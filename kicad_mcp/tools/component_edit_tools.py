@@ -468,7 +468,11 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
 
         Args:
             schematic_path: Absolute path to the target .kicad_sch file.
-            library_name: Library name as indexed (e.g. "Device").
+            library_name: Library name as returned by ``search_symbols`` in
+                the ``library_name`` field.  For KiCad 10 symdir-style
+                libraries this is ``"TableName/FileBaseName"``
+                (e.g. ``"Device/R_Small"``), not just the table name
+                (e.g. not ``"Device"``).
             symbol_name: Symbol name within the library (e.g. "R").
             x: X placement coordinate in mm (will be aligned to 0.5 mm grid).
             y: Y placement coordinate in mm (will be aligned to 0.5 mm grid).

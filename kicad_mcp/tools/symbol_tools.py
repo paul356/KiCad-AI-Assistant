@@ -167,6 +167,15 @@ def register_symbol_tools(mcp: FastMCP) -> None:
         Args:
             query: Search string (e.g. "resistor", "NPN transistor", "STM32").
             limit: Maximum number of results to return (default 50).
+
+        Returns:
+            A dict with a ``symbols`` list. Each entry has:
+            - ``library_name``: the exact value to pass as ``library_name`` to
+              ``add_symbol_to_schematic``, ``get_symbol``, or
+              ``get_library_symbols``.  For KiCad 10 symdir-style libraries
+              this is ``"TableName/FileBaseName"`` (e.g. ``"Device/R_Small"``),
+              not just the table name (e.g. not ``"Device"``).
+            - ``name``: the exact value to pass as ``symbol_name``.
         """
         try:
             mgr = _get_index_manager()
@@ -177,7 +186,7 @@ def register_symbol_tools(mcp: FastMCP) -> None:
                 "count": len(results),
                 "symbols": [
                     {
-                        "library": s.library_name,
+                        "library_name": s.library_name,
                         "name": s.symbol_name,
                         "description": s.description,
                         "keywords": s.keywords,
@@ -200,7 +209,10 @@ def register_symbol_tools(mcp: FastMCP) -> None:
         Look up a single KiCad symbol by library and symbol name.
 
         Args:
-            library_name: The library name as it appears in sym-lib-table (e.g. "Device").
+            library_name: The library name returned by ``search_symbols`` in the
+                ``library_name`` field.  For KiCad 10 symdir-style libraries
+                this is ``"TableName/FileBaseName"`` (e.g. ``"Device/R_Small"``)
+                not just the table name (e.g. not ``"Device"``).
             symbol_name:  The symbol name within the library (e.g. "R").
         """
         try:
@@ -213,7 +225,7 @@ def register_symbol_tools(mcp: FastMCP) -> None:
                 }
             return {
                 "success": True,
-                "library": symbol.library_name,
+                "library_name": symbol.library_name,
                 "name": symbol.symbol_name,
                 "description": symbol.description,
                 "keywords": symbol.keywords,
@@ -260,7 +272,11 @@ def register_symbol_tools(mcp: FastMCP) -> None:
         Return all symbols in a specific KiCad symbol library.
 
         Args:
-            library_name: The library name as it appears in sym-lib-table (e.g. "Device").
+            library_name: The library name returned by ``search_symbols`` or
+                ``list_symbol_libraries`` in the ``library_name`` field.  For
+                KiCad 10 symdir-style libraries this is
+                ``"TableName/FileBaseName"`` (e.g. ``"Device/R_Small"``), not
+                just the table name (e.g. not ``"Device"``).
         """
         try:
             mgr = _get_index_manager()
@@ -272,7 +288,7 @@ def register_symbol_tools(mcp: FastMCP) -> None:
                 }
             return {
                 "success": True,
-                "library": library_name,
+                "library_name": library_name,
                 "count": len(symbols),
                 "symbols": [
                     {

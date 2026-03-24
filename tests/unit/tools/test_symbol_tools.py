@@ -232,7 +232,7 @@ class TestGetSymbol:
             result = _call("get_symbol", library_name="Device", symbol_name="R")
 
         assert result["success"] is True
-        assert result["library"] == "Device"
+        assert result["library_name"] == "Device"
         assert result["name"] == "R"
         assert result["pin_count"] == 2
 
@@ -321,7 +321,7 @@ class TestGetLibrarySymbols:
             result = _call("get_library_symbols", library_name="Device")
 
         assert result["success"] is True
-        assert result["library"] == "Device"
+        assert result["library_name"] == "Device"
         assert result["count"] == 2
         names = [s["name"] for s in result["symbols"]]
         assert "R" in names
