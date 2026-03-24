@@ -46,12 +46,13 @@ def _get_index_manager() -> SymbolIndexManager:
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _align_to_grid(value: float, grid_size: float = 0.5) -> float:
+def _align_to_grid(value: float, grid_size: float = 1.27) -> float:
     """Align a coordinate to the nearest grid point.
     
     Args:
         value: The coordinate value in mm.
-        grid_size: The grid size in mm (default 0.5 mm for KiCad schematics).
+        grid_size: The grid size in mm (default 1.27 mm = 50 mils, the
+            standard KiCad schematic grid on which all symbol pins are placed).
     
     Returns:
         The coordinate rounded to the nearest grid point.
@@ -462,8 +463,9 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
         Looks up the symbol in the index database, extracts its definition
         from the library file, injects it into the schematic's lib_symbols
         block, and inserts a placed instance for every unit of the symbol.
-        The placement coordinates are automatically aligned to the 0.5 mm grid
-        for proper alignment. A backup (.kicad_sch.bak) is written before 
+        The placement coordinates are automatically aligned to the 1.27 mm
+        (50-mil) grid so that pins land on KiCad's standard schematic grid
+        and wires can connect to them. A backup (.kicad_sch.bak) is written before 
         saving.
 
         Args:
@@ -474,8 +476,8 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
                 (e.g. ``"Device/R_Small"``), not just the table name
                 (e.g. not ``"Device"``).
             symbol_name: Symbol name within the library (e.g. "R").
-            x: X placement coordinate in mm (will be aligned to 0.5 mm grid).
-            y: Y placement coordinate in mm (will be aligned to 0.5 mm grid).
+            x: X placement coordinate in mm (will be aligned to 1.27 mm / 50-mil grid).
+            y: Y placement coordinate in mm (will be aligned to 1.27 mm / 50-mil grid).
             rotation: Rotation in degrees; must be 0, 90, 180, or 270.
             value: Override for the Value property. Defaults to symbol_name.
             fields_autoplaced: When True (default) the placed symbol is marked
@@ -487,7 +489,7 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
 
         Returns:
             dict with keys: success (bool), reference_assigned, lib_id,
-            units_added, position (with grid-aligned coords), warnings.
+            units_added, position (with 50-mil grid-aligned coords), warnings.
         """
         # ---- Input validation ----
         if not schematic_path.endswith(".kicad_sch"):
