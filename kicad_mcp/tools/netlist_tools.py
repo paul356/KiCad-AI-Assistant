@@ -156,17 +156,62 @@ def register_netlist_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
     async def analyze_schematic_connections(schematic_path: str, ctx: Context | None) -> Dict[str, Any]:
-        """Analyze connections in a KiCad schematic.
+        """Summarize nets and flag potential issues in a KiCad schematic.
         
-        This tool provides detailed analysis of component connections,
-        including power nets, signal paths, and potential issues.
+        A net is a named group of pins that are electrically connected by wires.
+        For example, if R1/pin2, C1/pin1, and a GND power symbol are all joined
+        by wires, they form one net named "GND".
+
+        This tool provides a statistical overview of the schematic: component
+        type counts, net classification (power vs signal), and simple issue
+        detection. It does NOT describe how individual components are wired
+        together — use find_component_connections for that.
         
         Args:
             schematic_path: Path to the KiCad schematic file (.kicad_sch)
             ctx: MCP context for progress reporting
             
         Returns:
-            Dictionary with connection analysis
+            Dictionary with the following structure on success:
+            {
+                "success": True,
+                "schematic_path": "<path to the schematic file>",
+                "analysis": {
+                    "component_count": <int, total number of components>,
+                    "net_count": <int, total number of nets>,
+                    "component_types": {
+                        "<type_prefix>": <int, count>
+                        # e.g. {"R": 3, "C": 2, "U": 1}
+                        # type_prefix is the letter prefix of the reference (R, C, L, U, etc.)
+                    },
+                    "power_nets": [
+                        {
+                            "name": "<net name, e.g. GND, VCC, +5V>",
+                            "pin_count": <int, number of pins on this net>
+                        }
+                        # Nets whose names start with VCC, VDD, GND, +5V, +3V3, or +12V
+                    ],
+                    "signal_nets": [
+                        {
+                            "name": "<net name>",
+                            "pin_count": <int, number of pins on this net>
+                        }
+                        # All non-power nets. Labelled nets use the label text as the name.
+                        # Auto-generated names (e.g. Net-(R1-Pin2)) means Pin2 of R1 is not
+                        # in effect connected to any other pins.
+                    ],
+                    "potential_issues": [
+                        {
+                            "type": "floating_net",
+                            "net": "<net name>",
+                            "description": "<human-readable explanation>"
+                        }
+                        # floating_net: a non-power net with <= 1 connected pin,
+                        # meaning the pin is unconnected or drives nothing
+                    ]
+                }
+            }
+            On failure: {"success": False, "error": "<error message>"}
         """
         print(f"Analyzing connections in schematic: {schematic_path}")
         

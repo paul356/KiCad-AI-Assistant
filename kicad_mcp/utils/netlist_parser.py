@@ -3,49 +3,49 @@ KiCad schematic netlist extraction utilities.
 """
 import os
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 from collections import defaultdict
+
+import skip
+
 
 class SchematicParser:
     """Parser for KiCad schematic files to extract netlist information."""
-    
+
     def __init__(self, schematic_path: str):
         """Initialize the schematic parser.
-        
+
         Args:
             schematic_path: Path to the KiCad schematic file (.kicad_sch)
         """
         self.schematic_path = schematic_path
-        self.content = ""
-        self.components = []
-        self.labels = []
-        self.wires = []
-        self.junctions = []
-        self.no_connects = []
-        self.power_symbols = []
-        self.hierarchical_labels = []
-        self.global_labels = []
-        
+        self._sch = None
+        self.components: List[Dict[str, Any]] = []
+        self.labels: List[Dict[str, Any]] = []
+        self.wires: List[Dict[str, Any]] = []
+        self.junctions: List[Dict[str, Any]] = []
+        self.no_connects: List[Dict[str, Any]] = []
+        self.power_symbols: List[Dict[str, Any]] = []
+        self.hierarchical_labels: List[Dict[str, Any]] = []
+        self.global_labels: List[Dict[str, Any]] = []
+
         # Netlist information
-        self.nets = defaultdict(list)  # Net name -> connected pins
-        self.component_pins = {}  # (component_ref, pin_num) -> net_name
-        
+        self.nets: Dict[str, List] = defaultdict(list)
+        self.component_pins: Dict[Tuple, str] = {}
+
         # Component information
-        self.component_info = {}  # component_ref -> component details
-        
-        # Load the file
+        self.component_info: Dict[str, Dict[str, Any]] = {}
+
         self._load_schematic()
 
     def _load_schematic(self) -> None:
-        """Load the schematic file content."""
+        """Load the schematic using the skip library."""
         if not os.path.exists(self.schematic_path):
             print(f"Schematic file not found: {self.schematic_path}")
             raise FileNotFoundError(f"Schematic file not found: {self.schematic_path}")
-        
         try:
-            with open(self.schematic_path, 'r') as f:
-                self.content = f.read()
-                print(f"Successfully loaded schematic: {self.schematic_path}")
+            self._sch = skip.Schematic(self.schematic_path)
+            print(f"Successfully loaded schematic: {self.schematic_path}")
         except Exception as e:
             print(f"Error reading schematic file: {str(e)}")
             raise
@@ -57,29 +57,19 @@ class SchematicParser:
             Dictionary with parsed netlist information
         """
         print("Starting schematic parsing")
-        
-        # Extract symbols (components)
+
         self._extract_components()
-        
-        # Extract wires
         self._extract_wires()
-        
-        # Extract junctions
         self._extract_junctions()
-        
-        # Extract labels
         self._extract_labels()
-        
-        # Extract power symbols
         self._extract_power_symbols()
-        
-        # Extract no-connects
         self._extract_no_connects()
-        
-        # Build netlist
         self._build_netlist()
-        
-        # Create result
+
+        # Strip internal-only field before returning
+        for comp in self.component_info.values():
+            comp.pop('_pin_world_coords', None)
+
         result = {
             "components": self.component_info,
             "nets": dict(self.nets),
@@ -88,314 +78,336 @@ class SchematicParser:
             "junctions": self.junctions,
             "power_symbols": self.power_symbols,
             "component_count": len(self.component_info),
-            "net_count": len(self.nets)
+            "net_count": len(self.nets),
         }
-        
+
         print(f"Schematic parsing complete: found {len(self.component_info)} components and {len(self.nets)} nets")
         return result
-
-    def _extract_s_expressions(self, pattern: str) -> List[str]:
-        """Extract all matching S-expressions from the schematic content.
-        
-        Args:
-            pattern: Regex pattern to match the start of S-expressions
-            
-        Returns:
-            List of matching S-expressions
-        """
-        matches = []
-        positions = []
-        
-        # Find all starting positions of matches
-        for match in re.finditer(pattern, self.content):
-            positions.append(match.start())
-        
-        # Extract full S-expressions for each match
-        for pos in positions:
-            # Start from the matching position
-            current_pos = pos
-            depth = 0
-            s_exp = ""
-            
-            # Extract the full S-expression by tracking parentheses
-            while current_pos < len(self.content):
-                char = self.content[current_pos]
-                s_exp += char
-                
-                if char == '(':
-                    depth += 1
-                elif char == ')':
-                    depth -= 1
-                    if depth == 0:
-                        # Found the end of the S-expression
-                        break
-                
-                current_pos += 1
-            
-            matches.append(s_exp)
-        
-        return matches
 
     def _extract_components(self) -> None:
         """Extract component information from schematic."""
         print("Extracting components")
-        
-        # Extract all symbol expressions (components)
-        symbols = self._extract_s_expressions(r'\(symbol\s+')
-        
-        for symbol in symbols:
-            component = self._parse_component(symbol)
-            if component:
-                self.components.append(component)
-                
-                # Add to component info dictionary
-                ref = component.get('reference', 'Unknown')
-                self.component_info[ref] = component
-        
-        print(f"Extracted {len(self.components)} components")
+        try:
+            symbols = self._sch.symbol
+        except AttributeError:
+            print("No symbols found in schematic")
+            return
 
-    def _parse_component(self, symbol_expr: str) -> Dict[str, Any]:
-        """Parse a component from a symbol S-expression.
-        
-        Args:
-            symbol_expr: Symbol S-expression
-            
-        Returns:
-            Component information dictionary
-        """
-        component = {}
-        
-        # Extract library component ID
-        lib_id_match = re.search(r'\(lib_id\s+"([^"]+)"\)', symbol_expr)
-        if lib_id_match:
-            component['lib_id'] = lib_id_match.group(1)
-        
-        # Extract reference (e.g., R1, C2)
-        property_matches = re.finditer(r'\(property\s+"([^"]+)"\s+"([^"]+)"', symbol_expr)
-        for match in property_matches:
-            prop_name = match.group(1)
-            prop_value = match.group(2)
-            
-            if prop_name == "Reference":
-                component['reference'] = prop_value
-            elif prop_name == "Value":
-                component['value'] = prop_value
-            elif prop_name == "Footprint":
-                component['footprint'] = prop_value
-            else:
-                # Store other properties
-                if 'properties' not in component:
-                    component['properties'] = {}
-                component['properties'][prop_name] = prop_value
-        
-        # Extract position
-        pos_match = re.search(r'\(at\s+([\d\.-]+)\s+([\d\.-]+)(\s+[\d\.-]+)?\)', symbol_expr)
-        if pos_match:
-            component['position'] = {
-                'x': float(pos_match.group(1)),
-                'y': float(pos_match.group(2)),
-                'angle': float(pos_match.group(3).strip() if pos_match.group(3) else 0)
-            }
-        
-        # Extract pins
-        pins = []
-        pin_matches = re.finditer(r'\(pin\s+\(num\s+"([^"]+)"\)\s+\(name\s+"([^"]+)"\)', symbol_expr)
-        for match in pin_matches:
-            pin_num = match.group(1)
-            pin_name = match.group(2)
-            pins.append({
-                'num': pin_num,
-                'name': pin_name
-            })
-        
-        if pins:
-            component['pins'] = pins
-        
-        return component
+        for sym in symbols:
+            comp: Dict[str, Any] = {}
+
+            # Reference is required; skip entries that don't have one
+            try:
+                comp['reference'] = sym.property.Reference.value
+            except AttributeError:
+                continue
+            ref = comp['reference']
+            if not ref:
+                continue
+
+            try:
+                comp['lib_id'] = sym.lib_id.value
+            except AttributeError:
+                pass
+
+            try:
+                comp['value'] = sym.property.Value.value
+            except AttributeError:
+                pass
+
+            try:
+                comp['footprint'] = sym.property.Footprint.value
+            except AttributeError:
+                pass
+
+            # sym.at.value -> [x, y, angle]
+            try:
+                at_val = sym.at.value
+                comp['position'] = {
+                    'x': float(at_val[0]),
+                    'y': float(at_val[1]),
+                    'angle': float(at_val[2]) if len(at_val) > 2 else 0.0,
+                }
+            except (AttributeError, IndexError, TypeError):
+                pass
+
+            # Pins: pin.location gives world coords (rotation-corrected by skip)
+            pin_world_coords: List[Dict[str, Any]] = []
+            pins_summary: List[Dict[str, str]] = []
+            try:
+                for pin in sym.pin:
+                    try:
+                        num = str(pin.number)
+                        loc = pin.location
+                        pin_world_coords.append({
+                            'num': num,
+                            'world_x': float(loc.x),
+                            'world_y': float(loc.y),
+                        })
+                        pins_summary.append({'num': num})
+                    except AttributeError:
+                        continue
+            except (AttributeError, TypeError):
+                pass
+
+            if pins_summary:
+                comp['pins'] = pins_summary
+            # Internal field consumed by _build_netlist; stripped before parse() returns
+            comp['_pin_world_coords'] = pin_world_coords
+
+            self.components.append(comp)
+            self.component_info[ref] = comp
+
+        print(f"Extracted {len(self.components)} components")
 
     def _extract_wires(self) -> None:
         """Extract wire information from schematic."""
         print("Extracting wires")
-        
-        # Extract all wire expressions
-        wires = self._extract_s_expressions(r'\(wire\s+')
-        
-        for wire in wires:
-            # Extract the wire coordinates
-            pts_match = re.search(r'\(pts\s+\(xy\s+([\d\.-]+)\s+([\d\.-]+)\)\s+\(xy\s+([\d\.-]+)\s+([\d\.-]+)\)\)', wire)
-            if pts_match:
-                self.wires.append({
-                    'start': {
-                        'x': float(pts_match.group(1)),
-                        'y': float(pts_match.group(2))
-                    },
-                    'end': {
-                        'x': float(pts_match.group(3)),
-                        'y': float(pts_match.group(4))
-                    }
-                })
-        
+        try:
+            for wire in self._sch.wire:
+                try:
+                    xys = wire.pts.xy
+                    s, e = xys[0].value, xys[1].value
+                    self.wires.append({
+                        'start': {'x': float(s[0]), 'y': float(s[1])},
+                        'end':   {'x': float(e[0]), 'y': float(e[1])},
+                    })
+                except (AttributeError, IndexError, TypeError):
+                    continue
+        except AttributeError:
+            pass
         print(f"Extracted {len(self.wires)} wires")
 
     def _extract_junctions(self) -> None:
         """Extract junction information from schematic."""
         print("Extracting junctions")
-        
-        # Extract all junction expressions
-        junctions = self._extract_s_expressions(r'\(junction\s+')
-        
-        for junction in junctions:
-            # Extract the junction coordinates
-            xy_match = re.search(r'\(junction\s+\(xy\s+([\d\.-]+)\s+([\d\.-]+)\)\)', junction)
-            if xy_match:
-                self.junctions.append({
-                    'x': float(xy_match.group(1)),
-                    'y': float(xy_match.group(2))
-                })
-        
+        try:
+            for junc in self._sch.junction._elements:
+                try:
+                    at_val = junc.at.value
+                    self.junctions.append({
+                        'x': float(at_val[0]),
+                        'y': float(at_val[1]),
+                    })
+                except (AttributeError, IndexError, TypeError):
+                    continue
+        except AttributeError:
+            pass
         print(f"Extracted {len(self.junctions)} junctions")
 
     def _extract_labels(self) -> None:
         """Extract label information from schematic."""
         print("Extracting labels")
-        
-        # Extract local labels
-        local_labels = self._extract_s_expressions(r'\(label\s+')
-        
-        for label in local_labels:
-            # Extract label text and position
-            label_match = re.search(r'\(label\s+"([^"]+)"\s+\(at\s+([\d\.-]+)\s+([\d\.-]+)(\s+[\d\.-]+)?\)', label)
-            if label_match:
-                self.labels.append({
-                    'type': 'local',
-                    'text': label_match.group(1),
-                    'position': {
-                        'x': float(label_match.group(2)),
-                        'y': float(label_match.group(3)),
-                        'angle': float(label_match.group(4).strip() if label_match.group(4) else 0)
-                    }
-                })
-        
-        # Extract global labels
-        global_labels = self._extract_s_expressions(r'\(global_label\s+')
-        
-        for label in global_labels:
-            # Extract global label text and position
-            label_match = re.search(r'\(global_label\s+"([^"]+)"\s+\(shape\s+([^\s\)]+)\)\s+\(at\s+([\d\.-]+)\s+([\d\.-]+)(\s+[\d\.-]+)?\)', label)
-            if label_match:
-                self.global_labels.append({
-                    'type': 'global',
-                    'text': label_match.group(1),
-                    'shape': label_match.group(2),
-                    'position': {
-                        'x': float(label_match.group(3)),
-                        'y': float(label_match.group(4)),
-                        'angle': float(label_match.group(5).strip() if label_match.group(5) else 0)
-                    }
-                })
-        
-        # Extract hierarchical labels
-        hierarchical_labels = self._extract_s_expressions(r'\(hierarchical_label\s+')
-        
-        for label in hierarchical_labels:
-            # Extract hierarchical label text and position
-            label_match = re.search(r'\(hierarchical_label\s+"([^"]+)"\s+\(shape\s+([^\s\)]+)\)\s+\(at\s+([\d\.-]+)\s+([\d\.-]+)(\s+[\d\.-]+)?\)', label)
-            if label_match:
-                self.hierarchical_labels.append({
-                    'type': 'hierarchical',
-                    'text': label_match.group(1),
-                    'shape': label_match.group(2),
-                    'position': {
-                        'x': float(label_match.group(3)),
-                        'y': float(label_match.group(4)),
-                        'angle': float(label_match.group(5).strip() if label_match.group(5) else 0)
-                    }
-                })
-        
-        print(f"Extracted {len(self.labels)} local labels, {len(self.global_labels)} global labels, and {len(self.hierarchical_labels)} hierarchical labels")
+
+        # Local labels: (label "NAME" (at x y angle) ...)
+        try:
+            for label in self._sch.label._elements:
+                try:
+                    at_val = label.at.value
+                    self.labels.append({
+                        'type': 'local',
+                        'text': str(label.value),
+                        'position': {
+                            'x': float(at_val[0]),
+                            'y': float(at_val[1]),
+                            'angle': float(at_val[2]) if len(at_val) > 2 else 0.0,
+                        },
+                    })
+                except (AttributeError, IndexError, TypeError):
+                    continue
+        except AttributeError:
+            pass
+
+        # Global labels
+        try:
+            for label in self._sch.global_label._elements:
+                try:
+                    at_val = label.at.value
+                    self.global_labels.append({
+                        'type': 'global',
+                        'text': str(label.value),
+                        'position': {
+                            'x': float(at_val[0]),
+                            'y': float(at_val[1]),
+                            'angle': float(at_val[2]) if len(at_val) > 2 else 0.0,
+                        },
+                    })
+                except (AttributeError, IndexError, TypeError):
+                    continue
+        except AttributeError:
+            pass
+
+        # Hierarchical labels
+        try:
+            hl_coll = self._sch.hierarchical_label
+            if hl_coll is not None:
+                for label in hl_coll._elements:
+                    try:
+                        at_val = label.at.value
+                        self.hierarchical_labels.append({
+                            'type': 'hierarchical',
+                            'text': str(label.value),
+                            'position': {
+                                'x': float(at_val[0]),
+                                'y': float(at_val[1]),
+                                'angle': float(at_val[2]) if len(at_val) > 2 else 0.0,
+                            },
+                        })
+                    except (AttributeError, IndexError, TypeError):
+                        continue
+        except AttributeError:
+            pass
+
+        print(f"Extracted {len(self.labels)} local labels, "
+              f"{len(self.global_labels)} global labels, "
+              f"and {len(self.hierarchical_labels)} hierarchical labels")
 
     def _extract_power_symbols(self) -> None:
         """Extract power symbol information from schematic."""
         print("Extracting power symbols")
-        
-        # Extract all power symbol expressions
-        power_symbols = self._extract_s_expressions(r'\(symbol\s+\(lib_id\s+"power:')
-        
-        for symbol in power_symbols:
-            # Extract power symbol type and position
-            type_match = re.search(r'\(lib_id\s+"power:([^"]+)"\)', symbol)
-            pos_match = re.search(r'\(at\s+([\d\.-]+)\s+([\d\.-]+)(\s+[\d\.-]+)?\)', symbol)
-            
-            if type_match and pos_match:
+        for comp in self.components:
+            if comp.get('lib_id', '').startswith('power:'):
                 self.power_symbols.append({
-                    'type': type_match.group(1),
-                    'position': {
-                        'x': float(pos_match.group(1)),
-                        'y': float(pos_match.group(2)),
-                        'angle': float(pos_match.group(3).strip() if pos_match.group(3) else 0)
-                    }
+                    'type': comp['lib_id'].split(':', 1)[1],
+                    'position': comp.get('position', {}),
                 })
-        
         print(f"Extracted {len(self.power_symbols)} power symbols")
 
     def _extract_no_connects(self) -> None:
         """Extract no-connect information from schematic."""
         print("Extracting no-connects")
-        
-        # Extract all no-connect expressions
-        no_connects = self._extract_s_expressions(r'\(no_connect\s+')
-        
-        for no_connect in no_connects:
-            # Extract the no-connect coordinates
-            xy_match = re.search(r'\(no_connect\s+\(at\s+([\d\.-]+)\s+([\d\.-]+)\)', no_connect)
-            if xy_match:
-                self.no_connects.append({
-                    'x': float(xy_match.group(1)),
-                    'y': float(xy_match.group(2))
-                })
-        
+        try:
+            nc_coll = self._sch.no_connect
+            if nc_coll is not None:
+                for nc in nc_coll._elements:
+                    try:
+                        at_val = nc.at.value
+                        self.no_connects.append({
+                            'x': float(at_val[0]),
+                            'y': float(at_val[1]),
+                        })
+                    except (AttributeError, IndexError, TypeError):
+                        continue
+        except AttributeError:
+            pass
         print(f"Extracted {len(self.no_connects)} no-connects")
 
     def _build_netlist(self) -> None:
-        """Build the netlist from extracted components and connections."""
+        """Build the netlist by tracing wire connectivity between component pins.
+
+        Uses skip's pin.location (world coordinates, rotation already applied)
+        together with a union-find over wire endpoints to group connected pins
+        into nets.
+        """
         print("Building netlist from schematic data")
-        
-        # TODO: Implement netlist building algorithm
-        # This is a complex task that involves:
-        # 1. Tracking connections between components via wires
-        # 2. Handling labels (local, global, hierarchical)
-        # 3. Processing power symbols
-        # 4. Resolving junctions
-        
-        # For now, we'll implement a basic version that creates a list of nets
-        # based on component references and pin numbers
-        
-        # Process global labels as nets
+
+        ROUND = 4
+
+        def pt(x: float, y: float) -> Tuple[float, float]:
+            return (round(float(x), ROUND), round(float(y), ROUND))
+
+        # --- Union-Find ---
+        uf: Dict[Tuple, Tuple] = {}
+
+        def find(p: Tuple) -> Tuple:
+            uf.setdefault(p, p)
+            root = p
+            while uf[root] != root:
+                root = uf[root]
+            node = p
+            while uf[node] != root:
+                uf[node], node = root, uf[node]
+            return root
+
+        def union(p1: Tuple, p2: Tuple) -> None:
+            r1, r2 = find(p1), find(p2)
+            if r1 != r2:
+                uf[r1] = r2
+
+        # Step 1: Wire connectivity
+        for wire in self.wires:
+            union(
+                pt(wire['start']['x'], wire['start']['y']),
+                pt(wire['end']['x'],   wire['end']['y']),
+            )
+
+        # Step 2: Register pin world positions (already rotation-corrected by skip)
+        placed_pin_world: Dict[Tuple[str, str], Tuple] = {}
+        for ref, comp in self.component_info.items():
+            if ref.startswith('#'):
+                continue
+            for pin_data in comp.get('_pin_world_coords', []):
+                world_pt = pt(pin_data['world_x'], pin_data['world_y'])
+                find(world_pt)  # register in uf
+                placed_pin_world[(ref, pin_data['num'])] = world_pt
+
+        # Step 3: Assign net names from labels
+        point_net: Dict[Tuple, str] = {}
+
+        def name_point(p: Tuple, name: str) -> None:
+            root = find(p)
+            if root not in point_net or name.upper() in ('GND', 'VCC', 'VDD', 'VSS', 'VEE'):
+                point_net[root] = name
+
+        for label in self.labels:
+            name_point(pt(label['position']['x'], label['position']['y']), label['text'])
+
         for label in self.global_labels:
-            net_name = label['text']
-            self.nets[net_name] = []  # Initialize empty list for this net
-        
-        # Process power symbols as nets
-        for power in self.power_symbols:
-            net_name = power['type']
+            name_point(pt(label['position']['x'], label['position']['y']), label['text'])
+
+        for label in self.hierarchical_labels:
+            name_point(pt(label['position']['x'], label['position']['y']), label['text'])
+
+        # Power symbol pins provide net names at their world positions.
+        # When skip cannot resolve pin.location for a power symbol (e.g. power:GND),
+        # fall back to the symbol's placement position, which in KiCad is always
+        # the connection point for single-pin power symbols.
+        for ref, comp in self.component_info.items():
+            if comp.get('lib_id', '').startswith('power:'):
+                power_name = comp['lib_id'].split(':', 1)[1]
+                pin_coords = comp.get('_pin_world_coords', [])
+                if pin_coords:
+                    for pin_data in pin_coords:
+                        name_point(pt(pin_data['world_x'], pin_data['world_y']), power_name)
+                else:
+                    pos = comp.get('position', {})
+                    if pos:
+                        name_point(pt(pos.get('x', 0), pos.get('y', 0)), power_name)
+
+        # Step 4: Group component pins by union-find group -> net
+        group_pins: Dict[Tuple, List] = defaultdict(list)
+        for (ref, pin_num), world_pt in placed_pin_world.items():
+            group_pins[find(world_pt)].append({'component': ref, 'pin': pin_num})
+
+        net_counter = [1]
+
+        def auto_net_name(root: Tuple, pins: List) -> str:
+            if root in point_net:
+                return point_net[root]
+            if len(pins) == 1:
+                return f"Net-({pins[0]['component']}-Pin{pins[0]['pin']})"
+            name = f"Net-{net_counter[0]}"
+            net_counter[0] += 1
+            return name
+
+        for root, pins in group_pins.items():
+            self.nets[auto_net_name(root, pins)].extend(pins)
+
+        # Register named nets that carry no component pins
+        for root, net_name in point_net.items():
             if net_name not in self.nets:
                 self.nets[net_name] = []
-        
-        # In a full implementation, we would now trace connections between
-        # components, but that requires a more complex algorithm to follow wires
-        # and detect connected pins
-        
-        # For demonstration, we'll add a placeholder note
-        print("Note: Full netlist building requires complex connectivity tracing")
-        print(f"Found {len(self.nets)} potential nets from labels and power symbols")
+
+        print(f"Built netlist: {len(self.nets)} nets, "
+              f"{sum(len(v) for v in self.nets.values())} pin connections")
 
 
 def extract_netlist(schematic_path: str) -> Dict[str, Any]:
     """Extract netlist information from a KiCad schematic file.
-    
+
     Args:
         schematic_path: Path to the KiCad schematic file (.kicad_sch)
-        
+
     Returns:
         Dictionary with netlist information
     """
