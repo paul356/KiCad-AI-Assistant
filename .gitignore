@@ -49,6 +49,11 @@ logs/
 # MCP specific
 ~/.kicad_mcp/drc_history/
 
+# Symbol database files (auto-generated, do not commit)
+kicad_mcp/utils/symbol_db/*.db
+kicad_mcp/utils/symbol_db/*.db-shm
+kicad_mcp/utils/symbol_db/*.db-wal
+
 # UV and modern Python tooling
 uv.lock
 .uv-cache/
