@@ -3,7 +3,7 @@ Netlist extraction and analysis tools for KiCad schematics.
 """
 import os
 from typing import Dict, Any
-from mcp.server.fastmcp import FastMCP, Context
+from fastmcp import FastMCP, Context
 
 from kicad_mcp.utils.file_utils import get_project_files
 from kicad_mcp.utils.netlist_parser import extract_netlist, analyze_netlist

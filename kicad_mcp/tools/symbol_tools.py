@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from fastmcp import FastMCP
-from mcp.server.fastmcp import Context
+from fastmcp import Context
 
 from kicad_mcp.config import LibraryPathConfig
 from kicad_mcp.utils.symbol_index_reader import SymbolIndexReader

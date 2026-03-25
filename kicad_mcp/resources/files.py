@@ -2,7 +2,7 @@
 File content resources for KiCad files.
 """
 import os
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
 
 
 def register_file_resources(mcp: FastMCP) -> None:

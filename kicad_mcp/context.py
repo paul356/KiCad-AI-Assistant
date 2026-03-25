@@ -7,7 +7,7 @@ from typing import AsyncIterator, Dict, Any
 import logging # Import logging
 import os # Added for PID
 
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
 
 # Get PID for logging
 # _PID = os.getpid()

@@ -17,7 +17,7 @@ from typing import Any
 import sexpdata
 import skip
 from fastmcp import FastMCP
-from mcp.server.fastmcp import Context
+from fastmcp import Context
 
 from kicad_mcp.config import LibraryPathConfig
 from kicad_mcp.utils.symbol_extractor import extract_lib_symbol_raw

@@ -12,7 +12,7 @@ from typing import Any
 
 import skip
 from fastmcp import FastMCP
-from mcp.server.fastmcp import Context
+from fastmcp import Context
 
 log = logging.getLogger(__name__)
 
