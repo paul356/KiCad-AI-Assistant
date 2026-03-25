@@ -144,7 +144,7 @@ class SchematicParser:
                             'world_x': float(loc.x),
                             'world_y': float(loc.y),
                         })
-                        pins_summary.append({'num': num})
+                        pins_summary.append({'num': num, 'x': float(loc.x), 'y': float(loc.y)})
                     except AttributeError:
                         continue
             except (AttributeError, TypeError):

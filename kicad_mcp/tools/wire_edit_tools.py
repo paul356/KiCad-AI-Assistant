@@ -302,48 +302,6 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
 
 
     @mcp.tool()
-    async def list_wires_in_schematic(
-        schematic_path: str,
-        ctx: Context | None = None,
-    ) -> dict[str, Any]:
-        """List all wire segments present in a KiCad schematic.
-
-        Returns every wire's start and end coordinates (in mm).  Use the
-        returned coordinates with delete_wire_from_schematic to remove a
-        specific wire.
-
-        Args:
-            schematic_path: Absolute path to the target .kicad_sch file.
-
-        Returns:
-            dict with keys: success (bool), wires (list of {start, end} dicts),
-            count (int).
-        """
-        if not schematic_path.endswith(".kicad_sch"):
-            return {"error": f"Not a .kicad_sch file: {schematic_path!r}"}
-        if not os.path.isfile(schematic_path):
-            return {"error": f"Schematic file not found: {schematic_path!r}"}
-
-        try:
-            sch = skip.Schematic(schematic_path)
-        except Exception as exc:
-            return {"error": f"Failed to open schematic: {exc}"}
-
-        wires = []
-        try:
-            for w in sch.wire:
-                sx, sy = float(w.start.value[0]), float(w.start.value[1])
-                ex, ey = float(w.end.value[0]), float(w.end.value[1])
-                wires.append({
-                    "start": {"x": sx, "y": sy},
-                    "end": {"x": ex, "y": ey},
-                })
-        except AttributeError:
-            pass  # no wires in schematic
-
-        return {"success": True, "wires": wires, "count": len(wires)}
-
-    @mcp.tool()
     async def delete_wire_from_schematic(
         schematic_path: str,
         start_x: float,
@@ -357,9 +315,11 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
 
         Removes all wire segments whose start/end coordinates match
         (start_x, start_y) → (end_x, end_y) or the reverse direction,
-        within the specified tolerance.  Use list_wires_in_schematic first
-        to obtain the exact coordinates.  A backup (.kicad_sch.bak) is
-        written before saving.
+        within the specified tolerance.  Use
+        analyze_schematic_connections(include_wire_topology=True) first to
+        obtain exact wire coordinates (connected wires appear under each net's
+        ``wires`` list; unconnected stubs appear under ``unconnected_wires``).
+        A backup (.kicad_sch.bak) is written before saving.
 
         Args:
             schematic_path: Absolute path to the target .kicad_sch file.
