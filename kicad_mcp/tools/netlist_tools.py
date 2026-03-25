@@ -155,18 +155,78 @@ def register_netlist_tools(mcp: FastMCP) -> None:
             return {"success": False, "error": str(e)}
 
     @mcp.tool()
-    async def analyze_schematic_connections(schematic_path: str, ctx: Context | None) -> Dict[str, Any]:
-        """Analyze connections in a KiCad schematic.
-        
-        This tool provides detailed analysis of component connections,
-        including power nets, signal paths, and potential issues.
-        
+    async def analyze_schematic_connections(
+        schematic_path: str,
+        include_wire_topology: bool = True,
+        ctx: Context | None = None,
+    ) -> Dict[str, Any]:
+        """Summarize nets, component pins, and (optionally) wire geometry for a KiCad schematic.
+
+        A net is a named group of pins that are electrically connected by wires.
+        For example, if R1/pin2, C1/pin1, and a GND power symbol are all joined
+        by wires, they form one net named "GND".
+
+        This tool provides a statistical overview of the schematic: component
+        type counts, net classification (power vs signal), pin coordinates, and
+        simple issue detection.
+
+        Set ``include_wire_topology=True`` to also receive, for every net, the
+        exact wire segments that carry it (start/end mm coordinates, and which
+        component pins touch each endpoint). Unconnected wire segments (no net)
+        are returned separately under ``unconnected_wires``. This replaces the
+        need to call get_net_topology or list_wires_in_schematic separately.
+
         Args:
             schematic_path: Path to the KiCad schematic file (.kicad_sch)
+            include_wire_topology: When True, each net entry gains a ``wires``
+                list and ``wire_count``, and a top-level ``unconnected_wires``
+                list is added to the analysis. Default False.
             ctx: MCP context for progress reporting
-            
+
         Returns:
-            Dictionary with connection analysis
+            Dictionary with the following structure on success:
+            {
+                "success": True,
+                "schematic_path": "<path>",
+                "analysis": {
+                    "component_count": <int>,
+                    "net_count": <int>,
+                    "component_types": {"R": 3, "C": 2, ...},
+                    "power_nets": [
+                        {
+                            "name": "GND",
+                            "pin_count": <int>,
+                            "pins": [{"component": "R1", "pin": "1", "x": 10.16, "y": 25.4}, ...],
+                            # if include_wire_topology=True:
+                            "wire_count": <int>,
+                            "wires": [
+                                {
+                                    "start": {"x": ..., "y": ...},
+                                    "end":   {"x": ..., "y": ...},
+                                    "start_pins": [{"ref": "R1", "pin": "1"}],
+                                    "end_pins":   []
+                                }, ...
+                            ]
+                        },
+                        ...
+                    ],
+                    "signal_nets": [ <same structure as power_nets> ],
+                    "potential_issues": [
+                        {
+                            "type": "floating_net",
+                            "net": "<net name>",
+                            "description": "<explanation>"
+                        }, ...
+                    ],
+                    # if include_wire_topology=True:
+                    "unconnected_wires": [
+                        {"start": {"x": ..., "y": ...}, "end": {"x": ..., "y": ...},
+                         "start_pins": [], "end_pins": []}, ...
+                    ],
+                    "unconnected_wire_count": <int>
+                }
+            }
+            On failure: {"success": False, "error": "<error message>"}
         """
         print(f"Analyzing connections in schematic: {schematic_path}")
         
@@ -223,17 +283,48 @@ def register_netlist_tools(mcp: FastMCP) -> None:
                 await ctx.report_progress(60, 100)
             
             # Identify power nets
+            # Build a position lookup (ref → pin_num → {x, y}) from the enriched
+            # pins list (world coords are now stored directly on each pin entry).
+            components = netlist_data.get("components", {})
+            pin_positions: Dict[str, Dict[str, Dict[str, float]]] = {}
+            for cref, cdata in components.items():
+                pin_positions[cref] = {}
+                pos = cdata.get("position", {})
+                comp_x = pos.get("x", 0.0)
+                comp_y = pos.get("y", 0.0)
+                for pinfo in cdata.get("pins", []):
+                    pnum = str(pinfo.get("num", ""))
+                    pin_positions[cref][pnum] = {
+                        "x": float(pinfo.get("x", comp_x)),
+                        "y": float(pinfo.get("y", comp_y)),
+                    }
+
+            def pins_with_coords(pins: list) -> list:
+                enriched = []
+                for p in pins:
+                    ref = p.get("component", "")
+                    pin_num = str(p.get("pin", ""))
+                    entry = {"component": ref, "pin": pin_num}
+                    coords = pin_positions.get(ref, {}).get(pin_num)
+                    if coords:
+                        entry["x"] = coords["x"]
+                        entry["y"] = coords["y"]
+                    enriched.append(entry)
+                return enriched
+
             nets = netlist_data.get("nets", {})
             for net_name, pins in nets.items():
                 if any(net_name.startswith(prefix) for prefix in ["VCC", "VDD", "GND", "+5V", "+3V3", "+12V"]):
                     analysis["power_nets"].append({
                         "name": net_name,
-                        "pin_count": len(pins)
+                        "pin_count": len(pins),
+                        "pins": pins_with_coords(pins),
                     })
                 else:
                     analysis["signal_nets"].append({
                         "name": net_name,
-                        "pin_count": len(pins)
+                        "pin_count": len(pins),
+                        "pins": pins_with_coords(pins),
                     })
             
             if ctx:
@@ -251,10 +342,87 @@ def register_netlist_tools(mcp: FastMCP) -> None:
             
             # 2. Power pins without connections
             # This would require more detailed parsing of the schematic
-            
+
+            if include_wire_topology:
+                ROUND = 4
+
+                def rpt(x, y):
+                    return (round(float(x), ROUND), round(float(y), ROUND))
+
+                # Union-find over all wire segments
+                uf: Dict[Any, Any] = {}
+
+                def uf_find(p):
+                    uf.setdefault(p, p)
+                    root = p
+                    while uf[root] != root:
+                        root = uf[root]
+                    node = p
+                    while uf[node] != root:
+                        uf[node], node = root, uf[node]
+                    return root
+
+                def uf_union(a, b):
+                    ra, rb = uf_find(a), uf_find(b)
+                    if ra != rb:
+                        uf[ra] = rb
+
+                all_wires = netlist_data.get("wires", [])
+                for wdata in all_wires:
+                    uf_union(rpt(wdata["start"]["x"], wdata["start"]["y"]),
+                             rpt(wdata["end"]["x"],   wdata["end"]["y"]))
+
+                # Map each union-find root to its net name via pin world coords
+                root_to_net: Dict[Any, str] = {}
+                for net_name, pins in nets.items():
+                    for p in pins:
+                        coords = pin_positions.get(p.get("component", ""), {}).get(str(p.get("pin", "")))
+                        if coords:
+                            root = uf_find(rpt(coords["x"], coords["y"]))
+                            if root not in root_to_net:
+                                root_to_net[root] = net_name
+
+                # Build point → pins lookup for endpoint annotation
+                from collections import defaultdict as _dd
+                pin_at: Dict[Any, list] = _dd(list)
+                for net_name, pins in nets.items():
+                    for p in pins:
+                        coords = pin_positions.get(p.get("component", ""), {}).get(str(p.get("pin", "")))
+                        if coords:
+                            pin_at[rpt(coords["x"], coords["y"])].append(
+                                {"ref": p.get("component", ""), "pin": str(p.get("pin", ""))}
+                            )
+
+                # Assign each wire to its net
+                net_wires: Dict[str, list] = {}
+                unconnected_wires = []
+                for wdata in all_wires:
+                    sp = rpt(wdata["start"]["x"], wdata["start"]["y"])
+                    ep = rpt(wdata["end"]["x"],   wdata["end"]["y"])
+                    wnet = root_to_net.get(uf_find(sp)) or root_to_net.get(uf_find(ep))
+                    wire_entry = {
+                        "start": wdata["start"],
+                        "end":   wdata["end"],
+                        "start_pins": list(pin_at.get(sp, [])),
+                        "end_pins":   list(pin_at.get(ep, [])),
+                    }
+                    if wnet:
+                        net_wires.setdefault(wnet, []).append(wire_entry)
+                    else:
+                        unconnected_wires.append(wire_entry)
+
+                # Attach wire lists to each net entry
+                for entry in analysis["power_nets"] + analysis["signal_nets"]:
+                    wires = net_wires.get(entry["name"], [])
+                    entry["wires"] = wires
+                    entry["wire_count"] = len(wires)
+
+                analysis["unconnected_wires"] = unconnected_wires
+                analysis["unconnected_wire_count"] = len(unconnected_wires)
+
             if ctx:
                 await ctx.report_progress(90, 100)
-            
+
             # Build result
             result = {
                 "success": True,
