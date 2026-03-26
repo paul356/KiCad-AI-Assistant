@@ -8,6 +8,8 @@ from collections import defaultdict
 
 import skip
 
+from kicad_mcp.utils.skip_helpers import sym_pin_world_coords
+
 
 class SchematicParser:
     """Parser for KiCad schematic files to extract netlist information."""
@@ -129,49 +131,11 @@ class SchematicParser:
             except (AttributeError, IndexError, TypeError):
                 pass
 
-            # Pins: pin.location gives world coords (rotation-corrected by skip)
+            # Collect pin positions via shared helper (handles the skip bug
+            # for single-pin symbols: power nets, PWR_FLAG, TestPoint, etc.)
             pins_summary: List[Dict[str, str]] = []
-            try:
-                for pin in sym.pin:
-                    try:
-                        num = str(pin.number)
-                        loc = pin.location
-                        pins_summary.append({'num': num, 'x': float(loc.x), 'y': float(loc.y)})
-                    except AttributeError:
-                        continue
-            except (AttributeError, TypeError):
-                pass
-
-            # Fallback for a skip library bug: single-pin symbols (e.g. TestPoint)
-            # cause sym.pin to raise AttributeError internally, making Python fall
-            # back via __getattr__ to the raw ParsedValue.  Iterating it yields the
-            # pin's children ("1", uuid) rather than SymbolPin objects, so every
-            # pin.number access fails silently and pins_summary stays empty.
-            # Compute world positions directly from lib_symbol + placement instead.
-            if not pins_summary:
-                try:
-                    from skip.at_location import AtValue as _AtValue
-                    import copy as _copy
-                    lib_sym = sym.lib_symbol
-                    if lib_sym is not None:
-                        sym_at = _AtValue(sym.at.value)
-                        for lib_pin in lib_sym.pin:
-                            try:
-                                num = str(lib_pin.number.value)
-                                rel_raw = _copy.deepcopy(lib_pin.at.value)
-                                rel_at = _AtValue(rel_raw)
-                                manip_at = _AtValue(_copy.deepcopy(rel_raw))
-                                manip_at.rotation = 0
-                                while manip_at.rotation != sym_at.rotation:
-                                    manip_at.rotate90degrees()
-                                    rel_at.rotate90degrees()
-                                wx = round(sym_at.x + rel_at.x, 4)
-                                wy = round(sym_at.y - rel_at.y, 4)
-                                pins_summary.append({'num': num, 'x': wx, 'y': wy})
-                            except Exception:
-                                continue
-                except Exception:
-                    pass
+            for pin in sym_pin_world_coords(sym):
+                pins_summary.append({'num': pin.number, 'x': str(pin.x), 'y': str(pin.y)})
 
             if pins_summary:
                 comp['pins'] = pins_summary

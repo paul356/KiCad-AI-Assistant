@@ -136,10 +136,12 @@ def register_netlist_tools(mcp: FastMCP) -> None:
                     ],
                     # if include_wire_topology=True:
                     "wires": {
-                        "0": {"net": "GND", "start": {"x": ..., "y": ...}, "end": {"x": ..., "y": ...},
-                              "start_pins": [{"ref": "R1", "pin": "1"}], "end_pins": []},
-                        "5": {"net": null, "start": {"x": ..., "y": ...}, "end": {"x": ..., "y": ...},
-                              "start_pins": [], "end_pins": []},
+                        "0": {"net": "GND",
+                              "start": {"x": ..., "y": ..., "pins": [{"ref": "R1", "pin": "1"}]},
+                              "end":   {"x": ..., "y": ..., "pins": []}},
+                        "5": {"net": null,
+                              "start": {"x": ..., "y": ..., "pins": []},
+                              "end":   {"x": ..., "y": ..., "pins": []}},
                         ...
                     }
                 }
@@ -264,11 +266,9 @@ def register_netlist_tools(mcp: FastMCP) -> None:
                     ep = rpt(wdata["end"]["x"],   wdata["end"]["y"])
                     wnet = point_to_net.get(sp) or point_to_net.get(ep)
                     wires[str(wire_id)] = {
-                        "net":        wnet,
-                        "start":      wdata["start"],
-                        "end":        wdata["end"],
-                        "start_pins": list(pin_at.get(sp, [])),
-                        "end_pins":   list(pin_at.get(ep, [])),
+                        "net":   wnet,
+                        "start": {**wdata["start"], "pins": list(pin_at.get(sp, []))},
+                        "end":   {**wdata["end"],   "pins": list(pin_at.get(ep, []))},
                     }
 
                 analysis["wires"] = wires
