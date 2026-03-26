@@ -8,6 +8,8 @@ from collections import defaultdict
 
 import skip
 
+from kicad_mcp.utils.skip_helpers import sym_pin_world_coords
+
 
 class SchematicParser:
     """Parser for KiCad schematic files to extract netlist information."""
@@ -32,6 +34,7 @@ class SchematicParser:
         # Netlist information
         self.nets: Dict[str, List] = defaultdict(list)
         self.component_pins: Dict[Tuple, str] = {}
+        self.point_to_net: Dict[Tuple, str] = {}
 
         # Component information
         self.component_info: Dict[str, Dict[str, Any]] = {}
@@ -66,10 +69,6 @@ class SchematicParser:
         self._extract_no_connects()
         self._build_netlist()
 
-        # Strip internal-only field before returning
-        for comp in self.component_info.values():
-            comp.pop('_pin_world_coords', None)
-
         result = {
             "components": self.component_info,
             "nets": dict(self.nets),
@@ -79,6 +78,7 @@ class SchematicParser:
             "power_symbols": self.power_symbols,
             "component_count": len(self.component_info),
             "net_count": len(self.nets),
+            "point_to_net": self.point_to_net,
         }
 
         print(f"Schematic parsing complete: found {len(self.component_info)} components and {len(self.nets)} nets")
@@ -131,29 +131,14 @@ class SchematicParser:
             except (AttributeError, IndexError, TypeError):
                 pass
 
-            # Pins: pin.location gives world coords (rotation-corrected by skip)
-            pin_world_coords: List[Dict[str, Any]] = []
+            # Collect pin positions via shared helper (handles the skip bug
+            # for single-pin symbols: power nets, PWR_FLAG, TestPoint, etc.)
             pins_summary: List[Dict[str, str]] = []
-            try:
-                for pin in sym.pin:
-                    try:
-                        num = str(pin.number)
-                        loc = pin.location
-                        pin_world_coords.append({
-                            'num': num,
-                            'world_x': float(loc.x),
-                            'world_y': float(loc.y),
-                        })
-                        pins_summary.append({'num': num, 'x': float(loc.x), 'y': float(loc.y)})
-                    except AttributeError:
-                        continue
-            except (AttributeError, TypeError):
-                pass
+            for pin in sym_pin_world_coords(sym):
+                pins_summary.append({'num': pin.number, 'x': str(pin.x), 'y': str(pin.y)})
 
             if pins_summary:
                 comp['pins'] = pins_summary
-            # Internal field consumed by _build_netlist; stripped before parse() returns
-            comp['_pin_world_coords'] = pin_world_coords
 
             self.components.append(comp)
             self.component_info[ref] = comp
@@ -336,8 +321,8 @@ class SchematicParser:
         for ref, comp in self.component_info.items():
             if ref.startswith('#'):
                 continue
-            for pin_data in comp.get('_pin_world_coords', []):
-                world_pt = pt(pin_data['world_x'], pin_data['world_y'])
+            for pin_data in comp.get('pins', []):
+                world_pt = pt(pin_data['x'], pin_data['y'])
                 find(world_pt)  # register in uf
                 placed_pin_world[(ref, pin_data['num'])] = world_pt
 
@@ -365,10 +350,10 @@ class SchematicParser:
         for ref, comp in self.component_info.items():
             if comp.get('lib_id', '').startswith('power:'):
                 power_name = comp['lib_id'].split(':', 1)[1]
-                pin_coords = comp.get('_pin_world_coords', [])
+                pin_coords = comp.get('pins', [])
                 if pin_coords:
                     for pin_data in pin_coords:
-                        name_point(pt(pin_data['world_x'], pin_data['world_y']), power_name)
+                        name_point(pt(pin_data['x'], pin_data['y']), power_name)
                 else:
                     pos = comp.get('position', {})
                     if pos:
@@ -397,6 +382,13 @@ class SchematicParser:
         for root, net_name in point_net.items():
             if net_name not in self.nets:
                 self.nets[net_name] = []
+
+        # Expose a flat point → net-name mapping so callers can look up a wire
+        # endpoint's net directly without re-running union-find.
+        for p in list(uf.keys()):
+            root = find(p)
+            if root in point_net:
+                self.point_to_net[p] = point_net[root]
 
         print(f"Built netlist: {len(self.nets)} nets, "
               f"{sum(len(v) for v in self.nets.values())} pin connections")

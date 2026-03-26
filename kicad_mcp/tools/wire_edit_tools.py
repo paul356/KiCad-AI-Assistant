@@ -11,57 +11,288 @@ import shutil
 from typing import Any
 
 import skip
+from fastmcp import Context
 from fastmcp import FastMCP
-from mcp.server.fastmcp import Context
+
+from kicad_mcp.utils.skip_helpers import sym_pin_world_coords
 
 log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Orthogonal wire routing
+# Routing constants
+# ---------------------------------------------------------------------------
+
+_LEAD_OUT_DIST: float = 2.54   # mm — one KiCad grid step, pulls wire into open space
+_PIN_COLLISION_TOL: float = 0.5  # mm — clearance radius around each obstacle pin
+
+
+# ---------------------------------------------------------------------------
+# Geometry helpers
+# ---------------------------------------------------------------------------
+
+def _dir_vec(angle_deg: float) -> tuple[float, float]:
+    """Return the unit direction vector for a KiCad pin exit angle.
+
+    KiCad schematic coordinates have Y pointing **down** on screen.
+    Pin angle semantics (KiCad / skip convention):
+      0°   → pointing right  (+X)
+      90°  → pointing down   (+Y, screen)
+      180° → pointing left   (−X)
+      270° → pointing up     (−Y, screen)
+    """
+    a = int(round(angle_deg)) % 360
+    return {
+        0: (1.0, 0.0),
+        90: (0.0, 1.0),
+        180: (-1.0, 0.0),
+        270: (0.0, -1.0),
+    }.get(a, (math.cos(math.radians(a)), math.sin(math.radians(a))))
+
+
+def _point_on_open_segment(
+    px: float, py: float,
+    ax: float, ay: float,
+    bx: float, by: float,
+    tol: float,
+) -> bool:
+    """Return True if point P lies strictly inside axis-aligned segment A→B.
+
+    'Strictly inside' means the point is not at either endpoint, so that the
+    two connected pins do not self-collide with their own wire.
+    Works only for horizontal or vertical segments.
+    """
+    if abs(ay - by) < 1e-9:  # horizontal segment
+        if abs(py - ay) > tol:
+            return False
+        lo = min(ax, bx) + tol
+        hi = max(ax, bx) - tol
+        return lo <= px <= hi
+    if abs(ax - bx) < 1e-9:  # vertical segment
+        if abs(px - ax) > tol:
+            return False
+        lo = min(ay, by) + tol
+        hi = max(ay, by) - tol
+        return lo <= py <= hi
+    return False
+
+
+def _route_collides(
+    segments: list[tuple[float, float, float, float]],
+    obstacles: list[tuple[float, float]],
+    tol: float,
+) -> bool:
+    """Return True if any obstacle pin lands on the interior of any segment."""
+    for (ax, ay, bx, by) in segments:
+        for (px, py) in obstacles:
+            if _point_on_open_segment(px, py, ax, ay, bx, by, tol):
+                return True
+    return False
+
+
+def _route_candidates(
+    x1: float, y1: float, x2: float, y2: float,
+) -> list[list[tuple[float, float, float, float]]]:
+    """Return a ranked list of candidate segment-lists connecting (x1,y1)→(x2,y2).
+
+    Each candidate is a list of (ax, ay, bx, by) axis-aligned segments.
+    Candidates are tried in order; the first collision-free one wins.
+
+    Order:
+      1. Direct (1 segment) — only when points are axis-aligned.
+      2. L-A: horizontal-first via corner (x2, y1).
+      3. L-B: vertical-first via corner (x1, y2).
+      4-10.  7 horizontal Z-routes: jog at x = x1 + k*(x2−x1)/8 for k=1..7.
+      11-17. 7 vertical Z-routes:   jog at y = y1 + k*(y2−y1)/8 for k=1..7.
+    """
+    candidates: list[list[tuple[float, float, float, float]]] = []
+    dx = x2 - x1
+    dy = y2 - y1
+
+    # Direct single segment (only when already axis-aligned)
+    if abs(dy) < 1e-9 or abs(dx) < 1e-9:
+        candidates.append([(x1, y1, x2, y2)])
+
+    # L-A: horizontal then vertical
+    candidates.append([(x1, y1, x2, y1), (x2, y1, x2, y2)])
+
+    # L-B: vertical then horizontal
+    candidates.append([(x1, y1, x1, y2), (x1, y2, x2, y2)])
+
+    if abs(dx) > 1e-9 and abs(dy) > 1e-9:
+        # Horizontal Z-routes: jog the vertical column to a fractional x
+        for k in range(1, 8):
+            xj = x1 + dx * k / 8.0
+            candidates.append([
+                (x1, y1, xj, y1),
+                (xj, y1, xj, y2),
+                (xj, y2, x2, y2),
+            ])
+        # Vertical Z-routes: jog the horizontal row to a fractional y
+        for k in range(1, 8):
+            yj = y1 + dy * k / 8.0
+            candidates.append([
+                (x1, y1, x1, yj),
+                (x1, yj, x2, yj),
+                (x2, yj, x2, y2),
+            ])
+
+    return candidates
+
+
+def _merge_collinear_segments(
+    segments: list[tuple[float, float, float, float]],
+) -> list[tuple[float, float, float, float]]:
+    """Merge successive collinear axis-aligned segments into fewer segments.
+
+    Prevents redundant wire nodes when a Z-route jog lands on the same axis as
+    the adjacent lead-out stub.
+    """
+    if not segments:
+        return segments
+    result = list(segments)
+    changed = True
+    while changed:
+        changed = False
+        merged: list[tuple[float, float, float, float]] = []
+        i = 0
+        while i < len(result):
+            if i + 1 < len(result):
+                ax, ay, bx, by = result[i]
+                cx, cy, dx, dy = result[i + 1]
+                # Segments share the middle point
+                if abs(bx - cx) < 1e-9 and abs(by - cy) < 1e-9:
+                    # Horizontal merge: all four y values the same
+                    if (abs(ay - by) < 1e-9 and abs(cy - dy) < 1e-9
+                            and abs(ay - dy) < 1e-9):
+                        merged.append((ax, ay, dx, dy))
+                        i += 2
+                        changed = True
+                        continue
+                    # Vertical merge: all four x values the same
+                    if (abs(ax - bx) < 1e-9 and abs(cx - dx) < 1e-9
+                            and abs(ax - dx) < 1e-9):
+                        merged.append((ax, ay, dx, dy))
+                        i += 2
+                        changed = True
+                        continue
+            merged.append(result[i])
+            i += 1
+        result = merged
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Smart wire router
+# ---------------------------------------------------------------------------
+
+def _draw_smart_wire(
+    sch: Any,
+    sx: float, sy: float,
+    ex: float, ey: float,
+    start_angle: float | None = None,
+    end_angle: float | None = None,
+    obstacle_pins: list[tuple[float, float]] | None = None,
+    lead_out_dist: float = _LEAD_OUT_DIST,
+) -> bool:
+    """Draw a smart wire from (sx,sy) to (ex,ey) avoiding component pins.
+
+    Algorithm:
+      1. Compute a lead-out stub from each endpoint following the pin's exit
+         direction (if angle is supplied), moving the route into open space.
+      2. Try up to 16 candidate inner routes between the lead-out endpoints.
+      3. Pick the first candidate where no obstacle pin falls on the interior
+         of any segment.
+      4. Fall back to L-A (horizontal-first) with a logged warning when all
+         candidates collide.
+
+    Args:
+        sch: The skip schematic object.
+        sx, sy: Start point (pin position).
+        ex, ey: End point (pin position).
+        start_angle: Absolute exit angle of the start pin in degrees
+            (0=right, 90=down, 180=left, 270=up).  None to skip lead-out.
+        end_angle: Absolute exit angle of the end pin in degrees.
+        obstacle_pins: List of (x, y) positions to avoid.
+        lead_out_dist: Length of each lead-out stub in mm (default 2.54 mm).
+
+    Returns:
+        True if a collision-free route was found, False if the fallback was used.
+    """
+    obstacles = obstacle_pins or []
+
+    # Compute lead-out inner endpoints
+    if start_angle is not None:
+        dvx, dvy = _dir_vec(start_angle)
+        p1x = round(sx + dvx * lead_out_dist, 4)
+        p1y = round(sy + dvy * lead_out_dist, 4)
+    else:
+        p1x, p1y = sx, sy
+
+    if end_angle is not None:
+        dvx, dvy = _dir_vec(end_angle)
+        p2x = round(ex + dvx * lead_out_dist, 4)
+        p2y = round(ey + dvy * lead_out_dist, 4)
+    else:
+        p2x, p2y = ex, ey
+
+    # Build lead-out segments
+    lead_segs: list[tuple[float, float, float, float]] = []
+    if start_angle is not None and (abs(p1x - sx) > 1e-9 or abs(p1y - sy) > 1e-9):
+        lead_segs.append((sx, sy, p1x, p1y))
+    if end_angle is not None and (abs(p2x - ex) > 1e-9 or abs(p2y - ey) > 1e-9):
+        lead_segs.append((ex, ey, p2x, p2y))
+
+    # Try each inner route candidate
+    inner_candidates = _route_candidates(p1x, p1y, p2x, p2y)
+    chosen: list[tuple[float, float, float, float]] | None = None
+    for candidate in inner_candidates:
+        if not _route_collides(lead_segs + candidate, obstacles, _PIN_COLLISION_TOL):
+            chosen = candidate
+            break
+
+    collision_free = True
+    if chosen is None:
+        log.warning(
+            "smart_wire: all %d route candidates collide with obstacle pins "
+            "between (%.3f,%.3f) and (%.3f,%.3f); using L-A fallback.",
+            len(inner_candidates), sx, sy, ex, ey,
+        )
+        # Fallback: use first (L-A or direct) candidate
+        chosen = inner_candidates[0] if inner_candidates else [(p1x, p1y, p2x, p2y)]
+        collision_free = False
+
+    # Draw all segments, merging collinear neighbours first
+    all_draw = _merge_collinear_segments(lead_segs + chosen)
+    for (ax, ay, bx, by) in all_draw:
+        if abs(ax - bx) < 1e-9 and abs(ay - by) < 1e-9:
+            continue  # skip zero-length
+        w = sch.wire.new()
+        w.start_at([ax, ay])
+        w.end_at([bx, by])
+
+    return collision_free
+
+
+# ---------------------------------------------------------------------------
+# Orthogonal wire routing (thin wrapper — backward compatibility)
 # ---------------------------------------------------------------------------
 
 def _draw_orthogonal_wire(
-    sch: Any, start_x: float, start_y: float, end_x: float, end_y: float
-) -> None:
-    """Draw an orthogonal (horizontal-vertical-horizontal) wire path.
-    
-    This creates three wire segments to form a clean L-shaped or rectangular
-    path from start to end point. The routing goes:
-    1. Horizontal from start to (end_x, start_y)
-    2. Vertical from (end_x, start_y) to end point
-    
-    If start and end points are already horizontally or vertically aligned,
-    a single wire segment is drawn.
-    
-    Args:
-        sch: The skip schematic object.
-        start_x, start_y: Starting point coordinates.
-        end_x, end_y: Ending point coordinates.
+    sch: Any,
+    start_x: float, start_y: float,
+    end_x: float, end_y: float,
+    obstacle_pins: list[tuple[float, float]] | None = None,
+) -> bool:
+    """Draw an orthogonal wire, avoiding obstacle pins when supplied.
+
+    Thin wrapper around :func:`_draw_smart_wire` with no pin-direction
+    lead-outs.  Returns True when a collision-free route was found.
     """
-    # If horizontally aligned, draw vertical wire
-    if start_y == end_y:
-        w = sch.wire.new()
-        w.start_at([start_x, start_y])
-        w.end_at([end_x, end_y])
-        return
-    
-    # If vertically aligned, draw horizontal wire
-    if start_x == end_x:
-        w = sch.wire.new()
-        w.start_at([start_x, start_y])
-        w.end_at([end_x, end_y])
-        return
-    
-    # Draw horizontal segment from start to middle point
-    w1 = sch.wire.new()
-    w1.start_at([start_x, start_y])
-    w1.end_at([end_x, start_y])
-    
-    # Draw vertical segment from middle point to end
-    w2 = sch.wire.new()
-    w2.start_at([end_x, start_y])
-    w2.end_at([end_x, end_y])
+    return _draw_smart_wire(
+        sch, start_x, start_y, end_x, end_y,
+        obstacle_pins=obstacle_pins,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -73,8 +304,25 @@ def _get_pin_schematic_position(
 ) -> tuple[float, float]:
     """Return the absolute schematic (x, y) of a named pin on a placed symbol.
 
-    Uses skip's SymbolPin.location which accounts for the placed symbol's
-    position and rotation automatically.
+    Kept for backward compatibility.  Prefer :func:`_get_pin_position_and_direction`
+    when the exit angle is also needed.
+
+    Raises ValueError if the reference or pin number cannot be found.
+    """
+    x, y, _ = _get_pin_position_and_direction(sch, reference, pin_number)
+    return x, y
+
+
+def _get_pin_position_and_direction(
+    sch: Any, reference: str, pin_number: str
+) -> tuple[float, float, float]:
+    """Return the absolute schematic (x, y, angle°) of a named pin.
+
+    The angle is the direction the wire should leave the pin body:
+      0° → right,  90° → down (screen),  180° → left,  270° → up (screen).
+
+    Handles the skip library bug for single-pin symbols (power symbols,
+    TestPoint) via :func:`~kicad_mcp.utils.skip_helpers.sym_pin_world_coords`.
 
     Raises ValueError if the reference or pin number cannot be found.
     """
@@ -86,22 +334,50 @@ def _get_pin_schematic_position(
                 continue
             if ref_val != reference:
                 continue
-            try:
-                for pin in sym.pin:
-                    try:
-                        if str(pin.number) == str(pin_number):
-                            loc = pin.location
-                            return float(loc.x), float(loc.y)
-                    except AttributeError:
-                        continue
-            except AttributeError:
-                continue
+            for pin in sym_pin_world_coords(sym):
+                if pin.number == str(pin_number):
+                    return pin.x, pin.y, pin.angle
     except AttributeError:
         pass
     raise ValueError(
         f"Pin {pin_number!r} not found on symbol {reference!r}. "
         "Check that the reference designator and pin number are correct."
     )
+
+
+def _collect_all_pin_positions(
+    sch: Any,
+    exclude_pins: list[tuple[float, float]] | None = None,
+) -> list[tuple[float, float]]:
+    """Return the absolute schematic position of every pin of every placed symbol.
+
+    Uses :func:`~kicad_mcp.utils.skip_helpers.sym_pin_world_coords` which
+    handles the skip library bug for power symbols (VCC, GND, PWR_FLAG) and
+    single-pin symbols (TestPoint).
+
+    Args:
+        sch: The skip schematic object.
+        exclude_pins: Optional list of (x, y) positions to omit (e.g. the two
+            endpoint pins that are intentionally being connected).
+
+    Returns:
+        List of (x, y) tuples, one per pin, with excluded pins removed.
+    """
+    exclusions: set[tuple[float, float]] = set()
+    if exclude_pins:
+        for px, py in exclude_pins:
+            exclusions.add((round(px, 4), round(py, 4)))
+
+    positions: list[tuple[float, float]] = []
+    try:
+        for sym in sch.symbol:
+            for pin in sym_pin_world_coords(sym):
+                pt = (pin.x, pin.y)
+                if pt not in exclusions:
+                    positions.append(pt)
+    except AttributeError:
+        pass
+    return positions
 
 
 # ---------------------------------------------------------------------------
@@ -120,20 +396,15 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
         end_y: float,
         add_junction_start: bool = False,
         add_junction_end: bool = False,
-        use_orthogonal_routing: bool = True,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Add a wire segment to a KiCad schematic between two coordinates.
 
-        Draws a wire from (start_x, start_y) to (end_x, end_y) using clean
-        orthogonal (horizontal-vertical) routing by default. Optionally places 
-        junction dots at either endpoint, which is required when the endpoint 
-        lands in the middle of an existing wire (T-junction). A backup 
+        Draws a wire from (start_x, start_y) to (end_x, end_y) using
+        orthogonal (horizontal-vertical) routing. Optionally places junction
+        dots at either endpoint, which is required when the endpoint lands in
+        the middle of an existing wire (T-junction). A backup
         (.kicad_sch.bak) is written before saving.
-
-        By default, wires are drawn in an L-shape (horizontal then vertical) for
-        better readability and cleaner schematics. If you prefer straight diagonal 
-        wires, set use_orthogonal_routing to False.
 
         Args:
             schematic_path: Absolute path to the target .kicad_sch file.
@@ -143,13 +414,10 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
             end_y: Y coordinate of the wire end point in mm.
             add_junction_start: Place a junction dot at the start point.
             add_junction_end: Place a junction dot at the end point.
-            use_orthogonal_routing: When True (default), draws orthogonal
-                (L-shaped) wires for cleaner routing. When False, draws
-                single straight diagonal wires.
 
         Returns:
             dict with keys: success (bool), wire (start/end coords),
-            junctions_added (list of coords), routing_type (str: "orthogonal" or "direct").
+            junctions_added (list of coords).
         """
         if not schematic_path.endswith(".kicad_sch"):
             return {"error": f"Not a .kicad_sch file: {schematic_path!r}"}
@@ -170,16 +438,10 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
             return {"error": f"Failed to open schematic: {exc}"}
 
         try:
-            # Use orthogonal routing by default for cleaner wires
-            if use_orthogonal_routing:
-                _draw_orthogonal_wire(sch, start_x, start_y, end_x, end_y)
-                routing_type = "orthogonal"
-            else:
-                # Draw single straight wire
-                w = sch.wire.new()
-                w.start_at([start_x, start_y])
-                w.end_at([end_x, end_y])
-                routing_type = "direct"
+            # Collect all pin positions to avoid routing wires through them
+            obstacles = _collect_all_pin_positions(sch)
+            _draw_orthogonal_wire(sch, start_x, start_y, end_x, end_y,
+                                  obstacle_pins=obstacles)
 
             junctions_added = []
             if add_junction_start:
@@ -203,7 +465,6 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
                 "end": {"x": end_x, "y": end_y},
             },
             "junctions_added": junctions_added,
-            "routing_type": routing_type,
         }
 
     @mcp.tool()
@@ -213,21 +474,15 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
         from_pin: str,
         to_ref: str,
         to_pin: str,
-        add_junctions: bool = False,
-        use_orthogonal_routing: bool = True,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
-        """Connect two symbol pins with a wire, using clean orthogonal routing.
+        """Connect two symbol pins with a wire, using smart orthogonal routing.
 
         Resolves the absolute schematic coordinates of both pins automatically
         (accounting for each symbol's placement position and rotation), then
-        draws a wire between them using orthogonal (horizontal-vertical) routing
-        for a cleaner, more professional appearance. Optionally places junction 
-        dots at both endpoints. A backup (.kicad_sch.bak) is written before saving.
-
-        By default, wires are drawn in an L-shape (horizontal then vertical) for
-        better readability. If you prefer straight diagonal wires, set 
-        use_orthogonal_routing to False.
+        draws a wire between them using smart orthogonal routing that follows
+        pin exit directions and avoids other component pins. A backup
+        (.kicad_sch.bak) is written before saving.
 
         Args:
             schematic_path: Absolute path to the target .kicad_sch file.
@@ -235,14 +490,10 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
             from_pin: Pin number of the source pin (e.g. "1").
             to_ref: Reference designator of the destination symbol (e.g. "C1").
             to_pin: Pin number of the destination pin (e.g. "2").
-            add_junctions: Place junction dots at both wire endpoints.
-            use_orthogonal_routing: When True (default), draws orthogonal
-                (L-shaped) wires for cleaner routing. When False, draws
-                single straight diagonal wires.
 
         Returns:
             dict with keys: success (bool), wire (from/to with ref, pin, x, y),
-            junctions_added (bool), routing_type (str: "orthogonal" or "direct").
+            collision_free (bool).
         """
         if not schematic_path.endswith(".kicad_sch"):
             return {"error": f"Not a .kicad_sch file: {schematic_path!r}"}
@@ -255,12 +506,16 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
             return {"error": f"Failed to open schematic: {exc}"}
 
         try:
-            start_x, start_y = _get_pin_schematic_position(sch, from_ref, from_pin)
+            start_x, start_y, start_angle = _get_pin_position_and_direction(
+                sch, from_ref, from_pin
+            )
         except ValueError as exc:
             return {"error": str(exc)}
 
         try:
-            end_x, end_y = _get_pin_schematic_position(sch, to_ref, to_pin)
+            end_x, end_y, end_angle = _get_pin_position_and_direction(
+                sch, to_ref, to_pin
+            )
         except ValueError as exc:
             return {"error": str(exc)}
 
@@ -268,37 +523,35 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
             return {"error": "Both pins are at the same coordinate; cannot draw a wire"}
 
         try:
-            # Use orthogonal routing by default for cleaner wires
-            if use_orthogonal_routing:
-                _draw_orthogonal_wire(sch, start_x, start_y, end_x, end_y)
-                routing_type = "orthogonal"
-            else:
-                # Draw single straight wire
-                w = sch.wire.new()
-                w.start_at([start_x, start_y])
-                w.end_at([end_x, end_y])
-                routing_type = "direct"
+            # Collect obstacle pins excluding the two endpoints being connected
+            obstacles = _collect_all_pin_positions(
+                sch, exclude_pins=[(start_x, start_y), (end_x, end_y)]
+            )
 
-            if add_junctions:
-                j = sch.junction.new()
-                j.at.value = [start_x, start_y]
-                j = sch.junction.new()
-                j.at.value = [end_x, end_y]
+            collision_free: bool | None = None
+            # Smart routing: follow pin exit directions, avoid all other pins
+            collision_free = _draw_smart_wire(
+                sch, start_x, start_y, end_x, end_y,
+                start_angle=start_angle,
+                end_angle=end_angle,
+                obstacle_pins=obstacles,
+            )
 
             shutil.copy(schematic_path, schematic_path + ".bak")
             sch.write(schematic_path)
         except Exception as exc:
             return {"error": f"Failed to add wire: {exc}"}
 
-        return {
+        result: dict[str, Any] = {
             "success": True,
             "wire": {
                 "from": {"ref": from_ref, "pin": from_pin, "x": start_x, "y": start_y},
                 "to": {"ref": to_ref, "pin": to_pin, "x": end_x, "y": end_y},
             },
-            "junctions_added": add_junctions,
-            "routing_type": routing_type,
         }
+        if collision_free is not None:
+            result["collision_free"] = collision_free
+        return result
 
 
     @mcp.tool()
