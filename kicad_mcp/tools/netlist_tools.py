@@ -2,12 +2,11 @@
 Netlist extraction and analysis tools for KiCad schematics.
 """
 import os
-import re
 from typing import Dict, Any
 from fastmcp import FastMCP, Context
 
 from kicad_mcp.utils.file_utils import get_project_files
-from kicad_mcp.utils.netlist_parser import extract_netlist
+from kicad_mcp.utils.netlist_parser import extract_netlist, analyze_netlist
 
 def register_netlist_tools(mcp: FastMCP) -> None:
     """Register netlist-related tools with the MCP server.
@@ -16,6 +15,85 @@ def register_netlist_tools(mcp: FastMCP) -> None:
         mcp: The FastMCP server instance
     """
     
+    @mcp.tool()
+    async def extract_schematic_netlist(schematic_path: str, ctx: Context | None) -> Dict[str, Any]:
+        """Extract netlist information from a KiCad schematic.
+        
+        This tool parses a KiCad schematic file and extracts comprehensive
+        netlist information including components, connections, and labels.
+        
+        Args:
+            schematic_path: Path to the KiCad schematic file (.kicad_sch)
+            ctx: MCP context for progress reporting
+            
+        Returns:
+            Dictionary with netlist information
+        """
+        print(f"Extracting netlist from schematic: {schematic_path}")
+        
+        if not os.path.exists(schematic_path):
+            print(f"Schematic file not found: {schematic_path}")
+            if ctx:
+                ctx.info(f"Schematic file not found: {schematic_path}")
+            return {"success": False, "error": f"Schematic file not found: {schematic_path}"}
+        
+        # Report progress
+        if ctx:
+            await ctx.report_progress(10, 100)
+            ctx.info(f"Loading schematic file: {os.path.basename(schematic_path)}")
+        
+        # Extract netlist information
+        try:
+            if ctx:
+                await ctx.report_progress(20, 100)
+                ctx.info("Parsing schematic structure...")
+            
+            netlist_data = extract_netlist(schematic_path)
+            
+            if "error" in netlist_data:
+                print(f"Error extracting netlist: {netlist_data['error']}")
+                if ctx:
+                    ctx.info(f"Error extracting netlist: {netlist_data['error']}")
+                return {"success": False, "error": netlist_data['error']}
+            
+            if ctx:
+                await ctx.report_progress(60, 100)
+                ctx.info(f"Extracted {netlist_data['component_count']} components and {netlist_data['net_count']} nets")
+            
+            # Analyze the netlist
+            if ctx:
+                await ctx.report_progress(70, 100)
+                ctx.info("Analyzing netlist data...")
+            
+            analysis_results = analyze_netlist(netlist_data)
+            
+            if ctx:
+                await ctx.report_progress(90, 100)
+            
+            # Build result
+            result = {
+                "success": True,
+                "schematic_path": schematic_path,
+                "component_count": netlist_data["component_count"],
+                "net_count": netlist_data["net_count"],
+                "components": netlist_data["components"],
+                "nets": netlist_data["nets"],
+                "analysis": analysis_results
+            }
+            
+            # Complete progress
+            if ctx:
+                await ctx.report_progress(100, 100)
+                ctx.info("Netlist extraction complete")
+            
+            return result
+            
+        except Exception as e:
+            print(f"Error extracting netlist: {str(e)}")
+            if ctx:
+                ctx.info(f"Error extracting netlist: {str(e)}")
+            return {"success": False, "error": str(e)}
+
     @mcp.tool()
     async def extract_project_netlist(project_path: str, ctx: Context | None) -> Dict[str, Any]:
         """Extract netlist from a KiCad project's schematic.
@@ -62,7 +140,7 @@ def register_netlist_tools(mcp: FastMCP) -> None:
                 await ctx.report_progress(20, 100)
             
             # Call the schematic netlist extraction
-            result = await extract_schematic_netlist(schematic_path, ctx=ctx)
+            result = await extract_schematic_netlist(schematic_path, ctx)
             
             # Add project path to result
             if "success" in result and result["success"]:
@@ -77,78 +155,20 @@ def register_netlist_tools(mcp: FastMCP) -> None:
             return {"success": False, "error": str(e)}
 
     @mcp.tool()
-    async def extract_schematic_netlist(
-        schematic_path: str,
-        include_wire_topology: bool = False,
-        ctx: Context | None = None,
-    ) -> Dict[str, Any]:
-        """Extract component inventory, net analysis, and wire geometry() for a KiCad schematic.
-
-        A net is a named group of pins that are electrically connected by wires.
-        For example, if R1/pin2, C1/pin1, and a GND power symbol are all joined
-        by wires, they form one net named "GND".
-
-        Returns the full component list (with positions and pin coordinates), net
-        classification (power vs signal), component type counts, and simple issue
-        detection. Pin coordinates are included in the component list; net entries
-        contain only component references and pin numbers to avoid duplication.
-
-        Set ``include_wire_topology=True`` to also receive a top-level ``wires``
-        dict keyed by wire ID. Each wire entry includes its net name (``null``
-        if unconnected), start/end mm coordinates, and which component pins touch
-        each endpoint.
-
+    async def analyze_schematic_connections(schematic_path: str, ctx: Context | None) -> Dict[str, Any]:
+        """Analyze connections in a KiCad schematic.
+        
+        This tool provides detailed analysis of component connections,
+        including power nets, signal paths, and potential issues.
+        
         Args:
             schematic_path: Path to the KiCad schematic file (.kicad_sch)
-            include_wire_topology: When True, a top-level ``wires`` dict is
-                added to the analysis. Each wire carries its own ``net`` field
-                (the net name, or null if the wire is unconnected). Default True.
             ctx: MCP context for progress reporting
-
+            
         Returns:
-            Dictionary with the following structure on success:
-            {
-                "success": True,
-                "schematic_path": "<path>",
-                "analysis": {
-                    "component_count": <int>,
-                    "net_count": <int>,
-                    "component_types": {"R": 3, "C": 2, ...},
-                    "components": {
-                        "R1": {"value": "10k",
-                               "position": {"x": ..., "y": ...},
-                               "pins": [{"num": "1", "x": ..., "y": ..., "net": "GND"}, ...]},
-                        ...
-                    },
-                    "power_nets": [
-                        {
-                            "name": "GND",
-                            "pin_count": <int>
-                        },
-                        ...
-                    ],
-                    "signal_nets": [ <same structure as power_nets> ],
-                    "floating_nets": [
-                        {
-                            "net": "<net name>",
-                            "description": "<explanation>"
-                        }, ...
-                    ],
-                    # if include_wire_topology=True:
-                    "wires": {
-                        "0": {"net": "GND",
-                              "start": {"x": ..., "y": ..., "pins": [{"ref": "R1", "pin": "1"}]},
-                              "end":   {"x": ..., "y": ..., "pins": []}},
-                        "5": {"net": null,
-                              "start": {"x": ..., "y": ..., "pins": []},
-                              "end":   {"x": ..., "y": ..., "pins": []}},
-                        ...
-                    }
-                }
-            }
-            On failure: {"success": False, "error": "<error message>"}
+            Dictionary with connection analysis
         """
-        print(f"Extracting netlist from schematic: {schematic_path}")
+        print(f"Analyzing connections in schematic: {schematic_path}")
         
         if not os.path.exists(schematic_path):
             print(f"Schematic file not found: {schematic_path}")
@@ -178,104 +198,63 @@ def register_netlist_tools(mcp: FastMCP) -> None:
             if ctx:
                 ctx.info("Performing connection analysis...")
             
-            raw_components = netlist_data.get("components", {})
-
-            # Build pin→net lookup so each pin entry can carry its net name
-            _raw_nets = netlist_data.get("nets", {})
-            pin_to_net: Dict[tuple, str] = {}
-            for _net_name, _net_pins in _raw_nets.items():
-                for _p in _net_pins:
-                    pin_to_net[(_p.get("component", ""), str(_p.get("pin", "")))] = _net_name
-
-            components = {
-                ref: {
-                    "value": cdata.get("value", ""),
-                    "position": cdata.get("position", {}),
-                    "pins": [
-                        {**pinfo, "net": pin_to_net.get((ref, str(pinfo.get("num", ""))), None)}
-                        for pinfo in cdata.get("pins", [])
-                    ],
-                }
-                for ref, cdata in raw_components.items()
-            }
             analysis = {
                 "component_count": netlist_data["component_count"],
                 "net_count": netlist_data["net_count"],
                 "component_types": {},
-                "components": components,
                 "power_nets": [],
                 "signal_nets": [],
-                "floating_nets": []
+                "potential_issues": []
             }
             
             # Analyze component types
-            for ref in components:
+            components = netlist_data.get("components", {})
+            for ref, component in components.items():
+                # Extract component type from reference (e.g., R1 -> R)
+                import re
                 comp_type_match = re.match(r'^([A-Za-z_]+)', ref)
                 if comp_type_match:
                     comp_type = comp_type_match.group(1)
-                    analysis["component_types"][comp_type] = analysis["component_types"].get(comp_type, 0) + 1
+                    if comp_type not in analysis["component_types"]:
+                        analysis["component_types"][comp_type] = 0
+                    analysis["component_types"][comp_type] += 1
             
             if ctx:
                 await ctx.report_progress(60, 100)
-
-            # Classify nets and detect floating ones in a single pass
-            _POWER_PREFIXES = ("VCC", "VDD", "GND", "+5V", "+3V3", "+12V")
+            
+            # Identify power nets
             nets = netlist_data.get("nets", {})
             for net_name, pins in nets.items():
-                is_power = any(net_name.startswith(pfx) for pfx in _POWER_PREFIXES)
-                net_entry = {
-                    "name": net_name,
-                    "pin_count": len(pins),
-                }
-                if is_power:
-                    analysis["power_nets"].append(net_entry)
+                if any(net_name.startswith(prefix) for prefix in ["VCC", "VDD", "GND", "+5V", "+3V3", "+12V"]):
+                    analysis["power_nets"].append({
+                        "name": net_name,
+                        "pin_count": len(pins)
+                    })
                 else:
-                    analysis["signal_nets"].append(net_entry)
-                    if len(pins) <= 1:
-                        analysis["floating_nets"].append({
-                            "net": net_name,
-                            "description": f"Net '{net_name}' appears to be floating (only has {len(pins)} connection)"
-                        })
-
+                    analysis["signal_nets"].append({
+                        "name": net_name,
+                        "pin_count": len(pins)
+                    })
+            
             if ctx:
                 await ctx.report_progress(80, 100)
-
-            if include_wire_topology:
-                ROUND = 4
-
-                def rpt(x, y):
-                    return (round(float(x), ROUND), round(float(y), ROUND))
-
-                # Reuse the wire→net mapping already resolved by the parser
-                point_to_net = netlist_data.get("point_to_net", {})
-
-                # Build point → component-pins lookup from component pin world coords
-                from collections import defaultdict as _dd
-                pin_at: Dict[Any, list] = _dd(list)
-                for ref, cdata in components.items():
-                    for pinfo in cdata.get("pins", []):
-                        pin_at[rpt(pinfo["x"], pinfo["y"])].append(
-                            {"ref": ref, "pin": str(pinfo.get("num", ""))}
-                        )
-
-                # Build global wire registry
-                all_wires = netlist_data.get("wires", [])
-                wires: Dict[str, Any] = {}
-                for wire_id, wdata in enumerate(all_wires):
-                    sp = rpt(wdata["start"]["x"], wdata["start"]["y"])
-                    ep = rpt(wdata["end"]["x"],   wdata["end"]["y"])
-                    wnet = point_to_net.get(sp) or point_to_net.get(ep)
-                    wires[str(wire_id)] = {
-                        "net":   wnet,
-                        "start": {**wdata["start"], "pins": list(pin_at.get(sp, []))},
-                        "end":   {**wdata["end"],   "pins": list(pin_at.get(ep, []))},
-                    }
-
-                analysis["wires"] = wires
-
+            
+            # Check for potential issues
+            # 1. Nets with only one connection (floating)
+            for net_name, pins in nets.items():
+                if len(pins) <= 1 and not any(net_name.startswith(prefix) for prefix in ["VCC", "VDD", "GND", "+5V", "+3V3", "+12V"]):
+                    analysis["potential_issues"].append({
+                        "type": "floating_net",
+                        "net": net_name,
+                        "description": f"Net '{net_name}' appears to be floating (only has {len(pins)} connection)"
+                    })
+            
+            # 2. Power pins without connections
+            # This would require more detailed parsing of the schematic
+            
             if ctx:
                 await ctx.report_progress(90, 100)
-
+            
             # Build result
             result = {
                 "success": True,
@@ -286,14 +265,14 @@ def register_netlist_tools(mcp: FastMCP) -> None:
             # Complete progress
             if ctx:
                 await ctx.report_progress(100, 100)
-                ctx.info("Netlist extraction complete")
+                ctx.info("Connection analysis complete")
             
             return result
             
         except Exception as e:
-            print(f"Error extracting netlist: {str(e)}")
+            print(f"Error analyzing connections: {str(e)}")
             if ctx:
-                ctx.info(f"Error extracting netlist: {str(e)}")
+                ctx.info(f"Error analyzing connections: {str(e)}")
             return {"success": False, "error": str(e)}
 
     @mcp.tool()
