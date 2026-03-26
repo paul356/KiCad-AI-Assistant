@@ -396,20 +396,15 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
         end_y: float,
         add_junction_start: bool = False,
         add_junction_end: bool = False,
-        use_orthogonal_routing: bool = True,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Add a wire segment to a KiCad schematic between two coordinates.
 
-        Draws a wire from (start_x, start_y) to (end_x, end_y) using clean
-        orthogonal (horizontal-vertical) routing by default. Optionally places 
-        junction dots at either endpoint, which is required when the endpoint 
-        lands in the middle of an existing wire (T-junction). A backup 
+        Draws a wire from (start_x, start_y) to (end_x, end_y) using
+        orthogonal (horizontal-vertical) routing. Optionally places junction
+        dots at either endpoint, which is required when the endpoint lands in
+        the middle of an existing wire (T-junction). A backup
         (.kicad_sch.bak) is written before saving.
-
-        By default, wires are drawn in an L-shape (horizontal then vertical) for
-        better readability and cleaner schematics. If you prefer straight diagonal 
-        wires, set use_orthogonal_routing to False.
 
         Args:
             schematic_path: Absolute path to the target .kicad_sch file.
@@ -419,13 +414,10 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
             end_y: Y coordinate of the wire end point in mm.
             add_junction_start: Place a junction dot at the start point.
             add_junction_end: Place a junction dot at the end point.
-            use_orthogonal_routing: When True (default), draws orthogonal
-                (L-shaped) wires for cleaner routing. When False, draws
-                single straight diagonal wires.
 
         Returns:
             dict with keys: success (bool), wire (start/end coords),
-            junctions_added (list of coords), routing_type (str: "orthogonal" or "direct").
+            junctions_added (list of coords).
         """
         if not schematic_path.endswith(".kicad_sch"):
             return {"error": f"Not a .kicad_sch file: {schematic_path!r}"}
@@ -448,18 +440,8 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
         try:
             # Collect all pin positions to avoid routing wires through them
             obstacles = _collect_all_pin_positions(sch)
-
-            # Use orthogonal routing by default for cleaner wires
-            if use_orthogonal_routing:
-                _draw_orthogonal_wire(sch, start_x, start_y, end_x, end_y,
-                                      obstacle_pins=obstacles)
-                routing_type = "orthogonal"
-            else:
-                # Draw single straight wire (no obstacle avoidance)
-                w = sch.wire.new()
-                w.start_at([start_x, start_y])
-                w.end_at([end_x, end_y])
-                routing_type = "direct"
+            _draw_orthogonal_wire(sch, start_x, start_y, end_x, end_y,
+                                  obstacle_pins=obstacles)
 
             junctions_added = []
             if add_junction_start:
@@ -483,7 +465,6 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
                 "end": {"x": end_x, "y": end_y},
             },
             "junctions_added": junctions_added,
-            "routing_type": routing_type,
         }
 
     @mcp.tool()
@@ -493,21 +474,15 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
         from_pin: str,
         to_ref: str,
         to_pin: str,
-        add_junctions: bool = False,
-        use_orthogonal_routing: bool = True,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
-        """Connect two symbol pins with a wire, using clean orthogonal routing.
+        """Connect two symbol pins with a wire, using smart orthogonal routing.
 
         Resolves the absolute schematic coordinates of both pins automatically
         (accounting for each symbol's placement position and rotation), then
-        draws a wire between them using orthogonal (horizontal-vertical) routing
-        for a cleaner, more professional appearance. Optionally places junction 
-        dots at both endpoints. A backup (.kicad_sch.bak) is written before saving.
-
-        By default, wires are drawn in an L-shape (horizontal then vertical) for
-        better readability. If you prefer straight diagonal wires, set 
-        use_orthogonal_routing to False.
+        draws a wire between them using smart orthogonal routing that follows
+        pin exit directions and avoids other component pins. A backup
+        (.kicad_sch.bak) is written before saving.
 
         Args:
             schematic_path: Absolute path to the target .kicad_sch file.
@@ -515,14 +490,10 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
             from_pin: Pin number of the source pin (e.g. "1").
             to_ref: Reference designator of the destination symbol (e.g. "C1").
             to_pin: Pin number of the destination pin (e.g. "2").
-            add_junctions: Place junction dots at both wire endpoints.
-            use_orthogonal_routing: When True (default), draws orthogonal
-                (L-shaped) wires for cleaner routing. When False, draws
-                single straight diagonal wires.
 
         Returns:
             dict with keys: success (bool), wire (from/to with ref, pin, x, y),
-            junctions_added (bool), routing_type (str: "orthogonal" or "direct").
+            collision_free (bool).
         """
         if not schematic_path.endswith(".kicad_sch"):
             return {"error": f"Not a .kicad_sch file: {schematic_path!r}"}
@@ -558,27 +529,13 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
             )
 
             collision_free: bool | None = None
-            if use_orthogonal_routing:
-                # Smart routing: follow pin exit directions, avoid all other pins
-                collision_free = _draw_smart_wire(
-                    sch, start_x, start_y, end_x, end_y,
-                    start_angle=start_angle,
-                    end_angle=end_angle,
-                    obstacle_pins=obstacles,
-                )
-                routing_type = "smart_orthogonal"
-            else:
-                # Draw single straight wire (no obstacle avoidance)
-                w = sch.wire.new()
-                w.start_at([start_x, start_y])
-                w.end_at([end_x, end_y])
-                routing_type = "direct"
-
-            if add_junctions:
-                j = sch.junction.new()
-                j.at.value = [start_x, start_y]
-                j = sch.junction.new()
-                j.at.value = [end_x, end_y]
+            # Smart routing: follow pin exit directions, avoid all other pins
+            collision_free = _draw_smart_wire(
+                sch, start_x, start_y, end_x, end_y,
+                start_angle=start_angle,
+                end_angle=end_angle,
+                obstacle_pins=obstacles,
+            )
 
             shutil.copy(schematic_path, schematic_path + ".bak")
             sch.write(schematic_path)
@@ -591,8 +548,6 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
                 "from": {"ref": from_ref, "pin": from_pin, "x": start_x, "y": start_y},
                 "to": {"ref": to_ref, "pin": to_pin, "x": end_x, "y": end_y},
             },
-            "junctions_added": add_junctions,
-            "routing_type": routing_type,
         }
         if collision_free is not None:
             result["collision_free"] = collision_free
