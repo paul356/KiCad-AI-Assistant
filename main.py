@@ -19,7 +19,7 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - [PID:%(process)d] - %(message)s',
     handlers=[
         logging.FileHandler(log_file, mode='w'), # Use 'w' to overwrite log on each start
-        # logging.StreamHandler() # Optionally keep logging to console if needed
+        logging.StreamHandler() # Optionally keep logging to console if needed
     ]
 )
 # ---------------------

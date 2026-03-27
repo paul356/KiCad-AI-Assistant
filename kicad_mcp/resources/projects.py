@@ -2,7 +2,7 @@
 Project listing and information resources.
 """
 import os
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
 
 from kicad_mcp.utils.kicad_utils import find_kicad_projects
 from kicad_mcp.utils.file_utils import get_project_files, load_project_json

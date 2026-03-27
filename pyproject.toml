@@ -47,6 +47,8 @@ dependencies = [
     "pandas>=2.0.0",
     "pyyaml>=6.0.0",
     "defusedxml>=0.7.0",  # Secure XML parsing
+    "kicad-skip>=0.2.5",  # KiCad S-expression file parser (imports as `skip`)
+    "sqlalchemy>=2.0.0",  # Symbol database ORM
 ]
 
 [project.urls]

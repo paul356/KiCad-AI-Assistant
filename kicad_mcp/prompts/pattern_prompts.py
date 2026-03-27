@@ -1,7 +1,7 @@
 """
 Prompt templates for circuit pattern analysis in KiCad.
 """
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
 
 
 def register_pattern_prompts(mcp: FastMCP) -> None:

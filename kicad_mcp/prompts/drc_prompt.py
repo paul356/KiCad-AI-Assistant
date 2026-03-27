@@ -1,7 +1,7 @@
 """
 DRC prompt templates for KiCad PCB design.
 """
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
 
 
 def register_drc_prompts(mcp: FastMCP) -> None:

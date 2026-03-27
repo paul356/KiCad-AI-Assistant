@@ -1,7 +1,7 @@
 """
 BOM-related prompt templates for KiCad.
 """
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
 
 
 def register_bom_prompts(mcp: FastMCP) -> None:

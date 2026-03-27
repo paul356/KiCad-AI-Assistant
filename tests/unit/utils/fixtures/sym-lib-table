@@ -1,0 +1,4 @@
+(sym_lib_table
+  (lib (name "TestDevice")(type "KiCad")(uri "${KICAD_TEST_FIXTURES_DIR}/test_device.kicad_sym")(options "")(descr "Test discrete components"))
+  (lib (name "TestPower")(type "KiCad")(uri "${KICAD_TEST_FIXTURES_DIR}/test_power.kicad_sym")(options "")(descr "Test power symbols"))
+)

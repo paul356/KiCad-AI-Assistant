@@ -7,6 +7,7 @@ All settings are determined at import time based on the operating system.
 
 Module Variables:
     system (str): Operating system name from platform.system()
+    KICAD_VERSION (str): KiCad version string used to construct versioned paths
     KICAD_USER_DIR (str): User's KiCad documents directory
     KICAD_APP_PATH (str): KiCad application installation path
     ADDITIONAL_SEARCH_PATHS (List[str]): Additional project search locations
@@ -20,6 +21,7 @@ Module Variables:
     TIMEOUT_CONSTANTS (Dict[str, float]): Operation timeout values in seconds
     PROGRESS_CONSTANTS (Dict[str, int]): Progress reporting percentage values
     DISPLAY_CONSTANTS (Dict[str, int]): UI display configuration values
+    LibraryPathConfig: Configuration class for symbol library paths and settings
 
 Platform Support:
     - macOS (Darwin): Full support with application bundle paths
@@ -197,3 +199,97 @@ PROGRESS_CONSTANTS = {
 DISPLAY_CONSTANTS = {
     "bom_preview_limit": 20,  # Maximum number of BOM items to show in preview
 }
+
+# KiCad version string — fallback used when KICAD_VERSION env var is not set
+KICAD_VERSION = "9.0"
+
+class LibraryPathConfig:
+    """
+    KiCad symbol library path configuration.
+
+    Reads KICAD_VERSION and each path from the corresponding environment
+    variable; if a variable is absent the built-in default is used. The
+    resolved values are collected into ``self._env_vars`` so they can be
+    injected into subprocess environments that expand ``${VAR}`` URI
+    references.
+    """
+
+    @staticmethod
+    def _default_symbol_dir(kicad_app_path: str) -> str:
+        """Return the platform-specific default KiCad system symbols directory."""
+        if system == "Darwin":
+            return os.path.join(kicad_app_path, "Contents", "SharedSupport", "symbols")
+        elif system == "Windows":
+            return os.path.join(kicad_app_path, "share", "kicad", "symbols")
+        else:
+            return os.path.join(kicad_app_path, "symbols")
+
+    @staticmethod
+    def _default_config_dir(kicad_version: str) -> str:
+        """Return the platform-specific default KiCad configuration directory."""
+        if system == "Darwin":
+            return os.path.expanduser(f"~/Library/Preferences/kicad/{kicad_version}")
+        elif system == "Windows":
+            appdata = os.environ.get("APPDATA", os.path.expanduser("~"))
+            return os.path.join(appdata, "kicad", kicad_version)
+        else:
+            return os.path.expanduser(f"~/.config/kicad/{kicad_version}")
+
+    @staticmethod
+    def _default_3rd_party(kicad_version: str) -> str:
+        """Return the platform-specific default KiCad 3rd-party packages directory."""
+        if system == "Darwin":
+            return os.path.expanduser(f"~/Library/Application Support/kicad/{kicad_version}/3rdparty")
+        elif system == "Windows":
+            appdata = os.environ.get("APPDATA", os.path.expanduser("~"))
+            return os.path.join(appdata, "kicad", kicad_version, "3rdparty")
+        else:
+            return os.path.expanduser(f"~/.local/share/kicad/{kicad_version}/3rdparty")
+
+    @staticmethod
+    def _default_template_dir(kicad_app_path: str, kicad_version: str) -> str:
+        """Return the platform-specific default KiCad templates directory."""
+        if system == "Darwin":
+            return os.path.join(kicad_app_path, "Contents", "SharedSupport", "template")
+        elif system == "Windows":
+            return os.path.join(kicad_app_path, "share", "kicad", "template")
+        else:
+            return os.path.join(kicad_app_path, "template")
+
+    def __init__(self):
+        kicad_version = os.environ.get("KICAD_VERSION") or KICAD_VERSION
+        _ver_tag = kicad_version.split(".")[0]
+        kicad_app_path = os.environ.get("KICAD_APP_PATH") or KICAD_APP_PATH
+
+        self._kicad_config_dir = (
+            os.environ.get("KICAD_CONFIG_DIR")
+            or self._default_config_dir(kicad_version)
+        )
+        self._kicad_symbol_dir = (
+            os.environ.get("KICAD_SYMBOL_DIR")
+            or self._default_symbol_dir(kicad_app_path)
+        )
+        self._kicad_3rd_party = (
+            os.environ.get("KICAD_3RD_PARTY")
+            or self._default_3rd_party(kicad_version)
+        )
+        self._kicad_template_dir = (
+            os.environ.get("KICAD_TEMPLATE_DIR")
+            or self._default_template_dir(kicad_app_path, kicad_version)
+        )
+
+        # Env vars to inject into subprocesses that expand ${VAR} placeholders in library URIs
+        self._env_vars = {
+            f"KICAD{_ver_tag}_SYMBOL_DIR": self._kicad_symbol_dir,
+            f"KICAD{_ver_tag}_3RD_PARTY": self._kicad_3rd_party,
+            f"KICAD{_ver_tag}_TEMPLATE_DIR": self._kicad_template_dir
+        }
+
+    @property
+    def symbol_table_file(self) -> str:
+        """Path to the sym-lib-table file."""
+        return self._kicad_config_dir + "/sym-lib-table"
+
+    def get_env_vars(self):
+        """Get the complete environment variables dictionary."""
+        return self._env_vars.copy()

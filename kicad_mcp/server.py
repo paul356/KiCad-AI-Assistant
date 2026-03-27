@@ -26,6 +26,9 @@ from kicad_mcp.tools.drc_tools import register_drc_tools
 from kicad_mcp.tools.bom_tools import register_bom_tools
 from kicad_mcp.tools.netlist_tools import register_netlist_tools
 from kicad_mcp.tools.pattern_tools import register_pattern_tools
+from kicad_mcp.tools.symbol_tools import register_symbol_tools
+from kicad_mcp.tools.component_edit_tools import register_component_edit_tools
+from kicad_mcp.tools.wire_edit_tools import register_wire_edit_tools
 
 # Import prompt handlers
 from kicad_mcp.prompts.templates import register_prompts
@@ -153,6 +156,9 @@ def create_server() -> FastMCP:
     register_bom_tools(mcp)
     register_netlist_tools(mcp)
     register_pattern_tools(mcp)
+    register_symbol_tools(mcp)
+    register_component_edit_tools(mcp)
+    register_wire_edit_tools(mcp)
     
     # Register prompts
     logging.info(f"Registering prompts...")
@@ -216,9 +222,14 @@ def main() -> None:
     logging.info("Starting KiCad MCP server...")
     
     server = create_server()
+
+    # Read transport from environment variable; default to 'stdio'
+    # Supported values: 'stdio', 'streamable-http', 'sse'
+    transport = os.environ.get('MCP_TRANSPORT', 'stdio')
+    logging.info(f"Using transport: {transport}")
     
     try:
-        server.run()  # FastMCP manages its own event loop
+        server.run(transport=transport)  # FastMCP manages its own event loop
     except KeyboardInterrupt:
         logging.info("Server interrupted by user")
     except Exception as e:
