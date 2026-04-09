@@ -148,7 +148,7 @@ class TestAddSymbolToSchematic:
         assert os.path.exists(tmp_sch + ".bak")
 
     def test_grid_alignment(self, tools, tmp_sch):
-        """Coordinates should be aligned to the 0.5 mm grid in the response."""
+        """Coordinates should be aligned to the 1.27 mm (50 mil) grid in the response."""
         mgr = _make_mock_manager()
         with patch("kicad_mcp.tools.component_edit_tools._get_index_manager", return_value=mgr):
             result = asyncio.run(
@@ -156,15 +156,16 @@ class TestAddSymbolToSchematic:
                     schematic_path=tmp_sch,
                     library_name=_LIB_NAME,
                     symbol_name=_SYM_NAME,
-                    x=50.3,   # not on 0.5 grid
+                    x=50.3,   # not on 1.27 mm grid
                     y=49.7,
                 )
             )
         assert result.get("success") is True, result
         pos = result["position"]
-        # Must be a multiple of 0.5
-        assert abs(pos["x"] % 0.5) < 1e-9, pos
-        assert abs(pos["y"] % 0.5) < 1e-9, pos
+        grid = 1.27  # KiCad default schematic grid: 50 mils = 1.27 mm
+        # Must be a multiple of 1.27 mm
+        assert abs(pos["x"] / grid - round(pos["x"] / grid)) < 1e-6, pos
+        assert abs(pos["y"] / grid - round(pos["y"] / grid)) < 1e-6, pos
 
     def test_auto_increments_reference(self, tools, tmp_sch):
         """Successive add_symbol calls should yield distinct reference designators."""
