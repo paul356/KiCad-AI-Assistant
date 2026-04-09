@@ -683,3 +683,291 @@ class TestSetComponentProperty:
                             return
                 pytest.fail("Footprint property is not hidden after update")
         pytest.fail("R1 not found in written schematic")
+
+
+# ---------------------------------------------------------------------------
+# TestListComponentProperties
+# ---------------------------------------------------------------------------
+
+class TestListComponentProperties:
+
+    def test_returns_expected_properties(self, tools, tmp_sch):
+        """list_component_properties should return Reference, Value, etc. for R1."""
+        result = asyncio.run(
+            tools["list_component_properties"](
+                schematic_path=tmp_sch,
+                reference="R1",
+            )
+        )
+        assert result.get("success") is True, result
+        assert result["reference"] == "R1"
+        names = [p["name"] for p in result["properties"]]
+        assert "Reference" in names
+        assert "Value" in names
+
+    def test_returns_correct_values(self, tools, tmp_sch):
+        """The values returned should match what is in the fixture schematic."""
+        result = asyncio.run(
+            tools["list_component_properties"](
+                schematic_path=tmp_sch,
+                reference="R1",
+            )
+        )
+        assert result.get("success") is True, result
+        by_name = {p["name"]: p["value"] for p in result["properties"]}
+        assert by_name["Reference"] == "R1"
+        assert by_name["Value"] == "R_Small"
+
+    def test_reference_not_found_returns_error(self, tools, tmp_sch):
+        """An unknown reference should return an error dict."""
+        result = asyncio.run(
+            tools["list_component_properties"](
+                schematic_path=tmp_sch,
+                reference="Z99",
+            )
+        )
+        assert "error" in result
+
+    def test_empty_reference_returns_error(self, tools, tmp_sch):
+        """An empty reference string should be rejected."""
+        result = asyncio.run(
+            tools["list_component_properties"](
+                schematic_path=tmp_sch,
+                reference="",
+            )
+        )
+        assert "error" in result
+
+    def test_invalid_extension_returns_error(self, tools):
+        """A non-.kicad_sch path should be rejected immediately."""
+        result = asyncio.run(
+            tools["list_component_properties"](
+                schematic_path="/tmp/bogus.txt",
+                reference="R1",
+            )
+        )
+        assert "error" in result
+
+    def test_file_not_found_returns_error(self, tools):
+        """A path to a non-existent .kicad_sch file should return an error."""
+        result = asyncio.run(
+            tools["list_component_properties"](
+                schematic_path="/tmp/does_not_exist.kicad_sch",
+                reference="R1",
+            )
+        )
+        assert "error" in result
+
+    def test_does_not_create_backup(self, tools, tmp_sch):
+        """list_component_properties is read-only and must not write a backup."""
+        asyncio.run(
+            tools["list_component_properties"](
+                schematic_path=tmp_sch,
+                reference="R1",
+            )
+        )
+        assert not os.path.exists(tmp_sch + ".bak")
+
+    def test_round_trip_with_set_property(self, tools, tmp_sch):
+        """A property added via set_component_property should appear in the list."""
+        add_result = asyncio.run(
+            tools["set_component_property"](
+                schematic_path=tmp_sch,
+                reference="R1",
+                property_name="MPN",
+                property_value="RC0402FR-0710KL",
+            )
+        )
+        assert add_result.get("success") is True, f"Setup failed: {add_result}"
+        result = asyncio.run(
+            tools["list_component_properties"](
+                schematic_path=tmp_sch,
+                reference="R1",
+            )
+        )
+        assert result.get("success") is True, result
+        by_name = {p["name"]: p["value"] for p in result["properties"]}
+        assert "MPN" in by_name, f"MPN not found in properties: {list(by_name)}"
+        assert by_name["MPN"] == "RC0402FR-0710KL"
+
+
+# ---------------------------------------------------------------------------
+# TestDeleteComponentProperty
+# ---------------------------------------------------------------------------
+
+class TestDeleteComponentProperty:
+
+    def _add_custom_property(self, tools, tmp_sch, name="MPN", value="RC0402FR-0710KL"):
+        """Helper: add a custom property to R1 and return the result."""
+        return asyncio.run(
+            tools["set_component_property"](
+                schematic_path=tmp_sch,
+                reference="R1",
+                property_name=name,
+                property_value=value,
+            )
+        )
+
+    def test_delete_custom_property_succeeds(self, tools, tmp_sch):
+        """Deleting a custom property should return success."""
+        add_result = self._add_custom_property(tools, tmp_sch)
+        assert add_result.get("success") is True, f"Setup failed: {add_result}"
+        result = asyncio.run(
+            tools["delete_component_property"](
+                schematic_path=tmp_sch,
+                reference="R1",
+                property_name="MPN",
+            )
+        )
+        assert result.get("success") is True, result
+        assert result["units_updated"] == 1
+
+    def test_deleted_property_absent_on_reload(self, tools, tmp_sch):
+        """After deletion the property should not appear when reloading the file."""
+        add_result = self._add_custom_property(tools, tmp_sch)
+        assert add_result.get("success") is True, f"Setup failed: {add_result}"
+        asyncio.run(
+            tools["delete_component_property"](
+                schematic_path=tmp_sch,
+                reference="R1",
+                property_name="MPN",
+            )
+        )
+        sch = skip.Schematic(tmp_sch)
+        for sym in sch.symbol:
+            try:
+                if sym.property.Reference.value != "R1":
+                    continue
+            except AttributeError:
+                continue
+            names = []
+            try:
+                for prop in sym.property:
+                    try:
+                        names.append(prop.children[0])
+                    except (AttributeError, IndexError):
+                        pass
+            except AttributeError:
+                pass
+            assert "MPN" not in names, f"MPN still present after deletion: {names}"
+            return
+        pytest.fail("R1 not found in reloaded schematic")
+
+    def test_creates_backup(self, tools, tmp_sch):
+        """A .bak file should appear next to the schematic after deletion."""
+        add_result = self._add_custom_property(tools, tmp_sch)
+        assert add_result.get("success") is True, f"Setup failed: {add_result}"
+        asyncio.run(
+            tools["delete_component_property"](
+                schematic_path=tmp_sch,
+                reference="R1",
+                property_name="MPN",
+            )
+        )
+        assert os.path.exists(tmp_sch + ".bak")
+
+    def test_delete_reference_is_rejected(self, tools, tmp_sch):
+        """Attempting to delete the Reference property should return an error."""
+        result = asyncio.run(
+            tools["delete_component_property"](
+                schematic_path=tmp_sch,
+                reference="R1",
+                property_name="Reference",
+            )
+        )
+        assert "error" in result
+        # File must be unchanged — R1 reference must still exist.
+        sch = skip.Schematic(tmp_sch)
+        refs = [
+            sym.property.Reference.value
+            for sym in sch.symbol
+            if hasattr(sym, "property") and hasattr(sym.property, "Reference")
+        ]
+        assert "R1" in refs
+
+    def test_delete_value_is_rejected(self, tools, tmp_sch):
+        """Attempting to delete the Value property should return an error."""
+        result = asyncio.run(
+            tools["delete_component_property"](
+                schematic_path=tmp_sch,
+                reference="R1",
+                property_name="Value",
+            )
+        )
+        assert "error" in result
+        # File must be unchanged — Value must still exist on R1.
+        sch = skip.Schematic(tmp_sch)
+        for sym in sch.symbol:
+            try:
+                if sym.property.Reference.value == "R1":
+                    assert sym.property.Value.value == "R_Small"
+                    return
+            except AttributeError:
+                continue
+        pytest.fail("R1 not found after rejected delete")
+
+    def test_property_not_found_returns_error(self, tools, tmp_sch):
+        """Deleting a property that does not exist should return an error."""
+        result = asyncio.run(
+            tools["delete_component_property"](
+                schematic_path=tmp_sch,
+                reference="R1",
+                property_name="NonExistentProp",
+            )
+        )
+        assert "error" in result
+
+    def test_reference_not_found_returns_error(self, tools, tmp_sch):
+        """An unknown reference should return an error dict."""
+        result = asyncio.run(
+            tools["delete_component_property"](
+                schematic_path=tmp_sch,
+                reference="Z99",
+                property_name="MPN",
+            )
+        )
+        assert "error" in result
+
+    def test_empty_reference_returns_error(self, tools, tmp_sch):
+        """An empty reference string should be rejected."""
+        result = asyncio.run(
+            tools["delete_component_property"](
+                schematic_path=tmp_sch,
+                reference="",
+                property_name="MPN",
+            )
+        )
+        assert "error" in result
+
+    def test_empty_property_name_returns_error(self, tools, tmp_sch):
+        """An empty property_name should be rejected."""
+        result = asyncio.run(
+            tools["delete_component_property"](
+                schematic_path=tmp_sch,
+                reference="R1",
+                property_name="",
+            )
+        )
+        assert "error" in result
+
+    def test_file_not_found_returns_error(self, tools):
+        """A path to a non-existent .kicad_sch file should return an error."""
+        result = asyncio.run(
+            tools["delete_component_property"](
+                schematic_path="/tmp/does_not_exist.kicad_sch",
+                reference="R1",
+                property_name="MPN",
+            )
+        )
+        assert "error" in result
+
+    def test_invalid_extension_returns_error(self, tools):
+        """A non-.kicad_sch path should be rejected immediately."""
+        result = asyncio.run(
+            tools["delete_component_property"](
+                schematic_path="/tmp/bogus.txt",
+                reference="R1",
+                property_name="MPN",
+            )
+        )
+        assert "error" in result

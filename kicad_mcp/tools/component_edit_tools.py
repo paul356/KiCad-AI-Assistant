@@ -863,3 +863,170 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
         except Exception as exc:
             log.exception("Unexpected error in set_component_property")
             return {"error": str(exc), "success": False}
+
+    @mcp.tool()
+    async def list_component_properties(
+        schematic_path: str,
+        reference: str,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """List all properties of a placed schematic component.
+
+        Returns every ``(property ...)`` entry found on the first unit of the
+        component identified by *reference*.  All units of a multi-unit
+        symbol share the same property list, so reading from the first unit
+        is sufficient.
+
+        Args:
+            schematic_path: Absolute path to the target .kicad_sch file.
+            reference: Reference designator of the component to inspect
+                (e.g. "R1", "U3").
+
+        Returns:
+            dict with keys: success (bool), reference,
+            properties (list of {name (str), value (str)}).
+        """
+        if not schematic_path.endswith(".kicad_sch"):
+            return {"error": f"Not a .kicad_sch file: {schematic_path!r}"}
+        if not os.path.isfile(schematic_path):
+            return {"error": f"Schematic file not found: {schematic_path!r}"}
+        if not reference:
+            return {"error": "reference must not be empty"}
+
+        try:
+            sch = skip.Schematic(schematic_path)
+        except Exception as exc:
+            return {"error": f"Failed to open schematic: {exc}"}
+
+        try:
+            # Find the first unit with the given reference.
+            first_unit: Any | None = None
+            try:
+                for sym in sch.symbol:
+                    try:
+                        if sym.property.Reference.value == reference:
+                            first_unit = sym
+                            break
+                    except AttributeError:
+                        continue
+            except AttributeError:
+                pass
+
+            if first_unit is None:
+                return {"error": f"No symbol with reference {reference!r} found"}
+
+            properties: list[dict[str, str]] = []
+            try:
+                for prop in first_unit.property:
+                    try:
+                        name = prop.children[0]
+                        value = prop.value
+                        properties.append({"name": str(name), "value": str(value)})
+                    except (AttributeError, IndexError):
+                        continue
+            except AttributeError:
+                pass
+
+            return {
+                "success": True,
+                "reference": reference,
+                "properties": properties,
+            }
+
+        except Exception as exc:
+            log.exception("Unexpected error in list_component_properties")
+            return {"error": str(exc), "success": False}
+
+    @mcp.tool()
+    async def delete_component_property(
+        schematic_path: str,
+        reference: str,
+        property_name: str,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Delete a property from a placed schematic component.
+
+        Removes the named property from every unit that shares the given
+        reference designator.  ``Reference`` and ``Value`` are required KiCad
+        fields and cannot be deleted; attempting to do so returns an error
+        without modifying the file.  A backup (.kicad_sch.bak) is written
+        before saving.
+
+        Args:
+            schematic_path: Absolute path to the target .kicad_sch file.
+            reference: Reference designator of the component to modify
+                (e.g. "R1", "U3").
+            property_name: Name of the property to delete
+                (e.g. "MPN", "Manufacturer").  ``Reference`` and ``Value``
+                are protected and cannot be deleted.
+
+        Returns:
+            dict with keys: success (bool), reference, property_name,
+            units_updated (int).
+        """
+        if not schematic_path.endswith(".kicad_sch"):
+            return {"error": f"Not a .kicad_sch file: {schematic_path!r}"}
+        if not os.path.isfile(schematic_path):
+            return {"error": f"Schematic file not found: {schematic_path!r}"}
+        if not reference:
+            return {"error": "reference must not be empty"}
+        if not property_name:
+            return {"error": "property_name must not be empty"}
+        if property_name in ("Reference", "Value"):
+            return {
+                "error": (
+                    f"Property {property_name!r} is required by KiCad and cannot be deleted"
+                )
+            }
+
+        try:
+            sch = skip.Schematic(schematic_path)
+        except Exception as exc:
+            return {"error": f"Failed to open schematic: {exc}"}
+
+        try:
+            # Collect all units with the given reference.
+            units: list[Any] = []
+            try:
+                for sym in sch.symbol:
+                    try:
+                        if sym.property.Reference.value == reference:
+                            units.append(sym)
+                    except AttributeError:
+                        continue
+            except AttributeError:
+                pass
+
+            if not units:
+                return {"error": f"No symbol with reference {reference!r} found"}
+
+            updated_count = 0
+            for sym in units:
+                prop = _find_property_by_name(sym, property_name)
+                if prop is not None:
+                    prop._pv.delete()
+                    updated_count += 1
+
+            if updated_count == 0:
+                return {
+                    "error": (
+                        f"Property {property_name!r} not found on component {reference!r}"
+                    )
+                }
+
+            try:
+                shutil.copy(schematic_path, schematic_path + ".bak")
+                sch.write(schematic_path)
+            except Exception as exc:
+                return {"error": f"Failed to save schematic: {exc}"}
+
+            return {
+                "success": True,
+                "reference": reference,
+                "property_name": property_name,
+                "units_updated": updated_count,
+            }
+
+        except Exception as exc:
+            log.exception("Unexpected error in delete_component_property")
+            return {"error": str(exc), "success": False}
