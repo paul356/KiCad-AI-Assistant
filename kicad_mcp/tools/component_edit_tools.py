@@ -238,6 +238,12 @@ def _get_property_at(prop_raw: list) -> tuple[float, float, int]:
 _BASE_REF_OFFSET: tuple[float, float] = (2.54, -1.27)
 _BASE_VAL_OFFSET: tuple[float, float] = (2.54, 1.27)
 
+# Properties that are conventionally visible on the schematic canvas.
+# Footprint, Datasheet, Description, and all custom properties (MPN,
+# Manufacturer, LCSC, etc.) are hidden by KiCad convention on placed
+# symbols and should have (hide yes) injected when added as new properties.
+_STANDARD_VISIBLE_PROPERTIES: frozenset[str] = frozenset({"Reference", "Value"})
+
 
 def _rotate_offset(dx: float, dy: float, angle_deg: int) -> tuple[float, float]:
     """Rotate a 2-D offset by angle_deg degrees (CCW positive, KiCad convention)."""
@@ -400,6 +406,26 @@ def _build_placed_symbol(
     )
 
     return entry
+
+
+def _find_property_by_name(sym: Any, name: str) -> Any | None:
+    """Return the first property on *sym* whose raw name matches *name*.
+
+    Uses ``prop.children[0]`` (the original, un-sanitised name as it appears
+    in the S-expression) rather than skip's cleansed attribute key so that
+    names containing spaces, hyphens, etc. are matched correctly.
+    Returns ``None`` if no matching property exists.
+    """
+    try:
+        for prop in sym.property:
+            try:
+                if prop.children[0] == name:
+                    return prop
+            except (AttributeError, IndexError):
+                continue
+    except AttributeError:
+        pass
+    return None
 
 
 def _add_lib_symbol(lib_symbols_wrapper: Any, lib_sym_raw: list, table_name: str) -> None:
@@ -709,4 +735,131 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
 
         except Exception as exc:
             log.exception("Unexpected error in remove_symbol_from_schematic")
+            return {"error": str(exc), "success": False}
+
+    @mcp.tool()
+    async def set_component_property(
+        schematic_path: str,
+        reference: str,
+        property_name: str,
+        property_value: str,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Set or add a property on a placed schematic component.
+
+        If the property already exists on the component it is updated
+        in-place.  If it does not exist a new property is created by
+        cloning the existing ``Value`` property entry and renaming it.
+        The operation is applied to every unit that shares the given
+        reference designator.  A backup (.kicad_sch.bak) is written
+        before saving.
+
+        Args:
+            schematic_path: Absolute path to the target .kicad_sch file.
+            reference: Reference designator of the component to modify
+                (e.g. "R1", "U3").
+            property_name: Name of the property to set or create
+                (e.g. "Value", "Footprint", "MPN", "Manufacturer").
+            property_value: The new value string for the property.
+                An empty string is a valid value and is permitted.
+
+        Returns:
+            dict with keys: success (bool), reference, property_name,
+            property_value, units_updated (int), units_where_added (int),
+            units_where_updated (int), action ("updated", "added", or
+            "mixed" when some units already had the property and others
+            did not).
+        """
+        if not schematic_path.endswith(".kicad_sch"):
+            return {"error": f"Not a .kicad_sch file: {schematic_path!r}"}
+        if not os.path.isfile(schematic_path):
+            return {"error": f"Schematic file not found: {schematic_path!r}"}
+        if not reference:
+            return {"error": "reference must not be empty"}
+        if not property_name:
+            return {"error": "property_name must not be empty"}
+
+        try:
+            sch = skip.Schematic(schematic_path)
+        except Exception as exc:
+            return {"error": f"Failed to open schematic: {exc}"}
+
+        try:
+            # Collect all units with the given reference.
+            units: list[Any] = []
+            try:
+                for sym in sch.symbol:
+                    try:
+                        if sym.property.Reference.value == reference:
+                            units.append(sym)
+                    except AttributeError:
+                        continue
+            except AttributeError:
+                pass
+
+            if not units:
+                return {"error": f"No symbol with reference {reference!r} found"}
+
+            updated_count = 0
+            added_count = 0
+            for sym in units:
+                existing = _find_property_by_name(sym, property_name)
+                if existing is not None:
+                    existing.value = property_value
+                    updated_count += 1
+                else:
+                    # Clone the Value property to create a new entry with the
+                    # correct structure (at, effects), then rename and set it.
+                    try:
+                        new_prop = sym.property.Value.clone()
+                        new_prop.name = property_name
+                        new_prop.value = property_value
+                        # Non-standard properties are hidden by default in
+                        # KiCad (only Reference and Value are visible on the
+                        # canvas).  Inject (hide yes) into the effects node of
+                        # the cloned property when needed.
+                        if property_name not in _STANDARD_VISIBLE_PROPERTIES:
+                            raw_tree = new_prop._pv._tree
+                            for child in raw_tree:
+                                if (
+                                    isinstance(child, list)
+                                    and len(child) >= 1
+                                    and isinstance(child[0], sexpdata.Symbol)
+                                    and child[0].value() == "effects"
+                                ):
+                                    child.append(
+                                        [sexpdata.Symbol("hide"),
+                                         sexpdata.Symbol("yes")]
+                                    )
+                                    break
+                        added_count += 1
+                    except Exception as exc:
+                        return {"error": f"Failed to add property {property_name!r} on unit {sym.unit.value if hasattr(sym, 'unit') else '?'}: {exc}"}
+
+            if added_count > 0 and updated_count > 0:
+                action = "mixed"
+            elif added_count > 0:
+                action = "added"
+            else:
+                action = "updated"
+
+            try:
+                shutil.copy(schematic_path, schematic_path + ".bak")
+                sch.write(schematic_path)
+            except Exception as exc:
+                return {"error": f"Failed to save schematic: {exc}"}
+
+            return {
+                "success": True,
+                "reference": reference,
+                "property_name": property_name,
+                "property_value": property_value,
+                "units_updated": len(units),
+                "units_where_updated": updated_count,
+                "units_where_added": added_count,
+                "action": action,
+            }
+
+        except Exception as exc:
+            log.exception("Unexpected error in set_component_property")
             return {"error": str(exc), "success": False}

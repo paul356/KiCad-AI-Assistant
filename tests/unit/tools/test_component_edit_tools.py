@@ -341,3 +341,345 @@ class TestRemoveSymbolFromSchematic:
             )
         )
         assert "error" in result
+
+
+# ---------------------------------------------------------------------------
+# TestSetComponentProperty
+# ---------------------------------------------------------------------------
+
+class TestSetComponentProperty:
+
+    def test_update_existing_value(self, tools, tmp_sch):
+        """Updating the Value property of an existing component should succeed."""
+        result = asyncio.run(
+            tools["set_component_property"](
+                schematic_path=tmp_sch,
+                reference="R1",
+                property_name="Value",
+                property_value="999k",
+            )
+        )
+        assert result.get("success") is True, result
+        assert result["action"] == "updated"
+        assert result["units_where_updated"] == 1
+        assert result["units_where_added"] == 0
+
+    def test_update_persists_after_write(self, tools, tmp_sch):
+        """The updated Value should be readable from the written file."""
+        asyncio.run(
+            tools["set_component_property"](
+                schematic_path=tmp_sch,
+                reference="R1",
+                property_name="Value",
+                property_value="47k",
+            )
+        )
+        sch = skip.Schematic(tmp_sch)
+        for sym in sch.symbol:
+            try:
+                if sym.property.Reference.value == "R1":
+                    assert sym.property.Value.value == "47k"
+                    return
+            except AttributeError:
+                continue
+        pytest.fail("R1 not found in written schematic")
+
+    def test_add_new_property(self, tools, tmp_sch):
+        """Adding a new custom property (MPN) should report action=='added'."""
+        result = asyncio.run(
+            tools["set_component_property"](
+                schematic_path=tmp_sch,
+                reference="R1",
+                property_name="MPN",
+                property_value="RC0402FR-0710KL",
+            )
+        )
+        assert result.get("success") is True, result
+        assert result["action"] == "added"
+        assert result["units_where_added"] == 1
+        assert result["units_where_updated"] == 0
+
+    def test_new_property_persists_after_write(self, tools, tmp_sch):
+        """A newly added property should be readable from the written file."""
+        asyncio.run(
+            tools["set_component_property"](
+                schematic_path=tmp_sch,
+                reference="R1",
+                property_name="MPN",
+                property_value="RC0402FR-0710KL",
+            )
+        )
+        sch = skip.Schematic(tmp_sch)
+        for sym in sch.symbol:
+            try:
+                if sym.property.Reference.value == "R1":
+                    assert "MPN" in sym.property
+                    assert sym.property.MPN.value == "RC0402FR-0710KL"
+                    return
+            except AttributeError:
+                continue
+        pytest.fail("R1 not found in written schematic")
+
+    def test_new_property_is_hidden(self, tools, tmp_sch):
+        """Non-standard properties should have (hide yes) in their effects."""
+        import sexpdata
+        asyncio.run(
+            tools["set_component_property"](
+                schematic_path=tmp_sch,
+                reference="R1",
+                property_name="Manufacturer",
+                property_value="Yageo",
+            )
+        )
+        sch = skip.Schematic(tmp_sch)
+        for sym in sch.symbol:
+            try:
+                if sym.property.Reference.value != "R1":
+                    continue
+            except AttributeError:
+                continue
+            # Walk the raw tree to verify (hide yes) — both key AND value.
+            for prop in sym.property:
+                try:
+                    if prop.children[0] != "Manufacturer":
+                        continue
+                except (AttributeError, IndexError):
+                    continue
+                raw_tree = prop._pv._tree
+                for child in raw_tree:
+                    if (
+                        isinstance(child, list)
+                        and len(child) >= 1
+                        and isinstance(child[0], sexpdata.Symbol)
+                        and child[0].value() == "effects"
+                    ):
+                        hide_yes_found = any(
+                            isinstance(c, list)
+                            and len(c) >= 2
+                            and isinstance(c[0], sexpdata.Symbol)
+                            and c[0].value() == "hide"
+                            and isinstance(c[1], sexpdata.Symbol)
+                            and c[1].value() == "yes"
+                            for c in child
+                        )
+                        assert hide_yes_found, (
+                            "Expected (hide yes) in effects of new property, "
+                            f"got effects: {child}"
+                        )
+                        return
+                pytest.fail("No effects node found on Manufacturer property")
+        pytest.fail("R1 not found in written schematic")
+
+    def test_creates_backup(self, tools, tmp_sch):
+        """A .bak file should appear next to the schematic after editing."""
+        asyncio.run(
+            tools["set_component_property"](
+                schematic_path=tmp_sch,
+                reference="R1",
+                property_name="Value",
+                property_value="1k",
+            )
+        )
+        assert os.path.exists(tmp_sch + ".bak")
+
+    def test_reference_not_found_returns_error(self, tools, tmp_sch):
+        """An unknown reference should return an error dict."""
+        result = asyncio.run(
+            tools["set_component_property"](
+                schematic_path=tmp_sch,
+                reference="Z99",
+                property_name="Value",
+                property_value="1k",
+            )
+        )
+        assert "error" in result
+
+    def test_empty_reference_returns_error(self, tools, tmp_sch):
+        """An empty reference string should be rejected."""
+        result = asyncio.run(
+            tools["set_component_property"](
+                schematic_path=tmp_sch,
+                reference="",
+                property_name="Value",
+                property_value="1k",
+            )
+        )
+        assert "error" in result
+
+    def test_empty_property_name_returns_error(self, tools, tmp_sch):
+        """An empty property_name should be rejected."""
+        result = asyncio.run(
+            tools["set_component_property"](
+                schematic_path=tmp_sch,
+                reference="R1",
+                property_name="",
+                property_value="1k",
+            )
+        )
+        assert "error" in result
+
+    def test_invalid_extension_returns_error(self, tools):
+        """A non-.kicad_sch path should be rejected immediately."""
+        result = asyncio.run(
+            tools["set_component_property"](
+                schematic_path="/tmp/bogus.txt",
+                reference="R1",
+                property_name="Value",
+                property_value="1k",
+            )
+        )
+        assert "error" in result
+
+    def test_update_is_idempotent(self, tools, tmp_sch):
+        """Calling set_component_property twice should not duplicate properties."""
+        asyncio.run(
+            tools["set_component_property"](
+                schematic_path=tmp_sch,
+                reference="R1",
+                property_name="MPN",
+                property_value="RC0402FR-0710KL",
+            )
+        )
+        result2 = asyncio.run(
+            tools["set_component_property"](
+                schematic_path=tmp_sch,
+                reference="R1",
+                property_name="MPN",
+                property_value="RC0402FR-0710KL",
+            )
+        )
+        # Second call should update (not add) the existing property.
+        assert result2.get("success") is True, result2
+        assert result2["action"] == "updated", (
+            f"Second call should be 'updated', got {result2['action']!r}"
+        )
+        # Reload from disk: exactly one MPN property should exist.
+        sch = skip.Schematic(tmp_sch)
+        for sym in sch.symbol:
+            try:
+                if sym.property.Reference.value != "R1":
+                    continue
+            except AttributeError:
+                continue
+            mpn_count = sum(
+                1 for p in sym.property
+                if getattr(p, "children", [None])[0] == "MPN"
+            )
+            assert mpn_count == 1, f"Expected 1 MPN property, found {mpn_count}"
+            assert sym.property.MPN.value == "RC0402FR-0710KL"
+            return
+        pytest.fail("R1 not found in written schematic")
+
+    def test_units_updated_count(self, tools, tmp_sch):
+        """units_updated should equal the number of units with the reference."""
+        result = asyncio.run(
+            tools["set_component_property"](
+                schematic_path=tmp_sch,
+                reference="R1",
+                property_name="Value",
+                property_value="2k2",
+            )
+        )
+        assert result.get("success") is True, result
+        # tools_test.kicad_sch has single-unit symbols; R1 has 1 unit.
+        assert result["units_updated"] == 1
+
+    def test_empty_property_value_accepted(self, tools, tmp_sch):
+        """An empty property_value is valid and should be persisted."""
+        result = asyncio.run(
+            tools["set_component_property"](
+                schematic_path=tmp_sch,
+                reference="R1",
+                property_name="Value",
+                property_value="",
+            )
+        )
+        assert result.get("success") is True, result
+        sch = skip.Schematic(tmp_sch)
+        for sym in sch.symbol:
+            try:
+                if sym.property.Reference.value == "R1":
+                    assert sym.property.Value.value == ""
+                    return
+            except AttributeError:
+                continue
+        pytest.fail("R1 not found in written schematic")
+
+    def test_file_not_found_returns_error(self, tools):
+        """A path to a non-existent .kicad_sch file should return an error."""
+        result = asyncio.run(
+            tools["set_component_property"](
+                schematic_path="/tmp/does_not_exist.kicad_sch",
+                reference="R1",
+                property_name="Value",
+                property_value="1k",
+            )
+        )
+        assert "error" in result
+
+    def test_footprint_update_is_hidden(self, tools, tmp_sch):
+        """When adding a new Footprint property, it should be hidden per KiCad convention."""
+        import sexpdata
+        # Use a reference whose Footprint property is absent in the fixture.
+        # Add a fresh symbol first (R8 doesn't exist), then set its Footprint.
+        # Alternatively, confirm an existing component's Footprint value can be
+        # updated and its hidden state is preserved from the original.
+        result = asyncio.run(
+            tools["set_component_property"](
+                schematic_path=tmp_sch,
+                reference="R1",
+                property_name="Footprint",
+                property_value="R_0402",
+            )
+        )
+        assert result.get("success") is True, result
+        # Footprint already exists on placed symbols; updating preserves its
+        # existing hide state (which is hide=yes per KiCad convention).
+        sch = skip.Schematic(tmp_sch)
+        for sym in sch.symbol:
+            try:
+                if sym.property.Reference.value != "R1":
+                    continue
+            except AttributeError:
+                continue
+            for prop in sym.property:
+                try:
+                    if prop.children[0] != "Footprint":
+                        continue
+                except (AttributeError, IndexError):
+                    continue
+                assert prop.value == "R_0402", f"Unexpected Footprint value: {prop.value}"
+                # Confirm the property is still hidden in the written file.
+                raw_tree = prop._pv._tree
+                for child in raw_tree:
+                    if (
+                        isinstance(child, list)
+                        and len(child) >= 1
+                        and isinstance(child[0], sexpdata.Symbol)
+                        and child[0].value() == "hide"
+                        and len(child) >= 2
+                        and isinstance(child[1], sexpdata.Symbol)
+                        and child[1].value() == "yes"
+                    ):
+                        return  # hide=yes confirmed
+                # Also check inside (effects ...) for KiCad10 format
+                for child in raw_tree:
+                    if (
+                        isinstance(child, list)
+                        and len(child) >= 1
+                        and isinstance(child[0], sexpdata.Symbol)
+                        and child[0].value() == "effects"
+                    ):
+                        hide_yes = any(
+                            isinstance(c, list)
+                            and len(c) >= 2
+                            and isinstance(c[0], sexpdata.Symbol)
+                            and c[0].value() == "hide"
+                            and isinstance(c[1], sexpdata.Symbol)
+                            and c[1].value() == "yes"
+                            for c in child
+                        )
+                        if hide_yes:
+                            return
+                pytest.fail("Footprint property is not hidden after update")
+        pytest.fail("R1 not found in written schematic")
