@@ -27,7 +27,7 @@ import skip
 # ---------------------------------------------------------------------------
 
 SCHEMATIC_PATH = str(
-    Path(__file__).parent / "tools_test.kicad_sch"
+    Path(__file__).parent / "fixtures" / "tools_test.kicad_sch"
 )
 
 

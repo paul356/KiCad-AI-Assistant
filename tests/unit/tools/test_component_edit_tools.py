@@ -975,15 +975,15 @@ class TestDeleteComponentProperty:
 
 
 # ---------------------------------------------------------------------------
-# TestRotateComponent
+# TestMoveComponent
 # ---------------------------------------------------------------------------
 
-class TestRotateComponent:
+class TestMoveComponent:
 
-    def test_rotate_happy_path(self, tools, tmp_sch):
-        """rotate_component should return success with the requested rotation."""
+    def test_rotate_only_happy_path(self, tools, tmp_sch):
+        """move_component with only rotation should succeed."""
         result = asyncio.run(
-            tools["rotate_component"](
+            tools["move_component"](
                 schematic_path=tmp_sch,
                 reference="R1",
                 rotation=90,
@@ -992,11 +992,12 @@ class TestRotateComponent:
         assert result.get("success") is True, result
         assert result["rotation"] == 90
         assert result["units_updated"] >= 1
+        assert "position" in result
 
     def test_rotate_persists(self, tools, tmp_sch):
         """The new rotation should be readable from the written file."""
         asyncio.run(
-            tools["rotate_component"](
+            tools["move_component"](
                 schematic_path=tmp_sch,
                 reference="R1",
                 rotation=180,
@@ -1014,7 +1015,6 @@ class TestRotateComponent:
 
     def test_rotate_position_preserved(self, tools, tmp_sch):
         """x/y coordinates must not change when only the rotation is updated."""
-        # Read original position from fixture before rotating.
         sch_orig = skip.Schematic(tmp_sch)
         orig_x = orig_y = None
         for sym in sch_orig.symbol:
@@ -1027,7 +1027,7 @@ class TestRotateComponent:
         assert orig_x is not None, "R1 not found in fixture"
 
         asyncio.run(
-            tools["rotate_component"](
+            tools["move_component"](
                 schematic_path=tmp_sch,
                 reference="R1",
                 rotation=270,
@@ -1044,10 +1044,75 @@ class TestRotateComponent:
                 continue
         pytest.fail("R1 not found in written schematic")
 
-    def test_rotate_creates_backup(self, tools, tmp_sch):
-        """A .bak file should appear next to the schematic after rotating."""
+    def test_move_xy_only(self, tools, tmp_sch):
+        """move_component with only x/y should update position but not rotation."""
+        sch_orig = skip.Schematic(tmp_sch)
+        orig_rot = None
+        for sym in sch_orig.symbol:
+            try:
+                if sym.property.Reference.value == "R1":
+                    orig_rot = sym.at.value[2] if len(sym.at.value) > 2 else 0
+                    break
+            except AttributeError:
+                continue
+
+        result = asyncio.run(
+            tools["move_component"](
+                schematic_path=tmp_sch,
+                reference="R1",
+                x=55.0,
+                y=66.0,
+            )
+        )
+        assert result.get("success") is True, result
+        assert abs(result["position"]["x"] - 55.0) < 0.001
+        assert abs(result["position"]["y"] - 66.0) < 0.001
+
+        sch = skip.Schematic(tmp_sch)
+        for sym in sch.symbol:
+            try:
+                if sym.property.Reference.value == "R1":
+                    assert abs(sym.at.value[0] - 55.0) < 0.001, "x not updated"
+                    assert abs(sym.at.value[1] - 66.0) < 0.001, "y not updated"
+                    if orig_rot is not None:
+                        assert sym.at.value[2] == orig_rot, "rotation should not change"
+                    return
+            except AttributeError:
+                continue
+        pytest.fail("R1 not found in written schematic")
+
+    def test_move_xy_and_rotation(self, tools, tmp_sch):
+        """move_component with x, y, and rotation should update all three."""
+        result = asyncio.run(
+            tools["move_component"](
+                schematic_path=tmp_sch,
+                reference="R1",
+                x=77.0,
+                y=88.0,
+                rotation=180,
+            )
+        )
+        assert result.get("success") is True, result
+        assert abs(result["position"]["x"] - 77.0) < 0.001
+        assert abs(result["position"]["y"] - 88.0) < 0.001
+        assert result["rotation"] == 180
+
+        sch = skip.Schematic(tmp_sch)
+        for sym in sch.symbol:
+            try:
+                if sym.property.Reference.value == "R1":
+                    assert abs(sym.at.value[0] - 77.0) < 0.001
+                    assert abs(sym.at.value[1] - 88.0) < 0.001
+                    assert sym.at.value[2] == 180
+                    return
+            except AttributeError:
+                continue
+        pytest.fail("R1 not found in written schematic")
+
+    def test_move_creates_backup(self, tools, tmp_sch):
+        """A .bak file should appear next to the schematic after moving."""
         asyncio.run(
-            tools["rotate_component"](
+            tools["move_component"](
                 schematic_path=tmp_sch,
                 reference="R1",
                 rotation=90,
@@ -1055,12 +1120,10 @@ class TestRotateComponent:
         )
         assert os.path.exists(tmp_sch + ".bak")
 
-    def test_rotate_fields_autoplaced(self, tools, tmp_sch):
-        """After rotating a component that has NO pre-existing fields_autoplaced,
-        the node should be present in the written file."""
+    def test_fields_autoplaced_added(self, tools, tmp_sch):
+        """fields_autoplaced must appear in the S-expression after move_component."""
         import sexpdata
 
-        # Pre-verify: R2 must NOT have fields_autoplaced in the fixture.
         sch_before = skip.Schematic(tmp_sch)
         r2_sym_before = None
         for sym in sch_before.symbol:
@@ -1084,7 +1147,7 @@ class TestRotateComponent:
         )
 
         result = asyncio.run(
-            tools["rotate_component"](
+            tools["move_component"](
                 schematic_path=tmp_sch,
                 reference="R2",
                 rotation=90,
@@ -1092,7 +1155,6 @@ class TestRotateComponent:
         )
         assert result.get("success") is True, result
 
-        # Post-verify: fields_autoplaced must now be present and rotation applied.
         sch_after = skip.Schematic(tmp_sch)
         for sym in sch_after.symbol:
             try:
@@ -1105,13 +1167,13 @@ class TestRotateComponent:
                         and child[0].value() == "fields_autoplaced"
                         for child in raw_after
                     )
-                    assert fa_present, "fields_autoplaced node not found in R2 after rotate"
+                    assert fa_present, "fields_autoplaced node not found in R2 after move"
                     return
             except AttributeError:
                 continue
         pytest.fail("R2 not found in written schematic")
 
-    def test_rotate_fields_autoplaced_insert_ordering(self, tools, tmp_sch):
+    def test_fields_autoplaced_insert_ordering(self, tools, tmp_sch):
         """When fields_autoplaced is inserted it must appear BEFORE the uuid node."""
         import sexpdata
 
@@ -1124,7 +1186,7 @@ class TestRotateComponent:
             return -1
 
         asyncio.run(
-            tools["rotate_component"](
+            tools["move_component"](
                 schematic_path=tmp_sch,
                 reference="R2",
                 rotation=90,
@@ -1138,8 +1200,8 @@ class TestRotateComponent:
                     raw_tree = sym._pv._tree
                     fa_idx = _find_tag_idx(raw_tree, "fields_autoplaced")
                     uuid_idx = _find_tag_idx(raw_tree, "uuid")
-                    assert fa_idx != -1, "fields_autoplaced node missing after rotate"
-                    assert uuid_idx != -1, "uuid node missing after rotate"
+                    assert fa_idx != -1, "fields_autoplaced node missing after move"
+                    assert uuid_idx != -1, "uuid node missing after move"
                     assert fa_idx < uuid_idx, (
                         f"fields_autoplaced (idx={fa_idx}) must precede "
                         f"uuid (idx={uuid_idx})"
@@ -1149,10 +1211,20 @@ class TestRotateComponent:
                 continue
         pytest.fail("R2 not found in written schematic")
 
-    def test_rotate_invalid_rotation(self, tools, tmp_sch):
+    def test_no_args_returns_error(self, tools, tmp_sch):
+        """Calling with no x/y/rotation should return an error."""
+        result = asyncio.run(
+            tools["move_component"](
+                schematic_path=tmp_sch,
+                reference="R1",
+            )
+        )
+        assert "error" in result
+
+    def test_invalid_rotation(self, tools, tmp_sch):
         """rotation=45 is not valid; should return an error dict."""
         result = asyncio.run(
-            tools["rotate_component"](
+            tools["move_component"](
                 schematic_path=tmp_sch,
                 reference="R1",
                 rotation=45,
@@ -1160,10 +1232,22 @@ class TestRotateComponent:
         )
         assert "error" in result
 
-    def test_rotate_reference_not_found(self, tools, tmp_sch):
+    def test_non_finite_x(self, tools, tmp_sch):
+        """Non-finite x coordinate should be rejected."""
+        import math as _math
+        result = asyncio.run(
+            tools["move_component"](
+                schematic_path=tmp_sch,
+                reference="R1",
+                x=_math.inf,
+            )
+        )
+        assert "error" in result
+
+    def test_reference_not_found(self, tools, tmp_sch):
         """A non-existent reference should return an error dict."""
         result = asyncio.run(
-            tools["rotate_component"](
+            tools["move_component"](
                 schematic_path=tmp_sch,
                 reference="ZZZNOTEXIST",
                 rotation=90,
@@ -1171,10 +1255,10 @@ class TestRotateComponent:
         )
         assert "error" in result
 
-    def test_rotate_empty_reference(self, tools, tmp_sch):
+    def test_empty_reference(self, tools, tmp_sch):
         """An empty reference string should be rejected."""
         result = asyncio.run(
-            tools["rotate_component"](
+            tools["move_component"](
                 schematic_path=tmp_sch,
                 reference="",
                 rotation=90,
@@ -1182,10 +1266,10 @@ class TestRotateComponent:
         )
         assert "error" in result
 
-    def test_rotate_bad_extension(self, tools):
+    def test_bad_extension(self, tools):
         """A non-.kicad_sch path should be rejected immediately."""
         result = asyncio.run(
-            tools["rotate_component"](
+            tools["move_component"](
                 schematic_path="/tmp/bogus.txt",
                 reference="R1",
                 rotation=90,
@@ -1193,10 +1277,10 @@ class TestRotateComponent:
         )
         assert "error" in result
 
-    def test_rotate_file_not_found(self, tools):
+    def test_file_not_found(self, tools):
         """A non-existent .kicad_sch path should return an error."""
         result = asyncio.run(
-            tools["rotate_component"](
+            tools["move_component"](
                 schematic_path="/tmp/does_not_exist.kicad_sch",
                 reference="R1",
                 rotation=90,

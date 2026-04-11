@@ -126,7 +126,7 @@ class SchematicParser:
                 comp['position'] = {
                     'x': float(at_val[0]),
                     'y': float(at_val[1]),
-                    'angle': float(at_val[2]) if len(at_val) > 2 else 0.0,
+                    'rotation': float(at_val[2]) if len(at_val) > 2 else 0.0,
                 }
             except (AttributeError, IndexError, TypeError):
                 pass

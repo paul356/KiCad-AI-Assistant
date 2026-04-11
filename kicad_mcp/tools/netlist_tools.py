@@ -116,7 +116,7 @@ def register_netlist_tools(mcp: FastMCP) -> None:
                     "component_types": {"R": 3, "C": 2, ...},
                     "components": {
                         "R1": {"value": "10k",
-                               "position": {"x": ..., "y": ...},
+                               "position": {"x": ..., "y": ..., "rotation": ...},
                                "pins": [{"num": "1", "x": ..., "y": ..., "net": "GND"}, ...]},
                         ...
                     },

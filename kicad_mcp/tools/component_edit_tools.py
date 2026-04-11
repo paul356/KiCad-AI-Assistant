@@ -1032,34 +1032,30 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
             return {"error": str(exc), "success": False}
 
     @mcp.tool()
-    async def rotate_component(
+    async def move_component(
         schematic_path: str,
         reference: str,
-        rotation: int,
+        x: float | None = None,
+        y: float | None = None,
+        rotation: int | None = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
-        """Set the placement rotation of a schematic component.
+        """Move and/or rotate a component in a schematic.
 
-        Updates ``(at x y rotation)`` for every unit with the given reference
-        designator.  The rotation is an absolute value (not a delta), so
-        passing ``rotation=90`` always results in a 90° placement regardless
-        of the current rotation.
-
-        Field label positions (Reference, Value) stored on the placed symbol
-        become stale when the symbol body rotates.  This tool marks each
-        updated unit ``(fields_autoplaced yes)`` so that KiCad automatically
-        repositions the labels the next time the schematic is opened.
-
-        A backup (.kicad_sch.bak) is written before saving.
+        At least one of x, y, rotation must be provided; omitted values are
+        left unchanged. Rotation is absolute (0/90/180/270°). A backup is
+        written before saving.
 
         Args:
-            schematic_path: Absolute path to the target .kicad_sch file.
-            reference: Reference designator of the component (e.g. "R1", "U3").
-            rotation: New rotation in degrees; must be 0, 90, 180, or 270.
+            schematic_path: Path to the .kicad_sch file.
+            reference: Reference designator (e.g. "R1").
+            x: New X coordinate in mm.
+            y: New Y coordinate in mm.
+            rotation: New absolute rotation in degrees (0, 90, 180, or 270).
 
         Returns:
-            dict with keys: success (bool), reference, rotation,
-            units_updated (int).
+            dict with keys: success, reference, position ({x, y}), rotation,
+            units_updated.
         """
         if not schematic_path.endswith(".kicad_sch"):
             return {"error": f"Not a .kicad_sch file: {schematic_path!r}"}
@@ -1067,7 +1063,13 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
             return {"error": f"Schematic file not found: {schematic_path!r}"}
         if not reference:
             return {"error": "reference must not be empty"}
-        if rotation not in (0, 90, 180, 270):
+        if x is None and y is None and rotation is None:
+            return {"error": "At least one of x, y, or rotation must be provided"}
+        if x is not None and not math.isfinite(x):
+            return {"error": f"x must be a finite number (got {x!r})"}
+        if y is not None and not math.isfinite(y):
+            return {"error": f"y must be a finite number (got {y!r})"}
+        if rotation is not None and rotation not in (0, 90, 180, 270):
             return {"error": f"rotation must be 0, 90, 180, or 270 (got {rotation!r})"}
 
         try:
@@ -1092,7 +1094,10 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
 
             for sym in units:
                 at = sym.at.value
-                sym.at.value = [at[0], at[1], rotation]
+                new_x = x if x is not None else at[0]
+                new_y = y if y is not None else at[1]
+                new_rot = rotation if rotation is not None else (at[2] if len(at) > 2 else 0)
+                sym.at.value = [new_x, new_y, new_rot]
                 # Mark fields_autoplaced so KiCad repositions the Reference/
                 # Value labels on next open (they would otherwise be stale).
                 try:
@@ -1124,7 +1129,7 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
                         )
                         raw_tree.insert(uuid_idx, fa_node)
                 except Exception:
-                    pass  # non-critical; rotation still applied
+                    pass  # non-critical; position/rotation still applied
 
             try:
                 shutil.copy(schematic_path, schematic_path + ".bak")
@@ -1132,13 +1137,16 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
             except Exception as exc:
                 return {"error": f"Failed to save schematic: {exc}"}
 
+            # Read back final position from the first unit
+            final_at = units[0].at.value
             return {
                 "success": True,
                 "reference": reference,
-                "rotation": rotation,
+                "position": {"x": final_at[0], "y": final_at[1]},
+                "rotation": final_at[2] if len(final_at) > 2 else 0,
                 "units_updated": len(units),
             }
 
         except Exception as exc:
-            log.exception("Unexpected error in rotate_component")
+            log.exception("Unexpected error in move_component")
             return {"error": str(exc), "success": False}

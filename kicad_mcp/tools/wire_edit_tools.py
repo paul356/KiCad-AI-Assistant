@@ -474,6 +474,7 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
         from_pin: str,
         to_ref: str,
         to_pin: str,
+        add_junctions: bool = False,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Connect two symbol pins with a wire, using smart orthogonal routing.
@@ -490,10 +491,11 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
             from_pin: Pin number of the source pin (e.g. "1").
             to_ref: Reference designator of the destination symbol (e.g. "C1").
             to_pin: Pin number of the destination pin (e.g. "2").
+            add_junctions: When True, place junction dots at both pin endpoints.
 
         Returns:
             dict with keys: success (bool), wire (from/to with ref, pin, x, y),
-            collision_free (bool).
+            collision_free (bool), junctions_added (bool, only when add_junctions=True).
         """
         if not schematic_path.endswith(".kicad_sch"):
             return {"error": f"Not a .kicad_sch file: {schematic_path!r}"}
@@ -537,6 +539,11 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
                 obstacle_pins=obstacles,
             )
 
+            if add_junctions:
+                for jx, jy in [(start_x, start_y), (end_x, end_y)]:
+                    j = sch.junction.new()
+                    j.at.value = [jx, jy]
+
             shutil.copy(schematic_path, schematic_path + ".bak")
             sch.write(schematic_path)
         except Exception as exc:
@@ -551,6 +558,8 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
         }
         if collision_free is not None:
             result["collision_free"] = collision_free
+        if add_junctions:
+            result["junctions_added"] = True
         return result
 
 
@@ -640,6 +649,46 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
             return {"error": f"Failed to delete wire: {exc}"}
 
         return {"success": True, "deleted_count": len(to_delete)}
+
+    @mcp.tool()
+    async def list_wires_in_schematic(
+        schematic_path: str,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """List all wire segments present in a KiCad schematic.
+
+        Returns every wire's start and end coordinates (in mm).  Use the
+        returned coordinates with delete_wire_from_schematic to remove a
+        specific wire.
+
+        Args:
+            schematic_path: Absolute path to the target .kicad_sch file.
+
+        Returns:
+            dict with keys: success (bool), wires (list of
+            {start: {x, y}, end: {x, y}} dicts), count (int).
+        """
+        if not schematic_path.endswith(".kicad_sch"):
+            return {"error": f"Not a .kicad_sch file: {schematic_path!r}"}
+        if not os.path.isfile(schematic_path):
+            return {"error": f"Schematic file not found: {schematic_path!r}"}
+
+        try:
+            sch = skip.Schematic(schematic_path)
+        except Exception as exc:
+            return {"error": f"Failed to open schematic: {exc}"}
+
+        wires = []
+        try:
+            for w in sch.wire:
+                wires.append({
+                    "start": {"x": float(w.start.value[0]), "y": float(w.start.value[1])},
+                    "end":   {"x": float(w.end.value[0]),   "y": float(w.end.value[1])},
+                })
+        except AttributeError:
+            pass  # no wires in schematic
+
+        return {"success": True, "wires": wires, "count": len(wires)}
 
     @mcp.tool()
     async def add_junction_to_schematic(
