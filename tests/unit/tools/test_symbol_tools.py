@@ -6,12 +6,14 @@ are fully self-contained and do not require a real KiCad installation.
 """
 
 import asyncio
+import os
 import threading
 from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+import sexpdata
 
 
 # ---------------------------------------------------------------------------
@@ -363,3 +365,256 @@ class TestGetSymbolIndexStats:
         assert result["symbol_count"] == 12345
         assert result["last_sync"] == "2025-01-01T00:00:00"
         assert result["db_path"] == "/home/user/.kicad_mcp/symbols.db"
+
+
+# ---------------------------------------------------------------------------
+# Helpers shared by TestGetSymbolPins and TestParseLibPins
+# ---------------------------------------------------------------------------
+
+_TOOLS_FIXTURE_DIR = os.path.join(os.path.dirname(__file__), "fixtures")
+_FIXTURE_SYM = os.path.join(_TOOLS_FIXTURE_DIR, "test_symbols.kicad_sym")
+
+
+def _load_fixture_symbol(fixture_path: str, symbol_name: str) -> list:
+    """Parse a .kicad_sym fixture file and return the raw sexpdata list for *symbol_name*."""
+    with open(fixture_path) as f:
+        lib_data = sexpdata.loads(f.read())
+    for entry in lib_data:
+        if (
+            isinstance(entry, list)
+            and len(entry) >= 2
+            and isinstance(entry[0], sexpdata.Symbol)
+            and entry[0].value() == "symbol"
+            and entry[1] == symbol_name
+        ):
+            return entry
+    raise ValueError(f"Symbol {symbol_name!r} not found in {fixture_path}")
+
+
+# ---------------------------------------------------------------------------
+# TestGetSymbolPins
+# ---------------------------------------------------------------------------
+
+
+class TestGetSymbolPins:
+    """Tests for the get_symbol_pins() MCP tool."""
+
+    def _make_mock_mgr(self):
+        """Return (mock_mgr, sym_rec, lib_rec) backed by the R_Small fixture."""
+        sym_rec = MagicMock()
+        sym_rec.file_index = 0
+
+        lib_rec = MagicMock()
+        lib_rec.file_path = _FIXTURE_SYM
+        lib_rec.mtime = 0.0
+        lib_rec.file_size = 0
+
+        mock_mgr = MagicMock()
+        mock_mgr.get_symbol.return_value = sym_rec
+        mock_mgr.get_library_by_name.return_value = lib_rec
+        return mock_mgr
+
+    def test_happy_path(self):
+        """get_symbol_pins returns success with pin data for R_Small."""
+        raw = _load_fixture_symbol(_FIXTURE_SYM, "R_Small")
+        mock_mgr = self._make_mock_mgr()
+
+        with patch("kicad_mcp.tools.symbol_tools._get_index_manager", return_value=mock_mgr), \
+             patch("kicad_mcp.tools.symbol_tools.extract_lib_symbol_raw", return_value=raw):
+            result = _call("get_symbol_pins", library_name="Device", symbol_name="R_Small")
+
+        assert result["success"] is True
+        assert result["symbol_name"] == "R_Small"
+        assert result["library_name"] == "Device"
+        assert result["pin_count"] > 0
+
+    def test_pin_fields(self):
+        """Each pin has exactly number, name, type, angle keys; angle is an int."""
+        raw = _load_fixture_symbol(_FIXTURE_SYM, "R_Small")
+        mock_mgr = self._make_mock_mgr()
+
+        with patch("kicad_mcp.tools.symbol_tools._get_index_manager", return_value=mock_mgr), \
+             patch("kicad_mcp.tools.symbol_tools.extract_lib_symbol_raw", return_value=raw):
+            result = _call("get_symbol_pins", library_name="Device", symbol_name="R_Small")
+
+        for pin in result["pins"]:
+            assert set(pin.keys()) == {"number", "name", "type", "angle"}
+            assert isinstance(pin["angle"], int)
+
+    def test_pin_count_matches_list(self):
+        """result['pin_count'] == len(result['pins'])."""
+        raw = _load_fixture_symbol(_FIXTURE_SYM, "R_Small")
+        mock_mgr = self._make_mock_mgr()
+
+        with patch("kicad_mcp.tools.symbol_tools._get_index_manager", return_value=mock_mgr), \
+             patch("kicad_mcp.tools.symbol_tools.extract_lib_symbol_raw", return_value=raw):
+            result = _call("get_symbol_pins", library_name="Device", symbol_name="R_Small")
+
+        assert result["pin_count"] == len(result["pins"])
+
+    def test_symbol_not_found(self):
+        """Returns error dict when index manager has no record for the symbol."""
+        mock_mgr = MagicMock()
+        mock_mgr.get_symbol.return_value = None
+
+        with patch("kicad_mcp.tools.symbol_tools._get_index_manager", return_value=mock_mgr):
+            result = _call("get_symbol_pins", library_name="Device", symbol_name="NOEXIST")
+
+        assert result.get("success") is False
+        assert "error" in result
+
+    def test_symbol_not_in_index_with_empty_name(self):
+        """Returns error dict when index has no record for the symbol (empty name query)."""
+        mock_mgr = MagicMock()
+        mock_mgr.get_symbol.return_value = None
+
+        with patch("kicad_mcp.tools.symbol_tools._get_index_manager", return_value=mock_mgr):
+            result = _call("get_symbol_pins", library_name="Device", symbol_name="")
+
+        assert result.get("success") is False
+        assert "error" in result
+
+    def test_library_not_found(self):
+        """Returns error dict when library record is absent from the index."""
+        sym_rec = MagicMock()
+        mock_mgr = MagicMock()
+        mock_mgr.get_symbol.return_value = sym_rec
+        mock_mgr.get_library_by_name.return_value = None
+
+        with patch("kicad_mcp.tools.symbol_tools._get_index_manager", return_value=mock_mgr):
+            result = _call("get_symbol_pins", library_name="MISSINGLIB", symbol_name="R")
+
+        assert result.get("success") is False
+        assert "error" in result
+
+    def test_extract_lib_raises_returns_error(self):
+        """Inner except around extract_lib_symbol_raw returns error dict on FileNotFoundError."""
+        mock_mgr = self._make_mock_mgr()
+
+        with patch("kicad_mcp.tools.symbol_tools._get_index_manager", return_value=mock_mgr), \
+             patch("kicad_mcp.tools.symbol_tools.extract_lib_symbol_raw",
+                   side_effect=FileNotFoundError("lib gone")):
+            result = _call("get_symbol_pins", library_name="Device", symbol_name="R_Small")
+
+        assert result.get("success") is False
+        assert "error" in result
+
+    def test_extract_lib_raises_value_error_returns_error(self):
+        """Inner except around extract_lib_symbol_raw returns error dict on ValueError."""
+        mock_mgr = self._make_mock_mgr()
+
+        with patch("kicad_mcp.tools.symbol_tools._get_index_manager", return_value=mock_mgr), \
+             patch("kicad_mcp.tools.symbol_tools.extract_lib_symbol_raw",
+                   side_effect=ValueError("bad data")):
+            result = _call("get_symbol_pins", library_name="Device", symbol_name="R_Small")
+
+        assert result.get("success") is False
+        assert "error" in result
+
+    def test_r_small_exact_pin_values(self):
+        """Exact pin field values for R_Small: number, empty name, passive type, angles."""
+        raw = _load_fixture_symbol(_FIXTURE_SYM, "R_Small")
+        mock_mgr = self._make_mock_mgr()
+
+        with patch("kicad_mcp.tools.symbol_tools._get_index_manager", return_value=mock_mgr), \
+             patch("kicad_mcp.tools.symbol_tools.extract_lib_symbol_raw", return_value=raw):
+            result = _call("get_symbol_pins", library_name="Device", symbol_name="R_Small")
+
+        by_num = {p["number"]: p for p in result["pins"]}
+        assert by_num["1"] == {"number": "1", "name": "", "type": "passive", "angle": 270}
+        assert by_num["2"] == {"number": "2", "name": "", "type": "passive", "angle": 90}
+
+
+# ---------------------------------------------------------------------------
+# TestParseLibPins
+# ---------------------------------------------------------------------------
+
+
+class TestParseLibPins:
+    """Unit tests for the _parse_lib_pins() module-level helper."""
+
+    def setup_method(self):
+        from kicad_mcp.tools.symbol_tools import _parse_lib_pins
+        self._parse = _parse_lib_pins
+
+    def test_r_small_pin_count(self):
+        """R_Small in the fixture file has exactly 2 pins."""
+        raw = _load_fixture_symbol(_FIXTURE_SYM, "R_Small")
+        pins = self._parse(raw)
+        assert len(pins) == 2
+
+    def test_r_small_pin_numbers(self):
+        """R_Small pins are numbered '1' and '2'."""
+        raw = _load_fixture_symbol(_FIXTURE_SYM, "R_Small")
+        pins = self._parse(raw)
+        assert {p["number"] for p in pins} == {"1", "2"}
+
+    def test_pin_type_is_passive(self):
+        """All R_Small pins have type 'passive'."""
+        raw = _load_fixture_symbol(_FIXTURE_SYM, "R_Small")
+        pins = self._parse(raw)
+        for pin in pins:
+            assert pin["type"] == "passive"
+
+    def test_pin_angles_are_normalised_ints(self):
+        """Every parsed angle is an int in [0, 359]."""
+        raw = _load_fixture_symbol(_FIXTURE_SYM, "R_Small")
+        pins = self._parse(raw)
+        for pin in pins:
+            assert isinstance(pin["angle"], int)
+            assert 0 <= pin["angle"] < 360
+
+    def test_pin_angles_match_fixture(self):
+        """Pin 1 is at 270° and pin 2 is at 90° in the fixture file."""
+        raw = _load_fixture_symbol(_FIXTURE_SYM, "R_Small")
+        pins = self._parse(raw)
+        by_num = {p["number"]: p for p in pins}
+        assert by_num["1"]["angle"] == 270
+        assert by_num["2"]["angle"] == 90
+
+    def test_no_duplicate_pin_numbers(self):
+        """_parse_lib_pins deduplicates pins with the same number."""
+        raw = _load_fixture_symbol(_FIXTURE_SYM, "R_Small")
+        pins = self._parse(raw)
+        numbers = [p["number"] for p in pins]
+        assert len(numbers) == len(set(numbers))
+
+    def test_result_sorted_by_number(self):
+        """Returned pins are sorted in ascending order by pin number string."""
+        raw = _load_fixture_symbol(_FIXTURE_SYM, "R_Small")
+        pins = self._parse(raw)
+        numbers = [p["number"] for p in pins]
+        assert numbers == sorted(numbers)
+
+    def test_dedup_multi_unit_pins(self):
+        """_parse_lib_pins deduplicates pin numbers that appear in multiple sub-units."""
+        S = sexpdata.Symbol
+        fake_raw = [
+            S("symbol"), "FakeOp",
+            # unit 1 sub-symbol
+            [S("symbol"), "FakeOp_1_1",
+                [S("pin"), S("input"), S("line"),
+                    [S("at"), 0, 0, 0], [S("length"), 2.54],
+                    [S("name"), "IN+", [S("effects"), [S("font"), [S("size"), 1.27, 1.27]]]],
+                    [S("number"), "1", [S("effects"), [S("font"), [S("size"), 1.27, 1.27]]]]],
+                [S("pin"), S("power_in"), S("line"),
+                    [S("at"), 0, 5.08, 270], [S("length"), 2.54],
+                    [S("name"), "VCC", [S("effects"), [S("font"), [S("size"), 1.27, 1.27]]]],
+                    [S("number"), "3", [S("effects"), [S("font"), [S("size"), 1.27, 1.27]]]]],
+            ],
+            # unit 2 sub-symbol — pin 3 (VCC) appears again here
+            [S("symbol"), "FakeOp_2_1",
+                [S("pin"), S("output"), S("line"),
+                    [S("at"), 0, 0, 180], [S("length"), 2.54],
+                    [S("name"), "OUT", [S("effects"), [S("font"), [S("size"), 1.27, 1.27]]]],
+                    [S("number"), "2", [S("effects"), [S("font"), [S("size"), 1.27, 1.27]]]]],
+                [S("pin"), S("power_in"), S("line"),
+                    [S("at"), 0, 5.08, 270], [S("length"), 2.54],
+                    [S("name"), "VCC", [S("effects"), [S("font"), [S("size"), 1.27, 1.27]]]],
+                    [S("number"), "3", [S("effects"), [S("font"), [S("size"), 1.27, 1.27]]]]],
+            ],
+        ]
+
+        pins = self._parse(fake_raw)
+        assert len(pins) == 3
+        assert [p["number"] for p in pins].count("3") == 1
