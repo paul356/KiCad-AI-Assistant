@@ -135,7 +135,7 @@ class SchematicParser:
             # for single-pin symbols: power nets, PWR_FLAG, TestPoint, etc.)
             pins_summary: List[Dict[str, str]] = []
             for pin in sym_pin_world_coords(sym):
-                pins_summary.append({'num': pin.number, 'x': str(pin.x), 'y': str(pin.y)})
+                pins_summary.append({'num': pin.number, 'x': str(pin.x), 'y': str(pin.y), 'angle': str(pin.angle)})
 
             if pins_summary:
                 comp['pins'] = pins_summary

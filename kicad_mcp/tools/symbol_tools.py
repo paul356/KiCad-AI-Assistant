@@ -9,10 +9,12 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any
 
+import sexpdata
 from fastmcp import FastMCP
 from fastmcp import Context
 
 from kicad_mcp.config import LibraryPathConfig
+from kicad_mcp.utils.symbol_extractor import extract_lib_symbol_raw
 from kicad_mcp.utils.symbol_index_reader import SymbolIndexReader
 from kicad_mcp.utils.symbol_index_manager import SymbolIndexManager
 
@@ -81,6 +83,66 @@ def _run_sync_in_background(force: bool) -> None:
         with _sync_lock:
             _sync_state.running = False
             _sync_state.current_library = ''
+
+
+
+def _parse_lib_pins(lib_sym_raw: list) -> list[dict]:
+    """Parse pin definitions from a raw lib symbol S-expression list.
+
+    Walks every sub-symbol (``SYMNAME_UNIT_STYLE`` children) and collects each
+    ``(pin type shape (at x y angle) (length l) (name N ...) (number M ...))``
+    entry. Returns one dict per pin:
+
+    ``{"number": str, "name": str, "type": str, "angle": int}``
+    """
+    sym_name = lib_sym_raw[1]
+    prefix = sym_name + "_"
+    pins: list[dict] = []
+    seen_numbers: set[str] = set()
+
+    def _walk(children: list) -> None:
+        for entry in children:
+            if not (
+                isinstance(entry, list)
+                and len(entry) >= 1
+                and isinstance(entry[0], sexpdata.Symbol)
+            ):
+                continue
+            tag = entry[0].value()
+            if tag == "pin":
+                # (pin <type> <shape> (at x y angle) (length l) (name N ...) (number M ...))
+                pin_type = entry[1].value() if len(entry) > 1 and hasattr(entry[1], "value") else str(entry[1])
+                angle = 0
+                pin_name = ""
+                pin_number = ""
+                for child in entry[2:]:
+                    if not (isinstance(child, list) and len(child) >= 1 and isinstance(child[0], sexpdata.Symbol)):
+                        continue
+                    ctag = child[0].value()
+                    if ctag == "at" and len(child) >= 4:
+                        try:
+                            angle = int(round(float(child[3])))
+                        except (ValueError, TypeError):
+                            pass
+                    elif ctag == "name" and len(child) >= 2:
+                        pin_name = str(child[1])
+                    elif ctag == "number" and len(child) >= 2:
+                        pin_number = str(child[1])
+                if pin_number and pin_number not in seen_numbers:
+                    seen_numbers.add(pin_number)
+                    angle_norm = angle % 360
+                    pins.append({
+                        "number": pin_number,
+                        "name": pin_name,
+                        "type": pin_type,
+                        "angle": angle_norm,
+                    })
+            elif tag == "symbol" and isinstance(entry[1], str) and entry[1].startswith(prefix):
+                _walk(entry[2:])
+
+    _walk(lib_sym_raw[2:])
+    pins.sort(key=lambda p: p["number"])
+    return pins
 
 
 def register_symbol_tools(mcp: FastMCP) -> None:
@@ -324,4 +386,73 @@ def register_symbol_tools(mcp: FastMCP) -> None:
             }
         except Exception as e:
             log.error(f"get_symbol_index_stats failed: {e}", exc_info=True)
+            return {"success": False, "error": str(e)}
+
+    @mcp.tool()
+    async def get_symbol_pins(
+        library_name: str,
+        symbol_name: str,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Return detailed pin information for a KiCad library symbol.
+
+        Reads the full pin definitions from the .kicad_sym library file and
+        returns one entry per pin with its number, name, electrical type, and
+        exit angle in **library coordinate space** (i.e. before any placement
+        rotation or mirroring on a schematic).
+
+        Angle convention in library space (Y increases upward in .kicad_sym):
+        - 0°   = pin exits right (→)
+        - 90°  = pin exits up   (↑)
+        - 180° = pin exits left (←)
+        - 270° = pin exits down (↓)
+
+        To get the absolute world-space exit angles after a symbol has been
+        placed on a schematic use ``extract_schematic_netlist`` and look at
+        the ``angle`` field in each component's ``pins`` list.
+
+        Args:
+            library_name: The library name as returned by ``search_symbols``
+                (e.g. ``"Device/R"`` for KiCad 10 symdir-style libraries).
+            symbol_name: The symbol name within the library (e.g. ``"R"``).
+
+        Returns:
+            dict with keys: success, library_name, symbol_name, pin_count,
+            pins (list of {number, name, type, angle}).
+        """
+        try:
+            mgr = _get_index_manager()
+            sym_rec = mgr.get_symbol(library_name, symbol_name)
+            if sym_rec is None:
+                return {
+                    "success": False,
+                    "error": f"Symbol '{library_name}:{symbol_name}' not found in index.",
+                }
+            lib_rec = mgr.get_library_by_name(library_name)
+            if lib_rec is None:
+                return {
+                    "success": False,
+                    "error": f"Library '{library_name}' not found in index.",
+                }
+            try:
+                lib_sym_raw = extract_lib_symbol_raw(
+                    lib_rec.file_path,
+                    sym_rec.file_index,
+                    symbol_name,
+                    lib_rec.mtime,
+                    lib_rec.file_size,
+                )
+            except Exception as exc:
+                return {"success": False, "error": f"Failed to read library file: {exc}"}
+
+            pins = _parse_lib_pins(lib_sym_raw)
+            return {
+                "success": True,
+                "library_name": library_name,
+                "symbol_name": symbol_name,
+                "pin_count": len(pins),
+                "pins": pins,
+            }
+        except Exception as e:
+            log.error(f"get_symbol_pins failed: {e}", exc_info=True)
             return {"success": False, "error": str(e)}

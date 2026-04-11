@@ -1030,3 +1030,115 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
         except Exception as exc:
             log.exception("Unexpected error in delete_component_property")
             return {"error": str(exc), "success": False}
+
+    @mcp.tool()
+    async def rotate_component(
+        schematic_path: str,
+        reference: str,
+        rotation: int,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Set the placement rotation of a schematic component.
+
+        Updates ``(at x y rotation)`` for every unit with the given reference
+        designator.  The rotation is an absolute value (not a delta), so
+        passing ``rotation=90`` always results in a 90° placement regardless
+        of the current rotation.
+
+        Field label positions (Reference, Value) stored on the placed symbol
+        become stale when the symbol body rotates.  This tool marks each
+        updated unit ``(fields_autoplaced yes)`` so that KiCad automatically
+        repositions the labels the next time the schematic is opened.
+
+        A backup (.kicad_sch.bak) is written before saving.
+
+        Args:
+            schematic_path: Absolute path to the target .kicad_sch file.
+            reference: Reference designator of the component (e.g. "R1", "U3").
+            rotation: New rotation in degrees; must be 0, 90, 180, or 270.
+
+        Returns:
+            dict with keys: success (bool), reference, rotation,
+            units_updated (int).
+        """
+        if not schematic_path.endswith(".kicad_sch"):
+            return {"error": f"Not a .kicad_sch file: {schematic_path!r}"}
+        if not os.path.isfile(schematic_path):
+            return {"error": f"Schematic file not found: {schematic_path!r}"}
+        if not reference:
+            return {"error": "reference must not be empty"}
+        if rotation not in (0, 90, 180, 270):
+            return {"error": f"rotation must be 0, 90, 180, or 270 (got {rotation!r})"}
+
+        try:
+            sch = skip.Schematic(schematic_path)
+        except Exception as exc:
+            return {"error": f"Failed to open schematic: {exc}"}
+
+        try:
+            units: list[Any] = []
+            try:
+                for sym in sch.symbol:
+                    try:
+                        if sym.property.Reference.value == reference:
+                            units.append(sym)
+                    except AttributeError:
+                        continue
+            except AttributeError:
+                pass
+
+            if not units:
+                return {"error": f"No symbol with reference {reference!r} found"}
+
+            for sym in units:
+                at = sym.at.value
+                sym.at.value = [at[0], at[1], rotation]
+                # Mark fields_autoplaced so KiCad repositions the Reference/
+                # Value labels on next open (they would otherwise be stale).
+                try:
+                    raw_tree = sym._pv._tree
+                    # Check whether (fields_autoplaced yes) already exists.
+                    fa_found = False
+                    for child in raw_tree:
+                        if (
+                            isinstance(child, list)
+                            and len(child) >= 2
+                            and isinstance(child[0], sexpdata.Symbol)
+                            and child[0].value() == "fields_autoplaced"
+                        ):
+                            child[1] = sexpdata.Symbol("yes")
+                            fa_found = True
+                            break
+                    if not fa_found:
+                        fa_node = [sexpdata.Symbol("fields_autoplaced"), sexpdata.Symbol("yes")]
+                        # Insert before uuid to match canonical KiCad S-expression ordering.
+                        uuid_idx = next(
+                            (
+                                i for i, child in enumerate(raw_tree)
+                                if isinstance(child, list)
+                                and len(child) >= 1
+                                and isinstance(child[0], sexpdata.Symbol)
+                                and child[0].value() == "uuid"
+                            ),
+                            len(raw_tree),  # fallback: append if uuid not found
+                        )
+                        raw_tree.insert(uuid_idx, fa_node)
+                except Exception:
+                    pass  # non-critical; rotation still applied
+
+            try:
+                shutil.copy(schematic_path, schematic_path + ".bak")
+                sch.write(schematic_path)
+            except Exception as exc:
+                return {"error": f"Failed to save schematic: {exc}"}
+
+            return {
+                "success": True,
+                "reference": reference,
+                "rotation": rotation,
+                "units_updated": len(units),
+            }
+
+        except Exception as exc:
+            log.exception("Unexpected error in rotate_component")
+            return {"error": str(exc), "success": False}
