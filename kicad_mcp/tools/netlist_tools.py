@@ -117,7 +117,8 @@ def register_netlist_tools(mcp: FastMCP) -> None:
                     "components": {
                         "R1": {"value": "10k",
                                "position": {"x": ..., "y": ..., "rotation": ...},
-                               "pins": [{"num": "1", "x": ..., "y": ..., "net": "GND"}, ...]},
+                               "pins": [{"num": "1", "x": ..., "y": ..., "angle": ..., "net": "GND"}, ...]},
+                               # angle: wire-exit direction in screen coords: 0=right, 90=down, 180=left, 270=up
                         ...
                     },
                     "power_nets": [
@@ -309,7 +310,9 @@ def register_netlist_tools(mcp: FastMCP) -> None:
             ctx: MCP context for progress reporting
             
         Returns:
-            Dictionary with component connection information
+            Dictionary with component connection information. In component_info,
+            each pin's ``angle`` is the wire-exit direction in screen coordinates:
+            0=right, 90=down, 180=left, 270=up.
         """
         print(f"Finding connections for component {component_ref} in project: {project_path}")
         

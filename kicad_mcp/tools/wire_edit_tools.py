@@ -182,6 +182,57 @@ def _merge_collinear_segments(
     return result
 
 
+def _segments_overlap(
+    ax: float, ay: float, bx: float, by: float,
+    cx: float, cy: float, dx: float, dy: float,
+    tol: float,
+) -> bool:
+    """Return True if two axis-aligned segments are collinear and share more than a point.
+
+    A point-touch (endpoint meeting endpoint, or a T-junction at a shared
+    endpoint) is *not* considered an overlap.  Only collinear segments whose
+    projected intervals intersect with length > tol are flagged.
+    """
+    # Both horizontal
+    if abs(ay - by) < 1e-9 and abs(cy - dy) < 1e-9 and abs(ay - cy) < tol:
+        lo1, hi1 = min(ax, bx), max(ax, bx)
+        lo2, hi2 = min(cx, dx), max(cx, dx)
+        return min(hi1, hi2) - max(lo1, lo2) > tol
+    # Both vertical
+    if abs(ax - bx) < 1e-9 and abs(cx - dx) < 1e-9 and abs(ax - cx) < tol:
+        lo1, hi1 = min(ay, by), max(ay, by)
+        lo2, hi2 = min(cy, dy), max(cy, dy)
+        return min(hi1, hi2) - max(lo1, lo2) > tol
+    return False
+
+
+def _route_overlaps_wires(
+    segments: list[tuple[float, float, float, float]],
+    existing_wires: list[tuple[float, float, float, float]],
+    tol: float,
+) -> bool:
+    """Return True if any segment in *segments* overlaps any existing wire."""
+    for (ax, ay, bx, by) in segments:
+        for (cx, cy, dx, dy) in existing_wires:
+            if _segments_overlap(ax, ay, bx, by, cx, cy, dx, dy, tol):
+                return True
+    return False
+
+
+def _collect_existing_wires(sch: Any) -> list[tuple[float, float, float, float]]:
+    """Return all wire segments currently in the schematic as (ax, ay, bx, by) tuples."""
+    wires: list[tuple[float, float, float, float]] = []
+    try:
+        for w in sch.wire:
+            wires.append((
+                float(w.start.value[0]), float(w.start.value[1]),
+                float(w.end.value[0]),   float(w.end.value[1]),
+            ))
+    except AttributeError:
+        pass
+    return wires
+
+
 # ---------------------------------------------------------------------------
 # Smart wire router
 # ---------------------------------------------------------------------------
@@ -190,26 +241,29 @@ def _draw_smart_wire(
     sch: Any,
     sx: float, sy: float,
     ex: float, ey: float,
+    existing_wires: list[tuple[float, float, float, float]],
     start_angle: float | None = None,
     end_angle: float | None = None,
     obstacle_pins: list[tuple[float, float]] | None = None,
     lead_out_dist: float = _LEAD_OUT_DIST,
 ) -> bool:
-    """Draw a smart wire from (sx,sy) to (ex,ey) avoiding component pins.
+    """Draw a smart wire from (sx,sy) to (ex,ey) avoiding pins and existing wires.
 
     Algorithm:
       1. Compute a lead-out stub from each endpoint following the pin's exit
          direction (if angle is supplied), moving the route into open space.
       2. Try up to 16 candidate inner routes between the lead-out endpoints.
       3. Pick the first candidate where no obstacle pin falls on the interior
-         of any segment.
+         of any segment AND no segment overlaps an existing wire.
       4. Fall back to L-A (horizontal-first) with a logged warning when all
-         candidates collide.
+         candidates are blocked.
 
     Args:
         sch: The skip schematic object.
         sx, sy: Start point (pin position).
         ex, ey: End point (pin position).
+        existing_wires: All wire segments already in the schematic, as
+            (ax, ay, bx, by) tuples.  Used to prevent overlapping routes.
         start_angle: Absolute exit angle of the start pin in degrees
             (0=right, 90=down, 180=left, 270=up).  None to skip lead-out.
         end_angle: Absolute exit angle of the end pin in degrees.
@@ -217,7 +271,8 @@ def _draw_smart_wire(
         lead_out_dist: Length of each lead-out stub in mm (default 2.54 mm).
 
     Returns:
-        True if a collision-free route was found, False if the fallback was used.
+        True if a collision-free, non-overlapping route was found, False if
+        the fallback was used.
     """
     obstacles = obstacle_pins or []
 
@@ -236,34 +291,49 @@ def _draw_smart_wire(
     else:
         p2x, p2y = ex, ey
 
-    # Build lead-out segments
-    lead_segs: list[tuple[float, float, float, float]] = []
+    # Build lead-out segments separately so they can be ordered correctly for
+    # merging: start_lead → inner... → end_lead.  The end lead-out is stored
+    # reversed (pin→inner-endpoint becomes inner-endpoint→pin) so that when
+    # all segments are concatenated the end of one segment always touches the
+    # start of the next — a prerequisite for _merge_collinear_segments to
+    # collapse collinear neighbours.
+    start_lead: list[tuple[float, float, float, float]] = []
+    end_lead: list[tuple[float, float, float, float]] = []
     if start_angle is not None and (abs(p1x - sx) > 1e-9 or abs(p1y - sy) > 1e-9):
-        lead_segs.append((sx, sy, p1x, p1y))
+        start_lead.append((sx, sy, p1x, p1y))
     if end_angle is not None and (abs(p2x - ex) > 1e-9 or abs(p2y - ey) > 1e-9):
-        lead_segs.append((ex, ey, p2x, p2y))
+        # Reversed: inner-endpoint → pin, so it continues naturally from chosen
+        end_lead.append((p2x, p2y, ex, ey))
+
+    # For collision detection the direction of each segment doesn't matter
+    lead_segs = start_lead + [(a, b, c, d) for (c, d, a, b) in end_lead]
 
     # Try each inner route candidate
     inner_candidates = _route_candidates(p1x, p1y, p2x, p2y)
     chosen: list[tuple[float, float, float, float]] | None = None
     for candidate in inner_candidates:
-        if not _route_collides(lead_segs + candidate, obstacles, _PIN_COLLISION_TOL):
+        all_segs = lead_segs + candidate
+        if (not _route_collides(all_segs, obstacles, _PIN_COLLISION_TOL)
+                and not _route_overlaps_wires(all_segs, existing_wires, _PIN_COLLISION_TOL)):
             chosen = candidate
             break
 
     collision_free = True
     if chosen is None:
         log.warning(
-            "smart_wire: all %d route candidates collide with obstacle pins "
-            "between (%.3f,%.3f) and (%.3f,%.3f); using L-A fallback.",
+            "smart_wire: all %d route candidates are blocked (pin collision or "
+            "wire overlap) between (%.3f,%.3f) and (%.3f,%.3f); using L-A fallback.",
             len(inner_candidates), sx, sy, ex, ey,
         )
         # Fallback: use first (L-A or direct) candidate
         chosen = inner_candidates[0] if inner_candidates else [(p1x, p1y, p2x, p2y)]
         collision_free = False
 
-    # Draw all segments, merging collinear neighbours first
-    all_draw = _merge_collinear_segments(lead_segs + chosen)
+    # Draw all segments, merging collinear neighbours first.
+    # Order: start_lead → inner segments → end_lead (reversed) ensures that
+    # consecutive segments always share an endpoint, which is required for
+    # _merge_collinear_segments to collapse collinear pairs correctly.
+    all_draw = _merge_collinear_segments(start_lead + chosen + end_lead)
     for (ax, ay, bx, by) in all_draw:
         if abs(ax - bx) < 1e-9 and abs(ay - by) < 1e-9:
             continue  # skip zero-length
@@ -272,27 +342,6 @@ def _draw_smart_wire(
         w.end_at([bx, by])
 
     return collision_free
-
-
-# ---------------------------------------------------------------------------
-# Orthogonal wire routing (thin wrapper — backward compatibility)
-# ---------------------------------------------------------------------------
-
-def _draw_orthogonal_wire(
-    sch: Any,
-    start_x: float, start_y: float,
-    end_x: float, end_y: float,
-    obstacle_pins: list[tuple[float, float]] | None = None,
-) -> bool:
-    """Draw an orthogonal wire, avoiding obstacle pins when supplied.
-
-    Thin wrapper around :func:`_draw_smart_wire` with no pin-direction
-    lead-outs.  Returns True when a collision-free route was found.
-    """
-    return _draw_smart_wire(
-        sch, start_x, start_y, end_x, end_y,
-        obstacle_pins=obstacle_pins,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -345,39 +394,50 @@ def _get_pin_position_and_direction(
     )
 
 
-def _collect_all_pin_positions(
-    sch: Any,
-    exclude_pins: list[tuple[float, float]] | None = None,
-) -> list[tuple[float, float]]:
+def _collect_all_pin_positions(sch: Any) -> list[tuple[float, float]]:
     """Return the absolute schematic position of every pin of every placed symbol.
 
     Uses :func:`~kicad_mcp.utils.skip_helpers.sym_pin_world_coords` which
     handles the skip library bug for power symbols (VCC, GND, PWR_FLAG) and
     single-pin symbols (TestPoint).
 
-    Args:
-        sch: The skip schematic object.
-        exclude_pins: Optional list of (x, y) positions to omit (e.g. the two
-            endpoint pins that are intentionally being connected).
-
     Returns:
-        List of (x, y) tuples, one per pin, with excluded pins removed.
+        List of (x, y) tuples, one per pin.
     """
-    exclusions: set[tuple[float, float]] = set()
-    if exclude_pins:
-        for px, py in exclude_pins:
-            exclusions.add((round(px, 4), round(py, 4)))
-
     positions: list[tuple[float, float]] = []
     try:
         for sym in sch.symbol:
             for pin in sym_pin_world_coords(sym):
-                pt = (pin.x, pin.y)
-                if pt not in exclusions:
-                    positions.append(pt)
+                positions.append((pin.x, pin.y))
     except AttributeError:
         pass
     return positions
+
+
+def _junction_exists_at(sch: Any, px: float, py: float, tol: float = 0.01) -> bool:
+    """Return True if a junction already exists at (px, py) within tolerance."""
+    try:
+        for j in sch.junction:
+            coords = j.at.value
+            if abs(float(coords[0]) - px) <= tol and abs(float(coords[1]) - py) <= tol:
+                return True
+    except AttributeError:
+        pass
+    return False
+
+
+def _wire_connected_at(sch: Any, px: float, py: float, tol: float = 0.01) -> bool:
+    """Return True if any existing wire has an endpoint at (px, py) within tolerance."""
+    try:
+        for w in sch.wire:
+            sx, sy = float(w.start.value[0]), float(w.start.value[1])
+            ex, ey = float(w.end.value[0]), float(w.end.value[1])
+            if (abs(sx - px) <= tol and abs(sy - py) <= tol) or \
+               (abs(ex - px) <= tol and abs(ey - py) <= tol):
+                return True
+    except AttributeError:
+        pass
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -438,10 +498,15 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
             return {"error": f"Failed to open schematic: {exc}"}
 
         try:
-            # Collect all pin positions to avoid routing wires through them
+            # Collect all pin positions and existing wires to avoid routing
+            # through them or overlapping with them.
             obstacles = _collect_all_pin_positions(sch)
-            _draw_orthogonal_wire(sch, start_x, start_y, end_x, end_y,
-                                  obstacle_pins=obstacles)
+            existing_wires = _collect_existing_wires(sch)
+            _draw_smart_wire(
+                sch, start_x, start_y, end_x, end_y,
+                existing_wires=existing_wires,
+                obstacle_pins=obstacles,
+            )
 
             junctions_added = []
             if add_junction_start:
@@ -474,7 +539,6 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
         from_pin: str,
         to_ref: str,
         to_pin: str,
-        add_junctions: bool = False,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Connect two symbol pins with a wire, using smart orthogonal routing.
@@ -482,7 +546,9 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
         Resolves the absolute schematic coordinates of both pins automatically
         (accounting for each symbol's placement position and rotation), then
         draws a wire between them using smart orthogonal routing that follows
-        pin exit directions and avoids other component pins. A backup
+        pin exit directions and avoids other component pins. If either pin is
+        already connected to a wire and has no junction yet, a junction is
+        automatically placed there before drawing the new wire. A backup
         (.kicad_sch.bak) is written before saving.
 
         Args:
@@ -491,11 +557,11 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
             from_pin: Pin number of the source pin (e.g. "1").
             to_ref: Reference designator of the destination symbol (e.g. "C1").
             to_pin: Pin number of the destination pin (e.g. "2").
-            add_junctions: When True, place junction dots at both pin endpoints.
 
         Returns:
             dict with keys: success (bool), wire (from/to with ref, pin, x, y),
-            collision_free (bool), junctions_added (bool, only when add_junctions=True).
+            collision_free (bool), auto_junctions_added (list of {x, y}, only
+            when junctions were automatically placed).
         """
         if not schematic_path.endswith(".kicad_sch"):
             return {"error": f"Not a .kicad_sch file: {schematic_path!r}"}
@@ -525,24 +591,35 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
             return {"error": "Both pins are at the same coordinate; cannot draw a wire"}
 
         try:
-            # Collect obstacle pins excluding the two endpoints being connected
-            obstacles = _collect_all_pin_positions(
-                sch, exclude_pins=[(start_x, start_y), (end_x, end_y)]
-            )
+            # Auto-junction: if a pin already connects to a wire, add a junction
+            # before drawing the new wire so the T-connection is explicit.
+            auto_junctions: list[dict[str, float]] = []
+            for jx, jy in [(start_x, start_y), (end_x, end_y)]:
+                if _wire_connected_at(sch, jx, jy) and not _junction_exists_at(sch, jx, jy):
+                    j = sch.junction.new()
+                    j.at.value = [jx, jy]
+                    auto_junctions.append({"x": jx, "y": jy})
+
+            # All pins are obstacles — _point_on_open_segment uses a strict
+            # interior check (lo = min+tol, hi = max−tol) so the two endpoint
+            # pins at (start_x,start_y) and (end_x,end_y) are never flagged as
+            # interior points on their own lead-out stubs.  Including them lets
+            # the router correctly reject any inner-route candidate that would
+            # pass *through* the end pin, which would otherwise produce a
+            # self-overlapping backtrack wire.
+            obstacles = _collect_all_pin_positions(sch)
+            existing_wires = _collect_existing_wires(sch)
 
             collision_free: bool | None = None
             # Smart routing: follow pin exit directions, avoid all other pins
+            # and existing wire segments
             collision_free = _draw_smart_wire(
                 sch, start_x, start_y, end_x, end_y,
+                existing_wires=existing_wires,
                 start_angle=start_angle,
                 end_angle=end_angle,
                 obstacle_pins=obstacles,
             )
-
-            if add_junctions:
-                for jx, jy in [(start_x, start_y), (end_x, end_y)]:
-                    j = sch.junction.new()
-                    j.at.value = [jx, jy]
 
             shutil.copy(schematic_path, schematic_path + ".bak")
             sch.write(schematic_path)
@@ -558,26 +635,27 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
         }
         if collision_free is not None:
             result["collision_free"] = collision_free
-        if add_junctions:
-            result["junctions_added"] = True
+        if auto_junctions:
+            result["auto_junctions_added"] = auto_junctions
         return result
 
 
     @mcp.tool()
     async def delete_wire_from_schematic(
         schematic_path: str,
-        start_x: float,
-        start_y: float,
-        end_x: float,
-        end_y: float,
+        wires: list[dict],
         tolerance: float = 0.01,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
-        """Delete a wire segment from a KiCad schematic by its endpoints.
+        """Delete one or more wire segments from a KiCad schematic by their endpoints.
 
-        Removes all wire segments whose start/end coordinates match
-        (start_x, start_y) → (end_x, end_y) or the reverse direction,
-        within the specified tolerance.  Use
+        Opens the schematic once, removes all matching wire segments in a single
+        pass, then writes the file once — making batch deletions efficient.
+
+        Each entry in ``wires`` must be a dict with keys:
+            ``start_x``, ``start_y``, ``end_x``, ``end_y`` (all floats, in mm).
+
+        Both directions of a segment are matched (A→B or B→A).  Use
         analyze_schematic_connections(include_wire_topology=True) first to
         obtain exact wire coordinates (connected wires appear under each net's
         ``wires`` list; unconnected stubs appear under ``unconnected_wires``).
@@ -585,26 +663,39 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
 
         Args:
             schematic_path: Absolute path to the target .kicad_sch file.
-            start_x: X coordinate of the wire start point in mm.
-            start_y: Y coordinate of the wire start point in mm.
-            end_x: X coordinate of the wire end point in mm.
-            end_y: Y coordinate of the wire end point in mm.
+            wires: List of wire specs, each a dict with start_x, start_y,
+                end_x, end_y (floats in mm).
             tolerance: Maximum coordinate difference considered a match
                 (default 0.01 mm).
 
         Returns:
-            dict with keys: success (bool), deleted_count (int).
+            dict with keys:
+                success (bool),
+                deleted_count (int) — total wire objects removed,
+                not_found (list[int]) — 0-based indices of wire specs that
+                    had no match in the schematic.
         """
         if not schematic_path.endswith(".kicad_sch"):
             return {"error": f"Not a .kicad_sch file: {schematic_path!r}"}
         if not os.path.isfile(schematic_path):
             return {"error": f"Schematic file not found: {schematic_path!r}"}
-        for name, val in [
-            ("start_x", start_x), ("start_y", start_y),
-            ("end_x", end_x), ("end_y", end_y),
-        ]:
-            if not math.isfinite(val):
-                return {"error": f"Coordinate '{name}' must be a finite number (got {val})"}
+        if not wires:
+            return {"error": "The 'wires' list must not be empty"}
+
+        # Validate all wire specs up front.
+        parsed: list[tuple[float, float, float, float]] = []
+        for i, spec in enumerate(wires):
+            try:
+                sx = float(spec["start_x"])
+                sy = float(spec["start_y"])
+                ex = float(spec["end_x"])
+                ey = float(spec["end_y"])
+            except (KeyError, TypeError, ValueError) as exc:
+                return {"error": f"Wire spec at index {i} is invalid: {exc}"}
+            for name, val in [("start_x", sx), ("start_y", sy), ("end_x", ex), ("end_y", ey)]:
+                if not math.isfinite(val):
+                    return {"error": f"Wire spec at index {i}: '{name}' must be a finite number (got {val})"}
+            parsed.append((sx, sy, ex, ey))
 
         try:
             sch = skip.Schematic(schematic_path)
@@ -612,32 +703,40 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
             return {"error": f"Failed to open schematic: {exc}"}
 
         try:
-            to_delete = []
+            # Collect schematic wires once.
             try:
-                for w in sch.wire:
-                    sx = float(w.start.value[0])
-                    sy = float(w.start.value[1])
-                    ex = float(w.end.value[0])
-                    ey = float(w.end.value[1])
+                all_wires = list(sch.wire)
+            except AttributeError:
+                all_wires = []
+
+            to_delete: list = []
+            matched = [False] * len(parsed)
+
+            for w in all_wires:
+                wx0 = float(w.start.value[0])
+                wy0 = float(w.start.value[1])
+                wx1 = float(w.end.value[0])
+                wy1 = float(w.end.value[1])
+                for i, (sx, sy, ex, ey) in enumerate(parsed):
                     forward = (
-                        abs(sx - start_x) <= tolerance and abs(sy - start_y) <= tolerance
-                        and abs(ex - end_x) <= tolerance and abs(ey - end_y) <= tolerance
+                        abs(wx0 - sx) <= tolerance and abs(wy0 - sy) <= tolerance
+                        and abs(wx1 - ex) <= tolerance and abs(wy1 - ey) <= tolerance
                     )
                     backward = (
-                        abs(sx - end_x) <= tolerance and abs(sy - end_y) <= tolerance
-                        and abs(ex - start_x) <= tolerance and abs(ey - start_y) <= tolerance
+                        abs(wx0 - ex) <= tolerance and abs(wy0 - ey) <= tolerance
+                        and abs(wx1 - sx) <= tolerance and abs(wy1 - sy) <= tolerance
                     )
                     if forward or backward:
                         to_delete.append(w)
-            except AttributeError:
-                pass  # no wires
+                        matched[i] = True
+                        break  # each schematic wire can only match one spec
+
+            not_found = [i for i, m in enumerate(matched) if not m]
 
             if not to_delete:
                 return {
-                    "error": (
-                        f"No wire found matching ({start_x}, {start_y}) → "
-                        f"({end_x}, {end_y}) within tolerance {tolerance}"
-                    )
+                    "error": "No wire matched any of the provided specs within tolerance",
+                    "not_found": not_found,
                 }
 
             for w in to_delete:
@@ -648,47 +747,10 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
         except Exception as exc:
             return {"error": f"Failed to delete wire: {exc}"}
 
-        return {"success": True, "deleted_count": len(to_delete)}
-
-    @mcp.tool()
-    async def list_wires_in_schematic(
-        schematic_path: str,
-        ctx: Context | None = None,
-    ) -> dict[str, Any]:
-        """List all wire segments present in a KiCad schematic.
-
-        Returns every wire's start and end coordinates (in mm).  Use the
-        returned coordinates with delete_wire_from_schematic to remove a
-        specific wire.
-
-        Args:
-            schematic_path: Absolute path to the target .kicad_sch file.
-
-        Returns:
-            dict with keys: success (bool), wires (list of
-            {start: {x, y}, end: {x, y}} dicts), count (int).
-        """
-        if not schematic_path.endswith(".kicad_sch"):
-            return {"error": f"Not a .kicad_sch file: {schematic_path!r}"}
-        if not os.path.isfile(schematic_path):
-            return {"error": f"Schematic file not found: {schematic_path!r}"}
-
-        try:
-            sch = skip.Schematic(schematic_path)
-        except Exception as exc:
-            return {"error": f"Failed to open schematic: {exc}"}
-
-        wires = []
-        try:
-            for w in sch.wire:
-                wires.append({
-                    "start": {"x": float(w.start.value[0]), "y": float(w.start.value[1])},
-                    "end":   {"x": float(w.end.value[0]),   "y": float(w.end.value[1])},
-                })
-        except AttributeError:
-            pass  # no wires in schematic
-
-        return {"success": True, "wires": wires, "count": len(wires)}
+        result: dict[str, Any] = {"success": True, "deleted_count": len(to_delete)}
+        if not_found:
+            result["not_found"] = not_found
+        return result
 
     @mcp.tool()
     async def add_junction_to_schematic(

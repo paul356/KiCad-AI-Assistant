@@ -1150,3 +1150,173 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
         except Exception as exc:
             log.exception("Unexpected error in move_component")
             return {"error": str(exc), "success": False}
+
+    @mcp.tool()
+    async def add_label_to_schematic(
+        schematic_path: str,
+        text: str,
+        x: float,
+        y: float,
+        angle: int = 0,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Add a local net label to a KiCad schematic.
+
+        A local label creates a named net connection at the given coordinate.
+        Two wires or pins with the same label text on the same sheet are
+        electrically connected. The label must be placed on a wire or pin
+        endpoint. A backup (.kicad_sch.bak) is written before saving.
+
+        Args:
+            schematic_path: Absolute path to the target .kicad_sch file.
+            text: Net label text (e.g. "VCC", "NET_A"). Must not be empty.
+            x: X coordinate of the label connection point in mm.
+            y: Y coordinate of the label connection point in mm.
+            angle: Rotation angle in degrees; must be 0, 90, 180, or 270.
+
+        Returns:
+            dict with keys: success (bool), label (text, x, y, angle).
+        """
+        if not schematic_path.endswith(".kicad_sch"):
+            return {"error": f"Not a .kicad_sch file: {schematic_path!r}"}
+        if not os.path.isfile(schematic_path):
+            return {"error": f"Schematic file not found: {schematic_path!r}"}
+        if not text:
+            return {"error": "text must not be empty"}
+        if not math.isfinite(x) or not math.isfinite(y):
+            return {"error": f"Coordinates must be finite numbers (got x={x}, y={y})"}
+        if angle not in (0, 90, 180, 270):
+            return {"error": f"angle must be 0, 90, 180, or 270 (got {angle})"}
+
+        try:
+            sch = skip.Schematic(schematic_path)
+        except Exception as exc:
+            return {"error": f"Failed to open schematic: {exc}"}
+
+        try:
+            lbl = sch.label.new()
+            lbl.value = text
+            lbl.at.value = [x, y, angle]
+
+            shutil.copy(schematic_path, schematic_path + ".bak")
+            sch.write(schematic_path)
+        except Exception as exc:
+            return {"error": f"Failed to add label: {exc}"}
+
+        return {"success": True, "label": {"text": text, "x": x, "y": y, "angle": angle}}
+
+    @mcp.tool()
+    async def list_labels_in_schematic(
+        schematic_path: str,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """List all local net labels in a KiCad schematic.
+
+        Returns every local label's text and position. Use the returned
+        coordinates with delete_label_from_schematic to remove a specific label.
+
+        Args:
+            schematic_path: Absolute path to the target .kicad_sch file.
+
+        Returns:
+            dict with keys: success (bool), labels (list of {text, x, y, angle}),
+            count (int).
+        """
+        if not schematic_path.endswith(".kicad_sch"):
+            return {"error": f"Not a .kicad_sch file: {schematic_path!r}"}
+        if not os.path.isfile(schematic_path):
+            return {"error": f"Schematic file not found: {schematic_path!r}"}
+
+        try:
+            sch = skip.Schematic(schematic_path)
+        except Exception as exc:
+            return {"error": f"Failed to open schematic: {exc}"}
+
+        labels = []
+        try:
+            for lbl in sch.label:
+                try:
+                    at_val = lbl.at.value
+                    labels.append({
+                        "text": str(lbl.value),
+                        "x": float(at_val[0]),
+                        "y": float(at_val[1]),
+                        "angle": int(at_val[2]) if len(at_val) > 2 else 0,
+                    })
+                except (AttributeError, IndexError, ValueError):
+                    continue
+        except AttributeError:
+            pass  # no labels in schematic
+
+        return {"success": True, "labels": labels, "count": len(labels)}
+
+    @mcp.tool()
+    async def delete_label_from_schematic(
+        schematic_path: str,
+        x: float,
+        y: float,
+        text: str | None = None,
+        tolerance: float = 0.01,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Delete a local net label from a KiCad schematic by its position.
+
+        Removes all local labels whose position matches (x, y) within the
+        specified tolerance. When text is provided, only labels with that exact
+        text are removed. Use list_labels_in_schematic first to obtain the
+        exact coordinates. A backup (.kicad_sch.bak) is written before saving.
+
+        Args:
+            schematic_path: Absolute path to the target .kicad_sch file.
+            x: X coordinate of the label in mm.
+            y: Y coordinate of the label in mm.
+            text: Optional label text to match. When omitted, all labels at
+                (x, y) within tolerance are removed.
+            tolerance: Maximum coordinate difference considered a match
+                (default 0.01 mm).
+
+        Returns:
+            dict with keys: success (bool), deleted_count (int).
+        """
+        if not schematic_path.endswith(".kicad_sch"):
+            return {"error": f"Not a .kicad_sch file: {schematic_path!r}"}
+        if not os.path.isfile(schematic_path):
+            return {"error": f"Schematic file not found: {schematic_path!r}"}
+        if not math.isfinite(x) or not math.isfinite(y):
+            return {"error": f"Coordinates must be finite numbers (got x={x}, y={y})"}
+
+        try:
+            sch = skip.Schematic(schematic_path)
+        except Exception as exc:
+            return {"error": f"Failed to open schematic: {exc}"}
+
+        try:
+            to_delete = []
+            try:
+                for lbl in sch.label:
+                    try:
+                        at_val = lbl.at.value
+                        lx, ly = float(at_val[0]), float(at_val[1])
+                        if abs(lx - x) <= tolerance and abs(ly - y) <= tolerance:
+                            if text is None or str(lbl.value) == text:
+                                to_delete.append(lbl)
+                    except (AttributeError, IndexError, ValueError):
+                        continue
+            except AttributeError:
+                pass  # no labels
+
+            if not to_delete:
+                msg = f"No label found at ({x}, {y}) within tolerance {tolerance}"
+                if text is not None:
+                    msg += f" with text {text!r}"
+                return {"error": msg}
+
+            for lbl in to_delete:
+                lbl.delete()
+
+            shutil.copy(schematic_path, schematic_path + ".bak")
+            sch.write(schematic_path)
+        except Exception as exc:
+            return {"error": f"Failed to delete label: {exc}"}
+
+        return {"success": True, "deleted_count": len(to_delete)}

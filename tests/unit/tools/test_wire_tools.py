@@ -288,16 +288,16 @@ class TestConnectPinsWithWire:
                             to_ref="R7", to_pin="1")
         assert result.get("success") is True
 
-    def test_connect_with_junctions(self, tools, tmp_sch):
+    def test_connect_no_preexisting_wire_no_auto_junction(self, tools, tmp_sch):
+        """Connecting fresh pins with no pre-existing wires adds no auto junctions."""
         result = self._call(tools, schematic_path=tmp_sch,
                             from_ref="R2", from_pin="2",
-                            to_ref="R3", to_pin="2",
-                            add_junctions=True)
+                            to_ref="R3", to_pin="2")
         assert result.get("success") is True
-        assert result["junctions_added"] is True
+        assert not result.get("auto_junctions_added")
 
         sch2 = skip.Schematic(tmp_sch)
-        assert len(list(sch2.junction)) >= 2
+        assert len(list(sch2.junction)) == 0
 
     def test_backup_created(self, tools, tmp_sch):
         self._call(tools, schematic_path=tmp_sch,
@@ -316,82 +316,17 @@ class TestConnectPinsWithWire:
 
 
 # ---------------------------------------------------------------------------
-# list_wires_in_schematic — tests
-# ---------------------------------------------------------------------------
-
-class TestListWiresInSchematic:
-
-    def _call(self, tools, **kwargs):
-        return asyncio.run(tools["list_wires_in_schematic"](**kwargs))
-
-    def test_wrong_extension(self, tools):
-        result = self._call(tools, schematic_path="/tmp/bad.txt")
-        assert "error" in result
-
-    def test_file_not_found(self, tools):
-        result = self._call(tools, schematic_path="/tmp/no_such.kicad_sch")
-        assert "error" in result
-
-    def test_empty_schematic_returns_zero_wires(self, tools, tmp_sch):
-        """Fresh schematic copy has no wires."""
-        result = self._call(tools, schematic_path=tmp_sch)
-        assert result.get("success") is True
-        assert result["count"] == 0
-        assert result["wires"] == []
-
-    def test_returns_added_wire(self, tools, tmp_sch):
-        """After adding a wire it should appear in the list."""
-        add = asyncio.run(tools["add_wire_to_schematic"](
-            schematic_path=tmp_sch,
-            start_x=100.0, start_y=102.54,
-            end_x=120.0, end_y=102.54,
-        ))
-        assert add.get("success") is True
-
-        result = self._call(tools, schematic_path=tmp_sch)
-        assert result.get("success") is True
-        assert result["count"] == 1
-        w = result["wires"][0]
-        assert abs(w["start"]["x"] - 100.0) < 0.01
-        assert abs(w["start"]["y"] - 102.54) < 0.01
-        assert abs(w["end"]["x"] - 120.0) < 0.01
-        assert abs(w["end"]["y"] - 102.54) < 0.01
-
-    def test_multiple_wires_counted(self, tools, tmp_sch):
-        asyncio.run(tools["add_wire_to_schematic"](
-            schematic_path=tmp_sch,
-            start_x=100.0, start_y=97.46, end_x=120.0, end_y=97.46,
-        ))
-        asyncio.run(tools["add_wire_to_schematic"](
-            schematic_path=tmp_sch,
-            start_x=100.0, start_y=102.54, end_x=120.0, end_y=102.54,
-        ))
-        result = self._call(tools, schematic_path=tmp_sch)
-        assert result.get("success") is True
-        assert result["count"] == 2
-
-    def test_wire_coords_are_numbers(self, tools, tmp_sch):
-        asyncio.run(tools["add_wire_to_schematic"](
-            schematic_path=tmp_sch,
-            start_x=110.0, start_y=97.46, end_x=130.0, end_y=97.46,
-        ))
-        result = self._call(tools, schematic_path=tmp_sch)
-        assert result.get("success") is True
-        for w in result["wires"]:
-            assert isinstance(w["start"]["x"], float)
-            assert isinstance(w["start"]["y"], float)
-            assert isinstance(w["end"]["x"], float)
-            assert isinstance(w["end"]["y"], float)
-
-
-# ---------------------------------------------------------------------------
 # delete_wire_from_schematic — tests
 # ---------------------------------------------------------------------------
 
 class TestDeleteWireFromSchematic:
 
-    def _call(self, tools, **kwargs):
-        return asyncio.run(tools["delete_wire_from_schematic"](**kwargs))
+    def _call(self, tools, schematic_path, wires, **kwargs):
+        return asyncio.run(tools["delete_wire_from_schematic"](
+            schematic_path=schematic_path,
+            wires=wires,
+            **kwargs,
+        ))
 
     def _add_wire(self, tools, tmp_sch, sx, sy, ex, ey):
         return asyncio.run(tools["add_wire_to_schematic"](
@@ -399,28 +334,34 @@ class TestDeleteWireFromSchematic:
             start_x=sx, start_y=sy, end_x=ex, end_y=ey,
         ))
 
+    def _spec(self, sx, sy, ex, ey):
+        return {"start_x": sx, "start_y": sy, "end_x": ex, "end_y": ey}
+
     # --- validation errors ---------------------------------------------------
 
     def test_wrong_extension(self, tools):
         result = self._call(tools, schematic_path="/tmp/bad.txt",
-                            start_x=0, start_y=0, end_x=10, end_y=0)
+                            wires=[self._spec(0, 0, 10, 0)])
         assert "error" in result
 
     def test_file_not_found(self, tools):
         result = self._call(tools, schematic_path="/tmp/no_such.kicad_sch",
-                            start_x=0, start_y=0, end_x=10, end_y=0)
+                            wires=[self._spec(0, 0, 10, 0)])
+        assert "error" in result
+
+    def test_empty_wires_list(self, tools):
+        result = self._call(tools, schematic_path=SCHEMATIC_PATH, wires=[])
         assert "error" in result
 
     def test_non_finite_coordinate(self, tools):
         import math as _math
         result = self._call(tools, schematic_path=SCHEMATIC_PATH,
-                            start_x=_math.inf, start_y=0, end_x=10, end_y=0)
+                            wires=[self._spec(_math.inf, 0, 10, 0)])
         assert "error" in result
 
     def test_no_matching_wire(self, tools, tmp_sch):
         result = self._call(tools, schematic_path=tmp_sch,
-                            start_x=999.0, start_y=999.0,
-                            end_x=1000.0, end_y=999.0)
+                            wires=[self._spec(999.0, 999.0, 1000.0, 999.0)])
         assert "error" in result
 
     # --- happy path ----------------------------------------------------------
@@ -428,8 +369,7 @@ class TestDeleteWireFromSchematic:
     def test_delete_exact_wire(self, tools, tmp_sch):
         self._add_wire(tools, tmp_sch, 100.0, 97.46, 120.0, 97.46)
         result = self._call(tools, schematic_path=tmp_sch,
-                            start_x=100.0, start_y=97.46,
-                            end_x=120.0, end_y=97.46)
+                            wires=[self._spec(100.0, 97.46, 120.0, 97.46)])
         assert result.get("success") is True
         assert result["deleted_count"] == 1
 
@@ -440,8 +380,7 @@ class TestDeleteWireFromSchematic:
         """Wire stored as A→B should also be found when queried as B→A."""
         self._add_wire(tools, tmp_sch, 100.0, 97.46, 120.0, 97.46)
         result = self._call(tools, schematic_path=tmp_sch,
-                            start_x=120.0, start_y=97.46,
-                            end_x=100.0, end_y=97.46)
+                            wires=[self._spec(120.0, 97.46, 100.0, 97.46)])
         assert result.get("success") is True
         assert result["deleted_count"] == 1
 
@@ -450,8 +389,7 @@ class TestDeleteWireFromSchematic:
         self._add_wire(tools, tmp_sch, 100.0, 102.54, 120.0, 102.54)
 
         result = self._call(tools, schematic_path=tmp_sch,
-                            start_x=100.0, start_y=97.46,
-                            end_x=120.0, end_y=97.46)
+                            wires=[self._spec(100.0, 97.46, 120.0, 97.46)])
         assert result.get("success") is True
         assert result["deleted_count"] == 1
 
@@ -460,11 +398,41 @@ class TestDeleteWireFromSchematic:
         assert len(remaining) == 1
         assert abs(remaining[0].start.value[1] - 102.54) < 0.01
 
+    def test_delete_batch_two_wires(self, tools, tmp_sch):
+        """Batch deletion removes two wires in a single call."""
+        self._add_wire(tools, tmp_sch, 100.0, 97.46, 120.0, 97.46)
+        self._add_wire(tools, tmp_sch, 100.0, 102.54, 120.0, 102.54)
+
+        result = self._call(tools, schematic_path=tmp_sch, wires=[
+            self._spec(100.0, 97.46, 120.0, 97.46),
+            self._spec(100.0, 102.54, 120.0, 102.54),
+        ])
+        assert result.get("success") is True
+        assert result["deleted_count"] == 2
+        assert "not_found" not in result
+
+        sch2 = skip.Schematic(tmp_sch)
+        assert len(list(sch2.wire)) == 0
+
+    def test_batch_partial_match_reports_not_found(self, tools, tmp_sch):
+        """Specs with no match are reported in not_found, matched ones are deleted."""
+        self._add_wire(tools, tmp_sch, 100.0, 97.46, 120.0, 97.46)
+
+        result = self._call(tools, schematic_path=tmp_sch, wires=[
+            self._spec(100.0, 97.46, 120.0, 97.46),   # index 0 — exists
+            self._spec(999.0, 999.0, 1000.0, 999.0),  # index 1 — does not exist
+        ])
+        assert result.get("success") is True
+        assert result["deleted_count"] == 1
+        assert result.get("not_found") == [1]
+
+        sch2 = skip.Schematic(tmp_sch)
+        assert len(list(sch2.wire)) == 0
+
     def test_backup_created(self, tools, tmp_sch):
         self._add_wire(tools, tmp_sch, 100.0, 97.46, 120.0, 97.46)
         self._call(tools, schematic_path=tmp_sch,
-                   start_x=100.0, start_y=97.46,
-                   end_x=120.0, end_y=97.46)
+                   wires=[self._spec(100.0, 97.46, 120.0, 97.46)])
         assert os.path.exists(tmp_sch + ".bak")
 
 
