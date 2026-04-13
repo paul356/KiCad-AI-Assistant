@@ -371,7 +371,8 @@ def _build_placed_symbol(
         *([[sexpdata.Symbol("fields_autoplaced"), sexpdata.Symbol("yes")]] if fields_autoplaced else []),
         [sexpdata.Symbol("uuid"), sym_uuid],
         _build_property("Reference", reference, x + ref_dx, y + ref_dy, 0,
-                         justify="left", do_not_autoplace=not fields_autoplaced),
+                         justify="left", do_not_autoplace=not fields_autoplaced,
+                         hide=reference.startswith("#")),
         _build_property("Value", value, x + val_dx, y + val_dy, 0,
                          justify="left", do_not_autoplace=not fields_autoplaced),
     ]
@@ -1094,29 +1095,45 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
 
             for sym in units:
                 at = sym.at.value
-                new_x = x if x is not None else at[0]
-                new_y = y if y is not None else at[1]
+                old_x = at[0]
+                old_y = at[1]
+                new_x = x if x is not None else old_x
+                new_y = y if y is not None else old_y
                 new_rot = rotation if rotation is not None else (at[2] if len(at) > 2 else 0)
+                dx = new_x - old_x
+                dy = new_y - old_y
                 sym.at.value = [new_x, new_y, new_rot]
-                # Mark fields_autoplaced so KiCad repositions the Reference/
-                # Value labels on next open (they would otherwise be stale).
+                # Shift every property's (at x y rot) by the same delta so
+                # Reference/Value and other field labels move with the symbol.
+                # Also ensure fields_autoplaced is set so KiCad's GUI knows
+                # to reflow fields if the user manually opens the file.
                 try:
                     raw_tree = sym._pv._tree
-                    # Check whether (fields_autoplaced yes) already exists.
                     fa_found = False
                     for child in raw_tree:
                         if (
                             isinstance(child, list)
                             and len(child) >= 2
                             and isinstance(child[0], sexpdata.Symbol)
-                            and child[0].value() == "fields_autoplaced"
                         ):
-                            child[1] = sexpdata.Symbol("yes")
-                            fa_found = True
-                            break
+                            tag = child[0].value()
+                            if tag == "fields_autoplaced":
+                                child[1] = sexpdata.Symbol("yes")
+                                fa_found = True
+                            elif tag == "property":
+                                # Shift the (at px py rot) sub-node
+                                for sub in child[2:]:
+                                    if (
+                                        isinstance(sub, list)
+                                        and len(sub) >= 3
+                                        and isinstance(sub[0], sexpdata.Symbol)
+                                        and sub[0].value() == "at"
+                                    ):
+                                        sub[1] = round(float(sub[1]) + dx, 4)
+                                        sub[2] = round(float(sub[2]) + dy, 4)
+                                        break
                     if not fa_found:
                         fa_node = [sexpdata.Symbol("fields_autoplaced"), sexpdata.Symbol("yes")]
-                        # Insert before uuid to match canonical KiCad S-expression ordering.
                         uuid_idx = next(
                             (
                                 i for i, child in enumerate(raw_tree)
@@ -1125,11 +1142,11 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
                                 and isinstance(child[0], sexpdata.Symbol)
                                 and child[0].value() == "uuid"
                             ),
-                            len(raw_tree),  # fallback: append if uuid not found
+                            len(raw_tree),
                         )
                         raw_tree.insert(uuid_idx, fa_node)
                 except Exception:
-                    pass  # non-critical; position/rotation still applied
+                    pass  # non-critical; symbol position still applied
 
             try:
                 shutil.copy(schematic_path, schematic_path + ".bak")

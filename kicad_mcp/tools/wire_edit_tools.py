@@ -104,6 +104,8 @@ def _route_candidates(
       3. L-B: vertical-first via corner (x1, y2).
       4-10.  7 horizontal Z-routes: jog at x = x1 + k*(x2−x1)/8 for k=1..7.
       11-17. 7 vertical Z-routes:   jog at y = y1 + k*(y2−y1)/8 for k=1..7.
+      18-29. U-detours for the collinear case (same axis, direct route blocked):
+             jog ±2.54, ±5.08, ±7.62 mm perpendicular, crossing full span, then back.
     """
     candidates: list[list[tuple[float, float, float, float]]] = []
     dx = x2 - x1
@@ -136,6 +138,34 @@ def _route_candidates(
                 (x1, yj, x2, yj),
                 (x2, yj, x2, y2),
             ])
+
+    # U-detours: used when the direct axis-aligned route is blocked by an
+    # existing wire.  Jog perpendicular to the connecting axis by multiples
+    # of one KiCad grid step (2.54 mm), then bridge the full span, then
+    # return.  Both perpendicular directions are tried at each offset so the
+    # router can pick whichever side has open space.
+    _GRID = 2.54
+    _U_STEPS = [1, 2, 3]  # grid multiples to try: 2.54, 5.08, 7.62 mm
+    if abs(dy) < 1e-9 and abs(dx) > 1e-9:
+        # Horizontal collinear: jog in ±y
+        for n in _U_STEPS:
+            for yoff in (n * _GRID, -n * _GRID):
+                yj = y1 + yoff
+                candidates.append([
+                    (x1, y1, x1, yj),
+                    (x1, yj, x2, yj),
+                    (x2, yj, x2, y2),
+                ])
+    elif abs(dx) < 1e-9 and abs(dy) > 1e-9:
+        # Vertical collinear: jog in ±x
+        for n in _U_STEPS:
+            for xoff in (n * _GRID, -n * _GRID):
+                xj = x1 + xoff
+                candidates.append([
+                    (x1, y1, xj, y1),
+                    (xj, y1, xj, y2),
+                    (xj, y2, x2, y2),
+                ])
 
     return candidates
 
@@ -233,6 +263,78 @@ def _collect_existing_wires(sch: Any) -> list[tuple[float, float, float, float]]
     return wires
 
 
+def _follow_wire_extent(
+    sx: float, sy: float,
+    angle: float,
+    existing_wires: list[tuple[float, float, float, float]],
+    tol: float,
+    obstacle_pins: list[tuple[float, float]] | None = None,
+) -> tuple[float, float]:
+    """Return the farthest point reachable from (sx, sy) along connected wire
+    segments in the given angle direction without any gap.
+
+    Used when a lead-out would overlap an existing wire: instead of starting the
+    inner route just one lead-out step from the pin, we follow the existing wire
+    network all the way to where it ends so the inner route begins past the
+    entire existing segment chain.
+
+    Args:
+        obstacle_pins: If provided, traversal stops before stepping onto any of
+            these pin positions.  The current position (not the blocked pin) is
+            returned.
+    """
+    dvx, dvy = _dir_vec(angle)
+    cx, cy = sx, sy
+    visited: set[int] = set()
+    while True:
+        found = False
+        for idx, (ax, ay, bx, by) in enumerate(existing_wires):
+            if idx in visited:
+                continue
+            for (ex, ey, ox, oy) in ((ax, ay, bx, by), (bx, by, ax, ay)):
+                if abs(ex - cx) > tol or abs(ey - cy) > tol:
+                    continue
+                dx, dy = ox - cx, oy - cy
+                dist = math.sqrt(dx * dx + dy * dy)
+                if dist < tol:
+                    continue
+                if abs(dx / dist - dvx) < 0.1 and abs(dy / dist - dvy) < 0.1:
+                    # Stop before landing on a component pin
+                    if obstacle_pins and any(
+                        abs(ox - px) <= tol and abs(oy - py) <= tol
+                        for px, py in obstacle_pins
+                    ):
+                        continue
+                    visited.add(idx)
+                    cx, cy = ox, oy
+                    found = True
+                    break
+            if found:
+                break
+        if not found:
+            break
+    return cx, cy
+
+
+def _infer_angles_toward(
+    x1: float, y1: float, x2: float, y2: float,
+) -> list[float]:
+    """Return axis-aligned angles from (x1,y1) that point toward (x2,y2).
+
+    For axis-aligned targets (same row or column), returns a single angle.
+    For diagonal targets, returns both the horizontal and vertical component
+    angles so callers can try each direction independently.
+    """
+    angles: list[float] = []
+    dx = x2 - x1
+    dy = y2 - y1
+    if abs(dx) > 1e-9:
+        angles.append(0.0 if dx > 0 else 180.0)
+    if abs(dy) > 1e-9:
+        angles.append(90.0 if dy > 0 else 270.0)
+    return angles
+
+
 # ---------------------------------------------------------------------------
 # Smart wire router
 # ---------------------------------------------------------------------------
@@ -252,11 +354,18 @@ def _draw_smart_wire(
     Algorithm:
       1. Compute a lead-out stub from each endpoint following the pin's exit
          direction (if angle is supplied), moving the route into open space.
+         If a lead would overlap an existing wire (pin already connected in
+         that direction), the lead is suppressed and the inner route starts
+         from the lead endpoint — no duplicate segment is drawn.
       2. Try up to 16 candidate inner routes between the lead-out endpoints.
       3. Pick the first candidate where no obstacle pin falls on the interior
          of any segment AND no segment overlaps an existing wire.
-      4. Fall back to L-A (horizontal-first) with a logged warning when all
-         candidates are blocked.
+      4. If all candidates are blocked, draw nothing and return False.
+
+    When a lead-out is suppressed (an existing wire already covers that
+    direction from the pin), the routing start/end point is advanced to the
+    far end of the existing wire chain via _follow_wire_extent, and a junction
+    dot is placed there to mark the new T-branch.
 
     Args:
         sch: The skip schematic object.
@@ -271,8 +380,8 @@ def _draw_smart_wire(
         lead_out_dist: Length of each lead-out stub in mm (default 2.54 mm).
 
     Returns:
-        True if a collision-free, non-overlapping route was found, False if
-        the fallback was used.
+        True if a valid route was found and drawn, False if no valid route
+        exists (nothing is drawn in that case).
     """
     obstacles = obstacle_pins or []
 
@@ -291,19 +400,39 @@ def _draw_smart_wire(
     else:
         p2x, p2y = ex, ey
 
-    # Build lead-out segments separately so they can be ordered correctly for
-    # merging: start_lead → inner... → end_lead.  The end lead-out is stored
-    # reversed (pin→inner-endpoint becomes inner-endpoint→pin) so that when
+    # Build lead-out segments.  If a lead would overlap an existing wire
+    # (the pin already has a wire leaving in that direction), suppress the
+    # lead segment — the existing wire covers that path — but keep p1/p2 at
+    # the lead endpoint so the inner route still starts/ends in open space.
+    # This avoids duplicate wire segments when a pin has multiple connections.
+    #
+    # The end lead-out is stored reversed (inner-endpoint → pin) so that when
     # all segments are concatenated the end of one segment always touches the
-    # start of the next — a prerequisite for _merge_collinear_segments to
-    # collapse collinear neighbours.
+    # start of the next — a prerequisite for _merge_collinear_segments.
     start_lead: list[tuple[float, float, float, float]] = []
     end_lead: list[tuple[float, float, float, float]] = []
+    start_suppressed = False
+    end_suppressed = False
     if start_angle is not None and (abs(p1x - sx) > 1e-9 or abs(p1y - sy) > 1e-9):
-        start_lead.append((sx, sy, p1x, p1y))
+        seg = (sx, sy, p1x, p1y)
+        if not _route_overlaps_wires([seg], existing_wires, _PIN_COLLISION_TOL):
+            start_lead.append(seg)
+        else:
+            # Existing wire already covers the lead direction.  Advance p1 to
+            # the far end of the existing wire chain so the inner route starts
+            # past the entire covered segment.  A junction will be placed at
+            # p1 after drawing to mark the new T-branch.
+            p1x, p1y = _follow_wire_extent(sx, sy, start_angle, existing_wires, _PIN_COLLISION_TOL)
+            start_suppressed = True
     if end_angle is not None and (abs(p2x - ex) > 1e-9 or abs(p2y - ey) > 1e-9):
-        # Reversed: inner-endpoint → pin, so it continues naturally from chosen
-        end_lead.append((p2x, p2y, ex, ey))
+        seg = (ex, ey, p2x, p2y)  # canonical direction for overlap check
+        if not _route_overlaps_wires([seg], existing_wires, _PIN_COLLISION_TOL):
+            # Reversed: inner-endpoint → pin, so it continues naturally from chosen
+            end_lead.append((p2x, p2y, ex, ey))
+        else:
+            # Same: advance p2 to the far end of the existing wire chain.
+            p2x, p2y = _follow_wire_extent(ex, ey, end_angle, existing_wires, _PIN_COLLISION_TOL)
+            end_suppressed = True
 
     # For collision detection the direction of each segment doesn't matter
     lead_segs = start_lead + [(a, b, c, d) for (c, d, a, b) in end_lead]
@@ -318,16 +447,13 @@ def _draw_smart_wire(
             chosen = candidate
             break
 
-    collision_free = True
     if chosen is None:
         log.warning(
             "smart_wire: all %d route candidates are blocked (pin collision or "
-            "wire overlap) between (%.3f,%.3f) and (%.3f,%.3f); using L-A fallback.",
+            "wire overlap) between (%.3f,%.3f) and (%.3f,%.3f); no wire drawn.",
             len(inner_candidates), sx, sy, ex, ey,
         )
-        # Fallback: use first (L-A or direct) candidate
-        chosen = inner_candidates[0] if inner_candidates else [(p1x, p1y, p2x, p2y)]
-        collision_free = False
+        return False
 
     # Draw all segments, merging collinear neighbours first.
     # Order: start_lead → inner segments → end_lead (reversed) ensures that
@@ -341,7 +467,18 @@ def _draw_smart_wire(
         w.start_at([ax, ay])
         w.end_at([bx, by])
 
-    return collision_free
+    # Place junction dots at suppressed-lead endpoints.  These are T-branch
+    # points where the new route branches off an existing wire.
+    for jx, jy in (
+        [(p1x, p1y)] if start_suppressed else []
+    ) + (
+        [(p2x, p2y)] if end_suppressed else []
+    ):
+        if not _junction_exists_at(sch, jx, jy):
+            j = sch.junction.new()
+            j.at.value = [jx, jy]
+
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -502,21 +639,115 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
             # through them or overlapping with them.
             obstacles = _collect_all_pin_positions(sch)
             existing_wires = _collect_existing_wires(sch)
-            _draw_smart_wire(
-                sch, start_x, start_y, end_x, end_y,
+
+            # For each endpoint, if it lies on the interior of an existing wire
+            # and that wire's axis aligns with a routing direction toward the
+            # other endpoint, advance the effective coordinate to the wire's
+            # endpoint that lies in that direction — but only if that endpoint
+            # is not a component pin.  A junction is placed at the followed-to
+            # point because the new wire joins an existing wire tip there.
+            tol = _PIN_COLLISION_TOL
+            start_eff_x, start_eff_y = start_x, start_y
+            end_eff_x, end_eff_y = end_x, end_y
+
+            def _is_pin_pos(px: float, py: float) -> bool:
+                return any(
+                    abs(px - ox) <= tol and abs(py - oy) <= tol
+                    for ox, oy in obstacles
+                )
+
+            def _try_follow_wire(
+                px: float, py: float,
+                tx: float, ty: float,
+            ) -> tuple[float, float] | None:
+                """Try to advance (px,py) along an existing wire toward (tx,ty).
+
+                Two cases are handled for each axis-aligned direction toward target:
+                  1. Interior point: (px,py) lies strictly inside a wire aligned
+                     with that direction → snap to the wire endpoint in that direction.
+                  2. Endpoint: (px,py) is a wire endpoint and the wire continues in
+                     that direction → follow the full chain to its far end.
+
+                Returns the advanced coordinate if it is not a pin, else None.
+                """
+                for angle in _infer_angles_toward(px, py, tx, ty):
+                    # direction vector for this angle
+                    rad = math.radians(angle)
+                    dvx = round(math.cos(rad))  # 1, 0, or -1
+                    dvy = round(math.sin(rad))  # 1, 0, or -1
+                    dir_horiz = abs(dvy) < 1e-9
+                    dir_vert = abs(dvx) < 1e-9
+                    for ax, ay, bx, by in existing_wires:
+                        wire_horiz = abs(ay - by) < 1e-9
+                        wire_vert = abs(ax - bx) < 1e-9
+                        if dir_horiz and not wire_horiz:
+                            continue
+                        if dir_vert and not wire_vert:
+                            continue
+                        # Case 1: interior point → snap to endpoint in direction
+                        if _point_on_open_segment(px, py, ax, ay, bx, by, tol):
+                            dot_a = (ax - px) * dvx + (ay - py) * dvy
+                            dot_b = (bx - px) * dvx + (by - py) * dvy
+                            cand_x, cand_y = (ax, ay) if dot_a > dot_b else (bx, by)
+                            if not _is_pin_pos(cand_x, cand_y):
+                                return (cand_x, cand_y)
+                        # Case 2: at wire endpoint, wire continues in direction
+                        at_a = abs(ax - px) <= tol and abs(ay - py) <= tol
+                        at_b = abs(bx - px) <= tol and abs(by - py) <= tol
+                        if at_a or at_b:
+                            other_x, other_y = (bx, by) if at_a else (ax, ay)
+                            dot = (other_x - px) * dvx + (other_y - py) * dvy
+                            if dot > tol:
+                                adv = _follow_wire_extent(
+                                    px, py, angle, existing_wires, tol,
+                                    obstacle_pins=obstacles,
+                                )
+                                if not _is_pin_pos(adv[0], adv[1]):
+                                    return adv
+                return None
+
+            # Track which effective endpoints were produced by following, so
+            # we can place junctions there.
+            followed_junctions: list[tuple[float, float]] = []
+
+            result = _try_follow_wire(start_x, start_y, end_x, end_y)
+            if result is not None:
+                start_eff_x, start_eff_y = result
+                followed_junctions.append(result)
+
+            result = _try_follow_wire(end_x, end_y, start_x, start_y)
+            if result is not None:
+                end_eff_x, end_eff_y = result
+                followed_junctions.append(result)
+
+            if start_eff_x == end_eff_x and start_eff_y == end_eff_y:
+                return {"error": "Wire endpoints converge to the same coordinate after following existing wire chains"}
+
+            # Auto-junction: if an original endpoint already has a wire
+            # connected there, place a junction so the T-connection is explicit.
+            # Also place junctions at any points reached by wire-extent following.
+            junctions_added = []
+            for jx, jy, flag in [
+                (start_x, start_y, add_junction_start),
+                (end_x, end_y, add_junction_end),
+            ]:
+                if flag or (_wire_connected_at(sch, jx, jy) and not _junction_exists_at(sch, jx, jy)):
+                    j = sch.junction.new()
+                    j.at.value = [jx, jy]
+                    junctions_added.append({"x": jx, "y": jy})
+            for jx, jy in followed_junctions:
+                if not _junction_exists_at(sch, jx, jy):
+                    j = sch.junction.new()
+                    j.at.value = [jx, jy]
+                    junctions_added.append({"x": jx, "y": jy})
+
+            ok = _draw_smart_wire(
+                sch, start_eff_x, start_eff_y, end_eff_x, end_eff_y,
                 existing_wires=existing_wires,
                 obstacle_pins=obstacles,
             )
-
-            junctions_added = []
-            if add_junction_start:
-                j = sch.junction.new()
-                j.at.value = [start_x, start_y]
-                junctions_added.append({"x": start_x, "y": start_y})
-            if add_junction_end:
-                j = sch.junction.new()
-                j.at.value = [end_x, end_y]
-                junctions_added.append({"x": end_x, "y": end_y})
+            if not ok:
+                return {"error": "No valid route found: all routing candidates overlap existing wires or collide with component pins"}
 
             shutil.copy(schematic_path, schematic_path + ".bak")
             sch.write(schematic_path)
@@ -610,16 +841,17 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
             obstacles = _collect_all_pin_positions(sch)
             existing_wires = _collect_existing_wires(sch)
 
-            collision_free: bool | None = None
             # Smart routing: follow pin exit directions, avoid all other pins
             # and existing wire segments
-            collision_free = _draw_smart_wire(
+            ok = _draw_smart_wire(
                 sch, start_x, start_y, end_x, end_y,
                 existing_wires=existing_wires,
                 start_angle=start_angle,
                 end_angle=end_angle,
                 obstacle_pins=obstacles,
             )
+            if not ok:
+                return {"error": f"No valid route found between {from_ref} pin {from_pin} and {to_ref} pin {to_pin}: all routing candidates overlap existing wires or collide with component pins"}
 
             shutil.copy(schematic_path, schematic_path + ".bak")
             sch.write(schematic_path)
@@ -633,8 +865,6 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
                 "to": {"ref": to_ref, "pin": to_pin, "x": end_x, "y": end_y},
             },
         }
-        if collision_free is not None:
-            result["collision_free"] = collision_free
         if auto_junctions:
             result["auto_junctions_added"] = auto_junctions
         return result
