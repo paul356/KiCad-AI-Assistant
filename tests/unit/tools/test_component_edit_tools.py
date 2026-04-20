@@ -266,18 +266,19 @@ class TestRemoveSymbolFromSchematic:
         result = asyncio.run(
             tools["remove_symbol_from_schematic"](
                 schematic_path=tmp_sch,
-                reference="R2",
+                references=["R2"],
             )
         )
         assert result.get("success") is True, result
-        assert result["removed_units"] >= 1
+        assert result["total_removed_units"] >= 1
+        assert result["results"]["R2"]["removed_units"] >= 1
 
     def test_removed_symbol_no_longer_in_schematic(self, tools, tmp_sch):
         """After removing R2, loading the schematic should show no R2."""
         asyncio.run(
             tools["remove_symbol_from_schematic"](
                 schematic_path=tmp_sch,
-                reference="R2",
+                references=["R2"],
             )
         )
         sch = skip.Schematic(tmp_sch)
@@ -297,7 +298,7 @@ class TestRemoveSymbolFromSchematic:
         asyncio.run(
             tools["remove_symbol_from_schematic"](
                 schematic_path=tmp_sch,
-                reference="R2",
+                references=["R2"],
             )
         )
         sch = skip.Schematic(tmp_sch)
@@ -318,7 +319,7 @@ class TestRemoveSymbolFromSchematic:
         asyncio.run(
             tools["remove_symbol_from_schematic"](
                 schematic_path=tmp_sch,
-                reference="R2",
+                references=["R2"],
             )
         )
         assert os.path.exists(tmp_sch + ".bak")
@@ -328,7 +329,7 @@ class TestRemoveSymbolFromSchematic:
         result = asyncio.run(
             tools["remove_symbol_from_schematic"](
                 schematic_path=tmp_sch,
-                reference="Z99",
+                references=["Z99"],
             )
         )
         assert "error" in result
@@ -338,10 +339,59 @@ class TestRemoveSymbolFromSchematic:
         result = asyncio.run(
             tools["remove_symbol_from_schematic"](
                 schematic_path="/tmp/bogus.txt",
-                reference="R2",
+                references=["R2"],
             )
         )
         assert "error" in result
+
+    def test_empty_references_list_returns_error(self, tools, tmp_sch):
+        """An empty references list should be rejected immediately."""
+        result = asyncio.run(
+            tools["remove_symbol_from_schematic"](
+                schematic_path=tmp_sch,
+                references=[],
+            )
+        )
+        assert "error" in result
+
+    def test_batch_remove_multiple_symbols(self, tools, tmp_sch):
+        """Batch delete R2 and R3 in one call; both should be gone afterwards."""
+        result = asyncio.run(
+            tools["remove_symbol_from_schematic"](
+                schematic_path=tmp_sch,
+                references=["R2", "R3"],
+            )
+        )
+        assert result.get("success") is True, result
+        assert result["total_removed_units"] >= 2
+        assert result["results"]["R2"]["removed_units"] >= 1
+        assert result["results"]["R3"]["removed_units"] >= 1
+
+        sch = skip.Schematic(tmp_sch)
+        refs = set()
+        try:
+            for sym in sch.symbol:
+                try:
+                    refs.add(sym.property.Reference.value)
+                except AttributeError:
+                    pass
+        except AttributeError:
+            pass
+        assert "R2" not in refs, "R2 should have been removed"
+        assert "R3" not in refs, "R3 should have been removed"
+
+    def test_batch_partial_not_found_reports_per_entry(self, tools, tmp_sch):
+        """When some references exist and some don't, successes and errors are reported per entry."""
+        result = asyncio.run(
+            tools["remove_symbol_from_schematic"](
+                schematic_path=tmp_sch,
+                references=["R2", "Z99"],
+            )
+        )
+        # Overall: at least one was removed so success=True
+        assert result.get("success") is True, result
+        assert result["results"]["R2"]["removed_units"] >= 1
+        assert "error" in result["results"]["Z99"]
 
 
 # ---------------------------------------------------------------------------

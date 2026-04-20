@@ -429,7 +429,7 @@ class TestGetSymbolPins:
         assert result["pin_count"] > 0
 
     def test_pin_fields(self):
-        """Each pin has exactly number, name, type, angle keys; angle is an int."""
+        """Each pin has exactly number, name, type, direction keys; direction is a str."""
         raw = _load_fixture_symbol(_FIXTURE_SYM, "R_Small")
         mock_mgr = self._make_mock_mgr()
 
@@ -438,8 +438,8 @@ class TestGetSymbolPins:
             result = _call("get_symbol_pins", library_name="Device", symbol_name="R_Small")
 
         for pin in result["pins"]:
-            assert set(pin.keys()) == {"number", "name", "type", "angle"}
-            assert isinstance(pin["angle"], int)
+            assert set(pin.keys()) == {"number", "name", "type", "direction"}
+            assert isinstance(pin["direction"], str)
 
     def test_pin_count_matches_list(self):
         """result['pin_count'] == len(result['pins'])."""
@@ -512,7 +512,7 @@ class TestGetSymbolPins:
         assert "error" in result
 
     def test_r_small_exact_pin_values(self):
-        """Exact pin field values for R_Small: number, empty name, passive type, angles."""
+        """Exact pin field values for R_Small: number, empty name, passive type, directions."""
         raw = _load_fixture_symbol(_FIXTURE_SYM, "R_Small")
         mock_mgr = self._make_mock_mgr()
 
@@ -521,8 +521,8 @@ class TestGetSymbolPins:
             result = _call("get_symbol_pins", library_name="Device", symbol_name="R_Small")
 
         by_num = {p["number"]: p for p in result["pins"]}
-        assert by_num["1"] == {"number": "1", "name": "", "type": "passive", "angle": 270}
-        assert by_num["2"] == {"number": "2", "name": "", "type": "passive", "angle": 90}
+        assert by_num["1"] == {"number": "1", "name": "", "type": "passive", "direction": "down"}
+        assert by_num["2"] == {"number": "2", "name": "", "type": "passive", "direction": "up"}
 
 
 # ---------------------------------------------------------------------------
@@ -556,21 +556,22 @@ class TestParseLibPins:
         for pin in pins:
             assert pin["type"] == "passive"
 
-    def test_pin_angles_are_normalised_ints(self):
-        """Every parsed angle is an int in [0, 359]."""
+    def test_pin_directions_are_valid_strings(self):
+        """Every parsed direction is a valid string from the expected set."""
         raw = _load_fixture_symbol(_FIXTURE_SYM, "R_Small")
         pins = self._parse(raw)
+        valid = {"right", "up", "left", "down"}
         for pin in pins:
-            assert isinstance(pin["angle"], int)
-            assert 0 <= pin["angle"] < 360
+            assert isinstance(pin["direction"], str)
+            assert pin["direction"] in valid
 
-    def test_pin_angles_match_fixture(self):
-        """Pin 1 is at 270° and pin 2 is at 90° in the fixture file."""
+    def test_pin_directions_match_fixture(self):
+        """Pin 1 is at 270° (→ 'down' in lib-space) and pin 2 is at 90° (→ 'up') in fixture."""
         raw = _load_fixture_symbol(_FIXTURE_SYM, "R_Small")
         pins = self._parse(raw)
         by_num = {p["number"]: p for p in pins}
-        assert by_num["1"]["angle"] == 270
-        assert by_num["2"]["angle"] == 90
+        assert by_num["1"]["direction"] == "down"
+        assert by_num["2"]["direction"] == "up"
 
     def test_no_duplicate_pin_numbers(self):
         """_parse_lib_pins deduplicates pins with the same number."""

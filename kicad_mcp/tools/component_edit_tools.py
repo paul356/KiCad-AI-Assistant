@@ -26,6 +26,19 @@ from kicad_mcp.utils.symbol_index_reader import SymbolIndexReader
 
 log = logging.getLogger(__name__)
 
+
+def _angle_to_direction(angle_deg: int | float) -> str:
+    """Convert a screen-space label/pin angle to a human-readable direction string.
+
+    KiCad schematic uses Y-down screen coordinates:
+      0   → "right"  (+X)
+      90  → "down"   (+Y screen)
+      180 → "left"   (-X)
+      270 → "up"     (-Y screen)
+    """
+    a = int(round(float(angle_deg))) % 360
+    return {0: "right", 90: "down", 180: "left", 270: "up"}.get(a, f"{a}deg")
+
 # ---------------------------------------------------------------------------
 # Symbol index manager singleton
 # ---------------------------------------------------------------------------
@@ -651,27 +664,35 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
     @mcp.tool()
     async def remove_symbol_from_schematic(
         schematic_path: str,
-        reference: str,
+        references: list[str],
         ctx: Context | None = None,
     ) -> dict[str, Any]:
-        """Remove all placed symbol units with the given reference designator.
+        """Remove placed symbol units for one or more reference designators.
 
         Removes every ``(symbol ...)`` entry whose Reference property matches
-        *reference* (case-sensitive).  Also removes the corresponding
-        ``(lib_symbols ...)`` entry when no other placed symbol still uses
-        that lib_id.  A backup (.kicad_sch.bak) is written before saving.
+        any entry in *references* (case-sensitive).  Also removes the
+        corresponding ``(lib_symbols ...)`` entry when no other placed symbol
+        still uses that lib_id.  A backup (.kicad_sch.bak) is written before
+        saving.
+
+        Pass a single-element list to remove just one component, or multiple
+        elements to remove several in one operation.
 
         Args:
             schematic_path: Absolute path to the target .kicad_sch file.
-            reference: Reference designator to remove (e.g. "C1").
+            references: List of reference designators to remove (e.g. ["C1",
+                "R3"]).  Must contain at least one entry.
 
         Returns:
-            dict with keys: success (bool), removed_units (int), warnings.
+            dict with keys: success (bool), total_removed_units (int),
+            results (dict mapping each reference to its outcome), warnings.
         """
         if not schematic_path.endswith(".kicad_sch"):
             return {"error": f"Not a .kicad_sch file: {schematic_path!r}"}
         if not os.path.isfile(schematic_path):
             return {"error": f"Schematic file not found: {schematic_path!r}"}
+        if not references:
+            return {"error": "references list must not be empty"}
 
         try:
             sch = skip.Schematic(schematic_path)
@@ -679,8 +700,10 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
             return {"error": f"Failed to open schematic: {exc}"}
 
         try:
-            # Collect units to remove and the lib_ids they use.
-            to_remove = []
+            ref_set = set(references)
+
+            # Collect units to remove grouped by reference.
+            per_ref: dict[str, list] = {r: [] for r in references}
             removed_lib_ids: set[str] = set()
             try:
                 for sym in sch.symbol:
@@ -688,8 +711,8 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
                         ref_val = sym.property.Reference.value
                     except AttributeError:
                         continue
-                    if ref_val == reference:
-                        to_remove.append(sym)
+                    if ref_val in ref_set:
+                        per_ref[ref_val].append(sym)
                         try:
                             removed_lib_ids.add(sym.lib_id.value)
                         except AttributeError:
@@ -697,11 +720,24 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
             except AttributeError:
                 pass  # empty schematic
 
-            if not to_remove:
-                return {"error": f"No symbol with reference {reference!r} found"}
+            # Delete collected units.
+            results: dict[str, Any] = {}
+            total_removed = 0
+            for ref, units in per_ref.items():
+                if not units:
+                    results[ref] = {"error": f"No symbol with reference {ref!r} found"}
+                else:
+                    for sym in units:
+                        sym.delete()
+                    results[ref] = {"removed_units": len(units)}
+                    total_removed += len(units)
 
-            for sym in to_remove:
-                sym.delete()
+            if total_removed == 0:
+                return {
+                    "error": "None of the specified references were found",
+                    "results": results,
+                    "success": False,
+                }
 
             # Remove orphaned lib_symbols entries.
             warnings: list[str] = []
@@ -730,7 +766,8 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
 
             return {
                 "success": True,
-                "removed_units": len(to_remove),
+                "total_removed_units": total_removed,
+                "results": results,
                 "warnings": warnings,
             }
 
@@ -1192,7 +1229,8 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
             angle: Rotation angle in degrees; must be 0, 90, 180, or 270.
 
         Returns:
-            dict with keys: success (bool), label (text, x, y, angle).
+            dict with keys: success (bool), label (text, x, y, direction).
+            direction is one of "right", "down", "left", "up".
         """
         if not schematic_path.endswith(".kicad_sch"):
             return {"error": f"Not a .kicad_sch file: {schematic_path!r}"}
@@ -1220,7 +1258,7 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
         except Exception as exc:
             return {"error": f"Failed to add label: {exc}"}
 
-        return {"success": True, "label": {"text": text, "x": x, "y": y, "angle": angle}}
+        return {"success": True, "label": {"text": text, "x": x, "y": y, "direction": _angle_to_direction(angle)}}
 
     @mcp.tool()
     async def list_labels_in_schematic(
@@ -1236,8 +1274,8 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
             schematic_path: Absolute path to the target .kicad_sch file.
 
         Returns:
-            dict with keys: success (bool), labels (list of {text, x, y, angle}),
-            count (int).
+            dict with keys: success (bool), labels (list of {text, x, y, direction}),
+            count (int). direction is one of "right", "down", "left", "up".
         """
         if not schematic_path.endswith(".kicad_sch"):
             return {"error": f"Not a .kicad_sch file: {schematic_path!r}"}
@@ -1258,7 +1296,7 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
                         "text": str(lbl.value),
                         "x": float(at_val[0]),
                         "y": float(at_val[1]),
-                        "angle": int(at_val[2]) if len(at_val) > 2 else 0,
+                        "direction": _angle_to_direction(at_val[2] if len(at_val) > 2 else 0),
                     })
                 except (AttributeError, IndexError, ValueError):
                     continue
@@ -1270,35 +1308,127 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
     @mcp.tool()
     async def delete_label_from_schematic(
         schematic_path: str,
-        x: float,
-        y: float,
+        x: float = 0.0,
+        y: float = 0.0,
         text: str | None = None,
         tolerance: float = 0.01,
+        positions: list[dict] | None = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
-        """Delete a local net label from a KiCad schematic by its position.
+        """Delete one or more local net labels from a KiCad schematic.
 
-        Removes all local labels whose position matches (x, y) within the
-        specified tolerance. When text is provided, only labels with that exact
-        text are removed. Use list_labels_in_schematic first to obtain the
-        exact coordinates. A backup (.kicad_sch.bak) is written before saving.
+        **Single mode** (default): removes all local labels whose position
+        matches (x, y) within *tolerance*.  When *text* is provided, only
+        labels with that exact text are removed.
+
+        **Batch mode**: when *positions* is provided, the *x*/*y*/*text*
+        parameters are ignored and each entry in *positions* is processed
+        independently.  Each entry is a dict with keys ``x`` (float),
+        ``y`` (float), and optionally ``text`` (str).
+
+        Use list_labels_in_schematic first to obtain exact coordinates.
+        A backup (.kicad_sch.bak) is written before saving.
 
         Args:
             schematic_path: Absolute path to the target .kicad_sch file.
-            x: X coordinate of the label in mm.
-            y: Y coordinate of the label in mm.
-            text: Optional label text to match. When omitted, all labels at
-                (x, y) within tolerance are removed.
+            x: X coordinate of the label in mm (single mode).
+            y: Y coordinate of the label in mm (single mode).
+            text: Optional label text to match (single mode).
             tolerance: Maximum coordinate difference considered a match
-                (default 0.01 mm).
+                (default 0.01 mm).  Applied in both modes.
+            positions: Batch mode — list of dicts, each with ``x``, ``y``,
+                and optional ``text`` keys.
 
         Returns:
-            dict with keys: success (bool), deleted_count (int).
+            Single mode: dict with keys success (bool), deleted_count (int).
+            Batch mode: dict with keys success (bool), total_deleted (int),
+            results (list with per-entry outcome).
         """
         if not schematic_path.endswith(".kicad_sch"):
             return {"error": f"Not a .kicad_sch file: {schematic_path!r}"}
         if not os.path.isfile(schematic_path):
             return {"error": f"Schematic file not found: {schematic_path!r}"}
+
+        # ---- batch mode ------------------------------------------------
+        if positions is not None:
+            if not positions:
+                return {"error": "positions list must not be empty"}
+
+            try:
+                sch = skip.Schematic(schematic_path)
+            except Exception as exc:
+                return {"error": f"Failed to open schematic: {exc}"}
+
+            try:
+                # Build a flat list of all labels once for efficiency.
+                all_labels = []
+                try:
+                    all_labels = list(sch.label)
+                except AttributeError:
+                    pass  # schematic has no labels
+
+                results = []
+                total_deleted = 0
+                global_to_delete: list = []
+
+                for entry in positions:
+                    ex = float(entry.get("x", 0.0))
+                    ey = float(entry.get("y", 0.0))
+                    etxt = entry.get("text")  # may be None
+                    if not math.isfinite(ex) or not math.isfinite(ey):
+                        results.append({"x": ex, "y": ey, "error": "Non-finite coordinates"})
+                        continue
+
+                    matched = []
+                    for lbl in all_labels:
+                        if lbl in global_to_delete:
+                            continue  # already queued for deletion
+                        try:
+                            at_val = lbl.at.value
+                            lx, ly = float(at_val[0]), float(at_val[1])
+                            if abs(lx - ex) <= tolerance and abs(ly - ey) <= tolerance:
+                                if etxt is None or str(lbl.value) == etxt:
+                                    matched.append(lbl)
+                        except (AttributeError, IndexError, ValueError):
+                            continue
+
+                    if not matched:
+                        msg = f"No label found at ({ex}, {ey}) within tolerance {tolerance}"
+                        if etxt is not None:
+                            msg += f" with text {etxt!r}"
+                        entry_result: dict[str, Any] = {"x": ex, "y": ey, "error": msg}
+                        if etxt is not None:
+                            entry_result["text"] = etxt
+                        results.append(entry_result)
+                    else:
+                        global_to_delete.extend(matched)
+                        total_deleted += len(matched)
+                        entry_result = {"x": ex, "y": ey, "deleted_count": len(matched)}
+                        if etxt is not None:
+                            entry_result["text"] = etxt
+                        results.append(entry_result)
+
+                for lbl in global_to_delete:
+                    lbl.delete()
+
+                if total_deleted > 0:
+                    try:
+                        shutil.copy(schematic_path, schematic_path + ".bak")
+                        sch.write(schematic_path)
+                    except Exception as exc:
+                        return {"error": f"Failed to save schematic: {exc}"}
+
+                return {
+                    "success": total_deleted > 0,
+                    "total_deleted": total_deleted,
+                    "results": results,
+                }
+
+            except Exception as exc:
+                log.exception("Unexpected error in delete_label_from_schematic (batch)")
+                return {"error": str(exc), "success": False}
+
+        # ---- single mode -----------------------------------------------
         if not math.isfinite(x) or not math.isfinite(y):
             return {"error": f"Coordinates must be finite numbers (got x={x}, y={y})"}
 

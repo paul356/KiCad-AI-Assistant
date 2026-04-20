@@ -20,6 +20,19 @@ from kicad_mcp.utils.symbol_index_manager import SymbolIndexManager
 
 log = logging.getLogger(__name__)
 
+
+def _lib_angle_to_direction(angle_deg: int) -> str:
+    """Convert a library-space pin angle to a human-readable direction string.
+
+    KiCad .kicad_sym library files use Y-up coordinates:
+      0   → "right"  (+X)
+      90  → "up"     (+Y lib, pointing up on screen)
+      180 → "left"   (-X)
+      270 → "down"   (-Y lib, pointing down on screen)
+    """
+    a = int(round(float(angle_deg))) % 360
+    return {0: "right", 90: "up", 180: "left", 270: "down"}.get(a, f"{a}deg")
+
 # Module-level singleton so the DB connection is reused across tool calls.
 _index_manager: SymbolIndexManager | None = None
 
@@ -93,7 +106,7 @@ def _parse_lib_pins(lib_sym_raw: list) -> list[dict]:
     ``(pin type shape (at x y angle) (length l) (name N ...) (number M ...))``
     entry. Returns one dict per pin:
 
-    ``{"number": str, "name": str, "type": str, "angle": int}``
+    ``{"number": str, "name": str, "type": str, "direction": str}``
     """
     sym_name = lib_sym_raw[1]
     prefix = sym_name + "_"
@@ -135,7 +148,7 @@ def _parse_lib_pins(lib_sym_raw: list) -> list[dict]:
                         "number": pin_number,
                         "name": pin_name,
                         "type": pin_type,
-                        "angle": angle_norm,
+                        "direction": _lib_angle_to_direction(angle_norm),
                     })
             elif tag == "symbol" and isinstance(entry[1], str) and entry[1].startswith(prefix):
                 _walk(entry[2:])
@@ -398,18 +411,18 @@ def register_symbol_tools(mcp: FastMCP) -> None:
 
         Reads the full pin definitions from the .kicad_sym library file and
         returns one entry per pin with its number, name, electrical type, and
-        exit angle in **library coordinate space** (i.e. before any placement
+        exit direction in **library coordinate space** (i.e. before any placement
         rotation or mirroring on a schematic).
 
-        Angle convention in library space (Y increases upward in .kicad_sym):
-        - 0°   = pin exits right (→)
-        - 90°  = pin exits up   (↑)
-        - 180° = pin exits left (←)
-        - 270° = pin exits down (↓)
+        Direction convention in library space (Y increases upward in .kicad_sym):
+        - "right" = pin exits right (→)
+        - "up"    = pin exits up   (↑)
+        - "left"  = pin exits left (←)
+        - "down"  = pin exits down (↓)
 
-        To get the absolute world-space exit angles after a symbol has been
+        To get the absolute world-space exit directions after a symbol has been
         placed on a schematic use ``extract_schematic_netlist`` and look at
-        the ``angle`` field in each component's ``pins`` list.
+        the ``direction`` field in each component's ``pins`` list.
 
         Args:
             library_name: The library name as returned by ``search_symbols``
@@ -418,7 +431,7 @@ def register_symbol_tools(mcp: FastMCP) -> None:
 
         Returns:
             dict with keys: success, library_name, symbol_name, pin_count,
-            pins (list of {number, name, type, angle}).
+            pins (list of {number, name, type, direction}).
         """
         try:
             mgr = _get_index_manager()

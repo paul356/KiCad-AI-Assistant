@@ -11,6 +11,19 @@ import skip
 from kicad_mcp.utils.skip_helpers import sym_pin_world_coords
 
 
+def _angle_to_direction_screen(angle_deg: float) -> str:
+    """Convert a screen-space pin exit angle to a human-readable direction string.
+
+    KiCad schematic uses Y-down screen coordinates:
+      0   → "right"  (+X)
+      90  → "down"   (+Y screen)
+      180 → "left"   (-X)
+      270 → "up"     (-Y screen)
+    """
+    a = int(round(float(angle_deg))) % 360
+    return {0: "right", 90: "down", 180: "left", 270: "up"}.get(a, f"{a}deg")
+
+
 class SchematicParser:
     """Parser for KiCad schematic files to extract netlist information."""
 
@@ -135,7 +148,7 @@ class SchematicParser:
             # for single-pin symbols: power nets, PWR_FLAG, TestPoint, etc.)
             pins_summary: List[Dict[str, str]] = []
             for pin in sym_pin_world_coords(sym):
-                pins_summary.append({'num': pin.number, 'x': str(pin.x), 'y': str(pin.y), 'angle': str(pin.angle)})
+                pins_summary.append({'num': pin.number, 'x': str(pin.x), 'y': str(pin.y), 'direction': _angle_to_direction_screen(pin.angle)})
 
             if pins_summary:
                 comp['pins'] = pins_summary
