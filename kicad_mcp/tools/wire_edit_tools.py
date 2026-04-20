@@ -761,6 +761,8 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
                 "end": {"x": end_x, "y": end_y},
             },
             "junctions_added": junctions_added,
+            "file_modified": schematic_path,
+            "backup_path": schematic_path + ".bak",
         }
 
     @mcp.tool()
@@ -864,6 +866,8 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
                 "from": {"ref": from_ref, "pin": from_pin, "x": start_x, "y": start_y},
                 "to": {"ref": to_ref, "pin": to_pin, "x": end_x, "y": end_y},
             },
+            "file_modified": schematic_path,
+            "backup_path": schematic_path + ".bak",
         }
         if auto_junctions:
             result["auto_junctions_added"] = auto_junctions
@@ -977,7 +981,7 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
         except Exception as exc:
             return {"error": f"Failed to delete wire: {exc}"}
 
-        result: dict[str, Any] = {"success": True, "deleted_count": len(to_delete)}
+        result: dict[str, Any] = {"success": True, "deleted_count": len(to_delete), "file_modified": schematic_path, "backup_path": schematic_path + ".bak"}
         if not_found:
             result["not_found"] = not_found
         return result
@@ -1025,7 +1029,7 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
         except Exception as exc:
             return {"error": f"Failed to add junction: {exc}"}
 
-        return {"success": True, "junction": {"x": x, "y": y}}
+        return {"success": True, "junction": {"x": x, "y": y}, "file_modified": schematic_path, "backup_path": schematic_path + ".bak"}
 
     @mcp.tool()
     async def list_junctions_in_schematic(
@@ -1128,4 +1132,4 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
         except Exception as exc:
             return {"error": f"Failed to delete junction: {exc}"}
 
-        return {"success": True, "deleted_count": len(to_delete)}
+        return {"success": True, "deleted_count": len(to_delete), "file_modified": schematic_path, "backup_path": schematic_path + ".bak"}

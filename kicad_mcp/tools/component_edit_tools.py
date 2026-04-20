@@ -655,6 +655,8 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
                 "units_added": unit_count,
                 "position": {"x": x, "y": y},
                 "warnings": [],
+                "file_modified": schematic_path,
+                "backup_path": schematic_path + ".bak",
             }
 
         except Exception as exc:
@@ -769,6 +771,8 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
                 "total_removed_units": total_removed,
                 "results": results,
                 "warnings": warnings,
+                "file_modified": schematic_path,
+                "backup_path": schematic_path + ".bak",
             }
 
         except Exception as exc:
@@ -896,6 +900,8 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
                 "units_where_updated": updated_count,
                 "units_where_added": added_count,
                 "action": action,
+                "file_modified": schematic_path,
+                "backup_path": schematic_path + ".bak",
             }
 
         except Exception as exc:
@@ -1063,6 +1069,8 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
                 "reference": reference,
                 "property_name": property_name,
                 "units_updated": updated_count,
+                "file_modified": schematic_path,
+                "backup_path": schematic_path + ".bak",
             }
 
         except Exception as exc:
@@ -1191,7 +1199,6 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
             except Exception as exc:
                 return {"error": f"Failed to save schematic: {exc}"}
 
-            # Read back final position from the first unit
             final_at = units[0].at.value
             return {
                 "success": True,
@@ -1199,6 +1206,8 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
                 "position": {"x": final_at[0], "y": final_at[1]},
                 "rotation": final_at[2] if len(final_at) > 2 else 0,
                 "units_updated": len(units),
+                "file_modified": schematic_path,
+                "backup_path": schematic_path + ".bak",
             }
 
         except Exception as exc:
@@ -1258,7 +1267,7 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
         except Exception as exc:
             return {"error": f"Failed to add label: {exc}"}
 
-        return {"success": True, "label": {"text": text, "x": x, "y": y, "direction": _angle_to_direction(angle)}}
+        return {"success": True, "label": {"text": text, "x": x, "y": y, "direction": _angle_to_direction(angle)}, "file_modified": schematic_path, "backup_path": schematic_path + ".bak"}
 
     @mcp.tool()
     async def list_labels_in_schematic(
@@ -1418,11 +1427,15 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
                     except Exception as exc:
                         return {"error": f"Failed to save schematic: {exc}"}
 
-                return {
+                result: dict[str, Any] = {
                     "success": total_deleted > 0,
                     "total_deleted": total_deleted,
                     "results": results,
                 }
+                if total_deleted > 0:
+                    result["file_modified"] = schematic_path
+                    result["backup_path"] = schematic_path + ".bak"
+                return result
 
             except Exception as exc:
                 log.exception("Unexpected error in delete_label_from_schematic (batch)")
@@ -1466,4 +1479,5 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
         except Exception as exc:
             return {"error": f"Failed to delete label: {exc}"}
 
-        return {"success": True, "deleted_count": len(to_delete)}
+        return {"success": True, "deleted_count": len(to_delete), "file_modified": schematic_path, "backup_path": schematic_path + ".bak"}
+

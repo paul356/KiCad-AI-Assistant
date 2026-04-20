@@ -1,52 +1,43 @@
 """
 MCP server creation and configuration.
+
+Two server profiles are supported, selected via the KICAD_MCP_PROFILE environment variable:
+
+  full   (default) — registers all tools, resources, and prompts. Intended for
+                     standalone MCP clients such as Claude Desktop.
+
+  plugin            — registers only the skip-based schematic editing tools
+                     (netlist, symbol, component, wire/junction). No resources,
+                     no prompts, no kicad-cli-dependent tools. Intended for the
+                     KiCad plugin integration where the plugin supplies project
+                     context directly and the LLM drives editing via tool calls.
 """
 import atexit
 import os
 import signal
 import logging
 import functools
-from typing import Callable
+from typing import Callable, Literal
 from fastmcp import FastMCP
 
-# Import resource handlers
-from kicad_mcp.resources.projects import register_project_resources
-from kicad_mcp.resources.files import register_file_resources
-from kicad_mcp.resources.drc_resources import register_drc_resources
-from kicad_mcp.resources.bom_resources import register_bom_resources
-from kicad_mcp.resources.netlist_resources import register_netlist_resources
-from kicad_mcp.resources.pattern_resources import register_pattern_resources
-
-
-# Import tool handlers
-from kicad_mcp.tools.project_tools import register_project_tools
-from kicad_mcp.tools.analysis_tools import register_analysis_tools
-from kicad_mcp.tools.export_tools import register_export_tools
-from kicad_mcp.tools.drc_tools import register_drc_tools
-from kicad_mcp.tools.bom_tools import register_bom_tools
+# Plugin profile tools — always imported (skip-based, no kicad-cli dependency)
 from kicad_mcp.tools.netlist_tools import register_netlist_tools
-from kicad_mcp.tools.pattern_tools import register_pattern_tools
 from kicad_mcp.tools.symbol_tools import register_symbol_tools
 from kicad_mcp.tools.component_edit_tools import register_component_edit_tools
 from kicad_mcp.tools.wire_edit_tools import register_wire_edit_tools
 
-# Import prompt handlers
-from kicad_mcp.prompts.templates import register_prompts
-from kicad_mcp.prompts.drc_prompt import register_drc_prompts
-from kicad_mcp.prompts.bom_prompts import register_bom_prompts
-from kicad_mcp.prompts.pattern_prompts import register_pattern_prompts
+# Full-profile imports are deferred inside _register_full_profile() to avoid
+# loading kicad-cli-dependent modules when running in plugin mode.
 
-# Import context management
 from kicad_mcp.context import kicad_lifespan
+
+ServerProfile = Literal["full", "plugin"]
 
 # Track cleanup handlers
 cleanup_handlers = []
 
 # Flag to track whether we're already in shutdown process
 _shutting_down = False
-
-# Store server instance for clean shutdown
-_server_instance = None
 
 def add_cleanup_handler(handler: Callable) -> None:
     """Register a function to be called during cleanup.
@@ -58,97 +49,87 @@ def add_cleanup_handler(handler: Callable) -> None:
 
 def run_cleanup_handlers() -> None:
     """Run all registered cleanup handlers."""
-    logging.info(f"Running cleanup handlers...")
-
     global _shutting_down
-    
+
     # Prevent running cleanup handlers multiple times
     if _shutting_down:
         return
 
     _shutting_down = True
-    logging.info(f"Running cleanup handlers...")
-    
+    logging.info("Running cleanup handlers...")
+
     for handler in cleanup_handlers:
         try:
             handler()
-            logging.info(f"Cleanup handler {handler.__name__} completed successfully")
+            logging.info("Cleanup handler %s completed successfully", handler.__name__)
         except Exception as e:
-            logging.error(f"Error in cleanup handler {handler.__name__}: {str(e)}", exc_info=True)
-
-def shutdown_server():
-    """Properly shutdown the server if it exists."""
-    global _server_instance
-    
-    if _server_instance:
-        try:
-            logging.info(f"Shutting down KiCad MCP server")
-            _server_instance = None
-            logging.info(f"KiCad MCP server shutdown complete")
-        except Exception as e:
-            logging.error(f"Error shutting down server: {str(e)}", exc_info=True)
+            logging.error("Error in cleanup handler %s: %s", handler.__name__, str(e), exc_info=True)
 
 
 def register_signal_handlers(server: FastMCP) -> None:
     """Register handlers for system signals to ensure clean shutdown.
-    
+
     Args:
         server: The FastMCP server instance
     """
     def handle_exit_signal(signum, frame):
-        logging.info(f"Received signal {signum}, initiating shutdown...")
-        
-        # Run cleanup first
+        logging.info("Received signal %s, initiating shutdown...", signum)
         run_cleanup_handlers()
-        
-        # Then shutdown server
-        shutdown_server()
-        
-        # Exit without waiting for stdio processes which might be blocking
+        # os._exit skips atexit handlers and buffered stdio — necessary here
+        # because the stdio MCP transport may be blocking on reads.
         os._exit(0)
-    
-    # Register for common termination signals
+
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
             signal.signal(sig, handle_exit_signal)
-            logging.info(f"Registered handler for signal {sig}")
+            logging.info("Registered handler for signal %s", sig)
         except (ValueError, AttributeError) as e:
-            # Some signals may not be available on all platforms
-            logging.error(f"Could not register handler for signal {sig}: {str(e)}")
+            logging.error("Could not register handler for signal %s: %s", sig, str(e))
 
 
-def create_server() -> FastMCP:
-    """Create and configure the KiCad MCP server."""
-    logging.info(f"Initializing KiCad MCP server")
+def _register_plugin_profile(mcp: FastMCP) -> None:
+    """Register only the skip-based schematic editing tools for the plugin profile."""
+    logging.info("Registering plugin profile: netlist, symbol, component, wire tools only")
+    register_netlist_tools(mcp)
+    register_symbol_tools(mcp)
+    register_component_edit_tools(mcp)
+    register_wire_edit_tools(mcp)
 
-    # Try to set up KiCad Python path - Removed
-    # kicad_modules_available = setup_kicad_python_path()
-    kicad_modules_available = False # Set to False as we removed the setup logic
 
-    # if kicad_modules_available:
-    #     print("KiCad Python modules successfully configured")
-    # else:
-    # Always print this now, as we rely on CLI
-    logging.info(f"KiCad Python module setup removed; relying on kicad-cli for external operations.")
+def _register_full_profile(mcp: FastMCP) -> None:
+    """Register all tools, resources, and prompts for the full profile.
 
-    # Build a lifespan callable with the kwarg baked in (FastMCP 2.x dropped lifespan_kwargs)
-    lifespan_factory = functools.partial(kicad_lifespan, kicad_modules_available=kicad_modules_available)
+    Full-profile imports are deferred here so that kicad-cli-dependent modules
+    are never loaded when the server runs in plugin mode.
+    """
+    logging.info("Registering full profile: all tools, resources, and prompts")
 
-    # Initialize FastMCP server
-    mcp = FastMCP("KiCad", lifespan=lifespan_factory)
-    logging.info(f"Created FastMCP server instance with lifespan management")
-    
-    # Register resources
-    logging.info(f"Registering resources...")
+    from kicad_mcp.resources.projects import register_project_resources
+    from kicad_mcp.resources.files import register_file_resources
+    from kicad_mcp.resources.drc_resources import register_drc_resources
+    from kicad_mcp.resources.bom_resources import register_bom_resources
+    from kicad_mcp.resources.netlist_resources import register_netlist_resources
+    from kicad_mcp.resources.pattern_resources import register_pattern_resources
+    from kicad_mcp.tools.project_tools import register_project_tools
+    from kicad_mcp.tools.analysis_tools import register_analysis_tools
+    from kicad_mcp.tools.export_tools import register_export_tools
+    from kicad_mcp.tools.drc_tools import register_drc_tools
+    from kicad_mcp.tools.bom_tools import register_bom_tools
+    from kicad_mcp.tools.pattern_tools import register_pattern_tools
+    from kicad_mcp.prompts.templates import register_prompts
+    from kicad_mcp.prompts.drc_prompt import register_drc_prompts
+    from kicad_mcp.prompts.bom_prompts import register_bom_prompts
+    from kicad_mcp.prompts.pattern_prompts import register_pattern_prompts
+
+    # Resources
     register_project_resources(mcp)
     register_file_resources(mcp)
     register_drc_resources(mcp)
     register_bom_resources(mcp)
     register_netlist_resources(mcp)
     register_pattern_resources(mcp)
-    
-    # Register tools
-    logging.info(f"Registering tools...")
+
+    # Tools
     register_project_tools(mcp)
     register_analysis_tools(mcp)
     register_export_tools(mcp)
@@ -159,13 +140,45 @@ def create_server() -> FastMCP:
     register_symbol_tools(mcp)
     register_component_edit_tools(mcp)
     register_wire_edit_tools(mcp)
-    
-    # Register prompts
-    logging.info(f"Registering prompts...")
+
+    # Prompts
     register_prompts(mcp)
     register_drc_prompts(mcp)
     register_bom_prompts(mcp)
     register_pattern_prompts(mcp)
+
+
+def create_server(profile: ServerProfile = "full") -> FastMCP:
+    """Create and configure the KiCad MCP server.
+
+    Args:
+        profile: Server capability profile.
+            "full"   — all tools, resources, and prompts (default; for Claude Desktop etc.)
+            "plugin" — plugin-facing profile: 26 skip-based schematic editing tools only,
+                       no resources, no prompts, no kicad-cli-dependent tools.
+                       Override via KICAD_MCP_PROFILE env var.
+    """
+    # Allow env var to override the profile argument; strip whitespace/case variants
+    raw = os.environ.get("KICAD_MCP_PROFILE", profile).strip().lower()
+    if raw not in ("full", "plugin"):
+        logging.warning("Unknown KICAD_MCP_PROFILE '%s'; falling back to 'full'", raw)
+        raw = "full"
+    profile = "plugin" if raw == "plugin" else "full"
+
+    logging.info(f"Initializing KiCad MCP server (profile={profile})")
+
+    kicad_modules_available = False
+    logging.info("KiCad Python module setup removed; relying on kicad-cli for external operations.")
+
+    lifespan_factory = functools.partial(kicad_lifespan, kicad_modules_available=kicad_modules_available)
+
+    mcp = FastMCP("KiCad", lifespan=lifespan_factory)
+    logging.info("Created FastMCP server instance with lifespan management")
+
+    if profile == "plugin":
+        _register_plugin_profile(mcp)
+    else:
+        _register_full_profile(mcp)
 
     # Register signal handlers and cleanup
     register_signal_handlers(mcp)
