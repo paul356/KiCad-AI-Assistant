@@ -9,9 +9,134 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import platform
+import shutil
+import subprocess
 from typing import Any, Callable, Generator, Optional
 
 log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# HTTPS shim
+#
+# KiCad's embedded interpreter on some platforms (notably the Linux AppImage)
+# ships without a working ``_ssl`` extension, so an in-process
+# ``urllib.request.urlopen("https://…")`` raises
+# ``URLError("unknown url type: https")``.  When that happens we shell out to
+# the plugin's own venv Python (the same interpreter that runs the MCP server)
+# which has full SSL support.
+# ---------------------------------------------------------------------------
+
+# Marker substring used to detect the missing-ssl failure mode.
+_NO_HTTPS_MARKER = "unknown url type: https"
+
+
+def _resolve_plugin_python() -> Optional[str]:
+    """Return the path to the plugin venv's Python, or None if absent."""
+    plugin_dir = os.path.dirname(os.path.abspath(__file__))
+    if platform.system() == "Windows":
+        candidate = os.path.join(plugin_dir, ".venv", "Scripts", "python.exe")
+    else:
+        candidate = os.path.join(plugin_dir, ".venv", "bin", "python")
+    return candidate if os.path.isfile(candidate) else None
+
+
+# Subprocess script: read raw body bytes from stdin, perform the POST, emit
+# a single-line JSON object on stdout describing the outcome.
+_SUBPROCESS_SCRIPT = r"""
+import json, sys, urllib.request, urllib.error
+url = sys.argv[1]
+headers = json.loads(sys.argv[2])
+timeout = float(sys.argv[3])
+body = sys.stdin.buffer.read()
+req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+try:
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        out = {"status": resp.status, "body": resp.read().decode("utf-8", "replace")}
+except urllib.error.HTTPError as e:
+    out = {"status": e.code, "body": e.read().decode("utf-8", "replace")}
+except Exception as e:
+    out = {"error": f"{type(e).__name__}: {e}"}
+sys.stdout.write(json.dumps(out))
+"""
+
+
+def _https_post_json(
+    url: str,
+    headers: dict[str, str],
+    body: bytes,
+    timeout: float,
+) -> tuple[int, str]:
+    """POST ``body`` to ``url`` and return ``(status_code, response_text)``.
+
+    Tries in-process ``urllib`` first; on the missing-https-handler failure
+    mode, falls back to invoking the plugin venv Python as a one-shot proxy.
+    Raises ``RuntimeError`` with a clear message if both paths fail.
+    """
+    import urllib.request
+    import urllib.error
+
+    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, resp.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode("utf-8", "replace")
+    except urllib.error.URLError as e:
+        if _NO_HTTPS_MARKER not in str(e.reason):
+            raise RuntimeError(f"HTTPS request failed: {e}") from e
+        # Fall through to subprocess fallback below.
+    except Exception as e:  # noqa: BLE001 — surface unexpected errors verbatim
+        raise RuntimeError(f"HTTPS request failed: {e}") from e
+
+    # Subprocess fallback: embedded Python lacks working ssl.
+    venv_python = _resolve_plugin_python()
+    if not venv_python:
+        raise RuntimeError(
+            "KiCad's embedded Python lacks SSL support and no plugin venv "
+            "Python was found. Run 'kicad_plugin/setup_plugin.sh <repo>' to create one."
+        )
+
+    # Build a clean env using an explicit allowlist (mirrors ServerManager).
+    # KiCad's AppImage sets PYTHONHOME/PYTHONPATH/LD_LIBRARY_PATH for its own
+    # embedded interpreter; inheriting them would break the venv Python.
+    _ENV_ALLOWLIST = (
+        "PATH", "HOME", "USER", "LOGNAME",
+        "LANG", "LC_ALL", "LC_CTYPE",
+        "TMPDIR", "TEMP", "TMP",
+        "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME",
+        "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+        "http_proxy", "https_proxy", "no_proxy",
+        "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
+    )
+    clean_env = {k: os.environ[k] for k in _ENV_ALLOWLIST if k in os.environ}
+
+    try:
+        proc = subprocess.run(
+            [venv_python, "-I", "-c", _SUBPROCESS_SCRIPT, url, json.dumps(headers), str(timeout)],
+            input=body,
+            capture_output=True,
+            timeout=timeout + 5,
+            check=False,
+            env=clean_env,
+        )
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError(f"HTTPS subprocess timed out after {timeout}s") from e
+
+    if proc.returncode != 0:
+        stderr = proc.stderr.decode("utf-8", "replace")[:500]
+        raise RuntimeError(f"HTTPS subprocess failed (exit {proc.returncode}): {stderr}")
+
+    try:
+        out = json.loads(proc.stdout.decode("utf-8", "replace"))
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"HTTPS subprocess returned invalid JSON: {e}") from e
+
+    if "error" in out:
+        raise RuntimeError(f"HTTPS request failed: {out['error']}")
+    return int(out["status"]), str(out["body"])
 
 MAX_HISTORY_MESSAGES = 100  # default sliding-window cap for conversation history
 
@@ -43,6 +168,25 @@ def build_system_prompt(context_block: str) -> str:
 # MCP HTTP tool caller
 # ---------------------------------------------------------------------------
 
+def _parse_mcp_response_text(text: str) -> dict[str, Any]:
+    """Parse a FastMCP streamable-http response body.
+
+    The server may reply with either plain JSON (``json_response=True``) or an
+    SSE event stream containing ``data: {...}`` lines. Handle both shapes.
+    """
+    text = text.strip()
+    if text.startswith("{") or text.startswith("["):
+        return json.loads(text)
+    # SSE framing: collect the last `data:` payload (the JSON-RPC reply).
+    last_data: Optional[str] = None
+    for line in text.splitlines():
+        if line.startswith("data:"):
+            last_data = line[5:].strip()
+    if last_data is None:
+        raise json.JSONDecodeError("No JSON or SSE 'data:' frame in response", text, 0)
+    return json.loads(last_data)
+
+
 def call_mcp_tool(base_url: str, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     """
     Call one MCP tool over HTTP and return the result dict.
@@ -64,12 +208,17 @@ def call_mcp_tool(base_url: str, tool_name: str, arguments: dict[str, Any]) -> d
     req = urllib.request.Request(
         url,
         data=payload,
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            # FastMCP's streamable-http transport requires the client to
+            # advertise both possible reply types or it returns 406.
+            "Accept": "application/json, text/event-stream",
+        },
         method="POST",
     )
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
-            body = json.loads(resp.read().decode())
+            body = _parse_mcp_response_text(resp.read().decode())
     except urllib.error.URLError as e:
         return {"success": False, "error": f"MCP server unreachable: {e}"}
     except json.JSONDecodeError as e:
@@ -217,11 +366,15 @@ class LLMClient:
         }).encode()
         req = urllib.request.Request(
             url, data=payload,
-            headers={"Content-Type": "application/json"}, method="POST"
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json, text/event-stream",
+            },
+            method="POST",
         )
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
-                body = json.loads(resp.read().decode())
+                body = _parse_mcp_response_text(resp.read().decode())
         except Exception as e:
             log.warning(f"Could not fetch tool list: {e}")
             return []
@@ -248,29 +401,37 @@ class LLMClient:
         return self._call_openai(system, tools)
 
     def _call_openai(self, system: str, tools: list[dict]) -> dict[str, Any]:
-        import urllib.request, urllib.error
-        base = self._settings.llm_base_url or "https://api.openai.com"
-        url = f"{base.rstrip('/')}/v1/chat/completions"
+        base = (self._settings.llm_base_url or "https://api.openai.com").rstrip("/")
+        # Accept either a server root (e.g. "https://api.openai.com") or a
+        # full endpoint URL (e.g. ".../v1/chat/completions").  Only append the
+        # default path when the user hasn't already specified one.
+        if "/chat/completions" in base:
+            url = base
+        elif base.endswith("/v1"):
+            url = f"{base}/chat/completions"
+        else:
+            url = f"{base}/v1/chat/completions"
         messages = [{"role": "system", "content": system}] + self._history
         payload = json.dumps({
             "model": self._settings.llm_model,
             "messages": messages,
             "tools": tools or None,
         }).encode()
-        req = urllib.request.Request(
-            url, data=payload,
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {self._settings.llm_api_key}",
-            }, method="POST"
-        )
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self._settings.llm_api_key}",
+        }
         try:
-            with urllib.request.urlopen(req, timeout=60) as resp:
-                body = json.loads(resp.read().decode())
-        except urllib.error.HTTPError as e:
-            return {"error": f"HTTP {e.code}: {e.read().decode()[:200]}"}
-        except Exception as e:
+            status, text = _https_post_json(url, headers, payload, timeout=60)
+        except RuntimeError as e:
             return {"error": str(e)}
+
+        if status >= 400:
+            return {"error": f"HTTP {status}: {text[:200]}"}
+        try:
+            body = json.loads(text)
+        except json.JSONDecodeError as e:
+            return {"error": f"Invalid JSON from OpenAI: {e}"}
 
         choice = body.get("choices", [{}])[0]
         return {
@@ -279,7 +440,6 @@ class LLMClient:
         }
 
     def _call_anthropic(self, system: str, tools: list[dict]) -> dict[str, Any]:
-        import urllib.request, urllib.error
         url = "https://api.anthropic.com/v1/messages"
         # Convert OpenAI tool format to Anthropic format
         anthropic_tools = [
@@ -336,21 +496,22 @@ class LLMClient:
         if anthropic_tools:
             payload["tools"] = anthropic_tools
         encoded = json.dumps(payload).encode()
-        req = urllib.request.Request(
-            url, data=encoded,
-            headers={
-                "Content-Type": "application/json",
-                "x-api-key": self._settings.llm_api_key,
-                "anthropic-version": "2023-06-01",
-            }, method="POST"
-        )
+        headers = {
+            "Content-Type": "application/json",
+            "x-api-key": self._settings.llm_api_key,
+            "anthropic-version": "2023-06-01",
+        }
         try:
-            with urllib.request.urlopen(req, timeout=60) as resp:
-                body = json.loads(resp.read().decode())
-        except urllib.error.HTTPError as e:
-            return {"error": f"HTTP {e.code}: {e.read().decode()[:200]}"}
-        except Exception as e:
+            status, text = _https_post_json(url, headers, encoded, timeout=60)
+        except RuntimeError as e:
             return {"error": str(e)}
+
+        if status >= 400:
+            return {"error": f"HTTP {status}: {text[:200]}"}
+        try:
+            body = json.loads(text)
+        except json.JSONDecodeError as e:
+            return {"error": f"Invalid JSON from Anthropic: {e}"}
 
         stop_reason = body.get("stop_reason", "end_turn")
         content_blocks_resp = body.get("content", [])

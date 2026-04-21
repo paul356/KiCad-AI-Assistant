@@ -162,7 +162,7 @@ class ServerManager:
 
         Priority:
         1. Explicit setting (python_executable).
-        2. .venv inside the plugin directory — created by ``make setup-plugin-venv``.
+        2. .venv inside the plugin directory — created by ``kicad_plugin/setup_plugin.sh``.
            This venv has kicad_mcp and all its dependencies pre-installed.
         3. System python3 / python fallback.
 
@@ -187,7 +187,7 @@ class ServerManager:
         python = shutil.which("python3") or shutil.which("python") or "python3"
         log.warning(
             "Plugin venv not found at %s; falling back to system Python: %s. "
-            "Run 'make setup-plugin-venv' to create the plugin venv.",
+            "Run 'kicad_plugin/setup_plugin.sh <repo>' to create the plugin venv.",
             os.path.join(plugin_dir, ".venv"),
             python,
         )

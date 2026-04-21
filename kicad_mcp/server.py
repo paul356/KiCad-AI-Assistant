@@ -251,6 +251,15 @@ def main() -> None:
             logging.warning("Invalid MCP_PORT '%s'; defaulting to 8000", port_str)
             transport_kwargs["port"] = 8000
 
+    # The plugin profile is consumed by an in-process HTTP client that does
+    # not implement the MCP session/initialize handshake. Run streamable-http
+    # in stateless mode with plain-JSON responses so each POST is
+    # self-contained.
+    profile_env = os.environ.get("KICAD_MCP_PROFILE", "").strip().lower()
+    if profile_env == "plugin" and transport == "streamable-http":
+        transport_kwargs["stateless_http"] = True
+        transport_kwargs["json_response"] = True
+
     try:
         server.run(transport=transport, **transport_kwargs)
     except KeyboardInterrupt:
