@@ -85,9 +85,9 @@ class KiCadAIPlugin(_ActionPluginBase):
                 panel_alive = False
 
         if not panel_alive:
-            from kicad_plugin.ui.panel import AssistantPanel
-            from kicad_plugin.server_manager import ServerManager
-            from kicad_plugin.settings import PluginSettings
+            from .ui.panel import AssistantPanel
+            from .server_manager import ServerManager
+            from .settings import PluginSettings
 
             settings = PluginSettings.load()
             server_mgr = ServerManager(settings)
@@ -108,8 +108,7 @@ class KiCadAIPlugin(_ActionPluginBase):
         if not _IN_KICAD:
             return
         try:
-            self.defaults()
-            _pcbnew.RegisterActionPlugin(self)
+            super().register()
             log.info("KiCad AI Assistant plugin registered")
         except Exception as e:
             log.error("Failed to register plugin: %s", e)

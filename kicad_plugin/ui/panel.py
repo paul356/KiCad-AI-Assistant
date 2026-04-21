@@ -114,6 +114,7 @@ if _WX_AVAILABLE:
             self.Bind(wx.EVT_MENU, self._on_settings, id=wx.ID_PREFERENCES)
             self.Bind(wx.EVT_MENU, self._on_clear, id=wx.ID_CLEAR)
             self.Bind(wx.EVT_CLOSE, self._on_close)
+            self.Bind(wx.EVT_WINDOW_DESTROY, self._on_destroy)
 
         # ------------------------------------------------------------------ #
         # Server lifecycle
@@ -137,7 +138,7 @@ if _WX_AVAILABLE:
             self.Layout()
 
         def _init_llm_client(self) -> None:
-            from kicad_plugin.llm_client import LLMClient
+            from ..llm_client import LLMClient
             self._llm_client = LLMClient(self._settings, self._server_mgr.base_url)
 
         # ------------------------------------------------------------------ #
@@ -155,7 +156,7 @@ if _WX_AVAILABLE:
             self._busy = True
             self._send_btn.Enable(False)
 
-            from kicad_plugin.context_bridge import collect_context, context_to_system_prompt_block
+            from ..context_bridge import collect_context, context_to_system_prompt_block
             ctx = collect_context()
             context_block = context_to_system_prompt_block(ctx)
 
@@ -208,7 +209,7 @@ if _WX_AVAILABLE:
             self.Fit()
 
         def _on_settings(self, event) -> None:
-            from kicad_plugin.ui.settings_dialog import SettingsDialog
+            from .settings_dialog import SettingsDialog
             dlg = SettingsDialog(self, self._settings)
             if dlg.ShowModal() == wx.ID_OK:
                 dlg.apply_to(self._settings)
@@ -228,7 +229,21 @@ if _WX_AVAILABLE:
                 self._llm_client.reset()
 
         def _on_close(self, event) -> None:
-            self.Hide()  # keep the process alive so re-opening is fast
+            # Check if the parent (KiCad main window) is being destroyed.
+            # If so, stop the server so KiCad can exit cleanly.
+            parent = self.GetParent()
+            parent_closing = parent is None or not parent.IsShown()
+            if parent_closing:
+                self._server_mgr.stop()
+                self.Destroy()
+            else:
+                self.Hide()  # keep server alive so re-opening is fast
+
+        def _on_destroy(self, event) -> None:
+            """Called when the wx window is actually destroyed (e.g. KiCad shutdown)."""
+            if event.GetEventObject() is self:
+                self._server_mgr.stop()
+            event.Skip()
 
         # ------------------------------------------------------------------ #
         # Logging helpers

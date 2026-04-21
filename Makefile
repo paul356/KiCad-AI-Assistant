@@ -60,6 +60,9 @@ run:
 #     ui/
 #     README.md
 # Install: unzip into ~/.local/share/kicad/<ver>/scripting/plugins/
+#          then run from the plugin dir:
+#            ./setup_plugin.sh /path/to/kicad-mcp
+#   setup_plugin.sh              <- creates .venv with kicad_mcp installed
 PLUGIN_ZIP := dist/kicad_ai_assistant.zip
 PLUGIN_SRC := kicad_plugin
 
@@ -67,26 +70,12 @@ dist-plugin:
 	@mkdir -p dist
 	@rm -f $(PLUGIN_ZIP)
 	@echo "Building $(PLUGIN_ZIP)..."
-	@cd . && zip -r $(PLUGIN_ZIP) $(PLUGIN_SRC) \
-		-x "$(PLUGIN_SRC)/__pycache__/*" \
-		-x "$(PLUGIN_SRC)/ui/__pycache__/*" \
-		-x "$(PLUGIN_SRC)/*.pyc" \
-		-x "$(PLUGIN_SRC)/ui/*.pyc"
-	@# Rename the top-level dir inside the zip from kicad_plugin → kicad_ai_assistant
-	@python3 - <<'EOF'
-import zipfile, os, shutil
-
-src_zip = "$(PLUGIN_ZIP)"
-tmp_zip = src_zip + ".tmp"
-
-with zipfile.ZipFile(src_zip, "r") as zin, zipfile.ZipFile(tmp_zip, "w", zipfile.ZIP_DEFLATED) as zout:
-    for item in zin.infolist():
-        data = zin.read(item.filename)
-        new_name = item.filename.replace("kicad_plugin/", "kicad_ai_assistant/", 1)
-        item.filename = new_name
-        zout.writestr(item, data)
-
-os.replace(tmp_zip, src_zip)
-print("Created", src_zip)
-EOF
+	@rm -rf dist/_stage
+	@mkdir -p dist/_stage
+	@cp -r $(PLUGIN_SRC) dist/_stage/kicad_ai_assistant
+	@find dist/_stage -type d -name __pycache__ -exec rm -rf {} +
+	@find dist/_stage -type f -name "*.pyc" -delete
+	@cd dist/_stage && zip -r ../$(notdir $(PLUGIN_ZIP)) kicad_ai_assistant
+	@rm -rf dist/_stage
+	@echo "Created $(PLUGIN_ZIP)"
 

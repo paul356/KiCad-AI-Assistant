@@ -21,7 +21,7 @@ if _WX_AVAILABLE:
         _PROVIDERS = ["openai", "anthropic", "custom"]
 
         def __init__(self, parent, settings) -> None:
-            super().__init__(parent, title="AI Assistant Settings", size=(420, 320))
+            super().__init__(parent, title="AI Assistant Settings", size=(420, 360))
             self._settings = settings
             self._build_ui()
 
@@ -52,6 +52,12 @@ if _WX_AVAILABLE:
             self._base_url = wx.TextCtrl(self, value=self._settings.llm_base_url)
             grid.Add(self._base_url, 1, wx.EXPAND)
 
+            # Python executable
+            grid.Add(wx.StaticText(self, label="Python executable:"), 0, wx.ALIGN_CENTER_VERTICAL)
+            self._python = wx.TextCtrl(self, value=self._settings.python_executable)
+            self._python.SetHint("auto-detect (leave blank)")
+            grid.Add(self._python, 1, wx.EXPAND)
+
             # Server port
             grid.Add(wx.StaticText(self, label="Server port (0=auto):"), 0, wx.ALIGN_CENTER_VERTICAL)
             self._port = wx.SpinCtrl(self, value=str(self._settings.server_port), min=0, max=65535)
@@ -78,6 +84,7 @@ if _WX_AVAILABLE:
             settings.llm_api_key = self._api_key.GetValue().strip()
             settings.llm_model = self._model.GetValue().strip()
             settings.llm_base_url = self._base_url.GetValue().strip()
+            settings.python_executable = self._python.GetValue().strip()
             settings.server_port = self._port.GetValue()
             settings.show_tool_log = self._show_tool_log.GetValue()
 

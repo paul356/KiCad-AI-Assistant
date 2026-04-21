@@ -40,6 +40,7 @@ class PluginSettings:
     # MCP server
     server_port: int = 0                  # 0 = auto-select a free port at startup
     server_log_dir: str = ""              # "" = KiCad user config dir
+    python_executable: str = ""           # "" = auto-detect (shutil.which("python3"))
 
     # UI preferences
     show_tool_log: bool = True            # show the tool-call log by default

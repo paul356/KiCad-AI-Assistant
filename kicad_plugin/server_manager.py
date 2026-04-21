@@ -12,7 +12,6 @@ import platform
 import shutil
 import socket
 import subprocess
-import sys
 import threading
 import time
 from typing import Optional
@@ -156,12 +155,64 @@ class ServerManager:
 
     def _build_command(self) -> list[str]:
         """Build the command to launch the MCP server."""
-        python = sys.executable or shutil.which("python3") or shutil.which("python") or "python3"
-        return [python, "-m", "kicad_mcp.server"]
+        return [self._resolve_python(), "-m", "kicad_mcp.server"]
+
+    def _resolve_python(self) -> str:
+        """Return the best available Python executable.
+
+        Priority:
+        1. Explicit setting (python_executable).
+        2. .venv inside the plugin directory — created by ``make setup-plugin-venv``.
+           This venv has kicad_mcp and all its dependencies pre-installed.
+        3. System python3 / python fallback.
+
+        Never falls back to sys.executable: inside KiCad that is KiCad's own
+        embedded interpreter which cannot find its stdlib when run standalone.
+        """
+        # 1. Explicit override
+        if self._settings.python_executable:
+            return self._settings.python_executable
+
+        # 2. .venv co-located with the plugin directory
+        plugin_dir = os.path.dirname(os.path.abspath(__file__))
+        if platform.system() == "Windows":
+            venv_python = os.path.join(plugin_dir, ".venv", "Scripts", "python.exe")
+        else:
+            venv_python = os.path.join(plugin_dir, ".venv", "bin", "python")
+        if os.path.isfile(venv_python):
+            log.debug("Using plugin venv Python: %s", venv_python)
+            return venv_python
+
+        # 3. System fallback
+        python = shutil.which("python3") or shutil.which("python") or "python3"
+        log.warning(
+            "Plugin venv not found at %s; falling back to system Python: %s. "
+            "Run 'make setup-plugin-venv' to create the plugin venv.",
+            os.path.join(plugin_dir, ".venv"),
+            python,
+        )
+        return python
+
+    # Environment variables from the parent process that are safe to pass
+    # through to the server subprocess.  Everything else is excluded to avoid
+    # inheriting AppImage/KiCad-specific overrides (PYTHONHOME, PYTHONPATH,
+    # LD_LIBRARY_PATH, LD_PRELOAD, …) that would break the standalone venv.
+    _ENV_PASSTHROUGH = (
+        "PATH", "HOME", "USER", "LOGNAME",
+        "LANG", "LC_ALL", "LC_CTYPE",
+        "TMPDIR", "TEMP", "TMP",
+        "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME",
+        "DBUS_SESSION_BUS_ADDRESS",
+    )
 
     def _build_env(self, port: int) -> dict[str, str]:
-        """Build environment variables for the server subprocess."""
-        env = os.environ.copy()
+        """Build a clean environment for the server subprocess.
+
+        Uses an explicit allowlist rather than inheriting the full parent
+        environment, so KiCad AppImage variables never bleed through.
+        """
+        env = {k: os.environ[k] for k in self._ENV_PASSTHROUGH if k in os.environ}
+
         env["MCP_TRANSPORT"] = "streamable-http"
         env["MCP_PORT"] = str(port)
         env["MCP_HOST"] = "127.0.0.1"  # never listen on 0.0.0.0
