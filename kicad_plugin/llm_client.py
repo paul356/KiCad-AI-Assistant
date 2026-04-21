@@ -13,6 +13,8 @@ from typing import Any, Callable, Generator, Optional
 
 log = logging.getLogger(__name__)
 
+MAX_HISTORY_MESSAGES = 100  # default sliding-window cap for conversation history
+
 # ---------------------------------------------------------------------------
 # System prompt template
 # ---------------------------------------------------------------------------
@@ -100,14 +102,39 @@ class LLMClient:
       - provider="anthropic" → Anthropic messages API
     """
 
-    def __init__(self, settings, mcp_base_url: str) -> None:
+    def __init__(self, settings, mcp_base_url: str, max_history: int = MAX_HISTORY_MESSAGES) -> None:
         self._settings = settings
         self._mcp_base_url = mcp_base_url
+        self._max_history = max_history
         self._history: list[dict[str, Any]] = []
 
     def reset(self) -> None:
         """Clear conversation history."""
         self._history = []
+
+    def _trim_history(self) -> None:
+        """Drop oldest complete turns until history is within the cap.
+
+        A "turn" is one assistant message optionally followed by consecutive
+        tool-result messages.  We never split a turn in half, and we never
+        drop user messages ahead of assistant turns.
+        """
+        while len(self._history) > self._max_history:
+            # Find the first assistant message and drop it together with any
+            # immediately following tool-result messages.
+            dropped = False
+            for i, msg in enumerate(self._history):
+                if msg.get("role") == "assistant":
+                    # Count how many consecutive tool messages follow
+                    j = i + 1
+                    while j < len(self._history) and self._history[j].get("role") == "tool":
+                        j += 1
+                    del self._history[i:j]
+                    dropped = True
+                    break
+            if not dropped:
+                # Fallback: drop the oldest message of any role
+                self._history.pop(0)
 
     def run(
         self,
@@ -129,6 +156,7 @@ class LLMClient:
         """
         system = build_system_prompt(context_block)
         self._history.append({"role": "user", "content": user_message})
+        self._trim_history()
 
         tools = self._fetch_tool_definitions()
 

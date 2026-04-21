@@ -1,6 +1,7 @@
 """Tests for PluginSettings: load, save, defaults, and round-trip."""
 import json
 import os
+import sys
 import tempfile
 
 import pytest
@@ -89,3 +90,35 @@ class TestPluginSettingsSaveLoad:
         with open(s.settings_path) as f:
             data = json.load(f)
         assert "config_dir" not in data
+
+
+class TestPluginSettingsSecurity:
+    def test_api_key_not_in_repr(self):
+        s = PluginSettings(llm_api_key="sk-super-secret")
+        r = repr(s)
+        assert "sk-super-secret" not in r
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="Unix permissions only")
+    def test_save_creates_file_with_owner_only_permissions(self, tmp_path):
+        s = PluginSettings(config_dir=str(tmp_path), llm_api_key="sk-secret")
+        s.save()
+        mode = oct(os.stat(s.settings_path).st_mode)[-3:]
+        assert mode == "600", f"Expected 600, got {mode}"
+
+    def test_load_ignores_unknown_keys(self, tmp_path):
+        s = PluginSettings(config_dir=str(tmp_path))
+        os.makedirs(str(tmp_path), exist_ok=True)
+        with open(s.settings_path, "w") as f:
+            json.dump({"llm_provider": "anthropic", "unknown_future_key": "ignored"}, f)
+        loaded = PluginSettings.load(config_dir=str(tmp_path))
+        assert loaded.llm_provider == "anthropic"  # known key applied
+
+    def test_load_wrong_type_field_accepted_as_is(self, tmp_path):
+        s = PluginSettings(config_dir=str(tmp_path))
+        os.makedirs(str(tmp_path), exist_ok=True)
+        with open(s.settings_path, "w") as f:
+            json.dump({"server_port": "not_a_number"}, f)
+        # Current behaviour: value is set without type validation
+        loaded = PluginSettings.load(config_dir=str(tmp_path))
+        assert loaded.server_port == "not_a_number"
+

@@ -240,9 +240,19 @@ def main() -> None:
     # Supported values: 'stdio', 'streamable-http', 'sse'
     transport = os.environ.get('MCP_TRANSPORT', 'stdio')
     logging.info(f"Using transport: {transport}")
-    
+
+    transport_kwargs: dict = {}
+    if transport in ("streamable-http", "sse"):
+        transport_kwargs["host"] = os.environ.get("MCP_HOST", "127.0.0.1")
+        port_str = os.environ.get("MCP_PORT", "8000")
+        try:
+            transport_kwargs["port"] = int(port_str)
+        except ValueError:
+            logging.warning("Invalid MCP_PORT '%s'; defaulting to 8000", port_str)
+            transport_kwargs["port"] = 8000
+
     try:
-        server.run(transport=transport)  # FastMCP manages its own event loop
+        server.run(transport=transport, **transport_kwargs)
     except KeyboardInterrupt:
         logging.info("Server interrupted by user")
     except Exception as e:
