@@ -67,9 +67,21 @@ if _WX_AVAILABLE:
             panel = wx.Panel(self)
             vbox = wx.BoxSizer(wx.VERTICAL)
 
-            # ---- Status bar ----
+            # ---- Status bar (label + Reload + Restart on same row) ----
+            status_hbox = wx.BoxSizer(wx.HORIZONTAL)
             self._status_label = wx.StaticText(panel, label="⏳ Starting backend…")
-            vbox.Add(self._status_label, 0, wx.ALL | wx.EXPAND, 4)
+            status_hbox.Add(self._status_label, 1, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
+
+            self._reload_btn = wx.Button(panel, label="⟳ Reload", style=wx.BU_EXACTFIT)
+            self._reload_btn.SetToolTip("Reload the schematic view")
+            self._reload_btn.Enable(False)
+            status_hbox.Add(self._reload_btn, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
+
+            self._restart_btn = wx.Button(panel, label="↺ Restart", style=wx.BU_EXACTFIT)
+            self._restart_btn.SetToolTip("Restart the MCP backend server")
+            status_hbox.Add(self._restart_btn, 0, wx.ALIGN_CENTER_VERTICAL)
+
+            vbox.Add(status_hbox, 0, wx.ALL | wx.EXPAND, 4)
 
             # ---- Conversation log ----
             conv_label = wx.StaticText(panel, label="Conversation")
@@ -114,15 +126,6 @@ if _WX_AVAILABLE:
 
             # ---- Bottom bar ----
             hbox = wx.BoxSizer(wx.HORIZONTAL)
-
-            self._reload_btn = wx.Button(panel, label="⟳ Reload")
-            self._reload_btn.SetToolTip("Reload the schematic view")
-            self._reload_btn.Enable(False)
-            hbox.Add(self._reload_btn, 0, wx.RIGHT, 4)
-
-            self._restart_btn = wx.Button(panel, label="↺ Restart")
-            self._restart_btn.SetToolTip("Restart the MCP backend server")
-            hbox.Add(self._restart_btn, 0, wx.RIGHT, 6)
 
             self._input = wx.TextCtrl(panel, style=wx.TE_PROCESS_ENTER)
             self._input.SetHint("Ask the AI assistant…")
