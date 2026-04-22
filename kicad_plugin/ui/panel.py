@@ -12,6 +12,7 @@ Layout:
 """
 from __future__ import annotations
 
+import collections
 import logging
 import threading
 from typing import Any, Optional
@@ -40,6 +41,9 @@ if _WX_AVAILABLE:
             self._settings = settings
             self._llm_client: Optional[Any] = None
             self._busy = False
+            # Thread-safe buffer for streamed text chunks; drained by _stream_timer
+            self._stream_buffer: collections.deque = collections.deque()
+            self._stream_header_shown: bool = False
 
             self._build_ui()
             self._start_server()
@@ -116,6 +120,10 @@ if _WX_AVAILABLE:
             self.Bind(wx.EVT_CLOSE, self._on_close)
             self.Bind(wx.EVT_WINDOW_DESTROY, self._on_destroy)
 
+            # Timer that drains the streaming text buffer at ~20 fps
+            self._stream_timer = wx.Timer(self)
+            self.Bind(wx.EVT_TIMER, self._on_stream_flush, self._stream_timer)
+
         # ------------------------------------------------------------------ #
         # Server lifecycle
         # ------------------------------------------------------------------ #
@@ -160,17 +168,17 @@ if _WX_AVAILABLE:
             ctx = collect_context()
             context_block = context_to_system_prompt_block(ctx)
 
+            # Reset streaming state and start the flush timer
+            self._stream_buffer.clear()
+            self._stream_header_shown = False
+            self._stream_timer.Start(50)  # flush every 50 ms → ~20 fps
+
             state = {"ai_turn_started": False}
 
             def _on_delta(chunk: str) -> None:
-                started = not state["ai_turn_started"]
+                # Called from background thread — just push to buffer; timer handles UI
                 state["ai_turn_started"] = True
-
-                def _ui():
-                    if started:
-                        self._append_conv("AI: ", bold=False, color=(0, 0, 180))
-                    self._append_conv(chunk)
-                wx.CallAfter(_ui)
+                self._stream_buffer.append(chunk)
 
             def _run():
                 try:
@@ -190,15 +198,36 @@ if _WX_AVAILABLE:
             threading.Thread(target=_run, daemon=True).start()
 
         def _on_reply(self, reply: str, ctx: dict, was_streamed: bool = False) -> None:
+            # Stop the flush timer and drain any remaining chunks
+            self._stream_timer.Stop()
+            self._on_stream_flush(None)
+
             if not was_streamed:
                 self._append_conv(f"AI: {reply}\n\n")
             else:
-                self._append_conv("\n\n")  # just close the streamed text
+                self._append_conv("\n\n")  # close the streamed text
             self._busy = False
             self._send_btn.Enable(True)
             # Enable reload button if schematic was mentioned in context
             if ctx.get("active_schematic"):
                 self._reload_btn.Enable(True)
+
+        def _on_stream_flush(self, event) -> None:
+            """Drain the streaming buffer into the conversation log (main thread, timer-driven)."""
+            if not self._stream_buffer:
+                return
+            parts = []
+            while self._stream_buffer:
+                try:
+                    parts.append(self._stream_buffer.popleft())
+                except IndexError:
+                    break
+            if not parts:
+                return
+            if not self._stream_header_shown:
+                self._stream_header_shown = True
+                self._append_conv("AI: ", color=(0, 0, 180))
+            self._append_conv("".join(parts))
 
         def _on_tool_call(self, name: str, args: dict, result: Any) -> None:
             ok = result.get("success", True) if isinstance(result, dict) else True
@@ -239,6 +268,9 @@ if _WX_AVAILABLE:
                     "Busy", wx.OK | wx.ICON_INFORMATION,
                 )
                 return
+            self._stream_timer.Stop()
+            self._stream_buffer.clear()
+            self._stream_header_shown = False
             self._conv_log.Clear()
             self._tool_log.Clear()
             if self._llm_client:
