@@ -1,0 +1,164 @@
+"""
+Helpers for working with footprint S-expression nodes inside a PCB tree.
+
+Handles: locating footprints, reading/writing the `at` position, and
+reading/writing named `property` entries.  The layer-flip map used by
+flip_footprint also lives here.
+"""
+from typing import Any, Dict, List, Optional, Tuple
+
+import sexpdata
+
+# ---------------------------------------------------------------------------
+# Layer flip map — F.* ↔ B.*
+# ---------------------------------------------------------------------------
+
+LAYER_FLIP_MAP: Dict[str, str] = {
+    "F.Cu": "B.Cu",
+    "B.Cu": "F.Cu",
+    "F.Adhes": "B.Adhes",
+    "B.Adhes": "F.Adhes",
+    "F.Paste": "B.Paste",
+    "B.Paste": "F.Paste",
+    "F.SilkS": "B.SilkS",
+    "B.SilkS": "F.SilkS",
+    "F.Mask": "B.Mask",
+    "B.Mask": "F.Mask",
+    "F.Fab": "B.Fab",
+    "B.Fab": "F.Fab",
+    "F.Courtyard": "B.Courtyard",
+    "B.Courtyard": "F.Courtyard",
+    # KiCad 7+ names
+    "F.Cu": "B.Cu",
+    "F_Cu": "B_Cu",
+    "B_Cu": "F_Cu",
+    "F_Fab": "B_Fab",
+    "B_Fab": "F_Fab",
+    "F_SilkS": "B_SilkS",
+    "B_SilkS": "F_SilkS",
+    "F_Mask": "B_Mask",
+    "B_Mask": "F_Mask",
+    "F_Paste": "B_Paste",
+    "B_Paste": "F_Paste",
+    "F_Courtyard": "B_Courtyard",
+    "B_Courtyard": "F_Courtyard",
+    "F_Adhes": "B_Adhes",
+    "B_Adhes": "F_Adhes",
+}
+
+
+def _sym(value: Any) -> str:
+    """Return the string form of a sexpdata Symbol or plain string."""
+    if isinstance(value, sexpdata.Symbol):
+        return str(value)
+    return str(value)
+
+
+def find_footprint(data: List[Any], reference: str) -> List[Any]:
+    """Return the footprint S-expression node matching *reference*.
+
+    :param data: Parsed PCB S-expression tree (from load_pcb).
+    :param reference: Footprint reference designator, e.g. ``"R1"``.
+    :returns: The footprint list node.
+    :raises KeyError: If no footprint with that reference is found.
+    """
+    for item in data:
+        if not (isinstance(item, list) and len(item) > 0):
+            continue
+        if _sym(item[0]) != "footprint":
+            continue
+        ref = _get_fp_reference(item)
+        if ref == reference:
+            return item
+    raise KeyError(f"Footprint '{reference}' not found in PCB")
+
+
+def _get_fp_reference(fp_node: List[Any]) -> Optional[str]:
+    """Extract the Reference property value from a footprint node."""
+    for sub in fp_node:
+        if isinstance(sub, list) and len(sub) >= 3 and _sym(sub[0]) == "property":
+            name = sub[1] if isinstance(sub[1], str) else _sym(sub[1])
+            if name == "Reference":
+                return sub[2] if isinstance(sub[2], str) else _sym(sub[2])
+    return None
+
+
+def get_fp_at(fp_node: List[Any]) -> Tuple[float, float, float]:
+    """Return ``(x, y, rotation)`` from a footprint's ``at`` entry.
+
+    Rotation defaults to 0.0 if absent.
+    """
+    for sub in fp_node:
+        if isinstance(sub, list) and len(sub) >= 3 and _sym(sub[0]) == "at":
+            x = float(sub[1])
+            y = float(sub[2])
+            rot = float(sub[3]) if len(sub) > 3 else 0.0
+            return x, y, rot
+    return 0.0, 0.0, 0.0
+
+
+def set_fp_at(fp_node: List[Any], x: float, y: float, rotation: float) -> None:
+    """Update the ``at`` entry of a footprint node in-place."""
+    for sub in fp_node:
+        if isinstance(sub, list) and len(sub) >= 3 and _sym(sub[0]) == "at":
+            sub[1] = x
+            sub[2] = y
+            if len(sub) > 3:
+                sub[3] = rotation
+            elif rotation != 0.0:
+                sub.append(rotation)
+            return
+    # No `at` found — create one
+    fp_node.append([sexpdata.Symbol("at"), x, y, rotation])
+
+
+def get_fp_property(fp_node: List[Any], name: str) -> Optional[str]:
+    """Return the value of a named ``property`` in a footprint node, or None."""
+    for sub in fp_node:
+        if isinstance(sub, list) and len(sub) >= 3 and _sym(sub[0]) == "property":
+            prop_name = sub[1] if isinstance(sub[1], str) else _sym(sub[1])
+            if prop_name == name:
+                return sub[2] if isinstance(sub[2], str) else _sym(sub[2])
+    return None
+
+
+def set_fp_property(fp_node: List[Any], name: str, value: str) -> bool:
+    """Update a named ``property`` in a footprint node in-place.
+
+    :returns: True if the property was found and updated; False if not found.
+    """
+    for sub in fp_node:
+        if isinstance(sub, list) and len(sub) >= 3 and _sym(sub[0]) == "property":
+            prop_name = sub[1] if isinstance(sub[1], str) else _sym(sub[1])
+            if prop_name == name:
+                sub[2] = value
+                return True
+    return False
+
+
+def get_fp_layer(fp_node: List[Any]) -> Optional[str]:
+    """Return the primary layer of a footprint (e.g. ``'F.Cu'``)."""
+    for sub in fp_node:
+        if isinstance(sub, list) and len(sub) >= 2 and _sym(sub[0]) == "layer":
+            return sub[1] if isinstance(sub[1], str) else _sym(sub[1])
+    return None
+
+
+def flip_fp_layers(fp_node: List[Any]) -> None:
+    """Flip all layer references in a footprint node from F.* to B.* and vice-versa."""
+    _flip_layers_recursive(fp_node)
+
+
+def _flip_layers_recursive(node: Any) -> None:
+    """Recursively walk node and flip every layer string using LAYER_FLIP_MAP."""
+    if not isinstance(node, list):
+        return
+    for i, sub in enumerate(node):
+        if isinstance(sub, list):
+            if len(sub) >= 2 and _sym(sub[0]) == "layer":
+                current = sub[1] if isinstance(sub[1], str) else _sym(sub[1])
+                flipped = LAYER_FLIP_MAP.get(current)
+                if flipped:
+                    sub[1] = flipped
+            else:
+                _flip_layers_recursive(sub)

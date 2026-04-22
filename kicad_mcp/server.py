@@ -25,6 +25,9 @@ from kicad_mcp.tools.netlist_tools import register_netlist_tools
 from kicad_mcp.tools.symbol_tools import register_symbol_tools
 from kicad_mcp.tools.component_edit_tools import register_component_edit_tools
 from kicad_mcp.tools.wire_edit_tools import register_wire_edit_tools
+from kicad_mcp.tools.pcb_library_tools import register_pcb_library_tools
+from kicad_mcp.tools.pcb_query_tools import register_pcb_query_tools
+from kicad_mcp.tools.pcb_placement_tools import register_pcb_placement_tools
 
 # Full-profile imports are deferred inside _register_full_profile() to avoid
 # loading kicad-cli-dependent modules when running in plugin mode.
@@ -89,11 +92,14 @@ def register_signal_handlers(server: FastMCP) -> None:
 
 def _register_plugin_profile(mcp: FastMCP) -> None:
     """Register only the skip-based schematic editing tools for the plugin profile."""
-    logging.info("Registering plugin profile: netlist, symbol, component, wire tools only")
+    logging.info("Registering plugin profile: schematic + PCB tools")
     register_netlist_tools(mcp)
     register_symbol_tools(mcp)
     register_component_edit_tools(mcp)
     register_wire_edit_tools(mcp)
+    register_pcb_library_tools(mcp)
+    register_pcb_query_tools(mcp)
+    register_pcb_placement_tools(mcp)
 
 
 def _register_full_profile(mcp: FastMCP) -> None:
@@ -140,6 +146,9 @@ def _register_full_profile(mcp: FastMCP) -> None:
     register_symbol_tools(mcp)
     register_component_edit_tools(mcp)
     register_wire_edit_tools(mcp)
+    register_pcb_library_tools(mcp)
+    register_pcb_query_tools(mcp)
+    register_pcb_placement_tools(mcp)
 
     # Prompts
     register_prompts(mcp)
