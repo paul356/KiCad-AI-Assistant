@@ -160,6 +160,18 @@ if _WX_AVAILABLE:
             ctx = collect_context()
             context_block = context_to_system_prompt_block(ctx)
 
+            state = {"ai_turn_started": False}
+
+            def _on_delta(chunk: str) -> None:
+                started = not state["ai_turn_started"]
+                state["ai_turn_started"] = True
+
+                def _ui():
+                    if started:
+                        self._append_conv("AI: ", bold=False, color=(0, 0, 180))
+                    self._append_conv(chunk)
+                wx.CallAfter(_ui)
+
             def _run():
                 try:
                     reply = self._llm_client.run(
@@ -168,16 +180,20 @@ if _WX_AVAILABLE:
                         on_tool_call=lambda name, args, result: wx.CallAfter(
                             self._on_tool_call, name, args, result
                         ),
+                        on_text_delta=_on_delta,
                     )
                 except Exception as e:
                     log.exception("LLM request failed")
                     reply = f"[Error] {e}"
-                wx.CallAfter(self._on_reply, reply, ctx)
+                wx.CallAfter(self._on_reply, reply, ctx, was_streamed=state["ai_turn_started"])
 
             threading.Thread(target=_run, daemon=True).start()
 
-        def _on_reply(self, reply: str, ctx: dict) -> None:
-            self._append_conv(f"AI: {reply}\n\n")
+        def _on_reply(self, reply: str, ctx: dict, was_streamed: bool = False) -> None:
+            if not was_streamed:
+                self._append_conv(f"AI: {reply}\n\n")
+            else:
+                self._append_conv("\n\n")  # just close the streamed text
             self._busy = False
             self._send_btn.Enable(True)
             # Enable reload button if schematic was mentioned in context

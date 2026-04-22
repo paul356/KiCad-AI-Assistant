@@ -50,6 +50,7 @@ class TestServerManager:
             server_port=port,
             server_log_dir=log_dir,
             resolved_log_dir=log_dir,
+            python_executable="",  # required by _resolve_python()
         )
         return ServerManager(settings)
 

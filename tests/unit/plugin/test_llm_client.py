@@ -131,3 +131,153 @@ class TestRunTrims:
         # After run(), history should not have ballooned past max_history + 2
         # (the new user message + final assistant message are added during run)
         assert len(client._history) <= client._max_history + 2
+
+
+# ---------------------------------------------------------------------------
+# Streaming tests
+# ---------------------------------------------------------------------------
+
+class TestStreaming:
+    def _make_sse_response(self, lines):
+        """Return a mock response object that yields SSE lines via readline()."""
+        data = [line.encode("utf-8") + b"\n" for line in lines] + [b""]
+        obj = MagicMock()
+        obj.readline.side_effect = data
+        obj.__enter__ = lambda s: s
+        obj.__exit__ = MagicMock(return_value=False)
+        return obj
+
+    def test_stream_openai_text_only(self):
+        client = _make_client()
+        sse_lines = [
+            'data: {"choices":[{"delta":{"content":"Hello"},"finish_reason":null}]}',
+            'data: {"choices":[{"delta":{"content":" world"},"finish_reason":null}]}',
+            'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}',
+            'data: [DONE]',
+        ]
+        chunks = []
+        mock_resp = self._make_sse_response(sse_lines)
+        with patch("urllib.request.urlopen", return_value=mock_resp):
+            result = client._stream_openai("sys", [], on_text_delta=chunks.append)
+
+        assert chunks == ["Hello", " world"]
+        assert result["message"]["content"] == "Hello world"
+        assert result["finish_reason"] == "stop"
+
+    def test_stream_openai_tool_calls(self):
+        client = _make_client()
+        sse_lines = [
+            'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"tc1","function":{"name":"add_wire","arguments":""}}]},"finish_reason":null}]}',
+            'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\"x\\":"}}]},"finish_reason":null}]}',
+            'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"1}"}}]},"finish_reason":null}]}',
+            'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}',
+            'data: [DONE]',
+        ]
+        chunks = []
+        mock_resp = self._make_sse_response(sse_lines)
+        with patch("urllib.request.urlopen", return_value=mock_resp):
+            result = client._stream_openai("sys", [], on_text_delta=chunks.append)
+
+        assert chunks == []
+        tc = result["message"]["tool_calls"]
+        assert len(tc) == 1
+        assert tc[0]["id"] == "tc1"
+        assert tc[0]["function"]["name"] == "add_wire"
+        assert tc[0]["function"]["arguments"] == '{"x":1}'
+        assert result["finish_reason"] == "tool_calls"
+
+    def test_stream_anthropic_text_only(self):
+        client = _make_client()
+        # Set provider to anthropic
+        client._settings.llm_provider = "anthropic"
+        sse_lines = [
+            "event: content_block_start",
+            'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+            "",
+            "event: content_block_delta",
+            'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}',
+            "",
+            "event: content_block_delta",
+            'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" AI"}}',
+            "",
+            "event: message_delta",
+            'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}',
+            "",
+            "event: message_stop",
+            'data: {"type":"message_stop"}',
+        ]
+        chunks = []
+        mock_resp = self._make_sse_response(sse_lines)
+        with patch("urllib.request.urlopen", return_value=mock_resp):
+            result = client._stream_anthropic("sys", [], on_text_delta=chunks.append)
+
+        assert chunks == ["Hello", " AI"]
+        assert result["message"]["content"] == "Hello AI"
+        assert result["finish_reason"] == "stop"
+
+    def test_stream_anthropic_tool_use(self):
+        client = _make_client()
+        client._settings.llm_provider = "anthropic"
+        sse_lines = [
+            "event: content_block_start",
+            'data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tu1","name":"get_netlist","input":{}}}',
+            "",
+            "event: content_block_delta",
+            'data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"path\\":"}}',
+            "",
+            "event: content_block_delta",
+            'data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\\"sch.kicad_sch\\"}"}}',
+            "",
+            "event: message_delta",
+            'data: {"type":"message_delta","delta":{"stop_reason":"tool_use"}}',
+        ]
+        chunks = []
+        mock_resp = self._make_sse_response(sse_lines)
+        with patch("urllib.request.urlopen", return_value=mock_resp):
+            result = client._stream_anthropic("sys", [], on_text_delta=chunks.append)
+
+        assert chunks == []
+        tc = result["message"]["tool_calls"]
+        assert len(tc) == 1
+        assert tc[0]["id"] == "tu1"
+        assert tc[0]["function"]["name"] == "get_netlist"
+        args = json.loads(tc[0]["function"]["arguments"])
+        assert args == {"path": "sch.kicad_sch"}
+        assert result["finish_reason"] == "tool_calls"
+
+    def test_stream_openai_ssl_fallback(self):
+        import urllib.error
+        client = _make_client()
+        chunks = []
+
+        fallback_result = {
+            "finish_reason": "stop",
+            "message": {"content": "Fallback text", "tool_calls": []},
+        }
+
+        with patch("urllib.request.urlopen",
+                   side_effect=urllib.error.URLError("unknown url type: https")), \
+             patch.object(client, "_call_openai", return_value=fallback_result) as mock_call:
+            result = client._stream_openai("sys", [], on_text_delta=chunks.append)
+
+        mock_call.assert_called_once()
+        assert chunks == ["Fallback text"]
+        assert result["message"]["content"] == "Fallback text"
+
+    def test_run_passes_on_text_delta_to_call_llm(self):
+        client = _make_client()
+        final_response = {
+            "finish_reason": "stop",
+            "message": {"content": "done", "tool_calls": []},
+        }
+        on_delta = MagicMock()
+        client._call_llm = MagicMock(return_value=final_response)
+        client._fetch_tool_definitions = MagicMock(return_value=[])
+
+        result = client.run("hello", context_block="", on_text_delta=on_delta)
+
+        assert result == "done"
+        # _call_llm must have been called with on_text_delta=on_delta
+        call_kwargs = client._call_llm.call_args
+        assert call_kwargs.kwargs.get("on_text_delta") is on_delta
+

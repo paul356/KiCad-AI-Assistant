@@ -290,6 +290,7 @@ class LLMClient:
         user_message: str,
         context_block: str,
         on_tool_call: Optional[Callable[[str, dict, Any], None]] = None,
+        on_text_delta: Optional[Callable[[str], None]] = None,
     ) -> str:
         """
         Run one engineer request through the agentic loop.
@@ -299,6 +300,8 @@ class LLMClient:
             context_block: Rendered KiCad context from context_bridge.
             on_tool_call:  Optional callback(tool_name, arguments, result) fired
                            after each tool execution — use this to update the UI.
+            on_text_delta: Optional callback(chunk) fired for each text chunk
+                           when streaming is active.
 
         Returns:
             The final assistant text message for display.
@@ -310,7 +313,7 @@ class LLMClient:
         tools = self._fetch_tool_definitions()
 
         for _ in range(20):  # max 20 iterations (guard against infinite loops)
-            response = self._call_llm(system, tools)
+            response = self._call_llm(system, tools, on_text_delta=on_text_delta)
 
             if response.get("error"):
                 return f"[LLM error] {response['error']}"
@@ -393,12 +396,295 @@ class LLMClient:
             for t in tools_raw
         ]
 
-    def _call_llm(self, system: str, tools: list[dict]) -> dict[str, Any]:
+    def _call_llm(self, system: str, tools: list[dict], on_text_delta=None) -> dict[str, Any]:
         """Dispatch to the configured LLM provider."""
         provider = self._settings.llm_provider
+        if on_text_delta is not None:
+            if provider == "anthropic":
+                return self._stream_anthropic(system, tools, on_text_delta)
+            return self._stream_openai(system, tools, on_text_delta)
         if provider == "anthropic":
             return self._call_anthropic(system, tools)
         return self._call_openai(system, tools)
+
+    def _build_anthropic_messages(self) -> list[dict]:
+        """Convert self._history from OpenAI format to Anthropic message format.
+
+        Consecutive role="tool" messages are batched into a single role="user"
+        message with multiple tool_result content blocks — Anthropic requires
+        strictly alternating user/assistant roles.
+        """
+        messages = []
+        i = 0
+        while i < len(self._history):
+            m = self._history[i]
+            role = m.get("role")
+            if role == "tool":
+                # Batch all consecutive tool results into one user message
+                tool_results = []
+                while i < len(self._history) and self._history[i].get("role") == "tool":
+                    t = self._history[i]
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": t.get("tool_call_id"),
+                        "content": t.get("content"),
+                    })
+                    i += 1
+                messages.append({"role": "user", "content": tool_results})
+                continue
+            elif role == "assistant" and m.get("tool_calls"):
+                # Include any assistant text alongside tool_use blocks
+                content_blocks: list[dict[str, Any]] = []
+                if m.get("content"):
+                    content_blocks.append({"type": "text", "text": m["content"]})
+                content_blocks.extend([
+                    {
+                        "type": "tool_use",
+                        "id": tc["id"],
+                        "name": tc["function"]["name"],
+                        "input": json.loads(tc["function"].get("arguments", "{}")),
+                    }
+                    for tc in m["tool_calls"]
+                ])
+                messages.append({"role": "assistant", "content": content_blocks})
+            else:
+                messages.append({"role": role, "content": m.get("content", "")})
+            i += 1
+        return messages
+
+    def _stream_openai(self, system: str, tools: list[dict], on_text_delta) -> dict[str, Any]:
+        """Call OpenAI-compatible API with streaming enabled."""
+        import urllib.request
+        import urllib.error
+
+        base = (self._settings.llm_base_url or "https://api.openai.com").rstrip("/")
+        if "/chat/completions" in base:
+            url = base
+        elif base.endswith("/v1"):
+            url = f"{base}/chat/completions"
+        else:
+            url = f"{base}/v1/chat/completions"
+
+        messages = [{"role": "system", "content": system}] + self._history
+        payload = json.dumps({
+            "model": self._settings.llm_model,
+            "messages": messages,
+            "tools": tools or None,
+            "stream": True,
+        }).encode()
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self._settings.llm_api_key}",
+        }
+
+        req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=300) as resp:
+                text_parts = []
+                tool_calls_by_index: dict[int, dict] = {}
+                finish_reason = "stop"
+
+                while True:
+                    raw = resp.readline()
+                    if raw == b"":
+                        break
+                    line = raw.decode("utf-8", "replace").rstrip("\r\n")
+                    if not line.startswith("data:"):
+                        continue
+                    data_str = line[5:].strip()
+                    if data_str == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        continue
+
+                    choice = chunk.get("choices", [{}])[0]
+                    fr = choice.get("finish_reason")
+                    if fr is not None:
+                        finish_reason = fr
+
+                    delta = choice.get("delta", {})
+                    content = delta.get("content")
+                    if content:
+                        text_parts.append(content)
+                        try:
+                            on_text_delta(content)
+                        except Exception:
+                            pass
+
+                    for tc_delta in delta.get("tool_calls") or []:
+                        idx = tc_delta["index"]
+                        if idx not in tool_calls_by_index:
+                            tool_calls_by_index[idx] = {
+                                "id": "",
+                                "type": "function",
+                                "function": {"name": "", "arguments": ""},
+                            }
+                        tc = tool_calls_by_index[idx]
+                        if tc_delta.get("id"):
+                            tc["id"] += tc_delta["id"]
+                        fn = tc_delta.get("function", {})
+                        if fn.get("name"):
+                            tc["function"]["name"] += fn["name"]
+                        if fn.get("arguments"):
+                            tc["function"]["arguments"] += fn["arguments"]
+
+                tool_calls = [tool_calls_by_index[k] for k in sorted(tool_calls_by_index)]
+                message: dict[str, Any] = {"content": "".join(text_parts)}
+                if tool_calls:
+                    message["tool_calls"] = tool_calls
+                return {"finish_reason": finish_reason, "message": message}
+
+        except urllib.error.URLError as e:
+            if _NO_HTTPS_MARKER not in str(e.reason):
+                return {"error": f"HTTPS request failed: {e}"}
+            # SSL fallback: use non-streaming call then fire on_text_delta once
+            result = self._call_openai(system, tools)
+            content = result.get("message", {}).get("content", "")
+            if content:
+                try:
+                    on_text_delta(content)
+                except Exception:
+                    pass
+            return result
+        except Exception as e:
+            return {"error": f"Streaming request failed: {e}"}
+
+    def _stream_anthropic(self, system: str, tools: list[dict], on_text_delta) -> dict[str, Any]:
+        """Call Anthropic API with streaming enabled."""
+        import urllib.request
+        import urllib.error
+
+        url = "https://api.anthropic.com/v1/messages"
+        anthropic_tools = [
+            {
+                "name": t["function"]["name"],
+                "description": t["function"].get("description", ""),
+                "input_schema": t["function"].get("parameters", {}),
+            }
+            for t in tools
+        ]
+        messages = self._build_anthropic_messages()
+        payload: dict[str, Any] = {
+            "model": self._settings.llm_model,
+            "max_tokens": 4096,
+            "system": system,
+            "messages": messages,
+            "stream": True,
+        }
+        if anthropic_tools:
+            payload["tools"] = anthropic_tools
+        encoded = json.dumps(payload).encode()
+        headers = {
+            "Content-Type": "application/json",
+            "x-api-key": self._settings.llm_api_key,
+            "anthropic-version": "2023-06-01",
+        }
+
+        req = urllib.request.Request(url, data=encoded, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=300) as resp:
+                text_blocks: dict[int, str] = {}
+                tool_blocks: dict[int, dict] = {}
+                stop_reason = "end_turn"
+                current_event = ""
+
+                while True:
+                    raw = resp.readline()
+                    if raw == b"":
+                        break
+                    line = raw.decode("utf-8", "replace").rstrip("\r\n")
+                    if line.startswith("event:"):
+                        current_event = line[6:].strip()
+                        continue
+                    if not line.startswith("data:"):
+                        continue
+                    data_str = line[5:].strip()
+                    try:
+                        event_data = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        continue
+
+                    etype = event_data.get("type", current_event)
+
+                    if etype == "content_block_start":
+                        idx = event_data.get("index", 0)
+                        block = event_data.get("content_block", {})
+                        btype = block.get("type")
+                        if btype == "text":
+                            text_blocks[idx] = block.get("text", "")
+                        elif btype == "tool_use":
+                            tool_blocks[idx] = {
+                                "id": block["id"],
+                                "name": block["name"],
+                                "input_json": "",
+                            }
+
+                    elif etype == "content_block_delta":
+                        idx = event_data.get("index", 0)
+                        delta = event_data.get("delta", {})
+                        dtype = delta.get("type")
+                        if dtype == "text_delta":
+                            chunk = delta.get("text", "")
+                            text_blocks[idx] = text_blocks.get(idx, "") + chunk
+                            if chunk:
+                                try:
+                                    on_text_delta(chunk)
+                                except Exception:
+                                    pass
+                        elif dtype == "input_json_delta":
+                            partial = delta.get("partial_json", "")
+                            if idx in tool_blocks:
+                                tool_blocks[idx]["input_json"] += partial
+
+                    elif etype == "message_delta":
+                        delta = event_data.get("delta", {})
+                        sr = delta.get("stop_reason")
+                        if sr:
+                            stop_reason = sr
+
+                    elif etype == "error":
+                        err = event_data.get("error", {})
+                        return {"error": f"Anthropic stream error: {err.get('message', str(err))}"}
+
+                full_text = "\n".join(text_blocks[k] for k in sorted(text_blocks))
+                tool_calls = []
+                for k in sorted(tool_blocks):
+                    tb = tool_blocks[k]
+                    try:
+                        inp = json.loads(tb["input_json"]) if tb["input_json"] else {}
+                    except json.JSONDecodeError:
+                        inp = {}
+                    tool_calls.append({
+                        "id": tb["id"],
+                        "type": "function",
+                        "function": {
+                            "name": tb["name"],
+                            "arguments": json.dumps(inp),
+                        },
+                    })
+                message_out: dict[str, Any] = {"content": full_text}
+                if tool_calls:
+                    message_out["tool_calls"] = tool_calls
+                finish = "tool_calls" if tool_calls else "stop"
+                if stop_reason == "max_tokens":
+                    finish = "stop"
+                return {"finish_reason": finish, "message": message_out}
+
+        except urllib.error.URLError as e:
+            if _NO_HTTPS_MARKER not in str(e.reason):
+                return {"error": f"HTTPS request failed: {e}"}
+            result = self._call_anthropic(system, tools)
+            content = result.get("message", {}).get("content", "")
+            if content:
+                try:
+                    on_text_delta(content)
+                except Exception:
+                    pass
+            return result
+        except Exception as e:
+            return {"error": f"Streaming request failed: {e}"}
 
     def _call_openai(self, system: str, tools: list[dict]) -> dict[str, Any]:
         base = (self._settings.llm_base_url or "https://api.openai.com").rstrip("/")
@@ -450,46 +736,7 @@ class LLMClient:
             }
             for t in tools
         ]
-        # Convert history (OpenAI format → Anthropic format).
-        # Consecutive role="tool" messages must be batched into a single
-        # role="user" message with multiple tool_result content blocks —
-        # Anthropic requires strictly alternating user/assistant roles.
-        messages = []
-        i = 0
-        while i < len(self._history):
-            m = self._history[i]
-            role = m.get("role")
-            if role == "tool":
-                # Batch all consecutive tool results into one user message
-                tool_results = []
-                while i < len(self._history) and self._history[i].get("role") == "tool":
-                    t = self._history[i]
-                    tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": t.get("tool_call_id"),
-                        "content": t.get("content"),
-                    })
-                    i += 1
-                messages.append({"role": "user", "content": tool_results})
-                continue
-            elif role == "assistant" and m.get("tool_calls"):
-                # Include any assistant text alongside tool_use blocks
-                content_blocks: list[dict[str, Any]] = []
-                if m.get("content"):
-                    content_blocks.append({"type": "text", "text": m["content"]})
-                content_blocks.extend([
-                    {
-                        "type": "tool_use",
-                        "id": tc["id"],
-                        "name": tc["function"]["name"],
-                        "input": json.loads(tc["function"].get("arguments", "{}")),
-                    }
-                    for tc in m["tool_calls"]
-                ])
-                messages.append({"role": "assistant", "content": content_blocks})
-            else:
-                messages.append({"role": role, "content": m.get("content", "")})
-            i += 1
+        messages = self._build_anthropic_messages()
 
         payload = {"model": self._settings.llm_model, "max_tokens": 4096,
                    "system": system, "messages": messages}
