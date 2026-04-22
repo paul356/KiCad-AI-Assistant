@@ -53,6 +53,16 @@ if _WX_AVAILABLE:
         # UI Construction
         # ------------------------------------------------------------------ #
 
+        # Colour palette (RGB tuples) — centralised for easy theming
+        _C_USER   = (34,  85, 204)   # Blue    – "You:" prefix
+        _C_AI     = (0,  130,  80)   # Green   – "AI:" prefix
+        _C_TOOL   = (120, 120, 120)  # Grey    – tool-call lines
+        _C_OK     = (0,  140,  0)    # Green   – success notices
+        _C_WARN   = (190, 100,  0)   # Amber   – warnings
+        _C_ERR    = (190,  30,  30)  # Red     – errors
+        _BG_CONV  = wx.Colour(245, 247, 252)  # Very light blue-grey conversation bg
+        _BG_TOOL  = wx.Colour(250, 248, 240)  # Warm off-white tool-log bg
+
         def _build_ui(self) -> None:
             panel = wx.Panel(self)
             vbox = wx.BoxSizer(wx.VERTICAL)
@@ -62,12 +72,23 @@ if _WX_AVAILABLE:
             vbox.Add(self._status_label, 0, wx.ALL | wx.EXPAND, 4)
 
             # ---- Conversation log ----
-            vbox.Add(wx.StaticText(panel, label="Conversation"), 0, wx.LEFT | wx.TOP, 4)
+            conv_label = wx.StaticText(panel, label="Conversation")
+            conv_font = conv_label.GetFont()
+            conv_font.SetWeight(wx.FONTWEIGHT_BOLD)
+            conv_label.SetFont(conv_font)
+            vbox.Add(conv_label, 0, wx.LEFT | wx.TOP, 6)
+
             self._conv_log = wx.TextCtrl(
                 panel,
-                style=wx.TE_MULTILINE | wx.TE_READONLY | wx.TE_RICH2 | wx.BORDER_SIMPLE,
+                style=wx.TE_MULTILINE | wx.TE_READONLY | wx.TE_RICH2 | wx.BORDER_SUNKEN,
             )
             self._conv_log.SetMinSize((-1, 300))
+            self._conv_log.SetBackgroundColour(self._BG_CONV)
+            # Use a slightly larger, more readable font
+            chat_font = wx.Font(
+                10, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_NORMAL,
+            )
+            self._conv_log.SetFont(chat_font)
             vbox.Add(self._conv_log, 1, wx.ALL | wx.EXPAND, 4)
 
             # ---- Tool log (collapsible) ----
@@ -79,6 +100,11 @@ if _WX_AVAILABLE:
                 style=wx.TE_MULTILINE | wx.TE_READONLY | wx.TE_RICH2 | wx.BORDER_SIMPLE,
             )
             self._tool_log.SetMinSize((-1, 120))
+            self._tool_log.SetBackgroundColour(self._BG_TOOL)
+            tool_log_font = wx.Font(
+                9, wx.FONTFAMILY_TELETYPE, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_NORMAL,
+            )
+            self._tool_log.SetFont(tool_log_font)
             tool_sizer.Add(self._tool_log, 1, wx.EXPAND)
             tool_pane_win.SetSizer(tool_sizer)
             if self._settings.show_tool_log:
@@ -88,11 +114,18 @@ if _WX_AVAILABLE:
 
             # ---- Bottom bar ----
             hbox = wx.BoxSizer(wx.HORIZONTAL)
-            self._reload_btn = wx.Button(panel, label="Reload Schematic")
+
+            self._reload_btn = wx.Button(panel, label="⟳ Reload")
+            self._reload_btn.SetToolTip("Reload the schematic view")
             self._reload_btn.Enable(False)
-            hbox.Add(self._reload_btn, 0, wx.RIGHT, 6)
+            hbox.Add(self._reload_btn, 0, wx.RIGHT, 4)
+
+            self._restart_btn = wx.Button(panel, label="↺ Restart")
+            self._restart_btn.SetToolTip("Restart the MCP backend server")
+            hbox.Add(self._restart_btn, 0, wx.RIGHT, 6)
 
             self._input = wx.TextCtrl(panel, style=wx.TE_PROCESS_ENTER)
+            self._input.SetHint("Ask the AI assistant…")
             hbox.Add(self._input, 1, wx.RIGHT, 6)
 
             self._send_btn = wx.Button(panel, label="Send")
@@ -103,11 +136,13 @@ if _WX_AVAILABLE:
 
             panel.SetSizer(vbox)
 
-            # ---- Settings button in title bar area ----
+            # ---- Menu bar ----
             menu_bar = wx.MenuBar()
             m = wx.Menu()
             m.Append(wx.ID_PREFERENCES, "&Settings\tCtrl+,")
             m.Append(wx.ID_CLEAR, "Clear Conversation")
+            self._menu_restart_id = wx.NewIdRef()
+            m.Append(self._menu_restart_id, "Restart Backend")
             menu_bar.Append(m, "&Options")
             self.SetMenuBar(menu_bar)
 
@@ -115,8 +150,10 @@ if _WX_AVAILABLE:
             self._send_btn.Bind(wx.EVT_BUTTON, self._on_send)
             self._input.Bind(wx.EVT_TEXT_ENTER, self._on_send)
             self._reload_btn.Bind(wx.EVT_BUTTON, self._on_reload)
+            self._restart_btn.Bind(wx.EVT_BUTTON, self._on_restart)
             self.Bind(wx.EVT_MENU, self._on_settings, id=wx.ID_PREFERENCES)
             self.Bind(wx.EVT_MENU, self._on_clear, id=wx.ID_CLEAR)
+            self.Bind(wx.EVT_MENU, self._on_restart, id=self._menu_restart_id)
             self.Bind(wx.EVT_CLOSE, self._on_close)
             self.Bind(wx.EVT_WINDOW_DESTROY, self._on_destroy)
 
@@ -139,10 +176,12 @@ if _WX_AVAILABLE:
         def _on_server_started(self, ok: bool) -> None:
             if ok:
                 self._status_label.SetLabel("✅ Backend ready")
+                self._status_label.SetForegroundColour(wx.Colour(*self._C_OK))
                 self._send_btn.Enable(True)
                 self._init_llm_client()
             else:
-                self._status_label.SetLabel("❌ Backend failed to start. [Options → Restart]")
+                self._status_label.SetLabel("❌ Backend failed to start — use ↺ Restart to retry")
+                self._status_label.SetForegroundColour(wx.Colour(*self._C_ERR))
             self.Layout()
 
         def _init_llm_client(self) -> None:
@@ -160,7 +199,8 @@ if _WX_AVAILABLE:
             if not text:
                 return
             self._input.Clear()
-            self._append_conv(f"You: {text}\n", bold=True)
+            self._append_conv("You: ", bold=True, color=self._C_USER)
+            self._append_conv(f"{text}\n")
             self._busy = True
             self._send_btn.Enable(False)
 
@@ -203,7 +243,8 @@ if _WX_AVAILABLE:
             self._on_stream_flush(None)
 
             if not was_streamed:
-                self._append_conv(f"AI: {reply}\n\n")
+                self._append_conv("AI: ", color=self._C_AI, bold=True)
+                self._append_conv(f"{reply}\n\n")
             else:
                 self._append_conv("\n\n")  # close the streamed text
             self._busy = False
@@ -226,28 +267,58 @@ if _WX_AVAILABLE:
                 return
             if not self._stream_header_shown:
                 self._stream_header_shown = True
-                self._append_conv("AI: ", color=(0, 0, 180))
+                self._append_conv("AI: ", color=self._C_AI, bold=True)
             self._append_conv("".join(parts))
 
         def _on_tool_call(self, name: str, args: dict, result: Any) -> None:
             ok = result.get("success", True) if isinstance(result, dict) else True
             icon = "✓" if ok else "✗"
             summary = result.get("message", "") if isinstance(result, dict) else str(result)
-            self._append_conv(f"  ↳ {name}  {icon} {summary}\n", color=(100, 100, 100))
+            self._append_conv(f"  ↳ {name}  {icon} {summary}\n", color=self._C_TOOL, italic=True)
             self._append_tool_log(name, args, result)
 
         def _on_reload(self, event) -> None:
             try:
                 import pcbnew
                 pcbnew.Refresh()
-                self._append_conv("⟳ Board view refreshed.\n", color=(0, 128, 0))
+                self._append_conv("⟳ Board view refreshed.\n", color=self._C_OK)
             except ImportError:
                 self._append_conv(
                     "⚠ Reload not available in schematic editor. Press F5 to refresh.\n",
-                    color=(200, 128, 0),
+                    color=self._C_WARN,
                 )
             except Exception as e:
-                self._append_conv(f"⚠ Reload failed: {e}\n", color=(200, 0, 0))
+                self._append_conv(f"⚠ Reload failed: {e}\n", color=self._C_ERR)
+
+        def _on_restart(self, event) -> None:
+            if self._busy:
+                wx.MessageBox(
+                    "Please wait for the current request to finish.",
+                    "Busy", wx.OK | wx.ICON_INFORMATION,
+                )
+                return
+            self._restart_btn.Enable(False)
+            self._send_btn.Enable(False)
+            self._status_label.SetLabel("⏳ Restarting backend…")
+            self._status_label.SetForegroundColour(wx.NullColour)
+            self._append_conv("↺ Restarting MCP backend…\n", color=self._C_WARN)
+
+            def _do_restart():
+                ok = self._server_mgr.restart()
+                wx.CallAfter(self._on_restart_done, ok)
+
+            threading.Thread(target=_do_restart, daemon=True).start()
+
+        def _on_restart_done(self, ok: bool) -> None:
+            self._restart_btn.Enable(True)
+            if ok:
+                self._append_conv("✅ Backend restarted successfully.\n\n", color=self._C_OK)
+                self._init_llm_client()
+                self._on_server_started(True)
+            else:
+                self._append_conv("❌ Backend failed to restart.\n\n", color=self._C_ERR)
+                self._on_server_started(False)
+
 
         def _on_pane_changed(self, event) -> None:
             self.Layout()
@@ -301,14 +372,17 @@ if _WX_AVAILABLE:
             self,
             text: str,
             bold: bool = False,
-            color: tuple = (0, 0, 0),
+            italic: bool = False,
+            color: tuple = (30, 30, 30),
         ) -> None:
             attr = wx.TextAttr(wx.Colour(*color))
             if bold:
                 attr.SetFontWeight(wx.FONTWEIGHT_BOLD)
+            if italic:
+                attr.SetFontStyle(wx.FONTSTYLE_ITALIC)
             self._conv_log.SetDefaultStyle(attr)
             self._conv_log.AppendText(text)
-            self._conv_log.SetDefaultStyle(wx.TextAttr(wx.BLACK))
+            self._conv_log.SetDefaultStyle(wx.TextAttr(wx.Colour(30, 30, 30)))
 
         def _append_tool_log(self, name: str, args: dict, result: Any) -> None:
             import json as _json
