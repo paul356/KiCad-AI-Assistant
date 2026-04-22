@@ -44,6 +44,8 @@ if _WX_AVAILABLE:
             # Thread-safe buffer for streamed text chunks; drained by _stream_timer
             self._stream_buffer: collections.deque = collections.deque()
             self._stream_header_shown: bool = False
+            # Set to True when at least one tool call happens during a turn
+            self._tool_calls_made: bool = False
 
             self._build_ui()
             self._start_server()
@@ -214,6 +216,7 @@ if _WX_AVAILABLE:
             # Reset streaming state and start the flush timer
             self._stream_buffer.clear()
             self._stream_header_shown = False
+            self._tool_calls_made = False
             self._stream_timer.Start(50)  # flush every 50 ms → ~20 fps
 
             state = {"ai_turn_started": False}
@@ -255,6 +258,9 @@ if _WX_AVAILABLE:
             # Enable reload button if schematic was mentioned in context
             if ctx.get("active_schematic"):
                 self._reload_btn.Enable(True)
+            # Auto-refresh after tool calls
+            if self._tool_calls_made:
+                self._auto_refresh(ctx)
 
         def _on_stream_flush(self, event) -> None:
             """Drain the streaming buffer into the conversation log (main thread, timer-driven)."""
@@ -279,8 +285,28 @@ if _WX_AVAILABLE:
             summary = result.get("message", "") if isinstance(result, dict) else str(result)
             self._append_conv(f"  ↳ {name}  {icon} {summary}\n", color=self._C_TOOL, italic=True)
             self._append_tool_log(name, args, result)
+            self._tool_calls_made = True
+
+        def _auto_refresh(self, ctx: dict) -> None:
+            """Refresh the KiCad view automatically after tool calls."""
+            editor = ctx.get("active_editor", "unknown")
+            try:
+                import pcbnew
+                pcbnew.Refresh()
+                self._append_conv("⟳ Board view refreshed.\n", color=self._C_OK)
+            except ImportError:
+                pass  # outside KiCad — silently skip
+            except Exception as e:
+                self._append_conv(f"⚠ Auto-refresh failed: {e}\n", color=self._C_WARN)
+                return
+            if editor == "schematic":
+                self._append_conv(
+                    "ℹ Schematic updated on disk — use File → Revert to see changes in the editor.\n",
+                    color=self._C_WARN,
+                )
 
         def _on_reload(self, event) -> None:
+            ctx = {"active_editor": "pcb"}  # manual reload always attempts pcbnew.Refresh
             try:
                 import pcbnew
                 pcbnew.Refresh()
