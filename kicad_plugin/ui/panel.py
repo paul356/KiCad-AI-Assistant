@@ -7,7 +7,7 @@ Layout:
   ├──────────────────────────────────────────────────────────┤
   │  Tool log (collapsible wx.TextCtrl)                      │
   ├──────────────────────────────────────────────────────────┤
-  │  [Reload Schematic]   [input field]        [Send]        │
+  │  [input field]                             [Send]        │
   └──────────────────────────────────────────────────────────┘
 """
 from __future__ import annotations
@@ -21,6 +21,7 @@ log = logging.getLogger(__name__)
 
 try:
     import wx
+    import wx.html
     _WX_AVAILABLE = True
 except ImportError:
     _WX_AVAILABLE = False
@@ -43,9 +44,12 @@ if _WX_AVAILABLE:
             self._busy = False
             # Thread-safe buffer for streamed text chunks; drained by _stream_timer
             self._stream_buffer: collections.deque = collections.deque()
-            self._stream_header_shown: bool = False
             # Set to True when at least one tool call happens during a turn
             self._tool_calls_made: bool = False
+            # Structured conversation history for HTML rendering
+            self._conv_entries: list[dict] = []
+            # Accumulates streamed AI text before it is finalised as an entry
+            self._pending_ai_text: str = ""
 
             self._build_ui()
             self._start_server()
@@ -65,45 +69,28 @@ if _WX_AVAILABLE:
         _BG_CONV  = wx.Colour(245, 247, 252)  # Very light blue-grey conversation bg
         _BG_TOOL  = wx.Colour(250, 248, 240)  # Warm off-white tool-log bg
 
+        # Hex equivalents for HTML rendering
+        _C_USER_HEX  = "#2255CC"
+        _C_AI_HEX    = "#008250"
+        _C_TOOL_HEX  = "#787878"
+        _C_OK_HEX    = "#008C00"
+        _C_WARN_HEX  = "#BE6400"
+        _C_ERR_HEX   = "#BE1E1E"
+        _BG_CONV_HEX = "#F5F7FC"
+
         def _build_ui(self) -> None:
             panel = wx.Panel(self)
             vbox = wx.BoxSizer(wx.VERTICAL)
 
-            # ---- Status bar (label + Reload + Restart on same row) ----
-            status_hbox = wx.BoxSizer(wx.HORIZONTAL)
-            self._status_label = wx.StaticText(panel, label="⏳ Starting backend…")
-            status_hbox.Add(self._status_label, 1, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
-
-            self._reload_btn = wx.Button(panel, label="⟳ Reload", style=wx.BU_EXACTFIT)
-            self._reload_btn.SetToolTip("Reload the schematic view")
-            self._reload_btn.Enable(False)
-            status_hbox.Add(self._reload_btn, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
-
-            self._restart_btn = wx.Button(panel, label="↺ Restart", style=wx.BU_EXACTFIT)
-            self._restart_btn.SetToolTip("Restart the MCP backend server")
-            status_hbox.Add(self._restart_btn, 0, wx.ALIGN_CENTER_VERTICAL)
-
-            vbox.Add(status_hbox, 0, wx.ALL | wx.EXPAND, 4)
-
             # ---- Conversation log ----
-            conv_label = wx.StaticText(panel, label="Conversation")
-            conv_font = conv_label.GetFont()
-            conv_font.SetWeight(wx.FONTWEIGHT_BOLD)
-            conv_label.SetFont(conv_font)
-            vbox.Add(conv_label, 0, wx.LEFT | wx.TOP, 6)
-
-            self._conv_log = wx.TextCtrl(
+            self._conv_html = wx.html.HtmlWindow(
                 panel,
-                style=wx.TE_MULTILINE | wx.TE_READONLY | wx.TE_RICH2 | wx.BORDER_SUNKEN,
+                style=wx.BORDER_SUNKEN,
             )
-            self._conv_log.SetMinSize((-1, 300))
-            self._conv_log.SetBackgroundColour(self._BG_CONV)
-            # Use a slightly larger, more readable font
-            chat_font = wx.Font(
-                10, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_NORMAL,
-            )
-            self._conv_log.SetFont(chat_font)
-            vbox.Add(self._conv_log, 1, wx.ALL | wx.EXPAND, 4)
+            self._conv_html.SetMinSize((-1, 300))
+            self._conv_html.SetBackgroundColour(self._BG_CONV)
+            self._conv_html.SetPage(f'<html><body bgcolor="{self._BG_CONV_HEX}"></body></html>')
+            vbox.Add(self._conv_html, 1, wx.ALL | wx.EXPAND, 4)
 
             # ---- Tool log (collapsible) ----
             self._tool_log_pane = wx.CollapsiblePane(panel, label="Tool Log")
@@ -126,7 +113,7 @@ if _WX_AVAILABLE:
             vbox.Add(self._tool_log_pane, 0, wx.ALL | wx.EXPAND, 4)
             self._tool_log_pane.Bind(wx.EVT_COLLAPSIBLEPANE_CHANGED, self._on_pane_changed)
 
-            # ---- Bottom bar ----
+            # ---- Input row ----
             hbox = wx.BoxSizer(wx.HORIZONTAL)
 
             self._input = wx.TextCtrl(panel, style=wx.TE_PROCESS_ENTER)
@@ -138,6 +125,17 @@ if _WX_AVAILABLE:
             hbox.Add(self._send_btn, 0)
 
             vbox.Add(hbox, 0, wx.ALL | wx.EXPAND, 4)
+
+            # ---- Status bar (below input) ----
+            status_hbox = wx.BoxSizer(wx.HORIZONTAL)
+            self._status_label = wx.StaticText(panel, label="⏳ Starting backend…")
+            status_hbox.Add(self._status_label, 1, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
+
+            self._restart_btn = wx.Button(panel, label="↺ Restart", style=wx.BU_EXACTFIT)
+            self._restart_btn.SetToolTip("Restart the MCP backend server")
+            status_hbox.Add(self._restart_btn, 0, wx.ALIGN_CENTER_VERTICAL)
+
+            vbox.Add(status_hbox, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM | wx.EXPAND, 4)
 
             panel.SetSizer(vbox)
 
@@ -154,7 +152,6 @@ if _WX_AVAILABLE:
             # ---- Events ----
             self._send_btn.Bind(wx.EVT_BUTTON, self._on_send)
             self._input.Bind(wx.EVT_TEXT_ENTER, self._on_send)
-            self._reload_btn.Bind(wx.EVT_BUTTON, self._on_reload)
             self._restart_btn.Bind(wx.EVT_BUTTON, self._on_restart)
             self.Bind(wx.EVT_MENU, self._on_settings, id=wx.ID_PREFERENCES)
             self.Bind(wx.EVT_MENU, self._on_clear, id=wx.ID_CLEAR)
@@ -204,8 +201,8 @@ if _WX_AVAILABLE:
             if not text:
                 return
             self._input.Clear()
-            self._append_conv("You: ", bold=True, color=self._C_USER)
-            self._append_conv(f"{text}\n")
+            self._conv_entries.append({"type": "user", "text": text})
+            self._render_conversation()
             self._busy = True
             self._send_btn.Enable(False)
 
@@ -215,7 +212,7 @@ if _WX_AVAILABLE:
 
             # Reset streaming state and start the flush timer
             self._stream_buffer.clear()
-            self._stream_header_shown = False
+            self._pending_ai_text = ""
             self._tool_calls_made = False
             self._stream_timer.Start(50)  # flush every 50 ms → ~20 fps
 
@@ -249,21 +246,22 @@ if _WX_AVAILABLE:
             self._on_stream_flush(None)
 
             if not was_streamed:
-                self._append_conv("AI: ", color=self._C_AI, bold=True)
-                self._append_conv(f"{reply}\n\n")
+                self._conv_entries.append({"type": "ai", "text": reply})
+                self._render_conversation()
             else:
-                self._append_conv("\n\n")  # close the streamed text
+                # Finalise the streamed text as a proper AI entry
+                if self._pending_ai_text:
+                    self._conv_entries.append({"type": "ai", "text": self._pending_ai_text})
+                    self._pending_ai_text = ""
+                    self._render_conversation()
             self._busy = False
             self._send_btn.Enable(True)
-            # Enable reload button if schematic was mentioned in context
-            if ctx.get("active_schematic"):
-                self._reload_btn.Enable(True)
             # Auto-refresh after tool calls
             if self._tool_calls_made:
                 self._auto_refresh(ctx)
 
         def _on_stream_flush(self, event) -> None:
-            """Drain the streaming buffer into the conversation log (main thread, timer-driven)."""
+            """Drain the streaming buffer into the pending AI text (main thread, timer-driven)."""
             if not self._stream_buffer:
                 return
             parts = []
@@ -274,16 +272,15 @@ if _WX_AVAILABLE:
                     break
             if not parts:
                 return
-            if not self._stream_header_shown:
-                self._stream_header_shown = True
-                self._append_conv("AI: ", color=self._C_AI, bold=True)
-            self._append_conv("".join(parts))
+            self._pending_ai_text += "".join(parts)
+            self._render_conversation()
 
         def _on_tool_call(self, name: str, args: dict, result: Any) -> None:
             ok = result.get("success", True) if isinstance(result, dict) else True
             icon = "✓" if ok else "✗"
             summary = result.get("message", "") if isinstance(result, dict) else str(result)
-            self._append_conv(f"  ↳ {name}  {icon} {summary}\n", color=self._C_TOOL, italic=True)
+            self._conv_entries.append({"type": "tool", "text": f"↳ {name}  {icon} {summary}"})
+            self._render_conversation()
             self._append_tool_log(name, args, result)
             self._tool_calls_made = True
 
@@ -293,31 +290,21 @@ if _WX_AVAILABLE:
             try:
                 import pcbnew
                 pcbnew.Refresh()
-                self._append_conv("⟳ Board view refreshed.\n", color=self._C_OK)
+                self._conv_entries.append({"type": "status", "text": "⟳ Board view refreshed.", "color_hex": self._C_OK_HEX})
+                self._render_conversation()
             except ImportError:
                 pass  # outside KiCad — silently skip
             except Exception as e:
-                self._append_conv(f"⚠ Auto-refresh failed: {e}\n", color=self._C_WARN)
+                self._conv_entries.append({"type": "status", "text": f"⚠ Auto-refresh failed: {e}", "color_hex": self._C_WARN_HEX})
+                self._render_conversation()
                 return
             if editor == "schematic":
-                self._append_conv(
-                    "ℹ Schematic updated on disk — use File → Revert to see changes in the editor.\n",
-                    color=self._C_WARN,
-                )
-
-        def _on_reload(self, event) -> None:
-            ctx = {"active_editor": "pcb"}  # manual reload always attempts pcbnew.Refresh
-            try:
-                import pcbnew
-                pcbnew.Refresh()
-                self._append_conv("⟳ Board view refreshed.\n", color=self._C_OK)
-            except ImportError:
-                self._append_conv(
-                    "⚠ Reload not available in schematic editor. Press F5 to refresh.\n",
-                    color=self._C_WARN,
-                )
-            except Exception as e:
-                self._append_conv(f"⚠ Reload failed: {e}\n", color=self._C_ERR)
+                self._conv_entries.append({
+                    "type": "status",
+                    "text": "ℹ Schematic updated on disk — use File → Revert to see changes in the editor.",
+                    "color_hex": self._C_WARN_HEX,
+                })
+                self._render_conversation()
 
         def _on_restart(self, event) -> None:
             if self._busy:
@@ -330,7 +317,8 @@ if _WX_AVAILABLE:
             self._send_btn.Enable(False)
             self._status_label.SetLabel("⏳ Restarting backend…")
             self._status_label.SetForegroundColour(wx.NullColour)
-            self._append_conv("↺ Restarting MCP backend…\n", color=self._C_WARN)
+            self._conv_entries.append({"type": "status", "text": "↺ Restarting MCP backend…", "color_hex": self._C_WARN_HEX})
+            self._render_conversation()
 
             def _do_restart():
                 ok = self._server_mgr.restart()
@@ -341,11 +329,13 @@ if _WX_AVAILABLE:
         def _on_restart_done(self, ok: bool) -> None:
             self._restart_btn.Enable(True)
             if ok:
-                self._append_conv("✅ Backend restarted successfully.\n\n", color=self._C_OK)
+                self._conv_entries.append({"type": "status", "text": "✅ Backend restarted successfully.", "color_hex": self._C_OK_HEX})
+                self._render_conversation()
                 self._init_llm_client()
                 self._on_server_started(True)
             else:
-                self._append_conv("❌ Backend failed to restart.\n\n", color=self._C_ERR)
+                self._conv_entries.append({"type": "status", "text": "❌ Backend failed to restart.", "color_hex": self._C_ERR_HEX})
+                self._render_conversation()
                 self._on_server_started(False)
 
 
@@ -370,8 +360,9 @@ if _WX_AVAILABLE:
                 return
             self._stream_timer.Stop()
             self._stream_buffer.clear()
-            self._stream_header_shown = False
-            self._conv_log.Clear()
+            self._conv_entries.clear()
+            self._pending_ai_text = ""
+            self._render_conversation()
             self._tool_log.Clear()
             if self._llm_client:
                 self._llm_client.reset()
@@ -394,24 +385,143 @@ if _WX_AVAILABLE:
             event.Skip()
 
         # ------------------------------------------------------------------ #
-        # Logging helpers
+        # Rendering helpers
         # ------------------------------------------------------------------ #
 
-        def _append_conv(
-            self,
-            text: str,
-            bold: bool = False,
-            italic: bool = False,
-            color: tuple = (30, 30, 30),
-        ) -> None:
-            attr = wx.TextAttr(wx.Colour(*color))
-            if bold:
-                attr.SetFontWeight(wx.FONTWEIGHT_BOLD)
-            if italic:
-                attr.SetFontStyle(wx.FONTSTYLE_ITALIC)
-            self._conv_log.SetDefaultStyle(attr)
-            self._conv_log.AppendText(text)
-            self._conv_log.SetDefaultStyle(wx.TextAttr(wx.Colour(30, 30, 30)))
+        @staticmethod
+        def _md_to_html(text: str) -> str:
+            """Convert markdown text to HTML.
+
+            Uses the ``markdown`` package when available; otherwise falls back
+            to a built-in converter that handles the most common syntax:
+            ATX headings, bold/italic/code spans, pipe tables, and unordered lists.
+            """
+            try:
+                import markdown
+                return markdown.markdown(text, extensions=["tables", "fenced_code"])
+            except ImportError:
+                pass
+
+            import html as _h
+            import re
+
+            def _inline(s: str) -> str:
+                s = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", s)
+                s = re.sub(r"\*(.+?)\*", r"<i>\1</i>", s)
+                s = re.sub(r"`([^`]+)`", r"<tt>\1</tt>", s)
+                return s
+
+            lines = text.split("\n")
+            out: list[str] = []
+            in_list = False
+            i = 0
+
+            while i < len(lines):
+                line = lines[i]
+
+                # Pipe table: header row followed by a separator row  |---|---|
+                if "|" in line and i + 1 < len(lines) and re.match(r"^\s*\|?[\s:|-]+\|", lines[i + 1]):
+                    if in_list:
+                        out.append("</ul>")
+                        in_list = False
+                    cells = [c.strip() for c in line.strip().strip("|").split("|")]
+                    out.append('<table border="1" cellpadding="4" cellspacing="0"><tr>')
+                    for c in cells:
+                        out.append(f"<th>{_inline(_h.escape(c))}</th>")
+                    out.append("</tr>")
+                    i += 2  # skip separator row
+                    while i < len(lines) and "|" in lines[i] and lines[i].strip():
+                        row_cells = [c.strip() for c in lines[i].strip().strip("|").split("|")]
+                        out.append("<tr>")
+                        for c in row_cells:
+                            out.append(f"<td>{_inline(_h.escape(c))}</td>")
+                        out.append("</tr>")
+                        i += 1
+                    out.append("</table>")
+                    continue
+
+                # ATX headings  # … ######
+                hm = re.match(r"^(#{1,6})\s+(.*)", line)
+                if hm:
+                    if in_list:
+                        out.append("</ul>")
+                        in_list = False
+                    level = len(hm.group(1))
+                    out.append(f"<h{level}>{_inline(_h.escape(hm.group(2)))}</h{level}>")
+                    i += 1
+                    continue
+
+                # Unordered list items  - … or * …
+                lm = re.match(r"^\s*[-*]\s+(.*)", line)
+                if lm:
+                    if not in_list:
+                        out.append("<ul>")
+                        in_list = True
+                    out.append(f"<li>{_inline(_h.escape(lm.group(1)))}</li>")
+                    i += 1
+                    continue
+
+                if in_list:
+                    out.append("</ul>")
+                    in_list = False
+
+                if not line.strip():
+                    out.append("<p>")
+                else:
+                    out.append(_inline(_h.escape(line)) + "<br>")
+                i += 1
+
+            if in_list:
+                out.append("</ul>")
+
+            return "".join(out)
+
+        def _render_conversation(self) -> None:
+            """Re-render the full conversation as HTML and update the HtmlWindow."""
+            import html as _h
+
+            parts = [
+                f'<html><body style="font-family: Arial, sans-serif; font-size: 10pt;"'
+                f' bgcolor="{self._BG_CONV_HEX}">'
+            ]
+
+            def _msg_block(sender: str, sender_color: str, bg_color: str, body_html: str) -> str:
+                return (
+                    f'<table width="100%" cellpadding="10" cellspacing="0" bgcolor="{bg_color}"'
+                    f' border="0"><tr><td>'
+                    f'<b><font color="{sender_color}" size="3">{sender}</font></b>'
+                    f'<br>{body_html}'
+                    f'</td></tr></table>'
+                    f'<br>'
+                )
+
+            for entry in self._conv_entries:
+                typ = entry["type"]
+                text = entry["text"]
+                if typ == "user":
+                    body = _h.escape(text).replace("\n", "<br>")
+                    parts.append(_msg_block("You", self._C_USER_HEX, "#EBF0FF", body))
+                elif typ == "ai":
+                    body = self._md_to_html(text)
+                    parts.append(_msg_block("AI", self._C_AI_HEX, "#EBF7F2", body))
+                elif typ == "tool":
+                    escaped = _h.escape(text)
+                    parts.append(
+                        f'<p style="margin: 2px 8px;"><font color="{self._C_TOOL_HEX}"><i>{escaped}</i></font></p>'
+                    )
+                elif typ == "status":
+                    color = entry.get("color_hex", "#1E1E1E")
+                    escaped = _h.escape(text)
+                    parts.append(f'<p style="margin: 2px 8px;"><font color="{color}">{escaped}</font></p>')
+
+            # Show pending streamed AI text
+            if self._pending_ai_text:
+                body = self._md_to_html(self._pending_ai_text)
+                parts.append(_msg_block("AI", self._C_AI_HEX, "#EBF7F2", body))
+
+            parts.append("</body></html>")
+            self._conv_html.SetPage("".join(parts))
+            self._conv_html.Scroll(0, self._conv_html.GetScrollRange(wx.VERTICAL))
 
         def _append_tool_log(self, name: str, args: dict, result: Any) -> None:
             import json as _json
