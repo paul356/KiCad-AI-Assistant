@@ -14,6 +14,7 @@ import sexpdata
 # ---------------------------------------------------------------------------
 
 LAYER_FLIP_MAP: Dict[str, str] = {
+    # KiCad 6 dot-separated names
     "F.Cu": "B.Cu",
     "B.Cu": "F.Cu",
     "F.Adhes": "B.Adhes",
@@ -28,8 +29,7 @@ LAYER_FLIP_MAP: Dict[str, str] = {
     "B.Fab": "F.Fab",
     "F.Courtyard": "B.Courtyard",
     "B.Courtyard": "F.Courtyard",
-    # KiCad 7+ names
-    "F.Cu": "B.Cu",
+    # KiCad 7+ underscore names
     "F_Cu": "B_Cu",
     "B_Cu": "F_Cu",
     "F_Fab": "B_Fab",
@@ -156,9 +156,17 @@ def _flip_layers_recursive(node: Any) -> None:
     for i, sub in enumerate(node):
         if isinstance(sub, list):
             if len(sub) >= 2 and _sym(sub[0]) == "layer":
+                # (layer "F.Cu") — singular layer reference
                 current = sub[1] if isinstance(sub[1], str) else _sym(sub[1])
                 flipped = LAYER_FLIP_MAP.get(current)
                 if flipped:
                     sub[1] = flipped
+            elif len(sub) >= 2 and _sym(sub[0]) == "layers":
+                # (layers "F.Cu" "F.Paste" "F.Mask") — SMD pad multi-layer list
+                for j in range(1, len(sub)):
+                    layer_str = sub[j] if isinstance(sub[j], str) else _sym(sub[j])
+                    flipped = LAYER_FLIP_MAP.get(layer_str)
+                    if flipped:
+                        sub[j] = flipped
             else:
                 _flip_layers_recursive(sub)

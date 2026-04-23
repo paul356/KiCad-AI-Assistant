@@ -4,6 +4,7 @@ Low-level S-expression I/O for KiCad PCB files (.kicad_pcb).
 Only concerns: load, save, and backup.  No domain knowledge about
 footprints, nets, or layers lives here.
 """
+import os
 import re
 import shutil
 from typing import Any, List
@@ -37,16 +38,23 @@ def load_pcb(path: str) -> List[Any]:
 def save_pcb(path: str, data: List[Any]) -> str:
     """Write *data* back to *path*, creating a .bak backup first.
 
+    Uses an atomic write: serializes to a .tmp sibling file then
+    renames it over the target so a crash or disk-full error never
+    leaves the PCB file partially written or empty.
+
     :param path: Absolute path to the .kicad_pcb file to overwrite.
     :param data: The (possibly mutated) S-expression tree.
     :returns: Path to the backup file that was created.
+    :raises OSError: If the backup copy or the atomic rename fails.
     """
     bak_path = path + ".bak"
+    tmp_path = path + ".tmp"
     shutil.copy2(path, bak_path)
 
     text = _serialize(data)
-    with open(path, "w", encoding="utf-8") as fh:
+    with open(tmp_path, "w", encoding="utf-8") as fh:
         fh.write(text)
+    os.replace(tmp_path, path)
 
     return bak_path
 

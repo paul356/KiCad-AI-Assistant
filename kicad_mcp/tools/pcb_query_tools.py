@@ -179,8 +179,8 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
                 "number": str(pad_num),
                 "type": str(pad_type),
                 "shape": str(pad_shape),
-                "x": pad_x,
-                "y": pad_y,
+                "local_x": pad_x,
+                "local_y": pad_y,
                 "net_name": net_name,
             })
 
@@ -270,14 +270,18 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
                     item[2] if isinstance(item[2], str) else _sym(item[2])
                 )
 
-        # Collect all pads grouped by net_id
-        # Each entry: (ref, pad_num, abs_x, abs_y)
+        # Collect all pads grouped by net_id with correct world coordinates
+        # (apply footprint rotation using KiCad's clockwise-positive convention)
+        import math
         pads_by_net: Dict[int, List[Tuple]] = defaultdict(list)
         for item in data:
-            if not (isinstance(item, list) and _sym(item[0]) == "footprint"):
+            if not (isinstance(item, list) and len(item) > 0 and _sym(item[0]) == "footprint"):
                 continue
             ref = get_fp_property(item, "Reference") or "?"
-            fp_x, fp_y, fp_rot = get_fp_at(item)
+            fp_x, fp_y, fp_rot_deg = get_fp_at(item)
+            theta = math.radians(fp_rot_deg)
+            cos_t = math.cos(theta)
+            sin_t = math.sin(theta)
             for sub in item:
                 if not (isinstance(sub, list) and len(sub) >= 4 and _sym(sub[0]) == "pad"):
                     continue
@@ -286,15 +290,23 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
                 net_id = None
                 for psub in sub:
                     if isinstance(psub, list) and len(psub) >= 3 and _sym(psub[0]) == "at":
-                        rel_x, rel_y = float(psub[1]), float(psub[2])
+                        try:
+                            rel_x, rel_y = float(psub[1]), float(psub[2])
+                        except (ValueError, TypeError):
+                            pass
                     elif isinstance(psub, list) and len(psub) >= 2 and _sym(psub[0]) == "net":
-                        net_id = int(psub[1])
+                        try:
+                            net_id = int(psub[1])
+                        except (ValueError, TypeError):
+                            pass
                 if net_id is not None and net_id != 0:
-                    abs_x = fp_x + rel_x
-                    abs_y = fp_y + rel_y
+                    # KiCad rotation is clockwise-positive; transform to world coords
+                    abs_x = fp_x + rel_x * cos_t + rel_y * sin_t
+                    abs_y = fp_y - rel_x * sin_t + rel_y * cos_t
                     pads_by_net[net_id].append((ref, str(pad_num), abs_x, abs_y))
 
-        # Build track endpoint set for connectivity check
+        # Build track endpoint set keyed by (net_id, rounded_x, rounded_y)
+        # so track endpoints from one net cannot falsely mark another net connected
         track_endpoints: set = set()
         _TOLERANCE = 0.01  # mm
 
@@ -302,38 +314,47 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
             return round(v / _TOLERANCE)
 
         for item in data:
-            if not isinstance(item, list):
+            if not (isinstance(item, list) and len(item) > 0):
                 continue
             key = _sym(item[0])
             if key in ("segment", "via"):
+                # Read the net id for this segment/via
+                seg_net: Optional[int] = None
+                for sub in item:
+                    if isinstance(sub, list) and len(sub) >= 2 and _sym(sub[0]) == "net":
+                        try:
+                            seg_net = int(sub[1])
+                        except (ValueError, TypeError):
+                            pass
                 for sub in item:
                     if isinstance(sub, list) and len(sub) >= 3 and _sym(sub[0]) in ("start", "end", "at"):
                         try:
-                            track_endpoints.add((_rounded(float(sub[1])), _rounded(float(sub[2]))))
+                            track_endpoints.add((seg_net, _rounded(float(sub[1])), _rounded(float(sub[2]))))
                         except (ValueError, TypeError):
                             pass
 
-        # For each net with ≥2 pads, report pairs where neither pad
+        # For each net with ≥2 pads, report ALL pairs where neither pad
         # has a track endpoint at its position (simple heuristic)
         unconnected = []
         for net_id, pad_list in sorted(pads_by_net.items()):
             if len(pad_list) < 2:
                 continue
             net_name = net_id_to_name.get(net_id, str(net_id))
-            connected = {
+            connected_indices = {
                 i
                 for i, (_, _, px, py) in enumerate(pad_list)
-                if (_rounded(px), _rounded(py)) in track_endpoints
+                if (net_id, _rounded(px), _rounded(py)) in track_endpoints
             }
-            disconnected = [p for i, p in enumerate(pad_list) if i not in connected]
-            if len(disconnected) >= 2:
-                # Report first pair as representative
-                a, b = disconnected[0], disconnected[1]
-                unconnected.append({
-                    "net": net_name,
-                    "from": {"ref": a[0], "pad": a[1], "x": a[2], "y": a[3]},
-                    "to": {"ref": b[0], "pad": b[1], "x": b[2], "y": b[3]},
-                })
+            disconnected = [p for i, p in enumerate(pad_list) if i not in connected_indices]
+            # Report all disconnected pairs (not just first)
+            for i in range(len(disconnected)):
+                for j in range(i + 1, len(disconnected)):
+                    a, b = disconnected[i], disconnected[j]
+                    unconnected.append({
+                        "net": net_name,
+                        "from": {"ref": a[0], "pad": a[1], "x": a[2], "y": a[3]},
+                        "to": {"ref": b[0], "pad": b[1], "x": b[2], "y": b[3]},
+                    })
 
         return {
             "unconnected": unconnected,

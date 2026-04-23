@@ -69,7 +69,10 @@ def register_pcb_placement_tools(mcp: FastMCP) -> None:
         new_rot = old_rot if rotation is None else float(rotation)
 
         set_fp_at(fp, new_x, new_y, new_rot)
-        backup_path = save_pcb(pcb_path, data)
+        try:
+            backup_path = save_pcb(pcb_path, data)
+        except OSError as exc:
+            return {"error": f"Failed to write PCB file: {exc}"}
 
         return {
             "reference": reference,
@@ -109,7 +112,10 @@ def register_pcb_placement_tools(mcp: FastMCP) -> None:
         old_layer = get_fp_layer(fp) or "unknown"
         flip_fp_layers(fp)
         new_layer = get_fp_layer(fp) or "unknown"
-        backup_path = save_pcb(pcb_path, data)
+        try:
+            backup_path = save_pcb(pcb_path, data)
+        except OSError as exc:
+            return {"error": f"Failed to write PCB file: {exc}"}
 
         return {
             "reference": reference,
@@ -164,7 +170,10 @@ def register_pcb_placement_tools(mcp: FastMCP) -> None:
         if not updated:
             return {"error": f"Failed to update property '{property_name}' on '{reference}'."}
 
-        backup_path = save_pcb(pcb_path, data)
+        try:
+            backup_path = save_pcb(pcb_path, data)
+        except OSError as exc:
+            return {"error": f"Failed to write PCB file: {exc}"}
 
         return {
             "reference": reference,

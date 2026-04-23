@@ -280,6 +280,15 @@ class FootprintIndexManager:
             footprints = self._parse_library(library_name, dir_path)
         except Exception as exc:
             log.error(f"Parse failed for {dir_path}: {exc}")
+            # Clear any stale checksum so the next sync retries this library
+            self._db.save_library(
+                library_name=library_name,
+                raw_uri=raw_uri,
+                dir_path=dir_path,
+                description=description,
+                checksum="",
+                footprints=[],
+            )
             return -1
 
         n = self._db.save_library(

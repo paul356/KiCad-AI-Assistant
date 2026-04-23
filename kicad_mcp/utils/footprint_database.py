@@ -159,8 +159,20 @@ class FootprintDatabase:
 
         @event.listens_for(self._engine, 'connect')
         def _set_pragmas(conn, _record):
-            conn.execute('PRAGMA journal_mode = WAL')
+            cursor = conn.execute('PRAGMA journal_mode = WAL')
+            result = cursor.fetchone()
+            if result and result[0].lower() not in ('wal', 'memory'):
+                import logging as _logging
+                _logging.getLogger(__name__).warning(
+                    "PRAGMA journal_mode=WAL not applied; got %r", result[0]
+                )
             conn.execute('PRAGMA foreign_keys = ON')
+            fk_result = conn.execute('PRAGMA foreign_keys').fetchone()
+            if not fk_result or fk_result[0] != 1:
+                import logging as _logging
+                _logging.getLogger(__name__).warning(
+                    "PRAGMA foreign_keys=ON not applied; got %r", fk_result
+                )
 
         self._Session = sessionmaker(bind=self._engine)
         self._apply_schema()
@@ -401,7 +413,9 @@ class FootprintDatabase:
     def _fts_escape(query: str) -> str:
         """Convert a plain user query into a safe FTS5 MATCH expression."""
         tokens = re.split(r'\s+', query.strip())
-        escaped = ' '.join(f'"{t}"' for t in tokens if t)
+        # Strip double-quotes from each token to avoid malformed FTS5 MATCH syntax
+        cleaned = [t.replace('"', '') for t in tokens if t]
+        escaped = ' '.join(f'"{t}"' for t in cleaned if t)
         return escaped if escaped else '""'
 
     @staticmethod

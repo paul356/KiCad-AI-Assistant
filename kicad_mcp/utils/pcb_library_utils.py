@@ -60,7 +60,7 @@ def find_fp_lib_tables(project_path: Optional[str] = None) -> List[str]:
 # fp-lib-table parsing
 # ---------------------------------------------------------------------------
 
-def _build_env_map() -> Dict[str, str]:
+def _build_env_map(project_dir: Optional[str] = None) -> Dict[str, str]:
     """Build a dict of KiCad ${VAR} substitutions from the environment."""
     env: Dict[str, str] = {}
     for key, val in os.environ.items():
@@ -73,6 +73,8 @@ def _build_env_map() -> Dict[str, str]:
         env.setdefault(f"{tag}_3RD_PARTY", os.path.join(home, ".local", "share", "kicad", f"{ver_num}.0", "3rdparty"))
         env.setdefault(f"{tag}_TEMPLATE_DIR", f"/usr/share/kicad/template")
         env.setdefault(f"{tag}_FOOTPRINT_DIR", f"/usr/share/kicad/footprints")
+    if project_dir:
+        env["KIPRJMOD"] = project_dir
     return env
 
 
@@ -127,7 +129,7 @@ def _parse_fp_lib_table_raw(table_path: str, env: Dict[str, str]) -> List[Dict[s
     return libraries
 
 
-def parse_fp_lib_table(table_path: str) -> List[Dict[str, str]]:
+def parse_fp_lib_table(table_path: str, project_dir: Optional[str] = None) -> List[Dict[str, str]]:
     """Parse an fp-lib-table file and return library entries.
 
     Handles ``type="Table"`` indirection: when an entry's type is ``Table``,
@@ -135,10 +137,12 @@ def parse_fp_lib_table(table_path: str) -> List[Dict[str, str]]:
     inline.  A visited-path set prevents infinite recursion.
 
     :param table_path: Absolute path to an fp-lib-table file.
+    :param project_dir: Optional project directory used to resolve
+        ``${KIPRJMOD}`` in library URIs.
     :returns: List of dicts with keys ``nickname``, ``type``, ``uri``
         (resolved), ``raw_uri`` (unexpanded), ``description``.
     """
-    env = _build_env_map()
+    env = _build_env_map(project_dir)
     return _parse_fp_lib_table_recursive(table_path, env, visited=set())
 
 
@@ -176,15 +180,17 @@ def build_effective_library_list(
     occurrence wins (project libraries override global ones).
 
     :param project_path: Optional path to a ``.kicad_pro`` file; its directory
-        is checked for a project-local fp-lib-table.
+        is checked for a project-local fp-lib-table and used to resolve
+        ``${KIPRJMOD}`` in library URIs.
     :returns: List of dicts: ``nickname``, ``type``, ``uri`` (resolved),
         ``raw_uri`` (unexpanded), ``description``.
     """
+    project_dir = os.path.dirname(project_path) if project_path else None
     table_paths = find_fp_lib_tables(project_path)
     seen_nicknames: set = set()
     result: List[Dict[str, str]] = []
     for tpath in table_paths:
-        for lib in parse_fp_lib_table(tpath):
+        for lib in parse_fp_lib_table(tpath, project_dir=project_dir):
             if lib["nickname"] not in seen_nicknames:
                 seen_nicknames.add(lib["nickname"])
                 result.append(lib)
@@ -287,7 +293,10 @@ def _parse_pad(pad_node: List[Any], sym: Any) -> Optional[Dict[str, Any]]:
     layer = ""
     for sub in pad_node:
         if isinstance(sub, list) and len(sub) >= 3 and sym(sub[0]) == "at":
-            x, y = float(sub[1]), float(sub[2])
+            try:
+                x, y = float(sub[1]), float(sub[2])
+            except (ValueError, TypeError):
+                pass
         elif isinstance(sub, list) and len(sub) >= 2 and sym(sub[0]) == "layers":
             layer = sub[1] if isinstance(sub[1], str) else sym(sub[1])
         elif isinstance(sub, list) and len(sub) >= 2 and sym(sub[0]) == "layer":
