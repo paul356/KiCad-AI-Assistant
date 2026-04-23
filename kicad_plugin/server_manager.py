@@ -210,8 +210,15 @@ class ServerManager:
 
         Uses an explicit allowlist rather than inheriting the full parent
         environment, so KiCad AppImage variables never bleed through.
+        KICAD* variables (path pointers for footprint/template dirs) are also
+        passed through so footprint library resolution works correctly.
         """
         env = {k: os.environ[k] for k in self._ENV_PASSTHROUGH if k in os.environ}
+        # Pass KICAD* path variables (e.g. KICAD10_FOOTPRINT_DIR set by the
+        # AppImage) so library URI resolution works in the subprocess.
+        for k, v in os.environ.items():
+            if k.startswith("KICAD"):
+                env[k] = v
 
         env["MCP_TRANSPORT"] = "streamable-http"
         env["MCP_PORT"] = str(port)

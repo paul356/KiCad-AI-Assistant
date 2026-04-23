@@ -84,19 +84,16 @@ def _resolve_uri(uri: str, env: Dict[str, str]) -> str:
     return re.sub(r"\$\{([^}]+)\}", _replace, uri)
 
 
-def parse_fp_lib_table(table_path: str) -> List[Dict[str, str]]:
-    """Parse an fp-lib-table file and return library entries.
+def _parse_fp_lib_table_raw(table_path: str, env: Dict[str, str]) -> List[Dict[str, str]]:
+    """Parse a single fp-lib-table file without recursion.
 
-    :param table_path: Absolute path to an fp-lib-table file.
-    :returns: List of dicts with keys ``nickname``, ``type``, ``uri``,
-        ``description`` (resolved path, not the raw ${VAR} form).
+    :returns: List of dicts with keys ``nickname``, ``type``, ``uri``
+        (resolved), ``raw_uri`` (unexpanded), ``description``.
     """
-    env = _build_env_map()
     libraries: List[Dict[str, str]] = []
-
-    with open(table_path, "r", encoding="utf-8") as fh:
-        raw = fh.read()
     try:
+        with open(table_path, "r", encoding="utf-8") as fh:
+            raw = fh.read()
         data = sexpdata.loads(raw)
     except Exception:
         return libraries
@@ -107,7 +104,9 @@ def parse_fp_lib_table(table_path: str) -> List[Dict[str, str]]:
     for item in data:
         if not (isinstance(item, list) and len(item) > 0 and _sym(item[0]) == "lib"):
             continue
-        entry: Dict[str, str] = {"nickname": "", "type": "", "uri": "", "description": ""}
+        entry: Dict[str, str] = {
+            "nickname": "", "type": "", "uri": "", "raw_uri": "", "description": "",
+        }
         for sub in item[1:]:
             if not (isinstance(sub, list) and len(sub) >= 2):
                 continue
@@ -118,6 +117,7 @@ def parse_fp_lib_table(table_path: str) -> List[Dict[str, str]]:
             elif key == "type":
                 entry["type"] = val
             elif key == "uri":
+                entry["raw_uri"] = val
                 entry["uri"] = _resolve_uri(val, env)
             elif key == "descr":
                 entry["description"] = val
@@ -125,6 +125,70 @@ def parse_fp_lib_table(table_path: str) -> List[Dict[str, str]]:
             libraries.append(entry)
 
     return libraries
+
+
+def parse_fp_lib_table(table_path: str) -> List[Dict[str, str]]:
+    """Parse an fp-lib-table file and return library entries.
+
+    Handles ``type="Table"`` indirection: when an entry's type is ``Table``,
+    its ``uri`` points to another fp-lib-table file whose entries are included
+    inline.  A visited-path set prevents infinite recursion.
+
+    :param table_path: Absolute path to an fp-lib-table file.
+    :returns: List of dicts with keys ``nickname``, ``type``, ``uri``
+        (resolved), ``raw_uri`` (unexpanded), ``description``.
+    """
+    env = _build_env_map()
+    return _parse_fp_lib_table_recursive(table_path, env, visited=set())
+
+
+def _parse_fp_lib_table_recursive(
+    table_path: str,
+    env: Dict[str, str],
+    visited: set,
+) -> List[Dict[str, str]]:
+    """Recursive helper for parse_fp_lib_table."""
+    real_path = os.path.realpath(table_path)
+    if real_path in visited:
+        return []
+    visited.add(real_path)
+
+    result: List[Dict[str, str]] = []
+    for entry in _parse_fp_lib_table_raw(table_path, env):
+        if entry["type"].lower() == "table":
+            sub_table = entry["uri"]
+            if os.path.isfile(sub_table):
+                result.extend(
+                    _parse_fp_lib_table_recursive(sub_table, env, visited)
+                )
+        else:
+            result.append(entry)
+    return result
+
+
+def build_effective_library_list(
+    project_path: Optional[str] = None,
+) -> List[Dict[str, str]]:
+    """Return a deduplicated, precedence-ordered list of footprint libraries.
+
+    Reads all fp-lib-table files (project first, then global), resolves
+    ``type="Table"`` indirections, and deduplicates by nickname — the first
+    occurrence wins (project libraries override global ones).
+
+    :param project_path: Optional path to a ``.kicad_pro`` file; its directory
+        is checked for a project-local fp-lib-table.
+    :returns: List of dicts: ``nickname``, ``type``, ``uri`` (resolved),
+        ``raw_uri`` (unexpanded), ``description``.
+    """
+    table_paths = find_fp_lib_tables(project_path)
+    seen_nicknames: set = set()
+    result: List[Dict[str, str]] = []
+    for tpath in table_paths:
+        for lib in parse_fp_lib_table(tpath):
+            if lib["nickname"] not in seen_nicknames:
+                seen_nicknames.add(lib["nickname"])
+                result.append(lib)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -151,15 +215,18 @@ def parse_kicad_mod(path: str) -> Dict[str, Any]:
     """Extract metadata and pad information from a .kicad_mod file.
 
     :param path: Absolute path to a .kicad_mod file.
-    :returns: Dict with keys ``name``, ``description``, ``tags``,
-        ``layer``, ``pads`` (list of pad dicts), ``courtyard_bbox``
-        (``{min_x, min_y, max_x, max_y}`` or None).
+    :returns: Dict with keys ``name``, ``description``, ``tags``, ``layer``,
+        ``attr`` (e.g. ``"smd"``, ``"through_hole"``, or ``""``),
+        ``has_3d_model`` (bool), ``pads`` (list of pad dicts),
+        ``courtyard_bbox`` (``{min_x, min_y, max_x, max_y}`` or None).
     """
     result: Dict[str, Any] = {
         "name": os.path.splitext(os.path.basename(path))[0],
         "description": "",
         "tags": "",
         "layer": "",
+        "attr": "",
+        "has_3d_model": False,
         "pads": [],
         "courtyard_bbox": None,
     }
@@ -186,6 +253,11 @@ def parse_kicad_mod(path: str) -> Dict[str, Any]:
             result["tags"] = item[1] if isinstance(item[1], str) else _sym(item[1])
         elif key == "layer":
             result["layer"] = item[1] if isinstance(item[1], str) else _sym(item[1])
+        elif key == "attr":
+            # (attr smd) or (attr through_hole) — unquoted value is a Symbol
+            result["attr"] = _sym(item[1])
+        elif key == "model":
+            result["has_3d_model"] = True
         elif key == "pad":
             pad = _parse_pad(item, _sym)
             if pad:

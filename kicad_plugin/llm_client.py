@@ -32,6 +32,10 @@ log = logging.getLogger(__name__)
 # Marker substring used to detect the missing-ssl failure mode.
 _NO_HTTPS_MARKER = "unknown url type: https"
 
+# Cached result of whether in-process urllib can reach HTTPS.
+# None = unknown, True = works, False = SSL unavailable (use subprocess).
+_in_process_ssl: bool | None = None
+
 
 def _resolve_plugin_python() -> Optional[str]:
     """Return the path to the plugin venv's Python, or None if absent."""
@@ -45,21 +49,28 @@ def _resolve_plugin_python() -> Optional[str]:
 
 # Subprocess script: read raw body bytes from stdin, perform the POST, emit
 # a single-line JSON object on stdout describing the outcome.
+# Always exits with code 0 and communicates errors via the JSON payload:
+#   success/HTTP error -> {"status": <http_code>, "body": "<response_text>"}
+#   network/other error -> {"status": 0, "error": "<description>"}
 _SUBPROCESS_SCRIPT = r"""
 import json, sys, urllib.request, urllib.error
-url = sys.argv[1]
-headers = json.loads(sys.argv[2])
-timeout = float(sys.argv[3])
-body = sys.stdin.buffer.read()
-req = urllib.request.Request(url, data=body, headers=headers, method="POST")
 try:
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        out = {"status": resp.status, "body": resp.read().decode("utf-8", "replace")}
-except urllib.error.HTTPError as e:
-    out = {"status": e.code, "body": e.read().decode("utf-8", "replace")}
+    url = sys.argv[1]
+    headers = json.loads(sys.argv[2])
+    timeout = float(sys.argv[3])
+    body = sys.stdin.buffer.read()
+    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            result = {"status": resp.status, "body": resp.read().decode("utf-8", "replace")}
+    except urllib.error.HTTPError as e:
+        result = {"status": e.code, "body": e.read().decode("utf-8", "replace")}
+    except Exception as e:
+        result = {"status": 0, "error": f"{type(e).__name__}: {e}"}
 except Exception as e:
-    out = {"error": f"{type(e).__name__}: {e}"}
-sys.stdout.write(json.dumps(out))
+    result = {"status": 0, "error": f"subprocess setup error: {type(e).__name__}: {e}"}
+sys.stdout.write(json.dumps(result))
+sys.stdout.flush()
 """
 
 
@@ -75,21 +86,26 @@ def _https_post_json(
     mode, falls back to invoking the plugin venv Python as a one-shot proxy.
     Raises ``RuntimeError`` with a clear message if both paths fail.
     """
+    global _in_process_ssl
     import urllib.request
     import urllib.error
 
-    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.status, resp.read().decode("utf-8", "replace")
-    except urllib.error.HTTPError as e:
-        return e.code, e.read().decode("utf-8", "replace")
-    except urllib.error.URLError as e:
-        if _NO_HTTPS_MARKER not in str(e.reason):
+    if _in_process_ssl is not False:
+        req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                _in_process_ssl = True
+                return resp.status, resp.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as e:
+            _in_process_ssl = True
+            return e.code, e.read().decode("utf-8", "replace")
+        except urllib.error.URLError as e:
+            if _NO_HTTPS_MARKER not in str(e.reason):
+                raise RuntimeError(f"HTTPS request failed: {e}") from e
+            _in_process_ssl = False
+            # Fall through to subprocess fallback below.
+        except Exception as e:  # noqa: BLE001 — surface unexpected errors verbatim
             raise RuntimeError(f"HTTPS request failed: {e}") from e
-        # Fall through to subprocess fallback below.
-    except Exception as e:  # noqa: BLE001 — surface unexpected errors verbatim
-        raise RuntimeError(f"HTTPS request failed: {e}") from e
 
     # Subprocess fallback: embedded Python lacks working ssl.
     venv_python = _resolve_plugin_python()
@@ -127,16 +143,17 @@ def _https_post_json(
 
     if proc.returncode != 0:
         stderr = proc.stderr.decode("utf-8", "replace")[:500]
-        raise RuntimeError(f"HTTPS subprocess failed (exit {proc.returncode}): {stderr}")
+        raise RuntimeError(f"HTTPS subprocess crashed (exit {proc.returncode}): {stderr}")
 
     try:
         out = json.loads(proc.stdout.decode("utf-8", "replace"))
     except json.JSONDecodeError as e:
         raise RuntimeError(f"HTTPS subprocess returned invalid JSON: {e}") from e
 
-    if "error" in out:
-        raise RuntimeError(f"HTTPS request failed: {out['error']}")
-    return int(out["status"]), str(out["body"])
+    status = out.get("status", 0)
+    if status == 0:
+        raise RuntimeError(f"HTTPS request failed: {out.get('error', 'unknown error')}")
+    return int(status), str(out.get("body", ""))
 
 MAX_HISTORY_MESSAGES = 100  # default sliding-window cap for conversation history
 
@@ -453,7 +470,12 @@ class LLMClient:
         return messages
 
     def _stream_openai(self, system: str, tools: list[dict], on_text_delta) -> dict[str, Any]:
-        """Call OpenAI-compatible API with streaming enabled."""
+        """Call OpenAI-compatible API with streaming enabled.
+
+        Uses in-process urllib for true SSE streaming when SSL is available.
+        Falls back to non-streaming via _call_openai (subprocess) otherwise.
+        """
+        global _in_process_ssl
         import urllib.request
         import urllib.error
 
@@ -477,82 +499,92 @@ class LLMClient:
             "Authorization": f"Bearer {self._settings.llm_api_key}",
         }
 
-        req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
-        try:
-            with urllib.request.urlopen(req, timeout=300) as resp:
-                text_parts = []
-                tool_calls_by_index: dict[int, dict] = {}
-                finish_reason = "stop"
+        if _in_process_ssl is not False:
+            req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
+            try:
+                with urllib.request.urlopen(req, timeout=300) as resp:
+                    _in_process_ssl = True
+                    text_parts = []
+                    tool_calls_by_index: dict[int, dict] = {}
+                    finish_reason = "stop"
 
-                while True:
-                    raw = resp.readline()
-                    if raw == b"":
-                        break
-                    line = raw.decode("utf-8", "replace").rstrip("\r\n")
-                    if not line.startswith("data:"):
-                        continue
-                    data_str = line[5:].strip()
-                    if data_str == "[DONE]":
-                        break
-                    try:
-                        chunk = json.loads(data_str)
-                    except json.JSONDecodeError:
-                        continue
-
-                    choice = chunk.get("choices", [{}])[0]
-                    fr = choice.get("finish_reason")
-                    if fr is not None:
-                        finish_reason = fr
-
-                    delta = choice.get("delta", {})
-                    content = delta.get("content")
-                    if content:
-                        text_parts.append(content)
+                    while True:
+                        raw = resp.readline()
+                        if raw == b"":
+                            break
+                        line = raw.decode("utf-8", "replace").rstrip("\r\n")
+                        if not line.startswith("data:"):
+                            continue
+                        data_str = line[5:].strip()
+                        if data_str == "[DONE]":
+                            break
                         try:
-                            on_text_delta(content)
-                        except Exception:
-                            pass
+                            chunk = json.loads(data_str)
+                        except json.JSONDecodeError:
+                            continue
 
-                    for tc_delta in delta.get("tool_calls") or []:
-                        idx = tc_delta["index"]
-                        if idx not in tool_calls_by_index:
-                            tool_calls_by_index[idx] = {
-                                "id": "",
-                                "type": "function",
-                                "function": {"name": "", "arguments": ""},
-                            }
-                        tc = tool_calls_by_index[idx]
-                        if tc_delta.get("id"):
-                            tc["id"] += tc_delta["id"]
-                        fn = tc_delta.get("function", {})
-                        if fn.get("name"):
-                            tc["function"]["name"] += fn["name"]
-                        if fn.get("arguments"):
-                            tc["function"]["arguments"] += fn["arguments"]
+                        choice = chunk.get("choices", [{}])[0]
+                        fr = choice.get("finish_reason")
+                        if fr is not None:
+                            finish_reason = fr
 
-                tool_calls = [tool_calls_by_index[k] for k in sorted(tool_calls_by_index)]
-                message: dict[str, Any] = {"content": "".join(text_parts)}
-                if tool_calls:
-                    message["tool_calls"] = tool_calls
-                return {"finish_reason": finish_reason, "message": message}
+                        delta = choice.get("delta", {})
+                        content = delta.get("content")
+                        if content:
+                            text_parts.append(content)
+                            try:
+                                on_text_delta(content)
+                            except Exception:
+                                pass
 
-        except urllib.error.URLError as e:
-            if _NO_HTTPS_MARKER not in str(e.reason):
-                return {"error": f"HTTPS request failed: {e}"}
-            # SSL fallback: use non-streaming call then fire on_text_delta once
-            result = self._call_openai(system, tools)
-            content = result.get("message", {}).get("content", "")
-            if content:
-                try:
-                    on_text_delta(content)
-                except Exception:
-                    pass
-            return result
-        except Exception as e:
-            return {"error": f"Streaming request failed: {e}"}
+                        for tc_delta in delta.get("tool_calls") or []:
+                            idx = tc_delta["index"]
+                            if idx not in tool_calls_by_index:
+                                tool_calls_by_index[idx] = {
+                                    "id": "",
+                                    "type": "function",
+                                    "function": {"name": "", "arguments": ""},
+                                }
+                            tc = tool_calls_by_index[idx]
+                            if tc_delta.get("id"):
+                                tc["id"] += tc_delta["id"]
+                            fn = tc_delta.get("function", {})
+                            if fn.get("name"):
+                                tc["function"]["name"] += fn["name"]
+                            if fn.get("arguments"):
+                                tc["function"]["arguments"] += fn["arguments"]
+
+                    tool_calls = [tool_calls_by_index[k] for k in sorted(tool_calls_by_index)]
+                    message: dict[str, Any] = {"content": "".join(text_parts)}
+                    if tool_calls:
+                        message["tool_calls"] = tool_calls
+                    return {"finish_reason": finish_reason, "message": message}
+
+            except urllib.error.URLError as e:
+                if _NO_HTTPS_MARKER not in str(e.reason):
+                    return {"error": f"HTTPS request failed: {e}"}
+                _in_process_ssl = False
+                # Fall through to non-streaming fallback below.
+            except Exception as e:
+                return {"error": f"Streaming request failed: {e}"}
+
+        # In-process SSL unavailable: fall back to non-streaming via subprocess.
+        result = self._call_openai(system, tools)
+        content = result.get("message", {}).get("content", "")
+        if content:
+            try:
+                on_text_delta(content)
+            except Exception:
+                pass
+        return result
 
     def _stream_anthropic(self, system: str, tools: list[dict], on_text_delta) -> dict[str, Any]:
-        """Call Anthropic API with streaming enabled."""
+        """Call Anthropic API with streaming enabled.
+
+        Uses in-process urllib for true SSE streaming when SSL is available.
+        Falls back to non-streaming via _call_anthropic (subprocess) otherwise.
+        """
+        global _in_process_ssl
         import urllib.request
         import urllib.error
 
@@ -582,109 +614,115 @@ class LLMClient:
             "anthropic-version": "2023-06-01",
         }
 
-        req = urllib.request.Request(url, data=encoded, headers=headers, method="POST")
-        try:
-            with urllib.request.urlopen(req, timeout=300) as resp:
-                text_blocks: dict[int, str] = {}
-                tool_blocks: dict[int, dict] = {}
-                stop_reason = "end_turn"
-                current_event = ""
+        if _in_process_ssl is not False:
+            req = urllib.request.Request(url, data=encoded, headers=headers, method="POST")
+            try:
+                with urllib.request.urlopen(req, timeout=300) as resp:
+                    _in_process_ssl = True
+                    text_blocks: dict[int, str] = {}
+                    tool_blocks: dict[int, dict] = {}
+                    stop_reason = "end_turn"
+                    current_event = ""
 
-                while True:
-                    raw = resp.readline()
-                    if raw == b"":
-                        break
-                    line = raw.decode("utf-8", "replace").rstrip("\r\n")
-                    if line.startswith("event:"):
-                        current_event = line[6:].strip()
-                        continue
-                    if not line.startswith("data:"):
-                        continue
-                    data_str = line[5:].strip()
-                    try:
-                        event_data = json.loads(data_str)
-                    except json.JSONDecodeError:
-                        continue
+                    while True:
+                        raw = resp.readline()
+                        if raw == b"":
+                            break
+                        line = raw.decode("utf-8", "replace").rstrip("\r\n")
+                        if line.startswith("event:"):
+                            current_event = line[6:].strip()
+                            continue
+                        if not line.startswith("data:"):
+                            continue
+                        data_str = line[5:].strip()
+                        try:
+                            event_data = json.loads(data_str)
+                        except json.JSONDecodeError:
+                            continue
 
-                    etype = event_data.get("type", current_event)
+                        etype = event_data.get("type", current_event)
 
-                    if etype == "content_block_start":
-                        idx = event_data.get("index", 0)
-                        block = event_data.get("content_block", {})
-                        btype = block.get("type")
-                        if btype == "text":
-                            text_blocks[idx] = block.get("text", "")
-                        elif btype == "tool_use":
-                            tool_blocks[idx] = {
-                                "id": block["id"],
-                                "name": block["name"],
-                                "input_json": "",
-                            }
+                        if etype == "content_block_start":
+                            idx = event_data.get("index", 0)
+                            block = event_data.get("content_block", {})
+                            btype = block.get("type")
+                            if btype == "text":
+                                text_blocks[idx] = block.get("text", "")
+                            elif btype == "tool_use":
+                                tool_blocks[idx] = {
+                                    "id": block["id"],
+                                    "name": block["name"],
+                                    "input_json": "",
+                                }
 
-                    elif etype == "content_block_delta":
-                        idx = event_data.get("index", 0)
-                        delta = event_data.get("delta", {})
-                        dtype = delta.get("type")
-                        if dtype == "text_delta":
-                            chunk = delta.get("text", "")
-                            text_blocks[idx] = text_blocks.get(idx, "") + chunk
-                            if chunk:
-                                try:
-                                    on_text_delta(chunk)
-                                except Exception:
-                                    pass
-                        elif dtype == "input_json_delta":
-                            partial = delta.get("partial_json", "")
-                            if idx in tool_blocks:
-                                tool_blocks[idx]["input_json"] += partial
+                        elif etype == "content_block_delta":
+                            idx = event_data.get("index", 0)
+                            delta = event_data.get("delta", {})
+                            dtype = delta.get("type")
+                            if dtype == "text_delta":
+                                chunk = delta.get("text", "")
+                                text_blocks[idx] = text_blocks.get(idx, "") + chunk
+                                if chunk:
+                                    try:
+                                        on_text_delta(chunk)
+                                    except Exception:
+                                        pass
+                            elif dtype == "input_json_delta":
+                                partial = delta.get("partial_json", "")
+                                if idx in tool_blocks:
+                                    tool_blocks[idx]["input_json"] += partial
 
-                    elif etype == "message_delta":
-                        delta = event_data.get("delta", {})
-                        sr = delta.get("stop_reason")
-                        if sr:
-                            stop_reason = sr
+                        elif etype == "message_delta":
+                            delta = event_data.get("delta", {})
+                            sr = delta.get("stop_reason")
+                            if sr:
+                                stop_reason = sr
 
-                    elif etype == "error":
-                        err = event_data.get("error", {})
-                        return {"error": f"Anthropic stream error: {err.get('message', str(err))}"}
+                        elif etype == "error":
+                            err = event_data.get("error", {})
+                            return {"error": f"Anthropic stream error: {err.get('message', str(err))}"}
 
-                full_text = "\n".join(text_blocks[k] for k in sorted(text_blocks))
-                tool_calls = []
-                for k in sorted(tool_blocks):
-                    tb = tool_blocks[k]
-                    try:
-                        inp = json.loads(tb["input_json"]) if tb["input_json"] else {}
-                    except json.JSONDecodeError:
-                        inp = {}
-                    tool_calls.append({
-                        "id": tb["id"],
-                        "type": "function",
-                        "function": {
-                            "name": tb["name"],
-                            "arguments": json.dumps(inp),
-                        },
-                    })
-                message_out: dict[str, Any] = {"content": full_text}
-                if tool_calls:
-                    message_out["tool_calls"] = tool_calls
-                finish = "tool_calls" if tool_calls else "stop"
-                if stop_reason == "max_tokens":
-                    finish = "stop"
-                return {"finish_reason": finish, "message": message_out}
+                    full_text = "\n".join(text_blocks[k] for k in sorted(text_blocks))
+                    tool_calls = []
+                    for k in sorted(tool_blocks):
+                        tb = tool_blocks[k]
+                        try:
+                            inp = json.loads(tb["input_json"]) if tb["input_json"] else {}
+                        except json.JSONDecodeError:
+                            inp = {}
+                        tool_calls.append({
+                            "id": tb["id"],
+                            "type": "function",
+                            "function": {
+                                "name": tb["name"],
+                                "arguments": json.dumps(inp),
+                            },
+                        })
+                    message_out: dict[str, Any] = {"content": full_text}
+                    if tool_calls:
+                        message_out["tool_calls"] = tool_calls
+                    finish = "tool_calls" if tool_calls else "stop"
+                    if stop_reason == "max_tokens":
+                        finish = "stop"
+                    return {"finish_reason": finish, "message": message_out}
 
-        except urllib.error.URLError as e:
-            if _NO_HTTPS_MARKER not in str(e.reason):
-                return {"error": f"HTTPS request failed: {e}"}
-            result = self._call_anthropic(system, tools)
-            content = result.get("message", {}).get("content", "")
-            if content:
-                try:
-                    on_text_delta(content)
-                except Exception:
-                    pass
-            return result
-        except Exception as e:
-            return {"error": f"Streaming request failed: {e}"}
+            except urllib.error.URLError as e:
+                if _NO_HTTPS_MARKER not in str(e.reason):
+                    return {"error": f"HTTPS request failed: {e}"}
+                _in_process_ssl = False
+                # Fall through to non-streaming fallback below.
+            except Exception as e:
+                return {"error": f"Streaming request failed: {e}"}
+
+        # In-process SSL unavailable: fall back to non-streaming via subprocess.
+        result = self._call_anthropic(system, tools)
+        content = result.get("message", {}).get("content", "")
+        if content:
+            try:
+                on_text_delta(content)
+            except Exception:
+                pass
+        return result
 
     def _call_openai(self, system: str, tools: list[dict]) -> dict[str, Any]:
         base = (self._settings.llm_base_url or "https://api.openai.com").rstrip("/")
@@ -718,6 +756,9 @@ class LLMClient:
             body = json.loads(text)
         except json.JSONDecodeError as e:
             return {"error": f"Invalid JSON from OpenAI: {e}"}
+
+        if not isinstance(body, dict):
+            return {"error": f"Unexpected response from OpenAI: {text[:200]}"}
 
         choice = body.get("choices", [{}])[0]
         return {
@@ -759,6 +800,9 @@ class LLMClient:
             body = json.loads(text)
         except json.JSONDecodeError as e:
             return {"error": f"Invalid JSON from Anthropic: {e}"}
+
+        if not isinstance(body, dict):
+            return {"error": f"Unexpected response from Anthropic: {text[:200]}"}
 
         stop_reason = body.get("stop_reason", "end_turn")
         content_blocks_resp = body.get("content", [])
