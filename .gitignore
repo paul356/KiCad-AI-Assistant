@@ -67,6 +67,9 @@ uv.lock
 # Pre-commit
 .pre-commit-config.yaml
 
+# Sample/demo KiCad project files (not part of the MCP codebase)
+smart-keyboard.*
+
 # KiCad backup files
 *-backups/
 fp-info-cache
