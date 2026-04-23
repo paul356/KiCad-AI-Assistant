@@ -34,6 +34,7 @@ nosetests.xml
 coverage.xml
 *.cover
 .pytest_cache/
+MagicMock/
 
 # Logs
 logs/
@@ -66,9 +67,6 @@ uv.lock
 
 # Pre-commit
 .pre-commit-config.yaml
-
-# Sample/demo KiCad project files (not part of the MCP codebase)
-smart-keyboard.*
 
 # KiCad backup files
 *-backups/
