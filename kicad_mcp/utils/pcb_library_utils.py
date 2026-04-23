@@ -5,12 +5,17 @@ Handles: finding fp-lib-table files, parsing them, resolving
 ${VAR} placeholders in URIs, and scanning .pretty directories
 for .kicad_mod files.
 """
+import logging
 import os
 import re
 import sys
 from typing import Any, Dict, List, Optional
 
 import sexpdata
+
+from kicad_mcp.config import LibraryPathConfig
+
+log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -61,29 +66,43 @@ def find_fp_lib_tables(project_path: Optional[str] = None) -> List[str]:
 # ---------------------------------------------------------------------------
 
 def _build_env_map(project_dir: Optional[str] = None) -> Dict[str, str]:
-    """Build a dict of KiCad ${VAR} substitutions from the environment."""
-    env: Dict[str, str] = {}
+    """Build a dict of KiCad ``${VAR}`` substitutions for fp-lib-table URIs.
+
+    Sources, in increasing precedence:
+      1. Defaults from :class:`LibraryPathConfig` (KICAD{N}_SYMBOL_DIR,
+         KICAD{N}_FOOTPRINT_DIR, KICAD{N}_TEMPLATE_DIR, KICAD{N}_3RD_PARTY) —
+         derived from KICAD_APP_PATH or an auto-detected AppImage mount.
+      2. Any ``KICAD*`` environment variables set in the current process.
+      3. ``KIPRJMOD`` set to *project_dir* if given.
+    """
+    env: Dict[str, str] = LibraryPathConfig().get_env_vars()
     for key, val in os.environ.items():
         if key.startswith("KICAD"):
             env[key] = val
-    # Common defaults for Linux
-    home = os.path.expanduser("~")
-    for ver_num in ["10", "9", "8", "7"]:
-        tag = f"KICAD{ver_num}"
-        env.setdefault(f"{tag}_3RD_PARTY", os.path.join(home, ".local", "share", "kicad", f"{ver_num}.0", "3rdparty"))
-        env.setdefault(f"{tag}_TEMPLATE_DIR", f"/usr/share/kicad/template")
-        env.setdefault(f"{tag}_FOOTPRINT_DIR", f"/usr/share/kicad/footprints")
     if project_dir:
         env["KIPRJMOD"] = project_dir
     return env
 
 
 def _resolve_uri(uri: str, env: Dict[str, str]) -> str:
-    """Expand ${VAR} placeholders in a library URI."""
+    """Expand ``${VAR}`` placeholders in a library URI.
+
+    Logs a warning when any placeholder cannot be resolved so that missing
+    KiCad environment variables (e.g. ``KICAD10_TEMPLATE_DIR`` when no
+    AppImage is mounted) surface clearly instead of silently producing a
+    broken path.
+    """
     def _replace(match: re.Match) -> str:
         var = match.group(1)
         return env.get(var, match.group(0))
-    return re.sub(r"\$\{([^}]+)\}", _replace, uri)
+    expanded = re.sub(r"\$\{([^}]+)\}", _replace, uri)
+    unresolved = sorted(set(re.findall(r"\$\{([^}]+)\}", expanded)))
+    if unresolved:
+        log.warning(
+            "Unresolved fp-lib-table variable(s) %s in URI: %s",
+            unresolved, uri,
+        )
+    return expanded
 
 
 def _parse_fp_lib_table_raw(table_path: str, env: Dict[str, str]) -> List[Dict[str, str]]:
@@ -164,6 +183,13 @@ def _parse_fp_lib_table_recursive(
             if os.path.isfile(sub_table):
                 result.extend(
                     _parse_fp_lib_table_recursive(sub_table, env, visited)
+                )
+            else:
+                log.warning(
+                    "fp-lib-table indirection target not found: %s "
+                    "(entry '%s' in %s, raw uri %r)",
+                    sub_table, entry.get("nickname", ""),
+                    table_path, entry.get("raw_uri", ""),
                 )
         else:
             result.append(entry)

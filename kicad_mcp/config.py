@@ -34,8 +34,11 @@ Dependencies:
     - platform: Operating system detection
 """
 
+import logging
 import os
 import platform
+
+log = logging.getLogger(__name__)
 
 # Determine operating system for platform-specific configuration
 # Returns 'Darwin' (macOS), 'Windows', 'Linux', or other
@@ -225,6 +228,16 @@ class LibraryPathConfig:
             return os.path.join(kicad_app_path, "symbols")
 
     @staticmethod
+    def _default_footprint_dir(kicad_app_path: str) -> str:
+        """Return the platform-specific default KiCad system footprints directory."""
+        if system == "Darwin":
+            return os.path.join(kicad_app_path, "Contents", "SharedSupport", "footprints")
+        elif system == "Windows":
+            return os.path.join(kicad_app_path, "share", "kicad", "footprints")
+        else:
+            return os.path.join(kicad_app_path, "footprints")
+
+    @staticmethod
     def _default_config_dir(kicad_version: str) -> str:
         """Return the platform-specific default KiCad configuration directory."""
         if system == "Darwin":
@@ -259,21 +272,40 @@ class LibraryPathConfig:
     def __init__(self):
         kicad_version = os.environ.get("KICAD_VERSION") or KICAD_VERSION
         _ver_tag = kicad_version.split(".")[0]
-        kicad_app_path = os.environ.get("KICAD_APP_PATH") or KICAD_APP_PATH
 
-        self._kicad_config_dir = (
+        # KICAD_APP_PATH must be set in the environment (typically via .env)
+        # for AppImage / non-standard installs.  If the resolved path doesn't
+        # exist we log a clear warning rather than silently falling back —
+        # otherwise sym/fp-lib-table entries that reference
+        # ${KICAD{N}_TEMPLATE_DIR}/... etc. would be silently dropped.
+        kicad_app_path = os.environ.get("KICAD_APP_PATH") or KICAD_APP_PATH
+        if not os.path.isdir(kicad_app_path):
+            log.warning(
+                "KiCad application path does not exist: %s. "
+                "System symbol/footprint/template libraries will be unresolvable. "
+                "Set KICAD_APP_PATH in your .env file (e.g. for an AppImage, "
+                "the path under /tmp/.mount_kicad*/share/kicad while KiCad is "
+                "running).",
+                kicad_app_path,
+            )
+
+        self._kicad_config_dir = os.path.expanduser(
             os.environ.get("KICAD_CONFIG_DIR")
             or self._default_config_dir(kicad_version)
         )
-        self._kicad_symbol_dir = (
+        self._kicad_symbol_dir = os.path.expanduser(
             os.environ.get("KICAD_SYMBOL_DIR")
             or self._default_symbol_dir(kicad_app_path)
         )
-        self._kicad_3rd_party = (
+        self._kicad_footprint_dir = os.path.expanduser(
+            os.environ.get("KICAD_FOOTPRINT_DIR")
+            or self._default_footprint_dir(kicad_app_path)
+        )
+        self._kicad_3rd_party = os.path.expanduser(
             os.environ.get("KICAD_3RD_PARTY")
             or self._default_3rd_party(kicad_version)
         )
-        self._kicad_template_dir = (
+        self._kicad_template_dir = os.path.expanduser(
             os.environ.get("KICAD_TEMPLATE_DIR")
             or self._default_template_dir(kicad_app_path, kicad_version)
         )
@@ -281,8 +313,9 @@ class LibraryPathConfig:
         # Env vars to inject into subprocesses that expand ${VAR} placeholders in library URIs
         self._env_vars = {
             f"KICAD{_ver_tag}_SYMBOL_DIR": self._kicad_symbol_dir,
+            f"KICAD{_ver_tag}_FOOTPRINT_DIR": self._kicad_footprint_dir,
             f"KICAD{_ver_tag}_3RD_PARTY": self._kicad_3rd_party,
-            f"KICAD{_ver_tag}_TEMPLATE_DIR": self._kicad_template_dir
+            f"KICAD{_ver_tag}_TEMPLATE_DIR": self._kicad_template_dir,
         }
 
     @property

@@ -128,4 +128,10 @@ class SymbolIndexReader:
         """Replace ${VAR_NAME} placeholders using the configured env vars."""
         for var, value in self._config.get_env_vars().items():
             path = re.sub(r'\$\{' + re.escape(var) + r'\}', value, path)
+        unresolved = sorted(set(re.findall(r'\$\{([^}]+)\}', path)))
+        if unresolved:
+            log.warning(
+                "Unresolved sym-lib-table variable(s) %s in URI: %s",
+                unresolved, path,
+            )
         return path

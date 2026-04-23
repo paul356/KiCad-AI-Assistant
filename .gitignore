@@ -54,6 +54,11 @@ kicad_mcp/utils/symbol_db/*.db
 kicad_mcp/utils/symbol_db/*.db-shm
 kicad_mcp/utils/symbol_db/*.db-wal
 
+# Footprint database files (auto-generated, do not commit)
+kicad_mcp/utils/footprint_db/*.db
+kicad_mcp/utils/footprint_db/*.db-shm
+kicad_mcp/utils/footprint_db/*.db-wal
+
 # UV and modern Python tooling
 uv.lock
 .uv-cache/
