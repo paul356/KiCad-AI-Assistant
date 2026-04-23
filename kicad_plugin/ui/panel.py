@@ -131,10 +131,6 @@ if _WX_AVAILABLE:
             self._status_label = wx.StaticText(panel, label="⏳ Starting backend…")
             status_hbox.Add(self._status_label, 1, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
 
-            self._restart_btn = wx.Button(panel, label="↺ Restart", style=wx.BU_EXACTFIT)
-            self._restart_btn.SetToolTip("Restart the MCP backend server")
-            status_hbox.Add(self._restart_btn, 0, wx.ALIGN_CENTER_VERTICAL)
-
             vbox.Add(status_hbox, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM | wx.EXPAND, 4)
 
             panel.SetSizer(vbox)
@@ -152,7 +148,6 @@ if _WX_AVAILABLE:
             # ---- Events ----
             self._send_btn.Bind(wx.EVT_BUTTON, self._on_send)
             self._input.Bind(wx.EVT_TEXT_ENTER, self._on_send)
-            self._restart_btn.Bind(wx.EVT_BUTTON, self._on_restart)
             self.Bind(wx.EVT_MENU, self._on_settings, id=wx.ID_PREFERENCES)
             self.Bind(wx.EVT_MENU, self._on_clear, id=wx.ID_CLEAR)
             self.Bind(wx.EVT_MENU, self._on_restart, id=self._menu_restart_id)
@@ -182,7 +177,7 @@ if _WX_AVAILABLE:
                 self._send_btn.Enable(True)
                 self._init_llm_client()
             else:
-                self._status_label.SetLabel("❌ Backend failed to start — use ↺ Restart to retry")
+                self._status_label.SetLabel("❌ Backend failed to start — use Options → Restart Backend to retry")
                 self._status_label.SetForegroundColour(wx.Colour(*self._C_ERR))
             self.Layout()
 
@@ -313,7 +308,6 @@ if _WX_AVAILABLE:
                     "Busy", wx.OK | wx.ICON_INFORMATION,
                 )
                 return
-            self._restart_btn.Enable(False)
             self._send_btn.Enable(False)
             self._status_label.SetLabel("⏳ Restarting backend…")
             self._status_label.SetForegroundColour(wx.NullColour)
@@ -327,7 +321,6 @@ if _WX_AVAILABLE:
             threading.Thread(target=_do_restart, daemon=True).start()
 
         def _on_restart_done(self, ok: bool) -> None:
-            self._restart_btn.Enable(True)
             if ok:
                 self._conv_entries.append({"type": "status", "text": "✅ Backend restarted successfully.", "color_hex": self._C_OK_HEX})
                 self._render_conversation()
