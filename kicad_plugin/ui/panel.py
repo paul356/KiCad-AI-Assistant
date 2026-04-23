@@ -82,36 +82,68 @@ if _WX_AVAILABLE:
             panel = wx.Panel(self)
             vbox = wx.BoxSizer(wx.VERTICAL)
 
-            # ---- Conversation log ----
-            self._conv_html = wx.html.HtmlWindow(
-                panel,
-                style=wx.BORDER_SUNKEN,
+            # ---- Splitter: conversation (top) / tool log (bottom) ----
+            self._splitter = wx.SplitterWindow(
+                panel, style=wx.SP_LIVE_UPDATE | wx.SP_3DSASH,
             )
-            self._conv_html.SetMinSize((-1, 300))
+            self._splitter.SetMinimumPaneSize(60)
+            self._splitter.SetSashGravity(0.7)  # extra space goes to conversation
+
+            # Conversation pane.
+            self._conv_html = wx.html.HtmlWindow(
+                self._splitter, style=wx.BORDER_SUNKEN,
+            )
+            self._conv_html.SetMinSize((-1, 120))
             self._conv_html.SetBackgroundColour(self._BG_CONV)
             self._conv_html.SetPage(f'<html><body bgcolor="{self._BG_CONV_HEX}"></body></html>')
-            vbox.Add(self._conv_html, 1, wx.ALL | wx.EXPAND, 4)
 
-            # ---- Tool log (collapsible) ----
-            self._tool_log_pane = wx.CollapsiblePane(panel, label="Tool Log")
-            tool_pane_win = self._tool_log_pane.GetPane()
-            tool_sizer = wx.BoxSizer(wx.VERTICAL)
-            self._tool_log = wx.TextCtrl(
-                tool_pane_win,
-                style=wx.TE_MULTILINE | wx.TE_READONLY | wx.TE_RICH2 | wx.BORDER_SIMPLE,
+            # Tool log pane: header row (label + show/hide toggle) + scrolled list.
+            self._tool_log_panel = wx.Panel(self._splitter)
+            tlp_vbox = wx.BoxSizer(wx.VERTICAL)
+
+            tlp_header = wx.BoxSizer(wx.HORIZONTAL)
+            tlp_header.Add(
+                wx.StaticText(self._tool_log_panel, label="Tool Log"),
+                1, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 2,
             )
-            self._tool_log.SetMinSize((-1, 120))
-            self._tool_log.SetBackgroundColour(self._BG_TOOL)
-            tool_log_font = wx.Font(
+            self._tool_log_toggle_btn = wx.Button(
+                self._tool_log_panel, label="Hide", style=wx.BU_EXACTFIT,
+            )
+            tlp_header.Add(self._tool_log_toggle_btn, 0, wx.ALIGN_CENTER_VERTICAL)
+            tlp_vbox.Add(tlp_header, 0, wx.EXPAND | wx.BOTTOM, 2)
+
+            # Scrolled window that holds one wx.CollapsiblePane per tool call.
+            self._tool_log_scroll = wx.ScrolledWindow(
+                self._tool_log_panel, style=wx.BORDER_SIMPLE | wx.VSCROLL,
+            )
+            self._tool_log_scroll.SetBackgroundColour(self._BG_TOOL)
+            self._tool_log_scroll.SetScrollRate(0, 16)
+            self._tool_log_entries_sizer = wx.BoxSizer(wx.VERTICAL)
+            self._tool_log_scroll.SetSizer(self._tool_log_entries_sizer)
+            tlp_vbox.Add(self._tool_log_scroll, 1, wx.EXPAND)
+
+            self._tool_log_panel.SetSizer(tlp_vbox)
+
+            # Cached monospace font used by per-call expanded bodies.
+            self._tool_log_font = wx.Font(
                 9, wx.FONTFAMILY_TELETYPE, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_NORMAL,
             )
-            self._tool_log.SetFont(tool_log_font)
-            tool_sizer.Add(self._tool_log, 1, wx.EXPAND)
-            tool_pane_win.SetSizer(tool_sizer)
-            if self._settings.show_tool_log:
-                self._tool_log_pane.Expand()
-            vbox.Add(self._tool_log_pane, 0, wx.ALL | wx.EXPAND, 4)
-            self._tool_log_pane.Bind(wx.EVT_COLLAPSIBLEPANE_CHANGED, self._on_pane_changed)
+
+            # Initial split: conversation gets ~70%, tool log ~30%.
+            self._splitter.SplitHorizontally(
+                self._conv_html, self._tool_log_panel, -200,
+            )
+            vbox.Add(self._splitter, 1, wx.ALL | wx.EXPAND, 4)
+
+            if not self._settings.show_tool_log:
+                # Start with tool log hidden but remember the sash for restore.
+                self._tool_log_saved_sash = 200
+                self._splitter.Unsplit(self._tool_log_panel)
+                self._tool_log_toggle_btn.SetLabel("Show")
+            else:
+                self._tool_log_saved_sash = 200
+
+            self._tool_log_toggle_btn.Bind(wx.EVT_BUTTON, self._on_toggle_tool_log)
 
             # ---- Input row ----
             hbox = wx.BoxSizer(wx.HORIZONTAL)
@@ -333,8 +365,31 @@ if _WX_AVAILABLE:
 
 
         def _on_pane_changed(self, event) -> None:
+            # Per-entry tool-log panes use this; just relayout, don't Fit().
             self.Layout()
-            self.Fit()
+
+        def _on_toggle_tool_log(self, _event) -> None:
+            """Show/hide the tool-log pane in the splitter."""
+            if self._splitter.IsSplit():
+                # Remember current sash so we can restore it.
+                total = self._splitter.GetClientSize().GetHeight()
+                self._tool_log_saved_sash = max(
+                    60, total - self._splitter.GetSashPosition()
+                )
+                self._splitter.Unsplit(self._tool_log_panel)
+                self._tool_log_toggle_btn.SetLabel("Show")
+                self._settings.show_tool_log = False
+            else:
+                sash = -max(60, getattr(self, "_tool_log_saved_sash", 200))
+                self._splitter.SplitHorizontally(
+                    self._conv_html, self._tool_log_panel, sash,
+                )
+                self._tool_log_toggle_btn.SetLabel("Hide")
+                self._settings.show_tool_log = True
+            try:
+                self._settings.save()
+            except Exception:
+                pass
 
         def _on_settings(self, event) -> None:
             from .settings_dialog import SettingsDialog
@@ -356,7 +411,7 @@ if _WX_AVAILABLE:
             self._conv_entries.clear()
             self._pending_ai_text = ""
             self._render_conversation()
-            self._tool_log.Clear()
+            self._clear_tool_log()
             if self._llm_client:
                 self._llm_client.reset()
 
@@ -516,10 +571,89 @@ if _WX_AVAILABLE:
             self._conv_html.SetPage("".join(parts))
             self._conv_html.Scroll(0, self._conv_html.GetScrollRange(wx.VERTICAL))
 
-        def _append_tool_log(self, name: str, args: dict, result: Any) -> None:
+        def _clear_tool_log(self) -> None:
+            """Destroy all per-call collapsible entries in the tool log."""
+            self._tool_log_entries_sizer.Clear(delete_windows=True)
+            self._tool_log_scroll.FitInside()
+            self._tool_log_scroll.Layout()
+
+        @staticmethod
+        def _json_dump_safe(value: Any, *, indent: int | None = None) -> str:
             import json as _json
-            line = f"{name}({_json.dumps(args, separators=(',', ':'))[:80]}) → {_json.dumps(result, separators=(',', ':'))[:120]}\n"
-            self._tool_log.AppendText(line)
+            try:
+                if indent is None:
+                    return _json.dumps(value, separators=(',', ':'), default=str)
+                return _json.dumps(value, indent=indent, default=str)
+            except (TypeError, ValueError):
+                return repr(value)
+
+        def _append_tool_log(self, name: str, args: dict, result: Any) -> None:
+            """Append a collapsible entry for one tool call.
+
+            The header (always visible) shows a one-line truncated summary.
+            The full one-line summary is also placed at the top of the
+            expanded body and as the entry's tooltip, so users can read or
+            copy it even if the native pane label is OS-truncated.
+            """
+            args_compact = self._json_dump_safe(args)
+            result_compact = self._json_dump_safe(result)
+            summary = f"{name}({args_compact}) → {result_compact}"
+
+            # Native CollapsiblePane labels are single-line; cap to keep the
+            # header tidy. The full text is available in body + tooltip.
+            header = f"{name}({args_compact[:80]}) → {result_compact[:120]}"
+            if len(header) > 200:
+                header = header[:197] + "…"
+
+            entry_pane = wx.CollapsiblePane(
+                self._tool_log_scroll, label=header,
+                style=wx.CP_DEFAULT_STYLE | wx.CP_NO_TLW_RESIZE,
+            )
+            try:
+                entry_pane.SetToolTip(summary)
+            except Exception:
+                pass
+            inner = entry_pane.GetPane()
+            inner_sizer = wx.BoxSizer(wx.VERTICAL)
+
+            body_text = (
+                f"# {summary}\n\n"
+                f"args:\n{self._json_dump_safe(args, indent=2)}\n\n"
+                f"result:\n{self._json_dump_safe(result, indent=2)}"
+            )
+            body = wx.TextCtrl(
+                inner, value=body_text,
+                style=wx.TE_MULTILINE | wx.TE_READONLY | wx.TE_RICH2 | wx.BORDER_SIMPLE | wx.HSCROLL,
+            )
+            body.SetFont(self._tool_log_font)
+            body.SetBackgroundColour(self._BG_TOOL)
+            # Size the body to fit its content so expanding the entry actually
+            # reveals more of the result. Clamp between a small minimum and a
+            # generous maximum so very long outputs still scroll within the
+            # entry instead of dominating the panel.
+            line_h = body.GetCharHeight()
+            n_lines = body_text.count("\n") + 1
+            # +2 for a little breathing room (top/bottom padding).
+            desired_h = (n_lines + 2) * line_h
+            min_h, max_h = 80, 600
+            body.SetMinSize((-1, max(min_h, min(desired_h, max_h))))
+            inner_sizer.Add(body, 1, wx.EXPAND | wx.ALL, 2)
+            inner.SetSizer(inner_sizer)
+
+            def _on_entry_toggle(_evt, _scroll=self._tool_log_scroll) -> None:
+                _scroll.FitInside()
+                _scroll.Layout()
+
+            entry_pane.Bind(wx.EVT_COLLAPSIBLEPANE_CHANGED, _on_entry_toggle)
+
+            self._tool_log_entries_sizer.Add(entry_pane, 0, wx.EXPAND | wx.ALL, 2)
+            self._tool_log_scroll.FitInside()
+            self._tool_log_scroll.Layout()
+            # Auto-scroll to the newest entry.
+            _, vunit = self._tool_log_scroll.GetScrollPixelsPerUnit()
+            virt_h = self._tool_log_scroll.GetVirtualSize().GetHeight()
+            if vunit:
+                self._tool_log_scroll.Scroll(-1, virt_h // vunit)
 
 
 else:
