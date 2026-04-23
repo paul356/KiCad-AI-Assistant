@@ -364,7 +364,7 @@ def _build_placed_symbol(
         pval = prop[2] if len(prop) >= 3 else ""
         extra_props.append(
             _build_property(pname, pval, x + pdx, y + pdy, prop_rot,
-                            hide=(pname == "Description"),
+                            hide=(pname not in _STANDARD_VISIBLE_PROPERTIES),
                             do_not_autoplace=not fields_autoplaced)
         )
 
