@@ -526,3 +526,135 @@ class TestFootprintIndexManagerSync:
         assert s2.skipped == 1  # content same, path changed → touch-only
         states = mgr._db.get_library_states()
         assert "new_mount" in states["Res"][2]
+
+
+# ---------------------------------------------------------------------------
+# Tests for async sync_footprint_index + get_footprint_sync_status tools
+# ---------------------------------------------------------------------------
+
+import time
+import kicad_mcp.tools.pcb_library_tools as _tool_module
+
+
+class TestFpSyncTools:
+    """Tests for the background sync tool pair."""
+
+    def setup_method(self):
+        """Reset module-level sync state before each test."""
+        with _tool_module._fp_sync_lock:
+            _tool_module._fp_sync_state.running = False
+            _tool_module._fp_sync_state.current = 0
+            _tool_module._fp_sync_state.total = 0
+            _tool_module._fp_sync_state.current_library = ''
+            _tool_module._fp_sync_state.last_result = None
+            _tool_module._fp_sync_state.error = None
+
+    def test_background_sync_completes(self, tmp_path, monkeypatch):
+        """_run_fp_sync_in_background updates state to done with last_result."""
+        lib_dir = _make_pretty(tmp_path, "Res", ["R_0402"])
+
+        def _effective(project_path=None):
+            return [{"nickname": "Res", "uri": lib_dir, "raw_uri": "${FP}/Res.pretty", "description": ""}]
+
+        from kicad_mcp.utils.footprint_index_manager import FootprintIndexManager
+        db_path = str(tmp_path / "fp.db")
+        mgr = FootprintIndexManager(db_path=db_path)
+
+        monkeypatch.setattr(
+            "kicad_mcp.utils.footprint_index_manager.build_effective_library_list",
+            _effective,
+        )
+        monkeypatch.setattr(
+            "kicad_mcp.tools.pcb_library_tools.get_footprint_index_manager",
+            lambda project_path=None: mgr,
+        )
+
+        with _tool_module._fp_sync_lock:
+            _tool_module._fp_sync_state.running = True
+
+        _tool_module._run_fp_sync_in_background(False, None)
+
+        with _tool_module._fp_sync_lock:
+            assert _tool_module._fp_sync_state.running is False
+            assert _tool_module._fp_sync_state.last_result is not None
+            assert _tool_module._fp_sync_state.last_result["success"] is True
+            assert _tool_module._fp_sync_state.error is None
+
+    def test_state_reflects_progress(self, tmp_path, monkeypatch):
+        """_run_fp_sync_in_background updates _fp_sync_state correctly."""
+        lib_dir = _make_pretty(tmp_path, "Cap", ["C_0402"])
+
+        def _effective(project_path=None):
+            return [{"nickname": "Cap", "uri": lib_dir, "raw_uri": "${FP}/Cap.pretty", "description": ""}]
+
+        from kicad_mcp.utils.footprint_index_manager import FootprintIndexManager
+        db_path = str(tmp_path / "fp2.db")
+        mgr = FootprintIndexManager(db_path=db_path)
+
+        monkeypatch.setattr(
+            "kicad_mcp.utils.footprint_index_manager.build_effective_library_list",
+            _effective,
+        )
+        monkeypatch.setattr(
+            "kicad_mcp.tools.pcb_library_tools.get_footprint_index_manager",
+            lambda project_path=None: mgr,
+        )
+
+        with _tool_module._fp_sync_lock:
+            _tool_module._fp_sync_state.running = True
+
+        _tool_module._run_fp_sync_in_background(False, None)
+
+        # After thread function completes: running=False, last_result populated
+        with _tool_module._fp_sync_lock:
+            assert _tool_module._fp_sync_state.running is False
+            assert _tool_module._fp_sync_state.last_result is not None
+            assert _tool_module._fp_sync_state.last_result["success"] is True
+            assert _tool_module._fp_sync_state.error is None
+
+    def test_already_running_guard(self):
+        """sync_footprint_index returns already_running when sync is in progress."""
+        import asyncio
+
+        async def _call():
+            with _tool_module._fp_sync_lock:
+                _tool_module._fp_sync_state.running = True
+                _tool_module._fp_sync_state.current = 5
+                _tool_module._fp_sync_state.total = 20
+                _tool_module._fp_sync_state.current_library = "SomeLib"
+
+            from fastmcp import FastMCP
+            mcp = FastMCP("test")
+            _tool_module.register_pcb_library_tools(mcp)
+            tool = await mcp.get_tool("sync_footprint_index")
+            assert tool is not None
+            result = await tool.fn()
+            return result
+
+        result = asyncio.run(_call())
+        assert result["status"] == "already_running"
+        assert result["current"] == 5
+        assert result["total"] == 20
+
+    def test_status_percent_complete(self):
+        """get_footprint_sync_status computes percent_complete correctly."""
+        import asyncio
+
+        async def _call():
+            with _tool_module._fp_sync_lock:
+                _tool_module._fp_sync_state.running = True
+                _tool_module._fp_sync_state.current = 50
+                _tool_module._fp_sync_state.total = 100
+                _tool_module._fp_sync_state.current_library = "Lib50"
+
+            from fastmcp import FastMCP
+            mcp = FastMCP("test")
+            _tool_module.register_pcb_library_tools(mcp)
+            tool = await mcp.get_tool("get_footprint_sync_status")
+            assert tool is not None
+            return await tool.fn()
+
+        result = asyncio.run(_call())
+        assert result["percent_complete"] == 50
+        assert result["running"] is True
+        assert result["current_library"] == "Lib50"

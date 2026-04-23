@@ -6,6 +6,8 @@ by name or description, and retrieve detailed footprint metadata.
 """
 import logging
 import os
+import threading
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from fastmcp import Context, FastMCP
@@ -21,48 +23,44 @@ from kicad_mcp.utils.file_utils import get_project_files
 log = logging.getLogger(__name__)
 
 
-def register_pcb_library_tools(mcp: FastMCP) -> None:
-    """Register footprint library tools with the MCP server."""
+# ---------------------------------------------------------------------------
+# Background sync state (thread-safe via lock)
+# ---------------------------------------------------------------------------
 
-    @mcp.tool()
-    async def sync_footprint_index(
-        project_path: Optional[str],
-        force: bool,
-        ctx: Context | None,
-    ) -> Dict[str, Any]:
-        """Build or refresh the footprint library index.
+@dataclass
+class _FpSyncState:
+    running: bool = False
+    current: int = 0
+    total: int = 0
+    current_library: str = ''
+    last_result: dict | None = None
+    error: str | None = None
 
-        Scans all fp-lib-table entries, reads .kicad_mod files that have
-        changed since the last sync, and stores metadata in a local SQLite
-        database.  Subsequent calls to ``search_footprints`` and
-        ``list_footprint_libraries`` use the index and are much faster than
-        scanning files on demand.
 
-        Args:
-            project_path: Optional path to a .kicad_pro file; its project-local
-                fp-lib-table is included in the sync.
-            force: If true, reparse every library regardless of cached state.
-            ctx: MCP context for progress reporting.
+_fp_sync_state = _FpSyncState()
+_fp_sync_lock = threading.Lock()
 
-        Returns:
-            dict with added, updated, removed, skipped, failed counts,
-            total_footprints indexed this run, elapsed_seconds, and
-            database stats (library_count, footprint_count).
-        """
-        if ctx:
-            await ctx.info("Starting footprint index sync…")
 
+def _run_fp_sync_in_background(force: bool, project_path: Optional[str]) -> None:
+    """Target function executed in the background footprint sync thread."""
+    def _progress(current: int, total: int, library_name: str) -> None:
+        with _fp_sync_lock:
+            _fp_sync_state.current = current
+            _fp_sync_state.total = total
+            _fp_sync_state.current_library = library_name
+
+    try:
         mgr = get_footprint_index_manager(project_path)
-        stats = mgr.sync(force=bool(force))
+        stats = mgr.sync(force=force, progress_callback=_progress)
         db_stats = mgr.get_stats()
-
-        return {
+        result = {
+            "success": True,
             "added": stats.added,
             "updated": stats.updated,
             "removed": stats.removed,
             "skipped": stats.skipped,
             "failed": stats.failed,
-            "total_footprints_this_run": stats.total_footprints,
+            "total_footprints": stats.total_footprints,
             "elapsed_seconds": round(stats.elapsed_seconds, 2),
             "database": {
                 "library_count": db_stats.library_count,
@@ -70,6 +68,108 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
                 "last_sync": db_stats.last_sync,
             },
         }
+        with _fp_sync_lock:
+            _fp_sync_state.last_result = result
+            _fp_sync_state.error = None
+    except Exception as exc:
+        log.error("Background footprint index sync failed: %s", exc, exc_info=True)
+        with _fp_sync_lock:
+            _fp_sync_state.last_result = None
+            _fp_sync_state.error = str(exc)
+    finally:
+        with _fp_sync_lock:
+            _fp_sync_state.running = False
+            _fp_sync_state.current_library = ''
+
+
+def register_pcb_library_tools(mcp: FastMCP) -> None:
+    """Register footprint library tools with the MCP server."""
+
+    @mcp.tool()
+    async def sync_footprint_index(
+        project_path: Optional[str] = None,
+        force: bool = False,
+        ctx: Context | None = None,
+    ) -> Dict[str, Any]:
+        """Start building or refreshing the footprint library index.
+
+        This tool returns immediately — the actual sync runs in a background
+        thread to avoid tool call timeouts.  The first sync can take several
+        minutes because it parses all .kicad_mod files.  Subsequent calls are
+        incremental (only changed libraries are re-read).
+
+        After calling this tool, use ``get_footprint_sync_status`` to monitor
+        progress and check when the sync completes.  Do NOT call
+        ``sync_footprint_index`` again while a sync is already running.
+
+        Args:
+            project_path: Optional path to a .kicad_pro file; its project-local
+                fp-lib-table is included in the sync.
+            force: If True, reparse every library regardless of cached state.
+                Use only when the database is messed up.
+            ctx: MCP context for progress reporting.
+        """
+        with _fp_sync_lock:
+            if _fp_sync_state.running:
+                return {
+                    "status": "already_running",
+                    "message": "A sync is already in progress. Use get_footprint_sync_status to check progress.",
+                    "current": _fp_sync_state.current,
+                    "total": _fp_sync_state.total,
+                    "current_library": _fp_sync_state.current_library,
+                }
+            _fp_sync_state.running = True
+            _fp_sync_state.current = 0
+            _fp_sync_state.total = 0
+            _fp_sync_state.current_library = ''
+            _fp_sync_state.error = None
+
+        if ctx:
+            await ctx.info("Starting footprint index sync in background thread…")
+
+        t = threading.Thread(
+            target=_run_fp_sync_in_background,
+            args=(bool(force), project_path),
+            daemon=True,
+        )
+        t.start()
+        log.info("Background footprint sync thread started.")
+        return {
+            "status": "started",
+            "message": (
+                "Footprint index sync started in the background. "
+                "Call get_footprint_sync_status to monitor progress."
+            ),
+        }
+
+    @mcp.tool()
+    async def get_footprint_sync_status(ctx: Context | None = None) -> Dict[str, Any]:
+        """Return the current status of the background footprint index sync.
+
+        Call this after ``sync_footprint_index`` to monitor progress.  Poll
+        every few seconds until ``running`` is False.
+
+        Returns:
+            running: True while sync is in progress.
+            current / total: libraries processed so far / total libraries found.
+            percent_complete: 0–100 progress estimate.
+            current_library: name of the library being processed right now.
+            last_result: final stats dict when the sync succeeded (None while running).
+            error: error message if the last sync failed (None otherwise).
+        """
+        with _fp_sync_lock:
+            total = _fp_sync_state.total or 0
+            current = _fp_sync_state.current
+            pct = round(100.0 * current / total) if total > 0 else 0
+            return {
+                "running": _fp_sync_state.running,
+                "current": current,
+                "total": total,
+                "percent_complete": pct,
+                "current_library": _fp_sync_state.current_library,
+                "last_result": _fp_sync_state.last_result,
+                "error": _fp_sync_state.error,
+            }
 
     @mcp.tool()
     async def list_footprint_libraries(
