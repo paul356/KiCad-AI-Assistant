@@ -190,6 +190,16 @@ if _WX_AVAILABLE:
             self._stream_timer = wx.Timer(self)
             self.Bind(wx.EVT_TIMER, self._on_stream_flush, self._stream_timer)
 
+            # Suicide watchdog: when KiCad is closed, our top-level wx.Frame
+            # would otherwise keep the wx event loop alive. KiCad's shutdown
+            # does not reliably propagate EVT_CLOSE / EVT_WINDOW_DESTROY to
+            # plugin frames, so we instead poll wx.GetTopLevelWindows(): once
+            # we are the only visible top-level window left, KiCad's main
+            # window is gone and we close ourselves.
+            self._suicide_timer = wx.Timer(self)
+            self.Bind(wx.EVT_TIMER, self._on_suicide_check, self._suicide_timer)
+            self._suicide_timer.Start(500)  # 500 ms poll
+
         # ------------------------------------------------------------------ #
         # Server lifecycle
         # ------------------------------------------------------------------ #
@@ -416,15 +426,23 @@ if _WX_AVAILABLE:
                 self._llm_client.reset()
 
         def _on_close(self, event) -> None:
-            # Check if the parent (KiCad main window) is being destroyed.
-            # If so, stop the server so KiCad can exit cleanly.
-            parent = self.GetParent()
-            parent_closing = parent is None or not parent.IsShown()
-            if parent_closing:
-                self._server_mgr.stop()
-                self.Destroy()
-            else:
-                self.Hide()  # keep server alive so re-opening is fast
+            # Always tear down. Hiding instead (to keep the server warm)
+            # leaves a top-level wx.Frame alive that prevents KiCad from
+            # exiting cleanly when the user closes KiCad first.
+            self._server_mgr.stop()
+            self.Destroy()
+
+        def _on_suicide_check(self, event) -> None:
+            """Periodically check if KiCad is gone. If we are the only
+            visible top-level wx window left, KiCad's main window must
+            have been closed without sending us EVT_CLOSE — so close
+            ourselves now."""
+            others = [
+                w for w in wx.GetTopLevelWindows()
+                if w is not self and w.IsShown()
+            ]
+            if not others:
+                self.Close(force=True)
 
         def _on_destroy(self, event) -> None:
             """Called when the wx window is actually destroyed (e.g. KiCad shutdown)."""
