@@ -15,6 +15,7 @@ from fastmcp import Context
 
 from kicad_mcp.config import LibraryPathConfig
 from kicad_mcp.utils.symbol_extractor import extract_lib_symbol_raw
+from kicad_mcp.utils.symbol_geometry import compute_unit_bboxes
 from kicad_mcp.utils.symbol_index_reader import SymbolIndexReader
 from kicad_mcp.utils.symbol_index_manager import SymbolIndexManager
 
@@ -97,6 +98,50 @@ def _run_sync_in_background(force: bool) -> None:
             _sync_state.running = False
             _sync_state.current_library = ''
 
+
+
+def _load_lib_symbol_raw(library_name: str, symbol_name: str):
+    """Look up + extract the raw lib-symbol S-expression, or return (None, error)."""
+    mgr = _get_index_manager()
+    sym_rec = mgr.get_symbol(library_name, symbol_name)
+    if sym_rec is None:
+        return None, f"Symbol '{library_name}:{symbol_name}' not found in index."
+    lib_rec = mgr.get_library_by_name(library_name)
+    if lib_rec is None:
+        return None, f"Library '{library_name}' not found in index."
+    try:
+        raw = extract_lib_symbol_raw(
+            lib_rec.file_path,
+            sym_rec.file_index,
+            symbol_name,
+            lib_rec.mtime,
+            lib_rec.file_size,
+        )
+        return raw, None
+    except Exception as exc:
+        return None, f"Failed to read library file: {exc}"
+
+
+def _bbox_summary(lib_sym_raw: list) -> dict | None:
+    """Return body bbox info for the canonical (unit-1, style-1) view, or None.
+
+    The dict contains the unit-1 ``body_bbox`` (library Y-up coords, mm,
+    suitable for placement-clearance reasoning), the symbol's ``unit_count``,
+    and per-unit body bboxes under ``unit_bboxes`` for multi-unit symbols.
+    """
+    try:
+        bboxes = compute_unit_bboxes(lib_sym_raw)
+    except Exception as e:
+        log.debug("bbox computation failed: %s", e)
+        return None
+    if not bboxes:
+        return None
+    primary = bboxes.get(1) or next(iter(bboxes.values()))
+    return {
+        "body_bbox": primary.to_dict(),
+        "unit_count": len(bboxes),
+        "unit_bboxes": {str(u): bb.to_dict() for u, bb in sorted(bboxes.items())},
+    }
 
 
 def _parse_lib_pins(lib_sym_raw: list) -> list[dict]:
@@ -283,6 +328,16 @@ def register_symbol_tools(mcp: FastMCP) -> None:
         """
         Look up a single KiCad symbol by library and symbol name.
 
+        Returns symbol metadata plus a ``body_bbox`` describing the symbol's
+        extent in **library coordinate space** (Y-up, mm). The bbox is the
+        union of graphic primitives and pin connection points, so it is
+        suitable for placement-clearance reasoning. For multi-unit symbols,
+        ``unit_bboxes`` maps each unit number to its own bbox; the top-level
+        ``body_bbox`` is the unit-1 bbox.
+
+        To get the bbox of a *placed* symbol in schematic (Y-down) world
+        coordinates, use ``extract_schematic_netlist``.
+
         Args:
             library_name: The library name returned by ``search_symbols`` in the
                 ``library_name`` field.  For KiCad 10 symdir-style libraries
@@ -298,7 +353,7 @@ def register_symbol_tools(mcp: FastMCP) -> None:
                     "success": False,
                     "error": f"Symbol '{library_name}:{symbol_name}' not found in index.",
                 }
-            return {
+            result: dict[str, Any] = {
                 "success": True,
                 "library_name": symbol.library_name,
                 "name": symbol.symbol_name,
@@ -306,6 +361,12 @@ def register_symbol_tools(mcp: FastMCP) -> None:
                 "keywords": symbol.keywords,
                 "pin_count": symbol.pin_count,
             }
+            raw, err = _load_lib_symbol_raw(library_name, symbol_name)
+            if raw is not None:
+                summary = _bbox_summary(raw)
+                if summary is not None:
+                    result.update(summary)
+            return result
         except Exception as e:
             log.error(f"get_symbol failed: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
@@ -431,41 +492,27 @@ def register_symbol_tools(mcp: FastMCP) -> None:
 
         Returns:
             dict with keys: success, library_name, symbol_name, pin_count,
-            pins (list of {number, name, type, direction}).
+            pins (list of {number, name, type, direction}), body_bbox
+            (library Y-up clearance bbox), unit_count, unit_bboxes
+            (per-unit bboxes when multi-unit).
         """
         try:
-            mgr = _get_index_manager()
-            sym_rec = mgr.get_symbol(library_name, symbol_name)
-            if sym_rec is None:
-                return {
-                    "success": False,
-                    "error": f"Symbol '{library_name}:{symbol_name}' not found in index.",
-                }
-            lib_rec = mgr.get_library_by_name(library_name)
-            if lib_rec is None:
-                return {
-                    "success": False,
-                    "error": f"Library '{library_name}' not found in index.",
-                }
-            try:
-                lib_sym_raw = extract_lib_symbol_raw(
-                    lib_rec.file_path,
-                    sym_rec.file_index,
-                    symbol_name,
-                    lib_rec.mtime,
-                    lib_rec.file_size,
-                )
-            except Exception as exc:
-                return {"success": False, "error": f"Failed to read library file: {exc}"}
+            lib_sym_raw, err = _load_lib_symbol_raw(library_name, symbol_name)
+            if lib_sym_raw is None:
+                return {"success": False, "error": err}
 
             pins = _parse_lib_pins(lib_sym_raw)
-            return {
+            result: dict[str, Any] = {
                 "success": True,
                 "library_name": library_name,
                 "symbol_name": symbol_name,
                 "pin_count": len(pins),
                 "pins": pins,
             }
+            summary = _bbox_summary(lib_sym_raw)
+            if summary is not None:
+                result.update(summary)
+            return result
         except Exception as e:
             log.error(f"get_symbol_pins failed: {e}", exc_info=True)
             return {"success": False, "error": str(e)}

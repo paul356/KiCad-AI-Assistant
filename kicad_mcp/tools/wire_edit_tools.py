@@ -595,12 +595,29 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
         add_junction_end: bool = False,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
-        """Add a wire segment to a KiCad schematic between two coordinates.
+        """Add a wire segment to a KiCad schematic between two raw coordinates.
 
-        Draws a wire from (start_x, start_y) to (end_x, end_y) using
-        orthogonal (horizontal-vertical) routing. Optionally places junction
-        dots at either endpoint, which is required when the endpoint lands in
-        the middle of an existing wire (T-junction). A backup
+        Use this for **wires between bare points**. When both endpoints are
+        symbol pins, prefer ``connect_pins_with_wire`` — it resolves pin
+        coordinates from placement/rotation, picks a routing direction from
+        the pin exit angle, and handles junctions automatically.
+
+        Routing is orthogonal (horizontal-vertical). Coordinates are mm in
+        KiCad screen convention (**+Y is down**); align them to the 1.27 mm
+        grid so they meet pins/other wires exactly. Two convenience
+        behaviours run before drawing:
+
+        * **Wire-following**: if an endpoint lies on the interior of an
+          existing wire (or on its tip and the wire continues toward the
+          other endpoint) the endpoint is advanced along that wire — and a
+          junction is dropped at the joining point. This lets you say
+          "extend the GND rail to here" without computing the rail tip.
+        * **Auto-junction**: if an endpoint coincides with an existing wire
+          and no junction is present yet, one is added so the T-connection
+          is electrically explicit.
+
+        ``add_junction_start`` / ``add_junction_end`` force a junction at
+        that endpoint regardless of the heuristic above. A backup
         (.kicad_sch.bak) is written before saving.
 
         Args:
@@ -609,12 +626,14 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
             start_y: Y coordinate of the wire start point in mm.
             end_x: X coordinate of the wire end point in mm.
             end_y: Y coordinate of the wire end point in mm.
-            add_junction_start: Place a junction dot at the start point.
-            add_junction_end: Place a junction dot at the end point.
+            add_junction_start: Force a junction dot at the start point.
+            add_junction_end: Force a junction dot at the end point.
 
         Returns:
-            dict with keys: success (bool), wire (start/end coords),
-            junctions_added (list of coords).
+            dict with keys: success (bool), wire (start/end coords as
+            originally supplied), junctions_added (list of {x, y} for
+            every junction inserted by this call, including ones added by
+            wire-following / auto-junction).
         """
         if not schematic_path.endswith(".kicad_sch"):
             return {"error": f"Not a .kicad_sch file: {schematic_path!r}"}

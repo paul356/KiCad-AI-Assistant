@@ -1,0 +1,363 @@
+"""Tests for placement_helpers (get_schematic_sheet_info, find_free_area)
+and the new placement-related additions to component_edit_tools
+(body_bbox in add/move returns, place_symbol_relative).
+"""
+import asyncio
+import os
+import shutil
+import tempfile
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+SCHEMATIC_PATH = str(Path(__file__).parent / "fixtures/tools_test.kicad_sch")
+TEST_SYM_PATH = str(Path(__file__).parent / "fixtures/test_symbols.kicad_sym")
+
+_LIB_NAME = "Device"
+_SYM_NAME = "R_Small"
+
+
+class _MockMCP:
+    def __init__(self):
+        self.tools: dict = {}
+
+    def tool(self):
+        def decorator(fn):
+            self.tools[fn.__name__] = fn
+            return fn
+        return decorator
+
+
+def _placement_tools() -> dict:
+    from kicad_mcp.tools.placement_helpers import register_placement_helpers
+    mock = _MockMCP()
+    register_placement_helpers(mock)
+    return mock.tools
+
+
+def _component_tools() -> dict:
+    from kicad_mcp.tools.component_edit_tools import register_component_edit_tools
+    mock = _MockMCP()
+    register_component_edit_tools(mock)
+    return mock.tools
+
+
+def _make_temp_copy() -> str:
+    tmp = tempfile.NamedTemporaryFile(suffix=".kicad_sch", delete=False)
+    tmp.close()
+    shutil.copy(SCHEMATIC_PATH, tmp.name)
+    return tmp.name
+
+
+def _make_mock_manager() -> MagicMock:
+    mgr = MagicMock()
+    lib_rec = MagicMock()
+    lib_rec.file_path = TEST_SYM_PATH
+    lib_rec.mtime = 0.0
+    lib_rec.file_size = 0
+    sym_rec = MagicMock()
+    sym_rec.file_index = 0
+    mgr.get_library_by_name.return_value = lib_rec
+    mgr.get_symbol.return_value = sym_rec
+    return mgr
+
+
+@pytest.fixture()
+def tmp_sch():
+    path = _make_temp_copy()
+    yield path
+    for p in [path, path + ".bak"]:
+        if os.path.exists(p):
+            os.unlink(p)
+
+
+# ---------------------------------------------------------------------------
+# get_schematic_sheet_info
+# ---------------------------------------------------------------------------
+
+class TestSheetInfo:
+    def test_returns_paper_and_drawing_area(self, tmp_sch):
+        tools = _placement_tools()
+        info = tools["get_schematic_sheet_info"](tmp_sch)
+        assert "paper" in info
+        assert info["paper"]["width_mm"] > 0
+        assert info["paper"]["height_mm"] > 0
+        assert info["grid_mm"] == 1.27
+        # drawing area starts at (0,0).
+        assert info["drawing_area"]["min_x"] == 0.0
+        assert info["drawing_area"]["min_y"] == 0.0
+        # title block is in bottom-right, and recommended area excludes it.
+        tb = info["title_block_default"]
+        rec = info["recommended_area"]
+        assert tb["max_x"] == info["paper"]["width_mm"]
+        assert rec["max_y"] <= tb["min_y"]
+
+    def test_missing_file_returns_error(self):
+        tools = _placement_tools()
+        out = tools["get_schematic_sheet_info"]("/nonexistent.kicad_sch")
+        assert "error" in out
+
+
+# ---------------------------------------------------------------------------
+# find_free_area
+# ---------------------------------------------------------------------------
+
+class TestFindFreeArea:
+    def test_returns_grid_aligned_candidates(self, tmp_sch):
+        tools = _placement_tools()
+        out = tools["find_free_area"](tmp_sch, width=10.0, height=10.0,
+                                      max_candidates=3)
+        assert "candidates" in out
+        assert len(out["candidates"]) > 0
+        for cand in out["candidates"]:
+            x = cand["origin"]["x"]
+            y = cand["origin"]["y"]
+            # Snapped to 1.27 mm grid.
+            assert abs(round(x / 1.27) * 1.27 - x) < 1e-6
+            assert abs(round(y / 1.27) * 1.27 - y) < 1e-6
+            bb = cand["bbox"]
+            assert bb["max_x"] - bb["min_x"] == pytest.approx(10.0)
+            assert bb["max_y"] - bb["min_y"] == pytest.approx(10.0)
+
+    def test_avoids_existing_components(self, tmp_sch):
+        """After adding a symbol, find_free_area must not return overlapping anchors."""
+        comps = _component_tools()
+        mgr = _make_mock_manager()
+        with patch(
+            "kicad_mcp.tools.component_edit_tools._get_index_manager",
+            return_value=mgr,
+        ):
+            res = asyncio.run(comps["add_symbol_to_schematic"](
+                schematic_path=tmp_sch,
+                library_name=_LIB_NAME, symbol_name=_SYM_NAME,
+                x=80.0, y=80.0,
+            ))
+        assert res["success"], res
+        bb = res["body_bbox"]
+        assert bb is not None
+
+        ptools = _placement_tools()
+        out = ptools["find_free_area"](tmp_sch, width=5.0, height=5.0,
+                                       max_candidates=20, margin=2.54)
+        for cand in out["candidates"]:
+            cb = cand["bbox"]
+            # No overlap with the placed symbol's body bbox.
+            sep = (cb["max_x"] <= bb["min_x"]
+                   or cb["min_x"] >= bb["max_x"]
+                   or cb["max_y"] <= bb["min_y"]
+                   or cb["min_y"] >= bb["max_y"])
+            assert sep, f"candidate {cb} overlaps placed bbox {bb}"
+
+    def test_invalid_dimensions_error(self, tmp_sch):
+        tools = _placement_tools()
+        out = tools["find_free_area"](tmp_sch, width=0.0, height=10.0)
+        assert "error" in out
+
+    def test_oversized_request_returns_no_candidates(self, tmp_sch):
+        tools = _placement_tools()
+        out = tools["find_free_area"](tmp_sch, width=10000.0, height=10000.0)
+        assert out["candidates"] == []
+
+    def test_for_symbol_returns_placement_anchor(self, tmp_sch):
+        """When for_library/for_symbol are passed, each candidate must
+        include a ``placement`` whose use as add_symbol_to_schematic(x, y)
+        yields a body_bbox that matches the candidate bbox (i.e. origin vs
+        symbol-anchor offset is handled by the tool, not the LLM).
+        """
+        tools = _placement_tools()
+        comps = _component_tools()
+        mgr = _make_mock_manager()
+        with patch(
+            "kicad_mcp.tools.component_edit_tools._get_index_manager",
+            return_value=mgr,
+        ):
+            out = tools["find_free_area"](
+                tmp_sch,
+                for_library=_LIB_NAME, for_symbol=_SYM_NAME,
+                max_candidates=1,
+            )
+            assert out["candidates"], out
+            cand = out["candidates"][0]
+            assert "placement" in cand
+            res = asyncio.run(comps["add_symbol_to_schematic"](
+                schematic_path=tmp_sch,
+                library_name=_LIB_NAME, symbol_name=_SYM_NAME,
+                x=cand["placement"]["x"], y=cand["placement"]["y"],
+            ))
+        assert res["success"], res
+        bb = res["body_bbox"]
+        cb = cand["bbox"]
+        # Body bbox of the placed symbol should match the free-area bbox
+        # (within grid snap of 1.27 mm).
+        for k in ("min_x", "min_y", "max_x", "max_y"):
+            assert abs(bb[k] - cb[k]) <= 1.27, (k, bb[k], cb[k])
+
+
+# ---------------------------------------------------------------------------
+# place_symbol_relative + bbox in returns
+# ---------------------------------------------------------------------------
+
+class TestPlaceSymbolRelative:
+    def test_add_returns_body_bbox(self, tmp_sch):
+        comps = _component_tools()
+        mgr = _make_mock_manager()
+        with patch(
+            "kicad_mcp.tools.component_edit_tools._get_index_manager",
+            return_value=mgr,
+        ):
+            res = asyncio.run(comps["add_symbol_to_schematic"](
+                schematic_path=tmp_sch,
+                library_name=_LIB_NAME, symbol_name=_SYM_NAME,
+                x=100.0, y=100.0,
+            ))
+        assert res["success"], res
+        bb = res["body_bbox"]
+        assert bb is not None
+        assert bb["max_x"] > bb["min_x"]
+        assert bb["max_y"] > bb["min_y"]
+
+    def test_relative_right_lands_to_the_right(self, tmp_sch):
+        comps = _component_tools()
+        mgr = _make_mock_manager()
+        with patch(
+            "kicad_mcp.tools.component_edit_tools._get_index_manager",
+            return_value=mgr,
+        ):
+            anchor = asyncio.run(comps["add_symbol_to_schematic"](
+                schematic_path=tmp_sch,
+                library_name=_LIB_NAME, symbol_name=_SYM_NAME,
+                x=120.0, y=80.0,
+            ))
+            assert anchor["success"], anchor
+            anchor_ref = anchor["reference_assigned"]
+            anchor_bb = anchor["body_bbox"]
+
+            placed = asyncio.run(comps["place_symbol_relative"](
+                schematic_path=tmp_sch,
+                library_name=_LIB_NAME, symbol_name=_SYM_NAME,
+                anchor_reference=anchor_ref, side="right", gap=2.54,
+            ))
+        assert placed.get("success"), placed
+        new_bb = placed["body_bbox"]
+        assert new_bb is not None
+        # New symbol must be entirely to the right of the anchor.
+        assert new_bb["min_x"] >= anchor_bb["max_x"]
+
+    def test_relative_invalid_side_errors(self, tmp_sch):
+        comps = _component_tools()
+        out = asyncio.run(comps["place_symbol_relative"](
+            schematic_path=tmp_sch,
+            library_name=_LIB_NAME, symbol_name=_SYM_NAME,
+            anchor_reference="R99", side="diagonal",
+        ))
+        assert "error" in out
+
+    def test_multi_unit_prediction_unions_every_unit(self):
+        """Regression: place_symbol_relative must predict the union of EVERY
+        placed unit's world bbox (each at unit_y = (N-1)*10), not just unit
+        1, otherwise multi-unit symbols overlap the anchor."""
+        from sexpdata import Symbol as S
+
+        from kicad_mcp.utils.symbol_geometry import (
+            compute_unit_bboxes, lib_bbox_to_world, union_bboxes,
+        )
+        lib = [S("symbol"), "DUAL",
+            [S("symbol"), "DUAL_1_1",
+                [S("rectangle"), [S("start"), -1, -2], [S("end"), 1, 2]]],
+            [S("symbol"), "DUAL_2_1",
+                [S("rectangle"), [S("start"), -1, -2], [S("end"), 1, 2]]],
+        ]
+        unit_bbs = compute_unit_bboxes(lib)
+        per_unit = [
+            lib_bbox_to_world(bb, 0.0, (u - 1) * 10.0, 0, None)
+            for u, bb in sorted(unit_bbs.items())
+        ]
+        merged = union_bboxes(per_unit)
+        # Unit 1 placed at y=0, unit 2 at y=10. Y-flip turns lib (-2..+2) into
+        # world (0-2..0+2)=(-2..2) for unit 1 and (10-2..10+2)=(8..12) for u2.
+        assert merged is not None
+        assert merged.min_y == pytest.approx(-2.0)
+        assert merged.max_y == pytest.approx(12.0)
+        assert (merged.max_y - merged.min_y) > 10.0  # spans both units
+
+    def test_move_component_returns_bbox(self, tmp_sch):
+        comps = _component_tools()
+        mgr = _make_mock_manager()
+        with patch(
+            "kicad_mcp.tools.component_edit_tools._get_index_manager",
+            return_value=mgr,
+        ):
+            added = asyncio.run(comps["add_symbol_to_schematic"](
+                schematic_path=tmp_sch,
+                library_name=_LIB_NAME, symbol_name=_SYM_NAME,
+                x=60.0, y=60.0,
+            ))
+            assert added["success"], added
+            ref = added["reference_assigned"]
+
+            moved = asyncio.run(comps["move_component"](
+                schematic_path=tmp_sch,
+                reference=ref, x=90.0, y=90.0,
+            ))
+        assert moved["success"], moved
+        bb = moved["body_bbox"]
+        assert bb is not None
+        # The bbox should be near (90, 90).
+        cx = (bb["min_x"] + bb["max_x"]) / 2.0
+        cy = (bb["min_y"] + bb["max_y"]) / 2.0
+        assert abs(cx - 90.0) < 5.0
+        assert abs(cy - 90.0) < 5.0
+
+    def test_move_component_snaps_to_grid(self, tmp_sch):
+        """Regression: move_component must snap x/y to the 1.27 mm grid so
+        pins remain on-grid (the system prompt advertises this behaviour)."""
+        comps = _component_tools()
+        mgr = _make_mock_manager()
+        with patch(
+            "kicad_mcp.tools.component_edit_tools._get_index_manager",
+            return_value=mgr,
+        ):
+            added = asyncio.run(comps["add_symbol_to_schematic"](
+                schematic_path=tmp_sch,
+                library_name=_LIB_NAME, symbol_name=_SYM_NAME,
+                x=60.0, y=60.0,
+            ))
+            assert added["success"], added
+            ref = added["reference_assigned"]
+            moved = asyncio.run(comps["move_component"](
+                schematic_path=tmp_sch,
+                reference=ref, x=90.10, y=90.10,
+            ))
+        assert moved["success"], moved
+        # Read back the .kicad_sch and verify the placed symbol's `at` is
+        # at the nearest grid point to (90.10, 90.10), i.e. 71*1.27=90.17.
+        from kicad_mcp.utils.netlist_parser import extract_netlist
+        netlist = extract_netlist(tmp_sch)
+        comp = netlist["components"][ref]
+        x_pos, y_pos = comp["position"]["x"], comp["position"]["y"]
+        # Each coordinate must be an exact multiple of 1.27.
+        assert abs(round(x_pos / 1.27) * 1.27 - x_pos) < 1e-6
+        assert abs(round(y_pos / 1.27) * 1.27 - y_pos) < 1e-6
+
+def test_system_prompt_mentions_placement_workflow():
+    from kicad_plugin.llm_client import build_system_prompt
+    rendered = build_system_prompt("CTX")
+    for needle in (
+        "find_free_area",
+        "place_symbol_relative",
+        "1.27",
+        "Y DOWN",
+        "get_schematic_sheet_info",
+        # Wiring guidance + correct tool names.
+        "connect_pins_with_wire",
+        "add_wire_to_schematic",
+        "add_junction_to_schematic",
+        "closest",
+        "Manhattan",
+    ):
+        assert needle in rendered, f"prompt missing {needle!r}"
+    # Must NOT reference the old non-existent tool names.
+    for forbidden in ("add_wire(", "create_junction"):
+        assert forbidden not in rendered, f"prompt still references {forbidden!r}"
+    assert "CTX" in rendered

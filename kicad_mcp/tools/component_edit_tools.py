@@ -21,6 +21,12 @@ from fastmcp import Context
 
 from kicad_mcp.config import LibraryPathConfig
 from kicad_mcp.utils.symbol_extractor import extract_lib_symbol_raw
+from kicad_mcp.utils.symbol_geometry import (
+    BBox,
+    compute_unit_bboxes,
+    lib_bbox_to_world,
+    union_bboxes,
+)
 from kicad_mcp.utils.symbol_index_manager import SymbolIndexManager
 from kicad_mcp.utils.symbol_index_reader import SymbolIndexReader
 
@@ -71,6 +77,155 @@ def _align_to_grid(value: float, grid_size: float = 1.27) -> float:
         The coordinate rounded to the nearest grid point.
     """
     return round(value / grid_size) * grid_size
+
+
+def _do_add_symbol(
+    schematic_path: str,
+    library_name: str,
+    symbol_name: str,
+    x: float,
+    y: float,
+    rotation: int,
+    value: str | None,
+    fields_autoplaced: bool,
+) -> dict[str, Any]:
+    """Core implementation of ``add_symbol_to_schematic``.
+
+    Validates inputs, opens the schematic, injects the lib symbol if needed,
+    inserts one placed instance per electrical unit, writes the file (with a
+    .bak backup) and returns a result dict including the world-space
+    ``body_bbox``.
+    """
+    if not schematic_path.endswith(".kicad_sch"):
+        return {"error": f"Not a .kicad_sch file: {schematic_path!r}"}
+    if not os.path.isfile(schematic_path):
+        return {"error": f"Schematic file not found: {schematic_path!r}"}
+    if not math.isfinite(x) or not math.isfinite(y):
+        return {"error": f"Coordinates must be finite numbers (got x={x}, y={y})"}
+    if rotation not in (0, 90, 180, 270):
+        return {"error": f"rotation must be 0, 90, 180, or 270 (got {rotation})"}
+
+    x = _align_to_grid(x)
+    y = _align_to_grid(y)
+    try:
+        table_name = library_name.split("/")[0]
+        lib_id_str = f"{table_name}:{symbol_name}"
+        effective_value = value or symbol_name
+
+        mgr = _get_index_manager()
+        lib_rec = mgr.get_library_by_name(library_name)
+        if lib_rec is None:
+            return {"error": (f"Library '{library_name}' not found in index. "
+                              "Verify the library name is correct.")}
+
+        sym_rec = mgr.get_symbol(library_name, symbol_name)
+        if sym_rec is None:
+            return {"error": (f"Symbol '{symbol_name}' not found in library "
+                              f"'{library_name}'. Verify the symbol name.")}
+
+        try:
+            lib_sym_raw = extract_lib_symbol_raw(
+                lib_rec.file_path, sym_rec.file_index, symbol_name,
+                lib_rec.mtime, lib_rec.file_size,
+            )
+        except Exception as exc:
+            return {"error": f"Failed to extract lib symbol: {exc}"}
+
+        try:
+            sch = skip.Schematic(schematic_path)
+        except Exception as exc:
+            return {"error": f"Failed to open schematic: {exc}"}
+
+        sch_uuid_obj = getattr(sch, "uuid", None)
+        if sch_uuid_obj is not None:
+            sch_uuid = str(sch_uuid_obj.value).lstrip("/")
+        else:
+            sch_uuid = str(uuid.uuid4())
+
+        try:
+            if lib_id_str not in sch.lib_symbols:
+                _add_lib_symbol(sch.lib_symbols, lib_sym_raw, table_name)
+        except Exception as exc:
+            return {"error": f"Failed to inject lib symbol: {exc}"}
+
+        unit_count = _get_unit_count(lib_sym_raw)
+        prefix = "U"
+        for child in lib_sym_raw[2:]:
+            if (
+                isinstance(child, list)
+                and len(child) >= 3
+                and isinstance(child[0], sexpdata.Symbol)
+                and child[0].value() == "property"
+                and child[1] == "Reference"
+            ):
+                prefix = child[2] if isinstance(child[2], str) else "U"
+                break
+        reference = _next_reference(sch, prefix)
+
+        project_name = _find_project_name(schematic_path)
+
+        placements: list[tuple[int, float, float, int, str | None]] = []
+        for unit in range(1, unit_count + 1):
+            unit_y = y + (unit - 1) * 10.0
+            placed_raw = _build_placed_symbol(
+                lib_id_str, x, unit_y, rotation, unit,
+                reference, effective_value, sch_uuid,
+                project_name, lib_sym_raw,
+                fields_autoplaced=fields_autoplaced,
+            )
+            sch.new_from_list(placed_raw)
+            placements.append((unit, x, unit_y, rotation, None))
+
+        try:
+            shutil.copy(schematic_path, schematic_path + ".bak")
+            sch.write(schematic_path)
+        except Exception as exc:
+            return {"error": f"Failed to save schematic: {exc}"}
+
+        body_bbox = _placed_world_bbox(lib_sym_raw, placements)
+
+        return {
+            "success": True,
+            "reference_assigned": reference,
+            "lib_id": lib_id_str,
+            "units_added": unit_count,
+            "position": {"x": x, "y": y},
+            "body_bbox": body_bbox,
+            "warnings": [],
+            "file_modified": schematic_path,
+            "backup_path": schematic_path + ".bak",
+        }
+    except Exception as exc:
+        log.exception("Unexpected error in _do_add_symbol")
+        return {"error": str(exc), "success": False}
+
+
+
+def _placed_world_bbox(
+    lib_sym_raw: list,
+    placements: list[tuple[int, float, float, int, str | None]],
+) -> dict | None:
+    """Compute the world-space body bbox covering one or more placed units.
+
+    Each placement is ``(unit, x, y, rotation_deg, mirror)`` where mirror is
+    ``"x"``, ``"y"`` or ``None``. Returns a ``{min_x, min_y, max_x, max_y,
+    width, height}`` dict in mm with +Y down, or ``None`` if the lib symbol
+    has no drawable geometry.
+    """
+    try:
+        unit_bbs = compute_unit_bboxes(lib_sym_raw)
+    except Exception:
+        return None
+    if not unit_bbs:
+        return None
+    world_bbs: list[BBox] = []
+    for unit, sx, sy, rot, mirror in placements:
+        lib_bb = unit_bbs.get(unit) or unit_bbs.get(1)
+        if lib_bb is None:
+            continue
+        world_bbs.append(lib_bbox_to_world(lib_bb, sx, sy, int(rot), mirror))
+    merged = union_bboxes(world_bbs)
+    return merged.to_dict() if merged is not None else None
 
 
 def _find_project_name(schematic_path: str) -> str:
@@ -503,10 +658,18 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
         Looks up the symbol in the index database, extracts its definition
         from the library file, injects it into the schematic's lib_symbols
         block, and inserts a placed instance for every unit of the symbol.
-        The placement coordinates are automatically aligned to the 1.27 mm
-        (50-mil) grid so that pins land on KiCad's standard schematic grid
-        and wires can connect to them. A backup (.kicad_sch.bak) is written before 
-        saving.
+        Coordinates are mm in KiCad screen convention (**+Y is down**) and
+        are auto-snapped to the 1.27 mm (50-mil) grid so pins land on KiCad's
+        standard schematic grid and wires can connect to them. A backup
+        (.kicad_sch.bak) is written before saving.
+
+        For multi-unit symbols, additional units are auto-stacked below the
+        anchor at +10 mm Y intervals.
+
+        Tip: prefer ``place_symbol_relative`` when the new symbol should sit
+        next to an existing component, or call ``find_free_area`` (with
+        ``for_library``/``for_symbol``) to get a collision-free anchor before
+        calling this tool.
 
         Args:
             schematic_path: Absolute path to the target .kicad_sch file.
@@ -529,139 +692,165 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
 
         Returns:
             dict with keys: success (bool), reference_assigned, lib_id,
-            units_added, position (with 50-mil grid-aligned coords), warnings.
+            units_added, position (with 50-mil grid-aligned coords),
+            body_bbox (world-space union of all placed unit bboxes — ``None``
+            for graphics-less symbols), warnings.
         """
-        # ---- Input validation ----
-        if not schematic_path.endswith(".kicad_sch"):
-            return {"error": f"Not a .kicad_sch file: {schematic_path!r}"}
-        if not os.path.isfile(schematic_path):
-            return {"error": f"Schematic file not found: {schematic_path!r}"}
-        if not math.isfinite(x) or not math.isfinite(y):
-            return {"error": f"Coordinates must be finite numbers (got x={x}, y={y})"}
-        if rotation not in (0, 90, 180, 270):
-            return {"error": f"rotation must be 0, 90, 180, or 270 (got {rotation})"}
+        return _do_add_symbol(
+            schematic_path=schematic_path,
+            library_name=library_name,
+            symbol_name=symbol_name,
+            x=x,
+            y=y,
+            rotation=rotation,
+            value=value,
+            fields_autoplaced=fields_autoplaced,
+        )
 
-        # Align coordinates to grid
-        x = _align_to_grid(x)
-        y = _align_to_grid(y)
+    @mcp.tool()
+    async def place_symbol_relative(
+        schematic_path: str,
+        library_name: str,
+        symbol_name: str,
+        anchor_reference: str,
+        side: str,
+        gap: float = 2.54,
+        rotation: int = 0,
+        value: str | None = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Place a new symbol next to an existing component without computing
+        coordinates yourself.
+
+        Looks up ``anchor_reference`` in the schematic, reads its world-space
+        body bbox, picks an insertion point so the new symbol's body sits on
+        the requested ``side`` with ``gap`` mm clearance (centre-aligned on
+        the perpendicular axis), and inserts via the same path as
+        ``add_symbol_to_schematic``. Coordinates are then snapped to the
+        1.27 mm grid.
+
+        Use this in preference to absolute ``add_symbol_to_schematic`` calls
+        whenever you can describe the placement relative to an existing
+        reference (e.g. "decoupling cap to the right of U1").
+
+        Args:
+            schematic_path: Path to the .kicad_sch file.
+            library_name: Library name as accepted by
+                ``add_symbol_to_schematic``.
+            symbol_name: Symbol name within the library.
+            anchor_reference: Reference designator of the existing component
+                to anchor against (e.g. "U1").
+            side: One of ``"right"``, ``"left"``, ``"above"``, ``"below"``
+                (KiCad screen Y-down: "above" = smaller Y).
+            gap: Clearance in mm between the bboxes. Defaults to 2.54 mm.
+            rotation: Rotation for the new symbol. 0/90/180/270.
+            value: Optional Value override.
+
+        Returns:
+            Same shape as ``add_symbol_to_schematic`` plus ``anchor_bbox``
+            and ``side``. Returns ``{"error": ...}`` if the anchor can't be
+            found or has no bbox.
+        """
+        if side not in ("right", "left", "above", "below"):
+            return {"error": f"side must be right/left/above/below (got {side!r})"}
+        if gap < 0 or not math.isfinite(gap):
+            return {"error": f"gap must be a non-negative finite number (got {gap})"}
+
+        # Look up anchor's world bbox via netlist extraction.
         try:
-            # For KiCad 10+ .kicad_symdir libraries the index stores
-            # library_name as "TableName/SymFileName" (e.g. "Device/R_Small").
-            # KiCad's lib_id format is "TableName:SymbolName" (e.g. "Device:R_Small"),
-            # so we use only the part before the first "/" as the table name.
-            table_name = library_name.split("/")[0]
-            lib_id_str = f"{table_name}:{symbol_name}"
-            effective_value = value or symbol_name
+            from kicad_mcp.utils.netlist_parser import extract_netlist
+            netlist = extract_netlist(schematic_path)
+        except Exception as exc:
+            return {"error": f"Failed to read schematic netlist: {exc}"}
+        comps = netlist.get("components", {}) or {}
+        anchor = comps.get(anchor_reference)
+        if anchor is None:
+            return {"error": f"Anchor reference {anchor_reference!r} not found"}
+        bb_d = anchor.get("body_bbox")
+        if not bb_d:
+            return {"error": (f"Anchor {anchor_reference!r} has no computable "
+                              "bbox (lib symbol missing or graphics-less)")}
 
-            # Index lookup
+        # We need the new symbol's lib bbox to centre it correctly.
+        try:
             mgr = _get_index_manager()
             lib_rec = mgr.get_library_by_name(library_name)
             if lib_rec is None:
-                return {
-                    "error": (
-                        f"Library '{library_name}' not found in index. "
-                        "Verify the library name is correct."
-                    )
-                }
-
+                return {"error": f"Library '{library_name}' not found in index"}
             sym_rec = mgr.get_symbol(library_name, symbol_name)
             if sym_rec is None:
-                return {
-                    "error": (
-                        f"Symbol '{symbol_name}' not found in library '{library_name}'. "
-                        "Verify the symbol name is correct."
-                    )
-                }
-
-            # Extract lib symbol raw S-expression
-            try:
-                lib_sym_raw = extract_lib_symbol_raw(
-                    lib_rec.file_path,
-                    sym_rec.file_index,
-                    symbol_name,
-                    lib_rec.mtime,
-                    lib_rec.file_size,
-                )
-            except Exception as exc:
-                return {"error": f"Failed to extract lib symbol: {exc}"}
-
-            # Open schematic
-            try:
-                sch = skip.Schematic(schematic_path)
-            except Exception as exc:
-                return {"error": f"Failed to open schematic: {exc}"}
-
-            # Schematic UUID
-            sch_uuid_obj = getattr(sch, "uuid", None)
-            if sch_uuid_obj is not None:
-                sch_uuid = str(sch_uuid_obj.value).lstrip("/")
-            else:
-                sch_uuid = str(uuid.uuid4())
-
-            # Inject lib symbol definition if absent.
-            # Must pass table_name (e.g. "Device") not the full index key
-            # (e.g. "Device/C") so that sub-symbol names are formed as
-            # "Device:C_0_1" rather than "Device/C:C_0_1".
-            try:
-                if lib_id_str not in sch.lib_symbols:
-                    _add_lib_symbol(sch.lib_symbols, lib_sym_raw, table_name)
-            except Exception as exc:
-                return {"error": f"Failed to inject lib symbol: {exc}"}
-
-            # Unit count and reference prefix
-            unit_count = _get_unit_count(lib_sym_raw)
-            prefix = "U"
-            for child in lib_sym_raw[2:]:
-                if (
-                    isinstance(child, list)
-                    and len(child) >= 3
-                    and isinstance(child[0], sexpdata.Symbol)
-                    and child[0].value() == "property"
-                    and child[1] == "Reference"
-                ):
-                    prefix = child[2] if isinstance(child[2], str) else "U"
-                    break
-            reference = _next_reference(sch, prefix)
-
-            # Project name
-            project_name = _find_project_name(schematic_path)
-
-            # Build and insert all units
-            for unit in range(1, unit_count + 1):
-                unit_y = y + (unit - 1) * 10.0
-                placed_raw = _build_placed_symbol(
-                    lib_id_str, x, unit_y, rotation, unit,
-                    reference, effective_value, sch_uuid,
-                    project_name, lib_sym_raw,
-                    fields_autoplaced=fields_autoplaced,
-                )
-                sch.new_from_list(placed_raw)
-                # Note: new_from_list appends to the raw S-expression tree
-                # but does not register the entry in sch.symbol
-                # (SymbolCollection). The symbol will appear in sch.symbol
-                # after write() + reload.
-
-            # Backup and save
-            try:
-                shutil.copy(schematic_path, schematic_path + ".bak")
-                sch.write(schematic_path)
-            except Exception as exc:
-                return {"error": f"Failed to save schematic: {exc}"}
-
-            return {
-                "success": True,
-                "reference_assigned": reference,
-                "lib_id": lib_id_str,
-                "units_added": unit_count,
-                "position": {"x": x, "y": y},
-                "warnings": [],
-                "file_modified": schematic_path,
-                "backup_path": schematic_path + ".bak",
-            }
-
+                return {"error": (f"Symbol '{symbol_name}' not found in library "
+                                  f"'{library_name}'")}
+            new_lib_raw = extract_lib_symbol_raw(
+                lib_rec.file_path, sym_rec.file_index, symbol_name,
+                lib_rec.mtime, lib_rec.file_size,
+            )
+            new_unit_bbs = compute_unit_bboxes(new_lib_raw)
         except Exception as exc:
-            log.exception("Unexpected error in add_symbol_to_schematic")
-            return {"error": str(exc), "success": False}
+            return {"error": f"Failed to inspect new symbol: {exc}"}
+
+        if not new_unit_bbs:
+            return {"error": "New symbol has no graphics; cannot compute relative placement"}
+
+        # Predict the world bbox for ALL units placed at sym=(0,0) using the
+        # same per-unit Y offset _do_add_symbol applies (unit_y = y + (N-1)*10).
+        # This must mirror that loop or multi-unit symbols will overlap the
+        # anchor or land off-centre.
+        per_unit_world: list[BBox] = []
+        for unit, lib_bb in sorted(new_unit_bbs.items()):
+            unit_y_off = (unit - 1) * 10.0
+            per_unit_world.append(
+                lib_bbox_to_world(lib_bb, 0.0, unit_y_off, int(rotation), None)
+            )
+        ref_at_origin = union_bboxes(per_unit_world)
+        if ref_at_origin is None:
+            return {"error": "New symbol has no graphics; cannot compute relative placement"}
+        new_w = ref_at_origin.max_x - ref_at_origin.min_x
+        new_h = ref_at_origin.max_y - ref_at_origin.min_y
+        # Offset from sym placement (x,y) to bbox top-left corner.
+        off_dx = ref_at_origin.min_x  # i.e. bbox.min_x - sym_x   (sym_x=0)
+        off_dy = ref_at_origin.min_y
+
+        anchor_min_x = float(bb_d["min_x"])
+        anchor_min_y = float(bb_d["min_y"])
+        anchor_max_x = float(bb_d["max_x"])
+        anchor_max_y = float(bb_d["max_y"])
+        anchor_cx = (anchor_min_x + anchor_max_x) / 2.0
+        anchor_cy = (anchor_min_y + anchor_max_y) / 2.0
+
+        # Compute the desired top-left of the new bbox.
+        if side == "right":
+            new_min_x = anchor_max_x + gap
+            new_min_y = anchor_cy - new_h / 2.0
+        elif side == "left":
+            new_min_x = anchor_min_x - gap - new_w
+            new_min_y = anchor_cy - new_h / 2.0
+        elif side == "below":  # +Y in KiCad screen coords
+            new_min_x = anchor_cx - new_w / 2.0
+            new_min_y = anchor_max_y + gap
+        else:  # "above"
+            new_min_x = anchor_cx - new_w / 2.0
+            new_min_y = anchor_min_y - gap - new_h
+
+        # Translate bbox top-left back to the sym placement (x, y).
+        sym_x = new_min_x - off_dx
+        sym_y = new_min_y - off_dy
+
+        result = _do_add_symbol(
+            schematic_path=schematic_path,
+            library_name=library_name,
+            symbol_name=symbol_name,
+            x=sym_x,
+            y=sym_y,
+            rotation=rotation,
+            value=value,
+            fields_autoplaced=True,
+        )
+        if result.get("success"):
+            result["anchor_reference"] = anchor_reference
+            result["anchor_bbox"] = bb_d
+            result["side"] = side
+        return result
 
     @mcp.tool()
     async def remove_symbol_from_schematic(
@@ -1086,22 +1275,32 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
         rotation: int | None = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
-        """Move and/or rotate a component in a schematic.
+        """Move and/or rotate a placed schematic component.
 
-        At least one of x, y, rotation must be provided; omitted values are
-        left unchanged. Rotation is absolute (0/90/180/270°). A backup is
-        written before saving.
+        At least one of ``x``, ``y``, ``rotation`` must be provided; omitted
+        values are left unchanged. Coordinates are mm in KiCad screen
+        convention (**+Y is down**) and are auto-snapped to the 1.27 mm
+        (50-mil) grid so pins remain on KiCad's standard schematic grid and
+        existing wires stay connected. Rotation is absolute (0/90/180/270°).
+        All units sharing the reference are moved together, and Reference /
+        Value field positions shift by the same delta. A backup
+        (.kicad_sch.bak) is written before saving.
+
+        Tip: to move a component to sit relative to another, prefer
+        ``place_symbol_relative`` (handles bbox + clearance for you). To find
+        free space, call ``find_free_area`` first.
 
         Args:
             schematic_path: Path to the .kicad_sch file.
             reference: Reference designator (e.g. "R1").
-            x: New X coordinate in mm.
-            y: New Y coordinate in mm.
+            x: New X coordinate in mm (auto grid-snapped).
+            y: New Y coordinate in mm (auto grid-snapped).
             rotation: New absolute rotation in degrees (0, 90, 180, or 270).
 
         Returns:
-            dict with keys: success, reference, position ({x, y}), rotation,
-            units_updated.
+            dict with keys: success, reference, position ({x, y} after grid
+            snap), rotation, units_updated, body_bbox (world-space union of
+            unit bboxes after the move; ``None`` for graphics-less symbols).
         """
         if not schematic_path.endswith(".kicad_sch"):
             return {"error": f"Not a .kicad_sch file: {schematic_path!r}"}
@@ -1142,8 +1341,8 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
                 at = sym.at.value
                 old_x = at[0]
                 old_y = at[1]
-                new_x = x if x is not None else old_x
-                new_y = y if y is not None else old_y
+                new_x = _align_to_grid(x) if x is not None else old_x
+                new_y = _align_to_grid(y) if y is not None else old_y
                 new_rot = rotation if rotation is not None else (at[2] if len(at) > 2 else 0)
                 dx = new_x - old_x
                 dy = new_y - old_y
@@ -1200,12 +1399,44 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
                 return {"error": f"Failed to save schematic: {exc}"}
 
             final_at = units[0].at.value
+            # Compute updated body_bbox (best-effort) so the LLM doesn't need
+            # to re-extract the netlist after a move.
+            body_bbox = None
+            try:
+                lib_id = units[0].lib_id.value
+                wrapper = sch.lib_symbols._libsyms_by_id.get(lib_id)
+                lib_raw = None
+                if wrapper is not None:
+                    if isinstance(wrapper, list):
+                        lib_raw = wrapper
+                    else:
+                        pv = getattr(wrapper, "_pv", None)
+                        lib_raw = getattr(pv, "_tree", None) if pv is not None else None
+                if lib_raw is not None:
+                    placements: list[tuple[int, float, float, int, str | None]] = []
+                    for sym in units:
+                        try:
+                            unit_no = int(sym.unit.value)
+                        except (AttributeError, ValueError, TypeError):
+                            unit_no = 1
+                        at = sym.at.value
+                        rot = int(round(float(at[2]))) if len(at) > 2 else 0
+                        try:
+                            mv = sym.mirror.value
+                            mirror_val = mv.value() if hasattr(mv, "value") else mv
+                        except AttributeError:
+                            mirror_val = None
+                        placements.append((unit_no, float(at[0]), float(at[1]), rot, mirror_val))
+                    body_bbox = _placed_world_bbox(lib_raw, placements)
+            except Exception:
+                body_bbox = None
             return {
                 "success": True,
                 "reference": reference,
                 "position": {"x": final_at[0], "y": final_at[1]},
                 "rotation": final_at[2] if len(final_at) > 2 else 0,
                 "units_updated": len(units),
+                "body_bbox": body_bbox,
                 "file_modified": schematic_path,
                 "backup_path": schematic_path + ".bak",
             }
@@ -1227,15 +1458,22 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
 
         A local label creates a named net connection at the given coordinate.
         Two wires or pins with the same label text on the same sheet are
-        electrically connected. The label must be placed on a wire or pin
-        endpoint. A backup (.kicad_sch.bak) is written before saving.
+        electrically connected. The label must sit **exactly on a wire or
+        pin endpoint** to actually attach — coordinates are mm in screen
+        convention (**+Y is down**) and **must be aligned to the 1.27 mm
+        (50-mil) grid**. This tool does NOT auto-snap; pass coordinates
+        from ``extract_schematic_netlist`` (pin x/y) or wire endpoints
+        (wires returned by ``include_wire_topology=True``).
+
+        A backup (.kicad_sch.bak) is written before saving.
 
         Args:
             schematic_path: Absolute path to the target .kicad_sch file.
             text: Net label text (e.g. "VCC", "NET_A"). Must not be empty.
             x: X coordinate of the label connection point in mm.
             y: Y coordinate of the label connection point in mm.
-            angle: Rotation angle in degrees; must be 0, 90, 180, or 270.
+            angle: Label text rotation in degrees; must be 0, 90, 180, or
+                270. 0 = text reads left-to-right; 90 = bottom-to-top.
 
         Returns:
             dict with keys: success (bool), label (text, x, y, direction).

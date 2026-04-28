@@ -1110,20 +1110,20 @@ class TestMoveComponent:
             tools["move_component"](
                 schematic_path=tmp_sch,
                 reference="R1",
-                x=55.0,
-                y=66.0,
+                x=55.88,  # grid-aligned: 44 * 1.27
+                y=66.04,  # grid-aligned: 52 * 1.27
             )
         )
         assert result.get("success") is True, result
-        assert abs(result["position"]["x"] - 55.0) < 0.001
-        assert abs(result["position"]["y"] - 66.0) < 0.001
+        assert abs(result["position"]["x"] - 55.88) < 0.001
+        assert abs(result["position"]["y"] - 66.04) < 0.001
 
         sch = skip.Schematic(tmp_sch)
         for sym in sch.symbol:
             try:
                 if sym.property.Reference.value == "R1":
-                    assert abs(sym.at.value[0] - 55.0) < 0.001, "x not updated"
-                    assert abs(sym.at.value[1] - 66.0) < 0.001, "y not updated"
+                    assert abs(sym.at.value[0] - 55.88) < 0.001, "x not updated"
+                    assert abs(sym.at.value[1] - 66.04) < 0.001, "y not updated"
                     if orig_rot is not None:
                         assert sym.at.value[2] == orig_rot, "rotation should not change"
                     return
@@ -1137,22 +1137,22 @@ class TestMoveComponent:
             tools["move_component"](
                 schematic_path=tmp_sch,
                 reference="R1",
-                x=77.0,
-                y=88.0,
+                x=76.20,  # 60 * 1.27
+                y=88.90,  # 70 * 1.27
                 rotation=180,
             )
         )
         assert result.get("success") is True, result
-        assert abs(result["position"]["x"] - 77.0) < 0.001
-        assert abs(result["position"]["y"] - 88.0) < 0.001
+        assert abs(result["position"]["x"] - 76.20) < 0.001
+        assert abs(result["position"]["y"] - 88.90) < 0.001
         assert result["rotation"] == 180
 
         sch = skip.Schematic(tmp_sch)
         for sym in sch.symbol:
             try:
                 if sym.property.Reference.value == "R1":
-                    assert abs(sym.at.value[0] - 77.0) < 0.001
-                    assert abs(sym.at.value[1] - 88.0) < 0.001
+                    assert abs(sym.at.value[0] - 76.20) < 0.001
+                    assert abs(sym.at.value[1] - 88.90) < 0.001
                     assert sym.at.value[2] == 180
                     return
             except AttributeError:

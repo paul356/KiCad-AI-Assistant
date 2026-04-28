@@ -82,21 +82,40 @@ def register_netlist_tools(mcp: FastMCP) -> None:
         include_wire_topology: bool = False,
         ctx: Context | None = None,
     ) -> Dict[str, Any]:
-        """Extract component inventory, net analysis, and wire geometry() for a KiCad schematic.
+        """Extract component inventory, net analysis, and wire geometry for a KiCad schematic.
 
         A net is a named group of pins that are electrically connected by wires.
         For example, if R1/pin2, C1/pin1, and a GND power symbol are all joined
         by wires, they form one net named "GND".
 
-        Returns the full component list (with positions and pin coordinates), net
-        classification (power vs signal), component type counts, and simple issue
-        detection. Pin coordinates are included in the component list; net entries
-        contain only component references and pin numbers to avoid duplication.
+        This is the primary tool for spatial and connectivity reasoning. Each
+        entry in ``components`` (keyed by reference) contains:
+
+        - ``position``: ``{x, y}`` placement anchor in mm (KiCad screen coords,
+          **+Y is down**).
+        - ``rotation``, ``mirror``, ``lib_id``, ``value``, ``footprint``.
+        - ``body_bbox``: ``{min_x, min_y, max_x, max_y}`` world-space bounding
+          box (union of every placed unit). Use this to check overlaps before
+          calling ``move_component`` / ``add_symbol_to_schematic``. May be
+          absent for graphics-less symbols (e.g. PWR_FLAG).
+        - ``pins``: list of ``{num, x, y, direction}``. ``x``/``y`` are world
+          coordinates already accounting for placement and rotation;
+          ``direction`` is the screen-space exit direction
+          (``"right"|"up"|"left"|"down"``). When choosing which two pins to
+          wire, the **electrically correct pin** comes first — only fall
+          back to "closest pin pair" geometry when both candidates are
+          electrically interchangeable (e.g. the two leads of a non-polar
+          R/C/L, or any two pins already on the same net). Never pick by
+          distance for polarised parts (diodes, electrolytic caps, LEDs,
+          transistors), ICs, connectors, or named pins.
+
+        Net entries contain only ``component``/``pin`` references (pin
+        coordinates live on the component side to avoid duplication).
 
         Set ``include_wire_topology=True`` to also receive a top-level ``wires``
         dict keyed by wire ID. Each wire entry includes its net name (``null``
         if unconnected), start/end mm coordinates, and which component pins touch
-        each endpoint.
+        each endpoint. Required input for ``delete_wire_from_schematic``.
 
         Args:
             schematic_path: Path to the KiCad schematic file (.kicad_sch)
@@ -196,6 +215,7 @@ def register_netlist_tools(mcp: FastMCP) -> None:
                         {**pinfo, "net": pin_to_net.get((ref, str(pinfo.get("num", ""))), None)}
                         for pinfo in cdata.get("pins", [])
                     ],
+                    **({"body_bbox": cdata["body_bbox"]} if "body_bbox" in cdata else {}),
                 }
                 for ref, cdata in raw_components.items()
             }

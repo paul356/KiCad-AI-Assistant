@@ -38,6 +38,13 @@ def register_pcb_placement_tools(mcp: FastMCP) -> None:
     ) -> Dict[str, Any]:
         """Move and/or rotate a footprint on the PCB board.
 
+        PCB coordinates are mm with +X right, **+Y down**, and rotation
+        is in degrees, **clockwise-positive** (KiCad PCB convention —
+        opposite to the math/Y-up CCW convention used by .kicad_sym
+        library data). This tool does NOT auto-snap; pass coordinates
+        already aligned to your board grid (typical SMD work uses
+        0.1 mm or 0.05 mm; through-hole often 1.27 mm / 50 mil).
+
         Any of x, y, rotation may be omitted (None) to leave that value
         unchanged.  At least one of them must be provided.
 
@@ -46,13 +53,15 @@ def register_pcb_placement_tools(mcp: FastMCP) -> None:
         Args:
             pcb_path: Absolute path to the .kicad_pcb file.
             reference: Footprint reference designator, e.g. ``"U1"``.
-            x: New X coordinate in mm, or None to keep current value.
-            y: New Y coordinate in mm, or None to keep current value.
-            rotation: New rotation in degrees (0–360), or None to keep current.
+            x: New X coordinate in mm (world), or None to keep current.
+            y: New Y coordinate in mm (world), or None to keep current.
+            rotation: New rotation in degrees clockwise-positive (any
+                value; KiCad normalises). None to keep current.
             ctx: MCP context for progress reporting.
 
         Returns:
-            dict with reference, previous position, new position, backup_path.
+            dict with reference, previous {x, y, rotation}, new
+            {x, y, rotation}, backup_path, pcb_path.
         """
         if x is None and y is None and rotation is None:
             return {"error": "At least one of x, y, rotation must be provided."}

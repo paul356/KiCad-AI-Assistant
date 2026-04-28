@@ -9,6 +9,12 @@ from collections import defaultdict
 import skip
 
 from kicad_mcp.utils.skip_helpers import sym_pin_world_coords
+from kicad_mcp.utils.symbol_geometry import (
+    BBox,
+    compute_unit_bboxes,
+    lib_bbox_to_world,
+    union_bboxes,
+)
 
 
 def _angle_to_direction_screen(angle_deg: float) -> str:
@@ -106,6 +112,39 @@ class SchematicParser:
             print("No symbols found in schematic")
             return
 
+        # Cache per-lib_id unit bboxes (lib Y-up coords).
+        lib_bbox_cache: Dict[str, Dict[int, BBox]] = {}
+
+        def _lib_unit_bboxes(lib_id: str) -> Dict[int, BBox]:
+            if lib_id in lib_bbox_cache:
+                return lib_bbox_cache[lib_id]
+            try:
+                wrapper = self._sch.lib_symbols._libsyms_by_id.get(lib_id)
+            except AttributeError:
+                wrapper = None
+            # _libsyms_by_id values are skip LibSymbol wrappers (or raw lists
+            # if injected via _add_lib_symbol before write+reload). Reach
+            # through to the underlying sexpdata tree either way.
+            raw = None
+            if wrapper is not None:
+                if isinstance(wrapper, list):
+                    raw = wrapper
+                else:
+                    pv = getattr(wrapper, "_pv", None)
+                    raw = getattr(pv, "_tree", None) if pv is not None else None
+            bboxes: Dict[int, BBox] = {}
+            if raw is not None:
+                try:
+                    bboxes = compute_unit_bboxes(raw)
+                except Exception:
+                    bboxes = {}
+            lib_bbox_cache[lib_id] = bboxes
+            return bboxes
+
+        # World bboxes accumulated per reference so multi-unit symbols
+        # report the union of every placed unit's footprint.
+        world_bbox_per_ref: Dict[str, List[BBox]] = defaultdict(list)
+
         for sym in symbols:
             comp: Dict[str, Any] = {}
 
@@ -134,15 +173,44 @@ class SchematicParser:
                 pass
 
             # sym.at.value -> [x, y, angle]
+            sym_x = sym_y = sym_rot = None
             try:
                 at_val = sym.at.value
+                sym_x = float(at_val[0])
+                sym_y = float(at_val[1])
+                sym_rot = float(at_val[2]) if len(at_val) > 2 else 0.0
                 comp['position'] = {
-                    'x': float(at_val[0]),
-                    'y': float(at_val[1]),
-                    'rotation': float(at_val[2]) if len(at_val) > 2 else 0.0,
+                    'x': sym_x,
+                    'y': sym_y,
+                    'rotation': sym_rot,
                 }
             except (AttributeError, IndexError, TypeError):
                 pass
+
+            # Mirror flag (rare; "x" or "y") so the world bbox is correct
+            # even when the user has flipped a placed instance in KiCad.
+            mirror_val: str | None = None
+            try:
+                mv = sym.mirror.value
+                mirror_val = mv.value() if hasattr(mv, "value") else mv
+            except AttributeError:
+                pass
+
+            # Per-unit world bbox: look up this unit's lib bbox, transform.
+            if comp.get('lib_id') and sym_x is not None and sym_y is not None:
+                unit_no = 1
+                try:
+                    unit_no = int(sym.unit.value)
+                except (AttributeError, ValueError, TypeError):
+                    pass
+                bboxes = _lib_unit_bboxes(comp['lib_id'])
+                lib_bb = bboxes.get(unit_no) or bboxes.get(1)
+                if lib_bb is not None:
+                    rot_int = int(round(sym_rot or 0.0))
+                    world_bb = lib_bbox_to_world(
+                        lib_bb, sym_x, sym_y, rot_int, mirror_val,
+                    )
+                    world_bbox_per_ref[ref].append(world_bb)
 
             # Collect pin positions via shared helper (handles the skip bug
             # for single-pin symbols: power nets, PWR_FLAG, TestPoint, etc.)
@@ -155,6 +223,12 @@ class SchematicParser:
 
             self.components.append(comp)
             self.component_info[ref] = comp
+
+        # Attach the union world bbox to each component info entry.
+        for ref, bbs in world_bbox_per_ref.items():
+            merged = union_bboxes(bbs)
+            if merged is not None and ref in self.component_info:
+                self.component_info[ref]['body_bbox'] = merged.to_dict()
 
         print(f"Extracted {len(self.components)} components")
 

@@ -98,12 +98,19 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
     async def list_footprints(pcb_path: str, ctx: Context | None) -> Dict[str, Any]:
         """List all footprints placed on a KiCad PCB board.
 
+        PCB coordinate convention (used by every PCB tool): millimetres,
+        +X right, **+Y down** (KiCad PCB screen coords), and rotation in
+        **degrees, clockwise-positive**. The ``x``/``y`` here are the
+        footprint anchor in **board world coordinates**.
+
         Args:
             pcb_path: Absolute path to the .kicad_pcb file.
             ctx: MCP context for progress reporting.
 
         Returns:
-            dict with footprints: list of {reference, value, x, y, rotation, layer}
+            dict with footprints: list of {reference, value, x, y (mm,
+            world), rotation (deg, CW+), layer (e.g. "F.Cu"/"B.Cu")},
+            count.
         """
         data = load_pcb(pcb_path)
         footprints = []
@@ -134,14 +141,29 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
     ) -> Dict[str, Any]:
         """Get detailed information about a specific footprint on the board.
 
+        Coordinates are mm, +Y down, rotation in degrees clockwise-positive
+        (KiCad PCB convention). The footprint's ``x``/``y``/``rotation``
+        are in **board world coordinates**, but each pad's ``local_x``/
+        ``local_y`` are in **footprint-local coordinates** (relative to
+        the footprint anchor, before applying its rotation). To get pad
+        positions in world coordinates, transform with the footprint's
+        rotation:
+
+            world_x = fp.x + local_x * cos(θ) + local_y * sin(θ)
+            world_y = fp.y - local_x * sin(θ) + local_y * cos(θ)
+            (θ in radians; sign matches KiCad's clockwise-positive convention)
+
+        Or use ``get_ratsnest`` which returns world pad coordinates directly.
+
         Args:
             pcb_path: Absolute path to the .kicad_pcb file.
             reference: Footprint reference designator, e.g. ``"R1"``.
             ctx: MCP context for progress reporting.
 
         Returns:
-            dict with reference, value, x, y, rotation, layer, all properties
-            (dict), and pads list of {number, net_name, x, y, type, shape}.
+            dict with reference, value, x/y/rotation (world, mm/deg CW+),
+            layer, properties (dict of all property name→value), pads
+            (list of {number, type, shape, local_x, local_y, net_name}).
         """
         data = load_pcb(pcb_path)
         try:
@@ -248,6 +270,11 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
         copper tracks or vias.  Returns a list of unconnected pairs —
         an empty list means the board is fully routed.
 
+        Pad ``x``/``y`` in the result are **world coordinates** (mm,
+        +Y down) — the footprint rotation has already been applied, so
+        you can feed them straight into routing/placement reasoning.
+        Contrast with ``get_footprint`` which returns *local* pad coords.
+
         Note: This is an approximation based on net membership and track
         endpoint proximity, not a full topological connectivity analysis.
 
@@ -258,6 +285,7 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
         Returns:
             dict with:
                 unconnected: list of {net, from: {ref, pad, x, y}, to: {ref, pad, x, y}}
+                    where x/y are world mm.
                 unconnected_count: number of unconnected pairs
                 fully_routed: True if no unconnected pairs found
         """
