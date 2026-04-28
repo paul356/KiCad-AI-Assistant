@@ -474,9 +474,7 @@ def _draw_smart_wire(
     ) + (
         [(p2x, p2y)] if end_suppressed else []
     ):
-        if not _junction_exists_at(sch, jx, jy):
-            j = sch.junction.new()
-            j.at.value = [jx, jy]
+        _add_junction_and_split(sch, jx, jy)
 
     return True
 
@@ -575,6 +573,72 @@ def _wire_connected_at(sch: Any, px: float, py: float, tol: float = 0.01) -> boo
     except AttributeError:
         pass
     return False
+
+
+def _split_wires_at_point(sch: Any, px: float, py: float, tol: float = 0.01) -> int:
+    """Split any wire whose interior contains (px, py) into two segments.
+
+    KiCad ≥ 10 silently deletes a junction that does not coincide with at
+    least one wire endpoint when the schematic is opened. To make junctions
+    at T-taps persist, the underlying wire must be split into two segments
+    that share the junction coordinate as a common endpoint.
+
+    A point at a wire endpoint is NOT treated as interior — no split is
+    performed in that case (the existing endpoint already anchors the
+    junction).
+
+    Args:
+        sch: kicad-skip Schematic object.
+        px: X coordinate of the junction in mm.
+        py: Y coordinate of the junction in mm.
+        tol: Tolerance in mm for collinearity / endpoint matching.
+
+    Returns:
+        Number of wires that were split.
+    """
+    splits = 0
+    try:
+        wires_to_split: list[tuple[Any, float, float, float, float]] = []
+        for w in sch.wire:
+            try:
+                ax = float(w.start.value[0])
+                ay = float(w.start.value[1])
+                bx = float(w.end.value[0])
+                by = float(w.end.value[1])
+            except (AttributeError, IndexError, TypeError):
+                continue
+            if _point_on_open_segment(px, py, ax, ay, bx, by, tol):
+                wires_to_split.append((w, ax, ay, bx, by))
+        for w, _ax, _ay, bx, by in wires_to_split:
+            # Shorten the existing wire to (start)→(px,py); add a new wire
+            # (px,py)→(original end) so the junction sits on a shared endpoint.
+            w.end_at([px, py])
+            nw = sch.wire.new()
+            nw.start_at([px, py])
+            nw.end_at([bx, by])
+            splits += 1
+    except AttributeError:
+        pass
+    return splits
+
+
+def _add_junction_and_split(
+    sch: Any, px: float, py: float, tol: float = 0.01
+) -> bool:
+    """Add a junction at (px, py) and split any wire passing through it.
+
+    No-op (returns False) if a junction already exists at (px, py); in that
+    case wires are still split so the existing junction becomes anchored.
+
+    Returns True if a new junction was created.
+    """
+    created = False
+    if not _junction_exists_at(sch, px, py, tol):
+        j = sch.junction.new()
+        j.at.value = [px, py]
+        created = True
+    _split_wires_at_point(sch, px, py, tol)
+    return created
 
 
 # ---------------------------------------------------------------------------
@@ -751,13 +815,10 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
                 (end_x, end_y, add_junction_end),
             ]:
                 if flag or (_wire_connected_at(sch, jx, jy) and not _junction_exists_at(sch, jx, jy)):
-                    j = sch.junction.new()
-                    j.at.value = [jx, jy]
-                    junctions_added.append({"x": jx, "y": jy})
+                    if _add_junction_and_split(sch, jx, jy):
+                        junctions_added.append({"x": jx, "y": jy})
             for jx, jy in followed_junctions:
-                if not _junction_exists_at(sch, jx, jy):
-                    j = sch.junction.new()
-                    j.at.value = [jx, jy]
+                if _add_junction_and_split(sch, jx, jy):
                     junctions_added.append({"x": jx, "y": jy})
 
             ok = _draw_smart_wire(
@@ -1016,8 +1077,15 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
 
         A junction is required wherever a wire endpoint or pin lies on the
         interior of another wire (T-junction), to mark the electrical
-        connection explicitly.  A backup (.kicad_sch.bak) is written before
-        saving.
+        connection explicitly.
+
+        If the requested point lies on the **interior** of an existing wire
+        segment, that wire is automatically split into two segments meeting
+        at the junction coordinate. This is required because KiCad ≥ 10
+        silently deletes any junction that does not coincide with at least
+        one wire endpoint when the schematic is reopened.
+
+        A backup (.kicad_sch.bak) is written before saving.
 
         Args:
             schematic_path: Absolute path to the target .kicad_sch file.
@@ -1040,8 +1108,7 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
             return {"error": f"Failed to open schematic: {exc}"}
 
         try:
-            j = sch.junction.new()
-            j.at.value = [x, y]
+            _add_junction_and_split(sch, x, y)
 
             shutil.copy(schematic_path, schematic_path + ".bak")
             sch.write(schematic_path)

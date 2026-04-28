@@ -477,6 +477,68 @@ class TestAddJunctionToSchematic:
         self._call(tools, schematic_path=tmp_sch, x=120.0, y=97.46)
         assert os.path.exists(tmp_sch + ".bak")
 
+    def test_splits_wire_when_junction_at_interior(self, tools, tmp_sch):
+        """A junction placed on the interior of a wire must split that wire
+        into two segments meeting at the junction coordinate, otherwise
+        KiCad ≥ 10 silently deletes the junction on reload.
+        """
+        # Lay a single horizontal wire from (100, 90) to (140, 90).
+        sch = skip.Schematic(tmp_sch)
+        w = sch.wire.new()
+        w.start_at([100.0, 90.0])
+        w.end_at([140.0, 90.0])
+        sch.write(tmp_sch)
+
+        # Place a junction at the midpoint (120, 90).
+        result = self._call(tools, schematic_path=tmp_sch, x=120.0, y=90.0)
+        assert result.get("success") is True
+
+        # Reload and check the wire is now two segments meeting at (120, 90).
+        sch2 = skip.Schematic(tmp_sch)
+        segs = sorted(
+            (
+                round(float(w.start.value[0]), 3),
+                round(float(w.start.value[1]), 3),
+                round(float(w.end.value[0]), 3),
+                round(float(w.end.value[1]), 3),
+            )
+            for w in sch2.wire
+        )
+
+        def _norm(seg):
+            ax, ay, bx, by = seg
+            return tuple(sorted([(ax, ay), (bx, by)]))
+
+        norm_segs = sorted(_norm(s) for s in segs)
+        assert ((100.0, 90.0), (120.0, 90.0)) in norm_segs
+        assert ((120.0, 90.0), (140.0, 90.0)) in norm_segs
+        # Original full-length wire must be gone.
+        assert ((100.0, 90.0), (140.0, 90.0)) not in norm_segs
+
+        # And the junction itself was added.
+        assert any(
+            abs(float(j.at.value[0]) - 120.0) < 0.01
+            and abs(float(j.at.value[1]) - 90.0) < 0.01
+            for j in sch2.junction
+        )
+
+    def test_no_split_when_junction_at_wire_endpoint(self, tools, tmp_sch):
+        """A junction placed at a wire endpoint must NOT split the wire."""
+        sch = skip.Schematic(tmp_sch)
+        w = sch.wire.new()
+        w.start_at([100.0, 90.0])
+        w.end_at([140.0, 90.0])
+        sch.write(tmp_sch)
+        wire_count_before = len(list(skip.Schematic(tmp_sch).wire))
+
+        # Junction exactly at the wire's start endpoint.
+        result = self._call(tools, schematic_path=tmp_sch, x=100.0, y=90.0)
+        assert result.get("success") is True
+
+        sch2 = skip.Schematic(tmp_sch)
+        assert len(list(sch2.wire)) == wire_count_before, \
+            "wire should not be split when junction sits at an endpoint"
+
 
 # ---------------------------------------------------------------------------
 # list_junctions_in_schematic — tests
