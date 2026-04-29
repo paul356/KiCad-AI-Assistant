@@ -229,12 +229,28 @@ class TestGetBoardBoundingBox:
 
 class TestAlignFootprints:
     def test_align_y_to_mean(self, tools, board_copy):
-        # All three resistors are at y=20, so mean=20
+        """Aligning footprints at y=20, y=20, y=30 to mean (≈23.33) moves the third."""
+        from kicad_mcp.utils.pcb_sexp_utils import load_pcb
+        from kicad_mcp.utils.pcb_footprint_utils import find_footprint, get_fp_at, set_fp_at
+        # First move R3 to y=30 so the mean is not trivially unchanged
+        data = load_pcb(board_copy)
+        fp = find_footprint(data, "R3")
+        ox, oy, rot = get_fp_at(fp)
+        set_fp_at(fp, ox, 30.0, rot)
+        from kicad_mcp.utils.pcb_sexp_utils import save_pcb
+        save_pcb(board_copy, data)
+
         result = _run(tools["align_footprints"](
             pcb_path=board_copy, references=["R1", "R2", "R3"],
             axis="y", coordinate=None, ctx=None))
         assert "error" not in result
-        assert result["target_coordinate"] == pytest.approx(20.0)
+        expected_mean = (20.0 + 20.0 + 30.0) / 3.0
+        assert result["target_coordinate"] == pytest.approx(expected_mean, abs=1e-4)
+        # Re-read from disk to confirm the change was persisted
+        data2 = load_pcb(board_copy)
+        for ref in ("R1", "R2", "R3"):
+            _, py, _ = get_fp_at(find_footprint(data2, ref))
+            assert py == pytest.approx(expected_mean, abs=1e-4)
 
     def test_align_y_to_explicit_coordinate(self, tools, board_copy):
         result = _run(tools["align_footprints"](
@@ -277,16 +293,30 @@ class TestAlignFootprints:
 
 class TestDistributeFootprints:
     def test_three_footprints_evenly_spaced(self, tools, board_copy):
-        # R1=10, R3=20, R2=30 — distribute along x → spacing=10
+        """Distribute R1=10, R2=12, R3=30 → R2 should move to x=20."""
+        from kicad_mcp.utils.pcb_sexp_utils import load_pcb, save_pcb
+        from kicad_mcp.utils.pcb_footprint_utils import find_footprint, get_fp_at, set_fp_at
+        # Move R2 to x=12 and R3 to x=30 so they are not evenly spaced
+        data = load_pcb(board_copy)
+        for ref, new_x in (("R2", 12.0), ("R3", 30.0)):
+            fp = find_footprint(data, ref)
+            ox, oy, rot = get_fp_at(fp)
+            set_fp_at(fp, new_x, oy, rot)
+        save_pcb(board_copy, data)
+
         result = _run(tools["distribute_footprints"](
             pcb_path=board_copy, references=["R1", "R2", "R3"],
             axis="x", ctx=None))
         assert "error" not in result
         assert result["spacing_mm"] == pytest.approx(10.0)
-        xs = sorted(e["new_x"] for e in result["distributed"])
-        assert xs[0] == pytest.approx(10.0)
-        assert xs[1] == pytest.approx(20.0)
-        assert xs[2] == pytest.approx(30.0)
+        new_xs = {e["reference"]: e["new_x"] for e in result["distributed"]}
+        assert new_xs["R1"] == pytest.approx(10.0)
+        assert new_xs["R2"] == pytest.approx(20.0)
+        assert new_xs["R3"] == pytest.approx(30.0)
+        # Verify persisted on disk
+        data2 = load_pcb(board_copy)
+        px, _, _ = get_fp_at(find_footprint(data2, "R2"))
+        assert px == pytest.approx(20.0)
 
     def test_two_refs_unchanged(self, tools, board_copy):
         result = _run(tools["distribute_footprints"](

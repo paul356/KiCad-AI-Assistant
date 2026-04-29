@@ -244,15 +244,21 @@ def add_gr_arc(
     :param width: Line width in mm.
     :param layer: Target layer.
     """
-    # Convert CW-from-+X angles to standard math angles for trig:
-    #   math_angle = -kicad_cw_angle (because KiCad Y-down inverts the sense)
+    # In KiCad's +Y-down coordinate system CW angles map directly to standard
+    # trig: a point at θ° CW from +X lies at (cx + r·cosθ, cy + r·sinθ).
+    # No negation is needed; sin(θ) is positive downward, matching +Y-down.
     def _pt(angle_cw_deg: float) -> Tuple[float, float]:
-        rad = math.radians(-angle_cw_deg)
+        rad = math.radians(angle_cw_deg)
         return cx + radius * math.cos(rad), cy + radius * math.sin(rad)
 
-    # Midpoint angle (halfway around the arc, going CW)
-    # KiCad 6 expects start → mid → end to define the arc direction.
-    mid_angle_cw = start_angle_deg + (end_angle_deg - start_angle_deg) / 2.0
+    # Midpoint angle going CW from start to end.
+    # Normalize the arc span to [0°, 360°) so wrap-around arcs (e.g.
+    # start=315°, end=45°) pick the midpoint of the short arc, not the
+    # complementary 270° arc.
+    span = (end_angle_deg - start_angle_deg) % 360.0
+    if span == 0.0:
+        span = 360.0
+    mid_angle_cw = start_angle_deg + span / 2.0
 
     sx, sy = _pt(start_angle_deg)
     mx, my = _pt(mid_angle_cw)
@@ -347,9 +353,13 @@ def get_fp_courtyard_bbox(
                     elif k == "end":
                         ex, ey = float(ssub[1]), float(ssub[2])
             r = math.hypot(ex - cx, ey - cy)
-            # Approximate circle with 4 cardinal points
+            # A circle of radius r centred at (cx, cy) in footprint-local space
+            # always extends exactly ±r in world space regardless of footprint
+            # rotation.  Rotate only the centre and then add the world-space
+            # cardinal offsets directly.
+            wcx, wcy = _to_world(cx, cy)
             for dx, dy in ((r, 0), (-r, 0), (0, r), (0, -r)):
-                points.append(_to_world(cx + dx, cy + dy))
+                points.append((wcx + dx, wcy + dy))
 
         elif kind == "fp_arc":
             for ssub in sub:
