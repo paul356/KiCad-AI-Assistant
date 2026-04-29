@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import collections
 import logging
+import os
 import threading
 from typing import Any, Optional
 
@@ -46,6 +47,8 @@ if _WX_AVAILABLE:
             self._stream_buffer: collections.deque = collections.deque()
             # Set to True when at least one tool call happens during a turn
             self._tool_calls_made: bool = False
+            # PCB file mtime recorded just before a tool-call session begins
+            self._pcb_mtime_before: float = 0.0
             # Structured conversation history for HTML rendering
             self._conv_entries: list[dict] = []
             # Accumulates streamed AI text before it is finalised as an entry
@@ -251,6 +254,7 @@ if _WX_AVAILABLE:
             self._stream_buffer.clear()
             self._pending_ai_text = ""
             self._tool_calls_made = False
+            self._pcb_mtime_before = self._get_pcb_mtime(ctx.get("active_pcb"))
             self._stream_timer.Start(50)  # flush every 50 ms → ~20 fps
 
             state = {"ai_turn_started": False}
@@ -321,6 +325,15 @@ if _WX_AVAILABLE:
             self._append_tool_log(name, args, result)
             self._tool_calls_made = True
 
+        def _get_pcb_mtime(self, pcb_path: Optional[str]) -> float:
+            """Return the mtime of the PCB file, or 0.0 if unavailable."""
+            if pcb_path:
+                try:
+                    return os.path.getmtime(pcb_path)
+                except OSError:
+                    pass
+            return 0.0
+
         def _auto_refresh(self, ctx: dict) -> None:
             """Refresh the KiCad view automatically after tool calls."""
             editor = ctx.get("active_editor", "unknown")
@@ -335,6 +348,15 @@ if _WX_AVAILABLE:
                 self._conv_entries.append({"type": "status", "text": f"⚠ Auto-refresh failed: {e}", "color_hex": self._C_WARN_HEX})
                 self._render_conversation()
                 return
+            if editor == "pcb":
+                pcb_path = ctx.get("active_pcb")
+                if pcb_path and self._get_pcb_mtime(pcb_path) != self._pcb_mtime_before:
+                    self._conv_entries.append({
+                        "type": "status",
+                        "text": "ℹ PCB file was updated — use File → Revert in the PCB editor to load the latest version.",
+                        "color_hex": self._C_WARN_HEX,
+                    })
+                    self._render_conversation()
             if editor == "schematic":
                 self._conv_entries.append({
                     "type": "status",
