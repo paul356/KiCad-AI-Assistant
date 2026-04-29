@@ -27,7 +27,6 @@ def collect_context() -> dict[str, Any]:
         active_project     Absolute path to .kicad_pro, or None
         active_schematic   Absolute path to .kicad_sch (root), or None
         active_pcb         Absolute path to .kicad_pcb, or None
-        active_editor      "schematic" | "pcb" | "unknown"
         selected_refs      List of component reference strings currently selected
         active_sheet       Sheet path in hierarchical schematics, or None
     """
@@ -35,7 +34,6 @@ def collect_context() -> dict[str, Any]:
         "active_project": None,
         "active_schematic": None,
         "active_pcb": None,
-        "active_editor": "unknown",
         "selected_refs": [],
         "active_sheet": None,
     }
@@ -54,7 +52,6 @@ def collect_context() -> dict[str, Any]:
             pcb_path = board.GetFileName()
             if pcb_path:
                 ctx["active_pcb"] = os.path.abspath(pcb_path)
-                ctx["active_editor"] = "pcb"
 
                 proj_dir = os.path.dirname(pcb_path)
                 proj_name = os.path.splitext(os.path.basename(pcb_path))[0]
@@ -78,17 +75,6 @@ def collect_context() -> dict[str, Any]:
     except Exception as e:
         log.debug("Could not collect PCB context: %s", e)
 
-    # ------------------------------------------------------------------ #
-    # Schematic editor context (Eeschema frame)
-    # ------------------------------------------------------------------ #
-    try:
-        frame = pcbnew.GetCurrentFrame()
-        frame_name = type(frame).__name__ if frame else ""
-        if "Schematic" in frame_name or "Eeschema" in frame_name:
-            ctx["active_editor"] = "schematic"
-    except Exception:
-        pass
-
     return ctx
 
 
@@ -109,10 +95,10 @@ def context_to_system_prompt_block(ctx: dict[str, Any]) -> str:
     else:
         lines.append("Active schematic: (none)")
 
-    lines.append(f"Active editor: {ctx.get('active_editor', 'unknown')}")
-
-    if ctx.get("active_pcb") and ctx.get("active_editor") == "pcb":
+    if ctx.get("active_pcb"):
         lines.append(f"Active PCB: {ctx['active_pcb']}")
+    else:
+        lines.append("Active PCB: (none)")
 
     refs = ctx.get("selected_refs", [])
     if refs:
@@ -127,6 +113,13 @@ def context_to_system_prompt_block(ctx: dict[str, Any]) -> str:
         lines.append(
             f"\nWhen editing the schematic, use {ctx['active_schematic']!r} "
             "as the schematic_path argument for all editing tools unless the "
+            "engineer specifies a different file."
+        )
+
+    if ctx.get("active_pcb"):
+        lines.append(
+            f"\nWhen editing the PCB, use {ctx['active_pcb']!r} "
+            "as the pcb_path argument for all PCB tools unless the "
             "engineer specifies a different file."
         )
 

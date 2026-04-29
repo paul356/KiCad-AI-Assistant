@@ -336,7 +336,6 @@ if _WX_AVAILABLE:
 
         def _auto_refresh(self, ctx: dict) -> None:
             """Refresh the KiCad view automatically after tool calls."""
-            editor = ctx.get("active_editor", "unknown")
             try:
                 import pcbnew
                 pcbnew.Refresh()
@@ -348,16 +347,15 @@ if _WX_AVAILABLE:
                 self._conv_entries.append({"type": "status", "text": f"⚠ Auto-refresh failed: {e}", "color_hex": self._C_WARN_HEX})
                 self._render_conversation()
                 return
-            if editor == "pcb":
-                pcb_path = ctx.get("active_pcb")
-                if pcb_path and self._get_pcb_mtime(pcb_path) != self._pcb_mtime_before:
-                    self._conv_entries.append({
-                        "type": "status",
-                        "text": "ℹ PCB file was updated — use File → Revert in the PCB editor to load the latest version.",
-                        "color_hex": self._C_WARN_HEX,
-                    })
-                    self._render_conversation()
-            if editor == "schematic":
+            pcb_path = ctx.get("active_pcb")
+            if pcb_path and self._get_pcb_mtime(pcb_path) != self._pcb_mtime_before:
+                self._conv_entries.append({
+                    "type": "status",
+                    "text": "ℹ PCB file was updated — use File → Revert in the PCB editor to load the latest version.",
+                    "color_hex": self._C_WARN_HEX,
+                })
+                self._render_conversation()
+            if ctx.get("active_schematic"):
                 self._conv_entries.append({
                     "type": "status",
                     "text": "ℹ Schematic updated on disk — use File → Revert to see changes in the editor.",
