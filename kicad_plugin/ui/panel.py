@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import collections
 import logging
-import os
 import threading
 from typing import Any, Optional
 
@@ -47,8 +46,8 @@ if _WX_AVAILABLE:
             self._stream_buffer: collections.deque = collections.deque()
             # Set to True when at least one tool call happens during a turn
             self._tool_calls_made: bool = False
-            # PCB file mtime recorded just before a tool-call session begins
-            self._pcb_mtime_before: float = 0.0
+            # Set to True when any tool modifies a .kicad_sch file this turn
+            self._schematic_edited: bool = False
             # Structured conversation history for HTML rendering
             self._conv_entries: list[dict] = []
             # Accumulates streamed AI text before it is finalised as an entry
@@ -221,6 +220,7 @@ if _WX_AVAILABLE:
                 self._status_label.SetForegroundColour(wx.Colour(*self._C_OK))
                 self._send_btn.Enable(True)
                 self._init_llm_client()
+                self._check_kicad_ipc_environment()
             else:
                 self._status_label.SetLabel("❌ Backend failed to start — use Options → Restart Backend to retry")
                 self._status_label.SetForegroundColour(wx.Colour(*self._C_ERR))
@@ -229,6 +229,89 @@ if _WX_AVAILABLE:
         def _init_llm_client(self) -> None:
             from ..llm_client import LLMClient
             self._llm_client = LLMClient(self._settings, self._server_mgr.base_url)
+
+        # ------------------------------------------------------------------ #
+        # KiCad IPC API status check
+        # ------------------------------------------------------------------ #
+
+        def _check_kicad_ipc_environment(self) -> None:
+            """Check that kipy is in the MCP venv and the KiCad IPC socket exists.
+
+            The "Reload PCB" feature and the ``update_pcb_from_schematic``
+            tool both depend on the kicad-python (kipy) module (installed in
+            the plugin's .venv, *not* in KiCad's Python) and a live KiCad IPC
+            socket (default ``/tmp/kicad/api.sock`` on Linux/macOS).
+            If either is missing, surface a friendly warning in the
+            conversation panel so the user knows what to enable.
+            """
+            import glob
+            import os
+            import platform
+            from tempfile import gettempdir
+
+            # 1) kipy presence check in the plugin's .venv -----------------
+            # kipy runs inside the MCP server venv, not KiCad's Python, so
+            # we must NOT do `import kipy` here.  Instead probe the venv's
+            # site-packages on disk.
+            plugin_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            venv_site = os.path.join(plugin_dir, ".venv", "lib")
+            kipy_found = bool(glob.glob(os.path.join(venv_site, "python*", "site-packages", "kipy")))
+            kipy_ok = kipy_found
+            if not kipy_ok:
+                self._conv_entries.append({
+                    "type": "status",
+                    "text": (
+                        "⚠ kicad-python (kipy) is not installed in the MCP "
+                        "server's virtual environment. The 'Reload PCB' "
+                        "feature and the 'update_pcb_from_schematic' tool "
+                        "will be disabled. Run: "
+                        f".venv/bin/pip install kicad-python  "
+                        f"(looked in {venv_site})"
+                    ),
+                    "color_hex": self._C_WARN_HEX,
+                })
+
+            # 2) IPC socket check ------------------------------------------
+            socket_url = os.environ.get("KICAD_API_SOCKET")
+            if socket_url:
+                # Strip ipc:// prefix if present, check filesystem path
+                socket_path = socket_url[len("ipc://"):] if socket_url.startswith("ipc://") else socket_url
+                socket_exists = os.path.exists(socket_path) or platform.system() == "Windows"
+                checked_path = socket_url
+            elif platform.system() == "Windows":
+                # Windows uses a named pipe — can't easily stat it
+                socket_exists = True
+                checked_path = f"{gettempdir()}\\kicad\\api.sock"
+            else:
+                # Try flatpak path first, then standard path
+                home = os.environ.get("HOME", "")
+                flatpak_path = f"{home}/.var/app/org.kicad.KiCad/cache/tmp/kicad/api.sock"
+                standard_path = "/tmp/kicad/api.sock"
+                if home and os.path.exists(flatpak_path):
+                    socket_exists = True
+                    checked_path = flatpak_path
+                elif os.path.exists(standard_path):
+                    socket_exists = True
+                    checked_path = standard_path
+                else:
+                    socket_exists = False
+                    checked_path = standard_path
+
+            if not socket_exists:
+                self._conv_entries.append({
+                    "type": "status",
+                    "text": (
+                        f"⚠ KiCad IPC API socket not found at {checked_path}. "
+                        "The 'Reload PCB' feature and 'update_pcb_from_schematic' "
+                        "tool require it. Enable it in KiCad: "
+                        "Preferences → Preferences → Plugins → "
+                        "'Enable KiCad API' (KiCad 9+)."
+                    ),
+                    "color_hex": self._C_WARN_HEX,
+                })
+
+            if not kipy_ok or not socket_exists:
+                self._render_conversation()
 
         # ------------------------------------------------------------------ #
         # Event handlers
@@ -254,7 +337,7 @@ if _WX_AVAILABLE:
             self._stream_buffer.clear()
             self._pending_ai_text = ""
             self._tool_calls_made = False
-            self._pcb_mtime_before = self._get_pcb_mtime(ctx.get("active_pcb"))
+            self._schematic_edited = False
             self._stream_timer.Start(50)  # flush every 50 ms → ~20 fps
 
             state = {"ai_turn_started": False}
@@ -324,18 +407,12 @@ if _WX_AVAILABLE:
             self._render_conversation()
             self._append_tool_log(name, args, result)
             self._tool_calls_made = True
-
-        def _get_pcb_mtime(self, pcb_path: Optional[str]) -> float:
-            """Return the mtime of the PCB file, or 0.0 if unavailable."""
-            if pcb_path:
-                try:
-                    return os.path.getmtime(pcb_path)
-                except OSError:
-                    pass
-            return 0.0
+            if isinstance(result, dict) and str(result.get("file_modified", "")).endswith(".kicad_sch"):
+                self._schematic_edited = True
 
         def _auto_refresh(self, ctx: dict) -> None:
             """Refresh the KiCad view automatically after tool calls."""
+            editor = ctx.get("active_editor", "unknown")
             try:
                 import pcbnew
                 pcbnew.Refresh()
@@ -347,18 +424,10 @@ if _WX_AVAILABLE:
                 self._conv_entries.append({"type": "status", "text": f"⚠ Auto-refresh failed: {e}", "color_hex": self._C_WARN_HEX})
                 self._render_conversation()
                 return
-            pcb_path = ctx.get("active_pcb")
-            if pcb_path and self._get_pcb_mtime(pcb_path) != self._pcb_mtime_before:
+            if self._schematic_edited:
                 self._conv_entries.append({
                     "type": "status",
-                    "text": "ℹ PCB file was updated — use File → Revert in the PCB editor to load the latest version.",
-                    "color_hex": self._C_WARN_HEX,
-                })
-                self._render_conversation()
-            if ctx.get("active_schematic"):
-                self._conv_entries.append({
-                    "type": "status",
-                    "text": "ℹ Schematic updated on disk — use File → Revert to see changes in the editor.",
+                    "text": "ℹ Schematic updated on disk — use File → Revert in the Schematic Editor to see the changes.",
                     "color_hex": self._C_WARN_HEX,
                 })
                 self._render_conversation()

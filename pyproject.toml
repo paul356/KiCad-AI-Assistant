@@ -49,6 +49,7 @@ dependencies = [
     "defusedxml>=0.7.0",  # Secure XML parsing
     "kicad-skip>=0.2.5",  # KiCad S-expression file parser (imports as `skip`)
     "sqlalchemy>=2.0.0",  # Symbol database ORM
+    "kicad-python>=0.7.1",  # KiCad IPC API bindings (requires KiCad 9+ GUI running)
 ]
 
 [project.urls]

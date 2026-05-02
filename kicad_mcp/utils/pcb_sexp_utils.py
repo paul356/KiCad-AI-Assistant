@@ -56,6 +56,10 @@ def save_pcb(path: str, data: List[Any]) -> str:
         fh.write(text)
     os.replace(tmp_path, path)
 
+    # Trigger KiCad GUI to reload (best-effort; never raises).
+    from kicad_mcp.utils.kipy_reload import try_reload_pcb_in_kicad  # noqa: PLC0415
+    try_reload_pcb_in_kicad(path)
+
     return bak_path
 
 
