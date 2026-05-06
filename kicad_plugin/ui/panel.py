@@ -57,6 +57,8 @@ if _WX_AVAILABLE:
             self._tool_calls_made: bool = False
             # Set to True when any tool modifies a .kicad_sch file this turn
             self._schematic_edited: bool = False
+            # Set to True when any tool modifies a .kicad_pcb file this turn
+            self._pcb_edited: bool = False
             # Tool calls buffered during the current AI turn; flushed into the
             # AI conv_entry when the turn finishes.
             self._pending_tool_calls: list[dict] = []
@@ -341,6 +343,7 @@ if _WX_AVAILABLE:
             self._pending_tool_calls = []
             self._tool_calls_made = False
             self._schematic_edited = False
+            self._pcb_edited = False
             self._stream_timer.Start(50)  # flush every 50 ms → ~20 fps
 
             state = {"ai_turn_started": False}
@@ -427,21 +430,24 @@ if _WX_AVAILABLE:
             self._tool_calls_made = True
             if isinstance(result, dict) and str(result.get("file_modified", "")).endswith(".kicad_sch"):
                 self._schematic_edited = True
+            if isinstance(result, dict) and str(result.get("file_modified", "")).endswith(".kicad_pcb"):
+                self._pcb_edited = True
 
         def _auto_refresh(self, ctx: dict) -> None:
             """Refresh the KiCad view automatically after tool calls."""
             editor = ctx.get("active_editor", "unknown")
-            try:
-                import pcbnew
-                pcbnew.Refresh()
-                self._conv_entries.append({"type": "status", "text": "⟳ Board view refreshed.", "color_hex": self._C_OK_HEX})
-                self._render_conversation()
-            except ImportError:
-                pass  # outside KiCad — silently skip
-            except Exception as e:
-                self._conv_entries.append({"type": "status", "text": f"⚠ Auto-refresh failed: {e}", "color_hex": self._C_WARN_HEX})
-                self._render_conversation()
-                return
+            if self._pcb_edited:
+                try:
+                    import pcbnew
+                    pcbnew.Refresh()
+                    self._conv_entries.append({"type": "status", "text": "⟳ Board view refreshed.", "color_hex": self._C_OK_HEX})
+                    self._render_conversation()
+                except ImportError:
+                    pass  # outside KiCad — silently skip
+                except Exception as e:
+                    self._conv_entries.append({"type": "status", "text": f"⚠ Auto-refresh failed: {e}", "color_hex": self._C_WARN_HEX})
+                    self._render_conversation()
+                    return
             if self._schematic_edited:
                 self._conv_entries.append({
                     "type": "status",
