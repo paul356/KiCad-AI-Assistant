@@ -155,8 +155,6 @@ def _https_post_json(
         raise RuntimeError(f"HTTPS request failed: {out.get('error', 'unknown error')}")
     return int(status), str(out.get("body", ""))
 
-MAX_HISTORY_MESSAGES = 100  # default sliding-window cap for conversation history
-
 # ---------------------------------------------------------------------------
 # System prompt
 # ---------------------------------------------------------------------------
@@ -442,10 +440,13 @@ class LLMClient:
       - provider="anthropic" → Anthropic messages API
     """
 
-    def __init__(self, settings, mcp_base_url: str, max_history: int = MAX_HISTORY_MESSAGES) -> None:
+    def __init__(self, settings, mcp_base_url: str) -> None:
         self._settings = settings
         self._mcp_base_url = mcp_base_url
-        self._max_history = max_history
+        self._context_tokens: int = getattr(settings, "llm_context_tokens", 128_000)
+        self._compact_threshold: float = getattr(settings, "llm_compact_threshold", 0.70)
+        self._compact_target_threshold: float = getattr(settings, "llm_compact_target_threshold", 0.49)
+        self._keep_recent_turns: int = getattr(settings, "llm_keep_recent_turns", 4)
         self._history: list[dict[str, Any]] = []
 
     def reset(self) -> None:
@@ -484,6 +485,200 @@ class LLMClient:
                 # Fallback: drop the oldest message of any role
                 self._history.pop(0)
 
+    def _estimate_tokens(self, messages: list[dict[str, Any]]) -> int:
+        """Estimate token count as character count divided by 4 (no external tokenizer)."""
+        return sum(len(json.dumps(m)) for m in messages) // 4
+
+    def _dedup_tool_calls(self) -> None:
+        """Remove stale duplicate tool calls, keeping only the latest call to each tool.
+
+        Walks history from tail to head. A "tool turn" is one assistant message
+        that contains tool_calls plus all immediately-following role=="tool" messages.
+        If every tool name in a turn has already been seen in a more-recent turn,
+        the entire turn (assistant + its tool results) is deleted.
+        """
+        seen_tools: set[str] = set()
+        i = len(self._history) - 1
+        while i >= 0:
+            msg = self._history[i]
+            if msg.get("role") == "tool":
+                i -= 1
+                continue
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                # Find the extent of this tool turn: assistant msg at i,
+                # followed by consecutive tool messages at i+1 …
+                j = i + 1
+                while j < len(self._history) and self._history[j].get("role") == "tool":
+                    j += 1
+                tool_names = {tc["function"]["name"] for tc in msg["tool_calls"]}
+                if tool_names.issubset(seen_tools):
+                    # All tools in this turn are superseded — drop the whole turn
+                    del self._history[i:j]
+                    i -= 1
+                    continue
+                # Keep this turn; mark its tools as seen
+                seen_tools.update(tool_names)
+            i -= 1
+
+    def _compact_history(self, system_prompt: str, target_summary_chars: int) -> bool:
+        """Summarise the oldest part of history into a single compact message.
+
+        Identifies the last ``self._keep_recent_turns`` complete assistant turns
+        as the "recent" block that is always preserved verbatim.  Everything before
+        those turns is the compactable prefix.
+
+        Builds a text-only transcript of the prefix (user/assistant text only;
+        tool names noted inline; raw tool results omitted) and asks the LLM to
+        summarise it with user intentions and agreements listed first.
+
+        The returned summary is hard-clipped to ``target_summary_chars`` at a
+        word boundary before storing.
+
+        Returns True on success, False if nothing was compacted or an error occurred.
+        """
+        # ---- Identify the split point (oldest of the recent turns) ----------
+        turns_found = 0
+        split_idx = len(self._history)  # index of first message in "recent" block
+        i = len(self._history) - 1
+        while i >= 0 and turns_found < self._keep_recent_turns:
+            if self._history[i].get("role") == "assistant":
+                split_idx = i
+                turns_found += 1
+            i -= 1
+
+        # Walk back to include the user message that opened this oldest recent turn
+        j = split_idx - 1
+        while j >= 0 and self._history[j].get("role") != "user":
+            j -= 1
+        if j >= 0:
+            split_idx = j
+
+        prefix = self._history[:split_idx]
+        if len(prefix) < 4:
+            return False  # nothing worth compacting yet
+
+        # ---- Build text-only transcript of the prefix -----------------------
+        lines: list[str] = []
+        for msg in prefix:
+            role = msg.get("role", "")
+            if role == "user":
+                content = msg.get("content") or ""
+                lines.append(f"User: {content}")
+            elif role == "assistant":
+                content = msg.get("content") or ""
+                tool_calls = msg.get("tool_calls") or []
+                if content:
+                    lines.append(f"Assistant: {content}")
+                if tool_calls:
+                    names = ", ".join(tc["function"]["name"] for tc in tool_calls)
+                    lines.append(f"Assistant called tools: {names}")
+            # role=="tool" messages are omitted entirely
+
+        transcript = "\n".join(lines)
+        target_words = max(50, target_summary_chars // 4)
+        compact_prompt = (
+            f"Summarize the following KiCad assistant session excerpt in approximately "
+            f"{target_words} words.\n"
+            "Structure your summary as follows:\n"
+            "1. User intentions and agreed proposals (list these first)\n"
+            "2. Any other relevant context\n\n"
+            "Drop intermediate tool roundtrips, failed attempts, superseded proposals, "
+            "and tool-returned data (placements, net lists, positions — those will be "
+            "re-fetched from tools when needed).\n\n"
+            f"<session>\n{transcript}\n</session>"
+        )
+
+        # ---- Call LLM for the summary (no tools, short timeout) -------------
+        try:
+            provider = self._settings.llm_provider
+            compaction_history = [{"role": "user", "content": compact_prompt}]
+            # Temporarily swap history for the compaction call
+            original_history = self._history
+            self._history = compaction_history
+            if provider == "anthropic":
+                resp = self._call_anthropic(
+                    "You are a helpful assistant that summarizes conversations concisely.",
+                    [],
+                )
+            else:
+                resp = self._call_openai(
+                    "You are a helpful assistant that summarizes conversations concisely.",
+                    [],
+                )
+            self._history = original_history
+        except Exception as e:
+            self._history = original_history  # type: ignore[possibly-undefined]
+            log.warning("History compaction failed: %s", e)
+            return False
+
+        if resp.get("error"):
+            log.warning("History compaction LLM error: %s", resp["error"])
+            return False
+
+        summary = resp.get("message", {}).get("content") or ""
+        if not summary:
+            return False
+
+        # ---- Hard-clip summary to target_summary_chars at a word boundary ---
+        if len(summary) > target_summary_chars:
+            clipped = summary[:target_summary_chars]
+            # Walk back to last space to avoid cutting mid-word
+            last_space = clipped.rfind(" ")
+            if last_space > target_summary_chars // 2:
+                clipped = clipped[:last_space]
+            summary = clipped
+
+        # ---- Replace the compactable prefix with the summary message --------
+        summary_msg = {
+            "role": "user",
+            "content": f"[Session summary – earlier context]: {summary}",
+        }
+        self._history = [summary_msg] + self._history[split_idx:]
+        log.debug(
+            "History compacted: prefix of %d messages → 1 summary message (%d chars)",
+            len(prefix),
+            len(summary),
+        )
+        return True
+
+    def _maybe_compact(self, system_prompt: str) -> None:
+        """Dedup tool calls then, if the token budget is exceeded, compact history.
+
+        This is the sole history-management entry point; called once per user turn
+        before the LLM is invoked.
+        """
+        self._dedup_tool_calls()
+
+        system_tokens = len(system_prompt) // 4
+        history_tokens = self._estimate_tokens(self._history)
+        used = system_tokens + history_tokens
+        budget = self._context_tokens * self._compact_threshold
+
+        if used <= budget:
+            return  # well within limits, nothing to do
+
+        # Estimate the cost of the recent turns we will always keep
+        i = len(self._history) - 1
+        turns_found = 0
+        split_idx = len(self._history)
+        while i >= 0 and turns_found < self._keep_recent_turns:
+            if self._history[i].get("role") == "assistant":
+                split_idx = i
+                turns_found += 1
+            i -= 1
+        # Walk back to include the user message that opened the oldest recent turn
+        j = split_idx - 1
+        while j >= 0 and self._history[j].get("role") != "user":
+            j -= 1
+        if j >= 0:
+            split_idx = j
+        recent_tokens = self._estimate_tokens(self._history[split_idx:])
+
+        target_post_compact = self._context_tokens * self._compact_target_threshold
+        target_summary_chars = max(200, int((target_post_compact - system_tokens - recent_tokens) * 4))
+
+        self._compact_history(system_prompt, target_summary_chars)
+
     def run(
         self,
         user_message: str,
@@ -507,7 +702,7 @@ class LLMClient:
         """
         system = build_system_prompt(context_block)
         self._history.append({"role": "user", "content": user_message})
-        self._trim_history()
+        self._maybe_compact(system)
 
         tools = self._fetch_tool_definitions()
 

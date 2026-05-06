@@ -21,7 +21,7 @@ if _WX_AVAILABLE:
         _PROVIDERS = ["openai", "anthropic", "custom"]
 
         def __init__(self, parent, settings) -> None:
-            super().__init__(parent, title="AI Assistant Settings", size=(420, 360))
+            super().__init__(parent, title="AI Assistant Settings", size=(480, 600))
             self._settings = settings
             self._build_ui()
 
@@ -69,6 +69,29 @@ if _WX_AVAILABLE:
             self._show_tool_log.SetValue(self._settings.show_tool_log)
             grid.Add(self._show_tool_log, 1)
 
+            # Context window management
+            grid.Add(wx.StaticText(self, label="Context window (tokens):"), 0, wx.ALIGN_CENTER_VERTICAL)
+            self._context_tokens = wx.SpinCtrl(self, min=1000, max=2_000_000,
+                                               initial=self._settings.llm_context_tokens)
+            grid.Add(self._context_tokens, 1, wx.EXPAND)
+
+            grid.Add(wx.StaticText(self, label="Compaction threshold (0–1):"), 0, wx.ALIGN_CENTER_VERTICAL)
+            self._compact_threshold = wx.SpinCtrlDouble(self, min=0.1, max=0.95, inc=0.05,
+                                                        initial=self._settings.llm_compact_threshold)
+            self._compact_threshold.SetDigits(2)
+            grid.Add(self._compact_threshold, 1, wx.EXPAND)
+
+            grid.Add(wx.StaticText(self, label="Compaction target (0–1):"), 0, wx.ALIGN_CENTER_VERTICAL)
+            self._compact_target = wx.SpinCtrlDouble(self, min=0.05, max=0.90, inc=0.05,
+                                                     initial=self._settings.llm_compact_target_threshold)
+            self._compact_target.SetDigits(2)
+            grid.Add(self._compact_target, 1, wx.EXPAND)
+
+            grid.Add(wx.StaticText(self, label="Recent turns to keep:"), 0, wx.ALIGN_CENTER_VERTICAL)
+            self._keep_recent_turns = wx.SpinCtrl(self, min=1, max=20,
+                                                  initial=self._settings.llm_keep_recent_turns)
+            grid.Add(self._keep_recent_turns, 1, wx.EXPAND)
+
             vbox.Add(grid, 1, wx.ALL | wx.EXPAND, 10)
 
             # Buttons
@@ -78,8 +101,22 @@ if _WX_AVAILABLE:
             self.SetSizer(vbox)
             self.Layout()
 
-        def apply_to(self, settings) -> None:
-            """Write dialog values back to settings object."""
+        def apply_to(self, settings) -> bool:
+            """Write dialog values back to settings object.
+
+            Returns False (and shows an error) if validation fails.
+            """
+            compact_threshold = self._compact_threshold.GetValue()
+            compact_target = self._compact_target.GetValue()
+            if compact_target >= compact_threshold:
+                wx.MessageBox(
+                    "Compaction target must be strictly less than compaction threshold.\n"
+                    f"(target={compact_target:.2f}, threshold={compact_threshold:.2f})",
+                    "Invalid Settings",
+                    wx.OK | wx.ICON_ERROR,
+                    self,
+                )
+                return False
             settings.llm_provider = self._PROVIDERS[self._provider.GetSelection()]
             settings.llm_api_key = self._api_key.GetValue().strip()
             settings.llm_model = self._model.GetValue().strip()
@@ -87,6 +124,11 @@ if _WX_AVAILABLE:
             settings.python_executable = self._python.GetValue().strip()
             settings.server_port = self._port.GetValue()
             settings.show_tool_log = self._show_tool_log.GetValue()
+            settings.llm_context_tokens = self._context_tokens.GetValue()
+            settings.llm_compact_threshold = compact_threshold
+            settings.llm_compact_target_threshold = compact_target
+            settings.llm_keep_recent_turns = self._keep_recent_turns.GetValue()
+            return True
 
 else:
     class SettingsDialog:  # type: ignore[no-redef]
@@ -96,8 +138,8 @@ else:
         def ShowModal(self):
             return 0
 
-        def apply_to(self, settings) -> None:
-            pass
+        def apply_to(self, settings) -> bool:
+            return True
 
         def Destroy(self) -> None:
             pass

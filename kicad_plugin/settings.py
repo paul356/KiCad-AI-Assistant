@@ -45,6 +45,12 @@ class PluginSettings:
     # UI preferences
     show_tool_log: bool = True            # show the tool-call log by default
 
+    # Context window management
+    llm_context_tokens: int = 128_000        # total context window size in tokens
+    llm_compact_threshold: float = 0.70      # trigger compaction when estimated usage exceeds this fraction
+    llm_compact_target_threshold: float = 0.49  # post-compaction target fraction (must be < llm_compact_threshold)
+    llm_keep_recent_turns: int = 4           # number of latest complete assistant turns to preserve verbatim
+
     # Internal — not shown in settings UI
     config_dir: str = field(default_factory=_default_config_dir, repr=False)
 

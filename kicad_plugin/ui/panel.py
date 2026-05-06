@@ -156,7 +156,6 @@ if _WX_AVAILABLE:
             menu_bar = wx.MenuBar()
             m = wx.Menu()
             m.Append(wx.ID_PREFERENCES, "&Settings\tCtrl+,")
-            m.Append(wx.ID_CLEAR, "Clear Conversation")
             self._menu_new_session_id = wx.NewIdRef()
             self._menu_load_session_id = wx.NewIdRef()
             m.AppendSeparator()
@@ -172,7 +171,6 @@ if _WX_AVAILABLE:
             self._send_btn.Bind(wx.EVT_BUTTON, self._on_send)
             self._input.Bind(wx.EVT_TEXT_ENTER, self._on_send)
             self.Bind(wx.EVT_MENU, self._on_settings, id=wx.ID_PREFERENCES)
-            self.Bind(wx.EVT_MENU, self._on_clear, id=wx.ID_CLEAR)
             self.Bind(wx.EVT_MENU, self._on_new_session, id=self._menu_new_session_id)
             self.Bind(wx.EVT_MENU, self._on_load_session, id=self._menu_load_session_id)
             self.Bind(wx.EVT_MENU, self._on_restart, id=self._menu_restart_id)
@@ -491,8 +489,8 @@ if _WX_AVAILABLE:
             from .settings_dialog import SettingsDialog
             dlg = SettingsDialog(self, self._settings)
             if dlg.ShowModal() == wx.ID_OK:
-                dlg.apply_to(self._settings)
-                self._settings.save()
+                if dlg.apply_to(self._settings):
+                    self._settings.save()
             dlg.Destroy()
 
         # ------------------------------------------------------------------ #
