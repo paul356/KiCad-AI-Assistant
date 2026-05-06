@@ -372,29 +372,85 @@ def register_symbol_tools(mcp: FastMCP) -> None:
             return {"success": False, "error": str(e)}
 
     @mcp.tool()
-    async def list_symbol_libraries(ctx: Context | None = None) -> dict[str, Any]:
+    async def list_symbol_libraries(
+        table: str | None = None,
+        limit: int = 200,
+        offset: int = 0,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
         """
-        List all KiCad symbol libraries currently in the index.
+        List KiCad symbol libraries from the index.
 
-        Returns library names, file paths, symbol counts, and KiCad version.
-        Run sync_symbol_index first if the list is empty.
+        **Always prefer** ``search_symbols`` when looking for a specific
+        component — it searches names, descriptions, and keywords across all
+        libraries in one call and is far more token-efficient.
+
+        Use this tool only to **browse** the library tree:
+
+        - No arguments → returns a compact list of *table* names (the
+          top-level groupings such as ``"Device"``, ``"Regulator_Linear"``,
+          ``"power"``) with aggregated symbol counts.  Typically ~200 entries.
+        - ``table=<name>`` → returns individual libraries inside that table
+          (e.g. ``table="Device"`` lists ``"Device/R"``, ``"Device/C"``, …).
+          Use ``limit`` and ``offset`` to page through large tables.
+
+        Args:
+            table:  Table name to drill into (e.g. ``"Regulator_Linear"``).
+                    Omit to get the top-level table summary.
+            limit:  Maximum entries to return (default 200, max 500).
+            offset: 0-based entry offset for pagination (default 0).
         """
         try:
+            limit = min(max(1, limit), 500)
+            offset = max(0, offset)
             mgr = _get_index_manager()
             libraries = mgr.get_all_libraries()
-            return {
-                "success": True,
-                "count": len(libraries),
-                "libraries": [
-                    {
-                        "name": lib.library_name,
-                        "path": lib.file_path,
-                        "symbol_count": lib.symbol_count,
-                        "kicad_version": lib.kicad_version,
-                    }
-                    for lib in libraries
-                ],
-            }
+
+            if table is None:
+                # Aggregate into table-level summaries.
+                table_counts: dict[str, int] = {}
+                for lib in libraries:
+                    tbl = lib.library_name.split("/")[0]
+                    table_counts[tbl] = table_counts.get(tbl, 0) + lib.symbol_count
+                tables_sorted = sorted(table_counts.items())
+                page = tables_sorted[offset: offset + limit]
+                return {
+                    "success": True,
+                    "mode": "tables",
+                    "total": len(tables_sorted),
+                    "offset": offset,
+                    "limit": limit,
+                    "truncated": (offset + limit) < len(tables_sorted),
+                    "tables": [
+                        {"name": t, "symbol_count": c} for t, c in page
+                    ],
+                }
+            else:
+                # Filter to the requested table.
+                prefix = table + "/"
+                # Support both symdir style ("Device/R") and flat style ("Device")
+                matching = [
+                    lib for lib in libraries
+                    if lib.library_name.startswith(prefix)
+                    or lib.library_name == table
+                ]
+                page = matching[offset: offset + limit]
+                return {
+                    "success": True,
+                    "mode": "libraries",
+                    "table": table,
+                    "total": len(matching),
+                    "offset": offset,
+                    "limit": limit,
+                    "truncated": (offset + limit) < len(matching),
+                    "libraries": [
+                        {
+                            "name": lib.library_name,
+                            "symbol_count": lib.symbol_count,
+                        }
+                        for lib in page
+                    ],
+                }
         except Exception as e:
             log.error(f"list_symbol_libraries failed: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
@@ -402,19 +458,31 @@ def register_symbol_tools(mcp: FastMCP) -> None:
     @mcp.tool()
     async def get_library_symbols(
         library_name: str,
+        limit: int = 50,
+        offset: int = 0,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """
-        Return all symbols in a specific KiCad symbol library.
+        Return symbols in a specific KiCad symbol library.
+
+        **Prefer** ``search_symbols`` when looking for a specific component.
+        Use this tool only to enumerate the contents of a *known* library.
+
+        Results are ordered by position in the library file.  Use ``limit``
+        and ``offset`` to page through large libraries.
 
         Args:
-            library_name: The library name returned by ``search_symbols`` or
+            library_name: The library name as returned by ``search_symbols`` or
                 ``list_symbol_libraries`` in the ``library_name`` field.  For
                 KiCad 10 symdir-style libraries this is
                 ``"TableName/FileBaseName"`` (e.g. ``"Device/R_Small"``), not
                 just the table name (e.g. not ``"Device"``).
+            limit:  Maximum symbols to return (default 50, max 200).
+            offset: 0-based symbol offset for pagination (default 0).
         """
         try:
+            limit = min(max(1, limit), 200)
+            offset = max(0, offset)
             mgr = _get_index_manager()
             symbols = mgr.get_library_symbols(library_name)
             if not symbols:
@@ -422,10 +490,14 @@ def register_symbol_tools(mcp: FastMCP) -> None:
                     "success": False,
                     "error": f"Library '{library_name}' not found or has no indexed symbols.",
                 }
+            page = symbols[offset: offset + limit]
             return {
                 "success": True,
                 "library_name": library_name,
-                "count": len(symbols),
+                "total": len(symbols),
+                "offset": offset,
+                "limit": limit,
+                "truncated": (offset + limit) < len(symbols),
                 "symbols": [
                     {
                         "name": s.symbol_name,
@@ -433,7 +505,7 @@ def register_symbol_tools(mcp: FastMCP) -> None:
                         "keywords": s.keywords,
                         "pin_count": s.pin_count,
                     }
-                    for s in symbols
+                    for s in page
                 ],
             }
         except Exception as e:
