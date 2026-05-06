@@ -1046,7 +1046,8 @@ if _WX_AVAILABLE:
                 parts.append(_msg_block("AI", self._C_AI_HEX, "#EBF7F2", body, tools_html))
 
             if self._use_webview:
-                # Capture scroll position before replacing the page
+                # Read the current scroll position BEFORE SetPage (old page still loaded).
+                # RunScript is synchronous on the current page so values are reliable.
                 _ok_y, _sy = self._conv_view.RunScript("String(window.scrollY)")
                 _ok_h, _sh = self._conv_view.RunScript(
                     "String(document.body.scrollHeight - window.innerHeight)"
@@ -1060,17 +1061,16 @@ if _WX_AVAILABLE:
                     _at_bottom = True
                     _sy_val = 0
 
-                parts.append("</body></html>")
-                html = "".join(parts)
-                self._conv_view.SetPage(html, "")
+                # Embed the scroll command as an inline <script> at the end of <body>
+                # so it executes synchronously as part of the page load, avoiding the
+                # async race condition that makes a post-SetPage RunScript ineffective.
                 if _at_bottom:
-                    self._conv_view.RunScript(
-                        "window.scrollTo(0, document.body.scrollHeight);"
-                    )
+                    _scroll_js = "window.scrollTo(0, document.body.scrollHeight);"
                 else:
-                    self._conv_view.RunScript(
-                        f"window.scrollTo(0, {_sy_val});"
-                    )
+                    _scroll_js = f"window.scrollTo(0, {_sy_val});"
+                parts.append(f"<script>{_scroll_js}</script>")
+                parts.append("</body></html>")
+                self._conv_view.SetPage("".join(parts), "")
             else:
                 # Capture scroll position before replacing the page
                 _max = self._conv_view.GetScrollRange(wx.VERTICAL)
@@ -1079,12 +1079,16 @@ if _WX_AVAILABLE:
 
                 parts.append("</body></html>")
                 self._conv_view.SetPage("".join(parts))
-                _new_max = self._conv_view.GetScrollRange(wx.VERTICAL)
+                # Defer scroll until after layout is complete
                 if _at_bottom:
-                    self._conv_view.Scroll(0, _new_max)
+                    wx.CallAfter(
+                        self._conv_view.Scroll, 0,
+                        self._conv_view.GetScrollRange(wx.VERTICAL)
+                    )
                 else:
+                    _new_max = self._conv_view.GetScrollRange(wx.VERTICAL)
                     _new_pos = int(_pos * _new_max / _max) if _max > 0 else 0
-                    self._conv_view.Scroll(0, _new_pos)
+                    wx.CallAfter(self._conv_view.Scroll, 0, _new_pos)
 
         @staticmethod
         def _json_dump_safe(value: Any, *, indent: int | None = None) -> str:
