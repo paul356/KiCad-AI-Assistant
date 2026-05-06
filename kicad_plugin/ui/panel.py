@@ -687,9 +687,16 @@ if _WX_AVAILABLE:
                 self._llm_client.reset()
 
         def _on_close(self, event) -> None:
-            # Always tear down. Hiding instead (to keep the server warm)
-            # leaves a top-level wx.Frame alive that prevents KiCad from
-            # exiting cleanly when the user closes KiCad first.
+            if event.CanVeto():
+                # User closed the plugin panel – hide it so the backend stays
+                # warm and KiCad is unaffected. The suicide watchdog timer
+                # (_on_suicide_check) will force-close us when KiCad itself
+                # exits, triggering the real teardown path below.
+                event.Veto()
+                self.Hide()
+                return
+            # Force-close (e.g. from _on_suicide_check when KiCad has exited)
+            # – tear down completely.
             self._autosave_session()
             self._server_mgr.stop()
             self.Destroy()
