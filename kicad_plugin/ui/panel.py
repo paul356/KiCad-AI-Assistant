@@ -821,6 +821,27 @@ if _WX_AVAILABLE:
             while i < len(lines):
                 line = lines[i]
 
+                # Fenced code block  ``` … ```
+                if re.match(r"^```", line):
+                    if in_list:
+                        out.append("</ul>")
+                        in_list = False
+                    i += 1
+                    code_lines: list[str] = []
+                    while i < len(lines) and not re.match(r"^```", lines[i]):
+                        code_lines.append(_h.escape(lines[i]))
+                        i += 1
+                    i += 1  # skip closing ```
+                    code_content = "\n".join(code_lines)
+                    out.append(
+                        '<pre style="font-family:monospace;white-space:pre;'
+                        'background:#f4f4f4;padding:8px;border-radius:4px;'
+                        'overflow-x:auto;font-size:9pt">'
+                        + code_content
+                        + "</pre>"
+                    )
+                    continue
+
                 # Pipe table: header row followed by a separator row  |---|---|
                 if "|" in line and i + 1 < len(lines) and re.match(r"^\s*\|?[\s:|-]+\|", lines[i + 1]):
                     if in_list:
@@ -902,6 +923,12 @@ if _WX_AVAILABLE:
                     "word-break:break-all}"
                     ".tool-ok{border-left-color:#4caf50}"
                     ".tool-err{border-left-color:#f44336}"
+                    "pre{font-family:monospace;white-space:pre;background:#f4f4f4;"
+                    "padding:8px;border-radius:4px;overflow-x:auto;font-size:9pt;"
+                    "line-height:1.4}"
+                    "pre code{background:none;padding:0;border-radius:0;font-size:inherit}"
+                    "code{font-family:monospace;background:#f0f0f0;"
+                    "padding:1px 3px;border-radius:2px}"
                     "</style></head>"
                     f"<body>"
                 ]
