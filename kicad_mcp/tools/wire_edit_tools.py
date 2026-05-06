@@ -14,7 +14,6 @@ import skip
 from fastmcp import Context
 from fastmcp import FastMCP
 
-from kicad_mcp.utils.kipy_reload import try_reload_schematic_in_kicad as _reload_sch
 from kicad_mcp.utils.skip_helpers import sym_pin_world_coords
 
 log = logging.getLogger(__name__)
@@ -832,7 +831,6 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
 
             shutil.copy(schematic_path, schematic_path + ".bak")
             sch.write(schematic_path)
-            _reload_sch(schematic_path)
         except Exception as exc:
             return {"error": f"Failed to add wire: {exc}"}
 
@@ -939,7 +937,6 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
 
             shutil.copy(schematic_path, schematic_path + ".bak")
             sch.write(schematic_path)
-            _reload_sch(schematic_path)
         except Exception as exc:
             return {"error": f"Failed to add wire: {exc}"}
 
@@ -1061,7 +1058,6 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
 
             shutil.copy(schematic_path, schematic_path + ".bak")
             sch.write(schematic_path)
-            _reload_sch(schematic_path)
         except Exception as exc:
             return {"error": f"Failed to delete wire: {exc}"}
 
@@ -1116,7 +1112,6 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
 
             shutil.copy(schematic_path, schematic_path + ".bak")
             sch.write(schematic_path)
-            _reload_sch(schematic_path)
         except Exception as exc:
             return {"error": f"Failed to add junction: {exc}"}
 
@@ -1220,7 +1215,6 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
 
             shutil.copy(schematic_path, schematic_path + ".bak")
             sch.write(schematic_path)
-            _reload_sch(schematic_path)
         except Exception as exc:
             return {"error": f"Failed to delete junction: {exc}"}
 

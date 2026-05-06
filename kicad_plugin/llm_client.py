@@ -253,11 +253,11 @@ _PROMPT_SCHEMATIC = """\
   state before making spatial changes. Never invent coordinates.
 - Use the active_schematic path from the context block below as the
   schematic_path argument for every editing tool.
-- Every mutation tool automatically writes a .kicad_sch.bak backup, saves
-  to disk, and attempts to reload the Schematic Editor via the KiCad IPC
-  API. On KiCad 11+ this reloads automatically; on KiCad 10 or if the IPC
-  API is unavailable, the engineer must use **File → Revert** in the
-  Schematic Editor to load the updated file.
+- Every mutation tool automatically writes a .kicad_sch.bak backup and saves
+  to disk. After completing **all** edits in a session, call
+  **reload_kicad(paths=[active_schematic])** once to reload the file in KiCad.
+  Do NOT call reload_kicad after every individual tool call — call it once when
+  done.
 - Report errors clearly. Do not silently retry failed tool calls.
 - If find_free_area returns no candidates and no relative placement is
   appropriate, ASK the engineer instead of guessing a position.\
@@ -339,8 +339,11 @@ _PROMPT_PCB = """\
   Never invent footprint coordinates.
 - Use the active_pcb path from the context block below as the pcb_path
   argument for every PCB editing tool.
-- Every mutation tool automatically writes a .kicad_pcb.bak backup and
-  **reloads the PCB editor in KiCad** — no manual reload is needed.
+- Every mutation tool automatically writes a .kicad_pcb.bak backup and saves
+  to disk. After completing **all** edits in a session, call
+  **reload_kicad(paths=[active_pcb])** once to reload the file in KiCad.
+  Do NOT call reload_kicad after every individual tool call — call it once when
+  done.
 - Report errors clearly. Do not silently retry failed tool calls.
 - Do not overlap footprint courtyards.  Verify clearances with
   get_footprint_bbox / get_board_bounding_box before committing a move.\

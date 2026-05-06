@@ -29,7 +29,6 @@ from kicad_mcp.utils.symbol_geometry import (
 )
 from kicad_mcp.utils.symbol_index_manager import SymbolIndexManager
 from kicad_mcp.utils.symbol_index_reader import SymbolIndexReader
-from kicad_mcp.utils.kipy_reload import try_reload_schematic_in_kicad as _reload_sch
 
 log = logging.getLogger(__name__)
 
@@ -132,6 +131,10 @@ def _do_add_symbol(
         except Exception as exc:
             return {"error": f"Failed to extract lib symbol: {exc}"}
 
+        # Expand (extends ...) symbols into self-contained definitions so that
+        # the injected lib_symbol has full geometry and pin sub-symbols.
+        lib_sym_raw = _resolve_extends_symbol(lib_sym_raw, library_name)
+
         try:
             sch = skip.Schematic(schematic_path)
         except Exception as exc:
@@ -180,7 +183,6 @@ def _do_add_symbol(
         try:
             shutil.copy(schematic_path, schematic_path + ".bak")
             sch.write(schematic_path)
-            _reload_sch(schematic_path)
         except Exception as exc:
             return {"error": f"Failed to save schematic: {exc}"}
 
@@ -599,6 +601,169 @@ def _find_property_by_name(sym: Any, name: str) -> Any | None:
     return None
 
 
+def _get_extends_base_name(lib_sym_raw: list) -> str | None:
+    """Return the base symbol name from an ``(extends ...)`` clause, or ``None``."""
+    for child in lib_sym_raw[2:]:
+        if (
+            isinstance(child, list)
+            and len(child) >= 2
+            and isinstance(child[0], sexpdata.Symbol)
+            and child[0].value() == "extends"
+        ):
+            return str(child[1])
+    return None
+
+
+def _resolve_extends_symbol(lib_sym_raw: list, library_name: str) -> list:
+    """Resolve an ``(extends ...)`` lib symbol into a fully self-contained definition.
+
+    KiCad's ``.kicad_symdir`` format stores variant symbols (e.g.
+    ``AP2112K-3.3``) as thin wrappers that reference a base symbol
+    (e.g. ``AP2204K-1.5``) for all geometry and pin definitions via an
+    ``(extends ...)`` clause.  When such a symbol is injected into a
+    schematic's ``lib_symbols`` block it must be self-contained — there is no
+    external library present at parse time — otherwise tools like ``skip`` that
+    parse the schematic will crash with ``AttributeError`` on the missing
+    sub-symbol children.
+
+    This function:
+
+    1. Detects the ``(extends "BaseName")`` child of *lib_sym_raw*.
+    2. Looks the base symbol up in the index DB (same library table).
+    3. Builds a merged raw list:
+       - Structural attributes (``pin_numbers``, ``pin_names``, etc.) from the
+         base, overridden by any that appear in the extending symbol.
+       - Properties: base as default, extending symbol overrides.
+       - Sub-symbols (``_N_M`` geometry/pin blocks) from the base, with their
+         names re-prefixed to match the extending symbol.
+
+    Returns *lib_sym_raw* unchanged if no ``(extends ...)`` clause is present
+    or if the base symbol cannot be resolved (a warning is logged).
+    """
+    base_name = _get_extends_base_name(lib_sym_raw)
+    if base_name is None:
+        return lib_sym_raw
+
+    extending_name = lib_sym_raw[1]  # e.g. "AP2112K-3.3"
+
+    # For symdir libraries the DB key is "TableName/SymbolFileName".  The base
+    # symbol lives in a sibling file, so replace just the file stem.
+    parts = library_name.split("/", 1)
+    base_lib_name = f"{parts[0]}/{base_name}" if len(parts) >= 2 else library_name
+
+    mgr = _get_index_manager()
+    base_sym_rec = mgr.get_symbol(base_lib_name, base_name)
+    base_lib_rec = mgr.get_library_by_name(base_lib_name)
+
+    if base_sym_rec is None or base_lib_rec is None:
+        log.warning(
+            "extends base symbol %r not found under library %r; "
+            "injecting as-is (schematic may be incomplete)",
+            base_name,
+            base_lib_name,
+        )
+        return lib_sym_raw
+
+    try:
+        base_raw = extract_lib_symbol_raw(
+            base_lib_rec.file_path,
+            base_sym_rec.file_index,
+            base_name,
+            base_lib_rec.mtime,
+            base_lib_rec.file_size,
+        )
+    except Exception as exc:
+        log.warning(
+            "Could not extract base symbol %r: %s; injecting as-is",
+            base_name,
+            exc,
+        )
+        return lib_sym_raw
+
+    base_raw = copy.deepcopy(base_raw)
+
+    # Tags that are not structural config attributes.
+    _META_TAGS = frozenset({"symbol", "property", "extends"})
+
+    # Collect structural attributes and properties from the *extending* symbol.
+    ext_structural: dict[str, list] = {}
+    ext_props: dict[str, list] = {}
+    for child in lib_sym_raw[2:]:
+        if not (
+            isinstance(child, list)
+            and len(child) >= 1
+            and isinstance(child[0], sexpdata.Symbol)
+        ):
+            continue
+        tag = child[0].value()
+        if tag == "extends":
+            continue
+        if tag == "property" and len(child) >= 2:
+            ext_props[child[1]] = child
+        elif tag not in _META_TAGS:
+            ext_structural[tag] = child
+
+    # Build merged symbol.
+    merged: list = [sexpdata.Symbol("symbol"), extending_name]
+
+    # 1. Structural attributes: base as default, extending overrides.
+    seen_structural: set[str] = set()
+    for child in base_raw[2:]:
+        if not (
+            isinstance(child, list)
+            and len(child) >= 1
+            and isinstance(child[0], sexpdata.Symbol)
+        ):
+            continue
+        tag = child[0].value()
+        if tag in _META_TAGS or tag in seen_structural:
+            continue
+        merged.append(copy.deepcopy(ext_structural.get(tag, child)))
+        seen_structural.add(tag)
+    for tag, child in ext_structural.items():
+        if tag not in seen_structural:
+            merged.append(copy.deepcopy(child))
+
+    # 2. Properties: base as default, extending overrides.
+    seen_props: set[str] = set()
+    for child in base_raw[2:]:
+        if not (
+            isinstance(child, list)
+            and len(child) >= 1
+            and isinstance(child[0], sexpdata.Symbol)
+            and child[0].value() == "property"
+            and len(child) >= 2
+        ):
+            continue
+        pname = child[1]
+        if pname in seen_props:
+            continue
+        merged.append(copy.deepcopy(ext_props.get(pname, child)))
+        seen_props.add(pname)
+    for pname, child in ext_props.items():
+        if pname not in seen_props:
+            merged.append(copy.deepcopy(child))
+
+    # 3. Sub-symbols: from base, with names re-prefixed to the extending name.
+    base_prefix = base_name + "_"
+    ext_prefix = extending_name + "_"
+    for child in base_raw[2:]:
+        if not (
+            isinstance(child, list)
+            and len(child) >= 2
+            and isinstance(child[0], sexpdata.Symbol)
+            and child[0].value() == "symbol"
+        ):
+            continue
+        sub_name = child[1]
+        if isinstance(sub_name, str) and sub_name.startswith(base_prefix):
+            sub_copy = copy.deepcopy(child)
+            sub_copy[1] = ext_prefix + sub_name[len(base_prefix):]
+            merged.append(sub_copy)
+
+    return merged
+
+
 def _add_lib_symbol(lib_symbols_wrapper: Any, lib_sym_raw: list, table_name: str) -> None:
     """Inject a lib symbol raw S-expression into a schematic's lib_symbols block.
 
@@ -954,7 +1119,6 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
             try:
                 shutil.copy(schematic_path, schematic_path + ".bak")
                 sch.write(schematic_path)
-                _reload_sch(schematic_path)
             except Exception as exc:
                 return {"error": f"Failed to save schematic: {exc}"}
 
@@ -1080,7 +1244,6 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
             try:
                 shutil.copy(schematic_path, schematic_path + ".bak")
                 sch.write(schematic_path)
-                _reload_sch(schematic_path)
             except Exception as exc:
                 return {"error": f"Failed to save schematic: {exc}"}
 
@@ -1254,7 +1417,6 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
             try:
                 shutil.copy(schematic_path, schematic_path + ".bak")
                 sch.write(schematic_path)
-                _reload_sch(schematic_path)
             except Exception as exc:
                 return {"error": f"Failed to save schematic: {exc}"}
 
@@ -1400,7 +1562,6 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
             try:
                 shutil.copy(schematic_path, schematic_path + ".bak")
                 sch.write(schematic_path)
-                _reload_sch(schematic_path)
             except Exception as exc:
                 return {"error": f"Failed to save schematic: {exc}"}
 
@@ -1508,7 +1669,6 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
 
             shutil.copy(schematic_path, schematic_path + ".bak")
             sch.write(schematic_path)
-            _reload_sch(schematic_path)
         except Exception as exc:
             return {"error": f"Failed to add label: {exc}"}
 
@@ -1669,7 +1829,6 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
                     try:
                         shutil.copy(schematic_path, schematic_path + ".bak")
                         sch.write(schematic_path)
-                        _reload_sch(schematic_path)
                     except Exception as exc:
                         return {"error": f"Failed to save schematic: {exc}"}
 
@@ -1722,7 +1881,6 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
 
             shutil.copy(schematic_path, schematic_path + ".bak")
             sch.write(schematic_path)
-            _reload_sch(schematic_path)
         except Exception as exc:
             return {"error": f"Failed to delete label: {exc}"}
 
