@@ -1046,16 +1046,45 @@ if _WX_AVAILABLE:
                 parts.append(_msg_block("AI", self._C_AI_HEX, "#EBF7F2", body, tools_html))
 
             if self._use_webview:
+                # Capture scroll position before replacing the page
+                _ok_y, _sy = self._conv_view.RunScript("String(window.scrollY)")
+                _ok_h, _sh = self._conv_view.RunScript(
+                    "String(document.body.scrollHeight - window.innerHeight)"
+                )
+                try:
+                    _sy_val = int(float(_sy)) if _ok_y else 0
+                    _sh_val = int(float(_sh)) if _ok_h else 0
+                    # Consider "at bottom" when within 50 px or page not yet scrollable
+                    _at_bottom = _sh_val < 50 or (_sh_val - _sy_val) < 50
+                except (ValueError, TypeError):
+                    _at_bottom = True
+                    _sy_val = 0
+
                 parts.append("</body></html>")
                 html = "".join(parts)
                 self._conv_view.SetPage(html, "")
-                self._conv_view.RunScript(
-                    "window.scrollTo(0, document.body.scrollHeight);"
-                )
+                if _at_bottom:
+                    self._conv_view.RunScript(
+                        "window.scrollTo(0, document.body.scrollHeight);"
+                    )
+                else:
+                    self._conv_view.RunScript(
+                        f"window.scrollTo(0, {_sy_val});"
+                    )
             else:
+                # Capture scroll position before replacing the page
+                _max = self._conv_view.GetScrollRange(wx.VERTICAL)
+                _pos = self._conv_view.GetScrollPos(wx.VERTICAL)
+                _at_bottom = _max == 0 or (_max - _pos) < 3
+
                 parts.append("</body></html>")
                 self._conv_view.SetPage("".join(parts))
-                self._conv_view.Scroll(0, self._conv_view.GetScrollRange(wx.VERTICAL))
+                _new_max = self._conv_view.GetScrollRange(wx.VERTICAL)
+                if _at_bottom:
+                    self._conv_view.Scroll(0, _new_max)
+                else:
+                    _new_pos = int(_pos * _new_max / _max) if _max > 0 else 0
+                    self._conv_view.Scroll(0, _new_pos)
 
         @staticmethod
         def _json_dump_safe(value: Any, *, indent: int | None = None) -> str:
