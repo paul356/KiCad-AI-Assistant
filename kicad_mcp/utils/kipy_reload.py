@@ -11,6 +11,38 @@ import os
 log = logging.getLogger(__name__)
 
 
+def _find_kicad_socket() -> str:
+    """Return the IPC socket URL for the running KiCad instance.
+
+    Mirrors the logic in kipy_tools._find_kicad_socket — kept local to avoid
+    a cross-package import between utils and tools.
+    """
+    import glob
+    import platform
+
+    env = os.environ.get("KICAD_API_SOCKET")
+    if env:
+        return env
+
+    if platform.system() == "Windows":
+        from tempfile import gettempdir
+        return f"ipc://{gettempdir()}\\kicad\\api.sock"
+
+    home = os.environ.get("HOME", "")
+    candidate_dirs = []
+    if home:
+        candidate_dirs.append(f"{home}/.var/app/org.kicad.KiCad/cache/tmp/kicad")
+    candidate_dirs.append("/tmp/kicad")
+
+    for sock_dir in candidate_dirs:
+        matches = glob.glob(os.path.join(sock_dir, "api*.sock"))
+        if matches:
+            newest = max(matches, key=os.path.getmtime)
+            return f"ipc://{newest}"
+
+    return "ipc:///tmp/kicad/api.sock"
+
+
 def try_reload_pcb_in_kicad(pcb_path: str) -> None:
     """Silently revert the active board in KiCad to the version just saved.
 
@@ -22,7 +54,7 @@ def try_reload_pcb_in_kicad(pcb_path: str) -> None:
     try:
         import kipy  # lazy import — kipy is optional at server start-up
 
-        kicad = kipy.KiCad()
+        kicad = kipy.KiCad(socket_path=_find_kicad_socket())
         board = kicad.get_board()
         if board is None:
             return
@@ -68,7 +100,7 @@ def try_reload_schematic_in_kicad(sch_path: str) -> bool:
         from kipy.proto.common.types import DocumentType  # noqa: PLC0415
         from kipy.schematic import Schematic  # noqa: PLC0415
 
-        kicad = kipy.KiCad()
+        kicad = kipy.KiCad(socket_path=_find_kicad_socket())
         docs = kicad.get_open_documents(DocumentType.DOCTYPE_SCHEMATIC)
         if not docs:
             log.debug("No open schematic documents in KiCad; skipping reload")

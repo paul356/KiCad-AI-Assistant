@@ -283,19 +283,25 @@ if _WX_AVAILABLE:
                 socket_exists = True
                 checked_path = f"{gettempdir()}\\kicad\\api.sock"
             else:
-                # Try flatpak path first, then standard path
+                # Glob for api*.sock (covers api.sock and api-<pid>.sock).
+                # Try flatpak directory first, then standard /tmp/kicad.
                 home = os.environ.get("HOME", "")
-                flatpak_path = f"{home}/.var/app/org.kicad.KiCad/cache/tmp/kicad/api.sock"
-                standard_path = "/tmp/kicad/api.sock"
-                if home and os.path.exists(flatpak_path):
-                    socket_exists = True
-                    checked_path = flatpak_path
-                elif os.path.exists(standard_path):
-                    socket_exists = True
-                    checked_path = standard_path
-                else:
-                    socket_exists = False
-                    checked_path = standard_path
+                candidate_dirs = []
+                if home:
+                    candidate_dirs.append(f"{home}/.var/app/org.kicad.KiCad/cache/tmp/kicad")
+                candidate_dirs.append("/tmp/kicad")
+
+                socket_exists = False
+                checked_path = "/tmp/kicad/api.sock"  # fallback for error message
+                for sock_dir in candidate_dirs:
+                    matches = glob.glob(os.path.join(sock_dir, "api*.sock"))
+                    if matches:
+                        # Report the newest socket found
+                        checked_path = max(matches, key=os.path.getmtime)
+                        socket_exists = True
+                        break
+                if not socket_exists:
+                    checked_path = "/tmp/kicad/api.sock"
 
             if not socket_exists:
                 self._conv_entries.append({
