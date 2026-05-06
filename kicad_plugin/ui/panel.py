@@ -3,9 +3,7 @@ AssistantPanel: the main wx.Frame for the KiCad AI Assistant plugin.
 
 Layout:
   ┌──────────────────────────────────────────────────────────┐
-  │  Conversation log (wx.TextCtrl, read-only, scrollable)   │
-  ├──────────────────────────────────────────────────────────┤
-  │  Tool log (collapsible wx.TextCtrl)                      │
+  │  Conversation log (scrollable, tool calls folded inline) │
   ├──────────────────────────────────────────────────────────┤
   │  [input field]                             [Send]        │
   └──────────────────────────────────────────────────────────┘
@@ -14,6 +12,7 @@ from __future__ import annotations
 
 import collections
 import logging
+import os
 import threading
 from typing import Any, Optional
 
@@ -25,6 +24,16 @@ try:
     _WX_AVAILABLE = True
 except ImportError:
     _WX_AVAILABLE = False
+
+# Try to use WebView (HTML5 + <details>/<summary> for folding).
+# Falls back to wx.html.HtmlWindow when unavailable.
+_WEBVIEW_AVAILABLE = False
+if _WX_AVAILABLE:
+    try:
+        import wx.html2 as _wx_html2
+        _WEBVIEW_AVAILABLE = True
+    except ImportError:
+        pass
 
 
 if _WX_AVAILABLE:
@@ -48,10 +57,22 @@ if _WX_AVAILABLE:
             self._tool_calls_made: bool = False
             # Set to True when any tool modifies a .kicad_sch file this turn
             self._schematic_edited: bool = False
-            # Structured conversation history for HTML rendering
+            # Tool calls buffered during the current AI turn; flushed into the
+            # AI conv_entry when the turn finishes.
+            self._pending_tool_calls: list[dict] = []
+            # Structured conversation history for HTML rendering.
+            # Each entry is one of:
+            #   {"type": "user",   "text": str}
+            #   {"type": "ai",     "text": str,
+            #                      "tools": [{"name":str,"args":dict,"result":dict},...]}
+            #   {"type": "status", "text": str, "color_hex": str}
             self._conv_entries: list[dict] = []
             # Accumulates streamed AI text before it is finalised as an entry
             self._pending_ai_text: str = ""
+            # Basename of the current session file; None means no file yet.
+            # _save_session_to_disk overwrites this file when set, or creates
+            # a new timestamped one otherwise.
+            self._current_session_file: Optional[str] = None
 
             self._build_ui()
             self._start_server()
@@ -84,68 +105,28 @@ if _WX_AVAILABLE:
             panel = wx.Panel(self)
             vbox = wx.BoxSizer(wx.VERTICAL)
 
-            # ---- Splitter: conversation (top) / tool log (bottom) ----
-            self._splitter = wx.SplitterWindow(
-                panel, style=wx.SP_LIVE_UPDATE | wx.SP_3DSASH,
-            )
-            self._splitter.SetMinimumPaneSize(60)
-            self._splitter.SetSashGravity(0.7)  # extra space goes to conversation
+            # ---- Conversation view (WebView when available, HtmlWindow fallback) ----
+            self._use_webview = False
+            if _WEBVIEW_AVAILABLE:
+                try:
+                    self._conv_view = _wx_html2.WebView.New(
+                        panel, style=wx.BORDER_SUNKEN,
+                    )
+                    self._use_webview = True
+                except Exception:
+                    pass
 
-            # Conversation pane.
-            self._conv_html = wx.html.HtmlWindow(
-                self._splitter, style=wx.BORDER_SUNKEN,
-            )
-            self._conv_html.SetMinSize((-1, 120))
-            self._conv_html.SetBackgroundColour(self._BG_CONV)
-            self._conv_html.SetPage(f'<html><body bgcolor="{self._BG_CONV_HEX}"></body></html>')
+            if not self._use_webview:
+                self._conv_view = wx.html.HtmlWindow(
+                    panel, style=wx.BORDER_SUNKEN,
+                )
+                self._conv_view.SetBackgroundColour(self._BG_CONV)
+                self._conv_view.SetPage(
+                    f'<html><body bgcolor="{self._BG_CONV_HEX}"></body></html>'
+                )
 
-            # Tool log pane: header row (label + show/hide toggle) + scrolled list.
-            self._tool_log_panel = wx.Panel(self._splitter)
-            tlp_vbox = wx.BoxSizer(wx.VERTICAL)
-
-            tlp_header = wx.BoxSizer(wx.HORIZONTAL)
-            tlp_header.Add(
-                wx.StaticText(self._tool_log_panel, label="Tool Log"),
-                1, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 2,
-            )
-            self._tool_log_toggle_btn = wx.Button(
-                self._tool_log_panel, label="Hide", style=wx.BU_EXACTFIT,
-            )
-            tlp_header.Add(self._tool_log_toggle_btn, 0, wx.ALIGN_CENTER_VERTICAL)
-            tlp_vbox.Add(tlp_header, 0, wx.EXPAND | wx.BOTTOM, 2)
-
-            # Scrolled window that holds one wx.CollapsiblePane per tool call.
-            self._tool_log_scroll = wx.ScrolledWindow(
-                self._tool_log_panel, style=wx.BORDER_SIMPLE | wx.VSCROLL,
-            )
-            self._tool_log_scroll.SetBackgroundColour(self._BG_TOOL)
-            self._tool_log_scroll.SetScrollRate(0, 16)
-            self._tool_log_entries_sizer = wx.BoxSizer(wx.VERTICAL)
-            self._tool_log_scroll.SetSizer(self._tool_log_entries_sizer)
-            tlp_vbox.Add(self._tool_log_scroll, 1, wx.EXPAND)
-
-            self._tool_log_panel.SetSizer(tlp_vbox)
-
-            # Cached monospace font used by per-call expanded bodies.
-            self._tool_log_font = wx.Font(
-                9, wx.FONTFAMILY_TELETYPE, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_NORMAL,
-            )
-
-            # Initial split: conversation gets ~70%, tool log ~30%.
-            self._splitter.SplitHorizontally(
-                self._conv_html, self._tool_log_panel, -200,
-            )
-            vbox.Add(self._splitter, 1, wx.ALL | wx.EXPAND, 4)
-
-            if not self._settings.show_tool_log:
-                # Start with tool log hidden but remember the sash for restore.
-                self._tool_log_saved_sash = 200
-                self._splitter.Unsplit(self._tool_log_panel)
-                self._tool_log_toggle_btn.SetLabel("Show")
-            else:
-                self._tool_log_saved_sash = 200
-
-            self._tool_log_toggle_btn.Bind(wx.EVT_BUTTON, self._on_toggle_tool_log)
+            self._conv_view.SetMinSize((-1, 120))
+            vbox.Add(self._conv_view, 1, wx.ALL | wx.EXPAND, 4)
 
             # ---- Input row ----
             hbox = wx.BoxSizer(wx.HORIZONTAL)
@@ -174,6 +155,12 @@ if _WX_AVAILABLE:
             m = wx.Menu()
             m.Append(wx.ID_PREFERENCES, "&Settings\tCtrl+,")
             m.Append(wx.ID_CLEAR, "Clear Conversation")
+            self._menu_new_session_id = wx.NewIdRef()
+            self._menu_load_session_id = wx.NewIdRef()
+            m.AppendSeparator()
+            m.Append(self._menu_new_session_id, "New Session")
+            m.Append(self._menu_load_session_id, "Load Session…")
+            m.AppendSeparator()
             self._menu_restart_id = wx.NewIdRef()
             m.Append(self._menu_restart_id, "Restart Backend")
             menu_bar.Append(m, "&Options")
@@ -184,6 +171,8 @@ if _WX_AVAILABLE:
             self._input.Bind(wx.EVT_TEXT_ENTER, self._on_send)
             self.Bind(wx.EVT_MENU, self._on_settings, id=wx.ID_PREFERENCES)
             self.Bind(wx.EVT_MENU, self._on_clear, id=wx.ID_CLEAR)
+            self.Bind(wx.EVT_MENU, self._on_new_session, id=self._menu_new_session_id)
+            self.Bind(wx.EVT_MENU, self._on_load_session, id=self._menu_load_session_id)
             self.Bind(wx.EVT_MENU, self._on_restart, id=self._menu_restart_id)
             self.Bind(wx.EVT_CLOSE, self._on_close)
             self.Bind(wx.EVT_WINDOW_DESTROY, self._on_destroy)
@@ -229,6 +218,7 @@ if _WX_AVAILABLE:
         def _init_llm_client(self) -> None:
             from ..llm_client import LLMClient
             self._llm_client = LLMClient(self._settings, self._server_mgr.base_url)
+            self._autoload_session()
 
         # ------------------------------------------------------------------ #
         # KiCad IPC API status check
@@ -331,6 +321,12 @@ if _WX_AVAILABLE:
                 return
             self._input.Clear()
             self._conv_entries.append({"type": "user", "text": text})
+            # Create the session file on the very first message so current.json
+            # is established before the AI responds.
+            if self._current_session_file is None:
+                err = self._save_session_to_disk()
+                if err:
+                    log.warning("Could not create session file: %s", err)
             self._render_conversation()
             self._busy = True
             self._send_btn.Enable(False)
@@ -342,6 +338,7 @@ if _WX_AVAILABLE:
             # Reset streaming state and start the flush timer
             self._stream_buffer.clear()
             self._pending_ai_text = ""
+            self._pending_tool_calls = []
             self._tool_calls_made = False
             self._schematic_edited = False
             self._stream_timer.Start(50)  # flush every 50 ms → ~20 fps
@@ -375,13 +372,24 @@ if _WX_AVAILABLE:
             self._stream_timer.Stop()
             self._on_stream_flush(None)
 
+            tools_snapshot = list(self._pending_tool_calls)
+            self._pending_tool_calls = []
+
+            # Remove the transient in-progress tool lines; they will be
+            # replaced by the folded tool details inside the AI entry.
+            self._conv_entries = [e for e in self._conv_entries if e["type"] != "tool"]
+
             if not was_streamed:
-                self._conv_entries.append({"type": "ai", "text": reply})
+                self._conv_entries.append({"type": "ai", "text": reply, "tools": tools_snapshot})
                 self._render_conversation()
             else:
                 # Finalise the streamed text as a proper AI entry
                 if self._pending_ai_text:
-                    self._conv_entries.append({"type": "ai", "text": self._pending_ai_text})
+                    self._conv_entries.append({
+                        "type": "ai",
+                        "text": self._pending_ai_text,
+                        "tools": tools_snapshot,
+                    })
                     self._pending_ai_text = ""
                     self._render_conversation()
             self._busy = False
@@ -406,12 +414,16 @@ if _WX_AVAILABLE:
             self._render_conversation()
 
         def _on_tool_call(self, name: str, args: dict, result: Any) -> None:
+            # Buffer for embedding into the AI entry when the turn finishes.
+            self._pending_tool_calls.append({"name": name, "args": args, "result": result})
+            # Show a lightweight in-progress line while the turn is still running
+            # so the user sees activity.  This entry is not persisted — it will
+            # be replaced by the final AI entry in _on_reply.
             ok = result.get("success", True) if isinstance(result, dict) else True
             icon = "✓" if ok else "✗"
             summary = result.get("message", "") if isinstance(result, dict) else str(result)
             self._conv_entries.append({"type": "tool", "text": f"↳ {name}  {icon} {summary}"})
             self._render_conversation()
-            self._append_tool_log(name, args, result)
             self._tool_calls_made = True
             if isinstance(result, dict) and str(result.get("file_modified", "")).endswith(".kicad_sch"):
                 self._schematic_edited = True
@@ -469,33 +481,6 @@ if _WX_AVAILABLE:
                 self._on_server_started(False)
 
 
-        def _on_pane_changed(self, event) -> None:
-            # Per-entry tool-log panes use this; just relayout, don't Fit().
-            self.Layout()
-
-        def _on_toggle_tool_log(self, _event) -> None:
-            """Show/hide the tool-log pane in the splitter."""
-            if self._splitter.IsSplit():
-                # Remember current sash so we can restore it.
-                total = self._splitter.GetClientSize().GetHeight()
-                self._tool_log_saved_sash = max(
-                    60, total - self._splitter.GetSashPosition()
-                )
-                self._splitter.Unsplit(self._tool_log_panel)
-                self._tool_log_toggle_btn.SetLabel("Show")
-                self._settings.show_tool_log = False
-            else:
-                sash = -max(60, getattr(self, "_tool_log_saved_sash", 200))
-                self._splitter.SplitHorizontally(
-                    self._conv_html, self._tool_log_panel, sash,
-                )
-                self._tool_log_toggle_btn.SetLabel("Hide")
-                self._settings.show_tool_log = True
-            try:
-                self._settings.save()
-            except Exception:
-                pass
-
         def _on_settings(self, event) -> None:
             from .settings_dialog import SettingsDialog
             dlg = SettingsDialog(self, self._settings)
@@ -503,6 +488,183 @@ if _WX_AVAILABLE:
                 dlg.apply_to(self._settings)
                 self._settings.save()
             dlg.Destroy()
+
+        # ------------------------------------------------------------------ #
+        # Session persistence
+        # ------------------------------------------------------------------ #
+
+        def _sessions_dir(self) -> str:
+            return os.path.join(self._settings.config_dir, "kicad_ai_sessions")
+
+        def _on_new_session(self, event) -> None:
+            """Save the current session (if non-empty) then clear to start a new one."""
+            if self._busy:
+                wx.MessageBox(
+                    "Please wait for the current request to finish.",
+                    "Busy", wx.OK | wx.ICON_INFORMATION,
+                )
+                return
+
+            has_content = any(e["type"] in ("user", "ai") for e in self._conv_entries)
+            if has_content:
+                err = self._save_session_to_disk()
+                if err:
+                    wx.MessageBox(f"Could not save session:\n{err}", "Error", wx.OK | wx.ICON_ERROR)
+                    return
+
+            # Clear conversation and LLM history for the new session.
+            self._stream_timer.Stop()
+            self._stream_buffer.clear()
+            self._conv_entries.clear()
+            self._pending_tool_calls = []
+            self._pending_ai_text = ""
+            self._current_session_file = None
+            self._render_conversation()
+            if self._llm_client:
+                self._llm_client.reset()
+
+            # Remove current.json so a blank close won't restore the old session.
+            self._remove_current_link()
+
+            self._status_label.SetLabel("✅ New session started" + (
+                " (previous session saved)" if has_content else ""
+            ))
+            self._status_label.SetForegroundColour(wx.Colour(*self._C_OK))
+            self.Layout()
+
+        def _remove_current_link(self) -> None:
+            """Remove current.json (both symlink and plain-text variants)."""
+            link = os.path.join(self._sessions_dir(), "current.json")
+            try:
+                if os.path.lexists(link):  # lexists catches dangling symlinks too
+                    os.remove(link)
+            except OSError as e:
+                log.warning("Could not remove current.json: %s", e)
+
+        def _save_session_to_disk(self) -> Optional[str]:
+            """Write current conv_entries + history to disk and update current.json.
+
+            If ``_current_session_file`` is already set the existing file is
+            overwritten; otherwise a new timestamped file is created and
+            ``_current_session_file`` is updated to track it.
+
+            Returns an error string on failure, None on success.
+            """
+            import datetime
+            import json as _json
+
+            sessions_dir = self._sessions_dir()
+            try:
+                os.makedirs(sessions_dir, exist_ok=True)
+            except OSError as e:
+                return str(e)
+
+            title = next(
+                (e["text"][:60] for e in self._conv_entries if e["type"] == "user"),
+                "session",
+            )
+            if self._current_session_file:
+                filename = self._current_session_file
+            else:
+                ts = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
+                filename = f"session_{ts}.json"
+                self._current_session_file = filename
+            path = os.path.join(sessions_dir, filename)
+            data = {
+                "version": 1,
+                "title": title,
+                "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
+                "conv_entries": self._conv_entries,
+                "llm_history": self._llm_client.get_history() if self._llm_client else [],
+            }
+            try:
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    _json.dump(data, f, indent=2, default=str)
+            except OSError as e:
+                return str(e)
+
+            self._update_current_link(filename)
+            return None
+
+        def _update_current_link(self, filename: str) -> None:
+            """Atomically update current.json to point at *filename* (basename)."""
+            sessions_dir = self._sessions_dir()
+            link = os.path.join(sessions_dir, "current.json")
+            tmp_link = link + ".tmp"
+            try:
+                os.symlink(filename, tmp_link)
+                os.replace(tmp_link, link)
+            except Exception:
+                try:
+                    with open(link, "w", encoding="utf-8") as lf:
+                        lf.write(filename)
+                except Exception:
+                    pass
+
+        def _on_load_session(self, event) -> None:
+            import json as _json
+            import glob
+
+            if self._busy:
+                wx.MessageBox("Please wait for the current request to finish.",
+                              "Busy", wx.OK | wx.ICON_INFORMATION)
+                return
+
+            sessions_dir = self._sessions_dir()
+            files = sorted(
+                glob.glob(os.path.join(sessions_dir, "session_*.json")),
+                reverse=True,
+            )
+            if not files:
+                wx.MessageBox("No saved sessions found.", "Load Session",
+                              wx.OK | wx.ICON_INFORMATION)
+                return
+
+            # Build display labels
+            labels = []
+            for f in files:
+                try:
+                    with open(f, "r", encoding="utf-8") as fh:
+                        d = _json.load(fh)
+                    ts = d.get("timestamp", "")[:19].replace("T", " ")
+                    title = d.get("title", "")[:50]
+                    labels.append(f"{ts}  —  {title}")
+                except Exception:
+                    labels.append(os.path.basename(f))
+
+            dlg = wx.SingleChoiceDialog(
+                self, "Select a session to restore:", "Load Session", labels,
+            )
+            if dlg.ShowModal() != wx.ID_OK:
+                dlg.Destroy()
+                return
+            idx = dlg.GetSelection()
+            dlg.Destroy()
+
+            chosen = files[idx]
+            try:
+                with open(chosen, "r", encoding="utf-8") as fh:
+                    data = _json.load(fh)
+            except (OSError, _json.JSONDecodeError) as e:
+                wx.MessageBox(f"Could not load session:\n{e}", "Error", wx.OK | wx.ICON_ERROR)
+                return
+
+            # Restore state
+            self._stream_timer.Stop()
+            self._stream_buffer.clear()
+            self._pending_ai_text = ""
+            self._pending_tool_calls = []
+            self._conv_entries = data.get("conv_entries", [])
+            if self._llm_client:
+                self._llm_client.set_history(data.get("llm_history", []))
+            # Track which file is now active; point current.json at it.
+            self._current_session_file = os.path.basename(chosen)
+            self._update_current_link(self._current_session_file)
+            self._render_conversation()
+            self._status_label.SetLabel("✅ Session restored")
+            self._status_label.SetForegroundColour(wx.Colour(*self._C_OK))
+            self.Layout()
 
         def _on_clear(self, event) -> None:
             if self._busy:
@@ -514,9 +676,9 @@ if _WX_AVAILABLE:
             self._stream_timer.Stop()
             self._stream_buffer.clear()
             self._conv_entries.clear()
+            self._pending_tool_calls = []
             self._pending_ai_text = ""
             self._render_conversation()
-            self._clear_tool_log()
             if self._llm_client:
                 self._llm_client.reset()
 
@@ -524,6 +686,7 @@ if _WX_AVAILABLE:
             # Always tear down. Hiding instead (to keep the server warm)
             # leaves a top-level wx.Frame alive that prevents KiCad from
             # exiting cleanly when the user closes KiCad first.
+            self._autosave_session()
             self._server_mgr.stop()
             self.Destroy()
 
@@ -542,8 +705,86 @@ if _WX_AVAILABLE:
         def _on_destroy(self, event) -> None:
             """Called when the wx window is actually destroyed (e.g. KiCad shutdown)."""
             if event.GetEventObject() is self:
+                self._autosave_session()
                 self._server_mgr.stop()
             event.Skip()
+
+        # ------------------------------------------------------------------ #
+        # Auto-save / auto-load
+        # ------------------------------------------------------------------ #
+
+        def _autosave_session(self) -> None:
+            """Save a timestamped session file on every close.
+
+            Also atomically updates the ``current.json`` symlink in the sessions
+            directory so the next startup can load it directly without globbing.
+            """
+            # Only save if there is real conversational content — skip sessions
+            # that only contain status/warning notices.
+            if not any(e["type"] in ("user", "ai") for e in self._conv_entries):
+                return
+            err = self._save_session_to_disk()
+            if err:
+                log.warning("Auto-save failed: %s", err)
+
+        def _autoload_session(self) -> None:
+            """Restore the session pointed to by ``current.json`` on startup.
+
+            Only follows current.json — no glob fallback. This ensures "New
+            Session" (which removes current.json) always starts blank.
+            """
+            import json as _json
+
+            sessions_dir = self._sessions_dir()
+            link = os.path.join(sessions_dir, "current.json")
+            path: Optional[str] = None
+
+            if os.path.exists(link):
+                # Resolve: may be a real symlink or the plain-text fallback.
+                if os.path.islink(link):
+                    target = os.readlink(link)
+                    # readlink may return a relative path — resolve against dir.
+                    if not os.path.isabs(target):
+                        target = os.path.join(sessions_dir, target)
+                    if os.path.isfile(target):
+                        path = target
+                else:
+                    # Plain-text pointer written by the symlink fallback.
+                    try:
+                        with open(link, "r", encoding="utf-8") as lf:
+                            fname = lf.read().strip()
+                        candidate = os.path.join(sessions_dir, fname)
+                        if os.path.isfile(candidate):
+                            path = candidate
+                    except OSError:
+                        pass
+
+            if path is None:
+                return  # No current.json and no sessions dir — blank start.
+
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = _json.load(f)
+            except (OSError, _json.JSONDecodeError) as e:
+                log.warning("Auto-load failed: %s", e)
+                return
+
+            conv = data.get("conv_entries", [])
+            history = data.get("llm_history", [])
+            if not conv:
+                return
+
+            self._conv_entries = conv
+            self._current_session_file = os.path.basename(path)
+            if self._llm_client:
+                self._llm_client.set_history(history)
+            self._render_conversation()
+            self._conv_entries.append({
+                "type": "status",
+                "text": "↺ Previous session restored automatically.",
+                "color_hex": self._C_TOOL_HEX,
+            })
+            self._render_conversation()
 
         # ------------------------------------------------------------------ #
         # Rendering helpers
@@ -638,23 +879,105 @@ if _WX_AVAILABLE:
             return "".join(out)
 
         def _render_conversation(self) -> None:
-            """Re-render the full conversation as HTML and update the HtmlWindow."""
+            """Re-render the full conversation as HTML and update the view."""
             import html as _h
+            import json as _json
 
-            parts = [
-                f'<html><body style="font-family: Arial, sans-serif; font-size: 10pt;"'
-                f' bgcolor="{self._BG_CONV_HEX}">'
-            ]
+            if self._use_webview:
+                bg = self._BG_CONV_HEX
+                parts = [
+                    "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+                    "<style>"
+                    f"body{{font-family:Arial,sans-serif;font-size:10pt;background:{bg};margin:4px}}"
+                    "table.msg{width:100%;border-collapse:collapse;margin-bottom:8px}"
+                    "table.msg td{padding:8px 10px;border-radius:4px}"
+                    "details.tools{margin-top:6px;font-size:9pt}"
+                    "details.tools summary{cursor:pointer;color:#787878;user-select:none;"
+                    "padding:2px 4px;border-radius:3px;list-style:disclosure-closed}"
+                    "details.tools summary:hover{background:#e8e8e8}"
+                    "details.tools[open] summary{list-style:disclosure-open}"
+                    ".tool-entry{margin:4px 0;padding:4px 8px;background:#f5f5f0;"
+                    "border-left:3px solid #ccc;border-radius:2px;"
+                    "font-family:monospace;font-size:8.5pt;white-space:pre-wrap;"
+                    "word-break:break-all}"
+                    ".tool-ok{border-left-color:#4caf50}"
+                    ".tool-err{border-left-color:#f44336}"
+                    "</style></head>"
+                    f"<body>"
+                ]
+            else:
+                parts = [
+                    f'<html><body style="font-family: Arial, sans-serif; font-size: 10pt;"'
+                    f' bgcolor="{self._BG_CONV_HEX}">'
+                ]
 
-            def _msg_block(sender: str, sender_color: str, bg_color: str, body_html: str) -> str:
+            def _tool_html_webview(tools: list[dict]) -> str:
+                if not tools:
+                    return ""
+                count = len(tools)
+                label = f"{count} tool call{'s' if count > 1 else ''}"
+                rows = []
+                for t in tools:
+                    ok = t["result"].get("success", True) if isinstance(t["result"], dict) else True
+                    icon = "✓" if ok else "✗"
+                    css = "tool-entry tool-ok" if ok else "tool-entry tool-err"
+                    args_txt = _h.escape(_json.dumps(t["args"], separators=(",", ":"), default=str))
+                    result_txt = _h.escape(_json.dumps(t["result"], separators=(",", ":"), default=str))
+                    name = _h.escape(t["name"])
+                    rows.append(
+                        f'<div class="{css}">'
+                        f'<b>{icon} {name}</b><br>'
+                        f'<span style="color:#555">args:</span> {args_txt}<br>'
+                        f'<span style="color:#555">result:</span> {result_txt}'
+                        f'</div>'
+                    )
                 return (
-                    f'<table width="100%" cellpadding="10" cellspacing="0" bgcolor="{bg_color}"'
-                    f' border="0"><tr><td>'
-                    f'<b><font color="{sender_color}" size="3">{sender}</font></b>'
-                    f'<br>{body_html}'
-                    f'</td></tr></table>'
-                    f'<br>'
+                    f'<details class="tools"><summary>{label}</summary>'
+                    + "".join(rows)
+                    + "</details>"
                 )
+
+            def _tool_html_plain(tools: list[dict]) -> str:
+                """Compact inline tool summary for wx.html.HtmlWindow (no folding)."""
+                if not tools:
+                    return ""
+                rows = []
+                for t in tools:
+                    ok = t["result"].get("success", True) if isinstance(t["result"], dict) else True
+                    icon = "&#x2713;" if ok else "&#x2717;"
+                    name = _h.escape(t["name"])
+                    summary = _h.escape(
+                        t["result"].get("message", "") if isinstance(t["result"], dict)
+                        else str(t["result"])
+                    )[:120]
+                    color = self._C_OK_HEX if ok else self._C_ERR_HEX
+                    rows.append(
+                        f'<font color="{color}"><tt>{icon} {name}</tt></font>'
+                        f' <font color="{self._C_TOOL_HEX}"><i>{summary}</i></font>'
+                    )
+                inner = "<br>".join(rows)
+                return f'<blockquote style="margin:4px 0">{inner}</blockquote>'
+
+            if self._use_webview:
+                def _msg_block(sender: str, sender_color: str, bg_color: str,
+                               body_html: str, tools_html: str = "") -> str:
+                    return (
+                        f'<table class="msg"><tr><td style="background:{bg_color}">'
+                        f'<b><span style="color:{sender_color}">{sender}</span></b>'
+                        f'<br>{body_html}{tools_html}'
+                        f'</td></tr></table>'
+                    )
+            else:
+                def _msg_block(sender: str, sender_color: str, bg_color: str,
+                               body_html: str, tools_html: str = "") -> str:
+                    return (
+                        f'<table width="100%" cellpadding="10" cellspacing="0" bgcolor="{bg_color}"'
+                        f' border="0"><tr><td>'
+                        f'<b><font color="{sender_color}" size="3">{sender}</font></b>'
+                        f'<br>{body_html}{tools_html}'
+                        f'</td></tr></table>'
+                        f'<br>'
+                    )
 
             for entry in self._conv_entries:
                 typ = entry["type"]
@@ -664,8 +987,14 @@ if _WX_AVAILABLE:
                     parts.append(_msg_block("You", self._C_USER_HEX, "#EBF0FF", body))
                 elif typ == "ai":
                     body = self._md_to_html(text)
-                    parts.append(_msg_block("AI", self._C_AI_HEX, "#EBF7F2", body))
+                    tools = entry.get("tools") or []
+                    if self._use_webview:
+                        tools_html = _tool_html_webview(tools)
+                    else:
+                        tools_html = _tool_html_plain(tools)
+                    parts.append(_msg_block("AI", self._C_AI_HEX, "#EBF7F2", body, tools_html))
                 elif typ == "tool":
+                    # Transient in-progress line shown while the turn is running
                     escaped = _h.escape(text)
                     parts.append(
                         f'<p style="margin: 2px 8px;"><font color="{self._C_TOOL_HEX}"><i>{escaped}</i></font></p>'
@@ -678,17 +1007,24 @@ if _WX_AVAILABLE:
             # Show pending streamed AI text
             if self._pending_ai_text:
                 body = self._md_to_html(self._pending_ai_text)
-                parts.append(_msg_block("AI", self._C_AI_HEX, "#EBF7F2", body))
+                # Pending tool calls shown while streaming
+                if self._use_webview:
+                    tools_html = _tool_html_webview(self._pending_tool_calls)
+                else:
+                    tools_html = _tool_html_plain(self._pending_tool_calls)
+                parts.append(_msg_block("AI", self._C_AI_HEX, "#EBF7F2", body, tools_html))
 
-            parts.append("</body></html>")
-            self._conv_html.SetPage("".join(parts))
-            self._conv_html.Scroll(0, self._conv_html.GetScrollRange(wx.VERTICAL))
-
-        def _clear_tool_log(self) -> None:
-            """Destroy all per-call collapsible entries in the tool log."""
-            self._tool_log_entries_sizer.Clear(delete_windows=True)
-            self._tool_log_scroll.FitInside()
-            self._tool_log_scroll.Layout()
+            if self._use_webview:
+                parts.append("</body></html>")
+                html = "".join(parts)
+                self._conv_view.SetPage(html, "")
+                self._conv_view.RunScript(
+                    "window.scrollTo(0, document.body.scrollHeight);"
+                )
+            else:
+                parts.append("</body></html>")
+                self._conv_view.SetPage("".join(parts))
+                self._conv_view.Scroll(0, self._conv_view.GetScrollRange(wx.VERTICAL))
 
         @staticmethod
         def _json_dump_safe(value: Any, *, indent: int | None = None) -> str:
@@ -699,75 +1035,6 @@ if _WX_AVAILABLE:
                 return _json.dumps(value, indent=indent, default=str)
             except (TypeError, ValueError):
                 return repr(value)
-
-        def _append_tool_log(self, name: str, args: dict, result: Any) -> None:
-            """Append a collapsible entry for one tool call.
-
-            The header (always visible) shows a one-line truncated summary.
-            The full one-line summary is also placed at the top of the
-            expanded body and as the entry's tooltip, so users can read or
-            copy it even if the native pane label is OS-truncated.
-            """
-            args_compact = self._json_dump_safe(args)
-            result_compact = self._json_dump_safe(result)
-            summary = f"{name}({args_compact}) → {result_compact}"
-
-            # Native CollapsiblePane labels are single-line; cap to keep the
-            # header tidy. The full text is available in body + tooltip.
-            header = f"{name}({args_compact[:80]}) → {result_compact[:120]}"
-            if len(header) > 200:
-                header = header[:197] + "…"
-
-            entry_pane = wx.CollapsiblePane(
-                self._tool_log_scroll, label=header,
-                style=wx.CP_DEFAULT_STYLE | wx.CP_NO_TLW_RESIZE,
-            )
-            try:
-                entry_pane.SetToolTip(summary)
-            except Exception:
-                pass
-            inner = entry_pane.GetPane()
-            inner_sizer = wx.BoxSizer(wx.VERTICAL)
-
-            body_text = (
-                f"# {summary}\n\n"
-                f"args:\n{self._json_dump_safe(args, indent=2)}\n\n"
-                f"result:\n{self._json_dump_safe(result, indent=2)}"
-            )
-            body = wx.TextCtrl(
-                inner, value=body_text,
-                style=wx.TE_MULTILINE | wx.TE_READONLY | wx.TE_RICH2 | wx.BORDER_SIMPLE | wx.HSCROLL,
-            )
-            body.SetFont(self._tool_log_font)
-            body.SetBackgroundColour(self._BG_TOOL)
-            # Size the body to fit its content so expanding the entry actually
-            # reveals more of the result. Clamp between a small minimum and a
-            # generous maximum so very long outputs still scroll within the
-            # entry instead of dominating the panel.
-            line_h = body.GetCharHeight()
-            n_lines = body_text.count("\n") + 1
-            # +2 for a little breathing room (top/bottom padding).
-            desired_h = (n_lines + 2) * line_h
-            min_h, max_h = 80, 600
-            body.SetMinSize((-1, max(min_h, min(desired_h, max_h))))
-            inner_sizer.Add(body, 1, wx.EXPAND | wx.ALL, 2)
-            inner.SetSizer(inner_sizer)
-
-            def _on_entry_toggle(_evt, _scroll=self._tool_log_scroll) -> None:
-                _scroll.FitInside()
-                _scroll.Layout()
-
-            entry_pane.Bind(wx.EVT_COLLAPSIBLEPANE_CHANGED, _on_entry_toggle)
-
-            self._tool_log_entries_sizer.Add(entry_pane, 0, wx.EXPAND | wx.ALL, 2)
-            self._tool_log_scroll.FitInside()
-            self._tool_log_scroll.Layout()
-            # Auto-scroll to the newest entry.
-            _, vunit = self._tool_log_scroll.GetScrollPixelsPerUnit()
-            virt_h = self._tool_log_scroll.GetVirtualSize().GetHeight()
-            if vunit:
-                self._tool_log_scroll.Scroll(-1, virt_h // vunit)
-
 
 else:
     # Fallback stub when wx is not available (e.g., during unit tests or dev)

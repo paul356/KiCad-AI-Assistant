@@ -452,6 +452,14 @@ class LLMClient:
         """Clear conversation history."""
         self._history = []
 
+    def get_history(self) -> list[dict[str, Any]]:
+        """Return a copy of the conversation history for session persistence."""
+        return list(self._history)
+
+    def set_history(self, history: list[dict[str, Any]]) -> None:
+        """Replace conversation history when restoring a saved session."""
+        self._history = list(history)
+
     def _trim_history(self) -> None:
         """Drop oldest complete turns until history is within the cap.
 
