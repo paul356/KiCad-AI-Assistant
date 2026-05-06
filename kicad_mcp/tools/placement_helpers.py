@@ -167,7 +167,7 @@ def register_placement_helpers(mcp: FastMCP) -> None:
         width: float | None = None,
         height: float | None = None,
         prefer_near: Optional[Dict[str, Any]] = None,
-        margin: float = 2.54,
+        margin: float = 3.81,
         max_candidates: int = 5,
         for_library: str | None = None,
         for_symbol: str | None = None,
@@ -194,9 +194,10 @@ def register_placement_helpers(mcp: FastMCP) -> None:
                 Euclidean distance from this point (or from the centre of
                 that component's bbox).
             margin: Clearance to add around every existing component bbox
-                before testing overlap (mm). Default 2.54 mm = two grid
-                units. Increase if you want extra breathing room for
-                Reference/Value labels.
+                before testing overlap (mm). Default 3.81 mm (1.5 × 2.54).
+                Each existing symbol's bbox already includes its full
+                pin stubs, so this margin is pure extra breathing room for
+                wires and Reference/Value labels.
             max_candidates: Maximum number of candidate anchors to return.
             for_library: Optional library name of the symbol to be placed.
                 When provided together with ``for_symbol`` the result

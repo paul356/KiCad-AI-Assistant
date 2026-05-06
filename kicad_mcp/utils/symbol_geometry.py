@@ -94,6 +94,20 @@ def _find_xy(node: list, tag: str) -> tuple[float, float] | None:
     return None
 
 
+def _find_at(node: list) -> tuple[float, float, float] | None:
+    """Return (x, y, angle_deg) of the first ``(at ...)`` child, or None."""
+    for child in node[1:]:
+        if _is_node(child) and _tag(child) == "at" and len(child) >= 3:
+            try:
+                x = float(child[1])
+                y = float(child[2])
+                angle = float(child[3]) if len(child) >= 4 else 0.0
+                return (x, y, angle)
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
 def _find_number(node: list, tag: str) -> float | None:
     for child in node[1:]:
         if _is_node(child) and _tag(child) == tag and len(child) >= 2:
@@ -228,9 +242,21 @@ def _walk_unit_geometry(unit_node: list) -> list[tuple[float, float]]:
 
         elif tag == "pin":
             # (pin <type> <shape> (at x y angle) (length l) ...)
-            at = _find_xy(child, "at")
-            if at is not None:
-                points.append(at)
+            # Include both the connection endpoint (at) and the body end
+            # (at + length along the pin direction) so that the bbox covers
+            # the full pin stub.  This prevents placement candidates from
+            # landing on top of a neighbour's exposed pin wire.
+            pin_at = _find_at(child)
+            length = _find_number(child, "length")
+            if pin_at is not None:
+                px, py, angle_deg = pin_at
+                points.append((px, py))
+                if length is not None and length > 0:
+                    rad = math.radians(angle_deg)
+                    points.append((
+                        px + length * math.cos(rad),
+                        py + length * math.sin(rad),
+                    ))
 
     return points
 
