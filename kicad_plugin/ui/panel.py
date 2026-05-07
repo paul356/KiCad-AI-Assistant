@@ -923,12 +923,13 @@ if _WX_AVAILABLE:
                     f"body{{font-family:Arial,sans-serif;font-size:10pt;background:{bg};margin:4px}}"
                     "table.msg{width:100%;border-collapse:collapse;margin-bottom:8px}"
                     "table.msg td{padding:8px 10px;border-radius:4px}"
-                    "details.tools{margin-top:6px;font-size:9pt}"
-                    "details.tools summary{cursor:pointer;color:#787878;user-select:none;"
+                    ".tool-list{margin-top:6px;font-size:9pt}"
+                    "details.tools{margin:2px 0}"
+                    "details.tools summary{cursor:pointer;color:#555;user-select:none;"
                     "padding:2px 4px;border-radius:3px;list-style:disclosure-closed}"
                     "details.tools summary:hover{background:#e8e8e8}"
                     "details.tools[open] summary{list-style:disclosure-open}"
-                    ".tool-entry{margin:4px 0;padding:4px 8px;background:#f5f5f0;"
+                    ".tool-entry{margin:2px 0;padding:4px 8px;background:#f5f5f0;"
                     "border-left:3px solid #ccc;border-radius:2px;"
                     "font-family:monospace;font-size:8.5pt;white-space:pre-wrap;"
                     "word-break:break-all}"
@@ -952,28 +953,25 @@ if _WX_AVAILABLE:
             def _tool_html_webview(tools: list[dict]) -> str:
                 if not tools:
                     return ""
-                count = len(tools)
-                label = f"{count} tool call{'s' if count > 1 else ''}"
-                rows = []
+                items = []
                 for t in tools:
                     ok = t["result"].get("success", True) if isinstance(t["result"], dict) else True
                     icon = "✓" if ok else "✗"
+                    icon_color = "#4caf50" if ok else "#f44336"
                     css = "tool-entry tool-ok" if ok else "tool-entry tool-err"
                     args_txt = _h.escape(_json.dumps(t["args"], separators=(",", ":"), default=str))
                     result_txt = _h.escape(_json.dumps(t["result"], separators=(",", ":"), default=str))
                     name = _h.escape(t["name"])
-                    rows.append(
+                    items.append(
+                        f'<details class="tools">'
+                        f'<summary><span style="color:{icon_color}">{icon}</span> {name}</summary>'
                         f'<div class="{css}">'
-                        f'<b>{icon} {name}</b><br>'
                         f'<span style="color:#555">args:</span> {args_txt}<br>'
                         f'<span style="color:#555">result:</span> {result_txt}'
                         f'</div>'
+                        f'</details>'
                     )
-                return (
-                    f'<details class="tools"><summary>{label}</summary>'
-                    + "".join(rows)
-                    + "</details>"
-                )
+                return '<div class="tool-list">' + "".join(items) + '</div>'
 
             def _tool_html_plain(tools: list[dict]) -> str:
                 """Compact inline tool summary for wx.html.HtmlWindow (no folding)."""

@@ -894,7 +894,6 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
             "backup_path": schematic_path + ".bak",
         }
 
-    @mcp.tool()
     async def add_wire_to_schematic(
         schematic_path: str,
         start_x: float,
@@ -1080,7 +1079,18 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
             return {"error": str(exc)}
 
         if start_x == end_x and start_y == end_y:
-            return {"error": "Both pins are at the same coordinate; cannot draw a wire"}
+            return {
+                "success": True,
+                "wire": {
+                    "from": {"ref": from_ref, "pin": from_pin, "x": start_x, "y": start_y},
+                    "to": {"ref": to_ref, "pin": to_pin, "x": end_x, "y": end_y},
+                },
+                "note": (
+                    f"{from_ref} pin {from_pin} and {to_ref} pin {to_pin} share the same "
+                    "schematic coordinate — they are co-located on a shared stub and are "
+                    "already connected. No wire was drawn."
+                ),
+            }
 
         try:
             # Auto-junction: if a pin already connects to a wire, add a junction

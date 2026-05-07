@@ -203,7 +203,7 @@ _PROMPT_SCHEMATIC = """\
 3. After moves/inserts, prefer using the returned body_bbox; only call
    extract_schematic_netlist again if you need to refresh net info.
 4. Wire pins using this priority order — try each in turn, stop at first
-   success; if all three fail, **report the failure and the coordinates to
+   success; if both fail, **report the failure and the coordinates to
    the user** instead of silently skipping the wire:
    a. **connect_pins_with_wire(from_ref, from_pin, to_ref, to_pin)** —
       preferred for pin-to-pin; resolves coordinates automatically, routes
@@ -214,13 +214,9 @@ _PROMPT_SCHEMATIC = """\
    b. **connect_points_with_wire(start_x, start_y, end_x, end_y)** — smart
       orthogonal routing between bare coordinates; use when endpoints are
       not symbol pins (e.g. net label positions, existing wire tips).
-      If this fails, **immediately report to the user**: the tool name
+      If this fails, **stop and report** the tool name
       (connect_points_with_wire), the exact arguments used, and the full
-      error message returned. Then proceed to (c).
-   c. **add_wire_to_schematic(start_x, start_y, end_x, end_y)** — naive
-      horizontal-or-vertical segment only; use ONLY when (a) and (b) have
-      both failed.  If this also fails, stop and tell the user which wire
-      could not be routed and why.
+      error message to the user.
    Use **add_junction_to_schematic** for explicit T/X junctions.
 
 # Wiring strategy
@@ -246,9 +242,8 @@ _PROMPT_SCHEMATIC = """\
   going back to the same anchor — this keeps the net visually local.
 - Prefer connect_pins_with_wire over manual coordinate routing whenever
   both endpoints are pins; it handles rotation and junction insertion for
-  you.  When endpoints are bare coordinates, use connect_points_with_wire
-  next.  Fall back to add_wire_to_schematic (H/V only) only if both of
-  those fail — and always report failures to the user.
+  you.  When endpoints are bare coordinates, use connect_points_with_wire.
+  Always report failures to the user.
 - If the electrically-correct pin pair would produce a long or cluttered
   wire, consider **rotating or moving one of the components** instead of
   picking a different (wrong) pin.
