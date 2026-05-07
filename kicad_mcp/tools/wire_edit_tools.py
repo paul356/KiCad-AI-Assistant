@@ -90,6 +90,36 @@ def _route_collides(
     return False
 
 
+def _route_collides_at_corners(
+    segments: list[tuple[float, float, float, float]],
+    obstacles: list[tuple[float, float]],
+    tol: float,
+    route_sx: float, route_sy: float,
+    route_ex: float, route_ey: float,
+) -> bool:
+    """Return True if any obstacle pin coincides with an intermediate corner.
+
+    ``_route_collides`` uses ``_point_on_open_segment`` which excludes segment
+    endpoints.  A pin sitting exactly at a corner waypoint shared by two
+    consecutive segments is therefore missed.  This helper collects every
+    segment endpoint that is *not* the overall route start (route_sx, route_sy)
+    or end (route_ex, route_ey) and checks whether any obstacle coincides with
+    it.  Pins at the overall start/end are legitimate connections and are
+    intentionally excluded.
+    """
+    for i, (ax, ay, bx, by) in enumerate(segments):
+        for cx, cy in ((ax, ay), (bx, by)):
+            # Skip the overall route start and end — those are the connected pins.
+            if (abs(cx - route_sx) <= tol and abs(cy - route_sy) <= tol):
+                continue
+            if (abs(cx - route_ex) <= tol and abs(cy - route_ey) <= tol):
+                continue
+            for px, py in obstacles:
+                if abs(cx - px) <= tol and abs(cy - py) <= tol:
+                    return True
+    return False
+
+
 def _route_candidates(
     x1: float, y1: float, x2: float, y2: float,
 ) -> list[list[tuple[float, float, float, float]]]:
@@ -406,6 +436,12 @@ def _draw_smart_wire(
     # the lead endpoint so the inner route still starts/ends in open space.
     # This avoids duplicate wire segments when a pin has multiple connections.
     #
+    # If the lead-out is blocked by a component pin (not a wire), it means
+    # there is insufficient clearance for a stub in that direction.  In that
+    # case skip the lead entirely and route directly from the pin tip.  Route
+    # candidates that would immediately head toward the pin body (stub
+    # direction) are then filtered out to avoid routing into the component.
+    #
     # The end lead-out is stored reversed (inner-endpoint → pin) so that when
     # all segments are concatenated the end of one segment always touches the
     # start of the next — a prerequisite for _merge_collinear_segments.
@@ -413,37 +449,86 @@ def _draw_smart_wire(
     end_lead: list[tuple[float, float, float, float]] = []
     start_suppressed = False
     end_suppressed = False
+    start_lead_pin_blocked = False  # True when lead-out skipped due to pin obstacle
+    end_lead_pin_blocked = False
     if start_angle is not None and (abs(p1x - sx) > 1e-9 or abs(p1y - sy) > 1e-9):
         seg = (sx, sy, p1x, p1y)
-        if not _route_overlaps_wires([seg], existing_wires, _PIN_COLLISION_TOL):
-            start_lead.append(seg)
-        else:
+        if _route_overlaps_wires([seg], existing_wires, _PIN_COLLISION_TOL):
             # Existing wire already covers the lead direction.  Advance p1 to
             # the far end of the existing wire chain so the inner route starts
             # past the entire covered segment.  A junction will be placed at
             # p1 after drawing to mark the new T-branch.
             p1x, p1y = _follow_wire_extent(sx, sy, start_angle, existing_wires, _PIN_COLLISION_TOL)
             start_suppressed = True
+        elif (_route_collides([seg], obstacles, _PIN_COLLISION_TOL)
+              or any(abs(p1x - ox) <= _PIN_COLLISION_TOL and abs(p1y - oy) <= _PIN_COLLISION_TOL
+                     for ox, oy in obstacles)):
+            # A component pin blocks the lead-out stub (either in its interior
+            # or exactly at the lead tip) — no room in that direction.  Route
+            # directly from the pin tip and remember to filter candidates that
+            # head toward the pin body.
+            p1x, p1y = sx, sy
+            start_lead_pin_blocked = True
+        else:
+            start_lead.append(seg)
     if end_angle is not None and (abs(p2x - ex) > 1e-9 or abs(p2y - ey) > 1e-9):
         seg = (ex, ey, p2x, p2y)  # canonical direction for overlap check
-        if not _route_overlaps_wires([seg], existing_wires, _PIN_COLLISION_TOL):
-            # Reversed: inner-endpoint → pin, so it continues naturally from chosen
-            end_lead.append((p2x, p2y, ex, ey))
-        else:
+        if _route_overlaps_wires([seg], existing_wires, _PIN_COLLISION_TOL):
             # Same: advance p2 to the far end of the existing wire chain.
             p2x, p2y = _follow_wire_extent(ex, ey, end_angle, existing_wires, _PIN_COLLISION_TOL)
             end_suppressed = True
+        elif (_route_collides([seg], obstacles, _PIN_COLLISION_TOL)
+              or any(abs(p2x - ox) <= _PIN_COLLISION_TOL and abs(p2y - oy) <= _PIN_COLLISION_TOL
+                     for ox, oy in obstacles)):
+            # A component pin blocks the end lead-out stub (interior or tip).
+            p2x, p2y = ex, ey
+            end_lead_pin_blocked = True
+        else:
+            # Reversed: inner-endpoint → pin, so it continues naturally from chosen
+            end_lead.append((p2x, p2y, ex, ey))
 
     # For collision detection the direction of each segment doesn't matter
     lead_segs = start_lead + [(a, b, c, d) for (c, d, a, b) in end_lead]
 
     # Try each inner route candidate
     inner_candidates = _route_candidates(p1x, p1y, p2x, p2y)
+
+    # When a lead-out was skipped because a component pin blocked it, filter
+    # out route candidates that immediately head in the pin body direction
+    # (stub direction = opposite of exit angle).  Those directions are blocked
+    # by the component and would produce invalid routes.
+    if start_lead_pin_blocked and start_angle is not None:
+        _body_dvx, _body_dvy = _dir_vec((start_angle + 180) % 360)
+        inner_candidates = [
+            c for c in inner_candidates
+            if not (
+                c
+                and abs(c[0][0] - p1x) < 1e-6
+                and abs(c[0][1] - p1y) < 1e-6
+                and _body_dvx * (c[0][2] - c[0][0]) + _body_dvy * (c[0][3] - c[0][1]) > 1e-6
+            )
+        ]
+    if end_lead_pin_blocked and end_angle is not None:
+        _body_dvx, _body_dvy = _dir_vec((end_angle + 180) % 360)
+        inner_candidates = [
+            c for c in inner_candidates
+            if not (
+                c
+                and abs(c[-1][2] - p2x) < 1e-6
+                and abs(c[-1][3] - p2y) < 1e-6
+                and _body_dvx * (c[-1][0] - p2x) + _body_dvy * (c[-1][1] - p2y) > 1e-6
+            )
+        ]
+
     chosen: list[tuple[float, float, float, float]] | None = None
     for candidate in inner_candidates:
         all_segs = lead_segs + candidate
         if (not _route_collides(all_segs, obstacles, _PIN_COLLISION_TOL)
-                and not _route_overlaps_wires(all_segs, existing_wires, _PIN_COLLISION_TOL)):
+                and not _route_overlaps_wires(all_segs, existing_wires, _PIN_COLLISION_TOL)
+                and not _route_collides_at_corners(
+                    all_segs, obstacles, _PIN_COLLISION_TOL,
+                    sx, sy, ex, ey,
+                )):
             chosen = candidate
             break
 
