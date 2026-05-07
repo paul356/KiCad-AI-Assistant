@@ -549,6 +549,22 @@ def _collect_all_pin_positions(sch: Any) -> list[tuple[float, float]]:
     return positions
 
 
+def _collect_all_pin_data(sch: Any) -> list[tuple[float, float, float]]:
+    """Return the absolute schematic position and exit angle of every pin.
+
+    Returns:
+        List of (x, y, angle) tuples, one per pin.
+    """
+    data: list[tuple[float, float, float]] = []
+    try:
+        for sym in sch.symbol:
+            for pin in sym_pin_world_coords(sym):
+                data.append((pin.x, pin.y, pin.angle))
+    except AttributeError:
+        pass
+    return data
+
+
 def _junction_exists_at(sch: Any, px: float, py: float, tol: float = 0.01) -> bool:
     """Return True if a junction already exists at (px, py) within tolerance."""
     try:
@@ -718,9 +734,10 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
             return {"error": f"Failed to open schematic: {exc}"}
 
         try:
-            # Collect all pin positions and existing wires to avoid routing
-            # through them or overlapping with them.
-            obstacles = _collect_all_pin_positions(sch)
+            # Collect all pin positions/angles and existing wires to avoid
+            # routing through them or overlapping with them.
+            all_pin_data = _collect_all_pin_data(sch)
+            obstacles = [(x, y) for x, y, _ in all_pin_data]
             existing_wires = _collect_existing_wires(sch)
 
             # For each endpoint, if it lies on the interior of an existing wire
@@ -806,6 +823,21 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
             if start_eff_x == end_eff_x and start_eff_y == end_eff_y:
                 return {"error": "Wire endpoints converge to the same coordinate after following existing wire chains"}
 
+            # Look up the exit angle for each effective endpoint if it coincides
+            # with a pin.  This lets _draw_smart_wire emit a lead-out stub that
+            # moves the route away from the pin body before turning, exactly as
+            # connect_pins_with_wire does.  When the pin is already connected in
+            # that direction _draw_smart_wire's lead-suppression logic handles it
+            # automatically (no duplicate segment, junction placed instead).
+            def _find_pin_angle(px: float, py: float) -> float | None:
+                for (x, y, angle) in all_pin_data:
+                    if abs(x - px) <= tol and abs(y - py) <= tol:
+                        return angle
+                return None
+
+            start_angle_wire = _find_pin_angle(start_eff_x, start_eff_y)
+            end_angle_wire = _find_pin_angle(end_eff_x, end_eff_y)
+
             # Auto-junction: if an original endpoint already has a wire
             # connected there, place a junction so the T-connection is explicit.
             # Also place junctions at any points reached by wire-extent following.
@@ -824,6 +856,8 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
             ok = _draw_smart_wire(
                 sch, start_eff_x, start_eff_y, end_eff_x, end_eff_y,
                 existing_wires=existing_wires,
+                start_angle=start_angle_wire,
+                end_angle=end_angle_wire,
                 obstacle_pins=obstacles,
             )
             if not ok:

@@ -54,6 +54,28 @@ def sym_pin_world_coords(sym: Any) -> list[PinWorldCoords]:
     # Works for multi-pin components where skip correctly wraps each pin as a
     # SymbolPin object with a .number attribute and a .location property that
     # accounts for the symbol's placement rotation and mirroring.
+    #
+    # NOTE on angle convention (skip library):
+    # skip's SymbolPin.location returns the pin angle in *library* coordinates:
+    #   • +Y is UP  (library editor convention)
+    #   • Angles are CCW
+    #   • The angle points from the wire-exit tip TOWARD the symbol body
+    #     (i.e. the stub direction, not the wire-exit direction)
+    #
+    # We need the wire-exit direction in *schematic* coordinates:
+    #   • +Y is DOWN  (screen convention)
+    #   • Angles are CW
+    #
+    # Two corrections are therefore needed:
+    #   1. CCW → CW  (negate):          angle_cw  = (360 - angle_lib) % 360
+    #   2. Tip-to-body → body-to-tip:   angle_exit = (angle_cw + 180) % 360
+    # Combined: angle_exit = (360 - angle_lib + 180) % 360
+    #                      = (540 - angle_lib) % 360
+    #
+    # Verification with known cases:
+    #   J3 right-side pin (sym rot=0): lib=180° → (540-180)%360 =   0° (→ right) ✓
+    #   R1 pin1 (sym rot=180):         lib= 90° → (540- 90)%360 =  90° (↓ down)  ✓
+    #   R1 pin2 (sym rot=180):         lib=270° → (540-270)%360 = 270° (↑ up)    ✓
     try:
         for pin in sym.pin:
             try:
@@ -63,72 +85,74 @@ def sym_pin_world_coords(sym: Any) -> list[PinWorldCoords]:
                     number=num,
                     x=round(float(loc.x), 4),
                     y=round(float(loc.y), 4),
-                    angle=float(loc.rotation),
+                    angle=(540.0 - float(loc.rotation)) % 360.0,
                 ))
             except AttributeError:
                 continue
     except (AttributeError, TypeError):
         pass
 
-    if results:
-        return results
-
-    # ---- Fallback path: manual rotation/mirror math -------------------------
-    # Triggered for power symbols, PWR_FLAG, TestPoint, etc., where skip's
-    # SymbolPin wrapper is not produced by sym.pin iteration.  We read the
-    # lib-symbol pin definitions directly and replicate the same transform that
-    # skip's SymbolPin.location property applies internally.
-    try:
-        lib_sym = sym.lib_symbol
-        if lib_sym is None:
-            return results
-
-        sym_at = AtValue(sym.at.value)  # placed symbol: (x, y, rotation°)
-
-        # Determine mirroring (if any)
-        mirror_val: str | None = None
+    if not results:
+        # ---- Fallback path: manual rotation/mirror math ---------------------
+        # Triggered for power symbols, PWR_FLAG, TestPoint, etc., where skip's
+        # SymbolPin wrapper is not produced by sym.pin iteration.  We read the
+        # lib-symbol pin definitions directly and replicate the same transform that
+        # skip's SymbolPin.location property applies internally.
         try:
-            mv = sym.mirror.value
-            mirror_val = mv.value() if hasattr(mv, "value") else mv
-        except AttributeError:
-            pass
+            lib_sym = sym.lib_symbol
+            if lib_sym is None:
+                return results
 
-        for lib_pin in lib_sym.pin:
+            sym_at = AtValue(sym.at.value)  # placed symbol: (x, y, rotation°)
+
+            # Determine mirroring (if any)
+            mirror_val: str | None = None
             try:
-                num = str(lib_pin.number.value)
-                rel_raw: list = copy.deepcopy(lib_pin.at.value)  # [x, y, angle]
+                mv = sym.mirror.value
+                mirror_val = mv.value() if hasattr(mv, "value") else mv
+            except AttributeError:
+                pass
 
-                # Apply mirroring to lib-pin relative position
-                rot = rel_raw[2]
-                if mirror_val == "y":
-                    rel_raw[0] = -rel_raw[0]
-                    if rot % 180 == 0:
-                        rel_raw[2] = (rot + 180) % 360
-                elif mirror_val == "x":
-                    rel_raw[1] = -rel_raw[1]
-                    if rot % 90 == 0:
-                        rel_raw[2] = (rot + 180) % 360
+            for lib_pin in lib_sym.pin:
+                try:
+                    num = str(lib_pin.number.value)
+                    rel_raw: list = copy.deepcopy(lib_pin.at.value)  # [x, y, angle]
 
-                rel_at = AtValue(rel_raw)
-                manip_at = AtValue(copy.deepcopy(rel_raw))
-                manip_at.rotation = 0
+                    # Apply mirroring to lib-pin relative position
+                    rot = rel_raw[2]
+                    if mirror_val == "y":
+                        rel_raw[0] = -rel_raw[0]
+                        if rot % 180 == 0:
+                            rel_raw[2] = (rot + 180) % 360
+                    elif mirror_val == "x":
+                        rel_raw[1] = -rel_raw[1]
+                        if rot % 90 == 0:
+                            rel_raw[2] = (rot + 180) % 360
 
-                # Rotate lib-pin position/angle to match placed symbol's rotation
-                while manip_at.rotation != sym_at.rotation:
-                    manip_at.rotate90degrees()
-                    rel_at.rotate90degrees()
+                    rel_at = AtValue(rel_raw)
+                    manip_at = AtValue(copy.deepcopy(rel_raw))
+                    manip_at.rotation = 0
 
-                wx = round(sym_at.x + rel_at.x, 4)
-                wy = round(sym_at.y - rel_at.y, 4)  # lib Y axis is flipped
-                results.append(PinWorldCoords(
-                    number=num,
-                    x=wx,
-                    y=wy,
-                    angle=float(rel_at.rotation),
-                ))
-            except Exception:
-                continue
-    except Exception:
-        pass
+                    # Rotate lib-pin position/angle to match placed symbol's rotation
+                    while manip_at.rotation != sym_at.rotation:
+                        manip_at.rotate90degrees()
+                        rel_at.rotate90degrees()
+
+                    wx = round(sym_at.x + rel_at.x, 4)
+                    wy = round(sym_at.y - rel_at.y, 4)  # lib Y axis is flipped
+                    # Apply the same (540 - angle) % 360 conversion as the
+                    # normal path: rel_at.rotation is still in library coords
+                    # (CCW, +Y up, tip-to-body) and must be converted to
+                    # schematic wire-exit direction (CW, +Y down, body-to-tip).
+                    results.append(PinWorldCoords(
+                        number=num,
+                        x=wx,
+                        y=wy,
+                        angle=(540.0 - float(rel_at.rotation)) % 360.0,
+                    ))
+                except Exception:
+                    continue
+        except Exception:
+            pass
 
     return results

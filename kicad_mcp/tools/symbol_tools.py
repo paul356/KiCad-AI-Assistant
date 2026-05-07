@@ -23,15 +23,24 @@ log = logging.getLogger(__name__)
 
 
 def _lib_angle_to_direction(angle_deg: int) -> str:
-    """Convert a library-space pin angle to a human-readable direction string.
+    """Convert a library-space pin angle to a human-readable wire-exit direction.
 
-    KiCad .kicad_sym library files use Y-up coordinates:
-      0   → "right"  (+X)
-      90  → "up"     (+Y lib, pointing up on screen)
-      180 → "left"   (-X)
-      270 → "down"   (-Y lib, pointing down on screen)
+    KiCad .kicad_sym files store pin angles as the **stub direction** — the
+    direction from the pin tip *toward* the symbol body.  To get the wire-exit
+    direction (from body *outward* to the pin tip) we add 180°.
+
+    The library coordinate system is Y-up with CCW angles:
+      raw 0°   (stub right  → body) → exit left  → after +180° = 180° → "left"
+      raw 90°  (stub up     → body) → exit down  → after +180° = 270° → "down"
+      raw 180° (stub left   → body) → exit right → after +180° =   0° → "right"
+      raw 270° (stub down   → body) → exit up    → after +180° =  90° → "up"
+
+    Examples with real parts:
+      USB-C right-side pin (wire exits right): lib stores 180° → "right" ✓
+      Resistor pin at top  (wire exits up):    lib stores 270° → "up"    ✓
     """
-    a = int(round(float(angle_deg))) % 360
+    # Add 180° to convert tip-to-body stub direction → body-to-tip exit direction.
+    a = (int(round(float(angle_deg))) + 180) % 360
     return {0: "right", 90: "up", 180: "left", 270: "down"}.get(a, f"{a}deg")
 
 # Module-level singleton so the DB connection is reused across tool calls.
@@ -544,14 +553,18 @@ def register_symbol_tools(mcp: FastMCP) -> None:
 
         Reads the full pin definitions from the .kicad_sym library file and
         returns one entry per pin with its number, name, electrical type, and
-        exit direction in **library coordinate space** (i.e. before any placement
-        rotation or mirroring on a schematic).
+        wire-exit direction in **library coordinate space** (Y-up, before any
+        placement rotation or mirroring on a schematic).
 
-        Direction convention in library space (Y increases upward in .kicad_sym):
-        - "right" = pin exits right (→)
-        - "up"    = pin exits up   (↑)
-        - "left"  = pin exits left (←)
-        - "down"  = pin exits down (↓)
+        Direction convention (library Y-up space, wire-exit direction):
+        - "right" = wire exits right (→)
+        - "up"    = wire exits up    (↑)
+        - "left"  = wire exits left  (←)
+        - "down"  = wire exits down  (↓)
+
+        Note: KiCad .kicad_sym files store the raw angle as the stub direction
+        (tip-to-body).  This tool converts that to the wire-exit direction
+        (body-to-tip) automatically by adding 180°.
 
         To get the absolute world-space exit directions after a symbol has been
         placed on a schematic use ``extract_schematic_netlist`` and look at

@@ -1,20 +1,25 @@
-"""Tests for LLMClient history trimming."""
+"""Tests for LLMClient history management (dedup + compaction)."""
 import json
 import types
 import pytest
 from unittest.mock import MagicMock, patch
 
-from kicad_plugin.llm_client import LLMClient, MAX_HISTORY_MESSAGES
+from kicad_plugin.llm_client import LLMClient
 
 
-def _make_client(max_history=10):
+def _make_client(context_tokens=10_000, compact_threshold=0.70,
+                 compact_target=0.49, keep_recent_turns=4):
     settings = types.SimpleNamespace(
         llm_provider="openai",
         llm_api_key="sk-test",
         llm_model="gpt-4o",
         llm_base_url="",
+        llm_context_tokens=context_tokens,
+        llm_compact_threshold=compact_threshold,
+        llm_compact_target_threshold=compact_target,
+        llm_keep_recent_turns=keep_recent_turns,
     )
-    return LLMClient(settings, mcp_base_url="http://127.0.0.1:9999", max_history=max_history)
+    return LLMClient(settings, mcp_base_url="http://127.0.0.1:9999")
 
 
 def _user(content="hello"):
@@ -33,92 +38,235 @@ def _tool(tool_call_id="tc1", content="result"):
 
 
 # ---------------------------------------------------------------------------
-# _trim_history unit tests
+# _dedup_tool_calls unit tests
 # ---------------------------------------------------------------------------
 
-class TestTrimHistory:
-    def test_no_trim_when_under_limit(self):
-        client = _make_client(max_history=10)
+class TestDedupToolCalls:
+    def test_no_change_when_no_tool_calls(self):
+        client = _make_client()
         client._history = [_user(), _assistant()]
-        client._trim_history()
+        client._dedup_tool_calls()
         assert len(client._history) == 2
 
-    def test_no_trim_when_exactly_at_limit(self):
-        client = _make_client(max_history=2)
-        client._history = [_user(), _assistant()]
-        client._trim_history()
-        assert len(client._history) == 2
-
-    def test_drops_oldest_assistant_turn(self):
-        client = _make_client(max_history=3)
-        # 4 messages: user, asst, user, asst  — need to drop 1 turn
+    def test_single_tool_call_kept(self):
+        client = _make_client()
         client._history = [
-            _user("q1"), _assistant("a1"),
-            _user("q2"), _assistant("a2"),
+            _user("q"),
+            _assistant("thinking", tool_calls=[{"id": "tc1", "function": {"name": "get_netlist", "arguments": "{}"}}]),
+            _tool("tc1", "result"),
         ]
-        client._trim_history()
-        assert len(client._history) <= 3
-        # The oldest assistant turn (a1) should be gone
-        contents = [m.get("content") for m in client._history]
-        assert "a1" not in contents
+        client._dedup_tool_calls()
+        assert len(client._history) == 3
 
-    def test_drops_complete_assistant_tool_pair(self):
-        client = _make_client(max_history=4)
-        # 5 messages: user, asst+tool_call, tool_result, user, asst
+    def test_duplicate_tool_call_oldest_dropped(self):
+        """Three calls to same tool — only the latest survives."""
+        client = _make_client()
         client._history = [
             _user("q1"),
-            _assistant("thinking", tool_calls=[{"id": "tc1"}]),
-            _tool("tc1", "tool result"),
+            _assistant("t1", tool_calls=[{"id": "tc1", "function": {"name": "extract_netlist", "arguments": "{}"}}]),
+            _tool("tc1", "r1"),
             _user("q2"),
-            _assistant("final"),
+            _assistant("t2", tool_calls=[{"id": "tc2", "function": {"name": "extract_netlist", "arguments": "{}"}}]),
+            _tool("tc2", "r2"),
+            _user("q3"),
+            _assistant("t3", tool_calls=[{"id": "tc3", "function": {"name": "extract_netlist", "arguments": "{}"}}]),
+            _tool("tc3", "r3"),
         ]
-        client._trim_history()
-        # Should have dropped the assistant+tool pair together (2 messages gone → 3 left)
-        assert len(client._history) <= 4
-        roles = [m["role"] for m in client._history]
-        # No orphaned tool message without preceding assistant
-        tool_indices = [i for i, m in enumerate(client._history) if m["role"] == "tool"]
-        for ti in tool_indices:
-            assert client._history[ti - 1]["role"] == "assistant"
+        client._dedup_tool_calls()
+        # Only the latest tool turn (tc3) should survive; tc1 and tc2 turns dropped
+        tool_ids_in_history = [
+            tc["id"]
+            for m in client._history
+            if m.get("tool_calls")
+            for tc in m["tool_calls"]
+        ]
+        assert tool_ids_in_history == ["tc3"]
 
-    def test_trim_multiple_rounds(self):
-        client = _make_client(max_history=2)
-        # Build a long history with many turns
-        client._history = []
-        for i in range(10):
-            client._history.append(_user(f"q{i}"))
-            client._history.append(_assistant(f"a{i}"))
-        client._trim_history()
-        assert len(client._history) <= 2
-
-    def test_fallback_drops_oldest_when_no_assistant(self):
-        client = _make_client(max_history=1)
-        client._history = [_user("q1"), _user("q2")]
-        client._trim_history()
-        assert len(client._history) <= 1
-
-    def test_max_history_default_is_constant(self):
-        settings = types.SimpleNamespace(
-            llm_provider="openai", llm_api_key="", llm_model="gpt-4o", llm_base_url=""
-        )
-        client = LLMClient(settings, "http://localhost:9999")
-        assert client._max_history == MAX_HISTORY_MESSAGES
-
-
-# ---------------------------------------------------------------------------
-# run() integration: trim called before LLM
-# ---------------------------------------------------------------------------
-
-class TestRunTrims:
-    def test_trim_called_before_llm_call(self):
-        client = _make_client(max_history=3)
-        # Pre-fill history with 4 messages so trim will fire
+    def test_two_different_tools_both_latest_survive(self):
+        """Two different tools each called twice — both latest survive."""
+        client = _make_client()
         client._history = [
-            _user("old1"), _assistant("r1"),
-            _user("old2"), _assistant("r2"),
+            _user("q1"),
+            _assistant("t1", tool_calls=[{"id": "tc1", "function": {"name": "tool_A", "arguments": "{}"}}]),
+            _tool("tc1", "r1"),
+            _user("q2"),
+            _assistant("t2", tool_calls=[{"id": "tc2", "function": {"name": "tool_B", "arguments": "{}"}}]),
+            _tool("tc2", "r2"),
+            _user("q3"),
+            _assistant("t3", tool_calls=[{"id": "tc3", "function": {"name": "tool_A", "arguments": "{}"}}]),
+            _tool("tc3", "r3"),
+            _user("q4"),
+            _assistant("t4", tool_calls=[{"id": "tc4", "function": {"name": "tool_B", "arguments": "{}"}}]),
+            _tool("tc4", "r4"),
         ]
+        client._dedup_tool_calls()
+        tool_ids = [
+            tc["id"]
+            for m in client._history
+            if m.get("tool_calls")
+            for tc in m["tool_calls"]
+        ]
+        # Only the latest call to each tool survives: tc3 (tool_A) and tc4 (tool_B)
+        assert sorted(tool_ids) == ["tc3", "tc4"]
 
-        # Mock out _call_llm to return a simple final response
+    def test_partial_overlap_turn_kept(self):
+        """A turn calling tool_A+tool_B is kept if tool_B has not been seen yet."""
+        client = _make_client()
+        client._history = [
+            _user("q1"),
+            _assistant("t1", tool_calls=[{"id": "tc1", "function": {"name": "tool_A", "arguments": "{}"}}]),
+            _tool("tc1", "r1"),
+            _user("q2"),
+            _assistant("t2", tool_calls=[
+                {"id": "tc2a", "function": {"name": "tool_A", "arguments": "{}"}},
+                {"id": "tc2b", "function": {"name": "tool_B", "arguments": "{}"}},
+            ]),
+            _tool("tc2a", "r2a"),
+            _tool("tc2b", "r2b"),
+        ]
+        client._dedup_tool_calls()
+        # tc2 turn calls tool_B for the first time → must be kept
+        tool_ids = [
+            tc["id"]
+            for m in client._history
+            if m.get("tool_calls")
+            for tc in m["tool_calls"]
+        ]
+        assert "tc2a" in tool_ids or "tc2b" in tool_ids
+
+
+# ---------------------------------------------------------------------------
+# _compact_history unit tests
+# ---------------------------------------------------------------------------
+
+class TestCompactHistory:
+    def _make_full_history(self, n_turns=6):
+        """Build a history with n_turns complete user+assistant turns."""
+        h = []
+        for i in range(n_turns):
+            h.append(_user(f"question {i}"))
+            h.append(_assistant(f"answer {i}"))
+        return h
+
+    def test_returns_false_when_prefix_too_short(self):
+        client = _make_client(keep_recent_turns=4)
+        # Only 4 turns total → after reserving 4 recent turns the prefix is empty
+        client._history = self._make_full_history(n_turns=4)
+        result = client._compact_history("system", target_summary_chars=500)
+        assert result is False
+        assert len(client._history) == 8  # unchanged
+
+    def test_compacts_prefix_and_preserves_recent_turns(self):
+        client = _make_client(keep_recent_turns=4)
+        client._history = self._make_full_history(n_turns=8)
+        original_recent = client._history[-8:]  # last 4 complete turns
+
+        summary_response = {
+            "finish_reason": "stop",
+            "message": {"content": "User wants to place R1 and connect to GND."},
+        }
+        with patch.object(client, "_call_openai", return_value=summary_response):
+            result = client._compact_history("system", target_summary_chars=1000)
+
+        assert result is True
+        # History should be: 1 summary message + last 4 turns (8 messages)
+        assert len(client._history) == 9
+        assert client._history[0]["role"] == "user"
+        assert "[Session summary" in client._history[0]["content"]
+        # Recent turns preserved verbatim
+        assert client._history[1:] == original_recent
+
+    def test_hard_clips_oversized_summary(self):
+        client = _make_client(keep_recent_turns=4)
+        client._history = self._make_full_history(n_turns=8)
+
+        long_summary = "word " * 2000  # ~10 000 chars
+        summary_response = {
+            "finish_reason": "stop",
+            "message": {"content": long_summary},
+        }
+        target = 100
+        with patch.object(client, "_call_openai", return_value=summary_response):
+            result = client._compact_history("system", target_summary_chars=target)
+
+        assert result is True
+        stored = client._history[0]["content"]
+        # The stored summary (inside the wrapper prefix) must not exceed target
+        summary_part = stored.replace("[Session summary – earlier context]: ", "")
+        assert len(summary_part) <= target
+
+    def test_returns_false_on_llm_error(self):
+        client = _make_client(keep_recent_turns=4)
+        client._history = self._make_full_history(n_turns=8)
+        original = list(client._history)
+
+        error_response = {"error": "API error", "message": {}}
+        with patch.object(client, "_call_openai", return_value=error_response):
+            result = client._compact_history("system", target_summary_chars=500)
+
+        assert result is False
+        assert client._history == original  # unchanged
+
+    def test_returns_false_on_exception(self):
+        client = _make_client(keep_recent_turns=4)
+        client._history = self._make_full_history(n_turns=8)
+        original = list(client._history)
+
+        with patch.object(client, "_call_openai", side_effect=RuntimeError("network")):
+            result = client._compact_history("system", target_summary_chars=500)
+
+        assert result is False
+        assert client._history == original
+
+
+# ---------------------------------------------------------------------------
+# _maybe_compact unit tests
+# ---------------------------------------------------------------------------
+
+class TestMaybeCompact:
+    def test_no_compaction_below_threshold(self):
+        # Large context window, small history → should not trigger
+        client = _make_client(context_tokens=128_000, compact_threshold=0.70)
+        client._history = [_user("hi"), _assistant("hello")]
+        with patch.object(client, "_compact_history") as mock_compact:
+            client._maybe_compact("short system prompt")
+        mock_compact.assert_not_called()
+
+    def test_compaction_triggered_above_threshold(self):
+        # Tiny context window so that a modest history exceeds the threshold
+        client = _make_client(context_tokens=100, compact_threshold=0.70,
+                              compact_target=0.40, keep_recent_turns=2)
+        # Fill history with large messages that exceed 70 tokens (70% of 100)
+        big_content = "x" * 400  # ~100 tokens each
+        client._history = [
+            _user(big_content), _assistant(big_content),
+            _user(big_content), _assistant(big_content),
+            _user(big_content), _assistant(big_content),
+        ]
+        with patch.object(client, "_compact_history", return_value=True) as mock_compact:
+            client._maybe_compact("system")
+        mock_compact.assert_called_once()
+        # Verify target_summary_chars was passed as a positive int
+        _, kwargs = mock_compact.call_args if mock_compact.call_args.kwargs else (mock_compact.call_args.args, {})
+        called_args = mock_compact.call_args.args
+        assert called_args[1] >= 200  # at least the minimum floor
+
+    def test_dedup_always_called(self):
+        client = _make_client()
+        client._history = [_user("hi"), _assistant("hello")]
+        with patch.object(client, "_dedup_tool_calls") as mock_dedup, \
+             patch.object(client, "_compact_history"):
+            client._maybe_compact("system")
+        mock_dedup.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# run() integration
+# ---------------------------------------------------------------------------
+
+class TestRunIntegration:
+    def test_maybe_compact_called_before_llm(self):
+        client = _make_client()
         final_response = {
             "finish_reason": "stop",
             "message": {"content": "done", "tool_calls": []},
@@ -126,11 +274,11 @@ class TestRunTrims:
         client._call_llm = MagicMock(return_value=final_response)
         client._fetch_tool_definitions = MagicMock(return_value=[])
 
-        result = client.run("new question", context_block="")
+        with patch.object(client, "_maybe_compact") as mock_compact:
+            result = client.run("new question", context_block="")
+
         assert result == "done"
-        # After run(), history should not have ballooned past max_history + 2
-        # (the new user message + final assistant message are added during run)
-        assert len(client._history) <= client._max_history + 2
+        mock_compact.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
