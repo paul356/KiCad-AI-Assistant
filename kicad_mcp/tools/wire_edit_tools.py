@@ -750,7 +750,7 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
     """Register all wire and junction editing tools with the MCP server."""
 
     @mcp.tool()
-    async def add_wire_to_schematic(
+    async def connect_points_with_wire(
         schematic_path: str,
         start_x: float,
         start_y: float,
@@ -760,45 +760,41 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
         add_junction_end: bool = False,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
-        """Add a wire segment to a KiCad schematic between two raw coordinates.
+        """Route a smart orthogonal wire between two raw schematic coordinates.
 
-        Use this for **wires between bare points**. When both endpoints are
-        symbol pins, prefer ``connect_pins_with_wire`` — it resolves pin
-        coordinates from placement/rotation, picks a routing direction from
-        the pin exit angle, and handles junctions automatically.
+        Use this when endpoints are known bare coordinates (e.g. a net label
+        position or an existing wire tip).  When both endpoints are symbol
+        pins, prefer ``connect_pins_with_wire`` — it resolves pin coordinates
+        automatically.  If this tool fails, fall back to
+        ``add_wire_to_schematic`` (horizontal/vertical only).
 
         Routing is orthogonal (horizontal-vertical). Coordinates are mm in
-        KiCad screen convention (**+Y is down**); align them to the 1.27 mm
-        grid so they meet pins/other wires exactly. Two convenience
-        behaviours run before drawing:
+        KiCad screen convention (**+Y is down**); align to the 1.27 mm grid.
 
-        * **Wire-following**: if an endpoint lies on the interior of an
-          existing wire (or on its tip and the wire continues toward the
-          other endpoint) the endpoint is advanced along that wire — and a
-          junction is dropped at the joining point. This lets you say
-          "extend the GND rail to here" without computing the rail tip.
-        * **Auto-junction**: if an endpoint coincides with an existing wire
-          and no junction is present yet, one is added so the T-connection
-          is electrically explicit.
+        Junction behaviour:
 
-        ``add_junction_start`` / ``add_junction_end`` force a junction at
-        that endpoint regardless of the heuristic above. A backup
-        (.kicad_sch.bak) is written before saving.
+        * If an endpoint lies on the **interior** of an existing wire, a
+          junction is placed there and that wire is split at the endpoint
+          (required so KiCad ≥ 10 keeps the junction on reload).
+        * If an endpoint coincides with an existing wire endpoint or a pin
+          that already has a wire, a junction is placed automatically.
+        * ``add_junction_start`` / ``add_junction_end`` force a junction at
+          that endpoint regardless of the heuristics above.
+
+        A backup (.kicad_sch.bak) is written before saving.
 
         Args:
             schematic_path: Absolute path to the target .kicad_sch file.
-            start_x: X coordinate of the wire start point in mm.
-            start_y: Y coordinate of the wire start point in mm.
-            end_x: X coordinate of the wire end point in mm.
-            end_y: Y coordinate of the wire end point in mm.
+            start_x: X coordinate of the wire start in mm.
+            start_y: Y coordinate of the wire start in mm.
+            end_x: X coordinate of the wire end in mm.
+            end_y: Y coordinate of the wire end in mm.
             add_junction_start: Force a junction dot at the start point.
             add_junction_end: Force a junction dot at the end point.
 
         Returns:
-            dict with keys: success (bool), wire (start/end coords as
-            originally supplied), junctions_added (list of {x, y} for
-            every junction inserted by this call, including ones added by
-            wire-following / auto-junction).
+            dict with keys: success (bool), wire (start/end coords),
+            junctions_added (list of {x, y} for every junction inserted).
         """
         if not schematic_path.endswith(".kicad_sch"):
             return {"error": f"Not a .kicad_sch file: {schematic_path!r}"}
@@ -819,134 +815,198 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
             return {"error": f"Failed to open schematic: {exc}"}
 
         try:
-            # Collect all pin positions/angles and existing wires to avoid
-            # routing through them or overlapping with them.
             all_pin_data = _collect_all_pin_data(sch)
             obstacles = [(x, y) for x, y, _ in all_pin_data]
             existing_wires = _collect_existing_wires(sch)
-
-            # For each endpoint, if it lies on the interior of an existing wire
-            # and that wire's axis aligns with a routing direction toward the
-            # other endpoint, advance the effective coordinate to the wire's
-            # endpoint that lies in that direction — but only if that endpoint
-            # is not a component pin.  A junction is placed at the followed-to
-            # point because the new wire joins an existing wire tip there.
             tol = _PIN_COLLISION_TOL
-            start_eff_x, start_eff_y = start_x, start_y
-            end_eff_x, end_eff_y = end_x, end_y
 
-            def _is_pin_pos(px: float, py: float) -> bool:
-                return any(
-                    abs(px - ox) <= tol and abs(py - oy) <= tol
-                    for ox, oy in obstacles
-                )
-
-            def _try_follow_wire(
-                px: float, py: float,
-                tx: float, ty: float,
-            ) -> tuple[float, float] | None:
-                """Try to advance (px,py) along an existing wire toward (tx,ty).
-
-                Two cases are handled for each axis-aligned direction toward target:
-                  1. Interior point: (px,py) lies strictly inside a wire aligned
-                     with that direction → snap to the wire endpoint in that direction.
-                  2. Endpoint: (px,py) is a wire endpoint and the wire continues in
-                     that direction → follow the full chain to its far end.
-
-                Returns the advanced coordinate if it is not a pin, else None.
-                """
-                for angle in _infer_angles_toward(px, py, tx, ty):
-                    # direction vector for this angle
-                    rad = math.radians(angle)
-                    dvx = round(math.cos(rad))  # 1, 0, or -1
-                    dvy = round(math.sin(rad))  # 1, 0, or -1
-                    dir_horiz = abs(dvy) < 1e-9
-                    dir_vert = abs(dvx) < 1e-9
-                    for ax, ay, bx, by in existing_wires:
-                        wire_horiz = abs(ay - by) < 1e-9
-                        wire_vert = abs(ax - bx) < 1e-9
-                        if dir_horiz and not wire_horiz:
-                            continue
-                        if dir_vert and not wire_vert:
-                            continue
-                        # Case 1: interior point → snap to endpoint in direction
-                        if _point_on_open_segment(px, py, ax, ay, bx, by, tol):
-                            dot_a = (ax - px) * dvx + (ay - py) * dvy
-                            dot_b = (bx - px) * dvx + (by - py) * dvy
-                            cand_x, cand_y = (ax, ay) if dot_a > dot_b else (bx, by)
-                            if not _is_pin_pos(cand_x, cand_y):
-                                return (cand_x, cand_y)
-                        # Case 2: at wire endpoint, wire continues in direction
-                        at_a = abs(ax - px) <= tol and abs(ay - py) <= tol
-                        at_b = abs(bx - px) <= tol and abs(by - py) <= tol
-                        if at_a or at_b:
-                            other_x, other_y = (bx, by) if at_a else (ax, ay)
-                            dot = (other_x - px) * dvx + (other_y - py) * dvy
-                            if dot > tol:
-                                adv = _follow_wire_extent(
-                                    px, py, angle, existing_wires, tol,
-                                    obstacle_pins=obstacles,
-                                )
-                                if not _is_pin_pos(adv[0], adv[1]):
-                                    return adv
-                return None
-
-            # Track which effective endpoints were produced by following, so
-            # we can place junctions there.
-            followed_junctions: list[tuple[float, float]] = []
-
-            result = _try_follow_wire(start_x, start_y, end_x, end_y)
-            if result is not None:
-                start_eff_x, start_eff_y = result
-                followed_junctions.append(result)
-
-            result = _try_follow_wire(end_x, end_y, start_x, start_y)
-            if result is not None:
-                end_eff_x, end_eff_y = result
-                followed_junctions.append(result)
-
-            if start_eff_x == end_eff_x and start_eff_y == end_eff_y:
-                return {"error": "Wire endpoints converge to the same coordinate after following existing wire chains"}
-
-            # Look up the exit angle for each effective endpoint if it coincides
-            # with a pin.  This lets _draw_smart_wire emit a lead-out stub that
-            # moves the route away from the pin body before turning, exactly as
-            # connect_pins_with_wire does.  When the pin is already connected in
-            # that direction _draw_smart_wire's lead-suppression logic handles it
-            # automatically (no duplicate segment, junction placed instead).
             def _find_pin_angle(px: float, py: float) -> float | None:
                 for (x, y, angle) in all_pin_data:
                     if abs(x - px) <= tol and abs(y - py) <= tol:
                         return angle
                 return None
 
-            start_angle_wire = _find_pin_angle(start_eff_x, start_eff_y)
-            end_angle_wire = _find_pin_angle(end_eff_x, end_eff_y)
+            def _is_on_wire_interior(px: float, py: float) -> bool:
+                return any(
+                    _point_on_open_segment(px, py, ax, ay, bx, by, tol)
+                    for (ax, ay, bx, by) in existing_wires
+                )
 
-            # Auto-junction: if an original endpoint already has a wire
-            # connected there, place a junction so the T-connection is explicit.
-            # Also place junctions at any points reached by wire-extent following.
-            junctions_added = []
+            junctions_added: list[dict[str, float]] = []
             for jx, jy, flag in [
                 (start_x, start_y, add_junction_start),
                 (end_x, end_y, add_junction_end),
             ]:
-                if flag or (_wire_connected_at(sch, jx, jy) and not _junction_exists_at(sch, jx, jy)):
+                needs = (
+                    flag
+                    or _is_on_wire_interior(jx, jy)
+                    or (_wire_connected_at(sch, jx, jy) and not _junction_exists_at(sch, jx, jy))
+                )
+                if needs:
                     if _add_junction_and_split(sch, jx, jy):
                         junctions_added.append({"x": jx, "y": jy})
-            for jx, jy in followed_junctions:
-                if _add_junction_and_split(sch, jx, jy):
-                    junctions_added.append({"x": jx, "y": jy})
 
-            ok = _draw_smart_wire(
-                sch, start_eff_x, start_eff_y, end_eff_x, end_eff_y,
-                existing_wires=existing_wires,
-                start_angle=start_angle_wire,
-                end_angle=end_angle_wire,
-                obstacle_pins=obstacles,
+            start_angle_wire = _find_pin_angle(start_x, start_y)
+            end_angle_wire = _find_pin_angle(end_x, end_y)
+
+            # Refresh after any splits so _draw_smart_wire sees the current
+            # wire topology (not the pre-split long wire which would cause
+            # false overlap rejections for collinear routes).
+            existing_wires = _collect_existing_wires(sch)
+
+            # If splitting created the exact segment we need (both endpoints
+            # were on the same wire's interior), the connection already exists
+            # — skip routing to avoid drawing a redundant U-detour path.
+            direct_exists = any(
+                (
+                    abs(ax - start_x) <= tol and abs(ay - start_y) <= tol
+                    and abs(bx - end_x) <= tol and abs(by - end_y) <= tol
+                ) or (
+                    abs(ax - end_x) <= tol and abs(ay - end_y) <= tol
+                    and abs(bx - start_x) <= tol and abs(by - start_y) <= tol
+                )
+                for ax, ay, bx, by in existing_wires
             )
-            if not ok:
-                return {"error": "No valid route found: all routing candidates overlap existing wires or collide with component pins"}
+            if not direct_exists:
+                ok = _draw_smart_wire(
+                    sch, start_x, start_y, end_x, end_y,
+                    existing_wires=existing_wires,
+                    start_angle=start_angle_wire,
+                    end_angle=end_angle_wire,
+                    obstacle_pins=obstacles,
+                )
+                if not ok:
+                    return {"error": "No valid route found: all routing candidates overlap existing wires or collide with component pins"}
+
+            shutil.copy(schematic_path, schematic_path + ".bak")
+            sch.write(schematic_path)
+        except Exception as exc:
+            return {"error": f"Failed to add wire: {exc}"}
+
+        return {
+            "success": True,
+            "wire": {
+                "start": {"x": start_x, "y": start_y},
+                "end": {"x": end_x, "y": end_y},
+            },
+            "junctions_added": junctions_added,
+            "file_modified": schematic_path,
+            "backup_path": schematic_path + ".bak",
+        }
+
+    @mcp.tool()
+    async def add_wire_to_schematic(
+        schematic_path: str,
+        start_x: float,
+        start_y: float,
+        end_x: float,
+        end_y: float,
+        add_junction_start: bool = False,
+        add_junction_end: bool = False,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Draw a single horizontal or vertical wire segment (naive fallback).
+
+        **Use this tool only if connect_pins_with_wire and
+        connect_points_with_wire have both failed.** If this tool also fails,
+        stop and report the failure and the coordinates to the user.
+
+        Only horizontal (same Y) or vertical (same X) segments are supported.
+        Returns an error for diagonal endpoints — use
+        ``connect_points_with_wire`` for those.
+
+        Junction behaviour:
+
+        * If an endpoint lies on the **interior** of an existing wire, a
+          junction is placed and that wire is split at the endpoint.
+        * If an endpoint coincides with an existing wire endpoint or a pin
+          that already has a wire, a junction is placed automatically.
+        * ``add_junction_start`` / ``add_junction_end`` force a junction at
+          that endpoint.
+
+        A backup (.kicad_sch.bak) is written before saving.
+
+        Args:
+            schematic_path: Absolute path to the target .kicad_sch file.
+            start_x: X coordinate of the wire start in mm.
+            start_y: Y coordinate of the wire start in mm.
+            end_x: X coordinate of the wire end in mm.
+            end_y: Y coordinate of the wire end in mm.
+            add_junction_start: Force a junction dot at the start point.
+            add_junction_end: Force a junction dot at the end point.
+
+        Returns:
+            dict with keys: success (bool), wire (start/end coords),
+            junctions_added (list of {x, y} for every junction inserted).
+        """
+        if not schematic_path.endswith(".kicad_sch"):
+            return {"error": f"Not a .kicad_sch file: {schematic_path!r}"}
+        if not os.path.isfile(schematic_path):
+            return {"error": f"Schematic file not found: {schematic_path!r}"}
+        for name, val in [
+            ("start_x", start_x), ("start_y", start_y),
+            ("end_x", end_x), ("end_y", end_y),
+        ]:
+            if not math.isfinite(val):
+                return {"error": f"Coordinate '{name}' must be a finite number (got {val})"}
+        if start_x == end_x and start_y == end_y:
+            return {"error": "Wire start and end points are identical (zero-length wire)"}
+        if abs(start_x - end_x) > 1e-9 and abs(start_y - end_y) > 1e-9:
+            return {
+                "error": (
+                    "add_wire_to_schematic only supports horizontal or vertical segments. "
+                    f"Got start=({start_x}, {start_y}) end=({end_x}, {end_y}). "
+                    "Use connect_points_with_wire for orthogonal routing."
+                )
+            }
+
+        try:
+            sch = skip.Schematic(schematic_path)
+        except Exception as exc:
+            return {"error": f"Failed to open schematic: {exc}"}
+
+        try:
+            existing_wires = _collect_existing_wires(sch)
+            tol = _PIN_COLLISION_TOL
+
+            def _is_on_wire_interior(px: float, py: float) -> bool:
+                return any(
+                    _point_on_open_segment(px, py, ax, ay, bx, by, tol)
+                    for (ax, ay, bx, by) in existing_wires
+                )
+
+            junctions_added: list[dict[str, float]] = []
+            for jx, jy, flag in [
+                (start_x, start_y, add_junction_start),
+                (end_x, end_y, add_junction_end),
+            ]:
+                needs = (
+                    flag
+                    or _is_on_wire_interior(jx, jy)
+                    or (_wire_connected_at(sch, jx, jy) and not _junction_exists_at(sch, jx, jy))
+                )
+                if needs:
+                    if _add_junction_and_split(sch, jx, jy):
+                        junctions_added.append({"x": jx, "y": jy})
+
+            # Refresh after any splits: the pre-split long wire is gone,
+            # replaced by shorter segments.  If splitting already created the
+            # exact segment we need, skip drawing to avoid a duplicate wire.
+            existing_wires = _collect_existing_wires(sch)
+            segment_exists = any(
+                (
+                    abs(ax - start_x) <= tol and abs(ay - start_y) <= tol
+                    and abs(bx - end_x) <= tol and abs(by - end_y) <= tol
+                ) or (
+                    abs(ax - end_x) <= tol and abs(ay - end_y) <= tol
+                    and abs(bx - start_x) <= tol and abs(by - start_y) <= tol
+                )
+                for ax, ay, bx, by in existing_wires
+            )
+            if not segment_exists:
+                w = sch.wire.new()
+                w.start_at([start_x, start_y])
+                w.end_at([end_x, end_y])
 
             shutil.copy(schematic_path, schematic_path + ".bak")
             sch.write(schematic_path)
