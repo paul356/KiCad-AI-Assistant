@@ -1084,16 +1084,22 @@ if _WX_AVAILABLE:
 
                 parts.append("</body></html>")
                 self._conv_view.SetPage("".join(parts))
-                # Defer scroll until after layout is complete
+                # Defer scroll until after layout is complete.
+                # GetScrollRange must be called inside the lambda so it reflects
+                # the new page geometry rather than the stale pre-SetPage value.
                 if _at_bottom:
                     wx.CallAfter(
-                        self._conv_view.Scroll, 0,
-                        self._conv_view.GetScrollRange(wx.VERTICAL)
+                        lambda: self._conv_view.Scroll(
+                            0, self._conv_view.GetScrollRange(wx.VERTICAL)
+                        )
                     )
                 else:
-                    _new_max = self._conv_view.GetScrollRange(wx.VERTICAL)
-                    _new_pos = int(_pos * _new_max / _max) if _max > 0 else 0
-                    wx.CallAfter(self._conv_view.Scroll, 0, _new_pos)
+                    _frac = _pos / _max if _max > 0 else 0.0
+                    wx.CallAfter(
+                        lambda f=_frac: self._conv_view.Scroll(
+                            0, int(f * self._conv_view.GetScrollRange(wx.VERTICAL))
+                        )
+                    )
 
         @staticmethod
         def _json_dump_safe(value: Any, *, indent: int | None = None) -> str:
