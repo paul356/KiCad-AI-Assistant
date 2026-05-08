@@ -784,6 +784,48 @@ def _wire_connected_at(sch: Any, px: float, py: float, tol: float = 0.01) -> boo
     return False
 
 
+def _points_already_connected(
+    existing_wires: list[tuple[float, float, float, float]],
+    x1: float, y1: float,
+    x2: float, y2: float,
+    tol: float,
+) -> bool:
+    """Return True if (x1,y1) and (x2,y2) are already electrically connected
+    through the existing wire network.
+
+    Uses a BFS over wire endpoints.  Two points are considered the same node
+    when their coordinates are within *tol* mm of each other.  A point that
+    lies on the interior of a wire segment (not at an endpoint) is also
+    reachable via that wire.
+    """
+    if abs(x1 - x2) <= tol and abs(y1 - y2) <= tol:
+        return True
+
+    def _neighbors(px: float, py: float) -> list[tuple[float, float]]:
+        result: list[tuple[float, float]] = []
+        for ax, ay, bx, by in existing_wires:
+            a_match = abs(ax - px) <= tol and abs(ay - py) <= tol
+            b_match = abs(bx - px) <= tol and abs(by - py) <= tol
+            interior = _point_on_open_segment(px, py, ax, ay, bx, by, tol)
+            if a_match or interior:
+                result.append((bx, by))
+            if b_match or interior:
+                result.append((ax, ay))
+        return result
+
+    visited: list[tuple[float, float]] = [(x1, y1)]
+    queue: list[tuple[float, float]] = [(x1, y1)]
+    while queue:
+        cx, cy = queue.pop()
+        for nx, ny in _neighbors(cx, cy):
+            if abs(nx - x2) <= tol and abs(ny - y2) <= tol:
+                return True
+            if not any(abs(nx - vx) <= tol and abs(ny - vy) <= tol for vx, vy in visited):
+                visited.append((nx, ny))
+                queue.append((nx, ny))
+    return False
+
+
 def _split_wires_at_point(sch: Any, px: float, py: float, tol: float = 0.01) -> int:
     """Split any wire whose interior contains (px, py) into two segments.
 
@@ -927,6 +969,14 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
             obstacles = [(x, y) for x, y, _ in all_pin_data]
             existing_wires = _collect_existing_wires(sch)
             tol = _PIN_COLLISION_TOL
+
+            if _points_already_connected(existing_wires, start_x, start_y, end_x, end_y, tol):
+                return {
+                    "error": (
+                        f"Points ({start_x}, {start_y}) and ({end_x}, {end_y}) are already "
+                        "connected through existing wires — no new wire needed."
+                    )
+                }
 
             def _find_pin_angle(px: float, py: float) -> float | None:
                 for (x, y, angle) in all_pin_data:
@@ -1076,6 +1126,14 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
             existing_wires = _collect_existing_wires(sch)
             tol = _PIN_COLLISION_TOL
 
+            if _points_already_connected(existing_wires, start_x, start_y, end_x, end_y, tol):
+                return {
+                    "error": (
+                        f"Points ({start_x}, {start_y}) and ({end_x}, {end_y}) are already "
+                        "connected through existing wires — no new wire needed."
+                    )
+                }
+
             def _is_on_wire_interior(px: float, py: float) -> bool:
                 return any(
                     _point_on_open_segment(px, py, ax, ay, bx, by, tol)
@@ -1198,6 +1256,17 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
                     "schematic coordinate — they are co-located on a shared stub and are "
                     "already connected. No wire was drawn."
                 ),
+            }
+
+        existing_wires_precheck = _collect_existing_wires(sch)
+        if _points_already_connected(
+            existing_wires_precheck, start_x, start_y, end_x, end_y, _PIN_COLLISION_TOL
+        ):
+            return {
+                "error": (
+                    f"{from_ref} pin {from_pin} and {to_ref} pin {to_pin} are already "
+                    "connected through existing wires — no new wire needed."
+                )
             }
 
         try:
