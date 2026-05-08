@@ -81,6 +81,145 @@ def _align_to_grid(value: float, grid_size: float = 1.27) -> float:
     return round(value / grid_size) * grid_size
 
 
+# ---------------------------------------------------------------------------
+# Pin-on-wire conflict detection for safe symbol placement
+# ---------------------------------------------------------------------------
+
+_PLACE_GRID: float = 2.54   # mm — standard KiCad schematic grid
+_PLACE_TOL: float = 0.5     # mm — tolerance for pin-on-wire detection
+
+
+def _extract_lib_pin_positions(lib_sym_raw: list) -> list[tuple[float, float]]:
+    """Return the (x, y) connection-point of every pin in library coordinates (Y-up).
+
+    Reads every ``(pin ...)`` node from all sub-symbol unit nodes in
+    *lib_sym_raw* and extracts the ``(at x y ...)`` coordinate.
+    """
+    positions: list[tuple[float, float]] = []
+    for entry in lib_sym_raw[2:]:
+        if not (
+            isinstance(entry, list)
+            and len(entry) >= 2
+            and isinstance(entry[0], sexpdata.Symbol)
+            and entry[0].value() == "symbol"
+        ):
+            continue
+        for child in entry[2:]:
+            if not (
+                isinstance(child, list)
+                and len(child) >= 1
+                and isinstance(child[0], sexpdata.Symbol)
+                and child[0].value() == "pin"
+            ):
+                continue
+            for sub in child[1:]:
+                if (
+                    isinstance(sub, list)
+                    and len(sub) >= 3
+                    and isinstance(sub[0], sexpdata.Symbol)
+                    and sub[0].value() == "at"
+                ):
+                    try:
+                        positions.append((float(sub[1]), float(sub[2])))
+                    except (TypeError, ValueError):
+                        pass
+                    break
+    return positions
+
+
+def _lib_pins_world(
+    lib_sym_raw: list,
+    sym_x: float,
+    sym_y: float,
+    rotation: int,
+) -> list[tuple[float, float]]:
+    """Return world-space (x, y) for every pin of *lib_sym_raw* placed at
+    (sym_x, sym_y) with the given rotation.
+
+    Uses the same transform as the skip library fallback: each 90° CW step
+    rotates the lib position as ``(x, y) → (y, −x)``, then
+    ``world_x = sym_x + rx``, ``world_y = sym_y − ry`` (lib Y axis is flipped).
+    """
+    steps = (rotation // 90) % 4
+    world: list[tuple[float, float]] = []
+    for lx, ly in _extract_lib_pin_positions(lib_sym_raw):
+        rx, ry = lx, ly
+        for _ in range(steps):
+            rx, ry = ry, -rx
+        world.append((round(sym_x + rx, 4), round(sym_y - ry, 4)))
+    return world
+
+
+def _pin_on_wire(
+    px: float, py: float,
+    wires: list[tuple[float, float, float, float]],
+    tol: float,
+) -> bool:
+    """Return True if (px, py) coincides with the interior or an endpoint of
+    any wire segment.
+
+    Both wire endpoints and axis-aligned interiors are treated as conflicts so
+    that newly placed symbol pins are fully isolated from all existing wiring.
+    """
+    for ax, ay, bx, by in wires:
+        if abs(px - ax) <= tol and abs(py - ay) <= tol:
+            return True
+        if abs(px - bx) <= tol and abs(py - by) <= tol:
+            return True
+        # Interior of an axis-aligned segment
+        if abs(ay - by) < 1e-9:  # horizontal
+            if abs(py - ay) <= tol:
+                lo = min(ax, bx) + tol
+                hi = max(ax, bx) - tol
+                if lo <= px <= hi:
+                    return True
+        elif abs(ax - bx) < 1e-9:  # vertical
+            if abs(px - ax) <= tol:
+                lo = min(ay, by) + tol
+                hi = max(ay, by) - tol
+                if lo <= py <= hi:
+                    return True
+    return False
+
+
+def _find_safe_placement(
+    lib_sym_raw: list,
+    x: float,
+    y: float,
+    rotation: int,
+    wires: list[tuple[float, float, float, float]],
+) -> tuple[float, float]:
+    """Return the nearest 2.54 mm grid position to (x, y) where no pin of the
+    placed symbol lands on any existing wire (interior or endpoint).
+
+    Expands outward in Chebyshev shells of 1–5 grid steps (up to 12.7 mm).
+    Returns the original coordinates unchanged if no conflict exists or if no
+    conflict-free position is found within the search radius.
+    """
+    def _conflicts(cx: float, cy: float) -> bool:
+        return any(
+            _pin_on_wire(px, py, wires, _PLACE_TOL)
+            for px, py in _lib_pins_world(lib_sym_raw, cx, cy, rotation)
+        )
+
+    if not _conflicts(x, y):
+        return x, y
+
+    for shell in range(1, 6):
+        candidates: list[tuple[float, float]] = [
+            (x + dx * _PLACE_GRID, y + dy * _PLACE_GRID)
+            for dx in range(-shell, shell + 1)
+            for dy in range(-shell, shell + 1)
+            if max(abs(dx), abs(dy)) == shell
+        ]
+        candidates.sort(key=lambda p: (p[0] - x) ** 2 + (p[1] - y) ** 2)
+        for cx, cy in candidates:
+            if not _conflicts(cx, cy):
+                return cx, cy
+
+    return x, y
+
+
 def _do_add_symbol(
     schematic_path: str,
     library_name: str,
@@ -170,6 +309,20 @@ def _do_add_symbol(
 
         project_name = _find_project_name(schematic_path)
 
+        # Collect existing wires and adjust placement if any pin would land
+        # on a wire interior or endpoint.
+        existing_wires: list[tuple[float, float, float, float]] = []
+        try:
+            for w in sch.wire:
+                existing_wires.append((
+                    float(w.start.value[0]), float(w.start.value[1]),
+                    float(w.end.value[0]),   float(w.end.value[1]),
+                ))
+        except AttributeError:
+            pass
+        original_x, original_y = x, y
+        x, y = _find_safe_placement(lib_sym_raw, x, y, rotation, existing_wires)
+
         placements: list[tuple[int, float, float, int, str | None]] = []
         for unit in range(1, unit_count + 1):
             unit_y = y + (unit - 1) * 10.0
@@ -189,17 +342,19 @@ def _do_add_symbol(
 
         body_bbox = _placed_world_bbox(lib_sym_raw, placements)
 
-        return {
+        result: dict[str, Any] = {
             "success": True,
             "reference_assigned": reference,
             "lib_id": lib_id_str,
             "units_added": unit_count,
             "position": {"x": x, "y": y},
+            "position_adjusted": x != original_x or y != original_y,
             "body_bbox": body_bbox,
             "warnings": [],
             "file_modified": schematic_path,
             "backup_path": schematic_path + ".bak",
         }
+        return result
     except Exception as exc:
         log.exception("Unexpected error in _do_add_symbol")
         return {"error": str(exc), "success": False}
