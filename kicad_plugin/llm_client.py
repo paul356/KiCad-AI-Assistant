@@ -225,7 +225,6 @@ _PROMPT_SCHEMATIC = """\
       If this fails, **stop and report** the tool name
       (connect_points_with_wire), the exact arguments used, and the full
       error message to the user.
-   Use **add_junction_to_schematic** for explicit T/X junctions.
 
 # Wiring strategy
 - The required pin on each component is dictated by the **circuit's
@@ -255,6 +254,10 @@ _PROMPT_SCHEMATIC = """\
 - If the electrically-correct pin pair would produce a long or cluttered
   wire, consider **rotating or moving one of the components** instead of
   picking a different (wrong) pin.
+- Do **not** break a wire into multiple segments by calling a wiring tool
+  multiple times. Always provide the direct start and end points in a
+  single call; the routing algorithm handles all intermediate bends
+  automatically.
 
 # Spacing & layout rules
 - Keep at least one grid step (1.27 mm) of clearance between symbol body

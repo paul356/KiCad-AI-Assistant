@@ -907,8 +907,6 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
         start_y: float,
         end_x: float,
         end_y: float,
-        add_junction_start: bool = False,
-        add_junction_end: bool = False,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Route a smart orthogonal wire between two raw schematic coordinates.
@@ -929,8 +927,6 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
           (required so KiCad ≥ 10 keeps the junction on reload).
         * If an endpoint coincides with an existing wire endpoint or a pin
           that already has a wire, a junction is placed automatically.
-        * ``add_junction_start`` / ``add_junction_end`` force a junction at
-          that endpoint regardless of the heuristics above.
 
         A backup (.kicad_sch.bak) is written before saving.
 
@@ -940,8 +936,6 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
             start_y: Y coordinate of the wire start in mm.
             end_x: X coordinate of the wire end in mm.
             end_y: Y coordinate of the wire end in mm.
-            add_junction_start: Force a junction dot at the start point.
-            add_junction_end: Force a junction dot at the end point.
 
         Returns:
             dict with keys: success (bool), wire (start/end coords),
@@ -992,13 +986,9 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
                 )
 
             junctions_added: list[dict[str, float]] = []
-            for jx, jy, flag in [
-                (start_x, start_y, add_junction_start),
-                (end_x, end_y, add_junction_end),
-            ]:
+            for jx, jy in [(start_x, start_y), (end_x, end_y)]:
                 needs = (
-                    flag
-                    or _is_on_wire_interior(jx, jy)
+                    _is_on_wire_interior(jx, jy)
                     or (_wire_connected_at(sch, jx, jy) and not _junction_exists_at(sch, jx, jy))
                 )
                 if needs:
@@ -1058,8 +1048,6 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
         start_y: float,
         end_x: float,
         end_y: float,
-        add_junction_start: bool = False,
-        add_junction_end: bool = False,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Draw a single horizontal or vertical wire segment (naive fallback).
@@ -1078,8 +1066,6 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
           junction is placed and that wire is split at the endpoint.
         * If an endpoint coincides with an existing wire endpoint or a pin
           that already has a wire, a junction is placed automatically.
-        * ``add_junction_start`` / ``add_junction_end`` force a junction at
-          that endpoint.
 
         A backup (.kicad_sch.bak) is written before saving.
 
@@ -1089,8 +1075,6 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
             start_y: Y coordinate of the wire start in mm.
             end_x: X coordinate of the wire end in mm.
             end_y: Y coordinate of the wire end in mm.
-            add_junction_start: Force a junction dot at the start point.
-            add_junction_end: Force a junction dot at the end point.
 
         Returns:
             dict with keys: success (bool), wire (start/end coords),
@@ -1141,13 +1125,9 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
                 )
 
             junctions_added: list[dict[str, float]] = []
-            for jx, jy, flag in [
-                (start_x, start_y, add_junction_start),
-                (end_x, end_y, add_junction_end),
-            ]:
+            for jx, jy in [(start_x, start_y), (end_x, end_y)]:
                 needs = (
-                    flag
-                    or _is_on_wire_interior(jx, jy)
+                    _is_on_wire_interior(jx, jy)
                     or (_wire_connected_at(sch, jx, jy) and not _junction_exists_at(sch, jx, jy))
                 )
                 if needs:
@@ -1428,155 +1408,3 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
         if not_found:
             result["not_found"] = not_found
         return result
-
-    @mcp.tool()
-    async def add_junction_to_schematic(
-        schematic_path: str,
-        x: float,
-        y: float,
-        ctx: Context | None = None,
-    ) -> dict[str, Any]:
-        """Add a junction dot to a KiCad schematic at a given coordinate.
-
-        A junction is required wherever a wire endpoint or pin lies on the
-        interior of another wire (T-junction), to mark the electrical
-        connection explicitly.
-
-        If the requested point lies on the **interior** of an existing wire
-        segment, that wire is automatically split into two segments meeting
-        at the junction coordinate. This is required because KiCad ≥ 10
-        silently deletes any junction that does not coincide with at least
-        one wire endpoint when the schematic is reopened.
-
-        A backup (.kicad_sch.bak) is written before saving.
-
-        Args:
-            schematic_path: Absolute path to the target .kicad_sch file.
-            x: X coordinate for the junction in mm.
-            y: Y coordinate for the junction in mm.
-
-        Returns:
-            dict with keys: success (bool), junction (x, y coords).
-        """
-        if not schematic_path.endswith(".kicad_sch"):
-            return {"error": f"Not a .kicad_sch file: {schematic_path!r}"}
-        if not os.path.isfile(schematic_path):
-            return {"error": f"Schematic file not found: {schematic_path!r}"}
-        if not math.isfinite(x) or not math.isfinite(y):
-            return {"error": f"Coordinates must be finite numbers (got x={x}, y={y})"}
-
-        try:
-            sch = skip.Schematic(schematic_path)
-        except Exception as exc:
-            return {"error": f"Failed to open schematic: {exc}"}
-
-        try:
-            _add_junction_and_split(sch, x, y)
-
-            save_schematic(schematic_path, sch)
-        except Exception as exc:
-            return {"error": f"Failed to add junction: {exc}"}
-
-        return {"success": True, "junction": {"x": x, "y": y}, "file_modified": schematic_path, "backup_path": schematic_path + ".bak"}
-
-    @mcp.tool()
-    async def list_junctions_in_schematic(
-        schematic_path: str,
-        ctx: Context | None = None,
-    ) -> dict[str, Any]:
-        """List all junction dots present in a KiCad schematic.
-
-        Returns every junction's coordinates (in mm).  Use the returned
-        coordinates with delete_junction_from_schematic to remove a specific
-        junction.
-
-        Args:
-            schematic_path: Absolute path to the target .kicad_sch file.
-
-        Returns:
-            dict with keys: success (bool), junctions (list of {x, y} dicts),
-            count (int).
-        """
-        if not schematic_path.endswith(".kicad_sch"):
-            return {"error": f"Not a .kicad_sch file: {schematic_path!r}"}
-        if not os.path.isfile(schematic_path):
-            return {"error": f"Schematic file not found: {schematic_path!r}"}
-
-        try:
-            sch = skip.Schematic(schematic_path)
-        except Exception as exc:
-            return {"error": f"Failed to open schematic: {exc}"}
-
-        junctions = []
-        try:
-            for j in sch.junction:
-                coords = j.at.value
-                junctions.append({"x": float(coords[0]), "y": float(coords[1])})
-        except AttributeError:
-            pass  # no junctions in schematic
-
-        return {"success": True, "junctions": junctions, "count": len(junctions)}
-
-    @mcp.tool()
-    async def delete_junction_from_schematic(
-        schematic_path: str,
-        x: float,
-        y: float,
-        tolerance: float = 0.01,
-        ctx: Context | None = None,
-    ) -> dict[str, Any]:
-        """Delete a junction dot from a KiCad schematic by its coordinates.
-
-        Removes all junctions whose position matches (x, y) within the
-        specified tolerance.  Use list_junctions_in_schematic first to obtain
-        the exact coordinates.  A backup (.kicad_sch.bak) is written before
-        saving.
-
-        Args:
-            schematic_path: Absolute path to the target .kicad_sch file.
-            x: X coordinate of the junction in mm.
-            y: Y coordinate of the junction in mm.
-            tolerance: Maximum coordinate difference considered a match
-                (default 0.01 mm).
-
-        Returns:
-            dict with keys: success (bool), deleted_count (int).
-        """
-        if not schematic_path.endswith(".kicad_sch"):
-            return {"error": f"Not a .kicad_sch file: {schematic_path!r}"}
-        if not os.path.isfile(schematic_path):
-            return {"error": f"Schematic file not found: {schematic_path!r}"}
-        if not math.isfinite(x) or not math.isfinite(y):
-            return {"error": f"Coordinates must be finite numbers (got x={x}, y={y})"}
-
-        try:
-            sch = skip.Schematic(schematic_path)
-        except Exception as exc:
-            return {"error": f"Failed to open schematic: {exc}"}
-
-        try:
-            to_delete = []
-            try:
-                for j in sch.junction:
-                    coords = j.at.value
-                    jx, jy = float(coords[0]), float(coords[1])
-                    if abs(jx - x) <= tolerance and abs(jy - y) <= tolerance:
-                        to_delete.append(j)
-            except AttributeError:
-                pass  # no junctions
-
-            if not to_delete:
-                return {
-                    "error": (
-                        f"No junction found at ({x}, {y}) within tolerance {tolerance}"
-                    )
-                }
-
-            for j in to_delete:
-                j.delete()
-
-            save_schematic(schematic_path, sch)
-        except Exception as exc:
-            return {"error": f"Failed to delete junction: {exc}"}
-
-        return {"success": True, "deleted_count": len(to_delete), "file_modified": schematic_path, "backup_path": schematic_path + ".bak"}
