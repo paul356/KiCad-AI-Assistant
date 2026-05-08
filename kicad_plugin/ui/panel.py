@@ -59,9 +59,6 @@ if _WX_AVAILABLE:
             self._schematic_edited: bool = False
             # Set to True when any tool modifies a .kicad_pcb file this turn
             self._pcb_edited: bool = False
-            # Tool calls buffered during the current AI turn; flushed into the
-            # AI conv_entry when the turn finishes.
-            self._pending_tool_calls: list[dict] = []
             # Structured conversation history for HTML rendering.
             # Each entry is one of:
             #   {"type": "user",   "text": str}
@@ -338,7 +335,6 @@ if _WX_AVAILABLE:
             # Reset streaming state and start the flush timer
             self._stream_buffer.clear()
             self._pending_ai_text = ""
-            self._pending_tool_calls = []
             self._tool_calls_made = False
             self._schematic_edited = False
             self._pcb_edited = False
@@ -373,23 +369,15 @@ if _WX_AVAILABLE:
             self._stream_timer.Stop()
             self._on_stream_flush(None)
 
-            tools_snapshot = list(self._pending_tool_calls)
-            self._pending_tool_calls = []
-
-            # Remove the transient in-progress tool lines; they will be
-            # replaced by the folded tool details inside the AI entry.
-            self._conv_entries = [e for e in self._conv_entries if e["type"] != "tool"]
-
             if not was_streamed:
-                self._conv_entries.append({"type": "ai", "text": reply, "tools": tools_snapshot})
+                self._conv_entries.append({"type": "ai", "text": reply})
                 self._render_conversation()
             else:
-                # Finalise the streamed text as a proper AI entry
+                # Finalise any remaining streamed text as a proper AI entry
                 if self._pending_ai_text:
                     self._conv_entries.append({
                         "type": "ai",
                         "text": self._pending_ai_text,
-                        "tools": tools_snapshot,
                     })
                     self._pending_ai_text = ""
                     self._render_conversation()
@@ -415,15 +403,14 @@ if _WX_AVAILABLE:
             self._render_conversation()
 
         def _on_tool_call(self, name: str, args: dict, result: Any) -> None:
-            # Buffer for embedding into the AI entry when the turn finishes.
-            self._pending_tool_calls.append({"name": name, "args": args, "result": result})
-            # Show a lightweight in-progress line while the turn is still running
-            # so the user sees activity.  This entry is not persisted — it will
-            # be replaced by the final AI entry in _on_reply.
-            ok = result.get("success", True) if isinstance(result, dict) else True
-            icon = "✓" if ok else "✗"
-            summary = result.get("message", "") if isinstance(result, dict) else str(result)
-            self._conv_entries.append({"type": "tool", "text": f"↳ {name}  {icon} {summary}"})
+            # If there is pending streamed text that preceded this tool call,
+            # finalise it as an AI entry now so the timeline order is correct.
+            if self._pending_ai_text:
+                self._conv_entries.append({"type": "ai", "text": self._pending_ai_text})
+                self._pending_ai_text = ""
+            # Append as a permanent timeline entry so tool calls appear in
+            # chronological order alongside user and AI messages.
+            self._conv_entries.append({"type": "tool_call", "name": name, "args": args, "result": result})
             self._render_conversation()
             self._tool_calls_made = True
             if isinstance(result, dict) and str(result.get("file_modified", "")).endswith(".kicad_sch"):
@@ -520,7 +507,6 @@ if _WX_AVAILABLE:
             self._stream_timer.Stop()
             self._stream_buffer.clear()
             self._conv_entries.clear()
-            self._pending_tool_calls = []
             self._pending_ai_text = ""
             self._current_session_file = None
             self._render_conversation()
@@ -658,7 +644,6 @@ if _WX_AVAILABLE:
             self._stream_timer.Stop()
             self._stream_buffer.clear()
             self._pending_ai_text = ""
-            self._pending_tool_calls = []
             self._conv_entries = data.get("conv_entries", [])
             if self._llm_client:
                 self._llm_client.set_history(data.get("llm_history", []))
@@ -680,7 +665,6 @@ if _WX_AVAILABLE:
             self._stream_timer.Stop()
             self._stream_buffer.clear()
             self._conv_entries.clear()
-            self._pending_tool_calls = []
             self._pending_ai_text = ""
             self._render_conversation()
             if self._llm_client:
@@ -1017,7 +1001,7 @@ if _WX_AVAILABLE:
 
             for entry in self._conv_entries:
                 typ = entry["type"]
-                text = entry["text"]
+                text = entry.get("text", "")
                 if typ == "user":
                     body = _h.escape(text).replace("\n", "<br>")
                     parts.append(_msg_block("You", self._C_USER_HEX, "#EBF0FF", body))
@@ -1029,12 +1013,33 @@ if _WX_AVAILABLE:
                     else:
                         tools_html = _tool_html_plain(tools)
                     parts.append(_msg_block("AI", self._C_AI_HEX, "#EBF7F2", body, tools_html))
-                elif typ == "tool":
-                    # Transient in-progress line shown while the turn is running
-                    escaped = _h.escape(text)
-                    parts.append(
-                        f'<p style="margin: 2px 8px;"><font color="{self._C_TOOL_HEX}"><i>{escaped}</i></font></p>'
-                    )
+                elif typ == "tool_call":
+                    if self._use_webview:
+                        ok = entry["result"].get("success", True) if isinstance(entry["result"], dict) else True
+                        icon = "✓" if ok else "✗"
+                        icon_color = "#4caf50" if ok else "#f44336"
+                        css = "tool-entry tool-ok" if ok else "tool-entry tool-err"
+                        args_txt = _h.escape(_json.dumps(entry["args"], separators=(",", ":"), default=str))
+                        result_txt = _h.escape(_json.dumps(entry["result"], separators=(",", ":"), default=str))
+                        tname = _h.escape(entry["name"])
+                        parts.append(
+                            f'<details class="tools" style="margin: 2px 8px;">'
+                            f'<summary><span style="color:{icon_color}">{icon}</span> '
+                            f'<span style="color:{self._C_TOOL_HEX}">↳ {tname}</span></summary>'
+                            f'<div class="{css}">'
+                            f'<span style="color:#555">args:</span> {args_txt}<br>'
+                            f'<span style="color:#555">result:</span> {result_txt}'
+                            f'</div>'
+                            f'</details>'
+                        )
+                    else:
+                        ok = entry["result"].get("success", True) if isinstance(entry["result"], dict) else True
+                        icon = "&#x2713;" if ok else "&#x2717;"
+                        tname = _h.escape(entry["name"])
+                        color = self._C_OK_HEX if ok else self._C_ERR_HEX
+                        parts.append(
+                            f'<p style="margin: 2px 8px;"><font color="{color}"><tt>{icon} ↳ {tname}</tt></font></p>'
+                        )
                 elif typ == "status":
                     color = entry.get("color_hex", "#1E1E1E")
                     escaped = _h.escape(text)
@@ -1043,12 +1048,7 @@ if _WX_AVAILABLE:
             # Show pending streamed AI text
             if self._pending_ai_text:
                 body = self._md_to_html(self._pending_ai_text)
-                # Pending tool calls shown while streaming
-                if self._use_webview:
-                    tools_html = _tool_html_webview(self._pending_tool_calls)
-                else:
-                    tools_html = _tool_html_plain(self._pending_tool_calls)
-                parts.append(_msg_block("AI", self._C_AI_HEX, "#EBF7F2", body, tools_html))
+                parts.append(_msg_block("AI", self._C_AI_HEX, "#EBF7F2", body))
 
             if self._use_webview:
                 # Read the current scroll position BEFORE SetPage (old page still loaded).
