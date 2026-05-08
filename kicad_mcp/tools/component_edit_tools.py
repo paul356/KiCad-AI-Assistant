@@ -12,6 +12,8 @@ import re
 import shutil
 import uuid
 from pathlib import Path
+
+from kicad_mcp.utils.schematic_sexp_utils import save_schematic
 from typing import Any
 
 import sexpdata
@@ -181,8 +183,7 @@ def _do_add_symbol(
             placements.append((unit, x, unit_y, rotation, None))
 
         try:
-            shutil.copy(schematic_path, schematic_path + ".bak")
-            sch.write(schematic_path)
+            save_schematic(schematic_path, sch)
         except Exception as exc:
             return {"error": f"Failed to save schematic: {exc}"}
 
@@ -1117,8 +1118,7 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
                         warnings.append(f"Could not remove lib_symbol {lib_id!r}: {exc}")
 
             try:
-                shutil.copy(schematic_path, schematic_path + ".bak")
-                sch.write(schematic_path)
+                save_schematic(schematic_path, sch)
             except Exception as exc:
                 return {"error": f"Failed to save schematic: {exc}"}
 
@@ -1242,8 +1242,7 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
                 action = "updated"
 
             try:
-                shutil.copy(schematic_path, schematic_path + ".bak")
-                sch.write(schematic_path)
+                save_schematic(schematic_path, sch)
             except Exception as exc:
                 return {"error": f"Failed to save schematic: {exc}"}
 
@@ -1415,8 +1414,7 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
                 }
 
             try:
-                shutil.copy(schematic_path, schematic_path + ".bak")
-                sch.write(schematic_path)
+                save_schematic(schematic_path, sch)
             except Exception as exc:
                 return {"error": f"Failed to save schematic: {exc}"}
 
@@ -1560,8 +1558,7 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
                     pass  # non-critical; symbol position still applied
 
             try:
-                shutil.copy(schematic_path, schematic_path + ".bak")
-                sch.write(schematic_path)
+                save_schematic(schematic_path, sch)
             except Exception as exc:
                 return {"error": f"Failed to save schematic: {exc}"}
 
@@ -1667,8 +1664,7 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
             lbl.value = text
             lbl.at.value = [x, y, angle]
 
-            shutil.copy(schematic_path, schematic_path + ".bak")
-            sch.write(schematic_path)
+            save_schematic(schematic_path, sch)
         except Exception as exc:
             return {"error": f"Failed to add label: {exc}"}
 
@@ -1827,8 +1823,7 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
 
                 if total_deleted > 0:
                     try:
-                        shutil.copy(schematic_path, schematic_path + ".bak")
-                        sch.write(schematic_path)
+                        save_schematic(schematic_path, sch)
                     except Exception as exc:
                         return {"error": f"Failed to save schematic: {exc}"}
 
@@ -1879,8 +1874,7 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
             for lbl in to_delete:
                 lbl.delete()
 
-            shutil.copy(schematic_path, schematic_path + ".bak")
-            sch.write(schematic_path)
+            save_schematic(schematic_path, sch)
         except Exception as exc:
             return {"error": f"Failed to delete label: {exc}"}
 

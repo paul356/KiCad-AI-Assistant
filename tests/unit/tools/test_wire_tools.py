@@ -128,6 +128,7 @@ class TestGetPinSchematicPosition:
 # add_wire_to_schematic — tests (naive H/V fallback tool)
 # ---------------------------------------------------------------------------
 
+@pytest.mark.skip(reason="add_wire_to_schematic intentionally removed")
 class TestAddWireToSchematic:
     """Tests for the naive horizontal/vertical-only fallback wire tool.
 
@@ -788,10 +789,11 @@ class TestDeleteWireFromSchematic:
         ))
 
     def _add_wire(self, tools, tmp_sch, sx, sy, ex, ey):
-        return asyncio.run(tools["add_wire_to_schematic"](
-            schematic_path=tmp_sch,
-            start_x=sx, start_y=sy, end_x=ex, end_y=ey,
-        ))
+        sch = skip.Schematic(tmp_sch)
+        w = sch.wire.new()
+        w.start_at([sx, sy])
+        w.end_at([ex, ey])
+        sch.write(tmp_sch)
 
     def _spec(self, sx, sy, ex, ey):
         return {"start_x": sx, "start_y": sy, "end_x": ex, "end_y": ey}
