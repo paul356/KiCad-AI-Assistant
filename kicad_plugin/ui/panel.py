@@ -11,6 +11,7 @@ Layout:
 from __future__ import annotations
 
 import collections
+import datetime
 import logging
 import os
 import threading
@@ -317,7 +318,7 @@ if _WX_AVAILABLE:
             if not text:
                 return
             self._input.Clear()
-            self._conv_entries.append({"type": "user", "text": text})
+            self._conv_entries.append({"type": "user", "text": text, "timestamp": datetime.datetime.now().strftime("%H:%M:%S")})
             # Create the session file on the very first message so current.json
             # is established before the AI responds.
             if self._current_session_file is None:
@@ -370,7 +371,7 @@ if _WX_AVAILABLE:
             self._on_stream_flush(None)
 
             if not was_streamed:
-                self._conv_entries.append({"type": "ai", "text": reply})
+                self._conv_entries.append({"type": "ai", "text": reply, "timestamp": datetime.datetime.now().strftime("%H:%M:%S")})
                 self._render_conversation()
             else:
                 # Finalise any remaining streamed text as a proper AI entry
@@ -378,6 +379,7 @@ if _WX_AVAILABLE:
                     self._conv_entries.append({
                         "type": "ai",
                         "text": self._pending_ai_text,
+                        "timestamp": datetime.datetime.now().strftime("%H:%M:%S"),
                     })
                     self._pending_ai_text = ""
                     self._render_conversation()
@@ -980,20 +982,33 @@ if _WX_AVAILABLE:
 
             if self._use_webview:
                 def _msg_block(sender: str, sender_color: str, bg_color: str,
-                               body_html: str, tools_html: str = "") -> str:
+                               body_html: str, tools_html: str = "",
+                               timestamp: str = "") -> str:
+                    ts_html = (
+                        f'<span style="float:right;font-size:8pt;color:#999;font-weight:normal">'
+                        f'{timestamp}</span>'
+                        if timestamp else ""
+                    )
                     return (
                         f'<table class="msg"><tr><td style="background:{bg_color}">'
                         f'<b><span style="color:{sender_color}">{sender}</span></b>'
+                        f'{ts_html}'
                         f'<br>{body_html}{tools_html}'
                         f'</td></tr></table>'
                     )
             else:
                 def _msg_block(sender: str, sender_color: str, bg_color: str,
-                               body_html: str, tools_html: str = "") -> str:
+                               body_html: str, tools_html: str = "",
+                               timestamp: str = "") -> str:
+                    ts_html = (
+                        f' <font size="2" color="#999999"><i>{timestamp}</i></font>'
+                        if timestamp else ""
+                    )
                     return (
                         f'<table width="100%" cellpadding="10" cellspacing="0" bgcolor="{bg_color}"'
                         f' border="0"><tr><td>'
                         f'<b><font color="{sender_color}" size="3">{sender}</font></b>'
+                        f'{ts_html}'
                         f'<br>{body_html}{tools_html}'
                         f'</td></tr></table>'
                         f'<br>'
@@ -1004,15 +1019,17 @@ if _WX_AVAILABLE:
                 text = entry.get("text", "")
                 if typ == "user":
                     body = _h.escape(text).replace("\n", "<br>")
-                    parts.append(_msg_block("You", self._C_USER_HEX, "#EBF0FF", body))
+                    ts = entry.get("timestamp", "")
+                    parts.append(_msg_block("You", self._C_USER_HEX, "#EBF0FF", body, timestamp=ts))
                 elif typ == "ai":
                     body = self._md_to_html(text)
                     tools = entry.get("tools") or []
+                    ts = entry.get("timestamp", "")
                     if self._use_webview:
                         tools_html = _tool_html_webview(tools)
                     else:
                         tools_html = _tool_html_plain(tools)
-                    parts.append(_msg_block("AI", self._C_AI_HEX, "#EBF7F2", body, tools_html))
+                    parts.append(_msg_block("AI", self._C_AI_HEX, "#EBF7F2", body, tools_html, timestamp=ts))
                 elif typ == "tool_call":
                     if self._use_webview:
                         ok = entry["result"].get("success", True) if isinstance(entry["result"], dict) else True
