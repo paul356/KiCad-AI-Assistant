@@ -98,18 +98,27 @@ def get_fp_at(fp_node: List[Any]) -> Tuple[float, float, float]:
 
 
 def set_fp_at(fp_node: List[Any], x: float, y: float, rotation: float) -> None:
-    """Update the ``at`` entry of a footprint node in-place."""
+    """Update the ``at`` entry of a footprint node in-place.
+
+    Also propagates any rotation change to child ``pad``, ``property``, and
+    ``fp_text`` nodes, which store their orientation as absolute board-space
+    degrees (clockwise-positive) in KiCad 10 PCB format.
+    """
     for sub in fp_node:
         if isinstance(sub, list) and len(sub) >= 3 and _sym(sub[0]) == "at":
+            old_rot = float(sub[3]) if len(sub) > 3 else 0.0
+            delta = rotation - old_rot
             sub[1] = x
             sub[2] = y
             if len(sub) > 3:
                 sub[3] = rotation
             elif rotation != 0.0:
                 sub.append(rotation)
+            _propagate_rotation_delta(fp_node, delta)
             return
-    # No `at` found — create one
+    # No `at` found — create one; treat old rotation as 0
     fp_node.append([sexpdata.Symbol("at"), x, y, rotation])
+    _propagate_rotation_delta(fp_node, rotation)
 
 
 def get_fp_property(fp_node: List[Any], name: str) -> Optional[str]:
@@ -142,6 +151,52 @@ def get_fp_layer(fp_node: List[Any]) -> Optional[str]:
         if isinstance(sub, list) and len(sub) >= 2 and _sym(sub[0]) == "layer":
             return sub[1] if isinstance(sub[1], str) else _sym(sub[1])
     return None
+
+
+# Child node types whose `at` rotation must track footprint rotation.
+# In KiCad 10 PCB format the rotation convention differs by child type:
+#
+#   pad       — stored rotation is *absolute board-space* (CW+).
+#               When footprint rotates by delta, pad rotation += delta.
+#
+#   property / fp_text — stored rotation is expressed so that the displayed
+#               text keeps the same absolute board orientation as the footprint
+#               moves.  When footprint rotates by delta, text rotation -= delta
+#               (this keeps text_stored + fp_rotation = constant, i.e. the
+#               label stays readable at the same angle in board space).
+_PAD_TYPES = {"pad"}
+_TEXT_TYPES = {"property", "fp_text"}
+
+
+def _propagate_rotation_delta(fp_node: List[Any], delta: float) -> None:
+    """Add *delta* degrees to the ``at`` rotation of all oriented children.
+
+    Pads receive ``+delta`` (absolute board orientation tracks footprint).
+    Text children (property, fp_text) receive ``-delta`` (they compensate so
+    the displayed text keeps the same absolute orientation).
+    The result is normalised to [0, 360).
+    """
+    if delta == 0.0:
+        return
+    for child in fp_node:
+        if not (isinstance(child, list) and len(child) >= 1):
+            continue
+        child_type = _sym(child[0])
+        if child_type in _PAD_TYPES:
+            sign = 1.0
+        elif child_type in _TEXT_TYPES:
+            sign = -1.0
+        else:
+            continue
+        for sub in child:
+            if isinstance(sub, list) and len(sub) >= 3 and _sym(sub[0]) == "at":
+                old_rot = float(sub[3]) if len(sub) > 3 else 0.0
+                new_rot = (old_rot + sign * delta) % 360
+                if len(sub) > 3:
+                    sub[3] = new_rot
+                elif new_rot != 0.0:
+                    sub.append(new_rot)
+                break
 
 
 def flip_fp_layers(fp_node: List[Any]) -> None:
