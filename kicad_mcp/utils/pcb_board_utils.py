@@ -279,7 +279,7 @@ def add_gr_arc(
 # Footprint courtyard / bounding box
 # ---------------------------------------------------------------------------
 
-_COURTYARD_LAYERS = {"F.Courtyard", "B.Courtyard", "F_Courtyard", "B_Courtyard"}
+_COURTYARD_LAYERS = {"F.Courtyard", "B.Courtyard", "F_Courtyard", "B_Courtyard", "F.CrtYd", "B.CrtYd"}
 _FP_GRAPHIC_TYPES = {"fp_line", "fp_rect", "fp_arc", "fp_circle", "fp_curve"}
 
 
@@ -309,11 +309,39 @@ def get_fp_courtyard_bbox(
     sin_t = math.sin(theta)
 
     def _to_world(lx: float, ly: float) -> Tuple[float, float]:
-        # KiCad CW rotation in Y-down space:
-        #   wx = fp_x + lx*cos - ly*sin    (standard 2-D CW rotation)
-        #   wy = fp_y + lx*sin + ly*cos
-        wx = fp_x + lx * cos_t - ly * sin_t
-        wy = fp_y + lx * sin_t + ly * cos_t
+        # Convert a footprint-local point (lx, ly) to board world coordinates.
+        #
+        # Variables:
+        #   fp_x, fp_y — footprint anchor in world mm (the "(at X Y rot)" field).
+        #                +X is right, +Y is DOWN (KiCad screen convention).
+        #   lx, ly     — coordinates of the point in the footprint's LOCAL frame,
+        #                i.e. relative to the footprint anchor before any rotation.
+        #                +lx is "right when the footprint is at 0°",
+        #                +ly is "down when the footprint is at 0°".
+        #   fp_rot_deg — KiCad rotation in CLOCKWISE-positive degrees
+        #                (0° = no rotation; 90° = rotated 90° clockwise on screen).
+        #
+        # Why the standard CCW formula is WRONG here:
+        #   The textbook CCW formula is:
+        #       wx = fp_x + lx*cos(θ) - ly*sin(θ)
+        #       wy = fp_y + lx*sin(θ) + ly*cos(θ)
+        #   KiCad's Y axis points DOWN, so a positive (clockwise) rotation of θ
+        #   is equivalent to a COUNTER-clockwise rotation of −θ in standard
+        #   right-handed math.  Substituting −θ:
+        #       cos(−θ) =  cos(θ)   sin(−θ) = −sin(θ)
+        #   gives the correct CW formula:
+        #       wx = fp_x + lx*cos(θ) + ly*sin(θ)   ← sign on ly*sin flipped
+        #       wy = fp_y - lx*sin(θ) + ly*cos(θ)   ← sign on lx*sin flipped
+        #
+        # Quick sanity check — footprint at (101,95), rotation=270°:
+        #   cos(270°)≈0, sin(270°)≈−1
+        #   CW formula:  wx = 101 + lx*0 + ly*(−1) = 101 − ly
+        #                wy =  95 − lx*(−1) + ly*0 =  95 + lx
+        #   For a corner at local (5.32, −5.27):
+        #       wx = 101 − (−5.27) = 106.27   ← correctly to the right of centre
+        #       wy =  95 +   5.32  = 100.32
+        wx = fp_x + lx * cos_t + ly * sin_t
+        wy = fp_y - lx * sin_t + ly * cos_t
         return wx, wy
 
     points: List[Tuple[float, float]] = []

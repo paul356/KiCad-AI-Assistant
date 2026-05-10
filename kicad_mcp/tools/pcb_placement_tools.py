@@ -5,21 +5,23 @@ Provides tools to reposition, flip, and update properties of footprints
 on a .kicad_pcb board.  All mutation tools create a .kicad_pcb.bak backup
 before writing.
 """
+
 import logging
-from typing import Any, Dict, Optional
+from typing import Any
 
 from fastmcp import Context, FastMCP
 
-from kicad_mcp.utils.pcb_sexp_utils import load_pcb, save_pcb
+from kicad_mcp.tools.pcb_placement_helpers import find_collisions
 from kicad_mcp.utils.pcb_footprint_utils import (
     find_footprint,
+    flip_fp_layers,
     get_fp_at,
     get_fp_layer,
     get_fp_property,
     set_fp_at,
     set_fp_property,
-    flip_fp_layers,
 )
+from kicad_mcp.utils.pcb_sexp_utils import load_pcb, save_pcb
 
 log = logging.getLogger(__name__)
 
@@ -31,11 +33,12 @@ def register_pcb_placement_tools(mcp: FastMCP) -> None:
     async def set_footprint_position(
         pcb_path: str,
         reference: str,
-        x: Optional[float],
-        y: Optional[float],
-        rotation: Optional[float],
+        x: float | None,
+        y: float | None,
+        rotation: float | None,
         ctx: Context | None,
-    ) -> Dict[str, Any]:
+        force: bool = False,
+    ) -> dict[str, Any]:
         """Move and/or rotate a footprint on the PCB board.
 
         PCB coordinates are mm with +X right, **+Y down**, and rotation
@@ -48,6 +51,16 @@ def register_pcb_placement_tools(mcp: FastMCP) -> None:
         Any of x, y, rotation may be omitted (None) to leave that value
         unchanged.  At least one of them must be provided.
 
+        By default (``force=False``) the tool refuses to place a
+        footprint if its courtyard would overlap any other footprint's
+        courtyard and returns an error without modifying the file.
+        **Do NOT set ``force=True`` as a routine workaround.** Only use
+        it when overlap is genuinely intentional and unavoidable (e.g.
+        edge connectors flush with the board edge, press-fit connectors,
+        or fiducials deliberately placed near other features). In all
+        other cases, call ``find_free_pcb_area`` first to obtain a
+        collision-free position.
+
         A .kicad_pcb.bak backup is created before writing.
 
         Args:
@@ -57,11 +70,17 @@ def register_pcb_placement_tools(mcp: FastMCP) -> None:
             y: New Y coordinate in mm (world), or None to keep current.
             rotation: New rotation in degrees clockwise-positive (any
                 value; KiCad normalises). None to keep current.
+            force: Override the courtyard collision guard.  **Default
+                False — only set True when overlap is genuinely
+                intentional** (e.g. edge connectors, fiducials).  A
+                warning is added to the result when overlaps are
+                detected and force is True.
             ctx: MCP context for progress reporting.
 
         Returns:
             dict with reference, previous {x, y, rotation}, new
-            {x, y, rotation}, backup_path, pcb_path.
+            {x, y, rotation}, backup_path, pcb_path, and an optional
+            ``warnings`` key when ``force=True`` and overlaps exist.
         """
         if x is None and y is None and rotation is None:
             return {"error": "At least one of x, y, rotation must be provided."}
@@ -77,26 +96,43 @@ def register_pcb_placement_tools(mcp: FastMCP) -> None:
         new_y = old_y if y is None else float(y)
         new_rot = old_rot if rotation is None else float(rotation)
 
+        # Collision check (footprint vs footprint only; board bounds not enforced)
+        collisions = find_collisions(data, [(reference, new_x, new_y, new_rot)])
+        if collisions and not force:
+            overlapping = collisions[0]["overlapping_with"]
+            return {
+                "error": "Collision detected: courtyard would overlap existing footprint(s).",
+                "overlapping_with": overlapping,
+                "proposed_position": {"x": new_x, "y": new_y, "rotation": new_rot},
+                "hint": "Call find_free_pcb_area to obtain a collision-free position. Only set force=True if the overlap is genuinely intentional (e.g. edge connectors, fiducials).",
+            }
+
         set_fp_at(fp, new_x, new_y, new_rot)
         try:
             backup_path = save_pcb(pcb_path, data)
         except OSError as exc:
             return {"error": f"Failed to write PCB file: {exc}"}
 
-        return {
+        result: dict[str, Any] = {
             "reference": reference,
             "previous": {"x": old_x, "y": old_y, "rotation": old_rot},
             "new": {"x": new_x, "y": new_y, "rotation": new_rot},
             "backup_path": backup_path,
             "pcb_path": pcb_path,
         }
+        if collisions and force:
+            result["warnings"] = {
+                "overlapping_with": collisions[0]["overlapping_with"],
+                "message": "Placed with force=True; courtyard overlaps detected.",
+            }
+        return result
 
     @mcp.tool()
     async def flip_footprint(
         pcb_path: str,
         reference: str,
         ctx: Context | None,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Flip a footprint from the front copper layer to the back, or vice-versa.
 
         Toggles the primary layer (F.Cu ↔ B.Cu) and flips all child element
@@ -119,8 +155,26 @@ def register_pcb_placement_tools(mcp: FastMCP) -> None:
             return {"error": str(exc)}
 
         old_layer = get_fp_layer(fp) or "unknown"
+        fp_x, fp_y, fp_rot = get_fp_at(fp)
         flip_fp_layers(fp)
         new_layer = get_fp_layer(fp) or "unknown"
+
+        # Collision check: compare against footprints on the destination layer only
+        collisions = find_collisions(
+            data,
+            [(reference, fp_x, fp_y, fp_rot)],
+            layer=new_layer,
+        )
+        if collisions:
+            overlapping = collisions[0]["overlapping_with"]
+            return {
+                "error": (
+                    f"Collision detected: flipping '{reference}' to {new_layer} would "
+                    "overlap existing footprint(s) on that layer."
+                ),
+                "overlapping_with": overlapping,
+            }
+
         try:
             backup_path = save_pcb(pcb_path, data)
         except OSError as exc:
@@ -141,7 +195,7 @@ def register_pcb_placement_tools(mcp: FastMCP) -> None:
         property_name: str,
         value: str,
         ctx: Context | None,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Update a property of a footprint on the PCB board.
 
         Common property names: ``Reference``, ``Value``, ``Datasheet``,

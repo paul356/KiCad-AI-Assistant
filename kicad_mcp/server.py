@@ -29,6 +29,7 @@ from kicad_mcp.tools.pcb_library_tools import register_pcb_library_tools
 from kicad_mcp.tools.pcb_query_tools import register_pcb_query_tools
 from kicad_mcp.tools.pcb_placement_tools import register_pcb_placement_tools
 from kicad_mcp.tools.pcb_edit_tools import register_pcb_edit_tools
+from kicad_mcp.tools.pcb_placement_helpers import register_pcb_placement_helper_tools
 from kicad_mcp.tools.placement_helpers import register_placement_helpers
 from kicad_mcp.tools.kipy_tools import register_kipy_tools
 from kicad_mcp.tools.version_tools import register_version_tools
@@ -105,6 +106,7 @@ def _register_plugin_profile(mcp: FastMCP) -> None:
     register_pcb_query_tools(mcp)
     register_pcb_placement_tools(mcp)
     register_pcb_edit_tools(mcp)
+    register_pcb_placement_helper_tools(mcp)
     register_placement_helpers(mcp)
     register_kipy_tools(mcp)
     register_version_tools(mcp)
@@ -158,6 +160,7 @@ def _register_full_profile(mcp: FastMCP) -> None:
     register_pcb_query_tools(mcp)
     register_pcb_placement_tools(mcp)
     register_pcb_edit_tools(mcp)
+    register_pcb_placement_helper_tools(mcp)
     register_placement_helpers(mcp)
     register_kipy_tools(mcp)
     register_version_tools(mcp)

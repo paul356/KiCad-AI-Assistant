@@ -12,21 +12,23 @@ PCB coordinate convention (all tools here):
 
 All mutation tools create a ``.kicad_pcb.bak`` backup before writing.
 """
+
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from fastmcp import Context, FastMCP
 
-from kicad_mcp.utils.pcb_sexp_utils import load_pcb, save_pcb
-from kicad_mcp.utils.pcb_footprint_utils import find_footprint, get_fp_at, set_fp_at
+from kicad_mcp.tools.pcb_placement_helpers import find_collisions
 from kicad_mcp.utils.pcb_board_utils import (
-    get_edge_cuts_items,
-    remove_edge_cuts_items,
+    add_gr_arc,
     add_gr_line,
     add_gr_rect,
-    add_gr_arc,
+    get_edge_cuts_items,
     get_fp_courtyard_bbox,
+    remove_edge_cuts_items,
 )
+from kicad_mcp.utils.pcb_footprint_utils import find_footprint, get_fp_at, set_fp_at
+from kicad_mcp.utils.pcb_sexp_utils import load_pcb, save_pcb
 
 log = logging.getLogger(__name__)
 
@@ -42,7 +44,7 @@ def register_pcb_edit_tools(mcp: FastMCP) -> None:
     async def get_board_outline(
         pcb_path: str,
         ctx: Context | None,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Return all graphic items on the Edge.Cuts (board outline) layer.
 
         PCB coordinates: mm, +X right, **+Y down**, rotation
@@ -78,7 +80,7 @@ def register_pcb_edit_tools(mcp: FastMCP) -> None:
     async def clear_board_outline(
         pcb_path: str,
         ctx: Context | None,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Remove all graphic items on the Edge.Cuts (board outline) layer.
 
         Use this before re-drawing the outline with
@@ -113,7 +115,7 @@ def register_pcb_edit_tools(mcp: FastMCP) -> None:
         y2: float,
         width: float,
         ctx: Context | None,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Add a straight line segment to the board outline (Edge.Cuts layer).
 
         PCB coordinates: mm, +X right, **+Y down**.  Build a closed
@@ -159,7 +161,7 @@ def register_pcb_edit_tools(mcp: FastMCP) -> None:
         end_angle_deg: float,
         width: float,
         ctx: Context | None,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Add an arc to the board outline (Edge.Cuts layer).
 
         Angles use KiCad PCB convention: 0° is the +X direction, angles
@@ -183,15 +185,21 @@ def register_pcb_edit_tools(mcp: FastMCP) -> None:
             dict with added arc parameters, backup_path, pcb_path.
         """
         data = load_pcb(pcb_path)
-        add_gr_arc(data, cx, cy, radius, start_angle_deg, end_angle_deg, width=width, layer="Edge.Cuts")
+        add_gr_arc(
+            data, cx, cy, radius, start_angle_deg, end_angle_deg, width=width, layer="Edge.Cuts"
+        )
         try:
             backup_path = save_pcb(pcb_path, data)
         except OSError as exc:
             return {"error": f"Failed to write PCB file: {exc}"}
         return {
             "added": {
-                "type": "gr_arc", "cx": cx, "cy": cy, "radius": radius,
-                "start_angle_deg": start_angle_deg, "end_angle_deg": end_angle_deg,
+                "type": "gr_arc",
+                "cx": cx,
+                "cy": cy,
+                "radius": radius,
+                "start_angle_deg": start_angle_deg,
+                "end_angle_deg": end_angle_deg,
                 "width": width,
             },
             "backup_path": backup_path,
@@ -212,7 +220,7 @@ def register_pcb_edit_tools(mcp: FastMCP) -> None:
         line_width: float,
         corner_radius: float,
         ctx: Context | None,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Set a rectangular board outline, replacing the current Edge.Cuts.
 
         Removes all existing Edge.Cuts items, then draws the rectangle.
@@ -258,13 +266,13 @@ def register_pcb_edit_tools(mcp: FastMCP) -> None:
         else:
             r = corner_radius
             # Four straight edges (inset by corner_radius)
-            add_gr_line(data, x + r, y, x2 - r, y, width=line_width)       # top
-            add_gr_line(data, x2, y + r, x2, y2 - r, width=line_width)     # right
-            add_gr_line(data, x2 - r, y2, x + r, y2, width=line_width)     # bottom
-            add_gr_line(data, x, y2 - r, x, y + r, width=line_width)       # left
+            add_gr_line(data, x + r, y, x2 - r, y, width=line_width)  # top
+            add_gr_line(data, x2, y + r, x2, y2 - r, width=line_width)  # right
+            add_gr_line(data, x2 - r, y2, x + r, y2, width=line_width)  # bottom
+            add_gr_line(data, x, y2 - r, x, y + r, width=line_width)  # left
             # Four corner arcs (CW angles, +Y down)
             add_gr_arc(data, x2 - r, y + r, r, 270, 360, width=line_width)  # top-right
-            add_gr_arc(data, x2 - r, y2 - r, r, 0, 90, width=line_width)   # bottom-right
+            add_gr_arc(data, x2 - r, y2 - r, r, 0, 90, width=line_width)  # bottom-right
             add_gr_arc(data, x + r, y2 - r, r, 90, 180, width=line_width)  # bottom-left
             add_gr_arc(data, x + r, y + r, r, 180, 270, width=line_width)  # top-left
             items_added = 8
@@ -275,8 +283,15 @@ def register_pcb_edit_tools(mcp: FastMCP) -> None:
             return {"error": f"Failed to write PCB file: {exc}"}
 
         return {
-            "board_rect": {"x": x, "y": y, "width": width, "height": height,
-                           "x2": x2, "y2": y2, "corner_radius": corner_radius},
+            "board_rect": {
+                "x": x,
+                "y": y,
+                "width": width,
+                "height": height,
+                "x2": x2,
+                "y2": y2,
+                "corner_radius": corner_radius,
+            },
             "items_added": items_added,
             "backup_path": backup_path,
             "pcb_path": pcb_path,
@@ -291,7 +306,7 @@ def register_pcb_edit_tools(mcp: FastMCP) -> None:
         pcb_path: str,
         reference: str,
         ctx: Context | None,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Return the world-coordinate bounding box of a footprint's courtyard.
 
         The bounding box is computed from ``F.Courtyard`` / ``B.Courtyard``
@@ -342,7 +357,7 @@ def register_pcb_edit_tools(mcp: FastMCP) -> None:
     async def get_board_bounding_box(
         pcb_path: str,
         ctx: Context | None,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Return the union bounding box of all footprint courtyards on the board.
 
         Useful for determining the minimum board size needed to contain all
@@ -367,12 +382,12 @@ def register_pcb_edit_tools(mcp: FastMCP) -> None:
             return str(v) if isinstance(v, _sx.Symbol) else str(v)
 
         data = load_pcb(pcb_path)
-        all_min_x: List[float] = []
-        all_min_y: List[float] = []
-        all_max_x: List[float] = []
-        all_max_y: List[float] = []
+        all_min_x: list[float] = []
+        all_min_y: list[float] = []
+        all_max_x: list[float] = []
+        all_max_y: list[float] = []
         fp_count = 0
-        no_courtyard: List[str] = []
+        no_courtyard: list[str] = []
 
         for item in data:
             if not (isinstance(item, list) and len(item) > 0):
@@ -434,11 +449,11 @@ def register_pcb_edit_tools(mcp: FastMCP) -> None:
     @mcp.tool()
     async def align_footprints(
         pcb_path: str,
-        references: List[str],
+        references: list[str],
         axis: str,
-        coordinate: Optional[float],
+        coordinate: float | None,
         ctx: Context | None,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Align a list of footprints to the same X or Y coordinate.
 
         Sets all listed footprints to the same ``x`` (if ``axis="x"``) or
@@ -493,12 +508,26 @@ def register_pcb_edit_tools(mcp: FastMCP) -> None:
             target = float(coordinate)
 
         aligned = []
+        proposals = []
         for ref, fp in fps.items():
             ox, oy, rot = positions[ref]
             nx = target if axis == "x" else ox
             ny = target if axis == "y" else oy
-            set_fp_at(fp, nx, ny, rot)
+            proposals.append((ref, nx, ny, rot))
             aligned.append({"reference": ref, "old_x": ox, "old_y": oy, "new_x": nx, "new_y": ny})
+
+        collisions = find_collisions(data, proposals)
+        if collisions:
+            details = [
+                {"ref": c["ref"], "overlapping_with": c["overlapping_with"]} for c in collisions
+            ]
+            return {
+                "error": "Collision detected: one or more footprints would overlap after alignment.",
+                "collisions": details,
+            }
+
+        for ref, nx, ny, rot in proposals:
+            set_fp_at(fps[ref], nx, ny, rot)
 
         try:
             backup_path = save_pcb(pcb_path, data)
@@ -521,10 +550,10 @@ def register_pcb_edit_tools(mcp: FastMCP) -> None:
     @mcp.tool()
     async def distribute_footprints(
         pcb_path: str,
-        references: List[str],
+        references: list[str],
         axis: str,
         ctx: Context | None,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Evenly space footprints along the X or Y axis.
 
         Keeps the two outermost footprint positions fixed and redistributes
@@ -579,13 +608,29 @@ def register_pcb_edit_tools(mcp: FastMCP) -> None:
         spacing = (last_pos - first_pos) / (n - 1) if n > 1 else 0.0
 
         distributed = []
+        proposals = []
         for i, ref in enumerate(sorted_refs):
             ox, oy, rot = positions[ref]
             target_coord = first_pos + i * spacing
             nx = target_coord if axis == "x" else ox
             ny = target_coord if axis == "y" else oy
+            proposals.append((ref, nx, ny, rot))
+            distributed.append(
+                {"reference": ref, "old_x": ox, "old_y": oy, "new_x": nx, "new_y": ny}
+            )
+
+        collisions = find_collisions(data, proposals)
+        if collisions:
+            details = [
+                {"ref": c["ref"], "overlapping_with": c["overlapping_with"]} for c in collisions
+            ]
+            return {
+                "error": "Collision detected: one or more footprints would overlap after distribution.",
+                "collisions": details,
+            }
+
+        for ref, nx, ny, rot in proposals:
             set_fp_at(fps[ref], nx, ny, rot)
-            distributed.append({"reference": ref, "old_x": ox, "old_y": oy, "new_x": nx, "new_y": ny})
 
         try:
             backup_path = save_pcb(pcb_path, data)
@@ -608,11 +653,11 @@ def register_pcb_edit_tools(mcp: FastMCP) -> None:
     @mcp.tool()
     async def move_footprints_by_delta(
         pcb_path: str,
-        references: List[str],
+        references: list[str],
         dx: float,
         dy: float,
         ctx: Context | None,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Move a group of footprints by the same (dx, dy) offset.
 
         Useful for shifting a functional block after the board outline
@@ -654,11 +699,25 @@ def register_pcb_edit_tools(mcp: FastMCP) -> None:
             return {"error": "None of the specified footprints were found.", "not_found": not_found}
 
         moved = []
+        proposals = []
         for ref, fp in fps.items():
             ox, oy, rot = get_fp_at(fp)
             nx, ny = ox + dx, oy + dy
-            set_fp_at(fp, nx, ny, rot)
+            proposals.append((ref, nx, ny, rot))
             moved.append({"reference": ref, "old_x": ox, "old_y": oy, "new_x": nx, "new_y": ny})
+
+        collisions = find_collisions(data, proposals, check_within_group=False)
+        if collisions:
+            details = [
+                {"ref": c["ref"], "overlapping_with": c["overlapping_with"]} for c in collisions
+            ]
+            return {
+                "error": "Collision detected: one or more footprints would overlap after the move.",
+                "collisions": details,
+            }
+
+        for ref, nx, ny, rot in proposals:
+            set_fp_at(fps[ref], nx, ny, rot)
 
         try:
             backup_path = save_pcb(pcb_path, data)
