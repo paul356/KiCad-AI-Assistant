@@ -37,6 +37,105 @@ log = logging.getLogger(__name__)
 _SUBPROCESS_TIMEOUT = 600
 
 
+def _strip_nets_from_dsn(dsn_path: str, net_names: List[str]) -> None:
+    """Remove ``(net NAME ...)`` blocks whose name is in *net_names* from the DSN.
+
+    Operates on the temp copy in-place.  Net names may be quoted
+    (``"Net-(U1-PROG)"``) or bare (``GND``, ``+3.3V``).  Quoted strings
+    inside the S-expression are handled correctly so that parentheses inside
+    net names don't confuse the depth counter.
+    """
+    if not net_names:
+        return
+
+    skip_set = {name.strip() for name in net_names}
+
+    with open(dsn_path, "r", encoding="utf-8") as f:
+        text = f.read()
+
+    out: List[str] = []
+    i = 0
+    n = len(text)
+
+    while i < n:
+        if text[i] != "(":
+            out.append(text[i])
+            i += 1
+            continue
+
+        # Skip whitespace after '(' to read the keyword.
+        j = i + 1
+        while j < n and text[j] in " \t":
+            j += 1
+
+        k = j
+        while k < n and text[k] not in " \t\n\r()":
+            k += 1
+        keyword = text[j:k]
+
+        if keyword != "net":
+            out.append(text[i])
+            i += 1
+            continue
+
+        # Skip whitespace before net name.
+        m = k
+        while m < n and text[m] in " \t":
+            m += 1
+
+        # Read quoted or unquoted net name.
+        if m < n and text[m] == '"':
+            try:
+                end_q = text.index('"', m + 1)
+            except ValueError:
+                # Malformed DSN: no closing quote — leave block untouched.
+                log.warning("autoroute: malformed quoted net name in DSN at pos %d; leaving block", m)
+                out.append(text[i])
+                i += 1
+                continue
+            net_name = text[m + 1 : end_q]
+        else:
+            end_u = m
+            while end_u < n and text[end_u] not in " \t\n\r()":
+                end_u += 1
+            net_name = text[m:end_u]
+            if not net_name:
+                # Empty or missing net name — leave block untouched.
+                out.append(text[i])
+                i += 1
+                continue
+
+        if net_name not in skip_set:
+            out.append(text[i])
+            i += 1
+            continue
+
+        # Skip the entire (net ...) block, respecting quoted strings.
+        depth = 1
+        pos = i + 1
+        in_string = False
+        while pos < n and depth > 0:
+            c = text[pos]
+            if in_string:
+                if c == '"':
+                    in_string = False
+            else:
+                if c == '"':
+                    in_string = True
+                elif c == "(":
+                    depth += 1
+                elif c == ")":
+                    depth -= 1
+            pos += 1
+        i = pos
+        # Drop the trailing newline(s) to avoid leaving blank lines.
+        while i < n and text[i] in ("\n", "\r"):
+            i += 1
+
+    with open(dsn_path, "w", encoding="utf-8") as f:
+        f.write("".join(out))
+
+
 def find_freerouting_jar() -> Optional[str]:
     """Return the absolute path to freerouting*.jar, or None if not found.
 
@@ -101,11 +200,16 @@ def _run_subprocess(
         "--gui.enabled=false",
         "-mp", str(max_passes),
     ]
-    if ignore_nets:
-        cmd += ["-inc", ",".join(ignore_nets)]
 
+    cmd_str = " ".join(cmd)
     _progress(f"Running FreeRouting (max {max_passes} passes)…")
-    log.info("freerouting: %s", " ".join(cmd))
+    log.info("freerouting: %s", cmd_str)
+
+    debug_prefix = f"Command: {cmd_str}\n"
+    if ignore_nets:
+        debug_prefix += f"Ignoring nets (removed from DSN): {', '.join(ignore_nets)}\n"
+        _strip_nets_from_dsn(dsn_path, ignore_nets)
+    debug_prefix += "---\n"
 
     try:
         result = subprocess.run(
@@ -119,7 +223,7 @@ def _run_subprocess(
     except subprocess.TimeoutExpired:
         return False, f"FreeRouting timed out after {_SUBPROCESS_TIMEOUT}s.", "", ""
 
-    stdout = result.stdout or ""
+    stdout = debug_prefix + (result.stdout or "")
     stderr = result.stderr or ""
 
     if not os.path.isfile(ses_path):
@@ -157,7 +261,9 @@ def start_freerouting_thread(
         Optional callback ``(message: str) -> None`` for intermediate updates.
         Also invoked from the worker thread — use ``wx.CallAfter``.
     ignore_nets:
-        Net names FreeRouting should skip (e.g. ``["GND", "VCC"]``).
+        Net *names* FreeRouting should skip (e.g. ``["GND", "+3.3V"]``).
+        These are removed from the DSN ``(network ...)`` section before
+        FreeRouting runs, so they stay as ratsnest and are not routed.
     max_passes:
         Maximum routing passes (``-mp`` flag).
     """

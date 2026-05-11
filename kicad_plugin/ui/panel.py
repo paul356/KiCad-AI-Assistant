@@ -522,12 +522,74 @@ if _WX_AVAILABLE:
                 self._render_conversation()
                 return
 
-            # ---- 2. Export DSN (main thread — pcbnew call) ----
+            # ---- 2. Enumerate net names from board, show checklist ----
+            # Net code 0 is the unconnected pseudo-net — skip it.
+            all_nets = []
+            try:
+                for net_code in range(1, board.GetNetCount()):
+                    net = board.FindNet(net_code)
+                    if net is not None:
+                        name = net.GetNetname()
+                        if name:
+                            all_nets.append(name)
+                all_nets.sort()
+            except Exception:
+                all_nets = []
+
+            # Fallback: plain text entry if we couldn't enumerate nets
+            if not all_nets:
+                dlg = wx.TextEntryDialog(
+                    self,
+                    "Net names to skip (comma-separated, e.g. GND,+3.3V).\n"
+                    "Leave blank to route all nets.",
+                    "Auto Route — Skip Nets",
+                    value="",
+                )
+                if dlg.ShowModal() != wx.ID_OK:
+                    dlg.Destroy()
+                    return
+                ignore_input = dlg.GetValue().strip()
+                dlg.Destroy()
+                ignore_nets = [n.strip() for n in ignore_input.split(",") if n.strip()] or None
+            else:
+                dlg = wx.MultiChoiceDialog(
+                    self,
+                    "Select nets FreeRouting should NOT route.\n"
+                    "(These stay as ratsnest — route them manually, e.g. via power planes.)",
+                    "Auto Route — Skip Nets",
+                    all_nets,
+                )
+                dlg.SetSelections([])
+                if dlg.ShowModal() != wx.ID_OK:
+                    dlg.Destroy()
+                    return
+                selections = dlg.GetSelections()
+                dlg.Destroy()
+                ignore_nets = [all_nets[i] for i in selections] or None
+
+            # ---- 3. Export DSN (main thread — pcbnew call) ----
             import shutil
             import tempfile
             tmp_dir = tempfile.mkdtemp(prefix="kicad_autoroute_")
             dsn_path = os.path.join(tmp_dir, "board.dsn")
             ses_path = os.path.join(tmp_dir, "board.ses")
+
+            # ---- Take a version snapshot via MCP tool before routing ----
+            board_path = board.GetFileName()
+            backup_path = ""
+            if board_path and os.path.isfile(board_path):
+                try:
+                    from ..llm_client import call_mcp_tool
+                    result = call_mcp_tool(
+                        self._server_mgr.base_url,
+                        "save_file_version",
+                        {"file_path": board_path},
+                    )
+                    backup_path = result.get("snapshot_path", "")
+                    log.info("autoroute: version snapshot saved to %s", backup_path)
+                except Exception as exc:
+                    log.warning("autoroute: version snapshot failed: %s", exc)
+                    backup_path = ""
 
             try:
                 _pcbnew.ExportSpecctraDSN(board, dsn_path)
@@ -575,13 +637,14 @@ if _WX_AVAILABLE:
                 # Marshal back to main thread for pcbnew import + UI update.
                 wx.CallAfter(
                     self._on_autoroute_done,
-                    success, message, stdout, stderr, ses_path, tmp_dir,
+                    success, message, stdout, stderr, ses_path, tmp_dir, backup_path,
                 )
 
             start_freerouting_thread(
                 dsn_path, ses_path,
                 on_done=_routing_done,
                 on_progress=_progress,
+                ignore_nets=ignore_nets,
             )
 
         def _on_autoroute_done(
@@ -592,6 +655,7 @@ if _WX_AVAILABLE:
             stderr: str,
             ses_path: str,
             tmp_dir: str,
+            backup_path: str = "",
         ) -> None:
             """Called on the wx main thread after FreeRouting finishes.
 
@@ -608,6 +672,9 @@ if _WX_AVAILABLE:
                         board = _pcbnew.GetBoard()
                         _pcbnew.ImportSpecctraSES(board, ses_path)
                         board.SetModified()
+                        file_name = board.GetFileName()
+                        if file_name:
+                            board.Save(file_name)
                         _pcbnew.Refresh()
                     except Exception as exc:
                         success = False
@@ -632,6 +699,8 @@ if _WX_AVAILABLE:
                     " Note: if traces look sparse on a pure-SMD board, "
                     "FreeRouting may have skipped pads with '(attach off)' padstacks."
                 )
+                if backup_path:
+                    message += f"\nBackup saved to: {backup_path}"
 
             # ---- Append collapsible log entry ----
             self._conv_entries.append({
