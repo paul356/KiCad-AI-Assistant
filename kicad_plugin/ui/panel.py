@@ -152,17 +152,33 @@ if _WX_AVAILABLE:
 
             # ---- Menu bar ----
             menu_bar = wx.MenuBar()
+
+            # Options menu
             m = wx.Menu()
             m.Append(wx.ID_PREFERENCES, "&Settings\tCtrl+,")
+            menu_bar.Append(m, "&Options")
+
+            # Session menu
             self._menu_new_session_id = wx.NewIdRef()
             self._menu_load_session_id = wx.NewIdRef()
-            m.AppendSeparator()
-            m.Append(self._menu_new_session_id, "New Session")
-            m.Append(self._menu_load_session_id, "Load Session…")
-            m.AppendSeparator()
+            session_menu = wx.Menu()
+            session_menu.Append(self._menu_new_session_id, "New Session")
+            session_menu.Append(self._menu_load_session_id, "Load Session\u2026")
+            menu_bar.Append(session_menu, "&Session")
+
+            # Backend menu
             self._menu_restart_id = wx.NewIdRef()
-            m.Append(self._menu_restart_id, "Restart Backend")
-            menu_bar.Append(m, "&Options")
+            backend_menu = wx.Menu()
+            backend_menu.Append(self._menu_restart_id, "Restart Backend")
+            menu_bar.Append(backend_menu, "&Backend")
+
+            # Tools menu
+            self._menu_autoroute_id = wx.NewIdRef()
+            tools_menu = wx.Menu()
+            tools_menu.Append(self._menu_autoroute_id, "Auto Route\u2026")
+            tools_menu.Enable(self._menu_autoroute_id, False)
+            menu_bar.Append(tools_menu, "&Tools")
+
             self.SetMenuBar(menu_bar)
 
             # ---- Events ----
@@ -172,6 +188,7 @@ if _WX_AVAILABLE:
             self.Bind(wx.EVT_MENU, self._on_new_session, id=self._menu_new_session_id)
             self.Bind(wx.EVT_MENU, self._on_load_session, id=self._menu_load_session_id)
             self.Bind(wx.EVT_MENU, self._on_restart, id=self._menu_restart_id)
+            self.Bind(wx.EVT_MENU, self._on_autoroute, id=self._menu_autoroute_id)
             self.Bind(wx.EVT_CLOSE, self._on_close)
             self.Bind(wx.EVT_WINDOW_DESTROY, self._on_destroy)
 
@@ -206,6 +223,7 @@ if _WX_AVAILABLE:
                 self._status_label.SetLabel("✅ Backend ready")
                 self._status_label.SetForegroundColour(wx.Colour(*self._C_OK))
                 self._send_btn.Enable(True)
+                self.GetMenuBar().Enable(self._menu_autoroute_id, True)
                 self._init_llm_client()
                 self._check_kicad_ipc_environment()
             else:
@@ -473,6 +491,80 @@ if _WX_AVAILABLE:
                 self._render_conversation()
                 self._on_server_started(False)
 
+
+        def _on_autoroute(self, event) -> None:
+            """Menu handler: Options → Auto Route…"""
+            if self._busy:
+                wx.MessageBox(
+                    "Please wait for the current AI request to finish.",
+                    "Busy", wx.OK | wx.ICON_INFORMATION,
+                )
+                return
+
+            # pcbnew is only available inside KiCad — import lazily.
+            try:
+                import pcbnew
+                board = pcbnew.GetBoard()
+            except Exception:
+                board = None
+
+            if board is None:
+                self._conv_entries.append({
+                    "type": "status",
+                    "text": "⚠ No board is currently open. Open a .kicad_pcb file before running Auto Route.",
+                    "color_hex": self._C_WARN_HEX,
+                })
+                self._render_conversation()
+                return
+
+            # Disable menu item and update status bar while routing runs.
+            self.GetMenuBar().Enable(self._menu_autoroute_id, False)
+            self._status_label.SetLabel("⏳ Auto-routing in progress…")
+            self._status_label.SetForegroundColour(wx.Colour(*self._C_WARN))
+            self.Layout()
+
+            self._conv_entries.append({
+                "type": "status",
+                "text": "⏳ Auto Route started — running FreeRouting in background…",
+                "color_hex": self._C_WARN_HEX,
+            })
+            self._render_conversation()
+
+            from ..autorouter import start_autoroute_thread
+
+            def _progress(msg: str) -> None:
+                wx.CallAfter(self._status_label.SetLabel, f"⏳ {msg}")
+
+            def _done(success: bool, message: str, stdout: str, stderr: str) -> None:
+                wx.CallAfter(self._on_autoroute_done, success, message, stdout, stderr)
+
+            start_autoroute_thread(board, on_progress=_progress, on_done=_done)
+
+        def _on_autoroute_done(
+            self, success: bool, message: str, stdout: str, stderr: str
+        ) -> None:
+            """Called on the wx main thread when FreeRouting finishes."""
+            # Restore menu item.
+            self.GetMenuBar().Enable(self._menu_autoroute_id, True)
+
+            # Restore status bar.
+            if success:
+                self._status_label.SetLabel("✅ Backend ready")
+                self._status_label.SetForegroundColour(wx.Colour(*self._C_OK))
+            else:
+                self._status_label.SetLabel("❌ Auto-routing failed")
+                self._status_label.SetForegroundColour(wx.Colour(*self._C_ERR))
+            self.Layout()
+
+            # Append a collapsible autoroute_log entry to the conversation.
+            self._conv_entries.append({
+                "type": "autoroute_log",
+                "success": success,
+                "message": message,
+                "stdout": stdout,
+                "stderr": stderr,
+            })
+            self._render_conversation()
 
         def _on_settings(self, event) -> None:
             from .settings_dialog import SettingsDialog
@@ -1061,6 +1153,37 @@ if _WX_AVAILABLE:
                     color = entry.get("color_hex", "#1E1E1E")
                     escaped = _h.escape(text)
                     parts.append(f'<p style="margin: 2px 8px;"><font color="{color}">{escaped}</font></p>')
+                elif typ == "autoroute_log":
+                    ok = entry.get("success", False)
+                    msg = _h.escape(entry.get("message", ""))
+                    raw_out = (entry.get("stdout") or "").strip()
+                    raw_err = (entry.get("stderr") or "").strip()
+                    combined = "\n".join(filter(None, [raw_out, ("--- stderr ---\n" + raw_err) if raw_err else ""]))
+                    icon = "✓" if ok else "✗"
+                    icon_color = "#4caf50" if ok else "#f44336"
+                    if self._use_webview:
+                        css = "tool-entry tool-ok" if ok else "tool-entry tool-err"
+                        log_body = (
+                            f'<pre style="margin:4px 0;max-height:300px;overflow-y:auto">'
+                            f'{_h.escape(combined) if combined else "(no output)"}'
+                            f'</pre>'
+                        )
+                        parts.append(
+                            f'<details class="tools" style="margin: 2px 8px;">'
+                            f'<summary><span style="color:{icon_color}">{icon}</span> '
+                            f'<b>Auto Route</b> — {msg}</summary>'
+                            f'<div class="{css}">{log_body}</div>'
+                            f'</details>'
+                        )
+                    else:
+                        # HtmlWindow fallback: no <details>, show truncated output
+                        color = self._C_OK_HEX if ok else self._C_ERR_HEX
+                        snippet = _h.escape(combined[:500] + ("…" if len(combined) > 500 else ""))
+                        parts.append(
+                            f'<p style="margin: 2px 8px;">'
+                            f'<font color="{color}"><tt>{icon} Auto Route</tt></font> {msg}</p>'
+                            f'<blockquote style="margin:2px 8px"><tt><font size="2">{snippet}</font></tt></blockquote>'
+                        )
 
             # Show pending streamed AI text
             if self._pending_ai_text:
