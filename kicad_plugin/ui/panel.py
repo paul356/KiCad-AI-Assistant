@@ -493,7 +493,12 @@ if _WX_AVAILABLE:
 
 
         def _on_autoroute(self, event) -> None:
-            """Menu handler: Options → Auto Route…"""
+            """Menu handler: Tools → Auto Route…
+
+            All pcbnew calls (ExportSpecctraDSN, ImportSpecctraSES, Refresh)
+            must happen on the wx main thread to avoid corruption of the board
+            view.  Only the FreeRouting subprocess runs in a background thread.
+            """
             if self._busy:
                 wx.MessageBox(
                     "Please wait for the current AI request to finish.",
@@ -501,10 +506,10 @@ if _WX_AVAILABLE:
                 )
                 return
 
-            # pcbnew is only available inside KiCad — import lazily.
+            # ---- 1. Get board (main thread) ----
             try:
-                import pcbnew
-                board = pcbnew.GetBoard()
+                import pcbnew as _pcbnew
+                board = _pcbnew.GetBoard()
             except Exception:
                 board = None
 
@@ -517,7 +522,38 @@ if _WX_AVAILABLE:
                 self._render_conversation()
                 return
 
-            # Disable menu item and update status bar while routing runs.
+            # ---- 2. Export DSN (main thread — pcbnew call) ----
+            import shutil
+            import tempfile
+            tmp_dir = tempfile.mkdtemp(prefix="kicad_autoroute_")
+            dsn_path = os.path.join(tmp_dir, "board.dsn")
+            ses_path = os.path.join(tmp_dir, "board.ses")
+
+            try:
+                _pcbnew.ExportSpecctraDSN(board, dsn_path)
+            except Exception as exc:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+                self._conv_entries.append({
+                    "type": "autoroute_log",
+                    "success": False,
+                    "message": f"DSN export failed: {exc}",
+                    "stdout": "", "stderr": "",
+                })
+                self._render_conversation()
+                return
+
+            if not os.path.isfile(dsn_path):
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+                self._conv_entries.append({
+                    "type": "autoroute_log",
+                    "success": False,
+                    "message": "DSN export produced no output file.",
+                    "stdout": "", "stderr": "",
+                })
+                self._render_conversation()
+                return
+
+            # ---- 3. Update UI, then start background thread ----
             self.GetMenuBar().Enable(self._menu_autoroute_id, False)
             self._status_label.SetLabel("⏳ Auto-routing in progress…")
             self._status_label.SetForegroundColour(wx.Colour(*self._C_WARN))
@@ -530,24 +566,58 @@ if _WX_AVAILABLE:
             })
             self._render_conversation()
 
-            from ..autorouter import start_autoroute_thread
+            from ..autorouter import start_freerouting_thread
 
             def _progress(msg: str) -> None:
                 wx.CallAfter(self._status_label.SetLabel, f"⏳ {msg}")
 
-            def _done(success: bool, message: str, stdout: str, stderr: str) -> None:
-                wx.CallAfter(self._on_autoroute_done, success, message, stdout, stderr)
+            def _routing_done(success: bool, message: str, stdout: str, stderr: str) -> None:
+                # Marshal back to main thread for pcbnew import + UI update.
+                wx.CallAfter(
+                    self._on_autoroute_done,
+                    success, message, stdout, stderr, ses_path, tmp_dir,
+                )
 
-            start_autoroute_thread(board, on_progress=_progress, on_done=_done)
+            start_freerouting_thread(
+                dsn_path, ses_path,
+                on_done=_routing_done,
+                on_progress=_progress,
+            )
 
         def _on_autoroute_done(
-            self, success: bool, message: str, stdout: str, stderr: str
+            self,
+            success: bool,
+            message: str,
+            stdout: str,
+            stderr: str,
+            ses_path: str,
+            tmp_dir: str,
         ) -> None:
-            """Called on the wx main thread when FreeRouting finishes."""
-            # Restore menu item.
-            self.GetMenuBar().Enable(self._menu_autoroute_id, True)
+            """Called on the wx main thread after FreeRouting finishes.
 
-            # Restore status bar.
+            Performs ImportSpecctraSES + Refresh here so that all pcbnew UI
+            operations stay on the main thread, preventing the blank-view bug.
+            """
+            import shutil
+
+            try:
+                if success and os.path.isfile(ses_path):
+                    # ---- Import SES (main thread — pcbnew call) ----
+                    try:
+                        import pcbnew as _pcbnew
+                        board = _pcbnew.GetBoard()
+                        _pcbnew.ImportSpecctraSES(board, ses_path)
+                        board.SetModified()
+                        _pcbnew.Refresh()
+                    except Exception as exc:
+                        success = False
+                        message = f"SES import failed: {exc}"
+                        log.error("autoroute: SES import error: %s", exc)
+            finally:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+
+            # ---- Restore menu item and status bar ----
+            self.GetMenuBar().Enable(self._menu_autoroute_id, True)
             if success:
                 self._status_label.SetLabel("✅ Backend ready")
                 self._status_label.SetForegroundColour(wx.Colour(*self._C_OK))
@@ -556,7 +626,14 @@ if _WX_AVAILABLE:
                 self._status_label.SetForegroundColour(wx.Colour(*self._C_ERR))
             self.Layout()
 
-            # Append a collapsible autoroute_log entry to the conversation.
+            # FreeRouting SMD padstack note
+            if success:
+                message += (
+                    " Note: if traces look sparse on a pure-SMD board, "
+                    "FreeRouting may have skipped pads with '(attach off)' padstacks."
+                )
+
+            # ---- Append collapsible log entry ----
             self._conv_entries.append({
                 "type": "autoroute_log",
                 "success": success,
