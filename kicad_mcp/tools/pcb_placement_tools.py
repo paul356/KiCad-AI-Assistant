@@ -101,10 +101,10 @@ def register_pcb_placement_tools(mcp: FastMCP) -> None:
         if collisions and not force:
             overlapping = collisions[0]["overlapping_with"]
             return {
-                "error": "Collision detected: courtyard would overlap existing footprint(s).",
+                "error": "Placement rejected: courtyard would overlap at the proposed position. Footprint was NOT moved.",
                 "overlapping_with": overlapping,
                 "proposed_position": {"x": new_x, "y": new_y, "rotation": new_rot},
-                "hint": "Call find_free_pcb_area to obtain a collision-free position. Only set force=True if the overlap is genuinely intentional (e.g. edge connectors, fiducials).",
+                "hint": "You may need to move the interfering component to another position or call find_free_pcb_area to obtain a free spot.",
             }
 
         set_fp_at(fp, new_x, new_y, new_rot)
