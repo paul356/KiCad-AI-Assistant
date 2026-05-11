@@ -11,7 +11,7 @@ from typing import Any
 
 from fastmcp import Context, FastMCP
 
-from kicad_mcp.tools.pcb_placement_helpers import find_collisions
+from kicad_mcp.tools.pcb_placement_helpers import find_collisions, find_nearest_free_position
 from kicad_mcp.utils.pcb_footprint_utils import (
     find_footprint,
     flip_fp_layers,
@@ -51,15 +51,16 @@ def register_pcb_placement_tools(mcp: FastMCP) -> None:
         Any of x, y, rotation may be omitted (None) to leave that value
         unchanged.  At least one of them must be provided.
 
-        By default (``force=False``) the tool refuses to place a
-        footprint if its courtyard would overlap any other footprint's
-        courtyard and returns an error without modifying the file.
+        By default (``force=False``) the tool automatically adjusts the
+        position when the requested coordinates would cause a courtyard
+        overlap: it scans outward on a 1.27 mm grid (up to 20 mm radius)
+        and places the footprint at the nearest collision-free spot.
+        If no free spot is found within 20 mm, the footprint is **not**
+        moved and an error is returned.
         **Do NOT set ``force=True`` as a routine workaround.** Only use
         it when overlap is genuinely intentional and unavoidable (e.g.
         edge connectors flush with the board edge, press-fit connectors,
-        or fiducials deliberately placed near other features). In all
-        other cases, call ``find_free_pcb_area`` first to obtain a
-        collision-free position.
+        or fiducials deliberately placed near other features).
 
         A .kicad_pcb.bak backup is created before writing.
 
@@ -78,9 +79,21 @@ def register_pcb_placement_tools(mcp: FastMCP) -> None:
             ctx: MCP context for progress reporting.
 
         Returns:
-            dict with reference, previous {x, y, rotation}, new
-            {x, y, rotation}, backup_path, pcb_path, and an optional
-            ``warnings`` key when ``force=True`` and overlaps exist.
+            dict with:
+
+            - ``status``: ``"placed"`` on success, or
+              ``"placed_at_adjusted_position"`` when the requested spot was
+              occupied and the tool found the nearest free position.
+            - ``reference``: the footprint reference.
+            - ``moved_from``: ``{x, y, rotation}`` — position before this call.
+            - ``placed_at``: ``{x, y, rotation}`` — position the footprint was
+              actually placed at (may differ from the request when adjusted).
+            - ``requested_position``: ``{x, y, rotation}`` — only present when
+              ``status`` is ``"placed_at_adjusted_position"``; the original
+              requested coords that caused a collision.
+            - ``backup_path``, ``pcb_path``.
+            - ``warnings``: only when ``force=True`` and overlaps exist;
+              contains ``courtyard_overlaps`` (list of refs) and ``message``.
         """
         if x is None and y is None and rotation is None:
             return {"error": "At least one of x, y, rotation must be provided."}
@@ -95,17 +108,24 @@ def register_pcb_placement_tools(mcp: FastMCP) -> None:
         new_x = old_x if x is None else float(x)
         new_y = old_y if y is None else float(y)
         new_rot = old_rot if rotation is None else float(rotation)
+        req_x, req_y = new_x, new_y  # save before possible auto-adjustment
 
         # Collision check (footprint vs footprint only; board bounds not enforced)
         collisions = find_collisions(data, [(reference, new_x, new_y, new_rot)])
+        adjusted_position: tuple[float, float] | None = None
         if collisions and not force:
-            overlapping = collisions[0]["overlapping_with"]
-            return {
-                "error": "Placement rejected: courtyard would overlap at the proposed position. Footprint was NOT moved.",
-                "overlapping_with": overlapping,
-                "proposed_position": {"x": new_x, "y": new_y, "rotation": new_rot},
-                "hint": "You may need to move the interfering component to another position or call find_free_pcb_area to obtain a free spot.",
-            }
+            free = find_nearest_free_position(data, reference, new_x, new_y, new_rot)
+            if free is None:
+                overlapping = collisions[0]["overlapping_with"]
+                return {
+                    "error": "Placement rejected: courtyard would overlap at the proposed position. Footprint was NOT moved.",
+                    "proposed_position_overlaps": overlapping,
+                    "proposed_position": {"x": new_x, "y": new_y, "rotation": new_rot},
+                    "current_position": {"x": old_x, "y": old_y, "rotation": old_rot},
+                    "hint": "No free spot found within 20 mm. You may need to move the interfering component first.",
+                }
+            adjusted_position = free
+            new_x, new_y = free
 
         set_fp_at(fp, new_x, new_y, new_rot)
         try:
@@ -114,16 +134,20 @@ def register_pcb_placement_tools(mcp: FastMCP) -> None:
             return {"error": f"Failed to write PCB file: {exc}"}
 
         result: dict[str, Any] = {
+            "status": "placed",
             "reference": reference,
-            "previous": {"x": old_x, "y": old_y, "rotation": old_rot},
-            "new": {"x": new_x, "y": new_y, "rotation": new_rot},
+            "moved_from": {"x": old_x, "y": old_y, "rotation": old_rot},
+            "placed_at": {"x": new_x, "y": new_y, "rotation": new_rot},
             "backup_path": backup_path,
             "pcb_path": pcb_path,
         }
+        if adjusted_position is not None:
+            result["status"] = "placed_at_adjusted_position"
+            result["requested_position"] = {"x": req_x, "y": req_y, "rotation": new_rot}
         if collisions and force:
             result["warnings"] = {
-                "overlapping_with": collisions[0]["overlapping_with"],
-                "message": "Placed with force=True; courtyard overlaps detected.",
+                "courtyard_overlaps": collisions[0]["overlapping_with"],
+                "message": "Footprint placed successfully at the new position. Courtyard overlaps detected (force=True was used).",
             }
         return result
 

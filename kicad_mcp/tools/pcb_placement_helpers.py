@@ -295,6 +295,76 @@ def find_collisions(
     return collisions
 
 
+def find_nearest_free_position(
+    data: list[Any],
+    reference: str,
+    target_x: float,
+    target_y: float,
+    rotation: float,
+    search_radius_mm: float = 20.0,
+) -> tuple[float, float] | None:
+    """Find the nearest grid-aligned free position for a footprint near a target.
+
+    Scans a ``_GRID_MM`` grid centred on ``(target_x, target_y)`` within
+    ``search_radius_mm``, returning the closest anchor position where the
+    footprint's courtyard does not overlap any existing footprint courtyard.
+
+    Args:
+        data: Parsed PCB S-expression tree.
+        reference: Footprint reference to check (excluded from static set).
+        target_x: Desired X anchor in mm.
+        target_y: Desired Y anchor in mm.
+        rotation: Footprint rotation in degrees (clockwise-positive).
+        search_radius_mm: Maximum search radius in mm (default 20 mm).
+
+    Returns:
+        ``(x, y)`` of the nearest free anchor, or ``None`` if none found
+        within ``search_radius_mm``.
+    """
+    # Courtyard offsets at the requested rotation anchored at origin
+    bbox_at_origin = _get_footprint_bbox_at(data, reference, 0.0, 0.0, rotation)
+    if bbox_at_origin is None:
+        # No courtyard geometry — any position is free; snap to grid
+        snap_x = round(round(target_x / _GRID_MM) * _GRID_MM, 9)
+        snap_y = round(round(target_y / _GRID_MM) * _GRID_MM, 9)
+        return (snap_x, snap_y)
+
+    off_min_x = bbox_at_origin["min_x"]
+    off_min_y = bbox_at_origin["min_y"]
+    off_max_x = bbox_at_origin["max_x"]
+    off_max_y = bbox_at_origin["max_y"]
+
+    static_bboxes = _get_all_footprint_bboxes(data, exclude_refs={reference})
+
+    # Snap target to nearest grid point, then scan outward sorted by distance
+    snap_x = round(round(target_x / _GRID_MM) * _GRID_MM, 9)
+    snap_y = round(round(target_y / _GRID_MM) * _GRID_MM, 9)
+    steps = math.ceil(search_radius_mm / _GRID_MM)
+
+    candidates: list[tuple[float, float, float]] = []
+    for di in range(-steps, steps + 1):
+        for dj in range(-steps, steps + 1):
+            cx = round(snap_x + di * _GRID_MM, 9)
+            cy = round(snap_y + dj * _GRID_MM, 9)
+            dist = math.hypot(cx - target_x, cy - target_y)
+            if dist <= search_radius_mm + 1e-9:
+                candidates.append((dist, cx, cy))
+
+    candidates.sort()
+
+    for _dist, cx, cy in candidates:
+        candidate_bbox = {
+            "min_x": cx + off_min_x,
+            "min_y": cy + off_min_y,
+            "max_x": cx + off_max_x,
+            "max_y": cy + off_max_y,
+        }
+        if not any(_bboxes_overlap(candidate_bbox, sb) for sb in static_bboxes):
+            return (cx, cy)
+
+    return None
+
+
 # ---------------------------------------------------------------------------
 # MCP tool registration
 # ---------------------------------------------------------------------------

@@ -323,7 +323,9 @@ _PROMPT_PCB = """\
   courtyards — useful for sizing the board outline around all components.
 - Move or rotate a single footprint: **set_footprint_position(pcb_path,
   reference, x, y, rotation)**.  Any argument may be ``null`` to leave it
-  unchanged; at least one must be provided.
+  unchanged; at least one must be provided.  If the requested position causes
+  a courtyard collision, the tool automatically adjusts to the nearest free
+  spot; if none is found within 20 mm, an error is returned.
 - Flip a footprint between F.Cu and B.Cu: **flip_footprint(pcb_path,
   reference)**.  All child layer items are updated automatically.
 - Update a footprint property (Reference, Value, Datasheet, or custom field):
