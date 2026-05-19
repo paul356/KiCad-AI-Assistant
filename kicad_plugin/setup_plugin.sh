@@ -13,7 +13,7 @@
 
 set -euo pipefail
 
-PYTHON_VERSION="3.10.20"
+PYTHON_VERSION="3.13"
 FREEROUTING_VERSION="2.2.3"
 FREEROUTING_JAR="freerouting-${FREEROUTING_VERSION}.jar"
 FREEROUTING_URL="https://github.com/freerouting/freerouting/releases/download/v${FREEROUTING_VERSION}/${FREEROUTING_JAR}"
