@@ -261,7 +261,12 @@ if _WX_AVAILABLE:
             # site-packages on disk.
             plugin_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
             venv_site = os.path.join(plugin_dir, ".venv", "lib")
+            # On Windows the venv layout is .venv/Lib/site-packages/ (capital
+            # Lib, no python* subdirectory).  Check both layouts.
             kipy_found = bool(glob.glob(os.path.join(venv_site, "python*", "site-packages", "kipy")))
+            if not kipy_found:
+                win_site = os.path.join(plugin_dir, ".venv", "Lib", "site-packages", "kipy")
+                kipy_found = os.path.isdir(win_site)
             kipy_ok = kipy_found
             if not kipy_ok:
                 self._conv_entries.append({

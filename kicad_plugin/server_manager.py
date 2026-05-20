@@ -203,6 +203,12 @@ class ServerManager:
         "TMPDIR", "TEMP", "TMP",
         "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME",
         "DBUS_SESSION_BUS_ADDRESS",
+        # Windows: required for Winsock service-provider DLL resolution.
+        # Without SystemRoot the subprocess cannot find ws2_32.dll / wship6.dll
+        # and asyncio._overlapped raises OSError [WinError 10106].
+        "SystemRoot", "SystemDrive", "USERPROFILE", "APPDATA", "LOCALAPPDATA",
+        "COMPUTERNAME", "USERNAME", "USERDOMAIN",
+        "COMSPEC", "windir",
     )
 
     def _build_env(self, port: int) -> dict[str, str]:
