@@ -21,7 +21,7 @@ if _WX_AVAILABLE:
         _PROVIDERS = ["openai", "anthropic", "custom"]
 
         def __init__(self, parent, settings) -> None:
-            super().__init__(parent, title="AI Assistant Settings", size=(480, 600))
+            super().__init__(parent, title="AI Assistant Settings", size=(600, 620))
             self._settings = settings
             self._build_ui()
 

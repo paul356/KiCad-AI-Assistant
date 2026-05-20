@@ -86,8 +86,13 @@ class ServerManager:
             try:
                 kwargs: dict = {}
                 if platform.system() == "Windows":
-                    # Windows-specific: CREATE_NEW_PROCESS_GROUP isolates signals
+                    # Windows-specific: CREATE_NEW_PROCESS_GROUP isolates signals;
+                    # STARTUPINFO with SW_SHOWMINIMIZED starts the console minimized.
+                    si = subprocess.STARTUPINFO()
+                    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                    si.wShowWindow = 6  # SW_MINIMIZE
                     kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+                    kwargs["startupinfo"] = si
                 else:
                     kwargs["start_new_session"] = True
 

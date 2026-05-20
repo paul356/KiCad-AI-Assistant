@@ -46,7 +46,7 @@ if _WX_AVAILABLE:
                 parent,
                 title="KiCad AI Assistant",
                 size=(520, 680),
-                style=wx.DEFAULT_FRAME_STYLE | wx.STAY_ON_TOP,
+                style=wx.DEFAULT_FRAME_STYLE,
             )
             self._server_mgr = server_mgr
             self._settings = settings
