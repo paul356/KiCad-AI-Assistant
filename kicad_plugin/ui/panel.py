@@ -1346,7 +1346,7 @@ if _WX_AVAILABLE:
                 # RunScript is synchronous on the current page so values are reliable.
                 _ok_y, _sy = self._conv_view.RunScript("String(window.scrollY)")
                 _ok_h, _sh = self._conv_view.RunScript(
-                    "String(document.body.scrollHeight - window.innerHeight)"
+                    "String(document.body ? document.body.scrollHeight - window.innerHeight : 0)"
                 )
                 try:
                     _sy_val = int(float(_sy)) if _ok_y else 0
@@ -1361,7 +1361,7 @@ if _WX_AVAILABLE:
                 # so it executes synchronously as part of the page load, avoiding the
                 # async race condition that makes a post-SetPage RunScript ineffective.
                 if _at_bottom:
-                    _scroll_js = "window.scrollTo(0, document.body.scrollHeight);"
+                    _scroll_js = "window.scrollTo(0, document.body ? document.body.scrollHeight : 0);"
                 else:
                     _scroll_js = f"window.scrollTo(0, {_sy_val});"
                 parts.append(f"<script>{_scroll_js}</script>")
