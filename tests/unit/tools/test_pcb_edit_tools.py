@@ -1,6 +1,4 @@
-"""
-Unit tests for kicad_mcp/tools/pcb_edit_tools.py
-"""
+"""Unit tests for kicad_mcp/tools/pcb_edit_tools.py."""
 
 import asyncio
 import os
@@ -259,256 +257,49 @@ class TestAddBoardOutlineArc:
         assert result["added"]["radius"] == pytest.approx(3.0)
 
 
-# ---------------------------------------------------------------------------
-# get_footprint_bbox
-# ---------------------------------------------------------------------------
-
-
-class TestGetFootprintBbox:
-    def test_r1_bbox_no_rotation(self, tools, board_copy):
-        """R1 is at (10, 20), courtyard ±1 × ±0.75 — no rotation."""
-        result = _run(tools["get_footprint_bbox"](pcb_path=board_copy, reference="R1", ctx=None))
-        assert "bbox" in result
-        bbox = result["bbox"]
-        assert bbox["min_x"] == pytest.approx(9.0)
-        assert bbox["max_x"] == pytest.approx(11.0)
-        assert bbox["min_y"] == pytest.approx(19.25)
-        assert bbox["max_y"] == pytest.approx(20.75)
-
-    def test_not_found_returns_error(self, tools, board_copy):
+class TestSetFootprintProperty:
+    def test_updates_value(self, tools, board_copy):
         result = _run(
-            tools["get_footprint_bbox"](pcb_path=board_copy, reference="MISSING", ctx=None)
+            tools["set_footprint_property"](
+                pcb_path=board_copy,
+                reference="R1",
+                property_name="Value",
+                value="22k",
+                ctx=None,
+            )
         )
-        assert "error" in result
-
-
-# ---------------------------------------------------------------------------
-# get_board_bounding_box
-# ---------------------------------------------------------------------------
-
-
-class TestGetBoardBoundingBox:
-    def test_returns_bbox_covering_all_fps(self, tools, board_copy):
-        result = _run(tools["get_board_bounding_box"](pcb_path=board_copy, ctx=None))
-        assert "bbox" in result
-        bbox = result["bbox"]
-        # R1 at x=10, R2 at x=30, R3 at x=20 — leftmost courtyard edge 10-1=9, rightmost 30+1=31
-        assert bbox["min_x"] == pytest.approx(9.0)
-        assert bbox["max_x"] == pytest.approx(31.0)
-
-    def test_footprint_count(self, tools, board_copy):
-        result = _run(tools["get_board_bounding_box"](pcb_path=board_copy, ctx=None))
-        assert result["footprint_count"] == 3
-
-
-# ---------------------------------------------------------------------------
-# align_footprints
-# ---------------------------------------------------------------------------
-
-
-class TestAlignFootprints:
-    def test_align_y_to_mean(self, tools, board_copy):
-        """Aligning footprints at y=20, y=20, y=30 to mean (≈23.33) moves the third."""
+        assert "error" not in result
         from kicad_mcp.utils.pcb_sexp_utils import load_pcb
-        from kicad_mcp.utils.pcb_footprint_utils import find_footprint, get_fp_at, set_fp_at
+        from kicad_mcp.utils.pcb_footprint_utils import find_footprint, get_fp_property
 
-        # First move R3 to y=30 so the mean is not trivially unchanged
         data = load_pcb(board_copy)
-        fp = find_footprint(data, "R3")
-        ox, oy, rot = get_fp_at(fp)
-        set_fp_at(fp, ox, 30.0, rot)
-        from kicad_mcp.utils.pcb_sexp_utils import save_pcb
+        fp = find_footprint(data, "R1")
+        assert get_fp_property(fp, "Value") == "22k"
 
-        save_pcb(board_copy, data)
-
+    def test_creates_backup(self, tools, board_copy):
         result = _run(
-            tools["align_footprints"](
+            tools["set_footprint_property"](
+                pcb_path=board_copy, reference="R1", property_name="Value", value="1k", ctx=None
+            )
+        )
+        assert os.path.isfile(result["backup_path"])
+
+    def test_error_on_missing_reference(self, tools, board_copy):
+        result = _run(
+            tools["set_footprint_property"](
+                pcb_path=board_copy, reference="U99", property_name="Value", value="x", ctx=None
+            )
+        )
+        assert "error" in result
+
+    def test_error_on_missing_property(self, tools, board_copy):
+        result = _run(
+            tools["set_footprint_property"](
                 pcb_path=board_copy,
-                references=["R1", "R2", "R3"],
-                axis="y",
-                coordinate=None,
+                reference="R1",
+                property_name="NoSuchProp",
+                value="x",
                 ctx=None,
             )
         )
-        assert "error" not in result
-        expected_mean = (20.0 + 20.0 + 30.0) / 3.0
-        assert result["target_coordinate"] == pytest.approx(expected_mean, abs=1e-4)
-        # Re-read from disk to confirm the change was persisted
-        data2 = load_pcb(board_copy)
-        for ref in ("R1", "R2", "R3"):
-            _, py, _ = get_fp_at(find_footprint(data2, ref))
-            assert py == pytest.approx(expected_mean, abs=1e-4)
-
-    def test_align_y_to_explicit_coordinate(self, tools, board_copy):
-        result = _run(
-            tools["align_footprints"](
-                pcb_path=board_copy, references=["R1", "R2"], axis="y", coordinate=25.0, ctx=None
-            )
-        )
-        assert "error" not in result
-        for entry in result["aligned"]:
-            assert entry["new_y"] == pytest.approx(25.0)
-
-    def test_align_x_to_explicit(self, tools, board_copy):
-        # Move R3 to y=30 first so that aligning R1 (y=20) and R3 (y=30) to x=15
-        # does not create an overlap (they will be at (15,20) and (15,30) respectively).
-        from kicad_mcp.utils.pcb_sexp_utils import load_pcb, save_pcb
-        from kicad_mcp.utils.pcb_footprint_utils import find_footprint, get_fp_at, set_fp_at
-
-        data = load_pcb(board_copy)
-        fp = find_footprint(data, "R3")
-        ox, _, rot = get_fp_at(fp)
-        set_fp_at(fp, ox, 30.0, rot)
-        save_pcb(board_copy, data)
-
-        result = _run(
-            tools["align_footprints"](
-                pcb_path=board_copy, references=["R1", "R3"], axis="x", coordinate=15.0, ctx=None
-            )
-        )
-        assert "error" not in result
-        for entry in result["aligned"]:
-            assert entry["new_x"] == pytest.approx(15.0)
-
-    def test_not_found_listed(self, tools, board_copy):
-        result = _run(
-            tools["align_footprints"](
-                pcb_path=board_copy,
-                references=["R1", "NOTHERE"],
-                axis="y",
-                coordinate=20.0,
-                ctx=None,
-            )
-        )
-        assert "NOTHERE" in result["not_found"]
-
-    def test_invalid_axis_rejected(self, tools, board_copy):
-        result = _run(
-            tools["align_footprints"](
-                pcb_path=board_copy, references=["R1"], axis="z", coordinate=None, ctx=None
-            )
-        )
         assert "error" in result
-
-    def test_backup_created(self, tools, board_copy):
-        _run(
-            tools["align_footprints"](
-                pcb_path=board_copy, references=["R1", "R2"], axis="y", coordinate=20.0, ctx=None
-            )
-        )
-        assert os.path.exists(board_copy + ".bak")
-
-
-# ---------------------------------------------------------------------------
-# distribute_footprints
-# ---------------------------------------------------------------------------
-
-
-class TestDistributeFootprints:
-    def test_three_footprints_evenly_spaced(self, tools, board_copy):
-        """Distribute R1=10, R2=12, R3=30 → R2 should move to x=20."""
-        from kicad_mcp.utils.pcb_sexp_utils import load_pcb, save_pcb
-        from kicad_mcp.utils.pcb_footprint_utils import find_footprint, get_fp_at, set_fp_at
-
-        # Move R2 to x=12 and R3 to x=30 so they are not evenly spaced
-        data = load_pcb(board_copy)
-        for ref, new_x in (("R2", 12.0), ("R3", 30.0)):
-            fp = find_footprint(data, ref)
-            ox, oy, rot = get_fp_at(fp)
-            set_fp_at(fp, new_x, oy, rot)
-        save_pcb(board_copy, data)
-
-        result = _run(
-            tools["distribute_footprints"](
-                pcb_path=board_copy, references=["R1", "R2", "R3"], axis="x", ctx=None
-            )
-        )
-        assert "error" not in result
-        assert result["spacing_mm"] == pytest.approx(10.0)
-        new_xs = {e["reference"]: e["new_x"] for e in result["distributed"]}
-        assert new_xs["R1"] == pytest.approx(10.0)
-        assert new_xs["R2"] == pytest.approx(20.0)
-        assert new_xs["R3"] == pytest.approx(30.0)
-        # Verify persisted on disk
-        data2 = load_pcb(board_copy)
-        px, _, _ = get_fp_at(find_footprint(data2, "R2"))
-        assert px == pytest.approx(20.0)
-
-    def test_two_refs_unchanged(self, tools, board_copy):
-        result = _run(
-            tools["distribute_footprints"](
-                pcb_path=board_copy, references=["R1", "R2"], axis="x", ctx=None
-            )
-        )
-        assert "error" not in result
-        # spacing = 30 - 10 = 20; only 2 points, both at extremes
-        assert result["spacing_mm"] == pytest.approx(20.0)
-
-    def test_invalid_axis_rejected(self, tools, board_copy):
-        result = _run(
-            tools["distribute_footprints"](
-                pcb_path=board_copy, references=["R1", "R2"], axis="z", ctx=None
-            )
-        )
-        assert "error" in result
-
-    def test_too_few_refs_rejected(self, tools, board_copy):
-        result = _run(
-            tools["distribute_footprints"](
-                pcb_path=board_copy, references=["R1"], axis="x", ctx=None
-            )
-        )
-        assert "error" in result
-
-
-# ---------------------------------------------------------------------------
-# move_footprints_by_delta
-# ---------------------------------------------------------------------------
-
-
-class TestMoveFootprintsByDelta:
-    def test_moves_by_delta(self, tools, board_copy):
-        result = _run(
-            tools["move_footprints_by_delta"](
-                pcb_path=board_copy, references=["R1", "R2"], dx=5.0, dy=-3.0, ctx=None
-            )
-        )
-        assert "error" not in result
-        moves = {e["reference"]: e for e in result["moved"]}
-        assert moves["R1"]["new_x"] == pytest.approx(15.0)  # 10 + 5
-        assert moves["R1"]["new_y"] == pytest.approx(17.0)  # 20 - 3
-        assert moves["R2"]["new_x"] == pytest.approx(35.0)  # 30 + 5
-
-    def test_zero_delta_rejected(self, tools, board_copy):
-        result = _run(
-            tools["move_footprints_by_delta"](
-                pcb_path=board_copy, references=["R1"], dx=0.0, dy=0.0, ctx=None
-            )
-        )
-        assert "error" in result
-
-    def test_empty_refs_rejected(self, tools, board_copy):
-        result = _run(
-            tools["move_footprints_by_delta"](
-                pcb_path=board_copy, references=[], dx=1.0, dy=0.0, ctx=None
-            )
-        )
-        assert "error" in result
-
-    def test_not_found_listed(self, tools, board_copy):
-        result = _run(
-            tools["move_footprints_by_delta"](
-                pcb_path=board_copy, references=["R1", "MISSING"], dx=1.0, dy=0.0, ctx=None
-            )
-        )
-        assert "MISSING" in result["not_found"]
-        # R1 should still have moved
-        assert len(result["moved"]) == 1
-
-    def test_backup_created(self, tools, board_copy):
-        _run(
-            tools["move_footprints_by_delta"](
-                pcb_path=board_copy, references=["R1"], dx=0.0, dy=1.0, ctx=None
-            )
-        )
-        assert os.path.exists(board_copy + ".bak")

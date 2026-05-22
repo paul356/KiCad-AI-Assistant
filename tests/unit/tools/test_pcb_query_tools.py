@@ -3,11 +3,13 @@ Unit tests for kicad_mcp/tools/pcb_query_tools.py
 """
 import asyncio
 import os
+import shutil
 
 import pytest
 
 FIXTURE_DIR = os.path.join(os.path.dirname(__file__), "fixtures")
 BOARD_FIXTURE = os.path.join(FIXTURE_DIR, "test_board.kicad_pcb")
+BOARD_WITH_OUTLINE_FIXTURE = os.path.join(FIXTURE_DIR, "test_board_with_outline.kicad_pcb")
 
 
 class _MockMCP:
@@ -32,6 +34,13 @@ def _get_tools() -> dict:
 @pytest.fixture(scope="module")
 def tools():
     return _get_tools()
+
+
+@pytest.fixture
+def board_with_outline_copy(tmp_path):
+    dest = tmp_path / "board_with_outline.kicad_pcb"
+    shutil.copy(BOARD_WITH_OUTLINE_FIXTURE, dest)
+    return str(dest)
 
 
 def _run(coro):
@@ -106,6 +115,40 @@ class TestGetFootprint:
     def test_returns_error_on_missing_reference(self, tools):
         result = _run(tools["get_footprint"](pcb_path=BOARD_FIXTURE, reference="U99", ctx=None))
         assert "error" in result
+
+
+class TestGetFootprintBbox:
+    def test_r1_bbox_no_rotation(self, tools, board_with_outline_copy):
+        result = _run(
+            tools["get_footprint_bbox"](pcb_path=board_with_outline_copy, reference="R1", ctx=None)
+        )
+        assert "bbox" in result
+        bbox = result["bbox"]
+        assert bbox["min_x"] == pytest.approx(9.0)
+        assert bbox["max_x"] == pytest.approx(11.0)
+        assert bbox["min_y"] == pytest.approx(19.25)
+        assert bbox["max_y"] == pytest.approx(20.75)
+
+    def test_not_found_returns_error(self, tools, board_with_outline_copy):
+        result = _run(
+            tools["get_footprint_bbox"](
+                pcb_path=board_with_outline_copy, reference="MISSING", ctx=None
+            )
+        )
+        assert "error" in result
+
+
+class TestGetBoardBoundingBox:
+    def test_returns_bbox_covering_all_fps(self, tools, board_with_outline_copy):
+        result = _run(tools["get_board_bounding_box"](pcb_path=board_with_outline_copy, ctx=None))
+        assert "bbox" in result
+        bbox = result["bbox"]
+        assert bbox["min_x"] == pytest.approx(9.0)
+        assert bbox["max_x"] == pytest.approx(31.0)
+
+    def test_footprint_count(self, tools, board_with_outline_copy):
+        result = _run(tools["get_board_bounding_box"](pcb_path=board_with_outline_copy, ctx=None))
+        assert result["footprint_count"] == 3
 
 
 class TestListNets:

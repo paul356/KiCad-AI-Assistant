@@ -1,7 +1,7 @@
 """
 PCB footprint placement tools for KiCad MCP server.
 
-Provides tools to reposition, flip, and update properties of footprints
+Provides tools to reposition, flip, align, distribute, and move footprints
 on a .kicad_pcb board.  All mutation tools create a .kicad_pcb.bak backup
 before writing.
 """
@@ -17,9 +17,7 @@ from kicad_mcp.utils.pcb_footprint_utils import (
     flip_fp_layers,
     get_fp_at,
     get_fp_layer,
-    get_fp_property,
     set_fp_at,
-    set_fp_property,
 )
 from kicad_mcp.utils.pcb_sexp_utils import load_pcb, save_pcb
 
@@ -213,49 +211,87 @@ def register_pcb_placement_tools(mcp: FastMCP) -> None:
         }
 
     @mcp.tool()
-    async def set_footprint_property(
+    async def align_footprints(
         pcb_path: str,
-        reference: str,
-        property_name: str,
-        value: str,
+        references: list[str],
+        axis: str,
+        coordinate: float | None,
         ctx: Context | None,
     ) -> dict[str, Any]:
-        """Update a property of a footprint on the PCB board.
+        """Align a list of footprints to the same X or Y coordinate.
 
-        Common property names: ``Reference``, ``Value``, ``Datasheet``,
-        ``Description``.  Custom user fields are also supported.
+        Sets all listed footprints to the same ``x`` (if ``axis="x"``) or
+        the same ``y`` (if ``axis="y"``).  The target coordinate may be
+        specified explicitly, or omitted (``None``) to use the mean of the
+        current positions.
 
+        PCB coordinates: mm, +X right, **+Y down**.
         A .kicad_pcb.bak backup is created before writing.
 
         Args:
             pcb_path: Absolute path to the .kicad_pcb file.
-            reference: Footprint reference designator, e.g. ``"R1"``.
-            property_name: Property name to update, e.g. ``"Value"``.
-            value: New property value.
-            ctx: MCP context for progress reporting.
+            references: List of reference designators to align,
+                e.g. ``["C1", "C2", "C3"]``.
+            axis: ``"x"`` to align horizontally (same X) or ``"y"`` to
+                align vertically (same Y).
+            coordinate: Target coordinate in mm.  Pass ``null`` to use the
+                mean of the current footprint positions along the chosen axis.
+            ctx: MCP context (unused).
 
         Returns:
-            dict with reference, property_name, previous_value, new_value,
-            backup_path.
+            dict with aligned (list of {reference, old_x, old_y, new_x,
+            new_y}), target_coordinate, backup_path, pcb_path, and any
+            not_found references.
         """
-        data = load_pcb(pcb_path)
-        try:
-            fp = find_footprint(data, reference)
-        except KeyError as exc:
-            return {"error": str(exc)}
+        if axis not in ("x", "y"):
+            return {"error": "axis must be 'x' or 'y'."}
+        if not references:
+            return {"error": "references list must not be empty."}
 
-        old_value = get_fp_property(fp, property_name)
-        if old_value is None:
+        data = load_pcb(pcb_path)
+
+        fps = {}
+        not_found = []
+        for ref in references:
+            try:
+                fps[ref] = find_footprint(data, ref)
+            except KeyError:
+                not_found.append(ref)
+
+        if not fps:
+            return {"error": "None of the specified footprints were found.", "not_found": not_found}
+
+        positions = {ref: get_fp_at(fp) for ref, fp in fps.items()}
+
+        if coordinate is None:
+            if axis == "x":
+                target = sum(p[0] for p in positions.values()) / len(positions)
+            else:
+                target = sum(p[1] for p in positions.values()) / len(positions)
+        else:
+            target = float(coordinate)
+
+        aligned = []
+        proposals = []
+        for ref, fp in fps.items():
+            ox, oy, rot = positions[ref]
+            nx = target if axis == "x" else ox
+            ny = target if axis == "y" else oy
+            proposals.append((ref, nx, ny, rot))
+            aligned.append({"reference": ref, "old_x": ox, "old_y": oy, "new_x": nx, "new_y": ny})
+
+        collisions = find_collisions(data, proposals)
+        if collisions:
+            details = [
+                {"ref": c["ref"], "overlapping_with": c["overlapping_with"]} for c in collisions
+            ]
             return {
-                "error": (
-                    f"Property '{property_name}' not found on footprint '{reference}'. "
-                    f"Use get_footprint to see available properties."
-                )
+                "error": "Collision detected: one or more footprints would overlap after alignment.",
+                "collisions": details,
             }
 
-        updated = set_fp_property(fp, property_name, value)
-        if not updated:
-            return {"error": f"Failed to update property '{property_name}' on '{reference}'."}
+        for ref, nx, ny, rot in proposals:
+            set_fp_at(fps[ref], nx, ny, rot)
 
         try:
             backup_path = save_pcb(pcb_path, data)
@@ -263,10 +299,158 @@ def register_pcb_placement_tools(mcp: FastMCP) -> None:
             return {"error": f"Failed to write PCB file: {exc}"}
 
         return {
-            "reference": reference,
-            "property_name": property_name,
-            "previous_value": old_value,
-            "new_value": value,
+            "aligned": aligned,
+            "target_coordinate": round(target, 4),
+            "axis": axis,
+            "not_found": not_found,
+            "backup_path": backup_path,
+            "pcb_path": pcb_path,
+        }
+
+    @mcp.tool()
+    async def distribute_footprints(
+        pcb_path: str,
+        references: list[str],
+        axis: str,
+        ctx: Context | None,
+    ) -> dict[str, Any]:
+        """Evenly space footprints along the X or Y axis.
+
+        Keeps the two outermost footprint positions fixed and redistributes
+        the intermediate ones at equal intervals.  At least three
+        footprints are needed; two footprints are returned unchanged.
+
+        Footprints are sorted by their current position along the chosen
+        axis before spacing.
+
+        PCB coordinates: mm, +X right, **+Y down**.
+        A .kicad_pcb.bak backup is created before writing.
+        """
+        if axis not in ("x", "y"):
+            return {"error": "axis must be 'x' or 'y'."}
+        if len(references) < 2:
+            return {"error": "At least 2 references are required."}
+
+        data = load_pcb(pcb_path)
+
+        fps = {}
+        not_found = []
+        for ref in references:
+            try:
+                fps[ref] = find_footprint(data, ref)
+            except KeyError:
+                not_found.append(ref)
+
+        if len(fps) < 2:
+            return {"error": "Fewer than 2 footprints found.", "not_found": not_found}
+
+        positions = {ref: get_fp_at(fp) for ref, fp in fps.items()}
+
+        key_idx = 0 if axis == "x" else 1
+        sorted_refs = sorted(fps.keys(), key=lambda r: positions[r][key_idx])
+
+        first_pos = positions[sorted_refs[0]][key_idx]
+        last_pos = positions[sorted_refs[-1]][key_idx]
+        n = len(sorted_refs)
+        spacing = (last_pos - first_pos) / (n - 1) if n > 1 else 0.0
+
+        distributed = []
+        proposals = []
+        for i, ref in enumerate(sorted_refs):
+            ox, oy, rot = positions[ref]
+            target_coord = first_pos + i * spacing
+            nx = target_coord if axis == "x" else ox
+            ny = target_coord if axis == "y" else oy
+            proposals.append((ref, nx, ny, rot))
+            distributed.append(
+                {"reference": ref, "old_x": ox, "old_y": oy, "new_x": nx, "new_y": ny}
+            )
+
+        collisions = find_collisions(data, proposals)
+        if collisions:
+            details = [
+                {"ref": c["ref"], "overlapping_with": c["overlapping_with"]} for c in collisions
+            ]
+            return {
+                "error": "Collision detected: one or more footprints would overlap after distribution.",
+                "collisions": details,
+            }
+
+        for ref, nx, ny, rot in proposals:
+            set_fp_at(fps[ref], nx, ny, rot)
+
+        try:
+            backup_path = save_pcb(pcb_path, data)
+        except OSError as exc:
+            return {"error": f"Failed to write PCB file: {exc}"}
+
+        return {
+            "distributed": distributed,
+            "axis": axis,
+            "spacing_mm": round(spacing, 4),
+            "not_found": not_found,
+            "backup_path": backup_path,
+            "pcb_path": pcb_path,
+        }
+
+    @mcp.tool()
+    async def move_footprints_by_delta(
+        pcb_path: str,
+        references: list[str],
+        dx: float,
+        dy: float,
+        ctx: Context | None,
+    ) -> dict[str, Any]:
+        """Move a group of footprints by the same (dx, dy) offset."""
+        if dx == 0 and dy == 0:
+            return {"error": "dx and dy are both zero — nothing to do."}
+        if not references:
+            return {"error": "references list must not be empty."}
+
+        data = load_pcb(pcb_path)
+
+        fps = {}
+        not_found = []
+        for ref in references:
+            try:
+                fps[ref] = find_footprint(data, ref)
+            except KeyError:
+                not_found.append(ref)
+
+        if not fps:
+            return {"error": "None of the specified footprints were found.", "not_found": not_found}
+
+        moved = []
+        proposals = []
+        for ref, fp in fps.items():
+            ox, oy, rot = get_fp_at(fp)
+            nx, ny = ox + dx, oy + dy
+            proposals.append((ref, nx, ny, rot))
+            moved.append({"reference": ref, "old_x": ox, "old_y": oy, "new_x": nx, "new_y": ny})
+
+        collisions = find_collisions(data, proposals, check_within_group=False)
+        if collisions:
+            details = [
+                {"ref": c["ref"], "overlapping_with": c["overlapping_with"]} for c in collisions
+            ]
+            return {
+                "error": "Collision detected: one or more footprints would overlap after the move.",
+                "collisions": details,
+            }
+
+        for ref, nx, ny, rot in proposals:
+            set_fp_at(fps[ref], nx, ny, rot)
+
+        try:
+            backup_path = save_pcb(pcb_path, data)
+        except OSError as exc:
+            return {"error": f"Failed to write PCB file: {exc}"}
+
+        return {
+            "moved": moved,
+            "dx": dx,
+            "dy": dy,
+            "not_found": not_found,
             "backup_path": backup_path,
             "pcb_path": pcb_path,
         }

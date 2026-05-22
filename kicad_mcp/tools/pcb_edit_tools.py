@@ -3,8 +3,7 @@ PCB board editing tools for KiCad MCP server.
 
 Provides tools to:
   - Read, draw, and clear the board outline (Edge.Cuts layer).
-  - Query footprint and board bounding boxes in world coordinates.
-  - Perform group footprint operations (align, distribute, move by delta).
+  - Edit non-placement PCB data such as footprint properties.
 
 PCB coordinate convention (all tools here):
   millimetres, +X right, **+Y down**, rotation **clockwise-positive**
@@ -18,16 +17,18 @@ from typing import Any
 
 from fastmcp import Context, FastMCP
 
-from kicad_mcp.tools.pcb_placement_helpers import find_collisions
 from kicad_mcp.utils.pcb_board_utils import (
     add_gr_arc,
     add_gr_line,
     add_gr_rect,
     get_edge_cuts_items,
-    get_fp_courtyard_bbox,
     remove_edge_cuts_items,
 )
-from kicad_mcp.utils.pcb_footprint_utils import find_footprint, get_fp_at, set_fp_at
+from kicad_mcp.utils.pcb_footprint_utils import (
+    find_footprint,
+    get_fp_property,
+    set_fp_property,
+)
 from kicad_mcp.utils.pcb_sexp_utils import load_pcb, save_pcb
 
 log = logging.getLogger(__name__)
@@ -297,38 +298,20 @@ def register_pcb_edit_tools(mcp: FastMCP) -> None:
             "pcb_path": pcb_path,
         }
 
-    # ------------------------------------------------------------------
-    # Footprint bounding box
-    # ------------------------------------------------------------------
-
     @mcp.tool()
-    async def get_footprint_bbox(
+    async def set_footprint_property(
         pcb_path: str,
         reference: str,
+        property_name: str,
+        value: str,
         ctx: Context | None,
-    ) -> dict[str, Any]:
-        """Return the world-coordinate bounding box of a footprint's courtyard.
+    ) -> dict[str, str]:
+        """Update a property of a footprint on the PCB board.
 
-        The bounding box is computed from ``F.Courtyard`` / ``B.Courtyard``
-        graphic items in the footprint, transformed to board world
-        coordinates by applying the footprint's position and rotation
-        (clockwise-positive).  If the footprint has no courtyard items the
-        tool falls back to all ``fp_line``/``fp_rect``/``fp_circle`` items.
+        Common property names: ``Reference``, ``Value``, ``Datasheet``,
+        ``Description``.  Custom user fields are also supported.
 
-        Use this to check for footprint overlaps before placement or to
-        size the board outline around all components.
-
-        PCB coordinates: mm, +X right, **+Y down**.
-
-        Args:
-            pcb_path: Absolute path to the .kicad_pcb file.
-            reference: Footprint reference designator, e.g. ``"U1"``.
-            ctx: MCP context (unused).
-
-        Returns:
-            dict with reference, x/y/rotation (anchor), bbox
-            {min_x, min_y, max_x, max_y, width, height} in world mm,
-            or ``error`` if not found / no geometry.
+        A .kicad_pcb.bak backup is created before writing.
         """
         data = load_pcb(pcb_path)
         try:
@@ -336,399 +319,29 @@ def register_pcb_edit_tools(mcp: FastMCP) -> None:
         except KeyError as exc:
             return {"error": str(exc)}
 
-        fp_x, fp_y, fp_rot = get_fp_at(fp)
-        bbox = get_fp_courtyard_bbox(fp, fp_x, fp_y, fp_rot)
-        if bbox is None:
-            return {"error": f"No courtyard or graphic geometry found for '{reference}'."}
+        old_value = get_fp_property(fp, property_name)
+        if old_value is None:
+            return {
+                "error": (
+                    f"Property '{property_name}' not found on footprint '{reference}'. "
+                    f"Use get_footprint to see available properties."
+                )
+            }
+
+        updated = set_fp_property(fp, property_name, value)
+        if not updated:
+            return {"error": f"Failed to update property '{property_name}' on '{reference}'."}
+
+        try:
+            backup_path = save_pcb(pcb_path, data)
+        except OSError as exc:
+            return {"error": f"Failed to write PCB file: {exc}"}
 
         return {
             "reference": reference,
-            "x": fp_x,
-            "y": fp_y,
-            "rotation": fp_rot,
-            "bbox": bbox,
-        }
-
-    # ------------------------------------------------------------------
-    # Board bounding box (union of all footprint courtyards)
-    # ------------------------------------------------------------------
-
-    @mcp.tool()
-    async def get_board_bounding_box(
-        pcb_path: str,
-        ctx: Context | None,
-    ) -> dict[str, Any]:
-        """Return the union bounding box of all footprint courtyards on the board.
-
-        Useful for determining the minimum board size needed to contain all
-        placed footprints, and for checking whether all footprints fit
-        within the current board outline.
-
-        PCB coordinates: mm, +X right, **+Y down**.
-
-        Args:
-            pcb_path: Absolute path to the .kicad_pcb file.
-            ctx: MCP context (unused).
-
-        Returns:
-            dict with bbox {min_x, min_y, max_x, max_y, width, height}
-            in world mm covering all footprints, footprint_count,
-            footprints_without_courtyard (list of references that had to
-            fall back to raw graphics or were skipped).
-        """
-        import sexpdata as _sx
-
-        def _sym_local(v: Any) -> str:
-            return str(v) if isinstance(v, _sx.Symbol) else str(v)
-
-        data = load_pcb(pcb_path)
-        all_min_x: list[float] = []
-        all_min_y: list[float] = []
-        all_max_x: list[float] = []
-        all_max_y: list[float] = []
-        fp_count = 0
-        no_courtyard: list[str] = []
-
-        for item in data:
-            if not (isinstance(item, list) and len(item) > 0):
-                continue
-            if _sym_local(item[0]) != "footprint":
-                continue
-            fp_count += 1
-            # Get reference
-            ref = ""
-            for sub in item:
-                if isinstance(sub, list) and len(sub) >= 3 and _sym_local(sub[0]) == "property":
-                    if (sub[1] if isinstance(sub[1], str) else _sym_local(sub[1])) == "Reference":
-                        ref = sub[2] if isinstance(sub[2], str) else _sym_local(sub[2])
-            # Get position
-            fp_x, fp_y, fp_rot = 0.0, 0.0, 0.0
-            for sub in item:
-                if isinstance(sub, list) and len(sub) >= 3 and _sym_local(sub[0]) == "at":
-                    fp_x, fp_y = float(sub[1]), float(sub[2])
-                    fp_rot = float(sub[3]) if len(sub) > 3 else 0.0
-
-            bbox = get_fp_courtyard_bbox(item, fp_x, fp_y, fp_rot)
-            if bbox is None:
-                no_courtyard.append(ref)
-                continue
-            all_min_x.append(bbox["min_x"])
-            all_min_y.append(bbox["min_y"])
-            all_max_x.append(bbox["max_x"])
-            all_max_y.append(bbox["max_y"])
-
-        if not all_min_x:
-            return {
-                "error": "No footprint geometry found.",
-                "footprint_count": fp_count,
-                "footprints_without_courtyard": no_courtyard,
-            }
-
-        min_x = min(all_min_x)
-        min_y = min(all_min_y)
-        max_x = max(all_max_x)
-        max_y = max(all_max_y)
-
-        return {
-            "bbox": {
-                "min_x": round(min_x, 4),
-                "min_y": round(min_y, 4),
-                "max_x": round(max_x, 4),
-                "max_y": round(max_y, 4),
-                "width": round(max_x - min_x, 4),
-                "height": round(max_y - min_y, 4),
-            },
-            "footprint_count": fp_count,
-            "footprints_without_courtyard": no_courtyard,
-        }
-
-    # ------------------------------------------------------------------
-    # Group operations — align
-    # ------------------------------------------------------------------
-
-    @mcp.tool()
-    async def align_footprints(
-        pcb_path: str,
-        references: list[str],
-        axis: str,
-        coordinate: float | None,
-        ctx: Context | None,
-    ) -> dict[str, Any]:
-        """Align a list of footprints to the same X or Y coordinate.
-
-        Sets all listed footprints to the same ``x`` (if ``axis="x"``) or
-        the same ``y`` (if ``axis="y"``).  The target coordinate may be
-        specified explicitly, or omitted (``None``) to use the mean of the
-        current positions.
-
-        PCB coordinates: mm, +X right, **+Y down**.
-        A .kicad_pcb.bak backup is created before writing.
-
-        Args:
-            pcb_path: Absolute path to the .kicad_pcb file.
-            references: List of reference designators to align,
-                e.g. ``["C1", "C2", "C3"]``.
-            axis: ``"x"`` to align horizontally (same X) or ``"y"`` to
-                align vertically (same Y).
-            coordinate: Target coordinate in mm.  Pass ``null`` to use the
-                mean of the current footprint positions along the chosen axis.
-            ctx: MCP context (unused).
-
-        Returns:
-            dict with aligned (list of {reference, old_x, old_y, new_x,
-            new_y}), target_coordinate, backup_path, pcb_path, and any
-            not_found references.
-        """
-        if axis not in ("x", "y"):
-            return {"error": "axis must be 'x' or 'y'."}
-        if not references:
-            return {"error": "references list must not be empty."}
-
-        data = load_pcb(pcb_path)
-
-        fps = {}
-        not_found = []
-        for ref in references:
-            try:
-                fps[ref] = find_footprint(data, ref)
-            except KeyError:
-                not_found.append(ref)
-
-        if not fps:
-            return {"error": "None of the specified footprints were found.", "not_found": not_found}
-
-        positions = {ref: get_fp_at(fp) for ref, fp in fps.items()}
-
-        if coordinate is None:
-            if axis == "x":
-                target = sum(p[0] for p in positions.values()) / len(positions)
-            else:
-                target = sum(p[1] for p in positions.values()) / len(positions)
-        else:
-            target = float(coordinate)
-
-        aligned = []
-        proposals = []
-        for ref, fp in fps.items():
-            ox, oy, rot = positions[ref]
-            nx = target if axis == "x" else ox
-            ny = target if axis == "y" else oy
-            proposals.append((ref, nx, ny, rot))
-            aligned.append({"reference": ref, "old_x": ox, "old_y": oy, "new_x": nx, "new_y": ny})
-
-        collisions = find_collisions(data, proposals)
-        if collisions:
-            details = [
-                {"ref": c["ref"], "overlapping_with": c["overlapping_with"]} for c in collisions
-            ]
-            return {
-                "error": "Collision detected: one or more footprints would overlap after alignment.",
-                "collisions": details,
-            }
-
-        for ref, nx, ny, rot in proposals:
-            set_fp_at(fps[ref], nx, ny, rot)
-
-        try:
-            backup_path = save_pcb(pcb_path, data)
-        except OSError as exc:
-            return {"error": f"Failed to write PCB file: {exc}"}
-
-        return {
-            "aligned": aligned,
-            "target_coordinate": round(target, 4),
-            "axis": axis,
-            "not_found": not_found,
-            "backup_path": backup_path,
-            "pcb_path": pcb_path,
-        }
-
-    # ------------------------------------------------------------------
-    # Group operations — distribute
-    # ------------------------------------------------------------------
-
-    @mcp.tool()
-    async def distribute_footprints(
-        pcb_path: str,
-        references: list[str],
-        axis: str,
-        ctx: Context | None,
-    ) -> dict[str, Any]:
-        """Evenly space footprints along the X or Y axis.
-
-        Keeps the two outermost footprint positions fixed and redistributes
-        the intermediate ones at equal intervals.  At least three
-        footprints are needed; two footprints are returned unchanged.
-
-        Footprints are sorted by their current position along the chosen
-        axis before spacing.
-
-        PCB coordinates: mm, +X right, **+Y down**.
-        A .kicad_pcb.bak backup is created before writing.
-
-        Args:
-            pcb_path: Absolute path to the .kicad_pcb file.
-            references: List of reference designators, e.g.
-                ``["C1", "C2", "C3", "C4"]``.
-            axis: ``"x"`` to distribute horizontally or ``"y"`` to
-                distribute vertically.
-            ctx: MCP context (unused).
-
-        Returns:
-            dict with distributed (list of {reference, old_x, old_y,
-            new_x, new_y}), spacing_mm, backup_path, pcb_path, not_found.
-        """
-        if axis not in ("x", "y"):
-            return {"error": "axis must be 'x' or 'y'."}
-        if len(references) < 2:
-            return {"error": "At least 2 references are required."}
-
-        data = load_pcb(pcb_path)
-
-        fps = {}
-        not_found = []
-        for ref in references:
-            try:
-                fps[ref] = find_footprint(data, ref)
-            except KeyError:
-                not_found.append(ref)
-
-        if len(fps) < 2:
-            return {"error": "Fewer than 2 footprints found.", "not_found": not_found}
-
-        positions = {ref: get_fp_at(fp) for ref, fp in fps.items()}
-
-        # Sort by position along chosen axis
-        key_idx = 0 if axis == "x" else 1
-        sorted_refs = sorted(fps.keys(), key=lambda r: positions[r][key_idx])
-
-        first_pos = positions[sorted_refs[0]][key_idx]
-        last_pos = positions[sorted_refs[-1]][key_idx]
-        n = len(sorted_refs)
-        spacing = (last_pos - first_pos) / (n - 1) if n > 1 else 0.0
-
-        distributed = []
-        proposals = []
-        for i, ref in enumerate(sorted_refs):
-            ox, oy, rot = positions[ref]
-            target_coord = first_pos + i * spacing
-            nx = target_coord if axis == "x" else ox
-            ny = target_coord if axis == "y" else oy
-            proposals.append((ref, nx, ny, rot))
-            distributed.append(
-                {"reference": ref, "old_x": ox, "old_y": oy, "new_x": nx, "new_y": ny}
-            )
-
-        collisions = find_collisions(data, proposals)
-        if collisions:
-            details = [
-                {"ref": c["ref"], "overlapping_with": c["overlapping_with"]} for c in collisions
-            ]
-            return {
-                "error": "Collision detected: one or more footprints would overlap after distribution.",
-                "collisions": details,
-            }
-
-        for ref, nx, ny, rot in proposals:
-            set_fp_at(fps[ref], nx, ny, rot)
-
-        try:
-            backup_path = save_pcb(pcb_path, data)
-        except OSError as exc:
-            return {"error": f"Failed to write PCB file: {exc}"}
-
-        return {
-            "distributed": distributed,
-            "axis": axis,
-            "spacing_mm": round(spacing, 4),
-            "not_found": not_found,
-            "backup_path": backup_path,
-            "pcb_path": pcb_path,
-        }
-
-    # ------------------------------------------------------------------
-    # Group operations — move by delta
-    # ------------------------------------------------------------------
-
-    @mcp.tool()
-    async def move_footprints_by_delta(
-        pcb_path: str,
-        references: list[str],
-        dx: float,
-        dy: float,
-        ctx: Context | None,
-    ) -> dict[str, Any]:
-        """Move a group of footprints by the same (dx, dy) offset.
-
-        Useful for shifting a functional block after the board outline
-        changes, without altering the relative positions of components
-        within the group.
-
-        PCB coordinates: mm, +X right, **+Y down** (so positive ``dy``
-        moves footprints downward on screen).
-        A .kicad_pcb.bak backup is created before writing.
-
-        Args:
-            pcb_path: Absolute path to the .kicad_pcb file.
-            references: List of reference designators to move, e.g.
-                ``["U1", "C1", "C2", "R1"]``.
-            dx: X offset in mm (positive → right).
-            dy: Y offset in mm (positive → down on screen).
-            ctx: MCP context (unused).
-
-        Returns:
-            dict with moved (list of {reference, old_x, old_y, new_x,
-            new_y}), dx, dy, backup_path, pcb_path, not_found.
-        """
-        if dx == 0 and dy == 0:
-            return {"error": "dx and dy are both zero — nothing to do."}
-        if not references:
-            return {"error": "references list must not be empty."}
-
-        data = load_pcb(pcb_path)
-
-        fps = {}
-        not_found = []
-        for ref in references:
-            try:
-                fps[ref] = find_footprint(data, ref)
-            except KeyError:
-                not_found.append(ref)
-
-        if not fps:
-            return {"error": "None of the specified footprints were found.", "not_found": not_found}
-
-        moved = []
-        proposals = []
-        for ref, fp in fps.items():
-            ox, oy, rot = get_fp_at(fp)
-            nx, ny = ox + dx, oy + dy
-            proposals.append((ref, nx, ny, rot))
-            moved.append({"reference": ref, "old_x": ox, "old_y": oy, "new_x": nx, "new_y": ny})
-
-        collisions = find_collisions(data, proposals, check_within_group=False)
-        if collisions:
-            details = [
-                {"ref": c["ref"], "overlapping_with": c["overlapping_with"]} for c in collisions
-            ]
-            return {
-                "error": "Collision detected: one or more footprints would overlap after the move.",
-                "collisions": details,
-            }
-
-        for ref, nx, ny, rot in proposals:
-            set_fp_at(fps[ref], nx, ny, rot)
-
-        try:
-            backup_path = save_pcb(pcb_path, data)
-        except OSError as exc:
-            return {"error": f"Failed to write PCB file: {exc}"}
-
-        return {
-            "moved": moved,
-            "dx": dx,
-            "dy": dy,
-            "not_found": not_found,
+            "property_name": property_name,
+            "previous_value": old_value,
+            "new_value": value,
             "backup_path": backup_path,
             "pcb_path": pcb_path,
         }

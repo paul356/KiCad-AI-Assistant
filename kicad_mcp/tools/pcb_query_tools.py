@@ -2,8 +2,8 @@
 PCB board read / query tools for KiCad MCP server.
 
 Provides read-only tools to inspect a .kicad_pcb file: board metadata,
-footprint list, individual footprint detail, net list, and ratsnest
-(unconnected pad pairs).
+footprint list, individual footprint detail, footprint/board bounding
+boxes, net list, and ratsnest (unconnected pad pairs).
 """
 import logging
 import math
@@ -15,6 +15,7 @@ import sexpdata
 from fastmcp import Context, FastMCP
 
 from kicad_mcp.utils.pcb_sexp_utils import load_pcb
+from kicad_mcp.utils.pcb_board_utils import get_fp_courtyard_bbox
 from kicad_mcp.utils.pcb_footprint_utils import (
     find_footprint,
     get_fp_at,
@@ -225,6 +226,140 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
             "layer": layer,
             "properties": props,
             "pads": pads,
+        }
+
+    @mcp.tool()
+    async def get_footprint_bbox(
+        pcb_path: str,
+        reference: str,
+        ctx: Context | None,
+    ) -> dict[str, Any]:
+        """Return the world-coordinate bounding box of a footprint's courtyard.
+
+        The bounding box is computed from ``F.Courtyard`` / ``B.Courtyard``
+        graphic items in the footprint, transformed to board world
+        coordinates by applying the footprint's position and rotation
+        (clockwise-positive).  If the footprint has no courtyard items the
+        tool falls back to all ``fp_line``/``fp_rect``/``fp_circle`` items.
+
+        Use this to check for footprint overlaps before placement or to
+        size the board outline around all components.
+
+        PCB coordinates: mm, +X right, **+Y down**.
+
+        Args:
+            pcb_path: Absolute path to the .kicad_pcb file.
+            reference: Footprint reference designator, e.g. ``"U1"``.
+            ctx: MCP context (unused).
+
+        Returns:
+            dict with reference, x/y/rotation (anchor), bbox
+            {min_x, min_y, max_x, max_y, width, height} in world mm,
+            or ``error`` if not found / no geometry.
+        """
+        data = load_pcb(pcb_path)
+        try:
+            fp = find_footprint(data, reference)
+        except KeyError as exc:
+            return {"error": str(exc)}
+
+        fp_x, fp_y, fp_rot = get_fp_at(fp)
+        bbox = get_fp_courtyard_bbox(fp, fp_x, fp_y, fp_rot)
+        if bbox is None:
+            return {"error": f"No courtyard or graphic geometry found for '{reference}'."}
+
+        return {
+            "reference": reference,
+            "x": fp_x,
+            "y": fp_y,
+            "rotation": fp_rot,
+            "bbox": bbox,
+        }
+
+    @mcp.tool()
+    async def get_board_bounding_box(
+        pcb_path: str,
+        ctx: Context | None,
+    ) -> dict[str, Any]:
+        """Return the union bounding box of all footprint courtyards on the board.
+
+        Useful for determining the minimum board size needed to contain all
+        placed footprints, and for checking whether all footprints fit
+        within the current board outline.
+
+        PCB coordinates: mm, +X right, **+Y down**.
+
+        Args:
+            pcb_path: Absolute path to the .kicad_pcb file.
+            ctx: MCP context (unused).
+
+        Returns:
+            dict with bbox {min_x, min_y, max_x, max_y, width, height}
+            in world mm covering all footprints, footprint_count,
+            footprints_without_courtyard (list of references that had to
+            fall back to raw graphics or were skipped).
+        """
+
+        def _sym_local(v: Any) -> str:
+            return str(v) if isinstance(v, sexpdata.Symbol) else str(v)
+
+        data = load_pcb(pcb_path)
+        all_min_x: list[float] = []
+        all_min_y: list[float] = []
+        all_max_x: list[float] = []
+        all_max_y: list[float] = []
+        fp_count = 0
+        no_courtyard: list[str] = []
+
+        for item in data:
+            if not (isinstance(item, list) and len(item) > 0):
+                continue
+            if _sym_local(item[0]) != "footprint":
+                continue
+            fp_count += 1
+            ref = ""
+            for sub in item:
+                if isinstance(sub, list) and len(sub) >= 3 and _sym_local(sub[0]) == "property":
+                    if (sub[1] if isinstance(sub[1], str) else _sym_local(sub[1])) == "Reference":
+                        ref = sub[2] if isinstance(sub[2], str) else _sym_local(sub[2])
+            fp_x, fp_y, fp_rot = 0.0, 0.0, 0.0
+            for sub in item:
+                if isinstance(sub, list) and len(sub) >= 3 and _sym_local(sub[0]) == "at":
+                    fp_x, fp_y = float(sub[1]), float(sub[2])
+                    fp_rot = float(sub[3]) if len(sub) > 3 else 0.0
+
+            bbox = get_fp_courtyard_bbox(item, fp_x, fp_y, fp_rot)
+            if bbox is None:
+                no_courtyard.append(ref)
+                continue
+            all_min_x.append(bbox["min_x"])
+            all_min_y.append(bbox["min_y"])
+            all_max_x.append(bbox["max_x"])
+            all_max_y.append(bbox["max_y"])
+
+        if not all_min_x:
+            return {
+                "error": "No footprint geometry found.",
+                "footprint_count": fp_count,
+                "footprints_without_courtyard": no_courtyard,
+            }
+
+        min_x = min(all_min_x)
+        min_y = min(all_min_y)
+        max_x = max(all_max_x)
+        max_y = max(all_max_y)
+
+        return {
+            "bbox": {
+                "min_x": round(min_x, 4),
+                "min_y": round(min_y, 4),
+                "max_x": round(max_x, 4),
+                "max_y": round(max_y, 4),
+                "width": round(max_x - min_x, 4),
+                "height": round(max_y - min_y, 4),
+            },
+            "footprint_count": fp_count,
+            "footprints_without_courtyard": no_courtyard,
         }
 
     @mcp.tool()

@@ -4,8 +4,8 @@ Integration tests for all PCB-related MCP tools.
 Covers:
   - Query tools:     get_board_info, list_footprints, get_footprint,
                      list_nets, get_ratsnest
-  - Placement tools: set_footprint_position, flip_footprint,
-                     set_footprint_property
+  - Placement tools: set_footprint_position, flip_footprint
+  - Edit tools:      set_footprint_property
   - Library tools:   sync_footprint_index, get_footprint_sync_status,
                      list_footprint_libraries, search_footprints,
                      get_footprint_details
