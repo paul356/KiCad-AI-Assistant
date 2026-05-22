@@ -1,0 +1,128 @@
+(kicad_pcb
+	(version 20241229)
+	(generator "pcbnew")
+	(generator_version "8.0")
+	(general
+		(thickness 1.6)
+		(legacy_teardrops no)
+	)
+	(paper "A4")
+	(layers
+		(0 "F.Cu" signal)
+		(31 "B.Cu" signal)
+		(36 "B.CrtYd" user)
+		(37 "F.CrtYd" user)
+		(39 "F.Fab" user)
+	)
+
+	; ---------------------------------------------------------------------------
+	; J3 – USB-C receptacle (HRO TYPE-C-31-M-12), anchor of the usb_c group.
+	; Real position from smart-keyboard.kicad_pcb: at 96.52 80.01 -90.0
+	; Local courtyard (lines) from real PCB: rect (-5.32,-5.27)→(5.32, 4.15).
+	; All 22 pads reproduced with real local coords and KiCad 8.x net format.
+	; ---------------------------------------------------------------------------
+	(footprint "Connector_USB:USB_C_Receptacle_HRO_TYPE-C-31-M-12"
+		(layer "F.Cu")
+		(at 96.52 80.01 -90.0)
+		(property "Reference" "J3")
+		(property "Value" "USB_C_Receptacle_USB2.0_14P")
+		(property "placement_group" "usb_c")
+		(fp_line (start -5.32 -5.27) (end 5.32 -5.27) (layer "F.CrtYd"))
+		(fp_line (start 5.32 -5.27) (end 5.32 4.15) (layer "F.CrtYd"))
+		(fp_line (start 5.32 4.15) (end -5.32 4.15) (layer "F.CrtYd"))
+		(fp_line (start -5.32 4.15) (end -5.32 -5.27) (layer "F.CrtYd"))
+		(pad "" np_thru_hole circle (at -2.89 -2.6 270) (size 0.65 0.65))
+		(pad "" np_thru_hole circle (at 2.89 -2.6 270) (size 0.65 0.65))
+		(pad "A1" smd roundrect (at -3.25 -4.045 270) (size 0.6 1.45) (net "GND"))
+		(pad "A4" smd roundrect (at -2.45 -4.045 270) (size 0.6 1.45) (net "Net-(D1-A)"))
+		(pad "A5" smd roundrect (at -1.25 -4.045 270) (size 0.3 1.45) (net "Net-(J3-CC1)"))
+		(pad "A6" smd roundrect (at -0.25 -4.045 270) (size 0.3 1.45) (net "Net-(J3-D+-PadA6)"))
+		(pad "A7" smd roundrect (at 0.25 -4.045 270) (size 0.3 1.45) (net "Net-(J3-D--PadA7)"))
+		(pad "A8" smd roundrect (at 1.25 -4.045 270) (size 0.3 1.45))
+		(pad "A9" smd roundrect (at 2.45 -4.045 270) (size 0.6 1.45) (net "Net-(D1-A)"))
+		(pad "A12" smd roundrect (at 3.25 -4.045 270) (size 0.6 1.45) (net "GND"))
+		(pad "B1" smd roundrect (at 3.25 -4.045 270) (size 0.6 1.45) (net "GND"))
+		(pad "B4" smd roundrect (at 2.45 -4.045 270) (size 0.6 1.45) (net "Net-(D1-A)"))
+		(pad "B5" smd roundrect (at 1.75 -4.045 270) (size 0.3 1.45) (net "Net-(J3-CC2)"))
+		(pad "B6" smd roundrect (at 0.75 -4.045 270) (size 0.3 1.45) (net "Net-(J3-D+-PadA6)"))
+		(pad "B7" smd roundrect (at -0.75 -4.045 270) (size 0.3 1.45) (net "Net-(J3-D--PadA7)"))
+		(pad "B8" smd roundrect (at -1.75 -4.045 270) (size 0.3 1.45))
+		(pad "B9" smd roundrect (at -2.45 -4.045 270) (size 0.6 1.45) (net "Net-(D1-A)"))
+		(pad "B12" smd roundrect (at -3.25 -4.045 270) (size 0.6 1.45) (net "GND"))
+		(pad "SH" thru_hole oval (at -4.32 -3.13 270) (size 1.0 2.1) (net "GND"))
+		(pad "SH" thru_hole oval (at -4.32 1.05 270) (size 1.0 1.6) (net "GND"))
+		(pad "SH" thru_hole oval (at 4.32 -3.13 270) (size 1.0 2.1) (net "GND"))
+		(pad "SH" thru_hole oval (at 4.32 1.05 270) (size 1.0 1.6) (net "GND"))
+	)
+
+	; ---------------------------------------------------------------------------
+	; R1 – 5.1 kΩ pull-down on CC1.
+	; Real position: at 106.68 80.01 (no rotation).
+	; Courtyard: fp_rect (-1.48,-0.73)→(1.48, 0.73) – standard 0603 metric.
+	; ---------------------------------------------------------------------------
+	(footprint "Resistor_SMD:R_0603_1608Metric"
+		(layer "F.Cu")
+		(at 106.68 80.01)
+		(property "Reference" "R1")
+		(property "Value" "5.1k")
+		(property "placement_group" "usb_c")
+		(fp_rect (start -1.48 -0.73) (end 1.48 0.73) (layer "F.CrtYd"))
+		(pad "1" smd roundrect (at -0.825 0) (size 0.8 0.95) (net "Net-(J3-CC1)"))
+		(pad "2" smd roundrect (at 0.825 0) (size 0.8 0.95) (net "GND"))
+	)
+
+	; ---------------------------------------------------------------------------
+	; R2 – 5.1 kΩ pull-down on CC2.
+	; Real position: at 96.52 90.17 (no rotation).
+	; ---------------------------------------------------------------------------
+	(footprint "Resistor_SMD:R_0603_1608Metric"
+		(layer "F.Cu")
+		(at 96.52 90.17)
+		(property "Reference" "R2")
+		(property "Value" "5.1k")
+		(property "placement_group" "usb_c")
+		(fp_rect (start -1.48 -0.73) (end 1.48 0.73) (layer "F.CrtYd"))
+		(pad "1" smd roundrect (at -0.825 0) (size 0.8 0.95) (net "GND"))
+		(pad "2" smd roundrect (at 0.825 0) (size 0.8 0.95) (net "Net-(J3-CC2)"))
+	)
+
+	; ---------------------------------------------------------------------------
+	; C1 – 100 nF bypass cap on VBUS.
+	; Real position: at 86.36 80.01 (no rotation).
+	; Courtyard: fp_rect (-1.48,-0.73)→(1.48, 0.73) – standard 0603 metric.
+	; ---------------------------------------------------------------------------
+	(footprint "Capacitor_SMD:C_0603_1608Metric"
+		(layer "F.Cu")
+		(at 86.36 80.01)
+		(property "Reference" "C1")
+		(property "Value" "100nF")
+		(property "placement_group" "usb_c")
+		(fp_rect (start -1.48 -0.73) (end 1.48 0.73) (layer "F.CrtYd"))
+		(pad "1" smd roundrect (at -0.775 0) (size 0.9 0.95) (net "Net-(D1-A)"))
+		(pad "2" smd roundrect (at 0.775 0) (size 0.9 0.95) (net "GND"))
+	)
+
+	; ---------------------------------------------------------------------------
+	; D1 – B5819W Schottky diode (VBUS protection / reverse polarity).
+	; Real position: at 96.52 69.85 180.0
+	; Courtyard: fp_rect (-2.35,-1.15)→(2.35, 1.15) – SOD-123 package.
+	; ---------------------------------------------------------------------------
+	(footprint "Diode_SMD:D_SOD-123"
+		(layer "F.Cu")
+		(at 96.52 69.85 180.0)
+		(property "Reference" "D1")
+		(property "Value" "B5819W")
+		(property "placement_group" "usb_c")
+		(fp_rect (start -2.35 -1.15) (end 2.35 1.15) (layer "F.CrtYd"))
+		(pad "1" smd roundrect (at -1.65 0 180) (size 0.9 1.2) (net "/VCC_SYS"))
+		(pad "2" smd roundrect (at 1.65 0 180) (size 0.9 1.2) (net "Net-(D1-A)"))
+	)
+
+	; ---------------------------------------------------------------------------
+	; Board outline – 200 × 120 mm rectangle on Edge.Cuts.
+	; ---------------------------------------------------------------------------
+	(gr_line (start 0 0) (end 200 0) (layer "Edge.Cuts"))
+	(gr_line (start 200 0) (end 200 120) (layer "Edge.Cuts"))
+	(gr_line (start 200 120) (end 0 120) (layer "Edge.Cuts"))
+	(gr_line (start 0 120) (end 0 0) (layer "Edge.Cuts"))
+)

@@ -145,6 +145,16 @@ def set_fp_property(fp_node: List[Any], name: str, value: str) -> bool:
     return False
 
 
+def upsert_fp_property(fp_node: List[Any], name: str, value: str) -> None:
+    """Update a named property in a footprint node, or create it if absent.
+
+    Unlike ``set_fp_property``, this never fails: if the property does not
+    exist it is appended as a minimal ``(property name value)`` node.
+    """
+    if not set_fp_property(fp_node, name, value):
+        fp_node.append([sexpdata.Symbol("property"), name, value])
+
+
 def get_fp_layer(fp_node: List[Any]) -> Optional[str]:
     """Return the primary layer of a footprint (e.g. ``'F.Cu'``)."""
     for sub in fp_node:

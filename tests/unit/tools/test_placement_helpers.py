@@ -352,8 +352,6 @@ def test_system_prompt_mentions_placement_workflow():
         # Wiring guidance + correct tool names.
         "connect_pins_with_wire",
         "connect_points_with_wire",
-        "add_wire_to_schematic",
-        "add_junction_to_schematic",
         "closest",
         "Manhattan",
     ):

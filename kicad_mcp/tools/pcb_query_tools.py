@@ -6,6 +6,8 @@ footprint list, individual footprint detail, net list, and ratsnest
 (unconnected pad pairs).
 """
 import logging
+import math
+import re
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -19,6 +21,14 @@ from kicad_mcp.utils.pcb_footprint_utils import (
     get_fp_layer,
     get_fp_property,
     _sym,
+)
+from kicad_mcp.tools.pcb_placement_helpers import (
+    _classify_footprint,
+    _compute_hpwl,
+    _get_all_footprint_bboxes,
+    _get_board_bounds_or_fallback,
+    _get_fp_pads_world,
+    _TIER_NAMES,
 )
 
 log = logging.getLogger(__name__)
@@ -388,4 +398,235 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
             "unconnected": unconnected,
             "unconnected_count": len(unconnected),
             "fully_routed": len(unconnected) == 0,
+        }
+
+    @mcp.tool()
+    async def score_placement(
+        pcb_path: str,
+        ctx: Context | None = None,
+    ) -> Dict[str, Any]:
+        """Score the current PCB component placement quality.
+
+        Computes three metrics from the existing pad positions — no routing
+        required.  All metrics are lower-is-better.
+
+        Metrics:
+          - **hpwl_mm**: Total Half-Perimeter Wirelength.  Sum of per-net
+            bounding-box half-perimeters across all nets.  Estimates the
+            minimum copper length needed to route the board.
+          - **congestion**: Peak component density in a 5 mm grid.
+            ``peak_density`` is the number of components in the most crowded
+            cell; ``hotspot_x/y`` locates that cell in board coordinates.
+          - **decap_proximity_mm**: Mean distance between each decoupling
+            capacitor and the nearest power-pad on an IC that shares its net.
+            ``null`` when no decoupling capacitors are detected.
+          - **worst_contributors**: Top-5 footprints whose connections
+            contribute most to HPWL — the best candidates to reposition first.
+
+        Args:
+            pcb_path: Absolute path to the .kicad_pcb file.
+
+        Returns:
+            dict with hpwl_mm, congestion, decap_proximity_mm,
+            worst_contributors.
+        """
+        data = load_pcb(pcb_path)
+
+        # --- HPWL ----------------------------------------------------------------
+        hpwl = _compute_hpwl(data)
+
+        # Per-net HPWL contributions (for worst_contributors)
+        net_pads: Dict[str, List[Tuple[str, float, float]]] = defaultdict(list)
+        fp_position: Dict[str, Tuple[float, float]] = {}
+        fp_pad_count: Dict[str, int] = defaultdict(int)
+
+        for item in data:
+            if not (isinstance(item, list) and len(item) > 0 and _sym(item[0]) == "footprint"):
+                continue
+            ref = get_fp_property(item, "Reference") or ""
+            x, y, _ = get_fp_at(item)
+            fp_position[ref] = (x, y)
+            for pad in _get_fp_pads_world(item):
+                if pad["net"]:
+                    net_pads[pad["net"]].append((ref, pad["x"], pad["y"]))
+                    fp_pad_count[ref] += 1
+
+        # Per-net HPWL
+        net_hpwl: Dict[str, float] = {}
+        for net_name, pads in net_pads.items():
+            if len(pads) < 2:
+                continue
+            xs = [p[1] for p in pads]
+            ys = [p[2] for p in pads]
+            net_hpwl[net_name] = (max(xs) - min(xs)) + (max(ys) - min(ys))
+
+        # Per-footprint displacement: distance from component to its net centroids
+        fp_displacement: Dict[str, float] = {}
+        for ref, (fx, fy) in fp_position.items():
+            connected_nets = [n for n, pads in net_pads.items() if any(p[0] == ref for p in pads)]
+            if not connected_nets:
+                continue
+            total_dist = 0.0
+            for net_name in connected_nets:
+                pads = net_pads[net_name]
+                cx = sum(p[1] for p in pads) / len(pads)
+                cy = sum(p[2] for p in pads) / len(pads)
+                total_dist += math.hypot(fx - cx, fy - cy)
+            fp_displacement[ref] = total_dist / len(connected_nets)
+
+        worst = sorted(fp_displacement.items(), key=lambda kv: kv[1], reverse=True)[:5]
+        worst_contributors = [
+            {"reference": ref, "avg_displacement_mm": round(dist, 2)}
+            for ref, dist in worst
+        ]
+
+        # --- Congestion grid (5 mm cells) ----------------------------------------
+        GRID = 5.0
+        bounds = _get_board_bounds_or_fallback(data)
+        cell_counts: Dict[Tuple[int, int], int] = defaultdict(int)
+
+        for fp_bbox in _get_all_footprint_bboxes(data):
+            cx = (fp_bbox["min_x"] + fp_bbox["max_x"]) / 2
+            cy = (fp_bbox["min_y"] + fp_bbox["max_y"]) / 2
+            cell = (
+                int((cx - bounds["min_x"]) / GRID),
+                int((cy - bounds["min_y"]) / GRID),
+            )
+            cell_counts[cell] += 1
+
+        if cell_counts:
+            peak_cell = max(cell_counts, key=lambda k: cell_counts[k])
+            peak_density = cell_counts[peak_cell]
+            hotspot_x = round(bounds["min_x"] + (peak_cell[0] + 0.5) * GRID, 2)
+            hotspot_y = round(bounds["min_y"] + (peak_cell[1] + 0.5) * GRID, 2)
+        else:
+            peak_density, hotspot_x, hotspot_y = 0, 0.0, 0.0
+
+        # --- Decap proximity -----------------------------------------------------
+        _POWER_NET_RE = re.compile(
+            r"VCC|VDD|VEE|VSS|VBAT|3V3|3\.3V|5V|12V|\bPWR\b|AVCC|DVCC", re.IGNORECASE
+        )
+        # Ground-return nets connect to a copper plane, so their physical
+        # proximity to IC pads is irrelevant for decoupling effectiveness.
+        # VSS and VEE match _POWER_NET_RE but must be excluded when recording
+        # decap supply pads to avoid measuring GND-plane distance instead of
+        # supply-trace distance.  The pad ordering in the S-expression is not
+        # guaranteed, so a ground-pad-first footprint would silently record the
+        # wrong pad if we relied on _POWER_NET_RE alone.
+        _GROUND_NET_RE = re.compile(r"VSS|VEE|GND|AGND|DGND|PGND", re.IGNORECASE)
+
+        # Collect IC power pads: U/IC prefix, on a power net
+        ic_power_pads: List[Tuple[str, str, float, float]] = []  # (ref, net, x, y)
+        decap_positions: List[Tuple[str, float, float]] = []     # (net, x, y)
+
+        for item in data:
+            if not (isinstance(item, list) and len(item) > 0 and _sym(item[0]) == "footprint"):
+                continue
+            ref = get_fp_property(item, "Reference") or ""
+            m = re.match(r"[A-Za-z]+", ref)
+            prefix = (m.group(0).upper() if m else "")
+            pads = _get_fp_pads_world(item)
+            pad_count = len(pads)
+
+            if prefix in ("U", "IC") or pad_count > 8:
+                for pad in pads:
+                    if pad["net"] and _POWER_NET_RE.search(pad["net"]):
+                        ic_power_pads.append((ref, pad["net"], pad["x"], pad["y"]))
+            elif prefix == "C" and pad_count <= 2:
+                # Record the supply-rail pad of the decoupling cap (not the GND
+                # return pad — that connects to a copper plane and its proximity
+                # to IC GND pins is irrelevant).  break after the first supply
+                # pad because a decap typically has exactly one supply net.
+                for pad in pads:
+                    if (pad["net"]
+                            and _POWER_NET_RE.search(pad["net"])
+                            and not _GROUND_NET_RE.search(pad["net"])):
+                        decap_positions.append((pad["net"], pad["x"], pad["y"]))
+                        break
+
+        decap_proximity_mm: Optional[float] = None
+        if decap_positions and ic_power_pads:
+            distances = []
+            for cap_net, cap_x, cap_y in decap_positions:
+                same_net_pads = [(px, py) for _, pnet, px, py in ic_power_pads if pnet == cap_net]
+                if same_net_pads:
+                    min_dist = min(math.hypot(cap_x - px, cap_y - py) for px, py in same_net_pads)
+                    distances.append(min_dist)
+            if distances:
+                decap_proximity_mm = round(sum(distances) / len(distances), 2)
+
+        return {
+            "hpwl_mm": round(hpwl, 2),
+            "congestion": {
+                "peak_density": peak_density,
+                "hotspot_x": hotspot_x,
+                "hotspot_y": hotspot_y,
+                "grid_size_mm": GRID,
+            },
+            "decap_proximity_mm": decap_proximity_mm,
+            "worst_contributors": worst_contributors,
+        }
+
+    @mcp.tool()
+    async def suggest_placement_order(
+        pcb_path: str,
+        ctx: Context | None = None,
+    ) -> Dict[str, Any]:
+        """Return footprints sorted by recommended placement order.
+
+        Classifies each footprint into one of four priority tiers and returns
+        them sorted tier-first (anchors first, free passives last).  Place
+        higher-tier components before lower-tier ones for best results with
+        the push-and-shove and group placement tools.
+
+        Tier definitions:
+          1 ``anchor``    — connectors, mounting holes, test points.
+          2 ``semi-fixed``— ICs, transistors, voltage regulators.
+          3 ``flexible``  — crystals, relays, larger passives.
+          4 ``free``      — resistors, small capacitors, inductors, diodes.
+
+        Args:
+            pcb_path: Absolute path to the .kicad_pcb file.
+
+        Returns:
+            dict with ``ordered`` (list of footprints sorted by tier then
+            reference) and ``tier_counts`` (count per tier).
+        """
+        data = load_pcb(pcb_path)
+        ordered = []
+
+        for item in data:
+            if not (isinstance(item, list) and len(item) > 0 and _sym(item[0]) == "footprint"):
+                continue
+            ref = get_fp_property(item, "Reference") or ""
+            value = get_fp_property(item, "Value") or ""
+            x, y, _ = get_fp_at(item)
+            layer = get_fp_layer(item) or ""
+
+            # count pads
+            pad_count = sum(
+                1 for sub in item
+                if isinstance(sub, list) and len(sub) >= 4 and _sym(sub[0]) == "pad"
+            )
+            tier = _classify_footprint(ref, pad_count, value)
+            ordered.append({
+                "reference": ref,
+                "value": value,
+                "x": x,
+                "y": y,
+                "layer": layer,
+                "pad_count": pad_count,
+                "tier": tier,
+                "tier_name": _TIER_NAMES.get(tier, "unknown"),
+            })
+
+        ordered.sort(key=lambda fp: (fp["tier"], fp["reference"]))
+
+        tier_counts: Dict[str, int] = defaultdict(int)
+        for fp in ordered:
+            tier_counts[fp["tier_name"]] += 1
+
+        return {
+            "ordered": ordered,
+            "tier_counts": dict(tier_counts),
         }

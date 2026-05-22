@@ -104,7 +104,7 @@ class TestConnectPinsAutoJunction:
         ))
 
     def _add_wire(self, tools, sch_path, sx, sy, ex, ey):
-        return asyncio.run(tools["add_wire_to_schematic"](
+        return asyncio.run(tools["connect_points_with_wire"](
             schematic_path=sch_path,
             start_x=sx,
             start_y=sy,
@@ -200,15 +200,25 @@ class TestConnectPinsAutoJunction:
 
     def test_existing_junction_is_not_duplicated(self, tools, tmp_sch):
         """When a junction already exists at a pin position, no duplicate is added."""
-        # Add a wire ending at R2 pin2 = (100.0, 102.54)
-        w = self._add_wire(tools, tmp_sch, 90.0, 102.54, 100.0, 102.54)
-        assert w.get("success") is True, w
+        # Add a wire whose right endpoint is exactly at R2 pin2 (100.0, 102.54).
+        wire_result = self._add_wire(tools, tmp_sch, 90.0, 102.54, 100.0, 102.54)
+        assert wire_result.get("success") is True, wire_result
 
-        # Manually place a junction at that same position
-        junc_result = asyncio.run(tools["add_junction_to_schematic"](
-            schematic_path=tmp_sch, x=100.0, y=102.54
-        ))
-        assert junc_result.get("success") is True, junc_result
+        # Directly write a junction at that same position using the skip library,
+        # bypassing the deleted add_junction_to_schematic tool.
+        sch_pre = skip.Schematic(tmp_sch)
+        j = sch_pre.junction.new()
+        j.at.value = [100.0, 102.54]
+        sch_pre.write(tmp_sch)
+
+        # Verify the junction was written before the connect call.
+        sch_verify = skip.Schematic(tmp_sch)
+        pre_count = sum(
+            1 for jj in sch_verify.junction
+            if abs(float(jj.at.value[0]) - 100.0) < 0.01
+            and abs(float(jj.at.value[1]) - 102.54) < 0.01
+        )
+        assert pre_count == 1, f"Pre-condition failed: expected 1 junction, got {pre_count}"
 
         # Connect R2 pin2 → R3 pin2; the existing junction must not be duplicated.
         result = self._connect(tools, tmp_sch, "R2", "2", "R3", "2")
@@ -223,12 +233,12 @@ class TestConnectPinsAutoJunction:
             f"A duplicate junction was placed at (100.0, 102.54): {auto!r}"
         )
 
-        # Exactly one junction at (100.0, 102.54) in the schematic
+        # Exactly one junction at (100.0, 102.54) in the schematic.
         sch2 = skip.Schematic(tmp_sch)
         junctions_at_pos = [
-            j for j in sch2.junction
-            if abs(float(j.at.value[0]) - 100.0) < 0.01
-            and abs(float(j.at.value[1]) - 102.54) < 0.01
+            jj for jj in sch2.junction
+            if abs(float(jj.at.value[0]) - 100.0) < 0.01
+            and abs(float(jj.at.value[1]) - 102.54) < 0.01
         ]
         assert len(junctions_at_pos) == 1, (
             f"Expected exactly 1 junction at (100.0, 102.54), "

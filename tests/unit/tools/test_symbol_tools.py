@@ -277,14 +277,13 @@ class TestListSymbolLibraries:
             result = _call("list_symbol_libraries")
 
         assert result["success"] is True
-        assert result["count"] == 2
-        names = [lib["name"] for lib in result["libraries"]]
+        assert result["mode"] == "tables"
+        assert result["total"] == 2
+        names = [t["name"] for t in result["tables"]]
         assert "Device" in names
         assert "Connector" in names
-        first = result["libraries"][0]
-        assert "path" in first
+        first = result["tables"][0]
         assert "symbol_count" in first
-        assert "kicad_version" in first
 
     def test_empty_libraries(self):
         mock_mgr = MagicMock()
@@ -294,8 +293,9 @@ class TestListSymbolLibraries:
             result = _call("list_symbol_libraries")
 
         assert result["success"] is True
-        assert result["count"] == 0
-        assert result["libraries"] == []
+        assert result["mode"] == "tables"
+        assert result["total"] == 0
+        assert result["tables"] == []
 
 
 # ---------------------------------------------------------------------------
@@ -324,7 +324,7 @@ class TestGetLibrarySymbols:
 
         assert result["success"] is True
         assert result["library_name"] == "Device"
-        assert result["count"] == 2
+        assert result["total"] == 2
         names = [s["name"] for s in result["symbols"]]
         assert "R" in names
 
@@ -521,8 +521,8 @@ class TestGetSymbolPins:
             result = _call("get_symbol_pins", library_name="Device", symbol_name="R_Small")
 
         by_num = {p["number"]: p for p in result["pins"]}
-        assert by_num["1"] == {"number": "1", "name": "", "type": "passive", "direction": "down"}
-        assert by_num["2"] == {"number": "2", "name": "", "type": "passive", "direction": "up"}
+        assert by_num["1"] == {"number": "1", "name": "", "type": "passive", "direction": "up"}
+        assert by_num["2"] == {"number": "2", "name": "", "type": "passive", "direction": "down"}
 
 
 # ---------------------------------------------------------------------------
@@ -566,12 +566,13 @@ class TestParseLibPins:
             assert pin["direction"] in valid
 
     def test_pin_directions_match_fixture(self):
-        """Pin 1 is at 270° (→ 'down' in lib-space) and pin 2 is at 90° (→ 'up') in fixture."""
+        """Pin 1 is at 270° stub angle → wire exits up (270°+180°=90°→'up' in screen space).
+        Pin 2 is at 90° stub angle → wire exits down (90°+180°=270°→'down')."""
         raw = _load_fixture_symbol(_FIXTURE_SYM, "R_Small")
         pins = self._parse(raw)
         by_num = {p["number"]: p for p in pins}
-        assert by_num["1"]["direction"] == "down"
-        assert by_num["2"]["direction"] == "up"
+        assert by_num["1"]["direction"] == "up"
+        assert by_num["2"]["direction"] == "down"
 
     def test_no_duplicate_pin_numbers(self):
         """_parse_lib_pins deduplicates pins with the same number."""
