@@ -76,6 +76,11 @@ if _WX_AVAILABLE:
             # Scroll target for the next EVT_WEBVIEW_LOADED event.
             # -1 means scroll to bottom; >= 0 means restore to that pixel offset.
             self._webview_scroll_target: int = -1
+            # Keep the conversation pinned to the newest output while one AI
+            # turn is actively streaming / appending tool results. This avoids
+            # racey SetPage() re-renders briefly scrolling down and then
+            # restoring a stale pre-render scroll position.
+            self._follow_output_to_bottom: bool = False
 
             self._build_ui()
             self._start_server()
@@ -350,13 +355,14 @@ if _WX_AVAILABLE:
                 return
             self._input.Clear()
             self._conv_entries.append({"type": "user", "text": text, "timestamp": datetime.datetime.now().strftime("%H:%M:%S")})
+            self._follow_output_to_bottom = True
             # Create the session file on the very first message so current.json
             # is established before the AI responds.
             if self._current_session_file is None:
                 err = self._save_session_to_disk()
                 if err:
                     log.warning("Could not create session file: %s", err)
-            self._render_conversation()
+            self._render_conversation(force_scroll_to_bottom=True)
             self._busy = True
             self._send_btn.Enable(False)
 
@@ -403,7 +409,7 @@ if _WX_AVAILABLE:
 
             if not was_streamed:
                 self._conv_entries.append({"type": "ai", "text": reply, "timestamp": datetime.datetime.now().strftime("%H:%M:%S")})
-                self._render_conversation()
+                self._render_conversation(force_scroll_to_bottom=True)
             else:
                 # Finalise any remaining streamed text as a proper AI entry
                 if self._pending_ai_text:
@@ -413,12 +419,13 @@ if _WX_AVAILABLE:
                         "timestamp": datetime.datetime.now().strftime("%H:%M:%S"),
                     })
                     self._pending_ai_text = ""
-                    self._render_conversation()
+                    self._render_conversation(force_scroll_to_bottom=True)
             self._busy = False
             self._send_btn.Enable(True)
             # Auto-refresh after tool calls
             if self._tool_calls_made:
                 self._auto_refresh(ctx)
+            self._follow_output_to_bottom = False
 
         def _on_stream_flush(self, event) -> None:
             """Drain the streaming buffer into the pending AI text (main thread, timer-driven)."""
@@ -433,7 +440,7 @@ if _WX_AVAILABLE:
             if not parts:
                 return
             self._pending_ai_text += "".join(parts)
-            self._render_conversation()
+            self._render_conversation(force_scroll_to_bottom=self._follow_output_to_bottom)
 
         def _on_tool_call(self, name: str, args: dict, result: Any) -> None:
             # If there is pending streamed text that preceded this tool call,
@@ -444,7 +451,7 @@ if _WX_AVAILABLE:
             # Append as a permanent timeline entry so tool calls appear in
             # chronological order alongside user and AI messages.
             self._conv_entries.append({"type": "tool_call", "name": name, "args": args, "result": result})
-            self._render_conversation()
+            self._render_conversation(force_scroll_to_bottom=self._follow_output_to_bottom)
             self._tool_calls_made = True
             if isinstance(result, dict) and str(result.get("file_modified", "")).endswith(".kicad_sch"):
                 self._schematic_edited = True
@@ -459,12 +466,12 @@ if _WX_AVAILABLE:
                     import pcbnew
                     pcbnew.Refresh()
                     self._conv_entries.append({"type": "status", "text": "⟳ Board view refreshed.", "color_hex": self._C_OK_HEX})
-                    self._render_conversation()
+                    self._render_conversation(force_scroll_to_bottom=self._follow_output_to_bottom)
                 except ImportError:
                     pass  # outside KiCad — silently skip
                 except Exception as e:
                     self._conv_entries.append({"type": "status", "text": f"⚠ Auto-refresh failed: {e}", "color_hex": self._C_WARN_HEX})
-                    self._render_conversation()
+                    self._render_conversation(force_scroll_to_bottom=self._follow_output_to_bottom)
                     return
             if self._schematic_edited:
                 self._conv_entries.append({
@@ -472,7 +479,7 @@ if _WX_AVAILABLE:
                     "text": "ℹ Schematic updated on disk — use File → Revert in the Schematic Editor to see the changes.",
                     "color_hex": self._C_WARN_HEX,
                 })
-                self._render_conversation()
+                self._render_conversation(force_scroll_to_bottom=self._follow_output_to_bottom)
 
         def _on_restart(self, event) -> None:
             if self._busy:
