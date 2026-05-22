@@ -73,6 +73,9 @@ if _WX_AVAILABLE:
             # _save_session_to_disk overwrites this file when set, or creates
             # a new timestamped one otherwise.
             self._current_session_file: Optional[str] = None
+            # Scroll target for the next EVT_WEBVIEW_LOADED event.
+            # -1 means scroll to bottom; >= 0 means restore to that pixel offset.
+            self._webview_scroll_target: int = -1
 
             self._build_ui()
             self._start_server()
@@ -113,6 +116,11 @@ if _WX_AVAILABLE:
                         panel, style=wx.BORDER_SUNKEN,
                     )
                     self._use_webview = True
+                    self.Bind(
+                        _wx_html2.EVT_WEBVIEW_LOADED,
+                        self._on_webview_loaded,
+                        self._conv_view,
+                    )
                 except Exception:
                     pass
 
@@ -895,7 +903,7 @@ if _WX_AVAILABLE:
             # Track which file is now active; point current.json at it.
             self._current_session_file = os.path.basename(chosen)
             self._update_current_link(self._current_session_file)
-            self._render_conversation()
+            self._render_conversation(force_scroll_to_bottom=True)
             self._status_label.SetLabel("✅ Session restored")
             self._status_label.SetForegroundColour(wx.Colour(*self._C_OK))
             self.Layout()
@@ -1018,13 +1026,13 @@ if _WX_AVAILABLE:
             self._current_session_file = os.path.basename(path)
             if self._llm_client:
                 self._llm_client.set_history(history)
-            self._render_conversation()
             self._conv_entries.append({
                 "type": "status",
                 "text": "↺ Previous session restored automatically.",
                 "color_hex": self._C_TOOL_HEX,
             })
-            self._render_conversation()
+            # Render once with all content and force scroll to bottom
+            self._render_conversation(force_scroll_to_bottom=True)
 
         # ------------------------------------------------------------------ #
         # Rendering helpers
@@ -1139,8 +1147,27 @@ if _WX_AVAILABLE:
 
             return "".join(out)
 
-        def _render_conversation(self) -> None:
-            """Re-render the full conversation as HTML and update the view."""
+        def _on_webview_loaded(self, event) -> None:
+            """Scroll the WebView after the page is fully loaded and laid out.
+
+            EVT_WEBVIEW_LOADED fires only once the browser engine has finished
+            parsing, laying out, and painting the page, so scrollHeight is
+            guaranteed to be correct at this point.
+            """
+            target = self._webview_scroll_target
+            if target < 0:
+                self._conv_view.RunScript(
+                    "window.scrollTo(0, document.body ? document.body.scrollHeight : 0);"
+                )
+            else:
+                self._conv_view.RunScript(f"window.scrollTo(0, {target});")
+
+        def _render_conversation(self, force_scroll_to_bottom: bool = False) -> None:
+            """Re-render the full conversation as HTML and update the view.
+            
+            Args:
+                force_scroll_to_bottom: If True, always scroll to bottom regardless of current position.
+            """
             import html as _h
             import json as _json
 
@@ -1352,44 +1379,43 @@ if _WX_AVAILABLE:
                     _sy_val = int(float(_sy)) if _ok_y else 0
                     _sh_val = int(float(_sh)) if _ok_h else 0
                     # Consider "at bottom" when within 50 px or page not yet scrollable
-                    _at_bottom = _sh_val < 50 or (_sh_val - _sy_val) < 50
+                    _at_bottom = force_scroll_to_bottom or _sh_val < 50 or (_sh_val - _sy_val) < 50
                 except (ValueError, TypeError):
                     _at_bottom = True
                     _sy_val = 0
 
-                # Embed the scroll command as an inline <script> at the end of <body>
-                # so it executes synchronously as part of the page load, avoiding the
-                # async race condition that makes a post-SetPage RunScript ineffective.
-                if _at_bottom:
-                    _scroll_js = "window.scrollTo(0, document.body ? document.body.scrollHeight : 0);"
-                else:
-                    _scroll_js = f"window.scrollTo(0, {_sy_val});"
-                parts.append(f"<script>{_scroll_js}</script>")
+                # Store scroll intent; the actual RunScript call happens in
+                # _on_webview_loaded, which fires only after the browser has
+                # fully loaded and laid out the new page.
+                self._webview_scroll_target = -1 if _at_bottom else _sy_val
                 parts.append("</body></html>")
                 self._conv_view.SetPage("".join(parts), "")
             else:
                 # Capture scroll position before replacing the page
                 _max = self._conv_view.GetScrollRange(wx.VERTICAL)
                 _pos = self._conv_view.GetScrollPos(wx.VERTICAL)
-                _at_bottom = _max == 0 or (_max - _pos) < 3
+                _at_bottom = force_scroll_to_bottom or _max == 0 or (_max - _pos) < 3
 
                 parts.append("</body></html>")
                 self._conv_view.SetPage("".join(parts))
-                # Defer scroll until after layout is complete.
-                # GetScrollRange must be called inside the lambda so it reflects
-                # the new page geometry rather than the stale pre-SetPage value.
+                # Use wx.CallLater so the scroll fires after wx has finished
+                # its layout pass for the new page.  wx.CallAfter (even nested)
+                # is not reliable here because layout is driven by paint events,
+                # not plain event-loop ticks; 50 ms is enough on any platform.
                 if _at_bottom:
-                    wx.CallAfter(
+                    wx.CallLater(
+                        50,
                         lambda: self._conv_view.Scroll(
                             0, self._conv_view.GetScrollRange(wx.VERTICAL)
-                        )
+                        ),
                     )
                 else:
                     _frac = _pos / _max if _max > 0 else 0.0
-                    wx.CallAfter(
+                    wx.CallLater(
+                        50,
                         lambda f=_frac: self._conv_view.Scroll(
                             0, int(f * self._conv_view.GetScrollRange(wx.VERTICAL))
-                        )
+                        ),
                     )
 
         @staticmethod
