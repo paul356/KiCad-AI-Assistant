@@ -5,15 +5,19 @@ and the MCP server.
 Supports OpenAI-compatible and Anthropic APIs. The client is intentionally
 thin — it delegates all KiCad knowledge to the MCP tool surface.
 """
+
 from __future__ import annotations
 
+from collections.abc import Callable
 import json
 import logging
 import os
 import platform
-import shutil
 import subprocess
-from typing import Any, Callable, Generator, Optional
+from dataclasses import dataclass, field
+from typing import Any
+
+from .tool_registry import get_missing_tool_policies, get_tool_policy
 
 log = logging.getLogger(__name__)
 
@@ -37,7 +41,7 @@ _NO_HTTPS_MARKER = "unknown url type: https"
 _in_process_ssl: bool | None = None
 
 
-def _resolve_plugin_python() -> Optional[str]:
+def _resolve_plugin_python() -> str | None:
     """Return the path to the plugin venv's Python, or None if absent."""
     plugin_dir = os.path.dirname(os.path.abspath(__file__))
     if platform.system() == "Windows":
@@ -119,13 +123,30 @@ def _https_post_json(
     # KiCad's AppImage sets PYTHONHOME/PYTHONPATH/LD_LIBRARY_PATH for its own
     # embedded interpreter; inheriting them would break the venv Python.
     _ENV_ALLOWLIST = (
-        "PATH", "HOME", "USER", "LOGNAME",
-        "LANG", "LC_ALL", "LC_CTYPE",
-        "TMPDIR", "TEMP", "TMP",
-        "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME",
-        "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
-        "http_proxy", "https_proxy", "no_proxy",
-        "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
+        "PATH",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "TMPDIR",
+        "TEMP",
+        "TMP",
+        "XDG_RUNTIME_DIR",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_CACHE_HOME",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "no_proxy",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "REQUESTS_CA_BUNDLE",
+        "CURL_CA_BUNDLE",
     )
     clean_env = {k: os.environ[k] for k in _ENV_ALLOWLIST if k in os.environ}
 
@@ -155,6 +176,7 @@ def _https_post_json(
         raise RuntimeError(f"HTTPS request failed: {out.get('error', 'unknown error')}")
     return int(status), str(out.get("body", ""))
 
+
 # ---------------------------------------------------------------------------
 # System prompt
 # ---------------------------------------------------------------------------
@@ -163,13 +185,14 @@ _PROMPT_HEADER = """\
 You are an expert KiCad assistant embedded in the KiCad EDA tool.
 You help engineers edit schematics and PCB layouts by calling the available MCP tools.
 
-# Version snapshots
-⚠️ Mandatory: At the beginning of every new user message that will modify a
-file, call save_file_version(file_path) before any other tool call. Skipping
-this violates the protocol. The only exception is pure read-only queries.
-This creates a restore point covering all changes made in that request. You
-do not need to repeat it before every subsequent tool call in the same
-request.\
+# Framework-managed mutation safety
+- The plugin framework automatically calls `save_file_version(file_path)` the
+  first time a request successfully attempts to modify a schematic or PCB file.
+- The framework automatically calls `reload_kicad(paths=[...])` once at the end
+  of the request for every file that was modified successfully.
+- Do **not** call `save_file_version` or `reload_kicad` as part of a normal
+  edit workflow. Use the version tools only when the engineer explicitly asks
+  to inspect or restore saved versions.\
 """
 
 _PROMPT_SCHEMATIC = """\
@@ -276,12 +299,8 @@ _PROMPT_SCHEMATIC = """\
 - Use the active_schematic path from the context block below as the
   schematic_path argument for every editing tool.
 - Every mutation tool automatically writes a .kicad_sch.bak backup and saves
-  to disk. Call **reload_kicad** as your **final tool call** in the request —
-  after all file modifications are complete and immediately before returning
-  your response to the user. Include every file modified in that request
-  (e.g. ``reload_kicad(paths=[active_schematic])``; if you also modified the
-  PCB, include it: ``paths=[active_schematic, active_pcb]``).
-  Do NOT call reload_kicad after every individual tool call.
+  to disk. The plugin framework handles the version snapshot and final
+  `reload_kicad(...)` call automatically for successful file mutations.
 - Report errors clearly. Do not silently retry failed tool calls.
 - If find_free_area returns no candidates and no relative placement is
   appropriate, ASK the engineer instead of guessing a position.\
@@ -366,12 +385,8 @@ _PROMPT_PCB = """\
 - Use the active_pcb path from the context block below as the pcb_path
   argument for every PCB editing tool.
 - Every mutation tool automatically writes a .kicad_pcb.bak backup and saves
-  to disk. Call **reload_kicad** as your **final tool call** in the request —
-  after all file modifications are complete and immediately before returning
-  your response to the user. Include every file modified in that request
-  (e.g. ``reload_kicad(paths=[active_pcb])``; if you also modified the
-  schematic, include it: ``paths=[active_schematic, active_pcb]``).
-  Do NOT call reload_kicad after every individual tool call.
+  to disk. The plugin framework handles the version snapshot and final
+  `reload_kicad(...)` call automatically for successful file mutations.
 - Report errors clearly. Do not silently retry failed tool calls.
 - Do not overlap footprint courtyards.  Verify clearances with
   get_footprint_bbox / get_board_bounding_box before committing a move.\
@@ -387,6 +402,7 @@ def build_system_prompt(context_block: str) -> str:
 # MCP HTTP tool caller
 # ---------------------------------------------------------------------------
 
+
 def _parse_mcp_response_text(text: str) -> dict[str, Any]:
     """Parse a FastMCP streamable-http response body.
 
@@ -397,7 +413,7 @@ def _parse_mcp_response_text(text: str) -> dict[str, Any]:
     if text.startswith("{") or text.startswith("["):
         return json.loads(text)
     # SSE framing: collect the last `data:` payload (the JSON-RPC reply).
-    last_data: Optional[str] = None
+    last_data: str | None = None
     for line in text.splitlines():
         if line.startswith("data:"):
             last_data = line[5:].strip()
@@ -416,12 +432,14 @@ def call_mcp_tool(base_url: str, tool_name: str, arguments: dict[str, Any]) -> d
     import urllib.request
     import urllib.error
 
-    payload = json.dumps({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": {"name": tool_name, "arguments": arguments},
-    }).encode()
+    payload = json.dumps(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": tool_name, "arguments": arguments},
+        }
+    ).encode()
 
     url = f"{base_url}/mcp"
     req = urllib.request.Request(
@@ -457,9 +475,18 @@ def call_mcp_tool(base_url: str, tool_name: str, arguments: dict[str, Any]) -> d
     return result
 
 
+@dataclass
+class _ToolExecutionState:
+    """Per-request framework state for snapshot and reload orchestration."""
+
+    snapshotted_paths: set[str] = field(default_factory=set)
+    dirty_paths: set[str] = field(default_factory=set)
+
+
 # ---------------------------------------------------------------------------
 # OpenAI-compatible agentic loop
 # ---------------------------------------------------------------------------
+
 
 class LLMClient:
     """
@@ -475,7 +502,9 @@ class LLMClient:
         self._mcp_base_url = mcp_base_url
         self._context_tokens: int = getattr(settings, "llm_context_tokens", 128_000)
         self._compact_threshold: float = getattr(settings, "llm_compact_threshold", 0.70)
-        self._compact_target_threshold: float = getattr(settings, "llm_compact_target_threshold", 0.49)
+        self._compact_target_threshold: float = getattr(
+            settings, "llm_compact_target_threshold", 0.49
+        )
         self._keep_recent_turns: int = getattr(settings, "llm_keep_recent_turns", 4)
         self._history: list[dict[str, Any]] = []
 
@@ -705,16 +734,147 @@ class LLMClient:
         recent_tokens = self._estimate_tokens(self._history[split_idx:])
 
         target_post_compact = self._context_tokens * self._compact_target_threshold
-        target_summary_chars = max(200, int((target_post_compact - system_tokens - recent_tokens) * 4))
+        target_summary_chars = max(
+            200, int((target_post_compact - system_tokens - recent_tokens) * 4)
+        )
 
         self._compact_history(system_prompt, target_summary_chars)
+
+    @staticmethod
+    def _tool_result_succeeded(result: Any) -> bool:
+        """Return True when *result* represents a successful tool execution."""
+
+        if not isinstance(result, dict):
+            return True
+        if result.get("success") is False:
+            return False
+        return "error" not in result
+
+    @staticmethod
+    def _get_required_path(
+        args: dict[str, Any], tool_name: str, arg_name: str | None
+    ) -> str | None:
+        """Extract a non-empty path argument required by the tool policy."""
+
+        if not arg_name:
+            return None
+        value = args.get(arg_name)
+        if isinstance(value, str):
+            stripped = value.strip()
+            if stripped:
+                return stripped
+        log.warning("Tool %s is missing required %s argument", tool_name, arg_name)
+        return None
+
+    @staticmethod
+    def _format_reload_failure(result: dict[str, Any]) -> str:
+        """Render a concise user-facing warning for a failed auto reload."""
+
+        errors = result.get("errors")
+        if isinstance(errors, dict) and errors:
+            parts = [f"{path}: {message}" for path, message in sorted(errors.items())]
+            return "KiCad reload failed: " + "; ".join(parts)
+        failed = result.get("failed")
+        if isinstance(failed, list) and failed:
+            return "KiCad reload failed for: " + ", ".join(str(path) for path in failed)
+        return str(result.get("error") or "KiCad reload failed.")
+
+    @staticmethod
+    def _emit_tool_callback(
+        on_tool_call: Callable[[str, dict, Any], None] | None,
+        tool_name: str,
+        args: dict[str, Any],
+        result: Any,
+    ) -> None:
+        """Safely notify the UI about a tool execution."""
+
+        if not on_tool_call:
+            return
+        try:
+            on_tool_call(tool_name, args, result)
+        except Exception:
+            pass  # UI callback errors must not break the loop
+
+    def _execute_tool_with_policy(
+        self,
+        tool_name: str,
+        args: dict[str, Any],
+        state: _ToolExecutionState,
+        on_tool_call: Callable[[str, dict, Any], None] | None,
+    ) -> dict[str, Any]:
+        """Execute one tool call with framework-managed snapshot tracking."""
+
+        policy = get_tool_policy(tool_name)
+        path = self._get_required_path(args, tool_name, policy.path_arg)
+
+        if policy.auto_snapshot:
+            if not path:
+                return {
+                    "success": False,
+                    "error": (
+                        f"Framework policy for {tool_name} requires a non-empty "
+                        f"{policy.path_arg!r} argument."
+                    ),
+                }
+            if path not in state.snapshotted_paths:
+                snapshot_args = {"file_path": path}
+                snapshot_result = call_mcp_tool(
+                    self._mcp_base_url, "save_file_version", snapshot_args
+                )
+                self._emit_tool_callback(
+                    on_tool_call, "save_file_version", snapshot_args, snapshot_result
+                )
+                if not self._tool_result_succeeded(snapshot_result):
+                    error = snapshot_result.get("error", "unknown error")
+                    return {
+                        "success": False,
+                        "error": f"Failed to save file version before {tool_name}: {error}",
+                    }
+                state.snapshotted_paths.add(path)
+
+        result = call_mcp_tool(self._mcp_base_url, tool_name, args)
+        self._emit_tool_callback(on_tool_call, tool_name, args, result)
+
+        if not self._tool_result_succeeded(result):
+            return result
+
+        if policy.track_snapshot and path:
+            state.snapshotted_paths.add(path)
+        if policy.mark_dirty and path:
+            state.dirty_paths.add(path)
+        if policy.clear_dirty_paths_arg:
+            reload_paths = args.get(policy.clear_dirty_paths_arg, [])
+            if isinstance(reload_paths, list):
+                for reload_path in reload_paths:
+                    if isinstance(reload_path, str):
+                        state.dirty_paths.discard(reload_path)
+        return result
+
+    def _auto_reload_modified_files(
+        self,
+        state: _ToolExecutionState,
+        on_tool_call: Callable[[str, dict, Any], None] | None,
+    ) -> str | None:
+        """Reload dirty KiCad files after a successful turn, if needed."""
+
+        if not state.dirty_paths:
+            return None
+
+        reload_args = {"paths": sorted(state.dirty_paths)}
+        reload_result = call_mcp_tool(self._mcp_base_url, "reload_kicad", reload_args)
+        self._emit_tool_callback(on_tool_call, "reload_kicad", reload_args, reload_result)
+
+        if self._tool_result_succeeded(reload_result):
+            state.dirty_paths.clear()
+            return None
+        return self._format_reload_failure(reload_result)
 
     def run(
         self,
         user_message: str,
         context_block: str,
-        on_tool_call: Optional[Callable[[str, dict, Any], None]] = None,
-        on_text_delta: Optional[Callable[[str], None]] = None,
+        on_tool_call: Callable[[str, dict, Any], None] | None = None,
+        on_text_delta: Callable[[str], None] | None = None,
     ) -> str:
         """
         Run one engineer request through the agentic loop.
@@ -735,6 +895,15 @@ class LLMClient:
         self._maybe_compact(system)
 
         tools = self._fetch_tool_definitions()
+        missing_policies = get_missing_tool_policies(
+            [tool["function"]["name"] for tool in tools if tool.get("function", {}).get("name")]
+        )
+        if missing_policies:
+            return "[Framework error] Tool policy registry is missing entries for: " + ", ".join(
+                missing_policies
+            )
+
+        state = _ToolExecutionState()
 
         for _ in range(20):  # max 20 iterations (guard against infinite loops)
             response = self._call_llm(system, tools, on_text_delta=on_text_delta)
@@ -742,13 +911,19 @@ class LLMClient:
             if response.get("error"):
                 return f"[LLM error] {response['error']}"
 
-            finish_reason = response.get("finish_reason", "stop")
             message = response.get("message", {})
             tool_calls = message.get("tool_calls") or []
 
             if not tool_calls:
                 # Final text response
                 text = message.get("content") or ""
+                reload_warning = self._auto_reload_modified_files(state, on_tool_call)
+                if reload_warning:
+                    text = (
+                        f"{text}\n\n[Framework warning] {reload_warning}"
+                        if text
+                        else f"[Framework warning] {reload_warning}"
+                    )
                 self._history.append({"role": "assistant", "content": text})
                 return text
 
@@ -762,37 +937,31 @@ class LLMClient:
                 except json.JSONDecodeError:
                     args = {}
 
-                result = call_mcp_tool(self._mcp_base_url, name, args)
+                result = self._execute_tool_with_policy(name, args, state, on_tool_call)
 
-                if on_tool_call:
-                    try:
-                        on_tool_call(name, args, result)
-                    except Exception:
-                        pass  # UI callback errors must not break the loop
-
-                tool_results.append({
-                    "role": "tool",
-                    "tool_call_id": tc["id"],
-                    "content": json.dumps(result),
-                })
+                tool_results.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tc["id"],
+                        "content": json.dumps(result),
+                    }
+                )
 
             self._history.extend(tool_results)
 
         return "[Error] Maximum tool-call iterations reached. Please try a simpler request."
 
-    # ------------------------------------------------------------------ #
-    # Internal
-    # ------------------------------------------------------------------ #
-
     def _fetch_tool_definitions(self) -> list[dict[str, Any]]:
         """Fetch available tools from the MCP server and convert to LLM format."""
         import urllib.request, urllib.error
+
         url = f"{self._mcp_base_url}/mcp"
-        payload = json.dumps({
-            "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}
-        }).encode()
+        payload = json.dumps(
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
+        ).encode()
         req = urllib.request.Request(
-            url, data=payload,
+            url,
+            data=payload,
             headers={
                 "Content-Type": "application/json",
                 "Accept": "application/json, text/event-stream",
@@ -848,11 +1017,13 @@ class LLMClient:
                 tool_results = []
                 while i < len(self._history) and self._history[i].get("role") == "tool":
                     t = self._history[i]
-                    tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": t.get("tool_call_id"),
-                        "content": t.get("content"),
-                    })
+                    tool_results.append(
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": t.get("tool_call_id"),
+                            "content": t.get("content"),
+                        }
+                    )
                     i += 1
                 messages.append({"role": "user", "content": tool_results})
                 continue
@@ -861,15 +1032,17 @@ class LLMClient:
                 content_blocks: list[dict[str, Any]] = []
                 if m.get("content"):
                     content_blocks.append({"type": "text", "text": m["content"]})
-                content_blocks.extend([
-                    {
-                        "type": "tool_use",
-                        "id": tc["id"],
-                        "name": tc["function"]["name"],
-                        "input": json.loads(tc["function"].get("arguments", "{}")),
-                    }
-                    for tc in m["tool_calls"]
-                ])
+                content_blocks.extend(
+                    [
+                        {
+                            "type": "tool_use",
+                            "id": tc["id"],
+                            "name": tc["function"]["name"],
+                            "input": json.loads(tc["function"].get("arguments", "{}")),
+                        }
+                        for tc in m["tool_calls"]
+                    ]
+                )
                 messages.append({"role": "assistant", "content": content_blocks})
             else:
                 messages.append({"role": role, "content": m.get("content", "")})
@@ -895,12 +1068,14 @@ class LLMClient:
             url = f"{base}/v1/chat/completions"
 
         messages = [{"role": "system", "content": system}] + self._history
-        payload = json.dumps({
-            "model": self._settings.llm_model,
-            "messages": messages,
-            "tools": tools or None,
-            "stream": True,
-        }).encode()
+        payload = json.dumps(
+            {
+                "model": self._settings.llm_model,
+                "messages": messages,
+                "tools": tools or None,
+                "stream": True,
+            }
+        ).encode()
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self._settings.llm_api_key}",
@@ -1087,7 +1262,9 @@ class LLMClient:
 
                         elif etype == "error":
                             err = event_data.get("error", {})
-                            return {"error": f"Anthropic stream error: {err.get('message', str(err))}"}
+                            return {
+                                "error": f"Anthropic stream error: {err.get('message', str(err))}"
+                            }
 
                     full_text = "\n".join(text_blocks[k] for k in sorted(text_blocks))
                     tool_calls = []
@@ -1097,14 +1274,16 @@ class LLMClient:
                             inp = json.loads(tb["input_json"]) if tb["input_json"] else {}
                         except json.JSONDecodeError:
                             inp = {}
-                        tool_calls.append({
-                            "id": tb["id"],
-                            "type": "function",
-                            "function": {
-                                "name": tb["name"],
-                                "arguments": json.dumps(inp),
-                            },
-                        })
+                        tool_calls.append(
+                            {
+                                "id": tb["id"],
+                                "type": "function",
+                                "function": {
+                                    "name": tb["name"],
+                                    "arguments": json.dumps(inp),
+                                },
+                            }
+                        )
                     message_out: dict[str, Any] = {"content": full_text}
                     if tool_calls:
                         message_out["tool_calls"] = tool_calls
@@ -1143,11 +1322,13 @@ class LLMClient:
         else:
             url = f"{base}/v1/chat/completions"
         messages = [{"role": "system", "content": system}] + self._history
-        payload = json.dumps({
-            "model": self._settings.llm_model,
-            "messages": messages,
-            "tools": tools or None,
-        }).encode()
+        payload = json.dumps(
+            {
+                "model": self._settings.llm_model,
+                "messages": messages,
+                "tools": tools or None,
+            }
+        ).encode()
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self._settings.llm_api_key}",
@@ -1186,8 +1367,12 @@ class LLMClient:
         ]
         messages = self._build_anthropic_messages()
 
-        payload = {"model": self._settings.llm_model, "max_tokens": 4096,
-                   "system": system, "messages": messages}
+        payload = {
+            "model": self._settings.llm_model,
+            "max_tokens": 4096,
+            "system": system,
+            "messages": messages,
+        }
         if anthropic_tools:
             payload["tools"] = anthropic_tools
         encoded = json.dumps(payload).encode()
