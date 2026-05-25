@@ -1,0 +1,181 @@
+// Shell HTML template for the WebView conversation panel
+// This file is loaded once via SetPage at startup
+
+// Polyfill for localStorage and sessionStorage in WebView2
+// WebView2 has Tracking Prevention enabled by default which blocks storage access
+// These polyfills provide in-memory storage that works regardless of tracking protection
+(function() {
+    function createStorage() {
+        var store = {};
+        return {
+            getItem: function(key) { return Object.hasOwn(store, key) ? store[key] : null; },
+            setItem: function(key, value) { store[key] = String(value); },
+            removeItem: function(key) { delete store[key]; },
+            clear: function() { store = {}; },
+            get length() { return Object.keys(store).length; },
+            key: function(i) { var keys = Object.keys(store); return i < keys.length ? keys[i] : null; }
+        };
+    }
+    try {
+        Object.defineProperty(window, 'localStorage', {
+            writable: true,
+            configurable: true,
+            value: createStorage()
+        });
+    } catch(e) {}
+    try {
+        Object.defineProperty(window, 'sessionStorage', {
+            writable: true,
+            configurable: true,
+            value: createStorage()
+        });
+    } catch(e) {}
+})();
+
+function _escapeHtml(s) {
+    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function _msgBlock(sender, senderColor, bgColor, bodyHtml, timestamp) {
+    var ts = timestamp ? '<span style="float:right;font-size:8pt;color:#999;font-weight:normal">' + _escapeHtml(timestamp) + '</span>' : '';
+    return '<table class="msg"><tr><td style="background:' + bgColor + '">'
+        + '<b><span style="color:' + senderColor + '">' + _escapeHtml(sender)
+        + '</span></b>' + ts + '<br>' + bodyHtml + '</td></tr></table>';
+}
+
+function _toolCallHtml(e) {
+    var r = e.result || {};
+    var ok = (typeof r === 'object') ? (r.success !== false) : true;
+    var icon = ok ? '\u2713' : '\u2717';
+    var iconColor = ok ? '#2e7d32' : '#c62828';
+    var css = ok ? 'tool-entry tool-ok' : 'tool-entry tool-err';
+    var args = typeof e.args === 'string' ? _escapeHtml(e.args) : _escapeHtml(JSON.stringify(e.args));
+    var result = typeof e.result === 'string' ? _escapeHtml(e.result) : _escapeHtml(JSON.stringify(e.result));
+    return '<details class="tools" style="margin:2px 8px">'
+        + '<summary><span style="color:' + iconColor + '">' + icon + '</span> '
+        + '<span style="color:#444;font-weight:600">\u21B3 ' + _escapeHtml(e.name)
+        + '</span></summary>'
+        + '<div class="' + css + '">'
+        + '<span style="color:#444">args:</span> ' + args + '<br>'
+        + '<span style="color:#444">result:</span> ' + result
+        + '</div></details>';
+}
+
+function _autorouteHtml(e) {
+    var ok = !!e.success;
+    var icon = ok ? '\u2713' : '\u2717';
+    var iconColor = ok ? '#2e7d32' : '#c62828';
+    var css = ok ? 'tool-entry tool-ok' : 'tool-entry tool-err';
+    var msg = _escapeHtml(e.message || '');
+    var output = _escapeHtml(e.output || '(no output)');
+    return '<details class="tools" style="margin:2px 8px">'
+        + '<summary><span style="color:' + iconColor + '">' + icon + '</span> '
+        + '<b>Auto Route</b> \u2014 ' + msg + '</summary>'
+        + '<div class="' + css + '">'
+        + '<pre style="margin:4px 0;max-height:300px;overflow-y:auto">'
+        + output + '</pre></div></details>';
+}
+
+function _renderEntry(e) {
+    try {
+        var div = document.createElement('div');
+        switch (e.type) {
+            case 'user':
+                div.innerHTML = _msgBlock('You', '#1565C0', '#E3F2FD',
+                    _escapeHtml(e.text || '').replace(/\n/g, '<br>'), e.timestamp || '');
+                break;
+            case 'ai':
+                div.innerHTML = _msgBlock('AI', '#00695C', '#E8F5E9',
+                    e.text || '', e.timestamp || '');
+                break;
+            case 'tool_call':
+                div.innerHTML = _toolCallHtml(e);
+                break;
+            case 'status':
+                div.innerHTML = '<p style="margin:2px 8px"><font color="'
+                    + (e.color || '#1E1E1E') + '">' + _escapeHtml(e.text || '')
+                    + '</font></p>';
+                break;
+            case 'autoroute_log':
+                div.innerHTML = _autorouteHtml(e);
+                break;
+            default:
+                div.innerHTML = '<p style="margin:2px 8px;color:#999">[unknown: '
+                    + _escapeHtml(String(e.type)) + ']</p>';
+        }
+        return div.firstElementChild || div;
+    } catch (err) {
+        var d = document.createElement('p');
+        d.style.cssText = 'margin:2px 8px;color:#BE6400';
+        d.textContent = '[render error: ' + err.message + ']';
+        return d;
+    }
+}
+
+function _shouldScrollBottom() {
+    var sh = document.body ? document.body.scrollHeight : 0;
+    var sy = window.scrollY || 0;
+    var ih = window.innerHeight || 0;
+    return (sh - ih - sy) < 80;
+}
+
+window._updateConversation = function(entriesJson, scrollBehavior) {
+    try {
+        var conv = document.getElementById('conversation');
+        if (!conv) return 'error:no conversation div';
+        var frag = document.createDocumentFragment();
+        var entries = JSON.parse(entriesJson);
+        for (var i = 0; i < entries.length; i++) {
+            frag.appendChild(_renderEntry(entries[i]));
+        }
+        conv.innerHTML = '';
+        conv.appendChild(frag);
+        var sw = document.getElementById('stream-wrapper');
+        if (sw) sw.style.display = 'none';
+        document.getElementById('pending-ai-text').innerHTML = '';
+        if (scrollBehavior === 'bottom') {
+            window.scrollTo(0, document.body ? document.body.scrollHeight : 0);
+        }
+        return 'ok:' + entries.length;
+    } catch (err) {
+        return 'error:' + err.message;
+    }
+};
+
+window._appendEntry = function(entryJson, scrollBehavior) {
+    try {
+        var entry = JSON.parse(entryJson);
+        var conv = document.getElementById('conversation');
+        if (!conv) return 'error:no conversation div';
+        conv.appendChild(_renderEntry(entry));
+        var sw = document.getElementById('stream-wrapper');
+        if (sw) sw.style.display = 'none';
+        document.getElementById('pending-ai-text').innerHTML = '';
+        if (scrollBehavior === 'bottom') {
+            window.scrollTo(0, document.body ? document.body.scrollHeight : 0);
+        }
+        return 'ok:' + entry.type;
+    } catch (err) {
+        return 'error:' + err.message;
+    }
+};
+
+window._updateStream = function(html, scrollToBottom) {
+    var el = document.getElementById('pending-ai-text');
+    if (!el) return;
+    el.innerHTML = html;
+    var sw = document.getElementById('stream-wrapper');
+    if (sw) sw.style.display = '';
+    if (scrollToBottom) {
+        window.scrollTo(0, document.body ? document.body.scrollHeight : 0);
+    }
+};
+
+window._clearConversation = function() {
+    document.getElementById('conversation').innerHTML = '';
+    var sw = document.getElementById('stream-wrapper');
+    if (sw) sw.style.display = 'none';
+    document.getElementById('pending-ai-text').innerHTML = '';
+    window.scrollTo(0, 0);
+};

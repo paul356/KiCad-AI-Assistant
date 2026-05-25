@@ -13,8 +13,52 @@ Usage:
 import os
 import sys
 import logging
+import platform
 
 log = logging.getLogger(__name__)
+
+
+def _setup_plugin_logging() -> None:
+    """Configure logging for the plugin (writes to KiCad config directory).
+
+    Sets the ``kicad_plugin`` logger hierarchy to DEBUG and writes to a file
+    so diagnostic messages are available when debugging on Windows.
+    """
+    try:
+        system = platform.system()
+        if system == "Darwin":
+            base = os.path.expanduser("~/Library/Preferences/kicad")
+        elif system == "Windows":
+            base = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "kicad")
+        else:
+            base = os.path.expanduser("~/.config/kicad")
+        log_dir = os.path.join(base, "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        log_file = os.path.join(log_dir, "kicad_ai_plugin.log")
+
+        # Use append mode so logs survive KiCad restarts (the typical
+        # debugging workflow is: reproduce freeze → restart → examine logs).
+        handler = logging.FileHandler(log_file, mode="a", encoding="utf-8")
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)-5s [%(name)s] %(message)s",
+            datefmt="%H:%M:%S",
+        ))
+
+        # Attach to THIS package's logger (and all child loggers).
+        # __name__ resolves to the actual package name (e.g. kicad_ai_assistant
+        # in the installed plugin, kicad_plugin in the dev tree).
+        plugin_logger = logging.getLogger(__name__)
+        plugin_logger.setLevel(logging.DEBUG)
+        plugin_logger.addHandler(handler)
+        plugin_logger.propagate = False  # don't duplicate to root logger
+        log.info("=" * 60)
+        log.info("Plugin logging started: %s (logger=%s)", log_file, __name__)
+    except Exception as exc:
+        # Logging setup must never crash the plugin
+        log.warning("Could not set up plugin logging: %s", exc)
+
+
+_setup_plugin_logging()
 
 # ---------------------------------------------------------------------------
 # Graceful import guard — pcbnew is only available inside KiCad

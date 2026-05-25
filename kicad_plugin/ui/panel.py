@@ -73,14 +73,31 @@ if _WX_AVAILABLE:
             # _save_session_to_disk overwrites this file when set, or creates
             # a new timestamped one otherwise.
             self._current_session_file: Optional[str] = None
-            # Scroll target for the next EVT_WEBVIEW_LOADED event.
-            # -1 means scroll to bottom; >= 0 means restore to that pixel offset.
-            self._webview_scroll_target: int = -1
             # Keep the conversation pinned to the newest output while one AI
-            # turn is actively streaming / appending tool results. This avoids
-            # racey SetPage() re-renders briefly scrolling down and then
-            # restoring a stale pre-render scroll position.
+            # turn is actively streaming / appending tool results.
             self._follow_output_to_bottom: bool = False
+            # True while SetPage(shell) is in-flight.  Only relevant during
+            # initial shell load — subsequent updates use RunScript, not SetPage.
+            self._page_loading: bool = False
+            # True once the shell HTML (CSS + JS framework + empty containers)
+            # has been successfully loaded into the WebView.
+            self._shell_loaded: bool = False
+            # True while any RunScript call is in-flight.  On Windows WebView2,
+            # RunScript pumps the message loop; we guard against re-entrant
+            # RunScript calls with this flag.
+            self._js_running: bool = False
+            # Set when a render is skipped (due to shell not loaded or
+            # _js_running).  The next opportunity triggers a deferred render.
+            self._render_pending: bool = False
+            # True when the stream-wrapper table is visible in the shell.
+            self._stream_wrapper_visible: bool = False
+            # Shell load retry counter (prevents infinite retry on WebView2 failure).
+            self._shell_retry_count: int = 0
+
+            # Page-load watchdog: if _on_webview_loaded never fires (WebView2
+            # glitch on Windows), reset _page_loading so renders are not
+            # permanently blocked.
+            self._page_watchdog = wx.Timer(self)
 
             self._build_ui()
             self._start_server()
@@ -109,6 +126,86 @@ if _WX_AVAILABLE:
         _C_ERR_HEX   = "#BE1E1E"
         _BG_CONV_HEX = "#F5F7FC"
 
+        @staticmethod
+        def _build_shell_html() -> str:
+            """Build the static shell HTML (CSS + JS framework + empty containers).
+
+            This is loaded once via SetPage at startup.  All subsequent UI
+            updates happen through RunScript calls to the JS functions defined
+            here — SetPage is never called again (unless the shell needs to be
+            reloaded after a WebView error).
+            """
+            import os
+
+            # Get the path to shell.js (in the same directory as this file)
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            shell_js_path = os.path.join(script_dir, "shell.js")
+
+            # Read the JS file
+            js_code = "// shell.js not found"
+            try:
+                with open(shell_js_path, "r", encoding="utf-8") as f:
+                    js_code = f.read()
+                log.info("Loaded shell.js: %d bytes", len(js_code))
+                # Check first few chars
+                log.info("shell.js starts with: %s", js_code[:100])
+            except Exception as e:
+                log.error("Failed to load shell.js: %s", e)
+
+            return (
+                "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+                "<style>"
+                "body{font-family:Microsoft YaHei,Ubuntu,Noto Sans CJK SC,Noto Sans CJK,DejaVu Sans,Arial,sans-serif;font-size:11pt;font-weight:400;background:#F5F7FC;margin:4px;color:#1E1E1E}"
+                "table.msg{width:100%;border-collapse:collapse;margin-bottom:8px}"
+                "table.msg td{padding:8px 10px;border-radius:4px}"
+                ".tool-list{margin-top:6px;font-size:9pt}"
+                "details.tools{margin:2px 0}"
+                "details.tools summary{cursor:pointer;color:#333;font-weight:600;user-select:none;"
+                "padding:2px 4px;border-radius:3px;list-style:disclosure-closed}"
+                "details.tools summary:hover{background:#e8e8e8}"
+                "details.tools[open] summary{list-style:disclosure-open}"
+                ".tool-entry{margin:2px 0;padding:4px 8px;background:#f5f5f0;"
+                "border-left:3px solid #999;border-radius:2px;"
+                "font-family:Microsoft YaHei UI,monospace;font-size:9pt;font-weight:600;white-space:pre-wrap;"
+                "word-break:break-all;color:#222}"
+                ".tool-ok{border-left-color:#2e7d32}"
+                ".tool-err{border-left-color:#c62828}"
+                "pre{font-family:Microsoft YaHei UI,monospace;white-space:pre;background:#e8e8e8;"
+                "padding:8px;border-radius:4px;overflow-x:auto;font-size:9pt;font-weight:500;"
+                "line-height:1.4;color:#222}"
+                "pre code{background:none;padding:0;border-radius:0;font-size:inherit}"
+                "code{font-family:Microsoft YaHei UI,monospace;background:#e0e0e0;"
+                "padding:1px 3px;border-radius:2px;font-weight:600}"
+                "</style>"
+                "<script>"
+                + js_code +
+                "</script>"
+                "</head>"
+                "<body>"
+                "<div id='conversation'></div>"
+                "<table class='msg' id='stream-wrapper' style='display:none'>"
+                "<tr><td style='background:#EBF7F2'>"
+                "<b><span style='color:#008250'>AI</span></b><br>"
+                "<div id='pending-ai-text'></div>"
+                "</td></tr></table>"
+                "</body></html>"
+            )
+
+        def _load_shell(self) -> None:
+            """Load the static shell HTML into the WebView.
+
+            Called once at startup and on WebView error recovery.  After this,
+            all UI updates go through RunScript — SetPage is never called again
+            (unless the shell needs to be reloaded).
+            """
+            shell_html = self._build_shell_html()
+            log.debug("Loading shell HTML: %d bytes", len(shell_html))
+            self._page_loading = True
+            self._shell_loaded = False
+            self._stream_wrapper_visible = False
+            self._page_watchdog.Start(5000, oneShot=True)
+            self._conv_view.SetPage(shell_html, "")
+
         def _build_ui(self) -> None:
             panel = wx.Panel(self)
             vbox = wx.BoxSizer(wx.VERTICAL)
@@ -126,8 +223,17 @@ if _WX_AVAILABLE:
                         self._on_webview_loaded,
                         self._conv_view,
                     )
-                except Exception:
-                    pass
+                    self.Bind(
+                        _wx_html2.EVT_WEBVIEW_ERROR,
+                        self._on_webview_error,
+                        self._conv_view,
+                    )
+                    # Load the static shell (CSS + JS + empty containers).
+                    # After this, all UI updates go through RunScript.
+                    self._load_shell()
+                except Exception as e:
+                    log.warning("WebView init failed, falling back to HtmlWindow: %s", e)
+                    self._use_webview = False
 
             if not self._use_webview:
                 self._conv_view = wx.html.HtmlWindow(
@@ -218,6 +324,11 @@ if _WX_AVAILABLE:
             self._suicide_timer = wx.Timer(self)
             self.Bind(wx.EVT_TIMER, self._on_suicide_check, self._suicide_timer)
             self._suicide_timer.Start(500)  # 500 ms poll
+
+            # Page-load watchdog: if _on_webview_loaded never fires (WebView2
+            # glitch on Windows), reset _page_loading so renders are not
+            # permanently blocked.
+            self.Bind(wx.EVT_TIMER, self._on_page_watchdog, self._page_watchdog)
 
         # ------------------------------------------------------------------ #
         # Server lifecycle
@@ -349,10 +460,12 @@ if _WX_AVAILABLE:
 
         def _on_send(self, event) -> None:
             if self._busy or not self._llm_client:
+                log.debug("_on_send: skipped (busy=%s, client=%s)", self._busy, self._llm_client is not None)
                 return
             text = self._input.GetValue().strip()
             if not text:
                 return
+            log.info("_on_send: user message (%d chars)", len(text))
             self._input.Clear()
             self._conv_entries.append({"type": "user", "text": text, "timestamp": datetime.datetime.now().strftime("%H:%M:%S")})
             self._follow_output_to_bottom = True
@@ -386,6 +499,7 @@ if _WX_AVAILABLE:
                 self._stream_buffer.append(chunk)
 
             def _run():
+                log.info("Background _run: started")
                 try:
                     reply = self._llm_client.run(
                         text,
@@ -398,28 +512,44 @@ if _WX_AVAILABLE:
                 except Exception as e:
                     log.exception("LLM request failed")
                     reply = f"[Error] {e}"
+                log.info("Background _run: finished (reply_len=%d, streamed=%s)",
+                         len(reply), state["ai_turn_started"])
                 wx.CallAfter(self._on_reply, reply, ctx, was_streamed=state["ai_turn_started"])
 
             threading.Thread(target=_run, daemon=True).start()
 
         def _on_reply(self, reply: str, ctx: dict, was_streamed: bool = False) -> None:
+            log.info("_on_reply: was_streamed=%s, reply_len=%d, pending_ai=%d",
+                     was_streamed, len(reply), len(self._pending_ai_text))
             # Stop the flush timer and drain any remaining chunks
             self._stream_timer.Stop()
             self._on_stream_flush(None)
 
+            # Hide streaming preview before appending the final entry
+            if self._use_webview:
+                self._hide_stream_wrapper()
+
             if not was_streamed:
-                self._conv_entries.append({"type": "ai", "text": reply, "timestamp": datetime.datetime.now().strftime("%H:%M:%S")})
-                self._render_conversation(force_scroll_to_bottom=True)
+                entry = {"type": "ai", "text": reply, "timestamp": datetime.datetime.now().strftime("%H:%M:%S")}
+                self._conv_entries.append(entry)
+                if self._use_webview and self._shell_loaded:
+                    self._append_entry_js(entry, force_scroll_to_bottom=True)
+                else:
+                    self._render_conversation(force_scroll_to_bottom=True)
             else:
                 # Finalise any remaining streamed text as a proper AI entry
                 if self._pending_ai_text:
-                    self._conv_entries.append({
+                    entry = {
                         "type": "ai",
                         "text": self._pending_ai_text,
                         "timestamp": datetime.datetime.now().strftime("%H:%M:%S"),
-                    })
+                    }
+                    self._conv_entries.append(entry)
                     self._pending_ai_text = ""
-                    self._render_conversation(force_scroll_to_bottom=True)
+                    if self._use_webview and self._shell_loaded:
+                        self._append_entry_js(entry, force_scroll_to_bottom=True)
+                    else:
+                        self._render_conversation(force_scroll_to_bottom=True)
             self._busy = False
             self._send_btn.Enable(True)
             # Auto-refresh after tool calls
@@ -440,9 +570,90 @@ if _WX_AVAILABLE:
             if not parts:
                 return
             self._pending_ai_text += "".join(parts)
-            self._render_conversation(force_scroll_to_bottom=self._follow_output_to_bottom)
+
+            if self._use_webview:
+                # Show stream wrapper on first chunk
+                if self._shell_loaded and not self._stream_wrapper_visible:
+                    self._show_stream_wrapper()
+                # Incremental DOM update — should always succeed with shell loaded
+                if self._incremental_stream_update():
+                    return
+                # Shell not loaded yet — defer
+                self._render_pending = True
+            else:
+                self._render_conversation(force_scroll_to_bottom=self._follow_output_to_bottom)
+
+        def _incremental_stream_update(self) -> bool:
+            """Update streaming AI text via _updateStream JS call.
+
+            The #pending-ai-text div always exists in the shell HTML, so this
+            should always succeed when the shell is loaded.
+            """
+            if not self._use_webview or not self._shell_loaded or self._js_running:
+                return False
+
+            import json as _json
+            body_html = self._md_to_html(self._pending_ai_text)
+            scroll_arg = "true" if self._follow_output_to_bottom else "false"
+            js = f'_updateStream({_json.dumps(body_html)}, {scroll_arg})'
+
+            self._js_running = True
+            try:
+                ok, result = self._conv_view.RunScript(js)
+                if not ok:
+                    log.warning("_incremental_stream_update: RunScript failed")
+                return ok
+            except Exception as e:
+                log.warning("_incremental_stream_update: exception: %s", e)
+                return False
+            finally:
+                self._js_running = False
+
+        def _on_page_watchdog(self, event) -> None:
+            """Safety net: detect shell load timeout.
+
+            The shell is the only thing loaded via SetPage.  If it times out,
+            we reset state and retry (up to 3 times).  Once the shell is
+            loaded, there is no further SetPage activity, so the watchdog
+            is not needed.
+            """
+            if not self._page_loading:
+                return
+            self._shell_retry_count += 1
+            self._page_loading = False
+            self._js_running = False
+            self._shell_loaded = False
+            self._stream_wrapper_visible = False
+            self._render_pending = False
+
+            if self._shell_retry_count > 3:
+                log.error("WebView shell failed to load after %d retries — giving up",
+                          self._shell_retry_count)
+                self._conv_entries.append({
+                    "type": "status",
+                    "text": (
+                        "⚠ WebView failed to initialize after multiple retries. "
+                        "The chat panel may not work. Try restarting KiCad."
+                    ),
+                    "color_hex": self._C_ERR_HEX,
+                })
+                return
+
+            log.warning("WebView watchdog: shell load timed out (>5s), retry %d/3",
+                        self._shell_retry_count)
+            self._conv_entries.append({
+                "type": "status",
+                "text": (
+                    f"⚠ WebView initialization timed out (>5s). "
+                    f"Retrying ({self._shell_retry_count}/3)…"
+                ),
+                "color_hex": self._C_WARN_HEX,
+            })
+            wx.CallAfter(self._load_shell)
 
         def _on_tool_call(self, name: str, args: dict, result: Any) -> None:
+            log.info("_on_tool_call: %s (shell_loaded=%s, entries=%d)",
+                     name, self._shell_loaded, len(self._conv_entries))
             # If there is pending streamed text that preceded this tool call,
             # finalise it as an AI entry now so the timeline order is correct.
             if self._pending_ai_text:
@@ -450,7 +661,15 @@ if _WX_AVAILABLE:
                 self._pending_ai_text = ""
             # Append as a permanent timeline entry so tool calls appear in
             # chronological order alongside user and AI messages.
-            self._conv_entries.append({"type": "tool_call", "name": name, "args": args, "result": result})
+            # Store full data — truncation for UI display happens at render time
+            # to preserve session data integrity.
+            self._conv_entries.append({
+                "type": "tool_call",
+                "name": name,
+                "args": args,
+                "result": result,
+            })
+            # Full update needed to clear pending-ai-text and show new entries
             self._render_conversation(force_scroll_to_bottom=self._follow_output_to_bottom)
             self._tool_calls_made = True
             if isinstance(result, dict) and str(result.get("file_modified", "")).endswith(".kicad_sch"):
@@ -1155,86 +1374,362 @@ if _WX_AVAILABLE:
             return "".join(out)
 
         def _on_webview_loaded(self, event) -> None:
-            """Scroll the WebView after the page is fully loaded and laid out.
+            """Called when the shell HTML has finished loading.
 
-            EVT_WEBVIEW_LOADED fires only once the browser engine has finished
-            parsing, laying out, and painting the page, so scrollHeight is
-            guaranteed to be correct at this point.
+            This fires exactly once at startup (and once after each shell
+            reload on WebView error recovery).  It transitions the shell
+            state and triggers the first conversation render.
             """
-            target = self._webview_scroll_target
-            if target < 0:
-                self._conv_view.RunScript(
-                    "window.scrollTo(0, document.body ? document.body.scrollHeight : 0);"
+            log.debug("_on_webview_loaded: shell ready (render_pending=%s, entries=%d)",
+                      self._render_pending, len(self._conv_entries))
+            self._page_loading = False
+            self._shell_retry_count = 0
+            self._page_watchdog.Stop()
+
+            # The page is loaded but JS may not have executed yet.
+            # Schedule verification for later.
+            wx.CallLater(1000, self._verify_shell_and_render)
+
+        def _on_webview_error(self, event) -> None:
+            """Handle WebView errors by reloading the shell.
+
+            Since the shell is the only thing loaded via SetPage, an error
+            means the shell failed to load.  We reset state and retry.
+            """
+            description = ""
+            try:
+                description = event.GetString()
+            except Exception:
+                pass
+            log.warning("WebView error: %s — reloading shell", description)
+            self._page_loading = False
+            self._shell_loaded = False
+            self._js_running = False
+            self._stream_wrapper_visible = False
+            self._page_watchdog.Stop()
+            self._conv_entries.append({
+                "type": "status",
+                "text": f"⚠ WebView error: {description}. Retrying…",
+                "color_hex": self._C_WARN_HEX,
+            })
+            self._render_pending = False
+            wx.CallAfter(self._load_shell)
+
+        def _verify_shell_and_render(self) -> None:
+            """Verify JS is working and trigger render if needed.
+
+            Called 1 second after EVT_WEBVIEW_LOADED to give scripts time to execute.
+            """
+            log.debug("_verify_shell_and_render: starting verification")
+            self._js_running = True
+            js_works = False
+
+            try:
+                # Check font
+                ok, result = self._conv_view.RunScript(
+                    "getComputedStyle(document.body).fontFamily"
                 )
+                log.info("_verify_shell_and_render: font=%r", result)
+
+                # Check all window functions (what's actually defined in window)
+                ok, result = self._conv_view.RunScript(
+                    "Object.keys(window).filter(k => typeof window[k] === 'function' && k.startsWith('_')).join(',')"
+                )
+                log.info("_verify_shell_and_render: window functions starting with _ =%r", result)
+
+                # Check scripts in document
+                ok, result = self._conv_view.RunScript(
+                    "document.scripts.length + ',' + (document.scripts[0] ? document.scripts[0].src : 'inline') + ',' + (document.scripts[0] ? document.scripts[0].innerHTML.length : 0)"
+                )
+                log.info("_verify_shell_and_render: scripts info=%r", result)
+
+                # Check for JS errors in the console
+                ok, result = self._conv_view.RunScript(
+                    "try { eval('1+1'); 'no_error'; } catch(e) { e.message; }"
+                )
+                log.info("_verify_shell_and_render: eval test=%r", result)
+
+                # Try to check for syntax errors in the script
+                ok, result = self._conv_view.RunScript(
+                    "try { new Function(document.scripts[0].innerHTML); 'syntax_ok'; } catch(e) { 'error:' + e.message; }"
+                )
+                log.info("_verify_shell_and_render: script syntax check=%r", result)
+
+                # Try to call JS function
+                ok, result = self._conv_view.RunScript(
+                    "try { _updateConversation('[]', 'preserve'); 'ok'; } catch(e) { e.message; }"
+                )
+                log.info("_verify_shell_and_render: JS call result=%r", result)
+                if ok and result and ("ok" in str(result) or "error" in str(result).lower()):
+                    js_works = True
+            except Exception as e:
+                log.error("_verify_shell_and_render: exception: %s", e)
+            finally:
+                self._js_running = False
+
+            if js_works:
+                self._shell_loaded = True
+                log.info("_verify_shell_and_render: JS verified, _shell_loaded=True")
             else:
-                self._conv_view.RunScript(f"window.scrollTo(0, {target});")
+                log.warning("_verify_shell_and_render: JS not working yet")
+
+            # Trigger render if there is content or pending
+            if self._render_pending or self._conv_entries:
+                self._render_pending = False
+                self._update_conversation(True)
+
+        # ------------------------------------------------------------------ #
+        # WebView rendering: SetPage-once architecture
+        # ------------------------------------------------------------------ #
+        # The shell HTML (CSS + JS framework + empty containers) is loaded
+        # exactly once via SetPage.  All subsequent UI updates go through
+        # RunScript calls to JS functions defined in the shell.  This
+        # eliminates the Windows WebView2 deadlock caused by repeated SetPage
+        # calls triggering nested message-pump re-entrancy.
+        # ------------------------------------------------------------------ #
+
+        def _prepare_entries_for_js(self) -> list[dict]:
+            """Serialize _conv_entries for JavaScript consumption.
+
+            - AI text: render markdown to HTML
+            - Tool calls: truncate args/result for display
+            - User text / status: kept as-is (JS will escape)
+            """
+            import json as _json
+            result = []
+            for entry in self._conv_entries:
+                e = dict(entry)  # shallow copy — don't mutate originals
+                if e["type"] == "ai":
+                    e["text"] = self._md_to_html(e.get("text", ""))
+                elif e["type"] == "tool_call":
+                    e["args"] = self._truncate_for_ui(e.get("args", {}), self._MAX_UI_JSON)
+                    e["result"] = self._truncate_for_ui(e.get("result", {}), self._MAX_UI_JSON)
+                elif e["type"] == "autoroute_log":
+                    raw_out = (e.get("stdout") or "").strip()
+                    raw_err = (e.get("stderr") or "").strip()
+                    combined = "\n".join(filter(None, [
+                        raw_out,
+                        ("--- stderr ---\n" + raw_err) if raw_err else "",
+                    ]))
+                    e["output"] = combined or "(no output)"
+                result.append(e)
+            return result
+
+        def _prepare_single_entry(self, entry: dict) -> dict:
+            """Prepare a single entry for JavaScript consumption."""
+            e = dict(entry)
+            if e["type"] == "ai":
+                e["text"] = self._md_to_html(e.get("text", ""))
+            elif e["type"] == "tool_call":
+                e["args"] = self._truncate_for_ui(e.get("args", {}), self._MAX_UI_JSON)
+                e["result"] = self._truncate_for_ui(e.get("result", {}), self._MAX_UI_JSON)
+            elif e["type"] == "autoroute_log":
+                raw_out = (e.get("stdout") or "").strip()
+                raw_err = (e.get("stderr") or "").strip()
+                combined = "\n".join(filter(None, [
+                    raw_out,
+                    ("--- stderr ---\n" + raw_err) if raw_err else "",
+                ]))
+                e["output"] = combined or "(no output)"
+            return e
+
+        def _update_conversation(self, force_scroll_to_bottom: bool = False) -> None:
+            """Full conversation update via RunScript (WebView path).
+
+            Serializes all entries as JSON and calls _updateConversation()
+            in the shell.
+            """
+            if not self._try_acquire_render_lock():
+                return  # _try_acquire_render_lock already set _render_pending
+
+            import json as _json
+            js_entries = self._prepare_entries_for_js()
+            scroll = '"bottom"' if force_scroll_to_bottom else '"preserve"'
+            # Double json.dumps: inner produces JSON string, outer escapes it
+            # for safe embedding inside a JS function call argument.
+            js = f'_updateConversation({_json.dumps(_json.dumps(js_entries))}, {scroll})'
+            log.debug("_updateConversation: %d entries, scroll=%s, js_size=%d",
+                      len(js_entries), scroll, len(js))
+
+            try:
+                ok, result = self._conv_view.RunScript(js)
+                if ok:
+                    self._stream_wrapper_visible = False
+                    result_str = str(result) if result else ""
+                    if result_str.startswith("error:"):
+                        log.error("_updateConversation JS error: %s (js_size=%d, entries=%d)",
+                                  result_str, len(js), len(js_entries))
+                    else:
+                        log.debug("_updateConversation JS result: %s", result_str)
+                else:
+                    log.error("_updateConversation RunScript FAILED: js_size=%d, result=%r, entries=%d",
+                              len(js), result, len(js_entries))
+            except Exception as e:
+                log.error("_updateConversation exception: %s", e)
+            finally:
+                self._release_render_lock(force_scroll_to_bottom)
+
+        def _process_pending_render(self, force_scroll_to_bottom: bool) -> None:
+            """Process any pending render after _js_running is reset."""
+            if self._render_pending:
+                self._render_pending = False
+                wx.CallAfter(self._update_conversation, force_scroll_to_bottom)
+
+        # ------------------------------------------------------------------ #
+        # Render lock helpers: encapsulate sync state management
+        # ------------------------------------------------------------------ #
+        def _try_acquire_render_lock(self) -> bool:
+            """Try to acquire the render lock. Returns True if acquired.
+
+            If acquisition fails (shell not loaded or another render in progress),
+            sets _render_pending so the render will be retried later.
+            """
+            self._render_pending = False  # Reset first to allow recursion
+
+            if self._js_running:
+                self._render_pending = True
+                return False
+
+            # If shell_loaded is False, try to detect if it actually is loaded
+            # (EVT_WEBVIEW_LOADED may not fire on all Windows WebView2 versions)
+            if not self._shell_loaded:
+                # Try to detect shell state by checking if the conversation div exists
+                # AND if JS functions are defined. Try multiple times in case scripts
+                # haven't executed yet.
+                shell_loaded_detected = False
+                for attempt in range(3):
+                    try:
+                        ok, result = self._conv_view.RunScript(
+                            "document.getElementById('conversation') ? 'loaded' : 'not_loaded'"
+                        )
+                        if ok and result and "loaded" in str(result):
+                            # Also verify JS functions exist by trying to call one
+                            ok2, result2 = self._conv_view.RunScript(
+                                "try { _updateConversation('[]', 'preserve'); 'ok'; } catch(e) { e.message; }"
+                            )
+                            log.info("JS test attempt %d: %r", attempt + 1, result2)
+                            if ok2 and result2 and ("ok" in str(result2) or "error" in str(result2).lower()):
+                                log.info("Detected shell and JS working (attempt %d)", attempt + 1)
+                                self._shell_loaded = True
+                                self._page_loading = False
+                                shell_loaded_detected = True
+                                break
+                            else:
+                                log.warning("Shell loaded but JS not working (attempt %d)", attempt + 1)
+                        else:
+                            break
+                    except Exception as e:
+                        log.warning("Failed to detect shell state (attempt %d): %s", attempt + 1, e)
+                        break
+
+                if not shell_loaded_detected:
+                    log.warning("Shell loaded but JS not working after 3 attempts, allowing retry")
+                    self._render_pending = True
+                    return False
+
+            self._js_running = True
+            return True
+
+        def _release_render_lock(self, force_scroll_to_bottom: bool) -> None:
+            """Release the render lock and process pending if needed."""
+            self._js_running = False
+            self._process_pending_render(force_scroll_to_bottom)
+
+        def _append_entry_js(self, entry: dict,
+                              force_scroll_to_bottom: bool = False) -> None:
+            """Append a single entry via JS _appendEntry (WebView path)."""
+            if not self._try_acquire_render_lock():
+                return  # _try_acquire_render_lock already set _render_pending
+
+            import json as _json
+            prepared = self._prepare_single_entry(entry)
+            scroll = '"bottom"' if force_scroll_to_bottom else '"preserve"'
+            js = f'_appendEntry({_json.dumps(_json.dumps(prepared))}, {scroll})'
+            log.debug("_appendEntry: type=%s, scroll=%s", entry.get("type"), scroll)
+
+            try:
+                ok, result = self._conv_view.RunScript(js)
+                if ok:
+                    self._stream_wrapper_visible = False
+                    result_str = str(result) if result else ""
+                    if result_str.startswith("error:"):
+                        log.error("_appendEntry JS error: %s (type=%s, js_size=%d)",
+                                  result_str, entry.get("type"), len(js))
+                    else:
+                        log.debug("_appendEntry JS result: %s", result_str)
+                else:
+                    log.error("_appendEntry RunScript FAILED: result=%r, type=%s, js_size=%d",
+                              result, entry.get("type"), len(js))
+                    self._render_pending = True
+            except Exception:
+                self._render_pending = True
+            finally:
+                self._release_render_lock(force_scroll_to_bottom)
+
+        def _show_stream_wrapper(self) -> None:
+            """Make the stream-wrapper table visible (first streaming chunk)."""
+            if not self._shell_loaded or self._stream_wrapper_visible:
+                return  # No-op
+
+            # Use the lock but handle the case where we don't need full update
+            if not self._try_acquire_render_lock():
+                return
+
+            try:
+                ok, _ = self._conv_view.RunScript(
+                    "document.getElementById('stream-wrapper').style.display=''"
+                )
+                if ok:
+                    self._stream_wrapper_visible = True
+            finally:
+                self._release_render_lock(False)
+
+        def _hide_stream_wrapper(self) -> None:
+            """Hide the stream-wrapper table and clear pending text."""
+            if not self._shell_loaded or not self._stream_wrapper_visible:
+                return  # No-op
+
+            # Use the lock but handle the case where we don't need full update
+            if not self._try_acquire_render_lock():
+                return
+
+            try:
+                ok, _ = self._conv_view.RunScript(
+                    "var w=document.getElementById('stream-wrapper');"
+                    "if(w)w.style.display='none';"
+                    "document.getElementById('pending-ai-text').innerHTML='';"
+                )
+                if ok:
+                    self._stream_wrapper_visible = False
+            finally:
+                self._release_render_lock(False)
 
         def _render_conversation(self, force_scroll_to_bottom: bool = False) -> None:
-            """Re-render the full conversation as HTML and update the view.
-            
-            Args:
-                force_scroll_to_bottom: If True, always scroll to bottom regardless of current position.
+            """Re-render the conversation.  Routes to WebView or HtmlWindow path."""
+            if self._use_webview:
+                # Note: _page_loading is handled by the shell load completion events
+                # which will trigger pending renders when done
+                if self._page_loading:
+                    self._render_pending = True
+                    return  # Let the page load complete and handle it
+
+                # Delegate to _update_conversation which handles locking
+                self._update_conversation(force_scroll_to_bottom)
+            else:
+                self._render_conversation_htmlwindow(force_scroll_to_bottom)
+
+        def _render_conversation_htmlwindow(self, force_scroll_to_bottom: bool = False) -> None:
+            """HtmlWindow fallback: build HTML and call SetPage.
+
+            Used only when wx.html2.WebView is unavailable.  The WebView path
+            uses _update_conversation (RunScript-based) instead.
             """
             import html as _h
-            import json as _json
 
-            if self._use_webview:
-                bg = self._BG_CONV_HEX
-                parts = [
-                    "<!DOCTYPE html><html><head><meta charset='utf-8'>"
-                    "<style>"
-                    f"body{{font-family:Arial,sans-serif;font-size:10pt;background:{bg};margin:4px}}"
-                    "table.msg{width:100%;border-collapse:collapse;margin-bottom:8px}"
-                    "table.msg td{padding:8px 10px;border-radius:4px}"
-                    ".tool-list{margin-top:6px;font-size:9pt}"
-                    "details.tools{margin:2px 0}"
-                    "details.tools summary{cursor:pointer;color:#555;user-select:none;"
-                    "padding:2px 4px;border-radius:3px;list-style:disclosure-closed}"
-                    "details.tools summary:hover{background:#e8e8e8}"
-                    "details.tools[open] summary{list-style:disclosure-open}"
-                    ".tool-entry{margin:2px 0;padding:4px 8px;background:#f5f5f0;"
-                    "border-left:3px solid #ccc;border-radius:2px;"
-                    "font-family:monospace;font-size:8.5pt;white-space:pre-wrap;"
-                    "word-break:break-all}"
-                    ".tool-ok{border-left-color:#4caf50}"
-                    ".tool-err{border-left-color:#f44336}"
-                    "pre{font-family:monospace;white-space:pre;background:#f4f4f4;"
-                    "padding:8px;border-radius:4px;overflow-x:auto;font-size:9pt;"
-                    "line-height:1.4}"
-                    "pre code{background:none;padding:0;border-radius:0;font-size:inherit}"
-                    "code{font-family:monospace;background:#f0f0f0;"
-                    "padding:1px 3px;border-radius:2px}"
-                    "</style></head>"
-                    f"<body>"
-                ]
-            else:
-                parts = [
-                    f'<html><body style="font-family: Arial, sans-serif; font-size: 10pt;"'
-                    f' bgcolor="{self._BG_CONV_HEX}">'
-                ]
-
-            def _tool_html_webview(tools: list[dict]) -> str:
-                if not tools:
-                    return ""
-                items = []
-                for t in tools:
-                    ok = t["result"].get("success", True) if isinstance(t["result"], dict) else True
-                    icon = "✓" if ok else "✗"
-                    icon_color = "#4caf50" if ok else "#f44336"
-                    css = "tool-entry tool-ok" if ok else "tool-entry tool-err"
-                    args_txt = _h.escape(_json.dumps(t["args"], separators=(",", ":"), default=str))
-                    result_txt = _h.escape(_json.dumps(t["result"], separators=(",", ":"), default=str))
-                    name = _h.escape(t["name"])
-                    items.append(
-                        f'<details class="tools">'
-                        f'<summary><span style="color:{icon_color}">{icon}</span> {name}</summary>'
-                        f'<div class="{css}">'
-                        f'<span style="color:#555">args:</span> {args_txt}<br>'
-                        f'<span style="color:#555">result:</span> {result_txt}'
-                        f'</div>'
-                        f'</details>'
-                    )
-                return '<div class="tool-list">' + "".join(items) + '</div>'
+            parts = [
+                f'<html><body style="font-family: Arial, sans-serif; font-size: 10pt;"'
+                f' bgcolor="{self._BG_CONV_HEX}">'
+            ]
 
             def _tool_html_plain(tools: list[dict]) -> str:
                 """Compact inline tool summary for wx.html.HtmlWindow (no folding)."""
@@ -1257,39 +1752,22 @@ if _WX_AVAILABLE:
                 inner = "<br>".join(rows)
                 return f'<blockquote style="margin:4px 0">{inner}</blockquote>'
 
-            if self._use_webview:
-                def _msg_block(sender: str, sender_color: str, bg_color: str,
-                               body_html: str, tools_html: str = "",
-                               timestamp: str = "") -> str:
-                    ts_html = (
-                        f'<span style="float:right;font-size:8pt;color:#999;font-weight:normal">'
-                        f'{timestamp}</span>'
-                        if timestamp else ""
-                    )
-                    return (
-                        f'<table class="msg"><tr><td style="background:{bg_color}">'
-                        f'<b><span style="color:{sender_color}">{sender}</span></b>'
-                        f'{ts_html}'
-                        f'<br>{body_html}{tools_html}'
-                        f'</td></tr></table>'
-                    )
-            else:
-                def _msg_block(sender: str, sender_color: str, bg_color: str,
-                               body_html: str, tools_html: str = "",
-                               timestamp: str = "") -> str:
-                    ts_html = (
-                        f' <font size="2" color="#999999"><i>{timestamp}</i></font>'
-                        if timestamp else ""
-                    )
-                    return (
-                        f'<table width="100%" cellpadding="10" cellspacing="0" bgcolor="{bg_color}"'
-                        f' border="0"><tr><td>'
-                        f'<b><font color="{sender_color}" size="3">{sender}</font></b>'
-                        f'{ts_html}'
-                        f'<br>{body_html}{tools_html}'
-                        f'</td></tr></table>'
-                        f'<br>'
-                    )
+            def _msg_block(sender: str, sender_color: str, bg_color: str,
+                           body_html: str, tools_html: str = "",
+                           timestamp: str = "") -> str:
+                ts_html = (
+                    f' <font size="2" color="#999999"><i>{timestamp}</i></font>'
+                    if timestamp else ""
+                )
+                return (
+                    f'<table width="100%" cellpadding="10" cellspacing="0" bgcolor="{bg_color}"'
+                    f' border="0"><tr><td>'
+                    f'<b><font color="{sender_color}" size="3">{sender}</font></b>'
+                    f'{ts_html}'
+                    f'<br>{body_html}{tools_html}'
+                    f'</td></tr></table>'
+                    f'<br>'
+                )
 
             for entry in self._conv_entries:
                 typ = entry["type"]
@@ -1302,38 +1780,16 @@ if _WX_AVAILABLE:
                     body = self._md_to_html(text)
                     tools = entry.get("tools") or []
                     ts = entry.get("timestamp", "")
-                    if self._use_webview:
-                        tools_html = _tool_html_webview(tools)
-                    else:
-                        tools_html = _tool_html_plain(tools)
+                    tools_html = _tool_html_plain(tools)
                     parts.append(_msg_block("AI", self._C_AI_HEX, "#EBF7F2", body, tools_html, timestamp=ts))
                 elif typ == "tool_call":
-                    if self._use_webview:
-                        ok = entry["result"].get("success", True) if isinstance(entry["result"], dict) else True
-                        icon = "✓" if ok else "✗"
-                        icon_color = "#4caf50" if ok else "#f44336"
-                        css = "tool-entry tool-ok" if ok else "tool-entry tool-err"
-                        args_txt = _h.escape(_json.dumps(entry["args"], separators=(",", ":"), default=str))
-                        result_txt = _h.escape(_json.dumps(entry["result"], separators=(",", ":"), default=str))
-                        tname = _h.escape(entry["name"])
-                        parts.append(
-                            f'<details class="tools" style="margin: 2px 8px;">'
-                            f'<summary><span style="color:{icon_color}">{icon}</span> '
-                            f'<span style="color:{self._C_TOOL_HEX}">↳ {tname}</span></summary>'
-                            f'<div class="{css}">'
-                            f'<span style="color:#555">args:</span> {args_txt}<br>'
-                            f'<span style="color:#555">result:</span> {result_txt}'
-                            f'</div>'
-                            f'</details>'
-                        )
-                    else:
-                        ok = entry["result"].get("success", True) if isinstance(entry["result"], dict) else True
-                        icon = "&#x2713;" if ok else "&#x2717;"
-                        tname = _h.escape(entry["name"])
-                        color = self._C_OK_HEX if ok else self._C_ERR_HEX
-                        parts.append(
-                            f'<p style="margin: 2px 8px;"><font color="{color}"><tt>{icon} ↳ {tname}</tt></font></p>'
-                        )
+                    ok = entry["result"].get("success", True) if isinstance(entry["result"], dict) else True
+                    icon = "&#x2713;" if ok else "&#x2717;"
+                    tname = _h.escape(entry["name"])
+                    color = self._C_OK_HEX if ok else self._C_ERR_HEX
+                    parts.append(
+                        f'<p style="margin: 2px 8px;"><font color="{color}"><tt>{icon} ↳ {tname}</tt></font></p>'
+                    )
                 elif typ == "status":
                     color = entry.get("color_hex", "#1E1E1E")
                     escaped = _h.escape(text)
@@ -1344,86 +1800,66 @@ if _WX_AVAILABLE:
                     raw_out = (entry.get("stdout") or "").strip()
                     raw_err = (entry.get("stderr") or "").strip()
                     combined = "\n".join(filter(None, [raw_out, ("--- stderr ---\n" + raw_err) if raw_err else ""]))
-                    icon = "✓" if ok else "✗"
-                    icon_color = "#4caf50" if ok else "#f44336"
-                    if self._use_webview:
-                        css = "tool-entry tool-ok" if ok else "tool-entry tool-err"
-                        log_body = (
-                            f'<pre style="margin:4px 0;max-height:300px;overflow-y:auto">'
-                            f'{_h.escape(combined) if combined else "(no output)"}'
-                            f'</pre>'
-                        )
-                        parts.append(
-                            f'<details class="tools" style="margin: 2px 8px;">'
-                            f'<summary><span style="color:{icon_color}">{icon}</span> '
-                            f'<b>Auto Route</b> — {msg}</summary>'
-                            f'<div class="{css}">{log_body}</div>'
-                            f'</details>'
-                        )
-                    else:
-                        # HtmlWindow fallback: no <details>, show truncated output
-                        color = self._C_OK_HEX if ok else self._C_ERR_HEX
-                        snippet = _h.escape(combined[:500] + ("…" if len(combined) > 500 else ""))
-                        parts.append(
-                            f'<p style="margin: 2px 8px;">'
-                            f'<font color="{color}"><tt>{icon} Auto Route</tt></font> {msg}</p>'
-                            f'<blockquote style="margin:2px 8px"><tt><font size="2">{snippet}</font></tt></blockquote>'
-                        )
+                    icon = "&#x2713;" if ok else "&#x2717;"
+                    color = self._C_OK_HEX if ok else self._C_ERR_HEX
+                    snippet = _h.escape(combined[:500] + ("…" if len(combined) > 500 else ""))
+                    parts.append(
+                        f'<p style="margin: 2px 8px;">'
+                        f'<font color="{color}"><tt>{icon} Auto Route</tt></font> {msg}</p>'
+                        f'<blockquote style="margin:2px 8px"><tt><font size="2">{snippet}</font></tt></blockquote>'
+                    )
 
-            # Show pending streamed AI text
+            # Show pending streamed AI text (HtmlWindow path only).
             if self._pending_ai_text:
                 body = self._md_to_html(self._pending_ai_text)
                 parts.append(_msg_block("AI", self._C_AI_HEX, "#EBF7F2", body))
 
-            if self._use_webview:
-                # Read the current scroll position BEFORE SetPage (old page still loaded).
-                # RunScript is synchronous on the current page so values are reliable.
-                _ok_y, _sy = self._conv_view.RunScript("String(window.scrollY)")
-                _ok_h, _sh = self._conv_view.RunScript(
-                    "String(document.body ? document.body.scrollHeight - window.innerHeight : 0)"
+            # Capture scroll position before replacing the page
+            _max = self._conv_view.GetScrollRange(wx.VERTICAL)
+            _pos = self._conv_view.GetScrollPos(wx.VERTICAL)
+            _at_bottom = force_scroll_to_bottom or _max == 0 or (_max - _pos) < 3
+
+            parts.append("</body></html>")
+            self._conv_view.SetPage("".join(parts))
+            # Use wx.CallLater so the scroll fires after wx has finished
+            # its layout pass for the new page.
+            if _at_bottom:
+                wx.CallLater(
+                    50,
+                    lambda: self._conv_view.Scroll(
+                        0, self._conv_view.GetScrollRange(wx.VERTICAL)
+                    ),
                 )
-                try:
-                    _sy_val = int(float(_sy)) if _ok_y else 0
-                    _sh_val = int(float(_sh)) if _ok_h else 0
-                    # Consider "at bottom" when within 50 px or page not yet scrollable
-                    _at_bottom = force_scroll_to_bottom or _sh_val < 50 or (_sh_val - _sy_val) < 50
-                except (ValueError, TypeError):
-                    _at_bottom = True
-                    _sy_val = 0
-
-                # Store scroll intent; the actual RunScript call happens in
-                # _on_webview_loaded, which fires only after the browser has
-                # fully loaded and laid out the new page.
-                self._webview_scroll_target = -1 if _at_bottom else _sy_val
-                parts.append("</body></html>")
-                self._conv_view.SetPage("".join(parts), "")
             else:
-                # Capture scroll position before replacing the page
-                _max = self._conv_view.GetScrollRange(wx.VERTICAL)
-                _pos = self._conv_view.GetScrollPos(wx.VERTICAL)
-                _at_bottom = force_scroll_to_bottom or _max == 0 or (_max - _pos) < 3
+                _frac = _pos / _max if _max > 0 else 0.0
+                wx.CallLater(
+                    50,
+                    lambda f=_frac: self._conv_view.Scroll(
+                        0, int(f * self._conv_view.GetScrollRange(wx.VERTICAL))
+                    ),
+                )
 
-                parts.append("</body></html>")
-                self._conv_view.SetPage("".join(parts))
-                # Use wx.CallLater so the scroll fires after wx has finished
-                # its layout pass for the new page.  wx.CallAfter (even nested)
-                # is not reliable here because layout is driven by paint events,
-                # not plain event-loop ticks; 50 ms is enough on any platform.
-                if _at_bottom:
-                    wx.CallLater(
-                        50,
-                        lambda: self._conv_view.Scroll(
-                            0, self._conv_view.GetScrollRange(wx.VERTICAL)
-                        ),
-                    )
-                else:
-                    _frac = _pos / _max if _max > 0 else 0.0
-                    wx.CallLater(
-                        50,
-                        lambda f=_frac: self._conv_view.Scroll(
-                            0, int(f * self._conv_view.GetScrollRange(wx.VERTICAL))
-                        ),
-                    )
+        # Maximum character length for tool args/result JSON in UI display.
+        # Keeps HTML size manageable for WebView2 (large NavigateToString payloads
+        # cause the control to freeze on Windows).  LLM history is unaffected.
+        _MAX_UI_JSON = 2000
+
+        @staticmethod
+        def _truncate_for_ui(obj: Any, max_chars: int = 2000) -> Any:
+            """Truncate large objects for UI display in tool_call entries.
+
+            Returns the original object if its JSON representation is within
+            *max_chars* characters; otherwise returns a truncated string.
+            The LLM conversation history always stores the full object.
+            """
+            import json as _json
+            try:
+                s = _json.dumps(obj, separators=(",", ":"), default=str)
+            except (TypeError, ValueError):
+                return repr(obj)
+            if len(s) <= max_chars:
+                return obj
+            return s[:max_chars] + f"… [{len(s)} chars total]"
 
         @staticmethod
         def _json_dump_safe(value: Any, *, indent: int | None = None) -> str:
