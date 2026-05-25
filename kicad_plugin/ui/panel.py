@@ -415,8 +415,11 @@ if _WX_AVAILABLE:
                 checked_path = socket_url
             elif platform.system() == "Windows":
                 # Windows uses a named pipe — can't easily stat it
-                socket_exists = True
-                checked_path = f"{gettempdir()}\\kicad\\api.sock"
+                temp_dir = gettempdir()
+                checked_path = f"{temp_dir}\\kicad\\api.sock"
+                log.info("Windows socket check: tempdir=%s, path=%s", temp_dir, checked_path)
+                socket_exists = os.path.exists(checked_path)
+                log.info("Windows socket exists: %s", socket_exists)
             else:
                 # Glob for api*.sock (covers api.sock and api-<pid>.sock).
                 # Try flatpak directory first, then standard /tmp/kicad.
@@ -519,8 +522,6 @@ if _WX_AVAILABLE:
             threading.Thread(target=_run, daemon=True).start()
 
         def _on_reply(self, reply: str, ctx: dict, was_streamed: bool = False) -> None:
-            log.info("_on_reply: was_streamed=%s, reply_len=%d, pending_ai=%d",
-                     was_streamed, len(reply), len(self._pending_ai_text))
             # Stop the flush timer and drain any remaining chunks
             self._stream_timer.Stop()
             self._on_stream_flush(None)
@@ -672,10 +673,18 @@ if _WX_AVAILABLE:
             # Full update needed to clear pending-ai-text and show new entries
             self._render_conversation(force_scroll_to_bottom=self._follow_output_to_bottom)
             self._tool_calls_made = True
-            if isinstance(result, dict) and str(result.get("file_modified", "")).endswith(".kicad_sch"):
-                self._schematic_edited = True
-            if isinstance(result, dict) and str(result.get("file_modified", "")).endswith(".kicad_pcb"):
+            # Use tool_registry to determine if tool modified PCB/schematic files
+            try:
+                from ..tool_registry import get_tool_policy
+                policy = get_tool_policy(name)
+            except Exception as e:
+                log.error("Failed to get tool policy for %s: %s", name, e)
+                policy = None
+
+            if policy and policy.path_arg == "pcb_path" and policy.mark_dirty:
                 self._pcb_edited = True
+            elif policy and policy.path_arg == "schematic_path" and policy.mark_dirty:
+                self._schematic_edited = True
 
         def _auto_refresh(self, ctx: dict) -> None:
             """Refresh the KiCad view automatically after tool calls."""
