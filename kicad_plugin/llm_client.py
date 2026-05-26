@@ -40,6 +40,9 @@ _NO_HTTPS_MARKER = "unknown url type: https"
 # None = unknown, True = works, False = SSL unavailable (use subprocess).
 _in_process_ssl: bool | None = None
 
+# Storage for reasoning_content (DeepSeek thinking mode)
+_current_reasoning: list[str] = []
+
 
 def _resolve_plugin_python() -> str | None:
     """Return the path to the plugin venv's Python, or None if absent."""
@@ -928,7 +931,15 @@ class LLMClient:
                 return text
 
             # Execute tool calls
-            self._history.append({"role": "assistant", **message})
+            # Save message, preserving thinking content for DeepSeek models
+            msg_to_save = {"role": "assistant"}
+            if message.get("content"):
+                msg_to_save["content"] = message["content"]
+            if message.get("reasoning_content"):
+                msg_to_save["reasoning_content"] = message["reasoning_content"]
+            if message.get("tool_calls"):
+                msg_to_save["tool_calls"] = message["tool_calls"]
+            self._history.append(msg_to_save)
             tool_results = []
             for tc in tool_calls:
                 name = tc["function"]["name"]
@@ -1055,6 +1066,8 @@ class LLMClient:
         Uses in-process urllib for true SSE streaming when SSL is available.
         Falls back to non-streaming via _call_openai (subprocess) otherwise.
         """
+        global _current_reasoning
+        _current_reasoning = []
         global _in_process_ssl
         import urllib.request
         import urllib.error
@@ -1119,6 +1132,10 @@ class LLMClient:
                             except Exception:
                                 pass
 
+                        reasoning = delta.get("reasoning_content")
+                        if reasoning:
+                            _current_reasoning.append(reasoning)
+
                         for tc_delta in delta.get("tool_calls") or []:
                             idx = tc_delta["index"]
                             if idx not in tool_calls_by_index:
@@ -1140,6 +1157,8 @@ class LLMClient:
                     message: dict[str, Any] = {"content": "".join(text_parts)}
                     if tool_calls:
                         message["tool_calls"] = tool_calls
+                    if _current_reasoning:
+                        message["reasoning_content"] = "".join(_current_reasoning)
                     return {"finish_reason": finish_reason, "message": message}
 
             except urllib.error.URLError as e:

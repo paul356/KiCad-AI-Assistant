@@ -343,22 +343,30 @@ if _WX_AVAILABLE:
             t.start()
 
         def _on_server_started(self, ok: bool) -> None:
-            if ok:
-                self._status_label.SetLabel("✅ Backend ready")
-                self._status_label.SetForegroundColour(wx.Colour(*self._C_OK))
-                self._send_btn.Enable(True)
-                self.GetMenuBar().Enable(self._menu_autoroute_id, True)
-                self._init_llm_client()
-                self._check_kicad_ipc_environment()
-            else:
-                self._status_label.SetLabel("❌ Backend failed to start — use Options → Restart Backend to retry")
-                self._status_label.SetForegroundColour(wx.Colour(*self._C_ERR))
-            self.Layout()
+            try:
+                if ok:
+                    self._status_label.SetLabel("✅ Backend ready")
+                    self._status_label.SetForegroundColour(wx.Colour(*self._C_OK))
+                    self._send_btn.Enable(True)
+                    self.GetMenuBar().Enable(self._menu_autoroute_id, True)
+                    self._init_llm_client()
+                    self._check_kicad_ipc_environment()
+                else:
+                    self._status_label.SetLabel("❌ Backend failed to start — use Options → Restart Backend to retry")
+                    self._status_label.SetForegroundColour(wx.Colour(*self._C_ERR))
+                self.Layout()
+            except Exception as e:
+                import traceback
+                log.error("_on_server_started failed: %s\n%s", e, traceback.format_exc())
 
         def _init_llm_client(self) -> None:
-            from ..llm_client import LLMClient
-            self._llm_client = LLMClient(self._settings, self._server_mgr.base_url)
-            self._autoload_session()
+            try:
+                from ..llm_client import LLMClient
+                self._llm_client = LLMClient(self._settings, self._server_mgr.base_url)
+                self._autoload_session()
+            except Exception as e:
+                import traceback
+                log.error("_init_llm_client failed: %s\n%s", e, traceback.format_exc())
 
         # ------------------------------------------------------------------ #
         # KiCad IPC API status check
