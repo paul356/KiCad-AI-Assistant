@@ -351,6 +351,7 @@ if _WX_AVAILABLE:
                     self.GetMenuBar().Enable(self._menu_autoroute_id, True)
                     self._init_llm_client()
                     self._check_kicad_ipc_environment()
+                    self._auto_save_pcb_on_open()
                 else:
                     self._status_label.SetLabel("❌ Backend failed to start — use Options → Restart Backend to retry")
                     self._status_label.SetForegroundColour(wx.Colour(*self._C_ERR))
@@ -384,8 +385,6 @@ if _WX_AVAILABLE:
             """
             import glob
             import os
-            import platform
-            from tempfile import gettempdir
 
             # 1) kipy presence check in the plugin's .venv -----------------
             # kipy runs inside the MCP server venv, not KiCad's Python, so
@@ -413,45 +412,44 @@ if _WX_AVAILABLE:
                     ),
                     "color_hex": self._C_WARN_HEX,
                 })
+                self._render_conversation()
 
             # 2) IPC socket check ------------------------------------------
-            # Simple file existence check for Unix systems
-            # On Windows, we skip the check since named pipes can't be easily verified
-            # The actual tools will provide clear error messages if the socket is unavailable
-            socket_exists = True  # Assume available unless proven otherwise
-            checked_path = "unknown"
-            
-            if platform.system() != "Windows":
-                # Unix: check if socket file exists
-                socket_url = os.environ.get("KICAD_API_SOCKET")
-                if socket_url:
-                    # Strip ipc:// prefix if present
-                    socket_path = socket_url[len("ipc://"):] if socket_url.startswith("ipc://") else socket_url
-                    socket_exists = os.path.exists(socket_path)
-                    checked_path = socket_url
-                else:
-                    # Check default locations
-                    home = os.environ.get("HOME", "")
-                    candidate_paths = []
-                    if home:
-                        candidate_paths.append(f"{home}/.var/app/org.kicad.KiCad/cache/tmp/kicad/api.sock")
-                    candidate_paths.append("/tmp/kicad/api.sock")
-                    
-                    socket_exists = False
-                    for path in candidate_paths:
-                        if os.path.exists(path):
-                            socket_exists = True
-                            checked_path = path
-                            break
-                    
-                    if not socket_exists:
-                        checked_path = "/tmp/kicad/api.sock"
-            
+            # This MUST run on a background thread: it connects to the KiCad
+            # IPC socket and sends a ping with a 10-second timeout.  Doing
+            # this on the KiCad main (UI) thread would block KiCad, which in
+            # turn prevents KiCad from accepting the IPC connection — a
+            # deadlock that freezes the entire application on startup.
+            def _check_socket_async():
+                socket_exists = False
+                checked_path = "unknown"
+                base_url = self._server_mgr.base_url
+                if base_url:
+                    try:
+                        from ..llm_client import call_mcp_tool
+                        result = call_mcp_tool(
+                            base_url,
+                            "check_kicad_ipc_connection",
+                            {},
+                        )
+                        socket_exists = result.get("connected", False)
+                        checked_path = result.get("socket_path", "unknown")
+                        if not socket_exists:
+                            log.debug("IPC socket check failed: %s", result.get("error", "unknown"))
+                    except Exception as exc:
+                        log.warning("Failed to check IPC socket via MCP tool: %s", exc)
+                wx.CallAfter(self._on_ipc_socket_checked, socket_exists, checked_path)
+
+            t = threading.Thread(target=_check_socket_async, daemon=True)
+            t.start()
+
+        def _on_ipc_socket_checked(self, socket_exists: bool, checked_path: str) -> None:
+            """Callback invoked on the UI thread after the async IPC socket check."""
             if not socket_exists:
                 self._conv_entries.append({
                     "type": "status",
                     "text": (
-                        f"⚠ KiCad IPC API socket not found at {checked_path}. "
+                        f"⚠ KiCad IPC API socket not available at {checked_path}. "
                         "The 'Reload PCB' feature and 'update_pcb_from_schematic' "
                         "tool require it. Enable it in KiCad: "
                         "Preferences → Preferences → Plugins → "
@@ -459,9 +457,36 @@ if _WX_AVAILABLE:
                     ),
                     "color_hex": self._C_WARN_HEX,
                 })
-
-            if not kipy_ok or not socket_exists:
                 self._render_conversation()
+
+        def _auto_save_pcb_on_open(self) -> None:
+            """Auto-save the PCB when the plugin opens.
+
+            KiCad marks the PCB editor as dirty when the plugin is opened,
+            so we save it immediately to clear the dirty state.
+            Uses the save_board MCP tool via IPC for proper state management.
+            
+            This MUST run on a background thread to avoid blocking the KiCad
+            main thread, which would prevent KiCad from responding to IPC
+            connections and cause a deadlock.
+            """
+            def _do_auto_save():
+                try:
+                    from ..llm_client import call_mcp_tool
+                    result = call_mcp_tool(
+                        self._server_mgr.base_url,
+                        "save_board",
+                        {},
+                    )
+                    if result.get("success"):
+                        log.info("Auto-saved PCB on plugin open via save_board tool")
+                    else:
+                        log.debug("Auto-save PCB failed: %s", result.get("error", "unknown"))
+                except Exception as exc:
+                    log.debug("Auto-save PCB skipped or failed: %s", exc)
+
+            t = threading.Thread(target=_do_auto_save, daemon=True)
+            t.start()
 
         # ------------------------------------------------------------------ #
         # Event handlers

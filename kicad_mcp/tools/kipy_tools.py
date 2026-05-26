@@ -61,11 +61,15 @@ def _find_kicad_socket() -> str:
     return "ipc:///tmp/kicad/api.sock"
 
 
-def _connect() -> Any:
-    """Return a connected kipy.KiCad instance, or raise ConnectionError."""
+def _connect(timeout_ms: int = 5000) -> Any:
+    """Return a connected kipy.KiCad instance, or raise ConnectionError.
+    
+    Args:
+        timeout_ms: Maximum time to wait for KiCad responses (default 5000ms).
+    """
     try:
         import kipy  # imported lazily so the module loads even without kipy
-        return kipy.KiCad(socket_path=_find_kicad_socket())
+        return kipy.KiCad(socket_path=_find_kicad_socket(), timeout_ms=timeout_ms)
     except ImportError as exc:
         raise RuntimeError(
             "kicad-python is not installed. "
@@ -82,6 +86,73 @@ def _connect() -> Any:
 
 def register_kipy_tools(mcp: FastMCP) -> None:
     """Register KiCad IPC API tools with the MCP server."""
+
+    # ------------------------------------------------------------------
+    # check_kicad_ipc_connection
+    # ------------------------------------------------------------------
+
+    @mcp.tool()
+    async def check_kicad_ipc_connection(ctx: Context | None = None) -> Dict[str, Any]:
+        """Check if the KiCad IPC socket is open and responsive.
+
+        Uses kipy's ping() command to actively test the connection to the
+        running KiCad instance. Works on both Linux (Unix domain sockets)
+        and Windows (named pipes).
+
+        Returns:
+            dict with:
+                success (bool): True if the tool executed without errors.
+                connected (bool): True if KiCad is reachable via IPC.
+                socket_path (str): The socket path that was tested.
+                error (str): Present only if connection failed.
+        """
+        try:
+            import kipy.errors  # noqa: PLC0415
+            
+            # Use longer timeout for ping check since KiCad may be slow to respond
+            kicad = _connect(timeout_ms=10000)
+            socket_path = _find_kicad_socket()
+            
+            try:
+                kicad.ping()
+                return {
+                    "success": True,
+                    "connected": True,
+                    "socket_path": socket_path,
+                }
+            except kipy.errors.ConnectionError as exc:
+                # Timeout means socket exists but KiCad is slow/busy
+                # Connection refused/missing means socket doesn't exist
+                error_msg = str(exc).lower()
+                if "timed out" in error_msg or "timeout" in error_msg:
+                    # Socket exists, just slow response - consider it connected
+                    log.debug("IPC ping timed out, but socket appears available: %s", exc)
+                    return {
+                        "success": True,
+                        "connected": True,
+                        "socket_path": socket_path,
+                        "warning": "Ping timed out but socket is available",
+                    }
+                else:
+                    # Real connection error - socket doesn't exist or permission denied
+                    return {
+                        "success": True,
+                        "connected": False,
+                        "error": str(exc),
+                    }
+        except RuntimeError as exc:
+            return {
+                "success": True,
+                "connected": False,
+                "error": str(exc),
+            }
+        except Exception as exc:
+            log.exception("Unexpected error in check_kicad_ipc_connection")
+            return {
+                "success": True,
+                "connected": False,
+                "error": str(exc),
+            }
 
     # ------------------------------------------------------------------
     # update_pcb_from_schematic
@@ -169,6 +240,35 @@ def register_kipy_tools(mcp: FastMCP) -> None:
             return {"success": False, "error": str(exc)}
         except Exception as exc:
             log.exception("Unexpected error in update_pcb_from_schematic")
+            return {"success": False, "error": str(exc)}
+
+    # ------------------------------------------------------------------
+    # save_board
+    # ------------------------------------------------------------------
+
+    @mcp.tool()
+    async def save_board(ctx: Context | None = None) -> dict:
+        """Save the currently open PCB in KiCad.
+
+        Uses the IPC API to trigger KiCad's save operation, which writes
+        the board to disk and clears the modified (dirty) flag in the UI.
+
+        Returns:
+            dict with keys:
+                success (bool): True if the save succeeded.
+                error (str): Present only if the save failed.
+        """
+        try:
+            kicad = _connect(timeout_ms=10000)
+            board = kicad.get_board()
+            if board is None:
+                return {"success": False, "error": "No board is currently open in KiCad"}
+            board.save()
+            return {"success": True}
+        except RuntimeError as exc:
+            return {"success": False, "error": str(exc)}
+        except Exception as exc:
+            log.exception("Unexpected error in save_board")
             return {"success": False, "error": str(exc)}
 
     # ------------------------------------------------------------------

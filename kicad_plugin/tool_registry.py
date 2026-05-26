@@ -230,6 +230,8 @@ TOOL_POLICIES: dict[str, ToolPolicy] = {
         mark_dirty=True,
     ),
     # KiCad IPC / UI tools
+    "check_kicad_ipc_connection": ToolPolicy(kind="query"),
+    "save_board": ToolPolicy(kind="ipc_action"),
     "update_pcb_from_schematic": ToolPolicy(kind="ipc_action"),
     "reload_kicad": ToolPolicy(kind="ui_refresh", clear_dirty_paths_arg="paths"),
     # Version tools
