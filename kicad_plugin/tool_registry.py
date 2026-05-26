@@ -215,6 +215,20 @@ TOOL_POLICIES: dict[str, ToolPolicy] = {
         auto_snapshot=True,
         mark_dirty=True,
     ),
+    # PCB zone tools
+    "list_zones": ToolPolicy(kind="query"),
+    "add_zone": ToolPolicy(
+        kind="file_mutation",
+        path_arg="pcb_path",
+        auto_snapshot=True,
+        mark_dirty=True,
+    ),
+    "delete_zone": ToolPolicy(
+        kind="file_mutation",
+        path_arg="pcb_path",
+        auto_snapshot=True,
+        mark_dirty=True,
+    ),
     # KiCad IPC / UI tools
     "update_pcb_from_schematic": ToolPolicy(kind="ipc_action"),
     "reload_kicad": ToolPolicy(kind="ui_refresh", clear_dirty_paths_arg="paths"),

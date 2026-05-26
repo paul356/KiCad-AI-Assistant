@@ -3,6 +3,7 @@ Unit tests for kicad_mcp/tools/pcb_query_tools.py
 """
 import asyncio
 import os
+import re
 import shutil
 
 import pytest
@@ -43,6 +44,17 @@ def board_with_outline_copy(tmp_path):
     return str(dest)
 
 
+@pytest.fixture
+def board_no_net_table(tmp_path):
+    dest = tmp_path / "board_no_net_table.kicad_pcb"
+    shutil.copy(BOARD_FIXTURE, dest)
+    text = dest.read_text(encoding="utf-8")
+    text = re.sub(r'^\t\(net\s+\d+\s+"[^"]*"\)\n', "", text, flags=re.MULTILINE)
+    text = re.sub(r'\(net\s+\d+\s+"([^"]*)"\)', r'(net "\1")', text)
+    dest.write_text(text, encoding="utf-8")
+    return str(dest)
+
+
 def _run(coro):
     return asyncio.run(coro)
 
@@ -55,6 +67,10 @@ class TestGetBoardInfo:
     def test_returns_net_count(self, tools):
         result = _run(tools["get_board_info"](pcb_path=BOARD_FIXTURE, ctx=None))
         assert result["net_count"] == 3  # nets 1-3 (net 0 excluded)
+
+    def test_returns_net_count_without_top_level_net_table(self, tools, board_no_net_table):
+        result = _run(tools["get_board_info"](pcb_path=board_no_net_table, ctx=None))
+        assert result["net_count"] == 3
 
     def test_returns_thickness(self, tools):
         result = _run(tools["get_board_info"](pcb_path=BOARD_FIXTURE, ctx=None))
@@ -168,6 +184,14 @@ class TestListNets:
         result = _run(tools["list_nets"](pcb_path=BOARD_FIXTURE, ctx=None))
         assert result["count"] == 3
 
+    def test_supports_name_only_pad_nets_without_top_level_table(self, tools, board_no_net_table):
+        result = _run(tools["list_nets"](pcb_path=board_no_net_table, ctx=None))
+        assert result["count"] == 3
+        names = {n["name"] for n in result["nets"]}
+        assert names == {"VCC", "GND", "NET_A"}
+        gnd = next(n for n in result["nets"] if n["name"] == "GND")
+        assert gnd["pad_count"] > 0
+
 
 class TestGetRatsnest:
     def test_returns_expected_keys(self, tools):
@@ -179,5 +203,10 @@ class TestGetRatsnest:
     def test_board_with_unrouted_pads_reports_them(self, tools):
         # NET_A has C1 pad2 and J1 pad2 — no track connects them
         result = _run(tools["get_ratsnest"](pcb_path=BOARD_FIXTURE, ctx=None))
+        net_a_items = [r for r in result["unconnected"] if r["net"] == "NET_A"]
+        assert len(net_a_items) > 0
+
+    def test_supports_name_only_pad_nets_without_top_level_table(self, tools, board_no_net_table):
+        result = _run(tools["get_ratsnest"](pcb_path=board_no_net_table, ctx=None))
         net_a_items = [r for r in result["unconnected"] if r["net"] == "NET_A"]
         assert len(net_a_items) > 0

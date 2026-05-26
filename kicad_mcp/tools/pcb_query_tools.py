@@ -35,6 +35,57 @@ from kicad_mcp.tools.pcb_placement_helpers import (
 log = logging.getLogger(__name__)
 
 
+def _collect_top_level_nets(data: List[Any]) -> tuple[Dict[int, str], Dict[str, int]]:
+    """Return board net lookup tables from top-level ``(net ...)`` entries."""
+    net_id_to_name: Dict[int, str] = {}
+    net_name_to_id: Dict[str, int] = {}
+    for item in data:
+        if isinstance(item, list) and len(item) >= 3 and _sym(item[0]) == "net":
+            try:
+                net_id = int(item[1])
+            except (TypeError, ValueError):
+                continue
+            net_name = item[2] if isinstance(item[2], str) else _sym(item[2])
+            net_id_to_name[net_id] = net_name
+            if net_name:
+                net_name_to_id[net_name] = net_id
+    return net_id_to_name, net_name_to_id
+
+
+def _parse_net_ref(
+    net_node: list[Any],
+    net_name_to_id: Dict[str, int],
+    net_id_to_name: Dict[int, str],
+) -> tuple[int | None, str]:
+    """Parse a KiCad net reference in either legacy or name-only form."""
+    if len(net_node) >= 3:
+        try:
+            net_id = int(net_node[1])
+            net_name = net_node[2] if isinstance(net_node[2], str) else _sym(net_node[2])
+            return net_id, net_name
+        except (TypeError, ValueError):
+            pass
+
+    if len(net_node) >= 2:
+        raw = net_node[1] if isinstance(net_node[1], str) else _sym(net_node[1])
+        if raw in net_name_to_id:
+            return net_name_to_id[raw], raw
+        try:
+            net_id = int(raw)
+            return net_id, net_id_to_name.get(net_id, str(net_id))
+        except (TypeError, ValueError):
+            return None, raw
+
+    return None, ""
+
+
+def _net_sort_key(net: Dict[str, Any]) -> tuple[int, Any, str]:
+    """Sort nets by known numeric id first, then by name."""
+    net_id = net.get("net_id")
+    name = str(net.get("name", ""))
+    return (0, net_id, name) if isinstance(net_id, int) else (1, name.lower(), name)
+
+
 def register_pcb_query_tools(mcp: FastMCP) -> None:
     """Register PCB board read/query tools with the MCP server."""
 
@@ -61,6 +112,7 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
         via_count = 0
         generator = ""
         generator_version = ""
+        pad_net_names: set[str] = set()
 
         for item in data:
             if not isinstance(item, list) or len(item) < 2:
@@ -80,6 +132,14 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
                         })
             elif key == "footprint":
                 footprint_count += 1
+                for sub in item[1:]:
+                    if not (isinstance(sub, list) and len(sub) >= 4 and _sym(sub[0]) == "pad"):
+                        continue
+                    for psub in sub:
+                        if isinstance(psub, list) and len(psub) >= 2 and _sym(psub[0]) == "net":
+                            _, pad_net_name = _parse_net_ref(psub, {}, {})
+                            if pad_net_name:
+                                pad_net_names.add(pad_net_name)
             elif key == "net":
                 net_count += 1
             elif key == "segment":
@@ -98,7 +158,7 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
             "copper_layer_count": len(copper_layers),
             "all_layers": layers,
             "footprint_count": footprint_count,
-            "net_count": max(0, net_count - 1),  # net 0 is always the unconnected net
+            "net_count": max(0, net_count - 1) if net_count else len(pad_net_names),
             "segment_count": segment_count,
             "via_count": via_count,
             "generator": generator,
@@ -375,15 +435,14 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
         """
         data = load_pcb(pcb_path)
 
-        net_id_to_name: Dict[int, str] = {}
-        for item in data:
-            if isinstance(item, list) and len(item) >= 3 and _sym(item[0]) == "net":
-                net_id = int(item[1])
-                net_name = item[2] if isinstance(item[2], str) else _sym(item[2])
-                net_id_to_name[net_id] = net_name
+        net_id_to_name, net_name_to_id = _collect_top_level_nets(data)
+        nets_by_name: Dict[str, Dict[str, Any]] = {}
+        for net_id, net_name in net_id_to_name.items():
+            if net_id == 0 or not net_name:
+                continue
+            nets_by_name[net_name] = {"net_id": net_id, "name": net_name, "pad_count": 0}
 
-        # Count pads per net by scanning footprints
-        pad_counts: Dict[int, int] = defaultdict(int)
+        # Count pads per net by scanning footprints.
         for item in data:
             if not (isinstance(item, list) and len(item) > 0 and _sym(item[0]) == "footprint"):
                 continue
@@ -392,18 +451,18 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
                     continue
                 for psub in sub:
                     if isinstance(psub, list) and len(psub) >= 2 and _sym(psub[0]) == "net":
-                        nid = int(psub[1])
-                        pad_counts[nid] += 1
+                        net_id, net_name = _parse_net_ref(psub, net_name_to_id, net_id_to_name)
+                        if not net_name:
+                            continue
+                        entry = nets_by_name.setdefault(
+                            net_name,
+                            {"net_id": net_id, "name": net_name, "pad_count": 0},
+                        )
+                        if entry["net_id"] is None and net_id is not None:
+                            entry["net_id"] = net_id
+                        entry["pad_count"] += 1
 
-        nets = []
-        for net_id, net_name in sorted(net_id_to_name.items()):
-            if net_id == 0:
-                continue  # skip the unconnected pseudo-net
-            nets.append({
-                "net_id": net_id,
-                "name": net_name,
-                "pad_count": pad_counts.get(net_id, 0),
-            })
+        nets = sorted(nets_by_name.values(), key=_net_sort_key)
 
         return {"nets": nets, "count": len(nets)}
 
@@ -436,17 +495,12 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
         """
         data = load_pcb(pcb_path)
 
-        net_id_to_name: Dict[int, str] = {}
-        for item in data:
-            if isinstance(item, list) and len(item) >= 3 and _sym(item[0]) == "net":
-                net_id_to_name[int(item[1])] = (
-                    item[2] if isinstance(item[2], str) else _sym(item[2])
-                )
+        net_id_to_name, net_name_to_id = _collect_top_level_nets(data)
 
-        # Collect all pads grouped by net_id with correct world coordinates
+        # Collect all pads grouped by net key with correct world coordinates.
         # (apply footprint rotation using KiCad's clockwise-positive convention)
         import math
-        pads_by_net: Dict[int, List[Tuple]] = defaultdict(list)
+        pads_by_net: Dict[str, List[Tuple]] = defaultdict(list)
         for item in data:
             if not (isinstance(item, list) and len(item) > 0 and _sym(item[0]) == "footprint"):
                 continue
@@ -460,7 +514,7 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
                     continue
                 pad_num = sub[1] if isinstance(sub[1], str) else _sym(sub[1])
                 rel_x, rel_y = 0.0, 0.0
-                net_id = None
+                net_key = ""
                 for psub in sub:
                     if isinstance(psub, list) and len(psub) >= 3 and _sym(psub[0]) == "at":
                         try:
@@ -468,18 +522,19 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
                         except (ValueError, TypeError):
                             pass
                     elif isinstance(psub, list) and len(psub) >= 2 and _sym(psub[0]) == "net":
-                        try:
-                            net_id = int(psub[1])
-                        except (ValueError, TypeError):
-                            pass
-                if net_id is not None and net_id != 0:
+                        net_id, net_name = _parse_net_ref(psub, net_name_to_id, net_id_to_name)
+                        if net_id == 0 and not net_name:
+                            net_key = ""
+                        else:
+                            net_key = net_name or (str(net_id) if net_id is not None else "")
+                if net_key:
                     # KiCad rotation is clockwise-positive; transform to world coords
                     abs_x = fp_x + rel_x * cos_t + rel_y * sin_t
                     abs_y = fp_y - rel_x * sin_t + rel_y * cos_t
-                    pads_by_net[net_id].append((ref, str(pad_num), abs_x, abs_y))
+                    pads_by_net[net_key].append((ref, str(pad_num), abs_x, abs_y))
 
-        # Build track endpoint set keyed by (net_id, rounded_x, rounded_y)
-        # so track endpoints from one net cannot falsely mark another net connected
+        # Build track endpoint set keyed by (net_key, rounded_x, rounded_y)
+        # so track endpoints from one net cannot falsely mark another net connected.
         track_endpoints: set = set()
         _TOLERANCE = 0.01  # mm
 
@@ -491,32 +546,36 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
                 continue
             key = _sym(item[0])
             if key in ("segment", "via"):
-                # Read the net id for this segment/via
-                seg_net: Optional[int] = None
+                # Read the net reference for this segment/via.
+                seg_net_key = ""
                 for sub in item:
                     if isinstance(sub, list) and len(sub) >= 2 and _sym(sub[0]) == "net":
-                        try:
-                            seg_net = int(sub[1])
-                        except (ValueError, TypeError):
-                            pass
+                        seg_net_id, seg_net_name = _parse_net_ref(sub, net_name_to_id, net_id_to_name)
+                        if seg_net_id == 0 and not seg_net_name:
+                            seg_net_key = ""
+                        else:
+                            seg_net_key = seg_net_name or (
+                                str(seg_net_id) if seg_net_id is not None else ""
+                            )
                 for sub in item:
                     if isinstance(sub, list) and len(sub) >= 3 and _sym(sub[0]) in ("start", "end", "at"):
                         try:
-                            track_endpoints.add((seg_net, _rounded(float(sub[1])), _rounded(float(sub[2]))))
+                            track_endpoints.add(
+                                (seg_net_key, _rounded(float(sub[1])), _rounded(float(sub[2])))
+                            )
                         except (ValueError, TypeError):
                             pass
 
         # For each net with ≥2 pads, report ALL pairs where neither pad
         # has a track endpoint at its position (simple heuristic)
         unconnected = []
-        for net_id, pad_list in sorted(pads_by_net.items()):
+        for net_name, pad_list in sorted(pads_by_net.items()):
             if len(pad_list) < 2:
                 continue
-            net_name = net_id_to_name.get(net_id, str(net_id))
             connected_indices = {
                 i
                 for i, (_, _, px, py) in enumerate(pad_list)
-                if (net_id, _rounded(px), _rounded(py)) in track_endpoints
+                if (net_name, _rounded(px), _rounded(py)) in track_endpoints
             }
             disconnected = [p for i, p in enumerate(pad_list) if i not in connected_indices]
             # Report all disconnected pairs (not just first)
