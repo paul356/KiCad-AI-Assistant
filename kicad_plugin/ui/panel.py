@@ -415,40 +415,38 @@ if _WX_AVAILABLE:
                 })
 
             # 2) IPC socket check ------------------------------------------
-            socket_url = os.environ.get("KICAD_API_SOCKET")
-            if socket_url:
-                # Strip ipc:// prefix if present, check filesystem path
-                socket_path = socket_url[len("ipc://"):] if socket_url.startswith("ipc://") else socket_url
-                socket_exists = os.path.exists(socket_path) or platform.system() == "Windows"
-                checked_path = socket_url
-            elif platform.system() == "Windows":
-                # Windows uses a named pipe — can't easily stat it
-                temp_dir = gettempdir()
-                checked_path = f"{temp_dir}\\kicad\\api.sock"
-                log.info("Windows socket check: tempdir=%s, path=%s", temp_dir, checked_path)
-                socket_exists = os.path.exists(checked_path)
-                log.info("Windows socket exists: %s", socket_exists)
-            else:
-                # Glob for api*.sock (covers api.sock and api-<pid>.sock).
-                # Try flatpak directory first, then standard /tmp/kicad.
-                home = os.environ.get("HOME", "")
-                candidate_dirs = []
-                if home:
-                    candidate_dirs.append(f"{home}/.var/app/org.kicad.KiCad/cache/tmp/kicad")
-                candidate_dirs.append("/tmp/kicad")
-
-                socket_exists = False
-                checked_path = "/tmp/kicad/api.sock"  # fallback for error message
-                for sock_dir in candidate_dirs:
-                    matches = glob.glob(os.path.join(sock_dir, "api*.sock"))
-                    if matches:
-                        # Report the newest socket found
-                        checked_path = max(matches, key=os.path.getmtime)
-                        socket_exists = True
-                        break
-                if not socket_exists:
-                    checked_path = "/tmp/kicad/api.sock"
-
+            # Simple file existence check for Unix systems
+            # On Windows, we skip the check since named pipes can't be easily verified
+            # The actual tools will provide clear error messages if the socket is unavailable
+            socket_exists = True  # Assume available unless proven otherwise
+            checked_path = "unknown"
+            
+            if platform.system() != "Windows":
+                # Unix: check if socket file exists
+                socket_url = os.environ.get("KICAD_API_SOCKET")
+                if socket_url:
+                    # Strip ipc:// prefix if present
+                    socket_path = socket_url[len("ipc://"):] if socket_url.startswith("ipc://") else socket_url
+                    socket_exists = os.path.exists(socket_path)
+                    checked_path = socket_url
+                else:
+                    # Check default locations
+                    home = os.environ.get("HOME", "")
+                    candidate_paths = []
+                    if home:
+                        candidate_paths.append(f"{home}/.var/app/org.kicad.KiCad/cache/tmp/kicad/api.sock")
+                    candidate_paths.append("/tmp/kicad/api.sock")
+                    
+                    socket_exists = False
+                    for path in candidate_paths:
+                        if os.path.exists(path):
+                            socket_exists = True
+                            checked_path = path
+                            break
+                    
+                    if not socket_exists:
+                        checked_path = "/tmp/kicad/api.sock"
+            
             if not socket_exists:
                 self._conv_entries.append({
                     "type": "status",
