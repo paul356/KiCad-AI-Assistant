@@ -463,6 +463,7 @@ def register_pcb_zone_tools(mcp: FastMCP) -> None:
         instance.
 
         The operation blocks until the refill is complete (up to 30 seconds).
+        The board is automatically saved after the refill completes.
 
         Returns:
             dict with keys:
@@ -476,6 +477,7 @@ def register_pcb_zone_tools(mcp: FastMCP) -> None:
             if board is None:
                 return {"success": False, "error": "No board is currently open in KiCad"}
             board.refill_zones(block=True, max_poll_seconds=30.0)
+            board.save()
             return {"success": True}
         except RuntimeError as exc:
             return {"success": False, "error": str(exc)}
