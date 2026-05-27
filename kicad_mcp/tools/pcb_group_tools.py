@@ -403,9 +403,10 @@ def _choose_rotation_for_connection(
         ideal_fp_cy = anchor_bbox["min_y"] - gap - member_cy_half_height
     
     # Convert ideal footprint center to ideal pad position
+    # Y-down CCW rotation: x' = x*cos + y*sin, y' = -x*sin + y*cos
     rot_rad = math.radians(best_rot)
-    rotated_pad_lx = member_pad_lx * math.cos(rot_rad) - member_pad_ly * math.sin(rot_rad)
-    rotated_pad_ly = member_pad_lx * math.sin(rot_rad) + member_pad_ly * math.cos(rot_rad)
+    rotated_pad_lx = member_pad_lx * math.cos(rot_rad) + member_pad_ly * math.sin(rot_rad)
+    rotated_pad_ly = -member_pad_lx * math.sin(rot_rad) + member_pad_ly * math.cos(rot_rad)
     ideal_pad_x = ideal_fp_cx + rotated_pad_lx
     ideal_pad_y = ideal_fp_cy + rotated_pad_ly
     
