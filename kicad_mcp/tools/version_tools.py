@@ -75,6 +75,7 @@ def register_version_tools(mcp: FastMCP) -> None:
         Returns:
             A dict with keys:
               - ``success`` (bool)
+              - ``current`` (dict): Current file info with ``timestamp`` and ``size_bytes``.
               - ``versions`` (list): List of version dicts, newest first.
                 Each entry has ``id``, ``timestamp``, and ``size_bytes``.
               - ``count`` (int): Number of available versions
@@ -84,7 +85,16 @@ def register_version_tools(mcp: FastMCP) -> None:
         except OSError as exc:
             return {"error": f"Failed to list versions: {exc}"}
 
-        return {"success": True, "versions": versions, "count": len(versions)}
+        current = None
+        if os.path.isfile(file_path):
+            from datetime import datetime
+            stat = os.stat(file_path)
+            current = {
+                "timestamp": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
+                "size_bytes": stat.st_size,
+            }
+
+        return {"success": True, "current": current, "versions": versions, "count": len(versions)}
 
     @mcp.tool()
     async def restore_file_version(
