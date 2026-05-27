@@ -243,32 +243,56 @@ def register_kipy_tools(mcp: FastMCP) -> None:
             return {"success": False, "error": str(exc)}
 
     # ------------------------------------------------------------------
-    # save_board
+    # save_document
     # ------------------------------------------------------------------
 
     @mcp.tool()
-    async def save_board(ctx: Context | None = None) -> dict:
-        """Save the currently open PCB in KiCad.
+    async def save_document(file_path: str, ctx: Context | None = None) -> dict:
+        """Save the currently open document (PCB or schematic) in KiCad.
 
         Uses the IPC API to trigger KiCad's save operation, which writes
-        the board to disk and clears the modified (dirty) flag in the UI.
+        the document to disk and clears the modified (dirty) flag in the UI.
+        The document type is determined by the file extension.
+
+        Args:
+            file_path: Path to the document file (.kicad_pcb or .kicad_sch).
 
         Returns:
             dict with keys:
                 success (bool): True if the save succeeded.
+                document_type (str): Type of document saved ("pcb" or "schematic").
                 error (str): Present only if the save failed.
         """
         try:
             kicad = _connect(timeout_ms=10000)
-            board = kicad.get_board()
-            if board is None:
-                return {"success": False, "error": "No board is currently open in KiCad"}
-            board.save()
-            return {"success": True}
+
+            if file_path.endswith(".kicad_pcb"):
+                from kipy.proto.common.types import DocumentType  # noqa: PLC0415
+                from kipy.board import Board  # noqa: PLC0415
+                docs = kicad.get_open_documents(DocumentType.DOCTYPE_PCB)
+                if not docs:
+                    return {"success": False, "error": "No PCB is currently open in KiCad"}
+                board = Board(kicad._client, docs[0])
+                board.save()
+                return {"success": True, "document_type": "pcb"}
+
+            elif file_path.endswith(".kicad_sch"):
+                from kipy.proto.common.types import DocumentType  # noqa: PLC0415
+                from kipy.schematic import Schematic  # noqa: PLC0415
+                docs = kicad.get_open_documents(DocumentType.DOCTYPE_SCHEMATIC)
+                if not docs:
+                    return {"success": False, "error": "No schematic is currently open in KiCad"}
+                schematic = Schematic(kicad._client, docs[0])
+                schematic.save()
+                return {"success": True, "document_type": "schematic"}
+
+            else:
+                return {"success": False, "error": f"Unsupported file type: {file_path}"}
+
         except RuntimeError as exc:
             return {"success": False, "error": str(exc)}
         except Exception as exc:
-            log.exception("Unexpected error in save_board")
+            log.exception("Unexpected error in save_document")
             return {"success": False, "error": str(exc)}
 
     # ------------------------------------------------------------------

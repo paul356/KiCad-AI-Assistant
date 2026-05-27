@@ -820,6 +820,22 @@ class LLMClient:
                     ),
                 }
             if path not in state.snapshotted_paths:
+                # Save the document in KiCad first to sync in-memory changes
+                # (e.g. from IPC operations) to disk before taking a snapshot.
+                save_args = {"file_path": path}
+                save_result = call_mcp_tool(
+                    self._mcp_base_url, "save_document", save_args
+                )
+                self._emit_tool_callback(
+                    on_tool_call, "save_document", save_args, save_result
+                )
+                if not self._tool_result_succeeded(save_result):
+                    log.warning(
+                        "save_document failed before %s: %s",
+                        tool_name,
+                        save_result.get("error", "unknown error"),
+                    )
+
                 snapshot_args = {"file_path": path}
                 snapshot_result = call_mcp_tool(
                     self._mcp_base_url, "save_file_version", snapshot_args

@@ -464,7 +464,7 @@ if _WX_AVAILABLE:
 
             KiCad marks the PCB editor as dirty when the plugin is opened,
             so we save it immediately to clear the dirty state.
-            Uses the save_board MCP tool via IPC for proper state management.
+            Uses the save_document MCP tool via IPC for proper state management.
             
             This MUST run on a background thread to avoid blocking the KiCad
             main thread, which would prevent KiCad from responding to IPC
@@ -472,18 +472,29 @@ if _WX_AVAILABLE:
             """
             def _do_auto_save():
                 try:
+                    import pcbnew as _pcbnew
+                    board = _pcbnew.GetBoard()
+                    if not board:
+                        log.debug("Auto-save: no board open")
+                        return
+                    
+                    file_path = board.GetFileName()
+                    if not file_path:
+                        log.debug("Auto-save: board has no file path")
+                        return
+                    
                     from ..llm_client import call_mcp_tool
                     result = call_mcp_tool(
                         self._server_mgr.base_url,
-                        "save_board",
-                        {},
+                        "save_document",
+                        {"file_path": file_path},
                     )
                     if result.get("success"):
-                        log.info("Auto-saved PCB on plugin open via save_board tool")
+                        log.info("Auto-saved document on plugin open via save_document tool")
                     else:
-                        log.debug("Auto-save PCB failed: %s", result.get("error", "unknown"))
+                        log.debug("Auto-save document failed: %s", result.get("error", "unknown"))
                 except Exception as exc:
-                    log.debug("Auto-save PCB skipped or failed: %s", exc)
+                    log.debug("Auto-save document skipped or failed: %s", exc)
 
             t = threading.Thread(target=_do_auto_save, daemon=True)
             t.start()
