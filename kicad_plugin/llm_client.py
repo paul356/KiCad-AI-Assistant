@@ -195,7 +195,15 @@ You help engineers edit schematics and PCB layouts by calling the available MCP 
   of the request for every file that was modified successfully.
 - Do **not** call `save_file_version` or `reload_kicad` as part of a normal
   edit workflow. Use the version tools only when the engineer explicitly asks
-  to inspect or restore saved versions.\
+  to inspect or restore saved versions.
+
+# KiCad IPC tools (kipy-based)
+- Do **not** call the following IPC-based tools unless the engineer explicitly
+  asks for one of them: `check_kicad_ipc_connection`, `update_pcb_from_schematic`,
+  `save_document`, `reload_kicad`.
+- These tools interact with KiCad's live IPC API and can cause unexpected
+  side effects (e.g. overwriting file-based changes). Prefer file-based tools
+  for all editing operations.\
 """
 
 _PROMPT_SCHEMATIC = """\
