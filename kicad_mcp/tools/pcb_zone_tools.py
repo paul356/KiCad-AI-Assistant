@@ -452,3 +452,33 @@ def register_pcb_zone_tools(mcp: FastMCP) -> None:
             "backup_path": backup_path,
             "pcb_path": pcb_path,
         }
+
+    @mcp.tool()
+    async def refill_zones(ctx: Context | None = None) -> dict:
+        """Refill all zones (copper pours) on the currently open PCB.
+
+        After adding or modifying zones via file-based tools, call this to
+        trigger KiCad to recalculate the copper fill for all zones. This
+        uses the IPC API to send a RefillZones command to the running KiCad
+        instance.
+
+        The operation blocks until the refill is complete (up to 30 seconds).
+
+        Returns:
+            dict with keys:
+                success (bool): True if the refill succeeded.
+                error (str): Present only if the refill failed.
+        """
+        try:
+            from kicad_mcp.tools.kipy_tools import _connect  # noqa: PLC0415
+            kicad = _connect(timeout_ms=35000)
+            board = kicad.get_board()
+            if board is None:
+                return {"success": False, "error": "No board is currently open in KiCad"}
+            board.refill_zones(block=True, max_poll_seconds=30.0)
+            return {"success": True}
+        except RuntimeError as exc:
+            return {"success": False, "error": str(exc)}
+        except Exception as exc:
+            log.exception("Unexpected error in refill_zones")
+            return {"success": False, "error": str(exc)}
