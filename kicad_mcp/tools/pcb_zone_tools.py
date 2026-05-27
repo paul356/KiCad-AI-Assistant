@@ -462,8 +462,10 @@ def register_pcb_zone_tools(mcp: FastMCP) -> None:
         uses the IPC API to send a RefillZones command to the running KiCad
         instance.
 
-        The operation blocks until the refill is complete (up to 30 seconds).
-        The board is automatically saved after the refill completes.
+        The tool first reverts the board in KiCad to sync with the latest
+        disk state (which includes file-based zone changes), then refills
+        all zones. The operation blocks until the refill is complete (up
+        to 30 seconds).
 
         Returns:
             dict with keys:
@@ -476,7 +478,11 @@ def register_pcb_zone_tools(mcp: FastMCP) -> None:
             board = kicad.get_board()
             if board is None:
                 return {"success": False, "error": "No board is currently open in KiCad"}
+            # Revert first so KiCad's in-memory state matches the disk file
+            # (which may have been modified by file-based tools like add_zone).
+            board.revert()
             board.refill_zones(block=True, max_poll_seconds=30.0)
+            # Save the filled zones back to disk so they persist after reload.
             board.save()
             return {"success": True}
         except RuntimeError as exc:
