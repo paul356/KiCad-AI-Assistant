@@ -199,8 +199,7 @@ You help engineers edit schematics and PCB layouts by calling the available MCP 
 
 # KiCad IPC tools (kipy-based)
 - Do **not** call the following IPC-based tools unless the engineer explicitly
-  asks for one of them: `check_kicad_ipc_connection`, `update_pcb_from_schematic`,
-  `save_document`, `reload_kicad`.
+  asks for one of them: `check_kicad_ipc_connection`, `save_document`, `reload_kicad`.
 - These tools interact with KiCad's live IPC API and can cause unexpected
   side effects (e.g. overwriting file-based changes). Prefer file-based tools
   for all editing operations.\
