@@ -49,7 +49,7 @@ def find_kicad_projects() -> list[dict[str, Any]]:
         # Use followlinks=True to follow symlinks if needed
         for root, _, files in os.walk(search_dir, followlinks=True):
             for file in files:
-                if file.endswith(config.KICAD_EXTENSIONS["project"]):
+                if file.endswith(config.kicad_extensions["project"]):
                     project_path = os.path.join(root, file)
                     # Check if it's a real file and not a broken symlink
                     if not os.path.isfile(project_path):
@@ -91,7 +91,7 @@ def get_project_name_from_path(project_path: str) -> str:
         Project name without extension
     """
     basename = os.path.basename(project_path)
-    return basename[: -len(config.KICAD_EXTENSIONS["project"])]
+    return basename[: -len(config.kicad_extensions["project"])]
 
 
 def open_kicad_project(project_path: str) -> dict[str, Any]:
