@@ -347,6 +347,7 @@ class TestRunIntegration:
 
         with patch("kicad_plugin.llm_client.call_mcp_tool") as mock_call_tool:
             mock_call_tool.side_effect = [
+                {"success": True},  # save_document
                 {"success": True, "version_id": "v1"},
                 {"success": True, "pcb_path": "/tmp/board.kicad_pcb"},
                 {"success": True, "reloaded": ["/tmp/board.kicad_pcb"], "failed": []},
@@ -355,6 +356,7 @@ class TestRunIntegration:
 
         assert result == "done"
         assert mock_call_tool.call_args_list == [
+            ((client._mcp_base_url, "save_document", {"file_path": "/tmp/board.kicad_pcb"}),),
             ((client._mcp_base_url, "save_file_version", {"file_path": "/tmp/board.kicad_pcb"}),),
             (
                 (
@@ -366,6 +368,7 @@ class TestRunIntegration:
             ((client._mcp_base_url, "reload_kicad", {"paths": ["/tmp/board.kicad_pcb"]}),),
         ]
         assert [call.args[0] for call in on_tool_call.call_args_list] == [
+            "save_document",
             "save_file_version",
             "set_footprint_position",
             "reload_kicad",
@@ -412,6 +415,7 @@ class TestRunIntegration:
 
         with patch("kicad_plugin.llm_client.call_mcp_tool") as mock_call_tool:
             mock_call_tool.side_effect = [
+                {"success": True},  # save_document
                 {"success": True, "version_id": "v1"},
                 {"success": True, "pcb_path": "/tmp/board.kicad_pcb"},
                 {"success": True, "pcb_path": "/tmp/board.kicad_pcb"},
@@ -421,6 +425,7 @@ class TestRunIntegration:
 
         assert result == "done"
         assert mock_call_tool.call_args_list == [
+            ((client._mcp_base_url, "save_document", {"file_path": "/tmp/board.kicad_pcb"}),),
             ((client._mcp_base_url, "save_file_version", {"file_path": "/tmp/board.kicad_pcb"}),),
             (
                 (
@@ -537,6 +542,7 @@ class TestRunIntegration:
 
         assert result == "done"
         assert mock_call_tool.call_args_list == [
+            ((client._mcp_base_url, "save_document", {"file_path": "/tmp/board.kicad_pcb"}),),
             ((client._mcp_base_url, "save_file_version", {"file_path": "/tmp/board.kicad_pcb"}),),
         ]
         tool_result = json.loads(client._history[-2]["content"])
@@ -628,6 +634,9 @@ class TestToolPolicyRegistry:
             "save_file_version",
             "list_file_versions",
             "restore_file_version",
+            "save_document",
+            "check_kicad_ipc_connection",
+            "refill_zones",
         }
 
         assert set(TOOL_POLICIES) == expected_tools

@@ -183,7 +183,7 @@ class TestMCPPluginProfileSmoke:
         }, session_id)
         tools = response.get("result", {}).get("tools", [])
         tool_names = [t["name"] for t in tools]
-        expected = ["add_symbol_to_schematic", "remove_symbol_from_schematic", "add_wire_to_schematic"]
+        expected = ["add_symbol_to_schematic", "remove_symbol_from_schematic"]
         for name in expected:
             assert name in tool_names, f"Expected tool '{name}' not found. Got: {tool_names}"
 

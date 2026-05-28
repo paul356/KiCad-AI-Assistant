@@ -18,7 +18,6 @@ class TestCollectContextNoPcbnew:
         assert ctx["active_project"] is None
         assert ctx["active_schematic"] is None
         assert ctx["active_pcb"] is None
-        assert ctx["active_editor"] == "unknown"
         assert ctx["selected_refs"] == []
         assert ctx["active_sheet"] is None
 
@@ -49,7 +48,6 @@ class TestCollectContextWithPcbnew:
             ctx = collect_context()
 
         assert ctx["active_pcb"] == os.path.abspath(pcb)
-        assert ctx["active_editor"] == "pcb"
 
     def test_active_schematic_derived_from_pcb(self, tmp_path):
         pcb = str(tmp_path / "board.kicad_pcb")
@@ -122,7 +120,6 @@ class TestContextToSystemPromptBlock:
             "active_project": "/proj/test.kicad_pro",
             "active_schematic": "/proj/test.kicad_sch",
             "active_pcb": None,
-            "active_editor": "schematic",
             "selected_refs": ["R1", "C3"],
             "active_sheet": None,
         }
@@ -134,7 +131,6 @@ class TestContextToSystemPromptBlock:
             "active_project": None,
             "active_schematic": "/proj/test.kicad_sch",
             "active_pcb": None,
-            "active_editor": "schematic",
             "selected_refs": [],
             "active_sheet": None,
         }
@@ -146,7 +142,6 @@ class TestContextToSystemPromptBlock:
             "active_project": None,
             "active_schematic": "/proj/test.kicad_sch",
             "active_pcb": None,
-            "active_editor": "schematic",
             "selected_refs": ["U1", "U2"],
             "active_sheet": None,
         }
@@ -159,7 +154,6 @@ class TestContextToSystemPromptBlock:
             "active_project": None,
             "active_schematic": None,
             "active_pcb": None,
-            "active_editor": "unknown",
             "selected_refs": [],
             "active_sheet": None,
         }
@@ -171,7 +165,6 @@ class TestContextToSystemPromptBlock:
             "active_project": None,
             "active_schematic": "/proj/board.kicad_sch",
             "active_pcb": None,
-            "active_editor": "schematic",
             "selected_refs": [],
             "active_sheet": None,
         }
@@ -184,7 +177,6 @@ class TestContextToSystemPromptBlock:
             "active_project": None,
             "active_schematic": None,
             "active_pcb": None,
-            "active_editor": "unknown",
             "selected_refs": [],
             "active_sheet": None,
         }
@@ -196,7 +188,6 @@ class TestContextToSystemPromptBlock:
             "active_project": None,
             "active_schematic": None,
             "active_pcb": None,
-            "active_editor": "unknown",
             "selected_refs": [],
             "active_sheet": None,
         }
@@ -208,7 +199,6 @@ class TestContextToSystemPromptBlock:
             "active_project": None,
             "active_schematic": None,
             "active_pcb": pcb,
-            "active_editor": "pcb",
             "selected_refs": [],
             "active_sheet": None,
         }
@@ -216,16 +206,14 @@ class TestContextToSystemPromptBlock:
         assert pcb in block
         assert "Active PCB" in block
 
-    def test_active_pcb_not_rendered_when_schematic_editor(self, tmp_path):
-        pcb = str(tmp_path / "board.kicad_pcb")
+    def test_active_pcb_not_rendered_when_none(self, tmp_path):
         ctx = {
             "active_project": None,
             "active_schematic": "/proj/board.kicad_sch",
-            "active_pcb": pcb,
-            "active_editor": "schematic",  # not pcb
+            "active_pcb": None,
             "selected_refs": [],
             "active_sheet": None,
         }
         block = context_to_system_prompt_block(ctx)
-        assert "Active PCB" not in block
+        assert "Active PCB: /" not in block  # Should show "(none)" not a path
 

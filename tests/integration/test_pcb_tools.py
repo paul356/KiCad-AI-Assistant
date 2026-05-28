@@ -344,8 +344,8 @@ class TestSetFootprintPosition:
             "rotation": None,
         })
         assert "error" not in result, result
-        assert abs(result["new"]["x"] - 50.0) < 0.001
-        assert abs(result["new"]["y"] - 60.0) < 0.001
+        assert abs(result["placed_at"]["x"] - 50.0) < 0.001
+        assert abs(result["placed_at"]["y"] - 60.0) < 0.001
 
     def test_preserves_unchanged_axis(self, mcp_server, tmp_path):
         port, sid = mcp_server
@@ -360,7 +360,7 @@ class TestSetFootprintPosition:
         })
         assert "error" not in result
         # y must be unchanged from fixture value (20.0)
-        assert abs(result["new"]["y"] - 20.0) < 0.001
+        assert abs(result["placed_at"]["y"] - 20.0) < 0.001
 
     def test_creates_backup_file(self, mcp_server, tmp_path):
         port, sid = mcp_server
@@ -389,8 +389,8 @@ class TestSetFootprintPosition:
             "rotation": None,
         })
         assert "error" not in result
-        assert abs(result["previous"]["x"] - 10.0) < 0.001
-        assert abs(result["previous"]["y"] - 20.0) < 0.001
+        assert abs(result["moved_from"]["x"] - 10.0) < 0.001
+        assert abs(result["moved_from"]["y"] - 20.0) < 0.001
 
     def test_missing_reference_returns_error(self, mcp_server, tmp_path):
         port, sid = mcp_server

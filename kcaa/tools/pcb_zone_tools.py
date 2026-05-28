@@ -75,7 +75,7 @@ def _parse_zone(node: List[Any]) -> dict[str, Any]:
             try:
                 result["net"] = int(sub[1])
             except (IndexError, ValueError, TypeError):
-                if len(sub) >= 2:
+                if len(sub) >= 2 and sub[1] != "":
                     result["net"] = None
                     result["net_name"] = sub[1] if isinstance(sub[1], str) else _sym(sub[1])
         elif key == "net_name":
