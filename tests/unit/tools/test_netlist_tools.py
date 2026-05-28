@@ -1,5 +1,5 @@
 """
-Unit tests for kicad_mcp/tools/netlist_tools.py.
+Unit tests for kcaa/tools/netlist_tools.py.
 
 Mocks extract_netlist and get_project_files so tests are self-contained.
 """
@@ -30,7 +30,7 @@ class _MockMCP:
 
 def _get_tools() -> dict:
     """Register netlist tools against a mock MCP and return the captured dict."""
-    from kicad_mcp.tools.netlist_tools import register_netlist_tools
+    from kcaa.tools.netlist_tools import register_netlist_tools
     mock = _MockMCP()
     register_netlist_tools(mock)
     return mock.tools
@@ -123,35 +123,35 @@ class TestExtractProjectNetlist:
         self.tools = _get_tools()
         self.fn = self.tools["extract_project_netlist"]
 
-    @patch("kicad_mcp.tools.netlist_tools.os.path.exists", return_value=False)
+    @patch("kcaa.tools.netlist_tools.os.path.exists", return_value=False)
     def test_project_not_found(self, mock_exists):
         result = _run(self.fn("/nonexistent/project.kicad_pro", ctx=None))
         assert result["success"] is False
         assert "Project not found" in result["error"]
 
-    @patch("kicad_mcp.tools.netlist_tools.os.path.exists", return_value=True)
-    @patch("kicad_mcp.tools.netlist_tools.get_project_files", return_value={})
+    @patch("kcaa.tools.netlist_tools.os.path.exists", return_value=True)
+    @patch("kcaa.tools.netlist_tools.get_project_files", return_value={})
     def test_schematic_not_in_project(self, mock_files, mock_exists):
         result = _run(self.fn("/some/project.kicad_pro", ctx=None))
         assert result["success"] is False
         assert "Schematic file not found" in result["error"]
 
-    @patch("kicad_mcp.tools.netlist_tools.os.path.exists", return_value=True)
+    @patch("kcaa.tools.netlist_tools.os.path.exists", return_value=True)
     @patch(
-        "kicad_mcp.tools.netlist_tools.get_project_files",
+        "kcaa.tools.netlist_tools.get_project_files",
         return_value={"schematic": "/some/project.kicad_sch"},
     )
-    @patch("kicad_mcp.tools.netlist_tools.os.path.exists", return_value=True)
-    @patch("kicad_mcp.tools.netlist_tools.extract_netlist", return_value=SAMPLE_NETLIST)
+    @patch("kcaa.tools.netlist_tools.os.path.exists", return_value=True)
+    @patch("kcaa.tools.netlist_tools.extract_netlist", return_value=SAMPLE_NETLIST)
     def test_success_delegates_to_schematic_netlist(self, mock_extract, mock_exists2, mock_files, mock_exists):
         result = _run(self.fn("/some/project.kicad_pro", ctx=None))
         assert result["success"] is True
         assert result["project_path"] == "/some/project.kicad_pro"
         assert "analysis" in result
 
-    @patch("kicad_mcp.tools.netlist_tools.os.path.exists", return_value=True)
+    @patch("kcaa.tools.netlist_tools.os.path.exists", return_value=True)
     @patch(
-        "kicad_mcp.tools.netlist_tools.get_project_files",
+        "kcaa.tools.netlist_tools.get_project_files",
         side_effect=RuntimeError("corrupt project"),
     )
     def test_exception_in_get_project_files(self, mock_files, mock_exists):
@@ -170,15 +170,15 @@ class TestExtractSchematicNetlist:
         self.tools = _get_tools()
         self.fn = self.tools["extract_schematic_netlist"]
 
-    @patch("kicad_mcp.tools.netlist_tools.os.path.exists", return_value=False)
+    @patch("kcaa.tools.netlist_tools.os.path.exists", return_value=False)
     def test_schematic_file_not_found(self, mock_exists):
         result = _run(self.fn("/nonexistent/design.kicad_sch", ctx=None))
         assert result["success"] is False
         assert "Schematic file not found" in result["error"]
 
-    @patch("kicad_mcp.tools.netlist_tools.os.path.exists", return_value=True)
+    @patch("kcaa.tools.netlist_tools.os.path.exists", return_value=True)
     @patch(
-        "kicad_mcp.tools.netlist_tools.extract_netlist",
+        "kcaa.tools.netlist_tools.extract_netlist",
         return_value={"error": "parse failed"},
     )
     def test_extract_netlist_returns_error(self, mock_extract, mock_exists):
@@ -186,8 +186,8 @@ class TestExtractSchematicNetlist:
         assert result["success"] is False
         assert "parse failed" in result["error"]
 
-    @patch("kicad_mcp.tools.netlist_tools.os.path.exists", return_value=True)
-    @patch("kicad_mcp.tools.netlist_tools.extract_netlist", return_value=SAMPLE_NETLIST)
+    @patch("kcaa.tools.netlist_tools.os.path.exists", return_value=True)
+    @patch("kcaa.tools.netlist_tools.extract_netlist", return_value=SAMPLE_NETLIST)
     def test_basic_extraction(self, mock_extract, mock_exists):
         result = _run(self.fn("/some/design.kicad_sch", ctx=None))
         assert result["success"] is True
@@ -199,16 +199,16 @@ class TestExtractSchematicNetlist:
         assert "R2" in analysis["components"]
         assert "C1" in analysis["components"]
 
-    @patch("kicad_mcp.tools.netlist_tools.os.path.exists", return_value=True)
-    @patch("kicad_mcp.tools.netlist_tools.extract_netlist", return_value=SAMPLE_NETLIST)
+    @patch("kcaa.tools.netlist_tools.os.path.exists", return_value=True)
+    @patch("kcaa.tools.netlist_tools.extract_netlist", return_value=SAMPLE_NETLIST)
     def test_component_types_classification(self, mock_extract, mock_exists):
         result = _run(self.fn("/some/design.kicad_sch", ctx=None))
         types = result["analysis"]["component_types"]
         assert types["R"] == 2
         assert types["C"] == 1
 
-    @patch("kicad_mcp.tools.netlist_tools.os.path.exists", return_value=True)
-    @patch("kicad_mcp.tools.netlist_tools.extract_netlist", return_value=SAMPLE_NETLIST)
+    @patch("kcaa.tools.netlist_tools.os.path.exists", return_value=True)
+    @patch("kcaa.tools.netlist_tools.extract_netlist", return_value=SAMPLE_NETLIST)
     def test_power_net_classification(self, mock_extract, mock_exists):
         result = _run(self.fn("/some/design.kicad_sch", ctx=None))
         power_names = [n["name"] for n in result["analysis"]["power_nets"]]
@@ -217,8 +217,8 @@ class TestExtractSchematicNetlist:
         assert "Net-(R1-Pad1)" in signal_names
         assert "GND" not in signal_names
 
-    @patch("kicad_mcp.tools.netlist_tools.os.path.exists", return_value=True)
-    @patch("kicad_mcp.tools.netlist_tools.extract_netlist")
+    @patch("kcaa.tools.netlist_tools.os.path.exists", return_value=True)
+    @patch("kcaa.tools.netlist_tools.extract_netlist")
     def test_floating_net_detection(self, mock_extract, mock_exists):
         netlist = {
             **SAMPLE_NETLIST,
@@ -232,8 +232,8 @@ class TestExtractSchematicNetlist:
         floating = result["analysis"]["floating_nets"]
         assert any(f["net"] == "Net-Floating" for f in floating)
 
-    @patch("kicad_mcp.tools.netlist_tools.os.path.exists", return_value=True)
-    @patch("kicad_mcp.tools.netlist_tools.extract_netlist", return_value=SAMPLE_NETLIST)
+    @patch("kcaa.tools.netlist_tools.os.path.exists", return_value=True)
+    @patch("kcaa.tools.netlist_tools.extract_netlist", return_value=SAMPLE_NETLIST)
     def test_pin_to_net_mapping(self, mock_extract, mock_exists):
         result = _run(self.fn("/some/design.kicad_sch", ctx=None))
         r1_pins = result["analysis"]["components"]["R1"]["pins"]
@@ -241,8 +241,8 @@ class TestExtractSchematicNetlist:
         assert pin_nets["2"] == "GND"
         assert pin_nets["1"] == "Net-(R1-Pad1)"
 
-    @patch("kicad_mcp.tools.netlist_tools.os.path.exists", return_value=True)
-    @patch("kicad_mcp.tools.netlist_tools.extract_netlist", return_value=SAMPLE_NETLIST)
+    @patch("kcaa.tools.netlist_tools.os.path.exists", return_value=True)
+    @patch("kcaa.tools.netlist_tools.extract_netlist", return_value=SAMPLE_NETLIST)
     def test_wire_topology_included(self, mock_extract, mock_exists):
         result = _run(self.fn("/some/design.kicad_sch", include_wire_topology=True, ctx=None))
         assert "wires" in result["analysis"]
@@ -255,15 +255,15 @@ class TestExtractSchematicNetlist:
         assert "pins" in wire["start"]
         assert "pins" in wire["end"]
 
-    @patch("kicad_mcp.tools.netlist_tools.os.path.exists", return_value=True)
-    @patch("kicad_mcp.tools.netlist_tools.extract_netlist", return_value=SAMPLE_NETLIST)
+    @patch("kcaa.tools.netlist_tools.os.path.exists", return_value=True)
+    @patch("kcaa.tools.netlist_tools.extract_netlist", return_value=SAMPLE_NETLIST)
     def test_wire_topology_excluded_by_default(self, mock_extract, mock_exists):
         result = _run(self.fn("/some/design.kicad_sch", ctx=None))
         assert "wires" not in result["analysis"]
 
-    @patch("kicad_mcp.tools.netlist_tools.os.path.exists", return_value=True)
+    @patch("kcaa.tools.netlist_tools.os.path.exists", return_value=True)
     @patch(
-        "kicad_mcp.tools.netlist_tools.extract_netlist",
+        "kcaa.tools.netlist_tools.extract_netlist",
         side_effect=RuntimeError("corrupt file"),
     )
     def test_extract_netlist_exception(self, mock_extract, mock_exists):
@@ -282,26 +282,26 @@ class TestFindComponentConnections:
         self.tools = _get_tools()
         self.fn = self.tools["find_component_connections"]
 
-    @patch("kicad_mcp.tools.netlist_tools.os.path.exists", return_value=False)
+    @patch("kcaa.tools.netlist_tools.os.path.exists", return_value=False)
     def test_project_not_found(self, mock_exists):
         result = _run(self.fn("/nonexistent/project.kicad_pro", "R1", ctx=None))
         assert result["success"] is False
         assert "Project not found" in result["error"]
 
-    @patch("kicad_mcp.tools.netlist_tools.os.path.exists", return_value=True)
-    @patch("kicad_mcp.tools.netlist_tools.get_project_files", return_value={})
+    @patch("kcaa.tools.netlist_tools.os.path.exists", return_value=True)
+    @patch("kcaa.tools.netlist_tools.get_project_files", return_value={})
     def test_schematic_not_in_project(self, mock_files, mock_exists):
         result = _run(self.fn("/some/project.kicad_pro", "R1", ctx=None))
         assert result["success"] is False
         assert "Schematic file not found" in result["error"]
 
-    @patch("kicad_mcp.tools.netlist_tools.os.path.exists", return_value=True)
+    @patch("kcaa.tools.netlist_tools.os.path.exists", return_value=True)
     @patch(
-        "kicad_mcp.tools.netlist_tools.get_project_files",
+        "kcaa.tools.netlist_tools.get_project_files",
         return_value={"schematic": "/some/project.kicad_sch"},
     )
     @patch(
-        "kicad_mcp.tools.netlist_tools.extract_netlist",
+        "kcaa.tools.netlist_tools.extract_netlist",
         return_value={"error": "parse error"},
     )
     def test_extract_netlist_error(self, mock_extract, mock_files, mock_exists):
@@ -309,24 +309,24 @@ class TestFindComponentConnections:
         assert result["success"] is False
         assert "parse error" in result["error"]
 
-    @patch("kicad_mcp.tools.netlist_tools.os.path.exists", return_value=True)
+    @patch("kcaa.tools.netlist_tools.os.path.exists", return_value=True)
     @patch(
-        "kicad_mcp.tools.netlist_tools.get_project_files",
+        "kcaa.tools.netlist_tools.get_project_files",
         return_value={"schematic": "/some/project.kicad_sch"},
     )
-    @patch("kicad_mcp.tools.netlist_tools.extract_netlist", return_value=SAMPLE_NETLIST)
+    @patch("kcaa.tools.netlist_tools.extract_netlist", return_value=SAMPLE_NETLIST)
     def test_component_not_found(self, mock_extract, mock_files, mock_exists):
         result = _run(self.fn("/some/project.kicad_pro", "U99", ctx=None))
         assert result["success"] is False
         assert "U99" in result["error"]
         assert "available_components" in result
 
-    @patch("kicad_mcp.tools.netlist_tools.os.path.exists", return_value=True)
+    @patch("kcaa.tools.netlist_tools.os.path.exists", return_value=True)
     @patch(
-        "kicad_mcp.tools.netlist_tools.get_project_files",
+        "kcaa.tools.netlist_tools.get_project_files",
         return_value={"schematic": "/some/project.kicad_sch"},
     )
-    @patch("kicad_mcp.tools.netlist_tools.extract_netlist", return_value=SAMPLE_NETLIST)
+    @patch("kcaa.tools.netlist_tools.extract_netlist", return_value=SAMPLE_NETLIST)
     def test_component_found_with_connections(self, mock_extract, mock_files, mock_exists):
         result = _run(self.fn("/some/project.kicad_pro", "R1", ctx=None))
         assert result["success"] is True
@@ -335,12 +335,12 @@ class TestFindComponentConnections:
         assert len(result["connected_nets"]) > 0
         assert "GND" in result["connected_nets"]
 
-    @patch("kicad_mcp.tools.netlist_tools.os.path.exists", return_value=True)
+    @patch("kcaa.tools.netlist_tools.os.path.exists", return_value=True)
     @patch(
-        "kicad_mcp.tools.netlist_tools.get_project_files",
+        "kcaa.tools.netlist_tools.get_project_files",
         return_value={"schematic": "/some/project.kicad_sch"},
     )
-    @patch("kicad_mcp.tools.netlist_tools.extract_netlist")
+    @patch("kcaa.tools.netlist_tools.extract_netlist")
     def test_pin_function_classification(self, mock_extract, mock_files, mock_exists):
         netlist = {
             **SAMPLE_NETLIST,
@@ -374,12 +374,12 @@ class TestFindComponentConnections:
         assert pf["4"]["type"] == "output"
         assert pf["5"]["type"] == "io"
 
-    @patch("kicad_mcp.tools.netlist_tools.os.path.exists", return_value=True)
+    @patch("kcaa.tools.netlist_tools.os.path.exists", return_value=True)
     @patch(
-        "kicad_mcp.tools.netlist_tools.get_project_files",
+        "kcaa.tools.netlist_tools.get_project_files",
         return_value={"schematic": "/some/project.kicad_sch"},
     )
-    @patch("kicad_mcp.tools.netlist_tools.extract_netlist")
+    @patch("kcaa.tools.netlist_tools.extract_netlist")
     def test_component_with_no_connections(self, mock_extract, mock_files, mock_exists):
         netlist = {
             "component_count": 1,

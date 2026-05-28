@@ -22,10 +22,10 @@ import shutil
 
 import pytest
 
-from kicad_mcp.utils.pcb_sexp_utils import load_pcb
-from kicad_mcp.utils.pcb_footprint_utils import find_footprint, get_fp_at
-from kicad_mcp.utils.pcb_board_utils import get_fp_courtyard_bbox
-from kicad_mcp.tools.pcb_placement_helpers import (
+from kcaa.utils.pcb_sexp_utils import load_pcb
+from kcaa.utils.pcb_footprint_utils import find_footprint, get_fp_at
+from kcaa.utils.pcb_board_utils import get_fp_courtyard_bbox
+from kcaa.tools.pcb_placement_helpers import (
     _get_fp_local_pads,
     _get_fp_pads_world,
     _compute_layout_hpwl,
@@ -34,7 +34,7 @@ from kicad_mcp.tools.pcb_placement_helpers import (
     _get_board_bounds_or_fallback,
     _GRID_MM,
 )
-from kicad_mcp.tools.pcb_group_tools import _grid_layout, _rotate_layout
+from kcaa.tools.pcb_group_tools import _grid_layout, _rotate_layout
 
 FIXTURE_PCB = os.path.join(os.path.dirname(__file__), "fixtures", "test_group_placement.kicad_pcb")
 
@@ -57,7 +57,7 @@ class _MockMCP:
 
 
 def _get_tools() -> dict:
-    from kicad_mcp.tools.pcb_group_tools import register_pcb_group_tools
+    from kcaa.tools.pcb_group_tools import register_pcb_group_tools
     mock = _MockMCP()
     register_pcb_group_tools(mock)
     return mock.tools
@@ -380,27 +380,27 @@ class TestGenerateGridCandidates:
 
     def test_anchor_position_included(self):
         """(0, 0) must be in the list so the overlap check can reject it."""
-        from kicad_mcp.tools.pcb_group_tools import _generate_grid_candidates
+        from kcaa.tools.pcb_group_tools import _generate_grid_candidates
         cands = _generate_grid_candidates(5.0)
         assert (0.0, 0.0) in cands
 
     def test_sorted_by_distance_from_origin(self):
         """Candidates are sorted closest-first when center is (0, 0)."""
-        from kicad_mcp.tools.pcb_group_tools import _generate_grid_candidates
+        from kcaa.tools.pcb_group_tools import _generate_grid_candidates
         cands = _generate_grid_candidates(5.0)
         dists = [x * x + y * y for x, y in cands]
         assert dists == sorted(dists)
 
     def test_center_offset_pulls_first_candidate_near_center(self):
         """With center_x=-5, center_y=0 the first candidate is close to (-5, 0)."""
-        from kicad_mcp.tools.pcb_group_tools import _generate_grid_candidates
+        from kcaa.tools.pcb_group_tools import _generate_grid_candidates
         cands = _generate_grid_candidates(10.0, center_x=-5.0, center_y=0.0)
         first = cands[0]
         assert math.hypot(first[0] + 5.0, first[1]) < _GRID_MM * 1.5
 
     def test_sorted_by_distance_from_center(self):
         """Candidates are sorted by distance from the given center."""
-        from kicad_mcp.tools.pcb_group_tools import _generate_grid_candidates
+        from kcaa.tools.pcb_group_tools import _generate_grid_candidates
         cx, cy = -3.81, 2.54
         cands = _generate_grid_candidates(10.0, center_x=cx, center_y=cy)
         dists = [(x - cx) ** 2 + (y - cy) ** 2 for x, y in cands]
@@ -408,14 +408,14 @@ class TestGenerateGridCandidates:
 
     def test_deterministic_for_same_center(self):
         """Two calls with identical parameters return identical lists."""
-        from kicad_mcp.tools.pcb_group_tools import _generate_grid_candidates
+        from kcaa.tools.pcb_group_tools import _generate_grid_candidates
         a = _generate_grid_candidates(8.0, center_x=-2.54, center_y=1.27)
         b = _generate_grid_candidates(8.0, center_x=-2.54, center_y=1.27)
         assert a == b
 
     def test_all_positions_on_grid(self):
         """Every returned position is a multiple of _GRID_MM."""
-        from kicad_mcp.tools.pcb_group_tools import _generate_grid_candidates
+        from kcaa.tools.pcb_group_tools import _generate_grid_candidates
         cands = _generate_grid_candidates(5.0)
         for x, y in cands:
             assert abs(round(x / _GRID_MM) * _GRID_MM - x) < 1e-6, f"{x} not on grid"
@@ -436,7 +436,7 @@ class TestChooseRotationForGrid:
 
     def test_horizontal_zone_prefers_wide_rotation(self, pcb_data):
         """Component to the left/right should be rotated so bbox.width >= bbox.height."""
-        from kicad_mcp.tools.pcb_group_tools import _choose_rotation_for_grid
+        from kcaa.tools.pcb_group_tools import _choose_rotation_for_grid
         mfp = self._wide_fp(pcb_data)
         # Place to the right (cx=10, cy=0) — horizontal zone
         rot = _choose_rotation_for_grid(mfp, cx=10.0, cy=0.0, base_rot=0.0, connecting_pairs=[])
@@ -448,7 +448,7 @@ class TestChooseRotationForGrid:
 
     def test_vertical_zone_prefers_tall_rotation(self, pcb_data):
         """Component above/below should be rotated so bbox.height > bbox.width."""
-        from kicad_mcp.tools.pcb_group_tools import _choose_rotation_for_grid
+        from kcaa.tools.pcb_group_tools import _choose_rotation_for_grid
         mfp = self._wide_fp(pcb_data)
         # Place above (cx=0, cy=-10) — vertical zone (|cy| > |cx|)
         rot = _choose_rotation_for_grid(mfp, cx=0.0, cy=-10.0, base_rot=0.0, connecting_pairs=[])
@@ -460,7 +460,7 @@ class TestChooseRotationForGrid:
 
     def test_returns_one_of_four_candidates(self, pcb_data):
         """Result must be one of the four 90°-step candidates from base_rot."""
-        from kicad_mcp.tools.pcb_group_tools import _choose_rotation_for_grid
+        from kcaa.tools.pcb_group_tools import _choose_rotation_for_grid
         mfp = self._wide_fp(pcb_data)
         base = 45.0
         rot = _choose_rotation_for_grid(mfp, cx=5.0, cy=0.0, base_rot=base, connecting_pairs=[])
@@ -478,7 +478,7 @@ class TestGridLayout:
 
     def test_all_members_placed(self, pcb_data):
         """Every non-anchor member receives a suggestion entry."""
-        from kicad_mcp.tools.pcb_group_tools import _grid_layout
+        from kcaa.tools.pcb_group_tools import _grid_layout
         member_refs = [r for r in _USB_C_REFS if r != "J3"]
         suggestions = _grid_layout(pcb_data, "J3", member_refs, gap_mm=1.0)
         placed_refs = {s["reference"] for s in suggestions}
@@ -486,7 +486,7 @@ class TestGridLayout:
 
     def test_no_overlap_between_members(self, pcb_data):
         """Placed member courtyards must not overlap each other (gap=0)."""
-        from kicad_mcp.tools.pcb_group_tools import _grid_layout
+        from kcaa.tools.pcb_group_tools import _grid_layout
         member_refs = [r for r in _USB_C_REFS if r != "J3"]
         suggestions = _grid_layout(pcb_data, "J3", member_refs, gap_mm=1.0)
 
@@ -513,7 +513,7 @@ class TestGridLayout:
 
     def test_no_overlap_with_anchor(self, pcb_data):
         """No placed member courtyard overlaps the anchor courtyard."""
-        from kicad_mcp.tools.pcb_group_tools import _grid_layout
+        from kcaa.tools.pcb_group_tools import _grid_layout
         anchor_fp = find_footprint(pcb_data, "J3")
         _, _, anchor_rot = get_fp_at(anchor_fp)
         anchor_bb = get_fp_courtyard_bbox(anchor_fp, 0.0, 0.0, anchor_rot)
@@ -540,7 +540,7 @@ class TestGridLayout:
 
     def test_positions_on_grid(self, pcb_data):
         """All dx/dy offsets are multiples of _GRID_MM."""
-        from kicad_mcp.tools.pcb_group_tools import _grid_layout
+        from kcaa.tools.pcb_group_tools import _grid_layout
         member_refs = [r for r in _USB_C_REFS if r != "J3"]
         suggestions = _grid_layout(pcb_data, "J3", member_refs, gap_mm=1.0)
         for s in suggestions:
@@ -553,7 +553,7 @@ class TestGridLayout:
 
     def test_no_placement_warning_for_normal_group(self, pcb_data):
         """A typical 5-member group should place without any overlap warnings."""
-        from kicad_mcp.tools.pcb_group_tools import _grid_layout
+        from kcaa.tools.pcb_group_tools import _grid_layout
         member_refs = [r for r in _USB_C_REFS if r != "J3"]
         suggestions = _grid_layout(pcb_data, "J3", member_refs, gap_mm=1.0)
         warnings = [s["reference"] for s in suggestions if "warning" in s]
@@ -561,13 +561,13 @@ class TestGridLayout:
 
     def test_connected_members_placed_closer_than_unconnected(self, pcb_data):
         """Connected members should on average be closer to the anchor than unconnected ones."""
-        from kicad_mcp.tools.pcb_group_tools import _grid_layout, _is_ground_net
-        from kicad_mcp.tools.pcb_placement_helpers import _get_fp_local_pads
+        from kcaa.tools.pcb_group_tools import _grid_layout, _is_ground_net
+        from kcaa.tools.pcb_placement_helpers import _get_fp_local_pads
 
         # Build anchor net map
         anchor_fp = find_footprint(pcb_data, "J3")
         ax, ay, _ = get_fp_at(anchor_fp)
-        from kicad_mcp.tools.pcb_placement_helpers import _get_fp_pads_world
+        from kcaa.tools.pcb_placement_helpers import _get_fp_pads_world
         anchor_net_pts: dict = {}
         for p in _get_fp_pads_world(anchor_fp):
             net = p["net"]

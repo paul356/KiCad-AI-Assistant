@@ -1,5 +1,5 @@
 """
-Unit tests for kicad_mcp/tools/version_tools.py.
+Unit tests for kcaa/tools/version_tools.py.
 
 Mocks version_manager functions so tests are self-contained.
 """
@@ -31,7 +31,7 @@ class _MockMCP:
 
 def _get_tools() -> dict:
     """Register version tools against a mock MCP and return the captured dict."""
-    from kicad_mcp.tools.version_tools import register_version_tools
+    from kcaa.tools.version_tools import register_version_tools
     mock = _MockMCP()
     register_version_tools(mock)
     return mock.tools
@@ -68,8 +68,8 @@ class TestSaveFileVersion:
         self.tools = _get_tools()
         self.fn = self.tools["save_file_version"]
 
-    @patch("kicad_mcp.tools.version_tools.save_version_snapshot")
-    @patch("kicad_mcp.tools.version_tools.list_versions", return_value=[])
+    @patch("kcaa.tools.version_tools.save_version_snapshot")
+    @patch("kcaa.tools.version_tools.list_versions", return_value=[])
     def test_save_new_version(self, mock_list, mock_save, tmp_path):
         """When saving a new version with no existing snapshots."""
         test_file = tmp_path / "design.kicad_sch"
@@ -85,8 +85,8 @@ class TestSaveFileVersion:
         assert result["version_id"] == "20260528_100000_000000"
         assert result["snapshot_path"] == snapshot_path
 
-    @patch("kicad_mcp.tools.version_tools.save_version_snapshot")
-    @patch("kicad_mcp.tools.version_tools.list_versions")
+    @patch("kcaa.tools.version_tools.save_version_snapshot")
+    @patch("kcaa.tools.version_tools.list_versions")
     def test_save_unchanged_file_reuses_snapshot(self, mock_list, mock_save, tmp_path):
         """When file content matches latest snapshot, reuse it."""
         test_file = tmp_path / "design.kicad_sch"
@@ -106,8 +106,8 @@ class TestSaveFileVersion:
         assert result["created"] is False
         assert result["version_id"] == existing_id
 
-    @patch("kicad_mcp.tools.version_tools.save_version_snapshot")
-    @patch("kicad_mcp.tools.version_tools.list_versions")
+    @patch("kcaa.tools.version_tools.save_version_snapshot")
+    @patch("kcaa.tools.version_tools.list_versions")
     def test_file_not_found(self, mock_list, mock_save, tmp_path):
         """When file does not exist."""
         test_file = tmp_path / "nonexistent.kicad_sch"
@@ -120,8 +120,8 @@ class TestSaveFileVersion:
         assert "error" in result
         assert "File not found" in result["error"]
 
-    @patch("kicad_mcp.tools.version_tools.save_version_snapshot")
-    @patch("kicad_mcp.tools.version_tools.list_versions", return_value=[])
+    @patch("kcaa.tools.version_tools.save_version_snapshot")
+    @patch("kcaa.tools.version_tools.list_versions", return_value=[])
     def test_os_error(self, mock_list, mock_save, tmp_path):
         """When save_version_snapshot raises OSError."""
         test_file = tmp_path / "design.kicad_sch"
@@ -145,7 +145,7 @@ class TestListFileVersions:
         self.tools = _get_tools()
         self.fn = self.tools["list_file_versions"]
 
-    @patch("kicad_mcp.tools.version_tools.list_versions")
+    @patch("kcaa.tools.version_tools.list_versions")
     def test_list_with_versions(self, mock_list, tmp_path):
         """When there are existing version snapshots."""
         test_file = tmp_path / "design.kicad_sch"
@@ -164,7 +164,7 @@ class TestListFileVersions:
         assert len(result["versions"]) == 2
         assert result["versions"][0]["id"] == "20260528_100000_000000"
 
-    @patch("kicad_mcp.tools.version_tools.list_versions", return_value=[])
+    @patch("kcaa.tools.version_tools.list_versions", return_value=[])
     def test_list_empty(self, mock_list, tmp_path):
         """When there are no version snapshots."""
         test_file = tmp_path / "design.kicad_sch"
@@ -176,7 +176,7 @@ class TestListFileVersions:
         assert result["count"] == 0
         assert result["versions"] == []
 
-    @patch("kicad_mcp.tools.version_tools.list_versions", return_value=[])
+    @patch("kcaa.tools.version_tools.list_versions", return_value=[])
     def test_current_file_info(self, mock_list, tmp_path):
         """When file exists, current info is included."""
         test_file = tmp_path / "design.kicad_sch"
@@ -190,7 +190,7 @@ class TestListFileVersions:
         assert "size_bytes" in result["current"]
         assert result["current"]["size_bytes"] == 7
 
-    @patch("kicad_mcp.tools.version_tools.list_versions")
+    @patch("kcaa.tools.version_tools.list_versions")
     def test_current_file_missing(self, mock_list, tmp_path):
         """When file doesn't exist but snapshots do, current is None."""
         test_file = tmp_path / "nonexistent.kicad_sch"
@@ -205,7 +205,7 @@ class TestListFileVersions:
         assert result["current"] is None
         assert result["count"] == 1
 
-    @patch("kicad_mcp.tools.version_tools.list_versions")
+    @patch("kcaa.tools.version_tools.list_versions")
     def test_os_error(self, mock_list, tmp_path):
         """When list_versions raises OSError."""
         test_file = tmp_path / "design.kicad_sch"
@@ -229,7 +229,7 @@ class TestRestoreFileVersion:
         self.tools = _get_tools()
         self.fn = self.tools["restore_file_version"]
 
-    @patch("kicad_mcp.tools.version_tools.restore_version")
+    @patch("kcaa.tools.version_tools.restore_version")
     def test_restore_success(self, mock_restore, tmp_path):
         """When restore succeeds."""
         test_file = tmp_path / "design.kicad_sch"
@@ -249,7 +249,7 @@ class TestRestoreFileVersion:
         assert result["restored_from"] == version_id
         assert result["backup_of_current"] == backup_path
 
-    @patch("kicad_mcp.tools.version_tools.restore_version")
+    @patch("kcaa.tools.version_tools.restore_version")
     def test_file_not_found(self, mock_restore, tmp_path):
         """When file does not exist."""
         test_file = tmp_path / "nonexistent.kicad_sch"
@@ -261,7 +261,7 @@ class TestRestoreFileVersion:
         assert "error" in result
         assert "File not found" in result["error"]
 
-    @patch("kicad_mcp.tools.version_tools.restore_version")
+    @patch("kcaa.tools.version_tools.restore_version")
     def test_version_not_found(self, mock_restore, tmp_path):
         """When version snapshot does not exist."""
         test_file = tmp_path / "design.kicad_sch"
@@ -274,7 +274,7 @@ class TestRestoreFileVersion:
         assert "error" in result
         assert "not found" in result["error"].lower()
 
-    @patch("kicad_mcp.tools.version_tools.restore_version")
+    @patch("kcaa.tools.version_tools.restore_version")
     def test_os_error(self, mock_restore, tmp_path):
         """When restore_version raises OSError."""
         test_file = tmp_path / "design.kicad_sch"

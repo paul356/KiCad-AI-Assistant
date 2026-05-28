@@ -4,7 +4,7 @@ Tests for SymbolDatabase — SQLAlchemy/SQLite storage layer for indexed symbols
 
 import pytest
 
-from kicad_mcp.utils.symbol_database import SymbolDatabase, SymbolRecord
+from kcaa.utils.symbol_database import SymbolDatabase, SymbolRecord
 
 
 # ---------------------------------------------------------------------------

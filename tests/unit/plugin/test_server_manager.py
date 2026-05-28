@@ -93,7 +93,7 @@ class TestServerManager:
         mgr = self._make_manager()
         cmd = mgr._build_command()
         assert "-m" in cmd
-        assert "kicad_mcp.server" in cmd
+        assert "kcaa.server" in cmd
 
     # ------------------------------------------------------------------ #
     # stop() tests

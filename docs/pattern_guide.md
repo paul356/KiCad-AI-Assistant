@@ -120,7 +120,7 @@ The pattern recognition system is designed to be extensible. If you find that ce
 
 ### Adding New Component Patterns
 
-The pattern recognition is primarily based on regular expression matching of component values and library IDs. The patterns are defined in the `kicad_mcp/utils/pattern_recognition.py` file.
+The pattern recognition is primarily based on regular expression matching of component values and library IDs. The patterns are defined in the `kcaa/utils/pattern_recognition.py` file.
 
 For example, to add support for a new microcontroller family, you could update the `mcu_patterns` dictionary in the `identify_microcontrollers()` function:
 
@@ -139,7 +139,7 @@ Similarly, you can add patterns for new sensors, power supply ICs, or other comp
 
 ### Adding New Circuit Recognition Functions
 
-For entirely new types of circuits, you can add new recognition functions in the `kicad_mcp/utils/pattern_recognition.py` file, following the pattern of existing functions.
+For entirely new types of circuits, you can add new recognition functions in the `kcaa/utils/pattern_recognition.py` file, following the pattern of existing functions.
 
 For example, you might add:
 
@@ -150,7 +150,7 @@ def identify_motor_drivers(components: Dict[str, Any], nets: Dict[str, Any]) -> 
     ...
 ```
 
-Then, update the `identify_circuit_patterns()` function in `kicad_mcp/tools/pattern_tools.py` to call your new function and include its results.
+Then, update the `identify_circuit_patterns()` function in `kcaa/tools/pattern_tools.py` to call your new function and include its results.
 
 ### Contributing Your Extensions
 
@@ -237,7 +237,7 @@ The pattern recognition system relies on a community-driven database of componen
 
 If you work with components that aren't being recognized:
 
-1. Check the current patterns in `kicad_mcp/utils/pattern_recognition.py`
+1. Check the current patterns in `kcaa/utils/pattern_recognition.py`
 2. Add your own patterns for components you use
 3. Submit a pull request to share with the community
 

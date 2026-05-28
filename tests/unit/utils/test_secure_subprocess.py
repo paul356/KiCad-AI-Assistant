@@ -9,9 +9,9 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from kicad_mcp.utils.kicad_cli import KiCadCLIError
-from kicad_mcp.utils.path_validator import PathValidationError, PathValidator
-from kicad_mcp.utils.secure_subprocess import (
+from kcaa.utils.kicad_cli import KiCadCLIError
+from kcaa.utils.path_validator import PathValidationError, PathValidator
+from kcaa.utils.secure_subprocess import (
     SecureSubprocessError,
     SecureSubprocessRunner,
     create_temp_file,
@@ -22,7 +22,7 @@ from kicad_mcp.utils.secure_subprocess import (
 def _kicad_cli_available():
     """Check if KiCad CLI is available."""
     try:
-        from kicad_mcp.utils.kicad_cli import get_kicad_cli_path
+        from kcaa.utils.kicad_cli import get_kicad_cli_path
 
         get_kicad_cli_path()
         return True
@@ -45,7 +45,7 @@ class TestSecureSubprocessRunner:
         runner = SecureSubprocessRunner(path_validator=validator)
         assert runner.path_validator is validator
 
-    @patch("kicad_mcp.utils.secure_subprocess.get_kicad_cli_path")
+    @patch("kcaa.utils.secure_subprocess.get_kicad_cli_path")
     @patch.object(SecureSubprocessRunner, "_run_subprocess")
     def test_run_kicad_command_success(self, mock_run_subprocess, mock_get_cli):
         """Test successful KiCad command execution."""
@@ -76,7 +76,7 @@ class TestSecureSubprocessRunner:
             assert result is mock_result
             mock_run_subprocess.assert_called_once()
 
-    @patch("kicad_mcp.utils.secure_subprocess.get_kicad_cli_path")
+    @patch("kcaa.utils.secure_subprocess.get_kicad_cli_path")
     def test_run_kicad_command_cli_not_found(self, mock_get_cli):
         """Test KiCad command when CLI not found."""
         mock_get_cli.side_effect = KiCadCLIError("CLI not found")
@@ -113,7 +113,7 @@ class TestSecureSubprocessRunner:
                     output_files=["/etc/output.svg"],
                 )
 
-    @patch("kicad_mcp.utils.secure_subprocess.get_kicad_cli_path")
+    @patch("kcaa.utils.secure_subprocess.get_kicad_cli_path")
     @patch.object(SecureSubprocessRunner, "_run_subprocess")
     def test_run_kicad_command_with_working_dir(self, mock_run_subprocess, mock_get_cli):
         """Test KiCad command with working directory."""
@@ -132,7 +132,7 @@ class TestSecureSubprocessRunner:
             call_args = mock_run_subprocess.call_args
             assert call_args[1]["working_dir"] == os.path.realpath(temp_dir)
 
-    @patch("kicad_mcp.utils.secure_subprocess.get_kicad_cli_path")
+    @patch("kcaa.utils.secure_subprocess.get_kicad_cli_path")
     @patch.object(SecureSubprocessRunner, "_run_subprocess")
     def test_run_kicad_command_subprocess_error(self, mock_run_subprocess, mock_get_cli):
         """Test KiCad command with subprocess error."""
@@ -145,7 +145,7 @@ class TestSecureSubprocessRunner:
             runner.run_kicad_command(["--version"])
 
     @pytest.mark.asyncio
-    @patch("kicad_mcp.utils.secure_subprocess.get_kicad_cli_path")
+    @patch("kcaa.utils.secure_subprocess.get_kicad_cli_path")
     @patch.object(SecureSubprocessRunner, "run_kicad_command")
     async def test_run_kicad_command_async(self, mock_run_command, mock_get_cli):
         """Test async KiCad command execution."""

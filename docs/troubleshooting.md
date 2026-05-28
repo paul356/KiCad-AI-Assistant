@@ -63,9 +63,9 @@ This guide helps you troubleshoot common issues with the KiCad MCP Server.
      {
          "mcpServers": {
              "kicad": {
-                 "command": "/ABSOLUTE/PATH/TO/YOUR/PROJECT/kicad-mcp/venv/bin/python",
+                 "command": "/ABSOLUTE/PATH/TO/YOUR/PROJECT/kcaa/venv/bin/python",
                  "args": [
-                     "/ABSOLUTE/PATH/TO/YOUR/PROJECT/kicad-mcp/main.py"
+                     "/ABSOLUTE/PATH/TO/YOUR/PROJECT/kcaa/main.py"
                  ]
              }
          }

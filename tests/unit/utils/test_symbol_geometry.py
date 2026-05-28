@@ -1,4 +1,4 @@
-"""Unit tests for kicad_mcp.utils.symbol_geometry."""
+"""Unit tests for kcaa.utils.symbol_geometry."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 import sexpdata
 
-from kicad_mcp.utils.symbol_geometry import (
+from kcaa.utils.symbol_geometry import (
     BBox,
     bboxes_overlap,
     compute_lib_bbox,

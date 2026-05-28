@@ -1,15 +1,15 @@
 """
 Unit tests for:
-  - kicad_mcp/utils/pcb_library_utils.py  (Table-type fix + attr/has_3d_model)
-  - kicad_mcp/utils/footprint_database.py
-  - kicad_mcp/utils/footprint_index_manager.py
+  - kcaa/utils/pcb_library_utils.py  (Table-type fix + attr/has_3d_model)
+  - kcaa/utils/footprint_database.py
+  - kcaa/utils/footprint_index_manager.py
 """
 import os
 import tempfile
 
 import pytest
 
-from kicad_mcp.utils.pcb_library_utils import (
+from kcaa.utils.pcb_library_utils import (
     parse_fp_lib_table,
     build_effective_library_list,
     parse_kicad_mod,
@@ -17,12 +17,12 @@ from kicad_mcp.utils.pcb_library_utils import (
     _parse_fp_lib_table_recursive,
     _build_env_map,
 )
-from kicad_mcp.utils.footprint_database import (
+from kcaa.utils.footprint_database import (
     FootprintDatabase,
     FootprintRecord,
     FpLibraryRecord,
 )
-from kicad_mcp.utils.footprint_index_manager import FootprintIndexManager
+from kcaa.utils.footprint_index_manager import FootprintIndexManager
 
 FIXTURE_DIR = os.path.join(os.path.dirname(__file__), "fixtures")
 FP_LIB_TABLE = os.path.join(FIXTURE_DIR, "fp-lib-table")
@@ -390,7 +390,7 @@ class TestFootprintIndexManagerSync:
 
         mgr = self._mgr(tmp_path)
         monkeypatch.setattr(
-            "kicad_mcp.utils.footprint_index_manager.build_effective_library_list",
+            "kcaa.utils.footprint_index_manager.build_effective_library_list",
             lambda project_path=None: [
                 {"nickname": "Res", "uri": lib_dir, "raw_uri": lib_dir, "description": ""},
             ],
@@ -405,7 +405,7 @@ class TestFootprintIndexManagerSync:
         entry = {"nickname": "Res", "uri": lib_dir, "raw_uri": lib_dir, "description": ""}
 
         monkeypatch.setattr(
-            "kicad_mcp.utils.footprint_index_manager.build_effective_library_list",
+            "kcaa.utils.footprint_index_manager.build_effective_library_list",
             lambda project_path=None: [entry],
         )
         mgr = self._mgr(tmp_path)
@@ -422,7 +422,7 @@ class TestFootprintIndexManagerSync:
         entry = {"nickname": "Res", "uri": lib_dir, "raw_uri": lib_dir, "description": ""}
 
         monkeypatch.setattr(
-            "kicad_mcp.utils.footprint_index_manager.build_effective_library_list",
+            "kcaa.utils.footprint_index_manager.build_effective_library_list",
             lambda project_path=None: [entry],
         )
         mgr = self._mgr(tmp_path)
@@ -451,7 +451,7 @@ class TestFootprintIndexManagerSync:
             return []  # library removed from table
 
         monkeypatch.setattr(
-            "kicad_mcp.utils.footprint_index_manager.build_effective_library_list",
+            "kcaa.utils.footprint_index_manager.build_effective_library_list",
             _effective,
         )
         mgr = self._mgr(tmp_path)
@@ -465,7 +465,7 @@ class TestFootprintIndexManagerSync:
         entry = {"nickname": "Res", "uri": lib_dir, "raw_uri": lib_dir, "description": ""}
 
         monkeypatch.setattr(
-            "kicad_mcp.utils.footprint_index_manager.build_effective_library_list",
+            "kcaa.utils.footprint_index_manager.build_effective_library_list",
             lambda project_path=None: [entry],
         )
         mgr = self._mgr(tmp_path)
@@ -476,7 +476,7 @@ class TestFootprintIndexManagerSync:
     def test_sync_handles_missing_dir(self, tmp_path, monkeypatch):
         entry = {"nickname": "Ghost", "uri": "/nonexistent/.pretty", "raw_uri": "u", "description": ""}
         monkeypatch.setattr(
-            "kicad_mcp.utils.footprint_index_manager.build_effective_library_list",
+            "kcaa.utils.footprint_index_manager.build_effective_library_list",
             lambda project_path=None: [entry],
         )
         mgr = self._mgr(tmp_path)
@@ -488,7 +488,7 @@ class TestFootprintIndexManagerSync:
         lib_dir = _make_pretty(tmp_path, "Res_SMD", ["R_0402_1005Metric"])
         entry = {"nickname": "Res_SMD", "uri": lib_dir, "raw_uri": lib_dir, "description": ""}
         monkeypatch.setattr(
-            "kicad_mcp.utils.footprint_index_manager.build_effective_library_list",
+            "kcaa.utils.footprint_index_manager.build_effective_library_list",
             lambda project_path=None: [entry],
         )
         mgr = self._mgr(tmp_path)
@@ -516,7 +516,7 @@ class TestFootprintIndexManagerSync:
             return [{"nickname": "Res", "uri": new_dir, "raw_uri": "${FP}/Res.pretty", "description": ""}]
 
         monkeypatch.setattr(
-            "kicad_mcp.utils.footprint_index_manager.build_effective_library_list",
+            "kcaa.utils.footprint_index_manager.build_effective_library_list",
             _effective,
         )
         mgr = self._mgr(tmp_path)
@@ -533,7 +533,7 @@ class TestFootprintIndexManagerSync:
 # ---------------------------------------------------------------------------
 
 import time
-import kicad_mcp.tools.pcb_library_tools as _tool_module
+import kcaa.tools.pcb_library_tools as _tool_module
 
 
 class TestFpSyncTools:
@@ -556,16 +556,16 @@ class TestFpSyncTools:
         def _effective(project_path=None):
             return [{"nickname": "Res", "uri": lib_dir, "raw_uri": "${FP}/Res.pretty", "description": ""}]
 
-        from kicad_mcp.utils.footprint_index_manager import FootprintIndexManager
+        from kcaa.utils.footprint_index_manager import FootprintIndexManager
         db_path = str(tmp_path / "fp.db")
         mgr = FootprintIndexManager(db_path=db_path)
 
         monkeypatch.setattr(
-            "kicad_mcp.utils.footprint_index_manager.build_effective_library_list",
+            "kcaa.utils.footprint_index_manager.build_effective_library_list",
             _effective,
         )
         monkeypatch.setattr(
-            "kicad_mcp.tools.pcb_library_tools.get_footprint_index_manager",
+            "kcaa.tools.pcb_library_tools.get_footprint_index_manager",
             lambda project_path=None: mgr,
         )
 
@@ -587,16 +587,16 @@ class TestFpSyncTools:
         def _effective(project_path=None):
             return [{"nickname": "Cap", "uri": lib_dir, "raw_uri": "${FP}/Cap.pretty", "description": ""}]
 
-        from kicad_mcp.utils.footprint_index_manager import FootprintIndexManager
+        from kcaa.utils.footprint_index_manager import FootprintIndexManager
         db_path = str(tmp_path / "fp2.db")
         mgr = FootprintIndexManager(db_path=db_path)
 
         monkeypatch.setattr(
-            "kicad_mcp.utils.footprint_index_manager.build_effective_library_list",
+            "kcaa.utils.footprint_index_manager.build_effective_library_list",
             _effective,
         )
         monkeypatch.setattr(
-            "kicad_mcp.tools.pcb_library_tools.get_footprint_index_manager",
+            "kcaa.tools.pcb_library_tools.get_footprint_index_manager",
             lambda project_path=None: mgr,
         )
 

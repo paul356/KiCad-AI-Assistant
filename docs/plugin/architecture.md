@@ -12,7 +12,7 @@ with conversation history, receives tool-call requests, forwards them to the MCP
 results back until the model produces a final natural-language reply.
 
 **MCP Server** is a separate Python subprocess running the existing FastMCP server
-(`kicad_mcp/server.py`) in `streamable-http` mode. It exposes the schematic-editing, netlist, and
+(`kcaa/server.py`) in `streamable-http` mode. It exposes the schematic-editing, netlist, and
 symbol tools exclusively; there is no `kicad-cli` dependency inside the server. Every mutation is
 backed up to a `.bak` file before being written. The server has no direct knowledge of KiCad's
 GUI.
@@ -85,7 +85,7 @@ with socket.socket() as s:
 plugin start
   → pick free port
   → subprocess.Popen(
-        [sys.executable, '-m', 'kicad_mcp.server'],
+        [sys.executable, '-m', 'kcaa.server'],
         env={..., 'MCP_TRANSPORT': 'streamable-http', 'MCP_PORT': str(port)}
     )
   → poll GET http://127.0.0.1:<port>/health  (100 ms interval, 10 s timeout)
@@ -136,21 +136,21 @@ user config directory). **Not** in `.env`.
 
 ### macOS
 ```
-~/Library/Preferences/kicad/<ver>/scripting/plugins/kicad_mcp_plugin/
+~/Library/Preferences/kicad/<ver>/scripting/plugins/kcaa_plugin/
     __init__.py          # wx panel entry point
     client/              # LLM client code
     logs/                # server logs (KICAD_MCP_LOG_DIR default)
 
-~/Library/Preferences/kicad/<ver>/scripting/plugins/kicad_mcp_plugin/
+~/Library/Preferences/kicad/<ver>/scripting/plugins/kcaa_plugin/
     settings.json        # API key, model, port override
 
 # MCP server (installed as a Python package, separate venv or system):
-<venv>/lib/python*/site-packages/kicad_mcp/
+<venv>/lib/python*/site-packages/kcaa/
 ```
 
 ### Linux
 ```
-~/.config/kicad/<ver>/scripting/plugins/kicad_mcp_plugin/
+~/.config/kicad/<ver>/scripting/plugins/kcaa_plugin/
     __init__.py
     client/
     logs/
@@ -159,7 +159,7 @@ user config directory). **Not** in `.env`.
 
 ### Windows
 ```
-%APPDATA%\kicad\<ver>\scripting\plugins\kicad_mcp_plugin\
+%APPDATA%\kicad\<ver>\scripting\plugins\kcaa_plugin\
     __init__.py
     client\
     logs\

@@ -135,7 +135,7 @@ def mcp_server():
     env.pop("HTTP_PROXY", None)
 
     proc = subprocess.Popen(
-        [sys.executable, "-m", "kicad_mcp.server"],
+        [sys.executable, "-m", "kcaa.server"],
         env=env,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,

@@ -61,7 +61,7 @@ class _MockMCP:
 
 
 def _get_tools() -> dict:
-    from kicad_mcp.tools.component_edit_tools import register_component_edit_tools
+    from kcaa.tools.component_edit_tools import register_component_edit_tools
     mock = _MockMCP()
     register_component_edit_tools(mock)
     return mock.tools
@@ -117,7 +117,7 @@ class TestAddSymbolToSchematic:
     def test_adds_symbol_and_assigns_reference(self, tools, tmp_sch):
         """Adding a symbol should succeed and assign a reference like 'R*'."""
         mgr = _make_mock_manager()
-        with patch("kicad_mcp.tools.component_edit_tools._get_index_manager", return_value=mgr):
+        with patch("kcaa.tools.component_edit_tools._get_index_manager", return_value=mgr):
             result = asyncio.run(
                 tools["add_symbol_to_schematic"](
                     schematic_path=tmp_sch,
@@ -135,7 +135,7 @@ class TestAddSymbolToSchematic:
     def test_creates_backup(self, tools, tmp_sch):
         """A .bak file should appear next to the schematic after adding."""
         mgr = _make_mock_manager()
-        with patch("kicad_mcp.tools.component_edit_tools._get_index_manager", return_value=mgr):
+        with patch("kcaa.tools.component_edit_tools._get_index_manager", return_value=mgr):
             asyncio.run(
                 tools["add_symbol_to_schematic"](
                     schematic_path=tmp_sch,
@@ -150,7 +150,7 @@ class TestAddSymbolToSchematic:
     def test_grid_alignment(self, tools, tmp_sch):
         """Coordinates should be aligned to the 1.27 mm (50 mil) grid in the response."""
         mgr = _make_mock_manager()
-        with patch("kicad_mcp.tools.component_edit_tools._get_index_manager", return_value=mgr):
+        with patch("kcaa.tools.component_edit_tools._get_index_manager", return_value=mgr):
             result = asyncio.run(
                 tools["add_symbol_to_schematic"](
                     schematic_path=tmp_sch,
@@ -170,7 +170,7 @@ class TestAddSymbolToSchematic:
     def test_auto_increments_reference(self, tools, tmp_sch):
         """Successive add_symbol calls should yield distinct reference designators."""
         mgr = _make_mock_manager()
-        with patch("kicad_mcp.tools.component_edit_tools._get_index_manager", return_value=mgr):
+        with patch("kcaa.tools.component_edit_tools._get_index_manager", return_value=mgr):
             r1 = asyncio.run(
                 tools["add_symbol_to_schematic"](
                     schematic_path=tmp_sch,
@@ -195,7 +195,7 @@ class TestAddSymbolToSchematic:
     def test_invalid_rotation_returns_error(self, tools, tmp_sch):
         """rotation=45 is not valid; should return an error dict."""
         mgr = _make_mock_manager()
-        with patch("kicad_mcp.tools.component_edit_tools._get_index_manager", return_value=mgr):
+        with patch("kcaa.tools.component_edit_tools._get_index_manager", return_value=mgr):
             result = asyncio.run(
                 tools["add_symbol_to_schematic"](
                     schematic_path=tmp_sch,
@@ -225,7 +225,7 @@ class TestAddSymbolToSchematic:
         """When the library is absent from the index, return an error."""
         mgr = MagicMock()
         mgr.get_library_by_name.return_value = None
-        with patch("kicad_mcp.tools.component_edit_tools._get_index_manager", return_value=mgr):
+        with patch("kcaa.tools.component_edit_tools._get_index_manager", return_value=mgr):
             result = asyncio.run(
                 tools["add_symbol_to_schematic"](
                     schematic_path=tmp_sch,
@@ -242,7 +242,7 @@ class TestAddSymbolToSchematic:
         mgr = MagicMock()
         mgr.get_library_by_name.return_value = MagicMock()
         mgr.get_symbol.return_value = None
-        with patch("kicad_mcp.tools.component_edit_tools._get_index_manager", return_value=mgr):
+        with patch("kcaa.tools.component_edit_tools._get_index_manager", return_value=mgr):
             result = asyncio.run(
                 tools["add_symbol_to_schematic"](
                     schematic_path=tmp_sch,

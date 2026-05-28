@@ -48,17 +48,17 @@ logs/
 .DS_Store
 
 # MCP specific
-~/.kicad_mcp/drc_history/
+~/.kcaa/drc_history/
 
 # Symbol database files (auto-generated, do not commit)
-kicad_mcp/utils/symbol_db/*.db
-kicad_mcp/utils/symbol_db/*.db-shm
-kicad_mcp/utils/symbol_db/*.db-wal
+kcaa/utils/symbol_db/*.db
+kcaa/utils/symbol_db/*.db-shm
+kcaa/utils/symbol_db/*.db-wal
 
 # Footprint database files (auto-generated, do not commit)
-kicad_mcp/utils/footprint_db/*.db
-kicad_mcp/utils/footprint_db/*.db-shm
-kicad_mcp/utils/footprint_db/*.db-wal
+kcaa/utils/footprint_db/*.db
+kcaa/utils/footprint_db/*.db-shm
+kcaa/utils/footprint_db/*.db-wal
 
 # UV and modern Python tooling
 uv.lock

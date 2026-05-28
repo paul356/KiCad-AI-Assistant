@@ -7,7 +7,7 @@ import tempfile
 
 import pytest
 
-from kicad_mcp.utils.path_validator import (
+from kcaa.utils.path_validator import (
     PathValidationError,
     PathValidator,
     validate_directory,
@@ -200,7 +200,7 @@ class TestConvenienceFunctions:
         """Test validate_path convenience function."""
         with tempfile.TemporaryDirectory() as temp_dir:
             # Add temp_dir to default validator
-            from kicad_mcp.utils.path_validator import get_default_validator
+            from kcaa.utils.path_validator import get_default_validator
 
             get_default_validator().add_trusted_root(temp_dir)
 
@@ -215,7 +215,7 @@ class TestConvenienceFunctions:
         """Test validate_kicad_file convenience function."""
         with tempfile.TemporaryDirectory() as temp_dir:
             # Add temp_dir to default validator
-            from kicad_mcp.utils.path_validator import get_default_validator
+            from kcaa.utils.path_validator import get_default_validator
 
             get_default_validator().add_trusted_root(temp_dir)
 
@@ -230,7 +230,7 @@ class TestConvenienceFunctions:
         """Test validate_directory convenience function."""
         with tempfile.TemporaryDirectory() as temp_dir:
             # Add temp_dir to default validator
-            from kicad_mcp.utils.path_validator import get_default_validator
+            from kcaa.utils.path_validator import get_default_validator
 
             get_default_validator().add_trusted_root(temp_dir)
 

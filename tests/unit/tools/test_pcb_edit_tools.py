@@ -1,4 +1,4 @@
-"""Unit tests for kicad_mcp/tools/pcb_edit_tools.py."""
+"""Unit tests for kcaa/tools/pcb_edit_tools.py."""
 
 import asyncio
 import os
@@ -24,7 +24,7 @@ class _MockMCP:
 
 
 def _get_tools() -> dict:
-    from kicad_mcp.tools.pcb_edit_tools import register_pcb_edit_tools
+    from kcaa.tools.pcb_edit_tools import register_pcb_edit_tools
 
     mock = _MockMCP()
     register_pcb_edit_tools(mock)
@@ -151,8 +151,8 @@ class TestSetBoardOutlineRect:
         )
         assert result["items_added"] == 1
         # Verify only one gr_rect on Edge.Cuts
-        from kicad_mcp.utils.pcb_sexp_utils import load_pcb
-        from kicad_mcp.utils.pcb_board_utils import get_edge_cuts_items
+        from kcaa.utils.pcb_sexp_utils import load_pcb
+        from kcaa.utils.pcb_board_utils import get_edge_cuts_items
 
         items = get_edge_cuts_items(load_pcb(board_copy))
         assert len(items) == 1
@@ -172,8 +172,8 @@ class TestSetBoardOutlineRect:
             )
         )
         assert result["items_added"] == 8
-        from kicad_mcp.utils.pcb_sexp_utils import load_pcb
-        from kicad_mcp.utils.pcb_board_utils import get_edge_cuts_items
+        from kcaa.utils.pcb_sexp_utils import load_pcb
+        from kcaa.utils.pcb_board_utils import get_edge_cuts_items
 
         items = get_edge_cuts_items(load_pcb(board_copy))
         assert len(items) == 8
@@ -192,8 +192,8 @@ class TestSetBoardOutlineRect:
                 ctx=None,
             )
         )
-        from kicad_mcp.utils.pcb_sexp_utils import load_pcb
-        from kicad_mcp.utils.pcb_board_utils import get_edge_cuts_items
+        from kcaa.utils.pcb_sexp_utils import load_pcb
+        from kcaa.utils.pcb_board_utils import get_edge_cuts_items
 
         items = get_edge_cuts_items(load_pcb(board_copy))
         assert len(items) == 1
@@ -269,8 +269,8 @@ class TestSetFootprintProperty:
             )
         )
         assert "error" not in result
-        from kicad_mcp.utils.pcb_sexp_utils import load_pcb
-        from kicad_mcp.utils.pcb_footprint_utils import find_footprint, get_fp_property
+        from kcaa.utils.pcb_sexp_utils import load_pcb
+        from kcaa.utils.pcb_footprint_utils import find_footprint, get_fp_property
 
         data = load_pcb(board_copy)
         fp = find_footprint(data, "R1")

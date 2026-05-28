@@ -1,5 +1,5 @@
 """
-ServerManager: starts, monitors, and stops the kicad-mcp MCP server subprocess.
+ServerManager: starts, monitors, and stops the kcaa MCP server subprocess.
 
 The server is launched in the 'plugin' profile via streamable-http transport
 on a dynamically chosen localhost port.
@@ -40,7 +40,7 @@ def _is_port_open(port: int) -> bool:
 
 
 class ServerManager:
-    """Manages the lifecycle of the kicad-mcp MCP server subprocess."""
+    """Manages the lifecycle of the kcaa MCP server subprocess."""
 
     def __init__(self, settings) -> None:
         self._settings = settings
@@ -77,7 +77,7 @@ class ServerManager:
                 return True
 
             port = self._settings.server_port or _find_free_port()
-            log.info("Starting kicad-mcp server on port %d", port)
+            log.info("Starting kcaa server on port %d", port)
 
             env = self._build_env(port)
             cmd = self._build_command()
@@ -97,7 +97,7 @@ class ServerManager:
                     kwargs["start_new_session"] = True
 
                 log_dir = self._settings.resolved_log_dir
-                log_path = os.path.join(log_dir, "kicad_mcp_server.log") if log_dir else None
+                log_path = os.path.join(log_dir, "kcaa_server.log") if log_dir else None
                 if log_path:
                     os.makedirs(log_dir, exist_ok=True)
                     log_file = open(log_path, "a")  # noqa: SIM115 — kept open for subprocess lifetime
@@ -119,7 +119,7 @@ class ServerManager:
 
         with self._lock:
             self._port = port
-        log.info("kicad-mcp server ready on port %d", port)
+        log.info("kcaa server ready on port %d", port)
         return True
 
     def stop(self) -> None:
@@ -131,7 +131,7 @@ class ServerManager:
             self._process = None
             self._port = None
 
-        log.info("Stopping kicad-mcp server")
+        log.info("Stopping kcaa server")
         try:
             process.terminate()
             try:
@@ -160,7 +160,7 @@ class ServerManager:
 
     def _build_command(self) -> list[str]:
         """Build the command to launch the MCP server."""
-        return [self._resolve_python(), "-m", "kicad_mcp.server"]
+        return [self._resolve_python(), "-m", "kcaa.server"]
 
     def _resolve_python(self) -> str:
         """Return the best available Python executable.
@@ -168,7 +168,7 @@ class ServerManager:
         Priority:
         1. Explicit setting (python_executable).
         2. .venv inside the plugin directory — created by ``kicad_plugin/setup_plugin.sh``.
-           This venv has kicad_mcp and all its dependencies pre-installed.
+           This venv has kcaa and all its dependencies pre-installed.
         3. System python3 / python fallback.
 
         Never falls back to sys.executable: inside KiCad that is KiCad's own
@@ -192,7 +192,7 @@ class ServerManager:
         python = shutil.which("python3") or shutil.which("python") or "python3"
         log.warning(
             "Plugin venv not found at %s; falling back to system Python: %s. "
-            "Run 'kicad_plugin/setup_plugin.sh <repo>' to create the plugin venv.",
+            "Run 'kicad_plugin/setup_plugin.sh' to create the plugin venv.",
             os.path.join(plugin_dir, ".venv"),
             python,
         )
@@ -230,6 +230,28 @@ class ServerManager:
         for k, v in os.environ.items():
             if k.startswith("KICAD"):
                 env[k] = v
+
+        # Read .env configuration file if present
+        plugin_dir = os.path.dirname(os.path.abspath(__file__))
+        env_file = os.path.join(plugin_dir, ".env")
+        if os.path.isfile(env_file):
+            try:
+                with open(env_file, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith("#"):
+                            continue
+                        if "=" in line:
+                            key, value = line.split("=", 1)
+                            key = key.strip()
+                            value = value.strip()
+                            # Expand ~ and environment variables
+                            value = os.path.expanduser(value)
+                            value = os.path.expandvars(value)
+                            env[key] = value
+                            log.debug("Loaded from .env: %s=%s", key, value)
+            except Exception as e:
+                log.warning("Failed to read .env file: %s", e)
 
         env["MCP_TRANSPORT"] = "streamable-http"
         env["MCP_PORT"] = str(port)

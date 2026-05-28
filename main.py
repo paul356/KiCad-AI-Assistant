@@ -8,12 +8,12 @@ import sys
 import logging # Import logging module
 
 # Must import config BEFORE env potentially overrides it via os.environ
-from kicad_mcp import config
-from kicad_mcp.server import main as server_main
-from kicad_mcp.utils.env import load_dotenv
+from kcaa import config
+from kcaa.server import main as server_main
+from kcaa.utils.env import load_dotenv
 
 # --- Setup Logging --- 
-log_file = os.path.join(os.path.dirname(__file__), 'kicad-mcp.log') 
+log_file = os.path.join(os.path.dirname(__file__), 'kcaa.log') 
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - [PID:%(process)d] - %(message)s',
@@ -49,7 +49,7 @@ logging.info(f"os.environ['KICAD_SEARCH_PATHS'] after load_dotenv: {effective_se
 # Re-log the values imported from config.py to see if they reflect os.environ changes
 # (This depends on config.py using os.getenv internally AFTER load_dotenv runs)
 try:
-    from kicad_mcp import config
+    from kcaa import config
     import importlib
     importlib.reload(config) # Attempt to force re-reading config
     logging.info(f"Effective KICAD_USER_DIR from config.py after reload: {config.KICAD_USER_DIR}")

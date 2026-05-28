@@ -119,7 +119,7 @@ def _https_post_json(
     if not venv_python:
         raise RuntimeError(
             "KiCad's embedded Python lacks SSL support and no plugin venv "
-            "Python was found. Run 'kicad_plugin/setup_plugin.sh <repo>' to create one."
+            "Python was found. Run 'kicad_plugin/setup_plugin.sh' to create one."
         )
 
     # Build a clean env using an explicit allowlist (mirrors ServerManager).

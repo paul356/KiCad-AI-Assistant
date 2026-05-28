@@ -1,5 +1,5 @@
 """
-Unit tests for kicad_mcp/tools/symbol_tools.py.
+Unit tests for kcaa/tools/symbol_tools.py.
 
 Patches the module-level _index_manager singleton and _sync_state so tests
 are fully self-contained and do not require a real KiCad installation.
@@ -35,7 +35,7 @@ class _MockMCP:
 
 def _get_tools() -> dict:
     """Register symbol tools against a mock MCP and return the captured dict."""
-    from kicad_mcp.tools.symbol_tools import register_symbol_tools
+    from kcaa.tools.symbol_tools import register_symbol_tools
     mock = _MockMCP()
     register_symbol_tools(mock)
     return mock.tools
@@ -67,7 +67,7 @@ class TestSyncSymbolIndex:
 
     def test_starts_when_idle(self):
         """When no sync is running, sync_symbol_index should start a thread."""
-        import kicad_mcp.tools.symbol_tools as mod
+        import kcaa.tools.symbol_tools as mod
 
         # Reset state to idle.
         with mod._sync_lock:
@@ -92,7 +92,7 @@ class TestSyncSymbolIndex:
 
     def test_already_running(self):
         """When a sync is already running, return already_running status."""
-        import kicad_mcp.tools.symbol_tools as mod
+        import kcaa.tools.symbol_tools as mod
 
         with mod._sync_lock:
             mod._sync_state.running = True
@@ -118,7 +118,7 @@ class TestGetSymbolSyncStatus:
 
     def test_idle_state(self):
         """Default state should show running=False."""
-        import kicad_mcp.tools.symbol_tools as mod
+        import kcaa.tools.symbol_tools as mod
 
         with mod._sync_lock:
             mod._sync_state.running = False
@@ -135,7 +135,7 @@ class TestGetSymbolSyncStatus:
 
     def test_running_state(self):
         """Should reflect whatever state _sync_state holds."""
-        import kicad_mcp.tools.symbol_tools as mod
+        import kcaa.tools.symbol_tools as mod
 
         with mod._sync_lock:
             mod._sync_state.running = True
@@ -180,7 +180,7 @@ class TestSearchSymbols:
         mock_mgr = MagicMock()
         mock_mgr.search_symbols.return_value = [rec1, rec2]
 
-        with patch("kicad_mcp.tools.symbol_tools._get_index_manager", return_value=mock_mgr):
+        with patch("kcaa.tools.symbol_tools._get_index_manager", return_value=mock_mgr):
             result = _call("search_symbols", query="passive")
 
         assert result["success"] is True
@@ -193,7 +193,7 @@ class TestSearchSymbols:
         mock_mgr = MagicMock()
         mock_mgr.search_symbols.return_value = []
 
-        with patch("kicad_mcp.tools.symbol_tools._get_index_manager", return_value=mock_mgr):
+        with patch("kcaa.tools.symbol_tools._get_index_manager", return_value=mock_mgr):
             result = _call("search_symbols", query="xyzzy_no_match")
 
         assert result["success"] is True
@@ -204,7 +204,7 @@ class TestSearchSymbols:
         mock_mgr = MagicMock()
         mock_mgr.search_symbols.side_effect = RuntimeError("DB locked")
 
-        with patch("kicad_mcp.tools.symbol_tools._get_index_manager", return_value=mock_mgr):
+        with patch("kcaa.tools.symbol_tools._get_index_manager", return_value=mock_mgr):
             result = _call("search_symbols", query="anything")
 
         assert result["success"] is False
@@ -230,7 +230,7 @@ class TestGetSymbol:
         mock_mgr = MagicMock()
         mock_mgr.get_symbol.return_value = rec
 
-        with patch("kicad_mcp.tools.symbol_tools._get_index_manager", return_value=mock_mgr):
+        with patch("kcaa.tools.symbol_tools._get_index_manager", return_value=mock_mgr):
             result = _call("get_symbol", library_name="Device", symbol_name="R")
 
         assert result["success"] is True
@@ -242,7 +242,7 @@ class TestGetSymbol:
         mock_mgr = MagicMock()
         mock_mgr.get_symbol.return_value = None
 
-        with patch("kicad_mcp.tools.symbol_tools._get_index_manager", return_value=mock_mgr):
+        with patch("kcaa.tools.symbol_tools._get_index_manager", return_value=mock_mgr):
             result = _call("get_symbol", library_name="Device", symbol_name="NOEXIST")
 
         assert result["success"] is False
@@ -273,7 +273,7 @@ class TestListSymbolLibraries:
         mock_mgr = MagicMock()
         mock_mgr.get_all_libraries.return_value = [lib1, lib2]
 
-        with patch("kicad_mcp.tools.symbol_tools._get_index_manager", return_value=mock_mgr):
+        with patch("kcaa.tools.symbol_tools._get_index_manager", return_value=mock_mgr):
             result = _call("list_symbol_libraries")
 
         assert result["success"] is True
@@ -289,7 +289,7 @@ class TestListSymbolLibraries:
         mock_mgr = MagicMock()
         mock_mgr.get_all_libraries.return_value = []
 
-        with patch("kicad_mcp.tools.symbol_tools._get_index_manager", return_value=mock_mgr):
+        with patch("kcaa.tools.symbol_tools._get_index_manager", return_value=mock_mgr):
             result = _call("list_symbol_libraries")
 
         assert result["success"] is True
@@ -319,7 +319,7 @@ class TestGetLibrarySymbols:
         mock_mgr = MagicMock()
         mock_mgr.get_library_symbols.return_value = syms
 
-        with patch("kicad_mcp.tools.symbol_tools._get_index_manager", return_value=mock_mgr):
+        with patch("kcaa.tools.symbol_tools._get_index_manager", return_value=mock_mgr):
             result = _call("get_library_symbols", library_name="Device")
 
         assert result["success"] is True
@@ -332,7 +332,7 @@ class TestGetLibrarySymbols:
         mock_mgr = MagicMock()
         mock_mgr.get_library_symbols.return_value = []
 
-        with patch("kicad_mcp.tools.symbol_tools._get_index_manager", return_value=mock_mgr):
+        with patch("kcaa.tools.symbol_tools._get_index_manager", return_value=mock_mgr):
             result = _call("get_library_symbols", library_name="NOLIB")
 
         assert result["success"] is False
@@ -352,19 +352,19 @@ class TestGetSymbolIndexStats:
         stats.library_count = 42
         stats.symbol_count = 12345
         stats.last_sync = "2025-01-01T00:00:00"
-        stats.db_path = "/home/user/.kicad_mcp/symbols.db"
+        stats.db_path = "/home/user/.kcaa/symbols.db"
 
         mock_mgr = MagicMock()
         mock_mgr.get_statistics.return_value = stats
 
-        with patch("kicad_mcp.tools.symbol_tools._get_index_manager", return_value=mock_mgr):
+        with patch("kcaa.tools.symbol_tools._get_index_manager", return_value=mock_mgr):
             result = _call("get_symbol_index_stats")
 
         assert result["success"] is True
         assert result["library_count"] == 42
         assert result["symbol_count"] == 12345
         assert result["last_sync"] == "2025-01-01T00:00:00"
-        assert result["db_path"] == "/home/user/.kicad_mcp/symbols.db"
+        assert result["db_path"] == "/home/user/.kcaa/symbols.db"
 
 
 # ---------------------------------------------------------------------------
@@ -419,8 +419,8 @@ class TestGetSymbolPins:
         raw = _load_fixture_symbol(_FIXTURE_SYM, "R_Small")
         mock_mgr = self._make_mock_mgr()
 
-        with patch("kicad_mcp.tools.symbol_tools._get_index_manager", return_value=mock_mgr), \
-             patch("kicad_mcp.tools.symbol_tools.extract_lib_symbol_raw", return_value=raw):
+        with patch("kcaa.tools.symbol_tools._get_index_manager", return_value=mock_mgr), \
+             patch("kcaa.tools.symbol_tools.extract_lib_symbol_raw", return_value=raw):
             result = _call("get_symbol_pins", library_name="Device", symbol_name="R_Small")
 
         assert result["success"] is True
@@ -433,8 +433,8 @@ class TestGetSymbolPins:
         raw = _load_fixture_symbol(_FIXTURE_SYM, "R_Small")
         mock_mgr = self._make_mock_mgr()
 
-        with patch("kicad_mcp.tools.symbol_tools._get_index_manager", return_value=mock_mgr), \
-             patch("kicad_mcp.tools.symbol_tools.extract_lib_symbol_raw", return_value=raw):
+        with patch("kcaa.tools.symbol_tools._get_index_manager", return_value=mock_mgr), \
+             patch("kcaa.tools.symbol_tools.extract_lib_symbol_raw", return_value=raw):
             result = _call("get_symbol_pins", library_name="Device", symbol_name="R_Small")
 
         for pin in result["pins"]:
@@ -446,8 +446,8 @@ class TestGetSymbolPins:
         raw = _load_fixture_symbol(_FIXTURE_SYM, "R_Small")
         mock_mgr = self._make_mock_mgr()
 
-        with patch("kicad_mcp.tools.symbol_tools._get_index_manager", return_value=mock_mgr), \
-             patch("kicad_mcp.tools.symbol_tools.extract_lib_symbol_raw", return_value=raw):
+        with patch("kcaa.tools.symbol_tools._get_index_manager", return_value=mock_mgr), \
+             patch("kcaa.tools.symbol_tools.extract_lib_symbol_raw", return_value=raw):
             result = _call("get_symbol_pins", library_name="Device", symbol_name="R_Small")
 
         assert result["pin_count"] == len(result["pins"])
@@ -457,7 +457,7 @@ class TestGetSymbolPins:
         mock_mgr = MagicMock()
         mock_mgr.get_symbol.return_value = None
 
-        with patch("kicad_mcp.tools.symbol_tools._get_index_manager", return_value=mock_mgr):
+        with patch("kcaa.tools.symbol_tools._get_index_manager", return_value=mock_mgr):
             result = _call("get_symbol_pins", library_name="Device", symbol_name="NOEXIST")
 
         assert result.get("success") is False
@@ -468,7 +468,7 @@ class TestGetSymbolPins:
         mock_mgr = MagicMock()
         mock_mgr.get_symbol.return_value = None
 
-        with patch("kicad_mcp.tools.symbol_tools._get_index_manager", return_value=mock_mgr):
+        with patch("kcaa.tools.symbol_tools._get_index_manager", return_value=mock_mgr):
             result = _call("get_symbol_pins", library_name="Device", symbol_name="")
 
         assert result.get("success") is False
@@ -481,7 +481,7 @@ class TestGetSymbolPins:
         mock_mgr.get_symbol.return_value = sym_rec
         mock_mgr.get_library_by_name.return_value = None
 
-        with patch("kicad_mcp.tools.symbol_tools._get_index_manager", return_value=mock_mgr):
+        with patch("kcaa.tools.symbol_tools._get_index_manager", return_value=mock_mgr):
             result = _call("get_symbol_pins", library_name="MISSINGLIB", symbol_name="R")
 
         assert result.get("success") is False
@@ -491,8 +491,8 @@ class TestGetSymbolPins:
         """Inner except around extract_lib_symbol_raw returns error dict on FileNotFoundError."""
         mock_mgr = self._make_mock_mgr()
 
-        with patch("kicad_mcp.tools.symbol_tools._get_index_manager", return_value=mock_mgr), \
-             patch("kicad_mcp.tools.symbol_tools.extract_lib_symbol_raw",
+        with patch("kcaa.tools.symbol_tools._get_index_manager", return_value=mock_mgr), \
+             patch("kcaa.tools.symbol_tools.extract_lib_symbol_raw",
                    side_effect=FileNotFoundError("lib gone")):
             result = _call("get_symbol_pins", library_name="Device", symbol_name="R_Small")
 
@@ -503,8 +503,8 @@ class TestGetSymbolPins:
         """Inner except around extract_lib_symbol_raw returns error dict on ValueError."""
         mock_mgr = self._make_mock_mgr()
 
-        with patch("kicad_mcp.tools.symbol_tools._get_index_manager", return_value=mock_mgr), \
-             patch("kicad_mcp.tools.symbol_tools.extract_lib_symbol_raw",
+        with patch("kcaa.tools.symbol_tools._get_index_manager", return_value=mock_mgr), \
+             patch("kcaa.tools.symbol_tools.extract_lib_symbol_raw",
                    side_effect=ValueError("bad data")):
             result = _call("get_symbol_pins", library_name="Device", symbol_name="R_Small")
 
@@ -516,8 +516,8 @@ class TestGetSymbolPins:
         raw = _load_fixture_symbol(_FIXTURE_SYM, "R_Small")
         mock_mgr = self._make_mock_mgr()
 
-        with patch("kicad_mcp.tools.symbol_tools._get_index_manager", return_value=mock_mgr), \
-             patch("kicad_mcp.tools.symbol_tools.extract_lib_symbol_raw", return_value=raw):
+        with patch("kcaa.tools.symbol_tools._get_index_manager", return_value=mock_mgr), \
+             patch("kcaa.tools.symbol_tools.extract_lib_symbol_raw", return_value=raw):
             result = _call("get_symbol_pins", library_name="Device", symbol_name="R_Small")
 
         by_num = {p["number"]: p for p in result["pins"]}
@@ -534,7 +534,7 @@ class TestParseLibPins:
     """Unit tests for the _parse_lib_pins() module-level helper."""
 
     def setup_method(self):
-        from kicad_mcp.tools.symbol_tools import _parse_lib_pins
+        from kcaa.tools.symbol_tools import _parse_lib_pins
         self._parse = _parse_lib_pins
 
     def test_r_small_pin_count(self):

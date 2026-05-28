@@ -56,7 +56,7 @@ class _MockMCP:
 
 def _get_tools() -> dict:
     """Register component edit tools against a mock MCP and return the dict."""
-    from kicad_mcp.tools.component_edit_tools import register_component_edit_tools
+    from kcaa.tools.component_edit_tools import register_component_edit_tools
     mock = _MockMCP()
     register_component_edit_tools(mock)
     return mock.tools

@@ -1,6 +1,6 @@
 # KiCad AI Assistant Plugin
 
-This directory contains the KiCad action plugin that connects to the `kicad-mcp` MCP server, allowing an LLM to edit KiCad schematics through natural-language chat.
+This directory contains the KiCad action plugin that connects to the `kcaa` MCP server, allowing an LLM to edit KiCad schematics through natural-language chat.
 
 ## Architecture
 
@@ -9,48 +9,56 @@ KiCad (GUI)
   └─ kicad_plugin/          ← this directory (action plugin)
        ├─ __init__.py        ← KiCad plugin entry point
        ├─ settings.py        ← Load/save LLM API key and preferences
-       ├─ server_manager.py  ← Start/stop the kicad-mcp subprocess
+       ├─ server_manager.py  ← Start/stop the kcaa subprocess
        ├─ context_bridge.py  ← Collect active project/schematic paths from KiCad
        ├─ llm_client.py      ← Agentic tool-call loop (OpenAI / Anthropic)
        └─ ui/
             ├─ panel.py         ← Main chat panel (wx.Frame)
             └─ settings_dialog.py ← Settings dialog
 
-kicad-mcp MCP server (subprocess, streamable-http on localhost)
+kcaa MCP server (subprocess, streamable-http on localhost)
   └─ Profile: "plugin" — 26 skip-based schematic editing tools only
 ```
 
 ## Installation
 
-### 1. Install the kicad-mcp package
-
-```bash
-pip install kicad-mcp
-# or from source:
-pip install -e /path/to/kicad-mcp
-```
-
-### 2. Copy the plugin into KiCad's plugin directory
+### 1. Copy the plugin into KiCad's plugin directory
 
 **Linux:**
 ```bash
-KICAD_PLUGIN_DIR=~/.local/share/kicad/8.0/scripting/plugins
+KICAD_PLUGIN_DIR=~/.local/share/kicad/10.0/scripting/plugins
 mkdir -p "$KICAD_PLUGIN_DIR"
-cp -r /path/to/kicad-mcp/kicad_plugin "$KICAD_PLUGIN_DIR/kicad_ai_plugin"
+cp -r kicad_plugin "$KICAD_PLUGIN_DIR/kicad_ai_plugin"
 ```
 
 **macOS:**
 ```bash
-KICAD_PLUGIN_DIR=~/Library/Preferences/kicad/8.0/scripting/plugins
+KICAD_PLUGIN_DIR=~/Library/Preferences/kicad/10.0/scripting/plugins
 mkdir -p "$KICAD_PLUGIN_DIR"
-cp -r /path/to/kicad-mcp/kicad_plugin "$KICAD_PLUGIN_DIR/kicad_ai_plugin"
+cp -r kicad_plugin "$KICAD_PLUGIN_DIR/kicad_ai_plugin"
 ```
 
 **Windows (PowerShell):**
 ```powershell
-$dir = "$env:APPDATA\kicad\8.0\scripting\plugins\kicad_ai_plugin"
+$dir = "$env:APPDATA\kicad\10.0\scripting\plugins\kicad_ai_plugin"
 New-Item -ItemType Directory -Force -Path $dir
-Copy-Item -Recurse /path/to/kicad-mcp/kicad_plugin/* $dir
+Copy-Item -Recurse kicad_plugin\* $dir
+```
+
+### 2. Run the setup script
+
+The setup script creates a virtual environment, installs `kcaa` from PyPI, and downloads the freerouting JAR.
+
+**Linux/macOS:**
+```bash
+cd "$KICAD_PLUGIN_DIR/kicad_ai_plugin"
+./setup_plugin.sh
+```
+
+**Windows:**
+```powershell
+cd "$env:APPDATA\kicad\10.0\scripting\plugins\kicad_ai_plugin"
+.\setup_plugin.bat
 ```
 
 ### 3. Open KiCad
@@ -100,7 +108,7 @@ See `docs/plugin/tool_contract.md` for full documentation.
 To test the plugin outside KiCad:
 
 ```bash
-cd /path/to/kicad-mcp
+cd /path/to/kcaa
 .venv/bin/python3 -c "
 from kicad_plugin.settings import PluginSettings
 from kicad_plugin.server_manager import ServerManager

@@ -37,8 +37,8 @@ Tested on **KiCad 10.0 / Linux**.
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/paul356/kicad-mcp.git
-cd kicad-mcp
+git clone https://github.com/paul356/kcaa.git
+cd kcaa
 ```
 
 ### 2. Configure the environment
@@ -72,12 +72,20 @@ KICAD_3RD_PARTY=~/.local/share/kicad/10.0/3rdparty
 MCP_TRANSPORT=streamable-http
 ```
 
-### 3. Build and install the plugin
+### 3. Install the plugin
 
-Build the plugin zip with `make`, then unzip it into KiCad's plugin directory:
+Download `kicad-ai-assistant.zip` from the [Releases page](https://github.com/paul356/KiCad-AI-Assistant/releases) and unzip it into KiCad's plugin directory:
 
 ```bash
-# In the kicad-mcp repository root:
+KICAD_PLUGIN_DIR=~/.local/share/kicad/10.0/scripting/plugins
+mkdir -p "$KICAD_PLUGIN_DIR"
+unzip kicad-ai-assistant.zip -d "$KICAD_PLUGIN_DIR"
+```
+
+Or build from source:
+
+```bash
+# In the kcaa repository root:
 make dist-plugin          # produces dist/kicad_ai_assistant.zip
 
 KICAD_PLUGIN_DIR=~/.local/share/kicad/10.0/scripting/plugins
@@ -87,11 +95,11 @@ unzip dist/kicad_ai_assistant.zip -d "$KICAD_PLUGIN_DIR"
 
 ### 4. Create the plugin virtual environment
 
-Run `setup_plugin.sh` from inside the installed plugin directory to create a `.venv` and install `kicad_mcp` as an editable package. `uv` will automatically install the required Python version.
+Run `setup_plugin.sh` from inside the installed plugin directory to create a `.venv` and install `kcaa` from PyPI. `uv` will automatically install the required Python version.
 
 ```bash
 cd ~/.local/share/kicad/10.0/scripting/plugins/kicad_ai_assistant
-./setup_plugin.sh /path/to/kicad-mcp
+./setup_plugin.sh
 ```
 
 ### 5. Load the plugin in KiCad
@@ -203,11 +211,11 @@ All settings can be changed through **Options → Settings** in the plugin panel
 ## Project Structure
 
 ```
-kicad-mcp/
+kcaa/
 ├── main.py                  # MCP server entry point
 ├── pyproject.toml           # Package metadata and dependencies
 ├── .env                     # Local environment configuration (not committed)
-├── kicad_mcp/               # MCP server package
+├── kcaa/               # MCP server package
 │   ├── server.py            # Server setup and tool registration
 │   ├── config.py            # Configuration and KiCad path detection
 │   ├── tools/               # All MCP tool implementations
@@ -215,7 +223,7 @@ kicad-mcp/
 │   └── prompts/             # MCP prompt templates
 ├── kicad_plugin/            # KiCad action plugin
 │   ├── __init__.py          # Plugin entry point (KiCadAIPlugin)
-│   ├── server_manager.py    # Start/stop the kicad-mcp subprocess
+│   ├── server_manager.py    # Start/stop the kcaa subprocess
 │   ├── llm_client.py        # Agentic tool-call loop (OpenAI / Anthropic)
 │   ├── context_bridge.py    # Collect active project paths from KiCad
 │   ├── settings.py          # Load/save plugin settings

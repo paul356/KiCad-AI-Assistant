@@ -36,15 +36,15 @@ def main():
     exit_code = 0
 
     # Run linting
-    exit_code |= run_command(["uv", "run", "ruff", "check", "kicad_mcp/", "tests/"], "Lint check")
+    exit_code |= run_command(["uv", "run", "ruff", "check", "kcaa/", "tests/"], "Lint check")
 
     # Run formatting check
     exit_code |= run_command(
-        ["uv", "run", "ruff", "format", "--check", "kicad_mcp/", "tests/"], "Format check"
+        ["uv", "run", "ruff", "format", "--check", "kcaa/", "tests/"], "Format check"
     )
 
     # Run type checking
-    exit_code |= run_command(["uv", "run", "mypy", "kicad_mcp/"], "Type check")
+    exit_code |= run_command(["uv", "run", "mypy", "kcaa/"], "Type check")
 
     # Run tests
     exit_code |= run_command(["uv", "run", "python", "-m", "pytest", "tests/", "-v"], "Unit tests")

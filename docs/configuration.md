@@ -8,7 +8,7 @@ The KiCad MCP Server can be configured in multiple ways:
 
 1. **Environment Variables**: Set directly when running the server
 2. **.env File**: Create a `.env` file in the project root (recommended)
-3. **Code Modifications**: Edit configuration constants in `kicad_mcp/config.py`
+3. **Code Modifications**: Edit configuration constants in `kcaa/config.py`
 
 ## Core Configuration Options
 
@@ -97,9 +97,9 @@ To configure Claude Desktop to use the KiCad MCP Server:
    {
        "mcpServers": {
            "kicad": {
-               "command": "/ABSOLUTE/PATH/TO/YOUR/PROJECT/kicad-mcp/venv/bin/python",
+               "command": "/ABSOLUTE/PATH/TO/YOUR/PROJECT/kcaa/venv/bin/python",
                "args": [
-                   "/ABSOLUTE/PATH/TO/YOUR/PROJECT/kicad-mcp/main.py"
+                   "/ABSOLUTE/PATH/TO/YOUR/PROJECT/kcaa/main.py"
                ]
            }
        }
@@ -111,9 +111,9 @@ To configure Claude Desktop to use the KiCad MCP Server:
    {
        "mcpServers": {
            "kicad": {
-               "command": "C:\\Path\\To\\Your\\Project\\kicad-mcp\\venv\\Scripts\\python.exe",
+               "command": "C:\\Path\\To\\Your\\Project\\kcaa\\venv\\Scripts\\python.exe",
                "args": [
-                   "C:\\Path\\To\\Your\\Project\\kicad-mcp\\main.py"
+                   "C:\\Path\\To\\Your\\Project\\kcaa\\main.py"
                ]
            }
        }
@@ -128,9 +128,9 @@ You can also set environment variables directly in the client configuration:
 {
     "mcpServers": {
         "kicad": {
-            "command": "/ABSOLUTE/PATH/TO/YOUR/PROJECT/kicad-mcp/venv/bin/python",
+            "command": "/ABSOLUTE/PATH/TO/YOUR/PROJECT/kcaa/venv/bin/python",
             "args": [
-                "/ABSOLUTE/PATH/TO/YOUR/PROJECT/kicad-mcp/main.py"
+                "/ABSOLUTE/PATH/TO/YOUR/PROJECT/kcaa/main.py"
             ],
             "env": {
                 "KICAD_SEARCH_PATHS": "/custom/path1,/custom/path2",
@@ -145,7 +145,7 @@ You can also set environment variables directly in the client configuration:
 
 ### Custom KiCad Extensions
 
-If you need to modify the recognized KiCad file extensions, you can edit `kicad_mcp/config.py`:
+If you need to modify the recognized KiCad file extensions, you can edit `kcaa/config.py`:
 
 ```python
 # File extensions
@@ -161,14 +161,14 @@ KICAD_EXTENSIONS = {
 
 The server stores DRC history to track changes over time. By default, history is stored in:
 
-- macOS/Linux: `~/.kicad_mcp/drc_history/`
-- Windows: `%APPDATA%\kicad_mcp\drc_history\`
+- macOS/Linux: `~/.kcaa/drc_history/`
+- Windows: `%APPDATA%\kcaa\drc_history\`
 
-You can modify this in `kicad_mcp/utils/drc_history.py` if needed.
+You can modify this in `kcaa/utils/drc_history.py` if needed.
 
 ### Python Path for KiCad Modules
 
-The server attempts to locate and add KiCad's Python modules to the Python path automatically. If this fails, you can modify the search paths in `kicad_mcp/utils/python_path.py`.
+The server attempts to locate and add KiCad's Python modules to the Python path automatically. If this fails, you can modify the search paths in `kcaa/utils/python_path.py`.
 
 ## Platform-Specific Configuration
 

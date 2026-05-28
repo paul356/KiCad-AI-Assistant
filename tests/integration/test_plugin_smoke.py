@@ -1,10 +1,10 @@
 """
-Integration smoke test: starts the kicad-mcp server in plugin profile and
+Integration smoke test: starts the kcaa server in plugin profile and
 verifies the MCP endpoint responds with a tools/list.
 
 This test requires no KiCad installation — it exercises the server process and
 HTTP transport in isolation.  It is skipped automatically in CI environments
-that don't have the kicad_mcp package importable or can't bind a network port.
+that don't have the kcaa package importable or can't bind a network port.
 
 Run manually:
     .venv/bin/pytest tests/integration/test_plugin_smoke.py -v
@@ -98,7 +98,7 @@ def mcp_server():
     env.pop("HTTP_PROXY", None)
 
     proc = subprocess.Popen(
-        [sys.executable, "-m", "kicad_mcp.server"],
+        [sys.executable, "-m", "kcaa.server"],
         env=env,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,

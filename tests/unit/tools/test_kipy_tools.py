@@ -1,5 +1,5 @@
 """
-Unit tests for kicad_mcp/tools/kipy_tools.py.
+Unit tests for kcaa/tools/kipy_tools.py.
 
 Mocks kipy module and related dependencies so tests are self-contained.
 """
@@ -31,7 +31,7 @@ class _MockMCP:
 
 def _get_tools() -> dict:
     """Register kipy tools against a mock MCP and return the captured dict."""
-    from kicad_mcp.tools.kipy_tools import register_kipy_tools
+    from kcaa.tools.kipy_tools import register_kipy_tools
     mock = _MockMCP()
     register_kipy_tools(mock)
     return mock.tools
@@ -67,7 +67,7 @@ class TestFindKicadSocket:
     """Test socket discovery logic by calling tools that use it."""
 
     @patch.dict(os.environ, {"KICAD_API_SOCKET": "ipc:///custom/socket.sock"})
-    @patch("kicad_mcp.tools.kipy_tools._connect")
+    @patch("kcaa.tools.kipy_tools._connect")
     def test_socket_from_env_var(self, mock_connect, tools):
         """When KICAD_API_SOCKET is set, use it."""
         mock_kicad = MagicMock()
@@ -81,9 +81,9 @@ class TestFindKicadSocket:
         assert result["socket_path"] == "ipc:///custom/socket.sock"
 
     @patch.dict(os.environ, {}, clear=True)
-    @patch("kicad_mcp.tools.kipy_tools.glob.glob")
-    @patch("kicad_mcp.tools.kipy_tools.os.path.getmtime")
-    @patch("kicad_mcp.tools.kipy_tools._connect")
+    @patch("kcaa.tools.kipy_tools.glob.glob")
+    @patch("kcaa.tools.kipy_tools.os.path.getmtime")
+    @patch("kcaa.tools.kipy_tools._connect")
     def test_socket_from_glob_linux(self, mock_connect, mock_getmtime, mock_glob, tools):
         """When no env var, glob for socket files and pick newest."""
         # Remove KICAD_API_SOCKET if it exists
@@ -103,8 +103,8 @@ class TestFindKicadSocket:
         assert "api-456.sock" in result["socket_path"]
 
     @patch.dict(os.environ, {}, clear=True)
-    @patch("kicad_mcp.tools.kipy_tools.glob.glob", return_value=[])
-    @patch("kicad_mcp.tools.kipy_tools._connect")
+    @patch("kcaa.tools.kipy_tools.glob.glob", return_value=[])
+    @patch("kcaa.tools.kipy_tools._connect")
     def test_socket_default_fallback(self, mock_connect, mock_glob, tools):
         """When no env var and no socket files, use default."""
         os.environ.pop("KICAD_API_SOCKET", None)
@@ -130,7 +130,7 @@ class TestCheckKicadIpcConnection:
         self.tools = _get_tools()
         self.fn = self.tools["check_kicad_ipc_connection"]
 
-    @patch("kicad_mcp.tools.kipy_tools._connect")
+    @patch("kcaa.tools.kipy_tools._connect")
     def test_connected_successfully(self, mock_connect):
         """When kipy connects and ping succeeds, return connected=True."""
         mock_kicad = MagicMock()
@@ -143,7 +143,7 @@ class TestCheckKicadIpcConnection:
         assert result["connected"] is True
         assert "socket_path" in result
 
-    @patch("kicad_mcp.tools.kipy_tools._connect")
+    @patch("kcaa.tools.kipy_tools._connect")
     def test_ping_timeout_still_connected(self, mock_connect):
         """When ping times out but socket exists, still consider connected."""
         # Create a mock kipy.errors module
@@ -169,7 +169,7 @@ class TestCheckKicadIpcConnection:
             assert result["connected"] is True
             assert "warning" in result
 
-    @patch("kicad_mcp.tools.kipy_tools._connect")
+    @patch("kcaa.tools.kipy_tools._connect")
     def test_connection_refused(self, mock_connect):
         """When connection is refused, return connected=False."""
         mock_kipy_errors = MagicMock()
@@ -193,7 +193,7 @@ class TestCheckKicadIpcConnection:
             assert result["connected"] is False
             assert "error" in result
 
-    @patch("kicad_mcp.tools.kipy_tools._connect")
+    @patch("kcaa.tools.kipy_tools._connect")
     def test_kipy_not_installed(self, mock_connect):
         """When kipy import fails, return error message."""
         mock_connect.side_effect = RuntimeError("kicad-python is not installed")
@@ -204,7 +204,7 @@ class TestCheckKicadIpcConnection:
         assert result["connected"] is False
         assert "not installed" in result["error"]
 
-    @patch("kicad_mcp.tools.kipy_tools._connect")
+    @patch("kcaa.tools.kipy_tools._connect")
     def test_unexpected_exception(self, mock_connect):
         """When unexpected error occurs, return error."""
         mock_connect.side_effect = RuntimeError("Unexpected error")
@@ -226,7 +226,7 @@ class TestSaveDocument:
         self.tools = _get_tools()
         self.fn = self.tools["save_document"]
 
-    @patch("kicad_mcp.tools.kipy_tools._connect")
+    @patch("kcaa.tools.kipy_tools._connect")
     def test_save_pcb_success(self, mock_connect):
         """When saving a PCB file successfully."""
         mock_kicad = MagicMock()
@@ -254,7 +254,7 @@ class TestSaveDocument:
             assert result["success"] is True
             assert result["document_type"] == "pcb"
 
-    @patch("kicad_mcp.tools.kipy_tools._connect")
+    @patch("kcaa.tools.kipy_tools._connect")
     def test_save_schematic_success(self, mock_connect):
         """When saving a schematic file successfully."""
         mock_kicad = MagicMock()
@@ -281,7 +281,7 @@ class TestSaveDocument:
             assert result["success"] is True
             assert result["document_type"] == "schematic"
 
-    @patch("kicad_mcp.tools.kipy_tools._connect")
+    @patch("kcaa.tools.kipy_tools._connect")
     def test_no_pcb_open(self, mock_connect):
         """When no PCB is open in KiCad."""
         mock_kicad = MagicMock()
@@ -304,7 +304,7 @@ class TestSaveDocument:
             assert result["success"] is False
             assert "No PCB is currently open" in result["error"]
 
-    @patch("kicad_mcp.tools.kipy_tools._connect")
+    @patch("kcaa.tools.kipy_tools._connect")
     def test_no_schematic_open(self, mock_connect):
         """When no schematic is open in KiCad."""
         mock_kicad = MagicMock()
@@ -351,7 +351,7 @@ class TestSaveDocument:
         assert result["success"] is False
         assert "Unsupported file type" in result["error"]
 
-    @patch("kicad_mcp.tools.kipy_tools._connect")
+    @patch("kcaa.tools.kipy_tools._connect")
     def test_kicad_not_running(self, mock_connect):
         """When KiCad is not running or IPC unavailable."""
         mock_connect.side_effect = RuntimeError("Not connected to KiCad")
@@ -372,7 +372,7 @@ class TestReloadKicad:
         self.tools = _get_tools()
         self.fn = self.tools["reload_kicad"]
 
-    @patch("kicad_mcp.utils.kipy_reload.try_reload_schematic_in_kicad", return_value=True)
+    @patch("kcaa.utils.kipy_reload.try_reload_schematic_in_kicad", return_value=True)
     def test_reload_schematic_success(self, mock_reload):
         """When schematic reload succeeds."""
         result = _run(self.fn(["/path/to/design.kicad_sch"], ctx=None))
@@ -381,7 +381,7 @@ class TestReloadKicad:
         assert "/path/to/design.kicad_sch" in result["reloaded"]
         assert result["failed"] == []
 
-    @patch("kicad_mcp.utils.kipy_reload.try_reload_pcb_in_kicad", return_value=None)
+    @patch("kcaa.utils.kipy_reload.try_reload_pcb_in_kicad", return_value=None)
     def test_reload_pcb_success(self, mock_reload):
         """When PCB reload succeeds (no exception)."""
         result = _run(self.fn(["/path/to/board.kicad_pcb"], ctx=None))
@@ -390,7 +390,7 @@ class TestReloadKicad:
         assert "/path/to/board.kicad_pcb" in result["reloaded"]
         assert result["failed"] == []
 
-    @patch("kicad_mcp.utils.kipy_reload.try_reload_schematic_in_kicad", return_value=False)
+    @patch("kcaa.utils.kipy_reload.try_reload_schematic_in_kicad", return_value=False)
     def test_reload_schematic_failure(self, mock_reload):
         """When schematic reload fails (returns False)."""
         result = _run(self.fn(["/path/to/design.kicad_sch"], ctx=None))
@@ -400,7 +400,7 @@ class TestReloadKicad:
         assert "errors" in result
         assert "automatically" in result["errors"]["/path/to/design.kicad_sch"].lower()
 
-    @patch("kicad_mcp.utils.kipy_reload.try_reload_pcb_in_kicad", side_effect=RuntimeError("IPC error"))
+    @patch("kcaa.utils.kipy_reload.try_reload_pcb_in_kicad", side_effect=RuntimeError("IPC error"))
     def test_reload_pcb_failure(self, mock_reload):
         """When PCB reload raises exception."""
         result = _run(self.fn(["/path/to/board.kicad_pcb"], ctx=None))
@@ -419,8 +419,8 @@ class TestReloadKicad:
         assert "errors" in result
         assert "Unsupported file extension" in result["errors"]["/path/to/file.txt"]
 
-    @patch("kicad_mcp.utils.kipy_reload.try_reload_schematic_in_kicad", return_value=True)
-    @patch("kicad_mcp.utils.kipy_reload.try_reload_pcb_in_kicad", side_effect=RuntimeError("error"))
+    @patch("kcaa.utils.kipy_reload.try_reload_schematic_in_kicad", return_value=True)
+    @patch("kcaa.utils.kipy_reload.try_reload_pcb_in_kicad", side_effect=RuntimeError("error"))
     def test_mixed_paths(self, mock_pcb, mock_sch):
         """When some paths succeed and others fail."""
         paths = [

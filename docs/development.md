@@ -29,9 +29,9 @@ This guide provides detailed information for developers who want to modify or ex
 The KiCad MCP Server follows a modular architecture:
 
 ```
-kicad-mcp/
+kcaa/
 ├── main.py                         # Entry point
-├── kicad_mcp/                      # Main package
+├── kcaa/                      # Main package
 │   ├── __init__.py
 │   ├── server.py                   # Server creation and setup
 │   ├── config.py                   # Configuration settings
@@ -69,7 +69,7 @@ kicad-mcp/
 
 Resources provide read-only data to the LLM. To add a new resource:
 
-1. Add your function to an existing resource file or create a new one in `kicad_mcp/resources/`:
+1. Add your function to an existing resource file or create a new one in `kcaa/resources/`:
 
 ```python
 from mcp.server.fastmcp import FastMCP
@@ -91,10 +91,10 @@ def register_my_resources(mcp: FastMCP) -> None:
         return f"Formatted data about {parameter}"
 ```
 
-2. Register your resources in `kicad_mcp/server.py`:
+2. Register your resources in `kcaa/server.py`:
 
 ```python
-from kicad_mcp.resources.my_resources import register_my_resources
+from kcaa.resources.my_resources import register_my_resources
 
 def create_server() -> FastMCP:
     # ...
@@ -106,7 +106,7 @@ def create_server() -> FastMCP:
 
 Tools are functions that perform actions or computations. To add a new tool:
 
-1. Add your function to an existing tool file or create a new one in `kicad_mcp/tools/`:
+1. Add your function to an existing tool file or create a new one in `kcaa/tools/`:
 
 ```python
 from typing import Dict, Any
@@ -143,10 +143,10 @@ def register_my_tools(mcp: FastMCP) -> None:
         }
 ```
 
-2. Register your tools in `kicad_mcp/server.py`:
+2. Register your tools in `kcaa/server.py`:
 
 ```python
-from kicad_mcp.tools.my_tools import register_my_tools
+from kcaa.tools.my_tools import register_my_tools
 
 def create_server() -> FastMCP:
     # ...
@@ -158,7 +158,7 @@ def create_server() -> FastMCP:
 
 Prompts are reusable templates for common interactions. To add a new prompt:
 
-1. Add your function to an existing prompt file or create a new one in `kicad_mcp/prompts/`:
+1. Add your function to an existing prompt file or create a new one in `kcaa/prompts/`:
 
 ```python
 from mcp.server.fastmcp import FastMCP
@@ -185,10 +185,10 @@ def register_my_prompts(mcp: FastMCP) -> None:
         return prompt
 ```
 
-2. Register your prompts in `kicad_mcp/server.py`:
+2. Register your prompts in `kcaa/server.py`:
 
 ```python
-from kicad_mcp.prompts.my_prompts import register_my_prompts
+from kcaa.prompts.my_prompts import register_my_prompts
 
 def create_server() -> FastMCP:
     # ...
@@ -201,7 +201,7 @@ def create_server() -> FastMCP:
 The KiCad MCP Server uses a typed lifespan context to share data across requests:
 
 ```python
-from kicad_mcp.context import KiCadAppContext
+from kcaa.context import KiCadAppContext
 
 @mcp.tool()
 def my_tool(parameter: str, ctx: Context) -> Dict[str, Any]:

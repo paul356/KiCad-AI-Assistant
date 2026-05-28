@@ -56,8 +56,8 @@ class _MockMCP:
 
 def _get_tools() -> dict:
     """Register schematic and wire edit tools against a mock MCP and return the dict."""
-    from kicad_mcp.tools.component_edit_tools import register_component_edit_tools
-    from kicad_mcp.tools.wire_edit_tools import register_wire_edit_tools
+    from kcaa.tools.component_edit_tools import register_component_edit_tools
+    from kcaa.tools.wire_edit_tools import register_wire_edit_tools
     mock = _MockMCP()
     register_component_edit_tools(mock)
     register_wire_edit_tools(mock)
@@ -91,7 +91,7 @@ class TestGetPinSchematicPosition:
     """Tests for the _get_pin_schematic_position internal helper."""
 
     def setup_method(self):
-        from kicad_mcp.tools.wire_edit_tools import _get_pin_schematic_position
+        from kcaa.tools.wire_edit_tools import _get_pin_schematic_position
         self._fn = _get_pin_schematic_position
         self._sch = skip.Schematic(SCHEMATIC_PATH)
 

@@ -6,7 +6,7 @@ import os
 
 import pytest
 
-from kicad_mcp.utils.netlist_parser import SchematicParser
+from kcaa.utils.netlist_parser import SchematicParser
 
 # Fixture shared with the tools tests - contains R1…R7 and C1.
 FIXTURE = os.path.join(

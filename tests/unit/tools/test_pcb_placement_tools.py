@@ -1,5 +1,5 @@
 """
-Unit tests for kicad_mcp/tools/pcb_placement_tools.py
+Unit tests for kcaa/tools/pcb_placement_tools.py
 """
 import asyncio
 import os
@@ -7,8 +7,8 @@ import shutil
 
 import pytest
 
-from kicad_mcp.utils.pcb_sexp_utils import load_pcb
-from kicad_mcp.utils.pcb_footprint_utils import (
+from kcaa.utils.pcb_sexp_utils import load_pcb
+from kcaa.utils.pcb_footprint_utils import (
     find_footprint,
     get_fp_at,
     get_fp_layer,
@@ -31,7 +31,7 @@ class _MockMCP:
 
 
 def _get_tools() -> dict:
-    from kicad_mcp.tools.pcb_placement_tools import register_pcb_placement_tools
+    from kcaa.tools.pcb_placement_tools import register_pcb_placement_tools
     mock = _MockMCP()
     register_pcb_placement_tools(mock)
     return mock.tools
@@ -160,8 +160,8 @@ class TestFlipFootprint:
 
 class TestAlignFootprints:
     def test_align_y_to_mean(self, tools, board_with_outline_copy):
-        from kicad_mcp.utils.pcb_sexp_utils import save_pcb
-        from kicad_mcp.utils.pcb_footprint_utils import set_fp_at
+        from kcaa.utils.pcb_sexp_utils import save_pcb
+        from kcaa.utils.pcb_footprint_utils import set_fp_at
 
         data = load_pcb(board_with_outline_copy)
         fp = find_footprint(data, "R3")
@@ -201,8 +201,8 @@ class TestAlignFootprints:
             assert entry["new_y"] == pytest.approx(25.0)
 
     def test_align_x_to_explicit(self, tools, board_with_outline_copy):
-        from kicad_mcp.utils.pcb_sexp_utils import save_pcb
-        from kicad_mcp.utils.pcb_footprint_utils import set_fp_at
+        from kcaa.utils.pcb_sexp_utils import save_pcb
+        from kcaa.utils.pcb_footprint_utils import set_fp_at
 
         data = load_pcb(board_with_outline_copy)
         fp = find_footprint(data, "R3")
@@ -262,8 +262,8 @@ class TestAlignFootprints:
 
 class TestDistributeFootprints:
     def test_three_footprints_evenly_spaced(self, tools, board_with_outline_copy):
-        from kicad_mcp.utils.pcb_sexp_utils import save_pcb
-        from kicad_mcp.utils.pcb_footprint_utils import set_fp_at
+        from kcaa.utils.pcb_sexp_utils import save_pcb
+        from kcaa.utils.pcb_footprint_utils import set_fp_at
 
         data = load_pcb(board_with_outline_copy)
         for ref, new_x in (("R2", 12.0), ("R3", 30.0)):

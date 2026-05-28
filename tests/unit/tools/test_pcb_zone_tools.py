@@ -13,7 +13,7 @@ import re
 import shutil
 import pytest
 
-from kicad_mcp.utils.pcb_sexp_utils import load_pcb
+from kcaa.utils.pcb_sexp_utils import load_pcb
 
 FIXTURE_PCB = os.path.join(
     os.path.dirname(__file__), "fixtures", "test_board_with_zones.kicad_pcb"
@@ -41,7 +41,7 @@ class _MockMCP:
 
 
 def _get_tools() -> dict:
-    from kicad_mcp.tools.pcb_zone_tools import register_pcb_zone_tools
+    from kcaa.tools.pcb_zone_tools import register_pcb_zone_tools
     mock = _MockMCP()
     register_pcb_zone_tools(mock)
     return mock.tools

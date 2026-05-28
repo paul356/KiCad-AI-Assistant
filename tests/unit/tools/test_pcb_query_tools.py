@@ -1,5 +1,5 @@
 """
-Unit tests for kicad_mcp/tools/pcb_query_tools.py
+Unit tests for kcaa/tools/pcb_query_tools.py
 """
 import asyncio
 import os
@@ -26,7 +26,7 @@ class _MockMCP:
 
 
 def _get_tools() -> dict:
-    from kicad_mcp.tools.pcb_query_tools import register_pcb_query_tools
+    from kcaa.tools.pcb_query_tools import register_pcb_query_tools
     mock = _MockMCP()
     register_pcb_query_tools(mock)
     return mock.tools

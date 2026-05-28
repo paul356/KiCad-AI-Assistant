@@ -26,11 +26,11 @@ test:
 	@:
 
 lint:
-	uv run ruff check kicad_mcp/ tests/
-	uv run mypy kicad_mcp/
+	uv run ruff check kcaa/ tests/
+	uv run mypy kcaa/
 
 format:
-	uv run ruff format kicad_mcp/ tests/
+	uv run ruff format kcaa/ tests/
 
 clean:
 	rm -rf dist/
@@ -61,8 +61,8 @@ run:
 #     README.md
 # Install: unzip into ~/.local/share/kicad/<ver>/scripting/plugins/
 #          then run from the plugin dir:
-#            ./setup_plugin.sh /path/to/kicad-mcp
-#   setup_plugin.sh              <- creates .venv with kicad_mcp installed
+#            ./setup_plugin.sh /path/to/kcaa
+#   setup_plugin.sh              <- creates .venv with kcaa from PyPI
 PLUGIN_ZIP := dist/kicad_ai_assistant.zip
 PLUGIN_SRC := kicad_plugin
 

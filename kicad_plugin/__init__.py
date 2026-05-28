@@ -1,5 +1,5 @@
 """
-KiCad Plugin: AI Assistant powered by the kicad-mcp MCP server.
+KiCad Plugin: AI Assistant powered by the kcaa MCP server.
 
 This is the KiCad action plugin entry point. KiCad discovers this file via
 the plugin directory and calls KiCadAIPlugin().register() at startup.
@@ -97,7 +97,7 @@ class KiCadAIPlugin(_ActionPluginBase):
         """Called by KiCad to populate plugin metadata."""
         self.name = "KiCad AI Assistant"
         self.category = "AI"
-        self.description = "LLM-powered schematic editing assistant via kicad-mcp"
+        self.description = "LLM-powered schematic editing assistant via kcaa"
         # Path to the 24×24 PNG icon (optional)
         icon_path = os.path.join(_plugin_dir(), "resources", "icon.png")
         if os.path.exists(icon_path):

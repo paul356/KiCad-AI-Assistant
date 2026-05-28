@@ -1,6 +1,6 @@
 # Capability Inventory
 
-All capabilities currently registered in `kicad_mcp/server.py` are classified here as **keep**, **defer**, or **remove** for the plugin-facing milestone-1 profile.
+All capabilities currently registered in `kcaa/server.py` are classified here as **keep**, **defer**, or **remove** for the plugin-facing milestone-1 profile.
 
 ---
 

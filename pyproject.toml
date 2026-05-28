@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "kicad-mcp"
+name = "kcaa"
 version = "0.1.0"
 description = "Model Context Protocol (MCP) server for KiCad electronic design automation (EDA) files"
 readme = "README.md"
@@ -53,12 +53,12 @@ dependencies = [
 ]
 
 [project.urls]
-"Homepage" = "https://github.com/lamaalrajih/kicad-mcp"
-"Bug Tracker" = "https://github.com/lamaalrajih/kicad-mcp/issues"
-"Documentation" = "https://github.com/lamaalrajih/kicad-mcp#readme"
+"Homepage" = "https://github.com/paul356/KiCad-AI-Assistant"
+"Bug Tracker" = "https://github.com/paul356/KiCad-AI-Assistant/issues"
+"Documentation" = "https://github.com/paul356/KiCad-AI-Assistant#readme"
 
 [project.scripts]
-kicad-mcp = "kicad_mcp.server:main"
+kcaa = "kcaa.server:main"
 
 [dependency-groups]
 dev = [
@@ -123,12 +123,12 @@ unfixable = [
     "D103",  # Missing docstring in public function
     "SLF001", # Private member accessed
 ]
-"kicad_mcp/config.py" = [
+"kcaa/config.py" = [
     "E501",  # Long lines in config are ok
 ]
 
 [tool.ruff.lint.isort]
-known-first-party = ["kicad_mcp"]
+known-first-party = ["kcaa"]
 force-sort-within-sections = true
 
 [tool.ruff.format]
@@ -166,7 +166,7 @@ minversion = "7.0"
 addopts = [
     "--strict-markers",
     "--strict-config",
-    "--cov=kicad_mcp",
+    "--cov=kcaa",
     "--cov-report=term-missing",
     "--cov-report=html:htmlcov",
     "--cov-report=xml",
@@ -193,11 +193,11 @@ filterwarnings = [
 ]
 
 [tool.coverage.run]
-source = ["kicad_mcp"]
+source = ["kcaa"]
 branch = true
 omit = [
     "tests/*",
-    "kicad_mcp/__init__.py",
+    "kcaa/__init__.py",
     "*/migrations/*",
     "*/venv/*",
     "*/.venv/*",
@@ -227,10 +227,10 @@ skips = ["B101", "B601", "B404", "B603", "B110", "B112"]  # Skip low-severity su
 [tool.bandit.assert_used]
 skips = ["*_test.py", "*/test_*.py"]
 
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["kicad_mcp*"]
-exclude = ["tests*", "docs*"]
+[tool.hatch.build.targets.wheel]
+packages = ["kcaa"]
+exclude = ["**/*.db", "**/*.db-shm", "**/*.db-wal"]
 
-[tool.setuptools.package-data]
-"kicad_mcp" = ["prompts/*.txt", "resources/**/*.json"]
+[tool.hatch.build.targets.sdist]
+include = ["kcaa/", "LICENSE", "README.md", "README_CN.md", "pyproject.toml"]
+exclude = ["**/*.db", "**/*.db-shm", "**/*.db-wal"]

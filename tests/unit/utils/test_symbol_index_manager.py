@@ -7,9 +7,9 @@ from pathlib import Path
 
 import pytest
 
-from kicad_mcp.config import LibraryPathConfig
-from kicad_mcp.utils.symbol_index_reader import SymbolIndexReader
-from kicad_mcp.utils.symbol_index_manager import SymbolIndexManager
+from kcaa.config import LibraryPathConfig
+from kcaa.utils.symbol_index_reader import SymbolIndexReader
+from kcaa.utils.symbol_index_manager import SymbolIndexManager
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 

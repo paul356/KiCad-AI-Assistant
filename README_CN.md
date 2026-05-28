@@ -37,8 +37,8 @@ KiCad AI Assistant 是一个 KiCad 动作插件，在 KiCad 内部直接嵌入�
 ### 1. 克隆仓库
 
 ```bash
-git clone https://github.com/paul356/kicad-mcp.git
-cd kicad-mcp
+git clone https://github.com/paul356/kcaa.git
+cd kcaa
 ```
 
 ### 2. 配置环境
@@ -72,12 +72,20 @@ KICAD_3RD_PARTY=~/.local/share/kicad/10.0/3rdparty
 MCP_TRANSPORT=streamable-http
 ```
 
-### 3. 构建并安装插件
+### 3. 安装插件
 
-使用 `make` 构建插件 zip 包，然后解压到 KiCad 插件目录：
+从 [Releases 页面](https://github.com/paul356/KiCad-AI-Assistant/releases) 下载 `kicad-ai-assistant.zip`，解压到 KiCad 插件目录：
 
 ```bash
-# 在 kicad-mcp 仓库根目录执行：
+KICAD_PLUGIN_DIR=~/.local/share/kicad/10.0/scripting/plugins
+mkdir -p "$KICAD_PLUGIN_DIR"
+unzip kicad-ai-assistant.zip -d "$KICAD_PLUGIN_DIR"
+```
+
+或从源码构建：
+
+```bash
+# 在 kcaa 仓库根目录执行：
 make dist-plugin          # 生成 dist/kicad_ai_assistant.zip
 
 KICAD_PLUGIN_DIR=~/.local/share/kicad/10.0/scripting/plugins
@@ -87,11 +95,11 @@ unzip dist/kicad_ai_assistant.zip -d "$KICAD_PLUGIN_DIR"
 
 ### 4. 创建插件虚拟环境
 
-在已安装的插件目录中运行 `setup_plugin.sh`，创建 `.venv` 并将 `kicad_mcp` 以可编辑模式安装。`uv` 会自动安装所需的 Python 版本。
+在已安装的插件目录中运行 `setup_plugin.sh`，创建 `.venv` 并从 PyPI 安装 `kcaa`。`uv` 会自动安装所需的 Python 版本。
 
 ```bash
 cd ~/.local/share/kicad/10.0/scripting/plugins/kicad_ai_assistant
-./setup_plugin.sh /path/to/kicad-mcp
+./setup_plugin.sh
 ```
 
 ### 5. 在 KiCad 中加载插件
@@ -201,11 +209,11 @@ cd ~/.local/share/kicad/10.0/scripting/plugins/kicad_ai_assistant
 ## 项目结构
 
 ```
-kicad-mcp/
+kcaa/
 ├── main.py                  # MCP 服务器入口
 ├── pyproject.toml           # 包元数据和依赖
 ├── .env                     # 本地环境配置（不提交到版本库）
-├── kicad_mcp/               # MCP 服务器包
+├── kcaa/               # MCP 服务器包
 │   ├── server.py            # 服务器初始化和工具注册
 │   ├── config.py            # 配置和 KiCad 路径检测
 │   ├── tools/               # 所有 MCP 工具实现
@@ -213,7 +221,7 @@ kicad-mcp/
 │   └── prompts/             # MCP 提示词模板
 ├── kicad_plugin/            # KiCad 动作插件
 │   ├── __init__.py          # 插件入口（KiCadAIPlugin）
-│   ├── server_manager.py    # 启动/停止 kicad-mcp 子进程
+│   ├── server_manager.py    # 启动/停止 kcaa 子进程
 │   ├── llm_client.py        # LLM 代理工具调用循环（OpenAI / Anthropic）
 │   ├── context_bridge.py    # 从 KiCad 收集当前项目路径
 │   ├── settings.py          # 加载/保存插件配置

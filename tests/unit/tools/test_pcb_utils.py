@@ -1,6 +1,6 @@
 """
-Unit tests for kicad_mcp/utils/pcb_sexp_utils.py and
-kicad_mcp/utils/pcb_footprint_utils.py.
+Unit tests for kcaa/utils/pcb_sexp_utils.py and
+kcaa/utils/pcb_footprint_utils.py.
 
 These modules are pure helpers (no FastMCP dependency) so they can be
 imported and tested without the mcp.tool() decoration pattern.
@@ -11,8 +11,8 @@ import shutil
 import pytest
 import sexpdata
 
-from kicad_mcp.utils.pcb_sexp_utils import load_pcb, save_pcb, _serialize
-from kicad_mcp.utils.pcb_footprint_utils import (
+from kcaa.utils.pcb_sexp_utils import load_pcb, save_pcb, _serialize
+from kcaa.utils.pcb_footprint_utils import (
     find_footprint,
     get_fp_at,
     get_fp_layer,

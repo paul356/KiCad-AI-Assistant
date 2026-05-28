@@ -1,5 +1,5 @@
 """
-Unit tests for kicad_mcp/utils/pcb_board_utils.py
+Unit tests for kcaa/utils/pcb_board_utils.py
 """
 import math
 import os
@@ -8,8 +8,8 @@ import tempfile
 
 import pytest
 
-from kicad_mcp.utils.pcb_sexp_utils import load_pcb, save_pcb
-from kicad_mcp.utils.pcb_board_utils import (
+from kcaa.utils.pcb_sexp_utils import load_pcb, save_pcb
+from kcaa.utils.pcb_board_utils import (
     get_edge_cuts_items,
     remove_edge_cuts_items,
     add_gr_line,
@@ -52,7 +52,7 @@ class TestGetEdgeCutsItems:
 
     def test_empty_when_no_outline(self):
         # Build a minimal PCB with no Edge.Cuts items
-        from kicad_mcp.utils.pcb_sexp_utils import load_pcb as _load
+        from kcaa.utils.pcb_sexp_utils import load_pcb as _load
         import sexpdata
         data = [sexpdata.Symbol("kicad_pcb")]
         items = get_edge_cuts_items(data)

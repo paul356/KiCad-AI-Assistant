@@ -30,14 +30,14 @@ class _MockMCP:
 
 
 def _placement_tools() -> dict:
-    from kicad_mcp.tools.placement_helpers import register_placement_helpers
+    from kcaa.tools.placement_helpers import register_placement_helpers
     mock = _MockMCP()
     register_placement_helpers(mock)
     return mock.tools
 
 
 def _component_tools() -> dict:
-    from kicad_mcp.tools.component_edit_tools import register_component_edit_tools
+    from kcaa.tools.component_edit_tools import register_component_edit_tools
     mock = _MockMCP()
     register_component_edit_tools(mock)
     return mock.tools
@@ -125,7 +125,7 @@ class TestFindFreeArea:
         comps = _component_tools()
         mgr = _make_mock_manager()
         with patch(
-            "kicad_mcp.tools.component_edit_tools._get_index_manager",
+            "kcaa.tools.component_edit_tools._get_index_manager",
             return_value=mgr,
         ):
             res = asyncio.run(comps["add_symbol_to_schematic"](
@@ -169,7 +169,7 @@ class TestFindFreeArea:
         comps = _component_tools()
         mgr = _make_mock_manager()
         with patch(
-            "kicad_mcp.tools.component_edit_tools._get_index_manager",
+            "kcaa.tools.component_edit_tools._get_index_manager",
             return_value=mgr,
         ):
             out = tools["find_free_area"](
@@ -203,7 +203,7 @@ class TestPlaceSymbolRelative:
         comps = _component_tools()
         mgr = _make_mock_manager()
         with patch(
-            "kicad_mcp.tools.component_edit_tools._get_index_manager",
+            "kcaa.tools.component_edit_tools._get_index_manager",
             return_value=mgr,
         ):
             res = asyncio.run(comps["add_symbol_to_schematic"](
@@ -221,7 +221,7 @@ class TestPlaceSymbolRelative:
         comps = _component_tools()
         mgr = _make_mock_manager()
         with patch(
-            "kicad_mcp.tools.component_edit_tools._get_index_manager",
+            "kcaa.tools.component_edit_tools._get_index_manager",
             return_value=mgr,
         ):
             anchor = asyncio.run(comps["add_symbol_to_schematic"](
@@ -259,7 +259,7 @@ class TestPlaceSymbolRelative:
         1, otherwise multi-unit symbols overlap the anchor."""
         from sexpdata import Symbol as S
 
-        from kicad_mcp.utils.symbol_geometry import (
+        from kcaa.utils.symbol_geometry import (
             compute_unit_bboxes, lib_bbox_to_world, union_bboxes,
         )
         lib = [S("symbol"), "DUAL",
@@ -285,7 +285,7 @@ class TestPlaceSymbolRelative:
         comps = _component_tools()
         mgr = _make_mock_manager()
         with patch(
-            "kicad_mcp.tools.component_edit_tools._get_index_manager",
+            "kcaa.tools.component_edit_tools._get_index_manager",
             return_value=mgr,
         ):
             added = asyncio.run(comps["add_symbol_to_schematic"](
@@ -315,7 +315,7 @@ class TestPlaceSymbolRelative:
         comps = _component_tools()
         mgr = _make_mock_manager()
         with patch(
-            "kicad_mcp.tools.component_edit_tools._get_index_manager",
+            "kcaa.tools.component_edit_tools._get_index_manager",
             return_value=mgr,
         ):
             added = asyncio.run(comps["add_symbol_to_schematic"](
@@ -332,7 +332,7 @@ class TestPlaceSymbolRelative:
         assert moved["success"], moved
         # Read back the .kicad_sch and verify the placed symbol's `at` is
         # at the nearest grid point to (90.10, 90.10), i.e. 71*1.27=90.17.
-        from kicad_mcp.utils.netlist_parser import extract_netlist
+        from kcaa.utils.netlist_parser import extract_netlist
         netlist = extract_netlist(tmp_sch)
         comp = netlist["components"][ref]
         x_pos, y_pos = comp["position"]["x"], comp["position"]["y"]
