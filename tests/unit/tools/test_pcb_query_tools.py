@@ -49,8 +49,8 @@ def board_no_net_table(tmp_path):
     dest = tmp_path / "board_no_net_table.kicad_pcb"
     shutil.copy(BOARD_FIXTURE, dest)
     text = dest.read_text(encoding="utf-8")
-    text = re.sub(r'^\t\(net\s+\d+\s+"[^"]*"\)\n', "", text, flags=re.MULTILINE)
-    text = re.sub(r'\(net\s+\d+\s+"([^"]*)"\)', r'(net "\1")', text)
+    # Remove top-level net declarations (KiCad 10 format)
+    text = re.sub(r'^\t\(net\s+"[^"]*"\)\n', "", text, flags=re.MULTILINE)
     dest.write_text(text, encoding="utf-8")
     return str(dest)
 
@@ -66,7 +66,7 @@ class TestGetBoardInfo:
 
     def test_returns_net_count(self, tools):
         result = _run(tools["get_board_info"](pcb_path=BOARD_FIXTURE, ctx=None))
-        assert result["net_count"] == 3  # nets 1-3 (net 0 excluded)
+        assert result["net_count"] == 3  # VCC, GND, NET_A
 
     def test_returns_net_count_without_top_level_net_table(self, tools, board_no_net_table):
         result = _run(tools["get_board_info"](pcb_path=board_no_net_table, ctx=None))

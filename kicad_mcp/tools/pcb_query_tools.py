@@ -36,19 +36,37 @@ log = logging.getLogger(__name__)
 
 
 def _collect_top_level_nets(data: List[Any]) -> tuple[Dict[int, str], Dict[str, int]]:
-    """Return board net lookup tables from top-level ``(net ...)`` entries."""
+    """Return board net lookup tables from top-level ``(net ...)`` entries.
+    
+    Supports both KiCad 8 format ``(net <id> "<name>")`` and KiCad 10 format
+    ``(net "<name>")``. For KiCad 10, net IDs are assigned sequentially starting
+    from 1 (ID 0 is reserved for unconnected).
+    """
     net_id_to_name: Dict[int, str] = {}
     net_name_to_id: Dict[str, int] = {}
+    next_id = 1
     for item in data:
-        if isinstance(item, list) and len(item) >= 3 and _sym(item[0]) == "net":
+        if not (isinstance(item, list) and len(item) >= 2 and _sym(item[0]) == "net"):
+            continue
+        # KiCad 8: (net <id> "<name>")
+        if len(item) >= 3:
             try:
                 net_id = int(item[1])
-            except (TypeError, ValueError):
+                net_name = item[2] if isinstance(item[2], str) else _sym(item[2])
+                net_id_to_name[net_id] = net_name
+                if net_name:
+                    net_name_to_id[net_name] = net_id
+                if net_id >= next_id:
+                    next_id = net_id + 1
                 continue
-            net_name = item[2] if isinstance(item[2], str) else _sym(item[2])
-            net_id_to_name[net_id] = net_name
-            if net_name:
-                net_name_to_id[net_name] = net_id
+            except (TypeError, ValueError):
+                pass
+        # KiCad 10: (net "<name>")
+        net_name = item[1] if isinstance(item[1], str) else _sym(item[1])
+        if net_name and net_name not in net_name_to_id:
+            net_id_to_name[next_id] = net_name
+            net_name_to_id[net_name] = next_id
+            next_id += 1
     return net_id_to_name, net_name_to_id
 
 
@@ -57,7 +75,12 @@ def _parse_net_ref(
     net_name_to_id: Dict[str, int],
     net_id_to_name: Dict[int, str],
 ) -> tuple[int | None, str]:
-    """Parse a KiCad net reference in either legacy or name-only form."""
+    """Parse a KiCad net reference in either legacy or name-only form.
+    
+    Supports:
+    - KiCad 8: ``(net <id> "<name>")``
+    - KiCad 10: ``(net "<name>")``
+    """
     if len(net_node) >= 3:
         try:
             net_id = int(net_node[1])
@@ -66,15 +89,12 @@ def _parse_net_ref(
         except (TypeError, ValueError):
             pass
 
+    # KiCad 10 format: (net "<name>")
     if len(net_node) >= 2:
         raw = net_node[1] if isinstance(net_node[1], str) else _sym(net_node[1])
         if raw in net_name_to_id:
             return net_name_to_id[raw], raw
-        try:
-            net_id = int(raw)
-            return net_id, net_id_to_name.get(net_id, str(net_id))
-        except (TypeError, ValueError):
-            return None, raw
+        return None, raw
 
     return None, ""
 
@@ -153,12 +173,16 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
 
         copper_layers = [lay for lay in layers if lay["type"] in ("signal", "mixed", "power")]
 
+        # KiCad 8 has net 0 with empty name, KiCad 10 doesn't
+        has_empty_net = any(name == "" for name in pad_net_names) or net_count == 0
+        adjusted_net_count = max(0, net_count - 1) if has_empty_net else net_count
+
         return {
             "thickness_mm": thickness,
             "copper_layer_count": len(copper_layers),
             "all_layers": layers,
             "footprint_count": footprint_count,
-            "net_count": max(0, net_count - 1) if net_count else len(pad_net_names),
+            "net_count": adjusted_net_count if net_count else len(pad_net_names),
             "segment_count": segment_count,
             "via_count": via_count,
             "generator": generator,
@@ -266,8 +290,8 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
             for psub in sub:
                 if isinstance(psub, list) and len(psub) >= 3 and _sym(psub[0]) == "at":
                     pad_x, pad_y = float(psub[1]), float(psub[2])
-                elif isinstance(psub, list) and len(psub) >= 3 and _sym(psub[0]) == "net":
-                    net_name = psub[2] if isinstance(psub[2], str) else _sym(psub[2])
+                elif isinstance(psub, list) and len(psub) >= 2 and _sym(psub[0]) == "net":
+                    _, net_name = _parse_net_ref(psub, {}, {})
             pads.append({
                 "number": str(pad_num),
                 "type": str(pad_type),

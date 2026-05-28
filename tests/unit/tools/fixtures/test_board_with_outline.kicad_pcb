@@ -1,7 +1,7 @@
 (kicad_pcb
-(version 20241229)
+(version 20260206)
 (generator "pcbnew")
-(generator_version "8.0")
+(generator_version "10.0")
 (general
 (thickness 1.6)
 (legacy_teardrops no)
@@ -14,7 +14,6 @@
 (37 "F.Courtyard" user)
 (44 "Edge.Cuts" user)
 )
-(net 0 "")
 (footprint "Resistor_SMD:R_0402"
 (layer "F.Cu")
 (at 10.0 20.0 0.0)
