@@ -53,6 +53,7 @@ echo "Step 3/4 — Detecting KiCad configuration ..."
 # Extract KICAD_VERSION from plugin directory path
 # Expected path format: ~/.local/share/kicad/10.0/scripting/plugins/kicad_ai_assistant
 KICAD_VERSION=""
+shopt -s nocasematch
 if [[ "$PLUGIN_DIR" =~ /kicad/([0-9]+\.[0-9]+)/ ]]; then
     KICAD_VERSION="${BASH_REMATCH[1]}"
     echo "  Detected KiCad version: $KICAD_VERSION"
@@ -64,6 +65,7 @@ else
         exit 1
     fi
 fi
+shopt -u nocasematch
 
 # Generate .env configuration file
 ENV_FILE="$PLUGIN_DIR/.env"

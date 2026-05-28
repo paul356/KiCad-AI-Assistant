@@ -11,10 +11,9 @@ Tested on **KiCad 10.0 / Linux**.
   - [Prerequisites](#prerequisites)
   - [Installation](#installation)
     - [1. Clone the repository](#1-clone-the-repository)
-    - [2. Configure the environment](#2-configure-the-environment)
-    - [3. Build and install the plugin](#3-build-and-install-the-plugin)
-    - [4. Create the plugin virtual environment](#4-create-the-plugin-virtual-environment)
-    - [5. Load the plugin in KiCad](#5-load-the-plugin-in-kicad)
+    - [2. Install the plugin](#2-install-the-plugin)
+    - [3. Create the plugin virtual environment](#3-create-the-plugin-virtual-environment)
+    - [4. Load the plugin in KiCad](#4-load-the-plugin-in-kicad)
   - [Configuration](#configuration)
   - [Feature Highlights](#feature-highlights)
   - [Available Tools](#available-tools)
@@ -34,45 +33,16 @@ Tested on **KiCad 10.0 / Linux**.
 
 ## Installation
 
-### 1. Clone the repository
+### 1. Clone the repository (optional)
+
+Only needed if you want to build the plugin from source or contribute to the project. Skip this step if you're downloading the pre-built plugin from the Releases page.
 
 ```bash
 git clone https://github.com/paul356/kcaa.git
 cd kcaa
 ```
 
-### 2. Configure the environment
-
-Create a `.env` file in the repository root to tell the server where KiCad is installed and where your projects live:
-
-```bash
-cp .env.example .env
-vim .env
-```
-
-Key variables to set:
-
-| Variable | Description | Example |
-|----------|-------------|---------|
-| `KICAD_SEARCH_PATHS` | Comma-separated directories to scan for KiCad projects | `/home/user/pcb` |
-| `KICAD_APP_PATH` | Path to KiCad's shared data directory | `/usr/share/kicad` |
-| `KICAD_VERSION` | KiCad major.minor version | `10.0` |
-| `KICAD_CONFIG_DIR` | KiCad user config directory | `~/.config/kicad/10.0` |
-| `KICAD_3RD_PARTY` | KiCad third-party plugins directory | `~/.local/share/kicad/10.0/3rdparty` |
-| `MCP_TRANSPORT` | MCP transport protocol | `streamable-http` |
-
-A typical Linux `.env` looks like:
-
-```dotenv
-KICAD_SEARCH_PATHS=/home/user/pcb
-KICAD_APP_PATH=/usr/share/kicad
-KICAD_VERSION=10.0
-KICAD_CONFIG_DIR=~/.config/kicad/10.0
-KICAD_3RD_PARTY=~/.local/share/kicad/10.0/3rdparty
-MCP_TRANSPORT=streamable-http
-```
-
-### 3. Install the plugin
+### 2. Install the plugin
 
 Download `kicad-ai-assistant.zip` from the [Releases page](https://github.com/paul356/KiCad-AI-Assistant/releases) and unzip it into KiCad's plugin directory:
 
@@ -93,16 +63,18 @@ mkdir -p "$KICAD_PLUGIN_DIR"
 unzip dist/kicad_ai_assistant.zip -d "$KICAD_PLUGIN_DIR"
 ```
 
-### 4. Create the plugin virtual environment
+### 3. Create the plugin virtual environment
 
-Run `setup_plugin.sh` from inside the installed plugin directory to create a `.venv` and install `kcaa` from PyPI. `uv` will automatically install the required Python version.
+Run `setup_plugin.sh` from inside the installed plugin directory to create a `.venv`, install `kcaa` from PyPI, and auto-generate the `.env` configuration file. `uv` will automatically install the required Python version.
 
 ```bash
 cd ~/.local/share/kicad/10.0/scripting/plugins/kicad_ai_assistant
 ./setup_plugin.sh
 ```
 
-### 5. Load the plugin in KiCad
+The script will detect your KiCad version from the plugin directory path and generate a `.env` file with platform-specific configuration paths.
+
+### 4. Load the plugin in KiCad
 
 1. Open KiCad and load your project.
 2. Open the **Schematic Editor** or **PCB Editor**.
@@ -129,6 +101,27 @@ All settings can be changed through **Options → Settings** in the plugin panel
 | `llm_context_tokens` | Total context window size in tokens | `128000` |
 | `llm_compact_threshold` | Trigger context compaction at this usage fraction | `0.70` |
 
+## Standalone MCP Server
+
+You can also run `kcaa` as a standalone MCP server without the KiCad plugin. This is useful for integrating with other MCP clients (e.g., Claude Desktop, Cursor).
+
+Create a `.env` file in your working directory:
+
+```dotenv
+KICAD_SEARCH_PATHS=/home/user/pcb
+KICAD_APP_PATH=/usr/share/kicad
+KICAD_VERSION=10.0
+KICAD_CONFIG_DIR=~/.config/kicad/10.0
+KICAD_3RD_PARTY=~/.local/share/kicad/10.0/3rdparty
+MCP_TRANSPORT=streamable-http
+```
+
+Then start the server:
+
+```bash
+kcaa
+```
+
 ## Feature Highlights
 
 - **Schematic editing** — Add/remove symbols, set properties, draw and delete wires, connect pins automatically
@@ -141,72 +134,154 @@ All settings can be changed through **Options → Settings** in the plugin panel
 
 ## Available Tools
 
-### Schematic Tools
+### Project Tools
 
 | Tool | Description |
 |------|-------------|
-| `list_symbol_libraries` | List all available symbol libraries |
-| `search_symbols` | Search symbols by name, description, or keyword |
-| `get_symbol` | Get detailed information about a symbol |
-| `get_symbol_pins` | Get pin definitions for a symbol |
+| `list_projects` | Find and list all KiCad projects |
+| `get_project_structure` | Get the structure and files of a KiCad project |
+| `open_project` | Open a KiCad project in KiCad |
+
+### Symbol Library
+
+| Tool | Description |
+|------|-------------|
 | `sync_symbol_index` | Build or refresh the symbol library index |
 | `get_symbol_sync_status` | Query symbol index build progress |
 | `get_symbol_index_stats` | Get statistics about the symbol index |
-| `get_symbol_index_libraries` | List libraries present in the symbol index |
+| `list_symbol_libraries` | List symbol libraries from the index |
+| `search_symbols` | Full-text search across indexed symbols |
+| `get_symbol` | Look up a symbol by library and name |
+| `get_library_symbols` | Return symbols in a specific library |
+| `get_symbol_pins` | Get pin definitions for a symbol |
+
+### Schematic Editing
+
+| Tool | Description |
+|------|-------------|
 | `add_symbol_to_schematic` | Place a symbol on the schematic |
-| `remove_symbol_from_schematic` | Remove a placed symbol by reference |
-| `move_component` | Move a component to new coordinates |
+| `place_symbol_relative` | Place a symbol relative to an existing component |
+| `remove_symbol_from_schematic` | Remove placed symbol by reference |
+| `move_component` | Move and/or rotate a placed component |
 | `set_component_property` | Set a property field on a placed symbol |
-| `get_component_properties` | Read all property fields of a placed symbol |
-| `add_wire_to_schematic` | Draw a wire segment between two points |
-| `connect_pins_with_wire` | Automatically route a wire between two pins |
-| `delete_wire_from_schematic` | Remove a wire segment |
-| `save_snapshot` | Save a snapshot of the current schematic for rollback |
-| `list_projects` | List KiCad projects in the search paths |
-| `get_project_info` | Get information about a KiCad project |
-| `open_project` | Open a KiCad project |
-| `extract_schematic_netlist` | Extract the netlist from a schematic |
-| `extract_project_netlist` | Extract the netlist for a whole project |
-| `find_component_connections` | Find all nets connected to a component |
-| `analyze_schematic` | Analyse the schematic for design issues |
+| `list_component_properties` | List all properties of a placed symbol |
+| `delete_component_property` | Delete a property from a placed symbol |
+| `connect_points_with_wire` | Route a smart orthogonal wire between two points |
+| `connect_pins_with_wire` | Connect two symbol pins with a wire |
+| `delete_wire_from_schematic` | Remove wire segments by endpoints |
+| `add_label_to_schematic` | Add a local net label |
+| `list_labels_in_schematic` | List all local net labels |
+| `delete_label_from_schematic` | Delete net labels |
+| `get_schematic_sheet_info` | Get drawing area, paper size, and grid |
+| `find_free_area` | Find candidate areas for placing a block |
+
+### Schematic Analysis
+
+| Tool | Description |
+|------|-------------|
+| `extract_schematic_netlist` | Extract netlist from a schematic |
+| `extract_project_netlist` | Extract netlist for a whole project |
+| `find_component_connections` | Find all connections for a component |
 | `identify_circuit_patterns` | Identify common circuit patterns |
-| `recognize_circuit_patterns` | Extended pattern recognition |
-| `run_drc` | Run KiCad CLI design-rule check |
-| `get_drc_history` | Retrieve historical DRC results |
-| `generate_bom` | Generate a bill of materials |
-| `export_bom` | Export the BOM to a file |
-| `generate_thumbnail` | Render a PCB thumbnail image |
+| `analyze_project_circuit_patterns` | Analyze circuit patterns in a project |
+| `validate_project` | Basic validation of a KiCad project |
+| `validate_project_boundaries` | Validate component boundaries |
+| `generate_validation_report` | Generate a comprehensive validation report |
 
-### PCB Tools
+### PCB Library
 
-| # | Tool | Description |
-|---|------|-------------|
-| 1 | `sync_footprint_index` | Build or incrementally update the footprint library index |
-| 2 | `get_footprint_sync_status` | Query footprint index build progress |
-| 3 | `list_footprint_libraries` | List all available footprint libraries |
-| 4 | `search_footprints` | Search footprints by name, description, or tag |
-| 5 | `get_footprint_details` | Get footprint details (pads, bounding box, etc.) |
-| 6 | `get_board_info` | Get basic PCB board information |
-| 7 | `list_footprints` | List all footprints placed on the board |
-| 8 | `get_footprint` | Get details of a single placed footprint |
-| 9 | `list_nets` | List all nets on the board |
-| 10 | `get_ratsnest` | Get unrouted ratsnest connections |
-| 11 | `get_board_outline` | Read Edge.Cuts board outline elements |
-| 12 | `clear_board_outline` | Clear the board outline |
-| 13 | `add_board_outline_segment` | Add a line segment to the board outline |
-| 14 | `add_board_outline_arc` | Add an arc to the board outline |
-| 15 | `set_board_outline_rect` | Set a rectangular board outline (with optional rounded corners) |
-| 16 | `get_footprint_bbox` | Get the courtyard bounding box of a footprint |
-| 17 | `get_board_bounding_box` | Get the union bounding box of all footprints |
-| 18 | `align_footprints` | Align a group of footprints to the same axis |
-| 19 | `distribute_footprints` | Distribute footprints evenly along an axis |
-| 20 | `move_footprints_by_delta` | Translate a group of footprints by (dx, dy) |
-| 21 | `find_free_pcb_area` | Find an area on the board free of existing footprints |
-| 22 | `set_footprint_position` | Move and/or rotate a single footprint |
-| 23 | `flip_footprint` | Flip a footprint between top and bottom layer |
-| 24 | `set_footprint_property` | Set a property field on a footprint |
-| 25 | `update_pcb_from_schematic` | Trigger *Update PCB from Schematic* via KiCad IPC |
-| 26 | `reload_kicad` | Reload the active file in the KiCad editor |
+| Tool | Description |
+|------|-------------|
+| `sync_footprint_index` | Build or refresh the footprint library index |
+| `get_footprint_sync_status` | Query footprint index build progress |
+| `list_footprint_libraries` | List all available footprint libraries |
+| `search_footprints` | Search footprints by name, description, or tag |
+| `get_footprint_details` | Get footprint details (pads, bounding box, etc.) |
+
+### PCB Query
+
+| Tool | Description |
+|------|-------------|
+| `get_board_info` | Get basic PCB board information |
+| `list_footprints` | List all footprints placed on the board |
+| `get_footprint` | Get details of a single placed footprint |
+| `get_footprint_bbox` | Get the courtyard bounding box of a footprint |
+| `get_board_bounding_box` | Get the union bounding box of all footprints |
+| `list_nets` | List all nets on the board |
+| `get_ratsnest` | Get unrouted ratsnest connections |
+| `score_placement` | Score the current PCB placement quality |
+| `suggest_placement_order` | Get recommended footprint placement order |
+
+### PCB Editing
+
+| Tool | Description |
+|------|-------------|
+| `get_board_outline` | Read Edge.Cuts board outline elements |
+| `clear_board_outline` | Clear the board outline |
+| `add_board_outline_segment` | Add a line segment to the board outline |
+| `add_board_outline_arc` | Add an arc to the board outline |
+| `set_board_outline_rect` | Set a rectangular board outline (with optional rounded corners) |
+| `set_footprint_property` | Set a property field on a footprint |
+| `update_pcb_from_schematic` | Trigger *Update PCB from Schematic* via KiCad IPC |
+
+### PCB Placement
+
+| Tool | Description |
+|------|-------------|
+| `set_footprint_position` | Move and/or rotate a single footprint |
+| `flip_footprint` | Flip a footprint between top and bottom layer |
+| `align_footprints` | Align footprints to the same axis |
+| `distribute_footprints` | Distribute footprints evenly along an axis |
+| `move_footprints_by_delta` | Translate footprints by (dx, dy) |
+| `find_free_pcb_area` | Find an area free of existing footprints |
+
+### PCB Groups
+
+| Tool | Description |
+|------|-------------|
+| `assign_to_group` | Assign footprints to a placement group |
+| `list_groups` | List all placement groups on the board |
+| `get_group` | Get details of a placement group |
+| `score_group` | Score intra-group placement quality |
+| `place_component_group` | Place all members of a group |
+| `move_group` | Translate a placed group |
+| `rotate_group` | Rotate a placed group around its anchor |
+
+### PCB Zones
+
+| Tool | Description |
+|------|-------------|
+| `list_zones` | List all copper-pour and keepout zones |
+| `add_zone` | Add a copper-pour or keepout zone |
+| `delete_zone` | Delete a zone by UUID |
+| `refill_zones` | Refill all zones on the PCB |
+
+### DRC & BOM
+
+| Tool | Description |
+|------|-------------|
+| `run_drc_check` | Run KiCad design-rule check |
+| `get_drc_history_tool` | Retrieve historical DRC results |
+| `analyze_bom` | Analyze the bill of materials |
+| `export_bom_csv` | Export the BOM to CSV |
+
+### Versioning & Export
+
+| Tool | Description |
+|------|-------------|
+| `save_file_version` | Save a version snapshot for rollback |
+| `list_file_versions` | List saved version snapshots |
+| `restore_file_version` | Restore to a previously saved version |
+| `generate_pcb_thumbnail` | Render a PCB thumbnail image |
+| `generate_project_thumbnail` | Render a project thumbnail |
+
+### KiCad IPC
+
+| Tool | Description |
+|------|-------------|
+| `check_kicad_ipc_connection` | Check if the KiCad IPC socket is responsive |
+| `save_document` | Save the active document in KiCad |
+| `reload_kicad` | Reload documents in the running KiCad editor |
 
 ## Project Structure
 
@@ -214,20 +289,26 @@ All settings can be changed through **Options → Settings** in the plugin panel
 kcaa/
 ├── main.py                  # MCP server entry point
 ├── pyproject.toml           # Package metadata and dependencies
-├── .env                     # Local environment configuration (not committed)
-├── kcaa/               # MCP server package
+├── run_tests.py             # Test runner script
+├── kcaa/                    # MCP server package
 │   ├── server.py            # Server setup and tool registration
 │   ├── config.py            # Configuration and KiCad path detection
+│   ├── context.py           # Request context management
 │   ├── tools/               # All MCP tool implementations
 │   ├── resources/           # MCP resource handlers
-│   └── prompts/             # MCP prompt templates
+│   ├── prompts/             # MCP prompt templates
+│   └── utils/               # Utility functions
 ├── kicad_plugin/            # KiCad action plugin
 │   ├── __init__.py          # Plugin entry point (KiCadAIPlugin)
 │   ├── server_manager.py    # Start/stop the kcaa subprocess
 │   ├── llm_client.py        # Agentic tool-call loop (OpenAI / Anthropic)
 │   ├── context_bridge.py    # Collect active project paths from KiCad
 │   ├── settings.py          # Load/save plugin settings
-│   ├── setup_plugin.sh      # Helper script to create the plugin .venv
+│   ├── autorouter.py        # FreeRouting integration
+│   ├── tool_registry.py     # Tool metadata and categorization
+│   ├── setup_plugin.sh      # Linux/macOS setup script
+│   ├── setup_plugin.ps1     # Windows PowerShell setup script
+│   ├── setup_plugin.bat     # Windows batch setup script
 │   └── ui/                  # wxPython chat panel and settings dialog
 ├── docs/                    # Feature documentation
 └── tests/                   # Unit tests
@@ -241,7 +322,7 @@ kcaa/
 - Check that `setup_plugin.sh` completed without errors and that `.venv/bin/python` exists inside the plugin directory.
 
 **MCP server fails to start:**
-- Verify `KICAD_APP_PATH` and `KICAD_VERSION` in `.env` point to your actual KiCad installation.
+- Verify the `.env` file in the plugin directory contains correct `KICAD_VERSION` and platform-specific paths.
 - Check the plugin log in `~/.config/kicad/` (Linux) for Python tracebacks.
 
 **Schematic editor does not refresh after edits:**
