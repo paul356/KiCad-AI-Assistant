@@ -4,6 +4,7 @@ Environment variable handling for KiCad MCP Server.
 
 import logging
 import os
+import platform
 
 
 def load_dotenv(env_file: str = ".env") -> dict[str, str]:
@@ -106,6 +107,39 @@ def find_env_file(filename: str = ".env") -> str | None:
         current_dir = parent_dir
 
     return None
+
+
+def get_kcaa_data_dir() -> str:
+    """Get the kcaa data directory for storing SQLite databases and other persistent data.
+    
+    This directory is located under KICAD_CONFIG_DIR/kcaa:
+    - Linux: ~/.config/kicad/kcaa
+    - macOS: ~/Library/Preferences/kicad/kcaa
+    - Windows: %APPDATA%/kicad/kcaa
+    
+    Returns:
+        Path to the kcaa data directory
+    """
+    # First try KICAD_CONFIG_DIR from environment
+    kicad_config_dir = os.environ.get("KICAD_CONFIG_DIR")
+    if kicad_config_dir:
+        kicad_config_dir = os.path.expanduser(kicad_config_dir)
+        kicad_config_dir = os.path.expandvars(kicad_config_dir)
+    else:
+        # Fall back to platform-specific defaults
+        system = platform.system()
+        if system == "Darwin":
+            kicad_config_dir = os.path.expanduser("~/Library/Preferences/kicad")
+        elif system == "Windows":
+            kicad_config_dir = os.path.join(
+                os.environ.get("APPDATA", os.path.expanduser("~")), "kicad"
+            )
+        else:  # Linux and others
+            kicad_config_dir = os.path.expanduser("~/.config/kicad")
+    
+    data_dir = os.path.join(kicad_config_dir, "kcaa")
+    os.makedirs(data_dir, exist_ok=True)
+    return data_dir
 
 
 def get_env_list(env_var: str, default: str = "") -> list:

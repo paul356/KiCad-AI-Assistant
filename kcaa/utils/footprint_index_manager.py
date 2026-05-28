@@ -47,7 +47,9 @@ from kcaa.utils.pcb_library_utils import (
 
 log = logging.getLogger(__name__)
 
-_DEFAULT_DB_PATH = Path(__file__).parent / "footprint_db" / "kicad_footprints.db"
+from kcaa.utils.env import get_kcaa_data_dir
+
+_DEFAULT_DB_PATH = Path(get_kcaa_data_dir()) / "kicad_footprints.db"
 
 
 @dataclass

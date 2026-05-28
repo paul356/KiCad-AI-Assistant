@@ -7,19 +7,13 @@ This will allow users to compare DRC results over time.
 from datetime import datetime
 import json
 import os
-import platform
 import time
 from typing import Any
 
+from kcaa.utils.env import get_kcaa_data_dir
+
 # Directory for storing DRC history
-if platform.system() == "Windows":
-    # Windows: Use APPDATA or LocalAppData
-    DRC_HISTORY_DIR = os.path.join(
-        os.environ.get("APPDATA", os.path.expanduser("~")), "kcaa", "drc_history"
-    )
-else:
-    # macOS/Linux: Use ~/.kcaa/drc_history
-    DRC_HISTORY_DIR = os.path.expanduser("~/.kcaa/drc_history")
+DRC_HISTORY_DIR = os.path.join(get_kcaa_data_dir(), "drc_history")
 
 
 def ensure_history_dir() -> None:

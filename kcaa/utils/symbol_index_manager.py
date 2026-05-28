@@ -34,7 +34,9 @@ from kcaa.utils.symbol_index_reader import SymbolIndexReader
 
 log = logging.getLogger(__name__)
 
-_DEFAULT_DB_PATH = Path(__file__).parent / "symbol_db" / "kicad_symbols.db"
+from kcaa.utils.env import get_kcaa_data_dir
+
+_DEFAULT_DB_PATH = Path(get_kcaa_data_dir()) / "kicad_symbols.db"
 
 
 # ---------------------------------------------------------------------------
