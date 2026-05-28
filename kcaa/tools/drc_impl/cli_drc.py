@@ -10,7 +10,7 @@ from typing import Any
 
 from fastmcp import Context
 
-from kcaa.config import system
+from kcaa.utils.config import config
 
 
 async def run_drc_via_cli(pcb_file: str, ctx: Context | None) -> dict[str, Any]:
@@ -117,7 +117,7 @@ def find_kicad_cli() -> str | None:
     """
     # Check if kicad-cli is in PATH
     try:
-        if system == "Windows":
+        if config.system == "Windows":
             # On Windows, check for kicad-cli.exe
             result = subprocess.run(["where", "kicad-cli.exe"], capture_output=True, text=True)
             if result.returncode == 0:
@@ -133,13 +133,13 @@ def find_kicad_cli() -> str | None:
 
     # If we get here, kicad-cli is not in PATH
     # Try common installation locations
-    if system == "Windows":
+    if config.system == "Windows":
         # Common Windows installation path
         potential_paths = [
             r"C:\Program Files\KiCad\bin\kicad-cli.exe",
             r"C:\Program Files (x86)\KiCad\bin\kicad-cli.exe",
         ]
-    elif system == "Darwin":  # macOS
+    elif config.system == "Darwin":  # macOS
         # Common macOS installation paths
         potential_paths = [
             "/Applications/KiCad/KiCad.app/Contents/MacOS/kicad-cli",

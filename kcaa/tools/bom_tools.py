@@ -671,11 +671,9 @@ async def export_bom_with_cli(
     output_file = os.path.join(output_dir, f"{project_name}_bom.csv")
 
     # Define the command based on operating system
-    if system == "Darwin":  # macOS
-        from kcaa.config import KICAD_APP_PATH
-
+    if config.system == "Darwin":  # macOS
         # Path to KiCad command-line tools on macOS
-        kicad_cli = os.path.join(KICAD_APP_PATH, "Contents/MacOS/kicad-cli")
+        kicad_cli = os.path.join(config.kicad_app_path, "Contents/MacOS/kicad-cli")
 
         if not os.path.exists(kicad_cli):
             return {
@@ -687,11 +685,9 @@ async def export_bom_with_cli(
         # Command to generate BOM
         cmd = [kicad_cli, "sch", "export", "bom", "--output", output_file, schematic_file]
 
-    elif system == "Windows":
-        from kcaa.config import KICAD_APP_PATH
-
+    elif config.system == "Windows":
         # Path to KiCad command-line tools on Windows
-        kicad_cli = os.path.join(KICAD_APP_PATH, "bin", "kicad-cli.exe")
+        kicad_cli = os.path.join(config.kicad_app_path, "bin", "kicad-cli.exe")
 
         if not os.path.exists(kicad_cli):
             return {

@@ -97,7 +97,7 @@ class ServerManager:
                     kwargs["start_new_session"] = True
 
                 log_dir = self._settings.resolved_log_dir
-                log_path = os.path.join(log_dir, "kcaa_server.log") if log_dir else None
+                log_path = os.path.join(log_dir, "kcaa_server_plugin.log") if log_dir else None
                 if log_path:
                     os.makedirs(log_dir, exist_ok=True)
                     log_file = open(log_path, "a")  # noqa: SIM115 — kept open for subprocess lifetime

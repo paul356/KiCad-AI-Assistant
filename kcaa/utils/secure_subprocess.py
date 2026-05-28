@@ -10,7 +10,7 @@ import logging
 import os
 import subprocess  # nosec B404 - subprocess usage is secured with validation
 
-from ..config import TIMEOUT_CONSTANTS
+from .config import config
 from .kicad_cli import get_kicad_cli_path
 from .path_validator import PathValidator, get_default_validator
 
@@ -39,7 +39,7 @@ class SecureSubprocessRunner:
             path_validator: Path validator to use (defaults to global instance)
         """
         self.path_validator = path_validator or get_default_validator()
-        self.default_timeout = TIMEOUT_CONSTANTS["subprocess_default"]
+        self.default_timeout = config.timeout_constants["subprocess_default"]
 
     def run_kicad_command(
         self,
@@ -214,7 +214,7 @@ class SecureSubprocessRunner:
         self,
         command: list[str],
         working_dir: str | None = None,
-        timeout: float = TIMEOUT_CONSTANTS["subprocess_default"],
+        timeout: float | None = None,
         capture_output: bool = True,
     ) -> subprocess.CompletedProcess:
         """
@@ -223,7 +223,7 @@ class SecureSubprocessRunner:
         Args:
             command: Command to execute
             working_dir: Working directory
-            timeout: Timeout in seconds
+            timeout: Timeout in seconds (defaults to config.timeout_constants["subprocess_default"])
             capture_output: Whether to capture output
 
         Returns:
@@ -232,6 +232,9 @@ class SecureSubprocessRunner:
         Raises:
             subprocess.SubprocessError: If command fails
         """
+        if timeout is None:
+            timeout = config.timeout_constants["subprocess_default"]
+        
         kwargs = {
             "timeout": timeout,
             "cwd": working_dir,

@@ -10,7 +10,7 @@ import subprocess
 from fastmcp import Context, FastMCP
 from fastmcp.utilities.types import Image
 
-from kcaa.config import KICAD_APP_PATH, system
+from kcaa.utils.config import config
 from kcaa.utils.file_utils import get_project_files
 
 
@@ -134,8 +134,8 @@ async def generate_thumbnail_with_cli(pcb_file: str, ctx: Context | None):
 
         # Check for required command-line tools based on OS
         kicad_cli = None
-        if system == "Darwin":  # macOS
-            kicad_cli_path = os.path.join(KICAD_APP_PATH, "Contents/MacOS/kicad-cli")
+        if config.system == "Darwin":  # macOS
+            kicad_cli_path = os.path.join(config.kicad_app_path, "Contents/MacOS/kicad-cli")
             if os.path.exists(kicad_cli_path):
                 kicad_cli = kicad_cli_path
             elif shutil.which("kicad-cli") is not None:
@@ -143,8 +143,8 @@ async def generate_thumbnail_with_cli(pcb_file: str, ctx: Context | None):
             else:
                 print(f"kicad-cli not found at {kicad_cli_path} or in PATH")
                 return None
-        elif system == "Windows":
-            kicad_cli_path = os.path.join(KICAD_APP_PATH, "bin", "kicad-cli.exe")
+        elif config.system == "Windows":
+            kicad_cli_path = os.path.join(config.kicad_app_path, "bin", "kicad-cli.exe")
             if os.path.exists(kicad_cli_path):
                 kicad_cli = kicad_cli_path
             elif shutil.which("kicad-cli.exe") is not None:
@@ -154,13 +154,13 @@ async def generate_thumbnail_with_cli(pcb_file: str, ctx: Context | None):
             else:
                 print(f"kicad-cli not found at {kicad_cli_path} or in PATH")
                 return None
-        elif system == "Linux":
+        elif config.system == "Linux":
             kicad_cli = shutil.which("kicad-cli")
             if not kicad_cli:
                 print("kicad-cli not found in PATH")
                 return None
         else:
-            print(f"Unsupported operating system: {system}")
+            print(f"Unsupported operating system: {config.system}")
             return None
 
         if ctx:

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from kcaa.config import LibraryPathConfig
+from kcaa.utils.config import LibraryPathConfig
 from kcaa.utils.symbol_index_reader import SymbolIndexReader
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"

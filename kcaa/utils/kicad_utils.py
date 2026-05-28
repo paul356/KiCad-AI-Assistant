@@ -8,7 +8,7 @@ import subprocess
 import sys  # Add sys import
 from typing import Any
 
-from kcaa import config
+from kcaa.utils.config import config
 
 # Get PID for logging - Removed, handled by logging config
 # _PID = os.getpid()
@@ -23,9 +23,9 @@ def find_kicad_projects() -> list[dict[str, Any]]:
     projects = []
     logging.info("Attempting to find KiCad projects...")  # Log start
     # Search directories to look for KiCad projects
-    raw_search_dirs = [config.KICAD_USER_DIR] + config.ADDITIONAL_SEARCH_PATHS
-    logging.info(f"Raw KICAD_USER_DIR: '{config.KICAD_USER_DIR}'")
-    logging.info(f"Raw ADDITIONAL_SEARCH_PATHS: {config.ADDITIONAL_SEARCH_PATHS}")
+    raw_search_dirs = [config.kicad_user_dir] + config.additional_search_paths
+    logging.info(f"Raw KICAD_USER_DIR: '{config.kicad_user_dir}'")
+    logging.info(f"Raw ADDITIONAL_SEARCH_PATHS: {config.additional_search_paths}")
     logging.info(f"Raw search list before expansion: {raw_search_dirs}")
 
     expanded_search_dirs = []
@@ -110,7 +110,7 @@ def open_kicad_project(project_path: str) -> dict[str, Any]:
         cmd = []
         if sys.platform == "darwin":  # macOS
             # On MacOS, use the 'open' command to open the project in KiCad
-            cmd = ["open", "-a", config.KICAD_APP_PATH, project_path]
+            cmd = ["open", "-a", config.kicad_app_path, project_path]
         elif sys.platform == "linux":  # Linux
             # On Linux, use 'xdg-open'
             cmd = ["xdg-open", project_path]

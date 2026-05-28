@@ -6,7 +6,7 @@ import os
 import shutil
 import subprocess
 
-from kcaa.config import system
+from kcaa.utils.config import config
 
 
 def check_for_cli_api() -> bool:
@@ -17,7 +17,7 @@ def check_for_cli_api() -> bool:
     """
     try:
         # Check if kicad-cli is in PATH
-        if system == "Windows":
+        if config.system == "Windows":
             # On Windows, check for kicad-cli.exe
             kicad_cli = shutil.which("kicad-cli.exe")
         else:
@@ -26,7 +26,7 @@ def check_for_cli_api() -> bool:
 
         if kicad_cli:
             # Verify it's a working kicad-cli
-            cmd = [kicad_cli, "--version"] if system == "Windows" else [kicad_cli, "--version"]
+            cmd = [kicad_cli, "--version"] if config.system == "Windows" else [kicad_cli, "--version"]
 
             result = subprocess.run(cmd, capture_output=True, text=True)
             if result.returncode == 0:
@@ -34,13 +34,13 @@ def check_for_cli_api() -> bool:
                 return True
 
         # Check common installation locations if not found in PATH
-        if system == "Windows":
+        if config.system == "Windows":
             # Common Windows installation paths
             potential_paths = [
                 r"C:\Program Files\KiCad\bin\kicad-cli.exe",
                 r"C:\Program Files (x86)\KiCad\bin\kicad-cli.exe",
             ]
-        elif system == "Darwin":  # macOS
+        elif config.system == "Darwin":  # macOS
             # Common macOS installation paths
             potential_paths = [
                 "/Applications/KiCad/KiCad.app/Contents/MacOS/kicad-cli",

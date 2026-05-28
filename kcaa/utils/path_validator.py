@@ -8,7 +8,7 @@ and ensure file operations are restricted to safe directories.
 import os
 import pathlib
 
-from kcaa.config import KICAD_EXTENSIONS
+from kcaa.utils.config import config
 
 
 class PathValidationError(Exception):
@@ -101,10 +101,10 @@ class PathValidator:
         normalized_path = self.validate_path(file_path, must_exist)
 
         # Check file extension
-        if file_type not in KICAD_EXTENSIONS:
+        if file_type not in config.kicad_extensions:
             raise PathValidationError(f"Unknown KiCad file type: {file_type}")
 
-        expected_extension = KICAD_EXTENSIONS[file_type]
+        expected_extension = config.kicad_extensions[file_type]
         if not normalized_path.endswith(expected_extension):
             raise PathValidationError(
                 f"File must have {expected_extension} extension, got: {file_path}"

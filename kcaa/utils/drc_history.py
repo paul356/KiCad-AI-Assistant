@@ -10,10 +10,10 @@ import os
 import time
 from typing import Any
 
-from kcaa.utils.env import get_kcaa_data_dir
+from kcaa.utils.config import config
 
 # Directory for storing DRC history
-DRC_HISTORY_DIR = os.path.join(get_kcaa_data_dir(), "drc_history")
+DRC_HISTORY_DIR = os.path.join(config.get_kcaa_data_dir(), "drc_history")
 
 
 def ensure_history_dir() -> None:

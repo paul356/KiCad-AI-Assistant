@@ -15,7 +15,7 @@ from typing import Any
 
 import sexpdata
 
-from kcaa.config import LibraryPathConfig
+from kcaa.utils.config import LibraryPathConfig
 
 log = logging.getLogger(__name__)
 

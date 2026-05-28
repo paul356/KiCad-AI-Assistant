@@ -15,16 +15,63 @@ log = logging.getLogger(__name__)
 _SETTINGS_FILENAME = "kicad_ai_assistant.json"
 
 
-def _default_config_dir() -> str:
-    """Return the KiCad user config directory for the current platform."""
+def _load_dotenv_for_plugin() -> None:
+    """Load .env file to get KICAD_VERSION and other config before path resolution.
+
+    This is a minimal .env loader that only sets environment variables.
+    The plugin cannot import kcaa, so we duplicate this logic here.
+    Safe to call multiple times — subsequent calls are no-ops once .env is loaded.
+    """
+    if getattr(_load_dotenv_for_plugin, "_done", False):
+        return
+    try:
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        for _ in range(3):
+            env_path = os.path.join(current_dir, ".env")
+            if os.path.exists(env_path):
+                with open(env_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith("#"):
+                            continue
+                        if "=" in line:
+                            key, value = line.split("=", 1)
+                            key = key.strip()
+                            value = value.strip()
+                            if value.startswith('"') and value.endswith('"'):
+                                value = value[1:-1]
+                            elif value.startswith("'") and value.endswith("'"):
+                                value = value[1:-1]
+                            if "~" in value:
+                                value = os.path.expanduser(value)
+                            os.environ[key] = value
+                break
+            parent = os.path.dirname(current_dir)
+            if parent == current_dir:
+                break
+            current_dir = parent
+    except Exception:
+        pass
+    _load_dotenv_for_plugin._done = True
+
+
+def _get_kcaa_data_dir() -> str:
+    """Return the kcaa data directory under the KiCad user config directory.
+
+    Loads .env first to ensure KICAD_VERSION is available.
+    """
+    _load_dotenv_for_plugin()
+    kicad_version = os.environ.get("KICAD_VERSION", "9.0")
     system = platform.system()
     if system == "Darwin":
-        base = os.path.expanduser("~/Library/Preferences/kicad")
+        base = os.path.expanduser(f"~/Library/Preferences/kicad/{kicad_version}")
     elif system == "Windows":
-        base = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "kicad")
+        base = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "kicad", kicad_version)
     else:  # Linux and others
-        base = os.path.expanduser("~/.config/kicad")
-    return base
+        base = os.path.expanduser(f"~/.config/kicad/{kicad_version}")
+    return os.path.join(base, "kcaa")
+
+
 
 
 @dataclass
@@ -52,7 +99,7 @@ class PluginSettings:
     llm_keep_recent_turns: int = 4           # number of latest complete assistant turns to preserve verbatim
 
     # Internal — not shown in settings UI
-    config_dir: str = field(default_factory=_default_config_dir, repr=False)
+    config_dir: str = field(default_factory=_get_kcaa_data_dir, repr=False)
 
     # ------------------------------------------------------------------ #
 

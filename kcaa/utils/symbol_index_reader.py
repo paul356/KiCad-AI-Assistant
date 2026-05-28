@@ -11,7 +11,7 @@ import re
 
 import skip.sexp.sourcefile
 
-from kcaa.config import LibraryPathConfig
+from kcaa.utils.config import LibraryPathConfig
 
 log = logging.getLogger(__name__)
 

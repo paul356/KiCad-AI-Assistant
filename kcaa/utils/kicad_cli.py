@@ -11,7 +11,7 @@ import platform
 import shutil
 import subprocess
 
-from ..config import TIMEOUT_CONSTANTS
+from .config import config
 
 logger = logging.getLogger(__name__)
 
@@ -110,7 +110,7 @@ class KiCadCLIManager:
                 [cli_path, "--version"],
                 capture_output=True,
                 text=True,
-                timeout=TIMEOUT_CONSTANTS["kicad_cli_version_check"],
+                timeout=config.timeout_constants["kicad_cli_version_check"],
             )
             if result.returncode == 0:
                 return result.stdout.strip()
@@ -202,7 +202,7 @@ class KiCadCLIManager:
                 [cli_path, "--version"],
                 capture_output=True,
                 text=True,
-                timeout=TIMEOUT_CONSTANTS["kicad_cli_version_check"],
+                timeout=config.timeout_constants["kicad_cli_version_check"],
             )
             return result.returncode == 0
         except (subprocess.SubprocessError, OSError, FileNotFoundError):

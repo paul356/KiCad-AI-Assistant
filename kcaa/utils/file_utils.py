@@ -18,7 +18,7 @@ def get_project_files(project_path: str) -> dict[str, str]:
     Returns:
         Dictionary mapping file types to file paths
     """
-    from kcaa.config import DATA_EXTENSIONS, KICAD_EXTENSIONS
+    from kcaa.utils.config import config
 
     project_dir = os.path.dirname(project_path)
     project_name = get_project_name_from_path(project_path)
@@ -26,7 +26,7 @@ def get_project_files(project_path: str) -> dict[str, str]:
     files = {}
 
     # Check for standard KiCad files
-    for file_type, extension in KICAD_EXTENSIONS.items():
+    for file_type, extension in config.kicad_extensions.items():
         if file_type == "project":
             # We already have the project file
             files[file_type] = project_path
@@ -38,7 +38,7 @@ def get_project_files(project_path: str) -> dict[str, str]:
 
     # Check for data files
     try:
-        for ext in DATA_EXTENSIONS:
+        for ext in config.data_extensions:
             for file in os.listdir(project_dir):
                 if file.startswith(project_name) and file.endswith(ext):
                     # Extract the type from filename (e.g., project_name-bom.csv -> bom)

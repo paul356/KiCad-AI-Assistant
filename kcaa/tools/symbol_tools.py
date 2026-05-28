@@ -14,7 +14,7 @@ from typing import Any
 from fastmcp import Context, FastMCP
 import sexpdata
 
-from kcaa.config import LibraryPathConfig
+from kcaa.utils.config import LibraryPathConfig
 from kcaa.utils.symbol_extractor import extract_lib_symbol_raw
 from kcaa.utils.symbol_geometry import compute_unit_bboxes
 from kcaa.utils.symbol_index_manager import SymbolIndexManager

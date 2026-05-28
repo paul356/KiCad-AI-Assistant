@@ -13,7 +13,6 @@ Usage:
 import os
 import sys
 import logging
-import platform
 
 log = logging.getLogger(__name__)
 
@@ -25,14 +24,9 @@ def _setup_plugin_logging() -> None:
     so diagnostic messages are available when debugging on Windows.
     """
     try:
-        system = platform.system()
-        if system == "Darwin":
-            base = os.path.expanduser("~/Library/Preferences/kicad")
-        elif system == "Windows":
-            base = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "kicad")
-        else:
-            base = os.path.expanduser("~/.config/kicad")
-        log_dir = os.path.join(base, "logs")
+        from .settings import _get_kcaa_data_dir
+
+        log_dir = _get_kcaa_data_dir()
         os.makedirs(log_dir, exist_ok=True)
         log_file = os.path.join(log_dir, "kicad_ai_plugin.log")
 
