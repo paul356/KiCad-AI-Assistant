@@ -20,9 +20,9 @@ The schematic has no pre-existing wires or junctions.
 
 import asyncio
 import os
+from pathlib import Path
 import shutil
 import tempfile
-from pathlib import Path
 
 import pytest
 import skip
@@ -31,16 +31,12 @@ import skip
 # Helpers
 # ---------------------------------------------------------------------------
 
-SCHEMATIC_PATH = str(
-    Path(__file__).parent / "fixtures" / "tools_test.kicad_sch"
-)
+SCHEMATIC_PATH = str(Path(__file__).parent / "fixtures" / "tools_test.kicad_sch")
 
 
 def _make_temp_copy() -> str:
     """Return path to a fresh temporary copy of tools_test.kicad_sch."""
-    tmp = tempfile.NamedTemporaryFile(
-        suffix=".kicad_sch", delete=False, dir=tempfile.gettempdir()
-    )
+    tmp = tempfile.NamedTemporaryFile(suffix=".kicad_sch", delete=False, dir=tempfile.gettempdir())
     tmp.close()
     shutil.copy(SCHEMATIC_PATH, tmp.name)
     return tmp.name
@@ -56,6 +52,7 @@ class _MockMCP:
         def decorator(fn):
             self.tools[fn.__name__] = fn
             return fn
+
         return decorator
 
 
@@ -63,6 +60,7 @@ def _get_tools() -> dict:
     """Register component and wire edit tools against a mock MCP and return the dict."""
     from kcaa.tools.component_edit_tools import register_component_edit_tools
     from kcaa.tools.wire_edit_tools import register_wire_edit_tools
+
     mock = _MockMCP()
     register_component_edit_tools(mock)
     register_wire_edit_tools(mock)
@@ -72,6 +70,7 @@ def _get_tools() -> dict:
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
 
 @pytest.fixture(scope="module")
 def tools():
@@ -92,25 +91,29 @@ def tmp_sch():
 # Tests
 # ---------------------------------------------------------------------------
 
-class TestConnectPinsAutoJunction:
 
+class TestConnectPinsAutoJunction:
     def _connect(self, tools, sch_path, from_ref, from_pin, to_ref, to_pin):
-        return asyncio.run(tools["connect_pins_with_wire"](
-            schematic_path=sch_path,
-            from_ref=from_ref,
-            from_pin=from_pin,
-            to_ref=to_ref,
-            to_pin=to_pin,
-        ))
+        return asyncio.run(
+            tools["connect_pins_with_wire"](
+                schematic_path=sch_path,
+                from_ref=from_ref,
+                from_pin=from_pin,
+                to_ref=to_ref,
+                to_pin=to_pin,
+            )
+        )
 
     def _add_wire(self, tools, sch_path, sx, sy, ex, ey):
-        return asyncio.run(tools["connect_points_with_wire"](
-            schematic_path=sch_path,
-            start_x=sx,
-            start_y=sy,
-            end_x=ex,
-            end_y=ey,
-        ))
+        return asyncio.run(
+            tools["connect_points_with_wire"](
+                schematic_path=sch_path,
+                start_x=sx,
+                start_y=sy,
+                end_x=ex,
+                end_y=ey,
+            )
+        )
 
     # -------------------------------------------------------------------------
     # Test 1: No existing wire at pins → no auto junction
@@ -156,8 +159,7 @@ class TestConnectPinsAutoJunction:
         sch2 = skip.Schematic(tmp_sch)
         junction_coords = [j.at.value[:2] for j in sch2.junction]
         assert any(
-            abs(jx - 100.0) < 0.01 and abs(jy - 102.54) < 0.01
-            for jx, jy in junction_coords
+            abs(jx - 100.0) < 0.01 and abs(jy - 102.54) < 0.01 for jx, jy in junction_coords
         ), f"Junction at (100.0, 102.54) not found in schematic; junctions={junction_coords}"
 
     # -------------------------------------------------------------------------
@@ -186,12 +188,10 @@ class TestConnectPinsAutoJunction:
         sch2 = skip.Schematic(tmp_sch)
         junction_coords = [j.at.value[:2] for j in sch2.junction]
         assert any(
-            abs(jx - 100.0) < 0.01 and abs(jy - 102.54) < 0.01
-            for jx, jy in junction_coords
+            abs(jx - 100.0) < 0.01 and abs(jy - 102.54) < 0.01 for jx, jy in junction_coords
         ), "Junction at (100.0, 102.54) not found in schematic"
         assert any(
-            abs(jx - 120.0) < 0.01 and abs(jy - 102.54) < 0.01
-            for jx, jy in junction_coords
+            abs(jx - 120.0) < 0.01 and abs(jy - 102.54) < 0.01 for jx, jy in junction_coords
         ), "Junction at (120.0, 102.54) not found in schematic"
 
     # -------------------------------------------------------------------------
@@ -214,7 +214,8 @@ class TestConnectPinsAutoJunction:
         # Verify the junction was written before the connect call.
         sch_verify = skip.Schematic(tmp_sch)
         pre_count = sum(
-            1 for jj in sch_verify.junction
+            1
+            for jj in sch_verify.junction
             if abs(float(jj.at.value[0]) - 100.0) < 0.01
             and abs(float(jj.at.value[1]) - 102.54) < 0.01
         )
@@ -225,24 +226,19 @@ class TestConnectPinsAutoJunction:
         assert result.get("success") is True, result
 
         auto = result.get("auto_junctions_added", [])
-        duplicated = [
-            j for j in auto
-            if abs(j["x"] - 100.0) < 0.01 and abs(j["y"] - 102.54) < 0.01
-        ]
-        assert len(duplicated) == 0, (
-            f"A duplicate junction was placed at (100.0, 102.54): {auto!r}"
-        )
+        duplicated = [j for j in auto if abs(j["x"] - 100.0) < 0.01 and abs(j["y"] - 102.54) < 0.01]
+        assert len(duplicated) == 0, f"A duplicate junction was placed at (100.0, 102.54): {auto!r}"
 
         # Exactly one junction at (100.0, 102.54) in the schematic.
         sch2 = skip.Schematic(tmp_sch)
         junctions_at_pos = [
-            jj for jj in sch2.junction
+            jj
+            for jj in sch2.junction
             if abs(float(jj.at.value[0]) - 100.0) < 0.01
             and abs(float(jj.at.value[1]) - 102.54) < 0.01
         ]
         assert len(junctions_at_pos) == 1, (
-            f"Expected exactly 1 junction at (100.0, 102.54), "
-            f"found {len(junctions_at_pos)}"
+            f"Expected exactly 1 junction at (100.0, 102.54), found {len(junctions_at_pos)}"
         )
 
     # -------------------------------------------------------------------------
@@ -267,8 +263,7 @@ class TestConnectPinsAutoJunction:
         # Verify at least one wire segment starting at R4 pin2 exists in the saved file
         sch2 = skip.Schematic(tmp_sch)
         found = any(
-            abs(w.start.value[0] - 140.0) < 0.01
-            and abs(w.start.value[1] - 102.54) < 0.01
+            abs(w.start.value[0] - 140.0) < 0.01 and abs(w.start.value[1] - 102.54) < 0.01
             for w in sch2.wire
         )
         assert found, "Expected wire segment from R4 pin2 not found in saved schematic"

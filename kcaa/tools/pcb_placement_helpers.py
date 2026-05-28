@@ -11,10 +11,11 @@ PCB coordinate convention: mm, +X right, **+Y down**,
 rotation **clockwise-positive**.
 """
 
+from collections import defaultdict
+import contextlib
 import logging
 import math
 import re
-from collections import defaultdict
 from typing import Any
 
 from fastmcp import Context, FastMCP
@@ -292,10 +293,8 @@ def _get_fp_pads_world(fp_node: list[Any]) -> list[dict[str, Any]]:
         net_name = ""
         for psub in sub:
             if isinstance(psub, list) and len(psub) >= 3 and _sym(psub[0]) == "at":
-                try:
+                with contextlib.suppress(ValueError, TypeError):
                     rel_x, rel_y = float(psub[1]), float(psub[2])
-                except (ValueError, TypeError):
-                    pass
             elif isinstance(psub, list) and len(psub) >= 2 and _sym(psub[0]) == "net":
                 # KiCad 8.x: (net "name") — 2 elements
                 # KiCad <8:  (net N "name") — 3 elements
@@ -337,17 +336,23 @@ def _get_fp_local_pads(fp_node: list[Any]) -> list[dict[str, Any]]:
                 except (ValueError, TypeError):
                     pass
             elif isinstance(psub, list) and len(psub) >= 3 and _sym(psub[0]) == "size":
-                try:
+                with contextlib.suppress(ValueError, TypeError):
                     pad_w, pad_h = float(psub[1]), float(psub[2])
-                except (ValueError, TypeError):
-                    pass
             elif isinstance(psub, list) and len(psub) >= 2 and _sym(psub[0]) == "net":
                 if len(psub) >= 3 and not isinstance(psub[1], str):
                     net_name = psub[2] if isinstance(psub[2], str) else _sym(psub[2])
                 else:
                     net_name = psub[1] if isinstance(psub[1], str) else _sym(psub[1])
-        pads.append({"lx": lx, "ly": ly, "net": net_name,
-                     "pad_rot": pad_rot, "pad_w": pad_w, "pad_h": pad_h})
+        pads.append(
+            {
+                "lx": lx,
+                "ly": ly,
+                "net": net_name,
+                "pad_rot": pad_rot,
+                "pad_w": pad_w,
+                "pad_h": pad_h,
+            }
+        )
     return pads
 
 
@@ -699,13 +704,9 @@ def _resolve_push_shove(
         List of ``{ref, push_dx, push_dy}`` push actions (grid-snapped) on
         success, or ``None`` if any conflict cannot be resolved.
     """
-    static_bbox_map: dict[str, dict[str, float]] = {
-        b["ref"]: b for b in all_static_bboxes
-    }
+    static_bbox_map: dict[str, dict[str, float]] = {b["ref"]: b for b in all_static_bboxes}
     # Track tentatively updated bboxes to detect newly introduced conflicts.
-    updated: dict[str, dict[str, float]] = {
-        ref: dict(b) for ref, b in static_bbox_map.items()
-    }
+    updated: dict[str, dict[str, float]] = {ref: dict(b) for ref, b in static_bbox_map.items()}
     push_list: list[dict[str, Any]] = []
 
     for s_ref, member_bboxes in conflicting.items():
@@ -721,13 +722,9 @@ def _resolve_push_shove(
 
         # Round up to the nearest full grid step so the courtyard fully clears.
         if push_dx != 0.0:
-            push_dx = math.copysign(
-                math.ceil(abs(push_dx) / _GRID_MM) * _GRID_MM, push_dx
-            )
+            push_dx = math.copysign(math.ceil(abs(push_dx) / _GRID_MM) * _GRID_MM, push_dx)
         if push_dy != 0.0:
-            push_dy = math.copysign(
-                math.ceil(abs(push_dy) / _GRID_MM) * _GRID_MM, push_dy
-            )
+            push_dy = math.copysign(math.ceil(abs(push_dy) / _GRID_MM) * _GRID_MM, push_dy)
 
         if math.hypot(push_dx, push_dy) > max_push_mm:
             return None  # push exceeds the allowed limit
@@ -905,12 +902,10 @@ def _find_group_board_position(
     # uses O(1) lookups instead of re-scanning all of data on every step.
     fp_node_cache: dict[str, Any] = {}
     for item in data:
-        if not (isinstance(item, list) and len(item) > 0
-                and _sym(item[0]) == "footprint"):
+        if not (isinstance(item, list) and len(item) > 0 and _sym(item[0]) == "footprint"):
             continue
         for sub in item:
-            if (isinstance(sub, list) and len(sub) >= 3
-                    and _sym(sub[0]) == "property"):
+            if isinstance(sub, list) and len(sub) >= 3 and _sym(sub[0]) == "property":
                 prop_name = sub[1] if isinstance(sub[1], str) else _sym(sub[1])
                 if prop_name == "Reference":
                     ref_val = sub[2] if isinstance(sub[2], str) else _sym(sub[2])
@@ -919,9 +914,11 @@ def _find_group_board_position(
                     break
 
     # Helper to check overlap for a given position
-    def check_position(cx: float, cy: float) -> tuple[bool, dict[str, list[dict[str, float]]], list[dict[str, float]]]:
+    def check_position(
+        cx: float, cy: float
+    ) -> tuple[bool, dict[str, list[dict[str, float]]], list[dict[str, float]]]:
         """Check if position (cx, cy) is collision-free.
-        
+
         Returns:
             (found_clear, conflicting, placed_member_bboxes) where:
             - found_clear: True if no overlaps
@@ -962,7 +959,7 @@ def _find_group_board_position(
                         break
             if member_clear:
                 placed_member_bboxes.append(member_bbox)
-        
+
         return found_clear, conflicting, placed_member_bboxes
 
     # Helper to calculate overlap area between two bboxes
@@ -980,45 +977,49 @@ def _find_group_board_position(
         # Snap to grid
         current_x = round(round(current_x / _GRID_MM) * _GRID_MM, 9)
         current_y = round(round(current_y / _GRID_MM) * _GRID_MM, 9)
-        
-        log.info(f"Smart placement: starting from anchor position ({current_x:.1f}, {current_y:.1f})")
-        
+
+        log.info(
+            f"Smart placement: starting from anchor position ({current_x:.1f}, {current_y:.1f})"
+        )
+
         # Check if current position is clear
         found_clear, conflicting, placed_bboxes = check_position(current_x, current_y)
-        
+
         if found_clear:
-            log.info(f"Current position is clear, using it")
+            log.info("Current position is clear, using it")
             hpwl = _compute_hpwl_with_hypothetical_group(
                 data, group_refs, fp_node_cache, relative_layout, current_x, current_y
             )
             log.info(f"Position ({current_x:.1f}, {current_y:.1f}) HPWL: {hpwl:.1f} mm")
             return current_x, current_y, True, []
-        
+
         if push_shove_mm > 0.0 and conflicting:
             push_list = _resolve_push_shove(conflicting, static_bboxes, push_shove_mm)
             if push_list is not None:
-                log.info(f"Current position viable with push-and-shove")
+                log.info("Current position viable with push-and-shove")
                 return current_x, current_y, True, push_list
-        
+
         # Current position has overlaps - calculate best direction to move
-        log.info(f"Current position has overlaps with {len(conflicting) if conflicting else 'members'}")
-        
+        log.info(
+            f"Current position has overlaps with {len(conflicting) if conflicting else 'members'}"
+        )
+
         # Calculate total overlap for each direction
         # We'll try 8 cardinal/diagonal directions
         directions = [
-            (1.0, 0.0),   # Right
-            (1.0, 1.0),   # Down-right
-            (0.0, 1.0),   # Down
+            (1.0, 0.0),  # Right
+            (1.0, 1.0),  # Down-right
+            (0.0, 1.0),  # Down
             (-1.0, 1.0),  # Down-left
             (-1.0, 0.0),  # Left
-            (-1.0, -1.0), # Up-left
+            (-1.0, -1.0),  # Up-left
             (0.0, -1.0),  # Up
             (1.0, -1.0),  # Up-right
         ]
-        
+
         # For each direction, calculate total overlap reduction
         direction_scores: list[tuple[float, float, float]] = []
-        
+
         for dx_norm, dy_norm in directions:
             # Calculate overlap at current position in this direction
             total_overlap = 0.0
@@ -1031,23 +1032,27 @@ def _find_group_board_position(
                 member_bbox = get_fp_courtyard_bbox(fp_node, mx, my, pos["rotation"])
                 if member_bbox is None:
                     continue
-                
+
                 # Check overlap with all static components
                 for sb in static_bboxes:
                     area = overlap_area(member_bbox, sb)
                     if area > 0:
                         # Calculate centroid of overlap region
-                        overlap_cx = (max(member_bbox["min_x"], sb["min_x"]) + 
-                                     min(member_bbox["max_x"], sb["max_x"])) / 2
-                        overlap_cy = (max(member_bbox["min_y"], sb["min_y"]) + 
-                                     min(member_bbox["max_y"], sb["max_y"])) / 2
+                        overlap_cx = (
+                            max(member_bbox["min_x"], sb["min_x"])
+                            + min(member_bbox["max_x"], sb["max_x"])
+                        ) / 2
+                        overlap_cy = (
+                            max(member_bbox["min_y"], sb["min_y"])
+                            + min(member_bbox["max_y"], sb["max_y"])
+                        ) / 2
                         member_cx = (member_bbox["min_x"] + member_bbox["max_x"]) / 2
                         member_cy = (member_bbox["min_y"] + member_bbox["max_y"]) / 2
-                        
+
                         # Direction from overlap center to member center
                         away_dx = member_cx - overlap_cx
                         away_dy = member_cy - overlap_cy
-                        
+
                         # Normalize if non-zero
                         mag = math.hypot(away_dx, away_dy)
                         if mag > 0.001:
@@ -1057,15 +1062,17 @@ def _find_group_board_position(
                             alignment = away_dx * dx_norm + away_dy * dy_norm
                             # Negative alignment means we're reducing overlap
                             total_overlap += area * (1.0 - alignment)
-            
+
             direction_scores.append((total_overlap, dx_norm, dy_norm))
-        
+
         # Sort by overlap score (lower is better - means moving away from overlaps)
         direction_scores.sort(key=lambda x: x[0])
-        
-        log.info(f"Best direction: ({direction_scores[0][1]:.1f}, {direction_scores[0][2]:.1f}) "
-                f"with score {direction_scores[0][0]:.1f}")
-        
+
+        log.info(
+            f"Best direction: ({direction_scores[0][1]:.1f}, {direction_scores[0][2]:.1f}) "
+            f"with score {direction_scores[0][0]:.1f}"
+        )
+
         # Search in the best directions for a clear position
         max_search_steps = 100  # Search up to 100 grid steps
         for overlap_score, best_dx, best_dy in direction_scores[:3]:  # Try top 3 directions
@@ -1074,14 +1081,16 @@ def _find_group_board_position(
                 test_y = current_y + step * STEP * best_dy
                 test_x = round(round(test_x / _GRID_MM) * _GRID_MM, 9)
                 test_y = round(round(test_y / _GRID_MM) * _GRID_MM, 9)
-                
+
                 # Check bounds
-                if not (bounds["min_x"] <= test_x <= bounds["max_x"] and
-                       bounds["min_y"] <= test_y <= bounds["max_y"]):
+                if not (
+                    bounds["min_x"] <= test_x <= bounds["max_x"]
+                    and bounds["min_y"] <= test_y <= bounds["max_y"]
+                ):
                     break
-                
+
                 found_clear, conflicting, _ = check_position(test_x, test_y)
-                
+
                 if found_clear:
                     hpwl = _compute_hpwl_with_hypothetical_group(
                         data, group_refs, fp_node_cache, relative_layout, test_x, test_y
@@ -1091,7 +1100,7 @@ def _find_group_board_position(
                         f"after {step} steps, HPWL: {hpwl:.1f} mm"
                     )
                     return test_x, test_y, True, []
-                
+
                 if push_shove_mm > 0.0 and conflicting:
                     push_list = _resolve_push_shove(conflicting, static_bboxes, push_shove_mm)
                     if push_list is not None:
@@ -1100,7 +1109,7 @@ def _find_group_board_position(
                             f"after {step} steps"
                         )
                         return test_x, test_y, True, push_list
-        
+
         log.info("No clear position found in preferred directions, falling back to full scan")
 
     # Fallback: full board scan (legacy behavior)

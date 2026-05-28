@@ -19,6 +19,7 @@ tmp_path copies of the fixture schematic.
 Run:
     uv run python -m pytest tests/integration/test_schematic_tools.py -v
 """
+
 from __future__ import annotations
 
 import itertools
@@ -42,6 +43,7 @@ SCH_FIXTURE = os.path.join(FIXTURE_DIR, "test_schematic.kicad_sch")
 # ---------------------------------------------------------------------------
 # Transport helpers
 # ---------------------------------------------------------------------------
+
 
 def _find_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -81,7 +83,7 @@ def _mcp_post(port: int, payload: dict, session_id: str | None = None) -> tuple[
     for line in raw.splitlines():
         line = line.strip()
         if line.startswith("data:"):
-            json_str = line[len("data:"):].strip()
+            json_str = line[len("data:") :].strip()
             if json_str:
                 return json.loads(json_str), returned_session_id
 
@@ -118,16 +120,19 @@ def _call_tool(port: int, session_id: str | None, name: str, arguments: dict) ->
 # Fixture: running MCP server (module scope)
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture(scope="module")
 def mcp_server():
     port = _find_free_port()
     env = os.environ.copy()
-    env.update({
-        "MCP_TRANSPORT": "streamable-http",
-        "MCP_PORT": str(port),
-        "MCP_HOST": "127.0.0.1",
-        "KICAD_MCP_PROFILE": "plugin",
-    })
+    env.update(
+        {
+            "MCP_TRANSPORT": "streamable-http",
+            "MCP_PORT": str(port),
+            "MCP_HOST": "127.0.0.1",
+            "KICAD_MCP_PROFILE": "plugin",
+        }
+    )
     env.pop("http_proxy", None)
     env.pop("HTTP_PROXY", None)
 
@@ -174,6 +179,7 @@ def mcp_server():
 # Helper: copy schematic fixture to tmp
 # ---------------------------------------------------------------------------
 
+
 def _copy_sch(tmp_path, name: str = "test.kicad_sch") -> str:
     dst = tmp_path / name
     shutil.copy2(SCH_FIXTURE, dst)
@@ -184,37 +190,58 @@ def _copy_sch(tmp_path, name: str = "test.kicad_sch") -> str:
 # Query tools (read-only — use fixture directly)
 # ===========================================================================
 
+
 class TestGetSchematicSheetInfo:
     def test_returns_paper_info(self, mcp_server):
         port, sid = mcp_server
-        result = _call_tool(port, sid, "get_schematic_sheet_info", {
-            "schematic_path": SCH_FIXTURE,
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "get_schematic_sheet_info",
+            {
+                "schematic_path": SCH_FIXTURE,
+            },
+        )
         assert "error" not in result, result
         assert "paper" in result
         assert result["paper"]["name"] == "A4"
 
     def test_returns_drawing_area(self, mcp_server):
         port, sid = mcp_server
-        result = _call_tool(port, sid, "get_schematic_sheet_info", {
-            "schematic_path": SCH_FIXTURE,
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "get_schematic_sheet_info",
+            {
+                "schematic_path": SCH_FIXTURE,
+            },
+        )
         assert "drawing_area" in result
         assert result["drawing_area"]["max_x"] > 0
         assert result["drawing_area"]["max_y"] > 0
 
     def test_returns_grid_mm(self, mcp_server):
         port, sid = mcp_server
-        result = _call_tool(port, sid, "get_schematic_sheet_info", {
-            "schematic_path": SCH_FIXTURE,
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "get_schematic_sheet_info",
+            {
+                "schematic_path": SCH_FIXTURE,
+            },
+        )
         assert abs(result["grid_mm"] - 1.27) < 0.01
 
     def test_returns_recommended_area(self, mcp_server):
         port, sid = mcp_server
-        result = _call_tool(port, sid, "get_schematic_sheet_info", {
-            "schematic_path": SCH_FIXTURE,
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "get_schematic_sheet_info",
+            {
+                "schematic_path": SCH_FIXTURE,
+            },
+        )
         assert "recommended_area" in result
         rec = result["recommended_area"]
         assert rec["min_x"] < rec["max_x"]
@@ -222,18 +249,28 @@ class TestGetSchematicSheetInfo:
 
     def test_nonexistent_file_returns_error(self, mcp_server):
         port, sid = mcp_server
-        result = _call_tool(port, sid, "get_schematic_sheet_info", {
-            "schematic_path": "/nonexistent/schematic.kicad_sch",
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "get_schematic_sheet_info",
+            {
+                "schematic_path": "/nonexistent/schematic.kicad_sch",
+            },
+        )
         assert "error" in result
 
 
 class TestExtractSchematicNetlist:
     def test_returns_components(self, mcp_server):
         port, sid = mcp_server
-        result = _call_tool(port, sid, "extract_schematic_netlist", {
-            "schematic_path": SCH_FIXTURE,
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "extract_schematic_netlist",
+            {
+                "schematic_path": SCH_FIXTURE,
+            },
+        )
         assert "error" not in result, result
         assert result.get("success") is True
         assert "analysis" in result
@@ -242,37 +279,59 @@ class TestExtractSchematicNetlist:
 
     def test_fixture_has_r1(self, mcp_server):
         port, sid = mcp_server
-        result = _call_tool(port, sid, "extract_schematic_netlist", {
-            "schematic_path": SCH_FIXTURE,
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "extract_schematic_netlist",
+            {
+                "schematic_path": SCH_FIXTURE,
+            },
+        )
         assert "error" not in result
         assert "R1" in result["analysis"]["components"]
 
     def test_returns_nets(self, mcp_server):
         port, sid = mcp_server
-        result = _call_tool(port, sid, "extract_schematic_netlist", {
-            "schematic_path": SCH_FIXTURE,
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "extract_schematic_netlist",
+            {
+                "schematic_path": SCH_FIXTURE,
+            },
+        )
         assert "error" not in result
         assert "analysis" in result
         # Nets may be under analysis or as floating_nets
         analysis = result["analysis"]
         has_nets = "nets" in analysis or "floating_nets" in analysis
-        assert has_nets, f"Expected nets or floating_nets in analysis, got keys: {list(analysis.keys())}"
+        assert has_nets, (
+            f"Expected nets or floating_nets in analysis, got keys: {list(analysis.keys())}"
+        )
 
     def test_nonexistent_file_returns_error(self, mcp_server):
         port, sid = mcp_server
-        result = _call_tool(port, sid, "extract_schematic_netlist", {
-            "schematic_path": "/nonexistent/schematic.kicad_sch",
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "extract_schematic_netlist",
+            {
+                "schematic_path": "/nonexistent/schematic.kicad_sch",
+            },
+        )
         assert "error" in result
 
     def test_with_wire_topology(self, mcp_server):
         port, sid = mcp_server
-        result = _call_tool(port, sid, "extract_schematic_netlist", {
-            "schematic_path": SCH_FIXTURE,
-            "include_wire_topology": True,
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "extract_schematic_netlist",
+            {
+                "schematic_path": SCH_FIXTURE,
+                "include_wire_topology": True,
+            },
+        )
         assert "error" not in result
         assert "analysis" in result
         assert "components" in result["analysis"]
@@ -281,10 +340,15 @@ class TestExtractSchematicNetlist:
 class TestListComponentProperties:
     def test_returns_properties_for_r1(self, mcp_server):
         port, sid = mcp_server
-        result = _call_tool(port, sid, "list_component_properties", {
-            "schematic_path": SCH_FIXTURE,
-            "reference": "R1",
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "list_component_properties",
+            {
+                "schematic_path": SCH_FIXTURE,
+                "reference": "R1",
+            },
+        )
         assert "error" not in result, result
         assert result.get("success") is True
         assert "properties" in result
@@ -294,27 +358,42 @@ class TestListComponentProperties:
 
     def test_nonexistent_reference_returns_error(self, mcp_server):
         port, sid = mcp_server
-        result = _call_tool(port, sid, "list_component_properties", {
-            "schematic_path": SCH_FIXTURE,
-            "reference": "U99",
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "list_component_properties",
+            {
+                "schematic_path": SCH_FIXTURE,
+                "reference": "U99",
+            },
+        )
         assert "error" in result
 
     def test_nonexistent_file_returns_error(self, mcp_server):
         port, sid = mcp_server
-        result = _call_tool(port, sid, "list_component_properties", {
-            "schematic_path": "/nonexistent/schematic.kicad_sch",
-            "reference": "R1",
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "list_component_properties",
+            {
+                "schematic_path": "/nonexistent/schematic.kicad_sch",
+                "reference": "R1",
+            },
+        )
         assert "error" in result
 
 
 class TestListLabelsInSchematic:
     def test_returns_labels_list(self, mcp_server):
         port, sid = mcp_server
-        result = _call_tool(port, sid, "list_labels_in_schematic", {
-            "schematic_path": SCH_FIXTURE,
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "list_labels_in_schematic",
+            {
+                "schematic_path": SCH_FIXTURE,
+            },
+        )
         assert "error" not in result, result
         assert result.get("success") is True
         assert "labels" in result
@@ -323,42 +402,62 @@ class TestListLabelsInSchematic:
 
     def test_nonexistent_file_returns_error(self, mcp_server):
         port, sid = mcp_server
-        result = _call_tool(port, sid, "list_labels_in_schematic", {
-            "schematic_path": "/nonexistent/schematic.kicad_sch",
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "list_labels_in_schematic",
+            {
+                "schematic_path": "/nonexistent/schematic.kicad_sch",
+            },
+        )
         assert "error" in result
 
 
 class TestFindFreeArea:
     def test_returns_candidates(self, mcp_server):
         port, sid = mcp_server
-        result = _call_tool(port, sid, "find_free_area", {
-            "schematic_path": SCH_FIXTURE,
-            "width": 10.0,
-            "height": 10.0,
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "find_free_area",
+            {
+                "schematic_path": SCH_FIXTURE,
+                "width": 10.0,
+                "height": 10.0,
+            },
+        )
         assert "error" not in result, result
         assert "candidates" in result
         assert len(result["candidates"]) > 0
 
     def test_candidate_has_origin(self, mcp_server):
         port, sid = mcp_server
-        result = _call_tool(port, sid, "find_free_area", {
-            "schematic_path": SCH_FIXTURE,
-            "width": 5.0,
-            "height": 5.0,
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "find_free_area",
+            {
+                "schematic_path": SCH_FIXTURE,
+                "width": 5.0,
+                "height": 5.0,
+            },
+        )
         assert "error" not in result
         c = result["candidates"][0]
         assert "origin" in c or "placement" in c
 
     def test_nonexistent_file_returns_error(self, mcp_server):
         port, sid = mcp_server
-        result = _call_tool(port, sid, "find_free_area", {
-            "schematic_path": "/nonexistent/schematic.kicad_sch",
-            "width": 10.0,
-            "height": 10.0,
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "find_free_area",
+            {
+                "schematic_path": "/nonexistent/schematic.kicad_sch",
+                "width": 10.0,
+                "height": 10.0,
+            },
+        )
         assert "error" in result
 
 
@@ -366,28 +465,39 @@ class TestFindFreeArea:
 # Mutation tools (use tmp_path copies)
 # ===========================================================================
 
+
 class TestMoveComponent:
     def test_moves_component(self, mcp_server, tmp_path):
         port, sid = mcp_server
         sch = _copy_sch(tmp_path)
-        result = _call_tool(port, sid, "move_component", {
-            "schematic_path": sch,
-            "reference": "R1",
-            "x": 50.0,
-            "y": 50.0,
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "move_component",
+            {
+                "schematic_path": sch,
+                "reference": "R1",
+                "x": 50.0,
+                "y": 50.0,
+            },
+        )
         assert "error" not in result, result
         assert result.get("success") is True
 
     def test_creates_backup(self, mcp_server, tmp_path):
         port, sid = mcp_server
         sch = _copy_sch(tmp_path)
-        result = _call_tool(port, sid, "move_component", {
-            "schematic_path": sch,
-            "reference": "R1",
-            "x": 50.0,
-            "y": 50.0,
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "move_component",
+            {
+                "schematic_path": sch,
+                "reference": "R1",
+                "x": 50.0,
+                "y": 50.0,
+            },
+        )
         assert "error" not in result
         bak = result.get("backup_path", "")
         assert bak and os.path.isfile(bak)
@@ -395,22 +505,32 @@ class TestMoveComponent:
     def test_nonexistent_reference_returns_error(self, mcp_server, tmp_path):
         port, sid = mcp_server
         sch = _copy_sch(tmp_path)
-        result = _call_tool(port, sid, "move_component", {
-            "schematic_path": sch,
-            "reference": "U99",
-            "x": 50.0,
-            "y": 50.0,
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "move_component",
+            {
+                "schematic_path": sch,
+                "reference": "U99",
+                "x": 50.0,
+                "y": 50.0,
+            },
+        )
         assert "error" in result
 
     def test_nonexistent_file_returns_error(self, mcp_server):
         port, sid = mcp_server
-        result = _call_tool(port, sid, "move_component", {
-            "schematic_path": "/nonexistent/schematic.kicad_sch",
-            "reference": "R1",
-            "x": 50.0,
-            "y": 50.0,
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "move_component",
+            {
+                "schematic_path": "/nonexistent/schematic.kicad_sch",
+                "reference": "R1",
+                "x": 50.0,
+                "y": 50.0,
+            },
+        )
         assert "error" in result
 
 
@@ -418,28 +538,43 @@ class TestSetComponentProperty:
     def test_updates_value(self, mcp_server, tmp_path):
         port, sid = mcp_server
         sch = _copy_sch(tmp_path)
-        result = _call_tool(port, sid, "set_component_property", {
-            "schematic_path": sch,
-            "reference": "R1",
-            "property_name": "Value",
-            "property_value": "22k",
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "set_component_property",
+            {
+                "schematic_path": sch,
+                "reference": "R1",
+                "property_name": "Value",
+                "property_value": "22k",
+            },
+        )
         assert "error" not in result, result
         assert result.get("success") is True
 
     def test_change_persists(self, mcp_server, tmp_path):
         port, sid = mcp_server
         sch = _copy_sch(tmp_path)
-        _call_tool(port, sid, "set_component_property", {
-            "schematic_path": sch,
-            "reference": "R1",
-            "property_name": "Value",
-            "property_value": "47k",
-        })
-        result = _call_tool(port, sid, "list_component_properties", {
-            "schematic_path": sch,
-            "reference": "R1",
-        })
+        _call_tool(
+            port,
+            sid,
+            "set_component_property",
+            {
+                "schematic_path": sch,
+                "reference": "R1",
+                "property_name": "Value",
+                "property_value": "47k",
+            },
+        )
+        result = _call_tool(
+            port,
+            sid,
+            "list_component_properties",
+            {
+                "schematic_path": sch,
+                "reference": "R1",
+            },
+        )
         assert "error" not in result
         val_prop = next(p for p in result["properties"] if p["name"] == "Value")
         assert val_prop["value"] == "47k"
@@ -447,12 +582,17 @@ class TestSetComponentProperty:
     def test_nonexistent_reference_returns_error(self, mcp_server, tmp_path):
         port, sid = mcp_server
         sch = _copy_sch(tmp_path)
-        result = _call_tool(port, sid, "set_component_property", {
-            "schematic_path": sch,
-            "reference": "U99",
-            "property_name": "Value",
-            "property_value": "x",
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "set_component_property",
+            {
+                "schematic_path": sch,
+                "reference": "U99",
+                "property_name": "Value",
+                "property_value": "x",
+            },
+        )
         assert "error" in result
 
 
@@ -460,10 +600,15 @@ class TestRemoveSymbolFromSchematic:
     def test_removes_symbol(self, mcp_server, tmp_path):
         port, sid = mcp_server
         sch = _copy_sch(tmp_path)
-        result = _call_tool(port, sid, "remove_symbol_from_schematic", {
-            "schematic_path": sch,
-            "references": ["R2"],
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "remove_symbol_from_schematic",
+            {
+                "schematic_path": sch,
+                "references": ["R2"],
+            },
+        )
         assert "error" not in result, result
         assert result.get("success") is True
         assert result.get("total_removed_units", 0) >= 1
@@ -471,19 +616,29 @@ class TestRemoveSymbolFromSchematic:
     def test_nonexistent_reference_returns_error(self, mcp_server, tmp_path):
         port, sid = mcp_server
         sch = _copy_sch(tmp_path)
-        result = _call_tool(port, sid, "remove_symbol_from_schematic", {
-            "schematic_path": sch,
-            "references": ["U99"],
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "remove_symbol_from_schematic",
+            {
+                "schematic_path": sch,
+                "references": ["U99"],
+            },
+        )
         assert "error" in result
 
     def test_empty_references_returns_error(self, mcp_server, tmp_path):
         port, sid = mcp_server
         sch = _copy_sch(tmp_path)
-        result = _call_tool(port, sid, "remove_symbol_from_schematic", {
-            "schematic_path": sch,
-            "references": [],
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "remove_symbol_from_schematic",
+            {
+                "schematic_path": sch,
+                "references": [],
+            },
+        )
         assert "error" in result
 
 
@@ -491,29 +646,44 @@ class TestAddLabelToSchematic:
     def test_adds_label(self, mcp_server, tmp_path):
         port, sid = mcp_server
         sch = _copy_sch(tmp_path)
-        result = _call_tool(port, sid, "add_label_to_schematic", {
-            "schematic_path": sch,
-            "text": "NET_TEST",
-            "x": 100.0,
-            "y": 100.0,
-            "angle": 0,
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "add_label_to_schematic",
+            {
+                "schematic_path": sch,
+                "text": "NET_TEST",
+                "x": 100.0,
+                "y": 100.0,
+                "angle": 0,
+            },
+        )
         assert "error" not in result, result
         assert result.get("success") is True
 
     def test_label_appears_in_list(self, mcp_server, tmp_path):
         port, sid = mcp_server
         sch = _copy_sch(tmp_path)
-        _call_tool(port, sid, "add_label_to_schematic", {
-            "schematic_path": sch,
-            "text": "MY_NET",
-            "x": 101.6,
-            "y": 101.6,
-            "angle": 0,
-        })
-        result = _call_tool(port, sid, "list_labels_in_schematic", {
-            "schematic_path": sch,
-        })
+        _call_tool(
+            port,
+            sid,
+            "add_label_to_schematic",
+            {
+                "schematic_path": sch,
+                "text": "MY_NET",
+                "x": 101.6,
+                "y": 101.6,
+                "angle": 0,
+            },
+        )
+        result = _call_tool(
+            port,
+            sid,
+            "list_labels_in_schematic",
+            {
+                "schematic_path": sch,
+            },
+        )
         assert "error" not in result
         texts = [lbl["text"] for lbl in result["labels"]]
         assert "MY_NET" in texts
@@ -521,25 +691,35 @@ class TestAddLabelToSchematic:
     def test_empty_text_returns_error(self, mcp_server, tmp_path):
         port, sid = mcp_server
         sch = _copy_sch(tmp_path)
-        result = _call_tool(port, sid, "add_label_to_schematic", {
-            "schematic_path": sch,
-            "text": "",
-            "x": 100.0,
-            "y": 100.0,
-            "angle": 0,
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "add_label_to_schematic",
+            {
+                "schematic_path": sch,
+                "text": "",
+                "x": 100.0,
+                "y": 100.0,
+                "angle": 0,
+            },
+        )
         assert "error" in result
 
     def test_invalid_angle_returns_error(self, mcp_server, tmp_path):
         port, sid = mcp_server
         sch = _copy_sch(tmp_path)
-        result = _call_tool(port, sid, "add_label_to_schematic", {
-            "schematic_path": sch,
-            "text": "NET",
-            "x": 100.0,
-            "y": 100.0,
-            "angle": 45,
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "add_label_to_schematic",
+            {
+                "schematic_path": sch,
+                "text": "NET",
+                "x": 100.0,
+                "y": 100.0,
+                "angle": 45,
+            },
+        )
         assert "error" in result
 
 
@@ -547,19 +727,29 @@ class TestDeleteLabelFromSchematic:
     def test_delete_after_add(self, mcp_server, tmp_path):
         port, sid = mcp_server
         sch = _copy_sch(tmp_path)
-        _call_tool(port, sid, "add_label_to_schematic", {
-            "schematic_path": sch,
-            "text": "DEL_ME",
-            "x": 101.6,
-            "y": 101.6,
-            "angle": 0,
-        })
-        result = _call_tool(port, sid, "delete_label_from_schematic", {
-            "schematic_path": sch,
-            "x": 101.6,
-            "y": 101.6,
-            "text": "DEL_ME",
-        })
+        _call_tool(
+            port,
+            sid,
+            "add_label_to_schematic",
+            {
+                "schematic_path": sch,
+                "text": "DEL_ME",
+                "x": 101.6,
+                "y": 101.6,
+                "angle": 0,
+            },
+        )
+        result = _call_tool(
+            port,
+            sid,
+            "delete_label_from_schematic",
+            {
+                "schematic_path": sch,
+                "x": 101.6,
+                "y": 101.6,
+                "text": "DEL_ME",
+            },
+        )
         assert "error" not in result, result
         assert result.get("success") is True
 
@@ -568,57 +758,82 @@ class TestDeleteComponentProperty:
     def test_cannot_delete_reference(self, mcp_server, tmp_path):
         port, sid = mcp_server
         sch = _copy_sch(tmp_path)
-        result = _call_tool(port, sid, "delete_component_property", {
-            "schematic_path": sch,
-            "reference": "R1",
-            "property_name": "Reference",
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "delete_component_property",
+            {
+                "schematic_path": sch,
+                "reference": "R1",
+                "property_name": "Reference",
+            },
+        )
         assert "error" in result
 
     def test_cannot_delete_value(self, mcp_server, tmp_path):
         port, sid = mcp_server
         sch = _copy_sch(tmp_path)
-        result = _call_tool(port, sid, "delete_component_property", {
-            "schematic_path": sch,
-            "reference": "R1",
-            "property_name": "Value",
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "delete_component_property",
+            {
+                "schematic_path": sch,
+                "reference": "R1",
+                "property_name": "Value",
+            },
+        )
         assert "error" in result
 
     def test_nonexistent_property_returns_error(self, mcp_server, tmp_path):
         port, sid = mcp_server
         sch = _copy_sch(tmp_path)
-        result = _call_tool(port, sid, "delete_component_property", {
-            "schematic_path": sch,
-            "reference": "R1",
-            "property_name": "NonExistentProp",
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "delete_component_property",
+            {
+                "schematic_path": sch,
+                "reference": "R1",
+                "property_name": "NonExistentProp",
+            },
+        )
         assert "error" in result
 
 
 class TestAddSymbolToSchematic:
     def test_nonexistent_file_returns_error(self, mcp_server):
         port, sid = mcp_server
-        result = _call_tool(port, sid, "add_symbol_to_schematic", {
-            "schematic_path": "/nonexistent/schematic.kicad_sch",
-            "library_name": "Device",
-            "symbol_name": "R_Small",
-            "x": 100.0,
-            "y": 100.0,
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "add_symbol_to_schematic",
+            {
+                "schematic_path": "/nonexistent/schematic.kicad_sch",
+                "library_name": "Device",
+                "symbol_name": "R_Small",
+                "x": 100.0,
+                "y": 100.0,
+            },
+        )
         assert "error" in result
 
     def test_not_kicad_sch_returns_error(self, mcp_server, tmp_path):
         port, sid = mcp_server
         fake = tmp_path / "test.txt"
         fake.write_text("not a schematic")
-        result = _call_tool(port, sid, "add_symbol_to_schematic", {
-            "schematic_path": str(fake),
-            "library_name": "Device",
-            "symbol_name": "R_Small",
-            "x": 100.0,
-            "y": 100.0,
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "add_symbol_to_schematic",
+            {
+                "schematic_path": str(fake),
+                "library_name": "Device",
+                "symbol_name": "R_Small",
+                "x": 100.0,
+                "y": 100.0,
+            },
+        )
         assert "error" in result
 
 
@@ -626,78 +841,109 @@ class TestAddSymbolToSchematic:
 # Wire edit tools
 # ===========================================================================
 
+
 class TestConnectPinsWithWire:
     def test_nonexistent_file_returns_error(self, mcp_server):
         port, sid = mcp_server
-        result = _call_tool(port, sid, "connect_pins_with_wire", {
-            "schematic_path": "/nonexistent/schematic.kicad_sch",
-            "from_ref": "R1",
-            "from_pin": "1",
-            "to_ref": "R2",
-            "to_pin": "1",
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "connect_pins_with_wire",
+            {
+                "schematic_path": "/nonexistent/schematic.kicad_sch",
+                "from_ref": "R1",
+                "from_pin": "1",
+                "to_ref": "R2",
+                "to_pin": "1",
+            },
+        )
         assert "error" in result
 
     def test_not_kicad_sch_returns_error(self, mcp_server, tmp_path):
         port, sid = mcp_server
         fake = tmp_path / "test.txt"
         fake.write_text("not a schematic")
-        result = _call_tool(port, sid, "connect_pins_with_wire", {
-            "schematic_path": str(fake),
-            "from_ref": "R1",
-            "from_pin": "1",
-            "to_ref": "R2",
-            "to_pin": "1",
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "connect_pins_with_wire",
+            {
+                "schematic_path": str(fake),
+                "from_ref": "R1",
+                "from_pin": "1",
+                "to_ref": "R2",
+                "to_pin": "1",
+            },
+        )
         assert "error" in result
 
     def test_nonexistent_pin_returns_error(self, mcp_server, tmp_path):
         port, sid = mcp_server
         sch = _copy_sch(tmp_path)
-        result = _call_tool(port, sid, "connect_pins_with_wire", {
-            "schematic_path": sch,
-            "from_ref": "U99",
-            "from_pin": "1",
-            "to_ref": "R1",
-            "to_pin": "1",
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "connect_pins_with_wire",
+            {
+                "schematic_path": sch,
+                "from_ref": "U99",
+                "from_pin": "1",
+                "to_ref": "R1",
+                "to_pin": "1",
+            },
+        )
         assert "error" in result
 
 
 class TestConnectPointsWithWire:
     def test_nonexistent_file_returns_error(self, mcp_server):
         port, sid = mcp_server
-        result = _call_tool(port, sid, "connect_points_with_wire", {
-            "schematic_path": "/nonexistent/schematic.kicad_sch",
-            "start_x": 100.0,
-            "start_y": 100.0,
-            "end_x": 150.0,
-            "end_y": 100.0,
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "connect_points_with_wire",
+            {
+                "schematic_path": "/nonexistent/schematic.kicad_sch",
+                "start_x": 100.0,
+                "start_y": 100.0,
+                "end_x": 150.0,
+                "end_y": 100.0,
+            },
+        )
         assert "error" in result
 
     def test_zero_length_wire_returns_error(self, mcp_server, tmp_path):
         port, sid = mcp_server
         sch = _copy_sch(tmp_path)
-        result = _call_tool(port, sid, "connect_points_with_wire", {
-            "schematic_path": sch,
-            "start_x": 100.0,
-            "start_y": 100.0,
-            "end_x": 100.0,
-            "end_y": 100.0,
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "connect_points_with_wire",
+            {
+                "schematic_path": sch,
+                "start_x": 100.0,
+                "start_y": 100.0,
+                "end_x": 100.0,
+                "end_y": 100.0,
+            },
+        )
         assert "error" in result
 
     def test_adds_wire_between_points(self, mcp_server, tmp_path):
         port, sid = mcp_server
         sch = _copy_sch(tmp_path)
-        result = _call_tool(port, sid, "connect_points_with_wire", {
-            "schematic_path": sch,
-            "start_x": 50.8,
-            "start_y": 50.8,
-            "end_x": 60.96,
-            "end_y": 50.8,
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "connect_points_with_wire",
+            {
+                "schematic_path": sch,
+                "start_x": 50.8,
+                "start_y": 50.8,
+                "end_x": 60.96,
+                "end_y": 50.8,
+            },
+        )
         # May succeed or error depending on wire routing; just check no crash
         assert isinstance(result, dict)
 
@@ -705,18 +951,32 @@ class TestConnectPointsWithWire:
 class TestDeleteWireFromSchematic:
     def test_nonexistent_file_returns_error(self, mcp_server):
         port, sid = mcp_server
-        result = _call_tool(port, sid, "delete_wire_from_schematic", {
-            "schematic_path": "/nonexistent/schematic.kicad_sch",
-            "wires": [{"start_x": 0, "start_y": 0, "end_x": 10, "end_y": 10}],
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "delete_wire_from_schematic",
+            {
+                "schematic_path": "/nonexistent/schematic.kicad_sch",
+                "wires": [{"start_x": 0, "start_y": 0, "end_x": 10, "end_y": 10}],
+            },
+        )
         assert "error" in result
 
     def test_no_matching_wire_returns_error(self, mcp_server, tmp_path):
         port, sid = mcp_server
         sch = _copy_sch(tmp_path)
-        result = _call_tool(port, sid, "delete_wire_from_schematic", {
-            "schematic_path": sch,
-            "wires": [{"start_x": 0.0, "start_y": 0.0, "end_x": 1.0, "end_y": 1.0}],
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "delete_wire_from_schematic",
+            {
+                "schematic_path": sch,
+                "wires": [{"start_x": 0.0, "start_y": 0.0, "end_x": 1.0, "end_y": 1.0}],
+            },
+        )
         # Should return error or success=False since no wire at those coords
-        assert "error" in result or result.get("success") is False or result.get("deleted_count", 0) == 0
+        assert (
+            "error" in result
+            or result.get("success") is False
+            or result.get("deleted_count", 0) == 0
+        )

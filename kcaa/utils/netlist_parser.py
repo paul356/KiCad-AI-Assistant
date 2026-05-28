@@ -1,10 +1,12 @@
 """
 KiCad schematic netlist extraction utilities.
 """
+
+from collections import defaultdict
+import contextlib
 import os
 import re
-from typing import Any, Dict, List, Tuple
-from collections import defaultdict
+from typing import Any
 
 import skip
 
@@ -41,22 +43,22 @@ class SchematicParser:
         """
         self.schematic_path = schematic_path
         self._sch = None
-        self.components: List[Dict[str, Any]] = []
-        self.labels: List[Dict[str, Any]] = []
-        self.wires: List[Dict[str, Any]] = []
-        self.junctions: List[Dict[str, Any]] = []
-        self.no_connects: List[Dict[str, Any]] = []
-        self.power_symbols: List[Dict[str, Any]] = []
-        self.hierarchical_labels: List[Dict[str, Any]] = []
-        self.global_labels: List[Dict[str, Any]] = []
+        self.components: list[dict[str, Any]] = []
+        self.labels: list[dict[str, Any]] = []
+        self.wires: list[dict[str, Any]] = []
+        self.junctions: list[dict[str, Any]] = []
+        self.no_connects: list[dict[str, Any]] = []
+        self.power_symbols: list[dict[str, Any]] = []
+        self.hierarchical_labels: list[dict[str, Any]] = []
+        self.global_labels: list[dict[str, Any]] = []
 
         # Netlist information
-        self.nets: Dict[str, List] = defaultdict(list)
-        self.component_pins: Dict[Tuple, str] = {}
-        self.point_to_net: Dict[Tuple, str] = {}
+        self.nets: dict[str, list] = defaultdict(list)
+        self.component_pins: dict[tuple, str] = {}
+        self.point_to_net: dict[tuple, str] = {}
 
         # Component information
-        self.component_info: Dict[str, Dict[str, Any]] = {}
+        self.component_info: dict[str, dict[str, Any]] = {}
 
         self._load_schematic()
 
@@ -72,9 +74,9 @@ class SchematicParser:
             print(f"Error reading schematic file: {str(e)}")
             raise
 
-    def parse(self) -> Dict[str, Any]:
+    def parse(self) -> dict[str, Any]:
         """Parse the schematic to extract netlist information.
-        
+
         Returns:
             Dictionary with parsed netlist information
         """
@@ -100,7 +102,9 @@ class SchematicParser:
             "point_to_net": self.point_to_net,
         }
 
-        print(f"Schematic parsing complete: found {len(self.component_info)} components and {len(self.nets)} nets")
+        print(
+            f"Schematic parsing complete: found {len(self.component_info)} components and {len(self.nets)} nets"
+        )
         return result
 
     def _extract_components(self) -> None:
@@ -113,9 +117,9 @@ class SchematicParser:
             return
 
         # Cache per-lib_id unit bboxes (lib Y-up coords).
-        lib_bbox_cache: Dict[str, Dict[int, BBox]] = {}
+        lib_bbox_cache: dict[str, dict[int, BBox]] = {}
 
-        def _lib_unit_bboxes(lib_id: str) -> Dict[int, BBox]:
+        def _lib_unit_bboxes(lib_id: str) -> dict[int, BBox]:
             if lib_id in lib_bbox_cache:
                 return lib_bbox_cache[lib_id]
             try:
@@ -132,7 +136,7 @@ class SchematicParser:
                 else:
                     pv = getattr(wrapper, "_pv", None)
                     raw = getattr(pv, "_tree", None) if pv is not None else None
-            bboxes: Dict[int, BBox] = {}
+            bboxes: dict[int, BBox] = {}
             if raw is not None:
                 try:
                     bboxes = compute_unit_bboxes(raw)
@@ -143,34 +147,28 @@ class SchematicParser:
 
         # World bboxes accumulated per reference so multi-unit symbols
         # report the union of every placed unit's footprint.
-        world_bbox_per_ref: Dict[str, List[BBox]] = defaultdict(list)
+        world_bbox_per_ref: dict[str, list[BBox]] = defaultdict(list)
 
         for sym in symbols:
-            comp: Dict[str, Any] = {}
+            comp: dict[str, Any] = {}
 
             # Reference is required; skip entries that don't have one
             try:
-                comp['reference'] = sym.property.Reference.value
+                comp["reference"] = sym.property.Reference.value
             except AttributeError:
                 continue
-            ref = comp['reference']
+            ref = comp["reference"]
             if not ref:
                 continue
 
-            try:
-                comp['lib_id'] = sym.lib_id.value
-            except AttributeError:
-                pass
+            with contextlib.suppress(AttributeError):
+                comp["lib_id"] = sym.lib_id.value
 
-            try:
-                comp['value'] = sym.property.Value.value
-            except AttributeError:
-                pass
+            with contextlib.suppress(AttributeError):
+                comp["value"] = sym.property.Value.value
 
-            try:
-                comp['footprint'] = sym.property.Footprint.value
-            except AttributeError:
-                pass
+            with contextlib.suppress(AttributeError):
+                comp["footprint"] = sym.property.Footprint.value
 
             # sym.at.value -> [x, y, angle]
             sym_x = sym_y = sym_rot = None
@@ -179,10 +177,10 @@ class SchematicParser:
                 sym_x = float(at_val[0])
                 sym_y = float(at_val[1])
                 sym_rot = float(at_val[2]) if len(at_val) > 2 else 0.0
-                comp['position'] = {
-                    'x': sym_x,
-                    'y': sym_y,
-                    'rotation': sym_rot,
+                comp["position"] = {
+                    "x": sym_x,
+                    "y": sym_y,
+                    "rotation": sym_rot,
                 }
             except (AttributeError, IndexError, TypeError):
                 pass
@@ -197,29 +195,38 @@ class SchematicParser:
                 pass
 
             # Per-unit world bbox: look up this unit's lib bbox, transform.
-            if comp.get('lib_id') and sym_x is not None and sym_y is not None:
+            if comp.get("lib_id") and sym_x is not None and sym_y is not None:
                 unit_no = 1
-                try:
+                with contextlib.suppress(AttributeError, ValueError, TypeError):
                     unit_no = int(sym.unit.value)
-                except (AttributeError, ValueError, TypeError):
-                    pass
-                bboxes = _lib_unit_bboxes(comp['lib_id'])
+                bboxes = _lib_unit_bboxes(comp["lib_id"])
                 lib_bb = bboxes.get(unit_no) or bboxes.get(1)
                 if lib_bb is not None:
                     rot_int = int(round(sym_rot or 0.0))
                     world_bb = lib_bbox_to_world(
-                        lib_bb, sym_x, sym_y, rot_int, mirror_val,
+                        lib_bb,
+                        sym_x,
+                        sym_y,
+                        rot_int,
+                        mirror_val,
                     )
                     world_bbox_per_ref[ref].append(world_bb)
 
             # Collect pin positions via shared helper (handles the skip bug
             # for single-pin symbols: power nets, PWR_FLAG, TestPoint, etc.)
-            pins_summary: List[Dict[str, str]] = []
+            pins_summary: list[dict[str, str]] = []
             for pin in sym_pin_world_coords(sym):
-                pins_summary.append({'num': pin.number, 'x': str(pin.x), 'y': str(pin.y), 'direction': _angle_to_direction_screen(pin.angle)})
+                pins_summary.append(
+                    {
+                        "num": pin.number,
+                        "x": str(pin.x),
+                        "y": str(pin.y),
+                        "direction": _angle_to_direction_screen(pin.angle),
+                    }
+                )
 
             if pins_summary:
-                comp['pins'] = pins_summary
+                comp["pins"] = pins_summary
 
             self.components.append(comp)
             self.component_info[ref] = comp
@@ -228,7 +235,7 @@ class SchematicParser:
         for ref, bbs in world_bbox_per_ref.items():
             merged = union_bboxes(bbs)
             if merged is not None and ref in self.component_info:
-                self.component_info[ref]['body_bbox'] = merged.to_dict()
+                self.component_info[ref]["body_bbox"] = merged.to_dict()
 
         print(f"Extracted {len(self.components)} components")
 
@@ -240,10 +247,12 @@ class SchematicParser:
                 try:
                     xys = wire.pts.xy
                     s, e = xys[0].value, xys[1].value
-                    self.wires.append({
-                        'start': {'x': float(s[0]), 'y': float(s[1])},
-                        'end':   {'x': float(e[0]), 'y': float(e[1])},
-                    })
+                    self.wires.append(
+                        {
+                            "start": {"x": float(s[0]), "y": float(s[1])},
+                            "end": {"x": float(e[0]), "y": float(e[1])},
+                        }
+                    )
                 except (AttributeError, IndexError, TypeError):
                     continue
         except AttributeError:
@@ -257,10 +266,12 @@ class SchematicParser:
             for junc in self._sch.junction._elements:
                 try:
                     at_val = junc.at.value
-                    self.junctions.append({
-                        'x': float(at_val[0]),
-                        'y': float(at_val[1]),
-                    })
+                    self.junctions.append(
+                        {
+                            "x": float(at_val[0]),
+                            "y": float(at_val[1]),
+                        }
+                    )
                 except (AttributeError, IndexError, TypeError):
                     continue
         except AttributeError:
@@ -276,15 +287,17 @@ class SchematicParser:
             for label in self._sch.label._elements:
                 try:
                     at_val = label.at.value
-                    self.labels.append({
-                        'type': 'local',
-                        'text': str(label.value),
-                        'position': {
-                            'x': float(at_val[0]),
-                            'y': float(at_val[1]),
-                            'angle': float(at_val[2]) if len(at_val) > 2 else 0.0,
-                        },
-                    })
+                    self.labels.append(
+                        {
+                            "type": "local",
+                            "text": str(label.value),
+                            "position": {
+                                "x": float(at_val[0]),
+                                "y": float(at_val[1]),
+                                "angle": float(at_val[2]) if len(at_val) > 2 else 0.0,
+                            },
+                        }
+                    )
                 except (AttributeError, IndexError, TypeError):
                     continue
         except AttributeError:
@@ -295,15 +308,17 @@ class SchematicParser:
             for label in self._sch.global_label._elements:
                 try:
                     at_val = label.at.value
-                    self.global_labels.append({
-                        'type': 'global',
-                        'text': str(label.value),
-                        'position': {
-                            'x': float(at_val[0]),
-                            'y': float(at_val[1]),
-                            'angle': float(at_val[2]) if len(at_val) > 2 else 0.0,
-                        },
-                    })
+                    self.global_labels.append(
+                        {
+                            "type": "global",
+                            "text": str(label.value),
+                            "position": {
+                                "x": float(at_val[0]),
+                                "y": float(at_val[1]),
+                                "angle": float(at_val[2]) if len(at_val) > 2 else 0.0,
+                            },
+                        }
+                    )
                 except (AttributeError, IndexError, TypeError):
                     continue
         except AttributeError:
@@ -316,33 +331,39 @@ class SchematicParser:
                 for label in hl_coll._elements:
                     try:
                         at_val = label.at.value
-                        self.hierarchical_labels.append({
-                            'type': 'hierarchical',
-                            'text': str(label.value),
-                            'position': {
-                                'x': float(at_val[0]),
-                                'y': float(at_val[1]),
-                                'angle': float(at_val[2]) if len(at_val) > 2 else 0.0,
-                            },
-                        })
+                        self.hierarchical_labels.append(
+                            {
+                                "type": "hierarchical",
+                                "text": str(label.value),
+                                "position": {
+                                    "x": float(at_val[0]),
+                                    "y": float(at_val[1]),
+                                    "angle": float(at_val[2]) if len(at_val) > 2 else 0.0,
+                                },
+                            }
+                        )
                     except (AttributeError, IndexError, TypeError):
                         continue
         except AttributeError:
             pass
 
-        print(f"Extracted {len(self.labels)} local labels, "
-              f"{len(self.global_labels)} global labels, "
-              f"and {len(self.hierarchical_labels)} hierarchical labels")
+        print(
+            f"Extracted {len(self.labels)} local labels, "
+            f"{len(self.global_labels)} global labels, "
+            f"and {len(self.hierarchical_labels)} hierarchical labels"
+        )
 
     def _extract_power_symbols(self) -> None:
         """Extract power symbol information from schematic."""
         print("Extracting power symbols")
         for comp in self.components:
-            if comp.get('lib_id', '').startswith('power:'):
-                self.power_symbols.append({
-                    'type': comp['lib_id'].split(':', 1)[1],
-                    'position': comp.get('position', {}),
-                })
+            if comp.get("lib_id", "").startswith("power:"):
+                self.power_symbols.append(
+                    {
+                        "type": comp["lib_id"].split(":", 1)[1],
+                        "position": comp.get("position", {}),
+                    }
+                )
         print(f"Extracted {len(self.power_symbols)} power symbols")
 
     def _extract_no_connects(self) -> None:
@@ -354,10 +375,12 @@ class SchematicParser:
                 for nc in nc_coll._elements:
                     try:
                         at_val = nc.at.value
-                        self.no_connects.append({
-                            'x': float(at_val[0]),
-                            'y': float(at_val[1]),
-                        })
+                        self.no_connects.append(
+                            {
+                                "x": float(at_val[0]),
+                                "y": float(at_val[1]),
+                            }
+                        )
                     except (AttributeError, IndexError, TypeError):
                         continue
         except AttributeError:
@@ -375,13 +398,13 @@ class SchematicParser:
 
         ROUND = 4
 
-        def pt(x: float, y: float) -> Tuple[float, float]:
+        def pt(x: float, y: float) -> tuple[float, float]:
             return (round(float(x), ROUND), round(float(y), ROUND))
 
         # --- Union-Find ---
-        uf: Dict[Tuple, Tuple] = {}
+        uf: dict[tuple, tuple] = {}
 
-        def find(p: Tuple) -> Tuple:
+        def find(p: tuple) -> tuple:
             uf.setdefault(p, p)
             root = p
             while uf[root] != root:
@@ -391,7 +414,7 @@ class SchematicParser:
                 uf[node], node = root, uf[node]
             return root
 
-        def union(p1: Tuple, p2: Tuple) -> None:
+        def union(p1: tuple, p2: tuple) -> None:
             r1, r2 = find(p1), find(p2)
             if r1 != r2:
                 uf[r1] = r2
@@ -399,61 +422,61 @@ class SchematicParser:
         # Step 1: Wire connectivity
         for wire in self.wires:
             union(
-                pt(wire['start']['x'], wire['start']['y']),
-                pt(wire['end']['x'],   wire['end']['y']),
+                pt(wire["start"]["x"], wire["start"]["y"]),
+                pt(wire["end"]["x"], wire["end"]["y"]),
             )
 
         # Step 2: Register pin world positions (already rotation-corrected by skip)
-        placed_pin_world: Dict[Tuple[str, str], Tuple] = {}
+        placed_pin_world: dict[tuple[str, str], tuple] = {}
         for ref, comp in self.component_info.items():
-            if ref.startswith('#'):
+            if ref.startswith("#"):
                 continue
-            for pin_data in comp.get('pins', []):
-                world_pt = pt(pin_data['x'], pin_data['y'])
+            for pin_data in comp.get("pins", []):
+                world_pt = pt(pin_data["x"], pin_data["y"])
                 find(world_pt)  # register in uf
-                placed_pin_world[(ref, pin_data['num'])] = world_pt
+                placed_pin_world[(ref, pin_data["num"])] = world_pt
 
         # Step 3: Assign net names from labels
-        point_net: Dict[Tuple, str] = {}
+        point_net: dict[tuple, str] = {}
 
-        def name_point(p: Tuple, name: str) -> None:
+        def name_point(p: tuple, name: str) -> None:
             root = find(p)
-            if root not in point_net or name.upper() in ('GND', 'VCC', 'VDD', 'VSS', 'VEE'):
+            if root not in point_net or name.upper() in ("GND", "VCC", "VDD", "VSS", "VEE"):
                 point_net[root] = name
 
         for label in self.labels:
-            name_point(pt(label['position']['x'], label['position']['y']), label['text'])
+            name_point(pt(label["position"]["x"], label["position"]["y"]), label["text"])
 
         for label in self.global_labels:
-            name_point(pt(label['position']['x'], label['position']['y']), label['text'])
+            name_point(pt(label["position"]["x"], label["position"]["y"]), label["text"])
 
         for label in self.hierarchical_labels:
-            name_point(pt(label['position']['x'], label['position']['y']), label['text'])
+            name_point(pt(label["position"]["x"], label["position"]["y"]), label["text"])
 
         # Power symbol pins provide net names at their world positions.
         # When skip cannot resolve pin.location for a power symbol (e.g. power:GND),
         # fall back to the symbol's placement position, which in KiCad is always
         # the connection point for single-pin power symbols.
         for ref, comp in self.component_info.items():
-            if comp.get('lib_id', '').startswith('power:'):
-                power_name = comp['lib_id'].split(':', 1)[1]
-                pin_coords = comp.get('pins', [])
+            if comp.get("lib_id", "").startswith("power:"):
+                power_name = comp["lib_id"].split(":", 1)[1]
+                pin_coords = comp.get("pins", [])
                 if pin_coords:
                     for pin_data in pin_coords:
-                        name_point(pt(pin_data['x'], pin_data['y']), power_name)
+                        name_point(pt(pin_data["x"], pin_data["y"]), power_name)
                 else:
-                    pos = comp.get('position', {})
+                    pos = comp.get("position", {})
                     if pos:
-                        name_point(pt(pos.get('x', 0), pos.get('y', 0)), power_name)
+                        name_point(pt(pos.get("x", 0), pos.get("y", 0)), power_name)
 
         # Step 4: Group component pins by union-find group -> net
-        group_pins: Dict[Tuple, List] = defaultdict(list)
+        group_pins: dict[tuple, list] = defaultdict(list)
         for (ref, pin_num), world_pt in placed_pin_world.items():
-            group_pins[find(world_pt)].append({'component': ref, 'pin': pin_num})
+            group_pins[find(world_pt)].append({"component": ref, "pin": pin_num})
 
         net_counter = [1]
 
-        def auto_net_name(root: Tuple, pins: List) -> str:
+        def auto_net_name(root: tuple, pins: list) -> str:
             if root in point_net:
                 return point_net[root]
             if len(pins) == 1:
@@ -477,11 +500,13 @@ class SchematicParser:
             if root in point_net:
                 self.point_to_net[p] = point_net[root]
 
-        print(f"Built netlist: {len(self.nets)} nets, "
-              f"{sum(len(v) for v in self.nets.values())} pin connections")
+        print(
+            f"Built netlist: {len(self.nets)} nets, "
+            f"{sum(len(v) for v in self.nets.values())} pin connections"
+        )
 
 
-def extract_netlist(schematic_path: str) -> Dict[str, Any]:
+def extract_netlist(schematic_path: str) -> dict[str, Any]:
     """Extract netlist information from a KiCad schematic file.
 
     Args:
@@ -495,21 +520,15 @@ def extract_netlist(schematic_path: str) -> Dict[str, Any]:
         return parser.parse()
     except Exception as e:
         print(f"Error extracting netlist: {str(e)}")
-        return {
-            "error": str(e),
-            "components": {},
-            "nets": {},
-            "component_count": 0,
-            "net_count": 0
-        }
+        return {"error": str(e), "components": {}, "nets": {}, "component_count": 0, "net_count": 0}
 
 
-def analyze_netlist(netlist_data: Dict[str, Any]) -> Dict[str, Any]:
+def analyze_netlist(netlist_data: dict[str, Any]) -> dict[str, Any]:
     """Analyze netlist data to provide insights.
-    
+
     Args:
         netlist_data: Dictionary with netlist information
-        
+
     Returns:
         Dictionary with analysis results
     """
@@ -517,23 +536,25 @@ def analyze_netlist(netlist_data: Dict[str, Any]) -> Dict[str, Any]:
         "component_count": netlist_data.get("component_count", 0),
         "net_count": netlist_data.get("net_count", 0),
         "component_types": defaultdict(int),
-        "power_nets": []
+        "power_nets": [],
     }
-    
+
     # Analyze component types
     for ref, component in netlist_data.get("components", {}).items():
         # Extract component type from reference (e.g., R1 -> R)
-        comp_type = re.match(r'^([A-Za-z_]+)', ref)
+        comp_type = re.match(r"^([A-Za-z_]+)", ref)
         if comp_type:
             results["component_types"][comp_type.group(1)] += 1
-    
+
     # Identify power nets
     for net_name in netlist_data.get("nets", {}):
-        if any(net_name.startswith(prefix) for prefix in ["VCC", "VDD", "GND", "+5V", "+3V3", "+12V"]):
+        if any(
+            net_name.startswith(prefix) for prefix in ["VCC", "VDD", "GND", "+5V", "+3V3", "+12V"]
+        ):
             results["power_nets"].append(net_name)
-    
+
     # Count pin connections
     total_pins = sum(len(pins) for pins in netlist_data.get("nets", {}).values())
     results["total_pin_connections"] = total_pins
-    
+
     return results

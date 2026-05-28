@@ -5,11 +5,13 @@ Handles: finding fp-lib-table files, parsing them, resolving
 ${VAR} placeholders in URIs, and scanning .pretty directories
 for .kicad_mod files.
 """
+
+import contextlib
 import logging
 import os
 import re
 import sys
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import sexpdata
 
@@ -22,7 +24,8 @@ log = logging.getLogger(__name__)
 # fp-lib-table location helpers
 # ---------------------------------------------------------------------------
 
-def _default_kicad_config_dirs() -> List[str]:
+
+def _default_kicad_config_dirs() -> list[str]:
     """Return candidate KiCad config directories in priority order."""
     candidates = []
     if sys.platform == "darwin":
@@ -40,14 +43,14 @@ def _default_kicad_config_dirs() -> List[str]:
     return candidates
 
 
-def find_fp_lib_tables(project_path: Optional[str] = None) -> List[str]:
+def find_fp_lib_tables(project_path: str | None = None) -> list[str]:
     """Return a list of fp-lib-table file paths that exist on this system.
 
     :param project_path: Optional path to a project directory; if given, the
         project-local fp-lib-table is searched first.
     :returns: List of existing fp-lib-table paths, most-specific first.
     """
-    tables: List[str] = []
+    tables: list[str] = []
     if project_path:
         proj_table = os.path.join(os.path.dirname(project_path), "fp-lib-table")
         if os.path.isfile(proj_table):
@@ -65,7 +68,8 @@ def find_fp_lib_tables(project_path: Optional[str] = None) -> List[str]:
 # fp-lib-table parsing
 # ---------------------------------------------------------------------------
 
-def _build_env_map(project_dir: Optional[str] = None) -> Dict[str, str]:
+
+def _build_env_map(project_dir: str | None = None) -> dict[str, str]:
     """Build a dict of KiCad ``${VAR}`` substitutions for fp-lib-table URIs.
 
     Sources, in increasing precedence:
@@ -75,7 +79,7 @@ def _build_env_map(project_dir: Optional[str] = None) -> Dict[str, str]:
       2. Any ``KICAD*`` environment variables set in the current process.
       3. ``KIPRJMOD`` set to *project_dir* if given.
     """
-    env: Dict[str, str] = LibraryPathConfig().get_env_vars()
+    env: dict[str, str] = LibraryPathConfig().get_env_vars()
     for key, val in os.environ.items():
         if key.startswith("KICAD"):
             env[key] = val
@@ -84,7 +88,7 @@ def _build_env_map(project_dir: Optional[str] = None) -> Dict[str, str]:
     return env
 
 
-def _resolve_uri(uri: str, env: Dict[str, str]) -> str:
+def _resolve_uri(uri: str, env: dict[str, str]) -> str:
     """Expand ``${VAR}`` placeholders in a library URI.
 
     Logs a warning when any placeholder cannot be resolved so that missing
@@ -92,28 +96,31 @@ def _resolve_uri(uri: str, env: Dict[str, str]) -> str:
     AppImage is mounted) surface clearly instead of silently producing a
     broken path.
     """
+
     def _replace(match: re.Match) -> str:
         var = match.group(1)
         return env.get(var, match.group(0))
+
     expanded = re.sub(r"\$\{([^}]+)\}", _replace, uri)
     unresolved = sorted(set(re.findall(r"\$\{([^}]+)\}", expanded)))
     if unresolved:
         log.warning(
             "Unresolved fp-lib-table variable(s) %s in URI: %s",
-            unresolved, uri,
+            unresolved,
+            uri,
         )
     return expanded
 
 
-def _parse_fp_lib_table_raw(table_path: str, env: Dict[str, str]) -> List[Dict[str, str]]:
+def _parse_fp_lib_table_raw(table_path: str, env: dict[str, str]) -> list[dict[str, str]]:
     """Parse a single fp-lib-table file without recursion.
 
     :returns: List of dicts with keys ``nickname``, ``type``, ``uri``
         (resolved), ``raw_uri`` (unexpanded), ``description``.
     """
-    libraries: List[Dict[str, str]] = []
+    libraries: list[dict[str, str]] = []
     try:
-        with open(table_path, "r", encoding="utf-8") as fh:
+        with open(table_path, encoding="utf-8") as fh:
             raw = fh.read()
         data = sexpdata.loads(raw)
     except Exception:
@@ -125,8 +132,12 @@ def _parse_fp_lib_table_raw(table_path: str, env: Dict[str, str]) -> List[Dict[s
     for item in data:
         if not (isinstance(item, list) and len(item) > 0 and _sym(item[0]) == "lib"):
             continue
-        entry: Dict[str, str] = {
-            "nickname": "", "type": "", "uri": "", "raw_uri": "", "description": "",
+        entry: dict[str, str] = {
+            "nickname": "",
+            "type": "",
+            "uri": "",
+            "raw_uri": "",
+            "description": "",
         }
         for sub in item[1:]:
             if not (isinstance(sub, list) and len(sub) >= 2):
@@ -148,7 +159,7 @@ def _parse_fp_lib_table_raw(table_path: str, env: Dict[str, str]) -> List[Dict[s
     return libraries
 
 
-def parse_fp_lib_table(table_path: str, project_dir: Optional[str] = None) -> List[Dict[str, str]]:
+def parse_fp_lib_table(table_path: str, project_dir: str | None = None) -> list[dict[str, str]]:
     """Parse an fp-lib-table file and return library entries.
 
     Handles ``type="Table"`` indirection: when an entry's type is ``Table``,
@@ -167,29 +178,28 @@ def parse_fp_lib_table(table_path: str, project_dir: Optional[str] = None) -> Li
 
 def _parse_fp_lib_table_recursive(
     table_path: str,
-    env: Dict[str, str],
+    env: dict[str, str],
     visited: set,
-) -> List[Dict[str, str]]:
+) -> list[dict[str, str]]:
     """Recursive helper for parse_fp_lib_table."""
     real_path = os.path.realpath(table_path)
     if real_path in visited:
         return []
     visited.add(real_path)
 
-    result: List[Dict[str, str]] = []
+    result: list[dict[str, str]] = []
     for entry in _parse_fp_lib_table_raw(table_path, env):
         if entry["type"].lower() == "table":
             sub_table = entry["uri"]
             if os.path.isfile(sub_table):
-                result.extend(
-                    _parse_fp_lib_table_recursive(sub_table, env, visited)
-                )
+                result.extend(_parse_fp_lib_table_recursive(sub_table, env, visited))
             else:
                 log.warning(
-                    "fp-lib-table indirection target not found: %s "
-                    "(entry '%s' in %s, raw uri %r)",
-                    sub_table, entry.get("nickname", ""),
-                    table_path, entry.get("raw_uri", ""),
+                    "fp-lib-table indirection target not found: %s (entry '%s' in %s, raw uri %r)",
+                    sub_table,
+                    entry.get("nickname", ""),
+                    table_path,
+                    entry.get("raw_uri", ""),
                 )
         else:
             result.append(entry)
@@ -197,8 +207,8 @@ def _parse_fp_lib_table_recursive(
 
 
 def build_effective_library_list(
-    project_path: Optional[str] = None,
-) -> List[Dict[str, str]]:
+    project_path: str | None = None,
+) -> list[dict[str, str]]:
     """Return a deduplicated, precedence-ordered list of footprint libraries.
 
     Reads all fp-lib-table files (project first, then global), resolves
@@ -214,7 +224,7 @@ def build_effective_library_list(
     project_dir = os.path.dirname(project_path) if project_path else None
     table_paths = find_fp_lib_tables(project_path)
     seen_nicknames: set = set()
-    result: List[Dict[str, str]] = []
+    result: list[dict[str, str]] = []
     for tpath in table_paths:
         for lib in parse_fp_lib_table(tpath, project_dir=project_dir):
             if lib["nickname"] not in seen_nicknames:
@@ -227,7 +237,8 @@ def build_effective_library_list(
 # .pretty directory scanning
 # ---------------------------------------------------------------------------
 
-def scan_footprint_library(library_path: str) -> List[str]:
+
+def scan_footprint_library(library_path: str) -> list[str]:
     """Return a list of footprint names (without .kicad_mod) in *library_path*.
 
     :param library_path: Path to a .pretty directory.  May be a nested
@@ -239,11 +250,11 @@ def scan_footprint_library(library_path: str) -> List[str]:
     names = []
     for fname in os.listdir(library_path):
         if fname.endswith(".kicad_mod"):
-            names.append(fname[:-len(".kicad_mod")])
+            names.append(fname[: -len(".kicad_mod")])
     return sorted(names)
 
 
-def parse_kicad_mod(path: str) -> Dict[str, Any]:
+def parse_kicad_mod(path: str) -> dict[str, Any]:
     """Extract metadata and pad information from a .kicad_mod file.
 
     :param path: Absolute path to a .kicad_mod file.
@@ -252,7 +263,7 @@ def parse_kicad_mod(path: str) -> Dict[str, Any]:
         ``has_3d_model`` (bool), ``pads`` (list of pad dicts),
         ``courtyard_bbox`` (``{min_x, min_y, max_x, max_y}`` or None).
     """
-    result: Dict[str, Any] = {
+    result: dict[str, Any] = {
         "name": os.path.splitext(os.path.basename(path))[0],
         "description": "",
         "tags": "",
@@ -264,7 +275,7 @@ def parse_kicad_mod(path: str) -> Dict[str, Any]:
     }
 
     try:
-        with open(path, "r", encoding="utf-8") as fh:
+        with open(path, encoding="utf-8") as fh:
             raw = fh.read()
         data = sexpdata.loads(raw)
     except Exception:
@@ -273,7 +284,7 @@ def parse_kicad_mod(path: str) -> Dict[str, Any]:
     def _sym(v: Any) -> str:
         return str(v) if isinstance(v, sexpdata.Symbol) else str(v)
 
-    courtyard_points: List[tuple] = []
+    courtyard_points: list[tuple] = []
 
     for item in data:
         if not isinstance(item, list) or len(item) < 2:
@@ -301,14 +312,16 @@ def parse_kicad_mod(path: str) -> Dict[str, Any]:
         xs = [p[0] for p in courtyard_points]
         ys = [p[1] for p in courtyard_points]
         result["courtyard_bbox"] = {
-            "min_x": min(xs), "min_y": min(ys),
-            "max_x": max(xs), "max_y": max(ys),
+            "min_x": min(xs),
+            "min_y": min(ys),
+            "max_x": max(xs),
+            "max_y": max(ys),
         }
 
     return result
 
 
-def _parse_pad(pad_node: List[Any], sym: Any) -> Optional[Dict[str, Any]]:
+def _parse_pad(pad_node: list[Any], sym: Any) -> dict[str, Any] | None:
     """Extract pad info from a pad S-expression node."""
     if len(pad_node) < 4:
         return None
@@ -319,18 +332,28 @@ def _parse_pad(pad_node: List[Any], sym: Any) -> Optional[Dict[str, Any]]:
     layer = ""
     for sub in pad_node:
         if isinstance(sub, list) and len(sub) >= 3 and sym(sub[0]) == "at":
-            try:
+            with contextlib.suppress(ValueError, TypeError):
                 x, y = float(sub[1]), float(sub[2])
-            except (ValueError, TypeError):
-                pass
-        elif isinstance(sub, list) and len(sub) >= 2 and sym(sub[0]) == "layers":
+        elif (
+            isinstance(sub, list)
+            and len(sub) >= 2
+            and sym(sub[0]) == "layers"
+            or isinstance(sub, list)
+            and len(sub) >= 2
+            and sym(sub[0]) == "layer"
+        ):
             layer = sub[1] if isinstance(sub[1], str) else sym(sub[1])
-        elif isinstance(sub, list) and len(sub) >= 2 and sym(sub[0]) == "layer":
-            layer = sub[1] if isinstance(sub[1], str) else sym(sub[1])
-    return {"number": str(pad_num), "type": str(pad_type), "shape": str(pad_shape), "x": x, "y": y, "layer": layer}
+    return {
+        "number": str(pad_num),
+        "type": str(pad_type),
+        "shape": str(pad_shape),
+        "x": x,
+        "y": y,
+        "layer": layer,
+    }
 
 
-def _is_courtyard(node: List[Any], sym: Any) -> bool:
+def _is_courtyard(node: list[Any], sym: Any) -> bool:
     """Return True if node belongs to a courtyard layer."""
     for sub in node:
         if isinstance(sub, list) and len(sub) >= 2 and sym(sub[0]) == "layer":
@@ -339,13 +362,11 @@ def _is_courtyard(node: List[Any], sym: Any) -> bool:
     return False
 
 
-def _extract_line_points(node: List[Any], sym: Any) -> List[tuple]:
+def _extract_line_points(node: list[Any], sym: Any) -> list[tuple]:
     """Extract all (x, y) coordinate pairs from a line/arc/rect node."""
     points = []
     for sub in node:
         if isinstance(sub, list) and len(sub) >= 3 and sym(sub[0]) in ("start", "end", "mid"):
-            try:
+            with contextlib.suppress(ValueError, TypeError):
                 points.append((float(sub[1]), float(sub[2])))
-            except (ValueError, TypeError):
-                pass
     return points

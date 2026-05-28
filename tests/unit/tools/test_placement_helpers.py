@@ -2,11 +2,12 @@
 and the new placement-related additions to component_edit_tools
 (body_bbox in add/move returns, place_symbol_relative).
 """
+
 import asyncio
 import os
+from pathlib import Path
 import shutil
 import tempfile
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -26,11 +27,13 @@ class _MockMCP:
         def decorator(fn):
             self.tools[fn.__name__] = fn
             return fn
+
         return decorator
 
 
 def _placement_tools() -> dict:
     from kcaa.tools.placement_helpers import register_placement_helpers
+
     mock = _MockMCP()
     register_placement_helpers(mock)
     return mock.tools
@@ -38,6 +41,7 @@ def _placement_tools() -> dict:
 
 def _component_tools() -> dict:
     from kcaa.tools.component_edit_tools import register_component_edit_tools
+
     mock = _MockMCP()
     register_component_edit_tools(mock)
     return mock.tools
@@ -76,6 +80,7 @@ def tmp_sch():
 # get_schematic_sheet_info
 # ---------------------------------------------------------------------------
 
+
 class TestSheetInfo:
     def test_returns_paper_and_drawing_area(self, tmp_sch):
         tools = _placement_tools()
@@ -103,11 +108,11 @@ class TestSheetInfo:
 # find_free_area
 # ---------------------------------------------------------------------------
 
+
 class TestFindFreeArea:
     def test_returns_grid_aligned_candidates(self, tmp_sch):
         tools = _placement_tools()
-        out = tools["find_free_area"](tmp_sch, width=10.0, height=10.0,
-                                      max_candidates=3)
+        out = tools["find_free_area"](tmp_sch, width=10.0, height=10.0, max_candidates=3)
         assert "candidates" in out
         assert len(out["candidates"]) > 0
         for cand in out["candidates"]:
@@ -128,25 +133,32 @@ class TestFindFreeArea:
             "kcaa.tools.component_edit_tools._get_index_manager",
             return_value=mgr,
         ):
-            res = asyncio.run(comps["add_symbol_to_schematic"](
-                schematic_path=tmp_sch,
-                library_name=_LIB_NAME, symbol_name=_SYM_NAME,
-                x=80.0, y=80.0,
-            ))
+            res = asyncio.run(
+                comps["add_symbol_to_schematic"](
+                    schematic_path=tmp_sch,
+                    library_name=_LIB_NAME,
+                    symbol_name=_SYM_NAME,
+                    x=80.0,
+                    y=80.0,
+                )
+            )
         assert res["success"], res
         bb = res["body_bbox"]
         assert bb is not None
 
         ptools = _placement_tools()
-        out = ptools["find_free_area"](tmp_sch, width=5.0, height=5.0,
-                                       max_candidates=20, margin=2.54)
+        out = ptools["find_free_area"](
+            tmp_sch, width=5.0, height=5.0, max_candidates=20, margin=2.54
+        )
         for cand in out["candidates"]:
             cb = cand["bbox"]
             # No overlap with the placed symbol's body bbox.
-            sep = (cb["max_x"] <= bb["min_x"]
-                   or cb["min_x"] >= bb["max_x"]
-                   or cb["max_y"] <= bb["min_y"]
-                   or cb["min_y"] >= bb["max_y"])
+            sep = (
+                cb["max_x"] <= bb["min_x"]
+                or cb["min_x"] >= bb["max_x"]
+                or cb["max_y"] <= bb["min_y"]
+                or cb["min_y"] >= bb["max_y"]
+            )
             assert sep, f"candidate {cb} overlaps placed bbox {bb}"
 
     def test_invalid_dimensions_error(self, tmp_sch):
@@ -174,17 +186,22 @@ class TestFindFreeArea:
         ):
             out = tools["find_free_area"](
                 tmp_sch,
-                for_library=_LIB_NAME, for_symbol=_SYM_NAME,
+                for_library=_LIB_NAME,
+                for_symbol=_SYM_NAME,
                 max_candidates=1,
             )
             assert out["candidates"], out
             cand = out["candidates"][0]
             assert "placement" in cand
-            res = asyncio.run(comps["add_symbol_to_schematic"](
-                schematic_path=tmp_sch,
-                library_name=_LIB_NAME, symbol_name=_SYM_NAME,
-                x=cand["placement"]["x"], y=cand["placement"]["y"],
-            ))
+            res = asyncio.run(
+                comps["add_symbol_to_schematic"](
+                    schematic_path=tmp_sch,
+                    library_name=_LIB_NAME,
+                    symbol_name=_SYM_NAME,
+                    x=cand["placement"]["x"],
+                    y=cand["placement"]["y"],
+                )
+            )
         assert res["success"], res
         bb = res["body_bbox"]
         cb = cand["bbox"]
@@ -198,6 +215,7 @@ class TestFindFreeArea:
 # place_symbol_relative + bbox in returns
 # ---------------------------------------------------------------------------
 
+
 class TestPlaceSymbolRelative:
     def test_add_returns_body_bbox(self, tmp_sch):
         comps = _component_tools()
@@ -206,11 +224,15 @@ class TestPlaceSymbolRelative:
             "kcaa.tools.component_edit_tools._get_index_manager",
             return_value=mgr,
         ):
-            res = asyncio.run(comps["add_symbol_to_schematic"](
-                schematic_path=tmp_sch,
-                library_name=_LIB_NAME, symbol_name=_SYM_NAME,
-                x=100.0, y=100.0,
-            ))
+            res = asyncio.run(
+                comps["add_symbol_to_schematic"](
+                    schematic_path=tmp_sch,
+                    library_name=_LIB_NAME,
+                    symbol_name=_SYM_NAME,
+                    x=100.0,
+                    y=100.0,
+                )
+            )
         assert res["success"], res
         bb = res["body_bbox"]
         assert bb is not None
@@ -224,20 +246,29 @@ class TestPlaceSymbolRelative:
             "kcaa.tools.component_edit_tools._get_index_manager",
             return_value=mgr,
         ):
-            anchor = asyncio.run(comps["add_symbol_to_schematic"](
-                schematic_path=tmp_sch,
-                library_name=_LIB_NAME, symbol_name=_SYM_NAME,
-                x=120.0, y=80.0,
-            ))
+            anchor = asyncio.run(
+                comps["add_symbol_to_schematic"](
+                    schematic_path=tmp_sch,
+                    library_name=_LIB_NAME,
+                    symbol_name=_SYM_NAME,
+                    x=120.0,
+                    y=80.0,
+                )
+            )
             assert anchor["success"], anchor
             anchor_ref = anchor["reference_assigned"]
             anchor_bb = anchor["body_bbox"]
 
-            placed = asyncio.run(comps["place_symbol_relative"](
-                schematic_path=tmp_sch,
-                library_name=_LIB_NAME, symbol_name=_SYM_NAME,
-                anchor_reference=anchor_ref, side="right", gap=2.54,
-            ))
+            placed = asyncio.run(
+                comps["place_symbol_relative"](
+                    schematic_path=tmp_sch,
+                    library_name=_LIB_NAME,
+                    symbol_name=_SYM_NAME,
+                    anchor_reference=anchor_ref,
+                    side="right",
+                    gap=2.54,
+                )
+            )
         assert placed.get("success"), placed
         new_bb = placed["body_bbox"]
         assert new_bb is not None
@@ -246,11 +277,15 @@ class TestPlaceSymbolRelative:
 
     def test_relative_invalid_side_errors(self, tmp_sch):
         comps = _component_tools()
-        out = asyncio.run(comps["place_symbol_relative"](
-            schematic_path=tmp_sch,
-            library_name=_LIB_NAME, symbol_name=_SYM_NAME,
-            anchor_reference="R99", side="diagonal",
-        ))
+        out = asyncio.run(
+            comps["place_symbol_relative"](
+                schematic_path=tmp_sch,
+                library_name=_LIB_NAME,
+                symbol_name=_SYM_NAME,
+                anchor_reference="R99",
+                side="diagonal",
+            )
+        )
         assert "error" in out
 
     def test_multi_unit_prediction_unions_every_unit(self):
@@ -260,13 +295,16 @@ class TestPlaceSymbolRelative:
         from sexpdata import Symbol as S
 
         from kcaa.utils.symbol_geometry import (
-            compute_unit_bboxes, lib_bbox_to_world, union_bboxes,
+            compute_unit_bboxes,
+            lib_bbox_to_world,
+            union_bboxes,
         )
-        lib = [S("symbol"), "DUAL",
-            [S("symbol"), "DUAL_1_1",
-                [S("rectangle"), [S("start"), -1, -2], [S("end"), 1, 2]]],
-            [S("symbol"), "DUAL_2_1",
-                [S("rectangle"), [S("start"), -1, -2], [S("end"), 1, 2]]],
+
+        lib = [
+            S("symbol"),
+            "DUAL",
+            [S("symbol"), "DUAL_1_1", [S("rectangle"), [S("start"), -1, -2], [S("end"), 1, 2]]],
+            [S("symbol"), "DUAL_2_1", [S("rectangle"), [S("start"), -1, -2], [S("end"), 1, 2]]],
         ]
         unit_bbs = compute_unit_bboxes(lib)
         per_unit = [
@@ -288,18 +326,26 @@ class TestPlaceSymbolRelative:
             "kcaa.tools.component_edit_tools._get_index_manager",
             return_value=mgr,
         ):
-            added = asyncio.run(comps["add_symbol_to_schematic"](
-                schematic_path=tmp_sch,
-                library_name=_LIB_NAME, symbol_name=_SYM_NAME,
-                x=60.0, y=60.0,
-            ))
+            added = asyncio.run(
+                comps["add_symbol_to_schematic"](
+                    schematic_path=tmp_sch,
+                    library_name=_LIB_NAME,
+                    symbol_name=_SYM_NAME,
+                    x=60.0,
+                    y=60.0,
+                )
+            )
             assert added["success"], added
             ref = added["reference_assigned"]
 
-            moved = asyncio.run(comps["move_component"](
-                schematic_path=tmp_sch,
-                reference=ref, x=90.0, y=90.0,
-            ))
+            moved = asyncio.run(
+                comps["move_component"](
+                    schematic_path=tmp_sch,
+                    reference=ref,
+                    x=90.0,
+                    y=90.0,
+                )
+            )
         assert moved["success"], moved
         bb = moved["body_bbox"]
         assert bb is not None
@@ -318,21 +364,30 @@ class TestPlaceSymbolRelative:
             "kcaa.tools.component_edit_tools._get_index_manager",
             return_value=mgr,
         ):
-            added = asyncio.run(comps["add_symbol_to_schematic"](
-                schematic_path=tmp_sch,
-                library_name=_LIB_NAME, symbol_name=_SYM_NAME,
-                x=60.0, y=60.0,
-            ))
+            added = asyncio.run(
+                comps["add_symbol_to_schematic"](
+                    schematic_path=tmp_sch,
+                    library_name=_LIB_NAME,
+                    symbol_name=_SYM_NAME,
+                    x=60.0,
+                    y=60.0,
+                )
+            )
             assert added["success"], added
             ref = added["reference_assigned"]
-            moved = asyncio.run(comps["move_component"](
-                schematic_path=tmp_sch,
-                reference=ref, x=90.10, y=90.10,
-            ))
+            moved = asyncio.run(
+                comps["move_component"](
+                    schematic_path=tmp_sch,
+                    reference=ref,
+                    x=90.10,
+                    y=90.10,
+                )
+            )
         assert moved["success"], moved
         # Read back the .kicad_sch and verify the placed symbol's `at` is
         # at the nearest grid point to (90.10, 90.10), i.e. 71*1.27=90.17.
         from kcaa.utils.netlist_parser import extract_netlist
+
         netlist = extract_netlist(tmp_sch)
         comp = netlist["components"][ref]
         x_pos, y_pos = comp["position"]["x"], comp["position"]["y"]
@@ -340,8 +395,10 @@ class TestPlaceSymbolRelative:
         assert abs(round(x_pos / 1.27) * 1.27 - x_pos) < 1e-6
         assert abs(round(y_pos / 1.27) * 1.27 - y_pos) < 1e-6
 
+
 def test_system_prompt_mentions_placement_workflow():
     from kicad_plugin.llm_client import build_system_prompt
+
     rendered = build_system_prompt("CTX")
     for needle in (
         "find_free_area",

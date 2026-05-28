@@ -19,6 +19,7 @@ environment.
 Run:
     uv run python -m pytest tests/integration/test_symbol_tools.py -v
 """
+
 from __future__ import annotations
 
 import itertools
@@ -34,6 +35,7 @@ import pytest
 # ---------------------------------------------------------------------------
 # Transport helpers
 # ---------------------------------------------------------------------------
+
 
 def _find_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -73,7 +75,7 @@ def _mcp_post(port: int, payload: dict, session_id: str | None = None) -> tuple[
     for line in raw.splitlines():
         line = line.strip()
         if line.startswith("data:"):
-            json_str = line[len("data:"):].strip()
+            json_str = line[len("data:") :].strip()
             if json_str:
                 return json.loads(json_str), returned_session_id
 
@@ -110,16 +112,19 @@ def _call_tool(port: int, session_id: str | None, name: str, arguments: dict) ->
 # Fixture: running MCP server (module scope)
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture(scope="module")
 def mcp_server():
     port = _find_free_port()
     env = os.environ.copy()
-    env.update({
-        "MCP_TRANSPORT": "streamable-http",
-        "MCP_PORT": str(port),
-        "MCP_HOST": "127.0.0.1",
-        "KICAD_MCP_PROFILE": "plugin",
-    })
+    env.update(
+        {
+            "MCP_TRANSPORT": "streamable-http",
+            "MCP_PORT": str(port),
+            "MCP_HOST": "127.0.0.1",
+            "KICAD_MCP_PROFILE": "plugin",
+        }
+    )
     env.pop("http_proxy", None)
     env.pop("HTTP_PROXY", None)
 
@@ -166,6 +171,7 @@ def mcp_server():
 # Tests: sync_symbol_index
 # ---------------------------------------------------------------------------
 
+
 class TestSyncSymbolIndex:
     def test_returns_started_or_already_running(self, mcp_server):
         port, sid = mcp_server
@@ -185,12 +191,12 @@ class TestSyncSymbolIndex:
 # Tests: get_symbol_sync_status
 # ---------------------------------------------------------------------------
 
+
 class TestGetSymbolSyncStatus:
     def test_returns_expected_keys(self, mcp_server):
         port, sid = mcp_server
         result = _call_tool(port, sid, "get_symbol_sync_status", {})
-        for key in ("running", "current", "total", "current_library",
-                    "last_result", "error"):
+        for key in ("running", "current", "total", "current_library", "last_result", "error"):
             assert key in result, f"Missing key {key!r} in status response"
 
     def test_running_is_bool(self, mcp_server):
@@ -203,14 +209,20 @@ class TestGetSymbolSyncStatus:
 # Tests: list_symbol_libraries
 # ---------------------------------------------------------------------------
 
+
 class TestListSymbolLibraries:
     def test_returns_expected_keys(self, mcp_server):
         port, sid = mcp_server
-        result = _call_tool(port, sid, "list_symbol_libraries", {
-            "table": None,
-            "limit": 200,
-            "offset": 0,
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "list_symbol_libraries",
+            {
+                "table": None,
+                "limit": 200,
+                "offset": 0,
+            },
+        )
         assert "success" in result
         if result.get("success"):
             assert "tables" in result or "libraries" in result
@@ -218,11 +230,16 @@ class TestListSymbolLibraries:
 
     def test_no_error_in_response(self, mcp_server):
         port, sid = mcp_server
-        result = _call_tool(port, sid, "list_symbol_libraries", {
-            "table": None,
-            "limit": 200,
-            "offset": 0,
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "list_symbol_libraries",
+            {
+                "table": None,
+                "limit": 200,
+                "offset": 0,
+            },
+        )
         assert "error" not in result or result.get("success") is False
 
 
@@ -230,13 +247,19 @@ class TestListSymbolLibraries:
 # Tests: search_symbols
 # ---------------------------------------------------------------------------
 
+
 class TestSearchSymbols:
     def test_returns_expected_structure(self, mcp_server):
         port, sid = mcp_server
-        result = _call_tool(port, sid, "search_symbols", {
-            "query": "resistor",
-            "limit": 10,
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "search_symbols",
+            {
+                "query": "resistor",
+                "limit": 10,
+            },
+        )
         assert "success" in result
         if result.get("success"):
             assert "symbols" in result
@@ -245,10 +268,15 @@ class TestSearchSymbols:
 
     def test_empty_query_returns_empty_or_results(self, mcp_server):
         port, sid = mcp_server
-        result = _call_tool(port, sid, "search_symbols", {
-            "query": "nonexistent_symbol_xyz123",
-            "limit": 10,
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "search_symbols",
+            {
+                "query": "nonexistent_symbol_xyz123",
+                "limit": 10,
+            },
+        )
         # Should either succeed with empty results or fail gracefully
         if result.get("success"):
             assert result.get("count", 0) == 0 or len(result.get("symbols", [])) == 0
@@ -258,13 +286,19 @@ class TestSearchSymbols:
 # Tests: get_symbol
 # ---------------------------------------------------------------------------
 
+
 class TestGetSymbol:
     def test_nonexistent_symbol_returns_error(self, mcp_server):
         port, sid = mcp_server
-        result = _call_tool(port, sid, "get_symbol", {
-            "library_name": "NonExistentLib",
-            "symbol_name": "NonExistentSymbol",
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "get_symbol",
+            {
+                "library_name": "NonExistentLib",
+                "symbol_name": "NonExistentSymbol",
+            },
+        )
         # Should return success=False with error
         assert result.get("success") is False or "error" in result
 
@@ -273,20 +307,27 @@ class TestGetSymbol:
 # Tests: get_library_symbols
 # ---------------------------------------------------------------------------
 
+
 class TestGetLibrarySymbols:
     def test_nonexistent_library_returns_error(self, mcp_server):
         port, sid = mcp_server
-        result = _call_tool(port, sid, "get_library_symbols", {
-            "library_name": "NonExistentLibrary",
-            "limit": 50,
-            "offset": 0,
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "get_library_symbols",
+            {
+                "library_name": "NonExistentLibrary",
+                "limit": 50,
+                "offset": 0,
+            },
+        )
         assert result.get("success") is False or "error" in result
 
 
 # ---------------------------------------------------------------------------
 # Tests: get_symbol_index_stats
 # ---------------------------------------------------------------------------
+
 
 class TestGetSymbolIndexStats:
     def test_returns_expected_keys(self, mcp_server):
@@ -310,11 +351,17 @@ class TestGetSymbolIndexStats:
 # Tests: get_symbol_pins
 # ---------------------------------------------------------------------------
 
+
 class TestGetSymbolPins:
     def test_nonexistent_symbol_returns_error(self, mcp_server):
         port, sid = mcp_server
-        result = _call_tool(port, sid, "get_symbol_pins", {
-            "library_name": "NonExistentLib",
-            "symbol_name": "NonExistentSymbol",
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "get_symbol_pins",
+            {
+                "library_name": "NonExistentLib",
+                "symbol_name": "NonExistentSymbol",
+            },
+        )
         assert result.get("success") is False or "error" in result

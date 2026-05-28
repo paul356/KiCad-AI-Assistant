@@ -287,8 +287,6 @@ async def run_kicad_command_async(
     )
 
 
-def create_temp_file(
-    suffix: str = "", prefix: str = "kcaa_", content: str | None = None
-) -> str:
+def create_temp_file(suffix: str = "", prefix: str = "kcaa_", content: str | None = None) -> str:
     """Convenience function to create temporary file."""
     return get_subprocess_runner().create_temp_file(suffix, prefix, content)

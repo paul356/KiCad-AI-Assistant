@@ -6,14 +6,15 @@ let it ask "where can I put a W x H mm box?" instead of inventing
 coordinates. Coordinates are in **mm** with **+Y pointing down** to match
 KiCad schematic placement.
 """
+
 from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any
 
-import sexpdata
 from fastmcp import FastMCP
+import sexpdata
 
 from kcaa.utils.netlist_parser import extract_netlist
 from kcaa.utils.symbol_geometry import (
@@ -29,21 +30,21 @@ log = logging.getLogger(__name__)
 
 
 # Standard KiCad paper sizes, width x height in mm, landscape orientation.
-_PAPER_SIZES_MM: Dict[str, tuple[float, float]] = {
-    "A0":      (1189.0, 841.0),
-    "A1":      (841.0,  594.0),
-    "A2":      (594.0,  420.0),
-    "A3":      (420.0,  297.0),
-    "A4":      (297.0,  210.0),
-    "A5":      (210.0,  148.0),
-    "A":       (279.4,  215.9),
-    "B":       (431.8,  279.4),
-    "C":       (558.8,  431.8),
-    "D":       (863.6,  558.8),
-    "E":       (1117.6, 863.6),
-    "USLetter":(279.4,  215.9),
-    "USLegal": (355.6,  215.9),
-    "USLedger":(431.8,  279.4),
+_PAPER_SIZES_MM: dict[str, tuple[float, float]] = {
+    "A0": (1189.0, 841.0),
+    "A1": (841.0, 594.0),
+    "A2": (594.0, 420.0),
+    "A3": (420.0, 297.0),
+    "A4": (297.0, 210.0),
+    "A5": (210.0, 148.0),
+    "A": (279.4, 215.9),
+    "B": (431.8, 279.4),
+    "C": (558.8, 431.8),
+    "D": (863.6, 558.8),
+    "E": (1117.6, 863.6),
+    "USLetter": (279.4, 215.9),
+    "USLegal": (355.6, 215.9),
+    "USLedger": (431.8, 279.4),
 }
 
 # Approximate default KiCad title-block footprint (anchored bottom-right of
@@ -62,7 +63,7 @@ def _parse_paper_size(schematic_path: str) -> tuple[str, float, float, bool]:
     Falls back to ("A4", 297, 210, False) on any error.
     """
     try:
-        with open(schematic_path, "r", encoding="utf-8") as fh:
+        with open(schematic_path, encoding="utf-8") as fh:
             text = fh.read()
         tree = sexpdata.loads(text)
     except Exception as exc:
@@ -71,13 +72,16 @@ def _parse_paper_size(schematic_path: str) -> tuple[str, float, float, bool]:
 
     paper_name = "A4"
     portrait = False
-    custom_w: Optional[float] = None
-    custom_h: Optional[float] = None
+    custom_w: float | None = None
+    custom_h: float | None = None
     if isinstance(tree, list):
         for item in tree:
-            if (isinstance(item, list) and item
-                    and isinstance(item[0], sexpdata.Symbol)
-                    and item[0].value() == "paper"):
+            if (
+                isinstance(item, list)
+                and item
+                and isinstance(item[0], sexpdata.Symbol)
+                and item[0].value() == "paper"
+            ):
                 # (paper "A4") or (paper "User" 200 150) or (paper "A4" portrait)
                 if len(item) >= 2 and isinstance(item[1], str):
                     paper_name = item[1]
@@ -115,7 +119,7 @@ def register_placement_helpers(mcp: FastMCP) -> None:
     """Register schematic placement helper tools."""
 
     @mcp.tool()
-    def get_schematic_sheet_info(schematic_path: str) -> Dict[str, Any]:
+    def get_schematic_sheet_info(schematic_path: str) -> dict[str, Any]:
         """Return drawing area, paper size, and grid for a schematic.
 
         Use this BEFORE placing new symbols so you know:
@@ -153,7 +157,7 @@ def register_placement_helpers(mcp: FastMCP) -> None:
             "drawing_area": {"min_x": 0.0, "min_y": 0.0, "max_x": w, "max_y": h},
             "title_block_default": {
                 "note": "Approximate default KiCad title-block footprint; "
-                        "not parsed from a custom .kicad_wks if any.",
+                "not parsed from a custom .kicad_wks if any.",
                 **title_bb.to_dict(),
             },
             "grid_mm": GRID_MM,
@@ -166,13 +170,13 @@ def register_placement_helpers(mcp: FastMCP) -> None:
         schematic_path: str,
         width: float | None = None,
         height: float | None = None,
-        prefer_near: Optional[Dict[str, Any]] = None,
+        prefer_near: dict[str, Any] | None = None,
         margin: float = 3.81,
         max_candidates: int = 5,
         for_library: str | None = None,
         for_symbol: str | None = None,
         rotation: int = 0,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Find candidate top-left anchors where a ``width`` x ``height`` mm
         rectangle fits without overlapping placed symbols or the title block.
 
@@ -228,23 +232,30 @@ def register_placement_helpers(mcp: FastMCP) -> None:
                     return {"error": f"Library '{for_library}' not found in index"}
                 sym_rec = mgr.get_symbol(for_library, for_symbol)
                 if sym_rec is None:
-                    return {"error": (f"Symbol '{for_symbol}' not found in "
-                                      f"library '{for_library}'")}
+                    return {
+                        "error": (f"Symbol '{for_symbol}' not found in library '{for_library}'")
+                    }
                 lib_raw = extract_lib_symbol_raw(
-                    lib_rec.file_path, sym_rec.file_index, for_symbol,
-                    lib_rec.mtime, lib_rec.file_size,
+                    lib_rec.file_path,
+                    sym_rec.file_index,
+                    for_symbol,
+                    lib_rec.mtime,
+                    lib_rec.file_size,
                 )
                 unit_bbs = compute_unit_bboxes(lib_raw)
                 if not unit_bbs:
-                    return {"error": (f"Symbol '{for_symbol}' has no graphics; "
-                                      "cannot derive size for placement")}
+                    return {
+                        "error": (
+                            f"Symbol '{for_symbol}' has no graphics; "
+                            "cannot derive size for placement"
+                        )
+                    }
                 # Predict union over every unit at sym=(0, (N-1)*10) — same
                 # offsets used by add_symbol_to_schematic.
                 per_unit = []
                 for unit, lib_bb in sorted(unit_bbs.items()):
                     per_unit.append(
-                        lib_bbox_to_world(lib_bb, 0.0, (unit - 1) * 10.0,
-                                          int(rotation), None)
+                        lib_bbox_to_world(lib_bb, 0.0, (unit - 1) * 10.0, int(rotation), None)
                     )
                 ref_at_origin = union_bboxes(per_unit)
                 assert ref_at_origin is not None
@@ -259,17 +270,20 @@ def register_placement_helpers(mcp: FastMCP) -> None:
                 return {"error": f"Failed to inspect symbol for placement: {exc}"}
 
         if width is None or height is None:
-            return {"error": ("width and height are required unless "
-                              "for_library/for_symbol are provided")}
+            return {
+                "error": (
+                    "width and height are required unless for_library/for_symbol are provided"
+                )
+            }
         if width <= 0 or height <= 0:
             return {"error": "width and height must be positive"}
 
         # Collect occupied bboxes (already mm, +Y down).
         netlist = extract_netlist(schematic_path)
-        components: Dict[str, Any] = netlist.get("components", {}) or {}
+        components: dict[str, Any] = netlist.get("components", {}) or {}
 
-        occupied: List[BBox] = []
-        ref_bboxes: Dict[str, BBox] = {}
+        occupied: list[BBox] = []
+        ref_bboxes: dict[str, BBox] = {}
         for ref, comp in components.items():
             bb_d = comp.get("body_bbox")
             if not bb_d:
@@ -301,8 +315,8 @@ def register_placement_helpers(mcp: FastMCP) -> None:
             return {"candidates": [], "error": "Requested area larger than drawing area."}
 
         # Resolve prefer_near to a point.
-        bias_x: Optional[float] = None
-        bias_y: Optional[float] = None
+        bias_x: float | None = None
+        bias_y: float | None = None
         if prefer_near:
             if "reference" in prefer_near:
                 ref_bb = ref_bboxes.get(prefer_near["reference"])
@@ -326,7 +340,7 @@ def register_placement_helpers(mcp: FastMCP) -> None:
         x0 = _snap_up(x_lo)
         y0 = _snap_up(y_lo)
 
-        candidates: List[Dict[str, Any]] = []
+        candidates: list[dict[str, Any]] = []
         # Cap to keep scan bounded on huge sheets / very small targets.
         max_collect = max(50, max_candidates * 50)
         x = x0
@@ -348,7 +362,7 @@ def register_placement_helpers(mcp: FastMCP) -> None:
                     else:
                         # Prefer top-left when no bias is given.
                         dist = (x - x_lo) + (y - y_lo)
-                    cand_dict: Dict[str, Any] = {
+                    cand_dict: dict[str, Any] = {
                         "origin": {"x": x, "y": y},
                         "bbox": cand.to_dict(),
                         "_dist": dist,
@@ -368,7 +382,7 @@ def register_placement_helpers(mcp: FastMCP) -> None:
 
         candidates.sort(key=lambda c: c["_dist"])
         out = []
-        for c in candidates[:max(1, max_candidates)]:
+        for c in candidates[: max(1, max_candidates)]:
             c.pop("_dist", None)
             out.append(c)
         return {

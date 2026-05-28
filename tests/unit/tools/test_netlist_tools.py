@@ -5,15 +5,14 @@ Mocks extract_netlist and get_project_files so tests are self-contained.
 """
 
 import asyncio
-import os
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-
 # ---------------------------------------------------------------------------
 # MockMCP — captures @mcp.tool()-decorated coroutines
 # ---------------------------------------------------------------------------
+
 
 class _MockMCP:
     """Minimal FastMCP stand-in that captures @mcp.tool()-decorated functions."""
@@ -25,12 +24,14 @@ class _MockMCP:
         def decorator(fn):
             self.tools[fn.__name__] = fn
             return fn
+
         return decorator
 
 
 def _get_tools() -> dict:
     """Register netlist tools against a mock MCP and return the captured dict."""
     from kcaa.tools.netlist_tools import register_netlist_tools
+
     mock = _MockMCP()
     register_netlist_tools(mock)
     return mock.tools
@@ -43,6 +44,7 @@ def _run(coro):
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
 
 @pytest.fixture()
 def tools():
@@ -143,7 +145,9 @@ class TestExtractProjectNetlist:
     )
     @patch("kcaa.tools.netlist_tools.os.path.exists", return_value=True)
     @patch("kcaa.tools.netlist_tools.extract_netlist", return_value=SAMPLE_NETLIST)
-    def test_success_delegates_to_schematic_netlist(self, mock_extract, mock_exists2, mock_files, mock_exists):
+    def test_success_delegates_to_schematic_netlist(
+        self, mock_extract, mock_exists2, mock_files, mock_exists
+    ):
         result = _run(self.fn("/some/project.kicad_pro", ctx=None))
         assert result["success"] is True
         assert result["project_path"] == "/some/project.kicad_pro"

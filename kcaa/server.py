@@ -12,34 +12,36 @@ Two server profiles are supported, selected via the KICAD_MCP_PROFILE environmen
                      KiCad plugin integration where the plugin supplies project
                      context directly and the LLM drives editing via tool calls.
 """
+
 import atexit
+from collections.abc import Callable
+import functools
+import logging
 import os
 import signal
-import logging
-import functools
-from typing import Callable, Literal
-from fastmcp import FastMCP
+from typing import Literal
 
-# Plugin profile tools — always imported (skip-based, no kicad-cli dependency)
-from kcaa.tools.netlist_tools import register_netlist_tools
-from kcaa.tools.symbol_tools import register_symbol_tools
-from kcaa.tools.component_edit_tools import register_component_edit_tools
-from kcaa.tools.wire_edit_tools import register_wire_edit_tools
-from kcaa.tools.pcb_library_tools import register_pcb_library_tools
-from kcaa.tools.pcb_query_tools import register_pcb_query_tools
-from kcaa.tools.pcb_placement_tools import register_pcb_placement_tools
-from kcaa.tools.pcb_edit_tools import register_pcb_edit_tools
-from kcaa.tools.pcb_placement_helpers import register_pcb_placement_helper_tools
-from kcaa.tools.placement_helpers import register_placement_helpers
-from kcaa.tools.pcb_group_tools import register_pcb_group_tools
-from kcaa.tools.pcb_zone_tools import register_pcb_zone_tools
-from kcaa.tools.kipy_tools import register_kipy_tools
-from kcaa.tools.version_tools import register_version_tools
+from fastmcp import FastMCP
 
 # Full-profile imports are deferred inside _register_full_profile() to avoid
 # loading kicad-cli-dependent modules when running in plugin mode.
-
 from kcaa.context import kicad_lifespan
+from kcaa.tools.component_edit_tools import register_component_edit_tools
+from kcaa.tools.kipy_tools import register_kipy_tools
+
+# Plugin profile tools — always imported (skip-based, no kicad-cli dependency)
+from kcaa.tools.netlist_tools import register_netlist_tools
+from kcaa.tools.pcb_edit_tools import register_pcb_edit_tools
+from kcaa.tools.pcb_group_tools import register_pcb_group_tools
+from kcaa.tools.pcb_library_tools import register_pcb_library_tools
+from kcaa.tools.pcb_placement_helpers import register_pcb_placement_helper_tools
+from kcaa.tools.pcb_placement_tools import register_pcb_placement_tools
+from kcaa.tools.pcb_query_tools import register_pcb_query_tools
+from kcaa.tools.pcb_zone_tools import register_pcb_zone_tools
+from kcaa.tools.placement_helpers import register_placement_helpers
+from kcaa.tools.symbol_tools import register_symbol_tools
+from kcaa.tools.version_tools import register_version_tools
+from kcaa.tools.wire_edit_tools import register_wire_edit_tools
 
 ServerProfile = Literal["full", "plugin"]
 
@@ -49,13 +51,15 @@ cleanup_handlers = []
 # Flag to track whether we're already in shutdown process
 _shutting_down = False
 
+
 def add_cleanup_handler(handler: Callable) -> None:
     """Register a function to be called during cleanup.
-    
+
     Args:
         handler: Function to call during cleanup
     """
     cleanup_handlers.append(handler)
+
 
 def run_cleanup_handlers() -> None:
     """Run all registered cleanup handlers."""
@@ -73,7 +77,9 @@ def run_cleanup_handlers() -> None:
             handler()
             logging.info("Cleanup handler %s completed successfully", handler.__name__)
         except Exception as e:
-            logging.error("Error in cleanup handler %s: %s", handler.__name__, str(e), exc_info=True)
+            logging.error(
+                "Error in cleanup handler %s: %s", handler.__name__, str(e), exc_info=True
+            )
 
 
 def register_signal_handlers(server: FastMCP) -> None:
@@ -82,6 +88,7 @@ def register_signal_handlers(server: FastMCP) -> None:
     Args:
         server: The FastMCP server instance
     """
+
     def handle_exit_signal(signum, frame):
         logging.info("Received signal %s, initiating shutdown...", signum)
         run_cleanup_handlers()
@@ -124,22 +131,22 @@ def _register_full_profile(mcp: FastMCP) -> None:
     """
     logging.info("Registering full profile: all tools, resources, and prompts")
 
-    from kcaa.resources.projects import register_project_resources
-    from kcaa.resources.files import register_file_resources
-    from kcaa.resources.drc_resources import register_drc_resources
+    from kcaa.prompts.bom_prompts import register_bom_prompts
+    from kcaa.prompts.drc_prompt import register_drc_prompts
+    from kcaa.prompts.pattern_prompts import register_pattern_prompts
+    from kcaa.prompts.templates import register_prompts
     from kcaa.resources.bom_resources import register_bom_resources
+    from kcaa.resources.drc_resources import register_drc_resources
+    from kcaa.resources.files import register_file_resources
     from kcaa.resources.netlist_resources import register_netlist_resources
     from kcaa.resources.pattern_resources import register_pattern_resources
-    from kcaa.tools.project_tools import register_project_tools
+    from kcaa.resources.projects import register_project_resources
     from kcaa.tools.analysis_tools import register_analysis_tools
-    from kcaa.tools.export_tools import register_export_tools
-    from kcaa.tools.drc_tools import register_drc_tools
     from kcaa.tools.bom_tools import register_bom_tools
+    from kcaa.tools.drc_tools import register_drc_tools
+    from kcaa.tools.export_tools import register_export_tools
     from kcaa.tools.pattern_tools import register_pattern_tools
-    from kcaa.prompts.templates import register_prompts
-    from kcaa.prompts.drc_prompt import register_drc_prompts
-    from kcaa.prompts.bom_prompts import register_bom_prompts
-    from kcaa.prompts.pattern_prompts import register_pattern_prompts
+    from kcaa.tools.project_tools import register_project_tools
 
     # Resources
     register_project_resources(mcp)
@@ -200,7 +207,9 @@ def create_server(profile: ServerProfile = "full") -> FastMCP:
     kicad_modules_available = False
     logging.info("KiCad Python module setup removed; relying on kicad-cli for external operations.")
 
-    lifespan_factory = functools.partial(kicad_lifespan, kicad_modules_available=kicad_modules_available)
+    lifespan_factory = functools.partial(
+        kicad_lifespan, kicad_modules_available=kicad_modules_available
+    )
 
     mcp = FastMCP("KiCad", lifespan=lifespan_factory)
     logging.info("Created FastMCP server instance with lifespan management")
@@ -213,19 +222,20 @@ def create_server(profile: ServerProfile = "full") -> FastMCP:
     # Register signal handlers and cleanup
     register_signal_handlers(mcp)
     atexit.register(run_cleanup_handlers)
-    
+
     # Add specific cleanup handlers
-    add_cleanup_handler(lambda: logging.info(f"KiCad MCP server shutdown complete"))
+    add_cleanup_handler(lambda: logging.info("KiCad MCP server shutdown complete"))
 
     # Add temp directory cleanup
     def cleanup_temp_dirs():
         """Clean up any temporary directories created by the server."""
         import shutil
+
         from kcaa.utils.temp_dir_manager import get_temp_dirs
-        
+
         temp_dirs = get_temp_dirs()
         logging.info(f"Cleaning up {len(temp_dirs)} temporary directories")
-        
+
         for temp_dir in temp_dirs:
             try:
                 if os.path.exists(temp_dir):
@@ -233,10 +243,10 @@ def create_server(profile: ServerProfile = "full") -> FastMCP:
                     logging.info(f"Removed temporary directory: {temp_dir}")
             except Exception as e:
                 logging.error(f"Error cleaning up temporary directory {temp_dir}: {str(e)}")
-    
+
     add_cleanup_handler(cleanup_temp_dirs)
-    
-    logging.info(f"Server initialization complete")
+
+    logging.info("Server initialization complete")
     return mcp
 
 
@@ -254,8 +264,7 @@ def cleanup_handler() -> None:
 def setup_logging() -> None:
     """Configure logging for the server."""
     logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     )
 
 
@@ -263,12 +272,12 @@ def main() -> None:
     """Start the KiCad MCP server (blocking)."""
     setup_logging()
     logging.info("Starting KiCad MCP server...")
-    
+
     server = create_server()
 
     # Read transport from environment variable; default to 'stdio'
     # Supported values: 'stdio', 'streamable-http', 'sse'
-    transport = os.environ.get('MCP_TRANSPORT', 'stdio')
+    transport = os.environ.get("MCP_TRANSPORT", "stdio")
     logging.info(f"Using transport: {transport}")
 
     transport_kwargs: dict = {}

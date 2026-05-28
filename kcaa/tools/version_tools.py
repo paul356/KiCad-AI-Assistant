@@ -88,6 +88,7 @@ def register_version_tools(mcp: FastMCP) -> None:
         current = None
         if os.path.isfile(file_path):
             from datetime import datetime
+
             stat = os.stat(file_path)
             current = {
                 "timestamp": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),

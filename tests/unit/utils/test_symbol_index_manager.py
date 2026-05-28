@@ -5,11 +5,9 @@ parsing, and database storage through sync() and search/lookup methods.
 
 from pathlib import Path
 
-import pytest
-
 from kcaa.config import LibraryPathConfig
-from kcaa.utils.symbol_index_reader import SymbolIndexReader
 from kcaa.utils.symbol_index_manager import SymbolIndexManager
+from kcaa.utils.symbol_index_reader import SymbolIndexReader
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 

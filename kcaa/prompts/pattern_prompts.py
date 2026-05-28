@@ -1,16 +1,17 @@
 """
 Prompt templates for circuit pattern analysis in KiCad.
 """
+
 from fastmcp import FastMCP
 
 
 def register_pattern_prompts(mcp: FastMCP) -> None:
     """Register pattern-related prompt templates with the MCP server.
-    
+
     Args:
         mcp: The FastMCP server instance
     """
-    
+
     @mcp.prompt()
     def analyze_circuit_patterns() -> str:
         """Prompt for circuit pattern analysis."""
@@ -27,7 +28,7 @@ def register_pattern_prompts(mcp: FastMCP) -> None:
 
         Please identify as many common patterns as possible (power supplies, amplifiers, filters, etc.)
         """
-        
+
         return prompt
 
     @mcp.prompt()
@@ -46,7 +47,7 @@ def register_pattern_prompts(mcp: FastMCP) -> None:
 
         Please focus on both linear regulators and switching power supplies.
         """
-        
+
         return prompt
 
     @mcp.prompt()
@@ -65,7 +66,7 @@ def register_pattern_prompts(mcp: FastMCP) -> None:
 
         Please identify temperature, pressure, motion, light, and any other sensors in the design.
         """
-        
+
         return prompt
 
     @mcp.prompt()
@@ -84,7 +85,7 @@ def register_pattern_prompts(mcp: FastMCP) -> None:
 
         Please focus on interface circuits (SPI, I2C, UART), sensor connections, and power supply connections.
         """
-        
+
         return prompt
 
     @mcp.prompt()
@@ -103,7 +104,7 @@ def register_pattern_prompts(mcp: FastMCP) -> None:
 
         Please replace [CIRCUIT_TYPE] with the type of circuit you're interested in (e.g., "filter", "amplifier", "power supply", etc.)
         """
-        
+
         return prompt
 
     @mcp.prompt()
@@ -122,7 +123,7 @@ def register_pattern_prompts(mcp: FastMCP) -> None:
 
         Please focus on identifying differences in approaches to the same functional circuit blocks.
         """
-        
+
         return prompt
 
     @mcp.prompt()
@@ -141,5 +142,5 @@ def register_pattern_prompts(mcp: FastMCP) -> None:
 
         Please provide explanations that would help someone unfamiliar with the design understand it.
         """
-        
+
         return prompt

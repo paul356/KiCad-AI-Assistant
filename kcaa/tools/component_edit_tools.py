@@ -4,24 +4,22 @@ Provides tools to add symbols to KiCad schematics by combining
 the symbol index DB, the streaming extractor, and the skip library.
 """
 
+import contextlib
 import copy
 import logging
 import math
 import os
-import re
-import shutil
-import uuid
 from pathlib import Path
-
-from kcaa.utils.schematic_sexp_utils import save_schematic
+import re
 from typing import Any
+import uuid
 
+from fastmcp import Context, FastMCP
 import sexpdata
 import skip
-from fastmcp import FastMCP
-from fastmcp import Context
 
 from kcaa.config import LibraryPathConfig
+from kcaa.utils.schematic_sexp_utils import save_schematic
 from kcaa.utils.symbol_extractor import extract_lib_symbol_raw
 from kcaa.utils.symbol_geometry import (
     BBox,
@@ -47,6 +45,7 @@ def _angle_to_direction(angle_deg: int | float) -> str:
     a = int(round(float(angle_deg))) % 360
     return {0: "right", 90: "down", 180: "left", 270: "up"}.get(a, f"{a}deg")
 
+
 # ---------------------------------------------------------------------------
 # Symbol index manager singleton
 # ---------------------------------------------------------------------------
@@ -67,14 +66,15 @@ def _get_index_manager() -> SymbolIndexManager:
 # Internal helpers
 # ---------------------------------------------------------------------------
 
+
 def _align_to_grid(value: float, grid_size: float = 1.27) -> float:
     """Align a coordinate to the nearest grid point.
-    
+
     Args:
         value: The coordinate value in mm.
         grid_size: The grid size in mm (default 1.27 mm = 50 mils, the
             standard KiCad schematic grid on which all symbol pins are placed).
-    
+
     Returns:
         The coordinate rounded to the nearest grid point.
     """
@@ -85,8 +85,8 @@ def _align_to_grid(value: float, grid_size: float = 1.27) -> float:
 # Pin-on-wire conflict detection for safe symbol placement
 # ---------------------------------------------------------------------------
 
-_PLACE_GRID: float = 2.54   # mm — standard KiCad schematic grid
-_PLACE_TOL: float = 0.5     # mm — tolerance for pin-on-wire detection
+_PLACE_GRID: float = 2.54  # mm — standard KiCad schematic grid
+_PLACE_TOL: float = 0.5  # mm — tolerance for pin-on-wire detection
 
 
 def _extract_lib_pin_positions(lib_sym_raw: list) -> list[tuple[float, float]]:
@@ -119,10 +119,8 @@ def _extract_lib_pin_positions(lib_sym_raw: list) -> list[tuple[float, float]]:
                     and isinstance(sub[0], sexpdata.Symbol)
                     and sub[0].value() == "at"
                 ):
-                    try:
+                    with contextlib.suppress(TypeError, ValueError):
                         positions.append((float(sub[1]), float(sub[2])))
-                    except (TypeError, ValueError):
-                        pass
                     break
     return positions
 
@@ -151,7 +149,8 @@ def _lib_pins_world(
 
 
 def _pin_on_wire(
-    px: float, py: float,
+    px: float,
+    py: float,
     wires: list[tuple[float, float, float, float]],
     tol: float,
 ) -> bool:
@@ -196,6 +195,7 @@ def _find_safe_placement(
     Returns the original coordinates unchanged if no conflict exists or if no
     conflict-free position is found within the search radius.
     """
+
     def _conflicts(cx: float, cy: float) -> bool:
         return any(
             _pin_on_wire(px, py, wires, _PLACE_TOL)
@@ -256,18 +256,29 @@ def _do_add_symbol(
         mgr = _get_index_manager()
         lib_rec = mgr.get_library_by_name(library_name)
         if lib_rec is None:
-            return {"error": (f"Library '{library_name}' not found in index. "
-                              "Verify the library name is correct.")}
+            return {
+                "error": (
+                    f"Library '{library_name}' not found in index. "
+                    "Verify the library name is correct."
+                )
+            }
 
         sym_rec = mgr.get_symbol(library_name, symbol_name)
         if sym_rec is None:
-            return {"error": (f"Symbol '{symbol_name}' not found in library "
-                              f"'{library_name}'. Verify the symbol name.")}
+            return {
+                "error": (
+                    f"Symbol '{symbol_name}' not found in library "
+                    f"'{library_name}'. Verify the symbol name."
+                )
+            }
 
         try:
             lib_sym_raw = extract_lib_symbol_raw(
-                lib_rec.file_path, sym_rec.file_index, symbol_name,
-                lib_rec.mtime, lib_rec.file_size,
+                lib_rec.file_path,
+                sym_rec.file_index,
+                symbol_name,
+                lib_rec.mtime,
+                lib_rec.file_size,
             )
         except Exception as exc:
             return {"error": f"Failed to extract lib symbol: {exc}"}
@@ -314,10 +325,14 @@ def _do_add_symbol(
         existing_wires: list[tuple[float, float, float, float]] = []
         try:
             for w in sch.wire:
-                existing_wires.append((
-                    float(w.start.value[0]), float(w.start.value[1]),
-                    float(w.end.value[0]),   float(w.end.value[1]),
-                ))
+                existing_wires.append(
+                    (
+                        float(w.start.value[0]),
+                        float(w.start.value[1]),
+                        float(w.end.value[0]),
+                        float(w.end.value[1]),
+                    )
+                )
         except AttributeError:
             pass
         original_x, original_y = x, y
@@ -327,9 +342,16 @@ def _do_add_symbol(
         for unit in range(1, unit_count + 1):
             unit_y = y + (unit - 1) * 10.0
             placed_raw = _build_placed_symbol(
-                lib_id_str, x, unit_y, rotation, unit,
-                reference, effective_value, sch_uuid,
-                project_name, lib_sym_raw,
+                lib_id_str,
+                x,
+                unit_y,
+                rotation,
+                unit,
+                reference,
+                effective_value,
+                sch_uuid,
+                project_name,
+                lib_sym_raw,
                 fields_autoplaced=fields_autoplaced,
             )
             sch.new_from_list(placed_raw)
@@ -358,7 +380,6 @@ def _do_add_symbol(
     except Exception as exc:
         log.exception("Unexpected error in _do_add_symbol")
         return {"error": str(exc), "success": False}
-
 
 
 def _placed_world_bbox(
@@ -452,7 +473,7 @@ def _get_unit_count(lib_sym_raw: list) -> int:
         sub_name = child[1]
         if not sub_name.startswith(prefix):
             continue
-        rest = sub_name[len(prefix):]   # e.g. "1_1" or "0_1"
+        rest = sub_name[len(prefix) :]  # e.g. "1_1" or "0_1"
         parts = rest.split("_")
         if len(parts) >= 2:
             try:
@@ -504,7 +525,7 @@ def _collect_unit_pin_numbers(lib_sym_raw: list, unit: int) -> list[str]:
         sub_name = child[1]
         if not sub_name.startswith(prefix):
             continue
-        rest = sub_name[len(prefix):]
+        rest = sub_name[len(prefix) :]
         parts = rest.split("_")
         if len(parts) < 2:
             continue
@@ -671,16 +692,21 @@ def _build_placed_symbol(
         if len(prop) < 2:
             continue
         pname = prop[1]
-        if pname in ("Reference", "Value",
-                     "ki_keywords", "ki_fp_filters", "ki_description"):
+        if pname in ("Reference", "Value", "ki_keywords", "ki_fp_filters", "ki_description"):
             continue
         prop_x, prop_y, prop_rot = _get_property_at(prop)
         pdx, pdy = _rotate_offset(prop_x, prop_y, rotation)
         pval = prop[2] if len(prop) >= 3 else ""
         extra_props.append(
-            _build_property(pname, pval, x + pdx, y + pdy, prop_rot,
-                            hide=(pname not in _STANDARD_VISIBLE_PROPERTIES),
-                            do_not_autoplace=not fields_autoplaced)
+            _build_property(
+                pname,
+                pval,
+                x + pdx,
+                y + pdy,
+                prop_rot,
+                hide=(pname not in _STANDARD_VISIBLE_PROPERTIES),
+                do_not_autoplace=not fields_autoplaced,
+            )
         )
 
     # Collect pin numbers for this unit.
@@ -696,13 +722,31 @@ def _build_placed_symbol(
         [sexpdata.Symbol("in_bom"), sexpdata.Symbol("yes")],
         [sexpdata.Symbol("on_board"), sexpdata.Symbol("yes")],
         [sexpdata.Symbol("dnp"), sexpdata.Symbol("no")],
-        *([[sexpdata.Symbol("fields_autoplaced"), sexpdata.Symbol("yes")]] if fields_autoplaced else []),
+        *(
+            [[sexpdata.Symbol("fields_autoplaced"), sexpdata.Symbol("yes")]]
+            if fields_autoplaced
+            else []
+        ),
         [sexpdata.Symbol("uuid"), sym_uuid],
-        _build_property("Reference", reference, x + ref_dx, y + ref_dy, 0,
-                         justify="left", do_not_autoplace=not fields_autoplaced,
-                         hide=reference.startswith("#")),
-        _build_property("Value", value, x + val_dx, y + val_dy, 0,
-                         justify="left", do_not_autoplace=not fields_autoplaced),
+        _build_property(
+            "Reference",
+            reference,
+            x + ref_dx,
+            y + ref_dy,
+            0,
+            justify="left",
+            do_not_autoplace=not fields_autoplaced,
+            hide=reference.startswith("#"),
+        ),
+        _build_property(
+            "Value",
+            value,
+            x + val_dx,
+            y + val_dy,
+            0,
+            justify="left",
+            do_not_autoplace=not fields_autoplaced,
+        ),
     ]
 
     for prop in extra_props:
@@ -846,9 +890,7 @@ def _resolve_extends_symbol(lib_sym_raw: list, library_name: str) -> list:
     ext_props: dict[str, list] = {}
     for child in lib_sym_raw[2:]:
         if not (
-            isinstance(child, list)
-            and len(child) >= 1
-            and isinstance(child[0], sexpdata.Symbol)
+            isinstance(child, list) and len(child) >= 1 and isinstance(child[0], sexpdata.Symbol)
         ):
             continue
         tag = child[0].value()
@@ -866,9 +908,7 @@ def _resolve_extends_symbol(lib_sym_raw: list, library_name: str) -> list:
     seen_structural: set[str] = set()
     for child in base_raw[2:]:
         if not (
-            isinstance(child, list)
-            and len(child) >= 1
-            and isinstance(child[0], sexpdata.Symbol)
+            isinstance(child, list) and len(child) >= 1 and isinstance(child[0], sexpdata.Symbol)
         ):
             continue
         tag = child[0].value()
@@ -914,7 +954,7 @@ def _resolve_extends_symbol(lib_sym_raw: list, library_name: str) -> list:
         sub_name = child[1]
         if isinstance(sub_name, str) and sub_name.startswith(base_prefix):
             sub_copy = copy.deepcopy(child)
-            sub_copy[1] = ext_prefix + sub_name[len(base_prefix):]
+            sub_copy[1] = ext_prefix + sub_name[len(base_prefix) :]
             merged.append(sub_copy)
 
     return merged
@@ -960,6 +1000,7 @@ def _add_lib_symbol(lib_symbols_wrapper: Any, lib_sym_raw: list, table_name: str
 # ---------------------------------------------------------------------------
 # MCP tool registration
 # ---------------------------------------------------------------------------
+
 
 def register_component_edit_tools(mcp: FastMCP) -> None:
     """Register all component editing tools with the MCP server."""
@@ -1082,6 +1123,7 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
         # Look up anchor's world bbox via netlist extraction.
         try:
             from kcaa.utils.netlist_parser import extract_netlist
+
             netlist = extract_netlist(schematic_path)
         except Exception as exc:
             return {"error": f"Failed to read schematic netlist: {exc}"}
@@ -1091,8 +1133,12 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
             return {"error": f"Anchor reference {anchor_reference!r} not found"}
         bb_d = anchor.get("body_bbox")
         if not bb_d:
-            return {"error": (f"Anchor {anchor_reference!r} has no computable "
-                              "bbox (lib symbol missing or graphics-less)")}
+            return {
+                "error": (
+                    f"Anchor {anchor_reference!r} has no computable "
+                    "bbox (lib symbol missing or graphics-less)"
+                )
+            }
 
         # We need the new symbol's lib bbox to centre it correctly.
         try:
@@ -1102,11 +1148,13 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
                 return {"error": f"Library '{library_name}' not found in index"}
             sym_rec = mgr.get_symbol(library_name, symbol_name)
             if sym_rec is None:
-                return {"error": (f"Symbol '{symbol_name}' not found in library "
-                                  f"'{library_name}'")}
+                return {"error": (f"Symbol '{symbol_name}' not found in library '{library_name}'")}
             new_lib_raw = extract_lib_symbol_raw(
-                lib_rec.file_path, sym_rec.file_index, symbol_name,
-                lib_rec.mtime, lib_rec.file_size,
+                lib_rec.file_path,
+                sym_rec.file_index,
+                symbol_name,
+                lib_rec.mtime,
+                lib_rec.file_size,
             )
             new_unit_bbs = compute_unit_bboxes(new_lib_raw)
         except Exception as exc:
@@ -1122,9 +1170,7 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
         per_unit_world: list[BBox] = []
         for unit, lib_bb in sorted(new_unit_bbs.items()):
             unit_y_off = (unit - 1) * 10.0
-            per_unit_world.append(
-                lib_bbox_to_world(lib_bb, 0.0, unit_y_off, int(rotation), None)
-            )
+            per_unit_world.append(lib_bbox_to_world(lib_bb, 0.0, unit_y_off, int(rotation), None))
         ref_at_origin = union_bboxes(per_unit_world)
         if ref_at_origin is None:
             return {"error": "New symbol has no graphics; cannot compute relative placement"}
@@ -1227,10 +1273,8 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
                         continue
                     if ref_val in ref_set:
                         per_ref[ref_val].append(sym)
-                        try:
+                        with contextlib.suppress(AttributeError):
                             removed_lib_ids.add(sym.lib_id.value)
-                        except AttributeError:
-                            pass
             except AttributeError:
                 pass  # empty schematic
 
@@ -1258,10 +1302,8 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
             remaining_lib_ids: set[str] = set()
             try:
                 for sym in sch.symbol:
-                    try:
+                    with contextlib.suppress(AttributeError):
                         remaining_lib_ids.add(sym.lib_id.value)
-                    except AttributeError:
-                        pass
             except AttributeError:
                 pass
 
@@ -1380,14 +1422,13 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
                                     and isinstance(child[0], sexpdata.Symbol)
                                     and child[0].value() == "effects"
                                 ):
-                                    child.append(
-                                        [sexpdata.Symbol("hide"),
-                                         sexpdata.Symbol("yes")]
-                                    )
+                                    child.append([sexpdata.Symbol("hide"), sexpdata.Symbol("yes")])
                                     break
                         added_count += 1
                     except Exception as exc:
-                        return {"error": f"Failed to add property {property_name!r} on unit {sym.unit.value if hasattr(sym, 'unit') else '?'}: {exc}"}
+                        return {
+                            "error": f"Failed to add property {property_name!r} on unit {sym.unit.value if hasattr(sym, 'unit') else '?'}: {exc}"
+                        }
 
             if added_count > 0 and updated_count > 0:
                 action = "mixed"
@@ -1528,9 +1569,7 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
             return {"error": "property_name must not be empty"}
         if property_name in ("Reference", "Value"):
             return {
-                "error": (
-                    f"Property {property_name!r} is required by KiCad and cannot be deleted"
-                )
+                "error": (f"Property {property_name!r} is required by KiCad and cannot be deleted")
             }
 
         try:
@@ -1563,9 +1602,7 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
 
             if updated_count == 0:
                 return {
-                    "error": (
-                        f"Property {property_name!r} not found on component {reference!r}"
-                    )
+                    "error": (f"Property {property_name!r} not found on component {reference!r}")
                 }
 
             try:
@@ -1700,7 +1737,8 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
                         fa_node = [sexpdata.Symbol("fields_autoplaced"), sexpdata.Symbol("yes")]
                         uuid_idx = next(
                             (
-                                i for i, child in enumerate(raw_tree)
+                                i
+                                for i, child in enumerate(raw_tree)
                                 if isinstance(child, list)
                                 and len(child) >= 1
                                 and isinstance(child[0], sexpdata.Symbol)
@@ -1823,7 +1861,12 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
         except Exception as exc:
             return {"error": f"Failed to add label: {exc}"}
 
-        return {"success": True, "label": {"text": text, "x": x, "y": y, "direction": _angle_to_direction(angle)}, "file_modified": schematic_path, "backup_path": schematic_path + ".bak"}
+        return {
+            "success": True,
+            "label": {"text": text, "x": x, "y": y, "direction": _angle_to_direction(angle)},
+            "file_modified": schematic_path,
+            "backup_path": schematic_path + ".bak",
+        }
 
     @mcp.tool()
     async def list_labels_in_schematic(
@@ -1857,12 +1900,14 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
             for lbl in sch.label:
                 try:
                     at_val = lbl.at.value
-                    labels.append({
-                        "text": str(lbl.value),
-                        "x": float(at_val[0]),
-                        "y": float(at_val[1]),
-                        "direction": _angle_to_direction(at_val[2] if len(at_val) > 2 else 0),
-                    })
+                    labels.append(
+                        {
+                            "text": str(lbl.value),
+                            "x": float(at_val[0]),
+                            "y": float(at_val[1]),
+                            "direction": _angle_to_direction(at_val[2] if len(at_val) > 2 else 0),
+                        }
+                    )
                 except (AttributeError, IndexError, ValueError):
                     continue
         except AttributeError:
@@ -2033,5 +2078,9 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
         except Exception as exc:
             return {"error": f"Failed to delete label: {exc}"}
 
-        return {"success": True, "deleted_count": len(to_delete), "file_modified": schematic_path, "backup_path": schematic_path + ".bak"}
-
+        return {
+            "success": True,
+            "deleted_count": len(to_delete),
+            "file_modified": schematic_path,
+            "backup_path": schematic_path + ".bak",
+        }

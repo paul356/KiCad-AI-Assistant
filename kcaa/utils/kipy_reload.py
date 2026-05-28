@@ -5,6 +5,7 @@ Both functions are **fire-and-forget**: all errors are logged at DEBUG level
 and never re-raised so that the calling tool can still return a success
 result even when KiCad is not running or the IPC API is unavailable.
 """
+
 import logging
 import os
 
@@ -26,6 +27,7 @@ def _find_kicad_socket() -> str:
 
     if platform.system() == "Windows":
         from tempfile import gettempdir
+
         return f"ipc://{gettempdir()}\\kicad\\api.sock"
 
     home = os.environ.get("HOME", "")

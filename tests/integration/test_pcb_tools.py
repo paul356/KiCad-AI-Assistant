@@ -20,6 +20,7 @@ library environment.
 Run:
     uv run python -m pytest tests/integration/test_pcb_tools.py -v
 """
+
 from __future__ import annotations
 
 import itertools
@@ -43,6 +44,7 @@ BOARD_FIXTURE = os.path.join(FIXTURE_DIR, "test_board.kicad_pcb")
 # ---------------------------------------------------------------------------
 # Transport helpers (duplicated from test_plugin_smoke for self-containment)
 # ---------------------------------------------------------------------------
+
 
 def _find_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -86,7 +88,7 @@ def _mcp_post(port: int, payload: dict, session_id: str | None = None) -> tuple[
     for line in raw.splitlines():
         line = line.strip()
         if line.startswith("data:"):
-            json_str = line[len("data:"):].strip()
+            json_str = line[len("data:") :].strip()
             if json_str:
                 return json.loads(json_str), returned_session_id
 
@@ -133,17 +135,20 @@ def _call_tool(port: int, session_id: str | None, name: str, arguments: dict) ->
 # Fixture: running MCP server (module scope — shared across all test classes)
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture(scope="module")
 def mcp_server():
     """Start the MCP server (plugin profile); yield (port, session_id)."""
     port = _find_free_port()
     env = os.environ.copy()
-    env.update({
-        "MCP_TRANSPORT": "streamable-http",
-        "MCP_PORT": str(port),
-        "MCP_HOST": "127.0.0.1",
-        "KICAD_MCP_PROFILE": "plugin",
-    })
+    env.update(
+        {
+            "MCP_TRANSPORT": "streamable-http",
+            "MCP_PORT": str(port),
+            "MCP_HOST": "127.0.0.1",
+            "KICAD_MCP_PROFILE": "plugin",
+        }
+    )
     env.pop("http_proxy", None)
     env.pop("HTTP_PROXY", None)
 
@@ -190,6 +195,7 @@ def mcp_server():
 # Query tool tests (read-only — use fixture directly)
 # ---------------------------------------------------------------------------
 
+
 class TestGetBoardInfo:
     def test_footprint_count(self, mcp_server):
         port, sid = mcp_server
@@ -215,7 +221,9 @@ class TestGetBoardInfo:
 
     def test_missing_file_returns_error(self, mcp_server):
         port, sid = mcp_server
-        result = _call_tool(port, sid, "get_board_info", {"pcb_path": "/nonexistent/board.kicad_pcb"})
+        result = _call_tool(
+            port, sid, "get_board_info", {"pcb_path": "/nonexistent/board.kicad_pcb"}
+        )
         assert "error" in result
 
 
@@ -249,32 +257,42 @@ class TestListFootprints:
 class TestGetFootprint:
     def test_value_and_reference(self, mcp_server):
         port, sid = mcp_server
-        result = _call_tool(port, sid, "get_footprint", {"pcb_path": BOARD_FIXTURE, "reference": "R1"})
+        result = _call_tool(
+            port, sid, "get_footprint", {"pcb_path": BOARD_FIXTURE, "reference": "R1"}
+        )
         assert result.get("reference") == "R1"
         assert result.get("value") == "10k"
 
     def test_pad_count(self, mcp_server):
         port, sid = mcp_server
-        result = _call_tool(port, sid, "get_footprint", {"pcb_path": BOARD_FIXTURE, "reference": "R1"})
+        result = _call_tool(
+            port, sid, "get_footprint", {"pcb_path": BOARD_FIXTURE, "reference": "R1"}
+        )
         assert len(result.get("pads", [])) == 2
 
     def test_pad_net_name(self, mcp_server):
         port, sid = mcp_server
-        result = _call_tool(port, sid, "get_footprint", {"pcb_path": BOARD_FIXTURE, "reference": "R1"})
+        result = _call_tool(
+            port, sid, "get_footprint", {"pcb_path": BOARD_FIXTURE, "reference": "R1"}
+        )
         pad1 = next(p for p in result["pads"] if p["number"] == "1")
         assert pad1["net_name"] == "VCC"
 
     def test_pad_coords_are_local(self, mcp_server):
         """Pads expose local_x/local_y (footprint-relative), not world coords."""
         port, sid = mcp_server
-        result = _call_tool(port, sid, "get_footprint", {"pcb_path": BOARD_FIXTURE, "reference": "R1"})
+        result = _call_tool(
+            port, sid, "get_footprint", {"pcb_path": BOARD_FIXTURE, "reference": "R1"}
+        )
         pad1 = next(p for p in result["pads"] if p["number"] == "1")
         assert "local_x" in pad1
         assert "local_y" in pad1
 
     def test_missing_reference_returns_error(self, mcp_server):
         port, sid = mcp_server
-        result = _call_tool(port, sid, "get_footprint", {"pcb_path": BOARD_FIXTURE, "reference": "U99"})
+        result = _call_tool(
+            port, sid, "get_footprint", {"pcb_path": BOARD_FIXTURE, "reference": "U99"}
+        )
         assert "error" in result
 
 
@@ -331,18 +349,24 @@ class TestGetRatsnest:
 # Placement tool tests (mutation — each test gets its own temp PCB copy)
 # ---------------------------------------------------------------------------
 
+
 class TestSetFootprintPosition:
     def test_moves_footprint(self, mcp_server, tmp_path):
         port, sid = mcp_server
         pcb = tmp_path / "board.kicad_pcb"
         shutil.copy2(BOARD_FIXTURE, pcb)
-        result = _call_tool(port, sid, "set_footprint_position", {
-            "pcb_path": str(pcb),
-            "reference": "R1",
-            "x": 50.0,
-            "y": 60.0,
-            "rotation": None,
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "set_footprint_position",
+            {
+                "pcb_path": str(pcb),
+                "reference": "R1",
+                "x": 50.0,
+                "y": 60.0,
+                "rotation": None,
+            },
+        )
         assert "error" not in result, result
         assert abs(result["placed_at"]["x"] - 50.0) < 0.001
         assert abs(result["placed_at"]["y"] - 60.0) < 0.001
@@ -351,13 +375,18 @@ class TestSetFootprintPosition:
         port, sid = mcp_server
         pcb = tmp_path / "board.kicad_pcb"
         shutil.copy2(BOARD_FIXTURE, pcb)
-        result = _call_tool(port, sid, "set_footprint_position", {
-            "pcb_path": str(pcb),
-            "reference": "R1",
-            "x": 99.0,
-            "y": None,
-            "rotation": None,
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "set_footprint_position",
+            {
+                "pcb_path": str(pcb),
+                "reference": "R1",
+                "x": 99.0,
+                "y": None,
+                "rotation": None,
+            },
+        )
         assert "error" not in result
         # y must be unchanged from fixture value (20.0)
         assert abs(result["placed_at"]["y"] - 20.0) < 0.001
@@ -366,13 +395,18 @@ class TestSetFootprintPosition:
         port, sid = mcp_server
         pcb = tmp_path / "board.kicad_pcb"
         shutil.copy2(BOARD_FIXTURE, pcb)
-        result = _call_tool(port, sid, "set_footprint_position", {
-            "pcb_path": str(pcb),
-            "reference": "R1",
-            "x": 1.0,
-            "y": 1.0,
-            "rotation": None,
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "set_footprint_position",
+            {
+                "pcb_path": str(pcb),
+                "reference": "R1",
+                "x": 1.0,
+                "y": 1.0,
+                "rotation": None,
+            },
+        )
         assert "error" not in result
         bak = result.get("backup_path", "")
         assert bak and os.path.isfile(bak), f"Backup file not found at {bak!r}"
@@ -381,13 +415,18 @@ class TestSetFootprintPosition:
         port, sid = mcp_server
         pcb = tmp_path / "board.kicad_pcb"
         shutil.copy2(BOARD_FIXTURE, pcb)
-        result = _call_tool(port, sid, "set_footprint_position", {
-            "pcb_path": str(pcb),
-            "reference": "R1",
-            "x": 5.0,
-            "y": 5.0,
-            "rotation": None,
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "set_footprint_position",
+            {
+                "pcb_path": str(pcb),
+                "reference": "R1",
+                "x": 5.0,
+                "y": 5.0,
+                "rotation": None,
+            },
+        )
         assert "error" not in result
         assert abs(result["moved_from"]["x"] - 10.0) < 0.001
         assert abs(result["moved_from"]["y"] - 20.0) < 0.001
@@ -396,26 +435,36 @@ class TestSetFootprintPosition:
         port, sid = mcp_server
         pcb = tmp_path / "board.kicad_pcb"
         shutil.copy2(BOARD_FIXTURE, pcb)
-        result = _call_tool(port, sid, "set_footprint_position", {
-            "pcb_path": str(pcb),
-            "reference": "U99",
-            "x": 1.0,
-            "y": 1.0,
-            "rotation": None,
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "set_footprint_position",
+            {
+                "pcb_path": str(pcb),
+                "reference": "U99",
+                "x": 1.0,
+                "y": 1.0,
+                "rotation": None,
+            },
+        )
         assert "error" in result
 
     def test_no_args_returns_error(self, mcp_server, tmp_path):
         port, sid = mcp_server
         pcb = tmp_path / "board.kicad_pcb"
         shutil.copy2(BOARD_FIXTURE, pcb)
-        result = _call_tool(port, sid, "set_footprint_position", {
-            "pcb_path": str(pcb),
-            "reference": "R1",
-            "x": None,
-            "y": None,
-            "rotation": None,
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "set_footprint_position",
+            {
+                "pcb_path": str(pcb),
+                "reference": "R1",
+                "x": None,
+                "y": None,
+                "rotation": None,
+            },
+        )
         assert "error" in result
 
 
@@ -424,10 +473,15 @@ class TestFlipFootprint:
         port, sid = mcp_server
         pcb = tmp_path / "board.kicad_pcb"
         shutil.copy2(BOARD_FIXTURE, pcb)
-        result = _call_tool(port, sid, "flip_footprint", {
-            "pcb_path": str(pcb),
-            "reference": "R1",
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "flip_footprint",
+            {
+                "pcb_path": str(pcb),
+                "reference": "R1",
+            },
+        )
         assert "error" not in result, result
         assert result.get("previous_layer") == "F.Cu"
         assert result.get("new_layer") == "B.Cu"
@@ -436,10 +490,15 @@ class TestFlipFootprint:
         port, sid = mcp_server
         pcb = tmp_path / "board.kicad_pcb"
         shutil.copy2(BOARD_FIXTURE, pcb)
-        result = _call_tool(port, sid, "flip_footprint", {
-            "pcb_path": str(pcb),
-            "reference": "J1",
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "flip_footprint",
+            {
+                "pcb_path": str(pcb),
+                "reference": "J1",
+            },
+        )
         assert "error" not in result
         assert result.get("previous_layer") == "B.Cu"
         assert result.get("new_layer") == "F.Cu"
@@ -456,10 +515,15 @@ class TestFlipFootprint:
         port, sid = mcp_server
         pcb = tmp_path / "board.kicad_pcb"
         shutil.copy2(BOARD_FIXTURE, pcb)
-        result = _call_tool(port, sid, "flip_footprint", {
-            "pcb_path": str(pcb),
-            "reference": "U99",
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "flip_footprint",
+            {
+                "pcb_path": str(pcb),
+                "reference": "U99",
+            },
+        )
         assert "error" in result
 
     def test_creates_backup(self, mcp_server, tmp_path):
@@ -477,12 +541,17 @@ class TestSetFootprintProperty:
         port, sid = mcp_server
         pcb = tmp_path / "board.kicad_pcb"
         shutil.copy2(BOARD_FIXTURE, pcb)
-        result = _call_tool(port, sid, "set_footprint_property", {
-            "pcb_path": str(pcb),
-            "reference": "R1",
-            "property_name": "Value",
-            "value": "22k",
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "set_footprint_property",
+            {
+                "pcb_path": str(pcb),
+                "reference": "R1",
+                "property_name": "Value",
+                "value": "22k",
+            },
+        )
         assert "error" not in result, result
         assert result.get("new_value") == "22k"
         assert result.get("previous_value") == "10k"
@@ -492,12 +561,17 @@ class TestSetFootprintProperty:
         port, sid = mcp_server
         pcb = tmp_path / "board.kicad_pcb"
         shutil.copy2(BOARD_FIXTURE, pcb)
-        _call_tool(port, sid, "set_footprint_property", {
-            "pcb_path": str(pcb),
-            "reference": "R1",
-            "property_name": "Value",
-            "value": "47k",
-        })
+        _call_tool(
+            port,
+            sid,
+            "set_footprint_property",
+            {
+                "pcb_path": str(pcb),
+                "reference": "R1",
+                "property_name": "Value",
+                "value": "47k",
+            },
+        )
         result = _call_tool(port, sid, "get_footprint", {"pcb_path": str(pcb), "reference": "R1"})
         assert result.get("value") == "47k"
 
@@ -505,24 +579,34 @@ class TestSetFootprintProperty:
         port, sid = mcp_server
         pcb = tmp_path / "board.kicad_pcb"
         shutil.copy2(BOARD_FIXTURE, pcb)
-        result = _call_tool(port, sid, "set_footprint_property", {
-            "pcb_path": str(pcb),
-            "reference": "R1",
-            "property_name": "NonExistentProp",
-            "value": "x",
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "set_footprint_property",
+            {
+                "pcb_path": str(pcb),
+                "reference": "R1",
+                "property_name": "NonExistentProp",
+                "value": "x",
+            },
+        )
         assert "error" in result
 
     def test_missing_reference_returns_error(self, mcp_server, tmp_path):
         port, sid = mcp_server
         pcb = tmp_path / "board.kicad_pcb"
         shutil.copy2(BOARD_FIXTURE, pcb)
-        result = _call_tool(port, sid, "set_footprint_property", {
-            "pcb_path": str(pcb),
-            "reference": "U99",
-            "property_name": "Value",
-            "value": "x",
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "set_footprint_property",
+            {
+                "pcb_path": str(pcb),
+                "reference": "U99",
+                "property_name": "Value",
+                "value": "x",
+            },
+        )
         assert "error" in result
 
 
@@ -530,13 +614,19 @@ class TestSetFootprintProperty:
 # Library tool tests (structure-only; tolerates missing KiCad installation)
 # ---------------------------------------------------------------------------
 
+
 class TestSyncFootprintIndex:
     def test_returns_started_or_already_running(self, mcp_server):
         port, sid = mcp_server
-        result = _call_tool(port, sid, "sync_footprint_index", {
-            "force": False,
-            "project_path": None,
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "sync_footprint_index",
+            {
+                "force": False,
+                "project_path": None,
+            },
+        )
         assert result.get("status") in ("started", "already_running"), (
             f"Unexpected status: {result}"
         )
@@ -546,10 +636,15 @@ class TestSyncFootprintIndex:
         port, sid = mcp_server
         # Wait a moment in case a previous sync is still running
         time.sleep(0.5)
-        result = _call_tool(port, sid, "sync_footprint_index", {
-            "force": True,
-            "project_path": None,
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "sync_footprint_index",
+            {
+                "force": True,
+                "project_path": None,
+            },
+        )
         assert result.get("status") in ("started", "already_running")
 
 
@@ -557,8 +652,15 @@ class TestGetFootprintSyncStatus:
     def test_returns_expected_keys(self, mcp_server):
         port, sid = mcp_server
         result = _call_tool(port, sid, "get_footprint_sync_status", {})
-        for key in ("running", "current", "total", "percent_complete",
-                    "current_library", "last_result", "error"):
+        for key in (
+            "running",
+            "current",
+            "total",
+            "percent_complete",
+            "current_library",
+            "last_result",
+            "error",
+        ):
             assert key in result, f"Missing key {key!r} in status response"
 
     def test_running_is_bool(self, mcp_server):
@@ -576,62 +678,97 @@ class TestGetFootprintSyncStatus:
 class TestListFootprintLibraries:
     def test_returns_expected_keys(self, mcp_server):
         port, sid = mcp_server
-        result = _call_tool(port, sid, "list_footprint_libraries", {
-            "project_path": None,
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "list_footprint_libraries",
+            {
+                "project_path": None,
+            },
+        )
         assert "libraries" in result
         assert "count" in result
 
     def test_count_matches_list_length(self, mcp_server):
         port, sid = mcp_server
-        result = _call_tool(port, sid, "list_footprint_libraries", {
-            "project_path": None,
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "list_footprint_libraries",
+            {
+                "project_path": None,
+            },
+        )
         assert result["count"] == len(result["libraries"])
 
     def test_no_error_in_response(self, mcp_server):
         port, sid = mcp_server
-        result = _call_tool(port, sid, "list_footprint_libraries", {
-            "project_path": None,
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "list_footprint_libraries",
+            {
+                "project_path": None,
+            },
+        )
         assert "error" not in result
 
 
 class TestSearchFootprints:
     def test_returns_results_key(self, mcp_server):
         port, sid = mcp_server
-        result = _call_tool(port, sid, "search_footprints", {
-            "query": "resistor",
-            "project_path": None,
-            "max_results": 5,
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "search_footprints",
+            {
+                "query": "resistor",
+                "project_path": None,
+                "max_results": 5,
+            },
+        )
         assert "results" in result
 
     def test_results_is_list(self, mcp_server):
         port, sid = mcp_server
-        result = _call_tool(port, sid, "search_footprints", {
-            "query": "capacitor",
-            "project_path": None,
-            "max_results": 5,
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "search_footprints",
+            {
+                "query": "capacitor",
+                "project_path": None,
+                "max_results": 5,
+            },
+        )
         assert isinstance(result["results"], list)
 
     def test_empty_query_returns_error(self, mcp_server):
         port, sid = mcp_server
-        result = _call_tool(port, sid, "search_footprints", {
-            "query": "",
-            "project_path": None,
-            "max_results": 5,
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "search_footprints",
+            {
+                "query": "",
+                "project_path": None,
+                "max_results": 5,
+            },
+        )
         assert "error" in result
 
     def test_result_entries_have_expected_keys(self, mcp_server):
         port, sid = mcp_server
-        result = _call_tool(port, sid, "search_footprints", {
-            "query": "R_0402",
-            "project_path": None,
-            "max_results": 3,
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "search_footprints",
+            {
+                "query": "R_0402",
+                "project_path": None,
+                "max_results": 3,
+            },
+        )
         for entry in result.get("results", []):
             assert "name" in entry
             assert "library" in entry
@@ -640,19 +777,29 @@ class TestSearchFootprints:
 class TestGetFootprintDetails:
     def test_nonexistent_library_returns_error(self, mcp_server):
         port, sid = mcp_server
-        result = _call_tool(port, sid, "get_footprint_details", {
-            "library_name": "__nonexistent_lib__",
-            "footprint_name": "R_0402",
-            "project_path": None,
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "get_footprint_details",
+            {
+                "library_name": "__nonexistent_lib__",
+                "footprint_name": "R_0402",
+                "project_path": None,
+            },
+        )
         assert "error" in result
 
     def test_nonexistent_footprint_in_known_library(self, mcp_server):
         """If the library exists but the footprint doesn't, expect an error."""
         port, sid = mcp_server
-        result = _call_tool(port, sid, "get_footprint_details", {
-            "library_name": "Resistor_SMD",
-            "footprint_name": "__nonexistent_footprint__",
-            "project_path": None,
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "get_footprint_details",
+            {
+                "library_name": "Resistor_SMD",
+                "footprint_name": "__nonexistent_footprint__",
+                "project_path": None,
+            },
+        )
         assert "error" in result

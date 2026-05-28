@@ -1,16 +1,17 @@
 """
 Prompt templates for KiCad interactions.
 """
+
 from fastmcp import FastMCP
 
 
 def register_prompts(mcp: FastMCP) -> None:
     """Register prompt templates with the MCP server.
-    
+
     Args:
         mcp: The FastMCP server instance
     """
-    
+
     @mcp.prompt()
     def create_new_component() -> str:
         """Prompt for creating a new KiCad component."""
@@ -24,7 +25,7 @@ def register_prompts(mcp: FastMCP) -> None:
 
         Please provide step-by-step instructions on how to create a new component in KiCad.
         """
-        
+
         return prompt
 
     @mcp.prompt()
@@ -40,20 +41,9 @@ def register_prompts(mcp: FastMCP) -> None:
 
         Please provide a systematic approach to identifying and fixing these issues in KiCad.
         """
-        
+
         return prompt
 
     @mcp.prompt()
     def pcb_manufacturing_checklist() -> str:
         """Prompt for PCB manufacturing preparation checklist."""
-        prompt = """
-        I'm preparing to send my KiCad PCB design for manufacturing. Please help me with a comprehensive checklist of things to verify before submitting my design, including:
-
-        1. Design rule compliance
-        2. Layer stack configuration
-        3. Manufacturing notes and specifications
-        4. Required output files (Gerber, drill, etc.)
-        5. Component placement considerations
-
-        Please provide a detailed checklist I can follow to ensure my design is ready for manufacturing.
-        """

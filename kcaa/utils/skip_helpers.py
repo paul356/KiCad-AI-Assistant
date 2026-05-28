@@ -23,11 +23,11 @@ from typing import Any, NamedTuple
 class PinWorldCoords(NamedTuple):
     """Absolute schematic position and exit direction of one pin."""
 
-    number: str    # pin number label, e.g. "1", "2", "A3"
-    x: float       # absolute schematic X (mm)
-    y: float       # absolute schematic Y (mm)
-    angle: float   # wire-exit direction in degrees:
-                   #   0=right, 90=down (screen), 180=left, 270=up (screen)
+    number: str  # pin number label, e.g. "1", "2", "A3"
+    x: float  # absolute schematic X (mm)
+    y: float  # absolute schematic Y (mm)
+    angle: float  # wire-exit direction in degrees:
+    #   0=right, 90=down (screen), 180=left, 270=up (screen)
 
 
 def sym_pin_world_coords(sym: Any) -> list[PinWorldCoords]:
@@ -81,12 +81,14 @@ def sym_pin_world_coords(sym: Any) -> list[PinWorldCoords]:
             try:
                 num = str(pin.number)
                 loc = pin.location
-                results.append(PinWorldCoords(
-                    number=num,
-                    x=round(float(loc.x), 4),
-                    y=round(float(loc.y), 4),
-                    angle=(540.0 - float(loc.rotation)) % 360.0,
-                ))
+                results.append(
+                    PinWorldCoords(
+                        number=num,
+                        x=round(float(loc.x), 4),
+                        y=round(float(loc.y), 4),
+                        angle=(540.0 - float(loc.rotation)) % 360.0,
+                    )
+                )
             except AttributeError:
                 continue
     except (AttributeError, TypeError):
@@ -144,12 +146,14 @@ def sym_pin_world_coords(sym: Any) -> list[PinWorldCoords]:
                     # normal path: rel_at.rotation is still in library coords
                     # (CCW, +Y up, tip-to-body) and must be converted to
                     # schematic wire-exit direction (CW, +Y down, body-to-tip).
-                    results.append(PinWorldCoords(
-                        number=num,
-                        x=wx,
-                        y=wy,
-                        angle=(540.0 - float(rel_at.rotation)) % 360.0,
-                    ))
+                    results.append(
+                        PinWorldCoords(
+                            number=num,
+                            x=wx,
+                            y=wy,
+                            angle=(540.0 - float(rel_at.rotation)) % 360.0,
+                        )
+                    )
                 except Exception:
                     continue
         except Exception:

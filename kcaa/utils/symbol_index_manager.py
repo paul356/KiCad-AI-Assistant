@@ -14,32 +14,33 @@ Database location:
     <this file's directory>/symbol_db/kicad_symbols.db
 """
 
-import os
-import hashlib
-import time
-import logging
 from dataclasses import dataclass
+import hashlib
+import logging
+import os
 from pathlib import Path
+import time
 
-import skip.sexp.sourcefile
 import skip.collection
+import skip.sexp.sourcefile
 
-from kcaa.utils.symbol_index_reader import SymbolIndexReader
 from kcaa.utils.symbol_database import (
+    DbStats,
+    LibraryRecord,
     SymbolDatabase,
     SymbolRecord,
-    LibraryRecord,
-    DbStats,
 )
+from kcaa.utils.symbol_index_reader import SymbolIndexReader
 
 log = logging.getLogger(__name__)
 
-_DEFAULT_DB_PATH = Path(__file__).parent / 'symbol_db' / 'kicad_symbols.db'
+_DEFAULT_DB_PATH = Path(__file__).parent / "symbol_db" / "kicad_symbols.db"
 
 
 # ---------------------------------------------------------------------------
 # SyncStats
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class SyncStats:
@@ -57,7 +58,7 @@ class SyncStats:
 # ---------------------------------------------------------------------------
 
 try:
-    import objgraph as _objgraph          # type: ignore
+    import objgraph as _objgraph  # type: ignore
 except ImportError:
     _objgraph = None
 
@@ -70,9 +71,9 @@ except ImportError:
 def _rss_mb() -> float:
     """Return current process RSS in MB (Linux only)."""
     try:
-        with open('/proc/self/status') as f:
+        with open("/proc/self/status") as f:
             for line in f:
-                if line.startswith('VmRSS:'):
+                if line.startswith("VmRSS:"):
                     return int(line.split()[1]) / 1024.0
     except OSError:
         pass
@@ -82,12 +83,13 @@ def _rss_mb() -> float:
 def _parsed_value_count() -> int | None:
     if _objgraph is None:
         return None
-    return _objgraph.count('ParsedValue')
+    return _objgraph.count("ParsedValue")
 
 
 # ---------------------------------------------------------------------------
 # SymbolIndexManager
 # ---------------------------------------------------------------------------
+
 
 class SymbolIndexManager:
     """
@@ -142,12 +144,17 @@ class SymbolIndexManager:
         """
         t0 = time.time()
         stats = SyncStats(
-            added=0, updated=0, removed=0, skipped=0,
-            failed=0, total_symbols=0, elapsed_seconds=0.0,
+            added=0,
+            updated=0,
+            removed=0,
+            skipped=0,
+            failed=0,
+            total_symbols=0,
+            elapsed_seconds=0.0,
         )
 
         entries = self._library_manager.get_libraries()
-        db_known = self._db.get_library_states()   # {path: (id, mtime, size, checksum)}
+        db_known = self._db.get_library_states()  # {path: (id, mtime, size, checksum)}
 
         current_paths: set[str] = set()
 
@@ -162,8 +169,8 @@ class SymbolIndexManager:
             if os.path.isdir(raw_path):
                 try:
                     for fname in sorted(os.listdir(raw_path)):
-                        if fname.endswith('.kicad_sym'):
-                            stem = fname[:-len('.kicad_sym')]
+                        if fname.endswith(".kicad_sym"):
+                            stem = fname[: -len(".kicad_sym")]
                             lib_name = f"{entry.name}/{stem}"
                             all_file_entries.append((lib_name, os.path.join(raw_path, fname)))
                 except OSError as exc:
@@ -181,7 +188,7 @@ class SymbolIndexManager:
                 except Exception as exc:
                     log.warning("progress_callback raised: %s", exc)
             if not os.path.exists(path):
-                log.warning(f"[{i+1}/{total}] Skipping missing: {lib_name}")
+                log.warning(f"[{i + 1}/{total}] Skipping missing: {lib_name}")
                 stats.failed += 1
                 continue
 
@@ -192,7 +199,7 @@ class SymbolIndexManager:
                 cur_mtime: float = stat.st_mtime
                 cur_size: int = stat.st_size
             except OSError as exc:
-                log.warning(f"[{i+1}/{total}] Cannot stat {path}: {exc}")
+                log.warning(f"[{i + 1}/{total}] Cannot stat {path}: {exc}")
                 stats.failed += 1
                 continue
 
@@ -201,25 +208,27 @@ class SymbolIndexManager:
 
                 if not force and db_mtime == cur_mtime and db_size == cur_size:
                     # Fast path: metadata identical → assume unchanged.
-                    log.debug(f"[{i+1}/{total}] Unchanged: {lib_name}")
+                    log.debug(f"[{i + 1}/{total}] Unchanged: {lib_name}")
                     stats.skipped += 1
                     continue
 
                 # Metadata changed — compare content via checksum before reparsing.
                 new_checksum = self._compute_checksum(path)
-                if not force and new_checksum == db_checksum and db_checksum != '':
+                if not force and new_checksum == db_checksum and db_checksum != "":
                     # File was touched/copied but content is identical → just
                     # update the stored mtime/size so the fast path fires next time.
-                    log.debug(
-                        f"[{i+1}/{total}] Metadata changed, content unchanged: {lib_name}"
-                    )
+                    log.debug(f"[{i + 1}/{total}] Metadata changed, content unchanged: {lib_name}")
                     self._db.touch_library(lib_id, cur_mtime, cur_size, new_checksum)
                     stats.skipped += 1
                     continue
 
-                log.info(f"[{i+1}/{total}] Updating: {lib_name}")
+                log.info(f"[{i + 1}/{total}] Updating: {lib_name}")
                 n = self._index_library(
-                    lib_name, path, cur_mtime, cur_size, new_checksum,
+                    lib_name,
+                    path,
+                    cur_mtime,
+                    cur_size,
+                    new_checksum,
                     diagnose=diagnose,
                 )
                 if n >= 0:
@@ -228,10 +237,14 @@ class SymbolIndexManager:
                 else:
                     stats.failed += 1
             else:
-                log.info(f"[{i+1}/{total}] Adding: {lib_name}")
+                log.info(f"[{i + 1}/{total}] Adding: {lib_name}")
                 new_checksum = self._compute_checksum(path)
                 n = self._index_library(
-                    lib_name, path, cur_mtime, cur_size, new_checksum,
+                    lib_name,
+                    path,
+                    cur_mtime,
+                    cur_size,
+                    new_checksum,
                     diagnose=diagnose,
                 )
                 if n >= 0:
@@ -242,7 +255,7 @@ class SymbolIndexManager:
 
         if progress_callback is not None:
             try:
-                progress_callback(total, total, '')
+                progress_callback(total, total, "")
             except Exception as exc:
                 log.warning("progress_callback raised on completion: %s", exc)
 
@@ -299,13 +312,15 @@ class SymbolIndexManager:
         Read in chunks to avoid loading large library files fully into memory.
         """
         h = hashlib.sha256()
-        with open(file_path, 'rb') as f:
-            for chunk in iter(lambda: f.read(65536), b''):
+        with open(file_path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
                 h.update(chunk)
         return h.hexdigest()
 
     def _parse_library(
-        self, file_path: str, diagnose: bool = False,
+        self,
+        file_path: str,
+        diagnose: bool = False,
     ) -> tuple[list[SymbolRecord], str]:
         """
         Parse a .kicad_sym file and extract symbol metadata.
@@ -318,27 +333,28 @@ class SymbolIndexManager:
 
         Returns (list[SymbolRecord], kicad_version_string).
         """
+
         def snapshot(label: str) -> None:
             if not diagnose:
                 return
             rss = _rss_mb()
             pv = _parsed_value_count()
-            pv_str = f', ParsedValue live: {pv}' if pv is not None else ''
-            print(f'  [{label}] RSS: {rss:.1f} MB{pv_str}')
+            pv_str = f", ParsedValue live: {pv}" if pv is not None else ""
+            print(f"  [{label}] RSS: {rss:.1f} MB{pv_str}")
 
-        snapshot('before SourceFile()')
+        snapshot("before SourceFile()")
         library_file = skip.sexp.sourcefile.SourceFile(file_path)
-        snapshot('after SourceFile()')
+        snapshot("after SourceFile()")
 
         if diagnose and _asizeof is not None:
             deep_mb = _asizeof.asizeof(library_file) / 1024 / 1024
-            print(f'  [deep size] pympler asizeof: {deep_mb:.1f} MB')
+            print(f"  [deep size] pympler asizeof: {deep_mb:.1f} MB")
 
         kicad_version = self._extract_version(library_file)
         symbol_elements = self._get_symbol_elements(library_file)
 
         if diagnose:
-            print(f'  [info] symbol count: {len(symbol_elements)}')
+            print(f"  [info] symbol count: {len(symbol_elements)}")
 
         symbols: list[SymbolRecord] = []
         for idx, sym_el in enumerate(symbol_elements):
@@ -348,47 +364,49 @@ class SymbolIndexManager:
                     continue
 
                 description, keywords = self._extract_properties(sym_el)
-                pin_count = len(sym_el.getElementsByEntityType('pin'))
+                pin_count = len(sym_el.getElementsByEntityType("pin"))
 
-                symbols.append(SymbolRecord(
-                    library_name='',    # filled in by SymbolDatabase.save_library
-                    symbol_name=symbol_name,
-                    library_id=0,       # filled in by SymbolDatabase.save_library
-                    description=description,
-                    keywords=keywords,
-                    pin_count=pin_count,
-                    file_index=idx,
-                ))
+                symbols.append(
+                    SymbolRecord(
+                        library_name="",  # filled in by SymbolDatabase.save_library
+                        symbol_name=symbol_name,
+                        library_id=0,  # filled in by SymbolDatabase.save_library
+                        description=description,
+                        keywords=keywords,
+                        pin_count=pin_count,
+                        file_index=idx,
+                    )
+                )
             except Exception as exc:
                 log.warning(f"Skipped symbol {idx} in {file_path}: {exc}")
 
-        snapshot('after extracting symbols (elements still alive)')
+        snapshot("after extracting symbols (elements still alive)")
 
         # Discard the S-expression tree so it can be garbage-collected.
         del symbol_elements
-        snapshot('after del symbol_elements')
+        snapshot("after del symbol_elements")
         del library_file
-        snapshot('after del library_file (before any GC)')
+        snapshot("after del library_file (before any GC)")
 
         if diagnose:
-            print('  [note] ParsedValue count may not drop until cyclic GC runs.')
+            print("  [note] ParsedValue count may not drop until cyclic GC runs.")
 
         return symbols, kicad_version
 
     @staticmethod
     def _extract_version(library_file: object) -> str:
         """Extract the kicad_version string from the library file root."""
-        if hasattr(library_file, 'version'):
+        if hasattr(library_file, "version"):
             try:
                 return str(library_file.version.value)
             except Exception as exc:
                 log.warning("Could not read kicad_version: %s", exc)
-        return ''
+        return ""
 
     @staticmethod
     def _get_symbol_elements(library_file: object) -> list:
         """Return the list of top-level symbol ParsedValues."""
-        if not hasattr(library_file, 'symbol'):
+        if not hasattr(library_file, "symbol"):
             return []
         elements = library_file.symbol
         # Could be a single ParsedValue, a plain list, or an ElementCollection.
@@ -408,17 +426,17 @@ class SymbolIndexManager:
             prop.children[0] = "Description"   (str, property name)
             prop.children[1] = "Resistor"       (str, property value)
         """
-        description = ''
-        keywords = ''
-        for prop in sym_el.getElementsByEntityType('property'):
+        description = ""
+        keywords = ""
+        for prop in sym_el.getElementsByEntityType("property"):
             children = prop.children
             if len(children) < 2:
                 continue
-            prop_name = children[0] if isinstance(children[0], str) else ''
-            prop_val  = children[1] if isinstance(children[1], str) else ''
-            if prop_name in ('Description', 'ki_description'):
+            prop_name = children[0] if isinstance(children[0], str) else ""
+            prop_val = children[1] if isinstance(children[1], str) else ""
+            if prop_name in ("Description", "ki_description"):
                 description = prop_val
-            elif prop_name == 'ki_keywords':
+            elif prop_name == "ki_keywords":
                 keywords = prop_val
         return description, keywords
 
@@ -460,10 +478,7 @@ class SymbolIndexManager:
 
     def list_all_symbols(self) -> list[str]:
         """Return all symbol keys as 'library_name:symbol_name' strings."""
-        return [
-            f'{s.library_name}:{s.symbol_name}'
-            for s in self._db.get_all_symbols()
-        ]
+        return [f"{s.library_name}:{s.symbol_name}" for s in self._db.get_all_symbols()]
 
     def get_all_libraries(self) -> list[LibraryRecord]:
         """Return all indexed library records."""

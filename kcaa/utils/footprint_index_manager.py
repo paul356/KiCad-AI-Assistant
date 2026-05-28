@@ -26,19 +26,18 @@ Example
     results = mgr.search_footprints('0402')
 """
 
+from dataclasses import dataclass
 import hashlib
 import logging
 import os
-import time
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+import time
 
 from kcaa.utils.footprint_database import (
+    DbStats,
     FootprintDatabase,
     FootprintRecord,
     FpLibraryRecord,
-    DbStats,
 )
 from kcaa.utils.pcb_library_utils import (
     build_effective_library_list,
@@ -48,7 +47,7 @@ from kcaa.utils.pcb_library_utils import (
 
 log = logging.getLogger(__name__)
 
-_DEFAULT_DB_PATH = Path(__file__).parent / 'footprint_db' / 'kicad_footprints.db'
+_DEFAULT_DB_PATH = Path(__file__).parent / "footprint_db" / "kicad_footprints.db"
 
 
 @dataclass
@@ -77,8 +76,8 @@ class FootprintIndexManager:
 
     def __init__(
         self,
-        db_path: 'str | Path | None' = None,
-        project_path: Optional[str] = None,
+        db_path: "str | Path | None" = None,
+        project_path: str | None = None,
     ):
         resolved = Path(db_path) if db_path else _DEFAULT_DB_PATH
         self._db = FootprintDatabase(str(resolved))
@@ -110,19 +109,24 @@ class FootprintIndexManager:
         """
         t0 = time.time()
         stats = SyncStats(
-            added=0, updated=0, removed=0, skipped=0,
-            failed=0, total_footprints=0, elapsed_seconds=0.0,
+            added=0,
+            updated=0,
+            removed=0,
+            skipped=0,
+            failed=0,
+            total_footprints=0,
+            elapsed_seconds=0.0,
         )
 
         entries = build_effective_library_list(self._project_path)
-        db_known = self._db.get_library_states()   # {library_name: (id, checksum, dir_path)}
+        db_known = self._db.get_library_states()  # {library_name: (id, checksum, dir_path)}
         current_names: set[str] = set()
         total = len(entries)
 
         for i, entry in enumerate(entries):
             lib_name = entry["nickname"]
             raw_uri = entry.get("raw_uri", entry["uri"])
-            dir_path = entry["uri"]   # resolved path to .pretty directory
+            dir_path = entry["uri"]  # resolved path to .pretty directory
             description = entry.get("description", "")
 
             if progress_callback is not None:
@@ -132,7 +136,7 @@ class FootprintIndexManager:
                     log.warning("progress_callback raised: %s", exc)
 
             if not os.path.isdir(dir_path):
-                log.debug(f"[{i+1}/{total}] Missing or not a dir: {lib_name} → {dir_path}")
+                log.debug(f"[{i + 1}/{total}] Missing or not a dir: {lib_name} → {dir_path}")
                 stats.failed += 1
                 continue
 
@@ -141,27 +145,27 @@ class FootprintIndexManager:
             try:
                 new_checksum = self._compute_dir_checksum(dir_path)
             except OSError as exc:
-                log.warning(f"[{i+1}/{total}] Cannot fingerprint {dir_path}: {exc}")
+                log.warning(f"[{i + 1}/{total}] Cannot fingerprint {dir_path}: {exc}")
                 stats.failed += 1
                 continue
 
             if lib_name in db_known:
                 lib_id, db_checksum, db_dir_path = db_known[lib_name]
 
-                if not force and new_checksum == db_checksum and db_checksum != '':
+                if not force and new_checksum == db_checksum and db_checksum != "":
                     # Content unchanged — just refresh dir_path if it moved
                     # (e.g. AppImage re-mounted at a new temp path).
                     if db_dir_path != dir_path:
                         log.debug(
-                            f"[{i+1}/{total}] Path relocated, content unchanged: {lib_name}"
+                            f"[{i + 1}/{total}] Path relocated, content unchanged: {lib_name}"
                         )
                         self._db.touch_library(lib_id, new_checksum, dir_path)
                     else:
-                        log.debug(f"[{i+1}/{total}] Unchanged: {lib_name}")
+                        log.debug(f"[{i + 1}/{total}] Unchanged: {lib_name}")
                     stats.skipped += 1
                     continue
 
-                log.info(f"[{i+1}/{total}] Updating: {lib_name}")
+                log.info(f"[{i + 1}/{total}] Updating: {lib_name}")
                 n = self._index_library(lib_name, raw_uri, dir_path, description, new_checksum)
                 if n >= 0:
                     stats.updated += 1
@@ -169,7 +173,7 @@ class FootprintIndexManager:
                 else:
                     stats.failed += 1
             else:
-                log.info(f"[{i+1}/{total}] Adding: {lib_name}")
+                log.info(f"[{i + 1}/{total}] Adding: {lib_name}")
                 n = self._index_library(lib_name, raw_uri, dir_path, description, new_checksum)
                 if n >= 0:
                     stats.added += 1
@@ -179,7 +183,7 @@ class FootprintIndexManager:
 
         if progress_callback is not None:
             try:
-                progress_callback(total, total, '')
+                progress_callback(total, total, "")
             except Exception as exc:
                 log.warning("progress_callback raised on completion: %s", exc)
 
@@ -204,9 +208,7 @@ class FootprintIndexManager:
     # Search / lookup passthrough
     # ------------------------------------------------------------------
 
-    def search_footprints(
-        self, query: str, limit: int = 50
-    ) -> list[FootprintRecord]:
+    def search_footprints(self, query: str, limit: int = 50) -> list[FootprintRecord]:
         """Full-text search across footprint names, descriptions, and tags."""
         return self._db.search(query, limit=limit)
 
@@ -216,15 +218,11 @@ class FootprintIndexManager:
         """Search footprints by name substring or exact match."""
         return self._db.search_by_name(name, exact=exact, limit=limit)
 
-    def get_footprint(
-        self, library_name: str, footprint_name: str
-    ) -> FootprintRecord | None:
+    def get_footprint(self, library_name: str, footprint_name: str) -> FootprintRecord | None:
         """Look up a single footprint by library nickname and name."""
         return self._db.get_footprint(library_name, footprint_name)
 
-    def get_library_footprints(
-        self, library_name: str
-    ) -> list[FootprintRecord]:
+    def get_library_footprints(self, library_name: str) -> list[FootprintRecord]:
         """Return all indexed footprints for a library, ordered by name."""
         return self._db.get_library_footprints(library_name)
 
@@ -251,7 +249,7 @@ class FootprintIndexManager:
         """
         lines: list[str] = []
         for fname in os.listdir(dir_path):
-            if not fname.endswith('.kicad_mod'):
+            if not fname.endswith(".kicad_mod"):
                 continue
             fpath = os.path.join(dir_path, fname)
             try:
@@ -303,25 +301,25 @@ class FootprintIndexManager:
         return n
 
     @staticmethod
-    def _parse_library(
-        library_name: str, dir_path: str
-    ) -> list[FootprintRecord]:
+    def _parse_library(library_name: str, dir_path: str) -> list[FootprintRecord]:
         """Read every .kicad_mod in dir_path and return FootprintRecord list."""
         records: list[FootprintRecord] = []
         for fp_name in scan_footprint_library(dir_path):
-            mod_path = os.path.join(dir_path, fp_name + '.kicad_mod')
+            mod_path = os.path.join(dir_path, fp_name + ".kicad_mod")
             try:
                 info = parse_kicad_mod(mod_path)
-                records.append(FootprintRecord(
-                    library_name=library_name,
-                    footprint_name=fp_name,
-                    library_id=0,   # filled in by FootprintDatabase.save_library
-                    description=info.get('description', ''),
-                    tags=info.get('tags', ''),
-                    attr=info.get('attr', ''),
-                    pad_count=len(info.get('pads', [])),
-                    has_3d_model=bool(info.get('has_3d_model', False)),
-                ))
+                records.append(
+                    FootprintRecord(
+                        library_name=library_name,
+                        footprint_name=fp_name,
+                        library_id=0,  # filled in by FootprintDatabase.save_library
+                        description=info.get("description", ""),
+                        tags=info.get("tags", ""),
+                        attr=info.get("attr", ""),
+                        pad_count=len(info.get("pads", [])),
+                        has_3d_model=bool(info.get("has_3d_model", False)),
+                    )
+                )
             except Exception as exc:
                 log.warning(f"Skipped {mod_path}: {exc}")
         return records
@@ -335,7 +333,7 @@ _singleton: FootprintIndexManager | None = None
 
 
 def get_footprint_index_manager(
-    project_path: Optional[str] = None,
+    project_path: str | None = None,
 ) -> FootprintIndexManager:
     """Return the module-level FootprintIndexManager singleton.
 

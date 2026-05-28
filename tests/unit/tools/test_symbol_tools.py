@@ -8,17 +8,14 @@ are fully self-contained and do not require a real KiCad installation.
 import asyncio
 import os
 import threading
-from dataclasses import dataclass
-from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-import pytest
 import sexpdata
-
 
 # ---------------------------------------------------------------------------
 # MockMCP — captures @mcp.tool()-decorated coroutines
 # ---------------------------------------------------------------------------
+
 
 class _MockMCP:
     """Minimal FastMCP stand-in that captures @mcp.tool()-decorated functions."""
@@ -30,12 +27,14 @@ class _MockMCP:
         def decorator(fn):
             self.tools[fn.__name__] = fn
             return fn
+
         return decorator
 
 
 def _get_tools() -> dict:
     """Register symbol tools against a mock MCP and return the captured dict."""
     from kcaa.tools.symbol_tools import register_symbol_tools
+
     mock = _MockMCP()
     register_symbol_tools(mock)
     return mock.tools
@@ -74,7 +73,7 @@ class TestSyncSymbolIndex:
             mod._sync_state.running = False
             mod._sync_state.current = 0
             mod._sync_state.total = 0
-            mod._sync_state.current_library = ''
+            mod._sync_state.current_library = ""
             mod._sync_state.error = None
 
         with patch.object(threading, "Thread") as mock_thread_cls:
@@ -124,7 +123,7 @@ class TestGetSymbolSyncStatus:
             mod._sync_state.running = False
             mod._sync_state.current = 0
             mod._sync_state.total = 0
-            mod._sync_state.current_library = ''
+            mod._sync_state.current_library = ""
             mod._sync_state.last_result = None
             mod._sync_state.error = None
 
@@ -419,8 +418,10 @@ class TestGetSymbolPins:
         raw = _load_fixture_symbol(_FIXTURE_SYM, "R_Small")
         mock_mgr = self._make_mock_mgr()
 
-        with patch("kcaa.tools.symbol_tools._get_index_manager", return_value=mock_mgr), \
-             patch("kcaa.tools.symbol_tools.extract_lib_symbol_raw", return_value=raw):
+        with (
+            patch("kcaa.tools.symbol_tools._get_index_manager", return_value=mock_mgr),
+            patch("kcaa.tools.symbol_tools.extract_lib_symbol_raw", return_value=raw),
+        ):
             result = _call("get_symbol_pins", library_name="Device", symbol_name="R_Small")
 
         assert result["success"] is True
@@ -433,8 +434,10 @@ class TestGetSymbolPins:
         raw = _load_fixture_symbol(_FIXTURE_SYM, "R_Small")
         mock_mgr = self._make_mock_mgr()
 
-        with patch("kcaa.tools.symbol_tools._get_index_manager", return_value=mock_mgr), \
-             patch("kcaa.tools.symbol_tools.extract_lib_symbol_raw", return_value=raw):
+        with (
+            patch("kcaa.tools.symbol_tools._get_index_manager", return_value=mock_mgr),
+            patch("kcaa.tools.symbol_tools.extract_lib_symbol_raw", return_value=raw),
+        ):
             result = _call("get_symbol_pins", library_name="Device", symbol_name="R_Small")
 
         for pin in result["pins"]:
@@ -446,8 +449,10 @@ class TestGetSymbolPins:
         raw = _load_fixture_symbol(_FIXTURE_SYM, "R_Small")
         mock_mgr = self._make_mock_mgr()
 
-        with patch("kcaa.tools.symbol_tools._get_index_manager", return_value=mock_mgr), \
-             patch("kcaa.tools.symbol_tools.extract_lib_symbol_raw", return_value=raw):
+        with (
+            patch("kcaa.tools.symbol_tools._get_index_manager", return_value=mock_mgr),
+            patch("kcaa.tools.symbol_tools.extract_lib_symbol_raw", return_value=raw),
+        ):
             result = _call("get_symbol_pins", library_name="Device", symbol_name="R_Small")
 
         assert result["pin_count"] == len(result["pins"])
@@ -491,9 +496,13 @@ class TestGetSymbolPins:
         """Inner except around extract_lib_symbol_raw returns error dict on FileNotFoundError."""
         mock_mgr = self._make_mock_mgr()
 
-        with patch("kcaa.tools.symbol_tools._get_index_manager", return_value=mock_mgr), \
-             patch("kcaa.tools.symbol_tools.extract_lib_symbol_raw",
-                   side_effect=FileNotFoundError("lib gone")):
+        with (
+            patch("kcaa.tools.symbol_tools._get_index_manager", return_value=mock_mgr),
+            patch(
+                "kcaa.tools.symbol_tools.extract_lib_symbol_raw",
+                side_effect=FileNotFoundError("lib gone"),
+            ),
+        ):
             result = _call("get_symbol_pins", library_name="Device", symbol_name="R_Small")
 
         assert result.get("success") is False
@@ -503,9 +512,12 @@ class TestGetSymbolPins:
         """Inner except around extract_lib_symbol_raw returns error dict on ValueError."""
         mock_mgr = self._make_mock_mgr()
 
-        with patch("kcaa.tools.symbol_tools._get_index_manager", return_value=mock_mgr), \
-             patch("kcaa.tools.symbol_tools.extract_lib_symbol_raw",
-                   side_effect=ValueError("bad data")):
+        with (
+            patch("kcaa.tools.symbol_tools._get_index_manager", return_value=mock_mgr),
+            patch(
+                "kcaa.tools.symbol_tools.extract_lib_symbol_raw", side_effect=ValueError("bad data")
+            ),
+        ):
             result = _call("get_symbol_pins", library_name="Device", symbol_name="R_Small")
 
         assert result.get("success") is False
@@ -516,8 +528,10 @@ class TestGetSymbolPins:
         raw = _load_fixture_symbol(_FIXTURE_SYM, "R_Small")
         mock_mgr = self._make_mock_mgr()
 
-        with patch("kcaa.tools.symbol_tools._get_index_manager", return_value=mock_mgr), \
-             patch("kcaa.tools.symbol_tools.extract_lib_symbol_raw", return_value=raw):
+        with (
+            patch("kcaa.tools.symbol_tools._get_index_manager", return_value=mock_mgr),
+            patch("kcaa.tools.symbol_tools.extract_lib_symbol_raw", return_value=raw),
+        ):
             result = _call("get_symbol_pins", library_name="Device", symbol_name="R_Small")
 
         by_num = {p["number"]: p for p in result["pins"]}
@@ -535,6 +549,7 @@ class TestParseLibPins:
 
     def setup_method(self):
         from kcaa.tools.symbol_tools import _parse_lib_pins
+
         self._parse = _parse_lib_pins
 
     def test_r_small_pin_count(self):
@@ -592,28 +607,53 @@ class TestParseLibPins:
         """_parse_lib_pins deduplicates pin numbers that appear in multiple sub-units."""
         S = sexpdata.Symbol
         fake_raw = [
-            S("symbol"), "FakeOp",
+            S("symbol"),
+            "FakeOp",
             # unit 1 sub-symbol
-            [S("symbol"), "FakeOp_1_1",
-                [S("pin"), S("input"), S("line"),
-                    [S("at"), 0, 0, 0], [S("length"), 2.54],
+            [
+                S("symbol"),
+                "FakeOp_1_1",
+                [
+                    S("pin"),
+                    S("input"),
+                    S("line"),
+                    [S("at"), 0, 0, 0],
+                    [S("length"), 2.54],
                     [S("name"), "IN+", [S("effects"), [S("font"), [S("size"), 1.27, 1.27]]]],
-                    [S("number"), "1", [S("effects"), [S("font"), [S("size"), 1.27, 1.27]]]]],
-                [S("pin"), S("power_in"), S("line"),
-                    [S("at"), 0, 5.08, 270], [S("length"), 2.54],
+                    [S("number"), "1", [S("effects"), [S("font"), [S("size"), 1.27, 1.27]]]],
+                ],
+                [
+                    S("pin"),
+                    S("power_in"),
+                    S("line"),
+                    [S("at"), 0, 5.08, 270],
+                    [S("length"), 2.54],
                     [S("name"), "VCC", [S("effects"), [S("font"), [S("size"), 1.27, 1.27]]]],
-                    [S("number"), "3", [S("effects"), [S("font"), [S("size"), 1.27, 1.27]]]]],
+                    [S("number"), "3", [S("effects"), [S("font"), [S("size"), 1.27, 1.27]]]],
+                ],
             ],
             # unit 2 sub-symbol — pin 3 (VCC) appears again here
-            [S("symbol"), "FakeOp_2_1",
-                [S("pin"), S("output"), S("line"),
-                    [S("at"), 0, 0, 180], [S("length"), 2.54],
+            [
+                S("symbol"),
+                "FakeOp_2_1",
+                [
+                    S("pin"),
+                    S("output"),
+                    S("line"),
+                    [S("at"), 0, 0, 180],
+                    [S("length"), 2.54],
                     [S("name"), "OUT", [S("effects"), [S("font"), [S("size"), 1.27, 1.27]]]],
-                    [S("number"), "2", [S("effects"), [S("font"), [S("size"), 1.27, 1.27]]]]],
-                [S("pin"), S("power_in"), S("line"),
-                    [S("at"), 0, 5.08, 270], [S("length"), 2.54],
+                    [S("number"), "2", [S("effects"), [S("font"), [S("size"), 1.27, 1.27]]]],
+                ],
+                [
+                    S("pin"),
+                    S("power_in"),
+                    S("line"),
+                    [S("at"), 0, 5.08, 270],
+                    [S("length"), 2.54],
                     [S("name"), "VCC", [S("effects"), [S("font"), [S("size"), 1.27, 1.27]]]],
-                    [S("number"), "3", [S("effects"), [S("font"), [S("size"), 1.27, 1.27]]]]],
+                    [S("number"), "3", [S("effects"), [S("font"), [S("size"), 1.27, 1.27]]]],
+                ],
             ],
         ]
 

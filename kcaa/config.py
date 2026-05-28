@@ -206,6 +206,7 @@ DISPLAY_CONSTANTS = {
 # KiCad version string — fallback used when KICAD_VERSION env var is not set
 KICAD_VERSION = "9.0"
 
+
 class LibraryPathConfig:
     """
     KiCad symbol library path configuration.
@@ -252,7 +253,9 @@ class LibraryPathConfig:
     def _default_3rd_party(kicad_version: str) -> str:
         """Return the platform-specific default KiCad 3rd-party packages directory."""
         if system == "Darwin":
-            return os.path.expanduser(f"~/Library/Application Support/kicad/{kicad_version}/3rdparty")
+            return os.path.expanduser(
+                f"~/Library/Application Support/kicad/{kicad_version}/3rdparty"
+            )
         elif system == "Windows":
             appdata = os.environ.get("APPDATA", os.path.expanduser("~"))
             return os.path.join(appdata, "kicad", kicad_version, "3rdparty")
@@ -290,20 +293,16 @@ class LibraryPathConfig:
             )
 
         self._kicad_config_dir = os.path.expanduser(
-            os.environ.get("KICAD_CONFIG_DIR")
-            or self._default_config_dir(kicad_version)
+            os.environ.get("KICAD_CONFIG_DIR") or self._default_config_dir(kicad_version)
         )
         self._kicad_symbol_dir = os.path.expanduser(
-            os.environ.get("KICAD_SYMBOL_DIR")
-            or self._default_symbol_dir(kicad_app_path)
+            os.environ.get("KICAD_SYMBOL_DIR") or self._default_symbol_dir(kicad_app_path)
         )
         self._kicad_footprint_dir = os.path.expanduser(
-            os.environ.get("KICAD_FOOTPRINT_DIR")
-            or self._default_footprint_dir(kicad_app_path)
+            os.environ.get("KICAD_FOOTPRINT_DIR") or self._default_footprint_dir(kicad_app_path)
         )
         self._kicad_3rd_party = os.path.expanduser(
-            os.environ.get("KICAD_3RD_PARTY")
-            or self._default_3rd_party(kicad_version)
+            os.environ.get("KICAD_3RD_PARTY") or self._default_3rd_party(kicad_version)
         )
         self._kicad_template_dir = os.path.expanduser(
             os.environ.get("KICAD_TEMPLATE_DIR")

@@ -4,20 +4,21 @@ Symbol library tools for KiCad MCP server.
 Provides tools to index, search, and look up KiCad symbol libraries
 using a SQLite-backed full-text search index.
 """
+
+import contextlib
+from dataclasses import dataclass
 import logging
 import threading
-from dataclasses import dataclass, field
 from typing import Any
 
+from fastmcp import Context, FastMCP
 import sexpdata
-from fastmcp import FastMCP
-from fastmcp import Context
 
 from kcaa.config import LibraryPathConfig
 from kcaa.utils.symbol_extractor import extract_lib_symbol_raw
 from kcaa.utils.symbol_geometry import compute_unit_bboxes
-from kcaa.utils.symbol_index_reader import SymbolIndexReader
 from kcaa.utils.symbol_index_manager import SymbolIndexManager
+from kcaa.utils.symbol_index_reader import SymbolIndexReader
 
 log = logging.getLogger(__name__)
 
@@ -43,6 +44,7 @@ def _lib_angle_to_direction(angle_deg: int) -> str:
     a = (int(round(float(angle_deg))) + 180) % 360
     return {0: "right", 90: "up", 180: "left", 270: "down"}.get(a, f"{a}deg")
 
+
 # Module-level singleton so the DB connection is reused across tool calls.
 _index_manager: SymbolIndexManager | None = None
 
@@ -60,14 +62,16 @@ def _get_index_manager() -> SymbolIndexManager:
 # Background sync state (thread-safe via lock)
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class _SyncState:
     running: bool = False
     current: int = 0
     total: int = 0
-    current_library: str = ''
+    current_library: str = ""
     last_result: dict | None = None
     error: str | None = None
+
 
 _sync_state = _SyncState()
 _sync_lock = threading.Lock()
@@ -75,6 +79,7 @@ _sync_lock = threading.Lock()
 
 def _run_sync_in_background(force: bool) -> None:
     """Target function executed in the background sync thread."""
+
     def _progress(current: int, total: int, library_name: str) -> None:
         with _sync_lock:
             _sync_state.current = current
@@ -105,8 +110,7 @@ def _run_sync_in_background(force: bool) -> None:
     finally:
         with _sync_lock:
             _sync_state.running = False
-            _sync_state.current_library = ''
-
+            _sync_state.current_library = ""
 
 
 def _load_lib_symbol_raw(library_name: str, symbol_name: str):
@@ -178,19 +182,25 @@ def _parse_lib_pins(lib_sym_raw: list) -> list[dict]:
             tag = entry[0].value()
             if tag == "pin":
                 # (pin <type> <shape> (at x y angle) (length l) (name N ...) (number M ...))
-                pin_type = entry[1].value() if len(entry) > 1 and hasattr(entry[1], "value") else str(entry[1])
+                pin_type = (
+                    entry[1].value()
+                    if len(entry) > 1 and hasattr(entry[1], "value")
+                    else str(entry[1])
+                )
                 angle = 0
                 pin_name = ""
                 pin_number = ""
                 for child in entry[2:]:
-                    if not (isinstance(child, list) and len(child) >= 1 and isinstance(child[0], sexpdata.Symbol)):
+                    if not (
+                        isinstance(child, list)
+                        and len(child) >= 1
+                        and isinstance(child[0], sexpdata.Symbol)
+                    ):
                         continue
                     ctag = child[0].value()
                     if ctag == "at" and len(child) >= 4:
-                        try:
+                        with contextlib.suppress(ValueError, TypeError):
                             angle = int(round(float(child[3])))
-                        except (ValueError, TypeError):
-                            pass
                     elif ctag == "name" and len(child) >= 2:
                         pin_name = str(child[1])
                     elif ctag == "number" and len(child) >= 2:
@@ -198,12 +208,14 @@ def _parse_lib_pins(lib_sym_raw: list) -> list[dict]:
                 if pin_number and pin_number not in seen_numbers:
                     seen_numbers.add(pin_number)
                     angle_norm = angle % 360
-                    pins.append({
-                        "number": pin_number,
-                        "name": pin_name,
-                        "type": pin_type,
-                        "direction": _lib_angle_to_direction(angle_norm),
-                    })
+                    pins.append(
+                        {
+                            "number": pin_number,
+                            "name": pin_name,
+                            "type": pin_type,
+                            "direction": _lib_angle_to_direction(angle_norm),
+                        }
+                    )
             elif tag == "symbol" and isinstance(entry[1], str) and entry[1].startswith(prefix):
                 _walk(entry[2:])
 
@@ -245,7 +257,7 @@ def register_symbol_tools(mcp: FastMCP) -> None:
             _sync_state.running = True
             _sync_state.current = 0
             _sync_state.total = 0
-            _sync_state.current_library = ''
+            _sync_state.current_library = ""
             _sync_state.error = None
 
         if ctx:
@@ -257,7 +269,7 @@ def register_symbol_tools(mcp: FastMCP) -> None:
         return {
             "status": "started",
             "message": "Symbol index sync started in the background. "
-                       "Call get_symbol_sync_status to monitor progress.",
+            "Call get_symbol_sync_status to monitor progress.",
         }
 
     @mcp.tool()
@@ -422,7 +434,7 @@ def register_symbol_tools(mcp: FastMCP) -> None:
                     tbl = lib.library_name.split("/")[0]
                     table_counts[tbl] = table_counts.get(tbl, 0) + lib.symbol_count
                 tables_sorted = sorted(table_counts.items())
-                page = tables_sorted[offset: offset + limit]
+                page = tables_sorted[offset : offset + limit]
                 return {
                     "success": True,
                     "mode": "tables",
@@ -430,20 +442,18 @@ def register_symbol_tools(mcp: FastMCP) -> None:
                     "offset": offset,
                     "limit": limit,
                     "truncated": (offset + limit) < len(tables_sorted),
-                    "tables": [
-                        {"name": t, "symbol_count": c} for t, c in page
-                    ],
+                    "tables": [{"name": t, "symbol_count": c} for t, c in page],
                 }
             else:
                 # Filter to the requested table.
                 prefix = table + "/"
                 # Support both symdir style ("Device/R") and flat style ("Device")
                 matching = [
-                    lib for lib in libraries
-                    if lib.library_name.startswith(prefix)
-                    or lib.library_name == table
+                    lib
+                    for lib in libraries
+                    if lib.library_name.startswith(prefix) or lib.library_name == table
                 ]
-                page = matching[offset: offset + limit]
+                page = matching[offset : offset + limit]
                 return {
                     "success": True,
                     "mode": "libraries",
@@ -499,7 +509,7 @@ def register_symbol_tools(mcp: FastMCP) -> None:
                     "success": False,
                     "error": f"Library '{library_name}' not found or has no indexed symbols.",
                 }
-            page = symbols[offset: offset + limit]
+            page = symbols[offset : offset + limit]
             return {
                 "success": True,
                 "library_name": library_name,

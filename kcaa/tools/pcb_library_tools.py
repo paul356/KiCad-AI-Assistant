@@ -4,21 +4,21 @@ Footprint library discovery and inspection tools for KiCad MCP server.
 Provides tools to list available footprint libraries, search footprints
 by name or description, and retrieve detailed footprint metadata.
 """
+
+from dataclasses import dataclass
 import logging
 import os
 import threading
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from fastmcp import Context, FastMCP
 
+from kcaa.utils.footprint_index_manager import get_footprint_index_manager
 from kcaa.utils.pcb_library_utils import (
     build_effective_library_list,
     find_fp_lib_tables,
     parse_kicad_mod,
 )
-from kcaa.utils.footprint_index_manager import get_footprint_index_manager
-from kcaa.utils.file_utils import get_project_files
 
 log = logging.getLogger(__name__)
 
@@ -27,12 +27,13 @@ log = logging.getLogger(__name__)
 # Background sync state (thread-safe via lock)
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class _FpSyncState:
     running: bool = False
     current: int = 0
     total: int = 0
-    current_library: str = ''
+    current_library: str = ""
     last_result: dict | None = None
     error: str | None = None
 
@@ -41,8 +42,9 @@ _fp_sync_state = _FpSyncState()
 _fp_sync_lock = threading.Lock()
 
 
-def _run_fp_sync_in_background(force: bool, project_path: Optional[str]) -> None:
+def _run_fp_sync_in_background(force: bool, project_path: str | None) -> None:
     """Target function executed in the background footprint sync thread."""
+
     def _progress(current: int, total: int, library_name: str) -> None:
         with _fp_sync_lock:
             _fp_sync_state.current = current
@@ -79,7 +81,7 @@ def _run_fp_sync_in_background(force: bool, project_path: Optional[str]) -> None
     finally:
         with _fp_sync_lock:
             _fp_sync_state.running = False
-            _fp_sync_state.current_library = ''
+            _fp_sync_state.current_library = ""
 
 
 def register_pcb_library_tools(mcp: FastMCP) -> None:
@@ -87,10 +89,10 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
     async def sync_footprint_index(
-        project_path: Optional[str] = None,
+        project_path: str | None = None,
         force: bool = False,
         ctx: Context | None = None,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Start building or refreshing the footprint library index.
 
         This tool returns immediately — the actual sync runs in a background
@@ -121,7 +123,7 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
             _fp_sync_state.running = True
             _fp_sync_state.current = 0
             _fp_sync_state.total = 0
-            _fp_sync_state.current_library = ''
+            _fp_sync_state.current_library = ""
             _fp_sync_state.error = None
 
         if ctx:
@@ -143,7 +145,7 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
         }
 
     @mcp.tool()
-    async def get_footprint_sync_status(ctx: Context | None = None) -> Dict[str, Any]:
+    async def get_footprint_sync_status(ctx: Context | None = None) -> dict[str, Any]:
         """Return the current status of the background footprint index sync.
 
         Call this after ``sync_footprint_index`` to monitor progress.  Poll
@@ -173,9 +175,9 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
     async def list_footprint_libraries(
-        project_path: Optional[str],
+        project_path: str | None,
         ctx: Context | None,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """List all available KiCad footprint libraries.
 
         Returns libraries from the footprint index if it has been built;
@@ -241,10 +243,10 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
     @mcp.tool()
     async def search_footprints(
         query: str,
-        project_path: Optional[str],
+        project_path: str | None,
         ctx: Context | None,
         max_results: int = 50,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Search for footprints by name, description, or tags.
 
         Uses the footprint index (built by ``sync_footprint_index``) for fast
@@ -308,9 +310,9 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
     async def get_footprint_details(
         library_name: str,
         footprint_name: str,
-        project_path: Optional[str],
+        project_path: str | None,
         ctx: Context | None,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Get detailed information about a specific footprint.
 
         Returns pad layout, courtyard bounding box, and metadata for a
@@ -332,7 +334,7 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
         mgr = get_footprint_index_manager(project_path)
         db_stats = mgr.get_stats()
 
-        lib_path: Optional[str] = None
+        lib_path: str | None = None
 
         if db_stats.library_count > 0:
             lib_records = mgr.get_all_libraries()
@@ -364,19 +366,24 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
 
 async def _live_search_footprints(
     query: str,
-    project_path: Optional[str],
+    project_path: str | None,
     max_results: int,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Slow live-scan fallback for search_footprints when index is empty."""
     from kcaa.utils.pcb_library_utils import scan_footprint_library
 
     needle = query.strip().lower()
     libraries = build_effective_library_list(project_path)
     if not libraries:
-        return {"results": [], "total_matches": 0, "truncated": False,
-                "warning": "No fp-lib-table files found.", "source": "live_scan"}
+        return {
+            "results": [],
+            "total_matches": 0,
+            "truncated": False,
+            "warning": "No fp-lib-table files found.",
+            "source": "live_scan",
+        }
 
-    matches: List[Dict[str, str]] = []
+    matches: list[dict[str, str]] = []
     for lib in libraries:
         lib_path = lib["uri"]
         if not os.path.isdir(lib_path):
@@ -392,14 +399,16 @@ async def _live_search_footprints(
                     attr = info.get("attr", "")
                 except Exception:
                     pass
-                matches.append({
-                    "library": lib["nickname"],
-                    "name": fp_name,
-                    "description": desc,
-                    "tags": tags,
-                    "attr": attr,
-                    "pad_count": 0,
-                })
+                matches.append(
+                    {
+                        "library": lib["nickname"],
+                        "name": fp_name,
+                        "description": desc,
+                        "tags": tags,
+                        "attr": attr,
+                        "pad_count": 0,
+                    }
+                )
                 if len(matches) >= max_results:
                     break
         if len(matches) >= max_results:

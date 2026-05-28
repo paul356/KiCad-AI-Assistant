@@ -12,10 +12,11 @@ fixture so the extraction runs on disk.  Only the index manager
 """
 
 import asyncio
+import contextlib
 import os
+from pathlib import Path
 import shutil
 import tempfile
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -37,11 +38,10 @@ _SYM_NAME = "R_Small"
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _make_temp_copy() -> str:
     """Return path to a fresh temporary copy of tools_test.kicad_sch."""
-    tmp = tempfile.NamedTemporaryFile(
-        suffix=".kicad_sch", delete=False, dir=tempfile.gettempdir()
-    )
+    tmp = tempfile.NamedTemporaryFile(suffix=".kicad_sch", delete=False, dir=tempfile.gettempdir())
     tmp.close()
     shutil.copy(SCHEMATIC_PATH, tmp.name)
     return tmp.name
@@ -57,11 +57,13 @@ class _MockMCP:
         def decorator(fn):
             self.tools[fn.__name__] = fn
             return fn
+
         return decorator
 
 
 def _get_tools() -> dict:
     from kcaa.tools.component_edit_tools import register_component_edit_tools
+
     mock = _MockMCP()
     register_component_edit_tools(mock)
     return mock.tools
@@ -77,7 +79,7 @@ def _make_mock_manager() -> MagicMock:
 
     lib_rec = MagicMock()
     lib_rec.file_path = TEST_SYM_PATH
-    lib_rec.mtime = 0.0       # force fallback parse
+    lib_rec.mtime = 0.0  # force fallback parse
     lib_rec.file_size = 0
 
     sym_rec = MagicMock()
@@ -92,6 +94,7 @@ def _make_mock_manager() -> MagicMock:
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
 
 @pytest.fixture(scope="module")
 def tools():
@@ -112,8 +115,8 @@ def tmp_sch():
 # TestAddSymbolToSchematic
 # ---------------------------------------------------------------------------
 
-class TestAddSymbolToSchematic:
 
+class TestAddSymbolToSchematic:
     def test_adds_symbol_and_assigns_reference(self, tools, tmp_sch):
         """Adding a symbol should succeed and assign a reference like 'R*'."""
         mgr = _make_mock_manager()
@@ -156,7 +159,7 @@ class TestAddSymbolToSchematic:
                     schematic_path=tmp_sch,
                     library_name=_LIB_NAME,
                     symbol_name=_SYM_NAME,
-                    x=50.3,   # not on 1.27 mm grid
+                    x=50.3,  # not on 1.27 mm grid
                     y=49.7,
                 )
             )
@@ -259,8 +262,8 @@ class TestAddSymbolToSchematic:
 # TestRemoveSymbolFromSchematic
 # ---------------------------------------------------------------------------
 
-class TestRemoveSymbolFromSchematic:
 
+class TestRemoveSymbolFromSchematic:
     def test_removes_existing_symbol(self, tools, tmp_sch):
         """remove_symbol_from_schematic should remove R2 successfully."""
         result = asyncio.run(
@@ -285,10 +288,8 @@ class TestRemoveSymbolFromSchematic:
         refs = []
         try:
             for sym in sch.symbol:
-                try:
+                with contextlib.suppress(AttributeError):
                     refs.append(sym.property.Reference.value)
-                except AttributeError:
-                    pass
         except AttributeError:
             pass
         assert "R2" not in refs
@@ -305,10 +306,8 @@ class TestRemoveSymbolFromSchematic:
         refs = set()
         try:
             for sym in sch.symbol:
-                try:
+                with contextlib.suppress(AttributeError):
                     refs.add(sym.property.Reference.value)
-                except AttributeError:
-                    pass
         except AttributeError:
             pass
         for expected in ("R3", "R4", "R5"):
@@ -371,10 +370,8 @@ class TestRemoveSymbolFromSchematic:
         refs = set()
         try:
             for sym in sch.symbol:
-                try:
+                with contextlib.suppress(AttributeError):
                     refs.add(sym.property.Reference.value)
-                except AttributeError:
-                    pass
         except AttributeError:
             pass
         assert "R2" not in refs, "R2 should have been removed"
@@ -398,8 +395,8 @@ class TestRemoveSymbolFromSchematic:
 # TestSetComponentProperty
 # ---------------------------------------------------------------------------
 
-class TestSetComponentProperty:
 
+class TestSetComponentProperty:
     def test_update_existing_value(self, tools, tmp_sch):
         """Updating the Value property of an existing component should succeed."""
         result = asyncio.run(
@@ -474,6 +471,7 @@ class TestSetComponentProperty:
     def test_new_property_is_hidden(self, tools, tmp_sch):
         """Non-standard properties should have (hide yes) in their effects."""
         import sexpdata
+
         asyncio.run(
             tools["set_component_property"](
                 schematic_path=tmp_sch,
@@ -514,8 +512,7 @@ class TestSetComponentProperty:
                             for c in child
                         )
                         assert hide_yes_found, (
-                            "Expected (hide yes) in effects of new property, "
-                            f"got effects: {child}"
+                            f"Expected (hide yes) in effects of new property, got effects: {child}"
                         )
                         return
                 pytest.fail("No effects node found on Manufacturer property")
@@ -612,10 +609,7 @@ class TestSetComponentProperty:
                     continue
             except AttributeError:
                 continue
-            mpn_count = sum(
-                1 for p in sym.property
-                if getattr(p, "children", [None])[0] == "MPN"
-            )
+            mpn_count = sum(1 for p in sym.property if getattr(p, "children", [None])[0] == "MPN")
             assert mpn_count == 1, f"Expected 1 MPN property, found {mpn_count}"
             assert sym.property.MPN.value == "RC0402FR-0710KL"
             return
@@ -671,6 +665,7 @@ class TestSetComponentProperty:
     def test_footprint_update_is_hidden(self, tools, tmp_sch):
         """When adding a new Footprint property, it should be hidden per KiCad convention."""
         import sexpdata
+
         # Use a reference whose Footprint property is absent in the fixture.
         # Add a fresh symbol first (R8 doesn't exist), then set its Footprint.
         # Alternatively, confirm an existing component's Footprint value can be
@@ -740,8 +735,8 @@ class TestSetComponentProperty:
 # TestListComponentProperties
 # ---------------------------------------------------------------------------
 
-class TestListComponentProperties:
 
+class TestListComponentProperties:
     def test_returns_expected_properties(self, tools, tmp_sch):
         """list_component_properties should return Reference, Value, etc. for R1."""
         result = asyncio.run(
@@ -846,8 +841,8 @@ class TestListComponentProperties:
 # TestDeleteComponentProperty
 # ---------------------------------------------------------------------------
 
-class TestDeleteComponentProperty:
 
+class TestDeleteComponentProperty:
     def _add_custom_property(self, tools, tmp_sch, name="MPN", value="RC0402FR-0710KL"):
         """Helper: add a custom property to R1 and return the result."""
         return asyncio.run(
@@ -894,10 +889,8 @@ class TestDeleteComponentProperty:
             names = []
             try:
                 for prop in sym.property:
-                    try:
+                    with contextlib.suppress(AttributeError, IndexError):
                         names.append(prop.children[0])
-                    except (AttributeError, IndexError):
-                        pass
             except AttributeError:
                 pass
             assert "MPN" not in names, f"MPN still present after deletion: {names}"
@@ -1028,8 +1021,8 @@ class TestDeleteComponentProperty:
 # TestMoveComponent
 # ---------------------------------------------------------------------------
 
-class TestMoveComponent:
 
+class TestMoveComponent:
     def test_rotate_only_happy_path(self, tools, tmp_sch):
         """move_component with only rotation should succeed."""
         result = asyncio.run(
@@ -1187,9 +1180,12 @@ class TestMoveComponent:
         raw_before = r2_sym_before._pv._tree
         fa_idx_before = -1
         for i, child in enumerate(raw_before):
-            if (isinstance(child, list) and len(child) >= 1
-                    and isinstance(child[0], sexpdata.Symbol)
-                    and child[0].value() == "fields_autoplaced"):
+            if (
+                isinstance(child, list)
+                and len(child) >= 1
+                and isinstance(child[0], sexpdata.Symbol)
+                and child[0].value() == "fields_autoplaced"
+            ):
                 fa_idx_before = i
                 break
         assert fa_idx_before == -1, (
@@ -1212,7 +1208,8 @@ class TestMoveComponent:
                     assert sym.at.value[2] == 90, f"Expected rotation 90, got {sym.at.value[2]}"
                     raw_after = sym._pv._tree
                     fa_present = any(
-                        isinstance(child, list) and len(child) >= 1
+                        isinstance(child, list)
+                        and len(child) >= 1
                         and isinstance(child[0], sexpdata.Symbol)
                         and child[0].value() == "fields_autoplaced"
                         for child in raw_after
@@ -1229,9 +1226,12 @@ class TestMoveComponent:
 
         def _find_tag_idx(raw_tree, tag_name):
             for i, child in enumerate(raw_tree):
-                if (isinstance(child, list) and len(child) >= 1
-                        and isinstance(child[0], sexpdata.Symbol)
-                        and child[0].value() == tag_name):
+                if (
+                    isinstance(child, list)
+                    and len(child) >= 1
+                    and isinstance(child[0], sexpdata.Symbol)
+                    and child[0].value() == tag_name
+                ):
                     return i
             return -1
 
@@ -1253,8 +1253,7 @@ class TestMoveComponent:
                     assert fa_idx != -1, "fields_autoplaced node missing after move"
                     assert uuid_idx != -1, "uuid node missing after move"
                     assert fa_idx < uuid_idx, (
-                        f"fields_autoplaced (idx={fa_idx}) must precede "
-                        f"uuid (idx={uuid_idx})"
+                        f"fields_autoplaced (idx={fa_idx}) must precede uuid (idx={uuid_idx})"
                     )
                     return
             except AttributeError:
@@ -1285,6 +1284,7 @@ class TestMoveComponent:
     def test_non_finite_x(self, tools, tmp_sch):
         """Non-finite x coordinate should be rejected."""
         import math as _math
+
         result = asyncio.run(
             tools["move_component"](
                 schematic_path=tmp_sch,

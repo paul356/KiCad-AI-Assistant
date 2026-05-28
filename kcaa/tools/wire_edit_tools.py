@@ -7,12 +7,10 @@ in KiCad schematics using the skip library.
 import logging
 import math
 import os
-import shutil
 from typing import Any
 
+from fastmcp import Context, FastMCP
 import skip
-from fastmcp import Context
-from fastmcp import FastMCP
 
 from kcaa.utils.schematic_sexp_utils import save_schematic
 from kcaa.utils.skip_helpers import sym_pin_world_coords
@@ -24,13 +22,14 @@ log = logging.getLogger(__name__)
 # Routing constants
 # ---------------------------------------------------------------------------
 
-_LEAD_OUT_DIST: float = 2.54   # mm — one KiCad grid step, pulls wire into open space
+_LEAD_OUT_DIST: float = 2.54  # mm — one KiCad grid step, pulls wire into open space
 _PIN_COLLISION_TOL: float = 0.5  # mm — clearance radius around each obstacle pin
 
 
 # ---------------------------------------------------------------------------
 # Geometry helpers
 # ---------------------------------------------------------------------------
+
 
 def _dir_vec(angle_deg: float) -> tuple[float, float]:
     """Return the unit direction vector for a KiCad pin exit angle.
@@ -52,9 +51,12 @@ def _dir_vec(angle_deg: float) -> tuple[float, float]:
 
 
 def _point_on_open_segment(
-    px: float, py: float,
-    ax: float, ay: float,
-    bx: float, by: float,
+    px: float,
+    py: float,
+    ax: float,
+    ay: float,
+    bx: float,
+    by: float,
     tol: float,
 ) -> bool:
     """Return True if point P lies strictly inside axis-aligned segment A→B.
@@ -84,8 +86,8 @@ def _route_collides(
     tol: float,
 ) -> bool:
     """Return True if any obstacle pin lands on the interior of any segment."""
-    for (ax, ay, bx, by) in segments:
-        for (px, py) in obstacles:
+    for ax, ay, bx, by in segments:
+        for px, py in obstacles:
             if _point_on_open_segment(px, py, ax, ay, bx, by, tol):
                 return True
     return False
@@ -95,8 +97,10 @@ def _route_collides_at_corners(
     segments: list[tuple[float, float, float, float]],
     obstacles: list[tuple[float, float]],
     tol: float,
-    route_sx: float, route_sy: float,
-    route_ex: float, route_ey: float,
+    route_sx: float,
+    route_sy: float,
+    route_ex: float,
+    route_ey: float,
 ) -> bool:
     """Return True if any obstacle pin coincides with an intermediate corner.
 
@@ -111,9 +115,9 @@ def _route_collides_at_corners(
     for i, (ax, ay, bx, by) in enumerate(segments):
         for cx, cy in ((ax, ay), (bx, by)):
             # Skip the overall route start and end — those are the connected pins.
-            if (abs(cx - route_sx) <= tol and abs(cy - route_sy) <= tol):
+            if abs(cx - route_sx) <= tol and abs(cy - route_sy) <= tol:
                 continue
-            if (abs(cx - route_ex) <= tol and abs(cy - route_ey) <= tol):
+            if abs(cx - route_ex) <= tol and abs(cy - route_ey) <= tol:
                 continue
             for px, py in obstacles:
                 if abs(cx - px) <= tol and abs(cy - py) <= tol:
@@ -122,7 +126,10 @@ def _route_collides_at_corners(
 
 
 def _route_candidates(
-    x1: float, y1: float, x2: float, y2: float,
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
 ) -> list[list[tuple[float, float, float, float]]]:
     """Return a ranked list of candidate segment-lists connecting (x1,y1)→(x2,y2).
 
@@ -156,19 +163,23 @@ def _route_candidates(
         # Horizontal Z-routes: jog the vertical column to a fractional x
         for k in range(1, 8):
             xj = x1 + dx * k / 8.0
-            candidates.append([
-                (x1, y1, xj, y1),
-                (xj, y1, xj, y2),
-                (xj, y2, x2, y2),
-            ])
+            candidates.append(
+                [
+                    (x1, y1, xj, y1),
+                    (xj, y1, xj, y2),
+                    (xj, y2, x2, y2),
+                ]
+            )
         # Vertical Z-routes: jog the horizontal row to a fractional y
         for k in range(1, 8):
             yj = y1 + dy * k / 8.0
-            candidates.append([
-                (x1, y1, x1, yj),
-                (x1, yj, x2, yj),
-                (x2, yj, x2, y2),
-            ])
+            candidates.append(
+                [
+                    (x1, y1, x1, yj),
+                    (x1, yj, x2, yj),
+                    (x2, yj, x2, y2),
+                ]
+            )
 
     # U-detours: used when the direct axis-aligned route is blocked by an
     # existing wire.  Jog perpendicular to the connecting axis by multiples
@@ -182,21 +193,25 @@ def _route_candidates(
         for n in _U_STEPS:
             for yoff in (n * _GRID, -n * _GRID):
                 yj = y1 + yoff
-                candidates.append([
-                    (x1, y1, x1, yj),
-                    (x1, yj, x2, yj),
-                    (x2, yj, x2, y2),
-                ])
+                candidates.append(
+                    [
+                        (x1, y1, x1, yj),
+                        (x1, yj, x2, yj),
+                        (x2, yj, x2, y2),
+                    ]
+                )
     elif abs(dx) < 1e-9 and abs(dy) > 1e-9:
         # Vertical collinear: jog in ±x
         for n in _U_STEPS:
             for xoff in (n * _GRID, -n * _GRID):
                 xj = x1 + xoff
-                candidates.append([
-                    (x1, y1, xj, y1),
-                    (xj, y1, xj, y2),
-                    (xj, y2, x2, y2),
-                ])
+                candidates.append(
+                    [
+                        (x1, y1, xj, y1),
+                        (xj, y1, xj, y2),
+                        (xj, y2, x2, y2),
+                    ]
+                )
 
     return candidates
 
@@ -224,15 +239,13 @@ def _merge_collinear_segments(
                 # Segments share the middle point
                 if abs(bx - cx) < 1e-9 and abs(by - cy) < 1e-9:
                     # Horizontal merge: all four y values the same
-                    if (abs(ay - by) < 1e-9 and abs(cy - dy) < 1e-9
-                            and abs(ay - dy) < 1e-9):
+                    if abs(ay - by) < 1e-9 and abs(cy - dy) < 1e-9 and abs(ay - dy) < 1e-9:
                         merged.append((ax, ay, dx, dy))
                         i += 2
                         changed = True
                         continue
                     # Vertical merge: all four x values the same
-                    if (abs(ax - bx) < 1e-9 and abs(cx - dx) < 1e-9
-                            and abs(ax - dx) < 1e-9):
+                    if abs(ax - bx) < 1e-9 and abs(cx - dx) < 1e-9 and abs(ax - dx) < 1e-9:
                         merged.append((ax, ay, dx, dy))
                         i += 2
                         changed = True
@@ -244,8 +257,14 @@ def _merge_collinear_segments(
 
 
 def _segments_overlap(
-    ax: float, ay: float, bx: float, by: float,
-    cx: float, cy: float, dx: float, dy: float,
+    ax: float,
+    ay: float,
+    bx: float,
+    by: float,
+    cx: float,
+    cy: float,
+    dx: float,
+    dy: float,
     tol: float,
 ) -> bool:
     """Return True if two axis-aligned segments are collinear and share more than a point.
@@ -273,8 +292,8 @@ def _route_overlaps_wires(
     tol: float,
 ) -> bool:
     """Return True if any segment in *segments* overlaps any existing wire."""
-    for (ax, ay, bx, by) in segments:
-        for (cx, cy, dx, dy) in existing_wires:
+    for ax, ay, bx, by in segments:
+        for cx, cy, dx, dy in existing_wires:
             if _segments_overlap(ax, ay, bx, by, cx, cy, dx, dy, tol):
                 return True
     return False
@@ -285,17 +304,22 @@ def _collect_existing_wires(sch: Any) -> list[tuple[float, float, float, float]]
     wires: list[tuple[float, float, float, float]] = []
     try:
         for w in sch.wire:
-            wires.append((
-                float(w.start.value[0]), float(w.start.value[1]),
-                float(w.end.value[0]),   float(w.end.value[1]),
-            ))
+            wires.append(
+                (
+                    float(w.start.value[0]),
+                    float(w.start.value[1]),
+                    float(w.end.value[0]),
+                    float(w.end.value[1]),
+                )
+            )
     except AttributeError:
         pass
     return wires
 
 
 def _follow_wire_extent(
-    sx: float, sy: float,
+    sx: float,
+    sy: float,
     angle: float,
     existing_wires: list[tuple[float, float, float, float]],
     tol: float,
@@ -322,7 +346,7 @@ def _follow_wire_extent(
         for idx, (ax, ay, bx, by) in enumerate(existing_wires):
             if idx in visited:
                 continue
-            for (ex, ey, ox, oy) in ((ax, ay, bx, by), (bx, by, ax, ay)):
+            for ex, ey, ox, oy in ((ax, ay, bx, by), (bx, by, ax, ay)):
                 if abs(ex - cx) > tol or abs(ey - cy) > tol:
                     continue
                 dx, dy = ox - cx, oy - cy
@@ -332,8 +356,7 @@ def _follow_wire_extent(
                 if abs(dx / dist - dvx) < 0.1 and abs(dy / dist - dvy) < 0.1:
                     # Stop before landing on a component pin
                     if obstacle_pins and any(
-                        abs(ox - px) <= tol and abs(oy - py) <= tol
-                        for px, py in obstacle_pins
+                        abs(ox - px) <= tol and abs(oy - py) <= tol for px, py in obstacle_pins
                     ):
                         continue
                     visited.add(idx)
@@ -348,7 +371,8 @@ def _follow_wire_extent(
 
 
 def _follow_connected_wires(
-    px: float, py: float,
+    px: float,
+    py: float,
     existing_wires: list[tuple[float, float, float, float]],
     obstacle_pins: list[tuple[float, float]] | None,
     tol: float,
@@ -381,7 +405,10 @@ def _follow_connected_wires(
 
 
 def _infer_angles_toward(
-    x1: float, y1: float, x2: float, y2: float,
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
 ) -> list[float]:
     """Return axis-aligned angles from (x1,y1) that point toward (x2,y2).
 
@@ -401,8 +428,10 @@ def _infer_angles_toward(
 
 def _ordered_exit_angles(
     natural: float | None,
-    sx: float, sy: float,
-    tx: float, ty: float,
+    sx: float,
+    sy: float,
+    tx: float,
+    ty: float,
 ) -> list[float]:
     """Return all 4 cardinal angles ordered for routing from (sx,sy) toward (tx,ty).
 
@@ -447,16 +476,20 @@ _RouteConfig = tuple[
     list[tuple[float, float, float, float]],  # start_lead
     list[tuple[float, float, float, float]],  # end_lead  (stored inner→pin)
     list[tuple[float, float, float, float]],  # chosen inner segments
-    float, float,                              # p1x, p1y  (start lead tip)
-    float, float,                              # p2x, p2y  (end lead tip)
-    bool,                                      # start_suppressed
-    bool,                                      # end_suppressed
+    float,
+    float,  # p1x, p1y  (start lead tip)
+    float,
+    float,  # p2x, p2y  (end lead tip)
+    bool,  # start_suppressed
+    bool,  # end_suppressed
 ]
 
 
 def _try_angle_config(
-    sx: float, sy: float,
-    ex: float, ey: float,
+    sx: float,
+    sy: float,
+    ex: float,
+    ey: float,
     sa: float | None,
     ea: float | None,
     existing_wires: list[tuple[float, float, float, float]],
@@ -509,12 +542,14 @@ def _try_angle_config(
         if _route_overlaps_wires([seg], existing_wires, _PIN_COLLISION_TOL):
             p1x, p1y = _follow_wire_extent(sx, sy, sa, existing_wires, _PIN_COLLISION_TOL)
             start_suppressed = True
-        elif (start_natural is not None
-              and abs((sa - (start_natural + 180.0) % 360.0) % 360.0) < 1e-9):
+        elif (
+            start_natural is not None and abs((sa - (start_natural + 180.0) % 360.0) % 360.0) < 1e-9
+        ):
             return None  # lead goes into component body (opposite to natural exit)
-        elif (_route_collides([seg], obstacles, _PIN_COLLISION_TOL)
-              or any(abs(p1x - ox) <= _PIN_COLLISION_TOL and abs(p1y - oy) <= _PIN_COLLISION_TOL
-                     for ox, oy in obstacles)):
+        elif _route_collides([seg], obstacles, _PIN_COLLISION_TOL) or any(
+            abs(p1x - ox) <= _PIN_COLLISION_TOL and abs(p1y - oy) <= _PIN_COLLISION_TOL
+            for ox, oy in obstacles
+        ):
             return None  # direction blocked by a component pin
         else:
             start_lead = [seg]
@@ -534,12 +569,12 @@ def _try_angle_config(
         if _route_overlaps_wires([seg], existing_wires, _PIN_COLLISION_TOL):
             p2x, p2y = _follow_wire_extent(ex, ey, ea, existing_wires, _PIN_COLLISION_TOL)
             end_suppressed = True
-        elif (end_natural is not None
-              and abs((ea - (end_natural + 180.0) % 360.0) % 360.0) < 1e-9):
+        elif end_natural is not None and abs((ea - (end_natural + 180.0) % 360.0) % 360.0) < 1e-9:
             return None  # lead goes into component body (opposite to natural exit)
-        elif (_route_collides([seg], obstacles, _PIN_COLLISION_TOL)
-              or any(abs(p2x - ox) <= _PIN_COLLISION_TOL and abs(p2y - oy) <= _PIN_COLLISION_TOL
-                     for ox, oy in obstacles)):
+        elif _route_collides([seg], obstacles, _PIN_COLLISION_TOL) or any(
+            abs(p2x - ox) <= _PIN_COLLISION_TOL and abs(p2y - oy) <= _PIN_COLLISION_TOL
+            for ox, oy in obstacles
+        ):
             return None  # direction blocked by a component pin
         else:
             end_lead = [(p2x, p2y, ex, ey)]  # reversed: inner→pin
@@ -549,22 +584,39 @@ def _try_angle_config(
 
     for candidate in _route_candidates(p1x, p1y, p2x, p2y):
         all_segs = lead_segs + candidate
-        if (not _route_collides(all_segs, obstacles, _PIN_COLLISION_TOL)
-                and not _route_overlaps_wires(all_segs, existing_wires, _PIN_COLLISION_TOL)
-                and not _route_collides_at_corners(
-                    all_segs, obstacles, _PIN_COLLISION_TOL,
-                    sx, sy, ex, ey,
-                )):
-            return (start_lead, end_lead, candidate,
-                    p1x, p1y, p2x, p2y,
-                    start_suppressed, end_suppressed)
+        if (
+            not _route_collides(all_segs, obstacles, _PIN_COLLISION_TOL)
+            and not _route_overlaps_wires(all_segs, existing_wires, _PIN_COLLISION_TOL)
+            and not _route_collides_at_corners(
+                all_segs,
+                obstacles,
+                _PIN_COLLISION_TOL,
+                sx,
+                sy,
+                ex,
+                ey,
+            )
+        ):
+            return (
+                start_lead,
+                end_lead,
+                candidate,
+                p1x,
+                p1y,
+                p2x,
+                p2y,
+                start_suppressed,
+                end_suppressed,
+            )
     return None
 
 
 def _draw_smart_wire(
     sch: Any,
-    sx: float, sy: float,
-    ex: float, ey: float,
+    sx: float,
+    sy: float,
+    ex: float,
+    ey: float,
     existing_wires: list[tuple[float, float, float, float]],
     start_angle: float | None = None,
     end_angle: float | None = None,
@@ -612,7 +664,7 @@ def _draw_smart_wire(
     # Ordered angle lists for each endpoint.
     # natural exit angle → toward target → perpendiculars → away from target.
     _start_angles: list[float | None] = _ordered_exit_angles(start_angle, sx, sy, ex, ey)
-    _end_angles:   list[float | None] = _ordered_exit_angles(end_angle,   ex, ey, sx, sy)
+    _end_angles: list[float | None] = _ordered_exit_angles(end_angle, ex, ey, sx, sy)
 
     # Iterate angle pairs in diagonal / rank-sum order:
     #   rank-sum 0: (sa[0], ea[0])
@@ -630,8 +682,15 @@ def _draw_smart_wire(
             if ei < 0 or ei >= len(_end_angles):
                 continue
             result = _try_angle_config(
-                sx, sy, ex, ey, _start_angles[si], _end_angles[ei],
-                existing_wires, obstacles, lead_out_dist,
+                sx,
+                sy,
+                ex,
+                ey,
+                _start_angles[si],
+                _end_angles[ei],
+                existing_wires,
+                obstacles,
+                lead_out_dist,
                 start_natural=start_angle,
                 end_natural=end_angle,
             )
@@ -644,7 +703,10 @@ def _draw_smart_wire(
         log.warning(
             "smart_wire: no valid route found between (%.3f,%.3f) and "
             "(%.3f,%.3f); all angle/candidate combinations are blocked.",
-            sx, sy, ex, ey,
+            sx,
+            sy,
+            ex,
+            ey,
         )
         return False
 
@@ -655,7 +717,7 @@ def _draw_smart_wire(
     # consecutive segments always share an endpoint, which is required for
     # _merge_collinear_segments to collapse collinear pairs correctly.
     all_draw = _merge_collinear_segments(start_lead + chosen + end_lead)
-    for (ax, ay, bx, by) in all_draw:
+    for ax, ay, bx, by in all_draw:
         if abs(ax - bx) < 1e-9 and abs(ay - by) < 1e-9:
             continue  # skip zero-length
         w = sch.wire.new()
@@ -663,9 +725,7 @@ def _draw_smart_wire(
         w.end_at([bx, by])
 
     # Place junction dots at suppressed-lead endpoints (T-tap points).
-    for jx, jy in (
-        [(p1x, p1y)] if start_suppressed else []
-    ) + (
+    for jx, jy in ([(p1x, p1y)] if start_suppressed else []) + (
         [(p2x, p2y)] if end_suppressed else []
     ):
         _add_junction_and_split(sch, jx, jy)
@@ -677,9 +737,8 @@ def _draw_smart_wire(
 # Pin position resolution
 # ---------------------------------------------------------------------------
 
-def _get_pin_schematic_position(
-    sch: Any, reference: str, pin_number: str
-) -> tuple[float, float]:
+
+def _get_pin_schematic_position(sch: Any, reference: str, pin_number: str) -> tuple[float, float]:
     """Return the absolute schematic (x, y) of a named pin on a placed symbol.
 
     Kept for backward compatibility.  Prefer :func:`_get_pin_position_and_direction`
@@ -777,8 +836,9 @@ def _wire_connected_at(sch: Any, px: float, py: float, tol: float = 0.01) -> boo
         for w in sch.wire:
             sx, sy = float(w.start.value[0]), float(w.start.value[1])
             ex, ey = float(w.end.value[0]), float(w.end.value[1])
-            if (abs(sx - px) <= tol and abs(sy - py) <= tol) or \
-               (abs(ex - px) <= tol and abs(ey - py) <= tol):
+            if (abs(sx - px) <= tol and abs(sy - py) <= tol) or (
+                abs(ex - px) <= tol and abs(ey - py) <= tol
+            ):
                 return True
     except AttributeError:
         pass
@@ -787,8 +847,10 @@ def _wire_connected_at(sch: Any, px: float, py: float, tol: float = 0.01) -> boo
 
 def _points_already_connected(
     existing_wires: list[tuple[float, float, float, float]],
-    x1: float, y1: float,
-    x2: float, y2: float,
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
     tol: float,
 ) -> bool:
     """Return True if (x1,y1) and (x2,y2) are already electrically connected
@@ -874,9 +936,7 @@ def _split_wires_at_point(sch: Any, px: float, py: float, tol: float = 0.01) -> 
     return splits
 
 
-def _add_junction_and_split(
-    sch: Any, px: float, py: float, tol: float = 0.01
-) -> bool:
+def _add_junction_and_split(sch: Any, px: float, py: float, tol: float = 0.01) -> bool:
     """Add a junction at (px, py) and split any wire passing through it.
 
     No-op (returns False) if a junction already exists at (px, py); in that
@@ -896,6 +956,7 @@ def _add_junction_and_split(
 # ---------------------------------------------------------------------------
 # MCP tool registration
 # ---------------------------------------------------------------------------
+
 
 def register_wire_edit_tools(mcp: FastMCP) -> None:
     """Register all wire and junction editing tools with the MCP server."""
@@ -946,8 +1007,10 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
         if not os.path.isfile(schematic_path):
             return {"error": f"Schematic file not found: {schematic_path!r}"}
         for name, val in [
-            ("start_x", start_x), ("start_y", start_y),
-            ("end_x", end_x), ("end_y", end_y),
+            ("start_x", start_x),
+            ("start_y", start_y),
+            ("end_x", end_x),
+            ("end_y", end_y),
         ]:
             if not math.isfinite(val):
                 return {"error": f"Coordinate '{name}' must be a finite number (got {val})"}
@@ -974,7 +1037,7 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
                 }
 
             def _find_pin_angle(px: float, py: float) -> float | None:
-                for (x, y, angle) in all_pin_data:
+                for x, y, angle in all_pin_data:
                     if abs(x - px) <= tol and abs(y - py) <= tol:
                         return angle
                 return None
@@ -987,13 +1050,11 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
 
             junctions_added: list[dict[str, float]] = []
             for jx, jy in [(start_x, start_y), (end_x, end_y)]:
-                needs = (
-                    _is_on_wire_interior(jx, jy)
-                    or (_wire_connected_at(sch, jx, jy) and not _junction_exists_at(sch, jx, jy))
+                needs = _is_on_wire_interior(jx, jy) or (
+                    _wire_connected_at(sch, jx, jy) and not _junction_exists_at(sch, jx, jy)
                 )
-                if needs:
-                    if _add_junction_and_split(sch, jx, jy):
-                        junctions_added.append({"x": jx, "y": jy})
+                if needs and _add_junction_and_split(sch, jx, jy):
+                    junctions_added.append({"x": jx, "y": jy})
 
             start_angle_wire = _find_pin_angle(start_x, start_y)
             end_angle_wire = _find_pin_angle(end_x, end_y)
@@ -1008,24 +1069,35 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
             # — skip routing to avoid drawing a redundant U-detour path.
             direct_exists = any(
                 (
-                    abs(ax - start_x) <= tol and abs(ay - start_y) <= tol
-                    and abs(bx - end_x) <= tol and abs(by - end_y) <= tol
-                ) or (
-                    abs(ax - end_x) <= tol and abs(ay - end_y) <= tol
-                    and abs(bx - start_x) <= tol and abs(by - start_y) <= tol
+                    abs(ax - start_x) <= tol
+                    and abs(ay - start_y) <= tol
+                    and abs(bx - end_x) <= tol
+                    and abs(by - end_y) <= tol
+                )
+                or (
+                    abs(ax - end_x) <= tol
+                    and abs(ay - end_y) <= tol
+                    and abs(bx - start_x) <= tol
+                    and abs(by - start_y) <= tol
                 )
                 for ax, ay, bx, by in existing_wires
             )
             if not direct_exists:
                 ok = _draw_smart_wire(
-                    sch, start_x, start_y, end_x, end_y,
+                    sch,
+                    start_x,
+                    start_y,
+                    end_x,
+                    end_y,
                     existing_wires=existing_wires,
                     start_angle=start_angle_wire,
                     end_angle=end_angle_wire,
                     obstacle_pins=obstacles,
                 )
                 if not ok:
-                    return {"error": "No valid route found: all routing candidates overlap existing wires or collide with component pins"}
+                    return {
+                        "error": "No valid route found: all routing candidates overlap existing wires or collide with component pins"
+                    }
 
             save_schematic(schematic_path, sch)
         except Exception as exc:
@@ -1085,8 +1157,10 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
         if not os.path.isfile(schematic_path):
             return {"error": f"Schematic file not found: {schematic_path!r}"}
         for name, val in [
-            ("start_x", start_x), ("start_y", start_y),
-            ("end_x", end_x), ("end_y", end_y),
+            ("start_x", start_x),
+            ("start_y", start_y),
+            ("end_x", end_x),
+            ("end_y", end_y),
         ]:
             if not math.isfinite(val):
                 return {"error": f"Coordinate '{name}' must be a finite number (got {val})"}
@@ -1126,13 +1200,11 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
 
             junctions_added: list[dict[str, float]] = []
             for jx, jy in [(start_x, start_y), (end_x, end_y)]:
-                needs = (
-                    _is_on_wire_interior(jx, jy)
-                    or (_wire_connected_at(sch, jx, jy) and not _junction_exists_at(sch, jx, jy))
+                needs = _is_on_wire_interior(jx, jy) or (
+                    _wire_connected_at(sch, jx, jy) and not _junction_exists_at(sch, jx, jy)
                 )
-                if needs:
-                    if _add_junction_and_split(sch, jx, jy):
-                        junctions_added.append({"x": jx, "y": jy})
+                if needs and _add_junction_and_split(sch, jx, jy):
+                    junctions_added.append({"x": jx, "y": jy})
 
             # Refresh after any splits: the pre-split long wire is gone,
             # replaced by shorter segments.  If splitting already created the
@@ -1140,11 +1212,16 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
             existing_wires = _collect_existing_wires(sch)
             segment_exists = any(
                 (
-                    abs(ax - start_x) <= tol and abs(ay - start_y) <= tol
-                    and abs(bx - end_x) <= tol and abs(by - end_y) <= tol
-                ) or (
-                    abs(ax - end_x) <= tol and abs(ay - end_y) <= tol
-                    and abs(bx - start_x) <= tol and abs(by - start_y) <= tol
+                    abs(ax - start_x) <= tol
+                    and abs(ay - start_y) <= tol
+                    and abs(bx - end_x) <= tol
+                    and abs(by - end_y) <= tol
+                )
+                or (
+                    abs(ax - end_x) <= tol
+                    and abs(ay - end_y) <= tol
+                    and abs(bx - start_x) <= tol
+                    and abs(by - start_y) <= tol
                 )
                 for ax, ay, bx, by in existing_wires
             )
@@ -1210,16 +1287,12 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
             return {"error": f"Failed to open schematic: {exc}"}
 
         try:
-            start_x, start_y, start_angle = _get_pin_position_and_direction(
-                sch, from_ref, from_pin
-            )
+            start_x, start_y, start_angle = _get_pin_position_and_direction(sch, from_ref, from_pin)
         except ValueError as exc:
             return {"error": str(exc)}
 
         try:
-            end_x, end_y, end_angle = _get_pin_position_and_direction(
-                sch, to_ref, to_pin
-            )
+            end_x, end_y, end_angle = _get_pin_position_and_direction(sch, to_ref, to_pin)
         except ValueError as exc:
             return {"error": str(exc)}
 
@@ -1271,14 +1344,20 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
             # Smart routing: follow pin exit directions, avoid all other pins
             # and existing wire segments
             ok = _draw_smart_wire(
-                sch, start_x, start_y, end_x, end_y,
+                sch,
+                start_x,
+                start_y,
+                end_x,
+                end_y,
                 existing_wires=existing_wires,
                 start_angle=start_angle,
                 end_angle=end_angle,
                 obstacle_pins=obstacles,
             )
             if not ok:
-                return {"error": f"No valid route found between {from_ref} pin {from_pin} and {to_ref} pin {to_pin}: all routing candidates overlap existing wires or collide with component pins"}
+                return {
+                    "error": f"No valid route found between {from_ref} pin {from_pin} and {to_ref} pin {to_pin}: all routing candidates overlap existing wires or collide with component pins"
+                }
 
             save_schematic(schematic_path, sch)
         except Exception as exc:
@@ -1296,7 +1375,6 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
         if auto_junctions:
             result["auto_junctions_added"] = auto_junctions
         return result
-
 
     @mcp.tool()
     async def delete_wire_from_schematic(
@@ -1352,7 +1430,9 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
                 return {"error": f"Wire spec at index {i} is invalid: {exc}"}
             for name, val in [("start_x", sx), ("start_y", sy), ("end_x", ex), ("end_y", ey)]:
                 if not math.isfinite(val):
-                    return {"error": f"Wire spec at index {i}: '{name}' must be a finite number (got {val})"}
+                    return {
+                        "error": f"Wire spec at index {i}: '{name}' must be a finite number (got {val})"
+                    }
             parsed.append((sx, sy, ex, ey))
 
         try:
@@ -1377,12 +1457,16 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
                 wy1 = float(w.end.value[1])
                 for i, (sx, sy, ex, ey) in enumerate(parsed):
                     forward = (
-                        abs(wx0 - sx) <= tolerance and abs(wy0 - sy) <= tolerance
-                        and abs(wx1 - ex) <= tolerance and abs(wy1 - ey) <= tolerance
+                        abs(wx0 - sx) <= tolerance
+                        and abs(wy0 - sy) <= tolerance
+                        and abs(wx1 - ex) <= tolerance
+                        and abs(wy1 - ey) <= tolerance
                     )
                     backward = (
-                        abs(wx0 - ex) <= tolerance and abs(wy0 - ey) <= tolerance
-                        and abs(wx1 - sx) <= tolerance and abs(wy1 - sy) <= tolerance
+                        abs(wx0 - ex) <= tolerance
+                        and abs(wy0 - ey) <= tolerance
+                        and abs(wx1 - sx) <= tolerance
+                        and abs(wy1 - sy) <= tolerance
                     )
                     if forward or backward:
                         to_delete.append(w)
@@ -1404,7 +1488,12 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
         except Exception as exc:
             return {"error": f"Failed to delete wire: {exc}"}
 
-        result: dict[str, Any] = {"success": True, "deleted_count": len(to_delete), "file_modified": schematic_path, "backup_path": schematic_path + ".bak"}
+        result: dict[str, Any] = {
+            "success": True,
+            "deleted_count": len(to_delete),
+            "file_modified": schematic_path,
+            "backup_path": schematic_path + ".bak",
+        }
         if not_found:
             result["not_found"] = not_found
         return result

@@ -22,31 +22,30 @@ PCB coordinate convention: mm, +X right, +Y down, rotation CW-positive.
 
 import logging
 import math
-import re
 from typing import Any
 
 from fastmcp import Context, FastMCP
 
 from kcaa.tools.pcb_placement_helpers import (
+    _GRID_MM,
+    _TIER_NAMES,
     _bboxes_overlap,
     _classify_footprint,
     _compute_group_hpwl,
     _find_group_board_position,
     _get_fp_local_pads,
     _get_fp_pads_world,
-    _GRID_MM,
-    _TIER_NAMES,
     find_collisions,
 )
 from kcaa.utils.pcb_board_utils import get_fp_courtyard_bbox
 from kcaa.utils.pcb_footprint_utils import (
+    _sym,
     find_footprint,
     get_fp_at,
     get_fp_layer,
     get_fp_property,
     set_fp_at,
     upsert_fp_property,
-    _sym,
 )
 from kcaa.utils.pcb_sexp_utils import load_pcb, save_pcb
 
@@ -71,8 +70,7 @@ def _iter_footprints(data: list[Any]):
 def _fp_pad_count(fp_node: list[Any]) -> int:
     """Return the number of pad nodes in a footprint."""
     return sum(
-        1 for sub in fp_node
-        if isinstance(sub, list) and len(sub) >= 4 and _sym(sub[0]) == "pad"
+        1 for sub in fp_node if isinstance(sub, list) and len(sub) >= 4 and _sym(sub[0]) == "pad"
     )
 
 
@@ -86,17 +84,21 @@ def _get_group_members(data: list[Any], group_name: str) -> list[dict[str, Any]]
             x, y, rot = get_fp_at(fp)
             layer = get_fp_layer(fp) or ""
             pad_count = _fp_pad_count(fp)
-            members.append({
-                "reference": ref,
-                "value": value,
-                "x": x,
-                "y": y,
-                "rotation": rot,
-                "layer": layer,
-                "pad_count": pad_count,
-                "tier": _classify_footprint(ref, pad_count, value),
-                "tier_name": _TIER_NAMES.get(_classify_footprint(ref, pad_count, value), "unknown"),
-            })
+            members.append(
+                {
+                    "reference": ref,
+                    "value": value,
+                    "x": x,
+                    "y": y,
+                    "rotation": rot,
+                    "layer": layer,
+                    "pad_count": pad_count,
+                    "tier": _classify_footprint(ref, pad_count, value),
+                    "tier_name": _TIER_NAMES.get(
+                        _classify_footprint(ref, pad_count, value), "unknown"
+                    ),
+                }
+            )
     return members
 
 
@@ -122,27 +124,25 @@ def _is_ground_net(net: str) -> bool:
 
 
 def _get_edge_normal_direction(
-    pad_x: float,
-    pad_y: float,
-    courtyard: dict[str, float] | None
+    pad_x: float, pad_y: float, courtyard: dict[str, float] | None
 ) -> tuple[float, float]:
     """Classify pad to nearest courtyard edge and return unit normal direction.
-    
+
     For elongated connectors (e.g. long double-row DIN), this ensures all pads
     in the same column/row get the same directional preference, creating better
     clustering than using raw pad positions.
-    
+
     Args:
         pad_x, pad_y: Pad position relative to footprint center
         courtyard: Bounding box dict with keys min_x, max_x, min_y, max_y
-        
+
     Returns:
         Unit vector pointing away from the nearest edge:
         LEFT edge   → (-1, 0)
         RIGHT edge  → (+1, 0)
         ABOVE edge  → (0, -1)
         BELOW edge  → (0, +1)
-        
+
     If courtyard is None, falls back to raw pad position (normalized).
     """
     if courtyard is None:
@@ -151,16 +151,16 @@ def _get_edge_normal_direction(
         if dist < 0.001:
             return (1.0, 0.0)  # Default to RIGHT
         return (pad_x / dist, pad_y / dist)
-    
+
     # Calculate distance to each courtyard edge
     dist_to_left = abs(pad_x - courtyard["min_x"])
     dist_to_right = abs(pad_x - courtyard["max_x"])
     dist_to_top = abs(pad_y - courtyard["min_y"])
     dist_to_bottom = abs(pad_y - courtyard["max_y"])
-    
+
     # Find nearest edge
     min_dist = min(dist_to_left, dist_to_right, dist_to_top, dist_to_bottom)
-    
+
     if min_dist == dist_to_left:
         return (-1.0, 0.0)  # LEFT edge
     elif min_dist == dist_to_right:
@@ -186,12 +186,12 @@ def _generate_grid_candidates(
     When prefer_direction is provided, candidates are scored by the actual
     edge-to-edge routing distance, NOT centroid-to-centroid. We route from
     the facing edges of the two pads:
-    
+
     - If member pad is RIGHT of anchor: anchor.right_edge → member.left_edge
-    - If member pad is LEFT of anchor: anchor.left_edge → member.right_edge  
+    - If member pad is LEFT of anchor: anchor.left_edge → member.right_edge
     - If member pad is BELOW anchor: anchor.bottom_edge → member.top_edge
     - If member pad is ABOVE anchor: anchor.top_edge → member.bottom_edge
-    
+
     This gives the true minimum routing length between the pad edges, accounting
     for the rectangular extents of both pads in the actual routing direction.
 
@@ -220,7 +220,7 @@ def _generate_grid_candidates(
     """
     steps = int(math.ceil(radius_mm / _GRID_MM))
     candidates: list[tuple[float, float, float]] = []
-    
+
     # Normalize preferred direction if provided
     prefer_dx, prefer_dy = 0.0, 0.0
     if prefer_direction:
@@ -228,7 +228,7 @@ def _generate_grid_candidates(
         if mag > 0.01:
             prefer_dx = prefer_direction[0] / mag
             prefer_dy = prefer_direction[1] / mag
-    
+
     for row in range(-steps, steps + 1):
         for col in range(-steps, steps + 1):
             x = round(col * _GRID_MM, 9)
@@ -236,7 +236,7 @@ def _generate_grid_candidates(
             dx = x - center_x
             dy = y - center_y
             dist_sq = dx * dx + dy * dy
-            
+
             # Calculate directional score if prefer_direction provided
             if prefer_direction and mag > 0.01:
                 # Member pad position (where it would be at this candidate)
@@ -245,78 +245,80 @@ def _generate_grid_candidates(
                     member_pad_cy = y + member_pad_offset[1]
                 else:
                     member_pad_cx, member_pad_cy = x, y
-                
+
                 # Anchor pad position (from prefer_direction, which is anchor_pad_cx, anchor_pad_cy)
                 anchor_pad_cx = prefer_direction[0]
                 anchor_pad_cy = prefer_direction[1]
-                
+
                 # Calculate edge-to-edge routing distance
                 # We route from the facing edges, not from centroids
-                
+
                 # Get pad dimensions (default to 0 if not provided)
                 aw = anchor_pad_size[0] if anchor_pad_size else 0.0
                 ah = anchor_pad_size[1] if anchor_pad_size else 0.0
                 mw = member_pad_size[0] if member_pad_size else 0.0
                 mh = member_pad_size[1] if member_pad_size else 0.0
-                
+
                 # Calculate distances between edges
                 # Horizontal distance: distance between left/right edges
                 if member_pad_cx >= anchor_pad_cx:
                     # Member is to the RIGHT of anchor
                     # Connect anchor RIGHT edge to member LEFT edge
-                    horiz_dist = (member_pad_cx - mw/2) - (anchor_pad_cx + aw/2)
+                    horiz_dist = (member_pad_cx - mw / 2) - (anchor_pad_cx + aw / 2)
                 else:
                     # Member is to the LEFT of anchor
                     # Connect anchor LEFT edge to member RIGHT edge
-                    horiz_dist = (anchor_pad_cx - aw/2) - (member_pad_cx + mw/2)
-                
+                    horiz_dist = (anchor_pad_cx - aw / 2) - (member_pad_cx + mw / 2)
+
                 # Vertical distance: distance between top/bottom edges
                 if member_pad_cy >= anchor_pad_cy:
                     # Member is BELOW anchor (remember +Y is down)
                     # Connect anchor BOTTOM edge to member TOP edge
-                    vert_dist = (member_pad_cy - mh/2) - (anchor_pad_cy + ah/2)
+                    vert_dist = (member_pad_cy - mh / 2) - (anchor_pad_cy + ah / 2)
                 else:
                     # Member is ABOVE anchor
                     # Connect anchor TOP edge to member BOTTOM edge
-                    vert_dist = (anchor_pad_cy - ah/2) - (member_pad_cy + mh/2)
-                
+                    vert_dist = (anchor_pad_cy - ah / 2) - (member_pad_cy + mh / 2)
+
                 # The effective routing distance is the larger of the two
                 # (We need to route in both directions if both are positive)
                 # If either is negative, pads overlap in that dimension
                 horiz_dist = max(0.0, horiz_dist)
                 vert_dist = max(0.0, vert_dist)
-                
+
                 # Use Euclidean distance for diagonal routing
                 # (Manhattan distance would be horiz_dist + vert_dist)
                 effective_dist = math.sqrt(horiz_dist * horiz_dist + vert_dist * vert_dist)
-                
+
                 # Apply directional preference: favor positions in same direction as anchor pad
                 # Calculate direction from anchor origin to member pad
-                member_dist = math.sqrt(member_pad_cx * member_pad_cx + member_pad_cy * member_pad_cy)
+                member_dist = math.sqrt(
+                    member_pad_cx * member_pad_cx + member_pad_cy * member_pad_cy
+                )
                 if member_dist > 0.001:
                     # Normalized direction to member pad
                     member_dir_x = member_pad_cx / member_dist
                     member_dir_y = member_pad_cy / member_dist
-                    
+
                     # Dot product with preferred direction (already normalized earlier)
                     # prefer_dx, prefer_dy are normalized direction to anchor pad
                     dot = member_dir_x * prefer_dx + member_dir_y * prefer_dy
-                    
+
                     # Map dot product [-1, 1] to multiplier [1.5, 0.7]
                     # dot = +1 (same direction): multiplier = 0.7 (30% discount)
                     # dot =  0 (perpendicular): multiplier = 1.1 (10% penalty)
                     # dot = -1 (opposite): multiplier = 1.5 (50% penalty)
                     direction_multiplier = 1.1 - 0.4 * dot
-                    
+
                     effective_dist = effective_dist * direction_multiplier
-                
+
                 # Use effective distance as primary sort key
                 score = (effective_dist * effective_dist, dist_sq)
             else:
                 score = (dist_sq, 0.0)
-            
+
             candidates.append((x, y, score[0], score[1]))
-    
+
     # Sort by effective distance (directional), then absolute distance (tie-breaker)
     candidates.sort(key=lambda c: (c[2], c[3]))
     return [(c[0], c[1]) for c in candidates]
@@ -331,34 +333,34 @@ def _choose_rotation_for_connection(
     member_footprint: list[Any] | None = None,
 ) -> tuple[float, float, float]:
     """Determine rotation that places member component body OUTSIDE anchor courtyard.
-    
+
     Strategy:
     1. Determine which direction the anchor_pad is from anchor center (0, 0)
     2. Choose rotation so member pad faces that direction
     3. Calculate ideal footprint center that clears anchor courtyard (considering member courtyard)
     4. Derive ideal pad position from ideal footprint center
     5. Return (rotation, ideal_pad_x, ideal_pad_y)
-    
+
     This ensures the component body extends AWAY from the anchor and fully clears its courtyard.
     """
     if not anchor_bbox:
         # No courtyard - place at anchor pad with 0° rotation
         return 0.0, anchor_pad_cx, anchor_pad_cy
-    
+
     # Determine which direction the anchor pad is from anchor center
     # This tells us which SIDE of the anchor the pad is on
     angle_from_center = math.degrees(math.atan2(anchor_pad_cy, anchor_pad_cx))
-    
+
     # Normalize to [0, 360) and round to nearest 90°
     direction_90 = round(angle_from_center / 90) * 90
     direction_90 = direction_90 % 360
-    
+
     # Calculate pad angle at 0° rotation
     pad_angle_0 = math.degrees(math.atan2(member_pad_ly, member_pad_lx))
-    
+
     # Determine rotation and target angle based on direction
     gap = 1.0  # mm clearance outside courtyard
-    
+
     if direction_90 == 0:  # Anchor pad on RIGHT side
         # Place member to RIGHT, pad faces LEFT (180°)
         target_angle = 180.0
@@ -371,12 +373,12 @@ def _choose_rotation_for_connection(
     else:  # direction_90 == 270, Anchor pad on TOP side
         # Place member above, pad faces DOWN (90°)
         target_angle = 90.0
-    
+
     # Calculate rotation needed
     needed_rotation = target_angle - pad_angle_0
     best_rot = round(needed_rotation / 90) * 90
     best_rot = best_rot % 360
-    
+
     # Get member courtyard at this rotation to calculate clearances
     member_cy_half_width = 0.0
     member_cy_half_height = 0.0
@@ -385,7 +387,7 @@ def _choose_rotation_for_connection(
         if member_bbox:
             member_cy_half_width = (member_bbox["max_x"] - member_bbox["min_x"]) / 2.0
             member_cy_half_height = (member_bbox["max_y"] - member_bbox["min_y"]) / 2.0
-    
+
     # Calculate ideal FOOTPRINT CENTER that clears anchor courtyard
     # For horizontal (RIGHT/LEFT) placement, only move in X to clear
     # For vertical (TOP/BOTTOM) placement, only move in Y to clear
@@ -401,7 +403,7 @@ def _choose_rotation_for_connection(
     else:  # TOP side (direction_90 == 270)
         ideal_fp_cx = anchor_pad_cx  # Match anchor pad X position
         ideal_fp_cy = anchor_bbox["min_y"] - gap - member_cy_half_height
-    
+
     # Convert ideal footprint center to ideal pad position
     # Y-down CCW rotation: x' = x*cos + y*sin, y' = -x*sin + y*cos
     rot_rad = math.radians(best_rot)
@@ -409,7 +411,7 @@ def _choose_rotation_for_connection(
     rotated_pad_ly = -member_pad_lx * math.sin(rot_rad) + member_pad_ly * math.cos(rot_rad)
     ideal_pad_x = ideal_fp_cx + rotated_pad_lx
     ideal_pad_y = ideal_fp_cy + rotated_pad_ly
-    
+
     return best_rot, ideal_pad_x, ideal_pad_y
 
 
@@ -451,24 +453,24 @@ def _choose_rotation_for_grid(
 
     # Use the first connecting pair (primary connection)
     lx, ly, ax, ay, _, _, _, _ = connecting_pairs[0]
-    
+
     # Direction from component position to anchor pad
     target_dx = ax - cx
     target_dy = ay - cy
-    
+
     # Angle from component center to anchor pad
     target_angle = math.degrees(math.atan2(target_dy, target_dx))
-    
+
     # Current angle of the pad at 0° rotation
     pad_angle = math.degrees(math.atan2(ly, lx))
-    
+
     # Rotation needed to align pad with target
     needed_rotation = target_angle - pad_angle
-    
+
     # Round to nearest 90° and normalize to [0, 360)
     best_rot = round(needed_rotation / 90) * 90
     best_rot = best_rot % 360
-    
+
     return best_rot
 
 
@@ -523,21 +525,21 @@ def _grid_layout(
     anchor_world_pads = _get_fp_pads_world(anchor_fp)
     anchor_pads_rel = []
     for lp, wp in zip(anchor_local_pads, anchor_world_pads):
-        anchor_pads_rel.append({
-            "x": wp["x"] - anchor_wx,
-            "y": wp["y"] - anchor_wy,
-            "net": wp["net"],
-            "w": lp["pad_w"],
-            "h": lp["pad_h"]
-        })
-    
+        anchor_pads_rel.append(
+            {
+                "x": wp["x"] - anchor_wx,
+                "y": wp["y"] - anchor_wy,
+                "net": wp["net"],
+                "w": lp["pad_w"],
+                "h": lp["pad_h"],
+            }
+        )
+
     # Store anchor pads with dimensions: {net: [(x, y, w, h), ...]}
     anchor_net_pts: dict[str, list[tuple[float, float, float, float]]] = {}
     for _p in anchor_pads_rel:
         if _p["net"] and not _is_ground_net(_p["net"]):
-            anchor_net_pts.setdefault(_p["net"], []).append(
-                (_p["x"], _p["y"], _p["w"], _p["h"])
-            )
+            anchor_net_pts.setdefault(_p["net"], []).append((_p["x"], _p["y"], _p["w"], _p["h"]))
 
     # ── Classify members ─────────────────────────────────────────────────
     connected: list[str] = []
@@ -567,21 +569,27 @@ def _grid_layout(
     _cand_cache: dict[tuple[float, float], list[tuple[float, float]]] = {}
 
     def _candidates_for_pad(
-        grid_cx: float, grid_cy: float, anchor_pad_cx: float, anchor_pad_cy: float,
-        anchor_pad_w: float, anchor_pad_h: float,
-        member_pad_lx: float, member_pad_ly: float,
-        member_pad_w: float, member_pad_h: float,
+        grid_cx: float,
+        grid_cy: float,
+        anchor_pad_cx: float,
+        anchor_pad_cy: float,
+        anchor_pad_w: float,
+        anchor_pad_h: float,
+        member_pad_lx: float,
+        member_pad_ly: float,
+        member_pad_w: float,
+        member_pad_h: float,
         anchor_courtyard: dict[str, float] | None,
-        best_rotation: float = 0.0
+        best_rotation: float = 0.0,
     ) -> list[tuple[float, float]]:
         """Generate grid of test points centered at ANCHOR PAD and sorted by pad-to-pad distance.
-        
+
         Per user specification:
         1. Generate grid centered at target anchor pad
         2. Filter out points inside anchor courtyard (done in placement loop)
         3. Calculate track distance from member pad to anchor pad
         4. Sort by distance (closest first)
-        
+
         Args:
             grid_cx, grid_cy: Ideal footprint center (for reference only)
             anchor_pad_cx, anchor_pad_cy: Anchor pad position (GRID CENTER)
@@ -598,19 +606,25 @@ def _grid_layout(
             round(anchor_courtyard["min_y"], 3) if anchor_courtyard else 0,
             round(anchor_courtyard["max_y"], 3) if anchor_courtyard else 0,
         )
-        key = (round(anchor_pad_cx, 3), round(anchor_pad_cy, 3),
-               round(member_pad_lx, 3), round(member_pad_ly, 3), round(best_rotation, 3), courtyard_key)
-        
+        key = (
+            round(anchor_pad_cx, 3),
+            round(anchor_pad_cy, 3),
+            round(member_pad_lx, 3),
+            round(member_pad_ly, 3),
+            round(best_rotation, 3),
+            courtyard_key,
+        )
+
         if key not in _cand_cache:
             # Calculate rotated pad offset
             rot_rad = math.radians(best_rotation)
             rotated_pad_lx = member_pad_lx * math.cos(rot_rad) - member_pad_ly * math.sin(rot_rad)
             rotated_pad_ly = member_pad_lx * math.sin(rot_rad) + member_pad_ly * math.cos(rot_rad)
-            
+
             # Step 1: Generate grid of TEST POINTS (member pad positions) centered at ANCHOR PAD
             steps = int(math.ceil(grid_radius_mm / _GRID_MM))
             candidates = []
-            
+
             # Determine ideal perpendicular direction based on rotation
             # Rotation tells us where component BODY goes (from _choose_rotation_for_connection):
             # 0° → component body to RIGHT (+X)
@@ -630,23 +644,23 @@ def _grid_layout(
             else:  # 270
                 # Component body to TOP
                 ideal_perp_x, ideal_perp_y = 0.0, -1.0
-            
+
             for row in range(-steps, steps + 1):
                 for col in range(-steps, steps + 1):
                     # Test point = member pad position (grid origin at ANCHOR PAD)
                     test_point_x = anchor_pad_cx + round(col * _GRID_MM, 9)
                     test_point_y = anchor_pad_cy + round(row * _GRID_MM, 9)
-                    
+
                     # Step 3: Calculate track distance (test point to anchor pad)
                     dx = test_point_x - anchor_pad_cx
                     dy = test_point_y - anchor_pad_cy
                     dist_sq = dx * dx + dy * dy
-                    
+
                     # Calculate footprint center from test point (pad position)
                     # footprint_center = pad_position - rotated_pad_offset
                     footprint_x = test_point_x - rotated_pad_lx
                     footprint_y = test_point_y - rotated_pad_ly
-                    
+
                     # Apply angular penalty based on alignment with perpendicular direction
                     # Use cosine of angle between (anchor→grid) and ideal perpendicular direction
                     # multiplier = 1 - 0.8 * cos(angle)
@@ -663,15 +677,15 @@ def _grid_layout(
                         cos_angle = norm_dx * ideal_perp_x + norm_dy * ideal_perp_y
                         # Apply multiplier formula
                         multiplier = 1.0 - 0.8 * cos_angle
-                    
+
                     effective_dist_sq = dist_sq * multiplier
-                    
+
                     candidates.append((footprint_x, footprint_y, effective_dist_sq))
-            
+
             # Step 4: Sort by effective distance (prioritizes preferred direction)
             candidates.sort(key=lambda c: c[2])
             _cand_cache[key] = [(c[0], c[1]) for c in candidates]
-        
+
         return _cand_cache[key]
 
     # ── Running obstacle list: inflated bboxes of already-placed members ──
@@ -703,7 +717,16 @@ def _grid_layout(
             )
             # Store: (member_lx, member_ly, anchor_x, anchor_y, anchor_w, anchor_h, member_w, member_h)
             connecting_pairs.append(
-                (mpad["lx"], mpad["ly"], ax_best, ay_best, aw_best, ah_best, mpad["pad_w"], mpad["pad_h"])
+                (
+                    mpad["lx"],
+                    mpad["ly"],
+                    ax_best,
+                    ay_best,
+                    aw_best,
+                    ah_best,
+                    mpad["pad_w"],
+                    mpad["pad_h"],
+                )
             )
             shared_nets.add(net)
 
@@ -720,28 +743,44 @@ def _grid_layout(
         # member pad's local position.
         if connecting_pairs:
             # Anchor pad target centroid
-            anchor_pad_cx = sum(ax for _, _, ax, _, _, _, _, _ in connecting_pairs) / len(connecting_pairs)
-            anchor_pad_cy = sum(ay for _, _, _, ay, _, _, _, _ in connecting_pairs) / len(connecting_pairs)
+            anchor_pad_cx = sum(ax for _, _, ax, _, _, _, _, _ in connecting_pairs) / len(
+                connecting_pairs
+            )
+            anchor_pad_cy = sum(ay for _, _, _, ay, _, _, _, _ in connecting_pairs) / len(
+                connecting_pairs
+            )
             # Anchor pad average dimensions
-            anchor_pad_w = sum(aw for _, _, _, _, aw, _, _, _ in connecting_pairs) / len(connecting_pairs)
-            anchor_pad_h = sum(ah for _, _, _, _, _, ah, _, _ in connecting_pairs) / len(connecting_pairs)
+            anchor_pad_w = sum(aw for _, _, _, _, aw, _, _, _ in connecting_pairs) / len(
+                connecting_pairs
+            )
+            anchor_pad_h = sum(ah for _, _, _, _, _, ah, _, _ in connecting_pairs) / len(
+                connecting_pairs
+            )
             # Member pad centroid in local coordinates
-            member_pad_lx = sum(lx for lx, _, _, _, _, _, _, _ in connecting_pairs) / len(connecting_pairs)
-            member_pad_ly = sum(ly for _, ly, _, _, _, _, _, _ in connecting_pairs) / len(connecting_pairs)
+            member_pad_lx = sum(lx for lx, _, _, _, _, _, _, _ in connecting_pairs) / len(
+                connecting_pairs
+            )
+            member_pad_ly = sum(ly for _, ly, _, _, _, _, _, _ in connecting_pairs) / len(
+                connecting_pairs
+            )
             # Member pad average dimensions
-            member_pad_w = sum(mw for _, _, _, _, _, _, mw, _ in connecting_pairs) / len(connecting_pairs)
-            member_pad_h = sum(mh for _, _, _, _, _, _, _, mh in connecting_pairs) / len(connecting_pairs)
-            
+            member_pad_w = sum(mw for _, _, _, _, _, _, mw, _ in connecting_pairs) / len(
+                connecting_pairs
+            )
+            member_pad_h = sum(mh for _, _, _, _, _, _, _, mh in connecting_pairs) / len(
+                connecting_pairs
+            )
+
             # Calculate best rotation and ideal position based on anchor edge
             best_rot, ideal_pad_x, ideal_pad_y = _choose_rotation_for_connection(
                 member_pad_lx, member_pad_ly, anchor_pad_cx, anchor_pad_cy, anchor_bbox, mfp
             )
-            
+
             # Calculate rotated pad offset
             rot_rad = math.radians(best_rot)
             rotated_pad_lx = member_pad_lx * math.cos(rot_rad) - member_pad_ly * math.sin(rot_rad)
             rotated_pad_ly = member_pad_lx * math.sin(rot_rad) + member_pad_ly * math.cos(rot_rad)
-            
+
             # Grid center = ideal pad position - rotated pad offset
             grid_center_x = ideal_pad_x - rotated_pad_lx
             grid_center_y = ideal_pad_y - rotated_pad_ly
@@ -757,16 +796,12 @@ def _grid_layout(
         # Calculate ideal member pad world position for logging
         ideal_member_pad_world_x = ideal_pad_x
         ideal_member_pad_world_y = ideal_pad_y
-        
-        log.info(
-            f"\n{'='*70}\n"
-            f"PLACING {member_ref}\n"
-            f"{'='*70}"
-        )
+
+        log.info(f"\n{'=' * 70}\nPLACING {member_ref}\n{'=' * 70}")
         log.info(f"Connecting pairs: {len(connecting_pairs)}")
         for i, (mlx, mly, ax, ay, aw, ah, mw, mh) in enumerate(connecting_pairs):
             log.info(
-                f"  Pair {i+1}: member pad local ({mlx:+.1f}, {mly:+.1f}) [{mw:.1f}×{mh:.1f}mm] "
+                f"  Pair {i + 1}: member pad local ({mlx:+.1f}, {mly:+.1f}) [{mw:.1f}×{mh:.1f}mm] "
                 f"→ anchor pad WORLD ({ax:.1f}, {ay:.1f}) [{aw:.1f}×{ah:.1f}mm]"
             )
         log.info(
@@ -786,22 +821,25 @@ def _grid_layout(
 
         # Get member courtyard for logging
         test_bb = get_fp_courtyard_bbox(mfp, 0.0, 0.0, base_rot)
-        member_bbox_at_origin = test_bb  # Save for retract algorithm
         if test_bb:
             cy_width = test_bb["max_x"] - test_bb["min_x"]
             cy_height = test_bb["max_y"] - test_bb["min_y"]
             log.info(f"Member courtyard: {cy_width:.1f}×{cy_height:.1f}mm")
-        
+
         log.info("\nSearching for valid placement position...")
-        
+
         # Add detailed logging for R4 to show grid search
         show_details = member_ref == "R4"
-        
+
         # Pre-calculate ideal perpendicular direction for show_details
         if show_details:
             rot_rad = math.radians(best_rot)
-            rotated_pad_lx_show = member_pad_lx * math.cos(rot_rad) - member_pad_ly * math.sin(rot_rad)
-            rotated_pad_ly_show = member_pad_lx * math.sin(rot_rad) + member_pad_ly * math.cos(rot_rad)
+            rotated_pad_lx_show = member_pad_lx * math.cos(rot_rad) - member_pad_ly * math.sin(
+                rot_rad
+            )
+            rotated_pad_ly_show = member_pad_lx * math.sin(rot_rad) + member_pad_ly * math.cos(
+                rot_rad
+            )
             rotation_normalized = best_rot % 360
             if rotation_normalized == 0:
                 ideal_perp_x_show, ideal_perp_y_show = 1.0, 0.0
@@ -811,13 +849,23 @@ def _grid_layout(
                 ideal_perp_x_show, ideal_perp_y_show = 0.0, 1.0
             else:
                 ideal_perp_x_show, ideal_perp_y_show = 0.0, -1.0
-        
-        for cx, cy in _candidates_for_pad(grid_center_x, grid_center_y, anchor_pad_cx, anchor_pad_cy,
-                                          anchor_pad_w, anchor_pad_h, member_pad_lx, member_pad_ly,
-                                          member_pad_w, member_pad_h, anchor_bbox, best_rot):
-            
+
+        for cx, cy in _candidates_for_pad(
+            grid_center_x,
+            grid_center_y,
+            anchor_pad_cx,
+            anchor_pad_cy,
+            anchor_pad_w,
+            anchor_pad_h,
+            member_pad_lx,
+            member_pad_ly,
+            member_pad_w,
+            member_pad_h,
+            anchor_bbox,
+            best_rot,
+        ):
             tries += 1
-            
+
             if show_details and tries <= 25:
                 # Show grid position and angular alignment
                 actual_pad_x = cx + rotated_pad_lx_show
@@ -833,12 +881,14 @@ def _grid_layout(
                     cos_angle = norm_dx * ideal_perp_x_show + norm_dy * ideal_perp_y_show
                 multiplier_show = 1.0 - 0.8 * cos_angle
                 effective_dist_sq = dist * dist * multiplier_show
-                log.info(f"  Try {tries}: fp({cx:.1f},{cy:.1f}) pad({actual_pad_x:.1f},{actual_pad_y:.1f}) "
-                        f"dx={dx:.1f} dy={dy:.1f} dist={dist:.1f}mm cos={cos_angle:.3f} mult={multiplier_show:.3f} eff={effective_dist_sq:.2f}")
+                log.info(
+                    f"  Try {tries}: fp({cx:.1f},{cy:.1f}) pad({actual_pad_x:.1f},{actual_pad_y:.1f}) "
+                    f"dx={dx:.1f} dy={dy:.1f} dist={dist:.1f}mm cos={cos_angle:.3f} mult={multiplier_show:.3f} eff={effective_dist_sq:.2f}"
+                )
             # The anchor occupies (0, 0); never place a member there.
             if cx == 0.0 and cy == 0.0:
                 if show_details and tries <= 25:
-                    log.info(f"    → SKIP (anchor origin)")
+                    log.info("    → SKIP (anchor origin)")
                 else:
                     log.info(f"  Try {tries}: WORLD ({cx:.1f}, {cy:.1f}) - SKIP (anchor origin)")
                 continue
@@ -851,9 +901,11 @@ def _grid_layout(
                 # No courtyard: accept position if anchor check also skipped.
                 if anchor_check is None:
                     if show_details and tries <= 25:
-                        log.info(f"    → ✓ ACCEPTED (no courtyard)")
+                        log.info("    → ✓ ACCEPTED (no courtyard)")
                     else:
-                        log.info(f"  Try {tries}: WORLD ({cx:.1f}, {cy:.1f}) rot={rot}° - ✓ ACCEPTED (no courtyard)")
+                        log.info(
+                            f"  Try {tries}: WORLD ({cx:.1f}, {cy:.1f}) rot={rot}° - ✓ ACCEPTED (no courtyard)"
+                        )
                     chosen_dx, chosen_dy, chosen_rot = cx, cy, rot
                     found = True
                     break
@@ -871,9 +923,11 @@ def _grid_layout(
             # Check against anchor (with gap).
             if anchor_check and _bboxes_overlap(placed_bb, anchor_check):
                 if show_details and tries <= 25:
-                    log.info(f"    → ✗ ANCHOR OVERLAP")
+                    log.info("    → ✗ ANCHOR OVERLAP")
                 else:
-                    log.debug(f"  Try {tries}: WORLD ({cx:.1f}, {cy:.1f}) rot={rot}° - ✗ ANCHOR OVERLAP")
+                    log.debug(
+                        f"  Try {tries}: WORLD ({cx:.1f}, {cy:.1f}) rot={rot}° - ✗ ANCHOR OVERLAP"
+                    )
                 continue  # Try next grid position instead of breaking
 
             # Check against already-placed members (already gap-inflated).
@@ -881,10 +935,10 @@ def _grid_layout(
             for obs_idx, obs in enumerate(placed_inflated):
                 if _bboxes_overlap(placed_bb, obs):
                     if show_details and tries <= 25:
-                        log.info(f"    → ✗ MEMBER OVERLAP #{obs_idx+1}")
+                        log.info(f"    → ✗ MEMBER OVERLAP #{obs_idx + 1}")
                     else:
                         log.debug(
-                            f"  Try {tries}: WORLD ({cx:.1f}, {cy:.1f}) rot={rot}° - ✗ MEMBER OVERLAP #{obs_idx+1}"
+                            f"  Try {tries}: WORLD ({cx:.1f}, {cy:.1f}) rot={rot}° - ✗ MEMBER OVERLAP #{obs_idx + 1}"
                         )
                     overlapping_member = True
                     break
@@ -900,7 +954,7 @@ def _grid_layout(
             actual_pad_y = cy + rotated_pad_ly
             pad_dist = math.hypot(actual_pad_x - anchor_pad_cx, actual_pad_y - anchor_pad_cy)
             if show_details:
-                log.info(f"    → ✓ ACCEPTED")
+                log.info("    → ✓ ACCEPTED")
             log.info(
                 f"  Try {tries}: WORLD ({cx:.1f}, {cy:.1f}) rot={rot}° - ✓ ACCEPTED\n"
                 f"    Footprint center WORLD: ({cx:.1f}, {cy:.1f})\n"
@@ -916,34 +970,36 @@ def _grid_layout(
 
         entry: dict[str, Any] = {
             "reference": member_ref,
-            "dx":        chosen_dx,
-            "dy":        chosen_dy,
-            "rotation":  chosen_rot,
+            "dx": chosen_dx,
+            "dy": chosen_dy,
+            "rotation": chosen_rot,
             "rationale": rationale,
         }
         if not found:
             entry["warning"] = "no clear position within grid radius; position may overlap"
             log.warning(
-                f"\n{'='*70}\n"
+                f"\n{'=' * 70}\n"
                 f"✗ {member_ref}: NO CLEAR POSITION FOUND\n"
                 f"  Tried {tries} positions\n"
                 f"  Ideal grid center was ({grid_center_x:.1f}, {grid_center_y:.1f})\n"
                 f"  All positions had collisions!\n"
-                f"{'='*70}\n"
+                f"{'=' * 70}\n"
             )
         suggestions.append(entry)
-        log.info(f"\n{'='*70}\n")
+        log.info(f"\n{'=' * 70}\n")
 
         # Record the placed bbox (gap-inflated) for subsequent members.
         if found:
             placed_bb_raw = get_fp_courtyard_bbox(mfp, 0.0, 0.0, chosen_rot)
             if placed_bb_raw:
-                placed_inflated.append({
-                    "min_x": placed_bb_raw["min_x"] + chosen_dx - gap_mm,
-                    "min_y": placed_bb_raw["min_y"] + chosen_dy - gap_mm,
-                    "max_x": placed_bb_raw["max_x"] + chosen_dx + gap_mm,
-                    "max_y": placed_bb_raw["max_y"] + chosen_dy + gap_mm,
-                })
+                placed_inflated.append(
+                    {
+                        "min_x": placed_bb_raw["min_x"] + chosen_dx - gap_mm,
+                        "min_y": placed_bb_raw["min_y"] + chosen_dy - gap_mm,
+                        "max_x": placed_bb_raw["max_x"] + chosen_dx + gap_mm,
+                        "max_y": placed_bb_raw["max_y"] + chosen_dy + gap_mm,
+                    }
+                )
 
     # Place connected members first (closest to anchor by connectivity).
     for ref in connected:
@@ -1108,18 +1164,20 @@ def register_pcb_group_tools(mcp: FastMCP) -> None:
             anchor = _find_anchor(members)
             xs = [m["x"] for m in members]
             ys = [m["y"] for m in members]
-            groups.append({
-                "group_name": gname,
-                "member_count": len(members),
-                "anchor_ref": anchor["reference"] if anchor else None,
-                "members": [m["reference"] for m in members],
-                "bbox": {
-                    "min_x": round(min(xs), 3),
-                    "min_y": round(min(ys), 3),
-                    "max_x": round(max(xs), 3),
-                    "max_y": round(max(ys), 3),
-                },
-            })
+            groups.append(
+                {
+                    "group_name": gname,
+                    "member_count": len(members),
+                    "anchor_ref": anchor["reference"] if anchor else None,
+                    "members": [m["reference"] for m in members],
+                    "bbox": {
+                        "min_x": round(min(xs), 3),
+                        "min_y": round(min(ys), 3),
+                        "max_x": round(max(xs), 3),
+                        "max_y": round(max(ys), 3),
+                    },
+                }
+            )
 
         return {
             "groups": groups,
@@ -1318,21 +1376,27 @@ def register_pcb_group_tools(mcp: FastMCP) -> None:
         all_y = [anchor_y] + [round(anchor_y + s["dy"], 9) for s in relative_layout]
         cx_mean = sum(all_x) / len(all_x)
         cy_mean = sum(all_y) / len(all_y)
-        mean_spread = (
-            sum(math.hypot(x - cx_mean, y - cy_mean) for x, y in zip(all_x, all_y))
-            / len(all_x)
+        mean_spread = sum(math.hypot(x - cx_mean, y - cy_mean) for x, y in zip(all_x, all_y)) / len(
+            all_x
         )
 
         placed = [
-            {"reference": anchor_ref, "x": anchor_x, "y": anchor_y,
-             "rotation": anchor_rot, "rationale": "anchor"},
+            {
+                "reference": anchor_ref,
+                "x": anchor_x,
+                "y": anchor_y,
+                "rotation": anchor_rot,
+                "rationale": "anchor",
+            },
         ]
         placed += [
-            {"reference": s["reference"],
-             "x": round(anchor_x + s["dx"], 9),
-             "y": round(anchor_y + s["dy"], 9),
-             "rotation": s["rotation"],
-             "rationale": s["rationale"]}
+            {
+                "reference": s["reference"],
+                "x": round(anchor_x + s["dx"], 9),
+                "y": round(anchor_y + s["dy"], 9),
+                "rotation": s["rotation"],
+                "rationale": s["rationale"],
+            }
             for s in relative_layout
         ]
 
@@ -1393,8 +1457,7 @@ def register_pcb_group_tools(mcp: FastMCP) -> None:
         delta_y = float(anchor_y) - anchor["y"]
 
         proposals = [
-            (m["reference"], m["x"] + delta_x, m["y"] + delta_y, m["rotation"])
-            for m in members
+            (m["reference"], m["x"] + delta_x, m["y"] + delta_y, m["rotation"]) for m in members
         ]
 
         collisions = find_collisions(data, proposals, check_within_group=False)
@@ -1405,8 +1468,7 @@ def register_pcb_group_tools(mcp: FastMCP) -> None:
                     "Use move_group with a different target position."
                 ),
                 "inter_group_collisions": [
-                    {"ref": c["ref"], "overlapping_with": c["overlapping_with"]}
-                    for c in collisions
+                    {"ref": c["ref"], "overlapping_with": c["overlapping_with"]} for c in collisions
                 ],
                 "group_name": group_name,
             }
@@ -1516,8 +1578,7 @@ def register_pcb_group_tools(mcp: FastMCP) -> None:
                     "Try a different rotation_delta or move the group first."
                 ),
                 "inter_group_collisions": [
-                    {"ref": c["ref"], "overlapping_with": c["overlapping_with"]}
-                    for c in collisions
+                    {"ref": c["ref"], "overlapping_with": c["overlapping_with"]} for c in collisions
                 ],
                 "group_name": group_name,
             }

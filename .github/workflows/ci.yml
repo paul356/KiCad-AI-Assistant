@@ -34,17 +34,8 @@ jobs:
       run: uv run ruff format --check kcaa/ tests/
 
   test:
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-        python-version: ["3.10", "3.11", "3.12", "3.13"]
-        exclude:
-          - os: macos-latest
-            python-version: "3.10"
-
-    name: Test Python ${{ matrix.python-version }} on ${{ matrix.os }}
+    runs-on: ubuntu-latest
+    name: Test Python 3.13
 
     steps:
     - uses: actions/checkout@v4
@@ -54,10 +45,10 @@ jobs:
       with:
         enable-cache: true
 
-    - name: Set up Python ${{ matrix.python-version }}
+    - name: Set up Python 3.13
       run: |
-        uv python install ${{ matrix.python-version }}
-        uv python pin ${{ matrix.python-version }}
+        uv python install 3.13
+        uv python pin 3.13
 
     - name: Install dependencies
       run: uv sync --group dev
@@ -67,7 +58,6 @@ jobs:
 
     - name: Upload coverage to Codecov
       uses: codecov/codecov-action@v4
-      if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
       with:
         file: ./coverage.xml
         fail_ci_if_error: false

@@ -1,10 +1,7 @@
 """Tests for context_bridge: context collection and system prompt rendering."""
-import importlib
-import os
-import sys
-from unittest.mock import patch, MagicMock
 
-import pytest
+import os
+from unittest.mock import MagicMock, patch
 
 from kicad_plugin.context_bridge import collect_context, context_to_system_prompt_block
 
@@ -216,4 +213,3 @@ class TestContextToSystemPromptBlock:
         }
         block = context_to_system_prompt_block(ctx)
         assert "Active PCB: /" not in block  # Should show "(none)" not a path
-

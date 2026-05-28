@@ -5,7 +5,8 @@ Handles: locating footprints, reading/writing the `at` position, and
 reading/writing named `property` entries.  The layer-flip map used by
 flip_footprint also lives here.
 """
-from typing import Any, Dict, List, Optional, Tuple
+
+from typing import Any
 
 import sexpdata
 
@@ -13,7 +14,7 @@ import sexpdata
 # Layer flip map — F.* ↔ B.*
 # ---------------------------------------------------------------------------
 
-LAYER_FLIP_MAP: Dict[str, str] = {
+LAYER_FLIP_MAP: dict[str, str] = {
     # KiCad 6 dot-separated names
     "F.Cu": "B.Cu",
     "B.Cu": "F.Cu",
@@ -54,7 +55,7 @@ def _sym(value: Any) -> str:
     return str(value)
 
 
-def find_footprint(data: List[Any], reference: str) -> List[Any]:
+def find_footprint(data: list[Any], reference: str) -> list[Any]:
     """Return the footprint S-expression node matching *reference*.
 
     :param data: Parsed PCB S-expression tree (from load_pcb).
@@ -73,7 +74,7 @@ def find_footprint(data: List[Any], reference: str) -> List[Any]:
     raise KeyError(f"Footprint '{reference}' not found in PCB")
 
 
-def _get_fp_reference(fp_node: List[Any]) -> Optional[str]:
+def _get_fp_reference(fp_node: list[Any]) -> str | None:
     """Extract the Reference property value from a footprint node."""
     for sub in fp_node:
         if isinstance(sub, list) and len(sub) >= 3 and _sym(sub[0]) == "property":
@@ -83,7 +84,7 @@ def _get_fp_reference(fp_node: List[Any]) -> Optional[str]:
     return None
 
 
-def get_fp_at(fp_node: List[Any]) -> Tuple[float, float, float]:
+def get_fp_at(fp_node: list[Any]) -> tuple[float, float, float]:
     """Return ``(x, y, rotation)`` from a footprint's ``at`` entry.
 
     Rotation defaults to 0.0 if absent.
@@ -97,7 +98,7 @@ def get_fp_at(fp_node: List[Any]) -> Tuple[float, float, float]:
     return 0.0, 0.0, 0.0
 
 
-def set_fp_at(fp_node: List[Any], x: float, y: float, rotation: float) -> None:
+def set_fp_at(fp_node: list[Any], x: float, y: float, rotation: float) -> None:
     """Update the ``at`` entry of a footprint node in-place.
 
     Also propagates any rotation change to child ``pad``, ``property``, and
@@ -121,7 +122,7 @@ def set_fp_at(fp_node: List[Any], x: float, y: float, rotation: float) -> None:
     _propagate_rotation_delta(fp_node, rotation)
 
 
-def get_fp_property(fp_node: List[Any], name: str) -> Optional[str]:
+def get_fp_property(fp_node: list[Any], name: str) -> str | None:
     """Return the value of a named ``property`` in a footprint node, or None."""
     for sub in fp_node:
         if isinstance(sub, list) and len(sub) >= 3 and _sym(sub[0]) == "property":
@@ -131,7 +132,7 @@ def get_fp_property(fp_node: List[Any], name: str) -> Optional[str]:
     return None
 
 
-def set_fp_property(fp_node: List[Any], name: str, value: str) -> bool:
+def set_fp_property(fp_node: list[Any], name: str, value: str) -> bool:
     """Update a named ``property`` in a footprint node in-place.
 
     :returns: True if the property was found and updated; False if not found.
@@ -145,7 +146,7 @@ def set_fp_property(fp_node: List[Any], name: str, value: str) -> bool:
     return False
 
 
-def upsert_fp_property(fp_node: List[Any], name: str, value: str) -> None:
+def upsert_fp_property(fp_node: list[Any], name: str, value: str) -> None:
     """Update a named property in a footprint node, or create it if absent.
 
     Unlike ``set_fp_property``, this never fails: if the property does not
@@ -155,7 +156,7 @@ def upsert_fp_property(fp_node: List[Any], name: str, value: str) -> None:
         fp_node.append([sexpdata.Symbol("property"), name, value])
 
 
-def get_fp_layer(fp_node: List[Any]) -> Optional[str]:
+def get_fp_layer(fp_node: list[Any]) -> str | None:
     """Return the primary layer of a footprint (e.g. ``'F.Cu'``)."""
     for sub in fp_node:
         if isinstance(sub, list) and len(sub) >= 2 and _sym(sub[0]) == "layer":
@@ -178,7 +179,7 @@ _PAD_TYPES = {"pad"}
 _TEXT_TYPES = {"property", "fp_text"}
 
 
-def _propagate_rotation_delta(fp_node: List[Any], delta: float) -> None:
+def _propagate_rotation_delta(fp_node: list[Any], delta: float) -> None:
     """Add *delta* degrees to the ``at`` rotation of all oriented children.
 
     Pads receive ``+delta`` (absolute board orientation tracks footprint).
@@ -209,7 +210,7 @@ def _propagate_rotation_delta(fp_node: List[Any], delta: float) -> None:
                 break
 
 
-def flip_fp_layers(fp_node: List[Any]) -> None:
+def flip_fp_layers(fp_node: list[Any]) -> None:
     """Flip all layer references in a footprint node from F.* to B.* and vice-versa."""
     _flip_layers_recursive(fp_node)
 

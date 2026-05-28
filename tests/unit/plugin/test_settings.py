@@ -1,8 +1,8 @@
 """Tests for PluginSettings: load, save, defaults, and round-trip."""
+
 import json
 import os
 import sys
-import tempfile
 
 import pytest
 
@@ -121,4 +121,3 @@ class TestPluginSettingsSecurity:
         # Current behaviour: value is set without type validation
         loaded = PluginSettings.load(config_dir=str(tmp_path))
         assert loaded.server_port == "not_a_number"
-

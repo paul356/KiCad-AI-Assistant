@@ -13,12 +13,12 @@ are created in temporary directories so tests are fully isolated.
 Run:
     uv run python -m pytest tests/integration/test_version_tools.py -v
 """
+
 from __future__ import annotations
 
 import itertools
 import json
 import os
-import shutil
 import socket
 import subprocess
 import sys
@@ -29,6 +29,7 @@ import pytest
 # ---------------------------------------------------------------------------
 # Transport helpers (same pattern as test_pcb_tools.py)
 # ---------------------------------------------------------------------------
+
 
 def _find_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -68,7 +69,7 @@ def _mcp_post(port: int, payload: dict, session_id: str | None = None) -> tuple[
     for line in raw.splitlines():
         line = line.strip()
         if line.startswith("data:"):
-            json_str = line[len("data:"):].strip()
+            json_str = line[len("data:") :].strip()
             if json_str:
                 return json.loads(json_str), returned_session_id
 
@@ -105,16 +106,19 @@ def _call_tool(port: int, session_id: str | None, name: str, arguments: dict) ->
 # Fixture: running MCP server (module scope)
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture(scope="module")
 def mcp_server():
     port = _find_free_port()
     env = os.environ.copy()
-    env.update({
-        "MCP_TRANSPORT": "streamable-http",
-        "MCP_PORT": str(port),
-        "MCP_HOST": "127.0.0.1",
-        "KICAD_MCP_PROFILE": "plugin",
-    })
+    env.update(
+        {
+            "MCP_TRANSPORT": "streamable-http",
+            "MCP_PORT": str(port),
+            "MCP_HOST": "127.0.0.1",
+            "KICAD_MCP_PROFILE": "plugin",
+        }
+    )
     env.pop("http_proxy", None)
     env.pop("HTTP_PROXY", None)
 
@@ -161,7 +165,10 @@ def mcp_server():
 # Helper: create a temp file with known content
 # ---------------------------------------------------------------------------
 
-def _make_test_file(tmp_path, name: str = "test.kicad_sch", content: str = "version 1 content") -> str:
+
+def _make_test_file(
+    tmp_path, name: str = "test.kicad_sch", content: str = "version 1 content"
+) -> str:
     p = tmp_path / name
     p.write_text(content)
     return str(p)
@@ -170,6 +177,7 @@ def _make_test_file(tmp_path, name: str = "test.kicad_sch", content: str = "vers
 # ---------------------------------------------------------------------------
 # Tests: save_file_version
 # ---------------------------------------------------------------------------
+
 
 class TestSaveFileVersion:
     def test_saves_version_successfully(self, mcp_server, tmp_path):
@@ -203,15 +211,21 @@ class TestSaveFileVersion:
 
     def test_nonexistent_file_returns_error(self, mcp_server):
         port, sid = mcp_server
-        result = _call_tool(port, sid, "save_file_version", {
-            "file_path": "/nonexistent/path/test.kicad_sch",
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "save_file_version",
+            {
+                "file_path": "/nonexistent/path/test.kicad_sch",
+            },
+        )
         assert "error" in result
 
 
 # ---------------------------------------------------------------------------
 # Tests: list_file_versions
 # ---------------------------------------------------------------------------
+
 
 class TestListFileVersions:
     def test_lists_saved_versions(self, mcp_server, tmp_path):
@@ -260,6 +274,7 @@ class TestListFileVersions:
 # Tests: restore_file_version
 # ---------------------------------------------------------------------------
 
+
 class TestRestoreFileVersion:
     def test_restore_reverts_file_content(self, mcp_server, tmp_path):
         port, sid = mcp_server
@@ -273,10 +288,15 @@ class TestRestoreFileVersion:
             f.write("modified content")
 
         # Restore
-        result = _call_tool(port, sid, "restore_file_version", {
-            "file_path": fp,
-            "version_id": version_id,
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "restore_file_version",
+            {
+                "file_path": fp,
+                "version_id": version_id,
+            },
+        )
         assert "error" not in result, result
         assert result.get("success") is True
 
@@ -293,10 +313,15 @@ class TestRestoreFileVersion:
         with open(fp, "w") as f:
             f.write("v2")
 
-        result = _call_tool(port, sid, "restore_file_version", {
-            "file_path": fp,
-            "version_id": version_id,
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "restore_file_version",
+            {
+                "file_path": fp,
+                "version_id": version_id,
+            },
+        )
         assert "error" not in result
         backup = result.get("backup_of_current", "")
         assert backup and os.path.isfile(backup), f"Backup not found at {backup!r}"
@@ -304,18 +329,28 @@ class TestRestoreFileVersion:
     def test_restore_invalid_version_returns_error(self, mcp_server, tmp_path):
         port, sid = mcp_server
         fp = _make_test_file(tmp_path)
-        result = _call_tool(port, sid, "restore_file_version", {
-            "file_path": fp,
-            "version_id": "nonexistent-version-id",
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "restore_file_version",
+            {
+                "file_path": fp,
+                "version_id": "nonexistent-version-id",
+            },
+        )
         assert "error" in result
 
     def test_restore_nonexistent_file_returns_error(self, mcp_server):
         port, sid = mcp_server
-        result = _call_tool(port, sid, "restore_file_version", {
-            "file_path": "/nonexistent/path/test.kicad_sch",
-            "version_id": "some-id",
-        })
+        result = _call_tool(
+            port,
+            sid,
+            "restore_file_version",
+            {
+                "file_path": "/nonexistent/path/test.kicad_sch",
+                "version_id": "some-id",
+            },
+        )
         assert "error" in result
 
     def test_save_list_restore_roundtrip(self, mcp_server, tmp_path):
@@ -339,10 +374,15 @@ class TestRestoreFileVersion:
         assert any(v["id"] == vid for v in lst["versions"])
 
         # Restore
-        restore = _call_tool(port, sid, "restore_file_version", {
-            "file_path": fp,
-            "version_id": vid,
-        })
+        restore = _call_tool(
+            port,
+            sid,
+            "restore_file_version",
+            {
+                "file_path": fp,
+                "version_id": vid,
+            },
+        )
         assert "error" not in restore
 
         # Verify

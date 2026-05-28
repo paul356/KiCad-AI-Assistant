@@ -17,15 +17,25 @@ directly against the connection, while all standard CRUD goes through the
 ORM session.
 """
 
+from dataclasses import dataclass
+import logging
 import os
 import re
 import time
-import logging
-from dataclasses import dataclass
 
 from sqlalchemy import (
-    Column, Integer, Float, String, ForeignKey,
-    Index, create_engine, text, event, func, select, insert
+    Column,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    create_engine,
+    event,
+    func,
+    insert,
+    select,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
@@ -35,6 +45,7 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Public dataclasses  (the external API — never expose ORM rows directly)
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class LibraryRecord:
@@ -64,7 +75,7 @@ class SymbolRecord:
 class DbStats:
     library_count: int
     symbol_count: int
-    last_sync: float        # Unix timestamp; 0.0 if never synced
+    last_sync: float  # Unix timestamp; 0.0 if never synced
     db_path: str
 
 
@@ -72,39 +83,39 @@ class DbStats:
 # ORM models  (internal — prefixed with _ to signal non-public)
 # ---------------------------------------------------------------------------
 
+
 class _Base(DeclarativeBase):
     pass
 
 
 class _LibraryRow(_Base):
-    __tablename__ = 'libraries'
+    __tablename__ = "libraries"
 
-    id            = Column(Integer, primary_key=True, autoincrement=True)
-    library_name  = Column(String,  nullable=False)
-    file_path     = Column(String,  nullable=False, unique=True)
-    file_size     = Column(Integer, nullable=False, default=0)
-    mtime         = Column(Float,   nullable=False, default=0.0)
-    checksum      = Column(String,  nullable=False, default='')
-    symbol_count  = Column(Integer, nullable=False, default=0)
-    last_indexed  = Column(Float,   nullable=False, default=0.0)
-    kicad_version = Column(String,  nullable=False, default='')
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    library_name = Column(String, nullable=False)
+    file_path = Column(String, nullable=False, unique=True)
+    file_size = Column(Integer, nullable=False, default=0)
+    mtime = Column(Float, nullable=False, default=0.0)
+    checksum = Column(String, nullable=False, default="")
+    symbol_count = Column(Integer, nullable=False, default=0)
+    last_indexed = Column(Float, nullable=False, default=0.0)
+    kicad_version = Column(String, nullable=False, default="")
 
 
 class _SymbolRow(_Base):
-    __tablename__ = 'symbols'
+    __tablename__ = "symbols"
 
-    library_name = Column(String,  nullable=False, primary_key=True)
-    symbol_name  = Column(String,  nullable=False, primary_key=True)
-    library_id   = Column(Integer, ForeignKey('libraries.id', ondelete='CASCADE'),
-                          nullable=False)
-    description  = Column(String,  nullable=False, default='')
-    keywords     = Column(String,  nullable=False, default='')
-    pin_count    = Column(Integer, nullable=False, default=0)
-    file_index   = Column(Integer, nullable=False, default=0)
+    library_name = Column(String, nullable=False, primary_key=True)
+    symbol_name = Column(String, nullable=False, primary_key=True)
+    library_id = Column(Integer, ForeignKey("libraries.id", ondelete="CASCADE"), nullable=False)
+    description = Column(String, nullable=False, default="")
+    keywords = Column(String, nullable=False, default="")
+    pin_count = Column(Integer, nullable=False, default=0)
+    file_index = Column(Integer, nullable=False, default=0)
 
     __table_args__ = (
-        Index('idx_sym_library_id', 'library_id'),
-        Index('idx_sym_name', 'symbol_name'),
+        Index("idx_sym_library_id", "library_id"),
+        Index("idx_sym_name", "symbol_name"),
     )
 
 
@@ -137,6 +148,7 @@ END;
 # SymbolDatabase
 # ---------------------------------------------------------------------------
 
+
 class SymbolDatabase:
     """SQLAlchemy-backed store for KiCad symbol library index data."""
 
@@ -149,15 +161,15 @@ class SymbolDatabase:
         self._db_path = db_path
 
         self._engine = create_engine(
-            f'sqlite:///{db_path}',
-            connect_args={'check_same_thread': False},
+            f"sqlite:///{db_path}",
+            connect_args={"check_same_thread": False},
         )
 
         # Enable WAL mode and foreign keys on every new connection.
-        @event.listens_for(self._engine, 'connect')
+        @event.listens_for(self._engine, "connect")
         def _set_pragmas(conn, _record):
-            conn.execute('PRAGMA journal_mode = WAL')
-            conn.execute('PRAGMA foreign_keys = ON')
+            conn.execute("PRAGMA journal_mode = WAL")
+            conn.execute("PRAGMA foreign_keys = ON")
 
         self._Session = sessionmaker(bind=self._engine)
         self._apply_schema()
@@ -171,15 +183,14 @@ class SymbolDatabase:
         _Base.metadata.create_all(self._engine)
         with self._engine.connect() as conn:
             try:
-                for statement in _DDL_FTS.split(';\n\n'):
+                for statement in _DDL_FTS.split(";\n\n"):
                     stmt = statement.strip()
                     if stmt:
                         conn.execute(text(stmt))
                 conn.commit()
             except Exception as exc:
                 log.warning(
-                    f"FTS5 not available in this SQLite build — "
-                    f"full-text search disabled. ({exc})"
+                    f"FTS5 not available in this SQLite build — full-text search disabled. ({exc})"
                 )
 
     # ------------------------------------------------------------------
@@ -201,10 +212,7 @@ class SymbolDatabase:
                     _LibraryRow.checksum,
                 )
             ).all()
-        return {
-            row.file_path: (row.id, row.mtime, row.file_size, row.checksum)
-            for row in rows
-        }
+        return {row.file_path: (row.id, row.mtime, row.file_size, row.checksum) for row in rows}
 
     # ------------------------------------------------------------------
     # Public API — write (used by SymbolIndexManager)
@@ -218,7 +226,7 @@ class SymbolDatabase:
         file_size: int,
         kicad_version: str,
         symbols: list[SymbolRecord],
-        checksum: str = '',
+        checksum: str = "",
     ) -> int:
         """
         Insert or fully replace a library and its symbols in one transaction.
@@ -244,7 +252,7 @@ class SymbolDatabase:
                 kicad_version=kicad_version,
             )
             session.add(lib_row)
-            session.flush()   # assigns lib_row.id
+            session.flush()  # assigns lib_row.id
             lib_id: int = lib_row.id
 
             if symbols:
@@ -252,13 +260,13 @@ class SymbolDatabase:
                     insert(_SymbolRow),
                     [
                         {
-                            'library_name': library_name,
-                            'symbol_name':  sym.symbol_name,
-                            'library_id':   lib_id,
-                            'description':  sym.description,
-                            'keywords':     sym.keywords,
-                            'pin_count':    sym.pin_count,
-                            'file_index':   sym.file_index,
+                            "library_name": library_name,
+                            "symbol_name": sym.symbol_name,
+                            "library_id": lib_id,
+                            "description": sym.description,
+                            "keywords": sym.keywords,
+                            "pin_count": sym.pin_count,
+                            "file_index": sym.file_index,
                         }
                         for sym in symbols
                     ],
@@ -289,9 +297,7 @@ class SymbolDatabase:
     def delete_library(self, lib_id: int) -> None:
         """Delete a library row (symbols removed via ON DELETE CASCADE)."""
         with self._Session() as session:
-            session.execute(
-                _LibraryRow.__table__.delete().where(_LibraryRow.id == lib_id)
-            )
+            session.execute(_LibraryRow.__table__.delete().where(_LibraryRow.id == lib_id))
             session.commit()
 
     # ------------------------------------------------------------------
@@ -318,7 +324,7 @@ class SymbolDatabase:
         )
         try:
             with self._engine.connect() as conn:
-                rows = conn.execute(sql, {'q': safe_query, 'lim': limit}).all()
+                rows = conn.execute(sql, {"q": safe_query, "lim": limit}).all()
             return [self._row_to_symbol(r) for r in rows]
         except Exception:
             log.debug("FTS5 unavailable, falling back to LIKE search")
@@ -341,9 +347,7 @@ class SymbolDatabase:
                 q = q.where(func.lower(_SymbolRow.symbol_name) == name.lower())
             else:
                 q = q.where(
-                    _SymbolRow.symbol_name.ilike(
-                        f'%{self._like_escape(name)}%', escape='\\'
-                    )
+                    _SymbolRow.symbol_name.ilike(f"%{self._like_escape(name)}%", escape="\\")
                 )
             rows = session.execute(q.limit(limit)).scalars().all()
         return [self._orm_to_symbol(r) for r in rows]
@@ -352,9 +356,7 @@ class SymbolDatabase:
     # Public API — lookup
     # ------------------------------------------------------------------
 
-    def get_symbol(
-        self, library_name: str, symbol_name: str
-    ) -> SymbolRecord | None:
+    def get_symbol(self, library_name: str, symbol_name: str) -> SymbolRecord | None:
         """Look up a single symbol by (library_name, symbol_name)."""
         with self._Session() as session:
             row = session.execute(
@@ -368,28 +370,37 @@ class SymbolDatabase:
     def get_library_symbols(self, library_name: str) -> list[SymbolRecord]:
         """Return all symbols in a library, ordered by their position in the file."""
         with self._Session() as session:
-            rows = session.execute(
-                select(_SymbolRow)
-                .where(_SymbolRow.library_name == library_name)
-                .order_by(_SymbolRow.file_index)
-            ).scalars().all()
+            rows = (
+                session.execute(
+                    select(_SymbolRow)
+                    .where(_SymbolRow.library_name == library_name)
+                    .order_by(_SymbolRow.file_index)
+                )
+                .scalars()
+                .all()
+            )
         return [self._orm_to_symbol(r) for r in rows]
 
     def get_all_symbols(self) -> list[SymbolRecord]:
         """Return every indexed symbol, ordered by library then position."""
         with self._Session() as session:
-            rows = session.execute(
-                select(_SymbolRow)
-                .order_by(_SymbolRow.library_name, _SymbolRow.file_index)
-            ).scalars().all()
+            rows = (
+                session.execute(
+                    select(_SymbolRow).order_by(_SymbolRow.library_name, _SymbolRow.file_index)
+                )
+                .scalars()
+                .all()
+            )
         return [self._orm_to_symbol(r) for r in rows]
 
     def get_all_libraries(self) -> list[LibraryRecord]:
         """Return all indexed library records, ordered alphabetically."""
         with self._Session() as session:
-            rows = session.execute(
-                select(_LibraryRow).order_by(_LibraryRow.library_name)
-            ).scalars().all()
+            rows = (
+                session.execute(select(_LibraryRow).order_by(_LibraryRow.library_name))
+                .scalars()
+                .all()
+            )
         return [self._orm_to_library(r) for r in rows]
 
     def get_library_by_name(self, name: str) -> LibraryRecord | None:
@@ -400,9 +411,7 @@ class SymbolDatabase:
             ).scalar_one_or_none()
         return self._orm_to_library(row) if row else None
 
-    def get_symbol_file_index(
-        self, library_name: str, symbol_name: str
-    ) -> int | None:
+    def get_symbol_file_index(self, library_name: str, symbol_name: str) -> int | None:
         """Return the 0-based file_index of a symbol, or None if not found."""
         with self._Session() as session:
             row = session.execute(
@@ -422,9 +431,7 @@ class SymbolDatabase:
             sym_count: int = session.execute(
                 select(func.count()).select_from(_SymbolRow)
             ).scalar_one()
-            last_sync = session.execute(
-                select(func.max(_LibraryRow.last_indexed))
-            ).scalar_one()
+            last_sync = session.execute(select(func.max(_LibraryRow.last_indexed))).scalar_one()
         return DbStats(
             library_count=lib_count,
             symbol_count=sym_count,
@@ -447,14 +454,14 @@ class SymbolDatabase:
         Each whitespace-separated token is double-quoted to prevent FTS5
         syntax errors on inputs like 'C++' or '24V'.
         """
-        tokens = re.split(r'\s+', query.strip())
-        escaped = ' '.join(f'"{t}"' for t in tokens if t)
+        tokens = re.split(r"\s+", query.strip())
+        escaped = " ".join(f'"{t}"' for t in tokens if t)
         return escaped if escaped else '""'
 
     @staticmethod
     def _like_escape(s: str) -> str:
         """Escape LIKE special characters in a user-supplied substring."""
-        return s.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
+        return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
     # ------------------------------------------------------------------
     # Internal helpers — ORM row → public dataclass

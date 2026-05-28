@@ -5,23 +5,23 @@ kcaa/utils/pcb_footprint_utils.py.
 These modules are pure helpers (no FastMCP dependency) so they can be
 imported and tested without the mcp.tool() decoration pattern.
 """
+
 import os
 import shutil
 
 import pytest
-import sexpdata
 
-from kcaa.utils.pcb_sexp_utils import load_pcb, save_pcb, _serialize
 from kcaa.utils.pcb_footprint_utils import (
+    LAYER_FLIP_MAP,
     find_footprint,
+    flip_fp_layers,
     get_fp_at,
     get_fp_layer,
     get_fp_property,
     set_fp_at,
     set_fp_property,
-    flip_fp_layers,
-    LAYER_FLIP_MAP,
 )
+from kcaa.utils.pcb_sexp_utils import _serialize, load_pcb, save_pcb
 
 FIXTURE_DIR = os.path.join(os.path.dirname(__file__), "fixtures")
 BOARD_FIXTURE = os.path.join(FIXTURE_DIR, "test_board.kicad_pcb")
@@ -30,6 +30,7 @@ BOARD_FIXTURE = os.path.join(FIXTURE_DIR, "test_board.kicad_pcb")
 # ---------------------------------------------------------------------------
 # pcb_sexp_utils
 # ---------------------------------------------------------------------------
+
 
 class TestLoadPcb:
     def test_loads_fixture(self):
@@ -95,6 +96,7 @@ class TestSerialize:
 # ---------------------------------------------------------------------------
 # pcb_footprint_utils
 # ---------------------------------------------------------------------------
+
 
 class TestFindFootprint:
     def setup_method(self):

@@ -6,15 +6,16 @@ Coordinate convention (all functions here and in callers):
   - Millimetres, +X right, **+Y down**, rotation **clockwise-positive**
     (KiCad PCB convention).
 """
+
 import math
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 import sexpdata
-
 
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
 
 def _sym(value: Any) -> str:
     """Return the string form of a sexpdata Symbol or plain string."""
@@ -27,7 +28,7 @@ def _make_sym(name: str) -> sexpdata.Symbol:
     return sexpdata.Symbol(name)
 
 
-def _get_layer(node: List[Any]) -> Optional[str]:
+def _get_layer(node: list[Any]) -> str | None:
     """Return the layer string of a graphic node, or None."""
     for sub in node:
         if isinstance(sub, list) and len(sub) >= 2 and _sym(sub[0]) == "layer":
@@ -39,7 +40,7 @@ _GRAPHIC_TYPES = {"gr_line", "gr_arc", "gr_rect", "gr_circle", "gr_curve"}
 _EDGE_CUTS_NAMES = {"Edge.Cuts", "Edge_Cuts"}
 
 
-def _is_edge_cuts(layer: Optional[str]) -> bool:
+def _is_edge_cuts(layer: str | None) -> bool:
     return layer in _EDGE_CUTS_NAMES
 
 
@@ -47,7 +48,8 @@ def _is_edge_cuts(layer: Optional[str]) -> bool:
 # Edge.Cuts read / write
 # ---------------------------------------------------------------------------
 
-def get_edge_cuts_items(data: List[Any]) -> List[Dict[str, Any]]:
+
+def get_edge_cuts_items(data: list[Any]) -> list[dict[str, Any]]:
     """Return a list of dicts describing all graphic items on Edge.Cuts.
 
     Each dict has at minimum ``type`` (e.g. ``"gr_line"``) and ``layer``
@@ -74,24 +76,9 @@ def get_edge_cuts_items(data: List[Any]) -> List[Dict[str, Any]]:
         if not _is_edge_cuts(layer):
             continue
 
-        info: Dict[str, Any] = {"type": kind, "layer": layer}
+        info: dict[str, Any] = {"type": kind, "layer": layer}
 
-        if kind == "gr_line":
-            for sub in item:
-                if isinstance(sub, list) and len(sub) >= 3:
-                    k = _sym(sub[0])
-                    if k == "start":
-                        info["x1"], info["y1"] = float(sub[1]), float(sub[2])
-                    elif k == "end":
-                        info["x2"], info["y2"] = float(sub[1]), float(sub[2])
-                    elif k == "stroke":
-                        for ssub in sub:
-                            if isinstance(ssub, list) and _sym(ssub[0]) == "width":
-                                info["width"] = float(ssub[1])
-                elif isinstance(sub, list) and len(sub) >= 2 and _sym(sub[0]) == "width":
-                    info.setdefault("width", float(sub[1]))
-
-        elif kind == "gr_rect":
+        if kind == "gr_line" or kind == "gr_rect":
             for sub in item:
                 if isinstance(sub, list) and len(sub) >= 3:
                     k = _sym(sub[0])
@@ -142,7 +129,7 @@ def get_edge_cuts_items(data: List[Any]) -> List[Dict[str, Any]]:
     return result
 
 
-def remove_edge_cuts_items(data: List[Any]) -> int:
+def remove_edge_cuts_items(data: list[Any]) -> int:
     """Remove all graphic items on the Edge.Cuts layer from *data* in-place.
 
     :param data: Parsed PCB S-expression tree (mutated in place).
@@ -162,7 +149,7 @@ def remove_edge_cuts_items(data: List[Any]) -> int:
 
 
 def add_gr_line(
-    data: List[Any],
+    data: list[Any],
     x1: float,
     y1: float,
     x2: float,
@@ -191,7 +178,7 @@ def add_gr_line(
 
 
 def add_gr_rect(
-    data: List[Any],
+    data: list[Any],
     x1: float,
     y1: float,
     x2: float,
@@ -221,7 +208,7 @@ def add_gr_rect(
 
 
 def add_gr_arc(
-    data: List[Any],
+    data: list[Any],
     cx: float,
     cy: float,
     radius: float,
@@ -244,10 +231,11 @@ def add_gr_arc(
     :param width: Line width in mm.
     :param layer: Target layer.
     """
+
     # In KiCad's +Y-down coordinate system CW angles map directly to standard
     # trig: a point at θ° CW from +X lies at (cx + r·cosθ, cy + r·sinθ).
     # No negation is needed; sin(θ) is positive downward, matching +Y-down.
-    def _pt(angle_cw_deg: float) -> Tuple[float, float]:
+    def _pt(angle_cw_deg: float) -> tuple[float, float]:
         rad = math.radians(angle_cw_deg)
         return cx + radius * math.cos(rad), cy + radius * math.sin(rad)
 
@@ -279,16 +267,23 @@ def add_gr_arc(
 # Footprint courtyard / bounding box
 # ---------------------------------------------------------------------------
 
-_COURTYARD_LAYERS = {"F.Courtyard", "B.Courtyard", "F_Courtyard", "B_Courtyard", "F.CrtYd", "B.CrtYd"}
+_COURTYARD_LAYERS = {
+    "F.Courtyard",
+    "B.Courtyard",
+    "F_Courtyard",
+    "B_Courtyard",
+    "F.CrtYd",
+    "B.CrtYd",
+}
 _FP_GRAPHIC_TYPES = {"fp_line", "fp_rect", "fp_arc", "fp_circle", "fp_curve"}
 
 
 def get_fp_courtyard_bbox(
-    fp_node: List[Any],
+    fp_node: list[Any],
     fp_x: float,
     fp_y: float,
     fp_rot_deg: float,
-) -> Optional[Dict[str, float]]:
+) -> dict[str, float] | None:
     """Compute the world-coordinate axis-aligned bounding box of a footprint's courtyard.
 
     Transforms all courtyard graphic endpoints by the footprint rotation
@@ -308,7 +303,7 @@ def get_fp_courtyard_bbox(
     cos_t = math.cos(theta)
     sin_t = math.sin(theta)
 
-    def _to_world(lx: float, ly: float) -> Tuple[float, float]:
+    def _to_world(lx: float, ly: float) -> tuple[float, float]:
         # Convert a footprint-local point (lx, ly) to board world coordinates.
         #
         # Variables:
@@ -344,15 +339,15 @@ def get_fp_courtyard_bbox(
         wy = fp_y - lx * sin_t + ly * cos_t
         return wx, wy
 
-    points: List[Tuple[float, float]] = []
+    points: list[tuple[float, float]] = []
 
-    def _collect_fp_item(sub: List[Any], require_courtyard: bool) -> None:
+    def _collect_fp_item(sub: list[Any], require_courtyard: bool) -> None:
         if not (isinstance(sub, list) and len(sub) > 0):
             return
         kind = _sym(sub[0])
         if kind not in _FP_GRAPHIC_TYPES:
             return
-        layer: Optional[str] = None
+        layer: str | None = None
         for ssub in sub:
             if isinstance(ssub, list) and len(ssub) >= 2 and _sym(ssub[0]) == "layer":
                 layer = ssub[1] if isinstance(ssub[1], str) else _sym(ssub[1])

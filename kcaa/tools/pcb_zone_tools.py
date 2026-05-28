@@ -13,12 +13,11 @@ All mutation tools create a ``.kicad_pcb.bak`` backup before writing.
 """
 
 import logging
-import re
+from typing import Any
 import uuid
-from typing import Any, List
 
-import sexpdata
 from fastmcp import Context, FastMCP
+import sexpdata
 
 from kcaa.utils.pcb_sexp_utils import load_pcb, save_pcb
 
@@ -37,7 +36,7 @@ def _sym(value: Any) -> str:
     return str(value)
 
 
-def _parse_zone(node: List[Any]) -> dict[str, Any]:
+def _parse_zone(node: list[Any]) -> dict[str, Any]:
     """Parse a ``(zone ...)`` S-expression node into a plain dict.
 
     Returns a dict with:
@@ -83,9 +82,7 @@ def _parse_zone(node: List[Any]) -> dict[str, Any]:
         elif key == "layer":
             result["layer"] = sub[1] if isinstance(sub[1], str) else _sym(sub[1])
         elif key == "layers":
-            result["layer"] = [
-                (s if isinstance(s, str) else _sym(s)) for s in sub[1:]
-            ]
+            result["layer"] = [(s if isinstance(s, str) else _sym(s)) for s in sub[1:]]
         elif key == "hatch":
             if len(sub) >= 2:
                 result["hatch_style"] = sub[1] if isinstance(sub[1], str) else _sym(sub[1])
@@ -117,7 +114,7 @@ def _parse_zone(node: List[Any]) -> dict[str, Any]:
     return result
 
 
-def _find_zones(data: List[Any]) -> List[tuple[int, dict[str, Any]]]:
+def _find_zones(data: list[Any]) -> list[tuple[int, dict[str, Any]]]:
     """Return ``(index, parsed_zone)`` for every top-level zone in *data*."""
     results = []
     for idx, item in enumerate(data):
@@ -126,7 +123,7 @@ def _find_zones(data: List[Any]) -> List[tuple[int, dict[str, Any]]]:
     return results
 
 
-def _get_layer_names(data: List[Any]) -> set[str]:
+def _get_layer_names(data: list[Any]) -> set[str]:
     """Return the set of declared board layer names."""
     for item in data:
         if isinstance(item, list) and len(item) >= 1 and _sym(item[0]) == "layers":
@@ -138,7 +135,7 @@ def _get_layer_names(data: List[Any]) -> set[str]:
     return set()
 
 
-def _find_net_by_name(data: List[Any], net_name: str) -> tuple[int | None, str] | None:
+def _find_net_by_name(data: list[Any], net_name: str) -> tuple[int | None, str] | None:
     """Return ``(net_id, canonical_name)`` for *net_name*, or None if absent."""
     for item in data:
         if isinstance(item, list) and len(item) >= 3 and _sym(item[0]) == "net":
@@ -174,10 +171,7 @@ def _build_xy_pts(points: list[dict[str, float]]) -> list[Any]:
     """Build a KiCad ``(pts (xy ...) ...)`` node from point dicts."""
     return [
         sexpdata.Symbol("pts"),
-        *[
-            [sexpdata.Symbol("xy"), float(point["x"]), float(point["y"])]
-            for point in points
-        ],
+        *[[sexpdata.Symbol("xy"), float(point["x"]), float(point["y"])] for point in points],
     ]
 
 
@@ -444,7 +438,11 @@ def register_pcb_zone_tools(mcp: FastMCP) -> None:
         try:
             backup_path = save_pcb(pcb_path, data)
         except OSError as exc:
-            return {"deleted": False, "zone_uuid": zone_uuid, "error": f"Failed to write PCB file: {exc}"}
+            return {
+                "deleted": False,
+                "zone_uuid": zone_uuid,
+                "error": f"Failed to write PCB file: {exc}",
+            }
 
         return {
             "deleted": True,
@@ -474,6 +472,7 @@ def register_pcb_zone_tools(mcp: FastMCP) -> None:
         """
         try:
             from kcaa.tools.kipy_tools import _connect  # noqa: PLC0415
+
             kicad = _connect(timeout_ms=35000)
             board = kicad.get_board()
             if board is None:

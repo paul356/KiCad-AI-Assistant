@@ -4,22 +4,37 @@ Low-level S-expression I/O for KiCad PCB files (.kicad_pcb).
 Only concerns: load, save, and backup.  No domain knowledge about
 footprints, nets, or layers lives here.
 """
+
 import os
 import re
 import shutil
-from typing import Any, List
+from typing import Any
 
 import sexpdata
 
 # Top-level PCB elements that should start on their own line for readability.
 _NEWLINE_ELEMENTS = [
-    "footprint", "net", "segment", "via", "zone", "gr_line", "gr_arc",
-    "gr_text", "gr_rect", "gr_circle", "gr_curve", "arc", "generated",
-    "embedded_fonts", "layers", "setup", "general",
+    "footprint",
+    "net",
+    "segment",
+    "via",
+    "zone",
+    "gr_line",
+    "gr_arc",
+    "gr_text",
+    "gr_rect",
+    "gr_circle",
+    "gr_curve",
+    "arc",
+    "generated",
+    "embedded_fonts",
+    "layers",
+    "setup",
+    "general",
 ]
 
 
-def load_pcb(path: str) -> List[Any]:
+def load_pcb(path: str) -> list[Any]:
     """Parse a .kicad_pcb file and return its S-expression tree.
 
     :param path: Absolute path to the .kicad_pcb file.
@@ -27,7 +42,7 @@ def load_pcb(path: str) -> List[Any]:
     :raises FileNotFoundError: If path does not exist.
     :raises ValueError: If the file cannot be parsed.
     """
-    with open(path, "r", encoding="utf-8") as fh:
+    with open(path, encoding="utf-8") as fh:
         raw = fh.read()
     try:
         return sexpdata.loads(raw)
@@ -35,7 +50,7 @@ def load_pcb(path: str) -> List[Any]:
         raise ValueError(f"Failed to parse PCB file '{path}': {exc}") from exc
 
 
-def save_pcb(path: str, data: List[Any]) -> str:
+def save_pcb(path: str, data: list[Any]) -> str:
     """Write *data* back to *path*, creating a .bak backup first.
 
     Uses an atomic write: serializes to a .tmp sibling file then
@@ -59,7 +74,7 @@ def save_pcb(path: str, data: List[Any]) -> str:
     return bak_path
 
 
-def _serialize(data: List[Any]) -> str:
+def _serialize(data: list[Any]) -> str:
     """Convert an S-expression tree to a KiCad-compatible string.
 
     Uses sexpdata.dumps for the base serialisation, then inserts newlines

@@ -19,16 +19,16 @@ serialised output stable.
 
 from __future__ import annotations
 
-import math
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Iterable
+import math
 
 import sexpdata
-
 
 # ---------------------------------------------------------------------------
 # Data type
 # ---------------------------------------------------------------------------
+
 
 @dataclass(frozen=True)
 class BBox:
@@ -60,12 +60,9 @@ class BBox:
 # Internals
 # ---------------------------------------------------------------------------
 
+
 def _is_node(x) -> bool:
-    return (
-        isinstance(x, list)
-        and len(x) >= 1
-        and isinstance(x[0], sexpdata.Symbol)
-    )
+    return isinstance(x, list) and len(x) >= 1 and isinstance(x[0], sexpdata.Symbol)
 
 
 def _tag(node: list) -> str:
@@ -235,10 +232,12 @@ def _walk_unit_geometry(unit_node: list) -> list[tuple[float, float]]:
             c = _find_xy(child, "center")
             r = _find_number(child, "radius")
             if c is not None and r is not None:
-                points.extend([
-                    (c[0] - r, c[1] - r),
-                    (c[0] + r, c[1] + r),
-                ])
+                points.extend(
+                    [
+                        (c[0] - r, c[1] - r),
+                        (c[0] + r, c[1] + r),
+                    ]
+                )
 
         elif tag == "pin":
             # (pin <type> <shape> (at x y angle) (length l) ...)
@@ -253,10 +252,12 @@ def _walk_unit_geometry(unit_node: list) -> list[tuple[float, float]]:
                 points.append((px, py))
                 if length is not None and length > 0:
                     rad = math.radians(angle_deg)
-                    points.append((
-                        px + length * math.cos(rad),
-                        py + length * math.sin(rad),
-                    ))
+                    points.append(
+                        (
+                            px + length * math.cos(rad),
+                            py + length * math.sin(rad),
+                        )
+                    )
 
     return points
 
@@ -264,6 +265,7 @@ def _walk_unit_geometry(unit_node: list) -> list[tuple[float, float]]:
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
 
 def compute_unit_bboxes(
     lib_sym_raw: list,
@@ -290,9 +292,7 @@ def compute_unit_bboxes(
         callers can always look up unit 1.
     """
     if not (
-        isinstance(lib_sym_raw, list)
-        and len(lib_sym_raw) >= 2
-        and isinstance(lib_sym_raw[1], str)
+        isinstance(lib_sym_raw, list) and len(lib_sym_raw) >= 2 and isinstance(lib_sym_raw[1], str)
     ):
         return {}
 
@@ -315,7 +315,7 @@ def compute_unit_bboxes(
         name = entry[1]
         if not name.startswith(prefix):
             continue
-        suffix = name[len(prefix):]
+        suffix = name[len(prefix) :]
         parts = suffix.split("_")
         if len(parts) < 2:
             continue

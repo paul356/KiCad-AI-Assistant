@@ -15,9 +15,9 @@ Fixture assumptions (tools_test.kicad_sch):
 
 import asyncio
 import os
+from pathlib import Path
 import shutil
 import tempfile
-from pathlib import Path
 
 import pytest
 import skip
@@ -26,16 +26,12 @@ import skip
 # Helpers
 # ---------------------------------------------------------------------------
 
-SCHEMATIC_PATH = str(
-    Path(__file__).parent / "fixtures" / "tools_test.kicad_sch"
-)
+SCHEMATIC_PATH = str(Path(__file__).parent / "fixtures" / "tools_test.kicad_sch")
 
 
 def _make_temp_copy() -> str:
     """Return path to a fresh temporary copy of tools_test.kicad_sch."""
-    tmp = tempfile.NamedTemporaryFile(
-        suffix=".kicad_sch", delete=False, dir=tempfile.gettempdir()
-    )
+    tmp = tempfile.NamedTemporaryFile(suffix=".kicad_sch", delete=False, dir=tempfile.gettempdir())
     tmp.close()
     shutil.copy(SCHEMATIC_PATH, tmp.name)
     return tmp.name
@@ -51,12 +47,14 @@ class _MockMCP:
         def decorator(fn):
             self.tools[fn.__name__] = fn
             return fn
+
         return decorator
 
 
 def _get_tools() -> dict:
     """Register component edit tools against a mock MCP and return the dict."""
     from kcaa.tools.component_edit_tools import register_component_edit_tools
+
     mock = _MockMCP()
     register_component_edit_tools(mock)
     return mock.tools
@@ -65,6 +63,7 @@ def _get_tools() -> dict:
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
 
 @pytest.fixture(scope="module")
 def tools():
@@ -85,16 +84,18 @@ def tmp_sch():
 # add_label_to_schematic
 # ---------------------------------------------------------------------------
 
-class TestAddLabelToSchematic:
 
+class TestAddLabelToSchematic:
     def _add(self, tools, schematic_path, text="NET_A", x=200.0, y=200.0, angle=0):
-        return asyncio.run(tools["add_label_to_schematic"](
-            schematic_path=schematic_path,
-            text=text,
-            x=x,
-            y=y,
-            angle=angle,
-        ))
+        return asyncio.run(
+            tools["add_label_to_schematic"](
+                schematic_path=schematic_path,
+                text=text,
+                x=x,
+                y=y,
+                angle=angle,
+            )
+        )
 
     def test_add_label_returns_success_and_correct_metadata(self, tools, tmp_sch):
         """Adding a valid label returns success=True with correct text/x/y/direction."""
@@ -141,30 +142,36 @@ class TestAddLabelToSchematic:
 # list_labels_in_schematic
 # ---------------------------------------------------------------------------
 
-class TestListLabelsInSchematic:
 
+class TestListLabelsInSchematic:
     def test_no_labels_returns_empty_list_and_zero_count(self, tools, tmp_sch):
         """A freshly-copied schematic with no labels returns success=True, count=0, labels=[]."""
-        result = asyncio.run(tools["list_labels_in_schematic"](
-            schematic_path=tmp_sch,
-        ))
+        result = asyncio.run(
+            tools["list_labels_in_schematic"](
+                schematic_path=tmp_sch,
+            )
+        )
         assert result.get("success") is True, result
         assert result["count"] == 0
         assert result["labels"] == []
 
     def test_added_label_appears_in_list_with_correct_fields(self, tools, tmp_sch):
         """After adding a label, list_labels_in_schematic reports it with the correct fields."""
-        asyncio.run(tools["add_label_to_schematic"](
-            schematic_path=tmp_sch,
-            text="SIGNAL_X",
-            x=201.0,
-            y=201.0,
-            angle=90,
-        ))
+        asyncio.run(
+            tools["add_label_to_schematic"](
+                schematic_path=tmp_sch,
+                text="SIGNAL_X",
+                x=201.0,
+                y=201.0,
+                angle=90,
+            )
+        )
 
-        result = asyncio.run(tools["list_labels_in_schematic"](
-            schematic_path=tmp_sch,
-        ))
+        result = asyncio.run(
+            tools["list_labels_in_schematic"](
+                schematic_path=tmp_sch,
+            )
+        )
         assert result.get("success") is True, result
         assert result["count"] >= 1
 
@@ -182,24 +189,28 @@ class TestListLabelsInSchematic:
 # delete_label_from_schematic
 # ---------------------------------------------------------------------------
 
-class TestDeleteLabelFromSchematic:
 
+class TestDeleteLabelFromSchematic:
     def _add(self, tools, sch_path, text="NET_DEL", x=210.0, y=210.0, angle=0):
-        return asyncio.run(tools["add_label_to_schematic"](
-            schematic_path=sch_path,
-            text=text,
-            x=x,
-            y=y,
-            angle=angle,
-        ))
+        return asyncio.run(
+            tools["add_label_to_schematic"](
+                schematic_path=sch_path,
+                text=text,
+                x=x,
+                y=y,
+                angle=angle,
+            )
+        )
 
     def _delete(self, tools, sch_path, x, y, **kwargs):
-        return asyncio.run(tools["delete_label_from_schematic"](
-            schematic_path=sch_path,
-            x=x,
-            y=y,
-            **kwargs,
-        ))
+        return asyncio.run(
+            tools["delete_label_from_schematic"](
+                schematic_path=sch_path,
+                x=x,
+                y=y,
+                **kwargs,
+            )
+        )
 
     def test_delete_by_position_succeeds_and_removes_label(self, tools, tmp_sch):
         """Deleting a label by its position returns success=True/deleted_count=1 and removes it."""
@@ -217,8 +228,7 @@ class TestDeleteLabelFromSchematic:
         except AttributeError:
             remaining = []
         still_present = any(
-            str(lbl.value) == "TO_DEL"
-            and abs(float(lbl.at.value[0]) - 210.0) < 0.01
+            str(lbl.value) == "TO_DEL" and abs(float(lbl.at.value[0]) - 210.0) < 0.01
             for lbl in remaining
         )
         assert not still_present, "Deleted label 'TO_DEL' still present in schematic"
@@ -243,8 +253,7 @@ class TestDeleteLabelFromSchematic:
         # Original label must still be present
         sch2 = skip.Schematic(tmp_sch)
         found = any(
-            str(lbl.value) == "KEEP_ME"
-            and abs(float(lbl.at.value[0]) - 212.0) < 0.01
+            str(lbl.value) == "KEEP_ME" and abs(float(lbl.at.value[0]) - 212.0) < 0.01
             for lbl in sch2.label
         )
         assert found, "Label 'KEEP_ME' should not have been deleted"
@@ -259,29 +268,33 @@ class TestDeleteLabelFromSchematic:
 # delete_label_from_schematic – batch mode (positions=[...])
 # ---------------------------------------------------------------------------
 
-class TestDeleteLabelBatchMode:
 
+class TestDeleteLabelBatchMode:
     def _add(self, tools, sch_path, text, x, y, angle=0):
-        return asyncio.run(tools["add_label_to_schematic"](
-            schematic_path=sch_path,
-            text=text,
-            x=x,
-            y=y,
-            angle=angle,
-        ))
+        return asyncio.run(
+            tools["add_label_to_schematic"](
+                schematic_path=sch_path,
+                text=text,
+                x=x,
+                y=y,
+                angle=angle,
+            )
+        )
 
     def test_batch_delete_two_labels(self, tools, tmp_sch):
         """Passing positions=[...] deletes all matching labels in one call."""
         self._add(tools, tmp_sch, text="B_NET1", x=220.0, y=220.0)
         self._add(tools, tmp_sch, text="B_NET2", x=221.0, y=221.0)
 
-        result = asyncio.run(tools["delete_label_from_schematic"](
-            schematic_path=tmp_sch,
-            positions=[
-                {"x": 220.0, "y": 220.0},
-                {"x": 221.0, "y": 221.0},
-            ],
-        ))
+        result = asyncio.run(
+            tools["delete_label_from_schematic"](
+                schematic_path=tmp_sch,
+                positions=[
+                    {"x": 220.0, "y": 220.0},
+                    {"x": 221.0, "y": 221.0},
+                ],
+            )
+        )
         assert result.get("success") is True, result
         assert result["total_deleted"] == 2
         assert len(result["results"]) == 2
@@ -299,10 +312,12 @@ class TestDeleteLabelBatchMode:
         """Batch entry with text= only deletes labels whose text matches."""
         self._add(tools, tmp_sch, text="CORRECT", x=222.0, y=222.0)
 
-        result = asyncio.run(tools["delete_label_from_schematic"](
-            schematic_path=tmp_sch,
-            positions=[{"x": 222.0, "y": 222.0, "text": "CORRECT"}],
-        ))
+        result = asyncio.run(
+            tools["delete_label_from_schematic"](
+                schematic_path=tmp_sch,
+                positions=[{"x": 222.0, "y": 222.0, "text": "CORRECT"}],
+            )
+        )
         assert result.get("success") is True, result
         assert result["total_deleted"] == 1
 
@@ -310,13 +325,15 @@ class TestDeleteLabelBatchMode:
         """When some positions match and some don't, results are reported per entry."""
         self._add(tools, tmp_sch, text="EXIST", x=223.0, y=223.0)
 
-        result = asyncio.run(tools["delete_label_from_schematic"](
-            schematic_path=tmp_sch,
-            positions=[
-                {"x": 223.0, "y": 223.0},   # exists
-                {"x": 998.0, "y": 998.0},   # does not exist
-            ],
-        ))
+        result = asyncio.run(
+            tools["delete_label_from_schematic"](
+                schematic_path=tmp_sch,
+                positions=[
+                    {"x": 223.0, "y": 223.0},  # exists
+                    {"x": 998.0, "y": 998.0},  # does not exist
+                ],
+            )
+        )
         assert result.get("success") is True, result
         assert result["total_deleted"] == 1
         ok_entry = next(r for r in result["results"] if r.get("deleted_count"))
@@ -326,21 +343,25 @@ class TestDeleteLabelBatchMode:
 
     def test_batch_all_not_found_returns_success_false(self, tools, tmp_sch):
         """When no positions match at all, success should be False."""
-        result = asyncio.run(tools["delete_label_from_schematic"](
-            schematic_path=tmp_sch,
-            positions=[
-                {"x": 991.0, "y": 991.0},
-                {"x": 992.0, "y": 992.0},
-            ],
-        ))
+        result = asyncio.run(
+            tools["delete_label_from_schematic"](
+                schematic_path=tmp_sch,
+                positions=[
+                    {"x": 991.0, "y": 991.0},
+                    {"x": 992.0, "y": 992.0},
+                ],
+            )
+        )
         assert result.get("success") is False, result
         assert result["total_deleted"] == 0
         assert all("error" in r for r in result["results"])
 
     def test_batch_empty_positions_returns_error(self, tools, tmp_sch):
         """An empty positions list should return an error immediately."""
-        result = asyncio.run(tools["delete_label_from_schematic"](
-            schematic_path=tmp_sch,
-            positions=[],
-        ))
+        result = asyncio.run(
+            tools["delete_label_from_schematic"](
+                schematic_path=tmp_sch,
+                positions=[],
+            )
+        )
         assert "error" in result

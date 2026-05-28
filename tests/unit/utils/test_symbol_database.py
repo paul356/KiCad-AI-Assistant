@@ -6,7 +6,6 @@ import pytest
 
 from kcaa.utils.symbol_database import SymbolDatabase, SymbolRecord
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -92,10 +91,13 @@ class TestSaveLibrary:
         assert "/tmp/lib.kicad_sym" in states
 
     def test_multiple_symbols_stored(self, db):
-        syms = _make_symbols("Dev", [
-            ("R", "Resistor", "R resistor", 2),
-            ("C", "Capacitor", "C capacitor", 2),
-        ])
+        syms = _make_symbols(
+            "Dev",
+            [
+                ("R", "Resistor", "R resistor", 2),
+                ("C", "Capacitor", "C capacitor", 2),
+            ],
+        )
         db.save_library("Dev", "/tmp/dev.kicad_sym", 1.0, 100, "", syms)
         stored = db.get_library_symbols("Dev")
         assert len(stored) == 2
@@ -122,11 +124,19 @@ class TestSaveLibrary:
 
     def test_two_libraries_independent(self, db):
         db.save_library(
-            "DevLib", "/tmp/dev.kicad_sym", 1.0, 100, "",
+            "DevLib",
+            "/tmp/dev.kicad_sym",
+            1.0,
+            100,
+            "",
             _make_symbols("DevLib", [("R", "Resistor", "", 2)]),
         )
         db.save_library(
-            "PwrLib", "/tmp/pwr.kicad_sym", 1.0, 100, "",
+            "PwrLib",
+            "/tmp/pwr.kicad_sym",
+            1.0,
+            100,
+            "",
             _make_symbols("PwrLib", [("VCC", "VCC", "", 1)]),
         )
         stats = db.get_stats()
@@ -189,18 +199,32 @@ class TestLookup:
     def _populate(self, db):
         self.db = db
         db.save_library(
-            "Dev", "/tmp/dev.kicad_sym", 1.0, 100, "",
-            _make_symbols("Dev", [
-                ("R", "Resistor", "R resistor passive", 2),
-                ("C", "Capacitor", "C capacitor passive", 2),
-            ]),
+            "Dev",
+            "/tmp/dev.kicad_sym",
+            1.0,
+            100,
+            "",
+            _make_symbols(
+                "Dev",
+                [
+                    ("R", "Resistor", "R resistor passive", 2),
+                    ("C", "Capacitor", "C capacitor passive", 2),
+                ],
+            ),
         )
         db.save_library(
-            "Pwr", "/tmp/pwr.kicad_sym", 1.0, 100, "",
-            _make_symbols("Pwr", [
-                ("VCC", "Power supply positive", "power VCC supply", 1),
-                ("GND", "Power supply ground", "power GND ground", 1),
-            ]),
+            "Pwr",
+            "/tmp/pwr.kicad_sym",
+            1.0,
+            100,
+            "",
+            _make_symbols(
+                "Pwr",
+                [
+                    ("VCC", "Power supply positive", "power VCC supply", 1),
+                    ("GND", "Power supply ground", "power GND ground", 1),
+                ],
+            ),
         )
 
     def test_get_symbol_found(self):
@@ -256,12 +280,19 @@ class TestSearchByName:
     def _populate(self, db):
         self.db = db
         db.save_library(
-            "Dev", "/tmp/dev.kicad_sym", 1.0, 100, "",
-            _make_symbols("Dev", [
-                ("R", "Resistor", "R resistor", 2),
-                ("C", "Capacitor", "C capacitor", 2),
-                ("VCC", "Power positive", "power VCC", 1),
-            ]),
+            "Dev",
+            "/tmp/dev.kicad_sym",
+            1.0,
+            100,
+            "",
+            _make_symbols(
+                "Dev",
+                [
+                    ("R", "Resistor", "R resistor", 2),
+                    ("C", "Capacitor", "C capacitor", 2),
+                    ("VCC", "Power positive", "power VCC", 1),
+                ],
+            ),
         )
 
     def test_substring_match(self):
@@ -288,11 +319,18 @@ class TestFTSSearch:
     def _populate(self, db):
         self.db = db
         db.save_library(
-            "Dev", "/tmp/dev.kicad_sym", 1.0, 100, "",
-            _make_symbols("Dev", [
-                ("R", "Resistor", "R resistor passive", 2),
-                ("C", "Capacitor", "C capacitor passive", 2),
-            ]),
+            "Dev",
+            "/tmp/dev.kicad_sym",
+            1.0,
+            100,
+            "",
+            _make_symbols(
+                "Dev",
+                [
+                    ("R", "Resistor", "R resistor passive", 2),
+                    ("C", "Capacitor", "C capacitor passive", 2),
+                ],
+            ),
         )
 
     def test_search_by_description_word(self):

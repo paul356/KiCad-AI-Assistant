@@ -1,16 +1,17 @@
 """
 DRC prompt templates for KiCad PCB design.
 """
+
 from fastmcp import FastMCP
 
 
 def register_drc_prompts(mcp: FastMCP) -> None:
     """Register DRC prompt templates with the MCP server.
-    
+
     Args:
         mcp: The FastMCP server instance
     """
-    
+
     @mcp.prompt()
     def fix_drc_violations() -> str:
         """Prompt for assistance with fixing DRC violations."""

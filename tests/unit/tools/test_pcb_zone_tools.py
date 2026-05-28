@@ -7,20 +7,18 @@ contains:
   - zone0002…002  keepout    on F.Cu   (no net)
   - zone0003…003  copper_pour on B.Cu  (net VCC)
 """
+
 import asyncio
 import os
 import re
 import shutil
+
 import pytest
 
-from kcaa.utils.pcb_sexp_utils import load_pcb
-
-FIXTURE_PCB = os.path.join(
-    os.path.dirname(__file__), "fixtures", "test_board_with_zones.kicad_pcb"
-)
+FIXTURE_PCB = os.path.join(os.path.dirname(__file__), "fixtures", "test_board_with_zones.kicad_pcb")
 
 UUID_COPPER_GND = "zone0001-0000-0000-0000-000000000001"
-UUID_KEEPOUT    = "zone0002-0000-0000-0000-000000000002"
+UUID_KEEPOUT = "zone0002-0000-0000-0000-000000000002"
 UUID_COPPER_VCC = "zone0003-0000-0000-0000-000000000003"
 
 
@@ -37,11 +35,13 @@ class _MockMCP:
         def decorator(fn):
             self.tools[fn.__name__] = fn
             return fn
+
         return decorator
 
 
 def _get_tools() -> dict:
     from kcaa.tools.pcb_zone_tools import register_pcb_zone_tools
+
     mock = _MockMCP()
     register_pcb_zone_tools(mock)
     return mock.tools
@@ -309,7 +309,7 @@ class TestAddZone:
 class TestDeleteZone:
     def setup_method(self):
         self.tools = _get_tools()
-        self.list_zones  = self.tools["list_zones"]
+        self.list_zones = self.tools["list_zones"]
         self.delete_zone = self.tools["delete_zone"]
 
     def test_delete_copper_pour(self, tmp_pcb):

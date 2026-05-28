@@ -5,45 +5,47 @@ Provides read-only tools to inspect a .kicad_pcb file: board metadata,
 footprint list, individual footprint detail, footprint/board bounding
 boxes, net list, and ratsnest (unconnected pad pairs).
 """
+
+from collections import defaultdict
+import contextlib
 import logging
 import math
 import re
-from collections import defaultdict
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
-import sexpdata
 from fastmcp import Context, FastMCP
+import sexpdata
 
-from kcaa.utils.pcb_sexp_utils import load_pcb
-from kcaa.utils.pcb_board_utils import get_fp_courtyard_bbox
-from kcaa.utils.pcb_footprint_utils import (
-    find_footprint,
-    get_fp_at,
-    get_fp_layer,
-    get_fp_property,
-    _sym,
-)
 from kcaa.tools.pcb_placement_helpers import (
+    _TIER_NAMES,
     _classify_footprint,
     _compute_hpwl,
     _get_all_footprint_bboxes,
     _get_board_bounds_or_fallback,
     _get_fp_pads_world,
-    _TIER_NAMES,
 )
+from kcaa.utils.pcb_board_utils import get_fp_courtyard_bbox
+from kcaa.utils.pcb_footprint_utils import (
+    _sym,
+    find_footprint,
+    get_fp_at,
+    get_fp_layer,
+    get_fp_property,
+)
+from kcaa.utils.pcb_sexp_utils import load_pcb
 
 log = logging.getLogger(__name__)
 
 
-def _collect_top_level_nets(data: List[Any]) -> tuple[Dict[int, str], Dict[str, int]]:
+def _collect_top_level_nets(data: list[Any]) -> tuple[dict[int, str], dict[str, int]]:
     """Return board net lookup tables from top-level ``(net ...)`` entries.
-    
+
     Supports both KiCad 8 format ``(net <id> "<name>")`` and KiCad 10 format
     ``(net "<name>")``. For KiCad 10, net IDs are assigned sequentially starting
     from 1 (ID 0 is reserved for unconnected).
     """
-    net_id_to_name: Dict[int, str] = {}
-    net_name_to_id: Dict[str, int] = {}
+    net_id_to_name: dict[int, str] = {}
+    net_name_to_id: dict[str, int] = {}
     next_id = 1
     for item in data:
         if not (isinstance(item, list) and len(item) >= 2 and _sym(item[0]) == "net"):
@@ -72,11 +74,11 @@ def _collect_top_level_nets(data: List[Any]) -> tuple[Dict[int, str], Dict[str, 
 
 def _parse_net_ref(
     net_node: list[Any],
-    net_name_to_id: Dict[str, int],
-    net_id_to_name: Dict[int, str],
+    net_name_to_id: dict[str, int],
+    net_id_to_name: dict[int, str],
 ) -> tuple[int | None, str]:
     """Parse a KiCad net reference in either legacy or name-only form.
-    
+
     Supports:
     - KiCad 8: ``(net <id> "<name>")``
     - KiCad 10: ``(net "<name>")``
@@ -99,7 +101,7 @@ def _parse_net_ref(
     return None, ""
 
 
-def _net_sort_key(net: Dict[str, Any]) -> tuple[int, Any, str]:
+def _net_sort_key(net: dict[str, Any]) -> tuple[int, Any, str]:
     """Sort nets by known numeric id first, then by name."""
     net_id = net.get("net_id")
     name = str(net.get("name", ""))
@@ -110,7 +112,7 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
     """Register PCB board read/query tools with the MCP server."""
 
     @mcp.tool()
-    async def get_board_info(pcb_path: str, ctx: Context | None) -> Dict[str, Any]:
+    async def get_board_info(pcb_path: str, ctx: Context | None) -> dict[str, Any]:
         """Get general information about a KiCad PCB board.
 
         Args:
@@ -125,7 +127,7 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
         data = load_pcb(pcb_path)
 
         thickness = None
-        layers: List[Dict] = []
+        layers: list[dict] = []
         footprint_count = 0
         net_count = 0
         segment_count = 0
@@ -145,11 +147,13 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
             elif key == "layers":
                 for sub in item[1:]:
                     if isinstance(sub, list) and len(sub) >= 3:
-                        layers.append({
-                            "id": int(sub[0]) if isinstance(sub[0], int) else sub[0],
-                            "name": sub[1] if isinstance(sub[1], str) else _sym(sub[1]),
-                            "type": sub[2] if isinstance(sub[2], str) else _sym(sub[2]),
-                        })
+                        layers.append(
+                            {
+                                "id": int(sub[0]) if isinstance(sub[0], int) else sub[0],
+                                "name": sub[1] if isinstance(sub[1], str) else _sym(sub[1]),
+                                "type": sub[2] if isinstance(sub[2], str) else _sym(sub[2]),
+                            }
+                        )
             elif key == "footprint":
                 footprint_count += 1
                 for sub in item[1:]:
@@ -190,7 +194,7 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
         }
 
     @mcp.tool()
-    async def list_footprints(pcb_path: str, ctx: Context | None) -> Dict[str, Any]:
+    async def list_footprints(pcb_path: str, ctx: Context | None) -> dict[str, Any]:
         """List all footprints placed on a KiCad PCB board.
 
         PCB coordinate convention (used by every PCB tool): millimetres,
@@ -217,14 +221,16 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
             value = get_fp_property(item, "Value") or ""
             x, y, rot = get_fp_at(item)
             layer = get_fp_layer(item) or ""
-            footprints.append({
-                "reference": ref,
-                "value": value,
-                "x": x,
-                "y": y,
-                "rotation": rot,
-                "layer": layer,
-            })
+            footprints.append(
+                {
+                    "reference": ref,
+                    "value": value,
+                    "x": x,
+                    "y": y,
+                    "rotation": rot,
+                    "layer": layer,
+                }
+            )
 
         return {"footprints": footprints, "count": len(footprints)}
 
@@ -233,7 +239,7 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
         pcb_path: str,
         reference: str,
         ctx: Context | None,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Get detailed information about a specific footprint on the board.
 
         Coordinates are mm, +Y down, rotation in degrees clockwise-positive
@@ -270,7 +276,7 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
         layer = get_fp_layer(fp) or ""
 
         # Collect all properties
-        props: Dict[str, str] = {}
+        props: dict[str, str] = {}
         for sub in fp:
             if isinstance(sub, list) and len(sub) >= 3 and _sym(sub[0]) == "property":
                 name = sub[1] if isinstance(sub[1], str) else _sym(sub[1])
@@ -292,14 +298,16 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
                     pad_x, pad_y = float(psub[1]), float(psub[2])
                 elif isinstance(psub, list) and len(psub) >= 2 and _sym(psub[0]) == "net":
                     _, net_name = _parse_net_ref(psub, {}, {})
-            pads.append({
-                "number": str(pad_num),
-                "type": str(pad_type),
-                "shape": str(pad_shape),
-                "local_x": pad_x,
-                "local_y": pad_y,
-                "net_name": net_name,
-            })
+            pads.append(
+                {
+                    "number": str(pad_num),
+                    "type": str(pad_type),
+                    "shape": str(pad_shape),
+                    "local_x": pad_x,
+                    "local_y": pad_y,
+                    "net_name": net_name,
+                }
+            )
 
         return {
             "reference": reference,
@@ -447,7 +455,7 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
         }
 
     @mcp.tool()
-    async def list_nets(pcb_path: str, ctx: Context | None) -> Dict[str, Any]:
+    async def list_nets(pcb_path: str, ctx: Context | None) -> dict[str, Any]:
         """List all nets in a KiCad PCB board.
 
         Args:
@@ -460,7 +468,7 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
         data = load_pcb(pcb_path)
 
         net_id_to_name, net_name_to_id = _collect_top_level_nets(data)
-        nets_by_name: Dict[str, Dict[str, Any]] = {}
+        nets_by_name: dict[str, dict[str, Any]] = {}
         for net_id, net_name in net_id_to_name.items():
             if net_id == 0 or not net_name:
                 continue
@@ -491,7 +499,7 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
         return {"nets": nets, "count": len(nets)}
 
     @mcp.tool()
-    async def get_ratsnest(pcb_path: str, ctx: Context | None) -> Dict[str, Any]:
+    async def get_ratsnest(pcb_path: str, ctx: Context | None) -> dict[str, Any]:
         """Get unconnected pad pairs (ratsnest) for a KiCad PCB board.
 
         Identifies pads that share a net but are not yet connected by
@@ -524,7 +532,8 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
         # Collect all pads grouped by net key with correct world coordinates.
         # (apply footprint rotation using KiCad's clockwise-positive convention)
         import math
-        pads_by_net: Dict[str, List[Tuple]] = defaultdict(list)
+
+        pads_by_net: dict[str, list[tuple]] = defaultdict(list)
         for item in data:
             if not (isinstance(item, list) and len(item) > 0 and _sym(item[0]) == "footprint"):
                 continue
@@ -541,10 +550,8 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
                 net_key = ""
                 for psub in sub:
                     if isinstance(psub, list) and len(psub) >= 3 and _sym(psub[0]) == "at":
-                        try:
+                        with contextlib.suppress(ValueError, TypeError):
                             rel_x, rel_y = float(psub[1]), float(psub[2])
-                        except (ValueError, TypeError):
-                            pass
                     elif isinstance(psub, list) and len(psub) >= 2 and _sym(psub[0]) == "net":
                         net_id, net_name = _parse_net_ref(psub, net_name_to_id, net_id_to_name)
                         if net_id == 0 and not net_name:
@@ -574,7 +581,9 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
                 seg_net_key = ""
                 for sub in item:
                     if isinstance(sub, list) and len(sub) >= 2 and _sym(sub[0]) == "net":
-                        seg_net_id, seg_net_name = _parse_net_ref(sub, net_name_to_id, net_id_to_name)
+                        seg_net_id, seg_net_name = _parse_net_ref(
+                            sub, net_name_to_id, net_id_to_name
+                        )
                         if seg_net_id == 0 and not seg_net_name:
                             seg_net_key = ""
                         else:
@@ -582,13 +591,15 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
                                 str(seg_net_id) if seg_net_id is not None else ""
                             )
                 for sub in item:
-                    if isinstance(sub, list) and len(sub) >= 3 and _sym(sub[0]) in ("start", "end", "at"):
-                        try:
+                    if (
+                        isinstance(sub, list)
+                        and len(sub) >= 3
+                        and _sym(sub[0]) in ("start", "end", "at")
+                    ):
+                        with contextlib.suppress(ValueError, TypeError):
                             track_endpoints.add(
                                 (seg_net_key, _rounded(float(sub[1])), _rounded(float(sub[2])))
                             )
-                        except (ValueError, TypeError):
-                            pass
 
         # For each net with ≥2 pads, report ALL pairs where neither pad
         # has a track endpoint at its position (simple heuristic)
@@ -606,11 +617,13 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
             for i in range(len(disconnected)):
                 for j in range(i + 1, len(disconnected)):
                     a, b = disconnected[i], disconnected[j]
-                    unconnected.append({
-                        "net": net_name,
-                        "from": {"ref": a[0], "pad": a[1], "x": a[2], "y": a[3]},
-                        "to": {"ref": b[0], "pad": b[1], "x": b[2], "y": b[3]},
-                    })
+                    unconnected.append(
+                        {
+                            "net": net_name,
+                            "from": {"ref": a[0], "pad": a[1], "x": a[2], "y": a[3]},
+                            "to": {"ref": b[0], "pad": b[1], "x": b[2], "y": b[3]},
+                        }
+                    )
 
         return {
             "unconnected": unconnected,
@@ -622,7 +635,7 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
     async def score_placement(
         pcb_path: str,
         ctx: Context | None = None,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Score the current PCB component placement quality.
 
         Computes three metrics from the existing pad positions — no routing
@@ -654,9 +667,9 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
         hpwl = _compute_hpwl(data)
 
         # Per-net HPWL contributions (for worst_contributors)
-        net_pads: Dict[str, List[Tuple[str, float, float]]] = defaultdict(list)
-        fp_position: Dict[str, Tuple[float, float]] = {}
-        fp_pad_count: Dict[str, int] = defaultdict(int)
+        net_pads: dict[str, list[tuple[str, float, float]]] = defaultdict(list)
+        fp_position: dict[str, tuple[float, float]] = {}
+        fp_pad_count: dict[str, int] = defaultdict(int)
 
         for item in data:
             if not (isinstance(item, list) and len(item) > 0 and _sym(item[0]) == "footprint"):
@@ -670,7 +683,7 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
                     fp_pad_count[ref] += 1
 
         # Per-net HPWL
-        net_hpwl: Dict[str, float] = {}
+        net_hpwl: dict[str, float] = {}
         for net_name, pads in net_pads.items():
             if len(pads) < 2:
                 continue
@@ -679,7 +692,7 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
             net_hpwl[net_name] = (max(xs) - min(xs)) + (max(ys) - min(ys))
 
         # Per-footprint displacement: distance from component to its net centroids
-        fp_displacement: Dict[str, float] = {}
+        fp_displacement: dict[str, float] = {}
         for ref, (fx, fy) in fp_position.items():
             connected_nets = [n for n, pads in net_pads.items() if any(p[0] == ref for p in pads)]
             if not connected_nets:
@@ -694,14 +707,13 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
 
         worst = sorted(fp_displacement.items(), key=lambda kv: kv[1], reverse=True)[:5]
         worst_contributors = [
-            {"reference": ref, "avg_displacement_mm": round(dist, 2)}
-            for ref, dist in worst
+            {"reference": ref, "avg_displacement_mm": round(dist, 2)} for ref, dist in worst
         ]
 
         # --- Congestion grid (5 mm cells) ----------------------------------------
         GRID = 5.0
         bounds = _get_board_bounds_or_fallback(data)
-        cell_counts: Dict[Tuple[int, int], int] = defaultdict(int)
+        cell_counts: dict[tuple[int, int], int] = defaultdict(int)
 
         for fp_bbox in _get_all_footprint_bboxes(data):
             cx = (fp_bbox["min_x"] + fp_bbox["max_x"]) / 2
@@ -734,15 +746,15 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
         _GROUND_NET_RE = re.compile(r"VSS|VEE|GND|AGND|DGND|PGND", re.IGNORECASE)
 
         # Collect IC power pads: U/IC prefix, on a power net
-        ic_power_pads: List[Tuple[str, str, float, float]] = []  # (ref, net, x, y)
-        decap_positions: List[Tuple[str, float, float]] = []     # (net, x, y)
+        ic_power_pads: list[tuple[str, str, float, float]] = []  # (ref, net, x, y)
+        decap_positions: list[tuple[str, float, float]] = []  # (net, x, y)
 
         for item in data:
             if not (isinstance(item, list) and len(item) > 0 and _sym(item[0]) == "footprint"):
                 continue
             ref = get_fp_property(item, "Reference") or ""
             m = re.match(r"[A-Za-z]+", ref)
-            prefix = (m.group(0).upper() if m else "")
+            prefix = m.group(0).upper() if m else ""
             pads = _get_fp_pads_world(item)
             pad_count = len(pads)
 
@@ -756,13 +768,15 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
                 # to IC GND pins is irrelevant).  break after the first supply
                 # pad because a decap typically has exactly one supply net.
                 for pad in pads:
-                    if (pad["net"]
-                            and _POWER_NET_RE.search(pad["net"])
-                            and not _GROUND_NET_RE.search(pad["net"])):
+                    if (
+                        pad["net"]
+                        and _POWER_NET_RE.search(pad["net"])
+                        and not _GROUND_NET_RE.search(pad["net"])
+                    ):
                         decap_positions.append((pad["net"], pad["x"], pad["y"]))
                         break
 
-        decap_proximity_mm: Optional[float] = None
+        decap_proximity_mm: float | None = None
         if decap_positions and ic_power_pads:
             distances = []
             for cap_net, cap_x, cap_y in decap_positions:
@@ -789,7 +803,7 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
     async def suggest_placement_order(
         pcb_path: str,
         ctx: Context | None = None,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Return footprints sorted by recommended placement order.
 
         Classifies each footprint into one of four priority tiers and returns
@@ -823,24 +837,27 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
 
             # count pads
             pad_count = sum(
-                1 for sub in item
+                1
+                for sub in item
                 if isinstance(sub, list) and len(sub) >= 4 and _sym(sub[0]) == "pad"
             )
             tier = _classify_footprint(ref, pad_count, value)
-            ordered.append({
-                "reference": ref,
-                "value": value,
-                "x": x,
-                "y": y,
-                "layer": layer,
-                "pad_count": pad_count,
-                "tier": tier,
-                "tier_name": _TIER_NAMES.get(tier, "unknown"),
-            })
+            ordered.append(
+                {
+                    "reference": ref,
+                    "value": value,
+                    "x": x,
+                    "y": y,
+                    "layer": layer,
+                    "pad_count": pad_count,
+                    "tier": tier,
+                    "tier_name": _TIER_NAMES.get(tier, "unknown"),
+                }
+            )
 
         ordered.sort(key=lambda fp: (fp["tier"], fp["reference"]))
 
-        tier_counts: Dict[str, int] = defaultdict(int)
+        tier_counts: dict[str, int] = defaultdict(int)
         for fp in ordered:
             tier_counts[fp["tier_name"]] += 1
 

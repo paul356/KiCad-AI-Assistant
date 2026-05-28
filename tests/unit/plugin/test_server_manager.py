@@ -1,11 +1,9 @@
 """Tests for ServerManager: port selection, env building, health check."""
+
 import socket
 import subprocess
-import sys
 import types
 from unittest.mock import MagicMock, patch
-
-import pytest
 
 from kicad_plugin.server_manager import (
     ServerManager,
@@ -155,8 +153,10 @@ class TestServerManager:
 
     def test_start_uses_fixed_port_from_settings(self):
         mgr = self._make_manager(port=19999)
-        with patch.object(mgr, "_wait_for_ready", return_value=True), \
-             patch("subprocess.Popen") as mock_popen:
+        with (
+            patch.object(mgr, "_wait_for_ready", return_value=True),
+            patch("subprocess.Popen") as mock_popen,
+        ):
             proc = MagicMock()
             proc.poll.return_value = None
             mock_popen.return_value = proc
@@ -166,9 +166,11 @@ class TestServerManager:
 
     def test_start_auto_selects_port_when_zero(self):
         mgr = self._make_manager(port=0)
-        with patch.object(mgr, "_wait_for_ready", return_value=True), \
-             patch("subprocess.Popen") as mock_popen, \
-             patch("kicad_plugin.server_manager._find_free_port", return_value=54321):
+        with (
+            patch.object(mgr, "_wait_for_ready", return_value=True),
+            patch("subprocess.Popen") as mock_popen,
+            patch("kicad_plugin.server_manager._find_free_port", return_value=54321),
+        ):
             proc = MagicMock()
             proc.poll.return_value = None
             mock_popen.return_value = proc
@@ -185,8 +187,10 @@ class TestServerManager:
 
     def test_start_returns_false_on_timeout(self):
         mgr = self._make_manager()
-        with patch("subprocess.Popen") as mock_popen, \
-             patch.object(mgr, "_wait_for_ready", return_value=False):
+        with (
+            patch("subprocess.Popen") as mock_popen,
+            patch.object(mgr, "_wait_for_ready", return_value=False),
+        ):
             proc = MagicMock()
             proc.poll.return_value = None
             mock_popen.return_value = proc
@@ -208,4 +212,3 @@ class TestServerManager:
         mgr._process = mock_proc
         mgr._port = 9999
         assert mgr.check() is True
-

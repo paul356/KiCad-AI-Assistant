@@ -15,6 +15,7 @@ Enhancements tested:
 
 KiCad 8.x net format: ``(net "name")`` — no integer IDs in pad net nodes.
 """
+
 import asyncio
 import math
 import os
@@ -22,19 +23,19 @@ import shutil
 
 import pytest
 
-from kcaa.utils.pcb_sexp_utils import load_pcb
-from kcaa.utils.pcb_footprint_utils import find_footprint, get_fp_at
-from kcaa.utils.pcb_board_utils import get_fp_courtyard_bbox
+from kcaa.tools.pcb_group_tools import _grid_layout, _rotate_layout
 from kcaa.tools.pcb_placement_helpers import (
-    _get_fp_local_pads,
-    _get_fp_pads_world,
+    _GRID_MM,
+    _bboxes_overlap,
     _compute_layout_hpwl,
     _find_group_board_position,
-    _bboxes_overlap,
     _get_board_bounds_or_fallback,
-    _GRID_MM,
+    _get_fp_local_pads,
+    _get_fp_pads_world,
 )
-from kcaa.tools.pcb_group_tools import _grid_layout, _rotate_layout
+from kcaa.utils.pcb_board_utils import get_fp_courtyard_bbox
+from kcaa.utils.pcb_footprint_utils import find_footprint, get_fp_at
+from kcaa.utils.pcb_sexp_utils import load_pcb
 
 FIXTURE_PCB = os.path.join(os.path.dirname(__file__), "fixtures", "test_group_placement.kicad_pcb")
 
@@ -53,11 +54,13 @@ class _MockMCP:
         def decorator(fn):
             self.tools[fn.__name__] = fn
             return fn
+
         return decorator
 
 
 def _get_tools() -> dict:
     from kcaa.tools.pcb_group_tools import register_pcb_group_tools
+
     mock = _MockMCP()
     register_pcb_group_tools(mock)
     return mock.tools
@@ -132,8 +135,8 @@ class TestGetFpLocalPads:
         world = _get_fp_pads_world(fp_cache["R1"])
         local_xs = {abs(round(p["lx"], 1)) for p in local}
         world_xs = {round(abs(p["x"]), 0) for p in world}
-        assert local_xs == {0.8}           # ±0.825 → abs rounds to 0.8
-        assert all(x > 10.0 for x in world_xs)   # world X is ~105–108 mm
+        assert local_xs == {0.8}  # ±0.825 → abs rounds to 0.8
+        assert all(x > 10.0 for x in world_xs)  # world X is ~105–108 mm
 
     def test_d1_pads_have_expected_nets(self, fp_cache):
         """D1 pad 1 → /VCC_SYS, pad 2 → Net-(D1-A)."""
@@ -175,10 +178,10 @@ class TestComputeLayoutHpwl:
         """Shifting the entire layout by (100, 200) does not change HPWL."""
         cache = {r: fp_cache[r] for r in ("J3", "R1", "C1", "D1")}
         base = [
-            {"ref": "J3", "dx": 0.0,   "dy": 0.0,  "rotation": -90.0},
-            {"ref": "R1", "dx": 10.0,  "dy": 0.0,  "rotation": 0.0},
-            {"ref": "C1", "dx": -10.0, "dy": 0.0,  "rotation": 0.0},
-            {"ref": "D1", "dx": 0.0,   "dy": 10.0, "rotation": 0.0},
+            {"ref": "J3", "dx": 0.0, "dy": 0.0, "rotation": -90.0},
+            {"ref": "R1", "dx": 10.0, "dy": 0.0, "rotation": 0.0},
+            {"ref": "C1", "dx": -10.0, "dy": 0.0, "rotation": 0.0},
+            {"ref": "D1", "dx": 0.0, "dy": 10.0, "rotation": 0.0},
         ]
         shifted = [{**p, "dx": p["dx"] + 100.0, "dy": p["dy"] + 200.0} for p in base]
         h1 = _compute_layout_hpwl(cache, base)
@@ -296,9 +299,7 @@ class TestFindGroupBoardPositionPreferNear:
         full_layout = self._make_full_layout(pcb_data)
         target = (150.0, 100.0)
 
-        ax_default, ay_default, _, _ = _find_group_board_position(
-            pcb_data, group_refs, full_layout
-        )
+        ax_default, ay_default, _, _ = _find_group_board_position(pcb_data, group_refs, full_layout)
         ax_near, ay_near, ok_near, _ = _find_group_board_position(
             pcb_data, group_refs, full_layout, prefer_near=target
         )
@@ -381,12 +382,14 @@ class TestGenerateGridCandidates:
     def test_anchor_position_included(self):
         """(0, 0) must be in the list so the overlap check can reject it."""
         from kcaa.tools.pcb_group_tools import _generate_grid_candidates
+
         cands = _generate_grid_candidates(5.0)
         assert (0.0, 0.0) in cands
 
     def test_sorted_by_distance_from_origin(self):
         """Candidates are sorted closest-first when center is (0, 0)."""
         from kcaa.tools.pcb_group_tools import _generate_grid_candidates
+
         cands = _generate_grid_candidates(5.0)
         dists = [x * x + y * y for x, y in cands]
         assert dists == sorted(dists)
@@ -394,6 +397,7 @@ class TestGenerateGridCandidates:
     def test_center_offset_pulls_first_candidate_near_center(self):
         """With center_x=-5, center_y=0 the first candidate is close to (-5, 0)."""
         from kcaa.tools.pcb_group_tools import _generate_grid_candidates
+
         cands = _generate_grid_candidates(10.0, center_x=-5.0, center_y=0.0)
         first = cands[0]
         assert math.hypot(first[0] + 5.0, first[1]) < _GRID_MM * 1.5
@@ -401,6 +405,7 @@ class TestGenerateGridCandidates:
     def test_sorted_by_distance_from_center(self):
         """Candidates are sorted by distance from the given center."""
         from kcaa.tools.pcb_group_tools import _generate_grid_candidates
+
         cx, cy = -3.81, 2.54
         cands = _generate_grid_candidates(10.0, center_x=cx, center_y=cy)
         dists = [(x - cx) ** 2 + (y - cy) ** 2 for x, y in cands]
@@ -409,6 +414,7 @@ class TestGenerateGridCandidates:
     def test_deterministic_for_same_center(self):
         """Two calls with identical parameters return identical lists."""
         from kcaa.tools.pcb_group_tools import _generate_grid_candidates
+
         a = _generate_grid_candidates(8.0, center_x=-2.54, center_y=1.27)
         b = _generate_grid_candidates(8.0, center_x=-2.54, center_y=1.27)
         assert a == b
@@ -416,6 +422,7 @@ class TestGenerateGridCandidates:
     def test_all_positions_on_grid(self):
         """Every returned position is a multiple of _GRID_MM."""
         from kcaa.tools.pcb_group_tools import _generate_grid_candidates
+
         cands = _generate_grid_candidates(5.0)
         for x, y in cands:
             assert abs(round(x / _GRID_MM) * _GRID_MM - x) < 1e-6, f"{x} not on grid"
@@ -437,6 +444,7 @@ class TestChooseRotationForGrid:
     def test_horizontal_zone_prefers_wide_rotation(self, pcb_data):
         """Component to the left/right should be rotated so bbox.width >= bbox.height."""
         from kcaa.tools.pcb_group_tools import _choose_rotation_for_grid
+
         mfp = self._wide_fp(pcb_data)
         # Place to the right (cx=10, cy=0) — horizontal zone
         rot = _choose_rotation_for_grid(mfp, cx=10.0, cy=0.0, base_rot=0.0, connecting_pairs=[])
@@ -449,6 +457,7 @@ class TestChooseRotationForGrid:
     def test_no_connecting_pairs_returns_zero(self, pcb_data):
         """When connecting_pairs is empty, function returns 0 (base rotation not used)."""
         from kcaa.tools.pcb_group_tools import _choose_rotation_for_grid
+
         mfp = self._wide_fp(pcb_data)
         # No connecting pairs → returns 0 regardless of position or base_rot
         rot = _choose_rotation_for_grid(mfp, cx=0.0, cy=-10.0, base_rot=45.0, connecting_pairs=[])
@@ -457,6 +466,7 @@ class TestChooseRotationForGrid:
     def test_with_connecting_pairs_returns_90_degree_step(self, pcb_data):
         """When connecting_pairs provided, result is a 90° step (0, 90, 180, 270)."""
         from kcaa.tools.pcb_group_tools import _choose_rotation_for_grid
+
         mfp = self._wide_fp(pcb_data)
         # Provide a connecting pair: (lx, ly, ax, ay, aw, ah, mw, mh)
         # lx,ly = member pad local coords, ax,ay = anchor pad coords
@@ -477,6 +487,7 @@ class TestGridLayout:
     def test_all_members_placed(self, pcb_data):
         """Every non-anchor member receives a suggestion entry."""
         from kcaa.tools.pcb_group_tools import _grid_layout
+
         member_refs = [r for r in _USB_C_REFS if r != "J3"]
         suggestions = _grid_layout(pcb_data, "J3", member_refs, gap_mm=1.0)
         placed_refs = {s["reference"] for s in suggestions}
@@ -485,6 +496,7 @@ class TestGridLayout:
     def test_no_overlap_between_members(self, pcb_data):
         """Placed member courtyards must not overlap each other (gap=0)."""
         from kcaa.tools.pcb_group_tools import _grid_layout
+
         member_refs = [r for r in _USB_C_REFS if r != "J3"]
         suggestions = _grid_layout(pcb_data, "J3", member_refs, gap_mm=1.0)
 
@@ -495,13 +507,15 @@ class TestGridLayout:
             mfp = find_footprint(pcb_data, s["reference"])
             bb = get_fp_courtyard_bbox(mfp, 0.0, 0.0, s["rotation"])
             if bb:
-                bboxes.append({
-                    "ref": s["reference"],
-                    "min_x": bb["min_x"] + s["dx"],
-                    "min_y": bb["min_y"] + s["dy"],
-                    "max_x": bb["max_x"] + s["dx"],
-                    "max_y": bb["max_y"] + s["dy"],
-                })
+                bboxes.append(
+                    {
+                        "ref": s["reference"],
+                        "min_x": bb["min_x"] + s["dx"],
+                        "min_y": bb["min_y"] + s["dy"],
+                        "max_x": bb["max_x"] + s["dx"],
+                        "max_y": bb["max_y"] + s["dy"],
+                    }
+                )
 
         for i in range(len(bboxes)):
             for j in range(i + 1, len(bboxes)):
@@ -512,6 +526,7 @@ class TestGridLayout:
     def test_no_overlap_with_anchor(self, pcb_data):
         """No placed member courtyard overlaps the anchor courtyard."""
         from kcaa.tools.pcb_group_tools import _grid_layout
+
         anchor_fp = find_footprint(pcb_data, "J3")
         _, _, anchor_rot = get_fp_at(anchor_fp)
         anchor_bb = get_fp_courtyard_bbox(anchor_fp, 0.0, 0.0, anchor_rot)
@@ -532,17 +547,16 @@ class TestGridLayout:
                 "max_x": bb["max_x"] + s["dx"],
                 "max_y": bb["max_y"] + s["dy"],
             }
-            assert not _bboxes_overlap(placed, anchor_bb), (
-                f"{s['reference']} overlaps anchor"
-            )
+            assert not _bboxes_overlap(placed, anchor_bb), f"{s['reference']} overlaps anchor"
 
     def test_positions_near_grid(self, pcb_data):
         """All dx/dy offsets are within one grid step of _GRID_MM multiples.
-        
+
         The grid algorithm places pads on grid, but footprint centers are
         offset by pad local coordinates, so centers may not be exact grid multiples.
         """
         from kcaa.tools.pcb_group_tools import _grid_layout
+
         member_refs = [r for r in _USB_C_REFS if r != "J3"]
         suggestions = _grid_layout(pcb_data, "J3", member_refs, gap_mm=1.0)
         # Footprint center = pad position - rotated pad offset
@@ -562,6 +576,7 @@ class TestGridLayout:
     def test_no_placement_warning_for_normal_group(self, pcb_data):
         """A typical 5-member group should place without any overlap warnings."""
         from kcaa.tools.pcb_group_tools import _grid_layout
+
         member_refs = [r for r in _USB_C_REFS if r != "J3"]
         suggestions = _grid_layout(pcb_data, "J3", member_refs, gap_mm=1.0)
         warnings = [s["reference"] for s in suggestions if "warning" in s]
@@ -576,6 +591,7 @@ class TestGridLayout:
         anchor_fp = find_footprint(pcb_data, "J3")
         ax, ay, _ = get_fp_at(anchor_fp)
         from kcaa.tools.pcb_placement_helpers import _get_fp_pads_world
+
         anchor_net_pts: dict = {}
         for p in _get_fp_pads_world(anchor_fp):
             net = p["net"]
@@ -625,7 +641,7 @@ class TestRotateGroup:
         """90° CW rotation moves components to the right BELOW the anchor."""
         # First place the group
         _run(tools["place_component_group"](board_copy, "usb_c"))
-        
+
         # Get initial positions
         data_before = load_pcb(board_copy)
         j3_before = find_footprint(data_before, "J3")
@@ -634,22 +650,22 @@ class TestRotateGroup:
         r1x_before, r1y_before, _ = get_fp_at(r1_before)
         dx_before = r1x_before - ax
         dy_before = r1y_before - ay
-        
+
         # Rotate 90° CW
         result = _run(tools["rotate_group"](board_copy, "usb_c", 90.0))
         assert "error" not in result, f"Unexpected error: {result.get('error')}"
-        
+
         # Check positions after rotation
         data_after = load_pcb(board_copy)
         j3_after = find_footprint(data_after, "J3")
         r1_after = find_footprint(data_after, "R1")
         ax_after, ay_after, _ = get_fp_at(j3_after)
         r1x_after, r1y_after, _ = get_fp_at(r1_after)
-        
+
         # Anchor should not move
         assert abs(ax_after - ax) < 0.01
         assert abs(ay_after - ay) < 0.01
-        
+
         # R1's relative position should rotate 90° CW
         # In KiCad coords (+Y down), 90° CW rotation: (dx, dy) → (-dy, dx)
         # RIGHT (+dx) → DOWN (+dy), DOWN (+dy) → LEFT (-dx)
@@ -657,7 +673,7 @@ class TestRotateGroup:
         dy_after = r1y_after - ay_after
         expected_dx = -dy_before
         expected_dy = dx_before
-        
+
         assert abs(dx_after - expected_dx) < 0.01, (
             f"R1 dx: expected {expected_dx:.2f}, got {dx_after:.2f}"
         )
@@ -668,28 +684,28 @@ class TestRotateGroup:
     def test_rotate_group_increments_component_rotations(self, tools, board_copy):
         """Component orientations counter-rotate to maintain orientation in group frame."""
         _run(tools["place_component_group"](board_copy, "usb_c"))
-        
+
         data_before = load_pcb(board_copy)
         j3_before = find_footprint(data_before, "J3")
         d1_before = find_footprint(data_before, "D1")
         _, _, j3_rot_before = get_fp_at(j3_before)
         _, _, d1_rot_before = get_fp_at(d1_before)
-        
+
         # Rotate 90° CW
         result = _run(tools["rotate_group"](board_copy, "usb_c", 90.0))
         assert "error" not in result
-        
+
         data_after = load_pcb(board_copy)
         j3_after = find_footprint(data_after, "J3")
         d1_after = find_footprint(data_after, "D1")
         _, _, j3_rot_after = get_fp_at(j3_after)
         _, _, d1_rot_after = get_fp_at(d1_after)
-        
+
         # Components counter-rotate to maintain orientation in group frame
         # Group rotates 90° CW, so component orientations decrease by 90°
         expected_j3_rot = (j3_rot_before - 90.0) % 360.0
         expected_d1_rot = (d1_rot_before - 90.0) % 360.0
-        
+
         assert abs(j3_rot_after - expected_j3_rot) < 0.01, (
             f"J3 rotation: expected {expected_j3_rot:.1f}°, got {j3_rot_after:.1f}°"
         )
@@ -700,52 +716,52 @@ class TestRotateGroup:
     def test_rotate_group_180_degrees(self, tools, board_copy):
         """180° rotation should flip positions while preserving distances."""
         _run(tools["place_component_group"](board_copy, "usb_c"))
-        
+
         data_before = load_pcb(board_copy)
         j3_before = find_footprint(data_before, "J3")
         r2_before = find_footprint(data_before, "R2")
         ax, ay, _ = get_fp_at(j3_before)
         r2x_before, r2y_before, _ = get_fp_at(r2_before)
         dist_before = math.hypot(r2x_before - ax, r2y_before - ay)
-        
+
         # Rotate 180°
         result = _run(tools["rotate_group"](board_copy, "usb_c", 180.0))
         assert "error" not in result
-        
+
         data_after = load_pcb(board_copy)
         j3_after = find_footprint(data_after, "J3")
         r2_after = find_footprint(data_after, "R2")
         ax_after, ay_after, _ = get_fp_at(j3_after)
         r2x_after, r2y_after, _ = get_fp_at(r2_after)
         dist_after = math.hypot(r2x_after - ax_after, r2y_after - ay_after)
-        
+
         # Distance should be preserved
         assert abs(dist_after - dist_before) < 0.01
-        
+
         # Relative position should be negated
         dx_before = r2x_before - ax
         dy_before = r2y_before - ay
         dx_after = r2x_after - ax_after
         dy_after = r2y_after - ay_after
-        
+
         assert abs(dx_after + dx_before) < 0.01
         assert abs(dy_after + dy_before) < 0.01
 
     def test_rotate_group_multiple_rotations_compound(self, tools, board_copy):
         """Two 90° rotations should equal one 180° rotation."""
         _run(tools["place_component_group"](board_copy, "usb_c"))
-        
+
         # Rotate 90° twice
         _run(tools["rotate_group"](board_copy, "usb_c", 90.0))
         result = _run(tools["rotate_group"](board_copy, "usb_c", 90.0))
         assert "error" not in result
-        
+
         data = load_pcb(board_copy)
         c1 = find_footprint(data, "C1")
         j3 = find_footprint(data, "J3")
         c1x, c1y, c1_rot = get_fp_at(c1)
         ax, ay, j3_rot = get_fp_at(j3)
-        
+
         # The rotation field should have incremented by 180° total
         # (we don't know the initial rotation, but it should have changed)
         assert result["rotation_delta"] == 90.0
@@ -754,25 +770,25 @@ class TestRotateGroup:
     def test_rotate_group_anchor_stays_in_place(self, tools, board_copy):
         """The anchor position must not change during rotation."""
         _run(tools["place_component_group"](board_copy, "usb_c"))
-        
+
         data_before = load_pcb(board_copy)
         j3_before = find_footprint(data_before, "J3")
         ax_before, ay_before, _ = get_fp_at(j3_before)
-        
+
         # Rotate 45°
         _run(tools["rotate_group"](board_copy, "usb_c", 45.0))
-        
+
         data_after = load_pcb(board_copy)
         j3_after = find_footprint(data_after, "J3")
         ax_after, ay_after, _ = get_fp_at(j3_after)
-        
+
         assert abs(ax_after - ax_before) < 1e-6
         assert abs(ay_after - ay_before) < 1e-6
 
     def test_rotate_group_returns_correct_metadata(self, tools, board_copy):
         """rotate_group returns group_name, anchor_ref, rotation_delta, rotated_count."""
         _run(tools["place_component_group"](board_copy, "usb_c"))
-        
+
         result = _run(tools["rotate_group"](board_copy, "usb_c", 90.0))
         assert result["group_name"] == "usb_c"
         assert result["anchor_ref"] == "J3"
@@ -783,7 +799,7 @@ class TestRotateGroup:
     def test_rotate_group_creates_backup(self, tools, board_copy):
         """A .kicad_pcb.bak backup is created before rotation."""
         _run(tools["place_component_group"](board_copy, "usb_c"))
-        
+
         result = _run(tools["rotate_group"](board_copy, "usb_c", 90.0))
         backup = result.get("backup_path", board_copy + ".bak")
         assert os.path.exists(backup), f"Backup not found at {backup}"
@@ -797,22 +813,22 @@ class TestRotateGroup:
     def test_rotate_group_360_is_identity(self, tools, board_copy):
         """360° rotation should return to original positions (modulo floating point)."""
         _run(tools["place_component_group"](board_copy, "usb_c"))
-        
+
         data_before = load_pcb(board_copy)
         r1_before = find_footprint(data_before, "R1")
         r1x_before, r1y_before, r1_rot_before = get_fp_at(r1_before)
-        
+
         # Rotate 360°
         _run(tools["rotate_group"](board_copy, "usb_c", 360.0))
-        
+
         data_after = load_pcb(board_copy)
         r1_after = find_footprint(data_after, "R1")
         r1x_after, r1y_after, r1_rot_after = get_fp_at(r1_after)
-        
+
         # Position should be unchanged
         assert abs(r1x_after - r1x_before) < 1e-6
         assert abs(r1y_after - r1y_before) < 1e-6
-        
+
         # Rotation should increment by 360° (wraps to same angle)
         expected_rot = (r1_rot_before + 360.0) % 360.0
         assert abs(r1_rot_after - expected_rot) < 0.01

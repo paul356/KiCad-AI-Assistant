@@ -1,6 +1,7 @@
 """
 Unit tests for kcaa/tools/pcb_query_tools.py
 """
+
 import asyncio
 import os
 import re
@@ -15,6 +16,7 @@ BOARD_WITH_OUTLINE_FIXTURE = os.path.join(FIXTURE_DIR, "test_board_with_outline.
 
 class _MockMCP:
     """Minimal FastMCP stand-in that captures @mcp.tool()-decorated functions."""
+
     def __init__(self):
         self.tools: dict = {}
 
@@ -22,11 +24,13 @@ class _MockMCP:
         def decorator(fn):
             self.tools[fn.__name__] = fn
             return fn
+
         return decorator
 
 
 def _get_tools() -> dict:
     from kcaa.tools.pcb_query_tools import register_pcb_query_tools
+
     mock = _MockMCP()
     register_pcb_query_tools(mock)
     return mock.tools

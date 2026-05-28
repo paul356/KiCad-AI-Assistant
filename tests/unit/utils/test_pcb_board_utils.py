@@ -1,22 +1,21 @@
 """
 Unit tests for kcaa/utils/pcb_board_utils.py
 """
+
 import math
 import os
-import shutil
-import tempfile
 
 import pytest
 
-from kcaa.utils.pcb_sexp_utils import load_pcb, save_pcb
 from kcaa.utils.pcb_board_utils import (
-    get_edge_cuts_items,
-    remove_edge_cuts_items,
+    add_gr_arc,
     add_gr_line,
     add_gr_rect,
-    add_gr_arc,
+    get_edge_cuts_items,
     get_fp_courtyard_bbox,
+    remove_edge_cuts_items,
 )
+from kcaa.utils.pcb_sexp_utils import load_pcb
 
 FIXTURE_DIR = os.path.join(os.path.dirname(__file__), "..", "tools", "fixtures")
 BOARD_FIXTURE = os.path.join(FIXTURE_DIR, "test_board_with_outline.kicad_pcb")
@@ -30,6 +29,7 @@ def pcb_data():
 # ---------------------------------------------------------------------------
 # get_edge_cuts_items
 # ---------------------------------------------------------------------------
+
 
 class TestGetEdgeCutsItems:
     def test_returns_four_lines(self, pcb_data):
@@ -52,8 +52,8 @@ class TestGetEdgeCutsItems:
 
     def test_empty_when_no_outline(self):
         # Build a minimal PCB with no Edge.Cuts items
-        from kcaa.utils.pcb_sexp_utils import load_pcb as _load
         import sexpdata
+
         data = [sexpdata.Symbol("kicad_pcb")]
         items = get_edge_cuts_items(data)
         assert items == []
@@ -61,14 +61,17 @@ class TestGetEdgeCutsItems:
     def test_gr_rect_parsed(self):
         """get_edge_cuts_items parses gr_rect items correctly."""
         import sexpdata as sx
+
         s = sx.Symbol
         data = [
             s("kicad_pcb"),
-            [s("gr_rect"),
-             [s("start"), 0.0, 0.0],
-             [s("end"), 50.0, 40.0],
-             [s("stroke"), [s("width"), 0.05], [s("type"), s("solid")]],
-             [s("layer"), "Edge.Cuts"]],
+            [
+                s("gr_rect"),
+                [s("start"), 0.0, 0.0],
+                [s("end"), 50.0, 40.0],
+                [s("stroke"), [s("width"), 0.05], [s("type"), s("solid")]],
+                [s("layer"), "Edge.Cuts"],
+            ],
         ]
         items = get_edge_cuts_items(data)
         assert len(items) == 1
@@ -80,6 +83,7 @@ class TestGetEdgeCutsItems:
 # ---------------------------------------------------------------------------
 # remove_edge_cuts_items
 # ---------------------------------------------------------------------------
+
 
 class TestRemoveEdgeCutsItems:
     def test_removes_four_lines(self, pcb_data):
@@ -94,15 +98,15 @@ class TestRemoveEdgeCutsItems:
     def test_footprints_untouched(self, pcb_data):
         """Removing Edge.Cuts must not remove footprints."""
         fp_count_before = sum(
-            1 for item in pcb_data
-            if isinstance(item, list) and len(item) > 0
-            and str(item[0]) == "footprint"
+            1
+            for item in pcb_data
+            if isinstance(item, list) and len(item) > 0 and str(item[0]) == "footprint"
         )
         remove_edge_cuts_items(pcb_data)
         fp_count_after = sum(
-            1 for item in pcb_data
-            if isinstance(item, list) and len(item) > 0
-            and str(item[0]) == "footprint"
+            1
+            for item in pcb_data
+            if isinstance(item, list) and len(item) > 0 and str(item[0]) == "footprint"
         )
         assert fp_count_before == fp_count_after
 
@@ -110,6 +114,7 @@ class TestRemoveEdgeCutsItems:
 # ---------------------------------------------------------------------------
 # add_gr_line
 # ---------------------------------------------------------------------------
+
 
 class TestAddGrLine:
     def test_appended_to_data(self, pcb_data):
@@ -129,6 +134,7 @@ class TestAddGrLine:
 
     def test_custom_layer(self):
         import sexpdata as sx
+
         data = [sx.Symbol("kicad_pcb")]
         add_gr_line(data, 0, 0, 1, 1, layer="Margin")
         # Should not appear in Edge.Cuts query
@@ -140,9 +146,11 @@ class TestAddGrLine:
 # add_gr_rect
 # ---------------------------------------------------------------------------
 
+
 class TestAddGrRect:
     def test_appended(self):
         import sexpdata as sx
+
         data = [sx.Symbol("kicad_pcb")]
         add_gr_rect(data, 0.0, 0.0, 50.0, 40.0)
         items = get_edge_cuts_items(data)
@@ -156,9 +164,11 @@ class TestAddGrRect:
 # add_gr_arc
 # ---------------------------------------------------------------------------
 
+
 class TestAddGrArc:
     def test_appended_to_data(self):
         import sexpdata as sx
+
         data = [sx.Symbol("kicad_pcb")]
         add_gr_arc(data, 5.0, 5.0, 5.0, 180.0, 270.0)
         items = get_edge_cuts_items(data)
@@ -168,6 +178,7 @@ class TestAddGrArc:
     def test_start_end_on_circle(self):
         """start and end points must lie on the circle of given radius."""
         import sexpdata as sx
+
         cx, cy, r = 10.0, 10.0, 3.0
         data = [sx.Symbol("kicad_pcb")]
         add_gr_arc(data, cx, cy, r, 0.0, 90.0)
@@ -188,6 +199,7 @@ class TestAddGrArc:
         270° → (cx,   cy-r) [up]
         """
         import sexpdata as sx
+
         cx, cy, r = 0.0, 0.0, 5.0
         data = [sx.Symbol("kicad_pcb")]
         add_gr_arc(data, cx, cy, r, 0.0, 90.0)
@@ -202,6 +214,7 @@ class TestAddGrArc:
     def test_wraparound_arc_midpoint(self):
         """An arc from 315° to 45° (crossing 0°) should have midpoint at 0°."""
         import sexpdata as sx
+
         cx, cy, r = 0.0, 0.0, 5.0
         data = [sx.Symbol("kicad_pcb")]
         add_gr_arc(data, cx, cy, r, 315.0, 45.0)
@@ -215,21 +228,48 @@ class TestAddGrArc:
 # get_fp_courtyard_bbox
 # ---------------------------------------------------------------------------
 
+
 class TestGetFpCourtyardBbox:
     def _fp_node(self, fp_x, fp_y, fp_rot, courtyard_half_w=1.0, courtyard_half_h=0.75):
         """Build a minimal footprint S-expression node with a rectangular courtyard."""
         import sexpdata as sx
+
         s = sx.Symbol
         hw, hh = courtyard_half_w, courtyard_half_h
         node = [
-            s("footprint"), "TestLib:R",
+            s("footprint"),
+            "TestLib:R",
             [s("at"), fp_x, fp_y, fp_rot],
             [s("layer"), "F.Cu"],
             # courtyard lines
-            [s("fp_line"), [s("start"), -hw, -hh], [s("end"), hw, -hh], [s("layer"), "F.Courtyard"], [s("width"), 0.05]],
-            [s("fp_line"), [s("start"), hw, -hh],  [s("end"), hw, hh],  [s("layer"), "F.Courtyard"], [s("width"), 0.05]],
-            [s("fp_line"), [s("start"), hw, hh],   [s("end"), -hw, hh], [s("layer"), "F.Courtyard"], [s("width"), 0.05]],
-            [s("fp_line"), [s("start"), -hw, hh],  [s("end"), -hw, -hh],[s("layer"), "F.Courtyard"], [s("width"), 0.05]],
+            [
+                s("fp_line"),
+                [s("start"), -hw, -hh],
+                [s("end"), hw, -hh],
+                [s("layer"), "F.Courtyard"],
+                [s("width"), 0.05],
+            ],
+            [
+                s("fp_line"),
+                [s("start"), hw, -hh],
+                [s("end"), hw, hh],
+                [s("layer"), "F.Courtyard"],
+                [s("width"), 0.05],
+            ],
+            [
+                s("fp_line"),
+                [s("start"), hw, hh],
+                [s("end"), -hw, hh],
+                [s("layer"), "F.Courtyard"],
+                [s("width"), 0.05],
+            ],
+            [
+                s("fp_line"),
+                [s("start"), -hw, hh],
+                [s("end"), -hw, -hh],
+                [s("layer"), "F.Courtyard"],
+                [s("width"), 0.05],
+            ],
         ]
         return node
 
@@ -265,20 +305,28 @@ class TestGetFpCourtyardBbox:
     def test_no_courtyard_falls_back(self):
         """If no courtyard layer items exist the function falls back to all fp_line."""
         import sexpdata as sx
+
         s = sx.Symbol
         fp = [
-            s("footprint"), "TestLib:R",
+            s("footprint"),
+            "TestLib:R",
             [s("at"), 0.0, 0.0, 0.0],
             [s("layer"), "F.Cu"],
             # no courtyard — just fab layer
-            [s("fp_line"), [s("start"), -1.0, -1.0], [s("end"), 1.0, 1.0],
-             [s("layer"), "F.Fab"], [s("width"), 0.1]],
+            [
+                s("fp_line"),
+                [s("start"), -1.0, -1.0],
+                [s("end"), 1.0, 1.0],
+                [s("layer"), "F.Fab"],
+                [s("width"), 0.1],
+            ],
         ]
         bbox = get_fp_courtyard_bbox(fp, 0.0, 0.0, 0.0)
         assert bbox is not None
 
     def test_no_geometry_returns_none(self):
         import sexpdata as sx
+
         s = sx.Symbol
         fp = [s("footprint"), "TestLib:R", [s("at"), 0.0, 0.0, 0.0], [s("layer"), "F.Cu"]]
         assert get_fp_courtyard_bbox(fp, 0.0, 0.0, 0.0) is None

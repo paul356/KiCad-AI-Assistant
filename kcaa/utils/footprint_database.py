@@ -24,15 +24,25 @@ directly against the connection, while all standard CRUD goes through the
 ORM session.
 """
 
+from dataclasses import dataclass
+import logging
 import os
 import re
 import time
-import logging
-from dataclasses import dataclass
 
 from sqlalchemy import (
-    Column, Integer, Float, String, ForeignKey,
-    Index, create_engine, text, event, func, select, insert
+    Column,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    create_engine,
+    event,
+    func,
+    insert,
+    select,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
@@ -43,14 +53,15 @@ log = logging.getLogger(__name__)
 # Public dataclasses  (the external API — never expose ORM rows directly)
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class FpLibraryRecord:
     id: int
-    library_name: str     # nickname (stable key, API identifier)
-    raw_uri: str          # unexpanded URI e.g. "${KICAD10_FOOTPRINT_DIR}/Foo.pretty"
-    dir_path: str         # resolved runtime path to .pretty directory
+    library_name: str  # nickname (stable key, API identifier)
+    raw_uri: str  # unexpanded URI e.g. "${KICAD10_FOOTPRINT_DIR}/Foo.pretty"
+    dir_path: str  # resolved runtime path to .pretty directory
     description: str
-    checksum: str         # SHA-256 of sorted "filename:mtime:size\n" manifest
+    checksum: str  # SHA-256 of sorted "filename:mtime:size\n" manifest
     footprint_count: int
     last_indexed: float
 
@@ -62,7 +73,7 @@ class FootprintRecord:
     library_id: int
     description: str
     tags: str
-    attr: str             # "smd", "through_hole", or ""
+    attr: str  # "smd", "through_hole", or ""
     pad_count: int
     has_3d_model: bool
 
@@ -71,7 +82,7 @@ class FootprintRecord:
 class DbStats:
     library_count: int
     footprint_count: int
-    last_sync: float      # Unix timestamp; 0.0 if never synced
+    last_sync: float  # Unix timestamp; 0.0 if never synced
     db_path: str
 
 
@@ -79,39 +90,39 @@ class DbStats:
 # ORM models  (internal — prefixed with _ to signal non-public)
 # ---------------------------------------------------------------------------
 
+
 class _Base(DeclarativeBase):
     pass
 
 
 class _FpLibraryRow(_Base):
-    __tablename__ = 'fp_libraries'
+    __tablename__ = "fp_libraries"
 
-    id               = Column(Integer, primary_key=True, autoincrement=True)
-    library_name     = Column(String,  nullable=False, unique=True)
-    raw_uri          = Column(String,  nullable=False, default='')
-    dir_path         = Column(String,  nullable=False, default='')
-    description      = Column(String,  nullable=False, default='')
-    checksum         = Column(String,  nullable=False, default='')
-    footprint_count  = Column(Integer, nullable=False, default=0)
-    last_indexed     = Column(Float,   nullable=False, default=0.0)
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    library_name = Column(String, nullable=False, unique=True)
+    raw_uri = Column(String, nullable=False, default="")
+    dir_path = Column(String, nullable=False, default="")
+    description = Column(String, nullable=False, default="")
+    checksum = Column(String, nullable=False, default="")
+    footprint_count = Column(Integer, nullable=False, default=0)
+    last_indexed = Column(Float, nullable=False, default=0.0)
 
 
 class _FootprintRow(_Base):
-    __tablename__ = 'footprints'
+    __tablename__ = "footprints"
 
-    library_name    = Column(String,  nullable=False, primary_key=True)
-    footprint_name  = Column(String,  nullable=False, primary_key=True)
-    library_id      = Column(Integer, ForeignKey('fp_libraries.id', ondelete='CASCADE'),
-                             nullable=False)
-    description     = Column(String,  nullable=False, default='')
-    tags            = Column(String,  nullable=False, default='')
-    attr            = Column(String,  nullable=False, default='')
-    pad_count       = Column(Integer, nullable=False, default=0)
-    has_3d_model    = Column(Integer, nullable=False, default=0)  # 0/1 boolean
+    library_name = Column(String, nullable=False, primary_key=True)
+    footprint_name = Column(String, nullable=False, primary_key=True)
+    library_id = Column(Integer, ForeignKey("fp_libraries.id", ondelete="CASCADE"), nullable=False)
+    description = Column(String, nullable=False, default="")
+    tags = Column(String, nullable=False, default="")
+    attr = Column(String, nullable=False, default="")
+    pad_count = Column(Integer, nullable=False, default=0)
+    has_3d_model = Column(Integer, nullable=False, default=0)  # 0/1 boolean
 
     __table_args__ = (
-        Index('idx_fp_library_id', 'library_id'),
-        Index('idx_fp_name', 'footprint_name'),
+        Index("idx_fp_library_id", "library_id"),
+        Index("idx_fp_name", "footprint_name"),
     )
 
 
@@ -144,6 +155,7 @@ END;
 # FootprintDatabase
 # ---------------------------------------------------------------------------
 
+
 class FootprintDatabase:
     """SQLAlchemy-backed store for KiCad footprint library index data."""
 
@@ -153,23 +165,25 @@ class FootprintDatabase:
         self._db_path = db_path
 
         self._engine = create_engine(
-            f'sqlite:///{db_path}',
-            connect_args={'check_same_thread': False},
+            f"sqlite:///{db_path}",
+            connect_args={"check_same_thread": False},
         )
 
-        @event.listens_for(self._engine, 'connect')
+        @event.listens_for(self._engine, "connect")
         def _set_pragmas(conn, _record):
-            cursor = conn.execute('PRAGMA journal_mode = WAL')
+            cursor = conn.execute("PRAGMA journal_mode = WAL")
             result = cursor.fetchone()
-            if result and result[0].lower() not in ('wal', 'memory'):
+            if result and result[0].lower() not in ("wal", "memory"):
                 import logging as _logging
+
                 _logging.getLogger(__name__).warning(
                     "PRAGMA journal_mode=WAL not applied; got %r", result[0]
                 )
-            conn.execute('PRAGMA foreign_keys = ON')
-            fk_result = conn.execute('PRAGMA foreign_keys').fetchone()
+            conn.execute("PRAGMA foreign_keys = ON")
+            fk_result = conn.execute("PRAGMA foreign_keys").fetchone()
             if not fk_result or fk_result[0] != 1:
                 import logging as _logging
+
                 _logging.getLogger(__name__).warning(
                     "PRAGMA foreign_keys=ON not applied; got %r", fk_result
                 )
@@ -186,15 +200,14 @@ class FootprintDatabase:
         _Base.metadata.create_all(self._engine)
         with self._engine.connect() as conn:
             try:
-                for statement in _DDL_FTS.split(';\n\n'):
+                for statement in _DDL_FTS.split(";\n\n"):
                     stmt = statement.strip()
                     if stmt:
                         conn.execute(text(stmt))
                 conn.commit()
             except Exception as exc:
                 log.warning(
-                    f"FTS5 not available in this SQLite build — "
-                    f"full-text search disabled. ({exc})"
+                    f"FTS5 not available in this SQLite build — full-text search disabled. ({exc})"
                 )
 
     # ------------------------------------------------------------------
@@ -214,10 +227,7 @@ class FootprintDatabase:
                     _FpLibraryRow.dir_path,
                 )
             ).all()
-        return {
-            row.library_name: (row.id, row.checksum, row.dir_path)
-            for row in rows
-        }
+        return {row.library_name: (row.id, row.checksum, row.dir_path) for row in rows}
 
     # ------------------------------------------------------------------
     # Public API — write (used by FootprintIndexManager)
@@ -230,7 +240,7 @@ class FootprintDatabase:
         dir_path: str,
         description: str,
         checksum: str,
-        footprints: list['FootprintRecord'],
+        footprints: list["FootprintRecord"],
     ) -> int:
         """Insert or fully replace a library and its footprints.
         Returns the number of footprints stored.
@@ -238,8 +248,7 @@ class FootprintDatabase:
         now = time.time()
         with self._Session() as session:
             session.execute(
-                _FpLibraryRow.__table__.delete()
-                .where(_FpLibraryRow.library_name == library_name)
+                _FpLibraryRow.__table__.delete().where(_FpLibraryRow.library_name == library_name)
             )
 
             lib_row = _FpLibraryRow(
@@ -260,14 +269,14 @@ class FootprintDatabase:
                     insert(_FootprintRow),
                     [
                         {
-                            'library_name':   library_name,
-                            'footprint_name': fp.footprint_name,
-                            'library_id':     lib_id,
-                            'description':    fp.description,
-                            'tags':           fp.tags,
-                            'attr':           fp.attr,
-                            'pad_count':      fp.pad_count,
-                            'has_3d_model':   int(fp.has_3d_model),
+                            "library_name": library_name,
+                            "footprint_name": fp.footprint_name,
+                            "library_id": lib_id,
+                            "description": fp.description,
+                            "tags": fp.tags,
+                            "attr": fp.attr,
+                            "pad_count": fp.pad_count,
+                            "has_3d_model": int(fp.has_3d_model),
                         }
                         for fp in footprints
                     ],
@@ -294,16 +303,14 @@ class FootprintDatabase:
     def delete_library(self, lib_id: int) -> None:
         """Delete a library row (footprints removed via ON DELETE CASCADE)."""
         with self._Session() as session:
-            session.execute(
-                _FpLibraryRow.__table__.delete().where(_FpLibraryRow.id == lib_id)
-            )
+            session.execute(_FpLibraryRow.__table__.delete().where(_FpLibraryRow.id == lib_id))
             session.commit()
 
     # ------------------------------------------------------------------
     # Public API — search
     # ------------------------------------------------------------------
 
-    def search(self, query: str, limit: int = 50) -> list['FootprintRecord']:
+    def search(self, query: str, limit: int = 50) -> list["FootprintRecord"]:
         """Full-text search across footprint_name, description, and tags.
         Falls back to LIKE search if FTS5 is unavailable.
         """
@@ -321,7 +328,7 @@ class FootprintDatabase:
         )
         try:
             with self._engine.connect() as conn:
-                rows = conn.execute(sql, {'q': safe_query, 'lim': limit}).all()
+                rows = conn.execute(sql, {"q": safe_query, "lim": limit}).all()
             return [self._row_to_footprint(r) for r in rows]
         except Exception:
             log.debug("FTS5 unavailable, falling back to LIKE search")
@@ -332,7 +339,7 @@ class FootprintDatabase:
         name: str,
         exact: bool = False,
         limit: int = 50,
-    ) -> list['FootprintRecord']:
+    ) -> list["FootprintRecord"]:
         """Search footprints by name substring or exact match."""
         with self._Session() as session:
             q = select(_FootprintRow)
@@ -340,9 +347,7 @@ class FootprintDatabase:
                 q = q.where(func.lower(_FootprintRow.footprint_name) == name.lower())
             else:
                 q = q.where(
-                    _FootprintRow.footprint_name.ilike(
-                        f'%{self._like_escape(name)}%', escape='\\'
-                    )
+                    _FootprintRow.footprint_name.ilike(f"%{self._like_escape(name)}%", escape="\\")
                 )
             rows = session.execute(q.limit(limit)).scalars().all()
         return [self._orm_to_footprint(r) for r in rows]
@@ -351,9 +356,7 @@ class FootprintDatabase:
     # Public API — lookup
     # ------------------------------------------------------------------
 
-    def get_footprint(
-        self, library_name: str, footprint_name: str
-    ) -> 'FootprintRecord | None':
+    def get_footprint(self, library_name: str, footprint_name: str) -> "FootprintRecord | None":
         """Look up a single footprint by (library_name, footprint_name)."""
         with self._Session() as session:
             row = session.execute(
@@ -364,25 +367,31 @@ class FootprintDatabase:
             ).scalar_one_or_none()
         return self._orm_to_footprint(row) if row else None
 
-    def get_library_footprints(self, library_name: str) -> list['FootprintRecord']:
+    def get_library_footprints(self, library_name: str) -> list["FootprintRecord"]:
         """Return all footprints in a library, ordered by name."""
         with self._Session() as session:
-            rows = session.execute(
-                select(_FootprintRow)
-                .where(_FootprintRow.library_name == library_name)
-                .order_by(_FootprintRow.footprint_name)
-            ).scalars().all()
+            rows = (
+                session.execute(
+                    select(_FootprintRow)
+                    .where(_FootprintRow.library_name == library_name)
+                    .order_by(_FootprintRow.footprint_name)
+                )
+                .scalars()
+                .all()
+            )
         return [self._orm_to_footprint(r) for r in rows]
 
-    def get_all_libraries(self) -> list['FpLibraryRecord']:
+    def get_all_libraries(self) -> list["FpLibraryRecord"]:
         """Return all indexed library records, ordered alphabetically."""
         with self._Session() as session:
-            rows = session.execute(
-                select(_FpLibraryRow).order_by(_FpLibraryRow.library_name)
-            ).scalars().all()
+            rows = (
+                session.execute(select(_FpLibraryRow).order_by(_FpLibraryRow.library_name))
+                .scalars()
+                .all()
+            )
         return [self._orm_to_library(r) for r in rows]
 
-    def get_stats(self) -> 'DbStats':
+    def get_stats(self) -> "DbStats":
         """Return summary statistics about the database."""
         with self._Session() as session:
             lib_count: int = session.execute(
@@ -391,9 +400,7 @@ class FootprintDatabase:
             fp_count: int = session.execute(
                 select(func.count()).select_from(_FootprintRow)
             ).scalar_one()
-            last_sync = session.execute(
-                select(func.max(_FpLibraryRow.last_indexed))
-            ).scalar_one()
+            last_sync = session.execute(select(func.max(_FpLibraryRow.last_indexed))).scalar_one()
         return DbStats(
             library_count=lib_count,
             footprint_count=fp_count,
@@ -412,19 +419,19 @@ class FootprintDatabase:
     @staticmethod
     def _fts_escape(query: str) -> str:
         """Convert a plain user query into a safe FTS5 MATCH expression."""
-        tokens = re.split(r'\s+', query.strip())
+        tokens = re.split(r"\s+", query.strip())
         # Strip double-quotes from each token to avoid malformed FTS5 MATCH syntax
-        cleaned = [t.replace('"', '') for t in tokens if t]
-        escaped = ' '.join(f'"{t}"' for t in cleaned if t)
+        cleaned = [t.replace('"', "") for t in tokens if t]
+        escaped = " ".join(f'"{t}"' for t in cleaned if t)
         return escaped if escaped else '""'
 
     @staticmethod
     def _like_escape(s: str) -> str:
         """Escape LIKE special characters in a user-supplied substring."""
-        return s.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
+        return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
     @staticmethod
-    def _orm_to_footprint(row: _FootprintRow) -> 'FootprintRecord':
+    def _orm_to_footprint(row: _FootprintRow) -> "FootprintRecord":
         return FootprintRecord(
             library_name=row.library_name,
             footprint_name=row.footprint_name,
@@ -437,7 +444,7 @@ class FootprintDatabase:
         )
 
     @staticmethod
-    def _orm_to_library(row: _FpLibraryRow) -> 'FpLibraryRecord':
+    def _orm_to_library(row: _FpLibraryRow) -> "FpLibraryRecord":
         return FpLibraryRecord(
             id=row.id,
             library_name=row.library_name,
@@ -450,7 +457,7 @@ class FootprintDatabase:
         )
 
     @staticmethod
-    def _row_to_footprint(row) -> 'FootprintRecord':
+    def _row_to_footprint(row) -> "FootprintRecord":
         """Convert a raw DB row (from FTS query) to FootprintRecord."""
         return FootprintRecord(
             library_name=row.library_name,

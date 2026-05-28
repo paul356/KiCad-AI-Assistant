@@ -3,7 +3,6 @@
 import asyncio
 import os
 import shutil
-import tempfile
 
 import pytest
 
@@ -88,7 +87,7 @@ class TestClearBoardOutline:
         assert result["count"] == 0
 
     def test_backup_created(self, tools, board_copy):
-        result = _run(tools["clear_board_outline"](pcb_path=board_copy, ctx=None))
+        _run(tools["clear_board_outline"](pcb_path=board_copy, ctx=None))
         assert os.path.exists(board_copy + ".bak")
 
 
@@ -151,8 +150,8 @@ class TestSetBoardOutlineRect:
         )
         assert result["items_added"] == 1
         # Verify only one gr_rect on Edge.Cuts
-        from kcaa.utils.pcb_sexp_utils import load_pcb
         from kcaa.utils.pcb_board_utils import get_edge_cuts_items
+        from kcaa.utils.pcb_sexp_utils import load_pcb
 
         items = get_edge_cuts_items(load_pcb(board_copy))
         assert len(items) == 1
@@ -172,8 +171,8 @@ class TestSetBoardOutlineRect:
             )
         )
         assert result["items_added"] == 8
-        from kcaa.utils.pcb_sexp_utils import load_pcb
         from kcaa.utils.pcb_board_utils import get_edge_cuts_items
+        from kcaa.utils.pcb_sexp_utils import load_pcb
 
         items = get_edge_cuts_items(load_pcb(board_copy))
         assert len(items) == 8
@@ -192,8 +191,8 @@ class TestSetBoardOutlineRect:
                 ctx=None,
             )
         )
-        from kcaa.utils.pcb_sexp_utils import load_pcb
         from kcaa.utils.pcb_board_utils import get_edge_cuts_items
+        from kcaa.utils.pcb_sexp_utils import load_pcb
 
         items = get_edge_cuts_items(load_pcb(board_copy))
         assert len(items) == 1
@@ -269,8 +268,8 @@ class TestSetFootprintProperty:
             )
         )
         assert "error" not in result
-        from kcaa.utils.pcb_sexp_utils import load_pcb
         from kcaa.utils.pcb_footprint_utils import find_footprint, get_fp_property
+        from kcaa.utils.pcb_sexp_utils import load_pcb
 
         data = load_pcb(board_copy)
         fp = find_footprint(data, "R1")

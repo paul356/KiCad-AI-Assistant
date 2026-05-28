@@ -4,25 +4,21 @@ Unit tests for:
   - kcaa/utils/footprint_database.py
   - kcaa/utils/footprint_index_manager.py
 """
+
 import os
-import tempfile
 
-import pytest
-
-from kcaa.utils.pcb_library_utils import (
-    parse_fp_lib_table,
-    build_effective_library_list,
-    parse_kicad_mod,
-    scan_footprint_library,
-    _parse_fp_lib_table_recursive,
-    _build_env_map,
-)
 from kcaa.utils.footprint_database import (
     FootprintDatabase,
     FootprintRecord,
-    FpLibraryRecord,
 )
 from kcaa.utils.footprint_index_manager import FootprintIndexManager
+from kcaa.utils.pcb_library_utils import (
+    _build_env_map,
+    _parse_fp_lib_table_recursive,
+    build_effective_library_list,
+    parse_fp_lib_table,
+    parse_kicad_mod,
+)
 
 FIXTURE_DIR = os.path.join(os.path.dirname(__file__), "fixtures")
 FP_LIB_TABLE = os.path.join(FIXTURE_DIR, "fp-lib-table")
@@ -37,6 +33,7 @@ def _compute_dir_checksum(path: str) -> str:
 # Helpers — build temporary .pretty and fp-lib-table fixtures
 # ---------------------------------------------------------------------------
 
+
 def _make_pretty(tmp_path, name: str, mods: list[str]) -> str:
     """Create a .pretty directory with given .kicad_mod filenames (empty)."""
     lib_dir = tmp_path / f"{name}.pretty"
@@ -50,29 +47,32 @@ def _make_pretty(tmp_path, name: str, mods: list[str]) -> str:
 
 def _make_fp_lib_table(path: str, entries: list[tuple[str, str]]) -> str:
     """Write a minimal fp-lib-table with given (nickname, uri) entries."""
-    lines = ['(fp_lib_table\n  (version 7)']
+    lines = ["(fp_lib_table\n  (version 7)"]
     for nick, uri in entries:
-        lines.append(f'  (lib (name "{nick}") (type "KiCad") (uri "{uri}") (options "") (descr ""))')
-    lines.append(')')
-    with open(path, 'w') as f:
-        f.write('\n'.join(lines))
+        lines.append(
+            f'  (lib (name "{nick}") (type "KiCad") (uri "{uri}") (options "") (descr ""))'
+        )
+    lines.append(")")
+    with open(path, "w") as f:
+        f.write("\n".join(lines))
     return path
 
 
 def _make_table_entry_fp_lib_table(outer_path: str, inner_path: str) -> None:
     """Write an fp-lib-table where one entry has type="Table"."""
     content = (
-        '(fp_lib_table\n  (version 7)\n'
+        "(fp_lib_table\n  (version 7)\n"
         f'  (lib (name "System") (type "Table") (uri "{inner_path}") (options "") (descr ""))\n'
-        ')'
+        ")"
     )
-    with open(outer_path, 'w') as f:
+    with open(outer_path, "w") as f:
         f.write(content)
 
 
 # ---------------------------------------------------------------------------
 # parse_kicad_mod — attr and has_3d_model
 # ---------------------------------------------------------------------------
+
 
 class TestParseKicadModAttr:
     def test_attr_smd(self):
@@ -88,7 +88,7 @@ class TestParseKicadModAttr:
         mod.write_text(
             '(footprint "W3D" (layer "F.Cu") (descr "with 3d") (attr smd)'
             '  (model "foo.step" (offset (xyz 0 0 0)))'
-            ')'
+            ")"
         )
         info = parse_kicad_mod(str(mod))
         assert info["has_3d_model"] is True
@@ -102,9 +102,7 @@ class TestParseKicadModAttr:
 
     def test_through_hole_attr(self, tmp_path):
         mod = tmp_path / "TH.kicad_mod"
-        mod.write_text(
-            '(footprint "TH" (layer "F.Cu") (descr "through hole") (attr through_hole))'
-        )
+        mod.write_text('(footprint "TH" (layer "F.Cu") (descr "through hole") (attr through_hole))')
         info = parse_kicad_mod(str(mod))
         assert info["attr"] == "through_hole"
 
@@ -112,6 +110,7 @@ class TestParseKicadModAttr:
 # ---------------------------------------------------------------------------
 # parse_fp_lib_table — Table-type indirection
 # ---------------------------------------------------------------------------
+
 
 class TestParseFpLibTableTableType:
     def test_direct_kicad_entries(self, tmp_path):
@@ -160,16 +159,16 @@ class TestBuildEffectiveLibraryList:
 
         global_table = tmp_path / "global-fp-lib-table"
         global_table.write_text(
-            '(fp_lib_table\n  (version 7)\n'
+            "(fp_lib_table\n  (version 7)\n"
             f'  (lib (name "Shared") (type "KiCad") (uri "{sys_dir}") (options "") (descr "global"))\n'
-            ')'
+            ")"
         )
 
         project_table = tmp_path / "project-fp-lib-table"
         project_table.write_text(
-            '(fp_lib_table\n  (version 7)\n'
+            "(fp_lib_table\n  (version 7)\n"
             f'  (lib (name "Shared") (type "KiCad") (uri "{proj_dir}") (options "") (descr "project"))\n'
-            ')'
+            ")"
         )
 
         env = _build_env_map()
@@ -194,6 +193,7 @@ class TestBuildEffectiveLibraryList:
 # FootprintDatabase
 # ---------------------------------------------------------------------------
 
+
 def _make_db(tmp_path) -> FootprintDatabase:
     return FootprintDatabase(str(tmp_path / "fp.db"))
 
@@ -215,7 +215,9 @@ class TestFootprintDatabase:
     def test_save_and_retrieve(self, tmp_path):
         db = _make_db(tmp_path)
         recs = [_make_record("Res_SMD", "R_0402"), _make_record("Res_SMD", "R_0603")]
-        n = db.save_library("Res_SMD", "${FP}/Res.pretty", "/tmp/Res.pretty", "SMD Res", "abc123", recs)
+        n = db.save_library(
+            "Res_SMD", "${FP}/Res.pretty", "/tmp/Res.pretty", "SMD Res", "abc123", recs
+        )
         assert n == 2
         fps = db.get_library_footprints("Res_SMD")
         assert len(fps) == 2
@@ -224,8 +226,14 @@ class TestFootprintDatabase:
 
     def test_get_footprint(self, tmp_path):
         db = _make_db(tmp_path)
-        db.save_library("Res_SMD", "${FP}/Res.pretty", "/tmp/Res.pretty", "SMD Res", "abc",
-                        [_make_record("Res_SMD", "R_0402", description="0402 res", tags="resistor")])
+        db.save_library(
+            "Res_SMD",
+            "${FP}/Res.pretty",
+            "/tmp/Res.pretty",
+            "SMD Res",
+            "abc",
+            [_make_record("Res_SMD", "R_0402", description="0402 res", tags="resistor")],
+        )
         fp = db.get_footprint("Res_SMD", "R_0402")
         assert fp is not None
         assert fp.description == "0402 res"
@@ -298,7 +306,9 @@ class TestFootprintDatabase:
 
     def test_stats(self, tmp_path):
         db = _make_db(tmp_path)
-        db.save_library("L", "u", "/p", "d", "c", [_make_record("L", "F1"), _make_record("L", "F2")])
+        db.save_library(
+            "L", "u", "/p", "d", "c", [_make_record("L", "F1"), _make_record("L", "F2")]
+        )
         stats = db.get_stats()
         assert stats.library_count == 1
         assert stats.footprint_count == 2
@@ -322,6 +332,7 @@ class TestFootprintDatabase:
 # ---------------------------------------------------------------------------
 # FootprintIndexManager._compute_dir_checksum
 # ---------------------------------------------------------------------------
+
 
 class TestComputeDirChecksum:
     def test_empty_dir(self, tmp_path):
@@ -349,6 +360,7 @@ class TestComputeDirChecksum:
 
     def test_different_checksum_after_modify(self, tmp_path):
         import time as _time
+
         d = tmp_path / "Lib.pretty"
         d.mkdir()
         f = d / "R.kicad_mod"
@@ -373,6 +385,7 @@ class TestComputeDirChecksum:
 # FootprintIndexManager.sync
 # ---------------------------------------------------------------------------
 
+
 class TestFootprintIndexManagerSync:
     def _mgr(self, tmp_path, project_path=None) -> FootprintIndexManager:
         db_path = tmp_path / "test_fp.db"
@@ -386,7 +399,7 @@ class TestFootprintIndexManagerSync:
 
     def test_sync_adds_new_libraries(self, tmp_path, monkeypatch):
         lib_dir = _make_pretty(tmp_path, "Res", ["R_0402", "R_0603"])
-        table = self._make_lib_table_for(tmp_path, lib_dir)
+        self._make_lib_table_for(tmp_path, lib_dir)
 
         mgr = self._mgr(tmp_path)
         monkeypatch.setattr(
@@ -418,6 +431,7 @@ class TestFootprintIndexManagerSync:
 
     def test_sync_updates_on_file_change(self, tmp_path, monkeypatch):
         import time as _time
+
         lib_dir = _make_pretty(tmp_path, "Res", ["R_0402"])
         entry = {"nickname": "Res", "uri": lib_dir, "raw_uri": lib_dir, "description": ""}
 
@@ -474,7 +488,12 @@ class TestFootprintIndexManagerSync:
         assert s2.updated == 1  # force=True causes reparse even if unchanged
 
     def test_sync_handles_missing_dir(self, tmp_path, monkeypatch):
-        entry = {"nickname": "Ghost", "uri": "/nonexistent/.pretty", "raw_uri": "u", "description": ""}
+        entry = {
+            "nickname": "Ghost",
+            "uri": "/nonexistent/.pretty",
+            "raw_uri": "u",
+            "description": "",
+        }
         monkeypatch.setattr(
             "kcaa.utils.footprint_index_manager.build_effective_library_list",
             lambda project_path=None: [entry],
@@ -498,7 +517,12 @@ class TestFootprintIndexManagerSync:
 
     def test_touch_updates_dir_path_on_path_change(self, tmp_path, monkeypatch):
         lib_dir = _make_pretty(tmp_path, "Res", ["R_0402"])
-        entry_old = {"nickname": "Res", "uri": lib_dir, "raw_uri": "${FP}/Res.pretty", "description": ""}
+        entry_old = {
+            "nickname": "Res",
+            "uri": lib_dir,
+            "raw_uri": "${FP}/Res.pretty",
+            "description": "",
+        }
 
         call_count = 0
 
@@ -511,9 +535,17 @@ class TestFootprintIndexManagerSync:
             new_dir = str(tmp_path / "new_mount" / "Res.pretty")
             os.makedirs(new_dir, exist_ok=True)
             import shutil
+
             for f in os.listdir(lib_dir):
                 shutil.copy2(os.path.join(lib_dir, f), os.path.join(new_dir, f))
-            return [{"nickname": "Res", "uri": new_dir, "raw_uri": "${FP}/Res.pretty", "description": ""}]
+            return [
+                {
+                    "nickname": "Res",
+                    "uri": new_dir,
+                    "raw_uri": "${FP}/Res.pretty",
+                    "description": "",
+                }
+            ]
 
         monkeypatch.setattr(
             "kcaa.utils.footprint_index_manager.build_effective_library_list",
@@ -532,7 +564,6 @@ class TestFootprintIndexManagerSync:
 # Tests for async sync_footprint_index + get_footprint_sync_status tools
 # ---------------------------------------------------------------------------
 
-import time
 import kcaa.tools.pcb_library_tools as _tool_module
 
 
@@ -545,7 +576,7 @@ class TestFpSyncTools:
             _tool_module._fp_sync_state.running = False
             _tool_module._fp_sync_state.current = 0
             _tool_module._fp_sync_state.total = 0
-            _tool_module._fp_sync_state.current_library = ''
+            _tool_module._fp_sync_state.current_library = ""
             _tool_module._fp_sync_state.last_result = None
             _tool_module._fp_sync_state.error = None
 
@@ -554,9 +585,17 @@ class TestFpSyncTools:
         lib_dir = _make_pretty(tmp_path, "Res", ["R_0402"])
 
         def _effective(project_path=None):
-            return [{"nickname": "Res", "uri": lib_dir, "raw_uri": "${FP}/Res.pretty", "description": ""}]
+            return [
+                {
+                    "nickname": "Res",
+                    "uri": lib_dir,
+                    "raw_uri": "${FP}/Res.pretty",
+                    "description": "",
+                }
+            ]
 
         from kcaa.utils.footprint_index_manager import FootprintIndexManager
+
         db_path = str(tmp_path / "fp.db")
         mgr = FootprintIndexManager(db_path=db_path)
 
@@ -585,9 +624,17 @@ class TestFpSyncTools:
         lib_dir = _make_pretty(tmp_path, "Cap", ["C_0402"])
 
         def _effective(project_path=None):
-            return [{"nickname": "Cap", "uri": lib_dir, "raw_uri": "${FP}/Cap.pretty", "description": ""}]
+            return [
+                {
+                    "nickname": "Cap",
+                    "uri": lib_dir,
+                    "raw_uri": "${FP}/Cap.pretty",
+                    "description": "",
+                }
+            ]
 
         from kcaa.utils.footprint_index_manager import FootprintIndexManager
+
         db_path = str(tmp_path / "fp2.db")
         mgr = FootprintIndexManager(db_path=db_path)
 
@@ -624,6 +671,7 @@ class TestFpSyncTools:
                 _tool_module._fp_sync_state.current_library = "SomeLib"
 
             from fastmcp import FastMCP
+
             mcp = FastMCP("test")
             _tool_module.register_pcb_library_tools(mcp)
             tool = await mcp.get_tool("sync_footprint_index")
@@ -648,6 +696,7 @@ class TestFpSyncTools:
                 _tool_module._fp_sync_state.current_library = "Lib50"
 
             from fastmcp import FastMCP
+
             mcp = FastMCP("test")
             _tool_module.register_pcb_library_tools(mcp)
             tool = await mcp.get_tool("get_footprint_sync_status")

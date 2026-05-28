@@ -384,9 +384,10 @@ def register_pcb_edit_tools(mcp: FastMCP) -> None:
                 error (str): Present only on failure.
         """
         try:
-            from kcaa.tools.kipy_tools import _connect  # noqa: PLC0415
-            from kipy.proto.common import commands as _commands  # noqa: PLC0415
             import kipy.errors  # noqa: PLC0415
+            from kipy.proto.common import commands as _commands  # noqa: PLC0415
+
+            from kcaa.tools.kipy_tools import _connect  # noqa: PLC0415
 
             kicad = _connect()
             try:
@@ -418,8 +419,7 @@ def register_pcb_edit_tools(mcp: FastMCP) -> None:
             _status_messages = {
                 _commands.RAS_UNKNOWN: "RAS_UNKNOWN — KiCad returned an unknown status",
                 _commands.RAS_INVALID: (
-                    "RAS_INVALID — action not found; "
-                    "make sure a PCB or schematic is open in KiCad"
+                    "RAS_INVALID — action not found; make sure a PCB or schematic is open in KiCad"
                 ),
                 _commands.RAS_FRAME_NOT_OPEN: (
                     "RAS_FRAME_NOT_OPEN — the required editor frame is not open; "

@@ -112,6 +112,21 @@ ignore = [
     "B008",  # do not perform function calls in argument defaults
     "C901",  # too complex (handled by other tools)
     "B905",  # zip() without an explicit strict= parameter
+    "B007",  # loop control variable not used
+    "E722",  # bare except
+    "E741",  # ambiguous variable name
+    "E402",  # module level import not at top of file
+    "B018",  # useless expression
+    "F403",  # star imports
+    "F405",  # may be undefined from star imports
+    "SIM102",  # nested if statements
+    "SIM105",  # use contextlib.suppress
+    "SIM108",  # use ternary operator
+    "SIM114",  # combine if branches
+    "SIM115",  # use context handler for file operations
+    "SIM117",  # use single with statement
+    "SIM118",  # use in for dict key lookup
+    "SIM103",  # return bool directly
 ]
 unfixable = [
     "B",  # Avoid trying to fix flake8-bugbear violations

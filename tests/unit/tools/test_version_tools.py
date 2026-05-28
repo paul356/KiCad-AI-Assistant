@@ -5,16 +5,14 @@ Mocks version_manager functions so tests are self-contained.
 """
 
 import asyncio
-import os
-from datetime import datetime
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-
 # ---------------------------------------------------------------------------
 # MockMCP — captures @mcp.tool()-decorated coroutines
 # ---------------------------------------------------------------------------
+
 
 class _MockMCP:
     """Minimal FastMCP stand-in that captures @mcp.tool()-decorated functions."""
@@ -26,12 +24,14 @@ class _MockMCP:
         def decorator(fn):
             self.tools[fn.__name__] = fn
             return fn
+
         return decorator
 
 
 def _get_tools() -> dict:
     """Register version tools against a mock MCP and return the captured dict."""
     from kcaa.tools.version_tools import register_version_tools
+
     mock = _MockMCP()
     register_version_tools(mock)
     return mock.tools
@@ -44,6 +44,7 @@ def _run(coro):
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
 
 @pytest.fixture()
 def tools():
@@ -74,7 +75,7 @@ class TestSaveFileVersion:
         """When saving a new version with no existing snapshots."""
         test_file = tmp_path / "design.kicad_sch"
         test_file.write_text("content")
-        
+
         snapshot_path = str(tmp_path / ".versions" / "design.kicad_sch.20260528_100000_000000")
         mock_save.return_value = snapshot_path
 
@@ -91,12 +92,12 @@ class TestSaveFileVersion:
         """When file content matches latest snapshot, reuse it."""
         test_file = tmp_path / "design.kicad_sch"
         test_file.write_text("content")
-        
+
         existing_id = "20260528_090000_000000"
         mock_list.return_value = [
             {"id": existing_id, "timestamp": "2026-05-28 09:00:00", "size_bytes": 7}
         ]
-        
+
         snapshot_path = str(tmp_path / ".versions" / f"design.kicad_sch.{existing_id}")
         mock_save.return_value = snapshot_path
 
@@ -111,7 +112,7 @@ class TestSaveFileVersion:
     def test_file_not_found(self, mock_list, mock_save, tmp_path):
         """When file does not exist."""
         test_file = tmp_path / "nonexistent.kicad_sch"
-        
+
         mock_list.return_value = []
         mock_save.side_effect = FileNotFoundError(f"File not found: {test_file}")
 
@@ -126,7 +127,7 @@ class TestSaveFileVersion:
         """When save_version_snapshot raises OSError."""
         test_file = tmp_path / "design.kicad_sch"
         test_file.write_text("content")
-        
+
         mock_save.side_effect = OSError("Permission denied")
 
         result = _run(self.fn(str(test_file), ctx=None))
@@ -150,7 +151,7 @@ class TestListFileVersions:
         """When there are existing version snapshots."""
         test_file = tmp_path / "design.kicad_sch"
         test_file.write_text("content")
-        
+
         versions = [
             {"id": "20260528_100000_000000", "timestamp": "2026-05-28 10:00:00", "size_bytes": 100},
             {"id": "20260528_090000_000000", "timestamp": "2026-05-28 09:00:00", "size_bytes": 90},
@@ -194,7 +195,7 @@ class TestListFileVersions:
     def test_current_file_missing(self, mock_list, tmp_path):
         """When file doesn't exist but snapshots do, current is None."""
         test_file = tmp_path / "nonexistent.kicad_sch"
-        
+
         mock_list.return_value = [
             {"id": "20260528_100000_000000", "timestamp": "2026-05-28 10:00:00", "size_bytes": 100}
         ]
@@ -210,7 +211,7 @@ class TestListFileVersions:
         """When list_versions raises OSError."""
         test_file = tmp_path / "design.kicad_sch"
         test_file.write_text("content")
-        
+
         mock_list.side_effect = OSError("Permission denied")
 
         result = _run(self.fn(str(test_file), ctx=None))
@@ -234,10 +235,10 @@ class TestRestoreFileVersion:
         """When restore succeeds."""
         test_file = tmp_path / "design.kicad_sch"
         test_file.write_text("content")
-        
+
         version_id = "20260528_090000_000000"
         backup_path = str(tmp_path / ".versions" / "design.kicad_sch.20260528_100000_000000")
-        
+
         mock_restore.return_value = {
             "restored_from": version_id,
             "backup_of_current": backup_path,
@@ -253,7 +254,7 @@ class TestRestoreFileVersion:
     def test_file_not_found(self, mock_restore, tmp_path):
         """When file does not exist."""
         test_file = tmp_path / "nonexistent.kicad_sch"
-        
+
         mock_restore.side_effect = FileNotFoundError(f"File not found: {test_file}")
 
         result = _run(self.fn(str(test_file), "20260528_090000_000000", ctx=None))
@@ -266,7 +267,7 @@ class TestRestoreFileVersion:
         """When version snapshot does not exist."""
         test_file = tmp_path / "design.kicad_sch"
         test_file.write_text("content")
-        
+
         mock_restore.side_effect = FileNotFoundError("Version 'invalid' not found")
 
         result = _run(self.fn(str(test_file), "invalid", ctx=None))
@@ -279,7 +280,7 @@ class TestRestoreFileVersion:
         """When restore_version raises OSError."""
         test_file = tmp_path / "design.kicad_sch"
         test_file.write_text("content")
-        
+
         mock_restore.side_effect = OSError("Permission denied")
 
         result = _run(self.fn(str(test_file), "20260528_090000_000000", ctx=None))

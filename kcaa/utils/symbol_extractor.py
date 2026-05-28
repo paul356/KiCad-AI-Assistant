@@ -51,9 +51,7 @@ def extract_lib_symbol_raw(
     try:
         stat = os.stat(file_path)
     except OSError as exc:
-        raise FileNotFoundError(
-            f"Cannot stat library file {file_path!r}: {exc}"
-        ) from exc
+        raise FileNotFoundError(f"Cannot stat library file {file_path!r}: {exc}") from exc
 
     if stat.st_mtime == db_mtime and stat.st_size == db_size:
         log.debug("Fast-path extract: file_index=%d from %r", file_index, file_path)
@@ -67,10 +65,7 @@ def extract_lib_symbol_raw(
         raw = _fallback_path(file_path, symbol_name)
 
     if len(raw) < 2 or not isinstance(raw[1], str):
-        raise ValueError(
-            f"Extracted symbol has no string name at index 1 "
-            f"(got {raw[:3]!r})"
-        )
+        raise ValueError(f"Extracted symbol has no string name at index 1 (got {raw[:3]!r})")
     extracted_name = raw[1]
     if extracted_name != symbol_name:
         raise ValueError(
@@ -95,13 +90,13 @@ def _fast_path(file_path: str, file_index: int) -> list:
       1  inside (kicad_symbol_lib ...)
       2  inside a direct child of (kicad_symbol_lib ...)
     """
-    with open(file_path, "r", encoding="utf-8") as fh:
+    with open(file_path, encoding="utf-8") as fh:
         text = fh.read()
 
     depth = 0
     in_string = False
     escape_next = False
-    sym_count = 0         # (symbol ...) blocks seen so far (0-based)
+    sym_count = 0  # (symbol ...) blocks seen so far (0-based)
     capture_start = None
 
     i = 0
@@ -138,7 +133,7 @@ def _fast_path(file_path: str, file_index: int) -> list:
                 while j < n and text[j] in " \t\r\n":
                     j += 1
                 tok_start = j
-                while j < n and text[j] not in " \t\r\n()\"":
+                while j < n and text[j] not in ' \t\r\n()"':
                     j += 1
                 token = text[tok_start:j]
 

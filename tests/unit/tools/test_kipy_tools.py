@@ -7,14 +7,14 @@ Mocks kipy module and related dependencies so tests are self-contained.
 import asyncio
 import os
 import sys
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
-
 
 # ---------------------------------------------------------------------------
 # MockMCP — captures @mcp.tool()-decorated coroutines
 # ---------------------------------------------------------------------------
+
 
 class _MockMCP:
     """Minimal FastMCP stand-in that captures @mcp.tool()-decorated functions."""
@@ -26,12 +26,14 @@ class _MockMCP:
         def decorator(fn):
             self.tools[fn.__name__] = fn
             return fn
+
         return decorator
 
 
 def _get_tools() -> dict:
     """Register kipy tools against a mock MCP and return the captured dict."""
     from kcaa.tools.kipy_tools import register_kipy_tools
+
     mock = _MockMCP()
     register_kipy_tools(mock)
     return mock.tools
@@ -44,6 +46,7 @@ def _run(coro):
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
 
 @pytest.fixture()
 def tools():
@@ -88,10 +91,10 @@ class TestFindKicadSocket:
         """When no env var, glob for socket files and pick newest."""
         # Remove KICAD_API_SOCKET if it exists
         os.environ.pop("KICAD_API_SOCKET", None)
-        
+
         mock_glob.return_value = ["/tmp/kicad/api-123.sock", "/tmp/kicad/api-456.sock"]
         mock_getmtime.side_effect = [1000, 2000]  # second is newer
-        
+
         mock_kicad = MagicMock()
         mock_kicad.ping.return_value = None
         mock_connect.return_value = mock_kicad
@@ -108,7 +111,7 @@ class TestFindKicadSocket:
     def test_socket_default_fallback(self, mock_connect, mock_glob, tools):
         """When no env var and no socket files, use default."""
         os.environ.pop("KICAD_API_SOCKET", None)
-        
+
         mock_kicad = MagicMock()
         mock_kicad.ping.return_value = None
         mock_connect.return_value = mock_kicad
@@ -148,16 +151,16 @@ class TestCheckKicadIpcConnection:
         """When ping times out but socket exists, still consider connected."""
         # Create a mock kipy.errors module
         mock_kipy_errors = MagicMock()
-        
+
         class MockConnectionError(Exception):
             pass
-        
+
         mock_kipy_errors.ConnectionError = MockConnectionError
-        
+
         # Mock the kipy module
         mock_kipy = MagicMock()
         mock_kipy.errors = mock_kipy_errors
-        
+
         with patch.dict(sys.modules, {"kipy": mock_kipy, "kipy.errors": mock_kipy_errors}):
             mock_kicad = MagicMock()
             mock_kicad.ping.side_effect = MockConnectionError("Connection timed out")
@@ -173,15 +176,15 @@ class TestCheckKicadIpcConnection:
     def test_connection_refused(self, mock_connect):
         """When connection is refused, return connected=False."""
         mock_kipy_errors = MagicMock()
-        
+
         class MockConnectionError(Exception):
             pass
-        
+
         mock_kipy_errors.ConnectionError = MockConnectionError
-        
+
         mock_kipy = MagicMock()
         mock_kipy.errors = mock_kipy_errors
-        
+
         with patch.dict(sys.modules, {"kipy": mock_kipy, "kipy.errors": mock_kipy_errors}):
             mock_kicad = MagicMock()
             mock_kicad.ping.side_effect = MockConnectionError("Connection refused")
@@ -235,20 +238,23 @@ class TestSaveDocument:
         # Mock kipy imports
         mock_document_type = MagicMock()
         mock_document_type.DOCTYPE_PCB = "pcb"
-        
+
         mock_board_doc = MagicMock()
         mock_kicad.get_open_documents.return_value = [mock_board_doc]
-        
+
         mock_board = MagicMock()
         mock_board.save.return_value = None
 
-        with patch.dict(sys.modules, {
-            "kipy": MagicMock(),
-            "kipy.proto": MagicMock(),
-            "kipy.proto.common": MagicMock(),
-            "kipy.proto.common.types": MagicMock(DocumentType=mock_document_type),
-            "kipy.board": MagicMock(Board=MagicMock(return_value=mock_board)),
-        }):
+        with patch.dict(
+            sys.modules,
+            {
+                "kipy": MagicMock(),
+                "kipy.proto": MagicMock(),
+                "kipy.proto.common": MagicMock(),
+                "kipy.proto.common.types": MagicMock(DocumentType=mock_document_type),
+                "kipy.board": MagicMock(Board=MagicMock(return_value=mock_board)),
+            },
+        ):
             result = _run(self.fn("/path/to/board.kicad_pcb", ctx=None))
 
             assert result["success"] is True
@@ -262,20 +268,23 @@ class TestSaveDocument:
 
         mock_document_type = MagicMock()
         mock_document_type.DOCTYPE_SCHEMATIC = "schematic"
-        
+
         mock_sch_doc = MagicMock()
         mock_kicad.get_open_documents.return_value = [mock_sch_doc]
-        
+
         mock_schematic = MagicMock()
         mock_schematic.save.return_value = None
 
-        with patch.dict(sys.modules, {
-            "kipy": MagicMock(),
-            "kipy.proto": MagicMock(),
-            "kipy.proto.common": MagicMock(),
-            "kipy.proto.common.types": MagicMock(DocumentType=mock_document_type),
-            "kipy.schematic": MagicMock(Schematic=MagicMock(return_value=mock_schematic)),
-        }):
+        with patch.dict(
+            sys.modules,
+            {
+                "kipy": MagicMock(),
+                "kipy.proto": MagicMock(),
+                "kipy.proto.common": MagicMock(),
+                "kipy.proto.common.types": MagicMock(DocumentType=mock_document_type),
+                "kipy.schematic": MagicMock(Schematic=MagicMock(return_value=mock_schematic)),
+            },
+        ):
             result = _run(self.fn("/path/to/design.kicad_sch", ctx=None))
 
             assert result["success"] is True
@@ -289,16 +298,19 @@ class TestSaveDocument:
 
         mock_document_type = MagicMock()
         mock_document_type.DOCTYPE_PCB = "pcb"
-        
+
         mock_kicad.get_open_documents.return_value = []
 
-        with patch.dict(sys.modules, {
-            "kipy": MagicMock(),
-            "kipy.proto": MagicMock(),
-            "kipy.proto.common": MagicMock(),
-            "kipy.proto.common.types": MagicMock(DocumentType=mock_document_type),
-            "kipy.board": MagicMock(),
-        }):
+        with patch.dict(
+            sys.modules,
+            {
+                "kipy": MagicMock(),
+                "kipy.proto": MagicMock(),
+                "kipy.proto.common": MagicMock(),
+                "kipy.proto.common.types": MagicMock(DocumentType=mock_document_type),
+                "kipy.board": MagicMock(),
+            },
+        ):
             result = _run(self.fn("/path/to/board.kicad_pcb", ctx=None))
 
             assert result["success"] is False
@@ -312,33 +324,36 @@ class TestSaveDocument:
 
         mock_document_type = MagicMock()
         mock_document_type.DOCTYPE_SCHEMATIC = "schematic"
-        
+
         mock_kicad.get_open_documents.return_value = []
 
         # Create proper mock modules
         mock_kipy_proto_common_types = MagicMock()
         mock_kipy_proto_common_types.DocumentType = mock_document_type
-        
+
         mock_kipy_proto_common = MagicMock()
         mock_kipy_proto_common.types = mock_kipy_proto_common_types
-        
+
         mock_kipy_proto = MagicMock()
         mock_kipy_proto.common = mock_kipy_proto_common
-        
+
         mock_kipy_schematic = MagicMock()
         mock_kipy_schematic.Schematic = MagicMock()
-        
+
         mock_kipy = MagicMock()
         mock_kipy.proto = mock_kipy_proto
         mock_kipy.schematic = mock_kipy_schematic
 
-        with patch.dict(sys.modules, {
-            "kipy": mock_kipy,
-            "kipy.proto": mock_kipy_proto,
-            "kipy.proto.common": mock_kipy_proto_common,
-            "kipy.proto.common.types": mock_kipy_proto_common_types,
-            "kipy.schematic": mock_kipy_schematic,
-        }):
+        with patch.dict(
+            sys.modules,
+            {
+                "kipy": mock_kipy,
+                "kipy.proto": mock_kipy_proto,
+                "kipy.proto.common": mock_kipy_proto_common,
+                "kipy.proto.common.types": mock_kipy_proto_common_types,
+                "kipy.schematic": mock_kipy_schematic,
+            },
+        ):
             result = _run(self.fn("/path/to/design.kicad_sch", ctx=None))
 
             assert result["success"] is False

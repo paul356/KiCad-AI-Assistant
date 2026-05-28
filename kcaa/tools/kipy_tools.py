@@ -9,11 +9,12 @@ directly.
 WARNING: run_action uses an unstable KiCad internal API.  Action names may
 change between KiCad versions.
 """
+
 import glob
 import logging
 import os
 import platform
-from typing import Any, Dict
+from typing import Any
 
 from fastmcp import Context, FastMCP
 
@@ -35,6 +36,7 @@ def _find_kicad_socket() -> str:
 
     if platform.system() == "Windows":
         from tempfile import gettempdir
+
         return f"ipc://{gettempdir()}\\kicad\\api.sock"
 
     # Candidate directories (Flatpak first, then standard)
@@ -56,24 +58,23 @@ def _find_kicad_socket() -> str:
 
 def _connect(timeout_ms: int = 5000) -> Any:
     """Return a connected kipy.KiCad instance, or raise ConnectionError.
-    
+
     Args:
         timeout_ms: Maximum time to wait for KiCad responses (default 5000ms).
     """
     try:
         import kipy  # imported lazily so the module loads even without kipy
+
         return kipy.KiCad(socket_path=_find_kicad_socket(), timeout_ms=timeout_ms)
     except ImportError as exc:
         raise RuntimeError(
-            "kicad-python is not installed. "
-            "Run: uv pip install kicad-python"
+            "kicad-python is not installed. Run: uv pip install kicad-python"
         ) from exc
     except Exception as exc:
         # kipy raises kipy.errors.ConnectionError (subclass of OSError) when
         # KiCad is not running or the socket is unavailable.
         raise RuntimeError(
-            f"Not connected to KiCad: {exc}. "
-            "Make sure KiCad is running and the IPC API is enabled."
+            f"Not connected to KiCad: {exc}. Make sure KiCad is running and the IPC API is enabled."
         ) from exc
 
 
@@ -85,7 +86,7 @@ def register_kipy_tools(mcp: FastMCP) -> None:
     # ------------------------------------------------------------------
 
     @mcp.tool()
-    async def check_kicad_ipc_connection(ctx: Context | None = None) -> Dict[str, Any]:
+    async def check_kicad_ipc_connection(ctx: Context | None = None) -> dict[str, Any]:
         """Check if the KiCad IPC socket is open and responsive.
 
         Uses kipy's ping() command to actively test the connection to the
@@ -101,11 +102,11 @@ def register_kipy_tools(mcp: FastMCP) -> None:
         """
         try:
             import kipy.errors  # noqa: PLC0415
-            
+
             # Use longer timeout for ping check since KiCad may be slow to respond
             kicad = _connect(timeout_ms=10000)
             socket_path = _find_kicad_socket()
-            
+
             try:
                 kicad.ping()
                 return {
@@ -172,8 +173,9 @@ def register_kipy_tools(mcp: FastMCP) -> None:
             kicad = _connect(timeout_ms=10000)
 
             if file_path.endswith(".kicad_pcb"):
-                from kipy.proto.common.types import DocumentType  # noqa: PLC0415
                 from kipy.board import Board  # noqa: PLC0415
+                from kipy.proto.common.types import DocumentType  # noqa: PLC0415
+
                 docs = kicad.get_open_documents(DocumentType.DOCTYPE_PCB)
                 if not docs:
                     return {"success": False, "error": "No PCB is currently open in KiCad"}
@@ -184,6 +186,7 @@ def register_kipy_tools(mcp: FastMCP) -> None:
             elif file_path.endswith(".kicad_sch"):
                 from kipy.proto.common.types import DocumentType  # noqa: PLC0415
                 from kipy.schematic import Schematic  # noqa: PLC0415
+
                 docs = kicad.get_open_documents(DocumentType.DOCTYPE_SCHEMATIC)
                 if not docs:
                     return {"success": False, "error": "No schematic is currently open in KiCad"}
