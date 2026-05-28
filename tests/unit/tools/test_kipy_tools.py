@@ -297,6 +297,7 @@ class TestSaveDocument:
             "kipy.proto": MagicMock(),
             "kipy.proto.common": MagicMock(),
             "kipy.proto.common.types": MagicMock(DocumentType=mock_document_type),
+            "kipy.board": MagicMock(),
         }):
             result = _run(self.fn("/path/to/board.kicad_pcb", ctx=None))
 

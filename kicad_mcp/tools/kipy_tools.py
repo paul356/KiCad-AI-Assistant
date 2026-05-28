@@ -196,6 +196,15 @@ def register_kipy_tools(mcp: FastMCP) -> None:
 
         except RuntimeError as exc:
             return {"success": False, "error": str(exc)}
+        except ConnectionError as exc:
+            # kipy raises ConnectionError when IPC API is not available
+            return {
+                "success": False,
+                "error": (
+                    f"Cannot connect to KiCad IPC API: {exc}. "
+                    "Please enable IPC in KiCad: Preferences → Preferences → Plugins → 'Enable KiCad API' (KiCad 9+)."
+                ),
+            }
         except Exception as exc:
             log.exception("Unexpected error in save_document")
             return {"success": False, "error": str(exc)}
