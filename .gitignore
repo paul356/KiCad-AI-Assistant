@@ -61,7 +61,6 @@ kcaa/utils/footprint_db/*.db-shm
 kcaa/utils/footprint_db/*.db-wal
 
 # UV and modern Python tooling
-uv.lock
 .uv-cache/
 .ruff_cache/
 
