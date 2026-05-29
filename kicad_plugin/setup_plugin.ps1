@@ -84,16 +84,32 @@ if ($PluginDir -match '\\kicad\\(\d+\.\d+)\\') {
 
 # --- Platform-specific default paths ---
 $appdata = $env:APPDATA
-$DefaultAppPath = "C:\Program Files\KiCad"
 $KicadConfigDir = "$appdata\kicad\$KicadVersion"
-$Kicad3rdParty = "$appdata\kicad\$KicadVersion\3rdparty"
+# Candidate paths for 3rd-party resources (search in order)
+$Kicad3rdParty = @(
+    "$appdata\kicad\$KicadVersion\3rdparty",
+    (Join-Path ([Environment]::GetFolderPath('MyDocuments')) (Join-Path 'KiCad' (Join-Path $KicadVersion '3rdparty')))
+)
 
 # --- KICAD_APP_PATH ---
-$KicadAppPath = $DefaultAppPath
-if (Test-Path $KicadAppPath) {
+# Try to find KiCad in "Program Files" on any fixed drive (C:, D:, etc.).
+# Only check the standard Program Files path (no Program Files (x86)).
+$possibleTarget = "Program Files\KiCad"
+$KicadAppPath = $null
+
+$drives = Get-PSDrive -PSProvider FileSystem | Where-Object { $_.Root -match '^[A-Za-z]:\\$' }
+foreach ($d in $drives) {
+    $candidate = Join-Path $d.Root $possibleTarget
+    if (Test-Path $candidate) {
+        $KicadAppPath = $candidate
+        break
+    }
+}
+
+if ($KicadAppPath) {
     Write-Host "  Detected KICAD_APP_PATH: $KicadAppPath"
 } else {
-    Write-Host "  Warning: Default KICAD_APP_PATH not found: $KicadAppPath"
+    Write-Host "  Warning: KiCad not found in $possibleTarget on any drive."
     $KicadAppPath = Read-Host "  Please enter KiCad application path"
     if (-not (Test-Path $KicadAppPath)) {
         Write-Host "  Error: Directory does not exist: $KicadAppPath"
@@ -114,10 +130,23 @@ if (Test-Path $KicadConfigDir) {
 }
 
 # --- Verify KICAD_3RD_PARTY ---
-if (Test-Path $Kicad3rdParty) {
+# Find the first existing candidate
+$Kicad3rdPartySelected = $null
+$Kicad3rdPartySource = $null
+foreach ($p in $Kicad3rdParty) {
+    if (Test-Path $p) {
+        $Kicad3rdPartySelected = $p
+        $Kicad3rdPartySource = $p
+        break
+    }
+}
+
+if ($Kicad3rdPartySelected) {
+    $Kicad3rdParty = $Kicad3rdPartySelected
     Write-Host "  Detected KICAD_3RD_PARTY: $Kicad3rdParty"
 } else {
-    Write-Host "  Warning: KICAD_3RD_PARTY not found: $Kicad3rdParty"
+    $searched = $Kicad3rdParty -join '; '
+    Write-Host "  Warning: KICAD_3RD_PARTY not found. Searched: $searched"
     $Kicad3rdParty = Read-Host "  Please enter KiCad 3rd-party directory"
     if (-not (Test-Path $Kicad3rdParty)) {
         Write-Host "  Error: Directory does not exist: $Kicad3rdParty"
@@ -137,7 +166,8 @@ $envContent = @(
     "KICAD_3RD_PARTY=$Kicad3rdParty"
 )
 
-$envContent | Out-File -FilePath $EnvFile -Encoding UTF8
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+[System.IO.File]::WriteAllLines($EnvFile, $envContent, $utf8NoBom)
 
 Write-Host ""
 Write-Host "  Configuration written to: $EnvFile"

@@ -18,7 +18,7 @@ from typing import Optional
 
 log = logging.getLogger(__name__)
 
-_STARTUP_TIMEOUT_S = 15
+_STARTUP_TIMEOUT_S = 30
 _HEALTH_POLL_INTERVAL_S = 0.3
 _HEALTH_PATH = "/mcp"  # FastMCP's default health-check endpoint
 
