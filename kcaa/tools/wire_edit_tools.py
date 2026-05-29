@@ -13,6 +13,7 @@ from fastmcp import Context, FastMCP
 import skip
 
 from kcaa.utils.schematic_sexp_utils import save_schematic
+from kcaa.utils.skip_compat import safe_schematic
 from kcaa.utils.skip_helpers import sym_pin_world_coords
 
 log = logging.getLogger(__name__)
@@ -1018,7 +1019,7 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
             return {"error": "Wire start and end points are identical (zero-length wire)"}
 
         try:
-            sch = skip.Schematic(schematic_path)
+            sch = safe_schematic(schematic_path)
         except Exception as exc:
             return {"error": f"Failed to open schematic: {exc}"}
 
@@ -1176,7 +1177,7 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
             }
 
         try:
-            sch = skip.Schematic(schematic_path)
+            sch = safe_schematic(schematic_path)
         except Exception as exc:
             return {"error": f"Failed to open schematic: {exc}"}
 
@@ -1282,7 +1283,7 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
             return {"error": f"Schematic file not found: {schematic_path!r}"}
 
         try:
-            sch = skip.Schematic(schematic_path)
+            sch = safe_schematic(schematic_path)
         except Exception as exc:
             return {"error": f"Failed to open schematic: {exc}"}
 
@@ -1436,7 +1437,7 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
             parsed.append((sx, sy, ex, ey))
 
         try:
-            sch = skip.Schematic(schematic_path)
+            sch = safe_schematic(schematic_path)
         except Exception as exc:
             return {"error": f"Failed to open schematic: {exc}"}
 

@@ -101,7 +101,7 @@ def _resolve_uri(uri: str, env: dict[str, str]) -> str:
         var = match.group(1)
         return env.get(var, match.group(0))
 
-    expanded = re.sub(r"\$\{([^}]+)\}", _replace, uri)
+    expanded = os.path.normpath(re.sub(r"\$\{([^}]+)\}", _replace, uri))
     unresolved = sorted(set(re.findall(r"\$\{([^}]+)\}", expanded)))
     if unresolved:
         log.warning(

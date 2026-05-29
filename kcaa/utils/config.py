@@ -176,12 +176,12 @@ class LibraryPathConfig:
         # Search paths
         self._additional_search_paths = self._build_search_paths()
 
-        # Library paths
-        self._kicad_config_dir = self._resolve_config_dir()
-        self._kicad_symbol_dir = self._resolve_symbol_dir()
-        self._kicad_footprint_dir = self._resolve_footprint_dir()
-        self._kicad_3rd_party = self._resolve_3rd_party()
-        self._kicad_template_dir = self._resolve_template_dir()
+        # Library paths (normalised for cross-platform consistency)
+        self._kicad_config_dir = os.path.normpath(self._resolve_config_dir())
+        self._kicad_symbol_dir = os.path.normpath(self._resolve_symbol_dir())
+        self._kicad_footprint_dir = os.path.normpath(self._resolve_footprint_dir())
+        self._kicad_3rd_party = os.path.normpath(self._resolve_3rd_party())
+        self._kicad_template_dir = os.path.normpath(self._resolve_template_dir())
 
         # Environment variables for subprocess injection
         self._env_vars = {
@@ -337,22 +337,26 @@ class LibraryPathConfig:
         return paths
 
     @staticmethod
-    def _default_symbol_dir(kicad_app_path: str) -> str:
+    def _default_symbol_dir(kicad_app_path: str, kicad_version: str) -> str:
         """Return the platform-specific default KiCad system symbols directory."""
         if _SYSTEM == "Darwin":
             return os.path.join(kicad_app_path, "Contents", "SharedSupport", "symbols")
         elif _SYSTEM == "Windows":
-            return os.path.join(kicad_app_path, "share", "kicad", "symbols")
+            return os.path.join(kicad_app_path, kicad_version, "share", "kicad", "symbols")
+        elif _SYSTEM == "Linux":
+            return os.path.join(kicad_app_path, "symbols")
         else:
             return os.path.join(kicad_app_path, "symbols")
 
     @staticmethod
-    def _default_footprint_dir(kicad_app_path: str) -> str:
+    def _default_footprint_dir(kicad_app_path: str, kicad_version: str) -> str:
         """Return the platform-specific default KiCad system footprints directory."""
         if _SYSTEM == "Darwin":
             return os.path.join(kicad_app_path, "Contents", "SharedSupport", "footprints")
         elif _SYSTEM == "Windows":
-            return os.path.join(kicad_app_path, "share", "kicad", "footprints")
+            return os.path.join(kicad_app_path, kicad_version, "share", "kicad", "footprints")
+        elif _SYSTEM == "Linux":
+            return os.path.join(kicad_app_path, "footprints")
         else:
             return os.path.join(kicad_app_path, "footprints")
 
@@ -386,7 +390,7 @@ class LibraryPathConfig:
         if _SYSTEM == "Darwin":
             return os.path.join(kicad_app_path, "Contents", "SharedSupport", "template")
         elif _SYSTEM == "Windows":
-            return os.path.join(kicad_app_path, "share", "kicad", "template")
+            return os.path.join(kicad_app_path, kicad_version, "share", "kicad", "template")
         else:
             return os.path.join(kicad_app_path, "template")
 
@@ -402,14 +406,14 @@ class LibraryPathConfig:
         env_path = os.environ.get("KICAD_SYMBOL_DIR")
         if env_path:
             return os.path.expanduser(env_path)
-        return self._default_symbol_dir(self._kicad_app_path)
+        return self._default_symbol_dir(self._kicad_app_path, self._kicad_version)
 
     def _resolve_footprint_dir(self) -> str:
         """Resolve KiCad footprint directory from environment or defaults."""
         env_path = os.environ.get("KICAD_FOOTPRINT_DIR")
         if env_path:
             return os.path.expanduser(env_path)
-        return self._default_footprint_dir(self._kicad_app_path)
+        return self._default_footprint_dir(self._kicad_app_path, self._kicad_version)
 
     def _resolve_3rd_party(self) -> str:
         """Resolve KiCad 3rd-party packages directory from environment or defaults."""
@@ -487,7 +491,7 @@ class LibraryPathConfig:
     @property
     def symbol_table_file(self) -> str:
         """Path to the sym-lib-table file."""
-        return self._kicad_config_dir + "/sym-lib-table"
+        return os.path.join(self._kicad_config_dir, "sym-lib-table")
 
     @property
     def kicad_extensions(self) -> dict[str, str]:

@@ -22,7 +22,8 @@ from pathlib import Path
 import time
 
 import skip.collection
-import skip.sexp.sourcefile
+
+from kcaa.utils.skip_compat import safe_source_file
 
 from kcaa.utils.symbol_database import (
     DbStats,
@@ -190,7 +191,7 @@ class SymbolIndexManager:
                 except Exception as exc:
                     log.warning("progress_callback raised: %s", exc)
             if not os.path.exists(path):
-                log.warning(f"[{i + 1}/{total}] Skipping missing: {lib_name}")
+                log.warning(f"[{i + 1}/{total}] Skipping missing: {lib_name} -> {path}")
                 stats.failed += 1
                 continue
 
@@ -345,7 +346,7 @@ class SymbolIndexManager:
             print(f"  [{label}] RSS: {rss:.1f} MB{pv_str}")
 
         snapshot("before SourceFile()")
-        library_file = skip.sexp.sourcefile.SourceFile(file_path)
+        library_file = safe_source_file(file_path)
         snapshot("after SourceFile()")
 
         if diagnose and _asizeof is not None:

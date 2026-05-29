@@ -13,7 +13,8 @@ import os
 
 import sexpdata
 import skip.collection
-import skip.sexp.sourcefile
+
+from kcaa.utils.skip_compat import safe_source_file
 
 log = logging.getLogger(__name__)
 
@@ -169,7 +170,7 @@ def _fallback_path(file_path: str, symbol_name: str) -> list:
     Full-parse fallback: parse the entire file with skip's SourceFile,
     then find the symbol by name and return a deep copy of its raw list.
     """
-    library_file = skip.sexp.sourcefile.SourceFile(file_path)
+    library_file = safe_source_file(file_path)
 
     if not hasattr(library_file, "symbol"):
         raise ValueError(f"No symbols found in {file_path!r}")

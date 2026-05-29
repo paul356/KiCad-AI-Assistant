@@ -9,9 +9,8 @@ import logging
 import os
 import re
 
-import skip.sexp.sourcefile
-
 from kcaa.utils.config import LibraryPathConfig
+from kcaa.utils.skip_compat import safe_source_file
 
 log = logging.getLogger(__name__)
 
@@ -81,7 +80,7 @@ class SymbolIndexReader:
         visited.add(real_path)
 
         log.info("Parsing sym-lib-table: %s", path)
-        table = skip.sexp.sourcefile.SourceFile(path)
+        table = safe_source_file(path)
         entries: list[LibraryTableEntry] = []
 
         if not hasattr(table, "lib"):
@@ -140,7 +139,9 @@ class SymbolIndexReader:
     def _expand_env_vars(self, path: str) -> str:
         """Replace ${VAR_NAME} placeholders using the configured env vars."""
         for var, value in self._config.get_env_vars().items():
-            path = re.sub(r"\$\{" + re.escape(var) + r"\}", value, path)
+            path = path.replace("${" + var + "}", value)
+        # Normalise mixed \ and / separators on Windows.
+        path = os.path.normpath(path)
         unresolved = sorted(set(re.findall(r"\$\{([^}]+)\}", path)))
         if unresolved:
             log.warning(

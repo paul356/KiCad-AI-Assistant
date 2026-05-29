@@ -20,6 +20,7 @@ import skip
 
 from kcaa.utils.config import LibraryPathConfig
 from kcaa.utils.schematic_sexp_utils import save_schematic
+from kcaa.utils.skip_compat import safe_schematic
 from kcaa.utils.symbol_extractor import extract_lib_symbol_raw
 from kcaa.utils.symbol_geometry import (
     BBox,
@@ -288,7 +289,7 @@ def _do_add_symbol(
         lib_sym_raw = _resolve_extends_symbol(lib_sym_raw, library_name)
 
         try:
-            sch = skip.Schematic(schematic_path)
+            sch = safe_schematic(schematic_path)
         except Exception as exc:
             return {"error": f"Failed to open schematic: {exc}"}
 
@@ -1255,7 +1256,7 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
             return {"error": "references list must not be empty"}
 
         try:
-            sch = skip.Schematic(schematic_path)
+            sch = safe_schematic(schematic_path)
         except Exception as exc:
             return {"error": f"Failed to open schematic: {exc}"}
 
@@ -1375,7 +1376,7 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
             return {"error": "property_name must not be empty"}
 
         try:
-            sch = skip.Schematic(schematic_path)
+            sch = safe_schematic(schematic_path)
         except Exception as exc:
             return {"error": f"Failed to open schematic: {exc}"}
 
@@ -1489,7 +1490,7 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
             return {"error": "reference must not be empty"}
 
         try:
-            sch = skip.Schematic(schematic_path)
+            sch = safe_schematic(schematic_path)
         except Exception as exc:
             return {"error": f"Failed to open schematic: {exc}"}
 
@@ -1573,7 +1574,7 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
             }
 
         try:
-            sch = skip.Schematic(schematic_path)
+            sch = safe_schematic(schematic_path)
         except Exception as exc:
             return {"error": f"Failed to open schematic: {exc}"}
 
@@ -1675,7 +1676,7 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
             return {"error": f"rotation must be 0, 90, 180, or 270 (got {rotation!r})"}
 
         try:
-            sch = skip.Schematic(schematic_path)
+            sch = safe_schematic(schematic_path)
         except Exception as exc:
             return {"error": f"Failed to open schematic: {exc}"}
 
@@ -1848,7 +1849,7 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
             return {"error": f"angle must be 0, 90, 180, or 270 (got {angle})"}
 
         try:
-            sch = skip.Schematic(schematic_path)
+            sch = safe_schematic(schematic_path)
         except Exception as exc:
             return {"error": f"Failed to open schematic: {exc}"}
 
@@ -1891,7 +1892,7 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
             return {"error": f"Schematic file not found: {schematic_path!r}"}
 
         try:
-            sch = skip.Schematic(schematic_path)
+            sch = safe_schematic(schematic_path)
         except Exception as exc:
             return {"error": f"Failed to open schematic: {exc}"}
 
@@ -1965,7 +1966,7 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
                 return {"error": "positions list must not be empty"}
 
             try:
-                sch = skip.Schematic(schematic_path)
+                sch = safe_schematic(schematic_path)
             except Exception as exc:
                 return {"error": f"Failed to open schematic: {exc}"}
 
@@ -2046,7 +2047,7 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
             return {"error": f"Coordinates must be finite numbers (got x={x}, y={y})"}
 
         try:
-            sch = skip.Schematic(schematic_path)
+            sch = safe_schematic(schematic_path)
         except Exception as exc:
             return {"error": f"Failed to open schematic: {exc}"}
 

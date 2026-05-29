@@ -10,6 +10,7 @@ from typing import Any
 
 import skip
 
+from kcaa.utils.skip_compat import safe_schematic
 from kcaa.utils.skip_helpers import sym_pin_world_coords
 from kcaa.utils.symbol_geometry import (
     BBox,
@@ -68,7 +69,7 @@ class SchematicParser:
             print(f"Schematic file not found: {self.schematic_path}")
             raise FileNotFoundError(f"Schematic file not found: {self.schematic_path}")
         try:
-            self._sch = skip.Schematic(self.schematic_path)
+            self._sch = safe_schematic(self.schematic_path)
             print(f"Successfully loaded schematic: {self.schematic_path}")
         except Exception as e:
             print(f"Error reading schematic file: {str(e)}")
