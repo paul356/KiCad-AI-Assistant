@@ -8,6 +8,7 @@ result even when KiCad is not running or the IPC API is unavailable.
 
 import logging
 import os
+import tempfile
 
 log = logging.getLogger(__name__)
 
@@ -34,7 +35,7 @@ def _find_kicad_socket() -> str:
     candidate_dirs = []
     if home:
         candidate_dirs.append(f"{home}/.var/app/org.kicad.KiCad/cache/tmp/kicad")
-    candidate_dirs.append("/tmp/kicad")
+    candidate_dirs.append(os.path.join(tempfile.gettempdir(), "kicad"))
 
     for sock_dir in candidate_dirs:
         matches = glob.glob(os.path.join(sock_dir, "api*.sock"))

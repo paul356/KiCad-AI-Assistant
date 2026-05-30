@@ -8,6 +8,7 @@ Layout:
   │  [input field]                             [Send]        │
   └──────────────────────────────────────────────────────────┘
 """
+
 from __future__ import annotations
 
 import collections
@@ -15,13 +16,14 @@ import datetime
 import logging
 import os
 import threading
-from typing import Any, Optional
+from typing import Any
 
 log = logging.getLogger(__name__)
 
 try:
     import wx
     import wx.html
+
     _WX_AVAILABLE = True
 except ImportError:
     _WX_AVAILABLE = False
@@ -32,12 +34,14 @@ _WEBVIEW_AVAILABLE = False
 if _WX_AVAILABLE:
     try:
         import wx.html2 as _wx_html2
+
         _WEBVIEW_AVAILABLE = True
     except ImportError:
         pass
 
 
 if _WX_AVAILABLE:
+
     class AssistantPanel(wx.Frame):
         """Main floating panel for the KiCad AI Assistant."""
 
@@ -50,7 +54,7 @@ if _WX_AVAILABLE:
             )
             self._server_mgr = server_mgr
             self._settings = settings
-            self._llm_client: Optional[Any] = None
+            self._llm_client: Any | None = None
             self._busy = False
             # Thread-safe buffer for streamed text chunks; drained by _stream_timer
             self._stream_buffer: collections.deque = collections.deque()
@@ -72,7 +76,7 @@ if _WX_AVAILABLE:
             # Basename of the current session file; None means no file yet.
             # _save_session_to_disk overwrites this file when set, or creates
             # a new timestamped one otherwise.
-            self._current_session_file: Optional[str] = None
+            self._current_session_file: str | None = None
             # Keep the conversation pinned to the newest output while one AI
             # turn is actively streaming / appending tool results.
             self._follow_output_to_bottom: bool = False
@@ -108,22 +112,22 @@ if _WX_AVAILABLE:
         # ------------------------------------------------------------------ #
 
         # Colour palette (RGB tuples) — centralised for easy theming
-        _C_USER   = (34,  85, 204)   # Blue    – "You:" prefix
-        _C_AI     = (0,  130,  80)   # Green   – "AI:" prefix
-        _C_TOOL   = (120, 120, 120)  # Grey    – tool-call lines
-        _C_OK     = (0,  140,  0)    # Green   – success notices
-        _C_WARN   = (190, 100,  0)   # Amber   – warnings
-        _C_ERR    = (190,  30,  30)  # Red     – errors
-        _BG_CONV  = wx.Colour(245, 247, 252)  # Very light blue-grey conversation bg
-        _BG_TOOL  = wx.Colour(250, 248, 240)  # Warm off-white tool-log bg
+        _C_USER = (34, 85, 204)  # Blue    – "You:" prefix
+        _C_AI = (0, 130, 80)  # Green   – "AI:" prefix
+        _C_TOOL = (120, 120, 120)  # Grey    – tool-call lines
+        _C_OK = (0, 140, 0)  # Green   – success notices
+        _C_WARN = (190, 100, 0)  # Amber   – warnings
+        _C_ERR = (190, 30, 30)  # Red     – errors
+        _BG_CONV = wx.Colour(245, 247, 252)  # Very light blue-grey conversation bg
+        _BG_TOOL = wx.Colour(250, 248, 240)  # Warm off-white tool-log bg
 
         # Hex equivalents for HTML rendering
-        _C_USER_HEX  = "#2255CC"
-        _C_AI_HEX    = "#008250"
-        _C_TOOL_HEX  = "#787878"
-        _C_OK_HEX    = "#008C00"
-        _C_WARN_HEX  = "#BE6400"
-        _C_ERR_HEX   = "#BE1E1E"
+        _C_USER_HEX = "#2255CC"
+        _C_AI_HEX = "#008250"
+        _C_TOOL_HEX = "#787878"
+        _C_OK_HEX = "#008C00"
+        _C_WARN_HEX = "#BE6400"
+        _C_ERR_HEX = "#BE1E1E"
         _BG_CONV_HEX = "#F5F7FC"
 
         @staticmethod
@@ -144,7 +148,7 @@ if _WX_AVAILABLE:
             # Read the JS file
             js_code = "// shell.js not found"
             try:
-                with open(shell_js_path, "r", encoding="utf-8") as f:
+                with open(shell_js_path, encoding="utf-8") as f:
                     js_code = f.read()
                 log.info("Loaded shell.js: %d bytes", len(js_code))
                 # Check first few chars
@@ -177,9 +181,7 @@ if _WX_AVAILABLE:
                 "code{font-family:Microsoft YaHei UI,monospace;background:#e0e0e0;"
                 "padding:1px 3px;border-radius:2px;font-weight:600}"
                 "</style>"
-                "<script>"
-                + js_code +
-                "</script>"
+                "<script>" + js_code + "</script>"
                 "</head>"
                 "<body>"
                 "<div id='conversation'></div>"
@@ -215,7 +217,8 @@ if _WX_AVAILABLE:
             if _WEBVIEW_AVAILABLE:
                 try:
                     self._conv_view = _wx_html2.WebView.New(
-                        panel, style=wx.BORDER_SUNKEN,
+                        panel,
+                        style=wx.BORDER_SUNKEN,
                     )
                     self._use_webview = True
                     self.Bind(
@@ -237,12 +240,11 @@ if _WX_AVAILABLE:
 
             if not self._use_webview:
                 self._conv_view = wx.html.HtmlWindow(
-                    panel, style=wx.BORDER_SUNKEN,
+                    panel,
+                    style=wx.BORDER_SUNKEN,
                 )
                 self._conv_view.SetBackgroundColour(self._BG_CONV)
-                self._conv_view.SetPage(
-                    f'<html><body bgcolor="{self._BG_CONV_HEX}"></body></html>'
-                )
+                self._conv_view.SetPage(f'<html><body bgcolor="{self._BG_CONV_HEX}"></body></html>')
 
             self._conv_view.SetMinSize((-1, 120))
             vbox.Add(self._conv_view, 1, wx.ALL | wx.EXPAND, 4)
@@ -353,20 +355,25 @@ if _WX_AVAILABLE:
                     self._check_kicad_ipc_environment()
                     self._auto_save_pcb_on_open()
                 else:
-                    self._status_label.SetLabel("❌ Backend failed to start — use Options → Restart Backend to retry")
+                    self._status_label.SetLabel(
+                        "❌ Backend failed to start — use Options → Restart Backend to retry"
+                    )
                     self._status_label.SetForegroundColour(wx.Colour(*self._C_ERR))
                 self.Layout()
             except Exception as e:
                 import traceback
+
                 log.error("_on_server_started failed: %s\n%s", e, traceback.format_exc())
 
         def _init_llm_client(self) -> None:
             try:
                 from ..llm_client import LLMClient
+
                 self._llm_client = LLMClient(self._settings, self._server_mgr.base_url)
                 self._autoload_session()
             except Exception as e:
                 import traceback
+
                 log.error("_init_llm_client failed: %s\n%s", e, traceback.format_exc())
 
         # ------------------------------------------------------------------ #
@@ -394,24 +401,28 @@ if _WX_AVAILABLE:
             venv_site = os.path.join(plugin_dir, ".venv", "lib")
             # On Windows the venv layout is .venv/Lib/site-packages/ (capital
             # Lib, no python* subdirectory).  Check both layouts.
-            kipy_found = bool(glob.glob(os.path.join(venv_site, "python*", "site-packages", "kipy")))
+            kipy_found = bool(
+                glob.glob(os.path.join(venv_site, "python*", "site-packages", "kipy"))
+            )
             if not kipy_found:
                 win_site = os.path.join(plugin_dir, ".venv", "Lib", "site-packages", "kipy")
                 kipy_found = os.path.isdir(win_site)
             kipy_ok = kipy_found
             if not kipy_ok:
-                self._conv_entries.append({
-                    "type": "status",
-                    "text": (
-                        "⚠ kicad-python (kipy) is not installed in the MCP "
-                        "server's virtual environment. The 'Reload PCB' "
-                        "feature and the 'update_pcb_from_schematic' tool "
-                        "will be disabled. Run: "
-                        f".venv/bin/pip install kicad-python  "
-                        f"(looked in {venv_site})"
-                    ),
-                    "color_hex": self._C_WARN_HEX,
-                })
+                self._conv_entries.append(
+                    {
+                        "type": "status",
+                        "text": (
+                            "⚠ kicad-python (kipy) is not installed in the MCP "
+                            "server's virtual environment. The 'Reload PCB' "
+                            "feature and the 'update_pcb_from_schematic' tool "
+                            "will be disabled. Run: "
+                            f".venv/bin/pip install kicad-python  "
+                            f"(looked in {venv_site})"
+                        ),
+                        "color_hex": self._C_WARN_HEX,
+                    }
+                )
                 self._render_conversation()
 
             # 2) IPC socket check ------------------------------------------
@@ -427,6 +438,7 @@ if _WX_AVAILABLE:
                 if base_url:
                     try:
                         from ..llm_client import call_mcp_tool
+
                         result = call_mcp_tool(
                             base_url,
                             "check_kicad_ipc_connection",
@@ -446,17 +458,19 @@ if _WX_AVAILABLE:
         def _on_ipc_socket_checked(self, socket_exists: bool, checked_path: str) -> None:
             """Callback invoked on the UI thread after the async IPC socket check."""
             if not socket_exists:
-                self._conv_entries.append({
-                    "type": "status",
-                    "text": (
-                        f"⚠ KiCad IPC API socket not available at {checked_path}. "
-                        "The 'Reload PCB' feature and 'update_pcb_from_schematic' "
-                        "tool require it. Enable it in KiCad: "
-                        "Preferences → Preferences → Plugins → "
-                        "'Enable KiCad API' (KiCad 9+)."
-                    ),
-                    "color_hex": self._C_WARN_HEX,
-                })
+                self._conv_entries.append(
+                    {
+                        "type": "status",
+                        "text": (
+                            f"⚠ KiCad IPC API socket not available at {checked_path}. "
+                            "The 'Reload PCB' feature and 'update_pcb_from_schematic' "
+                            "tool require it. Enable it in KiCad: "
+                            "Preferences → Preferences → Plugins → "
+                            "'Enable KiCad API' (KiCad 9+)."
+                        ),
+                        "color_hex": self._C_WARN_HEX,
+                    }
+                )
                 self._render_conversation()
 
         def _auto_save_pcb_on_open(self) -> None:
@@ -465,25 +479,28 @@ if _WX_AVAILABLE:
             KiCad marks the PCB editor as dirty when the plugin is opened,
             so we save it immediately to clear the dirty state.
             Uses the save_document MCP tool via IPC for proper state management.
-            
+
             This MUST run on a background thread to avoid blocking the KiCad
             main thread, which would prevent KiCad from responding to IPC
             connections and cause a deadlock.
             """
+
             def _do_auto_save():
                 try:
                     import pcbnew as _pcbnew
+
                     board = _pcbnew.GetBoard()
                     if not board:
                         log.debug("Auto-save: no board open")
                         return
-                    
+
                     file_path = board.GetFileName()
                     if not file_path:
                         log.debug("Auto-save: board has no file path")
                         return
-                    
+
                     from ..llm_client import call_mcp_tool
+
                     result = call_mcp_tool(
                         self._server_mgr.base_url,
                         "save_document",
@@ -505,14 +522,24 @@ if _WX_AVAILABLE:
 
         def _on_send(self, event) -> None:
             if self._busy or not self._llm_client:
-                log.debug("_on_send: skipped (busy=%s, client=%s)", self._busy, self._llm_client is not None)
+                log.debug(
+                    "_on_send: skipped (busy=%s, client=%s)",
+                    self._busy,
+                    self._llm_client is not None,
+                )
                 return
             text = self._input.GetValue().strip()
             if not text:
                 return
             log.info("_on_send: user message (%d chars)", len(text))
             self._input.Clear()
-            self._conv_entries.append({"type": "user", "text": text, "timestamp": datetime.datetime.now().strftime("%H:%M:%S")})
+            self._conv_entries.append(
+                {
+                    "type": "user",
+                    "text": text,
+                    "timestamp": datetime.datetime.now().strftime("%H:%M:%S"),
+                }
+            )
             self._follow_output_to_bottom = True
             # Create the session file on the very first message so current.json
             # is established before the AI responds.
@@ -525,6 +552,7 @@ if _WX_AVAILABLE:
             self._send_btn.Enable(False)
 
             from ..context_bridge import collect_context, context_to_system_prompt_block
+
             ctx = collect_context()
             context_block = context_to_system_prompt_block(ctx)
 
@@ -557,8 +585,11 @@ if _WX_AVAILABLE:
                 except Exception as e:
                     log.exception("LLM request failed")
                     reply = f"[Error] {e}"
-                log.info("Background _run: finished (reply_len=%d, streamed=%s)",
-                         len(reply), state["ai_turn_started"])
+                log.info(
+                    "Background _run: finished (reply_len=%d, streamed=%s)",
+                    len(reply),
+                    state["ai_turn_started"],
+                )
                 wx.CallAfter(self._on_reply, reply, ctx, was_streamed=state["ai_turn_started"])
 
             threading.Thread(target=_run, daemon=True).start()
@@ -573,7 +604,11 @@ if _WX_AVAILABLE:
                 self._hide_stream_wrapper()
 
             if not was_streamed:
-                entry = {"type": "ai", "text": reply, "timestamp": datetime.datetime.now().strftime("%H:%M:%S")}
+                entry = {
+                    "type": "ai",
+                    "text": reply,
+                    "timestamp": datetime.datetime.now().strftime("%H:%M:%S"),
+                }
                 self._conv_entries.append(entry)
                 if self._use_webview and self._shell_loaded:
                     self._append_entry_js(entry, force_scroll_to_bottom=True)
@@ -636,9 +671,10 @@ if _WX_AVAILABLE:
                 return False
 
             import json as _json
+
             body_html = self._md_to_html(self._pending_ai_text)
             scroll_arg = "true" if self._follow_output_to_bottom else "false"
-            js = f'_updateStream({_json.dumps(body_html)}, {scroll_arg})'
+            js = f"_updateStream({_json.dumps(body_html)}, {scroll_arg})"
 
             self._js_running = True
             try:
@@ -670,33 +706,44 @@ if _WX_AVAILABLE:
             self._render_pending = False
 
             if self._shell_retry_count > 3:
-                log.error("WebView shell failed to load after %d retries — giving up",
-                          self._shell_retry_count)
-                self._conv_entries.append({
-                    "type": "status",
-                    "text": (
-                        "⚠ WebView failed to initialize after multiple retries. "
-                        "The chat panel may not work. Try restarting KiCad."
-                    ),
-                    "color_hex": self._C_ERR_HEX,
-                })
+                log.error(
+                    "WebView shell failed to load after %d retries — giving up",
+                    self._shell_retry_count,
+                )
+                self._conv_entries.append(
+                    {
+                        "type": "status",
+                        "text": (
+                            "⚠ WebView failed to initialize after multiple retries. "
+                            "The chat panel may not work. Try restarting KiCad."
+                        ),
+                        "color_hex": self._C_ERR_HEX,
+                    }
+                )
                 return
 
-            log.warning("WebView watchdog: shell load timed out (>5s), retry %d/3",
-                        self._shell_retry_count)
-            self._conv_entries.append({
-                "type": "status",
-                "text": (
-                    f"⚠ WebView initialization timed out (>5s). "
-                    f"Retrying ({self._shell_retry_count}/3)…"
-                ),
-                "color_hex": self._C_WARN_HEX,
-            })
+            log.warning(
+                "WebView watchdog: shell load timed out (>5s), retry %d/3", self._shell_retry_count
+            )
+            self._conv_entries.append(
+                {
+                    "type": "status",
+                    "text": (
+                        f"⚠ WebView initialization timed out (>5s). "
+                        f"Retrying ({self._shell_retry_count}/3)…"
+                    ),
+                    "color_hex": self._C_WARN_HEX,
+                }
+            )
             wx.CallAfter(self._load_shell)
 
         def _on_tool_call(self, name: str, args: dict, result: Any) -> None:
-            log.info("_on_tool_call: %s (shell_loaded=%s, entries=%d)",
-                     name, self._shell_loaded, len(self._conv_entries))
+            log.info(
+                "_on_tool_call: %s (shell_loaded=%s, entries=%d)",
+                name,
+                self._shell_loaded,
+                len(self._conv_entries),
+            )
             # If there is pending streamed text that preceded this tool call,
             # finalise it as an AI entry now so the timeline order is correct.
             if self._pending_ai_text:
@@ -706,18 +753,21 @@ if _WX_AVAILABLE:
             # chronological order alongside user and AI messages.
             # Store full data — truncation for UI display happens at render time
             # to preserve session data integrity.
-            self._conv_entries.append({
-                "type": "tool_call",
-                "name": name,
-                "args": args,
-                "result": result,
-            })
+            self._conv_entries.append(
+                {
+                    "type": "tool_call",
+                    "name": name,
+                    "args": args,
+                    "result": result,
+                }
+            )
             # Full update needed to clear pending-ai-text and show new entries
             self._render_conversation(force_scroll_to_bottom=self._follow_output_to_bottom)
             self._tool_calls_made = True
             # Use tool_registry to determine if tool modified PCB/schematic files
             try:
                 from ..tool_registry import get_tool_policy
+
                 policy = get_tool_policy(name)
             except Exception as e:
                 log.error("Failed to get tool policy for %s: %s", name, e)
@@ -730,38 +780,59 @@ if _WX_AVAILABLE:
 
         def _auto_refresh(self, ctx: dict) -> None:
             """Refresh the KiCad view automatically after tool calls."""
-            editor = ctx.get("active_editor", "unknown")
             if self._pcb_edited:
                 try:
                     import pcbnew
+
                     pcbnew.Refresh()
-                    self._conv_entries.append({"type": "status", "text": "⟳ Board view refreshed.", "color_hex": self._C_OK_HEX})
+                    self._conv_entries.append(
+                        {
+                            "type": "status",
+                            "text": "⟳ Board view refreshed.",
+                            "color_hex": self._C_OK_HEX,
+                        }
+                    )
                     self._render_conversation(force_scroll_to_bottom=self._follow_output_to_bottom)
                 except ImportError:
                     pass  # outside KiCad — silently skip
                 except Exception as e:
-                    self._conv_entries.append({"type": "status", "text": f"⚠ Auto-refresh failed: {e}", "color_hex": self._C_WARN_HEX})
+                    self._conv_entries.append(
+                        {
+                            "type": "status",
+                            "text": f"⚠ Auto-refresh failed: {e}",
+                            "color_hex": self._C_WARN_HEX,
+                        }
+                    )
                     self._render_conversation(force_scroll_to_bottom=self._follow_output_to_bottom)
                     return
             if self._schematic_edited:
-                self._conv_entries.append({
-                    "type": "status",
-                    "text": "ℹ Schematic updated on disk — use File → Revert in the Schematic Editor to see the changes.",
-                    "color_hex": self._C_WARN_HEX,
-                })
+                self._conv_entries.append(
+                    {
+                        "type": "status",
+                        "text": "ℹ Schematic updated on disk — use File → Revert in the Schematic Editor to see the changes.",
+                        "color_hex": self._C_WARN_HEX,
+                    }
+                )
                 self._render_conversation(force_scroll_to_bottom=self._follow_output_to_bottom)
 
         def _on_restart(self, event) -> None:
             if self._busy:
                 wx.MessageBox(
                     "Please wait for the current request to finish.",
-                    "Busy", wx.OK | wx.ICON_INFORMATION,
+                    "Busy",
+                    wx.OK | wx.ICON_INFORMATION,
                 )
                 return
             self._send_btn.Enable(False)
             self._status_label.SetLabel("⏳ Restarting backend…")
             self._status_label.SetForegroundColour(wx.NullColour)
-            self._conv_entries.append({"type": "status", "text": "↺ Restarting MCP backend…", "color_hex": self._C_WARN_HEX})
+            self._conv_entries.append(
+                {
+                    "type": "status",
+                    "text": "↺ Restarting MCP backend…",
+                    "color_hex": self._C_WARN_HEX,
+                }
+            )
             self._render_conversation()
 
             def _do_restart():
@@ -772,15 +843,26 @@ if _WX_AVAILABLE:
 
         def _on_restart_done(self, ok: bool) -> None:
             if ok:
-                self._conv_entries.append({"type": "status", "text": "✅ Backend restarted successfully.", "color_hex": self._C_OK_HEX})
+                self._conv_entries.append(
+                    {
+                        "type": "status",
+                        "text": "✅ Backend restarted successfully.",
+                        "color_hex": self._C_OK_HEX,
+                    }
+                )
                 self._render_conversation()
                 self._init_llm_client()
                 self._on_server_started(True)
             else:
-                self._conv_entries.append({"type": "status", "text": "❌ Backend failed to restart.", "color_hex": self._C_ERR_HEX})
+                self._conv_entries.append(
+                    {
+                        "type": "status",
+                        "text": "❌ Backend failed to restart.",
+                        "color_hex": self._C_ERR_HEX,
+                    }
+                )
                 self._render_conversation()
                 self._on_server_started(False)
-
 
         def _on_autoroute(self, event) -> None:
             """Menu handler: Tools → Auto Route…
@@ -792,23 +874,27 @@ if _WX_AVAILABLE:
             if self._busy:
                 wx.MessageBox(
                     "Please wait for the current AI request to finish.",
-                    "Busy", wx.OK | wx.ICON_INFORMATION,
+                    "Busy",
+                    wx.OK | wx.ICON_INFORMATION,
                 )
                 return
 
             # ---- 1. Get board (main thread) ----
             try:
                 import pcbnew as _pcbnew
+
                 board = _pcbnew.GetBoard()
             except Exception:
                 board = None
 
             if board is None:
-                self._conv_entries.append({
-                    "type": "status",
-                    "text": "⚠ No board is currently open. Open a .kicad_pcb file before running Auto Route.",
-                    "color_hex": self._C_WARN_HEX,
-                })
+                self._conv_entries.append(
+                    {
+                        "type": "status",
+                        "text": "⚠ No board is currently open. Open a .kicad_pcb file before running Auto Route.",
+                        "color_hex": self._C_WARN_HEX,
+                    }
+                )
                 self._render_conversation()
                 return
 
@@ -860,6 +946,7 @@ if _WX_AVAILABLE:
             # ---- 3. Export DSN (main thread — pcbnew call) ----
             import shutil
             import tempfile
+
             tmp_dir = tempfile.mkdtemp(prefix="kicad_autoroute_")
             dsn_path = os.path.join(tmp_dir, "board.dsn")
             ses_path = os.path.join(tmp_dir, "board.ses")
@@ -870,6 +957,7 @@ if _WX_AVAILABLE:
             if board_path and os.path.isfile(board_path):
                 try:
                     from ..llm_client import call_mcp_tool
+
                     result = call_mcp_tool(
                         self._server_mgr.base_url,
                         "save_file_version",
@@ -885,23 +973,29 @@ if _WX_AVAILABLE:
                 _pcbnew.ExportSpecctraDSN(board, dsn_path)
             except Exception as exc:
                 shutil.rmtree(tmp_dir, ignore_errors=True)
-                self._conv_entries.append({
-                    "type": "autoroute_log",
-                    "success": False,
-                    "message": f"DSN export failed: {exc}",
-                    "stdout": "", "stderr": "",
-                })
+                self._conv_entries.append(
+                    {
+                        "type": "autoroute_log",
+                        "success": False,
+                        "message": f"DSN export failed: {exc}",
+                        "stdout": "",
+                        "stderr": "",
+                    }
+                )
                 self._render_conversation()
                 return
 
             if not os.path.isfile(dsn_path):
                 shutil.rmtree(tmp_dir, ignore_errors=True)
-                self._conv_entries.append({
-                    "type": "autoroute_log",
-                    "success": False,
-                    "message": "DSN export produced no output file.",
-                    "stdout": "", "stderr": "",
-                })
+                self._conv_entries.append(
+                    {
+                        "type": "autoroute_log",
+                        "success": False,
+                        "message": "DSN export produced no output file.",
+                        "stdout": "",
+                        "stderr": "",
+                    }
+                )
                 self._render_conversation()
                 return
 
@@ -911,11 +1005,13 @@ if _WX_AVAILABLE:
             self._status_label.SetForegroundColour(wx.Colour(*self._C_WARN))
             self.Layout()
 
-            self._conv_entries.append({
-                "type": "status",
-                "text": "⏳ Auto Route started — running FreeRouting in background…",
-                "color_hex": self._C_WARN_HEX,
-            })
+            self._conv_entries.append(
+                {
+                    "type": "status",
+                    "text": "⏳ Auto Route started — running FreeRouting in background…",
+                    "color_hex": self._C_WARN_HEX,
+                }
+            )
             self._render_conversation()
 
             from ..autorouter import start_freerouting_thread
@@ -927,11 +1023,18 @@ if _WX_AVAILABLE:
                 # Marshal back to main thread for pcbnew import + UI update.
                 wx.CallAfter(
                     self._on_autoroute_done,
-                    success, message, stdout, stderr, ses_path, tmp_dir, backup_path,
+                    success,
+                    message,
+                    stdout,
+                    stderr,
+                    ses_path,
+                    tmp_dir,
+                    backup_path,
                 )
 
             start_freerouting_thread(
-                dsn_path, ses_path,
+                dsn_path,
+                ses_path,
                 on_done=_routing_done,
                 on_progress=_progress,
                 ignore_nets=ignore_nets,
@@ -959,6 +1062,7 @@ if _WX_AVAILABLE:
                     # ---- Import SES (main thread — pcbnew call) ----
                     try:
                         import pcbnew as _pcbnew
+
                         board = _pcbnew.GetBoard()
                         _pcbnew.ImportSpecctraSES(board, ses_path)
                         board.SetModified()
@@ -993,17 +1097,20 @@ if _WX_AVAILABLE:
                     message += f"\nBackup saved to: {backup_path}"
 
             # ---- Append collapsible log entry ----
-            self._conv_entries.append({
-                "type": "autoroute_log",
-                "success": success,
-                "message": message,
-                "stdout": stdout,
-                "stderr": stderr,
-            })
+            self._conv_entries.append(
+                {
+                    "type": "autoroute_log",
+                    "success": success,
+                    "message": message,
+                    "stdout": stdout,
+                    "stderr": stderr,
+                }
+            )
             self._render_conversation()
 
         def _on_settings(self, event) -> None:
             from .settings_dialog import SettingsDialog
+
             dlg = SettingsDialog(self, self._settings)
             if dlg.ShowModal() == wx.ID_OK:
                 if dlg.apply_to(self._settings):
@@ -1022,7 +1129,8 @@ if _WX_AVAILABLE:
             if self._busy:
                 wx.MessageBox(
                     "Please wait for the current request to finish.",
-                    "Busy", wx.OK | wx.ICON_INFORMATION,
+                    "Busy",
+                    wx.OK | wx.ICON_INFORMATION,
                 )
                 return
 
@@ -1046,9 +1154,9 @@ if _WX_AVAILABLE:
             # Remove current.json so a blank close won't restore the old session.
             self._remove_current_link()
 
-            self._status_label.SetLabel("✅ New session started" + (
-                " (previous session saved)" if has_content else ""
-            ))
+            self._status_label.SetLabel(
+                "✅ New session started" + (" (previous session saved)" if has_content else "")
+            )
             self._status_label.SetForegroundColour(wx.Colour(*self._C_OK))
             self.Layout()
 
@@ -1061,7 +1169,7 @@ if _WX_AVAILABLE:
             except OSError as e:
                 log.warning("Could not remove current.json: %s", e)
 
-        def _save_session_to_disk(self) -> Optional[str]:
+        def _save_session_to_disk(self) -> str | None:
             """Write current conv_entries + history to disk and update current.json.
 
             If ``_current_session_file`` is already set the existing file is
@@ -1119,16 +1227,19 @@ if _WX_AVAILABLE:
                 try:
                     with open(link, "w", encoding="utf-8") as lf:
                         lf.write(filename)
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug("Could not write session file link: %s", e)
 
         def _on_load_session(self, event) -> None:
-            import json as _json
             import glob
+            import json as _json
 
             if self._busy:
-                wx.MessageBox("Please wait for the current request to finish.",
-                              "Busy", wx.OK | wx.ICON_INFORMATION)
+                wx.MessageBox(
+                    "Please wait for the current request to finish.",
+                    "Busy",
+                    wx.OK | wx.ICON_INFORMATION,
+                )
                 return
 
             sessions_dir = self._sessions_dir()
@@ -1137,15 +1248,16 @@ if _WX_AVAILABLE:
                 reverse=True,
             )
             if not files:
-                wx.MessageBox("No saved sessions found.", "Load Session",
-                              wx.OK | wx.ICON_INFORMATION)
+                wx.MessageBox(
+                    "No saved sessions found.", "Load Session", wx.OK | wx.ICON_INFORMATION
+                )
                 return
 
             # Build display labels
             labels = []
             for f in files:
                 try:
-                    with open(f, "r", encoding="utf-8") as fh:
+                    with open(f, encoding="utf-8") as fh:
                         d = _json.load(fh)
                     ts = d.get("timestamp", "")[:19].replace("T", " ")
                     title = d.get("title", "")[:50]
@@ -1154,7 +1266,10 @@ if _WX_AVAILABLE:
                     labels.append(os.path.basename(f))
 
             dlg = wx.SingleChoiceDialog(
-                self, "Select a session to restore:", "Load Session", labels,
+                self,
+                "Select a session to restore:",
+                "Load Session",
+                labels,
             )
             if dlg.ShowModal() != wx.ID_OK:
                 dlg.Destroy()
@@ -1164,7 +1279,7 @@ if _WX_AVAILABLE:
 
             chosen = files[idx]
             try:
-                with open(chosen, "r", encoding="utf-8") as fh:
+                with open(chosen, encoding="utf-8") as fh:
                     data = _json.load(fh)
             except (OSError, _json.JSONDecodeError) as e:
                 wx.MessageBox(f"Could not load session:\n{e}", "Error", wx.OK | wx.ICON_ERROR)
@@ -1189,7 +1304,8 @@ if _WX_AVAILABLE:
             if self._busy:
                 wx.MessageBox(
                     "Please wait for the current request to finish.",
-                    "Busy", wx.OK | wx.ICON_INFORMATION,
+                    "Busy",
+                    wx.OK | wx.ICON_INFORMATION,
                 )
                 return
             self._stream_timer.Stop()
@@ -1220,10 +1336,7 @@ if _WX_AVAILABLE:
             visible top-level wx window left, KiCad's main window must
             have been closed without sending us EVT_CLOSE — so close
             ourselves now."""
-            others = [
-                w for w in wx.GetTopLevelWindows()
-                if w is not self and w.IsShown()
-            ]
+            others = [w for w in wx.GetTopLevelWindows() if w is not self and w.IsShown()]
             if not others:
                 self.Close(force=True)
 
@@ -1262,7 +1375,7 @@ if _WX_AVAILABLE:
 
             sessions_dir = self._sessions_dir()
             link = os.path.join(sessions_dir, "current.json")
-            path: Optional[str] = None
+            path: str | None = None
 
             if os.path.exists(link):
                 # Resolve: may be a real symlink or the plain-text fallback.
@@ -1276,7 +1389,7 @@ if _WX_AVAILABLE:
                 else:
                     # Plain-text pointer written by the symlink fallback.
                     try:
-                        with open(link, "r", encoding="utf-8") as lf:
+                        with open(link, encoding="utf-8") as lf:
                             fname = lf.read().strip()
                         candidate = os.path.join(sessions_dir, fname)
                         if os.path.isfile(candidate):
@@ -1288,7 +1401,7 @@ if _WX_AVAILABLE:
                 return  # No current.json and no sessions dir — blank start.
 
             try:
-                with open(path, "r", encoding="utf-8") as f:
+                with open(path, encoding="utf-8") as f:
                     data = _json.load(f)
             except (OSError, _json.JSONDecodeError) as e:
                 log.warning("Auto-load failed: %s", e)
@@ -1303,11 +1416,13 @@ if _WX_AVAILABLE:
             self._current_session_file = os.path.basename(path)
             if self._llm_client:
                 self._llm_client.set_history(history)
-            self._conv_entries.append({
-                "type": "status",
-                "text": "↺ Previous session restored automatically.",
-                "color_hex": self._C_TOOL_HEX,
-            })
+            self._conv_entries.append(
+                {
+                    "type": "status",
+                    "text": "↺ Previous session restored automatically.",
+                    "color_hex": self._C_TOOL_HEX,
+                }
+            )
             # Render once with all content and force scroll to bottom
             self._render_conversation(force_scroll_to_bottom=True)
 
@@ -1325,6 +1440,7 @@ if _WX_AVAILABLE:
             """
             try:
                 import markdown
+
                 return markdown.markdown(text, extensions=["tables", "fenced_code"])
             except ImportError:
                 pass
@@ -1360,15 +1476,17 @@ if _WX_AVAILABLE:
                     code_content = "\n".join(code_lines)
                     out.append(
                         '<pre style="font-family:monospace;white-space:pre;'
-                        'background:#f4f4f4;padding:8px;border-radius:4px;'
-                        'overflow-x:auto;font-size:9pt">'
-                        + code_content
-                        + "</pre>"
+                        "background:#f4f4f4;padding:8px;border-radius:4px;"
+                        'overflow-x:auto;font-size:9pt">' + code_content + "</pre>"
                     )
                     continue
 
                 # Pipe table: header row followed by a separator row  |---|---|
-                if "|" in line and i + 1 < len(lines) and re.match(r"^\s*\|?[\s:|-]+\|", lines[i + 1]):
+                if (
+                    "|" in line
+                    and i + 1 < len(lines)
+                    and re.match(r"^\s*\|?[\s:|-]+\|", lines[i + 1])
+                ):
                     if in_list:
                         out.append("</ul>")
                         in_list = False
@@ -1431,8 +1549,11 @@ if _WX_AVAILABLE:
             reload on WebView error recovery).  It transitions the shell
             state and triggers the first conversation render.
             """
-            log.debug("_on_webview_loaded: shell ready (render_pending=%s, entries=%d)",
-                      self._render_pending, len(self._conv_entries))
+            log.debug(
+                "_on_webview_loaded: shell ready (render_pending=%s, entries=%d)",
+                self._render_pending,
+                len(self._conv_entries),
+            )
             self._page_loading = False
             self._shell_retry_count = 0
             self._page_watchdog.Stop()
@@ -1450,19 +1571,21 @@ if _WX_AVAILABLE:
             description = ""
             try:
                 description = event.GetString()
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("WebView error description not available: %s", e)
             log.warning("WebView error: %s — reloading shell", description)
             self._page_loading = False
             self._shell_loaded = False
             self._js_running = False
             self._stream_wrapper_visible = False
             self._page_watchdog.Stop()
-            self._conv_entries.append({
-                "type": "status",
-                "text": f"⚠ WebView error: {description}. Retrying…",
-                "color_hex": self._C_WARN_HEX,
-            })
+            self._conv_entries.append(
+                {
+                    "type": "status",
+                    "text": f"⚠ WebView error: {description}. Retrying…",
+                    "color_hex": self._C_WARN_HEX,
+                }
+            )
             self._render_pending = False
             wx.CallAfter(self._load_shell)
 
@@ -1477,9 +1600,7 @@ if _WX_AVAILABLE:
 
             try:
                 # Check font
-                ok, result = self._conv_view.RunScript(
-                    "getComputedStyle(document.body).fontFamily"
-                )
+                ok, result = self._conv_view.RunScript("getComputedStyle(document.body).fontFamily")
                 log.info("_verify_shell_and_render: font=%r", result)
 
                 # Check all window functions (what's actually defined in window)
@@ -1546,7 +1667,6 @@ if _WX_AVAILABLE:
             - Tool calls: truncate args/result for display
             - User text / status: kept as-is (JS will escape)
             """
-            import json as _json
             result = []
             for entry in self._conv_entries:
                 e = dict(entry)  # shallow copy — don't mutate originals
@@ -1558,10 +1678,15 @@ if _WX_AVAILABLE:
                 elif e["type"] == "autoroute_log":
                     raw_out = (e.get("stdout") or "").strip()
                     raw_err = (e.get("stderr") or "").strip()
-                    combined = "\n".join(filter(None, [
-                        raw_out,
-                        ("--- stderr ---\n" + raw_err) if raw_err else "",
-                    ]))
+                    combined = "\n".join(
+                        filter(
+                            None,
+                            [
+                                raw_out,
+                                ("--- stderr ---\n" + raw_err) if raw_err else "",
+                            ],
+                        )
+                    )
                     e["output"] = combined or "(no output)"
                 result.append(e)
             return result
@@ -1577,10 +1702,15 @@ if _WX_AVAILABLE:
             elif e["type"] == "autoroute_log":
                 raw_out = (e.get("stdout") or "").strip()
                 raw_err = (e.get("stderr") or "").strip()
-                combined = "\n".join(filter(None, [
-                    raw_out,
-                    ("--- stderr ---\n" + raw_err) if raw_err else "",
-                ]))
+                combined = "\n".join(
+                    filter(
+                        None,
+                        [
+                            raw_out,
+                            ("--- stderr ---\n" + raw_err) if raw_err else "",
+                        ],
+                    )
+                )
                 e["output"] = combined or "(no output)"
             return e
 
@@ -1594,13 +1724,18 @@ if _WX_AVAILABLE:
                 return  # _try_acquire_render_lock already set _render_pending
 
             import json as _json
+
             js_entries = self._prepare_entries_for_js()
             scroll = '"bottom"' if force_scroll_to_bottom else '"preserve"'
             # Double json.dumps: inner produces JSON string, outer escapes it
             # for safe embedding inside a JS function call argument.
-            js = f'_updateConversation({_json.dumps(_json.dumps(js_entries))}, {scroll})'
-            log.debug("_updateConversation: %d entries, scroll=%s, js_size=%d",
-                      len(js_entries), scroll, len(js))
+            js = f"_updateConversation({_json.dumps(_json.dumps(js_entries))}, {scroll})"
+            log.debug(
+                "_updateConversation: %d entries, scroll=%s, js_size=%d",
+                len(js_entries),
+                scroll,
+                len(js),
+            )
 
             try:
                 ok, result = self._conv_view.RunScript(js)
@@ -1608,13 +1743,21 @@ if _WX_AVAILABLE:
                     self._stream_wrapper_visible = False
                     result_str = str(result) if result else ""
                     if result_str.startswith("error:"):
-                        log.error("_updateConversation JS error: %s (js_size=%d, entries=%d)",
-                                  result_str, len(js), len(js_entries))
+                        log.error(
+                            "_updateConversation JS error: %s (js_size=%d, entries=%d)",
+                            result_str,
+                            len(js),
+                            len(js_entries),
+                        )
                     else:
                         log.debug("_updateConversation JS result: %s", result_str)
                 else:
-                    log.error("_updateConversation RunScript FAILED: js_size=%d, result=%r, entries=%d",
-                              len(js), result, len(js_entries))
+                    log.error(
+                        "_updateConversation RunScript FAILED: js_size=%d, result=%r, entries=%d",
+                        len(js),
+                        result,
+                        len(js_entries),
+                    )
             except Exception as e:
                 log.error("_updateConversation exception: %s", e)
             finally:
@@ -1659,14 +1802,20 @@ if _WX_AVAILABLE:
                                 "try { _updateConversation('[]', 'preserve'); 'ok'; } catch(e) { e.message; }"
                             )
                             log.info("JS test attempt %d: %r", attempt + 1, result2)
-                            if ok2 and result2 and ("ok" in str(result2) or "error" in str(result2).lower()):
+                            if (
+                                ok2
+                                and result2
+                                and ("ok" in str(result2) or "error" in str(result2).lower())
+                            ):
                                 log.info("Detected shell and JS working (attempt %d)", attempt + 1)
                                 self._shell_loaded = True
                                 self._page_loading = False
                                 shell_loaded_detected = True
                                 break
                             else:
-                                log.warning("Shell loaded but JS not working (attempt %d)", attempt + 1)
+                                log.warning(
+                                    "Shell loaded but JS not working (attempt %d)", attempt + 1
+                                )
                         else:
                             break
                     except Exception as e:
@@ -1686,16 +1835,16 @@ if _WX_AVAILABLE:
             self._js_running = False
             self._process_pending_render(force_scroll_to_bottom)
 
-        def _append_entry_js(self, entry: dict,
-                              force_scroll_to_bottom: bool = False) -> None:
+        def _append_entry_js(self, entry: dict, force_scroll_to_bottom: bool = False) -> None:
             """Append a single entry via JS _appendEntry (WebView path)."""
             if not self._try_acquire_render_lock():
                 return  # _try_acquire_render_lock already set _render_pending
 
             import json as _json
+
             prepared = self._prepare_single_entry(entry)
             scroll = '"bottom"' if force_scroll_to_bottom else '"preserve"'
-            js = f'_appendEntry({_json.dumps(_json.dumps(prepared))}, {scroll})'
+            js = f"_appendEntry({_json.dumps(_json.dumps(prepared))}, {scroll})"
             log.debug("_appendEntry: type=%s, scroll=%s", entry.get("type"), scroll)
 
             try:
@@ -1704,13 +1853,21 @@ if _WX_AVAILABLE:
                     self._stream_wrapper_visible = False
                     result_str = str(result) if result else ""
                     if result_str.startswith("error:"):
-                        log.error("_appendEntry JS error: %s (type=%s, js_size=%d)",
-                                  result_str, entry.get("type"), len(js))
+                        log.error(
+                            "_appendEntry JS error: %s (type=%s, js_size=%d)",
+                            result_str,
+                            entry.get("type"),
+                            len(js),
+                        )
                     else:
                         log.debug("_appendEntry JS result: %s", result_str)
                 else:
-                    log.error("_appendEntry RunScript FAILED: result=%r, type=%s, js_size=%d",
-                              result, entry.get("type"), len(js))
+                    log.error(
+                        "_appendEntry RunScript FAILED: result=%r, type=%s, js_size=%d",
+                        result,
+                        entry.get("type"),
+                        len(js),
+                    )
                     self._render_pending = True
             except Exception:
                 self._render_pending = True
@@ -1792,7 +1949,8 @@ if _WX_AVAILABLE:
                     icon = "&#x2713;" if ok else "&#x2717;"
                     name = _h.escape(t["name"])
                     summary = _h.escape(
-                        t["result"].get("message", "") if isinstance(t["result"], dict)
+                        t["result"].get("message", "")
+                        if isinstance(t["result"], dict)
                         else str(t["result"])
                     )[:120]
                     color = self._C_OK_HEX if ok else self._C_ERR_HEX
@@ -1803,21 +1961,27 @@ if _WX_AVAILABLE:
                 inner = "<br>".join(rows)
                 return f'<blockquote style="margin:4px 0">{inner}</blockquote>'
 
-            def _msg_block(sender: str, sender_color: str, bg_color: str,
-                           body_html: str, tools_html: str = "",
-                           timestamp: str = "") -> str:
+            def _msg_block(
+                sender: str,
+                sender_color: str,
+                bg_color: str,
+                body_html: str,
+                tools_html: str = "",
+                timestamp: str = "",
+            ) -> str:
                 ts_html = (
                     f' <font size="2" color="#999999"><i>{timestamp}</i></font>'
-                    if timestamp else ""
+                    if timestamp
+                    else ""
                 )
                 return (
                     f'<table width="100%" cellpadding="10" cellspacing="0" bgcolor="{bg_color}"'
                     f' border="0"><tr><td>'
                     f'<b><font color="{sender_color}" size="3">{sender}</font></b>'
-                    f'{ts_html}'
-                    f'<br>{body_html}{tools_html}'
-                    f'</td></tr></table>'
-                    f'<br>'
+                    f"{ts_html}"
+                    f"<br>{body_html}{tools_html}"
+                    f"</td></tr></table>"
+                    f"<br>"
                 )
 
             for entry in self._conv_entries:
@@ -1832,9 +1996,15 @@ if _WX_AVAILABLE:
                     tools = entry.get("tools") or []
                     ts = entry.get("timestamp", "")
                     tools_html = _tool_html_plain(tools)
-                    parts.append(_msg_block("AI", self._C_AI_HEX, "#EBF7F2", body, tools_html, timestamp=ts))
+                    parts.append(
+                        _msg_block("AI", self._C_AI_HEX, "#EBF7F2", body, tools_html, timestamp=ts)
+                    )
                 elif typ == "tool_call":
-                    ok = entry["result"].get("success", True) if isinstance(entry["result"], dict) else True
+                    ok = (
+                        entry["result"].get("success", True)
+                        if isinstance(entry["result"], dict)
+                        else True
+                    )
                     icon = "&#x2713;" if ok else "&#x2717;"
                     tname = _h.escape(entry["name"])
                     color = self._C_OK_HEX if ok else self._C_ERR_HEX
@@ -1844,13 +2014,17 @@ if _WX_AVAILABLE:
                 elif typ == "status":
                     color = entry.get("color_hex", "#1E1E1E")
                     escaped = _h.escape(text)
-                    parts.append(f'<p style="margin: 2px 8px;"><font color="{color}">{escaped}</font></p>')
+                    parts.append(
+                        f'<p style="margin: 2px 8px;"><font color="{color}">{escaped}</font></p>'
+                    )
                 elif typ == "autoroute_log":
                     ok = entry.get("success", False)
                     msg = _h.escape(entry.get("message", ""))
                     raw_out = (entry.get("stdout") or "").strip()
                     raw_err = (entry.get("stderr") or "").strip()
-                    combined = "\n".join(filter(None, [raw_out, ("--- stderr ---\n" + raw_err) if raw_err else ""]))
+                    combined = "\n".join(
+                        filter(None, [raw_out, ("--- stderr ---\n" + raw_err) if raw_err else ""])
+                    )
                     icon = "&#x2713;" if ok else "&#x2717;"
                     color = self._C_OK_HEX if ok else self._C_ERR_HEX
                     snippet = _h.escape(combined[:500] + ("…" if len(combined) > 500 else ""))
@@ -1877,9 +2051,7 @@ if _WX_AVAILABLE:
             if _at_bottom:
                 wx.CallLater(
                     50,
-                    lambda: self._conv_view.Scroll(
-                        0, self._conv_view.GetScrollRange(wx.VERTICAL)
-                    ),
+                    lambda: self._conv_view.Scroll(0, self._conv_view.GetScrollRange(wx.VERTICAL)),
                 )
             else:
                 _frac = _pos / _max if _max > 0 else 0.0
@@ -1904,6 +2076,7 @@ if _WX_AVAILABLE:
             The LLM conversation history always stores the full object.
             """
             import json as _json
+
             try:
                 s = _json.dumps(obj, separators=(",", ":"), default=str)
             except (TypeError, ValueError):
@@ -1915,9 +2088,10 @@ if _WX_AVAILABLE:
         @staticmethod
         def _json_dump_safe(value: Any, *, indent: int | None = None) -> str:
             import json as _json
+
             try:
                 if indent is None:
-                    return _json.dumps(value, separators=(',', ':'), default=str)
+                    return _json.dumps(value, separators=(",", ":"), default=str)
                 return _json.dumps(value, indent=indent, default=str)
             except (TypeError, ValueError):
                 return repr(value)

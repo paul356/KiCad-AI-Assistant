@@ -17,7 +17,10 @@ yields nothing.
 from __future__ import annotations
 
 import copy
+import logging
 from typing import Any, NamedTuple
+
+log = logging.getLogger(__name__)
 
 
 class PinWorldCoords(NamedTuple):
@@ -155,8 +158,9 @@ def sym_pin_world_coords(sym: Any) -> list[PinWorldCoords]:
                         )
                     )
                 except Exception:
+                    log.debug("Failed to get world coordinates for pin %s", num)
                     continue
         except Exception:
-            pass
+            log.debug("Failed to get pin world coordinates")
 
     return results

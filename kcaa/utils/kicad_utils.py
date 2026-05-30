@@ -4,7 +4,7 @@ KiCad-specific utility functions.
 
 import logging  # Import logging
 import os
-import subprocess
+import subprocess  # nosec B404 -- controlled command execution, no user input
 import sys  # Add sys import
 from typing import Any
 
@@ -118,7 +118,7 @@ def open_kicad_project(project_path: str) -> dict[str, Any]:
             # Fallback or error for unsupported OS
             return {"success": False, "error": f"Unsupported operating system: {sys.platform}"}
 
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = subprocess.run(cmd, capture_output=True, text=True)  # nosec B603 -- input is validated
 
         return {
             "success": result.returncode == 0,

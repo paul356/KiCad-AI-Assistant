@@ -10,7 +10,6 @@ import os
 from typing import Any
 
 from fastmcp import Context, FastMCP
-import skip
 
 from kcaa.utils.schematic_sexp_utils import save_schematic
 from kcaa.utils.skip_compat import safe_schematic

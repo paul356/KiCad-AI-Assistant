@@ -22,14 +22,15 @@ find_freerouting_jar() -> Optional[str]
 start_freerouting_thread(dsn_path, ses_path, on_done, ...) -> threading.Thread
     Run FreeRouting in a background thread; call on_done when finished.
 """
+
 from __future__ import annotations
 
+from collections.abc import Callable
 import glob
 import logging
 import os
-import subprocess
+import subprocess  # nosec B404 -- controlled subprocess execution, no user input
 import threading
-from typing import Callable, List, Optional, Tuple
 
 log = logging.getLogger(__name__)
 
@@ -37,7 +38,7 @@ log = logging.getLogger(__name__)
 _SUBPROCESS_TIMEOUT = 600
 
 
-def _strip_nets_from_dsn(dsn_path: str, net_names: List[str]) -> None:
+def _strip_nets_from_dsn(dsn_path: str, net_names: list[str]) -> None:
     """Remove ``(net NAME ...)`` blocks whose name is in *net_names* from the DSN.
 
     Operates on the temp copy in-place.  Net names may be quoted
@@ -50,10 +51,10 @@ def _strip_nets_from_dsn(dsn_path: str, net_names: List[str]) -> None:
 
     skip_set = {name.strip() for name in net_names}
 
-    with open(dsn_path, "r", encoding="utf-8") as f:
+    with open(dsn_path, encoding="utf-8") as f:
         text = f.read()
 
-    out: List[str] = []
+    out: list[str] = []
     i = 0
     n = len(text)
 
@@ -89,7 +90,9 @@ def _strip_nets_from_dsn(dsn_path: str, net_names: List[str]) -> None:
                 end_q = text.index('"', m + 1)
             except ValueError:
                 # Malformed DSN: no closing quote — leave block untouched.
-                log.warning("autoroute: malformed quoted net name in DSN at pos %d; leaving block", m)
+                log.warning(
+                    "autoroute: malformed quoted net name in DSN at pos %d; leaving block", m
+                )
                 out.append(text[i])
                 i += 1
                 continue
@@ -136,7 +139,7 @@ def _strip_nets_from_dsn(dsn_path: str, net_names: List[str]) -> None:
         f.write("".join(out))
 
 
-def find_freerouting_jar() -> Optional[str]:
+def find_freerouting_jar() -> str | None:
     """Return the absolute path to freerouting*.jar, or None if not found.
 
     Search order:
@@ -152,10 +155,20 @@ def find_freerouting_jar() -> Optional[str]:
     # 2. Glob fallback across all KiCad user scripting plugin dirs
     home = os.path.expanduser("~")
     patterns = [
-        os.path.join(home, ".local", "share", "kicad", "*",
-                     "scripting", "plugins", "*", "freerouting*.jar"),
-        os.path.join(home, "Library", "Preferences", "kicad", "*",
-                     "scripting", "plugins", "*", "freerouting*.jar"),
+        os.path.join(
+            home, ".local", "share", "kicad", "*", "scripting", "plugins", "*", "freerouting*.jar"
+        ),
+        os.path.join(
+            home,
+            "Library",
+            "Preferences",
+            "kicad",
+            "*",
+            "scripting",
+            "plugins",
+            "*",
+            "freerouting*.jar",
+        ),
     ]
     for pattern in patterns:
         matches = glob.glob(pattern)
@@ -168,15 +181,16 @@ def find_freerouting_jar() -> Optional[str]:
 def _run_subprocess(
     dsn_path: str,
     ses_path: str,
-    on_progress: Optional[Callable[[str], None]],
-    ignore_nets: Optional[List[str]],
+    on_progress: Callable[[str], None] | None,
+    ignore_nets: list[str] | None,
     max_passes: int,
-) -> Tuple[bool, str, str, str]:
+) -> tuple[bool, str, str, str]:
     """Run FreeRouting synchronously and return (success, message, stdout, stderr).
 
     This function has NO pcbnew calls and is safe to run in a background thread.
     The DSN file must already exist at *dsn_path* before this is called.
     """
+
     def _progress(msg: str) -> None:
         log.info("freerouting: %s", msg)
         if on_progress:
@@ -188,17 +202,23 @@ def _run_subprocess(
         return (
             False,
             "freerouting.jar not found. Place it in the plugin directory.",
-            "", "",
+            "",
+            "",
         )
 
     log.info("freerouting: using jar at %s", jar_path)
 
-    cmd: List[str] = [
-        "java", "-jar", jar_path,
-        "-de", dsn_path,
-        "-do", ses_path,
+    cmd: list[str] = [
+        "java",
+        "-jar",
+        jar_path,
+        "-de",
+        dsn_path,
+        "-do",
+        ses_path,
         "--gui.enabled=false",
-        "-mp", str(max_passes),
+        "-mp",
+        str(max_passes),
     ]
 
     cmd_str = " ".join(cmd)
@@ -212,7 +232,7 @@ def _run_subprocess(
     debug_prefix += "---\n"
 
     try:
-        result = subprocess.run(
+        result = subprocess.run(  # nosec B603 -- input is validated
             cmd,
             capture_output=True,
             text=True,
@@ -241,8 +261,8 @@ def start_freerouting_thread(
     dsn_path: str,
     ses_path: str,
     on_done: Callable[[bool, str, str, str], None],
-    on_progress: Optional[Callable[[str], None]] = None,
-    ignore_nets: Optional[List[str]] = None,
+    on_progress: Callable[[str], None] | None = None,
+    ignore_nets: list[str] | None = None,
     max_passes: int = 50,
 ) -> threading.Thread:
     """Start FreeRouting in a background daemon thread.
@@ -267,6 +287,7 @@ def start_freerouting_thread(
     max_passes:
         Maximum routing passes (``-mp`` flag).
     """
+
     def _worker() -> None:
         success, message, stdout, stderr = _run_subprocess(
             dsn_path, ses_path, on_progress, ignore_nets, max_passes

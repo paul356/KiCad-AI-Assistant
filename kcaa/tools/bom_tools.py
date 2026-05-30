@@ -10,6 +10,7 @@ from typing import Any
 from fastmcp import Context, FastMCP
 import pandas as pd
 
+from kcaa.utils.config import config
 from kcaa.utils.file_utils import get_project_files
 
 
@@ -660,7 +661,7 @@ async def export_bom_with_cli(
         Dictionary with export results
     """
     import platform
-    import subprocess
+    import subprocess  # nosec B404 -- controlled command execution, no user input
 
     system = platform.system()
     print(f"Exporting BOM using CLI tools on {system}")
@@ -719,7 +720,7 @@ async def export_bom_with_cli(
             await ctx.report_progress(60, 100)
 
         # Run the command
-        process = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        process = subprocess.run(cmd, capture_output=True, text=True, timeout=30)  # nosec B603 -- input is validated
 
         # Check if the command was successful
         if process.returncode != 0:

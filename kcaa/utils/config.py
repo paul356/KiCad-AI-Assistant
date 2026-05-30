@@ -52,7 +52,6 @@ class LibraryPathConfig:
     """
 
     # KiCad version fallback
-    _DEFAULT_KICAD_VERSION = "9.0"
 
     # File extension mappings
     _KICAD_EXTENSIONS = {
@@ -164,8 +163,16 @@ class LibraryPathConfig:
         # Platform detection
         self._system = _SYSTEM
 
-        # KiCad version
-        self._kicad_version = os.environ.get("KICAD_VERSION") or self._DEFAULT_KICAD_VERSION
+        # KiCad version — from KICAD_VERSION env var (.env), or detected
+        # from KICAD{N}_* variables. Raises RuntimeError if undetermined.
+        self._kicad_version = (
+            os.environ.get("KICAD_VERSION") or self._detect_kicad_version_from_env()
+        )
+        if self._kicad_version is None:
+            raise RuntimeError(
+                "Cannot detect KiCad version. Set KICAD_VERSION in .env or ensure "
+                "KICAD{N}_* environment variables are present."
+            )
         self._ver_tag = self._kicad_version.split(".")[0]
 
         # Platform-specific paths
@@ -183,13 +190,35 @@ class LibraryPathConfig:
         self._kicad_3rd_party = os.path.normpath(self._resolve_3rd_party())
         self._kicad_template_dir = os.path.normpath(self._resolve_template_dir())
 
-        # Environment variables for subprocess injection
-        self._env_vars = {
+        # Environment variables for subprocess injection.
+        # Prefer os.environ values (e.g. set by KiCad) over our computed defaults.
+        _default_env_vars = {
             f"KICAD{self._ver_tag}_SYMBOL_DIR": self._kicad_symbol_dir,
             f"KICAD{self._ver_tag}_FOOTPRINT_DIR": self._kicad_footprint_dir,
             f"KICAD{self._ver_tag}_3RD_PARTY": self._kicad_3rd_party,
             f"KICAD{self._ver_tag}_TEMPLATE_DIR": self._kicad_template_dir,
         }
+        self._env_vars = {}
+        for var, default_val in _default_env_vars.items():
+            self._env_vars[var] = os.environ.get(var, default_val)
+
+    # ---------------------------------------------------------------------------
+    # Version detection (static)
+    # ---------------------------------------------------------------------------
+
+    @staticmethod
+    def _detect_kicad_version_from_env() -> str | None:
+        """Detect KiCad version from KICAD{N}_* environment variables.
+
+        Used as fallback when .env does not set KICAD_VERSION.
+        E.g. KICAD10_SYMBOL_DIR → "10.0".
+        """
+        for key in os.environ:
+            if key.startswith("KICAD") and "_" in key:
+                major = key[5:].split("_")[0]
+                if major.isdigit():
+                    return f"{major}.0"
+        return None
 
     # ---------------------------------------------------------------------------
     # .env file loading (private)
@@ -226,8 +255,10 @@ class LibraryPathConfig:
 
                         # Remove quotes if present
                         if (
-                            value.startswith('"') and value.endswith('"')
-                            or value.startswith("'") and value.endswith("'")
+                            value.startswith('"')
+                            and value.endswith('"')
+                            or value.startswith("'")
+                            and value.endswith("'")
                         ):
                             value = value[1:-1]
 

@@ -8,8 +8,6 @@ import os
 import re
 from typing import Any
 
-import skip
-
 from kcaa.utils.skip_compat import safe_schematic
 from kcaa.utils.skip_helpers import sym_pin_world_coords
 from kcaa.utils.symbol_geometry import (

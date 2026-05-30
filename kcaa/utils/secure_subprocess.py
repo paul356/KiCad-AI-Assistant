@@ -234,7 +234,7 @@ class SecureSubprocessRunner:
         """
         if timeout is None:
             timeout = config.timeout_constants["subprocess_default"]
-        
+
         kwargs = {
             "timeout": timeout,
             "cwd": working_dir,

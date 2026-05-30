@@ -33,10 +33,10 @@ import builtins
 from contextlib import contextmanager
 from typing import Any
 
-
 # ---------------------------------------------------------------------------
 # Internal: temporary open() monkey-patch
 # ---------------------------------------------------------------------------
+
 
 @contextmanager
 def _utf8_open_context():
@@ -60,9 +60,7 @@ def _utf8_open_context():
     ):
         if encoding is None and "b" not in mode:
             encoding = "utf-8"
-        return original_open(
-            file, mode, buffering, encoding, errors, newline, closefd, opener
-        )
+        return original_open(file, mode, buffering, encoding, errors, newline, closefd, opener)
 
     builtins.open = _open  # type: ignore[assignment]
     try:
@@ -74,6 +72,7 @@ def _utf8_open_context():
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
 
 def safe_source_file(path: str):
     """Open a KiCad S-expression file with UTF-8 encoding via skip.

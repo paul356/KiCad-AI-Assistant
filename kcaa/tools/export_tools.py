@@ -5,7 +5,7 @@ Export tools for KiCad projects.
 import asyncio
 import os
 import shutil
-import subprocess
+import subprocess  # nosec B404 -- controlled command execution, no user input
 
 from fastmcp import Context, FastMCP
 from fastmcp.utilities.types import Image
@@ -187,7 +187,7 @@ async def generate_thumbnail_with_cli(pcb_file: str, ctx: Context | None):
 
         # Run the command
         try:
-            process = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=30)
+            process = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=30)  # nosec B603 -- input is validated
             print(f"Command successful: {process.stdout}")
 
             if ctx:

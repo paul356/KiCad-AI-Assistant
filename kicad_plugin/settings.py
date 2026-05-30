@@ -1,77 +1,76 @@
 """
 Plugin settings: load/save from KiCad user config directory.
 """
+
 from __future__ import annotations
 
+from dataclasses import asdict, dataclass, field
 import json
 import logging
 import os
 import platform
-from dataclasses import dataclass, field, asdict
-from typing import Optional
+import re
 
 log = logging.getLogger(__name__)
 
 _SETTINGS_FILENAME = "kicad_ai_assistant.json"
 
 
-def _load_dotenv_for_plugin() -> None:
-    """Load .env file to get KICAD_VERSION and other config before path resolution.
+def _detect_kicad_version() -> str | None:
+    """Detect KiCad version for the plugin context.
 
-    This is a minimal .env loader that only sets environment variables.
-    The plugin cannot import kcaa, so we duplicate this logic here.
-    Safe to call multiple times — subsequent calls are no-ops once .env is loaded.
+    Tries in order:
+    1. KICAD_VERSION environment variable
+    2. Plugin directory path (e.g. .../kicad/10.0/scripting/plugins/...)
+    3. KICAD{N}_* variables (e.g. KICAD10_SYMBOL_DIR → "10.0")
+    Returns None if no source yields a version.
     """
-    if getattr(_load_dotenv_for_plugin, "_done", False):
-        return
+    # 1. From KICAD_VERSION environment variable
+    ver = os.environ.get("KICAD_VERSION")
+    if ver:
+        return ver
+
+    # 2. From the plugin directory path
     try:
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        for _ in range(3):
-            env_path = os.path.join(current_dir, ".env")
-            if os.path.exists(env_path):
-                with open(env_path, "r", encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line or line.startswith("#"):
-                            continue
-                        if "=" in line:
-                            key, value = line.split("=", 1)
-                            key = key.strip()
-                            value = value.strip()
-                            if value.startswith('"') and value.endswith('"'):
-                                value = value[1:-1]
-                            elif value.startswith("'") and value.endswith("'"):
-                                value = value[1:-1]
-                            if "~" in value:
-                                value = os.path.expanduser(value)
-                            os.environ[key] = value
-                break
-            parent = os.path.dirname(current_dir)
-            if parent == current_dir:
-                break
-            current_dir = parent
-    except Exception:
-        pass
-    _load_dotenv_for_plugin._done = True
+        path = os.path.abspath(__file__)
+        m = re.search(r"[/\\]kicad[/\\](\d+\.\d+)[/\\]", path, re.IGNORECASE)
+        if m:
+            return m.group(1)
+    except Exception as e:
+        log.debug("Could not detect KiCad version from path: %s", e)
+
+    # 3. From KICAD{N}_* environment variables
+    for key in os.environ:
+        if key.startswith("KICAD") and "_" in key:
+            major = key[5:].split("_")[0]
+            if major.isdigit():
+                return f"{major}.0"
+
+    return None
 
 
 def _get_kcaa_data_dir() -> str:
     """Return the kcaa data directory under the KiCad user config directory.
 
-    Loads .env first to ensure KICAD_VERSION is available.
+    KiCad version is detected from KICAD{N}_* environment variables or plugin path.
     """
-    _load_dotenv_for_plugin()
-    kicad_version = os.environ.get("KICAD_VERSION", "9.0")
+    kicad_version = _detect_kicad_version()
+    if kicad_version is None:
+        raise RuntimeError(
+            "Cannot detect KiCad version. Ensure KICAD{N}_* environment variables "
+            "are set (e.g. KICAD10_SYMBOL_DIR) or the plugin is installed under "
+            "a versioned KiCad directory (e.g. .../kicad/10.0/scripting/plugins/...)."
+        )
     system = platform.system()
     if system == "Darwin":
         base = os.path.expanduser(f"~/Library/Preferences/kicad/{kicad_version}")
     elif system == "Windows":
-        base = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "kicad", kicad_version)
+        base = os.path.join(
+            os.environ.get("APPDATA", os.path.expanduser("~")), "kicad", kicad_version
+        )
     else:  # Linux and others
         base = os.path.expanduser(f"~/.config/kicad/{kicad_version}")
     return os.path.join(base, "kcaa")
-
-
 
 
 @dataclass
@@ -79,24 +78,28 @@ class PluginSettings:
     """All user-configurable settings for the KiCad AI Assistant plugin."""
 
     # LLM provider
-    llm_provider: str = "openai"          # "openai" | "anthropic" | "custom"
+    llm_provider: str = "openai"  # "openai" | "anthropic" | "custom"
     llm_api_key: str = field(default="", repr=False)  # never leak key in logs/repr
-    llm_model: str = "gpt-4o"            # model name
-    llm_base_url: str = ""               # custom endpoint URL (if provider == "custom")
+    llm_model: str = "gpt-4o"  # model name
+    llm_base_url: str = ""  # custom endpoint URL (if provider == "custom")
 
     # MCP server
-    server_port: int = 0                  # 0 = auto-select a free port at startup
-    server_log_dir: str = ""              # "" = KiCad user config dir
-    python_executable: str = ""           # "" = auto-detect (shutil.which("python3"))
+    server_port: int = 0  # 0 = auto-select a free port at startup
+    server_log_dir: str = ""  # "" = KiCad user config dir
+    python_executable: str = ""  # "" = auto-detect (shutil.which("python3"))
 
     # UI preferences
-    show_tool_log: bool = True            # show the tool-call log by default
+    show_tool_log: bool = True  # show the tool-call log by default
 
     # Context window management
-    llm_context_tokens: int = 128_000        # total context window size in tokens
-    llm_compact_threshold: float = 0.70      # trigger compaction when estimated usage exceeds this fraction
-    llm_compact_target_threshold: float = 0.49  # post-compaction target fraction (must be < llm_compact_threshold)
-    llm_keep_recent_turns: int = 4           # number of latest complete assistant turns to preserve verbatim
+    llm_context_tokens: int = 128_000  # total context window size in tokens
+    llm_compact_threshold: float = (
+        0.70  # trigger compaction when estimated usage exceeds this fraction
+    )
+    llm_compact_target_threshold: float = (
+        0.49  # post-compaction target fraction (must be < llm_compact_threshold)
+    )
+    llm_keep_recent_turns: int = 4  # number of latest complete assistant turns to preserve verbatim
 
     # Internal — not shown in settings UI
     config_dir: str = field(default_factory=_get_kcaa_data_dir, repr=False)
@@ -125,7 +128,7 @@ class PluginSettings:
             log.error("Failed to save settings: %s", e)
 
     @classmethod
-    def load(cls, config_dir: Optional[str] = None) -> "PluginSettings":
+    def load(cls, config_dir: str | None = None) -> PluginSettings:
         """Load settings from disk, returning defaults if the file doesn't exist."""
         inst = cls()
         if config_dir:
@@ -136,7 +139,7 @@ class PluginSettings:
             return inst
 
         try:
-            with open(inst.settings_path, "r", encoding="utf-8") as f:
+            with open(inst.settings_path, encoding="utf-8") as f:
                 data = json.load(f)
             for key, value in data.items():
                 if hasattr(inst, key) and key != "config_dir":

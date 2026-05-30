@@ -2,11 +2,12 @@
 Context bridge: collect the active KiCad editor context and return it
 as a structured dict that the plugin injects into every LLM request.
 """
+
 from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Optional
+from typing import Any
 
 log = logging.getLogger(__name__)
 
@@ -14,6 +15,7 @@ log = logging.getLogger(__name__)
 def _try_import_pcbnew():
     try:
         import pcbnew  # noqa: F401
+
         return pcbnew
     except ImportError:
         return None
@@ -69,8 +71,8 @@ def collect_context() -> dict[str, Any]:
                 try:
                     if fp.IsSelected():
                         selection.append(fp.GetReference())
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug("Could not get footprint reference: %s", e)
             ctx["selected_refs"] = selection
     except Exception as e:
         log.debug("Could not collect PCB context: %s", e)
