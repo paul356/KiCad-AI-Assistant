@@ -75,6 +75,9 @@ dist-plugin:
 	@cp -r $(PLUGIN_SRC) dist/_stage/kicad_ai_assistant
 	@find dist/_stage -type d -name __pycache__ -exec rm -rf {} +
 	@find dist/_stage -type f -name "*.pyc" -delete
+	@echo "Extracting version from pyproject.toml..."
+	@grep -m1 '^version = ' pyproject.toml | sed 's/version = "\(.*\)"/\1/' > dist/_stage/kicad_ai_assistant/VERSION
+	@echo "Version: $$(cat dist/_stage/kicad_ai_assistant/VERSION)"
 	@cd dist/_stage && zip -r ../$(notdir $(PLUGIN_ZIP)) kicad_ai_assistant
 	@rm -rf dist/_stage
 	@echo "Created $(PLUGIN_ZIP)"
