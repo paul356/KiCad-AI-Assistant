@@ -399,7 +399,152 @@ def _do_add_sheet_symbol(
     child_title: str | None,
 ) -> dict[str, Any]:
     """Implementation of add_sheet_symbol (delegated from the MCP tool)."""
-    raise NotImplementedError("Sheet creation will be implemented in Phase 2")
+    import sexpdata
+
+    from kcaa.utils.schematic_sexp_utils import save_schematic
+
+    if not schematic_path.endswith(".kicad_sch"):
+        return {"error": f"Not a .kicad_sch file: {schematic_path!r}"}
+    if not os.path.isfile(schematic_path):
+        return {"error": f"Schematic file not found: {schematic_path!r}"}
+
+    # Optionally create child file first
+    child_path = None
+    if create_child:
+        try:
+            child_path = _generate_child_schematic(
+                schematic_path, sheet_file, paper=child_paper, title=child_title
+            )
+        except FileExistsError:
+            # Child already exists, that's fine
+            parent_dir = os.path.dirname(os.path.abspath(schematic_path))
+            child_path = os.path.join(parent_dir, sheet_file)
+        except Exception as e:
+            return {"error": f"Failed to create child schematic: {e}"}
+
+    # Snap coordinates to grid
+    x = _align_to_grid(x)
+    y = _align_to_grid(y)
+    width = _align_to_grid(width)
+    height = _align_to_grid(height)
+
+    # Generate UUID for the sheet symbol
+    sheet_uuid = str(uuid.uuid4())
+
+    # Build the (sheet ...) S-expression as a nested list
+    sheet_entry: list = [
+        sexpdata.Symbol("sheet"),
+        [sexpdata.Symbol("at"), x, y],
+        [sexpdata.Symbol("size"), width, height],
+        [
+            sexpdata.Symbol("stroke"),
+            [sexpdata.Symbol("width"), 0],
+            [sexpdata.Symbol("type"), sexpdata.Symbol("dash")],
+        ],
+        [sexpdata.Symbol("fill"), [sexpdata.Symbol("type"), sexpdata.Symbol("none")]],
+        [sexpdata.Symbol("uuid"), sheet_uuid],
+        [
+            sexpdata.Symbol("property"),
+            "Sheet name",
+            sheet_name,
+            [sexpdata.Symbol("at"), 0, 0, 0],
+            [sexpdata.Symbol("show_name"), sexpdata.Symbol("no")],
+            [sexpdata.Symbol("do_not_autoplace"), sexpdata.Symbol("yes")],
+            [
+                sexpdata.Symbol("effects"),
+                [sexpdata.Symbol("font"), [sexpdata.Symbol("size"), 1.27, 1.27]],
+                [sexpdata.Symbol("justify"), sexpdata.Symbol("left")],
+            ],
+        ],
+        [
+            sexpdata.Symbol("property"),
+            "Sheet file",
+            sheet_file,
+            [sexpdata.Symbol("at"), 0, 0, 0],
+            [sexpdata.Symbol("show_name"), sexpdata.Symbol("no")],
+            [sexpdata.Symbol("do_not_autoplace"), sexpdata.Symbol("yes")],
+            [
+                sexpdata.Symbol("effects"),
+                [sexpdata.Symbol("font"), [sexpdata.Symbol("size"), 1.27, 1.27]],
+                [sexpdata.Symbol("justify"), sexpdata.Symbol("left")],
+            ],
+        ],
+    ]
+
+    # Add pins if provided
+    pins_created = 0
+    if pins:
+        for pin_def in pins:
+            pin_name = pin_def.get("name")
+            edge = pin_def.get("edge", "right")
+            distance_mm = pin_def.get("distance_mm", 0.0)
+            if not pin_name:
+                continue
+
+            # Calculate pin position based on edge
+            edge_to_rotation = {"right": 0, "left": 180, "bottom": 270, "top": 90}
+            rot = edge_to_rotation.get(edge, 0)
+
+            # Position along the edge
+            if edge in ("left", "right"):
+                pin_x = _align_to_grid(distance_mm)
+                pin_y = 0.0
+            else:  # top, bottom
+                pin_x = _align_to_grid(distance_mm)
+                pin_y = 0.0
+
+            pin_uuid = str(uuid.uuid4())
+            pin_entry = [
+                sexpdata.Symbol("pin"),
+                pin_name,
+                sexpdata.Symbol("input"),  # default shape
+                [sexpdata.Symbol("at"), pin_x, pin_y, rot],
+                [sexpdata.Symbol("uuid"), pin_uuid],
+                [
+                    sexpdata.Symbol("effects"),
+                    [sexpdata.Symbol("font"), [sexpdata.Symbol("size"), 1.27, 1.27]],
+                    [sexpdata.Symbol("justify"), sexpdata.Symbol("left")],
+                ],
+            ]
+            sheet_entry.append(pin_entry)
+            pins_created += 1
+
+    # Add instances block
+    # Derive project name from schematic filename
+    project_name = os.path.splitext(os.path.basename(schematic_path))[0]
+    instances_entry = [
+        sexpdata.Symbol("instances"),
+        [
+            sexpdata.Symbol("project"),
+            project_name,
+            [
+                sexpdata.Symbol("path"),
+                f"/{sheet_uuid}",
+                [sexpdata.Symbol("page"), "1"],
+            ],
+        ],
+    ]
+    sheet_entry.append(instances_entry)
+
+    # Load schematic and insert the new sheet
+    sch = safe_schematic(schematic_path)
+    sch.new_from_list(sheet_entry)
+
+    # Save the modified schematic
+    backup_path = save_schematic(schematic_path, sch)
+
+    return {
+        "success": True,
+        "sheet_uuid": sheet_uuid,
+        "sheet_name": sheet_name,
+        "sheet_file": sheet_file,
+        "position": {"x": x, "y": y},
+        "size": {"width": width, "height": height},
+        "pins_created": pins_created,
+        "child_path": child_path,
+        "file_modified": schematic_path,
+        "backup_path": backup_path,
+    }
 
 
 def _do_remove_sheet_symbol(
@@ -407,7 +552,65 @@ def _do_remove_sheet_symbol(
     sheet_identifier: str,
 ) -> dict[str, Any]:
     """Implementation of remove_sheet_symbol."""
-    raise NotImplementedError("Sheet removal will be implemented in Phase 3")
+    import sexpdata
+
+    from kcaa.utils.schematic_sexp_utils import save_schematic
+
+    if not schematic_path.endswith(".kicad_sch"):
+        return {"error": f"Not a .kicad_sch file: {schematic_path!r}"}
+    if not os.path.isfile(schematic_path):
+        return {"error": f"Schematic file not found: {schematic_path!r}"}
+
+    sch = safe_schematic(schematic_path)
+
+    # Find the sheet to remove
+    raw_sheets = None
+    try:
+        raw_sheets = sch.sheet
+    except AttributeError:
+        return {"error": "No sheet symbols found in schematic"}
+
+    sheets_list = _normalize_collection(raw_sheets)
+    target_sheet = None
+    target_index = None
+
+    for i, sheet in enumerate(sheets_list):
+        info = _sheet_dict_from_wrapper(sheet)
+        # Match by UUID or name
+        if info.get("uuid") == sheet_identifier or info.get("sheet_name") == sheet_identifier:
+            target_sheet = info
+            target_index = i
+            break
+
+    if target_sheet is None:
+        return {"error": f"Sheet symbol not found: {sheet_identifier!r}"}
+
+    # Remove from the tree
+    tree = sch.tree
+    sheet_entries = []
+    for i, entry in enumerate(tree):
+        if isinstance(entry, list) and len(entry) > 0:
+            tag = entry[0]
+            if isinstance(tag, sexpdata.Symbol) and tag.value() == "sheet":
+                sheet_entries.append((i, entry))
+
+    if target_index >= len(sheet_entries):
+        return {"error": "Internal error: sheet index mismatch"}
+
+    tree_index, removed_entry = sheet_entries[target_index]
+    tree.pop(tree_index)
+
+    # Save the modified schematic
+    backup_path = save_schematic(schematic_path, sch)
+
+    return {
+        "success": True,
+        "removed_uuid": target_sheet.get("uuid"),
+        "removed_name": target_sheet.get("sheet_name"),
+        "removed_file": target_sheet.get("sheet_file"),
+        "file_modified": schematic_path,
+        "backup_path": backup_path,
+    }
 
 
 def _do_update_sheet_symbol(
@@ -421,7 +624,125 @@ def _do_update_sheet_symbol(
     height: float | None,
 ) -> dict[str, Any]:
     """Implementation of update_sheet_symbol."""
-    raise NotImplementedError("Sheet update will be implemented in Phase 3")
+    import sexpdata
+
+    from kcaa.utils.schematic_sexp_utils import save_schematic
+
+    if not schematic_path.endswith(".kicad_sch"):
+        return {"error": f"Not a .kicad_sch file: {schematic_path!r}"}
+    if not os.path.isfile(schematic_path):
+        return {"error": f"Schematic file not found: {schematic_path!r}"}
+
+    sch = safe_schematic(schematic_path)
+
+    # Find the sheet to update
+    raw_sheets = None
+    try:
+        raw_sheets = sch.sheet
+    except AttributeError:
+        return {"error": "No sheet symbols found in schematic"}
+
+    sheets_list = _normalize_collection(raw_sheets)
+    target_sheet = None
+    target_index = None
+
+    for i, sheet in enumerate(sheets_list):
+        info = _sheet_dict_from_wrapper(sheet)
+        # Match by UUID or name
+        if info.get("uuid") == sheet_identifier or info.get("sheet_name") == sheet_identifier:
+            target_sheet = info
+            target_index = i
+            break
+
+    if target_sheet is None:
+        return {"error": f"Sheet symbol not found: {sheet_identifier!r}"}
+
+    # Find the sheet entry in the tree
+    tree = sch.tree
+    sheet_entries = []
+    for i, entry in enumerate(tree):
+        if isinstance(entry, list) and len(entry) > 0:
+            tag = entry[0]
+            if isinstance(tag, sexpdata.Symbol) and tag.value() == "sheet":
+                sheet_entries.append((i, entry))
+
+    if target_index >= len(sheet_entries):
+        return {"error": "Internal error: sheet index mismatch"}
+
+    tree_index, sheet_entry = sheet_entries[target_index]
+
+    # Track what we updated
+    updated_fields = []
+
+    # Update position if provided
+    if x is not None or y is not None:
+        new_x = _align_to_grid(x) if x is not None else target_sheet.get("position", {}).get("x", 0)
+        new_y = _align_to_grid(y) if y is not None else target_sheet.get("position", {}).get("y", 0)
+
+        # Find and update the (at ...) entry
+        for child in sheet_entry:
+            if isinstance(child, list) and len(child) > 0:
+                if isinstance(child[0], sexpdata.Symbol) and child[0].value() == "at":
+                    child[1] = new_x
+                    child[2] = new_y
+                    updated_fields.append("position")
+                    break
+
+    # Update size if provided
+    if width is not None or height is not None:
+        new_width = (
+            _align_to_grid(width)
+            if width is not None
+            else target_sheet.get("size", {}).get("width", 0)
+        )
+        new_height = (
+            _align_to_grid(height)
+            if height is not None
+            else target_sheet.get("size", {}).get("height", 0)
+        )
+
+        # Find and update the (size ...) entry
+        for child in sheet_entry:
+            if isinstance(child, list) and len(child) > 0:
+                if isinstance(child[0], sexpdata.Symbol) and child[0].value() == "size":
+                    child[1] = new_width
+                    child[2] = new_height
+                    updated_fields.append("size")
+                    break
+
+    # Update sheet name if provided
+    if sheet_name is not None:
+        for child in sheet_entry:
+            if isinstance(child, list) and len(child) > 0:
+                if isinstance(child[0], sexpdata.Symbol) and child[0].value() == "property":
+                    if len(child) > 1 and child[1] == "Sheet name":
+                        child[2] = sheet_name
+                        updated_fields.append("sheet_name")
+                        break
+
+    # Update sheet file if provided
+    if sheet_file is not None:
+        for child in sheet_entry:
+            if isinstance(child, list) and len(child) > 0:
+                if isinstance(child[0], sexpdata.Symbol) and child[0].value() == "property":
+                    if len(child) > 1 and child[1] == "Sheet file":
+                        child[2] = sheet_file
+                        updated_fields.append("sheet_file")
+                        break
+
+    if not updated_fields:
+        return {"error": "No fields to update"}
+
+    # Save the modified schematic
+    backup_path = save_schematic(schematic_path, sch)
+
+    return {
+        "success": True,
+        "sheet_uuid": target_sheet.get("uuid"),
+        "updated_fields": updated_fields,
+        "file_modified": schematic_path,
+        "backup_path": backup_path,
+    }
 
 
 def _do_add_sheet_pin(
@@ -432,7 +753,124 @@ def _do_add_sheet_pin(
     distance_mm: float,
 ) -> dict[str, Any]:
     """Implementation of add_sheet_pin."""
-    raise NotImplementedError("Sheet pin tools will be implemented in Phase 4")
+    import sexpdata
+
+    from kcaa.utils.schematic_sexp_utils import save_schematic
+
+    if not schematic_path.endswith(".kicad_sch"):
+        return {"error": f"Not a .kicad_sch file: {schematic_path!r}"}
+    if not os.path.isfile(schematic_path):
+        return {"error": f"Schematic file not found: {schematic_path!r}"}
+
+    sch = safe_schematic(schematic_path)
+
+    # Find the sheet to add the pin to
+    raw_sheets = None
+    try:
+        raw_sheets = sch.sheet
+    except AttributeError:
+        return {"error": "No sheet symbols found in schematic"}
+
+    sheets_list = _normalize_collection(raw_sheets)
+    target_sheet = None
+    target_index = None
+
+    for i, sheet in enumerate(sheets_list):
+        info = _sheet_dict_from_wrapper(sheet)
+        # Match by UUID or name
+        if info.get("uuid") == sheet_identifier or info.get("sheet_name") == sheet_identifier:
+            target_sheet = info
+            target_index = i
+            break
+
+    if target_sheet is None:
+        return {"error": f"Sheet symbol not found: {sheet_identifier!r}"}
+
+    # Find the sheet entry in the tree
+    tree = sch.tree
+    sheet_entries = []
+    for i, entry in enumerate(tree):
+        if isinstance(entry, list) and len(entry) > 0:
+            tag = entry[0]
+            if isinstance(tag, sexpdata.Symbol) and tag.value() == "sheet":
+                sheet_entries.append((i, entry))
+
+    if target_index >= len(sheet_entries):
+        return {"error": "Internal error: sheet index mismatch"}
+
+    tree_index, sheet_entry = sheet_entries[target_index]
+
+    # Get sheet position and size
+    sheet_x = target_sheet.get("position", {}).get("x", 0)
+    sheet_y = target_sheet.get("position", {}).get("y", 0)
+    sheet_width = target_sheet.get("size", {}).get("width", 0)
+    sheet_height = target_sheet.get("size", {}).get("height", 0)
+
+    # Calculate pin position based on edge
+    if edge == "right":
+        pin_x = sheet_x + sheet_width
+        pin_y = sheet_y + distance_mm
+        pin_angle = 0
+    elif edge == "left":
+        pin_x = sheet_x
+        pin_y = sheet_y + distance_mm
+        pin_angle = 180
+    elif edge == "top":
+        pin_x = sheet_x + distance_mm
+        pin_y = sheet_y
+        pin_angle = 90
+    elif edge == "bottom":
+        pin_x = sheet_x + distance_mm
+        pin_y = sheet_y + sheet_height
+        pin_angle = 270
+    else:
+        return {"error": f"Invalid edge: {edge!r}. Must be right/left/top/bottom"}
+
+    # Generate UUID for the pin
+    pin_uuid = str(uuid.uuid4())
+
+    # Build the pin S-expression
+    pin_entry = [
+        sexpdata.Symbol("pin"),
+        pin_name,
+        sexpdata.Symbol("input"),  # default shape
+        [sexpdata.Symbol("at"), pin_x, pin_y, pin_angle],
+        [sexpdata.Symbol("uuid"), pin_uuid],
+        [
+            sexpdata.Symbol("effects"),
+            [sexpdata.Symbol("font"), [sexpdata.Symbol("size"), 1.27, 1.27]],
+            [sexpdata.Symbol("justify"), sexpdata.Symbol("left")],
+        ],
+    ]
+
+    # Find the instances block and insert the pin before it
+    instances_index = None
+    for i, child in enumerate(sheet_entry):
+        if isinstance(child, list) and len(child) > 0:
+            if isinstance(child[0], sexpdata.Symbol) and child[0].value() == "instances":
+                instances_index = i
+                break
+
+    if instances_index is None:
+        # No instances block, append to end
+        sheet_entry.append(pin_entry)
+    else:
+        # Insert before instances block
+        sheet_entry.insert(instances_index, pin_entry)
+
+    # Save the modified schematic
+    backup_path = save_schematic(schematic_path, sch)
+
+    return {
+        "success": True,
+        "pin_uuid": pin_uuid,
+        "sheet_uuid": target_sheet.get("uuid"),
+        "pin_name": pin_name,
+        "edge": edge,
+        "position": {"x": pin_x, "y": pin_y},
+        "file_modified": schematic_path,
+        "backup_path": backup_path,
+    }
 
 
 def _do_remove_sheet_pin(
@@ -441,7 +879,79 @@ def _do_remove_sheet_pin(
     pin_name: str,
 ) -> dict[str, Any]:
     """Implementation of remove_sheet_pin."""
-    raise NotImplementedError("Sheet pin tools will be implemented in Phase 4")
+    import sexpdata
+
+    from kcaa.utils.schematic_sexp_utils import save_schematic
+
+    if not schematic_path.endswith(".kicad_sch"):
+        return {"error": f"Not a .kicad_sch file: {schematic_path!r}"}
+    if not os.path.isfile(schematic_path):
+        return {"error": f"Schematic file not found: {schematic_path!r}"}
+
+    sch = safe_schematic(schematic_path)
+
+    # Find the sheet to remove the pin from
+    raw_sheets = None
+    try:
+        raw_sheets = sch.sheet
+    except AttributeError:
+        return {"error": "No sheet symbols found in schematic"}
+
+    sheets_list = _normalize_collection(raw_sheets)
+    target_sheet = None
+    target_index = None
+
+    for i, sheet in enumerate(sheets_list):
+        info = _sheet_dict_from_wrapper(sheet)
+        # Match by UUID or name
+        if info.get("uuid") == sheet_identifier or info.get("sheet_name") == sheet_identifier:
+            target_sheet = info
+            target_index = i
+            break
+
+    if target_sheet is None:
+        return {"error": f"Sheet symbol not found: {sheet_identifier!r}"}
+
+    # Find the sheet entry in the tree
+    tree = sch.tree
+    sheet_entries = []
+    for i, entry in enumerate(tree):
+        if isinstance(entry, list) and len(entry) > 0:
+            tag = entry[0]
+            if isinstance(tag, sexpdata.Symbol) and tag.value() == "sheet":
+                sheet_entries.append((i, entry))
+
+    if target_index >= len(sheet_entries):
+        return {"error": "Internal error: sheet index mismatch"}
+
+    tree_index, sheet_entry = sheet_entries[target_index]
+
+    # Find the pin to remove
+    pin_index = None
+    for i, child in enumerate(sheet_entry):
+        if isinstance(child, list) and len(child) > 0:
+            if isinstance(child[0], sexpdata.Symbol) and child[0].value() == "pin":
+                # Pin name is at index 1
+                if len(child) > 1 and child[1] == pin_name:
+                    pin_index = i
+                    break
+
+    if pin_index is None:
+        return {"error": f"Pin not found: {pin_name!r}"}
+
+    # Remove the pin
+    sheet_entry.pop(pin_index)
+
+    # Save the modified schematic
+    backup_path = save_schematic(schematic_path, sch)
+
+    return {
+        "success": True,
+        "removed_pin_name": pin_name,
+        "sheet_uuid": target_sheet.get("uuid"),
+        "file_modified": schematic_path,
+        "backup_path": backup_path,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -591,7 +1101,7 @@ def register_sheet_tools(mcp: FastMCP) -> None:
         child_title: str | None = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
-        """Add a hierarchical sheet symbol to a schematic. **(not yet implemented)**
+        """Add a hierarchical sheet symbol to a schematic.
 
         Args:
             schematic_path: Absolute path to the target ``.kicad_sch`` file.
@@ -614,9 +1124,18 @@ def register_sheet_tools(mcp: FastMCP) -> None:
             dict with keys: success, sheet_uuid, position, size, pins_created,
             child_path (if create_child was True).
         """
-        raise NotImplementedError(
-            "Sheet creation will be implemented in Phase 2 (sheet-create-tool). "
-            "Use create_child_sheet to create child files for now."
+        return _do_add_sheet_symbol(
+            schematic_path=schematic_path,
+            sheet_name=sheet_name,
+            sheet_file=sheet_file,
+            x=x,
+            y=y,
+            width=width,
+            height=height,
+            pins=pins,
+            create_child=create_child,
+            child_paper=child_paper,
+            child_title=child_title,
         )
 
     @mcp.tool()
@@ -625,7 +1144,7 @@ def register_sheet_tools(mcp: FastMCP) -> None:
         sheet_identifier: str,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
-        """Remove a sheet symbol from a schematic. **(not yet implemented)**
+        """Remove a sheet symbol from a schematic.
 
         Args:
             schematic_path: Absolute path to the target ``.kicad_sch`` file.
@@ -634,8 +1153,9 @@ def register_sheet_tools(mcp: FastMCP) -> None:
         Returns:
             dict with keys: success, removed_uuid, removed_name, orphaned_files.
         """
-        raise NotImplementedError(
-            "Sheet removal will be implemented in Phase 3 (sheet-remove-tool)."
+        return _do_remove_sheet_symbol(
+            schematic_path=schematic_path,
+            sheet_identifier=sheet_identifier,
         )
 
     @mcp.tool()
@@ -650,7 +1170,7 @@ def register_sheet_tools(mcp: FastMCP) -> None:
         height: float | None = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
-        """Update a sheet symbol's properties. **(not yet implemented)**
+        """Update a sheet symbol's properties.
 
         Args:
             schematic_path: Absolute path to the target ``.kicad_sch`` file.
@@ -665,8 +1185,15 @@ def register_sheet_tools(mcp: FastMCP) -> None:
         Returns:
             dict with keys: success, uuid, updated_fields.
         """
-        raise NotImplementedError(
-            "Sheet update will be implemented in Phase 3 (sheet-update-tool)."
+        return _do_update_sheet_symbol(
+            schematic_path=schematic_path,
+            sheet_identifier=sheet_identifier,
+            sheet_name=sheet_name,
+            sheet_file=sheet_file,
+            x=x,
+            y=y,
+            width=width,
+            height=height,
         )
 
     @mcp.tool()
@@ -678,7 +1205,7 @@ def register_sheet_tools(mcp: FastMCP) -> None:
         distance_mm: float,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
-        """Add a hierarchical pin to a sheet symbol. **(not yet implemented)**
+        """Add a hierarchical pin to a sheet symbol.
 
         Args:
             schematic_path: Absolute path to the target ``.kicad_sch`` file.
@@ -690,9 +1217,7 @@ def register_sheet_tools(mcp: FastMCP) -> None:
         Returns:
             dict with keys: success, pin_uuid, pin_name, edge, distance_mm.
         """
-        raise NotImplementedError(
-            "Sheet pin tools will be implemented in Phase 4 (sheet-pin-tools)."
-        )
+        return _do_add_sheet_pin(schematic_path, sheet_identifier, pin_name, edge, distance_mm)
 
     @mcp.tool()
     async def remove_sheet_pin(
@@ -701,7 +1226,7 @@ def register_sheet_tools(mcp: FastMCP) -> None:
         pin_name: str,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
-        """Remove a hierarchical pin from a sheet symbol. **(not yet implemented)**
+        """Remove a hierarchical pin from a sheet symbol.
 
         Args:
             schematic_path: Absolute path to the target ``.kicad_sch`` file.
@@ -711,6 +1236,4 @@ def register_sheet_tools(mcp: FastMCP) -> None:
         Returns:
             dict with keys: success, removed_pin_name.
         """
-        raise NotImplementedError(
-            "Sheet pin tools will be implemented in Phase 4 (sheet-pin-tools)."
-        )
+        return _do_remove_sheet_pin(schematic_path, sheet_identifier, pin_name)

@@ -578,3 +578,815 @@ class TestCreateChildSchematic:
             )
             assert "error" not in result, f"Paper {paper!r} rejected: {result.get('error')}"
             assert result["success"] is True
+
+
+# ---------------------------------------------------------------------------
+# add_sheet_symbol
+# ---------------------------------------------------------------------------
+
+
+class TestAddSheetSymbol:
+    """Integration tests for add_sheet_symbol."""
+
+    def test_add_sheet_symbol_basic(self, mcp_server, tmp_path):
+        """Add a sheet symbol without pins or child creation."""
+        port, sid = mcp_server
+        _copy_children_to(tmp_path)
+        parent_path = _copy_root(tmp_path)
+
+        result = _call_tool(
+            port,
+            sid,
+            "add_sheet_symbol",
+            {
+                "schematic_path": parent_path,
+                "sheet_name": "New Sheet",
+                "sheet_file": "new_sheet.kicad_sch",
+                "x": 100.0,
+                "y": 100.0,
+                "width": 50.8,
+                "height": 50.8,
+            },
+        )
+        assert "error" not in result, result.get("error")
+        assert result["success"] is True
+        assert "sheet_uuid" in result
+        assert result["sheet_name"] == "New Sheet"
+        assert result["sheet_file"] == "new_sheet.kicad_sch"
+        assert result["child_path"] is None
+
+        # Verify the sheet was added by listing sheets
+        list_result = _call_tool(port, sid, "list_sheet_symbols", {"schematic_path": parent_path})
+        assert list_result["sheet_count"] == 3  # Original 2 + 1 new
+        sheet_names = [s["sheet_name"] for s in list_result["sheets"]]
+        assert "New Sheet" in sheet_names
+
+    def test_add_sheet_symbol_with_create_child(self, mcp_server, tmp_path):
+        """Add a sheet symbol and create the child file."""
+        port, sid = mcp_server
+        _copy_children_to(tmp_path)
+        parent_path = _copy_root(tmp_path)
+
+        result = _call_tool(
+            port,
+            sid,
+            "add_sheet_symbol",
+            {
+                "schematic_path": parent_path,
+                "sheet_name": "Created Child",
+                "sheet_file": "created_child.kicad_sch",
+                "x": 150.0,
+                "y": 150.0,
+                "width": 76.2,
+                "height": 50.8,
+                "create_child": True,
+                "child_paper": "A4",
+            },
+        )
+        assert "error" not in result, result.get("error")
+        assert result["success"] is True
+        assert result["child_path"] is not None
+        assert os.path.exists(result["child_path"])
+
+        # Verify child file is valid
+        child_result = _call_tool(
+            port, sid, "list_sheet_symbols", {"schematic_path": result["child_path"]}
+        )
+        assert "error" not in child_result
+
+    def test_add_sheet_symbol_with_pins(self, mcp_server, tmp_path):
+        """Add a sheet symbol with hierarchical pins."""
+        port, sid = mcp_server
+        _copy_children_to(tmp_path)
+        parent_path = _copy_root(tmp_path)
+
+        result = _call_tool(
+            port,
+            sid,
+            "add_sheet_symbol",
+            {
+                "schematic_path": parent_path,
+                "sheet_name": "Pinned Sheet",
+                "sheet_file": "pinned_sheet.kicad_sch",
+                "x": 200.0,
+                "y": 200.0,
+                "width": 100.0,
+                "height": 75.0,
+                "pins": [
+                    {"name": "VCC", "edge": "right", "distance_mm": 10.0},
+                    {"name": "GND", "edge": "right", "distance_mm": 20.0},
+                    {"name": "INPUT", "edge": "left", "distance_mm": 15.0},
+                ],
+            },
+        )
+        assert "error" not in result, result.get("error")
+        assert result["success"] is True
+        assert result["pins_created"] == 3
+
+        # Verify pins were added
+        list_result = _call_tool(port, sid, "list_sheet_symbols", {"schematic_path": parent_path})
+        pinned_sheet = next(s for s in list_result["sheets"] if s["sheet_name"] == "Pinned Sheet")
+        assert len(pinned_sheet["pins"]) == 3
+        pin_names = [p["name"] for p in pinned_sheet["pins"]]
+        assert "VCC" in pin_names
+        assert "GND" in pin_names
+        assert "INPUT" in pin_names
+
+    def test_add_sheet_symbol_coordinates_snapped_to_grid(self, mcp_server, tmp_path):
+        """Verify coordinates are snapped to 1.27mm grid."""
+        port, sid = mcp_server
+        _copy_children_to(tmp_path)
+        parent_path = _copy_root(tmp_path)
+
+        result = _call_tool(
+            port,
+            sid,
+            "add_sheet_symbol",
+            {
+                "schematic_path": parent_path,
+                "sheet_name": "Grid Test",
+                "sheet_file": "grid_test.kicad_sch",
+                "x": 100.5,  # Should snap to 100.33
+                "y": 200.7,  # Should snap to 200.66
+                "width": 50.3,  # Should snap to 50.8
+                "height": 75.9,  # Should snap to 76.2
+            },
+        )
+        assert "error" not in result, result.get("error")
+        assert result["success"] is True
+
+        # Verify snapped coordinates
+        pos = result["position"]
+        size = result["size"]
+        assert abs(pos["x"] - 100.33) < 0.01
+        assert abs(pos["y"] - 200.66) < 0.01
+        assert abs(size["width"] - 50.8) < 0.01
+        assert abs(size["height"] - 76.2) < 0.01
+
+    def test_add_sheet_symbol_invalid_schematic(self, mcp_server, tmp_path):
+        """Reject non-.kicad_sch files."""
+        port, sid = mcp_server
+        bad_file = tmp_path / "not_a_schematic.txt"
+        bad_file.write_text("not a schematic")
+
+        result = _call_tool(
+            port,
+            sid,
+            "add_sheet_symbol",
+            {
+                "schematic_path": str(bad_file),
+                "sheet_name": "Test",
+                "sheet_file": "test.kicad_sch",
+                "x": 0.0,
+                "y": 0.0,
+            },
+        )
+        assert "error" in result
+
+    def test_add_sheet_symbol_nonexistent_schematic(self, mcp_server, tmp_path):
+        """Reject nonexistent schematic files."""
+        port, sid = mcp_server
+
+        result = _call_tool(
+            port,
+            sid,
+            "add_sheet_symbol",
+            {
+                "schematic_path": str(tmp_path / "no_such_file.kicad_sch"),
+                "sheet_name": "Test",
+                "sheet_file": "test.kicad_sch",
+                "x": 0.0,
+                "y": 0.0,
+            },
+        )
+        assert "error" in result
+
+
+# ---------------------------------------------------------------------------
+# remove_sheet_symbol
+# ---------------------------------------------------------------------------
+
+
+class TestRemoveSheetSymbol:
+    """Integration tests for remove_sheet_symbol."""
+
+    def test_remove_sheet_by_uuid(self, mcp_server, tmp_path):
+        """Remove a sheet symbol by UUID."""
+        port, sid = mcp_server
+        _copy_children_to(tmp_path)
+        parent_path = _copy_root(tmp_path)
+
+        # Get the UUID of the first sheet
+        list_result = _call_tool(port, sid, "list_sheet_symbols", {"schematic_path": parent_path})
+        assert list_result["sheet_count"] == 2
+        target_uuid = list_result["sheets"][0]["uuid"]
+        target_name = list_result["sheets"][0]["sheet_name"]
+
+        # Remove it
+        result = _call_tool(
+            port,
+            sid,
+            "remove_sheet_symbol",
+            {
+                "schematic_path": parent_path,
+                "sheet_identifier": target_uuid,
+            },
+        )
+        assert "error" not in result, result.get("error")
+        assert result["success"] is True
+        assert result["removed_uuid"] == target_uuid
+        assert result["removed_name"] == target_name
+
+        # Verify it's gone
+        list_result = _call_tool(port, sid, "list_sheet_symbols", {"schematic_path": parent_path})
+        assert list_result["sheet_count"] == 1
+        remaining_uuids = [s["uuid"] for s in list_result["sheets"]]
+        assert target_uuid not in remaining_uuids
+
+    def test_remove_sheet_by_name(self, mcp_server, tmp_path):
+        """Remove a sheet symbol by name."""
+        port, sid = mcp_server
+        _copy_children_to(tmp_path)
+        parent_path = _copy_root(tmp_path)
+
+        # Remove by name
+        result = _call_tool(
+            port,
+            sid,
+            "remove_sheet_symbol",
+            {
+                "schematic_path": parent_path,
+                "sheet_identifier": "Power Supply",
+            },
+        )
+        assert "error" not in result, result.get("error")
+        assert result["success"] is True
+        assert result["removed_name"] == "Power Supply"
+
+        # Verify it's gone
+        list_result = _call_tool(port, sid, "list_sheet_symbols", {"schematic_path": parent_path})
+        assert list_result["sheet_count"] == 1
+        remaining_names = [s["sheet_name"] for s in list_result["sheets"]]
+        assert "Power Supply" not in remaining_names
+
+    def test_remove_nonexistent_sheet_returns_error(self, mcp_server, tmp_path):
+        """Removing a nonexistent sheet returns an error."""
+        port, sid = mcp_server
+        _copy_children_to(tmp_path)
+        parent_path = _copy_root(tmp_path)
+
+        result = _call_tool(
+            port,
+            sid,
+            "remove_sheet_symbol",
+            {
+                "schematic_path": parent_path,
+                "sheet_identifier": "nonexistent-uuid-12345",
+            },
+        )
+        assert "error" in result
+
+    def test_remove_from_empty_schematic_returns_error(self, mcp_server, tmp_path):
+        """Removing from a schematic with no sheets returns an error."""
+        port, sid = mcp_server
+        _copy_children_to(tmp_path)
+        parent_path = _copy_root(tmp_path)
+
+        # Remove all sheets first
+        list_result = _call_tool(port, sid, "list_sheet_symbols", {"schematic_path": parent_path})
+        for sheet in list_result["sheets"]:
+            _call_tool(
+                port,
+                sid,
+                "remove_sheet_symbol",
+                {
+                    "schematic_path": parent_path,
+                    "sheet_identifier": sheet["uuid"],
+                },
+            )
+
+        # Try to remove from empty schematic
+        result = _call_tool(
+            port,
+            sid,
+            "remove_sheet_symbol",
+            {
+                "schematic_path": parent_path,
+                "sheet_identifier": "any-uuid",
+            },
+        )
+        assert "error" in result
+
+    def test_remove_sheet_invalid_schematic(self, mcp_server, tmp_path):
+        """Reject non-.kicad_sch files."""
+        port, sid = mcp_server
+        bad_file = tmp_path / "not_a_schematic.txt"
+        bad_file.write_text("not a schematic")
+
+        result = _call_tool(
+            port,
+            sid,
+            "remove_sheet_symbol",
+            {
+                "schematic_path": str(bad_file),
+                "sheet_identifier": "any-uuid",
+            },
+        )
+        assert "error" in result
+
+
+# ---------------------------------------------------------------------------
+# update_sheet_symbol
+# ---------------------------------------------------------------------------
+
+
+class TestUpdateSheetSymbol:
+    """Integration tests for update_sheet_symbol."""
+
+    def test_update_sheet_name(self, mcp_server, tmp_path):
+        """Update the sheet name."""
+        port, sid = mcp_server
+        _copy_children_to(tmp_path)
+        parent_path = _copy_root(tmp_path)
+
+        # Get the UUID of the first sheet
+        list_result = _call_tool(port, sid, "list_sheet_symbols", {"schematic_path": parent_path})
+        target_uuid = list_result["sheets"][0]["uuid"]
+
+        # Update the name
+        result = _call_tool(
+            port,
+            sid,
+            "update_sheet_symbol",
+            {
+                "schematic_path": parent_path,
+                "sheet_identifier": target_uuid,
+                "sheet_name": "Renamed Sheet",
+            },
+        )
+        assert "error" not in result, result.get("error")
+        assert result["success"] is True
+        assert "sheet_name" in result["updated_fields"]
+
+        # Verify the update
+        list_result = _call_tool(port, sid, "list_sheet_symbols", {"schematic_path": parent_path})
+        updated_sheet = next(s for s in list_result["sheets"] if s["uuid"] == target_uuid)
+        assert updated_sheet["sheet_name"] == "Renamed Sheet"
+
+    def test_update_sheet_file(self, mcp_server, tmp_path):
+        """Update the sheet file reference."""
+        port, sid = mcp_server
+        _copy_children_to(tmp_path)
+        parent_path = _copy_root(tmp_path)
+
+        list_result = _call_tool(port, sid, "list_sheet_symbols", {"schematic_path": parent_path})
+        target_uuid = list_result["sheets"][0]["uuid"]
+
+        result = _call_tool(
+            port,
+            sid,
+            "update_sheet_symbol",
+            {
+                "schematic_path": parent_path,
+                "sheet_identifier": target_uuid,
+                "sheet_file": "new_file.kicad_sch",
+            },
+        )
+        assert "error" not in result, result.get("error")
+        assert result["success"] is True
+        assert "sheet_file" in result["updated_fields"]
+
+        # Verify the update
+        list_result = _call_tool(port, sid, "list_sheet_symbols", {"schematic_path": parent_path})
+        updated_sheet = next(s for s in list_result["sheets"] if s["uuid"] == target_uuid)
+        assert updated_sheet["sheet_file"] == "new_file.kicad_sch"
+
+    def test_update_position(self, mcp_server, tmp_path):
+        """Update the sheet position."""
+        port, sid = mcp_server
+        _copy_children_to(tmp_path)
+        parent_path = _copy_root(tmp_path)
+
+        list_result = _call_tool(port, sid, "list_sheet_symbols", {"schematic_path": parent_path})
+        target_uuid = list_result["sheets"][0]["uuid"]
+
+        # Use grid-aligned coordinates (multiples of 1.27mm)
+        result = _call_tool(
+            port,
+            sid,
+            "update_sheet_symbol",
+            {
+                "schematic_path": parent_path,
+                "sheet_identifier": target_uuid,
+                "x": 300.99,  # 237 * 1.27
+                "y": 400.05,  # 315 * 1.27
+            },
+        )
+        assert "error" not in result, result.get("error")
+        assert result["success"] is True
+        assert "position" in result["updated_fields"]
+
+        # Verify the update
+        list_result = _call_tool(port, sid, "list_sheet_symbols", {"schematic_path": parent_path})
+        updated_sheet = next(s for s in list_result["sheets"] if s["uuid"] == target_uuid)
+        assert abs(updated_sheet["position"]["x"] - 300.99) < 0.01
+        assert abs(updated_sheet["position"]["y"] - 400.05) < 0.01
+
+    def test_update_size(self, mcp_server, tmp_path):
+        """Update the sheet size."""
+        port, sid = mcp_server
+        _copy_children_to(tmp_path)
+        parent_path = _copy_root(tmp_path)
+
+        list_result = _call_tool(port, sid, "list_sheet_symbols", {"schematic_path": parent_path})
+        target_uuid = list_result["sheets"][0]["uuid"]
+
+        # Use grid-aligned sizes (multiples of 1.27mm)
+        result = _call_tool(
+            port,
+            sid,
+            "update_sheet_symbol",
+            {
+                "schematic_path": parent_path,
+                "sheet_identifier": target_uuid,
+                "width": 151.13,  # 119 * 1.27
+                "height": 100.33,  # 79 * 1.27
+            },
+        )
+        assert "error" not in result, result.get("error")
+        assert result["success"] is True
+        assert "size" in result["updated_fields"]
+
+        # Verify the update
+        list_result = _call_tool(port, sid, "list_sheet_symbols", {"schematic_path": parent_path})
+        updated_sheet = next(s for s in list_result["sheets"] if s["uuid"] == target_uuid)
+        assert abs(updated_sheet["size"]["width"] - 151.13) < 0.01
+        assert abs(updated_sheet["size"]["height"] - 100.33) < 0.01
+
+    def test_update_multiple_fields(self, mcp_server, tmp_path):
+        """Update multiple fields at once."""
+        port, sid = mcp_server
+        _copy_children_to(tmp_path)
+        parent_path = _copy_root(tmp_path)
+
+        list_result = _call_tool(port, sid, "list_sheet_symbols", {"schematic_path": parent_path})
+        target_uuid = list_result["sheets"][0]["uuid"]
+
+        # Use grid-aligned coordinates (multiples of 1.27mm)
+        result = _call_tool(
+            port,
+            sid,
+            "update_sheet_symbol",
+            {
+                "schematic_path": parent_path,
+                "sheet_identifier": target_uuid,
+                "sheet_name": "Multi Update",
+                "sheet_file": "multi.kicad_sch",
+                "x": 50.8,  # 40 * 1.27
+                "y": 63.5,  # 50 * 1.27
+                "width": 76.2,  # 60 * 1.27
+                "height": 88.9,  # 70 * 1.27
+            },
+        )
+        assert "error" not in result, result.get("error")
+        assert result["success"] is True
+        assert len(result["updated_fields"]) == 4
+
+        # Verify all updates
+        list_result = _call_tool(port, sid, "list_sheet_symbols", {"schematic_path": parent_path})
+        updated_sheet = next(s for s in list_result["sheets"] if s["uuid"] == target_uuid)
+        assert updated_sheet["sheet_name"] == "Multi Update"
+        assert updated_sheet["sheet_file"] == "multi.kicad_sch"
+        assert abs(updated_sheet["position"]["x"] - 50.8) < 0.01
+        assert abs(updated_sheet["position"]["y"] - 63.5) < 0.01
+        assert abs(updated_sheet["size"]["width"] - 76.2) < 0.01
+        assert abs(updated_sheet["size"]["height"] - 88.9) < 0.01
+
+    def test_update_nonexistent_sheet_returns_error(self, mcp_server, tmp_path):
+        """Updating a nonexistent sheet returns an error."""
+        port, sid = mcp_server
+        _copy_children_to(tmp_path)
+        parent_path = _copy_root(tmp_path)
+
+        result = _call_tool(
+            port,
+            sid,
+            "update_sheet_symbol",
+            {
+                "schematic_path": parent_path,
+                "sheet_identifier": "nonexistent-uuid-12345",
+                "sheet_name": "Test",
+            },
+        )
+        assert "error" in result
+
+    def test_update_with_no_fields_returns_error(self, mcp_server, tmp_path):
+        """Updating with no fields returns an error."""
+        port, sid = mcp_server
+        _copy_children_to(tmp_path)
+        parent_path = _copy_root(tmp_path)
+
+        list_result = _call_tool(port, sid, "list_sheet_symbols", {"schematic_path": parent_path})
+        target_uuid = list_result["sheets"][0]["uuid"]
+
+        result = _call_tool(
+            port,
+            sid,
+            "update_sheet_symbol",
+            {
+                "schematic_path": parent_path,
+                "sheet_identifier": target_uuid,
+            },
+        )
+        assert "error" in result
+
+    def test_update_sheet_invalid_schematic(self, mcp_server, tmp_path):
+        """Reject non-.kicad_sch files."""
+        port, sid = mcp_server
+        bad_file = tmp_path / "not_a_schematic.txt"
+        bad_file.write_text("not a schematic")
+
+        result = _call_tool(
+            port,
+            sid,
+            "update_sheet_symbol",
+            {
+                "schematic_path": str(bad_file),
+                "sheet_identifier": "any-uuid",
+                "sheet_name": "Test",
+            },
+        )
+        assert "error" in result
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: Sheet Pin Management
+# ---------------------------------------------------------------------------
+
+
+class TestAddSheetPin:
+    """Integration tests for add_sheet_pin tool."""
+
+    def test_add_pin_to_right_edge(self, mcp_server, tmp_path):
+        """Add a pin to the right edge of a sheet symbol."""
+        port, sid = mcp_server
+        _copy_children_to(tmp_path)
+        parent_path = _copy_root(tmp_path)
+
+        list_result = _call_tool(port, sid, "list_sheet_symbols", {"schematic_path": parent_path})
+        target_uuid = list_result["sheets"][0]["uuid"]
+
+        result = _call_tool(
+            port,
+            sid,
+            "add_sheet_pin",
+            {
+                "schematic_path": parent_path,
+                "sheet_identifier": target_uuid,
+                "pin_name": "NEW_PIN",
+                "edge": "right",
+                "distance_mm": 5.08,
+            },
+        )
+        assert result["success"] is True
+        assert result["pin_name"] == "NEW_PIN"
+        assert result["edge"] == "right"
+        assert "pin_uuid" in result
+
+    def test_add_pin_to_left_edge(self, mcp_server, tmp_path):
+        """Add a pin to the left edge of a sheet symbol."""
+        port, sid = mcp_server
+        _copy_children_to(tmp_path)
+        parent_path = _copy_root(tmp_path)
+
+        list_result = _call_tool(port, sid, "list_sheet_symbols", {"schematic_path": parent_path})
+        target_uuid = list_result["sheets"][0]["uuid"]
+
+        result = _call_tool(
+            port,
+            sid,
+            "add_sheet_pin",
+            {
+                "schematic_path": parent_path,
+                "sheet_identifier": target_uuid,
+                "pin_name": "LEFT_PIN",
+                "edge": "left",
+                "distance_mm": 2.54,
+            },
+        )
+        assert result["success"] is True
+        assert result["edge"] == "left"
+
+    def test_add_pin_to_top_edge(self, mcp_server, tmp_path):
+        """Add a pin to the top edge of a sheet symbol."""
+        port, sid = mcp_server
+        _copy_children_to(tmp_path)
+        parent_path = _copy_root(tmp_path)
+
+        list_result = _call_tool(port, sid, "list_sheet_symbols", {"schematic_path": parent_path})
+        target_uuid = list_result["sheets"][0]["uuid"]
+
+        result = _call_tool(
+            port,
+            sid,
+            "add_sheet_pin",
+            {
+                "schematic_path": parent_path,
+                "sheet_identifier": target_uuid,
+                "pin_name": "TOP_PIN",
+                "edge": "top",
+                "distance_mm": 3.81,
+            },
+        )
+        assert result["success"] is True
+        assert result["edge"] == "top"
+
+    def test_add_pin_to_bottom_edge(self, mcp_server, tmp_path):
+        """Add a pin to the bottom edge of a sheet symbol."""
+        port, sid = mcp_server
+        _copy_children_to(tmp_path)
+        parent_path = _copy_root(tmp_path)
+
+        list_result = _call_tool(port, sid, "list_sheet_symbols", {"schematic_path": parent_path})
+        target_uuid = list_result["sheets"][0]["uuid"]
+
+        result = _call_tool(
+            port,
+            sid,
+            "add_sheet_pin",
+            {
+                "schematic_path": parent_path,
+                "sheet_identifier": target_uuid,
+                "pin_name": "BOTTOM_PIN",
+                "edge": "bottom",
+                "distance_mm": 1.27,
+            },
+        )
+        assert result["success"] is True
+        assert result["edge"] == "bottom"
+
+    def test_add_pin_invalid_edge_returns_error(self, mcp_server, tmp_path):
+        """Invalid edge value returns an error."""
+        port, sid = mcp_server
+        _copy_children_to(tmp_path)
+        parent_path = _copy_root(tmp_path)
+
+        list_result = _call_tool(port, sid, "list_sheet_symbols", {"schematic_path": parent_path})
+        target_uuid = list_result["sheets"][0]["uuid"]
+
+        result = _call_tool(
+            port,
+            sid,
+            "add_sheet_pin",
+            {
+                "schematic_path": parent_path,
+                "sheet_identifier": target_uuid,
+                "pin_name": "BAD_PIN",
+                "edge": "diagonal",
+                "distance_mm": 1.27,
+            },
+        )
+        assert "error" in result
+
+    def test_add_pin_sheet_not_found_returns_error(self, mcp_server, tmp_path):
+        """Adding a pin to a non-existent sheet returns an error."""
+        port, sid = mcp_server
+        _copy_children_to(tmp_path)
+        parent_path = _copy_root(tmp_path)
+
+        result = _call_tool(
+            port,
+            sid,
+            "add_sheet_pin",
+            {
+                "schematic_path": parent_path,
+                "sheet_identifier": "nonexistent-uuid-99999",
+                "pin_name": "ORPHAN_PIN",
+                "edge": "right",
+                "distance_mm": 1.27,
+            },
+        )
+        assert "error" in result
+
+
+class TestRemoveSheetPin:
+    """Integration tests for remove_sheet_pin tool."""
+
+    def test_remove_existing_pin(self, mcp_server, tmp_path):
+        """Remove an existing pin from a sheet symbol."""
+        port, sid = mcp_server
+        _copy_children_to(tmp_path)
+        parent_path = _copy_root(tmp_path)
+
+        list_result = _call_tool(port, sid, "list_sheet_symbols", {"schematic_path": parent_path})
+        # Power Supply sheet has VCC and GND pins
+        power_sheet = next(s for s in list_result["sheets"] if s["sheet_name"] == "Power Supply")
+        target_uuid = power_sheet["uuid"]
+
+        result = _call_tool(
+            port,
+            sid,
+            "remove_sheet_pin",
+            {
+                "schematic_path": parent_path,
+                "sheet_identifier": target_uuid,
+                "pin_name": "VCC",
+            },
+        )
+        assert result["success"] is True
+        assert result["removed_pin_name"] == "VCC"
+
+    def test_remove_nonexistent_pin_returns_error(self, mcp_server, tmp_path):
+        """Removing a pin that doesn't exist returns an error."""
+        port, sid = mcp_server
+        _copy_children_to(tmp_path)
+        parent_path = _copy_root(tmp_path)
+
+        list_result = _call_tool(port, sid, "list_sheet_symbols", {"schematic_path": parent_path})
+        target_uuid = list_result["sheets"][0]["uuid"]
+
+        result = _call_tool(
+            port,
+            sid,
+            "remove_sheet_pin",
+            {
+                "schematic_path": parent_path,
+                "sheet_identifier": target_uuid,
+                "pin_name": "NONEXISTENT_PIN",
+            },
+        )
+        assert "error" in result
+
+    def test_remove_pin_sheet_not_found_returns_error(self, mcp_server, tmp_path):
+        """Removing a pin from a non-existent sheet returns an error."""
+        port, sid = mcp_server
+        _copy_children_to(tmp_path)
+        parent_path = _copy_root(tmp_path)
+
+        result = _call_tool(
+            port,
+            sid,
+            "remove_sheet_pin",
+            {
+                "schematic_path": parent_path,
+                "sheet_identifier": "nonexistent-uuid-88888",
+                "pin_name": "ANY_PIN",
+            },
+        )
+        assert "error" in result
+
+    def test_add_then_remove_pin_roundtrip(self, mcp_server, tmp_path):
+        """Add a pin then remove it - roundtrip test."""
+        port, sid = mcp_server
+        _copy_children_to(tmp_path)
+        parent_path = _copy_root(tmp_path)
+
+        list_result = _call_tool(port, sid, "list_sheet_symbols", {"schematic_path": parent_path})
+        target_uuid = list_result["sheets"][0]["uuid"]
+
+        # Add a pin
+        add_result = _call_tool(
+            port,
+            sid,
+            "add_sheet_pin",
+            {
+                "schematic_path": parent_path,
+                "sheet_identifier": target_uuid,
+                "pin_name": "TEMP_PIN",
+                "edge": "right",
+                "distance_mm": 2.54,
+            },
+        )
+        assert add_result["success"] is True
+
+        # Remove the same pin
+        remove_result = _call_tool(
+            port,
+            sid,
+            "remove_sheet_pin",
+            {
+                "schematic_path": parent_path,
+                "sheet_identifier": target_uuid,
+                "pin_name": "TEMP_PIN",
+            },
+        )
+        assert remove_result["success"] is True
+        assert remove_result["removed_pin_name"] == "TEMP_PIN"
+
+    def test_remove_pin_invalid_schematic(self, mcp_server, tmp_path):
+        """Reject non-.kicad_sch files."""
+        port, sid = mcp_server
+        bad_file = tmp_path / "not_a_schematic.txt"
+        bad_file.write_text("not a schematic")
+
+        result = _call_tool(
+            port,
+            sid,
+            "remove_sheet_pin",
+            {
+                "schematic_path": str(bad_file),
+                "sheet_identifier": "any-uuid",
+                "pin_name": "ANY_PIN",
+            },
+        )
+        assert "error" in result

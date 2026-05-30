@@ -94,6 +94,36 @@ TOOL_POLICIES: dict[str, ToolPolicy] = {
         auto_snapshot=False,
         mark_dirty=False,
     ),
+    "add_sheet_symbol": ToolPolicy(
+        kind="file_mutation",
+        path_arg="schematic_path",
+        auto_snapshot=True,
+        mark_dirty=True,
+    ),
+    "remove_sheet_symbol": ToolPolicy(
+        kind="file_mutation",
+        path_arg="schematic_path",
+        auto_snapshot=True,
+        mark_dirty=True,
+    ),
+    "update_sheet_symbol": ToolPolicy(
+        kind="file_mutation",
+        path_arg="schematic_path",
+        auto_snapshot=True,
+        mark_dirty=True,
+    ),
+    "add_sheet_pin": ToolPolicy(
+        kind="file_mutation",
+        path_arg="schematic_path",
+        auto_snapshot=True,
+        mark_dirty=True,
+    ),
+    "remove_sheet_pin": ToolPolicy(
+        kind="file_mutation",
+        path_arg="schematic_path",
+        auto_snapshot=True,
+        mark_dirty=True,
+    ),
     # Wire edit tools
     "connect_points_with_wire": ToolPolicy(
         kind="file_mutation",
