@@ -85,6 +85,15 @@ TOOL_POLICIES: dict[str, ToolPolicy] = {
         auto_snapshot=True,
         mark_dirty=True,
     ),
+    # Sheet tools
+    "list_sheet_symbols": ToolPolicy(kind="query"),
+    "get_sheet_hierarchy": ToolPolicy(kind="query"),
+    "create_child_sheet": ToolPolicy(
+        kind="file_mutation",
+        path_arg="parent_path",
+        auto_snapshot=False,
+        mark_dirty=False,
+    ),
     # Wire edit tools
     "connect_points_with_wire": ToolPolicy(
         kind="file_mutation",
