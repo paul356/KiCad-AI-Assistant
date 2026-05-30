@@ -54,7 +54,7 @@ jobs:
       run: uv sync --group dev
 
     - name: Run tests
-      run: uv run python -m pytest tests/ -v --cov=kcaa --cov-report=xml --cov-fail-under=30
+      run: uv run python -m pytest tests/ -v --cov=kcaa --cov-report=xml --cov-fail-under=45
 
     - name: Upload coverage to Codecov
       uses: codecov/codecov-action@v4

@@ -4,6 +4,8 @@ KiCad AI Assistant is a KiCad action plugin that embeds an LLM-powered chat pane
 
 Tested on **KiCad 10.0 / Linux**.
 
+[![CI](https://github.com/paul356/KiCad-AI-Assistant/actions/workflows/ci.yml/badge.svg)](https://github.com/paul356/KiCad-AI-Assistant/actions/workflows/ci.yml)
+
 ## Table of Contents
 
 - [KiCad AI Assistant](#kicad-ai-assistant)
