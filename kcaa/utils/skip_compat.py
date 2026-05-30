@@ -33,7 +33,6 @@ import builtins
 from contextlib import contextmanager
 from typing import Any
 
-
 # ---------------------------------------------------------------------------
 # Internal: temporary open() monkey-patch
 # ---------------------------------------------------------------------------

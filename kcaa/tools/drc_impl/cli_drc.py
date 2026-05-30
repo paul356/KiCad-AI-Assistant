@@ -4,7 +4,8 @@ Design Rule Check (DRC) implementation using KiCad command-line interface.
 
 import json
 import os
-import subprocess
+import shutil
+import subprocess  # nosec B404 -- controlled command execution, no user input
 import tempfile
 from typing import Any
 
@@ -49,7 +50,7 @@ async def run_drc_via_cli(pcb_file: str, ctx: Context | None) -> dict[str, Any]:
             cmd = [kicad_cli, "pcb", "drc", "--format", "json", "--output", output_file, pcb_file]
 
             print(f"Running command: {' '.join(cmd)}")
-            process = subprocess.run(cmd, capture_output=True, text=True)
+            process = subprocess.run(cmd, capture_output=True, text=True)  # nosec B603 -- input is validated
 
             # Check if the command was successful
             if process.returncode != 0:
@@ -119,14 +120,12 @@ def find_kicad_cli() -> str | None:
     try:
         if config.system == "Windows":
             # On Windows, check for kicad-cli.exe
-            result = subprocess.run(["where", "kicad-cli.exe"], capture_output=True, text=True)
-            if result.returncode == 0:
-                return result.stdout.strip().split("\n")[0]
+            kicad_cli = shutil.which("kicad-cli.exe")
         else:
-            # On Unix-like systems, use which
-            result = subprocess.run(["which", "kicad-cli"], capture_output=True, text=True)
-            if result.returncode == 0:
-                return result.stdout.strip()
+            # On Unix-like systems
+            kicad_cli = shutil.which("kicad-cli")
+        if kicad_cli:
+            return kicad_cli
 
     except Exception as e:
         print(f"Error finding kicad-cli: {str(e)}")

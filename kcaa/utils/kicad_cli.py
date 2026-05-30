@@ -9,7 +9,7 @@ import logging
 import os
 import platform
 import shutil
-import subprocess
+import subprocess  # nosec B404 -- controlled command execution, no user input
 
 from .config import config
 

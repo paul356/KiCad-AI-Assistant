@@ -3,6 +3,7 @@ Bill of Materials (BOM) resources for KiCad projects.
 """
 
 import json
+import logging
 import os
 
 from fastmcp import FastMCP
@@ -11,6 +12,8 @@ import pandas as pd
 # Import the helper functions from bom_tools.py to avoid code duplication
 from kcaa.tools.bom_tools import analyze_bom_data, parse_bom_file
 from kcaa.utils.file_utils import get_project_files
+
+log = logging.getLogger(__name__)
 
 
 def register_bom_resources(mcp: FastMCP) -> None:
@@ -266,9 +269,9 @@ def register_bom_resources(mcp: FastMCP) -> None:
                         try:
                             result["bom_files"][file_type] = json.load(f)
                             continue
-                        except:
+                        except Exception:
                             # If JSON parsing fails, fall back to regular parsing
-                            pass
+                            log.debug("JSON parsing failed for %s, falling back to regular parsing", file_path)
 
                 # Otherwise parse with our utility
                 bom_data, format_info = parse_bom_file(file_path)

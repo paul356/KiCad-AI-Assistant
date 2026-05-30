@@ -16,7 +16,6 @@ import uuid
 
 from fastmcp import Context, FastMCP
 import sexpdata
-import skip
 
 from kcaa.utils.config import LibraryPathConfig
 from kcaa.utils.schematic_sexp_utils import save_schematic
@@ -1749,7 +1748,7 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
                         )
                         raw_tree.insert(uuid_idx, fa_node)
                 except Exception:
-                    pass  # non-critical; symbol position still applied
+                    log.debug("Failed to insert field_autoplace node, symbol position still applied")
 
             try:
                 save_schematic(schematic_path, sch)

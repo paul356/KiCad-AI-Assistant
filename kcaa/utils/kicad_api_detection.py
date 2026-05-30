@@ -4,7 +4,7 @@ Utility functions for detecting and selecting available KiCad API approaches.
 
 import os
 import shutil
-import subprocess
+import subprocess  # nosec B404 -- controlled command execution, no user input
 
 from kcaa.utils.config import config
 
@@ -28,7 +28,7 @@ def check_for_cli_api() -> bool:
             # Verify it's a working kicad-cli
             cmd = [kicad_cli, "--version"] if config.system == "Windows" else [kicad_cli, "--version"]
 
-            result = subprocess.run(cmd, capture_output=True, text=True)
+            result = subprocess.run(cmd, capture_output=True, text=True)  # nosec B603 -- input is validated
             if result.returncode == 0:
                 print(f"Found working kicad-cli: {kicad_cli}")
                 return True

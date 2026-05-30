@@ -138,7 +138,7 @@ def _fast_path(file_path: str, file_index: int) -> list:
                     j += 1
                 token = text[tok_start:j]
 
-                if token == "symbol":
+                if token == "symbol":  # nosec B105 -- KiCad S-expression token, not a password
                     if sym_count == file_index:
                         capture_start = i
                     sym_count += 1
@@ -187,6 +187,7 @@ def _fallback_path(file_path: str, symbol_name: str) -> list:
             if sym_el.value == symbol_name:
                 return copy.deepcopy(sym_el.raw)
         except Exception:
+            log.debug("Failed to check symbol element, continuing")
             continue
 
     raise ValueError(f"Symbol {symbol_name!r} not found in {file_path!r}")

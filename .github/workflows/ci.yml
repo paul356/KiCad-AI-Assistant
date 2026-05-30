@@ -36,6 +36,8 @@ jobs:
   test:
     runs-on: ubuntu-latest
     name: Test Python 3.13
+    env:
+      KICAD_VERSION: "10"
 
     steps:
     - uses: actions/checkout@v4

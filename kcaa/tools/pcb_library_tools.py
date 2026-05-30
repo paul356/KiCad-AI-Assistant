@@ -398,7 +398,7 @@ async def _live_search_footprints(
                     tags = info.get("tags", "")
                     attr = info.get("attr", "")
                 except Exception:
-                    pass
+                    log.debug("Failed to parse footprint metadata from %s", mod_path)
                 matches.append(
                     {
                         "library": lib["nickname"],

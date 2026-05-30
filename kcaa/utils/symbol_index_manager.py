@@ -24,7 +24,6 @@ import time
 import skip.collection
 
 from kcaa.utils.skip_compat import safe_source_file
-
 from kcaa.utils.symbol_database import (
     DbStats,
     LibraryRecord,
