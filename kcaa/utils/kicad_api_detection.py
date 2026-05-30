@@ -26,7 +26,9 @@ def check_for_cli_api() -> bool:
 
         if kicad_cli:
             # Verify it's a working kicad-cli
-            cmd = [kicad_cli, "--version"] if config.system == "Windows" else [kicad_cli, "--version"]
+            cmd = (
+                [kicad_cli, "--version"] if config.system == "Windows" else [kicad_cli, "--version"]
+            )
 
             result = subprocess.run(cmd, capture_output=True, text=True)  # nosec B603 -- input is validated
             if result.returncode == 0:

@@ -71,8 +71,8 @@ def collect_context() -> dict[str, Any]:
                 try:
                     if fp.IsSelected():
                         selection.append(fp.GetReference())
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug("Could not get footprint reference: %s", e)
             ctx["selected_refs"] = selection
     except Exception as e:
         log.debug("Could not collect PCB context: %s", e)

@@ -166,8 +166,7 @@ class LibraryPathConfig:
         # KiCad version — from KICAD_VERSION env var (.env), or detected
         # from KICAD{N}_* variables. Raises RuntimeError if undetermined.
         self._kicad_version = (
-            os.environ.get("KICAD_VERSION")
-            or self._detect_kicad_version_from_env()
+            os.environ.get("KICAD_VERSION") or self._detect_kicad_version_from_env()
         )
         if self._kicad_version is None:
             raise RuntimeError(
@@ -256,8 +255,10 @@ class LibraryPathConfig:
 
                         # Remove quotes if present
                         if (
-                            value.startswith('"') and value.endswith('"')
-                            or value.startswith("'") and value.endswith("'")
+                            value.startswith('"')
+                            and value.endswith('"')
+                            or value.startswith("'")
+                            and value.endswith("'")
                         ):
                             value = value[1:-1]
 

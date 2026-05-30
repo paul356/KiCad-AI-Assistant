@@ -271,7 +271,10 @@ def register_bom_resources(mcp: FastMCP) -> None:
                             continue
                         except Exception:
                             # If JSON parsing fails, fall back to regular parsing
-                            log.debug("JSON parsing failed for %s, falling back to regular parsing", file_path)
+                            log.debug(
+                                "JSON parsing failed for %s, falling back to regular parsing",
+                                file_path,
+                            )
 
                 # Otherwise parse with our utility
                 bom_data, format_info = parse_bom_file(file_path)

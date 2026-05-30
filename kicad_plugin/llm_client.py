@@ -14,7 +14,7 @@ import json
 import logging
 import os
 import platform
-import subprocess
+import subprocess  # nosec B404 -- controlled subprocess execution, no user input
 from typing import Any
 
 from .tool_registry import get_missing_tool_policies, get_tool_policy
@@ -154,7 +154,7 @@ def _https_post_json(
     clean_env = {k: os.environ[k] for k in _ENV_ALLOWLIST if k in os.environ}
 
     try:
-        proc = subprocess.run(
+        proc = subprocess.run(  # nosec B603 -- input is validated
             [venv_python, "-I", "-c", _SUBPROCESS_SCRIPT, url, json.dumps(headers), str(timeout)],
             input=body,
             capture_output=True,
@@ -802,8 +802,8 @@ class LLMClient:
             return
         try:
             on_tool_call(tool_name, args, result)
-        except Exception:
-            pass  # UI callback errors must not break the loop
+        except Exception as e:
+            log.debug("UI callback error in _emit_tool_callback: %s", e)  # must not break the loop
 
     def _execute_tool_with_policy(
         self,
@@ -1149,8 +1149,8 @@ class LLMClient:
                             text_parts.append(content)
                             try:
                                 on_text_delta(content)
-                            except Exception:
-                                pass
+                            except Exception as e:
+                                log.debug("Text delta callback error in streaming: %s", e)
 
                         reasoning = delta.get("reasoning_content")
                         if reasoning:
@@ -1195,8 +1195,8 @@ class LLMClient:
         if content:
             try:
                 on_text_delta(content)
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("Non-streaming callback error: %s", e)
         return result
 
     def _stream_anthropic(self, system: str, tools: list[dict], on_text_delta) -> dict[str, Any]:
@@ -1286,8 +1286,8 @@ class LLMClient:
                                 if chunk:
                                     try:
                                         on_text_delta(chunk)
-                                    except Exception:
-                                        pass
+                                    except Exception as e:
+                                        log.debug("Anthropic text delta callback error: %s", e)
                             elif dtype == "input_json_delta":
                                 partial = delta.get("partial_json", "")
                                 if idx in tool_blocks:
@@ -1345,8 +1345,8 @@ class LLMClient:
         if content:
             try:
                 on_text_delta(content)
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("Non-streaming callback error: %s", e)
         return result
 
     def _call_openai(self, system: str, tools: list[dict]) -> dict[str, Any]:

@@ -36,8 +36,8 @@ def _detect_kicad_version() -> str | None:
         m = re.search(r"[/\\]kicad[/\\](\d+\.\d+)[/\\]", path, re.IGNORECASE)
         if m:
             return m.group(1)
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug("Could not detect KiCad version from path: %s", e)
 
     # 3. From KICAD{N}_* environment variables
     for key in os.environ:

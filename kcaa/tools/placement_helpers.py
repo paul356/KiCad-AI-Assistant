@@ -88,9 +88,9 @@ def _parse_paper_size(schematic_path: str) -> tuple[str, float, float, bool]:
                 for extra in item[2:]:
                     if isinstance(extra, sexpdata.Symbol) and extra.value() == "portrait":
                         portrait = True
-                    elif isinstance(extra, (int, float)) and custom_w is None:
+                    elif isinstance(extra, int | float) and custom_w is None:
                         custom_w = float(extra)
-                    elif isinstance(extra, (int, float)) and custom_h is None:
+                    elif isinstance(extra, int | float) and custom_h is None:
                         custom_h = float(extra)
                 break
 
@@ -259,7 +259,9 @@ def register_placement_helpers(mcp: FastMCP) -> None:
                     )
                 ref_at_origin = union_bboxes(per_unit)
                 if ref_at_origin is None:
-                    raise ValueError("ref_at_origin is None, cannot compute bounding box dimensions")
+                    raise ValueError(
+                        "ref_at_origin is None, cannot compute bounding box dimensions"
+                    )
                 derived_w = ref_at_origin.max_x - ref_at_origin.min_x
                 derived_h = ref_at_origin.max_y - ref_at_origin.min_y
                 sym_bbox_offset = (ref_at_origin.min_x, ref_at_origin.min_y)

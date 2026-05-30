@@ -12,7 +12,7 @@ import os
 import platform
 import shutil
 import socket
-import subprocess
+import subprocess  # nosec B404 -- controlled subprocess execution, no user input
 import threading
 import time
 
@@ -107,7 +107,7 @@ class ServerManager:
                     kwargs["stdout"] = subprocess.DEVNULL
                     kwargs["stderr"] = subprocess.DEVNULL
 
-                self._process = subprocess.Popen(cmd, env=env, **kwargs)
+                self._process = subprocess.Popen(cmd, env=env, **kwargs)  # nosec B603 -- input is validated
             except (FileNotFoundError, PermissionError) as e:
                 log.error("Failed to launch server: %s", e)
                 return False

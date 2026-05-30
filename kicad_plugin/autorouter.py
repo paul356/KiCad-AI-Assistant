@@ -29,7 +29,7 @@ from collections.abc import Callable
 import glob
 import logging
 import os
-import subprocess
+import subprocess  # nosec B404 -- controlled subprocess execution, no user input
 import threading
 
 log = logging.getLogger(__name__)
@@ -232,7 +232,7 @@ def _run_subprocess(
     debug_prefix += "---\n"
 
     try:
-        result = subprocess.run(
+        result = subprocess.run(  # nosec B603 -- input is validated
             cmd,
             capture_output=True,
             text=True,

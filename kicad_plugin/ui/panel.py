@@ -1227,8 +1227,8 @@ if _WX_AVAILABLE:
                 try:
                     with open(link, "w", encoding="utf-8") as lf:
                         lf.write(filename)
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug("Could not write session file link: %s", e)
 
         def _on_load_session(self, event) -> None:
             import glob
@@ -1571,8 +1571,8 @@ if _WX_AVAILABLE:
             description = ""
             try:
                 description = event.GetString()
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("WebView error description not available: %s", e)
             log.warning("WebView error: %s — reloading shell", description)
             self._page_loading = False
             self._shell_loaded = False

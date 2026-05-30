@@ -138,8 +138,8 @@ class KiCadAIPlugin(_ActionPluginBase):
             if _IN_KICAD:
                 try:
                     parent = _pcbnew.GetCurrentFrame()
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug("Could not get KiCad parent frame: %s", e)
 
             self._panel = AssistantPanel(parent, server_mgr=server_mgr, settings=settings)
             self._panel.Show()

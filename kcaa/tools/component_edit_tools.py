@@ -1748,7 +1748,9 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
                         )
                         raw_tree.insert(uuid_idx, fa_node)
                 except Exception:
-                    log.debug("Failed to insert field_autoplace node, symbol position still applied")
+                    log.debug(
+                        "Failed to insert field_autoplace node, symbol position still applied"
+                    )
 
             try:
                 save_schematic(schematic_path, sch)
