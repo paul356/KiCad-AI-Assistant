@@ -10,9 +10,9 @@ Usage:
     - macOS:   ~/Library/Preferences/kicad/<ver>/scripting/plugins/kicad_ai_plugin/
     - Windows: %APPDATA%\\kicad\\<ver>\\scripting\\plugins\\kicad_ai_plugin\\
 """
-import os
-import sys
+
 import logging
+import os
 
 log = logging.getLogger(__name__)
 
@@ -33,10 +33,12 @@ def _setup_plugin_logging() -> None:
         # Use append mode so logs survive KiCad restarts (the typical
         # debugging workflow is: reproduce freeze → restart → examine logs).
         handler = logging.FileHandler(log_file, mode="a", encoding="utf-8")
-        handler.setFormatter(logging.Formatter(
-            "%(asctime)s %(levelname)-5s [%(name)s] %(message)s",
-            datefmt="%H:%M:%S",
-        ))
+        handler.setFormatter(
+            logging.Formatter(
+                "%(asctime)s %(levelname)-5s [%(name)s] %(message)s",
+                datefmt="%H:%M:%S",
+            )
+        )
 
         # Attach to THIS package's logger (and all child loggers).
         # __name__ resolves to the actual package name (e.g. kicad_ai_assistant
@@ -59,6 +61,7 @@ _setup_plugin_logging()
 # ---------------------------------------------------------------------------
 try:
     import pcbnew as _pcbnew  # noqa: F401
+
     _IN_KICAD = True
     _ActionPluginBase = _pcbnew.ActionPlugin
 except ImportError:
@@ -69,6 +72,7 @@ except ImportError:
 
 try:
     import wx  # noqa: F401  (wxPython, bundled with KiCad)
+
     _WX_AVAILABLE = True
 except ImportError:
     _WX_AVAILABLE = False
@@ -123,9 +127,9 @@ class KiCadAIPlugin(_ActionPluginBase):
                 panel_alive = False
 
         if not panel_alive:
-            from .ui.panel import AssistantPanel
             from .server_manager import ServerManager
             from .settings import PluginSettings
+            from .ui.panel import AssistantPanel
 
             settings = PluginSettings.load()
             server_mgr = ServerManager(settings)

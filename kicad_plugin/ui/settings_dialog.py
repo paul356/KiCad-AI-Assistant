@@ -1,6 +1,7 @@
 """
 Settings dialog: lets the engineer configure the LLM provider and API key.
 """
+
 from __future__ import annotations
 
 import logging
@@ -9,12 +10,14 @@ log = logging.getLogger(__name__)
 
 try:
     import wx
+
     _WX_AVAILABLE = True
 except ImportError:
     _WX_AVAILABLE = False
 
 
 if _WX_AVAILABLE:
+
     class SettingsDialog(wx.Dialog):
         """Simple dialog for editing plugin settings."""
 
@@ -33,13 +36,19 @@ if _WX_AVAILABLE:
             # Provider
             grid.Add(wx.StaticText(self, label="LLM Provider:"), 0, wx.ALIGN_CENTER_VERTICAL)
             self._provider = wx.Choice(self, choices=self._PROVIDERS)
-            idx = self._PROVIDERS.index(self._settings.llm_provider) if self._settings.llm_provider in self._PROVIDERS else 0
+            idx = (
+                self._PROVIDERS.index(self._settings.llm_provider)
+                if self._settings.llm_provider in self._PROVIDERS
+                else 0
+            )
             self._provider.SetSelection(idx)
             grid.Add(self._provider, 1, wx.EXPAND)
 
             # API Key
             grid.Add(wx.StaticText(self, label="API Key:"), 0, wx.ALIGN_CENTER_VERTICAL)
-            self._api_key = wx.TextCtrl(self, value=self._settings.llm_api_key, style=wx.TE_PASSWORD)
+            self._api_key = wx.TextCtrl(
+                self, value=self._settings.llm_api_key, style=wx.TE_PASSWORD
+            )
             grid.Add(self._api_key, 1, wx.EXPAND)
 
             # Model
@@ -59,37 +68,59 @@ if _WX_AVAILABLE:
             grid.Add(self._python, 1, wx.EXPAND)
 
             # Server port
-            grid.Add(wx.StaticText(self, label="Server port (0=auto):"), 0, wx.ALIGN_CENTER_VERTICAL)
+            grid.Add(
+                wx.StaticText(self, label="Server port (0=auto):"), 0, wx.ALIGN_CENTER_VERTICAL
+            )
             self._port = wx.SpinCtrl(self, value=str(self._settings.server_port), min=0, max=65535)
             grid.Add(self._port, 1, wx.EXPAND)
 
             # Show tool log
-            grid.Add(wx.StaticText(self, label="Show tool log by default:"), 0, wx.ALIGN_CENTER_VERTICAL)
+            grid.Add(
+                wx.StaticText(self, label="Show tool log by default:"), 0, wx.ALIGN_CENTER_VERTICAL
+            )
             self._show_tool_log = wx.CheckBox(self)
             self._show_tool_log.SetValue(self._settings.show_tool_log)
             grid.Add(self._show_tool_log, 1)
 
             # Context window management
-            grid.Add(wx.StaticText(self, label="Context window (tokens):"), 0, wx.ALIGN_CENTER_VERTICAL)
-            self._context_tokens = wx.SpinCtrl(self, min=1000, max=2_000_000,
-                                               initial=self._settings.llm_context_tokens)
+            grid.Add(
+                wx.StaticText(self, label="Context window (tokens):"), 0, wx.ALIGN_CENTER_VERTICAL
+            )
+            self._context_tokens = wx.SpinCtrl(
+                self, min=1000, max=2_000_000, initial=self._settings.llm_context_tokens
+            )
             grid.Add(self._context_tokens, 1, wx.EXPAND)
 
-            grid.Add(wx.StaticText(self, label="Compaction threshold (0–1):"), 0, wx.ALIGN_CENTER_VERTICAL)
-            self._compact_threshold = wx.SpinCtrlDouble(self, min=0.1, max=0.95, inc=0.05,
-                                                        initial=self._settings.llm_compact_threshold)
+            grid.Add(
+                wx.StaticText(self, label="Compaction threshold (0–1):"),
+                0,
+                wx.ALIGN_CENTER_VERTICAL,
+            )
+            self._compact_threshold = wx.SpinCtrlDouble(
+                self, min=0.1, max=0.95, inc=0.05, initial=self._settings.llm_compact_threshold
+            )
             self._compact_threshold.SetDigits(2)
             grid.Add(self._compact_threshold, 1, wx.EXPAND)
 
-            grid.Add(wx.StaticText(self, label="Compaction target (0–1):"), 0, wx.ALIGN_CENTER_VERTICAL)
-            self._compact_target = wx.SpinCtrlDouble(self, min=0.05, max=0.90, inc=0.05,
-                                                     initial=self._settings.llm_compact_target_threshold)
+            grid.Add(
+                wx.StaticText(self, label="Compaction target (0–1):"), 0, wx.ALIGN_CENTER_VERTICAL
+            )
+            self._compact_target = wx.SpinCtrlDouble(
+                self,
+                min=0.05,
+                max=0.90,
+                inc=0.05,
+                initial=self._settings.llm_compact_target_threshold,
+            )
             self._compact_target.SetDigits(2)
             grid.Add(self._compact_target, 1, wx.EXPAND)
 
-            grid.Add(wx.StaticText(self, label="Recent turns to keep:"), 0, wx.ALIGN_CENTER_VERTICAL)
-            self._keep_recent_turns = wx.SpinCtrl(self, min=1, max=20,
-                                                  initial=self._settings.llm_keep_recent_turns)
+            grid.Add(
+                wx.StaticText(self, label="Recent turns to keep:"), 0, wx.ALIGN_CENTER_VERTICAL
+            )
+            self._keep_recent_turns = wx.SpinCtrl(
+                self, min=1, max=20, initial=self._settings.llm_keep_recent_turns
+            )
             grid.Add(self._keep_recent_turns, 1, wx.EXPAND)
 
             vbox.Add(grid, 1, wx.ALL | wx.EXPAND, 10)
@@ -131,6 +162,7 @@ if _WX_AVAILABLE:
             return True
 
 else:
+
     class SettingsDialog:  # type: ignore[no-redef]
         def __init__(self, parent, settings) -> None:
             pass

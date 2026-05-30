@@ -1,15 +1,15 @@
 """
 Plugin settings: load/save from KiCad user config directory.
 """
+
 from __future__ import annotations
 
+from dataclasses import asdict, dataclass, field
 import json
 import logging
 import os
 import platform
 import re
-from dataclasses import dataclass, field, asdict
-from typing import Optional
 
 log = logging.getLogger(__name__)
 
@@ -65,12 +65,12 @@ def _get_kcaa_data_dir() -> str:
     if system == "Darwin":
         base = os.path.expanduser(f"~/Library/Preferences/kicad/{kicad_version}")
     elif system == "Windows":
-        base = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "kicad", kicad_version)
+        base = os.path.join(
+            os.environ.get("APPDATA", os.path.expanduser("~")), "kicad", kicad_version
+        )
     else:  # Linux and others
         base = os.path.expanduser(f"~/.config/kicad/{kicad_version}")
     return os.path.join(base, "kcaa")
-
-
 
 
 @dataclass
@@ -78,24 +78,28 @@ class PluginSettings:
     """All user-configurable settings for the KiCad AI Assistant plugin."""
 
     # LLM provider
-    llm_provider: str = "openai"          # "openai" | "anthropic" | "custom"
+    llm_provider: str = "openai"  # "openai" | "anthropic" | "custom"
     llm_api_key: str = field(default="", repr=False)  # never leak key in logs/repr
-    llm_model: str = "gpt-4o"            # model name
-    llm_base_url: str = ""               # custom endpoint URL (if provider == "custom")
+    llm_model: str = "gpt-4o"  # model name
+    llm_base_url: str = ""  # custom endpoint URL (if provider == "custom")
 
     # MCP server
-    server_port: int = 0                  # 0 = auto-select a free port at startup
-    server_log_dir: str = ""              # "" = KiCad user config dir
-    python_executable: str = ""           # "" = auto-detect (shutil.which("python3"))
+    server_port: int = 0  # 0 = auto-select a free port at startup
+    server_log_dir: str = ""  # "" = KiCad user config dir
+    python_executable: str = ""  # "" = auto-detect (shutil.which("python3"))
 
     # UI preferences
-    show_tool_log: bool = True            # show the tool-call log by default
+    show_tool_log: bool = True  # show the tool-call log by default
 
     # Context window management
-    llm_context_tokens: int = 128_000        # total context window size in tokens
-    llm_compact_threshold: float = 0.70      # trigger compaction when estimated usage exceeds this fraction
-    llm_compact_target_threshold: float = 0.49  # post-compaction target fraction (must be < llm_compact_threshold)
-    llm_keep_recent_turns: int = 4           # number of latest complete assistant turns to preserve verbatim
+    llm_context_tokens: int = 128_000  # total context window size in tokens
+    llm_compact_threshold: float = (
+        0.70  # trigger compaction when estimated usage exceeds this fraction
+    )
+    llm_compact_target_threshold: float = (
+        0.49  # post-compaction target fraction (must be < llm_compact_threshold)
+    )
+    llm_keep_recent_turns: int = 4  # number of latest complete assistant turns to preserve verbatim
 
     # Internal — not shown in settings UI
     config_dir: str = field(default_factory=_get_kcaa_data_dir, repr=False)
@@ -124,7 +128,7 @@ class PluginSettings:
             log.error("Failed to save settings: %s", e)
 
     @classmethod
-    def load(cls, config_dir: Optional[str] = None) -> "PluginSettings":
+    def load(cls, config_dir: str | None = None) -> PluginSettings:
         """Load settings from disk, returning defaults if the file doesn't exist."""
         inst = cls()
         if config_dir:
@@ -135,7 +139,7 @@ class PluginSettings:
             return inst
 
         try:
-            with open(inst.settings_path, "r", encoding="utf-8") as f:
+            with open(inst.settings_path, encoding="utf-8") as f:
                 data = json.load(f)
             for key, value in data.items():
                 if hasattr(inst, key) and key != "config_dir":

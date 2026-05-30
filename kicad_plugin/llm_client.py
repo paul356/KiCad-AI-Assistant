@@ -9,12 +9,12 @@ thin — it delegates all KiCad knowledge to the MCP tool surface.
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass, field
 import json
 import logging
 import os
 import platform
 import subprocess
-from dataclasses import dataclass, field
 from typing import Any
 
 from .tool_registry import get_missing_tool_policies, get_tool_policy
@@ -94,13 +94,13 @@ def _https_post_json(
     Raises ``RuntimeError`` with a clear message if both paths fail.
     """
     global _in_process_ssl
-    import urllib.request
     import urllib.error
+    import urllib.request
 
     if _in_process_ssl is not False:
         req = urllib.request.Request(url, data=body, headers=headers, method="POST")
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:  # nosec B310 -- MCP client, localhost only
                 _in_process_ssl = True
                 return resp.status, resp.read().decode("utf-8", "replace")
         except urllib.error.HTTPError as e:
@@ -439,8 +439,8 @@ def call_mcp_tool(base_url: str, tool_name: str, arguments: dict[str, Any]) -> d
     Uses urllib (stdlib only) so there is no extra dependency beyond what
     KiCad's bundled Python provides.
     """
-    import urllib.request
     import urllib.error
+    import urllib.request
 
     payload = json.dumps(
         {
@@ -464,7 +464,7 @@ def call_mcp_tool(base_url: str, tool_name: str, arguments: dict[str, Any]) -> d
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with urllib.request.urlopen(req, timeout=30) as resp:  # nosec B310 -- MCP client, localhost only
             body = _parse_mcp_response_text(resp.read().decode())
     except urllib.error.URLError as e:
         return {"success": False, "error": f"MCP server unreachable: {e}"}
@@ -830,12 +830,8 @@ class LLMClient:
                 # Save the document in KiCad first to sync in-memory changes
                 # (e.g. from IPC operations) to disk before taking a snapshot.
                 save_args = {"file_path": path}
-                save_result = call_mcp_tool(
-                    self._mcp_base_url, "save_document", save_args
-                )
-                self._emit_tool_callback(
-                    on_tool_call, "save_document", save_args, save_result
-                )
+                save_result = call_mcp_tool(self._mcp_base_url, "save_document", save_args)
+                self._emit_tool_callback(on_tool_call, "save_document", save_args, save_result)
                 if not self._tool_result_succeeded(save_result):
                     log.warning(
                         "save_document failed before %s: %s",
@@ -987,7 +983,8 @@ class LLMClient:
 
     def _fetch_tool_definitions(self) -> list[dict[str, Any]]:
         """Fetch available tools from the MCP server and convert to LLM format."""
-        import urllib.request, urllib.error
+        import urllib.error
+        import urllib.request
 
         url = f"{self._mcp_base_url}/mcp"
         payload = json.dumps(
@@ -1003,7 +1000,7 @@ class LLMClient:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
+            with urllib.request.urlopen(req, timeout=10) as resp:  # nosec B310 -- MCP client, localhost only
                 body = _parse_mcp_response_text(resp.read().decode())
         except Exception as e:
             log.warning(f"Could not fetch tool list: {e}")
@@ -1092,8 +1089,8 @@ class LLMClient:
         global _current_reasoning
         _current_reasoning = []
         global _in_process_ssl
-        import urllib.request
         import urllib.error
+        import urllib.request
 
         base = (self._settings.llm_base_url or "https://api.openai.com").rstrip("/")
         if "/chat/completions" in base:
@@ -1120,7 +1117,7 @@ class LLMClient:
         if _in_process_ssl is not False:
             req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
             try:
-                with urllib.request.urlopen(req, timeout=300) as resp:
+                with urllib.request.urlopen(req, timeout=300) as resp:  # nosec B310 -- MCP client, localhost only
                     _in_process_ssl = True
                     text_parts = []
                     tool_calls_by_index: dict[int, dict] = {}
@@ -1209,8 +1206,8 @@ class LLMClient:
         Falls back to non-streaming via _call_anthropic (subprocess) otherwise.
         """
         global _in_process_ssl
-        import urllib.request
         import urllib.error
+        import urllib.request
 
         url = "https://api.anthropic.com/v1/messages"
         anthropic_tools = [
@@ -1241,7 +1238,7 @@ class LLMClient:
         if _in_process_ssl is not False:
             req = urllib.request.Request(url, data=encoded, headers=headers, method="POST")
             try:
-                with urllib.request.urlopen(req, timeout=300) as resp:
+                with urllib.request.urlopen(req, timeout=300) as resp:  # nosec B310 -- MCP client, localhost only
                     _in_process_ssl = True
                     text_blocks: dict[int, str] = {}
                     tool_blocks: dict[int, dict] = {}
@@ -1438,7 +1435,6 @@ class LLMClient:
         if not isinstance(body, dict):
             return {"error": f"Unexpected response from Anthropic: {text[:200]}"}
 
-        stop_reason = body.get("stop_reason", "end_turn")
         content_blocks_resp = body.get("content", [])
         text_blocks = [b["text"] for b in content_blocks_resp if b.get("type") == "text"]
         tool_use_blocks = [b for b in content_blocks_resp if b.get("type") == "tool_use"]

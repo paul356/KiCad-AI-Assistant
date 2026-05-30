@@ -28,10 +28,10 @@ jobs:
       run: uv sync --group dev
 
     - name: Lint with ruff
-      run: uv run ruff check kcaa/ tests/
+      run: uv run ruff check kcaa/ tests/ kicad_plugin/
 
     - name: Check formatting with ruff
-      run: uv run ruff format --check kcaa/ tests/
+      run: uv run ruff format --check kcaa/ tests/ kicad_plugin/
 
   test:
     runs-on: ubuntu-latest
@@ -85,7 +85,7 @@ jobs:
       run: uv sync --group dev
 
     - name: Run security scan
-      run: uv run bandit -r kcaa/
+      run: uv run bandit -r kcaa/ kicad_plugin/
 
   build:
     runs-on: ubuntu-latest

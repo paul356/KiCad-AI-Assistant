@@ -2,11 +2,12 @@
 Context bridge: collect the active KiCad editor context and return it
 as a structured dict that the plugin injects into every LLM request.
 """
+
 from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Optional
+from typing import Any
 
 log = logging.getLogger(__name__)
 
@@ -14,6 +15,7 @@ log = logging.getLogger(__name__)
 def _try_import_pcbnew():
     try:
         import pcbnew  # noqa: F401
+
         return pcbnew
     except ImportError:
         return None

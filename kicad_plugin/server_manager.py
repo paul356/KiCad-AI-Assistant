@@ -4,6 +4,7 @@ ServerManager: starts, monitors, and stops the kcaa MCP server subprocess.
 The server is launched in the 'plugin' profile via streamable-http transport
 on a dynamically chosen localhost port.
 """
+
 from __future__ import annotations
 
 import logging
@@ -14,7 +15,6 @@ import socket
 import subprocess
 import threading
 import time
-from typing import Optional
 
 log = logging.getLogger(__name__)
 
@@ -44,8 +44,8 @@ class ServerManager:
 
     def __init__(self, settings) -> None:
         self._settings = settings
-        self._process: Optional[subprocess.Popen] = None
-        self._port: Optional[int] = None
+        self._process: subprocess.Popen | None = None
+        self._port: int | None = None
         self._lock = threading.Lock()
 
     # ------------------------------------------------------------------ #
@@ -53,12 +53,12 @@ class ServerManager:
     # ------------------------------------------------------------------ #
 
     @property
-    def port(self) -> Optional[int]:
+    def port(self) -> int | None:
         """The port the server is listening on, or None if not started."""
         return self._port
 
     @property
-    def base_url(self) -> Optional[str]:
+    def base_url(self) -> str | None:
         """HTTP base URL for the running server, or None."""
         if self._port is None:
             return None
@@ -203,17 +203,34 @@ class ServerManager:
     # inheriting AppImage/KiCad-specific overrides (PYTHONHOME, PYTHONPATH,
     # LD_LIBRARY_PATH, LD_PRELOAD, …) that would break the standalone venv.
     _ENV_PASSTHROUGH = (
-        "PATH", "HOME", "USER", "LOGNAME",
-        "LANG", "LC_ALL", "LC_CTYPE",
-        "TMPDIR", "TEMP", "TMP",
-        "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME",
+        "PATH",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "TMPDIR",
+        "TEMP",
+        "TMP",
+        "XDG_RUNTIME_DIR",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_CACHE_HOME",
         "DBUS_SESSION_BUS_ADDRESS",
         # Windows: required for Winsock service-provider DLL resolution.
         # Without SystemRoot the subprocess cannot find ws2_32.dll / wship6.dll
         # and asyncio._overlapped raises OSError [WinError 10106].
-        "SystemRoot", "SystemDrive", "USERPROFILE", "APPDATA", "LOCALAPPDATA",
-        "COMPUTERNAME", "USERNAME", "USERDOMAIN",
-        "COMSPEC", "windir",
+        "SystemRoot",
+        "SystemDrive",
+        "USERPROFILE",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "COMPUTERNAME",
+        "USERNAME",
+        "USERDOMAIN",
+        "COMSPEC",
+        "windir",
     )
 
     def _build_env(self, port: int) -> dict[str, str]:
