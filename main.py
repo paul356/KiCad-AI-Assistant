@@ -7,7 +7,7 @@ import os
 import sys
 import logging
 
-# Import the config singleton - .env is loaded at import time
+# Import the config singleton — loads .env at import time if present
 from kcaa.utils.config import config
 from kcaa.server import main as server_main
 

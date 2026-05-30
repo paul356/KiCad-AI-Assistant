@@ -225,33 +225,11 @@ class ServerManager:
         passed through so footprint library resolution works correctly.
         """
         env = {k: os.environ[k] for k in self._ENV_PASSTHROUGH if k in os.environ}
-        # Pass KICAD* path variables (e.g. KICAD10_FOOTPRINT_DIR set by the
-        # AppImage) so library URI resolution works in the subprocess.
+        # Pass KICAD* path variables (e.g. KICAD10_FOOTPRINT_DIR set by KiCad)
+        # so library URI resolution works in the subprocess.
         for k, v in os.environ.items():
             if k.startswith("KICAD"):
                 env[k] = v
-
-        # Read .env configuration file if present
-        plugin_dir = os.path.dirname(os.path.abspath(__file__))
-        env_file = os.path.join(plugin_dir, ".env")
-        if os.path.isfile(env_file):
-            try:
-                with open(env_file, "r", encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line or line.startswith("#"):
-                            continue
-                        if "=" in line:
-                            key, value = line.split("=", 1)
-                            key = key.strip()
-                            value = value.strip()
-                            # Expand ~ and environment variables
-                            value = os.path.expanduser(value)
-                            value = os.path.expandvars(value)
-                            env[key] = value
-                            log.debug("Loaded from .env: %s=%s", key, value)
-            except Exception as e:
-                log.warning("Failed to read .env file: %s", e)
 
         env["MCP_TRANSPORT"] = "streamable-http"
         env["MCP_PORT"] = str(port)

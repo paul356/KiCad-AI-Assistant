@@ -77,14 +77,14 @@ unzip dist/kicad_ai_assistant.zip -d "$KICAD_PLUGIN_DIR"
 
 ### 3. 创建插件虚拟环境
 
-在已安装的插件目录中运行 `setup_plugin.sh`，创建 `.venv`、从 PyPI 安装 `kcaa`，并自动生成 `.env` 配置文件。`uv` 会自动安装所需的 Python 版本。
+在已安装的插件目录中运行 `setup_plugin.sh`，创建 `.venv`、从 PyPI 安装 `kcaa`，并下载 freerouting JAR。`uv` 会自动安装所需的 Python 版本。
 
 ```bash
 cd ~/.local/share/kicad/10.0/scripting/plugins/kicad_ai_assistant
 ./setup_plugin.sh
 ```
 
-脚本会从插件目录路径自动检测 KiCad 版本，并生成包含平台特定路径的 `.env` 配置文件。
+脚本会从插件目录路径自动检测 KiCad 版本。KiCad 已提供所有必要的环境变量（`KICAD_VERSION`、`KICAD*_DIR` 等），无需 `.env` 文件。
 
 ### 4. 在 KiCad 中加载插件
 
@@ -332,7 +332,6 @@ kcaa/
 - 检查 `setup_plugin.sh` 是否成功完成，并确认插件目录下存在 `.venv/bin/python`。
 
 **MCP 服务器启动失败：**
-- 检查插件目录下的 `.env` 文件是否包含正确的 `KICAD_VERSION` 和平台特定路径。
 - 查看 `~/.config/kicad/` 目录下的插件日志，排查 Python 报错信息。
 
 **原理图编辑器编辑后未刷新：**

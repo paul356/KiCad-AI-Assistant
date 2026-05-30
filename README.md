@@ -77,14 +77,14 @@ unzip dist/kicad_ai_assistant.zip -d "$KICAD_PLUGIN_DIR"
 
 ### 3. Create the plugin virtual environment
 
-Run `setup_plugin.sh` from inside the installed plugin directory to create a `.venv`, install `kcaa` from PyPI, and auto-generate the `.env` configuration file. `uv` will automatically install the required Python version.
+Run `setup_plugin.sh` from inside the installed plugin directory to create a `.venv`, install `kcaa` from PyPI, and download the freerouting JAR. `uv` will automatically install the required Python version.
 
 ```bash
 cd ~/.local/share/kicad/10.0/scripting/plugins/kicad_ai_assistant
 ./setup_plugin.sh
 ```
 
-The script will detect your KiCad version from the plugin directory path and generate a `.env` file with platform-specific configuration paths.
+The script will detect your KiCad version from the plugin directory path. KiCad already provides all necessary environment variables (`KICAD_VERSION`, `KICAD*_DIR`, etc.), so no `.env` file is needed.
 
 ### 4. Load the plugin in KiCad
 
@@ -334,7 +334,6 @@ kcaa/
 - Check that `setup_plugin.sh` completed without errors and that `.venv/bin/python` exists inside the plugin directory.
 
 **MCP server fails to start:**
-- Verify the `.env` file in the plugin directory contains correct `KICAD_VERSION` and platform-specific paths.
 - Check the plugin log in `~/.config/kicad/` (Linux) for Python tracebacks.
 
 **Schematic editor does not refresh after edits:**
