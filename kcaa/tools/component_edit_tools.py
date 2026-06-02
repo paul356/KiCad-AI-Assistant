@@ -32,6 +32,9 @@ from kcaa.utils.symbol_index_reader import SymbolIndexReader
 
 log = logging.getLogger(__name__)
 
+VALID_LABEL_TYPES = ("local", "global", "hierarchical")
+VALID_SHAPES = ("input", "output", "bidirectional", "tri_state", "passive")
+
 
 def _angle_to_direction(angle_deg: int | float) -> str:
     """Convert a screen-space label/pin angle to a human-readable direction string.
@@ -44,6 +47,20 @@ def _angle_to_direction(angle_deg: int | float) -> str:
     """
     a = int(round(float(angle_deg))) % 360
     return {0: "right", 90: "down", 180: "left", 270: "up"}.get(a, f"{a}deg")
+
+
+def _iter_schematic_labels(sch: Any, attr_name: str) -> list[Any]:
+    """Safely iterate label-like elements from a schematic attribute."""
+    try:
+        coll = getattr(sch, attr_name)
+    except AttributeError:
+        return []
+
+    elements = getattr(coll, "_elements", None)
+    if elements is not None:
+        return list(elements)
+
+    return [coll]
 
 
 # ---------------------------------------------------------------------------
@@ -1811,18 +1828,18 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
         x: float,
         y: float,
         angle: int = 0,
+        label_type: str = "local",
+        shape: str = "input",
         ctx: Context | None = None,
     ) -> dict[str, Any]:
-        """Add a local net label to a KiCad schematic.
+        """Add a local, global, or hierarchical net label to a KiCad schematic.
 
-        A local label creates a named net connection at the given coordinate.
-        Two wires or pins with the same label text on the same sheet are
-        electrically connected. The label must sit **exactly on a wire or
-        pin endpoint** to actually attach — coordinates are mm in screen
-        convention (**+Y is down**) and **must be aligned to the 1.27 mm
-        (50-mil) grid**. This tool does NOT auto-snap; pass coordinates
-        from ``extract_schematic_netlist`` (pin x/y) or wire endpoints
-        (wires returned by ``include_wire_topology=True``).
+        Labels create named net connections at the given coordinate. The label
+        must sit **exactly on a wire or pin endpoint** to actually attach —
+        coordinates are mm in screen convention (**+Y is down**) and **must be
+        aligned to the 1.27 mm (50-mil) grid**. This tool does NOT auto-snap;
+        pass coordinates from ``extract_schematic_netlist`` (pin x/y) or wire
+        endpoints (wires returned by ``include_wire_topology=True``).
 
         A backup (.kicad_sch.bak) is written before saving.
 
@@ -1833,10 +1850,13 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
             y: Y coordinate of the label connection point in mm.
             angle: Label text rotation in degrees; must be 0, 90, 180, or
                 270. 0 = text reads left-to-right; 90 = bottom-to-top.
+            label_type: Label kind: "local", "global", or "hierarchical".
+            shape: Shape for global or hierarchical labels.
 
         Returns:
-            dict with keys: success (bool), label (text, x, y, direction).
-            direction is one of "right", "down", "left", "up".
+            dict with keys: success (bool), label (text, x, y, direction,
+            label_type, shape). direction is one of "right", "down", "left",
+            "up".
         """
         if not schematic_path.endswith(".kicad_sch"):
             return {"error": f"Not a .kicad_sch file: {schematic_path!r}"}
@@ -1848,16 +1868,48 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
             return {"error": f"Coordinates must be finite numbers (got x={x}, y={y})"}
         if angle not in (0, 90, 180, 270):
             return {"error": f"angle must be 0, 90, 180, or 270 (got {angle})"}
+        if label_type not in VALID_LABEL_TYPES:
+            return {"error": f"label_type must be one of {VALID_LABEL_TYPES}"}
+        if label_type in ("global", "hierarchical") and shape not in VALID_SHAPES:
+            return {"error": f"shape must be one of {VALID_SHAPES}"}
 
         try:
             sch = safe_schematic(schematic_path)
         except Exception as exc:
             return {"error": f"Failed to open schematic: {exc}"}
 
+        shape_value: str | None = None
         try:
-            lbl = sch.label.new()
-            lbl.value = text
-            lbl.at.value = [x, y, angle]
+            if label_type == "local":
+                lbl = sch.label.new()
+                lbl.value = text
+                lbl.at.value = [x, y, angle]
+            elif label_type == "global":
+                try:
+                    lbl = sch.global_label.new()
+                except AttributeError:
+                    from skip.element_template import ElementTemplate
+
+                    lbl = sch.new_from_list(list(ElementTemplate["global_label"]))
+                lbl.value = text
+                lbl.at.value = [x, y, angle]
+                lbl.shape.value = shape
+                shape_value = shape
+            else:
+                hier_tmpl = [
+                    sexpdata.Symbol("hierarchical_label"),
+                    text,
+                    [sexpdata.Symbol("shape"), sexpdata.Symbol(shape)],
+                    [sexpdata.Symbol("at"), x, y, angle],
+                    [
+                        sexpdata.Symbol("effects"),
+                        [sexpdata.Symbol("font"), [sexpdata.Symbol("size"), 1.27, 1.27]],
+                        [sexpdata.Symbol("justify"), sexpdata.Symbol("left")],
+                    ],
+                    [sexpdata.Symbol("uuid"), sexpdata.Symbol(str(uuid.uuid4()))],
+                ]
+                lbl = sch.new_from_list(hier_tmpl)
+                shape_value = shape
 
             save_schematic(schematic_path, sch)
         except Exception as exc:
@@ -1865,7 +1917,14 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
 
         return {
             "success": True,
-            "label": {"text": text, "x": x, "y": y, "direction": _angle_to_direction(angle)},
+            "label": {
+                "text": text,
+                "x": x,
+                "y": y,
+                "direction": _angle_to_direction(angle),
+                "label_type": label_type,
+                "shape": shape_value,
+            },
             "file_modified": schematic_path,
             "backup_path": schematic_path + ".bak",
         }
@@ -1873,24 +1932,30 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
     @mcp.tool()
     async def list_labels_in_schematic(
         schematic_path: str,
+        label_type: str | None = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
-        """List all local net labels in a KiCad schematic.
+        """List local, global, and hierarchical labels in a KiCad schematic.
 
-        Returns every local label's text and position. Use the returned
-        coordinates with delete_label_from_schematic to remove a specific label.
+        Returns every matching label's text, position, type, and shape. Use the
+        returned coordinates with delete_label_from_schematic to remove a
+        specific label.
 
         Args:
             schematic_path: Absolute path to the target .kicad_sch file.
+            label_type: Optional filter: "local", "global", or "hierarchical".
 
         Returns:
-            dict with keys: success (bool), labels (list of {text, x, y, direction}),
-            count (int). direction is one of "right", "down", "left", "up".
+            dict with keys: success (bool), labels (list of {text, x, y,
+            direction, label_type, shape}), count (int). direction is one of
+            "right", "down", "left", "up".
         """
         if not schematic_path.endswith(".kicad_sch"):
             return {"error": f"Not a .kicad_sch file: {schematic_path!r}"}
         if not os.path.isfile(schematic_path):
             return {"error": f"Schematic file not found: {schematic_path!r}"}
+        if label_type is not None and label_type not in VALID_LABEL_TYPES:
+            return {"error": f"label_type must be one of {VALID_LABEL_TYPES}"}
 
         try:
             sch = safe_schematic(schematic_path)
@@ -1898,8 +1963,14 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
             return {"error": f"Failed to open schematic: {exc}"}
 
         labels = []
-        try:
-            for lbl in sch.label:
+        for current_type, attr_name in (
+            ("local", "label"),
+            ("global", "global_label"),
+            ("hierarchical", "hierarchical_label"),
+        ):
+            if label_type is not None and current_type != label_type:
+                continue
+            for lbl in _iter_schematic_labels(sch, attr_name):
                 try:
                     at_val = lbl.at.value
                     labels.append(
@@ -1908,12 +1979,16 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
                             "x": float(at_val[0]),
                             "y": float(at_val[1]),
                             "direction": _angle_to_direction(at_val[2] if len(at_val) > 2 else 0),
+                            "label_type": current_type,
+                            "shape": (
+                                str(lbl.shape.value)
+                                if current_type in ("global", "hierarchical")
+                                else None
+                            ),
                         }
                     )
-                except (AttributeError, IndexError, ValueError):
+                except (AttributeError, IndexError, TypeError, ValueError):
                     continue
-        except AttributeError:
-            pass  # no labels in schematic
 
         return {"success": True, "labels": labels, "count": len(labels)}
 
@@ -1925,18 +2000,20 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
         text: str | None = None,
         tolerance: float = 0.01,
         positions: list[dict] | None = None,
+        label_type: str | None = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
-        """Delete one or more local net labels from a KiCad schematic.
+        """Delete one or more local, global, or hierarchical labels.
 
-        **Single mode** (default): removes all local labels whose position
-        matches (x, y) within *tolerance*.  When *text* is provided, only
-        labels with that exact text are removed.
+        **Single mode** (default): removes all matching labels whose position
+        matches (x, y) within *tolerance*. When *text* is provided, only labels
+        with that exact text are removed. When *label_type* is provided, only
+        that label type is considered.
 
         **Batch mode**: when *positions* is provided, the *x*/*y*/*text*
         parameters are ignored and each entry in *positions* is processed
-        independently.  Each entry is a dict with keys ``x`` (float),
-        ``y`` (float), and optionally ``text`` (str).
+        independently. Each entry is a dict with keys ``x`` (float), ``y``
+        (float), and optionally ``text`` (str). *label_type* still applies.
 
         Use list_labels_in_schematic first to obtain exact coordinates.
         A backup (.kicad_sch.bak) is written before saving.
@@ -1947,9 +2024,10 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
             y: Y coordinate of the label in mm (single mode).
             text: Optional label text to match (single mode).
             tolerance: Maximum coordinate difference considered a match
-                (default 0.01 mm).  Applied in both modes.
+                (default 0.01 mm). Applied in both modes.
             positions: Batch mode — list of dicts, each with ``x``, ``y``,
                 and optional ``text`` keys.
+            label_type: Optional filter: "local", "global", or "hierarchical".
 
         Returns:
             Single mode: dict with keys success (bool), deleted_count (int).
@@ -1960,6 +2038,14 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
             return {"error": f"Not a .kicad_sch file: {schematic_path!r}"}
         if not os.path.isfile(schematic_path):
             return {"error": f"Schematic file not found: {schematic_path!r}"}
+        if label_type is not None and label_type not in VALID_LABEL_TYPES:
+            return {"error": f"label_type must be one of {VALID_LABEL_TYPES}"}
+
+        label_sources = (
+            ("local", "label"),
+            ("global", "global_label"),
+            ("hierarchical", "hierarchical_label"),
+        )
 
         # ---- batch mode ------------------------------------------------
         if positions is not None:
@@ -1972,40 +2058,43 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
                 return {"error": f"Failed to open schematic: {exc}"}
 
             try:
-                # Build a flat list of all labels once for efficiency.
-                all_labels = []
-                try:
-                    all_labels = list(sch.label)
-                except AttributeError:
-                    pass  # schematic has no labels
+                all_labels: list[tuple[str, Any]] = []
+                for current_type, attr_name in label_sources:
+                    if label_type is not None and current_type != label_type:
+                        continue
+                    all_labels.extend(
+                        (current_type, lbl) for lbl in _iter_schematic_labels(sch, attr_name)
+                    )
 
                 results = []
                 total_deleted = 0
-                global_to_delete: list = []
+                global_to_delete: list[Any] = []
+                queued_ids: set[int] = set()
 
                 for entry in positions:
                     ex = float(entry.get("x", 0.0))
                     ey = float(entry.get("y", 0.0))
-                    etxt = entry.get("text")  # may be None
+                    etxt = entry.get("text")
                     if not math.isfinite(ex) or not math.isfinite(ey):
                         results.append({"x": ex, "y": ey, "error": "Non-finite coordinates"})
                         continue
 
                     matched = []
-                    for lbl in all_labels:
-                        if lbl in global_to_delete:
-                            continue  # already queued for deletion
+                    for _current_type, lbl in all_labels:
+                        if id(lbl) in queued_ids:
+                            continue
                         try:
                             at_val = lbl.at.value
                             lx, ly = float(at_val[0]), float(at_val[1])
                             if abs(lx - ex) <= tolerance and abs(ly - ey) <= tolerance:
                                 if etxt is None or str(lbl.value) == etxt:
                                     matched.append(lbl)
-                        except (AttributeError, IndexError, ValueError):
+                        except (AttributeError, IndexError, TypeError, ValueError):
                             continue
 
                     if not matched:
-                        msg = f"No label found at ({ex}, {ey}) within tolerance {tolerance}"
+                        kind = f" {label_type}" if label_type is not None else ""
+                        msg = f"No{kind} label found at ({ex}, {ey}) within tolerance {tolerance}"
                         if etxt is not None:
                             msg += f" with text {etxt!r}"
                         entry_result: dict[str, Any] = {"x": ex, "y": ey, "error": msg}
@@ -2013,6 +2102,8 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
                             entry_result["text"] = etxt
                         results.append(entry_result)
                     else:
+                        for lbl in matched:
+                            queued_ids.add(id(lbl))
                         global_to_delete.extend(matched)
                         total_deleted += len(matched)
                         entry_result = {"x": ex, "y": ey, "deleted_count": len(matched)}
@@ -2054,21 +2145,22 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
 
         try:
             to_delete = []
-            try:
-                for lbl in sch.label:
+            for current_type, attr_name in label_sources:
+                if label_type is not None and current_type != label_type:
+                    continue
+                for lbl in _iter_schematic_labels(sch, attr_name):
                     try:
                         at_val = lbl.at.value
                         lx, ly = float(at_val[0]), float(at_val[1])
                         if abs(lx - x) <= tolerance and abs(ly - y) <= tolerance:
                             if text is None or str(lbl.value) == text:
                                 to_delete.append(lbl)
-                    except (AttributeError, IndexError, ValueError):
+                    except (AttributeError, IndexError, TypeError, ValueError):
                         continue
-            except AttributeError:
-                pass  # no labels
 
             if not to_delete:
-                msg = f"No label found at ({x}, {y}) within tolerance {tolerance}"
+                kind = f" {label_type}" if label_type is not None else ""
+                msg = f"No{kind} label found at ({x}, {y}) within tolerance {tolerance}"
                 if text is not None:
                     msg += f" with text {text!r}"
                 return {"error": msg}
