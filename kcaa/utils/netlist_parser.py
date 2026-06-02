@@ -99,6 +99,7 @@ class SchematicParser:
             "component_count": len(self.component_info),
             "net_count": len(self.nets),
             "point_to_net": self.point_to_net,
+            "dangling_points": list(self._compute_dangling_points()),
         }
 
         print(
@@ -484,25 +485,64 @@ class SchematicParser:
             net_counter[0] += 1
             return name
 
+        # Build root → net name for all groups (named and auto-generated).
+        root_to_name: dict[tuple, str] = {}
         for root, pins in group_pins.items():
-            self.nets[auto_net_name(root, pins)].extend(pins)
+            name = auto_net_name(root, pins)
+            root_to_name[root] = name
+            self.nets[name].extend(pins)
 
         # Register named nets that carry no component pins
         for root, net_name in point_net.items():
             if net_name not in self.nets:
                 self.nets[net_name] = []
+            if root not in root_to_name:
+                root_to_name[root] = net_name
 
-        # Expose a flat point → net-name mapping so callers can look up a wire
-        # endpoint's net directly without re-running union-find.
+        # Expose a flat point → net-name mapping for ALL connected points,
+        # including auto-named nets (previously only named/labeled nets were covered).
         for p in list(uf.keys()):
             root = find(p)
-            if root in point_net:
-                self.point_to_net[p] = point_net[root]
+            if root in root_to_name:
+                self.point_to_net[p] = root_to_name[root]
 
         print(
             f"Built netlist: {len(self.nets)} nets, "
             f"{sum(len(v) for v in self.nets.values())} pin connections"
         )
+
+    def _compute_dangling_points(self) -> set[tuple[float, float]]:
+        """Return wire endpoints that have no other connections.
+
+        A point is dangling when exactly one wire touches it AND no component
+        pin, net label, or junction sits at that coordinate.  A no-connect
+        marker at a wire endpoint is intentionally omitted from the anchored
+        set: a wire landing on a no-connect is a schematic contradiction and
+        should still be flagged.
+        """
+        ROUND = 4
+
+        def rpt(x: float, y: float) -> tuple[float, float]:
+            return (round(float(x), ROUND), round(float(y), ROUND))
+
+        endpoint_count: dict[tuple, int] = {}
+        for wire in self.wires:
+            sp = rpt(wire["start"]["x"], wire["start"]["y"])
+            ep = rpt(wire["end"]["x"], wire["end"]["y"])
+            endpoint_count[sp] = endpoint_count.get(sp, 0) + 1
+            endpoint_count[ep] = endpoint_count.get(ep, 0) + 1
+
+        anchored: set[tuple] = set()
+        for cdata in self.component_info.values():
+            for pin in cdata.get("pins", []):
+                anchored.add(rpt(pin["x"], pin["y"]))
+        for label in self.labels + self.global_labels + self.hierarchical_labels:
+            pos = label["position"]
+            anchored.add(rpt(pos["x"], pos["y"]))
+        for junc in self.junctions:
+            anchored.add(rpt(junc["x"], junc["y"]))
+
+        return {pt for pt, count in endpoint_count.items() if count == 1 and pt not in anchored}
 
 
 def extract_netlist(schematic_path: str) -> dict[str, Any]:

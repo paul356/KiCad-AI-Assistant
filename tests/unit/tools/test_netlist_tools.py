@@ -112,6 +112,32 @@ SAMPLE_NETLIST = {
         (105.0, 50.0): "Net-(R1-Pad1)",
         (145.0, 50.0): "Net-(R1-Pad1)",
     },
+    "dangling_points": [],
+}
+
+# Variant with one dangling wire stub (start at 95,50 is a pin, end at 75,50 is free)
+NETLIST_WITH_DANGLING = {
+    **SAMPLE_NETLIST,
+    "wires": [
+        *SAMPLE_NETLIST["wires"],
+        {"start": {"x": 95, "y": 50}, "end": {"x": 75, "y": 50}},
+    ],
+    "point_to_net": {
+        **SAMPLE_NETLIST["point_to_net"],
+        (95.0, 50.0): "Net-(R1-Pad1)",
+    },
+    # (75,50) has only 1 wire touching it and no pin/label → dangling
+    "dangling_points": [(75.0, 50.0)],
+}
+
+# Variant where both ends of a wire are free (completely floating wire)
+NETLIST_WITH_FLOATING_WIRE = {
+    **SAMPLE_NETLIST,
+    "wires": [
+        *SAMPLE_NETLIST["wires"],
+        {"start": {"x": 10, "y": 10}, "end": {"x": 20, "y": 10}},
+    ],
+    "dangling_points": [(10.0, 10.0), (20.0, 10.0)],
 }
 
 
@@ -256,8 +282,40 @@ class TestExtractSchematicNetlist:
         assert "net" in wire
         assert "start" in wire
         assert "end" in wire
-        assert "pins" in wire["start"]
-        assert "pins" in wire["end"]
+        # pins only present when non-empty
+        # dangling_start/end/endpoints_share_net only present when True
+        # is_dangling removed
+
+    @patch("kcaa.tools.netlist_tools.os.path.exists", return_value=True)
+    @patch("kcaa.tools.netlist_tools.extract_netlist", return_value=SAMPLE_NETLIST)
+    def test_wire_endpoints_share_net(self, mock_extract, mock_exists):
+        result = _run(self.fn("/some/design.kicad_sch", include_wire_topology=True, ctx=None))
+        wire = result["analysis"]["wires"]["0"]
+        # Both endpoints are on "Net-(R1-Pad1)" per SAMPLE_NETLIST point_to_net
+        assert wire["endpoints_share_net"] is True
+        assert "dangling_start" not in wire
+        assert "dangling_end" not in wire
+
+    @patch("kcaa.tools.netlist_tools.os.path.exists", return_value=True)
+    @patch("kcaa.tools.netlist_tools.extract_netlist", return_value=NETLIST_WITH_DANGLING)
+    def test_wire_dangling_one_end(self, mock_extract, mock_exists):
+        result = _run(self.fn("/some/design.kicad_sch", include_wire_topology=True, ctx=None))
+        wires = result["analysis"]["wires"]
+        # Wire "1" is the dangling stub: start=(95,50) has net, end=(75,50) is dangling
+        stub = wires["1"]
+        assert stub["dangling_end"] is True
+        assert "dangling_start" not in stub
+
+    @patch("kcaa.tools.netlist_tools.os.path.exists", return_value=True)
+    @patch("kcaa.tools.netlist_tools.extract_netlist", return_value=NETLIST_WITH_FLOATING_WIRE)
+    def test_wire_both_ends_dangling(self, mock_extract, mock_exists):
+        result = _run(self.fn("/some/design.kicad_sch", include_wire_topology=True, ctx=None))
+        wires = result["analysis"]["wires"]
+        # Wire "1" is the completely floating wire
+        floating = wires["1"]
+        assert floating["dangling_start"] is True
+        assert floating["dangling_end"] is True
+        assert "endpoints_share_net" not in floating
 
     @patch("kcaa.tools.netlist_tools.os.path.exists", return_value=True)
     @patch("kcaa.tools.netlist_tools.extract_netlist", return_value=SAMPLE_NETLIST)
