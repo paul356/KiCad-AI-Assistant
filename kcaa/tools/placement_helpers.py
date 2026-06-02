@@ -29,6 +29,30 @@ from kcaa.utils.symbol_geometry import (
 log = logging.getLogger(__name__)
 
 
+def _sheet_symbol_bbox(sheet_info: dict[str, Any]) -> BBox | None:
+    """Compute world-space bbox of a sheet symbol from its position and size.
+
+    Pin coordinates are intentionally excluded because different code paths
+    store pin ``at`` in local vs world space (inconsistent convention).
+    The ``margin`` applied by the caller provides sufficient clearance for
+    pin labels/stubs that extend beyond the sheet rectangle.
+    """
+    pos = sheet_info.get("position")
+    size = sheet_info.get("size")
+    if not pos or not size:
+        return None
+    try:
+        x = float(pos["x"])
+        y = float(pos["y"])
+        w = float(size["width"])
+        h = float(size["height"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if w <= 0 or h <= 0:
+        return None
+    return BBox(x, y, x + w, y + h)
+
+
 # Standard KiCad paper sizes, width x height in mm, landscape orientation.
 _PAPER_SIZES_MM: dict[str, tuple[float, float]] = {
     "A0": (1189.0, 841.0),
@@ -302,6 +326,18 @@ def register_placement_helpers(mcp: FastMCP) -> None:
                 continue
             ref_bboxes[ref] = bb
             occupied.append(inflate_bbox(bb, margin))
+
+        # Collect sheet symbol bboxes.
+        try:
+            from kcaa.tools.sheet_tools import _list_sheet_symbols_impl
+
+            sheet_result = _list_sheet_symbols_impl(schematic_path)
+            for sheet in sheet_result.get("sheets", []):
+                bb = _sheet_symbol_bbox(sheet)
+                if bb is not None:
+                    occupied.append(inflate_bbox(bb, margin))
+        except Exception as exc:
+            log.warning("Failed to collect sheet symbol bboxes for overlap detection: %s", exc)
 
         # Sheet bounds and exclusions.
         _, sheet_w, sheet_h, _ = _parse_paper_size(schematic_path)

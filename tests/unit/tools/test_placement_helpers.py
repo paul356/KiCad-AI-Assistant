@@ -161,6 +161,46 @@ class TestFindFreeArea:
             )
             assert sep, f"candidate {cb} overlaps placed bbox {bb}"
 
+    def test_avoids_sheet_symbols(self, tmp_sch):
+        """find_free_area must not return candidates overlapping a sheet symbol."""
+        sheet_x, sheet_y, sheet_w, sheet_h = 50.0, 50.0, 60.0, 40.0
+        mock_sheets = {
+            "sheets": [
+                {
+                    "uuid": "test-uuid",
+                    "sheet_name": "TestSheet",
+                    "sheet_file": "child.kicad_sch",
+                    "position": {"x": sheet_x, "y": sheet_y},
+                    "size": {"width": sheet_w, "height": sheet_h},
+                    "pins": [],
+                }
+            ]
+        }
+        tools = _placement_tools()
+        with patch(
+            "kcaa.tools.sheet_tools._list_sheet_symbols_impl",
+            return_value=mock_sheets,
+        ):
+            out = tools["find_free_area"](
+                tmp_sch, width=5.0, height=5.0, max_candidates=20, margin=2.54
+            )
+        assert "candidates" in out
+        sheet_bb = {
+            "min_x": sheet_x,
+            "min_y": sheet_y,
+            "max_x": sheet_x + sheet_w,
+            "max_y": sheet_y + sheet_h,
+        }
+        for cand in out["candidates"]:
+            cb = cand["bbox"]
+            sep = (
+                cb["max_x"] <= sheet_bb["min_x"]
+                or cb["min_x"] >= sheet_bb["max_x"]
+                or cb["max_y"] <= sheet_bb["min_y"]
+                or cb["min_y"] >= sheet_bb["max_y"]
+            )
+            assert sep, f"candidate {cb} overlaps sheet bbox {sheet_bb}"
+
     def test_invalid_dimensions_error(self, tmp_sch):
         tools = _placement_tools()
         out = tools["find_free_area"](tmp_sch, width=0.0, height=10.0)
