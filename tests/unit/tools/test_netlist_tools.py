@@ -282,13 +282,9 @@ class TestExtractSchematicNetlist:
         assert "net" in wire
         assert "start" in wire
         assert "end" in wire
-        assert "pins" in wire["start"]
-        assert "pins" in wire["end"]
-        # New fields
-        assert "dangling_start" in wire
-        assert "dangling_end" in wire
-        assert "is_dangling" in wire
-        assert "endpoints_share_net" in wire
+        # pins only present when non-empty
+        # dangling_start/end/endpoints_share_net only present when True
+        # is_dangling removed
 
     @patch("kcaa.tools.netlist_tools.os.path.exists", return_value=True)
     @patch("kcaa.tools.netlist_tools.extract_netlist", return_value=SAMPLE_NETLIST)
@@ -297,7 +293,8 @@ class TestExtractSchematicNetlist:
         wire = result["analysis"]["wires"]["0"]
         # Both endpoints are on "Net-(R1-Pad1)" per SAMPLE_NETLIST point_to_net
         assert wire["endpoints_share_net"] is True
-        assert wire["is_dangling"] is False
+        assert "dangling_start" not in wire
+        assert "dangling_end" not in wire
 
     @patch("kcaa.tools.netlist_tools.os.path.exists", return_value=True)
     @patch("kcaa.tools.netlist_tools.extract_netlist", return_value=NETLIST_WITH_DANGLING)
@@ -307,8 +304,7 @@ class TestExtractSchematicNetlist:
         # Wire "1" is the dangling stub: start=(95,50) has net, end=(75,50) is dangling
         stub = wires["1"]
         assert stub["dangling_end"] is True
-        assert stub["dangling_start"] is False
-        assert stub["is_dangling"] is True
+        assert "dangling_start" not in stub
 
     @patch("kcaa.tools.netlist_tools.os.path.exists", return_value=True)
     @patch("kcaa.tools.netlist_tools.extract_netlist", return_value=NETLIST_WITH_FLOATING_WIRE)
@@ -319,8 +315,7 @@ class TestExtractSchematicNetlist:
         floating = wires["1"]
         assert floating["dangling_start"] is True
         assert floating["dangling_end"] is True
-        assert floating["is_dangling"] is True
-        assert floating["endpoints_share_net"] is False
+        assert "endpoints_share_net" not in floating
 
     @patch("kcaa.tools.netlist_tools.os.path.exists", return_value=True)
     @patch("kcaa.tools.netlist_tools.extract_netlist", return_value=SAMPLE_NETLIST)
