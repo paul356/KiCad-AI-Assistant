@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 import json
 import logging
 import os
+from pathlib import Path
 import platform
 import subprocess  # nosec B404 -- controlled subprocess execution, no user input
 from typing import Any
@@ -20,6 +21,60 @@ from typing import Any
 from .tool_registry import get_missing_tool_policies, get_tool_policy
 
 log = logging.getLogger(__name__)
+
+_SKILLS_DIR = Path(
+    os.environ.get(
+        "KCAA_SKILLS_DIR", str(Path(__file__).resolve().parent.parent / "kcaa" / "skills")
+    )
+)
+
+
+def _parse_skill_front_matter(text: str) -> dict[str, str]:
+    """Return flat front-matter metadata from a skill Markdown file."""
+    if not text.startswith("---"):
+        return {}
+    end = text.find("\n---", 3)
+    if end == -1:
+        return {}
+    meta: dict[str, str] = {}
+    for line in text[3:end].strip().splitlines():
+        if ":" not in line:
+            continue
+        key, _, value = line.partition(":")
+        meta[key.strip()] = value.strip().strip('"').strip("'")
+    return meta
+
+
+def _load_skill_catalog_entries() -> list[dict[str, str]]:
+    """Load skill metadata for prompt-time catalog generation."""
+    if not _SKILLS_DIR.exists():
+        return []
+
+    skills: list[dict[str, str]] = []
+    for path in _SKILLS_DIR.glob("*.md"):
+        try:
+            meta = _parse_skill_front_matter(path.read_text(encoding="utf-8"))
+            name = meta.get("name") or path.stem.replace("_", "-")
+            skills.append(
+                {
+                    "name": name,
+                    "description": meta.get("description", ""),
+                    "priority": meta.get("priority", "50"),
+                }
+            )
+        except Exception:
+            log.warning("Failed to read skill file %s", path)
+
+    return sorted(skills, key=lambda s: (-int(s["priority"]), s["name"]))
+
+
+def _build_skill_catalog_block() -> str:
+    """Render a compact catalog of available on-demand workflow skills."""
+    skills = _load_skill_catalog_entries()
+    if not skills:
+        return ""
+    names = ", ".join(skill["name"] for skill in skills)
+    return "# Skills\n" + names
 
 
 # ---------------------------------------------------------------------------
@@ -185,28 +240,12 @@ def _https_post_json(
 # ---------------------------------------------------------------------------
 
 _PROMPT_HEADER = """\
-You are an expert KiCad assistant embedded in the KiCad EDA tool.
-You help engineers edit schematics and PCB layouts by calling the available MCP tools.
-
-# Framework-managed mutation safety
-- The plugin framework automatically calls `save_file_version(file_path)` the
-  first time a request successfully attempts to modify a schematic or PCB file.
-- The framework automatically calls `reload_kicad(paths=[...])` once at the end
-  of the request for every file that was modified successfully.
-- Do **not** call `save_file_version` or `reload_kicad` as part of a normal
-  edit workflow. Use the version tools only when the engineer explicitly asks
-  to inspect or restore saved versions.
-
-# KiCad IPC tools (kipy-based)
-- Do **not** call the following IPC-based tools unless the engineer explicitly
-  asks for one of them: `check_kicad_ipc_connection`, `save_document`, `reload_kicad`.
-- These tools interact with KiCad's live IPC API and can cause unexpected
-  side effects (e.g. overwriting file-based changes). Prefer file-based tools
-  for all editing operations.
-
-# On-demand workflow skills
-Call ``list_skills()`` to see available step-by-step workflow guides, then
-``get_skill(name)`` to load one into your context for the rest of the session.\
+You are a KiCad assistant.
+- Edit schematics/PCBs via MCP tools.
+- Unless asked, never call `save_file_version`, `reload_kicad`,
+  `check_kicad_ipc_connection`, or `save_document`.
+- The framework handles snapshots/reloads. Use ``list_skills()`` /
+  ``get_skill(name)`` for guides.\
 """
 
 _PROMPT_SCHEMATIC = """\
@@ -223,89 +262,6 @@ _PROMPT_SCHEMATIC = """\
   that involves spatial changes, call get_schematic_sheet_info once to
   confirm the actual paper size and to learn the recommended drawing area
   (it accounts for the title block).
-
-# Geometry you get for free
-- get_symbol and get_symbol_pins return body_bbox + per-unit bboxes in
-  library coordinates so you can size new placements before inserting.
-- extract_schematic_netlist returns body_bbox per placed component in
-  schematic (Y-down) world coordinates. Use it as your occupancy map.
-- add_symbol_to_schematic, place_symbol_relative and move_component all
-  return the resulting body_bbox so you usually do NOT need to re-extract
-  the netlist after a successful placement.
-
-# Recommended placement workflow
-1. Call extract_schematic_netlist to learn what already exists and where.
-2. To add a new symbol:
-   a. Look it up with search_symbols / get_symbol (note its body_bbox).
-   b. PREFER place_symbol_relative when you can describe the position
-      relative to an existing reference (e.g. "right of U1, gap 2.54").
-   c. Otherwise call find_free_area(for_library=..., for_symbol=...,
-      prefer_near=...) — always supply ``for_library`` and ``for_symbol``
-      so each candidate includes a **placement** ``{x, y}`` field. Pass
-      ``placement.x`` / ``placement.y`` directly to add_symbol_to_schematic.
-      (``origin`` is the bbox top-left, NOT the symbol anchor; do not use
-      it for placement coordinates.)
-   d. Only fall back to absolute add_symbol_to_schematic(x, y, ...) if the
-      helpers above cannot satisfy the request.
-3. After moves/inserts, prefer using the returned body_bbox; only call
-   extract_schematic_netlist again if you need to refresh net info.
-4. Wire pins using this priority order — try each in turn, stop at first
-   success; if both fail, **report the failure and the coordinates to
-   the user** instead of silently skipping the wire:
-   a. **connect_pins_with_wire(from_ref, from_pin, to_ref, to_pin)** —
-      preferred for pin-to-pin; resolves coordinates automatically, routes
-      with smart orthogonal routing, and inserts junctions automatically.
-      If this fails, **immediately report to the user**: the tool name
-      (connect_pins_with_wire), the exact arguments used, and the full
-      error message returned. Then proceed to (b).
-   b. **connect_points_with_wire(start_x, start_y, end_x, end_y)** — smart
-      orthogonal routing between bare coordinates; use when endpoints are
-      not symbol pins (e.g. net label positions, existing wire tips).
-      If this fails, **stop and report** the tool name
-      (connect_points_with_wire), the exact arguments used, and the full
-      error message to the user.
-
-# Wiring strategy
-- The required pin on each component is dictated by the **circuit's
-  electrical intent** — that comes first, ALWAYS. Pin choice is
-  flexible only when both candidate pins are electrically interchangeable
-  ("isotropic"): e.g. the two leads of a non-polarised resistor or
-  ceramic capacitor, the two ends of an inductor, or two pins on the
-  same internal net. It is NEVER flexible for polarised parts (diodes
-  anode/cathode, electrolytic/tantalum capacitor +/-, LEDs, BJT/MOSFET
-  terminals), ICs, connectors, or any pin whose name carries meaning
-  (VCC, GND, EN, CLK, D+, etc.). Use ``get_symbol_pins`` /
-  ``components[ref].pins[*].num`` together with the symbol's datasheet
-  semantics to pick the correct pin first; only then optimise geometry.
-- **When (and only when) the choice is between electrically equivalent
-  pins**, pick the pair whose schematic coordinates are closest
-  (minimum Manhattan distance). Read each candidate pin's world
-  ``x``/``y`` from extract_schematic_netlist
-  (``components[ref].pins[*]`` has ``num``, ``x``, ``y``, ``direction``).
-  Shorter wires mean fewer bends and fewer crossings.
-- For pins on the same net (e.g. all GND, all VCC), wire each new pin
-  to the *closest already-wired pin on that net* rather than always
-  going back to the same anchor — this keeps the net visually local.
-- Prefer connect_pins_with_wire over manual coordinate routing whenever
-  both endpoints are pins; it handles rotation and junction insertion for
-  you.  When endpoints are bare coordinates, use connect_points_with_wire.
-  Always report failures to the user.
-- If the electrically-correct pin pair would produce a long or cluttered
-  wire, consider **rotating or moving one of the components** instead of
-  picking a different (wrong) pin.
-- Do **not** break a wire into multiple segments by calling a wiring tool
-  multiple times. Always provide the direct start and end points in a
-  single call; the routing algorithm handles all intermediate bends
-  automatically.
-
-# Spacing & layout rules
-- Keep at least one grid step (1.27 mm) of clearance between symbol body
-  bboxes; 2.54 mm or more is preferred so Reference/Value labels do not
-  collide with neighbours.
-- Align rows of similar components on the same Y; align columns on the
-  same X. Use multiples of 1.27 mm for spacing so wires stay orthogonal.
-- Stay inside the recommended_area returned by get_schematic_sheet_info;
-  never place inside title_block_default.
 
 # Hard rules (schematic)
 - Always call extract_schematic_netlist (or get_schematic_sheet_info) for
@@ -335,64 +291,6 @@ _PROMPT_PCB = """\
   ``B.SilkS`` (silkscreen), ``F.Courtyard`` / ``B.Courtyard`` (keep-out),
   ``Edge.Cuts`` (board outline).
 
-# PCB query workflow
-1. Call **get_board_info** to learn layer stack, copper layer count, footprint
-   count, net count, and board generator.
-2. Call **list_footprints** to get every footprint's reference, value, x/y
-   (world mm), rotation (CW+), and layer.
-3. Call **get_footprint** for detailed info on a specific footprint: pad
-   numbers/types/nets, all properties, and local pad coordinates.
-   Note: pad coordinates from get_footprint are *local* (footprint-relative).
-   Use **get_ratsnest** when you need world-coordinate pad positions.
-4. Call **list_nets** to enumerate nets with their pad counts.
-5. Call **get_ratsnest** to identify unconnected pad pairs.  An empty result
-   means the board is fully routed.  Pad x/y in the ratsnest response are
-   already in world coordinates (rotation applied).
-
-# PCB placement workflow
-- Before placing, call **get_board_info** + **list_footprints** to understand
-  the current layout.
-- Use **get_footprint_bbox** to get a footprint's courtyard bounding box in
-  world coordinates.  Use this to check for overlaps before positioning.
-- Use **get_board_bounding_box** to get the union bbox of all footprint
-  courtyards — useful for sizing the board outline around all components.
-- Move or rotate a single footprint: **set_footprint_position(pcb_path,
-  reference, x, y, rotation)**.  Any argument may be ``null`` to leave it
-  unchanged; at least one must be provided.  If the requested position causes
-  a courtyard collision, the tool automatically adjusts to the nearest free
-  spot; if none is found within 20 mm, an error is returned.
-- Flip a footprint between F.Cu and B.Cu: **flip_footprint(pcb_path,
-  reference)**.  All child layer items are updated automatically.
-- Update a footprint property (Reference, Value, Datasheet, or custom field):
-  **set_footprint_property(pcb_path, reference, property_name, value)**.
-
-# PCB group operations
-- **align_footprints(pcb_path, references, axis, coordinate)** — align all
-  listed footprints to the same X or Y.  ``coordinate=null`` uses the mean.
-- **distribute_footprints(pcb_path, references, axis)** — evenly space ≥3
-  footprints along X or Y; outermost positions are fixed.
-- **move_footprints_by_delta(pcb_path, references, dx, dy)** — shift a group
-  by the same offset without changing their relative positions.
-
-# Board outline workflow
-- Query current Edge.Cuts geometry: **get_board_outline**.
-- Replace the entire outline with a rectangle: **set_board_outline_rect(
-  pcb_path, x, y, width, height, line_width, corner_radius)**.
-  ``corner_radius=0`` emits a single gr_rect; positive value draws four
-  lines + four 90° arcs.  Edge.Cuts line width is typically 0.05 mm.
-- Add individual segments or arcs: **add_board_outline_segment** /
-  **add_board_outline_arc**.  Wipe first with **clear_board_outline**.
-- Arc angles: 0° is +X, angles increase clockwise.
-
-# Footprint library workflow
-- Build/refresh the footprint index (background):
-  **sync_footprint_index(project_path, force)**.  Check progress with
-  **get_footprint_sync_status**.
-- List libraries: **list_footprint_libraries(project_path)**.
-- Search footprints: **search_footprints(query, project_path, limit)**.
-- Inspect pads/courtyard of a specific footprint:
-  **get_footprint_details(library, name)**.
-
 # Hard rules (PCB)
 - Always call get_board_info + list_footprints before making spatial changes.
   Never invent footprint coordinates.
@@ -405,6 +303,10 @@ _PROMPT_PCB = """\
 - Do not overlap footprint courtyards.  Verify clearances with
   get_footprint_bbox / get_board_bounding_box before committing a move.\
 """
+
+_PROMPT_SKILL_CATALOG = _build_skill_catalog_block()
+if _PROMPT_SKILL_CATALOG:
+    _PROMPT_PCB = _PROMPT_PCB + "\n\n" + _PROMPT_SKILL_CATALOG
 
 
 def build_system_prompt(context_block: str) -> str:
