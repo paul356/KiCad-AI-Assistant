@@ -140,9 +140,16 @@ NETLIST_WITH_FLOATING_WIRE = {
     "dangling_points": [(10.0, 10.0), (20.0, 10.0)],
 }
 
-
-# ---------------------------------------------------------------------------
-# extract_project_netlist
+# Variant with a duplicate parallel wire — both copies are non-bridges (redundant)
+NETLIST_WITH_REDUNDANT_WIRE = {
+    **SAMPLE_NETLIST,
+    "wires": [
+        # wire 0: original connection between the two pins
+        *SAMPLE_NETLIST["wires"],
+        # wire 1: exact duplicate of wire 0 — creates a parallel edge → both redundant
+        {"start": {"x": 105, "y": 50}, "end": {"x": 145, "y": 50}},
+    ],
+}
 # ---------------------------------------------------------------------------
 
 
@@ -283,7 +290,7 @@ class TestExtractSchematicNetlist:
         assert "start" in wire
         assert "end" in wire
         # pins only present when non-empty
-        # dangling_start/end/endpoints_share_net only present when True
+        # dangling_start/end only present when True
         # is_dangling removed
 
     @patch("kcaa.tools.netlist_tools.os.path.exists", return_value=True)
@@ -292,7 +299,7 @@ class TestExtractSchematicNetlist:
         result = _run(self.fn("/some/design.kicad_sch", include_wire_topology=True, ctx=None))
         wire = result["analysis"]["wires"]["0"]
         # Both endpoints are on "Net-(R1-Pad1)" per SAMPLE_NETLIST point_to_net
-        assert wire["endpoints_share_net"] is True
+        assert "endpoints_share_net" not in wire
         assert "dangling_start" not in wire
         assert "dangling_end" not in wire
 
@@ -315,7 +322,23 @@ class TestExtractSchematicNetlist:
         floating = wires["1"]
         assert floating["dangling_start"] is True
         assert floating["dangling_end"] is True
-        assert "endpoints_share_net" not in floating
+
+    @patch("kcaa.tools.netlist_tools.os.path.exists", return_value=True)
+    @patch("kcaa.tools.netlist_tools.extract_netlist", return_value=SAMPLE_NETLIST)
+    def test_non_redundant_wire_not_marked(self, mock_extract, mock_exists):
+        # SAMPLE_NETLIST has a single wire — it's a bridge, so NOT redundant
+        result = _run(self.fn("/some/design.kicad_sch", include_wire_topology=True, ctx=None))
+        wire = result["analysis"]["wires"]["0"]
+        assert "redundant" not in wire
+
+    @patch("kcaa.tools.netlist_tools.os.path.exists", return_value=True)
+    @patch("kcaa.tools.netlist_tools.extract_netlist", return_value=NETLIST_WITH_REDUNDANT_WIRE)
+    def test_redundant_wire_detected(self, mock_extract, mock_exists):
+        # Two parallel wires between the same endpoints — both are non-bridges
+        result = _run(self.fn("/some/design.kicad_sch", include_wire_topology=True, ctx=None))
+        wires = result["analysis"]["wires"]
+        assert wires["0"]["redundant"] is True
+        assert wires["1"]["redundant"] is True
 
     @patch("kcaa.tools.netlist_tools.os.path.exists", return_value=True)
     @patch("kcaa.tools.netlist_tools.extract_netlist", return_value=SAMPLE_NETLIST)
