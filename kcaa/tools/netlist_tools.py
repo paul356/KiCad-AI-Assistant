@@ -163,6 +163,10 @@ def register_netlist_tools(mcp: FastMCP) -> None:
                               "start": {"x": ..., "y": ..., "pins": [{"ref": "R1", "pin": "1"}]},
                               "end":   {"x": ..., "y": ...},
                               "dangling_end": True},
+                        "3": {"net": "VCC",
+                              "start": {"x": ..., "y": ...},
+                              "end":   {"x": ..., "y": ...},
+                              "redundant": True},
                         "5": {"net": null,
                               "start": {"x": ..., "y": ...},
                               "end":   {"x": ..., "y": ...},
@@ -173,8 +177,9 @@ def register_netlist_tools(mcp: FastMCP) -> None:
                     # pins field is omitted when empty.
                     # dangling_start/dangling_end: only present (True) when the endpoint
                     #   has no other wire, pin, label, or junction.
-                    # endpoints_share_net: only present (True) when both endpoints
-                    #   resolve to the same named net.
+                    # redundant: only present (True) when the wire is NOT a bridge in its
+                    #   net's wire graph — an alternate path already connects its endpoints,
+                    #   so the wire can be safely deleted without changing connectivity.
                     }
                 }
             }
@@ -324,9 +329,58 @@ def register_netlist_tools(mcp: FastMCP) -> None:
                         wire_entry["dangling_start"] = True
                     if dangling_end:
                         wire_entry["dangling_end"] = True
-                    if start_net is not None and start_net == end_net:
-                        wire_entry["endpoints_share_net"] = True
                     wires[str(wire_id)] = wire_entry
+
+                # Detect redundant wires: a wire is redundant when it is NOT a
+                # bridge in its net's wire graph, i.e. an alternative path
+                # already connects its two endpoints — the wire can be deleted
+                # without changing any net connectivity.
+                from collections import defaultdict as _dd2
+
+                _adj: dict[str, Any] = {}
+                for wid, wdata in wires.items():
+                    wnet = wdata.get("net")
+                    if not wnet:
+                        continue
+                    sp2 = rpt(wdata["start"]["x"], wdata["start"]["y"])
+                    ep2 = rpt(wdata["end"]["x"], wdata["end"]["y"])
+                    if wnet not in _adj:
+                        _adj[wnet] = _dd2(list)
+                    _adj[wnet][sp2].append((ep2, wid))
+                    _adj[wnet][ep2].append((sp2, wid))
+
+                _bridge_ids: set[str] = set()
+                for _wnet, _graph in _adj.items():
+                    _disc: dict = {}
+                    _low: dict = {}
+                    _tmr = [0]
+                    for _src in list(_graph.keys()):
+                        if _src in _disc:
+                            continue
+                        _disc[_src] = _low[_src] = _tmr[0]
+                        _tmr[0] += 1
+                        _stk = [(_src, None, iter(_graph[_src]))]
+                        while _stk:
+                            _u, _peid, _nbrs = _stk[-1]
+                            try:
+                                _v, _eid = next(_nbrs)
+                                if _v not in _disc:
+                                    _disc[_v] = _low[_v] = _tmr[0]
+                                    _tmr[0] += 1
+                                    _stk.append((_v, _eid, iter(_graph[_v])))
+                                elif _eid != _peid:
+                                    _low[_u] = min(_low[_u], _disc[_v])
+                            except StopIteration:
+                                _stk.pop()
+                                if _stk:
+                                    _pu = _stk[-1][0]
+                                    _low[_pu] = min(_low[_pu], _low[_u])
+                                    if _low[_u] > _disc[_pu]:
+                                        _bridge_ids.add(_peid)
+
+                for wid, wdata in wires.items():
+                    if wdata.get("net") is not None and wid not in _bridge_ids:
+                        wdata["redundant"] = True
 
                 analysis["wires"] = wires
 
