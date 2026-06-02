@@ -161,11 +161,20 @@ def register_netlist_tools(mcp: FastMCP) -> None:
                     "wires": {
                         "0": {"net": "GND",
                               "start": {"x": ..., "y": ..., "pins": [{"ref": "R1", "pin": "1"}]},
-                              "end":   {"x": ..., "y": ..., "pins": []}},
+                              "end":   {"x": ..., "y": ...},
+                              "dangling_end": True},
                         "5": {"net": null,
-                              "start": {"x": ..., "y": ..., "pins": []},
-                              "end":   {"x": ..., "y": ..., "pins": []}},
+                              "start": {"x": ..., "y": ...},
+                              "end":   {"x": ..., "y": ...},
+                              "dangling_start": True,
+                              "dangling_end": True},
                         ...
+                    }
+                    # pins field is omitted when empty.
+                    # dangling_start/dangling_end: only present (True) when the endpoint
+                    #   has no other wire, pin, label, or junction.
+                    # endpoints_share_net: only present (True) when both endpoints
+                    #   resolve to the same named net.
                     }
                 }
             }
@@ -277,6 +286,12 @@ def register_netlist_tools(mcp: FastMCP) -> None:
                 # Reuse the wire→net mapping already resolved by the parser
                 point_to_net = netlist_data.get("point_to_net", {})
 
+                # Dangling endpoints identified by the parser
+                dangling_pts = {
+                    (round(float(p[0]), ROUND), round(float(p[1]), ROUND))
+                    for p in netlist_data.get("dangling_points", [])
+                }
+
                 # Build point → component-pins lookup from component pin world coords
                 from collections import defaultdict as _dd
 
@@ -293,12 +308,25 @@ def register_netlist_tools(mcp: FastMCP) -> None:
                 for wire_id, wdata in enumerate(all_wires):
                     sp = rpt(wdata["start"]["x"], wdata["start"]["y"])
                     ep = rpt(wdata["end"]["x"], wdata["end"]["y"])
-                    wnet = point_to_net.get(sp) or point_to_net.get(ep)
-                    wires[str(wire_id)] = {
+                    start_net = point_to_net.get(sp)
+                    end_net = point_to_net.get(ep)
+                    wnet = start_net or end_net
+                    dangling_start = sp in dangling_pts
+                    dangling_end = ep in dangling_pts
+                    start_pins = list(pin_at.get(sp, []))
+                    end_pins = list(pin_at.get(ep, []))
+                    wire_entry: dict[str, Any] = {
                         "net": wnet,
-                        "start": {**wdata["start"], "pins": list(pin_at.get(sp, []))},
-                        "end": {**wdata["end"], "pins": list(pin_at.get(ep, []))},
+                        "start": {**wdata["start"], **({"pins": start_pins} if start_pins else {})},
+                        "end": {**wdata["end"], **({"pins": end_pins} if end_pins else {})},
                     }
+                    if dangling_start:
+                        wire_entry["dangling_start"] = True
+                    if dangling_end:
+                        wire_entry["dangling_end"] = True
+                    if start_net is not None and start_net == end_net:
+                        wire_entry["endpoints_share_net"] = True
+                    wires[str(wire_id)] = wire_entry
 
                 analysis["wires"] = wires
 
