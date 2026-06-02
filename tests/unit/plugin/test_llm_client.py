@@ -646,6 +646,8 @@ class TestToolPolicyRegistry:
             "save_document",
             "check_kicad_ipc_connection",
             "refill_zones",
+            "list_skills",
+            "get_skill",
         }
 
         assert set(TOOL_POLICIES) == expected_tools

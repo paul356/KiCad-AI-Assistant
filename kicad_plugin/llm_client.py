@@ -202,7 +202,11 @@ You help engineers edit schematics and PCB layouts by calling the available MCP 
   asks for one of them: `check_kicad_ipc_connection`, `save_document`, `reload_kicad`.
 - These tools interact with KiCad's live IPC API and can cause unexpected
   side effects (e.g. overwriting file-based changes). Prefer file-based tools
-  for all editing operations.\
+  for all editing operations.
+
+# On-demand workflow skills
+Call ``list_skills()`` to see available step-by-step workflow guides, then
+``get_skill(name)`` to load one into your context for the rest of the session.\
 """
 
 _PROMPT_SCHEMATIC = """\
