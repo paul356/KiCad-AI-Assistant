@@ -211,6 +211,149 @@ class TestFindFreeArea:
         out = tools["find_free_area"](tmp_sch, width=10000.0, height=10000.0)
         assert out["candidates"] == []
 
+    def test_prefer_near_right_side_returns_closest(self, tmp_sch):
+        """When prefer_near targets the right side of the sheet, the result
+        must be the *true* nearest free grid cell — not some position from
+        the far-left column.
+
+        This guards against grid-scan implementations that fill their
+        candidate buffer with left-edge positions and exit before reaching
+        the bias area (e.g. row-major scan with a low max_collect cap).
+
+        The bias area is deliberately crowded with an asymmetric cluster so
+        the algorithm must reject occupied positions before settling on an
+        unambiguous nearest free cell.  The test then independently verifies
+        that no closer free grid cell exists.
+        """
+        from kcaa.tools.placement_helpers import GRID_MM as _GRID_MM
+        from kcaa.tools.placement_helpers import PlacementHelpers
+        from kcaa.tools.sheet_tools import _align_to_grid
+
+        comps = _component_tools()
+        mgr = _make_mock_manager()
+
+        bias_x, bias_y = 170.0, 50.0
+        cluster_positions = [
+            (bias_x - 3.81, bias_y - 3.81),  # lower-left
+            (bias_x, bias_y),  # center
+            (bias_x + 3.81, bias_y + 3.81),  # upper-right
+            (bias_x + 3.81, bias_y),  # right
+            (bias_x, bias_y + 3.81),  # top
+        ]
+        # Collect body bboxes from every placed cluster component so we can
+        # independently verify occupancy.
+        cluster_bboxes: list[dict] = []
+        with patch(
+            "kcaa.tools.component_edit_tools._get_index_manager",
+            return_value=mgr,
+        ):
+            for i, (cx, cy) in enumerate(cluster_positions):
+                res = asyncio.run(
+                    comps["add_symbol_to_schematic"](
+                        schematic_path=tmp_sch,
+                        library_name=_LIB_NAME,
+                        symbol_name=_SYM_NAME,
+                        x=cx,
+                        y=cy,
+                    )
+                )
+                assert res["success"], f"Cluster[{i}] at ({cx},{cy}): {res}"
+                cluster_bboxes.append(res["body_bbox"])
+
+        width = 5.0
+        height = 5.0
+        margin = 3.81  # default used by the algorithm
+
+        result = PlacementHelpers.find_free_area(
+            schematic_path=tmp_sch,
+            width=_align_to_grid(width),
+            height=_align_to_grid(height),
+            prefer_near={"x": bias_x, "y": bias_y},
+            max_candidates=1,
+        )
+        cand = (result.get("candidates") or [None])[0]
+        assert cand is not None, "Expected at least one candidate"
+        ox = float(cand["origin"]["x"])
+        oy = float(cand["origin"]["y"])
+
+        # --- Helpers (same logic as the algorithm) ---
+
+        def _inflate(bb: dict) -> dict:
+            return {
+                "min_x": bb["min_x"] - margin,
+                "min_y": bb["min_y"] - margin,
+                "max_x": bb["max_x"] + margin,
+                "max_y": bb["max_y"] + margin,
+            }
+
+        def _overlaps(a: dict, b: dict) -> bool:
+            return (
+                a["min_x"] < b["max_x"]
+                and a["max_x"] > b["min_x"]
+                and a["min_y"] < b["max_y"]
+                and a["max_y"] > b["min_y"]
+            )
+
+        # --- 1. Sanity: the result bbox must NOT overlap any cluster ---
+        result_bb = {"min_x": ox, "min_y": oy, "max_x": ox + width, "max_y": oy + height}
+        infl_bboxes = [_inflate(cbb) for cbb in cluster_bboxes]
+        for i, ibb in enumerate(infl_bboxes):
+            assert not _overlaps(result_bb, ibb), (
+                f"result {result_bb} overlaps cluster[{i}] inflated {ibb}"
+            )
+
+        # --- 2. Prove the result is the TRUE nearest free grid cell ---
+        # Walk ALL grid positions in distance order.  Every position CLOSER
+        # to the bias than the result MUST overlap a cluster component.
+        # If a closer free cell exists, the algorithm is broken.
+
+        result_cx = ox + width / 2.0
+        result_cy = oy + height / 2.0
+        result_dist = ((result_cx - bias_x) ** 2 + (result_cy - bias_y) ** 2) ** 0.5
+
+        # Drawing area bounds (A4 = 297×210, edge margin = 10 mm).
+        sheet_w, sheet_h = 297.0, 210.0
+        edge = 10.0
+
+        def _snap_up(v: float) -> float:
+            n = int(v / _GRID_MM)
+            while n * _GRID_MM < v - 1e-9:
+                n += 1
+            return n * _GRID_MM
+
+        x0 = _snap_up(edge)
+        y0 = _snap_up(edge)
+        x_hi = sheet_w - edge - width
+        y_hi = sheet_h - edge - height
+
+        closer_free = None
+        x = x0
+        while x <= x_hi + 1e-9:
+            y = y0
+            while y <= y_hi + 1e-9:
+                pt_cx = x + width / 2.0
+                pt_cy = y + height / 2.0
+                pt_dist = ((pt_cx - bias_x) ** 2 + (pt_cy - bias_y) ** 2) ** 0.5
+                if pt_dist >= result_dist - 1e-9:
+                    y += _GRID_MM
+                    continue
+                pt_bb = {"min_x": x, "min_y": y, "max_x": x + width, "max_y": y + height}
+                if not any(_overlaps(pt_bb, ibb) for ibb in infl_bboxes):
+                    closer_free = (x, y, pt_dist)
+                    break
+                y += _GRID_MM
+            if closer_free:
+                break
+            x += _GRID_MM
+
+        assert closer_free is None, (
+            f"Grid point ({closer_free[0]:.2f},{closer_free[1]:.2f}) "
+            f"dist={closer_free[2]:.2f} is free and closer to bias "
+            f"({bias_x},{bias_y}) than algorithm's pick ({ox:.2f},{oy:.2f}) "
+            f"dist={result_dist:.2f} — the algorithm did NOT return the "
+            f"true nearest free position!"
+        )
+
     def test_for_symbol_returns_placement_anchor(self, tmp_sch):
         """When for_library/for_symbol are passed, each candidate must
         include a ``placement`` whose use as add_symbol_to_schematic(x, y)
