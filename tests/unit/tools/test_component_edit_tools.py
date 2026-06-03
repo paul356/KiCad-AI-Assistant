@@ -1383,47 +1383,75 @@ class TestMoveComponent:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Helper: generate a symbol s-expression that skip can parse
+# ---------------------------------------------------------------------------
+
+
+def _make_skip_symbol(ref: str, x: float, y: float, uid: str) -> str:
+    """Return a minimal symbol s-expression with pins that ``skip.Schematic`` accepts."""
+    return (
+        f'  (symbol (lib_id "Device:R") (at {x} {y} 180) (unit 1) (body_style 1)\n'
+        f"    (exclude_from_sim no) (in_bom yes) (on_board yes)"
+        f" (in_pos_files yes) (dnp no) (fields_autoplaced yes)\n"
+        f'    (uuid "{uid}")\n'
+        f'    (property "Reference" "{ref}" (at {x + 3} {y - 1} 0)'
+        f" (show_name no) (do_not_autoplace no)"
+        f" (effects (font (size 1.27 1.27))))\n"
+        f'    (property "Value" "10k" (at {x + 3} {y + 1} 0)'
+        f" (show_name no) (do_not_autoplace no)"
+        f" (effects (font (size 1.27 1.27))))\n"
+        f'    (property "Footprint" "" (at {x} {y - 3} 0)'
+        f" (show_name no) (do_not_autoplace no) (hide yes)"
+        f" (effects (font (size 1.27 1.27))))\n"
+        f'    (property "Datasheet" "~" (at {x} {y} 0)'
+        f" (show_name no) (do_not_autoplace no) (hide yes)"
+        f" (effects (font (size 1.27 1.27))))\n"
+        f'    (pin "1" (number "1") (name "~"))\n'
+        f'    (pin "2" (number "2") (name "~"))\n'
+        f'    (instances (project "test"'
+        f' (path "/fake" (reference "{ref}") (unit 1))))\n'
+        f"  )\n"
+    )
+
+
 class TestNextReferenceCrossFile:
     """Tests for _next_reference with project-wide scanning."""
 
     @pytest.fixture()
     def project_dir(self, tmp_path):
-        """Create a minimal KiCad project with two schematic files."""
+        """Create a minimal KiCad project with two schematic files that skip can parse."""
         proj = tmp_path / "test_proj"
         proj.mkdir()
-        # Create the .kicad_pro marker.
         (proj / "test_proj.kicad_pro").write_text("{}")
 
-        # Create a parent schematic.  We use a minimal but valid kicad_sch
-        # sexp so that regex scans work.  (skip.Schematic would need more
-        # structure, but we only use regex in cross-file tests.)
+        sym1 = _make_skip_symbol("R1", 0, 0, "aaaaaaaa-aaaa-aaaa-aaaa-000000000001")
+        sym2 = _make_skip_symbol("R3", 10, 0, "aaaaaaaa-aaaa-aaaa-aaaa-000000000002")
         parent_sch = proj / "test_proj.kicad_sch"
         parent_sch.write_text(
             '(kicad_sch (version 20240108) (generator "eeschema")\n'
-            '  (symbol (lib_id "Device:R") (at 0 0 0)\n'
-            '    (property "Reference" "R1" (at 0 0 0))\n'
-            "  )\n"
-            '  (symbol (lib_id "Device:R") (at 10 0 0)\n'
-            '    (property "Reference" "R3" (at 10 0 0))\n'
-            "  )\n"
-            "  (sheet (at 10 10) (size 20 10)\n"
-            '    (property "Sheet name" "Sub" (at 20 10 0))\n'
-            '    (property "Sheet file" "sub/sub.kicad_sch" (at 20 10 0))\n'
-            "  )\n"
-            '  (sheet_instances (path "/" (page "1")))\n'
-            ")\n"
+            + sym1
+            + sym2
+            + "  (sheet (at 10 10) (size 20 10)\n"
+            + '    (uuid "11111111-1111-1111-1111-111111111111")\n'
+            + '    (property "Sheet name" "Sub" (at 20 10 0)'
+            + " (effects (font (size 1.27 1.27))))\n"
+            + '    (property "Sheet file" "sub/sub.kicad_sch" (at 20 10 0)'
+            + " (effects (font (size 1.27 1.27))))\n"
+            + "  )\n"
+            + '  (sheet_instances (path "/" (page "1")))\n'
+            + ")\n"
         )
-        # Create a sub-sheet schematic with R2.
+
+        sym3 = _make_skip_symbol("R2", 0, 0, "aaaaaaaa-aaaa-aaaa-aaaa-000000000003")
         sub_dir = proj / "sub"
         sub_dir.mkdir()
         sub_sch = sub_dir / "sub.kicad_sch"
         sub_sch.write_text(
             '(kicad_sch (version 20240108) (generator "eeschema")\n'
-            '  (symbol (lib_id "Device:R") (at 0 0 0)\n'
-            '    (property "Reference" "R2" (at 0 0 0))\n'
-            "  )\n"
-            '  (sheet_instances (path "/" (page "1")))\n'
-            ")\n"
+            + sym3
+            + '  (sheet_instances (path "/" (page "1")))\n'
+            + ")\n"
         )
         return proj, parent_sch, sub_sch
 
@@ -1463,8 +1491,11 @@ class TestNextReferenceCrossFile:
         assert len(refs) == 2  # two .kicad_sch files
         parent_refs = refs[str(parent_sch.resolve())]
         sub_refs = refs[str(sub_sch.resolve())]
-        assert parent_refs == {"R1", "R3"}
-        assert sub_refs == {"R2"}
+        assert set(parent_refs.keys()) == {"R1", "R3"}
+        assert set(sub_refs.keys()) == {"R2"}
+        # UUIDs should be present.
+        assert all(len(v) == 36 for v in parent_refs.values())
+        assert all(len(v) == 36 for v in sub_refs.values())
 
     def test_next_reference_skips_own_file_but_scans_others(self, project_dir):
         """_next_reference should see R1, R3 from parent + R2 from sub,
@@ -1518,7 +1549,7 @@ class TestRenameSymbol:
         result = asyncio.run(
             tools["rename_symbol"](
                 schematic_path=tmp_sch,
-                current_reference="R1",
+                symbol_uuid="a27313ed-36db-4154-9e69-a66c07529185",
                 target_reference="R10",
             )
         )
@@ -1527,28 +1558,36 @@ class TestRenameSymbol:
         assert result["target_reference"] == "R10"
         assert result["units_updated"] >= 1
 
-        # Verify the file was actually changed.
+        from kcaa.tools.component_edit_tools import _read_instance_reference
+
+        # Verify the file was actually changed, including instances reference.
         sch = skip.Schematic(tmp_sch)
         found_new = False
         found_old = False
+        instances_updated = False
         for sym in sch.symbol:
             try:
                 ref = sym.property.Reference.value
                 if ref == "R10":
                     found_new = True
+                    # Verify instances path reference matches.
+                    iref = _read_instance_reference(sym)
+                    if iref == "R10":
+                        instances_updated = True
                 if ref == "R1":
                     found_old = True
             except AttributeError:
                 continue
         assert found_new, "R10 should exist after rename"
         assert not found_old, "R1 should not exist after rename"
+        assert instances_updated, "instances reference should also be R10"
 
     def test_current_reference_not_found(self, tools, tmp_sch):
-        """Renaming a non-existent reference should return an error."""
+        """Renaming a non-existent UUID should return an error."""
         result = asyncio.run(
             tools["rename_symbol"](
                 schematic_path=tmp_sch,
-                current_reference="ZZ99",
+                symbol_uuid="00000000-0000-0000-0000-000000000000",
                 target_reference="R10",
             )
         )
@@ -1560,7 +1599,7 @@ class TestRenameSymbol:
         result = asyncio.run(
             tools["rename_symbol"](
                 schematic_path=tmp_sch,
-                current_reference="R1",
+                symbol_uuid="a27313ed-36db-4154-9e69-a66c07529185",
                 target_reference="R5",
             )
         )
@@ -1572,18 +1611,18 @@ class TestRenameSymbol:
         result = asyncio.run(
             tools["rename_symbol"](
                 schematic_path=tmp_sch,
-                current_reference="R1",
+                symbol_uuid="a27313ed-36db-4154-9e69-a66c07529185",
                 target_reference="R1",
             )
         )
         assert "error" in result
 
     def test_empty_current_reference(self, tools, tmp_sch):
-        """Empty current_reference should return an error."""
+        """Empty symbol_uuid should return an error."""
         result = asyncio.run(
             tools["rename_symbol"](
                 schematic_path=tmp_sch,
-                current_reference="",
+                symbol_uuid="",
                 target_reference="R10",
             )
         )
@@ -1594,7 +1633,7 @@ class TestRenameSymbol:
         result = asyncio.run(
             tools["rename_symbol"](
                 schematic_path=tmp_sch,
-                current_reference="R1",
+                symbol_uuid="a27313ed-36db-4154-9e69-a66c07529185",
                 # target_reference omitted — auto-assign
             )
         )
@@ -1603,23 +1642,31 @@ class TestRenameSymbol:
         # tmp_sch has R1..R7, so next should be R8.
         assert result["target_reference"] == "R8"
 
-        # Verify R1 is gone and R8 is present.
+        # Verify R1 is gone and R8 is present, including instances.
+        from kcaa.tools.component_edit_tools import _read_instance_reference
+
         sch = skip.Schematic(tmp_sch)
         refs = set()
+        instances_ok = False
         for sym in sch.symbol:
             try:
-                refs.add(sym.property.Reference.value)
+                ref = sym.property.Reference.value
+                refs.add(ref)
+                if ref == "R8":
+                    if _read_instance_reference(sym) == "R8":
+                        instances_ok = True
             except AttributeError:
                 continue
         assert "R1" not in refs
         assert "R8" in refs
+        assert instances_ok, "instances reference should also be R8"
 
     def test_explicit_target_reference_not_auto_assigned(self, tools, tmp_sch):
         """When target_reference is provided, auto_assigned should be False."""
         result = asyncio.run(
             tools["rename_symbol"](
                 schematic_path=tmp_sch,
-                current_reference="R1",
+                symbol_uuid="a27313ed-36db-4154-9e69-a66c07529185",
                 target_reference="R10",
             )
         )
@@ -1632,7 +1679,7 @@ class TestRenameSymbol:
         result = asyncio.run(
             tools["rename_symbol"](
                 schematic_path="/nonexistent/schematic.kicad_sch",
-                current_reference="R1",
+                symbol_uuid="a27313ed-36db-4154-9e69-a66c07529185",
                 target_reference="R10",
             )
         )
@@ -1654,26 +1701,27 @@ class TestCheckReferenceConflicts:
         proj.mkdir()
         (proj / "clean_proj.kicad_pro").write_text("{}")
         parent = proj / "clean_proj.kicad_sch"
+        sym1 = _make_skip_symbol("R1", 0, 0, "bbbbbbbb-bbbb-bbbb-bbbb-000000000001")
         parent.write_text(
             '(kicad_sch (version 20240108) (generator "eeschema")\n'
-            '  (symbol (lib_id "Device:R") (at 0 0 0)\n'
-            '    (property "Reference" "R1" (at 0 0 0))\n'
-            "  )\n"
-            "  (sheet (at 10 10) (size 20 10)\n"
-            '    (property "Sheet name" "Power" (at 20 10 0))\n'
-            '    (property "Sheet file" "power.kicad_sch" (at 20 10 0))\n'
-            "  )\n"
-            '  (sheet_instances (path "/" (page "1")))\n'
-            ")\n"
+            + sym1
+            + "  (sheet (at 10 10) (size 20 10)\n"
+            + '    (uuid "22222222-2222-2222-2222-222222222222")\n'
+            + '    (property "Sheet name" "Power" (at 20 10 0)'
+            + " (effects (font (size 1.27 1.27))))\n"
+            + '    (property "Sheet file" "power.kicad_sch" (at 20 10 0)'
+            + " (effects (font (size 1.27 1.27))))\n"
+            + "  )\n"
+            + '  (sheet_instances (path "/" (page "1")))\n'
+            + ")\n"
         )
         sub = proj / "power.kicad_sch"
+        sym2 = _make_skip_symbol("R2", 0, 0, "bbbbbbbb-bbbb-bbbb-bbbb-000000000002")
         sub.write_text(
             '(kicad_sch (version 20240108) (generator "eeschema")\n'
-            '  (symbol (lib_id "Device:R") (at 0 0 0)\n'
-            '    (property "Reference" "R2" (at 0 0 0))\n'
-            "  )\n"
-            '  (sheet_instances (path "/" (page "1")))\n'
-            ")\n"
+            + sym2
+            + '  (sheet_instances (path "/" (page "1")))\n'
+            + ")\n"
         )
         return proj, parent, sub
 
@@ -1685,33 +1733,32 @@ class TestCheckReferenceConflicts:
         (proj / "conflict_proj.kicad_pro").write_text("{}")
         # Parent has R1 and C1.
         parent = proj / "conflict_proj.kicad_sch"
+        sym1 = _make_skip_symbol("R1", 0, 0, "cccccccc-cccc-cccc-cccc-000000000001")
+        sym2 = _make_skip_symbol("C1", 10, 0, "cccccccc-cccc-cccc-cccc-000000000002")
         parent.write_text(
             '(kicad_sch (version 20240108) (generator "eeschema")\n'
-            '  (symbol (lib_id "Device:R") (at 0 0 0)\n'
-            '    (property "Reference" "R1" (at 0 0 0))\n'
-            "  )\n"
-            '  (symbol (lib_id "Device:C") (at 10 0 0)\n'
-            '    (property "Reference" "C1" (at 10 0 0))\n'
-            "  )\n"
-            "  (sheet (at 10 10) (size 20 10)\n"
-            '    (property "Sheet name" "Power" (at 20 10 0))\n'
-            '    (property "Sheet file" "power.kicad_sch" (at 20 10 0))\n'
-            "  )\n"
-            '  (sheet_instances (path "/" (page "1")))\n'
-            ")\n"
+            + sym1
+            + sym2
+            + "  (sheet (at 10 10) (size 20 10)\n"
+            + '    (uuid "33333333-3333-3333-3333-333333333333")\n'
+            + '    (property "Sheet name" "Power" (at 20 10 0)'
+            + " (effects (font (size 1.27 1.27))))\n"
+            + '    (property "Sheet file" "power.kicad_sch" (at 20 10 0)'
+            + " (effects (font (size 1.27 1.27))))\n"
+            + "  )\n"
+            + '  (sheet_instances (path "/" (page "1")))\n'
+            + ")\n"
         )
         # Sub-sheet has R1 (conflict!) and C2.
         sub = proj / "power.kicad_sch"
+        sym3 = _make_skip_symbol("R1", 0, 0, "cccccccc-cccc-cccc-cccc-000000000003")
+        sym4 = _make_skip_symbol("C2", 10, 0, "cccccccc-cccc-cccc-cccc-000000000004")
         sub.write_text(
             '(kicad_sch (version 20240108) (generator "eeschema")\n'
-            '  (symbol (lib_id "Device:R") (at 0 0 0)\n'
-            '    (property "Reference" "R1" (at 0 0 0))\n'
-            "  )\n"
-            '  (symbol (lib_id "Device:C") (at 10 0 0)\n'
-            '    (property "Reference" "C2" (at 10 0 0))\n'
-            "  )\n"
-            '  (sheet_instances (path "/" (page "1")))\n'
-            ")\n"
+            + sym3
+            + sym4
+            + '  (sheet_instances (path "/" (page "1")))\n'
+            + ")\n"
         )
         return proj, parent, sub
 
@@ -1728,9 +1775,13 @@ class TestCheckReferenceConflicts:
         conflicts = result["conflicts"]
         assert len(conflicts) == 1
         assert conflicts[0]["reference"] == "R1"
-        assert len(conflicts[0]["sheets"]) == 2
-        assert str(parent) in conflicts[0]["sheets"]
-        assert str(sub) in conflicts[0]["sheets"]
+        assert len(conflicts[0]["instances"]) == 2
+        sheets = [inst["sheet"] for inst in conflicts[0]["instances"]]
+        assert str(parent) in sheets
+        assert str(sub) in sheets
+        # Verify UUIDs are included.
+        for inst in conflicts[0]["instances"]:
+            assert len(inst["uuid"]) == 36
 
     def test_no_conflicts(self, tools, clean_project):
         """A clean project should have zero conflicts."""

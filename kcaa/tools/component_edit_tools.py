@@ -17,6 +17,7 @@ import uuid
 from fastmcp import Context, FastMCP
 import sexpdata
 
+from kcaa.tools.sheet_tools import _normalize_collection, _sheet_dict_from_wrapper
 from kcaa.utils.config import LibraryPathConfig
 from kcaa.utils.schematic_sexp_utils import save_schematic
 from kcaa.utils.skip_compat import safe_schematic
@@ -440,10 +441,6 @@ def _find_project_name(schematic_path: str) -> str:
     return "project"
 
 
-_REFERENCE_RE = re.compile(r'\(property\s+"Reference"\s+"([^"]+)"')
-_SHEET_FILE_RE = re.compile(r'\(property\s+"Sheet\s+[Ff]ile"\s+"([^"]+)"')
-
-
 def _find_project_dir(schematic_path: str) -> Path | None:
     """Find the KiCad project directory containing a .kicad_pro file.
 
@@ -474,17 +471,45 @@ def _find_root_schematic(schematic_path: str) -> str | None:
     return str(root_sch) if root_sch.is_file() else None
 
 
-def _collect_hierarchy_references(schematic_path: str) -> dict[str, set[str]]:
-    """Collect symbol references by following the sheet hierarchy from a root schematic.
+def _read_instance_reference(sym: Any) -> str | None:
+    """Extract the reference from ``sym.instances``, which is KiCad's authoritative
+    reference for placed symbols.  Returns ``None`` when the instances block is
+    missing or unparseable.
+    """
+    try:
+        for item in sym.instances:
+            return item.path.reference.value
+    except (AttributeError, TypeError, StopIteration):
+        return None
+    return None
 
-    Starting from *schematic_path*, follows ``Sheet file`` property references
-    recursively and extracts reference designators via regex.
-    Returns a dict mapping each absolute schematic path to its set of
-    reference strings.  Does not scan directories unreachable from the root
-    (e.g. ``.history`` folders).
+
+def _update_instance_reference(sym: Any, new_ref: str) -> None:
+    """Update ``sym.instances.path.reference`` if it exists.  This keeps the
+    instances block in sync after a rename so KiCad displays the correct value.
+    """
+    try:
+        for item in sym.instances:
+            item.path.reference.value = new_ref
+    except (AttributeError, TypeError):
+        pass
+
+
+def _collect_hierarchy_references(schematic_path: str) -> dict[str, dict[str, str]]:
+    """Collect symbol references with anchor UUIDs by following the sheet hierarchy.
+
+    Uses the ``skip`` library to parse each schematic.  ``sch.symbol``
+    provides only placed symbol instances — ``lib_symbols`` template
+    definitions are automatically excluded.
+
+    For multi-unit symbols (e.g. ``U1A`` / ``U1B``) only the UUID of unit 1
+    (the anchor unit) is recorded.
+
+    Returns:
+        ``{absolute_file_path: {reference_designator: anchor_uuid}}``.
     """
     root = os.path.realpath(schematic_path)
-    refs_by_file: dict[str, set[str]] = {}
+    refs_by_file: dict[str, dict[str, str]] = {}
     visited: set[str] = set()
     queue: list[str] = [root]
 
@@ -494,24 +519,44 @@ def _collect_hierarchy_references(schematic_path: str) -> dict[str, set[str]]:
             continue
         visited.add(current)
 
-        try:
-            text = Path(current).read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
+        if not os.path.isfile(current):
             continue
 
-        ref_set: set[str] = set()
-        for m in _REFERENCE_RE.finditer(text):
-            ref_set.add(m.group(1))
-        refs_by_file[current] = ref_set
+        try:
+            sch = safe_schematic(current)
+        except Exception:
+            continue
 
+        # Collect refs from placed symbols — sch.symbol excludes lib_symbols.
+        ref_to_uuid: dict[str, str] = {}
+        for sym in sch.symbol:
+            try:
+                # Prefer instances.path.reference (KiCad's authoritative reference)
+                # over property.Reference which can be stale after manual edits.
+                ref = _read_instance_reference(sym)
+                if ref is None:
+                    ref = sym.property.Reference.value
+                sym_uuid = sym.uuid.value
+            except AttributeError:
+                continue
+            unit = getattr(getattr(sym, "unit", None), "value", 1)
+            # For multi-unit symbols, keep only the anchor unit's UUID.
+            if ref not in ref_to_uuid or unit == 1:
+                ref_to_uuid[ref] = sym_uuid
+        refs_by_file[current] = ref_to_uuid
+
+        # Follow sheet hierarchy via skip's sheet wrapper.
         parent_dir = os.path.dirname(current)
-        for m in _SHEET_FILE_RE.finditer(text):
-            child_file = m.group(1)
-            if not os.path.isabs(child_file):
-                child_file = os.path.join(parent_dir, child_file)
-            child_real = os.path.realpath(child_file)
-            if child_real not in visited:
-                queue.append(child_real)
+        raw_sheets = getattr(sch, "sheet", None)
+        for s in _normalize_collection(raw_sheets):
+            info = _sheet_dict_from_wrapper(s)
+            sheet_file = info.get("sheet_file")
+            if sheet_file:
+                if not os.path.isabs(sheet_file):
+                    sheet_file = os.path.join(parent_dir, sheet_file)
+                child_real = os.path.realpath(sheet_file)
+                if child_real not in visited:
+                    queue.append(child_real)
 
     return refs_by_file
 
@@ -533,7 +578,7 @@ def _next_reference(sch: Any, prefix: str, schematic_path: str | None = None) ->
     try:
         for sym in sch.symbol:
             try:
-                ref_val = sym.property.Reference.value
+                ref_val = _read_instance_reference(sym) or sym.property.Reference.value
                 m = suffix_re.match(ref_val)
                 if m:
                     max_n = max(max_n, int(m.group(1)))
@@ -553,7 +598,7 @@ def _next_reference(sch: Any, prefix: str, schematic_path: str | None = None) ->
             # Skip the current file — we already scanned its refs above.
             if os.path.normpath(file_path) == os.path.normpath(schematic_path):
                 continue
-            for ref_str in ref_set:
+            for ref_str in ref_set.keys():
                 m = suffix_re.match(ref_str)
                 if m:
                     max_n = max(max_n, int(m.group(1)))
@@ -1684,6 +1729,9 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
                     ref_prop.value = target_reference
                 else:
                     return {"error": f"Symbol {current_reference!r} has no Reference property"}
+                # Also update instances.path.reference — KiCad uses this as the
+                # authoritative display reference.
+                _update_instance_reference(sym, target_reference)
 
             try:
                 save_schematic(schematic_path, sch)
@@ -2346,7 +2394,9 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
 
         Returns:
             dict with keys: success (bool), root_schematic (str or null),
-            schematics_scanned (int), conflicts (list of {reference, sheets}).
+            schematics_scanned (int), conflicts (list of
+            ``{reference, instances: [{sheet, uuid}]}``).
+            For multi-unit symbols only the anchor unit's UUID is reported.
         """
         if not schematic_path.endswith(".kicad_sch"):
             return {"error": f"Not a .kicad_sch file: {schematic_path!r}"}
@@ -2366,16 +2416,21 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
         root_sch = _find_root_schematic(schematic_path) or schematic_path
         refs_by_file = _collect_hierarchy_references(root_sch)
 
-        # Invert: reference → list of files where it appears.
-        ref_to_files: dict[str, list[str]] = {}
-        for file_path, ref_set in refs_by_file.items():
-            for ref_str in ref_set:
-                ref_to_files.setdefault(ref_str, []).append(file_path)
+        # Invert: reference → list of {sheet, uuid} dicts.
+        ref_to_instances: dict[str, list[dict[str, str]]] = {}
+        for file_path, ref_dict in refs_by_file.items():
+            for ref_str, ref_uuid in ref_dict.items():
+                ref_to_instances.setdefault(ref_str, []).append(
+                    {"sheet": file_path, "uuid": ref_uuid}
+                )
 
         conflicts = [
-            {"reference": ref_str, "sheets": sorted(file_list)}
-            for ref_str, file_list in ref_to_files.items()
-            if len(file_list) > 1
+            {
+                "reference": ref_str,
+                "instances": sorted(info_list, key=lambda x: x["sheet"]),
+            }
+            for ref_str, info_list in ref_to_instances.items()
+            if len(info_list) > 1
         ]
         conflicts.sort(key=lambda c: c["reference"])
 
