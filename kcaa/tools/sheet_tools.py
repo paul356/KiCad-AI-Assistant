@@ -574,6 +574,7 @@ def _do_add_sheet_symbol(
 def _do_remove_sheet_symbol(
     schematic_path: str,
     sheet_identifier: str,
+    delete_child: bool = False,
 ) -> dict[str, Any]:
     """Implementation of remove_sheet_symbol."""
     import sexpdata
@@ -627,7 +628,7 @@ def _do_remove_sheet_symbol(
     # Save the modified schematic
     backup_path = save_schematic(schematic_path, sch)
 
-    return {
+    result: dict[str, Any] = {
         "success": True,
         "removed_uuid": target_sheet.get("uuid"),
         "removed_name": target_sheet.get("sheet_name"),
@@ -635,6 +636,25 @@ def _do_remove_sheet_symbol(
         "file_modified": schematic_path,
         "backup_path": backup_path,
     }
+
+    # Optionally delete the child .kicad_sch file
+    if delete_child:
+        child_file = target_sheet.get("sheet_file")
+        if child_file:
+            parent_dir = os.path.dirname(os.path.abspath(schematic_path))
+            child_path = (
+                child_file if os.path.isabs(child_file) else os.path.join(parent_dir, child_file)
+            )
+            if os.path.isfile(child_path):
+                try:
+                    os.remove(child_path)
+                    result["deleted_child_path"] = child_path
+                except OSError as exc:
+                    result["child_delete_error"] = str(exc)
+            else:
+                result["child_delete_skipped"] = f"File not found: {child_path}"
+
+    return result
 
 
 def _do_update_sheet_symbol(
@@ -1059,68 +1079,7 @@ def register_sheet_tools(mcp: FastMCP) -> None:
         """
         return _get_sheet_hierarchy_impl(schematic_path, max_depth)
 
-    # ---- Create tools ----
-
-    @mcp.tool()
-    async def create_child_sheet(
-        parent_path: str,
-        child_filename: str,
-        paper: str = "A4",
-        title: str | None = None,
-        ctx: Context | None = None,
-    ) -> dict[str, Any]:
-        """Create a minimal valid child ``.kicad_sch`` file for a hierarchical sheet.
-
-        Does NOT modify the parent schematic — use ``add_sheet_symbol`` to
-        add the corresponding sheet symbol after creating the child file.
-
-        **File mutation** — writes a new ``.kicad_sch`` file to disk.
-
-        Args:
-            parent_path: Absolute path to the parent ``.kicad_sch`` file.
-                Used to resolve the directory for *child_filename*.
-            child_filename: Filename for the new schematic (e.g.
-                ``"power-supply.kicad_sch"``).  ``.kicad_sch`` is appended
-                if missing.  May be an absolute path.
-            paper: Paper size name (default ``"A4"``).  Valid: A4, A3, A2,
-                A5, A, B, C, D, E, USLetter, USLegal, USLedger.
-            title: Optional title for the child sheet's title block.
-
-        Returns:
-            dict with keys:
-                - ``success`` (bool)
-                - ``child_path`` (str): absolute path to the created file
-                - ``child_uuid`` (str): the root UUID of the new file
-        """
-        if not parent_path.endswith(".kicad_sch"):
-            return {"error": f"Not a .kicad_sch file: {parent_path!r}"}
-        if not os.path.isfile(parent_path):
-            return {"error": f"Schematic file not found: {parent_path!r}"}
-        if paper not in _PAPER_SIZES:
-            return {
-                "error": f"Unknown paper size {paper!r}. Valid: {', '.join(sorted(_PAPER_SIZES))}"
-            }
-        try:
-            child_path = _generate_child_schematic(
-                parent_path, child_filename, paper=paper, title=title
-            )
-            # Read back the UUID for the response
-            child_sch = safe_schematic(child_path)
-            child_uuid = child_sch.uuid.value
-            return {
-                "success": True,
-                "child_path": child_path,
-                "child_uuid": child_uuid,
-            }
-        except FileExistsError as e:
-            return {"error": str(e)}
-        except ValueError as e:
-            return {"error": str(e)}
-        except Exception as e:
-            log.exception("Error creating child schematic")
-            return {"error": f"Failed to create child schematic: {e}"}
-
-    # ---- CUD tools (stubs — implemented in later phases) ----
+    # ---- Create / Update / Delete tools ----
 
     @mcp.tool()
     async def add_sheet_symbol(
@@ -1216,6 +1175,7 @@ def register_sheet_tools(mcp: FastMCP) -> None:
     async def remove_sheet_symbol(
         schematic_path: str,
         sheet_identifier: str,
+        delete_child: bool = False,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Remove a sheet symbol from a schematic.
@@ -1223,13 +1183,19 @@ def register_sheet_tools(mcp: FastMCP) -> None:
         Args:
             schematic_path: Absolute path to the target ``.kicad_sch`` file.
             sheet_identifier: UUID or sheet name of the sheet symbol to remove.
+            delete_child: If True, also delete the referenced child
+                ``.kicad_sch`` file from disk. Default is False (only removes
+                the symbol from the parent schematic).
 
         Returns:
-            dict with keys: success, removed_uuid, removed_name, orphaned_files.
+            dict with keys: success, removed_uuid, removed_name, removed_file,
+            file_modified, backup_path. When delete_child is True, also
+            deleted_child_path (on success) or child_delete_error (on failure).
         """
         return _do_remove_sheet_symbol(
             schematic_path=schematic_path,
             sheet_identifier=sheet_identifier,
+            delete_child=delete_child,
         )
 
     @mcp.tool()

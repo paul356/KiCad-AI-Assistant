@@ -88,12 +88,6 @@ TOOL_POLICIES: dict[str, ToolPolicy] = {
     # Sheet tools
     "list_sheet_symbols": ToolPolicy(kind="query"),
     "get_sheet_hierarchy": ToolPolicy(kind="query"),
-    "create_child_sheet": ToolPolicy(
-        kind="file_mutation",
-        path_arg="parent_path",
-        auto_snapshot=False,
-        mark_dirty=False,
-    ),
     "add_sheet_symbol": ToolPolicy(
         kind="file_mutation",
         path_arg="schematic_path",

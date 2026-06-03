@@ -590,7 +590,6 @@ class TestToolPolicyRegistry:
             "delete_label_from_schematic",
             "list_sheet_symbols",
             "get_sheet_hierarchy",
-            "create_child_sheet",
             "add_sheet_symbol",
             "remove_sheet_symbol",
             "update_sheet_symbol",
