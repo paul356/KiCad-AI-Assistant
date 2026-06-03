@@ -1163,6 +1163,115 @@ class TestMoveComponent:
                 continue
         pytest.fail("R1 not found in written schematic")
 
+    def test_move_overlap_adjusts_to_nearest_free(self, tools, tmp_sch):
+        """Moving a component onto another should auto-adjust to the nearest
+        conflict-free position, not just any free spot."""
+        import sexpdata
+
+        from kcaa.tools.placement_helpers import PlacementHelpers
+        from kcaa.tools.sheet_tools import _align_to_grid
+        from kcaa.utils.netlist_parser import extract_netlist
+
+        target_x = 100.0
+        target_y = 100.0  # R2 is at (100, 100) — guaranteed overlap.
+
+        # Read R1's current at position and UUID from the fixture.
+        sch = skip.Schematic(tmp_sch)
+        r1_uuid = None
+        r1_at_x = r1_at_y = None
+        for sym in sch.symbol:
+            try:
+                if sym.property.Reference.value == "R1":
+                    r1_at = sym.at.value
+                    r1_at_x, r1_at_y = float(r1_at[0]), float(r1_at[1])
+                    # Extract UUID from S-expression tree.
+                    for i, child in enumerate(sym._pv._tree):
+                        if (
+                            isinstance(child, list)
+                            and len(child) >= 2
+                            and isinstance(child[0], sexpdata.Symbol)
+                            and child[0].value() == "uuid"
+                        ):
+                            r1_uuid = child[1]
+                            break
+                    break
+            except AttributeError:
+                continue
+        assert r1_uuid is not None, "R1 UUID not found"
+        assert r1_at_x is not None, "R1 position not found"
+
+        # Get R1's body_bbox dimensions.
+        netlist = extract_netlist(tmp_sch)
+        bb_d = (netlist.get("components") or {}).get("R1", {}).get("body_bbox")
+        assert bb_d is not None, "R1 body_bbox not in netlist"
+        bbox_w = float(bb_d["max_x"]) - float(bb_d["min_x"])
+        bbox_h = float(bb_d["max_y"]) - float(bb_d["min_y"])
+
+        # Independently compute the expected nearest free position.
+        snapped_w = _align_to_grid(bbox_w)
+        snapped_h = _align_to_grid(bbox_h)
+        snapped_tx = _align_to_grid(target_x)
+        snapped_ty = _align_to_grid(target_y)
+        candidate = PlacementHelpers.find_free_area(
+            schematic_path=tmp_sch,
+            width=snapped_w,
+            height=snapped_h,
+            prefer_near={"x": snapped_tx, "y": snapped_ty},
+            max_candidates=1,
+            exclude_uuid=r1_uuid,
+        )["candidates"][0]["origin"]
+        cand_x, cand_y = float(candidate["x"]), float(candidate["y"])
+
+        # find_free_area returns a bbox origin; move_component converts it to
+        # a symbol at-position via:  at = bbox_origin - (bb_min - original_at).
+        off_x = float(bb_d["min_x"]) - r1_at_x
+        off_y = float(bb_d["min_y"]) - r1_at_y
+        expected_x = _align_to_grid(cand_x - off_x)
+        expected_y = _align_to_grid(cand_y - off_y)
+
+        result = asyncio.run(
+            tools["move_component"](
+                schematic_path=tmp_sch,
+                reference="R1",
+                x=target_x,
+                y=target_y,
+            )
+        )
+        assert result["success"] is True, result
+        assert result["position_adjusted"] is True, (
+            f"Expected adjustment, got position={result.get('position')}"
+        )
+        # requested_position reflects the grid-snapped target, not raw input.
+        assert result["requested_position"] == {
+            "x": snapped_tx,
+            "y": snapped_ty,
+        }
+        assert result["position"]["x"] == pytest.approx(expected_x)
+        assert result["position"]["y"] == pytest.approx(expected_y)
+        assert result["note"] == "Position adjusted to nearest free area to avoid overlap."
+
+    def test_move_no_overlap_keeps_exact_position(self, tools, tmp_sch):
+        """When the target position is free, move_component uses it as-is."""
+        from kcaa.tools.sheet_tools import _align_to_grid
+
+        target_x = 55.88  # 44 * 1.27 — grid-aligned
+        target_y = 10.16  # 8 * 1.27 — far from the component cluster (~Y=100).
+
+        result = asyncio.run(
+            tools["move_component"](
+                schematic_path=tmp_sch,
+                reference="R1",
+                x=target_x,
+                y=target_y,
+            )
+        )
+        assert result["success"] is True, result
+        assert result.get("position_adjusted") is False, (
+            f"Expected no adjustment at free position, got note={result.get('note')}"
+        )
+        assert abs(result["position"]["x"] - _align_to_grid(target_x)) < 0.001
+        assert abs(result["position"]["y"] - _align_to_grid(target_y)) < 0.001
+
     def test_move_creates_backup(self, tools, tmp_sch):
         """A .bak file should appear next to the schematic after moving."""
         asyncio.run(
