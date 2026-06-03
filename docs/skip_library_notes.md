@@ -72,28 +72,7 @@ def _iter_schematic_labels(sch, attr_name):
 
 ---
 
-## 2. `global_label` 在空 schematic 上的行为
-
-### 问题描述
-
-虽然 `global_label` 有专用集合类，但在某些 schematic 上（如单元测试 fixture）直接调用 `sch.global_label.new()` 可能抛 `AttributeError`（取决于 skip 版本和 schematic 内容）。
-
-### 变通方案
-
-```python
-try:
-    lbl = sch.global_label.new()
-except AttributeError:
-    from skip.element_template import ElementTemplate
-    lbl = sch.new_from_list(list(ElementTemplate['global_label']))
-lbl.value = text
-lbl.at.value = [x, y, angle]
-lbl.shape.value = shape
-```
-
----
-
-## 3. `ElementTemplate` 缺少 `hierarchical_label` 条目
+## 2. `ElementTemplate` 缺少 `hierarchical_label` 条目
 
 ### 问题描述
 
