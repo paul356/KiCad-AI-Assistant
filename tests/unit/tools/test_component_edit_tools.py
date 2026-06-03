@@ -1585,6 +1585,44 @@ class TestRenameSymbol:
         )
         assert "error" in result
 
+    def test_auto_assign_next_reference(self, tools, tmp_sch):
+        """When to_reference is omitted, auto-assign the next free reference."""
+        result = asyncio.run(
+            tools["rename_symbol"](
+                schematic_path=tmp_sch,
+                from_reference="R1",
+                # to_reference omitted — auto-assign
+            )
+        )
+        assert result.get("success") is True, result
+        assert result["auto_assigned"] is True
+        # tmp_sch has R1..R7, so next should be R8.
+        assert result["to_reference"] == "R8"
+
+        # Verify R1 is gone and R8 is present.
+        sch = skip.Schematic(tmp_sch)
+        refs = set()
+        for sym in sch.symbol:
+            try:
+                refs.add(sym.property.Reference.value)
+            except AttributeError:
+                continue
+        assert "R1" not in refs
+        assert "R8" in refs
+
+    def test_explicit_to_reference_not_auto_assigned(self, tools, tmp_sch):
+        """When to_reference is provided, auto_assigned should be False."""
+        result = asyncio.run(
+            tools["rename_symbol"](
+                schematic_path=tmp_sch,
+                from_reference="R1",
+                to_reference="R10",
+            )
+        )
+        assert result.get("success") is True, result
+        assert result["auto_assigned"] is False
+        assert result["to_reference"] == "R10"
+
     def test_file_not_found(self, tools):
         """Non-existent file should return an error."""
         result = asyncio.run(

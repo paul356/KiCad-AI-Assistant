@@ -1537,7 +1537,7 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
     async def rename_symbol(
         schematic_path: str,
         from_reference: str,
-        to_reference: str,
+        to_reference: str | None = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Rename a symbol's reference designator in a schematic.
@@ -1546,18 +1546,22 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
         identified by *from_reference*.  A backup (.kicad_sch.bak) is
         written before saving.
 
-        This is a convenience wrapper around ``set_component_property``
-        that uses more intuitive parameter names and adds an existence
-        check for the target reference.
+        If *to_reference* is omitted, the next available reference for the
+        same prefix is auto-assigned (scanning all project ``*.kicad_sch``
+        files to avoid cross-sheet conflicts).
 
         Args:
             schematic_path: Absolute path to the target .kicad_sch file.
             from_reference: Current reference designator (e.g. "R1").
-            to_reference: New reference designator (e.g. "R10").
+            to_reference: New reference designator (e.g. "R10").  When
+                ``None`` (default), the next free reference for the same
+                prefix is assigned automatically.
 
         Returns:
-            dict with keys: success (bool), from_reference, to_reference,
-            units_updated (int), file_modified, backup_path.
+            dict with keys: success (bool), from_reference, to_reference
+            (the final reference used), units_updated (int), file_modified,
+            backup_path, and auto_assigned (bool, ``True`` when
+            *to_reference* was auto-generated).
         """
         if not schematic_path.endswith(".kicad_sch"):
             return {"error": f"Not a .kicad_sch file: {schematic_path!r}"}
@@ -1565,9 +1569,7 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
             return {"error": f"Schematic file not found: {schematic_path!r}"}
         if not from_reference:
             return {"error": "from_reference must not be empty"}
-        if not to_reference:
-            return {"error": "to_reference must not be empty"}
-        if from_reference == to_reference:
+        if to_reference is not None and from_reference == to_reference:
             return {"error": "from_reference and to_reference are the same"}
 
         try:
@@ -1591,10 +1593,20 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
             if not units:
                 return {"error": f"No symbol with reference {from_reference!r} found"}
 
-            # Check that to_reference does not already exist.
+            # Auto-assign to_reference if not provided.
+            auto_assigned = False
+            if to_reference is None:
+                # Extract the prefix from from_reference (e.g. "R" from "R1").
+                prefix_match = re.match(r"^([A-Za-z]+)", from_reference)
+                prefix = prefix_match.group(1) if prefix_match else "U"
+                to_reference = _next_reference(sch, prefix, schematic_path=schematic_path)
+                auto_assigned = True
+
+            # Check that to_reference does not already exist (skip the
+            # symbol being renamed itself).
             for sym in sch.symbol:
                 try:
-                    if sym.property.Reference.value == to_reference:
+                    if sym not in units and sym.property.Reference.value == to_reference:
                         return {
                             "error": f"Target reference {to_reference!r} already exists in this schematic"
                         }
@@ -1618,6 +1630,7 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
                 "success": True,
                 "from_reference": from_reference,
                 "to_reference": to_reference,
+                "auto_assigned": auto_assigned,
                 "units_updated": len(units),
                 "file_modified": schematic_path,
                 "backup_path": schematic_path + ".bak",
