@@ -864,8 +864,8 @@ class TestUpdateSheetSymbol:
                 "sheet_identifier": target_uuid,
                 "sheet_name": "Multi Update",
                 "sheet_file": "multi.kicad_sch",
-                "x": 50.8,  # 40 * 1.27
-                "y": 63.5,  # 50 * 1.27
+                "x": 10.16,  # 8 * 1.27 — far from other sheets
+                "y": 10.16,  # 8 * 1.27
                 "width": 76.2,  # 60 * 1.27
                 "height": 88.9,  # 70 * 1.27
             },
@@ -879,8 +879,8 @@ class TestUpdateSheetSymbol:
         updated_sheet = next(s for s in list_result["sheets"] if s["uuid"] == target_uuid)
         assert updated_sheet["sheet_name"] == "Multi Update"
         assert updated_sheet["sheet_file"] == "multi.kicad_sch"
-        assert abs(updated_sheet["position"]["x"] - 50.8) < 0.01
-        assert abs(updated_sheet["position"]["y"] - 63.5) < 0.01
+        assert abs(updated_sheet["position"]["x"] - 10.16) < 0.01
+        assert abs(updated_sheet["position"]["y"] - 10.16) < 0.01
         assert abs(updated_sheet["size"]["width"] - 76.2) < 0.01
         assert abs(updated_sheet["size"]["height"] - 88.9) < 0.01
 

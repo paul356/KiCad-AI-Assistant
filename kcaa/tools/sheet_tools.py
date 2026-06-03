@@ -1131,17 +1131,64 @@ def register_sheet_tools(mcp: FastMCP) -> None:
         requested_position = {"x": x, "y": y}
         snapped_x = _align_to_grid(x)
         snapped_y = _align_to_grid(y)
-        place_x = x
-        place_y = y
+        eff_w = _align_to_grid(width)
+        eff_h = _align_to_grid(height)
+        place_x = snapped_x
+        place_y = snapped_y
         position_adjusted = False
 
-        if True:
+        # Check if the requested position conflicts with existing objects.
+        from kcaa.tools.placement_helpers import (
+            _default_title_block_bbox,
+            _parse_paper_size,
+            _sheet_symbol_bbox,
+        )
+        from kcaa.utils.netlist_parser import extract_netlist
+        from kcaa.utils.symbol_geometry import BBox, bboxes_overlap, inflate_bbox
+
+        cand_bbox = BBox(snapped_x, snapped_y, snapped_x + eff_w, snapped_y + eff_h)
+        MARGIN = 3.81
+        occupied: list[BBox] = []
+
+        # Other sheet symbols.
+        sheet_info = _list_sheet_symbols_impl(schematic_path)
+        for sheet in sheet_info.get("sheets", []):
+            bb = _sheet_symbol_bbox(sheet)
+            if bb is not None:
+                occupied.append(inflate_bbox(bb, MARGIN))
+
+        # Symbol components.
+        netlist = extract_netlist(schematic_path)
+        for ref, comp in (netlist.get("components", {}) or {}).items():
+            if comp.get("type") == "sheet":
+                continue
+            bb_d = comp.get("body_bbox")
+            if not bb_d:
+                continue
+            try:
+                bb = BBox(
+                    float(bb_d["min_x"]),
+                    float(bb_d["min_y"]),
+                    float(bb_d["max_x"]),
+                    float(bb_d["max_y"]),
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+            occupied.append(inflate_bbox(bb, MARGIN))
+
+        # Title block.
+        _, sheet_w, sheet_h, _ = _parse_paper_size(schematic_path)
+        occupied.append(_default_title_block_bbox(sheet_w, sheet_h))
+
+        has_conflict = any(bboxes_overlap(cand_bbox, occ) for occ in occupied)
+
+        if has_conflict:
             from kcaa.tools.placement_helpers import PlacementHelpers
 
             free_area = PlacementHelpers.find_free_area(
                 schematic_path=schematic_path,
-                width=_align_to_grid(width),
-                height=_align_to_grid(height),
+                width=eff_w,
+                height=eff_h,
                 prefer_near={"x": snapped_x, "y": snapped_y},
                 max_candidates=1,
             )
@@ -1237,7 +1284,14 @@ def register_sheet_tools(mcp: FastMCP) -> None:
         requested_position: dict[str, Any] | None = None
 
         if x is not None or y is not None:
-            from kcaa.tools.placement_helpers import PlacementHelpers
+            from kcaa.tools.placement_helpers import (
+                PlacementHelpers,
+                _default_title_block_bbox,
+                _parse_paper_size,
+                _sheet_symbol_bbox,
+            )
+            from kcaa.utils.netlist_parser import extract_netlist
+            from kcaa.utils.symbol_geometry import BBox, bboxes_overlap, inflate_bbox
 
             # Look up current sheet to fill in missing axis and get UUID/size.
             sheet_info = _list_sheet_symbols_impl(schematic_path)
@@ -1261,25 +1315,67 @@ def register_sheet_tools(mcp: FastMCP) -> None:
                 eff_w = _align_to_grid(width if width is not None else cur_w)
                 eff_h = _align_to_grid(height if height is not None else cur_h)
 
-                free_area = PlacementHelpers.find_free_area(
-                    schematic_path=schematic_path,
-                    width=eff_w,
-                    height=eff_h,
-                    prefer_near={"x": req_x, "y": req_y},
-                    max_candidates=1,
-                    exclude_uuid=sheet_uuid,
-                )
-                candidate = (free_area.get("candidates") or [{}])[0]
-                origin = candidate.get("origin")
-                if origin is not None:
-                    cand_x = float(origin["x"])
-                    cand_y = float(origin["y"])
-                    # Lock axes that were not explicitly specified by the caller.
-                    if x is None:
-                        cand_x = cur_x
-                    if y is None:
-                        cand_y = cur_y
-                    if cand_x != req_x or cand_y != req_y:
+                # Build the candidate bbox at the requested position.
+                cand_bbox = BBox(req_x, req_y, req_x + eff_w, req_y + eff_h)
+                MARGIN = 3.81
+
+                # Collect occupied areas: other sheets + components + title block.
+                occupied: list[BBox] = []
+
+                # Other sheet symbols (exclude the sheet being updated).
+                for sheet in sheet_info.get("sheets", []):
+                    if sheet.get("uuid") == sheet_uuid:
+                        continue
+                    bb = _sheet_symbol_bbox(sheet)
+                    if bb is not None:
+                        occupied.append(inflate_bbox(bb, MARGIN))
+
+                # Symbol components.
+                netlist = extract_netlist(schematic_path)
+                for ref, comp in (netlist.get("components", {}) or {}).items():
+                    if comp.get("type") == "sheet":
+                        continue
+                    bb_d = comp.get("body_bbox")
+                    if not bb_d:
+                        continue
+                    try:
+                        bb = BBox(
+                            float(bb_d["min_x"]),
+                            float(bb_d["min_y"]),
+                            float(bb_d["max_x"]),
+                            float(bb_d["max_y"]),
+                        )
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    occupied.append(inflate_bbox(bb, MARGIN))
+
+                # Title block.
+                _, sheet_w, sheet_h, _ = _parse_paper_size(schematic_path)
+                occupied.append(_default_title_block_bbox(sheet_w, sheet_h))
+
+                # Check if the requested position overlaps anything.
+                has_conflict = any(bboxes_overlap(cand_bbox, occ) for occ in occupied)
+
+                if has_conflict:
+                    # Conflict detected — find the nearest free area.
+                    free_area = PlacementHelpers.find_free_area(
+                        schematic_path=schematic_path,
+                        width=eff_w,
+                        height=eff_h,
+                        prefer_near={"x": req_x, "y": req_y},
+                        max_candidates=1,
+                        exclude_uuid=sheet_uuid,
+                    )
+                    candidate = (free_area.get("candidates") or [{}])[0]
+                    origin = candidate.get("origin")
+                    if origin is not None:
+                        cand_x = float(origin["x"])
+                        cand_y = float(origin["y"])
+                        # Lock axes that were not explicitly specified by the caller.
+                        if x is None:
+                            cand_x = cur_x
+                        if y is None:
+                            cand_y = cur_y
                         requested_position = {"x": x, "y": y}
                         place_x = cand_x
                         place_y = cand_y

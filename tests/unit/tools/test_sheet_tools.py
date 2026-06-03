@@ -81,7 +81,6 @@ class TestAddSheetSymbol:
                 y=requested_y,
                 width=width,
                 height=height,
-                auto_place=True,
             )
         )
 
@@ -107,7 +106,6 @@ class TestUpdateSheetSymbol:
                 y=y,
                 width=50.8,
                 height=50.8,
-                auto_place=False,
             )
         )
         assert result["success"] is True, result
@@ -122,14 +120,13 @@ class TestUpdateSheetSymbol:
         # Place the target sheet at (200, 200) — far from blocker.
         target_uuid = self._add_sheet(tools, tmp_sch, "Target", 200.0, 200.0)
 
-        # Try to move Target onto the blocker (20, 20).
+        # Try to move Target onto the blocker (20, 20) — should auto-adjust.
         result = asyncio.run(
             tools["update_sheet_symbol"](
                 schematic_path=tmp_sch,
                 sheet_identifier=target_uuid,
                 x=20.0,
                 y=20.0,
-                auto_place=True,
             )
         )
         assert result["success"] is True, result
@@ -144,23 +141,24 @@ class TestUpdateSheetSymbol:
                 and pytest.approx(actual_pos.get("y")) == _align_to_grid(20.0)
             )
 
-    def test_auto_place_false_keeps_exact_position(self, tools, tmp_sch):
-        """With auto_place=False, position is used as-is even if it overlaps."""
+    def test_no_conflict_keeps_exact_position(self, tools, tmp_sch):
+        """When the requested position is free, it is used as-is."""
 
-        # Place two overlapping sheets.
+        # Place one sheet far away — no conflict with target position.
         self._add_sheet(tools, tmp_sch, "Obstacle2", 30.0, 30.0)
         target_uuid = self._add_sheet(tools, tmp_sch, "Target2", 250.0, 250.0)
 
+        # Move to a free position (200, 10.16) — far from obstacle and components.
         result = asyncio.run(
             tools["update_sheet_symbol"](
                 schematic_path=tmp_sch,
                 sheet_identifier=target_uuid,
-                x=30.0,
-                y=30.0,
-                auto_place=False,
+                x=200.0,
+                y=10.16,
             )
         )
         assert result["success"] is True, result
+        # No conflict → no adjustment.
         assert result.get("position_adjusted") is False
 
     def test_size_only_change_skips_auto_place(self, tools, tmp_sch):
@@ -173,7 +171,6 @@ class TestUpdateSheetSymbol:
                 sheet_identifier=target_uuid,
                 width=76.2,
                 height=76.2,
-                auto_place=True,
             )
         )
         assert result["success"] is True, result
@@ -189,7 +186,6 @@ class TestUpdateSheetSymbol:
                 schematic_path=tmp_sch,
                 sheet_identifier=target_uuid,
                 x=185.0,
-                auto_place=True,
             )
         )
         assert result["success"] is True, result
