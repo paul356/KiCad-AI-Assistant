@@ -69,28 +69,6 @@ def _sexp_property(name: str, value: str, indent: int = 2) -> str:
     )
 
 
-def _sexp_sheet_pin(
-    name: str,
-    edge: str,
-    distance_mm: float,
-    indent: int = 2,
-) -> str:
-    """Build a ``(pin ...)`` S-expression for a sheet pin.
-
-    *edge* is one of ``"right"``, ``"left"``, ``"bottom"``, ``"top"``.
-    *distance_mm* is the offset along that edge from its origin corner.
-    """
-    edge_to_rotation = {"right": 0, "left": 180, "bottom": 270, "top": 90}
-    rot = edge_to_rotation.get(edge, 0)
-    # Pin anchor is placed at the edge midpoint at the right distance
-    return (
-        f'{" " * indent}(pin "{name}"'
-        f" (at {_align_to_grid(distance_mm):.2f} {_align_to_grid(0):.2f} {rot})"
-        f' (uuid "{uuid.uuid4()}")'
-        f" (effects (font (size 1.27 1.27)) (justify left)))"
-    )
-
-
 # ---------------------------------------------------------------------------
 # Child schematic file generation
 # ---------------------------------------------------------------------------
@@ -498,36 +476,43 @@ def _do_add_sheet_symbol(
     # Add pins if provided
     pins_created = 0
     if pins:
+        edge_to_rotation = {"right": 0, "left": 180, "bottom": 270, "top": 90}
+        # justify follows the angle: angle 0/90 (right/top) → justify right;
+        # angle 180/270 (left/bottom) → justify left.
+        edge_to_justify = {"right": "right", "top": "right", "left": "left", "bottom": "left"}
+
         for pin_def in pins:
             pin_name = pin_def.get("name")
             edge = pin_def.get("edge", "right")
-            distance_mm = pin_def.get("distance_mm", 0.0)
+            distance_mm = float(pin_def.get("distance_mm", 0.0))
             if not pin_name:
                 continue
 
-            # Calculate pin position based on edge
-            edge_to_rotation = {"right": 0, "left": 180, "bottom": 270, "top": 90}
             rot = edge_to_rotation.get(edge, 0)
+            justify = edge_to_justify.get(edge, "left")
+            d = _align_to_grid(distance_mm)
 
-            # Position along the edge
-            if edge in ("left", "right"):
-                pin_x = _align_to_grid(distance_mm)
-                pin_y = 0.0
-            else:  # top, bottom
-                pin_x = _align_to_grid(distance_mm)
-                pin_y = 0.0
+            # Absolute pin connection point on the sheet boundary.
+            if edge == "right":
+                pin_x, pin_y = x + width, y + d
+            elif edge == "left":
+                pin_x, pin_y = x, y + d
+            elif edge == "top":
+                pin_x, pin_y = x + d, y
+            else:  # bottom
+                pin_x, pin_y = x + d, y + height
 
             pin_uuid = str(uuid.uuid4())
             pin_entry = [
                 sexpdata.Symbol("pin"),
                 pin_name,
-                sexpdata.Symbol("input"),  # default shape
+                sexpdata.Symbol("input"),
                 [sexpdata.Symbol("at"), pin_x, pin_y, rot],
                 [sexpdata.Symbol("uuid"), pin_uuid],
                 [
                     sexpdata.Symbol("effects"),
                     [sexpdata.Symbol("font"), [sexpdata.Symbol("size"), 1.27, 1.27]],
-                    [sexpdata.Symbol("justify"), sexpdata.Symbol("left")],
+                    [sexpdata.Symbol("justify"), sexpdata.Symbol(justify)],
                 ],
             ]
             sheet_entry.append(pin_entry)
