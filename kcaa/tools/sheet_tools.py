@@ -1099,6 +1099,7 @@ def register_sheet_tools(mcp: FastMCP) -> None:
         create_child: bool = False,
         child_paper: str = "A4",
         child_title: str | None = None,
+        auto_place: bool = True,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Add a hierarchical sheet symbol to a schematic.
@@ -1119,17 +1120,48 @@ def register_sheet_tools(mcp: FastMCP) -> None:
                 disk before adding the sheet symbol.
             child_paper: Paper size for the child file (default ``"A4"``).
             child_title: Optional title for the child file's title block.
+            auto_place: When True (default), move the sheet to the nearest free
+                area if the requested position would overlap an existing symbol
+                or sheet.
 
         Returns:
             dict with keys: success, sheet_uuid, position, size, pins_created,
-            child_path (if create_child was True).
+            child_path (if create_child was True), and ``position_adjusted``
+            when auto-placement changes the requested location.
         """
-        return _do_add_sheet_symbol(
+        requested_position = {"x": x, "y": y}
+        snapped_x = _align_to_grid(x)
+        snapped_y = _align_to_grid(y)
+        place_x = x
+        place_y = y
+        position_adjusted = False
+
+        if auto_place:
+            from kcaa.tools.placement_helpers import PlacementHelpers
+
+            free_area = PlacementHelpers.find_free_area(
+                schematic_path=schematic_path,
+                width=_align_to_grid(width),
+                height=_align_to_grid(height),
+                prefer_near={"x": snapped_x, "y": snapped_y},
+                max_candidates=1,
+            )
+            candidate = (free_area.get("candidates") or [{}])[0]
+            origin = candidate.get("origin")
+            if origin is not None:
+                candidate_x = float(origin["x"])
+                candidate_y = float(origin["y"])
+                if candidate_x != snapped_x or candidate_y != snapped_y:
+                    place_x = candidate_x
+                    place_y = candidate_y
+                    position_adjusted = True
+
+        result = _do_add_sheet_symbol(
             schematic_path=schematic_path,
             sheet_name=sheet_name,
             sheet_file=sheet_file,
-            x=x,
-            y=y,
+            x=place_x,
+            y=place_y,
             width=width,
             height=height,
             pins=pins,
@@ -1137,6 +1169,12 @@ def register_sheet_tools(mcp: FastMCP) -> None:
             child_paper=child_paper,
             child_title=child_title,
         )
+        if result.get("success"):
+            result["position_adjusted"] = position_adjusted
+            if position_adjusted:
+                result["requested_position"] = requested_position
+                result["note"] = "Position adjusted to nearest free area."
+        return result
 
     @mcp.tool()
     async def remove_sheet_symbol(
