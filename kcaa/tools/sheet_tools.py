@@ -194,17 +194,20 @@ def _generate_child_schematic(
 
 
 def _normalize_collection(value) -> list:
-    """Return *value* as a plain list regardless of whether it is a single
-    ``ParsedValue``, an ``ElementCollection``, a ``list``, or ``None``."""
+    """Return *value* as a regular list for skip wrappers and collections."""
     if value is None:
         return []
-    # ElementCollection has __getitem__ but not __iter__; for-loop works via
-    # __getitem__, but isinstance/iter tests fail.  Try len() first.
+    elements = getattr(value, "_elements", None)
+    if elements is not None:
+        return list(elements)
+    if isinstance(value, list):
+        return value
+    if hasattr(value, "entity_type"):
+        return [value]
     try:
         length = len(value)
     except TypeError:
-        return [value]  # single SheetWrapper / ParsedValue
-    # Iterate by index (ElementCollection doesn't have __iter__)
+        return [value]
     return [value[i] for i in range(length)]
 
 

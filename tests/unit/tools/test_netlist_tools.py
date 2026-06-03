@@ -5,9 +5,13 @@ Mocks extract_netlist and get_project_files so tests are self-contained.
 """
 
 import asyncio
+from pathlib import Path
+import shutil
 from unittest.mock import MagicMock, patch
 
 import pytest
+
+SHEET_SCHEMATIC_PATH = str(Path(__file__).parent / "fixtures/sheet_netlist_test.kicad_sch")
 
 # ---------------------------------------------------------------------------
 # MockMCP — captures @mcp.tool()-decorated coroutines
@@ -235,6 +239,38 @@ class TestExtractSchematicNetlist:
         assert "R1" in analysis["components"]
         assert "R2" in analysis["components"]
         assert "C1" in analysis["components"]
+
+    def test_includes_sheet_components(self, tmp_path):
+        schematic_path = tmp_path / "sheet_netlist_test.kicad_sch"
+        shutil.copy(SHEET_SCHEMATIC_PATH, schematic_path)
+
+        result = _run(self.fn(str(schematic_path), ctx=None))
+
+        assert result["success"] is True, result
+        analysis = result["analysis"]
+        assert analysis["component_count"] == 1
+        assert analysis["component_types"]["sheet"] == 1
+        sheet = analysis["components"]["Power"]
+        assert sheet["type"] == "sheet"
+        assert sheet["value"] == "power.kicad_sch"
+        for key, expected in {
+            "min_x": 50.8,
+            "min_y": 50.8,
+            "max_x": 76.2,
+            "max_y": 76.2,
+        }.items():
+            assert sheet["body_bbox"][key] == pytest.approx(expected)
+        assert sheet["pins"] == [
+            {
+                "num": "VCC",
+                "number": "VCC",
+                "name": "VCC",
+                "x": 76.2,
+                "y": 63.5,
+                "net": "VCC",
+            }
+        ]
+        assert analysis["power_nets"] == [{"name": "VCC", "pin_count": 1}]
 
     @patch("kcaa.tools.netlist_tools.os.path.exists", return_value=True)
     @patch("kcaa.tools.netlist_tools.extract_netlist", return_value=SAMPLE_NETLIST)
