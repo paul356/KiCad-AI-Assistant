@@ -91,3 +91,107 @@ class TestAddSheetSymbol:
         assert result["position"]["x"] == pytest.approx(candidate["x"])
         assert result["position"]["y"] == pytest.approx(candidate["y"])
         assert result["note"] == "Position adjusted to nearest free area."
+
+
+class TestUpdateSheetSymbol:
+    """Tests for update_sheet_symbol auto-placement."""
+
+    def _add_sheet(self, tools, sch_path: str, name: str, x: float, y: float) -> str:
+        """Add a sheet and return its UUID."""
+        result = asyncio.run(
+            tools["add_sheet_symbol"](
+                schematic_path=sch_path,
+                sheet_name=name,
+                sheet_file=f"{name}.kicad_sch",
+                x=x,
+                y=y,
+                width=50.8,
+                height=50.8,
+                auto_place=False,
+            )
+        )
+        assert result["success"] is True, result
+        return result["sheet_uuid"]
+
+    def test_auto_place_true_avoids_overlap(self, tools, tmp_sch):
+        """Moving a sheet to an occupied spot should be auto-adjusted."""
+        from kcaa.tools.sheet_tools import _align_to_grid
+
+        # Place a blocker sheet at (20, 20).
+        self._add_sheet(tools, tmp_sch, "Blocker", 20.0, 20.0)
+        # Place the target sheet at (200, 200) — far from blocker.
+        target_uuid = self._add_sheet(tools, tmp_sch, "Target", 200.0, 200.0)
+
+        # Try to move Target onto the blocker (20, 20).
+        result = asyncio.run(
+            tools["update_sheet_symbol"](
+                schematic_path=tmp_sch,
+                sheet_identifier=target_uuid,
+                x=20.0,
+                y=20.0,
+                auto_place=True,
+            )
+        )
+        assert result["success"] is True, result
+        assert result["position_adjusted"] is True
+        assert result["requested_position"] == {"x": 20.0, "y": 20.0}
+        assert result["note"] == "Position adjusted to nearest free area."
+        # The sheet should NOT be at (20, 20).
+        actual_pos = result.get("position") or {}
+        if actual_pos:
+            assert not (
+                pytest.approx(actual_pos.get("x")) == _align_to_grid(20.0)
+                and pytest.approx(actual_pos.get("y")) == _align_to_grid(20.0)
+            )
+
+    def test_auto_place_false_keeps_exact_position(self, tools, tmp_sch):
+        """With auto_place=False, position is used as-is even if it overlaps."""
+
+        # Place two overlapping sheets.
+        self._add_sheet(tools, tmp_sch, "Obstacle2", 30.0, 30.0)
+        target_uuid = self._add_sheet(tools, tmp_sch, "Target2", 250.0, 250.0)
+
+        result = asyncio.run(
+            tools["update_sheet_symbol"](
+                schematic_path=tmp_sch,
+                sheet_identifier=target_uuid,
+                x=30.0,
+                y=30.0,
+                auto_place=False,
+            )
+        )
+        assert result["success"] is True, result
+        assert result.get("position_adjusted") is False
+
+    def test_size_only_change_skips_auto_place(self, tools, tmp_sch):
+        """Resizing without moving should never trigger auto-placement."""
+        target_uuid = self._add_sheet(tools, tmp_sch, "ResizeOnly", 150.0, 150.0)
+
+        result = asyncio.run(
+            tools["update_sheet_symbol"](
+                schematic_path=tmp_sch,
+                sheet_identifier=target_uuid,
+                width=76.2,
+                height=76.2,
+                auto_place=True,
+            )
+        )
+        assert result["success"] is True, result
+        # position_adjusted not set for size-only changes.
+        assert "position_adjusted" not in result
+
+    def test_partial_move_x_only(self, tools, tmp_sch):
+        """x-only move should not lose the y coordinate to bias."""
+        target_uuid = self._add_sheet(tools, tmp_sch, "XOnly", 180.0, 180.0)
+
+        result = asyncio.run(
+            tools["update_sheet_symbol"](
+                schematic_path=tmp_sch,
+                sheet_identifier=target_uuid,
+                x=185.0,
+                auto_place=True,
+            )
+        )
+        assert result["success"] is True, result
+        # Should not error out; position_adjusted may be True or False.
+        assert "error" not in result

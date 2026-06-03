@@ -149,6 +149,7 @@ def _find_free_area_impl(
     for_library: str | None = None,
     for_symbol: str | None = None,
     rotation: int = 0,
+    exclude_uuid: str | None = None,
 ) -> dict[str, Any]:
     """Core implementation shared by the MCP tool and sheet auto-placement."""
     if not os.path.exists(schematic_path):
@@ -210,12 +211,16 @@ def _find_free_area_impl(
         return {"error": "width and height must be positive"}
 
     # Collect occupied bboxes (already mm, +Y down).
+    # Skip type="sheet" components — sheets are covered by _list_sheet_symbols_impl below
+    # (avoiding double-counting and simplifying UUID-based exclusion).
     netlist = extract_netlist(schematic_path)
     components: dict[str, Any] = netlist.get("components", {}) or {}
 
     occupied: list[BBox] = []
     ref_bboxes: dict[str, BBox] = {}
     for ref, comp in components.items():
+        if comp.get("type") == "sheet":
+            continue
         bb_d = comp.get("body_bbox")
         if not bb_d:
             continue
@@ -231,12 +236,14 @@ def _find_free_area_impl(
         ref_bboxes[ref] = bb
         occupied.append(inflate_bbox(bb, margin))
 
-    # Collect sheet symbol bboxes.
+    # Collect sheet symbol bboxes, excluding the sheet being moved (by UUID).
     try:
         from kcaa.tools.sheet_tools import _list_sheet_symbols_impl
 
         sheet_result = _list_sheet_symbols_impl(schematic_path)
         for sheet in sheet_result.get("sheets", []):
+            if exclude_uuid and sheet.get("uuid") == exclude_uuid:
+                continue
             bb = _sheet_symbol_bbox(sheet)
             if bb is not None:
                 occupied.append(inflate_bbox(bb, margin))
@@ -350,6 +357,7 @@ class PlacementHelpers:
         for_library: str | None = None,
         for_symbol: str | None = None,
         rotation: int = 0,
+        exclude_uuid: str | None = None,
     ) -> dict[str, Any]:
         return _find_free_area_impl(
             schematic_path=schematic_path,
@@ -361,6 +369,7 @@ class PlacementHelpers:
             for_library=for_library,
             for_symbol=for_symbol,
             rotation=rotation,
+            exclude_uuid=exclude_uuid,
         )
 
 

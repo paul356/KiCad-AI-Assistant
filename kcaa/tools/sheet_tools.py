@@ -1208,6 +1208,7 @@ def register_sheet_tools(mcp: FastMCP) -> None:
         y: float | None = None,
         width: float | None = None,
         height: float | None = None,
+        auto_place: bool = True,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Update a sheet symbol's properties.
@@ -1221,20 +1222,81 @@ def register_sheet_tools(mcp: FastMCP) -> None:
             y: New Y position in mm (optional).
             width: New width in mm (optional).
             height: New height in mm (optional).
+            auto_place: When True (default), if a position change is requested,
+                move the sheet to the nearest free area when the requested
+                position would overlap an existing symbol or sheet. The moved
+                sheet itself is excluded from the obstacle list.
 
         Returns:
-            dict with keys: success, uuid, updated_fields.
+            dict with keys: success, uuid, updated_fields, and optionally
+            ``position_adjusted`` / ``requested_position`` / ``note`` when
+            auto-placement changes the requested location.
         """
-        return _do_update_sheet_symbol(
+        place_x = x
+        place_y = y
+        position_adjusted = False
+        requested_position: dict[str, Any] | None = None
+
+        if auto_place and (x is not None or y is not None):
+            from kcaa.tools.placement_helpers import PlacementHelpers
+
+            # Look up current sheet to fill in missing axis and get UUID/size.
+            sheet_info = _list_sheet_symbols_impl(schematic_path)
+            target_info: dict[str, Any] | None = None
+            for s in sheet_info.get("sheets", []):
+                if s.get("uuid") == sheet_identifier or s.get("sheet_name") == sheet_identifier:
+                    target_info = s
+                    break
+
+            if target_info is not None:
+                cur_pos = target_info.get("position") or {}
+                cur_size = target_info.get("size") or {}
+                cur_x = float(cur_pos.get("x", 0))
+                cur_y = float(cur_pos.get("y", 0))
+                cur_w = float(cur_size.get("width", 50.8))
+                cur_h = float(cur_size.get("height", 50.8))
+                sheet_uuid = target_info.get("uuid")
+
+                req_x = _align_to_grid(x if x is not None else cur_x)
+                req_y = _align_to_grid(y if y is not None else cur_y)
+                eff_w = _align_to_grid(width if width is not None else cur_w)
+                eff_h = _align_to_grid(height if height is not None else cur_h)
+
+                free_area = PlacementHelpers.find_free_area(
+                    schematic_path=schematic_path,
+                    width=eff_w,
+                    height=eff_h,
+                    prefer_near={"x": req_x, "y": req_y},
+                    max_candidates=1,
+                    exclude_uuid=sheet_uuid,
+                )
+                candidate = (free_area.get("candidates") or [{}])[0]
+                origin = candidate.get("origin")
+                if origin is not None:
+                    cand_x = float(origin["x"])
+                    cand_y = float(origin["y"])
+                    if cand_x != req_x or cand_y != req_y:
+                        requested_position = {"x": x, "y": y}
+                        place_x = cand_x
+                        place_y = cand_y
+                        position_adjusted = True
+
+        result = _do_update_sheet_symbol(
             schematic_path=schematic_path,
             sheet_identifier=sheet_identifier,
             sheet_name=sheet_name,
             sheet_file=sheet_file,
-            x=x,
-            y=y,
+            x=place_x,
+            y=place_y,
             width=width,
             height=height,
         )
+        if result.get("success") and (x is not None or y is not None):
+            result["position_adjusted"] = position_adjusted
+            if position_adjusted and requested_position is not None:
+                result["requested_position"] = requested_position
+                result["note"] = "Position adjusted to nearest free area."
+        return result
 
     @mcp.tool()
     async def add_sheet_pin(
