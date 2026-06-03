@@ -17,7 +17,7 @@ import asyncio
 import os
 from pathlib import Path
 import shutil
-import tempfile
+import uuid
 
 import pytest
 import skip
@@ -31,10 +31,9 @@ SCHEMATIC_PATH = str(Path(__file__).parent / "fixtures" / "tools_test.kicad_sch"
 
 def _make_temp_copy() -> str:
     """Return path to a fresh temporary copy of tools_test.kicad_sch."""
-    tmp = tempfile.NamedTemporaryFile(suffix=".kicad_sch", delete=False, dir=tempfile.gettempdir())
-    tmp.close()
-    shutil.copy(SCHEMATIC_PATH, tmp.name)
-    return tmp.name
+    tmp_path = Path(__file__).parent / "fixtures" / f"tools_test_{uuid.uuid4().hex}.kicad_sch"
+    shutil.copy(SCHEMATIC_PATH, tmp_path)
+    return str(tmp_path)
 
 
 class _MockMCP:
@@ -86,7 +85,17 @@ def tmp_sch():
 
 
 class TestAddLabelToSchematic:
-    def _add(self, tools, schematic_path, text="NET_A", x=200.0, y=200.0, angle=0):
+    def _add(
+        self,
+        tools,
+        schematic_path,
+        text="NET_A",
+        x=200.0,
+        y=200.0,
+        angle=0,
+        label_type="local",
+        shape="input",
+    ):
         return asyncio.run(
             tools["add_label_to_schematic"](
                 schematic_path=schematic_path,
@@ -94,6 +103,8 @@ class TestAddLabelToSchematic:
                 x=x,
                 y=y,
                 angle=angle,
+                label_type=label_type,
+                shape=shape,
             )
         )
 
@@ -127,14 +138,76 @@ class TestAddLabelToSchematic:
         result = self._add(tools, tmp_sch, text="")
         assert "error" in result
 
+    def test_add_global_label(self, tools, tmp_sch):
+        """Adding a global label stores its type and shape and makes it listable."""
+        result = self._add(
+            tools,
+            tmp_sch,
+            text="G_OUT",
+            x=230.0,
+            y=230.0,
+            angle=180,
+            label_type="global",
+            shape="output",
+        )
+        assert result.get("success") is True, result
+        assert result["label"]["label_type"] == "global"
+        assert result["label"]["shape"] == "output"
+
+        listed = asyncio.run(
+            tools["list_labels_in_schematic"](schematic_path=tmp_sch, label_type="global")
+        )
+        matches = [lbl for lbl in listed["labels"] if lbl["text"] == "G_OUT"]
+        assert len(matches) == 1
+        assert matches[0]["shape"] == "output"
+        assert matches[0]["label_type"] == "global"
+
+    def test_add_hierarchical_label(self, tools, tmp_sch):
+        """Adding a hierarchical label stores its type and shape and makes it listable."""
+        result = self._add(
+            tools,
+            tmp_sch,
+            text="H_BI",
+            x=231.0,
+            y=231.0,
+            angle=270,
+            label_type="hierarchical",
+            shape="bidirectional",
+        )
+        assert result.get("success") is True, result
+        assert result["label"]["label_type"] == "hierarchical"
+        assert result["label"]["shape"] == "bidirectional"
+
+        listed = asyncio.run(
+            tools["list_labels_in_schematic"](schematic_path=tmp_sch, label_type="hierarchical")
+        )
+        matches = [lbl for lbl in listed["labels"] if lbl["text"] == "H_BI"]
+        assert len(matches) == 1
+        assert matches[0]["shape"] == "bidirectional"
+        assert matches[0]["label_type"] == "hierarchical"
+
+    def test_add_label_invalid_type(self, tools, tmp_sch):
+        """Unknown label_type values should be rejected."""
+        result = self._add(tools, tmp_sch, label_type="mystery")
+        assert "error" in result
+        assert "label_type" in result["error"]
+
+    def test_add_label_invalid_shape(self, tools, tmp_sch):
+        """Unknown shapes for global/hierarchical labels should be rejected."""
+        result = self._add(tools, tmp_sch, label_type="global", shape="mystery")
+        assert "error" in result
+        assert "shape" in result["error"]
+
     def test_non_kicad_sch_extension_returns_error(self, tools):
         """A path without the .kicad_sch extension should be rejected immediately."""
-        result = self._add(tools, "/tmp/bogus.txt")
+        bogus_path = str(Path(__file__).parent / "fixtures" / "bogus.txt")
+        result = self._add(tools, bogus_path)
         assert "error" in result
 
     def test_nonexistent_file_returns_error(self, tools):
         """A .kicad_sch path that does not exist on disk should return an error."""
-        result = self._add(tools, "/tmp/no_such_file_label_test.kicad_sch")
+        missing_path = str(Path(__file__).parent / "fixtures" / "no_such_file_label_test.kicad_sch")
+        result = self._add(tools, missing_path)
         assert "error" in result
 
 
@@ -154,6 +227,78 @@ class TestListLabelsInSchematic:
         assert result.get("success") is True, result
         assert result["count"] == 0
         assert result["labels"] == []
+
+    def test_list_labels_all_types(self, tools, tmp_sch):
+        """Listing with no filter should include local, global, and hierarchical labels."""
+        asyncio.run(
+            tools["add_label_to_schematic"](
+                schematic_path=tmp_sch,
+                text="LOCAL_ALL",
+                x=240.0,
+                y=240.0,
+            )
+        )
+        asyncio.run(
+            tools["add_label_to_schematic"](
+                schematic_path=tmp_sch,
+                text="GLOBAL_ALL",
+                x=241.0,
+                y=241.0,
+                label_type="global",
+                shape="output",
+            )
+        )
+        asyncio.run(
+            tools["add_label_to_schematic"](
+                schematic_path=tmp_sch,
+                text="HIER_ALL",
+                x=242.0,
+                y=242.0,
+                label_type="hierarchical",
+                shape="passive",
+            )
+        )
+
+        result = asyncio.run(tools["list_labels_in_schematic"](schematic_path=tmp_sch))
+        assert result.get("success") is True, result
+        assert result["count"] == 3
+
+        by_text = {label["text"]: label for label in result["labels"]}
+        assert by_text["LOCAL_ALL"]["label_type"] == "local"
+        assert by_text["LOCAL_ALL"]["shape"] is None
+        assert by_text["GLOBAL_ALL"]["label_type"] == "global"
+        assert by_text["GLOBAL_ALL"]["shape"] == "output"
+        assert by_text["HIER_ALL"]["label_type"] == "hierarchical"
+        assert by_text["HIER_ALL"]["shape"] == "passive"
+
+    def test_list_labels_filter_by_type(self, tools, tmp_sch):
+        """The label_type filter should only return matching label types."""
+        asyncio.run(
+            tools["add_label_to_schematic"](
+                schematic_path=tmp_sch,
+                text="FILTER_LOCAL",
+                x=243.0,
+                y=243.0,
+            )
+        )
+        asyncio.run(
+            tools["add_label_to_schematic"](
+                schematic_path=tmp_sch,
+                text="FILTER_GLOBAL",
+                x=244.0,
+                y=244.0,
+                label_type="global",
+                shape="input",
+            )
+        )
+
+        result = asyncio.run(
+            tools["list_labels_in_schematic"](schematic_path=tmp_sch, label_type="global")
+        )
+        assert result.get("success") is True, result
+        assert result["count"] == 1
+        assert [label["text"] for label in result["labels"]] == ["FILTER_GLOBAL"]
+        assert all(label["label_type"] == "global" for label in result["labels"])
 
     def test_added_label_appears_in_list_with_correct_fields(self, tools, tmp_sch):
         """After adding a label, list_labels_in_schematic reports it with the correct fields."""
@@ -183,6 +328,8 @@ class TestListLabelsInSchematic:
         assert abs(m["x"] - 201.0) < 0.01, m
         assert abs(m["y"] - 201.0) < 0.01, m
         assert m["direction"] == "down", m
+        assert m["label_type"] == "local", m
+        assert m["shape"] is None, m
 
 
 # ---------------------------------------------------------------------------
@@ -191,7 +338,17 @@ class TestListLabelsInSchematic:
 
 
 class TestDeleteLabelFromSchematic:
-    def _add(self, tools, sch_path, text="NET_DEL", x=210.0, y=210.0, angle=0):
+    def _add(
+        self,
+        tools,
+        sch_path,
+        text="NET_DEL",
+        x=210.0,
+        y=210.0,
+        angle=0,
+        label_type="local",
+        shape="input",
+    ):
         return asyncio.run(
             tools["add_label_to_schematic"](
                 schematic_path=sch_path,
@@ -199,6 +356,8 @@ class TestDeleteLabelFromSchematic:
                 x=x,
                 y=y,
                 angle=angle,
+                label_type=label_type,
+                shape=shape,
             )
         )
 
@@ -211,6 +370,53 @@ class TestDeleteLabelFromSchematic:
                 **kwargs,
             )
         )
+
+    def test_delete_global_label(self, tools, tmp_sch):
+        """Deleting a global label with label_type filter should remove it."""
+        add_result = self._add(
+            tools,
+            tmp_sch,
+            text="GLOBAL_DEL",
+            x=213.0,
+            y=213.0,
+            label_type="global",
+            shape="output",
+        )
+        assert add_result.get("success") is True, add_result
+
+        result = self._delete(tools, tmp_sch, x=213.0, y=213.0, label_type="global")
+        assert result.get("success") is True, result
+        assert result["deleted_count"] == 1
+
+        listed = asyncio.run(
+            tools["list_labels_in_schematic"](schematic_path=tmp_sch, label_type="global")
+        )
+        assert listed["count"] == 0
+
+    def test_delete_hierarchical_label(self, tools, tmp_sch):
+        """Deleting a hierarchical label with label_type filter should remove it."""
+        add_result = self._add(
+            tools,
+            tmp_sch,
+            text="HIER_DEL",
+            x=214.0,
+            y=214.0,
+            label_type="hierarchical",
+            shape="bidirectional",
+        )
+        assert add_result.get("success") is True, add_result
+
+        result = self._delete(tools, tmp_sch, x=214.0, y=214.0, label_type="hierarchical")
+        assert result.get("success") is True, result
+        assert result["deleted_count"] == 1
+
+        listed = asyncio.run(
+            tools["list_labels_in_schematic"](
+                schematic_path=tmp_sch,
+                label_type="hierarchical",
+            )
+        )
+        assert listed["count"] == 0
 
     def test_delete_by_position_succeeds_and_removes_label(self, tools, tmp_sch):
         """Deleting a label by its position returns success=True/deleted_count=1 and removes it."""
@@ -270,7 +476,7 @@ class TestDeleteLabelFromSchematic:
 
 
 class TestDeleteLabelBatchMode:
-    def _add(self, tools, sch_path, text, x, y, angle=0):
+    def _add(self, tools, sch_path, text, x, y, angle=0, label_type="local", shape="input"):
         return asyncio.run(
             tools["add_label_to_schematic"](
                 schematic_path=sch_path,
@@ -278,6 +484,8 @@ class TestDeleteLabelBatchMode:
                 x=x,
                 y=y,
                 angle=angle,
+                label_type=label_type,
+                shape=shape,
             )
         )
 
@@ -355,6 +563,25 @@ class TestDeleteLabelBatchMode:
         assert result.get("success") is False, result
         assert result["total_deleted"] == 0
         assert all("error" in r for r in result["results"])
+
+    def test_batch_delete_respects_label_type(self, tools, tmp_sch):
+        """Batch deletion should only consider the requested label_type."""
+        self._add(tools, tmp_sch, text="GLOBAL_ONLY", x=224.0, y=224.0, label_type="global")
+
+        result = asyncio.run(
+            tools["delete_label_from_schematic"](
+                schematic_path=tmp_sch,
+                positions=[{"x": 224.0, "y": 224.0}],
+                label_type="local",
+            )
+        )
+        assert result.get("success") is False, result
+        assert result["total_deleted"] == 0
+
+        listed = asyncio.run(
+            tools["list_labels_in_schematic"](schematic_path=tmp_sch, label_type="global")
+        )
+        assert [label["text"] for label in listed["labels"]] == ["GLOBAL_ONLY"]
 
     def test_batch_empty_positions_returns_error(self, tools, tmp_sch):
         """An empty positions list should return an error immediately."""

@@ -31,6 +31,24 @@ def _angle_to_direction_screen(angle_deg: float) -> str:
     return {0: "right", 90: "down", 180: "left", 270: "up"}.get(a, f"{a}deg")
 
 
+def _normalize_iterable(value: Any) -> list[Any]:
+    """Return skip collections and single wrappers as a regular list."""
+    if value is None:
+        return []
+    elements = getattr(value, "_elements", None)
+    if elements is not None:
+        return list(elements)
+    if isinstance(value, list):
+        return value
+    if hasattr(value, "entity_type"):
+        return [value]
+    try:
+        length = len(value)
+    except TypeError:
+        return [value]
+    return [value[i] for i in range(length)]
+
+
 class SchematicParser:
     """Parser for KiCad schematic files to extract netlist information."""
 
@@ -82,6 +100,7 @@ class SchematicParser:
         print("Starting schematic parsing")
 
         self._extract_components()
+        self._extract_sheet_components()
         self._extract_wires()
         self._extract_junctions()
         self._extract_labels()
@@ -99,6 +118,7 @@ class SchematicParser:
             "component_count": len(self.component_info),
             "net_count": len(self.nets),
             "point_to_net": self.point_to_net,
+            "dangling_points": list(self._compute_dangling_points()),
         }
 
         print(
@@ -237,6 +257,110 @@ class SchematicParser:
                 self.component_info[ref]["body_bbox"] = merged.to_dict()
 
         print(f"Extracted {len(self.components)} components")
+
+    def _extract_sheet_components(self) -> None:
+        """Extract hierarchical sheet symbols as opaque components."""
+        print("Extracting sheet symbols")
+        try:
+            raw_sheets = self._sch.sheet
+        except AttributeError:
+            print("No sheet symbols found in schematic")
+            return
+
+        sheet_count = 0
+        for sheet_wrapper in _normalize_iterable(raw_sheets):
+            prop_map: dict[str, Any] = {}
+            try:
+                raw_props = sheet_wrapper.property
+            except AttributeError:
+                raw_props = None
+            for prop in _normalize_iterable(raw_props):
+                raw_tree = getattr(getattr(prop, "_pv", None), "_tree", None)
+                if not isinstance(raw_tree, list) or len(raw_tree) < 3:
+                    continue
+                prop_name = raw_tree[1]
+                if not isinstance(prop_name, str):
+                    continue
+                prop_map[prop_name.replace(" ", "").replace("_", "").lower()] = raw_tree[2]
+
+            sheet_name = prop_map.get("sheetname")
+            sheet_file = prop_map.get("sheetfile")
+            try:
+                sheet_uuid = sheet_wrapper.uuid.value
+            except AttributeError:
+                sheet_uuid = None
+
+            try:
+                at_vals = list(sheet_wrapper.at)
+                sheet_x = float(at_vals[0])
+                sheet_y = float(at_vals[1])
+            except (AttributeError, IndexError, TypeError, ValueError):
+                sheet_x = sheet_y = None
+
+            try:
+                size_vals = list(sheet_wrapper.size)
+                sheet_width = float(size_vals[0])
+                sheet_height = float(size_vals[1])
+            except (AttributeError, IndexError, TypeError, ValueError):
+                sheet_width = sheet_height = None
+
+            reference = str(sheet_name or sheet_uuid or f"sheet-{sheet_count + 1}")
+            unique_reference = reference
+            duplicate_index = 2
+            while unique_reference in self.component_info:
+                unique_reference = f"{reference}#{duplicate_index}"
+                duplicate_index += 1
+
+            pins: list[dict[str, Any]] = []
+            try:
+                raw_pins = sheet_wrapper.pin
+            except AttributeError:
+                raw_pins = None
+            for pin_wrapper in _normalize_iterable(raw_pins):
+                pin_value = getattr(pin_wrapper, "value", None)
+                if isinstance(pin_value, list) and pin_value:
+                    pin_name = str(pin_value[0])
+                elif pin_value is not None:
+                    pin_name = str(pin_value)
+                else:
+                    continue
+                try:
+                    pin_at = list(pin_wrapper.at)
+                    pin_x = float(pin_at[0])
+                    pin_y = float(pin_at[1])
+                except (AttributeError, IndexError, TypeError, ValueError):
+                    continue
+                pins.append(
+                    {
+                        "num": pin_name,
+                        "number": pin_name,
+                        "name": pin_name,
+                        "x": pin_x,
+                        "y": pin_y,
+                    }
+                )
+
+            comp: dict[str, Any] = {
+                "reference": unique_reference,
+                "value": str(sheet_file or ""),
+                "type": "sheet",
+                "pins": pins,
+            }
+            if sheet_x is not None and sheet_y is not None:
+                comp["position"] = {"x": sheet_x, "y": sheet_y}
+            if None not in (sheet_x, sheet_y, sheet_width, sheet_height):
+                comp["body_bbox"] = {
+                    "min_x": sheet_x,
+                    "min_y": sheet_y,
+                    "max_x": sheet_x + sheet_width,
+                    "max_y": sheet_y + sheet_height,
+                }
+
+            self.components.append(comp)
+            self.component_info[unique_reference] = comp
+            sheet_count += 1
+
+        print(f"Extracted {sheet_count} sheet symbols")
 
     def _extract_wires(self) -> None:
         """Extract wire information from schematic."""
@@ -431,9 +555,12 @@ class SchematicParser:
             if ref.startswith("#"):
                 continue
             for pin_data in comp.get("pins", []):
+                pin_number = str(pin_data.get("num", pin_data.get("number", "")))
+                if not pin_number:
+                    continue
                 world_pt = pt(pin_data["x"], pin_data["y"])
                 find(world_pt)  # register in uf
-                placed_pin_world[(ref, pin_data["num"])] = world_pt
+                placed_pin_world[(ref, pin_number)] = world_pt
 
         # Step 3: Assign net names from labels
         point_net: dict[tuple, str] = {}
@@ -451,6 +578,16 @@ class SchematicParser:
 
         for label in self.hierarchical_labels:
             name_point(pt(label["position"]["x"], label["position"]["y"]), label["text"])
+
+        for comp in self.component_info.values():
+            if comp.get("type") != "sheet":
+                continue
+            for pin_data in comp.get("pins", []):
+                pin_name = str(
+                    pin_data.get("name") or pin_data.get("number") or pin_data.get("num")
+                )
+                if pin_name:
+                    name_point(pt(pin_data["x"], pin_data["y"]), pin_name)
 
         # Power symbol pins provide net names at their world positions.
         # When skip cannot resolve pin.location for a power symbol (e.g. power:GND),
@@ -484,25 +621,64 @@ class SchematicParser:
             net_counter[0] += 1
             return name
 
+        # Build root → net name for all groups (named and auto-generated).
+        root_to_name: dict[tuple, str] = {}
         for root, pins in group_pins.items():
-            self.nets[auto_net_name(root, pins)].extend(pins)
+            name = auto_net_name(root, pins)
+            root_to_name[root] = name
+            self.nets[name].extend(pins)
 
         # Register named nets that carry no component pins
         for root, net_name in point_net.items():
             if net_name not in self.nets:
                 self.nets[net_name] = []
+            if root not in root_to_name:
+                root_to_name[root] = net_name
 
-        # Expose a flat point → net-name mapping so callers can look up a wire
-        # endpoint's net directly without re-running union-find.
+        # Expose a flat point → net-name mapping for ALL connected points,
+        # including auto-named nets (previously only named/labeled nets were covered).
         for p in list(uf.keys()):
             root = find(p)
-            if root in point_net:
-                self.point_to_net[p] = point_net[root]
+            if root in root_to_name:
+                self.point_to_net[p] = root_to_name[root]
 
         print(
             f"Built netlist: {len(self.nets)} nets, "
             f"{sum(len(v) for v in self.nets.values())} pin connections"
         )
+
+    def _compute_dangling_points(self) -> set[tuple[float, float]]:
+        """Return wire endpoints that have no other connections.
+
+        A point is dangling when exactly one wire touches it AND no component
+        pin, net label, or junction sits at that coordinate.  A no-connect
+        marker at a wire endpoint is intentionally omitted from the anchored
+        set: a wire landing on a no-connect is a schematic contradiction and
+        should still be flagged.
+        """
+        ROUND = 4
+
+        def rpt(x: float, y: float) -> tuple[float, float]:
+            return (round(float(x), ROUND), round(float(y), ROUND))
+
+        endpoint_count: dict[tuple, int] = {}
+        for wire in self.wires:
+            sp = rpt(wire["start"]["x"], wire["start"]["y"])
+            ep = rpt(wire["end"]["x"], wire["end"]["y"])
+            endpoint_count[sp] = endpoint_count.get(sp, 0) + 1
+            endpoint_count[ep] = endpoint_count.get(ep, 0) + 1
+
+        anchored: set[tuple] = set()
+        for cdata in self.component_info.values():
+            for pin in cdata.get("pins", []):
+                anchored.add(rpt(pin["x"], pin["y"]))
+        for label in self.labels + self.global_labels + self.hierarchical_labels:
+            pos = label["position"]
+            anchored.add(rpt(pos["x"], pos["y"]))
+        for junc in self.junctions:
+            anchored.add(rpt(junc["x"], junc["y"]))
+
+        return {pt for pt, count in endpoint_count.items() if count == 1 and pt not in anchored}
 
 
 def extract_netlist(schematic_path: str) -> dict[str, Any]:

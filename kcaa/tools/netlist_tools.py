@@ -94,6 +94,10 @@ def register_netlist_tools(mcp: FastMCP) -> None:
         This is the primary tool for spatial and connectivity reasoning. Each
         entry in ``components`` (keyed by reference) contains:
 
+        - Sub-sheets also appear in ``components`` with ``type="sheet"``.
+          Their hierarchical pins are exposed like component pins and use the
+          sheet-pin name as their local net name.
+
         - ``position``: ``{x, y}`` placement anchor in mm (KiCad screen coords,
           **+Y is down**).
         - ``rotation``, ``mirror``, ``lib_id``, ``value``, ``footprint``.
@@ -161,11 +165,25 @@ def register_netlist_tools(mcp: FastMCP) -> None:
                     "wires": {
                         "0": {"net": "GND",
                               "start": {"x": ..., "y": ..., "pins": [{"ref": "R1", "pin": "1"}]},
-                              "end":   {"x": ..., "y": ..., "pins": []}},
+                              "end":   {"x": ..., "y": ...},
+                              "dangling_end": True},
+                        "3": {"net": "VCC",
+                              "start": {"x": ..., "y": ...},
+                              "end":   {"x": ..., "y": ...},
+                              "redundant": True},
                         "5": {"net": null,
-                              "start": {"x": ..., "y": ..., "pins": []},
-                              "end":   {"x": ..., "y": ..., "pins": []}},
+                              "start": {"x": ..., "y": ...},
+                              "end":   {"x": ..., "y": ...},
+                              "dangling_start": True,
+                              "dangling_end": True},
                         ...
+                    }
+                    # pins field is omitted when empty.
+                    # dangling_start/dangling_end: only present (True) when the endpoint
+                    #   has no other wire, pin, label, or junction.
+                    # redundant: only present (True) when the wire is NOT a bridge in its
+                    #   net's wire graph — an alternate path already connects its endpoints,
+                    #   so the wire can be safely deleted without changing connectivity.
                     }
                 }
             }
@@ -213,9 +231,15 @@ def register_netlist_tools(mcp: FastMCP) -> None:
             components = {
                 ref: {
                     "value": cdata.get("value", ""),
+                    "type": cdata.get("type", "component"),
                     "position": cdata.get("position", {}),
                     "pins": [
-                        {**pinfo, "net": pin_to_net.get((ref, str(pinfo.get("num", ""))))}
+                        {
+                            **pinfo,
+                            "net": pin_to_net.get(
+                                (ref, str(pinfo.get("num", pinfo.get("number", ""))))
+                            ),
+                        }
                         for pinfo in cdata.get("pins", [])
                     ],
                     **({"body_bbox": cdata["body_bbox"]} if "body_bbox" in cdata else {}),
@@ -233,7 +257,12 @@ def register_netlist_tools(mcp: FastMCP) -> None:
             }
 
             # Analyze component types
-            for ref in components:
+            for ref, cdata in components.items():
+                if cdata.get("type") == "sheet":
+                    analysis["component_types"]["sheet"] = (
+                        analysis["component_types"].get("sheet", 0) + 1
+                    )
+                    continue
                 comp_type_match = re.match(r"^([A-Za-z_]+)", ref)
                 if comp_type_match:
                     comp_type = comp_type_match.group(1)
@@ -277,6 +306,12 @@ def register_netlist_tools(mcp: FastMCP) -> None:
                 # Reuse the wire→net mapping already resolved by the parser
                 point_to_net = netlist_data.get("point_to_net", {})
 
+                # Dangling endpoints identified by the parser
+                dangling_pts = {
+                    (round(float(p[0]), ROUND), round(float(p[1]), ROUND))
+                    for p in netlist_data.get("dangling_points", [])
+                }
+
                 # Build point → component-pins lookup from component pin world coords
                 from collections import defaultdict as _dd
 
@@ -293,12 +328,74 @@ def register_netlist_tools(mcp: FastMCP) -> None:
                 for wire_id, wdata in enumerate(all_wires):
                     sp = rpt(wdata["start"]["x"], wdata["start"]["y"])
                     ep = rpt(wdata["end"]["x"], wdata["end"]["y"])
-                    wnet = point_to_net.get(sp) or point_to_net.get(ep)
-                    wires[str(wire_id)] = {
+                    start_net = point_to_net.get(sp)
+                    end_net = point_to_net.get(ep)
+                    wnet = start_net or end_net
+                    dangling_start = sp in dangling_pts
+                    dangling_end = ep in dangling_pts
+                    start_pins = list(pin_at.get(sp, []))
+                    end_pins = list(pin_at.get(ep, []))
+                    wire_entry: dict[str, Any] = {
                         "net": wnet,
-                        "start": {**wdata["start"], "pins": list(pin_at.get(sp, []))},
-                        "end": {**wdata["end"], "pins": list(pin_at.get(ep, []))},
+                        "start": {**wdata["start"], **({"pins": start_pins} if start_pins else {})},
+                        "end": {**wdata["end"], **({"pins": end_pins} if end_pins else {})},
                     }
+                    if dangling_start:
+                        wire_entry["dangling_start"] = True
+                    if dangling_end:
+                        wire_entry["dangling_end"] = True
+                    wires[str(wire_id)] = wire_entry
+
+                # Detect redundant wires: a wire is redundant when it is NOT a
+                # bridge in its net's wire graph, i.e. an alternative path
+                # already connects its two endpoints — the wire can be deleted
+                # without changing any net connectivity.
+                from collections import defaultdict as _dd2
+
+                _adj: dict[str, Any] = {}
+                for wid, wdata in wires.items():
+                    wnet = wdata.get("net")
+                    if not wnet:
+                        continue
+                    sp2 = rpt(wdata["start"]["x"], wdata["start"]["y"])
+                    ep2 = rpt(wdata["end"]["x"], wdata["end"]["y"])
+                    if wnet not in _adj:
+                        _adj[wnet] = _dd2(list)
+                    _adj[wnet][sp2].append((ep2, wid))
+                    _adj[wnet][ep2].append((sp2, wid))
+
+                _bridge_ids: set[str] = set()
+                for _wnet, _graph in _adj.items():
+                    _disc: dict = {}
+                    _low: dict = {}
+                    _tmr = [0]
+                    for _src in list(_graph.keys()):
+                        if _src in _disc:
+                            continue
+                        _disc[_src] = _low[_src] = _tmr[0]
+                        _tmr[0] += 1
+                        _stk = [(_src, None, iter(_graph[_src]))]
+                        while _stk:
+                            _u, _peid, _nbrs = _stk[-1]
+                            try:
+                                _v, _eid = next(_nbrs)
+                                if _v not in _disc:
+                                    _disc[_v] = _low[_v] = _tmr[0]
+                                    _tmr[0] += 1
+                                    _stk.append((_v, _eid, iter(_graph[_v])))
+                                elif _eid != _peid:
+                                    _low[_u] = min(_low[_u], _disc[_v])
+                            except StopIteration:
+                                _stk.pop()
+                                if _stk:
+                                    _pu = _stk[-1][0]
+                                    _low[_pu] = min(_low[_pu], _low[_u])
+                                    if _low[_u] > _disc[_pu]:
+                                        _bridge_ids.add(_peid)
+
+                for wid, wdata in wires.items():
+                    if wdata.get("net") is not None and wid not in _bridge_ids:
+                        wdata["redundant"] = True
 
                 analysis["wires"] = wires
 

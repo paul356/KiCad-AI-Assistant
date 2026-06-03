@@ -1,0 +1,12 @@
+(kicad_sch (version 20260306) (generator "kcaa") (generator_version "0.2.0")
+  (uuid "9277afaf-d1a9-40dc-8a24-ccda44923874")
+  (paper "A4")
+  (title_block
+    (title "Power Supply")
+  )
+  (lib_symbols)
+  (sheet_instances
+    (path "/9277afaf-d1a9-40dc-8a24-ccda44923874" (page "1"))
+  )
+  (embedded_fonts no)
+)

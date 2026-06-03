@@ -50,15 +50,15 @@ function _toolCallHtml(e) {
     var icon = ok ? '\u2713' : '\u2717';
     var iconColor = ok ? '#2e7d32' : '#c62828';
     var css = ok ? 'tool-entry tool-ok' : 'tool-entry tool-err';
-    var args = typeof e.args === 'string' ? _escapeHtml(e.args) : _escapeHtml(JSON.stringify(e.args));
-    var result = typeof e.result === 'string' ? _escapeHtml(e.result) : _escapeHtml(JSON.stringify(e.result));
+    var args = typeof e.args === 'string' ? _escapeHtml(e.args) : _escapeHtml(JSON.stringify(e.args, null, 2));
+    var result = typeof e.result === 'string' ? _escapeHtml(e.result) : _escapeHtml(JSON.stringify(e.result, null, 2));
     return '<details class="tools" style="margin:2px 8px">'
         + '<summary><span style="color:' + iconColor + '">' + icon + '</span> '
         + '<span style="color:#444;font-weight:600">\u21B3 ' + _escapeHtml(e.name)
         + '</span></summary>'
         + '<div class="' + css + '">'
-        + '<span style="color:#444">args:</span> ' + args + '<br>'
-        + '<span style="color:#444">result:</span> ' + result
+        + '<span style="color:#444">args:</span><br><pre style="margin:2px 0">' + args + '</pre>'
+        + '<span style="color:#444">result:</span><br><pre style="margin:2px 0">' + result + '</pre>'
         + '</div></details>';
 }
 
