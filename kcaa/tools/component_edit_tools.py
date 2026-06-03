@@ -333,7 +333,7 @@ def _do_add_symbol(
             ):
                 prefix = child[2] if isinstance(child[2], str) else "U"
                 break
-        reference = _next_reference(sch, prefix)
+        reference = _next_reference(sch, prefix, schematic_path=schematic_path)
 
         project_name = _find_project_name(schematic_path)
 
@@ -440,16 +440,62 @@ def _find_project_name(schematic_path: str) -> str:
     return "project"
 
 
-def _next_reference(sch: Any, prefix: str) -> str:
-    """
-    Auto-assign the next available reference designator for a given prefix.
+_REFERENCE_RE = re.compile(r'\(property\s+"Reference"\s+"([^"]+)"')
 
-    Scans sch.symbol for references that start with ``prefix`` followed by
-    digits, finds the maximum integer suffix, and returns prefix + (max+1).
-    Returns prefix + "1" if no existing references match.
+
+def _find_project_dir(schematic_path: str) -> Path | None:
+    """Find the KiCad project directory containing a .kicad_pro file.
+
+    Searches the schematic's directory first, then the parent directory.
+    Returns the directory Path, or None if no .kicad_pro is found.
+    """
+    sch_dir = Path(schematic_path).parent
+    for search_dir in (sch_dir, sch_dir.parent):
+        if list(search_dir.glob("*.kicad_pro")):
+            return search_dir
+    return None
+
+
+def _collect_project_references(schematic_path: str) -> dict[str, set[str]]:
+    """Collect all symbol references from every .kicad_sch in a project.
+
+    Scans every ``*.kicad_sch`` file under the project directory and
+    extracts reference designators via regex (much faster than full parsing).
+    Returns a dict mapping each absolute schematic path to its set of
+    reference strings.  Returns an empty dict if no project root is found.
+    """
+    project_dir = _find_project_dir(schematic_path)
+    if project_dir is None:
+        return {}
+
+    refs_by_file: dict[str, set[str]] = {}
+    for sch_path in sorted(project_dir.rglob("*.kicad_sch")):
+        try:
+            text = sch_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        ref_set: set[str] = set()
+        for m in _REFERENCE_RE.finditer(text):
+            ref_set.add(m.group(1))
+        refs_by_file[str(sch_path)] = ref_set
+
+    return refs_by_file
+
+
+def _next_reference(sch: Any, prefix: str, schematic_path: str | None = None) -> str:
+    """Auto-assign the next available reference designator for a given prefix.
+
+    Scans ``sch.symbol`` for references that start with *prefix* followed by
+    digits, finds the maximum integer suffix, and returns ``prefix + (max+1)``.
+    When *schematic_path* is provided, also scans all ``*.kicad_sch`` files
+    under the project directory to avoid conflicts across sub-sheets.
+
+    Returns ``prefix + "1"`` if no existing references match.
     """
     suffix_re = re.compile(r"^" + re.escape(prefix) + r"(\d+)$")
     max_n = 0
+
+    # Scan the current schematic's symbols first.
     try:
         for sym in sch.symbol:
             try:
@@ -460,8 +506,19 @@ def _next_reference(sch: Any, prefix: str) -> str:
             except AttributeError:
                 continue
     except AttributeError:
-        # sch.symbol doesn't exist on an empty schematic.
         pass
+
+    # Also scan all other schematic files in the project.
+    if schematic_path is not None:
+        for file_path, ref_set in _collect_project_references(schematic_path).items():
+            # Skip the current file — we already scanned its refs above.
+            if os.path.normpath(file_path) == os.path.normpath(schematic_path):
+                continue
+            for ref_str in ref_set:
+                m = suffix_re.match(ref_str)
+                if m:
+                    max_n = max(max_n, int(m.group(1)))
+
     return f"{prefix}{max_n + 1}"
 
 
@@ -1477,6 +1534,100 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
             return {"error": str(exc), "success": False}
 
     @mcp.tool()
+    async def rename_symbol(
+        schematic_path: str,
+        from_reference: str,
+        to_reference: str,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Rename a symbol's reference designator in a schematic.
+
+        Updates the ``Reference`` property on every unit of the symbol
+        identified by *from_reference*.  A backup (.kicad_sch.bak) is
+        written before saving.
+
+        This is a convenience wrapper around ``set_component_property``
+        that uses more intuitive parameter names and adds an existence
+        check for the target reference.
+
+        Args:
+            schematic_path: Absolute path to the target .kicad_sch file.
+            from_reference: Current reference designator (e.g. "R1").
+            to_reference: New reference designator (e.g. "R10").
+
+        Returns:
+            dict with keys: success (bool), from_reference, to_reference,
+            units_updated (int), file_modified, backup_path.
+        """
+        if not schematic_path.endswith(".kicad_sch"):
+            return {"error": f"Not a .kicad_sch file: {schematic_path!r}"}
+        if not os.path.isfile(schematic_path):
+            return {"error": f"Schematic file not found: {schematic_path!r}"}
+        if not from_reference:
+            return {"error": "from_reference must not be empty"}
+        if not to_reference:
+            return {"error": "to_reference must not be empty"}
+        if from_reference == to_reference:
+            return {"error": "from_reference and to_reference are the same"}
+
+        try:
+            sch = safe_schematic(schematic_path)
+        except Exception as exc:
+            return {"error": f"Failed to open schematic: {exc}"}
+
+        try:
+            # Collect all units with from_reference.
+            units: list[Any] = []
+            try:
+                for sym in sch.symbol:
+                    try:
+                        if sym.property.Reference.value == from_reference:
+                            units.append(sym)
+                    except AttributeError:
+                        continue
+            except AttributeError:
+                pass
+
+            if not units:
+                return {"error": f"No symbol with reference {from_reference!r} found"}
+
+            # Check that to_reference does not already exist.
+            for sym in sch.symbol:
+                try:
+                    if sym.property.Reference.value == to_reference:
+                        return {
+                            "error": f"Target reference {to_reference!r} already exists in this schematic"
+                        }
+                except AttributeError:
+                    continue
+
+            # Update the Reference property on every unit.
+            for sym in units:
+                ref_prop = _find_property_by_name(sym, "Reference")
+                if ref_prop is not None:
+                    ref_prop.value = to_reference
+                else:
+                    return {"error": f"Symbol {from_reference!r} has no Reference property"}
+
+            try:
+                save_schematic(schematic_path, sch)
+            except Exception as exc:
+                return {"error": f"Failed to save schematic: {exc}"}
+
+            return {
+                "success": True,
+                "from_reference": from_reference,
+                "to_reference": to_reference,
+                "units_updated": len(units),
+                "file_modified": schematic_path,
+                "backup_path": schematic_path + ".bak",
+            }
+
+        except Exception as exc:
+            log.exception("Unexpected error in rename_symbol")
+            return {"error": str(exc), "success": False}
+
+    @mcp.tool()
     async def list_component_properties(
         schematic_path: str,
         reference: str,
@@ -2099,6 +2250,64 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
                     continue
 
         return {"success": True, "labels": labels, "count": len(labels)}
+
+    @mcp.tool()
+    async def check_reference_conflicts(
+        schematic_path: str,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Check for duplicate reference designators across a KiCad project.
+
+        Scans every ``*.kicad_sch`` file under the project directory and
+        reports any reference designators that appear in more than one
+        schematic file.  This catches the common mistake where a sub-sheet
+        symbol accidentally reuses a reference already claimed in the
+        parent sheet or another sub-sheet.
+
+        Args:
+            schematic_path: Absolute path to any .kicad_sch file in the
+                project.  The project root is auto-detected from this path.
+
+        Returns:
+            dict with keys: success (bool), project_dir (str or null),
+            schematics_scanned (int), conflicts (list of {reference, sheets}).
+        """
+        if not schematic_path.endswith(".kicad_sch"):
+            return {"error": f"Not a .kicad_sch file: {schematic_path!r}"}
+        if not os.path.isfile(schematic_path):
+            return {"error": f"Schematic file not found: {schematic_path!r}"}
+
+        project_dir = _find_project_dir(schematic_path)
+        if project_dir is None:
+            return {
+                "success": True,
+                "project_dir": None,
+                "schematics_scanned": 0,
+                "conflicts": [],
+                "message": "No .kicad_pro found — cannot determine project scope",
+            }
+
+        refs_by_file = _collect_project_references(schematic_path)
+
+        # Invert: reference → list of files where it appears.
+        ref_to_files: dict[str, list[str]] = {}
+        for file_path, ref_set in refs_by_file.items():
+            for ref_str in ref_set:
+                ref_to_files.setdefault(ref_str, []).append(file_path)
+
+        conflicts = [
+            {"reference": ref_str, "sheets": sorted(file_list)}
+            for ref_str, file_list in ref_to_files.items()
+            if len(file_list) > 1
+        ]
+        conflicts.sort(key=lambda c: c["reference"])
+
+        return {
+            "success": True,
+            "project_dir": str(project_dir),
+            "schematics_scanned": len(refs_by_file),
+            "conflicts": conflicts,
+        }
 
     @mcp.tool()
     async def delete_label_from_schematic(

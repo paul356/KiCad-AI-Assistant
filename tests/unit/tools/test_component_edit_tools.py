@@ -1376,3 +1376,341 @@ class TestMoveComponent:
             )
         )
         assert "error" in result
+
+
+# ---------------------------------------------------------------------------
+# Tests for cross-file _next_reference
+# ---------------------------------------------------------------------------
+
+
+class TestNextReferenceCrossFile:
+    """Tests for _next_reference with project-wide scanning."""
+
+    @pytest.fixture()
+    def project_dir(self, tmp_path):
+        """Create a minimal KiCad project with two schematic files."""
+        proj = tmp_path / "test_proj"
+        proj.mkdir()
+        # Create the .kicad_pro marker.
+        (proj / "test_proj.kicad_pro").write_text("{}")
+
+        # Create a parent schematic.  We use a minimal but valid kicad_sch
+        # sexp so that regex scans work.  (skip.Schematic would need more
+        # structure, but we only use regex in cross-file tests.)
+        parent_sch = proj / "test_proj.kicad_sch"
+        parent_sch.write_text(
+            '(kicad_sch (version 20240108) (generator "eeschema")\n'
+            '  (symbol (lib_id "Device:R") (at 0 0 0)\n'
+            '    (property "Reference" "R1" (at 0 0 0))\n'
+            "  )\n"
+            '  (symbol (lib_id "Device:R") (at 10 0 0)\n'
+            '    (property "Reference" "R3" (at 10 0 0))\n'
+            "  )\n"
+            '  (sheet_instances (path "/" (page "1")))\n'
+            ")\n"
+        )
+        # Create a sub-sheet schematic with R2.
+        sub_dir = proj / "sub"
+        sub_dir.mkdir()
+        sub_sch = sub_dir / "sub.kicad_sch"
+        sub_sch.write_text(
+            '(kicad_sch (version 20240108) (generator "eeschema")\n'
+            '  (symbol (lib_id "Device:R") (at 0 0 0)\n'
+            '    (property "Reference" "R2" (at 0 0 0))\n'
+            "  )\n"
+            '  (sheet_instances (path "/" (page "1")))\n'
+            ")\n"
+        )
+        return proj, parent_sch, sub_sch
+
+    def test_find_project_dir_found(self):
+        """_find_project_dir returns the dir containing .kicad_pro."""
+        import tempfile
+
+        from kcaa.tools.component_edit_tools import _find_project_dir
+
+        with tempfile.TemporaryDirectory() as td:
+            proj_dir = Path(td) / "proj"
+            proj_dir.mkdir()
+            (proj_dir / "proj.kicad_pro").write_text("{}")
+            sch = proj_dir / "proj.kicad_sch"
+            sch.write_text("(kicad_sch)\n")
+            result = _find_project_dir(str(sch))
+            assert result == proj_dir
+
+    def test_find_project_dir_not_found(self):
+        """_find_project_dir returns None when no .kicad_pro exists."""
+        import tempfile
+
+        from kcaa.tools.component_edit_tools import _find_project_dir
+
+        with tempfile.TemporaryDirectory() as td:
+            sch = Path(td) / "orphan.kicad_sch"
+            sch.write_text("(kicad_sch)\n")
+            result = _find_project_dir(str(sch))
+            assert result is None
+
+    def test_collect_project_references(self, project_dir):
+        """_collect_project_references gathers refs from all schematics."""
+        from kcaa.tools.component_edit_tools import _collect_project_references
+
+        proj, parent_sch, sub_sch = project_dir
+        refs = _collect_project_references(str(parent_sch))
+        assert len(refs) == 2  # two .kicad_sch files
+        parent_refs = refs[str(parent_sch)]
+        sub_refs = refs[str(sub_sch)]
+        assert parent_refs == {"R1", "R3"}
+        assert sub_refs == {"R2"}
+
+    def test_next_reference_skips_own_file_but_scans_others(self, project_dir):
+        """_next_reference should see R1, R3 from parent + R2 from sub,
+        giving R4 (not R2 which only exists in sub-sheet)."""
+        from kcaa.tools.component_edit_tools import _next_reference
+
+        proj, parent_sch, sub_sch = project_dir
+
+        # Create a mock sch that has no symbols of its own, so the
+        # cross-file scan is the sole source of reference data.
+        class _FakeSym:
+            class _Prop:
+                Reference = type("Ref", (), {"value": "R0"})()
+
+            property = _Prop()
+
+        class _FakeSch:
+            symbol = [_FakeSym()]
+
+        fake_sch = _FakeSch()
+
+        # From the project, parent has R1,R3 and sub has R2; max is 3 → R4.
+        ref = _next_reference(fake_sch, "R", schematic_path=str(sub_sch))
+        assert ref == "R4"
+
+    def test_next_reference_no_project_uses_current_sch_only(self, tmp_sch):
+        """When there's no project, _next_reference falls back to current file only."""
+        from kcaa.tools.component_edit_tools import _next_reference
+        from kcaa.utils.skip_compat import safe_schematic
+
+        sch = safe_schematic(tmp_sch)
+        # Only scan the current schematic (no schematic_path); the fixture has
+        # R1 through R7, so max is 7 and next should be 8.
+        ref_no_path = _next_reference(sch, "R")
+        assert ref_no_path == "R8"
+        # With schematic_path but no project found, should return the same.
+        ref_with_path = _next_reference(sch, "R", schematic_path=tmp_sch)
+        assert ref_with_path == "R8"
+
+
+# ---------------------------------------------------------------------------
+# Tests for rename_symbol
+# ---------------------------------------------------------------------------
+
+
+class TestRenameSymbol:
+    """Tests for the rename_symbol tool."""
+
+    def test_successful_rename(self, tools, tmp_sch):
+        """Renaming R1 to R10 should update the reference."""
+        result = asyncio.run(
+            tools["rename_symbol"](
+                schematic_path=tmp_sch,
+                from_reference="R1",
+                to_reference="R10",
+            )
+        )
+        assert result.get("success") is True, result
+        assert result["from_reference"] == "R1"
+        assert result["to_reference"] == "R10"
+        assert result["units_updated"] >= 1
+
+        # Verify the file was actually changed.
+        sch = skip.Schematic(tmp_sch)
+        found_new = False
+        found_old = False
+        for sym in sch.symbol:
+            try:
+                ref = sym.property.Reference.value
+                if ref == "R10":
+                    found_new = True
+                if ref == "R1":
+                    found_old = True
+            except AttributeError:
+                continue
+        assert found_new, "R10 should exist after rename"
+        assert not found_old, "R1 should not exist after rename"
+
+    def test_from_reference_not_found(self, tools, tmp_sch):
+        """Renaming a non-existent reference should return an error."""
+        result = asyncio.run(
+            tools["rename_symbol"](
+                schematic_path=tmp_sch,
+                from_reference="ZZ99",
+                to_reference="R10",
+            )
+        )
+        assert "error" in result
+
+    def test_to_reference_already_exists(self, tools, tmp_sch):
+        """Renaming to an existing reference should return an error."""
+        # R5 already exists in tmp_sch.
+        result = asyncio.run(
+            tools["rename_symbol"](
+                schematic_path=tmp_sch,
+                from_reference="R1",
+                to_reference="R5",
+            )
+        )
+        assert "error" in result
+        assert "already exists" in result["error"]
+
+    def test_same_from_and_to(self, tools, tmp_sch):
+        """Renaming R1 to R1 should return an error."""
+        result = asyncio.run(
+            tools["rename_symbol"](
+                schematic_path=tmp_sch,
+                from_reference="R1",
+                to_reference="R1",
+            )
+        )
+        assert "error" in result
+
+    def test_empty_from_reference(self, tools, tmp_sch):
+        """Empty from_reference should return an error."""
+        result = asyncio.run(
+            tools["rename_symbol"](
+                schematic_path=tmp_sch,
+                from_reference="",
+                to_reference="R10",
+            )
+        )
+        assert "error" in result
+
+    def test_file_not_found(self, tools):
+        """Non-existent file should return an error."""
+        result = asyncio.run(
+            tools["rename_symbol"](
+                schematic_path="/nonexistent/schematic.kicad_sch",
+                from_reference="R1",
+                to_reference="R10",
+            )
+        )
+        assert "error" in result
+
+
+# ---------------------------------------------------------------------------
+# Tests for check_reference_conflicts
+# ---------------------------------------------------------------------------
+
+
+class TestCheckReferenceConflicts:
+    """Tests for the check_reference_conflicts tool."""
+
+    @pytest.fixture()
+    def clean_project(self, tmp_path):
+        """Create a project with unique references across sheets."""
+        proj = tmp_path / "clean_proj"
+        proj.mkdir()
+        (proj / "clean_proj.kicad_pro").write_text("{}")
+        parent = proj / "clean_proj.kicad_sch"
+        parent.write_text(
+            '(kicad_sch (version 20240108) (generator "eeschema")\n'
+            '  (symbol (lib_id "Device:R") (at 0 0 0)\n'
+            '    (property "Reference" "R1" (at 0 0 0))\n'
+            "  )\n"
+            '  (sheet_instances (path "/" (page "1")))\n'
+            ")\n"
+        )
+        sub = proj / "power.kicad_sch"
+        sub.write_text(
+            '(kicad_sch (version 20240108) (generator "eeschema")\n'
+            '  (symbol (lib_id "Device:R") (at 0 0 0)\n'
+            '    (property "Reference" "R2" (at 0 0 0))\n'
+            "  )\n"
+            '  (sheet_instances (path "/" (page "1")))\n'
+            ")\n"
+        )
+        return proj, parent, sub
+
+    @pytest.fixture()
+    def conflict_project(self, tmp_path):
+        """Create a project with conflicting references across sheets."""
+        proj = tmp_path / "conflict_proj"
+        proj.mkdir()
+        (proj / "conflict_proj.kicad_pro").write_text("{}")
+        # Parent has R1 and C1.
+        parent = proj / "conflict_proj.kicad_sch"
+        parent.write_text(
+            '(kicad_sch (version 20240108) (generator "eeschema")\n'
+            '  (symbol (lib_id "Device:R") (at 0 0 0)\n'
+            '    (property "Reference" "R1" (at 0 0 0))\n'
+            "  )\n"
+            '  (symbol (lib_id "Device:C") (at 10 0 0)\n'
+            '    (property "Reference" "C1" (at 10 0 0))\n'
+            "  )\n"
+            '  (sheet_instances (path "/" (page "1")))\n'
+            ")\n"
+        )
+        # Sub-sheet has R1 (conflict!) and C2.
+        sub = proj / "power.kicad_sch"
+        sub.write_text(
+            '(kicad_sch (version 20240108) (generator "eeschema")\n'
+            '  (symbol (lib_id "Device:R") (at 0 0 0)\n'
+            '    (property "Reference" "R1" (at 0 0 0))\n'
+            "  )\n"
+            '  (symbol (lib_id "Device:C") (at 10 0 0)\n'
+            '    (property "Reference" "C2" (at 10 0 0))\n'
+            "  )\n"
+            '  (sheet_instances (path "/" (page "1")))\n'
+            ")\n"
+        )
+        return proj, parent, sub
+
+    def test_detects_conflict(self, tools, conflict_project):
+        """Should detect R1 appearing in both parent and sub-sheet."""
+        proj, parent, sub = conflict_project
+        result = asyncio.run(
+            tools["check_reference_conflicts"](
+                schematic_path=str(parent),
+            )
+        )
+        assert result.get("success") is True, result
+        assert result["schematics_scanned"] == 2
+        conflicts = result["conflicts"]
+        assert len(conflicts) == 1
+        assert conflicts[0]["reference"] == "R1"
+        assert len(conflicts[0]["sheets"]) == 2
+        assert str(parent) in conflicts[0]["sheets"]
+        assert str(sub) in conflicts[0]["sheets"]
+
+    def test_no_conflicts(self, tools, clean_project):
+        """A clean project should have zero conflicts."""
+        proj, parent_sch, sub_sch = clean_project
+        result = asyncio.run(
+            tools["check_reference_conflicts"](
+                schematic_path=str(parent_sch),
+            )
+        )
+        assert result.get("success") is True, result
+        assert result["schematics_scanned"] == 2
+        assert result["conflicts"] == []
+
+    def test_no_project_found(self, tools, tmp_sch):
+        """When no .kicad_pro is found, return empty with a message."""
+        result = asyncio.run(
+            tools["check_reference_conflicts"](
+                schematic_path=tmp_sch,
+            )
+        )
+        assert result.get("success") is True, result
+        assert result["project_dir"] is None
+        assert result["schematics_scanned"] == 0
+        assert result["conflicts"] == []
+
+    def test_invalid_file_extension(self, tools):
+        """Non-.kicad_sch paths should return an error."""
+        result = asyncio.run(
+            tools["check_reference_conflicts"](
+                schematic_path="/tmp/test.kicad_pcb",
+            )
+        )
+        assert "error" in result
