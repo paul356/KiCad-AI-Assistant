@@ -343,7 +343,7 @@ def _find_free_area_impl(
     if bias_x is not None and bias_y is not None:
         hw = width / 2.0
         hh = height / 2.0
-        points.sort(key=lambda p: ((p[0] + hw - bias_x) ** 2 + (p[1] + hh - bias_y) ** 2))
+        points.sort(key=lambda p: (p[0] + hw - bias_x) ** 2 + (p[1] + hh - bias_y) ** 2)
     else:
         points.sort(key=lambda p: (p[0] - x_lo) + (p[1] - y_lo))
 
