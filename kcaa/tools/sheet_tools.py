@@ -50,6 +50,79 @@ def _align_to_grid(value: float) -> float:
     return round(value / GRID_MM) * GRID_MM
 
 
+def _collect_occupied_bboxes(
+    schematic_path: str,
+    exclude_uuid: str | None = None,
+    margin: float = 3.81,
+) -> list:
+    """Collect occupied bounding boxes for overlap detection.
+
+    Gathers sheet symbols, symbol components, and the title block,
+    inflating each by *margin* for clearance.  When *exclude_uuid*
+    is provided, the sheet with that UUID is skipped.
+    """
+    from kcaa.tools.placement_helpers import (
+        _default_title_block_bbox,
+        _parse_paper_size,
+        _sheet_symbol_bbox,
+    )
+    from kcaa.utils.netlist_parser import extract_netlist
+    from kcaa.utils.symbol_geometry import BBox, inflate_bbox
+
+    occupied: list = []
+
+    # Sheet symbols.
+    sheet_info = _list_sheet_symbols_impl(schematic_path)
+    for sheet in sheet_info.get("sheets", []):
+        if exclude_uuid and sheet.get("uuid") == exclude_uuid:
+            continue
+        bb = _sheet_symbol_bbox(sheet)
+        if bb is not None:
+            occupied.append(inflate_bbox(bb, margin))
+
+    # Symbol components (skip type="sheet" — already covered above).
+    netlist = extract_netlist(schematic_path)
+    for ref, comp in (netlist.get("components", {}) or {}).items():
+        if comp.get("type") == "sheet":
+            continue
+        bb_d = comp.get("body_bbox")
+        if not bb_d:
+            continue
+        try:
+            bb = BBox(
+                float(bb_d["min_x"]),
+                float(bb_d["min_y"]),
+                float(bb_d["max_x"]),
+                float(bb_d["max_y"]),
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+        occupied.append(inflate_bbox(bb, margin))
+
+    # Title block.
+    _, sheet_w, sheet_h, _ = _parse_paper_size(schematic_path)
+    occupied.append(_default_title_block_bbox(sheet_w, sheet_h))
+
+    return occupied
+
+
+def _has_position_conflict(
+    schematic_path: str,
+    x: float,
+    y: float,
+    w: float,
+    h: float,
+    exclude_uuid: str | None = None,
+    margin: float = 3.81,
+) -> bool:
+    """Return True if a bbox at (x, y, w, h) overlaps any occupied area."""
+    from kcaa.utils.symbol_geometry import BBox, bboxes_overlap
+
+    cand = BBox(x, y, x + w, y + h)
+    occupied = _collect_occupied_bboxes(schematic_path, exclude_uuid, margin)
+    return any(bboxes_overlap(cand, occ) for occ in occupied)
+
+
 # ---------------------------------------------------------------------------
 # S-expression helpers for manual sheet construction
 # ---------------------------------------------------------------------------
@@ -1137,52 +1210,7 @@ def register_sheet_tools(mcp: FastMCP) -> None:
         place_y = snapped_y
         position_adjusted = False
 
-        # Check if the requested position conflicts with existing objects.
-        from kcaa.tools.placement_helpers import (
-            _default_title_block_bbox,
-            _parse_paper_size,
-            _sheet_symbol_bbox,
-        )
-        from kcaa.utils.netlist_parser import extract_netlist
-        from kcaa.utils.symbol_geometry import BBox, bboxes_overlap, inflate_bbox
-
-        cand_bbox = BBox(snapped_x, snapped_y, snapped_x + eff_w, snapped_y + eff_h)
-        MARGIN = 3.81
-        occupied: list[BBox] = []
-
-        # Other sheet symbols.
-        sheet_info = _list_sheet_symbols_impl(schematic_path)
-        for sheet in sheet_info.get("sheets", []):
-            bb = _sheet_symbol_bbox(sheet)
-            if bb is not None:
-                occupied.append(inflate_bbox(bb, MARGIN))
-
-        # Symbol components.
-        netlist = extract_netlist(schematic_path)
-        for ref, comp in (netlist.get("components", {}) or {}).items():
-            if comp.get("type") == "sheet":
-                continue
-            bb_d = comp.get("body_bbox")
-            if not bb_d:
-                continue
-            try:
-                bb = BBox(
-                    float(bb_d["min_x"]),
-                    float(bb_d["min_y"]),
-                    float(bb_d["max_x"]),
-                    float(bb_d["max_y"]),
-                )
-            except (KeyError, TypeError, ValueError):
-                continue
-            occupied.append(inflate_bbox(bb, MARGIN))
-
-        # Title block.
-        _, sheet_w, sheet_h, _ = _parse_paper_size(schematic_path)
-        occupied.append(_default_title_block_bbox(sheet_w, sheet_h))
-
-        has_conflict = any(bboxes_overlap(cand_bbox, occ) for occ in occupied)
-
-        if has_conflict:
+        if _has_position_conflict(schematic_path, snapped_x, snapped_y, eff_w, eff_h):
             from kcaa.tools.placement_helpers import PlacementHelpers
 
             free_area = PlacementHelpers.find_free_area(
@@ -1284,15 +1312,6 @@ def register_sheet_tools(mcp: FastMCP) -> None:
         requested_position: dict[str, Any] | None = None
 
         if x is not None or y is not None:
-            from kcaa.tools.placement_helpers import (
-                PlacementHelpers,
-                _default_title_block_bbox,
-                _parse_paper_size,
-                _sheet_symbol_bbox,
-            )
-            from kcaa.utils.netlist_parser import extract_netlist
-            from kcaa.utils.symbol_geometry import BBox, bboxes_overlap, inflate_bbox
-
             # Look up current sheet to fill in missing axis and get UUID/size.
             sheet_info = _list_sheet_symbols_impl(schematic_path)
             target_info: dict[str, Any] | None = None
@@ -1315,49 +1334,11 @@ def register_sheet_tools(mcp: FastMCP) -> None:
                 eff_w = _align_to_grid(width if width is not None else cur_w)
                 eff_h = _align_to_grid(height if height is not None else cur_h)
 
-                # Build the candidate bbox at the requested position.
-                cand_bbox = BBox(req_x, req_y, req_x + eff_w, req_y + eff_h)
-                MARGIN = 3.81
+                if _has_position_conflict(
+                    schematic_path, req_x, req_y, eff_w, eff_h, exclude_uuid=sheet_uuid
+                ):
+                    from kcaa.tools.placement_helpers import PlacementHelpers
 
-                # Collect occupied areas: other sheets + components + title block.
-                occupied: list[BBox] = []
-
-                # Other sheet symbols (exclude the sheet being updated).
-                for sheet in sheet_info.get("sheets", []):
-                    if sheet.get("uuid") == sheet_uuid:
-                        continue
-                    bb = _sheet_symbol_bbox(sheet)
-                    if bb is not None:
-                        occupied.append(inflate_bbox(bb, MARGIN))
-
-                # Symbol components.
-                netlist = extract_netlist(schematic_path)
-                for ref, comp in (netlist.get("components", {}) or {}).items():
-                    if comp.get("type") == "sheet":
-                        continue
-                    bb_d = comp.get("body_bbox")
-                    if not bb_d:
-                        continue
-                    try:
-                        bb = BBox(
-                            float(bb_d["min_x"]),
-                            float(bb_d["min_y"]),
-                            float(bb_d["max_x"]),
-                            float(bb_d["max_y"]),
-                        )
-                    except (KeyError, TypeError, ValueError):
-                        continue
-                    occupied.append(inflate_bbox(bb, MARGIN))
-
-                # Title block.
-                _, sheet_w, sheet_h, _ = _parse_paper_size(schematic_path)
-                occupied.append(_default_title_block_bbox(sheet_w, sheet_h))
-
-                # Check if the requested position overlaps anything.
-                has_conflict = any(bboxes_overlap(cand_bbox, occ) for occ in occupied)
-
-                if has_conflict:
-                    # Conflict detected — find the nearest free area.
                     free_area = PlacementHelpers.find_free_area(
                         schematic_path=schematic_path,
                         width=eff_w,
