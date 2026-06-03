@@ -2037,6 +2037,7 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
             if x is not None or y is not None:
                 try:
                     from kcaa.tools.placement_helpers import _find_free_area_impl
+                    from kcaa.tools.sheet_tools import _has_position_conflict
                     from kcaa.utils.netlist_parser import extract_netlist
 
                     netlist = extract_netlist(schematic_path)
@@ -2045,6 +2046,9 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
                     if bb_d:
                         bbox_w = float(bb_d["max_x"]) - float(bb_d["min_x"])
                         bbox_h = float(bb_d["max_y"]) - float(bb_d["min_y"])
+                        # Offset from body_bbox origin to symbol origin (at position).
+                        off_x = float(bb_d["min_x"]) - float(first_at[0])
+                        off_y = float(bb_d["min_y"]) - float(first_at[1])
                         # Determine the UUID of the symbol to exclude it from
                         # the obstacle list while it is being moved.
                         try:
@@ -2060,33 +2064,43 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
                             ][1]
                         except Exception:
                             sym_uuid = None
-                        free = _find_free_area_impl(
-                            schematic_path=schematic_path,
-                            width=bbox_w,
-                            height=bbox_h,
-                            prefer_near={"x": raw_new_x, "y": raw_new_y},
-                            max_candidates=1,
+                        # Try target position first; only search for free area
+                        # if there is an actual conflict.
+                        target_bbox_x = raw_new_x + off_x
+                        target_bbox_y = raw_new_y + off_y
+                        has_conflict = _has_position_conflict(
+                            schematic_path,
+                            target_bbox_x,
+                            target_bbox_y,
+                            bbox_w,
+                            bbox_h,
                             exclude_uuid=sym_uuid,
                         )
-                        cand = (free.get("candidates") or [{}])[0]
-                        origin = cand.get("origin")
-                        if origin is not None:
-                            cand_x = float(origin["x"])
-                            cand_y = float(origin["y"])
-                            # Offset from bbox origin to symbol origin.
-                            off_x = float(bb_d["min_x"]) - float(first_at[0])
-                            off_y = float(bb_d["min_y"]) - float(first_at[1])
-                            # Convert free-area bbox origin back to symbol origin.
-                            adj_x = cand_x - off_x
-                            adj_y = cand_y - off_y
-                            if x is None:
-                                adj_x = raw_new_x
-                            if y is None:
-                                adj_y = raw_new_y
-                            if abs(adj_x - raw_new_x) > 1e-6 or abs(adj_y - raw_new_y) > 1e-6:
-                                final_new_x = _align_to_grid(adj_x)
-                                final_new_y = _align_to_grid(adj_y)
-                                position_adjusted = True
+                        if has_conflict:
+                            free = _find_free_area_impl(
+                                schematic_path=schematic_path,
+                                width=bbox_w,
+                                height=bbox_h,
+                                prefer_near={"x": raw_new_x, "y": raw_new_y},
+                                max_candidates=1,
+                                exclude_uuid=sym_uuid,
+                            )
+                            cand = (free.get("candidates") or [{}])[0]
+                            origin = cand.get("origin")
+                            if origin is not None:
+                                cand_x = float(origin["x"])
+                                cand_y = float(origin["y"])
+                                # Convert free-area bbox origin back to symbol origin.
+                                adj_x = cand_x - off_x
+                                adj_y = cand_y - off_y
+                                if x is None:
+                                    adj_x = raw_new_x
+                                if y is None:
+                                    adj_y = raw_new_y
+                                if abs(adj_x - raw_new_x) > 1e-6 or abs(adj_y - raw_new_y) > 1e-6:
+                                    final_new_x = _align_to_grid(adj_x)
+                                    final_new_y = _align_to_grid(adj_y)
+                                    position_adjusted = True
                 except Exception:
                     pass  # Overlap avoidance is best-effort; proceed with requested coords.
 
