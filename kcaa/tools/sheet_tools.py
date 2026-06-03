@@ -889,6 +889,10 @@ def _do_add_sheet_pin(
     # Generate UUID for the pin
     pin_uuid = str(uuid.uuid4())
 
+    # right/top edges: text reads inward → justify right
+    # left/bottom edges: text reads inward → justify left
+    pin_justify = "right" if edge in ("right", "top") else "left"
+
     # Build the pin S-expression
     pin_entry = [
         sexpdata.Symbol("pin"),
@@ -899,7 +903,7 @@ def _do_add_sheet_pin(
         [
             sexpdata.Symbol("effects"),
             [sexpdata.Symbol("font"), [sexpdata.Symbol("size"), 1.27, 1.27]],
-            [sexpdata.Symbol("justify"), sexpdata.Symbol("left")],
+            [sexpdata.Symbol("justify"), sexpdata.Symbol(pin_justify)],
         ],
     ]
 

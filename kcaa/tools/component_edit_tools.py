@@ -441,6 +441,7 @@ def _find_project_name(schematic_path: str) -> str:
 
 
 _REFERENCE_RE = re.compile(r'\(property\s+"Reference"\s+"([^"]+)"')
+_SHEET_FILE_RE = re.compile(r'\(property\s+"Sheet\s+[Ff]ile"\s+"([^"]+)"')
 
 
 def _find_project_dir(schematic_path: str) -> Path | None:
@@ -456,28 +457,61 @@ def _find_project_dir(schematic_path: str) -> Path | None:
     return None
 
 
-def _collect_project_references(schematic_path: str) -> dict[str, set[str]]:
-    """Collect all symbol references from every .kicad_sch in a project.
+def _find_root_schematic(schematic_path: str) -> str | None:
+    """Return the root .kicad_sch path for the project containing *schematic_path*.
 
-    Scans every ``*.kicad_sch`` file under the project directory and
-    extracts reference designators via regex (much faster than full parsing).
-    Returns a dict mapping each absolute schematic path to its set of
-    reference strings.  Returns an empty dict if no project root is found.
+    Finds the .kicad_pro file via ``_find_project_dir``, then looks for a
+    .kicad_sch with the same stem in the project directory.  Returns None if
+    no project or matching root schematic is found.
     """
     project_dir = _find_project_dir(schematic_path)
     if project_dir is None:
-        return {}
+        return None
+    pro_files = list(project_dir.glob("*.kicad_pro"))
+    if not pro_files:
+        return None
+    root_sch = project_dir / (pro_files[0].stem + ".kicad_sch")
+    return str(root_sch) if root_sch.is_file() else None
 
+
+def _collect_hierarchy_references(schematic_path: str) -> dict[str, set[str]]:
+    """Collect symbol references by following the sheet hierarchy from a root schematic.
+
+    Starting from *schematic_path*, follows ``Sheet file`` property references
+    recursively and extracts reference designators via regex.
+    Returns a dict mapping each absolute schematic path to its set of
+    reference strings.  Does not scan directories unreachable from the root
+    (e.g. ``.history`` folders).
+    """
+    root = os.path.realpath(schematic_path)
     refs_by_file: dict[str, set[str]] = {}
-    for sch_path in sorted(project_dir.rglob("*.kicad_sch")):
+    visited: set[str] = set()
+    queue: list[str] = [root]
+
+    while queue:
+        current = queue.pop()
+        if current in visited:
+            continue
+        visited.add(current)
+
         try:
-            text = sch_path.read_text(encoding="utf-8")
+            text = Path(current).read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
             continue
+
         ref_set: set[str] = set()
         for m in _REFERENCE_RE.finditer(text):
             ref_set.add(m.group(1))
-        refs_by_file[str(sch_path)] = ref_set
+        refs_by_file[current] = ref_set
+
+        parent_dir = os.path.dirname(current)
+        for m in _SHEET_FILE_RE.finditer(text):
+            child_file = m.group(1)
+            if not os.path.isabs(child_file):
+                child_file = os.path.join(parent_dir, child_file)
+            child_real = os.path.realpath(child_file)
+            if child_real not in visited:
+                queue.append(child_real)
 
     return refs_by_file
 
@@ -508,9 +542,14 @@ def _next_reference(sch: Any, prefix: str, schematic_path: str | None = None) ->
     except AttributeError:
         pass
 
-    # Also scan all other schematic files in the project.
+    # Also scan all schematics reachable from the project root hierarchy.
     if schematic_path is not None:
-        for file_path, ref_set in _collect_project_references(schematic_path).items():
+        root_sch = _find_root_schematic(schematic_path)
+        if root_sch is not None:
+            hierarchy = _collect_hierarchy_references(root_sch)
+        else:
+            hierarchy = {}
+        for file_path, ref_set in hierarchy.items():
             # Skip the current file — we already scanned its refs above.
             if os.path.normpath(file_path) == os.path.normpath(schematic_path):
                 continue
@@ -1536,41 +1575,46 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
     @mcp.tool()
     async def rename_symbol(
         schematic_path: str,
-        from_reference: str,
-        to_reference: str | None = None,
+        symbol_uuid: str,
+        target_reference: str | None = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Rename a symbol's reference designator in a schematic.
 
-        Updates the ``Reference`` property on every unit of the symbol
-        identified by *from_reference*.  A backup (.kicad_sch.bak) is
-        written before saving.
+        Identifies the symbol by *symbol_uuid* (the ``uuid`` field from the
+        ``.kicad_sch`` s-expression, returned by ``extract_schematic_netlist``
+        in the ``uuid`` field of each component entry).  Once the anchor unit
+        is located its current ``Reference`` property is read, and then every
+        unit sharing that reference designator is updated together.
 
-        If *to_reference* is omitted, the next available reference for the
+        A backup (.kicad_sch.bak) is written before saving.
+
+        If *target_reference* is omitted, the next available reference for the
         same prefix is auto-assigned (scanning all project ``*.kicad_sch``
         files to avoid cross-sheet conflicts).
 
         Args:
             schematic_path: Absolute path to the target .kicad_sch file.
-            from_reference: Current reference designator (e.g. "R1").
-            to_reference: New reference designator (e.g. "R10").  When
-                ``None`` (default), the next free reference for the same
+            symbol_uuid: UUID of any placed unit of the symbol to rename
+                (e.g. ``"a27313ed-36db-4154-9e69-a66c07529185"``).  Obtain
+                this from ``extract_schematic_netlist`` → component ``uuid``.
+            target_reference: New reference designator (e.g. ``"R10"``).
+                When ``None`` (default), the next free reference for the same
                 prefix is assigned automatically.
 
         Returns:
-            dict with keys: success (bool), from_reference, to_reference
-            (the final reference used), units_updated (int), file_modified,
-            backup_path, and auto_assigned (bool, ``True`` when
-            *to_reference* was auto-generated).
+            dict with keys: success (bool), current_reference (the reference
+            before the rename), target_reference (the final reference used),
+            units_updated (int), file_modified, backup_path, and
+            auto_assigned (bool, ``True`` when *target_reference* was
+            auto-generated).
         """
         if not schematic_path.endswith(".kicad_sch"):
             return {"error": f"Not a .kicad_sch file: {schematic_path!r}"}
         if not os.path.isfile(schematic_path):
             return {"error": f"Schematic file not found: {schematic_path!r}"}
-        if not from_reference:
-            return {"error": "from_reference must not be empty"}
-        if to_reference is not None and from_reference == to_reference:
-            return {"error": "from_reference and to_reference are the same"}
+        if not symbol_uuid:
+            return {"error": "symbol_uuid must not be empty"}
 
         try:
             sch = safe_schematic(schematic_path)
@@ -1578,37 +1622,57 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
             return {"error": f"Failed to open schematic: {exc}"}
 
         try:
-            # Collect all units with from_reference.
+            # Find the anchor unit by UUID to determine current_reference.
+            anchor: Any | None = None
+            try:
+                for sym in sch.symbol:
+                    try:
+                        if sym.uuid.value == symbol_uuid:
+                            anchor = sym
+                            break
+                    except AttributeError:
+                        continue
+            except AttributeError:
+                pass
+
+            if anchor is None:
+                return {"error": f"No symbol with UUID {symbol_uuid!r} found"}
+
+            try:
+                current_reference = anchor.property.Reference.value
+            except AttributeError:
+                return {"error": f"Symbol with UUID {symbol_uuid!r} has no Reference property"}
+
+            if target_reference is not None and current_reference == target_reference:
+                return {"error": "current_reference and target_reference are the same"}
+
+            # Collect all units sharing current_reference (the full component).
             units: list[Any] = []
             try:
                 for sym in sch.symbol:
                     try:
-                        if sym.property.Reference.value == from_reference:
+                        if sym.property.Reference.value == current_reference:
                             units.append(sym)
                     except AttributeError:
                         continue
             except AttributeError:
                 pass
 
-            if not units:
-                return {"error": f"No symbol with reference {from_reference!r} found"}
-
-            # Auto-assign to_reference if not provided.
+            # Auto-assign target_reference if not provided.
             auto_assigned = False
-            if to_reference is None:
-                # Extract the prefix from from_reference (e.g. "R" from "R1").
-                prefix_match = re.match(r"^([A-Za-z]+)", from_reference)
+            if target_reference is None:
+                prefix_match = re.match(r"^([A-Za-z]+)", current_reference)
                 prefix = prefix_match.group(1) if prefix_match else "U"
-                to_reference = _next_reference(sch, prefix, schematic_path=schematic_path)
+                target_reference = _next_reference(sch, prefix, schematic_path=schematic_path)
                 auto_assigned = True
 
-            # Check that to_reference does not already exist (skip the
+            # Check that target_reference does not already exist (skip the
             # symbol being renamed itself).
             for sym in sch.symbol:
                 try:
-                    if sym not in units and sym.property.Reference.value == to_reference:
+                    if sym not in units and sym.property.Reference.value == target_reference:
                         return {
-                            "error": f"Target reference {to_reference!r} already exists in this schematic"
+                            "error": f"Target reference {target_reference!r} already exists in this schematic"
                         }
                 except AttributeError:
                     continue
@@ -1617,9 +1681,9 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
             for sym in units:
                 ref_prop = _find_property_by_name(sym, "Reference")
                 if ref_prop is not None:
-                    ref_prop.value = to_reference
+                    ref_prop.value = target_reference
                 else:
-                    return {"error": f"Symbol {from_reference!r} has no Reference property"}
+                    return {"error": f"Symbol {current_reference!r} has no Reference property"}
 
             try:
                 save_schematic(schematic_path, sch)
@@ -1628,8 +1692,8 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
 
             return {
                 "success": True,
-                "from_reference": from_reference,
-                "to_reference": to_reference,
+                "current_reference": current_reference,
+                "target_reference": target_reference,
                 "auto_assigned": auto_assigned,
                 "units_updated": len(units),
                 "file_modified": schematic_path,
@@ -2271,18 +2335,17 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
     ) -> dict[str, Any]:
         """Check for duplicate reference designators across a KiCad project.
 
-        Scans every ``*.kicad_sch`` file under the project directory and
-        reports any reference designators that appear in more than one
-        schematic file.  This catches the common mistake where a sub-sheet
-        symbol accidentally reuses a reference already claimed in the
-        parent sheet or another sub-sheet.
+        Follows the sheet hierarchy from the given schematic and reports any
+        reference designators that appear in more than one schematic file.
+        Only schematics referenced (directly or transitively) from
+        *schematic_path* are scanned — backup or history folders are not
+        included.
 
         Args:
-            schematic_path: Absolute path to any .kicad_sch file in the
-                project.  The project root is auto-detected from this path.
+            schematic_path: Absolute path to the root .kicad_sch file.
 
         Returns:
-            dict with keys: success (bool), project_dir (str or null),
+            dict with keys: success (bool), root_schematic (str or null),
             schematics_scanned (int), conflicts (list of {reference, sheets}).
         """
         if not schematic_path.endswith(".kicad_sch"):
@@ -2294,13 +2357,14 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
         if project_dir is None:
             return {
                 "success": True,
-                "project_dir": None,
+                "root_schematic": None,
                 "schematics_scanned": 0,
                 "conflicts": [],
                 "message": "No .kicad_pro found — cannot determine project scope",
             }
 
-        refs_by_file = _collect_project_references(schematic_path)
+        root_sch = _find_root_schematic(schematic_path) or schematic_path
+        refs_by_file = _collect_hierarchy_references(root_sch)
 
         # Invert: reference → list of files where it appears.
         ref_to_files: dict[str, list[str]] = {}
@@ -2317,7 +2381,7 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
 
         return {
             "success": True,
-            "project_dir": str(project_dir),
+            "root_schematic": root_sch,
             "schematics_scanned": len(refs_by_file),
             "conflicts": conflicts,
         }

@@ -1406,6 +1406,10 @@ class TestNextReferenceCrossFile:
             '  (symbol (lib_id "Device:R") (at 10 0 0)\n'
             '    (property "Reference" "R3" (at 10 0 0))\n'
             "  )\n"
+            "  (sheet (at 10 10) (size 20 10)\n"
+            '    (property "Sheet name" "Sub" (at 20 10 0))\n'
+            '    (property "Sheet file" "sub/sub.kicad_sch" (at 20 10 0))\n'
+            "  )\n"
             '  (sheet_instances (path "/" (page "1")))\n'
             ")\n"
         )
@@ -1451,14 +1455,14 @@ class TestNextReferenceCrossFile:
             assert result is None
 
     def test_collect_project_references(self, project_dir):
-        """_collect_project_references gathers refs from all schematics."""
-        from kcaa.tools.component_edit_tools import _collect_project_references
+        """_collect_hierarchy_references gathers refs from the sheet hierarchy."""
+        from kcaa.tools.component_edit_tools import _collect_hierarchy_references
 
         proj, parent_sch, sub_sch = project_dir
-        refs = _collect_project_references(str(parent_sch))
+        refs = _collect_hierarchy_references(str(parent_sch))
         assert len(refs) == 2  # two .kicad_sch files
-        parent_refs = refs[str(parent_sch)]
-        sub_refs = refs[str(sub_sch)]
+        parent_refs = refs[str(parent_sch.resolve())]
+        sub_refs = refs[str(sub_sch.resolve())]
         assert parent_refs == {"R1", "R3"}
         assert sub_refs == {"R2"}
 
@@ -1514,13 +1518,13 @@ class TestRenameSymbol:
         result = asyncio.run(
             tools["rename_symbol"](
                 schematic_path=tmp_sch,
-                from_reference="R1",
-                to_reference="R10",
+                current_reference="R1",
+                target_reference="R10",
             )
         )
         assert result.get("success") is True, result
-        assert result["from_reference"] == "R1"
-        assert result["to_reference"] == "R10"
+        assert result["current_reference"] == "R1"
+        assert result["target_reference"] == "R10"
         assert result["units_updated"] >= 1
 
         # Verify the file was actually changed.
@@ -1539,65 +1543,65 @@ class TestRenameSymbol:
         assert found_new, "R10 should exist after rename"
         assert not found_old, "R1 should not exist after rename"
 
-    def test_from_reference_not_found(self, tools, tmp_sch):
+    def test_current_reference_not_found(self, tools, tmp_sch):
         """Renaming a non-existent reference should return an error."""
         result = asyncio.run(
             tools["rename_symbol"](
                 schematic_path=tmp_sch,
-                from_reference="ZZ99",
-                to_reference="R10",
+                current_reference="ZZ99",
+                target_reference="R10",
             )
         )
         assert "error" in result
 
-    def test_to_reference_already_exists(self, tools, tmp_sch):
+    def test_target_reference_already_exists(self, tools, tmp_sch):
         """Renaming to an existing reference should return an error."""
         # R5 already exists in tmp_sch.
         result = asyncio.run(
             tools["rename_symbol"](
                 schematic_path=tmp_sch,
-                from_reference="R1",
-                to_reference="R5",
+                current_reference="R1",
+                target_reference="R5",
             )
         )
         assert "error" in result
         assert "already exists" in result["error"]
 
-    def test_same_from_and_to(self, tools, tmp_sch):
+    def test_same_current_and_target(self, tools, tmp_sch):
         """Renaming R1 to R1 should return an error."""
         result = asyncio.run(
             tools["rename_symbol"](
                 schematic_path=tmp_sch,
-                from_reference="R1",
-                to_reference="R1",
+                current_reference="R1",
+                target_reference="R1",
             )
         )
         assert "error" in result
 
-    def test_empty_from_reference(self, tools, tmp_sch):
-        """Empty from_reference should return an error."""
+    def test_empty_current_reference(self, tools, tmp_sch):
+        """Empty current_reference should return an error."""
         result = asyncio.run(
             tools["rename_symbol"](
                 schematic_path=tmp_sch,
-                from_reference="",
-                to_reference="R10",
+                current_reference="",
+                target_reference="R10",
             )
         )
         assert "error" in result
 
     def test_auto_assign_next_reference(self, tools, tmp_sch):
-        """When to_reference is omitted, auto-assign the next free reference."""
+        """When target_reference is omitted, auto-assign the next free reference."""
         result = asyncio.run(
             tools["rename_symbol"](
                 schematic_path=tmp_sch,
-                from_reference="R1",
-                # to_reference omitted — auto-assign
+                current_reference="R1",
+                # target_reference omitted — auto-assign
             )
         )
         assert result.get("success") is True, result
         assert result["auto_assigned"] is True
         # tmp_sch has R1..R7, so next should be R8.
-        assert result["to_reference"] == "R8"
+        assert result["target_reference"] == "R8"
 
         # Verify R1 is gone and R8 is present.
         sch = skip.Schematic(tmp_sch)
@@ -1610,26 +1614,26 @@ class TestRenameSymbol:
         assert "R1" not in refs
         assert "R8" in refs
 
-    def test_explicit_to_reference_not_auto_assigned(self, tools, tmp_sch):
-        """When to_reference is provided, auto_assigned should be False."""
+    def test_explicit_target_reference_not_auto_assigned(self, tools, tmp_sch):
+        """When target_reference is provided, auto_assigned should be False."""
         result = asyncio.run(
             tools["rename_symbol"](
                 schematic_path=tmp_sch,
-                from_reference="R1",
-                to_reference="R10",
+                current_reference="R1",
+                target_reference="R10",
             )
         )
         assert result.get("success") is True, result
         assert result["auto_assigned"] is False
-        assert result["to_reference"] == "R10"
+        assert result["target_reference"] == "R10"
 
     def test_file_not_found(self, tools):
         """Non-existent file should return an error."""
         result = asyncio.run(
             tools["rename_symbol"](
                 schematic_path="/nonexistent/schematic.kicad_sch",
-                from_reference="R1",
-                to_reference="R10",
+                current_reference="R1",
+                target_reference="R10",
             )
         )
         assert "error" in result
@@ -1654,6 +1658,10 @@ class TestCheckReferenceConflicts:
             '(kicad_sch (version 20240108) (generator "eeschema")\n'
             '  (symbol (lib_id "Device:R") (at 0 0 0)\n'
             '    (property "Reference" "R1" (at 0 0 0))\n'
+            "  )\n"
+            "  (sheet (at 10 10) (size 20 10)\n"
+            '    (property "Sheet name" "Power" (at 20 10 0))\n'
+            '    (property "Sheet file" "power.kicad_sch" (at 20 10 0))\n'
             "  )\n"
             '  (sheet_instances (path "/" (page "1")))\n'
             ")\n"
@@ -1684,6 +1692,10 @@ class TestCheckReferenceConflicts:
             "  )\n"
             '  (symbol (lib_id "Device:C") (at 10 0 0)\n'
             '    (property "Reference" "C1" (at 10 0 0))\n'
+            "  )\n"
+            "  (sheet (at 10 10) (size 20 10)\n"
+            '    (property "Sheet name" "Power" (at 20 10 0))\n'
+            '    (property "Sheet file" "power.kicad_sch" (at 20 10 0))\n'
             "  )\n"
             '  (sheet_instances (path "/" (page "1")))\n'
             ")\n"
@@ -1740,7 +1752,7 @@ class TestCheckReferenceConflicts:
             )
         )
         assert result.get("success") is True, result
-        assert result["project_dir"] is None
+        assert result["root_schematic"] is None
         assert result["schematics_scanned"] == 0
         assert result["conflicts"] == []
 
