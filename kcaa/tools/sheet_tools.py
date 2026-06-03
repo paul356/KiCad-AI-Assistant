@@ -101,7 +101,8 @@ def _collect_occupied_bboxes(
 
     # Title block.
     _, sheet_w, sheet_h, _ = _parse_paper_size(schematic_path)
-    occupied.append(_default_title_block_bbox(sheet_w, sheet_h))
+    tb = _default_title_block_bbox(sheet_w, sheet_h)
+    occupied.append(tb)
 
     return occupied
 
@@ -120,7 +121,18 @@ def _has_position_conflict(
 
     cand = BBox(x, y, x + w, y + h)
     occupied = _collect_occupied_bboxes(schematic_path, exclude_uuid, margin)
-    return any(bboxes_overlap(cand, occ) for occ in occupied)
+    conflicts = [occ for occ in occupied if bboxes_overlap(cand, occ)]
+    if conflicts:
+        log.info(
+            "_has_position_conflict: bbox(%s, %s, %sx%s) conflicts with %d areas: %s",
+            x,
+            y,
+            w,
+            h,
+            len(conflicts),
+            [(occ.min_x, occ.min_y, occ.max_x, occ.max_y) for occ in conflicts],
+        )
+    return bool(conflicts)
 
 
 # ---------------------------------------------------------------------------
@@ -1211,6 +1223,13 @@ def register_sheet_tools(mcp: FastMCP) -> None:
         position_adjusted = False
 
         if _has_position_conflict(schematic_path, snapped_x, snapped_y, eff_w, eff_h):
+            log.info(
+                "add_sheet_symbol: target (%s, %s) %sx%s conflicts, searching free area",
+                snapped_x,
+                snapped_y,
+                eff_w,
+                eff_h,
+            )
             from kcaa.tools.placement_helpers import PlacementHelpers
 
             free_area = PlacementHelpers.find_free_area(
@@ -1229,6 +1248,20 @@ def register_sheet_tools(mcp: FastMCP) -> None:
                     place_x = candidate_x
                     place_y = candidate_y
                     position_adjusted = True
+                    log.info(
+                        "add_sheet_symbol: adjusted to nearest free (%s, %s) "
+                        "from requested (%s, %s)",
+                        place_x,
+                        place_y,
+                        snapped_x,
+                        snapped_y,
+                    )
+                else:
+                    log.info(
+                        "add_sheet_symbol: nearest free is same as target (%s, %s)",
+                        snapped_x,
+                        snapped_y,
+                    )
 
         result = _do_add_sheet_symbol(
             schematic_path=schematic_path,
@@ -1334,6 +1367,19 @@ def register_sheet_tools(mcp: FastMCP) -> None:
                 eff_w = _align_to_grid(width if width is not None else cur_w)
                 eff_h = _align_to_grid(height if height is not None else cur_h)
 
+                log.info(
+                    "update_sheet_symbol: sheet=%s uuid=%s requested=(%s,%s) "
+                    "current=(%s,%s) size=%sx%s",
+                    sheet_identifier,
+                    sheet_uuid,
+                    req_x,
+                    req_y,
+                    cur_x,
+                    cur_y,
+                    eff_w,
+                    eff_h,
+                )
+
                 if _has_position_conflict(
                     schematic_path, req_x, req_y, eff_w, eff_h, exclude_uuid=sheet_uuid
                 ):
@@ -1349,6 +1395,12 @@ def register_sheet_tools(mcp: FastMCP) -> None:
                     )
                     candidate = (free_area.get("candidates") or [{}])[0]
                     origin = candidate.get("origin")
+                    log.info(
+                        "update_sheet_symbol: find_free_area returned %d candidates, "
+                        "picked origin=%s",
+                        len(free_area.get("candidates") or []),
+                        origin,
+                    )
                     if origin is not None:
                         cand_x = float(origin["x"])
                         cand_y = float(origin["y"])
@@ -1361,6 +1413,20 @@ def register_sheet_tools(mcp: FastMCP) -> None:
                         place_x = cand_x
                         place_y = cand_y
                         position_adjusted = True
+                        log.info(
+                            "update_sheet_symbol: adjusted to nearest free (%s, %s) "
+                            "from requested (%s, %s)",
+                            place_x,
+                            place_y,
+                            req_x,
+                            req_y,
+                        )
+                    else:
+                        log.info(
+                            "update_sheet_symbol: nearest free is same as target (%s, %s)",
+                            req_x,
+                            req_y,
+                        )
 
         result = _do_update_sheet_symbol(
             schematic_path=schematic_path,

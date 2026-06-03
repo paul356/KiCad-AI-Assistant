@@ -2077,6 +2077,15 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
                             exclude_uuid=sym_uuid,
                         )
                         if has_conflict:
+                            log.info(
+                                "move_component: target (%s, %s) bbox %sx%s conflicts "
+                                "(ref=%s), searching free area",
+                                raw_new_x,
+                                raw_new_y,
+                                bbox_w,
+                                bbox_h,
+                                reference,
+                            )
                             free = _find_free_area_impl(
                                 schematic_path=schematic_path,
                                 width=bbox_w,
@@ -2101,6 +2110,15 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
                                     final_new_x = _align_to_grid(adj_x)
                                     final_new_y = _align_to_grid(adj_y)
                                     position_adjusted = True
+                                    log.info(
+                                        "move_component: adjusted to nearest free (%s, %s) "
+                                        "from requested (%s, %s) (ref=%s)",
+                                        final_new_x,
+                                        final_new_y,
+                                        raw_new_x,
+                                        raw_new_y,
+                                        reference,
+                                    )
                 except Exception:
                     pass  # Overlap avoidance is best-effort; proceed with requested coords.
 

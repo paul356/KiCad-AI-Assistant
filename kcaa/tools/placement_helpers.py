@@ -242,11 +242,22 @@ def _find_free_area_impl(
 
         sheet_result = _list_sheet_symbols_impl(schematic_path)
         for sheet in sheet_result.get("sheets", []):
-            if exclude_uuid and sheet.get("uuid") == exclude_uuid:
-                continue
             bb = _sheet_symbol_bbox(sheet)
-            if bb is not None:
-                occupied.append(inflate_bbox(bb, margin))
+            if bb is None:
+                continue
+            if exclude_uuid and sheet.get("uuid") == exclude_uuid:
+                log.info(
+                    "find_free_area: sheet-symbol-own-bbox (%.1f,%.1f)-(%.1f,%.1f) w=%.1f h=%.1f name=%s",
+                    bb.min_x,
+                    bb.min_y,
+                    bb.max_x,
+                    bb.max_y,
+                    bb.width,
+                    bb.height,
+                    sheet.get("sheet_name", ""),
+                )
+                continue
+            occupied.append(inflate_bbox(bb, margin))
     except Exception as exc:
         log.warning("Failed to collect sheet symbol bboxes for overlap detection: %s", exc)
 
@@ -255,24 +266,13 @@ def _find_free_area_impl(
     title_bb = _default_title_block_bbox(sheet_w, sheet_h)
     occupied.append(title_bb)
 
-    log.debug(
+    log.info(
         "find_free_area: occupied=%d (components=%d sheets=%d), margin=%.2f",
         len(occupied),
         len(ref_bboxes),
         len(sheet_result.get("sheets", [])) - (1 if exclude_uuid else 0),
         margin,
     )
-    for i, occ in enumerate(occupied):
-        log.debug(
-            "  occupied[%d]: (%.1f, %.1f)-(%.1f, %.1f) w=%.1f h=%.1f",
-            i,
-            occ.min_x,
-            occ.min_y,
-            occ.max_x,
-            occ.max_y,
-            occ.width,
-            occ.height,
-        )
 
     # Drawing area minus 10 mm margin so the bbox fits fully on-sheet.
     edge = 10.0
@@ -280,8 +280,21 @@ def _find_free_area_impl(
     y_lo = edge
     x_hi = sheet_w - edge - width
     y_hi = sheet_h - edge - height
+    log.info(
+        "find_free_area: drawing_area sheet=%.0fx%.0f bbox=%.1fx%.1f edge=%.0f scan=(%.1f..%.1f, %.1f..%.1f) grid=%.2f",
+        sheet_w,
+        sheet_h,
+        width,
+        height,
+        edge,
+        x_lo,
+        x_hi,
+        y_lo,
+        y_hi,
+        GRID_MM,
+    )
     if x_hi < x_lo or y_hi < y_lo:
-        log.debug(
+        log.info(
             "find_free_area: area too small — sheet=%.0fx%.0f target=%.1fx%.1f edge=%.1f",
             sheet_w,
             sheet_h,
@@ -307,18 +320,6 @@ def _find_free_area_impl(
             except (TypeError, ValueError):
                 bias_x = bias_y = None
 
-    log.debug(
-        "find_free_area: scan x[%.1f..%.1f] y[%.1f..%.1f] bias=(%.1f, %.1f) target=%.1fx%.1f",
-        x_lo,
-        x_hi,
-        y_lo,
-        y_hi,
-        bias_x if bias_x is not None else -1,
-        bias_y if bias_y is not None else -1,
-        width,
-        height,
-    )
-
     # Snap scan to grid.
     def _snap_up(v: float) -> float:
         n = int(v / GRID_MM)
@@ -329,59 +330,94 @@ def _find_free_area_impl(
     x0 = _snap_up(x_lo)
     y0 = _snap_up(y_lo)
 
-    candidates: list[dict[str, Any]] = []
-    # Cap to keep scan bounded on huge sheets / very small targets.
-    max_collect = max(50, max_candidates * 50)
+    # --- Build all grid positions, sorted by distance to bias ---
+    points: list[tuple[float, float]] = []
     x = x0
-    outer_break = False
-    while x <= x_hi + 1e-9 and not outer_break:
+    while x <= x_hi + 1e-9:
         y = y0
         while y <= y_hi + 1e-9:
-            cand = BBox(x, y, x + width, y + height)
-            conflict = False
-            for occ in occupied:
-                if bboxes_overlap(cand, occ):
-                    conflict = True
-                    break
-            if not conflict:
-                if bias_x is not None and bias_y is not None:
-                    cx = (cand.min_x + cand.max_x) / 2.0
-                    cy = (cand.min_y + cand.max_y) / 2.0
-                    dist = ((cx - bias_x) ** 2 + (cy - bias_y) ** 2) ** 0.5
-                else:
-                    # Prefer top-left when no bias is given.
-                    dist = (x - x_lo) + (y - y_lo)
-                cand_dict: dict[str, Any] = {
-                    "origin": {"x": x, "y": y},
-                    "bbox": cand.to_dict(),
-                    "_dist": dist,
-                }
-                if sym_bbox_offset is not None:
-                    # bbox.min = sym + offset → sym = bbox.min - offset.
-                    cand_dict["placement"] = {
-                        "x": round(x - sym_bbox_offset[0], 4),
-                        "y": round(y - sym_bbox_offset[1], 4),
-                    }
-                candidates.append(cand_dict)
-                if len(candidates) >= max_collect:
-                    outer_break = True
-                    break
+            points.append((x, y))
             y += GRID_MM
         x += GRID_MM
 
-    candidates.sort(key=lambda c: c["_dist"])
-    top_dist = candidates[0]["_dist"] if candidates else -1
-    out = []
-    for c in candidates[: max(1, max_candidates)]:
-        c.pop("_dist", None)
-        out.append(c)
+    if bias_x is not None and bias_y is not None:
+        hw = width / 2.0
+        hh = height / 2.0
+        points.sort(key=lambda p: ((p[0] + hw - bias_x) ** 2 + (p[1] + hh - bias_y) ** 2))
+    else:
+        points.sort(key=lambda p: (p[0] - x_lo) + (p[1] - y_lo))
 
-    log.debug(
-        "find_free_area: found=%d returned=%d top_dist=%.1f",
-        len(candidates),
-        len(out),
-        top_dist,
+    log.info(
+        "find_free_area: %d grid points sorted, scanning nearest-first",
+        len(points),
     )
+
+    # --- Scan in distance order; stop on first conflict-free position ---
+    out: list[dict[str, Any]] = []
+    _conflict_logged: set[tuple[float, float, float, float]] = set()
+    scanned = 0
+    for px, py in points:
+        scanned += 1
+        cand = BBox(px, py, px + width, py + height)
+        conflict = False
+        for occ in occupied:
+            if bboxes_overlap(cand, occ):
+                conflict = True
+                occ_key = (
+                    round(occ.min_x, 2),
+                    round(occ.min_y, 2),
+                    round(occ.max_x, 2),
+                    round(occ.max_y, 2),
+                )
+                if occ_key not in _conflict_logged:
+                    _conflict_logged.add(occ_key)
+                    log.info(
+                        "find_free_area: CONFLICT cand(%.2f,%.2f)-(%.2f,%.2f) %.1fx%.1f"
+                        "  with occ(%.2f,%.2f)-(%.2f,%.2f) %.1fx%.1f",
+                        cand.min_x,
+                        cand.min_y,
+                        cand.max_x,
+                        cand.max_y,
+                        cand.width,
+                        cand.height,
+                        occ.min_x,
+                        occ.min_y,
+                        occ.max_x,
+                        occ.max_y,
+                        occ.width,
+                        occ.height,
+                    )
+                break
+        if not conflict:
+            cand_dict: dict[str, Any] = {
+                "origin": {"x": px, "y": py},
+                "bbox": cand.to_dict(),
+            }
+            if sym_bbox_offset is not None:
+                cand_dict["placement"] = {
+                    "x": round(px - sym_bbox_offset[0], 4),
+                    "y": round(py - sym_bbox_offset[1], 4),
+                }
+            out.append(cand_dict)
+            if len(out) >= max(1, max_candidates):
+                break
+
+    log.info(
+        "find_free_area: %d distinct occupied bboxes blocked positions (of %d total)",
+        len(_conflict_logged),
+        len(occupied),
+    )
+    if out:
+        origin = out[0]["origin"]
+        log.info(
+            "find_free_area: best origin=(%.1f, %.1f) — first hit after scanning "
+            "%d points in distance order",
+            origin["x"],
+            origin["y"],
+            scanned,
+        )
+    else:
+        log.warning("find_free_area: no free position found on sheet")
 
     return {
         "candidates": out,
