@@ -1,0 +1,12 @@
+(kicad_sch (version 20260306) (generator "kcaa") (generator_version "0.2.0")
+  (uuid "7888f5cc-e222-4383-ac91-ba495f94795f")
+  (paper "A4")
+  (title_block
+    (title "Feedback Network")
+  )
+  (lib_symbols)
+  (sheet_instances
+    (path "/7888f5cc-e222-4383-ac91-ba495f94795f" (page "1"))
+  )
+  (embedded_fonts no)
+)

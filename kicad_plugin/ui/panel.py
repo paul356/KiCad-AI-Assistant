@@ -1672,9 +1672,6 @@ if _WX_AVAILABLE:
                 e = dict(entry)  # shallow copy — don't mutate originals
                 if e["type"] == "ai":
                     e["text"] = self._md_to_html(e.get("text", ""))
-                elif e["type"] == "tool_call":
-                    e["args"] = self._truncate_for_ui(e.get("args", {}), self._MAX_UI_JSON)
-                    e["result"] = self._truncate_for_ui(e.get("result", {}), self._MAX_UI_JSON)
                 elif e["type"] == "autoroute_log":
                     raw_out = (e.get("stdout") or "").strip()
                     raw_err = (e.get("stderr") or "").strip()
@@ -1696,9 +1693,6 @@ if _WX_AVAILABLE:
             e = dict(entry)
             if e["type"] == "ai":
                 e["text"] = self._md_to_html(e.get("text", ""))
-            elif e["type"] == "tool_call":
-                e["args"] = self._truncate_for_ui(e.get("args", {}), self._MAX_UI_JSON)
-                e["result"] = self._truncate_for_ui(e.get("result", {}), self._MAX_UI_JSON)
             elif e["type"] == "autoroute_log":
                 raw_out = (e.get("stdout") or "").strip()
                 raw_err = (e.get("stderr") or "").strip()
@@ -2061,40 +2055,6 @@ if _WX_AVAILABLE:
                         0, int(f * self._conv_view.GetScrollRange(wx.VERTICAL))
                     ),
                 )
-
-        # Maximum character length for tool args/result JSON in UI display.
-        # Keeps HTML size manageable for WebView2 (large NavigateToString payloads
-        # cause the control to freeze on Windows).  LLM history is unaffected.
-        _MAX_UI_JSON = 2000
-
-        @staticmethod
-        def _truncate_for_ui(obj: Any, max_chars: int = 2000) -> Any:
-            """Truncate large objects for UI display in tool_call entries.
-
-            Returns the original object if its JSON representation is within
-            *max_chars* characters; otherwise returns a truncated string.
-            The LLM conversation history always stores the full object.
-            """
-            import json as _json
-
-            try:
-                s = _json.dumps(obj, separators=(",", ":"), default=str)
-            except (TypeError, ValueError):
-                return repr(obj)
-            if len(s) <= max_chars:
-                return obj
-            return s[:max_chars] + f"… [{len(s)} chars total]"
-
-        @staticmethod
-        def _json_dump_safe(value: Any, *, indent: int | None = None) -> str:
-            import json as _json
-
-            try:
-                if indent is None:
-                    return _json.dumps(value, separators=(",", ":"), default=str)
-                return _json.dumps(value, indent=indent, default=str)
-            except (TypeError, ValueError):
-                return repr(value)
 
 else:
     # Fallback stub when wx is not available (e.g., during unit tests or dev)

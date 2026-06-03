@@ -29,6 +29,30 @@ from kcaa.utils.symbol_geometry import (
 log = logging.getLogger(__name__)
 
 
+def _sheet_symbol_bbox(sheet_info: dict[str, Any]) -> BBox | None:
+    """Compute world-space bbox of a sheet symbol from its position and size.
+
+    Pin coordinates are intentionally excluded because different code paths
+    store pin ``at`` in local vs world space (inconsistent convention).
+    The ``margin`` applied by the caller provides sufficient clearance for
+    pin labels/stubs that extend beyond the sheet rectangle.
+    """
+    pos = sheet_info.get("position")
+    size = sheet_info.get("size")
+    if not pos or not size:
+        return None
+    try:
+        x = float(pos["x"])
+        y = float(pos["y"])
+        w = float(size["width"])
+        h = float(size["height"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if w <= 0 or h <= 0:
+        return None
+    return BBox(x, y, x + w, y + h)
+
+
 # Standard KiCad paper sizes, width x height in mm, landscape orientation.
 _PAPER_SIZES_MM: dict[str, tuple[float, float]] = {
     "A0": (1189.0, 841.0),
@@ -113,6 +137,324 @@ def _default_title_block_bbox(sheet_w: float, sheet_h: float) -> BBox:
         max_x=sheet_w,
         max_y=sheet_h,
     )
+
+
+def _find_free_area_impl(
+    schematic_path: str,
+    width: float | None = None,
+    height: float | None = None,
+    prefer_near: dict[str, Any] | None = None,
+    margin: float = 3.81,
+    max_candidates: int = 5,
+    for_library: str | None = None,
+    for_symbol: str | None = None,
+    rotation: int = 0,
+    exclude_uuid: str | None = None,
+) -> dict[str, Any]:
+    """Core implementation shared by the MCP tool and sheet auto-placement."""
+    if not os.path.exists(schematic_path):
+        return {"error": f"Schematic not found: {schematic_path}"}
+
+    # Optional symbol-aware mode: derive size + sym→bbox offset.
+    sym_bbox_offset: tuple[float, float] | None = None
+    if for_library and for_symbol:
+        try:
+            from kcaa.tools.component_edit_tools import _get_index_manager
+            from kcaa.utils.symbol_extractor import extract_lib_symbol_raw
+
+            mgr = _get_index_manager()
+            lib_rec = mgr.get_library_by_name(for_library)
+            if lib_rec is None:
+                return {"error": f"Library '{for_library}' not found in index"}
+            sym_rec = mgr.get_symbol(for_library, for_symbol)
+            if sym_rec is None:
+                return {"error": (f"Symbol '{for_symbol}' not found in library '{for_library}'")}
+            lib_raw = extract_lib_symbol_raw(
+                lib_rec.file_path,
+                sym_rec.file_index,
+                for_symbol,
+                lib_rec.mtime,
+                lib_rec.file_size,
+            )
+            unit_bbs = compute_unit_bboxes(lib_raw)
+            if not unit_bbs:
+                return {
+                    "error": (
+                        f"Symbol '{for_symbol}' has no graphics; cannot derive size for placement"
+                    )
+                }
+            # Predict union over every unit at sym=(0, (N-1)*10) — same
+            # offsets used by add_symbol_to_schematic.
+            per_unit = []
+            for unit, lib_bb in sorted(unit_bbs.items()):
+                per_unit.append(
+                    lib_bbox_to_world(lib_bb, 0.0, (unit - 1) * 10.0, int(rotation), None)
+                )
+            ref_at_origin = union_bboxes(per_unit)
+            if ref_at_origin is None:
+                raise ValueError("ref_at_origin is None, cannot compute bounding box dimensions")
+            derived_w = ref_at_origin.max_x - ref_at_origin.min_x
+            derived_h = ref_at_origin.max_y - ref_at_origin.min_y
+            sym_bbox_offset = (ref_at_origin.min_x, ref_at_origin.min_y)
+            if width is None:
+                width = derived_w
+            if height is None:
+                height = derived_h
+        except Exception as exc:
+            return {"error": f"Failed to inspect symbol for placement: {exc}"}
+
+    if width is None or height is None:
+        return {
+            "error": ("width and height are required unless for_library/for_symbol are provided")
+        }
+    if width <= 0 or height <= 0:
+        return {"error": "width and height must be positive"}
+
+    # Collect occupied bboxes (already mm, +Y down).
+    # Skip type="sheet" components — sheets are covered by _list_sheet_symbols_impl below
+    # (avoiding double-counting and simplifying UUID-based exclusion).
+    netlist = extract_netlist(schematic_path)
+    components: dict[str, Any] = netlist.get("components", {}) or {}
+
+    occupied: list[BBox] = []
+    ref_bboxes: dict[str, BBox] = {}
+    for ref, comp in components.items():
+        if comp.get("type") == "sheet":
+            continue
+        bb_d = comp.get("body_bbox")
+        if not bb_d:
+            continue
+        try:
+            bb = BBox(
+                float(bb_d["min_x"]),
+                float(bb_d["min_y"]),
+                float(bb_d["max_x"]),
+                float(bb_d["max_y"]),
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+        ref_bboxes[ref] = bb
+        occupied.append(inflate_bbox(bb, margin))
+
+    # Collect sheet symbol bboxes, excluding the sheet being moved (by UUID).
+    try:
+        from kcaa.tools.sheet_tools import _list_sheet_symbols_impl
+
+        sheet_result = _list_sheet_symbols_impl(schematic_path)
+        for sheet in sheet_result.get("sheets", []):
+            bb = _sheet_symbol_bbox(sheet)
+            if bb is None:
+                continue
+            if exclude_uuid and sheet.get("uuid") == exclude_uuid:
+                log.info(
+                    "find_free_area: sheet-symbol-own-bbox (%.1f,%.1f)-(%.1f,%.1f) w=%.1f h=%.1f name=%s",
+                    bb.min_x,
+                    bb.min_y,
+                    bb.max_x,
+                    bb.max_y,
+                    bb.width,
+                    bb.height,
+                    sheet.get("sheet_name", ""),
+                )
+                continue
+            occupied.append(inflate_bbox(bb, margin))
+    except Exception as exc:
+        log.warning("Failed to collect sheet symbol bboxes for overlap detection: %s", exc)
+
+    # Sheet bounds and exclusions.
+    _, sheet_w, sheet_h, _ = _parse_paper_size(schematic_path)
+    title_bb = _default_title_block_bbox(sheet_w, sheet_h)
+    occupied.append(title_bb)
+
+    log.info(
+        "find_free_area: occupied=%d (components=%d sheets=%d), margin=%.2f",
+        len(occupied),
+        len(ref_bboxes),
+        len(sheet_result.get("sheets", [])) - (1 if exclude_uuid else 0),
+        margin,
+    )
+
+    # Drawing area minus 10 mm margin so the bbox fits fully on-sheet.
+    edge = 10.0
+    x_lo = edge
+    y_lo = edge
+    x_hi = sheet_w - edge - width
+    y_hi = sheet_h - edge - height
+    log.info(
+        "find_free_area: drawing_area sheet=%.0fx%.0f bbox=%.1fx%.1f edge=%.0f scan=(%.1f..%.1f, %.1f..%.1f) grid=%.2f",
+        sheet_w,
+        sheet_h,
+        width,
+        height,
+        edge,
+        x_lo,
+        x_hi,
+        y_lo,
+        y_hi,
+        GRID_MM,
+    )
+    if x_hi < x_lo or y_hi < y_lo:
+        log.info(
+            "find_free_area: area too small — sheet=%.0fx%.0f target=%.1fx%.1f edge=%.1f",
+            sheet_w,
+            sheet_h,
+            width,
+            height,
+            edge,
+        )
+        return {"candidates": [], "error": "Requested area larger than drawing area."}
+
+    # Resolve prefer_near to a point.
+    bias_x: float | None = None
+    bias_y: float | None = None
+    if prefer_near:
+        if "reference" in prefer_near:
+            ref_bb = ref_bboxes.get(prefer_near["reference"])
+            if ref_bb is not None:
+                bias_x = (ref_bb.min_x + ref_bb.max_x) / 2.0
+                bias_y = (ref_bb.min_y + ref_bb.max_y) / 2.0
+        elif "x" in prefer_near and "y" in prefer_near:
+            try:
+                bias_x = float(prefer_near["x"])
+                bias_y = float(prefer_near["y"])
+            except (TypeError, ValueError):
+                bias_x = bias_y = None
+
+    # Snap scan to grid.
+    def _snap_up(v: float) -> float:
+        n = int(v / GRID_MM)
+        while n * GRID_MM < v - 1e-9:
+            n += 1
+        return n * GRID_MM
+
+    x0 = _snap_up(x_lo)
+    y0 = _snap_up(y_lo)
+
+    # --- Build all grid positions, sorted by distance to bias ---
+    points: list[tuple[float, float]] = []
+    x = x0
+    while x <= x_hi + 1e-9:
+        y = y0
+        while y <= y_hi + 1e-9:
+            points.append((x, y))
+            y += GRID_MM
+        x += GRID_MM
+
+    if bias_x is not None and bias_y is not None:
+        hw = width / 2.0
+        hh = height / 2.0
+        points.sort(key=lambda p: (p[0] + hw - bias_x) ** 2 + (p[1] + hh - bias_y) ** 2)
+    else:
+        points.sort(key=lambda p: (p[0] - x_lo) + (p[1] - y_lo))
+
+    log.info(
+        "find_free_area: %d grid points sorted, scanning nearest-first",
+        len(points),
+    )
+
+    # --- Scan in distance order; stop on first conflict-free position ---
+    out: list[dict[str, Any]] = []
+    _conflict_logged: set[tuple[float, float, float, float]] = set()
+    scanned = 0
+    for px, py in points:
+        scanned += 1
+        cand = BBox(px, py, px + width, py + height)
+        conflict = False
+        for occ in occupied:
+            if bboxes_overlap(cand, occ):
+                conflict = True
+                occ_key = (
+                    round(occ.min_x, 2),
+                    round(occ.min_y, 2),
+                    round(occ.max_x, 2),
+                    round(occ.max_y, 2),
+                )
+                if occ_key not in _conflict_logged:
+                    _conflict_logged.add(occ_key)
+                    log.info(
+                        "find_free_area: CONFLICT cand(%.2f,%.2f)-(%.2f,%.2f) %.1fx%.1f"
+                        "  with occ(%.2f,%.2f)-(%.2f,%.2f) %.1fx%.1f",
+                        cand.min_x,
+                        cand.min_y,
+                        cand.max_x,
+                        cand.max_y,
+                        cand.width,
+                        cand.height,
+                        occ.min_x,
+                        occ.min_y,
+                        occ.max_x,
+                        occ.max_y,
+                        occ.width,
+                        occ.height,
+                    )
+                break
+        if not conflict:
+            cand_dict: dict[str, Any] = {
+                "origin": {"x": px, "y": py},
+                "bbox": cand.to_dict(),
+            }
+            if sym_bbox_offset is not None:
+                cand_dict["placement"] = {
+                    "x": round(px - sym_bbox_offset[0], 4),
+                    "y": round(py - sym_bbox_offset[1], 4),
+                }
+            out.append(cand_dict)
+            if len(out) >= max(1, max_candidates):
+                break
+
+    log.info(
+        "find_free_area: %d distinct occupied bboxes blocked positions (of %d total)",
+        len(_conflict_logged),
+        len(occupied),
+    )
+    if out:
+        origin = out[0]["origin"]
+        log.info(
+            "find_free_area: best origin=(%.1f, %.1f) — first hit after scanning "
+            "%d points in distance order",
+            origin["x"],
+            origin["y"],
+            scanned,
+        )
+    else:
+        log.warning("find_free_area: no free position found on sheet")
+
+    return {
+        "candidates": out,
+        "margin_mm": margin,
+        "grid_mm": GRID_MM,
+        "axis_convention": "mm, +Y is down",
+    }
+
+
+class PlacementHelpers:
+    """Reusable placement helper logic shared across MCP tools."""
+
+    @staticmethod
+    def find_free_area(
+        schematic_path: str,
+        width: float | None = None,
+        height: float | None = None,
+        prefer_near: dict[str, Any] | None = None,
+        margin: float = 3.81,
+        max_candidates: int = 5,
+        for_library: str | None = None,
+        for_symbol: str | None = None,
+        rotation: int = 0,
+        exclude_uuid: str | None = None,
+    ) -> dict[str, Any]:
+        return _find_free_area_impl(
+            schematic_path=schematic_path,
+            width=width,
+            height=height,
+            prefer_near=prefer_near,
+            margin=margin,
+            max_candidates=max_candidates,
+            for_library=for_library,
+            for_symbol=for_symbol,
+            rotation=rotation,
+            exclude_uuid=exclude_uuid,
+        )
 
 
 def register_placement_helpers(mcp: FastMCP) -> None:
@@ -216,181 +558,14 @@ def register_placement_helpers(mcp: FastMCP) -> None:
                                 "placement": {"x": ..., "y": ...}? }, ...]}``
             sorted by preference. Empty list if nothing fits.
         """
-        if not os.path.exists(schematic_path):
-            return {"error": f"Schematic not found: {schematic_path}"}
-
-        # Optional symbol-aware mode: derive size + sym→bbox offset.
-        sym_bbox_offset: tuple[float, float] | None = None
-        if for_library and for_symbol:
-            try:
-                from kcaa.tools.component_edit_tools import _get_index_manager
-                from kcaa.utils.symbol_extractor import extract_lib_symbol_raw
-
-                mgr = _get_index_manager()
-                lib_rec = mgr.get_library_by_name(for_library)
-                if lib_rec is None:
-                    return {"error": f"Library '{for_library}' not found in index"}
-                sym_rec = mgr.get_symbol(for_library, for_symbol)
-                if sym_rec is None:
-                    return {
-                        "error": (f"Symbol '{for_symbol}' not found in library '{for_library}'")
-                    }
-                lib_raw = extract_lib_symbol_raw(
-                    lib_rec.file_path,
-                    sym_rec.file_index,
-                    for_symbol,
-                    lib_rec.mtime,
-                    lib_rec.file_size,
-                )
-                unit_bbs = compute_unit_bboxes(lib_raw)
-                if not unit_bbs:
-                    return {
-                        "error": (
-                            f"Symbol '{for_symbol}' has no graphics; "
-                            "cannot derive size for placement"
-                        )
-                    }
-                # Predict union over every unit at sym=(0, (N-1)*10) — same
-                # offsets used by add_symbol_to_schematic.
-                per_unit = []
-                for unit, lib_bb in sorted(unit_bbs.items()):
-                    per_unit.append(
-                        lib_bbox_to_world(lib_bb, 0.0, (unit - 1) * 10.0, int(rotation), None)
-                    )
-                ref_at_origin = union_bboxes(per_unit)
-                if ref_at_origin is None:
-                    raise ValueError(
-                        "ref_at_origin is None, cannot compute bounding box dimensions"
-                    )
-                derived_w = ref_at_origin.max_x - ref_at_origin.min_x
-                derived_h = ref_at_origin.max_y - ref_at_origin.min_y
-                sym_bbox_offset = (ref_at_origin.min_x, ref_at_origin.min_y)
-                if width is None:
-                    width = derived_w
-                if height is None:
-                    height = derived_h
-            except Exception as exc:
-                return {"error": f"Failed to inspect symbol for placement: {exc}"}
-
-        if width is None or height is None:
-            return {
-                "error": (
-                    "width and height are required unless for_library/for_symbol are provided"
-                )
-            }
-        if width <= 0 or height <= 0:
-            return {"error": "width and height must be positive"}
-
-        # Collect occupied bboxes (already mm, +Y down).
-        netlist = extract_netlist(schematic_path)
-        components: dict[str, Any] = netlist.get("components", {}) or {}
-
-        occupied: list[BBox] = []
-        ref_bboxes: dict[str, BBox] = {}
-        for ref, comp in components.items():
-            bb_d = comp.get("body_bbox")
-            if not bb_d:
-                continue
-            try:
-                bb = BBox(
-                    float(bb_d["min_x"]),
-                    float(bb_d["min_y"]),
-                    float(bb_d["max_x"]),
-                    float(bb_d["max_y"]),
-                )
-            except (KeyError, TypeError, ValueError):
-                continue
-            ref_bboxes[ref] = bb
-            occupied.append(inflate_bbox(bb, margin))
-
-        # Sheet bounds and exclusions.
-        _, sheet_w, sheet_h, _ = _parse_paper_size(schematic_path)
-        title_bb = _default_title_block_bbox(sheet_w, sheet_h)
-        occupied.append(title_bb)
-
-        # Drawing area minus 10 mm margin so the bbox fits fully on-sheet.
-        edge = 10.0
-        x_lo = edge
-        y_lo = edge
-        x_hi = sheet_w - edge - width
-        y_hi = sheet_h - edge - height
-        if x_hi < x_lo or y_hi < y_lo:
-            return {"candidates": [], "error": "Requested area larger than drawing area."}
-
-        # Resolve prefer_near to a point.
-        bias_x: float | None = None
-        bias_y: float | None = None
-        if prefer_near:
-            if "reference" in prefer_near:
-                ref_bb = ref_bboxes.get(prefer_near["reference"])
-                if ref_bb is not None:
-                    bias_x = (ref_bb.min_x + ref_bb.max_x) / 2.0
-                    bias_y = (ref_bb.min_y + ref_bb.max_y) / 2.0
-            elif "x" in prefer_near and "y" in prefer_near:
-                try:
-                    bias_x = float(prefer_near["x"])
-                    bias_y = float(prefer_near["y"])
-                except (TypeError, ValueError):
-                    bias_x = bias_y = None
-
-        # Snap scan to grid.
-        def _snap_up(v: float) -> float:
-            n = int(v / GRID_MM)
-            while n * GRID_MM < v - 1e-9:
-                n += 1
-            return n * GRID_MM
-
-        x0 = _snap_up(x_lo)
-        y0 = _snap_up(y_lo)
-
-        candidates: list[dict[str, Any]] = []
-        # Cap to keep scan bounded on huge sheets / very small targets.
-        max_collect = max(50, max_candidates * 50)
-        x = x0
-        outer_break = False
-        while x <= x_hi + 1e-9 and not outer_break:
-            y = y0
-            while y <= y_hi + 1e-9:
-                cand = BBox(x, y, x + width, y + height)
-                conflict = False
-                for occ in occupied:
-                    if bboxes_overlap(cand, occ):
-                        conflict = True
-                        break
-                if not conflict:
-                    if bias_x is not None and bias_y is not None:
-                        cx = (cand.min_x + cand.max_x) / 2.0
-                        cy = (cand.min_y + cand.max_y) / 2.0
-                        dist = ((cx - bias_x) ** 2 + (cy - bias_y) ** 2) ** 0.5
-                    else:
-                        # Prefer top-left when no bias is given.
-                        dist = (x - x_lo) + (y - y_lo)
-                    cand_dict: dict[str, Any] = {
-                        "origin": {"x": x, "y": y},
-                        "bbox": cand.to_dict(),
-                        "_dist": dist,
-                    }
-                    if sym_bbox_offset is not None:
-                        # bbox.min = sym + offset → sym = bbox.min - offset.
-                        cand_dict["placement"] = {
-                            "x": round(x - sym_bbox_offset[0], 4),
-                            "y": round(y - sym_bbox_offset[1], 4),
-                        }
-                    candidates.append(cand_dict)
-                    if len(candidates) >= max_collect:
-                        outer_break = True
-                        break
-                y += GRID_MM
-            x += GRID_MM
-
-        candidates.sort(key=lambda c: c["_dist"])
-        out = []
-        for c in candidates[: max(1, max_candidates)]:
-            c.pop("_dist", None)
-            out.append(c)
-        return {
-            "candidates": out,
-            "margin_mm": margin,
-            "grid_mm": GRID_MM,
-            "axis_convention": "mm, +Y is down",
-        }
+        return PlacementHelpers.find_free_area(
+            schematic_path=schematic_path,
+            width=width,
+            height=height,
+            prefer_near=prefer_near,
+            margin=margin,
+            max_candidates=max_candidates,
+            for_library=for_library,
+            for_symbol=for_symbol,
+            rotation=rotation,
+        )

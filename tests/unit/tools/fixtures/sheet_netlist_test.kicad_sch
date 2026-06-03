@@ -1,0 +1,46 @@
+(kicad_sch (version 20260306) (generator "kcaa") (generator_version "0.2.0")
+  (uuid "11111111-1111-1111-1111-111111111111")
+  (paper "A4")
+  (lib_symbols)
+  (wire
+    (pts
+      (xy 76.2 63.5)
+      (xy 88.9 63.5)
+    )
+    (stroke (width 0) (type default))
+    (uuid "22222222-2222-2222-2222-222222222222")
+  )
+  (sheet
+    (at 50.8 50.8)
+    (size 25.4 25.4)
+    (stroke (width 0) (type dash))
+    (fill (type none))
+    (uuid "33333333-3333-3333-3333-333333333333")
+    (property "Sheet name" "Power"
+      (at 0 0 0)
+      (show_name no)
+      (do_not_autoplace yes)
+      (effects (font (size 1.27 1.27)) (justify left))
+    )
+    (property "Sheet file" "power.kicad_sch"
+      (at 0 0 0)
+      (show_name no)
+      (do_not_autoplace yes)
+      (effects (font (size 1.27 1.27)) (justify left))
+    )
+    (pin "VCC" input
+      (at 76.2 63.5 0)
+      (uuid "44444444-4444-4444-4444-444444444444")
+      (effects (font (size 1.27 1.27)) (justify left))
+    )
+    (instances
+      (project "sheet-netlist-test"
+        (path "/33333333-3333-3333-3333-333333333333" (page "1"))
+      )
+    )
+  )
+  (sheet_instances
+    (path "/" (page "1"))
+  )
+  (embedded_fonts no)
+)

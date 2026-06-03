@@ -94,6 +94,10 @@ def register_netlist_tools(mcp: FastMCP) -> None:
         This is the primary tool for spatial and connectivity reasoning. Each
         entry in ``components`` (keyed by reference) contains:
 
+        - Sub-sheets also appear in ``components`` with ``type="sheet"``.
+          Their hierarchical pins are exposed like component pins and use the
+          sheet-pin name as their local net name.
+
         - ``position``: ``{x, y}`` placement anchor in mm (KiCad screen coords,
           **+Y is down**).
         - ``rotation``, ``mirror``, ``lib_id``, ``value``, ``footprint``.
@@ -227,9 +231,15 @@ def register_netlist_tools(mcp: FastMCP) -> None:
             components = {
                 ref: {
                     "value": cdata.get("value", ""),
+                    "type": cdata.get("type", "component"),
                     "position": cdata.get("position", {}),
                     "pins": [
-                        {**pinfo, "net": pin_to_net.get((ref, str(pinfo.get("num", ""))))}
+                        {
+                            **pinfo,
+                            "net": pin_to_net.get(
+                                (ref, str(pinfo.get("num", pinfo.get("number", ""))))
+                            ),
+                        }
                         for pinfo in cdata.get("pins", [])
                     ],
                     **({"body_bbox": cdata["body_bbox"]} if "body_bbox" in cdata else {}),
@@ -247,7 +257,12 @@ def register_netlist_tools(mcp: FastMCP) -> None:
             }
 
             # Analyze component types
-            for ref in components:
+            for ref, cdata in components.items():
+                if cdata.get("type") == "sheet":
+                    analysis["component_types"]["sheet"] = (
+                        analysis["component_types"].get("sheet", 0) + 1
+                    )
+                    continue
                 comp_type_match = re.match(r"^([A-Za-z_]+)", ref)
                 if comp_type_match:
                     comp_type = comp_type_match.group(1)

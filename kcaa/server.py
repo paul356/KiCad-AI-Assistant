@@ -39,6 +39,7 @@ from kcaa.tools.pcb_placement_tools import register_pcb_placement_tools
 from kcaa.tools.pcb_query_tools import register_pcb_query_tools
 from kcaa.tools.pcb_zone_tools import register_pcb_zone_tools
 from kcaa.tools.placement_helpers import register_placement_helpers
+from kcaa.tools.sheet_tools import register_sheet_tools
 from kcaa.tools.symbol_tools import register_symbol_tools
 from kcaa.tools.version_tools import register_version_tools
 from kcaa.tools.wire_edit_tools import register_wire_edit_tools
@@ -110,6 +111,7 @@ def _register_plugin_profile(mcp: FastMCP) -> None:
     register_netlist_tools(mcp)
     register_symbol_tools(mcp)
     register_component_edit_tools(mcp)
+    register_sheet_tools(mcp)
     register_wire_edit_tools(mcp)
     register_pcb_library_tools(mcp)
     register_pcb_query_tools(mcp)
@@ -166,6 +168,7 @@ def _register_full_profile(mcp: FastMCP) -> None:
     register_pattern_tools(mcp)
     register_symbol_tools(mcp)
     register_component_edit_tools(mcp)
+    register_sheet_tools(mcp)
     register_wire_edit_tools(mcp)
     register_pcb_library_tools(mcp)
     register_pcb_query_tools(mcp)

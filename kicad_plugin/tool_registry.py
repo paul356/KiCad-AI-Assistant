@@ -59,6 +59,12 @@ TOOL_POLICIES: dict[str, ToolPolicy] = {
         auto_snapshot=True,
         mark_dirty=True,
     ),
+    "rename_symbol": ToolPolicy(
+        kind="file_mutation",
+        path_arg="schematic_path",
+        auto_snapshot=True,
+        mark_dirty=True,
+    ),
     "list_component_properties": ToolPolicy(kind="query"),
     "delete_component_property": ToolPolicy(
         kind="file_mutation",
@@ -80,6 +86,40 @@ TOOL_POLICIES: dict[str, ToolPolicy] = {
     ),
     "list_labels_in_schematic": ToolPolicy(kind="query"),
     "delete_label_from_schematic": ToolPolicy(
+        kind="file_mutation",
+        path_arg="schematic_path",
+        auto_snapshot=True,
+        mark_dirty=True,
+    ),
+    "check_reference_conflicts": ToolPolicy(kind="query"),
+    # Sheet tools
+    "list_sheet_symbols": ToolPolicy(kind="query"),
+    "get_sheet_hierarchy": ToolPolicy(kind="query"),
+    "add_sheet_symbol": ToolPolicy(
+        kind="file_mutation",
+        path_arg="schematic_path",
+        auto_snapshot=True,
+        mark_dirty=True,
+    ),
+    "remove_sheet_symbol": ToolPolicy(
+        kind="file_mutation",
+        path_arg="schematic_path",
+        auto_snapshot=True,
+        mark_dirty=True,
+    ),
+    "update_sheet_symbol": ToolPolicy(
+        kind="file_mutation",
+        path_arg="schematic_path",
+        auto_snapshot=True,
+        mark_dirty=True,
+    ),
+    "add_sheet_pin": ToolPolicy(
+        kind="file_mutation",
+        path_arg="schematic_path",
+        auto_snapshot=True,
+        mark_dirty=True,
+    ),
+    "remove_sheet_pin": ToolPolicy(
         kind="file_mutation",
         path_arg="schematic_path",
         auto_snapshot=True,

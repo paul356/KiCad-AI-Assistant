@@ -17,6 +17,7 @@ import uuid
 from fastmcp import Context, FastMCP
 import sexpdata
 
+from kcaa.tools.sheet_tools import _normalize_collection, _sheet_dict_from_wrapper
 from kcaa.utils.config import LibraryPathConfig
 from kcaa.utils.schematic_sexp_utils import save_schematic
 from kcaa.utils.skip_compat import safe_schematic
@@ -32,6 +33,9 @@ from kcaa.utils.symbol_index_reader import SymbolIndexReader
 
 log = logging.getLogger(__name__)
 
+VALID_LABEL_TYPES = ("local", "global", "hierarchical")
+VALID_SHAPES = ("input", "output", "bidirectional", "tri_state", "passive")
+
 
 def _angle_to_direction(angle_deg: int | float) -> str:
     """Convert a screen-space label/pin angle to a human-readable direction string.
@@ -44,6 +48,20 @@ def _angle_to_direction(angle_deg: int | float) -> str:
     """
     a = int(round(float(angle_deg))) % 360
     return {0: "right", 90: "down", 180: "left", 270: "up"}.get(a, f"{a}deg")
+
+
+def _iter_schematic_labels(sch: Any, attr_name: str) -> list[Any]:
+    """Safely iterate label-like elements from a schematic attribute."""
+    try:
+        coll = getattr(sch, attr_name)
+    except AttributeError:
+        return []
+
+    elements = getattr(coll, "_elements", None)
+    if elements is not None:
+        return list(elements)
+
+    return [coll]
 
 
 # ---------------------------------------------------------------------------
@@ -316,7 +334,7 @@ def _do_add_symbol(
             ):
                 prefix = child[2] if isinstance(child[2], str) else "U"
                 break
-        reference = _next_reference(sch, prefix)
+        reference = _next_reference(sch, prefix, schematic_path=schematic_path)
 
         project_name = _find_project_name(schematic_path)
 
@@ -423,28 +441,169 @@ def _find_project_name(schematic_path: str) -> str:
     return "project"
 
 
-def _next_reference(sch: Any, prefix: str) -> str:
-    """
-    Auto-assign the next available reference designator for a given prefix.
+def _find_project_dir(schematic_path: str) -> Path | None:
+    """Find the KiCad project directory containing a .kicad_pro file.
 
-    Scans sch.symbol for references that start with ``prefix`` followed by
-    digits, finds the maximum integer suffix, and returns prefix + (max+1).
-    Returns prefix + "1" if no existing references match.
+    Searches the schematic's directory first, then the parent directory.
+    Returns the directory Path, or None if no .kicad_pro is found.
+    """
+    sch_dir = Path(schematic_path).parent
+    for search_dir in (sch_dir, sch_dir.parent):
+        if list(search_dir.glob("*.kicad_pro")):
+            return search_dir
+    return None
+
+
+def _find_root_schematic(schematic_path: str) -> str | None:
+    """Return the root .kicad_sch path for the project containing *schematic_path*.
+
+    Finds the .kicad_pro file via ``_find_project_dir``, then looks for a
+    .kicad_sch with the same stem in the project directory.  Returns None if
+    no project or matching root schematic is found.
+    """
+    project_dir = _find_project_dir(schematic_path)
+    if project_dir is None:
+        return None
+    pro_files = list(project_dir.glob("*.kicad_pro"))
+    if not pro_files:
+        return None
+    root_sch = project_dir / (pro_files[0].stem + ".kicad_sch")
+    return str(root_sch) if root_sch.is_file() else None
+
+
+def _read_instance_reference(sym: Any) -> str | None:
+    """Extract the reference from ``sym.instances``, which is KiCad's authoritative
+    reference for placed symbols.  Returns ``None`` when the instances block is
+    missing or unparseable.
+    """
+    try:
+        for item in sym.instances:
+            return item.path.reference.value
+    except (AttributeError, TypeError, StopIteration):
+        return None
+    return None
+
+
+def _update_instance_reference(sym: Any, new_ref: str) -> None:
+    """Update ``sym.instances.path.reference`` if it exists.  This keeps the
+    instances block in sync after a rename so KiCad displays the correct value.
+    """
+    try:
+        for item in sym.instances:
+            item.path.reference.value = new_ref
+    except (AttributeError, TypeError):
+        pass
+
+
+def _collect_hierarchy_references(schematic_path: str) -> dict[str, dict[str, str]]:
+    """Collect symbol references with anchor UUIDs by following the sheet hierarchy.
+
+    Uses the ``skip`` library to parse each schematic.  ``sch.symbol``
+    provides only placed symbol instances — ``lib_symbols`` template
+    definitions are automatically excluded.
+
+    For multi-unit symbols (e.g. ``U1A`` / ``U1B``) only the UUID of unit 1
+    (the anchor unit) is recorded.
+
+    Returns:
+        ``{absolute_file_path: {reference_designator: anchor_uuid}}``.
+    """
+    root = os.path.realpath(schematic_path)
+    refs_by_file: dict[str, dict[str, str]] = {}
+    visited: set[str] = set()
+    queue: list[str] = [root]
+
+    while queue:
+        current = queue.pop()
+        if current in visited:
+            continue
+        visited.add(current)
+
+        if not os.path.isfile(current):
+            continue
+
+        try:
+            sch = safe_schematic(current)
+        except (OSError, ValueError, RuntimeError) as e:
+            log.warning("Failed to parse schematic %s: %s", current, e)
+            continue
+
+        # Collect refs from placed symbols — sch.symbol excludes lib_symbols.
+        ref_to_uuid: dict[str, str] = {}
+        for sym in sch.symbol:
+            try:
+                # Prefer instances.path.reference (KiCad's authoritative reference)
+                # over property.Reference which can be stale after manual edits.
+                ref = _read_instance_reference(sym)
+                if ref is None:
+                    ref = sym.property.Reference.value
+                sym_uuid = sym.uuid.value
+            except AttributeError:
+                continue
+            unit = getattr(getattr(sym, "unit", None), "value", 1)
+            # For multi-unit symbols, keep only the anchor unit's UUID.
+            if ref not in ref_to_uuid or unit == 1:
+                ref_to_uuid[ref] = sym_uuid
+        refs_by_file[current] = ref_to_uuid
+
+        # Follow sheet hierarchy via skip's sheet wrapper.
+        parent_dir = os.path.dirname(current)
+        raw_sheets = getattr(sch, "sheet", None)
+        for s in _normalize_collection(raw_sheets):
+            info = _sheet_dict_from_wrapper(s)
+            sheet_file = info.get("sheet_file")
+            if sheet_file:
+                if not os.path.isabs(sheet_file):
+                    sheet_file = os.path.join(parent_dir, sheet_file)
+                child_real = os.path.realpath(sheet_file)
+                if child_real not in visited:
+                    queue.append(child_real)
+
+    return refs_by_file
+
+
+def _next_reference(sch: Any, prefix: str, schematic_path: str | None = None) -> str:
+    """Auto-assign the next available reference designator for a given prefix.
+
+    Scans ``sch.symbol`` for references that start with *prefix* followed by
+    digits, finds the maximum integer suffix, and returns ``prefix + (max+1)``.
+    When *schematic_path* is provided, also scans all ``*.kicad_sch`` files
+    under the project directory to avoid conflicts across sub-sheets.
+
+    Returns ``prefix + "1"`` if no existing references match.
     """
     suffix_re = re.compile(r"^" + re.escape(prefix) + r"(\d+)$")
     max_n = 0
+
+    # Scan the current schematic's symbols first.
     try:
         for sym in sch.symbol:
             try:
-                ref_val = sym.property.Reference.value
+                ref_val = _read_instance_reference(sym) or sym.property.Reference.value
                 m = suffix_re.match(ref_val)
                 if m:
                     max_n = max(max_n, int(m.group(1)))
             except AttributeError:
                 continue
     except AttributeError:
-        # sch.symbol doesn't exist on an empty schematic.
         pass
+
+    # Also scan all schematics reachable from the project root hierarchy.
+    if schematic_path is not None:
+        root_sch = _find_root_schematic(schematic_path)
+        if root_sch is not None:
+            hierarchy = _collect_hierarchy_references(root_sch)
+        else:
+            hierarchy = {}
+        for file_path, ref_set in hierarchy.items():
+            # Skip the current file — we already scanned its refs above.
+            if os.path.normpath(file_path) == os.path.normpath(schematic_path):
+                continue
+            for ref_str in ref_set.keys():
+                m = suffix_re.match(ref_str)
+                if m:
+                    max_n = max(max_n, int(m.group(1)))
+
     return f"{prefix}{max_n + 1}"
 
 
@@ -1460,6 +1619,141 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
             return {"error": str(exc), "success": False}
 
     @mcp.tool()
+    async def rename_symbol(
+        schematic_path: str,
+        symbol_uuid: str,
+        target_reference: str | None = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Rename a symbol's reference designator in a schematic.
+
+        Identifies the symbol by *symbol_uuid* (the ``uuid`` field from the
+        ``.kicad_sch`` s-expression, returned by ``extract_schematic_netlist``
+        in the ``uuid`` field of each component entry).  Once the anchor unit
+        is located its current ``Reference`` property is read, and then every
+        unit sharing that reference designator is updated together.
+
+        A backup (.kicad_sch.bak) is written before saving.
+
+        If *target_reference* is omitted, the next available reference for the
+        same prefix is auto-assigned (scanning all project ``*.kicad_sch``
+        files to avoid cross-sheet conflicts).
+
+        Args:
+            schematic_path: Absolute path to the target .kicad_sch file.
+            symbol_uuid: UUID of any placed unit of the symbol to rename
+                (e.g. ``"a27313ed-36db-4154-9e69-a66c07529185"``).  Obtain
+                this from ``extract_schematic_netlist`` → component ``uuid``.
+            target_reference: New reference designator (e.g. ``"R10"``).
+                When ``None`` (default), the next free reference for the same
+                prefix is assigned automatically.
+
+        Returns:
+            dict with keys: success (bool), current_reference (the reference
+            before the rename), target_reference (the final reference used),
+            units_updated (int), file_modified, backup_path, and
+            auto_assigned (bool, ``True`` when *target_reference* was
+            auto-generated).
+        """
+        if not schematic_path.endswith(".kicad_sch"):
+            return {"error": f"Not a .kicad_sch file: {schematic_path!r}"}
+        if not os.path.isfile(schematic_path):
+            return {"error": f"Schematic file not found: {schematic_path!r}"}
+        if not symbol_uuid:
+            return {"error": "symbol_uuid must not be empty"}
+
+        try:
+            sch = safe_schematic(schematic_path)
+        except Exception as exc:
+            return {"error": f"Failed to open schematic: {exc}"}
+
+        try:
+            # Find the anchor unit by UUID to determine current_reference.
+            anchor: Any | None = None
+            try:
+                for sym in sch.symbol:
+                    try:
+                        if sym.uuid.value == symbol_uuid:
+                            anchor = sym
+                            break
+                    except AttributeError:
+                        continue
+            except AttributeError:
+                pass
+
+            if anchor is None:
+                return {"error": f"No symbol with UUID {symbol_uuid!r} found"}
+
+            try:
+                current_reference = anchor.property.Reference.value
+            except AttributeError:
+                return {"error": f"Symbol with UUID {symbol_uuid!r} has no Reference property"}
+
+            if target_reference is not None and current_reference == target_reference:
+                return {"error": "current_reference and target_reference are the same"}
+
+            # Collect all units sharing current_reference (the full component).
+            units: list[Any] = []
+            try:
+                for sym in sch.symbol:
+                    try:
+                        if sym.property.Reference.value == current_reference:
+                            units.append(sym)
+                    except AttributeError:
+                        continue
+            except AttributeError:
+                pass
+
+            # Auto-assign target_reference if not provided.
+            auto_assigned = False
+            if target_reference is None:
+                prefix_match = re.match(r"^([A-Za-z]+)", current_reference)
+                prefix = prefix_match.group(1) if prefix_match else "U"
+                target_reference = _next_reference(sch, prefix, schematic_path=schematic_path)
+                auto_assigned = True
+
+            # Check that target_reference does not already exist (skip the
+            # symbol being renamed itself).
+            for sym in sch.symbol:
+                try:
+                    if sym not in units and sym.property.Reference.value == target_reference:
+                        return {
+                            "error": f"Target reference {target_reference!r} already exists in this schematic"
+                        }
+                except AttributeError:
+                    continue
+
+            # Update the Reference property on every unit.
+            for sym in units:
+                ref_prop = _find_property_by_name(sym, "Reference")
+                if ref_prop is not None:
+                    ref_prop.value = target_reference
+                else:
+                    return {"error": f"Symbol {current_reference!r} has no Reference property"}
+                # Also update instances.path.reference — KiCad uses this as the
+                # authoritative display reference.
+                _update_instance_reference(sym, target_reference)
+
+            try:
+                save_schematic(schematic_path, sch)
+            except Exception as exc:
+                return {"error": f"Failed to save schematic: {exc}"}
+
+            return {
+                "success": True,
+                "current_reference": current_reference,
+                "target_reference": target_reference,
+                "auto_assigned": auto_assigned,
+                "units_updated": len(units),
+                "file_modified": schematic_path,
+                "backup_path": schematic_path + ".bak",
+            }
+
+        except Exception as exc:
+            log.exception("Unexpected error in rename_symbol")
+            return {"error": str(exc), "success": False}
+
+    @mcp.tool()
     async def list_component_properties(
         schematic_path: str,
         reference: str,
@@ -1649,7 +1943,7 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
 
         Args:
             schematic_path: Path to the .kicad_sch file.
-            reference: Reference designator (e.g. "R1").
+            reference: Reference designator (e.g. "R1") or a sheet name.
             x: New X coordinate in mm (auto grid-snapped).
             y: New Y coordinate in mm (auto grid-snapped).
             rotation: New absolute rotation in degrees (0, 90, 180, or 270).
@@ -1692,14 +1986,155 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
                 pass
 
             if not units:
-                return {"error": f"No symbol with reference {reference!r} found"}
+                from kcaa.tools.sheet_tools import (
+                    _do_update_sheet_symbol,
+                    _list_sheet_symbols_impl,
+                )
+
+                sheet_info = next(
+                    (
+                        sheet
+                        for sheet in _list_sheet_symbols_impl(schematic_path).get("sheets", [])
+                        if sheet.get("sheet_name") == reference or sheet.get("uuid") == reference
+                    ),
+                    None,
+                )
+                if sheet_info is not None:
+                    if rotation is not None:
+                        return {"error": "rotation is not supported for sheet symbols"}
+                    sheet_result = _do_update_sheet_symbol(
+                        schematic_path=schematic_path,
+                        sheet_identifier=reference,
+                        sheet_name=None,
+                        sheet_file=None,
+                        x=x,
+                        y=y,
+                        width=None,
+                        height=None,
+                    )
+                    if "error" in sheet_result:
+                        return sheet_result
+                    return {
+                        "success": True,
+                        "sheet_name": sheet_result.get("sheet_name")
+                        or sheet_info.get("sheet_name"),
+                        "position": sheet_result.get("position")
+                        or {
+                            "x": sheet_info.get("position", {}).get("x"),
+                            "y": sheet_info.get("position", {}).get("y"),
+                        },
+                        "type": "sheet",
+                    }
+                return {"error": f"No symbol or sheet named {reference!r} found"}
+
+            # Compute the target position (grid-snapped), then nudge it to
+            # avoid overlap with other symbols/sheets if needed.
+            first_at = units[0].at.value
+            raw_new_x = _align_to_grid(x) if x is not None else float(first_at[0])
+            raw_new_y = _align_to_grid(y) if y is not None else float(first_at[1])
+            final_new_x = raw_new_x
+            final_new_y = raw_new_y
+            position_adjusted = False
+            if x is not None or y is not None:
+                try:
+                    from kcaa.tools.placement_helpers import _find_free_area_impl
+                    from kcaa.tools.sheet_tools import _has_position_conflict
+                    from kcaa.utils.netlist_parser import extract_netlist
+
+                    netlist = extract_netlist(schematic_path)
+                    comp_info = (netlist.get("components") or {}).get(reference)
+                    bb_d = comp_info.get("body_bbox") if comp_info else None
+                    if bb_d:
+                        bbox_w = float(bb_d["max_x"]) - float(bb_d["min_x"])
+                        bbox_h = float(bb_d["max_y"]) - float(bb_d["min_y"])
+                        # Offset from body_bbox origin to symbol origin (at position).
+                        off_x = float(bb_d["min_x"]) - float(first_at[0])
+                        off_y = float(bb_d["min_y"]) - float(first_at[1])
+                        # Determine the UUID of the symbol to exclude it from
+                        # the obstacle list while it is being moved.
+                        try:
+                            sym_uuid = units[0]._pv._tree[
+                                next(
+                                    i
+                                    for i, c in enumerate(units[0]._pv._tree)
+                                    if isinstance(c, list)
+                                    and len(c) >= 1
+                                    and isinstance(c[0], sexpdata.Symbol)
+                                    and c[0].value() == "uuid"
+                                )
+                            ][1]
+                        except Exception:
+                            sym_uuid = None
+                        # Try target position first; only search for free area
+                        # if there is an actual conflict.
+                        target_bbox_x = raw_new_x + off_x
+                        target_bbox_y = raw_new_y + off_y
+                        has_conflict = _has_position_conflict(
+                            schematic_path,
+                            target_bbox_x,
+                            target_bbox_y,
+                            bbox_w,
+                            bbox_h,
+                            exclude_uuid=sym_uuid,
+                        )
+                        if has_conflict:
+                            log.info(
+                                "move_component: target (%s, %s) bbox %sx%s conflicts "
+                                "(ref=%s), searching free area",
+                                raw_new_x,
+                                raw_new_y,
+                                bbox_w,
+                                bbox_h,
+                                reference,
+                            )
+                            free = _find_free_area_impl(
+                                schematic_path=schematic_path,
+                                width=bbox_w,
+                                height=bbox_h,
+                                prefer_near={"x": raw_new_x, "y": raw_new_y},
+                                max_candidates=1,
+                                exclude_uuid=sym_uuid,
+                            )
+                            cand = (free.get("candidates") or [{}])[0]
+                            origin = cand.get("origin")
+                            if origin is not None:
+                                cand_x = float(origin["x"])
+                                cand_y = float(origin["y"])
+                                # Convert free-area bbox origin back to symbol origin.
+                                adj_x = cand_x - off_x
+                                adj_y = cand_y - off_y
+                                if x is None:
+                                    adj_x = raw_new_x
+                                if y is None:
+                                    adj_y = raw_new_y
+                                if abs(adj_x - raw_new_x) > 1e-6 or abs(adj_y - raw_new_y) > 1e-6:
+                                    final_new_x = _align_to_grid(adj_x)
+                                    final_new_y = _align_to_grid(adj_y)
+                                    position_adjusted = True
+                                    log.info(
+                                        "move_component: adjusted to nearest free (%s, %s) "
+                                        "from requested (%s, %s) (ref=%s)",
+                                        final_new_x,
+                                        final_new_y,
+                                        raw_new_x,
+                                        raw_new_y,
+                                        reference,
+                                    )
+                except (AttributeError, KeyError, TypeError, ValueError, OSError) as e:
+                    log.info(
+                        "move_component: overlap avoidance failed for %s — "
+                        "using requested coords: %s",
+                        reference,
+                        e,
+                    )
+                    pass
 
             for sym in units:
                 at = sym.at.value
                 old_x = at[0]
                 old_y = at[1]
-                new_x = _align_to_grid(x) if x is not None else old_x
-                new_y = _align_to_grid(y) if y is not None else old_y
+                new_x = final_new_x if (x is not None) else old_x
+                new_y = final_new_y if (y is not None) else old_y
                 new_rot = rotation if rotation is not None else (at[2] if len(at) > 2 else 0)
                 dx = new_x - old_x
                 dy = new_y - old_y
@@ -1789,16 +2224,21 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
                     body_bbox = _placed_world_bbox(lib_raw, placements)
             except Exception:
                 body_bbox = None
-            return {
+            out: dict[str, Any] = {
                 "success": True,
                 "reference": reference,
                 "position": {"x": final_at[0], "y": final_at[1]},
                 "rotation": final_at[2] if len(final_at) > 2 else 0,
                 "units_updated": len(units),
                 "body_bbox": body_bbox,
+                "position_adjusted": position_adjusted,
                 "file_modified": schematic_path,
                 "backup_path": schematic_path + ".bak",
             }
+            if position_adjusted:
+                out["requested_position"] = {"x": raw_new_x, "y": raw_new_y}
+                out["note"] = "Position adjusted to nearest free area to avoid overlap."
+            return out
 
         except Exception as exc:
             log.exception("Unexpected error in move_component")
@@ -1811,18 +2251,18 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
         x: float,
         y: float,
         angle: int = 0,
+        label_type: str = "local",
+        shape: str = "input",
         ctx: Context | None = None,
     ) -> dict[str, Any]:
-        """Add a local net label to a KiCad schematic.
+        """Add a local, global, or hierarchical net label to a KiCad schematic.
 
-        A local label creates a named net connection at the given coordinate.
-        Two wires or pins with the same label text on the same sheet are
-        electrically connected. The label must sit **exactly on a wire or
-        pin endpoint** to actually attach — coordinates are mm in screen
-        convention (**+Y is down**) and **must be aligned to the 1.27 mm
-        (50-mil) grid**. This tool does NOT auto-snap; pass coordinates
-        from ``extract_schematic_netlist`` (pin x/y) or wire endpoints
-        (wires returned by ``include_wire_topology=True``).
+        Labels create named net connections at the given coordinate. The label
+        must sit **exactly on a wire or pin endpoint** to actually attach —
+        coordinates are mm in screen convention (**+Y is down**) and **must be
+        aligned to the 1.27 mm (50-mil) grid**. This tool does NOT auto-snap;
+        pass coordinates from ``extract_schematic_netlist`` (pin x/y) or wire
+        endpoints (wires returned by ``include_wire_topology=True``).
 
         A backup (.kicad_sch.bak) is written before saving.
 
@@ -1833,10 +2273,13 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
             y: Y coordinate of the label connection point in mm.
             angle: Label text rotation in degrees; must be 0, 90, 180, or
                 270. 0 = text reads left-to-right; 90 = bottom-to-top.
+            label_type: Label kind: "local", "global", or "hierarchical".
+            shape: Shape for global or hierarchical labels.
 
         Returns:
-            dict with keys: success (bool), label (text, x, y, direction).
-            direction is one of "right", "down", "left", "up".
+            dict with keys: success (bool), label (text, x, y, direction,
+            label_type, shape). direction is one of "right", "down", "left",
+            "up".
         """
         if not schematic_path.endswith(".kicad_sch"):
             return {"error": f"Not a .kicad_sch file: {schematic_path!r}"}
@@ -1848,16 +2291,48 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
             return {"error": f"Coordinates must be finite numbers (got x={x}, y={y})"}
         if angle not in (0, 90, 180, 270):
             return {"error": f"angle must be 0, 90, 180, or 270 (got {angle})"}
+        if label_type not in VALID_LABEL_TYPES:
+            return {"error": f"label_type must be one of {VALID_LABEL_TYPES}"}
+        if label_type in ("global", "hierarchical") and shape not in VALID_SHAPES:
+            return {"error": f"shape must be one of {VALID_SHAPES}"}
 
         try:
             sch = safe_schematic(schematic_path)
         except Exception as exc:
             return {"error": f"Failed to open schematic: {exc}"}
 
+        shape_value: str | None = None
         try:
-            lbl = sch.label.new()
-            lbl.value = text
-            lbl.at.value = [x, y, angle]
+            if label_type == "local":
+                lbl = sch.label.new()
+                lbl.value = text
+                lbl.at.value = [x, y, angle]
+            elif label_type == "global":
+                try:
+                    lbl = sch.global_label.new()
+                except AttributeError:
+                    from skip.element_template import ElementTemplate
+
+                    lbl = sch.new_from_list(list(ElementTemplate["global_label"]))
+                lbl.value = text
+                lbl.at.value = [x, y, angle]
+                lbl.shape.value = shape
+                shape_value = shape
+            else:
+                hier_tmpl = [
+                    sexpdata.Symbol("hierarchical_label"),
+                    text,
+                    [sexpdata.Symbol("shape"), sexpdata.Symbol(shape)],
+                    [sexpdata.Symbol("at"), x, y, angle],
+                    [
+                        sexpdata.Symbol("effects"),
+                        [sexpdata.Symbol("font"), [sexpdata.Symbol("size"), 1.27, 1.27]],
+                        [sexpdata.Symbol("justify"), sexpdata.Symbol("left")],
+                    ],
+                    [sexpdata.Symbol("uuid"), sexpdata.Symbol(str(uuid.uuid4()))],
+                ]
+                lbl = sch.new_from_list(hier_tmpl)
+                shape_value = shape
 
             save_schematic(schematic_path, sch)
         except Exception as exc:
@@ -1865,7 +2340,14 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
 
         return {
             "success": True,
-            "label": {"text": text, "x": x, "y": y, "direction": _angle_to_direction(angle)},
+            "label": {
+                "text": text,
+                "x": x,
+                "y": y,
+                "direction": _angle_to_direction(angle),
+                "label_type": label_type,
+                "shape": shape_value,
+            },
             "file_modified": schematic_path,
             "backup_path": schematic_path + ".bak",
         }
@@ -1873,24 +2355,30 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
     @mcp.tool()
     async def list_labels_in_schematic(
         schematic_path: str,
+        label_type: str | None = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
-        """List all local net labels in a KiCad schematic.
+        """List local, global, and hierarchical labels in a KiCad schematic.
 
-        Returns every local label's text and position. Use the returned
-        coordinates with delete_label_from_schematic to remove a specific label.
+        Returns every matching label's text, position, type, and shape. Use the
+        returned coordinates with delete_label_from_schematic to remove a
+        specific label.
 
         Args:
             schematic_path: Absolute path to the target .kicad_sch file.
+            label_type: Optional filter: "local", "global", or "hierarchical".
 
         Returns:
-            dict with keys: success (bool), labels (list of {text, x, y, direction}),
-            count (int). direction is one of "right", "down", "left", "up".
+            dict with keys: success (bool), labels (list of {text, x, y,
+            direction, label_type, shape}), count (int). direction is one of
+            "right", "down", "left", "up".
         """
         if not schematic_path.endswith(".kicad_sch"):
             return {"error": f"Not a .kicad_sch file: {schematic_path!r}"}
         if not os.path.isfile(schematic_path):
             return {"error": f"Schematic file not found: {schematic_path!r}"}
+        if label_type is not None and label_type not in VALID_LABEL_TYPES:
+            return {"error": f"label_type must be one of {VALID_LABEL_TYPES}"}
 
         try:
             sch = safe_schematic(schematic_path)
@@ -1898,8 +2386,14 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
             return {"error": f"Failed to open schematic: {exc}"}
 
         labels = []
-        try:
-            for lbl in sch.label:
+        for current_type, attr_name in (
+            ("local", "label"),
+            ("global", "global_label"),
+            ("hierarchical", "hierarchical_label"),
+        ):
+            if label_type is not None and current_type != label_type:
+                continue
+            for lbl in _iter_schematic_labels(sch, attr_name):
                 try:
                     at_val = lbl.at.value
                     labels.append(
@@ -1908,14 +2402,83 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
                             "x": float(at_val[0]),
                             "y": float(at_val[1]),
                             "direction": _angle_to_direction(at_val[2] if len(at_val) > 2 else 0),
+                            "label_type": current_type,
+                            "shape": (
+                                str(lbl.shape.value)
+                                if current_type in ("global", "hierarchical")
+                                else None
+                            ),
                         }
                     )
-                except (AttributeError, IndexError, ValueError):
+                except (AttributeError, IndexError, TypeError, ValueError):
                     continue
-        except AttributeError:
-            pass  # no labels in schematic
 
         return {"success": True, "labels": labels, "count": len(labels)}
+
+    @mcp.tool()
+    async def check_reference_conflicts(
+        schematic_path: str,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Check for duplicate reference designators across a KiCad project.
+
+        Follows the sheet hierarchy from the given schematic and reports any
+        reference designators that appear in more than one schematic file.
+        Only schematics referenced (directly or transitively) from
+        *schematic_path* are scanned — backup or history folders are not
+        included.
+
+        Args:
+            schematic_path: Absolute path to the root .kicad_sch file.
+
+        Returns:
+            dict with keys: success (bool), root_schematic (str or null),
+            schematics_scanned (int), conflicts (list of
+            ``{reference, instances: [{sheet, uuid}]}``).
+            For multi-unit symbols only the anchor unit's UUID is reported.
+        """
+        if not schematic_path.endswith(".kicad_sch"):
+            return {"error": f"Not a .kicad_sch file: {schematic_path!r}"}
+        if not os.path.isfile(schematic_path):
+            return {"error": f"Schematic file not found: {schematic_path!r}"}
+
+        project_dir = _find_project_dir(schematic_path)
+        if project_dir is None:
+            return {
+                "success": True,
+                "root_schematic": None,
+                "schematics_scanned": 0,
+                "conflicts": [],
+                "message": "No .kicad_pro found — cannot determine project scope",
+            }
+
+        root_sch = _find_root_schematic(schematic_path) or schematic_path
+        refs_by_file = _collect_hierarchy_references(root_sch)
+
+        # Invert: reference → list of {sheet, uuid} dicts.
+        ref_to_instances: dict[str, list[dict[str, str]]] = {}
+        for file_path, ref_dict in refs_by_file.items():
+            for ref_str, ref_uuid in ref_dict.items():
+                ref_to_instances.setdefault(ref_str, []).append(
+                    {"sheet": file_path, "uuid": ref_uuid}
+                )
+
+        conflicts = [
+            {
+                "reference": ref_str,
+                "instances": sorted(info_list, key=lambda x: x["sheet"]),
+            }
+            for ref_str, info_list in ref_to_instances.items()
+            if len(info_list) > 1
+        ]
+        conflicts.sort(key=lambda c: c["reference"])
+
+        return {
+            "success": True,
+            "root_schematic": root_sch,
+            "schematics_scanned": len(refs_by_file),
+            "conflicts": conflicts,
+        }
 
     @mcp.tool()
     async def delete_label_from_schematic(
@@ -1925,18 +2488,20 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
         text: str | None = None,
         tolerance: float = 0.01,
         positions: list[dict] | None = None,
+        label_type: str | None = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
-        """Delete one or more local net labels from a KiCad schematic.
+        """Delete one or more local, global, or hierarchical labels.
 
-        **Single mode** (default): removes all local labels whose position
-        matches (x, y) within *tolerance*.  When *text* is provided, only
-        labels with that exact text are removed.
+        **Single mode** (default): removes all matching labels whose position
+        matches (x, y) within *tolerance*. When *text* is provided, only labels
+        with that exact text are removed. When *label_type* is provided, only
+        that label type is considered.
 
         **Batch mode**: when *positions* is provided, the *x*/*y*/*text*
         parameters are ignored and each entry in *positions* is processed
-        independently.  Each entry is a dict with keys ``x`` (float),
-        ``y`` (float), and optionally ``text`` (str).
+        independently. Each entry is a dict with keys ``x`` (float), ``y``
+        (float), and optionally ``text`` (str). *label_type* still applies.
 
         Use list_labels_in_schematic first to obtain exact coordinates.
         A backup (.kicad_sch.bak) is written before saving.
@@ -1947,9 +2512,10 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
             y: Y coordinate of the label in mm (single mode).
             text: Optional label text to match (single mode).
             tolerance: Maximum coordinate difference considered a match
-                (default 0.01 mm).  Applied in both modes.
+                (default 0.01 mm). Applied in both modes.
             positions: Batch mode — list of dicts, each with ``x``, ``y``,
                 and optional ``text`` keys.
+            label_type: Optional filter: "local", "global", or "hierarchical".
 
         Returns:
             Single mode: dict with keys success (bool), deleted_count (int).
@@ -1960,6 +2526,14 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
             return {"error": f"Not a .kicad_sch file: {schematic_path!r}"}
         if not os.path.isfile(schematic_path):
             return {"error": f"Schematic file not found: {schematic_path!r}"}
+        if label_type is not None and label_type not in VALID_LABEL_TYPES:
+            return {"error": f"label_type must be one of {VALID_LABEL_TYPES}"}
+
+        label_sources = (
+            ("local", "label"),
+            ("global", "global_label"),
+            ("hierarchical", "hierarchical_label"),
+        )
 
         # ---- batch mode ------------------------------------------------
         if positions is not None:
@@ -1972,40 +2546,43 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
                 return {"error": f"Failed to open schematic: {exc}"}
 
             try:
-                # Build a flat list of all labels once for efficiency.
-                all_labels = []
-                try:
-                    all_labels = list(sch.label)
-                except AttributeError:
-                    pass  # schematic has no labels
+                all_labels: list[tuple[str, Any]] = []
+                for current_type, attr_name in label_sources:
+                    if label_type is not None and current_type != label_type:
+                        continue
+                    all_labels.extend(
+                        (current_type, lbl) for lbl in _iter_schematic_labels(sch, attr_name)
+                    )
 
                 results = []
                 total_deleted = 0
-                global_to_delete: list = []
+                global_to_delete: list[Any] = []
+                queued_ids: set[int] = set()
 
                 for entry in positions:
                     ex = float(entry.get("x", 0.0))
                     ey = float(entry.get("y", 0.0))
-                    etxt = entry.get("text")  # may be None
+                    etxt = entry.get("text")
                     if not math.isfinite(ex) or not math.isfinite(ey):
                         results.append({"x": ex, "y": ey, "error": "Non-finite coordinates"})
                         continue
 
                     matched = []
-                    for lbl in all_labels:
-                        if lbl in global_to_delete:
-                            continue  # already queued for deletion
+                    for _current_type, lbl in all_labels:
+                        if id(lbl) in queued_ids:
+                            continue
                         try:
                             at_val = lbl.at.value
                             lx, ly = float(at_val[0]), float(at_val[1])
                             if abs(lx - ex) <= tolerance and abs(ly - ey) <= tolerance:
                                 if etxt is None or str(lbl.value) == etxt:
                                     matched.append(lbl)
-                        except (AttributeError, IndexError, ValueError):
+                        except (AttributeError, IndexError, TypeError, ValueError):
                             continue
 
                     if not matched:
-                        msg = f"No label found at ({ex}, {ey}) within tolerance {tolerance}"
+                        kind = f" {label_type}" if label_type is not None else ""
+                        msg = f"No{kind} label found at ({ex}, {ey}) within tolerance {tolerance}"
                         if etxt is not None:
                             msg += f" with text {etxt!r}"
                         entry_result: dict[str, Any] = {"x": ex, "y": ey, "error": msg}
@@ -2013,6 +2590,8 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
                             entry_result["text"] = etxt
                         results.append(entry_result)
                     else:
+                        for lbl in matched:
+                            queued_ids.add(id(lbl))
                         global_to_delete.extend(matched)
                         total_deleted += len(matched)
                         entry_result = {"x": ex, "y": ey, "deleted_count": len(matched)}
@@ -2054,21 +2633,22 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
 
         try:
             to_delete = []
-            try:
-                for lbl in sch.label:
+            for current_type, attr_name in label_sources:
+                if label_type is not None and current_type != label_type:
+                    continue
+                for lbl in _iter_schematic_labels(sch, attr_name):
                     try:
                         at_val = lbl.at.value
                         lx, ly = float(at_val[0]), float(at_val[1])
                         if abs(lx - x) <= tolerance and abs(ly - y) <= tolerance:
                             if text is None or str(lbl.value) == text:
                                 to_delete.append(lbl)
-                    except (AttributeError, IndexError, ValueError):
+                    except (AttributeError, IndexError, TypeError, ValueError):
                         continue
-            except AttributeError:
-                pass  # no labels
 
             if not to_delete:
-                msg = f"No label found at ({x}, {y}) within tolerance {tolerance}"
+                kind = f" {label_type}" if label_type is not None else ""
+                msg = f"No{kind} label found at ({x}, {y}) within tolerance {tolerance}"
                 if text is not None:
                     msg += f" with text {text!r}"
                 return {"error": msg}

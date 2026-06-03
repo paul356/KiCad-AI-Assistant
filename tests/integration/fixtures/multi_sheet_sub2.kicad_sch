@@ -1,0 +1,12 @@
+(kicad_sch (version 20260306) (generator "kcaa") (generator_version "0.2.0")
+  (uuid "9cbbff7e-7287-4683-bd86-48ce6b02f348")
+  (paper "A4")
+  (title_block
+    (title "Amplifier Stage")
+  )
+  (lib_symbols)
+  (sheet_instances
+    (path "/9cbbff7e-7287-4683-bd86-48ce6b02f348" (page "1"))
+  )
+  (embedded_fonts no)
+)
