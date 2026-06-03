@@ -255,6 +255,25 @@ def _find_free_area_impl(
     title_bb = _default_title_block_bbox(sheet_w, sheet_h)
     occupied.append(title_bb)
 
+    log.debug(
+        "find_free_area: occupied=%d (components=%d sheets=%d), margin=%.2f",
+        len(occupied),
+        len(ref_bboxes),
+        len(sheet_result.get("sheets", [])) - (1 if exclude_uuid else 0),
+        margin,
+    )
+    for i, occ in enumerate(occupied):
+        log.debug(
+            "  occupied[%d]: (%.1f, %.1f)-(%.1f, %.1f) w=%.1f h=%.1f",
+            i,
+            occ.min_x,
+            occ.min_y,
+            occ.max_x,
+            occ.max_y,
+            occ.width,
+            occ.height,
+        )
+
     # Drawing area minus 10 mm margin so the bbox fits fully on-sheet.
     edge = 10.0
     x_lo = edge
@@ -262,6 +281,14 @@ def _find_free_area_impl(
     x_hi = sheet_w - edge - width
     y_hi = sheet_h - edge - height
     if x_hi < x_lo or y_hi < y_lo:
+        log.debug(
+            "find_free_area: area too small — sheet=%.0fx%.0f target=%.1fx%.1f edge=%.1f",
+            sheet_w,
+            sheet_h,
+            width,
+            height,
+            edge,
+        )
         return {"candidates": [], "error": "Requested area larger than drawing area."}
 
     # Resolve prefer_near to a point.
@@ -279,6 +306,18 @@ def _find_free_area_impl(
                 bias_y = float(prefer_near["y"])
             except (TypeError, ValueError):
                 bias_x = bias_y = None
+
+    log.debug(
+        "find_free_area: scan x[%.1f..%.1f] y[%.1f..%.1f] bias=(%.1f, %.1f) target=%.1fx%.1f",
+        x_lo,
+        x_hi,
+        y_lo,
+        y_hi,
+        bias_x if bias_x is not None else -1,
+        bias_y if bias_y is not None else -1,
+        width,
+        height,
+    )
 
     # Snap scan to grid.
     def _snap_up(v: float) -> float:
@@ -331,10 +370,19 @@ def _find_free_area_impl(
         x += GRID_MM
 
     candidates.sort(key=lambda c: c["_dist"])
+    top_dist = candidates[0]["_dist"] if candidates else -1
     out = []
     for c in candidates[: max(1, max_candidates)]:
         c.pop("_dist", None)
         out.append(c)
+
+    log.debug(
+        "find_free_area: found=%d returned=%d top_dist=%.1f",
+        len(candidates),
+        len(out),
+        top_dist,
+    )
+
     return {
         "candidates": out,
         "margin_mm": margin,
