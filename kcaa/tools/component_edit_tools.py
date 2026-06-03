@@ -1750,12 +1750,76 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
                     }
                 return {"error": f"No symbol or sheet named {reference!r} found"}
 
+            # Compute the target position (grid-snapped), then nudge it to
+            # avoid overlap with other symbols/sheets if needed.
+            first_at = units[0].at.value
+            raw_new_x = _align_to_grid(x) if x is not None else float(first_at[0])
+            raw_new_y = _align_to_grid(y) if y is not None else float(first_at[1])
+            final_new_x = raw_new_x
+            final_new_y = raw_new_y
+            position_adjusted = False
+            if x is not None or y is not None:
+                try:
+                    from kcaa.tools.placement_helpers import _find_free_area_impl
+                    from kcaa.utils.netlist_parser import extract_netlist
+
+                    netlist = extract_netlist(schematic_path)
+                    comp_info = (netlist.get("components") or {}).get(reference)
+                    bb_d = comp_info.get("body_bbox") if comp_info else None
+                    if bb_d:
+                        bbox_w = float(bb_d["max_x"]) - float(bb_d["min_x"])
+                        bbox_h = float(bb_d["max_y"]) - float(bb_d["min_y"])
+                        # Determine the UUID of the symbol to exclude it from
+                        # the obstacle list while it is being moved.
+                        try:
+                            sym_uuid = units[0]._pv._tree[
+                                next(
+                                    i
+                                    for i, c in enumerate(units[0]._pv._tree)
+                                    if isinstance(c, list)
+                                    and len(c) >= 1
+                                    and isinstance(c[0], sexpdata.Symbol)
+                                    and c[0].value() == "uuid"
+                                )
+                            ][1]
+                        except Exception:
+                            sym_uuid = None
+                        free = _find_free_area_impl(
+                            schematic_path=schematic_path,
+                            width=bbox_w,
+                            height=bbox_h,
+                            prefer_near={"x": raw_new_x, "y": raw_new_y},
+                            max_candidates=1,
+                            exclude_uuid=sym_uuid,
+                        )
+                        cand = (free.get("candidates") or [{}])[0]
+                        origin = cand.get("origin")
+                        if origin is not None:
+                            cand_x = float(origin["x"])
+                            cand_y = float(origin["y"])
+                            # Offset from bbox origin to symbol origin.
+                            off_x = float(bb_d["min_x"]) - float(first_at[0])
+                            off_y = float(bb_d["min_y"]) - float(first_at[1])
+                            # Convert free-area bbox origin back to symbol origin.
+                            adj_x = cand_x - off_x
+                            adj_y = cand_y - off_y
+                            if x is None:
+                                adj_x = raw_new_x
+                            if y is None:
+                                adj_y = raw_new_y
+                            if abs(adj_x - raw_new_x) > 1e-6 or abs(adj_y - raw_new_y) > 1e-6:
+                                final_new_x = _align_to_grid(adj_x)
+                                final_new_y = _align_to_grid(adj_y)
+                                position_adjusted = True
+                except Exception:
+                    pass  # Overlap avoidance is best-effort; proceed with requested coords.
+
             for sym in units:
                 at = sym.at.value
                 old_x = at[0]
                 old_y = at[1]
-                new_x = _align_to_grid(x) if x is not None else old_x
-                new_y = _align_to_grid(y) if y is not None else old_y
+                new_x = final_new_x if (x is not None) else old_x
+                new_y = final_new_y if (y is not None) else old_y
                 new_rot = rotation if rotation is not None else (at[2] if len(at) > 2 else 0)
                 dx = new_x - old_x
                 dy = new_y - old_y
@@ -1845,16 +1909,21 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
                     body_bbox = _placed_world_bbox(lib_raw, placements)
             except Exception:
                 body_bbox = None
-            return {
+            out: dict[str, Any] = {
                 "success": True,
                 "reference": reference,
                 "position": {"x": final_at[0], "y": final_at[1]},
                 "rotation": final_at[2] if len(final_at) > 2 else 0,
                 "units_updated": len(units),
                 "body_bbox": body_bbox,
+                "position_adjusted": position_adjusted,
                 "file_modified": schematic_path,
                 "backup_path": schematic_path + ".bak",
             }
+            if position_adjusted:
+                out["requested_position"] = {"x": raw_new_x, "y": raw_new_y}
+                out["note"] = "Position adjusted to nearest free area to avoid overlap."
+            return out
 
         except Exception as exc:
             log.exception("Unexpected error in move_component")

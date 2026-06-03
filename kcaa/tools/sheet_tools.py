@@ -709,10 +709,14 @@ def _do_update_sheet_symbol(
 
     # Update position if provided
     if x is not None or y is not None:
-        new_x = _align_to_grid(x) if x is not None else target_sheet.get("position", {}).get("x", 0)
-        new_y = _align_to_grid(y) if y is not None else target_sheet.get("position", {}).get("y", 0)
+        old_x = target_sheet.get("position", {}).get("x", 0)
+        old_y = target_sheet.get("position", {}).get("y", 0)
+        new_x = _align_to_grid(x) if x is not None else old_x
+        new_y = _align_to_grid(y) if y is not None else old_y
+        dx = new_x - old_x
+        dy = new_y - old_y
 
-        # Find and update the (at ...) entry
+        # Find and update the (at ...) entry for the sheet box
         for child in sheet_entry:
             if isinstance(child, list) and len(child) > 0:
                 if isinstance(child[0], sexpdata.Symbol) and child[0].value() == "at":
@@ -721,6 +725,21 @@ def _do_update_sheet_symbol(
                     final_position = {"x": new_x, "y": new_y}
                     updated_fields.append("position")
                     break
+
+        # Also update all pin (at ...) coordinates by the same delta,
+        # because pin positions are stored as absolute schematic coordinates.
+        for child in sheet_entry:
+            if isinstance(child, list) and len(child) > 0:
+                if isinstance(child[0], sexpdata.Symbol) and child[0].value() == "pin":
+                    for grandchild in child:
+                        if isinstance(grandchild, list) and len(grandchild) >= 3:
+                            if (
+                                isinstance(grandchild[0], sexpdata.Symbol)
+                                and grandchild[0].value() == "at"
+                            ):
+                                grandchild[1] = round(grandchild[1] + dx, 6)
+                                grandchild[2] = round(grandchild[2] + dy, 6)
+                                break
 
     # Update size if provided
     if width is not None or height is not None:
@@ -1079,7 +1098,6 @@ def register_sheet_tools(mcp: FastMCP) -> None:
         create_child: bool = False,
         child_paper: str = "A4",
         child_title: str | None = None,
-        auto_place: bool = True,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Add a hierarchical sheet symbol to a schematic.
@@ -1100,9 +1118,6 @@ def register_sheet_tools(mcp: FastMCP) -> None:
                 disk before adding the sheet symbol.
             child_paper: Paper size for the child file (default ``"A4"``).
             child_title: Optional title for the child file's title block.
-            auto_place: When True (default), move the sheet to the nearest free
-                area if the requested position would overlap an existing symbol
-                or sheet.
 
         Returns:
             dict with keys: success, sheet_uuid, position, size, pins_created,
@@ -1116,7 +1131,7 @@ def register_sheet_tools(mcp: FastMCP) -> None:
         place_y = y
         position_adjusted = False
 
-        if auto_place:
+        if True:
             from kcaa.tools.placement_helpers import PlacementHelpers
 
             free_area = PlacementHelpers.find_free_area(
@@ -1193,7 +1208,6 @@ def register_sheet_tools(mcp: FastMCP) -> None:
         y: float | None = None,
         width: float | None = None,
         height: float | None = None,
-        auto_place: bool = True,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Update a sheet symbol's properties.
@@ -1207,10 +1221,6 @@ def register_sheet_tools(mcp: FastMCP) -> None:
             y: New Y position in mm (optional).
             width: New width in mm (optional).
             height: New height in mm (optional).
-            auto_place: When True (default), if a position change is requested,
-                move the sheet to the nearest free area when the requested
-                position would overlap an existing symbol or sheet. The moved
-                sheet itself is excluded from the obstacle list.
 
         Returns:
             dict with keys: success, uuid, updated_fields, and optionally
@@ -1222,7 +1232,7 @@ def register_sheet_tools(mcp: FastMCP) -> None:
         position_adjusted = False
         requested_position: dict[str, Any] | None = None
 
-        if auto_place and (x is not None or y is not None):
+        if x is not None or y is not None:
             from kcaa.tools.placement_helpers import PlacementHelpers
 
             # Look up current sheet to fill in missing axis and get UUID/size.
@@ -1260,6 +1270,11 @@ def register_sheet_tools(mcp: FastMCP) -> None:
                 if origin is not None:
                     cand_x = float(origin["x"])
                     cand_y = float(origin["y"])
+                    # Lock axes that were not explicitly specified by the caller.
+                    if x is None:
+                        cand_x = cur_x
+                    if y is None:
+                        cand_y = cur_y
                     if cand_x != req_x or cand_y != req_y:
                         requested_position = {"x": x, "y": y}
                         place_x = cand_x
