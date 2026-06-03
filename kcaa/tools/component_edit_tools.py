@@ -1666,7 +1666,7 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
 
         Args:
             schematic_path: Path to the .kicad_sch file.
-            reference: Reference designator (e.g. "R1").
+            reference: Reference designator (e.g. "R1") or a sheet name.
             x: New X coordinate in mm (auto grid-snapped).
             y: New Y coordinate in mm (auto grid-snapped).
             rotation: New absolute rotation in degrees (0, 90, 180, or 270).
@@ -1709,7 +1709,46 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
                 pass
 
             if not units:
-                return {"error": f"No symbol with reference {reference!r} found"}
+                from kcaa.tools.sheet_tools import (
+                    _do_update_sheet_symbol,
+                    _list_sheet_symbols_impl,
+                )
+
+                sheet_info = next(
+                    (
+                        sheet
+                        for sheet in _list_sheet_symbols_impl(schematic_path).get("sheets", [])
+                        if sheet.get("sheet_name") == reference or sheet.get("uuid") == reference
+                    ),
+                    None,
+                )
+                if sheet_info is not None:
+                    if rotation is not None:
+                        return {"error": "rotation is not supported for sheet symbols"}
+                    sheet_result = _do_update_sheet_symbol(
+                        schematic_path=schematic_path,
+                        sheet_identifier=reference,
+                        sheet_name=None,
+                        sheet_file=None,
+                        x=x,
+                        y=y,
+                        width=None,
+                        height=None,
+                    )
+                    if "error" in sheet_result:
+                        return sheet_result
+                    return {
+                        "success": True,
+                        "sheet_name": sheet_result.get("sheet_name")
+                        or sheet_info.get("sheet_name"),
+                        "position": sheet_result.get("position")
+                        or {
+                            "x": sheet_info.get("position", {}).get("x"),
+                            "y": sheet_info.get("position", {}).get("y"),
+                        },
+                        "type": "sheet",
+                    }
+                return {"error": f"No symbol or sheet named {reference!r} found"}
 
             for sym in units:
                 at = sym.at.value

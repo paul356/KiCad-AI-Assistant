@@ -27,6 +27,7 @@ import skip
 # ---------------------------------------------------------------------------
 
 SCHEMATIC_PATH = str(Path(__file__).parent / "fixtures/tools_test.kicad_sch")
+SHEET_SCHEMATIC_PATH = str(Path(__file__).parent / "fixtures/sheet_netlist_test.kicad_sch")
 TEST_SYM_PATH = str(Path(__file__).parent / "fixtures/test_symbols.kicad_sym")
 
 # The symbol and library names used across tests.
@@ -109,6 +110,16 @@ def tmp_sch():
     for p in [path, path + ".bak"]:
         if os.path.exists(p):
             os.unlink(p)
+
+
+@pytest.fixture()
+def tmp_sheet_sch(tmp_path):
+    path = tmp_path / "sheet_netlist_test.kicad_sch"
+    shutil.copy(SHEET_SCHEMATIC_PATH, path)
+    yield str(path)
+    backup = str(path) + ".bak"
+    if os.path.exists(backup):
+        os.unlink(backup)
 
 
 # ---------------------------------------------------------------------------
@@ -1304,6 +1315,34 @@ class TestMoveComponent:
             )
         )
         assert "error" in result
+
+    def test_moves_sheet_by_name(self, tools, tmp_sheet_sch):
+        result = asyncio.run(
+            tools["move_component"](
+                schematic_path=tmp_sheet_sch,
+                reference="Power",
+                x=120.0,
+                y=80.0,
+            )
+        )
+
+        assert result == {
+            "success": True,
+            "sheet_name": "Power",
+            "position": {"x": 119.38, "y": 80.01},
+            "type": "sheet",
+        }
+
+    def test_sheet_move_rejects_rotation(self, tools, tmp_sheet_sch):
+        result = asyncio.run(
+            tools["move_component"](
+                schematic_path=tmp_sheet_sch,
+                reference="Power",
+                rotation=90,
+            )
+        )
+
+        assert result == {"error": "rotation is not supported for sheet symbols"}
 
     def test_empty_reference(self, tools, tmp_sch):
         """An empty reference string should be rejected."""

@@ -226,14 +226,35 @@ def _sheet_dict_from_wrapper(sheet) -> dict[str, Any]:
     except AttributeError:
         props = None
     if props is not None:
-        try:
-            sheet_name = props.Sheet_name.value if hasattr(props, "Sheet_name") else None
-        except (AttributeError, KeyError):
-            pass
-        try:
-            sheet_file = props.Sheet_file.value if hasattr(props, "Sheet_file") else None
-        except (AttributeError, KeyError):
-            pass
+        for attr_name, target_key in (
+            ("Sheet_name", "sheet_name"),
+            ("Sheetname", "sheet_name"),
+            ("Sheet_file", "sheet_file"),
+            ("Sheetfile", "sheet_file"),
+        ):
+            with_value = getattr(props, attr_name, None)
+            if with_value is None:
+                continue
+            try:
+                if target_key == "sheet_name" and sheet_name is None:
+                    sheet_name = with_value.value
+                elif target_key == "sheet_file" and sheet_file is None:
+                    sheet_file = with_value.value
+            except (AttributeError, KeyError):
+                continue
+
+        for prop in _normalize_collection(props):
+            raw_tree = getattr(getattr(prop, "_pv", None), "_tree", None)
+            if not isinstance(raw_tree, list) or len(raw_tree) < 3:
+                continue
+            prop_name = raw_tree[1]
+            if not isinstance(prop_name, str):
+                continue
+            normalized_name = prop_name.replace(" ", "").replace("_", "").lower()
+            if normalized_name == "sheetname" and sheet_name is None:
+                sheet_name = raw_tree[2]
+            elif normalized_name == "sheetfile" and sheet_file is None:
+                sheet_file = raw_tree[2]
     info["sheet_name"] = sheet_name
     info["sheet_file"] = sheet_file
 
@@ -673,6 +694,10 @@ def _do_update_sheet_symbol(
 
     # Track what we updated
     updated_fields = []
+    final_position = dict(target_sheet.get("position") or {})
+    final_size = dict(target_sheet.get("size") or {})
+    final_sheet_name = target_sheet.get("sheet_name")
+    final_sheet_file = target_sheet.get("sheet_file")
 
     # Update position if provided
     if x is not None or y is not None:
@@ -685,6 +710,7 @@ def _do_update_sheet_symbol(
                 if isinstance(child[0], sexpdata.Symbol) and child[0].value() == "at":
                     child[1] = new_x
                     child[2] = new_y
+                    final_position = {"x": new_x, "y": new_y}
                     updated_fields.append("position")
                     break
 
@@ -707,6 +733,7 @@ def _do_update_sheet_symbol(
                 if isinstance(child[0], sexpdata.Symbol) and child[0].value() == "size":
                     child[1] = new_width
                     child[2] = new_height
+                    final_size = {"width": new_width, "height": new_height}
                     updated_fields.append("size")
                     break
 
@@ -717,6 +744,7 @@ def _do_update_sheet_symbol(
                 if isinstance(child[0], sexpdata.Symbol) and child[0].value() == "property":
                     if len(child) > 1 and child[1] == "Sheet name":
                         child[2] = sheet_name
+                        final_sheet_name = sheet_name
                         updated_fields.append("sheet_name")
                         break
 
@@ -727,6 +755,7 @@ def _do_update_sheet_symbol(
                 if isinstance(child[0], sexpdata.Symbol) and child[0].value() == "property":
                     if len(child) > 1 and child[1] == "Sheet file":
                         child[2] = sheet_file
+                        final_sheet_file = sheet_file
                         updated_fields.append("sheet_file")
                         break
 
@@ -739,6 +768,10 @@ def _do_update_sheet_symbol(
     return {
         "success": True,
         "sheet_uuid": target_sheet.get("uuid"),
+        "sheet_name": final_sheet_name,
+        "sheet_file": final_sheet_file,
+        "position": final_position,
+        "size": final_size,
         "updated_fields": updated_fields,
         "file_modified": schematic_path,
         "backup_path": backup_path,
