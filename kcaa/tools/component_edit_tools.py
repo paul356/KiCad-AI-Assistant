@@ -524,7 +524,8 @@ def _collect_hierarchy_references(schematic_path: str) -> dict[str, dict[str, st
 
         try:
             sch = safe_schematic(current)
-        except Exception:
+        except (OSError, ValueError, RuntimeError) as e:
+            log.warning("Failed to parse schematic %s: %s", current, e)
             continue
 
         # Collect refs from placed symbols — sch.symbol excludes lib_symbols.
@@ -2119,8 +2120,14 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
                                         raw_new_y,
                                         reference,
                                     )
-                except Exception:
-                    pass  # Overlap avoidance is best-effort; proceed with requested coords.
+                except (AttributeError, KeyError, TypeError, ValueError, OSError) as e:
+                    log.info(
+                        "move_component: overlap avoidance failed for %s — "
+                        "using requested coords: %s",
+                        reference,
+                        e,
+                    )
+                    pass
 
             for sym in units:
                 at = sym.at.value
