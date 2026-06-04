@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import collections
 import datetime
+import json
 import logging
 import os
 import threading
@@ -185,6 +186,8 @@ if _WX_AVAILABLE:
                 "pre code{background:none;padding:0;border-radius:0;font-size:inherit}"
                 "code{font-family:Microsoft YaHei UI,monospace;background:#e0e0e0;"
                 "padding:1px 3px;border-radius:2px;font-weight:600}"
+                "mark.search-match{background:#FFEB3B;color:#000;padding:0 1px;border-radius:1px}"
+                "mark.search-active{background:#FF9800;color:#fff;padding:0 1px;border-radius:1px}"
                 "</style>"
                 "<script>" + js_code + "</script>"
                 "</head>"
@@ -215,6 +218,7 @@ if _WX_AVAILABLE:
 
         def _build_ui(self) -> None:
             panel = wx.Panel(self)
+            self._ui_panel = panel  # stored for Layout() calls
             vbox = wx.BoxSizer(wx.VERTICAL)
 
             # ---- Conversation view (WebView when available, HtmlWindow fallback) ----
@@ -253,6 +257,29 @@ if _WX_AVAILABLE:
 
             self._conv_view.SetMinSize((-1, 120))
             vbox.Add(self._conv_view, 1, wx.ALL | wx.EXPAND, 4)
+
+            # ---- Search bar (hidden by default, shown via Ctrl+F or Tools→Find) ----
+            search_hbox = wx.BoxSizer(wx.HORIZONTAL)
+            self._search_ctrl = wx.SearchCtrl(panel, style=wx.TE_PROCESS_ENTER)
+            self._search_ctrl.Show(False)
+            self._search_ctrl.SetDescriptiveText("Find in conversation\u2026")
+            search_hbox.Add(self._search_ctrl, 1, wx.RIGHT, 4)
+            self._search_prev_btn = wx.BitmapButton(panel, bitmap=wx.ArtProvider.GetBitmap(wx.ART_GO_UP, wx.ART_BUTTON, (20, 20)))
+            self._search_prev_btn.Show(False)
+            self._search_prev_btn.SetToolTip("Previous match (Shift+Enter)")
+            search_hbox.Add(self._search_prev_btn, 0, wx.RIGHT, 2)
+            self._search_next_btn = wx.BitmapButton(panel, bitmap=wx.ArtProvider.GetBitmap(wx.ART_GO_DOWN, wx.ART_BUTTON, (20, 20)))
+            self._search_next_btn.Show(False)
+            self._search_next_btn.SetToolTip("Next match (Enter)")
+            search_hbox.Add(self._search_next_btn, 0, wx.RIGHT, 4)
+            self._search_count_label = wx.StaticText(panel, label="0/0")
+            self._search_count_label.Show(False)
+            search_hbox.Add(self._search_count_label, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
+            self._search_close_btn = wx.BitmapButton(panel, bitmap=wx.ArtProvider.GetBitmap(wx.ART_CLOSE, wx.ART_BUTTON, (20, 20)))
+            self._search_close_btn.Show(False)
+            self._search_close_btn.SetToolTip("Close search (Escape)")
+            search_hbox.Add(self._search_close_btn, 0)
+            vbox.Add(search_hbox, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM | wx.EXPAND, 4)
 
             # ---- Input row ----
             hbox = wx.BoxSizer(wx.HORIZONTAL)
@@ -293,9 +320,12 @@ if _WX_AVAILABLE:
 
             # Tools menu
             self._menu_autoroute_id = wx.NewIdRef()
+            self._menu_find_id = wx.NewIdRef()
             tools_menu = wx.Menu()
             tools_menu.Append(self._menu_autoroute_id, "Auto Route\u2026")
             tools_menu.Enable(self._menu_autoroute_id, False)
+            tools_menu.AppendSeparator()
+            tools_menu.Append(self._menu_find_id, "Find in Conversation\tCtrl+F")
             menu_bar.Append(tools_menu, "&Tools")
 
             # Server menu (merged from Options + Backend)
@@ -323,7 +353,15 @@ if _WX_AVAILABLE:
             self.Bind(wx.EVT_MENU, self._on_load_session, id=self._menu_load_session_id)
             self.Bind(wx.EVT_MENU, self._on_restart, id=self._menu_restart_id)
             self.Bind(wx.EVT_MENU, self._on_autoroute, id=self._menu_autoroute_id)
+            self.Bind(wx.EVT_MENU, self._on_find, id=self._menu_find_id)
             self.Bind(wx.EVT_MENU, self._on_about, id=self._menu_about_id)
+            self._search_ctrl.Bind(wx.EVT_SEARCHCTRL_SEARCH_BTN, self._on_search)
+            self._search_ctrl.Bind(wx.EVT_TEXT, self._on_search_text)
+            self._search_ctrl.Bind(wx.EVT_TEXT_ENTER, self._on_search_next)
+            self._search_ctrl.Bind(wx.EVT_CHAR_HOOK, self._on_search_key)
+            self._search_next_btn.Bind(wx.EVT_BUTTON, self._on_search_next)
+            self._search_prev_btn.Bind(wx.EVT_BUTTON, self._on_search_prev)
+            self._search_close_btn.Bind(wx.EVT_BUTTON, self._on_search_close)
             self.Bind(wx.EVT_CLOSE, self._on_close)
             self.Bind(wx.EVT_WINDOW_DESTROY, self._on_destroy)
 
@@ -925,6 +963,73 @@ if _WX_AVAILABLE:
                 "About KiCad AI Assistant",
                 wx.OK | wx.ICON_INFORMATION,
             )
+
+        # ---- Search / Find handlers ----
+
+        def _on_find(self, event) -> None:
+            """Show the search bar (Ctrl+F or Tools→Find)."""
+            self._search_ctrl.Show(True)
+            self._search_prev_btn.Show(True)
+            self._search_next_btn.Show(True)
+            self._search_count_label.Show(True)
+            self._search_close_btn.Show(True)
+            self._search_ctrl.SetFocus()
+            self._ui_panel.Layout()
+            # Clear previous search
+            self._search_ctrl.SetValue("")
+            self._search_count_label.SetLabel("0/0")
+            if self._use_webview:
+                self._conv_view.RunScript("_clearFind()")
+
+        def _on_search_close(self, event=None) -> None:
+            """Hide search bar and clear highlights."""
+            self._search_ctrl.Show(False)
+            self._search_prev_btn.Show(False)
+            self._search_next_btn.Show(False)
+            self._search_count_label.Show(False)
+            self._search_close_btn.Show(False)
+            self._ui_panel.Layout()
+            if self._use_webview:
+                self._conv_view.RunScript("_clearFind()")
+            self._conv_view.SetFocus()
+
+        def _on_search_key(self, event) -> None:
+            """Handle keyboard shortcuts in search bar."""
+            key = event.GetKeyCode()
+            if key == wx.WXK_ESCAPE:
+                self._on_search_close()
+                return
+            event.Skip()
+
+        def _on_search_text(self, event) -> None:
+            """Search on every keystroke."""
+            query = self._search_ctrl.GetValue().strip()
+            if self._use_webview:
+                if query:
+                    ok, result = self._conv_view.RunScript(f"_findTextAndJump({json.dumps(query)})")
+                    if ok and result:
+                        self._search_count_label.SetLabel(str(result))
+                else:
+                    self._conv_view.RunScript("_clearFind()")
+                    self._search_count_label.SetLabel("0/0")
+
+        def _on_search(self, event) -> None:
+            """Search button clicked."""
+            self._on_search_text(event)
+
+        def _on_search_next(self, event=None) -> None:
+            """Jump to next match."""
+            if self._use_webview:
+                ok, result = self._conv_view.RunScript("_findNext()")
+                if ok and result:
+                    self._search_count_label.SetLabel(str(result))
+
+        def _on_search_prev(self, event=None) -> None:
+            """Jump to previous match."""
+            if self._use_webview:
+                ok, result = self._conv_view.RunScript("_findPrev()")
+                if ok and result:
+                    self._search_count_label.SetLabel(str(result))
 
         def _on_autoroute(self, event) -> None:
             """Menu handler: Tools → Auto Route…

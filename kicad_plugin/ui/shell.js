@@ -207,3 +207,119 @@ window._clearConversation = function() {
         });
     }
 })();
+
+// ---- Search / Find in conversation ----
+// State: array of DOM nodes that contain matches, plus the current index.
+window.__findMatches = [];
+window.__findIdx = -1;
+
+window._findText = function(query) {
+    _clearFind();
+    window.__findMatches = [];
+    window.__findIdx = -1;
+    if (!query || query.length === 0) return '0/0';
+
+    var conv = document.getElementById('conversation');
+    if (!conv) return '0/0';
+
+    // Walk all text nodes inside the conversation container
+    var walker = document.createTreeWalker(conv, NodeFilter.SHOW_TEXT, null, false);
+    var lowerQuery = query.toLowerCase();
+    var textNodes = [];
+    while (walker.nextNode()) {
+        var node = walker.currentNode;
+        // Skip nodes inside <style> or <script>
+        if (node.parentNode && (node.parentNode.tagName === 'STYLE' || node.parentNode.tagName === 'SCRIPT')) continue;
+        // Skip empty / whitespace-only nodes
+        if (!node.nodeValue || !node.nodeValue.trim()) continue;
+        textNodes.push(node);
+    }
+
+    for (var i = 0; i < textNodes.length; i++) {
+        var node = textNodes[i];
+        var text = node.nodeValue;
+        var lower = text.toLowerCase();
+        var idx = lower.indexOf(lowerQuery);
+        if (idx === -1) continue;
+
+        // Replace all occurrences in this text node with <mark> wrappers
+        var parent = node.parentNode;
+        var fragment = document.createDocumentFragment();
+        var lastEnd = 0;
+        while (idx !== -1) {
+            // Text before match
+            if (idx > lastEnd) {
+                fragment.appendChild(document.createTextNode(text.substring(lastEnd, idx)));
+            }
+            // The match wrapped in <mark>
+            var mark = document.createElement('mark');
+            mark.className = 'search-match';
+            mark.textContent = text.substring(idx, idx + query.length);
+            fragment.appendChild(mark);
+            window.__findMatches.push(mark);
+            lastEnd = idx + query.length;
+            idx = lower.indexOf(lowerQuery, lastEnd);
+        }
+        // Remaining text after last match
+        if (lastEnd < text.length) {
+            fragment.appendChild(document.createTextNode(text.substring(lastEnd)));
+        }
+        parent.replaceChild(fragment, node);
+    }
+
+    return window.__findMatches.length > 0 ? ('1/' + window.__findMatches.length) : '0/0';
+};
+
+window._findTextAndJump = function(query) {
+    var result = _findText(query);
+    if (window.__findMatches.length > 0) {
+        _findJump(0);
+    }
+    return result;
+};
+
+window._findJump = function(idx) {
+    if (window.__findMatches.length === 0) return '0/0';
+    // De-highlight previous
+    for (var i = 0; i < window.__findMatches.length; i++) {
+        window.__findMatches[i].classList.remove('search-active');
+    }
+    // Clamp index
+    var n = window.__findMatches.length;
+    var newIdx = ((idx % n) + n) % n;
+    window.__findIdx = newIdx;
+    var el = window.__findMatches[newIdx];
+    el.classList.add('search-active');
+    // Walk up and expand any parent <details> elements so the match is visible
+    var parent = el.parentNode;
+    while (parent) {
+        if (parent.tagName === 'DETAILS' && !parent.hasAttribute('open')) {
+            parent.setAttribute('open', '');
+        }
+        parent = parent.parentNode;
+    }
+    el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    return (newIdx + 1) + '/' + n;
+};
+
+window._findNext = function() {
+    return _findJump((window.__findIdx + 1) % (window.__findMatches.length || 1));
+};
+
+window._findPrev = function() {
+    return _findJump((window.__findIdx - 1 + (window.__findMatches.length || 1)) % (window.__findMatches.length || 1));
+};
+
+window._clearFind = function() {
+    var marks = document.querySelectorAll('mark.search-match');
+    for (var i = marks.length - 1; i >= 0; i--) {
+        var mark = marks[i];
+        var parent = mark.parentNode;
+        if (parent) {
+            parent.replaceChild(document.createTextNode(mark.textContent), mark);
+            parent.normalize();
+        }
+    }
+    window.__findMatches = [];
+    window.__findIdx = -1;
+};
