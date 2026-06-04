@@ -238,6 +238,8 @@ class SchematicParser:
                 pins_summary.append(
                     {
                         "num": pin.number,
+                        "name": pin.name,
+                        "electrical": pin.electrical_type,
                         "x": str(pin.x),
                         "y": str(pin.y),
                         "direction": _angle_to_direction_screen(pin.angle),
