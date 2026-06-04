@@ -269,6 +269,9 @@ TOOL_POLICIES: dict[str, ToolPolicy] = {
         auto_snapshot=True,
         mark_dirty=True,
     ),
+    # Skill tools
+    "list_skills": ToolPolicy(kind="query"),
+    "get_skill": ToolPolicy(kind="query"),
     # KiCad IPC / UI tools
     "check_kicad_ipc_connection": ToolPolicy(kind="query"),
     "save_document": ToolPolicy(kind="ipc_action", path_arg="file_path"),

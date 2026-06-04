@@ -27,10 +27,32 @@ class PinWorldCoords(NamedTuple):
     """Absolute schematic position and exit direction of one pin."""
 
     number: str  # pin number label, e.g. "1", "2", "A3"
+    name: str  # pin name, e.g. "VCC", "GND", "GPIO1"
+    electrical_type: str  # e.g. "input", "output", "bidirectional", "power_in"
     x: float  # absolute schematic X (mm)
     y: float  # absolute schematic Y (mm)
     angle: float  # wire-exit direction in degrees:
     #   0=right, 90=down (screen), 180=left, 270=up (screen)
+
+
+def _pin_electrical_type(pin: Any) -> str:
+    """Extract the electrical type from a SymbolPin.
+
+    Accesses the pin's underlying library symbol definition to read the
+    electrical type string (e.g. "input", "output", "power_in").
+    """
+    try:
+        return str(pin._lib_sym_pin.wrapped_parsed_value.value[0])
+    except Exception:
+        return ""
+
+
+def _lib_pin_electrical_type(lib_pin: Any) -> str:
+    """Extract the electrical type from a LibSymbolPin."""
+    try:
+        return str(lib_pin.wrapped_parsed_value.value[0])
+    except Exception:
+        return ""
 
 
 def sym_pin_world_coords(sym: Any) -> list[PinWorldCoords]:
@@ -83,10 +105,14 @@ def sym_pin_world_coords(sym: Any) -> list[PinWorldCoords]:
         for pin in sym.pin:
             try:
                 num = str(pin.number)
+                name = str(pin.name) if pin.name else ""
+                etype = _pin_electrical_type(pin)
                 loc = pin.location
                 results.append(
                     PinWorldCoords(
                         number=num,
+                        name=name,
+                        electrical_type=etype,
                         x=round(float(loc.x), 4),
                         y=round(float(loc.y), 4),
                         angle=(540.0 - float(loc.rotation)) % 360.0,
@@ -121,6 +147,8 @@ def sym_pin_world_coords(sym: Any) -> list[PinWorldCoords]:
             for lib_pin in lib_sym.pin:
                 try:
                     num = str(lib_pin.number.value)
+                    name = str(lib_pin.name.value) if lib_pin.name else ""
+                    etype = _lib_pin_electrical_type(lib_pin)
                     rel_raw: list = copy.deepcopy(lib_pin.at.value)  # [x, y, angle]
 
                     # Apply mirroring to lib-pin relative position
@@ -152,6 +180,8 @@ def sym_pin_world_coords(sym: Any) -> list[PinWorldCoords]:
                     results.append(
                         PinWorldCoords(
                             number=num,
+                            name=name,
+                            electrical_type=etype,
                             x=wx,
                             y=wy,
                             angle=(540.0 - float(rel_at.rotation)) % 360.0,

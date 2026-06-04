@@ -105,10 +105,13 @@ def register_netlist_tools(mcp: FastMCP) -> None:
           box (union of every placed unit). Use this to check overlaps before
           calling ``move_component`` / ``add_symbol_to_schematic``. May be
           absent for graphics-less symbols (e.g. PWR_FLAG).
-        - ``pins``: list of ``{num, x, y, direction}``. ``x``/``y`` are world
+        - ``pins``: list of ``{num, name, electrical, x, y, direction}``. ``x``/``y`` are world
           coordinates already accounting for placement and rotation;
           ``direction`` is the screen-space exit direction
-          (``"right"|"up"|"left"|"down"``). When choosing which two pins to
+          (``"right"|"up"|"left"|"down"``). ``name`` is the pin name
+          (e.g. ``"VCC"``, ``"GPIO1"``). ``electrical`` is the pin's
+          electrical type (e.g. ``"input"``, ``"output"``, ``"power_in"``,
+          ``"bidirectional"``). When choosing which two pins to
           wire, the **electrically correct pin** comes first — only fall
           back to "closest pin pair" geometry when both candidates are
           electrically interchangeable (e.g. the two leads of a non-polar
@@ -143,8 +146,11 @@ def register_netlist_tools(mcp: FastMCP) -> None:
                     "components": {
                         "R1": {"value": "10k",
                                "position": {"x": ..., "y": ..., "rotation": ...},
-                               "pins": [{"num": "1", "x": ..., "y": ..., "direction": ..., "net": "GND"}, ...]},
-                               # direction: wire-exit direction in screen coords: "right", "down", "left", "up"
+                               "pins": [{"num": "1", "name": "VCC",
+                                         "electrical": "power_in",
+                                         "x": ..., "y": ...,
+                                         "direction": ..., "net": "GND"}, ...]},
+                               # name: pin name (e.g. "VCC", "GPIO1"); electrical: electrical type
                         ...
                     },
                     "power_nets": [

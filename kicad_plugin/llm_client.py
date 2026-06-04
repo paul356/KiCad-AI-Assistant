@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 import json
 import logging
 import os
+from pathlib import Path
 import platform
 import subprocess  # nosec B404 -- controlled subprocess execution, no user input
 from typing import Any
@@ -20,6 +21,163 @@ from typing import Any
 from .tool_registry import get_missing_tool_policies, get_tool_policy
 
 log = logging.getLogger(__name__)
+
+# ------------------------------------------------------------------
+# P1  stale-query detection: category mappings
+# ------------------------------------------------------------------
+
+# Categories assigned to *query* tools based on what they return.
+# Library/lookup-only queries (search_symbols, get_symbol, …) are excluded
+# because they are never invalidated by a file mutation.
+QUERY_CATEGORY: dict[str, str] = {
+    # Schematic queries
+    "list_component_properties": "symbol_properties",
+    "get_symbol_pins": "symbol_pins",
+    "check_reference_conflicts": "symbol_inventory",
+    "list_labels_in_schematic": "labels",
+    "extract_project_netlist": "netlist",
+    "extract_schematic_netlist": "netlist",
+    "find_component_connections": "netlist",
+    "get_schematic_sheet_info": "sheet_meta",
+    "list_sheet_symbols": "sheet_inventory",
+    "get_sheet_hierarchy": "sheet_structure",
+    # PCB queries
+    "get_board_info": "pcb_meta",
+    "list_footprints": "pcb_inventory",
+    "get_footprint": "pcb_properties",
+    "list_nets": "pcb_nets",
+    "get_ratsnest": "pcb_nets",
+    "score_placement": "pcb_placement",
+    "suggest_placement_order": "pcb_placement",
+    "get_board_outline": "pcb_outline",
+    "get_footprint_bbox": "pcb_bbox",
+    "get_board_bounding_box": "pcb_bbox",
+    "find_free_pcb_area": "pcb_placement",
+    "list_groups": "pcb_groups",
+    "get_group": "pcb_groups",
+    "score_group": "pcb_groups",
+    "list_zones": "pcb_zones",
+}
+
+# Per-mutation categories that become stale.
+MUTATION_RIPPLES: dict[str, set[str]] = {
+    # Schematic mutations
+    "add_symbol_to_schematic": {
+        "symbol_inventory",
+        "symbol_properties",
+        "symbol_pins",
+        "netlist",
+        "placement",
+    },
+    "remove_symbol_from_schematic": {
+        "symbol_inventory",
+        "symbol_properties",
+        "symbol_pins",
+        "netlist",
+        "placement",
+    },
+    "set_component_property": {"symbol_properties"},
+    "rename_symbol": {"symbol_inventory"},
+    "delete_component_property": {"symbol_properties"},
+    "move_component": {"symbol_inventory", "placement"},
+    "place_symbol_relative": {"symbol_inventory", "placement"},
+    "add_label_to_schematic": {"labels"},
+    "delete_label_from_schematic": {"labels"},
+    "connect_points_with_wire": {"netlist"},
+    "connect_pins_with_wire": {"netlist"},
+    "delete_wire_from_schematic": {"netlist"},
+    "add_sheet_symbol": {"sheet_inventory", "sheet_structure", "placement"},
+    "remove_sheet_symbol": {"sheet_inventory", "sheet_structure", "placement"},
+    "update_sheet_symbol": {"sheet_inventory", "sheet_structure"},
+    "add_sheet_pin": {"sheet_structure"},
+    "remove_sheet_pin": {"sheet_structure"},
+    # PCB mutations
+    "set_footprint_position": {"pcb_inventory", "pcb_placement"},
+    "flip_footprint": {"pcb_inventory", "pcb_placement"},
+    "set_footprint_property": {"pcb_properties"},
+    "clear_board_outline": {"pcb_outline"},
+    "add_board_outline_segment": {"pcb_outline"},
+    "add_board_outline_arc": {"pcb_outline"},
+    "set_board_outline_rect": {"pcb_outline"},
+    "align_footprints": {"pcb_inventory", "pcb_placement"},
+    "distribute_footprints": {"pcb_inventory", "pcb_placement"},
+    "move_footprints_by_delta": {"pcb_inventory", "pcb_placement"},
+    "assign_to_group": {"pcb_groups", "pcb_inventory"},
+    "place_component_group": {"pcb_inventory", "pcb_groups", "pcb_placement"},
+    "move_group": {"pcb_inventory", "pcb_groups", "pcb_placement"},
+    "rotate_group": {"pcb_inventory", "pcb_groups", "pcb_placement"},
+    "add_zone": {"pcb_zones"},
+    "delete_zone": {"pcb_zones"},
+}
+
+# Token-efficient annotation prefix.
+_STALE_PREFIX = (
+    "⚠️ STALE — file was modified after this query. Re-query if the data may have changed.\n"
+)
+
+_STALE_PREFIX_LEN = len(_STALE_PREFIX)
+
+
+def _extract_file_path(args: dict[str, Any]) -> str:
+    """Return the first file-path value found in *args*, or ``""``."""
+    for key in ("file_path", "schematic_path", "pcb_path", "project_path"):
+        v = args.get(key, "")
+        if v:
+            return v
+    return ""
+
+
+_SKILLS_DIR = Path(
+    os.environ.get("KCAA_SKILLS_DIR", str(Path(__file__).resolve().parent / "skills"))
+)
+
+
+def _parse_skill_front_matter(text: str) -> dict[str, str]:
+    """Return flat front-matter metadata from a skill Markdown file."""
+    if not text.startswith("---"):
+        return {}
+    end = text.find("\n---", 3)
+    if end == -1:
+        return {}
+    meta: dict[str, str] = {}
+    for line in text[3:end].strip().splitlines():
+        if ":" not in line:
+            continue
+        key, _, value = line.partition(":")
+        meta[key.strip()] = value.strip().strip('"').strip("'")
+    return meta
+
+
+def _load_skill_catalog_entries() -> list[dict[str, str]]:
+    """Load skill metadata for prompt-time catalog generation."""
+    if not _SKILLS_DIR.exists():
+        return []
+
+    skills: list[dict[str, str]] = []
+    for path in _SKILLS_DIR.glob("*.md"):
+        try:
+            meta = _parse_skill_front_matter(path.read_text(encoding="utf-8"))
+            name = meta.get("name") or path.stem.replace("_", "-")
+            skills.append(
+                {
+                    "name": name,
+                    "description": meta.get("description", ""),
+                    "priority": meta.get("priority", "50"),
+                }
+            )
+        except Exception:
+            log.warning("Failed to read skill file %s", path)
+
+    return sorted(skills, key=lambda s: (-int(s["priority"]), s["name"]))
+
+
+def _build_skill_catalog_block() -> str:
+    """Render a compact catalog of available on-demand workflow skills."""
+    skills = _load_skill_catalog_entries()
+    if not skills:
+        return ""
+    names = ", ".join(skill["name"] for skill in skills)
+    return "# Skills\n" + names
 
 
 # ---------------------------------------------------------------------------
@@ -185,24 +343,16 @@ def _https_post_json(
 # ---------------------------------------------------------------------------
 
 _PROMPT_HEADER = """\
-You are an expert KiCad assistant embedded in the KiCad EDA tool.
-You help engineers edit schematics and PCB layouts by calling the available MCP tools.
-
-# Framework-managed mutation safety
-- The plugin framework automatically calls `save_file_version(file_path)` the
-  first time a request successfully attempts to modify a schematic or PCB file.
-- The framework automatically calls `reload_kicad(paths=[...])` once at the end
-  of the request for every file that was modified successfully.
-- Do **not** call `save_file_version` or `reload_kicad` as part of a normal
-  edit workflow. Use the version tools only when the engineer explicitly asks
-  to inspect or restore saved versions.
-
-# KiCad IPC tools (kipy-based)
-- Do **not** call the following IPC-based tools unless the engineer explicitly
-  asks for one of them: `check_kicad_ipc_connection`, `save_document`, `reload_kicad`.
-- These tools interact with KiCad's live IPC API and can cause unexpected
-  side effects (e.g. overwriting file-based changes). Prefer file-based tools
-  for all editing operations.\
+You are a KiCad assistant — modest, cautious, and proactive.
+- Before every task, briefly share your intent and plan with the user.
+- When a tool returns unexpected results or errors, pause and ask the user
+  for guidance. The user is more experienced at solving circuit design
+  problems — defer to their judgment.
+- Edit schematics/PCBs via MCP tools.
+- Unless asked, never call `save_file_version`, `reload_kicad`,
+  `check_kicad_ipc_connection`, or `save_document`.
+- The framework handles snapshots/reloads. Use ``list_skills()`` /
+  ``get_skill(name)`` for guides.\
 """
 
 _PROMPT_SCHEMATIC = """\
@@ -210,98 +360,17 @@ _PROMPT_SCHEMATIC = """\
 # Schematic coordinate system
 - All coordinates are in **millimetres** with **+X right, +Y DOWN** (KiCad
   schematic screen convention).
-- Library symbols (.kicad_sym) internally use Y-UP, but every tool that
-  takes or returns placed-symbol coordinates uses Y-DOWN. You only ever
-  reason in Y-DOWN.
+- Schematic symbol local coordinates (in .kicad_sym files) use **Y-UP**.
+  However, every tool that takes or returns placed-symbol coordinates uses
+  Y-DOWN. You only ever reason in Y-DOWN.
+- Rotation in symbol (.kicad_sym) files is **counterclockwise (CCW)**.
+  0°=unrotated, 90°=tilt left, 180°=flipped, 270°=tilt right.
 - The schematic grid is **1.27 mm (50 mil)**. add_symbol_to_schematic and
   move_component snap automatically; rotation is restricted to 0/90/180/270.
 - Default sheet is **A4 (297 x 210 mm)**. At the start of each request
   that involves spatial changes, call get_schematic_sheet_info once to
   confirm the actual paper size and to learn the recommended drawing area
   (it accounts for the title block).
-
-# Geometry you get for free
-- get_symbol and get_symbol_pins return body_bbox + per-unit bboxes in
-  library coordinates so you can size new placements before inserting.
-- extract_schematic_netlist returns body_bbox per placed component in
-  schematic (Y-down) world coordinates. Use it as your occupancy map.
-- add_symbol_to_schematic, place_symbol_relative and move_component all
-  return the resulting body_bbox so you usually do NOT need to re-extract
-  the netlist after a successful placement.
-
-# Recommended placement workflow
-1. Call extract_schematic_netlist to learn what already exists and where.
-2. To add a new symbol:
-   a. Look it up with search_symbols / get_symbol (note its body_bbox).
-   b. PREFER place_symbol_relative when you can describe the position
-      relative to an existing reference (e.g. "right of U1, gap 2.54").
-   c. Otherwise call find_free_area(for_library=..., for_symbol=...,
-      prefer_near=...) — always supply ``for_library`` and ``for_symbol``
-      so each candidate includes a **placement** ``{x, y}`` field. Pass
-      ``placement.x`` / ``placement.y`` directly to add_symbol_to_schematic.
-      (``origin`` is the bbox top-left, NOT the symbol anchor; do not use
-      it for placement coordinates.)
-   d. Only fall back to absolute add_symbol_to_schematic(x, y, ...) if the
-      helpers above cannot satisfy the request.
-3. After moves/inserts, prefer using the returned body_bbox; only call
-   extract_schematic_netlist again if you need to refresh net info.
-4. Wire pins using this priority order — try each in turn, stop at first
-   success; if both fail, **report the failure and the coordinates to
-   the user** instead of silently skipping the wire:
-   a. **connect_pins_with_wire(from_ref, from_pin, to_ref, to_pin)** —
-      preferred for pin-to-pin; resolves coordinates automatically, routes
-      with smart orthogonal routing, and inserts junctions automatically.
-      If this fails, **immediately report to the user**: the tool name
-      (connect_pins_with_wire), the exact arguments used, and the full
-      error message returned. Then proceed to (b).
-   b. **connect_points_with_wire(start_x, start_y, end_x, end_y)** — smart
-      orthogonal routing between bare coordinates; use when endpoints are
-      not symbol pins (e.g. net label positions, existing wire tips).
-      If this fails, **stop and report** the tool name
-      (connect_points_with_wire), the exact arguments used, and the full
-      error message to the user.
-
-# Wiring strategy
-- The required pin on each component is dictated by the **circuit's
-  electrical intent** — that comes first, ALWAYS. Pin choice is
-  flexible only when both candidate pins are electrically interchangeable
-  ("isotropic"): e.g. the two leads of a non-polarised resistor or
-  ceramic capacitor, the two ends of an inductor, or two pins on the
-  same internal net. It is NEVER flexible for polarised parts (diodes
-  anode/cathode, electrolytic/tantalum capacitor +/-, LEDs, BJT/MOSFET
-  terminals), ICs, connectors, or any pin whose name carries meaning
-  (VCC, GND, EN, CLK, D+, etc.). Use ``get_symbol_pins`` /
-  ``components[ref].pins[*].num`` together with the symbol's datasheet
-  semantics to pick the correct pin first; only then optimise geometry.
-- **When (and only when) the choice is between electrically equivalent
-  pins**, pick the pair whose schematic coordinates are closest
-  (minimum Manhattan distance). Read each candidate pin's world
-  ``x``/``y`` from extract_schematic_netlist
-  (``components[ref].pins[*]`` has ``num``, ``x``, ``y``, ``direction``).
-  Shorter wires mean fewer bends and fewer crossings.
-- For pins on the same net (e.g. all GND, all VCC), wire each new pin
-  to the *closest already-wired pin on that net* rather than always
-  going back to the same anchor — this keeps the net visually local.
-- Prefer connect_pins_with_wire over manual coordinate routing whenever
-  both endpoints are pins; it handles rotation and junction insertion for
-  you.  When endpoints are bare coordinates, use connect_points_with_wire.
-  Always report failures to the user.
-- If the electrically-correct pin pair would produce a long or cluttered
-  wire, consider **rotating or moving one of the components** instead of
-  picking a different (wrong) pin.
-- Do **not** break a wire into multiple segments by calling a wiring tool
-  multiple times. Always provide the direct start and end points in a
-  single call; the routing algorithm handles all intermediate bends
-  automatically.
-
-# Spacing & layout rules
-- Keep at least one grid step (1.27 mm) of clearance between symbol body
-  bboxes; 2.54 mm or more is preferred so Reference/Value labels do not
-  collide with neighbours.
-- Align rows of similar components on the same Y; align columns on the
-  same X. Use multiples of 1.27 mm for spacing so wires stay orthogonal.
-- Stay inside the recommended_area returned by get_schematic_sheet_info;
-  never place inside title_block_default.
 
 # Hard rules (schematic)
 - Always call extract_schematic_netlist (or get_schematic_sheet_info) for
@@ -321,73 +390,15 @@ _PROMPT_PCB = """\
 # PCB coordinate system
 - All PCB coordinates are **millimetres**, **+X right, +Y DOWN** (same screen
   convention as schematics).
-- PCB rotation is **clockwise-positive** (opposite to the CCW / Y-up
-  convention used by .kicad_sym library data).  0° is unrotated; 90° tilts
-  the footprint 90° clockwise on screen.
+- Footprint (.kicad_mod) files internally use **Y-DOWN** coordinates.
+- Rotation in footprint (.kicad_mod) files is **counterclockwise (CCW)**.
+  0°=unrotated, 90°=tilt left, 180°=flipped, 270°=tilt right.
 - There is no auto-snap for PCB tools.  Pass coordinates already aligned to
   your board grid.  Typical grids: **0.1 mm or 0.05 mm** for SMD work,
   **1.27 mm (50 mil)** for through-hole.
 - PCB layers of interest: ``F.Cu`` / ``B.Cu`` (copper), ``F.SilkS`` /
   ``B.SilkS`` (silkscreen), ``F.Courtyard`` / ``B.Courtyard`` (keep-out),
   ``Edge.Cuts`` (board outline).
-
-# PCB query workflow
-1. Call **get_board_info** to learn layer stack, copper layer count, footprint
-   count, net count, and board generator.
-2. Call **list_footprints** to get every footprint's reference, value, x/y
-   (world mm), rotation (CW+), and layer.
-3. Call **get_footprint** for detailed info on a specific footprint: pad
-   numbers/types/nets, all properties, and local pad coordinates.
-   Note: pad coordinates from get_footprint are *local* (footprint-relative).
-   Use **get_ratsnest** when you need world-coordinate pad positions.
-4. Call **list_nets** to enumerate nets with their pad counts.
-5. Call **get_ratsnest** to identify unconnected pad pairs.  An empty result
-   means the board is fully routed.  Pad x/y in the ratsnest response are
-   already in world coordinates (rotation applied).
-
-# PCB placement workflow
-- Before placing, call **get_board_info** + **list_footprints** to understand
-  the current layout.
-- Use **get_footprint_bbox** to get a footprint's courtyard bounding box in
-  world coordinates.  Use this to check for overlaps before positioning.
-- Use **get_board_bounding_box** to get the union bbox of all footprint
-  courtyards — useful for sizing the board outline around all components.
-- Move or rotate a single footprint: **set_footprint_position(pcb_path,
-  reference, x, y, rotation)**.  Any argument may be ``null`` to leave it
-  unchanged; at least one must be provided.  If the requested position causes
-  a courtyard collision, the tool automatically adjusts to the nearest free
-  spot; if none is found within 20 mm, an error is returned.
-- Flip a footprint between F.Cu and B.Cu: **flip_footprint(pcb_path,
-  reference)**.  All child layer items are updated automatically.
-- Update a footprint property (Reference, Value, Datasheet, or custom field):
-  **set_footprint_property(pcb_path, reference, property_name, value)**.
-
-# PCB group operations
-- **align_footprints(pcb_path, references, axis, coordinate)** — align all
-  listed footprints to the same X or Y.  ``coordinate=null`` uses the mean.
-- **distribute_footprints(pcb_path, references, axis)** — evenly space ≥3
-  footprints along X or Y; outermost positions are fixed.
-- **move_footprints_by_delta(pcb_path, references, dx, dy)** — shift a group
-  by the same offset without changing their relative positions.
-
-# Board outline workflow
-- Query current Edge.Cuts geometry: **get_board_outline**.
-- Replace the entire outline with a rectangle: **set_board_outline_rect(
-  pcb_path, x, y, width, height, line_width, corner_radius)**.
-  ``corner_radius=0`` emits a single gr_rect; positive value draws four
-  lines + four 90° arcs.  Edge.Cuts line width is typically 0.05 mm.
-- Add individual segments or arcs: **add_board_outline_segment** /
-  **add_board_outline_arc**.  Wipe first with **clear_board_outline**.
-- Arc angles: 0° is +X, angles increase clockwise.
-
-# Footprint library workflow
-- Build/refresh the footprint index (background):
-  **sync_footprint_index(project_path, force)**.  Check progress with
-  **get_footprint_sync_status**.
-- List libraries: **list_footprint_libraries(project_path)**.
-- Search footprints: **search_footprints(query, project_path, limit)**.
-- Inspect pads/courtyard of a specific footprint:
-  **get_footprint_details(library, name)**.
 
 # Hard rules (PCB)
 - Always call get_board_info + list_footprints before making spatial changes.
@@ -401,6 +412,10 @@ _PROMPT_PCB = """\
 - Do not overlap footprint courtyards.  Verify clearances with
   get_footprint_bbox / get_board_bounding_box before committing a move.\
 """
+
+_PROMPT_SKILL_CATALOG = _build_skill_catalog_block()
+if _PROMPT_SKILL_CATALOG:
+    _PROMPT_PCB = _PROMPT_PCB + "\n\n" + _PROMPT_SKILL_CATALOG
 
 
 def build_system_prompt(context_block: str) -> str:
@@ -710,12 +725,232 @@ class LLMClient:
         )
         return True
 
+    def _prune_rollback_history(self) -> None:
+        """Prune tool-call turns invalidated by restore_file_version.
+
+        When the LLM restores a file to an earlier version, every tool call that
+        mutated or queried that file between the save point and the restore is
+        now based on stale state — prune those turns.
+
+        Handles nested restores: starts from the most recent restore and skips
+        any restore whose messages fall inside an already-pruned range.
+        """
+        # ---- Build save-point lookup ------------------------------------------
+        # For each save_file_version tool result, record (file_path, version_id) → index.
+        save_points: dict[tuple[str, str], int] = {}
+        for i, msg in enumerate(self._history):
+            if msg.get("role") != "tool":
+                continue
+            p_idx = self._find_parent_assistant(i)
+            if p_idx is None:
+                continue
+            parent = self._history[p_idx]
+            tc_id = msg.get("tool_call_id")
+            for tc in parent.get("tool_calls") or []:
+                if tc.get("id") != tc_id:
+                    continue
+                if tc.get("function", {}).get("name") != "save_file_version":
+                    continue
+                try:
+                    args = json.loads(tc["function"].get("arguments", "{}"))
+                    result = json.loads(msg.get("content", "{}"))
+                    fp = args.get("file_path", "")
+                    vid = result.get("version_id", "")
+                    if fp and vid:
+                        save_points[(fp, vid)] = i
+                except (json.JSONDecodeError, KeyError, TypeError):
+                    pass
+
+        # ---- Scan from tail for restore_file_version -------------------------
+        marked: set[int] = set()  # indices to remove  (tool results)
+        tool_call_removals: dict[int, list[str]] = {}  # assistant_idx → [tc_id, ...]
+        i = len(self._history) - 1
+        while i >= 0:
+            if i in marked:
+                i -= 1
+                continue
+            msg = self._history[i]
+            if msg.get("role") != "tool":
+                i -= 1
+                continue
+            p_idx = self._find_parent_assistant(i)
+            if p_idx is None or p_idx in marked:
+                i -= 1
+                continue
+            parent = self._history[p_idx]
+            tc_id = msg.get("tool_call_id")
+            for tc in parent.get("tool_calls") or []:
+                if tc.get("id") != tc_id:
+                    continue
+                if tc.get("function", {}).get("name") != "restore_file_version":
+                    continue
+                try:
+                    args = json.loads(tc["function"].get("arguments", "{}"))
+                    file_path = args.get("file_path", "")
+                    version_id = args.get("version_id", "")
+                except (json.JSONDecodeError, KeyError, TypeError):
+                    break
+
+                save_idx = save_points.get((file_path, version_id))
+                if save_idx is None or save_idx >= i:
+                    break  # Can't locate save point
+
+                # Mark file-touching tool turns inside (save_idx, i]
+                for j in range(save_idx + 1, i):
+                    if j in marked:
+                        continue
+                    mj = self._history[j]
+                    if mj.get("role") != "tool":
+                        continue
+                    pj = self._find_parent_assistant(j)
+                    if pj is None:
+                        continue
+                    # Check the specific tool_call (not whole turn)
+                    tcj_id = mj.get("tool_call_id")
+                    parent_j = self._history[pj]
+                    for tcj in parent_j.get("tool_calls") or []:
+                        if tcj.get("id") != tcj_id:
+                            continue
+                        try:
+                            tcj_args = json.loads(tcj["function"].get("arguments", "{}"))
+                        except (json.JSONDecodeError, KeyError, TypeError):
+                            continue
+                        if self._tool_touches_file(tcj_args, file_path):
+                            marked.add(j)
+                            tool_call_removals.setdefault(pj, []).append(tcj_id)
+                break
+            i -= 1
+
+        if not marked:
+            return
+
+        # ---- Rebuild history --------------------------------------------------
+        # 1. Strip removed tool_calls from assistant messages.
+        # 2. Remove assistant messages with no remaining content or tool_calls.
+        # 3. Remove marked tool_result messages.
+        new_history: list[dict[str, Any]] = []
+        for idx, msg in enumerate(self._history):
+            if idx in marked:
+                continue  # drop tool_result
+            if msg.get("role") == "assistant" and idx in tool_call_removals:
+                removed_ids = set(tool_call_removals[idx])
+                new_tcs = [
+                    tc for tc in (msg.get("tool_calls") or []) if tc.get("id") not in removed_ids
+                ]
+                if not new_tcs and not msg.get("content"):
+                    continue  # drop empty assistant message
+                msg = dict(msg)  # shallow copy before mutating
+                msg["tool_calls"] = new_tcs
+            new_history.append(msg)
+
+        pruned = len(self._history) - len(new_history)
+        if pruned:
+            log.info("_prune_rollback_history: pruned %d stale messages", pruned)
+        self._history = new_history
+
+    def _find_parent_assistant(self, tool_result_index: int) -> int | None:
+        """Return the index of the assistant message that issued the tool call
+        whose result is at *tool_result_index*."""
+        for j in range(tool_result_index - 1, -1, -1):
+            if self._history[j].get("role") == "assistant":
+                return j
+        return None
+
+    def _annotate_stale_queries(self) -> None:
+        """Annotate query results that became stale due to a later file mutation.
+
+        For each ``file_mutation`` tool result we record the (file_path, categories)
+        pairs it invalidates. Then we walk forward and prepend a stale-warning to
+        any earlier query result whose category + file_path matches a later mutation.
+
+        This is non-destructive — it only adds a warning prefix, never removes data.
+        """
+        # ---- 1. Collect (file_path, rippled_categories) for every mutation ----
+        mutation_ripples: dict[int, tuple[str, set[str]]] = {}
+        for i, msg in enumerate(self._history):
+            if msg.get("role") != "tool":
+                continue
+            p_idx = self._find_parent_assistant(i)
+            if p_idx is None:
+                continue
+            parent = self._history[p_idx]
+            tc_id = msg.get("tool_call_id")
+            for tc in parent.get("tool_calls") or []:
+                if tc.get("id") != tc_id:
+                    continue
+                name = tc.get("function", {}).get("name", "")
+                ripples = MUTATION_RIPPLES.get(name)
+                if not ripples:
+                    continue
+                try:
+                    args = json.loads(tc["function"].get("arguments", "{}"))
+                except (json.JSONDecodeError, KeyError, TypeError):
+                    continue
+                fp = _extract_file_path(args)
+                if fp:
+                    mutation_ripples[i] = (fp, ripples)
+
+        if not mutation_ripples:
+            return
+
+        # ---- 2. For each query result, check if a later mutation invalidates it
+        annotated = 0
+        for i, msg in enumerate(self._history):
+            if msg.get("role") != "tool":
+                continue
+            p_idx = self._find_parent_assistant(i)
+            if p_idx is None:
+                continue
+            parent = self._history[p_idx]
+            tc_id = msg.get("tool_call_id")
+            for tc in parent.get("tool_calls") or []:
+                if tc.get("id") != tc_id:
+                    continue
+                name = tc.get("function", {}).get("name", "")
+                category = QUERY_CATEGORY.get(name)
+                if category is None:
+                    continue  # not tracked (library query, etc.)
+                try:
+                    args = json.loads(tc["function"].get("arguments", "{}"))
+                except (json.JSONDecodeError, KeyError, TypeError):
+                    continue
+                q_fp = _extract_file_path(args)
+                if not q_fp:
+                    continue
+
+                # Check if any LATER mutation on same file invalidates this category
+                for m_idx, (m_fp, m_cats) in mutation_ripples.items():
+                    if m_idx <= i:
+                        continue  # only later mutations matter
+                    if m_fp != q_fp:
+                        continue
+                    if category not in m_cats:
+                        continue
+                    # Found a matching invalidation
+                    content = msg.get("content", "")
+                    if not content.startswith(_STALE_PREFIX):
+                        msg["content"] = _STALE_PREFIX + content
+                        annotated += 1
+                    break  # one annotation per query is enough
+        if annotated:
+            log.info("_annotate_stale_queries: tagged %d stale query result(s)", annotated)
+
+    @staticmethod
+    def _tool_touches_file(args: dict[str, Any], file_path: str) -> bool:
+        """Return True if *args* reference *file_path* via any known file arg name."""
+        for key in ("file_path", "schematic_path", "pcb_path", "project_path"):
+            if args.get(key) == file_path:
+                return True
+        return False
+
     def _maybe_compact(self, system_prompt: str) -> None:
         """Dedup tool calls then, if the token budget is exceeded, compact history.
 
         This is the sole history-management entry point; called once per user turn
         before the LLM is invoked.
         """
+        self._prune_rollback_history()
+        self._annotate_stale_queries()
         self._dedup_tool_calls()
 
         system_tokens = len(system_prompt) // 4

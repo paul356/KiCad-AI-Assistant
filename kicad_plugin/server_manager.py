@@ -252,6 +252,7 @@ class ServerManager:
         env["MCP_PORT"] = str(port)
         env["MCP_HOST"] = "127.0.0.1"  # never listen on 0.0.0.0
         env["KICAD_MCP_PROFILE"] = "plugin"
+        env["KCAA_SKILLS_DIR"] = os.path.join(os.path.dirname(os.path.abspath(__file__)), "skills")
 
         if self._settings.server_log_dir:
             env["KICAD_MCP_LOG_DIR"] = self._settings.server_log_dir

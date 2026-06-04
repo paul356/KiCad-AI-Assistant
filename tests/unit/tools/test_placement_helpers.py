@@ -579,24 +579,38 @@ class TestPlaceSymbolRelative:
         assert abs(round(y_pos / 1.27) * 1.27 - y_pos) < 1e-6
 
 
-def test_system_prompt_mentions_placement_workflow():
+def test_system_prompt_mentions_skill_catalog_and_core_rules():
     from kicad_plugin.llm_client import build_system_prompt
 
     rendered = build_system_prompt("CTX")
     for needle in (
         "find_free_area",
-        "place_symbol_relative",
         "1.27",
         "Y DOWN",
         "get_schematic_sheet_info",
-        # Wiring guidance + correct tool names.
-        "connect_pins_with_wire",
-        "connect_points_with_wire",
-        "closest",
-        "Manhattan",
+        "list_skills()",
+        "get_skill(name)",
+        "# Skills",
+        "schematic-placement",
+        "schematic-wiring",
+        "pcb-query",
+        "pcb-placement",
+        "pcb-outline",
+        "pcb-footprint-library",
     ):
         assert needle in rendered, f"prompt missing {needle!r}"
-    # Must NOT reference the old non-existent tool names.
-    for forbidden in ("add_wire(", "create_junction"):
+    for forbidden in (
+        "# Geometry you get for free",
+        "# Recommended placement workflow",
+        "# Wiring strategy",
+        "# Spacing & layout rules",
+        "# PCB query workflow",
+        "# PCB placement workflow",
+        "# PCB group operations",
+        "# Board outline workflow",
+        "# Footprint library workflow",
+        "add_wire(",
+        "create_junction",
+    ):
         assert forbidden not in rendered, f"prompt still references {forbidden!r}"
     assert "CTX" in rendered

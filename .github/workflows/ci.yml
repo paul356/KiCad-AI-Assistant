@@ -53,6 +53,14 @@ jobs:
     - name: Install dependencies
       run: uv sync --group dev
 
+    - name: Install Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: "20"
+
+    - name: Install jsdom
+      run: npm install jsdom
+
     - name: Run tests
       run: uv run python -m pytest tests/ -v --cov=kcaa --cov-report=xml --cov-fail-under=45
 
