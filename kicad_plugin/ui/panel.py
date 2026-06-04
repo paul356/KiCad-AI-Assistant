@@ -56,6 +56,8 @@ if _WX_AVAILABLE:
             self._settings = settings
             self._llm_client: Any | None = None
             self._busy = False
+            # threading.Event for cancelling an in-progress LLM turn
+            self._cancel_event: threading.Event | None = None
             # Thread-safe buffer for streamed text chunks; drained by _stream_timer
             self._stream_buffer: collections.deque = collections.deque()
             # Set to True when at least one tool call happens during a turn
@@ -80,6 +82,9 @@ if _WX_AVAILABLE:
             # Keep the conversation pinned to the newest output while one AI
             # turn is actively streaming / appending tool results.
             self._follow_output_to_bottom: bool = False
+            # Monotonic counter for tool call sequence IDs (used by shell.js for
+            # unique details element IDs).
+            self._tool_seq: int = 0
             # True while SetPage(shell) is in-flight.  Only relevant during
             # initial shell load — subsequent updates use RunScript, not SetPage.
             self._page_loading: bool = False
@@ -260,6 +265,10 @@ if _WX_AVAILABLE:
             self._send_btn.Enable(False)
             hbox.Add(self._send_btn, 0)
 
+            self._stop_btn = wx.Button(panel, label="Stop")
+            self._stop_btn.Enable(False)
+            hbox.Add(self._stop_btn, 0, wx.LEFT, 4)
+
             vbox.Add(hbox, 0, wx.ALL | wx.EXPAND, 4)
 
             # ---- Status bar (below input) ----
@@ -274,11 +283,6 @@ if _WX_AVAILABLE:
             # ---- Menu bar ----
             menu_bar = wx.MenuBar()
 
-            # Options menu
-            m = wx.Menu()
-            m.Append(wx.ID_PREFERENCES, "&Settings\tCtrl+,")
-            menu_bar.Append(m, "&Options")
-
             # Session menu
             self._menu_new_session_id = wx.NewIdRef()
             self._menu_load_session_id = wx.NewIdRef()
@@ -287,12 +291,6 @@ if _WX_AVAILABLE:
             session_menu.Append(self._menu_load_session_id, "Load Session\u2026")
             menu_bar.Append(session_menu, "&Session")
 
-            # Backend menu
-            self._menu_restart_id = wx.NewIdRef()
-            backend_menu = wx.Menu()
-            backend_menu.Append(self._menu_restart_id, "Restart Backend")
-            menu_bar.Append(backend_menu, "&Backend")
-
             # Tools menu
             self._menu_autoroute_id = wx.NewIdRef()
             tools_menu = wx.Menu()
@@ -300,16 +298,32 @@ if _WX_AVAILABLE:
             tools_menu.Enable(self._menu_autoroute_id, False)
             menu_bar.Append(tools_menu, "&Tools")
 
+            # Server menu (merged from Options + Backend)
+            self._menu_restart_id = wx.NewIdRef()
+            server_menu = wx.Menu()
+            server_menu.Append(wx.ID_PREFERENCES, "&Settings\tCtrl+,")
+            server_menu.AppendSeparator()
+            server_menu.Append(self._menu_restart_id, "Restart Backend")
+            menu_bar.Append(server_menu, "&Server")
+
+            # Help menu
+            self._menu_about_id = wx.NewIdRef()
+            help_menu = wx.Menu()
+            help_menu.Append(self._menu_about_id, "About\u2026")
+            menu_bar.Append(help_menu, "&Help")
+
             self.SetMenuBar(menu_bar)
 
             # ---- Events ----
             self._send_btn.Bind(wx.EVT_BUTTON, self._on_send)
+            self._stop_btn.Bind(wx.EVT_BUTTON, self._on_stop)
             self._input.Bind(wx.EVT_TEXT_ENTER, self._on_send)
             self.Bind(wx.EVT_MENU, self._on_settings, id=wx.ID_PREFERENCES)
             self.Bind(wx.EVT_MENU, self._on_new_session, id=self._menu_new_session_id)
             self.Bind(wx.EVT_MENU, self._on_load_session, id=self._menu_load_session_id)
             self.Bind(wx.EVT_MENU, self._on_restart, id=self._menu_restart_id)
             self.Bind(wx.EVT_MENU, self._on_autoroute, id=self._menu_autoroute_id)
+            self.Bind(wx.EVT_MENU, self._on_about, id=self._menu_about_id)
             self.Bind(wx.EVT_CLOSE, self._on_close)
             self.Bind(wx.EVT_WINDOW_DESTROY, self._on_destroy)
 
@@ -549,7 +563,9 @@ if _WX_AVAILABLE:
                     log.warning("Could not create session file: %s", err)
             self._render_conversation(force_scroll_to_bottom=True)
             self._busy = True
+            self._cancel_event = threading.Event()
             self._send_btn.Enable(False)
+            self._stop_btn.Enable(True)
 
             from ..context_bridge import collect_context, context_to_system_prompt_block
 
@@ -568,6 +584,8 @@ if _WX_AVAILABLE:
 
             def _on_delta(chunk: str) -> None:
                 # Called from background thread — just push to buffer; timer handles UI
+                if self._cancel_event and self._cancel_event.is_set():
+                    return
                 state["ai_turn_started"] = True
                 self._stream_buffer.append(chunk)
 
@@ -629,6 +647,8 @@ if _WX_AVAILABLE:
                     else:
                         self._render_conversation(force_scroll_to_bottom=True)
             self._busy = False
+            self._cancel_event = None
+            self._stop_btn.Enable(False)
             self._send_btn.Enable(True)
             # Auto-refresh after tool calls
             if self._tool_calls_made:
@@ -753,12 +773,14 @@ if _WX_AVAILABLE:
             # chronological order alongside user and AI messages.
             # Store full data — truncation for UI display happens at render time
             # to preserve session data integrity.
+            self._tool_seq += 1
             self._conv_entries.append(
                 {
                     "type": "tool_call",
                     "name": name,
                     "args": args,
                     "result": result,
+                    "_seq": self._tool_seq,
                 }
             )
             # Full update needed to clear pending-ai-text and show new entries
@@ -815,6 +837,34 @@ if _WX_AVAILABLE:
                 )
                 self._render_conversation(force_scroll_to_bottom=self._follow_output_to_bottom)
 
+        def _on_stop(self, event) -> None:
+            """Stop button: cancel the in-progress LLM turn."""
+            if not self._busy or self._cancel_event is None:
+                return
+            log.info("_on_stop: cancelling LLM turn")
+            self._cancel_event.set()
+            # Drain stream buffer and finalise whatever text has arrived
+            self._stream_timer.Stop()
+            self._on_stream_flush(None)
+            if self._use_webview:
+                self._hide_stream_wrapper()
+            if self._pending_ai_text:
+                entry = {
+                    "type": "ai",
+                    "text": self._pending_ai_text,
+                    "timestamp": datetime.datetime.now().strftime("%H:%M:%S"),
+                }
+                self._conv_entries.append(entry)
+                self._pending_ai_text = ""
+                if self._use_webview and self._shell_loaded:
+                    self._append_entry_js(entry, force_scroll_to_bottom=True)
+                else:
+                    self._render_conversation(force_scroll_to_bottom=True)
+            self._busy = False
+            self._cancel_event = None
+            self._stop_btn.Enable(False)
+            self._send_btn.Enable(True)
+
         def _on_restart(self, event) -> None:
             if self._busy:
                 wx.MessageBox(
@@ -863,6 +913,18 @@ if _WX_AVAILABLE:
                 )
                 self._render_conversation()
                 self._on_server_started(False)
+
+        def _on_about(self, event) -> None:
+            """Show the About dialog with version and license info."""
+            wx.MessageBox(
+                "KiCad AI Assistant\n\n"
+                "Version: 0.1.4\n"
+                "License: MIT\n\n"
+                "LLM-powered schematic and PCB editing assistant\n"
+                "powered by the KCAA MCP server.",
+                "About KiCad AI Assistant",
+                wx.OK | wx.ICON_INFORMATION,
+            )
 
         def _on_autoroute(self, event) -> None:
             """Menu handler: Tools → Auto Route…

@@ -52,11 +52,12 @@ function _toolCallHtml(e) {
     var css = ok ? 'tool-entry tool-ok' : 'tool-entry tool-err';
     var args = typeof e.args === 'string' ? _escapeHtml(e.args) : _escapeHtml(JSON.stringify(e.args, null, 2));
     var result = typeof e.result === 'string' ? _escapeHtml(e.result) : _escapeHtml(JSON.stringify(e.result, null, 2));
-    return '<details class="tools" style="margin:2px 8px">'
-        + '<summary><span style="color:' + iconColor + '">' + icon + '</span> '
+    var uid = 'tool_' + (e._seq || Math.random().toString(36).slice(2));
+    return '<details class="tools tool-details" id="' + uid + '" style="margin:2px 8px">'
+        + '<summary class="tool-summary"><span style="color:' + iconColor + '">' + icon + '</span> '
         + '<span style="color:#444;font-weight:600">\u21B3 ' + _escapeHtml(e.name)
         + '</span></summary>'
-        + '<div class="' + css + '">'
+        + '<div class="tool-body ' + css + '" data-details="' + uid + '">'
         + '<span style="color:#444">args:</span><br><pre style="margin:2px 0">' + args + '</pre>'
         + '<span style="color:#444">result:</span><br><pre style="margin:2px 0">' + result + '</pre>'
         + '</div></details>';
@@ -179,3 +180,30 @@ window._clearConversation = function() {
     document.getElementById('pending-ai-text').innerHTML = '';
     window.scrollTo(0, 0);
 };
+
+// Click-to-collapse: clicking the tool body (args/result area) collapses
+// the details element.  Clicking the summary still expands natively.
+// Text selection is preserved: if the user has an active text selection
+// the click does NOT collapse (allowing copy via Ctrl+C).
+(function _installToolCollapse() {
+    function _onToolBodyClick(e) {
+        var toolBody = e.target.closest('.tool-body');
+        if (!toolBody) return;
+        // Don't collapse if the user is selecting / copying text.
+        var sel = window.getSelection();
+        if (sel && sel.type === 'Range' && sel.toString().length > 0) return;
+        var detailsId = toolBody.getAttribute('data-details');
+        if (!detailsId) return;
+        var details = document.getElementById(detailsId);
+        if (details && details.open) {
+            details.open = false;
+        }
+    }
+    if (document.readyState !== 'loading') {
+        document.addEventListener('click', _onToolBodyClick);
+    } else {
+        document.addEventListener('DOMContentLoaded', function() {
+            document.addEventListener('click', _onToolBodyClick);
+        });
+    }
+})();
