@@ -128,9 +128,7 @@ def _extract_file_path(args: dict[str, Any]) -> str:
 
 
 _SKILLS_DIR = Path(
-    os.environ.get(
-        "KCAA_SKILLS_DIR", str(Path(__file__).resolve().parent.parent / "kcaa" / "skills")
-    )
+    os.environ.get("KCAA_SKILLS_DIR", str(Path(__file__).resolve().parent / "skills"))
 )
 
 

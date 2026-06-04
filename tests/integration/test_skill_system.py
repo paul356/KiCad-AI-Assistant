@@ -20,6 +20,21 @@ def _make_mcp():
 
 @pytest.fixture
 def skill_functions():
+    # Point to kicad_plugin/skills/ for testing (standalone default would
+    # resolve to ~/.config/kicad/<ver>/kcaa/skills/ which is empty in CI).
+    import os
+    from pathlib import Path
+
+    skills_dir = Path(__file__).parent.parent.parent / "kicad_plugin" / "skills"
+    os.environ["KCAA_SKILLS_DIR"] = str(skills_dir.resolve())
+
+    # Invalidate cached module-level imports (FastMCP runtime reloads these).
+    import sys
+
+    for key in list(sys.modules):
+        if key.startswith("kcaa.tools.skill_tools"):
+            del sys.modules[key]
+
     from kcaa.tools.skill_tools import register_skill_tools
 
     mcp = _make_mcp()

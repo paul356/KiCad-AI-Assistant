@@ -1,6 +1,6 @@
 """Skill lookup tools — serve on-demand workflow guidance to the LLM.
 
-Skills are Markdown files in ``kcaa/skills/`` with YAML front matter::
+Skills are Markdown files with YAML front matter::
 
     ---
     name: schematic-placement
@@ -23,10 +23,15 @@ import re
 
 from fastmcp import FastMCP
 
+from kcaa.utils.config import config
+
 log = logging.getLogger(__name__)
 
-# Allow override via environment variable for testing / alternate installs.
-_SKILLS_DIR = Path(os.environ.get("KCAA_SKILLS_DIR", str(Path(__file__).parent.parent / "skills")))
+# Plugin mode: server_manager._build_env() sets KCAA_SKILLS_DIR to
+# kicad_plugin/skills/.  Standalone mode: default to the kcaa data
+# directory under KiCad's config dir (e.g. ~/.config/kicad/10.0/kcaa/skills/).
+_DEFAULT_SKILLS = os.path.join(config.get_kcaa_data_dir(), "skills")
+_SKILLS_DIR = Path(os.environ.get("KCAA_SKILLS_DIR", _DEFAULT_SKILLS))
 
 # Skill names must be lowercase slugs: letters, digits, hyphens.
 _VALID_NAME_RE = re.compile(r"^[a-z][a-z0-9-]*$")

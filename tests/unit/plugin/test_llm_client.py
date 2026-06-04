@@ -806,3 +806,635 @@ class TestStreaming:
         # _call_llm must have been called with on_text_delta=on_delta
         call_kwargs = client._call_llm.call_args
         assert call_kwargs.kwargs.get("on_text_delta") is on_delta
+
+
+# ---------------------------------------------------------------------------
+# _prune_rollback_history unit tests
+# ---------------------------------------------------------------------------
+
+
+def _tool_call(id_, name, args):
+    return {
+        "id": id_,
+        "type": "function",
+        "function": {"name": name, "arguments": json.dumps(args)},
+    }
+
+
+def _assistant_tc(content, tool_calls):
+    return {"role": "assistant", "content": content, "tool_calls": tool_calls}
+
+
+def _tool_result(tcid, content):
+    return {"role": "tool", "tool_call_id": tcid, "content": json.dumps(content)}
+
+
+class TestPruneRollbackHistory:
+    """Unit tests for rollback-aware history pruning."""
+
+    # ---- Helpers ---------------------------------------------------------------
+
+    @staticmethod
+    def _make_history(blocks):
+        """Expand a list of (role, payload) tuples into full messages.
+
+        Tuples:
+          ("user", "text or dict")
+          ("assistant", text)
+          ("assistant+tc", [tool_call, ...])
+          ("tool+save", file_path, version_id, tool_call_id)  → save_file_version result
+          ("tool+restore", file_path, version_id, tool_call_id) → restore result
+          ("tool+misc", tool_call_id, content_dict) → generic tool result
+          ("tool", tool_call_id, "content_string")
+        """
+        history = []
+        for b in blocks:
+            role = b[0]
+            if role == "user":
+                history.append({"role": "user", "content": b[1]})
+            elif role == "assistant":
+                history.append({"role": "assistant", "content": b[1]})
+            elif role == "assistant+tc":
+                history.append({"role": "assistant", "content": "", "tool_calls": b[1]})
+            elif role == "tool+save":
+                _, fp, vid, tcid = b
+                history.append(
+                    _tool_result(tcid, {"version_id": vid, "snapshot_path": f"/tmp/{vid}"})
+                )
+            elif role == "tool+restore":
+                _, fp, vid, tcid = b
+                history.append(_tool_result(tcid, {"restored_from": vid}))
+            elif role == "tool+misc":
+                _, tcid, content = b
+                history.append(_tool_result(tcid, content))
+            elif role == "tool":
+                history.append({"role": "tool", "tool_call_id": b[1], "content": b[2]})
+        return history
+
+    # ---- No-op cases ----------------------------------------------------------
+
+    def test_no_restore_no_pruning(self):
+        history = self._make_history(
+            [
+                ("user", "add resistor"),
+                (
+                    "assistant+tc",
+                    [
+                        _tool_call(
+                            "tc1", "add_symbol_to_schematic", {"file_path": "proj/main.kicad_sch"}
+                        )
+                    ],
+                ),
+                ("tool", "tc1", '{"uuid": "r1"}'),
+            ]
+        )
+        client = _make_client()
+        client._history = history
+        client._prune_rollback_history()
+        assert len(client._history) == 3
+
+    def test_save_not_found_no_pruning(self):
+        history = self._make_history(
+            [
+                ("user", "restore to version we never saved"),
+                (
+                    "assistant+tc",
+                    [
+                        _tool_call(
+                            "tc1",
+                            "restore_file_version",
+                            {"file_path": "f.sch", "version_id": "v999"},
+                        )
+                    ],
+                ),
+                ("tool+restore", "f.sch", "v999", "tc1"),
+            ]
+        )
+        client = _make_client()
+        client._history = history
+        client._prune_rollback_history()
+        assert len(client._history) == 3
+
+    # ---- Basic restore --------------------------------------------------------
+
+    def test_simple_restore_prunes_intermediate_turns(self):
+        history = self._make_history(
+            [
+                ("user", "add resistor"),
+                ("assistant+tc", [_tool_call("s1", "save_file_version", {"file_path": "f.sch"})]),
+                ("tool+save", "f.sch", "v1", "s1"),
+                # Turn A – touches file
+                (
+                    "assistant+tc",
+                    [_tool_call("tcA", "add_symbol_to_schematic", {"file_path": "f.sch"})],
+                ),
+                ("tool", "tcA", '{"uuid": "A"}'),
+                # Turn B – also touches file
+                ("assistant+tc", [_tool_call("tcB", "move_component", {"file_path": "f.sch"})]),
+                ("tool", "tcB", '{"ok": true}'),
+                # Turn C – restore
+                (
+                    "assistant+tc",
+                    [
+                        _tool_call(
+                            "rst",
+                            "restore_file_version",
+                            {"file_path": "f.sch", "version_id": "v1"},
+                        )
+                    ],
+                ),
+                ("tool+restore", "f.sch", "v1", "rst"),
+                ("user", "now do something else"),
+            ]
+        )
+        client = _make_client()
+        client._history = history
+        client._prune_rollback_history()
+        roles = [m["role"] for m in client._history]
+        assert roles == ["user", "assistant", "tool", "assistant", "tool", "user"]
+        # The pruned history should contain: save user+assistant+save_result, restore user+restore_result, final user
+        # (empty assistant removed since all its tool_calls pruned)
+
+    def test_non_file_touching_turns_preserved(self):
+        history = self._make_history(
+            [
+                ("user", "start"),
+                ("assistant+tc", [_tool_call("s1", "save_file_version", {"file_path": "f.sch"})]),
+                ("tool+save", "f.sch", "v1", "s1"),
+                # Turn touches f.sch
+                (
+                    "assistant+tc",
+                    [_tool_call("tcA", "add_symbol_to_schematic", {"file_path": "f.sch"})],
+                ),
+                ("tool", "tcA", '{"ok": true}'),
+                # Turn touches OTHER file
+                (
+                    "assistant+tc",
+                    [_tool_call("tcB", "add_symbol_to_schematic", {"file_path": "other.sch"})],
+                ),
+                ("tool", "tcB", '{"ok": true}'),
+                # Restore f.sch
+                (
+                    "assistant+tc",
+                    [
+                        _tool_call(
+                            "rst",
+                            "restore_file_version",
+                            {"file_path": "f.sch", "version_id": "v1"},
+                        )
+                    ],
+                ),
+                ("tool+restore", "f.sch", "v1", "rst"),
+            ]
+        )
+        client = _make_client()
+        client._history = history
+        client._prune_rollback_history()
+        # other.sch turn should survive; f.sch turn should be pruned
+        # Find the surviving add_symbol_to_schematic assistant
+        surviving = [
+            m
+            for m in client._history
+            if m["role"] == "assistant"
+            and m.get("tool_calls")
+            and any(tc["function"]["name"] == "add_symbol_to_schematic" for tc in m["tool_calls"])
+        ]
+        assert len(surviving) == 1
+        for tc in surviving[0]["tool_calls"]:
+            args = json.loads(tc["function"]["arguments"])
+            if tc["function"]["name"] == "add_symbol_to_schematic":
+                assert args["file_path"] == "other.sch"
+
+    # ---- Partial pruning within a turn ---------------------------------------
+
+    def test_partial_turn_pruning(self):
+        history = self._make_history(
+            [
+                ("user", "start"),
+                ("assistant+tc", [_tool_call("s1", "save_file_version", {"file_path": "f.sch"})]),
+                ("tool+save", "f.sch", "v1", "s1"),
+                # One turn with two tool_calls: only one touches f.sch
+                (
+                    "assistant+tc",
+                    [
+                        _tool_call("tcSchema", "add_symbol_to_schematic", {"file_path": "f.sch"}),
+                        _tool_call(
+                            "tcOther", "add_symbol_to_schematic", {"file_path": "other.sch"}
+                        ),
+                    ],
+                ),
+                ("tool", "tcSchema", '{"uuid": "A"}'),
+                ("tool", "tcOther", '{"uuid": "B"}'),
+                (
+                    "assistant+tc",
+                    [
+                        _tool_call(
+                            "rst",
+                            "restore_file_version",
+                            {"file_path": "f.sch", "version_id": "v1"},
+                        ),
+                    ],
+                ),
+                ("tool+restore", "f.sch", "v1", "rst"),
+            ]
+        )
+        client = _make_client()
+        client._history = history
+        client._prune_rollback_history()
+        # The pruned assistant should still have tcOther but NOT tcSchema
+        assistants = [
+            m for m in client._history if m["role"] == "assistant" and m.get("tool_calls")
+        ]
+        for a in assistants:
+            names = [tc["function"]["name"] for tc in a["tool_calls"]]
+            if "add_symbol_to_schematic" in names:
+                assert len(a["tool_calls"]) == 1  # only tcOther remains
+                assert a["tool_calls"][0]["id"] == "tcOther"
+
+    # ---- Nested restore ------------------------------------------------------
+
+    def test_nested_restore_skipped(self):
+        history = self._make_history(
+            [
+                ("user", "start"),
+                # save v1
+                ("assistant+tc", [_tool_call("s1", "save_file_version", {"file_path": "f.sch"})]),
+                ("tool+save", "f.sch", "v1", "s1"),
+                # Turn T1
+                (
+                    "assistant+tc",
+                    [_tool_call("t1", "add_symbol_to_schematic", {"file_path": "f.sch"})],
+                ),
+                ("tool", "t1", '{"uuid": "T1"}'),
+                # save v2 (after T1)
+                ("assistant+tc", [_tool_call("s2", "save_file_version", {"file_path": "f.sch"})]),
+                ("tool+save", "f.sch", "v2", "s2"),
+                # Turn T2
+                (
+                    "assistant+tc",
+                    [_tool_call("t2", "add_symbol_to_schematic", {"file_path": "f.sch"})],
+                ),
+                ("tool", "t2", '{"uuid": "T2"}'),
+                # restore v2 (inner)
+                (
+                    "assistant+tc",
+                    [
+                        _tool_call(
+                            "rst2",
+                            "restore_file_version",
+                            {"file_path": "f.sch", "version_id": "v2"},
+                        )
+                    ],
+                ),
+                ("tool+restore", "f.sch", "v2", "rst2"),
+                # Turn T3
+                (
+                    "assistant+tc",
+                    [_tool_call("t3", "add_symbol_to_schematic", {"file_path": "f.sch"})],
+                ),
+                ("tool", "t3", '{"uuid": "T3"}'),
+                # restore v1 (outer)
+                (
+                    "assistant+tc",
+                    [
+                        _tool_call(
+                            "rst1",
+                            "restore_file_version",
+                            {"file_path": "f.sch", "version_id": "v1"},
+                        )
+                    ],
+                ),
+                ("tool+restore", "f.sch", "v1", "rst1"),
+            ]
+        )
+        client = _make_client()
+        client._history = history
+        client._prune_rollback_history()
+        # T1, T2, T3 and both restore results should all be pruned
+        # Only save results and user messages survive
+        for m in client._history:
+            if m["role"] == "tool":
+                content = json.loads(m["content"])
+                assert "version_id" in content or "restored_from" in content
+            if m["role"] == "assistant" and m.get("tool_calls"):
+                names = [tc["function"]["name"] for tc in m["tool_calls"]]
+                assert all(n in ("save_file_version", "restore_file_version") for n in names)
+
+    # ---- Multiple file paths -------------------------------------------------
+
+    def test_restore_only_affects_matching_file(self):
+        history = self._make_history(
+            [
+                ("user", "start"),
+                ("assistant+tc", [_tool_call("s1", "save_file_version", {"file_path": "a.sch"})]),
+                ("tool+save", "a.sch", "vA", "s1"),
+                ("assistant+tc", [_tool_call("s2", "save_file_version", {"file_path": "b.sch"})]),
+                ("tool+save", "b.sch", "vB", "s2"),
+                (
+                    "assistant+tc",
+                    [_tool_call("tcA", "add_symbol_to_schematic", {"file_path": "a.sch"})],
+                ),
+                ("tool", "tcA", '{"ok": true}'),
+                (
+                    "assistant+tc",
+                    [_tool_call("tcB", "add_symbol_to_schematic", {"file_path": "b.sch"})],
+                ),
+                ("tool", "tcB", '{"ok": true}'),
+                (
+                    "assistant+tc",
+                    [
+                        _tool_call(
+                            "rst",
+                            "restore_file_version",
+                            {"file_path": "a.sch", "version_id": "vA"},
+                        )
+                    ],
+                ),
+                ("tool+restore", "a.sch", "vA", "rst"),
+            ]
+        )
+        client = _make_client()
+        client._history = history
+        client._prune_rollback_history()
+        # b.sch turn should survive
+        for m in client._history:
+            if m["role"] == "assistant" and m.get("tool_calls"):
+                for tc in m["tool_calls"]:
+                    args = json.loads(tc["function"]["arguments"])
+                    if tc["function"]["name"] == "add_symbol_to_schematic":
+                        assert args["file_path"] == "b.sch"
+
+    def test_restore_schematic_does_not_affect_pcb(self):
+        """Restoring a .sch file must not prune .kicad_pcb modifications."""
+        history = self._make_history(
+            [
+                ("user", "start"),
+                (
+                    "assistant+tc",
+                    [_tool_call("s1", "save_file_version", {"file_path": "proj/main.kicad_sch"})],
+                ),
+                ("tool+save", "proj/main.kicad_sch", "v1", "s1"),
+                # Schematic change
+                (
+                    "assistant+tc",
+                    [
+                        _tool_call(
+                            "tcS", "add_symbol_to_schematic", {"file_path": "proj/main.kicad_sch"}
+                        )
+                    ],
+                ),
+                ("tool", "tcS", '{"uuid": "R1"}'),
+                # PCB change – different file
+                (
+                    "assistant+tc",
+                    [_tool_call("tcP", "add_footprint", {"file_path": "proj/main.kicad_pcb"})],
+                ),
+                ("tool", "tcP", '{"ok": true}'),
+                # Restore schematic
+                (
+                    "assistant+tc",
+                    [
+                        _tool_call(
+                            "rst",
+                            "restore_file_version",
+                            {"file_path": "proj/main.kicad_sch", "version_id": "v1"},
+                        )
+                    ],
+                ),
+                ("tool+restore", "proj/main.kicad_sch", "v1", "rst"),
+            ]
+        )
+        client = _make_client()
+        client._history = history
+        client._prune_rollback_history()
+        # Schematic turn should be pruned
+        for m in client._history:
+            if m["role"] == "assistant" and m.get("tool_calls"):
+                names = [tc["function"]["name"] for tc in m["tool_calls"]]
+                assert "add_symbol_to_schematic" not in names
+        # PCB turn MUST survive
+        pcb_assistants = [
+            m
+            for m in client._history
+            if m["role"] == "assistant"
+            and m.get("tool_calls")
+            and any(tc["function"]["name"] == "add_footprint" for tc in m["tool_calls"])
+        ]
+        assert len(pcb_assistants) == 1
+        args = json.loads(pcb_assistants[0]["tool_calls"][0]["function"]["arguments"])
+        assert args["file_path"] == "proj/main.kicad_pcb"
+
+    def test_restore_shares_only_same_full_path(self):
+        """Files with same stem but different paths are treated independently."""
+        history = self._make_history(
+            [
+                ("user", "start"),
+                (
+                    "assistant+tc",
+                    [_tool_call("s1", "save_file_version", {"file_path": "proj/sub/leaf.sch"})],
+                ),
+                ("tool+save", "proj/sub/leaf.sch", "v1", "s1"),
+                # Change to leaf.sch in a different directory
+                (
+                    "assistant+tc",
+                    [_tool_call("tc1", "add_symbol_to_schematic", {"file_path": "other/leaf.sch"})],
+                ),
+                ("tool", "tc1", '{"ok": true}'),
+                # Restore proj/sub/leaf.sch
+                (
+                    "assistant+tc",
+                    [
+                        _tool_call(
+                            "rst",
+                            "restore_file_version",
+                            {"file_path": "proj/sub/leaf.sch", "version_id": "v1"},
+                        )
+                    ],
+                ),
+                ("tool+restore", "proj/sub/leaf.sch", "v1", "rst"),
+            ]
+        )
+        client = _make_client()
+        client._history = history
+        client._prune_rollback_history()
+        # other/leaf.sch survives – only same full path is pruned
+        for m in client._history:
+            if m["role"] == "assistant" and m.get("tool_calls"):
+                for tc in m["tool_calls"]:
+                    if tc["function"]["name"] == "add_symbol_to_schematic":
+                        args = json.loads(tc["function"]["arguments"])
+                        assert args["file_path"] == "other/leaf.sch"
+
+
+# ---------------------------------------------------------------------------
+# _annotate_stale_queries unit tests
+# ---------------------------------------------------------------------------
+
+_STALE_MARKER = "⚠️ STALE"
+
+
+class TestAnnotateStaleQueries:
+    """Unit tests for category-aware stale-query annotation."""
+
+    def _build_history(self, *entries):
+        """Each entry is (role, tool_call_id?, content, tool_calls_or_args?).
+
+        Shorthands for common patterns:
+          ("user", text)
+          ("assistant", text)
+          ("query", tool_name, file_path, tool_call_id, result_text)
+          ("mutation", tool_name, file_path, tool_call_id)
+          ("tool", tool_call_id, content)
+        """
+        history = []
+        for e in entries:
+            role = e[0]
+            if role == "user":
+                history.append({"role": "user", "content": e[1]})
+            elif role == "assistant":
+                history.append({"role": "assistant", "content": e[1]})
+            elif role == "query":
+                _, name, fp, tcid, result = e
+                history.append(
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [_tool_call(tcid, name, {"schematic_path": fp})],
+                    }
+                )
+                history.append({"role": "tool", "tool_call_id": tcid, "content": result})
+            elif role == "mutation":
+                _, name, fp, tcid = e
+                history.append(
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [_tool_call(tcid, name, {"schematic_path": fp})],
+                    }
+                )
+                history.append({"role": "tool", "tool_call_id": tcid, "content": "{}"})
+            elif role == "tool":
+                history.append({"role": "tool", "tool_call_id": e[1], "content": e[2]})
+        return history
+
+    # ---- No-op ---------------------------------------------------------------
+
+    def test_no_mutation_no_annotation(self):
+        history = self._build_history(
+            ("query", "check_reference_conflicts", "f.sch", "tc1", '["R1"]'),
+        )
+        client = _make_client()
+        client._history = history
+        client._annotate_stale_queries()
+        assert _STALE_MARKER not in str(client._history)
+
+    # ---- Basic invalidation --------------------------------------------------
+
+    def test_query_then_mutation_gets_annotated(self):
+        history = self._build_history(
+            ("query", "check_reference_conflicts", "f.sch", "tc1", '{"conflicts":[]}'),
+            ("mutation", "add_symbol_to_schematic", "f.sch", "tc2"),
+        )
+        client = _make_client()
+        client._history = history
+        client._annotate_stale_queries()
+        tc1_result = [m for m in client._history if m.get("tool_call_id") == "tc1"]
+        assert len(tc1_result) == 1
+        assert tc1_result[0]["content"].startswith(_STALE_MARKER)
+
+    def test_mutation_then_query_not_annotated(self):
+        """Query AFTER mutation is fresh — no annotation."""
+        history = self._build_history(
+            ("mutation", "add_symbol_to_schematic", "f.sch", "tc1"),
+            ("query", "check_reference_conflicts", "f.sch", "tc2", '["R1","R2","R3"]'),
+        )
+        client = _make_client()
+        client._history = history
+        client._annotate_stale_queries()
+        tc2_result = [m for m in client._history if m.get("tool_call_id") == "tc2"]
+        assert len(tc2_result) == 1
+        assert not tc2_result[0]["content"].startswith(_STALE_MARKER)
+
+    # ---- Category-aware ------------------------------------------------------
+
+    def test_non_matching_category_not_annotated(self):
+        """add_symbol invalidates 'labels' category, but list_labels is not in that."""
+        history = self._build_history(
+            ("query", "get_schematic_sheet_info", "f.sch", "tc1", '{"paper":"A4"}'),
+            ("mutation", "add_symbol_to_schematic", "f.sch", "tc2"),
+        )
+        client = _make_client()
+        client._history = history
+        client._annotate_stale_queries()
+        tc1_result = [m for m in client._history if m.get("tool_call_id") == "tc1"]
+        assert len(tc1_result) == 1
+        assert not tc1_result[0]["content"].startswith(_STALE_MARKER)
+        # add_symbol → {symbol_inventory, symbol_properties, symbol_pins, netlist, placement}
+        # sheet_meta is NOT in that set → not annotated
+
+    def test_different_file_not_annotated(self):
+        history = self._build_history(
+            ("query", "check_reference_conflicts", "a.sch", "tc1", '["R1"]'),
+            ("mutation", "add_symbol_to_schematic", "b.sch", "tc2"),
+        )
+        client = _make_client()
+        client._history = history
+        client._annotate_stale_queries()
+        tc1_result = [m for m in client._history if m.get("tool_call_id") == "tc1"]
+        assert len(tc1_result) == 1
+        assert not tc1_result[0]["content"].startswith(_STALE_MARKER)
+
+    # ---- Mixed scenarios -----------------------------------------------------
+
+    def test_only_matching_queries_annotated(self):
+        history = self._build_history(
+            ("query", "check_reference_conflicts", "f.sch", "tc1", '["R1"]'),
+            ("query", "get_schematic_sheet_info", "f.sch", "tc2", '{"paper":"A4"}'),
+            ("mutation", "add_symbol_to_schematic", "f.sch", "tc3"),
+        )
+        client = _make_client()
+        client._history = history
+        client._annotate_stale_queries()
+        tc1 = [m for m in client._history if m.get("tool_call_id") == "tc1"][0]
+        tc2_r = [m for m in client._history if m.get("tool_call_id") == "tc2"][0]
+        assert tc1["content"].startswith(_STALE_MARKER)  # symbol_inventory
+        assert not tc2_r["content"].startswith(_STALE_MARKER)  # sheet_meta
+
+    def test_library_query_never_annotated(self):
+        """Library queries (search_symbols etc.) have no QUERY_CATEGORY entry."""
+        history = self._build_history(
+            ("query", "search_symbols", "f.sch", "tc1", '["opamp"]'),
+            ("mutation", "add_symbol_to_schematic", "f.sch", "tc2"),
+        )
+        client = _make_client()
+        client._history = history
+        client._annotate_stale_queries()
+        tc1_result = [m for m in client._history if m.get("tool_call_id") == "tc1"]
+        assert len(tc1_result) == 1
+        assert not tc1_result[0]["content"].startswith(_STALE_MARKER)
+
+    def test_no_double_prefix(self):
+        history = self._build_history(
+            ("query", "check_reference_conflicts", "f.sch", "tc1", '["R1"]'),
+            ("mutation", "add_symbol_to_schematic", "f.sch", "tc2"),
+            ("mutation", "remove_symbol_from_schematic", "f.sch", "tc3"),
+        )
+        client = _make_client()
+        client._history = history
+        client._annotate_stale_queries()
+        tc1_result = [m for m in client._history if m.get("tool_call_id") == "tc1"][0]
+        content = tc1_result["content"]
+        # Should have exactly one prefix
+        assert content.startswith(_STALE_MARKER)
+        assert content.count(_STALE_MARKER) == 1
+
+    def test_pcb_query_vs_schematic_mutation_independent(self):
+        history = self._build_history(
+            ("query", "list_footprints", "proj/pcb.kicad_pcb", "tc1", '["U1"]'),
+            ("mutation", "add_symbol_to_schematic", "proj/pcb.kicad_sch", "tc2"),
+        )
+        client = _make_client()
+        client._history = history
+        client._annotate_stale_queries()
+        tc1_result = [m for m in client._history if m.get("tool_call_id") == "tc1"][0]
+        assert not tc1_result["content"].startswith(_STALE_MARKER)
