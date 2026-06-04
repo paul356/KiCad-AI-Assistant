@@ -23,14 +23,13 @@ import re
 
 from fastmcp import FastMCP
 
-from kcaa.utils.config import config
-
 log = logging.getLogger(__name__)
 
 # Plugin mode: server_manager._build_env() sets KCAA_SKILLS_DIR to
-# kicad_plugin/skills/.  Standalone mode: default to the kcaa data
-# directory under KiCad's config dir (e.g. ~/.config/kicad/10.0/kcaa/skills/).
-_DEFAULT_SKILLS = os.path.join(config.get_kcaa_data_dir(), "skills")
+# kicad_plugin/skills/.  Standalone mode: main.py sets KCAA_SKILLS_DIR
+# similarly.  If neither sets the env var, fall back to kicad_plugin/skills/
+# relative to this package.
+_DEFAULT_SKILLS = str(Path(__file__).parent.parent.parent / "kicad_plugin" / "skills")
 _SKILLS_DIR = Path(os.environ.get("KCAA_SKILLS_DIR", _DEFAULT_SKILLS))
 
 # Skill names must be lowercase slugs: letters, digits, hyphens.
@@ -112,25 +111,36 @@ def register_skill_tools(mcp: FastMCP) -> None:
                   (e.g. ``"schematic-placement"``).
         """
         if not _VALID_NAME_RE.match(name):
-            return (
+            raise ValueError(
                 f"Invalid skill name '{name}'. "
                 "Names must be lowercase letters, digits, and hyphens "
                 "(e.g. 'schematic-placement'). "
                 "Call list_skills() to see available options."
             )
 
-        # Resolve and validate path stays inside _SKILLS_DIR.
-        candidate = (_SKILLS_DIR / f"{name}.md").resolve()
-        try:
-            candidate.relative_to(_SKILLS_DIR.resolve())
-        except ValueError:
-            return f"Invalid skill name '{name}'."
+        # Match by front-matter name rather than filename so that the
+        # two can differ (e.g. hyphen in front matter, underscore on disk).
+        if not _SKILLS_DIR.exists():
+            log.warning("Skills directory %s does not exist", _SKILLS_DIR)
+            raise ValueError(f"Skill '{name}' not found. No skills are currently available.")
 
-        if not candidate.exists():
-            available = [s["name"] for s in _load_all_skills()]
-            if available:
-                return f"Skill '{name}' not found. Available skills: {', '.join(available)}"
-            return f"Skill '{name}' not found. No skills are currently available."
+        for path in sorted(_SKILLS_DIR.glob("*.md")):
+            try:
+                meta, body = _parse_front_matter(path.read_text(encoding="utf-8"))
+            except Exception:
+                log.warning("Failed to read skill file %s", path)
+                continue
+            candidate_name = meta.get("name") or path.stem
+            if candidate_name == name:
+                return body
 
-        _, body = _parse_front_matter(candidate.read_text(encoding="utf-8"))
-        return body
+        log.warning(
+            "Skill '%s' not found in %s (available files: %s)",
+            name,
+            _SKILLS_DIR,
+            [p.name for p in sorted(_SKILLS_DIR.glob("*.md"))],
+        )
+        available = [s["name"] for s in _load_all_skills()]
+        if available:
+            raise ValueError(f"Skill '{name}' not found. Available skills: {', '.join(available)}")
+        raise ValueError(f"Skill '{name}' not found. No skills are currently available.")

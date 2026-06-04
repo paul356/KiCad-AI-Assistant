@@ -20,17 +20,18 @@ def _make_mcp():
 
 @pytest.fixture
 def skill_functions():
-    # Point to kicad_plugin/skills/ for testing (standalone default would
-    # resolve to ~/.config/kicad/<ver>/kcaa/skills/ which is empty in CI).
+    # Standalone mode: main.py sets KCAA_SKILLS_DIR to kicad_plugin/skills/.
+    # Mirror that here so tests find skills without relying on the
+    # config-dir default (which may be empty).
     import os
     from pathlib import Path
-
-    skills_dir = Path(__file__).parent.parent.parent / "kicad_plugin" / "skills"
-    os.environ["KCAA_SKILLS_DIR"] = str(skills_dir.resolve())
-
-    # Invalidate cached module-level imports (FastMCP runtime reloads these).
     import sys
 
+    os.environ["KCAA_SKILLS_DIR"] = str(
+        (Path(__file__).parent.parent.parent / "kicad_plugin" / "skills").resolve()
+    )
+
+    # Clear cached import so _SKILLS_DIR is re-read from the updated env.
     for key in list(sys.modules):
         if key.startswith("kcaa.tools.skill_tools"):
             del sys.modules[key]
@@ -48,12 +49,12 @@ class TestGetSkillContent:
     @pytest.mark.parametrize(
         "skill_name,expected_keywords",
         [
-            ("schematic-placement", ["placement", "bbox"]),
-            ("schematic-wiring", ["wiring", "wire"]),
-            ("pcb-query", ["pcb", "footprint"]),
-            ("pcb-placement", ["placement", "footprint"]),
-            ("pcb-outline", ["outline", "Edge.Cuts"]),
-            ("pcb-footprint-library", ["footprint", "library"]),
+            ("schematic-placement", ["body_bbox", "find_free_area"]),
+            ("schematic-wiring", ["manhattan", "isotropic"]),
+            ("pcb-query", ["ratsnest", "layer stack"]),
+            ("pcb-placement", ["courtyard", "set_footprint_position"]),
+            ("pcb-outline", ["corner_radius", "gr_rect"]),
+            ("pcb-footprint-library", ["sync_footprint_index", "get_footprint_details"]),
         ],
     )
     def test_get_skill_returns_expected_content(
@@ -63,9 +64,15 @@ class TestGetSkillContent:
 
         result = get_skill(skill_name)
         assert result is not None
+
+        # Safety: the result must not be a "not found" / error message.
+        assert not str(result).startswith("Skill "), (
+            f"get_skill('{skill_name}') returned an error: {result!r}"
+        )
+
         content_lower = result.lower() if hasattr(result, "lower") else str(result).lower()
-        found = [kw for kw in expected_keywords if kw.lower() in content_lower]
-        assert found, f"None of {expected_keywords} found in skill '{skill_name}' content"
+        missing = [kw for kw in expected_keywords if kw.lower() not in content_lower]
+        assert not missing, f"Keywords {missing} not found in skill '{skill_name}' content"
 
     def test_list_skills_shows_all_six(self, skill_functions):
         _, list_skills = skill_functions
