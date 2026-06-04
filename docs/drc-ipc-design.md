@@ -53,6 +53,7 @@ This document specifies a two-pronged design:
 │                                                                  │
 │  run_action("pcbnew.InspectionTool.runDRC")   → trigger DRC     │
 │  board.get_items(PCB_MARKER_T)                → read violations  │
+│  board.refill_zones(block=True)               → rebuild zones    │
 │  kicad.client.send(GetBoardDesignRules...)    → get constraints  │
 │  kicad.client.send(UpdateBoardDesignRules...) → set constraints  │
 │  kicad.client.send(GetCustomRules...)         → list rules       │
@@ -83,6 +84,13 @@ This document specifies a two-pronged design:
 | `"pcbnew.InspectionTool.runDRC"` | Triggers DRC in KiCad GUI, populates board markers |
 | `"pcbnew.InspectionTool.clearMarkers"` | Removes all DRC markers from the board |
 | `"pcbnew.InspectionTool.listUnconnected"` | Lists unconnected pads (separate from DRC) |
+
+### Available via `board` object methods
+
+| Method | Effect |
+|--------|--------|
+| `board.refill_zones(block=True)` | Refills all zones, blocks until complete (uses `RefillZones` proto). Already implemented in `kcaa/tools/pcb_zone_tools.py`. |
+| `board.get_items(types=[...])` | Queries board items by type, including PCB_MARKER_T (to be verified) |
 
 ### Available via kipy client (raw protobuf)
 
@@ -172,7 +180,7 @@ This document specifies a two-pronged design:
 
 - [ ] **2.2 Post-routing DRC validation**
   - In `_on_autoroute_done()`, after `ImportSpecctraSES`:
-    1. Import `_pcbnew.RefillAllZones()` to rebuild zone fills.
+    1. Call `board.refill_zones()` via kipy to rebuild zone fills.
     2. Run `run_drc_via_ipc()` (Phase 0).
     3. If new violations found compared to pre-route DRC snapshot:
        - Append a summary entry to the conversation log: "Auto Route introduced N new violations: ..."
@@ -234,7 +242,7 @@ This document specifies a two-pronged design:
 
 | Risk | Mitigation |
 |------|-----------|
-| kipy doesn't expose `PCB_MARKER_T` as a gettable item type | Fall back to `pcbnew` module in the plugin process (wx main thread) if kipy insufficient |
+| kipy doesn't expose `PCB_MARKER_T` as a gettable item type | Use `run_action("runDRC")` + kipy-native marker query; verify during Phase 0.1 |
 | KiCad 9 vs 10 IPC API differences | Version-check `kicad.get_api_version()` and degrade gracefully |
 | FreeRouting `-dr` flag may conflict with DSN-embedded rules | Test empirically, prefer DSN preprocessing if CLI flag causes issues |
 | `run_action("runDRC")` is synchronous but doesn't return results | Accept that results must be polled via `get_items(markers)` after action returns |
