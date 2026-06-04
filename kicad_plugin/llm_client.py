@@ -22,6 +22,111 @@ from .tool_registry import get_missing_tool_policies, get_tool_policy
 
 log = logging.getLogger(__name__)
 
+# ------------------------------------------------------------------
+# P1  stale-query detection: category mappings
+# ------------------------------------------------------------------
+
+# Categories assigned to *query* tools based on what they return.
+# Library/lookup-only queries (search_symbols, get_symbol, …) are excluded
+# because they are never invalidated by a file mutation.
+QUERY_CATEGORY: dict[str, str] = {
+    # Schematic queries
+    "list_component_properties": "symbol_properties",
+    "get_symbol_pins": "symbol_pins",
+    "check_reference_conflicts": "symbol_inventory",
+    "list_labels_in_schematic": "labels",
+    "extract_project_netlist": "netlist",
+    "extract_schematic_netlist": "netlist",
+    "find_component_connections": "netlist",
+    "get_schematic_sheet_info": "sheet_meta",
+    "list_sheet_symbols": "sheet_inventory",
+    "get_sheet_hierarchy": "sheet_structure",
+    # PCB queries
+    "get_board_info": "pcb_meta",
+    "list_footprints": "pcb_inventory",
+    "get_footprint": "pcb_properties",
+    "list_nets": "pcb_nets",
+    "get_ratsnest": "pcb_nets",
+    "score_placement": "pcb_placement",
+    "suggest_placement_order": "pcb_placement",
+    "get_board_outline": "pcb_outline",
+    "get_footprint_bbox": "pcb_bbox",
+    "get_board_bounding_box": "pcb_bbox",
+    "find_free_pcb_area": "pcb_placement",
+    "list_groups": "pcb_groups",
+    "get_group": "pcb_groups",
+    "score_group": "pcb_groups",
+    "list_zones": "pcb_zones",
+}
+
+# Per-mutation categories that become stale.
+MUTATION_RIPPLES: dict[str, set[str]] = {
+    # Schematic mutations
+    "add_symbol_to_schematic": {
+        "symbol_inventory",
+        "symbol_properties",
+        "symbol_pins",
+        "netlist",
+        "placement",
+    },
+    "remove_symbol_from_schematic": {
+        "symbol_inventory",
+        "symbol_properties",
+        "symbol_pins",
+        "netlist",
+        "placement",
+    },
+    "set_component_property": {"symbol_properties"},
+    "rename_symbol": {"symbol_inventory"},
+    "delete_component_property": {"symbol_properties"},
+    "move_component": {"symbol_inventory", "placement"},
+    "place_symbol_relative": {"symbol_inventory", "placement"},
+    "add_label_to_schematic": {"labels"},
+    "delete_label_from_schematic": {"labels"},
+    "connect_points_with_wire": {"netlist"},
+    "connect_pins_with_wire": {"netlist"},
+    "delete_wire_from_schematic": {"netlist"},
+    "add_sheet_symbol": {"sheet_inventory", "sheet_structure", "placement"},
+    "remove_sheet_symbol": {"sheet_inventory", "sheet_structure", "placement"},
+    "update_sheet_symbol": {"sheet_inventory", "sheet_structure"},
+    "add_sheet_pin": {"sheet_structure"},
+    "remove_sheet_pin": {"sheet_structure"},
+    # PCB mutations
+    "set_footprint_position": {"pcb_inventory", "pcb_placement"},
+    "flip_footprint": {"pcb_inventory", "pcb_placement"},
+    "set_footprint_property": {"pcb_properties"},
+    "clear_board_outline": {"pcb_outline"},
+    "add_board_outline_segment": {"pcb_outline"},
+    "add_board_outline_arc": {"pcb_outline"},
+    "set_board_outline_rect": {"pcb_outline"},
+    "align_footprints": {"pcb_inventory", "pcb_placement"},
+    "distribute_footprints": {"pcb_inventory", "pcb_placement"},
+    "move_footprints_by_delta": {"pcb_inventory", "pcb_placement"},
+    "assign_to_group": {"pcb_groups", "pcb_inventory"},
+    "place_component_group": {"pcb_inventory", "pcb_groups", "pcb_placement"},
+    "move_group": {"pcb_inventory", "pcb_groups", "pcb_placement"},
+    "rotate_group": {"pcb_inventory", "pcb_groups", "pcb_placement"},
+    "add_zone": {"pcb_zones"},
+    "delete_zone": {"pcb_zones"},
+}
+
+# Token-efficient annotation prefix.
+_STALE_PREFIX = (
+    "⚠️ STALE — file was modified after this query. Re-query if the data may have changed.\n"
+)
+
+_STALE_PREFIX_LEN = len(_STALE_PREFIX)
+
+
+def _extract_file_path(args: dict[str, Any]) -> str:
+    """Return the first file-path value found in *args*, or ``""``."""
+    for key in ("file_path", "schematic_path", "pcb_path", "project_path"):
+        v = args.get(key, "")
+        if v:
+            return v
+    return ""
+
+
 _SKILLS_DIR = Path(
     os.environ.get(
         "KCAA_SKILLS_DIR", str(Path(__file__).resolve().parent.parent / "kcaa" / "skills")
@@ -240,7 +345,11 @@ def _https_post_json(
 # ---------------------------------------------------------------------------
 
 _PROMPT_HEADER = """\
-You are a KiCad assistant.
+You are a KiCad assistant — modest, cautious, and proactive.
+- Before every task, briefly share your intent and plan with the user.
+- When a tool returns unexpected results or errors, pause and ask the user
+  for guidance. The user is more experienced at solving circuit design
+  problems — defer to their judgment.
 - Edit schematics/PCBs via MCP tools.
 - Unless asked, never call `save_file_version`, `reload_kicad`,
   `check_kicad_ipc_connection`, or `save_document`.
@@ -253,9 +362,11 @@ _PROMPT_SCHEMATIC = """\
 # Schematic coordinate system
 - All coordinates are in **millimetres** with **+X right, +Y DOWN** (KiCad
   schematic screen convention).
-- Library symbols (.kicad_sym) internally use Y-UP, but every tool that
-  takes or returns placed-symbol coordinates uses Y-DOWN. You only ever
-  reason in Y-DOWN.
+- Schematic symbol local coordinates (in .kicad_sym files) use **Y-UP**.
+  However, every tool that takes or returns placed-symbol coordinates uses
+  Y-DOWN. You only ever reason in Y-DOWN.
+- Rotation in symbol (.kicad_sym) files is **counterclockwise (CCW)**.
+  0°=unrotated, 90°=tilt left, 180°=flipped, 270°=tilt right.
 - The schematic grid is **1.27 mm (50 mil)**. add_symbol_to_schematic and
   move_component snap automatically; rotation is restricted to 0/90/180/270.
 - Default sheet is **A4 (297 x 210 mm)**. At the start of each request
@@ -281,9 +392,9 @@ _PROMPT_PCB = """\
 # PCB coordinate system
 - All PCB coordinates are **millimetres**, **+X right, +Y DOWN** (same screen
   convention as schematics).
-- PCB rotation is **clockwise-positive** (opposite to the CCW / Y-up
-  convention used by .kicad_sym library data).  0° is unrotated; 90° tilts
-  the footprint 90° clockwise on screen.
+- Footprint (.kicad_mod) files internally use **Y-DOWN** coordinates.
+- Rotation in footprint (.kicad_mod) files is **counterclockwise (CCW)**.
+  0°=unrotated, 90°=tilt left, 180°=flipped, 270°=tilt right.
 - There is no auto-snap for PCB tools.  Pass coordinates already aligned to
   your board grid.  Typical grids: **0.1 mm or 0.05 mm** for SMD work,
   **1.27 mm (50 mil)** for through-hole.
@@ -616,12 +727,232 @@ class LLMClient:
         )
         return True
 
+    def _prune_rollback_history(self) -> None:
+        """Prune tool-call turns invalidated by restore_file_version.
+
+        When the LLM restores a file to an earlier version, every tool call that
+        mutated or queried that file between the save point and the restore is
+        now based on stale state — prune those turns.
+
+        Handles nested restores: starts from the most recent restore and skips
+        any restore whose messages fall inside an already-pruned range.
+        """
+        # ---- Build save-point lookup ------------------------------------------
+        # For each save_file_version tool result, record (file_path, version_id) → index.
+        save_points: dict[tuple[str, str], int] = {}
+        for i, msg in enumerate(self._history):
+            if msg.get("role") != "tool":
+                continue
+            p_idx = self._find_parent_assistant(i)
+            if p_idx is None:
+                continue
+            parent = self._history[p_idx]
+            tc_id = msg.get("tool_call_id")
+            for tc in parent.get("tool_calls") or []:
+                if tc.get("id") != tc_id:
+                    continue
+                if tc.get("function", {}).get("name") != "save_file_version":
+                    continue
+                try:
+                    args = json.loads(tc["function"].get("arguments", "{}"))
+                    result = json.loads(msg.get("content", "{}"))
+                    fp = args.get("file_path", "")
+                    vid = result.get("version_id", "")
+                    if fp and vid:
+                        save_points[(fp, vid)] = i
+                except (json.JSONDecodeError, KeyError, TypeError):
+                    pass
+
+        # ---- Scan from tail for restore_file_version -------------------------
+        marked: set[int] = set()  # indices to remove  (tool results)
+        tool_call_removals: dict[int, list[str]] = {}  # assistant_idx → [tc_id, ...]
+        i = len(self._history) - 1
+        while i >= 0:
+            if i in marked:
+                i -= 1
+                continue
+            msg = self._history[i]
+            if msg.get("role") != "tool":
+                i -= 1
+                continue
+            p_idx = self._find_parent_assistant(i)
+            if p_idx is None or p_idx in marked:
+                i -= 1
+                continue
+            parent = self._history[p_idx]
+            tc_id = msg.get("tool_call_id")
+            for tc in parent.get("tool_calls") or []:
+                if tc.get("id") != tc_id:
+                    continue
+                if tc.get("function", {}).get("name") != "restore_file_version":
+                    continue
+                try:
+                    args = json.loads(tc["function"].get("arguments", "{}"))
+                    file_path = args.get("file_path", "")
+                    version_id = args.get("version_id", "")
+                except (json.JSONDecodeError, KeyError, TypeError):
+                    break
+
+                save_idx = save_points.get((file_path, version_id))
+                if save_idx is None or save_idx >= i:
+                    break  # Can't locate save point
+
+                # Mark file-touching tool turns inside (save_idx, i]
+                for j in range(save_idx + 1, i):
+                    if j in marked:
+                        continue
+                    mj = self._history[j]
+                    if mj.get("role") != "tool":
+                        continue
+                    pj = self._find_parent_assistant(j)
+                    if pj is None:
+                        continue
+                    # Check the specific tool_call (not whole turn)
+                    tcj_id = mj.get("tool_call_id")
+                    parent_j = self._history[pj]
+                    for tcj in parent_j.get("tool_calls") or []:
+                        if tcj.get("id") != tcj_id:
+                            continue
+                        try:
+                            tcj_args = json.loads(tcj["function"].get("arguments", "{}"))
+                        except (json.JSONDecodeError, KeyError, TypeError):
+                            continue
+                        if self._tool_touches_file(tcj_args, file_path):
+                            marked.add(j)
+                            tool_call_removals.setdefault(pj, []).append(tcj_id)
+                break
+            i -= 1
+
+        if not marked:
+            return
+
+        # ---- Rebuild history --------------------------------------------------
+        # 1. Strip removed tool_calls from assistant messages.
+        # 2. Remove assistant messages with no remaining content or tool_calls.
+        # 3. Remove marked tool_result messages.
+        new_history: list[dict[str, Any]] = []
+        for idx, msg in enumerate(self._history):
+            if idx in marked:
+                continue  # drop tool_result
+            if msg.get("role") == "assistant" and idx in tool_call_removals:
+                removed_ids = set(tool_call_removals[idx])
+                new_tcs = [
+                    tc for tc in (msg.get("tool_calls") or []) if tc.get("id") not in removed_ids
+                ]
+                if not new_tcs and not msg.get("content"):
+                    continue  # drop empty assistant message
+                msg = dict(msg)  # shallow copy before mutating
+                msg["tool_calls"] = new_tcs
+            new_history.append(msg)
+
+        pruned = len(self._history) - len(new_history)
+        if pruned:
+            log.info("_prune_rollback_history: pruned %d stale messages", pruned)
+        self._history = new_history
+
+    def _find_parent_assistant(self, tool_result_index: int) -> int | None:
+        """Return the index of the assistant message that issued the tool call
+        whose result is at *tool_result_index*."""
+        for j in range(tool_result_index - 1, -1, -1):
+            if self._history[j].get("role") == "assistant":
+                return j
+        return None
+
+    def _annotate_stale_queries(self) -> None:
+        """Annotate query results that became stale due to a later file mutation.
+
+        For each ``file_mutation`` tool result we record the (file_path, categories)
+        pairs it invalidates. Then we walk forward and prepend a stale-warning to
+        any earlier query result whose category + file_path matches a later mutation.
+
+        This is non-destructive — it only adds a warning prefix, never removes data.
+        """
+        # ---- 1. Collect (file_path, rippled_categories) for every mutation ----
+        mutation_ripples: dict[int, tuple[str, set[str]]] = {}
+        for i, msg in enumerate(self._history):
+            if msg.get("role") != "tool":
+                continue
+            p_idx = self._find_parent_assistant(i)
+            if p_idx is None:
+                continue
+            parent = self._history[p_idx]
+            tc_id = msg.get("tool_call_id")
+            for tc in parent.get("tool_calls") or []:
+                if tc.get("id") != tc_id:
+                    continue
+                name = tc.get("function", {}).get("name", "")
+                ripples = MUTATION_RIPPLES.get(name)
+                if not ripples:
+                    continue
+                try:
+                    args = json.loads(tc["function"].get("arguments", "{}"))
+                except (json.JSONDecodeError, KeyError, TypeError):
+                    continue
+                fp = _extract_file_path(args)
+                if fp:
+                    mutation_ripples[i] = (fp, ripples)
+
+        if not mutation_ripples:
+            return
+
+        # ---- 2. For each query result, check if a later mutation invalidates it
+        annotated = 0
+        for i, msg in enumerate(self._history):
+            if msg.get("role") != "tool":
+                continue
+            p_idx = self._find_parent_assistant(i)
+            if p_idx is None:
+                continue
+            parent = self._history[p_idx]
+            tc_id = msg.get("tool_call_id")
+            for tc in parent.get("tool_calls") or []:
+                if tc.get("id") != tc_id:
+                    continue
+                name = tc.get("function", {}).get("name", "")
+                category = QUERY_CATEGORY.get(name)
+                if category is None:
+                    continue  # not tracked (library query, etc.)
+                try:
+                    args = json.loads(tc["function"].get("arguments", "{}"))
+                except (json.JSONDecodeError, KeyError, TypeError):
+                    continue
+                q_fp = _extract_file_path(args)
+                if not q_fp:
+                    continue
+
+                # Check if any LATER mutation on same file invalidates this category
+                for m_idx, (m_fp, m_cats) in mutation_ripples.items():
+                    if m_idx <= i:
+                        continue  # only later mutations matter
+                    if m_fp != q_fp:
+                        continue
+                    if category not in m_cats:
+                        continue
+                    # Found a matching invalidation
+                    content = msg.get("content", "")
+                    if not content.startswith(_STALE_PREFIX):
+                        msg["content"] = _STALE_PREFIX + content
+                        annotated += 1
+                    break  # one annotation per query is enough
+        if annotated:
+            log.info("_annotate_stale_queries: tagged %d stale query result(s)", annotated)
+
+    @staticmethod
+    def _tool_touches_file(args: dict[str, Any], file_path: str) -> bool:
+        """Return True if *args* reference *file_path* via any known file arg name."""
+        for key in ("file_path", "schematic_path", "pcb_path", "project_path"):
+            if args.get(key) == file_path:
+                return True
+        return False
+
     def _maybe_compact(self, system_prompt: str) -> None:
         """Dedup tool calls then, if the token budget is exceeded, compact history.
 
         This is the sole history-management entry point; called once per user turn
         before the LLM is invoked.
         """
+        self._prune_rollback_history()
+        self._annotate_stale_queries()
         self._dedup_tool_calls()
 
         system_tokens = len(system_prompt) // 4

@@ -78,8 +78,8 @@ class TestPromptSizeRegression:
         context = "## Context\nactive_schematic: /tmp/test.kicad_sch"
         prompt = build_system_prompt(context)
         estimated_tokens = len(prompt) // 4
-        assert estimated_tokens <= 800, (
-            f"Prompt is {estimated_tokens} tokens, expected ≤ 800. "
+        assert estimated_tokens <= 950, (
+            f"Prompt is {estimated_tokens} tokens, expected ≤ 950. "
             "System prompt grew too large — check for accidental additions."
         )
 
