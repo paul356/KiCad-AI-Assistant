@@ -24,11 +24,23 @@ def test_shell_search_functions() -> None:
 
     # Check that Node.js is available
     try:
-        result = subprocess.run(
-            ["node", "--version"], capture_output=True, text=True, timeout=10
-        )
+        result = subprocess.run(["node", "--version"], capture_output=True, text=True, timeout=10)
         if result.returncode != 0:
             pytest.skip("Node.js not available")
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pytest.skip("Node.js not available")
+
+    # Check that jsdom is installed (required by the test script)
+    try:
+        result = subprocess.run(
+            ["node", "-e", "require('jsdom')"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            cwd=repo_root,
+        )
+        if result.returncode != 0:
+            pytest.skip("jsdom not installed (run: npm install)")
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pytest.skip("Node.js not available")
 
@@ -47,6 +59,4 @@ def test_shell_search_functions() -> None:
     if result.stderr:
         print(result.stderr, file=sys.stderr)
 
-    assert result.returncode == 0, (
-        f"shell.js search tests failed (exit code {result.returncode})"
-    )
+    assert result.returncode == 0, f"shell.js search tests failed (exit code {result.returncode})"
