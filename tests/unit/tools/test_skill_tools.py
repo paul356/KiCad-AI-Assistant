@@ -5,6 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -157,9 +159,8 @@ class TestGetSkill:
         mcp = _make_mcp()
         with patch.object(skill_tools, "_SKILLS_DIR", tmp_path):
             skill_tools.register_skill_tools(mcp)
-            result = mcp.tools["get_skill"]("nonexistent")
-        assert "not found" in result.lower()
-        assert "schematic-placement" in result
+            with pytest.raises(ValueError, match="not found"):
+                mcp.tools["get_skill"]("nonexistent")
 
     def test_unknown_skill_empty_dir_returns_error(self, tmp_path):
         from kcaa.tools import skill_tools
@@ -167,8 +168,8 @@ class TestGetSkill:
         mcp = _make_mcp()
         with patch.object(skill_tools, "_SKILLS_DIR", tmp_path):
             skill_tools.register_skill_tools(mcp)
-            result = mcp.tools["get_skill"]("anything")
-        assert "not found" in result.lower()
+            with pytest.raises(ValueError, match="not found"):
+                mcp.tools["get_skill"]("anything")
 
     def test_invalid_name_format_rejected(self, tmp_path):
         from kcaa.tools import skill_tools
@@ -176,13 +177,11 @@ class TestGetSkill:
         mcp = _make_mcp()
         with patch.object(skill_tools, "_SKILLS_DIR", tmp_path):
             skill_tools.register_skill_tools(mcp)
-            for bad_name in ["../etc/passwd", "Uppercase", "has space", "", "."]:
+            for bad_name in ["../etc/passwd", "Uppercase", "has space", ".", ""]:
                 if not bad_name:
                     continue
-                result = mcp.tools["get_skill"](bad_name)
-                assert "Invalid" in result or "not found" in result.lower(), (
-                    f"Expected rejection for name {bad_name!r}, got: {result}"
-                )
+                with pytest.raises(ValueError, match="Invalid skill name"):
+                    mcp.tools["get_skill"](bad_name)
 
     def test_path_traversal_rejected(self, tmp_path):
         from kcaa.tools import skill_tools
@@ -190,8 +189,8 @@ class TestGetSkill:
         mcp = _make_mcp()
         with patch.object(skill_tools, "_SKILLS_DIR", tmp_path):
             skill_tools.register_skill_tools(mcp)
-            result = mcp.tools["get_skill"]("../secret")
-        assert "Invalid" in result
+            with pytest.raises(ValueError, match="Invalid skill name"):
+                mcp.tools["get_skill"]("../secret")
 
     def test_body_does_not_include_front_matter(self, tmp_path):
         from kcaa.tools import skill_tools
