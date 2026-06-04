@@ -64,8 +64,6 @@ kcaa/utils/footprint_db/*.db-wal
 .uv-cache/
 .ruff_cache/
 
-# Pre-commit
-.pre-commit-config.yaml
 
 # KiCad backup files
 *-backups/
