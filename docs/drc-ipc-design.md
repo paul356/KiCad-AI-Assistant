@@ -39,7 +39,7 @@ This document specifies a two-pronged design:
 ┌─────────────────────────────────────────────────────────────────┐
 │                    MCP Tools (kcaa/tools/)                       │
 │                                                                  │
-│  run_drc_check() ─── runs DRC + reads markers via kipy          │
+│  run_drc_check() ─── runs DRC (kipy) + reads markers (pcbnew)  │
 │  get_design_rules() ─── reads BoardDesignRules via kipy         │
 │  set_design_rules() ─── writes MinimumConstraints + severities   │
 │  list_custom_rules() ─── returns all (rule "name" ...) blocks   │
@@ -47,18 +47,25 @@ This document specifies a two-pronged design:
 │  run_autoroute() ─── enhanced with constraint passing + DRC      │
 └───────────────────────────┬─────────────────────────────────────┘
                             │
-                            ▼
-┌──────────────────────────────────────────────────────────────────┐
-│  kipy IPC layer (single path, all modes)                        │
-│                                                                  │
-│  run_action("pcbnew.InspectionTool.runDRC")   → trigger DRC     │
-│  board.get_items(PCB_MARKER_T)                → read violations  │
-│  board.refill_zones(block=True)               → rebuild zones    │
-│  kicad.client.send(GetBoardDesignRules...)    → get constraints  │
-│  kicad.client.send(UpdateBoardDesignRules...) → set constraints  │
-│  kicad.client.send(GetCustomRules...)         → list rules       │
-└──────────────────────────────────────────────────────────────────┘
+          ┌─────────────────┴─────────────────┐
+          ▼                                   ▼
+┌─────────────────────────┐    ┌──────────────────────────────┐
+│  kipy IPC               │    │  pcbnew (KiCad native API)   │
+│                          │    │                              │
+│  run_action("runDRC")   │    │  board.GetMarkers()          │
+│  run_action("clear")    │    │  → parse PCB_MARKER items    │
+│  board.refill_zones()   │    │  → violations list           │
+│  client.send(GetBoard   │    │                              │
+│    DesignRules...)      │    │  (pcbnew is always available  │
+│                          │    │   in KiCad's Python process) │
+└─────────────────────────┘    └──────────────────────────────┘
 ```
+
+**Rationale**: kipy can trigger/clear DRC, refill zones, and read/write design rules via
+protobuf, but does not wrap `PCB_MARKER` (no class in `_proto_to_object`). Reading DRC
+results requires `pcbnew` board API, which is KiCad's native Python module and always
+available inside the KiCad process. This is a single IPC-based approach — `pcbnew` is
+the KiCad API, not an external CLI fallback.
 
 ---
 
@@ -90,7 +97,13 @@ This document specifies a two-pronged design:
 | Method | Effect |
 |--------|--------|
 | `board.refill_zones(block=True)` | Refills all zones, blocks until complete (uses `RefillZones` proto). Already implemented in `kcaa/tools/pcb_zone_tools.py`. |
-| `board.get_items(types=[...])` | Queries board items by type, including PCB_MARKER_T (to be verified) |
+
+### kipy Limitations
+
+| Gap | Why | Resolution |
+|-----|-----|------------|
+| Cannot read `PCB_MARKER` items | No wrapper class in kipy `_proto_to_object` | Use `pcbnew` board API (`board.GetMarkers()`) in the KiCad process |
+| Design rules proto commands may need raw client | Not all wrapped by `kipy.board_rules` in current version | Use `kicad.client.send()` with raw protobuf messages |
 
 ### Available via kipy client (raw protobuf)
 
@@ -113,12 +126,17 @@ This document specifies a two-pronged design:
 - [ ] **0.1 Create `kcaa/tools/drc_impl/ipc_drc.py`**
   - `async def run_drc_via_ipc(board, ctx) -> dict`:
     1. Call `kipy.KiCad.run_action("pcbnew.InspectionTool.clearMarkers")` to clear old markers.
-    2. Call `kipy.KiCad.run_action("pcbnew.InspectionTool.runDRC")` to run DRC.
+    2. Call `kipy.KiCad.run_action("pcbnew.InspectionTool.runDRC")` to trigger DRC.
     3. Wait briefly (DRC is synchronous on the KiCad side, but markers may need a frame).
-    4. Call `board.get_items(types=[PCB_MARKER_T])` to read all DRC markers.
-    5. Parse each `PCB_MARKER` proto into `{"message": ..., "severity": ..., "location": {...}, "items": [...]}`.
+    4. Read markers via `pcbnew` board API (the KiCad native Python module):
+       ```python
+       import pcbnew
+       for marker in board.GetMarkers():
+           # marker: PCB_MARKER with .GetDescription(), .GetPosition(), .GetSeverity()
+       ```
+    5. Parse each marker into `{"message": ..., "severity": ..., "location": {"x": ..., "y": ...}, "items": [...]}`.
     6. Return `{"success": True, "total_violations": N, "violations": [...], "violation_categories": {...}}`.
-  - Handle: kipy not installed, KiCad not running, no board open.
+  - Handle: KiCad not running, no board open, pcbnew import failure.
 
 - [ ] **0.2 Replace `run_drc_check` in `kcaa/tools/drc_tools.py`**
   - `run_drc_check()` currently hardcodes the CLI path via `run_drc_via_cli()`.
@@ -242,10 +260,10 @@ This document specifies a two-pronged design:
 
 | Risk | Mitigation |
 |------|-----------|
-| kipy doesn't expose `PCB_MARKER_T` as a gettable item type | Use `run_action("runDRC")` + kipy-native marker query; verify during Phase 0.1 |
+| `pcbnew` import unavailable (standalone mode, KiCad not installed) | Raise clear error: "DRC requires KiCad running with a board open" |
 | KiCad 9 vs 10 IPC API differences | Version-check `kicad.get_api_version()` and degrade gracefully |
 | FreeRouting `-dr` flag may conflict with DSN-embedded rules | Test empirically, prefer DSN preprocessing if CLI flag causes issues |
-| `run_action("runDRC")` is synchronous but doesn't return results | Accept that results must be polled via `get_items(markers)` after action returns |
+| `run_action("runDRC")` is synchronous but doesn't return results | Read markers via `pcbnew` board API after action returns |
 | Custom rules can't be round-tripped perfectly | Only expose the stable subset (name + condition + single constraint), warn on complex rules |
 
 ---
