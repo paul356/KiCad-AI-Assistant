@@ -334,6 +334,16 @@ if _WX_AVAILABLE:
             tools_menu.Append(self._menu_find_id, "Find in Conversation\tCtrl+F")
             menu_bar.Append(tools_menu, "&Tools")
 
+            # Skills menu
+            self._menu_skill_add_id = wx.NewIdRef()
+            self._menu_skill_append_id = wx.NewIdRef()
+            self._menu_skill_delete_id = wx.NewIdRef()
+            skills_menu = wx.Menu()
+            skills_menu.Append(self._menu_skill_add_id, "Add Skill\u2026")
+            skills_menu.Append(self._menu_skill_append_id, "Append to Skill\u2026")
+            skills_menu.Append(self._menu_skill_delete_id, "Delete Skill\u2026")
+            menu_bar.Append(skills_menu, "&Skills")
+
             # Server menu (merged from Options + Backend)
             self._menu_restart_id = wx.NewIdRef()
             server_menu = wx.Menu()
@@ -361,6 +371,9 @@ if _WX_AVAILABLE:
             self.Bind(wx.EVT_MENU, self._on_autoroute, id=self._menu_autoroute_id)
             self.Bind(wx.EVT_MENU, self._on_find, id=self._menu_find_id)
             self.Bind(wx.EVT_MENU, self._on_about, id=self._menu_about_id)
+            self.Bind(wx.EVT_MENU, self._on_skill_add, id=self._menu_skill_add_id)
+            self.Bind(wx.EVT_MENU, self._on_skill_append, id=self._menu_skill_append_id)
+            self.Bind(wx.EVT_MENU, self._on_skill_delete, id=self._menu_skill_delete_id)
             self._search_ctrl.Bind(wx.EVT_SEARCHCTRL_SEARCH_BTN, self._on_search)
             self._search_ctrl.Bind(wx.EVT_TEXT, self._on_search_text)
             self._search_ctrl.Bind(wx.EVT_TEXT_ENTER, self._on_search_next)
@@ -969,6 +982,249 @@ if _WX_AVAILABLE:
                 "About KiCad AI Assistant",
                 wx.OK | wx.ICON_INFORMATION,
             )
+
+        # ---- Skills management handlers ----
+
+        def _skills_dir(self) -> str:
+            """Return the path to the skills directory."""
+            return os.path.join(os.path.dirname(os.path.dirname(__file__)), "skills")
+
+        def _get_skill_files(self) -> list[str]:
+            """Return sorted list of .md files (basenames) in the skills dir."""
+            skills_dir = self._skills_dir()
+            if not os.path.isdir(skills_dir):
+                return []
+            return sorted(
+                f
+                for f in os.listdir(skills_dir)
+                if f.endswith(".md") and os.path.isfile(os.path.join(skills_dir, f))
+            )
+
+        def _parse_skill_name(self, filepath: str) -> str | None:
+            """Extract the front-matter ``name`` field from a skill .md file."""
+            try:
+                with open(filepath, encoding="utf-8") as f:
+                    content = f.read()
+                # Match YAML front matter between --- markers
+                if not content.startswith("---"):
+                    return None
+                end = content.find("---", 3)
+                if end == -1:
+                    return None
+                front = content[3:end]
+                for line in front.splitlines():
+                    line = line.strip()
+                    if line.startswith("name:"):
+                        return line.split(":", 1)[1].strip().strip('"').strip("'")
+                return None
+            except Exception:
+                return None
+
+        def _list_skill_names(self) -> list[str]:
+            """Return sorted list of front-matter skill names from all .md files."""
+            skills_dir = self._skills_dir()
+            names = []
+            for f in self._get_skill_files():
+                name = self._parse_skill_name(os.path.join(skills_dir, f))
+                if name:
+                    names.append(name)
+            return sorted(names)
+
+        def _on_skill_add(self, event) -> None:
+            """Open a dialog to add a new skill."""
+            if self._busy:
+                wx.MessageBox(
+                    "Please wait for the current request to finish.",
+                    "Busy",
+                    wx.OK | wx.ICON_INFORMATION,
+                )
+                return
+
+            dlg = _SkillAddDialog(self)
+            if dlg.ShowModal() == wx.ID_OK:
+                name = dlg.name
+                priority = dlg.priority
+                description = dlg.description
+                content = dlg.content
+                dlg.Destroy()
+
+                # Validate name format (lowercase letters, digits, hyphens)
+                import re
+
+                if not re.match(r"^[a-z][a-z0-9-]*$", name):
+                    wx.MessageBox(
+                        "Skill name must start with a lowercase letter and contain "
+                        "only lowercase letters, digits, and hyphens.",
+                        "Invalid Name",
+                        wx.OK | wx.ICON_ERROR,
+                    )
+                    return
+
+                # Check for duplicate name
+                existing = self._list_skill_names()
+                if name in existing:
+                    wx.MessageBox(
+                        f"A skill named '{name}' already exists.",
+                        "Duplicate Skill",
+                        wx.OK | wx.ICON_ERROR,
+                    )
+                    return
+
+                # Build front matter
+                import datetime
+
+                fm = (
+                    f"---\n"
+                    f"name: {name}\n"
+                    f"description: {description}\n"
+                    f"priority: {priority}\n"
+                    f"updated: {datetime.datetime.now().strftime('%Y-%m-%d')}\n"
+                    f"---\n"
+                )
+                skill_text = fm + "\n" + content + "\n"
+
+                skills_dir = self._skills_dir()
+                os.makedirs(skills_dir, exist_ok=True)
+                filepath = os.path.join(skills_dir, f"{name}.md")
+                try:
+                    with open(filepath, "w", encoding="utf-8") as f:
+                        f.write(skill_text)
+                except OSError as e:
+                    wx.MessageBox(
+                        f"Could not write skill file:\n{e}", "Error", wx.OK | wx.ICON_ERROR
+                    )
+                    return
+
+                self._status_label.SetLabel(f"✅ Skill '{name}' added")
+                self._status_label.SetForegroundColour(wx.Colour(*self._C_OK))
+                self.Layout()
+            else:
+                dlg.Destroy()
+
+        def _on_skill_append(self, event) -> None:
+            """Open a dialog to append content to an existing skill."""
+            if self._busy:
+                wx.MessageBox(
+                    "Please wait for the current request to finish.",
+                    "Busy",
+                    wx.OK | wx.ICON_INFORMATION,
+                )
+                return
+
+            skill_names = self._list_skill_names()
+            if not skill_names:
+                wx.MessageBox(
+                    "No skills found. Add a skill first using Skills → Add Skill.",
+                    "No Skills",
+                    wx.OK | wx.ICON_INFORMATION,
+                )
+                return
+
+            dlg = _SkillAppendDialog(self, skill_names)
+            if dlg.ShowModal() == wx.ID_OK:
+                selected_name = dlg.selected_name
+                content_to_add = dlg.content
+                dlg.Destroy()
+
+                # Find the skill file
+                skills_dir = self._skills_dir()
+                filepath = None
+                for f in self._get_skill_files():
+                    fp = os.path.join(skills_dir, f)
+                    if self._parse_skill_name(fp) == selected_name:
+                        filepath = fp
+                        break
+
+                if filepath is None:
+                    wx.MessageBox(
+                        f"Could not find skill file for '{selected_name}'.",
+                        "Error",
+                        wx.OK | wx.ICON_ERROR,
+                    )
+                    return
+
+                try:
+                    with open(filepath, "a", encoding="utf-8") as f:
+                        f.write("\n" + content_to_add + "\n")
+                except OSError as e:
+                    wx.MessageBox(
+                        f"Could not append to skill:\n{e}", "Error", wx.OK | wx.ICON_ERROR
+                    )
+                    return
+
+                self._status_label.SetLabel(f"✅ Appended to skill '{selected_name}'")
+                self._status_label.SetForegroundColour(wx.Colour(*self._C_OK))
+                self.Layout()
+            else:
+                dlg.Destroy()
+
+        def _on_skill_delete(self, event) -> None:
+            """Open a dialog to soft-delete a skill."""
+            if self._busy:
+                wx.MessageBox(
+                    "Please wait for the current request to finish.",
+                    "Busy",
+                    wx.OK | wx.ICON_INFORMATION,
+                )
+                return
+
+            skill_names = self._list_skill_names()
+            if not skill_names:
+                wx.MessageBox(
+                    "No skills found to delete.",
+                    "No Skills",
+                    wx.OK | wx.ICON_INFORMATION,
+                )
+                return
+
+            dlg = _SkillDeleteDialog(self, skill_names)
+            if dlg.ShowModal() == wx.ID_OK:
+                selected_name = dlg.selected_name
+                dlg.Destroy()
+
+                # Find the skill file
+                skills_dir = self._skills_dir()
+                filepath = None
+                for f in self._get_skill_files():
+                    fp = os.path.join(skills_dir, f)
+                    if self._parse_skill_name(fp) == selected_name:
+                        filepath = fp
+                        break
+
+                if filepath is None:
+                    wx.MessageBox(
+                        f"Could not find skill file for '{selected_name}'.",
+                        "Error",
+                        wx.OK | wx.ICON_ERROR,
+                    )
+                    return
+
+                # Soft-delete: move to .deleted/ subdirectory
+                deleted_dir = os.path.join(skills_dir, ".deleted")
+                os.makedirs(deleted_dir, exist_ok=True)
+                basename = os.path.basename(filepath)
+                dest = os.path.join(deleted_dir, basename)
+
+                # Handle name collisions in .deleted/
+                counter = 1
+                name_part, ext = os.path.splitext(basename)
+                while os.path.exists(dest):
+                    dest = os.path.join(deleted_dir, f"{name_part}-{counter}{ext}")
+                    counter += 1
+
+                try:
+                    import shutil
+
+                    shutil.move(filepath, dest)
+                except OSError as e:
+                    wx.MessageBox(f"Could not delete skill:\n{e}", "Error", wx.OK | wx.ICON_ERROR)
+                    return
+
+                self._status_label.SetLabel(f"🗑️ Skill '{selected_name}' moved to .deleted/")
+                self._status_label.SetForegroundColour(wx.Colour(*self._C_OK))
+                self.Layout()
+            else:
+                dlg.Destroy()
 
         # ---- Search / Find handlers ----
 
@@ -2228,6 +2484,227 @@ if _WX_AVAILABLE:
                         0, int(f * self._conv_view.GetScrollRange(wx.VERTICAL))
                     ),
                 )
+
+    # ------------------------------------------------------------------ #
+    # Skill management dialogs
+    # ------------------------------------------------------------------ #
+
+    class _SkillAddDialog(wx.Dialog):
+        """Dialog for adding a new skill with front-matter metadata and content."""
+
+        def __init__(self, parent):
+            super().__init__(
+                parent,
+                title="Add Skill",
+                size=(520, 460),
+                style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER,
+            )
+            self.name = ""
+            self.priority = "50"
+            self.description = ""
+            self.content = ""
+
+            panel = wx.Panel(self)
+            sizer = wx.BoxSizer(wx.VERTICAL)
+
+            # Name
+            row1 = wx.BoxSizer(wx.HORIZONTAL)
+            row1.Add(wx.StaticText(panel, label="Name:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 8)
+            self._name_ctrl = wx.TextCtrl(panel, size=(280, -1))
+            self._name_ctrl.SetToolTip(
+                "Lowercase letters, digits, and hyphens (e.g., schematic-wiring)"
+            )
+            row1.Add(self._name_ctrl, 1)
+            sizer.Add(row1, 0, wx.EXPAND | wx.ALL, 10)
+
+            # Priority
+            row2 = wx.BoxSizer(wx.HORIZONTAL)
+            row2.Add(
+                wx.StaticText(panel, label="Priority:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 8
+            )
+            self._prio_ctrl = wx.SpinCtrl(panel, value="50", min=0, max=100, size=(80, -1))
+            self._prio_ctrl.SetToolTip("Higher priority = listed first (0-100)")
+            row2.Add(self._prio_ctrl, 0)
+            sizer.Add(row2, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+
+            # Description
+            row3 = wx.BoxSizer(wx.HORIZONTAL)
+            row3.Add(
+                wx.StaticText(panel, label="Description:"),
+                0,
+                wx.ALIGN_CENTER_VERTICAL | wx.RIGHT,
+                8,
+            )
+            self._desc_ctrl = wx.TextCtrl(panel, size=(280, -1))
+            self._desc_ctrl.SetToolTip("Short description shown in the skill catalog")
+            row3.Add(self._desc_ctrl, 1)
+            sizer.Add(row3, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+
+            # Content
+            sizer.Add(wx.StaticText(panel, label="Content (Markdown):"), 0, wx.LEFT | wx.RIGHT, 10)
+            self._content_ctrl = wx.TextCtrl(
+                panel, size=(480, 180), style=wx.TE_MULTILINE | wx.HSCROLL
+            )
+            self._content_ctrl.SetToolTip("Skill body in Markdown format")
+            sizer.Add(self._content_ctrl, 1, wx.EXPAND | wx.ALL, 10)
+
+            # Buttons
+            btn_sizer = wx.StdDialogButtonSizer()
+            ok_btn = wx.Button(panel, wx.ID_OK, "Add Skill")
+            ok_btn.SetDefault()
+            btn_sizer.AddButton(ok_btn)
+            cancel_btn = wx.Button(panel, wx.ID_CANCEL, "Cancel")
+            btn_sizer.AddButton(cancel_btn)
+            btn_sizer.Realize()
+            sizer.Add(btn_sizer, 0, wx.EXPAND | wx.ALL, 10)
+
+            panel.SetSizer(sizer)
+            self.CentreOnParent()
+
+            self.Bind(wx.EVT_BUTTON, self._on_ok, id=wx.ID_OK)
+
+        def _on_ok(self, event):
+            self.name = self._name_ctrl.GetValue().strip()
+            self.priority = str(self._prio_ctrl.GetValue())
+            self.description = self._desc_ctrl.GetValue().strip()
+            self.content = self._content_ctrl.GetValue()
+            if not self.name:
+                wx.MessageBox(
+                    "Skill name is required.", "Validation", wx.OK | wx.ICON_WARNING, self
+                )
+                return
+            if not self.content.strip():
+                wx.MessageBox(
+                    "Skill content is required.", "Validation", wx.OK | wx.ICON_WARNING, self
+                )
+                return
+            event.Skip()
+
+    class _SkillAppendDialog(wx.Dialog):
+        """Dialog for appending content to an existing skill."""
+
+        def __init__(self, parent, skill_names: list[str]):
+            super().__init__(
+                parent,
+                title="Append to Skill",
+                size=(480, 380),
+                style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER,
+            )
+            self.selected_name = ""
+            self.content = ""
+
+            panel = wx.Panel(self)
+            sizer = wx.BoxSizer(wx.VERTICAL)
+
+            # Skill choice
+            row1 = wx.BoxSizer(wx.HORIZONTAL)
+            row1.Add(
+                wx.StaticText(panel, label="Skill:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 8
+            )
+            self._choice = wx.Choice(panel, choices=skill_names, size=(280, -1))
+            if skill_names:
+                self._choice.SetSelection(0)
+            row1.Add(self._choice, 1)
+            sizer.Add(row1, 0, wx.EXPAND | wx.ALL, 10)
+
+            # Content
+            sizer.Add(
+                wx.StaticText(panel, label="Content to append (Markdown):"),
+                0,
+                wx.LEFT | wx.RIGHT,
+                10,
+            )
+            self._content_ctrl = wx.TextCtrl(
+                panel, size=(440, 180), style=wx.TE_MULTILINE | wx.HSCROLL
+            )
+            self._content_ctrl.SetToolTip("Markdown content to add at the end of the skill")
+            sizer.Add(self._content_ctrl, 1, wx.EXPAND | wx.ALL, 10)
+
+            # Buttons
+            btn_sizer = wx.StdDialogButtonSizer()
+            ok_btn = wx.Button(panel, wx.ID_OK, "Append")
+            ok_btn.SetDefault()
+            btn_sizer.AddButton(ok_btn)
+            cancel_btn = wx.Button(panel, wx.ID_CANCEL, "Cancel")
+            btn_sizer.AddButton(cancel_btn)
+            btn_sizer.Realize()
+            sizer.Add(btn_sizer, 0, wx.EXPAND | wx.ALL, 10)
+
+            panel.SetSizer(sizer)
+            self.CentreOnParent()
+
+            self.Bind(wx.EVT_BUTTON, self._on_ok, id=wx.ID_OK)
+
+        def _on_ok(self, event):
+            choice_idx = self._choice.GetSelection()
+            if choice_idx == wx.NOT_FOUND:
+                wx.MessageBox("Please select a skill.", "Validation", wx.OK | wx.ICON_WARNING, self)
+                return
+            self.selected_name = self._choice.GetString(choice_idx)
+            self.content = self._content_ctrl.GetValue()
+            if not self.content.strip():
+                wx.MessageBox(
+                    "Content to append is required.", "Validation", wx.OK | wx.ICON_WARNING, self
+                )
+                return
+            event.Skip()
+
+    class _SkillDeleteDialog(wx.Dialog):
+        """Dialog for soft-deleting a skill (moved to .deleted/ subdirectory)."""
+
+        def __init__(self, parent, skill_names: list[str]):
+            super().__init__(
+                parent,
+                title="Delete Skill",
+                size=(420, 200),
+                style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER,
+            )
+            self.selected_name = ""
+
+            panel = wx.Panel(self)
+            sizer = wx.BoxSizer(wx.VERTICAL)
+
+            # Info
+            info = wx.StaticText(
+                panel,
+                label="The skill file will be moved to skills/.deleted/.\n"
+                "You can manually restore it from that directory.",
+            )
+            info.Wrap(380)
+            sizer.Add(info, 0, wx.ALL, 10)
+
+            # Skill choice
+            row = wx.BoxSizer(wx.HORIZONTAL)
+            row.Add(wx.StaticText(panel, label="Skill:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 8)
+            self._choice = wx.Choice(panel, choices=skill_names, size=(280, -1))
+            if skill_names:
+                self._choice.SetSelection(0)
+            row.Add(self._choice, 1)
+            sizer.Add(row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+
+            # Buttons
+            btn_sizer = wx.StdDialogButtonSizer()
+            del_btn = wx.Button(panel, wx.ID_OK, "Delete")
+            del_btn.SetDefault()
+            btn_sizer.AddButton(del_btn)
+            cancel_btn = wx.Button(panel, wx.ID_CANCEL, "Cancel")
+            btn_sizer.AddButton(cancel_btn)
+            btn_sizer.Realize()
+            sizer.Add(btn_sizer, 0, wx.EXPAND | wx.ALL, 10)
+
+            panel.SetSizer(sizer)
+            self.CentreOnParent()
+
+            self.Bind(wx.EVT_BUTTON, self._on_ok, id=wx.ID_OK)
+
+        def _on_ok(self, event):
+            choice_idx = self._choice.GetSelection()
+            if choice_idx == wx.NOT_FOUND:
+                wx.MessageBox("Please select a skill.", "Validation", wx.OK | wx.ICON_WARNING, self)
+                return
+            self.selected_name = self._choice.GetString(choice_idx)
+            event.Skip()
+
 
 else:
     # Fallback stub when wx is not available (e.g., during unit tests or dev)

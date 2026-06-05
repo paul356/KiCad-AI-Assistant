@@ -12,6 +12,11 @@ Skills are Markdown files with YAML front matter::
 
 The LLM discovers available skills via ``list_skills()`` and loads the full
 content of a single skill via ``get_skill(name)``.
+
+Plugin users can manage skills through:
+- ``add_skill(name, description, priority, content)`` — create a new skill.
+- ``append_to_skill(name, content)`` — add content to an existing skill.
+- ``delete_skill(name)`` — soft-delete (move to .deleted/ subdirectory).
 """
 
 from __future__ import annotations
@@ -20,6 +25,7 @@ import logging
 import os
 from pathlib import Path
 import re
+import shutil
 
 from fastmcp import FastMCP
 
@@ -31,6 +37,9 @@ log = logging.getLogger(__name__)
 # relative to this package.
 _DEFAULT_SKILLS = str(Path(__file__).parent.parent.parent / "kicad_plugin" / "skills")
 _SKILLS_DIR = Path(os.environ.get("KCAA_SKILLS_DIR", _DEFAULT_SKILLS))
+
+# Soft-delete directory — inside the skills dir so permissions are the same.
+_DELETED_DIR = _SKILLS_DIR / ".deleted"
 
 # Skill names must be lowercase slugs: letters, digits, hyphens.
 _VALID_NAME_RE = re.compile(r"^[a-z][a-z0-9-]*$")
@@ -81,8 +90,47 @@ def _load_all_skills() -> list[dict[str, str]]:
     return sorted(skills, key=lambda s: (-int(s["priority"]), s["name"]))
 
 
+def _find_skill_file(name: str) -> Path | None:
+    """Return the Path to the skill file whose front-matter ``name``
+    matches *name*, or None if no match is found.
+    """
+    if not _SKILLS_DIR.exists():
+        return None
+    for path in sorted(_SKILLS_DIR.glob("*.md")):
+        try:
+            meta, _ = _parse_front_matter(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        candidate = meta.get("name") or path.stem
+        if candidate == name:
+            return path
+    return None
+
+
+def _unique_deleted_path(filename: str) -> Path:
+    """Return a path inside ``_DELETED_DIR`` that won't overwrite an
+    existing file.  Appends a counter if the filename already exists.
+    """
+    _DELETED_DIR.mkdir(parents=True, exist_ok=True)
+    target = _DELETED_DIR / filename
+    if not target.exists():
+        return target
+    stem, ext = os.path.splitext(filename)
+    counter = 1
+    while True:
+        target = _DELETED_DIR / f"{stem}-{counter}{ext}"
+        if not target.exists():
+            return target
+        counter += 1
+
+
+def _build_front_matter_blob(name: str, description: str, priority: int | str) -> str:
+    """Build the YAML front-matter block for a skill file."""
+    return f'---\nname: {name}\npriority: {priority}\ndescription: "{description}"\n---\n'
+
+
 def register_skill_tools(mcp: FastMCP) -> None:
-    """Register skill discovery and retrieval tools on *mcp*."""
+    """Register skill discovery, retrieval, and management tools on *mcp*."""
 
     @mcp.tool()
     def list_skills() -> str:
@@ -144,3 +192,103 @@ def register_skill_tools(mcp: FastMCP) -> None:
         if available:
             raise ValueError(f"Skill '{name}' not found. Available skills: {', '.join(available)}")
         raise ValueError(f"Skill '{name}' not found. No skills are currently available.")
+
+    # ------------------------------------------------------------------
+    # Skill management tools (write operations for plugin users)
+    # ------------------------------------------------------------------
+
+    @mcp.tool()
+    def add_skill(name: str, description: str, content: str, priority: int = 50) -> str:
+        """Create a new workflow skill.
+
+        Args:
+            name: Skill name — lowercase letters, digits, and hyphens
+                  (e.g. ``"my-custom-workflow"``).
+            description: One-line description shown in ``list_skills()``.
+            content: Markdown body of the skill (workflow guidance).
+            priority: Display priority (higher = shown first).  Default 50.
+        """
+        if not _VALID_NAME_RE.match(name):
+            raise ValueError(
+                f"Invalid skill name '{name}'. "
+                "Names must use lowercase letters, digits, and hyphens "
+                "(e.g. 'my-custom-workflow')."
+            )
+
+        _SKILLS_DIR.mkdir(parents=True, exist_ok=True)
+
+        # Reject duplicates
+        if _find_skill_file(name) is not None:
+            raise ValueError(
+                f"A skill named '{name}' already exists. "
+                "Use append_to_skill() to add content to it, or "
+                "delete_skill() first to replace it."
+            )
+
+        blob = _build_front_matter_blob(name, description, priority)
+        filepath = _SKILLS_DIR / f"{name}.md"
+        filepath.write_text(blob + content + "\n", encoding="utf-8")
+        log.info("Created skill file %s", filepath)
+        return f"Skill '{name}' created at {filepath}"
+
+    @mcp.tool()
+    def append_to_skill(name: str, content: str) -> str:
+        """Append content to an existing skill's body.
+
+        Useful for extending a workflow with additional steps or notes
+        without replacing the entire skill file.
+
+        Args:
+            name: Skill name as shown in ``list_skills()``.
+            content: Markdown text to append to the skill body.
+        """
+        if not _VALID_NAME_RE.match(name):
+            raise ValueError(
+                f"Invalid skill name '{name}'. "
+                "Names must use lowercase letters, digits, and hyphens."
+            )
+
+        path = _find_skill_file(name)
+        if path is None:
+            available = [s["name"] for s in _load_all_skills()]
+            hint = f" Available skills: {', '.join(available)}" if available else ""
+            raise ValueError(f"Skill '{name}' not found.{hint}")
+
+        current = path.read_text(encoding="utf-8")
+        # Ensure exactly one blank line between existing body and new content.
+        new_body = current.rstrip() + "\n\n" + content.strip() + "\n"
+        path.write_text(new_body, encoding="utf-8")
+        log.info("Appended content to skill %s", path)
+        return f"Content appended to skill '{name}'."
+
+    @mcp.tool()
+    def delete_skill(name: str) -> str:
+        """Soft-delete a skill by moving its file to a .deleted/ subdirectory.
+
+        The skill file is NOT permanently removed — it is moved to
+        ``skills/.deleted/`` where you can manually recover it.  If a file
+        with the same name already exists in the deleted directory, the
+        moved file is automatically renamed (e.g. ``my-skill-1.md``).
+
+        Args:
+            name: Skill name to delete.
+        """
+        if not _VALID_NAME_RE.match(name):
+            raise ValueError(
+                f"Invalid skill name '{name}'. "
+                "Names must use lowercase letters, digits, and hyphens."
+            )
+
+        path = _find_skill_file(name)
+        if path is None:
+            available = [s["name"] for s in _load_all_skills()]
+            hint = f" Available skills: {', '.join(available)}" if available else ""
+            raise ValueError(f"Skill '{name}' not found.{hint}")
+
+        dest = _unique_deleted_path(path.name)
+        shutil.move(str(path), str(dest))
+        log.info("Moved skill %s → %s", path, dest)
+        return (
+            f"Skill '{name}' moved to deleted directory: {dest}\n"
+            f"To restore, move the file back to {_SKILLS_DIR}/"
+        )

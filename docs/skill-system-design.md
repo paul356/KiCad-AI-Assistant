@@ -46,6 +46,16 @@ universal rules, while specialised workflow sections live as independently-loada
 └──────────────────────────────────────────────────────────┘
                            │
               kicad_plugin/skills/<name>.md
+
+          ┌────────────────────────────────────┐
+          │  Plugin UI — Skills menu           │
+          │                                    │
+          │  add_skill / append_to_skill       │
+          │  delete_skill (soft → .deleted/)   │
+          │                                    │
+          │  Direct filesystem access to       │
+          │  kicad_plugin/skills/              │
+          └────────────────────────────────────┘
 ```
 
 ---
@@ -55,6 +65,7 @@ universal rules, while specialised workflow sections live as independently-loada
 | Technique | Description | Status |
 |---|---|---|
 | **Tool-based lazy loading** | `get_skill(name)` tool; LLM requests what it needs | **Selected (Phase 1)** |
+| **User-managed skill authoring** | `add_skill` / `append_to_skill` / `delete_skill` via plugin UI | **Implemented (Phase 5)** |
 | Semantic retrieval (RAG) | Embed queries, topK skill retrieval via cosine similarity | Future — when skills > ~20 |
 | Dependency graph injection | Skill declares `requires`; loading A auto-fetches B | Future — complex workflows |
 | History-aware re-injection | Re-inject skills referenced before history compaction | Future — compaction fix |
@@ -124,7 +135,10 @@ Six initial skills extracted from the existing system prompt (no new content inv
 | `pcb-outline` | `_PROMPT_PCB` | `Edge.Cuts` creation and editing workflow |
 | `pcb-footprint-library` | `_PROMPT_PCB` | Footprint index, search, and inspection workflow |
 
-Skill files live in `kicad_plugin/skills/<name>.md`.
+Skill files live in `kicad_plugin/skills/<name>.md`.  Use the plugin
+**Skills** menu or the `add_skill` / `append_to_skill` / `delete_skill`
+MCP tools to manage them.  Deleted skills are moved to
+`skills/.deleted/` for manual recovery.
 
 ---
 
@@ -148,6 +162,57 @@ Returns:
 The tool is registered in `tool_registry.py` with the same policy structure as other
 read-only tools. It is implemented in a new file `kicad_plugin/skill_tools.py` (or
 inline in `llm_client.py` — TBD).
+
+### `list_skills` Tool Specification
+
+```
+Tool name:   list_skills
+Kind:        readonly
+Arguments:   (none)
+
+Returns:
+  "Available workflow skills:" followed by "- name: description" lines,
+  ordered by priority (descending).  Returns "No workflow skills are
+  currently available." when the skills directory is empty.
+```
+
+### Management Tool Specifications
+
+All three management tools are registered in `kcaa/tools/skill_tools.py`
+alongside `get_skill` and `list_skills`.  They operate on the same
+`kicad_plugin/skills/` directory.
+
+```
+Tool name:   add_skill
+Kind:        write
+Arguments:
+  name        (str, required) — lowercase, digits, hyphens; must start with letter
+  description (str, required) — one-line catalog description
+  content     (str, required) — Markdown body
+  priority    (int, optional) — 0-100, higher = listed first (default 50)
+
+Returns:     "Skill '<name>' created at <path>"
+Errors:      ValueError if name invalid or duplicate
+
+Tool name:   append_to_skill
+Kind:        write
+Arguments:
+  name        (str, required) — skill name from the catalog
+  content     (str, required) — Markdown to append after a blank-line separator
+
+Returns:     "Content appended to skill '<name>'."
+Errors:      ValueError if name invalid or not found
+
+Tool name:   delete_skill
+Kind:        write
+Arguments:
+  name        (str, required) — skill name from the catalog
+
+Returns:     "Skill '<name>' moved to deleted directory: <dest>"
+Behavior:    Moves <name>.md → skills/.deleted/<name>.md.  If a file already
+             exists in .deleted/, renames to <name>-1.md, <name>-2.md, etc.
+Errors:      ValueError if name invalid or not found
+```
 
 ---
 
@@ -230,6 +295,54 @@ new skill only requires dropping a new file into `kicad_plugin/skills/`.
 
 ---
 
+## Skill Management Tools
+
+Three MCP tools enable plugin users to create, extend, and soft-delete skills
+without editing `.md` files by hand. All three are registered in
+`kcaa/tools/skill_tools.py`.
+
+### `add_skill(name, description, content, priority=50)`
+
+Creates a new skill file at `skills/<name>.md` with YAML front matter. Rejects
+duplicate names (matched by front-matter `name`, not filename).
+
+- **name** — lowercase letters, digits, hyphens; must start with a letter
+- **description** — one-line catalog description shown in `list_skills()`
+- **content** — Markdown body (workflow guidance)
+- **priority** — integer 0-100, higher = listed first (default 50)
+
+### `append_to_skill(name, content)`
+
+Appends Markdown text to the body of an existing skill. Finds the skill file by
+front-matter name. The appended content is added after a blank-line separator.
+
+### `delete_skill(name)`
+
+Soft-deletes a skill by moving its `.md` file to `skills/.deleted/`. This is
+**not** a permanent deletion — users can manually restore files from the
+`.deleted/` directory. If a file with the same name already exists in
+`.deleted/`, the moved file is automatically renamed (e.g., `my-skill-1.md`)
+to prevent overwriting.
+
+### Plugin UI Integration
+
+The KiCad plugin panel provides a **Skills** menu between **Tools** and
+**Server** with three items:
+
+| Menu Item | Opens | Calls |
+|---|---|---|
+| Add Skill… | `_SkillAddDialog` — name, priority, description, content | Direct filesystem write |
+| Append to Skill… | `_SkillAppendDialog` — skill picker + content | Direct filesystem append |
+| Delete Skill… | `_SkillDeleteDialog` — skill picker with confirmation | `shutil.move()` to `.deleted/` |
+
+The UI operates directly on the `kicad_plugin/skills/` directory (shared with
+the MCP server) — no round-trip through the server is needed for file I/O.
+
+Dialog classes are defined at the end of `kicad_plugin/ui/panel.py`:
+`_SkillAddDialog`, `_SkillAppendDialog`, `_SkillDeleteDialog`.
+
+---
+
 ## Future: Semantic Retrieval Backend
 
 When the skill library grows beyond ~20 entries, the `get_skill` lookup can be replaced with:
@@ -258,10 +371,6 @@ Legend: `[ ]` = pending · `[~]` = in progress · `[x]` = done
 - [x] ~`load_skill` in plugin~ — skill loading happens server-side
 - [x] Implement `list_skills()` MCP tool in `kcaa/tools/skill_tools.py`
 - [x] Skill catalog returned by `list_skills()` MCP tool (auto-generated from front matter)
-- [ ] ~PromptBuilder~ — deferred to Phase 3 (needed when prompt refactor happens)
-
-
-
 - [x] Implement `get_skill(name)` MCP tool in `kcaa/tools/skill_tools.py`
   - Returns skill body on success
   - Returns helpful error + catalog listing on unknown name
@@ -297,11 +406,25 @@ section as the body, verify content matches source exactly.
 
 ### Phase 4 — Tests (depends on Phase 1 & Phase 3)
 
-- [ ] Unit tests for `PromptBuilder` (section ordering, empty skills list, priority sort)
-- [ ] Unit tests for `skill_loader` (load by name, unknown name error, catalog generation)
-- [ ] Integration test: `get_skill` returns correct content for each registered skill
-- [ ] Integration test: `get_skill` with unknown name returns error + available skill list
-- [ ] Prompt size regression test: confirm ≥ 60% reduction vs baseline
+- [x] Unit tests for `PromptBuilder` (section ordering, empty skills list, priority sort)
+- [x] Unit tests for `skill_loader` (load by name, unknown name error, catalog generation)
+- [x] Integration test: `get_skill` returns correct content for each registered skill
+- [x] Integration test: `get_skill` with unknown name returns error + available skill list
+- [x] Prompt size regression test: confirm ≥ 60% reduction vs baseline
+
+### Phase 5 — Skill Management Tools (add/append/delete + plugin UI)
+
+- [x] Implement `add_skill(name, description, content, priority)` in `skill_tools.py`
+- [x] Implement `append_to_skill(name, content)` in `skill_tools.py`
+- [x] Implement `delete_skill(name)` with soft-delete to `.deleted/` and collision-safe renaming
+- [x] Add `_SkillAddDialog`, `_SkillAppendDialog`, `_SkillDeleteDialog` to `panel.py`
+- [x] Add **Skills** menu with three items between **Tools** and **Server**
+- [x] Unit tests: 22 tests in `tests/unit/tools/test_skill_management.py`
+- [x] Integration tests: 12 tests in `tests/integration/test_skill_management_integration.py`
+- [x] Full lifecycle test: add → list → get → append → get → delete → verify in `.deleted/`
+- [x] Collision-safe rename test
+- [x] Ordering test (priority sort)
+- [x] Validation test (invalid name, duplicate, nonexistent)
 
 ### Dependency Order
 
