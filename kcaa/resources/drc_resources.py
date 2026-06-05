@@ -6,7 +6,7 @@ import os
 
 from fastmcp import FastMCP
 
-from kcaa.tools.drc_impl.cli_drc import run_drc_via_cli
+from kcaa.tools.drc_impl.ipc_drc import run_drc_via_ipc
 from kcaa.utils.drc_history import get_drc_history
 from kcaa.utils.file_utils import get_project_files
 
@@ -140,7 +140,7 @@ def register_drc_resources(mcp: FastMCP) -> None:
         return report
 
     @mcp.resource("kicad://drc/{project_path}")
-    def get_drc_report(project_path: str) -> str:
+    async def get_drc_report(project_path: str) -> str:
         """Get a formatted DRC report for a KiCad project.
 
         Args:
@@ -162,8 +162,8 @@ def register_drc_resources(mcp: FastMCP) -> None:
         pcb_file = files["pcb"]
         print(f"Found PCB file: {pcb_file}")
 
-        # Try to run DRC via command line
-        drc_results = run_drc_via_cli(pcb_file)
+        # Run DRC via IPC (kipy + pcbnew)
+        drc_results = await run_drc_via_ipc(pcb_file, ctx=None)
 
         if not drc_results["success"]:
             error_message = drc_results.get("error", "Unknown error")

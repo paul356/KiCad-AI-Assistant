@@ -1071,7 +1071,35 @@ if _WX_AVAILABLE:
                 self._render_conversation()
                 return
 
-            # ---- 2. Enumerate net names from board, show checklist ----
+            # ---- 2. Read design rules for constraint pass-through ----
+            board_path = board.GetFileName()
+            clearance_mm = None
+            constraint_hint = ""
+            if board_path and os.path.isfile(board_path):
+                try:
+                    from kcaa.tools.drc_impl.pcb_design_rules import get_design_rules_from_file
+
+                    dr_result = get_design_rules_from_file(board_path)
+                    if dr_result.get("success") and dr_result.get("rules"):
+                        rules = dr_result["rules"]
+                        min_clear = rules.get("min_clearance")
+                        min_track = rules.get("min_track_width")
+                        ce_clear = rules.get("copper_edge_clearance")
+                        parts = []
+                        if min_clear is not None:
+                            clearance_mm = min_clear
+                            parts.append(f"Clearance: {min_clear} mm")
+                        if min_track is not None:
+                            parts.append(f"Min Track: {min_track} mm")
+                        if ce_clear is not None:
+                            parts.append(f"Edge Clearance: {ce_clear} mm")
+                        if parts:
+                            constraint_hint = "Board constraints: " + ", ".join(parts) + ".\n"
+                            log.info("autoroute: extracted constraints from %s", board_path)
+                except Exception as exc:
+                    log.warning("autoroute: failed to read design rules: %s", exc)
+
+            # ---- 3. Enumerate net names from board, show checklist ----
             # Net code 0 is the unconnected pseudo-net — skip it.
             all_nets = []
             try:
@@ -1089,7 +1117,7 @@ if _WX_AVAILABLE:
             if not all_nets:
                 dlg = wx.TextEntryDialog(
                     self,
-                    "Net names to skip (comma-separated, e.g. GND,+3.3V).\n"
+                    constraint_hint + "Net names to skip (comma-separated, e.g. GND,+3.3V).\n"
                     "Leave blank to route all nets.",
                     "Auto Route — Skip Nets",
                     value="",
@@ -1103,7 +1131,7 @@ if _WX_AVAILABLE:
             else:
                 dlg = wx.MultiChoiceDialog(
                     self,
-                    "Select nets FreeRouting should NOT route.\n"
+                    constraint_hint + "Select nets FreeRouting should NOT route.\n"
                     "(These stay as ratsnest — route them manually, e.g. via power planes.)",
                     "Auto Route — Skip Nets",
                     all_nets,
@@ -1116,7 +1144,7 @@ if _WX_AVAILABLE:
                 dlg.Destroy()
                 ignore_nets = [all_nets[i] for i in selections] or None
 
-            # ---- 3. Export DSN (main thread — pcbnew call) ----
+            # ---- 4. Export DSN (main thread — pcbnew call) ----
             import shutil
             import tempfile
 
@@ -1172,7 +1200,7 @@ if _WX_AVAILABLE:
                 self._render_conversation()
                 return
 
-            # ---- 3. Update UI, then start background thread ----
+            # ---- 5. Update UI, then start background thread ----
             self.GetMenuBar().Enable(self._menu_autoroute_id, False)
             self._status_label.SetLabel("⏳ Auto-routing in progress…")
             self._status_label.SetForegroundColour(wx.Colour(*self._C_WARN))
@@ -1203,6 +1231,7 @@ if _WX_AVAILABLE:
                     ses_path,
                     tmp_dir,
                     backup_path,
+                    board_path,
                 )
 
             start_freerouting_thread(
@@ -1211,6 +1240,7 @@ if _WX_AVAILABLE:
                 on_done=_routing_done,
                 on_progress=_progress,
                 ignore_nets=ignore_nets,
+                clearance_mm=clearance_mm,
             )
 
         def _on_autoroute_done(
@@ -1222,6 +1252,7 @@ if _WX_AVAILABLE:
             ses_path: str,
             tmp_dir: str,
             backup_path: str = "",
+            board_path: str = "",
         ) -> None:
             """Called on the wx main thread after FreeRouting finishes.
 
@@ -1269,12 +1300,20 @@ if _WX_AVAILABLE:
                 if backup_path:
                     message += f"\nBackup saved to: {backup_path}"
 
+            # ---- Post-route DRC hint ----
+            drc_hint = ""
+            if success and board_path:
+                drc_hint = (
+                    "\n\n💡 After routing, run a Design Rule Check to verify the result."
+                    ' Use the DRC tool ("Check Board DRC" in the AI panel) to check for violations.'
+                )
+
             # ---- Append collapsible log entry ----
             self._conv_entries.append(
                 {
                     "type": "autoroute_log",
                     "success": success,
-                    "message": message,
+                    "message": message + drc_hint,
                     "stdout": stdout,
                     "stderr": stderr,
                 }
