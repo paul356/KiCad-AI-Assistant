@@ -46,16 +46,6 @@ universal rules, while specialised workflow sections live as independently-loada
 └──────────────────────────────────────────────────────────┘
                            │
               kicad_plugin/skills/<name>.md
-
-          ┌────────────────────────────────────┐
-          │  Plugin UI — Skills menu           │
-          │                                    │
-          │  add_skill / append_to_skill       │
-          │  delete_skill (soft → .deleted/)   │
-          │                                    │
-          │  Direct filesystem access to       │
-          │  kicad_plugin/skills/              │
-          └────────────────────────────────────┘
 ```
 
 ---
@@ -135,10 +125,9 @@ Six initial skills extracted from the existing system prompt (no new content inv
 | `pcb-outline` | `_PROMPT_PCB` | `Edge.Cuts` creation and editing workflow |
 | `pcb-footprint-library` | `_PROMPT_PCB` | Footprint index, search, and inspection workflow |
 
-Skill files live in `kicad_plugin/skills/<name>.md`.  Use the plugin
-**Skills** menu or the `add_skill` / `append_to_skill` / `delete_skill`
-MCP tools to manage them.  Deleted skills are moved to
-`skills/.deleted/` for manual recovery.
+Skill files live in `kicad_plugin/skills/<name>.md`.  Use the `add_skill`,
+`append_to_skill`, and `delete_skill` MCP tools to manage them.  Deleted
+skills are moved to `skills/.deleted/` for manual recovery.
 
 ---
 
@@ -324,22 +313,11 @@ Soft-deletes a skill by moving its `.md` file to `skills/.deleted/`. This is
 `.deleted/`, the moved file is automatically renamed (e.g., `my-skill-1.md`)
 to prevent overwriting.
 
-### Plugin UI Integration
-
-The KiCad plugin panel provides a **Skills** menu between **Tools** and
-**Server** with three items:
-
-| Menu Item | Opens | Calls |
-|---|---|---|
-| Add Skill… | `_SkillAddDialog` — name, priority, description, content | Direct filesystem write |
-| Append to Skill… | `_SkillAppendDialog` — skill picker + content | Direct filesystem append |
-| Delete Skill… | `_SkillDeleteDialog` — skill picker with confirmation | `shutil.move()` to `.deleted/` |
-
-The UI operates directly on the `kicad_plugin/skills/` directory (shared with
-the MCP server) — no round-trip through the server is needed for file I/O.
-
-Dialog classes are defined at the end of `kicad_plugin/ui/panel.py`:
-`_SkillAddDialog`, `_SkillAppendDialog`, `_SkillDeleteDialog`.
+**No explicit confirmation step exists** in the MCP tool — the LLM calling
+this tool should ask the user for confirmation before invoking
+`delete_skill`, especially when the skill name is ambiguous or the user's
+intent is unclear.  The soft-delete design (move instead of unlink) also acts
+as a safety net.
 
 ---
 
@@ -412,13 +390,11 @@ section as the body, verify content matches source exactly.
 - [x] Integration test: `get_skill` with unknown name returns error + available skill list
 - [x] Prompt size regression test: confirm ≥ 60% reduction vs baseline
 
-### Phase 5 — Skill Management Tools (add/append/delete + plugin UI)
+### Phase 5 — Skill Management Tools (add/append/delete)
 
 - [x] Implement `add_skill(name, description, content, priority)` in `skill_tools.py`
 - [x] Implement `append_to_skill(name, content)` in `skill_tools.py`
 - [x] Implement `delete_skill(name)` with soft-delete to `.deleted/` and collision-safe renaming
-- [x] Add `_SkillAddDialog`, `_SkillAppendDialog`, `_SkillDeleteDialog` to `panel.py`
-- [x] Add **Skills** menu with three items between **Tools** and **Server**
 - [x] Unit tests: 22 tests in `tests/unit/tools/test_skill_management.py`
 - [x] Integration tests: 12 tests in `tests/integration/test_skill_management_integration.py`
 - [x] Full lifecycle test: add → list → get → append → get → delete → verify in `.deleted/`
