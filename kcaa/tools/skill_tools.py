@@ -100,7 +100,8 @@ def _find_skill_file(name: str) -> Path | None:
         try:
             meta, _ = _parse_front_matter(path.read_text(encoding="utf-8"))
         except Exception:
-            continue
+            log.warning("Failed to parse skill file %s", path)
+            continue  # nosec B112 — intentionally skip unparseable files
         candidate = meta.get("name") or path.stem
         if candidate == name:
             return path
