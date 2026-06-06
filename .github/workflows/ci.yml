@@ -93,6 +93,40 @@ jobs:
     - name: Run security scan
       run: uv run bandit -r kcaa/ kicad_plugin/
 
+  test-windows:
+    runs-on: windows-latest
+    name: Test Windows (integration)
+    env:
+      KICAD_MCP_PROFILE: "plugin"
+      KICAD_VERSION: "10"
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v4
+      with:
+        enable-cache: true
+
+    - name: Set up Python 3.12
+      run: |
+        uv python install 3.12
+        uv python pin 3.12
+
+    - name: Install dependencies
+      run: uv sync --group dev
+
+    - name: Install Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: "20"
+
+    - name: Install jsdom
+      run: npm install jsdom
+
+    - name: Run integration tests
+      run: uv run python -m pytest tests/integration/ -v --tb=short -o "addopts="
+
   build:
     runs-on: ubuntu-latest
     name: Build Package
