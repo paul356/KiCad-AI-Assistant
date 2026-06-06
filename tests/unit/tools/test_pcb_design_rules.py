@@ -123,21 +123,17 @@ class TestGetDesignRules:
         assert result["rules"]["silk_clearance"] == 0.15
 
     def test_no_setup_section(self, tmp_path):
-        """When setup section is missing, returns empty rules."""
+        """When setup section is missing, returns empty rules (no defaults available)."""
         pcb = _write_pcb(_PCB_NO_SETUP, str(tmp_path))
-
         result = get_design_rules_from_file(pcb)
-
         assert result["success"] is True
         assert result["rules"] == {}
         assert "No (setup" in result.get("message", "")
 
     def test_no_design_rules_subsection(self, tmp_path):
-        """When design_rules subsection is missing, returns empty."""
+        """When design_rules subsection is missing, returns empty rules (no defaults available)."""
         pcb = _write_pcb(_PCB_SETUP_NO_DR, str(tmp_path))
-
         result = get_design_rules_from_file(pcb)
-
         assert result["success"] is True
         assert result["rules"] == {}
         assert "No (design_rules" in result.get("message", "")

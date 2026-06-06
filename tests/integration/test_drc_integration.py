@@ -89,13 +89,16 @@ class TestDesignRulesToAutorouter:
         assert rules["copper_edge_clearance"] == 0.5
 
     def test_no_design_rules_still_succeeds(self, tmp_path):
-        from kcaa.tools.drc_impl.pcb_design_rules import get_design_rules_from_file
+        from kcaa.tools.drc_impl.pcb_design_rules import (
+            get_design_rules_from_file,
+        )
 
         pcb_path = tmp_path / "empty.kicad_pcb"
         pcb_path.write_text("(kicad_pcb (version 20240108))\n")
 
         result = get_design_rules_from_file(str(pcb_path))
         assert result["success"]
+        # No plugin-exported defaults file in test → empty rules
         assert result["rules"] == {}
 
     def test_null_clearance_does_not_crash_autorouter(self, tmp_path):
@@ -369,7 +372,8 @@ class TestAutorouterWithDesignRules:
             assert cmd[dr_idx + 1] == "0.25"
 
     def test_missing_clearance_no_dr_flag(self, tmp_path):
-        """When min_clearance is not in the PCB, no -dr flag is added."""
+        """When min_clearance is not in the PCB and no defaults file exists,
+        autorouter does NOT pass -dr flag (safe default)."""
         from kcaa.tools.drc_impl.pcb_design_rules import get_design_rules_from_file
         from kicad_plugin.autorouter import _run_subprocess
 
@@ -380,7 +384,7 @@ class TestAutorouterWithDesignRules:
         dr_result = get_design_rules_from_file(str(pcb_path))
         assert dr_result["success"]
         clearance_mm = dr_result["rules"].get("min_clearance")
-        assert clearance_mm is None
+        assert clearance_mm is None  # no defaults file → None
 
         dsn = tmp_path / "noclear.dsn"
         ses = tmp_path / "noclear.ses"
@@ -401,7 +405,7 @@ class TestAutorouterWithDesignRules:
             _run_subprocess(str(dsn), str(ses), None, None, 50, clearance_mm=clearance_mm)
 
             cmd = mock_run.call_args[0][0]
-            assert "-dr" not in cmd
+            assert "-dr" not in cmd  # no defaults → no -dr flag
 
 
 # ---------------------------------------------------------------------------

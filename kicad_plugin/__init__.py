@@ -79,6 +79,55 @@ except ImportError:
     log.warning("wx not available — plugin running outside KiCad (dev mode)")
 
 
+def _export_design_defaults() -> None:
+    """Extract KiCad's default board design rules from pcbnew and persist them.
+
+    Writes ``design-defaults.json`` into the kcaa data directory (the same
+    directory used for logs and plugin settings) so the MCP server can read
+    KiCad's real default values without importing pcbnew.
+    """
+    if not _IN_KICAD:
+        return
+    try:
+        import json as _json
+
+        board = _pcbnew.BOARD()
+        settings = board.GetDesignSettings()
+
+        _FIELD_MAP = {
+            "min_clearance": "m_MinClearance",
+            "min_groove_width": "m_MinGrooveWidth",
+            "min_connection_width": "m_MinConn",
+            "min_track_width": "m_TrackMinWidth",
+            "min_via_annular_width": "m_ViasMinAnnularWidth",
+            "min_via_size": "m_ViasMinSize",
+            "min_through_drill": "m_MinThroughDrill",
+            "min_microvia_size": "m_MicroViasMinSize",
+            "min_microvia_drill": "m_MicroViasMinDrill",
+            "copper_edge_clearance": "m_CopperEdgeClearance",
+            "hole_clearance": "m_HoleClearance",
+            "hole_to_hole_min": "m_HoleToHoleMin",
+            "silk_clearance": "m_SilkClearance",
+            "min_silk_text_height": "m_MinSilkTextHeight",
+            "min_silk_text_thickness": "m_MinSilkTextThickness",
+        }
+        defaults = {}
+        for key, attr in _FIELD_MAP.items():
+            defaults[key] = _pcbnew.ToMM(getattr(settings, attr))
+        defaults["min_resolved_spokes"] = int(settings.m_MinResolvedSpokes)
+
+        from .settings import _get_kcaa_data_dir
+
+        defaults_dir = _get_kcaa_data_dir()
+        defaults_path = os.path.join(defaults_dir, "design-defaults.json")
+        os.makedirs(defaults_dir, exist_ok=True)
+        with open(defaults_path, "w", encoding="utf-8") as f:
+            _json.dump(defaults, f, indent=2)
+        log.info("Exported KiCad design defaults to %s", defaults_path)
+    except Exception as exc:
+        log.warning("Could not export KiCad design defaults: %s", exc)
+
+
 def _plugin_dir() -> str:
     return os.path.dirname(os.path.abspath(__file__))
 
@@ -159,5 +208,7 @@ class KiCadAIPlugin(_ActionPluginBase):
 # ---------------------------------------------------------------------------
 # KiCad auto-discovery: instantiate and register when the module is loaded
 # ---------------------------------------------------------------------------
+_export_design_defaults()
+
 plugin = KiCadAIPlugin()
 plugin.register()

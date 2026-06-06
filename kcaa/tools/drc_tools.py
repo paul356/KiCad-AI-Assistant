@@ -154,12 +154,17 @@ def register_drc_tools(mcp: FastMCP) -> None:
         etc. from the PCB file's ``(setup (design_rules ...))`` section.
         No KiCad process is required.
 
+        When the PCB has no custom design rules (the default for a new
+        board), defaults exported by the plugin from the running KiCad
+        instance are returned if available.
+
         Args:
             project_path: Path to the KiCad project file (.kicad_pro)
 
         Returns:
             Dictionary with ``rules`` key containing constraint name→value
-            pairs in millimeters.
+            pairs in millimeters.  When no custom rules exist and KiCad
+            defaults are available, ``"defaults_used": True`` is set.
         """
         if not os.path.exists(project_path):
             return {"success": False, "error": f"Project not found: {project_path}"}

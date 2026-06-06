@@ -6,8 +6,10 @@ Reads and writes the ``(setup (design_rules ...))`` and
 No KiCad process or kicad-cli is required — all operations are file-based.
 """
 
+import json as _json
 import logging
 import os
+import platform as _platform
 from typing import Any
 
 import sexpdata
@@ -42,6 +44,46 @@ _DESIGN_RULE_FIELDS = frozenset(
 )
 
 
+def _get_design_defaults_path() -> str:
+    """Return the path to the design defaults file in the kcaa data directory.
+
+    Tries ``kcaa.utils.config.config.get_kcaa_data_dir()`` first (available
+    when the MCP server is running).  Falls back to detecting the directory
+    from the ``KICAD_VERSION`` environment variable and platform.
+    """
+    try:
+        from kcaa.utils.config import config as _config
+
+        return os.path.join(_config.get_kcaa_data_dir(), "design-defaults.json")
+    except Exception:
+        pass
+
+    version = os.environ.get("KICAD_VERSION")
+    if not version:
+        # Try KICAD{N}_* variables (set inside KiCad)
+        for key in os.environ:
+            if key.startswith("KICAD") and "_" in key:
+                major = key[5:].split("_")[0]
+                if major.isdigit():
+                    version = f"{major}.0"
+                    break
+
+    if version:
+        system = _platform.system()
+        if system == "Darwin":
+            base = os.path.expanduser(f"~/Library/Preferences/kicad/{version}")
+        elif system == "Windows":
+            base = os.path.join(
+                os.environ.get("APPDATA", os.path.expanduser("~")), "kicad", version
+            )
+        else:
+            base = os.path.expanduser(f"~/.config/kicad/{version}")
+        return os.path.join(base, "kcaa", "design-defaults.json")
+
+    # Last resort: try the plugin's fixed path under ~/.kicad-mcp/
+    return os.path.join(os.path.expanduser("~"), ".kicad-mcp", "design-defaults.json")
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -74,12 +116,18 @@ def _str_symbol(val: Any) -> str:
 def get_design_rules_from_file(pcb_file: str) -> dict[str, Any]:
     """Read board-level design rules from a ``.kicad_pcb`` file.
 
+    When the PCB file has no custom design rules (the default for a new
+    board in KiCad), this function looks for real KiCad defaults that the
+    plugin exported to ``~/.kicad-mcp/design-defaults.json`` at startup.
+    If that file exists the defaults are returned with
+    ``"defaults_used": True``; otherwise an empty ``rules`` dict is returned.
+
     Args:
         pcb_file: Absolute path to the ``.kicad_pcb`` file.
 
     Returns:
-        ``{"success": True, "rules": {...}, ...}`` on success, or an
-        error dict with ``"success": False``.
+        ``{"success": True, "rules": {...}}`` on success.  On error,
+        ``{"success": False}``.
     """
     try:
         tree = load_pcb(pcb_file)
@@ -88,15 +136,11 @@ def get_design_rules_from_file(pcb_file: str) -> dict[str, Any]:
 
     setup = _find_section(tree, "setup")
     if setup is None:
-        return {
-            "success": True,
-            "rules": {},
-            "message": "No (setup ...) section found in PCB file.",
-        }
+        return _load_exported_defaults("No (setup ...) section found in PCB file.")
 
     dr_section = _find_section(setup, "design_rules")
     if dr_section is None:
-        return {"success": True, "rules": {}, "message": "No (design_rules ...) subsection found."}
+        return _load_exported_defaults("No (design_rules ...) subsection found.")
 
     rules: dict[str, float] = {}
     for item in dr_section[1:]:
@@ -108,7 +152,34 @@ def get_design_rules_from_file(pcb_file: str) -> dict[str, Any]:
                 except (ValueError, TypeError):
                     pass
 
+    if not rules:
+        return _load_exported_defaults("No design rules found in the (design_rules ...) section.")
+
     return {"success": True, "rules": rules}
+
+
+def _load_exported_defaults(message: str) -> dict[str, Any]:
+    """Try to load KiCad defaults from the file the plugin exports at startup.
+
+    When the file doesn't exist (KiCad not running, or plugin hasn't
+    exported yet), return an empty rules dict so the caller knows no
+    meaningful defaults are available.
+    """
+    try:
+        with open(_get_design_defaults_path(), encoding="utf-8") as f:
+            rules = _json.load(f)
+        return {
+            "success": True,
+            "rules": rules,
+            "defaults_used": True,
+            "message": f"{message} Loaded KiCad defaults from plugin export.",
+        }
+    except (FileNotFoundError, _json.JSONDecodeError, PermissionError) as exc:
+        return {
+            "success": True,
+            "rules": {},
+            "message": f"{message} No KiCad defaults available ({exc}).",
+        }
 
 
 def update_design_rules_in_file(pcb_file: str, updates: dict[str, float]) -> dict[str, Any]:
