@@ -125,7 +125,7 @@ jobs:
       run: npm install jsdom
 
     - name: Run integration tests
-      run: uv run python -m pytest tests/integration/ -v --tb=short
+      run: uv run python -m pytest tests/integration/ -v --tb=short -o "addopts="
 
   build:
     runs-on: ubuntu-latest
