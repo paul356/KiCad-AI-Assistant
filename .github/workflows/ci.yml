@@ -98,6 +98,7 @@ jobs:
     name: Test Windows (integration)
     env:
       KICAD_MCP_PROFILE: "plugin"
+      KICAD_VERSION: "10"
 
     steps:
     - uses: actions/checkout@v4
