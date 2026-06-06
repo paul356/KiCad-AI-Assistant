@@ -269,6 +269,38 @@ TOOL_POLICIES: dict[str, ToolPolicy] = {
         auto_snapshot=True,
         mark_dirty=True,
     ),
+    # DRC tools
+    "get_drc_history_tool": ToolPolicy(kind="query"),
+    "run_drc_check": ToolPolicy(
+        kind="ipc_action",
+        path_arg="project_path",
+    ),
+    "get_design_rules": ToolPolicy(
+        kind="query",
+        path_arg="project_path",
+    ),
+    "set_design_rules": ToolPolicy(
+        kind="file_mutation",
+        path_arg="project_path",
+        auto_snapshot=True,
+        mark_dirty=True,
+    ),
+    "list_custom_rules": ToolPolicy(
+        kind="query",
+        path_arg="project_path",
+    ),
+    "add_custom_rule": ToolPolicy(
+        kind="file_mutation",
+        path_arg="project_path",
+        auto_snapshot=True,
+        mark_dirty=True,
+    ),
+    "restore_design_rules": ToolPolicy(
+        kind="file_mutation",
+        path_arg="backup_path",
+        auto_snapshot=True,
+        mark_dirty=True,
+    ),
     # Skill tools
     "list_skills": ToolPolicy(kind="query"),
     "get_skill": ToolPolicy(kind="query"),
