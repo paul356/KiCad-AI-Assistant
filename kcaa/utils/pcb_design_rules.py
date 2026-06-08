@@ -115,7 +115,7 @@ def get_effective_design_rules_from_file(pcb_file: str) -> dict[str, Any]:
 
     Returns a unified view with three sections:
 
-    * ``board_constraints`` — global minimums from the PCB file's
+    * ``design_rules`` — global minimums from the PCB file's
       ``(design_rules ...)`` section.  These apply to **all** objects.
     * ``net_classes`` — per-netclass working values from the project's
       ``.kicad_pro`` file.  Each net class has its own clearance,
@@ -127,13 +127,13 @@ def get_effective_design_rules_from_file(pcb_file: str) -> dict[str, Any]:
     any one of them triggers an error.
 
     When the PCB file has no ``(design_rules ...)`` section, defaults
-    exported by the plugin are used for ``board_constraints``.
+    exported by the plugin are used for ``design_rules``.
 
     Args:
         pcb_file: Absolute path to the ``.kicad_pcb`` file.
 
     Returns:
-        ``{"success": True, "board_constraints": {...},
+        ``{"success": True, "design_rules": {...},
           "net_classes": [...], "custom_rules": [...]}`` on success.
     """
     result: dict[str, Any] = {"success": True}
@@ -163,18 +163,18 @@ def get_effective_design_rules_from_file(pcb_file: str) -> dict[str, Any]:
                 except (ValueError, TypeError):
                     pass
         if bc:
-            result["board_constraints"] = bc
+            result["design_rules"] = bc
         else:
-            result["board_constraints"] = {}
+            result["design_rules"] = {}
             notes.append("No design rules found; using plugin defaults if available.")
     else:
         fallback = _load_exported_defaults("No (design_rules ...) section found in PCB file.")
         if fallback.get("defaults_used"):
-            result["board_constraints"] = fallback["rules"]
-            result["defaults_used"] = True
+            result["design_rules"] = fallback["rules"]
+            result["design_rules"]["defaults_used"] = True
             notes.append(fallback["message"])
         else:
-            result["board_constraints"] = {}
+            result["design_rules"] = {}
             notes.append(fallback["message"])
 
     # 2. Net classes from .kicad_pro
@@ -201,7 +201,7 @@ def get_effective_design_rules_from_file(pcb_file: str) -> dict[str, Any]:
         0,
         (
             "Three layers checked independently: "
-            "(1) board_constraints — global hard minimums, apply to all objects; "
+            "(1) design_rules — global hard minimums, apply to all objects; "
             "(2) net_classes — per-net working values, checked on top of board minimums "
             "(net class values can be stricter but not looser than board constraints); "
             "(3) custom_rules — conditional DRC rules that can override or augment "

@@ -110,7 +110,7 @@ def register_drc_tools(mcp: FastMCP) -> None:
 
         Returns a unified view with three sections:
 
-        * ``board_constraints`` — global minimums (clearance, track width,
+        * ``design_rules`` — global minimums (clearance, track width,
           via sizes, etc.) from the PCB file's design rules. These are
           checked against **all** objects during DRC.
         * ``net_classes`` — per-netclass working values (clearance, track
@@ -124,7 +124,7 @@ def register_drc_tools(mcp: FastMCP) -> None:
             project_path: Path to the KiCad project file (.kicad_pro)
 
         Returns:
-            Dictionary with ``board_constraints``, ``net_classes``,
+            Dictionary with ``design_rules``, ``net_classes``,
             and ``custom_rules`` keys.
         """
         if not os.path.exists(project_path):

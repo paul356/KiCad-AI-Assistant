@@ -113,13 +113,13 @@ class TestGetEffectiveDesignRules:
         result = get_effective_design_rules_from_file(pcb)
 
         assert result["success"] is True
-        assert result["board_constraints"]["min_clearance"] == 0.2
-        assert result["board_constraints"]["min_track_width"] == 0.15
-        assert result["board_constraints"]["min_via_size"] == 0.6
-        assert result["board_constraints"]["min_through_drill"] == 0.3
-        assert result["board_constraints"]["copper_edge_clearance"] == 0.5
-        assert result["board_constraints"]["hole_clearance"] == 0.25
-        assert result["board_constraints"]["silk_clearance"] == 0.15
+        assert result["design_rules"]["min_clearance"] == 0.2
+        assert result["design_rules"]["min_track_width"] == 0.15
+        assert result["design_rules"]["min_via_size"] == 0.6
+        assert result["design_rules"]["min_through_drill"] == 0.3
+        assert result["design_rules"]["copper_edge_clearance"] == 0.5
+        assert result["design_rules"]["hole_clearance"] == 0.25
+        assert result["design_rules"]["silk_clearance"] == 0.15
 
     def test_no_setup_section(self, tmp_path):
         """When setup section is missing, returns empty rules (no defaults available)."""
@@ -128,7 +128,7 @@ class TestGetEffectiveDesignRules:
         assert result["success"] is True
         assert result["success"] is True
         # With design-defaults.json on disk, defaults are loaded
-        assert result.get("defaults_used") or "board_constraints" in result
+        assert result.get("design_rules", {}).get("defaults_used") or "design_rules" in result
         assert "note" in result
 
     def test_no_design_rules_subsection(self, tmp_path):
@@ -138,7 +138,7 @@ class TestGetEffectiveDesignRules:
         assert result["success"] is True
         assert result["success"] is True
         # With design-defaults.json on disk, defaults are loaded
-        assert result.get("defaults_used") or "board_constraints" in result
+        assert result.get("design_rules", {}).get("defaults_used") or "design_rules" in result
         assert "note" in result
 
     def test_file_not_found(self):
@@ -166,8 +166,8 @@ class TestGetEffectiveDesignRules:
         result = get_effective_design_rules_from_file(pcb)
 
         assert result["success"] is True
-        assert result["board_constraints"]["min_clearance"] == 0.2
-        assert "unknown_field" not in result["board_constraints"]
+        assert result["design_rules"]["min_clearance"] == 0.2
+        assert "unknown_field" not in result["design_rules"]
 
 
 # ---------------------------------------------------------------------------
@@ -192,9 +192,9 @@ class TestUpdateDesignRules:
 
         # Re-read and verify
         rules = get_effective_design_rules_from_file(pcb)
-        assert rules["board_constraints"]["min_clearance"] == 0.35
+        assert rules["design_rules"]["min_clearance"] == 0.35
         # Unchanged fields stay the same
-        assert rules["board_constraints"]["min_track_width"] == 0.15
+        assert rules["design_rules"]["min_track_width"] == 0.15
 
     def test_updates_multiple_fields(self, tmp_path):
         """Multiple fields can be updated in one call."""
@@ -207,8 +207,8 @@ class TestUpdateDesignRules:
         assert len(result["updated"]) == 2
 
         rules = get_effective_design_rules_from_file(pcb)
-        assert rules["board_constraints"]["min_clearance"] == 0.5
-        assert rules["board_constraints"]["min_track_width"] == 0.3
+        assert rules["design_rules"]["min_clearance"] == 0.5
+        assert rules["design_rules"]["min_track_width"] == 0.3
 
     def test_rejects_invalid_fields(self, tmp_path):
         """Unknown field names are rejected with an error."""
@@ -230,7 +230,7 @@ class TestUpdateDesignRules:
         assert os.path.exists(bak)
         # Backup contains original value
         rules = get_effective_design_rules_from_file(bak)
-        assert rules["board_constraints"]["min_clearance"] == 0.2
+        assert rules["design_rules"]["min_clearance"] == 0.2
 
     def test_no_design_rules_section(self, tmp_path):
         """Error when there's no design_rules to update."""

@@ -1081,7 +1081,7 @@ if _WX_AVAILABLE:
 
                     dr_result = get_effective_design_rules_from_file(board_path)
                     if dr_result.get("success"):
-                        rules = dr_result.get("board_constraints", {})
+                        rules = dr_result.get("design_rules", {})
                         min_clear = rules.get("min_clearance")
                         min_track = rules.get("min_track_width")
                         ce_clear = rules.get("copper_edge_clearance")
