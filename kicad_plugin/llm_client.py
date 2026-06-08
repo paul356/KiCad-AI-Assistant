@@ -1184,6 +1184,11 @@ class LLMClient:
                 state.snapshotted_paths.add(path)
 
         result = call_mcp_tool(self._mcp_base_url, tool_name, args)
+
+        # Run plugin-side post-process hook (e.g. DRC marker reading via pcbnew)
+        if policy.post_process is not None:
+            result = policy.post_process(result)
+
         self._emit_tool_callback(on_tool_call, tool_name, args, result)
 
         if not self._tool_result_succeeded(result):

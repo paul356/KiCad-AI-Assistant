@@ -1,15 +1,14 @@
 """
-Design rules parsing from KiCad PCB S-expression files (.kicad_pcb).
+Design rules parsing from KiCad project files (.kicad_pro).
 
-Reads and writes the ``(setup (design_rules ...))`` and
-``(setup (custom_rules ...))`` sections via the sexpdata library.
-No KiCad process or kicad-cli is required — all operations are file-based.
+KiCad 10.0 moved board-level design rules from ``.kicad_pcb`` s-expressions
+into ``.kicad_pro`` JSON under ``board.design_settings.rules``.
+This module reads and writes that section directly — no KiCad process
+or kicad-cli is required.
 """
 
 import json as _json
 import logging
-import os
-import platform as _platform
 from typing import Any
 
 import sexpdata
@@ -19,52 +18,14 @@ from kcaa.utils.pcb_sexp_utils import load_pcb, save_pcb
 log = logging.getLogger(__name__)
 
 
-def _get_design_defaults_path() -> str:
-    """Return the path to the design defaults file in the kcaa data directory.
-
-    Tries ``kcaa.utils.config.config.get_kcaa_data_dir()`` first (available
-    when the MCP server is running).  Falls back to detecting the directory
-    from the ``KICAD_VERSION`` environment variable and platform.
-    """
-    try:
-        from kcaa.utils.config import config as _config
-
-        return os.path.join(_config.get_kcaa_data_dir(), "design-defaults.json")
-    except Exception:
-        pass
-
-    version = os.environ.get("KICAD_VERSION")
-    if not version:
-        # Try KICAD{N}_* variables (set inside KiCad)
-        for key in os.environ:
-            if key.startswith("KICAD") and "_" in key:
-                major = key[5:].split("_")[0]
-                if major.isdigit():
-                    version = f"{major}.0"
-                    break
-
-    if version:
-        system = _platform.system()
-        if system == "Darwin":
-            base = os.path.expanduser(f"~/Library/Preferences/kicad/{version}")
-        elif system == "Windows":
-            base = os.path.join(
-                os.environ.get("APPDATA", os.path.expanduser("~")), "kicad", version
-            )
-        else:
-            base = os.path.expanduser(f"~/.config/kicad/{version}")
-        return os.path.join(base, "kcaa", "design-defaults.json")
-
-    return None
-
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-# Known design-rule field names (sexp tags inside (design_rules ...)).
-# Must match the keys exported by the plugin's _export_design_defaults().
-_DESIGN_RULE_FIELDS = frozenset(
+# User-facing field names (MCP API) — these are the names the LLM sees.
+# They map to the KiCad 10.0 ``board.design_settings.rules`` keys
+# in the ``.kicad_pro`` JSON file.
+_USER_FACING_DESIGN_RULE_FIELDS = frozenset(
     {
         "min_clearance",
         "min_groove_width",
@@ -84,6 +45,29 @@ _DESIGN_RULE_FIELDS = frozenset(
         "min_silk_text_thickness",
     }
 )
+
+# Map user-facing name → KiCad 10.0 ``board.design_settings.rules`` JSON key.
+_DESIGN_RULE_FIELD_MAP: dict[str, str] = {
+    "min_clearance": "min_clearance",
+    "min_groove_width": "min_groove_width",
+    "min_connection_width": "min_connection",
+    "min_track_width": "min_track_width",
+    "min_via_annular_width": "min_via_annular_width",
+    "min_via_size": "min_via_diameter",
+    "min_through_drill": "min_through_hole_diameter",
+    "min_microvia_size": "min_microvia_diameter",
+    "min_microvia_drill": "min_microvia_drill",
+    "copper_edge_clearance": "min_copper_edge_clearance",
+    "hole_clearance": "min_hole_clearance",
+    "hole_to_hole_min": "min_hole_to_hole",
+    "silk_clearance": "min_silk_clearance",
+    "min_resolved_spokes": "min_resolved_spokes",
+    "min_silk_text_height": "min_text_height",
+    "min_silk_text_thickness": "min_text_thickness",
+}
+
+# Reverse map: KiCad 10.0 key → user-facing name (for read-back).
+_PRO_KEY_TO_USER: dict[str, str] = {v: k for k, v in _DESIGN_RULE_FIELD_MAP.items()}
 
 
 def _find_section(tree: list[Any], tag: str) -> list[Any] | None:
@@ -111,23 +95,19 @@ def _str_symbol(val: Any) -> str:
 
 
 def get_effective_design_rules_from_file(pcb_file: str) -> dict[str, Any]:
-    """Read all design rules and net classes for a PCB from file.
+    """Read all design rules and net classes for a PCB from its project file.
 
     Returns a unified view with three sections:
 
-    * ``design_rules`` — global minimums from the PCB file's
-      ``(design_rules ...)`` section.  These apply to **all** objects.
+    * ``design_rules`` — global minimums from the project's
+      ``board.design_settings.rules`` in ``.kicad_pro`` (KiCad 10.0+).
     * ``net_classes`` — per-netclass working values from the project's
-      ``.kicad_pro`` file.  Each net class has its own clearance,
-      track width, via sizes, and diff-pair dimensions.
+      ``net_settings.classes``.
     * ``custom_rules`` — additional conditional constraints from the
-      ``(custom_rules ...)`` section.
+      PCB file's ``(custom_rules ...)`` sexp section.
 
     All three layers are checked independently during DRC — violating
     any one of them triggers an error.
-
-    When the PCB file has no ``(design_rules ...)`` section, defaults
-    exported by the plugin are used for ``design_rules``.
 
     Args:
         pcb_file: Absolute path to the ``.kicad_pcb`` file.
@@ -139,46 +119,32 @@ def get_effective_design_rules_from_file(pcb_file: str) -> dict[str, Any]:
     result: dict[str, Any] = {"success": True}
     notes: list[str] = []
 
-    # 1. Board constraints from .kicad_pcb sexp
+    pro_file = pcb_file.replace(".kicad_pcb", ".kicad_pro")
+
+    # 1. Board constraints from .kicad_pro JSON
     try:
-        tree = load_pcb(pcb_file)
-    except (FileNotFoundError, ValueError) as exc:
-        return {"success": False, "error": str(exc)}
+        with open(pro_file, encoding="utf-8") as f:
+            pro_data = _json.load(f)
+    except (FileNotFoundError, _json.JSONDecodeError, PermissionError) as exc:
+        return {"success": False, "error": f"Cannot read project file: {exc}"}
 
-    setup = _find_section(tree, "setup")
-    if setup is not None:
-        dr_section = _find_section(setup, "design_rules")
-    else:
-        dr_section = None
-
-    if dr_section is not None:
+    rules_raw = pro_data.get("board", {}).get("design_settings", {}).get("rules")
+    if isinstance(rules_raw, dict):
         bc: dict[str, float] = {}
-        for item in dr_section[1:]:
-            if isinstance(item, list) and len(item) >= 2:
-                field_name = _str_symbol(item[0])
-                if field_name not in _DESIGN_RULE_FIELDS:
-                    continue
-                try:
-                    bc[field_name] = float(item[1])
-                except (ValueError, TypeError):
-                    pass
+        for pro_key, value in rules_raw.items():
+            if isinstance(value, int | float | bool):
+                user_key = _PRO_KEY_TO_USER.get(pro_key)
+                if user_key is not None:
+                    bc[user_key] = float(value)
         if bc:
             result["design_rules"] = bc
         else:
             result["design_rules"] = {}
-            notes.append("No design rules found; using plugin defaults if available.")
     else:
-        fallback = _load_exported_defaults("No (design_rules ...) section found in PCB file.")
-        if fallback.get("defaults_used"):
-            result["design_rules"] = fallback["rules"]
-            result["design_rules"]["defaults_used"] = True
-            notes.append(fallback["message"])
-        else:
-            result["design_rules"] = {}
-            notes.append(fallback["message"])
+        result["design_rules"] = {}
+        notes.append("No board.design_settings.rules found in project file.")
 
     # 2. Net classes from .kicad_pro
-    pro_file = pcb_file.replace(".kicad_pcb", ".kicad_pro")
     try:
         from kcaa.utils.net_settings import get_net_classes_from_pro
 
@@ -215,83 +181,83 @@ def get_effective_design_rules_from_file(pcb_file: str) -> dict[str, Any]:
     return result
 
 
-def _load_exported_defaults(message: str) -> dict[str, Any]:
-    """Try to load KiCad defaults from the file the plugin exports at startup.
-
-    When the file doesn't exist (KiCad not running, or plugin hasn't
-    exported yet), return an empty rules dict so the caller knows no
-    meaningful defaults are available.
-    """
-    try:
-        with open(_get_design_defaults_path(), encoding="utf-8") as f:
-            rules = _json.load(f)
-        return {
-            "success": True,
-            "rules": rules,
-            "defaults_used": True,
-            "message": f"{message} Loaded KiCad defaults from plugin export.",
-        }
-    except (FileNotFoundError, _json.JSONDecodeError, PermissionError, TypeError) as exc:
-        return {
-            "success": True,
-            "rules": {},
-            "message": f"{message} No KiCad defaults available ({exc}).",
-        }
-
-
-def update_design_rules_in_file(pcb_file: str, updates: dict[str, float]) -> dict[str, Any]:
-    """Update specific design-rule values in a ``.kicad_pcb`` file.
+def update_design_rules_in_file(pro_file: str, updates: dict[str, float]) -> dict[str, Any]:
+    """Update board-level design rule values in the ``.kicad_pro`` project file.
 
     Only fields present in *updates* are modified; all other fields
     and the rest of the file are left untouched.  A ``.bak`` backup
     is created automatically.
 
+    Design rules are stored in ``board.design_settings.rules`` in the
+    project file (KiCad 10.0+ format).
+
     Args:
-        pcb_file: Absolute path to the ``.kicad_pcb`` file.
-        updates: Mapping of field names (e.g. ``"min_clearance"``) to
-                 new values in millimeters.
+        pro_file: Absolute path to the ``.kicad_pro`` file.
+        updates: Mapping of user-facing field names (e.g.
+                 ``"min_through_drill"``, ``"min_track_width"``)
+                 to new values in millimeters.
 
     Returns:
         ``{"success": True, "updated": [...], ...}`` or an error dict.
     """
-    # Validate field names against the known set
-    invalid = [k for k in updates if k not in _DESIGN_RULE_FIELDS]
+    # Validate field names
+    invalid = [k for k in updates if k not in _USER_FACING_DESIGN_RULE_FIELDS]
     if invalid:
         return {"success": False, "error": f"Unknown design rule fields: {', '.join(invalid)}"}
 
     try:
-        tree = load_pcb(pcb_file)
-    except (FileNotFoundError, ValueError) as exc:
-        return {"success": False, "error": str(exc)}
+        with open(pro_file, encoding="utf-8") as f:
+            data = _json.load(f)
+    except (FileNotFoundError, _json.JSONDecodeError, PermissionError) as exc:
+        return {"success": False, "error": f"Cannot read project file: {exc}"}
 
-    setup = _find_section(tree, "setup")
-    if setup is None:
-        return {"success": False, "error": "No (setup ...) section found in PCB file."}
+    board = data.get("board")
+    if not isinstance(board, dict):
+        return {"success": False, "error": "No 'board' section in project file."}
 
-    dr_section = _find_section(setup, "design_rules")
-    if dr_section is None:
-        return {"success": False, "error": "No (design_rules ...) subsection found in PCB file."}
+    ds = board.get("design_settings")
+    if not isinstance(ds, dict):
+        return {"success": False, "error": "No 'board.design_settings' section in project file."}
+
+    rules = ds.get("rules")
+    if not isinstance(rules, dict):
+        return {
+            "success": False,
+            "error": "No 'board.design_settings.rules' section in project file. "
+            "Open Board Setup in KiCad, adjust any value, and click OK to generate this section.",
+        }
 
     changed: list[str] = []
-    for i, item in enumerate(dr_section):
-        if not isinstance(item, list) or len(item) < 2:
-            continue
-        field_name = _str_symbol(item[0])
-        if field_name in updates:
-            old_val = item[1]
-            new_val = float(updates[field_name])
-            dr_section[i] = [sexpdata.Symbol(field_name), new_val]
-            changed.append(f"{field_name}: {old_val}mm → {new_val}mm")
+    for user_key, value in updates.items():
+        pro_key = _DESIGN_RULE_FIELD_MAP[user_key]
+        old_val = rules.get(pro_key)
+        rules[pro_key] = float(value)
+        changed.append(f"{user_key}: {old_val}mm → {value}mm")
 
     if not changed:
         return {"success": True, "updated": [], "message": "No matching fields found to update."}
 
-    try:
-        bak_path = save_pcb(pcb_file, tree)
-    except OSError as exc:
-        return {"success": False, "error": f"Failed to save PCB file: {exc}"}
+    import shutil
 
-    return {"success": True, "updated": changed, "backup_path": bak_path}
+    bak_path = pro_file + ".bak"
+    try:
+        shutil.copy2(pro_file, bak_path)
+    except OSError as exc:
+        return {"success": False, "error": f"Failed to create backup: {exc}"}
+
+    try:
+        with open(pro_file, "w", encoding="utf-8") as f:
+            _json.dump(data, f, indent=2)
+    except OSError as exc:
+        return {"success": False, "error": f"Failed to write project file: {exc}"}
+
+    log.info("Updated design rules in %s: %s", pro_file, changed)
+    return {
+        "success": True,
+        "updated": changed,
+        "backup_path": bak_path,
+        "warning": f"Changes saved to {pro_file}. Reopen the project in KiCad for design rules to take effect.",
+    }
 
 
 def get_custom_rules_from_file(pcb_file: str) -> dict[str, Any]:

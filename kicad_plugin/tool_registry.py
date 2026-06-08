@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 ToolKind = Literal["query", "file_mutation", "versioning", "ui_refresh", "ipc_action", "indexing"]
+
+# Signature for post-process hooks: (result_dict) -> result_dict
+PostProcessHook = Callable[[dict[str, Any]], dict[str, Any]]
 
 
 @dataclass(frozen=True)
@@ -18,6 +22,9 @@ class ToolPolicy:
     track_snapshot: bool = False
     mark_dirty: bool = False
     clear_dirty_paths_arg: str | None = None
+    # Optional hook run *after* the MCP tool returns, on the plugin side.
+    # Receives the MCP result dict; returns the (possibly modified) result.
+    post_process: PostProcessHook | None = None
 
 
 TOOL_POLICIES: dict[str, ToolPolicy] = {
@@ -284,7 +291,13 @@ TOOL_POLICIES: dict[str, ToolPolicy] = {
         auto_snapshot=True,
         mark_dirty=True,
     ),
-    "set_net_class": ToolPolicy(
+    "set_net_class_rules": ToolPolicy(
+        kind="file_mutation",
+        path_arg="project_path",
+        auto_snapshot=True,
+        mark_dirty=True,
+    ),
+    "assign_nets_to_class": ToolPolicy(
         kind="file_mutation",
         path_arg="project_path",
         auto_snapshot=True,

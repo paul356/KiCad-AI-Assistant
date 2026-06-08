@@ -651,7 +651,7 @@ class TestToolPolicyRegistry:
             "run_drc_check",
             "get_effective_design_rules",
             "set_design_rules",
-            "set_net_class",
+            "set_net_class_rules",
             "add_custom_rule",
             "del_custom_rule",
         }

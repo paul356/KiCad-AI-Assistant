@@ -159,7 +159,8 @@ class TestDRCToolRegistration:
             "run_drc_check",
             "get_effective_design_rules",
             "set_design_rules",
-            "set_net_class",
+            "set_net_class_rules",
+            "assign_nets_to_class",
             "add_custom_rule",
             "del_custom_rule",
         }

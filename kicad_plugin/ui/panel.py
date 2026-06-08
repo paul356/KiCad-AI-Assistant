@@ -1259,7 +1259,6 @@ if _WX_AVAILABLE:
             Performs ImportSpecctraSES + Refresh here so that all pcbnew UI
             operations stay on the main thread, preventing the blank-view bug.
             """
-            import shutil
 
             try:
                 if success and os.path.isfile(ses_path):
@@ -1279,7 +1278,8 @@ if _WX_AVAILABLE:
                         message = f"SES import failed: {exc}"
                         log.error("autoroute: SES import error: %s", exc)
             finally:
-                shutil.rmtree(tmp_dir, ignore_errors=True)
+                # shutil.rmtree(tmp_dir, ignore_errors=True)
+                log.info("autoroute: temp dir preserved at %s", tmp_dir)
 
             # ---- Restore menu item and status bar ----
             self.GetMenuBar().Enable(self._menu_autoroute_id, True)

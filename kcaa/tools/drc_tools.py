@@ -9,12 +9,11 @@ from typing import Any
 
 from fastmcp import Context, FastMCP
 
-from kcaa.utils.drc_history import compare_with_previous, save_drc_result
 from kcaa.utils.file_utils import get_project_files
 
 # Import implementations
 from kcaa.utils.ipc_drc import run_drc_via_ipc
-from kcaa.utils.net_settings import set_net_class_in_pro
+from kcaa.utils.net_settings import assign_nets_to_class_in_pro, set_net_class_in_pro
 from kcaa.utils.pcb_design_rules import (
     add_custom_rule_to_file,
     get_effective_design_rules_from_file,
@@ -32,77 +31,27 @@ def register_drc_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
     async def run_drc_check(project_path: str, ctx: Context | None) -> dict[str, Any]:
-        """Run a Design Rule Check on a KiCad PCB file.
+        """Open the Design Rules Checker dialog in KiCad.
+
+        Opens the DRC dialog via kipy IPC.  Click **Run DRC** in the
+        dialog to check for violations.  Results are displayed in the
+        dialog's list view.
 
         Args:
             project_path: Path to the KiCad project file (.kicad_pro)
             ctx: MCP context for progress reporting
 
         Returns:
-            Dictionary with DRC results and statistics
+            ``{"success": True}`` when the dialog was opened.
         """
-        print(f"Running DRC check for project: {project_path}")
-
         if not os.path.exists(project_path):
-            print(f"Project not found: {project_path}")
             return {"success": False, "error": f"Project not found: {project_path}"}
 
-        # Get PCB file from project
         files = get_project_files(project_path)
         if "pcb" not in files:
-            print("PCB file not found in project")
             return {"success": False, "error": "PCB file not found in project"}
 
-        pcb_file = files["pcb"]
-        print(f"Found PCB file: {pcb_file}")
-
-        # Report progress to user
-        if ctx:
-            await ctx.report_progress(10, 100)
-            ctx.info(f"Starting DRC check on {os.path.basename(pcb_file)}")
-
-        # Run DRC using IPC (kipy + pcbnew)
-        print("Using KiCad IPC for DRC")
-        if ctx:
-            ctx.info("Using KiCad IPC for DRC check...")
-        drc_results = await run_drc_via_ipc(pcb_file, ctx)
-
-        # Process and save results if successful
-        if drc_results and drc_results.get("success", False):
-            # logging.info(f"[DRC] DRC check successful for {pcb_file}. Saving results.") # <-- Remove log
-            # Save results to history
-            save_drc_result(project_path, drc_results)
-
-            # Add comparison with previous run
-            comparison = compare_with_previous(project_path, drc_results)
-            if comparison:
-                drc_results["comparison"] = comparison
-
-                if ctx:
-                    if comparison["change"] < 0:
-                        ctx.info(
-                            f"Great progress! You've fixed {abs(comparison['change'])} DRC violations since the last check."
-                        )
-                    elif comparison["change"] > 0:
-                        ctx.info(
-                            f"Found {comparison['change']} new DRC violations since the last check."
-                        )
-                    else:
-                        ctx.info("No change in the number of DRC violations since the last check.")
-        elif drc_results:
-            # logging.warning(f"[DRC] DRC check reported failure for {pcb_file}: {drc_results.get('error')}") # <-- Remove log
-            # Pass or print a warning if needed
-            pass
-        else:
-            # logging.error(f"[DRC] DRC check returned None for {pcb_file}") # <-- Remove log
-            # Pass or print an error if needed
-            pass
-
-        # Complete progress
-        if ctx:
-            await ctx.report_progress(100, 100)
-
-        return drc_results or {"success": False, "error": "DRC check failed with an unknown error"}
+        return await run_drc_via_ipc(files["pcb"], ctx)
 
     @mcp.tool()
     def get_effective_design_rules(project_path: str) -> dict[str, Any]:
@@ -144,7 +93,7 @@ def register_drc_tools(mcp: FastMCP) -> None:
         backup is created automatically.
 
         These are **global minimums** checked against all objects during
-        DRC.  To change per-netclass working values, use ``set_net_class``.
+        DRC.  To change per-netclass working values, use ``set_net_class_rules``.
 
         Args:
             project_path: Path to the KiCad project file (.kicad_pro)
@@ -156,14 +105,10 @@ def register_drc_tools(mcp: FastMCP) -> None:
         if not os.path.exists(project_path):
             return {"success": False, "error": f"Project not found: {project_path}"}
 
-        files = get_project_files(project_path)
-        if "pcb" not in files:
-            return {"success": False, "error": "PCB file not found in project"}
-
-        return update_design_rules_in_file(files["pcb"], rules)
+        return update_design_rules_in_file(project_path, rules)
 
     @mcp.tool()
-    def set_net_class(
+    def set_net_class_rules(
         project_path: str,
         class_name: str,
         updates: dict[str, float],
@@ -175,6 +120,11 @@ def register_drc_tools(mcp: FastMCP) -> None:
         **in addition to** the board-level minimums — violating either
         triggers a DRC error.
 
+        If the net class does not exist, it is **automatically created**
+        using the Default net class values as a baseline, then the provided
+        *updates* are applied on top.  Specify only the fields you want to
+        override — all others inherit from Default.
+
         Use ``get_design_rules`` to see current net class values before
         modifying.
 
@@ -184,16 +134,51 @@ def register_drc_tools(mcp: FastMCP) -> None:
 
         Args:
             project_path: Path to the KiCad project file (.kicad_pro)
-            class_name: Net class name (e.g. ``"Default"``)
+            class_name: Net class name (e.g. ``"Default"``, ``"HV"``)
             updates: Dict mapping field names to new values in millimeters.
 
         Returns:
             Dictionary with ``updated`` list of changes and ``backup_path``.
+            Includes ``"created": true`` when the net class was auto-created.
         """
         if not os.path.exists(project_path):
             return {"success": False, "error": f"Project not found: {project_path}"}
 
         return set_net_class_in_pro(project_path, class_name, updates)
+
+    @mcp.tool()
+    def assign_nets_to_class(
+        project_path: str,
+        class_name: str,
+        nets: list[str],
+    ) -> dict[str, Any]:
+        """Assign nets to a net class in the project file.
+
+        Adds exact-match entries to ``net_settings.netclass_patterns`` so each
+        listed net appears in the **Members** tab of Board Setup → Net Classes
+        and receives the class's design constraints (clearance, track width,
+        via size, etc.).
+
+        If a net was previously assigned to a different class, the old pattern
+        is **removed** (net is moved to the new class).
+
+        Nets already in the target class are silently skipped (returned in
+        ``existing``).  Use this after ``set_net_class_rules`` to make the
+        class constraints apply to specific nets.
+
+        Args:
+            project_path: Path to the KiCad project file (.kicad_pro)
+            class_name: Net class name to assign nets to (e.g. ``"VBUS"``)
+            nets: List of net names (e.g. ``["/tp4056/VBUS", "VCC_SYS"]``)
+
+        Returns:
+            Dictionary with ``assigned`` (newly assigned nets),
+            ``existing`` (already assigned), and ``backup_path``.
+        """
+        if not os.path.exists(project_path):
+            return {"success": False, "error": f"Project not found: {project_path}"}
+
+        return assign_nets_to_class_in_pro(project_path, class_name, nets)
 
     @mcp.tool()
     def add_custom_rule(
