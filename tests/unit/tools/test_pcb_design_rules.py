@@ -129,7 +129,7 @@ class TestGetEffectiveDesignRules:
         assert result["success"] is True
         # With design-defaults.json on disk, defaults are loaded
         assert result.get("defaults_used") or "board_constraints" in result
-        assert "board_constraints_note" in result
+        assert "note" in result
 
     def test_no_design_rules_subsection(self, tmp_path):
         """When design_rules subsection is missing, returns empty rules (no defaults available)."""
@@ -139,7 +139,7 @@ class TestGetEffectiveDesignRules:
         assert result["success"] is True
         # With design-defaults.json on disk, defaults are loaded
         assert result.get("defaults_used") or "board_constraints" in result
-        assert "board_constraints_note" in result
+        assert "note" in result
 
     def test_file_not_found(self):
         """Non-existent file returns error."""

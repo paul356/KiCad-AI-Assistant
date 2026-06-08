@@ -137,6 +137,7 @@ def get_effective_design_rules_from_file(pcb_file: str) -> dict[str, Any]:
           "net_classes": [...], "custom_rules": [...]}`` on success.
     """
     result: dict[str, Any] = {"success": True}
+    notes: list[str] = []
 
     # 1. Board constraints from .kicad_pcb sexp
     try:
@@ -165,18 +166,16 @@ def get_effective_design_rules_from_file(pcb_file: str) -> dict[str, Any]:
             result["board_constraints"] = bc
         else:
             result["board_constraints"] = {}
-            result["board_constraints_note"] = (
-                "No design rules found; using plugin defaults if available."
-            )
+            notes.append("No design rules found; using plugin defaults if available.")
     else:
         fallback = _load_exported_defaults("No (design_rules ...) section found in PCB file.")
         if fallback.get("defaults_used"):
             result["board_constraints"] = fallback["rules"]
             result["defaults_used"] = True
-            result["board_constraints_note"] = fallback["message"]
+            notes.append(fallback["message"])
         else:
             result["board_constraints"] = {}
-            result["board_constraints_note"] = fallback["message"]
+            notes.append(fallback["message"])
 
     # 2. Net classes from .kicad_pro
     pro_file = pcb_file.replace(".kicad_pcb", ".kicad_pro")
@@ -188,17 +187,17 @@ def get_effective_design_rules_from_file(pcb_file: str) -> dict[str, Any]:
             result["net_classes"] = nc_result.get("classes", [])
         else:
             result["net_classes"] = []
-            result["net_classes_note"] = nc_result.get("error", "Cannot read net classes")
+            notes.append(nc_result.get("error", "Cannot read net classes"))
     except Exception as exc:
         result["net_classes"] = []
-        result["net_classes_note"] = f"Cannot read net classes: {exc}"
+        notes.append(f"Cannot read net classes: {exc}")
 
     # 3. Custom rules from .kicad_pcb sexp
     cr_result = get_custom_rules_from_file(pcb_file)
     result["custom_rules"] = cr_result.get("rules", [])
-    result["custom_rules_note"] = (
-        "DRC checks both board_constraints, net_classes, and custom_rules. Violating any triggers an error."
-    )
+
+    if notes:
+        result["note"] = "; ".join(notes)
 
     return result
 
