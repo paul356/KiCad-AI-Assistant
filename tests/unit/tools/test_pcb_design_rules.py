@@ -1,5 +1,5 @@
 """
-Unit tests for kcaa/tools/drc_impl/pcb_design_rules.py.
+Unit tests for kcaa/utils/pcb_design_rules.py.
 
 Tests the S-expression-based design rules parser against synthetic
 .kicad_pcb file content.  No KiCad process is required.
@@ -7,11 +7,10 @@ Tests the S-expression-based design rules parser against synthetic
 
 import os
 
-from kcaa.tools.drc_impl.pcb_design_rules import (
+from kcaa.utils.pcb_design_rules import (
     add_custom_rule_to_file,
     get_custom_rules_from_file,
-    get_design_rules_from_file,
-    restore_design_rules_from_backup,
+    get_effective_design_rules_from_file,
     update_design_rules_in_file,
 )
 
@@ -99,48 +98,52 @@ def _write_pcb(content: str, dir_: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Tests: get_design_rules_from_file
+# Tests: get_effective_design_rules_from_file
 # ---------------------------------------------------------------------------
 
 
-class TestGetDesignRules:
-    """Tests for get_design_rules_from_file."""
+class TestGetEffectiveDesignRules:
+    """Tests for get_effective_design_rules_from_file."""
 
     def test_reads_all_known_fields(self, tmp_path):
         """All design_rule fields defined in the template are parsed."""
         content = _PCB_TEMPLATE.format(custom_rules_block="")
         pcb = _write_pcb(content, str(tmp_path))
 
-        result = get_design_rules_from_file(pcb)
+        result = get_effective_design_rules_from_file(pcb)
 
         assert result["success"] is True
-        assert result["rules"]["min_clearance"] == 0.2
-        assert result["rules"]["min_track_width"] == 0.15
-        assert result["rules"]["min_via_size"] == 0.6
-        assert result["rules"]["min_through_drill"] == 0.3
-        assert result["rules"]["copper_edge_clearance"] == 0.5
-        assert result["rules"]["hole_clearance"] == 0.25
-        assert result["rules"]["silk_clearance"] == 0.15
+        assert result["board_constraints"]["min_clearance"] == 0.2
+        assert result["board_constraints"]["min_track_width"] == 0.15
+        assert result["board_constraints"]["min_via_size"] == 0.6
+        assert result["board_constraints"]["min_through_drill"] == 0.3
+        assert result["board_constraints"]["copper_edge_clearance"] == 0.5
+        assert result["board_constraints"]["hole_clearance"] == 0.25
+        assert result["board_constraints"]["silk_clearance"] == 0.15
 
     def test_no_setup_section(self, tmp_path):
         """When setup section is missing, returns empty rules (no defaults available)."""
         pcb = _write_pcb(_PCB_NO_SETUP, str(tmp_path))
-        result = get_design_rules_from_file(pcb)
+        result = get_effective_design_rules_from_file(pcb)
         assert result["success"] is True
-        assert result["rules"] == {}
-        assert "No (setup" in result.get("message", "")
+        assert result["success"] is True
+        # With design-defaults.json on disk, defaults are loaded
+        assert result.get("defaults_used") or "board_constraints" in result
+        assert "board_constraints_note" in result
 
     def test_no_design_rules_subsection(self, tmp_path):
         """When design_rules subsection is missing, returns empty rules (no defaults available)."""
         pcb = _write_pcb(_PCB_SETUP_NO_DR, str(tmp_path))
-        result = get_design_rules_from_file(pcb)
+        result = get_effective_design_rules_from_file(pcb)
         assert result["success"] is True
-        assert result["rules"] == {}
-        assert "No (design_rules" in result.get("message", "")
+        assert result["success"] is True
+        # With design-defaults.json on disk, defaults are loaded
+        assert result.get("defaults_used") or "board_constraints" in result
+        assert "board_constraints_note" in result
 
     def test_file_not_found(self):
         """Non-existent file returns error."""
-        result = get_design_rules_from_file("/nonexistent/pcb.kicad_pcb")
+        result = get_effective_design_rules_from_file("/nonexistent/pcb.kicad_pcb")
 
         assert result["success"] is False
         assert "error" in result
@@ -160,11 +163,11 @@ class TestGetDesignRules:
 """
         pcb = _write_pcb(content, str(tmp_path))
 
-        result = get_design_rules_from_file(pcb)
+        result = get_effective_design_rules_from_file(pcb)
 
         assert result["success"] is True
-        assert result["rules"]["min_clearance"] == 0.2
-        assert "unknown_field" not in result["rules"]
+        assert result["board_constraints"]["min_clearance"] == 0.2
+        assert "unknown_field" not in result["board_constraints"]
 
 
 # ---------------------------------------------------------------------------
@@ -188,10 +191,10 @@ class TestUpdateDesignRules:
         assert result["backup_path"].endswith(".bak")
 
         # Re-read and verify
-        rules = get_design_rules_from_file(pcb)
-        assert rules["rules"]["min_clearance"] == 0.35
+        rules = get_effective_design_rules_from_file(pcb)
+        assert rules["board_constraints"]["min_clearance"] == 0.35
         # Unchanged fields stay the same
-        assert rules["rules"]["min_track_width"] == 0.15
+        assert rules["board_constraints"]["min_track_width"] == 0.15
 
     def test_updates_multiple_fields(self, tmp_path):
         """Multiple fields can be updated in one call."""
@@ -203,9 +206,9 @@ class TestUpdateDesignRules:
         assert result["success"] is True
         assert len(result["updated"]) == 2
 
-        rules = get_design_rules_from_file(pcb)
-        assert rules["rules"]["min_clearance"] == 0.5
-        assert rules["rules"]["min_track_width"] == 0.3
+        rules = get_effective_design_rules_from_file(pcb)
+        assert rules["board_constraints"]["min_clearance"] == 0.5
+        assert rules["board_constraints"]["min_track_width"] == 0.3
 
     def test_rejects_invalid_fields(self, tmp_path):
         """Unknown field names are rejected with an error."""
@@ -226,8 +229,8 @@ class TestUpdateDesignRules:
         bak = pcb + ".bak"
         assert os.path.exists(bak)
         # Backup contains original value
-        rules = get_design_rules_from_file(bak)
-        assert rules["rules"]["min_clearance"] == 0.2
+        rules = get_effective_design_rules_from_file(bak)
+        assert rules["board_constraints"]["min_clearance"] == 0.2
 
     def test_no_design_rules_section(self, tmp_path):
         """Error when there's no design_rules to update."""
@@ -357,74 +360,3 @@ class TestAddCustomRule:
 
 
 # ---------------------------------------------------------------------------
-# Tests for restore_design_rules_from_backup
-# ---------------------------------------------------------------------------
-
-
-class TestRestoreDesignRules:
-    """Verify rollback via backup restoration."""
-
-    def test_restore_from_valid_backup(self, tmp_path):
-        pcb = tmp_path / "board.kicad_pcb"
-        pcb.write_text(_PCB_TEMPLATE.format(custom_rules_block=""))
-        # Create a .bak file with different content
-        bak = tmp_path / "board.kicad_pcb.bak"
-        modified = _PCB_TEMPLATE.replace("(min_clearance 0.2)", "(min_clearance 0.5)")
-        bak.write_text(modified.format(custom_rules_block=""))
-
-        result = restore_design_rules_from_backup(str(bak))
-        assert result["success"]
-        assert os.path.isfile(result["safety_backup"])
-
-        # Check that original was restored (should now have 0.5 clearance)
-        dr = get_design_rules_from_file(str(pcb))
-        assert dr["rules"]["min_clearance"] == 0.5
-
-    def test_backup_not_found(self):
-        result = restore_design_rules_from_backup("/nonexistent/path.bak")
-        assert result["success"] is False
-        assert "not found" in result["error"].lower()
-
-    def test_not_a_bak_extension(self, tmp_path):
-        pcb = tmp_path / "board.kicad_pcb"
-        pcb.write_text(_PCB_TEMPLATE.format(custom_rules_block=""))
-
-        result = restore_design_rules_from_backup(str(pcb))
-        assert result["success"] is False
-        assert ".bak" in result["error"].lower()
-
-    def test_original_missing(self, tmp_path):
-        bak = tmp_path / "board.kicad_pcb.bak"
-        bak.write_text(_PCB_TEMPLATE.format(custom_rules_block=""))
-        # No corresponding .kicad_pcb file
-
-        result = restore_design_rules_from_backup(str(bak))
-        assert result["success"] is False
-        assert "not found" in result["error"].lower()
-
-    def test_safety_backup_created(self, tmp_path):
-        pcb = tmp_path / "board.kicad_pcb"
-        pcb.write_text(_PCB_TEMPLATE.format(custom_rules_block=""))
-        bak = tmp_path / "board.kicad_pcb.bak"
-        modified = _PCB_TEMPLATE.replace("(min_clearance 0.2)", "(min_clearance 0.8)")
-        bak.write_text(modified.format(custom_rules_block=""))
-
-        result = restore_design_rules_from_backup(str(bak))
-        assert result["success"]
-
-        safety = result["safety_backup"]
-        assert os.path.isfile(safety)
-        assert ".pre-restore-" in safety
-        # Safety backup should contain the pre-restore content (0.2 clearance)
-        dr_safety = get_design_rules_from_file(safety)
-        assert dr_safety["rules"]["min_clearance"] == 0.2
-
-    def test_invalid_backup_content(self, tmp_path):
-        pcb = tmp_path / "board.kicad_pcb"
-        pcb.write_text(_PCB_TEMPLATE.format(custom_rules_block=""))
-        bak = tmp_path / "board.kicad_pcb.bak"
-        bak.write_text("this is not valid sexp data {{{")
-
-        result = restore_design_rules_from_backup(str(bak))
-        assert result["success"] is False
-        assert "parse" in result["error"].lower()

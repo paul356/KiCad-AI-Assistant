@@ -18,31 +18,6 @@ from kcaa.utils.pcb_sexp_utils import load_pcb, save_pcb
 
 log = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Known design-rule field names (matched against the sexp tag inside
-# ``(setup (design_rules ...))``).  Values are millimeters.
-# ---------------------------------------------------------------------------
-_DESIGN_RULE_FIELDS = frozenset(
-    {
-        "min_clearance",
-        "min_groove_width",
-        "min_connection_width",
-        "min_track_width",
-        "min_via_annular_width",
-        "min_via_size",
-        "min_through_drill",
-        "min_microvia_size",
-        "min_microvia_drill",
-        "copper_edge_clearance",
-        "hole_clearance",
-        "hole_to_hole_min",
-        "silk_clearance",
-        "min_resolved_spokes",
-        "min_silk_text_height",
-        "min_silk_text_thickness",
-    }
-)
-
 
 def _get_design_defaults_path() -> str:
     """Return the path to the design defaults file in the kcaa data directory.
@@ -80,13 +55,35 @@ def _get_design_defaults_path() -> str:
             base = os.path.expanduser(f"~/.config/kicad/{version}")
         return os.path.join(base, "kcaa", "design-defaults.json")
 
-    # Last resort: try the plugin's fixed path under ~/.kicad-mcp/
-    return os.path.join(os.path.expanduser("~"), ".kicad-mcp", "design-defaults.json")
+    return None
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+# Known design-rule field names (sexp tags inside (design_rules ...)).
+# Must match the keys exported by the plugin's _export_design_defaults().
+_DESIGN_RULE_FIELDS = frozenset(
+    {
+        "min_clearance",
+        "min_groove_width",
+        "min_connection_width",
+        "min_track_width",
+        "min_via_annular_width",
+        "min_via_size",
+        "min_through_drill",
+        "min_microvia_size",
+        "min_microvia_drill",
+        "copper_edge_clearance",
+        "hole_clearance",
+        "hole_to_hole_min",
+        "silk_clearance",
+        "min_resolved_spokes",
+        "min_silk_text_height",
+        "min_silk_text_thickness",
+    }
+)
 
 
 def _find_section(tree: list[Any], tag: str) -> list[Any] | None:
@@ -113,49 +110,97 @@ def _str_symbol(val: Any) -> str:
 # ---------------------------------------------------------------------------
 
 
-def get_design_rules_from_file(pcb_file: str) -> dict[str, Any]:
-    """Read board-level design rules from a ``.kicad_pcb`` file.
+def get_effective_design_rules_from_file(pcb_file: str) -> dict[str, Any]:
+    """Read all design rules and net classes for a PCB from file.
 
-    When the PCB file has no custom design rules (the default for a new
-    board in KiCad), this function looks for real KiCad defaults that the
-    plugin exported to ``~/.kicad-mcp/design-defaults.json`` at startup.
-    If that file exists the defaults are returned with
-    ``"defaults_used": True``; otherwise an empty ``rules`` dict is returned.
+    Returns a unified view with three sections:
+
+    * ``board_constraints`` — global minimums from the PCB file's
+      ``(design_rules ...)`` section.  These apply to **all** objects.
+    * ``net_classes`` — per-netclass working values from the project's
+      ``.kicad_pro`` file.  Each net class has its own clearance,
+      track width, via sizes, and diff-pair dimensions.
+    * ``custom_rules`` — additional conditional constraints from the
+      ``(custom_rules ...)`` section.
+
+    All four layers are checked independently during DRC — violating
+    any one of them triggers an error.
+
+    When the PCB file has no ``(design_rules ...)`` section, defaults
+    exported by the plugin are used for ``board_constraints``.
 
     Args:
         pcb_file: Absolute path to the ``.kicad_pcb`` file.
 
     Returns:
-        ``{"success": True, "rules": {...}}`` on success.  On error,
-        ``{"success": False}``.
+        ``{"success": True, "board_constraints": {...},
+          "net_classes": [...], "custom_rules": [...]}`` on success.
     """
+    result: dict[str, Any] = {"success": True}
+
+    # 1. Board constraints from .kicad_pcb sexp
     try:
         tree = load_pcb(pcb_file)
     except (FileNotFoundError, ValueError) as exc:
         return {"success": False, "error": str(exc)}
 
     setup = _find_section(tree, "setup")
-    if setup is None:
-        return _load_exported_defaults("No (setup ...) section found in PCB file.")
+    if setup is not None:
+        dr_section = _find_section(setup, "design_rules")
+    else:
+        dr_section = None
 
-    dr_section = _find_section(setup, "design_rules")
-    if dr_section is None:
-        return _load_exported_defaults("No (design_rules ...) subsection found.")
-
-    rules: dict[str, float] = {}
-    for item in dr_section[1:]:
-        if isinstance(item, list) and len(item) >= 2:
-            field_name = _str_symbol(item[0])
-            if field_name in _DESIGN_RULE_FIELDS:
+    if dr_section is not None:
+        bc: dict[str, float] = {}
+        for item in dr_section[1:]:
+            if isinstance(item, list) and len(item) >= 2:
+                field_name = _str_symbol(item[0])
+                if field_name not in _DESIGN_RULE_FIELDS:
+                    continue
                 try:
-                    rules[field_name] = float(item[1])
+                    bc[field_name] = float(item[1])
                 except (ValueError, TypeError):
                     pass
+        if bc:
+            result["board_constraints"] = bc
+        else:
+            result["board_constraints"] = {}
+            result["board_constraints_note"] = (
+                "No design rules found; using plugin defaults if available."
+            )
+    else:
+        fallback = _load_exported_defaults("No (design_rules ...) section found in PCB file.")
+        if fallback.get("defaults_used"):
+            result["board_constraints"] = fallback["rules"]
+            result["defaults_used"] = True
+            result["board_constraints_note"] = fallback["message"]
+        else:
+            result["board_constraints"] = {}
+            result["board_constraints_note"] = fallback["message"]
 
-    if not rules:
-        return _load_exported_defaults("No design rules found in the (design_rules ...) section.")
+    # 2. Net classes from .kicad_pro
+    pro_file = pcb_file.replace(".kicad_pcb", ".kicad_pro")
+    try:
+        from kcaa.utils.net_settings import get_net_classes_from_pro
 
-    return {"success": True, "rules": rules}
+        nc_result = get_net_classes_from_pro(pro_file)
+        if nc_result.get("success"):
+            result["net_classes"] = nc_result.get("classes", [])
+        else:
+            result["net_classes"] = []
+            result["net_classes_note"] = nc_result.get("error", "Cannot read net classes")
+    except Exception as exc:
+        result["net_classes"] = []
+        result["net_classes_note"] = f"Cannot read net classes: {exc}"
+
+    # 3. Custom rules from .kicad_pcb sexp
+    cr_result = get_custom_rules_from_file(pcb_file)
+    result["custom_rules"] = cr_result.get("rules", [])
+    result["custom_rules_note"] = (
+        "DRC checks both board_constraints, net_classes, and custom_rules. Violating any triggers an error."
+    )
+
+    return result
 
 
 def _load_exported_defaults(message: str) -> dict[str, Any]:
@@ -174,7 +219,7 @@ def _load_exported_defaults(message: str) -> dict[str, Any]:
             "defaults_used": True,
             "message": f"{message} Loaded KiCad defaults from plugin export.",
         }
-    except (FileNotFoundError, _json.JSONDecodeError, PermissionError) as exc:
+    except (FileNotFoundError, _json.JSONDecodeError, PermissionError, TypeError) as exc:
         return {
             "success": True,
             "rules": {},
@@ -197,7 +242,7 @@ def update_design_rules_in_file(pcb_file: str, updates: dict[str, float]) -> dic
     Returns:
         ``{"success": True, "updated": [...], ...}`` or an error dict.
     """
-    # Validate field names
+    # Validate field names against the known set
     invalid = [k for k in updates if k not in _DESIGN_RULE_FIELDS]
     if invalid:
         return {"success": False, "error": f"Unknown design rule fields: {', '.join(invalid)}"}
@@ -350,60 +395,55 @@ def add_custom_rule_to_file(
     return {"success": True, "rule": rule_dict, "backup_path": bak_path}
 
 
-def restore_design_rules_from_backup(backup_path: str) -> dict[str, Any]:
-    """Restore a ``.kicad_pcb`` file from its ``.bak`` backup.
+def remove_custom_rule_from_file(pcb_file: str, rule_name: str) -> dict[str, Any]:
+    """Remove a custom design rule by name from the ``(custom_rules ...)`` section.
 
-    The backup is created automatically by ``update_design_rules_in_file``
-    and ``add_custom_rule_to_file``.  This tool copies the backup over the
-    current PCB file, creating a new safety backup of the current state first
-    (so the restoration itself can be undone).
+    A ``.bak`` backup is created automatically.
 
     Args:
-        backup_path: Absolute path to the ``.kicad_pcb.bak`` backup file.
+        pcb_file: Absolute path to the ``.kicad_pcb`` file.
+        rule_name: Name of the custom rule to remove (matches the ``name`` argument
+                   from ``add_custom_rule``).
 
     Returns:
-        ``{"success": True, "restored_to": ..., "safety_backup": ...}``
-        or an error dict.
+        ``{"success": True, "removed": rule_name, "backup_path": ...}`` or error.
     """
-    import shutil
-    import time
-
-    if not os.path.isfile(backup_path):
-        return {"success": False, "error": f"Backup file not found: {backup_path}"}
-
-    if not backup_path.endswith(".bak"):
-        return {"success": False, "error": "Backup path must end with .bak"}
-
-    original_path = backup_path[:-4]  # strip ".bak"
-    if not os.path.isfile(original_path):
-        return {"success": False, "error": f"Original file not found: {original_path}"}
-
-    # Verify backup is a valid PCB file
     try:
-        load_pcb(backup_path)
+        tree = load_pcb(pcb_file)
     except (FileNotFoundError, ValueError) as exc:
-        return {"success": False, "error": f"Failed to parse backup file: {exc}"}
+        return {"success": False, "error": str(exc)}
 
-    # Create safety backup of current state before restoring
-    stamp = time.strftime("%Y%m%d-%H%M%S")
-    safety_bak = original_path + f".pre-restore-{stamp}.bak"
+    setup = _find_section(tree, "setup")
+    if setup is None:
+        return {"success": False, "error": "No (setup ...) section found in PCB file."}
+
+    cr_section = _find_section(setup, "custom_rules")
+    if cr_section is None:
+        return {"success": False, "error": "No (custom_rules ...) section found."}
+
+    removed = None
+    new_children = [cr_section[0]]  # keep the "custom_rules" Symbol header
+    for item in cr_section[1:]:
+        if isinstance(item, list) and len(item) >= 2 and _str_symbol(item[0]) == "rule":
+            if _str_symbol(item[1]) == rule_name:
+                removed = item
+                continue
+        new_children.append(item)
+
+    if removed is None:
+        return {"success": False, "error": f"Custom rule '{rule_name}' not found."}
+
+    # Replace cr_section contents in-place
+    cr_section.clear()
+    cr_section.extend(new_children)
+
     try:
-        shutil.copy2(original_path, safety_bak)
+        bak_path = save_pcb(pcb_file, tree)
     except OSError as exc:
-        return {"success": False, "error": f"Failed to create safety backup: {exc}"}
+        return {"success": False, "error": f"Failed to save PCB file: {exc}"}
 
-    # Restore: copy backup over original
-    try:
-        shutil.copy2(backup_path, original_path)
-    except OSError as exc:
-        return {"success": False, "error": f"Failed to restore from backup: {exc}"}
-
-    return {
-        "success": True,
-        "message": f"Design rules restored from {os.path.basename(backup_path)}",
-        "restored_to": original_path,
-        "safety_backup": safety_bak,
-    }
+    log.info("Removed custom rule '%s' from %s", rule_name, pcb_file)
+    return {"success": True, "removed": rule_name, "backup_path": bak_path}
 
 
 def _parse_custom_rule(rule_sexp: list[Any]) -> dict[str, Any] | None:

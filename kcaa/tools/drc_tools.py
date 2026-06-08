@@ -9,17 +9,18 @@ from typing import Any
 
 from fastmcp import Context, FastMCP
 
+from kcaa.utils.drc_history import compare_with_previous, save_drc_result
+from kcaa.utils.file_utils import get_project_files
+
 # Import implementations
-from kcaa.tools.drc_impl.ipc_drc import run_drc_via_ipc
-from kcaa.tools.drc_impl.pcb_design_rules import (
+from kcaa.utils.ipc_drc import run_drc_via_ipc
+from kcaa.utils.net_settings import set_net_class_in_pro
+from kcaa.utils.pcb_design_rules import (
     add_custom_rule_to_file,
-    get_custom_rules_from_file,
-    get_design_rules_from_file,
-    restore_design_rules_from_backup,
+    get_effective_design_rules_from_file,
+    remove_custom_rule_from_file,
     update_design_rules_in_file,
 )
-from kcaa.utils.drc_history import compare_with_previous, get_drc_history, save_drc_result
-from kcaa.utils.file_utils import get_project_files
 
 
 def register_drc_tools(mcp: FastMCP) -> None:
@@ -28,49 +29,6 @@ def register_drc_tools(mcp: FastMCP) -> None:
     Args:
         mcp: The FastMCP server instance
     """
-
-    @mcp.tool()
-    def get_drc_history_tool(project_path: str) -> dict[str, Any]:
-        """Get the DRC check history for a KiCad project.
-
-        Args:
-            project_path: Path to the KiCad project file (.kicad_pro)
-
-        Returns:
-            Dictionary with DRC history entries
-        """
-        print(f"Getting DRC history for project: {project_path}")
-
-        if not os.path.exists(project_path):
-            print(f"Project not found: {project_path}")
-            return {"success": False, "error": f"Project not found: {project_path}"}
-
-        # Get history entries
-        history_entries = get_drc_history(project_path)
-
-        # Calculate trend information
-        trend = None
-        if len(history_entries) >= 2:
-            first = history_entries[-1]  # Oldest entry
-            last = history_entries[0]  # Newest entry
-
-            first_violations = first.get("total_violations", 0)
-            last_violations = last.get("total_violations", 0)
-
-            if first_violations > last_violations:
-                trend = "improving"
-            elif first_violations < last_violations:
-                trend = "degrading"
-            else:
-                trend = "stable"
-
-        return {
-            "success": True,
-            "project_path": project_path,
-            "history_entries": history_entries,
-            "entry_count": len(history_entries),
-            "trend": trend,
-        }
 
     @mcp.tool()
     async def run_drc_check(project_path: str, ctx: Context | None) -> dict[str, Any]:
@@ -147,24 +105,27 @@ def register_drc_tools(mcp: FastMCP) -> None:
         return drc_results or {"success": False, "error": "DRC check failed with an unknown error"}
 
     @mcp.tool()
-    def get_design_rules(project_path: str) -> dict[str, Any]:
-        """Get the board-level design rules for a KiCad project.
+    def get_effective_design_rules(project_path: str) -> dict[str, Any]:
+        """Get all design constraints for a KiCad project.
 
-        Reads constraints such as minimum clearance, track width, via size,
-        etc. from the PCB file's ``(setup (design_rules ...))`` section.
-        No KiCad process is required.
+        Returns a unified view with three sections:
 
-        When the PCB has no custom design rules (the default for a new
-        board), defaults exported by the plugin from the running KiCad
-        instance are returned if available.
+        * ``board_constraints`` — global minimums (clearance, track width,
+          via sizes, etc.) from the PCB file's design rules. These are
+          checked against **all** objects during DRC.
+        * ``net_classes`` — per-netclass working values (clearance, track
+          width, via sizes, diff-pair dimensions) from the project file.
+        * ``custom_rules`` — additional conditional DRC rules.
+
+        **All layers are checked independently during DRC** — violating
+        any one triggers an error.
 
         Args:
             project_path: Path to the KiCad project file (.kicad_pro)
 
         Returns:
-            Dictionary with ``rules`` key containing constraint name→value
-            pairs in millimeters.  When no custom rules exist and KiCad
-            defaults are available, ``"defaults_used": True`` is set.
+            Dictionary with ``board_constraints``, ``net_classes``,
+            and ``custom_rules`` keys.
         """
         if not os.path.exists(project_path):
             return {"success": False, "error": f"Project not found: {project_path}"}
@@ -173,19 +134,17 @@ def register_drc_tools(mcp: FastMCP) -> None:
         if "pcb" not in files:
             return {"success": False, "error": "PCB file not found in project"}
 
-        return get_design_rules_from_file(files["pcb"])
+        return get_effective_design_rules_from_file(files["pcb"])
 
     @mcp.tool()
     def set_design_rules(project_path: str, rules: dict[str, float]) -> dict[str, Any]:
-        """Update board-level design rule values in the PCB file.
+        """Update board-level design rule minimums (global hard floor).
 
         Only the fields provided in *rules* are modified.  A ``.bak``
-        backup is created automatically.  After updating, reload the board
-        in KiCad to see the changes take effect.
+        backup is created automatically.
 
-        Example fields: ``min_clearance``, ``min_track_width``,
-        ``min_via_size``, ``min_through_drill``, ``copper_edge_clearance``,
-        ``hole_clearance``, ``silk_clearance``.
+        These are **global minimums** checked against all objects during
+        DRC.  To change per-netclass working values, use ``set_net_class``.
 
         Args:
             project_path: Path to the KiCad project file (.kicad_pro)
@@ -204,27 +163,37 @@ def register_drc_tools(mcp: FastMCP) -> None:
         return update_design_rules_in_file(files["pcb"], rules)
 
     @mcp.tool()
-    def list_custom_rules(project_path: str) -> dict[str, Any]:
-        """List custom design rules defined in the PCB file.
+    def set_net_class(
+        project_path: str,
+        class_name: str,
+        updates: dict[str, float],
+    ) -> dict[str, Any]:
+        """Update a net class's design parameters in the project file.
 
-        Custom rules are additional constraints written in KiCad's
-        Lisp-like DSL that apply to specific net classes, layers, or
-        object types.
+        Net classes define working values (clearance, track width, via sizes,
+        diff-pair dimensions) for nets in that class.  These are checked
+        **in addition to** the board-level minimums — violating either
+        triggers a DRC error.
+
+        Use ``get_design_rules`` to see current net class values before
+        modifying.
+
+        Valid fields: ``clearance``, ``track_width``, ``via_diameter``,
+        ``via_drill``, ``microvia_diameter``, ``microvia_drill``,
+        ``diff_pair_width``, ``diff_pair_gap``, ``diff_pair_via_gap``.
 
         Args:
             project_path: Path to the KiCad project file (.kicad_pro)
+            class_name: Net class name (e.g. ``"Default"``)
+            updates: Dict mapping field names to new values in millimeters.
 
         Returns:
-            Dictionary with ``rules`` list of custom rule objects.
+            Dictionary with ``updated`` list of changes and ``backup_path``.
         """
         if not os.path.exists(project_path):
             return {"success": False, "error": f"Project not found: {project_path}"}
 
-        files = get_project_files(project_path)
-        if "pcb" not in files:
-            return {"success": False, "error": "PCB file not found in project"}
-
-        return get_custom_rules_from_file(files["pcb"])
+        return set_net_class_in_pro(project_path, class_name, updates)
 
     @mcp.tool()
     def add_custom_rule(
@@ -269,20 +238,24 @@ def register_drc_tools(mcp: FastMCP) -> None:
         )
 
     @mcp.tool()
-    def restore_design_rules(backup_path: str) -> dict[str, Any]:
-        """Restore PCB design rules from a ``.bak`` backup file.
+    def del_custom_rule(project_path: str, rule_name: str) -> dict[str, Any]:
+        """Remove a custom design rule by name from the PCB file.
 
-        When design rules are modified via ``set_design_rules`` or
-        ``add_custom_rule``, a ``.kicad_pcb.bak`` backup is automatically
-        created.  Use this tool to restore the design rules to the state
-        captured in that backup.  A safety backup of the current state is
-        created before restoring, so the operation can be undone.
+        A ``.bak`` backup is created automatically.
 
         Args:
-            backup_path: Absolute path to the ``.kicad_pcb.bak`` file.
+            project_path: Path to the KiCad project file (.kicad_pro)
+            rule_name: Name of the custom rule to remove (matches the name
+                       argument from ``add_custom_rule``).
 
         Returns:
-            Dictionary with ``restored_to`` and ``safety_backup`` paths
-            on success, or an error dict on failure.
+            Dictionary with ``removed`` and ``backup_path`` keys, or error.
         """
-        return restore_design_rules_from_backup(backup_path)
+        if not os.path.exists(project_path):
+            return {"success": False, "error": f"Project not found: {project_path}"}
+
+        files = get_project_files(project_path)
+        if "pcb" not in files:
+            return {"success": False, "error": "PCB file not found in project"}
+
+        return remove_custom_rule_from_file(files["pcb"], rule_name)

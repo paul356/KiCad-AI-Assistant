@@ -648,13 +648,12 @@ class TestToolPolicyRegistry:
             "refill_zones",
             "list_skills",
             "get_skill",
-            "get_drc_history_tool",
             "run_drc_check",
-            "get_design_rules",
+            "get_effective_design_rules",
             "set_design_rules",
-            "list_custom_rules",
+            "set_net_class",
             "add_custom_rule",
-            "restore_design_rules",
+            "del_custom_rule",
         }
 
         assert set(TOOL_POLICIES) == expected_tools

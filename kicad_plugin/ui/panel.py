@@ -1077,11 +1077,11 @@ if _WX_AVAILABLE:
             constraint_hint = ""
             if board_path and os.path.isfile(board_path):
                 try:
-                    from kcaa.tools.drc_impl.pcb_design_rules import get_design_rules_from_file
+                    from kcaa.utils.pcb_design_rules import get_effective_design_rules_from_file
 
-                    dr_result = get_design_rules_from_file(board_path)
-                    if dr_result.get("success") and dr_result.get("rules"):
-                        rules = dr_result["rules"]
+                    dr_result = get_effective_design_rules_from_file(board_path)
+                    if dr_result.get("success"):
+                        rules = dr_result.get("board_constraints", {})
                         min_clear = rules.get("min_clearance")
                         min_track = rules.get("min_track_width")
                         ce_clear = rules.get("copper_edge_clearance")

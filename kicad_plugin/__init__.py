@@ -80,11 +80,12 @@ except ImportError:
 
 
 def _export_design_defaults() -> None:
-    """Extract KiCad's default board design rules from pcbnew and persist them.
+    """Extract KiCad's default board design rules and persist them.
 
-    Writes ``design-defaults.json`` into the kcaa data directory (the same
-    directory used for logs and plugin settings) so the MCP server can read
-    KiCad's real default values without importing pcbnew.
+    Writes ``design-defaults.json`` into the kcaa data directory so the
+    MCP server can read KiCad's real default values without importing pcbnew.
+
+    Priority for each field: Default netclass value → board-level m_ attribute.
     """
     if not _IN_KICAD:
         return
@@ -94,6 +95,8 @@ def _export_design_defaults() -> None:
         board = _pcbnew.BOARD()
         settings = board.GetDesignSettings()
 
+        # Hardcoded mapping: sexp tag → pcbnew attribute name.
+        # Each attr is validated; warnings are logged for missing attributes.
         _FIELD_MAP = {
             "min_clearance": "m_MinClearance",
             "min_groove_width": "m_MinGrooveWidth",
@@ -111,10 +114,60 @@ def _export_design_defaults() -> None:
             "min_silk_text_height": "m_MinSilkTextHeight",
             "min_silk_text_thickness": "m_MinSilkTextThickness",
         }
+
+        # Netclass overrides: where a Default-netclass value is more
+        # meaningful than the bare board-level m_ attribute.
+        _NETCLASS_OVERRIDE = {
+            "min_clearance": "GetSmallestClearanceValue",
+            "min_track_width": "GetCurrentTrackWidth",
+            "min_via_size": "GetCurrentViaSize",
+            "min_through_drill": "GetCurrentViaDrill",
+            # uvia and diff-pair don't have direct netclass getters
+        }
+
         defaults = {}
+        log.info("Exporting KiCad design defaults (netclass > board m_):")
+
         for key, attr in _FIELD_MAP.items():
-            defaults[key] = _pcbnew.ToMM(getattr(settings, attr))
-        defaults["min_resolved_spokes"] = int(settings.m_MinResolvedSpokes)
+            # 1. Try netclass override
+            nc_method = _NETCLASS_OVERRIDE.get(key)
+            if nc_method is not None:
+                try:
+                    raw = getattr(settings, nc_method)()
+                    mm_value = _pcbnew.ToMM(raw)
+                    defaults[key] = mm_value
+                    log.info("  %s: %s mm (netclass %s, raw=%s)", key, mm_value, nc_method, raw)
+                    continue
+                except Exception as exc:
+                    log.warning(
+                        "  %s: netclass %s() failed (%s), falling back to %s",
+                        key,
+                        nc_method,
+                        exc,
+                        attr,
+                    )
+
+            # 2. Fall back to board-level m_ attribute
+            if not hasattr(settings, attr):
+                log.warning(
+                    "  %s: pcbnew attribute %s NOT FOUND on BOARD_DESIGN_SETTINGS — skipped",
+                    key,
+                    attr,
+                )
+                continue
+            raw = getattr(settings, attr)
+            mm_value = _pcbnew.ToMM(raw)
+            defaults[key] = mm_value
+            log.info("  %s: %s mm (board %s, raw=%s)", key, mm_value, attr, raw)
+
+        # Resolved spokes — board-level only
+        raw_spokes = settings.m_MinResolvedSpokes
+        defaults["min_resolved_spokes"] = int(raw_spokes)
+        log.info(
+            "  min_resolved_spokes: %s (board m_MinResolvedSpokes, raw=%s)",
+            int(raw_spokes),
+            raw_spokes,
+        )
 
         from .settings import _get_kcaa_data_dir
 

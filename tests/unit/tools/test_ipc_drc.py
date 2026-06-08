@@ -1,5 +1,5 @@
 """
-Unit tests for kcaa/tools/drc_impl/ipc_drc.py.
+Unit tests for kcaa/utils/ipc_drc.py.
 
 Mocks kipy and pcbnew so the IPC DRC runner can be tested without a
 running KiCad instance.
@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from kcaa.tools.drc_impl import ipc_drc
+from kcaa.utils import ipc_drc
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -70,7 +70,7 @@ class TestRunDrcViaIpc:
 
     All tests use lazy imports inside the function under test, so we must
     patch at the origin (kcaa.tools.kipy_tools._connect) rather than the
-    import site (drc_impl.ipc_drc).
+    import site (utils.ipc_drc).
     """
 
     @pytest.mark.asyncio
@@ -150,7 +150,7 @@ class TestRunDrcViaIpc:
     @pytest.mark.asyncio
     async def test_severity_mapping(self):
         """All known severity enum values map correctly."""
-        from kcaa.tools.drc_impl.ipc_drc import _severity_to_string
+        from kcaa.utils.ipc_drc import _severity_to_string
 
         assert _severity_to_string(0) == "error"
         assert _severity_to_string(1) == "warning"

@@ -6,9 +6,9 @@ import os
 
 from fastmcp import FastMCP
 
-from kcaa.tools.drc_impl.ipc_drc import run_drc_via_ipc
 from kcaa.utils.drc_history import get_drc_history
 from kcaa.utils.file_utils import get_project_files
+from kcaa.utils.ipc_drc import run_drc_via_ipc
 
 
 def register_drc_resources(mcp: FastMCP) -> None:

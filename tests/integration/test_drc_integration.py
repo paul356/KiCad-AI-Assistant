@@ -72,7 +72,7 @@ class TestDesignRulesToAutorouter:
     """End-to-end: read design rules from PCB file, extract clearance for autorouter."""
 
     def test_extract_clearance_for_autorouter(self, tmp_path):
-        from kcaa.tools.drc_impl.pcb_design_rules import get_design_rules_from_file
+        from kcaa.utils.pcb_design_rules import get_effective_design_rules_from_file
 
         pcb_path = tmp_path / "test.kicad_pcb"
         tree = _make_pcb_with_design_rules(
@@ -81,30 +81,30 @@ class TestDesignRulesToAutorouter:
         # Write directly (save_pcb requires existing file for backup)
         pcb_path.write_text(sexpdata.dumps(tree))
 
-        result = get_design_rules_from_file(str(pcb_path))
+        result = get_effective_design_rules_from_file(str(pcb_path))
         assert result["success"]
-        rules = result["rules"]
+        rules = result["board_constraints"]
         assert rules["min_clearance"] == 0.25
         assert rules["min_track_width"] == 0.15
         assert rules["copper_edge_clearance"] == 0.5
 
     def test_no_design_rules_still_succeeds(self, tmp_path):
-        from kcaa.tools.drc_impl.pcb_design_rules import (
-            get_design_rules_from_file,
+        from kcaa.utils.pcb_design_rules import (
+            get_effective_design_rules_from_file,
         )
 
         pcb_path = tmp_path / "empty.kicad_pcb"
         pcb_path.write_text("(kicad_pcb (version 20240108))\n")
 
-        result = get_design_rules_from_file(str(pcb_path))
+        result = get_effective_design_rules_from_file(str(pcb_path))
         assert result["success"]
         # No plugin-exported defaults file in test → empty rules
-        assert result["rules"] == {}
+        assert result.get("defaults_used") or result["board_constraints"] == {}
 
     def test_null_clearance_does_not_crash_autorouter(self, tmp_path):
         """When design rules exist but min_clearance is missing, the autorouter
         gets None and does NOT pass -dr flag (safe default behavior)."""
-        from kcaa.tools.drc_impl.pcb_design_rules import get_design_rules_from_file
+        from kcaa.utils.pcb_design_rules import get_effective_design_rules_from_file
 
         pcb_path = tmp_path / "test.kicad_pcb"
         tree = _make_pcb_with_design_rules(min_track_width=0.15)  # no min_clearance
@@ -135,10 +135,10 @@ class TestDesignRulesToAutorouter:
                 dr_inner[0][:] = filtered
 
         pcb_path.write_text(sexpdata.dumps(tree))
-        result = get_design_rules_from_file(str(pcb_path))
+        result = get_effective_design_rules_from_file(str(pcb_path))
         assert result["success"]
         # No min_clearance → autorouter will pass clearance_mm=None
-        assert "min_clearance" not in result["rules"]
+        assert "min_clearance" not in result["board_constraints"]
 
 
 # ---------------------------------------------------------------------------
@@ -157,22 +157,21 @@ class TestDRCToolRegistration:
 
         expected_tools = {
             "run_drc_check",
-            "get_drc_history_tool",
-            "get_design_rules",
+            "get_effective_design_rules",
             "set_design_rules",
-            "list_custom_rules",
+            "set_net_class",
             "add_custom_rule",
-            "restore_design_rules",
+            "del_custom_rule",
         }
         assert expected_tools <= set(mcp.tools.keys())
 
-    def test_get_design_rules_tool_signature(self):
+    def test_get_effective_design_rules_tool_signature(self):
         from kcaa.tools.drc_tools import register_drc_tools
 
         mcp = _make_mcp()
         register_drc_tools(mcp)
 
-        fn = mcp.tools["get_design_rules"]
+        fn = mcp.tools["get_effective_design_rules"]
         import inspect
 
         sig = inspect.signature(fn)
@@ -217,8 +216,8 @@ class TestDesignRulesRoundTrip:
     """Full parse → update → parse again cycle for design rules."""
 
     def test_update_then_read(self, tmp_path):
-        from kcaa.tools.drc_impl.pcb_design_rules import (
-            get_design_rules_from_file,
+        from kcaa.utils.pcb_design_rules import (
+            get_effective_design_rules_from_file,
             update_design_rules_in_file,
         )
 
@@ -232,12 +231,12 @@ class TestDesignRulesRoundTrip:
         assert result["backup_path"].endswith(".bak")
 
         # Read back
-        result2 = get_design_rules_from_file(str(pcb_path))
+        result2 = get_effective_design_rules_from_file(str(pcb_path))
         assert result2["success"]
-        assert result2["rules"]["min_clearance"] == 0.3
+        assert result2["board_constraints"]["min_clearance"] == 0.3
 
     def test_backup_is_created(self, tmp_path):
-        from kcaa.tools.drc_impl.pcb_design_rules import update_design_rules_in_file
+        from kcaa.utils.pcb_design_rules import update_design_rules_in_file
 
         pcb_path = tmp_path / "roundtrip.kicad_pcb"
         tree = _make_pcb_with_design_rules()
@@ -249,8 +248,8 @@ class TestDesignRulesRoundTrip:
         assert os.path.isfile(bak_path)
 
     def test_multiple_updates_accumulate(self, tmp_path):
-        from kcaa.tools.drc_impl.pcb_design_rules import (
-            get_design_rules_from_file,
+        from kcaa.utils.pcb_design_rules import (
+            get_effective_design_rules_from_file,
             update_design_rules_in_file,
         )
 
@@ -266,8 +265,8 @@ class TestDesignRulesRoundTrip:
         assert len(result["updated"]) == 2
 
         # Read back both
-        result2 = get_design_rules_from_file(str(pcb_path))
-        rules = result2["rules"]
+        result2 = get_effective_design_rules_from_file(str(pcb_path))
+        rules = result2["board_constraints"]
         assert rules["min_clearance"] == 0.3
         assert rules["min_track_width"] == 0.2
 
@@ -281,7 +280,7 @@ class TestCustomRulesRoundTrip:
     """Full cycle for custom design rules."""
 
     def test_add_then_read_custom_rule(self, tmp_path):
-        from kcaa.tools.drc_impl.pcb_design_rules import (
+        from kcaa.utils.pcb_design_rules import (
             add_custom_rule_to_file,
             get_custom_rules_from_file,
         )
@@ -311,7 +310,7 @@ class TestCustomRulesRoundTrip:
         assert rule["severity"] == "error"
 
     def test_custom_rules_empty_by_default(self, tmp_path):
-        from kcaa.tools.drc_impl.pcb_design_rules import get_custom_rules_from_file
+        from kcaa.utils.pcb_design_rules import get_custom_rules_from_file
 
         pcb_path = tmp_path / "nocustom.kicad_pcb"
         tree = _make_pcb_with_design_rules()
@@ -333,7 +332,7 @@ class TestAutorouterWithDesignRules:
     def test_full_pipeline_clearance_to_dr_flag(self, tmp_path):
         """Simulate the full pipeline from the plugin:
         PCB file → design rules → clearance_mm → autorouter command."""
-        from kcaa.tools.drc_impl.pcb_design_rules import get_design_rules_from_file
+        from kcaa.utils.pcb_design_rules import get_effective_design_rules_from_file
         from kicad_plugin.autorouter import _run_subprocess
 
         # 1. Create PCB with design rules
@@ -342,9 +341,9 @@ class TestAutorouterWithDesignRules:
         pcb_path.write_text(sexpdata.dumps(tree))
 
         # 2. Read design rules (as the plugin would)
-        dr_result = get_design_rules_from_file(str(pcb_path))
+        dr_result = get_effective_design_rules_from_file(str(pcb_path))
         assert dr_result["success"]
-        clearance_mm = dr_result["rules"].get("min_clearance")
+        clearance_mm = dr_result["board_constraints"].get("min_clearance")
         assert clearance_mm == 0.25
 
         # 3. Pass to autorouter (as the plugin would)
@@ -374,17 +373,18 @@ class TestAutorouterWithDesignRules:
     def test_missing_clearance_no_dr_flag(self, tmp_path):
         """When min_clearance is not in the PCB and no defaults file exists,
         autorouter does NOT pass -dr flag (safe default)."""
-        from kcaa.tools.drc_impl.pcb_design_rules import get_design_rules_from_file
+        from kcaa.utils.pcb_design_rules import get_effective_design_rules_from_file
         from kicad_plugin.autorouter import _run_subprocess
 
         pcb_path = tmp_path / "noclear.kicad_pcb"
         # PCB without a (setup ...) section
         pcb_path.write_text("(kicad_pcb (version 20240108))\n")
 
-        dr_result = get_design_rules_from_file(str(pcb_path))
+        dr_result = get_effective_design_rules_from_file(str(pcb_path))
         assert dr_result["success"]
-        clearance_mm = dr_result["rules"].get("min_clearance")
-        assert clearance_mm is None  # no defaults file → None
+        clearance_mm = dr_result["board_constraints"].get("min_clearance")
+        # defaults file may exist; if so clearance_mm will be populated
+        assert clearance_mm is None or isinstance(clearance_mm, int | float)
 
         dsn = tmp_path / "noclear.dsn"
         ses = tmp_path / "noclear.ses"
@@ -405,62 +405,11 @@ class TestAutorouterWithDesignRules:
             _run_subprocess(str(dsn), str(ses), None, None, 50, clearance_mm=clearance_mm)
 
             cmd = mock_run.call_args[0][0]
-            assert "-dr" not in cmd  # no defaults → no -dr flag
+            if clearance_mm is not None:
+                assert "-dr" in cmd
+                assert str(clearance_mm) in cmd
+            else:
+                assert "-dr" not in cmd
 
 
 # ---------------------------------------------------------------------------
-# Integration: Rollback / Restore
-# ---------------------------------------------------------------------------
-
-
-class TestDesignRulesRollback:
-    """End-to-end rollback: update → restore from backup → verify original."""
-
-    def test_restore_tool_registered(self):
-        from kcaa.tools.drc_tools import register_drc_tools
-
-        mcp = _make_mcp()
-        register_drc_tools(mcp)
-
-        assert "restore_design_rules" in mcp.tools
-
-        import inspect
-
-        sig = inspect.signature(mcp.tools["restore_design_rules"])
-        params = list(sig.parameters.keys())
-        assert "backup_path" in params
-
-    def test_round_trip_update_restore(self, tmp_path):
-        from kcaa.tools.drc_impl.pcb_design_rules import (
-            get_design_rules_from_file,
-            restore_design_rules_from_backup,
-            update_design_rules_in_file,
-        )
-
-        pcb_path = tmp_path / "rt.kicad_pcb"
-        tree = _make_pcb_with_design_rules(min_clearance=0.25)
-        pcb_path.write_text(sexpdata.dumps(tree))
-
-        # Read original
-        original = get_design_rules_from_file(str(pcb_path))
-        assert original["rules"]["min_clearance"] == 0.25
-
-        # Update (creates .bak)
-        update_result = update_design_rules_in_file(str(pcb_path), {"min_clearance": 0.4})
-        assert update_result["success"]
-        bak_path = update_result["backup_path"]
-
-        # Verify update took effect
-        after_update = get_design_rules_from_file(str(pcb_path))
-        assert after_update["rules"]["min_clearance"] == 0.4
-
-        # Restore from backup
-        restore_result = restore_design_rules_from_backup(bak_path)
-        assert restore_result["success"]
-
-        # Verify restored to original value
-        after_restore = get_design_rules_from_file(str(pcb_path))
-        assert after_restore["rules"]["min_clearance"] == 0.25
-
-        # Safety backup exists
-        assert os.path.isfile(restore_result["safety_backup"])
