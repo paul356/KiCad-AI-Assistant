@@ -123,7 +123,7 @@ def get_effective_design_rules_from_file(pcb_file: str) -> dict[str, Any]:
     * ``custom_rules`` — additional conditional constraints from the
       ``(custom_rules ...)`` section.
 
-    All four layers are checked independently during DRC — violating
+    All three layers are checked independently during DRC — violating
     any one of them triggers an error.
 
     When the PCB file has no ``(design_rules ...)`` section, defaults
@@ -195,6 +195,19 @@ def get_effective_design_rules_from_file(pcb_file: str) -> dict[str, Any]:
     # 3. Custom rules from .kicad_pcb sexp
     cr_result = get_custom_rules_from_file(pcb_file)
     result["custom_rules"] = cr_result.get("rules", [])
+
+    # Add rule-layer semantics note (static, not per-file)
+    notes.insert(
+        0,
+        (
+            "Three layers checked independently: "
+            "(1) board_constraints — global hard minimums, apply to all objects; "
+            "(2) net_classes — per-net working values, checked on top of board minimums "
+            "(net class values can be stricter but not looser than board constraints); "
+            "(3) custom_rules — conditional DRC rules that can override or augment "
+            "the above. Violating any layer triggers a DRC error."
+        ),
+    )
 
     if notes:
         result["note"] = "; ".join(notes)
