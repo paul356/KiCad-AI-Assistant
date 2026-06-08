@@ -85,7 +85,9 @@ def _export_design_defaults() -> None:
     Writes ``design-defaults.json`` into the kcaa data directory so the
     MCP server can read KiCad's real default values without importing pcbnew.
 
-    Priority for each field: Default netclass value → board-level m_ attribute.
+    Reads the bare board-level ``m_`` attributes from a fresh ``BOARD()``.
+    Net-class values are not merged — they are returned separately by
+    ``get_effective_design_rules`` from the ``.kicad_pro`` file.
     """
     if not _IN_KICAD:
         return
@@ -115,39 +117,10 @@ def _export_design_defaults() -> None:
             "min_silk_text_thickness": "m_MinSilkTextThickness",
         }
 
-        # Netclass overrides: where a Default-netclass value is more
-        # meaningful than the bare board-level m_ attribute.
-        _NETCLASS_OVERRIDE = {
-            "min_clearance": "GetSmallestClearanceValue",
-            "min_track_width": "GetCurrentTrackWidth",
-            "min_via_size": "GetCurrentViaSize",
-            "min_through_drill": "GetCurrentViaDrill",
-            # uvia and diff-pair don't have direct netclass getters
-        }
-
         defaults = {}
-        log.info("Exporting KiCad design defaults (netclass > board m_):")
+        log.info("Exporting KiCad design defaults (board m_):")
 
         for key, attr in _FIELD_MAP.items():
-            # 1. Try netclass override
-            nc_method = _NETCLASS_OVERRIDE.get(key)
-            if nc_method is not None:
-                try:
-                    raw = getattr(settings, nc_method)()
-                    mm_value = _pcbnew.ToMM(raw)
-                    defaults[key] = mm_value
-                    log.info("  %s: %s mm (netclass %s, raw=%s)", key, mm_value, nc_method, raw)
-                    continue
-                except Exception as exc:
-                    log.warning(
-                        "  %s: netclass %s() failed (%s), falling back to %s",
-                        key,
-                        nc_method,
-                        exc,
-                        attr,
-                    )
-
-            # 2. Fall back to board-level m_ attribute
             if not hasattr(settings, attr):
                 log.warning(
                     "  %s: pcbnew attribute %s NOT FOUND on BOARD_DESIGN_SETTINGS — skipped",
