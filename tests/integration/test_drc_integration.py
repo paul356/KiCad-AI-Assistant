@@ -63,6 +63,36 @@ def _make_pcb_with_design_rules(min_clearance=0.2, min_track_width=0.15, copper_
     ]
 
 
+def _write_pro_for_pcb(pcb_path: Path | str, **rules) -> str:
+    """Write a companion .kicad_pro JSON file for the given .kicad_pcb path.
+
+    Writes board.design_settings.rules using the pro-key format.
+    Returns the .kicad_pro path.
+    """
+    import json
+
+    pro_path = str(pcb_path).replace(".kicad_pcb", ".kicad_pro")
+    pro_data = {
+        "board": {
+            "design_settings": {
+                "rules": {
+                    "min_clearance": rules.get("min_clearance", 0.2),
+                    "min_track_width": rules.get("min_track_width", 0.15),
+                    "min_via_diameter": rules.get("min_via_size", 0.6),
+                    "min_through_hole_diameter": rules.get("min_through_drill", 0.3),
+                    "min_copper_edge_clearance": rules.get("copper_edge_clearance", 0.5),
+                    "min_hole_clearance": rules.get("hole_clearance", 0.25),
+                    "min_silk_clearance": rules.get("silk_clearance", 0.15),
+                }
+            }
+        },
+        "net_settings": {"classes": [{"name": "Default", "clearance": 0.2, "track_width": 0.15}]},
+    }
+    with open(pro_path, "w", encoding="utf-8") as f:
+        json.dump(pro_data, f, indent=2)
+    return pro_path
+
+
 # ---------------------------------------------------------------------------
 # Integration: Design Rules → Constraint Extraction
 # ---------------------------------------------------------------------------
@@ -80,10 +110,16 @@ class TestDesignRulesToAutorouter:
         )
         # Write directly (save_pcb requires existing file for backup)
         pcb_path.write_text(sexpdata.dumps(tree))
+        _write_pro_for_pcb(
+            pcb_path,
+            min_clearance=0.25,
+            min_track_width=0.15,
+            copper_edge_clearance=0.5,
+        )
 
         result = get_effective_design_rules_from_file(str(pcb_path))
         assert result["success"]
-        rules = result["board_constraints"]
+        rules = result["design_rules"]
         assert rules["min_clearance"] == 0.25
         assert rules["min_track_width"] == 0.15
         assert rules["copper_edge_clearance"] == 0.5
@@ -95,11 +131,11 @@ class TestDesignRulesToAutorouter:
 
         pcb_path = tmp_path / "empty.kicad_pcb"
         pcb_path.write_text("(kicad_pcb (version 20240108))\n")
+        _write_pro_for_pcb(pcb_path)
 
         result = get_effective_design_rules_from_file(str(pcb_path))
         assert result["success"]
-        # No plugin-exported defaults file in test → empty rules
-        assert result.get("defaults_used") or result["board_constraints"] == {}
+        assert "design_rules" in result
 
     def test_null_clearance_does_not_crash_autorouter(self, tmp_path):
         """When design rules exist but min_clearance is missing, the autorouter
@@ -135,10 +171,26 @@ class TestDesignRulesToAutorouter:
                 dr_inner[0][:] = filtered
 
         pcb_path.write_text(sexpdata.dumps(tree))
+        # Write .kicad_pro WITHOUT min_clearance
+        _write_pro_for_pcb(
+            pcb_path,
+            min_track_width=0.15,
+            min_clearance=None,  # signal: omit this field
+        )
+        # Overwrite the rules dict to remove min_clearance key
+        import json
+
+        pro_path = str(pcb_path).replace(".kicad_pcb", ".kicad_pro")
+        with open(pro_path) as f:
+            pro_data = json.load(f)
+        del pro_data["board"]["design_settings"]["rules"]["min_clearance"]
+        with open(pro_path, "w") as f:
+            json.dump(pro_data, f, indent=2)
+
         result = get_effective_design_rules_from_file(str(pcb_path))
         assert result["success"]
         # No min_clearance → autorouter will pass clearance_mm=None
-        assert "min_clearance" not in result["board_constraints"]
+        assert "min_clearance" not in result["design_rules"]
 
 
 # ---------------------------------------------------------------------------
@@ -161,6 +213,7 @@ class TestDRCToolRegistration:
             "set_design_rules",
             "set_net_class_rules",
             "assign_nets_to_class",
+            "remove_nets_from_class",
             "add_custom_rule",
             "del_custom_rule",
         }
@@ -209,6 +262,225 @@ class TestDRCToolRegistration:
 
 
 # ---------------------------------------------------------------------------
+# Integration: Net Class & Nets Lifecycle
+# ---------------------------------------------------------------------------
+
+
+def _make_pro_json(net_classes=None, netclass_patterns=None):
+    """Build minimal .kicad_pro JSON content for net class tests."""
+    import json
+
+    data = {
+        "board": {"design_settings": {"rules": {}}},
+        "net_settings": {
+            "classes": net_classes or [{"name": "Default", "clearance": 0.2, "track_width": 0.15}],
+        },
+    }
+    if netclass_patterns is not None:
+        data["net_settings"]["netclass_patterns"] = netclass_patterns
+    return json.dumps(data, indent=2)
+
+
+class TestNetClassLifecycle:
+    """End-to-end: create net class → assign nets → read back → remove nets."""
+
+    def test_create_net_class_and_assign_nets(self, tmp_path):
+        from kcaa.utils.net_settings import (
+            assign_nets_to_class_in_pro,
+            get_net_classes_from_pro,
+            set_net_class_in_pro,
+        )
+
+        pro_path = tmp_path / "test.kicad_pro"
+        pro_path.write_text(_make_pro_json())
+
+        # 1. Create a new net class "HV" with custom clearance
+        result = set_net_class_in_pro(str(pro_path), "HV", {"clearance": 0.5})
+        assert result["success"]
+        assert result.get("created")
+
+        # 2. Assign nets to the class
+        result = assign_nets_to_class_in_pro(str(pro_path), "HV", ["VCC_SYS", "/tp4056/VBUS"])
+        assert result["success"]
+        assert sorted(result["assigned"]) == ["/tp4056/VBUS", "VCC_SYS"]
+
+        # 3. Read back — verify nets appear in the class
+        result = get_net_classes_from_pro(str(pro_path))
+        assert result["success"]
+        hv = next(c for c in result["classes"] if c["name"] == "HV")
+        assert sorted(hv["nets"]) == ["/tp4056/VBUS", "VCC_SYS"]
+        assert hv["clearance"] == 0.5
+
+    def test_assign_existing_net_is_skipped(self, tmp_path):
+        from kcaa.utils.net_settings import assign_nets_to_class_in_pro
+
+        pro_path = tmp_path / "test.kicad_pro"
+        pro_path.write_text(
+            _make_pro_json(
+                netclass_patterns=[
+                    {"netclass": "Default", "pattern": "GND"},
+                ]
+            )
+        )
+
+        result = assign_nets_to_class_in_pro(str(pro_path), "Default", ["GND", "VCC"])
+        assert result["success"]
+        assert result["existing"] == ["GND"]
+        assert result["assigned"] == ["VCC"]
+
+    def test_move_net_between_classes(self, tmp_path):
+        from kcaa.utils.net_settings import (
+            assign_nets_to_class_in_pro,
+            get_net_classes_from_pro,
+            set_net_class_in_pro,
+        )
+
+        pro_path = tmp_path / "test.kicad_pro"
+        pro_path.write_text(
+            _make_pro_json(
+                netclass_patterns=[
+                    {"netclass": "Default", "pattern": "GND"},
+                ]
+            )
+        )
+
+        # Create HV class and move GND into it
+        set_net_class_in_pro(str(pro_path), "HV", {"clearance": 0.5})
+        result = assign_nets_to_class_in_pro(str(pro_path), "HV", ["GND"])
+        assert result["success"]
+        assert result["assigned"] == ["GND"]
+
+        # Verify GND is now in HV, not Default
+        nc_result = get_net_classes_from_pro(str(pro_path))
+        hv = next(c for c in nc_result["classes"] if c["name"] == "HV")
+        default = next(c for c in nc_result["classes"] if c["name"] == "Default")
+        assert "GND" in hv["nets"]
+        assert "GND" not in default["nets"]
+
+    def test_remove_nets_from_class(self, tmp_path):
+        from kcaa.utils.net_settings import (
+            get_net_classes_from_pro,
+            remove_nets_from_class_in_pro,
+            set_net_class_in_pro,
+        )
+
+        pro_path = tmp_path / "test.kicad_pro"
+        pro_path.write_text(_make_pro_json())
+
+        # Create HV class first so it exists in classes
+        set_net_class_in_pro(str(pro_path), "HV", {"clearance": 0.5})
+
+        # Now assign nets (using the utility directly to set up state)
+        from kcaa.utils.net_settings import assign_nets_to_class_in_pro
+
+        assign_nets_to_class_in_pro(str(pro_path), "HV", ["VBUS", "VCC_SYS"])
+        assign_nets_to_class_in_pro(str(pro_path), "Default", ["GND"])
+
+        # Remove VBUS from HV
+        result = remove_nets_from_class_in_pro(str(pro_path), "HV", ["VBUS"])
+        assert result["success"]
+        assert result["removed"] == ["VBUS"]
+        assert result["not_found"] == []
+
+        # Verify VBUS is gone from HV, VCC_SYS remains
+        nc_result = get_net_classes_from_pro(str(pro_path))
+        hv = next(c for c in nc_result["classes"] if c["name"] == "HV")
+        assert "VBUS" not in hv["nets"]
+        assert "VCC_SYS" in hv["nets"]
+
+    def test_remove_nets_not_found(self, tmp_path):
+        from kcaa.utils.net_settings import remove_nets_from_class_in_pro
+
+        pro_path = tmp_path / "test.kicad_pro"
+        pro_path.write_text(_make_pro_json())
+
+        result = remove_nets_from_class_in_pro(str(pro_path), "Default", ["NONEXISTENT"])
+        assert not result["success"]
+        assert "None of the specified nets" in result["error"]
+
+    def test_remove_nets_mixed_found_and_not_found(self, tmp_path):
+        from kcaa.utils.net_settings import (
+            assign_nets_to_class_in_pro,
+            remove_nets_from_class_in_pro,
+            set_net_class_in_pro,
+        )
+
+        pro_path = tmp_path / "test.kicad_pro"
+        pro_path.write_text(_make_pro_json())
+        set_net_class_in_pro(str(pro_path), "HV", {"clearance": 0.5})
+        assign_nets_to_class_in_pro(str(pro_path), "HV", ["VBUS"])
+
+        result = remove_nets_from_class_in_pro(str(pro_path), "HV", ["VBUS", "NONEXISTENT"])
+        assert result["success"]
+        assert result["removed"] == ["VBUS"]
+        assert result["not_found"] == ["NONEXISTENT"]
+
+    def test_remove_nets_wrong_class_not_removed(self, tmp_path):
+        from kcaa.utils.net_settings import (
+            assign_nets_to_class_in_pro,
+            remove_nets_from_class_in_pro,
+            set_net_class_in_pro,
+        )
+
+        pro_path = tmp_path / "test.kicad_pro"
+        pro_path.write_text(_make_pro_json())
+        set_net_class_in_pro(str(pro_path), "HV", {"clearance": 0.5})
+        assign_nets_to_class_in_pro(str(pro_path), "HV", ["VBUS"])
+
+        # Try to remove VBUS from Default (it's actually in HV)
+        result = remove_nets_from_class_in_pro(str(pro_path), "Default", ["VBUS"])
+        assert not result["success"]
+        assert "None of the specified nets" in result["error"]
+
+    def test_full_lifecycle_create_assign_remove(self, tmp_path):
+        from kcaa.utils.net_settings import (
+            assign_nets_to_class_in_pro,
+            get_net_classes_from_pro,
+            remove_nets_from_class_in_pro,
+            set_net_class_in_pro,
+        )
+
+        pro_path = tmp_path / "test.kicad_pro"
+        pro_path.write_text(_make_pro_json())
+
+        # 1. Create class
+        set_net_class_in_pro(str(pro_path), "HV", {"clearance": 0.5})
+
+        # 2. Assign nets
+        assign_nets_to_class_in_pro(str(pro_path), "HV", ["VBUS", "VCC_SYS"])
+
+        # 3. Read back — nets present
+        nc_result = get_net_classes_from_pro(str(pro_path))
+        hv = next(c for c in nc_result["classes"] if c["name"] == "HV")
+        assert sorted(hv["nets"]) == ["VBUS", "VCC_SYS"]
+
+        # 4. Remove one net
+        remove_nets_from_class_in_pro(str(pro_path), "HV", ["VBUS"])
+
+        # 5. Read back — only VCC_SYS remains
+        nc_result = get_net_classes_from_pro(str(pro_path))
+        hv = next(c for c in nc_result["classes"] if c["name"] == "HV")
+        assert hv["nets"] == ["VCC_SYS"]
+
+    def test_remove_nets_backup_created(self, tmp_path):
+        from kcaa.utils.net_settings import (
+            assign_nets_to_class_in_pro,
+            remove_nets_from_class_in_pro,
+            set_net_class_in_pro,
+        )
+
+        pro_path = tmp_path / "test.kicad_pro"
+        pro_path.write_text(_make_pro_json())
+        set_net_class_in_pro(str(pro_path), "HV", {"clearance": 0.5})
+        assign_nets_to_class_in_pro(str(pro_path), "HV", ["VBUS"])
+
+        result = remove_nets_from_class_in_pro(str(pro_path), "HV", ["VBUS"])
+        assert result["success"]
+        bak_path = result["backup_path"]
+        assert os.path.isfile(bak_path)
+
+
+# ---------------------------------------------------------------------------
 # Integration: Design Rules Round-Trip
 # ---------------------------------------------------------------------------
 
@@ -225,16 +497,17 @@ class TestDesignRulesRoundTrip:
         pcb_path = tmp_path / "roundtrip.kicad_pcb"
         tree = _make_pcb_with_design_rules(min_clearance=0.2)
         pcb_path.write_text(sexpdata.dumps(tree))
+        pro_path = _write_pro_for_pcb(pcb_path, min_clearance=0.2)
 
         # Update
-        result = update_design_rules_in_file(str(pcb_path), {"min_clearance": 0.3})
+        result = update_design_rules_in_file(pro_path, {"min_clearance": 0.3})
         assert result["success"]
         assert result["backup_path"].endswith(".bak")
 
         # Read back
         result2 = get_effective_design_rules_from_file(str(pcb_path))
         assert result2["success"]
-        assert result2["board_constraints"]["min_clearance"] == 0.3
+        assert result2["design_rules"]["min_clearance"] == 0.3
 
     def test_backup_is_created(self, tmp_path):
         from kcaa.utils.pcb_design_rules import update_design_rules_in_file
@@ -242,8 +515,9 @@ class TestDesignRulesRoundTrip:
         pcb_path = tmp_path / "roundtrip.kicad_pcb"
         tree = _make_pcb_with_design_rules()
         pcb_path.write_text(sexpdata.dumps(tree))
+        pro_path = _write_pro_for_pcb(pcb_path)
 
-        result = update_design_rules_in_file(str(pcb_path), {"min_track_width": 0.25})
+        result = update_design_rules_in_file(pro_path, {"min_track_width": 0.25})
         assert result["success"]
         bak_path = result["backup_path"]
         assert os.path.isfile(bak_path)
@@ -257,17 +531,18 @@ class TestDesignRulesRoundTrip:
         pcb_path = tmp_path / "roundtrip.kicad_pcb"
         tree = _make_pcb_with_design_rules(min_clearance=0.2, min_track_width=0.1)
         pcb_path.write_text(sexpdata.dumps(tree))
+        pro_path = _write_pro_for_pcb(pcb_path, min_clearance=0.2, min_track_width=0.1)
 
         # Update both
         result = update_design_rules_in_file(
-            str(pcb_path), {"min_clearance": 0.3, "min_track_width": 0.2}
+            pro_path, {"min_clearance": 0.3, "min_track_width": 0.2}
         )
         assert result["success"]
         assert len(result["updated"]) == 2
 
         # Read back both
         result2 = get_effective_design_rules_from_file(str(pcb_path))
-        rules = result2["board_constraints"]
+        rules = result2["design_rules"]
         assert rules["min_clearance"] == 0.3
         assert rules["min_track_width"] == 0.2
 
@@ -340,11 +615,12 @@ class TestAutorouterWithDesignRules:
         pcb_path = tmp_path / "pipeline.kicad_pcb"
         tree = _make_pcb_with_design_rules(min_clearance=0.25)
         pcb_path.write_text(sexpdata.dumps(tree))
+        _write_pro_for_pcb(pcb_path, min_clearance=0.25)
 
         # 2. Read design rules (as the plugin would)
         dr_result = get_effective_design_rules_from_file(str(pcb_path))
         assert dr_result["success"]
-        clearance_mm = dr_result["board_constraints"].get("min_clearance")
+        clearance_mm = dr_result["design_rules"].get("min_clearance")
         assert clearance_mm == 0.25
 
         # 3. Pass to autorouter (as the plugin would)
@@ -378,14 +654,17 @@ class TestAutorouterWithDesignRules:
         from kicad_plugin.autorouter import _run_subprocess
 
         pcb_path = tmp_path / "noclear.kicad_pcb"
-        # PCB without a (setup ...) section
+        # PCB without a (setup ...) section — and no .kicad_pro file
         pcb_path.write_text("(kicad_pcb (version 20240108))\n")
 
         dr_result = get_effective_design_rules_from_file(str(pcb_path))
-        assert dr_result["success"]
-        clearance_mm = dr_result["board_constraints"].get("min_clearance")
-        # defaults file may exist; if so clearance_mm will be populated
-        assert clearance_mm is None or isinstance(clearance_mm, int | float)
+        # Without .kicad_pro sidecar, this returns an error now
+        assert dr_result["success"] is False or "design_rules" in dr_result
+        clearance_mm = (
+            dr_result.get("design_rules", {}).get("min_clearance")
+            if dr_result.get("success")
+            else None
+        )
 
         dsn = tmp_path / "noclear.dsn"
         ses = tmp_path / "noclear.ses"

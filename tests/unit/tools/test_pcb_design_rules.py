@@ -1,10 +1,11 @@
 """
 Unit tests for kcaa/utils/pcb_design_rules.py.
 
-Tests the S-expression-based design rules parser against synthetic
-.kicad_pcb file content.  No KiCad process is required.
+Tests the JSON-based design rules parser against synthetic .kicad_pro files.
+No KiCad process is required.
 """
 
+import json
 import os
 
 from kcaa.utils.pcb_design_rules import (
@@ -18,7 +19,7 @@ from kcaa.utils.pcb_design_rules import (
 # Helpers
 # ---------------------------------------------------------------------------
 
-# A minimal-but-realistic .kicad_pcb template with a (setup ...) section.
+# A minimal-but-realistic .kicad_pcb template (still needed for custom_rules tests).
 _PCB_TEMPLATE = """(kicad_pcb
 \t(version 20260206)
 \t(generator "pcbnew")
@@ -97,6 +98,78 @@ def _write_pcb(content: str, dir_: str) -> str:
     return path
 
 
+def _make_pro_rules(**kwargs: float) -> dict:
+    """Build board.design_settings.rules dict from user-facing field names."""
+    from kcaa.utils.pcb_design_rules import _DESIGN_RULE_FIELD_MAP
+
+    return {_DESIGN_RULE_FIELD_MAP[k]: v for k, v in kwargs.items()}
+
+
+def _write_pro(
+    dir_: str,
+    rules: dict | None = None,
+    classes: list | None = None,
+    stem: str = "test_board",
+) -> str:
+    """Write a .kicad_pro JSON file and return its path.
+
+    Args:
+        dir_: Temp directory.
+        rules: Dict of ``board.design_settings.rules`` values (pro-key format).
+               If an empty dict, the section is present but empty.
+               If None, the section is populated with default values.
+        classes: Optional list of net class dicts.
+        stem: Base filename without extension.
+    """
+    if rules is None:
+        rules = {
+            "min_clearance": 0.2,
+            "min_track_width": 0.15,
+            "min_via_diameter": 0.6,
+            "min_through_hole_diameter": 0.3,
+            "min_copper_edge_clearance": 0.5,
+            "min_hole_clearance": 0.25,
+            "min_silk_clearance": 0.15,
+        }
+    data: dict = {
+        "board": {
+            "design_settings": {
+                "rules": rules,
+            },
+        },
+        "net_settings": {
+            "classes": classes or [{"name": "Default", "clearance": 0.2, "track_width": 0.15}],
+        },
+    }
+    path = os.path.join(dir_, f"{stem}.kicad_pro")
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2)
+    return path
+
+
+def _write_pro_without_rules(dir_: str, stem: str = "test_board") -> str:
+    """Write a .kicad_pro JSON file with NO board.design_settings.rules section."""
+    data: dict = {
+        "board": {
+            "design_settings": {},
+        },
+        "net_settings": {
+            "classes": [{"name": "Default", "clearance": 0.2, "track_width": 0.15}],
+        },
+    }
+    path = os.path.join(dir_, f"{stem}.kicad_pro")
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2)
+    return path
+
+
+def _write_pcb_and_pro(pcb_content: str, dir_: str, rules: dict | None = None) -> str:
+    """Write both .kicad_pcb and .kicad_pro files; return pcb path."""
+    pcb = _write_pcb(pcb_content, dir_)
+    _write_pro(dir_, rules=rules)
+    return pcb
+
+
 # ---------------------------------------------------------------------------
 # Tests: get_effective_design_rules_from_file
 # ---------------------------------------------------------------------------
@@ -106,9 +179,9 @@ class TestGetEffectiveDesignRules:
     """Tests for get_effective_design_rules_from_file."""
 
     def test_reads_all_known_fields(self, tmp_path):
-        """All design_rule fields defined in the template are parsed."""
+        """All design_rule fields from the .kicad_pro JSON are parsed."""
         content = _PCB_TEMPLATE.format(custom_rules_block="")
-        pcb = _write_pcb(content, str(tmp_path))
+        pcb = _write_pcb_and_pro(content, str(tmp_path))
 
         result = get_effective_design_rules_from_file(pcb)
 
@@ -122,23 +195,20 @@ class TestGetEffectiveDesignRules:
         assert result["design_rules"]["silk_clearance"] == 0.15
 
     def test_no_setup_section(self, tmp_path):
-        """When setup section is missing, returns empty rules (no defaults available)."""
+        """When pro file is missing, returns error."""
         pcb = _write_pcb(_PCB_NO_SETUP, str(tmp_path))
         result = get_effective_design_rules_from_file(pcb)
-        assert result["success"] is True
-        assert result["success"] is True
-        # With design-defaults.json on disk, defaults are loaded
-        assert result.get("design_rules", {}).get("defaults_used") or "design_rules" in result
-        assert "note" in result
+        assert result["success"] is False
+        assert "Cannot read project file" in result["error"]
 
     def test_no_design_rules_subsection(self, tmp_path):
-        """When design_rules subsection is missing, returns empty rules (no defaults available)."""
+        """When design_settings.rules is missing, returns empty rules."""
         pcb = _write_pcb(_PCB_SETUP_NO_DR, str(tmp_path))
+        # Write a .kicad_pro with no rules section
+        _write_pro_without_rules(str(tmp_path))
         result = get_effective_design_rules_from_file(pcb)
         assert result["success"] is True
-        assert result["success"] is True
-        # With design-defaults.json on disk, defaults are loaded
-        assert result.get("design_rules", {}).get("defaults_used") or "design_rules" in result
+        assert result["design_rules"] == {}
         assert "note" in result
 
     def test_file_not_found(self):
@@ -149,19 +219,15 @@ class TestGetEffectiveDesignRules:
         assert "error" in result
 
     def test_ignores_unknown_fields(self, tmp_path):
-        """Unknown tags inside design_rules are silently skipped."""
-        content = """(kicad_pcb
-\t(version 20260206)
-\t(generator "pcbnew")
-\t(setup
-\t\t(design_rules
-\t\t\t(min_clearance 0.2)
-\t\t\t(unknown_field 999)
-\t\t)
-\t)
-)
-"""
-        pcb = _write_pcb(content, str(tmp_path))
+        """Unknown keys in board.design_settings.rules are silently skipped."""
+        pcb = _write_pcb(_PCB_NO_SETUP, str(tmp_path))
+        _write_pro(
+            str(tmp_path),
+            rules={
+                "min_clearance": 0.2,
+                "unknown_field": 999,
+            },
+        )
 
         result = get_effective_design_rules_from_file(pcb)
 
@@ -180,10 +246,9 @@ class TestUpdateDesignRules:
 
     def test_updates_single_field(self, tmp_path):
         """Update one field and verify file was changed."""
-        content = _PCB_TEMPLATE.format(custom_rules_block="")
-        pcb = _write_pcb(content, str(tmp_path))
+        pro = _write_pro(str(tmp_path))
 
-        result = update_design_rules_in_file(pcb, {"min_clearance": 0.35})
+        result = update_design_rules_in_file(pro, {"min_clearance": 0.35})
 
         assert result["success"] is True
         assert len(result["updated"]) == 1
@@ -191,55 +256,56 @@ class TestUpdateDesignRules:
         assert result["backup_path"].endswith(".bak")
 
         # Re-read and verify
-        rules = get_effective_design_rules_from_file(pcb)
+        rules = get_effective_design_rules_from_file(pro.replace(".kicad_pro", ".kicad_pcb"))
         assert rules["design_rules"]["min_clearance"] == 0.35
         # Unchanged fields stay the same
         assert rules["design_rules"]["min_track_width"] == 0.15
 
     def test_updates_multiple_fields(self, tmp_path):
         """Multiple fields can be updated in one call."""
-        content = _PCB_TEMPLATE.format(custom_rules_block="")
-        pcb = _write_pcb(content, str(tmp_path))
+        pro = _write_pro(str(tmp_path))
 
-        result = update_design_rules_in_file(pcb, {"min_clearance": 0.5, "min_track_width": 0.3})
+        result = update_design_rules_in_file(pro, {"min_clearance": 0.5, "min_track_width": 0.3})
 
         assert result["success"] is True
         assert len(result["updated"]) == 2
 
-        rules = get_effective_design_rules_from_file(pcb)
+        rules = get_effective_design_rules_from_file(pro.replace(".kicad_pro", ".kicad_pcb"))
         assert rules["design_rules"]["min_clearance"] == 0.5
         assert rules["design_rules"]["min_track_width"] == 0.3
 
     def test_rejects_invalid_fields(self, tmp_path):
         """Unknown field names are rejected with an error."""
-        pcb = _write_pcb(_PCB_TEMPLATE.format(custom_rules_block=""), str(tmp_path))
+        pro = _write_pro(str(tmp_path))
 
-        result = update_design_rules_in_file(pcb, {"bad_field": 1.0})
+        result = update_design_rules_in_file(pro, {"bad_field": 1.0})
 
         assert result["success"] is False
         assert "bad_field" in result["error"]
 
     def test_creates_backup(self, tmp_path):
         """Verify that a .bak file is created on update."""
-        content = _PCB_TEMPLATE.format(custom_rules_block="")
-        pcb = _write_pcb(content, str(tmp_path))
+        pro = _write_pro(str(tmp_path))
 
-        update_design_rules_in_file(pcb, {"min_clearance": 0.99})
+        update_design_rules_in_file(pro, {"min_clearance": 0.99})
 
-        bak = pcb + ".bak"
+        bak = pro + ".bak"
         assert os.path.exists(bak)
-        # Backup contains original value
-        rules = get_effective_design_rules_from_file(bak)
-        assert rules["design_rules"]["min_clearance"] == 0.2
+        # Backup contains original value (read JSON directly)
+        import json as _json
+
+        with open(bak) as f:
+            bak_data = _json.load(f)
+        assert bak_data["board"]["design_settings"]["rules"]["min_clearance"] == 0.2
 
     def test_no_design_rules_section(self, tmp_path):
-        """Error when there's no design_rules to update."""
-        pcb = _write_pcb(_PCB_SETUP_NO_DR, str(tmp_path))
+        """Error when there's no board.design_settings.rules to update."""
+        pro = _write_pro_without_rules(str(tmp_path))
 
-        result = update_design_rules_in_file(pcb, {"min_clearance": 0.1})
+        result = update_design_rules_in_file(pro, {"min_clearance": 0.1})
 
         assert result["success"] is False
-        assert "No (design_rules" in result["error"]
+        assert "board.design_settings.rules" in result["error"]
 
 
 # ---------------------------------------------------------------------------

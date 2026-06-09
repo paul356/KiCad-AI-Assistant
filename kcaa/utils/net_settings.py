@@ -37,6 +37,9 @@ def _find_pro_file(pcb_file: str) -> str | None:
 def get_net_classes_from_pro(pro_file: str) -> dict[str, Any]:
     """Read net class settings from a .kicad_pro project file.
 
+    Each class entry includes a ``nets`` list showing which nets are
+    assigned via ``netclass_patterns``.
+
     Args:
         pro_file: Absolute path to the .kicad_pro file.
 
@@ -55,14 +58,27 @@ def get_net_classes_from_pro(pro_file: str) -> dict[str, Any]:
     if not isinstance(classes_raw, list):
         return {"success": False, "error": "Invalid net_settings.classes in project file"}
 
+    # Build netclass → nets lookup from netclass_patterns
+    patterns_raw = ns.get("netclass_patterns")
+    class_nets: dict[str, list[str]] = {}
+    if isinstance(patterns_raw, list):
+        for p in patterns_raw:
+            if isinstance(p, dict):
+                nc_name = p.get("netclass", "")
+                pattern = p.get("pattern", "")
+                if nc_name and pattern:
+                    class_nets.setdefault(nc_name, []).append(pattern)
+
     classes = []
     default_netclass = None
     for nc in classes_raw:
         if not isinstance(nc, dict):
             continue
         entry = _netclass_to_dict(nc)
+        nc_name = nc.get("name", "")
+        entry["nets"] = class_nets.get(nc_name, [])
         classes.append(entry)
-        if nc.get("name") == "Default":
+        if nc_name == "Default":
             default_netclass = entry
 
     return {
@@ -300,6 +316,106 @@ def assign_nets_to_class_in_pro(pro_file: str, class_name: str, nets: list[str])
         "backup_path": bak_path,
         "warning": f"Changes saved to {pro_file}. Reopen the project in KiCad for net assignments to take effect.",
     }
+
+
+def remove_nets_from_class_in_pro(
+    pro_file: str, class_name: str, nets: list[str]
+) -> dict[str, Any]:
+    """Remove nets from a net class by deleting their netclass_patterns entries.
+
+    Removes exact-match entries from ``net_settings.netclass_patterns`` so the
+    listed nets no longer belong to the specified class and revert to Default.
+
+    Nets not currently assigned to *class_name* are silently skipped (returned
+    in ``not_found``).  Creates a ``.kicad_pro.bak`` backup automatically.
+
+    Args:
+        pro_file: Absolute path to the .kicad_pro file.
+        class_name: Name of the net class to remove nets from.
+        nets: List of net names to remove (e.g. ``["/tp4056/VBUS"]``).
+
+    Returns:
+        ``{"success": True, "removed": [...], "not_found": [...], "backup_path": ...}``
+        or error dict.
+    """
+    if not nets:
+        return {"success": False, "error": "No net names provided"}
+
+    try:
+        with open(pro_file, encoding="utf-8") as f:
+            data = _json.load(f)
+    except (FileNotFoundError, _json.JSONDecodeError, PermissionError) as exc:
+        return {"success": False, "error": f"Cannot read project file: {exc}"}
+
+    ns = data.get("net_settings")
+    if ns is None:
+        return {"success": False, "error": "No net_settings section in project file"}
+
+    patterns: list[dict] = ns.get("netclass_patterns")
+    if not isinstance(patterns, list):
+        patterns = []
+
+    net_set = {n.strip() for n in nets if n.strip()}
+    if not net_set:
+        return {"success": False, "error": "No valid net names to remove"}
+
+    removed = []
+    not_found = []
+
+    new_patterns = []
+    for p in patterns:
+        if not isinstance(p, dict):
+            new_patterns.append(p)
+            continue
+        pat = p.get("pattern", "")
+        nc = p.get("netclass", "")
+        if pat in net_set and nc == class_name:
+            removed.append(pat)
+            log.info("Removed net '%s' from class '%s'", pat, class_name)
+        else:
+            new_patterns.append(p)
+
+    for net in sorted(net_set):
+        if net not in removed:
+            not_found.append(net)
+
+    if not removed:
+        return {
+            "success": False,
+            "error": f"None of the specified nets are assigned to class '{class_name}'.",
+        }
+
+    ns["netclass_patterns"] = new_patterns
+
+    import shutil
+
+    bak_path = pro_file + ".bak"
+    try:
+        shutil.copy2(pro_file, bak_path)
+    except OSError as exc:
+        return {"success": False, "error": f"Failed to create backup: {exc}"}
+
+    try:
+        with open(pro_file, "w", encoding="utf-8") as f:
+            _json.dump(data, f, indent=2)
+    except OSError as exc:
+        return {"success": False, "error": f"Failed to write project file: {exc}"}
+
+    log.info(
+        "Removed %d net(s) from class '%s' in %s: %s",
+        len(removed),
+        class_name,
+        pro_file,
+        removed,
+    )
+    result: dict[str, Any] = {
+        "success": True,
+        "removed": removed,
+        "not_found": not_found,
+        "backup_path": bak_path,
+        "warning": f"Changes saved to {pro_file}. Reopen the project in KiCad for net assignments to take effect.",
+    }
+    return result
 
 
 def _netclass_to_dict(nc: dict) -> dict[str, Any]:

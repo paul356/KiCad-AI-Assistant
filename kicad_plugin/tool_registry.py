@@ -303,6 +303,12 @@ TOOL_POLICIES: dict[str, ToolPolicy] = {
         auto_snapshot=True,
         mark_dirty=True,
     ),
+    "remove_nets_from_class": ToolPolicy(
+        kind="file_mutation",
+        path_arg="project_path",
+        auto_snapshot=True,
+        mark_dirty=True,
+    ),
     "add_custom_rule": ToolPolicy(
         kind="file_mutation",
         path_arg="project_path",
@@ -318,6 +324,9 @@ TOOL_POLICIES: dict[str, ToolPolicy] = {
     # Skill tools
     "list_skills": ToolPolicy(kind="query"),
     "get_skill": ToolPolicy(kind="query"),
+    "add_skill": ToolPolicy(kind="query"),
+    "append_to_skill": ToolPolicy(kind="query"),
+    "delete_skill": ToolPolicy(kind="query"),
     # KiCad IPC / UI tools
     "check_kicad_ipc_connection": ToolPolicy(kind="query"),
     "save_document": ToolPolicy(kind="ipc_action", path_arg="file_path"),

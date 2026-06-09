@@ -13,7 +13,11 @@ from kcaa.utils.file_utils import get_project_files
 
 # Import implementations
 from kcaa.utils.ipc_drc import run_drc_via_ipc
-from kcaa.utils.net_settings import assign_nets_to_class_in_pro, set_net_class_in_pro
+from kcaa.utils.net_settings import (
+    assign_nets_to_class_in_pro,
+    remove_nets_from_class_in_pro,
+    set_net_class_in_pro,
+)
 from kcaa.utils.pcb_design_rules import (
     add_custom_rule_to_file,
     get_effective_design_rules_from_file,
@@ -63,7 +67,8 @@ def register_drc_tools(mcp: FastMCP) -> None:
           via sizes, etc.) from the PCB file's design rules. These are
           checked against **all** objects during DRC.
         * ``net_classes`` — per-netclass working values (clearance, track
-          width, via sizes, diff-pair dimensions) from the project file.
+          width, via sizes, diff-pair dimensions). Each entry includes a
+          ``nets`` list of assigned net names.
         * ``custom_rules`` — additional conditional DRC rules.
 
         **All layers are checked independently during DRC** — violating
@@ -179,6 +184,35 @@ def register_drc_tools(mcp: FastMCP) -> None:
             return {"success": False, "error": f"Project not found: {project_path}"}
 
         return assign_nets_to_class_in_pro(project_path, class_name, nets)
+
+    @mcp.tool()
+    def remove_nets_from_class(
+        project_path: str,
+        class_name: str,
+        nets: list[str],
+    ) -> dict[str, Any]:
+        """Remove nets from a net class, reverting them to Default.
+
+        Deletes exact-match entries from ``net_settings.netclass_patterns``
+        so the listed nets no longer receive the class's design constraints.
+        After removal, nets fall back to the Default net class.
+
+        Nets not currently in the specified class are silently skipped
+        (returned in ``not_found``).
+
+        Args:
+            project_path: Path to the KiCad project file (.kicad_pro)
+            class_name: Net class name to remove nets from (e.g. ``"VBUS"``)
+            nets: List of net names (e.g. ``["/tp4056/VBUS"]``)
+
+        Returns:
+            Dictionary with ``removed`` (nets taken out of the class),
+            ``not_found`` (nets not in the class), and ``backup_path``.
+        """
+        if not os.path.exists(project_path):
+            return {"success": False, "error": f"Project not found: {project_path}"}
+
+        return remove_nets_from_class_in_pro(project_path, class_name, nets)
 
     @mcp.tool()
     def add_custom_rule(

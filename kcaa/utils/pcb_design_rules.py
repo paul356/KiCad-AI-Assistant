@@ -102,7 +102,8 @@ def get_effective_design_rules_from_file(pcb_file: str) -> dict[str, Any]:
     * ``design_rules`` — global minimums from the project's
       ``board.design_settings.rules`` in ``.kicad_pro`` (KiCad 10.0+).
     * ``net_classes`` — per-netclass working values from the project's
-      ``net_settings.classes``.
+      ``net_settings.classes``. Each entry has a ``nets`` list of
+      assigned net names.
     * ``custom_rules`` — additional conditional constraints from the
       PCB file's ``(custom_rules ...)`` sexp section.
 
