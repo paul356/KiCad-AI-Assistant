@@ -261,34 +261,15 @@ class TestSaveDocument:
             assert result["document_type"] == "pcb"
 
     @patch("kcaa.tools.kipy_tools._connect")
-    def test_save_schematic_success(self, mock_connect):
-        """When saving a schematic file successfully."""
+    def test_save_schematic_not_supported_in_kicad10(self, mock_connect):
+        """Schematic save is not supported in KiCad 10."""
         mock_kicad = MagicMock()
         mock_connect.return_value = mock_kicad
 
-        mock_document_type = MagicMock()
-        mock_document_type.DOCTYPE_SCHEMATIC = "schematic"
+        result = _run(self.fn("/path/to/design.kicad_sch", ctx=None))
 
-        mock_sch_doc = MagicMock()
-        mock_kicad.get_open_documents.return_value = [mock_sch_doc]
-
-        mock_schematic = MagicMock()
-        mock_schematic.save.return_value = None
-
-        with patch.dict(
-            sys.modules,
-            {
-                "kipy": MagicMock(),
-                "kipy.proto": MagicMock(),
-                "kipy.proto.common": MagicMock(),
-                "kipy.proto.common.types": MagicMock(DocumentType=mock_document_type),
-                "kipy.schematic": MagicMock(Schematic=MagicMock(return_value=mock_schematic)),
-            },
-        ):
-            result = _run(self.fn("/path/to/design.kicad_sch", ctx=None))
-
-            assert result["success"] is True
-            assert result["document_type"] == "schematic"
+        assert result["success"] is False
+        assert "not yet supported in KiCad 10" in result["error"]
 
     @patch("kcaa.tools.kipy_tools._connect")
     def test_no_pcb_open(self, mock_connect):
@@ -317,54 +298,22 @@ class TestSaveDocument:
             assert "No PCB is currently open" in result["error"]
 
     @patch("kcaa.tools.kipy_tools._connect")
-    def test_no_schematic_open(self, mock_connect):
-        """When no schematic is open in KiCad."""
+    def test_save_schematic_not_supported_kicad10(self, mock_connect):
+        """Schematic save is not supported in KiCad 10."""
         mock_kicad = MagicMock()
         mock_connect.return_value = mock_kicad
 
-        mock_document_type = MagicMock()
-        mock_document_type.DOCTYPE_SCHEMATIC = "schematic"
+        result = _run(self.fn("/path/to/design.kicad_sch", ctx=None))
 
-        mock_kicad.get_open_documents.return_value = []
-
-        # Create proper mock modules
-        mock_kipy_proto_common_types = MagicMock()
-        mock_kipy_proto_common_types.DocumentType = mock_document_type
-
-        mock_kipy_proto_common = MagicMock()
-        mock_kipy_proto_common.types = mock_kipy_proto_common_types
-
-        mock_kipy_proto = MagicMock()
-        mock_kipy_proto.common = mock_kipy_proto_common
-
-        mock_kipy_schematic = MagicMock()
-        mock_kipy_schematic.Schematic = MagicMock()
-
-        mock_kipy = MagicMock()
-        mock_kipy.proto = mock_kipy_proto
-        mock_kipy.schematic = mock_kipy_schematic
-
-        with patch.dict(
-            sys.modules,
-            {
-                "kipy": mock_kipy,
-                "kipy.proto": mock_kipy_proto,
-                "kipy.proto.common": mock_kipy_proto_common,
-                "kipy.proto.common.types": mock_kipy_proto_common_types,
-                "kipy.schematic": mock_kipy_schematic,
-            },
-        ):
-            result = _run(self.fn("/path/to/design.kicad_sch", ctx=None))
-
-            assert result["success"] is False
-            assert "No schematic is currently open" in result["error"]
+        assert result["success"] is False
+        assert "not yet supported in KiCad 10" in result["error"]
 
     def test_unsupported_file_type(self):
         """When file extension is not supported."""
         result = _run(self.fn("/path/to/file.txt", ctx=None))
 
         assert result["success"] is False
-        assert "Unsupported file type" in result["error"]
+        assert "Only .kicad_pcb files can be saved" in result["error"]
 
     @patch("kcaa.tools.kipy_tools._connect")
     def test_kicad_not_running(self, mock_connect):
@@ -413,7 +362,7 @@ class TestReloadKicad:
         assert result["success"] is False
         assert "/path/to/design.kicad_sch" in result["failed"]
         assert "errors" in result
-        assert "automatically" in result["errors"]["/path/to/design.kicad_sch"].lower()
+        assert "not yet supported in KiCad 10" in result["errors"]["/path/to/design.kicad_sch"]
 
     @patch("kcaa.utils.kipy_reload.try_reload_pcb_in_kicad", side_effect=RuntimeError("IPC error"))
     def test_reload_pcb_failure(self, mock_reload):
