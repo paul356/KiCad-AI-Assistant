@@ -1,0 +1,18 @@
+name: Enforce PR from develop to main
+on:
+  pull_request:
+    branches:
+      - main
+jobs:
+  check-source:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail if PR is not from develop
+        if: github.event.pull_request.head.ref != 'develop'
+        run: |
+          echo "ERROR: Pull requests to main must come from the 'develop' branch."
+          echo "Current head ref: ${{ github.event.pull_request.head.ref }}"
+          exit 1
+      - name: Pass if from develop
+        if: github.event.pull_request.head.ref == 'develop'
+        run: echo "PR source is develop. All good."
