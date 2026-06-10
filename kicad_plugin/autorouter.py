@@ -184,11 +184,15 @@ def _run_subprocess(
     on_progress: Callable[[str], None] | None,
     ignore_nets: list[str] | None,
     max_passes: int,
+    clearance_mm: float | None = None,
 ) -> tuple[bool, str, str, str]:
     """Run FreeRouting synchronously and return (success, message, stdout, stderr).
 
     This function has NO pcbnew calls and is safe to run in a background thread.
     The DSN file must already exist at *dsn_path* before this is called.
+
+    *clearance_mm*: if provided, passed as the ``-dr`` (design rule) flag so
+    FreeRouting uses this clearance instead of the DSN-embedded value.
     """
 
     def _progress(msg: str) -> None:
@@ -220,6 +224,12 @@ def _run_subprocess(
         "-mp",
         str(max_passes),
     ]
+
+    # Insert -dr flag after -jar if clearance was specified
+    if clearance_mm is not None:
+        cmd.insert(3, str(clearance_mm))
+        cmd.insert(3, "-dr")
+        log.info("freerouting: using -dr %s mm", clearance_mm)
 
     cmd_str = " ".join(cmd)
     _progress(f"Running FreeRouting (max {max_passes} passes)…")
@@ -264,6 +274,7 @@ def start_freerouting_thread(
     on_progress: Callable[[str], None] | None = None,
     ignore_nets: list[str] | None = None,
     max_passes: int = 50,
+    clearance_mm: float | None = None,
 ) -> threading.Thread:
     """Start FreeRouting in a background daemon thread.
 
@@ -286,11 +297,14 @@ def start_freerouting_thread(
         FreeRouting runs, so they stay as ratsnest and are not routed.
     max_passes:
         Maximum routing passes (``-mp`` flag).
+    clearance_mm:
+        Design rule clearance in millimeters (``-dr`` flag).  When omitted
+        FreeRouting uses the DSN-embedded clearance value.
     """
 
     def _worker() -> None:
         success, message, stdout, stderr = _run_subprocess(
-            dsn_path, ses_path, on_progress, ignore_nets, max_passes
+            dsn_path, ses_path, on_progress, ignore_nets, max_passes, clearance_mm
         )
         on_done(success, message, stdout, stderr)
 

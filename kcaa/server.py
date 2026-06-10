@@ -27,6 +27,7 @@ from fastmcp import FastMCP
 # loading kicad-cli-dependent modules when running in plugin mode.
 from kcaa.context import kicad_lifespan
 from kcaa.tools.component_edit_tools import register_component_edit_tools
+from kcaa.tools.drc_tools import register_drc_tools
 from kcaa.tools.kipy_tools import register_kipy_tools
 
 # Plugin profile tools — always imported (skip-based, no kicad-cli dependency)
@@ -107,7 +108,7 @@ def register_signal_handlers(server: FastMCP) -> None:
 
 
 def _register_plugin_profile(mcp: FastMCP) -> None:
-    """Register only the skip-based schematic editing tools for the plugin profile."""
+    """Register only the skip-based schematic/PCB editing tools + IPC-based tools for the plugin profile."""
     logging.info("Registering plugin profile: schematic + PCB tools")
     register_netlist_tools(mcp)
     register_symbol_tools(mcp)
@@ -123,6 +124,7 @@ def _register_plugin_profile(mcp: FastMCP) -> None:
     register_pcb_group_tools(mcp)
     register_pcb_zone_tools(mcp)
     register_kipy_tools(mcp)
+    register_drc_tools(mcp)
     register_skill_tools(mcp)
     register_version_tools(mcp)
 

@@ -943,6 +943,99 @@ class LLMClient:
                 return True
         return False
 
+    def _validate_history(self) -> None:
+        """Repair orphaned tool_calls in self._history.
+
+        An assistant message that contains ``tool_calls`` must be immediately
+        followed by role="tool" messages with matching ``tool_call_id`` values.
+        If any are missing (e.g. due to a truncated stream), the API will
+        reject the request with HTTP 400.  This method detects and repairs
+        such inconsistencies before they reach the LLM.
+
+        Repair strategy for each malformed assistant message:
+        * If ALL tool_calls are orphaned → drop the entire assistant message.
+        * If SOME are orphaned → strip only the orphaned entries from
+          ``tool_calls``, keeping the valid ones and any text content.
+        """
+        i = 0
+        removed_count = 0
+        while i < len(self._history):
+            msg = self._history[i]
+            tool_calls = msg.get("tool_calls") if msg.get("role") == "assistant" else None
+            if not tool_calls:
+                i += 1
+                continue
+
+            # Collect all tool_call_ids declared by this assistant message
+            declared_ids: set[str] = set()
+            tc_names: dict[str, str] = {}
+            for tc in tool_calls:
+                tc_id = tc.get("id", "")
+                if tc_id:
+                    declared_ids.add(tc_id)
+                    tc_names[tc_id] = tc.get("function", {}).get("name", "?")
+
+            if not declared_ids:
+                i += 1
+                continue
+
+            # Collect tool_call_ids from immediately-following tool messages
+            satisfied_ids: set[str] = set()
+            j = i + 1
+            while j < len(self._history) and self._history[j].get("role") == "tool":
+                tc_id = self._history[j].get("tool_call_id", "")
+                if tc_id:
+                    satisfied_ids.add(tc_id)
+                j += 1
+
+            orphaned = declared_ids - satisfied_ids
+            if not orphaned:
+                i = j  # skip past the tool-results we just scanned
+                continue
+
+            # Log the corruption
+            orphaned_info = ", ".join(f"{tc_names.get(oid, '?')}({oid[:8]}…)" for oid in orphaned)
+            log.warning(
+                "_validate_history: %d orphaned tool_call(s) at history[%d]: %s",
+                len(orphaned),
+                i,
+                orphaned_info,
+            )
+
+            if orphaned == declared_ids:
+                # All tool_calls are orphaned — drop the entire assistant message
+                log.warning(
+                    "_validate_history: dropping assistant message at history[%d] "
+                    "(all %d tool_calls orphaned)",
+                    i,
+                    len(orphaned),
+                )
+                del self._history[i]
+                removed_count += 1
+                # Don't advance i — next message slides into this position
+                continue
+
+            # Partial corruption — strip only orphaned tool_calls
+            surviving = [tc for tc in tool_calls if tc.get("id") not in orphaned]
+            log.warning(
+                "_validate_history: stripping %d orphaned tool_call(s) from "
+                "assistant at history[%d] (%d surviving)",
+                len(orphaned),
+                i,
+                len(surviving),
+            )
+            msg = dict(msg)  # shallow copy before mutating
+            msg["tool_calls"] = surviving
+            self._history[i] = msg
+            removed_count += 1
+            i = j  # skip past the tool-results we scanned
+
+        if removed_count:
+            log.warning(
+                "_validate_history: repaired %d corrupted assistant turn(s)",
+                removed_count,
+            )
+
     def _maybe_compact(self, system_prompt: str) -> None:
         """Dedup tool calls then, if the token budget is exceeded, compact history.
 
@@ -984,6 +1077,7 @@ class LLMClient:
         )
 
         self._compact_history(system_prompt, target_summary_chars)
+        self._validate_history()  # compaction rebuilds history; verify integrity
 
     @staticmethod
     def _tool_result_succeeded(result: Any) -> bool:
@@ -1090,6 +1184,11 @@ class LLMClient:
                 state.snapshotted_paths.add(path)
 
         result = call_mcp_tool(self._mcp_base_url, tool_name, args)
+
+        # Run plugin-side post-process hook (e.g. DRC marker reading via pcbnew)
+        if policy.post_process is not None:
+            result = policy.post_process(result)
+
         self._emit_tool_callback(on_tool_call, tool_name, args, result)
 
         if not self._tool_result_succeeded(result):
@@ -1257,6 +1356,7 @@ class LLMClient:
 
     def _call_llm(self, system: str, tools: list[dict], on_text_delta=None) -> dict[str, Any]:
         """Dispatch to the configured LLM provider."""
+        self._validate_history()  # guard against corrupted history before every API call
         provider = self._settings.llm_provider
         if on_text_delta is not None:
             if provider == "anthropic":

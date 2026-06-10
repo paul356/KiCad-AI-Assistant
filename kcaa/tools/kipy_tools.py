@@ -155,14 +155,17 @@ def register_kipy_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
     async def save_document(file_path: str, ctx: Context | None = None) -> dict:
-        """Save the currently open document (PCB or schematic) in KiCad.
+        """Save the currently open PCB document in KiCad.
 
         Uses the IPC API to trigger KiCad's save operation, which writes
         the document to disk and clears the modified (dirty) flag in the UI.
-        The document type is determined by the file extension.
+
+        Note: Schematic (.kicad_sch) save is not yet supported in KiCad 10
+        due to breaking IPC API changes.  Project files (.kicad_pro) are
+        managed automatically by KiCad when you save the board.
 
         Args:
-            file_path: Path to the document file (.kicad_pcb or .kicad_sch).
+            file_path: Path to the PCB file (.kicad_pcb).
 
         Returns:
             dict with keys:
@@ -185,18 +188,32 @@ def register_kipy_tools(mcp: FastMCP) -> None:
                 return {"success": True, "document_type": "pcb"}
 
             elif file_path.endswith(".kicad_sch"):
-                from kipy.proto.common.types import DocumentType  # noqa: PLC0415
-                from kipy.schematic import Schematic  # noqa: PLC0415
+                return {
+                    "success": False,
+                    "error": (
+                        "Schematic save is not yet supported in KiCad 10 due to breaking API changes. "
+                        "As a workaround, KiCad auto-saves schematics — use File → Save in the "
+                        "Schematic Editor or press Ctrl+S after editing."
+                    ),
+                }
 
-                docs = kicad.get_open_documents(DocumentType.DOCTYPE_SCHEMATIC)
-                if not docs:
-                    return {"success": False, "error": "No schematic is currently open in KiCad"}
-                schematic = Schematic(kicad._client, docs[0])
-                schematic.save()
-                return {"success": True, "document_type": "schematic"}
+            elif file_path.endswith(".kicad_pro"):
+                return {
+                    "success": False,
+                    "error": (
+                        "Project files (.kicad_pro) are managed automatically by KiCad when you "
+                        "save the board. Use the .kicad_pcb path instead to save changes."
+                    ),
+                }
 
             else:
-                return {"success": False, "error": f"Unsupported file type: {file_path}"}
+                return {
+                    "success": False,
+                    "error": (
+                        f"Unsupported file type: {file_path}. "
+                        "Only .kicad_pcb files can be saved via the IPC API."
+                    ),
+                }
 
         except RuntimeError as exc:
             return {"success": False, "error": str(exc)}
@@ -230,8 +247,11 @@ def register_kipy_tools(mcp: FastMCP) -> None:
         revert call based on file extension.
 
         Supported extensions:
-            .kicad_sch  — reverts the schematic via the IPC API
             .kicad_pcb  — reverts the board via the IPC API
+            .kicad_sch  — not supported in KiCad 10; a manual-revert hint is returned
+
+        Project files (.kicad_pro) do not need separate reloading — KiCad
+        manages them automatically when you reload the board.
 
         Args:
             paths: List of absolute file paths to reload (e.g.
@@ -262,8 +282,8 @@ def register_kipy_tools(mcp: FastMCP) -> None:
                 else:
                     failed.append(path)
                     errors[path] = (
-                        "Schematic could not be reloaded automatically. "
-                        "Use File → Revert in the KiCad Schematic Editor."
+                        "Schematic reload is not yet supported in KiCad 10 due to breaking "
+                        "API changes. Use File → Revert in the KiCad Schematic Editor instead."
                     )
             elif path.endswith(".kicad_pcb"):
                 try:
@@ -272,9 +292,18 @@ def register_kipy_tools(mcp: FastMCP) -> None:
                 except Exception as exc:
                     failed.append(path)
                     errors[path] = str(exc)
+            elif path.endswith(".kicad_pro"):
+                failed.append(path)
+                errors[path] = (
+                    "Project files (.kicad_pro) are managed automatically by KiCad when you "
+                    "reload the board. Use the .kicad_pcb path instead to reload changes."
+                )
             else:
                 failed.append(path)
-                errors[path] = f"Unsupported file extension: {path!r}"
+                errors[path] = (
+                    f"Unsupported file extension: {path!r}. "
+                    "Only .kicad_pcb and .kicad_sch files can be reloaded."
+                )
 
         return {
             "success": len(failed) == 0,
