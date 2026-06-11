@@ -418,6 +418,96 @@ def remove_nets_from_class_in_pro(
     return result
 
 
+def delete_net_class_from_pro(pro_file: str, class_name: str) -> dict[str, Any]:
+    """Delete a net class definition from the project file.
+
+    Removes the class entry from ``net_settings.classes`` and cleans up any
+    ``netclass_patterns`` pointing to it — those nets revert to the Default
+    net class.  Creating a ``.kicad_pro.bak`` backup automatically.
+
+    The ``"Default"`` net class cannot be deleted.
+
+    Args:
+        pro_file: Absolute path to the .kicad_pro file.
+        class_name: Name of the net class to delete.
+
+    Returns:
+        ``{"success": True, "deleted": true, "cleared_patterns": [...], "backup_path": ...}``
+        or error dict.
+    """
+    if class_name == "Default":
+        return {"success": False, "error": "Cannot delete the Default net class."}
+
+    try:
+        with open(pro_file, encoding="utf-8") as f:
+            data = _json.load(f)
+    except (FileNotFoundError, _json.JSONDecodeError, PermissionError) as exc:
+        return {"success": False, "error": f"Cannot read project file: {exc}"}
+
+    ns = data.get("net_settings")
+    if ns is None:
+        return {"success": False, "error": "No net_settings section in project file"}
+
+    classes = ns.get("classes")
+    if not isinstance(classes, list):
+        return {"success": False, "error": "No classes array in net_settings"}
+
+    # Locate and remove the target class
+    original_len = len(classes)
+    new_classes = [
+        nc for nc in classes if not (isinstance(nc, dict) and nc.get("name") == class_name)
+    ]
+    if len(new_classes) == original_len:
+        return {
+            "success": False,
+            "error": f"Net class '{class_name}' not found in project file.",
+        }
+    ns["classes"] = new_classes
+
+    # Clean up netclass_patterns that reference the deleted class
+    patterns: list[dict] = ns.get("netclass_patterns")
+    cleared_patterns: list[str] = []
+    if isinstance(patterns, list):
+        new_patterns = []
+        for p in patterns:
+            if isinstance(p, dict) and p.get("netclass") == class_name:
+                cleared_patterns.append(p.get("pattern", ""))
+                log.info(
+                    "Removed pattern '%s' from deleted class '%s'", p.get("pattern"), class_name
+                )
+            else:
+                new_patterns.append(p)
+        ns["netclass_patterns"] = new_patterns
+
+    import shutil
+
+    bak_path = pro_file + ".bak"
+    try:
+        shutil.copy2(pro_file, bak_path)
+    except OSError as exc:
+        return {"success": False, "error": f"Failed to create backup: {exc}"}
+
+    try:
+        with open(pro_file, "w", encoding="utf-8") as f:
+            _json.dump(data, f, indent=2)
+    except OSError as exc:
+        return {"success": False, "error": f"Failed to write project file: {exc}"}
+
+    log.info(
+        "Deleted net class '%s' from %s (cleared %d patterns)",
+        class_name,
+        pro_file,
+        len(cleared_patterns),
+    )
+    return {
+        "success": True,
+        "deleted": True,
+        "cleared_patterns": cleared_patterns,
+        "backup_path": bak_path,
+        "warning": f"Net class '{class_name}' deleted from {pro_file}. Reopen the project in KiCad for changes to take effect.",
+    }
+
+
 def _netclass_to_dict(nc: dict) -> dict[str, Any]:
     """Convert a raw netclass dict to our canonical format (only design-relevant fields)."""
     entry: dict[str, Any] = {"name": nc.get("name", "")}

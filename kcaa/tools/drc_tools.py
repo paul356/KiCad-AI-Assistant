@@ -15,6 +15,7 @@ from kcaa.utils.file_utils import get_project_files
 from kcaa.utils.ipc_drc import run_drc_via_ipc
 from kcaa.utils.net_settings import (
     assign_nets_to_class_in_pro,
+    delete_net_class_from_pro,
     remove_nets_from_class_in_pro,
     set_net_class_in_pro,
 )
@@ -213,6 +214,31 @@ def register_drc_tools(mcp: FastMCP) -> None:
             return {"success": False, "error": f"Project not found: {project_path}"}
 
         return remove_nets_from_class_in_pro(project_path, class_name, nets)
+
+    @mcp.tool()
+    def delete_net_class(project_path: str, class_name: str) -> dict[str, Any]:
+        """Delete a net class definition from the project file.
+
+        Removes the net class entry and cleans up all net assignments
+        pointing to it — those nets revert to the Default net class.
+        A ``.bak`` backup is created automatically.
+
+        The ``"Default"`` net class cannot be deleted.  Use
+        ``remove_nets_from_class`` first if you only want to move nets
+        out of a class while keeping the class definition.
+
+        Args:
+            project_path: Path to the KiCad project file (.kicad_pro)
+            class_name: Name of the net class to delete (e.g. ``"Power"``)
+
+        Returns:
+            Dictionary with ``deleted``, ``cleared_patterns``, and
+            ``backup_path`` keys, or error.
+        """
+        if not os.path.exists(project_path):
+            return {"success": False, "error": f"Project not found: {project_path}"}
+
+        return delete_net_class_from_pro(project_path, class_name)
 
     @mcp.tool()
     def add_custom_rule(
