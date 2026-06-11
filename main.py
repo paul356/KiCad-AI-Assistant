@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-KiCad MCP Server - A Model Context Protocol server for KiCad on macOS.
+KiCad MCP Server - A Model Context Protocol server for KiCad (Linux, Windows, macOS).
 This server allows Claude and other MCP clients to interact with KiCad projects.
 """
 
