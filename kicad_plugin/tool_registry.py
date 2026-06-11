@@ -309,6 +309,12 @@ TOOL_POLICIES: dict[str, ToolPolicy] = {
         auto_snapshot=True,
         mark_dirty=True,
     ),
+    "delete_net_class": ToolPolicy(
+        kind="file_mutation",
+        path_arg="project_path",
+        auto_snapshot=True,
+        mark_dirty=True,
+    ),
     "add_custom_rule": ToolPolicy(
         kind="file_mutation",
         path_arg="project_path",
