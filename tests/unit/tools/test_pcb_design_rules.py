@@ -19,7 +19,7 @@ from kcaa.utils.pcb_design_rules import (
 # Helpers
 # ---------------------------------------------------------------------------
 
-# A minimal-but-realistic .kicad_pcb template (still needed for custom_rules tests).
+# A minimal-but-realistic .kicad_pcb template (no longer embeds custom_rules).
 _PCB_TEMPLATE = """(kicad_pcb
 \t(version 20260206)
 \t(generator "pcbnew")
@@ -37,25 +37,25 @@ _PCB_TEMPLATE = """(kicad_pcb
 \t\t\t(hole_clearance 0.25)
 \t\t\t(silk_clearance 0.15)
 \t\t)
-\t\t{custom_rules_block}
 \t)
 \t(net "VCC")
 \t(net "GND")
 )
 """
 
-_CUSTOM_RULES_BLOCK = """(custom_rules
-\t\t\t(rule "High voltage"
-\t\t\t\t(condition "A.NetClass == 'HV'")
-\t\t\t\t(constraint clearance min 1.0)
-\t\t\t\t(severity error)
-\t\t\t)
-\t\t\t(rule "Fine tracks"
-\t\t\t\t(condition "A.Type == 'track'")
-\t\t\t\t(constraint track_width min 0.1)
-\t\t\t\t(severity warning)
-\t\t\t)
-\t\t)"""
+# A .kicad_dru template with two custom rules (KiCad 10.0+ format).
+_DRU_WITH_RULES = """(version 1)
+(rule "High voltage"
+\t(condition "A.NetClass == 'HV'")
+\t(constraint clearance (min 1.0mm))
+\t(severity error)
+)
+(rule "Fine tracks"
+\t(condition "A.Type == 'track'")
+\t(constraint track_width (min 0.1mm))
+\t(severity warning)
+)
+"""
 
 # A PCB file with NO setup section at all.
 _PCB_NO_SETUP = """(kicad_pcb
@@ -76,8 +76,8 @@ _PCB_SETUP_NO_DR = """(kicad_pcb
 )
 """
 
-# A PCB file with setup + design_rules but NO custom_rules.
-_PCB_NO_CUSTOM = """(kicad_pcb
+# A PCB file with setup + design_rules section.
+_PCB_WITH_SETUP = """(kicad_pcb
 \t(version 20260206)
 \t(generator "pcbnew")
 \t(setup
@@ -93,6 +93,14 @@ _PCB_NO_CUSTOM = """(kicad_pcb
 def _write_pcb(content: str, dir_: str) -> str:
     """Write *content* to a temp .kicad_pcb file and return its path."""
     path = os.path.join(dir_, "test_board.kicad_pcb")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(content)
+    return path
+
+
+def _write_dru(content: str, dir_: str, stem: str = "test_board") -> str:
+    """Write *content* to a temp .kicad_dru file and return its path."""
+    path = os.path.join(dir_, f"{stem}.kicad_dru")
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(content)
     return path
@@ -180,8 +188,7 @@ class TestGetEffectiveDesignRules:
 
     def test_reads_all_known_fields(self, tmp_path):
         """All design_rule fields from the .kicad_pro JSON are parsed."""
-        content = _PCB_TEMPLATE.format(custom_rules_block="")
-        pcb = _write_pcb_and_pro(content, str(tmp_path))
+        pcb = _write_pcb_and_pro(_PCB_TEMPLATE, str(tmp_path))
 
         result = get_effective_design_rules_from_file(pcb)
 
@@ -318,8 +325,8 @@ class TestGetCustomRules:
 
     def test_reads_multiple_rules(self, tmp_path):
         """Two custom rules are parsed with all fields."""
-        content = _PCB_TEMPLATE.format(custom_rules_block=_CUSTOM_RULES_BLOCK)
-        pcb = _write_pcb(content, str(tmp_path))
+        pcb = _write_pcb(_PCB_TEMPLATE, str(tmp_path))
+        _write_dru(_DRU_WITH_RULES, str(tmp_path))
 
         result = get_custom_rules_from_file(pcb)
 
@@ -338,17 +345,17 @@ class TestGetCustomRules:
         assert r1["severity"] == "warning"
 
     def test_no_custom_rules(self, tmp_path):
-        """When no custom_rules subsection, returns empty list."""
-        pcb = _write_pcb(_PCB_NO_CUSTOM, str(tmp_path))
+        """When no .kicad_dru file, returns empty list."""
+        pcb = _write_pcb(_PCB_WITH_SETUP, str(tmp_path))
 
         result = get_custom_rules_from_file(pcb)
 
         assert result["success"] is True
         assert result["rules"] == []
-        assert "No (custom_rules" in result.get("message", "")
+        assert ".kicad_dru" in result.get("message", "")
 
-    def test_no_setup_section(self, tmp_path):
-        """When no setup section, returns empty list."""
+    def test_no_dru_file(self, tmp_path):
+        """When no .kicad_dru file at all, returns empty list."""
         pcb = _write_pcb(_PCB_NO_SETUP, str(tmp_path))
 
         result = get_custom_rules_from_file(pcb)
@@ -365,10 +372,10 @@ class TestGetCustomRules:
 class TestAddCustomRule:
     """Tests for add_custom_rule_to_file."""
 
-    def test_adds_rule_to_existing_custom_rules(self, tmp_path):
-        """Rule is appended when custom_rules section already exists."""
-        content = _PCB_TEMPLATE.format(custom_rules_block=_CUSTOM_RULES_BLOCK)
-        pcb = _write_pcb(content, str(tmp_path))
+    def test_adds_rule_to_existing_dru(self, tmp_path):
+        """Rule is appended when .kicad_dru already has rules."""
+        pcb = _write_pcb(_PCB_TEMPLATE, str(tmp_path))
+        _write_dru(_DRU_WITH_RULES, str(tmp_path))
 
         result = add_custom_rule_to_file(
             pcb, "Test rule", "A.NetName == 'CLK'", "clearance", 0.5, "warning"
@@ -376,7 +383,8 @@ class TestAddCustomRule:
 
         assert result["success"] is True
         assert result["rule"]["name"] == "Test rule"
-        assert result["backup_path"].endswith(".bak")
+        backup = result.get("backup_path")
+        assert backup is not None and backup.endswith(".bak")
 
         # Re-read and verify
         rules = get_custom_rules_from_file(pcb)
@@ -386,22 +394,24 @@ class TestAddCustomRule:
         assert new_rule["condition"] == "A.NetName == 'CLK'"
         assert new_rule["severity"] == "warning"
 
-    def test_adds_rule_when_no_custom_rules_section(self, tmp_path):
-        """Creates the custom_rules section if it doesn't exist."""
-        pcb = _write_pcb(_PCB_NO_CUSTOM, str(tmp_path))
+    def test_creates_dru_when_no_file(self, tmp_path):
+        """Creates .kicad_dru when it doesn't exist."""
+        pcb = _write_pcb(_PCB_WITH_SETUP, str(tmp_path))
 
         result = add_custom_rule_to_file(
             pcb, "New rule", "A.NetClass == 'Power'", "track_width", 0.25, "error"
         )
 
         assert result["success"] is True
+        # No backup when file didn't exist
+        assert result.get("backup_path") is None
 
         rules = get_custom_rules_from_file(pcb)
         assert len(rules["rules"]) == 1
         assert rules["rules"][0]["name"] == "New rule"
 
-    def test_adds_rule_when_no_setup_section(self, tmp_path):
-        """Creates both setup and custom_rules sections."""
+    def test_creates_dru_when_no_setup(self, tmp_path):
+        """Creates .kicad_dru even when PCB has no setup section."""
         pcb = _write_pcb(_PCB_NO_SETUP, str(tmp_path))
 
         result = add_custom_rule_to_file(
@@ -409,13 +419,14 @@ class TestAddCustomRule:
         )
 
         assert result["success"] is True
+        assert result.get("backup_path") is None
 
         rules = get_custom_rules_from_file(pcb)
         assert len(rules["rules"]) == 1
 
     def test_rejects_invalid_severity(self, tmp_path):
         """Invalid severity value is rejected."""
-        pcb = _write_pcb(_PCB_TEMPLATE.format(custom_rules_block=""), str(tmp_path))
+        pcb = _write_pcb(_PCB_TEMPLATE, str(tmp_path))
 
         result = add_custom_rule_to_file(
             pcb, "Bad rule", "A.NetClass == 'X'", "clearance", 1.0, "critical"

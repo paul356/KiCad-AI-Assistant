@@ -273,7 +273,7 @@ def start_freerouting_thread(
     on_done: Callable[[bool, str, str, str], None],
     on_progress: Callable[[str], None] | None = None,
     ignore_nets: list[str] | None = None,
-    max_passes: int = 50,
+    max_passes: int = 100,
     clearance_mm: float | None = None,
 ) -> threading.Thread:
     """Start FreeRouting in a background daemon thread.

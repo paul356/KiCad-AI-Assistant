@@ -260,7 +260,7 @@ class TestStartFreeroutingThread:
         call_args = mock_run.call_args
         assert call_args is not None
         # positional: dsn_path, ses_path, on_progress, ignore_nets, max_passes, clearance_mm
-        assert call_args[0][4] == 50  # max_passes (default)
+        assert call_args[0][4] == 100  # max_passes (default)
         assert call_args[0][5] == 0.3  # clearance_mm
 
     def test_clearance_none_not_passed_explicitly(self, tmp_path):

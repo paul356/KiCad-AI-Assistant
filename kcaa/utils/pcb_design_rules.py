@@ -9,11 +9,11 @@ or kicad-cli is required.
 
 import json as _json
 import logging
+import os
+import shutil
 from typing import Any
 
 import sexpdata
-
-from kcaa.utils.pcb_sexp_utils import load_pcb, save_pcb
 
 log = logging.getLogger(__name__)
 
@@ -80,6 +80,58 @@ def _find_section(tree: list[Any], tag: str) -> list[Any] | None:
         if isinstance(item, list) and len(item) > 0 and item[0] == tag_sym:
             return item
     return None
+
+
+def _dru_path(pcb_file: str) -> str:
+    """Derive the .kicad_dru path from a .kicad_pcb path."""
+    return pcb_file.replace(".kicad_pcb", ".kicad_dru")
+
+
+def _load_dru(dru_file: str) -> list[Any]:
+    """Parse a .kicad_dru file and return its S-expression tree.
+
+    Uses ``sexpdata.parse`` because dru files contain multiple top-level
+    forms (``(version 1)`` + ``(rule ...)`` etc.), unlike .kicad_pcb
+    which has a single ``(kicad_pcb ...)`` wrapper.
+    """
+    with open(dru_file, encoding="utf-8") as f:
+        return sexpdata.parse(f.read())
+
+
+def _save_dru(dru_file: str, data: list[Any]) -> str | None:
+    """Write *data* to *dru_file*, creating a .bak backup first if file exists.
+
+    Each top-level form in *data* is serialised on its own line so that
+    the file can be round-tripped with ``sexpdata.parse``.
+
+    Returns the backup path or None if the file didn't exist yet.
+    """
+    bak_path = None
+    if os.path.exists(dru_file):
+        bak_path = dru_file + ".bak"
+        shutil.copy2(dru_file, bak_path)
+
+    lines = [sexpdata.dumps(item) for item in data]
+    text = "\n".join(lines) + "\n"
+    tmp_path = dru_file + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(tmp_path, dru_file)
+    return bak_path
+
+
+def _parse_dru_value(val: Any) -> float:
+    """Parse a dru constraint value, stripping unit suffix (e.g. '0.4mm' → 0.4)."""
+    s = _str_symbol(val)
+    for unit in ("mm", "mil", "um", "nm", "inch", "in"):
+        if s.endswith(unit):
+            return float(s[: -len(unit)])
+    return float(s)
+
+
+def _format_dru_value(value: float) -> sexpdata.Symbol:
+    """Format a constraint value for dru output, adding mm suffix."""
+    return sexpdata.Symbol(f"{value}mm")
 
 
 def _str_symbol(val: Any) -> str:
@@ -262,34 +314,31 @@ def update_design_rules_in_file(pro_file: str, updates: dict[str, float]) -> dic
 
 
 def get_custom_rules_from_file(pcb_file: str) -> dict[str, Any]:
-    """Read custom design rules from a ``.kicad_pcb`` file.
+    """Read custom design rules from the ``.kicad_dru`` file.
+
+    KiCad 10.0 stores custom DRC rules in the .kicad_dru file, not in
+    .kicad_pcb.  This function derives the dru path from the pcb path.
 
     Args:
-        pcb_file: Absolute path to the ``.kicad_pcb`` file.
+        pcb_file: Absolute path to the ``.kicad_pcb`` file (used to
+                  derive the ``.kicad_dru`` path).
 
     Returns:
         ``{"success": True, "rules": [...]}`` with a list of custom
         rule dicts, or an error dict.
     """
+    dru_file = _dru_path(pcb_file)
+
+    if not os.path.exists(dru_file):
+        return {"success": True, "rules": [], "message": "No .kicad_dru file found."}
+
     try:
-        tree = load_pcb(pcb_file)
+        tree = _load_dru(dru_file)
     except (FileNotFoundError, ValueError) as exc:
         return {"success": False, "error": str(exc)}
 
-    setup = _find_section(tree, "setup")
-    if setup is None:
-        return {
-            "success": True,
-            "rules": [],
-            "message": "No (setup ...) section found in PCB file.",
-        }
-
-    cr_section = _find_section(setup, "custom_rules")
-    if cr_section is None:
-        return {"success": True, "rules": [], "message": "No (custom_rules ...) subsection found."}
-
     rules: list[dict[str, Any]] = []
-    for item in cr_section[1:]:
+    for item in tree:
         if isinstance(item, list) and len(item) >= 2 and _str_symbol(item[0]) == "rule":
             rule = _parse_custom_rule(item)
             if rule:
@@ -306,11 +355,15 @@ def add_custom_rule_to_file(
     value: float,
     severity: str = "error",
 ) -> dict[str, Any]:
-    """Append a custom design rule to the ``(custom_rules ...)`` section.
+    """Append a custom design rule to the ``.kicad_dru`` file.
+
+    KiCad 10.0 stores custom DRC rules in .kicad_dru.  If the file does
+    not exist yet, it is created with a ``(version 1)`` header.
 
     Args:
-        pcb_file: Absolute path to the ``.kicad_pcb`` file.
-        name: Human-readable rule name.
+        pcb_file: Absolute path to the ``.kicad_pcb`` file (used to
+                  derive the ``.kicad_dru`` path).
+        name: Human-readable rule name (a Symbol, no quotes).
         condition: Lisp-style condition expression (e.g.
                    ``"A.NetClass == 'HV'"``).
         constraint_type: One of ``clearance``, ``track_width``, ``hole_size``,
@@ -328,42 +381,36 @@ def add_custom_rule_to_file(
             "error": f"Invalid severity '{severity}'. Must be one of {sorted(valid_severities)}.",
         }
 
-    try:
-        tree = load_pcb(pcb_file)
-    except (FileNotFoundError, ValueError) as exc:
-        return {"success": False, "error": str(exc)}
+    dru_file = _dru_path(pcb_file)
 
-    # Find or create (setup ...)
-    setup = _find_section(tree, "setup")
-    if setup is None:
-        setup = [sexpdata.Symbol("setup")]
-        tree.append(setup)
+    # Load existing dru or create new tree
+    if os.path.exists(dru_file):
+        try:
+            tree = _load_dru(dru_file)
+        except (FileNotFoundError, ValueError) as exc:
+            return {"success": False, "error": str(exc)}
+    else:
+        tree = [sexpdata.Symbol("version"), 1]
 
-    # Find or create (custom_rules ...)
-    cr_section = _find_section(setup, "custom_rules")
-    if cr_section is None:
-        cr_section = [sexpdata.Symbol("custom_rules")]
-        setup.append(cr_section)
-
-    # Build the new rule sexp
+    # Build the new rule sexp in dru format:
+    # (rule Name (condition "...") (constraint type (min 0.4mm)) (severity error))
     rule_sexp: list[Any] = [
         sexpdata.Symbol("rule"),
-        name,
+        sexpdata.Symbol(name),
         [sexpdata.Symbol("condition"), condition],
         [
             sexpdata.Symbol("constraint"),
             sexpdata.Symbol(constraint_type),
-            sexpdata.Symbol("min"),
-            value,
+            [sexpdata.Symbol("min"), _format_dru_value(value)],
         ],
         [sexpdata.Symbol("severity"), sexpdata.Symbol(severity)],
     ]
-    cr_section.append(rule_sexp)
+    tree.append(rule_sexp)
 
     try:
-        bak_path = save_pcb(pcb_file, tree)
+        bak_path = _save_dru(dru_file, tree)
     except OSError as exc:
-        return {"success": False, "error": f"Failed to save PCB file: {exc}"}
+        return {"success": False, "error": f"Failed to save dru file: {exc}"}
 
     rule_dict = {
         "name": name,
@@ -375,58 +422,60 @@ def add_custom_rule_to_file(
 
 
 def remove_custom_rule_from_file(pcb_file: str, rule_name: str) -> dict[str, Any]:
-    """Remove a custom design rule by name from the ``(custom_rules ...)`` section.
+    """Remove a custom design rule by name from the ``.kicad_dru`` file.
 
     A ``.bak`` backup is created automatically.
 
     Args:
-        pcb_file: Absolute path to the ``.kicad_pcb`` file.
+        pcb_file: Absolute path to the ``.kicad_pcb`` file (used to
+                  derive the ``.kicad_dru`` path).
         rule_name: Name of the custom rule to remove (matches the ``name`` argument
                    from ``add_custom_rule``).
 
     Returns:
         ``{"success": True, "removed": rule_name, "backup_path": ...}`` or error.
     """
+    dru_file = _dru_path(pcb_file)
+
+    if not os.path.exists(dru_file):
+        return {"success": False, "error": "No .kicad_dru file found."}
+
     try:
-        tree = load_pcb(pcb_file)
+        tree = _load_dru(dru_file)
     except (FileNotFoundError, ValueError) as exc:
         return {"success": False, "error": str(exc)}
 
-    setup = _find_section(tree, "setup")
-    if setup is None:
-        return {"success": False, "error": "No (setup ...) section found in PCB file."}
-
-    cr_section = _find_section(setup, "custom_rules")
-    if cr_section is None:
-        return {"success": False, "error": "No (custom_rules ...) section found."}
-
     removed = None
-    new_children = [cr_section[0]]  # keep the "custom_rules" Symbol header
-    for item in cr_section[1:]:
+    new_tree: list[Any] = []
+    for item in tree:
         if isinstance(item, list) and len(item) >= 2 and _str_symbol(item[0]) == "rule":
             if _str_symbol(item[1]) == rule_name:
                 removed = item
                 continue
-        new_children.append(item)
+        new_tree.append(item)
 
     if removed is None:
         return {"success": False, "error": f"Custom rule '{rule_name}' not found."}
 
-    # Replace cr_section contents in-place
-    cr_section.clear()
-    cr_section.extend(new_children)
+    # Replace tree in-place
+    tree.clear()
+    tree.extend(new_tree)
 
     try:
-        bak_path = save_pcb(pcb_file, tree)
+        bak_path = _save_dru(dru_file, tree)
     except OSError as exc:
-        return {"success": False, "error": f"Failed to save PCB file: {exc}"}
+        return {"success": False, "error": f"Failed to save dru file: {exc}"}
 
-    log.info("Removed custom rule '%s' from %s", rule_name, pcb_file)
+    log.info("Removed custom rule '%s' from %s", rule_name, dru_file)
     return {"success": True, "removed": rule_name, "backup_path": bak_path}
 
 
 def _parse_custom_rule(rule_sexp: list[Any]) -> dict[str, Any] | None:
-    """Parse a single ``(rule ...)`` sexp into a dict."""
+    """Parse a single ``(rule ...)`` sexp into a dict.
+
+    Handles both the dru format ``(constraint type (min 0.4mm))`` and
+    the legacy PCB format ``(constraint type min 0.4)``.
+    """
     if len(rule_sexp) < 2:
         return None
     rule: dict[str, Any] = {"name": _str_symbol(rule_sexp[1])}
@@ -438,11 +487,19 @@ def _parse_custom_rule(rule_sexp: list[Any]) -> dict[str, Any] | None:
         if tag == "condition" and len(item) >= 2:
             rule["condition"] = item[1]
         elif tag == "constraint":
-            # (constraint <type> min|max|opt <value>)
+            # Dru format:   (constraint <type> (min 0.4mm))  → 3 top-level items
+            # Legacy format: (constraint <type> min <value>)  → 4 top-level items
             if len(item) >= 4:
                 rule["constraint"] = {
                     "type": _str_symbol(item[1]),
-                    _str_symbol(item[2]): item[3],
+                    _str_symbol(item[2]): _parse_dru_value(item[3]),
+                }
+            elif len(item) >= 3 and isinstance(item[2], list) and len(item[2]) >= 2:
+                # Dru format: third element is (min|max|opt <val_mm>)
+                sub = item[2]
+                rule["constraint"] = {
+                    "type": _str_symbol(item[1]),
+                    _str_symbol(sub[0]): _parse_dru_value(sub[1]),
                 }
             elif len(item) >= 3:
                 rule["constraint"] = {

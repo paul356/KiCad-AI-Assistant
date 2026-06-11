@@ -1136,7 +1136,6 @@ if _WX_AVAILABLE:
 
             # ---- 2. Read design rules for constraint pass-through ----
             board_path = board.GetFileName()
-            clearance_mm = None
             constraint_hint = ""
             if board_path and os.path.isfile(board_path):
                 try:
@@ -1150,7 +1149,6 @@ if _WX_AVAILABLE:
                         ce_clear = rules.get("copper_edge_clearance")
                         parts = []
                         if min_clear is not None:
-                            clearance_mm = min_clear
                             parts.append(f"Clearance: {min_clear} mm")
                         if min_track is not None:
                             parts.append(f"Min Track: {min_track} mm")
@@ -1303,7 +1301,6 @@ if _WX_AVAILABLE:
                 on_done=_routing_done,
                 on_progress=_progress,
                 ignore_nets=ignore_nets,
-                clearance_mm=clearance_mm,
             )
 
         def _on_autoroute_done(
