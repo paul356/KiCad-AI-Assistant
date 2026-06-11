@@ -657,6 +657,7 @@ class TestToolPolicyRegistry:
             "set_net_class_rules",
             "assign_nets_to_class",
             "remove_nets_from_class",
+            "delete_net_class",
             "add_custom_rule",
             "del_custom_rule",
         }
