@@ -959,16 +959,79 @@ if _WX_AVAILABLE:
                 self._on_server_started(False)
 
         def _on_about(self, event) -> None:
-            """Show the About dialog with version and license info."""
-            wx.MessageBox(
-                "KiCad AI Assistant\n\n"
-                "Version: 0.1.4\n"
-                "License: MIT\n\n"
-                "LLM-powered schematic and PCB editing assistant\n"
-                "powered by the KCAA MCP server.",
+            """Show the About dialog with version, license, dependencies, and links."""
+            # -- Resolve version dynamically from the installed kcaa package --
+            try:
+                from importlib.metadata import version as _pkg_version
+
+                _kcaa_ver = _pkg_version("kcaa")
+            except Exception:
+                _kcaa_ver = "unknown"
+
+            # -- Build the information text --
+            _info_lines = [
+                "KiCad AI Assistant",
+                "",
+                f"Version:   {_kcaa_ver}",
+                "License:   MIT",
+                "",
+                "Copyright (c) 2025 Lama Al Rajih",
+                "Copyright (c) 2024-2026 paul356",
+                "",
+                "LLM-powered schematic and PCB editing assistant.",
+                "",
+                "Dependencies:",
+                f"  • kcaa (KiCad MCP Server)  v{_kcaa_ver}",
+                "    https://github.com/paul356/KiCad-AI-Assistant",
+                "    (based on https://github.com/lamaalrajih/kicad-mcp)",
+                "",
+                "  • FreeRouting",
+                "    https://github.com/freerouting/freerouting",
+                "",
+                "Project:",
+                "  Homepage:     https://github.com/paul356/KiCad-AI-Assistant",
+                "  Issue Tracker: https://github.com/paul356/KiCad-AI-Assistant/issues",
+            ]
+
+            # -- Custom dialog so text can be selected and copied --
+            _dlg = wx.Dialog(
+                self,
+                wx.ID_ANY,
                 "About KiCad AI Assistant",
-                wx.OK | wx.ICON_INFORMATION,
+                size=(520, 400),
+                style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER,
             )
+            _dlg.SetMinSize((440, 340))
+
+            _panel = wx.Panel(_dlg)
+            _sizer = wx.BoxSizer(wx.VERTICAL)
+
+            _text = wx.TextCtrl(
+                _panel,
+                wx.ID_ANY,
+                "\n".join(_info_lines),
+                style=wx.TE_READONLY | wx.TE_MULTILINE | wx.BORDER_NONE,
+            )
+            _text.SetBackgroundColour(_panel.GetBackgroundColour())
+            # Use a monospace-friendly default font so alignment looks clean
+            _font = _text.GetFont()
+            if hasattr(_font, "SetFaceName"):
+                _font.SetFaceName("")
+            _text.SetFont(_font)
+
+            _sizer.Add(_text, 1, wx.EXPAND | wx.ALL, 12)
+
+            _btn_ok = wx.Button(_panel, wx.ID_OK, "OK")
+            _btn_sizer = wx.BoxSizer(wx.HORIZONTAL)
+            _btn_sizer.AddStretchSpacer()
+            _btn_sizer.Add(_btn_ok, 0, wx.ALL, 8)
+            _btn_sizer.AddStretchSpacer()
+            _sizer.Add(_btn_sizer, 0, wx.EXPAND)
+
+            _panel.SetSizer(_sizer)
+            _dlg.CentreOnParent()
+            _dlg.ShowModal()
+            _dlg.Destroy()
 
         # ---- Search / Find handlers ----
 
