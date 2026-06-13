@@ -2,7 +2,7 @@
 
 KiCad AI Assistant 是一个 KiCad 动作插件，在 KiCad 内部直接嵌入了由大语言模型（LLM）驱动的聊天面板。插件内置 [MCP](https://modelcontextprotocol.io/) 服务器，并暴露了丰富的工具集，让 LLM 能够通过自然语言对话读取和编辑原理图与 PCB。
 
-已在 **KiCad 10.0 / Linux** 上验证。
+已在 **KiCad 10.0 / Linux & Windows** 上验证。
 
 [![CI](https://github.com/paul356/KiCad-AI-Assistant/actions/workflows/ci.yml/badge.svg)](https://github.com/paul356/KiCad-AI-Assistant/actions/workflows/ci.yml)
 
@@ -25,14 +25,16 @@ KiCad AI Assistant 是一个 KiCad 动作插件，在 KiCad 内部直接嵌入�
     - [符号库](#符号库)
     - [原理图编辑](#原理图编辑)
     - [原理图分析](#原理图分析)
+    - [层次化图纸](#层次化图纸)
     - [PCB 封装库](#pcb-封装库)
     - [PCB 查询](#pcb-查询)
     - [PCB 编辑](#pcb-编辑)
     - [PCB 摆放](#pcb-摆放)
     - [PCB 分组](#pcb-分组)
     - [PCB 区域](#pcb-区域)
-    - [DRC 与 BOM](#drc-与-bom)
+    - [DRC 与设计规则](#drc-与设计规则)
     - [版本管理与导出](#版本管理与导出)
+    - [技能系统](#技能系统)
     - [KiCad IPC](#kicad-ipc)
   - [项目结构](#项目结构)
   - [常见问题](#常见问题)
@@ -61,10 +63,18 @@ cd kcaa
 
 从 [Releases 页面](https://github.com/paul356/KiCad-AI-Assistant/releases) 下载 `kicad-ai-assistant.zip`，解压到 KiCad 插件目录：
 
+**Linux:**
 ```bash
 KICAD_PLUGIN_DIR=~/.local/share/kicad/10.0/scripting/plugins
 mkdir -p "$KICAD_PLUGIN_DIR"
 unzip kicad-ai-assistant.zip -d "$KICAD_PLUGIN_DIR"
+```
+
+**Windows (PowerShell):**
+```powershell
+$KICAD_PLUGIN_DIR = "$env:USERPROFILE\Documents\KiCad\10.0\scripting\plugins"
+New-Item -ItemType Directory -Force -Path $KICAD_PLUGIN_DIR
+Expand-Archive -Path kicad-ai-assistant.zip -DestinationPath $KICAD_PLUGIN_DIR
 ```
 
 或从源码构建：
@@ -73,6 +83,7 @@ unzip kicad-ai-assistant.zip -d "$KICAD_PLUGIN_DIR"
 # 在 kcaa 仓库根目录执行：
 make dist-plugin          # 生成 dist/kicad_ai_assistant.zip
 
+# Linux:
 KICAD_PLUGIN_DIR=~/.local/share/kicad/10.0/scripting/plugins
 mkdir -p "$KICAD_PLUGIN_DIR"
 unzip dist/kicad_ai_assistant.zip -d "$KICAD_PLUGIN_DIR"
@@ -80,11 +91,24 @@ unzip dist/kicad_ai_assistant.zip -d "$KICAD_PLUGIN_DIR"
 
 ### 3. 创建插件虚拟环境
 
-在已安装的插件目录中运行 `setup_plugin.sh`，创建 `.venv`、从 PyPI 安装 `kcaa`，并下载 freerouting JAR。`uv` 会自动安装所需的 Python 版本。
+在已安装的插件目录中运行安装脚本，创建 `.venv`、从 PyPI 安装 `kcaa`，并下载 freerouting JAR。`uv` 会自动安装所需的 Python 版本。
 
+**Linux:**
 ```bash
 cd ~/.local/share/kicad/10.0/scripting/plugins/kicad_ai_assistant
 ./setup_plugin.sh
+```
+
+**Windows (PowerShell):**
+```powershell
+cd "$env:USERPROFILE\Documents\KiCad\10.0\scripting\plugins\kicad_ai_assistant"
+.\setup_plugin.ps1
+```
+
+**Windows (命令提示符):**
+```cmd
+cd /d "%USERPROFILE%\Documents\KiCad\10.0\scripting\plugins\kicad_ai_assistant"
+setup_plugin.bat
 ```
 
 脚本会从插件目录路径自动检测 KiCad 版本。KiCad 已提供所有必要的环境变量（`KICAD_VERSION`、`KICAD*_DIR` 等），无需 `.env` 文件。
@@ -137,13 +161,16 @@ kcaa
 
 ## 功能概览
 
-- **原理图编辑** — 添加/删除符号、设置属性、绘制和删除导线、自动连接引脚
+- **原理图编辑** — 添加/删除符号、设置/重命名属性、绘制和删除导线、自动连接引脚
+- **层次化图纸** — 创建、读取、更新、删除层次化图纸符号和图纸引脚
 - **PCB 封装库** — 按名称、描述或标签搜索系统封装库索引；为原理图符号设置封装
 - **PCB 同步** — 通过 KiCad IPC 接口触发"从原理图更新 PCB"操作
 - **PCB 摆放** — 查询、移动、旋转、翻转、对齐、等间距分布封装；定义或清除板框
+- **设计规则** — 查看和修改板级设计规则、网络类以及自定义 DRC 规则
+- **DRC** — 直接从插件运行设计规则检查
 - **上下文管理** — 当 LLM 上下文接近上限时自动压缩历史消息
 - **会话管理** — 保存、恢复、重置当前会话；保存快照以便回退修改
-- **DRC** — 运行设计规则检查并追踪违规历史
+- **技能系统** — 通过用户可定义的 Markdown 技能文件，为 LLM 提供按需工作流指导
 
 ## 工具列表
 
@@ -177,9 +204,12 @@ kcaa
 | `remove_symbol_from_schematic` | 按位号删除已放置的符号 |
 | `move_component` | 移动/旋转已放置的元件 |
 | `set_component_property` | 设置已放置符号的属性字段 |
+| `rename_symbol` | 重命名已放置符号的位号 |
 | `list_component_properties` | 列出已放置符号的所有属性 |
 | `delete_component_property` | 删除已放置符号的属性 |
+| `check_reference_conflicts` | 检查重复的位号 |
 | `connect_points_with_wire` | 在两点之间智能正交布线 |
+| `add_wire_to_schematic` | 按端点添加单条导线段 |
 | `connect_pins_with_wire` | 用导线连接两个引脚 |
 | `delete_wire_from_schematic` | 按端点删除导线段 |
 | `add_label_to_schematic` | 添加局部网络标签 |
@@ -200,6 +230,18 @@ kcaa
 | `validate_project` | 项目基本验证 |
 | `validate_project_boundaries` | 验证元件边界 |
 | `generate_validation_report` | 生成综合验证报告 |
+
+### 层次化图纸
+
+| 工具 | 说明 |
+|------|------|
+| `list_sheet_symbols` | 列出原理图中所有层次化图纸符号 |
+| `get_sheet_hierarchy` | 获取完整的图纸层次树 |
+| `add_sheet_symbol` | 添加新的层次化图纸符号 |
+| `remove_sheet_symbol` | 删除图纸符号（可选删除子文件） |
+| `update_sheet_symbol` | 更新图纸符号的属性和几何信息 |
+| `add_sheet_pin` | 向图纸符号添加层次化引脚 |
+| `remove_sheet_pin` | 从图纸符号删除层次化引脚 |
 
 ### PCB 封装库
 
@@ -269,12 +311,19 @@ kcaa
 | `delete_zone` | 按 UUID 删除区域 |
 | `refill_zones` | 重新填充所有铜皮区域 |
 
-### DRC 与 BOM
+### DRC 与设计规则
 
 | 工具 | 说明 |
 |------|------|
-| `run_drc_check` | 运行设计规则检查 |
-| `get_drc_history_tool` | 获取历史 DRC 结果 |
+| `get_effective_design_rules` | 获取所有设计约束（板级规则、网络类、自定义规则） |
+| `set_design_rules` | 更新板级设计规则最小值 |
+| `set_net_class_rules` | 创建或更新网络类的设计参数 |
+| `assign_nets_to_class` | 将网络分配到网络类 |
+| `remove_nets_from_class` | 从网络类中移除网络（恢复为 Default） |
+| `delete_net_class` | 删除网络类 |
+| `add_custom_rule` | 向项目添加自定义 DRC 规则 |
+| `del_custom_rule` | 按名称删除自定义 DRC 规则 |
+| `run_drc_check` | 打开 KiCad DRC 对话框 |
 | `analyze_bom` | 分析物料清单 |
 | `export_bom_csv` | 导出 BOM 为 CSV |
 
@@ -287,6 +336,16 @@ kcaa
 | `restore_file_version` | 恢复到之前保存的版本 |
 | `generate_pcb_thumbnail` | 渲染 PCB 缩略图 |
 | `generate_project_thumbnail` | 渲染项目缩略图 |
+
+### 技能系统
+
+| 工具 | 说明 |
+|------|------|
+| `list_skills` | 列出所有可用的技能文档 |
+| `get_skill` | 获取技能文档的完整内容 |
+| `add_skill` | 创建新的技能文档 |
+| `append_to_skill` | 向已有技能追加内容 |
+| `delete_skill` | 软删除技能文档 |
 
 ### KiCad IPC
 
@@ -332,10 +391,12 @@ kcaa/
 **插件未出现在 KiCad 中：**
 - 确认插件目录名称为 `kicad_ai_assistant`（注意不要写错）。
 - 安装后执行 **Tools → External Plugins → Refresh Plugins**。
-- 检查 `setup_plugin.sh` 是否成功完成，并确认插件目录下存在 `.venv/bin/python`。
+- Linux：检查 `setup_plugin.sh` 是否成功完成，并确认插件目录下存在 `.venv/bin/python`。
+- Windows：检查 `setup_plugin.bat`（或 `setup_plugin.ps1`）是否成功完成，并确认插件目录下存在 `.venv/Scripts/python.exe`。
 
 **MCP 服务器启动失败：**
-- 查看 `~/.config/kicad/` 目录下的插件日志，排查 Python 报错信息。
+- Linux：查看 `~/.config/kicad/` 目录下的插件日志，排查 Python 报错信息。
+- Windows：查看 `%APPDATA%/kicad/` 目录下的插件日志，排查 Python 报错信息。
 
 **原理图编辑器编辑后未刷新：**
 - 这是当前 KiCad IPC 接口的已知限制。请使用 **File → Reload** 或按 **Ctrl+Z / Ctrl+Y** 触发原理图编辑器刷新。

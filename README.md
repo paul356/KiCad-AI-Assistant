@@ -2,7 +2,7 @@
 
 KiCad AI Assistant is a KiCad action plugin that embeds an LLM-powered chat panel directly inside KiCad. It runs a built-in [MCP](https://modelcontextprotocol.io/) server and exposes a rich set of tools so the LLM can read and edit your schematics and PCB layouts through natural-language conversation.
 
-Tested on **KiCad 10.0 / Linux**.
+Tested on **KiCad 10.0 / Linux & Windows**.
 
 [![CI](https://github.com/paul356/KiCad-AI-Assistant/actions/workflows/ci.yml/badge.svg)](https://github.com/paul356/KiCad-AI-Assistant/actions/workflows/ci.yml)
 
@@ -24,14 +24,16 @@ Tested on **KiCad 10.0 / Linux**.
     - [Symbol Library](#symbol-library)
     - [Schematic Editing](#schematic-editing)
     - [Schematic Analysis](#schematic-analysis)
+    - [Hierarchical Sheets](#hierarchical-sheets)
     - [PCB Library](#pcb-library)
     - [PCB Query](#pcb-query)
     - [PCB Editing](#pcb-editing)
     - [PCB Placement](#pcb-placement)
     - [PCB Groups](#pcb-groups)
     - [PCB Zones](#pcb-zones)
-    - [DRC & BOM](#drc--bom)
+    - [DRC & Design Rules](#drc--design-rules)
     - [Versioning & Export](#versioning--export)
+    - [Skill System](#skill-system)
     - [KiCad IPC](#kicad-ipc)
   - [Project Structure](#project-structure)
   - [Troubleshooting](#troubleshooting)
@@ -60,10 +62,18 @@ cd kcaa
 
 Download `kicad-ai-assistant.zip` from the [Releases page](https://github.com/paul356/KiCad-AI-Assistant/releases) and unzip it into KiCad's plugin directory:
 
+**Linux:**
 ```bash
 KICAD_PLUGIN_DIR=~/.local/share/kicad/10.0/scripting/plugins
 mkdir -p "$KICAD_PLUGIN_DIR"
 unzip kicad-ai-assistant.zip -d "$KICAD_PLUGIN_DIR"
+```
+
+**Windows (PowerShell):**
+```powershell
+$KICAD_PLUGIN_DIR = "$env:USERPROFILE\Documents\KiCad\10.0\scripting\plugins"
+New-Item -ItemType Directory -Force -Path $KICAD_PLUGIN_DIR
+Expand-Archive -Path kicad-ai-assistant.zip -DestinationPath $KICAD_PLUGIN_DIR
 ```
 
 Or build from source:
@@ -72,6 +82,7 @@ Or build from source:
 # In the kcaa repository root:
 make dist-plugin          # produces dist/kicad_ai_assistant.zip
 
+# Linux:
 KICAD_PLUGIN_DIR=~/.local/share/kicad/10.0/scripting/plugins
 mkdir -p "$KICAD_PLUGIN_DIR"
 unzip dist/kicad_ai_assistant.zip -d "$KICAD_PLUGIN_DIR"
@@ -79,11 +90,24 @@ unzip dist/kicad_ai_assistant.zip -d "$KICAD_PLUGIN_DIR"
 
 ### 3. Create the plugin virtual environment
 
-Run `setup_plugin.sh` from inside the installed plugin directory to create a `.venv`, install `kcaa` from PyPI, and download the freerouting JAR. `uv` will automatically install the required Python version.
+Run the setup script from inside the installed plugin directory to create a `.venv`, install `kcaa` from PyPI, and download the freerouting JAR. `uv` will automatically install the required Python version.
 
+**Linux:**
 ```bash
 cd ~/.local/share/kicad/10.0/scripting/plugins/kicad_ai_assistant
 ./setup_plugin.sh
+```
+
+**Windows (PowerShell):**
+```powershell
+cd "$env:USERPROFILE\Documents\KiCad\10.0\scripting\plugins\kicad_ai_assistant"
+.\setup_plugin.ps1
+```
+
+**Windows (Command Prompt):**
+```cmd
+cd /d "%USERPROFILE%\Documents\KiCad\10.0\scripting\plugins\kicad_ai_assistant"
+setup_plugin.bat
 ```
 
 The script will detect your KiCad version from the plugin directory path. KiCad already provides all necessary environment variables (`KICAD_VERSION`, `KICAD*_DIR`, etc.), so no `.env` file is needed.
@@ -138,13 +162,16 @@ kcaa
 
 ## Feature Highlights
 
-- **Schematic editing** — Add/remove symbols, set properties, draw and delete wires, connect pins automatically
+- **Schematic editing** — Add/remove symbols, set/rename properties, draw and delete wires, connect pins automatically
+- **Hierarchical sheets** — Create, read, update, and delete hierarchical sheet symbols and sheet pins
 - **PCB footprint library** — Search the system footprint library index by name, description, or tag; set footprints on schematic symbols
 - **PCB synchronisation** — Trigger *Update PCB from Schematic* via KiCad's IPC API
 - **PCB placement** — Query, move, rotate, flip, align, and distribute footprints; define or clear the board outline
+- **Design rules** — View and modify board-level design rules, net classes, and custom DRC rules
+- **DRC** — Run design-rule checks directly from the plugin
 - **Context management** — Automatic compaction of the LLM context window when it approaches the limit
 - **Session management** — Save, restore, and reset the current conversation; save design snapshots for rollback
-- **DRC** — Run design-rule checks and track violations over time
+- **Skill system** — On-demand workflow guidance for the LLM via user-definable Markdown skill files
 
 ## Available Tools
 
@@ -178,9 +205,12 @@ kcaa
 | `remove_symbol_from_schematic` | Remove placed symbol by reference |
 | `move_component` | Move and/or rotate a placed component |
 | `set_component_property` | Set a property field on a placed symbol |
+| `rename_symbol` | Rename a placed symbol's reference designator |
 | `list_component_properties` | List all properties of a placed symbol |
 | `delete_component_property` | Delete a property from a placed symbol |
+| `check_reference_conflicts` | Check for duplicate reference designators |
 | `connect_points_with_wire` | Route a smart orthogonal wire between two points |
+| `add_wire_to_schematic` | Add a single wire segment by endpoints |
 | `connect_pins_with_wire` | Connect two symbol pins with a wire |
 | `delete_wire_from_schematic` | Remove wire segments by endpoints |
 | `add_label_to_schematic` | Add a local net label |
@@ -201,6 +231,18 @@ kcaa
 | `validate_project` | Basic validation of a KiCad project |
 | `validate_project_boundaries` | Validate component boundaries |
 | `generate_validation_report` | Generate a comprehensive validation report |
+
+### Hierarchical Sheets
+
+| Tool | Description |
+|------|-------------|
+| `list_sheet_symbols` | List all hierarchical sheet symbols in a schematic |
+| `get_sheet_hierarchy` | Get the full sheet hierarchy tree |
+| `add_sheet_symbol` | Add a new hierarchical sheet symbol |
+| `remove_sheet_symbol` | Remove a sheet symbol (with optional child file deletion) |
+| `update_sheet_symbol` | Update a sheet symbol's properties and geometry |
+| `add_sheet_pin` | Add a hierarchical pin to a sheet symbol |
+| `remove_sheet_pin` | Remove a hierarchical pin from a sheet symbol |
 
 ### PCB Library
 
@@ -270,12 +312,19 @@ kcaa
 | `delete_zone` | Delete a zone by UUID |
 | `refill_zones` | Refill all zones on the PCB |
 
-### DRC & BOM
+### DRC & Design Rules
 
 | Tool | Description |
 |------|-------------|
-| `run_drc_check` | Run KiCad design-rule check |
-| `get_drc_history_tool` | Retrieve historical DRC results |
+| `get_effective_design_rules` | Get all design constraints (board rules, net classes, custom rules) |
+| `set_design_rules` | Update board-level design rule minimums |
+| `set_net_class_rules` | Create or update a net class's design parameters |
+| `assign_nets_to_class` | Assign nets to a net class |
+| `remove_nets_from_class` | Remove nets from a net class (revert to Default) |
+| `delete_net_class` | Delete a net class |
+| `add_custom_rule` | Add a custom DRC rule to the project |
+| `del_custom_rule` | Delete a custom DRC rule by name |
+| `run_drc_check` | Open the KiCad DRC dialog |
 | `analyze_bom` | Analyze the bill of materials |
 | `export_bom_csv` | Export the BOM to CSV |
 
@@ -288,6 +337,16 @@ kcaa
 | `restore_file_version` | Restore to a previously saved version |
 | `generate_pcb_thumbnail` | Render a PCB thumbnail image |
 | `generate_project_thumbnail` | Render a project thumbnail |
+
+### Skill System
+
+| Tool | Description |
+|------|-------------|
+| `list_skills` | List all available skill documents |
+| `get_skill` | Get the full content of a skill document |
+| `add_skill` | Create a new skill document |
+| `append_to_skill` | Append content to an existing skill |
+| `delete_skill` | Soft-delete a skill document |
 
 ### KiCad IPC
 
@@ -333,10 +392,12 @@ kcaa/
 **Plugin does not appear in KiCad:**
 - Confirm the plugin directory is named exactly `kicad_ai_assistant` (not `kicad_ai_plugin`).
 - Run **Tools → External Plugins → Refresh Plugins** after installing.
-- Check that `setup_plugin.sh` completed without errors and that `.venv/bin/python` exists inside the plugin directory.
+- Linux: Check that `setup_plugin.sh` completed without errors and that `.venv/bin/python` exists inside the plugin directory.
+- Windows: Check that `setup_plugin.bat` (or `setup_plugin.ps1`) completed without errors and that `.venv/Scripts/python.exe` exists inside the plugin directory.
 
 **MCP server fails to start:**
-- Check the plugin log in `~/.config/kicad/` (Linux) for Python tracebacks.
+- Linux: Check the plugin log in `~/.config/kicad/` for Python tracebacks.
+- Windows: Check the plugin log in `%APPDATA%/kicad/` for Python tracebacks.
 
 **Schematic editor does not refresh after edits:**
 - This is a current KiCad IPC limitation. Use **File → Reload** or press **Ctrl+Z / Ctrl+Y** to trigger a refresh in the schematic editor.

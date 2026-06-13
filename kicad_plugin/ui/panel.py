@@ -5,7 +5,7 @@ Layout:
   ┌──────────────────────────────────────────────────────────┐
   │  Conversation log (scrollable, tool calls folded inline) │
   ├──────────────────────────────────────────────────────────┤
-  │  [input field]                             [Send]        │
+  │  [input field]                             [Stop]        │
   └──────────────────────────────────────────────────────────┘
 """
 
@@ -290,17 +290,43 @@ if _WX_AVAILABLE:
             # ---- Input row ----
             hbox = wx.BoxSizer(wx.HORIZONTAL)
 
-            self._input = wx.TextCtrl(panel, style=wx.TE_PROCESS_ENTER)
+            self._input = wx.TextCtrl(
+                panel, style=wx.TE_PROCESS_ENTER | wx.TE_MULTILINE | wx.BORDER_SIMPLE
+            )
             self._input.SetHint("Ask the AI assistant…")
-            hbox.Add(self._input, 1, wx.RIGHT, 6)
+            hbox.Add(self._input, 1, wx.EXPAND)
 
-            self._send_btn = wx.Button(panel, label="Send")
-            self._send_btn.Enable(False)
-            hbox.Add(self._send_btn, 0)
+            # Rounded red square stop button — matches TextCtrl height exactly.
+            # GetSizeFromTextSize excludes the BORDER_SIMPLE frame; add it back.
+            text_h = self._input.GetSizeFromTextSize(self._input.GetTextExtent("Ag")).height
+            btn_h = max(text_h + 4, 48)  # at least 48 to fit 40×40 red + padding
+            corner_r = 3  # small corner radius
 
-            self._stop_btn = wx.Button(panel, label="Stop")
+            stop_bmp = wx.Bitmap(btn_h, btn_h)
+            mdc = wx.MemoryDC(stop_bmp)
+            gc = wx.GraphicsContext.Create(mdc)
+            # Light grey button background
+            gc.SetBrush(wx.Brush(wx.Colour(230, 230, 230)))
+            gc.SetPen(wx.TRANSPARENT_PEN)
+            gc.DrawRectangle(0, 0, btn_h, btn_h)
+            # Flat red 40×40 rounded square, centred
+            red_sz = 40
+            pad = (btn_h - red_sz) // 2
+            path = gc.CreatePath()
+            path.AddRoundedRectangle(pad, pad, red_sz, red_sz, corner_r)
+            gc.SetBrush(wx.Brush(wx.Colour(255, 0, 0)))
+            gc.SetPen(wx.Pen(wx.Colour(180, 0, 0), 1))
+            gc.DrawPath(path)
+            del gc
+            del mdc
+
+            self._stop_btn = wx.BitmapButton(
+                panel, bitmap=stop_bmp, style=wx.BU_EXACTFIT | wx.BORDER_SIMPLE
+            )
+            self._stop_btn.SetMinSize(wx.Size(btn_h, btn_h))
+            self._stop_btn.SetToolTip("Stop generation (Escape)")
             self._stop_btn.Enable(False)
-            hbox.Add(self._stop_btn, 0, wx.LEFT, 4)
+            hbox.Add(self._stop_btn, 0, wx.EXPAND)
 
             vbox.Add(hbox, 0, wx.ALL | wx.EXPAND, 4)
 
@@ -351,9 +377,9 @@ if _WX_AVAILABLE:
             self.SetMenuBar(menu_bar)
 
             # ---- Events ----
-            self._send_btn.Bind(wx.EVT_BUTTON, self._on_send)
             self._stop_btn.Bind(wx.EVT_BUTTON, self._on_stop)
             self._input.Bind(wx.EVT_TEXT_ENTER, self._on_send)
+            self._input.Bind(wx.EVT_CHAR_HOOK, self._on_input_key)
             self.Bind(wx.EVT_MENU, self._on_settings, id=wx.ID_PREFERENCES)
             self.Bind(wx.EVT_MENU, self._on_new_session, id=self._menu_new_session_id)
             self.Bind(wx.EVT_MENU, self._on_load_session, id=self._menu_load_session_id)
@@ -407,7 +433,6 @@ if _WX_AVAILABLE:
                 if ok:
                     self._status_label.SetLabel("✅ Backend ready")
                     self._status_label.SetForegroundColour(wx.Colour(*self._C_OK))
-                    self._send_btn.Enable(True)
                     self.GetMenuBar().Enable(self._menu_autoroute_id, True)
                     self._init_llm_client()
                     self._check_kicad_ipc_environment()
@@ -608,7 +633,6 @@ if _WX_AVAILABLE:
             self._render_conversation(force_scroll_to_bottom=True)
             self._busy = True
             self._cancel_event = threading.Event()
-            self._send_btn.Enable(False)
             self._stop_btn.Enable(True)
 
             from ..context_bridge import collect_context, context_to_system_prompt_block
@@ -656,6 +680,18 @@ if _WX_AVAILABLE:
 
             threading.Thread(target=_run, daemon=True).start()
 
+        def _on_input_key(self, event) -> None:
+            """Handle keyboard shortcuts in the multi-line input.
+
+            - Shift+Enter:  insert a newline.
+            - Enter alone:  let EVT_TEXT_ENTER fire (→ _on_send).
+            """
+            key_code = event.GetKeyCode()
+            if key_code == wx.WXK_RETURN and event.ShiftDown():
+                self._input.WriteText("\n")
+                return  # consume the event — don't fire EVT_TEXT_ENTER
+            event.Skip()
+
         def _on_reply(self, reply: str, ctx: dict, was_streamed: bool = False) -> None:
             # Stop the flush timer and drain any remaining chunks
             self._stream_timer.Stop()
@@ -693,7 +729,6 @@ if _WX_AVAILABLE:
             self._busy = False
             self._cancel_event = None
             self._stop_btn.Enable(False)
-            self._send_btn.Enable(True)
             # Auto-refresh after tool calls
             if self._tool_calls_made:
                 self._auto_refresh(ctx)
@@ -907,7 +942,6 @@ if _WX_AVAILABLE:
             self._busy = False
             self._cancel_event = None
             self._stop_btn.Enable(False)
-            self._send_btn.Enable(True)
 
         def _on_restart(self, event) -> None:
             if self._busy:
@@ -917,7 +951,6 @@ if _WX_AVAILABLE:
                     wx.OK | wx.ICON_INFORMATION,
                 )
                 return
-            self._send_btn.Enable(False)
             self._status_label.SetLabel("⏳ Restarting backend…")
             self._status_label.SetForegroundColour(wx.NullColour)
             self._conv_entries.append(
