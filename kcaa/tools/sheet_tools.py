@@ -54,12 +54,15 @@ def _collect_occupied_bboxes(
     schematic_path: str,
     exclude_uuid: str | None = None,
     margin: float = 3.81,
+    exclude_refs: set[str] | None = None,
 ) -> list:
     """Collect occupied bounding boxes for overlap detection.
 
     Gathers sheet symbols, symbol components, and the title block,
     inflating each by *margin* for clearance.  When *exclude_uuid*
     is provided, the sheet with that UUID is skipped.
+    When *exclude_refs* is provided, components with those
+    references are skipped.
     """
     from kcaa.tools.placement_helpers import (
         _default_title_block_bbox,
@@ -70,6 +73,7 @@ def _collect_occupied_bboxes(
     from kcaa.utils.symbol_geometry import BBox, inflate_bbox
 
     occupied: list = []
+    _exclude_refs = exclude_refs or set()
 
     # Sheet symbols.
     sheet_info = _list_sheet_symbols_impl(schematic_path)
@@ -83,6 +87,8 @@ def _collect_occupied_bboxes(
     # Symbol components (skip type="sheet" — already covered above).
     netlist = extract_netlist(schematic_path)
     for ref, comp in (netlist.get("components", {}) or {}).items():
+        if ref in _exclude_refs:
+            continue
         if comp.get("type") == "sheet":
             continue
         bb_d = comp.get("body_bbox")
@@ -115,12 +121,13 @@ def _has_position_conflict(
     h: float,
     exclude_uuid: str | None = None,
     margin: float = 3.81,
+    exclude_refs: set[str] | None = None,
 ) -> bool:
     """Return True if a bbox at (x, y, w, h) overlaps any occupied area."""
     from kcaa.utils.symbol_geometry import BBox, bboxes_overlap
 
     cand = BBox(x, y, x + w, y + h)
-    occupied = _collect_occupied_bboxes(schematic_path, exclude_uuid, margin)
+    occupied = _collect_occupied_bboxes(schematic_path, exclude_uuid, margin, exclude_refs)
     conflicts = [occ for occ in occupied if bboxes_overlap(cand, occ)]
     if conflicts:
         log.info(

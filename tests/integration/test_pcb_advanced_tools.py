@@ -9,9 +9,9 @@ Covers:
   - PCB Edit (outline):    get_board_outline, clear_board_outline,
                            add_board_outline_segment, add_board_outline_arc,
                            set_board_outline_rect
-  - PCB Group:             assign_to_group, list_groups, get_group,
-                           score_group, place_component_group,
-                           move_group, rotate_group
+  - PCB Group:             assign_footprints_to_group, list_footprint_groups, get_footprint_group,
+                           score_footprint_group, place_footprint_group,
+                           move_footprint_group, rotate_footprint_group
   - PCB Zone:              list_zones, add_zone, delete_zone
   - PCB Placement Helper:  find_free_pcb_area
 
@@ -628,7 +628,7 @@ class TestGroupTools:
         result = _call_tool(
             port,
             sid,
-            "assign_to_group",
+            "assign_footprints_to_group",
             {
                 "pcb_path": pcb,
                 "references": ["R1", "C1"],
@@ -645,7 +645,7 @@ class TestGroupTools:
         result = _call_tool(
             port,
             sid,
-            "assign_to_group",
+            "assign_footprints_to_group",
             {
                 "pcb_path": pcb,
                 "references": ["U99"],
@@ -660,14 +660,14 @@ class TestGroupTools:
         _call_tool(
             port,
             sid,
-            "assign_to_group",
+            "assign_footprints_to_group",
             {
                 "pcb_path": pcb,
                 "references": ["R1", "C1"],
                 "group_name": "my_group",
             },
         )
-        result = _call_tool(port, sid, "list_groups", {"pcb_path": pcb})
+        result = _call_tool(port, sid, "list_footprint_groups", {"pcb_path": pcb})
         assert "error" not in result, result
         assert "groups" in result
         assert "group_count" in result
@@ -678,7 +678,7 @@ class TestGroupTools:
         _call_tool(
             port,
             sid,
-            "assign_to_group",
+            "assign_footprints_to_group",
             {
                 "pcb_path": pcb,
                 "references": ["R1", "C1"],
@@ -688,7 +688,7 @@ class TestGroupTools:
         result = _call_tool(
             port,
             sid,
-            "get_group",
+            "get_footprint_group",
             {
                 "pcb_path": pcb,
                 "group_name": "detail_group",
@@ -703,7 +703,7 @@ class TestGroupTools:
         result = _call_tool(
             port,
             sid,
-            "get_group",
+            "get_footprint_group",
             {
                 "pcb_path": BOARD_FIXTURE,
                 "group_name": "nonexistent_group",
@@ -717,20 +717,20 @@ class TestGroupTools:
         _call_tool(
             port,
             sid,
-            "assign_to_group",
+            "assign_footprints_to_group",
             {
                 "pcb_path": pcb,
                 "references": ["R1", "C1"],
-                "group_name": "score_group",
+                "group_name": "score_footprint_group",
             },
         )
         result = _call_tool(
             port,
             sid,
-            "score_group",
+            "score_footprint_group",
             {
                 "pcb_path": pcb,
-                "group_name": "score_group",
+                "group_name": "score_footprint_group",
             },
         )
         assert "error" not in result, result
@@ -743,20 +743,20 @@ class TestGroupTools:
         _call_tool(
             port,
             sid,
-            "assign_to_group",
+            "assign_footprints_to_group",
             {
                 "pcb_path": pcb,
                 "references": ["R1", "C1"],
-                "group_name": "move_group",
+                "group_name": "move_footprint_group",
             },
         )
         result = _call_tool(
             port,
             sid,
-            "move_group",
+            "move_footprint_group",
             {
                 "pcb_path": pcb,
-                "group_name": "move_group",
+                "group_name": "move_footprint_group",
                 "anchor_x": 50.0,
                 "anchor_y": 50.0,
             },
@@ -770,20 +770,20 @@ class TestGroupTools:
         _call_tool(
             port,
             sid,
-            "assign_to_group",
+            "assign_footprints_to_group",
             {
                 "pcb_path": pcb,
                 "references": ["R1", "C1"],
-                "group_name": "rotate_group",
+                "group_name": "rotate_footprint_group",
             },
         )
         result = _call_tool(
             port,
             sid,
-            "rotate_group",
+            "rotate_footprint_group",
             {
                 "pcb_path": pcb,
-                "group_name": "rotate_group",
+                "group_name": "rotate_footprint_group",
                 "rotation_delta": 90.0,
             },
         )
