@@ -19,15 +19,15 @@
 | `get_library_symbols` | `symbol_tools` | List every symbol in a specific library |
 | `get_symbol_index_stats` | `symbol_tools` | Return aggregate counts for the index |
 | `get_symbol_pins` | `symbol_tools` | Return pin list (number, name, type, direction) for one symbol |
-| `add_symbol_to_schematic` | `component_edit_tools` | Place a library symbol onto a schematic |
-| `remove_symbol_from_schematic` | `component_edit_tools` | Remove one or more components by reference designator |
-| `set_component_property` | `component_edit_tools` | Set or create a named property (e.g. `Value`, `Footprint`) on a component |
-| `list_component_properties` | `component_edit_tools` | Return all properties for a component |
-| `delete_component_property` | `component_edit_tools` | Delete a named property from a component |
-| `move_component` | `component_edit_tools` | Move a component to new coordinates, optionally changing rotation |
-| `add_label_to_schematic` | `component_edit_tools` | Place a net label at specific coordinates |
-| `list_labels_in_schematic` | `component_edit_tools` | Return all net labels and their positions |
-| `delete_label_from_schematic` | `component_edit_tools` | Remove a net label by text and coordinates |
+| `add_symbol_to_schematic` | `symbol_edit_tools` | Place a library symbol onto a schematic |
+| `remove_symbol_from_schematic` | `symbol_edit_tools` | Remove one or more components by reference designator |
+| `set_symbol_property` | `symbol_edit_tools` | Set or create a named property (e.g. `Value`, `Footprint`) on a component |
+| `list_symbol_properties` | `symbol_edit_tools` | Return all properties for a component |
+| `delete_symbol_property` | `symbol_edit_tools` | Delete a named property from a component |
+| `move_component` | `symbol_edit_tools` | Move a component to new coordinates, optionally changing rotation |
+| `add_label_to_schematic` | `symbol_edit_tools` | Place a net label at specific coordinates |
+| `list_labels_in_schematic` | `symbol_edit_tools` | Return all net labels and their positions |
+| `delete_label_from_schematic` | `symbol_edit_tools` | Remove a net label by text and coordinates |
 | `add_wire_to_schematic` | `wire_edit_tools` | Draw a wire segment between two coordinates (orthogonal routing) |
 | `connect_pins_with_wire` | `wire_edit_tools` | Connect two component pins automatically, resolving their schematic positions |
 | `delete_wire_from_schematic` | `wire_edit_tools` | Remove a wire segment matching given start/end coordinates |
@@ -43,7 +43,7 @@ A typical LLM editing session follows this pattern:
 
 1. **Read current state** — call `extract_schematic_netlist` with the `active_schematic` path from the plugin context. Inspect `analysis.components`, `analysis.power_nets`, and `analysis.signal_nets` to understand what is already present.
 2. **Find symbols** — if adding a new component, call `search_symbols` first to obtain the exact `library_name` and `name` values required by `add_symbol_to_schematic`. Never guess library names.
-3. **Place / edit / connect** — use the component-editing and wire-editing tools to make changes. After placing a symbol, call `extract_schematic_netlist` to get the new pin positions before routing wires.
+3. **Place / edit / connect** — use the symbol-editing and wire-editing tools to make changes. After placing a symbol, call `extract_schematic_netlist` to get the new pin positions before routing wires.
 4. **Verify** — call `extract_schematic_netlist` again after all edits. Confirm expected nets exist in `analysis.signal_nets` or `analysis.power_nets` and that `analysis.floating_nets` is empty.
 
 > **Tip:** `connect_pins_with_wire` is the preferred wiring tool when the two endpoints are component pins — it resolves positions automatically. Use `add_wire_to_schematic` only when routing to/from a known coordinate (e.g. a label or an existing wire endpoint).
@@ -215,7 +215,7 @@ All tools in this group write a backup to `<schematic_path>.bak` before saving.
 
 ---
 
-#### `set_component_property(schematic_path, reference, property_name, property_value)`
+#### `set_symbol_property(schematic_path, reference, property_name, property_value)`
 
 **Purpose:** Sets or creates a named property on a placed component (e.g. `"Footprint"`, `"Value"`, `"MPN"`).
 
@@ -225,15 +225,15 @@ All tools in this group write a backup to `<schematic_path>.bak` before saving.
 
 ---
 
-#### `list_component_properties(schematic_path, reference)`
+#### `list_symbol_properties(schematic_path, reference)`
 
-**Purpose:** Returns all properties and their values for one component. Use before `set_component_property` to discover existing field names.
+**Purpose:** Returns all properties and their values for one component. Use before `set_symbol_property` to discover existing field names.
 
 **Success response:** `{"success": true, "reference": "U1", "properties": {"Reference": "U1", "Value": "ATmega328P", ...}}`
 
 ---
 
-#### `delete_component_property(schematic_path, reference, property_name)`
+#### `delete_symbol_property(schematic_path, reference, property_name)`
 
 **Purpose:** Deletes a non-mandatory property from a component. Cannot delete `Reference` or `Value`.
 

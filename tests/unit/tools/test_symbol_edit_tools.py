@@ -1,5 +1,5 @@
 """
-Tests for component_edit_tools.py (add_symbol_to_schematic /
+Tests for symbol_edit_tools.py (add_symbol_to_schematic /
 remove_symbol_from_schematic).
 
 All tests that write to disk work on a temporary copy of
@@ -63,10 +63,10 @@ class _MockMCP:
 
 
 def _get_tools() -> dict:
-    from kcaa.tools.component_edit_tools import register_component_edit_tools
+    from kcaa.tools.symbol_edit_tools import register_symbol_edit_tools
 
     mock = _MockMCP()
-    register_component_edit_tools(mock)
+    register_symbol_edit_tools(mock)
     return mock.tools
 
 
@@ -131,7 +131,7 @@ class TestAddSymbolToSchematic:
     def test_adds_symbol_and_assigns_reference(self, tools, tmp_sch):
         """Adding a symbol should succeed and assign a reference like 'R*'."""
         mgr = _make_mock_manager()
-        with patch("kcaa.tools.component_edit_tools._get_index_manager", return_value=mgr):
+        with patch("kcaa.tools.symbol_edit_tools._get_index_manager", return_value=mgr):
             result = asyncio.run(
                 tools["add_symbol_to_schematic"](
                     schematic_path=tmp_sch,
@@ -149,7 +149,7 @@ class TestAddSymbolToSchematic:
     def test_creates_backup(self, tools, tmp_sch):
         """A .bak file should appear next to the schematic after adding."""
         mgr = _make_mock_manager()
-        with patch("kcaa.tools.component_edit_tools._get_index_manager", return_value=mgr):
+        with patch("kcaa.tools.symbol_edit_tools._get_index_manager", return_value=mgr):
             asyncio.run(
                 tools["add_symbol_to_schematic"](
                     schematic_path=tmp_sch,
@@ -164,7 +164,7 @@ class TestAddSymbolToSchematic:
     def test_grid_alignment(self, tools, tmp_sch):
         """Coordinates should be aligned to the 1.27 mm (50 mil) grid in the response."""
         mgr = _make_mock_manager()
-        with patch("kcaa.tools.component_edit_tools._get_index_manager", return_value=mgr):
+        with patch("kcaa.tools.symbol_edit_tools._get_index_manager", return_value=mgr):
             result = asyncio.run(
                 tools["add_symbol_to_schematic"](
                     schematic_path=tmp_sch,
@@ -184,7 +184,7 @@ class TestAddSymbolToSchematic:
     def test_auto_increments_reference(self, tools, tmp_sch):
         """Successive add_symbol calls should yield distinct reference designators."""
         mgr = _make_mock_manager()
-        with patch("kcaa.tools.component_edit_tools._get_index_manager", return_value=mgr):
+        with patch("kcaa.tools.symbol_edit_tools._get_index_manager", return_value=mgr):
             r1 = asyncio.run(
                 tools["add_symbol_to_schematic"](
                     schematic_path=tmp_sch,
@@ -209,7 +209,7 @@ class TestAddSymbolToSchematic:
     def test_invalid_rotation_returns_error(self, tools, tmp_sch):
         """rotation=45 is not valid; should return an error dict."""
         mgr = _make_mock_manager()
-        with patch("kcaa.tools.component_edit_tools._get_index_manager", return_value=mgr):
+        with patch("kcaa.tools.symbol_edit_tools._get_index_manager", return_value=mgr):
             result = asyncio.run(
                 tools["add_symbol_to_schematic"](
                     schematic_path=tmp_sch,
@@ -239,7 +239,7 @@ class TestAddSymbolToSchematic:
         """When the library is absent from the index, return an error."""
         mgr = MagicMock()
         mgr.get_library_by_name.return_value = None
-        with patch("kcaa.tools.component_edit_tools._get_index_manager", return_value=mgr):
+        with patch("kcaa.tools.symbol_edit_tools._get_index_manager", return_value=mgr):
             result = asyncio.run(
                 tools["add_symbol_to_schematic"](
                     schematic_path=tmp_sch,
@@ -256,7 +256,7 @@ class TestAddSymbolToSchematic:
         mgr = MagicMock()
         mgr.get_library_by_name.return_value = MagicMock()
         mgr.get_symbol.return_value = None
-        with patch("kcaa.tools.component_edit_tools._get_index_manager", return_value=mgr):
+        with patch("kcaa.tools.symbol_edit_tools._get_index_manager", return_value=mgr):
             result = asyncio.run(
                 tools["add_symbol_to_schematic"](
                     schematic_path=tmp_sch,
@@ -411,7 +411,7 @@ class TestSetComponentProperty:
     def test_update_existing_value(self, tools, tmp_sch):
         """Updating the Value property of an existing component should succeed."""
         result = asyncio.run(
-            tools["set_component_property"](
+            tools["set_symbol_property"](
                 schematic_path=tmp_sch,
                 reference="R1",
                 property_name="Value",
@@ -426,7 +426,7 @@ class TestSetComponentProperty:
     def test_update_persists_after_write(self, tools, tmp_sch):
         """The updated Value should be readable from the written file."""
         asyncio.run(
-            tools["set_component_property"](
+            tools["set_symbol_property"](
                 schematic_path=tmp_sch,
                 reference="R1",
                 property_name="Value",
@@ -446,7 +446,7 @@ class TestSetComponentProperty:
     def test_add_new_property(self, tools, tmp_sch):
         """Adding a new custom property (MPN) should report action=='added'."""
         result = asyncio.run(
-            tools["set_component_property"](
+            tools["set_symbol_property"](
                 schematic_path=tmp_sch,
                 reference="R1",
                 property_name="MPN",
@@ -461,7 +461,7 @@ class TestSetComponentProperty:
     def test_new_property_persists_after_write(self, tools, tmp_sch):
         """A newly added property should be readable from the written file."""
         asyncio.run(
-            tools["set_component_property"](
+            tools["set_symbol_property"](
                 schematic_path=tmp_sch,
                 reference="R1",
                 property_name="MPN",
@@ -484,7 +484,7 @@ class TestSetComponentProperty:
         import sexpdata
 
         asyncio.run(
-            tools["set_component_property"](
+            tools["set_symbol_property"](
                 schematic_path=tmp_sch,
                 reference="R1",
                 property_name="Manufacturer",
@@ -532,7 +532,7 @@ class TestSetComponentProperty:
     def test_creates_backup(self, tools, tmp_sch):
         """A .bak file should appear next to the schematic after editing."""
         asyncio.run(
-            tools["set_component_property"](
+            tools["set_symbol_property"](
                 schematic_path=tmp_sch,
                 reference="R1",
                 property_name="Value",
@@ -544,7 +544,7 @@ class TestSetComponentProperty:
     def test_reference_not_found_returns_error(self, tools, tmp_sch):
         """An unknown reference should return an error dict."""
         result = asyncio.run(
-            tools["set_component_property"](
+            tools["set_symbol_property"](
                 schematic_path=tmp_sch,
                 reference="Z99",
                 property_name="Value",
@@ -556,7 +556,7 @@ class TestSetComponentProperty:
     def test_empty_reference_returns_error(self, tools, tmp_sch):
         """An empty reference string should be rejected."""
         result = asyncio.run(
-            tools["set_component_property"](
+            tools["set_symbol_property"](
                 schematic_path=tmp_sch,
                 reference="",
                 property_name="Value",
@@ -568,7 +568,7 @@ class TestSetComponentProperty:
     def test_empty_property_name_returns_error(self, tools, tmp_sch):
         """An empty property_name should be rejected."""
         result = asyncio.run(
-            tools["set_component_property"](
+            tools["set_symbol_property"](
                 schematic_path=tmp_sch,
                 reference="R1",
                 property_name="",
@@ -580,7 +580,7 @@ class TestSetComponentProperty:
     def test_invalid_extension_returns_error(self, tools):
         """A non-.kicad_sch path should be rejected immediately."""
         result = asyncio.run(
-            tools["set_component_property"](
+            tools["set_symbol_property"](
                 schematic_path="/tmp/bogus.txt",
                 reference="R1",
                 property_name="Value",
@@ -590,9 +590,9 @@ class TestSetComponentProperty:
         assert "error" in result
 
     def test_update_is_idempotent(self, tools, tmp_sch):
-        """Calling set_component_property twice should not duplicate properties."""
+        """Calling set_symbol_property twice should not duplicate properties."""
         asyncio.run(
-            tools["set_component_property"](
+            tools["set_symbol_property"](
                 schematic_path=tmp_sch,
                 reference="R1",
                 property_name="MPN",
@@ -600,7 +600,7 @@ class TestSetComponentProperty:
             )
         )
         result2 = asyncio.run(
-            tools["set_component_property"](
+            tools["set_symbol_property"](
                 schematic_path=tmp_sch,
                 reference="R1",
                 property_name="MPN",
@@ -629,7 +629,7 @@ class TestSetComponentProperty:
     def test_units_updated_count(self, tools, tmp_sch):
         """units_updated should equal the number of units with the reference."""
         result = asyncio.run(
-            tools["set_component_property"](
+            tools["set_symbol_property"](
                 schematic_path=tmp_sch,
                 reference="R1",
                 property_name="Value",
@@ -643,7 +643,7 @@ class TestSetComponentProperty:
     def test_empty_property_value_accepted(self, tools, tmp_sch):
         """An empty property_value is valid and should be persisted."""
         result = asyncio.run(
-            tools["set_component_property"](
+            tools["set_symbol_property"](
                 schematic_path=tmp_sch,
                 reference="R1",
                 property_name="Value",
@@ -664,7 +664,7 @@ class TestSetComponentProperty:
     def test_file_not_found_returns_error(self, tools):
         """A path to a non-existent .kicad_sch file should return an error."""
         result = asyncio.run(
-            tools["set_component_property"](
+            tools["set_symbol_property"](
                 schematic_path="/tmp/does_not_exist.kicad_sch",
                 reference="R1",
                 property_name="Value",
@@ -682,7 +682,7 @@ class TestSetComponentProperty:
         # Alternatively, confirm an existing component's Footprint value can be
         # updated and its hidden state is preserved from the original.
         result = asyncio.run(
-            tools["set_component_property"](
+            tools["set_symbol_property"](
                 schematic_path=tmp_sch,
                 reference="R1",
                 property_name="Footprint",
@@ -749,9 +749,9 @@ class TestSetComponentProperty:
 
 class TestListComponentProperties:
     def test_returns_expected_properties(self, tools, tmp_sch):
-        """list_component_properties should return Reference, Value, etc. for R1."""
+        """list_symbol_properties should return Reference, Value, etc. for R1."""
         result = asyncio.run(
-            tools["list_component_properties"](
+            tools["list_symbol_properties"](
                 schematic_path=tmp_sch,
                 reference="R1",
             )
@@ -765,7 +765,7 @@ class TestListComponentProperties:
     def test_returns_correct_values(self, tools, tmp_sch):
         """The values returned should match what is in the fixture schematic."""
         result = asyncio.run(
-            tools["list_component_properties"](
+            tools["list_symbol_properties"](
                 schematic_path=tmp_sch,
                 reference="R1",
             )
@@ -778,7 +778,7 @@ class TestListComponentProperties:
     def test_reference_not_found_returns_error(self, tools, tmp_sch):
         """An unknown reference should return an error dict."""
         result = asyncio.run(
-            tools["list_component_properties"](
+            tools["list_symbol_properties"](
                 schematic_path=tmp_sch,
                 reference="Z99",
             )
@@ -788,7 +788,7 @@ class TestListComponentProperties:
     def test_empty_reference_returns_error(self, tools, tmp_sch):
         """An empty reference string should be rejected."""
         result = asyncio.run(
-            tools["list_component_properties"](
+            tools["list_symbol_properties"](
                 schematic_path=tmp_sch,
                 reference="",
             )
@@ -798,7 +798,7 @@ class TestListComponentProperties:
     def test_invalid_extension_returns_error(self, tools):
         """A non-.kicad_sch path should be rejected immediately."""
         result = asyncio.run(
-            tools["list_component_properties"](
+            tools["list_symbol_properties"](
                 schematic_path="/tmp/bogus.txt",
                 reference="R1",
             )
@@ -808,7 +808,7 @@ class TestListComponentProperties:
     def test_file_not_found_returns_error(self, tools):
         """A path to a non-existent .kicad_sch file should return an error."""
         result = asyncio.run(
-            tools["list_component_properties"](
+            tools["list_symbol_properties"](
                 schematic_path="/tmp/does_not_exist.kicad_sch",
                 reference="R1",
             )
@@ -816,9 +816,9 @@ class TestListComponentProperties:
         assert "error" in result
 
     def test_does_not_create_backup(self, tools, tmp_sch):
-        """list_component_properties is read-only and must not write a backup."""
+        """list_symbol_properties is read-only and must not write a backup."""
         asyncio.run(
-            tools["list_component_properties"](
+            tools["list_symbol_properties"](
                 schematic_path=tmp_sch,
                 reference="R1",
             )
@@ -826,9 +826,9 @@ class TestListComponentProperties:
         assert not os.path.exists(tmp_sch + ".bak")
 
     def test_round_trip_with_set_property(self, tools, tmp_sch):
-        """A property added via set_component_property should appear in the list."""
+        """A property added via set_symbol_property should appear in the list."""
         add_result = asyncio.run(
-            tools["set_component_property"](
+            tools["set_symbol_property"](
                 schematic_path=tmp_sch,
                 reference="R1",
                 property_name="MPN",
@@ -837,7 +837,7 @@ class TestListComponentProperties:
         )
         assert add_result.get("success") is True, f"Setup failed: {add_result}"
         result = asyncio.run(
-            tools["list_component_properties"](
+            tools["list_symbol_properties"](
                 schematic_path=tmp_sch,
                 reference="R1",
             )
@@ -857,7 +857,7 @@ class TestDeleteComponentProperty:
     def _add_custom_property(self, tools, tmp_sch, name="MPN", value="RC0402FR-0710KL"):
         """Helper: add a custom property to R1 and return the result."""
         return asyncio.run(
-            tools["set_component_property"](
+            tools["set_symbol_property"](
                 schematic_path=tmp_sch,
                 reference="R1",
                 property_name=name,
@@ -870,7 +870,7 @@ class TestDeleteComponentProperty:
         add_result = self._add_custom_property(tools, tmp_sch)
         assert add_result.get("success") is True, f"Setup failed: {add_result}"
         result = asyncio.run(
-            tools["delete_component_property"](
+            tools["delete_symbol_property"](
                 schematic_path=tmp_sch,
                 reference="R1",
                 property_name="MPN",
@@ -884,7 +884,7 @@ class TestDeleteComponentProperty:
         add_result = self._add_custom_property(tools, tmp_sch)
         assert add_result.get("success") is True, f"Setup failed: {add_result}"
         asyncio.run(
-            tools["delete_component_property"](
+            tools["delete_symbol_property"](
                 schematic_path=tmp_sch,
                 reference="R1",
                 property_name="MPN",
@@ -913,7 +913,7 @@ class TestDeleteComponentProperty:
         add_result = self._add_custom_property(tools, tmp_sch)
         assert add_result.get("success") is True, f"Setup failed: {add_result}"
         asyncio.run(
-            tools["delete_component_property"](
+            tools["delete_symbol_property"](
                 schematic_path=tmp_sch,
                 reference="R1",
                 property_name="MPN",
@@ -924,7 +924,7 @@ class TestDeleteComponentProperty:
     def test_delete_reference_is_rejected(self, tools, tmp_sch):
         """Attempting to delete the Reference property should return an error."""
         result = asyncio.run(
-            tools["delete_component_property"](
+            tools["delete_symbol_property"](
                 schematic_path=tmp_sch,
                 reference="R1",
                 property_name="Reference",
@@ -943,7 +943,7 @@ class TestDeleteComponentProperty:
     def test_delete_value_is_rejected(self, tools, tmp_sch):
         """Attempting to delete the Value property should return an error."""
         result = asyncio.run(
-            tools["delete_component_property"](
+            tools["delete_symbol_property"](
                 schematic_path=tmp_sch,
                 reference="R1",
                 property_name="Value",
@@ -964,7 +964,7 @@ class TestDeleteComponentProperty:
     def test_property_not_found_returns_error(self, tools, tmp_sch):
         """Deleting a property that does not exist should return an error."""
         result = asyncio.run(
-            tools["delete_component_property"](
+            tools["delete_symbol_property"](
                 schematic_path=tmp_sch,
                 reference="R1",
                 property_name="NonExistentProp",
@@ -975,7 +975,7 @@ class TestDeleteComponentProperty:
     def test_reference_not_found_returns_error(self, tools, tmp_sch):
         """An unknown reference should return an error dict."""
         result = asyncio.run(
-            tools["delete_component_property"](
+            tools["delete_symbol_property"](
                 schematic_path=tmp_sch,
                 reference="Z99",
                 property_name="MPN",
@@ -986,7 +986,7 @@ class TestDeleteComponentProperty:
     def test_empty_reference_returns_error(self, tools, tmp_sch):
         """An empty reference string should be rejected."""
         result = asyncio.run(
-            tools["delete_component_property"](
+            tools["delete_symbol_property"](
                 schematic_path=tmp_sch,
                 reference="",
                 property_name="MPN",
@@ -997,7 +997,7 @@ class TestDeleteComponentProperty:
     def test_empty_property_name_returns_error(self, tools, tmp_sch):
         """An empty property_name should be rejected."""
         result = asyncio.run(
-            tools["delete_component_property"](
+            tools["delete_symbol_property"](
                 schematic_path=tmp_sch,
                 reference="R1",
                 property_name="",
@@ -1008,7 +1008,7 @@ class TestDeleteComponentProperty:
     def test_file_not_found_returns_error(self, tools):
         """A path to a non-existent .kicad_sch file should return an error."""
         result = asyncio.run(
-            tools["delete_component_property"](
+            tools["delete_symbol_property"](
                 schematic_path="/tmp/does_not_exist.kicad_sch",
                 reference="R1",
                 property_name="MPN",
@@ -1019,7 +1019,7 @@ class TestDeleteComponentProperty:
     def test_invalid_extension_returns_error(self, tools):
         """A non-.kicad_sch path should be rejected immediately."""
         result = asyncio.run(
-            tools["delete_component_property"](
+            tools["delete_symbol_property"](
                 schematic_path="/tmp/bogus.txt",
                 reference="R1",
                 property_name="MPN",
@@ -1568,7 +1568,7 @@ class TestNextReferenceCrossFile:
         """_find_project_dir returns the dir containing .kicad_pro."""
         import tempfile
 
-        from kcaa.tools.component_edit_tools import _find_project_dir
+        from kcaa.tools.symbol_edit_tools import _find_project_dir
 
         with tempfile.TemporaryDirectory() as td:
             proj_dir = Path(td) / "proj"
@@ -1583,7 +1583,7 @@ class TestNextReferenceCrossFile:
         """_find_project_dir returns None when no .kicad_pro exists."""
         import tempfile
 
-        from kcaa.tools.component_edit_tools import _find_project_dir
+        from kcaa.tools.symbol_edit_tools import _find_project_dir
 
         with tempfile.TemporaryDirectory() as td:
             sch = Path(td) / "orphan.kicad_sch"
@@ -1593,7 +1593,7 @@ class TestNextReferenceCrossFile:
 
     def test_collect_project_references(self, project_dir):
         """_collect_hierarchy_references gathers refs from the sheet hierarchy."""
-        from kcaa.tools.component_edit_tools import _collect_hierarchy_references
+        from kcaa.tools.symbol_edit_tools import _collect_hierarchy_references
 
         proj, parent_sch, sub_sch = project_dir
         refs = _collect_hierarchy_references(str(parent_sch))
@@ -1609,7 +1609,7 @@ class TestNextReferenceCrossFile:
     def test_next_reference_skips_own_file_but_scans_others(self, project_dir):
         """_next_reference should see R1, R3 from parent + R2 from sub,
         giving R4 (not R2 which only exists in sub-sheet)."""
-        from kcaa.tools.component_edit_tools import _next_reference
+        from kcaa.tools.symbol_edit_tools import _next_reference
 
         proj, parent_sch, sub_sch = project_dir
 
@@ -1632,7 +1632,7 @@ class TestNextReferenceCrossFile:
 
     def test_next_reference_no_project_uses_current_sch_only(self, tmp_sch):
         """When there's no project, _next_reference falls back to current file only."""
-        from kcaa.tools.component_edit_tools import _next_reference
+        from kcaa.tools.symbol_edit_tools import _next_reference
         from kcaa.utils.skip_compat import safe_schematic
 
         sch = safe_schematic(tmp_sch)
@@ -1667,7 +1667,7 @@ class TestRenameSymbol:
         assert result["target_reference"] == "R10"
         assert result["units_updated"] >= 1
 
-        from kcaa.tools.component_edit_tools import _read_instance_reference
+        from kcaa.tools.symbol_edit_tools import _read_instance_reference
 
         # Verify the file was actually changed, including instances reference.
         sch = skip.Schematic(tmp_sch)
@@ -1752,7 +1752,7 @@ class TestRenameSymbol:
         assert result["target_reference"] == "R8"
 
         # Verify R1 is gone and R8 is present, including instances.
-        from kcaa.tools.component_edit_tools import _read_instance_reference
+        from kcaa.tools.symbol_edit_tools import _read_instance_reference
 
         sch = skip.Schematic(tmp_sch)
         refs = set()

@@ -35,15 +35,15 @@ These are **read-before-edit** tools. The LLM must call at least one of these be
 
 These are read-only tools. They must be used when the LLM is asked to add a component so it can find the correct library name and symbol name before calling `add_symbol_to_schematic`.
 
-#### Component and Label Editing (`component_edit_tools.py`)
+#### Component and Label Editing (`symbol_edit_tools.py`)
 
 | Tool | Purpose |
 |------|---------|
 | `add_symbol_to_schematic` | Place a new symbol at a given position |
 | `remove_symbol_from_schematic` | Remove one or more symbols by reference |
-| `set_component_property` | Update any property (value, footprint, datasheet, custom field) |
-| `list_component_properties` | Read all properties of one component |
-| `delete_component_property` | Remove a custom property |
+| `set_symbol_property` | Update any property (value, footprint, datasheet, custom field) |
+| `list_symbol_properties` | Read all properties of one component |
+| `delete_symbol_property` | Remove a custom property |
 | `move_component` | Reposition a component to new coordinates |
 | `add_label_to_schematic` | Add a net label at a position |
 | `list_labels_in_schematic` | Enumerate all labels in a schematic |

@@ -194,7 +194,7 @@ angle_schematic = (540 - angle_lib) % 360
 
 - skip 仓库：https://github.com/psychogenic/skip
 - kicad-mcp 中的实现：
-  - `kcaa/tools/component_edit_tools.py` — `add_label_to_schematic`、`list_labels_in_schematic`、`delete_label_from_schematic`
+  - `kcaa/tools/symbol_edit_tools.py` — `add_label_to_schematic`、`list_labels_in_schematic`、`delete_label_from_schematic`
   - `kcaa/utils/skip_helpers.py` — `sym_pin_world_coords`（单引脚 fallback + 坐标系变换）
   - `kcaa/utils/symbol_index_reader.py` — `table.lib` 单元素兼容处理
   - `kcaa/utils/skip_compat.py` — UTF-8 编码兼容（Windows）
