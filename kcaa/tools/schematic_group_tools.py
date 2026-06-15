@@ -28,7 +28,7 @@ from typing import Any
 from fastmcp import Context, FastMCP
 import sexpdata
 
-from kcaa.tools.component_edit_tools import _find_property_by_name
+from kcaa.tools.symbol_edit_tools import _find_property_by_name
 from kcaa.utils.netlist_parser import extract_netlist
 from kcaa.utils.schematic_sexp_utils import save_schematic
 from kcaa.utils.skip_compat import safe_schematic

@@ -1,5 +1,5 @@
 """
-Tests for the label tools in component_edit_tools.py:
+Tests for the label tools in symbol_edit_tools.py:
   - add_label_to_schematic
   - list_labels_in_schematic
   - delete_label_from_schematic
@@ -52,10 +52,10 @@ class _MockMCP:
 
 def _get_tools() -> dict:
     """Register component edit tools against a mock MCP and return the dict."""
-    from kcaa.tools.component_edit_tools import register_component_edit_tools
+    from kcaa.tools.symbol_edit_tools import register_symbol_edit_tools
 
     mock = _MockMCP()
-    register_component_edit_tools(mock)
+    register_symbol_edit_tools(mock)
     return mock.tools
 
 

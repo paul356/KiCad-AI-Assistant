@@ -58,11 +58,11 @@ class _MockMCP:
 
 def _get_tools() -> dict:
     """Register component and wire edit tools against a mock MCP and return the dict."""
-    from kcaa.tools.component_edit_tools import register_component_edit_tools
+    from kcaa.tools.symbol_edit_tools import register_symbol_edit_tools
     from kcaa.tools.wire_edit_tools import register_wire_edit_tools
 
     mock = _MockMCP()
-    register_component_edit_tools(mock)
+    register_symbol_edit_tools(mock)
     register_wire_edit_tools(mock)
     return mock.tools
 

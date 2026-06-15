@@ -91,7 +91,7 @@ The plugin exposes 26 schematic editing tools to the LLM:
 
 - **Netlist inspection:** `extract_schematic_netlist`, `extract_project_netlist`, `find_component_connections`
 - **Symbol search:** `search_symbols`, `get_symbol`, `list_symbol_libraries`, `get_symbol_pins` + 4 more
-- **Component editing:** `add_symbol_to_schematic`, `remove_symbol_from_schematic`, `move_component`, `set_component_property` + 5 more
+- **Component editing:** `add_symbol_to_schematic`, `remove_symbol_from_schematic`, `move_component`, `set_symbol_property` + 5 more
 - **Wire editing:** `add_wire_to_schematic`, `connect_pins_with_wire`, `delete_wire_from_schematic` + 3 more
 
 See `docs/plugin/tool_contract.md` for full documentation.

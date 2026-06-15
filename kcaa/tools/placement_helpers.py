@@ -159,7 +159,7 @@ def _find_free_area_impl(
     sym_bbox_offset: tuple[float, float] | None = None
     if for_library and for_symbol:
         try:
-            from kcaa.tools.component_edit_tools import _get_index_manager
+            from kcaa.tools.symbol_edit_tools import _get_index_manager
             from kcaa.utils.symbol_extractor import extract_lib_symbol_raw
 
             mgr = _get_index_manager()

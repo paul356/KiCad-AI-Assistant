@@ -26,7 +26,6 @@ from fastmcp import FastMCP
 # Full-profile imports are deferred inside _register_full_profile() to avoid
 # loading kicad-cli-dependent modules when running in plugin mode.
 from kcaa.context import kicad_lifespan
-from kcaa.tools.component_edit_tools import register_component_edit_tools
 from kcaa.tools.drc_tools import register_drc_tools
 from kcaa.tools.kipy_tools import register_kipy_tools
 
@@ -43,6 +42,7 @@ from kcaa.tools.placement_helpers import register_placement_helpers
 from kcaa.tools.schematic_group_tools import register_schematic_group_tools
 from kcaa.tools.sheet_tools import register_sheet_tools
 from kcaa.tools.skill_tools import register_skill_tools
+from kcaa.tools.symbol_edit_tools import register_symbol_edit_tools
 from kcaa.tools.symbol_tools import register_symbol_tools
 from kcaa.tools.version_tools import register_version_tools
 from kcaa.tools.wire_edit_tools import register_wire_edit_tools
@@ -113,7 +113,7 @@ def _register_plugin_profile(mcp: FastMCP) -> None:
     logging.info("Registering plugin profile: schematic + PCB tools")
     register_netlist_tools(mcp)
     register_symbol_tools(mcp)
-    register_component_edit_tools(mcp)
+    register_symbol_edit_tools(mcp)
     register_sheet_tools(mcp)
     register_wire_edit_tools(mcp)
     register_pcb_library_tools(mcp)
@@ -173,7 +173,7 @@ def _register_full_profile(mcp: FastMCP) -> None:
     register_netlist_tools(mcp)
     register_pattern_tools(mcp)
     register_symbol_tools(mcp)
-    register_component_edit_tools(mcp)
+    register_symbol_edit_tools(mcp)
     register_sheet_tools(mcp)
     register_wire_edit_tools(mcp)
     register_pcb_library_tools(mcp)

@@ -18,7 +18,7 @@ The group name is stored as a custom symbol property `placement_group`,
 exactly mirroring the PCB approach. This means:
 - Group assignments persist in the `.kicad_sch` file
 - Symbol properties are manipulated via the existing `_find_property_by_name`
-  and `set_component_property` clone mechanism
+  and `set_symbol_property` clone mechanism
 
 ## Seven Tools
 

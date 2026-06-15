@@ -1,26 +1,26 @@
 ---
-name: component-edit
+name: symbol-edit
 priority: 65
 description: "Property CRUD, reference renaming, label management, reference conflict checking"
 ---
 # Tools overview
-- **set_component_property** — Set or add a property on a placed schematic component.
+- **set_symbol_property** — Set or add a property on a placed schematic component.
 - **rename_symbol** — Rename a symbol's reference designator (auto-assign available).
-- **list_component_properties** — List all properties of a placed schematic component.
-- **delete_component_property** — Delete a non-essential property from a component.
+- **list_symbol_properties** — List all properties of a placed schematic component.
+- **delete_symbol_property** — Delete a non-essential property from a component.
 - **add_label_to_schematic** — Add a local, global, or hierarchical net label.
 - **list_labels_in_schematic** — List all labels with coordinates, type, and shape.
 - **delete_label_from_schematic** — Delete labels by position (single or batch mode).
 - **check_reference_conflicts** — Find duplicate reference designators across the project hierarchy.
 
 # Recommended property workflow
-1. Call **list_component_properties(schematic_path, reference)** to see existing properties
+1. Call **list_symbol_properties(schematic_path, reference)** to see existing properties
    (returns `{name, value}` pairs from the first unit of a multi-unit symbol).
-2. Call **set_component_property(schematic_path, reference, property_name, property_value)**
+2. Call **set_symbol_property(schematic_path, reference, property_name, property_value)**
    to add or update. All units sharing that reference are updated together. Non-standard
    properties (anything besides Reference and Value) are hidden on the canvas by default.
    Returns `action` ("added", "updated", or "mixed") to tell you what happened per-unit.
-3. To remove, call **delete_component_property(schematic_path, reference, property_name)**.
+3. To remove, call **delete_symbol_property(schematic_path, reference, property_name)**.
    `Reference` and `Value` are KiCad-required and **cannot be deleted**; attempting to do so
    returns an error without modifying the file.
 
@@ -53,7 +53,7 @@ description: "Property CRUD, reference renaming, label management, reference con
 - All mutation tools create a `.kicad_sch.bak` backup before saving.
 - `rename_symbol` also updates `instances.path.reference` (KiCad's authoritative display
   reference). Omitting `target_reference` sets `auto_assigned: true`.
-- `set_component_property` clones the existing Value property structure when creating a
+- `set_symbol_property` clones the existing Value property structure when creating a
   new property. Non-standard properties get `(hide yes)` injected automatically.
 - `delete_label_from_schematic` with `positions` (batch mode) collects all targets then
   saves once — far more efficient than calling it multiple times.
