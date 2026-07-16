@@ -202,6 +202,11 @@ class PathValidator:
 # Global default validator instance
 _default_validator = None
 
+# Validator scoped to the directories KiCad projects are actually expected to
+# live in, used by MCP tools/resources that accept a project/file path
+# supplied by the caller (see kcaa/resources and kcaa/tools).
+_project_validator = None
+
 
 def get_default_validator() -> PathValidator:
     """Get the default global path validator instance."""
@@ -209,6 +214,23 @@ def get_default_validator() -> PathValidator:
     if _default_validator is None:
         _default_validator = PathValidator()
     return _default_validator
+
+
+def get_project_validator() -> PathValidator:
+    """Get a path validator trusted for KiCad project directories.
+
+    Trusted roots are the configured KiCad user directory and any
+    additional search paths (``kicad_user_dir`` / ``additional_search_paths``
+    in :mod:`kcaa.utils.config`, the same locations ``find_kicad_projects``
+    scans), plus the process's working directory. Paths outside these roots
+    are rejected, preventing MCP callers from reading or triggering actions
+    on arbitrary files elsewhere on disk.
+    """
+    global _project_validator
+    if _project_validator is None:
+        roots = {os.getcwd(), config.kicad_user_dir, *config.additional_search_paths}
+        _project_validator = PathValidator(trusted_roots=roots)
+    return _project_validator
 
 
 def validate_path(file_path: str, must_exist: bool = False) -> str:

@@ -12,6 +12,7 @@ import pandas as pd
 
 from kcaa.utils.config import config
 from kcaa.utils.file_utils import get_project_files
+from kcaa.utils.path_validator import PathValidationError, get_project_validator
 
 
 def register_bom_tools(mcp: FastMCP) -> None:
@@ -178,11 +179,15 @@ def register_bom_tools(mcp: FastMCP) -> None:
         """
         print(f"Exporting BOM for project: {project_path}")
 
-        if not os.path.exists(project_path):
-            print(f"Project not found: {project_path}")
+        try:
+            project_path = get_project_validator().validate_kicad_file(
+                project_path, "project", must_exist=True
+            )
+        except PathValidationError as e:
+            print(f"Invalid project path: {e}")
             if ctx:
-                ctx.info(f"Project not found: {project_path}")
-            return {"success": False, "error": f"Project not found: {project_path}"}
+                ctx.info(f"Invalid project path: {e}")
+            return {"success": False, "error": f"Invalid project path: {e}"}
 
         # Get access to the app context
         app_context = ctx.request_context.lifespan_context if ctx else None

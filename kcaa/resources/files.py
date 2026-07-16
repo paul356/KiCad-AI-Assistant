@@ -6,6 +6,8 @@ import os
 
 from fastmcp import FastMCP
 
+from kcaa.utils.path_validator import PathValidationError, get_project_validator
+
 
 def register_file_resources(mcp: FastMCP) -> None:
     """Register file-related resources with the MCP server.
@@ -17,8 +19,12 @@ def register_file_resources(mcp: FastMCP) -> None:
     @mcp.resource("kicad://schematic/{schematic_path}")
     def get_schematic_info(schematic_path: str) -> str:
         """Extract information from a KiCad schematic file."""
-        if not os.path.exists(schematic_path):
-            return f"Schematic file not found: {schematic_path}"
+        try:
+            schematic_path = get_project_validator().validate_kicad_file(
+                schematic_path, "schematic", must_exist=True
+            )
+        except PathValidationError as e:
+            return f"Invalid schematic path: {e}"
 
         # KiCad schematic files are in S-expression format (not JSON)
         # This is a basic extraction of text-based information

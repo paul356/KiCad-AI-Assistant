@@ -7,6 +7,7 @@ import os
 from fastmcp import FastMCP
 
 from kcaa.utils.file_utils import get_project_files, load_project_json
+from kcaa.utils.path_validator import PathValidationError, get_project_validator
 
 
 def register_project_resources(mcp: FastMCP) -> None:
@@ -19,8 +20,12 @@ def register_project_resources(mcp: FastMCP) -> None:
     @mcp.resource("kicad://project/{project_path}")
     def get_project_details(project_path: str) -> str:
         """Get details about a specific KiCad project."""
-        if not os.path.exists(project_path):
-            return f"Project not found: {project_path}"
+        try:
+            project_path = get_project_validator().validate_kicad_file(
+                project_path, "project", must_exist=True
+            )
+        except PathValidationError as e:
+            return f"Invalid project path: {e}"
 
         try:
             # Load project file

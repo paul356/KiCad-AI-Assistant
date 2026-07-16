@@ -9,6 +9,7 @@ import sys  # Add sys import
 from typing import Any
 
 from kcaa.utils.config import config
+from kcaa.utils.path_validator import PathValidationError, get_project_validator
 
 # Get PID for logging - Removed, handled by logging config
 # _PID = os.getpid()
@@ -103,8 +104,12 @@ def open_kicad_project(project_path: str) -> dict[str, Any]:
     Returns:
         Dictionary with result information
     """
-    if not os.path.exists(project_path):
-        return {"success": False, "error": f"Project not found: {project_path}"}
+    try:
+        project_path = get_project_validator().validate_kicad_file(
+            project_path, "project", must_exist=True
+        )
+    except PathValidationError as e:
+        return {"success": False, "error": f"Invalid project path: {e}"}
 
     try:
         cmd = []
@@ -118,7 +123,7 @@ def open_kicad_project(project_path: str) -> dict[str, Any]:
             # Fallback or error for unsupported OS
             return {"success": False, "error": f"Unsupported operating system: {sys.platform}"}
 
-        result = subprocess.run(cmd, capture_output=True, text=True)  # nosec B603 -- input is validated
+        result = subprocess.run(cmd, capture_output=True, text=True)  # nosec B603 -- project_path validated via PathValidator (trusted roots + .kicad_pro extension)
 
         return {
             "success": result.returncode == 0,
