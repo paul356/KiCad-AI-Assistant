@@ -41,6 +41,86 @@ if _WX_AVAILABLE:
         pass
 
 
+import html as _html_mod
+import html.parser as _html_parser
+
+# Allow-list of tags/attributes considered safe to render in the WebView
+# chat panel. `markdown.markdown()` passes any raw HTML embedded in its
+# input straight through unsanitized, and AI responses may echo back text
+# read from project files or other untrusted sources -- so HTML produced by
+# `_md_to_html` is sanitized against this allow-list before it is ever
+# written into the WebView's DOM.
+_ALLOWED_HTML_TAGS = frozenset(
+    {
+        "p", "br", "hr", "strong", "b", "em", "i", "u", "s", "code", "pre",
+        "blockquote", "ul", "ol", "li",
+        "table", "thead", "tbody", "tr", "th", "td",
+        "h1", "h2", "h3", "h4", "h5", "h6", "span", "a",
+    }
+)
+_ALLOWED_HTML_ATTRS = {"a": {"href"}}
+_SAFE_URL_SCHEMES = ("http://", "https://", "mailto:")
+
+
+class _AllowListHTMLParser(_html_parser.HTMLParser):
+    """Rebuilds HTML keeping only an allow-listed set of tags/attributes.
+
+    Anything not on the allow-list (script tags, event-handler attributes,
+    javascript: URLs, iframes, etc.) is dropped; its text content, if any,
+    is escaped and kept.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=False)
+        self.out: list[str] = []
+
+    def handle_starttag(self, tag, attrs) -> None:
+        if tag not in _ALLOWED_HTML_TAGS:
+            return
+        kept = []
+        for name, value in attrs:
+            if name not in _ALLOWED_HTML_ATTRS.get(tag, ()):
+                continue
+            value = value or ""
+            if tag == "a" and name == "href" and not value.strip().lower().startswith(
+                _SAFE_URL_SCHEMES
+            ):
+                continue
+            kept.append(f'{name}="{_html_mod.escape(value, quote=True)}"')
+        attrs_str = (" " + " ".join(kept)) if kept else ""
+        self.out.append(f"<{tag}{attrs_str}>")
+
+    def handle_startendtag(self, tag, attrs) -> None:
+        if tag in ("br", "hr"):
+            self.out.append(f"<{tag}>")
+
+    def handle_endtag(self, tag) -> None:
+        if tag in _ALLOWED_HTML_TAGS:
+            self.out.append(f"</{tag}>")
+
+    def handle_data(self, data) -> None:
+        self.out.append(_html_mod.escape(data))
+
+    def handle_entityref(self, name) -> None:
+        self.out.append(f"&{name};")
+
+    def handle_charref(self, name) -> None:
+        self.out.append(f"&#{name};")
+
+
+def sanitize_ai_html(raw_html: str) -> str:
+    """Sanitize HTML produced from an AI response before rendering it.
+
+    Strips anything not on `_ALLOWED_HTML_TAGS`/`_ALLOWED_HTML_ATTRS`
+    (script tags, on* event handlers, javascript: URLs, iframes, ...),
+    escaping the rest so it displays as inert text instead of executing.
+    """
+    parser = _AllowListHTMLParser()
+    parser.feed(raw_html)
+    parser.close()
+    return "".join(parser.out)
+
+
 if _WX_AVAILABLE:
 
     class AssistantPanel(wx.Frame):
@@ -1759,7 +1839,12 @@ if _WX_AVAILABLE:
             try:
                 import markdown
 
-                return markdown.markdown(text, extensions=["tables", "fenced_code"])
+                # `markdown.markdown()` passes any raw HTML embedded in the
+                # source straight through unsanitized; sanitize the result
+                # against an allow-list before it is rendered in the WebView.
+                return sanitize_ai_html(
+                    markdown.markdown(text, extensions=["tables", "fenced_code"])
+                )
             except ImportError:
                 pass
 
