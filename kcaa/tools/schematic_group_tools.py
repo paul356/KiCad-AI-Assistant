@@ -90,14 +90,16 @@ def _set_sym_property(sym: Any, name: str, value: str) -> None:
 
 
 def _delete_sym_property(sym: Any, name: str) -> bool:
-    """Delete a property from a symbol.  Returns True if deleted."""
+    """Delete a property from a symbol.  Returns True if deleted.
+
+    Raises if the underlying kipy delete operation fails, matching the
+    behaviour of the same ``prop._pv.delete()`` call in
+    :func:`symbol_edit_tools.delete_symbol_property`.
+    """
     prop = _find_property_by_name(sym, name)
     if prop is not None:
-        try:
-            prop._pv.delete()
-            return True
-        except Exception:
-            pass
+        prop._pv.delete()
+        return True
     return False
 
 
