@@ -76,6 +76,13 @@ New-Item -ItemType Directory -Force -Path $KICAD_PLUGIN_DIR
 Expand-Archive -Path kicad_ai_assistant.zip -DestinationPath $KICAD_PLUGIN_DIR
 ```
 
+**Windows (PowerShell):**
+```powershell
+$KICAD_PLUGIN_DIR = "$env:USERPROFILE\Documents\KiCad\10.0\scripting\plugins"
+New-Item -ItemType Directory -Force -Path $KICAD_PLUGIN_DIR
+Expand-Archive -Path kicad-ai-assistant.zip -DestinationPath $KICAD_PLUGIN_DIR
+```
+
 Or build from source:
 
 ```bash
