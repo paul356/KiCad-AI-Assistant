@@ -60,20 +60,20 @@ cd kcaa
 
 ### 2. Install the plugin
 
-Download `kicad-ai-assistant.zip` from the [Releases page](https://github.com/paul356/KiCad-AI-Assistant/releases) and unzip it into KiCad's plugin directory:
+Download `kicad_ai_assistant.zip` from the [Releases page](https://github.com/paul356/KiCad-AI-Assistant/releases) and unzip it into KiCad's plugin directory:
 
 **Linux:**
 ```bash
 KICAD_PLUGIN_DIR=~/.local/share/kicad/10.0/scripting/plugins
 mkdir -p "$KICAD_PLUGIN_DIR"
-unzip kicad-ai-assistant.zip -d "$KICAD_PLUGIN_DIR"
+unzip kicad_ai_assistant.zip -d "$KICAD_PLUGIN_DIR"
 ```
 
 **Windows (PowerShell):**
 ```powershell
 $KICAD_PLUGIN_DIR = "$env:USERPROFILE\Documents\KiCad\10.0\scripting\plugins"
 New-Item -ItemType Directory -Force -Path $KICAD_PLUGIN_DIR
-Expand-Archive -Path kicad-ai-assistant.zip -DestinationPath $KICAD_PLUGIN_DIR
+Expand-Archive -Path kicad_ai_assistant.zip -DestinationPath $KICAD_PLUGIN_DIR
 ```
 
 Or build from source:
