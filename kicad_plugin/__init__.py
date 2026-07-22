@@ -79,81 +79,6 @@ except ImportError:
     log.warning("wx not available — plugin running outside KiCad (dev mode)")
 
 
-def _export_design_defaults() -> None:
-    """Extract KiCad's default board design rules and persist them.
-
-    Writes ``design-defaults.json`` into the kcaa data directory so the
-    MCP server can read KiCad's real default values without importing pcbnew.
-
-    Reads the bare board-level ``m_`` attributes from a fresh ``BOARD()``.
-    Net-class values are not merged — they are returned separately by
-    ``get_effective_design_rules`` from the ``.kicad_pro`` file.
-    """
-    if not _IN_KICAD:
-        return
-    try:
-        import json as _json
-
-        board = _pcbnew.BOARD()
-        settings = board.GetDesignSettings()
-
-        # Hardcoded mapping: sexp tag → pcbnew attribute name.
-        # Each attr is validated; warnings are logged for missing attributes.
-        _FIELD_MAP = {
-            "min_clearance": "m_MinClearance",
-            "min_groove_width": "m_MinGrooveWidth",
-            "min_connection_width": "m_MinConn",
-            "min_track_width": "m_TrackMinWidth",
-            "min_via_annular_width": "m_ViasMinAnnularWidth",
-            "min_via_size": "m_ViasMinSize",
-            "min_through_drill": "m_MinThroughDrill",
-            "min_microvia_size": "m_MicroViasMinSize",
-            "min_microvia_drill": "m_MicroViasMinDrill",
-            "copper_edge_clearance": "m_CopperEdgeClearance",
-            "hole_clearance": "m_HoleClearance",
-            "hole_to_hole_min": "m_HoleToHoleMin",
-            "silk_clearance": "m_SilkClearance",
-            "min_silk_text_height": "m_MinSilkTextHeight",
-            "min_silk_text_thickness": "m_MinSilkTextThickness",
-        }
-
-        defaults = {}
-        log.info("Exporting KiCad design defaults (board m_):")
-
-        for key, attr in _FIELD_MAP.items():
-            if not hasattr(settings, attr):
-                log.warning(
-                    "  %s: pcbnew attribute %s NOT FOUND on BOARD_DESIGN_SETTINGS — skipped",
-                    key,
-                    attr,
-                )
-                continue
-            raw = getattr(settings, attr)
-            mm_value = _pcbnew.ToMM(raw)
-            defaults[key] = mm_value
-            log.info("  %s: %s mm (board %s, raw=%s)", key, mm_value, attr, raw)
-
-        # Resolved spokes — board-level only
-        raw_spokes = settings.m_MinResolvedSpokes
-        defaults["min_resolved_spokes"] = int(raw_spokes)
-        log.info(
-            "  min_resolved_spokes: %s (board m_MinResolvedSpokes, raw=%s)",
-            int(raw_spokes),
-            raw_spokes,
-        )
-
-        from .settings import _get_kcaa_data_dir
-
-        defaults_dir = _get_kcaa_data_dir()
-        defaults_path = os.path.join(defaults_dir, "design-defaults.json")
-        os.makedirs(defaults_dir, exist_ok=True)
-        with open(defaults_path, "w", encoding="utf-8") as f:
-            _json.dump(defaults, f, indent=2)
-        log.info("Exported KiCad design defaults to %s", defaults_path)
-    except Exception as exc:
-        log.warning("Could not export KiCad design defaults: %s", exc)
-
-
 def _plugin_dir() -> str:
     return os.path.dirname(os.path.abspath(__file__))
 
@@ -234,7 +159,5 @@ class KiCadAIPlugin(_ActionPluginBase):
 # ---------------------------------------------------------------------------
 # KiCad auto-discovery: instantiate and register when the module is loaded
 # ---------------------------------------------------------------------------
-_export_design_defaults()
-
 plugin = KiCadAIPlugin()
 plugin.register()
