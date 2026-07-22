@@ -1161,7 +1161,7 @@ def _add_lib_symbol(lib_symbols_wrapper: Any, lib_sym_raw: list, table_name: str
 # ---------------------------------------------------------------------------
 
 
-def register_component_edit_tools(mcp: FastMCP) -> None:
+def register_symbol_edit_tools(mcp: FastMCP) -> None:
     """Register all component editing tools with the MCP server."""
 
     @mcp.tool()
@@ -1492,7 +1492,7 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
             return {"error": str(exc), "success": False}
 
     @mcp.tool()
-    async def set_component_property(
+    async def set_symbol_property(
         schematic_path: str,
         reference: str,
         property_name: str,
@@ -1615,7 +1615,7 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
             }
 
         except Exception as exc:
-            log.exception("Unexpected error in set_component_property")
+            log.exception("Unexpected error in set_symbol_property")
             return {"error": str(exc), "success": False}
 
     @mcp.tool()
@@ -1754,7 +1754,7 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
             return {"error": str(exc), "success": False}
 
     @mcp.tool()
-    async def list_component_properties(
+    async def list_symbol_properties(
         schematic_path: str,
         reference: str,
         ctx: Context | None = None,
@@ -1823,11 +1823,11 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
             }
 
         except Exception as exc:
-            log.exception("Unexpected error in list_component_properties")
+            log.exception("Unexpected error in list_symbol_properties")
             return {"error": str(exc), "success": False}
 
     @mcp.tool()
-    async def delete_component_property(
+    async def delete_symbol_property(
         schematic_path: str,
         reference: str,
         property_name: str,
@@ -1914,7 +1914,7 @@ def register_component_edit_tools(mcp: FastMCP) -> None:
             }
 
         except Exception as exc:
-            log.exception("Unexpected error in delete_component_property")
+            log.exception("Unexpected error in delete_symbol_property")
             return {"error": str(exc), "success": False}
 
     @mcp.tool()

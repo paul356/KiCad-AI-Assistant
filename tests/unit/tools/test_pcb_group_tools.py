@@ -322,22 +322,22 @@ class TestFindGroupBoardPositionPreferNear:
 
 
 # ---------------------------------------------------------------------------
-# place_component_group MCP tool — Enhancements 3 & 5 end-to-end
+# place_footprint_group MCP tool — Enhancements 3 & 5 end-to-end
 # ---------------------------------------------------------------------------
 
 
 class TestPlaceComponentGroup:
-    """End-to-end tests for the place_component_group MCP tool."""
+    """End-to-end tests for the place_footprint_group MCP tool."""
 
     def test_place_group_returns_placed_count(self, tools, board_copy):
-        """place_component_group places all 5 usb_c members (anchor + 4)."""
-        result = _run(tools["place_component_group"](board_copy, "usb_c"))
+        """place_footprint_group places all 5 usb_c members (anchor + 4)."""
+        result = _run(tools["place_footprint_group"](board_copy, "usb_c"))
         assert "error" not in result, f"Unexpected error: {result.get('error')}"
         assert result["placed_count"] == 5
 
     def test_place_group_hpwl_positive_and_finite(self, tools, board_copy):
         """HPWL reported after placement is a positive finite number."""
-        result = _run(tools["place_component_group"](board_copy, "usb_c"))
+        result = _run(tools["place_footprint_group"](board_copy, "usb_c"))
         assert "error" not in result
         hpwl = result["intra_hpwl_mm"]
         assert hpwl > 0.0
@@ -345,29 +345,29 @@ class TestPlaceComponentGroup:
 
     def test_place_group_found_clear_position(self, tools, board_copy):
         """Phase 2 raster scan finds a collision-free board position."""
-        result = _run(tools["place_component_group"](board_copy, "usb_c"))
+        result = _run(tools["place_footprint_group"](board_copy, "usb_c"))
         assert result["found_clear_position"] is True
 
     def test_anchor_ref_is_j3(self, tools, board_copy):
         """J3 (22-pad connector) is always chosen as the anchor (highest priority tier)."""
-        result = _run(tools["place_component_group"](board_copy, "usb_c"))
+        result = _run(tools["place_footprint_group"](board_copy, "usb_c"))
         assert result["anchor_ref"] == "J3"
 
     def test_placed_list_contains_all_refs(self, tools, board_copy):
         """The ``placed`` list contains entries for every group member."""
-        result = _run(tools["place_component_group"](board_copy, "usb_c"))
+        result = _run(tools["place_footprint_group"](board_copy, "usb_c"))
         placed_refs = {p["reference"] for p in result["placed"]}
         assert placed_refs == set(_USB_C_REFS)
 
     def test_backup_file_created(self, tools, board_copy):
         """A .kicad_pcb.bak backup is written before the file is modified."""
-        result = _run(tools["place_component_group"](board_copy, "usb_c"))
+        result = _run(tools["place_footprint_group"](board_copy, "usb_c"))
         backup = result.get("backup_path", board_copy + ".bak")
         assert os.path.exists(backup), f"Backup not found at {backup}"
 
     def test_unknown_group_returns_error(self, tools, board_copy):
         """Requesting a group that does not exist returns an error dict."""
-        result = _run(tools["place_component_group"](board_copy, "nonexistent_group"))
+        result = _run(tools["place_footprint_group"](board_copy, "nonexistent_group"))
         assert "error" in result
 
 
@@ -619,10 +619,10 @@ class TestGridLayout:
             )
 
     def test_grid_algo_via_tool(self, tools, tmp_path):
-        """place_component_group completes without error using the grid layout."""
+        """place_footprint_group completes without error using the grid layout."""
         copy = str(tmp_path / "grid.kicad_pcb")
         shutil.copy(FIXTURE_PCB, copy)
-        result = _run(tools["place_component_group"](copy, "usb_c"))
+        result = _run(tools["place_footprint_group"](copy, "usb_c"))
         assert "error" not in result, result
         assert result["placed_count"] == len(_USB_C_REFS)
         placed_refs = {p["reference"] for p in result["placed"]}
@@ -630,17 +630,17 @@ class TestGridLayout:
 
 
 # ---------------------------------------------------------------------------
-# rotate_group MCP tool
+# rotate_footprint_group MCP tool
 # ---------------------------------------------------------------------------
 
 
 class TestRotateGroup:
-    """Tests for the rotate_group MCP tool."""
+    """Tests for the rotate_footprint_group MCP tool."""
 
     def test_rotate_group_90_cw_preserves_relative_positions(self, tools, board_copy):
         """90° CW rotation moves components to the right BELOW the anchor."""
         # First place the group
-        _run(tools["place_component_group"](board_copy, "usb_c"))
+        _run(tools["place_footprint_group"](board_copy, "usb_c"))
 
         # Get initial positions
         data_before = load_pcb(board_copy)
@@ -652,7 +652,7 @@ class TestRotateGroup:
         dy_before = r1y_before - ay
 
         # Rotate 90° CW
-        result = _run(tools["rotate_group"](board_copy, "usb_c", 90.0))
+        result = _run(tools["rotate_footprint_group"](board_copy, "usb_c", 90.0))
         assert "error" not in result, f"Unexpected error: {result.get('error')}"
 
         # Check positions after rotation
@@ -683,7 +683,7 @@ class TestRotateGroup:
 
     def test_rotate_group_increments_component_rotations(self, tools, board_copy):
         """Component orientations counter-rotate to maintain orientation in group frame."""
-        _run(tools["place_component_group"](board_copy, "usb_c"))
+        _run(tools["place_footprint_group"](board_copy, "usb_c"))
 
         data_before = load_pcb(board_copy)
         j3_before = find_footprint(data_before, "J3")
@@ -692,7 +692,7 @@ class TestRotateGroup:
         _, _, d1_rot_before = get_fp_at(d1_before)
 
         # Rotate 90° CW
-        result = _run(tools["rotate_group"](board_copy, "usb_c", 90.0))
+        result = _run(tools["rotate_footprint_group"](board_copy, "usb_c", 90.0))
         assert "error" not in result
 
         data_after = load_pcb(board_copy)
@@ -715,7 +715,7 @@ class TestRotateGroup:
 
     def test_rotate_group_180_degrees(self, tools, board_copy):
         """180° rotation should flip positions while preserving distances."""
-        _run(tools["place_component_group"](board_copy, "usb_c"))
+        _run(tools["place_footprint_group"](board_copy, "usb_c"))
 
         data_before = load_pcb(board_copy)
         j3_before = find_footprint(data_before, "J3")
@@ -725,7 +725,7 @@ class TestRotateGroup:
         dist_before = math.hypot(r2x_before - ax, r2y_before - ay)
 
         # Rotate 180°
-        result = _run(tools["rotate_group"](board_copy, "usb_c", 180.0))
+        result = _run(tools["rotate_footprint_group"](board_copy, "usb_c", 180.0))
         assert "error" not in result
 
         data_after = load_pcb(board_copy)
@@ -749,11 +749,11 @@ class TestRotateGroup:
 
     def test_rotate_group_multiple_rotations_compound(self, tools, board_copy):
         """Two 90° rotations should equal one 180° rotation."""
-        _run(tools["place_component_group"](board_copy, "usb_c"))
+        _run(tools["place_footprint_group"](board_copy, "usb_c"))
 
         # Rotate 90° twice
-        _run(tools["rotate_group"](board_copy, "usb_c", 90.0))
-        result = _run(tools["rotate_group"](board_copy, "usb_c", 90.0))
+        _run(tools["rotate_footprint_group"](board_copy, "usb_c", 90.0))
+        result = _run(tools["rotate_footprint_group"](board_copy, "usb_c", 90.0))
         assert "error" not in result
 
         data = load_pcb(board_copy)
@@ -769,14 +769,14 @@ class TestRotateGroup:
 
     def test_rotate_group_anchor_stays_in_place(self, tools, board_copy):
         """The anchor position must not change during rotation."""
-        _run(tools["place_component_group"](board_copy, "usb_c"))
+        _run(tools["place_footprint_group"](board_copy, "usb_c"))
 
         data_before = load_pcb(board_copy)
         j3_before = find_footprint(data_before, "J3")
         ax_before, ay_before, _ = get_fp_at(j3_before)
 
         # Rotate 45°
-        _run(tools["rotate_group"](board_copy, "usb_c", 45.0))
+        _run(tools["rotate_footprint_group"](board_copy, "usb_c", 45.0))
 
         data_after = load_pcb(board_copy)
         j3_after = find_footprint(data_after, "J3")
@@ -787,9 +787,9 @@ class TestRotateGroup:
 
     def test_rotate_group_returns_correct_metadata(self, tools, board_copy):
         """rotate_group returns group_name, anchor_ref, rotation_delta, rotated_count."""
-        _run(tools["place_component_group"](board_copy, "usb_c"))
+        _run(tools["place_footprint_group"](board_copy, "usb_c"))
 
-        result = _run(tools["rotate_group"](board_copy, "usb_c", 90.0))
+        result = _run(tools["rotate_footprint_group"](board_copy, "usb_c", 90.0))
         assert result["group_name"] == "usb_c"
         assert result["anchor_ref"] == "J3"
         assert result["rotation_delta"] == 90.0
@@ -798,28 +798,28 @@ class TestRotateGroup:
 
     def test_rotate_group_creates_backup(self, tools, board_copy):
         """A .kicad_pcb.bak backup is created before rotation."""
-        _run(tools["place_component_group"](board_copy, "usb_c"))
+        _run(tools["place_footprint_group"](board_copy, "usb_c"))
 
-        result = _run(tools["rotate_group"](board_copy, "usb_c", 90.0))
+        result = _run(tools["rotate_footprint_group"](board_copy, "usb_c", 90.0))
         backup = result.get("backup_path", board_copy + ".bak")
         assert os.path.exists(backup), f"Backup not found at {backup}"
 
     def test_rotate_group_unknown_group_returns_error(self, tools, board_copy):
         """Rotating a nonexistent group returns an error."""
-        result = _run(tools["rotate_group"](board_copy, "nonexistent", 90.0))
+        result = _run(tools["rotate_footprint_group"](board_copy, "nonexistent", 90.0))
         assert "error" in result
         assert "no members" in result["error"].lower()
 
     def test_rotate_group_360_is_identity(self, tools, board_copy):
         """360° rotation should return to original positions (modulo floating point)."""
-        _run(tools["place_component_group"](board_copy, "usb_c"))
+        _run(tools["place_footprint_group"](board_copy, "usb_c"))
 
         data_before = load_pcb(board_copy)
         r1_before = find_footprint(data_before, "R1")
         r1x_before, r1y_before, r1_rot_before = get_fp_at(r1_before)
 
         # Rotate 360°
-        _run(tools["rotate_group"](board_copy, "usb_c", 360.0))
+        _run(tools["rotate_footprint_group"](board_copy, "usb_c", 360.0))
 
         data_after = load_pcb(board_copy)
         r1_after = find_footprint(data_after, "R1")

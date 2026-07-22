@@ -616,4 +616,4 @@ register_sheet_tools(mcp)
 
 4. **Single-file mutations only.** Each tool operates on one `.kicad_sch` file.  Multi-file coordination (create parent + add sheet + populate child) is the LLM's responsibility — this matches the existing pattern where the LLM chains tools.
 
-5. **Pattern match on existing codebase.** All tools follow the same patterns as `component_edit_tools.py`: async def, `@mcp.tool()`, `dict[str, Any]` return, `safe_schematic` + `save_schematic`, error-first returns.
+5. **Pattern match on existing codebase.** All tools follow the same patterns as `symbol_edit_tools.py`: async def, `@mcp.tool()`, `dict[str, Any]` return, `safe_schematic` + `save_schematic`, error-first returns.
