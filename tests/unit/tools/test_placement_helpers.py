@@ -1,5 +1,5 @@
 """Tests for placement_helpers (get_schematic_sheet_info, find_free_area)
-and the new placement-related additions to component_edit_tools
+and the new placement-related additions to symbol_edit_tools
 (body_bbox in add/move returns, place_symbol_relative).
 """
 
@@ -40,10 +40,10 @@ def _placement_tools() -> dict:
 
 
 def _component_tools() -> dict:
-    from kcaa.tools.component_edit_tools import register_component_edit_tools
+    from kcaa.tools.symbol_edit_tools import register_symbol_edit_tools
 
     mock = _MockMCP()
-    register_component_edit_tools(mock)
+    register_symbol_edit_tools(mock)
     return mock.tools
 
 
@@ -130,7 +130,7 @@ class TestFindFreeArea:
         comps = _component_tools()
         mgr = _make_mock_manager()
         with patch(
-            "kcaa.tools.component_edit_tools._get_index_manager",
+            "kcaa.tools.symbol_edit_tools._get_index_manager",
             return_value=mgr,
         ):
             res = asyncio.run(
@@ -244,7 +244,7 @@ class TestFindFreeArea:
         # independently verify occupancy.
         cluster_bboxes: list[dict] = []
         with patch(
-            "kcaa.tools.component_edit_tools._get_index_manager",
+            "kcaa.tools.symbol_edit_tools._get_index_manager",
             return_value=mgr,
         ):
             for i, (cx, cy) in enumerate(cluster_positions):
@@ -364,7 +364,7 @@ class TestFindFreeArea:
         comps = _component_tools()
         mgr = _make_mock_manager()
         with patch(
-            "kcaa.tools.component_edit_tools._get_index_manager",
+            "kcaa.tools.symbol_edit_tools._get_index_manager",
             return_value=mgr,
         ):
             out = tools["find_free_area"](
@@ -404,7 +404,7 @@ class TestPlaceSymbolRelative:
         comps = _component_tools()
         mgr = _make_mock_manager()
         with patch(
-            "kcaa.tools.component_edit_tools._get_index_manager",
+            "kcaa.tools.symbol_edit_tools._get_index_manager",
             return_value=mgr,
         ):
             res = asyncio.run(
@@ -426,7 +426,7 @@ class TestPlaceSymbolRelative:
         comps = _component_tools()
         mgr = _make_mock_manager()
         with patch(
-            "kcaa.tools.component_edit_tools._get_index_manager",
+            "kcaa.tools.symbol_edit_tools._get_index_manager",
             return_value=mgr,
         ):
             anchor = asyncio.run(
@@ -506,7 +506,7 @@ class TestPlaceSymbolRelative:
         comps = _component_tools()
         mgr = _make_mock_manager()
         with patch(
-            "kcaa.tools.component_edit_tools._get_index_manager",
+            "kcaa.tools.symbol_edit_tools._get_index_manager",
             return_value=mgr,
         ):
             added = asyncio.run(
@@ -544,7 +544,7 @@ class TestPlaceSymbolRelative:
         comps = _component_tools()
         mgr = _make_mock_manager()
         with patch(
-            "kcaa.tools.component_edit_tools._get_index_manager",
+            "kcaa.tools.symbol_edit_tools._get_index_manager",
             return_value=mgr,
         ):
             added = asyncio.run(

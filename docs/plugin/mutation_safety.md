@@ -10,7 +10,7 @@ Every write operation performed by the MCP server modifies a KiCad source file o
 
 ### 2.1 Current implementation
 
-All skip-based edit tools in `component_edit_tools.py` and `wire_edit_tools.py` follow this pattern before every write:
+All skip-based edit tools in `symbol_edit_tools.py` and `wire_edit_tools.py` follow this pattern before every write:
 
 ```python
 import shutil
@@ -149,7 +149,7 @@ The plugin shows the `message` field in the tool call indicator in the conversat
 
 | Module | Backup written? | File path in response? | Notes |
 |--------|----------------|----------------------|-------|
-| `component_edit_tools.py` | ✓ Yes (`.bak`) | Partial | Needs `backup_path` field added to all responses |
+| `symbol_edit_tools.py` | ✓ Yes (`.bak`) | Partial | Needs `backup_path` field added to all responses |
 | `wire_edit_tools.py` | ✓ Yes (`.bak`) | Partial | Same as above |
 | `netlist_tools.py` | N/A (read-only) | N/A | No mutations |
 | `symbol_tools.py` | N/A (read-only) | N/A | No mutations; writes only to the symbol index SQLite DB |

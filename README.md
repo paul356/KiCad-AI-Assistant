@@ -60,20 +60,20 @@ cd kcaa
 
 ### 2. Install the plugin
 
-Download `kicad-ai-assistant.zip` from the [Releases page](https://github.com/paul356/KiCad-AI-Assistant/releases) and unzip it into KiCad's plugin directory:
+Download `kicad_ai_assistant.zip` from the [Releases page](https://github.com/paul356/KiCad-AI-Assistant/releases) and unzip it into KiCad's plugin directory:
 
 **Linux:**
 ```bash
 KICAD_PLUGIN_DIR=~/.local/share/kicad/10.0/scripting/plugins
 mkdir -p "$KICAD_PLUGIN_DIR"
-unzip kicad-ai-assistant.zip -d "$KICAD_PLUGIN_DIR"
+unzip kicad_ai_assistant.zip -d "$KICAD_PLUGIN_DIR"
 ```
 
 **Windows (PowerShell):**
 ```powershell
 $KICAD_PLUGIN_DIR = "$env:USERPROFILE\Documents\KiCad\10.0\scripting\plugins"
 New-Item -ItemType Directory -Force -Path $KICAD_PLUGIN_DIR
-Expand-Archive -Path kicad-ai-assistant.zip -DestinationPath $KICAD_PLUGIN_DIR
+Expand-Archive -Path kicad_ai_assistant.zip -DestinationPath $KICAD_PLUGIN_DIR
 ```
 
 Or build from source:
@@ -204,10 +204,10 @@ kcaa
 | `place_symbol_relative` | Place a symbol relative to an existing component |
 | `remove_symbol_from_schematic` | Remove placed symbol by reference |
 | `move_component` | Move and/or rotate a placed component |
-| `set_component_property` | Set a property field on a placed symbol |
+| `set_symbol_property` | Set a property field on a placed symbol |
 | `rename_symbol` | Rename a placed symbol's reference designator |
-| `list_component_properties` | List all properties of a placed symbol |
-| `delete_component_property` | Delete a property from a placed symbol |
+| `list_symbol_properties` | List all properties of a placed symbol |
+| `delete_symbol_property` | Delete a property from a placed symbol |
 | `check_reference_conflicts` | Check for duplicate reference designators |
 | `connect_points_with_wire` | Route a smart orthogonal wire between two points |
 | `add_wire_to_schematic` | Add a single wire segment by endpoints |
@@ -295,13 +295,13 @@ kcaa
 
 | Tool | Description |
 |------|-------------|
-| `assign_to_group` | Assign footprints to a placement group |
-| `list_groups` | List all placement groups on the board |
-| `get_group` | Get details of a placement group |
-| `score_group` | Score intra-group placement quality |
-| `place_component_group` | Place all members of a group |
-| `move_group` | Translate a placed group |
-| `rotate_group` | Rotate a placed group around its anchor |
+| `assign_footprints_to_group` | Assign footprints to a placement group |
+| `list_footprint_groups` | List all placement groups on the board |
+| `get_footprint_group` | Get details of a placement group |
+| `score_footprint_group` | Score intra-group placement quality |
+| `place_footprint_group` | Place all members of a group |
+| `move_footprint_group` | Translate a placed group |
+| `rotate_footprint_group` | Rotate a placed group around its anchor |
 
 ### PCB Zones
 

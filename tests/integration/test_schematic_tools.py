@@ -3,11 +3,11 @@ Integration tests for schematic-related MCP tools.
 
 Covers:
   - Netlist tools:     extract_schematic_netlist, find_component_connections
-  - Component edit:    list_component_properties, set_component_property,
+  - Component edit:    list_symbol_properties, set_symbol_property,
                        move_component, remove_symbol_from_schematic,
                        add_label_to_schematic, list_labels_in_schematic,
                        delete_label_from_schematic, add_symbol_to_schematic,
-                       delete_component_property
+                       delete_symbol_property
   - Wire edit:        connect_pins_with_wire, connect_points_with_wire,
                        delete_wire_from_schematic
   - Placement helpers: get_schematic_sheet_info, find_free_area
@@ -343,7 +343,7 @@ class TestListComponentProperties:
         result = _call_tool(
             port,
             sid,
-            "list_component_properties",
+            "list_symbol_properties",
             {
                 "schematic_path": SCH_FIXTURE,
                 "reference": "R1",
@@ -361,7 +361,7 @@ class TestListComponentProperties:
         result = _call_tool(
             port,
             sid,
-            "list_component_properties",
+            "list_symbol_properties",
             {
                 "schematic_path": SCH_FIXTURE,
                 "reference": "U99",
@@ -374,7 +374,7 @@ class TestListComponentProperties:
         result = _call_tool(
             port,
             sid,
-            "list_component_properties",
+            "list_symbol_properties",
             {
                 "schematic_path": "/nonexistent/schematic.kicad_sch",
                 "reference": "R1",
@@ -541,7 +541,7 @@ class TestSetComponentProperty:
         result = _call_tool(
             port,
             sid,
-            "set_component_property",
+            "set_symbol_property",
             {
                 "schematic_path": sch,
                 "reference": "R1",
@@ -558,7 +558,7 @@ class TestSetComponentProperty:
         _call_tool(
             port,
             sid,
-            "set_component_property",
+            "set_symbol_property",
             {
                 "schematic_path": sch,
                 "reference": "R1",
@@ -569,7 +569,7 @@ class TestSetComponentProperty:
         result = _call_tool(
             port,
             sid,
-            "list_component_properties",
+            "list_symbol_properties",
             {
                 "schematic_path": sch,
                 "reference": "R1",
@@ -585,7 +585,7 @@ class TestSetComponentProperty:
         result = _call_tool(
             port,
             sid,
-            "set_component_property",
+            "set_symbol_property",
             {
                 "schematic_path": sch,
                 "reference": "U99",
@@ -761,7 +761,7 @@ class TestDeleteComponentProperty:
         result = _call_tool(
             port,
             sid,
-            "delete_component_property",
+            "delete_symbol_property",
             {
                 "schematic_path": sch,
                 "reference": "R1",
@@ -776,7 +776,7 @@ class TestDeleteComponentProperty:
         result = _call_tool(
             port,
             sid,
-            "delete_component_property",
+            "delete_symbol_property",
             {
                 "schematic_path": sch,
                 "reference": "R1",
@@ -791,7 +791,7 @@ class TestDeleteComponentProperty:
         result = _call_tool(
             port,
             sid,
-            "delete_component_property",
+            "delete_symbol_property",
             {
                 "schematic_path": sch,
                 "reference": "R1",

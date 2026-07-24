@@ -6,16 +6,16 @@ so group assignments persist in the .kicad_pcb file and are visible in
 the KiCad GUI's footprint properties dialog.
 
 Workflow:
-  1. ``assign_to_group``       — tag footprints with a group name (batch).
-  2. ``list_groups``           — inspect all groups on the board.
-  3. ``get_group``             — details for one group (members, bbox, anchor).
-  4. ``score_group``           — intra-group HPWL quality metric.
-  5. ``place_component_group`` — two-phase automatic placement: arranges
-                                 members radially (Phase 1) then finds the
-                                 first clear board position via raster scan
-                                 (Phase 2) and commits.
-  6. ``move_group``             — translate a placed group as a rigid unit.
-  7. ``rotate_group``           — rotate a placed group around its anchor.
+  1. ``assign_footprints_to_group`` — tag footprints with a group name (batch).
+  2. ``list_footprint_groups``      — inspect all groups on the board.
+  3. ``get_footprint_group``        — details for one group (members, bbox, anchor).
+  4. ``score_footprint_group``      — intra-group HPWL quality metric.
+  5. ``place_footprint_group``      — two-phase automatic placement: arranges
+                                      members radially (Phase 1) then finds the
+                                      first clear board position via raster scan
+                                      (Phase 2) and commits.
+  6. ``move_footprint_group``       — translate a placed group as a rigid unit.
+  7. ``rotate_footprint_group``     — rotate a placed group around its anchor.
 
 PCB coordinate convention: mm, +X right, +Y down, rotation CW-positive.
 """
@@ -1058,7 +1058,7 @@ def register_pcb_group_tools(mcp: FastMCP) -> None:
     """Register PCB component group management and placement tools."""
 
     @mcp.tool()
-    async def assign_to_group(
+    async def assign_footprints_to_group(
         pcb_path: str,
         references: list[str],
         group_name: str,
@@ -1114,7 +1114,7 @@ def register_pcb_group_tools(mcp: FastMCP) -> None:
         }
 
     @mcp.tool()
-    async def list_groups(
+    async def list_footprint_groups(
         pcb_path: str,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
@@ -1186,7 +1186,7 @@ def register_pcb_group_tools(mcp: FastMCP) -> None:
         }
 
     @mcp.tool()
-    async def get_group(
+    async def get_footprint_group(
         pcb_path: str,
         group_name: str,
         ctx: Context | None = None,
@@ -1227,7 +1227,7 @@ def register_pcb_group_tools(mcp: FastMCP) -> None:
         }
 
     @mcp.tool()
-    async def score_group(
+    async def score_footprint_group(
         pcb_path: str,
         group_name: str,
         ctx: Context | None = None,
@@ -1275,7 +1275,7 @@ def register_pcb_group_tools(mcp: FastMCP) -> None:
         }
 
     @mcp.tool()
-    async def place_component_group(
+    async def place_footprint_group(
         pcb_path: str,
         group_name: str,
         gap_mm: float = 1.0,
@@ -1300,7 +1300,7 @@ def register_pcb_group_tools(mcp: FastMCP) -> None:
         This approach keeps the group near its current location when possible,
         moving only as far as needed to resolve overlaps.
 
-        The anchor's current rotation is preserved.  Use ``rotate_group``
+        The anchor's current rotation is preserved.  Use ``rotate_footprint_group``
         after placement to reorient the whole group.
 
         A .kicad_pcb.bak backup is created before writing.
@@ -1327,7 +1327,7 @@ def register_pcb_group_tools(mcp: FastMCP) -> None:
             return {
                 "error": (
                     f"Group '{group_name}' has no members. "
-                    "Use assign_to_group to add footprints first."
+                    "Use assign_footprints_to_group to add footprints first."
                 )
             }
 
@@ -1414,7 +1414,7 @@ def register_pcb_group_tools(mcp: FastMCP) -> None:
         }
 
     @mcp.tool()
-    async def move_group(
+    async def move_footprint_group(
         pcb_path: str,
         group_name: str,
         anchor_x: float,
@@ -1448,7 +1448,7 @@ def register_pcb_group_tools(mcp: FastMCP) -> None:
             return {
                 "error": (
                     f"Group '{group_name}' has no members. "
-                    "Use assign_to_group to add footprints first."
+                    "Use assign_footprints_to_group to add footprints first."
                 )
             }
 
@@ -1465,7 +1465,7 @@ def register_pcb_group_tools(mcp: FastMCP) -> None:
             return {
                 "error": (
                     "Inter-group collision detected; group was NOT moved. "
-                    "Use move_group with a different target position."
+                    "Use move_footprint_group with a different target position."
                 ),
                 "inter_group_collisions": [
                     {"ref": c["ref"], "overlapping_with": c["overlapping_with"]} for c in collisions
@@ -1492,7 +1492,7 @@ def register_pcb_group_tools(mcp: FastMCP) -> None:
         }
 
     @mcp.tool()
-    async def rotate_group(
+    async def rotate_footprint_group(
         pcb_path: str,
         group_name: str,
         rotation_delta: float,
@@ -1528,7 +1528,7 @@ def register_pcb_group_tools(mcp: FastMCP) -> None:
             return {
                 "error": (
                     f"Group '{group_name}' has no members. "
-                    "Use assign_to_group to add footprints first."
+                    "Use assign_footprints_to_group to add footprints first."
                 )
             }
 

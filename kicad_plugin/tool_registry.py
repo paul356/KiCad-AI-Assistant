@@ -60,7 +60,7 @@ TOOL_POLICIES: dict[str, ToolPolicy] = {
         auto_snapshot=True,
         mark_dirty=True,
     ),
-    "set_component_property": ToolPolicy(
+    "set_symbol_property": ToolPolicy(
         kind="file_mutation",
         path_arg="schematic_path",
         auto_snapshot=True,
@@ -72,8 +72,8 @@ TOOL_POLICIES: dict[str, ToolPolicy] = {
         auto_snapshot=True,
         mark_dirty=True,
     ),
-    "list_component_properties": ToolPolicy(kind="query"),
-    "delete_component_property": ToolPolicy(
+    "list_symbol_properties": ToolPolicy(kind="query"),
+    "delete_symbol_property": ToolPolicy(
         kind="file_mutation",
         path_arg="schematic_path",
         auto_snapshot=True,
@@ -235,30 +235,58 @@ TOOL_POLICIES: dict[str, ToolPolicy] = {
     "get_schematic_sheet_info": ToolPolicy(kind="query"),
     "find_free_area": ToolPolicy(kind="query"),
     # PCB group tools
-    "assign_to_group": ToolPolicy(
+    "assign_footprints_to_group": ToolPolicy(
         kind="file_mutation",
         path_arg="pcb_path",
         auto_snapshot=True,
         mark_dirty=True,
     ),
-    "list_groups": ToolPolicy(kind="query"),
-    "get_group": ToolPolicy(kind="query"),
-    "score_group": ToolPolicy(kind="query"),
-    "place_component_group": ToolPolicy(
+    "list_footprint_groups": ToolPolicy(kind="query"),
+    "get_footprint_group": ToolPolicy(kind="query"),
+    "score_footprint_group": ToolPolicy(kind="query"),
+    "place_footprint_group": ToolPolicy(
         kind="file_mutation",
         path_arg="pcb_path",
         auto_snapshot=True,
         mark_dirty=True,
     ),
-    "move_group": ToolPolicy(
+    "move_footprint_group": ToolPolicy(
         kind="file_mutation",
         path_arg="pcb_path",
         auto_snapshot=True,
         mark_dirty=True,
     ),
-    "rotate_group": ToolPolicy(
+    "rotate_footprint_group": ToolPolicy(
         kind="file_mutation",
         path_arg="pcb_path",
+        auto_snapshot=True,
+        mark_dirty=True,
+    ),
+    # Schematic group tools
+    "assign_symbols_to_group": ToolPolicy(
+        kind="file_mutation",
+        path_arg="schematic_path",
+        auto_snapshot=True,
+        mark_dirty=True,
+    ),
+    "list_symbol_groups": ToolPolicy(kind="query"),
+    "get_symbol_group": ToolPolicy(kind="query"),
+    "score_symbol_group": ToolPolicy(kind="query"),
+    "place_symbol_group": ToolPolicy(
+        kind="file_mutation",
+        path_arg="schematic_path",
+        auto_snapshot=True,
+        mark_dirty=True,
+    ),
+    "move_symbol_group": ToolPolicy(
+        kind="file_mutation",
+        path_arg="schematic_path",
+        auto_snapshot=True,
+        mark_dirty=True,
+    ),
+    "rotate_symbol_group": ToolPolicy(
+        kind="file_mutation",
+        path_arg="schematic_path",
         auto_snapshot=True,
         mark_dirty=True,
     ),

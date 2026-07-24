@@ -203,10 +203,10 @@ kcaa
 | `place_symbol_relative` | 相对于已有元件放置符号 |
 | `remove_symbol_from_schematic` | 按位号删除已放置的符号 |
 | `move_component` | 移动/旋转已放置的元件 |
-| `set_component_property` | 设置已放置符号的属性字段 |
+| `set_symbol_property` | 设置已放置符号的属性字段 |
 | `rename_symbol` | 重命名已放置符号的位号 |
-| `list_component_properties` | 列出已放置符号的所有属性 |
-| `delete_component_property` | 删除已放置符号的属性 |
+| `list_symbol_properties` | 列出已放置符号的所有属性 |
+| `delete_symbol_property` | 删除已放置符号的属性 |
 | `check_reference_conflicts` | 检查重复的位号 |
 | `connect_points_with_wire` | 在两点之间智能正交布线 |
 | `add_wire_to_schematic` | 按端点添加单条导线段 |
@@ -294,13 +294,13 @@ kcaa
 
 | 工具 | 说明 |
 |------|------|
-| `assign_to_group` | 将封装分配到摆放分组 |
-| `list_groups` | 列出板上所有摆放分组 |
-| `get_group` | 获取分组详情 |
-| `score_group` | 评估分组内摆放质量 |
-| `place_component_group` | 放置分组中的所有成员 |
-| `move_group` | 平移已放置的分组 |
-| `rotate_group` | 绕锚点旋转已放置的分组 |
+| `assign_footprints_to_group` | 将封装分配到摆放分组 |
+| `list_footprint_groups` | 列出板上所有摆放分组 |
+| `get_footprint_group` | 获取分组详情 |
+| `score_footprint_group` | 评估分组内摆放质量 |
+| `place_footprint_group` | 放置分组中的所有成员 |
+| `move_footprint_group` | 平移已放置的分组 |
+| `rotate_footprint_group` | 绕锚点旋转已放置的分组 |
 
 ### PCB 区域
 
