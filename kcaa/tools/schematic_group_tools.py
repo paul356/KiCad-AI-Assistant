@@ -28,6 +28,8 @@ from typing import Any
 from fastmcp import Context, FastMCP
 import sexpdata
 
+logger = logging.getLogger(__name__)
+
 from kcaa.tools.symbol_edit_tools import _find_property_by_name
 from kcaa.utils.netlist_parser import extract_netlist
 from kcaa.utils.schematic_sexp_utils import save_schematic
@@ -72,7 +74,8 @@ def _set_sym_property(sym: Any, name: str, value: str) -> None:
         new_prop = sym.property.Value.clone()
         new_prop.name = name
         new_prop.value = value
-    except Exception:
+    except (AttributeError, RuntimeError, TypeError) as exc:
+        logger.debug("set property %r failed: %s", name, exc)
         return
 
     # Non-standard properties are hidden by default in KiCad.
@@ -98,8 +101,11 @@ def _delete_sym_property(sym: Any, name: str) -> bool:
     """
     prop = _find_property_by_name(sym, name)
     if prop is not None:
-        prop._pv.delete()
-        return True
+        try:
+            prop._pv.delete()
+            return True
+        except (AttributeError, RuntimeError, TypeError) as exc:
+            logger.debug("delete property %r failed: %s", name, exc)
     return False
 
 

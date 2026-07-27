@@ -50,7 +50,9 @@ dependencies = [
     "kicad-skip>=0.2.5",  # KiCad S-expression file parser (imports as `skip`)
     "sqlalchemy>=2.0.0",  # Symbol database ORM
     "kicad-python>=0.7.1",  # KiCad IPC API bindings (requires KiCad 9+ GUI running)
-]
+    "shapely>=2.0.0",      # Geometric operations for PNS router (polygon ops, buffering, visibility)
+    "rtree>=1.3.0",        # Spatial index for fast obstacle queries in PNS router
+] 
 
 [project.urls]
 "Homepage" = "https://github.com/paul356/KiCad-AI-Assistant"

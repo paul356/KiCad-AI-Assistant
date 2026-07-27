@@ -667,6 +667,8 @@ class TestToolPolicyRegistry:
             "delete_net_class",
             "add_custom_rule",
             "del_custom_rule",
+            "pcb_route_pad_to_pad",
+            "pcb_add_vias",
         }
 
         assert set(TOOL_POLICIES) == expected_tools

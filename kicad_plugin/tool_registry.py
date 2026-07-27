@@ -304,6 +304,19 @@ TOOL_POLICIES: dict[str, ToolPolicy] = {
         auto_snapshot=True,
         mark_dirty=True,
     ),
+    # PCB routing tools
+    "pcb_route_pad_to_pad": ToolPolicy(
+        kind="file_mutation",
+        path_arg="pcb_path",
+        auto_snapshot=True,
+        mark_dirty=True,
+    ),
+    "pcb_add_vias": ToolPolicy(
+        kind="file_mutation",
+        path_arg="pcb_path",
+        auto_snapshot=True,
+        mark_dirty=True,
+    ),
     # DRC tools
     "run_drc_check": ToolPolicy(
         kind="ipc_action",
