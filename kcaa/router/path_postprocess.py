@@ -41,6 +41,7 @@ from typing import Any
 
 import sexpdata
 
+from kcaa.router.grid_a_star import _line_crosses_obstacles
 from kcaa.router.visibility_graph import RouteNode
 
 
@@ -75,6 +76,8 @@ def postprocess(
     layer: str,
     net: str,
     max_miter_mm: float = 1.0,
+    _obstacles: list | None = None,
+    _pad_rects: list | None = None,
 ) -> list[OutputSegment]:
     """Convert an A\\* polyline into mitered OutputSegments.
 
@@ -108,7 +111,7 @@ def postprocess(
         out.append(OutputSegment(x1=x1, y1=y1, x2=x2, y2=y2, width=width, layer=layer, net=net))
 
     # Apply mitering in-place on the segments by splitting interior corners.
-    out = _apply_miters(out, max_miter_mm)
+    out = _apply_miters(out, max_miter_mm, _obstacles, _pad_rects)
     return out
 
 
@@ -126,6 +129,8 @@ def postprocess_path(
     max_miter_mm: float = 1.0,
     via_diameter_mm: float = DEFAULT_VIA_DIAMETER_MM,
     via_drill_mm: float = DEFAULT_VIA_DRILL_MM,
+    _obstacles: list | None = None,
+    _pad_rects: list | None = None,
 ) -> tuple[list[OutputSegment], list[OutputVia]]:
     """Convert a multi-layer A\\* path into mitered segments and vias.
 
@@ -180,7 +185,13 @@ def postprocess_path(
             # Emit the previous group as segments.
             segments.extend(
                 postprocess(
-                    group, width=width, layer=prev.layer, net=net, max_miter_mm=max_miter_mm
+                    group,
+                    width=width,
+                    layer=prev.layer,
+                    net=net,
+                    max_miter_mm=max_miter_mm,
+                    _obstacles=_obstacles,
+                    _pad_rects=_pad_rects,
                 )
             )
             # Emit the via at the transition point.
@@ -203,7 +214,13 @@ def postprocess_path(
     if group:
         segments.extend(
             postprocess(
-                group, width=width, layer=group[-1].layer, net=net, max_miter_mm=max_miter_mm
+                group,
+                width=width,
+                layer=group[-1].layer,
+                net=net,
+                max_miter_mm=max_miter_mm,
+                _obstacles=_obstacles,
+                _pad_rects=_pad_rects,
             )
         )
 
@@ -272,12 +289,30 @@ def _simplify_collinear(pts: list[tuple[float, float]]) -> list[tuple[float, flo
     return out
 
 
-def _apply_miters(segments: list[OutputSegment], max_miter_mm: float) -> list[OutputSegment]:
-    """At each interior join, replace two segments with three by inserting a 45° miter.
+def _apply_miters(
+    segments: list[OutputSegment],
+    max_miter_mm: float,
+    obstacles: list | None = None,
+    pad_rects: list | None = None,
+) -> list[OutputSegment]:
+    """At each interior join, insert a 45° miter between two axis-aligned segments.
 
-    Only interior corners whose two edges are axis-aligned (which is the
-    A\\* output we generate) can be mitered cleanly. Diagonal corners are
-    passed through unmodified.
+    For every pair of consecutive axis-aligned segments (horizontal + vertical
+    in either order), the shared corner is replaced with three segments:
+
+        A ──── M            A = shortened by *m* along its own axis
+                \
+                 N          N = shortened by *m* along B's axis
+                  \
+                   ──── B   M→N is the 45° miter
+
+    When *obstacles* is provided, checks the 45° diagonal M→N against
+    obstacle polygons using Shapely.  If blocked, halves *m* and retries
+    until the diagonal is clear (or *m* drops below 0.001 mm, in which
+    case the original 90° corner is kept).
+
+    The miter length *m* is bounded by *max_miter_mm* and by half the shorter
+    adjacent segment (so the miter never overshoots).
     """
     if len(segments) < 2:
         return segments
@@ -286,42 +321,79 @@ def _apply_miters(segments: list[OutputSegment], max_miter_mm: float) -> list[Ou
     for i in range(len(segments) - 1):
         a = segments[i]
         b = segments[i + 1]
-        # Axis-aligned edges only.
-        if not (_is_horizontal(a) or _is_vertical(a)):
-            out.append(a)
-            continue
-        if not (_is_horizontal(b) or _is_vertical(b)):
-            out.append(a)
-            continue
-        # Determine if the corner is convex (right turn for CW-positive y-down).
-        if not _is_convex_corner(a, b):
+
+        # Both must be axis-aligned (H/V) and orthogonal (one H, one V).
+        a_h = _is_horizontal(a)
+        a_v = _is_vertical(a)
+        b_h = _is_horizontal(b)
+        b_v = _is_vertical(b)
+        if not ((a_h and b_v) or (a_v and b_h)):
             out.append(a)
             continue
 
-        # Compute miter length: distance from a.end along a's axis to the
-        # perpendicular through b.start. Capped by half the shorter adjacent
-        # segment and by max_miter_mm.
-        ax, ay = a.x2, a.y2  # shared corner
-        miter_len = _compute_miter_length(a, b, max_miter_mm)
-        if miter_len <= 0:
+        # Shared corner.
+        cx, cy = a.x2, a.y2
+        # Length of each leg.
+        len_a = abs(a.x2 - a.x1) if a_h else abs(a.y2 - a.y1)
+        len_b = abs(b.x2 - b.x1) if b_h else abs(b.y2 - b.y1)
+        # Miter length: go back *m* on each leg from the corner.
+        m_max = min(len_a, len_b, max_miter_mm)
+        if m_max <= 0:
             out.append(a)
             continue
-        if _is_horizontal(a):
-            mx = ax + (miter_len if b.x2 > ax else -miter_len)
-            my = ay
-        else:
-            mx = ax
-            my = ay + (miter_len if b.y2 > ay else -miter_len)
-        # Replace a's end with the miter point and insert a new segment
-        # from miter point to b.start. Append the shortened a now, then
-        # append the new segment.
+
+        # Find the largest miter length ≤ m_max whose 45° diagonal is
+        # obstacle-free and doesn't encroach on no-diagonal zones.
+        m = m_max
+        chosen_m: float | None = None
+        while m >= 1e-3:
+            # Point M: back along A by *m* from the corner.
+            if a_h:
+                mx = cx - m if a.x2 > a.x1 else cx + m
+                my = cy
+            else:
+                mx = cx
+                my = cy - m if a.y2 > a.y1 else cy + m
+
+            # Point N: forward along B by *m* from the corner.
+            if b_h:
+                nx = cx + m if b.x2 > b.x1 else cx - m
+                ny = cy
+            else:
+                nx = cx
+                ny = cy + m if b.y2 > b.y1 else cy - m
+
+            # Reject if the corner sits inside a pad rectangle (the
+            # miter would turn a clean axis-aligned pad exit into a
+            # diagonal crossing the pad boundary).
+            if pad_rects:
+                if any(
+                    abs(cx - pcx) - hw <= 1e-9 and abs(cy - pcy) - hh <= 1e-9
+                    for pcx, pcy, hw, hh in pad_rects
+                ):
+                    chosen_m = None
+                    break
+
+            if obstacles is None or not _line_crosses_obstacles(mx, my, nx, ny, obstacles):
+                chosen_m = m
+                break
+            m *= 0.5
+
+        if chosen_m is None:
+            # Even a 0.001 mm chamfer is blocked — keep original 90°.
+            out.append(a)
+            continue
+
+        # Emit: shortened A, then 45° miter segment M→N.
         out.append(
             OutputSegment(x1=a.x1, y1=a.y1, x2=mx, y2=my, width=a.width, layer=a.layer, net=a.net)
         )
-        # We will append a "fake" b whose start is (mx, my); the loop's
-        # next iteration will then patch b's start to the miter point too.
+        out.append(
+            OutputSegment(x1=mx, y1=my, x2=nx, y2=ny, width=a.width, layer=a.layer, net=a.net)
+        )
+        # Patch B so the next iteration sees its start at N.
         segments[i + 1] = OutputSegment(
-            x1=mx, y1=my, x2=b.x2, y2=b.y2, width=b.width, layer=b.layer, net=b.net
+            x1=nx, y1=ny, x2=b.x2, y2=b.y2, width=b.width, layer=b.layer, net=b.net
         )
     out.append(segments[-1])
     return out
@@ -333,30 +405,3 @@ def _is_horizontal(s: OutputSegment) -> bool:
 
 def _is_vertical(s: OutputSegment) -> bool:
     return abs(s.x2 - s.x1) < 1e-9
-
-
-def _is_convex_corner(a: OutputSegment, b: OutputSegment) -> bool:
-    """True if the shared endpoint forms a convex (non-overlapping) join."""
-    # Direction of a as it enters the corner.
-    adx, ady = a.x2 - a.x1, a.y2 - a.y1
-    # Direction of b as it leaves the corner.
-    bdx, bdy = b.x2 - b.x1, b.y2 - b.y1
-    # Cross product z-component (positive = left turn in screen-y-down coords,
-    # which we treat as convex here).
-    cross = adx * bdy - ady * bdx
-    return cross > 0
-
-
-def _compute_miter_length(a: OutputSegment, b: OutputSegment, cap: float) -> float:
-    """Length of the 45° miter cut at the join of two axis-aligned segments."""
-    # Available length is how far a travels before its x or y matches b.start's.
-    if _is_horizontal(a):
-        avail_a = abs(a.x2 - a.x1)
-    else:
-        avail_a = abs(a.y2 - a.y1)
-    if _is_horizontal(b):
-        avail_b = abs(b.x2 - b.x1)
-    else:
-        avail_b = abs(b.y2 - b.y1)
-    # Miter can't exceed the shorter leg.
-    return min(avail_a, avail_b, cap)

@@ -39,20 +39,25 @@ class TestPostprocess:
 
     def test_l_shape_gets_miter(self):
         # Path: (0,0) → (5,0) → (5,5)
-        # Miter cuts a 45° diagonal from (4,0) to (5,5), shortening the first
-        # axis-aligned segment. We expect 2 segments after mitering.
+        # Miter cuts a 45° chamfer at the corner: A shortened by m, then
+        # 45° segment, then B shortened by m. We expect 3 segments.
         segs = postprocess(
             _path((0.0, 0.0), (5.0, 0.0), (5.0, 5.0)), 0.25, "F.Cu", "VCC", max_miter_mm=1.0
         )
-        assert len(segs) == 2
+        assert len(segs) == 3
         # First segment shortened by 1 mm → ends at (4, 0)
         assert segs[0].x2 == 4.0
         assert segs[0].y2 == 0.0
-        # Second segment is the 45° miter cut from (4,0) to (5,5)
+        # Second segment is the 45° miter cut from (4,0) to (5,1)
         assert segs[1].x1 == 4.0
         assert segs[1].y1 == 0.0
         assert segs[1].x2 == 5.0
-        assert segs[1].y2 == 5.0
+        assert segs[1].y2 == 1.0
+        # Third segment is the shortened vertical from (5,1) to (5,5)
+        assert segs[2].x1 == 5.0
+        assert segs[2].y1 == 1.0
+        assert segs[2].x2 == 5.0
+        assert segs[2].y2 == 5.0
 
     def test_miter_capped_by_max(self):
         # Long L — miter capped at max_miter_mm

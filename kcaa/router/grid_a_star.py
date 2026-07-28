@@ -33,7 +33,7 @@ from dataclasses import dataclass
 import heapq
 import math
 
-from shapely.geometry import Point
+from shapely.geometry import LineString, Point
 
 # Grid resolution (mm per cell).
 # 0.1 mm is a good balance: it captures fine-pitch pin gaps (~0.5 mm → 5 cells)
@@ -249,7 +249,6 @@ def grid_a_star(
     sx, sy = grid.to_grid(start_world[0], start_world[1])
     ex, ey = grid.to_grid(end_world[0], end_world[1])
 
-    # Clamp start/end to the grid.
     sx = max(0, min(grid.width - 1, sx))
     sy = max(0, min(grid.height - 1, sy))
     ex = max(0, min(grid.width - 1, ex))
@@ -262,7 +261,6 @@ def grid_a_star(
     start_id = sy * width + sx
     end_id = ey * width + ex
 
-    # A* state
     g_score = {start_id: 0.0}
     parent: dict[int, tuple[int, int] | None] = {start_id: None}
     open_heap = [(0.0, start_id)]
@@ -360,13 +358,9 @@ def hierarchical_a_star(
 ) -> AStarResult:
     """Run hierarchical A* with auto-detection of single-pass vs two-pass.
 
-    For small search areas (grid < ``_SINGLE_PASS_THRESHOLD`` cells) this
-    falls back to single-pass :func:`grid_a_star` — the overhead of
-    building two grids and running two searches is not worth it.
-
+    For small search areas falls back to single-pass :func:`grid_a_star`.
     For large areas, does a coarse pass at 5× resolution, computes a band
-    bounding box around the coarse path, then a fine pass at the requested
-    resolution within that band.
+    around the coarse path, then a fine pass at the requested resolution.
 
     Args:
         obstacles: Iterable of objects with a ``.shape`` (``Polygon``).
@@ -374,12 +368,10 @@ def hierarchical_a_star(
         end_world: ``(x, y)`` in mm.
         fine_resolution: Grid cell size in mm for the fine pass.
         route_bbox: ``(min_x, min_y, max_x, max_y)`` of the route area.
-            When ``None``, computed from start/end + 5 mm margin.
 
     Returns:
         :class:`AStarResult`.
     """
-    # Determine the route bounding box if not given.
     if route_bbox is not None:
         bbox = route_bbox
     else:
@@ -392,17 +384,14 @@ def hierarchical_a_star(
             max(sy, ey) + 5.0,
         )
 
-    # Compute the approximate number of cells at fine resolution.
     bw = bbox[2] - bbox[0]
     bh = bbox[3] - bbox[1]
     fine_cells = int(math.ceil(bw / fine_resolution)) * int(math.ceil(bh / fine_resolution))
 
-    # Small area → single pass.
     if fine_cells < _SINGLE_PASS_THRESHOLD:
         grid = build_grid_map(obstacles, bbox, resolution=fine_resolution)
         return grid_a_star(grid, start_world, end_world)
 
-    # Large area → hierarchical (coarse + band + fine).
     coarse_res = fine_resolution * COARSE_FACTOR
     coarse_grid = build_grid_map(obstacles, bbox, resolution=coarse_res)
     coarse_result = grid_a_star(coarse_grid, start_world, end_world)
@@ -411,7 +400,6 @@ def hierarchical_a_star(
 
     simplified = simplify_path(coarse_result.path)
     band = _band_bbox(simplified)
-    # Clamp band to the route bbox.
     band = (
         max(bbox[0], band[0]),
         max(bbox[1], band[1]),
@@ -421,11 +409,10 @@ def hierarchical_a_star(
 
     fine_grid = build_grid_map(obstacles, band, resolution=fine_resolution)
     result = grid_a_star(fine_grid, start_world, end_world)
-    coarse_visited = coarse_result.cells_visited
     if result.path is not None:
-        result.cells_visited += coarse_visited
+        result.cells_visited += coarse_result.cells_visited
     else:
-        result = AStarResult(path=None, cells_visited=coarse_visited)
+        result = AStarResult(path=None, cells_visited=coarse_result.cells_visited)
     return result
 
 
@@ -671,3 +658,284 @@ def path_to_nodes(
 ) -> list[GridNode]:
     """Convert world-coordinate points to :class:`GridNode` list."""
     return [GridNode(x=x, y=y, layer=layer) for x, y in pts]
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Path shortcut — remove redundant waypoints
+# ═══════════════════════════════════════════════════════════════════════
+
+
+def _grid_line_clear(
+    grid: GridMap,
+    x0: float,
+    y0: float,
+    x1: float,
+    y1: float,
+) -> bool:
+    """Bresenham line-of-sight check on *grid*.
+
+    Returns ``True`` if every cell the line crosses is free (or the
+    start/end cells which may be in a buffer zone).
+    """
+    gx0, gy0 = grid.to_grid(x0, y0)
+    gx1, gy1 = grid.to_grid(x1, y1)
+    gx0 = max(0, min(grid.width - 1, gx0))
+    gy0 = max(0, min(grid.height - 1, gy0))
+    gx1 = max(0, min(grid.width - 1, gx1))
+    gy1 = max(0, min(grid.height - 1, gy1))
+    dx = abs(gx1 - gx0)
+    dy = abs(gy1 - gy0)
+    sx = 1 if gx0 < gx1 else -1
+    sy = 1 if gy0 < gy1 else -1
+    err = dx - dy
+    cx, cy = gx0, gy0
+    while True:
+        if (cx != gx0 or cy != gy0) and (cx != gx1 or cy != gy1):
+            if not grid.is_free(cx, cy):
+                return False
+        if cx == gx1 and cy == gy1:
+            break
+        e2 = 2 * err
+        if e2 > -dy:
+            err -= dy
+            cx += sx
+        if e2 < dx:
+            err += dx
+            cy += sy
+    return True
+
+
+def shortcut_path(
+    pts: list[tuple[float, float]],
+    obstacles: list,
+    bbox: tuple[float, float, float, float],
+    resolution: float = GRID_RESOLUTION,
+) -> list[tuple[float, float]]:
+    """Remove intermediate waypoints whose straight-line shortcut is clear.
+
+    Builds a walkability grid once, then for each point tries to skip
+    as many subsequent points as possible while keeping the line clear.
+    Only 0°/45°/90°/135° shortcuts are accepted.
+
+    Args:
+        pts: Ordered ``(x, y)`` points (after collinear simplification).
+        obstacles: Inflated obstacle list (Polygon objects).
+        bbox: ``(min_x, min_y, max_x, max_y)`` of the route area.
+        resolution: Grid cell size in mm.
+
+    Returns:
+        Simplified polyline with redundant points removed.
+    """
+    if len(pts) <= 2:
+        return list(pts)
+
+    grid = build_grid_map(obstacles, bbox, resolution=resolution)
+    result = [pts[0]]
+    i = 0
+    while i < len(pts) - 1:
+        best_next = i + 1
+        for k in range(len(pts) - 1, i, -1):
+            dx = pts[k][0] - result[-1][0]
+            dy = pts[k][1] - result[-1][1]
+            if abs(dx) > 1e-9 and abs(dy) > 1e-9 and abs(abs(dx) - abs(dy)) > 1e-9:
+                continue  # not 0/45/90/135°
+            if _grid_line_clear(
+                grid,
+                result[-1][0],
+                result[-1][1],
+                pts[k][0],
+                pts[k][1],
+            ):
+                best_next = k
+                break
+        result.append(pts[best_next])
+        i = best_next
+
+    return result
+
+
+def snap_to_45_path_safe(
+    pts: list[tuple[float, float]],
+    obstacles: list,
+    bbox: tuple[float, float, float, float],
+    resolution: float = GRID_RESOLUTION,
+) -> list[tuple[float, float]]:
+    """Ensure every segment is 0/45/90°, avoiding obstacle overlap.
+
+    For any segment that is not axis-aligned or 45° diagonal, tries both
+    Manhattan corner candidates ``(x2, y1)`` and ``(x1, y2)``. Inserts
+    the first one whose two sub-segments both pass
+    :func:`_grid_line_clear` on the walkability grid.
+
+    Args:
+        pts: Ordered ``(x, y)`` points.
+        obstacles: Inflated obstacle list (Polygon objects).
+        bbox: ``(min_x, min_y, max_x, max_y)`` of the route area.
+        resolution: Grid cell size in mm.
+
+    Returns:
+        Polyline with safe corner points inserted where needed.
+    """
+    if len(pts) < 3:
+        return list(pts)
+
+    grid = build_grid_map(obstacles, bbox, resolution=resolution)
+    result: list[tuple[float, float]] = [pts[0]]
+
+    for i in range(1, len(pts)):
+        x1, y1 = result[-1]
+        x2, y2 = pts[i]
+        dx = x2 - x1
+        dy = y2 - y1
+
+        if abs(dx) < 1e-9 or abs(dy) < 1e-9 or abs(abs(dx) - abs(dy)) < 1e-9:
+            # Already 0/45/90 — keep as-is.
+            result.append((x2, y2))
+            continue
+
+        # Try both Manhattan corner candidates.
+        candidates = [(x2, y1), (x1, y2)]
+        chosen: tuple[float, float] | None = None
+        for cx, cy in candidates:
+            if _grid_line_clear(grid, x1, y1, cx, cy) and _grid_line_clear(grid, cx, cy, x2, y2):
+                chosen = (cx, cy)
+                break
+
+        if chosen is not None:
+            result.append(chosen)
+            result.append((x2, y2))
+        else:
+            result.append((x2, y1))
+            result.append((x2, y2))
+
+    return result
+
+
+def _deduplicate_pts(
+    pts: list[tuple[float, float]],
+    tol: float = 1e-9,
+) -> list[tuple[float, float]]:
+    """Remove consecutive duplicate points."""
+    if not pts:
+        return pts
+    out = [pts[0]]
+    for p in pts[1:]:
+        if abs(p[0] - out[-1][0]) > tol or abs(p[1] - out[-1][1]) > tol:
+            out.append(p)
+    return out
+
+
+def _line_crosses_obstacles(
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
+    obstacles: list,
+) -> bool:
+    """Return ``True`` if the line *(x1,y1)→(x2,y2)* crosses any obstacle polygon.
+
+    Uses Shapely ``LineString.crosses()`` so that grazing the boundary at
+    an endpoint is **not** counted as a crossing — only actual penetration
+    into the interior is flagged.
+    """
+    line = LineString([(x1, y1), (x2, y2)])
+    return any(line.crosses(obs.shape) for obs in obstacles)
+
+
+def validate_path_clear(
+    pts: list[tuple[float, float]],
+    ref_pts: list[tuple[float, float]],
+    obstacles: list,
+    bbox: tuple[float, float, float, float],
+    resolution: float = GRID_RESOLUTION,
+) -> list[tuple[float, float]]:
+    """Validate every segment against obstacles; repair via *ref_pts*.
+
+    After post-processing (shortcuts, snap-to-center, 45\u00b0 corners) some
+    segments may cross obstacle regions. This function checks **every**
+    consecutive pair against obstacle polygons using Shapely geometry.
+    For each violating segment, it finds the corresponding range in
+    ``ref_pts`` (the original A\\* path, which is guaranteed obstacle-free)
+    and inserts those reference waypoints.
+
+    Interior individual points (``pts[1]`` \u2026 ``pts[-2]``) are also
+    checked: if one lies inside a blocked grid cell the nearest free
+    point from ``ref_pts`` is substituted.
+
+    Args:
+        pts: Post-processed path to validate.
+        ref_pts: Original A\\* path (all points obstacle-free).
+        obstacles: Inflated obstacle list (Polygon objects).
+        bbox: ``(min_x, min_y, max_x, max_y)`` of the route area.
+        resolution: Grid cell size in mm.
+
+    Returns:
+        Validated path with reference points inserted where needed.
+    """
+    if len(pts) < 2:
+        return list(pts)
+
+    grid = build_grid_map(obstacles, bbox, resolution=resolution)
+
+    # ---- 1. Fix interior points that sit inside blocked cells ----
+    result: list[tuple[float, float]] = [pts[0]]
+    for p in pts[1:-1]:
+        gx, gy = grid.to_grid(p[0], p[1])
+        gx = max(0, min(grid.width - 1, gx))
+        gy = max(0, min(grid.height - 1, gy))
+        if grid.is_free(gx, gy):
+            result.append(p)
+        else:
+            # Point is inside a blocked cell — find nearest free ref_pt.
+            best = min(
+                ref_pts,
+                key=lambda r: (r[0] - p[0]) ** 2 + (r[1] - p[1]) ** 2,
+            )
+            result.append(best)
+    result.append(pts[-1])
+
+    # ---- 2. Fix segments that cross blocked cells ----
+    i = 1
+    while i < len(result):
+        x1, y1 = result[i - 1]
+        x2, y2 = result[i]
+
+        # The first and last segments connect into pads — their
+        # endpoints land on pad centres where same-net copper is
+        # excluded from obstacles.  Shapely may still flag them as
+        # crossing the pad boundary; just skip them.
+        if i == 1 or i == len(result) - 1:
+            i += 1
+            continue
+
+        if not _line_crosses_obstacles(x1, y1, x2, y2, obstacles):
+            i += 1
+            continue
+
+        # Segment crosses an obstacle — find the ref_pts range between
+        # the segment endpoints and insert those waypoints.
+        start_k = min(
+            range(len(ref_pts)),
+            key=lambda k: (ref_pts[k][0] - x1) ** 2 + (ref_pts[k][1] - y1) ** 2,
+        )
+        end_k = min(
+            range(len(ref_pts)),
+            key=lambda k: (ref_pts[k][0] - x2) ** 2 + (ref_pts[k][1] - y2) ** 2,
+        )
+        if start_k > end_k:
+            start_k, end_k = end_k, start_k
+
+        # Insert ref_pts[start_k+1 \u2026 end_k] (exclusive of start, inclusive
+        # of end) so the segment becomes a chain of safe sub-segments.
+        # The endpoint x2/y2 / result[i] will be overwritten.
+        inserted = 0
+        for k in range(start_k + 1, end_k + 1):
+            if (
+                abs(ref_pts[k][0] - result[i - 1][0]) > 1e-9
+                or abs(ref_pts[k][1] - result[i - 1][1]) > 1e-9
+            ):
+                result.insert(i + inserted, ref_pts[k])
+                inserted += 1
+        i += inserted + 1  # skip past newly inserted points + the old endpoint
+
+    return _deduplicate_pts(result)
