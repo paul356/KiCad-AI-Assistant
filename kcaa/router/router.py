@@ -43,6 +43,7 @@ import json
 import logging
 import math
 import os
+import tempfile
 
 from kcaa.router.grid_a_star import (
     GRID_RESOLUTION,
@@ -544,7 +545,7 @@ def _log_output_segments(label: str, segs: list) -> None:
 # Visualization dump
 # ---------------------------------------------------------------------------
 
-_VIZ_DIR = "/tmp/kcaa_viz"
+_VIZ_DIR = os.path.join(tempfile.gettempdir(), "kcaa_viz")
 
 import os as _os
 import time as _time
