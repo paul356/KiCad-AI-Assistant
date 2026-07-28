@@ -52,7 +52,6 @@ from kcaa.router.grid_a_star import (
     shortcut_path,
     simplify_path,
     snap_to_45_path_safe,
-    validate_path_clear,
 )
 from kcaa.router.path_postprocess import (
     OutputSegment,
@@ -386,15 +385,6 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
     best_path_pts = snap_to_45_path_safe(best_path_pts, buffered, route_bbox, resolution=grid_res)
     _log_path("snap45", best_path_pts)
     _dump_viz("4-snap45", best_path_pts, _pad_viz, buffered, route_bbox)
-    best_path_pts = validate_path_clear(
-        best_path_pts,
-        ref_pts=result.path,
-        obstacles=buffered,
-        bbox=route_bbox,
-        resolution=grid_res,
-    )
-    _log_path("validate", best_path_pts)
-    _dump_viz("5-validate", best_path_pts, _pad_viz, buffered, route_bbox)
 
     # ---- Align path endpoints with exact pad centres ----
     best_path_pts = _align_path_endpoints(
@@ -653,26 +643,26 @@ def _align_path_endpoints(
     pad_a_size: tuple[float, float] | None = None,
     pad_b_size: tuple[float, float] | None = None,
 ) -> list[tuple[float, float]]:
-    """Rigidly translate pad-side chain to align with exact pad centres.
+    """Align pad ends to exact centres.
 
-    ``_replace_pad_path`` places the wire at fence_y (or fence_x for
-    vertical pads).  This function finds the prefix/suffix of points
-    that share that pad-axis coordinate and translates all of them
-    together so the centre lands at the exact pad centre coordinate.
-    The first adjacent diagonal point is also translated so the
-    connecting segment keeps its angle."""
+    For rectangular pads: rigidly translate the wire chain (and
+    subsequent diagonal segments) so the projection axis aligns
+    with the centre axis.
 
+    For square/circular pads: simple single-point replacement
+    (no wire to protect, and the segment is short enough that
+    angle distortion is negligible).
+    """
     if len(path) < 1:
         return path
 
-    def _pick_axis(size):
-        return size[0] >= size[1] if size and size[0] > 0 and size[1] > 0 else True
-
     # --- Start pad ---
-    if pad_a_size and len(path) >= 2:
-        horizontal = _pick_axis(pad_a_size)
+    if not pad_a_size:
+        path[0] = start_center
+    elif len(path) >= 2:
         scx, scy = start_center
-        if horizontal:
+        seg_y_diff = abs(path[0][1] - path[1][1])
+        if seg_y_diff < 1e-9:
             ref_y = path[0][1]
             dy = scy - ref_y
             if dy != 0.0:
@@ -680,8 +670,11 @@ def _align_path_endpoints(
                 while k < len(path) and abs(path[k][1] - ref_y) < 1e-9:
                     path[k] = (path[k][0], path[k][1] + dy)
                     k += 1
-                if k < len(path):
+                while k < len(path):
+                    if abs(path[k][1] - path[k - 1][1]) < 1e-9:
+                        break
                     path[k] = (path[k][0], path[k][1] + dy)
+                    k += 1
         else:
             ref_x = path[0][0]
             dx = scx - ref_x
@@ -690,14 +683,19 @@ def _align_path_endpoints(
                 while k < len(path) and abs(path[k][0] - ref_x) < 1e-9:
                     path[k] = (path[k][0] + dx, path[k][1])
                     k += 1
-                if k < len(path):
+                while k < len(path):
+                    if abs(path[k][0] - path[k - 1][0]) < 1e-9:
+                        break
                     path[k] = (path[k][0] + dx, path[k][1])
+                    k += 1
 
     # --- End pad ---
-    if pad_b_size and len(path) >= 2:
-        horizontal = _pick_axis(pad_b_size)
+    if not pad_b_size:
+        path[-1] = end_center
+    elif len(path) >= 2:
         ecx, ecy = end_center
-        if horizontal:
+        seg_y_diff = abs(path[-1][1] - path[-2][1])
+        if seg_y_diff < 1e-9:
             ref_y = path[-1][1]
             dy = ecy - ref_y
             if dy != 0.0:
@@ -705,8 +703,11 @@ def _align_path_endpoints(
                 while k >= 0 and abs(path[k][1] - ref_y) < 1e-9:
                     path[k] = (path[k][0], path[k][1] + dy)
                     k -= 1
-                if k >= 0:
+                while k >= 0:
+                    if abs(path[k + 1][1] - path[k][1]) < 1e-9:
+                        break
                     path[k] = (path[k][0], path[k][1] + dy)
+                    k -= 1
         else:
             ref_x = path[-1][0]
             dx = ecx - ref_x
@@ -715,8 +716,11 @@ def _align_path_endpoints(
                 while k >= 0 and abs(path[k][0] - ref_x) < 1e-9:
                     path[k] = (path[k][0] + dx, path[k][1])
                     k -= 1
-                if k >= 0:
+                while k >= 0:
+                    if abs(path[k + 1][0] - path[k][0]) < 1e-9:
+                        break
                     path[k] = (path[k][0] + dx, path[k][1])
+                    k -= 1
 
     return path
 
@@ -728,25 +732,29 @@ def _replace_pad_path(
     from_center: bool,
 ) -> list[tuple[float, float]]:
     """Drop the A* path inside a rectangular pad and replace it with a
-    single axis-aligned wire: fence → projection → centre.  The pad
-    itself gets one straight segment along its long axis."""
+    single axis-aligned wire.  Direction (horizontal vs vertical) is
+    determined by which AABB edge the first outside point is on."""
 
     w, h = size
     cx, cy = center
     hw, hh = w / 2.0, h / 2.0
+    minx, maxx = cx - hw, cx + hw
+    miny, maxy = cy - hh, cy + hh
 
     if from_center:
         for k in range(1, len(path)):
             if not _inside_rect(path[k], center, hw, hh):
                 fx, fy = path[k - 1]
-                keep = _build_pad_wire(cx, cy, fx, fy, hw, hh, from_center=True)
+                ox, oy = path[k]
+                keep = _build_pad_wire(cx, cy, fx, fy, ox, oy, minx, maxx, miny, maxy)
                 return keep + path[k:]
         return path
     else:
         for k in range(len(path) - 2, -1, -1):
             if not _inside_rect(path[k], center, hw, hh):
                 fx, fy = path[k + 1]
-                keep = _build_pad_wire(fx, fy, cx, cy, hw, hh, from_center=False)
+                ox, oy = path[k]
+                keep = _build_pad_wire(fx, fy, cx, cy, ox, oy, minx, maxx, miny, maxy)
                 return path[: k + 1] + keep
         return path
 
@@ -762,35 +770,35 @@ def _inside_rect(
 
 
 def _build_pad_wire(
-    x1: float,
-    y1: float,
-    x2: float,
-    y2: float,
-    hw: float,
-    hh: float,
-    from_center: bool = False,
+    x1: float, y1: float,
+    x2: float, y2: float,
+    ox: float, oy: float,
+    minx: float, maxx: float,
+    miny: float, maxy: float,
 ) -> list[tuple[float, float]]:
-    """Connect two points with a single axis-aligned segment at the
-    fence's Y (or X for vertical pads).  The segment is at *fence_y*
-    (not *centre_y*) — ``_align_path_endpoints`` later translates
-    the pad-internal points vertically to hit the exact centre."""
+    """Return ``[projection, fence]`` — a single axis-aligned segment
+    along the AABB edge the outside point exits from.  The centre is
+    kept by the caller (``_replace_pad_path``), and the whole chain
+    is translated by ``_align_path_endpoints``."""
 
     if abs(x1 - x2) < 1e-6 or abs(y1 - y2) < 1e-6:
         return [(x1, y1), (x2, y2)]
 
-    horizontal = hw >= hh
-    if from_center:
-        # x1,y1 = centre, x2,y2 = fence
-        if horizontal:
-            return [(x1, y2), (x2, y2)]
-        else:
-            return [(x2, y1), (x2, y2)]
+    h_exit = ox <= minx or ox >= maxx
+    v_exit = oy <= miny or oy >= maxy
+    if h_exit and not v_exit:
+        horizontal = True
+    elif v_exit and not h_exit:
+        horizontal = False
     else:
-        # x1,y1 = fence, x2,y2 = centre
-        if horizontal:
-            return [(x1, y1), (x2, y1)]
-        else:
-            return [(x1, y1), (x1, y2)]
+        horizontal = abs(ox - x1) >= abs(oy - y1)
+
+    if horizontal:
+        # fence on left/right edge → horizontal wire at fence_y
+        return [(x1, y2), (x2, y2)]
+    else:
+        # fence on top/bottom edge → vertical wire at fence_x
+        return [(x2, y1), (x2, y2)]
 
 
 # ---------------------------------------------------------------------------

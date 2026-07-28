@@ -138,8 +138,8 @@ def _render_stage(fname: str, out_dir: str) -> None:
         all_ys.extend([aabb[1], aabb[3]])
     margin = 1.5  # mm
     ax.set_xlim(min(all_xs) - margin, max(all_xs) + margin)
-    ax.set_ylim(max(all_ys) + margin, min(all_ys) - margin)  # flip Y for KiCad
-    ax.invert_yaxis()
+    ax.set_ylim(min(all_ys) - margin, max(all_ys) + margin)
+    ax.invert_yaxis()  # KiCad +Y=down
 
     ax.set_title(f"Stage: {stage}  ({len(path)} pts)", fontsize=12)
     ax.set_xlabel("X (mm)")
