@@ -49,6 +49,7 @@ class TestServerManager:
             server_log_dir=log_dir,
             resolved_log_dir=log_dir,
             python_executable="",  # required by _resolve_python()
+            config_dir="/tmp",  # cwd for .env discovery
         )
         return ServerManager(settings)
 
