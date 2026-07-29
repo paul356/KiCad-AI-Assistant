@@ -107,6 +107,11 @@ class ServerManager:
                     kwargs["stdout"] = subprocess.DEVNULL
                     kwargs["stderr"] = subprocess.DEVNULL
 
+                # When launched via the plugin, set cwd to the kcaa data
+                # directory so ServerConfig._find_env_file discovers a .env
+                # placed alongside logs and other persistent data.
+                kwargs["cwd"] = self._settings.config_dir
+
                 self._process = subprocess.Popen(cmd, env=env, **kwargs)  # nosec B603 -- input is validated
             except (FileNotFoundError, PermissionError) as e:
                 log.error("Failed to launch server: %s", e)
