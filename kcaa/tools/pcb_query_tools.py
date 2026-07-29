@@ -499,7 +499,11 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
         return {"nets": nets, "count": len(nets)}
 
     @mcp.tool()
-    async def get_ratsnest(pcb_path: str, ctx: Context | None) -> dict[str, Any]:
+    async def get_ratsnest(
+        pcb_path: str,
+        ctx: Context | None,
+        get_connected_pads: bool = False,
+    ) -> dict[str, Any]:
         """Get unconnected pad pairs (ratsnest) for a KiCad PCB board.
 
         Identifies pads that share a net but are not yet connected by
@@ -517,12 +521,19 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
         Args:
             pcb_path: Absolute path to the .kicad_pcb file.
             ctx: MCP context for progress reporting.
+            get_connected_pads: When ``True``, also return ``connected_pads``
+                — pads that already have a track or via endpoint at their
+                centre.  Default ``False`` for efficiency.
 
         Returns:
             dict with:
                 unconnected: list of {net, from: {ref, pad, x, y}, to: {ref, pad, x, y}}
                     where x/y are world mm.
+                connected_pads: list of {net, ref, pad, x, y} (only when
+                    *get_connected_pads* is ``True``).
                 unconnected_count: number of unconnected pairs
+                connected_count: number of connected pads (0 when
+                    *get_connected_pads* is ``False``).
                 fully_routed: True if no unconnected pairs found
         """
         data = load_pcb(pcb_path)
@@ -604,6 +615,7 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
         # For each net with ≥2 pads, report ALL pairs where neither pad
         # has a track endpoint at its position (simple heuristic)
         unconnected = []
+        connected_pads: list[dict[str, Any]] = []
         for net_name, pad_list in sorted(pads_by_net.items()):
             if len(pad_list) < 2:
                 continue
@@ -612,6 +624,16 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
                 for i, (_, _, px, py) in enumerate(pad_list)
                 if (net_name, _rounded(px), _rounded(py)) in track_endpoints
             }
+            if get_connected_pads:
+                for i in connected_indices:
+                    ref, pad_num, px, py = pad_list[i]
+                    connected_pads.append({
+                        "net": net_name,
+                        "ref": ref,
+                        "pad": pad_num,
+                        "x": px,
+                        "y": py,
+                    })
             disconnected = [p for i, p in enumerate(pad_list) if i not in connected_indices]
             # Report all disconnected pairs (not just first)
             for i in range(len(disconnected)):
@@ -625,6 +647,14 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
                         }
                     )
 
+        if get_connected_pads:
+            return {
+                "unconnected": unconnected,
+                "connected_pads": connected_pads,
+                "unconnected_count": len(unconnected),
+                "connected_count": len(connected_pads),
+                "fully_routed": len(unconnected) == 0,
+            }
         return {
             "unconnected": unconnected,
             "unconnected_count": len(unconnected),
@@ -934,9 +964,48 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
         if not raw_segs:
             return {"traces": [], "segment_count": 0, "trace_count": 0}
 
+        # ── Collect pad centre positions (world coords) ──────────────
+        # Segments that meet at a pad centre are NOT connected (the
+        # connection goes through the pad, not directly segment-to-segment).
+        # Also build a reverse lookup: (rounded_x, rounded_y) → pad info.
+        pad_centres: set[tuple[float, float]] = set()
+        pad_at: dict[tuple[float, float], list[dict[str, Any]]] = {}
+        for item in data:
+            if not (isinstance(item, list) and len(item) > 0 and _sym(item[0]) == "footprint"):
+                continue
+            ref = get_fp_property(item, "Reference") or "?"
+            fp_x, fp_y, fp_rot_deg = get_fp_at(item)
+            theta = math.radians(fp_rot_deg)
+            cos_t = math.cos(theta)
+            sin_t = math.sin(theta)
+            for sub in item:
+                if not (isinstance(sub, list) and len(sub) >= 4 and _sym(sub[0]) == "pad"):
+                    continue
+                pad_num = sub[1] if isinstance(sub[1], str) else _sym(sub[1])
+                rel_x, rel_y = 0.0, 0.0
+                net_key = ""
+                for psub in sub:
+                    if isinstance(psub, list) and len(psub) >= 3 and _sym(psub[0]) == "at":
+                        with contextlib.suppress(ValueError, TypeError):
+                            rel_x, rel_y = float(psub[1]), float(psub[2])
+                    elif isinstance(psub, list) and len(psub) >= 2 and _sym(psub[0]) == "net":
+                        net_id, net_name = _parse_net_ref(psub, {}, {})
+                        net_key = net_name if net_name else ""
+                if not net_key:
+                    continue
+                abs_x = fp_x + rel_x * cos_t + rel_y * sin_t
+                abs_y = fp_y - rel_x * sin_t + rel_y * cos_t
+                rkey = (round(abs_x, 2), round(abs_y, 2))
+                pad_centres.add(rkey)
+                pad_at.setdefault(rkey, []).append({
+                    "ref": ref, "pad": str(pad_num), "net": net_key,
+                })
+
         # ── Build adjacency ──────────────────────────────────────────
         # Each segment has two endpoints (a, b).  Two segments share an
-        # endpoint if any endpoint pair is within tol.
+        # endpoint if any endpoint pair is within tol — *unless* that
+        # point is a pad centre (connection goes through the pad, not
+        # directly segment-to-segment).
         n = len(raw_segs)
         adj: list[list[int]] = [[] for _ in range(n)]
 
@@ -956,10 +1025,20 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
                     continue
                 if raw_segs[i]["net"] != raw_segs[j]["net"]:
                     continue
-                a2, b2 = seg_pts[j]
-                if _pt(a1, a2) or _pt(a1, b2) or _pt(b1, a2) or _pt(b1, b2):
-                    adj[i].append(j)
-                    adj[j].append(i)
+                # Check if any pair of endpoints match
+                match_pt = None
+                if _pt(a1, seg_pts[j][0]) or _pt(a1, seg_pts[j][1]):
+                    match_pt = a1
+                elif _pt(b1, seg_pts[j][0]) or _pt(b1, seg_pts[j][1]):
+                    match_pt = b1
+                if match_pt is None:
+                    continue
+                # Don't connect across a pad centre
+                rkey = (round(match_pt[0], 2), round(match_pt[1], 2))
+                if rkey in pad_centres:
+                    continue
+                adj[i].append(j)
+                adj[j].append(i)
 
         # ── Find connected components (traces) ────────────────────────
         visited = [False] * n
@@ -1084,14 +1163,26 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
                             break
                 polylines_out.append(segs_in_poly)
 
+            # Collect pads connected to this trace's endpoints
+            trace_pads: list[dict[str, Any]] = []
+            seen_pads: set[tuple[str, str]] = set()
+            for poly in polylines:
+                for pt in (poly[0], poly[-1]):
+                    rkey = (round(pt[0], 2), round(pt[1], 2))
+                    for p in pad_at.get(rkey, []):
+                        key = (p["ref"], p["pad"])
+                        if key not in seen_pads:
+                            seen_pads.add(key)
+                            trace_pads.append(p)
+
             result.append({
                 "width": raw_segs[comp[0]]["width"],
                 "layer": raw_segs[comp[0]]["layer"],
                 "net": raw_segs[comp[0]]["net"],
                 "segment_count": len(comp),
                 "polyline_count": len(polylines),
-                "polylines": [[round(p, 4) for p in poly] for poly in polylines],
                 "segments": [seg for poly in polylines_out for seg in poly],
+                "pads": trace_pads,
             })
 
         return {
