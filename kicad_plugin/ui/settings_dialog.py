@@ -21,7 +21,7 @@ if _WX_AVAILABLE:
     class SettingsDialog(wx.Dialog):
         """Simple dialog for editing plugin settings."""
 
-        _PROVIDERS = ["openai", "anthropic", "custom"]
+        _PROVIDERS = ["openai", "anthropic", "ollama"]
 
         def __init__(self, parent, settings) -> None:
             super().__init__(parent, title="AI Assistant Settings", size=(600, 620))
@@ -67,9 +67,9 @@ if _WX_AVAILABLE:
             self._python.SetHint("auto-detect (leave blank)")
             grid.Add(self._python, 1, wx.EXPAND)
 
-            # Server port
+            # MCP server port
             grid.Add(
-                wx.StaticText(self, label="Server port (0=auto):"), 0, wx.ALIGN_CENTER_VERTICAL
+                wx.StaticText(self, label="MCP server port (0=auto):"), 0, wx.ALIGN_CENTER_VERTICAL
             )
             self._port = wx.SpinCtrl(self, value=str(self._settings.server_port), min=0, max=65535)
             grid.Add(self._port, 1, wx.EXPAND)

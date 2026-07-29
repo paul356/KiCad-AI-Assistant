@@ -78,10 +78,10 @@ Settings are stored in the KiCad user config directory:
 
 | Setting | Description | Default |
 |---------|-------------|---------|
-| `llm_provider` | `openai`, `anthropic`, or `custom` | `openai` |
+| `llm_provider` | `openai`, `anthropic`, or `ollama` | `openai` |
 | `llm_api_key` | Your LLM API key | (empty) |
 | `llm_model` | Model name | `gpt-4o` |
-| `llm_base_url` | Custom endpoint URL | (uses provider default) |
+| `llm_base_url` | Ollama endpoint URL (e.g. http://localhost:11434) | (uses provider default) |
 | `server_port` | Fixed port for MCP server (0 = auto) | `0` |
 | `show_tool_log` | Show tool-call log by default | `true` |
 
