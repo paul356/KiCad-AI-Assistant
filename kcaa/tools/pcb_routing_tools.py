@@ -277,6 +277,184 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
             "pcb_path": pcb_path,
         }
 
+    @mcp.tool()
+    async def pcb_delete_tracks(
+        pcb_path: str,
+        net: str,
+        ctx: Context | None,
+        layer: str | None = None,
+    ) -> dict[str, Any]:
+        """Delete all track segments on a given net (optionally on one layer).
+
+        Removes every ``(segment ...)`` entry whose net matches *net* (by
+        name, regardless of whether the PCB uses numbered or name-only net
+        references).  When *layer* is provided, only segments on that layer
+        are removed.
+
+        A ``.bak`` backup is created before any modification.  An empty
+        match (zero deleted) is a no-op — no backup, no write.
+
+        Args:
+            pcb_path: Absolute path to the .kicad_pcb file.
+            net: Net name to match (e.g. ``"VCC"``, ``"GND"``).
+            ctx: MCP context (unused).
+            layer: Optional layer filter (e.g. ``"F.Cu"``).
+
+        Returns:
+            dict with ``deleted_count``, ``backup_path`` (or ``None`` if
+            nothing was deleted), and ``pcb_path``.
+        """
+        data = load_pcb(pcb_path)
+
+        to_remove: list[list] = []
+        for item in data:
+            if not (isinstance(item, list) and len(item) > 0):
+                continue
+            if not _is_sym(item[0], "segment"):
+                continue
+            # Check net
+            net_node = _find_sub(item, "net")
+            if net_node is None:
+                continue
+            item_net = _get_net_name(net_node)
+            if item_net != net:
+                continue
+            # Optional layer filter
+            if layer is not None:
+                lyr_node = _find_sub(item, "layer")
+                if lyr_node is None or len(lyr_node) < 2:
+                    continue
+                raw = lyr_node[1]
+                item_layer = raw if isinstance(raw, str) else str(raw)
+                if item_layer != layer:
+                    continue
+            to_remove.append(item)
+
+        if not to_remove:
+            return {"deleted_count": 0, "backup_path": None, "pcb_path": pcb_path}
+
+        for item in to_remove:
+            data.remove(item)
+
+        try:
+            backup_path = save_pcb(pcb_path, data)
+        except OSError as exc:
+            return {"error": f"Failed to write PCB file: {exc}"}
+
+        return {
+            "deleted_count": len(to_remove),
+            "backup_path": backup_path,
+            "pcb_path": pcb_path,
+        }
+
+    @mcp.tool()
+    async def pcb_delete_vias(
+        pcb_path: str,
+        net: str,
+        ctx: Context | None,
+        positions: list[tuple[float, float]] | None = None,
+    ) -> dict[str, Any]:
+        """Delete through-hole vias on a given net.
+
+        Removes every ``(via ...)`` entry whose net matches *net* (by
+        name).  When *positions* is provided, only vias at those exact
+        ``(x, y)`` locations (within 0.01 mm tolerance) are removed.
+
+        A ``.bak`` backup is created before any modification.  An empty
+        match (zero deleted) is a no-op — no backup, no write.
+
+        Args:
+            pcb_path: Absolute path to the .kicad_pcb file.
+            net: Net name to match (e.g. ``"VCC"``, ``"GND"``).
+            ctx: MCP context (unused).
+            positions: Optional list of ``(x, y)`` tuples.  When set, only
+                vias at these exact positions are deleted.
+
+        Returns:
+            dict with ``deleted_count``, ``backup_path`` (or ``None`` if
+            nothing was deleted), and ``pcb_path``.
+        """
+        data = load_pcb(pcb_path)
+
+        to_remove: list[list] = []
+        for item in data:
+            if not (isinstance(item, list) and len(item) > 0):
+                continue
+            if not _is_sym(item[0], "via"):
+                continue
+            # Check net
+            net_node = _find_sub(item, "net")
+            if net_node is None:
+                continue
+            item_net = _get_net_name(net_node)
+            if item_net != net:
+                continue
+            # Optional position filter
+            if positions is not None:
+                at_node = _find_sub(item, "at")
+                if at_node is None or len(at_node) < 3:
+                    continue
+                vx = float(at_node[1]) if not isinstance(at_node[1], str) else float(str(at_node[1]))
+                vy = float(at_node[2]) if not isinstance(at_node[2], str) else float(str(at_node[2]))
+                # Check if any position matches within 0.01 mm
+                matched = any(
+                    abs(vx - px) < 0.01 and abs(vy - py) < 0.01
+                    for px, py in positions
+                )
+                if not matched:
+                    continue
+            to_remove.append(item)
+
+        if not to_remove:
+            return {"deleted_count": 0, "backup_path": None, "pcb_path": pcb_path}
+
+        for item in to_remove:
+            data.remove(item)
+
+        try:
+            backup_path = save_pcb(pcb_path, data)
+        except OSError as exc:
+            return {"error": f"Failed to write PCB file: {exc}"}
+
+        return {
+            "deleted_count": len(to_remove),
+            "backup_path": backup_path,
+            "pcb_path": pcb_path,
+        }
+
+
+# ---------------------------------------------------------------------------
+# S-expression helpers
+# ---------------------------------------------------------------------------
+
+
+def _is_sym(value: Any, name: str) -> bool:
+    """Check if *value* is an sexpdata.Symbol matching *name*."""
+    return isinstance(value, sexpdata.Symbol) and str(value) == name
+
+
+def _find_sub(items: list, name: str) -> list | None:
+    """Find the first sub-list whose first element matches *name*."""
+    for sub in items:
+        if isinstance(sub, list) and len(sub) >= 2 and _is_sym(sub[0], name):
+            return sub
+    return None
+
+
+def _get_net_name(net_node: list) -> str | None:
+    """Extract the net name from a (net ...) reference.
+
+    Handles both KiCad 8 ``(net <id> "<name>")`` and
+    KiCad 10 ``(net "<name>")`` formats.
+    """
+    if len(net_node) >= 3:
+        raw = net_node[2]
+    elif len(net_node) >= 2:
+        raw = net_node[1]
+    else:
+        return None
+    return raw if isinstance(raw, str) else str(raw)
+
 
 # ---------------------------------------------------------------------------
 # S-expression emission (board-format strings)
