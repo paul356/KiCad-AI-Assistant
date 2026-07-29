@@ -62,7 +62,7 @@ jobs:
       run: npm install jsdom
 
     - name: Run tests
-      run: uv run python -m pytest tests/ -v --cov=kcaa --cov-report=xml --cov-fail-under=50
+      run: uv run python -m pytest tests/ -v --cov=kcaa --cov-report=xml --cov-fail-under=55
 
     - name: Upload coverage to Codecov
       uses: codecov/codecov-action@v4
