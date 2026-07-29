@@ -1365,14 +1365,16 @@ class LLMClient:
         """Dispatch to the configured LLM provider."""
         provider = self._settings.llm_provider
         tool_names = [t.get("function", {}).get("name", "?") for t in tools]
+        total_payload = len(system) + len(json.dumps(self._history)) + len(json.dumps(tools))
         log.info(
-            "LLM request — provider=%s model=%s tools=%d (%s) history=%d system_len=%d bytes",
+            "LLM request — provider=%s model=%s tools=%d (%s) history=%d system=%dB total≈%dB",
             provider,
             self._settings.llm_model,
             len(tools),
             ", ".join(tool_names[:10]) + ("…" if len(tool_names) > 10 else ""),
             len(self._history),
             len(system),
+            total_payload,
         )
         self._validate_history()  # guard against corrupted history before every API call
         if provider == "ollama":
