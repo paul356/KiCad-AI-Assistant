@@ -5,7 +5,7 @@ This module provides platform-specific configuration for KiCad integration,
 including file paths, extensions, component libraries, and operational constants.
 All settings are determined at import time based on the operating system.
 
-All configuration is accessed through the LibraryPathConfig singleton instance.
+All configuration is accessed through the ServerConfig singleton instance.
 On import, the module loads environment variables from a ``.env`` file (if present)
 so that all downstream configuration reflects user overrides.
 
@@ -36,14 +36,15 @@ log = logging.getLogger(__name__)
 _SYSTEM = platform.system()
 
 
-class LibraryPathConfig:
+class ServerConfig:
     """
-    KiCad configuration management.
+    Server-level environment configuration for KiCad MCP.
 
-    This class encapsulates all KiCad-related configuration including:
+    This class encapsulates all environment-dependent configuration including:
     - Platform-specific paths (app path, user dir, config dir)
     - Library paths (symbols, footprints, templates)
     - File extensions and constants
+    - Debug/feature toggles
     - Environment variable loading from .env files
 
     All configuration is accessed through the module-level singleton instance.
@@ -237,7 +238,14 @@ class LibraryPathConfig:
             return
 
         log.info(f"Loading .env file from: {env_path}")
+        self._load_dotenv_file(env_path)
 
+    def _load_dotenv_file(self, env_path: str) -> None:
+        """Load environment variables from a specific .env file path.
+
+        Args:
+            env_path: Full path to the .env file to load
+        """
         try:
             with open(env_path) as f:
                 for line in f:
@@ -274,7 +282,7 @@ class LibraryPathConfig:
             log.exception(f"Error loading .env file '{env_path}'")
 
     def _find_env_file(self, filename: str) -> str | None:
-        """Find a .env file in the current directory or parent directories.
+        """Find a .env file in the current directory.
 
         Args:
             filename: Name of the env file to find
@@ -282,20 +290,8 @@ class LibraryPathConfig:
         Returns:
             Path to the .env file if found, None otherwise
         """
-        current_dir = os.getcwd()
-        max_levels = 3
-
-        for _ in range(max_levels):
-            env_path = os.path.join(current_dir, filename)
-            if os.path.exists(env_path):
-                return env_path
-
-            parent_dir = os.path.dirname(current_dir)
-            if parent_dir == current_dir:
-                break
-            current_dir = parent_dir
-
-        return None
+        env_path = os.path.join(os.getcwd(), filename)
+        return env_path if os.path.exists(env_path) else None
 
     # ---------------------------------------------------------------------------
     # Path resolution helpers (private)
@@ -587,6 +583,14 @@ class LibraryPathConfig:
         os.makedirs(data_dir, exist_ok=True)
         return data_dir
 
+    @property
+    def viz_dump_enabled(self) -> bool:
+        """Whether to dump router pipeline visualization data.
+
+        Set ``KCAA_DUMP_ROUTE_PIPELINE=1`` in ``.env`` to enable.
+        """
+        return os.environ.get("KCAA_DUMP_ROUTE_PIPELINE") == "1"
+
     def get_env_list(self, env_var: str, default: str = "") -> list[str]:
         """Get a list from a comma-separated environment variable.
 
@@ -611,4 +615,4 @@ class LibraryPathConfig:
 
 # Create the singleton instance at module import time
 # This ensures .env is loaded and all configuration is available
-config = LibraryPathConfig()
+config = ServerConfig()

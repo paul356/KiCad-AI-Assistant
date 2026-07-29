@@ -14,7 +14,7 @@ from typing import Any
 from fastmcp import Context, FastMCP
 import sexpdata
 
-from kcaa.utils.config import LibraryPathConfig
+from kcaa.utils.config import ServerConfig
 from kcaa.utils.symbol_extractor import extract_lib_symbol_raw
 from kcaa.utils.symbol_geometry import compute_unit_bboxes
 from kcaa.utils.symbol_index_manager import SymbolIndexManager
@@ -52,7 +52,7 @@ _index_manager: SymbolIndexManager | None = None
 def _get_index_manager() -> SymbolIndexManager:
     global _index_manager
     if _index_manager is None:
-        config = LibraryPathConfig()
+        config = ServerConfig()
         library_reader = SymbolIndexReader(config)
         _index_manager = SymbolIndexManager(library_reader)
     return _index_manager

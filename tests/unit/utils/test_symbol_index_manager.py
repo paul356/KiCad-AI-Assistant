@@ -5,7 +5,7 @@ parsing, and database storage through sync() and search/lookup methods.
 
 from pathlib import Path
 
-from kcaa.utils.config import LibraryPathConfig
+from kcaa.utils.config import ServerConfig
 from kcaa.utils.symbol_index_manager import SymbolIndexManager
 from kcaa.utils.symbol_index_reader import SymbolIndexReader
 
@@ -17,8 +17,8 @@ FIXTURES_DIR = Path(__file__).parent / "fixtures"
 # ---------------------------------------------------------------------------
 
 
-class _FixtureConfig(LibraryPathConfig):
-    """LibraryPathConfig subclass pointing at the test fixture directory."""
+class _FixtureConfig(ServerConfig):
+    """ServerConfig subclass pointing at the test fixture directory."""
 
     def __init__(self):
         super().__init__()

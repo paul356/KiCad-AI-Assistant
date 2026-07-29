@@ -18,7 +18,7 @@ from fastmcp import Context, FastMCP
 import sexpdata
 
 from kcaa.tools.sheet_tools import _normalize_collection, _sheet_dict_from_wrapper
-from kcaa.utils.config import LibraryPathConfig
+from kcaa.utils.config import ServerConfig
 from kcaa.utils.schematic_sexp_utils import save_schematic
 from kcaa.utils.skip_compat import safe_schematic
 from kcaa.utils.symbol_extractor import extract_lib_symbol_raw
@@ -74,7 +74,7 @@ _index_manager: SymbolIndexManager | None = None
 def _get_index_manager() -> SymbolIndexManager:
     global _index_manager
     if _index_manager is None:
-        config = LibraryPathConfig()
+        config = ServerConfig()
         library_manager = SymbolIndexReader(config)
         _index_manager = SymbolIndexManager(library_manager)
     return _index_manager

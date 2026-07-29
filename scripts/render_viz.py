@@ -49,6 +49,7 @@ def _render_stage(fname: str, out_dir: str) -> None:
     path = data["path"]
     pads = data["pads"]
     obstacles = data.get("obstacles", [])
+    ts = os.path.basename(fname).split("_")[0]
 
     fig, ax = plt.subplots(1, 1, figsize=(14, 10))
     ax.set_aspect("equal")
@@ -155,7 +156,7 @@ def _render_stage(fname: str, out_dir: str) -> None:
     ]
     ax.legend(handles=legend_patches, loc="upper right", fontsize=8)
 
-    out_path = os.path.join(out_dir, f"{stage}.png")
+    out_path = os.path.join(out_dir, f"{ts}_{stage}.png")
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
@@ -163,7 +164,12 @@ def _render_stage(fname: str, out_dir: str) -> None:
 
 
 def main():
-    viz_dir = sys.argv[1] if len(sys.argv) > 1 else "/tmp/kcaa_viz"
+    if len(sys.argv) < 2:
+        print(f"Usage: {sys.argv[0]} <viz_dir> [run_prefix]")
+        print(f"  viz_dir     Path to kcaa_viz directory (e.g. ~/.config/kicad/10.0/kcaa/kcaa_viz)")
+        print(f"  run_prefix  Optional: render only runs matching this prefix (e.g. 102451)")
+        sys.exit(1)
+    viz_dir = sys.argv[1]
     out_dir = os.path.join(viz_dir, "png")
     os.makedirs(out_dir, exist_ok=True)
 
@@ -172,12 +178,33 @@ def main():
         print(f"No JSON files found in {viz_dir}")
         sys.exit(1)
 
-    print(f"Rendering {len(json_files)} stages from {viz_dir} → {out_dir}")
+    # Group by timestamp prefix (first 6 chars HHMMSS).
+    from collections import defaultdict
+    groups: dict[str, list[str]] = defaultdict(list)
     for fname in json_files:
-        try:
-            _render_stage(fname, out_dir)
-        except Exception as exc:
-            print(f"  FAILED {fname}: {exc}")
+        base = os.path.basename(fname)
+        ts = base[:6] if "_" in base else base
+        groups[ts].append(fname)
+
+    target_ts = sys.argv[2] if len(sys.argv) > 2 else max(groups.keys())
+    # Allow partial match — match all groups starting with the given prefix.
+    matched = {ts: files for ts, files in groups.items() if ts.startswith(target_ts)}
+
+    if not matched:
+        print(f"No runs matching '{target_ts}'. Available: {', '.join(sorted(groups))}")
+        sys.exit(1)
+
+    older = len(json_files) - sum(len(v) for v in matched.values())
+    if older:
+        print(f"Ignoring {older} files from other runs.")
+
+    for ts in sorted(matched):
+        print(f"Rendering {len(matched[ts])} stages ({ts}) → {out_dir}")
+        for fname in matched[ts]:
+            try:
+                _render_stage(fname, out_dir)
+            except Exception as exc:
+                print(f"  FAILED {fname}: {exc}")
 
     print("Done.")
 

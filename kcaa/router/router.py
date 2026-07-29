@@ -343,11 +343,11 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
     # ---- Discard A* path inside rectangular pads and replace with a
     #      single axis-aligned wire (fence → centre).  This keeps the
     #      pad exit clean; normal post-processing runs afterwards. ----
-    # Build viz context: pad rects, obstacles for rendering.
+    # Build viz context: pad rects (all pads, not just rectangular), obstacles.
     _pad_viz: list[tuple[str, tuple[float, float, float, float]]] = []
     for name, psize, pcenter in [
-        ("pad_a", pad_a_size, pad_a_xy),
-        ("pad_b", pad_b_size, pad_b_xy),
+        (f"{req.ref_a}/{req.pad_a}", pad_a_world_size, pad_a_xy),
+        (f"{req.ref_b}/{req.pad_b}", pad_b_world_size, pad_b_xy),
     ]:
         if psize is not None:
             w, h = psize
@@ -535,10 +535,14 @@ def _log_output_segments(label: str, segs: list) -> None:
 # Visualization dump
 # ---------------------------------------------------------------------------
 
-_VIZ_DIR = os.path.join(tempfile.gettempdir(), "kcaa_viz")
-
 import os as _os
 import time as _time
+
+
+def _viz_dir() -> str:
+    """Return the viz dump directory under the kcaa data dir."""
+    from kcaa.utils.config import config
+    return _os.path.join(config.get_kcaa_data_dir(), "kcaa_viz")
 
 
 def _dump_viz(
@@ -548,10 +552,18 @@ def _dump_viz(
     obstacles: list,
     route_bbox: tuple[float, float, float, float],
 ) -> None:
-    """Dump path, pad rects, and obstacles to a JSON file for rendering."""
-    _os.makedirs(_VIZ_DIR, exist_ok=True)
+    """Dump path, pad rects, and obstacles to a JSON file for rendering.
+
+    Only writes when ``config.viz_dump_enabled`` is ``True`` (set via
+    ``KCAA_DUMP_ROUTE_PIPELINE=1`` in ``.env``).
+    """
+    from kcaa.utils.config import config
+    if not config.viz_dump_enabled:
+        return
+    d = _viz_dir()
+    _os.makedirs(d, exist_ok=True)
     ts = _time.strftime("%H%M%S")
-    fname = _os.path.join(_VIZ_DIR, f"{ts}_{stage}.json")
+    fname = _os.path.join(d, f"{ts}_{stage}.json")
     data = {
         "stage": stage,
         "path": [(x, y) for x, y in pts],
@@ -574,10 +586,18 @@ def _dump_viz_segments(
     obstacles: list,
     route_bbox: tuple[float, float, float, float],
 ) -> None:
-    """Dump OutputSegments as a path for rendering."""
-    _os.makedirs(_VIZ_DIR, exist_ok=True)
+    """Dump OutputSegments as a path for rendering.
+
+    Only writes when ``config.viz_dump_enabled`` is ``True`` (set via
+    ``KCAA_DUMP_ROUTE_PIPELINE=1`` in ``.env``).
+    """
+    from kcaa.utils.config import config
+    if not config.viz_dump_enabled:
+        return
+    d = _viz_dir()
+    _os.makedirs(d, exist_ok=True)
     ts = _time.strftime("%H%M%S")
-    fname = _os.path.join(_VIZ_DIR, f"{ts}_{stage}.json")
+    fname = _os.path.join(d, f"{ts}_{stage}.json")
     pts: list[tuple[float, float]] = []
     for s in segs:
         pts.append((s.x1, s.y1))
@@ -643,84 +663,83 @@ def _align_path_endpoints(
     pad_a_size: tuple[float, float] | None = None,
     pad_b_size: tuple[float, float] | None = None,
 ) -> list[tuple[float, float]]:
-    """Align pad ends to exact centres.
+    """Align pad ends to exact centres via X-then-Y iterative translation.
 
-    For rectangular pads: rigidly translate the wire chain (and
-    subsequent diagonal segments) so the projection axis aligns
-    with the centre axis.
+    Both rectangular and non-rectangular pads use the same two-pass
+    approach (x then y).  Each pass:
+      1. Translate consecutive points whose axis-coordinate matches the
+         start point (the "protect the wire" phase).
+      2. Continue translating through diagonal segments, stopping at the
+         first segment whose direction matches the translation axis.
 
-    For square/circular pads: simple single-point replacement
-    (no wire to protect, and the segment is short enough that
-    angle distortion is negligible).
+    A snapshot of the original coordinates is used for segment-direction
+    checks so that mixing translated and untranslated points doesn't
+    produce false positives/negatives.
     """
-    if len(path) < 1:
+    if len(path) < 2:
         return path
 
-    # --- Start pad ---
-    if not pad_a_size:
-        path[0] = start_center
-    elif len(path) >= 2:
-        scx, scy = start_center
-        seg_y_diff = abs(path[0][1] - path[1][1])
-        if seg_y_diff < 1e-9:
-            ref_y = path[0][1]
-            dy = scy - ref_y
-            if dy != 0.0:
-                k = 0
-                while k < len(path) and abs(path[k][1] - ref_y) < 1e-9:
-                    path[k] = (path[k][0], path[k][1] + dy)
-                    k += 1
-                while k < len(path):
-                    if abs(path[k][1] - path[k - 1][1]) < 1e-9:
-                        break
-                    path[k] = (path[k][0], path[k][1] + dy)
-                    k += 1
-        else:
-            ref_x = path[0][0]
-            dx = scx - ref_x
-            if dx != 0.0:
-                k = 0
-                while k < len(path) and abs(path[k][0] - ref_x) < 1e-9:
-                    path[k] = (path[k][0] + dx, path[k][1])
-                    k += 1
-                while k < len(path):
-                    if abs(path[k][0] - path[k - 1][0]) < 1e-9:
-                        break
-                    path[k] = (path[k][0] + dx, path[k][1])
-                    k += 1
+    # ── Start pad ──────────────────────────────────────────────────
+    scx, scy = start_center
 
-    # --- End pad ---
-    if not pad_b_size:
-        path[-1] = end_center
-    elif len(path) >= 2:
-        ecx, ecy = end_center
-        seg_y_diff = abs(path[-1][1] - path[-2][1])
-        if seg_y_diff < 1e-9:
-            ref_y = path[-1][1]
-            dy = ecy - ref_y
-            if dy != 0.0:
-                k = len(path) - 1
-                while k >= 0 and abs(path[k][1] - ref_y) < 1e-9:
-                    path[k] = (path[k][0], path[k][1] + dy)
-                    k -= 1
-                while k >= 0:
-                    if abs(path[k + 1][1] - path[k][1]) < 1e-9:
-                        break
-                    path[k] = (path[k][0], path[k][1] + dy)
-                    k -= 1
-        else:
-            ref_x = path[-1][0]
-            dx = ecx - ref_x
-            if dx != 0.0:
-                k = len(path) - 1
-                while k >= 0 and abs(path[k][0] - ref_x) < 1e-9:
-                    path[k] = (path[k][0] + dx, path[k][1])
-                    k -= 1
-                while k >= 0:
-                    if abs(path[k + 1][0] - path[k][0]) < 1e-9:
-                        break
-                    path[k] = (path[k][0] + dx, path[k][1])
-                    k -= 1
+    # X-pass  —  stop at horizontal segment (same y, direction matches translation)
+    dx = scx - path[0][0]
+    if abs(dx) > 1e-9:
+        orig_x = list(path)
+        k = 0
+        while k < len(path) and abs(orig_x[k][0] - orig_x[0][0]) < 1e-9:
+            path[k] = (path[k][0] + dx, path[k][1])
+            k += 1
+        while k < len(path):
+            if abs(orig_x[k][1] - orig_x[k - 1][1]) < 1e-9:
+                break
+            path[k] = (path[k][0] + dx, path[k][1])
+            k += 1
+
+    # Y-pass  —  stop at vertical segment (same x, direction matches translation)
+    dy = scy - path[0][1]
+    if abs(dy) > 1e-9:
+        orig_y = list(path)
+        k = 0
+        while k < len(path) and abs(orig_y[k][1] - orig_y[0][1]) < 1e-9:
+            path[k] = (path[k][0], path[k][1] + dy)
+            k += 1
+        while k < len(path):
+            if abs(orig_y[k][0] - orig_y[k - 1][0]) < 1e-9:
+                break
+            path[k] = (path[k][0], path[k][1] + dy)
+            k += 1
+
+    # ── End pad ────────────────────────────────────────────────────
+    ecx, ecy = end_center
+
+    # X-pass (reverse)  —  stop at horizontal segment
+    dx = ecx - path[-1][0]
+    if abs(dx) > 1e-9:
+        orig_x = list(path)
+        k = len(path) - 1
+        while k >= 0 and abs(orig_x[k][0] - orig_x[-1][0]) < 1e-9:
+            path[k] = (path[k][0] + dx, path[k][1])
+            k -= 1
+        while k >= 0:
+            if abs(orig_x[k + 1][1] - orig_x[k][1]) < 1e-9:
+                break
+            path[k] = (path[k][0] + dx, path[k][1])
+            k -= 1
+
+    # Y-pass (reverse)  —  stop at vertical segment
+    dy = ecy - path[-1][1]
+    if abs(dy) > 1e-9:
+        orig_y = list(path)
+        k = len(path) - 1
+        while k >= 0 and abs(orig_y[k][1] - orig_y[-1][1]) < 1e-9:
+            path[k] = (path[k][0], path[k][1] + dy)
+            k -= 1
+        while k >= 0:
+            if abs(orig_y[k + 1][0] - orig_y[k][0]) < 1e-9:
+                break
+            path[k] = (path[k][0], path[k][1] + dy)
+            k -= 1
 
     return path
 
