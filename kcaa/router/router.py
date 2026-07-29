@@ -768,6 +768,7 @@ def _replace_pad_path(
                 fx, fy = path[k - 1]
                 ox, oy = path[k]
                 keep = _build_pad_wire(cx, cy, fx, fy, ox, oy, minx, maxx, miny, maxy)
+                # keep = [projection, fence]
                 return keep + path[k:]
         return path
     else:
@@ -775,8 +776,9 @@ def _replace_pad_path(
             if not _inside_rect(path[k], center, hw, hh):
                 fx, fy = path[k + 1]
                 ox, oy = path[k]
-                keep = _build_pad_wire(fx, fy, cx, cy, ox, oy, minx, maxx, miny, maxy)
-                return path[: k + 1] + keep
+                # Same (center, fence) order — reverse so path reads [fence, projection].
+                keep = _build_pad_wire(cx, cy, fx, fy, ox, oy, minx, maxx, miny, maxy)
+                return path[: k + 1] + keep[::-1]
         return path
 
 
