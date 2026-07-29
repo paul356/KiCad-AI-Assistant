@@ -264,7 +264,10 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
         Returns:
             dict with reference, value, x/y/rotation (world, mm/deg CW+),
             layer, properties (dict of all property name→value), pads
-            (list of {number, type, shape, local_x, local_y, net_name}).
+            (list of {number, type, shape, local_x, local_y,
+             local_w, local_h, world_w, world_h, net_name}).
+             ``world_w``/``world_h`` account for pad rotation (KiCad 10
+             stores pad rotation as absolute board-space CW+).
         """
         data = load_pcb(pcb_path)
         try:
@@ -292,12 +295,24 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
             pad_type = sub[2] if isinstance(sub[2], str) else _sym(sub[2])
             pad_shape = sub[3] if isinstance(sub[3], str) else _sym(sub[3])
             pad_x, pad_y = 0.0, 0.0
+            pad_rot = 0.0
+            pad_w, pad_h = 0.0, 0.0
             net_name = ""
             for psub in sub:
                 if isinstance(psub, list) and len(psub) >= 3 and _sym(psub[0]) == "at":
                     pad_x, pad_y = float(psub[1]), float(psub[2])
+                    pad_rot = float(psub[3]) if len(psub) > 3 else 0.0
+                elif isinstance(psub, list) and len(psub) >= 3 and _sym(psub[0]) == "size":
+                    pad_w, pad_h = float(psub[1]), float(psub[2])
                 elif isinstance(psub, list) and len(psub) >= 2 and _sym(psub[0]) == "net":
                     _, net_name = _parse_net_ref(psub, {}, {})
+            # World-oriented size.
+            # Pad rotation in KiCad 10 is stored as absolute board-space
+            # (CW+), so we use it directly without adding fp rotation.
+            if abs(pad_rot % 180.0 - 90.0) < 0.1:
+                wworld, hworld = pad_h, pad_w
+            else:
+                wworld, hworld = pad_w, pad_h
             pads.append(
                 {
                     "number": str(pad_num),
@@ -305,6 +320,10 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
                     "shape": str(pad_shape),
                     "local_x": pad_x,
                     "local_y": pad_y,
+                    "local_w": pad_w,
+                    "local_h": pad_h,
+                    "world_w": wworld,
+                    "world_h": hworld,
                     "net_name": net_name,
                 }
             )
@@ -455,15 +474,28 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
         }
 
     @mcp.tool()
-    async def list_nets(pcb_path: str, ctx: Context | None) -> dict[str, Any]:
+    async def list_nets(
+        pcb_path: str,
+        ctx: Context | None,
+        classify: bool = False,
+    ) -> dict[str, Any]:
         """List all nets in a KiCad PCB board.
+
+        When *classify* is ``True``, each net also includes its
+        **netclass** (resolved from the matching ``.kicad_pro`` via
+        ``netclass_patterns``) and **type** (``"power"`` /
+        ``"ground"`` / ``"signal"``).
 
         Args:
             pcb_path: Absolute path to the .kicad_pcb file.
             ctx: MCP context for progress reporting.
+            classify: When ``True``, also resolve netclass and type.
+                Requires a ``.kicad_pro`` next to the ``.kicad_pcb``.
+                Default ``False`` for efficiency.
 
         Returns:
-            dict with nets: list of {net_id, name, pad_count}
+            dict with nets: list of {net_id, name, pad_count,
+             netclass (str or None), type (str or None)}.
         """
         data = load_pcb(pcb_path)
 
@@ -493,6 +525,10 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
                         if entry["net_id"] is None and net_id is not None:
                             entry["net_id"] = net_id
                         entry["pad_count"] += 1
+
+        # Optional: resolve netclass & type from .kicad_pro
+        if classify:
+            _resolve_net_data(nets_by_name, pcb_path)
 
         nets = sorted(nets_by_name.values(), key=_net_sort_key)
 
@@ -611,6 +647,58 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
                             track_endpoints.add(
                                 (seg_net_key, _rounded(float(sub[1])), _rounded(float(sub[2])))
                             )
+
+        # ── Zone coverage: pads inside a filled copper pour on the same
+        #     net+layer are considered connected (zone acts as a plane). ──
+        try:
+            from shapely.geometry import Point as ShapelyPoint, Polygon as ShapelyPolygon
+        except ImportError:
+            ShapelyPoint = ShapelyPolygon = None  # type: ignore[assignment]
+
+        if ShapelyPoint is not None:
+            for item in data:
+                if not (isinstance(item, list) and len(item) > 0 and _sym(item[0]) == "zone"):
+                    continue
+                zone_net = ""
+                polygon_pts: list[tuple[float, float]] = []
+                is_keepout = False
+                collecting = False
+                for sub in item:
+                    if not isinstance(sub, list) or len(sub) < 2:
+                        continue
+                    zk = _sym(sub[0])
+                    if zk == "net":
+                        if len(sub) >= 3:
+                            try:
+                                int(sub[1])
+                                zone_net = sub[2] if isinstance(sub[2], str) else _sym(sub[2])
+                            except (TypeError, ValueError):
+                                zone_net = sub[1] if isinstance(sub[1], str) else _sym(sub[1])
+                        elif len(sub) >= 2:
+                            zone_net = sub[1] if isinstance(sub[1], str) else _sym(sub[1])
+                    elif zk == "keepout":
+                        is_keepout = True
+                    elif zk == "polygon":
+                        collecting = True
+                        polygon_pts = []
+                    elif zk == "pts" and collecting:
+                        for xy in sub[1:]:
+                            if isinstance(xy, list) and len(xy) >= 3 and _sym(xy[0]) == "xy":
+                                polygon_pts.append((float(xy[1]), float(xy[2])))
+                if is_keepout or not zone_net or len(polygon_pts) < 3:
+                    continue
+                try:
+                    zone_poly = ShapelyPolygon(polygon_pts)
+                except Exception:
+                    continue
+                # Mark any pad on the same net that falls inside the zone
+                # polygon as connected (copper pour acts as a plane).
+                for pad_idx, (ref, pad_num, px, py) in enumerate(
+                    pads_by_net.get(zone_net, [])
+                ):
+                    pt = ShapelyPoint(px, py)
+                    if zone_poly.covers(pt):
+                        track_endpoints.add((zone_net, _rounded(px), _rounded(py)))
 
         # For each net with ≥2 pads, report ALL pairs where neither pad
         # has a track endpoint at its position (simple heuristic)
@@ -1243,6 +1331,93 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
             })
 
         return {"vias": vias, "count": len(vias)}
+
+
+# ---------------------------------------------------------------------------
+# Helpers — netclass / type
+# ---------------------------------------------------------------------------
+
+
+def _resolve_net_data(
+    nets_by_name: dict[str, dict[str, Any]],
+    pcb_path: str,
+) -> None:
+    """Augment each net in *nets_by_name* with ``netclass`` and ``type``.
+
+    Reads the matching ``.kicad_pro`` JSON, resolves net→netclass via
+    ``netclass_patterns``, and classifies each net as power/ground/signal.
+
+    If the ``.kicad_pro`` cannot be found or parsed, the helper silently
+    returns (the extra fields remain as ``None``).
+    """
+    import json
+    import os
+    import re
+
+    # Derive .kicad_pro path
+    base = os.path.splitext(os.path.basename(pcb_path))[0]
+    d = os.path.dirname(pcb_path)
+    pro_path: str | None = None
+    for f in os.listdir(d):
+        if f.startswith(base + ".") and re.match(r".+\.kicad_pro$", f):
+            pro_path = os.path.join(d, f)
+            break
+    if pro_path is None or not os.path.isfile(pro_path):
+        return
+
+    try:
+        with open(pro_path, encoding="utf-8") as fh:
+            pro_data = json.load(fh)
+    except (json.JSONDecodeError, OSError):
+        return
+
+    ns = pro_data.get("net_settings", {}) if isinstance(pro_data, dict) else {}
+    if not isinstance(ns, dict):
+        return
+
+    # Build net→netclass map (explicit table + pattern matching)
+    net_to_class: dict[str, str | None] = {}
+    for net_name in nets_by_name:
+        net_to_class[net_name] = None
+
+    # Explicit per-net assignments
+    for n in ns.get("nets", []):
+        if isinstance(n, dict):
+            name = n.get("name")
+            nc = n.get("netclass") or n.get("class")
+            if isinstance(name, str) and isinstance(nc, str) and name in net_to_class:
+                net_to_class[name] = nc
+
+    # Pattern-based assignments (first match wins)
+    import fnmatch
+    for p in ns.get("netclass_patterns", []):
+        if not isinstance(p, dict):
+            continue
+        pat = p.get("pattern")
+        nc = p.get("netclass")
+        if not isinstance(pat, str) or not isinstance(nc, str):
+            continue
+        for net_name in net_to_class:
+            if net_to_class[net_name] is None and fnmatch.fnmatchcase(net_name, pat):
+                net_to_class[net_name] = nc
+
+    # Regex for signal integrity type
+    _POWER_RE = re.compile(
+        r"VCC|VDD|VEE|VBAT|3V3|3\.3V|5V|12V|\bPWR\b|AVCC|DVCC|VUSB",
+        re.IGNORECASE,
+    )
+    _GROUND_RE = re.compile(
+        r"VSS|VEE|GND|AGND|DGND|PGND|VSS", re.IGNORECASE
+    )
+
+    for net_name, entry in nets_by_name.items():
+        entry["netclass"] = net_to_class.get(net_name)
+        if _GROUND_RE.search(net_name):
+            entry["type"] = "ground"
+        elif _POWER_RE.search(net_name):
+            entry["type"] = "power"
+        else:
+            entry["type"] = "signal"
 
 
 # ---------------------------------------------------------------------------
