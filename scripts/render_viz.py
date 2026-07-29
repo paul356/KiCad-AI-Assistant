@@ -166,8 +166,8 @@ def _render_stage(fname: str, out_dir: str) -> None:
 def main():
     if len(sys.argv) < 2:
         print(f"Usage: {sys.argv[0]} <viz_dir> [run_prefix]")
-        print(f"  viz_dir     Path to kcaa_viz directory (e.g. ~/.config/kicad/10.0/kcaa/kcaa_viz)")
-        print(f"  run_prefix  Optional: render only runs matching this prefix (e.g. 102451)")
+        print("  viz_dir     Path to kcaa_viz directory (e.g. ~/.config/kicad/10.0/kcaa/kcaa_viz)")
+        print("  run_prefix  Optional: render only runs matching this prefix (e.g. 102451)")
         sys.exit(1)
     viz_dir = sys.argv[1]
     out_dir = os.path.join(viz_dir, "png")
@@ -180,6 +180,7 @@ def main():
 
     # Group by timestamp prefix (first 6 chars HHMMSS).
     from collections import defaultdict
+
     groups: dict[str, list[str]] = defaultdict(list)
     for fname in json_files:
         base = os.path.basename(fname)

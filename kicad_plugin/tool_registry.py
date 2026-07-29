@@ -317,6 +317,20 @@ TOOL_POLICIES: dict[str, ToolPolicy] = {
         auto_snapshot=True,
         mark_dirty=True,
     ),
+    "pcb_delete_tracks": ToolPolicy(
+        kind="file_mutation",
+        path_arg="pcb_path",
+        auto_snapshot=True,
+        mark_dirty=True,
+    ),
+    "pcb_delete_vias": ToolPolicy(
+        kind="file_mutation",
+        path_arg="pcb_path",
+        auto_snapshot=True,
+        mark_dirty=True,
+    ),
+    "list_tracks": ToolPolicy(kind="query"),
+    "list_vias": ToolPolicy(kind="query"),
     # DRC tools
     "run_drc_check": ToolPolicy(
         kind="ipc_action",

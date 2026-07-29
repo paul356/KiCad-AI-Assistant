@@ -862,7 +862,9 @@ class TestGetRatsnestWithConnected:
     def test_get_connected_pads_includes_key(self, mcp_server):
         port, sid = mcp_server
         result = _call_tool(
-            port, sid, "get_ratsnest",
+            port,
+            sid,
+            "get_ratsnest",
             {"pcb_path": self.FIXTURE, "get_connected_pads": True},
         )
         assert "connected_pads" in result

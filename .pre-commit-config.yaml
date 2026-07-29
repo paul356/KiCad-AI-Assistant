@@ -9,5 +9,5 @@ repos:
     rev: 1.9.4
     hooks:
       - id: bandit
-        args: ["-c", "pyproject.toml", "-r", "kcaa/", "kicad_plugin/"]
-        additional_dependencies: ["bandit[toml]"]
+        args: ["-r", "kcaa/", "kicad_plugin/"]
+        pass_filenames: false

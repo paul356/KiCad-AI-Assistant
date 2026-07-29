@@ -237,13 +237,6 @@ exclude_lines = [
     "@(abc\\.)?abstractmethod",
 ]
 
-[tool.bandit]
-exclude_dirs = ["tests", "build", "dist"]
-skips = ["B101", "B601", "B404", "B603", "B110", "B112"]  # Skip low-severity subprocess and exception handling warnings
-
-[tool.bandit.assert_used]
-skips = ["*_test.py", "*/test_*.py"]
-
 [tool.hatch.build.targets.wheel]
 packages = ["kcaa"]
 exclude = ["**/*.db", "**/*.db-shm", "**/*.db-wal"]

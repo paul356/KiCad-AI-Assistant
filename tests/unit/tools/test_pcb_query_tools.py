@@ -278,13 +278,17 @@ class TestGetRatsnest:
 
     def test_connected_pads_true_includes_key(self, tools):
         """When get_connected_pads=True the key appears."""
-        result = _run(tools["get_ratsnest"](pcb_path=BOARD_FIXTURE, ctx=None, get_connected_pads=True))
+        result = _run(
+            tools["get_ratsnest"](pcb_path=BOARD_FIXTURE, ctx=None, get_connected_pads=True)
+        )
         assert "connected_pads" in result
         assert "connected_count" in result
 
     def test_connected_pads_with_tracks(self, tools, board_with_tracks):
         """Board with existing VCC tracks — VCC pad gets marked connected."""
-        result = _run(tools["get_ratsnest"](pcb_path=board_with_tracks, ctx=None, get_connected_pads=True))
+        result = _run(
+            tools["get_ratsnest"](pcb_path=board_with_tracks, ctx=None, get_connected_pads=True)
+        )
         assert "connected_pads" in result
         assert "connected_count" in result
         # The segments exist but may not start at a pad centre
@@ -371,3 +375,116 @@ class TestGetFootprintPadSize:
             assert pad["local_h"] > 0
             assert pad["world_w"] > 0
             assert pad["world_h"] > 0
+
+    def test_world_size_for_rotated_footprint(self, tools):
+        """C1 is at 90°, pads are (size 0.5 0.5) square -> world_w == world_h."""
+        result = _run(tools["get_footprint"](pcb_path=BOARD_FIXTURE, reference="C1", ctx=None))
+        for pad in result["pads"]:
+            assert pad["world_w"] == pad["world_h"]
+            assert pad["world_w"] > 0
+
+
+class TestListNetsClassify:
+    def test_classify_requires_pro_file(self, tools, tmp_path):
+        """When classify=True but no .kicad_pro exists, fields are None."""
+        dest = tmp_path / "test.kicad_pcb"
+        shutil.copy(BOARD_FIXTURE, dest)
+        result = _run(tools["list_nets"](pcb_path=str(dest), ctx=None, classify=True))
+        for n in result["nets"]:
+            assert "netclass" in n
+            assert "type" in n
+            # No .kicad_pro → netclass should be None
+            assert n["netclass"] is None
+
+    def test_classify_resolves_netclass(self, tools, tmp_path):
+        """With a matching .kicad_pro, nets get netclass + type."""
+        dest = tmp_path / "test.kicad_pcb"
+        shutil.copy(BOARD_FIXTURE, dest)
+        # Create a matching .kicad_pro
+        pro = {
+            "net_settings": {
+                "classes": [
+                    {"name": "Default", "clearance": 0.2, "track_width": 0.25},
+                    {"name": "Power", "clearance": 0.3, "track_width": 0.5},
+                ],
+                "netclass_patterns": [
+                    {"netclass": "Power", "pattern": "VCC"},
+                ],
+            }
+        }
+        import json
+
+        pro_path = tmp_path / "test.kicad_pro"
+        with open(pro_path, "w") as f:
+            json.dump(pro, f)
+
+        result = _run(tools["list_nets"](pcb_path=str(dest), ctx=None, classify=True))
+        nets = {n["name"]: n for n in result["nets"]}
+        assert nets["VCC"]["netclass"] == "Power"
+        assert nets["VCC"]["type"] == "power"
+        assert nets["GND"]["type"] == "ground"
+        assert nets["NET_A"]["netclass"] is None
+        assert nets["NET_A"]["type"] == "signal"
+
+
+class TestGetRatsnestZoneCoverage:
+    @pytest.fixture
+    def board_with_zone_and_tracks(self, tmp_path):
+        """board_with_tracks plus a GND zone covering R1 pad2."""
+        import shutil
+
+        dest = tmp_path / "board_with_zone.kicad_pcb"
+        shutil.copy(BOARD_FIXTURE, dest)
+        text = dest.read_text(encoding="utf-8")
+        # Insert tracks + zone before final paren
+        idx = text.rstrip().rfind(")")
+        snippet = """
+\t(segment
+\t\t(start 10.0 20.0)
+\t\t(end 20.0 20.0)
+\t\t(width 0.25)
+\t\t(layer "F.Cu")
+\t\t(net "VCC")
+\t)
+\t(segment
+\t\t(start 30.0 10.0)
+\t\t(end 40.0 10.0)
+\t\t(width 0.50)
+\t\t(layer "F.Cu")
+\t\t(net "GND")
+\t)
+\t(zone
+\t\t(net "GND")
+\t\t(net_name "GND")
+\t\t(layer "F.Cu")
+\t\t(hatch edge 0.508)
+\t\t(connect_pads (clearance 0.5))
+\t\t(min_thickness 0.25)
+\t\t(fill yes (thermal_gap 0.5) (thermal_bridge_width 0.5))
+\t\t(polygon
+\t\t\t(pts
+\t\t\t\t(xy 5.0 5.0)
+\t\t\t\t(xy 60.0 5.0)
+\t\t\t\t(xy 60.0 60.0)
+\t\t\t\t(xy 5.0 60.0)
+\t\t\t)
+\t\t)
+\t)
+"""
+        text = text[:idx] + snippet + text[idx:]
+        dest.write_text(text, encoding="utf-8")
+        return str(dest)
+
+    def test_zone_covered_pad_marked_connected(self, tools, board_with_zone_and_tracks):
+        """GND pad inside GND zone should be treated as connected."""
+        result = _run(
+            tools["get_ratsnest"](
+                pcb_path=board_with_zone_and_tracks,
+                ctx=None,
+                get_connected_pads=True,
+            )
+        )
+        gnd_connected = [p for p in result["connected_pads"] if p["net"] == "GND"]
+        assert len(gnd_connected) > 0, "GND pad should be zone-connected"
+        # R1/2 is GND and inside the zone polygon (5,5)→(60,5)→(60,60)→(5,60)
+        assert any(p["ref"] == "R1" and p["pad"] == "2" for p in gnd_connected)

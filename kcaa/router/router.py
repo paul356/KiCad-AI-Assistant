@@ -43,7 +43,6 @@ import json
 import logging
 import math
 import os
-import tempfile
 
 from kcaa.router.grid_a_star import (
     GRID_RESOLUTION,
@@ -542,6 +541,7 @@ import time as _time
 def _viz_dir() -> str:
     """Return the viz dump directory under the kcaa data dir."""
     from kcaa.utils.config import config
+
     return _os.path.join(config.get_kcaa_data_dir(), "kcaa_viz")
 
 
@@ -558,6 +558,7 @@ def _dump_viz(
     ``KCAA_DUMP_ROUTE_PIPELINE=1`` in ``.env``).
     """
     from kcaa.utils.config import config
+
     if not config.viz_dump_enabled:
         return
     d = _viz_dir()
@@ -592,6 +593,7 @@ def _dump_viz_segments(
     ``KCAA_DUMP_ROUTE_PIPELINE=1`` in ``.env``).
     """
     from kcaa.utils.config import config
+
     if not config.viz_dump_enabled:
         return
     d = _viz_dir()
@@ -789,11 +791,16 @@ def _inside_rect(
 
 
 def _build_pad_wire(
-    x1: float, y1: float,
-    x2: float, y2: float,
-    ox: float, oy: float,
-    minx: float, maxx: float,
-    miny: float, maxy: float,
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
+    ox: float,
+    oy: float,
+    minx: float,
+    maxx: float,
+    miny: float,
+    maxy: float,
 ) -> list[tuple[float, float]]:
     """Return ``[projection, fence]`` — a single axis-aligned segment
     along the AABB edge the outside point exits from.  The centre is
@@ -1174,12 +1181,9 @@ def _default_clearance(pcb_path: str, net: str | None = None) -> float:
     # When the board's global min_clearance is 0.0, fall back to
     # the net class clearance for the requested net.
     if clr < 0.001 and net is not None:
-        try:
-            net_clr = _netclass_clearance(pcb_path, net)
-            if net_clr > 0.0:
-                clr = net_clr
-        except Exception:
-            pass  # keep the board value
+        net_clr = _netclass_clearance(pcb_path, net)
+        if net_clr > 0.0:
+            clr = net_clr
     return clr
 
 

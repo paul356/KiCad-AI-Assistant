@@ -36,6 +36,13 @@ _SEGMENTS_SNIPPET = """
 \t\t(layer "F.Cu")
 \t\t(net "GND")
 \t)
+\t(segment
+\t\t(start 50.0 50.0)
+\t\t(end 60.0 50.0)
+\t\t(width 0.25)
+\t\t(layer "B.Cu")
+\t\t(net "NET_A")
+\t)
 \t(via
 \t\t(at 20.0 20.0)
 \t\t(size 0.8)
@@ -101,34 +108,64 @@ class TestPcbDeleteTracks:
         assert result["backup_path"] is None
 
     def test_delete_single_segment(self, tools, board_with_tracks):
-        result = _run(tools["pcb_delete_tracks"](
-            pcb_path=board_with_tracks,
-            segments=[{"x1": 30.0, "y1": 10.0, "x2": 40.0, "y2": 10.0}],
-            ctx=None,
-        ))
+        result = _run(
+            tools["pcb_delete_tracks"](
+                pcb_path=board_with_tracks,
+                segments=[{"x1": 30.0, "y1": 10.0, "x2": 40.0, "y2": 10.0}],
+                ctx=None,
+            )
+        )
         assert result["deleted_count"] == 1
         assert result["backup_path"] is not None
 
     def test_delete_two_segments(self, tools, board_with_tracks):
-        result = _run(tools["pcb_delete_tracks"](
-            pcb_path=board_with_tracks,
-            segments=[
-                {"x1": 10.0, "y1": 20.0, "x2": 20.0, "y2": 20.0},
-                {"x1": 30.0, "y1": 10.0, "x2": 40.0, "y2": 10.0},
-            ],
-            ctx=None,
-        ))
+        result = _run(
+            tools["pcb_delete_tracks"](
+                pcb_path=board_with_tracks,
+                segments=[
+                    {"x1": 10.0, "y1": 20.0, "x2": 20.0, "y2": 20.0},
+                    {"x1": 30.0, "y1": 10.0, "x2": 40.0, "y2": 10.0},
+                ],
+                ctx=None,
+            )
+        )
         assert result["deleted_count"] == 2
 
     def test_not_found_reported(self, tools, board_with_tracks):
-        result = _run(tools["pcb_delete_tracks"](
-            pcb_path=board_with_tracks,
-            segments=[{"x1": 99.0, "y1": 99.0, "x2": 100.0, "y2": 100.0}],
-            ctx=None,
-        ))
+        result = _run(
+            tools["pcb_delete_tracks"](
+                pcb_path=board_with_tracks,
+                segments=[{"x1": 99.0, "y1": 99.0, "x2": 100.0, "y2": 100.0}],
+                ctx=None,
+            )
+        )
         assert result["deleted_count"] == 0
-        # not_found expects segments list items
-        assert len(result.get("not_found", [])) >= 1 or result["deleted_count"] == 0
+        assert len(result.get("not_found", [])) >= 1
+
+    def test_layer_filter_does_not_match_other_layer(self, tools, board_with_tracks):
+        """Segment on F.Cu should not be deleted when filtering for B.Cu."""
+        result = _run(
+            tools["pcb_delete_tracks"](
+                pcb_path=board_with_tracks,
+                segments=[{"x1": 10.0, "y1": 20.0, "x2": 20.0, "y2": 20.0, "layer": "B.Cu"}],
+                ctx=None,
+            )
+        )
+        # VCC segment (10,20)→(20,20) is on F.Cu, not B.Cu → not found
+        assert result["deleted_count"] == 0
+        assert len(result.get("not_found", [])) >= 1
+
+    def test_layer_filter_matches_correct_layer(self, tools, board_with_tracks):
+        """Segment on B.Cu should be deleted when filtering for B.Cu."""
+        result = _run(
+            tools["pcb_delete_tracks"](
+                pcb_path=board_with_tracks,
+                segments=[{"x1": 50.0, "y1": 50.0, "x2": 60.0, "y2": 50.0, "layer": "B.Cu"}],
+                ctx=None,
+            )
+        )
+        assert result["deleted_count"] == 1
+        assert result["backup_path"] is not None
 
 
 class TestPcbDeleteVias:
@@ -138,27 +175,33 @@ class TestPcbDeleteVias:
         assert result["backup_path"] is None
 
     def test_delete_single_via(self, tools, board_with_tracks):
-        result = _run(tools["pcb_delete_vias"](
-            pcb_path=board_with_tracks,
-            vias=[{"x": 20.0, "y": 20.0}],
-            ctx=None,
-        ))
+        result = _run(
+            tools["pcb_delete_vias"](
+                pcb_path=board_with_tracks,
+                vias=[{"x": 20.0, "y": 20.0}],
+                ctx=None,
+            )
+        )
         assert result["deleted_count"] == 1
         assert result["backup_path"] is not None
 
     def test_delete_multiple_vias(self, tools, board_with_tracks):
-        result = _run(tools["pcb_delete_vias"](
-            pcb_path=board_with_tracks,
-            vias=[{"x": 20.0, "y": 20.0}, {"x": 35.0, "y": 10.0}],
-            ctx=None,
-        ))
+        result = _run(
+            tools["pcb_delete_vias"](
+                pcb_path=board_with_tracks,
+                vias=[{"x": 20.0, "y": 20.0}, {"x": 35.0, "y": 10.0}],
+                ctx=None,
+            )
+        )
         assert result["deleted_count"] == 2
 
     def test_not_found_reported(self, tools, board_with_tracks):
-        result = _run(tools["pcb_delete_vias"](
-            pcb_path=board_with_tracks,
-            vias=[{"x": 99.0, "y": 99.0}],
-            ctx=None,
-        ))
+        result = _run(
+            tools["pcb_delete_vias"](
+                pcb_path=board_with_tracks,
+                vias=[{"x": 99.0, "y": 99.0}],
+                ctx=None,
+            )
+        )
         assert result["deleted_count"] == 0
         assert len(result["not_found"]) >= 1

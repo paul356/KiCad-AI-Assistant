@@ -331,8 +331,16 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
             layer_node = _find_sub(item, "layer")
             if start_node is None or end_node is None:
                 continue
-            sx = float(start_node[1]) if not isinstance(start_node[1], str) else float(str(start_node[1]))
-            sy = float(start_node[2]) if not isinstance(start_node[2], str) else float(str(start_node[2]))
+            sx = (
+                float(start_node[1])
+                if not isinstance(start_node[1], str)
+                else float(str(start_node[1]))
+            )
+            sy = (
+                float(start_node[2])
+                if not isinstance(start_node[2], str)
+                else float(str(start_node[2]))
+            )
             ex = float(end_node[1]) if not isinstance(end_node[1], str) else float(str(end_node[1]))
             ey = float(end_node[2]) if not isinstance(end_node[2], str) else float(str(end_node[2]))
             item_layer = str(layer_node[1]) if layer_node and len(layer_node) >= 2 else None
@@ -349,9 +357,15 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
                 dy2 = float(desc["y2"])
                 d_layer = desc.get("layer")
             except (KeyError, TypeError, ValueError) as exc:
-                not_found.append({"x1": desc.get("x1"), "y1": desc.get("y1"),
-                                  "x2": desc.get("x2"), "y2": desc.get("y2"),
-                                  "error": str(exc)})
+                not_found.append(
+                    {
+                        "x1": desc.get("x1"),
+                        "y1": desc.get("y1"),
+                        "x2": desc.get("x2"),
+                        "y2": desc.get("y2"),
+                        "error": str(exc),
+                    }
+                )
                 continue
 
             matched = False
@@ -359,8 +373,18 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
                 if idx in to_remove:
                     continue
                 # Check endpoint match (either direction)
-                forward = abs(sx - dx1) < tol and abs(sy - dy1) < tol and abs(ex - dx2) < tol and abs(ey - dy2) < tol
-                backward = abs(sx - dx2) < tol and abs(sy - dy2) < tol and abs(ex - dx1) < tol and abs(ey - dy1) < tol
+                forward = (
+                    abs(sx - dx1) < tol
+                    and abs(sy - dy1) < tol
+                    and abs(ex - dx2) < tol
+                    and abs(ey - dy2) < tol
+                )
+                backward = (
+                    abs(sx - dx2) < tol
+                    and abs(sy - dy2) < tol
+                    and abs(ex - dx1) < tol
+                    and abs(ey - dy1) < tol
+                )
                 if not forward and not backward:
                     continue
                 # Optional layer filter
@@ -426,8 +450,11 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
         """
         if not vias:
             return {
-                "deleted_count": 0, "matched_count": 0,
-                "not_found": [], "backup_path": None, "pcb_path": pcb_path,
+                "deleted_count": 0,
+                "matched_count": 0,
+                "not_found": [],
+                "backup_path": None,
+                "pcb_path": pcb_path,
             }
 
         data = load_pcb(pcb_path)
@@ -472,9 +499,11 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
 
         if not to_remove:
             return {
-                "deleted_count": 0, "matched_count": 0,
+                "deleted_count": 0,
+                "matched_count": 0,
                 "not_found": not_found,
-                "backup_path": None, "pcb_path": pcb_path,
+                "backup_path": None,
+                "pcb_path": pcb_path,
             }
 
         for idx in sorted(to_remove, reverse=True):

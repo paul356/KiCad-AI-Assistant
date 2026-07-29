@@ -651,7 +651,8 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
         # ── Zone coverage: pads inside a filled copper pour on the same
         #     net+layer are considered connected (zone acts as a plane). ──
         try:
-            from shapely.geometry import Point as ShapelyPoint, Polygon as ShapelyPolygon
+            from shapely.geometry import Point as ShapelyPoint
+            from shapely.geometry import Polygon as ShapelyPolygon
         except ImportError:
             ShapelyPoint = ShapelyPolygon = None  # type: ignore[assignment]
 
@@ -662,7 +663,6 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
                 zone_net = ""
                 polygon_pts: list[tuple[float, float]] = []
                 is_keepout = False
-                collecting = False
                 for sub in item:
                     if not isinstance(sub, list) or len(sub) < 2:
                         continue
@@ -679,23 +679,28 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
                     elif zk == "keepout":
                         is_keepout = True
                     elif zk == "polygon":
-                        collecting = True
-                        polygon_pts = []
-                    elif zk == "pts" and collecting:
-                        for xy in sub[1:]:
-                            if isinstance(xy, list) and len(xy) >= 3 and _sym(xy[0]) == "xy":
-                                polygon_pts.append((float(xy[1]), float(xy[2])))
+                        # First polygon only — the outline
+                        for psub in sub[1:]:
+                            if isinstance(psub, list) and _sym(psub[0]) == "pts":
+                                pts = []
+                                for pt in psub[1:]:
+                                    if (
+                                        isinstance(pt, list)
+                                        and len(pt) >= 3
+                                        and _sym(pt[0]) == "xy"
+                                    ):
+                                        pts.append((float(pt[1]), float(pt[2])))
+                                polygon_pts = pts
+                                break
                 if is_keepout or not zone_net or len(polygon_pts) < 3:
                     continue
                 try:
                     zone_poly = ShapelyPolygon(polygon_pts)
-                except Exception:
+                except (ValueError, TypeError):
                     continue
                 # Mark any pad on the same net that falls inside the zone
                 # polygon as connected (copper pour acts as a plane).
-                for pad_idx, (ref, pad_num, px, py) in enumerate(
-                    pads_by_net.get(zone_net, [])
-                ):
+                for pad_idx, (ref, pad_num, px, py) in enumerate(pads_by_net.get(zone_net, [])):
                     pt = ShapelyPoint(px, py)
                     if zone_poly.covers(pt):
                         track_endpoints.add((zone_net, _rounded(px), _rounded(py)))
@@ -715,13 +720,15 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
             if get_connected_pads:
                 for i in connected_indices:
                     ref, pad_num, px, py = pad_list[i]
-                    connected_pads.append({
-                        "net": net_name,
-                        "ref": ref,
-                        "pad": pad_num,
-                        "x": px,
-                        "y": py,
-                    })
+                    connected_pads.append(
+                        {
+                            "net": net_name,
+                            "ref": ref,
+                            "pad": pad_num,
+                            "x": px,
+                            "y": py,
+                        }
+                    )
             disconnected = [p for i, p in enumerate(pad_list) if i not in connected_indices]
             # Report all disconnected pairs (not just first)
             for i in range(len(disconnected)):
@@ -1031,8 +1038,16 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
             if start_node is None or end_node is None:
                 continue
 
-            sx = float(start_node[1]) if not isinstance(start_node[1], str) else float(str(start_node[1]))
-            sy = float(start_node[2]) if not isinstance(start_node[2], str) else float(str(start_node[2]))
+            sx = (
+                float(start_node[1])
+                if not isinstance(start_node[1], str)
+                else float(str(start_node[1]))
+            )
+            sy = (
+                float(start_node[2])
+                if not isinstance(start_node[2], str)
+                else float(str(start_node[2]))
+            )
             ex = float(end_node[1]) if not isinstance(end_node[1], str) else float(str(end_node[1]))
             ey = float(end_node[2]) if not isinstance(end_node[2], str) else float(str(end_node[2]))
             sw = float(width_node[1]) if width_node and len(width_node) >= 2 else 0.0
@@ -1044,10 +1059,17 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
             if layer is not None and item_layer != layer:
                 continue
 
-            raw_segs.append({
-                "x1": sx, "y1": sy, "x2": ex, "y2": ey,
-                "width": sw, "layer": item_layer, "net": item_net,
-            })
+            raw_segs.append(
+                {
+                    "x1": sx,
+                    "y1": sy,
+                    "x2": ex,
+                    "y2": ey,
+                    "width": sw,
+                    "layer": item_layer,
+                    "net": item_net,
+                }
+            )
 
         if not raw_segs:
             return {"traces": [], "segment_count": 0, "trace_count": 0}
@@ -1085,9 +1107,13 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
                 abs_y = fp_y - rel_x * sin_t + rel_y * cos_t
                 rkey = (round(abs_x, 2), round(abs_y, 2))
                 pad_centres.add(rkey)
-                pad_at.setdefault(rkey, []).append({
-                    "ref": ref, "pad": str(pad_num), "net": net_key,
-                })
+                pad_at.setdefault(rkey, []).append(
+                    {
+                        "ref": ref,
+                        "pad": str(pad_num),
+                        "net": net_key,
+                    }
+                )
 
         # ── Build adjacency ──────────────────────────────────────────
         # Each segment has two endpoints (a, b).  Two segments share an
@@ -1100,10 +1126,7 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
         def _pt(p: tuple[float, float], q: tuple[float, float]) -> bool:
             return abs(p[0] - q[0]) < tol and abs(p[1] - q[1]) < tol
 
-        seg_pts = [
-            ((s["x1"], s["y1"]), (s["x2"], s["y2"]))
-            for s in raw_segs
-        ]
+        seg_pts = [((s["x1"], s["y1"]), (s["x2"], s["y2"])) for s in raw_segs]
 
         for i in range(n):
             a1, b1 = seg_pts[i]
@@ -1184,9 +1207,7 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
                 s = raw_segs[start_idx]
                 # Prefer starting from a leaf endpoint (degree 1)
                 ep_a = (round(s["x1"], 2), round(s["y1"], 2))
-                ep_b = (round(s["x2"], 2), round(s["y2"], 2))
                 deg_a = len(merged_map.get(ep_a, []))
-                deg_b = len(merged_map.get(ep_b, []))
 
                 if deg_a == 1:
                     cur_pt = (s["x1"], s["y1"])
@@ -1241,12 +1262,20 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
                 for i in range(len(poly) - 1):
                     a, b = poly[i], poly[i + 1]
                     for s in raw_segs:
-                        if (abs(s["x1"] - a[0]) < tol and abs(s["y1"] - a[1]) < tol
-                                and abs(s["x2"] - b[0]) < tol and abs(s["y2"] - b[1]) < tol):
+                        if (
+                            abs(s["x1"] - a[0]) < tol
+                            and abs(s["y1"] - a[1]) < tol
+                            and abs(s["x2"] - b[0]) < tol
+                            and abs(s["y2"] - b[1]) < tol
+                        ):
                             segs_in_poly.append({"start": a, "end": b, "width": s["width"]})
                             break
-                        elif (abs(s["x1"] - b[0]) < tol and abs(s["y1"] - b[1]) < tol
-                              and abs(s["x2"] - a[0]) < tol and abs(s["y2"] - a[1]) < tol):
+                        elif (
+                            abs(s["x1"] - b[0]) < tol
+                            and abs(s["y1"] - b[1]) < tol
+                            and abs(s["x2"] - a[0]) < tol
+                            and abs(s["y2"] - a[1]) < tol
+                        ):
                             segs_in_poly.append({"start": a, "end": b, "width": s["width"]})
                             break
                 polylines_out.append(segs_in_poly)
@@ -1263,14 +1292,16 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
                             seen_pads.add(key)
                             trace_pads.append(p)
 
-            result.append({
-                "width": raw_segs[comp[0]]["width"],
-                "layer": raw_segs[comp[0]]["layer"],
-                "net": raw_segs[comp[0]]["net"],
-                "segment_count": len(comp),
-                "segments": [seg for poly in polylines_out for seg in poly],
-                "pads": trace_pads,
-            })
+            result.append(
+                {
+                    "width": raw_segs[comp[0]]["width"],
+                    "layer": raw_segs[comp[0]]["layer"],
+                    "net": raw_segs[comp[0]]["net"],
+                    "segment_count": len(comp),
+                    "segments": [seg for poly in polylines_out for seg in poly],
+                    "pads": trace_pads,
+                }
+            )
 
         return {
             "traces": result,
@@ -1323,11 +1354,16 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
             if net is not None and item_net != net:
                 continue
 
-            vias.append({
-                "x": vx, "y": vy,
-                "diameter": vs, "drill": vd,
-                "layers": via_layers, "net": item_net,
-            })
+            vias.append(
+                {
+                    "x": vx,
+                    "y": vy,
+                    "diameter": vs,
+                    "drill": vd,
+                    "layers": via_layers,
+                    "net": item_net,
+                }
+            )
 
         return {"vias": vias, "count": len(vias)}
 
@@ -1361,6 +1397,12 @@ def _resolve_net_data(
         if f.startswith(base + ".") and re.match(r".+\.kicad_pro$", f):
             pro_path = os.path.join(d, f)
             break
+
+    # Always set netclass/type (to None if .kicad_pro unavailable)
+    for net_name in nets_by_name:
+        nets_by_name[net_name].setdefault("netclass", None)
+        nets_by_name[net_name].setdefault("type", None)
+
     if pro_path is None or not os.path.isfile(pro_path):
         return
 
@@ -1389,6 +1431,7 @@ def _resolve_net_data(
 
     # Pattern-based assignments (first match wins)
     import fnmatch
+
     for p in ns.get("netclass_patterns", []):
         if not isinstance(p, dict):
             continue
@@ -1405,9 +1448,7 @@ def _resolve_net_data(
         r"VCC|VDD|VEE|VBAT|3V3|3\.3V|5V|12V|\bPWR\b|AVCC|DVCC|VUSB",
         re.IGNORECASE,
     )
-    _GROUND_RE = re.compile(
-        r"VSS|VEE|GND|AGND|DGND|PGND|VSS", re.IGNORECASE
-    )
+    _GROUND_RE = re.compile(r"VSS|VEE|GND|AGND|DGND|PGND|VSS", re.IGNORECASE)
 
     for net_name, entry in nets_by_name.items():
         entry["netclass"] = net_to_class.get(net_name)
