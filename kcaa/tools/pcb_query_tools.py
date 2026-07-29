@@ -1068,6 +1068,22 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
 
                 polylines.append(poly)
 
+            polylines_out = []
+            for poly in polylines:
+                segs_in_poly = []
+                for i in range(len(poly) - 1):
+                    a, b = poly[i], poly[i + 1]
+                    for s in raw_segs:
+                        if (abs(s["x1"] - a[0]) < tol and abs(s["y1"] - a[1]) < tol
+                                and abs(s["x2"] - b[0]) < tol and abs(s["y2"] - b[1]) < tol):
+                            segs_in_poly.append({"start": a, "end": b, "width": s["width"]})
+                            break
+                        elif (abs(s["x1"] - b[0]) < tol and abs(s["y1"] - b[1]) < tol
+                              and abs(s["x2"] - a[0]) < tol and abs(s["y2"] - a[1]) < tol):
+                            segs_in_poly.append({"start": a, "end": b, "width": s["width"]})
+                            break
+                polylines_out.append(segs_in_poly)
+
             result.append({
                 "width": raw_segs[comp[0]]["width"],
                 "layer": raw_segs[comp[0]]["layer"],
@@ -1075,6 +1091,7 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
                 "segment_count": len(comp),
                 "polyline_count": len(polylines),
                 "polylines": [[round(p, 4) for p in poly] for poly in polylines],
+                "segments": [seg for poly in polylines_out for seg in poly],
             })
 
         return {
