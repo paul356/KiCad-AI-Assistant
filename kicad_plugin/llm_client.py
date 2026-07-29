@@ -15,7 +15,9 @@ import logging
 import os
 from pathlib import Path
 import platform
+import random
 import subprocess  # nosec B404 -- controlled subprocess execution, no user input
+import time
 from typing import Any
 
 from .tool_registry import get_missing_tool_policies, get_tool_policy
@@ -505,6 +507,25 @@ def call_mcp_tool(base_url: str, tool_name: str, arguments: dict[str, Any]) -> d
         except json.JSONDecodeError:
             return {"success": True, "text": content[0]["text"]}
     return result
+
+
+def _is_retryable_llm_error(error: str) -> bool:
+    """Return True if *error* indicates a transient server-side issue worth retrying."""
+    lower = error.lower()
+    return any(
+        kw in lower
+        for kw in (
+            "503",
+            "502",
+            "service_unavailable",
+            "service is too busy",
+            "server error",
+            "internal server error",
+            "bad gateway",
+            "rate limit",
+            "429",
+        )
+    )
 
 
 @dataclass
@@ -1378,17 +1399,40 @@ class LLMClient:
             total_payload,
         )
         self._validate_history()  # guard against corrupted history before every API call
-        if provider == "ollama":
-            if on_text_delta is not None:
-                return self._stream_ollama(system, tools, on_text_delta)
-            return self._call_ollama(system, tools)
-        if on_text_delta is not None:
-            if provider == "anthropic":
-                return self._stream_anthropic(system, tools, on_text_delta)
-            return self._stream_openai(system, tools, on_text_delta)
-        if provider == "anthropic":
-            return self._call_anthropic(system, tools)
-        return self._call_openai(system, tools)
+        max_retries = 3
+        for attempt in range(max_retries):
+            if provider == "ollama":
+                if on_text_delta is not None:
+                    response = self._stream_ollama(system, tools, on_text_delta)
+                else:
+                    response = self._call_ollama(system, tools)
+            elif on_text_delta is not None:
+                if provider == "anthropic":
+                    response = self._stream_anthropic(system, tools, on_text_delta)
+                else:
+                    response = self._stream_openai(system, tools, on_text_delta)
+            elif provider == "anthropic":
+                response = self._call_anthropic(system, tools)
+            else:
+                response = self._call_openai(system, tools)
+
+            error = response.get("error") if isinstance(response, dict) else None
+            if error and _is_retryable_llm_error(error):
+                if attempt < max_retries - 1:
+                    delay = 1.0 + random.uniform(-0.5, 0.5)  # nosec B311 -- retry jitter, not cryptographic
+                    delay = max(0.1, delay)
+                    log.warning(
+                        "LLM retry %d/%d — waiting %.1fs: %s",
+                        attempt + 1,
+                        max_retries - 1,
+                        delay,
+                        error[:120],
+                    )
+                    time.sleep(delay)
+                    continue
+            return response
+
+        return response  # unreachable; placate static analysis
 
     def _build_anthropic_messages(self) -> list[dict]:
         """Convert self._history from OpenAI format to Anthropic message format.
