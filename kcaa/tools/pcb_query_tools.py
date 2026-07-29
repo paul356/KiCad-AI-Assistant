@@ -873,11 +873,15 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
         net: str | None = None,
         layer: str | None = None,
     ) -> dict[str, Any]:
-        """List all track segments on the PCB, optionally filtered.
+        """List all track segments on the PCB, grouped by trace connectivity.
 
-        Returns every ``(segment ...)`` entry with its endpoint
-        coordinates, width, layer, and net.  When ``net`` and/or
-        ``layer`` are provided, only matching segments are returned.
+        Returns segments grouped into **traces** — two segments belong to
+        the same trace when they share an endpoint (within 0.01 mm).
+        Segments within each trace are ordered end-to-end as polylines.
+        A trace with a T-junction branches into multiple polylines.
+
+        When ``net`` and/or ``layer`` are provided, only matching segments
+        are considered (and traces that cross layers or nets don't merge).
 
         Args:
             pcb_path: Absolute path to the .kicad_pcb file.
@@ -886,15 +890,21 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
             layer: Optional copper layer filter (e.g. ``"F.Cu"``).
 
         Returns:
-            dict with ``tracks`` (list of segment dicts) and ``count``.
+            dict with:
+                traces: list of trace groups.  Each trace has ``polylines``
+                    (list of point-lists) and shared metadata
+                    ``width``, ``layer``, ``net``.
+                segment_count: total number of segments.
+                trace_count: number of connected trace groups.
         """
         data = load_pcb(pcb_path)
+        tol = 0.01  # mm — same as delete tools
 
-        tracks: list[dict[str, Any]] = []
+        # ── Collect all raw segment entries ──────────────────────────
+        raw_segs: list[dict[str, Any]] = []
         for item in data:
             if not (isinstance(item, list) and len(item) > 0 and _sym(item[0]) == "segment"):
                 continue
-
             start_node = _find_sub_pq(item, "start")
             end_node = _find_sub_pq(item, "end")
             width_node = _find_sub_pq(item, "width")
@@ -916,12 +926,162 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
             if layer is not None and item_layer != layer:
                 continue
 
-            tracks.append({
+            raw_segs.append({
                 "x1": sx, "y1": sy, "x2": ex, "y2": ey,
                 "width": sw, "layer": item_layer, "net": item_net,
             })
 
-        return {"tracks": tracks, "count": len(tracks)}
+        if not raw_segs:
+            return {"traces": [], "segment_count": 0, "trace_count": 0}
+
+        # ── Build adjacency ──────────────────────────────────────────
+        # Each segment has two endpoints (a, b).  Two segments share an
+        # endpoint if any endpoint pair is within tol.
+        n = len(raw_segs)
+        adj: list[list[int]] = [[] for _ in range(n)]
+
+        def _pt(p: tuple[float, float], q: tuple[float, float]) -> bool:
+            return abs(p[0] - q[0]) < tol and abs(p[1] - q[1]) < tol
+
+        seg_pts = [
+            ((s["x1"], s["y1"]), (s["x2"], s["y2"]))
+            for s in raw_segs
+        ]
+
+        for i in range(n):
+            a1, b1 = seg_pts[i]
+            for j in range(i + 1, n):
+                # Only connect if same layer + net (don't bridge different nets)
+                if raw_segs[i]["layer"] != raw_segs[j]["layer"]:
+                    continue
+                if raw_segs[i]["net"] != raw_segs[j]["net"]:
+                    continue
+                a2, b2 = seg_pts[j]
+                if _pt(a1, a2) or _pt(a1, b2) or _pt(b1, a2) or _pt(b1, b2):
+                    adj[i].append(j)
+                    adj[j].append(i)
+
+        # ── Find connected components (traces) ────────────────────────
+        visited = [False] * n
+        traces: list[list[int]] = []
+
+        for i in range(n):
+            if visited[i]:
+                continue
+            comp: list[int] = []
+            stack = [i]
+            visited[i] = True
+            while stack:
+                v = stack.pop()
+                comp.append(v)
+                for u in adj[v]:
+                    if not visited[u]:
+                        visited[u] = True
+                        stack.append(u)
+            traces.append(comp)
+
+        # ── Order each trace into polylines ───────────────────────────
+        result: list[dict[str, Any]] = []
+        for comp in traces:
+            # Build dense degree info for endpoints within this component
+            # endpoint → list of segment indices
+            ep_map: dict[tuple[float, float], list[int]] = {}
+            for idx in comp:
+                s = raw_segs[idx]
+                p1 = (s["x1"], s["y1"])
+                p2 = (s["x2"], s["y2"])
+                ep_map.setdefault(p1, []).append(idx)
+                ep_map.setdefault(p2, []).append(idx)
+
+            # Deduplicate endpoints that are within tol of each other
+            # (simple: round to 0.01mm grid for binning)
+            bins: dict[tuple[float, float], list[tuple[float, float]]] = {}
+            for ep in ep_map:
+                key = (round(ep[0], 2), round(ep[1], 2))
+                bins.setdefault(key, []).append(ep)
+            merged_map: dict[tuple[float, float], list[int]] = {}
+            for key, pts in bins.items():
+                merged_ep = pts[0]
+                merged_list: list[int] = []
+                for p in pts:
+                    merged_list.extend(ep_map[p])
+                merged_map[merged_ep] = list(set(merged_list))
+
+            # Walk polylines — start from leaf endpoints (degree 1)
+            remaining = set(comp)
+            polylines: list[list[tuple[float, float]]] = []
+
+            while remaining:
+                # Pick a start segment
+                start_idx = next(iter(remaining))
+                s = raw_segs[start_idx]
+                # Prefer starting from a leaf endpoint (degree 1)
+                ep_a = (round(s["x1"], 2), round(s["y1"], 2))
+                ep_b = (round(s["x2"], 2), round(s["y2"], 2))
+                deg_a = len(merged_map.get(ep_a, []))
+                deg_b = len(merged_map.get(ep_b, []))
+
+                if deg_a == 1:
+                    cur_pt = (s["x1"], s["y1"])
+                    next_pt = (s["x2"], s["y2"])
+                else:
+                    cur_pt = (s["x2"], s["y2"])
+                    next_pt = (s["x1"], s["y1"])
+
+                poly = [cur_pt, next_pt]
+                remaining.remove(start_idx)
+
+                # Walk forward from next_pt
+                changed = True
+                while changed:
+                    changed = False
+                    rkey = (round(next_pt[0], 2), round(next_pt[1], 2))
+                    neighbors = [i for i in merged_map.get(rkey, []) if i in remaining]
+                    if len(neighbors) == 1:
+                        nxt = neighbors[0]
+                        s2 = raw_segs[nxt]
+                        # Determine other endpoint
+                        if _pt((s2["x1"], s2["y1"]), next_pt):
+                            next_pt = (s2["x2"], s2["y2"])
+                        else:
+                            next_pt = (s2["x1"], s2["y1"])
+                        poly.append(next_pt)
+                        remaining.remove(nxt)
+                        changed = True
+
+                # Try walking backward from cur_pt
+                changed = True
+                while changed:
+                    changed = False
+                    ckey = (round(cur_pt[0], 2), round(cur_pt[1], 2))
+                    neighbors = [i for i in merged_map.get(ckey, []) if i in remaining]
+                    if len(neighbors) == 1:
+                        nxt = neighbors[0]
+                        s2 = raw_segs[nxt]
+                        if _pt((s2["x1"], s2["y1"]), cur_pt):
+                            cur_pt = (s2["x2"], s2["y2"])
+                        else:
+                            cur_pt = (s2["x1"], s2["y1"])
+                        poly.insert(0, cur_pt)
+                        remaining.remove(nxt)
+                        changed = True
+
+                polylines.append(poly)
+
+            result.append({
+                "width": raw_segs[comp[0]]["width"],
+                "layer": raw_segs[comp[0]]["layer"],
+                "net": raw_segs[comp[0]]["net"],
+                "segment_count": len(comp),
+                "polyline_count": len(polylines),
+                "polylines": [[round(p, 4) for p in poly] for poly in polylines],
+            })
+
+        return {
+            "traces": result,
+            "segment_count": n,
+            "trace_count": len(result),
+        }
 
     @mcp.tool()
     async def list_vias(
