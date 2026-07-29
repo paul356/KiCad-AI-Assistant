@@ -9,7 +9,7 @@ import logging
 import os
 import re
 
-from kcaa.utils.config import LibraryPathConfig
+from kcaa.utils.config import ServerConfig
 from kcaa.utils.skip_compat import safe_source_file
 
 log = logging.getLogger(__name__)
@@ -39,8 +39,8 @@ class LibraryTableEntry:
 class SymbolIndexReader:
     """Reads the KiCad sym-lib-table file and returns its library entries."""
 
-    def __init__(self, config: LibraryPathConfig | None = None):
-        self._config = config or LibraryPathConfig()
+    def __init__(self, config: ServerConfig | None = None):
+        self._config = config or ServerConfig()
 
     # ------------------------------------------------------------------
     # Public API

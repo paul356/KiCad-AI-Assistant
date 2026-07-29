@@ -31,6 +31,7 @@ import hashlib
 import logging
 import os
 from pathlib import Path
+import threading
 import time
 
 from kcaa.utils.footprint_database import (
@@ -332,6 +333,7 @@ class FootprintIndexManager:
 # ---------------------------------------------------------------------------
 
 _singleton: FootprintIndexManager | None = None
+_singleton_lock = threading.Lock()
 
 
 def get_footprint_index_manager(
@@ -342,10 +344,14 @@ def get_footprint_index_manager(
     On first call the manager is created with the default DB path.
     If ``project_path`` is provided it is forwarded to
     ``build_effective_library_list`` so project-local libraries are included.
+
+    Thread-safe (double-checked locking).
     """
     global _singleton
     if _singleton is None:
-        _singleton = FootprintIndexManager(project_path=project_path)
+        with _singleton_lock:
+            if _singleton is None:
+                _singleton = FootprintIndexManager(project_path=project_path)
     elif project_path is not None:
         _singleton._project_path = project_path
     return _singleton

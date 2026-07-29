@@ -15,7 +15,7 @@ from typing import Any
 
 import sexpdata
 
-from kcaa.utils.config import LibraryPathConfig
+from kcaa.utils.config import ServerConfig
 
 log = logging.getLogger(__name__)
 
@@ -73,13 +73,13 @@ def _build_env_map(project_dir: str | None = None) -> dict[str, str]:
     """Build a dict of KiCad ``${VAR}`` substitutions for fp-lib-table URIs.
 
     Sources, in increasing precedence:
-      1. Defaults from :class:`LibraryPathConfig` (KICAD{N}_SYMBOL_DIR,
+      1. Defaults from :class:`ServerConfig` (KICAD{N}_SYMBOL_DIR,
          KICAD{N}_FOOTPRINT_DIR, KICAD{N}_TEMPLATE_DIR, KICAD{N}_3RD_PARTY) —
          derived from KICAD_APP_PATH or an auto-detected AppImage mount.
       2. Any ``KICAD*`` environment variables set in the current process.
       3. ``KIPRJMOD`` set to *project_dir* if given.
     """
-    env: dict[str, str] = LibraryPathConfig().get_env_vars()
+    env: dict[str, str] = ServerConfig().get_env_vars()
     for key, val in os.environ.items():
         if key.startswith("KICAD"):
             env[key] = val
