@@ -40,6 +40,7 @@ import pytest
 
 FIXTURE_DIR = os.path.join(os.path.dirname(__file__), "fixtures")
 BOARD_FIXTURE = os.path.join(FIXTURE_DIR, "test_board.kicad_pcb")
+TRACKS_FIXTURE = os.path.join(FIXTURE_DIR, "test_board_with_tracks.kicad_pcb")
 
 # ---------------------------------------------------------------------------
 # Transport helpers (duplicated from test_plugin_smoke for self-containment)
@@ -803,3 +804,67 @@ class TestGetFootprintDetails:
             },
         )
         assert "error" in result
+
+
+class TestListTracks:
+    FIXTURE = TRACKS_FIXTURE
+
+    def test_returns_traces(self, mcp_server):
+        port, sid = mcp_server
+        result = _call_tool(port, sid, "list_tracks", {"pcb_path": self.FIXTURE})
+        assert "traces" in result
+        assert "segment_count" in result
+        assert "trace_count" in result
+        assert result["segment_count"] >= 1
+
+    def test_traces_have_structure(self, mcp_server):
+        port, sid = mcp_server
+        result = _call_tool(port, sid, "list_tracks", {"pcb_path": self.FIXTURE})
+        for trace in result["traces"]:
+            assert "width" in trace
+            assert "layer" in trace
+            assert "net" in trace
+            assert "segments" in trace
+            assert "pads" in trace
+            assert len(trace["segments"]) > 0
+
+    def test_filter_by_net(self, mcp_server):
+        port, sid = mcp_server
+        result = _call_tool(port, sid, "list_tracks", {"pcb_path": self.FIXTURE, "net": "GND"})
+        assert all(t["net"] == "GND" for t in result["traces"])
+
+
+class TestListVias:
+    FIXTURE = TRACKS_FIXTURE
+
+    def test_returns_vias(self, mcp_server):
+        port, sid = mcp_server
+        result = _call_tool(port, sid, "list_vias", {"pcb_path": self.FIXTURE})
+        assert "vias" in result
+        assert "count" in result
+        assert result["count"] == 2
+
+    def test_filter_by_net(self, mcp_server):
+        port, sid = mcp_server
+        result = _call_tool(port, sid, "list_vias", {"pcb_path": self.FIXTURE, "net": "VCC"})
+        assert result["count"] == 1
+        assert all(v["net"] == "VCC" for v in result["vias"])
+
+
+class TestGetRatsnestWithConnected:
+    FIXTURE = TRACKS_FIXTURE
+
+    def test_default_excludes_connected_pads(self, mcp_server):
+        port, sid = mcp_server
+        result = _call_tool(port, sid, "get_ratsnest", {"pcb_path": self.FIXTURE})
+        assert "connected_pads" not in result
+
+    def test_get_connected_pads_includes_key(self, mcp_server):
+        port, sid = mcp_server
+        result = _call_tool(
+            port, sid, "get_ratsnest",
+            {"pcb_path": self.FIXTURE, "get_connected_pads": True},
+        )
+        assert "connected_pads" in result
+        assert "connected_count" in result
+        assert isinstance(result["connected_pads"], list)

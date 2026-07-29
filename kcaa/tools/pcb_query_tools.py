@@ -1268,7 +1268,6 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
                 "layer": raw_segs[comp[0]]["layer"],
                 "net": raw_segs[comp[0]]["net"],
                 "segment_count": len(comp),
-                "polyline_count": len(polylines),
                 "segments": [seg for poly in polylines_out for seg in poly],
                 "pads": trace_pads,
             })
