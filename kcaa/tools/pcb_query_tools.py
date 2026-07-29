@@ -264,7 +264,10 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
         Returns:
             dict with reference, value, x/y/rotation (world, mm/deg CW+),
             layer, properties (dict of all property name→value), pads
-            (list of {number, type, shape, local_x, local_y, net_name}).
+            (list of {number, type, shape, local_x, local_y,
+             local_w, local_h, world_w, world_h, net_name}).
+             ``world_w``/``world_h`` account for pad rotation (KiCad 10
+             stores pad rotation as absolute board-space CW+).
         """
         data = load_pcb(pcb_path)
         try:
@@ -292,12 +295,24 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
             pad_type = sub[2] if isinstance(sub[2], str) else _sym(sub[2])
             pad_shape = sub[3] if isinstance(sub[3], str) else _sym(sub[3])
             pad_x, pad_y = 0.0, 0.0
+            pad_rot = 0.0
+            pad_w, pad_h = 0.0, 0.0
             net_name = ""
             for psub in sub:
                 if isinstance(psub, list) and len(psub) >= 3 and _sym(psub[0]) == "at":
                     pad_x, pad_y = float(psub[1]), float(psub[2])
+                    pad_rot = float(psub[3]) if len(psub) > 3 else 0.0
+                elif isinstance(psub, list) and len(psub) >= 3 and _sym(psub[0]) == "size":
+                    pad_w, pad_h = float(psub[1]), float(psub[2])
                 elif isinstance(psub, list) and len(psub) >= 2 and _sym(psub[0]) == "net":
                     _, net_name = _parse_net_ref(psub, {}, {})
+            # World-oriented size.
+            # Pad rotation in KiCad 10 is stored as absolute board-space
+            # (CW+), so we use it directly without adding fp rotation.
+            if abs(pad_rot % 180.0 - 90.0) < 0.1:
+                wworld, hworld = pad_h, pad_w
+            else:
+                wworld, hworld = pad_w, pad_h
             pads.append(
                 {
                     "number": str(pad_num),
@@ -305,6 +320,10 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
                     "shape": str(pad_shape),
                     "local_x": pad_x,
                     "local_y": pad_y,
+                    "local_w": pad_w,
+                    "local_h": pad_h,
+                    "world_w": wworld,
+                    "world_h": hworld,
                     "net_name": net_name,
                 }
             )
@@ -455,15 +474,28 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
         }
 
     @mcp.tool()
-    async def list_nets(pcb_path: str, ctx: Context | None) -> dict[str, Any]:
+    async def list_nets(
+        pcb_path: str,
+        ctx: Context | None,
+        classify: bool = False,
+    ) -> dict[str, Any]:
         """List all nets in a KiCad PCB board.
+
+        When *classify* is ``True``, each net also includes its
+        **netclass** (resolved from the matching ``.kicad_pro`` via
+        ``netclass_patterns``) and **type** (``"power"`` /
+        ``"ground"`` / ``"signal"``).
 
         Args:
             pcb_path: Absolute path to the .kicad_pcb file.
             ctx: MCP context for progress reporting.
+            classify: When ``True``, also resolve netclass and type.
+                Requires a ``.kicad_pro`` next to the ``.kicad_pcb``.
+                Default ``False`` for efficiency.
 
         Returns:
-            dict with nets: list of {net_id, name, pad_count}
+            dict with nets: list of {net_id, name, pad_count,
+             netclass (str or None), type (str or None)}.
         """
         data = load_pcb(pcb_path)
 
@@ -494,12 +526,20 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
                             entry["net_id"] = net_id
                         entry["pad_count"] += 1
 
+        # Optional: resolve netclass & type from .kicad_pro
+        if classify:
+            _resolve_net_data(nets_by_name, pcb_path)
+
         nets = sorted(nets_by_name.values(), key=_net_sort_key)
 
         return {"nets": nets, "count": len(nets)}
 
     @mcp.tool()
-    async def get_ratsnest(pcb_path: str, ctx: Context | None) -> dict[str, Any]:
+    async def get_ratsnest(
+        pcb_path: str,
+        ctx: Context | None,
+        get_connected_pads: bool = False,
+    ) -> dict[str, Any]:
         """Get unconnected pad pairs (ratsnest) for a KiCad PCB board.
 
         Identifies pads that share a net but are not yet connected by
@@ -517,12 +557,19 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
         Args:
             pcb_path: Absolute path to the .kicad_pcb file.
             ctx: MCP context for progress reporting.
+            get_connected_pads: When ``True``, also return ``connected_pads``
+                — pads that already have a track or via endpoint at their
+                centre.  Default ``False`` for efficiency.
 
         Returns:
             dict with:
                 unconnected: list of {net, from: {ref, pad, x, y}, to: {ref, pad, x, y}}
                     where x/y are world mm.
+                connected_pads: list of {net, ref, pad, x, y} (only when
+                    *get_connected_pads* is ``True``).
                 unconnected_count: number of unconnected pairs
+                connected_count: number of connected pads (0 when
+                    *get_connected_pads* is ``False``).
                 fully_routed: True if no unconnected pairs found
         """
         data = load_pcb(pcb_path)
@@ -601,9 +648,67 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
                                 (seg_net_key, _rounded(float(sub[1])), _rounded(float(sub[2])))
                             )
 
+        # ── Zone coverage: pads inside a filled copper pour on the same
+        #     net+layer are considered connected (zone acts as a plane). ──
+        try:
+            from shapely.geometry import Point as ShapelyPoint
+            from shapely.geometry import Polygon as ShapelyPolygon
+        except ImportError:
+            ShapelyPoint = ShapelyPolygon = None  # type: ignore[assignment]
+
+        if ShapelyPoint is not None:
+            for item in data:
+                if not (isinstance(item, list) and len(item) > 0 and _sym(item[0]) == "zone"):
+                    continue
+                zone_net = ""
+                polygon_pts: list[tuple[float, float]] = []
+                is_keepout = False
+                for sub in item:
+                    if not isinstance(sub, list) or len(sub) < 2:
+                        continue
+                    zk = _sym(sub[0])
+                    if zk == "net":
+                        if len(sub) >= 3:
+                            try:
+                                int(sub[1])
+                                zone_net = sub[2] if isinstance(sub[2], str) else _sym(sub[2])
+                            except (TypeError, ValueError):
+                                zone_net = sub[1] if isinstance(sub[1], str) else _sym(sub[1])
+                        elif len(sub) >= 2:
+                            zone_net = sub[1] if isinstance(sub[1], str) else _sym(sub[1])
+                    elif zk == "keepout":
+                        is_keepout = True
+                    elif zk == "polygon":
+                        # First polygon only — the outline
+                        for psub in sub[1:]:
+                            if isinstance(psub, list) and _sym(psub[0]) == "pts":
+                                pts = []
+                                for pt in psub[1:]:
+                                    if (
+                                        isinstance(pt, list)
+                                        and len(pt) >= 3
+                                        and _sym(pt[0]) == "xy"
+                                    ):
+                                        pts.append((float(pt[1]), float(pt[2])))
+                                polygon_pts = pts
+                                break
+                if is_keepout or not zone_net or len(polygon_pts) < 3:
+                    continue
+                try:
+                    zone_poly = ShapelyPolygon(polygon_pts)
+                except (ValueError, TypeError):
+                    continue
+                # Mark any pad on the same net that falls inside the zone
+                # polygon as connected (copper pour acts as a plane).
+                for pad_idx, (ref, pad_num, px, py) in enumerate(pads_by_net.get(zone_net, [])):
+                    pt = ShapelyPoint(px, py)
+                    if zone_poly.covers(pt):
+                        track_endpoints.add((zone_net, _rounded(px), _rounded(py)))
+
         # For each net with ≥2 pads, report ALL pairs where neither pad
         # has a track endpoint at its position (simple heuristic)
         unconnected = []
+        connected_pads: list[dict[str, Any]] = []
         for net_name, pad_list in sorted(pads_by_net.items()):
             if len(pad_list) < 2:
                 continue
@@ -612,6 +717,18 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
                 for i, (_, _, px, py) in enumerate(pad_list)
                 if (net_name, _rounded(px), _rounded(py)) in track_endpoints
             }
+            if get_connected_pads:
+                for i in connected_indices:
+                    ref, pad_num, px, py = pad_list[i]
+                    connected_pads.append(
+                        {
+                            "net": net_name,
+                            "ref": ref,
+                            "pad": pad_num,
+                            "x": px,
+                            "y": py,
+                        }
+                    )
             disconnected = [p for i, p in enumerate(pad_list) if i not in connected_indices]
             # Report all disconnected pairs (not just first)
             for i in range(len(disconnected)):
@@ -625,6 +742,14 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
                         }
                     )
 
+        if get_connected_pads:
+            return {
+                "unconnected": unconnected,
+                "connected_pads": connected_pads,
+                "unconnected_count": len(unconnected),
+                "connected_count": len(connected_pads),
+                "fully_routed": len(unconnected) == 0,
+            }
         return {
             "unconnected": unconnected,
             "unconnected_count": len(unconnected),
@@ -865,3 +990,498 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
             "ordered": ordered,
             "tier_counts": dict(tier_counts),
         }
+
+    @mcp.tool()
+    async def list_tracks(
+        pcb_path: str,
+        ctx: Context | None = None,
+        net: str | None = None,
+        layer: str | None = None,
+    ) -> dict[str, Any]:
+        """List all track segments on the PCB, grouped by trace connectivity.
+
+        Returns segments grouped into **traces** — two segments belong to
+        the same trace when they share an endpoint (within 0.01 mm).
+        Segments within each trace are ordered end-to-end as polylines.
+        A trace with a T-junction branches into multiple polylines.
+
+        When ``net`` and/or ``layer`` are provided, only matching segments
+        are considered (and traces that cross layers or nets don't merge).
+
+        Args:
+            pcb_path: Absolute path to the .kicad_pcb file.
+            ctx: MCP context (unused).
+            net: Optional net name filter (e.g. ``"VCC"``).
+            layer: Optional copper layer filter (e.g. ``"F.Cu"``).
+
+        Returns:
+            dict with:
+                traces: list of trace groups.  Each trace has ``polylines``
+                    (list of point-lists) and shared metadata
+                    ``width``, ``layer``, ``net``.
+                segment_count: total number of segments.
+                trace_count: number of connected trace groups.
+        """
+        data = load_pcb(pcb_path)
+        tol = 0.01  # mm — same as delete tools
+
+        # ── Collect all raw segment entries ──────────────────────────
+        raw_segs: list[dict[str, Any]] = []
+        for item in data:
+            if not (isinstance(item, list) and len(item) > 0 and _sym(item[0]) == "segment"):
+                continue
+            start_node = _find_sub_pq(item, "start")
+            end_node = _find_sub_pq(item, "end")
+            width_node = _find_sub_pq(item, "width")
+            layer_node = _find_sub_pq(item, "layer")
+            net_node = _find_sub_pq(item, "net")
+            if start_node is None or end_node is None:
+                continue
+
+            sx = (
+                float(start_node[1])
+                if not isinstance(start_node[1], str)
+                else float(str(start_node[1]))
+            )
+            sy = (
+                float(start_node[2])
+                if not isinstance(start_node[2], str)
+                else float(str(start_node[2]))
+            )
+            ex = float(end_node[1]) if not isinstance(end_node[1], str) else float(str(end_node[1]))
+            ey = float(end_node[2]) if not isinstance(end_node[2], str) else float(str(end_node[2]))
+            sw = float(width_node[1]) if width_node and len(width_node) >= 2 else 0.0
+            item_layer = str(layer_node[1]) if layer_node and len(layer_node) >= 2 else ""
+            item_net = _get_net_name_pq(net_node) if net_node else ""
+
+            if net is not None and item_net != net:
+                continue
+            if layer is not None and item_layer != layer:
+                continue
+
+            raw_segs.append(
+                {
+                    "x1": sx,
+                    "y1": sy,
+                    "x2": ex,
+                    "y2": ey,
+                    "width": sw,
+                    "layer": item_layer,
+                    "net": item_net,
+                }
+            )
+
+        if not raw_segs:
+            return {"traces": [], "segment_count": 0, "trace_count": 0}
+
+        # ── Collect pad centre positions (world coords) ──────────────
+        # Segments that meet at a pad centre are NOT connected (the
+        # connection goes through the pad, not directly segment-to-segment).
+        # Also build a reverse lookup: (rounded_x, rounded_y) → pad info.
+        pad_centres: set[tuple[float, float]] = set()
+        pad_at: dict[tuple[float, float], list[dict[str, Any]]] = {}
+        for item in data:
+            if not (isinstance(item, list) and len(item) > 0 and _sym(item[0]) == "footprint"):
+                continue
+            ref = get_fp_property(item, "Reference") or "?"
+            fp_x, fp_y, fp_rot_deg = get_fp_at(item)
+            theta = math.radians(fp_rot_deg)
+            cos_t = math.cos(theta)
+            sin_t = math.sin(theta)
+            for sub in item:
+                if not (isinstance(sub, list) and len(sub) >= 4 and _sym(sub[0]) == "pad"):
+                    continue
+                pad_num = sub[1] if isinstance(sub[1], str) else _sym(sub[1])
+                rel_x, rel_y = 0.0, 0.0
+                net_key = ""
+                for psub in sub:
+                    if isinstance(psub, list) and len(psub) >= 3 and _sym(psub[0]) == "at":
+                        with contextlib.suppress(ValueError, TypeError):
+                            rel_x, rel_y = float(psub[1]), float(psub[2])
+                    elif isinstance(psub, list) and len(psub) >= 2 and _sym(psub[0]) == "net":
+                        net_id, net_name = _parse_net_ref(psub, {}, {})
+                        net_key = net_name if net_name else ""
+                if not net_key:
+                    continue
+                abs_x = fp_x + rel_x * cos_t + rel_y * sin_t
+                abs_y = fp_y - rel_x * sin_t + rel_y * cos_t
+                rkey = (round(abs_x, 2), round(abs_y, 2))
+                pad_centres.add(rkey)
+                pad_at.setdefault(rkey, []).append(
+                    {
+                        "ref": ref,
+                        "pad": str(pad_num),
+                        "net": net_key,
+                    }
+                )
+
+        # ── Build adjacency ──────────────────────────────────────────
+        # Each segment has two endpoints (a, b).  Two segments share an
+        # endpoint if any endpoint pair is within tol — *unless* that
+        # point is a pad centre (connection goes through the pad, not
+        # directly segment-to-segment).
+        n = len(raw_segs)
+        adj: list[list[int]] = [[] for _ in range(n)]
+
+        def _pt(p: tuple[float, float], q: tuple[float, float]) -> bool:
+            return abs(p[0] - q[0]) < tol and abs(p[1] - q[1]) < tol
+
+        seg_pts = [((s["x1"], s["y1"]), (s["x2"], s["y2"])) for s in raw_segs]
+
+        for i in range(n):
+            a1, b1 = seg_pts[i]
+            for j in range(i + 1, n):
+                # Only connect if same layer + net (don't bridge different nets)
+                if raw_segs[i]["layer"] != raw_segs[j]["layer"]:
+                    continue
+                if raw_segs[i]["net"] != raw_segs[j]["net"]:
+                    continue
+                # Check if any pair of endpoints match
+                match_pt = None
+                if _pt(a1, seg_pts[j][0]) or _pt(a1, seg_pts[j][1]):
+                    match_pt = a1
+                elif _pt(b1, seg_pts[j][0]) or _pt(b1, seg_pts[j][1]):
+                    match_pt = b1
+                if match_pt is None:
+                    continue
+                # Don't connect across a pad centre
+                rkey = (round(match_pt[0], 2), round(match_pt[1], 2))
+                if rkey in pad_centres:
+                    continue
+                adj[i].append(j)
+                adj[j].append(i)
+
+        # ── Find connected components (traces) ────────────────────────
+        visited = [False] * n
+        traces: list[list[int]] = []
+
+        for i in range(n):
+            if visited[i]:
+                continue
+            comp: list[int] = []
+            stack = [i]
+            visited[i] = True
+            while stack:
+                v = stack.pop()
+                comp.append(v)
+                for u in adj[v]:
+                    if not visited[u]:
+                        visited[u] = True
+                        stack.append(u)
+            traces.append(comp)
+
+        # ── Order each trace into polylines ───────────────────────────
+        result: list[dict[str, Any]] = []
+        for comp in traces:
+            # Build dense degree info for endpoints within this component
+            # endpoint → list of segment indices
+            ep_map: dict[tuple[float, float], list[int]] = {}
+            for idx in comp:
+                s = raw_segs[idx]
+                p1 = (s["x1"], s["y1"])
+                p2 = (s["x2"], s["y2"])
+                ep_map.setdefault(p1, []).append(idx)
+                ep_map.setdefault(p2, []).append(idx)
+
+            # Deduplicate endpoints that are within tol of each other
+            # (simple: round to 0.01mm grid for binning)
+            bins: dict[tuple[float, float], list[tuple[float, float]]] = {}
+            for ep in ep_map:
+                key = (round(ep[0], 2), round(ep[1], 2))
+                bins.setdefault(key, []).append(ep)
+            merged_map: dict[tuple[float, float], list[int]] = {}
+            for key, pts in bins.items():
+                merged_ep = pts[0]
+                merged_list: list[int] = []
+                for p in pts:
+                    merged_list.extend(ep_map[p])
+                merged_map[merged_ep] = list(set(merged_list))
+
+            # Walk polylines — start from leaf endpoints (degree 1)
+            remaining = set(comp)
+            polylines: list[list[tuple[float, float]]] = []
+
+            while remaining:
+                # Pick a start segment
+                start_idx = next(iter(remaining))
+                s = raw_segs[start_idx]
+                # Prefer starting from a leaf endpoint (degree 1)
+                ep_a = (round(s["x1"], 2), round(s["y1"], 2))
+                deg_a = len(merged_map.get(ep_a, []))
+
+                if deg_a == 1:
+                    cur_pt = (s["x1"], s["y1"])
+                    next_pt = (s["x2"], s["y2"])
+                else:
+                    cur_pt = (s["x2"], s["y2"])
+                    next_pt = (s["x1"], s["y1"])
+
+                poly = [cur_pt, next_pt]
+                remaining.remove(start_idx)
+
+                # Walk forward from next_pt
+                changed = True
+                while changed:
+                    changed = False
+                    rkey = (round(next_pt[0], 2), round(next_pt[1], 2))
+                    neighbors = [i for i in merged_map.get(rkey, []) if i in remaining]
+                    if len(neighbors) == 1:
+                        nxt = neighbors[0]
+                        s2 = raw_segs[nxt]
+                        # Determine other endpoint
+                        if _pt((s2["x1"], s2["y1"]), next_pt):
+                            next_pt = (s2["x2"], s2["y2"])
+                        else:
+                            next_pt = (s2["x1"], s2["y1"])
+                        poly.append(next_pt)
+                        remaining.remove(nxt)
+                        changed = True
+
+                # Try walking backward from cur_pt
+                changed = True
+                while changed:
+                    changed = False
+                    ckey = (round(cur_pt[0], 2), round(cur_pt[1], 2))
+                    neighbors = [i for i in merged_map.get(ckey, []) if i in remaining]
+                    if len(neighbors) == 1:
+                        nxt = neighbors[0]
+                        s2 = raw_segs[nxt]
+                        if _pt((s2["x1"], s2["y1"]), cur_pt):
+                            cur_pt = (s2["x2"], s2["y2"])
+                        else:
+                            cur_pt = (s2["x1"], s2["y1"])
+                        poly.insert(0, cur_pt)
+                        remaining.remove(nxt)
+                        changed = True
+
+                polylines.append(poly)
+
+            polylines_out = []
+            for poly in polylines:
+                segs_in_poly = []
+                for i in range(len(poly) - 1):
+                    a, b = poly[i], poly[i + 1]
+                    for s in raw_segs:
+                        if (
+                            abs(s["x1"] - a[0]) < tol
+                            and abs(s["y1"] - a[1]) < tol
+                            and abs(s["x2"] - b[0]) < tol
+                            and abs(s["y2"] - b[1]) < tol
+                        ):
+                            segs_in_poly.append({"start": a, "end": b, "width": s["width"]})
+                            break
+                        elif (
+                            abs(s["x1"] - b[0]) < tol
+                            and abs(s["y1"] - b[1]) < tol
+                            and abs(s["x2"] - a[0]) < tol
+                            and abs(s["y2"] - a[1]) < tol
+                        ):
+                            segs_in_poly.append({"start": a, "end": b, "width": s["width"]})
+                            break
+                polylines_out.append(segs_in_poly)
+
+            # Collect pads connected to this trace's endpoints
+            trace_pads: list[dict[str, Any]] = []
+            seen_pads: set[tuple[str, str]] = set()
+            for poly in polylines:
+                for pt in (poly[0], poly[-1]):
+                    rkey = (round(pt[0], 2), round(pt[1], 2))
+                    for p in pad_at.get(rkey, []):
+                        key = (p["ref"], p["pad"])
+                        if key not in seen_pads:
+                            seen_pads.add(key)
+                            trace_pads.append(p)
+
+            result.append(
+                {
+                    "width": raw_segs[comp[0]]["width"],
+                    "layer": raw_segs[comp[0]]["layer"],
+                    "net": raw_segs[comp[0]]["net"],
+                    "segment_count": len(comp),
+                    "segments": [seg for poly in polylines_out for seg in poly],
+                    "pads": trace_pads,
+                }
+            )
+
+        return {
+            "traces": result,
+            "segment_count": n,
+            "trace_count": len(result),
+        }
+
+    @mcp.tool()
+    async def list_vias(
+        pcb_path: str,
+        ctx: Context | None = None,
+        net: str | None = None,
+    ) -> dict[str, Any]:
+        """List all through-hole vias on the PCB, optionally filtered.
+
+        Returns every ``(via ...)`` entry with its position, size,
+        drill, layers, and net.  When ``net`` is provided, only
+        vias on that net are returned.
+
+        Args:
+            pcb_path: Absolute path to the .kicad_pcb file.
+            ctx: MCP context (unused).
+            net: Optional net name filter.
+
+        Returns:
+            dict with ``vias`` (list of via dicts) and ``count``.
+        """
+        data = load_pcb(pcb_path)
+
+        vias: list[dict[str, Any]] = []
+        for item in data:
+            if not (isinstance(item, list) and len(item) > 0 and _sym(item[0]) == "via"):
+                continue
+
+            at_node = _find_sub_pq(item, "at")
+            size_node = _find_sub_pq(item, "size")
+            drill_node = _find_sub_pq(item, "drill")
+            layers_node = _find_sub_pq(item, "layers")
+            net_node = _find_sub_pq(item, "net")
+            if at_node is None or len(at_node) < 3:
+                continue
+
+            vx = float(at_node[1]) if not isinstance(at_node[1], str) else float(str(at_node[1]))
+            vy = float(at_node[2]) if not isinstance(at_node[2], str) else float(str(at_node[2]))
+            vs = float(size_node[1]) if size_node and len(size_node) >= 2 else 0.0
+            vd = float(drill_node[1]) if drill_node and len(drill_node) >= 2 else 0.0
+            via_layers = [str(ln) for ln in layers_node[1:]] if layers_node else []
+            item_net = _get_net_name_pq(net_node) if net_node else ""
+
+            if net is not None and item_net != net:
+                continue
+
+            vias.append(
+                {
+                    "x": vx,
+                    "y": vy,
+                    "diameter": vs,
+                    "drill": vd,
+                    "layers": via_layers,
+                    "net": item_net,
+                }
+            )
+
+        return {"vias": vias, "count": len(vias)}
+
+
+# ---------------------------------------------------------------------------
+# Helpers — netclass / type
+# ---------------------------------------------------------------------------
+
+
+def _resolve_net_data(
+    nets_by_name: dict[str, dict[str, Any]],
+    pcb_path: str,
+) -> None:
+    """Augment each net in *nets_by_name* with ``netclass`` and ``type``.
+
+    Reads the matching ``.kicad_pro`` JSON, resolves net→netclass via
+    ``netclass_patterns``, and classifies each net as power/ground/signal.
+
+    If the ``.kicad_pro`` cannot be found or parsed, the helper silently
+    returns (the extra fields remain as ``None``).
+    """
+    import json
+    import os
+    import re
+
+    # Derive .kicad_pro path
+    base = os.path.splitext(os.path.basename(pcb_path))[0]
+    d = os.path.dirname(pcb_path)
+    pro_path: str | None = None
+    for f in os.listdir(d):
+        if f.startswith(base + ".") and re.match(r".+\.kicad_pro$", f):
+            pro_path = os.path.join(d, f)
+            break
+
+    # Always set netclass/type (to None if .kicad_pro unavailable)
+    for net_name in nets_by_name:
+        nets_by_name[net_name].setdefault("netclass", None)
+        nets_by_name[net_name].setdefault("type", None)
+
+    if pro_path is None or not os.path.isfile(pro_path):
+        return
+
+    try:
+        with open(pro_path, encoding="utf-8") as fh:
+            pro_data = json.load(fh)
+    except (json.JSONDecodeError, OSError):
+        return
+
+    ns = pro_data.get("net_settings", {}) if isinstance(pro_data, dict) else {}
+    if not isinstance(ns, dict):
+        return
+
+    # Build net→netclass map (explicit table + pattern matching)
+    net_to_class: dict[str, str | None] = {}
+    for net_name in nets_by_name:
+        net_to_class[net_name] = None
+
+    # Explicit per-net assignments
+    for n in ns.get("nets", []):
+        if isinstance(n, dict):
+            name = n.get("name")
+            nc = n.get("netclass") or n.get("class")
+            if isinstance(name, str) and isinstance(nc, str) and name in net_to_class:
+                net_to_class[name] = nc
+
+    # Pattern-based assignments (first match wins)
+    import fnmatch
+
+    for p in ns.get("netclass_patterns", []):
+        if not isinstance(p, dict):
+            continue
+        pat = p.get("pattern")
+        nc = p.get("netclass")
+        if not isinstance(pat, str) or not isinstance(nc, str):
+            continue
+        for net_name in net_to_class:
+            if net_to_class[net_name] is None and fnmatch.fnmatchcase(net_name, pat):
+                net_to_class[net_name] = nc
+
+    # Regex for signal integrity type
+    _POWER_RE = re.compile(
+        r"VCC|VDD|VEE|VBAT|3V3|3\.3V|5V|12V|\bPWR\b|AVCC|DVCC|VUSB",
+        re.IGNORECASE,
+    )
+    _GROUND_RE = re.compile(r"VSS|VEE|GND|AGND|DGND|PGND|VSS", re.IGNORECASE)
+
+    for net_name, entry in nets_by_name.items():
+        entry["netclass"] = net_to_class.get(net_name)
+        if _GROUND_RE.search(net_name):
+            entry["type"] = "ground"
+        elif _POWER_RE.search(net_name):
+            entry["type"] = "power"
+        else:
+            entry["type"] = "signal"
+
+
+# ---------------------------------------------------------------------------
+# Helpers (module-level, shared by tools in this module)
+# ---------------------------------------------------------------------------
+
+
+def _find_sub_pq(items: list, name: str) -> list | None:
+    """Find the first sub-list whose first Symbol matches *name*."""
+    for sub in items:
+        if isinstance(sub, list) and len(sub) >= 2 and _sym(sub[0]) == name:
+            return sub
+    return None
+
+
+def _get_net_name_pq(net_node: list) -> str | None:
+    """Extract net name from a (net ...) reference.
+
+    Handles KiCad 8 ``(net <id> "<name>")`` and KiCad 10 ``(net "<name>")``.
+    """
+    if len(net_node) >= 3:
+        raw = net_node[2]
+    elif len(net_node) >= 2:
+        raw = net_node[1]
+    else:
+        return None
+    return raw if isinstance(raw, str) else str(raw)

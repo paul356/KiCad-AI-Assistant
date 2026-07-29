@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "kcaa"
-version = "0.1.7"
+version = "0.1.8"
 description = "Model Context Protocol (MCP) server for KiCad electronic design automation (EDA) files"
 readme = "README.md"
 license = { text = "MIT" }
@@ -50,7 +50,9 @@ dependencies = [
     "kicad-skip>=0.2.5",  # KiCad S-expression file parser (imports as `skip`)
     "sqlalchemy>=2.0.0",  # Symbol database ORM
     "kicad-python>=0.7.1",  # KiCad IPC API bindings (requires KiCad 9+ GUI running)
-]
+    "shapely>=2.0.0",      # Geometric operations for PNS router (polygon ops, buffering, visibility)
+    "rtree>=1.3.0",        # Spatial index for fast obstacle queries in PNS router
+] 
 
 [project.urls]
 "Homepage" = "https://github.com/paul356/KiCad-AI-Assistant"
@@ -234,13 +236,6 @@ exclude_lines = [
     "class .*\\bProtocol\\):",
     "@(abc\\.)?abstractmethod",
 ]
-
-[tool.bandit]
-exclude_dirs = ["tests", "build", "dist"]
-skips = ["B101", "B601", "B404", "B603", "B110", "B112"]  # Skip low-severity subprocess and exception handling warnings
-
-[tool.bandit.assert_used]
-skips = ["*_test.py", "*/test_*.py"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["kcaa"]

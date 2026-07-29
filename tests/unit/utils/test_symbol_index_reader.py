@@ -6,14 +6,14 @@ from pathlib import Path
 
 import pytest
 
-from kcaa.utils.config import LibraryPathConfig
+from kcaa.utils.config import ServerConfig
 from kcaa.utils.symbol_index_reader import SymbolIndexReader
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
 
-class _FixtureConfig(LibraryPathConfig):
-    """LibraryPathConfig subclass that points to the test fixture directory."""
+class _FixtureConfig(ServerConfig):
+    """ServerConfig subclass that points to the test fixture directory."""
 
     def __init__(self):
         super().__init__()
@@ -26,7 +26,7 @@ class _FixtureConfig(LibraryPathConfig):
         return {"KICAD_TEST_FIXTURES_DIR": str(FIXTURES_DIR)}
 
 
-class _MissingTableConfig(LibraryPathConfig):
+class _MissingTableConfig(ServerConfig):
     """Config that points to a non-existent sym-lib-table."""
 
     def __init__(self):

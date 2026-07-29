@@ -115,7 +115,7 @@ The script will detect your KiCad version from the plugin directory path. KiCad 
 ### 4. Load the plugin in KiCad
 
 1. Open KiCad and load your project.
-2. Open the **Schematic Editor** or **PCB Editor**.
+2. Open the **PCB Editor**.
 3. Go to **Tools → External Plugins → Refresh Plugins**.
 4. Click **KiCad AI Assistant** in the plugin list to open the chat panel.
 5. Go to **Options → Settings** and enter your LLM API key.

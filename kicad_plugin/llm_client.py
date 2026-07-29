@@ -1363,8 +1363,24 @@ class LLMClient:
 
     def _call_llm(self, system: str, tools: list[dict], on_text_delta=None) -> dict[str, Any]:
         """Dispatch to the configured LLM provider."""
-        self._validate_history()  # guard against corrupted history before every API call
         provider = self._settings.llm_provider
+        tool_names = [t.get("function", {}).get("name", "?") for t in tools]
+        total_payload = len(system) + len(json.dumps(self._history)) + len(json.dumps(tools))
+        log.info(
+            "LLM request — provider=%s model=%s tools=%d (%s) history=%d system=%dB total≈%dB",
+            provider,
+            self._settings.llm_model,
+            len(tools),
+            ", ".join(tool_names[:10]) + ("…" if len(tool_names) > 10 else ""),
+            len(self._history),
+            len(system),
+            total_payload,
+        )
+        self._validate_history()  # guard against corrupted history before every API call
+        if provider == "ollama":
+            if on_text_delta is not None:
+                return self._stream_ollama(system, tools, on_text_delta)
+            return self._call_ollama(system, tools)
         if on_text_delta is not None:
             if provider == "anthropic":
                 return self._stream_anthropic(system, tools, on_text_delta)
@@ -1541,6 +1557,90 @@ class LLMClient:
                 log.debug("Non-streaming callback error: %s", e)
         return result
 
+    def _stream_ollama(self, system: str, tools: list[dict], on_text_delta) -> dict[str, Any]:
+        """Call Ollama native API with streaming enabled.
+
+        Uses the Ollama /api/chat endpoint with ``stream: true``.
+        Ollama returns newline-delimited JSON (NDJSON), not SSE.
+        Since Ollama runs on localhost, no SSL fallback is needed.
+        """
+        base = (self._settings.llm_base_url or "http://localhost:11434").rstrip("/")
+        url = f"{base}/api/chat"
+
+        messages = [{"role": "system", "content": system}] + self._history
+        payload = json.dumps(
+            {
+                "model": self._settings.llm_model,
+                "messages": messages,
+                "tools": tools or None,
+                "stream": True,
+            }
+        ).encode()
+        headers = {"Content-Type": "application/json"}
+
+        import urllib.error
+        import urllib.request
+
+        req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=300) as resp:  # nosec B310 -- localhost only
+                text_parts = []
+                tool_calls_by_index: dict[int, dict] = {}
+                finish_reason = "stop"
+
+                while True:
+                    raw = resp.readline()
+                    if raw == b"":
+                        break
+                    line = raw.decode("utf-8", "replace").rstrip("\r\n")
+                    if not line:
+                        continue
+                    try:
+                        chunk = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+
+                    if chunk.get("done"):
+                        finish_reason = chunk.get("done_reason", "stop")
+                        break
+
+                    msg = chunk.get("message", {})
+                    content = msg.get("content", "")
+                    if content:
+                        text_parts.append(content)
+                        try:
+                            on_text_delta(content)
+                        except Exception as e:
+                            log.debug("Text delta callback error in Ollama streaming: %s", e)
+
+                    for tc_delta in msg.get("tool_calls") or []:
+                        idx = tc_delta.get("index", 0)
+                        if idx not in tool_calls_by_index:
+                            tool_calls_by_index[idx] = {
+                                "id": "",
+                                "type": "function",
+                                "function": {"name": "", "arguments": ""},
+                            }
+                        tc = tool_calls_by_index[idx]
+                        if tc_delta.get("id"):
+                            tc["id"] += tc_delta["id"]
+                        fn = tc_delta.get("function", {})
+                        if fn.get("name"):
+                            tc["function"]["name"] += fn["name"]
+                        if fn.get("arguments"):
+                            tc["function"]["arguments"] += fn["arguments"]
+
+                tool_calls = [tool_calls_by_index[k] for k in sorted(tool_calls_by_index)]
+                message: dict[str, Any] = {"content": "".join(text_parts)}
+                if tool_calls:
+                    message["tool_calls"] = tool_calls
+                return {"finish_reason": finish_reason, "message": message}
+
+        except urllib.error.URLError as e:
+            return {"error": f"Ollama request failed: {e}"}
+        except Exception as e:
+            return {"error": f"Ollama streaming request failed: {e}"}
+
     def _stream_anthropic(self, system: str, tools: list[dict], on_text_delta) -> dict[str, Any]:
         """Call Anthropic API with streaming enabled.
 
@@ -1551,7 +1651,15 @@ class LLMClient:
         import urllib.error
         import urllib.request
 
-        url = "https://api.anthropic.com/v1/messages"
+        base = (self._settings.llm_base_url or "https://api.anthropic.com").rstrip("/")
+        # Accept full endpoint URL or bare hostname — only append the default
+        # path when the user hasn't already specified one.
+        if "/v1/messages" in base:
+            url = base
+        elif base.endswith("/v1"):
+            url = f"{base}/messages"
+        else:
+            url = f"{base}/v1/messages"
         anthropic_tools = [
             {
                 "name": t["function"]["name"],
@@ -1735,8 +1843,60 @@ class LLMClient:
             "message": choice.get("message", {}),
         }
 
+    def _call_ollama(self, system: str, tools: list[dict]) -> dict[str, Any]:
+        """Call Ollama native API (non-streaming).
+
+        Uses the Ollama /api/chat endpoint.  No API key is required.
+        Tool format is the same as OpenAI-compatible (Ollama supports it natively).
+        """
+        base = (self._settings.llm_base_url or "http://localhost:11434").rstrip("/")
+        url = f"{base}/api/chat"
+
+        messages = [{"role": "system", "content": system}] + self._history
+        payload = json.dumps(
+            {
+                "model": self._settings.llm_model,
+                "messages": messages,
+                "tools": tools or None,
+                "stream": False,
+            }
+        ).encode()
+        headers = {"Content-Type": "application/json"}
+
+        try:
+            status, text = _https_post_json(url, headers, payload, timeout=60)
+        except RuntimeError as e:
+            return {"error": str(e)}
+
+        if status >= 400:
+            return {"error": f"HTTP {status}: {text[:200]}"}
+        try:
+            body = json.loads(text)
+        except json.JSONDecodeError as e:
+            return {"error": f"Invalid JSON from Ollama: {e}"}
+
+        if not isinstance(body, dict):
+            return {"error": f"Unexpected response from Ollama: {text[:200]}"}
+
+        msg = body.get("message", {})
+        finish_reason = "stop"
+        if body.get("done_reason") == "tool_calls":
+            finish_reason = "tool_calls"
+        return {
+            "finish_reason": finish_reason,
+            "message": msg,
+        }
+
     def _call_anthropic(self, system: str, tools: list[dict]) -> dict[str, Any]:
-        url = "https://api.anthropic.com/v1/messages"
+        base = (self._settings.llm_base_url or "https://api.anthropic.com").rstrip("/")
+        # Accept full endpoint URL or bare hostname — only append the default
+        # path when the user hasn't already specified one.
+        if "/v1/messages" in base:
+            url = base
+        elif base.endswith("/v1"):
+            url = f"{base}/messages"
+        else:
+            url = f"{base}/v1/messages"
         # Convert OpenAI tool format to Anthropic format
         anthropic_tools = [
             {

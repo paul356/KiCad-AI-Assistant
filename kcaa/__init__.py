@@ -8,7 +8,7 @@ from importlib.metadata import PackageNotFoundError, version
 
 from .context import *
 from .server import *
-from .utils.config import LibraryPathConfig, config
+from .utils.config import ServerConfig, config
 
 try:
     __version__ = version("kcaa")
@@ -24,7 +24,7 @@ __all__ = [
     "__description__",
     # Configuration
     "config",
-    "LibraryPathConfig",
+    "ServerConfig",
     # Server creation / shutdown helpers
     "create_server",
     "add_cleanup_handler",

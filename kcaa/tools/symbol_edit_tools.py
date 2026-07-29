@@ -18,7 +18,7 @@ from fastmcp import Context, FastMCP
 import sexpdata
 
 from kcaa.tools.sheet_tools import _normalize_collection, _sheet_dict_from_wrapper
-from kcaa.utils.config import LibraryPathConfig
+from kcaa.utils.config import ServerConfig
 from kcaa.utils.schematic_sexp_utils import save_schematic
 from kcaa.utils.skip_compat import safe_schematic
 from kcaa.utils.symbol_extractor import extract_lib_symbol_raw
@@ -74,7 +74,7 @@ _index_manager: SymbolIndexManager | None = None
 def _get_index_manager() -> SymbolIndexManager:
     global _index_manager
     if _index_manager is None:
-        config = LibraryPathConfig()
+        config = ServerConfig()
         library_manager = SymbolIndexReader(config)
         _index_manager = SymbolIndexManager(library_manager)
     return _index_manager
@@ -444,13 +444,17 @@ def _find_project_name(schematic_path: str) -> str:
 def _find_project_dir(schematic_path: str) -> Path | None:
     """Find the KiCad project directory containing a .kicad_pro file.
 
-    Searches the schematic's directory first, then the parent directory.
+    A .kicad_pro matches only if a .kicad_sch with the same stem exists
+    in the same directory (standard KiCad convention).
     Returns the directory Path, or None if no .kicad_pro is found.
     """
-    sch_dir = Path(schematic_path).parent
-    for search_dir in (sch_dir, sch_dir.parent):
-        if list(search_dir.glob("*.kicad_pro")):
-            return search_dir
+    sch_path = Path(schematic_path)
+    sch_dir = sch_path.parent
+    dirs_to_check = {sch_dir, sch_dir.parent}
+    for d in dirs_to_check:
+        for proj in d.glob("*.kicad_pro"):
+            if (d / f"{proj.stem}.kicad_sch").exists():
+                return d
     return None
 
 
