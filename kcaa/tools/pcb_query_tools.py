@@ -865,3 +865,140 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
             "ordered": ordered,
             "tier_counts": dict(tier_counts),
         }
+
+    @mcp.tool()
+    async def list_tracks(
+        pcb_path: str,
+        ctx: Context | None = None,
+        net: str | None = None,
+        layer: str | None = None,
+    ) -> dict[str, Any]:
+        """List all track segments on the PCB, optionally filtered.
+
+        Returns every ``(segment ...)`` entry with its endpoint
+        coordinates, width, layer, and net.  When ``net`` and/or
+        ``layer`` are provided, only matching segments are returned.
+
+        Args:
+            pcb_path: Absolute path to the .kicad_pcb file.
+            ctx: MCP context (unused).
+            net: Optional net name filter (e.g. ``"VCC"``).
+            layer: Optional copper layer filter (e.g. ``"F.Cu"``).
+
+        Returns:
+            dict with ``tracks`` (list of segment dicts) and ``count``.
+        """
+        data = load_pcb(pcb_path)
+
+        tracks: list[dict[str, Any]] = []
+        for item in data:
+            if not (isinstance(item, list) and len(item) > 0 and _sym(item[0]) == "segment"):
+                continue
+
+            start_node = _find_sub_pq(item, "start")
+            end_node = _find_sub_pq(item, "end")
+            width_node = _find_sub_pq(item, "width")
+            layer_node = _find_sub_pq(item, "layer")
+            net_node = _find_sub_pq(item, "net")
+            if start_node is None or end_node is None:
+                continue
+
+            sx = float(start_node[1]) if not isinstance(start_node[1], str) else float(str(start_node[1]))
+            sy = float(start_node[2]) if not isinstance(start_node[2], str) else float(str(start_node[2]))
+            ex = float(end_node[1]) if not isinstance(end_node[1], str) else float(str(end_node[1]))
+            ey = float(end_node[2]) if not isinstance(end_node[2], str) else float(str(end_node[2]))
+            sw = float(width_node[1]) if width_node and len(width_node) >= 2 else 0.0
+            item_layer = str(layer_node[1]) if layer_node and len(layer_node) >= 2 else ""
+            item_net = _get_net_name_pq(net_node) if net_node else ""
+
+            if net is not None and item_net != net:
+                continue
+            if layer is not None and item_layer != layer:
+                continue
+
+            tracks.append({
+                "x1": sx, "y1": sy, "x2": ex, "y2": ey,
+                "width": sw, "layer": item_layer, "net": item_net,
+            })
+
+        return {"tracks": tracks, "count": len(tracks)}
+
+    @mcp.tool()
+    async def list_vias(
+        pcb_path: str,
+        ctx: Context | None = None,
+        net: str | None = None,
+    ) -> dict[str, Any]:
+        """List all through-hole vias on the PCB, optionally filtered.
+
+        Returns every ``(via ...)`` entry with its position, size,
+        drill, layers, and net.  When ``net`` is provided, only
+        vias on that net are returned.
+
+        Args:
+            pcb_path: Absolute path to the .kicad_pcb file.
+            ctx: MCP context (unused).
+            net: Optional net name filter.
+
+        Returns:
+            dict with ``vias`` (list of via dicts) and ``count``.
+        """
+        data = load_pcb(pcb_path)
+
+        vias: list[dict[str, Any]] = []
+        for item in data:
+            if not (isinstance(item, list) and len(item) > 0 and _sym(item[0]) == "via"):
+                continue
+
+            at_node = _find_sub_pq(item, "at")
+            size_node = _find_sub_pq(item, "size")
+            drill_node = _find_sub_pq(item, "drill")
+            layers_node = _find_sub_pq(item, "layers")
+            net_node = _find_sub_pq(item, "net")
+            if at_node is None or len(at_node) < 3:
+                continue
+
+            vx = float(at_node[1]) if not isinstance(at_node[1], str) else float(str(at_node[1]))
+            vy = float(at_node[2]) if not isinstance(at_node[2], str) else float(str(at_node[2]))
+            vs = float(size_node[1]) if size_node and len(size_node) >= 2 else 0.0
+            vd = float(drill_node[1]) if drill_node and len(drill_node) >= 2 else 0.0
+            via_layers = [str(ln) for ln in layers_node[1:]] if layers_node else []
+            item_net = _get_net_name_pq(net_node) if net_node else ""
+
+            if net is not None and item_net != net:
+                continue
+
+            vias.append({
+                "x": vx, "y": vy,
+                "diameter": vs, "drill": vd,
+                "layers": via_layers, "net": item_net,
+            })
+
+        return {"vias": vias, "count": len(vias)}
+
+
+# ---------------------------------------------------------------------------
+# Helpers (module-level, shared by tools in this module)
+# ---------------------------------------------------------------------------
+
+
+def _find_sub_pq(items: list, name: str) -> list | None:
+    """Find the first sub-list whose first Symbol matches *name*."""
+    for sub in items:
+        if isinstance(sub, list) and len(sub) >= 2 and _sym(sub[0]) == name:
+            return sub
+    return None
+
+
+def _get_net_name_pq(net_node: list) -> str | None:
+    """Extract net name from a (net ...) reference.
+
+    Handles KiCad 8 ``(net <id> "<name>")`` and KiCad 10 ``(net "<name>")``.
+    """
+    if len(net_node) >= 3:
+        raw = net_node[2]
+    elif len(net_node) >= 2:
+        raw = net_node[1]
+    else:
+        return None
+    return raw if isinstance(raw, str) else str(raw)

@@ -280,61 +280,111 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
     @mcp.tool()
     async def pcb_delete_tracks(
         pcb_path: str,
-        net: str,
+        segments: list[dict[str, Any]],
         ctx: Context | None,
-        layer: str | None = None,
     ) -> dict[str, Any]:
-        """Delete all track segments on a given net (optionally on one layer).
+        """Delete specific track segments by their endpoint coordinates.
 
-        Removes every ``(segment ...)`` entry whose net matches *net* (by
-        name, regardless of whether the PCB uses numbered or name-only net
-        references).  When *layer* is provided, only segments on that layer
-        are removed.
+        Each element of ``segments`` is a dict with ``x1``, ``y1``, ``x2``,
+        ``y2`` and optional ``layer``.  A matching ``(segment ...)`` entry is
+        removed when both endpoints match within 0.01 mm and (if specified)
+        the layer matches.
 
         A ``.bak`` backup is created before any modification.  An empty
-        match (zero deleted) is a no-op — no backup, no write.
+        match list (``[]``) is a no-op — no backup, no write.  Returns the
+        count of segments actually deleted (some may have already been
+        removed by a previous call).
 
         Args:
             pcb_path: Absolute path to the .kicad_pcb file.
-            net: Net name to match (e.g. ``"VCC"``, ``"GND"``).
+            segments: List of segment descriptors, each with
+                ``x1``, ``y1``, ``x2``, ``y2`` and optional ``layer``.
             ctx: MCP context (unused).
-            layer: Optional layer filter (e.g. ``"F.Cu"``).
 
         Returns:
-            dict with ``deleted_count``, ``backup_path`` (or ``None`` if
-            nothing was deleted), and ``pcb_path``.
+            dict with ``deleted_count``, ``matched_count`` (how many of
+            the input descriptors found a match), ``not_found`` (descriptors
+            that did not match any segment), ``backup_path``, and
+            ``pcb_path``.
         """
-        data = load_pcb(pcb_path)
+        if not segments:
+            return {
+                "deleted_count": 0,
+                "matched_count": 0,
+                "not_found": [],
+                "backup_path": None,
+                "pcb_path": pcb_path,
+            }
 
-        to_remove: list[list] = []
+        data = load_pcb(pcb_path)
+        tol = 0.01  # mm
+
+        # Collect existing (segment ...) items with their endpoint info.
+        existing: list[tuple[list, float, float, float, float, str | None]] = []
         for item in data:
             if not (isinstance(item, list) and len(item) > 0):
                 continue
             if not _is_sym(item[0], "segment"):
                 continue
-            # Check net
-            net_node = _find_sub(item, "net")
-            if net_node is None:
+            start_node = _find_sub(item, "start")
+            end_node = _find_sub(item, "end")
+            layer_node = _find_sub(item, "layer")
+            if start_node is None or end_node is None:
                 continue
-            item_net = _get_net_name(net_node)
-            if item_net != net:
+            sx = float(start_node[1]) if not isinstance(start_node[1], str) else float(str(start_node[1]))
+            sy = float(start_node[2]) if not isinstance(start_node[2], str) else float(str(start_node[2]))
+            ex = float(end_node[1]) if not isinstance(end_node[1], str) else float(str(end_node[1]))
+            ey = float(end_node[2]) if not isinstance(end_node[2], str) else float(str(end_node[2]))
+            item_layer = str(layer_node[1]) if layer_node and len(layer_node) >= 2 else None
+            existing.append((item, sx, sy, ex, ey, item_layer))
+
+        to_remove: set[int] = set()
+        not_found: list[dict[str, Any]] = []
+
+        for desc in segments:
+            try:
+                dx1 = float(desc["x1"])
+                dy1 = float(desc["y1"])
+                dx2 = float(desc["x2"])
+                dy2 = float(desc["y2"])
+                d_layer = desc.get("layer")
+            except (KeyError, TypeError, ValueError) as exc:
+                not_found.append({"x1": desc.get("x1"), "y1": desc.get("y1"),
+                                  "x2": desc.get("x2"), "y2": desc.get("y2"),
+                                  "error": str(exc)})
                 continue
-            # Optional layer filter
-            if layer is not None:
-                lyr_node = _find_sub(item, "layer")
-                if lyr_node is None or len(lyr_node) < 2:
+
+            matched = False
+            for idx, (item, sx, sy, ex, ey, item_layer) in enumerate(existing):
+                if idx in to_remove:
                     continue
-                raw = lyr_node[1]
-                item_layer = raw if isinstance(raw, str) else str(raw)
-                if item_layer != layer:
+                # Check endpoint match (either direction)
+                forward = abs(sx - dx1) < tol and abs(sy - dy1) < tol and abs(ex - dx2) < tol and abs(ey - dy2) < tol
+                backward = abs(sx - dx2) < tol and abs(sy - dy2) < tol and abs(ex - dx1) < tol and abs(ey - dy1) < tol
+                if not forward and not backward:
                     continue
-            to_remove.append(item)
+                # Optional layer filter
+                if d_layer is not None and item_layer is not None and item_layer != d_layer:
+                    continue
+                to_remove.add(idx)
+                matched = True
+                break
+
+            if not matched:
+                not_found.append({"x1": dx1, "y1": dy1, "x2": dx2, "y2": dy2})
 
         if not to_remove:
-            return {"deleted_count": 0, "backup_path": None, "pcb_path": pcb_path}
+            return {
+                "deleted_count": 0,
+                "matched_count": 0,
+                "not_found": not_found,
+                "backup_path": None,
+                "pcb_path": pcb_path,
+            }
 
-        for item in to_remove:
-            data.remove(item)
+        # Remove in reverse index order to preserve positions.
+        for idx in sorted(to_remove, reverse=True):
+            data.remove(existing[idx][0])
 
         try:
             backup_path = save_pcb(pcb_path, data)
@@ -343,6 +393,8 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
 
         return {
             "deleted_count": len(to_remove),
+            "matched_count": len(segments) - len(not_found),
+            "not_found": not_found,
             "backup_path": backup_path,
             "pcb_path": pcb_path,
         }
@@ -350,66 +402,83 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
     @mcp.tool()
     async def pcb_delete_vias(
         pcb_path: str,
-        net: str,
+        vias: list[dict[str, Any]],
         ctx: Context | None,
-        positions: list[tuple[float, float]] | None = None,
     ) -> dict[str, Any]:
-        """Delete through-hole vias on a given net.
+        """Delete specific through-hole vias by their position.
 
-        Removes every ``(via ...)`` entry whose net matches *net* (by
-        name).  When *positions* is provided, only vias at those exact
-        ``(x, y)`` locations (within 0.01 mm tolerance) are removed.
+        Each element of ``vias`` is a dict with ``x`` and ``y``.  A
+        matching ``(via ...)`` entry is removed when its position matches
+        within 0.01 mm.
 
         A ``.bak`` backup is created before any modification.  An empty
-        match (zero deleted) is a no-op — no backup, no write.
+        list (``[]``) is a no-op — no backup, no write.
 
         Args:
             pcb_path: Absolute path to the .kicad_pcb file.
-            net: Net name to match (e.g. ``"VCC"``, ``"GND"``).
+            vias: List of via position dicts, each with ``x`` and ``y``.
             ctx: MCP context (unused).
-            positions: Optional list of ``(x, y)`` tuples.  When set, only
-                vias at these exact positions are deleted.
 
         Returns:
-            dict with ``deleted_count``, ``backup_path`` (or ``None`` if
-            nothing was deleted), and ``pcb_path``.
+            dict with ``deleted_count``, ``matched_count``,
+            ``not_found`` (positions that did not match any via),
+            ``backup_path``, and ``pcb_path``.
         """
-        data = load_pcb(pcb_path)
+        if not vias:
+            return {
+                "deleted_count": 0, "matched_count": 0,
+                "not_found": [], "backup_path": None, "pcb_path": pcb_path,
+            }
 
-        to_remove: list[list] = []
+        data = load_pcb(pcb_path)
+        tol = 0.01  # mm
+
+        # Collect existing vias with positions.
+        existing: list[tuple[list, float, float]] = []
         for item in data:
             if not (isinstance(item, list) and len(item) > 0):
                 continue
             if not _is_sym(item[0], "via"):
                 continue
-            # Check net
-            net_node = _find_sub(item, "net")
-            if net_node is None:
+            at_node = _find_sub(item, "at")
+            if at_node is None or len(at_node) < 3:
                 continue
-            item_net = _get_net_name(net_node)
-            if item_net != net:
+            vx = float(at_node[1]) if not isinstance(at_node[1], str) else float(str(at_node[1]))
+            vy = float(at_node[2]) if not isinstance(at_node[2], str) else float(str(at_node[2]))
+            existing.append((item, vx, vy))
+
+        to_remove: set[int] = set()
+        not_found: list[dict[str, float]] = []
+
+        for desc in vias:
+            try:
+                dx = float(desc["x"])
+                dy = float(desc["y"])
+            except (KeyError, TypeError, ValueError) as exc:
+                not_found.append({"x": desc.get("x"), "y": desc.get("y"), "error": str(exc)})
                 continue
-            # Optional position filter
-            if positions is not None:
-                at_node = _find_sub(item, "at")
-                if at_node is None or len(at_node) < 3:
+
+            matched = False
+            for idx, (item, vx, vy) in enumerate(existing):
+                if idx in to_remove:
                     continue
-                vx = float(at_node[1]) if not isinstance(at_node[1], str) else float(str(at_node[1]))
-                vy = float(at_node[2]) if not isinstance(at_node[2], str) else float(str(at_node[2]))
-                # Check if any position matches within 0.01 mm
-                matched = any(
-                    abs(vx - px) < 0.01 and abs(vy - py) < 0.01
-                    for px, py in positions
-                )
-                if not matched:
-                    continue
-            to_remove.append(item)
+                if abs(vx - dx) < tol and abs(vy - dy) < tol:
+                    to_remove.add(idx)
+                    matched = True
+                    break
+
+            if not matched:
+                not_found.append({"x": dx, "y": dy})
 
         if not to_remove:
-            return {"deleted_count": 0, "backup_path": None, "pcb_path": pcb_path}
+            return {
+                "deleted_count": 0, "matched_count": 0,
+                "not_found": not_found,
+                "backup_path": None, "pcb_path": pcb_path,
+            }
 
-        for item in to_remove:
-            data.remove(item)
+        for idx in sorted(to_remove, reverse=True):
+            data.remove(existing[idx][0])
 
         try:
             backup_path = save_pcb(pcb_path, data)
@@ -418,6 +487,8 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
 
         return {
             "deleted_count": len(to_remove),
+            "matched_count": len(vias) - len(not_found),
+            "not_found": not_found,
             "backup_path": backup_path,
             "pcb_path": pcb_path,
         }
