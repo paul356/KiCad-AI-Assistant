@@ -44,9 +44,12 @@ import logging
 import math
 import os
 
+from shapely.geometry import box as _shapely_box
+
 from kcaa.router.grid_a_star import (
     GRID_RESOLUTION,
     hierarchical_a_star,
+    multi_layer_a_star,
     path_to_nodes,
     shortcut_path,
     simplify_path,
@@ -57,6 +60,7 @@ from kcaa.router.path_postprocess import (
     OutputVia,
     postprocess_path,
 )
+from kcaa.router.visibility_graph import RouteNode
 from kcaa.router.world_model import Obstacle, build_world_model
 from kcaa.utils.pcb_sexp_utils import load_pcb
 
@@ -233,6 +237,12 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
                 f"Cannot determine clearance: {exc}. "
                 f"Pass clearance= explicitly in RouteRequest to skip DRC lookup."
             ) from exc
+    via_diameter = req.via_diameter
+    if via_diameter is None:
+        via_diameter = _resolve_via_diameter(req.pcb_path, net=req.net)
+    via_drill = req.via_drill
+    if via_drill is None:
+        via_drill = _resolve_via_drill(req.pcb_path, net=req.net)
 
     # Pad center coordinates.
     pad_a_xy = _find_pad_center(data, req.ref_a, req.pad_a)
@@ -306,6 +316,23 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
     pad_a_size = pad_a_world_size if pad_a_world_size and _is_rect(pad_a_world_size) else None
     pad_b_size = pad_b_world_size if pad_b_world_size and _is_rect(pad_b_world_size) else None
 
+    # For multi-layer routing, clear the start/end pad areas from the
+    # obstacle grid so A* can start from / end at the pad centres.
+    # Existing copper (e.g. a track from another net) may occupy the pad.
+    if req.start_layer != req.end_layer:
+        if pad_a_world_size is not None:
+            obstacles_by_layer[req.start_layer] = _subtract_pad_aabb(
+                obstacles_by_layer[req.start_layer],
+                pad_a_xy,
+                pad_a_world_size,
+            )
+        if pad_b_world_size is not None:
+            obstacles_by_layer[req.end_layer] = _subtract_pad_aabb(
+                obstacles_by_layer[req.end_layer],
+                pad_b_xy,
+                pad_b_world_size,
+            )
+
     # Route from pad center to pad center.  A* on the grid naturally
     # produces 0/45/90° segments.
     route_bbox = (
@@ -324,25 +351,15 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
         f" → {req.ref_b}/{req.pad_b} ({_bx:.3f},{_by:.3f})"
         f"  size_a={pad_a_size} size_b={pad_b_size}"
     )
-    result = hierarchical_a_star(
-        buffered,
-        pad_a_xy,
-        pad_b_xy,
-        fine_resolution=grid_res,
-        route_bbox=route_bbox,
-    )
-    if result.path is None:
-        raise RouteFailure(
-            f"No obstacle-avoiding path from {req.ref_a}/{req.pad_a} to "
-            f"{req.ref_b}/{req.pad_b} at {req.width or 0.5}mm "
-            f"track width on layer {req.start_layer}."
-        )
-    print(f"  [route] A*: {len(result.path)} pts  cells_visited={result.cells_visited}")
+    # Build pad-rectangle descriptors early (used by postprocess_path in
+    # both single-layer and multi-layer branches).
+    _pad_rects: list[tuple[float, float, float, float]] = []
+    for psize, pcenter in [(pad_a_size, pad_a_xy), (pad_b_size, pad_b_xy)]:
+        if psize is not None:
+            w, h = psize
+            _pad_rects.append((pcenter[0], pcenter[1], w / 2.0, h / 2.0))
 
-    # ---- Discard A* path inside rectangular pads and replace with a
-    #      single axis-aligned wire (fence → centre).  This keeps the
-    #      pad exit clean; normal post-processing runs afterwards. ----
-    # Build viz context: pad rects (all pads, not just rectangular), obstacles.
+    # Build viz context: pad rects (all pads, not just rectangular).
     _pad_viz: list[tuple[str, tuple[float, float, float, float]]] = []
     for name, psize, pcenter in [
         (f"{req.ref_a}/{req.pad_a}", pad_a_world_size, pad_a_xy),
@@ -361,72 +378,128 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
                     ),
                 )
             )
-    _dump_viz("0-astar", result.path, _pad_viz, buffered, route_bbox)
 
-    if pad_a_size is not None:
-        n_before = len(result.path)
-        result.path = _replace_pad_path(result.path, pad_a_xy, pad_a_size, from_center=True)
-        _log_path("pad_a-replace", result.path, n_before)
-    if pad_b_size is not None:
-        n_before = len(result.path)
-        result.path = _replace_pad_path(result.path, pad_b_xy, pad_b_size, from_center=False)
-        _log_path("pad_b-replace", result.path, n_before)
-    _dump_viz("1-pad-replace", result.path, _pad_viz, buffered, route_bbox)
-
-    # ---- Post-process: simplify → shortcut → snap45 → validate ----
-    best_path_pts = result.path
-    best_path_pts = simplify_path(best_path_pts)
-    _log_path("simplify", best_path_pts)
-    _dump_viz("2-simplify", best_path_pts, _pad_viz, buffered, route_bbox)
-    best_path_pts = shortcut_path(best_path_pts, buffered, route_bbox, resolution=grid_res)
-    _log_path("shortcut", best_path_pts)
-    _dump_viz("3-shortcut", best_path_pts, _pad_viz, buffered, route_bbox)
-    best_path_pts = snap_to_45_path_safe(best_path_pts, buffered, route_bbox, resolution=grid_res)
-    _log_path("snap45", best_path_pts)
-    _dump_viz("4-snap45", best_path_pts, _pad_viz, buffered, route_bbox)
-
-    # ---- Align path endpoints with exact pad centres ----
-    best_path_pts = _align_path_endpoints(
-        best_path_pts,
-        pad_a_xy,
-        pad_b_xy,
-        buffered,
-        route_bbox,
-        grid_res,
-        pad_a_size=pad_a_size,
-        pad_b_size=pad_b_size,
-    )
-    _log_path("align-endpoints", best_path_pts)
-    _dump_viz("6-align-endpoints", best_path_pts, _pad_viz, buffered, route_bbox)
-
-    # Build pad-rectangle descriptors to suppress miters at pad exits.
-    _pad_rects: list[tuple[float, float, float, float]] = []
-    for psize, pcenter in [(pad_a_size, pad_a_xy), (pad_b_size, pad_b_xy)]:
-        if psize is not None:
-            w, h = psize
-            _pad_rects.append((pcenter[0], pcenter[1], w / 2.0, h / 2.0))
-
-    path_nodes = path_to_nodes(best_path_pts, req.start_layer)
-    segs, vias = postprocess_path(
-        path_nodes,
-        width=width,
-        net=req.net,
-        max_miter_mm=req.max_miter_mm,
-        _obstacles=buffered,
-        _pad_rects=_pad_rects or None,
-    )
-    # Discard zero-length segments that can arise from miter edge cases.
-    segs = [s for s in segs if abs(s.x1 - s.x2) > 1e-6 or abs(s.y1 - s.y2) > 1e-6]
-    _log_output_segments("final", segs)
-    _dump_viz_segments("7-final", segs, _pad_viz, buffered, route_bbox)
     if req.start_layer != req.end_layer:
-        raise RouteFailure(
-            f"Multi-layer routing ({req.start_layer} → {req.end_layer}) not supported yet."
+        # ── Multi-layer: grid A* with via edges ──────────────────────
+        ml_result = multi_layer_a_star(
+            obstacles_by_layer,
+            pad_a_xy,
+            pad_b_xy,
+            req.start_layer,
+            req.end_layer,
+            req.via_pairs,
+            route_bbox,
+            grid_res,
+        )
+        if ml_result.path is None:
+            raise RouteFailure(
+                f"No obstacle-avoiding multi-layer path from "
+                f"{req.ref_a}/{req.pad_a} to {req.ref_b}/{req.pad_b} at "
+                f"{width}mm track width ({req.start_layer} → {req.end_layer})."
+            )
+        print(
+            f"  [route] multi-layer A*: {len(ml_result.path)} pts"
+            f"  cells_visited={ml_result.cells_visited}"
         )
 
-    start_xy = (path_nodes[0].x, path_nodes[0].y)
-    end_xy = (path_nodes[-1].x, path_nodes[-1].y)
-    layers_used = _layers_used(path_nodes)
+        # Convert GridNode → RouteNode for postprocess_path.
+        path_nodes = [
+            RouteNode(x=n.x, y=n.y, layer=n.layer, node_id=i) for i, n in enumerate(ml_result.path)
+        ]
+        segs, vias = postprocess_path(
+            path_nodes,
+            width=width,
+            net=req.net,
+            max_miter_mm=req.max_miter_mm,
+            via_diameter_mm=via_diameter,
+            via_drill_mm=via_drill,
+            _obstacles=buffered,
+            _pad_rects=_pad_rects or None,
+        )
+        segs = [s for s in segs if abs(s.x1 - s.x2) > 1e-6 or abs(s.y1 - s.y2) > 1e-6]
+        _log_output_segments("final", segs)
+        _dump_viz_segments("7-final", segs, _pad_viz, buffered, route_bbox)
+
+        start_xy = (path_nodes[0].x, path_nodes[0].y)
+        end_xy = (path_nodes[-1].x, path_nodes[-1].y)
+        layers_used = _layers_used(path_nodes)
+    else:
+        # ── Single-layer: hierarchical A* ───────────────────────────
+        result = hierarchical_a_star(
+            buffered,
+            pad_a_xy,
+            pad_b_xy,
+            fine_resolution=grid_res,
+            route_bbox=route_bbox,
+        )
+        if result.path is None:
+            raise RouteFailure(
+                f"No obstacle-avoiding path from {req.ref_a}/{req.pad_a} to "
+                f"{req.ref_b}/{req.pad_b} at {req.width or 0.5}mm "
+                f"track width on layer {req.start_layer}."
+            )
+        print(f"  [route] A*: {len(result.path)} pts  cells_visited={result.cells_visited}")
+
+        # ---- Discard A* path inside rectangular pads and replace with a
+        #      single axis-aligned wire (fence → centre).  This keeps the
+        #      pad exit clean; normal post-processing runs afterwards. ----
+        _dump_viz("0-astar", result.path, _pad_viz, buffered, route_bbox)
+
+        if pad_a_size is not None:
+            n_before = len(result.path)
+            result.path = _replace_pad_path(result.path, pad_a_xy, pad_a_size, from_center=True)
+            _log_path("pad_a-replace", result.path, n_before)
+        if pad_b_size is not None:
+            n_before = len(result.path)
+            result.path = _replace_pad_path(result.path, pad_b_xy, pad_b_size, from_center=False)
+            _log_path("pad_b-replace", result.path, n_before)
+        _dump_viz("1-pad-replace", result.path, _pad_viz, buffered, route_bbox)
+
+        # ---- Post-process: simplify → shortcut → snap45 → validate ----
+        best_path_pts = result.path
+        best_path_pts = simplify_path(best_path_pts)
+        _log_path("simplify", best_path_pts)
+        _dump_viz("2-simplify", best_path_pts, _pad_viz, buffered, route_bbox)
+        best_path_pts = shortcut_path(best_path_pts, buffered, route_bbox, resolution=grid_res)
+        _log_path("shortcut", best_path_pts)
+        _dump_viz("3-shortcut", best_path_pts, _pad_viz, buffered, route_bbox)
+        best_path_pts = snap_to_45_path_safe(
+            best_path_pts, buffered, route_bbox, resolution=grid_res
+        )
+        _log_path("snap45", best_path_pts)
+        _dump_viz("4-snap45", best_path_pts, _pad_viz, buffered, route_bbox)
+
+        # ---- Align path endpoints with exact pad centres ----
+        best_path_pts = _align_path_endpoints(
+            best_path_pts,
+            pad_a_xy,
+            pad_b_xy,
+            buffered,
+            route_bbox,
+            grid_res,
+            pad_a_size=pad_a_size,
+            pad_b_size=pad_b_size,
+        )
+        _log_path("align-endpoints", best_path_pts)
+        _dump_viz("6-align-endpoints", best_path_pts, _pad_viz, buffered, route_bbox)
+
+        path_nodes = path_to_nodes(best_path_pts, req.start_layer)
+        segs, vias = postprocess_path(
+            path_nodes,
+            width=width,
+            net=req.net,
+            max_miter_mm=req.max_miter_mm,
+            _obstacles=buffered,
+            _pad_rects=_pad_rects or None,
+        )
+        # Discard zero-length segments that can arise from miter edge cases.
+        segs = [s for s in segs if abs(s.x1 - s.x2) > 1e-6 or abs(s.y1 - s.y2) > 1e-6]
+        _log_output_segments("final", segs)
+        _dump_viz_segments("7-final", segs, _pad_viz, buffered, route_bbox)
+
+        start_xy = (path_nodes[0].x, path_nodes[0].y)
+        end_xy = (path_nodes[-1].x, path_nodes[-1].y)
+        layers_used = _layers_used(path_nodes)
 
     # Verify every emitted segment stays inside the board (Edge.Cuts).
     # We use a board polygon that is shrunk by width/2 on each side so the
@@ -621,6 +694,36 @@ def _dump_viz_segments(
     with open(fname, "w") as f:
         json.dump(data, f)
     print(f"  [viz] dumped {fname}")
+
+
+# ---------------------------------------------------------------------------
+# Pad area clearing (for multi-layer A* start/end cells)
+# ---------------------------------------------------------------------------
+
+
+def _subtract_pad_aabb(
+    obstacles: list[Obstacle],
+    pad_center: tuple[float, float],
+    pad_size: tuple[float, float],
+) -> list[Obstacle]:
+    """Subtract a pad's AABB from each obstacle, returning only non-empty results.
+
+    Called before multi-layer A* to unblock the grid cells at the start
+    and end pad centres (existing copper from other nets may occupy the pad
+    area on the same layer).
+    """
+    pad_rect = _shapely_box(
+        pad_center[0] - pad_size[0] / 2.0,
+        pad_center[1] - pad_size[1] / 2.0,
+        pad_center[0] + pad_size[0] / 2.0,
+        pad_center[1] + pad_size[1] / 2.0,
+    )
+    out: list[Obstacle] = []
+    for o in obstacles:
+        diff = o.shape.difference(pad_rect)
+        if not diff.is_empty:
+            out.append(Obstacle(shape=diff, layers=o.layers, net=o.net, kind=o.kind, ref=o.ref))
+    return out
 
 
 # ---------------------------------------------------------------------------

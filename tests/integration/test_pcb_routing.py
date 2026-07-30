@@ -129,7 +129,6 @@ class TestAutoRoutePair:
         with pytest.raises(RouteFailure):
             auto_route_pair(req)
 
-    @pytest.mark.xfail(reason="Multi-layer routing not supported yet")
     def test_multi_layer_route_inserts_via(self, pcb_copy):
         # R1.2 is on F.Cu (GND). D1.1 is on In1.Cu (GND). The router must
         # insert at least one via to reach the destination layer.
@@ -151,7 +150,6 @@ class TestAutoRoutePair:
         for via in result.vias:
             assert via.layers in allowed, f"unexpected via pair: {via.layers}"
 
-    @pytest.mark.xfail(reason="Multi-layer routing not supported yet")
     def test_multi_layer_via_in_board(self, pcb_copy):
         req = RouteRequest(
             pcb_path=pcb_copy,
@@ -505,7 +503,6 @@ class TestRoutingTool:
         vias = [item for item in data if _is_list(item) and _sym(item[0]) == "via"]
         assert len(vias) == 2
 
-    @pytest.mark.xfail(reason="Multi-layer routing not supported yet")
     def test_multi_layer_tool_writes_segments_and_via(self, pcb_copy):
         # R1.2 is on F.Cu; D1.1 is on In1.Cu (GND).  Calling the tool
         # with target_layer="In1.Cu" should produce at least one via.
