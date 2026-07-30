@@ -133,6 +133,9 @@ class RouteRequest:
         grid_resolution: Grid cell size in mm for the walkability grid.
             Smaller values give finer paths but more cells.  ``None``
             uses the default (0.025 mm).
+        via_cost: Distance-equivalent penalty for taking a via edge in
+            multi-layer A*.  Higher values discourage unnecessary stack
+            vias.  Default 2.0 mm.
     """
 
     pcb_path: str
@@ -150,6 +153,7 @@ class RouteRequest:
     via_drill: float | None = None
     max_miter_mm: float = 1.0
     grid_resolution: float | None = None  # None → GRID_RESOLUTION
+    via_cost: float = 2.0  # mm penalty per via edge
 
 
 @dataclass
@@ -390,6 +394,7 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
             req.via_pairs,
             route_bbox,
             grid_res,
+            via_cost=req.via_cost,
         )
         if ml_result.path is None:
             raise RouteFailure(
@@ -419,6 +424,13 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
         segs = [s for s in segs if abs(s.x1 - s.x2) > 1e-6 or abs(s.y1 - s.y2) > 1e-6]
         _log_output_segments("final", segs)
         _dump_viz_segments("7-final", segs, _pad_viz, buffered, route_bbox)
+
+        # NOTE: we intentionally skip check_vias() here.  The router's
+        # internal obstacle model already prevents via-on-obstacle
+        # placement; running external DRC would flag false positives for
+        # vias near the start/end pads (which were cleared from the
+        # internal model).  Callers that write vias to a .kicad_pcb
+        # should run KiCad's native DRC as a final gate.
 
         start_xy = (path_nodes[0].x, path_nodes[0].y)
         end_xy = (path_nodes[-1].x, path_nodes[-1].y)
@@ -1227,7 +1239,6 @@ def _default_track_width(pcb_path: str, net: str) -> float:
             there is no ``Default`` netclass to fall back to.
     """
     import json
-    import os
 
     pro_path = _project_file_for(pcb_path)
     if pro_path is None or not os.path.exists(pro_path):
@@ -1293,7 +1304,6 @@ def _default_clearance(pcb_path: str, net: str | None = None) -> float:
 
 
 def _project_file_for(pcb_path: str) -> str | None:
-    import os
     import re
 
     base = os.path.splitext(os.path.basename(pcb_path))[0]
@@ -1349,7 +1359,6 @@ def _netclass_clearance(pcb_path: str, net: str) -> float:
     cannot be matched to a specific netclass.
     """
     import json
-    import os
 
     pro_path = _project_file_for(pcb_path)
     if pro_path is None or not os.path.exists(pro_path):
@@ -1371,51 +1380,72 @@ def _netclass_clearance(pcb_path: str, net: str) -> float:
     return 0.2
 
 
-def _default_via_params(data: dict) -> tuple[float, float]:
-    """Read via_diameter and via_drill from the Default netclass.
+def _default_via_params(data: dict, net: str) -> tuple[float, float]:
+    """Read via_diameter and via_drill from ``net``'s netclass.
 
-    Returns ``(via_diameter, via_drill)`` in mm.  Falls back to
-    ``(0.6, 0.3)`` if not found in the project file.
+    Falls back to Default netclass, then ``(0.6, 0.3)``.
     """
     ns = data.get("net_settings", {}) if isinstance(data, dict) else {}
     classes = ns.get("classes", []) if isinstance(ns, dict) else []
+    assignments = _net_to_netclass(data)
+    nc_name = _resolve_netclass(net, assignments)
+
+    # Read via params from all classes, indexed by name.
+    via_params: dict[str, tuple[float, float]] = {}
     for c in classes:
         if not isinstance(c, dict):
             continue
-        if c.get("name") == "Default":
-            vd = c.get("via_diameter")
-            vr = c.get("via_drill")
-            if vd is not None and vr is not None:
-                try:
-                    return float(vd), float(vr)
-                except (TypeError, ValueError):
-                    pass
+        name = c.get("name")
+        if not isinstance(name, str):
+            continue
+        vd = c.get("via_diameter")
+        vr = c.get("via_drill")
+        if vd is not None and vr is not None:
+            try:
+                via_params[name] = (float(vd), float(vr))
+            except (TypeError, ValueError):
+                continue
+
+    if nc_name is not None and nc_name in via_params:
+        return via_params[nc_name]
+    if "Default" in via_params:
+        return via_params["Default"]
     return 0.6, 0.3
 
 
 def _resolve_via_diameter(pcb_path: str, net: str) -> float:
-    """Resolve via diameter from the netclass (Default fallback via.)."""
+    """Resolve via diameter from ``net``'s netclass.
+
+    If the ``.kicad_pro`` is missing or unreadable, returns 0.6 mm.
+    """
+    import json
+
     pro_path = _project_file_for(pcb_path)
     if pro_path is None or not os.path.exists(pro_path):
         return 0.6
     try:
         with open(pro_path, encoding="utf-8") as f:
             data = json.load(f)
-        vd, _ = _default_via_params(data)
+        vd, _ = _default_via_params(data, net)
         return vd
     except (OSError, json.JSONDecodeError, TypeError, ValueError):
         return 0.6
 
 
 def _resolve_via_drill(pcb_path: str, net: str) -> float:
-    """Resolve via drill from the netclass (Default fallback via.)."""
+    """Resolve via drill from ``net``'s netclass.
+
+    If the ``.kicad_pro`` is missing or unreadable, returns 0.3 mm.
+    """
+    import json
+
     pro_path = _project_file_for(pcb_path)
     if pro_path is None or not os.path.exists(pro_path):
         return 0.3
     try:
         with open(pro_path, encoding="utf-8") as f:
             data = json.load(f)
-        _, vr = _default_via_params(data)
+        _, vr = _default_via_params(data, net)
         return vr
     except (OSError, json.JSONDecodeError, TypeError, ValueError):
         return 0.3
