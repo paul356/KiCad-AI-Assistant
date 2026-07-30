@@ -277,8 +277,6 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
     model = build_world_model(
         req.pcb_path,
         net_filter=req.net,
-        exclude_refs=set(),
-        include_footprints=False,
     )
 
     # Shrink obstacles by half the trace width (so the track is centered on
