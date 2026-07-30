@@ -385,6 +385,27 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
 
     if req.start_layer != req.end_layer:
         # ── Multi-layer: grid A* with via edges ──────────────────────
+        # Build via-forbidden zones from start/end pad AABBs to
+        # prevent via-in-pad (DFM issue: solder wicking).
+        via_forbidden: list = []
+        if pad_a_world_size is not None:
+            via_forbidden.append(
+                _shapely_box(
+                    pad_a_xy[0] - pad_a_world_size[0] / 2.0,
+                    pad_a_xy[1] - pad_a_world_size[1] / 2.0,
+                    pad_a_xy[0] + pad_a_world_size[0] / 2.0,
+                    pad_a_xy[1] + pad_a_world_size[1] / 2.0,
+                )
+            )
+        if pad_b_world_size is not None:
+            via_forbidden.append(
+                _shapely_box(
+                    pad_b_xy[0] - pad_b_world_size[0] / 2.0,
+                    pad_b_xy[1] - pad_b_world_size[1] / 2.0,
+                    pad_b_xy[0] + pad_b_world_size[0] / 2.0,
+                    pad_b_xy[1] + pad_b_world_size[1] / 2.0,
+                )
+            )
         ml_result = multi_layer_a_star(
             obstacles_by_layer,
             pad_a_xy,
@@ -395,6 +416,7 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
             route_bbox,
             grid_res,
             via_cost=req.via_cost,
+            via_forbidden_zones=via_forbidden or None,
         )
         if ml_result.path is None:
             raise RouteFailure(

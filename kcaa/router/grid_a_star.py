@@ -242,6 +242,7 @@ def grid_a_star(
     end_layer_idx: int = 0,
     via_from: dict[int, set[int]] | None = None,
     via_cost: float = _VIA_COST,
+    via_forbidden_zones: list | None = None,
 ) -> AStarResult:
     """Run A* on one or more walkability grids.
 
@@ -262,6 +263,8 @@ def grid_a_star(
         via_from: ``{layer_idx: {reachable_layer_idx}}``.  ``None`` means
             no via edges (single-layer mode).
         via_cost: Distance-equivalent cost per via transition (mm).
+        via_forbidden_zones: Optional list of ``shapely`` Polygon objects
+            where vias are forbidden (e.g. start/end pad AABBs).
 
     Returns:
         :class:`AStarResult` with ``path`` as ``list[(x, y, layer_idx)]``,
@@ -356,6 +359,11 @@ def grid_a_star(
             for tgt_li in via_from.get(li, ()):
                 if not grids[tgt_li].is_free(cx, cy):
                     continue
+                # Forbid vias on start/end pad AABBs.
+                if via_forbidden_zones:
+                    wx, wy = ref.to_world(cx, cy)
+                    if any(z.contains(Point(wx, wy)) for z in via_forbidden_zones):
+                        continue
                 nid = _encode(cx, cy, tgt_li)
                 if nid in closed:
                     continue
@@ -526,6 +534,7 @@ def multi_layer_a_star(
     route_bbox: tuple[float, float, float, float],
     fine_resolution: float = GRID_RESOLUTION,
     via_cost: float = _VIA_COST,
+    via_forbidden_zones: list | None = None,
 ) -> MultiLayerAStarResult:
     """Run A* across multiple copper layers.
 
@@ -542,6 +551,8 @@ def multi_layer_a_star(
         route_bbox: ``(min_x, min_y, max_x, max_y)``.
         fine_resolution: Grid cell size in mm.
         via_cost: Distance-equivalent cost per via transition.
+        via_forbidden_zones: ``shapely`` Polygon list where vias are
+            forbidden (e.g. start/end pad AABBs).
 
     Returns:
         :class:`MultiLayerAStarResult`.
@@ -571,6 +582,7 @@ def multi_layer_a_star(
         end_layer_idx=layer_to_idx[end_layer],
         via_from=via_from or None,
         via_cost=via_cost,
+        via_forbidden_zones=via_forbidden_zones,
     )
     if result.path is None:
         return MultiLayerAStarResult(path=None, cells_visited=result.cells_visited)
