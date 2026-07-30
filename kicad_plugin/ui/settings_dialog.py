@@ -116,6 +116,16 @@ if _WX_AVAILABLE:
             grid.Add(self._compact_target, 1, wx.EXPAND)
 
             grid.Add(
+                wx.StaticText(self, label="Max output tokens (0=default):"),
+                0,
+                wx.ALIGN_CENTER_VERTICAL,
+            )
+            self._max_tokens = wx.SpinCtrl(
+                self, min=0, max=1_000_000, initial=self._settings.llm_max_tokens
+            )
+            grid.Add(self._max_tokens, 1, wx.EXPAND)
+
+            grid.Add(
                 wx.StaticText(self, label="Recent turns to keep:"), 0, wx.ALIGN_CENTER_VERTICAL
             )
             self._keep_recent_turns = wx.SpinCtrl(
@@ -159,6 +169,7 @@ if _WX_AVAILABLE:
             settings.llm_compact_threshold = compact_threshold
             settings.llm_compact_target_threshold = compact_target
             settings.llm_keep_recent_turns = self._keep_recent_turns.GetValue()
+            settings.llm_max_tokens = self._max_tokens.GetValue()
             return True
 
 else:
