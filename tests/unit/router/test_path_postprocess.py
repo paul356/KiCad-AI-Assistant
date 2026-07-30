@@ -162,17 +162,21 @@ def test_postprocess_path_via_dimensions_from_call():
     assert vias[0].drill == 0.4
 
 
-def test_postprocess_path_inconsistent_via_raises():
-    """Layer transition that moves (x, y) is a programming error."""
+def test_postprocess_path_offset_via_emits_bridge():
+    """Layer transition with slightly offset (x, y) emits a bridging segment."""
     path = [
         RouteNode(0.0, 0.0, "F.Cu", 0),
         RouteNode(5.0, 0.0, "F.Cu", 1),
         RouteNode(5.0, 1.0, "B.Cu", 2),  # via at non-matching (x, y)
     ]
-    import pytest
-
-    with pytest.raises(RuntimeError, match="co-located"):
-        postprocess_path(path, width=0.25, net="VCC")
+    segs, vias = postprocess_path(path, width=0.25, net="VCC")
+    # Via is emitted at the previous node's position.
+    assert len(vias) == 1
+    assert vias[0].x == 5.0
+    assert vias[0].y == 0.0
+    assert vias[0].layers == ("F.Cu", "B.Cu")
+    # A bridging segment connects (5.0, 0.0)→(5.0, 1.0) on B.Cu.
+    assert len(segs) >= 2  # at least F.Cu segment + B.Cu bridge
 
 
 def test_postprocess_path_empty_returns_empty():
