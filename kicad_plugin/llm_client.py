@@ -1395,7 +1395,7 @@ class LLMClient:
             total_payload,
         )
         self._validate_history()  # guard against corrupted history before every API call
-        max_retries = 3
+        max_retries = 5
         for attempt in range(max_retries):
             if provider == "ollama":
                 if on_text_delta is not None:
