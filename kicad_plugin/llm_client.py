@@ -516,14 +516,10 @@ def _is_retryable_llm_error(error: str) -> bool:
         kw in lower
         for kw in (
             "503",
-            "502",
+            "429",
             "service_unavailable",
             "service is too busy",
-            "server error",
-            "internal server error",
-            "bad gateway",
             "rate limit",
-            "429",
         )
     )
 
