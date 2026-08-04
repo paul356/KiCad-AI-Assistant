@@ -559,6 +559,7 @@ class LLMClient:
             settings, "llm_compact_target_threshold", 0.49
         )
         self._keep_recent_turns: int = getattr(settings, "llm_keep_recent_turns", 4)
+        self._max_tokens: int = getattr(settings, "llm_max_tokens", 0)
         self._history: list[dict[str, Any]] = []
 
     def reset(self) -> None:
@@ -1613,14 +1614,16 @@ class LLMClient:
         url = f"{base}/api/chat"
 
         messages = [{"role": "system", "content": system}] + self._history
-        payload = json.dumps(
-            {
-                "model": self._settings.llm_model,
-                "messages": messages,
-                "tools": tools or None,
-                "stream": True,
-            }
-        ).encode()
+        payload_dict: dict[str, Any] = {
+            "model": self._settings.llm_model,
+            "messages": messages,
+            "tools": tools or None,
+            "stream": True,
+            "options": {"num_ctx": self._context_tokens},
+        }
+        if self._max_tokens > 0:
+            payload_dict["options"]["num_predict"] = self._max_tokens
+        payload = json.dumps(payload_dict).encode()
         headers = {"Content-Type": "application/json"}
 
         import urllib.error
@@ -1716,11 +1719,12 @@ class LLMClient:
         messages = self._build_anthropic_messages()
         payload: dict[str, Any] = {
             "model": self._settings.llm_model,
-            "max_tokens": 4096,
             "system": system,
             "messages": messages,
             "stream": True,
         }
+        if self._max_tokens > 0:
+            payload["max_tokens"] = self._max_tokens
         if anthropic_tools:
             payload["tools"] = anthropic_tools
         encoded = json.dumps(payload).encode()
@@ -1856,13 +1860,14 @@ class LLMClient:
         else:
             url = f"{base}/v1/chat/completions"
         messages = [{"role": "system", "content": system}] + self._history
-        payload = json.dumps(
-            {
-                "model": self._settings.llm_model,
-                "messages": messages,
-                "tools": tools or None,
-            }
-        ).encode()
+        payload_dict: dict[str, Any] = {
+            "model": self._settings.llm_model,
+            "messages": messages,
+            "tools": tools or None,
+        }
+        if self._max_tokens > 0:
+            payload_dict["max_tokens"] = self._max_tokens
+        payload = json.dumps(payload_dict).encode()
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self._settings.llm_api_key}",
@@ -1898,14 +1903,16 @@ class LLMClient:
         url = f"{base}/api/chat"
 
         messages = [{"role": "system", "content": system}] + self._history
-        payload = json.dumps(
-            {
-                "model": self._settings.llm_model,
-                "messages": messages,
-                "tools": tools or None,
-                "stream": False,
-            }
-        ).encode()
+        payload_dict: dict[str, Any] = {
+            "model": self._settings.llm_model,
+            "messages": messages,
+            "tools": tools or None,
+            "stream": False,
+            "options": {"num_ctx": self._context_tokens},
+        }
+        if self._max_tokens > 0:
+            payload_dict["options"]["num_predict"] = self._max_tokens
+        payload = json.dumps(payload_dict).encode()
         headers = {"Content-Type": "application/json"}
 
         try:
@@ -1953,12 +1960,13 @@ class LLMClient:
         ]
         messages = self._build_anthropic_messages()
 
-        payload = {
+        payload: dict[str, Any] = {
             "model": self._settings.llm_model,
-            "max_tokens": 4096,
             "system": system,
             "messages": messages,
         }
+        if self._max_tokens > 0:
+            payload["max_tokens"] = self._max_tokens
         if anthropic_tools:
             payload["tools"] = anthropic_tools
         encoded = json.dumps(payload).encode()
