@@ -175,13 +175,6 @@ def postprocess_path(
         prev = path[i - 1]
         cur = path[i]
         if cur.layer != prev.layer:
-            # Sanity-check: via edges should connect same (x, y) nodes.
-            if abs(cur.x - prev.x) > 1e-6 or abs(cur.y - prev.y) > 1e-6:
-                raise RuntimeError(
-                    f"Layer transition {prev.layer}->{cur.layer} at "
-                    f"({prev.x:.3f},{prev.y:.3f})->({cur.x:.3f},{cur.y:.3f}) "
-                    f"is not co-located; visibility graph bug."
-                )
             # Emit the previous group as segments.
             segments.extend(
                 postprocess(
@@ -205,9 +198,32 @@ def postprocess_path(
                     net=net,
                 )
             )
-            # Start a new group on the new layer, including the current node
-            # so the via point is preserved in the new layer's polyline.
-            group = [cur]
+            # If the next layer's start point differs from the via
+            # position, insert a short bridging segment on the new layer.
+            if abs(cur.x - prev.x) > 1e-6 or abs(cur.y - prev.y) > 1e-6:
+                group = [
+                    RouteNode(
+                        x=prev.x,
+                        y=prev.y,
+                        layer=cur.layer,
+                        node_id=prev.node_id,
+                    ),
+                    cur,
+                ]
+                segments.extend(
+                    postprocess(
+                        group,
+                        width=width,
+                        layer=cur.layer,
+                        net=net,
+                        max_miter_mm=max_miter_mm,
+                        _obstacles=_obstacles,
+                        _pad_rects=_pad_rects,
+                    )
+                )
+                group = [cur]
+            else:
+                group = [cur]
         else:
             group.append(cur)
     # Flush the final group.

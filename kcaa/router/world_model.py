@@ -27,7 +27,6 @@ from typing import Any, Literal
 
 from shapely.geometry import Point, Polygon
 
-from kcaa.utils.pcb_board_utils import get_fp_courtyard_bbox
 from kcaa.utils.pcb_sexp_utils import load_pcb
 
 ObstacleKind = Literal["footprint", "pad", "track", "via", "keepout", "board_edge", "drill"]
@@ -72,24 +71,20 @@ class WorldModel:
 def build_world_model(
     pcb_path: str,
     net_filter: str | None = None,
-    exclude_refs: set[str] | None = None,
-    include_footprints: bool = True,
 ) -> WorldModel:
     """Build a world model from a .kicad_pcb file.
 
+    Obstacles include only real copper: pads (excluding the route's own
+    net), NPTH drill holes, track segments, vias, and keepout zones.
+    Footprint courtyard AABBs are NOT treated as obstacles — they are a
+    DRC spacing concept, not copper, and vias can legitimately be placed
+    within another footprint's courtyard.
+
     Args:
         pcb_path: Absolute path to the .kicad_pcb file.
-        net_filter: If given, existing tracks/vias on this net are *not*
-            treated as obstacles (they belong to the route we're building).
-        exclude_refs: Footprint references to exclude entirely (e.g. the
-            footprint containing the start/end pad — no point routing around
-            itself). Only consulted when ``include_footprints`` is True.
-        include_footprints: When True (default), each footprint's courtyard
-            AABB is added as a forbidden region.  When False, footprints are
-            not added to the world model at all — only existing copper
-            (tracks, vias, keepouts) blocks the route.  This matches the
-            way most hand-routed PCBs work: the track only needs to dodge
-            existing copper, not the DRC spacing around other parts.
+        net_filter: If given, existing tracks/vias/pads on this net are
+            *not* treated as obstacles (they belong to the route we're
+            building).
 
     Returns:
         A populated :class:`WorldModel`.
@@ -97,7 +92,6 @@ def build_world_model(
     data = load_pcb(pcb_path)
     model = WorldModel()
     model.board_bbox = _board_bbox(data)
-    exclude_refs = exclude_refs or set()
 
     for item in data:
         if not _is_list(item):
@@ -105,8 +99,7 @@ def build_world_model(
         tag = _sym(item[0])
         if tag == "footprint":
             # NPTH drill holes are real copper-free regions on every
-            # layer, so they block routing independently of whether the
-            # caller wants footprint courtyards as obstacles.
+            # layer and block routing on all layers.
             fp_x, fp_y, fp_rot = _node_at3(item)
             for sub in item:
                 if not _is_list(sub) or str(sub[0]) != "pad":
@@ -115,10 +108,6 @@ def build_world_model(
                 if obs is not None:
                     model.obstacles.append(obs)
                 obs = _pad_obstacle(sub, fp_x, fp_y, fp_rot, net_filter)
-                if obs is not None:
-                    model.obstacles.append(obs)
-            if include_footprints:
-                obs = _footprint_obstacle(item, exclude_refs)
                 if obs is not None:
                     model.obstacles.append(obs)
         elif tag == "segment":
@@ -487,35 +476,6 @@ def _keepout_obstacle(zone_node: list[Any]) -> Obstacle | None:
     if poly.is_empty or not poly.is_valid:
         return None
     return Obstacle(shape=poly, layers=frozenset({layer}), net=None, kind="keepout")
-
-
-def _footprint_obstacle(fp_node: list[Any], exclude_refs: set[str]) -> Obstacle | None:
-    """Build a footprint obstacle from its courtyard AABB."""
-    fp_x, fp_y, fp_rot = _node_at3(fp_node)
-    ref = None
-    for sub in fp_node:
-        if _is_list(sub) and _sym(sub[0]) == "property" and len(sub) >= 2:
-            name = sub[1] if isinstance(sub[1], str) else _sym(sub[1])
-            if name == "Reference" and len(sub) >= 3:
-                ref = sub[2] if isinstance(sub[2], str) else _sym(sub[2])
-                break
-    if ref in exclude_refs:
-        return None
-
-    bbox = get_fp_courtyard_bbox(fp_node, fp_x, fp_y, fp_rot)
-    if bbox is None:
-        return None
-    poly = Polygon(
-        [
-            (bbox["min_x"], bbox["min_y"]),
-            (bbox["max_x"], bbox["min_y"]),
-            (bbox["max_x"], bbox["max_y"]),
-            (bbox["min_x"], bbox["max_y"]),
-        ]
-    )
-    return Obstacle(
-        shape=poly, layers=frozenset({"F.Cu", "B.Cu"}), net=None, kind="footprint", ref=ref
-    )
 
 
 def _board_bbox(data: list[Any]) -> tuple[float, float, float, float] | None:

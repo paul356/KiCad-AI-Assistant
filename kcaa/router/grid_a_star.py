@@ -56,6 +56,9 @@ _DIRECTIONS = [
 _CARD_COST = 1.0
 _DIAG_COST = math.sqrt(2.0)
 
+# Default via cost (mm added to the path for each via transition).
+_VIA_COST = 2.0
+
 
 @dataclass
 class GridNode:
@@ -212,13 +215,14 @@ class AStarResult:
     """Result of a Grid A* search.
 
     Attributes:
-        path: Ordered list of world-coordinate ``(x, y)`` tuples from
-            start to goal, or ``None`` if no path exists.
+        path: Ordered list of ``(x, y, layer_idx)`` tuples from start to
+            goal, or ``None`` if no path exists.  For single-layer searches
+            ``layer_idx`` is always 0.
         cells_visited: Number of cells expanded.
         path_length_mm: Total Euclidean length of the path in mm.
     """
 
-    path: list[tuple[float, float]] | None
+    path: list[tuple[float, float, int]] | None = None
     cells_visited: int = 0
     path_length_mm: float = 0.0
 
@@ -231,39 +235,68 @@ def _octile_dist(gx: int, gy: int, ex: int, ey: int) -> float:
 
 
 def grid_a_star(
-    grid: GridMap,
+    grids: list[GridMap],
     start_world: tuple[float, float],
     end_world: tuple[float, float],
+    start_layer_idx: int = 0,
+    end_layer_idx: int = 0,
+    via_from: dict[int, set[int]] | None = None,
+    via_cost: float = _VIA_COST,
+    via_forbidden_zones: list | None = None,
 ) -> AStarResult:
-    """Run A* on *grid* from *start_world* to *end_world*.
+    """Run A* on one or more walkability grids.
+
+    Single-layer usage (backward-compatible):
+        ``grid_a_star([grid], start, end)``
+
+    Multi-layer usage:
+        ``grid_a_star([g_fcu, g_bcu], start, end, start_layer_idx=0,
+                       end_layer_idx=1, via_from={0: {1}, 1: {0}})``
 
     Args:
-        grid: Walkability grid.
-        start_world: ``(x, y)`` in mm.
-        end_world: ``(x, y)`` in mm.
+        grids: One :class:`GridMap` per layer.  All grids must share the
+            same resolution, origin, width and height.
+        start_world: ``(x, y)`` in mm on ``grids[start_layer_idx]``.
+        end_world: ``(x, y)`` in mm on ``grids[end_layer_idx]``.
+        start_layer_idx: Index into ``grids`` for the start node.
+        end_layer_idx: Index into ``grids`` for the goal node.
+        via_from: ``{layer_idx: {reachable_layer_idx}}``.  ``None`` means
+            no via edges (single-layer mode).
+        via_cost: Distance-equivalent cost per via transition (mm).
+        via_forbidden_zones: Optional list of ``shapely`` Polygon objects
+            where vias are forbidden (e.g. start/end pad AABBs).
 
     Returns:
-        :class:`AStarResult` with the path in world coordinates, or
-        ``path=None`` if unreachable.
+        :class:`AStarResult` with ``path`` as ``list[(x, y, layer_idx)]``,
+        or ``path=None`` if unreachable.
     """
-    sx, sy = grid.to_grid(start_world[0], start_world[1])
-    ex, ey = grid.to_grid(end_world[0], end_world[1])
+    ref = grids[0]
+    W = ref.width
+    H = ref.height
+    n_layers = len(grids)
 
-    sx = max(0, min(grid.width - 1, sx))
-    sy = max(0, min(grid.height - 1, sy))
-    ex = max(0, min(grid.width - 1, ex))
-    ey = max(0, min(grid.height - 1, ey))
+    sx, sy = ref.to_grid(start_world[0], start_world[1])
+    ex, ey = ref.to_grid(end_world[0], end_world[1])
 
-    if not grid.is_free(sx, sy) or not grid.is_free(ex, ey):
+    sx = max(0, min(W - 1, sx))
+    sy = max(0, min(H - 1, sy))
+    ex = max(0, min(W - 1, ex))
+    ey = max(0, min(H - 1, ey))
+
+    if not grids[start_layer_idx].is_free(sx, sy):
+        return AStarResult(path=None)
+    if not grids[end_layer_idx].is_free(ex, ey):
         return AStarResult(path=None)
 
-    width = grid.width
-    start_id = sy * width + sx
-    end_id = ey * width + ex
+    def _encode(gx: int, gy: int, li: int) -> int:
+        return (gy * W + gx) * n_layers + li
+
+    start_id = _encode(sx, sy, start_layer_idx)
+    end_id = _encode(ex, ey, end_layer_idx)
 
     g_score = {start_id: 0.0}
-    parent: dict[int, tuple[int, int] | None] = {start_id: None}
-    open_heap = [(0.0, start_id)]
+    parent: dict[int, int | None] = {start_id: None}
+    open_heap = [(_octile_dist(sx, sy, ex, ey), start_id)]
     closed: set[int] = set()
     visited = 0
 
@@ -275,39 +308,73 @@ def grid_a_star(
         visited += 1
 
         if cur_id == end_id:
-            path: list[tuple[float, float]] = []
-            node = cur_id
-            while node is not None:
-                gx = node % width
-                gy = node // width
-                path.append(grid.to_world(gx, gy))
-                node = parent[node]  # type: ignore[assignment]
+            path: list[tuple[float, float, int]] = []
+            nid = cur_id
+            while nid is not None:
+                li = nid % n_layers
+                rest = nid // n_layers
+                gy_p = rest // W
+                gx_p = rest % W
+                wx, wy = ref.to_world(gx_p, gy_p)
+                path.append((wx, wy, li))
+                nid = parent[nid]
             path.reverse()
 
-            total_len = sum(
-                math.hypot(path[i + 1][0] - path[i][0], path[i + 1][1] - path[i][1])
-                for i in range(len(path) - 1)
-            )
+            # Compute length from world-coordinate distance (ignore
+            # layer — via cost is already baked into g_score).
+            total_len = 0.0
+            for i in range(1, len(path)):
+                px, py, _ = path[i - 1]
+                cx, cy, _ = path[i]
+                total_len += math.hypot(cx - px, cy - py)
             return AStarResult(path=path, cells_visited=visited, path_length_mm=total_len)
 
-        cx = cur_id % width
-        cy = cur_id // width
+        li = cur_id % n_layers
+        rest = cur_id // n_layers
+        cy = rest // W
+        cx = rest % W
         cur_g = g_score[cur_id]
+        cur_grid = grids[li]
 
+        # ---- Same-layer 8-dir moves ----
         for dx, dy, is_diag in _DIRECTIONS:
             nx, ny = cx + dx, cy + dy
-            if not grid.is_free(nx, ny):
+            if not cur_grid.is_free(nx, ny):
                 continue
-            nid = ny * width + nx
+            nid = _encode(nx, ny, li)
             if nid in closed:
                 continue
             step = _DIAG_COST if is_diag else _CARD_COST
             tentative = cur_g + step
             if tentative < g_score.get(nid, float("inf")):
                 g_score[nid] = tentative
-                f = tentative + _octile_dist(nx, ny, ex, ey)
-                heapq.heappush(open_heap, (f, nid))
+                heapq.heappush(
+                    open_heap,
+                    (tentative + _octile_dist(nx, ny, ex, ey), nid),
+                )
                 parent[nid] = cur_id
+
+        # ---- Via moves to other layers ----
+        if via_from:
+            for tgt_li in via_from.get(li, ()):
+                if not grids[tgt_li].is_free(cx, cy):
+                    continue
+                # Forbid vias on start/end pad AABBs.
+                if via_forbidden_zones:
+                    wx, wy = ref.to_world(cx, cy)
+                    if any(z.contains(Point(wx, wy)) for z in via_forbidden_zones):
+                        continue
+                nid = _encode(cx, cy, tgt_li)
+                if nid in closed:
+                    continue
+                tentative = cur_g + via_cost
+                if tentative < g_score.get(nid, float("inf")):
+                    g_score[nid] = tentative
+                    heapq.heappush(
+                        open_heap,
+                        (tentative + _octile_dist(cx, cy, ex, ey), nid),
+                    )
+                    parent[nid] = cur_id
 
     return AStarResult(path=None, cells_visited=visited)
 
@@ -390,15 +457,17 @@ def hierarchical_a_star(
 
     if fine_cells < _SINGLE_PASS_THRESHOLD:
         grid = build_grid_map(obstacles, bbox, resolution=fine_resolution)
-        return grid_a_star(grid, start_world, end_world)
+        return grid_a_star([grid], start_world, end_world)
 
     coarse_res = fine_resolution * COARSE_FACTOR
     coarse_grid = build_grid_map(obstacles, bbox, resolution=coarse_res)
-    coarse_result = grid_a_star(coarse_grid, start_world, end_world)
+    coarse_result = grid_a_star([coarse_grid], start_world, end_world)
     if coarse_result.path is None:
         return AStarResult(path=None, cells_visited=coarse_result.cells_visited)
 
-    simplified = simplify_path(coarse_result.path)
+    # Strip layer_idx from coarse path for simplify_path (expects (x, y)).
+    coarse_xy = [(x, y) for x, y, _ in coarse_result.path]
+    simplified = simplify_path(coarse_xy)
     band = _band_bbox(simplified)
     band = (
         max(bbox[0], band[0]),
@@ -408,7 +477,7 @@ def hierarchical_a_star(
     )
 
     fine_grid = build_grid_map(obstacles, band, resolution=fine_resolution)
-    result = grid_a_star(fine_grid, start_world, end_world)
+    result = grid_a_star([fine_grid], start_world, end_world)
     if result.path is not None:
         result.cells_visited += coarse_result.cells_visited
     else:
@@ -419,10 +488,6 @@ def hierarchical_a_star(
 # ═══════════════════════════════════════════════════════════════════════
 # Multi-layer A* — cross-layer routing with via edges
 # ═══════════════════════════════════════════════════════════════════════
-
-# Default via cost (mm added to the path for each via transition).
-# Matches the original visibility-graph DEFAULT_VIA_COST_FN(0).
-_VIA_COST = 2.0
 
 
 @dataclass
@@ -469,148 +534,61 @@ def multi_layer_a_star(
     route_bbox: tuple[float, float, float, float],
     fine_resolution: float = GRID_RESOLUTION,
     via_cost: float = _VIA_COST,
+    via_forbidden_zones: list | None = None,
 ) -> MultiLayerAStarResult:
-    """Run A* across multiple copper layers, inserting via edges where legal.
+    """Run A* across multiple copper layers.
 
-    Each layer has its own walkability grid.  The search state is
-    ``(grid_x, grid_y, layer)``.  From each state A* expands:
-
-    * 8 neighbours on the **same layer** (standard 8-dir movement).
-    * Via transitions to layers reachable via ``via_pairs``, provided the
-      target cell is free on the destination layer.
-
-    Via edges cost a fixed ``via_cost`` mm (2.0 mm default) — the same
-    cost model as the original visibility-graph router.  The cost is
-    independent of the via-count because Grid A* does not maintain a
-    running via count.
-
-    The heuristic is octile distance to the goal on the goal layer,
-    which is admissible because via costs are non-negative.
+    Thin wrapper around :func:`grid_a_star` that builds per-layer
+    :class:`GridMap` instances, translates layer names to indices,
+    and decodes the result into :class:`GridNode` objects.
 
     Args:
         obstacles_by_layer: ``{layer_name: [obstacle_objects]}``.
         start_world: ``(x, y)`` in mm on ``start_layer``.
         end_world: ``(x, y)`` in mm on ``end_layer``.
-        start_layer: Layer name for the start point.
-        end_layer: Layer name for the end point.
+        start_layer / end_layer: Copper layer names.
         via_pairs: Allowed ``(from, to)`` layer pairs for via edges.
-        route_bbox: ``(min_x, min_y, max_x, max_y)`` of the route area.
+        route_bbox: ``(min_x, min_y, max_x, max_y)``.
         fine_resolution: Grid cell size in mm.
-        via_cost: Distance-equivalent cost added per via transition.
+        via_cost: Distance-equivalent cost per via transition.
+        via_forbidden_zones: ``shapely`` Polygon list where vias are
+            forbidden (e.g. start/end pad AABBs).
 
     Returns:
-        :class:`MultiLayerAStarResult` with GridNode path (``path=None`` if
-        unreachable).
+        :class:`MultiLayerAStarResult`.
     """
     layers = _collect_routing_layers(start_layer, end_layer, via_pairs)
-    n_layers = len(layers)
     layer_to_idx = {l: i for i, l in enumerate(layers)}
 
-    # Build one GridMap per layer.  All share the same resolution and
-    # origin — crucial for via-edge alignment.
-    grids: dict[str, GridMap] = {}
+    # Build one GridMap per layer.
+    grids_list: list[GridMap] = []
     for layer in layers:
         obs = obstacles_by_layer.get(layer, [])
-        grids[layer] = build_grid_map(obs, route_bbox, resolution=fine_resolution)
+        grids_list.append(build_grid_map(obs, route_bbox, resolution=fine_resolution))
 
-    ref_grid = grids[layers[0]]
-    W = ref_grid.width
-    H = ref_grid.height
-
-    # Start / end grid coordinates.
-    gx, gy = ref_grid.to_grid(start_world[0], start_world[1])
-    sx = max(0, min(W - 1, gx))
-    sy = max(0, min(H - 1, gy))
-    gx, gy = ref_grid.to_grid(end_world[0], end_world[1])
-    ex = max(0, min(W - 1, gx))
-    ey = max(0, min(H - 1, gy))
-
-    start_li = layer_to_idx[start_layer]
-    end_li = layer_to_idx[end_layer]
-
-    if not grids[start_layer].is_free(sx, sy) or not grids[end_layer].is_free(ex, ey):
-        return MultiLayerAStarResult(path=None)
-
-    # State encoding: (gy * W + gx) * n_layers + layer_idx
-    def _encode(gx: int, gy: int, li: int) -> int:
-        return (gy * W + gx) * n_layers + li
-
-    start_id = _encode(sx, sy, start_li)
-    end_id = _encode(ex, ey, end_li)
-
-    # Build via adjacency: for each layer, which other layers can it via to?
-    via_from: dict[int, set[int]] = {i: set() for i in range(n_layers)}
+    # Build via adjacency index.
+    via_from: dict[int, set[int]] = {}
     for t, b in via_pairs:
         if t in layer_to_idx and b in layer_to_idx:
             ti, bi = layer_to_idx[t], layer_to_idx[b]
-            via_from[ti].add(bi)
-            via_from[bi].add(ti)
+            via_from.setdefault(ti, set()).add(bi)
+            via_from.setdefault(bi, set()).add(ti)
 
-    g_score = {start_id: 0.0}
-    parent: dict[int, int | None] = {start_id: None}
-    open_heap = [(_octile_dist(sx, sy, ex, ey), start_id)]
-    closed: set[int] = set()
-    visited = 0
+    result = grid_a_star(
+        grids_list,
+        start_world,
+        end_world,
+        start_layer_idx=layer_to_idx[start_layer],
+        end_layer_idx=layer_to_idx[end_layer],
+        via_from=via_from or None,
+        via_cost=via_cost,
+        via_forbidden_zones=via_forbidden_zones,
+    )
+    if result.path is None:
+        return MultiLayerAStarResult(path=None, cells_visited=result.cells_visited)
 
-    while open_heap:
-        _, cur_id = heapq.heappop(open_heap)
-        if cur_id in closed:
-            continue
-        closed.add(cur_id)
-        visited += 1
-
-        if cur_id == end_id:
-            # Reconstruct path
-            path_rev: list[GridNode] = []
-            nid = cur_id
-            while nid is not None:
-                li = nid % n_layers
-                rest = nid // n_layers
-                gy_p = rest // W
-                gx_p = rest % W
-                wx, wy = ref_grid.to_world(gx_p, gy_p)
-                path_rev.append(GridNode(x=wx, y=wy, layer=layers[li]))
-                nid = parent[nid]
-            path_rev.reverse()
-            return MultiLayerAStarResult(path=path_rev, cells_visited=visited)
-
-        li = cur_id % n_layers
-        rest = cur_id // n_layers
-        cy = rest // W
-        cx = rest % W
-        cur_g = g_score[cur_id]
-        cur_layer = layers[li]
-        cur_grid = grids[cur_layer]
-
-        # ---- Same-layer 8-dir moves ----
-        for dx, dy, is_diag in _DIRECTIONS:
-            nx, ny = cx + dx, cy + dy
-            if not cur_grid.is_free(nx, ny):
-                continue
-            nid = _encode(nx, ny, li)
-            if nid in closed:
-                continue
-            step = _DIAG_COST if is_diag else _CARD_COST
-            tentative = cur_g + step
-            if tentative < g_score.get(nid, float("inf")):
-                g_score[nid] = tentative
-                heapq.heappush(open_heap, (tentative + _octile_dist(nx, ny, ex, ey), nid))
-                parent[nid] = cur_id
-
-        # ---- Via moves to other layers ----
-        for tgt_li in via_from[li]:
-            if not grids[layers[tgt_li]].is_free(cx, cy):
-                continue
-            nid = _encode(cx, cy, tgt_li)
-            if nid in closed:
-                continue
-            tentative = cur_g + via_cost
-            if tentative < g_score.get(nid, float("inf")):
-                g_score[nid] = tentative
-                heapq.heappush(open_heap, (tentative + _octile_dist(cx, cy, ex, ey), nid))
-                parent[nid] = cur_id
-
-    return MultiLayerAStarResult(path=None, cells_visited=visited)
+    nodes = [GridNode(x=x, y=y, layer=layers[li]) for x, y, li in result.path]
+    return MultiLayerAStarResult(path=nodes, cells_visited=result.cells_visited)
 
 
 def simplify_path(
