@@ -672,6 +672,10 @@ class LLMClient:
             role = msg.get("role", "")
             if role == "user":
                 content = msg.get("content") or ""
+                if isinstance(content, list):
+                    content = " ".join(
+                        b.get("text", "") for b in content if b.get("type") == "text"
+                    )
                 lines.append(f"User: {content}")
             elif role == "assistant":
                 content = msg.get("content") or ""
@@ -1256,6 +1260,7 @@ class LLMClient:
         context_block: str,
         on_tool_call: Callable[[str, dict, Any], None] | None = None,
         on_text_delta: Callable[[str], None] | None = None,
+        images: list[dict[str, Any]] | None = None,
     ) -> str:
         """
         Run one engineer request through the agentic loop.
@@ -1267,12 +1272,15 @@ class LLMClient:
                            after each tool execution — use this to update the UI.
             on_text_delta: Optional callback(chunk) fired for each text chunk
                            when streaming is active.
+            images:        Optional list of dicts {"media_type": "image/png",
+                           "data": "<base64>"} attached to this user message.
 
         Returns:
             The final assistant text message for display.
         """
         system = build_system_prompt(context_block)
-        self._history.append({"role": "user", "content": user_message})
+        content = self._build_user_content(user_message, images)
+        self._history.append({"role": "user", "content": content})
         self._maybe_compact(system)
 
         tools = self._fetch_tool_definitions()
@@ -1339,6 +1347,30 @@ class LLMClient:
             self._history.extend(tool_results)
 
         return "[Error] Maximum tool-call iterations reached. Please try a simpler request."
+
+    @staticmethod
+    def _build_user_content(
+        user_message: str, images: list[dict[str, Any]] | None
+    ) -> str | list[dict[str, Any]]:
+        """Build the user message content (plain string or multimodal array).
+
+        The canonical format stored in history is OpenAI-style content blocks;
+        provider-specific formats (Anthropic / Ollama) are converted at request
+        time by _anthropic_content / _ollama_messages.
+        """
+        if not images:
+            return user_message
+        blocks: list[dict[str, Any]] = [{"type": "text", "text": user_message}]
+        for img in images:
+            media = img.get("media_type", "image/png")
+            data = img.get("data", "")
+            blocks.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{media};base64,{data}"},
+                }
+            )
+        return blocks
 
     def _fetch_tool_definitions(self) -> list[dict[str, Any]]:
         """Fetch available tools from the MCP server and convert to LLM format."""
@@ -1476,9 +1508,37 @@ class LLMClient:
                 )
                 messages.append({"role": "assistant", "content": content_blocks})
             else:
-                messages.append({"role": role, "content": m.get("content", "")})
+                messages.append(
+                    {"role": role, "content": self._anthropic_content(m.get("content", ""))}
+                )
             i += 1
         return messages
+
+    @staticmethod
+    def _anthropic_content(content) -> str | list[dict[str, Any]]:
+        """Convert OpenAI-style content blocks to Anthropic message format."""
+        if isinstance(content, str):
+            return content
+        blocks: list[dict[str, Any]] = []
+        for block in content:
+            if block.get("type") == "text":
+                blocks.append({"type": "text", "text": block.get("text", "")})
+            elif block.get("type") == "image_url":
+                url = block.get("image_url", {}).get("url", "")
+                if url.startswith("data:"):
+                    header, _, data = url.partition(",")
+                    media_type = header[5:].split(";")[0]
+                    blocks.append(
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": media_type,
+                                "data": data,
+                            },
+                        }
+                    )
+        return blocks
 
     def _stream_openai(self, system: str, tools: list[dict], on_text_delta) -> dict[str, Any]:
         """Call OpenAI-compatible API with streaming enabled.
@@ -1599,6 +1659,36 @@ class LLMClient:
                 log.debug("Non-streaming callback error: %s", e)
         return result
 
+    def _ollama_messages(self) -> list[dict[str, Any]]:
+        """Convert self._history to Ollama /api/chat message format.
+
+        Multimodal history (OpenAI-style image_url blocks) is flattened: text
+        becomes a plain string and base64 images are attached via the
+        per-message ``images`` field (supported by all Ollama versions).
+        """
+        out: list[dict[str, Any]] = []
+        for msg in self._history:
+            content = msg.get("content", "")
+            images: list[str] = []
+            if isinstance(content, list):
+                text_parts: list[str] = []
+                for block in content:
+                    if block.get("type") == "text":
+                        text_parts.append(block.get("text", ""))
+                    elif block.get("type") == "image_url":
+                        url = block.get("image_url", {}).get("url", "")
+                        if url.startswith("data:"):
+                            _, _, data = url.partition(",")
+                        else:
+                            data = url
+                        images.append(data)
+                content = "\n".join(p for p in text_parts if p)
+            converted = {**msg, "content": content}
+            if images:
+                converted["images"] = images
+            out.append(converted)
+        return out
+
     def _stream_ollama(self, system: str, tools: list[dict], on_text_delta) -> dict[str, Any]:
         """Call Ollama native API with streaming enabled.
 
@@ -1609,7 +1699,7 @@ class LLMClient:
         base = (self._settings.llm_base_url or "http://localhost:11434").rstrip("/")
         url = f"{base}/api/chat"
 
-        messages = [{"role": "system", "content": system}] + self._history
+        messages = [{"role": "system", "content": system}] + self._ollama_messages()
         payload_dict: dict[str, Any] = {
             "model": self._settings.llm_model,
             "messages": messages,
@@ -1898,7 +1988,7 @@ class LLMClient:
         base = (self._settings.llm_base_url or "http://localhost:11434").rstrip("/")
         url = f"{base}/api/chat"
 
-        messages = [{"role": "system", "content": system}] + self._history
+        messages = [{"role": "system", "content": system}] + self._ollama_messages()
         payload_dict: dict[str, Any] = {
             "model": self._settings.llm_model,
             "messages": messages,

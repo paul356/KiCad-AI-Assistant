@@ -41,6 +41,24 @@ if _WX_AVAILABLE:
         pass
 
 
+def _strip_images_from_history(history: list[dict]) -> list[dict]:
+    """Drop image_url blocks (base64 bloat) from history before persisting."""
+    stripped = []
+    for msg in history:
+        content = msg.get("content")
+        if isinstance(content, list):
+            text_blocks = [b for b in content if b.get("type") == "text"]
+            if len(text_blocks) == 1:
+                content = text_blocks[0].get("text", "")
+            elif text_blocks:
+                content = text_blocks
+            else:
+                content = ""
+            msg = {**msg, "content": content}
+        stripped.append(msg)
+    return stripped
+
+
 if _WX_AVAILABLE:
 
     class AssistantPanel(wx.Frame):
@@ -103,6 +121,9 @@ if _WX_AVAILABLE:
             self._stream_wrapper_visible: bool = False
             # Shell load retry counter (prevents infinite retry on WebView2 failure).
             self._shell_retry_count: int = 0
+            # Paths of images the user attached for the next message (cleared
+            # after send). Populated via the "Attach image" button or clipboard.
+            self._attached_images: list[str] = []
 
             # Page-load watchdog: if _on_webview_loaded never fires (WebView2
             # glitch on Windows), reset _page_loading so renders are not
@@ -287,8 +308,24 @@ if _WX_AVAILABLE:
             search_hbox.Add(self._search_close_btn, 0)
             vbox.Add(search_hbox, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM | wx.EXPAND, 4)
 
+            # ---- Attachments bar (image thumbnails; empty when none attached) ----
+            self._attachments_hbox = wx.BoxSizer(wx.HORIZONTAL)
+            vbox.Add(self._attachments_hbox, 0, wx.LEFT | wx.RIGHT | wx.EXPAND, 4)
+
             # ---- Input row ----
             hbox = wx.BoxSizer(wx.HORIZONTAL)
+
+            self._add_img_btn = wx.BitmapButton(
+                panel, bitmap=wx.ArtProvider.GetBitmap(wx.ART_FILE_OPEN, wx.ART_BUTTON, (20, 20))
+            )
+            self._add_img_btn.SetToolTip("Attach image(s)")
+            hbox.Add(self._add_img_btn, 0, wx.RIGHT, 2)
+
+            self._paste_img_btn = wx.BitmapButton(
+                panel, bitmap=wx.ArtProvider.GetBitmap(wx.ART_PASTE, wx.ART_BUTTON, (20, 20))
+            )
+            self._paste_img_btn.SetToolTip("Paste image from clipboard (Ctrl+V)")
+            hbox.Add(self._paste_img_btn, 0, wx.RIGHT, 4)
 
             self._input = wx.TextCtrl(
                 panel, style=wx.TE_PROCESS_ENTER | wx.TE_MULTILINE | wx.BORDER_SIMPLE
@@ -378,6 +415,8 @@ if _WX_AVAILABLE:
 
             # ---- Events ----
             self._stop_btn.Bind(wx.EVT_BUTTON, self._on_stop)
+            self._add_img_btn.Bind(wx.EVT_BUTTON, self._on_add_image)
+            self._paste_img_btn.Bind(wx.EVT_BUTTON, self._on_paste_from_clipboard)
             self._input.Bind(wx.EVT_TEXT_ENTER, self._on_send)
             self._input.Bind(wx.EVT_CHAR_HOOK, self._on_input_key)
             self.Bind(wx.EVT_MENU, self._on_settings, id=wx.ID_PREFERENCES)
@@ -612,17 +651,33 @@ if _WX_AVAILABLE:
                 )
                 return
             text = self._input.GetValue().strip()
-            if not text:
+            images = self._encode_attached_images()
+            if not text and not images:
                 return
-            log.info("_on_send: user message (%d chars)", len(text))
+            if images and not self._settings.llm_supports_vision:
+                wx.MessageBox(
+                    "The current model is configured as not supporting vision. "
+                    'Enable "Model supports vision" in Settings or remove the attached '
+                    "image(s) before sending.",
+                    "Vision not enabled",
+                    wx.OK | wx.ICON_WARNING,
+                    self,
+                )
+                return
+            log.info("_on_send: user message (%d chars, %d image(s))", len(text), len(images))
             self._input.Clear()
+            display_text = text or "(image attachment)"
+            if images:
+                display_text += f"\n\n[📎 {len(images)} image(s) attached]"
             self._conv_entries.append(
                 {
                     "type": "user",
-                    "text": text,
+                    "text": display_text,
                     "timestamp": datetime.datetime.now().strftime("%H:%M:%S"),
                 }
             )
+            self._attached_images.clear()
+            self._refresh_attachments_bar()
             self._follow_output_to_bottom = True
             # Create the session file on the very first message so current.json
             # is established before the AI responds.
@@ -667,6 +722,7 @@ if _WX_AVAILABLE:
                             self._on_tool_call, name, args, result
                         ),
                         on_text_delta=_on_delta,
+                        images=images,
                     )
                 except Exception as e:
                     log.exception("LLM request failed")
@@ -690,7 +746,172 @@ if _WX_AVAILABLE:
             if key_code == wx.WXK_RETURN and event.ShiftDown():
                 self._input.WriteText("\n")
                 return  # consume the event — don't fire EVT_TEXT_ENTER
+            if key_code == ord("V") and event.ControlDown():
+                # If the clipboard holds a bitmap, attach it as an image instead
+                # of pasting text; otherwise fall through to normal paste.
+                if self._clipboard_has_bitmap():
+                    self._on_paste_from_clipboard()
+                    return
             event.Skip()
+
+        # ------------------------------------------------------------------ #
+        # Image attachments
+        # ------------------------------------------------------------------ #
+
+        def _on_add_image(self, event) -> None:
+            """Open a file dialog and attach the selected images."""
+            wildcard = (
+                "Images (*.png;*.jpg;*.jpeg;*.bmp;*.webp;*.gif)"
+                "|*.png;*.jpg;*.jpeg;*.bmp;*.webp;*.gif|All files (*.*)|*.*"
+            )
+            dlg = wx.FileDialog(
+                self,
+                "Attach image(s)",
+                wildcard=wildcard,
+                style=wx.FD_OPEN | wx.FD_MULTIPLE | wx.FD_FILE_MUST_EXIST,
+            )
+            if dlg.ShowModal() == wx.ID_OK:
+                for path in dlg.GetPaths():
+                    if path not in self._attached_images:
+                        self._attached_images.append(path)
+                self._refresh_attachments_bar()
+            dlg.Destroy()
+
+        def _on_paste_from_clipboard(self, event=None) -> None:
+            """Read a bitmap from the OS clipboard and attach it as an image."""
+            if not wx.TheClipboard.Open():
+                wx.MessageBox(
+                    "Could not open the system clipboard.",
+                    "Clipboard",
+                    wx.OK | wx.ICON_INFORMATION,
+                )
+                return
+            try:
+                if wx.TheClipboard.IsSupported(wx.DataFormat(wx.DF_BITMAP)):
+                    bdo = wx.BitmapDataObject()
+                    if wx.TheClipboard.GetData(bdo):
+                        bmp = bdo.GetBitmap()
+                        if bmp.IsOk():
+                            path = self._save_clipboard_bitmap(bmp)
+                            if path and path not in self._attached_images:
+                                self._attached_images.append(path)
+                                self._refresh_attachments_bar()
+                            return
+                wx.MessageBox(
+                    "No image found in the clipboard.",
+                    "Clipboard",
+                    wx.OK | wx.ICON_INFORMATION,
+                )
+            finally:
+                wx.TheClipboard.Close()
+
+        def _clipboard_has_bitmap(self) -> bool:
+            if not wx.TheClipboard.Open():
+                return False
+            try:
+                return wx.TheClipboard.IsSupported(wx.DataFormat(wx.DF_BITMAP))
+            finally:
+                wx.TheClipboard.Close()
+
+        @staticmethod
+        def _save_clipboard_bitmap(bmp: wx.Bitmap) -> str | None:
+            """Persist a clipboard bitmap to a temp PNG and return its path."""
+            import tempfile
+            import uuid
+
+            img = bmp.ConvertToImage()
+            path = os.path.join(tempfile.gettempdir(), f"kicad_ai_clip_{uuid.uuid4().hex}.png")
+            return path if img.SaveFile(path, wx.BITMAP_TYPE_PNG) else None
+
+        def _remove_attachment(self, index: int) -> None:
+            if 0 <= index < len(self._attached_images):
+                del self._attached_images[index]
+            self._refresh_attachments_bar()
+
+        def _clear_attachments(self, event=None) -> None:
+            self._attached_images.clear()
+            self._refresh_attachments_bar()
+
+        def _refresh_attachments_bar(self) -> None:
+            """Rebuild the thumbnail strip from self._attached_images."""
+            for item in list(self._attachments_hbox.GetChildren()):
+                win = item.GetWindow()
+                self._attachments_hbox.Detach(win)
+                if win:
+                    win.Destroy()
+
+            if self._attached_images:
+                for idx, path in enumerate(self._attached_images):
+                    sb = wx.StaticBitmap(self._ui_panel, bitmap=self._fit_thumbnail(path))
+                    sb.SetToolTip(os.path.basename(path))
+                    sb.Bind(
+                        wx.EVT_LEFT_DOWN,
+                        lambda evt, i=idx: self._remove_attachment(i),
+                    )
+                    self._attachments_hbox.Add(sb, 0, wx.RIGHT, 4)
+                count = wx.StaticText(
+                    self._ui_panel, label=f"{len(self._attached_images)} image(s)"
+                )
+                self._attachments_hbox.Add(count, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
+                clear_btn = wx.Button(self._ui_panel, label="✕ clear")
+                clear_btn.Bind(wx.EVT_BUTTON, self._clear_attachments)
+                self._attachments_hbox.Add(clear_btn, 0, wx.ALIGN_CENTER_VERTICAL)
+            self.Layout()
+
+        @staticmethod
+        def _fit_thumbnail(path: str, max_size: int = 48) -> wx.Bitmap:
+            """Load an image and scale it to fit within max_size×max_size."""
+            try:
+                img = wx.Image(path, wx.BITMAP_TYPE_ANY)
+                w, h = img.GetWidth(), img.GetHeight()
+                scale = min(max_size / w, max_size / h, 1.0)
+                if scale < 1.0:
+                    img = img.Scale(
+                        max(1, int(round(w * scale))),
+                        max(1, int(round(h * scale))),
+                        wx.IMAGE_QUALITY_HIGH,
+                    )
+                return wx.Bitmap(img)
+            except Exception as e:
+                log.warning("Could not load thumbnail %s: %s", path, e)
+                return wx.Bitmap(max_size, max_size)
+
+        def _encode_attached_images(self) -> list[dict]:
+            """Resize (≤1024px longest edge) and base64-encode attached images."""
+            import base64
+            import tempfile
+            import uuid
+
+            encoded: list[dict] = []
+            for path in list(self._attached_images):
+                try:
+                    img = wx.Image(path, wx.BITMAP_TYPE_ANY)
+                    if not img.IsOk():
+                        continue
+                    w, h = img.GetWidth(), img.GetHeight()
+                    longest = max(w, h)
+                    if longest > 1024:
+                        scale = 1024.0 / longest
+                        img = img.Scale(
+                            int(round(w * scale)),
+                            int(round(h * scale)),
+                            wx.IMAGE_QUALITY_HIGH,
+                        )
+                    tmp = os.path.join(
+                        tempfile.gettempdir(), f"kicad_ai_enc_{uuid.uuid4().hex}.png"
+                    )
+                    if not img.SaveFile(tmp, wx.BITMAP_TYPE_PNG):
+                        continue
+                    with open(tmp, "rb") as f:
+                        data = base64.b64encode(f.read()).decode()
+                    try:
+                        os.remove(tmp)
+                    except OSError:
+                        pass
+                    encoded.append({"media_type": "image/png", "data": data})
+                except Exception as e:
+                    log.warning("Could not encode attachment %s: %s", path, e)
+            return encoded
 
         def _on_reply(self, reply: str, ctx: dict, was_streamed: bool = False) -> None:
             # Stop the flush timer and drain any remaining chunks
@@ -1521,7 +1742,11 @@ if _WX_AVAILABLE:
                 "title": title,
                 "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
                 "conv_entries": self._conv_entries,
-                "llm_history": self._llm_client.get_history() if self._llm_client else [],
+                "llm_history": (
+                    _strip_images_from_history(self._llm_client.get_history())
+                    if self._llm_client
+                    else []
+                ),
             }
             try:
                 fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
