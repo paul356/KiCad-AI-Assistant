@@ -41,7 +41,42 @@ if _WX_AVAILABLE:
         pass
 
 
+def _strip_images_from_history(history: list[dict]) -> list[dict]:
+    """Drop image_url blocks (base64 bloat) from history before persisting."""
+    stripped = []
+    for msg in history:
+        content = msg.get("content")
+        if isinstance(content, list):
+            text_blocks = [b for b in content if b.get("type") == "text"]
+            if len(text_blocks) == 1:
+                content = text_blocks[0].get("text", "")
+            elif text_blocks:
+                content = text_blocks
+            else:
+                content = ""
+            msg = {**msg, "content": content}
+        stripped.append(msg)
+    return stripped
+
+
 if _WX_AVAILABLE:
+
+    class _FileDropTarget(wx.FileDropTarget):
+        """Drag-and-drop handler for images and PDFs onto the input box."""
+
+        def __init__(self, panel: AssistantPanel) -> None:
+            super().__init__()
+            self._panel = panel
+
+        def OnDropFiles(self, x: int, y: int, filenames: list[str]) -> bool:  # noqa: N802
+            log.info("OnDropFiles: %d file(s)", len(filenames))
+            for path in filenames:
+                ftype = "pdf" if path.lower().endswith(".pdf") else "image"
+                entry = (path, ftype)
+                if entry not in self._panel._attached_files:  # noqa: SLF001
+                    self._panel._attached_files.append(entry)  # noqa: SLF001
+            self._panel._refresh_attachments_bar()  # noqa: SLF001
+            return True
 
     class AssistantPanel(wx.Frame):
         """Main floating panel for the KiCad AI Assistant."""
@@ -103,6 +138,9 @@ if _WX_AVAILABLE:
             self._stream_wrapper_visible: bool = False
             # Shell load retry counter (prevents infinite retry on WebView2 failure).
             self._shell_retry_count: int = 0
+            # Paths of images the user attached for the next message (cleared
+            # after send). Populated via the "Attach image" button or clipboard.
+            self._attached_files: list[tuple[str, str]] = []  # (path, "image"|"pdf")
 
             # Page-load watchdog: if _on_webview_loaded never fires (WebView2
             # glitch on Windows), reset _page_loading so renders are not
@@ -124,6 +162,7 @@ if _WX_AVAILABLE:
         _C_OK = (0, 140, 0)  # Green   – success notices
         _C_WARN = (190, 100, 0)  # Amber   – warnings
         _C_ERR = (190, 30, 30)  # Red     – errors
+        _C_GREY = (140, 140, 140)  # Grey   – idle status dot
         _BG_CONV = wx.Colour(245, 247, 252)  # Very light blue-grey conversation bg
         _BG_TOOL = wx.Colour(250, 248, 240)  # Warm off-white tool-log bg
 
@@ -240,6 +279,19 @@ if _WX_AVAILABLE:
                         self._on_webview_error,
                         self._conv_view,
                     )
+
+                    # Block navigation to any URL — prevents files (PDFs, images,
+                    # etc.) dropped onto the WebView from being opened inside it.
+                    # Only the shell page (loaded via SetPage) should ever display.
+                    def _on_navigating(event):
+                        if event.GetURL() not in ("", "about:blank"):
+                            event.Veto()
+
+                    self.Bind(
+                        _wx_html2.EVT_WEBVIEW_NAVIGATING,
+                        _on_navigating,
+                        self._conv_view,
+                    )
                     # Load the static shell (CSS + JS + empty containers).
                     # After this, all UI updates go through RunScript.
                     self._load_shell()
@@ -287,55 +339,58 @@ if _WX_AVAILABLE:
             search_hbox.Add(self._search_close_btn, 0)
             vbox.Add(search_hbox, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM | wx.EXPAND, 4)
 
+            # ---- Attachments bar (image thumbnails; empty when none attached) ----
+            self._attachments_hbox = wx.BoxSizer(wx.HORIZONTAL)
+            self._attachments_sizer_item = vbox.Add(
+                self._attachments_hbox, 0, wx.LEFT | wx.RIGHT | wx.EXPAND, 4
+            )
+            self._attachments_sizer_item.Show(False)  # hidden until images attached
+
             # ---- Input row ----
+            #  [📎] [____ Ask the AI assistant… ____] [ ●  ]
+            #  Attach  Text input (expands)         [➤/⬛]
             hbox = wx.BoxSizer(wx.HORIZONTAL)
 
+            # Attach button — single entry point for images & PDFs.
+            self._attach_btn = wx.BitmapButton(
+                panel,
+                bitmap=self._make_attach_bitmap(bg=panel.GetBackgroundColour()),
+                style=wx.BU_EXACTFIT | wx.BORDER_NONE,
+            )
+            self._attach_btn.SetToolTip("Attach image or PDF…")
+            hbox.Add(self._attach_btn, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
+
+            # Plain native TextCtrl — GTK themes paint the background (light)
+            # and SetBackgroundColour would be ignored, so leave it untouched.
             self._input = wx.TextCtrl(
                 panel, style=wx.TE_PROCESS_ENTER | wx.TE_MULTILINE | wx.BORDER_SIMPLE
             )
             self._input.SetHint("Ask the AI assistant…")
             hbox.Add(self._input, 1, wx.EXPAND)
 
-            # Rounded red square stop button — matches TextCtrl height exactly.
-            # GetSizeFromTextSize excludes the BORDER_SIMPLE frame; add it back.
-            text_h = self._input.GetSizeFromTextSize(self._input.GetTextExtent("Ag")).height
-            btn_h = max(text_h + 4, 48)  # at least 48 to fit 40×40 red + padding
-            corner_r = 3  # small corner radius
+            # Right-hand column: status dot on top, Send/Stop toggle below.
+            side_vbox = wx.BoxSizer(wx.VERTICAL)
 
-            stop_bmp = wx.Bitmap(btn_h, btn_h)
-            mdc = wx.MemoryDC(stop_bmp)
-            gc = wx.GraphicsContext.Create(mdc)
-            # Light grey button background
-            gc.SetBrush(wx.Brush(wx.Colour(230, 230, 230)))
-            gc.SetPen(wx.TRANSPARENT_PEN)
-            gc.DrawRectangle(0, 0, btn_h, btn_h)
-            # Flat red 40×40 rounded square, centred
-            red_sz = 40
-            pad = (btn_h - red_sz) // 2
-            path = gc.CreatePath()
-            path.AddRoundedRectangle(pad, pad, red_sz, red_sz, corner_r)
-            gc.SetBrush(wx.Brush(wx.Colour(255, 0, 0)))
-            gc.SetPen(wx.Pen(wx.Colour(180, 0, 0), 1))
-            gc.DrawPath(path)
-            del gc
-            del mdc
-
-            self._stop_btn = wx.BitmapButton(
-                panel, bitmap=stop_bmp, style=wx.BU_EXACTFIT | wx.BORDER_SIMPLE
+            # Status dot — 14 px coloured circle, tooltip carries full text.
+            self._status_dot = wx.StaticBitmap(
+                panel,
+                bitmap=self._make_status_dot_bitmap(self._C_GREY, bg=panel.GetBackgroundColour()),
             )
-            self._stop_btn.SetMinSize(wx.Size(btn_h, btn_h))
-            self._stop_btn.SetToolTip("Stop generation (Escape)")
-            self._stop_btn.Enable(False)
-            hbox.Add(self._stop_btn, 0, wx.EXPAND)
+            self._status_dot.SetToolTip("Starting backend…")
+            side_vbox.Add(self._status_dot, 0, wx.ALIGN_CENTER_HORIZONTAL | wx.BOTTOM, 2)
+
+            # Send / Stop toggle button — doubles as Stop during generation.
+            self._send_btn = wx.BitmapButton(
+                panel,
+                bitmap=self._make_send_bitmap(bg=panel.GetBackgroundColour()),
+                style=wx.BU_EXACTFIT | wx.BORDER_NONE,
+            )
+            self._send_btn.SetToolTip("Send message (Enter)")
+            side_vbox.Add(self._send_btn, 0, wx.ALIGN_CENTER_HORIZONTAL)
+
+            hbox.Add(side_vbox, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 4)
 
             vbox.Add(hbox, 0, wx.ALL | wx.EXPAND, 4)
-
-            # ---- Status bar (below input) ----
-            status_hbox = wx.BoxSizer(wx.HORIZONTAL)
-            self._status_label = wx.StaticText(panel, label="⏳ Starting backend…")
-            status_hbox.Add(self._status_label, 1, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
-
-            vbox.Add(status_hbox, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM | wx.EXPAND, 4)
 
             panel.SetSizer(vbox)
 
@@ -377,9 +432,12 @@ if _WX_AVAILABLE:
             self.SetMenuBar(menu_bar)
 
             # ---- Events ----
-            self._stop_btn.Bind(wx.EVT_BUTTON, self._on_stop)
+            self._send_btn.Bind(wx.EVT_BUTTON, self._on_send_btn)
+            self._attach_btn.Bind(wx.EVT_BUTTON, self._on_attach)
             self._input.Bind(wx.EVT_TEXT_ENTER, self._on_send)
             self._input.Bind(wx.EVT_CHAR_HOOK, self._on_input_key)
+            # Enable drag-and-drop of images and PDFs onto the input box.
+            self._input.SetDropTarget(_FileDropTarget(self))
             self.Bind(wx.EVT_MENU, self._on_settings, id=wx.ID_PREFERENCES)
             self.Bind(wx.EVT_MENU, self._on_new_session, id=self._menu_new_session_id)
             self.Bind(wx.EVT_MENU, self._on_load_session, id=self._menu_load_session_id)
@@ -431,17 +489,16 @@ if _WX_AVAILABLE:
         def _on_server_started(self, ok: bool) -> None:
             try:
                 if ok:
-                    self._status_label.SetLabel("✅ Backend ready")
-                    self._status_label.SetForegroundColour(wx.Colour(*self._C_OK))
+                    self._set_status("✅ Backend ready", self._C_OK)
                     self.GetMenuBar().Enable(self._menu_autoroute_id, True)
                     self._init_llm_client()
                     self._check_kicad_ipc_environment()
                     self._auto_save_pcb_on_open()
                 else:
-                    self._status_label.SetLabel(
-                        "❌ Backend failed to start — use Options → Restart Backend to retry"
+                    self._set_status(
+                        "❌ Backend failed to start — use Server → Restart Backend to retry",
+                        self._C_ERR,
                     )
-                    self._status_label.SetForegroundColour(wx.Colour(*self._C_ERR))
                 self.Layout()
             except Exception as e:
                 import traceback
@@ -612,17 +669,49 @@ if _WX_AVAILABLE:
                 )
                 return
             text = self._input.GetValue().strip()
-            if not text:
+            images = self._encode_attached_images()
+            pdfs = [p for p, t in self._attached_files if t == "pdf"]
+            if not text and not images and not pdfs:
                 return
-            log.info("_on_send: user message (%d chars)", len(text))
+            if images and not self._settings.llm_supports_vision:
+                log.info(
+                    "_on_send: blocked — %d image(s) but vision disabled in settings",
+                    len(images),
+                )
+                wx.MessageBox(
+                    "The current model is configured as not supporting vision. "
+                    'Enable "Model supports vision" in Settings or remove the attached '
+                    "image(s) before sending.",
+                    "Vision not enabled",
+                    wx.OK | wx.ICON_WARNING,
+                    self,
+                )
+                return
+            log.info(
+                "_on_send: user message (%d chars, %d image(s), %d PDF(s), vision=%s)",
+                len(text),
+                len(images),
+                len(pdfs),
+                self._settings.llm_supports_vision,
+            )
             self._input.Clear()
+            display_text = text or "(attachment)"
+            if images:
+                display_text += f"\n\n[📎 {len(images)} image(s) attached]"
+            if pdfs:
+                display_text += f"\n\n[📄 {len(pdfs)} PDF(s) attached]"
+            # Placeholder — pdf_texts filled in after background extraction
             self._conv_entries.append(
                 {
                     "type": "user",
-                    "text": text,
+                    "text": display_text,
                     "timestamp": datetime.datetime.now().strftime("%H:%M:%S"),
+                    "pdf_texts": [],
                 }
             )
+            _user_entry = self._conv_entries[-1]
+            self._attached_files.clear()
+            self._refresh_attachments_bar()
             self._follow_output_to_bottom = True
             # Create the session file on the very first message so current.json
             # is established before the AI responds.
@@ -633,7 +722,7 @@ if _WX_AVAILABLE:
             self._render_conversation(force_scroll_to_bottom=True)
             self._busy = True
             self._cancel_event = threading.Event()
-            self._stop_btn.Enable(True)
+            self._toggle_send_stop(busy=True)
 
             from ..context_bridge import collect_context, context_to_system_prompt_block
 
@@ -660,13 +749,44 @@ if _WX_AVAILABLE:
             def _run():
                 log.info("Background _run: started")
                 try:
+                    # Extract PDF text before sending to LLM
+                    text_with_pdf = text
+                    if pdfs:
+                        self._set_status("⏳ Extracting PDF text…", self._C_WARN)
+                        pdf_texts: list[dict] = []
+                        pdf_blocks: list[str] = []
+                        for pdf_path in pdfs:
+                            extracted = self._extract_pdf_text(pdf_path)
+                            basename = os.path.basename(pdf_path)
+                            if extracted.startswith("[Error]"):
+                                log.error("PDF extraction failed: %s — %s", pdf_path, extracted)
+                                pdf_texts.append(
+                                    {"name": basename, "text": extracted, "error": True}
+                                )
+                                pdf_blocks.append(f"--- PDF: {basename} ---\n{extracted}")
+                            else:
+                                log.info("PDF extracted: %s → %d chars", basename, len(extracted))
+                                pdf_texts.append({"name": basename, "text": extracted})
+                                pdf_blocks.append(
+                                    f"--- PDF: {basename} "
+                                    f"(text extracted with page numbers) ---\n\n{extracted}"
+                                )
+                        self._set_status("Ready", self._C_OK)
+                        # Store extracted texts for UI display
+                        _user_entry["pdf_texts"] = pdf_texts
+                        if pdf_blocks:
+                            pdf_block = "\n\n".join(pdf_blocks)
+                            text_with_pdf = text + ("\n\n" if text else "") + pdf_block
+                        # Re-render so the collapsible PDF text appears
+                        wx.CallAfter(self._render_conversation, True)
                     reply = self._llm_client.run(
-                        text,
+                        text_with_pdf,
                         context_block,
                         on_tool_call=lambda name, args, result: wx.CallAfter(
                             self._on_tool_call, name, args, result
                         ),
                         on_text_delta=_on_delta,
+                        images=images,
                     )
                 except Exception as e:
                     log.exception("LLM request failed")
@@ -690,7 +810,496 @@ if _WX_AVAILABLE:
             if key_code == wx.WXK_RETURN and event.ShiftDown():
                 self._input.WriteText("\n")
                 return  # consume the event — don't fire EVT_TEXT_ENTER
+            if key_code == ord("V") and event.ControlDown():
+                # If the clipboard holds a bitmap, attach it as an image instead
+                # of pasting text; otherwise fall through to normal paste.
+                if self._clipboard_has_bitmap():
+                    self._on_paste_from_clipboard()
+                    return
             event.Skip()
+
+        # ------------------------------------------------------------------ #
+        # Input-row helpers (bitmaps, status dot, send/stop toggle)
+        # ------------------------------------------------------------------ #
+
+        @staticmethod
+        def _new_icon_bitmap(
+            size: int, bg: wx.Colour | None = None
+        ) -> tuple[wx.Bitmap, wx.MemoryDC]:
+            """Create a canvas for a custom-drawn icon with the given background.
+
+            wx.Bitmap(size, size) starts uninitialised (often black on GTK) and
+            MemoryDC.Clear() does not reliably repaint it, so build the base
+            from a wx.Image filled with the panel background colour instead.
+            """
+            if bg is None:
+                bg = wx.WHITE
+            data = bytes((bg.Red(), bg.Green(), bg.Blue())) * (size * size)
+            img = wx.Image(size, size, data)
+            bmp = wx.Bitmap(img)
+            mdc = wx.MemoryDC()
+            mdc.SelectObject(bmp)
+            return bmp, mdc
+
+        @staticmethod
+        def _make_attach_bitmap(size: int = 28, bg: wx.Colour | None = None) -> wx.Bitmap:
+            """Paperclip icon: 3 semicircles + 4 line segments.
+
+            Layout (28×28 grid):
+                8  12  14  16  20
+             4      ╭───────╮          ← arc 2: inverted U (top)
+             8      ●       ●          ← arc 2 endpoints (8,8)(16,8)
+            12      │       │
+            16      │       │
+            20      ●─╮   ╭─●  ●───╯  ╰───●  ← arc 3 endpoints (12,20)(16,20)
+            26      ╰───────────╯        ← arc 1: large U (bottom)
+            """
+            bmp, mdc = AssistantPanel._new_icon_bitmap(size, bg)
+            pen = wx.Pen(wx.Colour(90, 90, 90), 2)
+            mdc.SetPen(pen)
+            mdc.SetBrush(wx.TRANSPARENT_BRUSH)
+
+            # Arc 1: Large bottom U (opening up)
+            # Center (14,20), r=6, bbox (8,14,12,12)
+            mdc.DrawEllipticArc(8, 14, 12, 12, 180, 360)
+
+            # Arc 2: Inverted U (opening down)
+            # Center (12,8), r=4, bbox (8,4,8,8)
+            mdc.DrawEllipticArc(8, 4, 8, 8, 0, 180)
+
+            # Arc 3: Small bottom U (opening up, smaller)
+            # Center (14,20), r=2, bbox (12,18,4,4)
+            mdc.DrawEllipticArc(12, 18, 4, 4, 180, 360)
+
+            # 4 line segments connecting arc endpoints
+            # Left outer:  arc1 left  (8,20) → arc2 left  (8,8)
+            # Right outer: arc1 right (20,20) → arc2 right (16,8)
+            # Left inner:  arc3 left  (12,20) → arc2 left  (8,8)
+            # Right inner: arc3 right (16,20) → arc2 right (16,8)
+            for x1, y1, x2, y2 in [
+                (8, 20, 8, 8),
+                (12, 20, 12, 8),
+                (16, 20, 16, 8),
+                (20, 20, 20, 8),
+            ]:
+                mdc.DrawLine(x1, y1, x2, y2)
+
+            del mdc
+            return bmp
+
+        @staticmethod
+        def _make_send_bitmap(size: int = 28, bg: wx.Colour | None = None) -> wx.Bitmap:
+            """Paper-plane send icon drawn with GraphicsContext."""
+            bmp, mdc = AssistantPanel._new_icon_bitmap(size, bg)
+            gc = wx.GraphicsContext.Create(mdc)
+            gc.SetBrush(wx.Brush(wx.Colour(34, 85, 204)))  # _C_USER blue
+            gc.SetPen(wx.Pen(wx.Colour(24, 65, 180), 1))
+            path = gc.CreatePath()
+            path.MoveToPoint(4, 4)
+            path.AddLineToPoint(size - 4, size / 2)
+            path.AddLineToPoint(4, size - 4)
+            path.AddLineToPoint(4, 4)
+            gc.DrawPath(path)
+            del gc, mdc
+            return bmp
+
+        @staticmethod
+        def _make_stop_bitmap(size: int = 28, bg: wx.Colour | None = None) -> wx.Bitmap:
+            """Red rounded-square stop icon drawn with GraphicsContext."""
+            bmp, mdc = AssistantPanel._new_icon_bitmap(size, bg)
+            gc = wx.GraphicsContext.Create(mdc)
+            gc.SetBrush(wx.Brush(wx.Colour(220, 70, 70)))
+            gc.SetPen(wx.Pen(wx.Colour(180, 50, 50), 1))
+            path = gc.CreatePath()
+            margin = 5
+            path.AddRoundedRectangle(margin, margin, size - 2 * margin, size - 2 * margin, 3)
+            gc.DrawPath(path)
+            del gc, mdc
+            return bmp
+
+        @staticmethod
+        def _make_status_dot_bitmap(
+            rgb: tuple, size: int = 14, bg: wx.Colour | None = None
+        ) -> wx.Bitmap:
+            """Coloured circle for the status indicator."""
+            bmp, mdc = AssistantPanel._new_icon_bitmap(size, bg)
+            gc = wx.GraphicsContext.Create(mdc)
+            gc.SetBrush(wx.Brush(wx.Colour(*rgb)))
+            gc.SetPen(wx.Pen(wx.Colour(*rgb), 1))
+            gc.DrawEllipse(1, 1, size - 2, size - 2)
+            del gc, mdc
+            return bmp
+
+        def _set_status(self, text: str, colour: tuple | None = None) -> None:
+            """Update the status dot colour + tooltip text."""
+            self._status_dot.SetToolTip(text)
+            if colour is not None:
+                bg = self._ui_panel.GetBackgroundColour()
+                self._status_dot.SetBitmap(self._make_status_dot_bitmap(colour, bg=bg))
+
+        def _toggle_send_stop(self, busy: bool) -> None:
+            """Switch the send button between Send and Stop modes."""
+            bg = self._ui_panel.GetBackgroundColour()
+            if busy:
+                self._send_btn.SetBitmap(self._make_stop_bitmap(bg=bg))
+                self._send_btn.SetToolTip("Stop generation (Escape)")
+            else:
+                self._send_btn.SetBitmap(self._make_send_bitmap(bg=bg))
+                self._send_btn.SetToolTip("Send message (Enter)")
+
+        def _on_send_btn(self, event) -> None:
+            """Handle send/stop button click depending on current state."""
+            if self._busy:
+                self._on_stop(event)
+            else:
+                self._on_send(event)
+
+        def _on_attach(self, event) -> None:
+            """Unified attach dialog: images or PDF in one file picker."""
+            wildcard = (
+                "Images (*.png;*.jpg;*.jpeg;*.bmp;*.webp;*.gif)"
+                "|*.png;*.jpg;*.jpeg;*.bmp;*.webp;*.gif|"
+                "PDF documents (*.pdf)|*.pdf|"
+                "All files (*.*)|*.*"
+            )
+            dlg = wx.FileDialog(
+                self,
+                "Attach image or PDF…",
+                wildcard=wildcard,
+                style=wx.FD_OPEN | wx.FD_MULTIPLE | wx.FD_FILE_MUST_EXIST,
+            )
+            if dlg.ShowModal() == wx.ID_OK:
+                paths = dlg.GetPaths()
+                log.info("_on_attach: %d file(s) selected", len(paths))
+                for path in paths:
+                    ftype = "pdf" if path.lower().endswith(".pdf") else "image"
+                    entry = (path, ftype)
+                    if entry not in self._attached_files:
+                        self._attached_files.append(entry)
+                self._refresh_attachments_bar()
+            dlg.Destroy()
+
+        # ------------------------------------------------------------------ #
+        # Image attachments
+        # ------------------------------------------------------------------ #
+
+        def _on_add_image(self, event) -> None:
+            """Open a file dialog and attach the selected images."""
+            wildcard = (
+                "Images (*.png;*.jpg;*.jpeg;*.bmp;*.webp;*.gif)"
+                "|*.png;*.jpg;*.jpeg;*.bmp;*.webp;*.gif|All files (*.*)|*.*"
+            )
+            dlg = wx.FileDialog(
+                self,
+                "Attach image(s)",
+                wildcard=wildcard,
+                style=wx.FD_OPEN | wx.FD_MULTIPLE | wx.FD_FILE_MUST_EXIST,
+            )
+            if dlg.ShowModal() == wx.ID_OK:
+                for path in dlg.GetPaths():
+                    entry = (path, "image")
+                    if entry not in self._attached_files:
+                        self._attached_files.append(entry)
+                self._refresh_attachments_bar()
+            dlg.Destroy()
+
+        def _on_paste_from_clipboard(self, event=None) -> None:
+            """Read a bitmap from the OS clipboard and attach it as an image."""
+            if not wx.TheClipboard.Open():
+                log.warning("_on_paste_from_clipboard: could not open clipboard")
+                wx.MessageBox(
+                    "Could not open the system clipboard.",
+                    "Clipboard",
+                    wx.OK | wx.ICON_INFORMATION,
+                )
+                return
+            try:
+                if wx.TheClipboard.IsSupported(wx.DataFormat(wx.DF_BITMAP)):
+                    bdo = wx.BitmapDataObject()
+                    if wx.TheClipboard.GetData(bdo):
+                        bmp = bdo.GetBitmap()
+                        if bmp.IsOk():
+                            path = self._save_clipboard_bitmap(bmp)
+                            if path:
+                                entry = (path, "image")
+                                if entry not in self._attached_files:
+                                    self._attached_files.append(entry)
+                                    self._refresh_attachments_bar()
+                                log.info(
+                                    "_on_paste_from_clipboard: pasted image %dx%d → %s",
+                                    bmp.GetWidth(),
+                                    bmp.GetHeight(),
+                                    os.path.basename(path),
+                                )
+                            return
+                    else:
+                        log.warning("_on_paste_from_clipboard: GetData returned False")
+                else:
+                    log.debug("_on_paste_from_clipboard: clipboard has no bitmap")
+                wx.MessageBox(
+                    "No image found in the clipboard.",
+                    "Clipboard",
+                    wx.OK | wx.ICON_INFORMATION,
+                )
+            finally:
+                wx.TheClipboard.Close()
+
+        def _clipboard_has_bitmap(self) -> bool:
+            if not wx.TheClipboard.Open():
+                return False
+            try:
+                return wx.TheClipboard.IsSupported(wx.DataFormat(wx.DF_BITMAP))
+            finally:
+                wx.TheClipboard.Close()
+
+        @staticmethod
+        def _save_clipboard_bitmap(bmp: wx.Bitmap) -> str | None:
+            """Persist a clipboard bitmap to a temp PNG and return its path."""
+            import tempfile
+            import uuid
+
+            img = bmp.ConvertToImage()
+            path = os.path.join(tempfile.gettempdir(), f"kicad_ai_clip_{uuid.uuid4().hex}.png")
+            return path if img.SaveFile(path, wx.BITMAP_TYPE_PNG) else None
+
+        def _remove_attachment(self, index: int) -> None:
+            if 0 <= index < len(self._attached_files):
+                del self._attached_files[index]
+            self._refresh_attachments_bar()
+
+        def _clear_attachments(self, event=None) -> None:
+            self._attached_files.clear()
+            self._refresh_attachments_bar()
+
+        def _refresh_attachments_bar(self) -> None:
+            """Rebuild the thumbnail strip from self._attached_files."""
+            for item in list(self._attachments_hbox.GetChildren()):
+                win = item.GetWindow()
+                self._attachments_hbox.Detach(win)
+                if win:
+                    win.Destroy()
+
+            # Show/hide the sizer item so the bar collapses when empty
+            self._attachments_sizer_item.Show(bool(self._attached_files))
+            if self._attached_files:
+                img_count = sum(1 for _, t in self._attached_files if t == "image")
+                pdf_count = sum(1 for _, t in self._attached_files if t == "pdf")
+                for idx, (path, ftype) in enumerate(self._attached_files):
+                    if ftype == "image":
+                        bmp = self._fit_thumbnail(path)
+                    else:
+                        bg = self._ui_panel.GetBackgroundColour()
+                        bmp = self._make_pdf_thumbnail(bg=bg)
+                    sb = wx.StaticBitmap(self._ui_panel, bitmap=bmp)
+                    sb.SetToolTip(os.path.basename(path))
+                    sb.Bind(
+                        wx.EVT_LEFT_DOWN,
+                        lambda evt, i=idx: self._remove_attachment(i),
+                    )
+                    self._attachments_hbox.Add(sb, 0, wx.RIGHT, 4)
+                parts = []
+                if img_count:
+                    parts.append(f"{img_count} image(s)")
+                if pdf_count:
+                    parts.append(f"{pdf_count} PDF(s)")
+                count = wx.StaticText(self._ui_panel, label=" + ".join(parts))
+                self._attachments_hbox.Add(count, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
+                clear_btn = wx.Button(self._ui_panel, label="✕ clear")
+                clear_btn.Bind(wx.EVT_BUTTON, self._clear_attachments)
+                self._attachments_hbox.Add(clear_btn, 0, wx.ALIGN_CENTER_VERTICAL)
+            # Defer layout to next idle so window destruction (Destroy() above)
+            # is fully processed before recalculating sizer geometry.
+            wx.CallAfter(self._ui_panel.Layout)
+            wx.CallAfter(self.SendSizeEvent)
+
+        @staticmethod
+        def _fit_thumbnail(path: str, max_size: int = 48) -> wx.Bitmap:
+            """Load an image and scale it to fit within max_size×max_size."""
+            try:
+                img = wx.Image(path, wx.BITMAP_TYPE_ANY)
+                w, h = img.GetWidth(), img.GetHeight()
+                scale = min(max_size / w, max_size / h, 1.0)
+                if scale < 1.0:
+                    img = img.Scale(
+                        max(1, int(round(w * scale))),
+                        max(1, int(round(h * scale))),
+                        wx.IMAGE_QUALITY_HIGH,
+                    )
+                return wx.Bitmap(img)
+            except Exception as e:
+                log.warning("Could not load thumbnail %s: %s", path, e)
+                return wx.Bitmap(max_size, max_size)
+
+        @staticmethod
+        def _make_pdf_thumbnail(size: int = 48, bg: wx.Colour | None = None) -> wx.Bitmap:
+            """Draw a simple PDF file icon with 'PDF' label."""
+            bmp, mdc = AssistantPanel._new_icon_bitmap(size, bg)
+            gc = wx.GraphicsContext.Create(mdc)
+            # White page with folded corner
+            page_w = size * 0.55
+            page_h = size * 0.7
+            x0 = (size - page_w) / 2
+            y0 = (size - page_h) / 2
+            fold = page_w * 0.25
+            path = gc.CreatePath()
+            path.MoveToPoint(x0, y0)
+            path.AddLineToPoint(x0 + page_w - fold, y0)
+            path.AddLineToPoint(x0 + page_w, y0 + fold)
+            path.AddLineToPoint(x0 + page_w, y0 + page_h)
+            path.AddLineToPoint(x0, y0 + page_h)
+            path.CloseSubpath()
+            gc.SetBrush(wx.Brush(wx.Colour(255, 255, 255)))
+            gc.SetPen(wx.Pen(wx.Colour(120, 120, 120), 1))
+            gc.DrawPath(path)
+            # Folded corner
+            fold_path = gc.CreatePath()
+            fold_path.MoveToPoint(x0 + page_w - fold, y0)
+            fold_path.AddLineToPoint(x0 + page_w - fold, y0 + fold)
+            fold_path.AddLineToPoint(x0 + page_w, y0 + fold)
+            fold_path.CloseSubpath()
+            gc.SetBrush(wx.Brush(wx.Colour(220, 220, 220)))
+            gc.DrawPath(fold_path)
+            # 'PDF' text
+            font = wx.Font(
+                max(7, int(size * 0.16)),
+                wx.FONTFAMILY_DEFAULT,
+                wx.FONTSTYLE_NORMAL,
+                wx.FONTWEIGHT_BOLD,
+            )
+            gc.SetFont(font, wx.Colour(200, 40, 40))
+            gc.DrawText("PDF", x0 + 2, y0 + page_h * 0.35)
+            del gc, mdc
+            return bmp
+
+        def _encode_attached_images(self) -> list[dict]:
+            """Resize (≤1024px longest edge) and base64-encode attached images."""
+            import base64
+            import tempfile
+            import uuid
+
+            encoded: list[dict] = []
+            for path, ftype in list(self._attached_files):
+                if ftype != "image":
+                    continue
+                try:
+                    img = wx.Image(path, wx.BITMAP_TYPE_ANY)
+                    if not img.IsOk():
+                        log.warning(
+                            "_encode_attached_images: %s failed to load (IsOk=False)",
+                            path,
+                        )
+                        continue
+                    w, h = img.GetWidth(), img.GetHeight()
+                    longest = max(w, h)
+                    if longest > 1024:
+                        scale = 1024.0 / longest
+                        img = img.Scale(
+                            int(round(w * scale)),
+                            int(round(h * scale)),
+                            wx.IMAGE_QUALITY_HIGH,
+                        )
+                        log.debug(
+                            "_encode_attached_images: %s resized %dx%d → %dx%d",
+                            os.path.basename(path),
+                            w,
+                            h,
+                            img.GetWidth(),
+                            img.GetHeight(),
+                        )
+                    tmp = os.path.join(
+                        tempfile.gettempdir(), f"kicad_ai_enc_{uuid.uuid4().hex}.png"
+                    )
+                    if not img.SaveFile(tmp, wx.BITMAP_TYPE_PNG):
+                        log.warning(
+                            "_encode_attached_images: %s SaveFile failed",
+                            path,
+                        )
+                        continue
+                    with open(tmp, "rb") as f:
+                        data = base64.b64encode(f.read()).decode()
+                    try:
+                        os.remove(tmp)
+                    except OSError:
+                        pass
+                    encoded.append({"media_type": "image/png", "data": data})
+                    log.debug(
+                        "_encode_attached_images: %s encoded (%d bytes base64)",
+                        os.path.basename(path),
+                        len(data),
+                    )
+                except Exception as e:
+                    log.warning("Could not encode attachment %s: %s", path, e)
+            img_total = sum(1 for _, t in self._attached_files if t == "image")
+            log.info(
+                "_encode_attached_images: %d/%d image(s) encoded successfully",
+                len(encoded),
+                img_total,
+            )
+            return encoded
+
+        # ------------------------------------------------------------------ #
+        # PDF text extraction
+        # ------------------------------------------------------------------ #
+
+        def _on_add_pdf(self, event=None, *, pdf_path: str | None = None) -> None:
+            """Add a PDF to the attachments bar (text extracted at send time)."""
+            if pdf_path is None:
+                wildcard = "PDF documents (*.pdf)|*.pdf|All files (*.*)|*.*"
+                dlg = wx.FileDialog(
+                    self,
+                    "Select PDF",
+                    wildcard=wildcard,
+                    style=wx.FD_OPEN | wx.FD_MULTIPLE | wx.FD_FILE_MUST_EXIST,
+                )
+                if dlg.ShowModal() != wx.ID_OK:
+                    dlg.Destroy()
+                    return
+                for path in dlg.GetPaths():
+                    entry = (path, "pdf")
+                    if entry not in self._attached_files:
+                        self._attached_files.append(entry)
+                dlg.Destroy()
+            else:
+                entry = (pdf_path, "pdf")
+                if entry not in self._attached_files:
+                    self._attached_files.append(entry)
+            self._refresh_attachments_bar()
+
+        def _extract_pdf_text(self, pdf_path: str) -> str:
+            """Extract text from a PDF (called from background thread at send time).
+
+            Returns the extracted text or an error message prefixed with [Error].
+            """
+            import subprocess  # nosec B404 -- controlled subprocess, no user input
+
+            python = self._server_mgr._resolve_python()  # noqa: SLF001
+            plugin_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            env = self._server_mgr._build_env(port=0)  # noqa: SLF001
+            for k in ("MCP_TRANSPORT", "MCP_PORT", "MCP_HOST"):
+                env.pop(k, None)
+            cmd = [
+                python,
+                "-m",
+                "kicad_plugin.pdf_extractor",
+                pdf_path,
+                "--max-pages",
+                "50",
+            ]
+            try:
+                result = subprocess.run(  # nosec B603 -- paths validated
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                    cwd=plugin_dir,
+                    env=env,
+                )
+            except Exception as e:  # noqa: BLE001
+                return f"[Error] Subprocess failed: {e}"
+            if result.returncode != 0:
+                err = result.stderr.strip() or "Unknown extraction error"
+                return f"[Error] {err}"
+            return result.stdout or ""
 
         def _on_reply(self, reply: str, ctx: dict, was_streamed: bool = False) -> None:
             # Stop the flush timer and drain any remaining chunks
@@ -728,7 +1337,7 @@ if _WX_AVAILABLE:
                         self._render_conversation(force_scroll_to_bottom=True)
             self._busy = False
             self._cancel_event = None
-            self._stop_btn.Enable(False)
+            self._toggle_send_stop(busy=False)
             # Auto-refresh after tool calls
             if self._tool_calls_made:
                 self._auto_refresh(ctx)
@@ -941,7 +1550,7 @@ if _WX_AVAILABLE:
                     self._render_conversation(force_scroll_to_bottom=True)
             self._busy = False
             self._cancel_event = None
-            self._stop_btn.Enable(False)
+            self._toggle_send_stop(busy=False)
 
         def _on_restart(self, event) -> None:
             if self._busy:
@@ -951,8 +1560,7 @@ if _WX_AVAILABLE:
                     wx.OK | wx.ICON_INFORMATION,
                 )
                 return
-            self._status_label.SetLabel("⏳ Restarting backend…")
-            self._status_label.SetForegroundColour(wx.NullColour)
+            self._set_status("⏳ Restarting backend…", self._C_WARN)
             self._conv_entries.append(
                 {
                     "type": "status",
@@ -1309,8 +1917,7 @@ if _WX_AVAILABLE:
 
             # ---- 5. Update UI, then start background thread ----
             self.GetMenuBar().Enable(self._menu_autoroute_id, False)
-            self._status_label.SetLabel("⏳ Auto-routing in progress…")
-            self._status_label.SetForegroundColour(wx.Colour(*self._C_WARN))
+            self._set_status("⏳ Auto-routing in progress…", self._C_WARN)
             self.Layout()
 
             self._conv_entries.append(
@@ -1325,7 +1932,7 @@ if _WX_AVAILABLE:
             from ..autorouter import start_freerouting_thread
 
             def _progress(msg: str) -> None:
-                wx.CallAfter(self._status_label.SetLabel, f"⏳ {msg}")
+                wx.CallAfter(self._set_status, f"⏳ {msg}", self._C_WARN)
 
             def _routing_done(success: bool, message: str, stdout: str, stderr: str) -> None:
                 # Marshal back to main thread for pcbnew import + UI update.
@@ -1390,11 +1997,9 @@ if _WX_AVAILABLE:
             # ---- Restore menu item and status bar ----
             self.GetMenuBar().Enable(self._menu_autoroute_id, True)
             if success:
-                self._status_label.SetLabel("✅ Backend ready")
-                self._status_label.SetForegroundColour(wx.Colour(*self._C_OK))
+                self._set_status("✅ Backend ready", self._C_OK)
             else:
-                self._status_label.SetLabel("❌ Auto-routing failed")
-                self._status_label.SetForegroundColour(wx.Colour(*self._C_ERR))
+                self._set_status("❌ Auto-routing failed", self._C_ERR)
             self.Layout()
 
             # FreeRouting SMD padstack note
@@ -1472,10 +2077,10 @@ if _WX_AVAILABLE:
             # Remove current.json so a blank close won't restore the old session.
             self._remove_current_link()
 
-            self._status_label.SetLabel(
-                "✅ New session started" + (" (previous session saved)" if has_content else "")
+            self._set_status(
+                "✅ New session started" + (" (previous session saved)" if has_content else ""),
+                self._C_OK,
             )
-            self._status_label.SetForegroundColour(wx.Colour(*self._C_OK))
             self.Layout()
 
         def _remove_current_link(self) -> None:
@@ -1521,7 +2126,11 @@ if _WX_AVAILABLE:
                 "title": title,
                 "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
                 "conv_entries": self._conv_entries,
-                "llm_history": self._llm_client.get_history() if self._llm_client else [],
+                "llm_history": (
+                    _strip_images_from_history(self._llm_client.get_history())
+                    if self._llm_client
+                    else []
+                ),
             }
             try:
                 fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -1614,8 +2223,7 @@ if _WX_AVAILABLE:
             self._current_session_file = os.path.basename(chosen)
             self._update_current_link(self._current_session_file)
             self._render_conversation(force_scroll_to_bottom=True)
-            self._status_label.SetLabel("✅ Session restored")
-            self._status_label.SetForegroundColour(wx.Colour(*self._C_OK))
+            self._set_status("✅ Session restored", self._C_OK)
             self.Layout()
 
         def _on_clear(self, event) -> None:

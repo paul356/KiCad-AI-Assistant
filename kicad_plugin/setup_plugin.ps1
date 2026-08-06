@@ -67,6 +67,7 @@ if ($LASTEXITCODE -ne 0) {
 # ---------------------------------------------------------------------------
 Write-Host "Step 2/3 - Installing kcaa from PyPI ..."
 uv pip install "kcaa==${KcaaVersion}" --python "$VenvDir"
+uv pip install "pymupdf" --python "$VenvDir"
 if ($LASTEXITCODE -ne 0) {
     Write-Host "ERROR: uv pip install failed (exit code $LASTEXITCODE)."
     exit $LASTEXITCODE
