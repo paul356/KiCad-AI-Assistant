@@ -1,130 +1,130 @@
-# kicad_plugin 优化建议
+# kicad_plugin Enhancement Plan
 
-## 状态：图片上传已完成，PDF 解析待做
+## Status: Image upload complete, PDF parsing done
 
-## 目标
+## Goals
 
-为 kicad_plugin（KiCad AI Assistant 插件）增加两项能力，要求同时支持 **Linux / Windows / macOS**：
+Add two capabilities to kicad_plugin (KiCad AI Assistant plugin), requiring support for **Linux / Windows / macOS**:
 
-1. 支持上传/粘贴图片（用户给 LLM 看图，含从剪贴板粘贴截图）
-2. 支持解析 PDF 文档
+1. Support uploading/pasting images (user shows images to LLM, including pasting screenshots from clipboard)
+2. Support parsing PDF documents
 
-> 截图能力不做插件内实现：用户自行截图后 **Ctrl+V** 粘贴到聊天框即可，schematic / PCB 截图均走此路径。详见「暂不考虑」章节。
+> Screenshot capture is not implemented inside the plugin: users take screenshots themselves and **Ctrl+V** paste into the chat box. Both schematic and PCB screenshots use this path. See "Not Considered" section for details.
 
-## 现有架构（相关部分）
+## Existing Architecture (Relevant Parts)
 
 ```
 KiCad GUI (wxPython)
   └─ kicad_plugin/
-       ├─ ui/panel.py        ← 聊天面板（wx.Frame, TextCtrl 输入）
-       ├─ llm_client.py      ← LLMClient，直连 OpenAI/Anthropic/Ollama，多模态消息在此构建
-       ├─ server_manager.py  ← 启动 kcaa MCP server（独立 venv 子进程）
-       └─ setup_plugin.sh/.bat/.ps1 ← 创建 venv 安装依赖
+       ├─ ui/panel.py        ← Chat panel (wx.Frame, TextCtrl input)
+       ├─ llm_client.py      ← LLMClient, direct connection to OpenAI/Anthropic/Ollama, multimodal messages built here
+       ├─ server_manager.py  ← Starts kcaa MCP server (separate venv subprocess)
+       └─ setup_plugin.sh/.bat/.ps1 ← Creates venv and installs dependencies
 ```
 
-关键结论：
-- 插件运行在 KiCad 嵌入式 wx 环境，`wx` 可用 → 截图/图片 UI 无需额外依赖。
-- LLM 消息构建集中在 `llm_client.py`（`_build_anthropic_messages` / `_stream_openai` / `_stream_ollama` / `_call_*`），新增多模态字段需按 provider 分别处理。
-- KiCad 嵌入式 Python 装第三方包受限；纯 Python / 有跨平台轮子的库（PyMuPDF、pdfplumber、pypdf）应装进 `setup_plugin*.sh/.bat/.ps1` 创建的 venv，插件侧以子进程调用。
+Key conclusions:
+- The plugin runs in KiCad's embedded wx environment, `wx` is available → screenshot/image UI needs no additional dependencies.
+- LLM message construction is centralized in `llm_client.py` (`_build_anthropic_messages` / `_stream_openai` / `_stream_ollama` / `_call_*`); adding multimodal fields requires per-provider handling.
+- KiCad's embedded Python has limited third-party package installation; pure Python / cross-platform wheel libraries (PyMuPDF, pdfplumber, pypdf) should be installed in the venv created by `setup_plugin*.sh/.bat/.ps1`, and called via subprocess from the plugin side.
 
 ---
 
-## 1. 支持上传 / 粘贴图片
+## 1. Support Uploading / Pasting Images
 
-### 方案
-- **UI（panel.py）**：输入框旁加"添加图片"按钮（`wx.FileDialog` 过滤 png/jpg），选中后 `wx.Image` 加载并显示缩略图；支持一次携带多张，随下一条消息一起发送。
-- **剪贴板粘贴（Ctrl+V）**：输入框内 Ctrl+V 时，若系统剪贴板含位图（`wx.DF_BITMAP`）则粘贴为图片（存临时 PNG 进附件栏），否则退化为普通文本粘贴；另有"粘贴"按钮（`wx.ART_PASTE`）触发同一逻辑。
-- **附件缩略图条**：已选图片显示 48×48 缩略图，点击移除；带数量标签与"✕ clear"一键清空。
-- **消息构建（llm_client.py）**，按 provider 区分：
-  - OpenAI：content 变为数组
+### Approach
+- **UI (panel.py)**: Add an "Add Image" button next to the input box (`wx.FileDialog` filtering png/jpg), after selection load with `wx.Image` and display thumbnail; support multiple images at once, sent together with the next message.
+- **Clipboard Paste (Ctrl+V)**: When Ctrl+V is pressed in the input box, if the system clipboard contains a bitmap (`wx.DF_BITMAP`), paste as image (save to temporary PNG and add to attachment bar), otherwise fall back to normal text paste; also a "Paste" button (`wx.ART_PASTE`) triggers the same logic.
+- **Attachment Thumbnail Bar**: Selected images show as 48×48 thumbnails, click to remove; includes count label and "✕ clear" button to clear all.
+- **Message Construction (llm_client.py)**, per provider:
+  - OpenAI: content becomes an array
     `[{"type":"text","text":...}, {"type":"image_url","image_url":{"url":"data:image/png;base64,..."}}]`
-  - Anthropic：
+  - Anthropic:
     `[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"<base64>"}}]`
-  - Ollama：请求体加 `images: ["<base64>"]`，messages 使用数组格式。
-- **发送前压缩**：最长边缩到 ~1024px，控制体积，避免超 token/超时；统一 `wx.Image.Scale` → `wx.Image.ConvertToBitmap` → 编码。
-- **会话保存**：写 session 文件前剥离 `image_url` 块（避免 base64 撑爆文件），加载会话后图片上下文不保留。
-- **模型要求**：需 vision 能力（gpt-4o / claude-3.x / llava 等），在设置中提示。
+  - Ollama: request body adds `images: ["<base64>"]`, messages use array format.
+- **Pre-send Compression**: Scale longest edge to ~1024px to control size, avoid token/timeout issues; unified `wx.Image.Scale` → `wx.Image.ConvertToBitmap` → encode.
+- **Session Saving**: Strip `image_url` blocks before writing session files (to avoid base64 bloating files); image context is not preserved after loading a session.
+- **Model Requirements**: Requires vision capability (gpt-4o / claude-3.x / llava, etc.), prompted in settings.
 
-### 跨平台
-- 全链路只用 Python 标准库（base64）+ wx → 天然支持三平台。
-
----
-
-## 2. 支持解析 PDF 文档
-
-### 方案 A（主路径）：文本抽取 + 页码标注
-- `pypdf`（纯 Python）/ `pdfplumber`（表格友好）/ `PyMuPDF`（fitz，速度快）。
-- **每段文字前标注页码**（如 `[P3]`），LLM 回答时能引用具体页。
-
-### 方案 B（用户按需补充）：页面转图
-- `PyMuPDF` 渲染用户指定页为 PNG，走第 1 节多模态格式发送 —— 适合 datasheet 原理图、图表密集页。
-- **由用户判断**：看完文本摘要后，如信息不足（图表、原理图），用户主动要求补充指定页截图，而非系统自动转图。
-
-### 推荐组合（简化版，2026-08-04 定稿）
-- **默认流程**：全量抽文本（带页码）入上下文。
-- **补充流程**：用户判断需要看图 → 用户要求渲染指定页（或当前打开的 PDF 页）→ 方案 B 转图发给 LLM。
-- 不引入 LLM 选页/自动转图逻辑，保持实现简单。
-
-### 运行位置
-- 库安装进 `setup_plugin.sh/.bat/.ps1` 的 venv（`pymupdf`、`pdfplumber`）。
-- 插件侧通过 `server_manager` 类似机制以子进程跑解析脚本，避免污染 KiCad 嵌入式 Python。
-
-### 跨平台
-- `pymupdf` / `pdfplumber` / `pypdf` 均有 Linux / macOS / Windows 支持（PyMuPDF 提供三平台 wheel）。
+### Cross-Platform
+- The entire chain uses only Python standard library (base64) + wx → naturally supports all three platforms.
 
 ---
 
-## 实施顺序建议
+## 2. Support Parsing PDF Documents
 
-1. 图片上传/粘贴（第 1 节）—— 打通多模态消息格式，PDF 复用。✅ 已完成
-2. PDF 解析（第 2 节）—— 主路径走方案 A（抽文本带页码）；补充走方案 B（用户指定页转图）。依赖 venv 与子进程机制。
+### Approach A (Main Path): Text Extraction + Page Number Annotation
+- `pypdf` (pure Python) / `pdfplumber` (table-friendly) / `PyMuPDF` (fitz, fast).
+- **Annotate page number before each text segment** (e.g., `[P3]`), so the LLM can reference specific pages when answering.
 
-## 风险 / 注意事项
+### Approach B (User-On-Demand): Page-to-Image Conversion
+- `PyMuPDF` renders user-specified pages as PNG, sent via the multimodal format from Section 1 — suitable for datasheet schematics, chart-dense pages.
+- **User decides**: After reading the text summary, if information is insufficient (charts, schematics), the user actively requests rendering specific pages, rather than the system auto-converting.
 
-- **token 与超时**：图片/多页 PDF 会显著增加输入体积，需限制尺寸与页数（如最多前 N 页）。
-- **Vision 模型支持**：需在设置中提示所选模型必须支持图像输入。
-- **剪贴板格式**：Ctrl+V 依赖系统剪贴板位图格式（wx.DF_BITMAP），X11/Wayland/Windows/macOS 需验证；剪贴板只有文本时退化为普通粘贴。
-- **测试**：三平台 CI 需覆盖图片粘贴与 PDF 解析（现有 `.github` 有 CI 可扩展）。
+### Recommended Combination (Simplified, finalized 2026-08-04)
+- **Default flow**: Extract all text (with page numbers) into context.
+- **Supplementary flow**: User decides they need to see images → user requests rendering specific pages (or currently open PDF page) → Approach B converts to image and sends to LLM.
+- No LLM page selection / auto-conversion logic, keeping implementation simple.
+
+### Execution Location
+- Libraries installed in the venv from `setup_plugin.sh/.bat/.ps1` (`pymupdf`, `pdfplumber`).
+- Plugin side runs the extraction script as a subprocess via a mechanism similar to `server_manager`, to avoid polluting KiCad's embedded Python.
+
+### Cross-Platform
+- `pymupdf` / `pdfplumber` / `pypdf` all support Linux / macOS / Windows (PyMuPDF provides wheels for all three platforms).
 
 ---
 
-## 最终方案与目标（2026-08-05 定稿）
+## Suggested Implementation Order
 
-### 目标
-为 kicad_plugin（KiCad AI Assistant 插件）增加两项能力，支持 Linux / Windows / macOS：
-1. 用户上传/粘贴图片给 LLM 看（含 Ctrl+V 粘贴系统截图）
-2. 解析 PDF 文档
+1. Image upload/paste (Section 1) — Establish multimodal message format, reused by PDF. ✅ Complete
+2. PDF parsing (Section 2) — Main path uses Approach A (extract text with page numbers); supplementary uses Approach B (user-specified page to image). Depends on venv and subprocess mechanism.
 
-> 截图不单独做插件内实现：用户自行截图后 Ctrl+V 粘贴到聊天框。
+## Risks / Notes
 
-### 最终方案
+- **Tokens and Timeout**: Images/multi-page PDFs significantly increase input size; need to limit size and page count (e.g., max first N pages).
+- **Vision Model Support**: Need to prompt in settings that the selected model must support image input.
+- **Clipboard Format**: Ctrl+V depends on system clipboard bitmap format (wx.DF_BITMAP); X11/Wayland/Windows/macOS need verification; when clipboard only has text, falls back to normal paste.
+- **Testing**: Three-platform CI needs to cover image paste and PDF parsing (existing `.github` has CI that can be extended).
 
-| 能力 | 方案 | 说明 |
+---
+
+## Final Plan and Goals (Finalized 2026-08-05)
+
+### Goals
+Add two capabilities to kicad_plugin (KiCad AI Assistant plugin), supporting Linux / Windows / macOS:
+1. Users upload/paste images for LLM to see (including Ctrl+V pasting system screenshots)
+2. Parse PDF documents
+
+> Screenshots are not implemented inside the plugin: users take screenshots themselves and Ctrl+V paste into the chat box.
+
+### Final Plan
+
+| Capability | Approach | Description |
 |---|---|---|
-| 图片上传 | **已实现**（2026-08-04） | 面板加"添加图片/粘贴"按钮，缩略图条，Ctrl+V 智能粘贴（剪贴板有 bitmap 时粘贴为图片，否则粘贴文本）；压缩 ≤1024px → base64；OpenAI/Anthropic/Ollama 三 provider 格式转换；会话保存剥离 base64 |
-| 截图（schematic/PCB） | 不实现插件内抓取 | 用户系统截图 → Ctrl+V 粘贴 → 复用图片链路 |
-| PDF 解析 | **主路径**：全量抽文本（带页码 `[P3]`）入上下文；**补充**：用户判断信息不足时要求渲染指定页转图 | 不做 LLM 选页/自动转图，保持简单 |
+| Image Upload | **Implemented** (2026-08-04) | Panel has "Add Image/Paste" button, thumbnail bar, Ctrl+V smart paste (pastes as image when clipboard has bitmap, otherwise pastes text); compress ≤1024px → base64; OpenAI/Anthropic/Ollama three-provider format conversion; session save strips base64 |
+| Screenshot (schematic/PCB) | Not implemented in plugin | User takes system screenshot → Ctrl+V paste → reuses image pipeline |
+| PDF Parsing | **Main path**: extract all text (with page numbers `[P3]`) into context; **Supplementary**: user requests rendering specific pages to image when text is insufficient | No LLM page selection / auto-conversion, keeping it simple |
 
-### 迭代路径（先落地，看效果再增强）
-1. **PDF v1**：只做"抽文本带页码"（PyMuPDF，venv 子进程）。验证文本抽取对 datasheet 的可用性。
-2. **PDF v2**（视 v1 效果）：用户指定页转图 → 复用图片注入链路。
-3. **PDF v3**（可选）：若文本乱/图表多，再考虑 qwen3.8-max 原生 PDF 理解（方案 C）或 LLM 选页（见「暂不考虑」章节）。
+### Iteration Path (Land first, enhance based on results)
+1. **PDF v1**: Only "extract text with page numbers" (PyMuPDF, venv subprocess). Validate text extraction usability for datasheets.
+2. **PDF v2** (depending on v1 results): User-specified page to image → reuse image injection pipeline.
+3. **PDF v3** (optional): If text is messy/chart-heavy, consider qwen3.8-max native PDF understanding (Approach C) or LLM page selection (see "Not Considered" section).
 
-### 已完成的代码改动（ideas 分支）
-- `kicad_plugin/llm_client.py`：`run()` 支持 `images` 参数；OpenAI 数组格式 + Anthropic/Ollama 转换；`_maybe_compact` 兼容数组 content。
-- `kicad_plugin/ui/panel.py`：附件 UI（添加/粘贴/缩略图/清空）；Ctrl+V 智能粘贴；压缩编码；会话保存剥离图片。
-- 44 个 `test_llm_client` 单元测试通过；ruff lint/format 通过。
+### Completed Code Changes (ideas branch)
+- `kicad_plugin/llm_client.py`: `run()` supports `images` parameter; OpenAI array format + Anthropic/Ollama conversion; `_maybe_compact` compatible with array content.
+- `kicad_plugin/ui/panel.py`: Attachment UI (add/paste/thumbnail/clear); Ctrl+V smart paste; compression encoding; session save strips images.
+- 44 `test_llm_client` unit tests pass; ruff lint/format pass.
 
 ---
 
-## 暂不考虑（2026-08-05）
+## Not Considered (2026-08-05)
 
-以下能力经研究后决定暂不实现，保留研究结论供后续参考。
+The following capabilities were researched but decided not to implement. Research conclusions are retained for future reference.
 
-### N1. 插件内 schematic / PCB 截图
+### N1. In-Plugin Schematic / PCB Screenshot
 
-#### 方案 A：wx 屏幕抓取（仅限 PCB editor 实时取景）
-- 插件在 KiCad GUI 内运行，用 `wx.ScreenDC` + `wx.MemoryDC` + `wx.Bitmap` 抓取当前编辑器画布区域：
+#### Approach A: wx Screen Capture (PCB editor only, real-time)
+- The plugin runs inside the KiCad GUI, use `wx.ScreenDC` + `wx.MemoryDC` + `wx.Bitmap` to capture the current editor canvas area:
   ```python
   dc = wx.ScreenDC()
   bmp = wx.Bitmap(w, h)
@@ -133,70 +133,70 @@ KiCad GUI (wxPython)
   mem.SelectObject(wx.NullBitmap)
   bmp.ConvertToImage().SaveFile(path, wx.BITMAP_TYPE_PNG)
   ```
-- 原理：`wx.ScreenDC` 走 OS 层 API 抓屏幕像素（X11 `XGetImage` / Windows `BitBlt` / macOS `CGWindowListCreateImage`），**抓取与窗口属于哪个进程无关**。
+- Principle: `wx.ScreenDC` uses OS-level API to capture screen pixels (X11 `XGetImage` / Windows `BitBlt` / macOS `CGWindowListCreateImage`), **capture works regardless of which process the window belongs to**.
 
-#### ⚠️ 难点（2026-08-04 研究结论）
-- **插件只运行在 PCB editor 进程**：`kicad_plugin/__init__.py` 中 `_ActionPluginBase = pcbnew.ActionPlugin`。
-- **KiCad 的 schematic editor（eeschema）是独立进程**：`wx.GetTopLevelWindows()` 只能枚举**本进程**窗口 → **Python 端从物理上拿不到 schematic editor 的 wx 对象**（不是难，是跨进程不可达）。
-- 要抓 schematic 窗口必须跨进程查窗口坐标：Windows `EnumWindows` / X11 `xwininfo` / macOS `CGWindowListCopyWindowInfo`，三平台实现各异、维护成本高。
-- **结论：方案 A 只对 PCB editor 可行（同进程拿 `GetScreenPosition()`）；schematic 实时截图改走方案 B。**
-- 另：Linux **Wayland** 下 `wx.ScreenDC` 抓屏受限（X11 正常），需验证。
+#### ⚠️ Challenges (2026-08-04 research conclusion)
+- **Plugin only runs in PCB editor process**: `kicad_plugin/__init__.py` has `_ActionPluginBase = pcbnew.ActionPlugin`.
+- **KiCad's schematic editor (eeschema) is a separate process**: `wx.GetTopLevelWindows()` can only enumerate **current process** windows → **Python side physically cannot access schematic editor's wx objects** (not difficult, just cross-process unreachable).
+- To capture schematic windows, must query window coordinates across processes: Windows `EnumWindows` / X11 `xwininfo` / macOS `CGWindowListCopyWindowInfo`, implementations differ across platforms, high maintenance cost.
+- **Conclusion: Approach A only works for PCB editor (same process, can get `GetScreenPosition()`); schematic real-time screenshot uses Approach B.**
+- Also: Linux **Wayland** has limited `wx.ScreenDC` screen capture (X11 works fine), needs verification.
 
-#### 方案 B：kicad-cli 导出
-- 不走 KiCad GUI，用独立进程 `kicad-cli` 导出文件 → **无跨进程问题、无 GUI 依赖**。
-- PCB：`kicad-cli pcb export svg --output out.svg board.kicad_pcb`（KiCad 7+）。
-- Schematic：`kicad-cli sch export svg --output out.svg sheet.kicad_sch`（KiCad 7+，`--recursive` 可导出层级子图）。
+#### Approach B: kicad-cli Export
+- Instead of going through KiCad GUI, use a separate process `kicad-cli` to export files → **no cross-process issue, no GUI dependency**.
+- PCB: `kicad-cli pcb export svg --output out.svg board.kicad_pcb` (KiCad 7+).
+- Schematic: `kicad-cli sch export svg --output out.svg sheet.kicad_sch` (KiCad 7+, `--recursive` can export hierarchical sub-sheets).
 
-#### ✅ 可行性（2026-08-04 研究结论：链路大半已存在）
-- **PCB 链路已实现**：`kcaa/tools/export_tools.py` 的 `generate_thumbnail_with_cli` 已用 `kicad-cli pcb export svg` 生成 PCB 图并返回给 LLM（fastmcp `Image`）。
-- **kicad-cli 查找已封装**：`kcaa/utils/kicad_cli.py`（三平台路径检测 + 缓存 + `KICAD_CLI_PATH` 环境变量）；安全子进程封装在 `kcaa/utils/secure_subprocess.py`。
-- **schematic 子命令已验证**：`kcaa/tools/bom_tools.py` 已用 `kicad-cli sch export bom` → sch 链路可用。
-- 测试夹具齐全：`tests/**/fixtures/` 下有 `.kicad_pcb` / `.kicad_sch`，可在有 KiCad 的环境写集成测试。
+#### ✅ Feasibility (2026-08-04 research conclusion: most of the pipeline already exists)
+- **PCB pipeline implemented**: `kcaa/tools/export_tools.py`'s `generate_thumbnail_with_cli` already uses `kicad-cli pcb export svg` to generate PCB image and return to LLM (fastmcp `Image`).
+- **kicad-cli lookup encapsulated**: `kcaa/utils/kicad_cli.py` (three-platform path detection + caching + `KICAD_CLI_PATH` environment variable); secure subprocess wrapper in `kcaa/utils/secure_subprocess.py`.
+- **Schematic subcommand verified**: `kcaa/tools/bom_tools.py` already uses `kicad-cli sch export bom` → sch pipeline works.
+- Test fixtures available: `tests/**/fixtures/` has `.kicad_pcb` / `.kicad_sch`, can write integration tests in environments with KiCad.
 
-#### ⚠️ 难点
-- **kicad-cli 不直接输出 PNG**（`pcb/sch export` 只支持 svg/pdf/dxf 等）。**SVG 不是 vision 模型原生支持的格式**（OpenAI/Anthropic/Ollama 只收 png/jpeg/webp/gif）→ 必须转换：Pillow（纯 wheel）或 cairosvg（native cairo）。
-- **现有 `generate_thumbnail_with_cli` 直接返回 `format="svg"`，LLM 侧可能拒收** → 需补 SVG→PNG 转换步骤。
-- 实时性差：导出的是整板/整图，不是当前视图（"当前视图"仍要靠方案 A，仅 PCB）。
-- 本机（2026-08-04）无 kicad-cli，尚未实测运行；需在有 KiCad 环境验证 `sch export svg` 与转换链路。
+#### ⚠️ Challenges
+- **kicad-cli does not directly output PNG** (`pcb/sch export` only supports svg/pdf/dxf, etc.). **SVG is not a format natively supported by vision models** (OpenAI/Anthropic/Ollama only accept png/jpeg/webp/gif) → must convert: Pillow (pure wheel) or cairosvg (native cairo).
+- **Existing `generate_thumbnail_with_cli` directly returns `format="svg"`, LLM side may reject** → need to add SVG→PNG conversion step.
+- Poor real-time: exports the entire board/sheet, not the current view ("current view" still requires Approach A, PCB only).
+- Local machine (2026-08-04) has no kicad-cli, not yet tested; need to verify `sch export svg` and conversion pipeline in an environment with KiCad.
 
-#### 暂不考虑原因
-- 方案 A 跨进程不可行（schematic）；方案 B 需额外维护 SVG→PNG 转换，性价比低。
-- **替代路径**：用户用系统截图工具截取 schematic / PCB 画面 → 在插件输入框 **Ctrl+V** 粘贴 → 走第 1 节图片注入链路发给 LLM。该功能已在第 1 节的图片粘贴实现中覆盖。
+#### Reason for Not Considering
+- Approach A is cross-process infeasible (schematic); Approach B requires additional SVG→PNG conversion maintenance, low cost-effectiveness.
+- **Alternative path**: User uses system screenshot tool to capture schematic / PCB screen → **Ctrl+V** paste in plugin input box → goes through Section 1 image injection pipeline to send to LLM. This functionality is already covered by the image paste implementation in Section 1.
 
-### N2. PDF 方案 C：百炼 + qwen3.8-max 原生 PDF 理解
+### N2. PDF Approach C: Bailian + qwen3.8-max Native PDF Understanding
 
-- **qwen3.8-max 原生支持 PDF**（2026-08-04 官方文档确认，`https://help.aliyun.com/zh/model-studio/pdf-understanding`），走 OpenAI 兼容接口，content 数组加 `type: "file"` 块：
+- **qwen3.8-max natively supports PDF** (2026-08-04 official documentation confirmed, `https://help.aliyun.com/zh/model-studio/pdf-understanding`), uses OpenAI-compatible interface, content array adds `type: "file"` block:
   ```json
-  {"type": "file", "file": {"file_url": "https://.../doc.pdf"}}            // URL，二选一
-  // 或 Base64：
-  {"type": "file", "file": {"file_data": "data:application/pdf;base64,xxx", "filename": "report.pdf"}}  // file_data 时 filename 必填
+  {"type": "file", "file": {"file_url": "https://.../doc.pdf"}}            // URL, either/or
+  // Or Base64:
+  {"type": "file", "file": {"file_data": "data:application/pdf;base64,xxx", "filename": "report.pdf"}}  // filename required when using file_data
   ```
-- **限制**：单文件 ≤150MB、≤500 页；首包超时最长 300s（建议流式）；**仅华北 2（北京）地域**；不支持 Responses API。
-- **计费**（两段流水线）：
-  1. 文档解析费：0.02 元/页（平台先做版面分析/OCR，拆成文字 + 图片）；
-  2. 模型调用费：解析出的**文字按文本 token、图片按图片 token** 计入输入，按模型标准输入价计费。
-- **优点**：不用在插件里装 PyMuPDF/pdfplumber 做预处理；文字走文本 token（便宜）、仅图表走图片 token。
-- **缺点**：非通用能力（仅百炼华北2 + qwen3.8-max）；base_url 需带 WorkspaceId（`https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/compatible-mode/v1`）。
+- **Limitations**: Single file ≤150MB, ≤500 pages; first packet timeout up to 300s (streaming recommended); **only North China 2 (Beijing) region**; does not support Responses API.
+- **Billing** (two-stage pipeline):
+  1. Document parsing fee: ¥0.02/page (platform first does layout analysis/OCR, splits into text + images);
+  2. Model call fee: parsed **text charged as text tokens, images as image tokens** for input, billed at model's standard input price.
+- **Pros**: No need to install PyMuPDF/pdfplumber in the plugin for preprocessing; text goes through text tokens (cheaper), only charts go through image tokens.
+- **Cons**: Not a universal capability (only Bailian North China 2 + qwen3.8-max); base_url needs WorkspaceId (`https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/compatible-mode/v1`).
 
-#### 暂不考虑原因
-- 非通用能力，仅百炼华北2 + qwen3.8-max；先走通用方案 A+B，视效果再考虑。
+#### Reason for Not Considering
+- Not a universal capability, only Bailian North China 2 + qwen3.8-max; first use universal Approach A+B, consider based on results.
 
-### N3. PDF 图文拆分的对应关系问题
+### N3. PDF Image-Text Split Correspondence Issue
 
-- 方案 C / 方案 A+B 把文字与图片拆开，**页面内图文相对位置丢失**（模型不知道图片A和文字B在页面上谁在上谁在下）。
-- **保留的**：页序、图注/标题文字（caption 是文字，跟着文字流走）。
-- **影响分场景**：文字为主（报告/论文）影响小；图文强耦合（datasheet 原理图+引脚表+时序图）影响中等 —— 但图片内部信息（引脚名、数值）模型可自读，不依赖坐标对应，且图注可交叉验证。
-- **强版面场景**：用方案 B 整页转图保真，代价是全页按图片 token 计费（更贵）。
+- Approach C / Approach A+B split text and images, **intra-page image-text relative position is lost** (the model doesn't know whether image A or text B is above/below on the page).
+- **Preserved**: page order, caption/title text (captions are text, follow the text flow).
+- **Impact by scenario**: Text-heavy (reports/papers) minimal impact; strong image-text coupling (datasheet schematics + pin tables + timing diagrams) moderate impact — but image internal information (pin names, values) can be read by the model itself, doesn't depend on coordinate correspondence, and captions can cross-validate.
+- **Strong layout scenarios**: Use Approach B full-page-to-image for fidelity, at the cost of full-page image token billing (more expensive).
 
-#### 暂不考虑原因
-- 先落地方案 A（抽文本带页码），看实际效果再决定是否需要整页转图保真。
+#### Reason for Not Considering
+- First implement Approach A (extract text with page numbers), see actual results before deciding whether full-page-to-image fidelity is needed.
 
-### N4. PDF 成本对比与图片 token 算法
+### N4. PDF Cost Comparison and Image Token Calculation
 
-| 方案 | 解析成本 | 输入 token 成本 | 通用性 |
+| Approach | Parsing Cost | Input Token Cost | Universality |
 |---|---|---|---|
-| 百炼原生 PDF（方案 C） | 0.02 元/页 | 文字按文本、图表按图片 token | 仅华北2 + qwen3.8-max |
-| 本地转图（方案 B） | 0（本地渲染） | 全页按图片 token（贵） | 任何 vision 模型 |
-| 本地抽文本（方案 A） | 0 | 仅文本 token（最便宜，但丢图表） | 任何模型 |
-- 图片 token 算法（百炼视觉模型）：**每张 ≈ ⌈h×w/1024⌉ + 2**（1024×1024 ≈ 1026 token，线性增长）。
-- 图文混合文档用方案 C 更划算；纯图 PDF 方案 B/C 成本接近。
+| Bailian native PDF (Approach C) | ¥0.02/page | Text as text tokens, charts as image tokens | Only North China 2 + qwen3.8-max |
+| Local image conversion (Approach B) | 0 (local rendering) | Full page as image tokens (expensive) | Any vision model |
+| Local text extraction (Approach A) | 0 | Text tokens only (cheapest, but loses charts) | Any model |
+- Image token calculation (Bailian vision model): **per image ≈ ⌈h×w/1024⌉ + 2** (1024×1024 ≈ 1026 tokens, linear growth).
+- Mixed image-text documents are more cost-effective with Approach C; pure-image PDFs have similar cost for Approach B/C.
