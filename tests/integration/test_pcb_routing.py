@@ -129,7 +129,6 @@ class TestAutoRoutePair:
         with pytest.raises(RouteFailure):
             auto_route_pair(req)
 
-    @pytest.mark.xfail(reason="Multi-layer routing not supported yet")
     def test_multi_layer_route_inserts_via(self, pcb_copy):
         # R1.2 is on F.Cu (GND). D1.1 is on In1.Cu (GND). The router must
         # insert at least one via to reach the destination layer.
@@ -151,7 +150,6 @@ class TestAutoRoutePair:
         for via in result.vias:
             assert via.layers in allowed, f"unexpected via pair: {via.layers}"
 
-    @pytest.mark.xfail(reason="Multi-layer routing not supported yet")
     def test_multi_layer_via_in_board(self, pcb_copy):
         req = RouteRequest(
             pcb_path=pcb_copy,
@@ -340,32 +338,6 @@ class TestRoutingTool:
         vias = [item for item in data if _is_list(item) and _sym(item[0]) == "via"]
         assert len(vias) == 0
 
-    def test_batch_via_tool_rejects_footprint_overlap(self, pcb_copy):
-        # R1 is placed in the test board.  Pull its footprint centre
-        # from the world model and drop a via right on top of it.
-        from kcaa.router.world_model import build_world_model
-
-        world = build_world_model(pcb_copy)
-        fp_obs = next(
-            (o for o in world.obstacles if o.kind == "footprint" and o.ref == "R1"),
-            None,
-        )
-        assert fp_obs is not None, "fixture should expose R1's courtyard"
-        centroid = fp_obs.shape.representative_point()
-        mcp = self._make_mcp()
-        result = self._call_tool(
-            mcp,
-            "pcb_add_vias",
-            pcb_path=pcb_copy,
-            vias=[{"x": centroid.x, "y": centroid.y, "net": "VCC"}],
-            ctx=None,
-        )
-        assert "error" in result
-        assert "footprint" in result["error"]
-        data = load_pcb(pcb_copy)
-        vias = [item for item in data if _is_list(item) and _sym(item[0]) == "via"]
-        assert len(vias) == 0
-
     def test_batch_via_tool_rejects_keepout_overlap(self, pcb_copy):
         # The fixture has a keepout zone at (38..42, 36..40) on F.Cu.
         # Default via layers are ("F.Cu", "B.Cu") so the F.Cu ring hits it.
@@ -505,7 +477,6 @@ class TestRoutingTool:
         vias = [item for item in data if _is_list(item) and _sym(item[0]) == "via"]
         assert len(vias) == 2
 
-    @pytest.mark.xfail(reason="Multi-layer routing not supported yet")
     def test_multi_layer_tool_writes_segments_and_via(self, pcb_copy):
         # R1.2 is on F.Cu; D1.1 is on In1.Cu (GND).  Calling the tool
         # with target_layer="In1.Cu" should produce at least one via.

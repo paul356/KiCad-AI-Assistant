@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "kcaa"
-version = "0.1.8"
+version = "0.1.9"
 description = "Model Context Protocol (MCP) server for KiCad electronic design automation (EDA) files"
 readme = "README.md"
 license = { text = "MIT" }

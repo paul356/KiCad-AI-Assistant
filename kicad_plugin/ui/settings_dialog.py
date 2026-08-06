@@ -56,6 +56,18 @@ if _WX_AVAILABLE:
             self._model = wx.TextCtrl(self, value=self._settings.llm_model)
             grid.Add(self._model, 1, wx.EXPAND)
 
+            # Supports vision
+            grid.Add(
+                wx.StaticText(self, label="Model supports vision:"), 0, wx.ALIGN_CENTER_VERTICAL
+            )
+            self._supports_vision = wx.CheckBox(self)
+            self._supports_vision.SetValue(self._settings.llm_supports_vision)
+            self._supports_vision.SetToolTip(
+                "Enable when the model accepts image input (e.g. gpt-4o, claude-3.x, llava). "
+                "Disable for text-only models to avoid sending image data they cannot process."
+            )
+            grid.Add(self._supports_vision, 1)
+
             # Custom base URL
             grid.Add(wx.StaticText(self, label="Custom endpoint URL:"), 0, wx.ALIGN_CENTER_VERTICAL)
             self._base_url = wx.TextCtrl(self, value=self._settings.llm_base_url)
@@ -161,6 +173,7 @@ if _WX_AVAILABLE:
             settings.llm_provider = self._PROVIDERS[self._provider.GetSelection()]
             settings.llm_api_key = self._api_key.GetValue().strip()
             settings.llm_model = self._model.GetValue().strip()
+            settings.llm_supports_vision = self._supports_vision.GetValue()
             settings.llm_base_url = self._base_url.GetValue().strip()
             settings.python_executable = self._python.GetValue().strip()
             settings.server_port = self._port.GetValue()

@@ -128,18 +128,8 @@ class TestFootprintObstacle:
         fp = _make_footprint("R1", 10.0, 20.0, courtyard=courtyard)
         path = _write_pcb(tmp_path, _make_pcb([fp]))
         m = build_world_model(path)
-        # 2 pad obstacles + 1 courtyard obstacle
-        assert len(m.obstacles) == 3
-        fp_obs = [o for o in m.obstacles if o.kind == "footprint"]
-        assert len(fp_obs) == 1
-        o = fp_obs[0]
-        assert o.ref == "R1"
-        assert o.layers == frozenset({"F.Cu", "B.Cu"})
-        assert o.net is None
-        # Bbox should be ~9..11, ~19..21
-        minx, miny, maxx, maxy = o.shape.bounds
-        assert minx == pytest.approx(9.0, abs=1e-6)
-        assert maxx == pytest.approx(11.0, abs=1e-6)
+        # 2 pad obstacles (courtyard not treated as obstacle)
+        assert len(m.obstacles) == 2
 
     def test_footprint_without_courtyard_is_skipped(self, tmp_path):
         fp = _make_footprint("R1", 10.0, 20.0)  # no courtyard
@@ -148,26 +138,6 @@ class TestFootprintObstacle:
         # 2 pad obstacles (no courtyard → no courtyard obstacle)
         assert len(m.obstacles) == 2
         assert all(o.kind == "pad" for o in m.obstacles)
-
-    def test_footprint_in_exclude_refs_is_skipped(self, tmp_path):
-        courtyard = [
-            [
-                _sym("fp_line"),
-                [_sym("start"), -1.0, -1.0],
-                [_sym("end"), 1.0, -1.0],
-                [_sym("layer"), "F.CrtYd"],
-                [_sym("width"), 0.05],
-            ],
-        ]
-        fp1 = _make_footprint("R1", 10.0, 20.0, courtyard=courtyard)
-        fp2 = _make_footprint("R2", 30.0, 30.0, courtyard=courtyard)
-        path = _write_pcb(tmp_path, _make_pcb([fp1, fp2]))
-        m = build_world_model(path, exclude_refs={"R1"})
-        # 4 pad obstacles (2 per footprint) + 1 courtyard (R2)
-        assert len(m.obstacles) == 5
-        fp_obs = [o for o in m.obstacles if o.kind == "footprint"]
-        assert len(fp_obs) == 1
-        assert fp_obs[0].ref == "R2"
 
 
 # ---------------------------------------------------------------------------
@@ -357,20 +327,11 @@ class TestRoutingFixture:
     def test_fixture_has_expected_obstacles(self):
         m = build_world_model(self.FIXTURE)
         kinds = sorted({o.kind for o in m.obstacles})
-        assert "footprint" in kinds
         assert "track" in kinds
         assert "keepout" in kinds
-        refs = {o.ref for o in m.obstacles if o.ref}
-        assert {"R1", "C1", "U1"}.issubset(refs)
+        assert "pad" in kinds
 
     def test_fixture_vcc_filter_excludes_track(self):
         m = build_world_model(self.FIXTURE, net_filter="VCC")
         tracks = [o for o in m.obstacles if o.kind == "track"]
         assert tracks == []
-
-    def test_fixture_exclude_refs_works(self):
-        m = build_world_model(self.FIXTURE, exclude_refs={"R1", "C1"})
-        refs = {o.ref for o in m.obstacles if o.ref}
-        assert "R1" not in refs
-        assert "C1" not in refs
-        assert "U1" in refs

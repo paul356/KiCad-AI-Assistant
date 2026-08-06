@@ -78,13 +78,37 @@ function _autorouteHtml(e) {
         + output + '</pre></div></details>';
 }
 
+function _pdfTextsHtml(pdfTexts) {
+    if (!pdfTexts || pdfTexts.length === 0) return '';
+    var html = '';
+    for (var i = 0; i < pdfTexts.length; i++) {
+        var p = pdfTexts[i];
+        var icon = p.error ? '\u2717' : '\u2713';
+        var iconColor = p.error ? '#c62828' : '#2e7d32';
+        var css = p.error ? 'tool-entry tool-err' : 'tool-entry tool-ok';
+        var uid = 'pdf_' + i + '_' + Math.random().toString(36).slice(2);
+        html += '<details class="tools" id="' + uid + '" style="margin:2px 0">'
+            + '<summary><span style="color:' + iconColor + '">' + icon + '</span> '
+            + '<span style="color:#444;font-weight:600">\uD83D\uDCC4 ' + _escapeHtml(p.name)
+            + '</span></summary>'
+            + '<div class="tool-body ' + css + '" data-details="' + uid + '">'
+            + '<pre style="margin:2px 0;max-height:300px;overflow-y:auto">'
+            + _escapeHtml(p.text || '') + '</pre></div></details>';
+    }
+    return html;
+}
+
 function _renderEntry(e) {
     try {
         var div = document.createElement('div');
         switch (e.type) {
             case 'user':
+                var userBody = _escapeHtml(e.text || '').replace(/\n/g, '<br>');
+                if (e.pdf_texts && e.pdf_texts.length > 0) {
+                    userBody += _pdfTextsHtml(e.pdf_texts);
+                }
                 div.innerHTML = _msgBlock('You', '#1565C0', '#E3F2FD',
-                    _escapeHtml(e.text || '').replace(/\n/g, '<br>'), e.timestamp || '');
+                    userBody, e.timestamp || '');
                 break;
             case 'ai':
                 div.innerHTML = _msgBlock('AI', '#00695C', '#E8F5E9',

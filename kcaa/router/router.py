@@ -44,9 +44,12 @@ import logging
 import math
 import os
 
+from shapely.geometry import box as _shapely_box
+
 from kcaa.router.grid_a_star import (
     GRID_RESOLUTION,
     hierarchical_a_star,
+    multi_layer_a_star,
     path_to_nodes,
     shortcut_path,
     simplify_path,
@@ -57,6 +60,7 @@ from kcaa.router.path_postprocess import (
     OutputVia,
     postprocess_path,
 )
+from kcaa.router.visibility_graph import RouteNode
 from kcaa.router.world_model import Obstacle, build_world_model
 from kcaa.utils.pcb_sexp_utils import load_pcb
 
@@ -129,6 +133,9 @@ class RouteRequest:
         grid_resolution: Grid cell size in mm for the walkability grid.
             Smaller values give finer paths but more cells.  ``None``
             uses the default (0.025 mm).
+        via_cost: Distance-equivalent penalty for taking a via edge in
+            multi-layer A*.  Higher values discourage unnecessary stack
+            vias.  Default 2.0 mm.
     """
 
     pcb_path: str
@@ -146,6 +153,7 @@ class RouteRequest:
     via_drill: float | None = None
     max_miter_mm: float = 1.0
     grid_resolution: float | None = None  # None → GRID_RESOLUTION
+    via_cost: float = 2.0  # mm penalty per via edge
 
 
 @dataclass
@@ -233,6 +241,12 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
                 f"Cannot determine clearance: {exc}. "
                 f"Pass clearance= explicitly in RouteRequest to skip DRC lookup."
             ) from exc
+    via_diameter = req.via_diameter
+    if via_diameter is None:
+        via_diameter = _resolve_via_diameter(req.pcb_path, net=req.net)
+    via_drill = req.via_drill
+    if via_drill is None:
+        via_drill = _resolve_via_drill(req.pcb_path, net=req.net)
 
     # Pad center coordinates.
     pad_a_xy = _find_pad_center(data, req.ref_a, req.pad_a)
@@ -263,8 +277,6 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
     model = build_world_model(
         req.pcb_path,
         net_filter=req.net,
-        exclude_refs=set(),
-        include_footprints=False,
     )
 
     # Shrink obstacles by half the trace width (so the track is centered on
@@ -306,6 +318,23 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
     pad_a_size = pad_a_world_size if pad_a_world_size and _is_rect(pad_a_world_size) else None
     pad_b_size = pad_b_world_size if pad_b_world_size and _is_rect(pad_b_world_size) else None
 
+    # For multi-layer routing, clear the start/end pad areas from the
+    # obstacle grid so A* can start from / end at the pad centres.
+    # Existing copper (e.g. a track from another net) may occupy the pad.
+    if req.start_layer != req.end_layer:
+        if pad_a_world_size is not None:
+            obstacles_by_layer[req.start_layer] = _subtract_pad_aabb(
+                obstacles_by_layer[req.start_layer],
+                pad_a_xy,
+                pad_a_world_size,
+            )
+        if pad_b_world_size is not None:
+            obstacles_by_layer[req.end_layer] = _subtract_pad_aabb(
+                obstacles_by_layer[req.end_layer],
+                pad_b_xy,
+                pad_b_world_size,
+            )
+
     # Route from pad center to pad center.  A* on the grid naturally
     # produces 0/45/90° segments.
     route_bbox = (
@@ -324,25 +353,15 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
         f" → {req.ref_b}/{req.pad_b} ({_bx:.3f},{_by:.3f})"
         f"  size_a={pad_a_size} size_b={pad_b_size}"
     )
-    result = hierarchical_a_star(
-        buffered,
-        pad_a_xy,
-        pad_b_xy,
-        fine_resolution=grid_res,
-        route_bbox=route_bbox,
-    )
-    if result.path is None:
-        raise RouteFailure(
-            f"No obstacle-avoiding path from {req.ref_a}/{req.pad_a} to "
-            f"{req.ref_b}/{req.pad_b} at {req.width or 0.5}mm "
-            f"track width on layer {req.start_layer}."
-        )
-    print(f"  [route] A*: {len(result.path)} pts  cells_visited={result.cells_visited}")
+    # Build pad-rectangle descriptors early (used by postprocess_path in
+    # both single-layer and multi-layer branches).
+    _pad_rects: list[tuple[float, float, float, float]] = []
+    for psize, pcenter in [(pad_a_size, pad_a_xy), (pad_b_size, pad_b_xy)]:
+        if psize is not None:
+            w, h = psize
+            _pad_rects.append((pcenter[0], pcenter[1], w / 2.0, h / 2.0))
 
-    # ---- Discard A* path inside rectangular pads and replace with a
-    #      single axis-aligned wire (fence → centre).  This keeps the
-    #      pad exit clean; normal post-processing runs afterwards. ----
-    # Build viz context: pad rects (all pads, not just rectangular), obstacles.
+    # Build viz context: pad rects (all pads, not just rectangular).
     _pad_viz: list[tuple[str, tuple[float, float, float, float]]] = []
     for name, psize, pcenter in [
         (f"{req.ref_a}/{req.pad_a}", pad_a_world_size, pad_a_xy),
@@ -361,72 +380,195 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
                     ),
                 )
             )
-    _dump_viz("0-astar", result.path, _pad_viz, buffered, route_bbox)
 
-    if pad_a_size is not None:
-        n_before = len(result.path)
-        result.path = _replace_pad_path(result.path, pad_a_xy, pad_a_size, from_center=True)
-        _log_path("pad_a-replace", result.path, n_before)
-    if pad_b_size is not None:
-        n_before = len(result.path)
-        result.path = _replace_pad_path(result.path, pad_b_xy, pad_b_size, from_center=False)
-        _log_path("pad_b-replace", result.path, n_before)
-    _dump_viz("1-pad-replace", result.path, _pad_viz, buffered, route_bbox)
-
-    # ---- Post-process: simplify → shortcut → snap45 → validate ----
-    best_path_pts = result.path
-    best_path_pts = simplify_path(best_path_pts)
-    _log_path("simplify", best_path_pts)
-    _dump_viz("2-simplify", best_path_pts, _pad_viz, buffered, route_bbox)
-    best_path_pts = shortcut_path(best_path_pts, buffered, route_bbox, resolution=grid_res)
-    _log_path("shortcut", best_path_pts)
-    _dump_viz("3-shortcut", best_path_pts, _pad_viz, buffered, route_bbox)
-    best_path_pts = snap_to_45_path_safe(best_path_pts, buffered, route_bbox, resolution=grid_res)
-    _log_path("snap45", best_path_pts)
-    _dump_viz("4-snap45", best_path_pts, _pad_viz, buffered, route_bbox)
-
-    # ---- Align path endpoints with exact pad centres ----
-    best_path_pts = _align_path_endpoints(
-        best_path_pts,
-        pad_a_xy,
-        pad_b_xy,
-        buffered,
-        route_bbox,
-        grid_res,
-        pad_a_size=pad_a_size,
-        pad_b_size=pad_b_size,
-    )
-    _log_path("align-endpoints", best_path_pts)
-    _dump_viz("6-align-endpoints", best_path_pts, _pad_viz, buffered, route_bbox)
-
-    # Build pad-rectangle descriptors to suppress miters at pad exits.
-    _pad_rects: list[tuple[float, float, float, float]] = []
-    for psize, pcenter in [(pad_a_size, pad_a_xy), (pad_b_size, pad_b_xy)]:
-        if psize is not None:
-            w, h = psize
-            _pad_rects.append((pcenter[0], pcenter[1], w / 2.0, h / 2.0))
-
-    path_nodes = path_to_nodes(best_path_pts, req.start_layer)
-    segs, vias = postprocess_path(
-        path_nodes,
-        width=width,
-        net=req.net,
-        max_miter_mm=req.max_miter_mm,
-        _obstacles=buffered,
-        _pad_rects=_pad_rects or None,
-    )
-    # Discard zero-length segments that can arise from miter edge cases.
-    segs = [s for s in segs if abs(s.x1 - s.x2) > 1e-6 or abs(s.y1 - s.y2) > 1e-6]
-    _log_output_segments("final", segs)
-    _dump_viz_segments("7-final", segs, _pad_viz, buffered, route_bbox)
     if req.start_layer != req.end_layer:
-        raise RouteFailure(
-            f"Multi-layer routing ({req.start_layer} → {req.end_layer}) not supported yet."
+        # ── Multi-layer: grid A* with via edges ──────────────────────
+        # Build via-forbidden zones from start/end pad AABBs to
+        # prevent via-in-pad (DFM issue: solder wicking).
+        via_forbidden: list = []
+        if pad_a_world_size is not None:
+            via_forbidden.append(
+                _shapely_box(
+                    pad_a_xy[0] - pad_a_world_size[0] / 2.0,
+                    pad_a_xy[1] - pad_a_world_size[1] / 2.0,
+                    pad_a_xy[0] + pad_a_world_size[0] / 2.0,
+                    pad_a_xy[1] + pad_a_world_size[1] / 2.0,
+                )
+            )
+        if pad_b_world_size is not None:
+            via_forbidden.append(
+                _shapely_box(
+                    pad_b_xy[0] - pad_b_world_size[0] / 2.0,
+                    pad_b_xy[1] - pad_b_world_size[1] / 2.0,
+                    pad_b_xy[0] + pad_b_world_size[0] / 2.0,
+                    pad_b_xy[1] + pad_b_world_size[1] / 2.0,
+                )
+            )
+        ml_result = multi_layer_a_star(
+            obstacles_by_layer,
+            pad_a_xy,
+            pad_b_xy,
+            req.start_layer,
+            req.end_layer,
+            req.via_pairs,
+            route_bbox,
+            grid_res,
+            via_cost=req.via_cost,
+            via_forbidden_zones=via_forbidden or None,
+        )
+        if ml_result.path is None:
+            raise RouteFailure(
+                f"No obstacle-avoiding multi-layer path from "
+                f"{req.ref_a}/{req.pad_a} to {req.ref_b}/{req.pad_b} at "
+                f"{width}mm track width ({req.start_layer} → {req.end_layer})."
+            )
+        print(
+            f"  [route] multi-layer A*: {len(ml_result.path)} pts"
+            f"  cells_visited={ml_result.cells_visited}"
         )
 
-    start_xy = (path_nodes[0].x, path_nodes[0].y)
-    end_xy = (path_nodes[-1].x, path_nodes[-1].y)
-    layers_used = _layers_used(path_nodes)
+        # Group GridNode by layer, run per-segment postprocess.
+        from itertools import groupby
+
+        groups = [
+            (layer, list(grp)) for layer, grp in groupby(ml_result.path, key=lambda n: n.layer)
+        ]
+        all_nodes: list[RouteNode] = []
+        node_id = 0
+        for gi, (layer, nodes) in enumerate(groups):
+            pts = [(n.x, n.y) for n in nodes]
+            if len(pts) < 2:
+                # Single-point segment (e.g. layer transition without
+                # meaningful path on the layer).  Keep the point for
+                # via continuity but skip postprocessing.
+                for n in nodes:
+                    all_nodes.append(RouteNode(x=n.x, y=n.y, layer=layer, node_id=node_id))
+                    node_id += 1
+                continue
+            obs = obstacles_by_layer.get(layer, [])
+            prefix = f"layer-{layer}"
+            is_first = gi == 0
+            is_last = gi == len(groups) - 1
+
+            _dump_viz(f"{prefix}-0-astar", pts, _pad_viz, obs, route_bbox)
+
+            # Pad replacement (start/end segments only).
+            if is_first and pad_a_size is not None:
+                n_before = len(pts)
+                pts = _replace_pad_path(pts, pad_a_xy, pad_a_size, from_center=True)
+                _log_path(f"{prefix}-pad-replace", pts, n_before)
+            elif is_last and pad_b_size is not None:
+                n_before = len(pts)
+                pts = _replace_pad_path(pts, pad_b_xy, pad_b_size, from_center=False)
+                _log_path(f"{prefix}-pad-replace", pts, n_before)
+            _dump_viz(f"{prefix}-1-pad-replace", pts, _pad_viz, obs, route_bbox)
+
+            # Simplify → shortcut → snap45.
+            pts = _postprocess_layer_segment(pts, obs, route_bbox, grid_res, prefix, _pad_viz)
+
+            # Align endpoint to pad centre (start/end segments only).
+            if is_first and pad_a_size is not None:
+                pts = _align_single_endpoint(
+                    pts, pad_a_xy, obs, route_bbox, grid_res, pad_a_size, from_center=True
+                )
+            elif is_last and pad_b_size is not None:
+                pts = _align_single_endpoint(
+                    pts, pad_b_xy, obs, route_bbox, grid_res, pad_b_size, from_center=False
+                )
+            _dump_viz(f"{prefix}-6-align", pts, _pad_viz, obs, route_bbox)
+
+            for x, y in pts:
+                all_nodes.append(RouteNode(x=x, y=y, layer=layer, node_id=node_id))
+                node_id += 1
+
+        segs, vias = postprocess_path(
+            all_nodes,
+            width=width,
+            net=req.net,
+            max_miter_mm=req.max_miter_mm,
+            via_diameter_mm=via_diameter,
+            via_drill_mm=via_drill,
+            _obstacles=buffered,
+            _pad_rects=_pad_rects or None,
+        )
+        segs = [s for s in segs if abs(s.x1 - s.x2) > 1e-6 or abs(s.y1 - s.y2) > 1e-6]
+        _log_output_segments("final", segs)
+        _dump_viz_segments("7-final", segs, _pad_viz, buffered, route_bbox)
+
+        start_xy = (all_nodes[0].x, all_nodes[0].y)
+        end_xy = (all_nodes[-1].x, all_nodes[-1].y)
+        layers_used = _layers_used(all_nodes)
+    else:
+        # ── Single-layer: hierarchical A* ───────────────────────────
+        result = hierarchical_a_star(
+            buffered,
+            pad_a_xy,
+            pad_b_xy,
+            fine_resolution=grid_res,
+            route_bbox=route_bbox,
+        )
+        if result.path is None:
+            raise RouteFailure(
+                f"No obstacle-avoiding path from {req.ref_a}/{req.pad_a} to "
+                f"{req.ref_b}/{req.pad_b} at {req.width or 0.5}mm "
+                f"track width on layer {req.start_layer}."
+            )
+        print(f"  [route] A*: {len(result.path)} pts  cells_visited={result.cells_visited}")
+
+        # Strip layer_idx from the unified A* result.
+        raw_pts = [(x, y) for x, y, _ in result.path]
+        _dump_viz("0-astar", raw_pts, _pad_viz, buffered, route_bbox)
+
+        # ---- Discard A* path inside rectangular pads and replace with
+        #      axis-aligned wire (fence → centre). ----
+        best_path_pts = raw_pts
+        if pad_a_size is not None:
+            n_before = len(best_path_pts)
+            best_path_pts = _replace_pad_path(best_path_pts, pad_a_xy, pad_a_size, from_center=True)
+            _log_path("pad_a-replace", best_path_pts, n_before)
+        if pad_b_size is not None:
+            n_before = len(best_path_pts)
+            best_path_pts = _replace_pad_path(
+                best_path_pts, pad_b_xy, pad_b_size, from_center=False
+            )
+            _log_path("pad_b-replace", best_path_pts, n_before)
+        _dump_viz("1-pad-replace", best_path_pts, _pad_viz, buffered, route_bbox)
+
+        # ---- Post-process: simplify → shortcut → snap45 ----
+        best_path_pts = _postprocess_layer_segment(
+            best_path_pts, buffered, route_bbox, grid_res, "", _pad_viz
+        )
+
+        # ---- Align path endpoints with exact pad centres ----
+        best_path_pts = _align_path_endpoints(
+            best_path_pts,
+            pad_a_xy,
+            pad_b_xy,
+            buffered,
+            route_bbox,
+            grid_res,
+            pad_a_size=pad_a_size,
+            pad_b_size=pad_b_size,
+        )
+        _log_path("align-endpoints", best_path_pts)
+        _dump_viz("6-align-endpoints", best_path_pts, _pad_viz, buffered, route_bbox)
+
+        path_nodes = path_to_nodes(best_path_pts, req.start_layer)
+        segs, vias = postprocess_path(
+            path_nodes,
+            width=width,
+            net=req.net,
+            max_miter_mm=req.max_miter_mm,
+            _obstacles=buffered,
+            _pad_rects=_pad_rects or None,
+        )
+        segs = [s for s in segs if abs(s.x1 - s.x2) > 1e-6 or abs(s.y1 - s.y2) > 1e-6]
+        _log_output_segments("final", segs)
+        _dump_viz_segments("7-final", segs, _pad_viz, buffered, route_bbox)
+
+        start_xy = (path_nodes[0].x, path_nodes[0].y)
+        end_xy = (path_nodes[-1].x, path_nodes[-1].y)
+        layers_used = _layers_used(path_nodes)
 
     # Verify every emitted segment stays inside the board (Edge.Cuts).
     # We use a board polygon that is shrunk by width/2 on each side so the
@@ -494,8 +636,11 @@ def _log_path(label: str, pts: list[tuple[float, float]], prev_n: int | None = N
     """Log a polyline step: point count, endpoints, segment breakdown."""
     n = len(pts)
     delta = f" (was {prev_n})" if prev_n is not None else ""
+    if n < 2:
+        print(f"  [{label}] {n} pts{delta}")
+        return
     segs = []
-    for i in range(len(pts) - 1):
+    for i in range(n - 1):
         x1, y1, x2, y2 = pts[i][0], pts[i][1], pts[i + 1][0], pts[i + 1][1]
         ang = _seg_angle(x1, y1, x2, y2)
         # Classify
@@ -624,6 +769,36 @@ def _dump_viz_segments(
 
 
 # ---------------------------------------------------------------------------
+# Pad area clearing (for multi-layer A* start/end cells)
+# ---------------------------------------------------------------------------
+
+
+def _subtract_pad_aabb(
+    obstacles: list[Obstacle],
+    pad_center: tuple[float, float],
+    pad_size: tuple[float, float],
+) -> list[Obstacle]:
+    """Subtract a pad's AABB from each obstacle, returning only non-empty results.
+
+    Called before multi-layer A* to unblock the grid cells at the start
+    and end pad centres (existing copper from other nets may occupy the pad
+    area on the same layer).
+    """
+    pad_rect = _shapely_box(
+        pad_center[0] - pad_size[0] / 2.0,
+        pad_center[1] - pad_size[1] / 2.0,
+        pad_center[0] + pad_size[0] / 2.0,
+        pad_center[1] + pad_size[1] / 2.0,
+    )
+    out: list[Obstacle] = []
+    for o in obstacles:
+        diff = o.shape.difference(pad_rect)
+        if not diff.is_empty:
+            out.append(Obstacle(shape=diff, layers=o.layers, net=o.net, kind=o.kind, ref=o.ref))
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Obstacle buffering
 # ---------------------------------------------------------------------------
 
@@ -655,6 +830,118 @@ def _inflate_obstacles(obstacles: list[Obstacle], delta: float) -> list[Obstacle
     return out
 
 
+# ---------------------------------------------------------------------------
+# Postprocess pipeline (shared by single-layer and multi-layer)
+# ---------------------------------------------------------------------------
+
+
+def _postprocess_layer_segment(
+    pts: list[tuple[float, float]],
+    obstacles: list,
+    route_bbox: tuple[float, float, float, float],
+    grid_res: float,
+    stage_prefix: str,
+    pad_viz: list[tuple[str, tuple[float, float, float, float]]],
+) -> list[tuple[float, float]]:
+    """Run simplify → shortcut → snap45 on a single layer's path points.
+
+    Each step dumps a viz file with ``stage_prefix`` prepended, so
+    multi-layer dumps carry the layer name (e.g. ``layer-F.Cu-2-simplify``)
+    while single-layer dumps use empty prefix (``2-simplify``).
+
+    Called identically by single-layer and multi-layer branches.
+    """
+    pts = simplify_path(pts)
+    _log_path(f"{stage_prefix}simplify", pts)
+    _dump_viz(f"{stage_prefix}2-simplify", pts, pad_viz, obstacles, route_bbox)
+
+    pts = shortcut_path(pts, obstacles, route_bbox, resolution=grid_res)
+    _log_path(f"{stage_prefix}shortcut", pts)
+    _dump_viz(f"{stage_prefix}3-shortcut", pts, pad_viz, obstacles, route_bbox)
+
+    pts = snap_to_45_path_safe(pts, obstacles, route_bbox, resolution=grid_res)
+    _log_path(f"{stage_prefix}snap45", pts)
+    _dump_viz(f"{stage_prefix}4-snap45", pts, pad_viz, obstacles, route_bbox)
+
+    return pts
+
+
+def _align_single_endpoint(
+    path: list[tuple[float, float]],
+    pad_center: tuple[float, float],
+    obstacles: list | None,
+    bbox: tuple[float, float, float, float],
+    resolution: float,
+    pad_size: tuple[float, float],
+    from_center: bool,
+) -> list[tuple[float, float]]:
+    """Align one endpoint to a pad centre via X→Y iterative translation.
+
+    ``from_center=True`` aligns the start of *path*; ``False`` aligns
+    the end.  See :func:`_align_path_endpoints` for the detailed algorithm.
+    """
+    if len(path) < 2:
+        return path
+
+    pcx, pcy = pad_center
+    if from_center:
+        # ── Start pad ───────────────────────────────────────────────
+        dx = pcx - path[0][0]
+        if abs(dx) > 1e-9:
+            orig = list(path)
+            k = 0
+            while k < len(path) and abs(orig[k][0] - orig[0][0]) < 1e-9:
+                path[k] = (path[k][0] + dx, path[k][1])
+                k += 1
+            while k < len(path):
+                if abs(orig[k][1] - orig[k - 1][1]) < 1e-9:
+                    break
+                path[k] = (path[k][0] + dx, path[k][1])
+                k += 1
+
+        dy = pcy - path[0][1]
+        if abs(dy) > 1e-9:
+            orig = list(path)
+            k = 0
+            while k < len(path) and abs(orig[k][1] - orig[0][1]) < 1e-9:
+                path[k] = (path[k][0], path[k][1] + dy)
+                k += 1
+            while k < len(path):
+                if abs(orig[k][0] - orig[k - 1][0]) < 1e-9:
+                    break
+                path[k] = (path[k][0], path[k][1] + dy)
+                k += 1
+    else:
+        # ── End pad ─────────────────────────────────────────────────
+        dx = pcx - path[-1][0]
+        if abs(dx) > 1e-9:
+            orig = list(path)
+            k = len(path) - 1
+            while k >= 0 and abs(orig[k][0] - orig[-1][0]) < 1e-9:
+                path[k] = (path[k][0] + dx, path[k][1])
+                k -= 1
+            while k >= 0:
+                if abs(orig[k + 1][1] - orig[k][1]) < 1e-9:
+                    break
+                path[k] = (path[k][0] + dx, path[k][1])
+                k -= 1
+
+        dy = pcy - path[-1][1]
+        if abs(dy) > 1e-9:
+            orig = list(path)
+            k = len(path) - 1
+            while k >= 0 and abs(orig[k][1] - orig[-1][1]) < 1e-9:
+                path[k] = (path[k][0], path[k][1] + dy)
+                k -= 1
+            while k >= 0:
+                if abs(orig[k + 1][0] - orig[k][0]) < 1e-9:
+                    break
+                path[k] = (path[k][0], path[k][1] + dy)
+                k -= 1
+
+    return path
+
+
 def _align_path_endpoints(
     path: list[tuple[float, float]],
     start_center: tuple[float, float],
@@ -665,84 +952,30 @@ def _align_path_endpoints(
     pad_a_size: tuple[float, float] | None = None,
     pad_b_size: tuple[float, float] | None = None,
 ) -> list[tuple[float, float]]:
-    """Align pad ends to exact centres via X-then-Y iterative translation.
+    """Align both endpoints to pad centres via X→Y translation.
 
-    Both rectangular and non-rectangular pads use the same two-pass
-    approach (x then y).  Each pass:
-      1. Translate consecutive points whose axis-coordinate matches the
-         start point (the "protect the wire" phase).
-      2. Continue translating through diagonal segments, stopping at the
-         first segment whose direction matches the translation axis.
-
-    A snapshot of the original coordinates is used for segment-direction
-    checks so that mixing translated and untranslated points doesn't
-    produce false positives/negatives.
+    See :func:`_align_single_endpoint` for the per-endpoint algorithm.
     """
     if len(path) < 2:
         return path
-
-    # ── Start pad ──────────────────────────────────────────────────
-    scx, scy = start_center
-
-    # X-pass  —  stop at horizontal segment (same y, direction matches translation)
-    dx = scx - path[0][0]
-    if abs(dx) > 1e-9:
-        orig_x = list(path)
-        k = 0
-        while k < len(path) and abs(orig_x[k][0] - orig_x[0][0]) < 1e-9:
-            path[k] = (path[k][0] + dx, path[k][1])
-            k += 1
-        while k < len(path):
-            if abs(orig_x[k][1] - orig_x[k - 1][1]) < 1e-9:
-                break
-            path[k] = (path[k][0] + dx, path[k][1])
-            k += 1
-
-    # Y-pass  —  stop at vertical segment (same x, direction matches translation)
-    dy = scy - path[0][1]
-    if abs(dy) > 1e-9:
-        orig_y = list(path)
-        k = 0
-        while k < len(path) and abs(orig_y[k][1] - orig_y[0][1]) < 1e-9:
-            path[k] = (path[k][0], path[k][1] + dy)
-            k += 1
-        while k < len(path):
-            if abs(orig_y[k][0] - orig_y[k - 1][0]) < 1e-9:
-                break
-            path[k] = (path[k][0], path[k][1] + dy)
-            k += 1
-
-    # ── End pad ────────────────────────────────────────────────────
-    ecx, ecy = end_center
-
-    # X-pass (reverse)  —  stop at horizontal segment
-    dx = ecx - path[-1][0]
-    if abs(dx) > 1e-9:
-        orig_x = list(path)
-        k = len(path) - 1
-        while k >= 0 and abs(orig_x[k][0] - orig_x[-1][0]) < 1e-9:
-            path[k] = (path[k][0] + dx, path[k][1])
-            k -= 1
-        while k >= 0:
-            if abs(orig_x[k + 1][1] - orig_x[k][1]) < 1e-9:
-                break
-            path[k] = (path[k][0] + dx, path[k][1])
-            k -= 1
-
-    # Y-pass (reverse)  —  stop at vertical segment
-    dy = ecy - path[-1][1]
-    if abs(dy) > 1e-9:
-        orig_y = list(path)
-        k = len(path) - 1
-        while k >= 0 and abs(orig_y[k][1] - orig_y[-1][1]) < 1e-9:
-            path[k] = (path[k][0], path[k][1] + dy)
-            k -= 1
-        while k >= 0:
-            if abs(orig_y[k + 1][0] - orig_y[k][0]) < 1e-9:
-                break
-            path[k] = (path[k][0], path[k][1] + dy)
-            k -= 1
-
+    path = _align_single_endpoint(
+        path,
+        start_center,
+        obstacles,
+        bbox,
+        resolution,
+        pad_a_size or (1.0, 1.0),
+        from_center=True,
+    )
+    path = _align_single_endpoint(
+        path,
+        end_center,
+        obstacles,
+        bbox,
+        resolution,
+        pad_b_size or (1.0, 1.0),
+        from_center=False,
+    )
     return path
 
 
@@ -1124,7 +1357,6 @@ def _default_track_width(pcb_path: str, net: str) -> float:
             there is no ``Default`` netclass to fall back to.
     """
     import json
-    import os
 
     pro_path = _project_file_for(pcb_path)
     if pro_path is None or not os.path.exists(pro_path):
@@ -1190,7 +1422,6 @@ def _default_clearance(pcb_path: str, net: str | None = None) -> float:
 
 
 def _project_file_for(pcb_path: str) -> str | None:
-    import os
     import re
 
     base = os.path.splitext(os.path.basename(pcb_path))[0]
@@ -1246,7 +1477,6 @@ def _netclass_clearance(pcb_path: str, net: str) -> float:
     cannot be matched to a specific netclass.
     """
     import json
-    import os
 
     pro_path = _project_file_for(pcb_path)
     if pro_path is None or not os.path.exists(pro_path):
@@ -1268,51 +1498,72 @@ def _netclass_clearance(pcb_path: str, net: str) -> float:
     return 0.2
 
 
-def _default_via_params(data: dict) -> tuple[float, float]:
-    """Read via_diameter and via_drill from the Default netclass.
+def _default_via_params(data: dict, net: str) -> tuple[float, float]:
+    """Read via_diameter and via_drill from ``net``'s netclass.
 
-    Returns ``(via_diameter, via_drill)`` in mm.  Falls back to
-    ``(0.6, 0.3)`` if not found in the project file.
+    Falls back to Default netclass, then ``(0.6, 0.3)``.
     """
     ns = data.get("net_settings", {}) if isinstance(data, dict) else {}
     classes = ns.get("classes", []) if isinstance(ns, dict) else []
+    assignments = _net_to_netclass(data)
+    nc_name = _resolve_netclass(net, assignments)
+
+    # Read via params from all classes, indexed by name.
+    via_params: dict[str, tuple[float, float]] = {}
     for c in classes:
         if not isinstance(c, dict):
             continue
-        if c.get("name") == "Default":
-            vd = c.get("via_diameter")
-            vr = c.get("via_drill")
-            if vd is not None and vr is not None:
-                try:
-                    return float(vd), float(vr)
-                except (TypeError, ValueError):
-                    pass
+        name = c.get("name")
+        if not isinstance(name, str):
+            continue
+        vd = c.get("via_diameter")
+        vr = c.get("via_drill")
+        if vd is not None and vr is not None:
+            try:
+                via_params[name] = (float(vd), float(vr))
+            except (TypeError, ValueError):
+                continue
+
+    if nc_name is not None and nc_name in via_params:
+        return via_params[nc_name]
+    if "Default" in via_params:
+        return via_params["Default"]
     return 0.6, 0.3
 
 
 def _resolve_via_diameter(pcb_path: str, net: str) -> float:
-    """Resolve via diameter from the netclass (Default fallback via.)."""
+    """Resolve via diameter from ``net``'s netclass.
+
+    If the ``.kicad_pro`` is missing or unreadable, returns 0.6 mm.
+    """
+    import json
+
     pro_path = _project_file_for(pcb_path)
     if pro_path is None or not os.path.exists(pro_path):
         return 0.6
     try:
         with open(pro_path, encoding="utf-8") as f:
             data = json.load(f)
-        vd, _ = _default_via_params(data)
+        vd, _ = _default_via_params(data, net)
         return vd
     except (OSError, json.JSONDecodeError, TypeError, ValueError):
         return 0.6
 
 
 def _resolve_via_drill(pcb_path: str, net: str) -> float:
-    """Resolve via drill from the netclass (Default fallback via.)."""
+    """Resolve via drill from ``net``'s netclass.
+
+    If the ``.kicad_pro`` is missing or unreadable, returns 0.3 mm.
+    """
+    import json
+
     pro_path = _project_file_for(pcb_path)
     if pro_path is None or not os.path.exists(pro_path):
         return 0.3
     try:
         with open(pro_path, encoding="utf-8") as f:
             data = json.load(f)
-        _, vr = _default_via_params(data)
+        _, vr = _default_via_params(data, net)
         return vr
     except (OSError, json.JSONDecodeError, TypeError, ValueError):
         return 0.3
