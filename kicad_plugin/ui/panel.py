@@ -61,6 +61,23 @@ def _strip_images_from_history(history: list[dict]) -> list[dict]:
 
 if _WX_AVAILABLE:
 
+    class _FileDropTarget(wx.FileDropTarget):
+        """Drag-and-drop handler for images and PDFs onto the input box."""
+
+        def __init__(self, panel: AssistantPanel) -> None:
+            super().__init__()
+            self._panel = panel
+
+        def OnDropFiles(self, x: int, y: int, filenames: list[str]) -> bool:  # noqa: N802
+            log.info("OnDropFiles: %d file(s)", len(filenames))
+            for path in filenames:
+                ftype = "pdf" if path.lower().endswith(".pdf") else "image"
+                entry = (path, ftype)
+                if entry not in self._panel._attached_files:  # noqa: SLF001
+                    self._panel._attached_files.append(entry)  # noqa: SLF001
+            self._panel._refresh_attachments_bar()  # noqa: SLF001
+            return True
+
     class AssistantPanel(wx.Frame):
         """Main floating panel for the KiCad AI Assistant."""
 
@@ -123,7 +140,7 @@ if _WX_AVAILABLE:
             self._shell_retry_count: int = 0
             # Paths of images the user attached for the next message (cleared
             # after send). Populated via the "Attach image" button or clipboard.
-            self._attached_images: list[str] = []
+            self._attached_files: list[tuple[str, str]] = []  # (path, "image"|"pdf")
 
             # Page-load watchdog: if _on_webview_loaded never fires (WebView2
             # glitch on Windows), reset _page_loading so renders are not
@@ -262,6 +279,19 @@ if _WX_AVAILABLE:
                         self._on_webview_error,
                         self._conv_view,
                     )
+
+                    # Block navigation to any URL — prevents files (PDFs, images,
+                    # etc.) dropped onto the WebView from being opened inside it.
+                    # Only the shell page (loaded via SetPage) should ever display.
+                    def _on_navigating(event):
+                        if event.GetURL() not in ("", "about:blank"):
+                            event.Veto()
+
+                    self.Bind(
+                        _wx_html2.EVT_WEBVIEW_NAVIGATING,
+                        _on_navigating,
+                        self._conv_view,
+                    )
                     # Load the static shell (CSS + JS + empty containers).
                     # After this, all UI updates go through RunScript.
                     self._load_shell()
@@ -311,7 +341,10 @@ if _WX_AVAILABLE:
 
             # ---- Attachments bar (image thumbnails; empty when none attached) ----
             self._attachments_hbox = wx.BoxSizer(wx.HORIZONTAL)
-            vbox.Add(self._attachments_hbox, 0, wx.LEFT | wx.RIGHT | wx.EXPAND, 4)
+            self._attachments_sizer_item = vbox.Add(
+                self._attachments_hbox, 0, wx.LEFT | wx.RIGHT | wx.EXPAND, 4
+            )
+            self._attachments_sizer_item.Show(False)  # hidden until images attached
 
             # ---- Input row ----
             #  [📎] [____ Ask the AI assistant… ____] [ ●  ]
@@ -403,6 +436,8 @@ if _WX_AVAILABLE:
             self._attach_btn.Bind(wx.EVT_BUTTON, self._on_attach)
             self._input.Bind(wx.EVT_TEXT_ENTER, self._on_send)
             self._input.Bind(wx.EVT_CHAR_HOOK, self._on_input_key)
+            # Enable drag-and-drop of images and PDFs onto the input box.
+            self._input.SetDropTarget(_FileDropTarget(self))
             self.Bind(wx.EVT_MENU, self._on_settings, id=wx.ID_PREFERENCES)
             self.Bind(wx.EVT_MENU, self._on_new_session, id=self._menu_new_session_id)
             self.Bind(wx.EVT_MENU, self._on_load_session, id=self._menu_load_session_id)
@@ -635,9 +670,14 @@ if _WX_AVAILABLE:
                 return
             text = self._input.GetValue().strip()
             images = self._encode_attached_images()
-            if not text and not images:
+            pdfs = [p for p, t in self._attached_files if t == "pdf"]
+            if not text and not images and not pdfs:
                 return
             if images and not self._settings.llm_supports_vision:
+                log.info(
+                    "_on_send: blocked — %d image(s) but vision disabled in settings",
+                    len(images),
+                )
                 wx.MessageBox(
                     "The current model is configured as not supporting vision. "
                     'Enable "Model supports vision" in Settings or remove the attached '
@@ -647,19 +687,30 @@ if _WX_AVAILABLE:
                     self,
                 )
                 return
-            log.info("_on_send: user message (%d chars, %d image(s))", len(text), len(images))
+            log.info(
+                "_on_send: user message (%d chars, %d image(s), %d PDF(s), vision=%s)",
+                len(text),
+                len(images),
+                len(pdfs),
+                self._settings.llm_supports_vision,
+            )
             self._input.Clear()
-            display_text = text or "(image attachment)"
+            display_text = text or "(attachment)"
             if images:
                 display_text += f"\n\n[📎 {len(images)} image(s) attached]"
+            if pdfs:
+                display_text += f"\n\n[📄 {len(pdfs)} PDF(s) attached]"
+            # Placeholder — pdf_texts filled in after background extraction
             self._conv_entries.append(
                 {
                     "type": "user",
                     "text": display_text,
                     "timestamp": datetime.datetime.now().strftime("%H:%M:%S"),
+                    "pdf_texts": [],
                 }
             )
-            self._attached_images.clear()
+            _user_entry = self._conv_entries[-1]
+            self._attached_files.clear()
             self._refresh_attachments_bar()
             self._follow_output_to_bottom = True
             # Create the session file on the very first message so current.json
@@ -698,8 +749,38 @@ if _WX_AVAILABLE:
             def _run():
                 log.info("Background _run: started")
                 try:
+                    # Extract PDF text before sending to LLM
+                    text_with_pdf = text
+                    if pdfs:
+                        self._set_status("⏳ Extracting PDF text…", self._C_WARN)
+                        pdf_texts: list[dict] = []
+                        pdf_blocks: list[str] = []
+                        for pdf_path in pdfs:
+                            extracted = self._extract_pdf_text(pdf_path)
+                            basename = os.path.basename(pdf_path)
+                            if extracted.startswith("[Error]"):
+                                log.error("PDF extraction failed: %s — %s", pdf_path, extracted)
+                                pdf_texts.append(
+                                    {"name": basename, "text": extracted, "error": True}
+                                )
+                                pdf_blocks.append(f"--- PDF: {basename} ---\n{extracted}")
+                            else:
+                                log.info("PDF extracted: %s → %d chars", basename, len(extracted))
+                                pdf_texts.append({"name": basename, "text": extracted})
+                                pdf_blocks.append(
+                                    f"--- PDF: {basename} "
+                                    f"(text extracted with page numbers) ---\n\n{extracted}"
+                                )
+                        self._set_status("Ready", self._C_OK)
+                        # Store extracted texts for UI display
+                        _user_entry["pdf_texts"] = pdf_texts
+                        if pdf_blocks:
+                            pdf_block = "\n\n".join(pdf_blocks)
+                            text_with_pdf = text + ("\n\n" if text else "") + pdf_block
+                        # Re-render so the collapsible PDF text appears
+                        wx.CallAfter(self._render_conversation, True)
                     reply = self._llm_client.run(
-                        text,
+                        text_with_pdf,
                         context_block,
                         on_tool_call=lambda name, args, result: wx.CallAfter(
                             self._on_tool_call, name, args, result
@@ -871,14 +952,13 @@ if _WX_AVAILABLE:
             )
             if dlg.ShowModal() == wx.ID_OK:
                 paths = dlg.GetPaths()
-                images = [p for p in paths if not p.lower().endswith(".pdf")]
-                pdfs = [p for p in paths if p.lower().endswith(".pdf")]
-                for path in images:
-                    if path not in self._attached_images:
-                        self._attached_images.append(path)
+                log.info("_on_attach: %d file(s) selected", len(paths))
+                for path in paths:
+                    ftype = "pdf" if path.lower().endswith(".pdf") else "image"
+                    entry = (path, ftype)
+                    if entry not in self._attached_files:
+                        self._attached_files.append(entry)
                 self._refresh_attachments_bar()
-                for path in pdfs:
-                    self._on_add_pdf(pdf_path=path)
             dlg.Destroy()
 
         # ------------------------------------------------------------------ #
@@ -899,14 +979,16 @@ if _WX_AVAILABLE:
             )
             if dlg.ShowModal() == wx.ID_OK:
                 for path in dlg.GetPaths():
-                    if path not in self._attached_images:
-                        self._attached_images.append(path)
+                    entry = (path, "image")
+                    if entry not in self._attached_files:
+                        self._attached_files.append(entry)
                 self._refresh_attachments_bar()
             dlg.Destroy()
 
         def _on_paste_from_clipboard(self, event=None) -> None:
             """Read a bitmap from the OS clipboard and attach it as an image."""
             if not wx.TheClipboard.Open():
+                log.warning("_on_paste_from_clipboard: could not open clipboard")
                 wx.MessageBox(
                     "Could not open the system clipboard.",
                     "Clipboard",
@@ -920,10 +1002,22 @@ if _WX_AVAILABLE:
                         bmp = bdo.GetBitmap()
                         if bmp.IsOk():
                             path = self._save_clipboard_bitmap(bmp)
-                            if path and path not in self._attached_images:
-                                self._attached_images.append(path)
-                                self._refresh_attachments_bar()
+                            if path:
+                                entry = (path, "image")
+                                if entry not in self._attached_files:
+                                    self._attached_files.append(entry)
+                                    self._refresh_attachments_bar()
+                                log.info(
+                                    "_on_paste_from_clipboard: pasted image %dx%d → %s",
+                                    bmp.GetWidth(),
+                                    bmp.GetHeight(),
+                                    os.path.basename(path),
+                                )
                             return
+                    else:
+                        log.warning("_on_paste_from_clipboard: GetData returned False")
+                else:
+                    log.debug("_on_paste_from_clipboard: clipboard has no bitmap")
                 wx.MessageBox(
                     "No image found in the clipboard.",
                     "Clipboard",
@@ -951,39 +1045,54 @@ if _WX_AVAILABLE:
             return path if img.SaveFile(path, wx.BITMAP_TYPE_PNG) else None
 
         def _remove_attachment(self, index: int) -> None:
-            if 0 <= index < len(self._attached_images):
-                del self._attached_images[index]
+            if 0 <= index < len(self._attached_files):
+                del self._attached_files[index]
             self._refresh_attachments_bar()
 
         def _clear_attachments(self, event=None) -> None:
-            self._attached_images.clear()
+            self._attached_files.clear()
             self._refresh_attachments_bar()
 
         def _refresh_attachments_bar(self) -> None:
-            """Rebuild the thumbnail strip from self._attached_images."""
+            """Rebuild the thumbnail strip from self._attached_files."""
             for item in list(self._attachments_hbox.GetChildren()):
                 win = item.GetWindow()
                 self._attachments_hbox.Detach(win)
                 if win:
                     win.Destroy()
 
-            if self._attached_images:
-                for idx, path in enumerate(self._attached_images):
-                    sb = wx.StaticBitmap(self._ui_panel, bitmap=self._fit_thumbnail(path))
+            # Show/hide the sizer item so the bar collapses when empty
+            self._attachments_sizer_item.Show(bool(self._attached_files))
+            if self._attached_files:
+                img_count = sum(1 for _, t in self._attached_files if t == "image")
+                pdf_count = sum(1 for _, t in self._attached_files if t == "pdf")
+                for idx, (path, ftype) in enumerate(self._attached_files):
+                    if ftype == "image":
+                        bmp = self._fit_thumbnail(path)
+                    else:
+                        bg = self._ui_panel.GetBackgroundColour()
+                        bmp = self._make_pdf_thumbnail(bg=bg)
+                    sb = wx.StaticBitmap(self._ui_panel, bitmap=bmp)
                     sb.SetToolTip(os.path.basename(path))
                     sb.Bind(
                         wx.EVT_LEFT_DOWN,
                         lambda evt, i=idx: self._remove_attachment(i),
                     )
                     self._attachments_hbox.Add(sb, 0, wx.RIGHT, 4)
-                count = wx.StaticText(
-                    self._ui_panel, label=f"{len(self._attached_images)} image(s)"
-                )
+                parts = []
+                if img_count:
+                    parts.append(f"{img_count} image(s)")
+                if pdf_count:
+                    parts.append(f"{pdf_count} PDF(s)")
+                count = wx.StaticText(self._ui_panel, label=" + ".join(parts))
                 self._attachments_hbox.Add(count, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
                 clear_btn = wx.Button(self._ui_panel, label="✕ clear")
                 clear_btn.Bind(wx.EVT_BUTTON, self._clear_attachments)
                 self._attachments_hbox.Add(clear_btn, 0, wx.ALIGN_CENTER_VERTICAL)
-            self.Layout()
+            # Defer layout to next idle so window destruction (Destroy() above)
+            # is fully processed before recalculating sizer geometry.
+            wx.CallAfter(self._ui_panel.Layout)
+            wx.CallAfter(self.SendSizeEvent)
 
         @staticmethod
         def _fit_thumbnail(path: str, max_size: int = 48) -> wx.Bitmap:
@@ -1003,6 +1112,47 @@ if _WX_AVAILABLE:
                 log.warning("Could not load thumbnail %s: %s", path, e)
                 return wx.Bitmap(max_size, max_size)
 
+        @staticmethod
+        def _make_pdf_thumbnail(size: int = 48, bg: wx.Colour | None = None) -> wx.Bitmap:
+            """Draw a simple PDF file icon with 'PDF' label."""
+            bmp, mdc = AssistantPanel._new_icon_bitmap(size, bg)
+            gc = wx.GraphicsContext.Create(mdc)
+            # White page with folded corner
+            page_w = size * 0.55
+            page_h = size * 0.7
+            x0 = (size - page_w) / 2
+            y0 = (size - page_h) / 2
+            fold = page_w * 0.25
+            path = gc.CreatePath()
+            path.MoveToPoint(x0, y0)
+            path.AddLineToPoint(x0 + page_w - fold, y0)
+            path.AddLineToPoint(x0 + page_w, y0 + fold)
+            path.AddLineToPoint(x0 + page_w, y0 + page_h)
+            path.AddLineToPoint(x0, y0 + page_h)
+            path.CloseSubpath()
+            gc.SetBrush(wx.Brush(wx.Colour(255, 255, 255)))
+            gc.SetPen(wx.Pen(wx.Colour(120, 120, 120), 1))
+            gc.DrawPath(path)
+            # Folded corner
+            fold_path = gc.CreatePath()
+            fold_path.MoveToPoint(x0 + page_w - fold, y0)
+            fold_path.AddLineToPoint(x0 + page_w - fold, y0 + fold)
+            fold_path.AddLineToPoint(x0 + page_w, y0 + fold)
+            fold_path.CloseSubpath()
+            gc.SetBrush(wx.Brush(wx.Colour(220, 220, 220)))
+            gc.DrawPath(fold_path)
+            # 'PDF' text
+            font = wx.Font(
+                max(7, int(size * 0.16)),
+                wx.FONTFAMILY_DEFAULT,
+                wx.FONTSTYLE_NORMAL,
+                wx.FONTWEIGHT_BOLD,
+            )
+            gc.SetFont(font, wx.Colour(200, 40, 40))
+            gc.DrawText("PDF", x0 + 2, y0 + page_h * 0.35)
+            del gc, mdc
+            return bmp
+
         def _encode_attached_images(self) -> list[dict]:
             """Resize (≤1024px longest edge) and base64-encode attached images."""
             import base64
@@ -1010,10 +1160,16 @@ if _WX_AVAILABLE:
             import uuid
 
             encoded: list[dict] = []
-            for path in list(self._attached_images):
+            for path, ftype in list(self._attached_files):
+                if ftype != "image":
+                    continue
                 try:
                     img = wx.Image(path, wx.BITMAP_TYPE_ANY)
                     if not img.IsOk():
+                        log.warning(
+                            "_encode_attached_images: %s failed to load (IsOk=False)",
+                            path,
+                        )
                         continue
                     w, h = img.GetWidth(), img.GetHeight()
                     longest = max(w, h)
@@ -1024,10 +1180,22 @@ if _WX_AVAILABLE:
                             int(round(h * scale)),
                             wx.IMAGE_QUALITY_HIGH,
                         )
+                        log.debug(
+                            "_encode_attached_images: %s resized %dx%d → %dx%d",
+                            os.path.basename(path),
+                            w,
+                            h,
+                            img.GetWidth(),
+                            img.GetHeight(),
+                        )
                     tmp = os.path.join(
                         tempfile.gettempdir(), f"kicad_ai_enc_{uuid.uuid4().hex}.png"
                     )
                     if not img.SaveFile(tmp, wx.BITMAP_TYPE_PNG):
+                        log.warning(
+                            "_encode_attached_images: %s SaveFile failed",
+                            path,
+                        )
                         continue
                     with open(tmp, "rb") as f:
                         data = base64.b64encode(f.read()).decode()
@@ -1036,8 +1204,19 @@ if _WX_AVAILABLE:
                     except OSError:
                         pass
                     encoded.append({"media_type": "image/png", "data": data})
+                    log.debug(
+                        "_encode_attached_images: %s encoded (%d bytes base64)",
+                        os.path.basename(path),
+                        len(data),
+                    )
                 except Exception as e:
                     log.warning("Could not encode attachment %s: %s", path, e)
+            img_total = sum(1 for _, t in self._attached_files if t == "image")
+            log.info(
+                "_encode_attached_images: %d/%d image(s) encoded successfully",
+                len(encoded),
+                img_total,
+            )
             return encoded
 
         # ------------------------------------------------------------------ #
@@ -1045,101 +1224,64 @@ if _WX_AVAILABLE:
         # ------------------------------------------------------------------ #
 
         def _on_add_pdf(self, event=None, *, pdf_path: str | None = None) -> None:
-            """Open a PDF, extract text with page numbers, inject into input."""
-            if self._busy:
-                wx.MessageBox(
-                    "Please wait for the current request to finish.",
-                    "Busy",
-                    wx.OK | wx.ICON_INFORMATION,
-                    self,
-                )
-                return
+            """Add a PDF to the attachments bar (text extracted at send time)."""
             if pdf_path is None:
                 wildcard = "PDF documents (*.pdf)|*.pdf|All files (*.*)|*.*"
                 dlg = wx.FileDialog(
                     self,
-                    "Select PDF to extract",
+                    "Select PDF",
                     wildcard=wildcard,
-                    style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST,
+                    style=wx.FD_OPEN | wx.FD_MULTIPLE | wx.FD_FILE_MUST_EXIST,
                 )
                 if dlg.ShowModal() != wx.ID_OK:
                     dlg.Destroy()
                     return
-                pdf_path = dlg.GetPath()
+                for path in dlg.GetPaths():
+                    entry = (path, "pdf")
+                    if entry not in self._attached_files:
+                        self._attached_files.append(entry)
                 dlg.Destroy()
-
-            # Run extraction in a background thread to avoid blocking the UI.
-            self._set_status("⏳ Extracting PDF text…", self._C_WARN)
-
-            def _run() -> None:
-                import subprocess  # nosec B404 -- controlled subprocess, no user input
-
-                # Resolve the plugin venv python (same one the MCP server uses).
-                python = self._server_mgr._resolve_python()  # noqa: SLF001
-                plugin_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-                cmd = [
-                    python,
-                    "-m",
-                    "kicad_plugin.pdf_extractor",
-                    pdf_path,
-                    "--max-pages",
-                    "50",
-                ]
-                try:
-                    result = subprocess.run(  # nosec B603 -- paths validated
-                        cmd,
-                        capture_output=True,
-                        text=True,
-                        timeout=60,
-                        cwd=plugin_dir,
-                    )
-                except Exception as e:  # noqa: BLE001
-                    wx.CallAfter(self._on_pdf_extracted, None, f"Subprocess failed: {e}", None)
-                    return
-
-                if result.returncode != 0:
-                    err = result.stderr.strip() or "Unknown extraction error"
-                    wx.CallAfter(self._on_pdf_extracted, None, err, None)
-                else:
-                    wx.CallAfter(self._on_pdf_extracted, result.stdout, None, pdf_path)
-
-            threading.Thread(target=_run, daemon=True).start()
-
-        def _on_pdf_extracted(
-            self, text: str | None, error: str | None, pdf_path: str | None
-        ) -> None:
-            """Called on the UI thread after PDF extraction finishes."""
-            self._set_status("Ready", self._C_OK)
-            if error:
-                wx.MessageBox(
-                    f"PDF text extraction failed:\n{error}",
-                    "PDF Error",
-                    wx.OK | wx.ICON_ERROR,
-                    self,
-                )
-                return
-            if not text:
-                wx.MessageBox(
-                    "No extractable text found in this PDF (it may be a "
-                    "scanned/image-only document).",
-                    "PDF Empty",
-                    wx.OK | wx.ICON_INFORMATION,
-                    self,
-                )
-                return
-            # Inject the extracted text into the input box, prefixed with a
-            # header so the LLM knows the source.
-            import os.path
-
-            basename = os.path.basename(pdf_path) if pdf_path else "document.pdf"
-            header = f"--- PDF: {basename} (text extracted with page numbers) ---\n\n"
-            current = self._input.GetValue()
-            if current and not current.endswith("\n"):
-                self._input.SetValue(current + "\n\n" + header + text)
             else:
-                self._input.SetValue(header + text)
-            self._input.SetInsertionPointEnd()
-            self._input.SetFocus()
+                entry = (pdf_path, "pdf")
+                if entry not in self._attached_files:
+                    self._attached_files.append(entry)
+            self._refresh_attachments_bar()
+
+        def _extract_pdf_text(self, pdf_path: str) -> str:
+            """Extract text from a PDF (called from background thread at send time).
+
+            Returns the extracted text or an error message prefixed with [Error].
+            """
+            import subprocess  # nosec B404 -- controlled subprocess, no user input
+
+            python = self._server_mgr._resolve_python()  # noqa: SLF001
+            plugin_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            env = self._server_mgr._build_env(port=0)  # noqa: SLF001
+            for k in ("MCP_TRANSPORT", "MCP_PORT", "MCP_HOST"):
+                env.pop(k, None)
+            cmd = [
+                python,
+                "-m",
+                "kicad_plugin.pdf_extractor",
+                pdf_path,
+                "--max-pages",
+                "50",
+            ]
+            try:
+                result = subprocess.run(  # nosec B603 -- paths validated
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                    cwd=plugin_dir,
+                    env=env,
+                )
+            except Exception as e:  # noqa: BLE001
+                return f"[Error] Subprocess failed: {e}"
+            if result.returncode != 0:
+                err = result.stderr.strip() or "Unknown extraction error"
+                return f"[Error] {err}"
+            return result.stdout or ""
 
         def _on_reply(self, reply: str, ctx: dict, was_streamed: bool = False) -> None:
             # Stop the flush timer and drain any remaining chunks
