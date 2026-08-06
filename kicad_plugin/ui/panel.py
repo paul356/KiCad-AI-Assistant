@@ -327,6 +327,12 @@ if _WX_AVAILABLE:
             self._paste_img_btn.SetToolTip("Paste image from clipboard (Ctrl+V)")
             hbox.Add(self._paste_img_btn, 0, wx.RIGHT, 4)
 
+            self._add_pdf_btn = wx.BitmapButton(
+                panel, bitmap=wx.ArtProvider.GetBitmap(wx.ART_FILE_OPEN, wx.ART_BUTTON, (20, 20))
+            )
+            self._add_pdf_btn.SetToolTip("Attach PDF (extract text with page numbers)")
+            hbox.Add(self._add_pdf_btn, 0, wx.RIGHT, 4)
+
             self._input = wx.TextCtrl(
                 panel, style=wx.TE_PROCESS_ENTER | wx.TE_MULTILINE | wx.BORDER_SIMPLE
             )
@@ -417,6 +423,7 @@ if _WX_AVAILABLE:
             self._stop_btn.Bind(wx.EVT_BUTTON, self._on_stop)
             self._add_img_btn.Bind(wx.EVT_BUTTON, self._on_add_image)
             self._paste_img_btn.Bind(wx.EVT_BUTTON, self._on_paste_from_clipboard)
+            self._add_pdf_btn.Bind(wx.EVT_BUTTON, self._on_add_pdf)
             self._input.Bind(wx.EVT_TEXT_ENTER, self._on_send)
             self._input.Bind(wx.EVT_CHAR_HOOK, self._on_input_key)
             self.Bind(wx.EVT_MENU, self._on_settings, id=wx.ID_PREFERENCES)
@@ -912,6 +919,108 @@ if _WX_AVAILABLE:
                 except Exception as e:
                     log.warning("Could not encode attachment %s: %s", path, e)
             return encoded
+
+        # ------------------------------------------------------------------ #
+        # PDF text extraction
+        # ------------------------------------------------------------------ #
+
+        def _on_add_pdf(self, event) -> None:
+            """Open a PDF, extract text with page numbers, inject into input."""
+            if self._busy:
+                wx.MessageBox(
+                    "Please wait for the current request to finish.",
+                    "Busy",
+                    wx.OK | wx.ICON_INFORMATION,
+                    self,
+                )
+                return
+            wildcard = "PDF documents (*.pdf)|*.pdf|All files (*.*)|*.*"
+            dlg = wx.FileDialog(
+                self,
+                "Select PDF to extract",
+                wildcard=wildcard,
+                style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST,
+            )
+            if dlg.ShowModal() != wx.ID_OK:
+                dlg.Destroy()
+                return
+            pdf_path = dlg.GetPath()
+            dlg.Destroy()
+
+            # Run extraction in a background thread to avoid blocking the UI.
+            self._status_label.SetLabel("⏳ Extracting PDF text…")
+            self._add_pdf_btn.Enable(False)
+
+            def _run() -> None:
+                import subprocess  # nosec B404 -- controlled subprocess, no user input
+
+                # Resolve the plugin venv python (same one the MCP server uses).
+                python = self._server_mgr._resolve_python()  # noqa: SLF001
+                plugin_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                cmd = [
+                    python,
+                    "-m",
+                    "kicad_plugin.pdf_extractor",
+                    pdf_path,
+                    "--max-pages",
+                    "50",
+                ]
+                try:
+                    result = subprocess.run(  # nosec B603 -- paths validated
+                        cmd,
+                        capture_output=True,
+                        text=True,
+                        timeout=60,
+                        cwd=plugin_dir,
+                    )
+                except Exception as e:  # noqa: BLE001
+                    wx.CallAfter(self._on_pdf_extracted, None, f"Subprocess failed: {e}", None)
+                    return
+
+                if result.returncode != 0:
+                    err = result.stderr.strip() or "Unknown extraction error"
+                    wx.CallAfter(self._on_pdf_extracted, None, err, None)
+                else:
+                    wx.CallAfter(self._on_pdf_extracted, result.stdout, None, pdf_path)
+
+            threading.Thread(target=_run, daemon=True).start()
+
+        def _on_pdf_extracted(
+            self, text: str | None, error: str | None, pdf_path: str | None
+        ) -> None:
+            """Called on the UI thread after PDF extraction finishes."""
+            self._add_pdf_btn.Enable(True)
+            self._status_label.SetLabel("Ready")
+            if error:
+                wx.MessageBox(
+                    f"PDF text extraction failed:\n{error}",
+                    "PDF Error",
+                    wx.OK | wx.ICON_ERROR,
+                    self,
+                )
+                return
+            if not text:
+                wx.MessageBox(
+                    "No extractable text found in this PDF (it may be a "
+                    "scanned/image-only document).",
+                    "PDF Empty",
+                    wx.OK | wx.ICON_INFORMATION,
+                    self,
+                )
+                return
+            # Inject the extracted text into the input box, prefixed with a
+            # header so the LLM knows the source.
+            import os.path
+
+            basename = os.path.basename(pdf_path) if pdf_path else "document.pdf"
+            header = f"--- PDF: {basename} (text extracted with page numbers) ---\n\n"
+            current = self._input.GetValue()
+            if current and not current.endswith("\n"):
+                self._input.SetValue(current + "\n\n" + header + text)
+            else:
+                self._input.SetValue(header + text)
+            self._input.SetInsertionPointEnd()
+            self._input.SetFocus()
 
         def _on_reply(self, reply: str, ctx: dict, was_streamed: bool = False) -> None:
             # Stop the flush timer and drain any remaining chunks

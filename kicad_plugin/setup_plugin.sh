@@ -60,6 +60,7 @@ uv venv "$VENV_DIR" --python "$PYTHON_VERSION"
 
 echo "Step 2/3 — Installing kcaa from PyPI ..."
 uv pip install "kcaa==${KCAA_VERSION}" --python "$VENV_DIR"
+uv pip install "pymupdf" --python "$VENV_DIR"
 
 echo ""
 echo "Step 3/3 — Downloading freerouting JAR ..."
