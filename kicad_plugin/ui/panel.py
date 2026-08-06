@@ -145,6 +145,7 @@ if _WX_AVAILABLE:
         _C_OK = (0, 140, 0)  # Green   – success notices
         _C_WARN = (190, 100, 0)  # Amber   – warnings
         _C_ERR = (190, 30, 30)  # Red     – errors
+        _C_GREY = (140, 140, 140)  # Grey   – idle status dot
         _BG_CONV = wx.Colour(245, 247, 252)  # Very light blue-grey conversation bg
         _BG_TOOL = wx.Colour(250, 248, 240)  # Warm off-white tool-log bg
 
@@ -313,72 +314,50 @@ if _WX_AVAILABLE:
             vbox.Add(self._attachments_hbox, 0, wx.LEFT | wx.RIGHT | wx.EXPAND, 4)
 
             # ---- Input row ----
+            #  [📎] [____ Ask the AI assistant… ____] [ ●  ]
+            #  Attach  Text input (expands)         [➤/⬛]
             hbox = wx.BoxSizer(wx.HORIZONTAL)
 
-            self._add_img_btn = wx.BitmapButton(
-                panel, bitmap=wx.ArtProvider.GetBitmap(wx.ART_FILE_OPEN, wx.ART_BUTTON, (20, 20))
+            # Attach button — single entry point for images & PDFs.
+            self._attach_btn = wx.BitmapButton(
+                panel,
+                bitmap=self._make_attach_bitmap(bg=panel.GetBackgroundColour()),
+                style=wx.BU_EXACTFIT | wx.BORDER_NONE,
             )
-            self._add_img_btn.SetToolTip("Attach image(s)")
-            hbox.Add(self._add_img_btn, 0, wx.RIGHT, 2)
+            self._attach_btn.SetToolTip("Attach image or PDF…")
+            hbox.Add(self._attach_btn, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
 
-            self._paste_img_btn = wx.BitmapButton(
-                panel, bitmap=wx.ArtProvider.GetBitmap(wx.ART_PASTE, wx.ART_BUTTON, (20, 20))
-            )
-            self._paste_img_btn.SetToolTip("Paste image from clipboard (Ctrl+V)")
-            hbox.Add(self._paste_img_btn, 0, wx.RIGHT, 4)
-
-            self._add_pdf_btn = wx.BitmapButton(
-                panel, bitmap=wx.ArtProvider.GetBitmap(wx.ART_FILE_OPEN, wx.ART_BUTTON, (20, 20))
-            )
-            self._add_pdf_btn.SetToolTip("Attach PDF (extract text with page numbers)")
-            hbox.Add(self._add_pdf_btn, 0, wx.RIGHT, 4)
-
+            # Plain native TextCtrl — GTK themes paint the background (light)
+            # and SetBackgroundColour would be ignored, so leave it untouched.
             self._input = wx.TextCtrl(
                 panel, style=wx.TE_PROCESS_ENTER | wx.TE_MULTILINE | wx.BORDER_SIMPLE
             )
             self._input.SetHint("Ask the AI assistant…")
             hbox.Add(self._input, 1, wx.EXPAND)
 
-            # Rounded red square stop button — matches TextCtrl height exactly.
-            # GetSizeFromTextSize excludes the BORDER_SIMPLE frame; add it back.
-            text_h = self._input.GetSizeFromTextSize(self._input.GetTextExtent("Ag")).height
-            btn_h = max(text_h + 4, 48)  # at least 48 to fit 40×40 red + padding
-            corner_r = 3  # small corner radius
+            # Right-hand column: status dot on top, Send/Stop toggle below.
+            side_vbox = wx.BoxSizer(wx.VERTICAL)
 
-            stop_bmp = wx.Bitmap(btn_h, btn_h)
-            mdc = wx.MemoryDC(stop_bmp)
-            gc = wx.GraphicsContext.Create(mdc)
-            # Light grey button background
-            gc.SetBrush(wx.Brush(wx.Colour(230, 230, 230)))
-            gc.SetPen(wx.TRANSPARENT_PEN)
-            gc.DrawRectangle(0, 0, btn_h, btn_h)
-            # Flat red 40×40 rounded square, centred
-            red_sz = 40
-            pad = (btn_h - red_sz) // 2
-            path = gc.CreatePath()
-            path.AddRoundedRectangle(pad, pad, red_sz, red_sz, corner_r)
-            gc.SetBrush(wx.Brush(wx.Colour(255, 0, 0)))
-            gc.SetPen(wx.Pen(wx.Colour(180, 0, 0), 1))
-            gc.DrawPath(path)
-            del gc
-            del mdc
-
-            self._stop_btn = wx.BitmapButton(
-                panel, bitmap=stop_bmp, style=wx.BU_EXACTFIT | wx.BORDER_SIMPLE
+            # Status dot — 14 px coloured circle, tooltip carries full text.
+            self._status_dot = wx.StaticBitmap(
+                panel,
+                bitmap=self._make_status_dot_bitmap(self._C_GREY, bg=panel.GetBackgroundColour()),
             )
-            self._stop_btn.SetMinSize(wx.Size(btn_h, btn_h))
-            self._stop_btn.SetToolTip("Stop generation (Escape)")
-            self._stop_btn.Enable(False)
-            hbox.Add(self._stop_btn, 0, wx.EXPAND)
+            self._status_dot.SetToolTip("Starting backend…")
+            side_vbox.Add(self._status_dot, 0, wx.ALIGN_CENTER_HORIZONTAL | wx.BOTTOM, 2)
+
+            # Send / Stop toggle button — doubles as Stop during generation.
+            self._send_btn = wx.BitmapButton(
+                panel,
+                bitmap=self._make_send_bitmap(bg=panel.GetBackgroundColour()),
+                style=wx.BU_EXACTFIT | wx.BORDER_NONE,
+            )
+            self._send_btn.SetToolTip("Send message (Enter)")
+            side_vbox.Add(self._send_btn, 0, wx.ALIGN_CENTER_HORIZONTAL)
+
+            hbox.Add(side_vbox, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 4)
 
             vbox.Add(hbox, 0, wx.ALL | wx.EXPAND, 4)
-
-            # ---- Status bar (below input) ----
-            status_hbox = wx.BoxSizer(wx.HORIZONTAL)
-            self._status_label = wx.StaticText(panel, label="⏳ Starting backend…")
-            status_hbox.Add(self._status_label, 1, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
-
-            vbox.Add(status_hbox, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM | wx.EXPAND, 4)
 
             panel.SetSizer(vbox)
 
@@ -420,10 +399,8 @@ if _WX_AVAILABLE:
             self.SetMenuBar(menu_bar)
 
             # ---- Events ----
-            self._stop_btn.Bind(wx.EVT_BUTTON, self._on_stop)
-            self._add_img_btn.Bind(wx.EVT_BUTTON, self._on_add_image)
-            self._paste_img_btn.Bind(wx.EVT_BUTTON, self._on_paste_from_clipboard)
-            self._add_pdf_btn.Bind(wx.EVT_BUTTON, self._on_add_pdf)
+            self._send_btn.Bind(wx.EVT_BUTTON, self._on_send_btn)
+            self._attach_btn.Bind(wx.EVT_BUTTON, self._on_attach)
             self._input.Bind(wx.EVT_TEXT_ENTER, self._on_send)
             self._input.Bind(wx.EVT_CHAR_HOOK, self._on_input_key)
             self.Bind(wx.EVT_MENU, self._on_settings, id=wx.ID_PREFERENCES)
@@ -477,17 +454,16 @@ if _WX_AVAILABLE:
         def _on_server_started(self, ok: bool) -> None:
             try:
                 if ok:
-                    self._status_label.SetLabel("✅ Backend ready")
-                    self._status_label.SetForegroundColour(wx.Colour(*self._C_OK))
+                    self._set_status("✅ Backend ready", self._C_OK)
                     self.GetMenuBar().Enable(self._menu_autoroute_id, True)
                     self._init_llm_client()
                     self._check_kicad_ipc_environment()
                     self._auto_save_pcb_on_open()
                 else:
-                    self._status_label.SetLabel(
-                        "❌ Backend failed to start — use Options → Restart Backend to retry"
+                    self._set_status(
+                        "❌ Backend failed to start — use Server → Restart Backend to retry",
+                        self._C_ERR,
                     )
-                    self._status_label.SetForegroundColour(wx.Colour(*self._C_ERR))
                 self.Layout()
             except Exception as e:
                 import traceback
@@ -695,7 +671,7 @@ if _WX_AVAILABLE:
             self._render_conversation(force_scroll_to_bottom=True)
             self._busy = True
             self._cancel_event = threading.Event()
-            self._stop_btn.Enable(True)
+            self._toggle_send_stop(busy=True)
 
             from ..context_bridge import collect_context, context_to_system_prompt_block
 
@@ -760,6 +736,150 @@ if _WX_AVAILABLE:
                     self._on_paste_from_clipboard()
                     return
             event.Skip()
+
+        # ------------------------------------------------------------------ #
+        # Input-row helpers (bitmaps, status dot, send/stop toggle)
+        # ------------------------------------------------------------------ #
+
+        @staticmethod
+        def _new_icon_bitmap(
+            size: int, bg: wx.Colour | None = None
+        ) -> tuple[wx.Bitmap, wx.MemoryDC]:
+            """Create a canvas for a custom-drawn icon with the given background.
+
+            wx.Bitmap(size, size) starts uninitialised (often black on GTK) and
+            MemoryDC.Clear() does not reliably repaint it, so build the base
+            from a wx.Image filled with the panel background colour instead.
+            """
+            if bg is None:
+                bg = wx.WHITE
+            data = bytes((bg.Red(), bg.Green(), bg.Blue())) * (size * size)
+            img = wx.Image(size, size, data)
+            bmp = wx.Bitmap(img)
+            mdc = wx.MemoryDC()
+            mdc.SelectObject(bmp)
+            return bmp, mdc
+
+        @staticmethod
+        def _make_attach_bitmap(size: int = 28, bg: wx.Colour | None = None) -> wx.Bitmap:
+            """Paperclip-style attach icon drawn with GraphicsContext."""
+            bmp, mdc = AssistantPanel._new_icon_bitmap(size, bg)
+            gc = wx.GraphicsContext.Create(mdc)
+            gc.SetPen(wx.Pen(wx.Colour(90, 90, 90), 2))
+            gc.SetBrush(wx.TRANSPARENT_BRUSH)
+            # Simplified paperclip: two rounded-rectangle arcs
+
+            cx, cy = size / 2, size / 2
+            r_outer = size * 0.32
+            r_inner = size * 0.18
+            rect_w = size * 0.36
+            # Outer rounded rect (vertical)
+            path_o = gc.CreatePath()
+            path_o.AddRoundedRectangle(
+                cx - rect_w / 2, cy - r_outer, rect_w, 2 * r_outer, rect_w / 2
+            )
+            gc.DrawPath(path_o)
+            # Inner rounded rect (vertical, shorter)
+            path_i = gc.CreatePath()
+            path_i.AddRoundedRectangle(
+                cx - rect_w / 2 + 3, cy - r_inner, rect_w - 6, 2 * r_inner, (rect_w - 6) / 2
+            )
+            gc.DrawPath(path_i)
+            del gc, mdc
+            return bmp
+
+        @staticmethod
+        def _make_send_bitmap(size: int = 28, bg: wx.Colour | None = None) -> wx.Bitmap:
+            """Paper-plane send icon drawn with GraphicsContext."""
+            bmp, mdc = AssistantPanel._new_icon_bitmap(size, bg)
+            gc = wx.GraphicsContext.Create(mdc)
+            gc.SetBrush(wx.Brush(wx.Colour(34, 85, 204)))  # _C_USER blue
+            gc.SetPen(wx.Pen(wx.Colour(24, 65, 180), 1))
+            path = gc.CreatePath()
+            path.MoveToPoint(4, 4)
+            path.AddLineToPoint(size - 4, size / 2)
+            path.AddLineToPoint(4, size - 4)
+            path.AddLineToPoint(4, 4)
+            gc.DrawPath(path)
+            del gc, mdc
+            return bmp
+
+        @staticmethod
+        def _make_stop_bitmap(size: int = 28, bg: wx.Colour | None = None) -> wx.Bitmap:
+            """Red rounded-square stop icon drawn with GraphicsContext."""
+            bmp, mdc = AssistantPanel._new_icon_bitmap(size, bg)
+            gc = wx.GraphicsContext.Create(mdc)
+            gc.SetBrush(wx.Brush(wx.Colour(220, 70, 70)))
+            gc.SetPen(wx.Pen(wx.Colour(180, 50, 50), 1))
+            path = gc.CreatePath()
+            margin = 5
+            path.AddRoundedRectangle(margin, margin, size - 2 * margin, size - 2 * margin, 3)
+            gc.DrawPath(path)
+            del gc, mdc
+            return bmp
+
+        @staticmethod
+        def _make_status_dot_bitmap(
+            rgb: tuple, size: int = 14, bg: wx.Colour | None = None
+        ) -> wx.Bitmap:
+            """Coloured circle for the status indicator."""
+            bmp, mdc = AssistantPanel._new_icon_bitmap(size, bg)
+            gc = wx.GraphicsContext.Create(mdc)
+            gc.SetBrush(wx.Brush(wx.Colour(*rgb)))
+            gc.SetPen(wx.Pen(wx.Colour(*rgb), 1))
+            gc.DrawEllipse(1, 1, size - 2, size - 2)
+            del gc, mdc
+            return bmp
+
+        def _set_status(self, text: str, colour: tuple | None = None) -> None:
+            """Update the status dot colour + tooltip text."""
+            self._status_dot.SetToolTip(text)
+            if colour is not None:
+                bg = self._ui_panel.GetBackgroundColour()
+                self._status_dot.SetBitmap(self._make_status_dot_bitmap(colour, bg=bg))
+
+        def _toggle_send_stop(self, busy: bool) -> None:
+            """Switch the send button between Send and Stop modes."""
+            bg = self._ui_panel.GetBackgroundColour()
+            if busy:
+                self._send_btn.SetBitmap(self._make_stop_bitmap(bg=bg))
+                self._send_btn.SetToolTip("Stop generation (Escape)")
+            else:
+                self._send_btn.SetBitmap(self._make_send_bitmap(bg=bg))
+                self._send_btn.SetToolTip("Send message (Enter)")
+
+        def _on_send_btn(self, event) -> None:
+            """Handle send/stop button click depending on current state."""
+            if self._busy:
+                self._on_stop(event)
+            else:
+                self._on_send(event)
+
+        def _on_attach(self, event) -> None:
+            """Unified attach dialog: images or PDF in one file picker."""
+            wildcard = (
+                "Images (*.png;*.jpg;*.jpeg;*.bmp;*.webp;*.gif)"
+                "|*.png;*.jpg;*.jpeg;*.bmp;*.webp;*.gif|"
+                "PDF documents (*.pdf)|*.pdf|"
+                "All files (*.*)|*.*"
+            )
+            dlg = wx.FileDialog(
+                self,
+                "Attach image or PDF…",
+                wildcard=wildcard,
+                style=wx.FD_OPEN | wx.FD_MULTIPLE | wx.FD_FILE_MUST_EXIST,
+            )
+            if dlg.ShowModal() == wx.ID_OK:
+                paths = dlg.GetPaths()
+                images = [p for p in paths if not p.lower().endswith(".pdf")]
+                pdfs = [p for p in paths if p.lower().endswith(".pdf")]
+                for path in images:
+                    if path not in self._attached_images:
+                        self._attached_images.append(path)
+                self._refresh_attachments_bar()
+                for path in pdfs:
+                    self._on_add_pdf(pdf_path=path)
+            dlg.Destroy()
 
         # ------------------------------------------------------------------ #
         # Image attachments
@@ -924,7 +1044,7 @@ if _WX_AVAILABLE:
         # PDF text extraction
         # ------------------------------------------------------------------ #
 
-        def _on_add_pdf(self, event) -> None:
+        def _on_add_pdf(self, event=None, *, pdf_path: str | None = None) -> None:
             """Open a PDF, extract text with page numbers, inject into input."""
             if self._busy:
                 wx.MessageBox(
@@ -934,22 +1054,22 @@ if _WX_AVAILABLE:
                     self,
                 )
                 return
-            wildcard = "PDF documents (*.pdf)|*.pdf|All files (*.*)|*.*"
-            dlg = wx.FileDialog(
-                self,
-                "Select PDF to extract",
-                wildcard=wildcard,
-                style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST,
-            )
-            if dlg.ShowModal() != wx.ID_OK:
+            if pdf_path is None:
+                wildcard = "PDF documents (*.pdf)|*.pdf|All files (*.*)|*.*"
+                dlg = wx.FileDialog(
+                    self,
+                    "Select PDF to extract",
+                    wildcard=wildcard,
+                    style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST,
+                )
+                if dlg.ShowModal() != wx.ID_OK:
+                    dlg.Destroy()
+                    return
+                pdf_path = dlg.GetPath()
                 dlg.Destroy()
-                return
-            pdf_path = dlg.GetPath()
-            dlg.Destroy()
 
             # Run extraction in a background thread to avoid blocking the UI.
-            self._status_label.SetLabel("⏳ Extracting PDF text…")
-            self._add_pdf_btn.Enable(False)
+            self._set_status("⏳ Extracting PDF text…", self._C_WARN)
 
             def _run() -> None:
                 import subprocess  # nosec B404 -- controlled subprocess, no user input
@@ -989,8 +1109,7 @@ if _WX_AVAILABLE:
             self, text: str | None, error: str | None, pdf_path: str | None
         ) -> None:
             """Called on the UI thread after PDF extraction finishes."""
-            self._add_pdf_btn.Enable(True)
-            self._status_label.SetLabel("Ready")
+            self._set_status("Ready", self._C_OK)
             if error:
                 wx.MessageBox(
                     f"PDF text extraction failed:\n{error}",
@@ -1058,7 +1177,7 @@ if _WX_AVAILABLE:
                         self._render_conversation(force_scroll_to_bottom=True)
             self._busy = False
             self._cancel_event = None
-            self._stop_btn.Enable(False)
+            self._toggle_send_stop(busy=False)
             # Auto-refresh after tool calls
             if self._tool_calls_made:
                 self._auto_refresh(ctx)
@@ -1271,7 +1390,7 @@ if _WX_AVAILABLE:
                     self._render_conversation(force_scroll_to_bottom=True)
             self._busy = False
             self._cancel_event = None
-            self._stop_btn.Enable(False)
+            self._toggle_send_stop(busy=False)
 
         def _on_restart(self, event) -> None:
             if self._busy:
@@ -1281,8 +1400,7 @@ if _WX_AVAILABLE:
                     wx.OK | wx.ICON_INFORMATION,
                 )
                 return
-            self._status_label.SetLabel("⏳ Restarting backend…")
-            self._status_label.SetForegroundColour(wx.NullColour)
+            self._set_status("⏳ Restarting backend…", self._C_WARN)
             self._conv_entries.append(
                 {
                     "type": "status",
@@ -1639,8 +1757,7 @@ if _WX_AVAILABLE:
 
             # ---- 5. Update UI, then start background thread ----
             self.GetMenuBar().Enable(self._menu_autoroute_id, False)
-            self._status_label.SetLabel("⏳ Auto-routing in progress…")
-            self._status_label.SetForegroundColour(wx.Colour(*self._C_WARN))
+            self._set_status("⏳ Auto-routing in progress…", self._C_WARN)
             self.Layout()
 
             self._conv_entries.append(
@@ -1655,7 +1772,7 @@ if _WX_AVAILABLE:
             from ..autorouter import start_freerouting_thread
 
             def _progress(msg: str) -> None:
-                wx.CallAfter(self._status_label.SetLabel, f"⏳ {msg}")
+                wx.CallAfter(self._set_status, f"⏳ {msg}", self._C_WARN)
 
             def _routing_done(success: bool, message: str, stdout: str, stderr: str) -> None:
                 # Marshal back to main thread for pcbnew import + UI update.
@@ -1720,11 +1837,9 @@ if _WX_AVAILABLE:
             # ---- Restore menu item and status bar ----
             self.GetMenuBar().Enable(self._menu_autoroute_id, True)
             if success:
-                self._status_label.SetLabel("✅ Backend ready")
-                self._status_label.SetForegroundColour(wx.Colour(*self._C_OK))
+                self._set_status("✅ Backend ready", self._C_OK)
             else:
-                self._status_label.SetLabel("❌ Auto-routing failed")
-                self._status_label.SetForegroundColour(wx.Colour(*self._C_ERR))
+                self._set_status("❌ Auto-routing failed", self._C_ERR)
             self.Layout()
 
             # FreeRouting SMD padstack note
@@ -1802,10 +1917,10 @@ if _WX_AVAILABLE:
             # Remove current.json so a blank close won't restore the old session.
             self._remove_current_link()
 
-            self._status_label.SetLabel(
-                "✅ New session started" + (" (previous session saved)" if has_content else "")
+            self._set_status(
+                "✅ New session started" + (" (previous session saved)" if has_content else ""),
+                self._C_OK,
             )
-            self._status_label.SetForegroundColour(wx.Colour(*self._C_OK))
             self.Layout()
 
         def _remove_current_link(self) -> None:
@@ -1948,8 +2063,7 @@ if _WX_AVAILABLE:
             self._current_session_file = os.path.basename(chosen)
             self._update_current_link(self._current_session_file)
             self._render_conversation(force_scroll_to_bottom=True)
-            self._status_label.SetLabel("✅ Session restored")
-            self._status_label.SetForegroundColour(wx.Colour(*self._C_OK))
+            self._set_status("✅ Session restored", self._C_OK)
             self.Layout()
 
         def _on_clear(self, event) -> None:
