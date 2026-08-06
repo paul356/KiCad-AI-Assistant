@@ -843,30 +843,48 @@ if _WX_AVAILABLE:
 
         @staticmethod
         def _make_attach_bitmap(size: int = 28, bg: wx.Colour | None = None) -> wx.Bitmap:
-            """Paperclip-style attach icon drawn with GraphicsContext."""
-            bmp, mdc = AssistantPanel._new_icon_bitmap(size, bg)
-            gc = wx.GraphicsContext.Create(mdc)
-            gc.SetPen(wx.Pen(wx.Colour(90, 90, 90), 2))
-            gc.SetBrush(wx.TRANSPARENT_BRUSH)
-            # Simplified paperclip: two rounded-rectangle arcs
+            """Paperclip icon: 3 semicircles + 4 line segments.
 
-            cx, cy = size / 2, size / 2
-            r_outer = size * 0.32
-            r_inner = size * 0.18
-            rect_w = size * 0.36
-            # Outer rounded rect (vertical)
-            path_o = gc.CreatePath()
-            path_o.AddRoundedRectangle(
-                cx - rect_w / 2, cy - r_outer, rect_w, 2 * r_outer, rect_w / 2
-            )
-            gc.DrawPath(path_o)
-            # Inner rounded rect (vertical, shorter)
-            path_i = gc.CreatePath()
-            path_i.AddRoundedRectangle(
-                cx - rect_w / 2 + 3, cy - r_inner, rect_w - 6, 2 * r_inner, (rect_w - 6) / 2
-            )
-            gc.DrawPath(path_i)
-            del gc, mdc
+            Layout (28×28 grid):
+                8  12  14  16  20
+             4      ╭───────╮          ← arc 2: inverted U (top)
+             8      ●       ●          ← arc 2 endpoints (8,8)(16,8)
+            12      │       │
+            16      │       │
+            20      ●─╮   ╭─●  ●───╯  ╰───●  ← arc 3 endpoints (12,20)(16,20)
+            26      ╰───────────╯        ← arc 1: large U (bottom)
+            """
+            bmp, mdc = AssistantPanel._new_icon_bitmap(size, bg)
+            pen = wx.Pen(wx.Colour(90, 90, 90), 2)
+            mdc.SetPen(pen)
+            mdc.SetBrush(wx.TRANSPARENT_BRUSH)
+
+            # Arc 1: Large bottom U (opening up)
+            # Center (14,20), r=6, bbox (8,14,12,12)
+            mdc.DrawEllipticArc(8, 14, 12, 12, 180, 360)
+
+            # Arc 2: Inverted U (opening down)
+            # Center (12,8), r=4, bbox (8,4,8,8)
+            mdc.DrawEllipticArc(8, 4, 8, 8, 0, 180)
+
+            # Arc 3: Small bottom U (opening up, smaller)
+            # Center (14,20), r=2, bbox (12,18,4,4)
+            mdc.DrawEllipticArc(12, 18, 4, 4, 180, 360)
+
+            # 4 line segments connecting arc endpoints
+            # Left outer:  arc1 left  (8,20) → arc2 left  (8,8)
+            # Right outer: arc1 right (20,20) → arc2 right (16,8)
+            # Left inner:  arc3 left  (12,20) → arc2 left  (8,8)
+            # Right inner: arc3 right (16,20) → arc2 right (16,8)
+            for x1, y1, x2, y2 in [
+                (8, 20, 8, 8),
+                (12, 20, 12, 8),
+                (16, 20, 16, 8),
+                (20, 20, 20, 8),
+            ]:
+                mdc.DrawLine(x1, y1, x2, y2)
+
+            del mdc
             return bmp
 
         @staticmethod
