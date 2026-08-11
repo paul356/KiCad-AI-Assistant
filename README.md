@@ -115,9 +115,9 @@ The script will detect your KiCad version from the plugin directory path. KiCad 
 ### 4. Load the plugin in KiCad
 
 1. Open KiCad and load your project.
-2. Open the **Schematic Editor** or **PCB Editor**.
+2. Open the **PCB Editor** (`pcbnew`) — *Note: KiCad Action Plugins are loaded within PCB Editor, not the Schematic Editor or main project manager launcher*.
 3. Go to **Tools → External Plugins → Refresh Plugins**.
-4. Click **KiCad AI Assistant** in the plugin list to open the chat panel.
+4. Click **KiCad AI Assistant** in the menu (or click its toolbar icon) to open the chat panel.
 5. Go to **Options → Settings** and enter your LLM API key.
 
 ## Configuration
@@ -390,14 +390,21 @@ kcaa/
 ## Troubleshooting
 
 **Plugin does not appear in KiCad:**
-- Confirm the plugin directory is named exactly `kicad_ai_assistant` (not `kicad_ai_plugin`).
-- Run **Tools → External Plugins → Refresh Plugins** after installing.
-- Linux: Check that `setup_plugin.sh` completed without errors and that `.venv/bin/python` exists inside the plugin directory.
-- Windows: Check that `setup_plugin.bat` (or `setup_plugin.ps1`) completed without errors and that `.venv/Scripts/python.exe` exists inside the plugin directory.
+- **Check the Editor**: KiCad Action Plugins only run inside **PCB Editor** (`pcbnew`). Open PCB Editor and check **Tools → External Plugins → KiCad AI Assistant**.
+- **Directory Location**: Confirm the plugin directory is named `kicad_ai_assistant` inside KiCad's scripting/plugins folder (e.g. `~/.local/share/kicad/10.0/scripting/plugins/kicad_ai_assistant`).
+- **Avoid Double Nesting**: Ensure `__init__.py` is directly at `.../scripting/plugins/kicad_ai_assistant/__init__.py`, NOT in a nested `.../scripting/plugins/kicad_ai_assistant/kicad_ai_assistant/` directory.
+- **Refresh Plugins**: Run **Tools → External Plugins → Refresh Plugins** in PCB Editor after installing.
+- **Diagnose via KiCad Scripting Console**:
+  1. In PCB Editor, open **Tools → Scripting Console**.
+  2. Run `import pcbnew; print(pcbnew.GetActionPluginList())` to check if KiCad registered the plugin.
+  3. Run `import kicad_ai_assistant` to see if a Python traceback/error occurs on import.
+- **Virtual Environment**:
+  - Linux: Check that `setup_plugin.sh` completed without errors and `.venv/bin/python` exists.
+  - Windows: Check that `setup_plugin.bat` (or `setup_plugin.ps1`) completed without errors and `.venv/Scripts/python.exe` exists.
 
 **MCP server fails to start:**
-- Linux: Check the plugin log in `~/.config/kicad/` for Python tracebacks.
-- Windows: Check the plugin log in `%APPDATA%/kicad/` for Python tracebacks.
+- Linux: Check the plugin log in `~/.config/kicad/<version>/kcaa/kicad_ai_plugin.log` for Python tracebacks.
+- Windows: Check the plugin log in `%APPDATA%/kicad/<version>/kcaa/kicad_ai_plugin.log` for Python tracebacks.
 
 **Schematic editor does not refresh after edits:**
 - This is a current KiCad IPC limitation. Use **File → Reload** or press **Ctrl+Z / Ctrl+Y** to trigger a refresh in the schematic editor.

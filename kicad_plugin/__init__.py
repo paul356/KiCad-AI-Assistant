@@ -59,6 +59,15 @@ _setup_plugin_logging()
 # ---------------------------------------------------------------------------
 # Graceful import guard — pcbnew is only available inside KiCad
 # ---------------------------------------------------------------------------
+# Ensure lib-dynload is in sys.path for embedded Python (fixes CachyOS / Arch Linux)
+import sys
+
+_py_ver = f"python{sys.version_info.major}.{sys.version_info.minor}"
+for _base in (sys.prefix, "/usr"):
+    _dynload = os.path.join(_base, "lib", _py_ver, "lib-dynload")
+    if os.path.exists(_dynload) and _dynload not in sys.path:
+        sys.path.insert(0, _dynload)
+
 try:
     import pcbnew as _pcbnew  # noqa: F401
 
@@ -134,16 +143,15 @@ class KiCadAIPlugin(_ActionPluginBase):
             settings = PluginSettings.load()
             server_mgr = ServerManager(settings)
 
+            # Top-level wx.Frame MUST use parent=None; passing _pcbnew.GetCurrentFrame()
+            # (SWIG pointer wrapper) directly to wx.Frame causes a C++ segfault on Linux GTK3.
             parent = None
-            if _IN_KICAD:
-                try:
-                    parent = _pcbnew.GetCurrentFrame()
-                except Exception as e:
-                    log.debug("Could not get KiCad parent frame: %s", e)
 
             self._panel = AssistantPanel(parent, server_mgr=server_mgr, settings=settings)
             self._panel.Show()
             self._panel.Raise()
+            if hasattr(self._panel, "schedule_server_start"):
+                self._panel.schedule_server_start()
 
     def register(self) -> None:
         """Register the plugin with KiCad's action plugin system."""

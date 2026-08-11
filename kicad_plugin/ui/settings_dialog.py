@@ -21,10 +21,10 @@ if _WX_AVAILABLE:
     class SettingsDialog(wx.Dialog):
         """Simple dialog for editing plugin settings."""
 
-        _PROVIDERS = ["openai", "anthropic", "custom"]
+        _PROVIDERS = ["openai", "anthropic", "ollama", "supergrok"]
 
         def __init__(self, parent, settings) -> None:
-            super().__init__(parent, title="AI Assistant Settings", size=(600, 620))
+            super().__init__(parent, title="AI Assistant Settings", size=(640, 700))
             self._settings = settings
             self._build_ui()
 
@@ -42,7 +42,29 @@ if _WX_AVAILABLE:
                 else 0
             )
             self._provider.SetSelection(idx)
+            self._provider.Bind(wx.EVT_CHOICE, self._on_provider_changed)
             grid.Add(self._provider, 1, wx.EXPAND)
+
+            # SuperGrok OAuth status + login
+            grid.Add(
+                wx.StaticText(self, label="SuperGrok account:"), 0, wx.ALIGN_CENTER_VERTICAL
+            )
+            sg_row = wx.BoxSizer(wx.HORIZONTAL)
+            try:
+                from ..supergrok_auth import status_summary as _sg_status
+
+                sg_status = _sg_status(getattr(self._settings, "config_dir", None))
+            except Exception:
+                sg_status = "SuperGrok auth module unavailable"
+            self._supergrok_status = wx.StaticText(self, label=sg_status)
+            sg_row.Add(self._supergrok_status, 1, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 8)
+            self._supergrok_login_btn = wx.Button(self, label="Login with SuperGrok…")
+            self._supergrok_login_btn.Bind(wx.EVT_BUTTON, self._on_supergrok_login)
+            sg_row.Add(self._supergrok_login_btn, 0)
+            self._supergrok_logout_btn = wx.Button(self, label="Logout")
+            self._supergrok_logout_btn.Bind(wx.EVT_BUTTON, self._on_supergrok_logout)
+            sg_row.Add(self._supergrok_logout_btn, 0, wx.LEFT, 4)
+            grid.Add(sg_row, 1, wx.EXPAND)
 
             # API Key
             grid.Add(wx.StaticText(self, label="API Key:"), 0, wx.ALIGN_CENTER_VERTICAL)
@@ -56,6 +78,18 @@ if _WX_AVAILABLE:
             self._model = wx.TextCtrl(self, value=self._settings.llm_model)
             grid.Add(self._model, 1, wx.EXPAND)
 
+            # Supports vision
+            grid.Add(
+                wx.StaticText(self, label="Model supports vision:"), 0, wx.ALIGN_CENTER_VERTICAL
+            )
+            self._supports_vision = wx.CheckBox(self)
+            self._supports_vision.SetValue(self._settings.llm_supports_vision)
+            self._supports_vision.SetToolTip(
+                "Enable when the model accepts image input (e.g. gpt-4o, claude-3.x, llava). "
+                "Disable for text-only models to avoid sending image data they cannot process."
+            )
+            grid.Add(self._supports_vision, 1)
+
             # Custom base URL
             grid.Add(wx.StaticText(self, label="Custom endpoint URL:"), 0, wx.ALIGN_CENTER_VERTICAL)
             self._base_url = wx.TextCtrl(self, value=self._settings.llm_base_url)
@@ -67,9 +101,9 @@ if _WX_AVAILABLE:
             self._python.SetHint("auto-detect (leave blank)")
             grid.Add(self._python, 1, wx.EXPAND)
 
-            # Server port
+            # MCP server port
             grid.Add(
-                wx.StaticText(self, label="Server port (0=auto):"), 0, wx.ALIGN_CENTER_VERTICAL
+                wx.StaticText(self, label="MCP server port (0=auto):"), 0, wx.ALIGN_CENTER_VERTICAL
             )
             self._port = wx.SpinCtrl(self, value=str(self._settings.server_port), min=0, max=65535)
             grid.Add(self._port, 1, wx.EXPAND)
@@ -116,6 +150,16 @@ if _WX_AVAILABLE:
             grid.Add(self._compact_target, 1, wx.EXPAND)
 
             grid.Add(
+                wx.StaticText(self, label="Max output tokens (0=default):"),
+                0,
+                wx.ALIGN_CENTER_VERTICAL,
+            )
+            self._max_tokens = wx.SpinCtrl(
+                self, min=0, max=1_000_000, initial=self._settings.llm_max_tokens
+            )
+            grid.Add(self._max_tokens, 1, wx.EXPAND)
+
+            grid.Add(
                 wx.StaticText(self, label="Recent turns to keep:"), 0, wx.ALIGN_CENTER_VERTICAL
             )
             self._keep_recent_turns = wx.SpinCtrl(
@@ -132,7 +176,141 @@ if _WX_AVAILABLE:
             self.SetSizer(vbox)
             self.Layout()
 
+
+        def _refresh_supergrok_status(self) -> None:
+            try:
+                from ..supergrok_auth import status_summary
+
+                label = status_summary(getattr(self._settings, "config_dir", None))
+            except Exception as e:
+                label = f"Status unavailable ({e})"
+            self._supergrok_status.SetLabel(label)
+            self.Layout()
+
+        def _on_provider_changed(self, event) -> None:
+            """Prefill sensible defaults when SuperGrok is selected."""
+            provider = self._PROVIDERS[self._provider.GetSelection()]
+            if provider == "supergrok":
+                if not self._model.GetValue().strip() or self._model.GetValue().strip() in (
+                    "gpt-4o",
+                    "claude-sonnet-4-20250514",
+                    "claude-3-5-sonnet-latest",
+                ):
+                    self._model.SetValue("grok-4.5")
+                # Base URL optional — empty means cli-chat-proxy default.
+                self._api_key.SetHint("not required for SuperGrok OAuth")
+                self._supports_vision.SetValue(True)
+            event.Skip()
+
+        def _on_supergrok_login(self, event) -> None:
+            """Run SuperGrok device-code OAuth and store tokens."""
+            import threading
+
+            try:
+                from ..supergrok_auth import poll_device_login, start_device_login
+            except Exception as e:
+                wx.MessageBox(
+                    f"SuperGrok auth module failed to import:\n{e}",
+                    "SuperGrok Login",
+                    wx.OK | wx.ICON_ERROR,
+                    self,
+                )
+                return
+
+            try:
+                session = start_device_login()
+            except Exception as e:
+                wx.MessageBox(
+                    f"Could not start SuperGrok login:\n{e}",
+                    "SuperGrok Login",
+                    wx.OK | wx.ICON_ERROR,
+                    self,
+                )
+                return
+
+            # Open browser immediately with the complete verification URL.
+            try:
+                import webbrowser
+
+                webbrowser.open(session.verification_uri_complete or session.verification_uri)
+            except Exception:
+                pass
+
+            # Show code + wait for approval.
+            msg = (
+                "Complete SuperGrok login in your browser.\n\n"
+                f"If the page does not open, visit:\n{session.verification_uri}\n\n"
+                f"Code:  {session.user_code}\n\n"
+                "Click OK, then approve access in the browser.\n"
+                "This dialog will wait until login finishes."
+            )
+            dlg = wx.MessageDialog(
+                self,
+                msg,
+                "SuperGrok Login",
+                wx.OK | wx.CANCEL | wx.ICON_INFORMATION,
+            )
+            if dlg.ShowModal() != wx.ID_OK:
+                dlg.Destroy()
+                return
+            dlg.Destroy()
+
+            self._supergrok_login_btn.Enable(False)
+            self._supergrok_status.SetLabel("Waiting for browser approval…")
+            self.Layout()
+
+            config_dir = getattr(self._settings, "config_dir", None)
+            result: dict = {"ok": False, "error": "", "email": ""}
+
+            def _worker():
+                try:
+                    tokens = poll_device_login(session, config_dir=config_dir, open_browser=False)
+                    result["ok"] = True
+                    result["email"] = tokens.email or tokens.user_id or "ok"
+                except Exception as exc:
+                    result["error"] = str(exc)
+                wx.CallAfter(_done)
+
+            def _done():
+                self._supergrok_login_btn.Enable(True)
+                if result["ok"]:
+                    # Prefer SuperGrok provider + grok-4.5 after successful login.
+                    if "supergrok" in self._PROVIDERS:
+                        self._provider.SetSelection(self._PROVIDERS.index("supergrok"))
+                    self._model.SetValue("grok-4.5")
+                    self._supports_vision.SetValue(True)
+                    self._refresh_supergrok_status()
+                    wx.MessageBox(
+                        f"Logged in to SuperGrok as {result['email']}.\n"
+                        "Provider set to supergrok / grok-4.5.\n"
+                        "Click OK in Settings to save.",
+                        "SuperGrok Login",
+                        wx.OK | wx.ICON_INFORMATION,
+                        self,
+                    )
+                else:
+                    self._refresh_supergrok_status()
+                    wx.MessageBox(
+                        f"SuperGrok login failed:\n{result['error']}",
+                        "SuperGrok Login",
+                        wx.OK | wx.ICON_ERROR,
+                        self,
+                    )
+
+            threading.Thread(target=_worker, daemon=True, name="supergrok-login").start()
+
+        def _on_supergrok_logout(self, event) -> None:
+            try:
+                from ..supergrok_auth import clear_tokens
+
+                clear_tokens(getattr(self._settings, "config_dir", None))
+            except Exception as e:
+                wx.MessageBox(str(e), "SuperGrok Logout", wx.OK | wx.ICON_ERROR, self)
+                return
+            self._refresh_supergrok_status()
+
         def apply_to(self, settings) -> bool:
+
             """Write dialog values back to settings object.
 
             Returns False (and shows an error) if validation fails.
@@ -151,6 +329,7 @@ if _WX_AVAILABLE:
             settings.llm_provider = self._PROVIDERS[self._provider.GetSelection()]
             settings.llm_api_key = self._api_key.GetValue().strip()
             settings.llm_model = self._model.GetValue().strip()
+            settings.llm_supports_vision = self._supports_vision.GetValue()
             settings.llm_base_url = self._base_url.GetValue().strip()
             settings.python_executable = self._python.GetValue().strip()
             settings.server_port = self._port.GetValue()
@@ -159,6 +338,7 @@ if _WX_AVAILABLE:
             settings.llm_compact_threshold = compact_threshold
             settings.llm_compact_target_threshold = compact_target
             settings.llm_keep_recent_turns = self._keep_recent_turns.GetValue()
+            settings.llm_max_tokens = self._max_tokens.GetValue()
             return True
 
 else:

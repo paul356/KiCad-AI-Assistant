@@ -116,9 +116,9 @@ setup_plugin.bat
 ### 4. 在 KiCad 中加载插件
 
 1. 打开 KiCad 并加载你的项目。
-2. 打开**原理图编辑器**或 **PCB 编辑器**。
+2. 打开 **PCB 编辑器**（`pcbnew`） — *注意：KiCad Action 插件仅在 PCB 编辑器中加载，不会出现在原理图编辑器或主项目管理器中*。
 3. 依次点击 **Tools → External Plugins → Refresh Plugins**。
-4. 在插件列表中点击 **KiCad AI Assistant**，打开聊天面板。
+4. 在菜单中点击 **KiCad AI Assistant**（或点击其工具栏图标）打开聊天面板。
 5. 进入 **Options → Settings**，输入你的 LLM API Key。
 
 ## 插件配置

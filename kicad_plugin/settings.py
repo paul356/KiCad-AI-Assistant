@@ -78,9 +78,10 @@ class PluginSettings:
     """All user-configurable settings for the KiCad AI Assistant plugin."""
 
     # LLM provider
-    llm_provider: str = "openai"  # "openai" | "anthropic" | "custom"
+    llm_provider: str = "openai"  # "openai" | "anthropic" | "ollama" | "supergrok" | "custom"
     llm_api_key: str = field(default="", repr=False)  # never leak key in logs/repr
     llm_model: str = "gpt-4o"  # model name
+    llm_supports_vision: bool = False  # whether the model accepts image input
     llm_base_url: str = ""  # custom endpoint URL (if provider == "custom")
 
     # MCP server

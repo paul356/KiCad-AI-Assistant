@@ -1365,6 +1365,10 @@ class LLMClient:
         """Dispatch to the configured LLM provider."""
         self._validate_history()  # guard against corrupted history before every API call
         provider = self._settings.llm_provider
+        if provider == "supergrok":
+            if on_text_delta is not None:
+                return self._stream_supergrok(system, tools, on_text_delta)
+            return self._call_supergrok(system, tools)
         if on_text_delta is not None:
             if provider == "anthropic":
                 return self._stream_anthropic(system, tools, on_text_delta)
@@ -1690,6 +1694,196 @@ class LLMClient:
             except Exception as e:
                 log.debug("Non-streaming callback error: %s", e)
         return result
+
+    # ------------------------------------------------------------------ #
+    # SuperGrok (xAI OAuth / cli-chat-proxy)
+    # ------------------------------------------------------------------ #
+
+    def _supergrok_auth_context(self) -> tuple[str, str, dict[str, str]]:
+        """Return (url, model, headers) for SuperGrok proxy calls.
+
+        Uses OAuth access token from the plugin store / ~/.grok/auth.json,
+        refreshing when expired.  Raises RuntimeError if login is required.
+        """
+        from .supergrok_auth import (  # noqa: PLC0415
+            DEFAULT_MODEL,
+            get_valid_access_token,
+            proxy_chat_url,
+            proxy_headers,
+            refresh_tokens,
+            load_tokens,
+        )
+
+        config_dir = getattr(self._settings, "config_dir", None)
+        model = (self._settings.llm_model or DEFAULT_MODEL).strip() or DEFAULT_MODEL
+        base = (self._settings.llm_base_url or "").strip() or None
+        url = proxy_chat_url(base)
+        try:
+            token = get_valid_access_token(config_dir)
+        except RuntimeError:
+            raise
+        except Exception as e:
+            # One refresh attempt if load succeeded but refresh path threw oddly.
+            tok = load_tokens(config_dir)
+            if tok is None:
+                raise RuntimeError(
+                    "Not logged in to SuperGrok. Open Settings → Login with SuperGrok."
+                ) from e
+            tok = refresh_tokens(tok, config_dir)
+            token = tok.access_token
+        headers = proxy_headers(token, model)
+        return url, model, headers
+
+    def _call_supergrok(self, system: str, tools: list[dict]) -> dict[str, Any]:
+        """Non-streaming SuperGrok call (most proxy models prefer streaming)."""
+        # Prefer streaming path even without a delta callback — proxy is happier.
+        def _noop(_chunk: str) -> None:
+            return None
+
+        return self._stream_supergrok(system, tools, _noop)
+
+    def _stream_supergrok(self, system: str, tools: list[dict], on_text_delta) -> dict[str, Any]:
+        """Stream chat completions from SuperGrok's cli-chat-proxy.
+
+        Wire format is OpenAI SSE.  Auth uses SuperGrok OAuth session tokens
+        plus the xAI CLI token-auth headers.
+        """
+        global _current_reasoning
+        _current_reasoning = []
+        import urllib.error
+        import urllib.request
+
+        from .supergrok_auth import (  # noqa: PLC0415
+            get_valid_access_token,
+            load_tokens,
+            proxy_headers,
+            refresh_tokens,
+        )
+
+        try:
+            url, model, headers = self._supergrok_auth_context()
+        except RuntimeError as e:
+            return {"error": str(e)}
+
+        messages = [{"role": "system", "content": system}] + self._history
+        payload_dict: dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "tools": tools or None,
+            "stream": True,
+        }
+        if getattr(self, "_max_tokens", 0) and self._max_tokens > 0:
+            payload_dict["max_tokens"] = self._max_tokens
+        payload = json.dumps(payload_dict).encode()
+
+        def _do_request(req_headers: dict[str, str]):
+            req = urllib.request.Request(url, data=payload, headers=req_headers, method="POST")
+            with urllib.request.urlopen(req, timeout=300) as resp:  # nosec B310
+                text_parts: list[str] = []
+                tool_calls_by_index: dict[int, dict] = {}
+                finish_reason = "stop"
+
+                while True:
+                    raw = resp.readline()
+                    if raw == b"":
+                        break
+                    line = raw.decode("utf-8", "replace").rstrip("\r\n")
+                    if not line.startswith("data:"):
+                        continue
+                    data_str = line[5:].strip()
+                    if data_str == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        continue
+
+                    # OpenAI-style choices
+                    choices = chunk.get("choices") or []
+                    if choices:
+                        choice = choices[0]
+                        fr = choice.get("finish_reason")
+                        if fr is not None:
+                            finish_reason = fr
+                        delta = choice.get("delta") or {}
+                        content = delta.get("content")
+                        if content:
+                            text_parts.append(content)
+                            try:
+                                on_text_delta(content)
+                            except Exception as e:
+                                log.debug("SuperGrok text delta callback error: %s", e)
+                        reasoning = delta.get("reasoning_content")
+                        if reasoning:
+                            _current_reasoning.append(reasoning)
+                        for tc_delta in delta.get("tool_calls") or []:
+                            idx = tc_delta.get("index", 0)
+                            if idx not in tool_calls_by_index:
+                                tool_calls_by_index[idx] = {
+                                    "id": "",
+                                    "type": "function",
+                                    "function": {"name": "", "arguments": ""},
+                                }
+                            tc = tool_calls_by_index[idx]
+                            if tc_delta.get("id"):
+                                tc["id"] += tc_delta["id"]
+                            fn = tc_delta.get("function") or {}
+                            if fn.get("name"):
+                                tc["function"]["name"] += fn["name"]
+                            if fn.get("arguments"):
+                                tc["function"]["arguments"] += fn["arguments"]
+                        continue
+
+                    # Some gateways emit error objects as SSE data lines.
+                    if chunk.get("error"):
+                        err = chunk["error"]
+                        if isinstance(err, dict):
+                            return {"error": err.get("message") or json.dumps(err)[:300]}
+                        return {"error": str(err)[:300]}
+
+                tool_calls = [tool_calls_by_index[k] for k in sorted(tool_calls_by_index)]
+                message: dict[str, Any] = {"content": "".join(text_parts)}
+                if tool_calls:
+                    message["tool_calls"] = tool_calls
+                    if finish_reason == "stop":
+                        finish_reason = "tool_calls"
+                if _current_reasoning:
+                    message["reasoning_content"] = "".join(_current_reasoning)
+                return {"finish_reason": finish_reason, "message": message}
+
+        try:
+            return _do_request(headers)
+        except urllib.error.HTTPError as e:
+            body = ""
+            try:
+                body = e.read().decode("utf-8", "replace")
+            except Exception:
+                pass
+            # On 401, force-refresh once and retry.
+            if e.code in (401, 403):
+                log.warning("SuperGrok auth rejected (%s) — refreshing token and retrying", e.code)
+                try:
+                    config_dir = getattr(self._settings, "config_dir", None)
+                    tok = load_tokens(config_dir)
+                    if tok is None:
+                        return {
+                            "error": "SuperGrok session expired. Open Settings → Login with SuperGrok."
+                        }
+                    # Force refresh even if local clock thinks token is valid.
+                    tok.expires_at = ""
+                    tok = refresh_tokens(tok, config_dir)
+                    headers = proxy_headers(tok.access_token, model)
+                    return _do_request(headers)
+                except Exception as refresh_exc:
+                    return {
+                        "error": (
+                            f"SuperGrok auth failed (HTTP {e.code}). "
+                            f"Re-login via Settings → Login with SuperGrok. ({refresh_exc})"
+                        )
+                    }
+            return {"error": f"HTTP {e.code}: {body[:300] or e}"}
+        except Exception as e:
+            return {"error": f"SuperGrok request failed: {e}"}
 
     def _call_openai(self, system: str, tools: list[dict]) -> dict[str, Any]:
         base = (self._settings.llm_base_url or "https://api.openai.com").rstrip("/")

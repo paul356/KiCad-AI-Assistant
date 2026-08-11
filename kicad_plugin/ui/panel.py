@@ -189,8 +189,12 @@ if _WX_AVAILABLE:
             # permanently blocked.
             self._page_watchdog = wx.Timer(self)
 
+            self._server_start_scheduled = False
+            self._suicide_empty_polls = 0
+            import time as _time
+            self._suicide_start_monotonic = _time.monotonic()
             self._build_ui()
-            self._start_server()
+            # Server start deferred via schedule_server_start() after Show().
             self.Centre()
 
         # ------------------------------------------------------------------ #
@@ -302,8 +306,29 @@ if _WX_AVAILABLE:
             vbox = wx.BoxSizer(wx.VERTICAL)
 
             # ---- Conversation view (WebView when available, HtmlWindow fallback) ----
+            # webkit2gtk under Wayland hard-crashes the whole KiCad process when
+            # embedded via wx.html2.WebView. Prefer HtmlWindow unless the user
+            # explicitly opts in with KCAA_ALLOW_WEBVIEW=1.
             self._use_webview = False
-            if _WEBVIEW_AVAILABLE:
+            force_html = os.environ.get("KCAA_FORCE_HTMLWINDOW", "").strip().lower() in (
+                "1", "true", "yes",
+            )
+            allow_webview = os.environ.get("KCAA_ALLOW_WEBVIEW", "").strip().lower() in (
+                "1", "true", "yes",
+            )
+            on_wayland = bool(
+                os.environ.get("WAYLAND_DISPLAY")
+                or os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland"
+            )
+            use_webview_backend = (
+                _WEBVIEW_AVAILABLE and not force_html and (allow_webview or not on_wayland)
+            )
+            if on_wayland and not allow_webview:
+                log.warning(
+                    "Wayland detected — using HtmlWindow instead of WebView "
+                    "(webkit2gtk can abort KiCad). Set KCAA_ALLOW_WEBVIEW=1 to override."
+                )
+            if use_webview_backend:
                 try:
                     self._conv_view = _wx_html2.WebView.New(
                         panel,
@@ -385,6 +410,9 @@ if _WX_AVAILABLE:
             stop_bmp = wx.Bitmap(btn_h, btn_h)
             mdc = wx.MemoryDC(stop_bmp)
             gc = wx.GraphicsContext.Create(mdc)
+            if gc is None:
+                del mdc
+                return bmp
             # Light grey button background
             gc.SetBrush(wx.Brush(wx.Colour(230, 230, 230)))
             gc.SetPen(wx.TRANSPARENT_PEN)
@@ -500,12 +528,23 @@ if _WX_AVAILABLE:
         # Server lifecycle
         # ------------------------------------------------------------------ #
 
+        def schedule_server_start(self) -> None:
+            if getattr(self, "_server_start_scheduled", False):
+                return
+            self._server_start_scheduled = True
+            wx.CallLater(200, self._start_server)
+
         def _start_server(self) -> None:
             def _do_start():
-                ok = self._server_mgr.start()
-                wx.CallAfter(self._on_server_started, ok)
+                try:
+                    ok = self._server_mgr.start()
+                    wx.CallAfter(self._on_server_started, ok)
+                except Exception:
+                    import traceback
+                    log.error("_start_server thread crashed:\n%s", traceback.format_exc())
+                    wx.CallAfter(self._on_server_started, False)
 
-            t = threading.Thread(target=_do_start, daemon=True)
+            t = threading.Thread(target=_do_start, daemon=True, name="kcaa-server-start")
             t.start()
 
         def _on_server_started(self, ok: bool) -> None:
@@ -643,25 +682,43 @@ if _WX_AVAILABLE:
             so we save it immediately to clear the dirty state.
             Uses the save_document MCP tool via IPC for proper state management.
 
-            This MUST run on a background thread to avoid blocking the KiCad
-            main thread, which would prevent KiCad from responding to IPC
-            connections and cause a deadlock.
+            IMPORTANT — thread safety:
+              KiCad's pcbnew API is NOT thread-safe.  Calling
+              ``pcbnew.GetBoard()`` (or any other ``board.*``) from a
+              thread other than the wx main thread has been observed to
+              crash the entire KiCad process with a segfault (status=1
+              /FAILURE in the systemd journal as soon as the menu item
+              is clicked).  So the pcbnew calls here run synchronously on
+              the main thread; only the network round-trip to the MCP
+              server is offloaded to a background thread — and that part
+              is pure-Python urllib-style HTTP, with no pcbnew, no wx and
+              no KiCad state involved, so it is safe off the main thread.
             """
 
-            def _do_auto_save():
+            # --- 1. Get board file path (must be on the wx main thread) ---
+            file_path = ""
+            try:
+                import pcbnew as _pcbnew
+
+                board = _pcbnew.GetBoard()
+                if not board:
+                    log.debug("Auto-save: no board open")
+                    return
+                file_path = board.GetFileName()
+                if not file_path:
+                    log.debug("Auto-save: board has no file path")
+                    return
+            except Exception as exc:
+                log.debug("Auto-save: pcbnew lookup skipped (%s)", exc)
+                return
+
+            # --- 2. Network round-trip — safe on a background thread ---
+            # The MCP ``save_document`` tool calls back into KiCad via the
+            # IPC API (kipy/Board.save()), so doing this from a background
+            # thread is safe: it's just an HTTP POST to a separate uvicorn
+            # subprocess, no KiCad state touched here in the plugin.
+            def _do_ipc_save():
                 try:
-                    import pcbnew as _pcbnew
-
-                    board = _pcbnew.GetBoard()
-                    if not board:
-                        log.debug("Auto-save: no board open")
-                        return
-
-                    file_path = board.GetFileName()
-                    if not file_path:
-                        log.debug("Auto-save: board has no file path")
-                        return
-
                     from ..llm_client import call_mcp_tool
 
                     result = call_mcp_tool(
@@ -676,7 +733,7 @@ if _WX_AVAILABLE:
                 except Exception as exc:
                     log.debug("Auto-save document skipped or failed: %s", exc)
 
-            t = threading.Thread(target=_do_auto_save, daemon=True)
+            t = threading.Thread(target=_do_ipc_save, daemon=True)
             t.start()
 
         # ------------------------------------------------------------------ #
