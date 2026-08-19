@@ -22,59 +22,59 @@ kcaa MCP server (subprocess, streamable-http on localhost)
 
 ## Installation
 
-### 1. Copy the plugin into KiCad's plugin directory
+### macOS (recommended)
 
-**Linux:**
+1. Install [KiCad](https://www.kicad.org/download/macos/) and [uv](https://github.com/astral-sh/uv) if you haven't already.
+2. Copy or extract this plugin folder so it lives at:
+   ```text
+   ~/Library/Preferences/kicad/10.0/scripting/plugins/kicad_ai_assistant
+   ```
+3. Double-click `setup_plugin_macos.command` inside that folder, **or** run from Terminal:
+   ```bash
+   cd ~/Library/Preferences/kicad/10.0/scripting/plugins/kicad_ai_assistant
+   ./setup_plugin_macos.command
+   ```
+
+For a fully automated install, run:
+```bash
+./install_macos.sh
+```
+This detects your KiCad version, copies the plugin to the correct directory, and runs the setup script.
+
+### Linux
+
 ```bash
 KICAD_PLUGIN_DIR=~/.local/share/kicad/10.0/scripting/plugins
 mkdir -p "$KICAD_PLUGIN_DIR"
-cp -r kicad_plugin "$KICAD_PLUGIN_DIR/kicad_ai_plugin"
-```
-
-**macOS:**
-```bash
-KICAD_PLUGIN_DIR=~/Library/Preferences/kicad/10.0/scripting/plugins
-mkdir -p "$KICAD_PLUGIN_DIR"
-cp -r kicad_plugin "$KICAD_PLUGIN_DIR/kicad_ai_plugin"
-```
-
-**Windows (PowerShell):**
-```powershell
-$dir = "$env:APPDATA\kicad\10.0\scripting\plugins\kicad_ai_plugin"
-New-Item -ItemType Directory -Force -Path $dir
-Copy-Item -Recurse kicad_plugin\* $dir
-```
-
-### 2. Run the setup script
-
-The setup script creates a virtual environment, installs `kcaa` from PyPI, and downloads the freerouting JAR.
-
-**Linux/macOS:**
-```bash
-cd "$KICAD_PLUGIN_DIR/kicad_ai_plugin"
+cp -r kicad_plugin "$KICAD_PLUGIN_DIR/kicad_ai_assistant"
+cd "$KICAD_PLUGIN_DIR/kicad_ai_assistant"
 ./setup_plugin.sh
 ```
 
-**Windows:**
+### Windows (PowerShell)
+
 ```powershell
-cd "$env:APPDATA\kicad\10.0\scripting\plugins\kicad_ai_plugin"
+$dir = "$env:APPDATA\kicad\10.0\scripting\plugins\kicad_ai_assistant"
+New-Item -ItemType Directory -Force -Path $dir
+Copy-Item -Recurse kicad_plugin\* $dir
+cd "$env:APPDATA\kicad\10.0\scripting\plugins\kicad_ai_assistant"
 .\setup_plugin.bat
 ```
 
-### 3. Open KiCad
+### Open KiCad
 
-1. Open KiCad and load your project
-2. In the PCB editor or schematic editor, go to **Tools → External Plugins → Refresh Plugins**
-3. The **KiCad AI Assistant** plugin will appear in the plugin list
-4. Click it to open the chat panel
+1. Close KiCad if it is already open so the plugin and API changes take effect.
+2. Reopen KiCad and load your project.
+3. In the PCB editor, the **KiCad AI Assistant** toolbar button should appear automatically. If it does not, choose **Tools → External Plugins → Refresh Plugins**.
+4. Click **KiCad AI Assistant** to open the chat panel.
 5. Enter your LLM API key in **Options → Settings**
 
 ## Configuration
 
-Settings are stored in the KiCad user config directory:
-- Linux: `~/.config/kicad/kicad_ai_assistant.json`
-- macOS: `~/Library/Preferences/kicad/kicad_ai_assistant.json`
-- Windows: `%APPDATA%\kicad\kicad_ai_assistant.json`
+Settings are stored in the KiCad user config directory. Replace `<ver>` with your KiCad version (e.g. `10.0`):
+- Linux: `~/.config/kicad/<ver>/kcaa/kicad_ai_assistant.json`
+- macOS: `~/Library/Preferences/kicad/<ver>/kcaa/kicad_ai_assistant.json`
+- Windows: `%APPDATA%\kicad\<ver>\kcaa\kicad_ai_assistant.json`
 
 | Setting | Description | Default |
 |---------|-------------|---------|

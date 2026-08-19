@@ -16,21 +16,35 @@ log = logging.getLogger(__name__)
 _SETTINGS_FILENAME = "kicad_ai_assistant.json"
 
 
-def _detect_kicad_version() -> str | None:
+def _detect_kicad_version() -> str:
     """Detect KiCad version for the plugin context.
 
     Tries in order:
-    1. KICAD_VERSION environment variable
-    2. Plugin directory path (e.g. .../kicad/10.0/scripting/plugins/...)
-    3. KICAD{N}_* variables (e.g. KICAD10_SYMBOL_DIR → "10.0")
-    Returns None if no source yields a version.
+    1. ``KICAD_VERSION`` environment variable
+    2. The running KiCad process via ``pcbnew.GetMajorMinorVersion()``
+    3. Plugin directory path (e.g. .../kicad/10.0/scripting/plugins/...)
+    4. ``KICAD{N}_*`` variables (e.g. KICAD10_SYMBOL_DIR → "10.0")
+
+    Falls back to ``"10.0"`` with a warning if nothing else works, so the plugin
+    still loads in non-standard installs or test environments.
     """
-    # 1. From KICAD_VERSION environment variable
+    # 1. Explicit override from environment
     ver = os.environ.get("KICAD_VERSION")
     if ver:
         return ver
 
-    # 2. From the plugin directory path
+    # 2. Ask the running KiCad process (most reliable when inside KiCad).
+    try:
+        import pcbnew  # noqa: PLC0415
+
+        ver = str(pcbnew.GetMajorMinorVersion())
+        if ver:
+            log.debug("Detected KiCad version from pcbnew: %s", ver)
+            return ver
+    except Exception as exc:
+        log.debug("Could not detect KiCad version from pcbnew: %s", exc)
+
+    # 3. From the plugin directory path
     try:
         path = os.path.abspath(__file__)
         m = re.search(r"[/\\]kicad[/\\](\d+\.\d+)[/\\]", path, re.IGNORECASE)
@@ -39,28 +53,27 @@ def _detect_kicad_version() -> str | None:
     except Exception as e:
         log.debug("Could not detect KiCad version from path: %s", e)
 
-    # 3. From KICAD{N}_* environment variables
+    # 4. From KICAD{N}_* environment variables
     for key in os.environ:
         if key.startswith("KICAD") and "_" in key:
             major = key[5:].split("_")[0]
             if major.isdigit():
                 return f"{major}.0"
 
-    return None
+    log.warning(
+        "Could not detect KiCad version from KICAD_VERSION, pcbnew, plugin path, "
+        "or KICAD{N}_* environment variables. Falling back to 10.0."
+    )
+    return "10.0"
 
 
 def _get_kcaa_data_dir() -> str:
     """Return the kcaa data directory under the KiCad user config directory.
 
-    KiCad version is detected from KICAD{N}_* environment variables or plugin path.
+    KiCad version is detected from KICAD{N}_* environment variables, the running
+    KiCad process, or the plugin install path.
     """
     kicad_version = _detect_kicad_version()
-    if kicad_version is None:
-        raise RuntimeError(
-            "Cannot detect KiCad version. Ensure KICAD{N}_* environment variables "
-            "are set (e.g. KICAD10_SYMBOL_DIR) or the plugin is installed under "
-            "a versioned KiCad directory (e.g. .../kicad/10.0/scripting/plugins/...)."
-        )
     system = platform.system()
     if system == "Darwin":
         base = os.path.expanduser(f"~/Library/Preferences/kicad/{kicad_version}")

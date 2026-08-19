@@ -221,6 +221,13 @@ def _resolve_plugin_python() -> str | None:
     return candidate if os.path.isfile(candidate) else None
 
 
+# On macOS, KiCad's embedded Python often has working _ssl but fails certificate
+# verification (empty/ambiguous URLError). Prefer the plugin venv Python for all
+# HTTPS traffic from the start when it is available.
+if platform.system() == "Darwin" and _resolve_plugin_python():
+    _in_process_ssl = False
+
+
 # Subprocess script: read raw body bytes from stdin, perform the POST, emit
 # a single-line JSON object on stdout describing the outcome.
 # Always exits with code 0 and communicates errors via the JSON payload:

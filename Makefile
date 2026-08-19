@@ -59,10 +59,12 @@ run:
 #     settings.py
 #     ui/
 #     README.md
-# Install: unzip into ~/.local/share/kicad/<ver>/scripting/plugins/
-#          then run from the plugin dir:
-#            ./setup_plugin.sh /path/to/kcaa
-#   setup_plugin.sh              <- creates .venv with kcaa from PyPI
+#     setup_plugin.sh            <- Linux setup
+#     setup_plugin_macos.command <- double-clickable macOS setup
+#     install_macos.sh           <- one-step macOS installer
+# Install: unzip into ~/.local/share/kicad/<ver>/scripting/plugins/ (Linux)
+#          or ~/Library/Preferences/kicad/<ver>/scripting/plugins/ (macOS)
+#          then run the appropriate setup script.
 PLUGIN_ZIP := dist/kicad_ai_assistant.zip
 PLUGIN_SRC := kicad_plugin
 

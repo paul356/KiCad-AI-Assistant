@@ -2,7 +2,7 @@
 
 KiCad AI Assistant is a KiCad action plugin that embeds an LLM-powered chat panel directly inside KiCad. It runs a built-in [MCP](https://modelcontextprotocol.io/) server and exposes a rich set of tools so the LLM can read and edit your schematics and PCB layouts through natural-language conversation.
 
-Tested on **KiCad 10.0 / Linux & Windows**.
+Tested on **KiCad 10.0 / macOS, Linux & Windows**.
 
 [![CI](https://github.com/paul356/KiCad-AI-Assistant/actions/workflows/ci.yml/badge.svg)](https://github.com/paul356/KiCad-AI-Assistant/actions/workflows/ci.yml)
 
@@ -62,6 +62,13 @@ cd kcaa
 
 Download `kicad_ai_assistant.zip` from the [Releases page](https://github.com/paul356/KiCad-AI-Assistant/releases) and unzip it into KiCad's plugin directory:
 
+**macOS:**
+```bash
+KICAD_PLUGIN_DIR=~/Library/Preferences/kicad/10.0/scripting/plugins
+mkdir -p "$KICAD_PLUGIN_DIR"
+unzip kicad_ai_assistant.zip -d "$KICAD_PLUGIN_DIR"
+```
+
 **Linux:**
 ```bash
 KICAD_PLUGIN_DIR=~/.local/share/kicad/10.0/scripting/plugins
@@ -92,6 +99,19 @@ unzip dist/kicad_ai_assistant.zip -d "$KICAD_PLUGIN_DIR"
 
 Run the setup script from inside the installed plugin directory to create a `.venv`, install `kcaa` from PyPI, and download the freerouting JAR. `uv` will automatically install the required Python version.
 
+**macOS (double-clickable):**
+```bash
+cd ~/Library/Preferences/kicad/10.0/scripting/plugins/kicad_ai_assistant
+./setup_plugin_macos.command
+```
+
+**macOS (one-step installer from the repo):**
+```bash
+cd kicad_plugin
+./install_macos.sh
+```
+This installer will detect your KiCad version, copy the plugin into the right folder, create the virtual environment, and **automatically enable the KiCad API server** in your KiCad preferences.
+
 **Linux:**
 ```bash
 cd ~/.local/share/kicad/10.0/scripting/plugins/kicad_ai_assistant
@@ -114,17 +134,20 @@ The script will detect your KiCad version from the plugin directory path. KiCad 
 
 ### 4. Load the plugin in KiCad
 
-1. Open KiCad and load your project.
-2. Open the **PCB Editor**.
-3. Go to **Tools → External Plugins → Refresh Plugins**.
-4. Click **KiCad AI Assistant** in the plugin list to open the chat panel.
-5. Go to **Options → Settings** and enter your LLM API key.
+1. Close KiCad if it is already open (the installer may have changed your preferences).
+2. Reopen KiCad and load your project.
+3. Open the **PCB Editor**.
+4. The **KiCad AI Assistant** toolbar button should appear automatically. If it does not, choose **Tools → External Plugins → Refresh Plugins**.
+5. Click **KiCad AI Assistant** to open the chat panel.
+6. Go to **Options → Settings** and enter your LLM API key.
 
 ## Configuration
 
-Plugin settings are stored in the KiCad user config directory:
+Plugin settings are stored in the KiCad user config directory. Replace `<ver>` with your KiCad version (e.g. `10.0`):
 
-Settings file: `~/.config/kicad/kicad_ai_assistant.json`
+- **macOS:** `~/Library/Preferences/kicad/<ver>/kcaa/kicad_ai_assistant.json`
+- **Linux:** `~/.config/kicad/<ver>/kcaa/kicad_ai_assistant.json`
+- **Windows:** `%APPDATA%\kicad\<ver>\kcaa\kicad_ai_assistant.json`
 
 All settings can be changed through **Options → Settings** in the plugin panel:
 
@@ -379,19 +402,29 @@ kcaa/
 │   ├── settings.py          # Load/save plugin settings
 │   ├── autorouter.py        # FreeRouting integration
 │   ├── tool_registry.py     # Tool metadata and categorization
-│   ├── setup_plugin.sh      # Linux/macOS setup script
-│   ├── setup_plugin.ps1     # Windows PowerShell setup script
-│   ├── setup_plugin.bat     # Windows batch setup script
-│   └── ui/                  # wxPython chat panel and settings dialog
+│   ├── setup_plugin.sh              # Linux setup script
+│   ├── setup_plugin_macos.command   # Double-clickable macOS setup
+│   ├── install_macos.sh             # One-step macOS installer
+│   ├── setup_plugin.ps1             # Windows PowerShell setup script
+│   ├── setup_plugin.bat             # Windows batch setup script
+│   └── ui/                          # wxPython chat panel and settings dialog
 ├── docs/                    # Feature documentation
 └── tests/                   # Unit tests
 ```
 
+## Documentation
+
+- **`docs/plugin-development.md`** — Detailed guide to how the plugin was developed: architecture, components, macOS port, installation plumbing, testing, and extension points.
+- **`docs/plugin/architecture.md`** — Architecture notes for the KiCad MCP plugin.
+- **`docs/configuration.md`** — Configuring the standalone MCP server.
+- **`docs/plugin/tool_contract.md`** — Tool interface contract.
+
 ## Troubleshooting
 
 **Plugin does not appear in KiCad:**
-- Confirm the plugin directory is named exactly `kicad_ai_assistant` (not `kicad_ai_plugin`).
+- Confirm the plugin directory is named exactly `kicad_ai_assistant`.
 - Run **Tools → External Plugins → Refresh Plugins** after installing.
+- macOS: Check that `setup_plugin_macos.command` completed without errors and that `.venv/bin/python` exists inside the plugin directory. The install path should be `~/Library/Preferences/kicad/<version>/scripting/plugins/kicad_ai_assistant`.
 - Linux: Check that `setup_plugin.sh` completed without errors and that `.venv/bin/python` exists inside the plugin directory.
 - Windows: Check that `setup_plugin.bat` (or `setup_plugin.ps1`) completed without errors and that `.venv/Scripts/python.exe` exists inside the plugin directory.
 
