@@ -411,7 +411,13 @@ kcaa/
 1. Fork the repository
 2. Create a feature branch
 3. Add your changes with tests
-4. Submit a pull request
+4. Submit a pull request **against the `develop` branch**
+
+> **Branch policy:**
+> - The `develop` branch is where new features are stabilized — please
+>   submit your changes there first so they can be tested and reviewed.
+> - The `main` branch is reserved for releasing versions. Changes are
+>   merged from `develop` into `main` once they have passed testing.
 
 ## License
 
