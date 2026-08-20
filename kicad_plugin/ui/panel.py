@@ -283,8 +283,16 @@ if _WX_AVAILABLE:
                     # Block navigation to any URL — prevents files (PDFs, images,
                     # etc.) dropped onto the WebView from being opened inside it.
                     # Only the shell page (loaded via SetPage) should ever display.
+                    #
+                    # NOTE (Windows): wx.html2.WebView.SetPage() triggers a
+                    # EVT_WEBVIEW_NAVIGATING with a `data:text/html;base64,...`
+                    # URL on WebView2.  Vetoing it would silently break the
+                    # shell load (EVT_WEBVIEW_LOADED never fires, JS never
+                    # executes).  Allow all `data:` URLs so SetPage works,
+                    # while still blocking external navigation.
                     def _on_navigating(event):
-                        if event.GetURL() not in ("", "about:blank"):
+                        url = event.GetURL()
+                        if url not in ("", "about:blank") and not url.startswith("data:"):
                             event.Veto()
 
                     self.Bind(
