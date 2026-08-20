@@ -1,0 +1,21 @@
+name: Build KiCad Plugin ZIP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-plugin:
+    runs-on: ubuntu-latest
+    name: Build kicad_ai_assistant plugin zip
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Build plugin zip (make dist-plugin)
+      run: make dist-plugin
+
+    - name: Upload plugin zip
+      uses: actions/upload-artifact@v4
+      with:
+        name: kicad-ai-assistant-plugin
+        path: dist/kicad_ai_assistant.zip
