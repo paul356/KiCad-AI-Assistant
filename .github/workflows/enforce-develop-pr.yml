@@ -7,12 +7,13 @@ jobs:
   check-source:
     runs-on: ubuntu-latest
     steps:
-      - name: Fail if PR is not from develop
-        if: github.event.pull_request.head.ref != 'develop'
+      - name: Fail if PR is not from the repository's own develop branch
+        if: github.event.pull_request.head.repo.full_name != github.repository || github.event.pull_request.head.ref != 'develop'
         run: |
-          echo "ERROR: Pull requests to main must come from the 'develop' branch."
+          echo "ERROR: Pull requests to main must come from the 'develop' branch of this repository (${{ github.repository }})."
           echo "Current head ref: ${{ github.event.pull_request.head.ref }}"
+          echo "Current head repo: ${{ github.event.pull_request.head.repo.full_name }}"
           exit 1
-      - name: Pass if from develop
-        if: github.event.pull_request.head.ref == 'develop'
-        run: echo "PR source is develop. All good."
+      - name: Pass if from the repository's own develop branch
+        if: github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref == 'develop'
+        run: echo "PR source is this repo's develop branch. All good."
