@@ -10,8 +10,38 @@ permissions:
   contents: read
 
 jobs:
+  # Skip the build/publish when pyproject.toml version already exists on PyPI
+  check-version:
+    runs-on: ubuntu-latest
+    outputs:
+      skip: ${{ steps.check.outputs.skip }}
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Check version against PyPI
+      id: check
+      env:
+        PYPI_PACKAGE: kcaa
+      run: |
+        VERSION=$(grep -E '^version = ' pyproject.toml | head -1 | sed -E 's/^version = "([^"]+)"/\1/')
+        if [ -z "$VERSION" ]; then
+          echo "::error::Could not read version from pyproject.toml"
+          exit 1
+        fi
+        PYPI_VERSION=$(curl -fsSL "https://pypi.org/pypi/${PYPI_PACKAGE}/json" | python3 -c 'import json, sys; print(json.load(sys.stdin)["info"]["version"])' 2>/dev/null || echo "")
+        echo "Local version:  ${VERSION}"
+        echo "Published version: ${PYPI_VERSION:-<none>}"
+        if [ -n "$PYPI_VERSION" ] && [ "$VERSION" = "$PYPI_VERSION" ]; then
+          echo "skip=true" >> "$GITHUB_OUTPUT"
+          echo "Version unchanged on PyPI, skipping publish."
+        else
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+        fi
+
   build:
     runs-on: ubuntu-latest
+    needs: check-version
+    if: needs.check-version.outputs.skip != 'true'
     steps:
     - uses: actions/checkout@v4
 
@@ -37,6 +67,7 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     needs: build
+    if: needs.check-version.outputs.skip != 'true'
     environment: pypi
     steps:
     - name: Download artifacts
