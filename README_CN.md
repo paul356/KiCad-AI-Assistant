@@ -412,6 +412,10 @@ kcaa/
 3. 提交包含测试的修改
 4. 发起 Pull Request **指向 `develop` 分支**
 
+> **PR 要求：**
+> - 一个 Pull Request 只能包含**一个**修复（fix）、增强（enhancement）或功能（feature）。如果有多个独立的修改，请分别提交为多个 Pull Request。
+> - 修改需要包含测试。
+
 > **分支说明：**
 > - `develop` 分支用于稳定新特性——请先把修改通过 PR 提交到这里，经过测试和评审后再合入。
 > - `main` 分支用于发布版本，在测试通过后，从 `develop` 合并到 `main` 完成发布。
