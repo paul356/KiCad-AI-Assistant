@@ -413,6 +413,12 @@ kcaa/
 3. Add your changes with tests
 4. Submit a pull request **against the `develop` branch**
 
+> **PR requirements:**
+> - One pull request should contain **only one** fix, enhancement, or
+>   feature. If you have multiple independent changes, please submit them
+>   as separate pull requests.
+> - Include tests for your changes.
+
 > **Branch policy:**
 > - The `develop` branch is where new features are stabilized — please
 >   submit your changes there first so they can be tested and reviewed.
