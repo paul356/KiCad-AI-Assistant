@@ -684,10 +684,10 @@ import time as _time
 
 
 def _viz_dir() -> str:
-    """Return the viz dump directory under the kcaa data dir."""
+    """Return the PCB viz dump directory under the kcaa data dir kcaa_viz/pcb_viz."""
     from kcaa.utils.config import config
 
-    return _os.path.join(config.get_kcaa_data_dir(), "kcaa_viz")
+    return _os.path.join(config.get_kcaa_data_dir(), "kcaa_viz", "pcb_viz")
 
 
 def _dump_viz(

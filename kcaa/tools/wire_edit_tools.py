@@ -4,9 +4,11 @@ Provides tools to draw, list, and delete wire segments and junction dots
 in KiCad schematics using the skip library.
 """
 
+import json
 import logging
 import math
 import os
+import time
 from typing import Any
 
 from fastmcp import Context, FastMCP
@@ -123,6 +125,33 @@ def _route_collides_at_corners(
                 if abs(cx - px) <= tol and abs(cy - py) <= tol:
                     return True
     return False
+
+
+def _route_check_failures(
+    segments: list[tuple[float, float, float, float]],
+    obstacles: list[tuple[float, float]],
+    existing_wires: list[tuple[float, float, float, float]],
+    sx: float,
+    sy: float,
+    ex: float,
+    ey: float,
+    tol: float,
+) -> list[str]:
+    """Return the list of checks that reject *segments*; empty list = pass.
+
+    Runs the same three gates used by ``_try_angle_config`` — pin on segment
+    interior, collinear overlap with existing wires, pin on a corner — and
+    reports which ones fail.  Kept as its own function so the visualisation
+    dump can record the exact rejection reason per candidate.
+    """
+    fails: list[str] = []
+    if _route_collides(segments, obstacles, tol):
+        fails.append("pin-on-interior")
+    if _route_overlaps_wires(segments, existing_wires, tol):
+        fails.append("wire-overlap")
+    if _route_collides_at_corners(segments, obstacles, tol, sx, sy, ex, ey):
+        fails.append("pin-at-corner")
+    return fails
 
 
 def _route_candidates(
@@ -497,6 +526,7 @@ def _try_angle_config(
     lead_out_dist: float,
     start_natural: float | None = None,
     end_natural: float | None = None,
+    diag: dict[str, Any] | None = None,
 ) -> _RouteConfig | None:
     """Try to find a valid route from (sx,sy) to (ex,ey) using the given
     lead-out angles sa (start) and ea (end).
@@ -524,6 +554,11 @@ def _try_angle_config(
     start_lead + chosen + end_lead always forms a continuous chain, which is
     required by _merge_collinear_segments.
 
+    diag: optional dict filled with leads outcome ("start_lead"/"end_lead":
+    ok | t-tap | opposite-natural | pin-blocked) and, per rejected candidate,
+    an entry in "rejected_candidates" with the segments and failing checks.
+    Only used by the visualisation dump; None disables the bookkeeping.
+
     Returns a _RouteConfig tuple on success, or None if no candidate inner
     route passes the collision / overlap checks.
     """
@@ -542,17 +577,25 @@ def _try_angle_config(
         if _route_overlaps_wires([seg], existing_wires, _PIN_COLLISION_TOL):
             p1x, p1y = _follow_wire_extent(sx, sy, sa, existing_wires, _PIN_COLLISION_TOL)
             start_suppressed = True
+            if diag is not None:
+                diag["start_lead"] = "t-tap"
         elif (
             start_natural is not None and abs((sa - (start_natural + 180.0) % 360.0) % 360.0) < 1e-9
         ):
+            if diag is not None:
+                diag["start_lead"] = "opposite-natural"
             return None  # lead goes into component body (opposite to natural exit)
         elif _route_collides([seg], obstacles, _PIN_COLLISION_TOL) or any(
             abs(p1x - ox) <= _PIN_COLLISION_TOL and abs(p1y - oy) <= _PIN_COLLISION_TOL
             for ox, oy in obstacles
         ):
+            if diag is not None:
+                diag["start_lead"] = "pin-blocked"
             return None  # direction blocked by a component pin
         else:
             start_lead = [seg]
+            if diag is not None:
+                diag["start_lead"] = "ok"
 
     # --- end lead ---
     if ea is not None:
@@ -569,34 +612,35 @@ def _try_angle_config(
         if _route_overlaps_wires([seg], existing_wires, _PIN_COLLISION_TOL):
             p2x, p2y = _follow_wire_extent(ex, ey, ea, existing_wires, _PIN_COLLISION_TOL)
             end_suppressed = True
+            if diag is not None:
+                diag["end_lead"] = "t-tap"
         elif end_natural is not None and abs((ea - (end_natural + 180.0) % 360.0) % 360.0) < 1e-9:
+            if diag is not None:
+                diag["end_lead"] = "opposite-natural"
             return None  # lead goes into component body (opposite to natural exit)
         elif _route_collides([seg], obstacles, _PIN_COLLISION_TOL) or any(
             abs(p2x - ox) <= _PIN_COLLISION_TOL and abs(p2y - oy) <= _PIN_COLLISION_TOL
             for ox, oy in obstacles
         ):
+            if diag is not None:
+                diag["end_lead"] = "pin-blocked"
             return None  # direction blocked by a component pin
         else:
             end_lead = [(p2x, p2y, ex, ey)]  # reversed: inner→pin
+            if diag is not None:
+                diag["end_lead"] = "ok"
 
     # Lead segments in canonical forward direction for collision checking
     lead_segs = start_lead + [(a, b, c, d) for (c, d, a, b) in end_lead]
 
     for candidate in _route_candidates(p1x, p1y, p2x, p2y):
         all_segs = lead_segs + candidate
-        if (
-            not _route_collides(all_segs, obstacles, _PIN_COLLISION_TOL)
-            and not _route_overlaps_wires(all_segs, existing_wires, _PIN_COLLISION_TOL)
-            and not _route_collides_at_corners(
-                all_segs,
-                obstacles,
-                _PIN_COLLISION_TOL,
-                sx,
-                sy,
-                ex,
-                ey,
-            )
-        ):
+        fails = _route_check_failures(
+            all_segs, obstacles, existing_wires, sx, sy, ex, ey, _PIN_COLLISION_TOL
+        )
+        if not fails:
+            if diag is not None:
+                diag["valid"] = True
             return (
                 start_lead,
                 end_lead,
@@ -608,7 +652,95 @@ def _try_angle_config(
                 start_suppressed,
                 end_suppressed,
             )
+        if diag is not None:
+            diag.setdefault("rejected_candidates", []).append(
+                {"segments": [list(s) for s in all_segs], "reasons": fails}
+            )
     return None
+
+
+# ---------------------------------------------------------------------------
+# Visualisation dump (schematic)
+# ---------------------------------------------------------------------------
+
+
+def _sch_viz_dir() -> str:
+    """Return the schematic viz dump directory under the kcaa data dir."""
+    from kcaa.utils.config import config
+
+    return os.path.join(config.get_kcaa_data_dir(), "kcaa_viz", "sch_viz")
+
+
+def _flatten_segments(
+    segments: list[tuple[float, float, float, float]],
+) -> list[list[float]]:
+    """Collapse a connected chain of segments into a deduplicated point list."""
+    pts: list[list[float]] = []
+    for ax, ay, bx, by in segments:
+        if not pts:
+            pts.append([ax, ay])
+        elif abs(pts[-1][0] - ax) > 1e-9 or abs(pts[-1][1] - ay) > 1e-9:
+            pts.append([ax, ay])
+        pts.append([bx, by])
+    return pts
+
+
+def _wire_rect(ax: float, ay: float, bx: float, by: float, half: float = 0.25) -> list[list[float]]:
+    """Thin rectangle polygon around an axis-aligned wire segment (mm)."""
+    if abs(ay - by) < 1e-9:
+        return [[ax, ay - half], [bx, by - half], [bx, by + half], [ax, ay + half]]
+    return [[ax - half, ay], [bx - half, by], [bx + half, by], [ax + half, ay]]
+
+
+def _dump_viz_schematic(
+    stage: str,
+    segments: list[tuple[float, float, float, float]] | None = None,
+    pins: list[tuple[float, float]] | None = None,
+    wires: list[tuple[float, float, float, float]] | None = None,
+    candidates: list[dict[str, Any]] | None = None,
+    notes: str | None = None,
+) -> None:
+    """Dump a schematic routing intermediate state for rendering.
+
+    Mirrors the PCB router pipeline dump (``kcaa/router/router.py``) but with
+    schematic geometry: every symbol pin becomes a small pad AABB (the
+    0.5 mm collision radius), every existing wire becomes a thin obstacle
+    rectangle, and the candidate routes under evaluation are stored alongside
+    their rejection reasons.  Only writes when ``config.viz_dump_enabled`` is
+    set via ``KCAA_DUMP_ROUTE_PIPELINE=1`` in ``.env``.
+    """
+    from kcaa.utils.config import config
+
+    if not config.viz_dump_enabled:
+        return
+    d = _sch_viz_dir()
+    os.makedirs(d, exist_ok=True)
+    ts = time.strftime("%H%M%S")
+    fname = os.path.join(d, f"{ts}_{stage}.json")
+
+    pins = pins or []
+    wires = wires or []
+    tol = _PIN_COLLISION_TOL
+    data: dict[str, Any] = {
+        "stage": stage,
+        "path": _flatten_segments(segments or []),
+        "pads": [["", [px - tol, py - tol, px + tol, py + tol]] for px, py in pins],
+        "obstacles": [(_wire_rect(cx, cy, dx, dy), "wire", "") for cx, cy, dx, dy in wires],
+        "candidates": candidates or [],
+    }
+    if notes:
+        data["notes"] = notes
+    with open(fname, "w") as f:
+        json.dump(data, f)
+    log.info("[viz] dumped %s", fname)
+
+
+def _config_from_result(
+    result: _RouteConfig,
+) -> list[tuple[float, float, float, float]]:
+    """Extract the drawable segment chain (start_lead + inner + end inner→pin)."""
+    start_lead, end_lead, chosen, *_ = result
+    return list(start_lead) + list(chosen) + list(end_lead)
 
 
 def _draw_smart_wire(
@@ -675,31 +807,73 @@ def _draw_smart_wire(
     # relaxes both endpoints together rather than exhausting all end angles
     # for one start angle before moving to the next start angle.
     result: _RouteConfig | None = None
+    from kcaa.utils.config import config
+
     max_rank = len(_start_angles) + len(_end_angles) - 2
     for rank_sum in range(max_rank + 1):
         for si in range(min(rank_sum + 1, len(_start_angles))):
             ei = rank_sum - si
             if ei < 0 or ei >= len(_end_angles):
                 continue
+            sa = _start_angles[si]
+            ea = _end_angles[ei]
+            diag: dict[str, Any] | None = {} if config.viz_dump_enabled else None
             result = _try_angle_config(
                 sx,
                 sy,
                 ex,
                 ey,
-                _start_angles[si],
-                _end_angles[ei],
+                sa,
+                ea,
                 existing_wires,
                 obstacles,
                 lead_out_dist,
                 start_natural=start_angle,
                 end_natural=end_angle,
+                diag=diag,
             )
             if result is not None:
+                try:
+                    _dump_viz_schematic(
+                        f"pair-sa{int(sa)}-ea{int(ea)}",
+                        segments=_config_from_result(result),
+                        pins=obstacles,
+                        wires=existing_wires,
+                        candidates=diag.get("rejected_candidates") if diag else None,
+                        notes="valid",
+                    )
+                except Exception:
+                    log.warning("[viz] failed to dump pair %s", int(sa), exc_info=True)
                 break
+            try:
+                _dump_viz_schematic(
+                    f"pair-sa{int(sa)}-ea{int(ea)}",
+                    segments=None,
+                    pins=obstacles,
+                    wires=existing_wires,
+                    candidates=diag.get("rejected_candidates") if diag else None,
+                    notes=(
+                        f"lead start={diag.get('start_lead')} end={diag.get('end_lead')}"
+                        if diag
+                        else ""
+                    ),
+                )
+            except Exception:
+                log.warning("[viz] failed to dump pair %s", int(sa), exc_info=True)
         if result is not None:
             break
 
     if result is None:
+        try:
+            _dump_viz_schematic(
+                "7-failed",
+                segments=None,
+                pins=obstacles,
+                wires=existing_wires,
+                notes=(f"no route after {len(_start_angles) * len(_end_angles)} angle pairs tried"),
+            )
+        except Exception:
+            log.warning("[viz] failed to dump 7-failed", exc_info=True)
         log.warning(
             "smart_wire: no valid route found between (%.3f,%.3f) and "
             "(%.3f,%.3f); all angle/candidate combinations are blocked.",
@@ -729,6 +903,17 @@ def _draw_smart_wire(
         [(p2x, p2y)] if end_suppressed else []
     ):
         _add_junction_and_split(sch, jx, jy)
+
+    try:
+        _dump_viz_schematic(
+            "7-final",
+            segments=all_draw,
+            pins=obstacles,
+            wires=existing_wires,
+            notes="route drawn",
+        )
+    except Exception:
+        log.warning("[viz] failed to dump 7-final", exc_info=True)
 
     return True
 
