@@ -77,6 +77,27 @@
 - 冷启动:会话加载 digest 一次即获全貌,工具往返大幅减少。
 - 一致性:digest 与 tool 查询共用同一解析代码。
 
+### 可选建议(评审后采纳;可作为上述文件方案的替代或简化)
+
+- **优先做成 `kicad://digest/{project_path}` 资源,而非"文件 + 生成工具"**。服务端已有资源层(`kcaa/resources/` 下 8 个 `kicad://` 资源:netlist / project_netlist / bom / drc / patterns / project / schematic / component)。新增 `digest_resources.py`,照抄 `netlist_resources.py` 的 `@mcp.resource` 写法,内部组合 `extract_project_netlist` + `get_board_info` + 库统计即可,约 100~150 行。理由:
+  - 无过期问题:每次请求现算,永远是当前状态;文件方案必然引入"AI 读到旧 digest"的陈旧风险。
+  - 无落盘/清理负担,不依赖 `.kicad_prl`。
+  - 与现有 UX 一致(AI 已习惯读 `kicad://netlist` 等)。
+- **无状态优先,不落盘**:普通项目解析为毫秒级;若超大型板解析变慢,再退化"以源文件 mtime 为 key"的内存缓存,不写文件。
+- **摘要优先、明细按需**:digest 只放概览(组件数/值/footprint 分布、net 数、sheet 树、已用库、DRC 状态),不带全量 netlist(那是 `kicad://netlist` 的职责)。Markdown 格式与现有资源一致;schema 加 `digest_v1` 版本字段;字段定稿前先采样 2~3 个真实项目。
+- **真正的价值在插件侧自动加载**:`kicad_plugin/context_bridge.py` 已有 `active_project`,检测到项目打开/切换时自动拉取 digest 注入对话上下文(先 opt-in,有 token 成本)。resource 只是地基,自动加载才是功能;这步不做,资源本身仍可用,但要 AI 记得主动读。
+
+**背景:resource 解决什么问题**(供评审时参考)
+
+| | tool | resource | 文件 |
+|---|---|---|---|
+| 本质 | 动作(计算/修改) | 数据(只读内容) | 数据(落盘) |
+| AI 获取 | 记得要调、传参 | 按地址读 | 先生成再读 |
+| 客户端可自动加载 | 不能 | 可以 | 需插件自行解析 |
+| 陈旧风险 | 无 | 无(现算) | 有 |
+
+Resource 的核心价值:让 AI **按需、无副作用、可被客户端自动加载**地获取上下文——读数据不占"动作"位,宿主(插件)可在"项目打开"事件里自动注入,这是 tool 和文件都给不了的。
+
 ### 风险 / 决策点
 
 - **陈旧 digest 误导 AI**:必须携带源文件 mtime 并在文档中提示"文件变更后需重新生成";默认拒绝加载过期 digest(或强制时明确标注 stale)。
@@ -117,10 +138,25 @@
 - 进阶:做成 skill(参考 `kicad_plugin/skills/` 与 `kcaa/prompts/` 现有结构),按项目类型(电源/MCU/传感器板)提供不同流程模板;
 - 避免过度工程:先交付 1 份通用流程 + 2~3 个典型模板,验证效果再扩展。
 
+### 可选建议(评审后采纳)
+
+- **做成 skill,而非纯静态文档**:新增 `kicad_plugin/skills/design_workflow.md`(front-matter 带 `name` / `description` / `priority`),`llm_client.py` 的 `build_system_prompt()` 会把所有 `skills/*.md` 自动编入 `# Skills` 目录并注入系统提示词,LLM 可随时按需取用;同时放一份到 `docs/` 供人阅读。
+- **流程每一步必须映射到已注册的真实工具名**:已核对 `kcaa/tools/` 全部工具,链条齐全(sync 索引 → search/get 选型 → sheet/wire 建图 → netlist/bom/pattern 校验 → pcb 布局布线 → drc → 导出),但发现一个缺口:**没有 Gerber 导出工具**(仅 `export_bom_*` 和 kicad-cli 缩略图)。第 7 步需二选一:在 `kcaa/tools/export_tools.py` 补一个 Gerber 导出(可复用 `kcaa/utils/kicad_cli.py`),或从流程中删掉该步。
+- **流程格式:前置条件 + 显式失败分支 + 验收标准**,而非叙事。例:"索引完成才能 search""`update_pcb_from_schematic` 要求原理图已保存""DRC 0 错误才能继续导出,DRC>0 则报告并停"。与"无默认降级路径"原则一致,失败必须可见。
+- **先做一条通用流程,不做板型矩阵**;通用版被实证薄弱后再扩展电源/MCU/传感器模板。
+
 ### 验收
 
 - 用一个真实小项目(如 STM32 最小系统)按文档流程从头到尾走通,所有工具调用序列无需人工修正;
 - LLM 在空项目场景下能自行调用第 1 步索引同步,而不是直接开始画图。
+
+---
+
+## 4. 实施顺序与依赖(可选建议)
+
+- **T3 依赖 T1**:工作流第 1 步(索引同步)对项目级符号库目前不生效——T1 不先做,工作流文档会教 LLM 走错路径(同步后搜不到项目库符号)。
+- 建议顺序:**T1(小、正确性缺口)→ T3(便宜、立即见效)→ T2(最大,且全价值依赖插件侧自动加载集成)**。
+- T3 的冷启动步骤可先引用现有 `kicad://project_netlist` / `kicad://bom` 资源,不必等 T2;T2 与 T3 可并行开发。
 
 ---
 
