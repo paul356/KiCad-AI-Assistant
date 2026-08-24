@@ -9,6 +9,7 @@ import json
 import logging
 import math
 import os
+import re
 import time
 from typing import Any
 
@@ -27,6 +28,7 @@ log = logging.getLogger(__name__)
 
 _LEAD_OUT_DIST: float = 2.54  # mm — one KiCad grid step, pulls wire into open space
 _PIN_COLLISION_TOL: float = 0.5  # mm — clearance radius around each obstacle pin
+_DUMP_MAX_REJECTED: int = 64  # cap rejected-candidate records per angle pair
 
 
 # ---------------------------------------------------------------------------
@@ -137,22 +139,132 @@ def _route_check_failures(
     ex: float,
     ey: float,
     tol: float,
+    pin_symbols: list[tuple[float, float, float, float]] | None = None,
+    lead_segs: list[tuple[float, float, float, float]] | None = None,
 ) -> list[str]:
     """Return the list of checks that reject *segments*; empty list = pass.
 
-    Runs the same three gates used by ``_try_angle_config`` — pin on segment
-    interior, collinear overlap with existing wires, pin on a corner — and
-    reports which ones fail.  Kept as its own function so the visualisation
-    dump can record the exact rejection reason per candidate.
+    Runs the four gates used by ``_try_angle_config`` — pin on segment
+    interior, collinear overlap with pin symbol stubs, collinear overlap
+    with existing wires, pin on a corner — and reports which ones fail.
+    Kept as its own function so the visualisation dump can record the exact
+    rejection reason per candidate.
+
+    Only the actual lead-out segments (``lead_segs``, in forward electrical
+    point → tip direction) running outward on their own pin stub are exempt
+    from the stub gate; every other overlap with a pin symbol is rejected.
     """
     fails: list[str] = []
     if _route_collides(segments, obstacles, tol):
         fails.append("pin-on-interior")
+    if pin_symbols and _intersects_any(
+        segments,
+        pin_symbols,
+        tol,
+        exempt=(
+            (lambda seg, line, tol: seg in (lead_segs or []) and _lead_on_own_stub(seg, line, tol))
+            if lead_segs
+            else None
+        ),
+    ):
+        fails.append("pin-overlap")
     if _route_overlaps_wires(segments, existing_wires, tol):
         fails.append("wire-overlap")
     if _route_collides_at_corners(segments, obstacles, tol, sx, sy, ex, ey):
         fails.append("pin-at-corner")
     return fails
+
+
+def _intersects_any(
+    segments: list[tuple[float, float, float, float]],
+    lines: list[tuple[float, float, float, float]],
+    tol: float,
+    exempt=None,
+) -> bool:
+    """Return True if any segment intersects (overlaps or crosses) any line.
+
+    *exempt* is an optional predicate ``(segment, line, tol) -> bool`` that
+    excuses specific pairs (e.g. a lead running outward on its own pin stub).
+    """
+    for seg in segments:
+        for line in lines:
+            if _segments_intersect(seg, line, tol):
+                if exempt is not None and exempt(seg, line, tol):
+                    continue
+                return True
+    return False
+
+
+def _lead_on_own_stub(
+    seg: tuple[float, float, float, float],
+    stub: tuple[float, float, float, float],
+    tol: float,
+) -> bool:
+    """True when *seg* is the outgoing lead of *stub*'s own pin.
+
+    The legitimate lead-out starts at the pin's electrical point and runs
+    outward along the stub direction (stub = electrical point → stub tip).
+    A segment that returns from outside onto the stub (or crosses it at
+    length) is *not* exempt — that is a wire drawn on top of the pin symbol.
+    """
+    ex, ey, tx, ty = stub
+    sdx, sdy = tx - ex, ty - ey
+    for sx0, sy0, sx1, sy1 in (
+        (seg[0], seg[1], seg[2], seg[3]),
+        (seg[2], seg[3], seg[0], seg[1]),  # end_lead is stored inner→pin
+    ):
+        if abs(sx0 - ex) <= tol and abs(sy0 - ey) <= tol:
+            if (sx1 - sx0) * sdx + (sy1 - sy0) * sdy > 0:
+                return True
+    return False
+
+
+def _point_in_interior(
+    px: float,
+    py: float,
+    sx0: float,
+    sy0: float,
+    sx1: float,
+    sy1: float,
+    tol: float,
+) -> bool:
+    """True when (px,py) lies strictly inside axis-aligned segment (s0→s1)."""
+    if abs(sy0 - sy1) < 1e-9:
+        return abs(py - sy0) <= tol and min(sx0, sx1) + tol < px < max(sx0, sx1) - tol
+    if abs(sx0 - sx1) < 1e-9:
+        return abs(px - sx0) <= tol and min(sy0, sy1) + tol < py < max(sy0, sy1) - tol
+    return False
+
+
+def _segments_intersect(
+    seg: tuple[float, float, float, float],
+    line: tuple[float, float, float, float],
+    tol: float,
+) -> bool:
+    """True when the two axis-aligned segments share more than an endpoint.
+
+    Covers both collinear interval overlap (the wire-overlap gate) and a
+    T/perpendicular crossing where one segment passes *through* the other's
+    interior — e.g. a route running across the middle of a pin symbol.
+    Endpoint touches (lead on its own stub, bridge landing on a wire end)
+    are not flagged.
+    """
+    if _segments_overlap(*seg, *line, tol):
+        return True
+    ax, ay, bx, by = seg
+    cx, cy, dx, dy = line
+    # One horizontal, one vertical, crossing strictly interior to both.
+    if abs(ay - by) < 1e-9 and abs(ax - bx) > 1e-9 and abs(cx - dx) < 1e-9 and abs(cy - dy) > 1e-9:
+        vx, hy = cx, ay
+        return _point_in_interior(vx, hy, ax, ay, bx, by, tol) and _point_in_interior(
+            vx, hy, cx, cy, cx, dy, tol
+        )
+    if abs(cx - dx) < 1e-9 and abs(cy - dy) > 1e-9 and abs(ay - by) < 1e-9 and abs(ax - bx) > 1e-9:
+        vx, hy = ax, cy
+        return _point_in_interior(vx, hy, cx, cy, dx, dy, tol) and _point_in_interior(
+            vx, hy, ax, ay, ax, by, tol
+        )
+    return False
 
 
 def _route_lanes(
@@ -628,6 +740,7 @@ def _try_angle_config(
     start_natural: float | None = None,
     end_natural: float | None = None,
     diag: dict[str, Any] | None = None,
+    pin_symbols: list[tuple[float, float, float, float]] | None = None,
 ) -> _RouteConfig | None:
     """Try to find a valid route from (sx,sy) to (ex,ey) using the given
     lead-out angles sa (start) and ea (end).
@@ -668,25 +781,29 @@ def _try_angle_config(
     Returns a _RouteConfig tuple on success, or None if no candidate inner
     route passes the collision / overlap checks.
     """
-    # --- start lead ---
+    # --- start lead options ---
+    # Angle-level state is length-independent and decided once:
+    #  * t-tap: lead overlaps an existing wire → tip absorbed into the
+    #    followed chain (any length does the same);
+    #  * opposite-natural: direction rejected outright;
+    #  * plain lead: each length has its own tip; lengths are swept by the
+    #    search below so a route blocked at the anchor can be rescued by
+    #    moving the exit point minimally (conflict-driven).
     dvsx = dvsy = 0.0
     if sa is not None:
         dvsx, dvsy = _dir_vec(sa)
 
-    p1x, p1y = sx, sy
-    start_lead: list[tuple[float, float, float, float]] = []
+    start_opts: list[
+        tuple[float | None, float, float, list[tuple[float, float, float, float]]]
+    ] = []
     start_suppressed = False
-    cur_sl: float | None = None  # lead length actually used (for diagnostics)
     if sa is not None:
-        # Angle-level gates are length-independent: evaluated once at the
-        # anchor length (T-tap absorbs any lead into the followed chain;
-        # opposite-natural rejects the direction outright).
         anchor = lead_lengths[0]
         seg_anchor = (sx, sy, round(sx + dvsx * anchor, 4), round(sy + dvsy * anchor, 4))
         if _route_overlaps_wires([seg_anchor], existing_wires, _PIN_COLLISION_TOL):
             p1x, p1y = _follow_wire_extent(sx, sy, sa, existing_wires, _PIN_COLLISION_TOL)
             start_suppressed = True
-            cur_sl = anchor
+            start_opts = [(anchor, p1x, p1y, [])]
             if diag is not None:
                 diag["start_lead"] = "t-tap"
         elif (
@@ -696,10 +813,6 @@ def _try_angle_config(
                 diag["start_lead"] = "opposite-natural"
             return None  # lead goes into component body (opposite to natural exit)
         else:
-            # Only the tip position depends on the length: try the anchor
-            # first, then shorter/longer leads only when a length is blocked,
-            # so the exit point is disrupted as little as possible.
-            found = False
             for length in lead_lengths:
                 tip = (round(sx + dvsx * length, 4), round(sy + dvsy * length, 4))
                 seg = (sx, sy, tip[0], tip[1])
@@ -709,34 +822,30 @@ def _try_angle_config(
                     for ox, oy in obstacles
                 ):
                     continue  # lead blocked at this length; try a neighbour
-                p1x, p1y = tip
-                start_lead = [seg]
-                cur_sl = length
-                found = True
-                break
-            if not found:
+                start_opts.append((length, tip[0], tip[1], [seg]))
+            if not start_opts:
                 if diag is not None:
                     diag["start_lead"] = "pin-blocked"
                 return None  # every lead length blocked by a component pin
             if diag is not None:
                 diag["start_lead"] = "ok"
+    else:
+        start_opts = [(None, sx, sy, [])]
 
-    # --- end lead ---
+    # --- end lead options ---
     dvex = dvey = 0.0
     if ea is not None:
         dvex, dvey = _dir_vec(ea)
 
-    p2x, p2y = ex, ey
-    end_lead: list[tuple[float, float, float, float]] = []
+    end_opts: list[tuple[float | None, float, float, list[tuple[float, float, float, float]]]] = []
     end_suppressed = False
-    cur_el: float | None = None  # end lead length actually used
     if ea is not None:
         anchor = lead_lengths[0]
         seg_anchor = (ex, ey, round(ex + dvex * anchor, 4), round(ey + dvey * anchor, 4))
         if _route_overlaps_wires([seg_anchor], existing_wires, _PIN_COLLISION_TOL):
             p2x, p2y = _follow_wire_extent(ex, ey, ea, existing_wires, _PIN_COLLISION_TOL)
             end_suppressed = True
-            cur_el = anchor
+            end_opts = [(anchor, p2x, p2y, [])]
             if diag is not None:
                 diag["end_lead"] = "t-tap"
         elif end_natural is not None and abs((ea - (end_natural + 180.0) % 360.0) % 360.0) < 1e-9:
@@ -744,7 +853,6 @@ def _try_angle_config(
                 diag["end_lead"] = "opposite-natural"
             return None  # lead goes into component body (opposite to natural exit)
         else:
-            found = False
             for length in lead_lengths:
                 tip = (round(ex + dvex * length, 4), round(ey + dvey * length, 4))
                 seg = (ex, ey, tip[0], tip[1])
@@ -754,48 +862,80 @@ def _try_angle_config(
                     for ox, oy in obstacles
                 ):
                     continue
-                p2x, p2y = tip
-                end_lead = [(p2x, p2y, ex, ey)]  # reversed: inner→pin
-                cur_el = length
-                found = True
-                break
-            if not found:
+                end_opts.append((length, tip[0], tip[1], [(tip[0], tip[1], ex, ey)]))  # inner→pin
+            if not end_opts:
                 if diag is not None:
                     diag["end_lead"] = "pin-blocked"
                 return None  # every lead length blocked by a component pin
             if diag is not None:
                 diag["end_lead"] = "ok"
+    else:
+        end_opts = [(None, ex, ey, [])]
 
-    # Lead segments in canonical forward direction for collision checking
-    lead_segs = start_lead + [(a, b, c, d) for (c, d, a, b) in end_lead]
+    # Conflict-driven length sweep: the anchor length pair is tried first so
+    # previously-working routes are untouched; further lengths are swept only
+    # because every candidate at the current length was rejected, moving the
+    # exit point as little as necessary.
+    anchor_l = lead_lengths[0]
+    combos = sorted(
+        (
+            (sl, s1x, s1y, sseg, el, e1x, e1y, eseg)
+            for sl, s1x, s1y, sseg in start_opts
+            for el, e1x, e1y, eseg in end_opts
+        ),
+        key=lambda c: (
+            (0.0 if c[0] is None else abs(c[0] - anchor_l))
+            + (0.0 if c[4] is None else abs(c[4] - anchor_l)),
+            c[0] or 0.0,
+            c[4] or 0.0,
+        ),
+    )
 
-    for candidate in _route_candidates(p1x, p1y, p2x, p2y):
-        all_segs = lead_segs + candidate
-        fails = _route_check_failures(
-            all_segs, obstacles, existing_wires, sx, sy, ex, ey, _PIN_COLLISION_TOL
-        )
-        if not fails:
+    for cur_sl, p1x, p1y, sseg, cur_el, p2x, p2y, eseg in combos:
+        # Lead segments in canonical forward direction for collision checking
+        lead_segs = sseg + [(a, b, c, d) for (c, d, a, b) in eseg]
+        for candidate in _route_candidates(p1x, p1y, p2x, p2y):
+            all_segs = lead_segs + candidate
+            fails = _route_check_failures(
+                all_segs,
+                obstacles,
+                existing_wires,
+                sx,
+                sy,
+                ex,
+                ey,
+                _PIN_COLLISION_TOL,
+                pin_symbols=pin_symbols,
+                lead_segs=lead_segs,
+            )
+            if not fails:
+                if diag is not None:
+                    diag["valid"] = True
+                return (
+                    sseg,
+                    eseg,
+                    candidate,
+                    p1x,
+                    p1y,
+                    p2x,
+                    p2y,
+                    start_suppressed,
+                    end_suppressed,
+                )
             if diag is not None:
-                diag["valid"] = True
-            return (
-                start_lead,
-                end_lead,
-                candidate,
-                p1x,
-                p1y,
-                p2x,
-                p2y,
-                start_suppressed,
-                end_suppressed,
-            )
-        if diag is not None:
-            diag.setdefault("rejected_candidates", []).append(
-                {
-                    "segments": [list(s) for s in all_segs],
-                    "reasons": fails,
-                    "lead": [cur_sl, cur_el],
-                }
-            )
+                rejected = diag.setdefault("rejected_candidates", [])
+                # Keep the record bounded: candidate shapes are checked in
+                # ranked order, so the first entries carry the diagnostic
+                # value; later W/snake variants repeat the same failure modes.
+                if len(rejected) < _DUMP_MAX_REJECTED:
+                    rejected.append(
+                        {
+                            "segments": [list(seg) for seg in all_segs],
+                            "reasons": fails,
+                            "lead": [cur_sl, cur_el],
+                        }
+                    )
+
     return None
 
 
@@ -839,6 +979,7 @@ def _dump_viz_schematic(
     wires: list[tuple[float, float, float, float]] | None = None,
     candidates: list[dict[str, Any]] | None = None,
     notes: str | None = None,
+    pin_stubs: list[tuple[float, float, float, float]] | None = None,
 ) -> None:
     """Dump a schematic routing intermediate state for rendering.
 
@@ -866,6 +1007,7 @@ def _dump_viz_schematic(
         "path": _flatten_segments(segments or []),
         "pads": [["", [px - tol, py - tol, px + tol, py + tol]] for px, py in pins],
         "obstacles": [(_wire_rect(cx, cy, dx, dy), "wire", "") for cx, cy, dx, dy in wires],
+        "pin_stubs": [list(s) for s in (pin_stubs or [])],
         "candidates": candidates or [],
     }
     if notes:
@@ -929,6 +1071,11 @@ def _draw_smart_wire(
     """
     obstacles = obstacle_pins or []
 
+    # Pin symbols are 2.54–3.81 mm lines on the schematic; treat them as
+    # collision bodies so routes cannot run on top of a pin.  Outgoing
+    # leads on their own stub stay exempt inside the collision gate.
+    pin_symbols = _collect_pin_symbol_stubs(sch)
+
     # Build the ordered list of (sa, ea) pairs to try.
     # Natural angles are tried first; then all 4 cardinals for each endpoint
     # (excluding duplicates already covered by the natural pair) are tried in
@@ -990,6 +1137,7 @@ def _draw_smart_wire(
                     start_natural=start_angle,
                     end_natural=end_angle,
                     diag=diag,
+                    pin_symbols=pin_symbols,
                 )
                 pair_name = f"{stage_name}-pair-sa{int(sa)}-ea{int(ea)}"
                 if result is not None:
@@ -1001,6 +1149,7 @@ def _draw_smart_wire(
                             pins=obstacles,
                             wires=existing_wires,
                             candidates=diag.get("rejected_candidates") if diag else None,
+                            pin_stubs=pin_symbols,
                             notes=f"stage={stage_name} valid",
                         )
                     except Exception:
@@ -1013,6 +1162,7 @@ def _draw_smart_wire(
                         pins=obstacles,
                         wires=existing_wires,
                         candidates=diag.get("rejected_candidates") if diag else None,
+                        pin_stubs=pin_symbols,
                         notes=(
                             f"stage={stage_name} lead start={diag.get('start_lead')} "
                             f"end={diag.get('end_lead')}"
@@ -1034,6 +1184,7 @@ def _draw_smart_wire(
                 segments=None,
                 pins=obstacles,
                 wires=existing_wires,
+                pin_stubs=pin_symbols,
                 notes=(
                     f"no route after {len(stages)} stages x "
                     f"{len(_start_angles) * len(_end_angles)} angle pairs tried"
@@ -1077,6 +1228,7 @@ def _draw_smart_wire(
             segments=all_draw,
             pins=obstacles,
             wires=existing_wires,
+            pin_stubs=pin_symbols,
             notes=f"stage={succeeded_stage} route drawn",
         )
     except Exception:
@@ -1168,6 +1320,93 @@ def _collect_all_pin_data(sch: Any) -> list[tuple[float, float, float]]:
     except AttributeError:
         pass
     return data
+
+
+def _symbol_pin_lengths(sch: Any) -> dict[str, dict[str, float]]:
+    """{sanitized lib_id: {pin number: symbol stub length in mm}}.
+
+    Reads the embedded ``lib_symbols`` of the schematic.  A KiCad pin symbol
+    is drawn as a line from its electrical point along the pin's direction;
+    its length (typically 2.54 or 3.81 mm) is part of the lib definition
+    and is not copied into the placed symbol instance, so the router needs
+    it from here to treat pin symbols as collision bodies.  Pins are
+    exposed as ``Pin_1``..``Pin_n`` attributes (skip nodes don't support
+    ``len()``/iteration on the wrapper).
+    """
+    if not hasattr(sch, "lib_symbols"):
+        return {}
+    libs = sch.lib_symbols
+    result: dict[str, dict[str, float]] = {}
+    for attr in dir(libs):
+        if attr.startswith("_"):
+            continue
+        lib = getattr(libs, attr, None)
+        pins = getattr(lib, "pin", None) if lib is not None else None
+        if pins is None:
+            continue
+        lengths: dict[str, float] = {}
+        for name in dir(pins):
+            if not name.startswith("Pin_"):
+                continue
+            m = re.search(r"\d+", name)
+            if not m:
+                continue
+            raw_len = str(
+                getattr(pins, name, "").length
+                if hasattr(getattr(pins, name, None), "length")
+                else ""
+            )
+            lm = re.search(r"[\d.]+", raw_len)
+            if lm:
+                lengths[m.group(0)] = float(lm.group(0))
+        if lengths:
+            result[attr] = lengths
+    return result
+
+
+def _sanitize_lib_id(lib_id: str) -> str:
+    """Map a lib id (``Vendor:Part``) to skip's sanitised attribute name."""
+    return lib_id.replace(":", "_").replace("/", "_").replace(".", "_").replace("-", "_")
+
+
+def _collect_pin_symbol_stubs(
+    sch: Any,
+) -> list[tuple[float, float, float, float]]:
+    """World-space stub segments for every pin symbol.
+
+    A KiCad pin symbol is drawn from its electrical point *into the
+    component body* — the opposite of the wire-exit direction that
+    ``sym_pin_world_coords`` reports.  These lines span the lib-defined pin
+    length and are the collision bodies a wire must not run on top of (a
+    plain point check against the electrical point alone misses e.g. a
+    route tail drawn on the far side of the pin).  The stub gate exempts
+    only outgoing leads on their own stub; all other overlaps are rejected.
+    """
+    lengths_by_lib = _symbol_pin_lengths(sch)
+    stubs: list[tuple[float, float, float, float]] = []
+    try:
+        for sym in sch.symbol:
+            raw_lib = getattr(sym, "lib_id", "")
+            lib_id = getattr(raw_lib, "value", raw_lib)
+            lib_lengths = lengths_by_lib.get(_sanitize_lib_id(str(lib_id)), {})
+            try:
+                for pin in sym_pin_world_coords(sym):
+                    length = lib_lengths.get(str(pin.number), 2.54)
+                    # Symbol line runs into the body: opposite the exit dir.
+                    dx, dy = _dir_vec((pin.angle + 180.0) % 360.0)
+                    stubs.append(
+                        (
+                            pin.x,
+                            pin.y,
+                            round(pin.x + dx * length, 4),
+                            round(pin.y + dy * length, 4),
+                        )
+                    )
+            except AttributeError:
+                continue
+    except AttributeError:
+        pass
+    return stubs
 
 
 def _junction_exists_at(sch: Any, px: float, py: float, tol: float = 0.01) -> bool:

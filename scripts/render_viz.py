@@ -88,6 +88,18 @@ def _render_scene(data: dict, out_path: str, highlight: int | None = None) -> No
     else:
         near_obs = []
 
+    # Pin symbol stubs: the lib-defined pin lines (2.54–3.81 mm) that wires
+    # must not run on top of.  Drawn as thin blue lines at a low zorder.
+    for sx0, sy0, sx1, sy1 in data.get("pin_stubs") or []:
+        ax.plot(
+            [sx0, sx1],
+            [sy0, sy1],
+            color="#2f6fd0",
+            linewidth=1.0,
+            alpha=0.7,
+            zorder=1,
+        )
+
     # Obstacles (gray fill, near path only). Dark enough to read as existing
     # wires while staying below the candidate/path zorder.
     for coords, kind, ref in near_obs[:60]:
