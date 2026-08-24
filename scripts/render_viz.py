@@ -62,8 +62,12 @@ def _render_scene(data: dict, out_path: str, highlight: int | None = None) -> No
     ax.set_aspect("equal")
 
     # Filter obstacles to only those near the path (culling invisible ones).
+    # Schematic overview images (pair level, no highlight) keep *all*
+    # existing wires so the full net topology is visible; only the per-candidate
+    # close-ups crop to the neighbourhood of the drawn path.
+    is_schematic = "pin_stubs" in data  # schematic router dumps carry pin stubs
     if obstacles:
-        if path:
+        if path and not (is_schematic and highlight is None):
             # Get path bounding box.
             px = [p[0] for p in path]
             py = [p[1] for p in path]
@@ -100,9 +104,10 @@ def _render_scene(data: dict, out_path: str, highlight: int | None = None) -> No
             zorder=1,
         )
 
-    # Obstacles (gray fill, near path only). Dark enough to read as existing
-    # wires while staying below the candidate/path zorder.
-    for coords, kind, ref in near_obs[:60]:
+    # Obstacles (gray fill). Dark enough to read as existing wires while
+    # staying below the candidate/path zorder.  The 60-polygon cap only
+    # applies to cropped views; schematic overviews draw everything.
+    for coords, kind, ref in near_obs if is_schematic else near_obs[:60]:
         xs = [c[0] for c in coords]
         ys = [c[1] for c in coords]
         ax.fill(xs, ys, alpha=0.3, color="#666666", linewidth=0.4, edgecolor="#999999")
