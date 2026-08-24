@@ -948,6 +948,12 @@ def _sch_viz_dir() -> str:
     """Return the schematic viz dump directory under the kcaa data dir."""
     from kcaa.utils.config import config
 
+    # KCAA_VIZ_DIR overrides the dump root so test/debug runs can be written
+    # to a scratch location instead of polluting the live viz directory the
+    # KiCad plugin renders from.
+    override = os.environ.get("KCAA_VIZ_DIR")
+    if override:
+        return os.path.join(os.path.expanduser(override), "sch_viz")
     return os.path.join(config.get_kcaa_data_dir(), "kcaa_viz", "sch_viz")
 
 
