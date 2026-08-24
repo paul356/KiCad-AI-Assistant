@@ -286,15 +286,100 @@ class TestMaybeCompact:
         called_args = mock_compact.call_args.args
         assert called_args[1] >= 200  # at least the minimum floor
 
-    def test_dedup_always_called(self):
-        client = _make_client()
+    def test_history_unmodified_under_budget(self):
+        """Under budget: history is append-only — no dedup, no annotation, no compaction."""
+        client = _make_client(context_tokens=128_000, compact_threshold=0.70)
         client._history = [_user("hi"), _assistant("hello")]
         with (
             patch.object(client, "_dedup_tool_calls") as mock_dedup,
-            patch.object(client, "_compact_history"),
+            patch.object(client, "_annotate_stale_queries") as mock_annotate,
+            patch.object(client, "_compact_history") as mock_compact,
+        ):
+            client._maybe_compact("short system prompt")
+        mock_dedup.assert_not_called()
+        mock_annotate.assert_not_called()
+        mock_compact.assert_not_called()
+
+    def test_dedup_called_over_budget(self):
+        """Dedup runs only once the budget is exceeded."""
+        client = _make_client(
+            context_tokens=100, compact_threshold=0.70, compact_target=0.40, keep_recent_turns=2
+        )
+        big_content = "x" * 400  # ~100 tokens each
+        client._history = [
+            _user(big_content),
+            _assistant(big_content),
+            _user(big_content),
+            _assistant(big_content),
+            _user(big_content),
+            _assistant(big_content),
+        ]
+        with (
+            patch.object(client, "_dedup_tool_calls") as mock_dedup,
+            patch.object(client, "_compact_history", return_value=True),
+            patch.object(client, "_annotate_stale_queries"),
         ):
             client._maybe_compact("system")
         mock_dedup.assert_called_once()
+
+    def test_dedup_can_avoid_compaction(self):
+        """Dedup alone can bring history back under budget — compact is skipped."""
+        client = _make_client(
+            context_tokens=200, compact_threshold=0.70, compact_target=0.40, keep_recent_turns=2
+        )
+        # ~270 estimated tokens: over the 140 budget. tc1's big tool result is a
+        # superseded duplicate of tc2, so dedup drops that whole turn.
+        client._history = [
+            _user("q1"),
+            _assistant(
+                "t1",
+                tool_calls=[
+                    {"id": "tc1", "function": {"name": "extract_netlist", "arguments": "{}"}}
+                ],
+            ),
+            _tool("tc1", "x" * 400),
+            _user("q2"),
+            _assistant(
+                "t2",
+                tool_calls=[
+                    {"id": "tc2", "function": {"name": "extract_netlist", "arguments": "{}"}}
+                ],
+            ),
+            _tool("tc2", "y" * 200),
+        ]
+        with (
+            patch.object(client, "_compact_history") as mock_compact,
+            patch.object(client, "_annotate_stale_queries") as mock_annotate,
+        ):
+            client._maybe_compact("system")
+        # tc1's turn was pruned, leaving ~120 tokens — back under budget
+        assert not any(m.get("tool_call_id") == "tc1" for m in client._history)
+        mock_compact.assert_not_called()
+        mock_annotate.assert_not_called()
+
+    def test_annotate_runs_after_compaction(self):
+        """Stale annotation runs after compaction, on the preserved turns only."""
+        client = _make_client(
+            context_tokens=100, compact_threshold=0.70, compact_target=0.40, keep_recent_turns=2
+        )
+        big_content = "x" * 400
+        client._history = [
+            _user(big_content),
+            _assistant(big_content),
+            _user(big_content),
+            _assistant(big_content),
+            _user(big_content),
+            _assistant(big_content),
+        ]
+        call_order: list[str] = []
+        with (
+            patch.object(client, "_compact_history", return_value=True) as mock_compact,
+            patch.object(client, "_annotate_stale_queries") as mock_annotate,
+        ):
+            mock_compact.side_effect = lambda *a, **k: call_order.append("compact")
+            mock_annotate.side_effect = lambda: call_order.append("annotate")
+            client._maybe_compact("system")
+        assert call_order == ["compact", "annotate"]
 
 
 # ---------------------------------------------------------------------------

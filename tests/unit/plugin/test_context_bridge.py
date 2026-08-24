@@ -15,7 +15,6 @@ class TestCollectContextNoPcbnew:
         assert ctx["active_project"] is None
         assert ctx["active_schematic"] is None
         assert ctx["active_pcb"] is None
-        assert ctx["selected_refs"] == []
         assert ctx["active_sheet"] is None
 
     def test_returns_dict(self):
@@ -27,11 +26,10 @@ class TestCollectContextNoPcbnew:
 class TestCollectContextWithPcbnew:
     """Tests for the pcbnew-available code path."""
 
-    def _make_mock_pcbnew(self, pcb_path=None, footprints=None):
+    def _make_mock_pcbnew(self, pcb_path=None):
         mock_pcbnew = MagicMock()
         mock_board = MagicMock()
         mock_board.GetFileName.return_value = pcb_path or ""
-        mock_board.GetFootprints.return_value = footprints or []
         mock_pcbnew.GetBoard.return_value = mock_board
         mock_pcbnew.GetCurrentFrame.return_value = None
         return mock_pcbnew
@@ -86,30 +84,6 @@ class TestCollectContextWithPcbnew:
 
         assert isinstance(ctx, dict)
 
-    def test_selected_refs_populated(self, tmp_path):
-        pcb = str(tmp_path / "test.kicad_pcb")
-        open(pcb, "w").close()
-
-        fp1 = MagicMock()
-        fp1.IsSelected.return_value = True
-        fp1.GetReference.return_value = "R1"
-
-        fp2 = MagicMock()
-        fp2.IsSelected.return_value = False
-
-        fp3 = MagicMock()
-        fp3.IsSelected.return_value = True
-        fp3.GetReference.return_value = "U1"
-
-        mock_pcbnew = self._make_mock_pcbnew(pcb_path=pcb, footprints=[fp1, fp2, fp3])
-
-        with patch("kicad_plugin.context_bridge._try_import_pcbnew", return_value=mock_pcbnew):
-            ctx = collect_context()
-
-        assert "R1" in ctx["selected_refs"]
-        assert "U1" in ctx["selected_refs"]
-        assert len(ctx["selected_refs"]) == 2
-
 
 class TestContextToSystemPromptBlock:
     def test_includes_active_project(self):
@@ -117,7 +91,6 @@ class TestContextToSystemPromptBlock:
             "active_project": "/proj/test.kicad_pro",
             "active_schematic": "/proj/test.kicad_sch",
             "active_pcb": None,
-            "selected_refs": ["R1", "C3"],
             "active_sheet": None,
         }
         block = context_to_system_prompt_block(ctx)
@@ -128,30 +101,16 @@ class TestContextToSystemPromptBlock:
             "active_project": None,
             "active_schematic": "/proj/test.kicad_sch",
             "active_pcb": None,
-            "selected_refs": [],
             "active_sheet": None,
         }
         block = context_to_system_prompt_block(ctx)
         assert "/proj/test.kicad_sch" in block
-
-    def test_includes_selected_refs(self):
-        ctx = {
-            "active_project": None,
-            "active_schematic": "/proj/test.kicad_sch",
-            "active_pcb": None,
-            "selected_refs": ["U1", "U2"],
-            "active_sheet": None,
-        }
-        block = context_to_system_prompt_block(ctx)
-        assert "U1" in block
-        assert "U2" in block
 
     def test_no_project_shows_none(self):
         ctx = {
             "active_project": None,
             "active_schematic": None,
             "active_pcb": None,
-            "selected_refs": [],
             "active_sheet": None,
         }
         block = context_to_system_prompt_block(ctx)
@@ -162,7 +121,6 @@ class TestContextToSystemPromptBlock:
             "active_project": None,
             "active_schematic": "/proj/board.kicad_sch",
             "active_pcb": None,
-            "selected_refs": [],
             "active_sheet": None,
         }
         block = context_to_system_prompt_block(ctx)
@@ -174,7 +132,6 @@ class TestContextToSystemPromptBlock:
             "active_project": None,
             "active_schematic": None,
             "active_pcb": None,
-            "selected_refs": [],
             "active_sheet": None,
         }
         block = context_to_system_prompt_block(ctx)
@@ -185,7 +142,6 @@ class TestContextToSystemPromptBlock:
             "active_project": None,
             "active_schematic": None,
             "active_pcb": None,
-            "selected_refs": [],
             "active_sheet": None,
         }
         assert isinstance(context_to_system_prompt_block(ctx), str)
@@ -196,7 +152,6 @@ class TestContextToSystemPromptBlock:
             "active_project": None,
             "active_schematic": None,
             "active_pcb": pcb,
-            "selected_refs": [],
             "active_sheet": None,
         }
         block = context_to_system_prompt_block(ctx)
@@ -208,7 +163,6 @@ class TestContextToSystemPromptBlock:
             "active_project": None,
             "active_schematic": "/proj/board.kicad_sch",
             "active_pcb": None,
-            "selected_refs": [],
             "active_sheet": None,
         }
         block = context_to_system_prompt_block(ctx)
