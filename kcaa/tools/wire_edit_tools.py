@@ -4,6 +4,7 @@ Provides tools to draw, list, and delete wire segments and junction dots
 in KiCad schematics using the skip library.
 """
 
+from collections.abc import Sequence
 import json
 import logging
 import math
@@ -154,6 +155,43 @@ def _route_check_failures(
     return fails
 
 
+def _route_lanes(
+    x1: float,
+    x2: float,
+    delta: float = 0.635,
+    n_anchors: int = 8,
+    n_offsets: int = 2,
+) -> list[float]:
+    """Ordered lane positions inside the open span between x1 and x2.
+
+    Direction-independent: works with x2 < x1 (a downwards/leftwards run).
+    The evenly spaced anchors come first (kept from the original 8th
+    fractions), then each anchor perturbed by ±k·*delta* (k=1..n_offsets)
+    so a blocked anchor can be escaped by a small local move instead of
+    jumping to a distant lane.  Values outside the span are clipped away
+    and duplicates removed.  n_offsets=0 returns plain anchors.
+    """
+    if abs(x2 - x1) <= 1e-9:
+        return []
+    span_lo, span_hi = min(x1, x2), max(x1, x2)
+    lanes: list[float] = []
+    seen: set[float] = set()
+
+    def _add(v: float) -> None:
+        r = round(v, 4)
+        if span_lo < r < span_hi and r not in seen:
+            seen.add(r)
+            lanes.append(r)
+
+    for k in range(1, n_anchors):
+        a = span_lo + (span_hi - span_lo) * k / n_anchors
+        _add(a)
+        for kd in range(1, n_offsets + 1):
+            _add(a - kd * delta)
+            _add(a + kd * delta)
+    return lanes
+
+
 def _route_candidates(
     x1: float,
     y1: float,
@@ -169,10 +207,18 @@ def _route_candidates(
       1. Direct (1 segment) — only when points are axis-aligned.
       2. L-A: horizontal-first via corner (x2, y1).
       3. L-B: vertical-first via corner (x1, y2).
-      4-10.  7 horizontal Z-routes: jog at x = x1 + k*(x2−x1)/8 for k=1..7.
-      11-17. 7 vertical Z-routes:   jog at y = y1 + k*(y2−y1)/8 for k=1..7.
-      18-29. U-detours for the collinear case (same axis, direct route blocked):
-             jog ±2.54, ±5.08, ±7.62 mm perpendicular, crossing full span, then back.
+      4-79.  Horizontal Z-routes: jog the vertical column to every lane x
+             (8 anchors + ±0.635/±1.27 micro-offsets).
+      80-155. Vertical Z-routes: jog the horizontal row to every lane y.
+      156-253. 4-seg W-routes (H-V-H-V / V-H-V-H) on the 8 anchors, so the
+             middle vertical can stop short of the far edge and dodge a
+             wall in the terminal column.
+      254-547. 5-seg snakes (H-V-H-V-H / V-H-V-H-V) on the 8 anchors: the
+             two jogs (xa, xb) / (ya, yb) are independent, letting the
+             final stub on the endpoint row stay short and clean.
+      548+.  U-detours for the collinear case (same axis, direct route
+             blocked): jog ±2.54, ±5.08, ±7.62 mm perpendicular, crossing
+             full span, then back.
     """
     candidates: list[list[tuple[float, float, float, float]]] = []
     dx = x2 - x1
@@ -189,9 +235,11 @@ def _route_candidates(
     candidates.append([(x1, y1, x1, y2), (x1, y2, x2, y2)])
 
     if abs(dx) > 1e-9 and abs(dy) > 1e-9:
-        # Horizontal Z-routes: jog the vertical column to a fractional x
-        for k in range(1, 8):
-            xj = x1 + dx * k / 8.0
+        xlanes = _route_lanes(x1, x2)
+        ylanes = _route_lanes(y1, y2)
+
+        # Horizontal Z-routes: jog the vertical column to a lane x
+        for xj in xlanes:
             candidates.append(
                 [
                     (x1, y1, xj, y1),
@@ -199,9 +247,8 @@ def _route_candidates(
                     (xj, y2, x2, y2),
                 ]
             )
-        # Vertical Z-routes: jog the horizontal row to a fractional y
-        for k in range(1, 8):
-            yj = y1 + dy * k / 8.0
+        # Vertical Z-routes: jog the horizontal row to a lane y
+        for yj in ylanes:
             candidates.append(
                 [
                     (x1, y1, x1, yj),
@@ -209,6 +256,60 @@ def _route_candidates(
                     (x2, yj, x2, y2),
                 ]
             )
+
+        # 4-seg W-routes: the middle vertical stops at a lane y instead of
+        # crossing the full span, so the last run is on the terminal column
+        # only (escapes a wall sitting on the start/end columns).
+        x_anchors = _route_lanes(x1, x2, n_offsets=0)
+        y_anchors = _route_lanes(y1, y2, n_offsets=0)
+        for xa in x_anchors:
+            for yw in y_anchors:
+                candidates.append(
+                    [
+                        (x1, y1, xa, y1),
+                        (xa, y1, xa, yw),
+                        (xa, yw, x2, yw),
+                        (x2, yw, x2, y2),
+                    ]
+                )
+        for ya in y_anchors:
+            for xw in x_anchors:
+                candidates.append(
+                    [
+                        (x1, y1, x1, ya),
+                        (x1, ya, xw, ya),
+                        (xw, ya, xw, y2),
+                        (xw, y2, x2, y2),
+                    ]
+                )
+
+        # 5-seg snakes: two independent jogs let the final stub on the
+        # endpoint row stay short (e.g. land left of a stub starting right
+        # at the pin instead of crossing it).
+        for i, xa in enumerate(x_anchors):
+            for xb in x_anchors[i + 1 :]:
+                for yw in y_anchors:
+                    candidates.append(
+                        [
+                            (x1, y1, xa, y1),
+                            (xa, y1, xa, yw),
+                            (xa, yw, xb, yw),
+                            (xb, yw, xb, y2),
+                            (xb, y2, x2, y2),
+                        ]
+                    )
+        for i, ya in enumerate(y_anchors):
+            for yb in y_anchors[i + 1 :]:
+                for xw in x_anchors:
+                    candidates.append(
+                        [
+                            (x1, y1, x1, ya),
+                            (x1, ya, xw, ya),
+                            (xw, ya, xw, yb),
+                            (xw, yb, x2, yb),
+                            (x2, yb, x2, y2),
+                        ]
+                    )
 
     # U-detours: used when the direct axis-aligned route is blocked by an
     # existing wire.  Jog perpendicular to the connecting axis by multiples
@@ -523,7 +624,7 @@ def _try_angle_config(
     ea: float | None,
     existing_wires: list[tuple[float, float, float, float]],
     obstacles: list[tuple[float, float]],
-    lead_out_dist: float,
+    lead_lengths: Sequence[float],
     start_natural: float | None = None,
     end_natural: float | None = None,
     diag: dict[str, Any] | None = None,
@@ -535,13 +636,18 @@ def _try_angle_config(
     * If the lead segment overlaps an existing wire: suppress the segment,
       advance the inner endpoint to the far end of the wire chain
       (T-tap mode), and mark as suppressed so a junction is placed later.
-    * If a component pin blocks the lead segment: return None — this angle
-      direction is unusable, try the next one.
+    * If a component pin blocks the lead segment at every tried length:
+      return None — this angle direction is unusable, try the next one.
     * If the lead direction is exactly opposite to the pin's natural exit
       angle and does not follow an existing wire: return None — this
       direction routes into the component body (e.g. through a GND triangle).
-    * Otherwise: emit the lead segment and place the inner endpoint at the
-      lead tip.
+    * Otherwise: emit the lead segment at the shortest tried length whose
+      tip is not blocked, and place the inner endpoint at that tip.
+
+    ``lead_lengths`` is tried in order; the first entry is the anchor
+    (caller-disrupting) length and remaining entries are fallbacks tried
+    only when a longer lead is blocked by a pin, keeping the exit point
+    as close to the anchor as possible.
     None for an angle means no lead-out from that endpoint (route directly
     from the pin position).
 
@@ -563,20 +669,24 @@ def _try_angle_config(
     route passes the collision / overlap checks.
     """
     # --- start lead ---
+    dvsx = dvsy = 0.0
     if sa is not None:
-        dvx, dvy = _dir_vec(sa)
-        p1x = round(sx + dvx * lead_out_dist, 4)
-        p1y = round(sy + dvy * lead_out_dist, 4)
-    else:
-        p1x, p1y = sx, sy
+        dvsx, dvsy = _dir_vec(sa)
 
+    p1x, p1y = sx, sy
     start_lead: list[tuple[float, float, float, float]] = []
     start_suppressed = False
-    if sa is not None and (abs(p1x - sx) > 1e-9 or abs(p1y - sy) > 1e-9):
-        seg = (sx, sy, p1x, p1y)
-        if _route_overlaps_wires([seg], existing_wires, _PIN_COLLISION_TOL):
+    cur_sl: float | None = None  # lead length actually used (for diagnostics)
+    if sa is not None:
+        # Angle-level gates are length-independent: evaluated once at the
+        # anchor length (T-tap absorbs any lead into the followed chain;
+        # opposite-natural rejects the direction outright).
+        anchor = lead_lengths[0]
+        seg_anchor = (sx, sy, round(sx + dvsx * anchor, 4), round(sy + dvsy * anchor, 4))
+        if _route_overlaps_wires([seg_anchor], existing_wires, _PIN_COLLISION_TOL):
             p1x, p1y = _follow_wire_extent(sx, sy, sa, existing_wires, _PIN_COLLISION_TOL)
             start_suppressed = True
+            cur_sl = anchor
             if diag is not None:
                 diag["start_lead"] = "t-tap"
         elif (
@@ -585,48 +695,74 @@ def _try_angle_config(
             if diag is not None:
                 diag["start_lead"] = "opposite-natural"
             return None  # lead goes into component body (opposite to natural exit)
-        elif _route_collides([seg], obstacles, _PIN_COLLISION_TOL) or any(
-            abs(p1x - ox) <= _PIN_COLLISION_TOL and abs(p1y - oy) <= _PIN_COLLISION_TOL
-            for ox, oy in obstacles
-        ):
-            if diag is not None:
-                diag["start_lead"] = "pin-blocked"
-            return None  # direction blocked by a component pin
         else:
-            start_lead = [seg]
+            # Only the tip position depends on the length: try the anchor
+            # first, then shorter/longer leads only when a length is blocked,
+            # so the exit point is disrupted as little as possible.
+            found = False
+            for length in lead_lengths:
+                tip = (round(sx + dvsx * length, 4), round(sy + dvsy * length, 4))
+                seg = (sx, sy, tip[0], tip[1])
+                if _route_collides([seg], obstacles, _PIN_COLLISION_TOL) or any(
+                    abs(tip[0] - ox) <= _PIN_COLLISION_TOL
+                    and abs(tip[1] - oy) <= _PIN_COLLISION_TOL
+                    for ox, oy in obstacles
+                ):
+                    continue  # lead blocked at this length; try a neighbour
+                p1x, p1y = tip
+                start_lead = [seg]
+                cur_sl = length
+                found = True
+                break
+            if not found:
+                if diag is not None:
+                    diag["start_lead"] = "pin-blocked"
+                return None  # every lead length blocked by a component pin
             if diag is not None:
                 diag["start_lead"] = "ok"
 
     # --- end lead ---
+    dvex = dvey = 0.0
     if ea is not None:
-        dvx, dvy = _dir_vec(ea)
-        p2x = round(ex + dvx * lead_out_dist, 4)
-        p2y = round(ey + dvy * lead_out_dist, 4)
-    else:
-        p2x, p2y = ex, ey
+        dvex, dvey = _dir_vec(ea)
 
+    p2x, p2y = ex, ey
     end_lead: list[tuple[float, float, float, float]] = []
     end_suppressed = False
-    if ea is not None and (abs(p2x - ex) > 1e-9 or abs(p2y - ey) > 1e-9):
-        seg = (ex, ey, p2x, p2y)
-        if _route_overlaps_wires([seg], existing_wires, _PIN_COLLISION_TOL):
+    cur_el: float | None = None  # end lead length actually used
+    if ea is not None:
+        anchor = lead_lengths[0]
+        seg_anchor = (ex, ey, round(ex + dvex * anchor, 4), round(ey + dvey * anchor, 4))
+        if _route_overlaps_wires([seg_anchor], existing_wires, _PIN_COLLISION_TOL):
             p2x, p2y = _follow_wire_extent(ex, ey, ea, existing_wires, _PIN_COLLISION_TOL)
             end_suppressed = True
+            cur_el = anchor
             if diag is not None:
                 diag["end_lead"] = "t-tap"
         elif end_natural is not None and abs((ea - (end_natural + 180.0) % 360.0) % 360.0) < 1e-9:
             if diag is not None:
                 diag["end_lead"] = "opposite-natural"
             return None  # lead goes into component body (opposite to natural exit)
-        elif _route_collides([seg], obstacles, _PIN_COLLISION_TOL) or any(
-            abs(p2x - ox) <= _PIN_COLLISION_TOL and abs(p2y - oy) <= _PIN_COLLISION_TOL
-            for ox, oy in obstacles
-        ):
-            if diag is not None:
-                diag["end_lead"] = "pin-blocked"
-            return None  # direction blocked by a component pin
         else:
-            end_lead = [(p2x, p2y, ex, ey)]  # reversed: inner→pin
+            found = False
+            for length in lead_lengths:
+                tip = (round(ex + dvex * length, 4), round(ey + dvey * length, 4))
+                seg = (ex, ey, tip[0], tip[1])
+                if _route_collides([seg], obstacles, _PIN_COLLISION_TOL) or any(
+                    abs(tip[0] - ox) <= _PIN_COLLISION_TOL
+                    and abs(tip[1] - oy) <= _PIN_COLLISION_TOL
+                    for ox, oy in obstacles
+                ):
+                    continue
+                p2x, p2y = tip
+                end_lead = [(p2x, p2y, ex, ey)]  # reversed: inner→pin
+                cur_el = length
+                found = True
+                break
+            if not found:
+                if diag is not None:
+                    diag["end_lead"] = "pin-blocked"
+                return None  # every lead length blocked by a component pin
             if diag is not None:
                 diag["end_lead"] = "ok"
 
@@ -654,7 +790,11 @@ def _try_angle_config(
             )
         if diag is not None:
             diag.setdefault("rejected_candidates", []).append(
-                {"segments": [list(s) for s in all_segs], "reasons": fails}
+                {
+                    "segments": [list(s) for s in all_segs],
+                    "reasons": fails,
+                    "lead": [cur_sl, cur_el],
+                }
             )
     return None
 
@@ -807,59 +947,83 @@ def _draw_smart_wire(
     # relaxes both endpoints together rather than exhausting all end angles
     # for one start angle before moving to the next start angle.
     result: _RouteConfig | None = None
+    succeeded_stage: str | None = None
     from kcaa.utils.config import config
 
+    # Two-stage exploration.  Stage 1 tries every angle pair at the anchor
+    # lead length only — bit-identical to previous behaviour whenever it
+    # succeeds.  Stage 2 repeats with neighbourhood lengths, so lead length
+    # changes are purely conflict-driven and never explored while an
+    # anchor-length route exists.  Candidate shapes (including micro-adjusted
+    # jog lanes) are the same for every angle pair in both stages.
+    delta = lead_out_dist / 4.0  # 0.635 mm for the default 2.54 anchor
+    lead_neighbourhood = sorted(
+        {round(lead_out_dist + k * delta, 4) for k in range(-3, 5)},
+        key=lambda length: (abs(length - lead_out_dist), length),
+    )
+    lead_neighbourhood = [length for length in lead_neighbourhood if length > 0]
+    stages: list[tuple[str, list[float]]] = [
+        ("s1", [lead_out_dist]),
+        ("s2", lead_neighbourhood),
+    ]
+
     max_rank = len(_start_angles) + len(_end_angles) - 2
-    for rank_sum in range(max_rank + 1):
-        for si in range(min(rank_sum + 1, len(_start_angles))):
-            ei = rank_sum - si
-            if ei < 0 or ei >= len(_end_angles):
-                continue
-            sa = _start_angles[si]
-            ea = _end_angles[ei]
-            diag: dict[str, Any] | None = {} if config.viz_dump_enabled else None
-            result = _try_angle_config(
-                sx,
-                sy,
-                ex,
-                ey,
-                sa,
-                ea,
-                existing_wires,
-                obstacles,
-                lead_out_dist,
-                start_natural=start_angle,
-                end_natural=end_angle,
-                diag=diag,
-            )
-            if result is not None:
+    for stage_name, lead_lengths in stages:
+        for rank_sum in range(max_rank + 1):
+            for si in range(min(rank_sum + 1, len(_start_angles))):
+                ei = rank_sum - si
+                if ei < 0 or ei >= len(_end_angles):
+                    continue
+                sa = _start_angles[si]
+                ea = _end_angles[ei]
+                diag: dict[str, Any] | None = {} if config.viz_dump_enabled else None
+                result = _try_angle_config(
+                    sx,
+                    sy,
+                    ex,
+                    ey,
+                    sa,
+                    ea,
+                    existing_wires,
+                    obstacles,
+                    lead_lengths,
+                    start_natural=start_angle,
+                    end_natural=end_angle,
+                    diag=diag,
+                )
+                pair_name = f"{stage_name}-pair-sa{int(sa)}-ea{int(ea)}"
+                if result is not None:
+                    succeeded_stage = stage_name
+                    try:
+                        _dump_viz_schematic(
+                            pair_name,
+                            segments=_config_from_result(result),
+                            pins=obstacles,
+                            wires=existing_wires,
+                            candidates=diag.get("rejected_candidates") if diag else None,
+                            notes=f"stage={stage_name} valid",
+                        )
+                    except Exception:
+                        log.warning("[viz] failed to dump pair %s", pair_name, exc_info=True)
+                    break
                 try:
                     _dump_viz_schematic(
-                        f"pair-sa{int(sa)}-ea{int(ea)}",
-                        segments=_config_from_result(result),
+                        pair_name,
+                        segments=None,
                         pins=obstacles,
                         wires=existing_wires,
                         candidates=diag.get("rejected_candidates") if diag else None,
-                        notes="valid",
+                        notes=(
+                            f"stage={stage_name} lead start={diag.get('start_lead')} "
+                            f"end={diag.get('end_lead')}"
+                            if diag
+                            else f"stage={stage_name}"
+                        ),
                     )
                 except Exception:
-                    log.warning("[viz] failed to dump pair %s", int(sa), exc_info=True)
+                    log.warning("[viz] failed to dump pair %s", pair_name, exc_info=True)
+            if result is not None:
                 break
-            try:
-                _dump_viz_schematic(
-                    f"pair-sa{int(sa)}-ea{int(ea)}",
-                    segments=None,
-                    pins=obstacles,
-                    wires=existing_wires,
-                    candidates=diag.get("rejected_candidates") if diag else None,
-                    notes=(
-                        f"lead start={diag.get('start_lead')} end={diag.get('end_lead')}"
-                        if diag
-                        else ""
-                    ),
-                )
-            except Exception:
-                log.warning("[viz] failed to dump pair %s", int(sa), exc_info=True)
         if result is not None:
             break
 
@@ -870,7 +1034,10 @@ def _draw_smart_wire(
                 segments=None,
                 pins=obstacles,
                 wires=existing_wires,
-                notes=(f"no route after {len(_start_angles) * len(_end_angles)} angle pairs tried"),
+                notes=(
+                    f"no route after {len(stages)} stages x "
+                    f"{len(_start_angles) * len(_end_angles)} angle pairs tried"
+                ),
             )
         except Exception:
             log.warning("[viz] failed to dump 7-failed", exc_info=True)
@@ -910,7 +1077,7 @@ def _draw_smart_wire(
             segments=all_draw,
             pins=obstacles,
             wires=existing_wires,
-            notes="route drawn",
+            notes=f"stage={succeeded_stage} route drawn",
         )
     except Exception:
         log.warning("[viz] failed to dump 7-final", exc_info=True)
