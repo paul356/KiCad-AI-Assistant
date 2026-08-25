@@ -5,6 +5,26 @@ on:
     branches: [ main, develop ]
 
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    name: Detect Changed Paths
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+      pyproject: ${{ steps.filter.outputs.pyproject }}
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dorny/paths-filter@v3
+      id: filter
+      with:
+        filters: |
+          code:
+            - 'kcaa/**'
+            - 'kicad_plugin/**'
+            - 'tests/**'
+            - 'uv.lock'
+          pyproject:
+            - 'pyproject.toml'
+
   lint:
     runs-on: ubuntu-latest
     name: Lint and Format
@@ -34,6 +54,8 @@ jobs:
   test:
     runs-on: ubuntu-latest
     name: Test Python 3.13
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     env:
       KICAD_VERSION: "10"
 
@@ -73,6 +95,8 @@ jobs:
   security:
     runs-on: ubuntu-latest
     name: Security Scan
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
 
     steps:
     - uses: actions/checkout@v4
@@ -96,6 +120,8 @@ jobs:
   test-windows:
     runs-on: windows-latest
     name: Test Windows (integration)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     env:
       KICAD_MCP_PROFILE: "plugin"
       KICAD_VERSION: "10"
@@ -130,7 +156,11 @@ jobs:
   build:
     runs-on: ubuntu-latest
     name: Build Package
-    needs: [lint, test]
+    needs: [lint, test, changes]
+    # Run when code OR pyproject.toml (e.g. version bump) changed; do not run
+    # when a prerequisite failed, but do run when test was skipped
+    # (pyproject-only PRs still validate packaging metadata).
+    if: (needs.changes.outputs.code == 'true' || needs.changes.outputs.pyproject == 'true') && needs.lint.result != 'failure' && needs.test.result != 'failure'
 
     steps:
     - uses: actions/checkout@v4
