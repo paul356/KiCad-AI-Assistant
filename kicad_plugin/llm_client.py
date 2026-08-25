@@ -1237,13 +1237,18 @@ class LLMClient:
 
         self._emit_tool_callback(on_tool_call, tool_name, args, result)
 
+        # Mark the path dirty even when the tool call fails: a failed edit may
+        # still have partially modified the file (e.g. IPC routing tools), so
+        # the end-of-turn reload must still run — keeping the actual refresh
+        # consistent with the UI's refresh entry.
+        if policy.mark_dirty and path:
+            state.dirty_paths.add(path)
+
         if not self._tool_result_succeeded(result):
             return result
 
         if policy.track_snapshot and path:
             state.snapshotted_paths.add(path)
-        if policy.mark_dirty and path:
-            state.dirty_paths.add(path)
         if policy.clear_dirty_paths_arg:
             reload_paths = args.get(policy.clear_dirty_paths_arg, [])
             if isinstance(reload_paths, list):
@@ -1310,60 +1315,79 @@ class LLMClient:
             )
 
         state = _ToolExecutionState()
+        reply: str | None = None
+        is_final_text = False
 
-        for _ in range(20):  # max 20 iterations (guard against infinite loops)
-            response = self._call_llm(system, tools, on_text_delta=on_text_delta)
+        try:
+            for _ in range(20):  # max 20 iterations (guard against infinite loops)
+                response = self._call_llm(system, tools, on_text_delta=on_text_delta)
 
-            if response.get("error"):
-                return f"[LLM error] {response['error']}"
+                if response.get("error"):
+                    reply = f"[LLM error] {response['error']}"
+                    break
 
-            message = response.get("message", {})
-            tool_calls = message.get("tool_calls") or []
+                message = response.get("message", {})
+                tool_calls = message.get("tool_calls") or []
 
-            if not tool_calls:
-                # Final text response
-                text = message.get("content") or ""
-                reload_warning = self._auto_reload_modified_files(state, on_tool_call)
-                if reload_warning:
-                    text = (
-                        f"{text}\n\n[Framework warning] {reload_warning}"
-                        if text
-                        else f"[Framework warning] {reload_warning}"
+                if not tool_calls:
+                    # Final text response
+                    reply = message.get("content") or ""
+                    is_final_text = True
+                    break
+
+                # Execute tool calls
+                # Save message, preserving thinking content for DeepSeek models
+                msg_to_save = {"role": "assistant"}
+                if message.get("content"):
+                    msg_to_save["content"] = message["content"]
+                if message.get("reasoning_content"):
+                    msg_to_save["reasoning_content"] = message["reasoning_content"]
+                if message.get("tool_calls"):
+                    msg_to_save["tool_calls"] = message["tool_calls"]
+                self._history.append(msg_to_save)
+                tool_results = []
+                for tc in tool_calls:
+                    name = tc["function"]["name"]
+                    try:
+                        args = json.loads(tc["function"].get("arguments", "{}"))
+                    except json.JSONDecodeError:
+                        args = {}
+
+                    result = self._execute_tool_with_policy(name, args, state, on_tool_call)
+
+                    tool_results.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tc["id"],
+                            "content": json.dumps(result),
+                        }
                     )
-                self._history.append({"role": "assistant", "content": text})
-                return text
 
-            # Execute tool calls
-            # Save message, preserving thinking content for DeepSeek models
-            msg_to_save = {"role": "assistant"}
-            if message.get("content"):
-                msg_to_save["content"] = message["content"]
-            if message.get("reasoning_content"):
-                msg_to_save["reasoning_content"] = message["reasoning_content"]
-            if message.get("tool_calls"):
-                msg_to_save["tool_calls"] = message["tool_calls"]
-            self._history.append(msg_to_save)
-            tool_results = []
-            for tc in tool_calls:
-                name = tc["function"]["name"]
-                try:
-                    args = json.loads(tc["function"].get("arguments", "{}"))
-                except json.JSONDecodeError:
-                    args = {}
-
-                result = self._execute_tool_with_policy(name, args, state, on_tool_call)
-
-                tool_results.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tc["id"],
-                        "content": json.dumps(result),
-                    }
+                self._history.extend(tool_results)
+            else:
+                reply = (
+                    "[Error] Maximum tool-call iterations reached. Please try a simpler request."
+                )
+        finally:
+            # Single shared flush for every exit path (final reply, LLM error,
+            # iteration cap, or an escaping exception): keep the KiCad reload in
+            # sync with the UI refresh display even when tools or the LLM failed.
+            # Wrapped so a reload failure can never mask the turn's own result.
+            try:
+                reload_warning = self._auto_reload_modified_files(state, on_tool_call)
+            except Exception as e:
+                log.warning("Auto-reload at end of turn failed: %s", e)
+                reload_warning = None
+            if reload_warning and reply is not None:
+                reply = (
+                    f"{reply}\n\n[Framework warning] {reload_warning}"
+                    if reply
+                    else f"[Framework warning] {reload_warning}"
                 )
 
-            self._history.extend(tool_results)
-
-        return "[Error] Maximum tool-call iterations reached. Please try a simpler request."
+        if is_final_text:
+            self._history.append({"role": "assistant", "content": reply})
+        return reply if reply is not None else "[Error] Unknown failure."
 
     @staticmethod
     def _build_user_content(
