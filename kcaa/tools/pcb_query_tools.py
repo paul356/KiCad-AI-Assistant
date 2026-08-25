@@ -24,7 +24,7 @@ from kcaa.tools.pcb_placement_helpers import (
     _get_board_bounds_or_fallback,
     _get_fp_pads_world,
 )
-from kcaa.utils.pcb_board_utils import get_fp_courtyard_bbox
+from kcaa.utils.pcb_board_utils import get_fp_courtyard_bbox, get_fp_edge_cuts_items
 from kcaa.utils.pcb_footprint_utils import (
     _sym,
     find_footprint,
@@ -265,7 +265,10 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
             dict with reference, value, x/y/rotation (world, mm/deg CW+),
             layer, properties (dict of all property name→value), pads
             (list of {number, type, shape, local_x, local_y,
-             local_w, local_h, world_w, world_h, net_name}).
+             local_w, local_h, world_w, world_h, net_name}),
+             edge_cuts (list of fp_line/fp_rect/fp_arc/fp_circle/fp_curve
+             items on the footprint's Edge.Cuts layer, in footprint-local
+             mm; transform to world coordinates the same way as pads).
              ``world_w``/``world_h`` account for pad rotation (KiCad 10
              stores pad rotation as absolute board-space CW+).
         """
@@ -337,6 +340,7 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
             "layer": layer,
             "properties": props,
             "pads": pads,
+            "edge_cuts": get_fp_edge_cuts_items(fp),
         }
 
     @mcp.tool()

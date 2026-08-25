@@ -16,6 +16,7 @@ from typing import Any
 import sexpdata
 
 from kcaa.utils.config import ServerConfig
+from kcaa.utils.pcb_board_utils import get_fp_edge_cuts_items
 
 log = logging.getLogger(__name__)
 
@@ -272,6 +273,7 @@ def parse_kicad_mod(path: str) -> dict[str, Any]:
         "has_3d_model": False,
         "pads": [],
         "courtyard_bbox": None,
+        "edge_cuts": [],
     }
 
     try:
@@ -317,6 +319,8 @@ def parse_kicad_mod(path: str) -> dict[str, Any]:
             "max_x": max(xs),
             "max_y": max(ys),
         }
+
+    result["edge_cuts"] = get_fp_edge_cuts_items(data)
 
     return result
 
