@@ -13,6 +13,7 @@ from kcaa.utils.pcb_board_utils import (
     add_gr_rect,
     get_edge_cuts_items,
     get_fp_courtyard_bbox,
+    get_fp_edge_cuts_items,
     remove_edge_cuts_items,
 )
 from kcaa.utils.pcb_sexp_utils import load_pcb
@@ -330,3 +331,185 @@ class TestGetFpCourtyardBbox:
         s = sx.Symbol
         fp = [s("footprint"), "TestLib:R", [s("at"), 0.0, 0.0, 0.0], [s("layer"), "F.Cu"]]
         assert get_fp_courtyard_bbox(fp, 0.0, 0.0, 0.0) is None
+
+
+# ---------------------------------------------------------------------------
+# get_fp_edge_cuts_items
+# ---------------------------------------------------------------------------
+
+
+class TestGetFpEdgeCutsItems:
+    def _fp_node(self):
+        """A footprint node with fp graphics on several layers."""
+        import sexpdata as sx
+
+        s = sx.Symbol
+        return [
+            s("footprint"),
+            "TestLib:EC",
+            [s("at"), 0.0, 0.0, 0.0],
+            [s("layer"), "F.Cu"],
+            [
+                s("fp_line"),
+                [s("start"), -1.0, 0.5],
+                [s("end"), 1.5, -0.5],
+                [s("stroke"), [s("width"), 0.1], [s("type"), s("solid")]],
+                [s("layer"), "Edge.Cuts"],
+            ],
+            [
+                s("fp_arc"),
+                [s("start"), 0.0, 0.0],
+                [s("mid"), 1.0, 1.0],
+                [s("end"), 2.0, 0.0],
+                [s("stroke"), [s("width"), 0.2]],
+                [s("layer"), "Edge.Cuts"],
+            ],
+            [
+                s("fp_rect"),
+                [s("start"), 0.0, 0.0],
+                [s("end"), 3.0, 4.0],
+                [s("stroke"), [s("width"), 0.05]],
+                [s("layer"), "Edge.Cuts"],
+            ],
+            [
+                s("fp_circle"),
+                [s("center"), 5.0, 5.0],
+                [s("end"), 6.0, 5.0],
+                [s("stroke"), [s("width"), 0.3]],
+                [s("layer"), "Edge.Cuts"],
+            ],
+            [
+                s("fp_curve"),
+                [s("pts"), [s("xy"), 0.0, 0.0], [s("xy"), 1.0, 2.0], [s("xy"), 2.0, 0.0]],
+                [s("stroke"), [s("width"), 0.15]],
+                [s("layer"), "Edge.Cuts"],
+            ],
+            # Must be ignored: courtyard layer, plain line layer
+            [
+                s("fp_line"),
+                [s("start"), 0.0, 0.0],
+                [s("end"), 10.0, 10.0],
+                [s("layer"), "F.CrtYd"],
+                [s("width"), 0.05],
+            ],
+            [
+                s("fp_line"),
+                [s("start"), 0.0, 0.0],
+                [s("end"), 1.0, 1.0],
+                [s("layer"), "F.SilkS"],
+                [s("width"), 0.05],
+            ],
+            # Must be ignored: pads
+            [
+                s("pad"),
+                "1",
+                s("smd"),
+                s("rect"),
+                [s("at"), 0.0, 0.0, 0.0],
+                [s("size"), 1.0, 1.0],
+                [s("layer"), "F.Cu"],
+            ],
+        ]
+
+    def test_parses_all_fp_types(self):
+        items = get_fp_edge_cuts_items(self._fp_node())
+        assert [i["type"] for i in items] == [
+            "fp_line",
+            "fp_arc",
+            "fp_rect",
+            "fp_circle",
+            "fp_curve",
+        ]
+
+    def test_line_geometry(self):
+        item = get_fp_edge_cuts_items(self._fp_node())[0]
+        assert item["x1"] == pytest.approx(-1.0)
+        assert item["y1"] == pytest.approx(0.5)
+        assert item["x2"] == pytest.approx(1.5)
+        assert item["y2"] == pytest.approx(-0.5)
+        assert item["width"] == pytest.approx(0.1)
+        assert item["layer"] == "Edge.Cuts"
+
+    def test_arc_geometry(self):
+        item = get_fp_edge_cuts_items(self._fp_node())[1]
+        assert item["start_x"] == pytest.approx(0.0)
+        assert item["start_y"] == pytest.approx(0.0)
+        assert item["mid_x"] == pytest.approx(1.0)
+        assert item["mid_y"] == pytest.approx(1.0)
+        assert item["end_x"] == pytest.approx(2.0)
+        assert item["end_y"] == pytest.approx(0.0)
+        assert item["width"] == pytest.approx(0.2)
+
+    def test_rect_geometry(self):
+        item = get_fp_edge_cuts_items(self._fp_node())[2]
+        assert item["x2"] == pytest.approx(3.0)
+        assert item["y2"] == pytest.approx(4.0)
+
+    def test_circle_geometry(self):
+        item = get_fp_edge_cuts_items(self._fp_node())[3]
+        assert item["cx"] == pytest.approx(5.0)
+        assert item["cy"] == pytest.approx(5.0)
+        assert item["ex"] == pytest.approx(6.0)
+        assert item["ey"] == pytest.approx(5.0)
+        assert item["width"] == pytest.approx(0.3)
+
+    def test_curve_pts(self):
+        item = get_fp_edge_cuts_items(self._fp_node())[4]
+        assert item["pts"] == [(0.0, 0.0), (1.0, 2.0), (2.0, 0.0)]
+        assert item["width"] == pytest.approx(0.15)
+
+    def test_ignores_non_edge_cuts_layers_and_pads(self):
+        items = get_fp_edge_cuts_items(self._fp_node())
+        assert len(items) == 5
+        assert all(i["layer"] == "Edge.Cuts" for i in items)
+
+    def test_empty_without_edge_cuts(self):
+        import sexpdata as sx
+
+        s = sx.Symbol
+        fp = [
+            s("footprint"),
+            "TestLib:Plain",
+            [
+                s("fp_line"),
+                [s("start"), 0.0, 0.0],
+                [s("end"), 1.0, 1.0],
+                [s("layer"), "F.SilkS"],
+                [s("width"), 0.05],
+            ],
+        ]
+        assert get_fp_edge_cuts_items(fp) == []
+
+    def test_legacy_edge_cuts_layer_name(self):
+        import sexpdata as sx
+
+        s = sx.Symbol
+        fp = [
+            [
+                s("fp_line"),
+                [s("start"), 0.0, 0.0],
+                [s("end"), 2.0, 0.0],
+                [s("layer"), "Edge_Cuts"],
+                [s("width"), 0.1],
+            ],
+        ]
+        items = get_fp_edge_cuts_items(fp)
+        assert len(items) == 1
+        assert items[0]["layer"] == "Edge_Cuts"
+
+    def test_bare_width_node_supported(self):
+        """Legacy fp_line with a direct (width ...) child still yields width."""
+        import sexpdata as sx
+
+        s = sx.Symbol
+        fp = [
+            [
+                s("fp_line"),
+                [s("start"), 0.0, 0.0],
+                [s("end"), 1.0, 1.0],
+                [s("layer"), "Edge.Cuts"],
+                [s("width"), 0.07],
+            ],
+        ]
+        item = get_fp_edge_cuts_items(fp)[0]
+        assert item["width"] == pytest.approx(0.07)

@@ -108,6 +108,51 @@ class TestParseKicadModAttr:
 
 
 # ---------------------------------------------------------------------------
+# parse_kicad_mod — edge_cuts
+# ---------------------------------------------------------------------------
+
+
+class TestParseKicadModEdgeCuts:
+    def test_empty_by_default(self):
+        info = parse_kicad_mod(TEST_MOD)
+        assert info["edge_cuts"] == []
+
+    def test_parses_edge_cuts_lines(self, tmp_path):
+        mod = tmp_path / "EC.kicad_mod"
+        mod.write_text(
+            '(footprint "EC" (layer "F.Cu")'
+            "  (fp_line (start -1 0.5) (end 1.5 -0.5)"
+            '    (stroke (width 0.1) (type solid)) (layer "Edge.Cuts"))'
+            ")"
+        )
+        info = parse_kicad_mod(str(mod))
+        assert info["edge_cuts"] == [
+            {
+                "type": "fp_line",
+                "layer": "Edge.Cuts",
+                "x1": -1.0,
+                "y1": 0.5,
+                "x2": 1.5,
+                "y2": -0.5,
+                "width": 0.1,
+            }
+        ]
+
+    def test_ignores_non_edge_cuts_layers(self, tmp_path):
+        mod = tmp_path / "Mixed.kicad_mod"
+        mod.write_text(
+            '(footprint "Mixed" (layer "F.Cu")'
+            '  (fp_line (start 0 0) (end 1 1) (stroke (width 0.1)) (layer "F.CrtYd"))'
+            '  (fp_line (start 0 0) (end 2 2) (stroke (width 0.1)) (layer "Edge.Cuts"))'
+            ")"
+        )
+        info = parse_kicad_mod(str(mod))
+        assert len(info["edge_cuts"]) == 1
+        assert info["edge_cuts"][0]["x2"] == 2.0
+        assert info["edge_cuts"][0]["x1"] == 0.0
+
+
+# ---------------------------------------------------------------------------
 # parse_fp_lib_table — Table-type indirection
 # ---------------------------------------------------------------------------
 
