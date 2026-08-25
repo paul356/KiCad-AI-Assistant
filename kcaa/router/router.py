@@ -248,13 +248,24 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
     if via_drill is None:
         via_drill = _resolve_via_drill(req.pcb_path, net=req.net)
 
-    # Pad center coordinates.
-    pad_a_xy = _find_pad_center(data, req.ref_a, req.pad_a)
-    pad_b_xy = _find_pad_center(data, req.ref_b, req.pad_b)
+    # Pad center coordinates. The layer keeps center and size on the SAME
+    # pad when a footprint declares several pads with one name.
+    pad_a_xy = _find_pad_center(data, req.ref_a, req.pad_a, req.start_layer)
+    pad_b_xy = _find_pad_center(data, req.ref_b, req.pad_b, req.end_layer)
     if pad_a_xy is None:
-        raise RouteFailure(f"Pad {req.ref_a}/{req.pad_a} not found")
+        if _find_pad_center(data, req.ref_a, req.pad_a) is None:
+            raise RouteFailure(f"Pad {req.ref_a}/{req.pad_a} not found")
+        raise RouteFailure(
+            f"Pad {req.ref_a}/{req.pad_a} has no copper shape on layer "
+            f"{req.start_layer!r}; cannot route from there."
+        )
     if pad_b_xy is None:
-        raise RouteFailure(f"Pad {req.ref_b}/{req.pad_b} not found")
+        if _find_pad_center(data, req.ref_b, req.pad_b) is None:
+            raise RouteFailure(f"Pad {req.ref_b}/{req.pad_b} not found")
+        raise RouteFailure(
+            f"Pad {req.ref_b}/{req.pad_b} has no copper shape on layer "
+            f"{req.end_layer!r}; cannot route to there."
+        )
 
     # Validate pads exist on the requested copper layers before doing
     # anything else (gives a clear error, not a confusing A* failure).
@@ -500,8 +511,13 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
         layers_used = _layers_used(all_nodes)
     else:
         # ── Single-layer: hierarchical A* ───────────────────────────
+        # Only copper on the routing layer can block the track; other
+        # layers are parallel physical planes and must not poison the
+        # grid (the multi-layer branch groups by layer for the same
+        # reason).
+        layer_obstacles = obstacles_by_layer[req.start_layer]
         result = hierarchical_a_star(
-            buffered,
+            layer_obstacles,
             pad_a_xy,
             pad_b_xy,
             fine_resolution=grid_res,
@@ -585,7 +601,14 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
             req.pcb_path,
         )
     else:
-        _check_segments_in_board(segs, model.board_bbox)
+        # Endpoint pads may straddle the board edge (edge connectors);
+        # their copper is a legal terminus, so exempt those rectangles
+        # from the board fence.
+        pad_zones: list[tuple[float, float, float, float]] = []
+        for pxy, psize in ((pad_a_xy, pad_a_world_size), (pad_b_xy, pad_b_world_size)):
+            if psize is not None:
+                pad_zones.append((pxy[0], pxy[1], psize[0] / 2.0, psize[1] / 2.0))
+        _check_segments_in_board(segs, model.board_bbox, pad_zones=pad_zones or None)
         if vias:
             _check_vias_in_board(vias, model.board_bbox)
 
@@ -1070,6 +1093,7 @@ def _build_pad_wire(
 def _check_segments_in_board(
     segs: list[OutputSegment],
     board_bbox: tuple[float, float, float, float],
+    pad_zones: list[tuple[float, float, float, float]] | None = None,
 ) -> None:
     """Raise :class:`RouteFailure` if any segment leaves the Edge.Cuts AABB.
 
@@ -1080,10 +1104,17 @@ def _check_segments_in_board(
     copper would still touch but not cross the edge); a track whose
     centerline is on the wrong side of the shrunk boundary fails.
 
+    ``pad_zones`` relaxes the fence around the route's endpoint pads:
+    footprints mounted on the board edge (edge connectors) legitimately
+    straddle the outline, so copper running onto those pads must not be
+    rejected. Each zone is ``(cx, cy, half_w, half_h)`` in world coords
+    and is unioned into the region a segment's copper may occupy.
+
     Args:
         segs: The segments produced by :func:`postprocess`.
         board_bbox: ``(minx, miny, maxx, maxy)`` from
             :func:`kcaa.router.world_model._board_bbox`.
+        pad_zones: Optional endpoint-pad rectangles to exempt.
 
     Raises:
         RouteFailure: The first segment that would leave the board.
@@ -1107,7 +1138,7 @@ def _check_segments_in_board(
                 f"Track width {seg.width} mm is wider than the board "
                 f"(shrunk bbox {shrunk_bbox} is degenerate)."
             )
-        board_poly = Polygon(
+        allowed = Polygon(
             [
                 (shrunk_bbox[0], shrunk_bbox[1]),
                 (shrunk_bbox[2], shrunk_bbox[1]),
@@ -1115,8 +1146,20 @@ def _check_segments_in_board(
                 (shrunk_bbox[0], shrunk_bbox[3]),
             ]
         )
+        if pad_zones:
+            for cx, cy, hw, hh in pad_zones:
+                allowed = allowed.union(
+                    Polygon(
+                        [
+                            (cx - hw, cy - hh),
+                            (cx + hw, cy - hh),
+                            (cx + hw, cy + hh),
+                            (cx - hw, cy + hh),
+                        ]
+                    )
+                )
         line = LineString([(seg.x1, seg.y1), (seg.x2, seg.y2)])
-        if not board_poly.covers(line):
+        if not allowed.covers(line):
             raise RouteFailure(
                 f"Segment {i} from ({seg.x1:.3f},{seg.y1:.3f}) to "
                 f"({seg.x2:.3f},{seg.y2:.3f}) would extend outside the "
@@ -1224,8 +1267,15 @@ def _find_pad_center(
     data: list,
     ref: str,
     pad_name: str,
+    layer: str | None = None,
 ) -> tuple[float, float] | None:
-    """Return the (x, y) center of the named pad on the given footprint ref."""
+    """Return the (x, y) center of the named pad on the given footprint ref.
+
+    When ``layer`` is given, only pads whose copper covers that layer are
+    considered — a footprint may declare several pads with the same name
+    (e.g. edge-connector fingers sharing a net), and the center must match
+    the pad whose shape :func:`_find_pad_size` would return.
+    """
     fp = _find_footprint(data, ref)
     if fp is None:
         return None
@@ -1237,6 +1287,8 @@ def _find_pad_center(
             continue
         name = _get_pad_name(sub)
         if name != pad_name:
+            continue
+        if layer is not None and layer not in _pad_layers(sub):
             continue
         # Pad ``at`` is in footprint-local coords.
         at = _get_sub(sub, "at")
@@ -1261,8 +1313,9 @@ def _find_pad_size(
 ) -> tuple[float, float] | None:
     """Return the (w, h) of the pad shape, for the requested copper layer.
 
-    Returns ``None`` if the pad is not on ``layer`` or not SMD (e.g. thru-hole
-    pads are circular and need a different exit strategy).
+    A footprint may declare several pads with the same name (e.g. edge-
+    connector fingers sharing a net). Returns the first pad whose copper
+    covers ``layer``, and ``None`` only if no same-named pad is on it.
     """
     fp = _find_footprint(data, ref)
     if fp is None:
@@ -1275,14 +1328,15 @@ def _find_pad_size(
         if _get_pad_name(sub) != pad_name:
             continue
         if layer not in _pad_layers(sub):
-            return None
+            # Another pad with this name may carry the requested layer.
+            continue
         size_sub = _get_sub(sub, "size")
         if size_sub is None or len(size_sub) < 3:
-            return None
+            continue
         try:
             return float(size_sub[1]), float(size_sub[2])
         except (TypeError, ValueError):
-            return None
+            continue
     return None
 
 

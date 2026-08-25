@@ -32,12 +32,15 @@ from kcaa.router.router import (
     _default_clearance,
     _default_track_width,
     _find_footprint,
+    _find_pad_center,
+    _find_pad_size,
     _layers_used,
     _project_file_for,
     _routing_layers,
     auto_route_pair,
     connect_with_via,
 )
+from kcaa.utils.pcb_sexp_utils import load_pcb
 
 # ---------------------------------------------------------------------------
 # _project_file_for
@@ -331,6 +334,24 @@ def test_check_segments_in_board_rejects_degenerate_bbox() -> None:
     assert "degenerate" in str(excinfo.value)
 
 
+def test_check_segments_in_board_accepts_segment_onto_edge_pad_zone() -> None:
+    """A segment ending past the shrunk boundary is legal when it lands on
+    an endpoint pad that straddles the edge (edge connector)."""
+    # Board 0..10; width 0.25 shrinks the fence to 0.125..9.875, so
+    # x=9.9 alone would be out of bounds — the pad zone makes it legal.
+    segs = [_seg(5.0, 5.0, 9.9, 5.0)]
+    _check_segments_in_board(segs, (0.0, 0.0, 10.0, 10.0), pad_zones=[(9.9, 5.0, 1.0, 1.0)])
+
+
+def test_check_segments_in_board_rejects_past_edge_without_pad_zone() -> None:
+    """The pad-zone exemption is scoped: same segment, different pad —
+    still rejected."""
+    segs = [_seg(5.0, 5.0, 4.0, 9.9)]
+    with pytest.raises(RouteFailure) as excinfo:
+        _check_segments_in_board(segs, (0.0, 0.0, 10.0, 10.0), pad_zones=[(9.9, 5.0, 1.0, 1.0)])
+    assert "outside the Edge.Cuts boundary" in str(excinfo.value)
+
+
 # ---------------------------------------------------------------------------
 # auto_route_pair — board-bounds check integration
 # ---------------------------------------------------------------------------
@@ -606,3 +627,73 @@ def test_thru_hole_pad_on_unused_layer_raises_failure(pcb_copy):
     )
     with pytest.raises(RouteFailure, match="no copper shape"):
         auto_route_pair(req)
+
+
+# ---------------------------------------------------------------------------
+# duplicate pad names in one footprint (edge-connector style)
+# ---------------------------------------------------------------------------
+
+
+def test_duplicate_pad_name_resolves_to_layer_matching_pad(tmp_path: Path) -> None:
+    """A footprint may declare several pads with the same name (e.g. edge-
+    connector fingers sharing a net). Looking up that name on a given
+    copper layer must resolve to the pad whose copper is actually there —
+    the first same-named pad must not shadow the rest, and a pad with a
+    drill hole (thru-hole) is a valid target."""
+    src = _fixture_pcb()
+    dst = tmp_path / "board.kicad_pcb"
+    board = Path(src).read_text().rstrip()
+    assert board.endswith(")")
+    x1 = (
+        "\n\t# ---- X1: duplicate 'T' pads; F.Cu finger first, thru-hole *.Cu second ----\n"
+        '\t(footprint "user_add:edge-connector"\n'
+        '\t\t(layer "F.Cu")\n'
+        '\t\t(uuid "66666666-0000-0000-0000-000000000006")\n'
+        "\t\t(at 62.0 45.0 0.0)\n"
+        '\t\t(property "Reference" "X1")\n'
+        '\t\t(property "Value" "X1")\n'
+        '\t\t(pad "T" smd rect\n'
+        "\t\t\t(at 0.0 0.0)\n"
+        "\t\t\t(size 1.0 1.0)\n"
+        '\t\t\t(layers "F.Cu" "F.Mask")\n'
+        '\t\t\t(net 1 "VCC")\n'
+        "\t\t)\n"
+        '\t\t(pad "T" thru_hole custom\n'
+        "\t\t\t(at 2.0 0.0)\n"
+        "\t\t\t(size 1.6 1.6)\n"
+        "\t\t\t(drill 1.0)\n"
+        '\t\t\t(layers "*.Cu" "*.Mask")\n'
+        '\t\t\t(net 1 "VCC")\n'
+        "\t\t)\n"
+        "\t)\n"
+    )
+    dst.write_text(board[:-1] + x1 + ")\n")
+
+    data = load_pcb(str(dst))
+    # F.Cu resolves to the first pad; B.Cu skips it and finds the thru-hole
+    # pad.  Center and size must describe the SAME pad.
+    assert _find_pad_size(data, "X1", "T", "F.Cu") == (1.0, 1.0)
+    assert _find_pad_size(data, "X1", "T", "B.Cu") == (1.6, 1.6)
+    assert _find_pad_center(data, "X1", "T", "F.Cu") == pytest.approx((62.0, 45.0))
+    assert _find_pad_center(data, "X1", "T", "B.Cu") == pytest.approx((64.0, 45.0))
+    # Unfiltered lookup keeps the legacy first-match behaviour.
+    assert _find_pad_center(data, "X1", "T") == pytest.approx((62.0, 45.0))
+
+    req = RouteRequest(
+        pcb_path=str(dst),
+        ref_a="R1",
+        pad_a="1",
+        ref_b="X1",
+        pad_b="T",
+        net="VCC",
+        start_layer="F.Cu",
+        end_layer="B.Cu",
+        width=0.25,
+        clearance=0.2,
+    )
+    result = auto_route_pair(req)
+    # The route must end on the thru-hole pad at world (62+2, 45), not on
+    # the F.Cu-only finger at (62, 45).
+    assert result.end == pytest.approx((64.0, 45.0), abs=0.02)
+    assert result.layers_used == ["F.Cu", "B.Cu"]
+    assert len(result.segments) > 0

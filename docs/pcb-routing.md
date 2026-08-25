@@ -26,6 +26,13 @@ to the board on the same layer as the source pad.  Obstacles include:
 * Existing tracks of *other* nets.
 * Keepout zones on the active layer.
 
+Only copper on the requested routing layer blocks a single-layer route;
+copper on other layers is a parallel plane and is ignored.  The board
+bounds check exempts the two endpoint pads' rectangles: a pad whose
+copper straddles the board edge (edge-mounted connectors) is a legal
+terminus, even though the track must otherwise stay inside the
+Edge.Cuts outline.
+
 ## Multi-layer routing (via insertion)
 
 If the source pad is on a different layer from the destination pad,
@@ -131,10 +138,19 @@ for the human-readable summary.
 
 | Failure | Meaning |
 | --- | --- |
-| `RouteFailure: Pad <ref>/<pad> not found` | Pad name is wrong or pad is on a different layer than requested. |
-| `RouteFailure: Pad <ref>/<pad> has no copper shape on layer '<layer>'` | The destination pad does not have a copper shape on the requested `end_layer`. |
+| `RouteFailure: Pad <ref>/<pad> not found` | No pad with that name exists on the footprint.  A pad that exists but has no copper on the requested layer fails with the layer-naming error below instead. |
+| `RouteFailure: Pad <ref>/<pad> has no copper shape on layer '<layer>'` | The pad exists, but no same-named pad has a copper shape on the requested layer. |
 | `RouteFailure: No obstacle-avoiding path from <a> to <b> across layers [...]` | No combination of exit points / via transitions yields a clear path.  Check obstacles and via pairs. |
 | `RouteFailure: Via at (x, y) would extend outside the board` | At least one via pad does not fit inside the Edge.Cuts board outline.  Move the route or shrink the board. |
 
 The tool returns `{"error": "..."}` on any of the above; the board
 file is **not** modified on failure.
+
+A footprint may declare several pads with the same name — edge-connector
+fingers sharing a net, e.g. a micro:bit edge connector exposing several
+`3v3` pads (SMD fingers plus one thru-hole pad).  The router resolves
+the pad by the requested layer: routing to `U11/3v3` on `B.Cu` targets
+the same-named pad whose copper is actually on `B.Cu` (typically the
+thru-hole pad), not merely the first occurrence in the footprint.  A
+thru-hole pad's center is a valid track terminus — the plated barrel
+carries the connection.
