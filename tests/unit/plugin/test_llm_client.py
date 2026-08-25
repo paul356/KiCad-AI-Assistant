@@ -4,6 +4,8 @@ import json
 import types
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from kicad_plugin.llm_client import LLMClient
 from kicad_plugin.tool_registry import TOOL_POLICIES
 
@@ -458,6 +460,201 @@ class TestRunIntegration:
             "set_footprint_position",
             "reload_kicad",
         ]
+
+    def test_failed_mutation_still_reloads_dirty_path_at_turn_end(self):
+        """A failed PCB mutation still marks the path dirty so reload_kicad
+        runs at turn end, keeping the UI refresh consistent with the action."""
+        client = _make_client()
+        tool_response = {
+            "finish_reason": "tool_calls",
+            "message": {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tc1",
+                        "type": "function",
+                        "function": {
+                            "name": "pcb_route_pad_to_pad",
+                            "arguments": json.dumps(
+                                {"pcb_path": "/tmp/board.kicad_pcb", "pad1": "A1", "pad2": "B2"}
+                            ),
+                        },
+                    }
+                ],
+            },
+        }
+        final_response = {"finish_reason": "stop", "message": {"content": "done"}}
+        client._call_llm = MagicMock(side_effect=[tool_response, final_response])
+        client._fetch_tool_definitions = MagicMock(
+            return_value=[{"function": {"name": "pcb_route_pad_to_pad"}}]
+        )
+        on_tool_call = MagicMock()
+
+        with patch("kicad_plugin.llm_client.call_mcp_tool") as mock_call_tool:
+            mock_call_tool.side_effect = [
+                {"success": True},  # save_document
+                {"success": True, "version_id": "v1"},
+                {"success": False, "error": "routing failed"},  # pcb_route_pad_to_pad fails
+                {"success": True, "reloaded": ["/tmp/board.kicad_pcb"], "failed": []},
+            ]
+            result = client.run("route A1 to B2", context_block="", on_tool_call=on_tool_call)
+
+        assert result == "done"
+        assert mock_call_tool.call_args_list == [
+            ((client._mcp_base_url, "save_document", {"file_path": "/tmp/board.kicad_pcb"}),),
+            ((client._mcp_base_url, "save_file_version", {"file_path": "/tmp/board.kicad_pcb"}),),
+            (
+                (
+                    client._mcp_base_url,
+                    "pcb_route_pad_to_pad",
+                    {"pcb_path": "/tmp/board.kicad_pcb", "pad1": "A1", "pad2": "B2"},
+                ),
+            ),
+            ((client._mcp_base_url, "reload_kicad", {"paths": ["/tmp/board.kicad_pcb"]}),),
+        ]
+        assert [call.args[0] for call in on_tool_call.call_args_list] == [
+            "save_document",
+            "save_file_version",
+            "pcb_route_pad_to_pad",
+            "reload_kicad",
+        ]
+
+    def test_llm_error_after_mutation_still_reloads_dirty_path(self):
+        """An [LLM error] exit still flushes dirty paths via the shared
+        end-of-turn reload, matching the UI refresh display."""
+        client = _make_client()
+        tool_response = {
+            "finish_reason": "tool_calls",
+            "message": {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tc1",
+                        "type": "function",
+                        "function": {
+                            "name": "set_footprint_position",
+                            "arguments": json.dumps(
+                                {"pcb_path": "/tmp/board.kicad_pcb", "reference": "R1", "x": 1.0}
+                            ),
+                        },
+                    }
+                ],
+            },
+        }
+        client._call_llm = MagicMock(side_effect=[tool_response, {"error": "API down"}])
+        client._fetch_tool_definitions = MagicMock(
+            return_value=[{"function": {"name": "set_footprint_position"}}]
+        )
+
+        with patch("kicad_plugin.llm_client.call_mcp_tool") as mock_call_tool:
+            mock_call_tool.side_effect = [
+                {"success": True},  # save_document
+                {"success": True, "version_id": "v1"},
+                {"success": True, "pcb_path": "/tmp/board.kicad_pcb"},
+                {"success": True, "reloaded": ["/tmp/board.kicad_pcb"], "failed": []},
+            ]
+            result = client.run("move R1", context_block="")
+
+        assert result == "[LLM error] API down"
+        assert mock_call_tool.call_args_list[-1] == (
+            (client._mcp_base_url, "reload_kicad", {"paths": ["/tmp/board.kicad_pcb"]}),
+        )
+
+    def test_max_iterations_exit_still_reloads_dirty_path(self):
+        """Hitting the iteration cap still flushes dirty paths via the shared
+        end-of-turn reload."""
+        client = _make_client()
+        tool_response = {
+            "finish_reason": "tool_calls",
+            "message": {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tc-loop",
+                        "type": "function",
+                        "function": {
+                            "name": "set_footprint_position",
+                            "arguments": json.dumps(
+                                {"pcb_path": "/tmp/board.kicad_pcb", "reference": "R1", "x": 1.0}
+                            ),
+                        },
+                    }
+                ],
+            },
+        }
+        client._call_llm = MagicMock(return_value=tool_response)  # never stops calling tools
+        client._fetch_tool_definitions = MagicMock(
+            return_value=[{"function": {"name": "set_footprint_position"}}]
+        )
+
+        with patch("kicad_plugin.llm_client.call_mcp_tool") as mock_call_tool:
+            mock_call_tool.side_effect = lambda base, name, args: (
+                {"success": True, "reloaded": ["/tmp/board.kicad_pcb"], "failed": []}
+                if name == "reload_kicad"
+                else {"success": True}
+            )
+            result = client.run("move R1", context_block="")
+
+        assert (
+            result == "[Error] Maximum tool-call iterations reached. Please try a simpler request."
+        )
+        assert mock_call_tool.call_args_list[-1][0][1] == "reload_kicad"
+        assert mock_call_tool.call_args_list[-1][0][2] == {"paths": ["/tmp/board.kicad_pcb"]}
+
+    def test_tool_exception_still_reloads_dirty_path(self):
+        """An exception escaping run() still flushes dirty paths from earlier
+        successful mutations in the same turn."""
+        client = _make_client()
+        tool_response = {
+            "finish_reason": "tool_calls",
+            "message": {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tc1",
+                        "type": "function",
+                        "function": {
+                            "name": "set_footprint_position",
+                            "arguments": json.dumps(
+                                {"pcb_path": "/tmp/board.kicad_pcb", "reference": "R1", "x": 1.0}
+                            ),
+                        },
+                    },
+                    {
+                        "id": "tc2",
+                        "type": "function",
+                        "function": {
+                            "name": "flip_footprint",
+                            "arguments": json.dumps(
+                                {"pcb_path": "/tmp/board.kicad_pcb", "reference": "R2"}
+                            ),
+                        },
+                    },
+                ],
+            },
+        }
+        client._call_llm = MagicMock(side_effect=[tool_response])
+        client._fetch_tool_definitions = MagicMock(
+            return_value=[
+                {"function": {"name": "set_footprint_position"}},
+                {"function": {"name": "flip_footprint"}},
+            ]
+        )
+
+        with patch("kicad_plugin.llm_client.call_mcp_tool") as mock_call_tool:
+            mock_call_tool.side_effect = [
+                {"success": True},  # save_document (snapshot for set_footprint_position)
+                {"success": True, "version_id": "v1"},
+                {"success": True, "pcb_path": "/tmp/board.kicad_pcb"},
+                # flip_footprint reuses the same-turn snapshot (no save calls)
+                RuntimeError("boom"),  # flip_footprint raises
+                {"success": True, "reloaded": ["/tmp/board.kicad_pcb"], "failed": []},
+            ]
+            with pytest.raises(RuntimeError, match="boom"):
+                client.run("edit board", context_block="")
+
+        assert mock_call_tool.call_args_list[-1][0][1] == "reload_kicad"
+        assert mock_call_tool.call_args_list[-1][0][2] == {"paths": ["/tmp/board.kicad_pcb"]}
 
     def test_framework_snapshots_each_file_once_per_turn(self):
         client = _make_client()
