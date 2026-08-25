@@ -44,7 +44,7 @@ import logging
 import math
 import os
 
-from shapely.geometry import Point, Polygon
+from shapely.geometry import Polygon
 from shapely.geometry import box as _shapely_box
 
 from kcaa.router.grid_a_star import (
@@ -347,66 +347,43 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
                 pad_b_world_size,
             )
 
-    # Same-net thru-hole pads have a drilled barrel that physically severs
-    # any track crossing it — but the world model drops same-net pad
-    # copper entirely (so the route can land on its own pads), which also
-    # drops the hole.  Re-add ONLY the drill hole of each same-net
-    # ``thru_hole`` pad as a circular obstacle on every copper layer: a
-    # track may run across same-net pad *copper* (same net, no DRC error),
-    # but never across the *hole* (the drill removes the copper path).
-    # Geometry mirrors :func:`kcaa.router.world_model._npth_obstacle`.
-    pad_delta = width / 2.0 + clearance
-    _tht_hole_shapes: list = []
-    for item in data:
-        if not _is_list(item) or str(item[0]) != "footprint":
+    # The world model drops same-net pad copper entirely (the route must
+    # land on its own endpoint pads).  Re-add every same-net pad as a
+    # transit obstacle on the copper layers it covers so the track never
+    # overlaps other same-net pad copper — it terminates on the endpoint
+    # pad only and connects to other same-net pads by separate tracks
+    # later.  Buffer by ``width/2`` (no clearance): same net needs no
+    # DRC clearance, the buffer just keeps the track *edge* off the pad
+    # copper.  The two endpoint pads are exempt on their own terminal
+    # layers so the track can start/end at their centres.
+    pad_half = 0.0  # same-net: no DRC clearance, block only the pad copper itself
+    _sn_shapes: list = []
+    for poly, players, _ref, _pname, center in _same_net_pad_polygons(data, req.net):
+        is_end = (abs(center[0] - pad_a_xy[0]) < 1e-6 and abs(center[1] - pad_a_xy[1]) < 1e-6) or (
+            abs(center[0] - pad_b_xy[0]) < 1e-6 and abs(center[1] - pad_b_xy[1]) < 1e-6
+        )
+        buf = poly.buffer(pad_half)
+        if buf.is_empty or not buf.is_valid:
             continue
-        fp_x, fp_y, fp_rot = _node_at3(item)
-        for sub in item:
-            if not _is_list(sub) or str(sub[0]) != "pad":
+        _sn_shapes.append(buf)
+        for layer in players:
+            if layer not in obstacles_by_layer:
                 continue
-            if _get_net(sub) != req.net:
+            if is_end and (layer == req.start_layer or layer == req.end_layer):
                 continue
-            if len(sub) < 3 or str(sub[2]) != "thru_hole":
-                continue
-            at = _get_sub(sub, "at")
-            if at is None or len(at) < 3:
-                continue
-            try:
-                lx, ly = float(at[1]), float(at[2])
-            except (TypeError, ValueError):
-                continue
-            drill_sub = _get_sub(sub, "drill")
-            if drill_sub is None or len(drill_sub) < 2:
-                continue
-            try:
-                drill = float(drill_sub[1])
-            except (TypeError, ValueError):
-                continue
-            wx_off, wy_off = _rotate(lx, ly, fp_rot)
-            wx, wy = fp_x + wx_off, fp_y + wy_off
-            # Skip endpoint pads: the route must start/end at the pad
-            # centre (on the hole), and the plated barrel connects all
-            # layers there — no obstacle needed at the termination.
-            if (abs(wx - pad_a_xy[0]) < 1e-6 and abs(wy - pad_a_xy[1]) < 1e-6) or (
-                abs(wx - pad_b_xy[0]) < 1e-6 and abs(wy - pad_b_xy[1]) < 1e-6
-            ):
-                continue
-            hole = Point(wx, wy).buffer(drill / 2.0 + pad_delta)
-            _tht_hole_shapes.append(hole)
-            for layer in obstacles_by_layer:
-                obstacles_by_layer[layer].append(
-                    Obstacle(
-                        shape=hole,
-                        layers=frozenset({layer}),
-                        net=req.net,
-                        kind="drill",
-                    )
+            obstacles_by_layer[layer].append(
+                Obstacle(
+                    shape=buf,
+                    layers=frozenset({layer}),
+                    net=req.net,
+                    kind="pad",
                 )
+            )
 
     # Route bounding box must cover the endpoint pads and every same-net
-    # THT hole obstacle: a detour around a wide drill can extend past the
-    # ±5 mm endpoint margin.
-    _hb = [s.bounds for s in _tht_hole_shapes]
+    # pad obstacle: a detour around a wide pad cluster can extend past
+    # the ±5 mm endpoint margin.
+    _hb = [s.bounds for s in _sn_shapes]
     _hx0 = min((b[0] for b in _hb), default=pad_a_xy[0])
     _hy0 = min((b[1] for b in _hb), default=pad_a_xy[1])
     _hx1 = max((b[2] for b in _hb), default=pad_a_xy[0])

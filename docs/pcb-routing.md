@@ -161,15 +161,19 @@ carries the connection.
 ### Same-net pad copper and drill holes
 
 The world model drops same-net pad copper entirely (the route must be
-able to land on its own endpoint pads), so a track may run across
-same-net pad *copper* without a DRC error — same net, no conflict.
-However, a same-net **thru-hole pad's drill hole** physically severs
-any track crossing it (the drill removes the copper path).  The router
-re-adds the drill hole of every same-net `thru_hole` pad as a circular
-obstacle on every routing layer, so A* routes around the hole instead
-of running a track through it.  The endpoint pads' own holes are
-exempt — the track terminates *at* the pad center, and the plated
-barrel connects all layers there.
+able to land on its own endpoint pads).  The router re-adds every
+same-net pad as a transit obstacle on the copper layers it covers so
+the track centreline never enters another same-net pad's copper — the
+track terminates on the endpoint pad only, and other same-net pads
+should be connected by separate tracks later.  The buffer is zero (no
+DRC clearance): same net needs no clearance, the obstacle just keeps
+the track *centreline* off the pad copper.  The track edge may still
+touch the pad edge for wide tracks in tight geometry — this is not a
+DRC error (same net) and is preferable to failing the route.  The two
+endpoint pads are exempt on their own terminal layers so the track can
+start/end at their centres; a same-net thru-hole pad's drill hole is
+covered by its pad-copper obstacle (non-endpoint pads), so a track
+never crosses a hole the drill physically severs.
 
 Vias must never land on any same-net pad face (a DFM defect: solder
 wicking, annular-ring breakout).  Via-forbidden zones cover **every**

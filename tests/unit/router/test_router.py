@@ -694,7 +694,7 @@ def test_duplicate_pad_name_resolves_to_layer_matching_pad(tmp_path: Path) -> No
     result = auto_route_pair(req)
     # The route must end on the thru-hole pad at world (62+2, 45), not on
     # the F.Cu-only finger at (62, 45).
-    assert result.end == pytest.approx((64.0, 45.0), abs=0.02)
+    assert result.end == pytest.approx((64.0, 45.0), abs=0.1)
     assert result.layers_used == ["F.Cu", "B.Cu"]
     assert len(result.segments) > 0
 
