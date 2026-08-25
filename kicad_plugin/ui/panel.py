@@ -127,12 +127,14 @@ if _WX_AVAILABLE:
             # True once the shell HTML (CSS + JS framework + empty containers)
             # has been successfully loaded into the WebView.
             self._shell_loaded: bool = False
-            # True while any RunScript call is in-flight.  On Windows WebView2,
-            # RunScript pumps the message loop; we guard against re-entrant
-            # RunScript calls with this flag.
+            # True while any WebView script is in-flight.  On Windows WebView2,
+            # RunScript pumps the message loop; re-entrant RunScript calls are
+            # guarded by _run_script, the only place that writes this flag.
             self._js_running: bool = False
-            # Set when a render is skipped (due to shell not loaded or
-            # _js_running).  The next opportunity triggers a deferred render.
+            # Set when a render is skipped (script in flight / shell not
+            # loaded / page loading).  Flushed as a full-conversation rebuild
+            # by whoever releases the render lock, or by the shell-load
+            # completion path.
             self._render_pending: bool = False
             # True when the stream-wrapper table is visible in the shell.
             self._stream_wrapper_visible: bool = False
@@ -740,6 +742,7 @@ if _WX_AVAILABLE:
             # Reset streaming state and start the flush timer
             self._stream_buffer.clear()
             self._pending_ai_text = ""
+            self._stream_delta_chars = 0
             self._tool_calls_made = False
             self._schematic_edited = False
             self._pcb_edited = False
@@ -750,8 +753,12 @@ if _WX_AVAILABLE:
             def _on_delta(chunk: str) -> None:
                 # Called from background thread — just push to buffer; timer handles UI
                 if self._cancel_event and self._cancel_event.is_set():
+                    if not state.get("cancel_dropped"):
+                        state["cancel_dropped"] = True
+                        log.debug("chat: dropping streamed chunks after cancel")
                     return
                 state["ai_turn_started"] = True
+                self._stream_delta_chars += len(chunk)
                 self._stream_buffer.append(chunk)
 
             def _run():
@@ -1314,6 +1321,16 @@ if _WX_AVAILABLE:
             self._stream_timer.Stop()
             self._on_stream_flush(None)
 
+            log.info(
+                "chat: _on_reply was_streamed=%s reply_len=%d pending_len=%d "
+                "buffer_left=%d delta_chars=%d",
+                was_streamed,
+                len(reply),
+                len(self._pending_ai_text),
+                len(self._stream_buffer),
+                getattr(self, "_stream_delta_chars", 0),
+            )
+
             # Hide streaming preview before appending the final entry
             if self._use_webview:
                 self._hide_stream_wrapper()
@@ -1337,12 +1354,19 @@ if _WX_AVAILABLE:
                         "text": self._pending_ai_text,
                         "timestamp": datetime.datetime.now().strftime("%H:%M:%S"),
                     }
+                    log.info(
+                        "chat: finalising streamed entry text_len=%d tail=%r",
+                        len(entry["text"]),
+                        entry["text"][-80:],
+                    )
                     self._conv_entries.append(entry)
                     self._pending_ai_text = ""
                     if self._use_webview and self._shell_loaded:
                         self._append_entry_js(entry, force_scroll_to_bottom=True)
                     else:
                         self._render_conversation(force_scroll_to_bottom=True)
+            # Any deferral during the turn is flushed by the lock holder's
+            # release (_run_script), so no turn-end safety net is needed.
             self._busy = False
             self._cancel_event = None
             self._toggle_send_stop(busy=False)
@@ -1372,8 +1396,14 @@ if _WX_AVAILABLE:
                 # Incremental DOM update — should always succeed with shell loaded
                 if self._incremental_stream_update():
                     return
-                # Shell not loaded yet — defer
-                self._render_pending = True
+                # Deferred (lock busy / shell not loaded) or update failed:
+                # _run_script already recorded _render_pending, so a full
+                # rebuild will replay (and the next flush re-shows stream
+                # text).  Nothing to bookkeep here.
+                log.warning(
+                    "chat: stream flush deferred render (pending=%d chars)",
+                    len(self._pending_ai_text),
+                )
             else:
                 self._render_conversation(force_scroll_to_bottom=self._follow_output_to_bottom)
 
@@ -1381,9 +1411,11 @@ if _WX_AVAILABLE:
             """Update streaming AI text via _updateStream JS call.
 
             The #pending-ai-text div always exists in the shell HTML, so this
-            should always succeed when the shell is loaded.
+            should always succeed when the shell is loaded.  Runs under the
+            render protocol via _run_script; on deferral or failure the
+            pending full-rebuild replay covers the missed incremental update.
             """
-            if not self._use_webview or not self._shell_loaded or self._js_running:
+            if not self._use_webview:
                 return False
 
             import json as _json
@@ -1392,17 +1424,13 @@ if _WX_AVAILABLE:
             scroll_arg = "true" if self._follow_output_to_bottom else "false"
             js = f"_updateStream({_json.dumps(body_html)}, {scroll_arg})"
 
-            self._js_running = True
-            try:
-                ok, result = self._conv_view.RunScript(js)
-                if not ok:
-                    log.warning("_incremental_stream_update: RunScript failed")
-                return ok
-            except Exception as e:
-                log.warning("_incremental_stream_update: exception: %s", e)
-                return False
-            finally:
-                self._js_running = False
+            return bool(
+                self._run_script(
+                    js,
+                    force_scroll_to_bottom=self._follow_output_to_bottom,
+                    retry_on_failure=True,
+                )[0]
+            )
 
         def _on_page_watchdog(self, event) -> None:
             """Safety net: detect shell load timeout.
@@ -1463,6 +1491,10 @@ if _WX_AVAILABLE:
             # If there is pending streamed text that preceded this tool call,
             # finalise it as an AI entry now so the timeline order is correct.
             if self._pending_ai_text:
+                log.debug(
+                    "chat: mid-turn finalise of streamed text len=%d",
+                    len(self._pending_ai_text),
+                )
                 self._conv_entries.append({"type": "ai", "text": self._pending_ai_text})
                 self._pending_ai_text = ""
             # Append as a permanent timeline entry so tool calls appear in
@@ -2529,49 +2561,57 @@ if _WX_AVAILABLE:
             Called 1 second after EVT_WEBVIEW_LOADED to give scripts time to execute.
             """
             log.debug("_verify_shell_and_render: starting verification")
-            self._js_running = True
             js_works = False
 
+            # Each probe runs under the render-protocol flag via
+            # _run_script(probe=True): before _shell_loaded is confirmed the
+            # normal acquire would defer instead of probing, so probe=True
+            # skips the shell-loaded gate while still excluding re-entrant
+            # renders from the probe windows.
             try:
                 # Check font
-                ok, result = self._conv_view.RunScript("getComputedStyle(document.body).fontFamily")
+                _, result = self._run_script(
+                    "getComputedStyle(document.body).fontFamily", probe=True
+                )
                 log.info("_verify_shell_and_render: font=%r", result)
 
                 # Check all window functions (what's actually defined in window)
-                ok, result = self._conv_view.RunScript(
-                    "Object.keys(window).filter(k => typeof window[k] === 'function' && k.startsWith('_')).join(',')"
+                _, result = self._run_script(
+                    "Object.keys(window).filter(k => typeof window[k] === 'function' && k.startsWith('_')).join(',')",
+                    probe=True,
                 )
                 log.info("_verify_shell_and_render: window functions starting with _ =%r", result)
 
                 # Check scripts in document
-                ok, result = self._conv_view.RunScript(
-                    "document.scripts.length + ',' + (document.scripts[0] ? document.scripts[0].src : 'inline') + ',' + (document.scripts[0] ? document.scripts[0].innerHTML.length : 0)"
+                _, result = self._run_script(
+                    "document.scripts.length + ',' + (document.scripts[0] ? document.scripts[0].src : 'inline') + ',' + (document.scripts[0] ? document.scripts[0].innerHTML.length : 0)",
+                    probe=True,
                 )
                 log.info("_verify_shell_and_render: scripts info=%r", result)
 
                 # Check for JS errors in the console
-                ok, result = self._conv_view.RunScript(
-                    "try { eval('1+1'); 'no_error'; } catch(e) { e.message; }"
+                _, result = self._run_script(
+                    "try { eval('1+1'); 'no_error'; } catch(e) { e.message; }", probe=True
                 )
                 log.info("_verify_shell_and_render: eval test=%r", result)
 
                 # Try to check for syntax errors in the script
-                ok, result = self._conv_view.RunScript(
-                    "try { new Function(document.scripts[0].innerHTML); 'syntax_ok'; } catch(e) { 'error:' + e.message; }"
+                _, result = self._run_script(
+                    "try { new Function(document.scripts[0].innerHTML); 'syntax_ok'; } catch(e) { 'error:' + e.message; }",
+                    probe=True,
                 )
                 log.info("_verify_shell_and_render: script syntax check=%r", result)
 
                 # Try to call JS function
-                ok, result = self._conv_view.RunScript(
-                    "try { _updateConversation('[]', 'preserve'); 'ok'; } catch(e) { e.message; }"
+                ok, result = self._run_script(
+                    "try { _updateConversation('[]', 'preserve'); 'ok'; } catch(e) { e.message; }",
+                    probe=True,
                 )
                 log.info("_verify_shell_and_render: JS call result=%r", result)
                 if ok and result and ("ok" in str(result) or "error" in str(result).lower()):
                     js_works = True
             except Exception as e:
                 log.error("_verify_shell_and_render: exception: %s", e)
-            finally:
-                self._js_running = False
 
             if js_works:
                 self._shell_loaded = True
@@ -2646,10 +2686,10 @@ if _WX_AVAILABLE:
             """Full conversation update via RunScript (WebView path).
 
             Serializes all entries as JSON and calls _updateConversation()
-            in the shell.
+            in the shell.  Locking/deferral is handled by _run_script.
             """
-            if not self._try_acquire_render_lock():
-                return  # _try_acquire_render_lock already set _render_pending
+            if not self._use_webview:
+                return
 
             import json as _json
 
@@ -2665,31 +2705,21 @@ if _WX_AVAILABLE:
                 len(js),
             )
 
-            try:
-                ok, result = self._conv_view.RunScript(js)
-                if ok:
-                    self._stream_wrapper_visible = False
-                    result_str = str(result) if result else ""
-                    if result_str.startswith("error:"):
-                        log.error(
-                            "_updateConversation JS error: %s (js_size=%d, entries=%d)",
-                            result_str,
-                            len(js),
-                            len(js_entries),
-                        )
-                    else:
-                        log.debug("_updateConversation JS result: %s", result_str)
-                else:
-                    log.error(
-                        "_updateConversation RunScript FAILED: js_size=%d, result=%r, entries=%d",
-                        len(js),
-                        result,
-                        len(js_entries),
-                    )
-            except Exception as e:
-                log.error("_updateConversation exception: %s", e)
-            finally:
-                self._release_render_lock(force_scroll_to_bottom)
+            ok, result = self._run_script(js, force_scroll_to_bottom)
+            if not ok:
+                log.debug("_updateConversation deferred (pending rebuild scheduled)")
+                return
+            self._stream_wrapper_visible = False
+            result_str = str(result) if result else ""
+            if result_str.startswith("error:"):
+                log.error(
+                    "_updateConversation JS error: %s (js_size=%d, entries=%d)",
+                    result_str,
+                    len(js),
+                    len(js_entries),
+                )
+            else:
+                log.debug("_updateConversation JS result: %s", result_str)
 
         def _process_pending_render(self, force_scroll_to_bottom: bool) -> None:
             """Process any pending render after _js_running is reset."""
@@ -2698,13 +2728,66 @@ if _WX_AVAILABLE:
                 wx.CallAfter(self._update_conversation, force_scroll_to_bottom)
 
         # ------------------------------------------------------------------ #
+        # Render protocol: single RunScript funnel
+        # ------------------------------------------------------------------ #
+        # Every conversation-rendering script goes through _run_script, which
+        # owns the _js_running / _render_pending bookkeeping.  RunScript on
+        # Windows WebView2 pumps the message loop, so a script submitted
+        # while another is in flight gets re-entrant instead of serialized;
+        # the _js_running flag turns that into "defer and replay as a full
+        # rebuild".  Callers of _run_script never touch lock state.
+
+        def _run_script(
+            self,
+            js: str,
+            force_scroll_to_bottom: bool = False,
+            retry_on_failure: bool = False,
+            probe: bool = False,
+        ) -> tuple[bool, object]:
+            """Run a WebView script under the render protocol.
+
+            Acquires the render lock (deferring -- _render_pending set -- when
+            another script is in flight or the shell is not confirmed loaded),
+            runs the script, then releases; the release flushes any deferral
+            as a wx.CallAfter full-conversation rebuild once the current
+            event stack has unwound.
+
+            probe=True runs before the shell is confirmed loaded (shell
+            verification): takes the lock flag to keep re-entrant renders out,
+            but skips the shell-loaded gate.
+
+            retry_on_failure=True records a pending rebuild when the script
+            itself fails, so a full rebuild replays the missed update.
+            """
+            if not self._use_webview:
+                return False, None
+            if not self._try_acquire_render_lock(probe=probe):
+                return False, None  # deferred: _render_pending already set
+            try:
+                ok, result = self._conv_view.RunScript(js)
+                if not ok:
+                    log.warning("_run_script: RunScript failed: %r", result)
+                    if retry_on_failure:
+                        self._render_pending = True
+                return ok, result
+            except Exception as e:
+                log.warning("_run_script exception: %s", e)
+                if retry_on_failure:
+                    self._render_pending = True
+                return False, None
+            finally:
+                self._release_render_lock(force_scroll_to_bottom)
+
+        # ------------------------------------------------------------------ #
         # Render lock helpers: encapsulate sync state management
         # ------------------------------------------------------------------ #
-        def _try_acquire_render_lock(self) -> bool:
+        def _try_acquire_render_lock(self, probe: bool = False) -> bool:
             """Try to acquire the render lock. Returns True if acquired.
 
-            If acquisition fails (shell not loaded or another render in progress),
-            sets _render_pending so the render will be retried later.
+            If acquisition fails (shell not loaded or another render in
+            progress), sets _render_pending so the render will be retried
+            later.  With probe=True the shell-loaded gate is skipped (shell
+            verification runs before _shell_loaded is confirmed).
             """
             self._render_pending = False  # Reset first to allow recursion
 
@@ -2712,51 +2795,54 @@ if _WX_AVAILABLE:
                 self._render_pending = True
                 return False
 
-            # If shell_loaded is False, try to detect if it actually is loaded
-            # (EVT_WEBVIEW_LOADED may not fire on all Windows WebView2 versions)
-            if not self._shell_loaded:
-                # Try to detect shell state by checking if the conversation div exists
-                # AND if JS functions are defined. Try multiple times in case scripts
-                # haven't executed yet.
-                shell_loaded_detected = False
-                for attempt in range(3):
-                    try:
-                        ok, result = self._conv_view.RunScript(
-                            "document.getElementById('conversation') ? 'loaded' : 'not_loaded'"
-                        )
-                        if ok and result and "loaded" in str(result):
-                            # Also verify JS functions exist by trying to call one
-                            ok2, result2 = self._conv_view.RunScript(
-                                "try { _updateConversation('[]', 'preserve'); 'ok'; } catch(e) { e.message; }"
-                            )
-                            log.info("JS test attempt %d: %r", attempt + 1, result2)
-                            if (
-                                ok2
-                                and result2
-                                and ("ok" in str(result2) or "error" in str(result2).lower())
-                            ):
-                                log.info("Detected shell and JS working (attempt %d)", attempt + 1)
-                                self._shell_loaded = True
-                                self._page_loading = False
-                                shell_loaded_detected = True
-                                break
-                            else:
-                                log.warning(
-                                    "Shell loaded but JS not working (attempt %d)", attempt + 1
-                                )
-                        else:
-                            break
-                    except Exception as e:
-                        log.warning("Failed to detect shell state (attempt %d): %s", attempt + 1, e)
-                        break
+            # Claim first: shell detection (below) runs raw RunScript probes,
+            # so the flag must be held while they are in flight to keep
+            # re-entrant renders out of the detection window too.
+            self._js_running = True
 
-                if not shell_loaded_detected:
-                    log.warning("Shell loaded but JS not working after 3 attempts, allowing retry")
+            if not probe and not self._shell_loaded:
+                if not self._detect_shell_loaded():
+                    self._js_running = False
                     self._render_pending = True
                     return False
 
-            self._js_running = True
             return True
+
+        def _detect_shell_loaded(self) -> bool:
+            """Probe the WebView for a working shell (div + JS functions).
+
+            EVT_WEBVIEW_LOADED may not fire on all Windows WebView2 versions,
+            so renders probe for shell readiness.  Runs with the render lock
+            held (_js_running=True).
+            """
+            for attempt in range(3):
+                try:
+                    ok, result = self._conv_view.RunScript(
+                        "document.getElementById('conversation') ? 'loaded' : 'not_loaded'"
+                    )
+                    if ok and result and "loaded" in str(result):
+                        # Also verify JS functions exist by trying to call one
+                        ok2, result2 = self._conv_view.RunScript(
+                            "try { _updateConversation('[]', 'preserve'); 'ok'; } catch(e) { e.message; }"
+                        )
+                        log.info("JS test attempt %d: %r", attempt + 1, result2)
+                        if (
+                            ok2
+                            and result2
+                            and ("ok" in str(result2) or "error" in str(result2).lower())
+                        ):
+                            log.info("Detected shell and JS working (attempt %d)", attempt + 1)
+                            self._shell_loaded = True
+                            self._page_loading = False
+                            return True
+                        log.warning("Shell loaded but JS not working (attempt %d)", attempt + 1)
+                    else:
+                        break
+                except Exception as e:
+                    log.warning("Failed to detect shell state (attempt %d): %s", attempt + 1, e)
+                    break
+            log.warning("Shell loaded but JS not working after 3 attempts, allowing retry")
+            return False
 
         def _release_render_lock(self, force_scroll_to_bottom: bool) -> None:
             """Release the render lock and process pending if needed."""
@@ -2765,80 +2851,64 @@ if _WX_AVAILABLE:
 
         def _append_entry_js(self, entry: dict, force_scroll_to_bottom: bool = False) -> None:
             """Append a single entry via JS _appendEntry (WebView path)."""
-            if not self._try_acquire_render_lock():
-                return  # _try_acquire_render_lock already set _render_pending
-
             import json as _json
 
             prepared = self._prepare_single_entry(entry)
             scroll = '"bottom"' if force_scroll_to_bottom else '"preserve"'
             js = f"_appendEntry({_json.dumps(_json.dumps(prepared))}, {scroll})"
-            log.debug("_appendEntry: type=%s, scroll=%s", entry.get("type"), scroll)
+            text = entry.get("text") or ""
+            log.debug(
+                "_appendEntry: type=%s, text_len=%d, tail=%r, scroll=%s",
+                entry.get("type"),
+                len(text),
+                text[-80:],
+                scroll,
+            )
 
-            try:
-                ok, result = self._conv_view.RunScript(js)
-                if ok:
-                    self._stream_wrapper_visible = False
-                    result_str = str(result) if result else ""
-                    if result_str.startswith("error:"):
-                        log.error(
-                            "_appendEntry JS error: %s (type=%s, js_size=%d)",
-                            result_str,
-                            entry.get("type"),
-                            len(js),
-                        )
-                    else:
-                        log.debug("_appendEntry JS result: %s", result_str)
-                else:
-                    log.error(
-                        "_appendEntry RunScript FAILED: result=%r, type=%s, js_size=%d",
-                        result,
-                        entry.get("type"),
-                        len(js),
-                    )
-                    self._render_pending = True
-            except Exception:
-                self._render_pending = True
-            finally:
-                self._release_render_lock(force_scroll_to_bottom)
+            ok, result = self._run_script(js, force_scroll_to_bottom, retry_on_failure=True)
+            if not ok:
+                # Deferred (lock busy / shell not loaded) or script failed —
+                # acquire/retry_on_failure already recorded a pending full
+                # rebuild that will replay this entry.
+                log.warning(
+                    "chat: append_entry_js deferred/retry (type=%s, text_len=%d) — pending rebuild scheduled",
+                    entry.get("type"),
+                    len(text),
+                )
+                return
+            self._stream_wrapper_visible = False
+            result_str = str(result) if result else ""
+            if result_str.startswith("error:"):
+                log.error(
+                    "_appendEntry JS error: %s (type=%s, js_size=%d)",
+                    result_str,
+                    entry.get("type"),
+                    len(js),
+                )
+            else:
+                log.debug("_appendEntry JS result: %s", result_str)
 
         def _show_stream_wrapper(self) -> None:
             """Make the stream-wrapper table visible (first streaming chunk)."""
             if not self._shell_loaded or self._stream_wrapper_visible:
                 return  # No-op
 
-            # Use the lock but handle the case where we don't need full update
-            if not self._try_acquire_render_lock():
-                return
-
-            try:
-                ok, _ = self._conv_view.RunScript(
-                    "document.getElementById('stream-wrapper').style.display=''"
-                )
-                if ok:
-                    self._stream_wrapper_visible = True
-            finally:
-                self._release_render_lock(False)
+            ok, _ = self._run_script("document.getElementById('stream-wrapper').style.display=''")
+            if ok:
+                self._stream_wrapper_visible = True
 
         def _hide_stream_wrapper(self) -> None:
             """Hide the stream-wrapper table and clear pending text."""
             if not self._shell_loaded or not self._stream_wrapper_visible:
                 return  # No-op
 
-            # Use the lock but handle the case where we don't need full update
-            if not self._try_acquire_render_lock():
-                return
-
-            try:
-                ok, _ = self._conv_view.RunScript(
-                    "var w=document.getElementById('stream-wrapper');"
-                    "if(w)w.style.display='none';"
-                    "document.getElementById('pending-ai-text').innerHTML='';"
-                )
-                if ok:
-                    self._stream_wrapper_visible = False
-            finally:
-                self._release_render_lock(False)
+            ok, _ = self._run_script(
+                "var w=document.getElementById('stream-wrapper');"
+                "if(w)w.style.display='none';"
+                "document.getElementById('pending-ai-text').innerHTML='';"
+            )
+            if ok:
+                self._stream_wrapper_visible = False
 
         def _render_conversation(self, force_scroll_to_bottom: bool = False) -> None:
             """Re-render the conversation.  Routes to WebView or HtmlWindow path."""
