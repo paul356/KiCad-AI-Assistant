@@ -157,3 +157,21 @@ the same-named pad whose copper is actually on `B.Cu` (typically the
 thru-hole pad), not merely the first occurrence in the footprint.  A
 thru-hole pad's center is a valid track terminus — the plated barrel
 carries the connection.
+
+### Same-net pad copper and drill holes
+
+The world model drops same-net pad copper entirely (the route must be
+able to land on its own endpoint pads), so a track may run across
+same-net pad *copper* without a DRC error — same net, no conflict.
+However, a same-net **thru-hole pad's drill hole** physically severs
+any track crossing it (the drill removes the copper path).  The router
+re-adds the drill hole of every same-net `thru_hole` pad as a circular
+obstacle on every routing layer, so A* routes around the hole instead
+of running a track through it.  The endpoint pads' own holes are
+exempt — the track terminates *at* the pad center, and the plated
+barrel connects all layers there.
+
+Vias must never land on any same-net pad face (a DFM defect: solder
+wicking, annular-ring breakout).  Via-forbidden zones cover **every**
+same-net pad, not just the two endpoint pads — a multi-layer route's
+vias are kept off all same-net fingers and annuli.

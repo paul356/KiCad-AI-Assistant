@@ -44,6 +44,7 @@ import logging
 import math
 import os
 
+from shapely.geometry import Point, Polygon
 from shapely.geometry import box as _shapely_box
 
 from kcaa.router.grid_a_star import (
@@ -61,7 +62,7 @@ from kcaa.router.path_postprocess import (
     postprocess_path,
 )
 from kcaa.router.visibility_graph import RouteNode
-from kcaa.router.world_model import Obstacle, build_world_model
+from kcaa.router.world_model import Obstacle, _get_net, build_world_model
 from kcaa.utils.pcb_sexp_utils import load_pcb
 
 logger = logging.getLogger(__name__)
@@ -346,13 +347,75 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
                 pad_b_world_size,
             )
 
-    # Route from pad center to pad center.  A* on the grid naturally
-    # produces 0/45/90° segments.
+    # Same-net thru-hole pads have a drilled barrel that physically severs
+    # any track crossing it — but the world model drops same-net pad
+    # copper entirely (so the route can land on its own pads), which also
+    # drops the hole.  Re-add ONLY the drill hole of each same-net
+    # ``thru_hole`` pad as a circular obstacle on every copper layer: a
+    # track may run across same-net pad *copper* (same net, no DRC error),
+    # but never across the *hole* (the drill removes the copper path).
+    # Geometry mirrors :func:`kcaa.router.world_model._npth_obstacle`.
+    pad_delta = width / 2.0 + clearance
+    _tht_hole_shapes: list = []
+    for item in data:
+        if not _is_list(item) or str(item[0]) != "footprint":
+            continue
+        fp_x, fp_y, fp_rot = _node_at3(item)
+        for sub in item:
+            if not _is_list(sub) or str(sub[0]) != "pad":
+                continue
+            if _get_net(sub) != req.net:
+                continue
+            if len(sub) < 3 or str(sub[2]) != "thru_hole":
+                continue
+            at = _get_sub(sub, "at")
+            if at is None or len(at) < 3:
+                continue
+            try:
+                lx, ly = float(at[1]), float(at[2])
+            except (TypeError, ValueError):
+                continue
+            drill_sub = _get_sub(sub, "drill")
+            if drill_sub is None or len(drill_sub) < 2:
+                continue
+            try:
+                drill = float(drill_sub[1])
+            except (TypeError, ValueError):
+                continue
+            wx_off, wy_off = _rotate(lx, ly, fp_rot)
+            wx, wy = fp_x + wx_off, fp_y + wy_off
+            # Skip endpoint pads: the route must start/end at the pad
+            # centre (on the hole), and the plated barrel connects all
+            # layers there — no obstacle needed at the termination.
+            if (abs(wx - pad_a_xy[0]) < 1e-6 and abs(wy - pad_a_xy[1]) < 1e-6) or (
+                abs(wx - pad_b_xy[0]) < 1e-6 and abs(wy - pad_b_xy[1]) < 1e-6
+            ):
+                continue
+            hole = Point(wx, wy).buffer(drill / 2.0 + pad_delta)
+            _tht_hole_shapes.append(hole)
+            for layer in obstacles_by_layer:
+                obstacles_by_layer[layer].append(
+                    Obstacle(
+                        shape=hole,
+                        layers=frozenset({layer}),
+                        net=req.net,
+                        kind="drill",
+                    )
+                )
+
+    # Route bounding box must cover the endpoint pads and every same-net
+    # THT hole obstacle: a detour around a wide drill can extend past the
+    # ±5 mm endpoint margin.
+    _hb = [s.bounds for s in _tht_hole_shapes]
+    _hx0 = min((b[0] for b in _hb), default=pad_a_xy[0])
+    _hy0 = min((b[1] for b in _hb), default=pad_a_xy[1])
+    _hx1 = max((b[2] for b in _hb), default=pad_a_xy[0])
+    _hy1 = max((b[3] for b in _hb), default=pad_b_xy[1])
     route_bbox = (
-        min(pad_a_xy[0], pad_b_xy[0]) - 5.0,
-        min(pad_a_xy[1], pad_b_xy[1]) - 5.0,
-        max(pad_a_xy[0], pad_b_xy[0]) + 5.0,
-        max(pad_a_xy[1], pad_b_xy[1]) + 5.0,
+        min(pad_a_xy[0], pad_b_xy[0], _hx0) - 5.0,
+        min(pad_a_xy[1], pad_b_xy[1], _hy0) - 5.0,
+        max(pad_a_xy[0], pad_b_xy[0], _hx1) + 5.0,
+        max(pad_a_xy[1], pad_b_xy[1], _hy1) + 5.0,
     )
     grid_res = req.grid_resolution or GRID_RESOLUTION
 
@@ -394,27 +457,15 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
 
     if req.start_layer != req.end_layer:
         # ── Multi-layer: grid A* with via edges ──────────────────────
-        # Build via-forbidden zones from start/end pad AABBs to
-        # prevent via-in-pad (DFM issue: solder wicking).
+        # Via-forbidden zones cover EVERY same-net pad, not just the two
+        # endpoint pads: a via on any same-net pad face is a DFM defect
+        # (solder wicking, annular-ring breakout).  Same-net pads are
+        # absent from the obstacle grid (the route must land on its own
+        # pads), so without this the via search would happily drop a via
+        # on a finger pad.
         via_forbidden: list = []
-        if pad_a_world_size is not None:
-            via_forbidden.append(
-                _shapely_box(
-                    pad_a_xy[0] - pad_a_world_size[0] / 2.0,
-                    pad_a_xy[1] - pad_a_world_size[1] / 2.0,
-                    pad_a_xy[0] + pad_a_world_size[0] / 2.0,
-                    pad_a_xy[1] + pad_a_world_size[1] / 2.0,
-                )
-            )
-        if pad_b_world_size is not None:
-            via_forbidden.append(
-                _shapely_box(
-                    pad_b_xy[0] - pad_b_world_size[0] / 2.0,
-                    pad_b_xy[1] - pad_b_world_size[1] / 2.0,
-                    pad_b_xy[0] + pad_b_world_size[0] / 2.0,
-                    pad_b_xy[1] + pad_b_world_size[1] / 2.0,
-                )
-            )
+        for poly, _players, _ref, _pname, _center in _same_net_pad_polygons(data, req.net):
+            via_forbidden.append(poly)
         ml_result = multi_layer_a_star(
             obstacles_by_layer,
             pad_a_xy,
@@ -1388,6 +1439,82 @@ def _pad_layers(pad_node: list) -> list[str]:
                 else:
                     layers.append(name)
     return layers
+
+
+def _same_net_pad_polygons(
+    data: list,
+    net: str,
+) -> list[tuple[object, frozenset[str], str, str, tuple[float, float]]]:
+    """Return ``(world polygon, copper layers, ref, pad name, world center)``
+    for every pad carrying ``net``.
+
+    The world model drops same-net copper so the route can land on its
+    own endpoint pads; the router re-adds those pads here as *transit*
+    obstacles — a track may terminate on a pad, never run across its
+    copper (a track through a thru-hole pad's hole is cut by the drill,
+    and a via on a pad face is a DFM defect).  Geometry mirrors
+    :func:`kcaa.router.world_model._pad_obstacle`.
+
+    The world center lets callers distinguish the *endpoint pad instance*
+    from other same-named pads by geometry — two pads on the same net
+    can share ``(ref, pad name)`` (edge connectors with multiple
+    ``3v3`` fingers), so name-based skip would wrongly exempt every
+    same-named pad.
+    """
+    out: list[tuple[object, frozenset[str], str, str, tuple[float, float]]] = []
+    for item in data:
+        if not _is_list(item) or str(item[0]) != "footprint":
+            continue
+        fp_x, fp_y, fp_rot = _node_at3(item)
+        ref = ""
+        for sub in item:
+            if (
+                _is_list(sub)
+                and str(sub[0]) == "property"
+                and len(sub) >= 3
+                and str(sub[1]) == "Reference"
+            ):
+                ref = sub[2] if isinstance(sub[2], str) else str(sub[2])
+        for sub in item:
+            if not _is_list(sub) or str(sub[0]) != "pad":
+                continue
+            if _get_net(sub) != net:
+                continue
+            if len(sub) > 2 and str(sub[2]) == "np_thru_hole":
+                continue  # bare mechanical hole — no copper to protect
+            players = _pad_layers(sub)
+            if not players:
+                continue
+            size = _get_sub(sub, "size")
+            if size is None or len(size) < 3:
+                continue
+            try:
+                pw, ph = float(size[1]), float(size[2])
+            except (TypeError, ValueError):
+                continue
+            at = _get_sub(sub, "at")
+            if at is None or len(at) < 3:
+                continue
+            try:
+                lx, ly = float(at[1]), float(at[2])
+            except (TypeError, ValueError):
+                continue
+            wx_off, wy_off = _rotate(lx, ly, fp_rot)
+            wx, wy = fp_x + wx_off, fp_y + wy_off
+            hw, hh = pw / 2.0, ph / 2.0
+            rad = math.radians(fp_rot)
+            c, s = math.cos(rad), math.sin(rad)
+            corners = [
+                (c * -hw + s * -hh, -s * -hw + c * -hh),
+                (c * hw + s * -hh, -s * hw + c * -hh),
+                (c * hw + s * hh, -s * hw + c * hh),
+                (c * -hw + s * hh, -s * -hw + c * hh),
+            ]
+            poly = Polygon([(wx + cx, wy + cy) for cx, cy in corners])
+            if poly.is_empty or not poly.is_valid:
+                continue
+            out.append((poly, frozenset(players), ref, _get_pad_name(sub), (wx, wy)))
+    return out
 
 
 # ---------------------------------------------------------------------------

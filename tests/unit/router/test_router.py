@@ -699,6 +699,144 @@ def test_duplicate_pad_name_resolves_to_layer_matching_pad(tmp_path: Path) -> No
     assert len(result.segments) > 0
 
 
+def test_multi_layer_via_not_on_same_net_pad(tmp_path: Path) -> None:
+    """A via must never land on any same-net pad face (DFM defect:
+    solder wicking / annular-ring breakout).  Via-forbidden zones
+    cover ALL same-net pads, not just the two endpoint pads."""
+    from shapely.geometry import Point, box
+
+    src = _fixture_pcb()
+    dst = tmp_path / "board.kicad_pcb"
+    board = Path(src).read_text().rstrip()
+    assert board.endswith(")")
+    # X3: same-net SMD pads on F.Cu near the route corridor between
+    # R1/1 (29.5, 30) and X1/T (64, 45).  Neither pad is an endpoint;
+    # a multi-layer route's via must avoid both.
+    x3 = (
+        "\n\t# ---- X3: same-net SMD pads, via must avoid ----\n"
+        '\t(footprint "user_add:via-dodge"\n'
+        '\t\t(layer "F.Cu")\n'
+        '\t\t(uuid "99999999-0000-0000-0000-000000000009")\n'
+        "\t\t(at 45.0 40.0 0.0)\n"
+        '\t\t(property "Reference" "X3")\n'
+        '\t\t(property "Value" "X3")\n'
+        '\t\t(pad "1" smd rect\n'
+        "\t\t\t(at 0.0 0.0)\n"
+        "\t\t\t(size 2.0 2.0)\n"
+        '\t\t\t(layers "F.Cu" "F.Mask")\n'
+        '\t\t\t(net 1 "VCC")\n'
+        "\t\t)\n"
+        '\t\t(pad "2" smd rect\n'
+        "\t\t\t(at 5.0 0.0)\n"
+        "\t\t\t(size 2.0 2.0)\n"
+        '\t\t\t(layers "F.Cu" "F.Mask")\n'
+        '\t\t\t(net 1 "VCC")\n'
+        "\t\t)\n"
+        "\t)\n"
+        # X1: duplicate T pads — THT variant on B.Cu (endpoint).
+        "\n\t# ---- X1: THT endpoint pad on B.Cu ----\n"
+        '\t(footprint "user_add:edge-connector"\n'
+        '\t\t(layer "F.Cu")\n'
+        '\t\t(uuid "66666666-0000-0000-0000-000000000006")\n'
+        "\t\t(at 62.0 45.0 0.0)\n"
+        '\t\t(property "Reference" "X1")\n'
+        '\t\t(property "Value" "X1")\n'
+        '\t\t(pad "T" thru_hole circle\n'
+        "\t\t\t(at 0.0 0.0)\n"
+        "\t\t\t(size 1.6 1.6)\n"
+        "\t\t\t(drill 1.0)\n"
+        '\t\t\t(layers "*.Cu" "*.Mask")\n'
+        '\t\t\t(net 1 "VCC")\n'
+        "\t\t)\n"
+        "\t)\n"
+    )
+    dst.write_text(board[:-1] + x3 + ")\n")
+
+    # R1/1 F.Cu -> X1/T B.Cu (both VCC).  A via is unavoidable (layer
+    # change).  The via must not land on X3/1 (45,40) or X3/2 (50,40).
+    req = RouteRequest(
+        pcb_path=str(dst),
+        ref_a="R1",
+        pad_a="1",
+        ref_b="X1",
+        pad_b="T",
+        net="VCC",
+        start_layer="F.Cu",
+        end_layer="B.Cu",
+        width=0.25,
+        clearance=0.2,
+    )
+    result = auto_route_pair(req)
+    assert len(result.vias) > 0
+    # Pad copper rectangles (unbuffered, world coords): 2×2 at (45,40)
+    # and (50,40).
+    pad_rects = [box(44, 39, 46, 41), box(49, 39, 51, 41)]
+    for via in result.vias:
+        pt = Point(via.x, via.y)
+        for i, rect in enumerate(pad_rects):
+            assert not rect.contains(pt), (
+                f"Via at ({via.x:.3f},{via.y:.3f}) lands on X3/{i + 1} pad"
+            )
+
+
+def test_multi_layer_route_avoids_same_net_tht_hole(tmp_path: Path) -> None:
+    """A same-net thru-hole pad's drill hole physically severs any track
+    crossing it.  The router must re-add the hole as an obstacle (the
+    world model drops same-net pad copper entirely) so A* routes around
+    the hole instead of running a track straight through it."""
+    from shapely.geometry import LineString, Point
+
+    src = _fixture_pcb()
+    dst = tmp_path / "board.kicad_pcb"
+    board = Path(src).read_text().rstrip()
+    assert board.endswith(")")
+    # X2: same-net THT pad sitting between R1/1 and C1/1.  Drill 3.0 mm
+    # is large enough that a straight track at x≈45 would cross the hole.
+    x2 = (
+        "\n\t# ---- X2: same-net THT transit pad between R1 and C1 ----\n"
+        '\t(footprint "user_add:tht-blocker"\n'
+        '\t\t(layer "F.Cu")\n'
+        '\t\t(uuid "88888888-0000-0000-0000-000000000008")\n'
+        "\t\t(at 45.0 30.0 0.0)\n"
+        '\t\t(property "Reference" "X2")\n'
+        '\t\t(property "Value" "X2")\n'
+        '\t\t(pad "1" thru_hole circle\n'
+        "\t\t\t(at 0.0 0.0)\n"
+        "\t\t\t(size 4.0 4.0)\n"
+        "\t\t\t(drill 3.0)\n"
+        '\t\t\t(layers "*.Cu" "*.Mask")\n'
+        '\t\t\t(net 1 "VCC")\n'
+        "\t\t)\n"
+        "\t)\n"
+    )
+    dst.write_text(board[:-1] + x2 + ")\n")
+
+    # R1/1 (29.5, 30) F.Cu -> C1/1 (60, 29.5) F.Cu, both VCC.
+    # Without the hole obstacle, A* would run a track at y≈30 through
+    # X2's drill (center 45,30, r=1.5).  The hole forces a detour.
+    req = RouteRequest(
+        pcb_path=str(dst),
+        ref_a="R1",
+        pad_a="1",
+        ref_b="C1",
+        pad_b="1",
+        net="VCC",
+        start_layer="F.Cu",
+        end_layer="F.Cu",
+        width=0.25,
+        clearance=0.2,
+    )
+    result = auto_route_pair(req)
+    assert len(result.segments) > 0
+    # No segment may cross the actual drill hole (r=1.5 at (45, 30)).
+    hole = Point(45.0, 30.0).buffer(1.5)
+    for seg in result.segments:
+        line = LineString([(seg.x1, seg.y1), (seg.x2, seg.y2)])
+        assert not line.intersects(hole), (
+            f"Segment {seg.x1:.3f},{seg.y1:.3f}->{seg.x2:.3f},{seg.y2:.3f} crosses X2 drill hole"
+        )
+
+
 def _board_with_bay_connector(tmp_path: Path) -> Path:
     """Fixture board + X1 edge connector at the top edge (baseline outline
     top y=60): X1 draws its bay with fp Edge.Cuts items (top at local y=4,
