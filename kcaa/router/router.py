@@ -352,11 +352,13 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
     # transit obstacle on the copper layers it covers so the track never
     # overlaps other same-net pad copper — it terminates on the endpoint
     # pad only and connects to other same-net pads by separate tracks
-    # later.  Buffer by ``width/2`` (no clearance): same net needs no
-    # DRC clearance, the buffer just keeps the track *edge* off the pad
-    # copper.  The two endpoint pads are exempt on their own terminal
-    # layers so the track can start/end at their centres.
-    pad_half = 0.0  # same-net: no DRC clearance, block only the pad copper itself
+    # later.  Buffer by ``width / 2 + clearance``: the track edge must
+    # keep a clearance gap from the pad copper, same as for any other
+    # obstacle.  If this makes the route impossible at the requested
+    # width, that is the correct answer — the user should try a
+    # narrower track.  The two endpoint pads are exempt on their own
+    # terminal layers so the track can start/end at their centres.
+    pad_half = width / 2.0 + clearance
     _sn_shapes: list = []
     for poly, players, _ref, _pname, center in _same_net_pad_polygons(data, req.net):
         is_end = (abs(center[0] - pad_a_xy[0]) < 1e-6 and abs(center[1] - pad_a_xy[1]) < 1e-6) or (

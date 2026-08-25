@@ -163,14 +163,13 @@ carries the connection.
 The world model drops same-net pad copper entirely (the route must be
 able to land on its own endpoint pads).  The router re-adds every
 same-net pad as a transit obstacle on the copper layers it covers so
-the track centreline never enters another same-net pad's copper — the
-track terminates on the endpoint pad only, and other same-net pads
-should be connected by separate tracks later.  The buffer is zero (no
-DRC clearance): same net needs no clearance, the obstacle just keeps
-the track *centreline* off the pad copper.  The track edge may still
-touch the pad edge for wide tracks in tight geometry — this is not a
-DRC error (same net) and is preferable to failing the route.  The two
-endpoint pads are exempt on their own terminal layers so the track can
+the track never overlaps other same-net pad copper — it terminates on
+the endpoint pad only and connects to other same-net pads by separate
+tracks later.  Buffer is ``width/2 + clearance``: the track edge must
+keep a full clearance gap from the pad copper, same as for any other
+obstacle.  If this makes the route impossible at the requested width,
+that is the correct answer — try a narrower track.  The two endpoint
+pads are exempt on their own terminal layers so the track can
 start/end at their centres; a same-net thru-hole pad's drill hole is
 covered by its pad-copper obstacle (non-endpoint pads), so a track
 never crosses a hole the drill physically severs.
