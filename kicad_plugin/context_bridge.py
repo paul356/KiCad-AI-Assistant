@@ -29,14 +29,12 @@ def collect_context() -> dict[str, Any]:
         active_project     Absolute path to .kicad_pro, or None
         active_schematic   Absolute path to .kicad_sch (root), or None
         active_pcb         Absolute path to .kicad_pcb, or None
-        selected_refs      List of component reference strings currently selected
         active_sheet       Sheet path in hierarchical schematics, or None
     """
     ctx: dict[str, Any] = {
         "active_project": None,
         "active_schematic": None,
         "active_pcb": None,
-        "selected_refs": [],
         "active_sheet": None,
     }
 
@@ -46,7 +44,7 @@ def collect_context() -> dict[str, Any]:
         return ctx
 
     # ------------------------------------------------------------------ #
-    # PCB file path + selection (single GetBoard() call)
+    # PCB file path (single GetBoard() call)
     # ------------------------------------------------------------------ #
     try:
         board = pcbnew.GetBoard()
@@ -64,16 +62,6 @@ def collect_context() -> dict[str, Any]:
                 sch_path = os.path.join(proj_dir, proj_name + ".kicad_sch")
                 if os.path.exists(sch_path):
                     ctx["active_schematic"] = os.path.abspath(sch_path)
-
-            # Collect selected footprint references
-            selection = []
-            for fp in board.GetFootprints():
-                try:
-                    if fp.IsSelected():
-                        selection.append(fp.GetReference())
-                except Exception as e:
-                    log.debug("Could not get footprint reference: %s", e)
-            ctx["selected_refs"] = selection
     except Exception as e:
         log.debug("Could not collect PCB context: %s", e)
 
@@ -101,12 +89,6 @@ def context_to_system_prompt_block(ctx: dict[str, Any]) -> str:
         lines.append(f"Active PCB: {ctx['active_pcb']}")
     else:
         lines.append("Active PCB: (none)")
-
-    refs = ctx.get("selected_refs", [])
-    if refs:
-        lines.append(f"Selected components: {', '.join(refs)}")
-    else:
-        lines.append("Selected components: (none)")
 
     if ctx.get("active_sheet"):
         lines.append(f"Active sheet path: {ctx['active_sheet']}")

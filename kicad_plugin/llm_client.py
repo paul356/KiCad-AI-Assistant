@@ -1066,23 +1066,36 @@ class LLMClient:
             )
 
     def _maybe_compact(self, system_prompt: str) -> None:
-        """Dedup tool calls then, if the token budget is exceeded, compact history.
+        """Manage history purely by token budget.
 
-        This is the sole history-management entry point; called once per user turn
-        before the LLM is invoked.
+        Under budget, history is left byte-identical (append-only growth), so
+        provider automatic prefix caches stay valid across turns.  All history
+        mutation — dedup of superseded tool turns, stale-query annotations, and
+        compaction — happens only once the budget is exceeded.
+
+        The one exception is ``_prune_rollback_history``: restoring an earlier
+        file version invalidates prior tool turns, so those are removed every
+        turn for correctness regardless of budget (rare, restore-only).
         """
         self._prune_rollback_history()
-        self._annotate_stale_queries()
-        self._dedup_tool_calls()
 
+        # ---- Budget check --------------------------------------------------
         system_tokens = len(system_prompt) // 4
         history_tokens = self._estimate_tokens(self._history)
         used = system_tokens + history_tokens
         budget = self._context_tokens * self._compact_threshold
 
         if used <= budget:
-            return  # well within limits, nothing to do
+            return  # well within limits — history stays append-only for cache
 
+        # ---- Over budget: cheapest saving first — drop superseded turns ----
+        self._dedup_tool_calls()
+        history_tokens = self._estimate_tokens(self._history)
+        used = system_tokens + history_tokens
+        if used <= budget:
+            return  # dedup alone brought us back within budget
+
+        # ---- Still over budget: compact, then annotate preserved turns -----
         # Estimate the cost of the recent turns we will always keep
         i = len(self._history) - 1
         turns_found = 0
@@ -1107,6 +1120,10 @@ class LLMClient:
 
         self._compact_history(system_prompt, target_summary_chars)
         self._validate_history()  # compaction rebuilds history; verify integrity
+
+        # Annotate stale query results among the preserved turns only — the
+        # compacted prefix is summarized, so nothing earlier needs marking.
+        self._annotate_stale_queries()
 
     @staticmethod
     def _tool_result_succeeded(result: Any) -> bool:
