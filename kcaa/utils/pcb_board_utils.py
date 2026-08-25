@@ -415,3 +415,105 @@ def get_fp_courtyard_bbox(
         "width": round(max_x - min_x, 6),
         "height": round(max_y - min_y, 6),
     }
+
+
+# ---------------------------------------------------------------------------
+# Footprint Edge.Cuts graphic items
+# ---------------------------------------------------------------------------
+
+
+def get_fp_edge_cuts_items(fp_node: list[Any]) -> list[dict[str, Any]]:
+    """Return all ``fp_*`` graphic items on Edge.Cuts inside a footprint.
+
+    Scans the footprint's content items for ``fp_line``/``fp_rect``/
+    ``fp_arc``/``fp_circle``/``fp_curve`` whose layer is ``Edge.Cuts`` (or
+    the legacy ``Edge_Cuts`` spelling) and returns their geometry in
+    **footprint-local coordinates** (mm, same frame as pads' ``local_x``/
+    ``local_y``).  Transform to board world coordinates the same way as pads:
+    ``world = fp.(x,y) + rotation(local)`` (clockwise-positive, +Y down).
+
+    Additional keys depend on the item type, mirroring
+    :func:`get_edge_cuts_items`:
+
+    - ``fp_line`` / ``fp_rect``: ``x1``, ``y1``, ``x2``, ``y2``, ``width``
+    - ``fp_arc``: ``start_x``, ``start_y``, ``mid_x``, ``mid_y``,
+      ``end_x``, ``end_y``, ``width``
+    - ``fp_circle``: ``cx``, ``cy``, ``ex``, ``ey``, ``width``
+      (``(end ...)`` is a point on the circumference as stored by KiCad)
+    - ``fp_curve``: ``pts`` (list of ``(x, y)`` tuples), ``width``
+
+    :param fp_node: A footprint S-expression list node — i.e. the list of
+        content items such as a placed footprint found via ``find_footprint``
+        or the parsed children of a ``.kicad_mod`` file.
+    :returns: List of graphic-item dicts on the footprint's Edge.Cuts layer.
+    """
+
+    def _stroke_width(node: list[Any]) -> float | None:
+        """Return the stroke width of a graphic node, or None."""
+        for sub in node:
+            if isinstance(sub, list) and _sym(sub[0]) == "stroke":
+                for ssub in sub:
+                    if isinstance(ssub, list) and len(ssub) >= 2 and _sym(ssub[0]) == "width":
+                        return float(ssub[1])
+            elif isinstance(sub, list) and len(sub) >= 2 and _sym(sub[0]) == "width":
+                return float(sub[1])
+        return None
+
+    result: list[dict[str, Any]] = []
+    for item in fp_node:
+        if not (isinstance(item, list) and len(item) > 0):
+            continue
+        kind = _sym(item[0])
+        if kind not in _FP_GRAPHIC_TYPES:
+            continue
+        layer = _get_layer(item)
+        if not _is_edge_cuts(layer):
+            continue
+
+        info: dict[str, Any] = {"type": kind, "layer": layer}
+
+        if kind in ("fp_line", "fp_rect"):
+            for sub in item:
+                if isinstance(sub, list) and len(sub) >= 3:
+                    k = _sym(sub[0])
+                    if k == "start":
+                        info["x1"], info["y1"] = float(sub[1]), float(sub[2])
+                    elif k == "end":
+                        info["x2"], info["y2"] = float(sub[1]), float(sub[2])
+
+        elif kind == "fp_arc":
+            for sub in item:
+                if isinstance(sub, list) and len(sub) >= 3:
+                    k = _sym(sub[0])
+                    if k == "start":
+                        info["start_x"], info["start_y"] = float(sub[1]), float(sub[2])
+                    elif k == "mid":
+                        info["mid_x"], info["mid_y"] = float(sub[1]), float(sub[2])
+                    elif k == "end":
+                        info["end_x"], info["end_y"] = float(sub[1]), float(sub[2])
+
+        elif kind == "fp_circle":
+            for sub in item:
+                if isinstance(sub, list) and len(sub) >= 3:
+                    k = _sym(sub[0])
+                    if k == "center":
+                        info["cx"], info["cy"] = float(sub[1]), float(sub[2])
+                    elif k == "end":
+                        info["ex"], info["ey"] = float(sub[1]), float(sub[2])
+
+        elif kind == "fp_curve":
+            pts: list[tuple[float, float]] = []
+            for sub in item:
+                if not (isinstance(sub, list) and _sym(sub[0]) == "pts"):
+                    continue
+                for pt in sub[1:]:
+                    if isinstance(pt, list) and len(pt) >= 3 and _sym(pt[0]) == "xy":
+                        pts.append((float(pt[1]), float(pt[2])))
+            if pts:
+                info["pts"] = pts
+
+        width = _stroke_width(item)
+        if width is not None:
+            info["width"] = width
+        result.append(info)
+    return result
