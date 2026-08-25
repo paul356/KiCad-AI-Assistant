@@ -478,29 +478,82 @@ def _keepout_obstacle(zone_node: list[Any]) -> Obstacle | None:
     return Obstacle(shape=poly, layers=frozenset({layer}), net=None, kind="keepout")
 
 
+_EDGE_GRAPHICS = {
+    "gr_line",
+    "gr_rect",
+    "gr_arc",
+    "gr_circle",
+    "gr_poly",
+    "fp_line",
+    "fp_rect",
+    "fp_arc",
+    "fp_circle",
+    "fp_poly",
+}
+
+
 def _board_bbox(data: list[Any]) -> tuple[float, float, float, float] | None:
-    """Compute the AABB of all Edge.Cuts items, or None."""
+    """Compute the AABB of all Edge.Cuts items, or None.
+
+    The outline is not always board-level graphics: edge-mounted
+    connectors (e.g. a micro:bit card bay) draw the notch they sit in
+    with ``fp_line``/``fp_poly`` Edge.Cuts items inside the footprint,
+    and those items are part of the real board outline.  Footprint
+    items are transformed into world coordinates through the footprint's
+    ``(at x y rot)`` placement.
+    """
     xs: list[float] = []
     ys: list[float] = []
-    for item in data:
-        if not _is_list(item):
-            continue
-        tag = _sym(item[0])
-        if tag not in {"gr_line", "gr_rect", "gr_arc", "gr_circle"}:
-            continue
-        layer = _get_layer_str(item)
-        if layer != "Edge.Cuts":
-            continue
-        for sub in item:
-            if not _is_list(sub):
-                continue
-            k = _sym(sub[0])
-            if k in {"start", "end", "mid", "center"} and len(sub) >= 3:
+
+    def _walk(node: list[Any], ox: float, oy: float, rot: float) -> None:
+        if not _is_list(node):
+            return
+        tag = _sym(node[0])
+        if tag == "footprint":
+            fox, foy, frot = ox, oy, rot
+            at = _get_sub(node, "at")
+            if at is not None and len(at) >= 3:
                 try:
-                    xs.append(float(sub[1]))
-                    ys.append(float(sub[2]))
+                    fox, foy = float(at[1]), float(at[2])
                 except (TypeError, ValueError):
                     pass
+                if len(at) >= 4:
+                    try:
+                        frot = float(at[3])
+                    except (TypeError, ValueError):
+                        pass
+            for sub in node:
+                _walk(sub, fox, foy, frot)
+            return
+        if tag in _EDGE_GRAPHICS:
+            if _get_layer_str(node) != "Edge.Cuts":
+                return
+            rad = math.radians(rot)
+            c, s = math.cos(rad), math.sin(rad)
+            for sub in node:
+                if not _is_list(sub):
+                    continue
+                k = _sym(sub[0])
+                if k in {"start", "end", "mid", "center"} and len(sub) >= 3:
+                    try:
+                        lx, ly = float(sub[1]), float(sub[2])
+                    except (TypeError, ValueError):
+                        continue
+                elif k == "xy" and len(sub) >= 3:
+                    try:
+                        lx, ly = float(sub[1]), float(sub[2])
+                    except (TypeError, ValueError):
+                        continue
+                else:
+                    continue
+                xs.append(ox + c * lx + s * ly)
+                ys.append(oy - s * lx + c * ly)
+            return
+        for sub in node:
+            _walk(sub, ox, oy, rot)
+
+    for item in data:
+        _walk(item, 0.0, 0.0, 0.0)
     if not xs:
         return None
     return min(xs), min(ys), max(xs), max(ys)

@@ -31,7 +31,10 @@ copper on other layers is a parallel plane and is ignored.  The board
 bounds check exempts the two endpoint pads' rectangles: a pad whose
 copper straddles the board edge (edge-mounted connectors) is a legal
 terminus, even though the track must otherwise stay inside the
-Edge.Cuts outline.
+Edge.Cuts outline.  The outline includes Edge.Cuts profiles drawn
+*inside* footprints — an edge-mounted connector (e.g. a card bay)
+describes the notch it sits in with its own Edge.Cuts items, and that
+region is real board area, so tracks may run into it.
 
 ## Multi-layer routing (via insertion)
 

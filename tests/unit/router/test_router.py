@@ -697,3 +697,84 @@ def test_duplicate_pad_name_resolves_to_layer_matching_pad(tmp_path: Path) -> No
     assert result.end == pytest.approx((64.0, 45.0), abs=0.02)
     assert result.layers_used == ["F.Cu", "B.Cu"]
     assert len(result.segments) > 0
+
+
+def _board_with_bay_connector(tmp_path: Path) -> Path:
+    """Fixture board + X1 edge connector at the top edge (baseline outline
+    top y=60): X1 draws its bay with fp Edge.Cuts items (top at local y=4,
+    world y=64) and carries pad T at local (2, 2) — world (64, 62) — which
+    sits in the bay, above the gr-only outline."""
+    src = _fixture_pcb()
+    dst = tmp_path / "board.kicad_pcb"
+    board = Path(src).read_text().rstrip()
+    assert board.endswith(")")
+    x1 = (
+        "\n\t# ---- X1: edge connector bay drawn with fp Edge.Cuts ----\n"
+        '\t(footprint "user_add:edge-connector"\n'
+        '\t\t(layer "F.Cu")\n'
+        '\t\t(uuid "77777777-0000-0000-0000-000000000007")\n'
+        "\t\t(at 62.0 60.0 0.0)\n"
+        '\t\t(property "Reference" "X1")\n'
+        '\t\t(property "Value" "X1")\n'
+        "\t\t(fp_line\n"
+        "\t\t\t(start -3.0 0.0)\n"
+        "\t\t\t(end -3.0 4.0)\n"
+        "\t\t\t(stroke (width 0.1) (type solid))\n"
+        '\t\t\t(layer "Edge.Cuts")\n'
+        "\t\t)\n"
+        "\t\t(fp_line\n"
+        "\t\t\t(start -3.0 4.0)\n"
+        "\t\t\t(end 7.0 4.0)\n"
+        "\t\t\t(stroke (width 0.1) (type solid))\n"
+        '\t\t\t(layer "Edge.Cuts")\n'
+        "\t\t)\n"
+        "\t\t(fp_line\n"
+        "\t\t\t(start 7.0 4.0)\n"
+        "\t\t\t(end 7.0 0.0)\n"
+        "\t\t\t(stroke (width 0.1) (type solid))\n"
+        '\t\t\t(layer "Edge.Cuts")\n'
+        "\t\t)\n"
+        '\t\t(pad "T" smd rect\n'
+        "\t\t\t(at 2.0 2.0)\n"
+        "\t\t\t(size 1.0 1.0)\n"
+        '\t\t\t(layers "F.Cu" "F.Mask")\n'
+        '\t\t\t(net 1 "VCC")\n'
+        "\t\t)\n"
+        "\t)\n"
+    )
+    dst.write_text(board[:-1] + x1 + ")\n")
+    return dst
+
+
+def test_board_bbox_includes_footprint_edge_cuts_profile(tmp_path: Path) -> None:
+    """Edge-mounted connectors describe the notch they sit in with
+    footprint-level Edge.Cuts items; those are part of the board outline
+    and must widen the AABB (baseline outline (0,0)-(70,60) → top 64)."""
+    from kcaa.router.world_model import _board_bbox
+
+    dst = _board_with_bay_connector(tmp_path)
+    data = load_pcb(str(dst))
+    bbox = _board_bbox(data)
+    assert bbox == (20.0, 20.0, 70.0, 64.0)
+
+
+def test_auto_route_pair_reaches_pad_in_footprint_drawn_bay(tmp_path: Path) -> None:
+    """A route into a pad sitting in a footprint-drawn bay (above the gr-only
+    outline) must pass the board-bounds check once the outline includes the
+    footprint Edge.Cuts profile."""
+    dst = _board_with_bay_connector(tmp_path)
+    req = RouteRequest(
+        pcb_path=str(dst),
+        ref_a="R1",
+        pad_a="1",
+        ref_b="X1",
+        pad_b="T",
+        net="VCC",
+        start_layer="F.Cu",
+        end_layer="F.Cu",
+        width=0.25,
+        clearance=0.2,
+    )
+    result = auto_route_pair(req)
+    assert result.end == pytest.approx((64.0, 62.0), abs=0.02)
+    assert len(result.segments) > 0
