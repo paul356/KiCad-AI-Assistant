@@ -718,6 +718,13 @@ def _grid_line_clear(
     return True
 
 
+def _is_45_family(x0: float, y0: float, x1: float, y1: float) -> bool:
+    """True when the segment (x0,y0)-(x1,y1) is axis-aligned or a 45° diagonal."""
+    dx = abs(x1 - x0)
+    dy = abs(y1 - y0)
+    return abs(dx) < 1e-6 or abs(dy) < 1e-6 or abs(dx - dy) < 1e-6
+
+
 def shortcut_path(
     pts: list[tuple[float, float]],
     obstacles: list,
@@ -728,17 +735,11 @@ def shortcut_path(
 
     Builds a walkability grid once, then for each point tries to skip
     as many subsequent points as possible while keeping the line clear.
-    Only 0°/45°/90°/135° shortcuts are preferred, but near-45° angles
-    are accepted (``snap_to_45_path_safe`` fixes angles afterward).
-
-    Args:
-        pts: Ordered ``(x, y)`` points (after collinear simplification).
-        obstacles: Inflated obstacle list (Polygon objects).
-        bbox: ``(min_x, min_y, max_x, max_y)`` of the route area.
-        resolution: Grid cell size in mm.
-
-    Returns:
-        Simplified polyline with redundant points removed.
+    Only 0°/45°/90°/135° shortcuts are accepted.  A shortcut that would
+    skip a direction change all the way through (producing a near-45°
+    long diagonal) is REJECTED: snapping that back to the 45° family
+    later would have to force a Manhattan corner (often a 90° turn), so
+    it is better to keep the original 45°+axis-aligned waypoints.
     """
     if len(pts) <= 2:
         return list(pts)
@@ -749,6 +750,13 @@ def shortcut_path(
     while i < len(pts) - 1:
         best_next = i + 1
         for k in range(len(pts) - 1, i, -1):
+            if not _is_45_family(
+                result[-1][0],
+                result[-1][1],
+                pts[k][0],
+                pts[k][1],
+            ):
+                continue
             if _grid_line_clear(
                 grid,
                 result[-1][0],

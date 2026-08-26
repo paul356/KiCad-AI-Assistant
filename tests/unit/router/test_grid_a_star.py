@@ -178,6 +178,56 @@ class TestMultiLayerAStar:
         assert _VIA_COST == 2.0
 
 
+# ── shortcut_path ─────────────────────────────────────────────────────
+
+
+class TestShortcutPath:
+    """Tests for :func:`shortcut_path` 45°-family constraint.
+
+    The router must never emit a shortcut that is not 0/45/90/135°:
+    snap_to_45_path_safe can only repair such segments into a Manhattan
+    corner pair, which often collapses into a 90° turn (and can even be
+    blocked).  Keep the original 45°+axis-aligned waypoints instead.
+    """
+
+    def test_rejects_non_45_shortcut_keeps_waypoint(self):
+        """A 50° shortcut (45° diagonal + vertical tail) must be rejected,
+        keeping the intermediate point so the path stays 0/45/90."""
+        from kcaa.router.grid_a_star import shortcut_path
+
+        # Mirror the test-route end shape: 45° approach then a vertical
+        # tail into the pad.  Shortcutting (10,10)->(20,25) is a ~50° line.
+        pts = [(0.0, 20.0), (10.0, 10.0), (20.0, 25.0)]
+        bbox = (-2.0, 8.0, 24.0, 27.0)
+        out = shortcut_path(pts, [], bbox, resolution=0.1)
+        # The near-45 shortcut is rejected -> intermediate point kept.
+        assert out == pts
+
+    def test_accepts_aligned_shortcuts(self):
+        """Axis-aligned and true-45° shortcuts are still collapsed."""
+        from kcaa.router.grid_a_star import shortcut_path
+
+        # Three collinear points on a single horizontal line -> one segment.
+        pts = [(0.0, 5.0), (5.0, 5.0), (10.0, 5.0)]
+        bbox = (-2.0, 3.0, 12.0, 7.0)
+        out = shortcut_path(pts, [], bbox, resolution=0.1)
+        assert len(out) == 2
+        assert out[0] == (0.0, 5.0)
+        assert out[-1] == (10.0, 5.0)
+
+    def test_true_45_diagonal_collapses(self):
+        """A genuine 45° corner is one segment after shortcutting."""
+        from kcaa.router.grid_a_star import shortcut_path
+
+        # (0,10) -> (10,0) is exactly 45°; intermediate point removable.
+        pts = [(0.0, 10.0), (5.0, 5.0), (10.0, 0.0)]
+        bbox = (-2.0, -2.0, 12.0, 12.0)
+        out = shortcut_path(pts, [], bbox, resolution=0.1)
+        assert len(out) == 2
+        assert out[0] == (0.0, 10.0)
+        assert out[-1] == (10.0, 0.0)
+
+
 # ── _subtract_pad_aabb ────────────────────────────────────────────────
 
 
