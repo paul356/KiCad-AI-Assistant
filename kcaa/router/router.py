@@ -12,7 +12,7 @@ Pipeline
 3. **Find pad centers**: locate the two pads to connect and read their copper
    pad shape's center.
 4. **Pick exit points**: choose one or two candidate exit points on the pad
-   edge for each end (axis-aligned first, 45° if needed).
+   edge for each end (axis-aligned first, 45 deg  if needed).
 5. **Grid search + A\\***: build a walkability grid from inflated obstacles
    and run 8-direction A*.  Multi-layer routes insert via edges at legal
    (x, y) positions between layers in ``via_pairs``.
@@ -24,7 +24,7 @@ Multi-layer routing
 
 When ``start_layer != end_layer`` the router builds one GridMap per
 routing layer and runs a multi-layer A* that can insert via edges.
-Via edges cost 2.0 mm (configurable) — this penalises vias so A* prefers
+Via edges cost 2.0 mm (configurable) -- this penalises vias so A* prefers
 routing on a single layer when possible.
 
 No shove
@@ -130,19 +130,22 @@ class RouteRequest:
             through-via. Default is ``(("F.Cu", "B.Cu"),)``. Pass an
             explicit tuple to restrict transitions (e.g. to forbid inner-
             layer vias on a 4-layer board).
-        width: Track width; ``None`` → resolve from netclass.
-        clearance: Minimum clearance to obstacles; ``None`` → resolve from
+        width: Track width; ``None`` -> resolve from netclass.
+        clearance: Minimum clearance to obstacles; ``None`` -> resolve from
             the board's design rules.
-        via_diameter / via_drill: Through-via dimensions; ``None`` →
+        via_diameter / via_drill: Through-via dimensions; ``None`` ->
             resolve from netclass.
         max_miter_mm: Maximum corner miter extension before falling back
-            to a sharp 90° corner.
+            to a sharp 90 deg  corner.
         grid_resolution: Grid cell size in mm for the walkability grid.
             Smaller values give finer paths but more cells.  ``None``
             uses the default (0.025 mm).
         via_cost: Distance-equivalent penalty for taking a via edge in
             multi-layer A*.  Higher values discourage unnecessary stack
             vias.  Default 2.0 mm.
+        turn_penalty: Distance-equivalent cost added when the path
+            changes direction.  0 disables (pure shortest path).
+            Default 0.3 mm ~ 3 cells at 0.1 mm resolution.
     """
 
     pcb_path: str
@@ -158,8 +161,9 @@ class RouteRequest:
     via_diameter: float | None = None
     via_drill: float | None = None
     max_miter_mm: float = 1.0
-    grid_resolution: float | None = None  # None → GRID_RESOLUTION
+    grid_resolution: float | None = None  # None -> GRID_RESOLUTION
     via_cost: float = 2.0  # mm penalty per via edge
+    turn_penalty: float = 0.3  # mm penalty per direction change; 0 disables
 
 
 @dataclass
@@ -289,7 +293,7 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
         )
 
     # World model: only existing copper (tracks, vias, keepouts) blocks the
-    # route.  Footprint courtyards are NOT obstacles — they're a DRC spacing
+    # route.  Footprint courtyards are NOT obstacles -- they're a DRC spacing
     # concept, not a hard copper boundary, and treating them as forbidden
     # forces pointless detours around parts.  Start/end footprints would be
     # excluded anyway, but we skip the whole footprint layer.
@@ -309,7 +313,7 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
         obstacles_by_layer[rl] = [o for o in buffered if rl in o.layers]
 
     # Detect rectangular pads to replace A* path inside them.
-    # A pad is "rectangular" when its width and height differ by ≥ 20%.
+    # A pad is "rectangular" when its width and height differ by >= 20%.
     def _is_rect(size: tuple[float, float] | None) -> bool:
         if size is None:
             return False
@@ -317,7 +321,7 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
         return w > 0 and h > 0 and abs(w - h) / max(w, h) >= 0.2
 
     def _world_size(local_w: float, local_h: float, fp_rot: float) -> tuple[float, float]:
-        """Return (world_w, world_h) accounting for ±90° footprint rotation."""
+        """Return (world_w, world_h) accounting for +/-90 degree footprint rotation."""
         if abs(fp_rot % 180.0 - 90.0) < 0.1:
             return local_h, local_w
         return local_w, local_h
@@ -357,12 +361,12 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
     # The world model drops same-net pad copper entirely (the route must
     # land on its own endpoint pads).  Re-add every same-net pad as a
     # transit obstacle on the copper layers it covers so the track never
-    # overlaps other same-net pad copper — it terminates on the endpoint
+    # overlaps other same-net pad copper -- it terminates on the endpoint
     # pad only and connects to other same-net pads by separate tracks
     # later.  Buffer by ``width / 2 + clearance``: the track edge must
     # keep a clearance gap from the pad copper, same as for any other
     # obstacle.  If this makes the route impossible at the requested
-    # width, that is the correct answer — the user should try a
+    # width, that is the correct answer -- the user should try a
     # narrower track.  The two endpoint pads are exempt on their own
     # terminal layers so the track can start/end at their centres.
     pad_half = width / 2.0 + clearance
@@ -391,7 +395,7 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
 
     # Route bounding box must cover the endpoint pads and every same-net
     # pad obstacle: a detour around a wide pad cluster can extend past
-    # the ±5 mm endpoint margin.
+    # the +/-5 mm endpoint margin.
     _hb = [s.bounds for s in _sn_shapes]
     _hx0 = min((b[0] for b in _hb), default=pad_a_xy[0])
     _hy0 = min((b[1] for b in _hb), default=pad_a_xy[1])
@@ -410,7 +414,7 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
     _bx, _by = pad_b_xy
     print(
         f"  [route] {req.ref_a}/{req.pad_a} ({_ax:.3f},{_ay:.3f})"
-        f" → {req.ref_b}/{req.pad_b} ({_bx:.3f},{_by:.3f})"
+        f" -> {req.ref_b}/{req.pad_b} ({_bx:.3f},{_by:.3f})"
         f"  size_a={pad_a_size} size_b={pad_b_size}"
     )
     # Build pad-rectangle descriptors early (used by postprocess_path in
@@ -442,7 +446,7 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
             )
 
     if start_layer != end_layer:
-        # ── Multi-layer: grid A* with via edges ──────────────────────
+        # -- Multi-layer: grid A* with via edges ----------------------
         # Via-forbidden zones cover EVERY same-net pad, not just the two
         # endpoint pads: a via on any same-net pad face is a DFM defect
         # (solder wicking, annular-ring breakout).  Same-net pads are
@@ -463,12 +467,13 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
             grid_res,
             via_cost=req.via_cost,
             via_forbidden_zones=via_forbidden or None,
+            turn_penalty=req.turn_penalty,
         )
         if ml_result.path is None:
             raise RouteFailure(
                 f"No obstacle-avoiding multi-layer path from "
                 f"{req.ref_a}/{req.pad_a} to {req.ref_b}/{req.pad_b} at "
-                f"{width}mm track width ({start_layer} → {end_layer})."
+                f"{width}mm track width ({start_layer} -> {end_layer})."
             )
         print(
             f"  [route] multi-layer A*: {len(ml_result.path)} pts"
@@ -511,7 +516,7 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
                 _log_path(f"{prefix}-pad-replace", pts, n_before)
             _dump_viz(f"{prefix}-1-pad-replace", pts, _pad_viz, obs, route_bbox)
 
-            # Simplify → shortcut → snap45.
+            # Simplify -> shortcut -> snap45.
             pts = _postprocess_layer_segment(pts, obs, route_bbox, grid_res, prefix, _pad_viz)
 
             # Align endpoint to pad centre (start/end segments only).
@@ -547,7 +552,7 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
         end_xy = (all_nodes[-1].x, all_nodes[-1].y)
         layers_used = _layers_used(all_nodes)
     else:
-        # ── Single-layer: hierarchical A* ───────────────────────────
+        # -- Single-layer: hierarchical A* ---------------------------
         # Only copper on the routing layer can block the track; other
         # layers are parallel physical planes and must not poison the
         # grid (the multi-layer branch groups by layer for the same
@@ -557,8 +562,8 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
             layer_obstacles,
             pad_a_xy,
             pad_b_xy,
-            fine_resolution=grid_res,
             route_bbox=route_bbox,
+            turn_penalty=req.turn_penalty,
         )
         if result.path is None:
             raise RouteFailure(
@@ -573,7 +578,7 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
         _dump_viz("0-astar", raw_pts, _pad_viz, buffered, route_bbox)
 
         # ---- Discard A* path inside rectangular pads and replace with
-        #      axis-aligned wire (fence → centre). ----
+        #      axis-aligned wire (fence -> centre). ----
         best_path_pts = raw_pts
         if pad_a_size is not None:
             n_before = len(best_path_pts)
@@ -587,7 +592,7 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
             _log_path("pad_b-replace", best_path_pts, n_before)
         _dump_viz("1-pad-replace", best_path_pts, _pad_viz, buffered, route_bbox)
 
-        # ---- Post-process: simplify → shortcut → snap45 ----
+        # ---- Post-process: simplify -> shortcut -> snap45 ----
         best_path_pts = _postprocess_layer_segment(
             best_path_pts, buffered, route_bbox, grid_res, "", _pad_viz
         )
@@ -669,7 +674,7 @@ def connect_with_via(
 ) -> OutputVia:
     """Helper to build a through-via connecting two segments on different layers.
 
-    The via is placed at the (x, y) of ``seg_a``'s end. Both segments are
+    The via is placed at the (x, y) of seg_a end. Both segments are
     expected to end at the same point.
     """
     return OutputVia(
@@ -712,7 +717,7 @@ def _log_path(label: str, pts: list[tuple[float, float]], prev_n: int | None = N
             kind = "45diag"
         else:
             kind = f"{ang:.0f}deg"
-        segs.append(f"({x1:.3f},{y1:.3f})→({x2:.3f},{y2:.3f}){kind}")
+        segs.append(f"({x1:.3f},{y1:.3f})->({x2:.3f},{y2:.3f}){kind}")
     print(f"  [{label}] {n} pts{delta}: {segs[0]}{'  ...  ' + segs[-1] if len(segs) > 1 else ''}")
     if len(segs) <= 6:
         for s in segs:
@@ -732,7 +737,7 @@ def _log_output_segments(label: str, segs: list) -> None:
             if abs(abs(s.x2 - s.x1) - abs(s.y2 - s.y1)) < 1e-6
             else f"{ang:.0f}deg"
         )
-        print(f"  [{label}] seg{i}: ({s.x1:.3f},{s.y1:.3f})→({s.x2:.3f},{s.y2:.3f}) {kind}")
+        print(f"  [{label}] seg{i}: ({s.x1:.3f},{s.y1:.3f})->({s.x2:.3f},{s.y2:.3f}) {kind}")
 
 
 # ---------------------------------------------------------------------------
@@ -903,7 +908,7 @@ def _postprocess_layer_segment(
     stage_prefix: str,
     pad_viz: list[tuple[str, tuple[float, float, float, float]]],
 ) -> list[tuple[float, float]]:
-    """Run simplify → shortcut → snap45 on a single layer's path.
+    """Run simplify -> shortcut -> snap45 on a single layer's path.
 
     Each step dumps a viz file with ``stage_prefix`` prepended, so
     multi-layer dumps carry the layer name (e.g. ``layer-F.Cu-2-simplify``)
@@ -939,7 +944,7 @@ def _align_single_endpoint(
     pad_size: tuple[float, float],
     from_center: bool,
 ) -> list[tuple[float, float]]:
-    """Align one endpoint to a pad centre via X→Y iterative translation.
+    """Align one endpoint to a pad centre via X->Y iterative translation.
 
     ``from_center=True`` aligns the start of *path*; ``False`` aligns
     the end.  See :func:`_align_path_endpoints` for the detailed algorithm.
@@ -949,7 +954,7 @@ def _align_single_endpoint(
 
     pcx, pcy = pad_center
     if from_center:
-        # ── Start pad ───────────────────────────────────────────────
+        # -- Start pad -----------------------------------------------
         dx = pcx - path[0][0]
         if abs(dx) > 1e-9:
             orig = list(path)
@@ -976,7 +981,7 @@ def _align_single_endpoint(
                 path[k] = (path[k][0], path[k][1] + dy)
                 k += 1
     else:
-        # ── End pad ─────────────────────────────────────────────────
+        # -- End pad -------------------------------------------------
         dx = pcx - path[-1][0]
         if abs(dx) > 1e-9:
             orig = list(path)
@@ -1016,7 +1021,7 @@ def _align_path_endpoints(
     pad_a_size: tuple[float, float] | None = None,
     pad_b_size: tuple[float, float] | None = None,
 ) -> list[tuple[float, float]]:
-    """Align both endpoints to pad centres via X→Y translation.
+    """Align both endpoints to pad centres via X->Y translation.
 
     See :func:`_align_single_endpoint` for the per-endpoint algorithm.
     """
@@ -1073,7 +1078,7 @@ def _replace_pad_path(
             if not _inside_rect(path[k], center, hw, hh):
                 fx, fy = path[k + 1]
                 ox, oy = path[k]
-                # Same (center, fence) order — reverse so path reads [fence, projection].
+                # Same (center, fence) order -- reverse so path reads [fence, projection].
                 keep = _build_pad_wire(cx, cy, fx, fy, ox, oy, minx, maxx, miny, maxy)
                 return path[: k + 1] + keep[::-1]
         return path
@@ -1101,7 +1106,7 @@ def _build_pad_wire(
     miny: float,
     maxy: float,
 ) -> list[tuple[float, float]]:
-    """Return ``[projection, fence]`` — a single axis-aligned segment
+    """Return ``[projection, fence]`` -- a single axis-aligned segment
     along the AABB edge the outside point exits from.  The centre is
     kept by the caller (``_replace_pad_path``), and the whole chain
     is translated by ``_align_path_endpoints``."""
@@ -1119,10 +1124,10 @@ def _build_pad_wire(
         horizontal = abs(ox - x1) >= abs(oy - y1)
 
     if horizontal:
-        # fence on left/right edge → horizontal wire at fence_y
+        # fence on left/right edge -> horizontal wire at fence_y
         return [(x1, y2), (x2, y2)]
     else:
-        # fence on top/bottom edge → vertical wire at fence_x
+        # fence on top/bottom edge -> vertical wire at fence_x
         return [(x2, y1), (x2, y2)]
 
 
@@ -1317,7 +1322,7 @@ def _find_pad_center(
     """Return the (x, y) center of the named pad on the given footprint ref.
 
     When ``layer`` is given, only pads whose copper covers that layer are
-    considered — a footprint may declare several pads with the same name
+    considered -- a footprint may declare several pads with the same name
     (e.g. edge-connector fingers sharing a net), and the center must match
     the pad whose shape :func:`_find_pad_size` would return.
     """
@@ -1343,7 +1348,7 @@ def _find_pad_center(
             px, py = float(at[1]), float(at[2])
         except (TypeError, ValueError):
             return None
-        # Transform local → world (only translation + rotation; pads don't
+        # Transform local -> world (only translation + rotation; pads don't
         # scale).
         wx, wy = _rotate(px, py, fp_rot)
         return fp_x + wx, fp_y + wy
@@ -1480,7 +1485,7 @@ def _resolve_layers(
 
     When a footprint declares several pads with the same name (edge
     connectors), the union of all same-named pads' copper layers is
-    used — a THT pad named ``3v3`` makes the pad flexible across all
+    used -- a THT pad named ``3v3`` makes the pad flexible across all
     copper layers even if the first same-named pad is SMD.
 
     Returns ``(start_layer, end_layer)``.
@@ -1496,7 +1501,7 @@ def _resolve_layers(
         raise RouteFailure(f"Pad {req.ref_b}/{req.pad_b} not found")
 
     # Collect ALL same-named pad nodes (a footprint may declare several
-    # pads with one name — edge-connector fingers + a THT pad).
+    # pads with one name -- edge-connector fingers + a THT pad).
     a_nodes = [
         s for s in fp_a if _is_list(s) and str(s[0]) == "pad" and _get_pad_name(s) == req.pad_a
     ]
@@ -1595,13 +1600,13 @@ def _same_net_pad_polygons(
 
     The world model drops same-net copper so the route can land on its
     own endpoint pads; the router re-adds those pads here as *transit*
-    obstacles — a track may terminate on a pad, never run across its
+    obstacles -- a track may terminate on a pad, never run across its
     copper (a track through a thru-hole pad's hole is cut by the drill,
     and a via on a pad face is a DFM defect).  Geometry mirrors
     :func:`kcaa.router.world_model._pad_obstacle`.
 
     The world center lets callers distinguish the *endpoint pad instance*
-    from other same-named pads by geometry — two pads on the same net
+    from other same-named pads by geometry -- two pads on the same net
     can share ``(ref, pad name)`` (edge connectors with multiple
     ``3v3`` fingers), so name-based skip would wrongly exempt every
     same-named pad.
@@ -1626,7 +1631,7 @@ def _same_net_pad_polygons(
             if _get_net(sub) != net:
                 continue
             if len(sub) > 2 and str(sub[2]) == "np_thru_hole":
-                continue  # bare mechanical hole — no copper to protect
+                continue  # bare mechanical hole -- no copper to protect
             players = _pad_layers(sub)
             if not players:
                 continue
@@ -1675,7 +1680,7 @@ def _default_track_width(pcb_path: str, net: str) -> float:
     ``track_width``.
 
     Raises:
-        ProFileMissing: No ``.kicad_pro`` next to ``pcb_path`` — pass
+        ProFileMissing: No ``.kicad_pro`` next to ``pcb_path`` -- pass
             ``RouteRequest(width=...)`` explicitly to skip DRC lookup.
         ProFileMalformed: The ``.kicad_pro`` exists but cannot be parsed or
             lacks the expected structure.
@@ -1709,7 +1714,7 @@ def _default_track_width(pcb_path: str, net: str) -> float:
 def _default_clearance(pcb_path: str, net: str | None = None) -> float:
     """Resolve minimum clearance from the board's effective design rules.
 
-    When the board's ``min_clearance`` is 0.0 (which is common — KiCad
+    When the board's ``min_clearance`` is 0.0 (which is common -- KiCad
     leaves it at 0 and relies on net class rules) this falls back to the
     clearance of the matching net class.  If no net class matches, uses
     the Default net class clearance (0.2 mm fallback).
@@ -1904,9 +1909,9 @@ def _resolve_via_drill(pcb_path: str, net: str) -> float:
 
 
 def _net_to_netclass(data: dict) -> dict[str, str]:
-    """Read net→netclass assignments from the JSON project file.
+    """Read net->netclass assignments from the JSON project file.
 
-    KiCad's project file uses ``netclass_patterns`` with a ``pattern`` glob —
+    KiCad's project file uses ``netclass_patterns`` with a ``pattern`` glob --
     a net belongs to the first matching pattern's netclass. This is a
     glob-style match (we use ``fnmatch`` for ``*`` and ``?`` wildcards).
     """
@@ -1935,7 +1940,7 @@ def _net_to_netclass(data: dict) -> dict[str, str]:
     # Resolve patterns into explicit per-net entries.
     # (Net names that are not in the explicit table are resolved here.)
     # The caller will look up by net name; for resolution we need to know
-    # the set of net names — but for our purposes (looking up a single
+    # the set of net names -- but for our purposes (looking up a single
     # net by name) the explicit table is enough. We expose the patterns
     # so a higher layer can resolve ambiguous names. For now, expose
     # ``out`` as the per-net map and also a fallback: if the net is not

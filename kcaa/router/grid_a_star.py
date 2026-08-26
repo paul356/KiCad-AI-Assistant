@@ -56,6 +56,14 @@ _DIRECTIONS = [
 _CARD_COST = 1.0
 _DIAG_COST = math.sqrt(2.0)
 
+# Turn penalty (mm-equivalent) added when the path changes direction.
+# 0.3 mm ≈ 3 cells at 0.1 mm resolution — discourages zigzag without
+# blocking legitimate detours.  Set to 0 to disable (pure shortest path).
+_TURN_PENALTY = 0.3
+
+# Number of movement directions (8-directional grid).
+_N_DIRS = 8
+
 # Default via cost (mm added to the path for each via transition).
 _VIA_COST = 2.0
 
@@ -231,7 +239,9 @@ def _octile_dist(gx: int, gy: int, ex: int, ey: int) -> float:
     """Octile distance heuristic (admissible for 8-direction movement)."""
     dx = abs(gx - ex)
     dy = abs(gy - ey)
-    return _CARD_COST * abs(dx - dy) + (_DIAG_COST - _CARD_COST) * min(dx, dy)
+    if dx > dy:
+        return _DIAG_COST * dy + (dx - dy)
+    return _DIAG_COST * dx + (dy - dx)
 
 
 def grid_a_star(
@@ -243,6 +253,7 @@ def grid_a_star(
     via_from: dict[int, set[int]] | None = None,
     via_cost: float = _VIA_COST,
     via_forbidden_zones: list | None = None,
+    turn_penalty: float = _TURN_PENALTY,
 ) -> AStarResult:
     """Run A* on one or more walkability grids.
 
@@ -265,6 +276,8 @@ def grid_a_star(
         via_cost: Distance-equivalent cost per via transition (mm).
         via_forbidden_zones: Optional list of ``shapely`` Polygon objects
             where vias are forbidden (e.g. start/end pad AABBs).
+        turn_penalty: Distance-equivalent cost added when the path
+            changes direction.  0 disables (pure shortest path).
 
     Returns:
         :class:`AStarResult` with ``path`` as ``list[(x, y, layer_idx)]``,
@@ -288,13 +301,21 @@ def grid_a_star(
     if not grids[end_layer_idx].is_free(ex, ey):
         return AStarResult(path=None)
 
-    def _encode(gx: int, gy: int, li: int) -> int:
-        return (gy * W + gx) * n_layers + li
+    # State encoding: (cell, layer, arrival_direction).
+    # arrival_direction is 0-7 (index into _DIRECTIONS) or _N_DIRS for
+    # the start node (no previous move).  This lets A* distinguish
+    # reaching a cell from different directions and apply a turn penalty
+    # when the direction changes.
+    _NO_DIR = _N_DIRS  # sentinel for "no previous direction"
 
-    start_id = _encode(sx, sy, start_layer_idx)
-    end_id = _encode(ex, ey, end_layer_idx)
+    def _encode(gx: int, gy: int, li: int, di: int) -> int:
+        return ((gy * W + gx) * n_layers + li) * (_N_DIRS + 1) + di
 
-    g_score = {start_id: 0.0}
+    # The goal is any state at (ex, ey, end_layer) regardless of direction.
+    # We check for the cell-level match inside the loop.
+    start_id = _encode(sx, sy, start_layer_idx, _NO_DIR)
+
+    g_score: dict[int, float] = {start_id: 0.0}
     parent: dict[int, int | None] = {start_id: None}
     open_heap = [(_octile_dist(sx, sy, ex, ey), start_id)]
     closed: set[int] = set()
@@ -307,45 +328,55 @@ def grid_a_star(
         closed.add(cur_id)
         visited += 1
 
-        if cur_id == end_id:
-            path: list[tuple[float, float, int]] = []
-            nid = cur_id
-            while nid is not None:
-                li = nid % n_layers
-                rest = nid // n_layers
-                gy_p = rest // W
-                gx_p = rest % W
-                wx, wy = ref.to_world(gx_p, gy_p)
-                path.append((wx, wy, li))
-                nid = parent[nid]
-            path.reverse()
-
-            # Compute length from world-coordinate distance (ignore
-            # layer — via cost is already baked into g_score).
-            total_len = 0.0
-            for i in range(1, len(path)):
-                px, py, _ = path[i - 1]
-                cx, cy, _ = path[i]
-                total_len += math.hypot(cx - px, cy - py)
-            return AStarResult(path=path, cells_visited=visited, path_length_mm=total_len)
-
-        li = cur_id % n_layers
-        rest = cur_id // n_layers
-        cy = rest // W
-        cx = rest % W
+        # Decode state.
+        di = cur_id % (_N_DIRS + 1)
+        rest = cur_id // (_N_DIRS + 1)
+        li = rest % n_layers
+        rest2 = rest // n_layers
+        cy = rest2 // W
+        cx = rest2 % W
         cur_g = g_score[cur_id]
         cur_grid = grids[li]
 
+        # Goal check: any direction at the target cell on the target layer.
+        if cx == ex and cy == ey and li == end_layer_idx:
+            path: list[tuple[float, float, int]] = []
+            nid: int | None = cur_id
+            while nid is not None:
+                rest_n = nid // (_N_DIRS + 1)
+                li_n = rest_n % n_layers
+                rest2_n = rest_n // n_layers
+                gy_p = rest2_n // W
+                gx_p = rest2_n % W
+                wx, wy = ref.to_world(gx_p, gy_p)
+                path.append((wx, wy, li_n))
+                nid = parent[nid]
+            path.reverse()
+
+            total_len = 0.0
+            for i in range(1, len(path)):
+                px, py, _ = path[i - 1]
+                cx_p, cy_p, _ = path[i]
+                total_len += math.hypot(cx_p - px, cy_p - py)
+            return AStarResult(path=path, cells_visited=visited, path_length_mm=total_len)
+
         # ---- Same-layer 8-dir moves ----
-        for dx, dy, is_diag in _DIRECTIONS:
+        for dir_idx, (dx, dy, is_diag) in enumerate(_DIRECTIONS):
             nx, ny = cx + dx, cy + dy
             if not cur_grid.is_free(nx, ny):
                 continue
-            nid = _encode(nx, ny, li)
+            nid = _encode(nx, ny, li, dir_idx)
             if nid in closed:
                 continue
             step = _DIAG_COST if is_diag else _CARD_COST
-            tentative = cur_g + step
+            # Turn penalty: if this move's direction differs from the
+            # arrival direction (and we have a previous direction), add
+            # the penalty.  45° changes (cardinal→diagonal) cost the
+            # same as 90° changes — both are one turn.
+            tp = 0.0
+            if turn_penalty > 0 and di != _NO_DIR and di != dir_idx:
+                tp = turn_penalty
+            tentative = cur_g + step + tp
             if tentative < g_score.get(nid, float("inf")):
                 g_score[nid] = tentative
                 heapq.heappush(
@@ -364,7 +395,8 @@ def grid_a_star(
                     wx, wy = ref.to_world(cx, cy)
                     if any(z.contains(Point(wx, wy)) for z in via_forbidden_zones):
                         continue
-                nid = _encode(cx, cy, tgt_li)
+                # Via resets direction (layer change is not a "turn").
+                nid = _encode(cx, cy, tgt_li, _NO_DIR)
                 if nid in closed:
                     continue
                 tentative = cur_g + via_cost
@@ -422,6 +454,7 @@ def hierarchical_a_star(
     end_world: tuple[float, float],
     fine_resolution: float = GRID_RESOLUTION,
     route_bbox: tuple[float, float, float, float] | None = None,
+    turn_penalty: float = _TURN_PENALTY,
 ) -> AStarResult:
     """Run hierarchical A* with auto-detection of single-pass vs two-pass.
 
@@ -457,11 +490,11 @@ def hierarchical_a_star(
 
     if fine_cells < _SINGLE_PASS_THRESHOLD:
         grid = build_grid_map(obstacles, bbox, resolution=fine_resolution)
-        return grid_a_star([grid], start_world, end_world)
+        return grid_a_star([grid], start_world, end_world, turn_penalty=turn_penalty)
 
     coarse_res = fine_resolution * COARSE_FACTOR
     coarse_grid = build_grid_map(obstacles, bbox, resolution=coarse_res)
-    coarse_result = grid_a_star([coarse_grid], start_world, end_world)
+    coarse_result = grid_a_star([coarse_grid], start_world, end_world, turn_penalty=turn_penalty)
     if coarse_result.path is None:
         return AStarResult(path=None, cells_visited=coarse_result.cells_visited)
 
@@ -477,7 +510,7 @@ def hierarchical_a_star(
     )
 
     fine_grid = build_grid_map(obstacles, band, resolution=fine_resolution)
-    result = grid_a_star([fine_grid], start_world, end_world)
+    result = grid_a_star([fine_grid], start_world, end_world, turn_penalty=turn_penalty)
     if result.path is not None:
         result.cells_visited += coarse_result.cells_visited
     else:
@@ -535,6 +568,7 @@ def multi_layer_a_star(
     fine_resolution: float = GRID_RESOLUTION,
     via_cost: float = _VIA_COST,
     via_forbidden_zones: list | None = None,
+    turn_penalty: float = _TURN_PENALTY,
 ) -> MultiLayerAStarResult:
     """Run A* across multiple copper layers.
 
@@ -583,6 +617,7 @@ def multi_layer_a_star(
         via_from=via_from or None,
         via_cost=via_cost,
         via_forbidden_zones=via_forbidden_zones,
+        turn_penalty=turn_penalty,
     )
     if result.path is None:
         return MultiLayerAStarResult(path=None, cells_visited=result.cells_visited)

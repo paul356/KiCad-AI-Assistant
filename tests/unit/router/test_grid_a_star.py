@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from shapely.geometry import Polygon
+from shapely.geometry import Point, Polygon
 
 from kcaa.router.grid_a_star import (
     multi_layer_a_star,
@@ -167,7 +167,7 @@ class TestMultiLayerAStar:
             if prev.layer != cur.layer:
                 # via transition — cur is on the destination layer.
                 # Its position should be outside the obstacle.
-                assert not (8.0 <= cur.x <= 12.0 and 9.0 <= cur.y <= 11.0), (
+                assert not obs.shape.contains(Point(cur.x, cur.y)), (
                     f"via landed on blocked cell at ({cur.x:.2f},{cur.y:.2f})"
                 )
 

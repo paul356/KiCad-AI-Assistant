@@ -46,6 +46,7 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
         width: float | None = None,
         layer_hint: str | None = None,
         via_pairs: tuple[tuple[str, str], ...] | None = None,
+        turn_penalty: float | None = None,
     ) -> dict[str, Any]:
         """Connect two pads with an obstacle-avoiding track, optionally across layers.
 
@@ -84,6 +85,9 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
                 the router is allowed to use as via transitions.  Defaults
                 to ``(("F.Cu", "B.Cu"),)`` when the resolved layers differ;
                 ignored otherwise.
+            turn_penalty: Cost added when the path changes direction (mm).
+                ``None`` uses the default (0.3 mm).  Set to 0 for pure
+                shortest-path routing (more zigzag).
 
         Returns:
             dict with:
@@ -111,6 +115,7 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
             layer_hint=layer_hint,
             width=width,
             via_pairs=via_pairs or (),
+            turn_penalty=turn_penalty if turn_penalty is not None else 0.3,
         )
         try:
             result = auto_route_pair(req)
