@@ -292,6 +292,21 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
             f"{end_layer!r}; cannot route to there."
         )
 
+    # Early net check: pads on different nets must not be routed together.
+    # A foreign-net pad is an obstacle -- past the net check the world model
+    # would dutifully treat it as one and fail deep inside A*, so fail fast
+    # with the actual cause.
+    for ref, pad, layer in (
+        (req.ref_a, req.pad_a, start_layer),
+        (req.ref_b, req.pad_b, end_layer),
+    ):
+        pad_net = _find_pad_net(data, ref, pad, layer)
+        if pad_net is not None and pad_net != req.net:
+            raise RouteFailure(
+                f"Pad {ref}/{pad} is on net {pad_net!r}, not the requested "
+                f"net {req.net!r}; cannot route between different nets."
+            )
+
     # World model: only existing copper (tracks, vias, keepouts) blocks the
     # route.  Footprint courtyards are NOT obstacles -- they're a DRC spacing
     # concept, not a hard copper boundary, and treating them as forbidden
@@ -1317,6 +1332,34 @@ def _pcb_layer_names(data: list) -> list[str]:
             names.append(v if isinstance(v, str) else str(v))
         return names
     return []
+
+
+def _find_pad_net(
+    data: list,
+    ref: str,
+    pad_name: str,
+    layer: str | None = None,
+) -> str | None:
+    """Return the net name of the named pad on the given footprint ref.
+
+    When ``layer`` is given, only pads whose copper covers that layer are
+    considered, matching :func:`_find_pad_center` semantics for footprints
+    that declare several pads with the same name.
+    """
+    fp = _find_footprint(data, ref)
+    if fp is None:
+        return None
+    for sub in fp:
+        if not _is_list(sub):
+            continue
+        if str(sub[0]) != "pad":
+            continue
+        if _get_pad_name(sub) != pad_name:
+            continue
+        if layer is not None and layer not in _pad_layers(sub):
+            continue
+        return _get_net(sub)
+    return None
 
 
 def _find_pad_center(

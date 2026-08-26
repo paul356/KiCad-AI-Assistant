@@ -989,6 +989,25 @@ def test_auto_route_pair_detours_around_internal_opening(tmp_path: Path) -> None
         )
 
 
+def test_auto_route_pair_rejects_pads_on_different_nets(tmp_path: Path) -> None:
+    """Routing two pads that are on DIFFERENT nets must fail fast with a
+    clear message instead of treating the target pad as a foreign-net
+    obstacle and failing deep inside A*."""
+    dst = _board_with_opening(tmp_path, (40.0, 25.0, 50.0, 35.0))
+    req = RouteRequest(
+        pcb_path=str(dst),
+        ref_a="R1",
+        pad_a="1",  # R1/1 is on VCC
+        ref_b="C1",
+        pad_b="1",  # C1/1 is on VCC
+        net="NET_A",  # matches neither pad -> early rejection
+        width=0.25,
+        clearance=0.2,
+    )
+    with pytest.raises(RouteFailure, match="cannot route between different nets"):
+        auto_route_pair(req)
+
+
 def test_edge_cuts_open_notch_is_not_opening(tmp_path: Path) -> None:
     """The X1 bay notch touches the board outline (it is carved out of the
     edge), so it is part of the outline -- NOT an internal opening.  The
