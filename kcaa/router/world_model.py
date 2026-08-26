@@ -359,7 +359,7 @@ def _pad_obstacle(
 
     Returns ``None`` for NPTH pads (handled by :func:`_npth_obstacle`).
     """
-    pad_type = str(pad_node[1]) if len(pad_node) > 1 else ""
+    pad_type = str(pad_node[2]) if len(pad_node) > 2 else ""
     if pad_type == "np_thru_hole":
         return None  # handled by _npth_obstacle
 
@@ -441,7 +441,7 @@ def _npth_obstacle(
     Unlike ``_via_obstacle``, NPTH pads do not have a net, so the
     ``net_filter`` argument is not consulted — the hole blocks every net.
     """
-    pad_type = str(pad_node[1]) if len(pad_node) > 1 else ""
+    pad_type = str(pad_node[2]) if len(pad_node) > 2 else ""
     if pad_type != "np_thru_hole":
         return None
     # Pad ``at`` is in footprint-local coords.

@@ -999,3 +999,107 @@ def test_edge_cuts_open_notch_is_not_opening(tmp_path: Path) -> None:
     world = build_world_model(str(dst), net_filter=None)
     openings = [o for o in world.obstacles if o.kind == "opening"]
     assert openings == []
+
+
+# ---------------------------------------------------------------------------
+# NPTH pad type index (type lives at [2], not [1])
+# ---------------------------------------------------------------------------
+
+
+def _fp_with_pad(pad_body: str, ref: str = "X1") -> str:
+    """One footprint with a single pad; returned as raw PCB text snippet."""
+    return (
+        '(footprint "test:npth"\n'
+        '\t(layer "F.Cu")\n'
+        "\t(at 100 100)\n"
+        f'\t(property "Reference" "{ref}")\n'
+        f'\t(property "Value" "{ref}")\n'
+        f"{pad_body}\n"
+        ")\n"
+    )
+
+
+def _load_pcb_text(pcb_text: str, tmp_path: Path) -> Path:
+    from kcaa.utils.pcb_sexp_utils import load_pcb as _lp
+
+    dst = tmp_path / "npth.kicad_pcb"
+    dst.write_text(f"(kicad_pcb (version 20240108) (generator pcbnew)\n{pcb_text}\n)\n")
+    _lp(str(dst))  # parse-validity smoke
+    return dst
+
+
+def test_npth_pad_becomes_drill_obstacle_not_pad_obstacle(tmp_path: Path) -> None:
+    """A KiCad NPTH pad (type at index [2], name '' at [1]) must produce a
+    drill-kind circular obstacle, not a pad-kind rectangle."""
+    from kcaa.router.world_model import build_world_model
+
+    pcb = _load_pcb_text(
+        _fp_with_pad(
+            '\t(pad "" np_thru_hole circle\n'
+            "\t\t(at 0 0)\n"
+            "\t\t(size 3.2 3.2)\n"
+            "\t\t(drill 1.6)\n"
+            '\t\t(layers "*.Cu" "*.Mask")\n'
+            "\t)\n"
+        ),
+        tmp_path,
+    )
+    world = build_world_model(str(pcb), net_filter=None)
+    drills = [o for o in world.obstacles if o.kind == "drill"]
+    pads = [o for o in world.obstacles if o.kind == "pad"]
+    assert len(drills) == 1, f"expected one drill obstacle, got {len(drills)}"
+    assert pads == [], "NPTH must not produce a pad-kind obstacle"
+    d = drills[0]
+    # Drill diameter 1.6 -> obstacle circle r=0.8 at footprint origin (100,100).
+    assert d.shape.area == pytest.approx(3.14159 * 0.8**2, rel=0.05)
+    assert (d.shape.centroid.x, d.shape.centroid.y) == pytest.approx((100.0, 100.0))
+    assert d.layers == frozenset({"F.Cu", "B.Cu", "In1.Cu", "In2.Cu", "In3.Cu", "In4.Cu"})
+    assert d.net is None
+
+
+def test_npth_pad_rotated_with_footprint(tmp_path: Path) -> None:
+    """The drill center follows the footprint placement/rotation."""
+    from kcaa.router.world_model import build_world_model
+
+    pcb = _load_pcb_text(
+        _fp_with_pad(
+            '\t(pad "" np_thru_hole circle\n'
+            "\t\t(at 5 0)\n"
+            "\t\t(size 3.2 3.2)\n"
+            "\t\t(drill 1.6)\n"
+            '\t\t(layers "*.Cu" "*.Mask")\n'
+            "\t)\n",
+            ref="X1",
+        ).replace("(at 100 100)", "(at 100 100 90)"),
+        tmp_path,
+    )
+    world = build_world_model(str(pcb), net_filter=None)
+    drills = [o for o in world.obstacles if o.kind == "drill"]
+    assert len(drills) == 1
+    # Local (5,0) rotated 90 CW on screen -> world (100, 95).
+    assert (drills[0].shape.centroid.x, drills[0].shape.centroid.y) == pytest.approx((100.0, 95.0))
+
+
+def test_plated_thru_hole_pad_still_pad_obstacle(tmp_path: Path) -> None:
+    """A regular plated THT pad must keep producing a pad-kind obstacle --
+    the index fix must not misclassify non-NPTH pads."""
+    from kcaa.router.world_model import build_world_model
+
+    pcb = _load_pcb_text(
+        _fp_with_pad(
+            '\t(pad "1" thru_hole circle\n'
+            "\t\t(at 0 0)\n"
+            "\t\t(size 2.0 2.0)\n"
+            "\t\t(drill 1.0)\n"
+            '\t\t(layers "*.Cu" "*.Mask")\n'
+            '\t\t(net 1 "VCC")\n'
+            "\t)\n"
+        ),
+        tmp_path,
+    )
+    world = build_world_model(str(pcb), net_filter="OtherNet")
+    pads = [o for o in world.obstacles if o.kind == "pad"]
+    drills = [o for o in world.obstacles if o.kind == "drill"]
+    assert len(pads) == 1, "plated THT pad must remain a pad-kind obstacle"
+    assert drills == [], "plated THT pad must not become a drill obstacle"
+    assert pads[0].net == "VCC"

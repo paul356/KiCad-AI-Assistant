@@ -6,7 +6,9 @@ can be picked up independently.
 
 ## NPTH pad type index bug in world_model
 
-**Status:** open (pre-existing, not introduced by PR #82)
+**Status:** fixed for circular NPTH on `fix/duplicate-pad-routing`
+(commit after `77e8301`); oval/slot drill support remains open (see
+sub-entry below)
 
 ### Symptom
 
@@ -138,3 +140,61 @@ are NOT openings — they stay part of the outline AABB, and the
 - Real board: ninja-keyboard world model reports 61+ `opening` obstacles
   (one per internal fp_rect); regression-check matrix-bit-card J2/3 ->
   U11/3v3 route is still produced (bay is an open notch, not an opening).
+
+## NPTH oval/slot drill shapes are not supported
+
+**Status:** open (discovered while fixing the NPTH index bug)
+
+### Symptom
+
+`_npth_obstacle` only reads a single drill value:
+
+```python
+drill = float(drill_sub[1])
+```
+
+A KiCad oval drill node is `(drill oval <width> <length>)` — `drill_sub[1]`
+is the `Symbol('oval')` tag, so `float()` raises `TypeError` and the
+function returns `None`. Oval/slot NPTH holes are silently dropped from the
+world model.
+
+### Evidence
+
+Real KiCad file `/home/user1/pcb/ninja-keyboard/.history/ninja-keyboard.kicad_pcb`:
+
+```
+(pad "MP" thru_hole rect (at 7.5 -3.1 180) (size 3 2.5)
+    (drill oval 2.5 2) (layers "*.Cu" "*.Mask") ...)
+```
+
+Multiple `(drill oval w l)` nodes exist in the file history. The router
+would generate no obstacle for any of them. (The current
+`ninja-keyboard.kicad_pcb` uses 309 circular NPTH drills only.)
+
+### Unresolved question
+
+KiCad's oval-drill semantics for `(drill oval w l)` is not confirmed from
+primary source at write time:
+- Is `l` the total slot length (outer ends) or the center-to-center
+  distance of the two end circles?
+- Does the slot's major axis follow the pad's own `at` rotation, the
+  footprint rotation, or neither (fixed along one axis)?
+
+The pad examples show mixed data (`(size 3 2.5)` with `(drill oval 2.5 2)`;
+`(size 1 1.6)` with `(drill oval 0.6 1.2)`) — size and drill axes do not
+obviously align, so the axis rule needs verification before implementing.
+
+### Fix (proposed)
+
+Shape the obstacle as a stadium/capsule: `LineString` between the two end
+circle centers, buffered by `width / 2` (shapely:
+`LineString([(-d, 0), (d, 0)]).buffer(w / 2, cap_style="round")`), where
+`d` depends on the resolved `l` semantics. Rotate by the pad's own `at`
+rotation plus the footprint rotation (verify which KiCad actually applies).
+
+### Validation
+
+- Unit: NPTH oval pad node -> obstacle shape whose bounding box matches
+  the resolved slot extent.
+- Real board: ninja-keyboard history file with `(drill oval ...)` pads
+  yields `drill`-kind obstacles.
