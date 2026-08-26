@@ -562,6 +562,7 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
             layer_obstacles,
             pad_a_xy,
             pad_b_xy,
+            fine_resolution=grid_res,
             route_bbox=route_bbox,
             turn_penalty=req.turn_penalty,
         )
