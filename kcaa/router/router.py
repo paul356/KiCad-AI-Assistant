@@ -422,6 +422,34 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
         max(pad_a_xy[0], pad_b_xy[0], _hx1) + 5.0,
         max(pad_a_xy[1], pad_b_xy[1], _hy1) + 5.0,
     )
+    # The A* search area is clipped to route_bbox; an obstacle that spans
+    # the whole box (e.g. an Edge.Cuts opening the two pads sit on either
+    # side of) then looks like an impassable wall even though a detour
+    # around it exists outside the box.  Extend the box to cover the
+    # bounds of every obstacle that intersects it (iterated to closure so
+    # obstacles discovered on the second ring are included too), giving
+    # the search enough room to route around them.
+    _routing = set(routing_layers)
+    _x0, _y0, _x1, _y1 = route_bbox
+    _grew = True
+    while _grew:
+        _grew = False
+        for _o in buffered:
+            if not (_routing & _o.layers):
+                continue
+            _b = _o.shape.bounds
+            if _b[2] < _x0 or _b[0] > _x1 or _b[3] < _y0 or _b[1] > _y1:
+                continue  # no overlap with the current search box
+            _nx0, _ny0, _nx1, _ny1 = (
+                min(_x0, _b[0]),
+                min(_y0, _b[1]),
+                max(_x1, _b[2]),
+                max(_y1, _b[3]),
+            )
+            if (_nx0, _ny0, _nx1, _ny1) != (_x0, _y0, _x1, _y1):
+                _x0, _y0, _x1, _y1 = _nx0, _ny0, _nx1, _ny1
+                _grew = True
+    route_bbox = (_x0, _y0, _x1, _y1)
     grid_res = req.grid_resolution or GRID_RESOLUTION
 
     # ---- A* directly from pad centre to pad centre ----

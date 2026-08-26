@@ -989,6 +989,41 @@ def test_auto_route_pair_detours_around_internal_opening(tmp_path: Path) -> None
         )
 
 
+def test_auto_route_pair_detours_around_tall_opening(tmp_path: Path) -> None:
+    """An opening TALLER than the pad +/-5 mm search box (it extends beyond
+    the bbox on both sides, e.g. a slot between two connectors) previously
+    looked like an impassable wall: the A* grid is clipped to route_bbox, so
+    the detour around the slot was outside the search area and the route
+    failed even though one exists.  The bbox must grow to cover the opening
+    so the router can find the detour."""
+    from shapely.geometry import LineString, Polygon
+
+    # Baseline outline (20,20)-(70,60); opening is taller than the
+    # R1(30,30) -> C1(60,30) search box (bbox y = 25..35, even with the
+    # 2 mm grid margin: 23..37) on both sides, yet fully inside the
+    # outline (y 20..60).
+    dst = _board_with_opening(tmp_path, (40.0, 21.0, 50.0, 45.0))
+    req = RouteRequest(
+        pcb_path=str(dst),
+        ref_a="R1",
+        pad_a="1",
+        ref_b="C1",
+        pad_b="1",
+        net="VCC",
+        width=0.25,
+        clearance=0.2,
+    )
+    result = auto_route_pair(req)
+    assert len(result.segments) > 0
+    slot = Polygon([(40.0, 21.0), (50.0, 21.0), (50.0, 45.0), (40.0, 45.0)])
+    for seg in result.segments:
+        line = LineString([(seg.x1, seg.y1), (seg.x2, seg.y2)])
+        assert not line.intersects(slot), (
+            f"Segment {seg.x1:.3f},{seg.y1:.3f}->{seg.x2:.3f},{seg.y2:.3f} "
+            f"crosses the tall Edge.Cuts opening"
+        )
+
+
 def test_auto_route_pair_rejects_pads_on_different_nets(tmp_path: Path) -> None:
     """Routing two pads that are on DIFFERENT nets must fail fast with a
     clear message instead of treating the target pad as a foreign-net
