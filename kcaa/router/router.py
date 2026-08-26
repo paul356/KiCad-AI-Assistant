@@ -1491,8 +1491,10 @@ def _resolve_layers(
 
     Returns ``(start_layer, end_layer)``.
 
-    Raises :class:`RouteFailure` if a pad has no copper on any layer, or
-    if the two pads share no copper layer when a hint is not given.
+    Raises :class:`RouteFailure` if either pad has no copper on any layer.
+    When the two pads share no copper layer and ``layer_hint`` is neither
+    pad's preferred layer, each pad falls back to its first available
+    copper layer; the returned layers may then differ (staggered).
     """
     fp_a = _find_footprint(data, req.ref_a)
     fp_b = _find_footprint(data, req.ref_b)
