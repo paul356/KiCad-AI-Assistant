@@ -470,6 +470,8 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
             turn_penalty=req.turn_penalty,
         )
         if ml_result.path is None:
+            # Dump the failure state so the blockage can be inspected.
+            _dump_viz("fail-multi-astar", [], _pad_viz, buffered, route_bbox)
             raise RouteFailure(
                 f"No obstacle-avoiding multi-layer path from "
                 f"{req.ref_a}/{req.pad_a} to {req.ref_b}/{req.pad_b} at "
@@ -567,6 +569,9 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
             turn_penalty=req.turn_penalty,
         )
         if result.path is None:
+            # Dump the failure state so the blockage can be inspected
+            # (same viz format as the success stages).
+            _dump_viz("fail-astar", [], _pad_viz, layer_obstacles, route_bbox)
             raise RouteFailure(
                 f"No obstacle-avoiding path from {req.ref_a}/{req.pad_a} to "
                 f"{req.ref_b}/{req.pad_b} at {req.width or 0.5}mm "
