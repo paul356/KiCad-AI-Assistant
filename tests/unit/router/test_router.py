@@ -423,18 +423,16 @@ def test_unknown_layer_in_pcb_raises_route_failure(tmp_path: Path) -> None:
     assert "In1.Cu" in str(excinfo.value)
 
 
-def test_pad_missing_on_layer_raises_route_failure(tmp_path: Path) -> None:
-    """If a pad has no copper shape on the resolved layer, routing from it
-    must fail loudly — never silently fall back to a guessed size."""
+def test_smd_pad_layer_hint_ignored_route_on_pad_layer(tmp_path: Path) -> None:
+    """SMD pads fix their layer: layer_hint="B.Cu" is ignored for R1.1/C1.1
+    (SMD on F.Cu), so the route proceeds on F.Cu and succeeds."""
     src = _fixture_pcb()
     dst = tmp_path / "board.kicad_pcb"
     dst.write_text(Path(src).read_text())
 
     # R1.1 / C1.1 are SMD on F.Cu in the fixture; layer_hint="B.Cu" is
     # ignored for SMD pads (layer is fixed), so the route stays on F.Cu
-    # and succeeds.  The real failure is when a pad has NO copper at all.
-    # This test now verifies the SMD path: layer_hint is ignored, route
-    # proceeds on the pad's own layer (F.Cu).
+    # and succeeds.
     req = RouteRequest(
         pcb_path=str(dst),
         ref_a="R1",
