@@ -903,7 +903,7 @@ def _postprocess_layer_segment(
     stage_prefix: str,
     pad_viz: list[tuple[str, tuple[float, float, float, float]]],
 ) -> list[tuple[float, float]]:
-    """Run simplify → shortcut → snap45 on a single layer's path points.
+    """Run simplify → shortcut → snap45 on a single layer's path.
 
     Each step dumps a viz file with ``stage_prefix`` prepended, so
     multi-layer dumps carry the layer name (e.g. ``layer-F.Cu-2-simplify``)
@@ -918,10 +918,14 @@ def _postprocess_layer_segment(
     pts = shortcut_path(pts, obstacles, route_bbox, resolution=grid_res)
     _log_path(f"{stage_prefix}shortcut", pts)
     _dump_viz(f"{stage_prefix}3-shortcut", pts, pad_viz, obstacles, route_bbox)
-
     pts = snap_to_45_path_safe(pts, obstacles, route_bbox, resolution=grid_res)
     _log_path(f"{stage_prefix}snap45", pts)
     _dump_viz(f"{stage_prefix}4-snap45", pts, pad_viz, obstacles, route_bbox)
+
+    # Re-simplify: snap45 may create new collinear points.
+    pts = simplify_path(pts)
+    _log_path(f"{stage_prefix}resimplify", pts)
+    _dump_viz(f"{stage_prefix}5-resimplify", pts, pad_viz, obstacles, route_bbox)
 
     return pts
 

@@ -693,7 +693,8 @@ def shortcut_path(
 
     Builds a walkability grid once, then for each point tries to skip
     as many subsequent points as possible while keeping the line clear.
-    Only 0°/45°/90°/135° shortcuts are accepted.
+    Only 0°/45°/90°/135° shortcuts are preferred, but near-45° angles
+    are accepted (``snap_to_45_path_safe`` fixes angles afterward).
 
     Args:
         pts: Ordered ``(x, y)`` points (after collinear simplification).
@@ -713,10 +714,6 @@ def shortcut_path(
     while i < len(pts) - 1:
         best_next = i + 1
         for k in range(len(pts) - 1, i, -1):
-            dx = pts[k][0] - result[-1][0]
-            dy = pts[k][1] - result[-1][1]
-            if abs(dx) > 1e-9 and abs(dy) > 1e-9 and abs(abs(dx) - abs(dy)) > 1e-9:
-                continue  # not 0/45/90/135°
             if _grid_line_clear(
                 grid,
                 result[-1][0],
