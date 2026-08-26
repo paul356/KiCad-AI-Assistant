@@ -43,9 +43,8 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
         pad_b: str,
         net: str,
         ctx: Context | None,
-        layer: str = "F.Cu",
         width: float | None = None,
-        target_layer: str | None = None,
+        layer_hint: str | None = None,
         via_pairs: tuple[tuple[str, str], ...] | None = None,
     ) -> dict[str, Any]:
         """Connect two pads with an obstacle-avoiding track, optionally across layers.
@@ -53,7 +52,7 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
         Uses the no-shove PNS router: if the path is blocked by an existing
         track or footprint courtyard, the call fails rather than moving
         anything.  Run the placement tools first to clear the way, or call
-        again with a different ``layer``.
+        again with a different ``layer_hint``.
 
         PCB coordinates: mm, +X right, **+Y down**, rotation
         **clockwise-positive** (KiCad PCB convention).
@@ -63,6 +62,11 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
         found).  Clearance is taken from the board's effective design rules
         (see :mod:`kcaa.utils.pcb_design_rules`).
 
+        Layer selection is automatic: SMD pads use their fixed layer;
+        thru-hole pads pick a shared copper layer, preferring
+        ``layer_hint``.  When both pads are thru-hole and share a layer,
+        the route stays on a single layer (no vias).
+
         Args:
             pcb_path: Absolute path to the .kicad_pcb file.
             ref_a: Reference designator of the first footprint (e.g. ``"R1"``).
@@ -71,16 +75,15 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
             pad_b: Pad number on ``ref_b``.
             net: Net name to assign to the new segments.
             ctx: MCP context (unused).
-            layer: Starting copper layer (``"F.Cu"`` by default).
             width: Override the netclass track width (mm).  ``None`` uses the
                 DRC default for the net.
-            target_layer: Destination copper layer.  When ``None`` (default)
-                the route stays on ``layer``.  When set, the router may
-                insert through-hole vias to reach the destination.
+            layer_hint: Preferred copper layer for thru-hole pads.  When
+                ``None`` (default) the router picks automatically.  Ignored
+                for SMD pads whose layer is fixed by the pad itself.
             via_pairs: Optional tuple of ``(from_layer, to_layer)`` pairs
                 the router is allowed to use as via transitions.  Defaults
-                to ``(("F.Cu", "B.Cu"),)`` when ``target_layer`` differs
-                from ``layer``; ignored otherwise.
+                to ``(("F.Cu", "B.Cu"),)`` when the resolved layers differ;
+                ignored otherwise.
 
         Returns:
             dict with:
@@ -96,9 +99,7 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
 
             Or ``{"error": "<message>"}`` on failure.
         """
-        if target_layer is None:
-            target_layer = layer
-        if via_pairs is None and target_layer != layer:
+        if via_pairs is None:
             via_pairs = (("F.Cu", "B.Cu"),)
         req = RouteRequest(
             pcb_path=pcb_path,
@@ -107,8 +108,7 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
             ref_b=ref_b,
             pad_b=pad_b,
             net=net,
-            start_layer=layer,
-            end_layer=target_layer,
+            layer_hint=layer_hint,
             width=width,
             via_pairs=via_pairs or (),
         )

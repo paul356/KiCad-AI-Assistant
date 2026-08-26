@@ -132,6 +132,8 @@ class TestAutoRoutePair:
     def test_multi_layer_route_inserts_via(self, pcb_copy):
         # R1.2 is on F.Cu (GND). D1.1 is on In1.Cu (GND). The router must
         # insert at least one via to reach the destination layer.
+        # R1.2 is SMD → fixed F.Cu. D1.1 is SMD on In1.Cu → fixed In1.Cu.
+        # No layer_hint needed: SMD layers are auto-detected.
         req = RouteRequest(
             pcb_path=pcb_copy,
             ref_a="R1",
@@ -139,8 +141,6 @@ class TestAutoRoutePair:
             ref_b="D1",
             pad_b="1",
             net="GND",
-            start_layer="F.Cu",
-            end_layer="In1.Cu",
             via_pairs=(("F.Cu", "B.Cu"), ("B.Cu", "In1.Cu")),
         )
         result = auto_route_pair(req)
@@ -158,8 +158,6 @@ class TestAutoRoutePair:
             ref_b="D1",
             pad_b="1",
             net="GND",
-            start_layer="F.Cu",
-            end_layer="In1.Cu",
             via_pairs=(("F.Cu", "B.Cu"), ("B.Cu", "In1.Cu")),
         )
         result = auto_route_pair(req)
@@ -168,7 +166,8 @@ class TestAutoRoutePair:
             assert 0.0 <= via.y <= 60.0
 
     def test_single_layer_with_via_pair_still_works(self, pcb_copy):
-        # When start_layer == end_layer, no vias are inserted even if via_pairs set.
+        # R1.1 and C1.1 are both SMD on F.Cu → same layer → no vias,
+        # even if via_pairs are set.
         req = RouteRequest(
             pcb_path=pcb_copy,
             ref_a="R1",
@@ -176,8 +175,6 @@ class TestAutoRoutePair:
             ref_b="C1",
             pad_b="1",
             net="VCC",
-            start_layer="F.Cu",
-            end_layer="F.Cu",
             via_pairs=(("F.Cu", "B.Cu"),),
         )
         result = auto_route_pair(req)
@@ -478,8 +475,8 @@ class TestRoutingTool:
         assert len(vias) == 2
 
     def test_multi_layer_tool_writes_segments_and_via(self, pcb_copy):
-        # R1.2 is on F.Cu; D1.1 is on In1.Cu (GND).  Calling the tool
-        # with target_layer="In1.Cu" should produce at least one via.
+        # R1.2 is SMD on F.Cu; D1.1 is SMD on In1.Cu.  Layers are
+        # auto-detected from pad types — no layer_hint needed.
         mcp = self._make_mcp()
         result = self._call_tool(
             mcp,
@@ -491,8 +488,6 @@ class TestRoutingTool:
             pad_b="1",
             net="GND",
             ctx=None,
-            layer="F.Cu",
-            target_layer="In1.Cu",
             via_pairs=(("F.Cu", "B.Cu"), ("B.Cu", "In1.Cu")),
         )
         assert "segment_count" in result
@@ -500,27 +495,26 @@ class TestRoutingTool:
         assert result["via_count"] >= 1
         assert "In1.Cu" in result["layers_used"]
 
-    def test_multi_layer_tool_default_via_pair(self, pcb_copy):
-        # When target_layer differs from layer, default via_pairs
-        # ((F.Cu, B.Cu),) is used.  F.Cu → B.Cu reaches a B.Cu pad.
+    def test_single_layer_tool_smd_pads(self, pcb_copy):
+        # R1.1 and C1.1 are both SMD on F.Cu.  layer_hint="B.Cu" is
+        # ignored for SMD pads — route stays on F.Cu.
         mcp = self._make_mcp()
         result = self._call_tool(
             mcp,
             "pcb_route_pad_to_pad",
             pcb_path=pcb_copy,
             ref_a="R1",
-            pad_a="2",
+            pad_a="1",
             ref_b="C1",
-            pad_b="2",
+            pad_b="1",
             net="VCC",
             ctx=None,
-            layer="F.Cu",
-            target_layer="B.Cu",
+            width=0.25,
+            layer_hint="B.Cu",
         )
-        # C1.2 is on F.Cu, so this should fall back to F.Cu routing
-        # (the pad has no copper on B.Cu) — the tool surfaces the error
-        # in result["error"].
-        assert "error" in result or result.get("via_count", 0) >= 0
+        assert "segment_count" in result
+        assert result["via_count"] == 0
+        assert set(result["layers_used"]) == {"F.Cu"}
 
 
 # ---------------------------------------------------------------------------

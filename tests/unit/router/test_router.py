@@ -401,8 +401,8 @@ def test_auto_route_pair_warns_when_no_edge_cuts(
 
 
 def test_unknown_layer_in_pcb_raises_route_failure(tmp_path: Path) -> None:
-    """A start_layer / end_layer / via_pair layer that the PCB doesn't declare
-    must fail loudly with a RouteFailure that names the offending layer."""
+    """A via_pair layer that the PCB doesn't declare must fail loudly with
+    a RouteFailure that names the offending layer."""
     src = _fixture_pcb()
     dst = tmp_path / "board.kicad_pcb"
     dst.write_text(Path(src).read_text())
@@ -416,7 +416,7 @@ def test_unknown_layer_in_pcb_raises_route_failure(tmp_path: Path) -> None:
         net="VCC",
         width=0.3,
         clearance=0.2,
-        start_layer="In1.Cu",  # 2-layer fixture has no In1.Cu
+        via_pairs=(("F.Cu", "In2.Cu"),),  # 4-layer fixture has no In2.Cu
     )
     with pytest.raises(RouteFailure) as excinfo:
         auto_route_pair(req)
@@ -424,12 +424,17 @@ def test_unknown_layer_in_pcb_raises_route_failure(tmp_path: Path) -> None:
 
 
 def test_pad_missing_on_layer_raises_route_failure(tmp_path: Path) -> None:
-    """If a pad has no copper shape on the requested layer, routing from it
+    """If a pad has no copper shape on the resolved layer, routing from it
     must fail loudly — never silently fall back to a guessed size."""
     src = _fixture_pcb()
     dst = tmp_path / "board.kicad_pcb"
     dst.write_text(Path(src).read_text())
 
+    # R1.1 / C1.1 are SMD on F.Cu in the fixture; layer_hint="B.Cu" is
+    # ignored for SMD pads (layer is fixed), so the route stays on F.Cu
+    # and succeeds.  The real failure is when a pad has NO copper at all.
+    # This test now verifies the SMD path: layer_hint is ignored, route
+    # proceeds on the pad's own layer (F.Cu).
     req = RouteRequest(
         pcb_path=str(dst),
         ref_a="R1",
@@ -439,11 +444,11 @@ def test_pad_missing_on_layer_raises_route_failure(tmp_path: Path) -> None:
         net="VCC",
         width=0.3,
         clearance=0.2,
-        end_layer="B.Cu",  # R1.1 / C1.1 are SMD on F.Cu in the fixture
+        layer_hint="B.Cu",  # ignored for SMD pads; route stays F.Cu
     )
-    with pytest.raises(RouteFailure) as excinfo:
-        auto_route_pair(req)
-    assert "no copper shape" in str(excinfo.value)
+    # R1.1 / C1.1 are SMD on F.Cu — route should succeed on F.Cu.
+    result = auto_route_pair(req)
+    assert len(result.segments) > 0
 
 
 # ---------------------------------------------------------------------------
@@ -459,11 +464,10 @@ def test_routing_layers_includes_start_end_and_via_pairs():
         ref_b="B",
         pad_b="1",
         net="N",
-        start_layer="F.Cu",
-        end_layer="B.Cu",
+        layer_hint="F.Cu",
         via_pairs=(("F.Cu", "B.Cu"),),
     )
-    layers = _routing_layers(req)
+    layers = _routing_layers(req, "F.Cu", "B.Cu")
     assert layers == ["F.Cu", "B.Cu"]
 
 
@@ -475,11 +479,10 @@ def test_routing_layers_dedupes():
         ref_b="B",
         pad_b="1",
         net="N",
-        start_layer="F.Cu",
-        end_layer="F.Cu",
+        layer_hint="F.Cu",
         via_pairs=(("F.Cu", "F.Cu"),),
     )
-    layers = _routing_layers(req)
+    layers = _routing_layers(req, "F.Cu", "F.Cu")
     assert layers == ["F.Cu"]
 
 
@@ -609,24 +612,24 @@ def test_invalid_ref_b_pad_raises_failure(pcb_copy):
 # ---------------------------------------------------------------------------
 
 
-def test_thru_hole_pad_on_unused_layer_raises_failure(pcb_copy):
-    # A thru-hole pad is on *.Cu layers but has a "through_hole" pad
-    # type with a hole, not an SMD rect — _find_pad_size returns None
-    # when the requested layer doesn't host the copper shape.  R1.1
-    # is an SMD on F.Cu only; requesting the route on B.Cu should
-    # fail because R1.1 has no copper shape there.
+def test_smd_pad_layer_is_fixed(pcb_copy):
+    # SMD pads are on exactly one copper layer.  layer_hint is ignored
+    # for SMD pads — the layer is fixed by the pad itself.  R1.1 and
+    # C1.2 are both SMD on F.Cu, so the route stays on F.Cu even when
+    # layer_hint suggests B.Cu.
     req = RouteRequest(
         pcb_path=pcb_copy,
         ref_a="R1",
         pad_a="1",
         ref_b="C1",
-        pad_b="2",
+        pad_b="1",
         net="VCC",
-        start_layer="B.Cu",
-        end_layer="B.Cu",
+        width=0.25,
+        clearance=0.2,
+        layer_hint="B.Cu",  # ignored — SMD pads are on F.Cu
     )
-    with pytest.raises(RouteFailure, match="no copper shape"):
-        auto_route_pair(req)
+    result = auto_route_pair(req)
+    assert result.layers_used == ["F.Cu"]
 
 
 # ---------------------------------------------------------------------------
@@ -686,8 +689,7 @@ def test_duplicate_pad_name_resolves_to_layer_matching_pad(tmp_path: Path) -> No
         ref_b="X1",
         pad_b="T",
         net="VCC",
-        start_layer="F.Cu",
-        end_layer="B.Cu",
+        layer_hint="B.Cu",
         width=0.25,
         clearance=0.2,
     )
@@ -761,8 +763,7 @@ def test_multi_layer_via_not_on_same_net_pad(tmp_path: Path) -> None:
         ref_b="X1",
         pad_b="T",
         net="VCC",
-        start_layer="F.Cu",
-        end_layer="B.Cu",
+        layer_hint="B.Cu",
         width=0.25,
         clearance=0.2,
     )
@@ -821,8 +822,7 @@ def test_multi_layer_route_avoids_same_net_tht_hole(tmp_path: Path) -> None:
         ref_b="C1",
         pad_b="1",
         net="VCC",
-        start_layer="F.Cu",
-        end_layer="F.Cu",
+        # Both R1/1 and C1/1 are SMD on F.Cu → single-layer route.
         width=0.25,
         clearance=0.2,
     )
@@ -908,8 +908,7 @@ def test_auto_route_pair_reaches_pad_in_footprint_drawn_bay(tmp_path: Path) -> N
         ref_b="X1",
         pad_b="T",
         net="VCC",
-        start_layer="F.Cu",
-        end_layer="F.Cu",
+        # R1/1 SMD F.Cu → X1/T THT; both share F.Cu → single-layer.
         width=0.25,
         clearance=0.2,
     )
