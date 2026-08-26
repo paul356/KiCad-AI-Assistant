@@ -913,3 +913,89 @@ def test_auto_route_pair_reaches_pad_in_footprint_drawn_bay(tmp_path: Path) -> N
     result = auto_route_pair(req)
     assert result.end == pytest.approx((64.0, 62.0), abs=0.02)
     assert len(result.segments) > 0
+
+
+# ---------------------------------------------------------------------------
+# Edge.Cuts internal openings
+# ---------------------------------------------------------------------------
+
+
+def _board_with_opening(tmp_path: Path, rect: tuple[float, float, float, float]) -> Path:
+    """Fixture board + one internal gr_rect opening on Edge.Cuts.
+
+    Baseline outline is (20,20)-(70,60); the opening must sit inside it.
+    """
+    src = _fixture_pcb()
+    dst = tmp_path / "board.kicad_pcb"
+    board = Path(src).read_text().rstrip()
+    assert board.endswith(")")
+    x1, y1, x2, y2 = rect
+    opening = (
+        "\n\t# ---- internal Edge.Cuts opening ----\n"
+        "\t(gr_rect\n"
+        f"\t\t(start {x1} {y1})\n"
+        f"\t\t(end {x2} {y2})\n"
+        "\t\t(stroke (width 0.1) (type solid))\n"
+        "\t\t(fill none)\n"
+        '\t\t(layer "Edge.Cuts")\n'
+        "\t)\n"
+    )
+    dst.write_text(board[:-1] + opening + ")\n")
+    return dst
+
+
+def test_edge_cuts_internal_rect_becomes_opening_obstacle(tmp_path: Path) -> None:
+    """A closed gr_rect fully inside the outline is a routing-slot opening:
+    it must appear in the world model as an all-layer obstacle of kind
+    "opening", not just widen the board AABB."""
+    from kcaa.router.world_model import build_world_model
+
+    dst = _board_with_opening(tmp_path, (40.0, 25.0, 50.0, 35.0))
+    world = build_world_model(str(dst), net_filter=None)
+    openings = [o for o in world.obstacles if o.kind == "opening"]
+    assert len(openings) == 1
+    o = openings[0]
+    # Slot polygon matches the requested rect (world coords).
+    assert o.shape.bounds == pytest.approx((40.0, 25.0, 50.0, 35.0))
+    assert o.layers == frozenset({"F.Cu", "B.Cu", "In1.Cu", "In2.Cu", "In3.Cu", "In4.Cu"})
+    assert o.net is None
+
+
+def test_auto_route_pair_detours_around_internal_opening(tmp_path: Path) -> None:
+    """R1 (30,30) -> C1 (60,30) crosses a 40..50 x 25..35 opening on the
+    straight line; the router must route around it (no segment may cross
+    the slot)."""
+    from shapely.geometry import LineString, Polygon
+
+    dst = _board_with_opening(tmp_path, (40.0, 25.0, 50.0, 35.0))
+    req = RouteRequest(
+        pcb_path=str(dst),
+        ref_a="R1",
+        pad_a="1",
+        ref_b="C1",
+        pad_b="1",
+        net="VCC",
+        width=0.25,
+        clearance=0.2,
+    )
+    result = auto_route_pair(req)
+    assert len(result.segments) > 0
+    slot = Polygon([(40.0, 25.0), (50.0, 25.0), (50.0, 35.0), (40.0, 35.0)])
+    for seg in result.segments:
+        line = LineString([(seg.x1, seg.y1), (seg.x2, seg.y2)])
+        assert not line.intersects(slot), (
+            f"Segment {seg.x1:.3f},{seg.y1:.3f}->{seg.x2:.3f},{seg.y2:.3f} "
+            f"crosses the Edge.Cuts opening"
+        )
+
+
+def test_edge_cuts_open_notch_is_not_opening(tmp_path: Path) -> None:
+    """The X1 bay notch touches the board outline (it is carved out of the
+    edge), so it is part of the outline -- NOT an internal opening.  The
+    world model must not produce an "opening" obstacle for it."""
+    from kcaa.router.world_model import build_world_model
+
+    dst = _board_with_bay_connector(tmp_path)
+    world = build_world_model(str(dst), net_filter=None)
+    openings = [o for o in world.obstacles if o.kind == "opening"]
+    assert openings == []

@@ -25,11 +25,21 @@ from dataclasses import dataclass, field
 import math
 from typing import Any, Literal
 
-from shapely.geometry import Point, Polygon
+from shapely.geometry import LineString, Point, Polygon
+from shapely.ops import polygonize, unary_union
 
 from kcaa.utils.pcb_sexp_utils import load_pcb
 
-ObstacleKind = Literal["footprint", "pad", "track", "via", "keepout", "board_edge", "drill"]
+ObstacleKind = Literal[
+    "footprint",
+    "pad",
+    "track",
+    "via",
+    "keepout",
+    "board_edge",
+    "drill",
+    "opening",
+]
 
 
 @dataclass(frozen=True)
@@ -122,6 +132,19 @@ def build_world_model(
             ko = _keepout_obstacle(item)
             if ko is not None:
                 model.obstacles.append(ko)
+
+    # Edge.Cuts internal openings (cutouts / routing slots) are physical
+    # voids through the whole stack: block them on every copper layer.
+    for opening in _edge_cuts_openings(data):
+        model.obstacles.append(
+            Obstacle(
+                shape=opening,
+                layers=_ALL_COPPER_LAYERS,
+                net=None,
+                kind="opening",
+                ref=None,
+            )
+        )
     return model
 
 
@@ -557,3 +580,213 @@ def _board_bbox(data: list[Any]) -> tuple[float, float, float, float] | None:
     if not xs:
         return None
     return min(xs), min(ys), max(xs), max(ys)
+
+
+# ---------------------------------------------------------------------------
+# Edge.Cuts openings (cutouts / routing slots inside the board)
+# ---------------------------------------------------------------------------
+
+
+def _edge_cuts_openings(data: list[Any]) -> list[Polygon]:
+    """Closed Edge.Cuts loops strictly inside the board outline.
+
+    KiCad draws internal cutouts (routing slots, mounting windows) as
+    closed loops on the Edge.Cuts layer that lie wholly inside the outer
+    outline.  A track routed across such a loop physically spans a hole in
+    the substrate -- fabrication-invalid copper.  Open notches that touch
+    the outer boundary (e.g. an edge-connector card bay) are NOT openings:
+    they are part of the outline, and the AABB fence handles them.
+
+    The outer outline is the polygonized face with maximum area; every
+    interior ring of that face is one opening loop.  Panel files with
+    several disjoint outlines are handled by collecting interior rings
+    from every face, not just the largest.
+
+    Returns [] when the outline is absent, open, or degenerate (same
+    workflow state as a missing ``_board_bbox``).
+    """
+    lines: list[LineString] = []
+
+    def _walk(node: list[Any], ox: float, oy: float, rot: float) -> None:
+        if not _is_list(node):
+            return
+        tag = _sym(node[0])
+        if tag == "footprint":
+            fox, foy, frot = ox, oy, rot
+            at = _get_sub(node, "at")
+            if at is not None and len(at) >= 3:
+                try:
+                    fox, foy = float(at[1]), float(at[2])
+                except (TypeError, ValueError):
+                    pass
+                if len(at) >= 4:
+                    try:
+                        frot = float(at[3])
+                    except (TypeError, ValueError):
+                        pass
+            for sub in node:
+                _walk(sub, fox, foy, frot)
+            return
+        if tag in _EDGE_GRAPHICS:
+            if _get_layer_str(node) != "Edge.Cuts":
+                return
+            segs = _edge_graphics_to_lines(node, ox, oy, rot)
+            lines.extend(segs)
+            return
+        for sub in node:
+            _walk(sub, ox, oy, rot)
+
+    for item in data:
+        _walk(item, 0.0, 0.0, 0.0)
+    if not lines:
+        return []
+    merged = unary_union(lines)
+    faces = list(polygonize(merged))
+    if not faces:
+        return []
+    # Every closed loop that is interior to *any* face is an opening.
+    # Taking interiors from all faces (not just the max-area one) also
+    # covers panel files with several disjoint board outlines.
+    openings = [Polygon(ring) for f in faces for ring in f.interiors]
+    return [p for p in openings if p.is_valid and not p.is_empty and p.area > 0]
+
+
+def _edge_graphics_to_lines(
+    node: list[Any],
+    ox: float,
+    oy: float,
+    rot: float,
+) -> list[LineString]:
+    """Convert one Edge.Cuts graphic node into world-coordinate segments.
+
+    Supports the KiCad line/rect/arc/circle/poly graphic families (board
+    ``gr_*`` and footprint ``fp_*`` variants).  Footprint-local coordinates
+    are transformed through the footprint origin/rotation, exactly like
+    :func:`_board_bbox`.
+    """
+    tag = _sym(node[0])
+    rad = math.radians(rot)
+    c, s = math.cos(rad), math.sin(rad)
+
+    def _pt(name: str) -> tuple[float, float] | None:
+        sub = _get_sub(node, name)
+        if sub is None or len(sub) < 3:
+            return None
+        try:
+            lx, ly = float(sub[1]), float(sub[2])
+        except (TypeError, ValueError):
+            return None
+        return (ox + c * lx + s * ly, oy - s * lx + c * ly)
+
+    if tag in ("gr_line", "fp_line"):
+        p1, p2 = _pt("start"), _pt("end")
+        if p1 is not None and p2 is not None:
+            return [LineString([p1, p2])]
+        return []
+    if tag in ("gr_rect", "fp_rect"):
+        p1, p2 = _pt("start"), _pt("end")
+        if p1 is None or p2 is None:
+            return []
+        x1, y1 = p1
+        x2, y2 = p2
+        ring = [(x1, y1), (x2, y1), (x2, y2), (x1, y2), (x1, y1)]
+        return [LineString(ring)]
+    if tag in ("gr_arc", "fp_arc"):
+        p1, pm, p2 = _pt("start"), _pt("mid"), _pt("end")
+        if p1 is None or pm is None or p2 is None:
+            return []
+        return [_arc_to_line(p1, pm, p2)]
+    if tag in ("gr_circle", "fp_circle"):
+        pc, pe = _pt("center"), _pt("end")
+        if pc is None or pe is None:
+            return []
+        r = math.hypot(pe[0] - pc[0], pe[1] - pc[1])
+        if r <= 0:
+            return []
+        n = 32
+        ring = [
+            (
+                pc[0] + r * math.cos(2.0 * math.pi * i / n),
+                pc[1] + r * math.sin(2.0 * math.pi * i / n),
+            )
+            for i in range(n + 1)
+        ]
+        return [LineString(ring)]
+    if tag in ("gr_poly", "fp_poly"):
+        pts: list[tuple[float, float]] = []
+        for sub in node:
+            if _is_list(sub) and _sym(sub[0]) == "pts":
+                for p in sub[1:]:
+                    if _is_list(p) and _sym(p[0]) == "xy" and len(p) >= 3:
+                        try:
+                            pts.append(
+                                (
+                                    ox + c * float(p[1]) + s * float(p[2]),
+                                    oy - s * float(p[1]) + c * float(p[2]),
+                                )
+                            )
+                        except (TypeError, ValueError):
+                            continue
+        if len(pts) >= 3:
+            if pts[0] != pts[-1]:
+                pts.append(pts[0])
+            return [LineString(pts)]
+        return []
+    return []
+
+
+def _arc_to_line(
+    p_start: tuple[float, float],
+    p_mid: tuple[float, float],
+    p_end: tuple[float, float],
+    n: int = 16,
+) -> LineString:
+    """Sample a 3-point arc (start, mid, end) into a polyline.
+
+    KiCad stores arcs as three on-arc points; the sweep direction is the
+    one that passes through ``p_mid``.  Returns a degenerate 2-point line
+    when the three points are collinear or coincident.
+    """
+    ax, ay = p_start
+    bx, by = p_mid
+    cx, cy = p_end
+    d = 2.0 * (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by))
+    if abs(d) < 1e-12:
+        return LineString([p_start, p_end])
+    ux = (
+        (ax * ax + ay * ay) * (by - cy)
+        + (bx * bx + by * by) * (cy - ay)
+        + (cx * cx + cy * cy) * (ay - by)
+    ) / d
+    uy = (
+        (ax * ax + ay * ay) * (cx - bx)
+        + (bx * bx + by * by) * (ax - cx)
+        + (cx * cx + cy * cy) * (bx - ax)
+    ) / d
+    r = math.hypot(ax - ux, ay - uy)
+    if r <= 0:
+        return LineString([p_start, p_end])
+    a1 = math.atan2(ay - uy, ax - ux)
+    am = math.atan2(by - uy, bx - ux)
+    a2 = math.atan2(cy - uy, cx - ux)
+    ccw = (a2 - a1) % (2.0 * math.pi)  # 0..2pi sweep start->end
+    mid_ccw = (am - a1) % (2.0 * math.pi)
+    if 0.0 < mid_ccw < ccw:
+        sweep = ccw
+    elif mid_ccw > ccw:
+        sweep = ccw - 2.0 * math.pi
+    else:  # coincident mid (start == mid or mid == end) -> straight-ish
+        sweep = ccw
+    if abs(sweep) < 1e-12:
+        return LineString([p_start, p_end])
+    pts = [
+        (ux + r * math.cos(a1 + sweep * i / n), uy + r * math.sin(a1 + sweep * i / n))
+        for i in range(n + 1)
+    ]
+    # Pin the sampled endpoints to the exact input points so the arc
+    # stitches exactly onto neighbouring Edge.Cuts segments (rounding in
+    # the center/radius reconstruction would otherwise leave a tiny gap
+    # that breaks polygonize's ring closing).
+    pts[0] = p_start
+    pts[-1] = p_end
+    return LineString(pts)

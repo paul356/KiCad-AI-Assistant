@@ -71,3 +71,70 @@ Also note the equivalent check at `router.py` (~line 1634,
   yield `drill`-kind obstacles for its two NPTH holes.
 - Real board: ninja-keyboard world model should report ~309 `drill`-kind
   obstacles instead of 0.
+---
+
+## Edge.Cuts internal openings are not routing obstacles
+
+**Status:** fixed on `fix/duplicate-pad-routing` (commit after `de8ff31`);
+implemented as `_edge_cuts_openings` + `opening`-kind world-model obstacles
+(see below for the original analysis)
+
+### Symptom
+
+`kcaa/router/world_model.py` only uses Edge.Cuts for two things:
+
+- `_board_bbox` — the AABB of all Edge.Cuts items (outer envelope),
+- `router._check_segments_in_board` — verifies segments stay inside that
+  AABB rectangle.
+
+Neither models **internal openings**: closed Edge.Cuts loops fully inside
+the board (cutouts, routing slots, mounting windows). The router treats
+the board as a solid rectangle and can place tracks across a physical
+void — a real fabrication defect.
+
+### Evidence
+
+Real board `/home/user1/pcb/ninja-keyboard/ninja-keyboard.kicad_pcb`:
+
+- 76 Edge.Cuts items total; **61 internal `fp_rect` openings** (3.4 x 3.0 mm,
+  fully inside the board AABB, e.g. SL61 at x[430.6, 434.0] y[251.0, 254.0])
+  plus 7 `gr_circle` items.
+- `world_model` builds **0** obstacles from any of them; only the outer
+  AABB `(158.475, 139.475, 444.225, 256.725)` is used for the board fence.
+- A* would happily route across any of those 61 holes.
+
+### Impact
+
+Tracks routed across a cutout are floating copper — electrically valid,
+fabrication-invalid (the copper has no substrate, and the DRC clearance
+rules around the cutout edge are not honored). KiCad will flag it in DRC,
+but the router should avoid producing it.
+
+### Fix (proposed)
+
+In `world_model.py`:
+
+1. Collect all Edge.Cuts graphics (board-level `gr_*` and footprint-level
+   `fp_*`, transformed into world coordinates like `_board_bbox` does) as
+   shapely linework.
+2. `unary_union` the linework, `polygonize` it, take the outer face (the
+   one with maximum area), and read its `interiors` — each interior ring
+   is a closed opening loop.
+3. Add one obstacle per opening: polygon = the ring, layers = ALL copper
+   layers (a cutout severs every layer), kind = `"opening"`, net = None.
+
+The router's existing `_inflate_obstacles` (width/2 + clearance) then
+applies automatically — tracks keep full clearance from the opening edge.
+
+Open loops (notches open to the board edge, like the micro:bit card bay)
+are NOT openings — they stay part of the outline AABB, and the
+`_check_segments_in_board` fence still applies.
+
+### Validation
+
+- Unit: fixture board with an internal rectangle + circle opening →
+  `world_model` yields `opening`-kind obstacles at the right position;
+  route that would cross the opening detours around it.
+- Real board: ninja-keyboard world model reports 61+ `opening` obstacles
+  (one per internal fp_rect); regression-check matrix-bit-card J2/3 ->
+  U11/3v3 route is still produced (bay is an open notch, not an opening).
