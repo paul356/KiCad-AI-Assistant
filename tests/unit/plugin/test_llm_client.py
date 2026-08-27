@@ -90,6 +90,21 @@ def _tool(tool_call_id="tc1", content="result"):
 # ---------------------------------------------------------------------------
 
 
+class TestSetBaseUrl:
+    def test_updates_url_after_construction(self):
+        client = _make_client()
+        assert client._mcp_base_url == "http://127.0.0.1:9999"
+        client.set_base_url("http://127.0.0.1:5555")
+        assert client._mcp_base_url == "http://127.0.0.1:5555"
+
+    def test_none_then_real_url(self):
+        client = _make_client()
+        # Client constructed before the backend is up sees base URL None.
+        client.set_base_url(None)
+        client.set_base_url("http://127.0.0.1:1234")
+        assert client._mcp_base_url == "http://127.0.0.1:1234"
+
+
 class TestDedupToolCalls:
     def test_no_change_when_no_tool_calls(self):
         client = _make_client()

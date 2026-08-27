@@ -855,6 +855,15 @@ class LLMClient:
         """Clear conversation history."""
         self._history = []
 
+    def set_base_url(self, url: str | None) -> None:
+        """Set the MCP backend base URL after construction.
+
+        The URL is only known once the backend has finished starting, which
+        may happen after the client is created (e.g. on panel display before
+        the backend came up).
+        """
+        self._mcp_base_url = url
+
     def get_history(self) -> list[dict[str, Any]]:
         """Return a copy of the conversation history for session persistence."""
         return list(self._history)
