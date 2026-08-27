@@ -12,7 +12,7 @@ Pipeline
 3. **Find pad centers**: locate the two pads to connect and read their copper
    pad shape's center.
 4. **Pick exit points**: choose one or two candidate exit points on the pad
-   edge for each end (axis-aligned first, 45° if needed).
+   edge for each end (axis-aligned first, 45 deg  if needed).
 5. **Grid search + A\\***: build a walkability grid from inflated obstacles
    and run 8-direction A*.  Multi-layer routes insert via edges at legal
    (x, y) positions between layers in ``via_pairs``.
@@ -24,7 +24,7 @@ Multi-layer routing
 
 When ``start_layer != end_layer`` the router builds one GridMap per
 routing layer and runs a multi-layer A* that can insert via edges.
-Via edges cost 2.0 mm (configurable) — this penalises vias so A* prefers
+Via edges cost 2.0 mm (configurable) -- this penalises vias so A* prefers
 routing on a single layer when possible.
 
 No shove
@@ -44,6 +44,7 @@ import logging
 import math
 import os
 
+from shapely.geometry import Polygon
 from shapely.geometry import box as _shapely_box
 
 from kcaa.router.grid_a_star import (
@@ -61,7 +62,7 @@ from kcaa.router.path_postprocess import (
     postprocess_path,
 )
 from kcaa.router.visibility_graph import RouteNode
-from kcaa.router.world_model import Obstacle, build_world_model
+from kcaa.router.world_model import Obstacle, _get_net, build_world_model
 from kcaa.utils.pcb_sexp_utils import load_pcb
 
 logger = logging.getLogger(__name__)
@@ -112,30 +113,39 @@ class RouteRequest:
     The pads may live on different copper layers; in that case the router
     will insert one or more vias to switch layers.
 
+    Layer selection is automatic: the router inspects each pad's type and
+    copper layers.  For SMD/connect pads the layer is fixed by the pad
+    itself.  For thru-hole pads (``*.Cu``) the router picks the best
+    shared copper layer, preferring ``layer_hint`` when it is valid.
+
     Attributes:
         pcb_path: Absolute path to the ``.kicad_pcb`` file.
         ref_a / pad_a: Reference designator and pad number for one end.
         ref_b / pad_b: Reference designator and pad number for the other end.
         net: Net name shared by both pads.
-        start_layer: Copper layer the pad-A copper shape is on.
-        end_layer: Copper layer the pad-B copper shape is on.
+        layer_hint: Preferred copper layer for thru-hole pads.  When
+            ``None`` (default) the router picks the best layer
+            automatically.  Ignored for SMD pads whose layer is fixed.
         via_pairs: Allowed (top, bottom) layer pairs that may carry a
             through-via. Default is ``(("F.Cu", "B.Cu"),)``. Pass an
             explicit tuple to restrict transitions (e.g. to forbid inner-
             layer vias on a 4-layer board).
-        width: Track width; ``None`` → resolve from netclass.
-        clearance: Minimum clearance to obstacles; ``None`` → resolve from
+        width: Track width; ``None`` -> resolve from netclass.
+        clearance: Minimum clearance to obstacles; ``None`` -> resolve from
             the board's design rules.
-        via_diameter / via_drill: Through-via dimensions; ``None`` →
+        via_diameter / via_drill: Through-via dimensions; ``None`` ->
             resolve from netclass.
         max_miter_mm: Maximum corner miter extension before falling back
-            to a sharp 90° corner.
+            to a sharp 90 deg  corner.
         grid_resolution: Grid cell size in mm for the walkability grid.
             Smaller values give finer paths but more cells.  ``None``
             uses the default (0.025 mm).
         via_cost: Distance-equivalent penalty for taking a via edge in
             multi-layer A*.  Higher values discourage unnecessary stack
             vias.  Default 2.0 mm.
+        turn_penalty: Distance-equivalent cost added when the path
+            changes direction.  0 disables (pure shortest path).
+            Default 0.3 mm ~ 3 cells at 0.1 mm resolution.
     """
 
     pcb_path: str
@@ -144,16 +154,16 @@ class RouteRequest:
     ref_b: str
     pad_b: str
     net: str
-    start_layer: str = "F.Cu"
-    end_layer: str = "F.Cu"
+    layer_hint: str | None = None
     via_pairs: tuple[tuple[str, str], ...] = (("F.Cu", "B.Cu"),)
     width: float | None = None  # if None, use DRC default for the net
     clearance: float | None = None
     via_diameter: float | None = None
     via_drill: float | None = None
     max_miter_mm: float = 1.0
-    grid_resolution: float | None = None  # None → GRID_RESOLUTION
+    grid_resolution: float | None = None  # None -> GRID_RESOLUTION
     via_cost: float = 2.0  # mm penalty per via edge
+    turn_penalty: float = 0.3  # mm penalty per direction change; 0 disables
 
 
 @dataclass
@@ -186,8 +196,11 @@ class RouteResult:
 
 def auto_route_pair(req: RouteRequest) -> RouteResult:
     """Connect pad ``req.pad_a`` on ``req.ref_a`` to pad ``req.pad_b`` on
-    ``req.ref_b`` on the same net ``req.net`` and same layer ``req.start_layer``
-    (and ``req.end_layer`` for the destination pad).
+    ``req.ref_b`` on the same net ``req.net``.
+
+    Layers are auto-resolved from pad types: SMD pads use their fixed
+    layer; thru-hole pads use a shared copper layer (preferring
+    ``req.layer_hint``).
 
     Returns:
         A :class:`RouteResult` containing the segments and (optionally) vias.
@@ -197,18 +210,8 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
     """
     data = load_pcb(req.pcb_path)
 
-    # Validate requested layers against the PCB early. The visibility graph
-    # query below assumes both layers exist; checking later would produce
-    # a less informative error path.
+    # Validate via_pairs against the PCB layers early.
     pcb_layers = _pcb_layer_names(data)
-    for layer in (req.start_layer, req.end_layer):
-        if layer not in pcb_layers:
-            raise RouteFailure(
-                f"Layer {layer!r} is not present in PCB {req.pcb_path}; "
-                f"PCB layers are {pcb_layers}."
-            )
-    # via_pairs must reference layers that exist too — otherwise A* would
-    # never use those edges and the user might not notice.
     for top, bot in req.via_pairs:
         if top not in pcb_layers:
             raise RouteFailure(
@@ -219,6 +222,15 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
             raise RouteFailure(
                 f"via_pairs contains bottom layer {bot!r} which is not in PCB "
                 f"{req.pcb_path}; PCB layers are {pcb_layers}."
+            )
+
+    # Auto-resolve start/end layers from pad types + layer_hint.
+    start_layer, end_layer = _resolve_layers(data, req)
+    for layer in (start_layer, end_layer):
+        if layer not in pcb_layers:
+            raise RouteFailure(
+                f"Layer {layer!r} is not present in PCB {req.pcb_path}; "
+                f"PCB layers are {pcb_layers}."
             )
 
     # DRC defaults from the .kicad_pro / board file. Fail loudly if the
@@ -248,29 +260,55 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
     if via_drill is None:
         via_drill = _resolve_via_drill(req.pcb_path, net=req.net)
 
-    # Pad center coordinates.
-    pad_a_xy = _find_pad_center(data, req.ref_a, req.pad_a)
-    pad_b_xy = _find_pad_center(data, req.ref_b, req.pad_b)
+    # Pad center coordinates. The layer keeps center and size on the SAME
+    # pad when a footprint declares several pads with one name.
+    pad_a_xy = _find_pad_center(data, req.ref_a, req.pad_a, start_layer)
+    pad_b_xy = _find_pad_center(data, req.ref_b, req.pad_b, end_layer)
     if pad_a_xy is None:
-        raise RouteFailure(f"Pad {req.ref_a}/{req.pad_a} not found")
-    if pad_b_xy is None:
-        raise RouteFailure(f"Pad {req.ref_b}/{req.pad_b} not found")
-
-    # Validate pads exist on the requested copper layers before doing
-    # anything else (gives a clear error, not a confusing A* failure).
-    if _find_pad_size(data, req.ref_a, req.pad_a, req.start_layer) is None:
+        if _find_pad_center(data, req.ref_a, req.pad_a) is None:
+            raise RouteFailure(f"Pad {req.ref_a}/{req.pad_a} not found")
         raise RouteFailure(
             f"Pad {req.ref_a}/{req.pad_a} has no copper shape on layer "
-            f"{req.start_layer!r}; cannot route from there."
+            f"{start_layer!r}; cannot route from there."
         )
-    if _find_pad_size(data, req.ref_b, req.pad_b, req.end_layer) is None:
+    if pad_b_xy is None:
+        if _find_pad_center(data, req.ref_b, req.pad_b) is None:
+            raise RouteFailure(f"Pad {req.ref_b}/{req.pad_b} not found")
         raise RouteFailure(
             f"Pad {req.ref_b}/{req.pad_b} has no copper shape on layer "
-            f"{req.end_layer!r}; cannot route to there."
+            f"{end_layer!r}; cannot route to there."
         )
 
+    # Validate pads exist on the resolved copper layers before doing
+    # anything else (gives a clear error, not a confusing A* failure).
+    if _find_pad_size(data, req.ref_a, req.pad_a, start_layer) is None:
+        raise RouteFailure(
+            f"Pad {req.ref_a}/{req.pad_a} has no copper shape on layer "
+            f"{start_layer!r}; cannot route from there."
+        )
+    if _find_pad_size(data, req.ref_b, req.pad_b, end_layer) is None:
+        raise RouteFailure(
+            f"Pad {req.ref_b}/{req.pad_b} has no copper shape on layer "
+            f"{end_layer!r}; cannot route to there."
+        )
+
+    # Early net check: pads on different nets must not be routed together.
+    # A foreign-net pad is an obstacle -- past the net check the world model
+    # would dutifully treat it as one and fail deep inside A*, so fail fast
+    # with the actual cause.
+    for ref, pad, layer in (
+        (req.ref_a, req.pad_a, start_layer),
+        (req.ref_b, req.pad_b, end_layer),
+    ):
+        pad_net = _find_pad_net(data, ref, pad, layer)
+        if pad_net is not None and pad_net != req.net:
+            raise RouteFailure(
+                f"Pad {ref}/{pad} is on net {pad_net!r}, not the requested "
+                f"net {req.net!r}; cannot route between different nets."
+            )
+
     # World model: only existing copper (tracks, vias, keepouts) blocks the
-    # route.  Footprint courtyards are NOT obstacles — they're a DRC spacing
+    # route.  Footprint courtyards are NOT obstacles -- they're a DRC spacing
     # concept, not a hard copper boundary, and treating them as forbidden
     # forces pointless detours around parts.  Start/end footprints would be
     # excluded anyway, but we skip the whole footprint layer.
@@ -284,13 +322,13 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
     buffered = _inflate_obstacles(model.obstacles, width / 2.0 + clearance)
 
     # Group inflated obstacles by layer for multi-layer routing.
-    routing_layers = _routing_layers(req)
+    routing_layers = _routing_layers(req, start_layer, end_layer)
     obstacles_by_layer: dict[str, list] = {}
     for rl in routing_layers:
         obstacles_by_layer[rl] = [o for o in buffered if rl in o.layers]
 
     # Detect rectangular pads to replace A* path inside them.
-    # A pad is "rectangular" when its width and height differ by ≥ 20%.
+    # A pad is "rectangular" when its width and height differ by >= 20%.
     def _is_rect(size: tuple[float, float] | None) -> bool:
         if size is None:
             return False
@@ -298,13 +336,13 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
         return w > 0 and h > 0 and abs(w - h) / max(w, h) >= 0.2
 
     def _world_size(local_w: float, local_h: float, fp_rot: float) -> tuple[float, float]:
-        """Return (world_w, world_h) accounting for ±90° footprint rotation."""
+        """Return (world_w, world_h) accounting for +/-90 degree footprint rotation."""
         if abs(fp_rot % 180.0 - 90.0) < 0.1:
             return local_h, local_w
         return local_w, local_h
 
-    pad_a_size = _find_pad_size(data, req.ref_a, req.pad_a, req.start_layer)
-    pad_b_size = _find_pad_size(data, req.ref_b, req.pad_b, req.end_layer)
+    pad_a_size = _find_pad_size(data, req.ref_a, req.pad_a, start_layer)
+    pad_b_size = _find_pad_size(data, req.ref_b, req.pad_b, end_layer)
     pad_a_world_size = (
         _world_size(pad_a_size[0], pad_a_size[1], _fp_rotation(data, req.ref_a))
         if pad_a_size
@@ -321,28 +359,97 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
     # For multi-layer routing, clear the start/end pad areas from the
     # obstacle grid so A* can start from / end at the pad centres.
     # Existing copper (e.g. a track from another net) may occupy the pad.
-    if req.start_layer != req.end_layer:
+    if start_layer != end_layer:
         if pad_a_world_size is not None:
-            obstacles_by_layer[req.start_layer] = _subtract_pad_aabb(
-                obstacles_by_layer[req.start_layer],
+            obstacles_by_layer[start_layer] = _subtract_pad_aabb(
+                obstacles_by_layer[start_layer],
                 pad_a_xy,
                 pad_a_world_size,
             )
         if pad_b_world_size is not None:
-            obstacles_by_layer[req.end_layer] = _subtract_pad_aabb(
-                obstacles_by_layer[req.end_layer],
+            obstacles_by_layer[end_layer] = _subtract_pad_aabb(
+                obstacles_by_layer[end_layer],
                 pad_b_xy,
                 pad_b_world_size,
             )
 
-    # Route from pad center to pad center.  A* on the grid naturally
-    # produces 0/45/90° segments.
+    # The world model drops same-net pad copper entirely (the route must
+    # land on its own endpoint pads).  Re-add every same-net pad as a
+    # transit obstacle on the copper layers it covers so the track never
+    # overlaps other same-net pad copper -- it terminates on the endpoint
+    # pad only and connects to other same-net pads by separate tracks
+    # later.  Buffer by ``width / 2 + clearance``: the track edge must
+    # keep a clearance gap from the pad copper, same as for any other
+    # obstacle.  If this makes the route impossible at the requested
+    # width, that is the correct answer -- the user should try a
+    # narrower track.  The two endpoint pads are exempt on their own
+    # terminal layers so the track can start/end at their centres.
+    pad_half = width / 2.0 + clearance
+    _sn_shapes: list = []
+    for poly, players, _ref, _pname, center in _same_net_pad_polygons(data, req.net):
+        is_end = (abs(center[0] - pad_a_xy[0]) < 1e-6 and abs(center[1] - pad_a_xy[1]) < 1e-6) or (
+            abs(center[0] - pad_b_xy[0]) < 1e-6 and abs(center[1] - pad_b_xy[1]) < 1e-6
+        )
+        buf = poly.buffer(pad_half)
+        if buf.is_empty or not buf.is_valid:
+            continue
+        _sn_shapes.append(buf)
+        for layer in players:
+            if layer not in obstacles_by_layer:
+                continue
+            if is_end and layer in (start_layer, end_layer):
+                continue
+            obstacles_by_layer[layer].append(
+                Obstacle(
+                    shape=buf,
+                    layers=frozenset({layer}),
+                    net=req.net,
+                    kind="pad",
+                )
+            )
+
+    # Route bounding box must cover the endpoint pads and every same-net
+    # pad obstacle: a detour around a wide pad cluster can extend past
+    # the +/-5 mm endpoint margin.
+    _hb = [s.bounds for s in _sn_shapes]
+    _hx0 = min((b[0] for b in _hb), default=pad_a_xy[0])
+    _hy0 = min((b[1] for b in _hb), default=pad_a_xy[1])
+    _hx1 = max((b[2] for b in _hb), default=pad_a_xy[0])
+    _hy1 = max((b[3] for b in _hb), default=pad_b_xy[1])
     route_bbox = (
-        min(pad_a_xy[0], pad_b_xy[0]) - 5.0,
-        min(pad_a_xy[1], pad_b_xy[1]) - 5.0,
-        max(pad_a_xy[0], pad_b_xy[0]) + 5.0,
-        max(pad_a_xy[1], pad_b_xy[1]) + 5.0,
+        min(pad_a_xy[0], pad_b_xy[0], _hx0) - 5.0,
+        min(pad_a_xy[1], pad_b_xy[1], _hy0) - 5.0,
+        max(pad_a_xy[0], pad_b_xy[0], _hx1) + 5.0,
+        max(pad_a_xy[1], pad_b_xy[1], _hy1) + 5.0,
     )
+    # The A* search area is clipped to route_bbox; an obstacle that spans
+    # the whole box (e.g. an Edge.Cuts opening the two pads sit on either
+    # side of) then looks like an impassable wall even though a detour
+    # around it exists outside the box.  Extend the box to cover the
+    # bounds of every obstacle that intersects it (iterated to closure so
+    # obstacles discovered on the second ring are included too), giving
+    # the search enough room to route around them.
+    _routing = set(routing_layers)
+    _x0, _y0, _x1, _y1 = route_bbox
+    _grew = True
+    while _grew:
+        _grew = False
+        for _o in buffered:
+            if not (_routing & _o.layers):
+                continue
+            _b = _o.shape.bounds
+            if _b[2] < _x0 or _b[0] > _x1 or _b[3] < _y0 or _b[1] > _y1:
+                continue  # no overlap with the current search box
+            _nx0, _ny0, _nx1, _ny1 = (
+                min(_x0, _b[0]),
+                min(_y0, _b[1]),
+                max(_x1, _b[2]),
+                max(_y1, _b[3]),
+            )
+            if (_nx0, _ny0, _nx1, _ny1) != (_x0, _y0, _x1, _y1):
+                _x0, _y0, _x1, _y1 = _nx0, _ny0, _nx1, _ny1
+                _grew = True
+    route_bbox = (_x0, _y0, _x1, _y1)
     grid_res = req.grid_resolution or GRID_RESOLUTION
 
     # ---- A* directly from pad centre to pad centre ----
@@ -350,7 +457,7 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
     _bx, _by = pad_b_xy
     print(
         f"  [route] {req.ref_a}/{req.pad_a} ({_ax:.3f},{_ay:.3f})"
-        f" → {req.ref_b}/{req.pad_b} ({_bx:.3f},{_by:.3f})"
+        f" -> {req.ref_b}/{req.pad_b} ({_bx:.3f},{_by:.3f})"
         f"  size_a={pad_a_size} size_b={pad_b_size}"
     )
     # Build pad-rectangle descriptors early (used by postprocess_path in
@@ -381,46 +488,37 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
                 )
             )
 
-    if req.start_layer != req.end_layer:
-        # ── Multi-layer: grid A* with via edges ──────────────────────
-        # Build via-forbidden zones from start/end pad AABBs to
-        # prevent via-in-pad (DFM issue: solder wicking).
+    if start_layer != end_layer:
+        # -- Multi-layer: grid A* with via edges ----------------------
+        # Via-forbidden zones cover EVERY same-net pad, not just the two
+        # endpoint pads: a via on any same-net pad face is a DFM defect
+        # (solder wicking, annular-ring breakout).  Same-net pads are
+        # absent from the obstacle grid (the route must land on its own
+        # pads), so without this the via search would happily drop a via
+        # on a finger pad.
         via_forbidden: list = []
-        if pad_a_world_size is not None:
-            via_forbidden.append(
-                _shapely_box(
-                    pad_a_xy[0] - pad_a_world_size[0] / 2.0,
-                    pad_a_xy[1] - pad_a_world_size[1] / 2.0,
-                    pad_a_xy[0] + pad_a_world_size[0] / 2.0,
-                    pad_a_xy[1] + pad_a_world_size[1] / 2.0,
-                )
-            )
-        if pad_b_world_size is not None:
-            via_forbidden.append(
-                _shapely_box(
-                    pad_b_xy[0] - pad_b_world_size[0] / 2.0,
-                    pad_b_xy[1] - pad_b_world_size[1] / 2.0,
-                    pad_b_xy[0] + pad_b_world_size[0] / 2.0,
-                    pad_b_xy[1] + pad_b_world_size[1] / 2.0,
-                )
-            )
+        for poly, _players, _ref, _pname, _center in _same_net_pad_polygons(data, req.net):
+            via_forbidden.append(poly)
         ml_result = multi_layer_a_star(
             obstacles_by_layer,
             pad_a_xy,
             pad_b_xy,
-            req.start_layer,
-            req.end_layer,
+            start_layer,
+            end_layer,
             req.via_pairs,
             route_bbox,
             grid_res,
             via_cost=req.via_cost,
             via_forbidden_zones=via_forbidden or None,
+            turn_penalty=req.turn_penalty,
         )
         if ml_result.path is None:
+            # Dump the failure state so the blockage can be inspected.
+            _dump_viz("fail-multi-astar", [], _pad_viz, buffered, route_bbox)
             raise RouteFailure(
                 f"No obstacle-avoiding multi-layer path from "
                 f"{req.ref_a}/{req.pad_a} to {req.ref_b}/{req.pad_b} at "
-                f"{width}mm track width ({req.start_layer} → {req.end_layer})."
+                f"{width}mm track width ({start_layer} -> {end_layer})."
             )
         print(
             f"  [route] multi-layer A*: {len(ml_result.path)} pts"
@@ -463,7 +561,7 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
                 _log_path(f"{prefix}-pad-replace", pts, n_before)
             _dump_viz(f"{prefix}-1-pad-replace", pts, _pad_viz, obs, route_bbox)
 
-            # Simplify → shortcut → snap45.
+            # Simplify -> shortcut -> snap45.
             pts = _postprocess_layer_segment(pts, obs, route_bbox, grid_res, prefix, _pad_viz)
 
             # Align endpoint to pad centre (start/end segments only).
@@ -499,19 +597,28 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
         end_xy = (all_nodes[-1].x, all_nodes[-1].y)
         layers_used = _layers_used(all_nodes)
     else:
-        # ── Single-layer: hierarchical A* ───────────────────────────
+        # -- Single-layer: hierarchical A* ---------------------------
+        # Only copper on the routing layer can block the track; other
+        # layers are parallel physical planes and must not poison the
+        # grid (the multi-layer branch groups by layer for the same
+        # reason).
+        layer_obstacles = obstacles_by_layer[start_layer]
         result = hierarchical_a_star(
-            buffered,
+            layer_obstacles,
             pad_a_xy,
             pad_b_xy,
             fine_resolution=grid_res,
             route_bbox=route_bbox,
+            turn_penalty=req.turn_penalty,
         )
         if result.path is None:
+            # Dump the failure state so the blockage can be inspected
+            # (same viz format as the success stages).
+            _dump_viz("fail-astar", [], _pad_viz, layer_obstacles, route_bbox)
             raise RouteFailure(
                 f"No obstacle-avoiding path from {req.ref_a}/{req.pad_a} to "
                 f"{req.ref_b}/{req.pad_b} at {req.width or 0.5}mm "
-                f"track width on layer {req.start_layer}."
+                f"track width on layer {start_layer}."
             )
         print(f"  [route] A*: {len(result.path)} pts  cells_visited={result.cells_visited}")
 
@@ -520,7 +627,7 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
         _dump_viz("0-astar", raw_pts, _pad_viz, buffered, route_bbox)
 
         # ---- Discard A* path inside rectangular pads and replace with
-        #      axis-aligned wire (fence → centre). ----
+        #      axis-aligned wire (fence -> centre). ----
         best_path_pts = raw_pts
         if pad_a_size is not None:
             n_before = len(best_path_pts)
@@ -534,7 +641,7 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
             _log_path("pad_b-replace", best_path_pts, n_before)
         _dump_viz("1-pad-replace", best_path_pts, _pad_viz, buffered, route_bbox)
 
-        # ---- Post-process: simplify → shortcut → snap45 ----
+        # ---- Post-process: simplify -> shortcut -> snap45 ----
         best_path_pts = _postprocess_layer_segment(
             best_path_pts, buffered, route_bbox, grid_res, "", _pad_viz
         )
@@ -553,7 +660,7 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
         _log_path("align-endpoints", best_path_pts)
         _dump_viz("6-align-endpoints", best_path_pts, _pad_viz, buffered, route_bbox)
 
-        path_nodes = path_to_nodes(best_path_pts, req.start_layer)
+        path_nodes = path_to_nodes(best_path_pts, start_layer)
         segs, vias = postprocess_path(
             path_nodes,
             width=width,
@@ -585,7 +692,14 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
             req.pcb_path,
         )
     else:
-        _check_segments_in_board(segs, model.board_bbox)
+        # Endpoint pads may straddle the board edge (edge connectors);
+        # their copper is a legal terminus, so exempt those rectangles
+        # from the board fence.
+        pad_zones: list[tuple[float, float, float, float]] = []
+        for pxy, psize in ((pad_a_xy, pad_a_world_size), (pad_b_xy, pad_b_world_size)):
+            if psize is not None:
+                pad_zones.append((pxy[0], pxy[1], psize[0] / 2.0, psize[1] / 2.0))
+        _check_segments_in_board(segs, model.board_bbox, pad_zones=pad_zones or None)
         if vias:
             _check_vias_in_board(vias, model.board_bbox)
 
@@ -609,7 +723,7 @@ def connect_with_via(
 ) -> OutputVia:
     """Helper to build a through-via connecting two segments on different layers.
 
-    The via is placed at the (x, y) of ``seg_a``'s end. Both segments are
+    The via is placed at the (x, y) of seg_a end. Both segments are
     expected to end at the same point.
     """
     return OutputVia(
@@ -652,7 +766,7 @@ def _log_path(label: str, pts: list[tuple[float, float]], prev_n: int | None = N
             kind = "45diag"
         else:
             kind = f"{ang:.0f}deg"
-        segs.append(f"({x1:.3f},{y1:.3f})→({x2:.3f},{y2:.3f}){kind}")
+        segs.append(f"({x1:.3f},{y1:.3f})->({x2:.3f},{y2:.3f}){kind}")
     print(f"  [{label}] {n} pts{delta}: {segs[0]}{'  ...  ' + segs[-1] if len(segs) > 1 else ''}")
     if len(segs) <= 6:
         for s in segs:
@@ -672,7 +786,7 @@ def _log_output_segments(label: str, segs: list) -> None:
             if abs(abs(s.x2 - s.x1) - abs(s.y2 - s.y1)) < 1e-6
             else f"{ang:.0f}deg"
         )
-        print(f"  [{label}] seg{i}: ({s.x1:.3f},{s.y1:.3f})→({s.x2:.3f},{s.y2:.3f}) {kind}")
+        print(f"  [{label}] seg{i}: ({s.x1:.3f},{s.y1:.3f})->({s.x2:.3f},{s.y2:.3f}) {kind}")
 
 
 # ---------------------------------------------------------------------------
@@ -843,7 +957,7 @@ def _postprocess_layer_segment(
     stage_prefix: str,
     pad_viz: list[tuple[str, tuple[float, float, float, float]]],
 ) -> list[tuple[float, float]]:
-    """Run simplify → shortcut → snap45 on a single layer's path points.
+    """Run simplify -> shortcut -> snap45 on a single layer's path.
 
     Each step dumps a viz file with ``stage_prefix`` prepended, so
     multi-layer dumps carry the layer name (e.g. ``layer-F.Cu-2-simplify``)
@@ -858,10 +972,14 @@ def _postprocess_layer_segment(
     pts = shortcut_path(pts, obstacles, route_bbox, resolution=grid_res)
     _log_path(f"{stage_prefix}shortcut", pts)
     _dump_viz(f"{stage_prefix}3-shortcut", pts, pad_viz, obstacles, route_bbox)
-
     pts = snap_to_45_path_safe(pts, obstacles, route_bbox, resolution=grid_res)
     _log_path(f"{stage_prefix}snap45", pts)
     _dump_viz(f"{stage_prefix}4-snap45", pts, pad_viz, obstacles, route_bbox)
+
+    # Re-simplify: snap45 may create new collinear points.
+    pts = simplify_path(pts)
+    _log_path(f"{stage_prefix}resimplify", pts)
+    _dump_viz(f"{stage_prefix}5-resimplify", pts, pad_viz, obstacles, route_bbox)
 
     return pts
 
@@ -875,7 +993,7 @@ def _align_single_endpoint(
     pad_size: tuple[float, float],
     from_center: bool,
 ) -> list[tuple[float, float]]:
-    """Align one endpoint to a pad centre via X→Y iterative translation.
+    """Align one endpoint to a pad centre via X->Y iterative translation.
 
     ``from_center=True`` aligns the start of *path*; ``False`` aligns
     the end.  See :func:`_align_path_endpoints` for the detailed algorithm.
@@ -885,7 +1003,7 @@ def _align_single_endpoint(
 
     pcx, pcy = pad_center
     if from_center:
-        # ── Start pad ───────────────────────────────────────────────
+        # -- Start pad -----------------------------------------------
         dx = pcx - path[0][0]
         if abs(dx) > 1e-9:
             orig = list(path)
@@ -912,7 +1030,7 @@ def _align_single_endpoint(
                 path[k] = (path[k][0], path[k][1] + dy)
                 k += 1
     else:
-        # ── End pad ─────────────────────────────────────────────────
+        # -- End pad -------------------------------------------------
         dx = pcx - path[-1][0]
         if abs(dx) > 1e-9:
             orig = list(path)
@@ -952,7 +1070,7 @@ def _align_path_endpoints(
     pad_a_size: tuple[float, float] | None = None,
     pad_b_size: tuple[float, float] | None = None,
 ) -> list[tuple[float, float]]:
-    """Align both endpoints to pad centres via X→Y translation.
+    """Align both endpoints to pad centres via X->Y translation.
 
     See :func:`_align_single_endpoint` for the per-endpoint algorithm.
     """
@@ -1009,7 +1127,7 @@ def _replace_pad_path(
             if not _inside_rect(path[k], center, hw, hh):
                 fx, fy = path[k + 1]
                 ox, oy = path[k]
-                # Same (center, fence) order — reverse so path reads [fence, projection].
+                # Same (center, fence) order -- reverse so path reads [fence, projection].
                 keep = _build_pad_wire(cx, cy, fx, fy, ox, oy, minx, maxx, miny, maxy)
                 return path[: k + 1] + keep[::-1]
         return path
@@ -1037,7 +1155,7 @@ def _build_pad_wire(
     miny: float,
     maxy: float,
 ) -> list[tuple[float, float]]:
-    """Return ``[projection, fence]`` — a single axis-aligned segment
+    """Return ``[projection, fence]`` -- a single axis-aligned segment
     along the AABB edge the outside point exits from.  The centre is
     kept by the caller (``_replace_pad_path``), and the whole chain
     is translated by ``_align_path_endpoints``."""
@@ -1055,10 +1173,10 @@ def _build_pad_wire(
         horizontal = abs(ox - x1) >= abs(oy - y1)
 
     if horizontal:
-        # fence on left/right edge → horizontal wire at fence_y
+        # fence on left/right edge -> horizontal wire at fence_y
         return [(x1, y2), (x2, y2)]
     else:
-        # fence on top/bottom edge → vertical wire at fence_x
+        # fence on top/bottom edge -> vertical wire at fence_x
         return [(x2, y1), (x2, y2)]
 
 
@@ -1070,6 +1188,7 @@ def _build_pad_wire(
 def _check_segments_in_board(
     segs: list[OutputSegment],
     board_bbox: tuple[float, float, float, float],
+    pad_zones: list[tuple[float, float, float, float]] | None = None,
 ) -> None:
     """Raise :class:`RouteFailure` if any segment leaves the Edge.Cuts AABB.
 
@@ -1080,10 +1199,17 @@ def _check_segments_in_board(
     copper would still touch but not cross the edge); a track whose
     centerline is on the wrong side of the shrunk boundary fails.
 
+    ``pad_zones`` relaxes the fence around the route's endpoint pads:
+    footprints mounted on the board edge (edge connectors) legitimately
+    straddle the outline, so copper running onto those pads must not be
+    rejected. Each zone is ``(cx, cy, half_w, half_h)`` in world coords
+    and is unioned into the region a segment's copper may occupy.
+
     Args:
         segs: The segments produced by :func:`postprocess`.
         board_bbox: ``(minx, miny, maxx, maxy)`` from
             :func:`kcaa.router.world_model._board_bbox`.
+        pad_zones: Optional endpoint-pad rectangles to exempt.
 
     Raises:
         RouteFailure: The first segment that would leave the board.
@@ -1107,7 +1233,7 @@ def _check_segments_in_board(
                 f"Track width {seg.width} mm is wider than the board "
                 f"(shrunk bbox {shrunk_bbox} is degenerate)."
             )
-        board_poly = Polygon(
+        allowed = Polygon(
             [
                 (shrunk_bbox[0], shrunk_bbox[1]),
                 (shrunk_bbox[2], shrunk_bbox[1]),
@@ -1115,8 +1241,20 @@ def _check_segments_in_board(
                 (shrunk_bbox[0], shrunk_bbox[3]),
             ]
         )
+        if pad_zones:
+            for cx, cy, hw, hh in pad_zones:
+                allowed = allowed.union(
+                    Polygon(
+                        [
+                            (cx - hw, cy - hh),
+                            (cx + hw, cy - hh),
+                            (cx + hw, cy + hh),
+                            (cx - hw, cy + hh),
+                        ]
+                    )
+                )
         line = LineString([(seg.x1, seg.y1), (seg.x2, seg.y2)])
-        if not board_poly.covers(line):
+        if not allowed.covers(line):
             raise RouteFailure(
                 f"Segment {i} from ({seg.x1:.3f},{seg.y1:.3f}) to "
                 f"({seg.x2:.3f},{seg.y2:.3f}) would extend outside the "
@@ -1163,7 +1301,11 @@ def _check_vias_in_board(
 # ---------------------------------------------------------------------------
 
 
-def _routing_layers(req: RouteRequest) -> list[str]:
+def _routing_layers(
+    req: RouteRequest,
+    start_layer: str,
+    end_layer: str,
+) -> list[str]:
     """Return the ordered list of layers the router must consider.
 
     Includes ``start_layer`` and ``end_layer`` and every layer referenced
@@ -1171,7 +1313,7 @@ def _routing_layers(req: RouteRequest) -> list[str]:
     """
     seen: set[str] = set()
     out: list[str] = []
-    for layer in (req.start_layer, req.end_layer):
+    for layer in (start_layer, end_layer):
         if layer not in seen:
             out.append(layer)
             seen.add(layer)
@@ -1220,12 +1362,47 @@ def _pcb_layer_names(data: list) -> list[str]:
     return []
 
 
+def _find_pad_net(
+    data: list,
+    ref: str,
+    pad_name: str,
+    layer: str | None = None,
+) -> str | None:
+    """Return the net name of the named pad on the given footprint ref.
+
+    When ``layer`` is given, only pads whose copper covers that layer are
+    considered, matching :func:`_find_pad_center` semantics for footprints
+    that declare several pads with the same name.
+    """
+    fp = _find_footprint(data, ref)
+    if fp is None:
+        return None
+    for sub in fp:
+        if not _is_list(sub):
+            continue
+        if str(sub[0]) != "pad":
+            continue
+        if _get_pad_name(sub) != pad_name:
+            continue
+        if layer is not None and layer not in _pad_layers(sub):
+            continue
+        return _get_net(sub)
+    return None
+
+
 def _find_pad_center(
     data: list,
     ref: str,
     pad_name: str,
+    layer: str | None = None,
 ) -> tuple[float, float] | None:
-    """Return the (x, y) center of the named pad on the given footprint ref."""
+    """Return the (x, y) center of the named pad on the given footprint ref.
+
+    When ``layer`` is given, only pads whose copper covers that layer are
+    considered -- a footprint may declare several pads with the same name
+    (e.g. edge-connector fingers sharing a net), and the center must match
+    the pad whose shape :func:`_find_pad_size` would return.
+    """
     fp = _find_footprint(data, ref)
     if fp is None:
         return None
@@ -1238,6 +1415,8 @@ def _find_pad_center(
         name = _get_pad_name(sub)
         if name != pad_name:
             continue
+        if layer is not None and layer not in _pad_layers(sub):
+            continue
         # Pad ``at`` is in footprint-local coords.
         at = _get_sub(sub, "at")
         if at is None or len(at) < 3:
@@ -1246,7 +1425,7 @@ def _find_pad_center(
             px, py = float(at[1]), float(at[2])
         except (TypeError, ValueError):
             return None
-        # Transform local → world (only translation + rotation; pads don't
+        # Transform local -> world (only translation + rotation; pads don't
         # scale).
         wx, wy = _rotate(px, py, fp_rot)
         return fp_x + wx, fp_y + wy
@@ -1261,8 +1440,9 @@ def _find_pad_size(
 ) -> tuple[float, float] | None:
     """Return the (w, h) of the pad shape, for the requested copper layer.
 
-    Returns ``None`` if the pad is not on ``layer`` or not SMD (e.g. thru-hole
-    pads are circular and need a different exit strategy).
+    A footprint may declare several pads with the same name (e.g. edge-
+    connector fingers sharing a net). Returns the first pad whose copper
+    covers ``layer``, and ``None`` only if no same-named pad is on it.
     """
     fp = _find_footprint(data, ref)
     if fp is None:
@@ -1275,14 +1455,15 @@ def _find_pad_size(
         if _get_pad_name(sub) != pad_name:
             continue
         if layer not in _pad_layers(sub):
-            return None
+            # Another pad with this name may carry the requested layer.
+            continue
         size_sub = _get_sub(sub, "size")
         if size_sub is None or len(size_sub) < 3:
-            return None
+            continue
         try:
             return float(size_sub[1]), float(size_sub[2])
         except (TypeError, ValueError):
-            return None
+            continue
     return None
 
 
@@ -1319,6 +1500,38 @@ def _get_pad_name(pad_node: list) -> str:
     return ""
 
 
+def _pad_type(pad_node: list) -> str:
+    """Return the pad type: ``thru_hole``, ``smd``, or ``connect``."""
+    if len(pad_node) > 2:
+        return str(pad_node[2])
+    return ""
+
+
+def _find_pad_node(
+    data: list,
+    ref: str,
+    pad_name: str,
+    layer: str | None = None,
+) -> list | None:
+    """Return the raw pad node for ``ref``/``pad_name``.
+
+    When ``layer`` is given, only pads whose copper covers that layer
+    are considered (same logic as :func:`_find_pad_center`).
+    """
+    fp = _find_footprint(data, ref)
+    if fp is None:
+        return None
+    for sub in fp:
+        if not _is_list(sub) or str(sub[0]) != "pad":
+            continue
+        if _get_pad_name(sub) != pad_name:
+            continue
+        if layer is not None and layer not in _pad_layers(sub):
+            continue
+        return sub
+    return None
+
+
 _ALL_COPPER = {"F.Cu", "B.Cu", "In1.Cu", "In2.Cu", "In3.Cu", "In4.Cu"}
 
 
@@ -1336,6 +1549,203 @@ def _pad_layers(pad_node: list) -> list[str]:
     return layers
 
 
+def _resolve_layers(
+    data: list,
+    req: RouteRequest,
+) -> tuple[str, str]:
+    """Auto-pick start/end copper layers from pad types and ``layer_hint``.
+
+    For SMD/connect pads the layer is fixed by the pad itself (it has
+    copper on exactly one copper layer).  For thru-hole pads (``*.Cu``)
+    the router picks the best shared copper layer, preferring
+    ``layer_hint`` when it is among the pad's copper layers.
+
+    When a footprint declares several pads with the same name (edge
+    connectors), the union of all same-named pads' copper layers is
+    used -- a THT pad named ``3v3`` makes the pad flexible across all
+    copper layers even if the first same-named pad is SMD.
+
+    Returns ``(start_layer, end_layer)``.
+
+    Raises :class:`RouteFailure` if either pad has no copper on any layer.
+    When the two pads share no copper layer and ``layer_hint`` is neither
+    pad's preferred layer, each pad falls back to its first available
+    copper layer; the returned layers may then differ (staggered).
+    """
+    fp_a = _find_footprint(data, req.ref_a)
+    fp_b = _find_footprint(data, req.ref_b)
+    if fp_a is None:
+        raise RouteFailure(f"Pad {req.ref_a}/{req.pad_a} not found")
+    if fp_b is None:
+        raise RouteFailure(f"Pad {req.ref_b}/{req.pad_b} not found")
+
+    # Collect ALL same-named pad nodes (a footprint may declare several
+    # pads with one name -- edge-connector fingers + a THT pad).
+    a_nodes = [
+        s for s in fp_a if _is_list(s) and str(s[0]) == "pad" and _get_pad_name(s) == req.pad_a
+    ]
+    b_nodes = [
+        s for s in fp_b if _is_list(s) and str(s[0]) == "pad" and _get_pad_name(s) == req.pad_b
+    ]
+    if not a_nodes:
+        raise RouteFailure(f"Pad {req.ref_a}/{req.pad_a} not found")
+    if not b_nodes:
+        raise RouteFailure(f"Pad {req.ref_b}/{req.pad_b} not found")
+
+    # Union of copper layers across all same-named pads, and detect
+    # whether any pad is THT (flexible) vs all SMD/connect (fixed).
+    pcb_copper = [l for l in _pcb_layer_names(data) if l.endswith(".Cu")]
+    a_layers: list[str] = []
+    b_layers: list[str] = []
+    a_has_tht = b_has_tht = False
+    for node in a_nodes:
+        if _pad_type(node) == "thru_hole":
+            a_has_tht = True
+        for l in _pad_layers(node):
+            if l.endswith(".Cu") and ".Mask" not in l and l not in a_layers:
+                a_layers.append(l)
+    for node in b_nodes:
+        if _pad_type(node) == "thru_hole":
+            b_has_tht = True
+        for l in _pad_layers(node):
+            if l.endswith(".Cu") and ".Mask" not in l and l not in b_layers:
+                b_layers.append(l)
+    # Filter THT layers to PCB's actual copper layers.
+    if a_has_tht:
+        a_layers = [l for l in a_layers if l in pcb_copper]
+    if b_has_tht:
+        b_layers = [l for l in b_layers if l in pcb_copper]
+    if not a_layers:
+        raise RouteFailure(f"Pad {req.ref_a}/{req.pad_a} has no copper layer")
+    if not b_layers:
+        raise RouteFailure(f"Pad {req.ref_b}/{req.pad_b} has no copper layer")
+
+    # A pad is "fixed" only when ALL same-named pads are SMD/connect.
+    a_fixed = not a_has_tht
+    b_fixed = not b_has_tht
+
+    # Determine start layer.
+    if a_fixed:
+        start_layer = a_layers[0]
+    elif req.layer_hint and req.layer_hint in a_layers:
+        start_layer = req.layer_hint
+    else:
+        start_layer = None
+
+    # Determine end layer.
+    if b_fixed:
+        end_layer = b_layers[0]
+    elif req.layer_hint and req.layer_hint in b_layers:
+        end_layer = req.layer_hint
+    else:
+        end_layer = None
+
+    # For THT pads without a fixed layer, pick a shared copper layer.
+    if start_layer is None or end_layer is None:
+        shared = [l for l in a_layers if l in b_layers]
+        if not shared:
+            if start_layer is None:
+                start_layer = (
+                    req.layer_hint
+                    if (req.layer_hint and req.layer_hint in a_layers)
+                    else a_layers[0]
+                )
+            if end_layer is None:
+                end_layer = (
+                    req.layer_hint
+                    if (req.layer_hint and req.layer_hint in b_layers)
+                    else b_layers[0]
+                )
+        else:
+            chosen = None
+            if req.layer_hint and req.layer_hint in shared:
+                chosen = req.layer_hint
+            else:
+                chosen = shared[0]
+            if start_layer is None:
+                start_layer = chosen
+            if end_layer is None:
+                end_layer = chosen
+
+    return start_layer, end_layer
+
+
+def _same_net_pad_polygons(
+    data: list,
+    net: str,
+) -> list[tuple[object, frozenset[str], str, str, tuple[float, float]]]:
+    """Return ``(world polygon, copper layers, ref, pad name, world center)``
+    for every pad carrying ``net``.
+
+    The world model drops same-net copper so the route can land on its
+    own endpoint pads; the router re-adds those pads here as *transit*
+    obstacles -- a track may terminate on a pad, never run across its
+    copper (a track through a thru-hole pad's hole is cut by the drill,
+    and a via on a pad face is a DFM defect).  Geometry mirrors
+    :func:`kcaa.router.world_model._pad_obstacle`.
+
+    The world center lets callers distinguish the *endpoint pad instance*
+    from other same-named pads by geometry -- two pads on the same net
+    can share ``(ref, pad name)`` (edge connectors with multiple
+    ``3v3`` fingers), so name-based skip would wrongly exempt every
+    same-named pad.
+    """
+    out: list[tuple[object, frozenset[str], str, str, tuple[float, float]]] = []
+    for item in data:
+        if not _is_list(item) or str(item[0]) != "footprint":
+            continue
+        fp_x, fp_y, fp_rot = _node_at3(item)
+        ref = ""
+        for sub in item:
+            if (
+                _is_list(sub)
+                and str(sub[0]) == "property"
+                and len(sub) >= 3
+                and str(sub[1]) == "Reference"
+            ):
+                ref = sub[2] if isinstance(sub[2], str) else str(sub[2])
+        for sub in item:
+            if not _is_list(sub) or str(sub[0]) != "pad":
+                continue
+            if _get_net(sub) != net:
+                continue
+            if len(sub) > 2 and str(sub[2]) == "np_thru_hole":
+                continue  # bare mechanical hole -- no copper to protect
+            players = _pad_layers(sub)
+            if not players:
+                continue
+            size = _get_sub(sub, "size")
+            if size is None or len(size) < 3:
+                continue
+            try:
+                pw, ph = float(size[1]), float(size[2])
+            except (TypeError, ValueError):
+                continue
+            at = _get_sub(sub, "at")
+            if at is None or len(at) < 3:
+                continue
+            try:
+                lx, ly = float(at[1]), float(at[2])
+            except (TypeError, ValueError):
+                continue
+            wx_off, wy_off = _rotate(lx, ly, fp_rot)
+            wx, wy = fp_x + wx_off, fp_y + wy_off
+            hw, hh = pw / 2.0, ph / 2.0
+            rad = math.radians(fp_rot)
+            c, s = math.cos(rad), math.sin(rad)
+            corners = [
+                (c * -hw + s * -hh, -s * -hw + c * -hh),
+                (c * hw + s * -hh, -s * hw + c * -hh),
+                (c * hw + s * hh, -s * hw + c * hh),
+                (c * -hw + s * hh, -s * -hw + c * hh),
+            ]
+            poly = Polygon([(wx + cx, wy + cy) for cx, cy in corners])
+            if poly.is_empty or not poly.is_valid:
+                continue
+            out.append((poly, frozenset(players), ref, _get_pad_name(sub), (wx, wy)))
+    return out
+
+
 # ---------------------------------------------------------------------------
 # DRC defaults (lightweight: read the netclass table from the .kicad_pro)
 # ---------------------------------------------------------------------------
@@ -1349,7 +1759,7 @@ def _default_track_width(pcb_path: str, net: str) -> float:
     ``track_width``.
 
     Raises:
-        ProFileMissing: No ``.kicad_pro`` next to ``pcb_path`` — pass
+        ProFileMissing: No ``.kicad_pro`` next to ``pcb_path`` -- pass
             ``RouteRequest(width=...)`` explicitly to skip DRC lookup.
         ProFileMalformed: The ``.kicad_pro`` exists but cannot be parsed or
             lacks the expected structure.
@@ -1383,7 +1793,7 @@ def _default_track_width(pcb_path: str, net: str) -> float:
 def _default_clearance(pcb_path: str, net: str | None = None) -> float:
     """Resolve minimum clearance from the board's effective design rules.
 
-    When the board's ``min_clearance`` is 0.0 (which is common — KiCad
+    When the board's ``min_clearance`` is 0.0 (which is common -- KiCad
     leaves it at 0 and relies on net class rules) this falls back to the
     clearance of the matching net class.  If no net class matches, uses
     the Default net class clearance (0.2 mm fallback).
@@ -1578,9 +1988,9 @@ def _resolve_via_drill(pcb_path: str, net: str) -> float:
 
 
 def _net_to_netclass(data: dict) -> dict[str, str]:
-    """Read net→netclass assignments from the JSON project file.
+    """Read net->netclass assignments from the JSON project file.
 
-    KiCad's project file uses ``netclass_patterns`` with a ``pattern`` glob —
+    KiCad's project file uses ``netclass_patterns`` with a ``pattern`` glob --
     a net belongs to the first matching pattern's netclass. This is a
     glob-style match (we use ``fnmatch`` for ``*`` and ``?`` wildcards).
     """
@@ -1609,7 +2019,7 @@ def _net_to_netclass(data: dict) -> dict[str, str]:
     # Resolve patterns into explicit per-net entries.
     # (Net names that are not in the explicit table are resolved here.)
     # The caller will look up by net name; for resolution we need to know
-    # the set of net names — but for our purposes (looking up a single
+    # the set of net names -- but for our purposes (looking up a single
     # net by name) the explicit table is enough. We expose the patterns
     # so a higher layer can resolve ambiguous names. For now, expose
     # ``out`` as the per-net map and also a fallback: if the net is not
