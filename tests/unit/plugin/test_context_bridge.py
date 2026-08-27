@@ -3,7 +3,11 @@
 import os
 from unittest.mock import MagicMock, patch
 
-from kicad_plugin.context_bridge import collect_context, context_to_system_prompt_block
+from kicad_plugin.context_bridge import (
+    collect_context,
+    context_to_system_prompt_block,
+    project_path_from_title,
+)
 
 
 class TestCollectContextNoPcbnew:
@@ -167,3 +171,35 @@ class TestContextToSystemPromptBlock:
         }
         block = context_to_system_prompt_block(ctx)
         assert "Active PCB: /" not in block  # Should show "(none)" not a path
+
+
+class TestProjectPathFromTitle:
+    def test_pcb_editor_title_derives_existing_project(self, tmp_path):
+        pcb = tmp_path / "board.kicad_pcb"
+        pro = pcb.with_suffix(".kicad_pro")
+        pcb.write_text("(kicad_pcb)")
+        pro.write_text("(kicad_project)")
+        assert project_path_from_title(f"PCB Editor: {pcb}") == os.path.abspath(str(pro))
+
+    def test_schematic_editor_title_derives_project(self, tmp_path):
+        sch = tmp_path / "board.kicad_sch"
+        sch.with_suffix(".kicad_pro").write_text("(kicad_project)")
+        sch.write_text("(kicad_sch)")
+        assert project_path_from_title(f"Eeschema: {sch}") == os.path.abspath(
+            str(sch.with_suffix(".kicad_pro"))
+        )
+
+    def test_project_title_direct(self, tmp_path):
+        pro = tmp_path / "proj.kicad_pro"
+        pro.write_text("(kicad_project)")
+        assert project_path_from_title(f"KiCad - {pro}") == os.path.abspath(str(pro))
+
+    def test_derived_project_missing_returns_none(self, tmp_path):
+        pcb = tmp_path / "board.kicad_pcb"
+        pcb.write_text("(kicad_pcb)")
+        # No sibling .kicad_pro — derivation fails and returns None.
+        assert project_path_from_title(f"PCB Editor: {pcb}") is None
+
+    def test_unrelated_title_returns_none(self):
+        assert project_path_from_title("Settings Dialog") is None
+        assert project_path_from_title("") is None

@@ -7,9 +7,32 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from typing import Any
 
 log = logging.getLogger(__name__)
+
+# KiCad window titles name project/board/schematic files, e.g.
+# "PCB Editor: /path/to/board.kicad_pcb [*]" or a .kicad_pro path.
+_TITLE_PROJECT_RE = re.compile(r"([^\s\[]+\.kicad_pro)\b")
+_TITLE_FRAME_RE = re.compile(r"([^\s\[]+\.kicad_(?:pcb|sch))\b")
+
+
+def project_path_from_title(title: str) -> str | None:
+    """Extract a ``.kicad_pro`` path from a KiCad window title, or None.
+
+    Editor windows title the active file (``.kicad_pcb`` / ``.kicad_sch``),
+    the project manager window may title the ``.kicad_pro`` itself.  When
+    only a board/schematic path is named, the sibling ``.kicad_pro`` is
+    derived and returned only if it actually exists.
+    """
+    for m in _TITLE_PROJECT_RE.finditer(title):
+        return os.path.abspath(m.group(1))
+    m = _TITLE_FRAME_RE.search(title)
+    if not m:
+        return None
+    pro = os.path.splitext(m.group(1))[0] + ".kicad_pro"
+    return os.path.abspath(pro) if os.path.exists(pro) else None
 
 
 def _try_import_pcbnew():

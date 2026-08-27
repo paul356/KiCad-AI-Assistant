@@ -155,6 +155,10 @@ if _WX_AVAILABLE:
             # switching projects can re-offer that project's saved sessions
             # (same flow as startup auto-restore). Started by _init_llm_client.
             self._active_project: str | None = None
+            # Project-switch confirmation: first differing reading is held
+            # here and only acted on when the next tick agrees.
+            self._watch_candidate: str | None = None
+            self._watch_candidate_seen: bool = False
             self._project_watch_timer = wx.Timer(self)
 
             self._build_ui()
@@ -2298,16 +2302,34 @@ if _WX_AVAILABLE:
             return True
 
         def _collect_active_project(self) -> str | None:
-            """Absolute path of the currently open .kicad_pro, or None."""
-            try:
-                from ..context_bridge import collect_context
+            """Absolute path of the currently open .kicad_pro, or None.
 
-                return collect_context().get("active_project")
+            Primary source: pcbnew.GetBoard() — only non-empty once a board
+            is loaded in the PCB Editor.  Fallback: KiCad top-level window
+            titles, which name the project/board/schematic path even while
+            GetBoard() is still settling (e.g. right after opening a project
+            or when only the project manager is open).
+            """
+            try:
+                from ..context_bridge import collect_context, project_path_from_title
+
+                proj = collect_context().get("active_project")
+                if proj:
+                    return proj
+                for w in wx.GetTopLevelWindows():
+                    title = w.GetTitle()
+                    if not title:
+                        continue
+                    p = project_path_from_title(title)
+                    if p:
+                        log.debug("project from window title %r -> %s", title, p)
+                        return p
             except Exception:
-                return None
+                log.debug("_collect_active_project failed", exc_info=True)
+            return None
 
         def _start_project_watch(self) -> None:
-            """Start polling for KiCad project switches (3 s interval).
+            """Start polling for KiCad project switches (1 s interval).
 
             The first snapshot is taken here — after auto-restore — so the
             watcher only reacts to *later* project changes, never to the
@@ -2316,34 +2338,56 @@ if _WX_AVAILABLE:
             if not self._project_watch_timer:
                 return
             self._active_project = self._collect_active_project()
-            self._project_watch_timer.Start(3000)
+            self._watch_candidate_seen = False
+            self._project_watch_timer.Start(
+                1000
+            )  # 1 s poll: project switch is noticed quickly once a board signal is available
 
         def _on_project_watch_tick(self, event) -> None:
-            """Offer the new project's sessions when the open project changes.
+            """Close this panel when the open KiCad project changes.
 
-            Same rule as startup auto-restore: if current.json already points
-            at a session of the newly opened project, the conversation is the
-            right one and nothing happens.  Only when current.json is null,
-            stale (still pointing at another project), or legacy do we offer
-            the new project's saved sessions.  Switching to no project, or to
-            a project without saved sessions, leaves things untouched.
+            The panel binds to the project that was active at startup; when
+            the project switches (or the board/project is closed), this
+            instance is stale.  Tear it down — including its MCP server —
+            instead of lingering; the panel opened in the new project
+            auto-restores the right session on first display.
+
+            The project signal flaps during project load (GetBoard() stays
+            empty until the board is up, and the window-title fallback is
+            equally transient), so a switch is only acted on after two
+            consecutive identical readings.
             """
             if self._busy:
                 return
             project = self._collect_active_project()
             if project == self._active_project:
+                self._watch_candidate_seen = False
                 return
+            if not self._watch_candidate_seen:
+                # First differing reading: remember it and wait for a second
+                # identical one before acting.
+                self._watch_candidate_seen = True
+                self._watch_candidate = project
+                return
+            if project != self._watch_candidate:
+                # Still flapping between values (project loading in
+                # background): re-arm with the latest reading.
+                self._watch_candidate = project
+                return
+            log.info(
+                "Project switch confirmed: %s -> %s; switching session",
+                self._active_project,
+                project,
+            )
             self._active_project = project
-            if not self._active_project:
-                return
-            from .. import session_store as _sstore
-
-            path = _sstore.resolve_current_session(self._settings.config_dir)
-            if path:
-                data, err = _sstore.load_session(path)
-                if data and _sstore.is_project_session(data, project):
-                    return  # Conversation already belongs to this project.
-            self._prompt_project_session_choice(self._active_project)
+            self._watch_candidate_seen = False
+            # Keep this panel open and re-run the startup restore flow for
+            # the new project: matching current.json is restored in place,
+            # otherwise the new project's sessions are offered.  Never
+            # Destroy() the window — on a top-level wx.Frame that behaves as
+            # a forced Close and cascaded into closing KiCad's project
+            # windows.
+            self._autoload_session()
 
         def _prompt_project_session_choice(self, project_path: str | None) -> None:
             """Offer the open project's saved sessions after a skip.
@@ -2360,6 +2404,7 @@ if _WX_AVAILABLE:
             if not project_path:
                 return
             candidates = _sstore.list_project_sessions(self._settings.config_dir, project_path)
+            log.info("Session picker for %s: %d candidate(s)", project_path, len(candidates))
             if not candidates:
                 return
             if len(candidates) == 1:
@@ -2407,27 +2452,38 @@ if _WX_AVAILABLE:
                 self._llm_client.reset()
 
         def _on_close(self, event) -> None:
-            if event.CanVeto():
-                # User closed the plugin panel – hide it so the backend stays
-                # warm and KiCad is unaffected. The suicide watchdog timer
-                # (_on_suicide_check) will force-close us when KiCad itself
-                # exits, triggering the real teardown path below.
-                event.Veto()
-                self.Hide()
-                return
-            # Force-close (e.g. from _on_suicide_check when KiCad has exited)
-            # – tear down completely. No final save needed: every user
-            # message, AI reply and cancellation is persisted immediately
-            # where it happens.
+            """Panel close (user clicks X, or watchdog force-close): tear down
+            completely.
+
+            Every user message, AI reply and cancellation is persisted as it
+            happens, so closing loses nothing — the next open restores the
+            session from disk.  The panel is never merely hidden: a hidden
+            panel would keep its timers and MCP server running in the
+            background.  Either the panel stays usable (project switch keeps
+            it open and swaps the session) or it is destroyed — no
+            half-alive state.
+            """
+            if self._busy and self._cancel_event is not None:
+                # An in-flight turn ends with the panel: ask it to stop
+                # writing before we tear down.
+                self._cancel_event.set()
             self._server_mgr.stop()
             self.Destroy()
 
         def _on_suicide_check(self, event) -> None:
-            """Periodically check if KiCad is gone. If we are the only
-            visible top-level wx window left, KiCad's main window must
-            have been closed without sending us EVT_CLOSE — so close
-            ourselves now."""
-            others = [w for w in wx.GetTopLevelWindows() if w is not self and w.IsShown()]
+            """Periodically check if KiCad is gone.
+
+            If the only visible top-level wx windows left are our own plugin
+            panels — including any other AssistantPanel instances (a second
+            panel must not count as a reason to stay alive) — KiCad's own
+            windows are all gone, so close ourselves.  Any non-panel window
+            (project manager, editors, dialogs) keeps us alive.
+            """
+            others = [
+                w
+                for w in wx.GetTopLevelWindows()
+                if not isinstance(w, AssistantPanel) and w.IsShown()
+            ]
             if not others:
                 self.Close(force=True)
 
