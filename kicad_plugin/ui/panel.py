@@ -91,6 +91,9 @@ if _WX_AVAILABLE:
             self._server_mgr = server_mgr
             self._settings = settings
             self._llm_client: Any | None = None
+            # True once the MCP backend reported a successful start; the LLM
+            # client is only created when this and panel display both hold.
+            self._server_ready: bool = False
             self._busy = False
             # threading.Event for cancelling an in-progress LLM turn
             self._cancel_event: threading.Event | None = None
@@ -127,12 +130,14 @@ if _WX_AVAILABLE:
             # True once the shell HTML (CSS + JS framework + empty containers)
             # has been successfully loaded into the WebView.
             self._shell_loaded: bool = False
-            # True while any RunScript call is in-flight.  On Windows WebView2,
-            # RunScript pumps the message loop; we guard against re-entrant
-            # RunScript calls with this flag.
+            # True while any WebView script is in-flight.  On Windows WebView2,
+            # RunScript pumps the message loop; re-entrant RunScript calls are
+            # guarded by _run_script, the only place that writes this flag.
             self._js_running: bool = False
-            # Set when a render is skipped (due to shell not loaded or
-            # _js_running).  The next opportunity triggers a deferred render.
+            # Set when a render is skipped (script in flight / shell not
+            # loaded / page loading).  Flushed as a full-conversation rebuild
+            # by whoever releases the render lock, or by the shell-load
+            # completion path.
             self._render_pending: bool = False
             # True when the stream-wrapper table is visible in the shell.
             self._stream_wrapper_visible: bool = False
@@ -146,6 +151,15 @@ if _WX_AVAILABLE:
             # glitch on Windows), reset _page_loading so renders are not
             # permanently blocked.
             self._page_watchdog = wx.Timer(self)
+            # Project-scoped session watch: tracks the open KiCad project so
+            # switching projects can re-offer that project's saved sessions
+            # (same flow as startup auto-restore). Started by _init_llm_client.
+            self._active_project: str | None = None
+            # Project-switch confirmation: first differing reading is held
+            # here and only acted on when the next tick agrees.
+            self._watch_candidate: str | None = None
+            self._watch_candidate_seen: bool = False
+            self._project_watch_timer = wx.Timer(self)
 
             self._build_ui()
             self._start_server()
@@ -394,6 +408,9 @@ if _WX_AVAILABLE:
                 style=wx.BU_EXACTFIT | wx.BORDER_NONE,
             )
             self._send_btn.SetToolTip("Send message (Enter)")
+            # Backend not ready until _on_server_started(True); the button is
+            # enabled there, not clickable while the backend is down.
+            self._send_btn.Disable()
             side_vbox.Add(self._send_btn, 0, wx.ALIGN_CENTER_HORIZONTAL)
 
             hbox.Add(side_vbox, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 4)
@@ -481,6 +498,8 @@ if _WX_AVAILABLE:
             # glitch on Windows), reset _page_loading so renders are not
             # permanently blocked.
             self.Bind(wx.EVT_TIMER, self._on_page_watchdog, self._page_watchdog)
+            self.Bind(wx.EVT_TIMER, self._on_project_watch_tick, self._project_watch_timer)
+            self.Bind(wx.EVT_SHOW, self._on_panel_show)
 
         # ------------------------------------------------------------------ #
         # Server lifecycle
@@ -499,14 +518,21 @@ if _WX_AVAILABLE:
                 if ok:
                     self._set_status("✅ Backend ready", self._C_OK)
                     self.GetMenuBar().Enable(self._menu_autoroute_id, True)
-                    self._init_llm_client()
                     self._check_kicad_ipc_environment()
                     self._auto_save_pcb_on_open()
+                    self._server_ready = True
+                    # The client captures the backend base URL at
+                    # construction; if it was created before the backend was
+                    # up (panel shown early), inject the URL now.
+                    if self._llm_client is not None:
+                        self._llm_client.set_base_url(self._server_mgr.base_url)
                 else:
+                    self._server_ready = False
                     self._set_status(
                         "❌ Backend failed to start — use Server → Restart Backend to retry",
                         self._C_ERR,
                     )
+                self._sync_send_button_state()
                 self.Layout()
             except Exception as e:
                 import traceback
@@ -519,10 +545,24 @@ if _WX_AVAILABLE:
 
                 self._llm_client = LLMClient(self._settings, self._server_mgr.base_url)
                 self._autoload_session()
+                self._start_project_watch()
             except Exception as e:
                 import traceback
 
                 log.error("_init_llm_client failed: %s\n%s", e, traceback.format_exc())
+
+        def _on_panel_show(self, event) -> None:
+            """Initialise the LLM client (and restore the session) on display.
+
+            Deferred from plugin registration so restore/prompt only happens
+            while the user looks at the panel.  The backend base URL is
+            injected later by _on_server_started once the backend is up, so
+            an early panel display is safe.  An already-initialised client
+            (e.g. after a backend Restart) is left untouched.
+            """
+            if event.IsShown() and self._llm_client is None:
+                self._init_llm_client()
+            event.Skip()
 
         # ------------------------------------------------------------------ #
         # KiCad IPC API status check
@@ -676,6 +716,9 @@ if _WX_AVAILABLE:
                     self._llm_client is not None,
                 )
                 return
+            if not self._server_ready:
+                log.debug("_on_send: skipped (backend not ready)")
+                return
             text = self._input.GetValue().strip()
             images = self._encode_attached_images()
             pdfs = [p for p, t in self._attached_files if t == "pdf"]
@@ -721,12 +764,13 @@ if _WX_AVAILABLE:
             self._attached_files.clear()
             self._refresh_attachments_bar()
             self._follow_output_to_bottom = True
-            # Create the session file on the very first message so current.json
-            # is established before the AI responds.
-            if self._current_session_file is None:
-                err = self._save_session_to_disk()
-                if err:
-                    log.warning("Could not create session file: %s", err)
+            # Persist on every user message: creates the file on the first
+            # message (so current.json exists before the AI responds) and makes
+            # the session durable immediately (also upgrading legacy v1 files
+            # to v2, since the user has now modified the session).
+            err = self._save_session_to_disk()
+            if err:
+                log.warning("Could not save session: %s", err)
             self._render_conversation(force_scroll_to_bottom=True)
             self._busy = True
             self._cancel_event = threading.Event()
@@ -740,6 +784,7 @@ if _WX_AVAILABLE:
             # Reset streaming state and start the flush timer
             self._stream_buffer.clear()
             self._pending_ai_text = ""
+            self._stream_delta_chars = 0
             self._tool_calls_made = False
             self._schematic_edited = False
             self._pcb_edited = False
@@ -750,8 +795,12 @@ if _WX_AVAILABLE:
             def _on_delta(chunk: str) -> None:
                 # Called from background thread — just push to buffer; timer handles UI
                 if self._cancel_event and self._cancel_event.is_set():
+                    if not state.get("cancel_dropped"):
+                        state["cancel_dropped"] = True
+                        log.debug("chat: dropping streamed chunks after cancel")
                     return
                 state["ai_turn_started"] = True
+                self._stream_delta_chars += len(chunk)
                 self._stream_buffer.append(chunk)
 
             def _run():
@@ -954,6 +1003,13 @@ if _WX_AVAILABLE:
             else:
                 self._send_btn.SetBitmap(self._make_send_bitmap(bg=bg))
                 self._send_btn.SetToolTip("Send message (Enter)")
+
+        def _sync_send_button_state(self) -> None:
+            """Enable the send button unless the backend is not ready.
+
+            A busy button is the Stop button and must stay clickable.
+            """
+            self._send_btn.Enable(self._server_ready or self._busy)
 
         def _on_send_btn(self, event) -> None:
             """Handle send/stop button click depending on current state."""
@@ -1314,6 +1370,16 @@ if _WX_AVAILABLE:
             self._stream_timer.Stop()
             self._on_stream_flush(None)
 
+            log.info(
+                "chat: _on_reply was_streamed=%s reply_len=%d pending_len=%d "
+                "buffer_left=%d delta_chars=%d",
+                was_streamed,
+                len(reply),
+                len(self._pending_ai_text),
+                len(self._stream_buffer),
+                getattr(self, "_stream_delta_chars", 0),
+            )
+
             # Hide streaming preview before appending the final entry
             if self._use_webview:
                 self._hide_stream_wrapper()
@@ -1337,12 +1403,19 @@ if _WX_AVAILABLE:
                         "text": self._pending_ai_text,
                         "timestamp": datetime.datetime.now().strftime("%H:%M:%S"),
                     }
+                    log.info(
+                        "chat: finalising streamed entry text_len=%d tail=%r",
+                        len(entry["text"]),
+                        entry["text"][-80:],
+                    )
                     self._conv_entries.append(entry)
                     self._pending_ai_text = ""
                     if self._use_webview and self._shell_loaded:
                         self._append_entry_js(entry, force_scroll_to_bottom=True)
                     else:
                         self._render_conversation(force_scroll_to_bottom=True)
+            # Any deferral during the turn is flushed by the lock holder's
+            # release (_run_script), so no turn-end safety net is needed.
             self._busy = False
             self._cancel_event = None
             self._toggle_send_stop(busy=False)
@@ -1350,6 +1423,12 @@ if _WX_AVAILABLE:
             if self._tool_calls_made:
                 self._auto_refresh(ctx)
             self._follow_output_to_bottom = False
+            # Persist the completed turn so disk always holds the full
+            # conversation, including the streamed AI reply. On-exit autosave
+            # then only refreshes — no data depends on it.
+            err = self._save_session_to_disk()
+            if err:
+                log.warning("Could not save session after reply: %s", err)
 
         def _on_stream_flush(self, event) -> None:
             """Drain the streaming buffer into the pending AI text (main thread, timer-driven)."""
@@ -1372,8 +1451,14 @@ if _WX_AVAILABLE:
                 # Incremental DOM update — should always succeed with shell loaded
                 if self._incremental_stream_update():
                     return
-                # Shell not loaded yet — defer
-                self._render_pending = True
+                # Deferred (lock busy / shell not loaded) or update failed:
+                # _run_script already recorded _render_pending, so a full
+                # rebuild will replay (and the next flush re-shows stream
+                # text).  Nothing to bookkeep here.
+                log.warning(
+                    "chat: stream flush deferred render (pending=%d chars)",
+                    len(self._pending_ai_text),
+                )
             else:
                 self._render_conversation(force_scroll_to_bottom=self._follow_output_to_bottom)
 
@@ -1381,9 +1466,11 @@ if _WX_AVAILABLE:
             """Update streaming AI text via _updateStream JS call.
 
             The #pending-ai-text div always exists in the shell HTML, so this
-            should always succeed when the shell is loaded.
+            should always succeed when the shell is loaded.  Runs under the
+            render protocol via _run_script; on deferral or failure the
+            pending full-rebuild replay covers the missed incremental update.
             """
-            if not self._use_webview or not self._shell_loaded or self._js_running:
+            if not self._use_webview:
                 return False
 
             import json as _json
@@ -1392,17 +1479,13 @@ if _WX_AVAILABLE:
             scroll_arg = "true" if self._follow_output_to_bottom else "false"
             js = f"_updateStream({_json.dumps(body_html)}, {scroll_arg})"
 
-            self._js_running = True
-            try:
-                ok, result = self._conv_view.RunScript(js)
-                if not ok:
-                    log.warning("_incremental_stream_update: RunScript failed")
-                return ok
-            except Exception as e:
-                log.warning("_incremental_stream_update: exception: %s", e)
-                return False
-            finally:
-                self._js_running = False
+            return bool(
+                self._run_script(
+                    js,
+                    force_scroll_to_bottom=self._follow_output_to_bottom,
+                    retry_on_failure=True,
+                )[0]
+            )
 
         def _on_page_watchdog(self, event) -> None:
             """Safety net: detect shell load timeout.
@@ -1463,6 +1546,10 @@ if _WX_AVAILABLE:
             # If there is pending streamed text that preceded this tool call,
             # finalise it as an AI entry now so the timeline order is correct.
             if self._pending_ai_text:
+                log.debug(
+                    "chat: mid-turn finalise of streamed text len=%d",
+                    len(self._pending_ai_text),
+                )
                 self._conv_entries.append({"type": "ai", "text": self._pending_ai_text})
                 self._pending_ai_text = ""
             # Append as a permanent timeline entry so tool calls appear in
@@ -1559,6 +1646,11 @@ if _WX_AVAILABLE:
             self._busy = False
             self._cancel_event = None
             self._toggle_send_stop(busy=False)
+            # Persist what has been finalised so far — the turn was cancelled
+            # mid-flight and on-exit autosave is best-effort only.
+            err = self._save_session_to_disk()
+            if err:
+                log.warning("Could not save session after stop: %s", err)
 
         def _on_restart(self, event) -> None:
             if self._busy:
@@ -1569,6 +1661,9 @@ if _WX_AVAILABLE:
                 )
                 return
             self._set_status("⏳ Restarting backend…", self._C_WARN)
+            # Messages are blocked while the backend is down.
+            self._server_ready = False
+            self._sync_send_button_state()
             self._conv_entries.append(
                 {
                     "type": "status",
@@ -1594,6 +1689,9 @@ if _WX_AVAILABLE:
                     }
                 )
                 self._render_conversation()
+                # Rebuild the LLM client: the backend may have come back on a
+                # new port, so the old client's base URL is stale.  Session
+                # restore here is lossless — disk holds every completed turn.
                 self._init_llm_client()
                 self._on_server_started(True)
             else:
@@ -2052,9 +2150,6 @@ if _WX_AVAILABLE:
         # Session persistence
         # ------------------------------------------------------------------ #
 
-        def _sessions_dir(self) -> str:
-            return os.path.join(self._settings.config_dir, "kicad_ai_sessions")
-
         def _on_new_session(self, event) -> None:
             """Save the current session (if non-empty) then clear to start a new one."""
             if self._busy:
@@ -2083,7 +2178,9 @@ if _WX_AVAILABLE:
                 self._llm_client.reset()
 
             # Remove current.json so a blank close won't restore the old session.
-            self._remove_current_link()
+            from .. import session_store as _sstore
+
+            _sstore.remove_current_link(self._settings.config_dir)
 
             self._set_status(
                 "✅ New session started" + (" (previous session saved)" if has_content else ""),
@@ -2091,17 +2188,12 @@ if _WX_AVAILABLE:
             )
             self.Layout()
 
-        def _remove_current_link(self) -> None:
-            """Remove current.json (both symlink and plain-text variants)."""
-            link = os.path.join(self._sessions_dir(), "current.json")
-            try:
-                if os.path.lexists(link):  # lexists catches dangling symlinks too
-                    os.remove(link)
-            except OSError as e:
-                log.warning("Could not remove current.json: %s", e)
-
         def _save_session_to_disk(self) -> str | None:
             """Write current conv_entries + history to disk and update current.json.
+
+            Sessions are stamped with the currently open KiCad project
+            (schema v2), so a session never silently leaks into a different
+            project.  The stamp reflects the project active at save time.
 
             If ``_current_session_file`` is already set the existing file is
             overwritten; otherwise a new timestamped file is created and
@@ -2109,65 +2201,31 @@ if _WX_AVAILABLE:
 
             Returns an error string on failure, None on success.
             """
-            import datetime
-            import json as _json
+            from .. import session_store as _sstore
 
-            sessions_dir = self._sessions_dir()
-            try:
-                os.makedirs(sessions_dir, exist_ok=True)
-            except OSError as e:
-                return str(e)
-
-            title = next(
-                (e["text"][:60] for e in self._conv_entries if e["type"] == "user"),
-                "session",
-            )
             if self._current_session_file:
                 filename = self._current_session_file
             else:
                 ts = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
                 filename = f"session_{ts}.json"
                 self._current_session_file = filename
-            path = os.path.join(sessions_dir, filename)
-            data = {
-                "version": 1,
-                "title": title,
-                "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
-                "conv_entries": self._conv_entries,
-                "llm_history": (
+            payload = _sstore.make_payload(
+                self._conv_entries,
+                (
                     _strip_images_from_history(self._llm_client.get_history())
                     if self._llm_client
                     else []
                 ),
-            }
-            try:
-                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-                with os.fdopen(fd, "w", encoding="utf-8") as f:
-                    _json.dump(data, f, indent=2, default=str)
-            except OSError as e:
-                return str(e)
-
-            self._update_current_link(filename)
+                self._collect_active_project(),
+            )
+            err = _sstore.save_session(self._settings.config_dir, filename, payload)
+            if err:
+                return err
+            _sstore.update_current_link(self._settings.config_dir, filename)
             return None
 
-        def _update_current_link(self, filename: str) -> None:
-            """Atomically update current.json to point at *filename* (basename)."""
-            sessions_dir = self._sessions_dir()
-            link = os.path.join(sessions_dir, "current.json")
-            tmp_link = link + ".tmp"
-            try:
-                os.symlink(filename, tmp_link)
-                os.replace(tmp_link, link)
-            except Exception:
-                try:
-                    with open(link, "w", encoding="utf-8") as lf:
-                        lf.write(filename)
-                except Exception as e:
-                    log.debug("Could not write session file link: %s", e)
-
         def _on_load_session(self, event) -> None:
-            import glob
-            import json as _json
+            from .. import session_store as _sstore
 
             if self._busy:
                 wx.MessageBox(
@@ -2177,28 +2235,28 @@ if _WX_AVAILABLE:
                 )
                 return
 
-            sessions_dir = self._sessions_dir()
-            files = sorted(
-                glob.glob(os.path.join(sessions_dir, "session_*.json")),
-                reverse=True,
+            files = _sstore.list_loadable_sessions(
+                self._settings.config_dir, self._collect_active_project()
             )
             if not files:
                 wx.MessageBox(
-                    "No saved sessions found.", "Load Session", wx.OK | wx.ICON_INFORMATION
+                    "No saved sessions found for the current project.",
+                    "Load Session",
+                    wx.OK | wx.ICON_INFORMATION,
                 )
                 return
 
             # Build display labels
             labels = []
             for f in files:
-                try:
-                    with open(f, encoding="utf-8") as fh:
-                        d = _json.load(fh)
-                    ts = d.get("timestamp", "")[:19].replace("T", " ")
-                    title = d.get("title", "")[:50]
-                    labels.append(f"{ts}  —  {title}")
-                except Exception:
+                d, _ = _sstore.load_session(f)
+                if d is None:
                     labels.append(os.path.basename(f))
+                    continue
+                ts = d.get("timestamp", "")[:19].replace("T", " ")
+                title = d.get("title", "")[:50]
+                suffix = "" if d.get("project_path") else "  [no project]"
+                labels.append(f"{ts}  —  {title}{suffix}")
 
             dlg = wx.SingleChoiceDialog(
                 self,
@@ -2211,14 +2269,21 @@ if _WX_AVAILABLE:
                 return
             idx = dlg.GetSelection()
             dlg.Destroy()
+            if 0 <= idx < len(files):
+                self._restore_session_file(files[idx])
 
-            chosen = files[idx]
-            try:
-                with open(chosen, encoding="utf-8") as fh:
-                    data = _json.load(fh)
-            except (OSError, _json.JSONDecodeError) as e:
-                wx.MessageBox(f"Could not load session:\n{e}", "Error", wx.OK | wx.ICON_ERROR)
-                return
+        def _restore_session_file(self, path: str) -> bool:
+            """Load a saved session file into the panel and point current.json at it.
+
+            Returns True on success; shows an error dialog and returns False
+            when the file cannot be loaded.
+            """
+            from .. import session_store as _sstore
+
+            data, err = _sstore.load_session(path)
+            if data is None:
+                wx.MessageBox(f"Could not load session:\n{err}", "Error", wx.OK | wx.ICON_ERROR)
+                return False
 
             # Restore state
             self._stream_timer.Stop()
@@ -2228,11 +2293,147 @@ if _WX_AVAILABLE:
             if self._llm_client:
                 self._llm_client.set_history(data.get("llm_history", []))
             # Track which file is now active; point current.json at it.
-            self._current_session_file = os.path.basename(chosen)
-            self._update_current_link(self._current_session_file)
+            self._current_session_file = os.path.basename(path)
+            _sstore.update_current_link(self._settings.config_dir, self._current_session_file)
+
             self._render_conversation(force_scroll_to_bottom=True)
             self._set_status("✅ Session restored", self._C_OK)
             self.Layout()
+            return True
+
+        def _collect_active_project(self) -> str | None:
+            """Absolute path of the currently open .kicad_pro, or None.
+
+            Primary source: pcbnew.GetBoard() — only non-empty once a board
+            is loaded in the PCB Editor.  Fallback: KiCad top-level window
+            titles, which name the project/board/schematic path even while
+            GetBoard() is still settling (e.g. right after opening a project
+            or when only the project manager is open).
+            """
+            try:
+                from ..context_bridge import collect_context, project_path_from_title
+
+                proj = collect_context().get("active_project")
+                if proj:
+                    return proj
+                for w in wx.GetTopLevelWindows():
+                    title = w.GetTitle()
+                    if not title:
+                        continue
+                    p = project_path_from_title(title)
+                    if p:
+                        log.debug("project from window title %r -> %s", title, p)
+                        return p
+            except Exception:
+                log.debug("_collect_active_project failed", exc_info=True)
+            return None
+
+        def _start_project_watch(self) -> None:
+            """Start polling for KiCad project switches (1 s interval).
+
+            The first snapshot is taken here — after auto-restore — so the
+            watcher only reacts to *later* project changes, never to the
+            project already active at startup.
+            """
+            if not self._project_watch_timer:
+                return
+            self._active_project = self._collect_active_project()
+            self._watch_candidate_seen = False
+            self._project_watch_timer.Start(
+                1000
+            )  # 1 s poll: project switch is noticed quickly once a board signal is available
+
+        def _on_project_watch_tick(self, event) -> None:
+            """Close this panel when the open KiCad project changes.
+
+            The panel binds to the project that was active at startup; when
+            the project switches (or the board/project is closed), this
+            instance is stale.  Tear it down — including its MCP server —
+            instead of lingering; the panel opened in the new project
+            auto-restores the right session on first display.
+
+            The project signal flaps during project load (GetBoard() stays
+            empty until the board is up, and the window-title fallback is
+            equally transient), so a switch is only acted on after two
+            consecutive identical readings.
+            """
+            if self._busy:
+                return
+            project = self._collect_active_project()
+            if project == self._active_project:
+                self._watch_candidate_seen = False
+                return
+            if not self._watch_candidate_seen:
+                # First differing reading: remember it and wait for a second
+                # identical one before acting.
+                self._watch_candidate_seen = True
+                self._watch_candidate = project
+                return
+            if project != self._watch_candidate:
+                # Still flapping between values (project loading in
+                # background): re-arm with the latest reading.
+                self._watch_candidate = project
+                return
+            log.info(
+                "Project switch confirmed: %s -> %s; switching session",
+                self._active_project,
+                project,
+            )
+            self._active_project = project
+            self._watch_candidate_seen = False
+            # Keep this panel open and re-run the startup restore flow for
+            # the new project: matching current.json is restored in place,
+            # otherwise the new project's sessions are offered.  Never
+            # Destroy() the window — on a top-level wx.Frame that behaves as
+            # a forced Close and cascaded into closing KiCad's project
+            # windows.
+            self._autoload_session()
+
+        def _prompt_project_session_choice(self, project_path: str | None) -> None:
+            """Offer the open project's saved sessions after a skip.
+
+            Invoked when current.json cannot be auto-restored for the open
+            project — callers (auto-restore, project switch) check that first.
+            Candidates are the sessions stamped with *project_path*; a single
+            candidate is restored directly (a one-option dialog adds no
+            information), and the user may cancel a multi-candidate picker to
+            start blank.
+            """
+            from .. import session_store as _sstore
+
+            if not project_path:
+                return
+            candidates = _sstore.list_project_sessions(self._settings.config_dir, project_path)
+            log.info("Session picker for %s: %d candidate(s)", project_path, len(candidates))
+            if not candidates:
+                return
+            if len(candidates) == 1:
+                self._restore_session_file(candidates[0])
+                return
+
+            labels = []
+            for f in candidates:
+                d, _ = _sstore.load_session(f)
+                if d is None:
+                    labels.append(os.path.basename(f))
+                    continue
+                ts = d.get("timestamp", "")[:19].replace("T", " ")
+                title = d.get("title", "")[:50]
+                labels.append(f"{ts}  —  {title}")
+
+            dlg = wx.SingleChoiceDialog(
+                self,
+                "Saved sessions for this project found — restore one?",
+                "Restore Session",
+                labels,
+            )
+            if dlg.ShowModal() != wx.ID_OK:
+                dlg.Destroy()
+                return
+            idx = dlg.GetSelection()
+            dlg.Destroy()
+            if 0 <= idx < len(candidates):
+                self._restore_session_file(candidates[idx])
 
         def _on_clear(self, event) -> None:
             if self._busy:
@@ -2251,94 +2452,87 @@ if _WX_AVAILABLE:
                 self._llm_client.reset()
 
         def _on_close(self, event) -> None:
-            if event.CanVeto():
-                # User closed the plugin panel – hide it so the backend stays
-                # warm and KiCad is unaffected. The suicide watchdog timer
-                # (_on_suicide_check) will force-close us when KiCad itself
-                # exits, triggering the real teardown path below.
-                event.Veto()
-                self.Hide()
-                return
-            # Force-close (e.g. from _on_suicide_check when KiCad has exited)
-            # – tear down completely.
-            self._autosave_session()
+            """Panel close (user clicks X, or watchdog force-close): tear down
+            completely.
+
+            Every user message, AI reply and cancellation is persisted as it
+            happens, so closing loses nothing — the next open restores the
+            session from disk.  The panel is never merely hidden: a hidden
+            panel would keep its timers and MCP server running in the
+            background.  Either the panel stays usable (project switch keeps
+            it open and swaps the session) or it is destroyed — no
+            half-alive state.
+            """
+            if self._busy and self._cancel_event is not None:
+                # An in-flight turn ends with the panel: ask it to stop
+                # writing before we tear down.
+                self._cancel_event.set()
             self._server_mgr.stop()
             self.Destroy()
 
         def _on_suicide_check(self, event) -> None:
-            """Periodically check if KiCad is gone. If we are the only
-            visible top-level wx window left, KiCad's main window must
-            have been closed without sending us EVT_CLOSE — so close
-            ourselves now."""
-            others = [w for w in wx.GetTopLevelWindows() if w is not self and w.IsShown()]
+            """Periodically check if KiCad is gone.
+
+            If the only visible top-level wx windows left are our own plugin
+            panels — including any other AssistantPanel instances (a second
+            panel must not count as a reason to stay alive) — KiCad's own
+            windows are all gone, so close ourselves.  Any non-panel window
+            (project manager, editors, dialogs) keeps us alive.
+            """
+            others = [
+                w
+                for w in wx.GetTopLevelWindows()
+                if not isinstance(w, AssistantPanel) and w.IsShown()
+            ]
             if not others:
                 self.Close(force=True)
 
         def _on_destroy(self, event) -> None:
             """Called when the wx window is actually destroyed (e.g. KiCad shutdown)."""
             if event.GetEventObject() is self:
-                self._autosave_session()
+                if self._project_watch_timer is not None:
+                    self._project_watch_timer.Stop()
                 self._server_mgr.stop()
             event.Skip()
 
         # ------------------------------------------------------------------ #
-        # Auto-save / auto-load
+        # Auto-load
         # ------------------------------------------------------------------ #
-
-        def _autosave_session(self) -> None:
-            """Save a timestamped session file on every close.
-
-            Also atomically updates the ``current.json`` symlink in the sessions
-            directory so the next startup can load it directly without globbing.
-            """
-            # Only save if there is real conversational content — skip sessions
-            # that only contain status/warning notices.
-            if not any(e["type"] in ("user", "ai") for e in self._conv_entries):
-                return
-            err = self._save_session_to_disk()
-            if err:
-                log.warning("Auto-save failed: %s", err)
 
         def _autoload_session(self) -> None:
             """Restore the session pointed to by ``current.json`` on startup.
 
+            Project-aware since schema v2: a session is auto-restored only
+            when it belongs to the currently open KiCad project.  Legacy v1
+            sessions (no project stamp) and sessions saved in other projects
+            are skipped; if the open project has sessions of its own, the
+            user is asked to pick one.
+
             Only follows current.json — no glob fallback. This ensures "New
             Session" (which removes current.json) always starts blank.
+
+            Runs when the LLM client is initialised — on first panel display, or
+            after a manual backend Restart.  Since every turn is persisted as
+            it completes (send/reply/stop), the disk snapshot is always the
+            newest completed state, and restoring it is lossless.
             """
-            import json as _json
+            from .. import session_store as _sstore
 
-            sessions_dir = self._sessions_dir()
-            link = os.path.join(sessions_dir, "current.json")
-            path: str | None = None
-
-            if os.path.exists(link):
-                # Resolve: may be a real symlink or the plain-text fallback.
-                if os.path.islink(link):
-                    target = os.readlink(link)
-                    # readlink may return a relative path — resolve against dir.
-                    if not os.path.isabs(target):
-                        target = os.path.join(sessions_dir, target)
-                    if os.path.isfile(target):
-                        path = target
-                else:
-                    # Plain-text pointer written by the symlink fallback.
-                    try:
-                        with open(link, encoding="utf-8") as lf:
-                            fname = lf.read().strip()
-                        candidate = os.path.join(sessions_dir, fname)
-                        if os.path.isfile(candidate):
-                            path = candidate
-                    except OSError:
-                        pass
-
+            path = _sstore.resolve_current_session(self._settings.config_dir)
             if path is None:
                 return  # No current.json and no sessions dir — blank start.
 
-            try:
-                with open(path, encoding="utf-8") as f:
-                    data = _json.load(f)
-            except (OSError, _json.JSONDecodeError) as e:
-                log.warning("Auto-load failed: %s", e)
+            data, err = _sstore.load_session(path)
+            if data is None:
+                log.warning("Auto-load failed: %s (%s)", path, err)
+                return
+
+            current_project = self._collect_active_project()
+
+            # Legacy v1 sessions and sessions of other projects must not leak
+            # into the open project — skip and offer project sessions instead.
+            if not _sstore.is_project_session(data, current_project):
+                self._prompt_project_session_choice(current_project)
                 return
 
             conv = data.get("conv_entries", [])
@@ -2529,49 +2723,57 @@ if _WX_AVAILABLE:
             Called 1 second after EVT_WEBVIEW_LOADED to give scripts time to execute.
             """
             log.debug("_verify_shell_and_render: starting verification")
-            self._js_running = True
             js_works = False
 
+            # Each probe runs under the render-protocol flag via
+            # _run_script(probe=True): before _shell_loaded is confirmed the
+            # normal acquire would defer instead of probing, so probe=True
+            # skips the shell-loaded gate while still excluding re-entrant
+            # renders from the probe windows.
             try:
                 # Check font
-                ok, result = self._conv_view.RunScript("getComputedStyle(document.body).fontFamily")
+                _, result = self._run_script(
+                    "getComputedStyle(document.body).fontFamily", probe=True
+                )
                 log.info("_verify_shell_and_render: font=%r", result)
 
                 # Check all window functions (what's actually defined in window)
-                ok, result = self._conv_view.RunScript(
-                    "Object.keys(window).filter(k => typeof window[k] === 'function' && k.startsWith('_')).join(',')"
+                _, result = self._run_script(
+                    "Object.keys(window).filter(k => typeof window[k] === 'function' && k.startsWith('_')).join(',')",
+                    probe=True,
                 )
                 log.info("_verify_shell_and_render: window functions starting with _ =%r", result)
 
                 # Check scripts in document
-                ok, result = self._conv_view.RunScript(
-                    "document.scripts.length + ',' + (document.scripts[0] ? document.scripts[0].src : 'inline') + ',' + (document.scripts[0] ? document.scripts[0].innerHTML.length : 0)"
+                _, result = self._run_script(
+                    "document.scripts.length + ',' + (document.scripts[0] ? document.scripts[0].src : 'inline') + ',' + (document.scripts[0] ? document.scripts[0].innerHTML.length : 0)",
+                    probe=True,
                 )
                 log.info("_verify_shell_and_render: scripts info=%r", result)
 
                 # Check for JS errors in the console
-                ok, result = self._conv_view.RunScript(
-                    "try { eval('1+1'); 'no_error'; } catch(e) { e.message; }"
+                _, result = self._run_script(
+                    "try { eval('1+1'); 'no_error'; } catch(e) { e.message; }", probe=True
                 )
                 log.info("_verify_shell_and_render: eval test=%r", result)
 
                 # Try to check for syntax errors in the script
-                ok, result = self._conv_view.RunScript(
-                    "try { new Function(document.scripts[0].innerHTML); 'syntax_ok'; } catch(e) { 'error:' + e.message; }"
+                _, result = self._run_script(
+                    "try { new Function(document.scripts[0].innerHTML); 'syntax_ok'; } catch(e) { 'error:' + e.message; }",
+                    probe=True,
                 )
                 log.info("_verify_shell_and_render: script syntax check=%r", result)
 
                 # Try to call JS function
-                ok, result = self._conv_view.RunScript(
-                    "try { _updateConversation('[]', 'preserve'); 'ok'; } catch(e) { e.message; }"
+                ok, result = self._run_script(
+                    "try { _updateConversation('[]', 'preserve'); 'ok'; } catch(e) { e.message; }",
+                    probe=True,
                 )
                 log.info("_verify_shell_and_render: JS call result=%r", result)
                 if ok and result and ("ok" in str(result) or "error" in str(result).lower()):
                     js_works = True
             except Exception as e:
                 log.error("_verify_shell_and_render: exception: %s", e)
-            finally:
-                self._js_running = False
 
             if js_works:
                 self._shell_loaded = True
@@ -2646,10 +2848,10 @@ if _WX_AVAILABLE:
             """Full conversation update via RunScript (WebView path).
 
             Serializes all entries as JSON and calls _updateConversation()
-            in the shell.
+            in the shell.  Locking/deferral is handled by _run_script.
             """
-            if not self._try_acquire_render_lock():
-                return  # _try_acquire_render_lock already set _render_pending
+            if not self._use_webview:
+                return
 
             import json as _json
 
@@ -2665,31 +2867,21 @@ if _WX_AVAILABLE:
                 len(js),
             )
 
-            try:
-                ok, result = self._conv_view.RunScript(js)
-                if ok:
-                    self._stream_wrapper_visible = False
-                    result_str = str(result) if result else ""
-                    if result_str.startswith("error:"):
-                        log.error(
-                            "_updateConversation JS error: %s (js_size=%d, entries=%d)",
-                            result_str,
-                            len(js),
-                            len(js_entries),
-                        )
-                    else:
-                        log.debug("_updateConversation JS result: %s", result_str)
-                else:
-                    log.error(
-                        "_updateConversation RunScript FAILED: js_size=%d, result=%r, entries=%d",
-                        len(js),
-                        result,
-                        len(js_entries),
-                    )
-            except Exception as e:
-                log.error("_updateConversation exception: %s", e)
-            finally:
-                self._release_render_lock(force_scroll_to_bottom)
+            ok, result = self._run_script(js, force_scroll_to_bottom)
+            if not ok:
+                log.debug("_updateConversation deferred (pending rebuild scheduled)")
+                return
+            self._stream_wrapper_visible = False
+            result_str = str(result) if result else ""
+            if result_str.startswith("error:"):
+                log.error(
+                    "_updateConversation JS error: %s (js_size=%d, entries=%d)",
+                    result_str,
+                    len(js),
+                    len(js_entries),
+                )
+            else:
+                log.debug("_updateConversation JS result: %s", result_str)
 
         def _process_pending_render(self, force_scroll_to_bottom: bool) -> None:
             """Process any pending render after _js_running is reset."""
@@ -2698,13 +2890,66 @@ if _WX_AVAILABLE:
                 wx.CallAfter(self._update_conversation, force_scroll_to_bottom)
 
         # ------------------------------------------------------------------ #
+        # Render protocol: single RunScript funnel
+        # ------------------------------------------------------------------ #
+        # Every conversation-rendering script goes through _run_script, which
+        # owns the _js_running / _render_pending bookkeeping.  RunScript on
+        # Windows WebView2 pumps the message loop, so a script submitted
+        # while another is in flight gets re-entrant instead of serialized;
+        # the _js_running flag turns that into "defer and replay as a full
+        # rebuild".  Callers of _run_script never touch lock state.
+
+        def _run_script(
+            self,
+            js: str,
+            force_scroll_to_bottom: bool = False,
+            retry_on_failure: bool = False,
+            probe: bool = False,
+        ) -> tuple[bool, object]:
+            """Run a WebView script under the render protocol.
+
+            Acquires the render lock (deferring -- _render_pending set -- when
+            another script is in flight or the shell is not confirmed loaded),
+            runs the script, then releases; the release flushes any deferral
+            as a wx.CallAfter full-conversation rebuild once the current
+            event stack has unwound.
+
+            probe=True runs before the shell is confirmed loaded (shell
+            verification): takes the lock flag to keep re-entrant renders out,
+            but skips the shell-loaded gate.
+
+            retry_on_failure=True records a pending rebuild when the script
+            itself fails, so a full rebuild replays the missed update.
+            """
+            if not self._use_webview:
+                return False, None
+            if not self._try_acquire_render_lock(probe=probe):
+                return False, None  # deferred: _render_pending already set
+            try:
+                ok, result = self._conv_view.RunScript(js)
+                if not ok:
+                    log.warning("_run_script: RunScript failed: %r", result)
+                    if retry_on_failure:
+                        self._render_pending = True
+                return ok, result
+            except Exception as e:
+                log.warning("_run_script exception: %s", e)
+                if retry_on_failure:
+                    self._render_pending = True
+                return False, None
+            finally:
+                self._release_render_lock(force_scroll_to_bottom)
+
+        # ------------------------------------------------------------------ #
         # Render lock helpers: encapsulate sync state management
         # ------------------------------------------------------------------ #
-        def _try_acquire_render_lock(self) -> bool:
+        def _try_acquire_render_lock(self, probe: bool = False) -> bool:
             """Try to acquire the render lock. Returns True if acquired.
 
-            If acquisition fails (shell not loaded or another render in progress),
-            sets _render_pending so the render will be retried later.
+            If acquisition fails (shell not loaded or another render in
+            progress), sets _render_pending so the render will be retried
+            later.  With probe=True the shell-loaded gate is skipped (shell
+            verification runs before _shell_loaded is confirmed).
             """
             self._render_pending = False  # Reset first to allow recursion
 
@@ -2712,51 +2957,54 @@ if _WX_AVAILABLE:
                 self._render_pending = True
                 return False
 
-            # If shell_loaded is False, try to detect if it actually is loaded
-            # (EVT_WEBVIEW_LOADED may not fire on all Windows WebView2 versions)
-            if not self._shell_loaded:
-                # Try to detect shell state by checking if the conversation div exists
-                # AND if JS functions are defined. Try multiple times in case scripts
-                # haven't executed yet.
-                shell_loaded_detected = False
-                for attempt in range(3):
-                    try:
-                        ok, result = self._conv_view.RunScript(
-                            "document.getElementById('conversation') ? 'loaded' : 'not_loaded'"
-                        )
-                        if ok and result and "loaded" in str(result):
-                            # Also verify JS functions exist by trying to call one
-                            ok2, result2 = self._conv_view.RunScript(
-                                "try { _updateConversation('[]', 'preserve'); 'ok'; } catch(e) { e.message; }"
-                            )
-                            log.info("JS test attempt %d: %r", attempt + 1, result2)
-                            if (
-                                ok2
-                                and result2
-                                and ("ok" in str(result2) or "error" in str(result2).lower())
-                            ):
-                                log.info("Detected shell and JS working (attempt %d)", attempt + 1)
-                                self._shell_loaded = True
-                                self._page_loading = False
-                                shell_loaded_detected = True
-                                break
-                            else:
-                                log.warning(
-                                    "Shell loaded but JS not working (attempt %d)", attempt + 1
-                                )
-                        else:
-                            break
-                    except Exception as e:
-                        log.warning("Failed to detect shell state (attempt %d): %s", attempt + 1, e)
-                        break
+            # Claim first: shell detection (below) runs raw RunScript probes,
+            # so the flag must be held while they are in flight to keep
+            # re-entrant renders out of the detection window too.
+            self._js_running = True
 
-                if not shell_loaded_detected:
-                    log.warning("Shell loaded but JS not working after 3 attempts, allowing retry")
+            if not probe and not self._shell_loaded:
+                if not self._detect_shell_loaded():
+                    self._js_running = False
                     self._render_pending = True
                     return False
 
-            self._js_running = True
             return True
+
+        def _detect_shell_loaded(self) -> bool:
+            """Probe the WebView for a working shell (div + JS functions).
+
+            EVT_WEBVIEW_LOADED may not fire on all Windows WebView2 versions,
+            so renders probe for shell readiness.  Runs with the render lock
+            held (_js_running=True).
+            """
+            for attempt in range(3):
+                try:
+                    ok, result = self._conv_view.RunScript(
+                        "document.getElementById('conversation') ? 'loaded' : 'not_loaded'"
+                    )
+                    if ok and result and "loaded" in str(result):
+                        # Also verify JS functions exist by trying to call one
+                        ok2, result2 = self._conv_view.RunScript(
+                            "try { _updateConversation('[]', 'preserve'); 'ok'; } catch(e) { e.message; }"
+                        )
+                        log.info("JS test attempt %d: %r", attempt + 1, result2)
+                        if (
+                            ok2
+                            and result2
+                            and ("ok" in str(result2) or "error" in str(result2).lower())
+                        ):
+                            log.info("Detected shell and JS working (attempt %d)", attempt + 1)
+                            self._shell_loaded = True
+                            self._page_loading = False
+                            return True
+                        log.warning("Shell loaded but JS not working (attempt %d)", attempt + 1)
+                    else:
+                        break
+                except Exception as e:
+                    log.warning("Failed to detect shell state (attempt %d): %s", attempt + 1, e)
+                    break
+            log.warning("Shell loaded but JS not working after 3 attempts, allowing retry")
+            return False
 
         def _release_render_lock(self, force_scroll_to_bottom: bool) -> None:
             """Release the render lock and process pending if needed."""
@@ -2765,80 +3013,64 @@ if _WX_AVAILABLE:
 
         def _append_entry_js(self, entry: dict, force_scroll_to_bottom: bool = False) -> None:
             """Append a single entry via JS _appendEntry (WebView path)."""
-            if not self._try_acquire_render_lock():
-                return  # _try_acquire_render_lock already set _render_pending
-
             import json as _json
 
             prepared = self._prepare_single_entry(entry)
             scroll = '"bottom"' if force_scroll_to_bottom else '"preserve"'
             js = f"_appendEntry({_json.dumps(_json.dumps(prepared))}, {scroll})"
-            log.debug("_appendEntry: type=%s, scroll=%s", entry.get("type"), scroll)
+            text = entry.get("text") or ""
+            log.debug(
+                "_appendEntry: type=%s, text_len=%d, tail=%r, scroll=%s",
+                entry.get("type"),
+                len(text),
+                text[-80:],
+                scroll,
+            )
 
-            try:
-                ok, result = self._conv_view.RunScript(js)
-                if ok:
-                    self._stream_wrapper_visible = False
-                    result_str = str(result) if result else ""
-                    if result_str.startswith("error:"):
-                        log.error(
-                            "_appendEntry JS error: %s (type=%s, js_size=%d)",
-                            result_str,
-                            entry.get("type"),
-                            len(js),
-                        )
-                    else:
-                        log.debug("_appendEntry JS result: %s", result_str)
-                else:
-                    log.error(
-                        "_appendEntry RunScript FAILED: result=%r, type=%s, js_size=%d",
-                        result,
-                        entry.get("type"),
-                        len(js),
-                    )
-                    self._render_pending = True
-            except Exception:
-                self._render_pending = True
-            finally:
-                self._release_render_lock(force_scroll_to_bottom)
+            ok, result = self._run_script(js, force_scroll_to_bottom, retry_on_failure=True)
+            if not ok:
+                # Deferred (lock busy / shell not loaded) or script failed —
+                # acquire/retry_on_failure already recorded a pending full
+                # rebuild that will replay this entry.
+                log.warning(
+                    "chat: append_entry_js deferred/retry (type=%s, text_len=%d) — pending rebuild scheduled",
+                    entry.get("type"),
+                    len(text),
+                )
+                return
+            self._stream_wrapper_visible = False
+            result_str = str(result) if result else ""
+            if result_str.startswith("error:"):
+                log.error(
+                    "_appendEntry JS error: %s (type=%s, js_size=%d)",
+                    result_str,
+                    entry.get("type"),
+                    len(js),
+                )
+            else:
+                log.debug("_appendEntry JS result: %s", result_str)
 
         def _show_stream_wrapper(self) -> None:
             """Make the stream-wrapper table visible (first streaming chunk)."""
             if not self._shell_loaded or self._stream_wrapper_visible:
                 return  # No-op
 
-            # Use the lock but handle the case where we don't need full update
-            if not self._try_acquire_render_lock():
-                return
-
-            try:
-                ok, _ = self._conv_view.RunScript(
-                    "document.getElementById('stream-wrapper').style.display=''"
-                )
-                if ok:
-                    self._stream_wrapper_visible = True
-            finally:
-                self._release_render_lock(False)
+            ok, _ = self._run_script("document.getElementById('stream-wrapper').style.display=''")
+            if ok:
+                self._stream_wrapper_visible = True
 
         def _hide_stream_wrapper(self) -> None:
             """Hide the stream-wrapper table and clear pending text."""
             if not self._shell_loaded or not self._stream_wrapper_visible:
                 return  # No-op
 
-            # Use the lock but handle the case where we don't need full update
-            if not self._try_acquire_render_lock():
-                return
-
-            try:
-                ok, _ = self._conv_view.RunScript(
-                    "var w=document.getElementById('stream-wrapper');"
-                    "if(w)w.style.display='none';"
-                    "document.getElementById('pending-ai-text').innerHTML='';"
-                )
-                if ok:
-                    self._stream_wrapper_visible = False
-            finally:
-                self._release_render_lock(False)
+            ok, _ = self._run_script(
+                "var w=document.getElementById('stream-wrapper');"
+                "if(w)w.style.display='none';"
+                "document.getElementById('pending-ai-text').innerHTML='';"
+            )
+            if ok:
+                self._stream_wrapper_visible = False
 
         def _render_conversation(self, force_scroll_to_bottom: bool = False) -> None:
             """Re-render the conversation.  Routes to WebView or HtmlWindow path."""

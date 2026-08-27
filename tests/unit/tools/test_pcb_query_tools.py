@@ -191,6 +191,12 @@ class TestGetFootprint:
         result = _run(tools["get_footprint"](pcb_path=BOARD_FIXTURE, reference="U99", ctx=None))
         assert "error" in result
 
+    def test_includes_edge_cuts_field(self, tools):
+        """get_footprint returns an edge_cuts list (empty when none exist)."""
+        result = _run(tools["get_footprint"](pcb_path=BOARD_FIXTURE, reference="R1", ctx=None))
+        assert "edge_cuts" in result
+        assert isinstance(result["edge_cuts"], list)
+
 
 class TestGetFootprintBbox:
     def test_r1_bbox_no_rotation(self, tools, board_with_outline_copy):

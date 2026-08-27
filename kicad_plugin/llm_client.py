@@ -247,6 +247,211 @@ sys.stdout.write(json.dumps(result))
 sys.stdout.flush()
 """
 
+# Environment allowlist for plugin-venv subprocesses. KiCad's AppImage sets
+# PYTHONHOME/PYTHONPATH/LD_LIBRARY_PATH for its own embedded interpreter;
+# inheriting them would break the venv Python.
+_SUBPROCESS_ENV_ALLOWLIST = (
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TMPDIR",
+    "TEMP",
+    "TMP",
+    "XDG_RUNTIME_DIR",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_CACHE_HOME",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "REQUESTS_CA_BUNDLE",
+    "CURL_CA_BUNDLE",
+)
+
+
+def _subprocess_env() -> dict[str, str]:
+    """Build a clean environment for plugin-venv subprocesses."""
+    return {k: os.environ[k] for k in _SUBPROCESS_ENV_ALLOWLIST if k in os.environ}
+
+
+# Subprocess SSE relay: read raw body bytes from stdin, perform the POST,
+# stream-parse the SSE response, and relay parsed deltas back over stdout.
+# Used when in-process SSL is unavailable so streaming still works with the
+# same per-read socket timeout as the in-process path.
+# Protocol (one JSON payload per line, whitespace-separated kind prefix):
+#   SSE-DATA  {"content": "..."}  text delta -> on_text_delta
+#   SSE-DONE  {"finish_reason": ..., "message": {...}}
+#   SSE-ERROR {"kind": "exception", "error": "..."} |
+#             {"status": <http_code>, "body": "..."} |
+#             {"kind": "stream", "error": "..."}
+_SUBPROCESS_SSE_SCRIPT = r"""
+import json, sys, urllib.request, urllib.error
+
+
+def emit(kind, payload):
+    sys.stdout.write("%s %s\n" % (kind, json.dumps(payload)))
+    sys.stdout.flush()
+
+
+try:
+    url = sys.argv[1]
+    headers = json.loads(sys.argv[2])
+    timeout = float(sys.argv[3])
+    fmt = sys.argv[4]
+    body = sys.stdin.buffer.read()
+
+    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            if fmt == "anthropic":
+                text_blocks = {}
+                tool_blocks = {}
+                stop_reason = "end_turn"
+                current_event = ""
+                while True:
+                    raw = resp.readline()
+                    if raw == b"":
+                        break
+                    line = raw.decode("utf-8", "replace").rstrip("\r\n")
+                    if line.startswith("event:"):
+                        current_event = line[6:].strip()
+                        continue
+                    if not line.startswith("data:"):
+                        continue
+                    data_str = line[5:].strip()
+                    try:
+                        event_data = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        continue
+                    etype = event_data.get("type", current_event)
+                    if etype == "content_block_start":
+                        idx = event_data.get("index", 0)
+                        block = event_data.get("content_block", {})
+                        btype = block.get("type")
+                        if btype == "text":
+                            text_blocks[idx] = block.get("text", "")
+                        elif btype == "tool_use":
+                            tool_blocks[idx] = {
+                                "id": block["id"],
+                                "name": block["name"],
+                                "input_json": "",
+                            }
+                    elif etype == "content_block_delta":
+                        idx = event_data.get("index", 0)
+                        delta = event_data.get("delta", {})
+                        dtype = delta.get("type")
+                        if dtype == "text_delta":
+                            chunk = delta.get("text", "")
+                            text_blocks[idx] = text_blocks.get(idx, "") + chunk
+                            if chunk:
+                                emit("SSE-DATA", {"content": chunk})
+                        elif dtype == "input_json_delta":
+                            partial = delta.get("partial_json", "")
+                            if idx in tool_blocks:
+                                tool_blocks[idx]["input_json"] += partial
+                    elif etype == "message_delta":
+                        sr = event_data.get("delta", {}).get("stop_reason")
+                        if sr:
+                            stop_reason = sr
+                    elif etype == "error":
+                        err = event_data.get("error", {})
+                        emit("SSE-ERROR", {"kind": "stream", "error": err.get("message", str(err))})
+                        sys.exit(0)
+                full_text = "\n".join(text_blocks[k] for k in sorted(text_blocks))
+                tool_calls = []
+                for k in sorted(tool_blocks):
+                    tb = tool_blocks[k]
+                    try:
+                        inp = json.loads(tb["input_json"]) if tb["input_json"] else {}
+                    except json.JSONDecodeError:
+                        inp = {}
+                    tool_calls.append({
+                        "id": tb["id"], "type": "function",
+                        "function": {"name": tb["name"], "arguments": json.dumps(inp)},
+                    })
+                message_out = {"content": full_text}
+                if tool_calls:
+                    message_out["tool_calls"] = tool_calls
+                finish = "tool_calls" if tool_calls else "stop"
+                if stop_reason == "max_tokens":
+                    finish = "stop"
+                emit("SSE-DONE", {"finish_reason": finish, "message": message_out})
+                sys.exit(0)
+
+            # fmt == "openai"
+            text_parts = []
+            tool_calls = {}
+            finish_reason = "stop"
+            reasoning = []
+            while True:
+                raw = resp.readline()
+                if raw == b"":
+                    break
+                line = raw.decode("utf-8", "replace").rstrip("\r\n")
+                if not line.startswith("data:"):
+                    continue
+                data_str = line[5:].strip()
+                if data_str == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data_str)
+                except json.JSONDecodeError:
+                    continue
+                choice = chunk.get("choices", [{}])[0]
+                fr = choice.get("finish_reason")
+                if fr is not None:
+                    finish_reason = fr
+                delta = choice.get("delta", {})
+                content = delta.get("content")
+                if content:
+                    text_parts.append(content)
+                    emit("SSE-DATA", {"content": content})
+                reasoning_part = delta.get("reasoning_content")
+                if reasoning_part:
+                    reasoning.append(reasoning_part)
+                for tc_delta in delta.get("tool_calls") or []:
+                    idx = tc_delta["index"]
+                    if idx not in tool_calls:
+                        tool_calls[idx] = {
+                            "id": "", "type": "function",
+                            "function": {"name": "", "arguments": ""},
+                        }
+                    tc = tool_calls[idx]
+                    if tc_delta.get("id"):
+                        tc["id"] += tc_delta["id"]
+                    fn = tc_delta.get("function", {})
+                    if fn.get("name"):
+                        tc["function"]["name"] += fn["name"]
+                    if fn.get("arguments"):
+                        tc["function"]["arguments"] += fn["arguments"]
+            tool_calls_list = [tool_calls[k] for k in sorted(tool_calls)]
+            message_out = {"content": "".join(text_parts)}
+            if tool_calls_list:
+                message_out["tool_calls"] = tool_calls_list
+            if reasoning:
+                message_out["reasoning_content"] = "".join(reasoning)
+            emit("SSE-DONE", {"finish_reason": finish_reason, "message": message_out})
+            sys.exit(0)
+    except urllib.error.HTTPError as e:
+        emit("SSE-ERROR", {"status": e.code, "body": e.read().decode("utf-8", "replace")})
+        sys.exit(0)
+    except Exception as e:
+        emit("SSE-ERROR", {"kind": "exception", "error": f"{type(e).__name__}: {e}"})
+        sys.exit(0)
+except Exception as e:
+    emit("SSE-ERROR", {"kind": "exception", "error": f"subprocess setup error: {type(e).__name__}: {e}"})
+    sys.exit(0)
+"""
+
 
 def _https_post_json(
     url: str,
@@ -290,35 +495,7 @@ def _https_post_json(
         )
 
     # Build a clean env using an explicit allowlist (mirrors ServerManager).
-    # KiCad's AppImage sets PYTHONHOME/PYTHONPATH/LD_LIBRARY_PATH for its own
-    # embedded interpreter; inheriting them would break the venv Python.
-    _ENV_ALLOWLIST = (
-        "PATH",
-        "HOME",
-        "USER",
-        "LOGNAME",
-        "LANG",
-        "LC_ALL",
-        "LC_CTYPE",
-        "TMPDIR",
-        "TEMP",
-        "TMP",
-        "XDG_RUNTIME_DIR",
-        "XDG_CONFIG_HOME",
-        "XDG_DATA_HOME",
-        "XDG_CACHE_HOME",
-        "HTTP_PROXY",
-        "HTTPS_PROXY",
-        "NO_PROXY",
-        "http_proxy",
-        "https_proxy",
-        "no_proxy",
-        "SSL_CERT_FILE",
-        "SSL_CERT_DIR",
-        "REQUESTS_CA_BUNDLE",
-        "CURL_CA_BUNDLE",
-    )
-    clean_env = {k: os.environ[k] for k in _ENV_ALLOWLIST if k in os.environ}
+    clean_env = _subprocess_env()
 
     try:
         proc = subprocess.run(  # nosec B603 -- input is validated
@@ -345,6 +522,122 @@ def _https_post_json(
     if status == 0:
         raise RuntimeError(f"HTTPS request failed: {out.get('error', 'unknown error')}")
     return int(status), str(out.get("body", ""))
+
+
+def _subprocess_sse_stream(
+    url: str,
+    headers: dict[str, str],
+    payload: bytes,
+    timeout: float,
+    fmt: str,
+    on_text_delta: Callable[[str], None] | None,
+) -> dict[str, Any]:
+    """Stream an HTTP SSE response through the plugin-venv Python subprocess.
+
+    Mirrors the in-process streaming path when KiCad's embedded Python lacks
+    SSL: the subprocess owns the socket (its ``urlopen`` timeout is the same
+    per-read deadline as in-process), parses deltas, and relays them over
+    stdout via ``SSE-DATA`` / ``SSE-DONE`` / ``SSE-ERROR`` lines.
+
+    Returns the same shape as the in-process ``_stream_*`` methods, including
+    the ``{"error": ...}`` convention.
+    """
+    venv_python = _resolve_plugin_python()
+    if not venv_python:
+        return {
+            "error": (
+                "KiCad's embedded Python lacks SSL support and no plugin venv "
+                "Python was found. Run 'kicad_plugin/setup_plugin.sh' to create one."
+            )
+        }
+
+    proc = subprocess.Popen(  # nosec B603 -- input is validated
+        [
+            venv_python,
+            "-u",
+            "-I",
+            "-c",
+            _SUBPROCESS_SSE_SCRIPT,
+            url,
+            json.dumps(headers),
+            str(timeout),
+            fmt,
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=_subprocess_env(),
+    )
+    if proc.stdin is None or proc.stdout is None:
+        proc.kill()
+        return {"error": "HTTPS subprocess stream could not be started"}
+    try:
+        proc.stdin.write(payload)
+        proc.stdin.close()
+    except OSError as e:
+        proc.kill()
+        return {"error": f"HTTPS request failed: {e}"}
+
+    done: dict[str, Any] | None = None
+    error_result: dict[str, Any] | None = None
+    for raw in proc.stdout:
+        line = raw.decode("utf-8", "replace").rstrip("\r\n")
+        kind, _, body = line.partition(" ")
+        if kind == "SSE-DATA" and body:
+            try:
+                content = json.loads(body).get("content") or ""
+            except json.JSONDecodeError:
+                continue
+            if content and on_text_delta is not None:
+                try:
+                    on_text_delta(content)
+                except Exception as e:  # noqa: BLE001 -- UI callback errors must not kill the turn
+                    log.debug("Subprocess text delta callback error: %s", e)
+        elif kind == "SSE-DONE" and body:
+            try:
+                done = json.loads(body)
+            except json.JSONDecodeError as e:
+                return {"error": f"HTTPS subprocess returned invalid SSE-DONE: {e}"}
+        elif kind == "SSE-ERROR" and body:
+            try:
+                err = json.loads(body)
+            except json.JSONDecodeError:
+                error_result = {
+                    "error": f"HTTPS subprocess returned invalid SSE-ERROR: {body[:200]}"
+                }
+                break
+            if err.get("kind") == "exception":
+                error_result = {"error": f"HTTPS request failed: {err['error']}"}
+                break
+            status = err.get("status")
+            if status:
+                error_result = {"error": f"HTTP {status}: {err.get('body', '')[:200]}"}
+                break
+            error_result = {"error": f"HTTPS request failed: {err.get('error', 'unknown error')}"}
+            break
+
+    if error_result is not None:
+        return error_result
+    if done is None:
+        stderr_tail = ""
+        if proc.stderr is not None:
+            stderr_tail = proc.stderr.read().decode("utf-8", "replace")[:500]
+        return {
+            "error": "HTTPS subprocess stream ended unexpectedly "
+            f"(exit {proc.returncode}): {stderr_tail}"
+        }
+    try:
+        proc.wait(timeout=30)  # recycle; the relay exits right after SSE-DONE
+    except subprocess.TimeoutExpired:
+        proc.kill()
+
+    message: dict[str, Any] = {"content": (done.get("message") or {}).get("content", "")}
+    done_message = done.get("message") or {}
+    if done_message.get("tool_calls"):
+        message["tool_calls"] = done_message["tool_calls"]
+    if done_message.get("reasoning_content"):
+        message["reasoning_content"] = done_message["reasoning_content"]
+    return {"finish_reason": done.get("finish_reason", "stop"), "message": message}
 
 
 # ---------------------------------------------------------------------------
@@ -561,6 +854,15 @@ class LLMClient:
     def reset(self) -> None:
         """Clear conversation history."""
         self._history = []
+
+    def set_base_url(self, url: str | None) -> None:
+        """Set the MCP backend base URL after construction.
+
+        The URL is only known once the backend has finished starting, which
+        may happen after the client is created (e.g. on panel display before
+        the backend came up).
+        """
+        self._mcp_base_url = url
 
     def get_history(self) -> list[dict[str, Any]]:
         """Return a copy of the conversation history for session persistence."""
@@ -1237,13 +1539,18 @@ class LLMClient:
 
         self._emit_tool_callback(on_tool_call, tool_name, args, result)
 
+        # Mark the path dirty even when the tool call fails: a failed edit may
+        # still have partially modified the file (e.g. IPC routing tools), so
+        # the end-of-turn reload must still run — keeping the actual refresh
+        # consistent with the UI's refresh entry.
+        if policy.mark_dirty and path:
+            state.dirty_paths.add(path)
+
         if not self._tool_result_succeeded(result):
             return result
 
         if policy.track_snapshot and path:
             state.snapshotted_paths.add(path)
-        if policy.mark_dirty and path:
-            state.dirty_paths.add(path)
         if policy.clear_dirty_paths_arg:
             reload_paths = args.get(policy.clear_dirty_paths_arg, [])
             if isinstance(reload_paths, list):
@@ -1310,60 +1617,79 @@ class LLMClient:
             )
 
         state = _ToolExecutionState()
+        reply: str | None = None
+        is_final_text = False
 
-        for _ in range(20):  # max 20 iterations (guard against infinite loops)
-            response = self._call_llm(system, tools, on_text_delta=on_text_delta)
+        try:
+            for _ in range(20):  # max 20 iterations (guard against infinite loops)
+                response = self._call_llm(system, tools, on_text_delta=on_text_delta)
 
-            if response.get("error"):
-                return f"[LLM error] {response['error']}"
+                if response.get("error"):
+                    reply = f"[LLM error] {response['error']}"
+                    break
 
-            message = response.get("message", {})
-            tool_calls = message.get("tool_calls") or []
+                message = response.get("message", {})
+                tool_calls = message.get("tool_calls") or []
 
-            if not tool_calls:
-                # Final text response
-                text = message.get("content") or ""
-                reload_warning = self._auto_reload_modified_files(state, on_tool_call)
-                if reload_warning:
-                    text = (
-                        f"{text}\n\n[Framework warning] {reload_warning}"
-                        if text
-                        else f"[Framework warning] {reload_warning}"
+                if not tool_calls:
+                    # Final text response
+                    reply = message.get("content") or ""
+                    is_final_text = True
+                    break
+
+                # Execute tool calls
+                # Save message, preserving thinking content for DeepSeek models
+                msg_to_save = {"role": "assistant"}
+                if message.get("content"):
+                    msg_to_save["content"] = message["content"]
+                if message.get("reasoning_content"):
+                    msg_to_save["reasoning_content"] = message["reasoning_content"]
+                if message.get("tool_calls"):
+                    msg_to_save["tool_calls"] = message["tool_calls"]
+                self._history.append(msg_to_save)
+                tool_results = []
+                for tc in tool_calls:
+                    name = tc["function"]["name"]
+                    try:
+                        args = json.loads(tc["function"].get("arguments", "{}"))
+                    except json.JSONDecodeError:
+                        args = {}
+
+                    result = self._execute_tool_with_policy(name, args, state, on_tool_call)
+
+                    tool_results.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tc["id"],
+                            "content": json.dumps(result),
+                        }
                     )
-                self._history.append({"role": "assistant", "content": text})
-                return text
 
-            # Execute tool calls
-            # Save message, preserving thinking content for DeepSeek models
-            msg_to_save = {"role": "assistant"}
-            if message.get("content"):
-                msg_to_save["content"] = message["content"]
-            if message.get("reasoning_content"):
-                msg_to_save["reasoning_content"] = message["reasoning_content"]
-            if message.get("tool_calls"):
-                msg_to_save["tool_calls"] = message["tool_calls"]
-            self._history.append(msg_to_save)
-            tool_results = []
-            for tc in tool_calls:
-                name = tc["function"]["name"]
-                try:
-                    args = json.loads(tc["function"].get("arguments", "{}"))
-                except json.JSONDecodeError:
-                    args = {}
-
-                result = self._execute_tool_with_policy(name, args, state, on_tool_call)
-
-                tool_results.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tc["id"],
-                        "content": json.dumps(result),
-                    }
+                self._history.extend(tool_results)
+            else:
+                reply = (
+                    "[Error] Maximum tool-call iterations reached. Please try a simpler request."
+                )
+        finally:
+            # Single shared flush for every exit path (final reply, LLM error,
+            # iteration cap, or an escaping exception): keep the KiCad reload in
+            # sync with the UI refresh display even when tools or the LLM failed.
+            # Wrapped so a reload failure can never mask the turn's own result.
+            try:
+                reload_warning = self._auto_reload_modified_files(state, on_tool_call)
+            except Exception as e:
+                log.warning("Auto-reload at end of turn failed: %s", e)
+                reload_warning = None
+            if reload_warning and reply is not None:
+                reply = (
+                    f"{reply}\n\n[Framework warning] {reload_warning}"
+                    if reply
+                    else f"[Framework warning] {reload_warning}"
                 )
 
-            self._history.extend(tool_results)
-
-        return "[Error] Maximum tool-call iterations reached. Please try a simpler request."
+        if is_final_text:
+            self._history.append({"role": "assistant", "content": reply})
+        return reply if reply is not None else "[Error] Unknown failure."
 
     @staticmethod
     def _build_user_content(
@@ -1662,19 +1988,14 @@ class LLMClient:
                 if _NO_HTTPS_MARKER not in str(e.reason):
                     return {"error": f"HTTPS request failed: {e}"}
                 _in_process_ssl = False
-                # Fall through to non-streaming fallback below.
+                # Fall through to subprocess streaming below.
             except Exception as e:
                 return {"error": f"Streaming request failed: {e}"}
 
-        # In-process SSL unavailable: fall back to non-streaming via subprocess.
-        result = self._call_openai(system, tools)
-        content = result.get("message", {}).get("content", "")
-        if content:
-            try:
-                on_text_delta(content)
-            except Exception as e:
-                log.debug("Non-streaming callback error: %s", e)
-        return result
+        # In-process SSL unavailable: stream via the plugin-venv Python subprocess.
+        return _subprocess_sse_stream(
+            url, headers, payload, timeout=300, fmt="openai", on_text_delta=on_text_delta
+        )
 
     def _ollama_messages(self) -> list[dict[str, Any]]:
         """Convert self._history to Ollama /api/chat message format.
@@ -1937,19 +2258,14 @@ class LLMClient:
                 if _NO_HTTPS_MARKER not in str(e.reason):
                     return {"error": f"HTTPS request failed: {e}"}
                 _in_process_ssl = False
-                # Fall through to non-streaming fallback below.
+                # Fall through to subprocess streaming below.
             except Exception as e:
                 return {"error": f"Streaming request failed: {e}"}
 
-        # In-process SSL unavailable: fall back to non-streaming via subprocess.
-        result = self._call_anthropic(system, tools)
-        content = result.get("message", {}).get("content", "")
-        if content:
-            try:
-                on_text_delta(content)
-            except Exception as e:
-                log.debug("Non-streaming callback error: %s", e)
-        return result
+        # In-process SSL unavailable: stream via the plugin-venv Python subprocess.
+        return _subprocess_sse_stream(
+            url, headers, encoded, timeout=300, fmt="anthropic", on_text_delta=on_text_delta
+        )
 
     def _call_openai(self, system: str, tools: list[dict]) -> dict[str, Any]:
         base = (self._settings.llm_base_url or "https://api.openai.com").rstrip("/")
@@ -1976,7 +2292,7 @@ class LLMClient:
             "Authorization": f"Bearer {self._settings.llm_api_key}",
         }
         try:
-            status, text = _https_post_json(url, headers, payload, timeout=60)
+            status, text = _https_post_json(url, headers, payload, timeout=300)
         except RuntimeError as e:
             return {"error": str(e)}
 
@@ -2019,7 +2335,7 @@ class LLMClient:
         headers = {"Content-Type": "application/json"}
 
         try:
-            status, text = _https_post_json(url, headers, payload, timeout=60)
+            status, text = _https_post_json(url, headers, payload, timeout=300)
         except RuntimeError as e:
             return {"error": str(e)}
 
@@ -2079,7 +2395,7 @@ class LLMClient:
             "anthropic-version": "2023-06-01",
         }
         try:
-            status, text = _https_post_json(url, headers, encoded, timeout=60)
+            status, text = _https_post_json(url, headers, encoded, timeout=300)
         except RuntimeError as e:
             return {"error": str(e)}
 

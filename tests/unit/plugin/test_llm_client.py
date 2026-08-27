@@ -1,11 +1,57 @@
 """Tests for LLMClient history management (dedup + compaction)."""
 
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import os
+import sys
+import threading
 import types
 from unittest.mock import MagicMock, patch
 
-from kicad_plugin.llm_client import LLMClient
+import pytest
+
+from kicad_plugin.llm_client import LLMClient, _subprocess_sse_stream
 from kicad_plugin.tool_registry import TOOL_POLICIES
+
+
+class _SSETestServer(ThreadingHTTPServer):
+    """Threaded localhost server that answers POST with an SSE body."""
+
+    def __init__(self, lines, status=200, body=b""):
+        self._lines = lines
+        self._status = status
+        self._body = body
+        super().__init__(("127.0.0.1", 0), self._make_handler(), bind_and_activate=True)
+        self._thread = threading.Thread(target=self.serve_forever, daemon=True)
+        self._thread.start()
+
+    def _make_handler(self):
+        server = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.send_response(server._status)
+                if server._status == 200:
+                    payload = "".join(line + "\n" for line in server._lines)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.send_header("Content-Length", str(len(payload.encode())))
+                    self.end_headers()
+                    self.wfile.write(payload.encode())
+                    self.wfile.flush()
+                else:
+                    self.send_header("Content-Type", "text/plain")
+                    self.send_header("Content-Length", str(len(server._body)))
+                    self.end_headers()
+                    self.wfile.write(server._body)
+
+            def log_message(self, *args):  # silence test-server noise
+                pass
+
+        return Handler
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self.server_port}"
 
 
 def _make_client(
@@ -42,6 +88,21 @@ def _tool(tool_call_id="tc1", content="result"):
 # ---------------------------------------------------------------------------
 # _dedup_tool_calls unit tests
 # ---------------------------------------------------------------------------
+
+
+class TestSetBaseUrl:
+    def test_updates_url_after_construction(self):
+        client = _make_client()
+        assert client._mcp_base_url == "http://127.0.0.1:9999"
+        client.set_base_url("http://127.0.0.1:5555")
+        assert client._mcp_base_url == "http://127.0.0.1:5555"
+
+    def test_none_then_real_url(self):
+        client = _make_client()
+        # Client constructed before the backend is up sees base URL None.
+        client.set_base_url(None)
+        client.set_base_url("http://127.0.0.1:1234")
+        assert client._mcp_base_url == "http://127.0.0.1:1234"
 
 
 class TestDedupToolCalls:
@@ -459,6 +520,201 @@ class TestRunIntegration:
             "reload_kicad",
         ]
 
+    def test_failed_mutation_still_reloads_dirty_path_at_turn_end(self):
+        """A failed PCB mutation still marks the path dirty so reload_kicad
+        runs at turn end, keeping the UI refresh consistent with the action."""
+        client = _make_client()
+        tool_response = {
+            "finish_reason": "tool_calls",
+            "message": {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tc1",
+                        "type": "function",
+                        "function": {
+                            "name": "pcb_route_pad_to_pad",
+                            "arguments": json.dumps(
+                                {"pcb_path": "/tmp/board.kicad_pcb", "pad1": "A1", "pad2": "B2"}
+                            ),
+                        },
+                    }
+                ],
+            },
+        }
+        final_response = {"finish_reason": "stop", "message": {"content": "done"}}
+        client._call_llm = MagicMock(side_effect=[tool_response, final_response])
+        client._fetch_tool_definitions = MagicMock(
+            return_value=[{"function": {"name": "pcb_route_pad_to_pad"}}]
+        )
+        on_tool_call = MagicMock()
+
+        with patch("kicad_plugin.llm_client.call_mcp_tool") as mock_call_tool:
+            mock_call_tool.side_effect = [
+                {"success": True},  # save_document
+                {"success": True, "version_id": "v1"},
+                {"success": False, "error": "routing failed"},  # pcb_route_pad_to_pad fails
+                {"success": True, "reloaded": ["/tmp/board.kicad_pcb"], "failed": []},
+            ]
+            result = client.run("route A1 to B2", context_block="", on_tool_call=on_tool_call)
+
+        assert result == "done"
+        assert mock_call_tool.call_args_list == [
+            ((client._mcp_base_url, "save_document", {"file_path": "/tmp/board.kicad_pcb"}),),
+            ((client._mcp_base_url, "save_file_version", {"file_path": "/tmp/board.kicad_pcb"}),),
+            (
+                (
+                    client._mcp_base_url,
+                    "pcb_route_pad_to_pad",
+                    {"pcb_path": "/tmp/board.kicad_pcb", "pad1": "A1", "pad2": "B2"},
+                ),
+            ),
+            ((client._mcp_base_url, "reload_kicad", {"paths": ["/tmp/board.kicad_pcb"]}),),
+        ]
+        assert [call.args[0] for call in on_tool_call.call_args_list] == [
+            "save_document",
+            "save_file_version",
+            "pcb_route_pad_to_pad",
+            "reload_kicad",
+        ]
+
+    def test_llm_error_after_mutation_still_reloads_dirty_path(self):
+        """An [LLM error] exit still flushes dirty paths via the shared
+        end-of-turn reload, matching the UI refresh display."""
+        client = _make_client()
+        tool_response = {
+            "finish_reason": "tool_calls",
+            "message": {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tc1",
+                        "type": "function",
+                        "function": {
+                            "name": "set_footprint_position",
+                            "arguments": json.dumps(
+                                {"pcb_path": "/tmp/board.kicad_pcb", "reference": "R1", "x": 1.0}
+                            ),
+                        },
+                    }
+                ],
+            },
+        }
+        client._call_llm = MagicMock(side_effect=[tool_response, {"error": "API down"}])
+        client._fetch_tool_definitions = MagicMock(
+            return_value=[{"function": {"name": "set_footprint_position"}}]
+        )
+
+        with patch("kicad_plugin.llm_client.call_mcp_tool") as mock_call_tool:
+            mock_call_tool.side_effect = [
+                {"success": True},  # save_document
+                {"success": True, "version_id": "v1"},
+                {"success": True, "pcb_path": "/tmp/board.kicad_pcb"},
+                {"success": True, "reloaded": ["/tmp/board.kicad_pcb"], "failed": []},
+            ]
+            result = client.run("move R1", context_block="")
+
+        assert result == "[LLM error] API down"
+        assert mock_call_tool.call_args_list[-1] == (
+            (client._mcp_base_url, "reload_kicad", {"paths": ["/tmp/board.kicad_pcb"]}),
+        )
+
+    def test_max_iterations_exit_still_reloads_dirty_path(self):
+        """Hitting the iteration cap still flushes dirty paths via the shared
+        end-of-turn reload."""
+        client = _make_client()
+        tool_response = {
+            "finish_reason": "tool_calls",
+            "message": {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tc-loop",
+                        "type": "function",
+                        "function": {
+                            "name": "set_footprint_position",
+                            "arguments": json.dumps(
+                                {"pcb_path": "/tmp/board.kicad_pcb", "reference": "R1", "x": 1.0}
+                            ),
+                        },
+                    }
+                ],
+            },
+        }
+        client._call_llm = MagicMock(return_value=tool_response)  # never stops calling tools
+        client._fetch_tool_definitions = MagicMock(
+            return_value=[{"function": {"name": "set_footprint_position"}}]
+        )
+
+        with patch("kicad_plugin.llm_client.call_mcp_tool") as mock_call_tool:
+            mock_call_tool.side_effect = lambda base, name, args: (
+                {"success": True, "reloaded": ["/tmp/board.kicad_pcb"], "failed": []}
+                if name == "reload_kicad"
+                else {"success": True}
+            )
+            result = client.run("move R1", context_block="")
+
+        assert (
+            result == "[Error] Maximum tool-call iterations reached. Please try a simpler request."
+        )
+        assert mock_call_tool.call_args_list[-1][0][1] == "reload_kicad"
+        assert mock_call_tool.call_args_list[-1][0][2] == {"paths": ["/tmp/board.kicad_pcb"]}
+
+    def test_tool_exception_still_reloads_dirty_path(self):
+        """An exception escaping run() still flushes dirty paths from earlier
+        successful mutations in the same turn."""
+        client = _make_client()
+        tool_response = {
+            "finish_reason": "tool_calls",
+            "message": {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tc1",
+                        "type": "function",
+                        "function": {
+                            "name": "set_footprint_position",
+                            "arguments": json.dumps(
+                                {"pcb_path": "/tmp/board.kicad_pcb", "reference": "R1", "x": 1.0}
+                            ),
+                        },
+                    },
+                    {
+                        "id": "tc2",
+                        "type": "function",
+                        "function": {
+                            "name": "flip_footprint",
+                            "arguments": json.dumps(
+                                {"pcb_path": "/tmp/board.kicad_pcb", "reference": "R2"}
+                            ),
+                        },
+                    },
+                ],
+            },
+        }
+        client._call_llm = MagicMock(side_effect=[tool_response])
+        client._fetch_tool_definitions = MagicMock(
+            return_value=[
+                {"function": {"name": "set_footprint_position"}},
+                {"function": {"name": "flip_footprint"}},
+            ]
+        )
+
+        with patch("kicad_plugin.llm_client.call_mcp_tool") as mock_call_tool:
+            mock_call_tool.side_effect = [
+                {"success": True},  # save_document (snapshot for set_footprint_position)
+                {"success": True, "version_id": "v1"},
+                {"success": True, "pcb_path": "/tmp/board.kicad_pcb"},
+                # flip_footprint reuses the same-turn snapshot (no save calls)
+                RuntimeError("boom"),  # flip_footprint raises
+                {"success": True, "reloaded": ["/tmp/board.kicad_pcb"], "failed": []},
+            ]
+            with pytest.raises(RuntimeError, match="boom"):
+                client.run("edit board", context_block="")
+
+        assert mock_call_tool.call_args_list[-1][0][1] == "reload_kicad"
+        assert mock_call_tool.call_args_list[-1][0][2] == {"paths": ["/tmp/board.kicad_pcb"]}
+
     def test_framework_snapshots_each_file_once_per_turn(self):
         client = _make_client()
         tool_response = {
@@ -783,15 +1039,15 @@ class TestStreaming:
         assert args == {"path": "sch.kicad_sch"}
         assert result["finish_reason"] == "tool_calls"
 
-    def test_stream_openai_ssl_fallback(self):
+    def test_stream_openai_ssl_fallback_streams_via_subprocess(self):
         import urllib.error
 
         client = _make_client()
         chunks = []
 
-        fallback_result = {
+        subprocess_result = {
             "finish_reason": "stop",
-            "message": {"content": "Fallback text", "tool_calls": []},
+            "message": {"content": "Relayed text", "tool_calls": []},
         }
 
         with (
@@ -799,13 +1055,50 @@ class TestStreaming:
                 "urllib.request.urlopen",
                 side_effect=urllib.error.URLError("unknown url type: https"),
             ),
-            patch.object(client, "_call_openai", return_value=fallback_result) as mock_call,
+            patch("kicad_plugin.llm_client._in_process_ssl", None),
+            patch(
+                "kicad_plugin.llm_client._subprocess_sse_stream",
+                return_value=subprocess_result,
+            ) as mock_stream,
         ):
             result = client._stream_openai("sys", [], on_text_delta=chunks.append)
 
-        mock_call.assert_called_once()
-        assert chunks == ["Fallback text"]
-        assert result["message"]["content"] == "Fallback text"
+        mock_stream.assert_called_once()
+        call_kwargs = mock_stream.call_args.kwargs
+        assert call_kwargs["fmt"] == "openai"
+        assert call_kwargs["timeout"] == 300
+        assert result["message"]["content"] == "Relayed text"
+
+    def test_stream_anthropic_ssl_fallback_streams_via_subprocess(self):
+        import urllib.error
+
+        client = _make_client()
+        client._settings.llm_provider = "anthropic"
+        chunks = []
+
+        subprocess_result = {
+            "finish_reason": "tool_calls",
+            "message": {"content": "", "tool_calls": [{"id": "tu1"}]},
+        }
+
+        with (
+            patch(
+                "urllib.request.urlopen",
+                side_effect=urllib.error.URLError("unknown url type: https"),
+            ),
+            patch("kicad_plugin.llm_client._in_process_ssl", None),
+            patch(
+                "kicad_plugin.llm_client._subprocess_sse_stream",
+                return_value=subprocess_result,
+            ) as mock_stream,
+        ):
+            result = client._stream_anthropic("sys", [], on_text_delta=chunks.append)
+
+        mock_stream.assert_called_once()
+        call_kwargs = mock_stream.call_args.kwargs
+        assert call_kwargs["fmt"] == "anthropic"
+        assert call_kwargs["timeout"] == 300
+        assert result["message"]["tool_calls"] == [{"id": "tu1"}]
 
     def test_run_passes_on_text_delta_to_call_llm(self):
         client = _make_client()
@@ -823,6 +1116,150 @@ class TestStreaming:
         # _call_llm must have been called with on_text_delta=on_delta
         call_kwargs = client._call_llm.call_args
         assert call_kwargs.kwargs.get("on_text_delta") is on_delta
+
+
+class TestSubprocessSSEStream:
+    """End-to-end relay: _subprocess_sse_stream runs a real subprocess Python
+    against a local HTTP server speaking SSE, verifying deltas, aggregation,
+    and error surfacing across the pipe protocol."""
+
+    def _relay(self, lines, status=200, body=b"", fmt="openai"):
+        server = _SSETestServer(lines, status=status, body=body)
+        chunks = []
+        try:
+            with (
+                patch(
+                    "kicad_plugin.llm_client._resolve_plugin_python",
+                    return_value=sys.executable,
+                ),
+                # Keep proxy env vars out of the subprocess so it reaches 127.0.0.1 directly.
+                patch(
+                    "kicad_plugin.llm_client._subprocess_env",
+                    return_value={"PATH": os.environ.get("PATH", "")},
+                ),
+            ):
+                result = _subprocess_sse_stream(
+                    url=server.url,
+                    headers={"Content-Type": "application/json"},
+                    payload=b'{"model":"t","stream":true}',
+                    timeout=30,
+                    fmt=fmt,
+                    on_text_delta=chunks.append,
+                )
+        finally:
+            server.shutdown()
+        return result, chunks
+
+    def test_openai_text_deltas_and_aggregation(self):
+        lines = [
+            'data: {"choices":[{"delta":{"content":"Hello"},"finish_reason":null}]}',
+            'data: {"choices":[{"delta":{"content":" world"},"finish_reason":null}]}',
+            'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}',
+            "data: [DONE]",
+        ]
+        result, chunks = self._relay(lines, fmt="openai")
+
+        assert "error" not in result
+        assert chunks == ["Hello", " world"]
+        assert result["message"]["content"] == "Hello world"
+        assert result["finish_reason"] == "stop"
+
+    def test_openai_tool_calls_and_reasoning_aggregated(self):
+        lines = [
+            'data: {"choices":[{"delta":{"reasoning_content":"think "},"finish_reason":null}]}',
+            'data: {"choices":[{"delta":{"reasoning_content":"hard"},"finish_reason":null}]}',
+            'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"tc1","function":{"name":"add_wire","arguments":""}}]},"finish_reason":null}]}',
+            'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\"x\\":1}"}}]},"finish_reason":"tool_calls"}]}',
+            "data: [DONE]",
+        ]
+        result, chunks = self._relay(lines, fmt="openai")
+
+        assert "error" not in result
+        assert chunks == []
+        tc = result["message"]["tool_calls"]
+        assert len(tc) == 1
+        assert tc[0]["id"] == "tc1"
+        assert tc[0]["function"]["name"] == "add_wire"
+        assert tc[0]["function"]["arguments"] == '{"x":1}'
+        assert result["message"]["reasoning_content"] == "think hard"
+        assert result["finish_reason"] == "tool_calls"
+
+    def test_anthropic_text_and_tool_use(self):
+        lines = [
+            "event: content_block_start",
+            'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+            "",
+            "event: content_block_delta",
+            'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}',
+            "",
+            "event: content_block_start",
+            'data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"tu1","name":"get_netlist","input":{}}}',
+            "",
+            "event: content_block_delta",
+            'data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\\"path\\":"}}',
+            "",
+            "event: content_block_delta",
+            'data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"\\"sch.kicad_sch\\"}"}}',
+            "",
+            "event: message_delta",
+            'data: {"type":"message_delta","delta":{"stop_reason":"tool_use"}}',
+        ]
+        result, chunks = self._relay(lines, fmt="anthropic")
+
+        assert "error" not in result
+        assert chunks == ["Hello"]
+        assert result["message"]["content"] == "Hello"
+        tc = result["message"]["tool_calls"]
+        assert len(tc) == 1
+        assert tc[0]["id"] == "tu1"
+        assert tc[0]["function"]["name"] == "get_netlist"
+        args = json.loads(tc[0]["function"]["arguments"])
+        assert args == {"path": "sch.kicad_sch"}
+        assert result["finish_reason"] == "tool_calls"
+
+    def test_http_error_surfaces_status_and_body(self):
+        result, chunks = self._relay([], status=429, body=b"rate limited", fmt="openai")
+
+        assert chunks == []
+        assert result["error"] == "HTTP 429: rate limited"
+
+    def test_delta_callback_error_does_not_abort_stream(self):
+        lines = [
+            'data: {"choices":[{"delta":{"content":"Hello"},"finish_reason":null}]}',
+            'data: {"choices":[{"delta":{"content":" world"},"finish_reason":"stop"}]}',
+            "data: [DONE]",
+        ]
+        server = _SSETestServer(lines)
+        seen = []
+
+        def boom(chunk):
+            seen.append(chunk)
+            raise ValueError("ui hiccup")
+
+        try:
+            with (
+                patch(
+                    "kicad_plugin.llm_client._resolve_plugin_python",
+                    return_value=sys.executable,
+                ),
+                patch(
+                    "kicad_plugin.llm_client._subprocess_env",
+                    return_value={"PATH": os.environ.get("PATH", "")},
+                ),
+            ):
+                result = _subprocess_sse_stream(
+                    url=server.url,
+                    headers={"Content-Type": "application/json"},
+                    payload=b"{}",
+                    timeout=30,
+                    fmt="openai",
+                    on_text_delta=boom,
+                )
+        finally:
+            server.shutdown()
+
+        assert seen == ["Hello", " world"]
+        assert result["message"]["content"] == "Hello world"
 
 
 # ---------------------------------------------------------------------------

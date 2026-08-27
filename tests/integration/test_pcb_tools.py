@@ -296,6 +296,14 @@ class TestGetFootprint:
         )
         assert "error" in result
 
+    def test_includes_edge_cuts_field(self, mcp_server):
+        """get_footprint response carries an edge_cuts list over JSON-RPC."""
+        port, sid = mcp_server
+        result = _call_tool(
+            port, sid, "get_footprint", {"pcb_path": BOARD_FIXTURE, "reference": "R1"}
+        )
+        assert isinstance(result.get("edge_cuts"), list)
+
 
 class TestListNets:
     def test_excludes_net_zero(self, mcp_server):
