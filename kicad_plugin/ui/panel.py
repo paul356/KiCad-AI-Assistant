@@ -91,6 +91,9 @@ if _WX_AVAILABLE:
             self._server_mgr = server_mgr
             self._settings = settings
             self._llm_client: Any | None = None
+            # True once the MCP backend reported a successful start; the LLM
+            # client is only created when this and panel display both hold.
+            self._server_ready: bool = False
             self._busy = False
             # threading.Event for cancelling an in-progress LLM turn
             self._cancel_event: threading.Event | None = None
@@ -148,6 +151,15 @@ if _WX_AVAILABLE:
             # glitch on Windows), reset _page_loading so renders are not
             # permanently blocked.
             self._page_watchdog = wx.Timer(self)
+            # Project-scoped session watch: tracks the open KiCad project so
+            # switching projects can re-offer that project's saved sessions
+            # (same flow as startup auto-restore). Started by _init_llm_client.
+            self._active_project: str | None = None
+            # Project-switch confirmation: first differing reading is held
+            # here and only acted on when the next tick agrees.
+            self._watch_candidate: str | None = None
+            self._watch_candidate_seen: bool = False
+            self._project_watch_timer = wx.Timer(self)
 
             self._build_ui()
             self._start_server()
@@ -396,6 +408,9 @@ if _WX_AVAILABLE:
                 style=wx.BU_EXACTFIT | wx.BORDER_NONE,
             )
             self._send_btn.SetToolTip("Send message (Enter)")
+            # Backend not ready until _on_server_started(True); the button is
+            # enabled there, not clickable while the backend is down.
+            self._send_btn.Disable()
             side_vbox.Add(self._send_btn, 0, wx.ALIGN_CENTER_HORIZONTAL)
 
             hbox.Add(side_vbox, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 4)
@@ -483,6 +498,8 @@ if _WX_AVAILABLE:
             # glitch on Windows), reset _page_loading so renders are not
             # permanently blocked.
             self.Bind(wx.EVT_TIMER, self._on_page_watchdog, self._page_watchdog)
+            self.Bind(wx.EVT_TIMER, self._on_project_watch_tick, self._project_watch_timer)
+            self.Bind(wx.EVT_SHOW, self._on_panel_show)
 
         # ------------------------------------------------------------------ #
         # Server lifecycle
@@ -501,14 +518,21 @@ if _WX_AVAILABLE:
                 if ok:
                     self._set_status("✅ Backend ready", self._C_OK)
                     self.GetMenuBar().Enable(self._menu_autoroute_id, True)
-                    self._init_llm_client()
                     self._check_kicad_ipc_environment()
                     self._auto_save_pcb_on_open()
+                    self._server_ready = True
+                    # The client captures the backend base URL at
+                    # construction; if it was created before the backend was
+                    # up (panel shown early), inject the URL now.
+                    if self._llm_client is not None:
+                        self._llm_client.set_base_url(self._server_mgr.base_url)
                 else:
+                    self._server_ready = False
                     self._set_status(
                         "❌ Backend failed to start — use Server → Restart Backend to retry",
                         self._C_ERR,
                     )
+                self._sync_send_button_state()
                 self.Layout()
             except Exception as e:
                 import traceback
@@ -521,10 +545,24 @@ if _WX_AVAILABLE:
 
                 self._llm_client = LLMClient(self._settings, self._server_mgr.base_url)
                 self._autoload_session()
+                self._start_project_watch()
             except Exception as e:
                 import traceback
 
                 log.error("_init_llm_client failed: %s\n%s", e, traceback.format_exc())
+
+        def _on_panel_show(self, event) -> None:
+            """Initialise the LLM client (and restore the session) on display.
+
+            Deferred from plugin registration so restore/prompt only happens
+            while the user looks at the panel.  The backend base URL is
+            injected later by _on_server_started once the backend is up, so
+            an early panel display is safe.  An already-initialised client
+            (e.g. after a backend Restart) is left untouched.
+            """
+            if event.IsShown() and self._llm_client is None:
+                self._init_llm_client()
+            event.Skip()
 
         # ------------------------------------------------------------------ #
         # KiCad IPC API status check
@@ -678,6 +716,9 @@ if _WX_AVAILABLE:
                     self._llm_client is not None,
                 )
                 return
+            if not self._server_ready:
+                log.debug("_on_send: skipped (backend not ready)")
+                return
             text = self._input.GetValue().strip()
             images = self._encode_attached_images()
             pdfs = [p for p, t in self._attached_files if t == "pdf"]
@@ -723,12 +764,13 @@ if _WX_AVAILABLE:
             self._attached_files.clear()
             self._refresh_attachments_bar()
             self._follow_output_to_bottom = True
-            # Create the session file on the very first message so current.json
-            # is established before the AI responds.
-            if self._current_session_file is None:
-                err = self._save_session_to_disk()
-                if err:
-                    log.warning("Could not create session file: %s", err)
+            # Persist on every user message: creates the file on the first
+            # message (so current.json exists before the AI responds) and makes
+            # the session durable immediately (also upgrading legacy v1 files
+            # to v2, since the user has now modified the session).
+            err = self._save_session_to_disk()
+            if err:
+                log.warning("Could not save session: %s", err)
             self._render_conversation(force_scroll_to_bottom=True)
             self._busy = True
             self._cancel_event = threading.Event()
@@ -961,6 +1003,13 @@ if _WX_AVAILABLE:
             else:
                 self._send_btn.SetBitmap(self._make_send_bitmap(bg=bg))
                 self._send_btn.SetToolTip("Send message (Enter)")
+
+        def _sync_send_button_state(self) -> None:
+            """Enable the send button unless the backend is not ready.
+
+            A busy button is the Stop button and must stay clickable.
+            """
+            self._send_btn.Enable(self._server_ready or self._busy)
 
         def _on_send_btn(self, event) -> None:
             """Handle send/stop button click depending on current state."""
@@ -1374,6 +1423,12 @@ if _WX_AVAILABLE:
             if self._tool_calls_made:
                 self._auto_refresh(ctx)
             self._follow_output_to_bottom = False
+            # Persist the completed turn so disk always holds the full
+            # conversation, including the streamed AI reply. On-exit autosave
+            # then only refreshes — no data depends on it.
+            err = self._save_session_to_disk()
+            if err:
+                log.warning("Could not save session after reply: %s", err)
 
         def _on_stream_flush(self, event) -> None:
             """Drain the streaming buffer into the pending AI text (main thread, timer-driven)."""
@@ -1591,6 +1646,11 @@ if _WX_AVAILABLE:
             self._busy = False
             self._cancel_event = None
             self._toggle_send_stop(busy=False)
+            # Persist what has been finalised so far — the turn was cancelled
+            # mid-flight and on-exit autosave is best-effort only.
+            err = self._save_session_to_disk()
+            if err:
+                log.warning("Could not save session after stop: %s", err)
 
         def _on_restart(self, event) -> None:
             if self._busy:
@@ -1601,6 +1661,9 @@ if _WX_AVAILABLE:
                 )
                 return
             self._set_status("⏳ Restarting backend…", self._C_WARN)
+            # Messages are blocked while the backend is down.
+            self._server_ready = False
+            self._sync_send_button_state()
             self._conv_entries.append(
                 {
                     "type": "status",
@@ -1626,6 +1689,9 @@ if _WX_AVAILABLE:
                     }
                 )
                 self._render_conversation()
+                # Rebuild the LLM client: the backend may have come back on a
+                # new port, so the old client's base URL is stale.  Session
+                # restore here is lossless — disk holds every completed turn.
                 self._init_llm_client()
                 self._on_server_started(True)
             else:
@@ -2084,9 +2150,6 @@ if _WX_AVAILABLE:
         # Session persistence
         # ------------------------------------------------------------------ #
 
-        def _sessions_dir(self) -> str:
-            return os.path.join(self._settings.config_dir, "kicad_ai_sessions")
-
         def _on_new_session(self, event) -> None:
             """Save the current session (if non-empty) then clear to start a new one."""
             if self._busy:
@@ -2115,7 +2178,9 @@ if _WX_AVAILABLE:
                 self._llm_client.reset()
 
             # Remove current.json so a blank close won't restore the old session.
-            self._remove_current_link()
+            from .. import session_store as _sstore
+
+            _sstore.remove_current_link(self._settings.config_dir)
 
             self._set_status(
                 "✅ New session started" + (" (previous session saved)" if has_content else ""),
@@ -2123,17 +2188,12 @@ if _WX_AVAILABLE:
             )
             self.Layout()
 
-        def _remove_current_link(self) -> None:
-            """Remove current.json (both symlink and plain-text variants)."""
-            link = os.path.join(self._sessions_dir(), "current.json")
-            try:
-                if os.path.lexists(link):  # lexists catches dangling symlinks too
-                    os.remove(link)
-            except OSError as e:
-                log.warning("Could not remove current.json: %s", e)
-
         def _save_session_to_disk(self) -> str | None:
             """Write current conv_entries + history to disk and update current.json.
+
+            Sessions are stamped with the currently open KiCad project
+            (schema v2), so a session never silently leaks into a different
+            project.  The stamp reflects the project active at save time.
 
             If ``_current_session_file`` is already set the existing file is
             overwritten; otherwise a new timestamped file is created and
@@ -2141,65 +2201,31 @@ if _WX_AVAILABLE:
 
             Returns an error string on failure, None on success.
             """
-            import datetime
-            import json as _json
+            from .. import session_store as _sstore
 
-            sessions_dir = self._sessions_dir()
-            try:
-                os.makedirs(sessions_dir, exist_ok=True)
-            except OSError as e:
-                return str(e)
-
-            title = next(
-                (e["text"][:60] for e in self._conv_entries if e["type"] == "user"),
-                "session",
-            )
             if self._current_session_file:
                 filename = self._current_session_file
             else:
                 ts = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
                 filename = f"session_{ts}.json"
                 self._current_session_file = filename
-            path = os.path.join(sessions_dir, filename)
-            data = {
-                "version": 1,
-                "title": title,
-                "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
-                "conv_entries": self._conv_entries,
-                "llm_history": (
+            payload = _sstore.make_payload(
+                self._conv_entries,
+                (
                     _strip_images_from_history(self._llm_client.get_history())
                     if self._llm_client
                     else []
                 ),
-            }
-            try:
-                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-                with os.fdopen(fd, "w", encoding="utf-8") as f:
-                    _json.dump(data, f, indent=2, default=str)
-            except OSError as e:
-                return str(e)
-
-            self._update_current_link(filename)
+                self._collect_active_project(),
+            )
+            err = _sstore.save_session(self._settings.config_dir, filename, payload)
+            if err:
+                return err
+            _sstore.update_current_link(self._settings.config_dir, filename)
             return None
 
-        def _update_current_link(self, filename: str) -> None:
-            """Atomically update current.json to point at *filename* (basename)."""
-            sessions_dir = self._sessions_dir()
-            link = os.path.join(sessions_dir, "current.json")
-            tmp_link = link + ".tmp"
-            try:
-                os.symlink(filename, tmp_link)
-                os.replace(tmp_link, link)
-            except Exception:
-                try:
-                    with open(link, "w", encoding="utf-8") as lf:
-                        lf.write(filename)
-                except Exception as e:
-                    log.debug("Could not write session file link: %s", e)
-
         def _on_load_session(self, event) -> None:
-            import glob
-            import json as _json
+            from .. import session_store as _sstore
 
             if self._busy:
                 wx.MessageBox(
@@ -2209,28 +2235,28 @@ if _WX_AVAILABLE:
                 )
                 return
 
-            sessions_dir = self._sessions_dir()
-            files = sorted(
-                glob.glob(os.path.join(sessions_dir, "session_*.json")),
-                reverse=True,
+            files = _sstore.list_loadable_sessions(
+                self._settings.config_dir, self._collect_active_project()
             )
             if not files:
                 wx.MessageBox(
-                    "No saved sessions found.", "Load Session", wx.OK | wx.ICON_INFORMATION
+                    "No saved sessions found for the current project.",
+                    "Load Session",
+                    wx.OK | wx.ICON_INFORMATION,
                 )
                 return
 
             # Build display labels
             labels = []
             for f in files:
-                try:
-                    with open(f, encoding="utf-8") as fh:
-                        d = _json.load(fh)
-                    ts = d.get("timestamp", "")[:19].replace("T", " ")
-                    title = d.get("title", "")[:50]
-                    labels.append(f"{ts}  —  {title}")
-                except Exception:
+                d, _ = _sstore.load_session(f)
+                if d is None:
                     labels.append(os.path.basename(f))
+                    continue
+                ts = d.get("timestamp", "")[:19].replace("T", " ")
+                title = d.get("title", "")[:50]
+                suffix = "" if d.get("project_path") else "  [no project]"
+                labels.append(f"{ts}  —  {title}{suffix}")
 
             dlg = wx.SingleChoiceDialog(
                 self,
@@ -2243,14 +2269,21 @@ if _WX_AVAILABLE:
                 return
             idx = dlg.GetSelection()
             dlg.Destroy()
+            if 0 <= idx < len(files):
+                self._restore_session_file(files[idx])
 
-            chosen = files[idx]
-            try:
-                with open(chosen, encoding="utf-8") as fh:
-                    data = _json.load(fh)
-            except (OSError, _json.JSONDecodeError) as e:
-                wx.MessageBox(f"Could not load session:\n{e}", "Error", wx.OK | wx.ICON_ERROR)
-                return
+        def _restore_session_file(self, path: str) -> bool:
+            """Load a saved session file into the panel and point current.json at it.
+
+            Returns True on success; shows an error dialog and returns False
+            when the file cannot be loaded.
+            """
+            from .. import session_store as _sstore
+
+            data, err = _sstore.load_session(path)
+            if data is None:
+                wx.MessageBox(f"Could not load session:\n{err}", "Error", wx.OK | wx.ICON_ERROR)
+                return False
 
             # Restore state
             self._stream_timer.Stop()
@@ -2260,11 +2293,147 @@ if _WX_AVAILABLE:
             if self._llm_client:
                 self._llm_client.set_history(data.get("llm_history", []))
             # Track which file is now active; point current.json at it.
-            self._current_session_file = os.path.basename(chosen)
-            self._update_current_link(self._current_session_file)
+            self._current_session_file = os.path.basename(path)
+            _sstore.update_current_link(self._settings.config_dir, self._current_session_file)
+
             self._render_conversation(force_scroll_to_bottom=True)
             self._set_status("✅ Session restored", self._C_OK)
             self.Layout()
+            return True
+
+        def _collect_active_project(self) -> str | None:
+            """Absolute path of the currently open .kicad_pro, or None.
+
+            Primary source: pcbnew.GetBoard() — only non-empty once a board
+            is loaded in the PCB Editor.  Fallback: KiCad top-level window
+            titles, which name the project/board/schematic path even while
+            GetBoard() is still settling (e.g. right after opening a project
+            or when only the project manager is open).
+            """
+            try:
+                from ..context_bridge import collect_context, project_path_from_title
+
+                proj = collect_context().get("active_project")
+                if proj:
+                    return proj
+                for w in wx.GetTopLevelWindows():
+                    title = w.GetTitle()
+                    if not title:
+                        continue
+                    p = project_path_from_title(title)
+                    if p:
+                        log.debug("project from window title %r -> %s", title, p)
+                        return p
+            except Exception:
+                log.debug("_collect_active_project failed", exc_info=True)
+            return None
+
+        def _start_project_watch(self) -> None:
+            """Start polling for KiCad project switches (1 s interval).
+
+            The first snapshot is taken here — after auto-restore — so the
+            watcher only reacts to *later* project changes, never to the
+            project already active at startup.
+            """
+            if not self._project_watch_timer:
+                return
+            self._active_project = self._collect_active_project()
+            self._watch_candidate_seen = False
+            self._project_watch_timer.Start(
+                1000
+            )  # 1 s poll: project switch is noticed quickly once a board signal is available
+
+        def _on_project_watch_tick(self, event) -> None:
+            """Close this panel when the open KiCad project changes.
+
+            The panel binds to the project that was active at startup; when
+            the project switches (or the board/project is closed), this
+            instance is stale.  Tear it down — including its MCP server —
+            instead of lingering; the panel opened in the new project
+            auto-restores the right session on first display.
+
+            The project signal flaps during project load (GetBoard() stays
+            empty until the board is up, and the window-title fallback is
+            equally transient), so a switch is only acted on after two
+            consecutive identical readings.
+            """
+            if self._busy:
+                return
+            project = self._collect_active_project()
+            if project == self._active_project:
+                self._watch_candidate_seen = False
+                return
+            if not self._watch_candidate_seen:
+                # First differing reading: remember it and wait for a second
+                # identical one before acting.
+                self._watch_candidate_seen = True
+                self._watch_candidate = project
+                return
+            if project != self._watch_candidate:
+                # Still flapping between values (project loading in
+                # background): re-arm with the latest reading.
+                self._watch_candidate = project
+                return
+            log.info(
+                "Project switch confirmed: %s -> %s; switching session",
+                self._active_project,
+                project,
+            )
+            self._active_project = project
+            self._watch_candidate_seen = False
+            # Keep this panel open and re-run the startup restore flow for
+            # the new project: matching current.json is restored in place,
+            # otherwise the new project's sessions are offered.  Never
+            # Destroy() the window — on a top-level wx.Frame that behaves as
+            # a forced Close and cascaded into closing KiCad's project
+            # windows.
+            self._autoload_session()
+
+        def _prompt_project_session_choice(self, project_path: str | None) -> None:
+            """Offer the open project's saved sessions after a skip.
+
+            Invoked when current.json cannot be auto-restored for the open
+            project — callers (auto-restore, project switch) check that first.
+            Candidates are the sessions stamped with *project_path*; a single
+            candidate is restored directly (a one-option dialog adds no
+            information), and the user may cancel a multi-candidate picker to
+            start blank.
+            """
+            from .. import session_store as _sstore
+
+            if not project_path:
+                return
+            candidates = _sstore.list_project_sessions(self._settings.config_dir, project_path)
+            log.info("Session picker for %s: %d candidate(s)", project_path, len(candidates))
+            if not candidates:
+                return
+            if len(candidates) == 1:
+                self._restore_session_file(candidates[0])
+                return
+
+            labels = []
+            for f in candidates:
+                d, _ = _sstore.load_session(f)
+                if d is None:
+                    labels.append(os.path.basename(f))
+                    continue
+                ts = d.get("timestamp", "")[:19].replace("T", " ")
+                title = d.get("title", "")[:50]
+                labels.append(f"{ts}  —  {title}")
+
+            dlg = wx.SingleChoiceDialog(
+                self,
+                "Saved sessions for this project found — restore one?",
+                "Restore Session",
+                labels,
+            )
+            if dlg.ShowModal() != wx.ID_OK:
+                dlg.Destroy()
+                return
+            idx = dlg.GetSelection()
+            dlg.Destroy()
+            if 0 <= idx < len(candidates):
+                self._restore_session_file(candidates[idx])
 
         def _on_clear(self, event) -> None:
             if self._busy:
@@ -2283,94 +2452,87 @@ if _WX_AVAILABLE:
                 self._llm_client.reset()
 
         def _on_close(self, event) -> None:
-            if event.CanVeto():
-                # User closed the plugin panel – hide it so the backend stays
-                # warm and KiCad is unaffected. The suicide watchdog timer
-                # (_on_suicide_check) will force-close us when KiCad itself
-                # exits, triggering the real teardown path below.
-                event.Veto()
-                self.Hide()
-                return
-            # Force-close (e.g. from _on_suicide_check when KiCad has exited)
-            # – tear down completely.
-            self._autosave_session()
+            """Panel close (user clicks X, or watchdog force-close): tear down
+            completely.
+
+            Every user message, AI reply and cancellation is persisted as it
+            happens, so closing loses nothing — the next open restores the
+            session from disk.  The panel is never merely hidden: a hidden
+            panel would keep its timers and MCP server running in the
+            background.  Either the panel stays usable (project switch keeps
+            it open and swaps the session) or it is destroyed — no
+            half-alive state.
+            """
+            if self._busy and self._cancel_event is not None:
+                # An in-flight turn ends with the panel: ask it to stop
+                # writing before we tear down.
+                self._cancel_event.set()
             self._server_mgr.stop()
             self.Destroy()
 
         def _on_suicide_check(self, event) -> None:
-            """Periodically check if KiCad is gone. If we are the only
-            visible top-level wx window left, KiCad's main window must
-            have been closed without sending us EVT_CLOSE — so close
-            ourselves now."""
-            others = [w for w in wx.GetTopLevelWindows() if w is not self and w.IsShown()]
+            """Periodically check if KiCad is gone.
+
+            If the only visible top-level wx windows left are our own plugin
+            panels — including any other AssistantPanel instances (a second
+            panel must not count as a reason to stay alive) — KiCad's own
+            windows are all gone, so close ourselves.  Any non-panel window
+            (project manager, editors, dialogs) keeps us alive.
+            """
+            others = [
+                w
+                for w in wx.GetTopLevelWindows()
+                if not isinstance(w, AssistantPanel) and w.IsShown()
+            ]
             if not others:
                 self.Close(force=True)
 
         def _on_destroy(self, event) -> None:
             """Called when the wx window is actually destroyed (e.g. KiCad shutdown)."""
             if event.GetEventObject() is self:
-                self._autosave_session()
+                if self._project_watch_timer is not None:
+                    self._project_watch_timer.Stop()
                 self._server_mgr.stop()
             event.Skip()
 
         # ------------------------------------------------------------------ #
-        # Auto-save / auto-load
+        # Auto-load
         # ------------------------------------------------------------------ #
-
-        def _autosave_session(self) -> None:
-            """Save a timestamped session file on every close.
-
-            Also atomically updates the ``current.json`` symlink in the sessions
-            directory so the next startup can load it directly without globbing.
-            """
-            # Only save if there is real conversational content — skip sessions
-            # that only contain status/warning notices.
-            if not any(e["type"] in ("user", "ai") for e in self._conv_entries):
-                return
-            err = self._save_session_to_disk()
-            if err:
-                log.warning("Auto-save failed: %s", err)
 
         def _autoload_session(self) -> None:
             """Restore the session pointed to by ``current.json`` on startup.
 
+            Project-aware since schema v2: a session is auto-restored only
+            when it belongs to the currently open KiCad project.  Legacy v1
+            sessions (no project stamp) and sessions saved in other projects
+            are skipped; if the open project has sessions of its own, the
+            user is asked to pick one.
+
             Only follows current.json — no glob fallback. This ensures "New
             Session" (which removes current.json) always starts blank.
+
+            Runs when the LLM client is initialised — on first panel display, or
+            after a manual backend Restart.  Since every turn is persisted as
+            it completes (send/reply/stop), the disk snapshot is always the
+            newest completed state, and restoring it is lossless.
             """
-            import json as _json
+            from .. import session_store as _sstore
 
-            sessions_dir = self._sessions_dir()
-            link = os.path.join(sessions_dir, "current.json")
-            path: str | None = None
-
-            if os.path.exists(link):
-                # Resolve: may be a real symlink or the plain-text fallback.
-                if os.path.islink(link):
-                    target = os.readlink(link)
-                    # readlink may return a relative path — resolve against dir.
-                    if not os.path.isabs(target):
-                        target = os.path.join(sessions_dir, target)
-                    if os.path.isfile(target):
-                        path = target
-                else:
-                    # Plain-text pointer written by the symlink fallback.
-                    try:
-                        with open(link, encoding="utf-8") as lf:
-                            fname = lf.read().strip()
-                        candidate = os.path.join(sessions_dir, fname)
-                        if os.path.isfile(candidate):
-                            path = candidate
-                    except OSError:
-                        pass
-
+            path = _sstore.resolve_current_session(self._settings.config_dir)
             if path is None:
                 return  # No current.json and no sessions dir — blank start.
 
-            try:
-                with open(path, encoding="utf-8") as f:
-                    data = _json.load(f)
-            except (OSError, _json.JSONDecodeError) as e:
-                log.warning("Auto-load failed: %s", e)
+            data, err = _sstore.load_session(path)
+            if data is None:
+                log.warning("Auto-load failed: %s (%s)", path, err)
+                return
+
+            current_project = self._collect_active_project()
+
+            # Legacy v1 sessions and sessions of other projects must not leak
+            # into the open project — skip and offer project sessions instead.
+            if not _sstore.is_project_session(data, current_project):
+                self._prompt_project_session_choice(current_project)
                 return
 
             conv = data.get("conv_entries", [])
