@@ -1,0 +1,57 @@
+name: macOS CI
+
+on:
+  pull_request:
+    branches: [ main, develop ]
+  push:
+    branches: [ main, develop ]
+
+jobs:
+  test-macos:
+    runs-on: macos-latest
+    name: Test on macOS
+    env:
+      KICAD_MCP_PROFILE: "plugin"
+      KICAD_VERSION: "10"
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v4
+      with:
+        enable-cache: true
+
+    - name: Set up Python 3.13
+      run: |
+        uv python install 3.13
+        uv python pin 3.13
+
+    - name: Install dependencies
+      run: uv sync --group dev
+
+    - name: Install Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: "20"
+
+    - name: Install jsdom
+      run: npm install jsdom
+
+    - name: Run plugin unit tests
+      run: uv run python -m pytest tests/unit/plugin/ -v --tb=short
+
+    - name: Run integration tests
+      run: uv run python -m pytest tests/integration/ -v --tb=short -o "addopts="
+
+    - name: Build package
+      run: uv build
+
+    - name: Build plugin zip
+      run: make dist-plugin
+
+    - name: Upload plugin zip
+      uses: actions/upload-artifact@v4
+      with:
+        name: kicad-ai-assistant-macos-zip
+        path: dist/kicad_ai_assistant.zip

@@ -652,9 +652,10 @@ if _WX_AVAILABLE:
                         "text": (
                             f"⚠ KiCad IPC API socket not available at {checked_path}. "
                             "The 'Reload PCB' feature and 'update_pcb_from_schematic' "
-                            "tool require it. Enable it in KiCad: "
-                            "Preferences → Preferences → Plugins → "
-                            "'Enable KiCad API' (KiCad 9+)."
+                            "tool require it. Enable the API server in KiCad: "
+                            "Preferences → API → 'Enable KiCad API server', "
+                            "then restart KiCad. On macOS this is under "
+                            "KiCad → Preferences → Preferences… → API."
                         ),
                         "color_hex": self._C_WARN_HEX,
                     }

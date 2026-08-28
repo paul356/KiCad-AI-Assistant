@@ -115,15 +115,20 @@ setup_plugin.bat
 
 ### 4. 在 KiCad 中加载插件
 
-1. 打开 KiCad 并加载你的项目。
-2. 打开 **PCB 编辑器**。
-3. 依次点击 **Tools → External Plugins → Refresh Plugins**。
-4. 在插件列表中点击 **KiCad AI Assistant**，打开聊天面板。
-5. 进入 **Options → Settings**，输入你的 LLM API Key。
+1. 如果 KiCad 正在运行，请先关闭它（安装程序可能已更改你的首选项）。
+2. 重新打开 KiCad 并加载你的项目。
+3. 打开 **PCB 编辑器**。
+4. **KiCad AI Assistant** 工具栏按钮应自动出现。如果没有出现，请选择 **Tools → External Plugins → Refresh Plugins**。
+5. 点击 **KiCad AI Assistant** 打开聊天面板。
+6. 进入 **Options → Settings**，输入你的 LLM API Key。
 
 ## 插件配置
 
-插件配置文件路径：`~/.config/kicad/kicad_ai_assistant.json`
+插件配置文件路径（将 `<ver>` 替换为你的 KiCad 版本，例如 `10.0`）：
+
+- **macOS:** `~/Library/Preferences/kicad/<ver>/kcaa/kicad_ai_assistant.json`
+- **Linux:** `~/.config/kicad/<ver>/kcaa/kicad_ai_assistant.json`
+- **Windows:** `%APPDATA%\kicad\<ver>\kcaa\kicad_ai_assistant.json`
 
 所有设置均可通过插件面板的 **Options → Settings** 修改：
 
