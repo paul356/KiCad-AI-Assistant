@@ -211,6 +211,59 @@ _in_process_ssl: bool | None = None
 _current_reasoning: list[str] = []
 
 
+def _is_certificate_verification_error(error: BaseException) -> bool:
+    """Return whether *error* was caused by an untrusted certificate chain."""
+    reason = getattr(error, "reason", error)
+    try:
+        import ssl
+
+        if isinstance(reason, ssl.SSLCertVerificationError):
+            return True
+    except ImportError:
+        pass
+    return "certificate verify failed" in str(reason).lower()
+
+
+def _needs_https_fallback(error: BaseException) -> bool:
+    """Return whether HTTPS should be retried with the plugin venv Python."""
+    reason = getattr(error, "reason", error)
+    return _NO_HTTPS_MARKER in str(reason) or _is_certificate_verification_error(error)
+
+
+def _plugin_ssl_context():
+    """Build an SSL context from the certifi bundle installed in the plugin venv."""
+    try:
+        import ssl
+
+        venv_dir = Path(__file__).resolve().parent / ".venv"
+        candidates = [venv_dir / "Lib" / "site-packages" / "certifi" / "cacert.pem"]
+        candidates.extend(venv_dir.glob("lib/python*/site-packages/certifi/cacert.pem"))
+        for ca_bundle in candidates:
+            if ca_bundle.is_file():
+                return ssl.create_default_context(cafile=str(ca_bundle))
+    except (ImportError, OSError):
+        pass
+    return None
+
+
+def _urlopen_with_plugin_ca_retry(request, timeout: float):
+    """Open a URL, retrying certificate failures with the plugin's CA bundle."""
+    import urllib.error
+    import urllib.request
+
+    try:
+        return urllib.request.urlopen(request, timeout=timeout)  # nosec B310 -- user-configured LLM endpoint
+    except urllib.error.URLError as error:
+        if not _is_certificate_verification_error(error):
+            raise
+        context = _plugin_ssl_context()
+        if context is None:
+            raise
+        return urllib.request.urlopen(  # nosec B310 -- user-configured LLM endpoint
+            request, timeout=timeout, context=context
+        )
+
+
 def _resolve_plugin_python() -> str | None:
     """Return the path to the plugin venv's Python, or None if absent."""
     plugin_dir = os.path.dirname(os.path.abspath(__file__))
@@ -472,14 +525,14 @@ def _https_post_json(
     if _in_process_ssl is not False:
         req = urllib.request.Request(url, data=body, headers=headers, method="POST")
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:  # nosec B310 -- MCP client, localhost only
+            with _urlopen_with_plugin_ca_retry(req, timeout=timeout) as resp:
                 _in_process_ssl = True
                 return resp.status, resp.read().decode("utf-8", "replace")
         except urllib.error.HTTPError as e:
             _in_process_ssl = True
             return e.code, e.read().decode("utf-8", "replace")
         except urllib.error.URLError as e:
-            if _NO_HTTPS_MARKER not in str(e.reason):
+            if not _needs_https_fallback(e):
                 raise RuntimeError(f"HTTPS request failed: {e}") from e
             _in_process_ssl = False
             # Fall through to subprocess fallback below.
@@ -1912,15 +1965,12 @@ class LLMClient:
                 "stream": True,
             }
         ).encode()
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self._settings.llm_api_key}",
-        }
+        headers = self._openai_headers()
 
         if _in_process_ssl is not False:
             req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
             try:
-                with urllib.request.urlopen(req, timeout=300) as resp:  # nosec B310 -- MCP client, localhost only
+                with _urlopen_with_plugin_ca_retry(req, timeout=300) as resp:
                     _in_process_ssl = True
                     text_parts = []
                     tool_calls_by_index: dict[int, dict] = {}
@@ -1985,7 +2035,7 @@ class LLMClient:
                     return {"finish_reason": finish_reason, "message": message}
 
             except urllib.error.URLError as e:
-                if _NO_HTTPS_MARKER not in str(e.reason):
+                if not _needs_https_fallback(e):
                     return {"error": f"HTTPS request failed: {e}"}
                 _in_process_ssl = False
                 # Fall through to subprocess streaming below.
@@ -2161,7 +2211,7 @@ class LLMClient:
         if _in_process_ssl is not False:
             req = urllib.request.Request(url, data=encoded, headers=headers, method="POST")
             try:
-                with urllib.request.urlopen(req, timeout=300) as resp:  # nosec B310 -- MCP client, localhost only
+                with _urlopen_with_plugin_ca_retry(req, timeout=300) as resp:
                     _in_process_ssl = True
                     text_blocks: dict[int, str] = {}
                     tool_blocks: dict[int, dict] = {}
@@ -2255,7 +2305,7 @@ class LLMClient:
                     return {"finish_reason": finish, "message": message_out}
 
             except urllib.error.URLError as e:
-                if _NO_HTTPS_MARKER not in str(e.reason):
+                if not _needs_https_fallback(e):
                     return {"error": f"HTTPS request failed: {e}"}
                 _in_process_ssl = False
                 # Fall through to subprocess streaming below.
@@ -2266,6 +2316,13 @@ class LLMClient:
         return _subprocess_sse_stream(
             url, headers, encoded, timeout=300, fmt="anthropic", on_text_delta=on_text_delta
         )
+
+    def _openai_headers(self) -> dict[str, str]:
+        """Build headers for OpenAI-compatible endpoints with optional auth."""
+        headers = {"Content-Type": "application/json"}
+        if self._settings.llm_api_key:
+            headers["Authorization"] = f"Bearer {self._settings.llm_api_key}"
+        return headers
 
     def _call_openai(self, system: str, tools: list[dict]) -> dict[str, Any]:
         base = (self._settings.llm_base_url or "https://api.openai.com").rstrip("/")
@@ -2287,10 +2344,7 @@ class LLMClient:
         if self._max_tokens > 0:
             payload_dict["max_tokens"] = self._max_tokens
         payload = json.dumps(payload_dict).encode()
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self._settings.llm_api_key}",
-        }
+        headers = self._openai_headers()
         try:
             status, text = _https_post_json(url, headers, payload, timeout=300)
         except RuntimeError as e:
