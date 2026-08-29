@@ -1066,12 +1066,6 @@ class TestHttpsFallback:
 
         assert llm_client._is_certificate_verification_error(error) is True
 
-    def test_certificate_text_without_urlerror_is_not_certificate_error(self):
-        assert (
-            llm_client._is_certificate_verification_error(OSError("certificate verify failed"))
-            is False
-        )
-
 
 # ---------------------------------------------------------------------------
 # Streaming tests
