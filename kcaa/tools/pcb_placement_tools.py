@@ -40,9 +40,9 @@ def register_pcb_placement_tools(mcp: FastMCP) -> None:
         """Move and/or rotate a footprint on the PCB board.
 
         PCB coordinates are mm with +X right, **+Y down**, and rotation
-        is in degrees, **clockwise-positive** (KiCad PCB convention —
-        opposite to the math/Y-up CCW convention used by .kicad_sym
-        library data). This tool does NOT auto-snap; pass coordinates
+        is in degrees, **CCW-positive on screen** (KiCad PCB convention —
+        the same CCW convention as the .kicad_sym library data; 0=right,
+        90=up). This tool does NOT auto-snap; pass coordinates
         already aligned to your board grid (typical SMD work uses
         0.1 mm or 0.05 mm; through-hole often 1.27 mm / 50 mil).
 
@@ -67,8 +67,8 @@ def register_pcb_placement_tools(mcp: FastMCP) -> None:
             reference: Footprint reference designator, e.g. ``"U1"``.
             x: New X coordinate in mm (world), or None to keep current.
             y: New Y coordinate in mm (world), or None to keep current.
-            rotation: New rotation in degrees clockwise-positive (any
-                value; KiCad normalises). None to keep current.
+            rotation: New rotation in degrees, CCW-positive on screen
+                (any value; KiCad normalises). None to keep current.
             force: Override the courtyard collision guard.  **Default
                 False — only set True when overlap is genuinely
                 intentional** (e.g. edge connectors, fiducials).  A

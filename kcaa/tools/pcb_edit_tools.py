@@ -6,8 +6,8 @@ Provides tools to:
   - Edit non-placement PCB data such as footprint properties.
 
 PCB coordinate convention (all tools here):
-  millimetres, +X right, **+Y down**, rotation **clockwise-positive**
-  (KiCad PCB convention).
+  millimetres, +X right, **+Y down**, rotation **CCW-positive on screen**
+  (KiCad PCB convention: 0=right, 90=up, 180=left, 270=down).
 
 All mutation tools create a ``.kicad_pcb.bak`` backup before writing.
 """
@@ -56,7 +56,7 @@ def register_pcb_edit_tools(mcp: FastMCP) -> None:
         """Return all graphic items on the Edge.Cuts (board outline) layer.
 
         PCB coordinates: mm, +X right, **+Y down**, rotation
-        **clockwise-positive**.
+        **CCW-positive on screen** (0=right, 90=up).
 
         Args:
             pcb_path: Absolute path to the .kicad_pcb file.
@@ -172,10 +172,10 @@ def register_pcb_edit_tools(mcp: FastMCP) -> None:
     ) -> dict[str, Any]:
         """Add an arc to the board outline (Edge.Cuts layer).
 
-        Angles use KiCad PCB convention: 0° is the +X direction, angles
-        increase **clockwise** (because +Y is down).  To draw a 90° rounded
+        Angles follow KiCad's file-angle convention: CCW-positive on
+        screen (0=right, 90=up).  To draw a 90° rounded
         corner at the top-left of a rectangular board — centre at
-        ``(corner_r, corner_r)``, radius ``corner_r``, from 180° to 270°.
+        ``(corner_r, corner_r)``, radius ``corner_r``, from 90° to 180°.
 
         A .kicad_pcb.bak backup is created before writing.
 
@@ -184,8 +184,9 @@ def register_pcb_edit_tools(mcp: FastMCP) -> None:
             cx: Arc centre X in mm.
             cy: Arc centre Y in mm (+Y down).
             radius: Arc radius in mm.
-            start_angle_deg: Start angle in degrees, clockwise from +X.
-            end_angle_deg: End angle in degrees, clockwise from +X.
+            start_angle_deg: Start angle in degrees, CCW from +X
+                (KiCad file convention).
+            end_angle_deg: End angle in degrees, CCW from +X.
             width: Line width in mm (default Edge.Cuts is 0.05 mm).
             ctx: MCP context (unused).
 
@@ -278,11 +279,11 @@ def register_pcb_edit_tools(mcp: FastMCP) -> None:
             add_gr_line(data, x2, y + r, x2, y2 - r, width=line_width)  # right
             add_gr_line(data, x2 - r, y2, x + r, y2, width=line_width)  # bottom
             add_gr_line(data, x, y2 - r, x, y + r, width=line_width)  # left
-            # Four corner arcs (CW angles, +Y down)
-            add_gr_arc(data, x2 - r, y + r, r, 270, 360, width=line_width)  # top-right
-            add_gr_arc(data, x2 - r, y2 - r, r, 0, 90, width=line_width)  # bottom-right
-            add_gr_arc(data, x + r, y2 - r, r, 90, 180, width=line_width)  # bottom-left
-            add_gr_arc(data, x + r, y + r, r, 180, 270, width=line_width)  # top-left
+            # Four corner arcs (CCW file angles)
+            add_gr_arc(data, x2 - r, y + r, r, 0, 90, width=line_width)  # top-right
+            add_gr_arc(data, x2 - r, y2 - r, r, 270, 360, width=line_width)  # bottom-right
+            add_gr_arc(data, x + r, y2 - r, r, 180, 270, width=line_width)  # bottom-left
+            add_gr_arc(data, x + r, y + r, r, 90, 180, width=line_width)  # top-left
             items_added = 8
 
         try:

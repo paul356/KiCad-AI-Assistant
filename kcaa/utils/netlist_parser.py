@@ -19,16 +19,16 @@ from kcaa.utils.symbol_geometry import (
 
 
 def _angle_to_direction_screen(angle_deg: float) -> str:
-    """Convert a screen-space pin exit angle to a human-readable direction string.
+    """Convert a pin wire-exit angle to a human-readable direction string.
 
-    KiCad schematic uses Y-down screen coordinates:
+    Angles use the KiCad file-angle convention (CCW on screen):
       0   → "right"  (+X)
-      90  → "down"   (+Y screen)
+      90  → "up"     (-Y screen)
       180 → "left"   (-X)
-      270 → "up"     (-Y screen)
+      270 → "down"   (+Y screen)
     """
     a = int(round(float(angle_deg))) % 360
-    return {0: "right", 90: "down", 180: "left", 270: "up"}.get(a, f"{a}deg")
+    return {0: "right", 90: "up", 180: "left", 270: "down"}.get(a, f"{a}deg")
 
 
 def _normalize_iterable(value: Any) -> list[Any]:
@@ -249,8 +249,26 @@ class SchematicParser:
             if pins_summary:
                 comp["pins"] = pins_summary
 
-            self.components.append(comp)
-            self.component_info[ref] = comp
+            prev = self.component_info.get(ref)
+            if prev is not None:
+                # Multi-unit symbol: keep the first unit's entry and merge
+                # every later unit's pins into it.  skip/schematic yields one
+                # Symbol per unit, so without merging only the last unit's
+                # pins would survive (U2 lost its 9 power pins).
+                # NOTE: comp["position"]/comp["rotation"] belong to the
+                # first unit skip yields, which is not necessarily unit 1
+                # (U2's entry carries unit 2's anchor).  The merged pins list
+                # covers all units and body_bbox is the union of all units.
+                prev_pins = prev.setdefault("pins", [])
+                seen = {(p["num"], p["x"], p["y"]) for p in prev_pins}
+                for pin in comp.get("pins", []):
+                    key = (pin["num"], pin["x"], pin["y"])
+                    if key not in seen:
+                        seen.add(key)
+                        prev_pins.append(pin)
+            else:
+                self.components.append(comp)
+                self.component_info[ref] = comp
 
         # Attach the union world bbox to each component info entry.
         for ref, bbs in world_bbox_per_ref.items():
@@ -515,9 +533,12 @@ class SchematicParser:
     def _build_netlist(self) -> None:
         """Build the netlist by tracing wire connectivity between component pins.
 
-        Uses skip's pin.location (world coordinates, rotation already applied)
-        together with a union-find over wire endpoints to group connected pins
-        into nets.
+        Uses the world pin coordinates computed by
+        :func:`~kcaa.utils.skip_helpers.sym_pin_world_coords` (already
+        rotation-corrected; skip's own ``SymbolPin.location`` is wrong for
+        90°/270° placements, see docs/skip_library_notes.md §6) together
+        with a union-find over wire endpoints to group connected pins into
+        nets.
         """
         print("Building netlist from schematic data")
 

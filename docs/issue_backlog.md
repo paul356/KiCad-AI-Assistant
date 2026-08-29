@@ -4,6 +4,61 @@ Known issues discovered during review but not fixed in the originating PR.
 Each entry records the evidence, the impact, and the proposed fix so the work
 can be picked up independently.
 
+## Multi-unit netlist output has no unit dimension
+
+**Status:** open (discovered while fixing the skip pin-coordinate bug, PR #87)
+
+### Symptom
+
+`SchematicParser` merges a multi-unit symbol into a single
+`components[ref]` entry with a flat pin list:
+
+- `position`/`rotation` belong to whichever unit skip yields first —
+  **not necessarily unit 1**. The entry's position is not derived from the
+  merged pins and cannot be used to anchor them.
+- Pins carry **no `unit` field**; unit membership must be guessed by
+  clustering coordinates.
+
+### Evidence
+
+Real board `two_ax_PCB.kicad_sch` (U2, two units):
+
+- unit=1 @ `(101.6, 93.8022, 90)`, unit=2 @ `(185.42, 223.3422, 90)`
+- `components["U2"]["position"]` = `(185.42, 223.3422, 90)` — the anchor of
+  **unit 2** (skip iterates unit 2 first), not U2A
+- pins of both units are in one flat list: unit1's column at `x≈96.52`
+  (PC8–PC12 …), unit2's 9 power pins at `x≈180.34/210.82`; no field
+  distinguishes them
+- 64 pins merged, deduped by `(num, x, y)`; `body_bbox` is the union of all
+  units (correct)
+
+### Impact
+
+- Consumers cannot per-unit analyze (e.g. "which unit carries the power
+  pins"), cannot re-verify a pin against its unit's lib definition and
+  anchor, and cannot derive one unit's pins from the reported `position`.
+- The pin x/y values themselves are correct per-unit world coordinates
+  (each unit's pins were computed with its own `(at …)`); the gap is unit
+  attribution and anchors, not geometry.
+
+### Fix (proposed)
+
+Both data sources are already available on skip (`sym.unit`,
+`sym.at`); pass the unit into `_pin_world_from_lib`'s call sites:
+
+1. add a `unit` key to each pin dict, and/or
+2. add `unit_positions: [{unit, x, y, rotation, pin_nums}]` to the
+   component entry, keeping `position` as a documented summary.
+
+### Validation
+
+- Unit: `multi_unit.kicad_sch` merge test asserts per-unit pin attribution
+  matches the fixture's two anchors.
+- Real board: U2 unit1/unit2 pin-grouping equals the coordinate-cluster
+  split above.
+
+---
+
 ## NPTH pad type index bug in world_model
 
 **Status:** fixed for circular NPTH on `fix/duplicate-pad-routing`

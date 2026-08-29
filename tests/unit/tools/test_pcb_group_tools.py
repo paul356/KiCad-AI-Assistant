@@ -221,8 +221,8 @@ class TestRotateLayout:
             assert abs(anchor["dx"]) < 1e-9, f"anchor dx non-zero after {angle}°"
             assert abs(anchor["dy"]) < 1e-9, f"anchor dy non-zero after {angle}°"
 
-    def test_90deg_cw_rotates_correctly(self):
-        """KiCad CW 90°: x′ = x·cos90 + y·sin90 = y, y′ = -x·sin90 + y·cos90 = -x."""
+    def test_90deg_ccw_rotates_correctly(self):
+        """KiCad CCW 90° (screen): x′ = x·cos90 + y·sin90 = y, y′ = -x·sin90 + y·cos90 = -x."""
         layout = [{"ref": "A", "dx": 10.0, "dy": 0.0, "rotation": 0.0}]
         result = _rotate_layout(layout, 90.0)
         assert abs(result[0]["dx"] - 0.0) < 1e-9
@@ -637,8 +637,8 @@ class TestGridLayout:
 class TestRotateGroup:
     """Tests for the rotate_footprint_group MCP tool."""
 
-    def test_rotate_group_90_cw_preserves_relative_positions(self, tools, board_copy):
-        """90° CW rotation moves components to the right BELOW the anchor."""
+    def test_rotate_group_90_ccw_preserves_relative_positions(self, tools, board_copy):
+        """90° CCW rotation moves components from right to ABOVE the anchor."""
         # First place the group
         _run(tools["place_footprint_group"](board_copy, "usb_c"))
 
@@ -651,7 +651,7 @@ class TestRotateGroup:
         dx_before = r1x_before - ax
         dy_before = r1y_before - ay
 
-        # Rotate 90° CW
+        # Rotate 90° CCW
         result = _run(tools["rotate_footprint_group"](board_copy, "usb_c", 90.0))
         assert "error" not in result, f"Unexpected error: {result.get('error')}"
 
@@ -666,13 +666,13 @@ class TestRotateGroup:
         assert abs(ax_after - ax) < 0.01
         assert abs(ay_after - ay) < 0.01
 
-        # R1's relative position should rotate 90° CW
-        # In KiCad coords (+Y down), 90° CW rotation: (dx, dy) → (-dy, dx)
-        # RIGHT (+dx) → DOWN (+dy), DOWN (+dy) → LEFT (-dx)
+        # R1's relative position should rotate 90° CCW
+        # In KiCad coords (+Y down), 90° CCW rotation: (dx, dy) → (dy, -dx)
+        # RIGHT (+dx) → UP (-dy)
         dx_after = r1x_after - ax_after
         dy_after = r1y_after - ay_after
-        expected_dx = -dy_before
-        expected_dy = dx_before
+        expected_dx = dy_before
+        expected_dy = -dx_before
 
         assert abs(dx_after - expected_dx) < 0.01, (
             f"R1 dx: expected {expected_dx:.2f}, got {dx_after:.2f}"
@@ -682,7 +682,7 @@ class TestRotateGroup:
         )
 
     def test_rotate_group_increments_component_rotations(self, tools, board_copy):
-        """Component orientations counter-rotate to maintain orientation in group frame."""
+        """Component orientations co-rotate to maintain orientation in group frame."""
         _run(tools["place_footprint_group"](board_copy, "usb_c"))
 
         data_before = load_pcb(board_copy)
@@ -691,7 +691,7 @@ class TestRotateGroup:
         _, _, j3_rot_before = get_fp_at(j3_before)
         _, _, d1_rot_before = get_fp_at(d1_before)
 
-        # Rotate 90° CW
+        # Rotate 90° CCW
         result = _run(tools["rotate_footprint_group"](board_copy, "usb_c", 90.0))
         assert "error" not in result
 
@@ -701,10 +701,10 @@ class TestRotateGroup:
         _, _, j3_rot_after = get_fp_at(j3_after)
         _, _, d1_rot_after = get_fp_at(d1_after)
 
-        # Components counter-rotate to maintain orientation in group frame
-        # Group rotates 90° CW, so component orientations decrease by 90°
-        expected_j3_rot = (j3_rot_before - 90.0) % 360.0
-        expected_d1_rot = (d1_rot_before - 90.0) % 360.0
+        # Components co-rotate with the group (CCW file angles, matching the
+        # CCW position sweep) so relative orientation is preserved.
+        expected_j3_rot = (j3_rot_before + 90.0) % 360.0
+        expected_d1_rot = (d1_rot_before + 90.0) % 360.0
 
         assert abs(j3_rot_after - expected_j3_rot) < 0.01, (
             f"J3 rotation: expected {expected_j3_rot:.1f}°, got {j3_rot_after:.1f}°"

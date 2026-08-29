@@ -138,21 +138,21 @@ if not results:
 - 角度为逆时针（CCW）
 - 角度方向是从导线出口指向元件体（即 stub 方向，非导线出方向）
 
-而原理图坐标系要求：
-
-- +Y 朝下（屏幕坐标）
-- 角度为顺时针（CW）
-- 角度方向为导线出口方向（即元件体指向导线）
+而 kcaa 需要的 wire-exit 方向（元件体 → 导线出口）使用**文件 CCW 约定**
+（屏幕 +Y 朝下，0=right, 90=up, 180=left, 270=down）。
 
 ### 变换公式
 
+kcaa 在 `skip_helpers._pin_world_from_lib` 中取 stub 反向（不依赖 skip
+的角度输出）：
+
 ```python
-angle_schematic = (540 - angle_lib) % 360
+angle_exit = (angle_lib + 180) % 360
 ```
 
 验证：
-- J3 右侧引脚（sym 旋转 0°）：lib=180° → `(540-180)%360 = 0°`（→ 右）✓
-- R1 pin1（sym 旋转 180°）：lib=90° → `(540-90)%360 = 90°`（↓ 下）✓
+- J3 右侧引脚（sym 旋转 0°）：lib=180° → `(180+180)%360 = 0°`（→ 右）✓
+- R1 pin1（sym 旋转 180°）：lib=90° → `(90+180)%360 = 270°`（↓ 下）✓
 
 ### 建议的 PR 修复
 
@@ -190,9 +190,48 @@ angle_schematic = (540 - angle_lib) % 360
 
 ---
 
+## 6. `AtValue.rotate90degrees` 旋转方向与 KiCad 相反
+
+### 问题描述
+
+`skip/at_location.py` 的 `AtValue.rotate90degrees()` 每步执行：
+
+```python
+new_x = self.y
+new_y = -1 * self.x    # (x, y) → (y, −x)
+```
+
+该矩阵在库坐标系（+Y 向上、数学 CCW）中是 **顺时针** 90°；而 KiCad 的符号/引脚旋转是 **逆时针**（CCW，`(x,y) → (−y, x)`）。对 **90°/270°** 放置的符号，引脚世界坐标系统性错误；**0°/180°** 时两种方向等价（两遍 90° 结果相同），因此只覆盖 0°/180° 的验证与测试不会暴露此问题。
+
+### 影响范围
+
+- `skip/eeschema/schematic/symbol.py` 的 `SymbolPin.location`（主路径：`while ... rotate90degrees()` 循环后 `par.x + rel.x, par.y - rel.y`）
+- `kcaa/utils/skip_helpers.py` fallback 的同一循环（单引脚电源符号路径）
+
+两处同源，误差均为 `(2·y_lib, 2·x_lib)`。**角度不受影响**：`rotation` 字段只是数值累加（每步 `+90`），两种方向的步数相同，因此 `(540−angle)%360` 的输出仍然正确；错误的是位置。
+
+### 实测证据
+
+ODrive v3 工程 `two_ax_PCB.kicad_sch`，U2A（`unit 1` @ (101.6, 93.8022, 90°)）pin52 = PC11：
+
+- 库定义：`(-78.74, 5.08, 270°)`
+- KiCad 真实世界坐标（磁盘导线精确匹配）：**(96.52, 172.54)**
+- skip 输出：**(106.68, 15.0622)**，偏差 `(+10.16, −157.48) = (2·5.08, 2·(−78.74))`
+
+验证方法：对该图全部 64 个引脚（unit A 55 + unit B 9），用 4 种候选 90° 变换计算世界坐标并与磁盘全部导线端点集合比对，只有 KiCad 正确矩阵（库 CCW90 再 y-flip，净 `(−y, −x)`）命中 64/64，其余候选 0~1 命中。
+
+### 修复方向
+
+- **不要用 `rotate90degrees()` 计算位置**。kcaa 已有正确的参考实现：`kcaa/utils/symbol_geometry.py::_rotate_lib_point`（库 y-up CCW 四方向分支表），`lib_bbox_to_world` 的完整四步（mirror → CCW 旋转 → 平移 → y-flip）与之配套。
+- `sym_pin_world_coords` 两条路径统一自算位置（经 `_rotate_lib_point`），角度逻辑（`(540−angle)%360`）保持不变。
+- 建议向 skip 上游提 PR：修正 `rotate90degrees` 为 CCW，或在 `SymbolPin.location` 内改用正确矩阵。
+
+---
+
 ## 参考
 
 - skip 仓库：https://github.com/psychogenic/skip
+- kcaa 坐标系约定总览：`docs/coordinate-systems.md`
 - kicad-mcp 中的实现：
   - `kcaa/tools/symbol_edit_tools.py` — `add_label_to_schematic`、`list_labels_in_schematic`、`delete_label_from_schematic`
   - `kcaa/utils/skip_helpers.py` — `sym_pin_world_coords`（单引脚 fallback + 坐标系变换）

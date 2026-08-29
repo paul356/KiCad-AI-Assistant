@@ -18,7 +18,8 @@ Workflow:
   6. ``move_symbol_group``          — translate a placed group as a rigid unit.
   7. ``rotate_symbol_group``        — rotate a placed group around its anchor.
 
-Schematic coordinate convention: mm, +X right, +Y down, rotation CW-positive.
+Schematic coordinate convention: mm, +X right, +Y down; file rotation is
+CCW-positive on screen (KiCad convention, 0=right, 90=up).
 """
 
 import logging
@@ -955,7 +956,10 @@ def register_schematic_group_tools(mcp: FastMCP) -> None:
         is also incremented by rotation_delta so symbols keep their relative
         orientation.
 
-        Positive angles rotate clockwise (KiCad +Y-down convention).
+        Positive angles rotate the group counter-clockwise on screen,
+        matching KiCad's CCW-positive file-angle convention (0=right,
+        90=up).  The position sweep and each member's file rotation both
+        rotate CCW, so the group stays rigid.
         Overlap with other symbols is checked before committing; if a
         conflict is detected the group is NOT rotated.
 
@@ -964,9 +968,9 @@ def register_schematic_group_tools(mcp: FastMCP) -> None:
         Args:
             schematic_path: Absolute path to the .kicad_sch file.
             group_name: Name of the group to rotate.
-            rotation_delta: Rotation in degrees (clockwise positive) to
-                apply to the group.  E.g. 90 rotates the whole group
-                90° clockwise around the anchor.
+            rotation_delta: Rotation in degrees (counter-clockwise on screen,
+                KiCad file convention) to apply to the group.  E.g. 90
+                rotates the whole group 90° CCW around the anchor.
 
         Returns:
             group_name, anchor_ref, rotation_delta, rotated_count,
@@ -1003,9 +1007,11 @@ def register_schematic_group_tools(mcp: FastMCP) -> None:
         for m in members:
             dx = m["x"] - ax
             dy = m["y"] - ay
-            new_x = round(ax + dx * cos_t - dy * sin_t, 9)
-            new_y = round(ay + dx * sin_t + dy * cos_t, 9)
-            # +Y-down: CW rotation = POSITIVE rotation_delta
+            # +Y-down CCW-on-screen rotation (KiCad file convention):
+            # (dx, dy) → (dx·cos + dy·sin, −dx·sin + dy·cos)
+            new_x = round(ax + dx * cos_t + dy * sin_t, 9)
+            new_y = round(ay - dx * sin_t + dy * cos_t, 9)
+            # +Y-down: CCW rotation = POSITIVE rotation_delta (file angle)
             new_rot = (m["rotation"] + rotation_delta) % 360.0
 
             new_positions[m["reference"]] = (

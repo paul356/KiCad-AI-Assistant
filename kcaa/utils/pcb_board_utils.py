@@ -2,9 +2,11 @@
 Utility helpers for PCB board-level geometry: Edge.Cuts management and
 footprint courtyard bounding boxes.
 
-Coordinate convention (all functions here and in callers):
-  - Millimetres, +X right, **+Y down**, rotation **clockwise-positive**
-    (KiCad PCB convention).
+Coordinate convention:
+  - Millimetres, +X right, **+Y down**; file rotation is **CCW-positive
+    on screen** (KiCad convention: 0=right, 90=up, 180=left, 270=down).
+  - All angle-taking helpers (including ``add_gr_arc``) use this same CCW
+    file convention.
 """
 
 import math
@@ -219,37 +221,36 @@ def add_gr_arc(
 ) -> None:
     """Append a ``gr_arc`` node using KiCad 6+ 3-point (start/mid/end) format.
 
-    Angles follow KiCad PCB convention: 0° is the positive-X direction;
-    angles increase **clockwise** (+Y down).
+    Angle parameters follow KiCad's file-angle convention: CCW-positive
+    on screen (0=right, 90=up).
 
     :param data: Parsed PCB tree (mutated in place).
     :param cx: Arc centre X in mm.
     :param cy: Arc centre Y in mm.
     :param radius: Arc radius in mm.
-    :param start_angle_deg: Arc start angle in degrees (clockwise from +X).
-    :param end_angle_deg: Arc end angle in degrees (clockwise from +X).
+    :param start_angle_deg: Arc start angle in degrees (CCW from +X).
+    :param end_angle_deg: Arc end angle in degrees (CCW from +X).
     :param width: Line width in mm.
     :param layer: Target layer.
     """
 
-    # In KiCad's +Y-down coordinate system CW angles map directly to standard
-    # trig: a point at θ° CW from +X lies at (cx + r·cosθ, cy + r·sinθ).
-    # No negation is needed; sin(θ) is positive downward, matching +Y-down.
-    def _pt(angle_cw_deg: float) -> tuple[float, float]:
-        rad = math.radians(angle_cw_deg)
-        return cx + radius * math.cos(rad), cy + radius * math.sin(rad)
+    # KiCad file angles are CCW-positive on screen (+Y down): a point at
+    # θ° (0=right, 90=up) lies at (cx + r·cosθ, cy − r·sinθ).
+    def _pt(angle_ccw_deg: float) -> tuple[float, float]:
+        rad = math.radians(angle_ccw_deg)
+        return cx + radius * math.cos(rad), cy - radius * math.sin(rad)
 
-    # Midpoint angle going CW from start to end.
+    # Midpoint angle going CCW from start to end.
     # Normalize the arc span to [0°, 360°) so wrap-around arcs (e.g.
     # start=315°, end=45°) pick the midpoint of the short arc, not the
     # complementary 270° arc.
     span = (end_angle_deg - start_angle_deg) % 360.0
     if span == 0.0:
         span = 360.0
-    mid_angle_cw = start_angle_deg + span / 2.0
+    mid_angle_ccw = start_angle_deg + span / 2.0
 
     sx, sy = _pt(start_angle_deg)
-    mx, my = _pt(mid_angle_cw)
+    mx, my = _pt(mid_angle_ccw)
     ex, ey = _pt(end_angle_deg)
 
     node = [
@@ -287,7 +288,8 @@ def get_fp_courtyard_bbox(
     """Compute the world-coordinate axis-aligned bounding box of a footprint's courtyard.
 
     Transforms all courtyard graphic endpoints by the footprint rotation
-    (clockwise-positive, Y-down) and returns an AABB in board world coordinates.
+    (CCW-positive on screen, Y-down) and returns an AABB in board world
+    coordinates.
 
     Falls back to scanning *all* ``fp_line``/``fp_rect``/``fp_circle`` items if
     no courtyard-layer items are found.  Returns ``None`` if the footprint has
@@ -296,7 +298,7 @@ def get_fp_courtyard_bbox(
     :param fp_node: A footprint S-expression list node.
     :param fp_x: Footprint anchor X in mm (world).
     :param fp_y: Footprint anchor Y in mm (world, +Y down).
-    :param fp_rot_deg: Footprint rotation in degrees, clockwise-positive.
+    :param fp_rot_deg: Footprint rotation in degrees, CCW-positive on screen.
     :returns: Dict ``{min_x, min_y, max_x, max_y, width, height}`` in mm, or None.
     """
     theta = math.radians(fp_rot_deg)
@@ -313,25 +315,26 @@ def get_fp_courtyard_bbox(
         #                i.e. relative to the footprint anchor before any rotation.
         #                +lx is "right when the footprint is at 0°",
         #                +ly is "down when the footprint is at 0°".
-        #   fp_rot_deg — KiCad rotation in CLOCKWISE-positive degrees
-        #                (0° = no rotation; 90° = rotated 90° clockwise on screen).
+        #   fp_rot_deg — KiCad file rotation, CCW-positive on screen
+        #                (0° = no rotation; 90° = rotated 90° to the UP
+        #                side, i.e. counter-clockwise on screen).
         #
-        # Why the standard CCW formula is WRONG here:
-        #   The textbook CCW formula is:
+        # Why the textbook CCW matrix is NOT used directly:
+        #   The textbook CCW matrix in y-up math is:
         #       wx = fp_x + lx*cos(θ) - ly*sin(θ)
         #       wy = fp_y + lx*sin(θ) + ly*cos(θ)
-        #   KiCad's Y axis points DOWN, so a positive (clockwise) rotation of θ
-        #   is equivalent to a COUNTER-clockwise rotation of −θ in standard
-        #   right-handed math.  Substituting −θ:
+        #   Applied to the +Y-down PCB plane that is a CLOCKWISE rotation
+        #   (right → down at +90°), the opposite of KiCad's file angle.
+        #   Substituting −θ:
         #       cos(−θ) =  cos(θ)   sin(−θ) = −sin(θ)
-        #   gives the correct CW formula:
+        #   gives the correct CCW-on-screen form:
         #       wx = fp_x + lx*cos(θ) + ly*sin(θ)   ← sign on ly*sin flipped
         #       wy = fp_y - lx*sin(θ) + ly*cos(θ)   ← sign on lx*sin flipped
         #
         # Quick sanity check — footprint at (101,95), rotation=270°:
         #   cos(270°)≈0, sin(270°)≈−1
-        #   CW formula:  wx = 101 + lx*0 + ly*(−1) = 101 − ly
-        #                wy =  95 − lx*(−1) + ly*0 =  95 + lx
+        #   CCW-on-screen formula:  wx = 101 + lx*0 + ly*(−1) = 101 − ly
+        #                       wy =  95 − lx*(−1) + ly*0 =  95 + lx
         #   For a corner at local (5.32, −5.27):
         #       wx = 101 − (−5.27) = 106.27   ← correctly to the right of centre
         #       wy =  95 +   5.32  = 100.32
@@ -430,7 +433,7 @@ def get_fp_edge_cuts_items(fp_node: list[Any]) -> list[dict[str, Any]]:
     the legacy ``Edge_Cuts`` spelling) and returns their geometry in
     **footprint-local coordinates** (mm, same frame as pads' ``local_x``/
     ``local_y``).  Transform to board world coordinates the same way as pads:
-    ``world = fp.(x,y) + rotation(local)`` (clockwise-positive, +Y down).
+    ``world = fp.(x,y) + rotation(local)`` (CCW-positive on screen, +Y down).
 
     Additional keys depend on the item type, mirroring
     :func:`get_edge_cuts_items`:
