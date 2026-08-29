@@ -79,7 +79,7 @@ Settings are stored in the KiCad user config directory:
 | Setting | Description | Default |
 |---------|-------------|---------|
 | `llm_provider` | `openai`, `anthropic`, or `ollama` | `openai` |
-| `llm_api_key` | API key; optional for unauthenticated OpenAI-compatible endpoints | (empty) |
+| `llm_api_key` | API key; optional for unauthenticated compatible endpoints | (empty) |
 | `llm_model` | Model name | `gpt-4o` |
 | `llm_base_url` | Custom OpenAI, Anthropic, or Ollama-compatible endpoint URL | (uses provider default) |
 | `server_port` | Fixed port for MCP server (0 = auto) | `0` |

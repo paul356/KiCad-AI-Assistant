@@ -2206,11 +2206,7 @@ class LLMClient:
         if anthropic_tools:
             payload["tools"] = anthropic_tools
         encoded = json.dumps(payload).encode()
-        headers = {
-            "Content-Type": "application/json",
-            "x-api-key": self._settings.llm_api_key,
-            "anthropic-version": "2023-06-01",
-        }
+        headers = self._anthropic_headers()
 
         if _in_process_ssl is not False:
             req = urllib.request.Request(url, data=encoded, headers=headers, method="POST")
@@ -2320,6 +2316,16 @@ class LLMClient:
         return _subprocess_sse_stream(
             url, headers, encoded, timeout=300, fmt="anthropic", on_text_delta=on_text_delta
         )
+
+    def _anthropic_headers(self) -> dict[str, str]:
+        """Build headers for Anthropic-compatible endpoints with optional auth."""
+        headers = {
+            "Content-Type": "application/json",
+            "anthropic-version": "2023-06-01",
+        }
+        if self._settings.llm_api_key:
+            headers["x-api-key"] = self._settings.llm_api_key
+        return headers
 
     def _openai_headers(self) -> dict[str, str]:
         """Build headers for OpenAI-compatible endpoints with optional auth."""
@@ -2447,11 +2453,7 @@ class LLMClient:
         if anthropic_tools:
             payload["tools"] = anthropic_tools
         encoded = json.dumps(payload).encode()
-        headers = {
-            "Content-Type": "application/json",
-            "x-api-key": self._settings.llm_api_key,
-            "anthropic-version": "2023-06-01",
-        }
+        headers = self._anthropic_headers()
         try:
             status, text = _https_post_json(url, headers, encoded, timeout=300)
         except RuntimeError as e:

@@ -978,6 +978,24 @@ class TestOpenAICompatibleRequests:
 
         assert client._openai_headers() == {"Content-Type": "application/json"}
 
+    def test_api_key_adds_x_api_key(self):
+        client = _make_client()
+
+        assert client._anthropic_headers() == {
+            "Content-Type": "application/json",
+            "anthropic-version": "2023-06-01",
+            "x-api-key": "sk-test",
+        }
+
+    def test_empty_api_key_omits_x_api_key(self):
+        client = _make_client()
+        client._settings.llm_api_key = ""
+
+        assert client._anthropic_headers() == {
+            "Content-Type": "application/json",
+            "anthropic-version": "2023-06-01",
+        }
+
 
 class TestHttpsFallback:
     def test_certificate_error_retries_with_plugin_ca_bundle(self):
