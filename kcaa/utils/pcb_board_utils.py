@@ -5,8 +5,8 @@ footprint courtyard bounding boxes.
 Coordinate convention:
   - Millimetres, +X right, **+Y down**; file rotation is **CCW-positive
     on screen** (KiCad convention: 0=right, 90=up, 180=left, 270=down).
-  - EXCEPTION: the arc helper ``add_gr_arc`` takes angles clockwise from
-    +X — a local drawing-helper convention, not the file-angle one.
+  - All angle-taking helpers (including ``add_gr_arc``) use this same CCW
+    file convention.
 """
 
 import math
@@ -221,38 +221,36 @@ def add_gr_arc(
 ) -> None:
     """Append a ``gr_arc`` node using KiCad 6+ 3-point (start/mid/end) format.
 
-    Angle parameters are measured clockwise from +X — this helper's
-    local convention, NOT KiCad's file-angle convention (which is
-    CCW-positive on screen).
+    Angle parameters follow KiCad's file-angle convention: CCW-positive
+    on screen (0=right, 90=up).
 
     :param data: Parsed PCB tree (mutated in place).
     :param cx: Arc centre X in mm.
     :param cy: Arc centre Y in mm.
     :param radius: Arc radius in mm.
-    :param start_angle_deg: Arc start angle in degrees (clockwise from +X).
-    :param end_angle_deg: Arc end angle in degrees (clockwise from +X).
+    :param start_angle_deg: Arc start angle in degrees (CCW from +X).
+    :param end_angle_deg: Arc end angle in degrees (CCW from +X).
     :param width: Line width in mm.
     :param layer: Target layer.
     """
 
-    # In the +Y-down plane, CW-on-screen angles map directly to standard
-    # trig: a point at θ° CW from +X lies at (cx + r·cosθ, cy + r·sinθ).
-    # No negation is needed; sin(θ) is positive downward, matching +Y-down.
-    def _pt(angle_cw_deg: float) -> tuple[float, float]:
-        rad = math.radians(angle_cw_deg)
-        return cx + radius * math.cos(rad), cy + radius * math.sin(rad)
+    # KiCad file angles are CCW-positive on screen (+Y down): a point at
+    # θ° (0=right, 90=up) lies at (cx + r·cosθ, cy − r·sinθ).
+    def _pt(angle_ccw_deg: float) -> tuple[float, float]:
+        rad = math.radians(angle_ccw_deg)
+        return cx + radius * math.cos(rad), cy - radius * math.sin(rad)
 
-    # Midpoint angle going CW from start to end.
+    # Midpoint angle going CCW from start to end.
     # Normalize the arc span to [0°, 360°) so wrap-around arcs (e.g.
     # start=315°, end=45°) pick the midpoint of the short arc, not the
     # complementary 270° arc.
     span = (end_angle_deg - start_angle_deg) % 360.0
     if span == 0.0:
         span = 360.0
-    mid_angle_cw = start_angle_deg + span / 2.0
+    mid_angle_ccw = start_angle_deg + span / 2.0
 
     sx, sy = _pt(start_angle_deg)
-    mx, my = _pt(mid_angle_cw)
+    mx, my = _pt(mid_angle_ccw)
     ex, ey = _pt(end_angle_deg)
 
     node = [

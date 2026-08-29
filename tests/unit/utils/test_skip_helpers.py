@@ -4,8 +4,8 @@ Regression for docs/skip_library_notes.md §6: skip's
 ``AtValue.rotate90degrees`` rotates the wrong way (CW in lib Y-up space), so
 its ``SymbolPin.location`` misplaces every pin of 90°/270°-rotated symbols.
 The world position must come from the CCW matrix
-(``symbol_geometry._rotate_lib_point``); angles (whose step count is the same
-either way) must stay on the existing ``(540 - angle) % 360`` conversion.
+(``symbol_geometry._rotate_lib_point``); angles use the CCW file-angle
+exit conversion ``(angle + 180) % 360`` (wire-exit = stub reversed).
 """
 
 from types import SimpleNamespace
@@ -67,12 +67,12 @@ class TestNormalPath:
             # 0°: identity (sx+lx, sy-ly)
             (4.0, 2.0, 180.0, 10.0, 20.0, 0, 14.0, 18.0, 0.0),
             # 90°: CCW in lib (x,y) -> (-y,x)
-            (4.0, 2.0, 180.0, 10.0, 20.0, 90, 8.0, 16.0, 270.0),
+            (4.0, 2.0, 180.0, 10.0, 20.0, 90, 8.0, 16.0, 90.0),
             # 180°: (x,y) -> (-x,-y) — identical to the old rotate90degrees
             # path, guarded so the CW/CCW change cannot regress it
             (4.0, 2.0, 180.0, 10.0, 20.0, 180, 6.0, 22.0, 180.0),
             # 270°: (x,y) -> (y,-x)
-            (4.0, 2.0, 180.0, 10.0, 20.0, 270, 12.0, 24.0, 90.0),
+            (4.0, 2.0, 180.0, 10.0, 20.0, 270, 12.0, 24.0, 270.0),
         ],
     )
     def test_four_directions(
@@ -91,12 +91,12 @@ class TestNormalPath:
         """
         pin = _one(_sym(101.6, 93.8022, 90, [_lib_pin("52", "PC11", -78.74, 5.08, 270)]))
         assert (pin.x, pin.y) == pytest.approx((96.52, 172.5422), abs=1e-3)
-        assert pin.angle == 180.0  # (270+90)=0 → (540-0)%360 → exit left
+        assert pin.angle == 180.0  # (270+90)=0 → (0+180)%360 → exit left
 
 
 class TestMirroredPath:
     def test_mirror_y_flips_lx(self):
-        # mirror "y" flips lib x; angle 180 → +180 → 0 → exit (540-0)%360=180.
+        # mirror "y" flips lib x; angle 180 → +180 → 0 → exit (0+180)%360=180.
         pin = _one(_sym(0.0, 0.0, 0, [_lib_pin("1", "P", 4.0, 2.0, 180)], mirror="y"))
         assert (pin.x, pin.y) == pytest.approx((-4.0, -2.0))
         assert pin.angle == 180.0
@@ -115,6 +115,6 @@ class TestFallbackPath:
         pin = _one(sym)
         # lib (0, 2.54) rot90 → (-2.54, 0); world (5-2.54, 6) = (2.46, 6)
         assert (pin.x, pin.y) == pytest.approx((2.46, 6.0))
-        assert pin.angle == 180.0  # (270+90)=0 → (540-0)%360 → exit left
+        assert pin.angle == 180.0  # (270+90)=0 → (0+180)%360 → exit left
         assert pin.name == "VCC"
         assert pin.electrical_type == "passive"

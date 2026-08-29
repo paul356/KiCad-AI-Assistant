@@ -38,16 +38,13 @@ VALID_SHAPES = ("input", "output", "bidirectional", "tri_state", "passive")
 
 
 def _angle_to_direction(angle_deg: int | float) -> str:
-    """Convert a screen-space label/pin angle to a human-readable direction string.
+    """Convert a label/pin at-angle to a human-readable direction string.
 
-    KiCad schematic uses Y-down screen coordinates:
-      0   → "right"  (+X)
-      90  → "down"   (+Y screen)
-      180 → "left"   (-X)
-      270 → "up"     (-Y screen)
+    Angles use the KiCad file-angle convention (CCW on screen, 0=right,
+    90=up, 180=left, 270=down).
     """
     a = int(round(float(angle_deg))) % 360
-    return {0: "right", 90: "down", 180: "left", 270: "up"}.get(a, f"{a}deg")
+    return {0: "right", 90: "up", 180: "left", 270: "down"}.get(a, f"{a}deg")
 
 
 def _iter_schematic_labels(sch: Any, attr_name: str) -> list[Any]:

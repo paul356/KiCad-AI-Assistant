@@ -19,16 +19,16 @@ from kcaa.utils.symbol_geometry import (
 
 
 def _angle_to_direction_screen(angle_deg: float) -> str:
-    """Convert a screen-space pin exit angle to a human-readable direction string.
+    """Convert a pin wire-exit angle to a human-readable direction string.
 
-    KiCad schematic uses Y-down screen coordinates:
+    Angles use the KiCad file-angle convention (CCW on screen):
       0   → "right"  (+X)
-      90  → "down"   (+Y screen)
+      90  → "up"     (-Y screen)
       180 → "left"   (-X)
-      270 → "up"     (-Y screen)
+      270 → "down"   (+Y screen)
     """
     a = int(round(float(angle_deg))) % 360
-    return {0: "right", 90: "down", 180: "left", 270: "up"}.get(a, f"{a}deg")
+    return {0: "right", 90: "up", 180: "left", 270: "down"}.get(a, f"{a}deg")
 
 
 def _normalize_iterable(value: Any) -> list[Any]:

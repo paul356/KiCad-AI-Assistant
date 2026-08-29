@@ -327,7 +327,7 @@ class TestListLabelsInSchematic:
         m = matches[0]
         assert abs(m["x"] - 201.0) < 0.01, m
         assert abs(m["y"] - 201.0) < 0.01, m
-        assert m["direction"] == "down", m
+        assert m["direction"] == "up", m  # angle=90 → CCW on screen → up
         assert m["label_type"] == "local", m
         assert m["shape"] is None, m
 

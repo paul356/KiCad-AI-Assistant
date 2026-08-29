@@ -193,11 +193,11 @@ class TestAddGrArc:
     def test_angular_positions_correct(self):
         """Verify the actual XY positions of start/end, not just their distance.
 
-        In KiCad +Y-down CW convention:
+        In KiCad CCW file-angle convention (+Y down):
           0° → (cx+r, cy)  [right]
-         90° → (cx,   cy+r) [down]
+         90° → (cx,   cy-r) [up]
         180° → (cx-r, cy)  [left]
-        270° → (cx,   cy-r) [up]
+        270° → (cx,   cy+r) [down]
         """
         import sexpdata as sx
 
@@ -208,9 +208,9 @@ class TestAddGrArc:
         # Start at 0°: (r, 0)
         assert arc["start_x"] == pytest.approx(r, abs=1e-4)
         assert arc["start_y"] == pytest.approx(0.0, abs=1e-4)
-        # End at 90° CW (+Y-down): (0, r)
+        # End at 90° CCW (+Y-down): (0, -r)
         assert arc["end_x"] == pytest.approx(0.0, abs=1e-4)
-        assert arc["end_y"] == pytest.approx(r, abs=1e-4)
+        assert arc["end_y"] == pytest.approx(-r, abs=1e-4)
 
     def test_wraparound_arc_midpoint(self):
         """An arc from 315° to 45° (crossing 0°) should have midpoint at 0°."""

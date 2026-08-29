@@ -34,8 +34,8 @@ class PinWorldCoords(NamedTuple):
     electrical_type: str  # e.g. "input", "output", "bidirectional", "power_in"
     x: float  # absolute schematic X (mm)
     y: float  # absolute schematic Y (mm)
-    angle: float  # wire-exit direction in degrees:
-    #   0=right, 90=down (screen), 180=left, 270=up (screen)
+    angle: float  # wire-exit direction in degrees (KiCad file-angle
+    #   convention, CCW on screen): 0=right, 90=up, 180=left, 270=down
 
 
 def _pin_electrical_type(pin: Any) -> str:
@@ -78,10 +78,12 @@ def _pin_world_from_lib(
       3. translate by the anchor,
       4. Y-flip: ``world_y = sym_y - rel_y``.
 
-    The pin angle is converted from lib notation (CCW, +Y up, tip-to-body)
-    to the schematic wire-exit direction (CW, +Y down, body-to-tip):
-    ``exit = (540 - angle) % 360``.  The mirror ±180° adjustments follow
-    skip's ``SymbolPin.location`` so mirrored output is unchanged.
+    The pin exit angle (wire-leave direction) is the stub angle reversed:
+    the lib pin angle is tip-to-body in the CCW lib frame, so the
+    body-to-tip exit direction in the same CCW file-angle convention is
+    ``exit = (angle + 180) % 360`` (0=right, 90=up, 180=left, 270=down on
+    screen).  The mirror ±180° adjustments follow skip's
+    ``SymbolPin.location`` so mirrored output is unchanged.
     """
     from kcaa.utils.symbol_geometry import _rotate_lib_point
 
@@ -108,14 +110,15 @@ def _pin_world_from_lib(
     wx = round(sym_at.x + rx, 4)
     wy = round(sym_at.y - ry, 4)  # lib Y axis is flipped
 
-    final_angle = (lib_angle + placement_rot) % 360.0
+    stub_angle = (lib_angle + placement_rot) % 360.0
     return PinWorldCoords(
         number=num,
         name=name,
         electrical_type=etype,
         x=wx,
         y=wy,
-        angle=(540.0 - final_angle) % 360.0,
+        # wire-exit = stub angle reversed, CCW file-angle convention
+        angle=(stub_angle + 180.0) % 360.0,
     )
 
 
@@ -130,7 +133,7 @@ def sym_pin_world_coords(sym: Any) -> list[PinWorldCoords]:
     Positions are always computed here from lib pin definitions — skip's
     ``SymbolPin.location`` relies on ``AtValue.rotate90degrees``, which is CW
     and misplaces pins of 90°/270°-rotated symbols (docs/skip_library_notes.md
-    §6).  Angles use the existing ``(540 - angle) % 360`` conversion.
+    §6).  Angles use the CCW file-angle exit conversion ``(angle + 180) % 360``.
 
     Args:
         sym: A placed symbol object from a ``skip.Schematic`` (the items

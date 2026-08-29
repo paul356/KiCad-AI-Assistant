@@ -742,7 +742,11 @@ def connect_with_via(
 
 
 def _seg_angle(x1: float, y1: float, x2: float, y2: float) -> float:
-    """Segment angle in degrees (0=right, 90=down)."""
+    """Segment angle in degrees, screen geometry (0=right, 90=down).
+
+    Debug-log only; this is the raw atan2 angle in Y-down screen
+    coordinates, NOT the KiCad CCW file-angle convention (90=up).
+    """
     return math.degrees(math.atan2(y2 - y1, x2 - x1)) % 360
 
 

@@ -1506,19 +1506,20 @@ def register_pcb_group_tools(mcp: FastMCP) -> None:
         is also incremented by rotation_delta so parts keep their board
         orientation.
 
-        Positive angles rotate the group clockwise on screen — this is the
-        tool's contract.  KiCad file angles are CCW-positive, which is why
-        member rotations SUBTRACT delta (see the QUIRK comment below).
-        Inter-group collisions are checked before writing.
+        Positive angles rotate the group counter-clockwise on screen,
+        matching KiCad's CCW-positive file-angle convention.  Member
+        rotations INCREMENT by delta so parts keep their board
+        orientation relative to the group.  Inter-group collisions are
+        checked before writing.
 
         A .kicad_pcb.bak backup is created before writing.
 
         Args:
             pcb_path: Absolute path to the .kicad_pcb file.
             group_name: Name of the group to rotate.
-            rotation_delta: Rotation in degrees (clockwise on screen) to
-                apply to the group.  E.g. 90 rotates the whole group
-                90° clockwise around the anchor.
+            rotation_delta: Rotation in degrees (counter-clockwise on screen,
+                KiCad file convention) to apply to the group.  E.g. 90
+                rotates the whole group 90° CCW around the anchor.
 
         Returns:
             group_name, anchor_ref, rotation_delta, rotated_count,
@@ -1539,40 +1540,34 @@ def register_pcb_group_tools(mcp: FastMCP) -> None:
         anchor_ref = anchor["reference"]
         ax, ay = anchor["x"], anchor["y"]
 
-        # PCB screen coords: +X right, +Y down.  The standard CCW math matrix
-        # applied in a +Y-down plane rotates points clockwise on screen, which
-        # is this tool's contract.  KiCad's file rotation is CCW-positive —
-        # hence the subtraction for member orientations below.
+        # PCB screen coords: +X right, +Y down.  Rotate counter-clockwise on
+        # screen (KiCad file convention): (dx, dy) → (dx·cos + dy·sin,
+        # −dx·sin + dy·cos).  Member file rotations increment by the same
+        # delta so the group stays rigid.
         theta = math.radians(rotation_delta)
         cos_t = math.cos(theta)
         sin_t = math.sin(theta)
 
         proposals = []
         for m in members:
-            # Component orientations: SUBTRACT rotation_delta to maintain relative orientation
+            # Component orientations INCREMENT by rotation_delta (CCW file angles),
+            # matching the CCW position sweep, so each part keeps its
+            # orientation relative to the group's local frame (e.g. USB-C
+            # pads continue facing the resistors they connect to).
             #
-            # QUIRK: position sweep vs footprint file rotation have opposite
-            # visual conventions:
-            # - Positions sweep clockwise on screen: +90° moves RIGHT → DOWN
-            # - KiCad file rotation is CCW-positive: +90° displays RIGHT → UP
-            #
-            # When group rotates 90° CW (positions move RIGHT → DOWN in PCB coords),
-            # we must SUBTRACT 90° from component orientations to keep them aligned with
-            # the group's local coordinate frame (e.g., USB-C pads continue facing toward
-            # resistors, diode marks maintain polarity direction relative to circuit).
-            #
-            # Example: Component at 0° pointing RIGHT, group rotates 90° CW
-            #   - Position moves from RIGHT to BELOW anchor (correct)
-            #   - Orientation: 0° - 90° = 270° = component now points UP
-            #   - Result: component still points toward anchor (relative orientation preserved)
-            new_rot = (m["rotation"] - rotation_delta) % 360.0
+            # Example: Component at 0° pointing RIGHT, group rotates 90° CCW
+            #   - Position moves from RIGHT to ABOVE the anchor
+            #   - Orientation: 0° + 90° = 90° = component now points UP
+            #   - Result: component still points toward anchor (relative
+            #     orientation preserved)
+            new_rot = (m["rotation"] + rotation_delta) % 360.0
             if m["reference"] == anchor_ref:
                 proposals.append((anchor_ref, ax, ay, new_rot))
             else:
                 dx = m["x"] - ax
                 dy = m["y"] - ay
-                new_x = round(ax + dx * cos_t - dy * sin_t, 9)
-                new_y = round(ay + dx * sin_t + dy * cos_t, 9)
+                new_x = round(ax + dx * cos_t + dy * sin_t, 9)
+                new_y = round(ay - dx * sin_t + dy * cos_t, 9)
                 proposals.append((m["reference"], new_x, new_y, new_rot))
 
         collisions = find_collisions(data, proposals, check_within_group=False)

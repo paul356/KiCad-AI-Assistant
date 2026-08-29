@@ -17,9 +17,10 @@ one a value is in:
 1. **Lib / file notation**: CCW, 0=right 90=up 180=left 270=down. This is
    what `EDA_ANGLE` (`libs/kimath/include/geometry/eda_angle.h`,
    `atan2(y, x)`) and all `.kicad_sym` / `.kicad_sch` angle fields use.
-2. **Screen notation (kcaa output)**: clockwise, 0=right **90=down**
-   180=left **270=up**. Used by `PinWorldCoords.angle`, `netlist_parser`
-   `_angle_to_direction_screen`, `wire_edit_tools._dir_vec`.
+2. **Screen notation (kcaa output)**: identical to the file notation —
+   CCW, 0=right 90=up 180=left 270=down.  Used by `PinWorldCoords.angle`,
+   `netlist_parser _angle_to_direction_screen`, `wire_edit_tools._dir_vec`
+   (was a separate CW notation; unified in the CCW-angle change).
 3. **Direction strings**: `"right"|"down"|"left"|"up"` — screen-space visual
    meaning, no degrees, hence no ambiguity.  Prefer these across API
    boundaries.
@@ -115,9 +116,9 @@ y' = −x·sin(d) + y·cos(d)        # d=90 → (x, y) → (y, −x)   → scree
 - Pad angles: KiCad stores pad rotation as an absolute board-space angle
   in the same CCW file convention (the `pcb_query_tools` docstring calls
   it "CW+" — trust the matrix above, not the label).
-- Arc drawing helpers (`pcb_board_utils`) expose a local **CW** angle API
-  (0°=+X, angles increase clockwise; `sin(θ)` positive downward) — a
-  drawing-helper convention, unrelated to the file-angle convention.
+- Arc drawing helpers (`pcb_board_utils.add_gr_arc`) take angles in the
+  same CCW file convention (0°=+X, 90°=up; point = `cx + r·cosθ,
+  cy − r·sinθ`).
 
 ### B-side (B.Cu) footprints
 
@@ -133,16 +134,8 @@ when computing world coordinates.
 
 ## 5. Direction-string mapping tables
 
-Screen notation (kcaa output):
-
-| angle | direction |
-|---|---|
-| 0   | right |
-| 90  | down  |
-| 180 | left  |
-| 270 | up    |
-
-Lib notation (symbol editing contexts, `symbol_tools._lib_angle_to_direction`):
+File-angle notation (kcaa output: `PinWorldCoords.angle`,
+`netlist_parser`, `wire_edit_tools`):
 
 | angle | direction |
 |---|---|
@@ -151,9 +144,18 @@ Lib notation (symbol editing contexts, `symbol_tools._lib_angle_to_direction`):
 | 180 | left  |
 | 270 | down  |
 
-These two tables look inverted for 90/270 — that is **intentional**: they
-consume angles in different notations.  If you consume one table where the
-other is expected, up/down flip.
+Lib notation (symbol editing contexts, `symbol_tools._lib_angle_to_direction`
+— also CCW, in the Y-up lib frame):
+
+| angle | direction |
+|---|---|
+| 0   | right |
+| 90  | up    |
+| 180 | left  |
+| 270 | down  |
+
+Both tables use the same CCW angle values; the lib one is interpreted in
+the Y-up library frame before placement.
 
 ## 6. Rules of thumb for new code
 
@@ -165,11 +167,10 @@ other is expected, up/down flip.
    ambiguous between lib (up) and screen (down).
 4. Y-flip belongs to the **position** transform only; angle conversion is a
    numeric notation swap — keep them separate.
-5. **Known inconsistency (TODO)**: KiCad uses CCW everywhere (symbols,
-   schematic, footprints).  kcaa's own screen-notation output
-   (`PinWorldCoords.angle`, 0=right, 90=down) is the sole CW island; it
-   matches the direction strings used by netlist exports but is a constant
-   source of confusion (see §5 tables).  Long-term direction: emit
-   direction strings / unit vectors across API boundaries, or switch the
-   angle notation to CCW; until then every angle value must declare its
-   notation.
+5. **Resolved (CCW unification)**: kcaa once had a separate CW screen
+   notation (`PinWorldCoords.angle`, 0=right, 90=down) as the sole CW
+   island; it was unified to the CCW file-angle convention.  Every angle
+   value still states its notation.
+6. Pin exit angle = stub angle reversed: lib pin `(at … angle)` is
+   tip→body, the wire-exit direction is body→tip, i.e.
+   `exit = (stub_angle + 180) % 360` in the same CCW notation.

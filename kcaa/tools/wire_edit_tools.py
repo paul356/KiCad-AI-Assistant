@@ -37,22 +37,22 @@ _DUMP_MAX_REJECTED: int = 64  # cap rejected-candidate records per angle pair
 
 
 def _dir_vec(angle_deg: float) -> tuple[float, float]:
-    """Return the unit direction vector for a KiCad pin exit angle.
+    """Return the unit direction vector for a pin wire-exit angle.
 
-    KiCad schematic coordinates have Y pointing **down** on screen.
-    Pin angle semantics (KiCad / skip convention):
+    Angles use the KiCad file-angle convention (CCW on screen, Y-down
+    schematic coordinates, 0=right 90=up):
       0°   → pointing right  (+X)
-      90°  → pointing down   (+Y, screen)
+      90°  → pointing up     (−Y, screen)
       180° → pointing left   (−X)
-      270° → pointing up     (−Y, screen)
+      270° → pointing down   (+Y, screen)
     """
     a = int(round(angle_deg)) % 360
     return {
         0: (1.0, 0.0),
-        90: (0.0, 1.0),
+        90: (0.0, -1.0),
         180: (-1.0, 0.0),
-        270: (0.0, -1.0),
-    }.get(a, (math.cos(math.radians(a)), math.sin(math.radians(a))))
+        270: (0.0, 1.0),
+    }.get(a, (math.cos(math.radians(a)), -math.sin(math.radians(a))))
 
 
 def _point_on_open_segment(
@@ -1066,8 +1066,9 @@ def _draw_smart_wire(
         sx, sy: Start point (pin position).
         ex, ey: End point (pin position).
         existing_wires: All wire segments already in the schematic.
-        start_angle: Natural exit angle of the start pin (0=right, 90=down,
-            180=left, 270=up).  None means no preferred direction.
+        start_angle: Natural exit angle of the start pin (0=right, 90=up,
+            180=left, 270=down, KiCad CCW file-angle convention).  None
+            means no preferred direction.
         end_angle: Natural exit angle of the end pin.
         obstacle_pins: List of (x, y) positions to avoid.
         lead_out_dist: Lead-out stub length in mm (default 2.54 mm).
@@ -1265,8 +1266,9 @@ def _get_pin_position_and_direction(
 ) -> tuple[float, float, float]:
     """Return the absolute schematic (x, y, angle°) of a named pin.
 
-    The angle is the direction the wire should leave the pin body:
-      0° → right,  90° → down (screen),  180° → left,  270° → up (screen).
+    The angle is the direction the wire should leave the pin body
+    (KiCad CCW file-angle convention on screen):
+      0° → right,  90° → up,  180° → left,  270° → down.
 
     Handles the skip library bug for single-pin symbols (power symbols,
     TestPoint) via :func:`~kcaa.utils.skip_helpers.sym_pin_world_coords`.
