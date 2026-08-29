@@ -978,6 +978,24 @@ class TestOpenAICompatibleRequests:
 
         assert client._openai_headers() == {"Content-Type": "application/json"}
 
+    def test_api_key_adds_x_api_key(self):
+        client = _make_client()
+
+        assert client._anthropic_headers() == {
+            "Content-Type": "application/json",
+            "anthropic-version": "2023-06-01",
+            "x-api-key": "sk-test",
+        }
+
+    def test_empty_api_key_omits_x_api_key(self):
+        client = _make_client()
+        client._settings.llm_api_key = ""
+
+        assert client._anthropic_headers() == {
+            "Content-Type": "application/json",
+            "anthropic-version": "2023-06-01",
+        }
+
 
 class TestHttpsFallback:
     def test_certificate_error_retries_with_plugin_ca_bundle(self):
@@ -1037,6 +1055,16 @@ class TestHttpsFallback:
 
         assert result == (200, "ok")
         run.assert_called_once()
+
+    def test_certificate_error_matches_reason_text(self):
+        error = urllib.error.URLError(
+            OSError(
+                "CERTIFICATE_VERIFY_FAILED certificate verify failed: "
+                "unable to get local issuer certificate"
+            )
+        )
+
+        assert llm_client._is_certificate_verification_error(error) is True
 
 
 # ---------------------------------------------------------------------------
@@ -1188,9 +1216,14 @@ class TestStreaming:
         assert call_kwargs["timeout"] == 300
         assert result["message"]["content"] == "Relayed text"
 
-    def test_stream_anthropic_ssl_fallback_streams_via_subprocess(self):
-        import urllib.error
-
+    @pytest.mark.parametrize(
+        "reason",
+        [
+            "unknown url type: https",
+            ssl.SSLCertVerificationError(1, "unable to get local issuer certificate"),
+        ],
+    )
+    def test_stream_anthropic_ssl_fallback_streams_via_subprocess(self, reason):
         client = _make_client()
         client._settings.llm_provider = "anthropic"
         chunks = []
@@ -1203,9 +1236,10 @@ class TestStreaming:
         with (
             patch(
                 "urllib.request.urlopen",
-                side_effect=urllib.error.URLError("unknown url type: https"),
+                side_effect=urllib.error.URLError(reason),
             ),
             patch("kicad_plugin.llm_client._in_process_ssl", None),
+            patch("kicad_plugin.llm_client._plugin_ssl_context", return_value=None),
             patch(
                 "kicad_plugin.llm_client._subprocess_sse_stream",
                 return_value=subprocess_result,
