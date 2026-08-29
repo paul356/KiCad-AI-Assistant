@@ -56,7 +56,7 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
         again with a different ``layer_hint``.
 
         PCB coordinates: mm, +X right, **+Y down**, rotation
-        **clockwise-positive** (KiCad PCB convention).
+        **CCW-positive on screen** (KiCad PCB convention).
 
         The track's width defaults to the net's netclass ``track_width`` from
         the matching ``.kicad_pro`` (or 0.25 mm if no project file is

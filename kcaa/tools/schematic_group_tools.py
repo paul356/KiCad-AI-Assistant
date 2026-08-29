@@ -18,7 +18,8 @@ Workflow:
   6. ``move_symbol_group``          — translate a placed group as a rigid unit.
   7. ``rotate_symbol_group``        — rotate a placed group around its anchor.
 
-Schematic coordinate convention: mm, +X right, +Y down, rotation CW-positive.
+Schematic coordinate convention: mm, +X right, +Y down; file rotation is
+CCW-positive on screen (KiCad convention, 0=right, 90=up).
 """
 
 import logging
@@ -955,7 +956,10 @@ def register_schematic_group_tools(mcp: FastMCP) -> None:
         is also incremented by rotation_delta so symbols keep their relative
         orientation.
 
-        Positive angles rotate clockwise (KiCad +Y-down convention).
+        Positive angles rotate the group clockwise on screen (this tool's
+        contract).  Note: KiCad file angles are CCW-positive, so positions
+        and rotation_delta sweep in opposite visual directions; direction
+        consistency here is UNVERIFIED (pcb_group_tools subtracts instead).
         Overlap with other symbols is checked before committing; if a
         conflict is detected the group is NOT rotated.
 
@@ -964,7 +968,7 @@ def register_schematic_group_tools(mcp: FastMCP) -> None:
         Args:
             schematic_path: Absolute path to the .kicad_sch file.
             group_name: Name of the group to rotate.
-            rotation_delta: Rotation in degrees (clockwise positive) to
+            rotation_delta: Rotation in degrees (clockwise on screen) to
                 apply to the group.  E.g. 90 rotates the whole group
                 90° clockwise around the anchor.
 

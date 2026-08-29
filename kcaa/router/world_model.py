@@ -303,10 +303,11 @@ def _via_obstacle(via_node: list[Any], net_filter: str | None) -> Obstacle | Non
 
 
 def _rotate_cw_on_screen(x: float, y: float, deg: float) -> tuple[float, float]:
-    """Rotate (x, y) by ``deg`` (CW-positive on screen, KiCad PCB convention).
+    """Rotate (x, y) by ``deg`` (CCW-positive on screen, KiCad PCB convention).
 
-    In KiCad's +Y-down world, a positive file rotation is clockwise on
-    screen, equivalent to a math counter-clockwise rotation of -deg::
+    A positive KiCad file rotation is counter-clockwise on screen
+    (0=right, 90=up, 180=left, 270=down), i.e. the -deg rotation in y-up
+    math::
 
         x' =  x*cos(d) + y*sin(d)
         y' = -x*sin(d) + y*cos(d)
@@ -459,7 +460,7 @@ def _npth_obstacle(
         drill = float(drill_sub[1])
     except (TypeError, ValueError):
         return None
-    # Transform local → world (CW-on-screen, KiCad PCB convention).
+    # Transform local → world (CCW-on-screen, KiCad PCB convention).
     wx_off, wy_off = _rotate_cw_on_screen(lx, ly, fp_rot)
     wx, wy = fp_x + wx_off, fp_y + wy_off
     return Obstacle(

@@ -17,7 +17,8 @@ Workflow:
   6. ``move_footprint_group``       — translate a placed group as a rigid unit.
   7. ``rotate_footprint_group``     — rotate a placed group around its anchor.
 
-PCB coordinate convention: mm, +X right, +Y down, rotation CW-positive.
+PCB coordinate convention: mm, +X right, +Y down; file rotation is
+CCW-positive on screen (KiCad convention: 0=right, 90=up).
 """
 
 import logging
@@ -1023,14 +1024,14 @@ def _rotate_layout(
 ) -> list[dict[str, Any]]:
     """Return a copy of *layout* with all positions rotated by *angle_deg*.
 
-    Rotation is clockwise-positive (KiCad convention), around the origin
-    (0, 0).  The ``rotation`` field of each entry is incremented by
+    Rotation is CCW-positive on screen (KiCad convention), around the
+    origin (0, 0).  The ``rotation`` field of each entry is incremented by
     *angle_deg*.  The input list is not mutated.
 
     Args:
         layout: List of placement dicts with ``ref``, ``dx``, ``dy``,
             ``rotation`` keys.
-        angle_deg: Clockwise rotation in degrees to apply.
+        angle_deg: Rotation in degrees, CCW-positive on screen.
 
     Returns:
         New list with rotated positions and updated ``rotation`` fields.
@@ -1505,7 +1506,9 @@ def register_pcb_group_tools(mcp: FastMCP) -> None:
         is also incremented by rotation_delta so parts keep their board
         orientation.
 
-        Positive angles rotate clockwise (KiCad convention).
+        Positive angles rotate the group clockwise on screen — this is the
+        tool's contract.  KiCad file angles are CCW-positive, which is why
+        member rotations SUBTRACT delta (see the QUIRK comment below).
         Inter-group collisions are checked before writing.
 
         A .kicad_pcb.bak backup is created before writing.
@@ -1513,7 +1516,7 @@ def register_pcb_group_tools(mcp: FastMCP) -> None:
         Args:
             pcb_path: Absolute path to the .kicad_pcb file.
             group_name: Name of the group to rotate.
-            rotation_delta: Rotation in degrees (clockwise positive) to
+            rotation_delta: Rotation in degrees (clockwise on screen) to
                 apply to the group.  E.g. 90 rotates the whole group
                 90° clockwise around the anchor.
 
@@ -1536,9 +1539,10 @@ def register_pcb_group_tools(mcp: FastMCP) -> None:
         anchor_ref = anchor["reference"]
         ax, ay = anchor["x"], anchor["y"]
 
-        # KiCad PCB coordinate system: +X right, +Y DOWN, rotation CW-positive
-        # In +Y down coords, the standard rotation matrix gives CW rotation
-        # when using positive angles (no negation needed)
+        # PCB screen coords: +X right, +Y down.  The standard CCW math matrix
+        # applied in a +Y-down plane rotates points clockwise on screen, which
+        # is this tool's contract.  KiCad's file rotation is CCW-positive —
+        # hence the subtraction for member orientations below.
         theta = math.radians(rotation_delta)
         cos_t = math.cos(theta)
         sin_t = math.sin(theta)
@@ -1547,9 +1551,10 @@ def register_pcb_group_tools(mcp: FastMCP) -> None:
         for m in members:
             # Component orientations: SUBTRACT rotation_delta to maintain relative orientation
             #
-            # QUIRK: Footprint rotation vs PCB position rotation have opposite conventions:
-            # - PCB positions use +Y DOWN (screen coords): rotating +90° CW moves RIGHT → DOWN
-            # - Footprint rotation appears to use +Y UP convention: rotating +90° turns RIGHT → UP
+            # QUIRK: position sweep vs footprint file rotation have opposite
+            # visual conventions:
+            # - Positions sweep clockwise on screen: +90° moves RIGHT → DOWN
+            # - KiCad file rotation is CCW-positive: +90° displays RIGHT → UP
             #
             # When group rotates 90° CW (positions move RIGHT → DOWN in PCB coords),
             # we must SUBTRACT 90° from component orientations to keep them aligned with

@@ -6,8 +6,8 @@ Provides tools to:
   - Edit non-placement PCB data such as footprint properties.
 
 PCB coordinate convention (all tools here):
-  millimetres, +X right, **+Y down**, rotation **clockwise-positive**
-  (KiCad PCB convention).
+  millimetres, +X right, **+Y down**, rotation **CCW-positive on screen**
+  (KiCad PCB convention: 0=right, 90=up, 180=left, 270=down).
 
 All mutation tools create a ``.kicad_pcb.bak`` backup before writing.
 """
@@ -56,7 +56,7 @@ def register_pcb_edit_tools(mcp: FastMCP) -> None:
         """Return all graphic items on the Edge.Cuts (board outline) layer.
 
         PCB coordinates: mm, +X right, **+Y down**, rotation
-        **clockwise-positive**.
+        **CCW-positive on screen** (0=right, 90=up).
 
         Args:
             pcb_path: Absolute path to the .kicad_pcb file.
@@ -172,8 +172,9 @@ def register_pcb_edit_tools(mcp: FastMCP) -> None:
     ) -> dict[str, Any]:
         """Add an arc to the board outline (Edge.Cuts layer).
 
-        Angles use KiCad PCB convention: 0° is the +X direction, angles
-        increase **clockwise** (because +Y is down).  To draw a 90° rounded
+        Angles are measured clockwise from +X — the arc-helper's own
+        local convention, NOT KiCad's file-angle convention (which is
+        CCW-positive on screen).  To draw a 90° rounded
         corner at the top-left of a rectangular board — centre at
         ``(corner_r, corner_r)``, radius ``corner_r``, from 180° to 270°.
 
