@@ -104,10 +104,9 @@ y' = −x·sin(d) + y·cos(d)        # d=90 → (x, y) → (y, −x)   → scree
 ```
 
   Implemented in `kcaa/router/router.py::_rotate` and
-  `kcaa/router/world_model.py::_rotate_cw_on_screen`.  Note that the kcaa
-  name `_rotate_cw_on_screen` is a **misnomer**: the formula rotates
-  counter-clockwise on screen (right → up at +90°); the code is right, the
-  label is wrong.
+  `kcaa/router/world_model.py::_rotate_ccw_on_screen`: both kcaa formulas
+  rotate counter-clockwise on screen (right → up at +90°), matching the
+  KiCad file convention.
 - Verified against the real board `two_ax_PCB.kicad_pcb`: of pads whose
   two candidate positions hit track/via endpoints for exactly one matrix,
   math-CCW won **81 : 30** (rot 90°: 17 : 7, rot 270°: 64 : 23; rot 180°

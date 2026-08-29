@@ -302,7 +302,7 @@ def _via_obstacle(via_node: list[Any], net_filter: str | None) -> Obstacle | Non
     )
 
 
-def _rotate_cw_on_screen(x: float, y: float, deg: float) -> tuple[float, float]:
+def _rotate_ccw_on_screen(x: float, y: float, deg: float) -> tuple[float, float]:
     """Rotate (x, y) by ``deg`` (CCW-positive on screen, KiCad PCB convention).
 
     A positive KiCad file rotation is counter-clockwise on screen
@@ -397,7 +397,7 @@ def _pad_obstacle(
         return None
 
     # World position.
-    wx_off, wy_off = _rotate_cw_on_screen(lx, ly, fp_rot)
+    wx_off, wy_off = _rotate_ccw_on_screen(lx, ly, fp_rot)
     wx, wy = fp_x + wx_off, fp_y + wy_off
 
     # Build a rectangle polygon centered at (0,0), rotate by fp_rot only,
@@ -407,10 +407,10 @@ def _pad_obstacle(
     total_angle = fp_rot
     hw, hh = pw / 2.0, ph / 2.0
     corners = [
-        _rotate_cw_on_screen(-hw, -hh, total_angle),
-        _rotate_cw_on_screen(hw, -hh, total_angle),
-        _rotate_cw_on_screen(hw, hh, total_angle),
-        _rotate_cw_on_screen(-hw, hh, total_angle),
+        _rotate_ccw_on_screen(-hw, -hh, total_angle),
+        _rotate_ccw_on_screen(hw, -hh, total_angle),
+        _rotate_ccw_on_screen(hw, hh, total_angle),
+        _rotate_ccw_on_screen(-hw, hh, total_angle),
     ]
     poly = Polygon([(wx + cx, wy + cy) for cx, cy in corners])
 
@@ -461,7 +461,7 @@ def _npth_obstacle(
     except (TypeError, ValueError):
         return None
     # Transform local → world (CCW-on-screen, KiCad PCB convention).
-    wx_off, wy_off = _rotate_cw_on_screen(lx, ly, fp_rot)
+    wx_off, wy_off = _rotate_ccw_on_screen(lx, ly, fp_rot)
     wx, wy = fp_x + wx_off, fp_y + wy_off
     return Obstacle(
         shape=Point(wx, wy).buffer(drill / 2.0),
