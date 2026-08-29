@@ -59,14 +59,17 @@ world offset = (−y_lib, −x_lib)
 
 - Pin world position therefore = `(ax + rx, ay − ry)` with `(rx, ry)` from
   step 2.
-- **Angle conversion** (skip lib angle → kcaa screen exit angle):
+- **Angle conversion** (lib stub angle → kcaa wire-exit angle, both in the
+  same CCW file-angle notation):
 
 ```
-exit_angle_screen = (540 − angle_lib) % 360      # (+180 stub→exit, then 360− for CCW→CW)
+exit_angle = (angle_lib + 180) % 360      # stub is tip→body; exit is body→tip
 ```
 
-  `0/180°` are unaffected by the CCW→CW step (left/right same in both
-  notations); only `90/270` swap, so test real up/down pins.
+  0=right, 90=up, 180=left, 270=down in both.  (An earlier draft encoded
+  90/270 with a mirrored CW table via `(540 − angle_lib) % 360`; the
+  output was visually identical, and the code now uses the plain
+  stub-reversal form above.)
 
 ### Verified example (ODrive v3 `two_ax_PCB.kicad_sch`)
 
@@ -76,7 +79,7 @@ U2A pin 52 (PC11): lib `(−78.74, 5.08, 270°)`, placement
 ```
 offset = (−y, −x) = (−5.08, +78.74)
 world  = (101.6 − 5.08, 93.8022 + 78.74) = (96.52, 172.54)
-exit angle: rotation = 270 + 90 ≡ 0 → (540 − 0) % 360 = 180° = "left"
+exit angle: rotation = 270 + 90 ≡ 0 → (0 + 180) % 360 = 180° = "left"
 ```
 
 Matches KiCad's own wire endpoints on disk (all 64 pins of U2 hit wire

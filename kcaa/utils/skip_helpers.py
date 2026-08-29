@@ -167,8 +167,10 @@ def sym_pin_world_coords(sym: Any) -> list[PinWorldCoords]:
     # per-unit lib definition (``_lib_sym_pin``), which we use to recompute
     # the position with the correct CCW matrix instead of skip's
     # ``pin.location`` (wrong for 90°/270°).
+    had_wrappers = False
     try:
         for pin in sym.pin:
+            had_wrappers = True
             try:
                 results.append(
                     _pin_world_from_lib(
@@ -185,6 +187,21 @@ def sym_pin_world_coords(sym: Any) -> list[PinWorldCoords]:
                 continue
     except (AttributeError, TypeError):
         pass
+
+    if not results and had_wrappers:
+        # Skip provided SymbolPin wrappers but every one failed — the raw
+        # lib-symbol fallback below drops per-unit filtering, which would
+        # mix the units of a multi-unit symbol.  Make the degradation
+        # visible instead of returning silently wrong pin data.
+        try:
+            ref = sym.property.Reference.value
+        except AttributeError:
+            ref = "<unknown>"
+        log.warning(
+            "sym_pin_world_coords: no pin data from SymbolPin wrappers for %s; "
+            "falling back to the raw lib definition (per-unit filtering lost)",
+            ref,
+        )
 
     if not results:
         # ---- Fallback path: raw lib-symbol definition ---------------------

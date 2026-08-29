@@ -255,6 +255,10 @@ class SchematicParser:
                 # every later unit's pins into it.  skip/schematic yields one
                 # Symbol per unit, so without merging only the last unit's
                 # pins would survive (U2 lost its 9 power pins).
+                # NOTE: comp["position"]/comp["rotation"] belong to the
+                # first unit skip yields, which is not necessarily unit 1
+                # (U2's entry carries unit 2's anchor).  The merged pins list
+                # covers all units and body_bbox is the union of all units.
                 prev_pins = prev.setdefault("pins", [])
                 seen = {(p["num"], p["x"], p["y"]) for p in prev_pins}
                 for pin in comp.get("pins", []):
