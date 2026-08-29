@@ -213,6 +213,8 @@ _current_reasoning: list[str] = []
 
 def _is_certificate_verification_error(error: BaseException) -> bool:
     """Return whether *error* was caused by an untrusted certificate chain."""
+    import urllib.error
+
     reason = getattr(error, "reason", error)
     try:
         import ssl
@@ -221,6 +223,8 @@ def _is_certificate_verification_error(error: BaseException) -> bool:
             return True
     except ImportError:
         pass
+    if not isinstance(error, urllib.error.URLError):
+        return False
     return "certificate verify failed" in str(reason).lower()
 
 

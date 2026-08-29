@@ -1038,6 +1038,22 @@ class TestHttpsFallback:
         assert result == (200, "ok")
         run.assert_called_once()
 
+    def test_certificate_error_matches_reason_text(self):
+        error = urllib.error.URLError(
+            OSError(
+                "CERTIFICATE_VERIFY_FAILED certificate verify failed: "
+                "unable to get local issuer certificate"
+            )
+        )
+
+        assert llm_client._is_certificate_verification_error(error) is True
+
+    def test_certificate_text_without_urlerror_is_not_certificate_error(self):
+        assert (
+            llm_client._is_certificate_verification_error(OSError("certificate verify failed"))
+            is False
+        )
+
 
 # ---------------------------------------------------------------------------
 # Streaming tests
@@ -1188,9 +1204,14 @@ class TestStreaming:
         assert call_kwargs["timeout"] == 300
         assert result["message"]["content"] == "Relayed text"
 
-    def test_stream_anthropic_ssl_fallback_streams_via_subprocess(self):
-        import urllib.error
-
+    @pytest.mark.parametrize(
+        "reason",
+        [
+            "unknown url type: https",
+            ssl.SSLCertVerificationError(1, "unable to get local issuer certificate"),
+        ],
+    )
+    def test_stream_anthropic_ssl_fallback_streams_via_subprocess(self, reason):
         client = _make_client()
         client._settings.llm_provider = "anthropic"
         chunks = []
@@ -1203,9 +1224,10 @@ class TestStreaming:
         with (
             patch(
                 "urllib.request.urlopen",
-                side_effect=urllib.error.URLError("unknown url type: https"),
+                side_effect=urllib.error.URLError(reason),
             ),
             patch("kicad_plugin.llm_client._in_process_ssl", None),
+            patch("kicad_plugin.llm_client._plugin_ssl_context", return_value=None),
             patch(
                 "kicad_plugin.llm_client._subprocess_sse_stream",
                 return_value=subprocess_result,
