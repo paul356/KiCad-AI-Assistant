@@ -249,8 +249,22 @@ class SchematicParser:
             if pins_summary:
                 comp["pins"] = pins_summary
 
-            self.components.append(comp)
-            self.component_info[ref] = comp
+            prev = self.component_info.get(ref)
+            if prev is not None:
+                # Multi-unit symbol: keep the first unit's entry and merge
+                # every later unit's pins into it.  skip/schematic yields one
+                # Symbol per unit, so without merging only the last unit's
+                # pins would survive (U2 lost its 9 power pins).
+                prev_pins = prev.setdefault("pins", [])
+                seen = {(p["num"], p["x"], p["y"]) for p in prev_pins}
+                for pin in comp.get("pins", []):
+                    key = (pin["num"], pin["x"], pin["y"])
+                    if key not in seen:
+                        seen.add(key)
+                        prev_pins.append(pin)
+            else:
+                self.components.append(comp)
+                self.component_info[ref] = comp
 
         # Attach the union world bbox to each component info entry.
         for ref, bbs in world_bbox_per_ref.items():

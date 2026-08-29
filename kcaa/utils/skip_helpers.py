@@ -8,10 +8,13 @@ via ``__getattr__`` to the raw ``ParsedValue``, yielding the pin's children
 ``pin.number`` / ``pin.location`` access then raises ``AttributeError``
 silently, leaving callers with no pin data.
 
-:func:`sym_pin_world_coords` provides a single canonical implementation that
-tries the normal ``SymbolPin`` path first and falls back to manual
-rotation/mirror math against the lib-symbol definition when the normal path
-yields nothing.
+:func:`sym_pin_world_coords` provides a single canonical implementation.
+It iterates the per-unit ``SymbolPin`` wrappers when skip provides them and
+falls back to the raw lib-symbol definition for single-pin symbols; in both
+cases the pin position is computed here with the correct CCW rotation,
+because skip's own ``SymbolPin.location`` uses ``AtValue.rotate90degrees``,
+which rotates the wrong way (CW in lib space) and misplaces every pin of
+90°/270°-rotated symbols (see ``docs/skip_library_notes.md`` §6).
 """
 
 from __future__ import annotations
@@ -55,13 +58,79 @@ def _lib_pin_electrical_type(lib_pin: Any) -> str:
         return ""
 
 
+def _pin_world_from_lib(
+    lib_pin: Any,
+    sym_at: Any,
+    mirror_val: str | None,
+    placement_rot: int,
+    num: str,
+    name: str,
+    etype: str,
+) -> PinWorldCoords:
+    """Compute one pin's world coords from its lib-space definition.
+
+    Applies the same chain as
+    :func:`kcaa.utils.symbol_geometry.lib_bbox_to_world`, in lib (Y-up, CCW)
+    space:
+
+      1. mirror (``"y"`` flips lib x → -x; ``"x"`` flips lib y → -y),
+      2. placement rotation (CCW, via ``symbol_geometry._rotate_lib_point``),
+      3. translate by the anchor,
+      4. Y-flip: ``world_y = sym_y - rel_y``.
+
+    The pin angle is converted from lib notation (CCW, +Y up, tip-to-body)
+    to the schematic wire-exit direction (CW, +Y down, body-to-tip):
+    ``exit = (540 - angle) % 360``.  The mirror ±180° adjustments follow
+    skip's ``SymbolPin.location`` so mirrored output is unchanged.
+    """
+    from kcaa.utils.symbol_geometry import _rotate_lib_point
+
+    rel_raw = [float(v) for v in copy.deepcopy(lib_pin.at.value)]
+    lx = rel_raw[0]
+    ly = rel_raw[1]
+    lib_angle = float(rel_raw[2]) if len(rel_raw) > 2 else 0.0
+
+    if mirror_val == "y":
+        lx = -lx
+        if lib_angle % 180 == 0:
+            lib_angle = (lib_angle + 180) % 360
+    elif mirror_val == "x":
+        ly = -ly
+        if lib_angle % 90 == 0:
+            lib_angle = (lib_angle + 180) % 360
+
+    # KiCad rotates symbols counter-clockwise in the lib Y-up frame.  Note:
+    # skip's rotate90degrees() is CW and wrong for 90°/270° positions (error
+    # (2·y, 2·x) — see docs/skip_library_notes.md §6); the angle accumulates
+    # the same number of 90° steps either way, so only x/y are affected here.
+    rx, ry = _rotate_lib_point(lx, ly, placement_rot)
+
+    wx = round(sym_at.x + rx, 4)
+    wy = round(sym_at.y - ry, 4)  # lib Y axis is flipped
+
+    final_angle = (lib_angle + placement_rot) % 360.0
+    return PinWorldCoords(
+        number=num,
+        name=name,
+        electrical_type=etype,
+        x=wx,
+        y=wy,
+        angle=(540.0 - final_angle) % 360.0,
+    )
+
+
 def sym_pin_world_coords(sym: Any) -> list[PinWorldCoords]:
     """Return world coordinates and exit angle for every pin of a placed symbol.
 
     Handles the known skip library bug for single-pin symbols (power symbols
     such as VCC, GND, PWR_FLAG and TestPoint footprints) by falling back to
-    manual rotation/mirror math when the normal ``SymbolPin`` wrapper path
-    yields no results.
+    the raw lib-symbol definition when the ``SymbolPin`` wrapper path yields
+    no results.
+
+    Positions are always computed here from lib pin definitions — skip's
+    ``SymbolPin.location`` relies on ``AtValue.rotate90degrees``, which is CW
+    and misplaces pins of 90°/270°-rotated symbols (docs/skip_library_notes.md
+    §6).  Angles use the existing ``(540 - angle) % 360`` conversion.
 
     Args:
         sym: A placed symbol object from a ``skip.Schematic`` (the items
@@ -75,47 +144,38 @@ def sym_pin_world_coords(sym: Any) -> list[PinWorldCoords]:
 
     results: list[PinWorldCoords] = []
 
-    # ---- Normal path via SymbolPin.location ---------------------------------
-    # Works for multi-pin components where skip correctly wraps each pin as a
-    # SymbolPin object with a .number attribute and a .location property that
-    # accounts for the symbol's placement rotation and mirroring.
-    #
-    # NOTE on angle convention (skip library):
-    # skip's SymbolPin.location returns the pin angle in *library* coordinates:
-    #   • +Y is UP  (library editor convention)
-    #   • Angles are CCW
-    #   • The angle points from the wire-exit tip TOWARD the symbol body
-    #     (i.e. the stub direction, not the wire-exit direction)
-    #
-    # We need the wire-exit direction in *schematic* coordinates:
-    #   • +Y is DOWN  (screen convention)
-    #   • Angles are CW
-    #
-    # Two corrections are therefore needed:
-    #   1. CCW → CW  (negate):          angle_cw  = (360 - angle_lib) % 360
-    #   2. Tip-to-body → body-to-tip:   angle_exit = (angle_cw + 180) % 360
-    # Combined: angle_exit = (360 - angle_lib + 180) % 360
-    #                      = (540 - angle_lib) % 360
-    #
-    # Verification with known cases:
-    #   J3 right-side pin (sym rot=0): lib=180° → (540-180)%360 =   0° (→ right) ✓
-    #   R1 pin1 (sym rot=180):         lib= 90° → (540- 90)%360 =  90° (↓ down)  ✓
-    #   R1 pin2 (sym rot=180):         lib=270° → (540-270)%360 = 270° (↑ up)    ✓
+    try:
+        sym_at = AtValue(sym.at.value)
+    except Exception:
+        return results
+
+    # Determine mirroring (if any)
+    mirror_val: str | None = None
+    try:
+        mv = sym.mirror.value
+        mirror_val = mv.value() if hasattr(mv, "value") else mv
+    except AttributeError:
+        pass
+
+    placement_rot = int(round(float(sym_at.rotation))) % 360
+
+    # ---- Normal path: per-unit SymbolPin wrappers -------------------------
+    # Works for multi-pin components.  Each SymbolPin carries its own
+    # per-unit lib definition (``_lib_sym_pin``), which we use to recompute
+    # the position with the correct CCW matrix instead of skip's
+    # ``pin.location`` (wrong for 90°/270°).
     try:
         for pin in sym.pin:
             try:
-                num = str(pin.number)
-                name = str(pin.name) if pin.name else ""
-                etype = _pin_electrical_type(pin)
-                loc = pin.location
                 results.append(
-                    PinWorldCoords(
-                        number=num,
-                        name=name,
-                        electrical_type=etype,
-                        x=round(float(loc.x), 4),
-                        y=round(float(loc.y), 4),
-                        angle=(540.0 - float(loc.rotation)) % 360.0,
+                    _pin_world_from_lib(
+                        pin._lib_sym_pin,
+                        sym_at,
+                        mirror_val,
+                        placement_rot,
+                        str(pin.number),
+                        str(pin.name) if pin.name else "",
+                        _pin_electrical_type(pin),
                     )
                 )
             except AttributeError:
@@ -124,67 +184,28 @@ def sym_pin_world_coords(sym: Any) -> list[PinWorldCoords]:
         pass
 
     if not results:
-        # ---- Fallback path: manual rotation/mirror math ---------------------
+        # ---- Fallback path: raw lib-symbol definition ---------------------
         # Triggered for power symbols, PWR_FLAG, TestPoint, etc., where skip's
-        # SymbolPin wrapper is not produced by sym.pin iteration.  We read the
-        # lib-symbol pin definitions directly and replicate the same transform that
-        # skip's SymbolPin.location property applies internally.
+        # SymbolPin wrapper is not produced by sym.pin iteration (single-pin
+        # symbols degrade to a raw ParsedValue).
         try:
             lib_sym = sym.lib_symbol
             if lib_sym is None:
                 return results
-
-            sym_at = AtValue(sym.at.value)  # placed symbol: (x, y, rotation°)
-
-            # Determine mirroring (if any)
-            mirror_val: str | None = None
-            try:
-                mv = sym.mirror.value
-                mirror_val = mv.value() if hasattr(mv, "value") else mv
-            except AttributeError:
-                pass
-
             for lib_pin in lib_sym.pin:
                 try:
                     num = str(lib_pin.number.value)
                     name = str(lib_pin.name.value) if lib_pin.name else ""
                     etype = _lib_pin_electrical_type(lib_pin)
-                    rel_raw: list = copy.deepcopy(lib_pin.at.value)  # [x, y, angle]
-
-                    # Apply mirroring to lib-pin relative position
-                    rot = rel_raw[2]
-                    if mirror_val == "y":
-                        rel_raw[0] = -rel_raw[0]
-                        if rot % 180 == 0:
-                            rel_raw[2] = (rot + 180) % 360
-                    elif mirror_val == "x":
-                        rel_raw[1] = -rel_raw[1]
-                        if rot % 90 == 0:
-                            rel_raw[2] = (rot + 180) % 360
-
-                    rel_at = AtValue(rel_raw)
-                    manip_at = AtValue(copy.deepcopy(rel_raw))
-                    manip_at.rotation = 0
-
-                    # Rotate lib-pin position/angle to match placed symbol's rotation
-                    while manip_at.rotation != sym_at.rotation:
-                        manip_at.rotate90degrees()
-                        rel_at.rotate90degrees()
-
-                    wx = round(sym_at.x + rel_at.x, 4)
-                    wy = round(sym_at.y - rel_at.y, 4)  # lib Y axis is flipped
-                    # Apply the same (540 - angle) % 360 conversion as the
-                    # normal path: rel_at.rotation is still in library coords
-                    # (CCW, +Y up, tip-to-body) and must be converted to
-                    # schematic wire-exit direction (CW, +Y down, body-to-tip).
                     results.append(
-                        PinWorldCoords(
-                            number=num,
-                            name=name,
-                            electrical_type=etype,
-                            x=wx,
-                            y=wy,
-                            angle=(540.0 - float(rel_at.rotation)) % 360.0,
+                        _pin_world_from_lib(
+                            lib_pin,
+                            sym_at,
+                            mirror_val,
+                            placement_rot,
+                            num,
+                            name,
+                            etype,
                         )
                     )
                 except Exception:

@@ -152,16 +152,19 @@ def _lib_pins_world(
     """Return world-space (x, y) for every pin of *lib_sym_raw* placed at
     (sym_x, sym_y) with the given rotation.
 
-    Uses the same transform as the skip library fallback: each 90° CW step
-    rotates the lib position as ``(x, y) → (y, −x)``, then
-    ``world_x = sym_x + rx``, ``world_y = sym_y − ry`` (lib Y axis is flipped).
+    Uses the canonical lib→world transform: CCW rotation in lib Y-up space
+    (``kcaa.utils.symbol_geometry._rotate_lib_point``), then
+    ``world_x = sym_x + rx``, ``world_y = sym_y − ry`` (lib Y axis is
+    flipped).  Do NOT use skip's ``rotate90degrees`` here: it rotates CW and
+    misplaces pins of 90°/270°-rotated symbols (see
+    docs/skip_library_notes.md §6).
     """
-    steps = (rotation // 90) % 4
+    from kcaa.utils.symbol_geometry import _rotate_lib_point
+
+    rot = int(rotation) % 360
     world: list[tuple[float, float]] = []
     for lx, ly in _extract_lib_pin_positions(lib_sym_raw):
-        rx, ry = lx, ly
-        for _ in range(steps):
-            rx, ry = ry, -rx
+        rx, ry = _rotate_lib_point(lx, ly, rot)
         world.append((round(sym_x + rx, 4), round(sym_y - ry, 4)))
     return world
 
