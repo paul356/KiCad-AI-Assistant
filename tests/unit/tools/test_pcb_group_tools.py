@@ -221,8 +221,8 @@ class TestRotateLayout:
             assert abs(anchor["dx"]) < 1e-9, f"anchor dx non-zero after {angle}°"
             assert abs(anchor["dy"]) < 1e-9, f"anchor dy non-zero after {angle}°"
 
-    def test_90deg_cw_rotates_correctly(self):
-        """KiCad CW 90°: x′ = x·cos90 + y·sin90 = y, y′ = -x·sin90 + y·cos90 = -x."""
+    def test_90deg_ccw_rotates_correctly(self):
+        """KiCad CCW 90° (screen): x′ = x·cos90 + y·sin90 = y, y′ = -x·sin90 + y·cos90 = -x."""
         layout = [{"ref": "A", "dx": 10.0, "dy": 0.0, "rotation": 0.0}]
         result = _rotate_layout(layout, 90.0)
         assert abs(result[0]["dx"] - 0.0) < 1e-9

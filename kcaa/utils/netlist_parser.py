@@ -529,9 +529,12 @@ class SchematicParser:
     def _build_netlist(self) -> None:
         """Build the netlist by tracing wire connectivity between component pins.
 
-        Uses skip's pin.location (world coordinates, rotation already applied)
-        together with a union-find over wire endpoints to group connected pins
-        into nets.
+        Uses the world pin coordinates computed by
+        :func:`~kcaa.utils.skip_helpers.sym_pin_world_coords` (already
+        rotation-corrected; skip's own ``SymbolPin.location`` is wrong for
+        90°/270° placements, see docs/skip_library_notes.md §6) together
+        with a union-find over wire endpoints to group connected pins into
+        nets.
         """
         print("Building netlist from schematic data")
 

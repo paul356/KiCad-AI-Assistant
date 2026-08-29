@@ -71,7 +71,7 @@ class TestNetlistPinDirection:
     def test_r1_pin_directions_exact(self, parsed):
         """R1 (Device:R_Small, rotation=0) must have pin 1 pointing up and pin 2 pointing down.
 
-        In screen-space: 270° → 'up', 90° → 'down'.
+        Stub angles (lib) 270°/90° → exit (stub+180): 90° → 'up', 270° → 'down'.
         """
         r1 = parsed["components"].get("R1")
         assert r1 is not None, "R1 not found in parsed components"
@@ -86,7 +86,7 @@ class TestNetlistPinDirection:
     def test_c1_pin_directions_exact(self, parsed):
         """C1 (Device:C, rotation=0) must have pin 1 pointing up and pin 2 pointing down.
 
-        In screen-space: 270° → 'up', 90° → 'down'.
+        Stub angles (lib) 270°/90° → exit (stub+180): 90° → 'up', 270° → 'down'.
         """
         c1 = parsed["components"].get("C1")
         assert c1 is not None, "C1 not found in parsed components"
