@@ -260,7 +260,7 @@ kcaa
 |------|-------------|
 | `get_board_info` | Get basic PCB board information |
 | `list_footprints` | List all footprints placed on the board |
-| `get_footprint` | Get details of a single placed footprint |
+| `get_footprint` | Get details of a placed footprint (pads, properties, Edge.Cuts geometry) |
 | `get_footprint_bbox` | Get the courtyard bounding box of a footprint |
 | `get_board_bounding_box` | Get the union bounding box of all footprints |
 | `list_nets` | List all nets on the board |

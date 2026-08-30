@@ -33,8 +33,9 @@ description: "Copper pour & keepout zone CRUD, zone refill via IPC, polygon geom
    `deleted: true` on success.
 
 # Coordinate convention
-- PCB coordinates: **millimetres, +X right, +Y down**, rotation **clockwise-positive**
-  (standard KiCad PCB convention). This is consistent with the rest of the PCB tools.
+- PCB coordinates: **millimetres, +X right, +Y down**, rotation
+  **CCW-positive on screen** (KiCad PCB convention: 0°=right, 90°=up,
+  180°=left, 270°=down). This is consistent with the rest of the PCB tools.
 
 # Caveats & gotchas
 - All mutation tools create a `.kicad_pcb.bak` backup before writing.

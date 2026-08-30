@@ -117,8 +117,9 @@ y' = −x·sin(d) + y·cos(d)        # d=90 → (x, y) → (y, −x)   → scree
   degenerate-equal as expected).  Consistent with the official manual
   (PCBNew `R` hotkey = counter-clockwise, Shift+R = clockwise).
 - Pad angles: KiCad stores pad rotation as an absolute board-space angle
-  in the same CCW file convention (the `pcb_query_tools` docstring calls
-  it "CW+" — trust the matrix above, not the label).
+  in the same CCW file convention (`pcb_query_tools.get_footprint` and
+  `pcb_board_utils.get_fp_edge_cuts_items` docstrings use "CCW+" for it,
+  matching the matrix above).
 - Arc drawing helpers (`pcb_board_utils.add_gr_arc`) take angles in the
   same CCW file convention (0°=+X, 90°=up; point = `cx + r·cosθ,
   cy − r·sinθ`).
