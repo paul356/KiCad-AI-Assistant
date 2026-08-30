@@ -56,7 +56,7 @@ wrong sign, and missing the `edge_cuts` geometry that #76 added.
 
 ## Multi-unit netlist output has no unit dimension
 
-**Status:** open (discovered while fixing the skip pin-coordinate bug, PR #87)
+**Status:** fixed on `fix/issue-89-multi-unit-netlist` (issue #89)
 
 ### Symptom
 
@@ -91,21 +91,50 @@ Real board `two_ax_PCB.kicad_sch` (U2, two units):
   (each unit's pins were computed with its own `(at …)`); the gap is unit
   attribution and anchors, not geometry.
 
-### Fix (proposed)
+### Fix (implemented)
 
-Both data sources are already available on skip (`sym.unit`,
-`sym.at`); pass the unit into `_pin_world_from_lib`'s call sites:
+`SchematicParser._extract_components` now nests every placed unit under its
+reference:
 
-1. add a `unit` key to each pin dict, and/or
-2. add `unit_positions: [{unit, x, y, rotation, pin_nums}]` to the
-   component entry, keeping `position` as a documented summary.
+```json
+"components[ref]": {
+  "units": {
+    "1": {"position": {"x", "y", "rotation"}, "body_bbox": {...}, "pins": [...]},
+    "2": {...}
+  }
+}
+```
+
+- Every `units[unit]` carries that unit's own anchor, pins, and world
+  `body_bbox`; the ambiguous top-level `position`, flat `pins`, and the
+  merged union `body_bbox` are gone (a union of far-apart units is
+  meaningless for per-unit reasoning). Sheets are opaque single-unit
+  placeholders nested under `units["1"]`.
+- `netlist_parser.iter_component_pins()` flattens the nested pins for
+  netlist tracing, tools, and reports; `first_unit_position()` gives the
+  lowest-numbered unit's anchor; `component_body_bbox()` fuses the unit
+  bboxes for callers that need the whole occupied region (overlap
+  avoidance, group membership).
+- `move_component` takes **deltas**: `x`/`y` are shifts in mm (snapped to
+  the 1.27 mm grid), `rotation` is an incremental angle applied as
+  `old + rotation` per unit — reading an absolute target from the netlist
+  and subtracting gives the delta. `unit=N` moves/rotates one unit
+  individually; omitted moves every unit by the same delta, preserving
+  relative layout (the old absolute write collapsed all units onto the
+  target anchor). The overlap-avoidance search excludes the moved
+  reference itself, so a unit's stale position never blocks the move.
 
 ### Validation
 
-- Unit: `multi_unit.kicad_sch` merge test asserts per-unit pin attribution
-  matches the fixture's two anchors.
-- Real board: U2 unit1/unit2 pin-grouping equals the coordinate-cluster
-  split above.
+- Unit: `tests/unit/utils/test_netlist_multi_unit.py` — units nested with
+  per-unit anchors, pins, and body_bbox, no top-level pins/position/bbox,
+  single-unit components nested under unit 1;
+  `tests/unit/tools/test_symbol_edit_tools.py` `TestMoveComponentMultiUnit` —
+  whole delta move preserves offsets and rotations, unit-scoped
+  move/rotate touches only that unit, validation errors.
+- Real board: `two_ax_PCB.kicad_sch` U2 — `units["1"]` @ (101.6, 93.8022,
+  90°) with 55 pins, `units["2"]` @ (185.42, 223.3422, 90°) with 9 power
+  pins; 64 pins total, matching the coordinate-cluster split above.
 
 ---
 

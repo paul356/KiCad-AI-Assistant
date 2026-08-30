@@ -3,6 +3,7 @@ KiCad schematic netlist extraction utilities.
 """
 
 from collections import defaultdict
+from collections.abc import Iterator
 import contextlib
 import os
 import re
@@ -47,6 +48,61 @@ def _normalize_iterable(value: Any) -> list[Any]:
     except TypeError:
         return [value]
     return [value[i] for i in range(length)]
+
+
+def iter_component_pins(comp: dict[str, Any]) -> Iterator[tuple[str, dict[str, Any]]]:
+    """Yield ``(unit, pin)`` for every pin of every unit in a component.
+
+    ``units`` (added for issue #89) nests pins per unit; callers that need
+    a flat pin view (netlist tracing, reports) iterate this instead of
+    reading a top-level ``pins`` list.
+    """
+    for unit_key, unit_data in (comp.get("units") or {}).items():
+        for pin in unit_data.get("pins", []):
+            yield unit_key, pin
+
+
+def first_unit_position(comp: dict[str, Any]) -> dict[str, Any]:
+    """Anchor of the lowest-numbered unit, as a deterministic summary.
+
+    Single-unit consumers (power symbols, placement fallbacks) previously
+    read a top-level ``position``; with units nested per reference the
+    anchor of unit 1 (or the first unit present) is the equivalent.
+    """
+    units = comp.get("units") or {}
+    first = units.get("1") or next(iter(units.values()), None) or {}
+    pos = first.get("position") if isinstance(first, dict) else None
+    return pos if isinstance(pos, dict) else {}
+
+
+def component_body_bbox(comp: dict[str, Any]) -> dict[str, float] | None:
+    """World-space union bbox covering every unit of a component.
+
+    The netlist schema keeps one ``body_bbox`` per unit, nested under
+    ``units[unit]`` (the merged top-level bbox was removed — the union of
+    two far-apart units is meaningless for per-unit reasoning). Consumers
+    that need the component's whole occupied region (overlap avoidance,
+    group membership) fuse the unit bboxes here. Returns ``None`` when no
+    unit has a bbox (e.g. graphics-less symbols like PWR_FLAG).
+    """
+    boxes: list[BBox] = []
+    for unit_data in (comp.get("units") or {}).values():
+        bb = unit_data.get("body_bbox") if isinstance(unit_data, dict) else None
+        if not bb:
+            continue
+        try:
+            boxes.append(
+                BBox(
+                    float(bb["min_x"]),
+                    float(bb["min_y"]),
+                    float(bb["max_x"]),
+                    float(bb["max_y"]),
+                )
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+    merged = union_bboxes(boxes)
+    return merged.to_dict() if merged is not None else None
 
 
 class SchematicParser:
@@ -127,7 +183,17 @@ class SchematicParser:
         return result
 
     def _extract_components(self) -> None:
-        """Extract component information from schematic."""
+        """Extract component information from schematic.
+
+        skip/schematic yields one Symbol per placed unit, so a multi-unit
+        symbol appears as several symbols sharing one reference.  Each unit
+        is nested under that reference in ``units[unit]`` with its own
+        anchor, pins, and world ``body_bbox``; there is no ambiguous
+        top-level ``position``/flat ``pins`` and unit membership never has
+        to be guessed from coordinates (issue #89).  There is no merged
+        top-level bbox — the union of far-apart units is meaningless, so
+        each unit reports its own footprint.
+        """
         print("Extracting components")
         try:
             symbols = self._sch.symbol
@@ -164,21 +230,21 @@ class SchematicParser:
             lib_bbox_cache[lib_id] = bboxes
             return bboxes
 
-        # World bboxes accumulated per reference so multi-unit symbols
-        # report the union of every placed unit's footprint.
-        world_bbox_per_ref: dict[str, list[BBox]] = defaultdict(list)
+        # World bboxes accumulated per (reference, unit) — each unit keeps
+        # its own footprint bbox under units[unit]["body_bbox"].
+        world_bbox_per_unit: dict[tuple[str, str], list[BBox]] = defaultdict(list)
 
         for sym in symbols:
             comp: dict[str, Any] = {}
 
             # Reference is required; skip entries that don't have one
             try:
-                comp["reference"] = sym.property.Reference.value
+                ref = sym.property.Reference.value
             except AttributeError:
                 continue
-            ref = comp["reference"]
             if not ref:
                 continue
+            comp["reference"] = ref
 
             with contextlib.suppress(AttributeError):
                 comp["lib_id"] = sym.lib_id.value
@@ -189,20 +255,21 @@ class SchematicParser:
             with contextlib.suppress(AttributeError):
                 comp["footprint"] = sym.property.Footprint.value
 
-            # sym.at.value -> [x, y, angle]
+            # sym.at.value -> [x, y, angle]; the anchor of THIS unit.
             sym_x = sym_y = sym_rot = None
             try:
                 at_val = sym.at.value
                 sym_x = float(at_val[0])
                 sym_y = float(at_val[1])
                 sym_rot = float(at_val[2]) if len(at_val) > 2 else 0.0
-                comp["position"] = {
-                    "x": sym_x,
-                    "y": sym_y,
-                    "rotation": sym_rot,
-                }
             except (AttributeError, IndexError, TypeError):
                 pass
+
+            # Unit number of this placed instance; symbols without an
+            # explicit `unit` field are unit 1.
+            unit_no = 1
+            with contextlib.suppress(AttributeError, ValueError, TypeError):
+                unit_no = int(sym.unit.value)
 
             # Mirror flag (rare; "x" or "y") so the world bbox is correct
             # even when the user has flipped a placed instance in KiCad.
@@ -215,9 +282,6 @@ class SchematicParser:
 
             # Per-unit world bbox: look up this unit's lib bbox, transform.
             if comp.get("lib_id") and sym_x is not None and sym_y is not None:
-                unit_no = 1
-                with contextlib.suppress(AttributeError, ValueError, TypeError):
-                    unit_no = int(sym.unit.value)
                 bboxes = _lib_unit_bboxes(comp["lib_id"])
                 lib_bb = bboxes.get(unit_no) or bboxes.get(1)
                 if lib_bb is not None:
@@ -229,9 +293,9 @@ class SchematicParser:
                         rot_int,
                         mirror_val,
                     )
-                    world_bbox_per_ref[ref].append(world_bb)
+                    world_bbox_per_unit[(ref, str(unit_no))].append(world_bb)
 
-            # Collect pin positions via shared helper (handles the skip bug
+            # Pins of this unit via the shared helper (handles the skip bug
             # for single-pin symbols: power nets, PWR_FLAG, TestPoint, etc.)
             pins_summary: list[dict[str, str]] = []
             for pin in sym_pin_world_coords(sym):
@@ -246,35 +310,47 @@ class SchematicParser:
                     }
                 )
 
+            unit_entry: dict[str, Any] = {}
+            if sym_x is not None and sym_y is not None:
+                unit_entry["position"] = {"x": sym_x, "y": sym_y, "rotation": sym_rot}
             if pins_summary:
-                comp["pins"] = pins_summary
+                unit_entry["pins"] = pins_summary
 
             prev = self.component_info.get(ref)
             if prev is not None:
-                # Multi-unit symbol: keep the first unit's entry and merge
-                # every later unit's pins into it.  skip/schematic yields one
-                # Symbol per unit, so without merging only the last unit's
-                # pins would survive (U2 lost its 9 power pins).
-                # NOTE: comp["position"]/comp["rotation"] belong to the
-                # first unit skip yields, which is not necessarily unit 1
-                # (U2's entry carries unit 2's anchor).  The merged pins list
-                # covers all units and body_bbox is the union of all units.
-                prev_pins = prev.setdefault("pins", [])
-                seen = {(p["num"], p["x"], p["y"]) for p in prev_pins}
-                for pin in comp.get("pins", []):
-                    key = (pin["num"], pin["x"], pin["y"])
-                    if key not in seen:
-                        seen.add(key)
-                        prev_pins.append(pin)
+                # Multi-unit symbol: this is another placed unit of the same
+                # reference — nest it under the existing entry.
+                prev_units = prev.setdefault("units", {})
+                unit_key = str(unit_no)
+                if unit_key in prev_units:
+                    # Defensive merge if a unit number repeats: keep the
+                    # first anchor, append pins not already present.
+                    existing = prev_units[unit_key]
+                    seen = {(p["num"], p["x"], p["y"]) for p in existing.get("pins", [])}
+                    for pin in pins_summary:
+                        key = (pin["num"], pin["x"], pin["y"])
+                        if key not in seen:
+                            seen.add(key)
+                            existing.setdefault("pins", []).append(pin)
+                else:
+                    prev_units[unit_key] = unit_entry
+                # Deterministic output: unit "1" first regardless of the
+                # order skip yields units.
+                prev["units"] = dict(sorted(prev_units.items(), key=lambda kv: int(kv[0])))
             else:
+                comp["units"] = {str(unit_no): unit_entry}
                 self.components.append(comp)
                 self.component_info[ref] = comp
 
-        # Attach the union world bbox to each component info entry.
-        for ref, bbs in world_bbox_per_ref.items():
+        # Attach each unit's world bbox; units with no graphics (e.g.
+        # PWR_FLAG) simply have none.
+        for (ref, unit_key), bbs in world_bbox_per_unit.items():
             merged = union_bboxes(bbs)
-            if merged is not None and ref in self.component_info:
-                self.component_info[ref]["body_bbox"] = merged.to_dict()
+            if merged is None or ref not in self.component_info:
+                continue
+            unit_entry = (self.component_info[ref].get("units") or {}).get(unit_key)
+            if unit_entry:
+                unit_entry["body_bbox"] = merged.to_dict()
 
         print(f"Extracted {len(self.components)} components")
 
@@ -360,16 +436,22 @@ class SchematicParser:
                     }
                 )
 
+            # Sheets are opaque single-unit placeholders: nest their anchor
+            # and pins under units["1"] so every component entry shares one
+            # schema.
+            sheet_unit: dict[str, Any] = {}
+            if pins:
+                sheet_unit["pins"] = pins
+            if sheet_x is not None and sheet_y is not None:
+                sheet_unit["position"] = {"x": sheet_x, "y": sheet_y}
             comp: dict[str, Any] = {
                 "reference": unique_reference,
                 "value": str(sheet_file or ""),
                 "type": "sheet",
-                "pins": pins,
+                "units": {"1": sheet_unit},
             }
-            if sheet_x is not None and sheet_y is not None:
-                comp["position"] = {"x": sheet_x, "y": sheet_y}
             if None not in (sheet_x, sheet_y, sheet_width, sheet_height):
-                comp["body_bbox"] = {
+                sheet_unit["body_bbox"] = {
                     "min_x": sheet_x,
                     "min_y": sheet_y,
                     "max_x": sheet_x + sheet_width,
@@ -504,7 +586,7 @@ class SchematicParser:
                 self.power_symbols.append(
                     {
                         "type": comp["lib_id"].split(":", 1)[1],
-                        "position": comp.get("position", {}),
+                        "position": first_unit_position(comp),
                     }
                 )
         print(f"Extracted {len(self.power_symbols)} power symbols")
@@ -577,7 +659,7 @@ class SchematicParser:
         for ref, comp in self.component_info.items():
             if ref.startswith("#"):
                 continue
-            for pin_data in comp.get("pins", []):
+            for _unit, pin_data in iter_component_pins(comp):
                 pin_number = str(pin_data.get("num", pin_data.get("number", "")))
                 if not pin_number:
                     continue
@@ -605,7 +687,7 @@ class SchematicParser:
         for comp in self.component_info.values():
             if comp.get("type") != "sheet":
                 continue
-            for pin_data in comp.get("pins", []):
+            for _unit, pin_data in iter_component_pins(comp):
                 pin_name = str(
                     pin_data.get("name") or pin_data.get("number") or pin_data.get("num")
                 )
@@ -619,12 +701,12 @@ class SchematicParser:
         for ref, comp in self.component_info.items():
             if comp.get("lib_id", "").startswith("power:"):
                 power_name = comp["lib_id"].split(":", 1)[1]
-                pin_coords = comp.get("pins", [])
+                pin_coords = [p for _unit, p in iter_component_pins(comp)]
                 if pin_coords:
                     for pin_data in pin_coords:
                         name_point(pt(pin_data["x"], pin_data["y"]), power_name)
                 else:
-                    pos = comp.get("position", {})
+                    pos = first_unit_position(comp)
                     if pos:
                         name_point(pt(pos.get("x", 0), pos.get("y", 0)), power_name)
 
@@ -693,7 +775,7 @@ class SchematicParser:
 
         anchored: set[tuple] = set()
         for cdata in self.component_info.values():
-            for pin in cdata.get("pins", []):
+            for _unit, pin in iter_component_pins(cdata):
                 anchored.add(rpt(pin["x"], pin["y"]))
         for label in self.labels + self.global_labels + self.hierarchical_labels:
             pos = label["position"]

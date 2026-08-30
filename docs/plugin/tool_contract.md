@@ -83,12 +83,22 @@ A typical LLM editing session follows this pattern:
   "net_count": 8,
   "component_types": {"R": 4, "C": 2, "U": 1},
   "components": {
-    "R1": {
-      "value": "10k",
-      "position": {"x": 100.0, "y": 50.0, "rotation": 0},
-      "pins": [
-        {"num": "1", "x": 101.27, "y": 50.0, "direction": "right", "net": "VCC"}
-      ]
+    "U2": {
+      "value": "motor driver",
+      "units": {
+        "1": {
+          "position": {"x": 101.6, "y": 93.8022, "rotation": 90},
+          "body_bbox": {"min_x": 96.52, "min_y": 89.2, "max_x": 142.24, "max_y": 98.4},
+          "pins": [
+            {"num": "14", "name": "PC11", "x": "96.52", "y": "172.54", "direction": "left", "net": "..."}
+          ]
+        },
+        "2": {
+          "position": {"x": 185.42, "y": 223.3422, "rotation": 90},
+          "body_bbox": {"min_x": 180.34, "min_y": 218.56, "max_x": 210.82, "max_y": 228.12},
+          "pins": [...]
+        }
+      }
     }
   },
   "power_nets": [{"name": "GND", "pin_count": 6}],
@@ -98,6 +108,18 @@ A typical LLM editing session follows this pattern:
 ```
 
 `direction` is the wire-exit direction in screen coordinates: `"right"`, `"down"`, `"left"`, or `"up"`.
+
+Components are nested per unit: `units` is keyed by unit number, and each
+unit carries its own `position` (anchor), `body_bbox` (world-space
+footprint), and `pins`. A single-unit component is nested under
+`units["1"]`. There is no merged top-level bbox — union the per-unit
+bboxes when you need a component's whole occupied region.
+
+`move_component` takes **deltas** (x/y shifts in mm, rotation increment)
+and accepts a `unit` number to move/rotate one unit individually
+(omitted = move all units together by the same delta, preserving their
+relative layout). Read the current anchor from `position` and subtract to
+express an absolute move as a delta.
 
 **When to use:** At the start of every session and after any structural edit to verify the result.
 
@@ -239,15 +261,16 @@ All tools in this group write a backup to `<schematic_path>.bak` before saving.
 
 ---
 
-#### `move_component(schematic_path, reference, x, y, rotation=None)`
+#### `move_component(schematic_path, reference, x, y, rotation=None, unit=None)`
 
-**Purpose:** Moves a component to a new position, optionally updating rotation. Coordinates are in mm and are snapped to the 1.27 mm grid.
+**Purpose:** Shifts a component by a delta, optionally updating rotation. `x`/`y` are **deltas** in mm (each snapped to the 1.27 mm grid, **+Y is down**); `rotation` is a **delta** in degrees applied as `old + rotation` per unit (0/90/180/270). Omitted axes are left unchanged. All units of the reference share the same shift; `unit=N` limits the move/rotate to that unit of a multi-unit symbol (no overlap-avoidance search).
 
 **Key parameters:**
-- `x`, `y` (`float`) — new position in mm.
-- `rotation` (`int | None`) — if `None`, preserves the existing rotation.
+- `x`, `y` (`float | None`) — delta in mm.
+- `rotation` (`int | None`) — delta in degrees (0/90/180/270).
+- `unit` (`int | None`) — optional unit to scope the move to.
 
-**Success response:** `{"success": true, "reference": "R1", "position": {"x": ..., "y": ..., "rotation": ...}}`
+**Success response:** `{"success": true, "reference": "R1", "unit": null, "position": {"x": ..., "y": ...}, "rotation": ..., "units_updated": 1, "body_bbox": {...}}` — `position`/`rotation` are the new **absolute** anchor and rotation of the first moved unit; `body_bbox` is the world-space union of the moved units after the move.
 
 ---
 

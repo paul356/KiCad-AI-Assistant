@@ -142,9 +142,11 @@ def _get_sym_at(sym: Any) -> tuple[float, float, float]:
 
 
 def _get_sym_body_bbox(sym: Any, schematic_path: str) -> dict[str, float] | None:
-    """Return the body_bbox dict for a symbol's reference from the netlist.
+    """Return the union body_bbox of a symbol's reference from the netlist.
 
-    Returns None if the bbox cannot be determined.
+    The netlist stores one body_bbox per unit; the union is the occupied
+    region of the whole multi-unit symbol. Returns None if no unit has a
+    bbox.
     """
     try:
         ref = _get_sym_property(sym, "Reference")
@@ -155,7 +157,9 @@ def _get_sym_body_bbox(sym: Any, schematic_path: str) -> dict[str, float] | None
     netlist = extract_netlist(schematic_path)
     comp = (netlist.get("components") or {}).get(ref)
     if comp:
-        return comp.get("body_bbox")
+        from kcaa.utils.netlist_parser import component_body_bbox
+
+        return component_body_bbox(comp)
     return None
 
 

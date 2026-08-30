@@ -29,6 +29,8 @@ import skip
 SCHEMATIC_PATH = str(Path(__file__).parent / "fixtures/tools_test.kicad_sch")
 SHEET_SCHEMATIC_PATH = str(Path(__file__).parent / "fixtures/sheet_netlist_test.kicad_sch")
 TEST_SYM_PATH = str(Path(__file__).parent / "fixtures/test_symbols.kicad_sym")
+# U1 = myLib:DUAL with units 1 (100,100,90°) and 2 (120,100,0°).
+MULTI_UNIT_PATH = str(Path(__file__).parent.parent / "utils/fixtures/multi_unit.kicad_sch")
 
 # The symbol and library names used across tests.
 _LIB_NAME = "Device"
@@ -106,6 +108,19 @@ def tools():
 def tmp_sch():
     """Yield a temp copy of the schematic, then clean up."""
     path = _make_temp_copy()
+    yield path
+    for p in [path, path + ".bak"]:
+        if os.path.exists(p):
+            os.unlink(p)
+
+
+@pytest.fixture()
+def tmp_multi_sch():
+    """Fresh temp copy of the multi-unit fixture (U1, two units)."""
+    path = tempfile.NamedTemporaryFile(
+        suffix=".kicad_sch", delete=False, dir=tempfile.gettempdir()
+    ).name
+    shutil.copy(MULTI_UNIT_PATH, path)
     yield path
     for p in [path, path + ".bak"]:
         if os.path.exists(p):
@@ -1099,35 +1114,39 @@ class TestMoveComponent:
         pytest.fail("R1 not found in written schematic")
 
     def test_move_xy_only(self, tools, tmp_sch):
-        """move_component with only x/y should update position but not rotation."""
+        """move_component with only x/y deltas should translate but not rotate."""
         sch_orig = skip.Schematic(tmp_sch)
-        orig_rot = None
+        orig_x = orig_y = orig_rot = None
         for sym in sch_orig.symbol:
             try:
                 if sym.property.Reference.value == "R1":
+                    orig_x, orig_y = sym.at.value[0], sym.at.value[1]
                     orig_rot = sym.at.value[2] if len(sym.at.value) > 2 else 0
                     break
             except AttributeError:
                 continue
+        assert orig_x is not None, "R1 not found in fixture"
 
+        dx = 55.88  # grid-aligned: 44 * 1.27
+        dy = 66.04  # grid-aligned: 52 * 1.27
         result = asyncio.run(
             tools["move_component"](
                 schematic_path=tmp_sch,
                 reference="R1",
-                x=55.88,  # grid-aligned: 44 * 1.27
-                y=66.04,  # grid-aligned: 52 * 1.27
+                x=dx,
+                y=dy,
             )
         )
         assert result.get("success") is True, result
-        assert abs(result["position"]["x"] - 55.88) < 0.001
-        assert abs(result["position"]["y"] - 66.04) < 0.001
+        assert abs(result["position"]["x"] - (orig_x + dx)) < 0.001
+        assert abs(result["position"]["y"] - (orig_y + dy)) < 0.001
 
         sch = skip.Schematic(tmp_sch)
         for sym in sch.symbol:
             try:
                 if sym.property.Reference.value == "R1":
-                    assert abs(sym.at.value[0] - 55.88) < 0.001, "x not updated"
-                    assert abs(sym.at.value[1] - 66.04) < 0.001, "y not updated"
+                    assert abs(sym.at.value[0] - (orig_x + dx)) < 0.001, "x not updated"
+                    assert abs(sym.at.value[1] - (orig_y + dy)) < 0.001, "y not updated"
                     if orig_rot is not None:
                         assert sym.at.value[2] == orig_rot, "rotation should not change"
                     return
@@ -1136,28 +1155,42 @@ class TestMoveComponent:
         pytest.fail("R1 not found in written schematic")
 
     def test_move_xy_and_rotation(self, tools, tmp_sch):
-        """move_component with x, y, and rotation should update all three."""
+        """move_component with x, y, and rotation deltas should update all three."""
+        sch_orig = skip.Schematic(tmp_sch)
+        orig_x = orig_y = orig_rot = None
+        for sym in sch_orig.symbol:
+            try:
+                if sym.property.Reference.value == "R1":
+                    orig_x, orig_y = sym.at.value[0], sym.at.value[1]
+                    orig_rot = sym.at.value[2] if len(sym.at.value) > 2 else 0
+                    break
+            except AttributeError:
+                continue
+        assert orig_x is not None and orig_rot is not None, "R1 not found in fixture"
+
+        dx = 12.7  # 10 * 1.27 — lands in free space, clear of the title block
+        dy = 25.4  # 20 * 1.27
         result = asyncio.run(
             tools["move_component"](
                 schematic_path=tmp_sch,
                 reference="R1",
-                x=76.20,  # 60 * 1.27
-                y=88.90,  # 70 * 1.27
+                x=dx,
+                y=dy,
                 rotation=180,
             )
         )
         assert result.get("success") is True, result
-        assert abs(result["position"]["x"] - 76.20) < 0.001
-        assert abs(result["position"]["y"] - 88.90) < 0.001
-        assert result["rotation"] == 180
+        assert abs(result["position"]["x"] - (orig_x + dx)) < 0.001
+        assert abs(result["position"]["y"] - (orig_y + dy)) < 0.001
+        assert result["rotation"] == (orig_rot + 180) % 360
 
         sch = skip.Schematic(tmp_sch)
         for sym in sch.symbol:
             try:
                 if sym.property.Reference.value == "R1":
-                    assert abs(sym.at.value[0] - 76.20) < 0.001
-                    assert abs(sym.at.value[1] - 88.90) < 0.001
-                    assert sym.at.value[2] == 180
+                    assert abs(sym.at.value[0] - (orig_x + dx)) < 0.001
+                    assert abs(sym.at.value[1] - (orig_y + dy)) < 0.001
+                    assert sym.at.value[2] == (orig_rot + 180) % 360
                     return
             except AttributeError:
                 continue
@@ -1172,8 +1205,9 @@ class TestMoveComponent:
         from kcaa.tools.sheet_tools import _align_to_grid
         from kcaa.utils.netlist_parser import extract_netlist
 
+        # R2 is at (100, 100) — a delta landing R1 there guarantees overlap.
         target_x = 100.0
-        target_y = 100.0  # R2 is at (100, 100) — guaranteed overlap.
+        target_y = 100.0
 
         # Read R1's current at position and UUID from the fixture.
         sch = skip.Schematic(tmp_sch)
@@ -1200,9 +1234,15 @@ class TestMoveComponent:
         assert r1_uuid is not None, "R1 UUID not found"
         assert r1_at_x is not None, "R1 position not found"
 
-        # Get R1's body_bbox dimensions.
+        # Get R1's body_bbox dimensions (per-unit schema; R1 is unit 1).
         netlist = extract_netlist(tmp_sch)
-        bb_d = (netlist.get("components") or {}).get("R1", {}).get("body_bbox")
+        bb_d = (
+            (netlist.get("components") or {})
+            .get("R1", {})
+            .get("units", {})
+            .get("1", {})
+            .get("body_bbox")
+        )
         assert bb_d is not None, "R1 body_bbox not in netlist"
         bbox_w = float(bb_d["max_x"]) - float(bb_d["min_x"])
         bbox_h = float(bb_d["max_y"]) - float(bb_d["min_y"])
@@ -1229,12 +1269,16 @@ class TestMoveComponent:
         expected_x = _align_to_grid(cand_x - off_x)
         expected_y = _align_to_grid(cand_y - off_y)
 
+        # move_component takes deltas; derive them so the snapped target lands
+        # on R2's spot.
+        delta_x = snapped_tx - r1_at_x
+        delta_y = snapped_ty - r1_at_y
         result = asyncio.run(
             tools["move_component"](
                 schematic_path=tmp_sch,
                 reference="R1",
-                x=target_x,
-                y=target_y,
+                x=delta_x,
+                y=delta_y,
             )
         )
         assert result["success"] is True, result
@@ -1242,35 +1286,41 @@ class TestMoveComponent:
             f"Expected adjustment, got position={result.get('position')}"
         )
         # requested_position reflects the grid-snapped target, not raw input.
-        assert result["requested_position"] == {
-            "x": snapped_tx,
-            "y": snapped_ty,
-        }
+        assert result["requested_position"] == pytest.approx({"x": snapped_tx, "y": snapped_ty})
         assert result["position"]["x"] == pytest.approx(expected_x)
         assert result["position"]["y"] == pytest.approx(expected_y)
         assert result["note"] == "Position adjusted to nearest free area to avoid overlap."
 
     def test_move_no_overlap_keeps_exact_position(self, tools, tmp_sch):
-        """When the target position is free, move_component uses it as-is."""
-        from kcaa.tools.sheet_tools import _align_to_grid
+        """When the delta lands in free space, move_component applies it as-is."""
+        sch_orig = skip.Schematic(tmp_sch)
+        orig_x = orig_y = None
+        for sym in sch_orig.symbol:
+            try:
+                if sym.property.Reference.value == "R1":
+                    orig_x, orig_y = sym.at.value[0], sym.at.value[1]
+                    break
+            except AttributeError:
+                continue
+        assert orig_x is not None, "R1 not found in fixture"
 
-        target_x = 55.88  # 44 * 1.27 — grid-aligned
-        target_y = 10.16  # 8 * 1.27 — far from the component cluster (~Y=100).
+        dx = 55.88  # 44 * 1.27 — grid-aligned
+        dy = 10.16  # 8 * 1.27 — lands far from the component cluster (~Y=100).
 
         result = asyncio.run(
             tools["move_component"](
                 schematic_path=tmp_sch,
                 reference="R1",
-                x=target_x,
-                y=target_y,
+                x=dx,
+                y=dy,
             )
         )
         assert result["success"] is True, result
         assert result.get("position_adjusted") is False, (
             f"Expected no adjustment at free position, got note={result.get('note')}"
         )
-        assert abs(result["position"]["x"] - _align_to_grid(target_x)) < 0.001
-        assert abs(result["position"]["y"] - _align_to_grid(target_y)) < 0.001
+        assert abs(result["position"]["x"] - (orig_x + dx)) < 0.001
+        assert abs(result["position"]["y"] - (orig_y + dy)) < 0.001
 
     def test_move_creates_backup(self, tools, tmp_sch):
         """A .bak file should appear next to the schematic after moving."""
@@ -1426,12 +1476,14 @@ class TestMoveComponent:
         assert "error" in result
 
     def test_moves_sheet_by_name(self, tools, tmp_sheet_sch):
+        """x/y are deltas here too: the sheet shifts, not moves to an
+        absolute spot. Fixture starts the sheet at (50.8, 50.8)."""
         result = asyncio.run(
             tools["move_component"](
                 schematic_path=tmp_sheet_sch,
                 reference="Power",
-                x=120.0,
-                y=80.0,
+                x=68.58,  # 54 * 1.27
+                y=29.21,  # 23 * 1.27
             )
         )
 
@@ -1522,6 +1574,132 @@ def _make_skip_symbol(ref: str, x: float, y: float, uid: str) -> str:
         f' (path "/fake" (reference "{ref}") (unit 1))))\n'
         f"  )\n"
     )
+
+
+class TestMoveComponentMultiUnit:
+    """move_component with unit scoping and multi-unit whole moves (issue #89)."""
+
+    @staticmethod
+    def _u1_units(path: str) -> dict:
+        """Return U1's nested units from extract_netlist for verification."""
+        from kcaa.utils.netlist_parser import extract_netlist
+
+        nl = extract_netlist(path)
+        comp = nl["components"]["U1"]
+        return {
+            int(unit_key): {
+                "position": unit_data.get("position"),
+                "pins": {
+                    p["num"]: (float(p["x"]), float(p["y"]), p["direction"])
+                    for p in unit_data.get("pins", [])
+                },
+            }
+            for unit_key, unit_data in comp["units"].items()
+        }
+
+    def test_whole_move_preserves_unit_offsets(self, tools, tmp_multi_sch):
+        """Whole-component delta move translates every unit by the same delta,
+        preserving relative unit layout and rotations."""
+        dx = 127.0  # 100 * 1.27 — grid-aligned
+        dy = 63.5  # 50 * 1.27 — grid-aligned
+        result = asyncio.run(
+            tools["move_component"](
+                schematic_path=tmp_multi_sch,
+                reference="U1",
+                x=dx,
+                y=dy,
+            )
+        )
+        assert result.get("success") is True, result
+        assert result["unit"] is None
+        assert result["units_updated"] == 2
+        assert result["position_adjusted"] is False, result
+        units = self._u1_units(tmp_multi_sch)
+        u1, u2 = units[1], units[2]
+        # unit 1 lands on old + delta…
+        assert (u1["position"]["x"], u1["position"]["y"]) == pytest.approx((100.0 + dx, 100.0 + dy))
+        assert u1["position"]["rotation"] == 90
+        # …and unit 2 keeps its relative +20 mm x offset, rotation untouched.
+        assert (u2["position"]["x"], u2["position"]["y"]) == pytest.approx((120.0 + dx, 100.0 + dy))
+        assert (u2["position"]["x"] - u1["position"]["x"]) == pytest.approx(20.0)
+        assert u2["position"]["rotation"] == 0
+
+    def test_unit_scoped_move_touches_only_that_unit(self, tools, tmp_multi_sch):
+        """unit=N applies the delta to only that unit, leaving the others untouched."""
+        dx = 101.6  # 80 * 1.27 — grid-aligned
+        dy = 19.05  # 15 * 1.27 — grid-aligned
+        result = asyncio.run(
+            tools["move_component"](
+                schematic_path=tmp_multi_sch,
+                reference="U1",
+                x=dx,
+                y=dy,
+                unit=2,
+            )
+        )
+        assert result.get("success") is True, result
+        assert result["unit"] == 2
+        assert result["units_updated"] == 1
+        units = self._u1_units(tmp_multi_sch)
+        assert (units[2]["position"]["x"], units[2]["position"]["y"]) == pytest.approx(
+            (120.0 + dx, 100.0 + dy)
+        )
+        assert units[2]["position"]["rotation"] == 0
+        assert units[2]["pins"]["3"] == pytest.approx((120.0 + dx, 100.0 + dy - 2.54, "up"))
+        # unit 1 anchor and pin world coordinates are untouched
+        assert (units[1]["position"]["x"], units[1]["position"]["y"]) == pytest.approx(
+            (100.0, 100.0)
+        )
+        assert units[1]["position"]["rotation"] == 90
+        assert units[1]["pins"]["1"] == pytest.approx((97.46, 100.0, "left"))
+
+    def test_unit_scoped_rotation_recomputes_pins(self, tools, tmp_multi_sch):
+        """Delta-rotating one unit about its own anchor moves that unit's pins."""
+        result = asyncio.run(
+            tools["move_component"](
+                schematic_path=tmp_multi_sch,
+                reference="U1",
+                rotation=90,
+                unit=2,
+            )
+        )
+        assert result["success"] is True, result
+        assert result["rotation"] == 90
+        units = self._u1_units(tmp_multi_sch)
+        # unit 2: 0° + 90° delta -> 90°; pins rotate CCW about the anchor.
+        assert units[2]["position"]["rotation"] == 90
+        assert (units[2]["position"]["x"], units[2]["position"]["y"]) == pytest.approx(
+            (120.0, 100.0)
+        )
+        assert units[2]["pins"]["3"] == pytest.approx((117.46, 100.0, "left"))
+        assert units[2]["pins"]["4"] == pytest.approx((122.54, 100.0, "right"))
+        # unit 1 untouched (still 90°, pins unchanged)
+        assert units[1]["position"]["rotation"] == 90
+        assert units[1]["pins"]["1"] == pytest.approx((97.46, 100.0, "left"))
+
+    def test_unit_validation_errors(self, tools, tmp_multi_sch):
+        """Nonexistent or non-positive unit numbers are rejected."""
+        r = asyncio.run(
+            tools["move_component"](
+                schematic_path=tmp_multi_sch,
+                reference="U1",
+                x=5.0,
+                unit=3,
+            )
+        )
+        assert "error" in r
+        assert "no unit 3" in r["error"]
+
+        r = asyncio.run(
+            tools["move_component"](
+                schematic_path=tmp_multi_sch,
+                reference="U1",
+                x=5.0,
+                unit=0,
+            )
+        )
+        assert "error" in r
+        assert "positive integer" in r["error"]
 
 
 class TestNextReferenceCrossFile:

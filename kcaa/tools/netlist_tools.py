@@ -9,7 +9,7 @@ from typing import Any
 from fastmcp import Context, FastMCP
 
 from kcaa.utils.file_utils import get_project_files
-from kcaa.utils.netlist_parser import extract_netlist
+from kcaa.utils.netlist_parser import extract_netlist, iter_component_pins
 
 
 def register_netlist_tools(mcp: FastMCP) -> None:
@@ -101,10 +101,11 @@ def register_netlist_tools(mcp: FastMCP) -> None:
         - ``position``: ``{x, y}`` placement anchor in mm (KiCad screen coords,
           **+Y is down**).
         - ``rotation``, ``mirror``, ``lib_id``, ``value``, ``footprint``.
-        - ``body_bbox``: ``{min_x, min_y, max_x, max_y}`` world-space bounding
-          box (union of every placed unit). Use this to check overlaps before
-          calling ``move_component`` / ``add_symbol_to_schematic``. May be
-          absent for graphics-less symbols (e.g. PWR_FLAG).
+        - each unit carries its own ``body_bbox``: ``{min_x, min_y, max_x,
+          max_y}`` world-space bounding box of that unit's footprint. Use it
+          to check overlaps before calling ``move_component`` /
+          ``add_symbol_to_schematic``. May be absent for graphics-less
+          symbols (e.g. PWR_FLAG).
         - ``pins``: list of ``{num, name, electrical, x, y, direction}``. ``x``/``y`` are world
           coordinates already accounting for placement and rotation;
           ``direction`` is the screen-space exit direction
@@ -238,17 +239,32 @@ def register_netlist_tools(mcp: FastMCP) -> None:
                 ref: {
                     "value": cdata.get("value", ""),
                     "type": cdata.get("type", "component"),
-                    "position": cdata.get("position", {}),
-                    "pins": [
-                        {
-                            **pinfo,
-                            "net": pin_to_net.get(
-                                (ref, str(pinfo.get("num", pinfo.get("number", ""))))
+                    # Units are nested per reference (issue #89): each unit
+                    # keeps its own anchor/pins; every pin gains its net.
+                    "units": {
+                        unit_key: {
+                            **(
+                                {"position": unit_data.get("position")}
+                                if unit_data.get("position")
+                                else {}
                             ),
+                            **(
+                                {"body_bbox": unit_data["body_bbox"]}
+                                if "body_bbox" in unit_data
+                                else {}
+                            ),
+                            "pins": [
+                                {
+                                    **pin,
+                                    "net": pin_to_net.get(
+                                        (ref, str(pin.get("num", pin.get("number", ""))))
+                                    ),
+                                }
+                                for pin in unit_data.get("pins", [])
+                            ],
                         }
-                        for pinfo in cdata.get("pins", [])
-                    ],
-                    **({"body_bbox": cdata["body_bbox"]} if "body_bbox" in cdata else {}),
+                        for unit_key, unit_data in (cdata.get("units") or {}).items()
+                    },
                 }
                 for ref, cdata in raw_components.items()
             }
@@ -323,7 +339,7 @@ def register_netlist_tools(mcp: FastMCP) -> None:
 
                 pin_at: dict[Any, list] = _dd(list)
                 for ref, cdata in components.items():
-                    for pinfo in cdata.get("pins", []):
+                    for _unit, pinfo in iter_component_pins(cdata):
                         pin_at[rpt(pinfo["x"], pinfo["y"])].append(
                             {"ref": ref, "pin": str(pinfo.get("num", ""))}
                         )
@@ -547,27 +563,26 @@ def register_netlist_tools(mcp: FastMCP) -> None:
 
             # Categorize connections by pin function (if possible)
             pin_functions = {}
-            if "pins" in component_info:
-                for pin in component_info["pins"]:
-                    pin_num = pin.get("num")
-                    pin_name = pin.get("name", "")
+            for _unit, pin in iter_component_pins(component_info):
+                pin_num = pin.get("num")
+                pin_name = pin.get("name", "")
 
-                    # Try to categorize based on pin name
-                    pin_type = "unknown"
+                # Try to categorize based on pin name
+                pin_type = "unknown"
 
-                    if any(
-                        power_term in pin_name.upper()
-                        for power_term in ["VCC", "VDD", "VEE", "VSS", "GND", "PWR", "POWER"]
-                    ):
-                        pin_type = "power"
-                    elif any(io_term in pin_name.upper() for io_term in ["IO", "I/O", "GPIO"]):
-                        pin_type = "io"
-                    elif any(input_term in pin_name.upper() for input_term in ["IN", "INPUT"]):
-                        pin_type = "input"
-                    elif any(output_term in pin_name.upper() for output_term in ["OUT", "OUTPUT"]):
-                        pin_type = "output"
+                if any(
+                    power_term in pin_name.upper()
+                    for power_term in ["VCC", "VDD", "VEE", "VSS", "GND", "PWR", "POWER"]
+                ):
+                    pin_type = "power"
+                elif any(io_term in pin_name.upper() for io_term in ["IO", "I/O", "GPIO"]):
+                    pin_type = "io"
+                elif any(input_term in pin_name.upper() for input_term in ["IN", "INPUT"]):
+                    pin_type = "input"
+                elif any(output_term in pin_name.upper() for output_term in ["OUT", "OUTPUT"]):
+                    pin_type = "output"
 
-                    pin_functions[pin_num] = {"name": pin_name, "type": pin_type}
+                pin_functions[pin_num] = {"name": pin_name, "type": pin_type}
 
             # Build result
             result = {

@@ -73,27 +73,39 @@ SAMPLE_NETLIST = {
     "components": {
         "R1": {
             "value": "10k",
-            "position": {"x": 100, "y": 50},
-            "pins": [
-                {"num": "1", "x": 95, "y": 50, "direction": "left"},
-                {"num": "2", "x": 105, "y": 50, "direction": "right"},
-            ],
+            "units": {
+                "1": {
+                    "position": {"x": 100, "y": 50, "rotation": 0},
+                    "pins": [
+                        {"num": "1", "x": 95, "y": 50, "direction": "left"},
+                        {"num": "2", "x": 105, "y": 50, "direction": "right"},
+                    ],
+                },
+            },
         },
         "R2": {
             "value": "4.7k",
-            "position": {"x": 150, "y": 50},
-            "pins": [
-                {"num": "1", "x": 145, "y": 50, "direction": "left"},
-                {"num": "2", "x": 155, "y": 50, "direction": "right"},
-            ],
+            "units": {
+                "1": {
+                    "position": {"x": 150, "y": 50, "rotation": 0},
+                    "pins": [
+                        {"num": "1", "x": 145, "y": 50, "direction": "left"},
+                        {"num": "2", "x": 155, "y": 50, "direction": "right"},
+                    ],
+                },
+            },
         },
         "C1": {
             "value": "100nF",
-            "position": {"x": 200, "y": 100},
-            "pins": [
-                {"num": "1", "x": 195, "y": 100, "direction": "left"},
-                {"num": "2", "x": 205, "y": 100, "direction": "right"},
-            ],
+            "units": {
+                "1": {
+                    "position": {"x": 200, "y": 100, "rotation": 0},
+                    "pins": [
+                        {"num": "1", "x": 195, "y": 100, "direction": "left"},
+                        {"num": "2", "x": 205, "y": 100, "direction": "right"},
+                    ],
+                },
+            },
         },
     },
     "nets": {
@@ -259,8 +271,8 @@ class TestExtractSchematicNetlist:
             "max_x": 76.2,
             "max_y": 76.2,
         }.items():
-            assert sheet["body_bbox"][key] == pytest.approx(expected)
-        assert sheet["pins"] == [
+            assert sheet["units"]["1"]["body_bbox"][key] == pytest.approx(expected)
+        assert sheet["units"]["1"]["pins"] == [
             {
                 "num": "VCC",
                 "number": "VCC",
@@ -309,7 +321,7 @@ class TestExtractSchematicNetlist:
     @patch("kcaa.tools.netlist_tools.extract_netlist", return_value=SAMPLE_NETLIST)
     def test_pin_to_net_mapping(self, mock_extract, mock_exists):
         result = _run(self.fn("/some/design.kicad_sch", ctx=None))
-        r1_pins = result["analysis"]["components"]["R1"]["pins"]
+        r1_pins = result["analysis"]["components"]["R1"]["units"]["1"]["pins"]
         pin_nets = {p["num"]: p["net"] for p in r1_pins}
         assert pin_nets["2"] == "GND"
         assert pin_nets["1"] == "Net-(R1-Pad1)"
@@ -469,14 +481,48 @@ class TestFindComponentConnections:
                 **SAMPLE_NETLIST["components"],
                 "U1": {
                     "value": "ATmega328",
-                    "position": {"x": 300, "y": 200},
-                    "pins": [
-                        {"num": "1", "x": 295, "y": 200, "direction": "left", "name": "VCC"},
-                        {"num": "2", "x": 305, "y": 200, "direction": "right", "name": "GND"},
-                        {"num": "3", "x": 295, "y": 210, "direction": "left", "name": "INPUT"},
-                        {"num": "4", "x": 305, "y": 210, "direction": "right", "name": "OUTPUT"},
-                        {"num": "5", "x": 295, "y": 220, "direction": "left", "name": "GPIO0"},
-                    ],
+                    "units": {
+                        "1": {
+                            "position": {"x": 300, "y": 200},
+                            "pins": [
+                                {
+                                    "num": "1",
+                                    "x": 295,
+                                    "y": 200,
+                                    "direction": "left",
+                                    "name": "VCC",
+                                },
+                                {
+                                    "num": "2",
+                                    "x": 305,
+                                    "y": 200,
+                                    "direction": "right",
+                                    "name": "GND",
+                                },
+                                {
+                                    "num": "3",
+                                    "x": 295,
+                                    "y": 210,
+                                    "direction": "left",
+                                    "name": "INPUT",
+                                },
+                                {
+                                    "num": "4",
+                                    "x": 305,
+                                    "y": 210,
+                                    "direction": "right",
+                                    "name": "OUTPUT",
+                                },
+                                {
+                                    "num": "5",
+                                    "x": 295,
+                                    "y": 220,
+                                    "direction": "left",
+                                    "name": "GPIO0",
+                                },
+                            ],
+                        }
+                    },
                 },
             },
             "nets": {
@@ -508,8 +554,12 @@ class TestFindComponentConnections:
             "components": {
                 "R1": {
                     "value": "10k",
-                    "position": {"x": 100, "y": 50},
-                    "pins": [{"num": "1", "x": 95, "y": 50, "direction": "left"}],
+                    "units": {
+                        "1": {
+                            "position": {"x": 100, "y": 50},
+                            "pins": [{"num": "1", "x": 95, "y": 50, "direction": "left"}],
+                        }
+                    },
                 },
             },
             "nets": {},
