@@ -53,7 +53,7 @@ function _toolCallHtml(e) {
     var args = typeof e.args === 'string' ? _escapeHtml(e.args) : _escapeHtml(JSON.stringify(e.args, null, 2));
     var result = typeof e.result === 'string' ? _escapeHtml(e.result) : _escapeHtml(JSON.stringify(e.result, null, 2));
     var uid = 'tool_' + (e._seq || Math.random().toString(36).slice(2));
-    return '<details open class="tools tool-details" id="' + uid + '" style="margin:2px 8px">'
+    return '<details class="tools tool-details" id="' + uid + '" style="margin:2px 8px">'
         + '<summary class="tool-summary"><span style="color:' + iconColor + '">' + icon + '</span> '
         + '<span style="color:#444;font-weight:600">\u21B3 ' + _escapeHtml(e.name)
         + '</span></summary>'
@@ -206,26 +206,28 @@ window._clearConversation = function() {
     window.scrollTo(0, 0);
 };
 
-// Click-to-collapse: results are expanded by default; clicking the tool
-// body (args/result area) collapses the details element.  Clicking the
-// summary toggles natively.
+// Click-to-collapse: results expand via the summary (native toggle).
+// Clicking the tool body (args/result area) collapses the details element.
 // Text selection is protected from interference:
-//  - a drag (mousedown then movement) is a selection gesture, never collapses
+//  - only a genuine drag (mousedown then movement beyond normal click
+//    jitter) is treated as a selection gesture, never collapses
 //  - an active selection at click time prevents collapse
 //  - double-click (word / line selection) cancels the pending collapse that
 //    its first click would otherwise schedule
 (function _installToolCollapse() {
-    var _downX = 0, _downY = 0, _dragMoved = false, _collapseTimer = null;
+    var _downX = 0, _downY = 0, _drag = false, _collapseTimer = null;
 
     document.addEventListener('mousedown', function(e) {
         _downX = e.clientX;
         _downY = e.clientY;
-        _dragMoved = false;
+        _drag = false;
     }, true);
     document.addEventListener('mousemove', function(e) {
-        if (!_dragMoved &&
-                (Math.abs(e.clientX - _downX) > 4 || Math.abs(e.clientY - _downY) > 4)) {
-            _dragMoved = true;  // drag = selection gesture, not a click
+        // Human clicks wobble a few pixels; only flag movements well beyond
+        // that (10px radius) as drags that could create a text selection.
+        var dx = e.clientX - _downX, dy = e.clientY - _downY;
+        if (!_drag && (dx * dx + dy * dy) > 100) {
+            _drag = true;
         }
     }, true);
     document.addEventListener('dblclick', function() {
@@ -239,16 +241,16 @@ window._clearConversation = function() {
         if (e.button !== undefined && e.button !== 0) return;  // left button only
         var toolBody = e.target.closest('.tool-body');
         if (!toolBody) return;
-        if (_dragMoved) return;  // was a drag-select
+        if (_drag) return;  // genuine drag-select, not a click
         var sel = window.getSelection();
-        if (sel && !sel.isCollapsed && sel.toString().length > 0) return;  // active selection
+        if (sel && !sel.isCollapsed) return;  // active selection
         var detailsId = toolBody.getAttribute('data-details');
         if (!detailsId) return;
         var details = document.getElementById(detailsId);
         if (!details || !details.open) return;
         // Defer: the first click of a double-click would collapse before the
         // dblclick event arrives; cancel the collapse when one follows.
-        if (_collapseTimer) clearTimeout(_collapseTimer);
+        clearTimeout(_collapseTimer);
         _collapseTimer = setTimeout(function() {
             _collapseTimer = null;
             details.open = false;
