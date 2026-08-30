@@ -122,6 +122,10 @@ class SchematicParser:
         self.junctions: list[dict[str, Any]] = []
         self.no_connects: list[dict[str, Any]] = []
         self.power_symbols: list[dict[str, Any]] = []
+        # (net name, world x, world y) for every power-symbol pin tip —
+        # collected straight from the placed symbols so custom/imported
+        # libraries (ref "#PWR?" but no "power:" lib_id) are covered too.
+        self._power_connections: list[dict[str, Any]] = []
         self.hierarchical_labels: list[dict[str, Any]] = []
         self.global_labels: list[dict[str, Any]] = []
 
@@ -315,6 +319,32 @@ class SchematicParser:
                 unit_entry["position"] = {"x": sym_x, "y": sym_y, "rotation": sym_rot}
             if pins_summary:
                 unit_entry["pins"] = pins_summary
+
+            # KiCad marks every power symbol with the fixed Reference
+            # "#PWR?" (lib_id "power:*" is only the KiCad-library spelling;
+            # custom / Altium-imported libraries use arbitrary lib_ids, so
+            # it must NOT be the gate). The net name is the Value property
+            # and the connection point is the pin tip. Collect all of them
+            # here so _build_netlist can declare these nets by name.
+            power_name = comp.get("value") or ""
+            if (ref == "#PWR?" or str(comp.get("lib_id", "")).startswith("power:")) and power_name:
+                # Power-symbol pins are hidden by convention, so
+                # sym_pin_world_coords does not surface them; the pin sits at
+                # the library origin, which rotation/mirror leaves unchanged,
+                # so the placement anchor IS the pin tip in world space.
+                tips: list[tuple[float, float]] = [
+                    (float(pin["x"]), float(pin["y"])) for pin in pins_summary
+                ]
+                if not tips and sym_x is not None and sym_y is not None:
+                    tips = [(sym_x, sym_y)]
+                for tx, ty in tips:
+                    self._power_connections.append(
+                        {
+                            "name": power_name,
+                            "x": tx,
+                            "y": ty,
+                        }
+                    )
 
             prev = self.component_info.get(ref)
             if prev is not None:
@@ -579,16 +609,29 @@ class SchematicParser:
         )
 
     def _extract_power_symbols(self) -> None:
-        """Extract power symbol information from schematic."""
+        """Extract power symbol information from schematic.
+
+        Power symbols are identified by their fixed Reference ``#PWR?``
+        (with ``power:`` lib_id as the KiCad-standard-library spelling) —
+        never by lib_id prefix alone, because custom / Altium-imported
+        libraries use arbitrary library names. The net name is the symbol's
+        Value property; the connection point is its pin tip (power-symbol
+        pins sit at the library origin, so the world tip equals the anchor
+        for unrotated placements).
+        """
         print("Extracting power symbols")
-        for comp in self.components:
-            if comp.get("lib_id", "").startswith("power:"):
-                self.power_symbols.append(
-                    {
-                        "type": comp["lib_id"].split(":", 1)[1],
-                        "position": first_unit_position(comp),
-                    }
-                )
+        seen: set[tuple[str, float, float]] = set()
+        for pc in self._power_connections:
+            key = (pc["name"], pc["x"], pc["y"])
+            if key in seen:
+                continue
+            seen.add(key)
+            self.power_symbols.append(
+                {
+                    "type": pc["name"],
+                    "position": {"x": pc["x"], "y": pc["y"]},
+                }
+            )
         print(f"Extracted {len(self.power_symbols)} power symbols")
 
     def _extract_no_connects(self) -> None:
@@ -654,7 +697,14 @@ class SchematicParser:
                 pt(wire["end"]["x"], wire["end"]["y"]),
             )
 
-        # Step 2: Register pin world positions (already rotation-corrected by skip)
+        # Step 2: Register pin world positions (already rotation-corrected by skip).
+        # KiCad connectivity: a pin's connection point is its tip (world
+        # position). Two pins whose tips coincide are electrically connected
+        # with no wire required (and a pin tip touching a wire endpoint
+        # connects too). The union-find keys points by their rounded world
+        # coordinates, so coincident points share a root; the explicit union
+        # below makes the pin-tip-to-pin-tip rule a stated contract rather
+        # than a side effect of the shared key.
         placed_pin_world: dict[tuple[str, str], tuple] = {}
         for ref, comp in self.component_info.items():
             if ref.startswith("#"):
@@ -666,6 +716,58 @@ class SchematicParser:
                 world_pt = pt(pin_data["x"], pin_data["y"])
                 find(world_pt)  # register in uf
                 placed_pin_world[(ref, pin_number)] = world_pt
+
+        # Step 2b: Explicitly union coincident pin tips (pin-to-pin contact).
+        first_at_pos: dict[tuple, tuple] = {}
+        for (_ref, _num), world_pt in placed_pin_world.items():
+            if world_pt in first_at_pos:
+                union(first_at_pos[world_pt], world_pt)
+            else:
+                first_at_pos[world_pt] = world_pt
+
+        # Step 2c: KiCad connects point items whose anchor lands ANYWHERE on
+        # a wire segment — a label placed mid-wire (or a pin tip touching a
+        # wire body) joins that wire's net with no junction; junction dots
+        # exist only for wire-to-wire crossings. Union such anchors into the
+        # wire net (its ends already share a root).
+        wire_segments = [
+            (pt(w["start"]["x"], w["start"]["y"]), pt(w["end"]["x"], w["end"]["y"]))
+            for w in self.wires
+        ]
+
+        def _mid_segment_hit(p, seg, eps=1e-6):
+            (ax, ay), (bx, by) = seg
+            px, py = p
+            if abs((bx - ax) * (py - ay) - (by - ay) * (px - ax)) > eps:
+                return False  # not collinear
+            if (px - ax) * (px - bx) > eps or (py - ay) * (py - by) > eps:
+                return False  # outside the segment bbox
+            # Exclude the segment's own ends (already connected by coordinate).
+            if abs(px - ax) < eps and abs(py - ay) < eps:
+                return False
+            if abs(px - bx) < eps and abs(py - by) < eps:
+                return False
+            return True
+
+        # Every point item that must attach to whatever wire it sits on:
+        # pin tips, label anchors (local/global/hierarchical), power-symbol
+        # tips, and sheet-symbol pin positions.
+        anchor_points: set[tuple, tuple] = set(placed_pin_world.values())
+        for label in self.labels + self.global_labels + self.hierarchical_labels:
+            anchor_points.add(pt(label["position"]["x"], label["position"]["y"]))
+        for pc in self._power_connections:
+            anchor_points.add(pt(pc["x"], pc["y"]))
+        for comp in self.component_info.values():
+            if comp.get("type") == "sheet":
+                for _unit, pin_data in iter_component_pins(comp):
+                    anchor_points.add(pt(pin_data["x"], pin_data["y"]))
+
+        for p in anchor_points:
+            find(p)  # register
+            for seg in wire_segments:
+                if _mid_segment_hit(p, seg):
+                    union(p, seg[0])
+                    break
 
         # Step 3: Assign net names from labels
         point_net: dict[tuple, str] = {}
@@ -694,21 +796,14 @@ class SchematicParser:
                 if pin_name:
                     name_point(pt(pin_data["x"], pin_data["y"]), pin_name)
 
-        # Power symbol pins provide net names at their world positions.
-        # When skip cannot resolve pin.location for a power symbol (e.g. power:GND),
-        # fall back to the symbol's placement position, which in KiCad is always
-        # the connection point for single-pin power symbols.
-        for ref, comp in self.component_info.items():
-            if comp.get("lib_id", "").startswith("power:"):
-                power_name = comp["lib_id"].split(":", 1)[1]
-                pin_coords = [p for _unit, p in iter_component_pins(comp)]
-                if pin_coords:
-                    for pin_data in pin_coords:
-                        name_point(pt(pin_data["x"], pin_data["y"]), power_name)
-                else:
-                    pos = first_unit_position(comp)
-                    if pos:
-                        name_point(pt(pos.get("x", 0), pos.get("y", 0)), power_name)
+        # Power-symbol pin tips declare net names at their world positions.
+        # Connections are collected from EVERY power symbol (ref "#PWR?" or
+        # "power:" lib_id) in _extract_components, including custom and
+        # Altium-imported libraries. Each tip is a connection point: any
+        # component pin or wire endpoint at that coordinate joins the named
+        # net (KiCad: power symbols carry the net name in their Value).
+        for pc in self._power_connections:
+            name_point(pt(pc["x"], pc["y"]), pc["name"])
 
         # Step 4: Group component pins by union-find group -> net
         group_pins: dict[tuple, list] = defaultdict(list)
@@ -782,6 +877,9 @@ class SchematicParser:
             anchored.add(rpt(pos["x"], pos["y"]))
         for junc in self.junctions:
             anchored.add(rpt(junc["x"], junc["y"]))
+        # Power-symbol pin tips anchor their wires like labels/junctions do.
+        for pc in self._power_connections:
+            anchored.add(rpt(pc["x"], pc["y"]))
 
         return {pt for pt, count in endpoint_count.items() if count == 1 and pt not in anchored}
 

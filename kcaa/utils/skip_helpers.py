@@ -73,7 +73,7 @@ def _pin_world_from_lib(
     :func:`kcaa.utils.symbol_geometry.lib_bbox_to_world`, in lib (Y-up, CCW)
     space:
 
-      1. mirror (``"y"`` flips lib x → -x; ``"x"`` flips lib y → -y),
+      1. mirror (``"x"`` flips lib x → -x; ``"y"`` flips lib y → -y),
       2. placement rotation (CCW, via ``symbol_geometry._rotate_lib_point``),
       3. translate by the anchor,
       4. Y-flip: ``world_y = sym_y - rel_y``.
@@ -82,8 +82,16 @@ def _pin_world_from_lib(
     the lib pin angle is tip-to-body in the CCW lib frame, so the
     body-to-tip exit direction in the same CCW file-angle convention is
     ``exit = (angle + 180) % 360`` (0=right, 90=up, 180=left, 270=down on
-    screen).  The mirror ±180° adjustments follow skip's
-    ``SymbolPin.location`` so mirrored output is unchanged.
+    screen).
+
+    Mirror axis semantics: KiCad's ``(mirror x)`` negates lib *x* (flip
+    through the vertical axis) and ``(mirror y)`` negates lib *y*.  A
+    negated axis reverses that axis' cardinal directions: x-flip swaps
+    0°/180°, y-flip swaps 90°/270° (angles along the flipped axis get
+    +180°, the other two are unchanged).  Verified against
+    ``MotorCell.kicad_sch`` J14 (``(mirror x)`` at 90°): the three pin
+    wire endpoints sit at x = anchor − 2.54, i.e. lib x is negated —
+    the earlier label-swapped implementation put them at x = anchor + 2.54.
     """
     from kcaa.utils.symbol_geometry import _rotate_lib_point
 
@@ -92,13 +100,13 @@ def _pin_world_from_lib(
     ly = rel_raw[1]
     lib_angle = float(rel_raw[2]) if len(rel_raw) > 2 else 0.0
 
-    if mirror_val == "y":
+    if mirror_val == "x":
         lx = -lx
         if lib_angle % 180 == 0:
             lib_angle = (lib_angle + 180) % 360
-    elif mirror_val == "x":
+    elif mirror_val == "y":
         ly = -ly
-        if lib_angle % 90 == 0:
+        if lib_angle % 180 != 0:
             lib_angle = (lib_angle + 180) % 360
 
     # KiCad rotates symbols counter-clockwise in the lib Y-up frame.  Note:
