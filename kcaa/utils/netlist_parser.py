@@ -725,6 +725,50 @@ class SchematicParser:
             else:
                 first_at_pos[world_pt] = world_pt
 
+        # Step 2c: KiCad connects point items whose anchor lands ANYWHERE on
+        # a wire segment — a label placed mid-wire (or a pin tip touching a
+        # wire body) joins that wire's net with no junction; junction dots
+        # exist only for wire-to-wire crossings. Union such anchors into the
+        # wire net (its ends already share a root).
+        wire_segments = [
+            (pt(w["start"]["x"], w["start"]["y"]), pt(w["end"]["x"], w["end"]["y"]))
+            for w in self.wires
+        ]
+
+        def _mid_segment_hit(p, seg, eps=1e-6):
+            (ax, ay), (bx, by) = seg
+            px, py = p
+            if abs((bx - ax) * (py - ay) - (by - ay) * (px - ax)) > eps:
+                return False  # not collinear
+            if (px - ax) * (px - bx) > eps or (py - ay) * (py - by) > eps:
+                return False  # outside the segment bbox
+            # Exclude the segment's own ends (already connected by coordinate).
+            if abs(px - ax) < eps and abs(py - ay) < eps:
+                return False
+            if abs(px - bx) < eps and abs(py - by) < eps:
+                return False
+            return True
+
+        # Every point item that must attach to whatever wire it sits on:
+        # pin tips, label anchors (local/global/hierarchical), power-symbol
+        # tips, and sheet-symbol pin positions.
+        anchor_points: set[tuple, tuple] = set(placed_pin_world.values())
+        for label in self.labels + self.global_labels + self.hierarchical_labels:
+            anchor_points.add(pt(label["position"]["x"], label["position"]["y"]))
+        for pc in self._power_connections:
+            anchor_points.add(pt(pc["x"], pc["y"]))
+        for comp in self.component_info.values():
+            if comp.get("type") == "sheet":
+                for _unit, pin_data in iter_component_pins(comp):
+                    anchor_points.add(pt(pin_data["x"], pin_data["y"]))
+
+        for p in anchor_points:
+            find(p)  # register
+            for seg in wire_segments:
+                if _mid_segment_hit(p, seg):
+                    union(p, seg[0])
+                    break
+
         # Step 3: Assign net names from labels
         point_net: dict[tuple, str] = {}
 

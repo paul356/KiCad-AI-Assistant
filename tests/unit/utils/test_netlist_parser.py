@@ -34,6 +34,7 @@ def _pins_of(comp: dict) -> list:
 
 PIN_TOUCH_FIXTURE = os.path.join(os.path.dirname(__file__), "fixtures", "pin_touch.kicad_sch")
 POWER_TOUCH_FIXTURE = os.path.join(os.path.dirname(__file__), "fixtures", "power_touch.kicad_sch")
+MID_WIRE_FIXTURE = os.path.join(os.path.dirname(__file__), "fixtures", "mid_wire.kicad_sch")
 
 
 @pytest.fixture(scope="module")
@@ -142,6 +143,64 @@ class TestPowerSymbolConnectivity:
         """R2 pin 2 has no power symbol and no wire: it remains its own
         single-pin net."""
         assert power_parsed["nets"].get("Net-(R2-Pin2)") == [{"component": "R2", "pin": "2"}]
+
+
+class TestMidWireAnchorConnectivity:
+    """Point items anchored mid-wire connect to that wire's net.
+
+    KiCad connects a label (or pin tip) whose anchor lands ANYWHERE on a
+    wire segment — junction dots exist only for wire-to-wire crossings.
+    Fixture geometry:
+
+    - wire (100, 102.54) -> (100, 112.46) joining R1 pin 2 and R2 pin 1,
+      with local label "MID" anchored at (100, 107.5) — its middle;
+    - wire (150, 97.46) -> (150, 105.0) with R3 pin 2 at (150, 102.54)
+      and R4 pin 1 at (150, 101.0) — both pin tips on the wire body.
+    """
+
+    @pytest.fixture(scope="class")
+    def mid_parsed(self):
+        return SchematicParser(MID_WIRE_FIXTURE).parse()
+
+    @staticmethod
+    def _net_of(parsed):
+        return {
+            (p["component"], str(p["pin"])): net
+            for net, pins in parsed["nets"].items()
+            for p in pins
+        }
+
+    def test_fixture_label_is_mid_wire(self, mid_parsed):
+        """Sanity: the MID label sits strictly between the wire's ends, so
+        a coordinate-coincidence-only matcher could never catch it."""
+        label = next(l for l in mid_parsed["labels"] if l["text"] == "MID")
+        y = label["position"]["y"]
+        assert 102.54 < y < 112.46
+
+    def test_mid_wire_label_names_the_whole_wire_net(self, mid_parsed):
+        """Both pins of the wire tree land on the label's net, and the
+        auto-generated name no longer claims them."""
+        net_of = self._net_of(mid_parsed)
+        assert net_of[("R1", "2")] == "MID"
+        assert net_of[("R2", "1")] == "MID"
+        mid_pins = sorted((p["component"], p["pin"]) for p in mid_parsed["nets"]["MID"])
+        assert mid_pins == [("R1", "2"), ("R2", "1")]
+        assert not any(
+            n.startswith("Net")
+            and len(ps) > 1
+            and ("R1", "2") in [(p["component"], p["pin"]) for p in ps]
+            for n, ps in mid_parsed["nets"].items()
+        )
+
+    def test_pin_tips_on_wire_body_connect(self, mid_parsed):
+        """R3 pin 2 and R4 pin 1 tips sit on the middle of the vertical
+        wire; both must join that wire net."""
+        net_of = self._net_of(mid_parsed)
+        assert net_of[("R3", "1")] == net_of[("R3", "2")] == net_of[("R4", "1")]
+
+    def test_pin_off_wire_stays_separate(self, mid_parsed):
+        """R4 pin 2 sits below the wire end and connects to nothing."""
+        assert mid_parsed["nets"].get("Net-(R4-Pin2)") == [{"component": "R4", "pin": "2"}]
 
 
 class TestNetlistPinDirection:
