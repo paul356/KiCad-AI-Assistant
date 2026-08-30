@@ -213,8 +213,11 @@ _current_reasoning: list[str] = []
 # The Anthropic Messages API requires max_tokens on every request; some
 # Anthropic-compatible gateways (e.g. Alibaba Model Studio) reject requests
 # without it.  Use this default when the user has not configured an output
-# cap via llm_max_tokens.
-_ANTHROPIC_DEFAULT_MAX_TOKENS = 4096
+# cap via llm_max_tokens.  32768 is the highest value the token-plan gateway
+# is known to accept (probed up to 131072 without rejection) and far above
+# any realistic single-turn output, so max_tokens never becomes the binding
+# constraint that truncates a tool-calling response.
+_ANTHROPIC_DEFAULT_MAX_TOKENS = 32768
 
 
 def _is_certificate_verification_error(error: BaseException) -> bool:
