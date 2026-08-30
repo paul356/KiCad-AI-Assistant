@@ -1951,8 +1951,11 @@ class LLMClient:
     def _stream_openai(self, system: str, tools: list[dict], on_text_delta) -> dict[str, Any]:
         """Call OpenAI-compatible API with streaming enabled.
 
-        Uses in-process urllib for true SSE streaming when SSL is available.
-        Falls back to non-streaming via _call_openai (subprocess) otherwise.
+        Uses in-process urllib for true SSE streaming when SSL is available;
+        otherwise relays the SSE stream through the plugin-venv Python
+        subprocess (_subprocess_sse_stream).  Both paths stream — there is no
+        non-streaming fallback here; _call_openai is used only by callers
+        that do not provide on_text_delta (e.g. history compaction).
         """
         global _current_reasoning
         _current_reasoning = []
@@ -2181,8 +2184,11 @@ class LLMClient:
     def _stream_anthropic(self, system: str, tools: list[dict], on_text_delta) -> dict[str, Any]:
         """Call Anthropic API with streaming enabled.
 
-        Uses in-process urllib for true SSE streaming when SSL is available.
-        Falls back to non-streaming via _call_anthropic (subprocess) otherwise.
+        Uses in-process urllib for true SSE streaming when SSL is available;
+        otherwise relays the SSE stream through the plugin-venv Python
+        subprocess (_subprocess_sse_stream, fmt="anthropic").  Both paths
+        stream — there is no non-streaming fallback here; _call_anthropic is
+        used only by callers without on_text_delta (e.g. history compaction).
         """
         global _in_process_ssl
         import urllib.error
