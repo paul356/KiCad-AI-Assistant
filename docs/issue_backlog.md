@@ -4,6 +4,56 @@ Known issues discovered during review but not fixed in the originating PR.
 Each entry records the evidence, the impact, and the proposed fix so the work
 can be picked up independently.
 
+## PCB angle convention stale in skills/README after #76
+
+**Status:** fixed on `fix/pcb-angle-docs` (issue #94)
+
+### Symptom
+
+PR #76 introduced the footprint Edge.Cuts `local → world` transform docs
+under a **"clockwise-positive"** angle label, but the angle convention was
+later unified to **CCW+ on screen** (0°=right, 90°=up) in the code
+docstrings (`get_footprint`, `get_fp_edge_cuts_items`, `add_gr_arc`,
+`docs/coordinate-systems.md` §4). The skill/README docs kept the old
+labels:
+
+- `kicad_plugin/skills/pcb_query.md`: `rotation (CW+)`
+- `kicad_plugin/skills/pcb_zone.md`: "rotation clockwise-positive"
+- `kicad_plugin/skills/pcb_outline.md`: "Arc angles ... increase clockwise"
+  (contradicts the `add_gr_arc` / `add_board_outline_arc` CCW
+  implementation)
+- `README.md` tool table: `get_footprint` row did not mention the new
+  `edge_cuts` field
+- `docs/coordinate-systems.md` still warned "trust the matrix, not the
+  label" about a `pcb_query_tools` docstring that had already been fixed
+
+### Impact
+
+The LLM reads these skills; trusting them means passing/reading PCB
+rotations (footprint rotation, pad angles, Edge.Cuts arc angles) with the
+wrong sign, and missing the `edge_cuts` geometry that #76 added.
+
+### Fix (implemented)
+
+- `pcb_query.md`: `rotation (CW+)` → `(CCW+)`; documents the `edge_cuts`
+  field (fp_line/fp_arc/fp_circle/fp_curve in footprint-local mm,
+  CCW+-transformed like pads).
+- `pcb_zone.md` / `pcb_outline.md`: "clockwise-positive" → CCW-positive-on-
+  screen; arc angles → counter-clockwise (KiCad file convention, 90°=up).
+- `docs/coordinate-systems.md`: stale "docstring calls it CW+" note
+  replaced with the current "CCW+" wording.
+- `README.md`: `get_footprint` row mentions Edge.Cuts geometry.
+
+### Validation
+
+- Grep over `README.md`, `kicad_plugin/README.md`, `kicad_plugin/skills/`,
+  `docs/`, `llm_client.py` prompt, and the PCB tool modules finds no
+  remaining `CW+` / `clockwise-positive` angle claims; the only
+  "clockwise" mentions left are in correct CCW-contexts (schematic/symbol
+  notes, the "why not the textbook CW matrix" implementation comment).
+
+---
+
 ## Multi-unit netlist output has no unit dimension
 
 **Status:** open (discovered while fixing the skip pin-coordinate bug, PR #87)
