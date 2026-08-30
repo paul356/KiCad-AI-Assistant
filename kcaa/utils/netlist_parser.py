@@ -122,6 +122,10 @@ class SchematicParser:
         self.junctions: list[dict[str, Any]] = []
         self.no_connects: list[dict[str, Any]] = []
         self.power_symbols: list[dict[str, Any]] = []
+        # (net name, world x, world y) for every power-symbol pin tip —
+        # collected straight from the placed symbols so custom/imported
+        # libraries (ref "#PWR?" but no "power:" lib_id) are covered too.
+        self._power_connections: list[dict[str, Any]] = []
         self.hierarchical_labels: list[dict[str, Any]] = []
         self.global_labels: list[dict[str, Any]] = []
 
@@ -315,6 +319,32 @@ class SchematicParser:
                 unit_entry["position"] = {"x": sym_x, "y": sym_y, "rotation": sym_rot}
             if pins_summary:
                 unit_entry["pins"] = pins_summary
+
+            # KiCad marks every power symbol with the fixed Reference
+            # "#PWR?" (lib_id "power:*" is only the KiCad-library spelling;
+            # custom / Altium-imported libraries use arbitrary lib_ids, so
+            # it must NOT be the gate). The net name is the Value property
+            # and the connection point is the pin tip. Collect all of them
+            # here so _build_netlist can declare these nets by name.
+            power_name = comp.get("value") or ""
+            if (ref == "#PWR?" or str(comp.get("lib_id", "")).startswith("power:")) and power_name:
+                # Power-symbol pins are hidden by convention, so
+                # sym_pin_world_coords does not surface them; the pin sits at
+                # the library origin, which rotation/mirror leaves unchanged,
+                # so the placement anchor IS the pin tip in world space.
+                tips: list[tuple[float, float]] = [
+                    (float(pin["x"]), float(pin["y"])) for pin in pins_summary
+                ]
+                if not tips and sym_x is not None and sym_y is not None:
+                    tips = [(sym_x, sym_y)]
+                for tx, ty in tips:
+                    self._power_connections.append(
+                        {
+                            "name": power_name,
+                            "x": tx,
+                            "y": ty,
+                        }
+                    )
 
             prev = self.component_info.get(ref)
             if prev is not None:
@@ -579,16 +609,29 @@ class SchematicParser:
         )
 
     def _extract_power_symbols(self) -> None:
-        """Extract power symbol information from schematic."""
+        """Extract power symbol information from schematic.
+
+        Power symbols are identified by their fixed Reference ``#PWR?``
+        (with ``power:`` lib_id as the KiCad-standard-library spelling) —
+        never by lib_id prefix alone, because custom / Altium-imported
+        libraries use arbitrary library names. The net name is the symbol's
+        Value property; the connection point is its pin tip (power-symbol
+        pins sit at the library origin, so the world tip equals the anchor
+        for unrotated placements).
+        """
         print("Extracting power symbols")
-        for comp in self.components:
-            if comp.get("lib_id", "").startswith("power:"):
-                self.power_symbols.append(
-                    {
-                        "type": comp["lib_id"].split(":", 1)[1],
-                        "position": first_unit_position(comp),
-                    }
-                )
+        seen: set[tuple[str, float, float]] = set()
+        for pc in self._power_connections:
+            key = (pc["name"], pc["x"], pc["y"])
+            if key in seen:
+                continue
+            seen.add(key)
+            self.power_symbols.append(
+                {
+                    "type": pc["name"],
+                    "position": {"x": pc["x"], "y": pc["y"]},
+                }
+            )
         print(f"Extracted {len(self.power_symbols)} power symbols")
 
     def _extract_no_connects(self) -> None:
@@ -709,21 +752,14 @@ class SchematicParser:
                 if pin_name:
                     name_point(pt(pin_data["x"], pin_data["y"]), pin_name)
 
-        # Power symbol pins provide net names at their world positions.
-        # When skip cannot resolve pin.location for a power symbol (e.g. power:GND),
-        # fall back to the symbol's placement position, which in KiCad is always
-        # the connection point for single-pin power symbols.
-        for ref, comp in self.component_info.items():
-            if comp.get("lib_id", "").startswith("power:"):
-                power_name = comp["lib_id"].split(":", 1)[1]
-                pin_coords = [p for _unit, p in iter_component_pins(comp)]
-                if pin_coords:
-                    for pin_data in pin_coords:
-                        name_point(pt(pin_data["x"], pin_data["y"]), power_name)
-                else:
-                    pos = first_unit_position(comp)
-                    if pos:
-                        name_point(pt(pos.get("x", 0), pos.get("y", 0)), power_name)
+        # Power-symbol pin tips declare net names at their world positions.
+        # Connections are collected from EVERY power symbol (ref "#PWR?" or
+        # "power:" lib_id) in _extract_components, including custom and
+        # Altium-imported libraries. Each tip is a connection point: any
+        # component pin or wire endpoint at that coordinate joins the named
+        # net (KiCad: power symbols carry the net name in their Value).
+        for pc in self._power_connections:
+            name_point(pt(pc["x"], pc["y"]), pc["name"])
 
         # Step 4: Group component pins by union-find group -> net
         group_pins: dict[tuple, list] = defaultdict(list)
@@ -797,6 +833,9 @@ class SchematicParser:
             anchored.add(rpt(pos["x"], pos["y"]))
         for junc in self.junctions:
             anchored.add(rpt(junc["x"], junc["y"]))
+        # Power-symbol pin tips anchor their wires like labels/junctions do.
+        for pc in self._power_connections:
+            anchored.add(rpt(pc["x"], pc["y"]))
 
         return {pt for pt, count in endpoint_count.items() if count == 1 and pt not in anchored}
 

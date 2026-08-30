@@ -33,6 +33,7 @@ def _pins_of(comp: dict) -> list:
 
 
 PIN_TOUCH_FIXTURE = os.path.join(os.path.dirname(__file__), "fixtures", "pin_touch.kicad_sch")
+POWER_TOUCH_FIXTURE = os.path.join(os.path.dirname(__file__), "fixtures", "power_touch.kicad_sch")
 
 
 @pytest.fixture(scope="module")
@@ -89,6 +90,58 @@ class TestPinTouchConnectivity:
         assert net_of[("R1", "1")] != net_of[("R2", "2")]
         assert len(touch_parsed["nets"][net_of[("R1", "1")]]) == 1
         assert len(touch_parsed["nets"][net_of[("R2", "2")]]) == 1
+
+
+class TestPowerSymbolConnectivity:
+    """Power symbols (ref #PWR?) declare nets by name at their pin tips.
+
+    KiCad power symbols carry the net name in their Value property and a
+    power_in/power_out pin at the library origin; any component pin whose
+    tip sits at that coordinate joins the named net even with no wire.
+    The fixture reuses the pin_touch geometry (R1 pin 2 touching R1 pin 1
+    of R2 at (100, 102.54)) and adds two power:PGND symbols: one on the
+    touch point and one on what used to be the isolated R1 pin 1.
+    """
+
+    @pytest.fixture(scope="class")
+    def power_parsed(self):
+        return SchematicParser(POWER_TOUCH_FIXTURE).parse()
+
+    @staticmethod
+    def _net_of(parsed):
+        return {
+            (p["component"], str(p["pin"])): net
+            for net, pins in parsed["nets"].items()
+            for p in pins
+        }
+
+    def test_power_symbols_are_collected(self, power_parsed):
+        """Both #PWR? placements survive as separate power symbols, each
+        carrying its Value ("PGND") and pin-tip position."""
+        ps = power_parsed["power_symbols"]
+        assert [p["type"] for p in ps] == ["PGND", "PGND"]
+        positions = {(p["position"]["x"], p["position"]["y"]) for p in ps}
+        assert positions == {(100.0, 102.54), (100.0, 97.46)}
+
+    def test_component_pins_join_the_named_power_net(self, power_parsed):
+        """The touching pair AND the previously isolated R1 pin 1 all land
+        on the PGND net — the power symbol's pin tip is a connection point
+        at the same world coordinate."""
+        net_of = self._net_of(power_parsed)
+        assert net_of[("R1", "1")] == "PGND"
+        assert net_of[("R1", "2")] == "PGND"
+        assert net_of[("R2", "1")] == "PGND"
+
+    def test_isolated_pin_no_longer_reported_as_pin_net(self, power_parsed):
+        """The old single-pin auto net Net-(R1-Pin1) must be gone, and the
+        PGND net carries all three joining pins."""
+        assert "Net-(R1-Pin1)" not in power_parsed["nets"]
+        assert len(power_parsed["nets"]["PGND"]) == 3
+
+    def test_unconnected_pin_stays_separate(self, power_parsed):
+        """R2 pin 2 has no power symbol and no wire: it remains its own
+        single-pin net."""
+        assert power_parsed["nets"].get("Net-(R2-Pin2)") == [{"component": "R2", "pin": "2"}]
 
 
 class TestNetlistPinDirection:
