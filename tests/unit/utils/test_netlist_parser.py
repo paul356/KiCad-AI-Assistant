@@ -32,10 +32,63 @@ def _pins_of(comp: dict) -> list:
     return comp["units"]["1"].get("pins", [])
 
 
+PIN_TOUCH_FIXTURE = os.path.join(os.path.dirname(__file__), "fixtures", "pin_touch.kicad_sch")
+
+
 @pytest.fixture(scope="module")
 def parsed():
     """Parse the fixture schematic once for the whole module."""
     return SchematicParser(FIXTURE).parse()
+
+
+class TestPinTouchConnectivity:
+    """Pin tips touching directly (no wire) form a connection.
+
+    KiCad's connection model places a connection point at every pin tip;
+    two pins whose world positions coincide share that point and are on the
+    same net without any wire. The fixture places R1 pin 2 at (100, 102.54)
+    exactly on top of R2 pin 1, with no wire between them.
+    """
+
+    @pytest.fixture(scope="class")
+    def touch_parsed(self):
+        return SchematicParser(PIN_TOUCH_FIXTURE).parse()
+
+    def test_touching_pins_share_a_world_position(self, touch_parsed):
+        """Fixture sanity: the two pins really do occupy the same coordinate,
+        otherwise the connectivity assertion below would be vacuous."""
+        by_ref = {}
+        for ref in ("R1", "R2"):
+            for unit in touch_parsed["components"][ref]["units"].values():
+                for pin in unit["pins"]:
+                    by_ref[(ref, str(pin["num"]))] = (float(pin["x"]), float(pin["y"]))
+        assert by_ref[("R1", "2")] == by_ref[("R2", "1")] == (100.0, 102.54)
+
+    def test_touching_pins_land_in_the_same_net(self, touch_parsed):
+        """R1 pin 2 and R2 pin 1 touch end-to-end with no wire; they must
+        share one net (KiCad connection-point semantics), and that net must
+        contain exactly those two pins."""
+        net_of = {
+            (p["component"], str(p["pin"])): net
+            for net, pins in touch_parsed["nets"].items()
+            for p in pins
+        }
+        assert net_of[("R1", "2")] == net_of[("R2", "1")]
+        touch_net = net_of[("R1", "2")]
+        assert touch_net not in ("Net-(R1-Pin1)", "Net-(R2-Pin2)")
+        assert len(touch_parsed["nets"][touch_net]) == 2
+
+    def test_non_touching_pins_stay_separate(self, touch_parsed):
+        """R1 pin 1 and R2 pin 2 have no wire and no shared position, so they
+        remain distinct single-pin nets."""
+        net_of = {
+            (p["component"], str(p["pin"])): net
+            for net, pins in touch_parsed["nets"].items()
+            for p in pins
+        }
+        assert net_of[("R1", "1")] != net_of[("R2", "2")]
+        assert len(touch_parsed["nets"][net_of[("R1", "1")]]) == 1
+        assert len(touch_parsed["nets"][net_of[("R2", "2")]]) == 1
 
 
 class TestNetlistPinDirection:

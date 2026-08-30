@@ -654,7 +654,14 @@ class SchematicParser:
                 pt(wire["end"]["x"], wire["end"]["y"]),
             )
 
-        # Step 2: Register pin world positions (already rotation-corrected by skip)
+        # Step 2: Register pin world positions (already rotation-corrected by skip).
+        # KiCad connectivity: a pin's connection point is its tip (world
+        # position). Two pins whose tips coincide are electrically connected
+        # with no wire required (and a pin tip touching a wire endpoint
+        # connects too). The union-find keys points by their rounded world
+        # coordinates, so coincident points share a root; the explicit union
+        # below makes the pin-tip-to-pin-tip rule a stated contract rather
+        # than a side effect of the shared key.
         placed_pin_world: dict[tuple[str, str], tuple] = {}
         for ref, comp in self.component_info.items():
             if ref.startswith("#"):
@@ -666,6 +673,14 @@ class SchematicParser:
                 world_pt = pt(pin_data["x"], pin_data["y"])
                 find(world_pt)  # register in uf
                 placed_pin_world[(ref, pin_number)] = world_pt
+
+        # Step 2b: Explicitly union coincident pin tips (pin-to-pin contact).
+        first_at_pos: dict[tuple, tuple] = {}
+        for (_ref, _num), world_pt in placed_pin_world.items():
+            if world_pt in first_at_pos:
+                union(first_at_pos[world_pt], world_pt)
+            else:
+                first_at_pos[world_pt] = world_pt
 
         # Step 3: Assign net names from labels
         point_net: dict[tuple, str] = {}
