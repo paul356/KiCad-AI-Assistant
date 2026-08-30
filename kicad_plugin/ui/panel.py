@@ -552,16 +552,28 @@ if _WX_AVAILABLE:
                 log.error("_init_llm_client failed: %s\n%s", e, traceback.format_exc())
 
         def _on_panel_show(self, event) -> None:
-            """Initialise the LLM client (and restore the session) on display.
+            """Initialise on first display; re-sync the session after hides.
 
             Deferred from plugin registration so restore/prompt only happens
             while the user looks at the panel.  The backend base URL is
             injected later by _on_server_started once the backend is up, so
             an early panel display is safe.  An already-initialised client
-            (e.g. after a backend Restart) is left untouched.
+            (e.g. after a backend Restart) is left untouched.  On a re-show
+            the project may have changed while the panel was hidden (the
+            project watch stays silent then), so the session is re-synced
+            with the current project — applied exactly once, on display.
             """
             if event.IsShown() and self._llm_client is None:
                 self._init_llm_client()
+            elif event.IsShown():
+                try:
+                    project = self._collect_active_project()
+                    if project != self._active_project and not self._busy:
+                        self._active_project = project
+                        self._watch_candidate_seen = False
+                        self._autoload_session()
+                except Exception:
+                    log.debug("project re-sync on panel show failed", exc_info=True)
             event.Skip()
 
         # ------------------------------------------------------------------ #
@@ -2357,6 +2369,12 @@ if _WX_AVAILABLE:
             equally transient), so a switch is only acted on after two
             consecutive identical readings.
             """
+            if not self.IsShown():
+                # Panel dismissed: stay silent — no session dialogs from a
+                # hidden frame.  The snapshot resyncs on the next Show
+                # (_on_panel_show), so a project switched while hidden is
+                # applied exactly once, when the user looks at the panel.
+                return
             if self._busy:
                 return
             project = self._collect_active_project()
@@ -2452,17 +2470,21 @@ if _WX_AVAILABLE:
                 self._llm_client.reset()
 
         def _on_close(self, event) -> None:
-            """Panel close (user clicks X, or watchdog force-close): tear down
-            completely.
+            """Panel close: user X hides; watchdog force-close tears down.
 
-            Every user message, AI reply and cancellation is persisted as it
-            happens, so closing loses nothing — the next open restores the
-            session from disk.  The panel is never merely hidden: a hidden
-            panel would keep its timers and MCP server running in the
-            background.  Either the panel stays usable (project switch keeps
-            it open and swaps the session) or it is destroyed — no
-            half-alive state.
+            A user-close is vetoed and the panel hidden, never destroyed:
+            AssistantPanel is a top-level wx.Frame, and Destroy() on such a
+            frame behaves as a forced close that cascades into closing
+            KiCad's own project windows (issue #93).  The same frame and its
+            live MCP server are reused on the next reopen, and the suicide
+            watchdog ensures the hidden frame never outlives KiCad.  Only
+            the force-close path (KiCad itself already gone) tears down.
             """
+            if event.CanVeto():
+                event.Veto()
+                self.Hide()
+                return
+            # Force-close (suicide watchdog after KiCad exited) — tear down.
             if self._busy and self._cancel_event is not None:
                 # An in-flight turn ends with the panel: ask it to stop
                 # writing before we tear down.
