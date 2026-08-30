@@ -6,8 +6,9 @@ description: "Symbol placement workflow, find_free_area, bbox geometry, spacing 
 # Geometry you get for free
 - get_symbol and get_symbol_pins return body_bbox + per-unit bboxes in
   library coordinates so you can size new placements before inserting.
-- extract_schematic_netlist returns body_bbox per placed component in
-  schematic (Y-down) world coordinates. Use it as your occupancy map.
+- extract_schematic_netlist returns a body_bbox per placed **unit** in
+  schematic (Y-down) world coordinates. Union every unit's bbox to get a
+  component's occupied region and use that as your occupancy map.
 - add_symbol_to_schematic, place_symbol_relative and move_component all
   return the resulting body_bbox so you usually do NOT need to re-extract
   the netlist after a successful placement.
@@ -28,6 +29,20 @@ description: "Symbol placement workflow, find_free_area, bbox geometry, spacing 
       helpers above cannot satisfy the request.
 3. After moves/inserts, prefer using the returned body_bbox; only call
    extract_schematic_netlist again if you need to refresh net info.
+
+# Moving / rotating components
+- move_component takes **deltas**: `x`/`y` are mm to shift by (each snapped
+  to the 1.27 mm grid), `rotation` is an increment applied per unit as
+  `(old + rotation) % 360` (restricted to 0/90/180/270). Read the current
+  anchor from extract_schematic_netlist and subtract to express an
+  absolute move as a delta; `position`/`rotation` in the result are the
+  new **absolute** values of the first moved unit.
+- Omitting `unit` moves **every** unit of a multi-unit symbol together by
+  the same shift, preserving relative layout. Pass `unit=N` to move/rotate
+  one unit individually (no overlap-avoidance search).
+- Whole-move deltas may be nudged to the nearest free area when the target
+  region is occupied: `position_adjusted` is then `True` and
+  `requested_position` holds the grid-snapped target.
 
 # Spacing & layout rules
 - Keep at least one grid step (1.27 mm) of clearance between symbol body

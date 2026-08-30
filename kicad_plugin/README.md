@@ -67,7 +67,7 @@ cd "$env:APPDATA\kicad\10.0\scripting\plugins\kicad_ai_plugin"
 2. In the PCB editor or schematic editor, go to **Tools → External Plugins → Refresh Plugins**
 3. The **KiCad AI Assistant** plugin will appear in the plugin list
 4. Click it to open the chat panel
-5. Enter your LLM API key in **Options → Settings**
+5. Enter your LLM API key in **Options → Settings** if your endpoint requires one
 
 ## Configuration
 
@@ -79,9 +79,9 @@ Settings are stored in the KiCad user config directory:
 | Setting | Description | Default |
 |---------|-------------|---------|
 | `llm_provider` | `openai`, `anthropic`, or `ollama` | `openai` |
-| `llm_api_key` | Your LLM API key | (empty) |
+| `llm_api_key` | API key; optional for unauthenticated compatible endpoints | (empty) |
 | `llm_model` | Model name | `gpt-4o` |
-| `llm_base_url` | Ollama endpoint URL (e.g. http://localhost:11434) | (uses provider default) |
+| `llm_base_url` | Custom OpenAI, Anthropic, or Ollama-compatible endpoint URL | (uses provider default) |
 | `server_port` | Fixed port for MCP server (0 = auto) | `0` |
 | `show_tool_log` | Show tool-call log by default | `true` |
 

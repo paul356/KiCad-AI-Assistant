@@ -324,21 +324,34 @@ class TestLibBboxToWorld:
         w = lib_bbox_to_world(lib, sym_x=100.0, sym_y=50.0, rotation=0)
         assert w == BBox(99.0, 49.0, 101.0, 51.0)
 
-    def test_mirror_y_flips_x(self):
-        """mirror=y flips lib x: bbox (1, -1, 3, 1) → (-3, -1, -1, 1) lib,
-        then placed at origin with no rotation."""
+    def test_mirror_x_flips_lib_x(self):
+        """mirror=x negates lib x: bbox (1, -1, 3, 1) → (-3, -1, -1, 1) lib,
+        then placed at origin with no rotation (y ∈ [-1, 1] is symmetric
+        under the world Y-flip, so the world bbox equals the lib one)."""
         lib = BBox(1.0, -1.0, 3.0, 1.0)
-        w = lib_bbox_to_world(lib, 0.0, 0.0, rotation=0, mirror="y")
-        # After mirror_y: corners x negated → bbox lib (-3, -1, -1, 1).
+        w = lib_bbox_to_world(lib, 0.0, 0.0, rotation=0, mirror="x")
+        # After mirror_x: corners x negated → bbox lib (-3, -1, -1, 1).
         # Y-flip alone: (-3, -1, -1, 1).
         assert w == BBox(-3.0, -1.0, -1.0, 1.0)
 
-    def test_mirror_x_flips_y(self):
+    def test_mirror_y_flips_lib_y(self):
+        """mirror=y negates lib y; with the world Y-flip the vertical
+        extent maps back onto itself (an involution at rot 0)."""
         lib = BBox(-1.0, 1.0, 1.0, 3.0)
-        w = lib_bbox_to_world(lib, 0.0, 0.0, rotation=0, mirror="x")
-        # mirror_x: lib y negated → lib bbox (-1, -3, 1, -1).
+        w = lib_bbox_to_world(lib, 0.0, 0.0, rotation=0, mirror="y")
+        # mirror_y: lib y negated → lib bbox (-1, -3, 1, -1).
         # Y-flip: world y = -lib_y → world bbox (-1, 1, 1, 3).
         assert w == BBox(-1.0, 1.0, 1.0, 3.0)
+
+    def test_mirror_x_rot90_swaps_axes(self):
+        """mirror x + 90° on an asymmetric bbox: x-negate, rotate CCW,
+        then Y-flip."""
+        lib = BBox(1.0, 1.0, 3.0, 2.0)
+        w = lib_bbox_to_world(lib, 0.0, 0.0, rotation=90, mirror="x")
+        # corners (1,1)(3,1)(3,2)(1,2) → x-neg → (-1,1)(-3,1)(-3,2)(-1,2)
+        # → rot 90 CCW (x,y)→(-y,x) → (-1,-1)(-1,-3)(-2,-3)(-2,-1)
+        # → world (x, -y) → (-1,1)(-1,3)(-2,3)(-2,1) → bbox (-2, 1, -1, 3)
+        assert w == BBox(-2.0, 1.0, -1.0, 3.0)
 
     def test_invalid_rotation_snaps(self):
         lib = BBox(0.0, 0.0, 1.0, 1.0)

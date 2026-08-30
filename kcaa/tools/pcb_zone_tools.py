@@ -7,7 +7,7 @@ Provides tools to:
   - Delete a zone by UUID.
 
 PCB coordinate convention: millimetres, +X right, +Y down,
-rotation clockwise-positive (KiCad PCB convention).
+rotation CCW-positive on screen (KiCad PCB convention).
 
 All mutation tools create a ``.kicad_pcb.bak`` backup before writing.
 """

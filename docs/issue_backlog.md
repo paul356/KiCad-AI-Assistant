@@ -4,6 +4,140 @@ Known issues discovered during review but not fixed in the originating PR.
 Each entry records the evidence, the impact, and the proposed fix so the work
 can be picked up independently.
 
+## PCB angle convention stale in skills/README after #76
+
+**Status:** fixed on `fix/pcb-angle-docs` (issue #94)
+
+### Symptom
+
+PR #76 introduced the footprint Edge.Cuts `local → world` transform docs
+under a **"clockwise-positive"** angle label, but the angle convention was
+later unified to **CCW+ on screen** (0°=right, 90°=up) in the code
+docstrings (`get_footprint`, `get_fp_edge_cuts_items`, `add_gr_arc`,
+`docs/coordinate-systems.md` §4). The skill/README docs kept the old
+labels:
+
+- `kicad_plugin/skills/pcb_query.md`: `rotation (CW+)`
+- `kicad_plugin/skills/pcb_zone.md`: "rotation clockwise-positive"
+- `kicad_plugin/skills/pcb_outline.md`: "Arc angles ... increase clockwise"
+  (contradicts the `add_gr_arc` / `add_board_outline_arc` CCW
+  implementation)
+- `README.md` tool table: `get_footprint` row did not mention the new
+  `edge_cuts` field
+- `docs/coordinate-systems.md` still warned "trust the matrix, not the
+  label" about a `pcb_query_tools` docstring that had already been fixed
+
+### Impact
+
+The LLM reads these skills; trusting them means passing/reading PCB
+rotations (footprint rotation, pad angles, Edge.Cuts arc angles) with the
+wrong sign, and missing the `edge_cuts` geometry that #76 added.
+
+### Fix (implemented)
+
+- `pcb_query.md`: `rotation (CW+)` → `(CCW+)`; documents the `edge_cuts`
+  field (fp_line/fp_arc/fp_circle/fp_curve in footprint-local mm,
+  CCW+-transformed like pads).
+- `pcb_zone.md` / `pcb_outline.md`: "clockwise-positive" → CCW-positive-on-
+  screen; arc angles → counter-clockwise (KiCad file convention, 90°=up).
+- `docs/coordinate-systems.md`: stale "docstring calls it CW+" note
+  replaced with the current "CCW+" wording.
+- `README.md`: `get_footprint` row mentions Edge.Cuts geometry.
+
+### Validation
+
+- Grep over `README.md`, `kicad_plugin/README.md`, `kicad_plugin/skills/`,
+  `docs/`, `llm_client.py` prompt, and the PCB tool modules finds no
+  remaining `CW+` / `clockwise-positive` angle claims; the only
+  "clockwise" mentions left are in correct CCW-contexts (schematic/symbol
+  notes, the "why not the textbook CW matrix" implementation comment).
+
+---
+
+## Multi-unit netlist output has no unit dimension
+
+**Status:** fixed on `fix/issue-89-multi-unit-netlist` (issue #89)
+
+### Symptom
+
+`SchematicParser` merges a multi-unit symbol into a single
+`components[ref]` entry with a flat pin list:
+
+- `position`/`rotation` belong to whichever unit skip yields first —
+  **not necessarily unit 1**. The entry's position is not derived from the
+  merged pins and cannot be used to anchor them.
+- Pins carry **no `unit` field**; unit membership must be guessed by
+  clustering coordinates.
+
+### Evidence
+
+Real board `two_ax_PCB.kicad_sch` (U2, two units):
+
+- unit=1 @ `(101.6, 93.8022, 90)`, unit=2 @ `(185.42, 223.3422, 90)`
+- `components["U2"]["position"]` = `(185.42, 223.3422, 90)` — the anchor of
+  **unit 2** (skip iterates unit 2 first), not U2A
+- pins of both units are in one flat list: unit1's column at `x≈96.52`
+  (PC8–PC12 …), unit2's 9 power pins at `x≈180.34/210.82`; no field
+  distinguishes them
+- 64 pins merged, deduped by `(num, x, y)`; `body_bbox` is the union of all
+  units (correct)
+
+### Impact
+
+- Consumers cannot per-unit analyze (e.g. "which unit carries the power
+  pins"), cannot re-verify a pin against its unit's lib definition and
+  anchor, and cannot derive one unit's pins from the reported `position`.
+- The pin x/y values themselves are correct per-unit world coordinates
+  (each unit's pins were computed with its own `(at …)`); the gap is unit
+  attribution and anchors, not geometry.
+
+### Fix (implemented)
+
+`SchematicParser._extract_components` now nests every placed unit under its
+reference:
+
+```json
+"components[ref]": {
+  "units": {
+    "1": {"position": {"x", "y", "rotation"}, "body_bbox": {...}, "pins": [...]},
+    "2": {...}
+  }
+}
+```
+
+- Every `units[unit]` carries that unit's own anchor, pins, and world
+  `body_bbox`; the ambiguous top-level `position`, flat `pins`, and the
+  merged union `body_bbox` are gone (a union of far-apart units is
+  meaningless for per-unit reasoning). Sheets are opaque single-unit
+  placeholders nested under `units["1"]`.
+- `netlist_parser.iter_component_pins()` flattens the nested pins for
+  netlist tracing, tools, and reports; `first_unit_position()` gives the
+  lowest-numbered unit's anchor; `component_body_bbox()` fuses the unit
+  bboxes for callers that need the whole occupied region (overlap
+  avoidance, group membership).
+- `move_component` takes **deltas**: `x`/`y` are shifts in mm (snapped to
+  the 1.27 mm grid), `rotation` is an incremental angle applied as
+  `old + rotation` per unit — reading an absolute target from the netlist
+  and subtracting gives the delta. `unit=N` moves/rotates one unit
+  individually; omitted moves every unit by the same delta, preserving
+  relative layout (the old absolute write collapsed all units onto the
+  target anchor). The overlap-avoidance search excludes the moved
+  reference itself, so a unit's stale position never blocks the move.
+
+### Validation
+
+- Unit: `tests/unit/utils/test_netlist_multi_unit.py` — units nested with
+  per-unit anchors, pins, and body_bbox, no top-level pins/position/bbox,
+  single-unit components nested under unit 1;
+  `tests/unit/tools/test_symbol_edit_tools.py` `TestMoveComponentMultiUnit` —
+  whole delta move preserves offsets and rotations, unit-scoped
+  move/rotate touches only that unit, validation errors.
+- Real board: `two_ax_PCB.kicad_sch` U2 — `units["1"]` @ (101.6, 93.8022,
+  90°) with 55 pins, `units["2"]` @ (185.42, 223.3422, 90°) with 9 power
+  pins; 64 pins total, matching the coordinate-cluster split above.
+
+---
+
 ## NPTH pad type index bug in world_model
 
 **Status:** fixed for circular NPTH on `fix/duplicate-pad-routing`
@@ -198,3 +332,70 @@ rotation plus the footprint rotation (verify which KiCad actually applies).
   the resolved slot extent.
 - Real board: ninja-keyboard history file with `(drill oval ...)` pads
   yields `drill`-kind obstacles.
+
+---
+
+## Wire routing does not avoid label / power-tip / junction anchors
+
+**Status:** open (proposed; not tracked as a GitHub issue)
+
+### Symptom
+
+The schematic wire-routing tools (`kcaa/tools/wire_edit_tools.py`:
+`connect_points_with_wire`, `add_wire_to_schematic`, `connect_pins_with_wire`)
+build their obstacle set from only three kinds of geometry:
+
+- `_collect_existing_wires` — existing wire segments,
+- `_collect_all_pin_positions` — pin tips (incl. power-symbol pins),
+- `_collect_pin_symbol_stubs` — pin stub lines.
+
+**Labels never appear in the obstacle set.** `label` occurs in the file
+only in `connect_points_with_wire`'s docstring, as an optional *endpoint*
+input ("e.g. a net label position") — never as a path obstacle. The same
+holds for power-symbol tips (they are covered only because they are also
+pins) and for existing junction dots: none are anchor points the router
+avoids.
+
+### Evidence
+
+- Grep of `wire_edit_tools.py` shows exactly three
+  `_collect_*` obstacle builders, none of which read `label`,
+  `global_label`, `hierarchical_label`, `junction`, or the `#PWR?`
+  placement set beyond the generic pin walk.
+- The router's rejection gates (`_try_angle_config`:
+  pin-on-interior, stub overlap, wire overlap, pin-at-corner) have no
+  label/junction gate.
+- The KiCad connection semantics that make this harmful are now enforced
+  in `netlist_parser._build_netlist` Step 2c (issue #100 fix): a point
+  item (label, power tip, pin tip) anchored anywhere on a wire segment
+  joins that wire's net.
+
+### Impact
+
+A candidate route that passes **through** a label anchor (not at an
+endpoint) merges that label's net with the new wire's net in KiCad —
+an unintended short or a silently renamed net. The same applies to
+power-symbol tips and existing junction dots. `connect_points_with_wire`
+using a label position as a *deliberate* endpoint should stay allowed,
+but the tools have no way to distinguish (no anchor check at all).
+
+### Fix (proposed)
+
+1. New `_collect_anchor_points(sch)`: local / global / hierarchical
+   label anchors + power-symbol (`#PWR?` or `power:` lib_id) tips +
+   existing junction positions.
+2. Fold the anchors into the existing `obstacles` list so the current
+   `_PIN_COLLISION_TOL` (0.5 mm) on-segment circle check rejects routes
+   crossing them, same channel as pin positions.
+3. Endpoint exemption: a candidate endpoint that coincides with an
+   anchor coordinate (user explicitly routed to a label) is allowed,
+   mirroring the existing pin-endpoint / lead-stub exemption logic.
+
+### Validation
+
+- Unit: route between two pins whose straight path crosses a label
+  anchor → routing rejects or detours; same label anchor as an explicit
+  endpoint → route allowed.
+- Real board: MotorCell, route a test wire through the `SL_B` mid-wire
+  label anchor at (276.86, 197.9422) → rejected (today it would be
+  accepted and would quietly merge the `SL_B` net).

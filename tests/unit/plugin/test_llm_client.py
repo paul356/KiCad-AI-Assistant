@@ -1,15 +1,19 @@
 """Tests for LLMClient history management (dedup + compaction)."""
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import io
 import json
 import os
+import ssl
 import sys
 import threading
 import types
 from unittest.mock import MagicMock, patch
+import urllib.error
 
 import pytest
 
+from kicad_plugin import llm_client
 from kicad_plugin.llm_client import LLMClient, _subprocess_sse_stream
 from kicad_plugin.tool_registry import TOOL_POLICIES
 
@@ -927,6 +931,177 @@ class TestToolPolicyRegistry:
 
 
 # ---------------------------------------------------------------------------
+# OpenAI-compatible endpoint and HTTPS fallback tests
+# ---------------------------------------------------------------------------
+
+
+class TestOpenAICompatibleRequests:
+    def test_custom_base_url_remains_available_on_openai_provider(self):
+        client = _make_client()
+        client._settings.llm_base_url = "https://gateway.example/v1"
+        response = json.dumps(
+            {"choices": [{"finish_reason": "stop", "message": {"content": "ok"}}]}
+        )
+
+        with patch(
+            "kicad_plugin.llm_client._https_post_json", return_value=(200, response)
+        ) as post:
+            client._call_openai("system", [])
+
+        assert post.call_args.args[0] == "https://gateway.example/v1/chat/completions"
+
+    def test_custom_base_url_remains_available_on_anthropic_provider(self):
+        client = _make_client()
+        client._settings.llm_provider = "anthropic"
+        client._settings.llm_base_url = "https://gateway.example/anthropic"
+        response = json.dumps(
+            {"content": [{"type": "text", "text": "ok"}], "stop_reason": "end_turn"}
+        )
+
+        with patch(
+            "kicad_plugin.llm_client._https_post_json", return_value=(200, response)
+        ) as post:
+            client._call_anthropic("system", [])
+
+        assert post.call_args.args[0] == "https://gateway.example/anthropic/v1/messages"
+
+    def test_call_anthropic_always_sends_max_tokens(self):
+        """Anthropic API requires max_tokens; compatible gateways reject
+        requests without it (400 InvalidParameter)."""
+        client = _make_client()
+        client._settings.llm_provider = "anthropic"
+        response = json.dumps(
+            {"content": [{"type": "text", "text": "ok"}], "stop_reason": "end_turn"}
+        )
+
+        with patch(
+            "kicad_plugin.llm_client._https_post_json", return_value=(200, response)
+        ) as post:
+            client._call_anthropic("system", [])
+
+        payload = json.loads(post.call_args.args[2])
+        assert payload["max_tokens"] == llm_client._ANTHROPIC_DEFAULT_MAX_TOKENS
+
+    def test_call_anthropic_honors_configured_max_tokens(self):
+        client = _make_client()
+        client._settings.llm_provider = "anthropic"
+        client._max_tokens = 128
+        response = json.dumps(
+            {"content": [{"type": "text", "text": "ok"}], "stop_reason": "end_turn"}
+        )
+
+        with patch(
+            "kicad_plugin.llm_client._https_post_json", return_value=(200, response)
+        ) as post:
+            client._call_anthropic("system", [])
+
+        payload = json.loads(post.call_args.args[2])
+        assert payload["max_tokens"] == 128
+
+    def test_api_key_adds_bearer_authorization(self):
+        client = _make_client()
+
+        assert client._openai_headers() == {
+            "Content-Type": "application/json",
+            "Authorization": "Bearer sk-test",
+        }
+
+    def test_empty_api_key_omits_authorization(self):
+        client = _make_client()
+        client._settings.llm_api_key = ""
+
+        assert client._openai_headers() == {"Content-Type": "application/json"}
+
+    def test_api_key_adds_x_api_key(self):
+        client = _make_client()
+
+        assert client._anthropic_headers() == {
+            "Content-Type": "application/json",
+            "anthropic-version": "2023-06-01",
+            "x-api-key": "sk-test",
+        }
+
+    def test_empty_api_key_omits_x_api_key(self):
+        client = _make_client()
+        client._settings.llm_api_key = ""
+
+        assert client._anthropic_headers() == {
+            "Content-Type": "application/json",
+            "anthropic-version": "2023-06-01",
+        }
+
+
+class TestHttpsFallback:
+    def test_certificate_error_retries_with_plugin_ca_bundle(self):
+        certificate_error = ssl.SSLCertVerificationError(
+            1, "unable to get local issuer certificate"
+        )
+        response = MagicMock(status=200)
+        response.read.return_value = b"ok"
+        response.__enter__.return_value = response
+        plugin_context = object()
+
+        with (
+            patch.object(llm_client, "_in_process_ssl", None),
+            patch(
+                "urllib.request.urlopen",
+                side_effect=[urllib.error.URLError(certificate_error), response],
+            ) as urlopen,
+            patch.object(llm_client, "_plugin_ssl_context", return_value=plugin_context),
+        ):
+            result = llm_client._https_post_json(
+                "https://gateway.example/v1/chat/completions",
+                {"Content-Type": "application/json"},
+                b"{}",
+                timeout=30,
+            )
+
+        assert result == (200, "ok")
+        assert urlopen.call_count == 2
+        assert urlopen.call_args_list[1].kwargs["context"] is plugin_context
+
+    def test_certificate_error_without_ca_bundle_uses_plugin_venv(self):
+        certificate_error = ssl.SSLCertVerificationError(
+            1, "unable to get local issuer certificate"
+        )
+        process = types.SimpleNamespace(
+            returncode=0,
+            stdout=b'{"status": 200, "body": "ok"}',
+            stderr=b"",
+        )
+
+        with (
+            patch.object(llm_client, "_in_process_ssl", None),
+            patch(
+                "urllib.request.urlopen",
+                side_effect=urllib.error.URLError(certificate_error),
+            ),
+            patch.object(llm_client, "_plugin_ssl_context", return_value=None),
+            patch.object(llm_client, "_resolve_plugin_python", return_value="/tmp/python"),
+            patch.object(llm_client.subprocess, "run", return_value=process) as run,
+        ):
+            result = llm_client._https_post_json(
+                "https://gateway.example/v1/chat/completions",
+                {"Content-Type": "application/json"},
+                b"{}",
+                timeout=30,
+            )
+
+        assert result == (200, "ok")
+        run.assert_called_once()
+
+    def test_certificate_error_matches_reason_text(self):
+        error = urllib.error.URLError(
+            OSError(
+                "CERTIFICATE_VERIFY_FAILED certificate verify failed: "
+                "unable to get local issuer certificate"
+            )
+        )
+
+        assert llm_client._is_certificate_verification_error(error) is True
+
+
+# ---------------------------------------------------------------------------
 # Streaming tests
 # ---------------------------------------------------------------------------
 
@@ -940,6 +1115,20 @@ class TestStreaming:
         obj.__enter__ = lambda s: s
         obj.__exit__ = MagicMock(return_value=False)
         return obj
+
+    def test_stream_anthropic_always_sends_max_tokens(self):
+        client = _make_client()
+        client._settings.llm_provider = "anthropic"
+        sse_lines = [
+            "event: message_delta",
+            'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}',
+        ]
+        mock_resp = self._make_sse_response(sse_lines)
+        with patch("urllib.request.urlopen", return_value=mock_resp) as m:
+            client._stream_anthropic("sys", [], on_text_delta=lambda c: None)
+
+        payload = json.loads(m.call_args[0][0].data)
+        assert payload["max_tokens"] == llm_client._ANTHROPIC_DEFAULT_MAX_TOKENS
 
     def test_stream_openai_text_only(self):
         client = _make_client()
@@ -957,6 +1146,58 @@ class TestStreaming:
         assert chunks == ["Hello", " world"]
         assert result["message"]["content"] == "Hello world"
         assert result["finish_reason"] == "stop"
+
+    def test_stream_openai_skips_empty_choices_chunk(self):
+        """Mid-stream empty choices chunks (usage/keepalive) must not abort
+        the parse — tool-call deltas that follow must still be captured."""
+        client = _make_client()
+        sse_lines = [
+            'data: {"choices":[{"delta":{"content":"Checking"},"finish_reason":null}]}',
+            'data: {"choices":[]}',
+            'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"tc1","function":{"name":"list_tracks","arguments":""}}]},"finish_reason":null}]}',
+            'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}',
+            "data: [DONE]",
+        ]
+        chunks = []
+        mock_resp = self._make_sse_response(sse_lines)
+        with patch("urllib.request.urlopen", return_value=mock_resp):
+            result = client._stream_openai("sys", [], on_text_delta=chunks.append)
+
+        assert chunks == ["Checking"]
+        tc = result["message"]["tool_calls"]
+        assert len(tc) == 1
+        assert tc[0]["function"]["name"] == "list_tracks"
+        assert result["finish_reason"] == "tool_calls"
+
+    def test_relay_script_guards_empty_choices_and_tool_use_keys(self):
+        """The venv subprocess relay must contain the same guards (it is the
+        path used by KiCad's SSL-less embedded Python)."""
+        script = llm_client._SUBPROCESS_SSE_SCRIPT
+        assert "if not _choices:" in script
+        assert 'block.get("id", "")' in script
+        assert 'block.get("name", "")' in script
+
+    def test_stream_openai_http_error_includes_body(self):
+        """In-process streaming must surface HTTP 4xx with the response body
+        (HTTPError is a URLError subclass; it must not be swallowed by the
+        HTTPS-fallback branch)."""
+        client = _make_client()
+        err = urllib.error.HTTPError(
+            "http://x",
+            400,
+            "Bad Request",
+            {},
+            io.BytesIO(b'{"code":"InvalidParameter","message":"Request body format invalid"}'),
+        )
+        with (
+            patch.object(llm_client, "_in_process_ssl", None),
+            patch("urllib.request.urlopen", side_effect=err),
+        ):
+            result = client._stream_openai("sys", [], on_text_delta=lambda c: None)
+
+        assert result["error"] == (
+            'HTTP 400: {"code":"InvalidParameter","message":"Request body format invalid"}'
+        )
 
     def test_stream_openai_tool_calls(self):
         client = _make_client()
@@ -979,6 +1220,26 @@ class TestStreaming:
         assert tc[0]["function"]["name"] == "add_wire"
         assert tc[0]["function"]["arguments"] == '{"x":1}'
         assert result["finish_reason"] == "tool_calls"
+
+    def test_stream_anthropic_http_error_includes_body(self):
+        client = _make_client()
+        client._settings.llm_provider = "anthropic"
+        err = urllib.error.HTTPError(
+            "http://x",
+            400,
+            "Bad Request",
+            {},
+            io.BytesIO(b'{"code":"InvalidParameter","message":"Request body format invalid"}'),
+        )
+        with (
+            patch.object(llm_client, "_in_process_ssl", None),
+            patch("urllib.request.urlopen", side_effect=err),
+        ):
+            result = client._stream_anthropic("sys", [], on_text_delta=lambda c: None)
+
+        assert result["error"] == (
+            'HTTP 400: {"code":"InvalidParameter","message":"Request body format invalid"}'
+        )
 
     def test_stream_anthropic_text_only(self):
         client = _make_client()
@@ -1039,9 +1300,14 @@ class TestStreaming:
         assert args == {"path": "sch.kicad_sch"}
         assert result["finish_reason"] == "tool_calls"
 
-    def test_stream_openai_ssl_fallback_streams_via_subprocess(self):
-        import urllib.error
-
+    @pytest.mark.parametrize(
+        "reason",
+        [
+            "unknown url type: https",
+            ssl.SSLCertVerificationError(1, "unable to get local issuer certificate"),
+        ],
+    )
+    def test_stream_openai_ssl_fallback_streams_via_subprocess(self, reason):
         client = _make_client()
         chunks = []
 
@@ -1053,9 +1319,10 @@ class TestStreaming:
         with (
             patch(
                 "urllib.request.urlopen",
-                side_effect=urllib.error.URLError("unknown url type: https"),
+                side_effect=urllib.error.URLError(reason),
             ),
             patch("kicad_plugin.llm_client._in_process_ssl", None),
+            patch("kicad_plugin.llm_client._plugin_ssl_context", return_value=None),
             patch(
                 "kicad_plugin.llm_client._subprocess_sse_stream",
                 return_value=subprocess_result,
@@ -1069,9 +1336,14 @@ class TestStreaming:
         assert call_kwargs["timeout"] == 300
         assert result["message"]["content"] == "Relayed text"
 
-    def test_stream_anthropic_ssl_fallback_streams_via_subprocess(self):
-        import urllib.error
-
+    @pytest.mark.parametrize(
+        "reason",
+        [
+            "unknown url type: https",
+            ssl.SSLCertVerificationError(1, "unable to get local issuer certificate"),
+        ],
+    )
+    def test_stream_anthropic_ssl_fallback_streams_via_subprocess(self, reason):
         client = _make_client()
         client._settings.llm_provider = "anthropic"
         chunks = []
@@ -1084,9 +1356,10 @@ class TestStreaming:
         with (
             patch(
                 "urllib.request.urlopen",
-                side_effect=urllib.error.URLError("unknown url type: https"),
+                side_effect=urllib.error.URLError(reason),
             ),
             patch("kicad_plugin.llm_client._in_process_ssl", None),
+            patch("kicad_plugin.llm_client._plugin_ssl_context", return_value=None),
             patch(
                 "kicad_plugin.llm_client._subprocess_sse_stream",
                 return_value=subprocess_result,

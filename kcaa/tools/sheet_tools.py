@@ -69,7 +69,7 @@ def _collect_occupied_bboxes(
         _parse_paper_size,
         _sheet_symbol_bbox,
     )
-    from kcaa.utils.netlist_parser import extract_netlist
+    from kcaa.utils.netlist_parser import component_body_bbox, extract_netlist
     from kcaa.utils.symbol_geometry import BBox, inflate_bbox
 
     occupied: list = []
@@ -91,7 +91,7 @@ def _collect_occupied_bboxes(
             continue
         if comp.get("type") == "sheet":
             continue
-        bb_d = comp.get("body_bbox")
+        bb_d = component_body_bbox(comp)
         if not bb_d:
             continue
         try:

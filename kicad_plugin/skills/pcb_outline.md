@@ -11,4 +11,6 @@ description: "Board Edge.Cuts creation and editing workflow"
   lines + four 90° arcs.  Edge.Cuts line width is typically 0.05 mm.
 - Add individual segments or arcs: **add_board_outline_segment** /
   **add_board_outline_arc**.  Wipe first with **clear_board_outline**.
-- Arc angles: 0° is +X, angles increase clockwise.
+- Arc angles: 0° is +X, angles increase **counter-clockwise** (CCW, the
+  KiCad file convention — 90°=up on screen). Same convention as the
+  footprint rotation and pad angles reported by the PCB query tools.

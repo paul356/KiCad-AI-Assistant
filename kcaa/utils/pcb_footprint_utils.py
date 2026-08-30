@@ -103,7 +103,8 @@ def set_fp_at(fp_node: list[Any], x: float, y: float, rotation: float) -> None:
 
     Also propagates any rotation change to child ``pad``, ``property``, and
     ``fp_text`` nodes, which store their orientation as absolute board-space
-    degrees (clockwise-positive) in KiCad 10 PCB format.
+    degrees (CCW-positive, same convention as the footprint) in KiCad 10
+    PCB format.
     """
     for sub in fp_node:
         if isinstance(sub, list) and len(sub) >= 3 and _sym(sub[0]) == "at":
@@ -167,7 +168,8 @@ def get_fp_layer(fp_node: list[Any]) -> str | None:
 # Child node types whose `at` rotation must track footprint rotation.
 # In KiCad 10 PCB format the rotation convention differs by child type:
 #
-#   pad       — stored rotation is *absolute board-space* (CW+).
+#   pad       — stored rotation is *absolute board-space* (CCW+, same
+#               convention as the footprint's own file rotation).
 #               When footprint rotates by delta, pad rotation += delta.
 #
 #   property / fp_text — stored rotation is expressed so that the displayed

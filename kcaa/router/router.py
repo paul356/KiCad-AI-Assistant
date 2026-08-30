@@ -742,7 +742,11 @@ def connect_with_via(
 
 
 def _seg_angle(x1: float, y1: float, x2: float, y2: float) -> float:
-    """Segment angle in degrees (0=right, 90=down)."""
+    """Segment angle in degrees, screen geometry (0=right, 90=down).
+
+    Debug-log only; this is the raw atan2 angle in Y-down screen
+    coordinates, NOT the KiCad CCW file-angle convention (90=up).
+    """
     return math.degrees(math.atan2(y2 - y1, x2 - x1)) % 360
 
 
@@ -2084,12 +2088,12 @@ def _node_at3(node: list) -> tuple[float, float, float]:
 
 
 def _rotate(x: float, y: float, deg: float) -> tuple[float, float]:
-    """Rotate (x, y) by ``deg`` (CW-positive on screen, matching KiCad's PCB convention).
+    """Rotate (x, y) by ``deg`` (CCW-positive on screen, KiCad PCB convention).
 
-    In KiCad's +Y-down world, a positive file rotation is clockwise on
-    screen, which is equivalent to a math counter-clockwise rotation of
-    -deg.  Substituting -deg into the standard CCW formula
-    (cos(-d) = cos(d), sin(-d) = -sin(d)) gives the CW-on-screen form:
+    A positive KiCad file rotation is counter-clockwise on screen
+    (0=right, 90=up, 180=left, 270=down), i.e. the -deg rotation in y-up
+    math.  Substituting cos(-d) = cos(d), sin(-d) = -sin(d) into the
+    standard CCW matrix gives:
 
         x' =  x*cos(d) + y*sin(d)
         y' = -x*sin(d) + y*cos(d)

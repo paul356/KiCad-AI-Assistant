@@ -210,6 +210,68 @@ _in_process_ssl: bool | None = None
 # Storage for reasoning_content (DeepSeek thinking mode)
 _current_reasoning: list[str] = []
 
+# The Anthropic Messages API requires max_tokens on every request; some
+# Anthropic-compatible gateways (e.g. Alibaba Model Studio) reject requests
+# without it.  Use this default when the user has not configured an output
+# cap via llm_max_tokens.  65536 is accepted by the token-plan gateway
+# (probed up to 131072 without rejection) and far above any realistic
+# single-turn output, so max_tokens never becomes the binding constraint
+# that truncates a tool-calling response.
+_ANTHROPIC_DEFAULT_MAX_TOKENS = 65536
+
+
+def _is_certificate_verification_error(error: BaseException) -> bool:
+    """Return whether *error* was caused by an untrusted certificate chain."""
+    reason = getattr(error, "reason", error)
+    try:
+        import ssl
+
+        if isinstance(reason, ssl.SSLCertVerificationError):
+            return True
+    except ImportError:
+        pass
+    return "certificate verify failed" in str(reason).lower()
+
+
+def _needs_https_fallback(error: BaseException) -> bool:
+    """Return whether HTTPS should be retried with the plugin venv Python."""
+    reason = getattr(error, "reason", error)
+    return _NO_HTTPS_MARKER in str(reason) or _is_certificate_verification_error(error)
+
+
+def _plugin_ssl_context():
+    """Build an SSL context from the certifi bundle installed in the plugin venv."""
+    try:
+        import ssl
+
+        venv_dir = Path(__file__).resolve().parent / ".venv"
+        candidates = [venv_dir / "Lib" / "site-packages" / "certifi" / "cacert.pem"]
+        candidates.extend(venv_dir.glob("lib/python*/site-packages/certifi/cacert.pem"))
+        for ca_bundle in candidates:
+            if ca_bundle.is_file():
+                return ssl.create_default_context(cafile=str(ca_bundle))
+    except (ImportError, OSError):
+        pass
+    return None
+
+
+def _urlopen_with_plugin_ca_retry(request, timeout: float):
+    """Open a URL, retrying certificate failures with the plugin's CA bundle."""
+    import urllib.error
+    import urllib.request
+
+    try:
+        return urllib.request.urlopen(request, timeout=timeout)  # nosec B310 -- user-configured LLM endpoint
+    except urllib.error.URLError as error:
+        if not _is_certificate_verification_error(error):
+            raise
+        context = _plugin_ssl_context()
+        if context is None:
+            raise
+        return urllib.request.urlopen(  # nosec B310 -- user-configured LLM endpoint
+            request, timeout=timeout, context=context
+        )
+
 
 def _resolve_plugin_python() -> str | None:
     """Return the path to the plugin venv's Python, or None if absent."""
@@ -341,8 +403,8 @@ try:
                             text_blocks[idx] = block.get("text", "")
                         elif btype == "tool_use":
                             tool_blocks[idx] = {
-                                "id": block["id"],
-                                "name": block["name"],
+                                "id": block.get("id", ""),
+                                "name": block.get("name", ""),
                                 "input_json": "",
                             }
                     elif etype == "content_block_delta":
@@ -406,7 +468,10 @@ try:
                     chunk = json.loads(data_str)
                 except json.JSONDecodeError:
                     continue
-                choice = chunk.get("choices", [{}])[0]
+                _choices = chunk.get("choices") or []
+                if not _choices:
+                    continue
+                choice = _choices[0]
                 fr = choice.get("finish_reason")
                 if fr is not None:
                     finish_reason = fr
@@ -472,14 +537,14 @@ def _https_post_json(
     if _in_process_ssl is not False:
         req = urllib.request.Request(url, data=body, headers=headers, method="POST")
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:  # nosec B310 -- MCP client, localhost only
+            with _urlopen_with_plugin_ca_retry(req, timeout=timeout) as resp:
                 _in_process_ssl = True
                 return resp.status, resp.read().decode("utf-8", "replace")
         except urllib.error.HTTPError as e:
             _in_process_ssl = True
             return e.code, e.read().decode("utf-8", "replace")
         except urllib.error.URLError as e:
-            if _NO_HTTPS_MARKER not in str(e.reason):
+            if not _needs_https_fallback(e):
                 raise RuntimeError(f"HTTPS request failed: {e}") from e
             _in_process_ssl = False
             # Fall through to subprocess fallback below.
@@ -1886,8 +1951,11 @@ class LLMClient:
     def _stream_openai(self, system: str, tools: list[dict], on_text_delta) -> dict[str, Any]:
         """Call OpenAI-compatible API with streaming enabled.
 
-        Uses in-process urllib for true SSE streaming when SSL is available.
-        Falls back to non-streaming via _call_openai (subprocess) otherwise.
+        Uses in-process urllib for true SSE streaming when SSL is available;
+        otherwise relays the SSE stream through the plugin-venv Python
+        subprocess (_subprocess_sse_stream).  Both paths stream — there is no
+        non-streaming fallback here; _call_openai is used only by callers
+        that do not provide on_text_delta (e.g. history compaction).
         """
         global _current_reasoning
         _current_reasoning = []
@@ -1912,15 +1980,12 @@ class LLMClient:
                 "stream": True,
             }
         ).encode()
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self._settings.llm_api_key}",
-        }
+        headers = self._openai_headers()
 
         if _in_process_ssl is not False:
             req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
             try:
-                with urllib.request.urlopen(req, timeout=300) as resp:  # nosec B310 -- MCP client, localhost only
+                with _urlopen_with_plugin_ca_retry(req, timeout=300) as resp:
                     _in_process_ssl = True
                     text_parts = []
                     tool_calls_by_index: dict[int, dict] = {}
@@ -1941,7 +2006,10 @@ class LLMClient:
                         except json.JSONDecodeError:
                             continue
 
-                        choice = chunk.get("choices", [{}])[0]
+                        _choices = chunk.get("choices") or []
+                        if not _choices:
+                            continue
+                        choice = _choices[0]
                         fr = choice.get("finish_reason")
                         if fr is not None:
                             finish_reason = fr
@@ -1984,8 +2052,10 @@ class LLMClient:
                         message["reasoning_content"] = "".join(_current_reasoning)
                     return {"finish_reason": finish_reason, "message": message}
 
+            except urllib.error.HTTPError as e:
+                return {"error": f"HTTP {e.code}: {e.read().decode('utf-8', 'replace')[:200]}"}
             except urllib.error.URLError as e:
-                if _NO_HTTPS_MARKER not in str(e.reason):
+                if not _needs_https_fallback(e):
                     return {"error": f"HTTPS request failed: {e}"}
                 _in_process_ssl = False
                 # Fall through to subprocess streaming below.
@@ -2116,8 +2186,11 @@ class LLMClient:
     def _stream_anthropic(self, system: str, tools: list[dict], on_text_delta) -> dict[str, Any]:
         """Call Anthropic API with streaming enabled.
 
-        Uses in-process urllib for true SSE streaming when SSL is available.
-        Falls back to non-streaming via _call_anthropic (subprocess) otherwise.
+        Uses in-process urllib for true SSE streaming when SSL is available;
+        otherwise relays the SSE stream through the plugin-venv Python
+        subprocess (_subprocess_sse_stream, fmt="anthropic").  Both paths
+        stream — there is no non-streaming fallback here; _call_anthropic is
+        used only by callers without on_text_delta (e.g. history compaction).
         """
         global _in_process_ssl
         import urllib.error
@@ -2146,22 +2219,19 @@ class LLMClient:
             "system": system,
             "messages": messages,
             "stream": True,
+            # Anthropic API requires max_tokens on every request; compatible
+            # gateways reject requests without it (400 InvalidParameter).
+            "max_tokens": self._max_tokens or _ANTHROPIC_DEFAULT_MAX_TOKENS,
         }
-        if self._max_tokens > 0:
-            payload["max_tokens"] = self._max_tokens
         if anthropic_tools:
             payload["tools"] = anthropic_tools
         encoded = json.dumps(payload).encode()
-        headers = {
-            "Content-Type": "application/json",
-            "x-api-key": self._settings.llm_api_key,
-            "anthropic-version": "2023-06-01",
-        }
+        headers = self._anthropic_headers()
 
         if _in_process_ssl is not False:
             req = urllib.request.Request(url, data=encoded, headers=headers, method="POST")
             try:
-                with urllib.request.urlopen(req, timeout=300) as resp:  # nosec B310 -- MCP client, localhost only
+                with _urlopen_with_plugin_ca_retry(req, timeout=300) as resp:
                     _in_process_ssl = True
                     text_blocks: dict[int, str] = {}
                     tool_blocks: dict[int, dict] = {}
@@ -2194,8 +2264,8 @@ class LLMClient:
                                 text_blocks[idx] = block.get("text", "")
                             elif btype == "tool_use":
                                 tool_blocks[idx] = {
-                                    "id": block["id"],
-                                    "name": block["name"],
+                                    "id": block.get("id", ""),
+                                    "name": block.get("name", ""),
                                     "input_json": "",
                                 }
 
@@ -2254,8 +2324,10 @@ class LLMClient:
                         finish = "stop"
                     return {"finish_reason": finish, "message": message_out}
 
+            except urllib.error.HTTPError as e:
+                return {"error": f"HTTP {e.code}: {e.read().decode('utf-8', 'replace')[:200]}"}
             except urllib.error.URLError as e:
-                if _NO_HTTPS_MARKER not in str(e.reason):
+                if not _needs_https_fallback(e):
                     return {"error": f"HTTPS request failed: {e}"}
                 _in_process_ssl = False
                 # Fall through to subprocess streaming below.
@@ -2266,6 +2338,23 @@ class LLMClient:
         return _subprocess_sse_stream(
             url, headers, encoded, timeout=300, fmt="anthropic", on_text_delta=on_text_delta
         )
+
+    def _anthropic_headers(self) -> dict[str, str]:
+        """Build headers for Anthropic-compatible endpoints with optional auth."""
+        headers = {
+            "Content-Type": "application/json",
+            "anthropic-version": "2023-06-01",
+        }
+        if self._settings.llm_api_key:
+            headers["x-api-key"] = self._settings.llm_api_key
+        return headers
+
+    def _openai_headers(self) -> dict[str, str]:
+        """Build headers for OpenAI-compatible endpoints with optional auth."""
+        headers = {"Content-Type": "application/json"}
+        if self._settings.llm_api_key:
+            headers["Authorization"] = f"Bearer {self._settings.llm_api_key}"
+        return headers
 
     def _call_openai(self, system: str, tools: list[dict]) -> dict[str, Any]:
         base = (self._settings.llm_base_url or "https://api.openai.com").rstrip("/")
@@ -2287,10 +2376,7 @@ class LLMClient:
         if self._max_tokens > 0:
             payload_dict["max_tokens"] = self._max_tokens
         payload = json.dumps(payload_dict).encode()
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self._settings.llm_api_key}",
-        }
+        headers = self._openai_headers()
         try:
             status, text = _https_post_json(url, headers, payload, timeout=300)
         except RuntimeError as e:
@@ -2306,7 +2392,10 @@ class LLMClient:
         if not isinstance(body, dict):
             return {"error": f"Unexpected response from OpenAI: {text[:200]}"}
 
-        choice = body.get("choices", [{}])[0]
+        _choices = body.get("choices") or []
+        if not _choices:
+            return {"error": "OpenAI response contained no choices"}
+        choice = _choices[0]
         return {
             "finish_reason": choice.get("finish_reason", "stop"),
             "message": choice.get("message", {}),
@@ -2383,17 +2472,14 @@ class LLMClient:
             "model": self._settings.llm_model,
             "system": system,
             "messages": messages,
+            # Anthropic API requires max_tokens on every request; compatible
+            # gateways reject requests without it (400 InvalidParameter).
+            "max_tokens": self._max_tokens or _ANTHROPIC_DEFAULT_MAX_TOKENS,
         }
-        if self._max_tokens > 0:
-            payload["max_tokens"] = self._max_tokens
         if anthropic_tools:
             payload["tools"] = anthropic_tools
         encoded = json.dumps(payload).encode()
-        headers = {
-            "Content-Type": "application/json",
-            "x-api-key": self._settings.llm_api_key,
-            "anthropic-version": "2023-06-01",
-        }
+        headers = self._anthropic_headers()
         try:
             status, text = _https_post_json(url, headers, encoded, timeout=300)
         except RuntimeError as e:
@@ -2410,15 +2496,18 @@ class LLMClient:
             return {"error": f"Unexpected response from Anthropic: {text[:200]}"}
 
         content_blocks_resp = body.get("content", [])
-        text_blocks = [b["text"] for b in content_blocks_resp if b.get("type") == "text"]
+        text_blocks = [b.get("text", "") for b in content_blocks_resp if b.get("type") == "text"]
         tool_use_blocks = [b for b in content_blocks_resp if b.get("type") == "tool_use"]
         message: dict[str, Any] = {"content": "\n".join(text_blocks)}
         if tool_use_blocks:
             message["tool_calls"] = [
                 {
-                    "id": b["id"],
+                    "id": b.get("id", ""),
                     "type": "function",
-                    "function": {"name": b["name"], "arguments": json.dumps(b.get("input", {}))},
+                    "function": {
+                        "name": b.get("name", ""),
+                        "arguments": json.dumps(b.get("input", {})),
+                    },
                 }
                 for b in tool_use_blocks
             ]

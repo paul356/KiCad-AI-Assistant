@@ -198,8 +198,9 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
         """List all footprints placed on a KiCad PCB board.
 
         PCB coordinate convention (used by every PCB tool): millimetres,
-        +X right, **+Y down** (KiCad PCB screen coords), and rotation in
-        **degrees, clockwise-positive**. The ``x``/``y`` here are the
+        +X right, **+Y down** (KiCad PCB front-view coords), and rotation
+        in **degrees, CCW-positive on screen** (0=right, 90=up). The
+        ``x``/``y`` here are the
         footprint anchor in **board world coordinates**.
 
         Args:
@@ -208,7 +209,7 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
 
         Returns:
             dict with footprints: list of {reference, value, x, y (mm,
-            world), rotation (deg, CW+), layer (e.g. "F.Cu"/"B.Cu")},
+            world), rotation (deg, CCW+), layer (e.g. "F.Cu"/"B.Cu")},
             count.
         """
         data = load_pcb(pcb_path)
@@ -242,8 +243,9 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
     ) -> dict[str, Any]:
         """Get detailed information about a specific footprint on the board.
 
-        Coordinates are mm, +Y down, rotation in degrees clockwise-positive
-        (KiCad PCB convention). The footprint's ``x``/``y``/``rotation``
+        Coordinates are mm, +Y down; rotation is CCW-positive on screen
+        (KiCad PCB convention: 0=right, 90=up). The footprint's
+        ``x``/``y``/``rotation``
         are in **board world coordinates**, but each pad's ``local_x``/
         ``local_y`` are in **footprint-local coordinates** (relative to
         the footprint anchor, before applying its rotation). To get pad
@@ -252,7 +254,7 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
 
             world_x = fp.x + local_x * cos(θ) + local_y * sin(θ)
             world_y = fp.y - local_x * sin(θ) + local_y * cos(θ)
-            (θ in radians; sign matches KiCad's clockwise-positive convention)
+            (θ in radians; matches KiCad's CCW-positive-on-screen convention)
 
         Or use ``get_ratsnest`` which returns world pad coordinates directly.
 
@@ -262,7 +264,7 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
             ctx: MCP context for progress reporting.
 
         Returns:
-            dict with reference, value, x/y/rotation (world, mm/deg CW+),
+            dict with reference, value, x/y/rotation (world, mm/deg CCW+),
             layer, properties (dict of all property name→value), pads
             (list of {number, type, shape, local_x, local_y,
              local_w, local_h, world_w, world_h, net_name}),
@@ -270,7 +272,8 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
              items on the footprint's Edge.Cuts layer, in footprint-local
              mm; transform to world coordinates the same way as pads).
              ``world_w``/``world_h`` account for pad rotation (KiCad 10
-             stores pad rotation as absolute board-space CW+).
+             stores pad rotation as absolute board-space angle in the same
+             CCW convention).
         """
         data = load_pcb(pcb_path)
         try:
@@ -311,7 +314,8 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
                     _, net_name = _parse_net_ref(psub, {}, {})
             # World-oriented size.
             # Pad rotation in KiCad 10 is stored as absolute board-space
-            # (CW+), so we use it directly without adding fp rotation.
+            # (same CCW convention as the footprint), so we use it directly
+            # without adding fp rotation.
             if abs(pad_rot % 180.0 - 90.0) < 0.1:
                 wworld, hworld = pad_h, pad_w
             else:
@@ -353,8 +357,8 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
 
         The bounding box is computed from ``F.Courtyard`` / ``B.Courtyard``
         graphic items in the footprint, transformed to board world
-        coordinates by applying the footprint's position and rotation
-        (clockwise-positive).  If the footprint has no courtyard items the
+        coordinates by applying the footprint's position and rotation (CCW-positive
+        on screen).  If the footprint has no courtyard items the
         tool falls back to all ``fp_line``/``fp_rect``/``fp_circle`` items.
 
         Use this to check for footprint overlaps before placement or to
@@ -581,7 +585,7 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
         net_id_to_name, net_name_to_id = _collect_top_level_nets(data)
 
         # Collect all pads grouped by net key with correct world coordinates.
-        # (apply footprint rotation using KiCad's clockwise-positive convention)
+        # (apply footprint rotation using KiCad's CCW-positive convention)
         import math
 
         pads_by_net: dict[str, list[tuple]] = defaultdict(list)
@@ -610,7 +614,7 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
                         else:
                             net_key = net_name or (str(net_id) if net_id is not None else "")
                 if net_key:
-                    # KiCad rotation is clockwise-positive; transform to world coords
+                    # KiCad rotation is CCW-positive on screen; transform to world coords
                     abs_x = fp_x + rel_x * cos_t + rel_y * sin_t
                     abs_y = fp_y - rel_x * sin_t + rel_y * cos_t
                     pads_by_net[net_key].append((ref, str(pad_num), abs_x, abs_y))

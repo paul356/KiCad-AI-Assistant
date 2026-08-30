@@ -1136,9 +1136,10 @@ wheels = [
 
 [[package]]
 name = "kcaa"
-version = "0.2.0"
+version = "0.2.1"
 source = { editable = "." }
 dependencies = [
+    { name = "certifi" },
     { name = "defusedxml" },
     { name = "fastmcp" },
     { name = "kicad-python" },
@@ -1188,6 +1189,7 @@ visualization = [
 
 [package.metadata]
 requires-dist = [
+    { name = "certifi", specifier = ">=2026.2.25" },
     { name = "defusedxml", specifier = ">=0.7.0" },
     { name = "fastmcp", specifier = ">=2.0.0" },
     { name = "kicad-python", specifier = ">=0.7.1" },

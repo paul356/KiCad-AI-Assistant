@@ -7,8 +7,8 @@ Provides:
   - ``find_collisions`` — module-level function imported by all five
     footprint-positioning tools to enforce the collision guard.
 
-PCB coordinate convention: mm, +X right, **+Y down**,
-rotation **clockwise-positive**.
+PCB coordinate convention: mm, +X right, **+Y down**, rotation
+**CCW-positive on screen** (KiCad convention: 0=right, 90=up).
 """
 
 from collections import defaultdict
@@ -198,7 +198,7 @@ def _get_footprint_bbox_at(
         reference: Footprint reference designator.
         x: Hypothetical X anchor in mm.
         y: Hypothetical Y anchor in mm.
-        rotation: Hypothetical rotation in degrees (clockwise-positive).
+        rotation: Hypothetical rotation in degrees (CCW-positive on screen).
 
     Returns:
         ``{min_x, min_y, max_x, max_y, width, height}`` dict, or ``None`` if
@@ -268,8 +268,8 @@ _TIER_NAMES = {1: "anchor", 2: "semi-fixed", 3: "flexible", 4: "free"}
 def _get_fp_pads_world(fp_node: list[Any]) -> list[dict[str, Any]]:
     """Return all pads of a footprint with world coordinates and net names.
 
-    Applies the footprint's rotation (clockwise-positive) to transform
-    local pad coordinates into board world coordinates.
+    Applies the footprint's rotation (CCW-positive on screen) to
+    transform local pad coordinates into board world coordinates.
 
     Returns:
         List of ``{x, y, net}`` dicts in world mm.
@@ -462,8 +462,8 @@ def _compute_layout_hpwl(
         for pad in local_pads:
             if not pad["net"]:
                 continue
-            # KiCad CW convention: x' = dx + lx*cos + ly*sin
-            #                      y' = dy - lx*sin + ly*cos
+            # KiCad rotation is CCW on screen:
+            #   x' = dx + lx*cos + ly*sin,  y' = dy - lx*sin + ly*cos
             wx = dx + pad["lx"] * cos_t + pad["ly"] * sin_t
             wy = dy - pad["lx"] * sin_t + pad["ly"] * cos_t
             net_pads[pad["net"]].append((wx, wy))
@@ -566,7 +566,7 @@ def find_nearest_free_position(
         reference: Footprint reference to check (excluded from static set).
         target_x: Desired X anchor in mm.
         target_y: Desired Y anchor in mm.
-        rotation: Footprint rotation in degrees (clockwise-positive).
+        rotation: Footprint rotation in degrees (CCW-positive on screen).
         search_radius_mm: Maximum search radius in mm (default 20 mm).
 
     Returns:
@@ -815,8 +815,8 @@ def _compute_hpwl_with_hypothetical_group(
         for pad in local_pads:
             if not pad["net"]:
                 continue
-            # KiCad CW convention: x' = dx + lx*cos + ly*sin
-            #                      y' = dy - lx*sin + ly*cos
+            # KiCad rotation is CCW on screen:
+            #   x' = dx + lx*cos + ly*sin,  y' = dy - lx*sin + ly*cos
             wx = dx + pad["lx"] * cos_t + pad["ly"] * sin_t
             wy = dy - pad["lx"] * sin_t + pad["ly"] * cos_t
             net_pads[pad["net"]].append((wx, wy))

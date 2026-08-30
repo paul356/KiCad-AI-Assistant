@@ -59,7 +59,8 @@ function _toolCallHtml(e) {
         + '</span></summary>'
         + '<div class="tool-body ' + css + '" data-details="' + uid + '">'
         + '<span style="color:#444">args:</span><br><pre style="margin:2px 0">' + args + '</pre>'
-        + '<span style="color:#444">result:</span><br><pre style="margin:2px 0">' + result + '</pre>'
+        + '<span style="color:#444">result:</span><br>'
+        + '<pre style="margin:2px 0;max-height:400px;overflow-y:auto">' + result + '</pre>'
         + '</div></details>';
 }
 
@@ -205,31 +206,57 @@ window._clearConversation = function() {
     window.scrollTo(0, 0);
 };
 
-// Click-to-collapse: clicking the tool body (args/result area) collapses
-// the details element.  Clicking the summary still expands natively.
-// Text selection is preserved: if the user has an active text selection
-// the click does NOT collapse (allowing copy via Ctrl+C).
+// Click-to-collapse: results expand via the summary (native toggle).
+// Clicking the tool body (args/result area) collapses the details element.
+// Text selection is protected from interference:
+//  - only a genuine drag (mousedown then movement beyond normal click
+//    jitter) is treated as a selection gesture, never collapses
+//  - an active selection at click time prevents collapse
+//  - double-click (word / line selection) cancels the pending collapse that
+//    its first click would otherwise schedule
 (function _installToolCollapse() {
+    var _downX = 0, _downY = 0, _drag = false, _collapseTimer = null;
+
+    document.addEventListener('mousedown', function(e) {
+        _downX = e.clientX;
+        _downY = e.clientY;
+        _drag = false;
+    }, true);
+    document.addEventListener('mousemove', function(e) {
+        // Human clicks wobble a few pixels; only flag movements well beyond
+        // that (10px radius) as drags that could create a text selection.
+        var dx = e.clientX - _downX, dy = e.clientY - _downY;
+        if (!_drag && (dx * dx + dy * dy) > 100) {
+            _drag = true;
+        }
+    }, true);
+    document.addEventListener('dblclick', function() {
+        if (_collapseTimer) {
+            clearTimeout(_collapseTimer);
+            _collapseTimer = null;
+        }
+    }, true);
+
     function _onToolBodyClick(e) {
+        if (e.button !== undefined && e.button !== 0) return;  // left button only
         var toolBody = e.target.closest('.tool-body');
         if (!toolBody) return;
-        // Don't collapse if the user is selecting / copying text.
+        if (_drag) return;  // genuine drag-select, not a click
         var sel = window.getSelection();
-        if (sel && sel.type === 'Range' && sel.toString().length > 0) return;
+        if (sel && !sel.isCollapsed) return;  // active selection
         var detailsId = toolBody.getAttribute('data-details');
         if (!detailsId) return;
         var details = document.getElementById(detailsId);
-        if (details && details.open) {
+        if (!details || !details.open) return;
+        // Defer: the first click of a double-click would collapse before the
+        // dblclick event arrives; cancel the collapse when one follows.
+        clearTimeout(_collapseTimer);
+        _collapseTimer = setTimeout(function() {
+            _collapseTimer = null;
             details.open = false;
-        }
+        }, 250);
     }
-    if (document.readyState !== 'loading') {
-        document.addEventListener('click', _onToolBodyClick);
-    } else {
-        document.addEventListener('DOMContentLoaded', function() {
-            document.addEventListener('click', _onToolBodyClick);
-        });
-    }
+    document.addEventListener('click', _onToolBodyClick);
 })();
 
 // ---- Search / Find in conversation ----
