@@ -30,6 +30,20 @@ description: "Symbol placement workflow, find_free_area, bbox geometry, spacing 
 3. After moves/inserts, prefer using the returned body_bbox; only call
    extract_schematic_netlist again if you need to refresh net info.
 
+# Moving / rotating components
+- move_component takes **deltas**: `x`/`y` are mm to shift by (each snapped
+  to the 1.27 mm grid), `rotation` is an increment applied per unit as
+  `(old + rotation) % 360` (restricted to 0/90/180/270). Read the current
+  anchor from extract_schematic_netlist and subtract to express an
+  absolute move as a delta; `position`/`rotation` in the result are the
+  new **absolute** values of the first moved unit.
+- Omitting `unit` moves **every** unit of a multi-unit symbol together by
+  the same shift, preserving relative layout. Pass `unit=N` to move/rotate
+  one unit individually (no overlap-avoidance search).
+- Whole-move deltas may be nudged to the nearest free area when the target
+  region is occupied: `position_adjusted` is then `True` and
+  `requested_position` holds the grid-snapped target.
+
 # Spacing & layout rules
 - Keep at least one grid step (1.27 mm) of clearance between symbol body
   bboxes; 2.54 mm or more is preferred so Reference/Value labels do not
