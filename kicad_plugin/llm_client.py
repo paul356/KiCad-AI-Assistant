@@ -210,6 +210,15 @@ _in_process_ssl: bool | None = None
 # Storage for reasoning_content (DeepSeek thinking mode)
 _current_reasoning: list[str] = []
 
+# The Anthropic Messages API requires max_tokens on every request; some
+# Anthropic-compatible gateways (e.g. Alibaba Model Studio) reject requests
+# without it.  Use this default when the user has not configured an output
+# cap via llm_max_tokens.  65536 is accepted by the token-plan gateway
+# (probed up to 131072 without rejection) and far above any realistic
+# single-turn output, so max_tokens never becomes the binding constraint
+# that truncates a tool-calling response.
+_ANTHROPIC_DEFAULT_MAX_TOKENS = 65536
+
 
 def _is_certificate_verification_error(error: BaseException) -> bool:
     """Return whether *error* was caused by an untrusted certificate chain."""
@@ -394,8 +403,8 @@ try:
                             text_blocks[idx] = block.get("text", "")
                         elif btype == "tool_use":
                             tool_blocks[idx] = {
-                                "id": block["id"],
-                                "name": block["name"],
+                                "id": block.get("id", ""),
+                                "name": block.get("name", ""),
                                 "input_json": "",
                             }
                     elif etype == "content_block_delta":
@@ -459,7 +468,10 @@ try:
                     chunk = json.loads(data_str)
                 except json.JSONDecodeError:
                     continue
-                choice = chunk.get("choices", [{}])[0]
+                _choices = chunk.get("choices") or []
+                if not _choices:
+                    continue
+                choice = _choices[0]
                 fr = choice.get("finish_reason")
                 if fr is not None:
                     finish_reason = fr
@@ -1939,8 +1951,11 @@ class LLMClient:
     def _stream_openai(self, system: str, tools: list[dict], on_text_delta) -> dict[str, Any]:
         """Call OpenAI-compatible API with streaming enabled.
 
-        Uses in-process urllib for true SSE streaming when SSL is available.
-        Falls back to non-streaming via _call_openai (subprocess) otherwise.
+        Uses in-process urllib for true SSE streaming when SSL is available;
+        otherwise relays the SSE stream through the plugin-venv Python
+        subprocess (_subprocess_sse_stream).  Both paths stream — there is no
+        non-streaming fallback here; _call_openai is used only by callers
+        that do not provide on_text_delta (e.g. history compaction).
         """
         global _current_reasoning
         _current_reasoning = []
@@ -1991,7 +2006,10 @@ class LLMClient:
                         except json.JSONDecodeError:
                             continue
 
-                        choice = chunk.get("choices", [{}])[0]
+                        _choices = chunk.get("choices") or []
+                        if not _choices:
+                            continue
+                        choice = _choices[0]
                         fr = choice.get("finish_reason")
                         if fr is not None:
                             finish_reason = fr
@@ -2034,6 +2052,8 @@ class LLMClient:
                         message["reasoning_content"] = "".join(_current_reasoning)
                     return {"finish_reason": finish_reason, "message": message}
 
+            except urllib.error.HTTPError as e:
+                return {"error": f"HTTP {e.code}: {e.read().decode('utf-8', 'replace')[:200]}"}
             except urllib.error.URLError as e:
                 if not _needs_https_fallback(e):
                     return {"error": f"HTTPS request failed: {e}"}
@@ -2166,8 +2186,11 @@ class LLMClient:
     def _stream_anthropic(self, system: str, tools: list[dict], on_text_delta) -> dict[str, Any]:
         """Call Anthropic API with streaming enabled.
 
-        Uses in-process urllib for true SSE streaming when SSL is available.
-        Falls back to non-streaming via _call_anthropic (subprocess) otherwise.
+        Uses in-process urllib for true SSE streaming when SSL is available;
+        otherwise relays the SSE stream through the plugin-venv Python
+        subprocess (_subprocess_sse_stream, fmt="anthropic").  Both paths
+        stream — there is no non-streaming fallback here; _call_anthropic is
+        used only by callers without on_text_delta (e.g. history compaction).
         """
         global _in_process_ssl
         import urllib.error
@@ -2196,9 +2219,10 @@ class LLMClient:
             "system": system,
             "messages": messages,
             "stream": True,
+            # Anthropic API requires max_tokens on every request; compatible
+            # gateways reject requests without it (400 InvalidParameter).
+            "max_tokens": self._max_tokens or _ANTHROPIC_DEFAULT_MAX_TOKENS,
         }
-        if self._max_tokens > 0:
-            payload["max_tokens"] = self._max_tokens
         if anthropic_tools:
             payload["tools"] = anthropic_tools
         encoded = json.dumps(payload).encode()
@@ -2240,8 +2264,8 @@ class LLMClient:
                                 text_blocks[idx] = block.get("text", "")
                             elif btype == "tool_use":
                                 tool_blocks[idx] = {
-                                    "id": block["id"],
-                                    "name": block["name"],
+                                    "id": block.get("id", ""),
+                                    "name": block.get("name", ""),
                                     "input_json": "",
                                 }
 
@@ -2300,6 +2324,8 @@ class LLMClient:
                         finish = "stop"
                     return {"finish_reason": finish, "message": message_out}
 
+            except urllib.error.HTTPError as e:
+                return {"error": f"HTTP {e.code}: {e.read().decode('utf-8', 'replace')[:200]}"}
             except urllib.error.URLError as e:
                 if not _needs_https_fallback(e):
                     return {"error": f"HTTPS request failed: {e}"}
@@ -2366,7 +2392,10 @@ class LLMClient:
         if not isinstance(body, dict):
             return {"error": f"Unexpected response from OpenAI: {text[:200]}"}
 
-        choice = body.get("choices", [{}])[0]
+        _choices = body.get("choices") or []
+        if not _choices:
+            return {"error": "OpenAI response contained no choices"}
+        choice = _choices[0]
         return {
             "finish_reason": choice.get("finish_reason", "stop"),
             "message": choice.get("message", {}),
@@ -2443,9 +2472,10 @@ class LLMClient:
             "model": self._settings.llm_model,
             "system": system,
             "messages": messages,
+            # Anthropic API requires max_tokens on every request; compatible
+            # gateways reject requests without it (400 InvalidParameter).
+            "max_tokens": self._max_tokens or _ANTHROPIC_DEFAULT_MAX_TOKENS,
         }
-        if self._max_tokens > 0:
-            payload["max_tokens"] = self._max_tokens
         if anthropic_tools:
             payload["tools"] = anthropic_tools
         encoded = json.dumps(payload).encode()
@@ -2466,15 +2496,18 @@ class LLMClient:
             return {"error": f"Unexpected response from Anthropic: {text[:200]}"}
 
         content_blocks_resp = body.get("content", [])
-        text_blocks = [b["text"] for b in content_blocks_resp if b.get("type") == "text"]
+        text_blocks = [b.get("text", "") for b in content_blocks_resp if b.get("type") == "text"]
         tool_use_blocks = [b for b in content_blocks_resp if b.get("type") == "tool_use"]
         message: dict[str, Any] = {"content": "\n".join(text_blocks)}
         if tool_use_blocks:
             message["tool_calls"] = [
                 {
-                    "id": b["id"],
+                    "id": b.get("id", ""),
                     "type": "function",
-                    "function": {"name": b["name"], "arguments": json.dumps(b.get("input", {}))},
+                    "function": {
+                        "name": b.get("name", ""),
+                        "arguments": json.dumps(b.get("input", {})),
+                    },
                 }
                 for b in tool_use_blocks
             ]

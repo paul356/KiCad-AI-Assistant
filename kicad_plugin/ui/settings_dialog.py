@@ -22,6 +22,9 @@ if _WX_AVAILABLE:
         """Simple dialog for editing plugin settings."""
 
         _PROVIDERS = ["openai", "anthropic", "ollama"]
+        # Vertical gap between form rows in the FlexGridSizer (must match the
+        # vgap literal used in _build_ui).
+        _GRID_VGAP = 6
 
         def __init__(self, parent, settings) -> None:
             super().__init__(parent, title="AI Assistant Settings", size=(600, 620))
@@ -153,6 +156,20 @@ if _WX_AVAILABLE:
 
             self.SetSizer(vbox)
             self.Layout()
+
+            # Reserve one extra form row (tallest typical control + grid vgap)
+            # so the last settings row is never clipped on dense themes.
+            control_heights = [
+                c.GetSize().GetHeight()
+                for c in (
+                    self._model,
+                    self._api_key,
+                    self._max_tokens,
+                    self._keep_recent_turns,
+                )
+            ]
+            row_extra = max(control_heights) + self._GRID_VGAP
+            self.SetSize(self.GetSize().GetWidth(), self.GetSize().GetHeight() + row_extra)
 
         def apply_to(self, settings) -> bool:
             """Write dialog values back to settings object.
