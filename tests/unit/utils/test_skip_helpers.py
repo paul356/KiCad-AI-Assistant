@@ -95,16 +95,37 @@ class TestNormalPath:
 
 
 class TestMirroredPath:
-    def test_mirror_y_flips_lx(self):
-        # mirror "y" flips lib x; angle 180 → +180 → 0 → exit (0+180)%360=180.
-        pin = _one(_sym(0.0, 0.0, 0, [_lib_pin("1", "P", 4.0, 2.0, 180)], mirror="y"))
+    def test_mirror_x_flips_lx(self):
+        # KiCad (mirror x) negates lib x; angle 180 → +180 → 0 →
+        # exit (0+180)%360 = 180 (left).
+        pin = _one(_sym(0.0, 0.0, 0, [_lib_pin("1", "P", 4.0, 2.0, 180)], mirror="x"))
         assert (pin.x, pin.y) == pytest.approx((-4.0, -2.0))
         assert pin.angle == 180.0
 
-    def test_mirror_x_flips_ly(self):
-        pin = _one(_sym(0.0, 0.0, 0, [_lib_pin("1", "P", 4.0, 2.0, 180)], mirror="x"))
+    def test_mirror_y_flips_ly(self):
+        # KiCad (mirror y) negates lib y; angle 180 lies along the
+        # unaffected axis (0/180 stay put under a y-flip) → exit 0 (right).
+        pin = _one(_sym(0.0, 0.0, 0, [_lib_pin("1", "P", 4.0, 2.0, 180)], mirror="y"))
         assert (pin.x, pin.y) == pytest.approx((4.0, 2.0))  # ly 2 → -2; sy-(-2)=2
-        assert pin.angle == 180.0
+        assert pin.angle == 0.0
+
+    def test_mirror_y_flips_angle_90_to_270(self):
+        # A y-flip swaps the 90°/270° directions (up ↔ down).
+        pin = _one(_sym(0.0, 0.0, 0, [_lib_pin("1", "P", 4.0, 2.0, 90)], mirror="y"))
+        assert (pin.x, pin.y) == pytest.approx((4.0, 2.0))
+        assert pin.angle == 90.0  # stub 90 → 270 → exit (270+180)%360 = 90 (up)
+
+    def test_j14_mirror_x_rot90_matches_kicad(self):
+        """Regression: MotorCell.kicad_sch J14 — (at 368.3 178.8922 90)
+        (mirror x), lib pin 1 at (1.27, 2.54, 270°).
+
+        KiCad's own wire endpoints (and skip's SymbolPin.location) put the
+        pin at (365.76, 180.1622) exiting left — i.e. lib x is NEGATED.
+        The label-swapped implementation emitted (370.84, 177.6222) "right".
+        """
+        pin = _one(_sym(368.3, 178.8922, 90, [_lib_pin("1", "P", 1.27, 2.54, 270)], mirror="x"))
+        assert (pin.x, pin.y) == pytest.approx((365.76, 180.1622))
+        assert pin.angle == 180.0  # wire-exit left, towards the wires
 
 
 class TestFallbackPath:

@@ -398,7 +398,7 @@ def lib_bbox_to_world(
     """Transform a library-space bbox into world (schematic) coordinates.
 
     Applies, in order:
-      1. mirror (``"x"`` flips lib y → -y; ``"y"`` flips lib x → -x),
+      1. mirror (``"x"`` flips lib x → -x; ``"y"`` flips lib y → -y),
       2. rotation around the lib origin (CCW in Y-up space),
       3. translation to ``(sym_x, sym_y)``,
       4. Y-axis flip (lib Y-up → schematic Y-down): ``world_y = sym_y - rel_y``.
@@ -414,9 +414,9 @@ def lib_bbox_to_world(
         (bbox.min_x, bbox.max_y),
     ]
 
-    if mirror == "y":
+    if mirror == "x":
         corners = [(-x, y) for (x, y) in corners]
-    elif mirror == "x":
+    elif mirror == "y":
         corners = [(x, -y) for (x, y) in corners]
 
     rot = int(rotation) % 360
