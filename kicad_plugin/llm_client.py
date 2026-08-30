@@ -2052,6 +2052,8 @@ class LLMClient:
                         message["reasoning_content"] = "".join(_current_reasoning)
                     return {"finish_reason": finish_reason, "message": message}
 
+            except urllib.error.HTTPError as e:
+                return {"error": f"HTTP {e.code}: {e.read().decode('utf-8', 'replace')[:200]}"}
             except urllib.error.URLError as e:
                 if not _needs_https_fallback(e):
                     return {"error": f"HTTPS request failed: {e}"}
@@ -2322,6 +2324,8 @@ class LLMClient:
                         finish = "stop"
                     return {"finish_reason": finish, "message": message_out}
 
+            except urllib.error.HTTPError as e:
+                return {"error": f"HTTP {e.code}: {e.read().decode('utf-8', 'replace')[:200]}"}
             except urllib.error.URLError as e:
                 if not _needs_https_fallback(e):
                     return {"error": f"HTTPS request failed: {e}"}

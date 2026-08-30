@@ -1,6 +1,7 @@
 """Tests for LLMClient history management (dedup + compaction)."""
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import io
 import json
 import os
 import ssl
@@ -1176,6 +1177,28 @@ class TestStreaming:
         assert 'block.get("id", "")' in script
         assert 'block.get("name", "")' in script
 
+    def test_stream_openai_http_error_includes_body(self):
+        """In-process streaming must surface HTTP 4xx with the response body
+        (HTTPError is a URLError subclass; it must not be swallowed by the
+        HTTPS-fallback branch)."""
+        client = _make_client()
+        err = urllib.error.HTTPError(
+            "http://x",
+            400,
+            "Bad Request",
+            {},
+            io.BytesIO(b'{"code":"InvalidParameter","message":"Request body format invalid"}'),
+        )
+        with (
+            patch.object(llm_client, "_in_process_ssl", None),
+            patch("urllib.request.urlopen", side_effect=err),
+        ):
+            result = client._stream_openai("sys", [], on_text_delta=lambda c: None)
+
+        assert result["error"] == (
+            'HTTP 400: {"code":"InvalidParameter","message":"Request body format invalid"}'
+        )
+
     def test_stream_openai_tool_calls(self):
         client = _make_client()
         sse_lines = [
@@ -1197,6 +1220,26 @@ class TestStreaming:
         assert tc[0]["function"]["name"] == "add_wire"
         assert tc[0]["function"]["arguments"] == '{"x":1}'
         assert result["finish_reason"] == "tool_calls"
+
+    def test_stream_anthropic_http_error_includes_body(self):
+        client = _make_client()
+        client._settings.llm_provider = "anthropic"
+        err = urllib.error.HTTPError(
+            "http://x",
+            400,
+            "Bad Request",
+            {},
+            io.BytesIO(b'{"code":"InvalidParameter","message":"Request body format invalid"}'),
+        )
+        with (
+            patch.object(llm_client, "_in_process_ssl", None),
+            patch("urllib.request.urlopen", side_effect=err),
+        ):
+            result = client._stream_anthropic("sys", [], on_text_delta=lambda c: None)
+
+        assert result["error"] == (
+            'HTTP 400: {"code":"InvalidParameter","message":"Request body format invalid"}'
+        )
 
     def test_stream_anthropic_text_only(self):
         client = _make_client()
