@@ -459,7 +459,10 @@ try:
                     chunk = json.loads(data_str)
                 except json.JSONDecodeError:
                     continue
-                choice = chunk.get("choices", [{}])[0]
+                _choices = chunk.get("choices") or []
+                if not _choices:
+                    continue
+                choice = _choices[0]
                 fr = choice.get("finish_reason")
                 if fr is not None:
                     finish_reason = fr
@@ -1991,7 +1994,10 @@ class LLMClient:
                         except json.JSONDecodeError:
                             continue
 
-                        choice = chunk.get("choices", [{}])[0]
+                        _choices = chunk.get("choices") or []
+                        if not _choices:
+                            continue
+                        choice = _choices[0]
                         fr = choice.get("finish_reason")
                         if fr is not None:
                             finish_reason = fr
@@ -2366,7 +2372,10 @@ class LLMClient:
         if not isinstance(body, dict):
             return {"error": f"Unexpected response from OpenAI: {text[:200]}"}
 
-        choice = body.get("choices", [{}])[0]
+        _choices = body.get("choices") or []
+        if not _choices:
+            return {"error": "OpenAI response contained no choices"}
+        choice = _choices[0]
         return {
             "finish_reason": choice.get("finish_reason", "stop"),
             "message": choice.get("message", {}),
