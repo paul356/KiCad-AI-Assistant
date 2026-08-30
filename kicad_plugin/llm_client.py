@@ -210,6 +210,12 @@ _in_process_ssl: bool | None = None
 # Storage for reasoning_content (DeepSeek thinking mode)
 _current_reasoning: list[str] = []
 
+# The Anthropic Messages API requires max_tokens on every request; some
+# Anthropic-compatible gateways (e.g. Alibaba Model Studio) reject requests
+# without it.  Use this default when the user has not configured an output
+# cap via llm_max_tokens.
+_ANTHROPIC_DEFAULT_MAX_TOKENS = 4096
+
 
 def _is_certificate_verification_error(error: BaseException) -> bool:
     """Return whether *error* was caused by an untrusted certificate chain."""
@@ -394,8 +400,8 @@ try:
                             text_blocks[idx] = block.get("text", "")
                         elif btype == "tool_use":
                             tool_blocks[idx] = {
-                                "id": block["id"],
-                                "name": block["name"],
+                                "id": block.get("id", ""),
+                                "name": block.get("name", ""),
                                 "input_json": "",
                             }
                     elif etype == "content_block_delta":
@@ -2202,9 +2208,10 @@ class LLMClient:
             "system": system,
             "messages": messages,
             "stream": True,
+            # Anthropic API requires max_tokens on every request; compatible
+            # gateways reject requests without it (400 InvalidParameter).
+            "max_tokens": self._max_tokens or _ANTHROPIC_DEFAULT_MAX_TOKENS,
         }
-        if self._max_tokens > 0:
-            payload["max_tokens"] = self._max_tokens
         if anthropic_tools:
             payload["tools"] = anthropic_tools
         encoded = json.dumps(payload).encode()
@@ -2246,8 +2253,8 @@ class LLMClient:
                                 text_blocks[idx] = block.get("text", "")
                             elif btype == "tool_use":
                                 tool_blocks[idx] = {
-                                    "id": block["id"],
-                                    "name": block["name"],
+                                    "id": block.get("id", ""),
+                                    "name": block.get("name", ""),
                                     "input_json": "",
                                 }
 
@@ -2452,9 +2459,10 @@ class LLMClient:
             "model": self._settings.llm_model,
             "system": system,
             "messages": messages,
+            # Anthropic API requires max_tokens on every request; compatible
+            # gateways reject requests without it (400 InvalidParameter).
+            "max_tokens": self._max_tokens or _ANTHROPIC_DEFAULT_MAX_TOKENS,
         }
-        if self._max_tokens > 0:
-            payload["max_tokens"] = self._max_tokens
         if anthropic_tools:
             payload["tools"] = anthropic_tools
         encoded = json.dumps(payload).encode()
@@ -2475,15 +2483,18 @@ class LLMClient:
             return {"error": f"Unexpected response from Anthropic: {text[:200]}"}
 
         content_blocks_resp = body.get("content", [])
-        text_blocks = [b["text"] for b in content_blocks_resp if b.get("type") == "text"]
+        text_blocks = [b.get("text", "") for b in content_blocks_resp if b.get("type") == "text"]
         tool_use_blocks = [b for b in content_blocks_resp if b.get("type") == "tool_use"]
         message: dict[str, Any] = {"content": "\n".join(text_blocks)}
         if tool_use_blocks:
             message["tool_calls"] = [
                 {
-                    "id": b["id"],
+                    "id": b.get("id", ""),
                     "type": "function",
-                    "function": {"name": b["name"], "arguments": json.dumps(b.get("input", {}))},
+                    "function": {
+                        "name": b.get("name", ""),
+                        "arguments": json.dumps(b.get("input", {})),
+                    },
                 }
                 for b in tool_use_blocks
             ]
