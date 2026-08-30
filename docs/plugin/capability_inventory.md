@@ -44,7 +44,7 @@ These are read-only tools. They must be used when the LLM is asked to add a comp
 | `set_symbol_property` | Update any property (value, footprint, datasheet, custom field) |
 | `list_symbol_properties` | Read all properties of one component |
 | `delete_symbol_property` | Remove a custom property |
-| `move_component` | Reposition a component to new coordinates |
+| `move_component` | Shift a component by a delta, optionally per unit |
 | `add_label_to_schematic` | Add a net label at a position |
 | `list_labels_in_schematic` | Enumerate all labels in a schematic |
 | `delete_label_from_schematic` | Remove a label by text and position |

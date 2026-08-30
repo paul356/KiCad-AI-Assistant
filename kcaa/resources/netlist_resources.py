@@ -7,7 +7,7 @@ import os
 from fastmcp import FastMCP
 
 from kcaa.utils.file_utils import get_project_files
-from kcaa.utils.netlist_parser import analyze_netlist, extract_netlist
+from kcaa.utils.netlist_parser import analyze_netlist, extract_netlist, iter_component_pins
 
 
 def register_netlist_resources(mcp: FastMCP) -> None:
@@ -210,12 +210,16 @@ def register_netlist_resources(mcp: FastMCP) -> None:
 
             report += "\n"
 
-            # Pins section
-            if "pins" in component_info:
+            # Pins section — pins are nested per unit (issue #89); list them flat,
+            # tagging the unit only for multi-unit components.
+            units = component_info.get("units") or {}
+            if units:
+                multi_unit = len(units) > 1
                 report += "## Pins\n\n"
 
-                for pin in component_info["pins"]:
-                    report += f"- **Pin {pin['num']}**: {pin['name']}\n"
+                for unit, pin in iter_component_pins(component_info):
+                    suffix = f" (unit {unit})" if multi_unit else ""
+                    report += f"- **Pin {pin['num']}{suffix}**: {pin['name']}\n"
 
                 report += "\n"
 

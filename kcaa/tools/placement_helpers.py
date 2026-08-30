@@ -16,7 +16,7 @@ from typing import Any
 from fastmcp import FastMCP
 import sexpdata
 
-from kcaa.utils.netlist_parser import extract_netlist
+from kcaa.utils.netlist_parser import component_body_bbox, extract_netlist
 from kcaa.utils.symbol_geometry import (
     BBox,
     bboxes_overlap,
@@ -150,6 +150,7 @@ def _find_free_area_impl(
     for_symbol: str | None = None,
     rotation: int = 0,
     exclude_uuid: str | None = None,
+    exclude_refs: set[str] | None = None,
 ) -> dict[str, Any]:
     """Core implementation shared by the MCP tool and sheet auto-placement."""
     if not os.path.exists(schematic_path):
@@ -221,7 +222,9 @@ def _find_free_area_impl(
     for ref, comp in components.items():
         if comp.get("type") == "sheet":
             continue
-        bb_d = comp.get("body_bbox")
+        if exclude_refs and ref in exclude_refs:
+            continue
+        bb_d = component_body_bbox(comp)
         if not bb_d:
             continue
         try:

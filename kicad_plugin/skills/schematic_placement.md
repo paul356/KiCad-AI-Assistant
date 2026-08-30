@@ -6,8 +6,9 @@ description: "Symbol placement workflow, find_free_area, bbox geometry, spacing 
 # Geometry you get for free
 - get_symbol and get_symbol_pins return body_bbox + per-unit bboxes in
   library coordinates so you can size new placements before inserting.
-- extract_schematic_netlist returns body_bbox per placed component in
-  schematic (Y-down) world coordinates. Use it as your occupancy map.
+- extract_schematic_netlist returns a body_bbox per placed **unit** in
+  schematic (Y-down) world coordinates. Union every unit's bbox to get a
+  component's occupied region and use that as your occupancy map.
 - add_symbol_to_schematic, place_symbol_relative and move_component all
   return the resulting body_bbox so you usually do NOT need to re-extract
   the netlist after a successful placement.

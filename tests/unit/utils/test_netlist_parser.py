@@ -22,8 +22,14 @@ def _all_pins(parsed: dict) -> list:
     """Return a flat list of every pin dict across all components."""
     pins = []
     for comp in parsed["components"].values():
-        pins.extend(comp.get("pins", []))
+        for unit in (comp.get("units") or {}).values():
+            pins.extend(unit.get("pins", []))
     return pins
+
+
+def _pins_of(comp: dict) -> list:
+    """Pins of a component's unit 1 (fixture components are single-unit)."""
+    return comp["units"]["1"].get("pins", [])
 
 
 @pytest.fixture(scope="module")
@@ -54,7 +60,7 @@ class TestNetlistPinDirection:
         """R1 (R_Small) has exactly 2 pins; both must carry a 'direction' key."""
         r1 = parsed["components"].get("R1")
         assert r1 is not None, "R1 not found in parsed components"
-        pins = r1.get("pins", [])
+        pins = _pins_of(r1)
         assert len(pins) == 2, f"Expected 2 pins for R1, got {len(pins)}"
         for pin in pins:
             assert "direction" in pin
@@ -63,7 +69,7 @@ class TestNetlistPinDirection:
         """C1 (capacitor) has exactly 2 pins; both must carry a 'direction' key."""
         c1 = parsed["components"].get("C1")
         assert c1 is not None, "C1 not found in parsed components"
-        pins = c1.get("pins", [])
+        pins = _pins_of(c1)
         assert len(pins) == 2, f"Expected 2 pins for C1, got {len(pins)}"
         for pin in pins:
             assert "direction" in pin
@@ -75,7 +81,7 @@ class TestNetlistPinDirection:
         """
         r1 = parsed["components"].get("R1")
         assert r1 is not None, "R1 not found in parsed components"
-        by_num = {pin["num"]: pin for pin in r1.get("pins", [])}
+        by_num = {pin["num"]: pin for pin in _pins_of(r1)}
         assert by_num["1"]["direction"] == "up", (
             f"R1 pin 1 direction expected 'up', got {by_num['1']['direction']!r}"
         )
@@ -90,7 +96,7 @@ class TestNetlistPinDirection:
         """
         c1 = parsed["components"].get("C1")
         assert c1 is not None, "C1 not found in parsed components"
-        by_num = {pin["num"]: pin for pin in c1.get("pins", [])}
+        by_num = {pin["num"]: pin for pin in _pins_of(c1)}
         assert by_num["1"]["direction"] == "up", (
             f"C1 pin 1 direction expected 'up', got {by_num['1']['direction']!r}"
         )

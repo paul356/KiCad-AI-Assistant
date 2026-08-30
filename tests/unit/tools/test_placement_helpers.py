@@ -525,14 +525,15 @@ class TestPlaceSymbolRelative:
                 comps["move_component"](
                     schematic_path=tmp_sch,
                     reference=ref,
-                    x=90.0,
-                    y=90.0,
+                    x=30.0,  # delta, grid-snapped
+                    y=30.0,
                 )
             )
         assert moved["success"], moved
         bb = moved["body_bbox"]
         assert bb is not None
-        # The bbox should be near (90, 90).
+        # Added at ~(60, 60) plus a 30 mm delta: the bbox should sit near
+        # (90, 90).
         cx = (bb["min_x"] + bb["max_x"]) / 2.0
         cy = (bb["min_y"] + bb["max_y"]) / 2.0
         assert abs(cx - 90.0) < 5.0
@@ -567,13 +568,15 @@ class TestPlaceSymbolRelative:
                 )
             )
         assert moved["success"], moved
-        # Read back the .kicad_sch and verify the placed symbol's `at` is
-        # at the nearest grid point to (90.10, 90.10), i.e. 71*1.27=90.17.
+        # Read back the .kicad_sch and verify the delta was snapped to the
+        # 1.27 mm grid (90.10 -> 71*1.27 = 90.17) so the resulting `at`
+        # stays grid-aligned.
         from kcaa.utils.netlist_parser import extract_netlist
 
         netlist = extract_netlist(tmp_sch)
         comp = netlist["components"][ref]
-        x_pos, y_pos = comp["position"]["x"], comp["position"]["y"]
+        unit_pos = comp["units"]["1"]["position"]
+        x_pos, y_pos = unit_pos["x"], unit_pos["y"]
         # Each coordinate must be an exact multiple of 1.27.
         assert abs(round(x_pos / 1.27) * 1.27 - x_pos) < 1e-6
         assert abs(round(y_pos / 1.27) * 1.27 - y_pos) < 1e-6

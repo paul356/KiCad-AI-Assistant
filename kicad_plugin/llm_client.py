@@ -734,6 +734,13 @@ _PROMPT_SCHEMATIC = """\
   0°=unrotated, 90°=tilt left, 180°=flipped, 270°=tilt right.
 - The schematic grid is **1.27 mm (50 mil)**. add_symbol_to_schematic and
   move_component snap automatically; rotation is restricted to 0/90/180/270.
+- move_component takes **deltas**: x/y are mm to shift by, rotation is an
+  incremental angle added to the component's current rotation. Read the
+  current anchor from extract_schematic_netlist and subtract to express an
+  absolute move as a delta; position/rotation in the result are the new
+  absolute values of the first moved unit. Omitting `unit` moves every
+  unit of a multi-unit symbol together; pass `unit=N` to move/rotate one
+  unit individually.
 - Default sheet is **A4 (297 x 210 mm)**. At the start of each request
   that involves spatial changes, call get_schematic_sheet_info once to
   confirm the actual paper size and to learn the recommended drawing area

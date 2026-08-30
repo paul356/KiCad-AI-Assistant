@@ -1283,9 +1283,10 @@ def register_symbol_edit_tools(mcp: FastMCP) -> None:
         if gap < 0 or not math.isfinite(gap):
             return {"error": f"gap must be a non-negative finite number (got {gap})"}
 
-        # Look up anchor's world bbox via netlist extraction.
+        # Look up anchor's world bbox via netlist extraction. The netlist keeps
+        # bboxes per unit; fuse them for the anchor's occupied region.
         try:
-            from kcaa.utils.netlist_parser import extract_netlist
+            from kcaa.utils.netlist_parser import component_body_bbox, extract_netlist
 
             netlist = extract_netlist(schematic_path)
         except Exception as exc:
@@ -1294,7 +1295,7 @@ def register_symbol_edit_tools(mcp: FastMCP) -> None:
         anchor = comps.get(anchor_reference)
         if anchor is None:
             return {"error": f"Anchor reference {anchor_reference!r} not found"}
-        bb_d = anchor.get("body_bbox")
+        bb_d = component_body_bbox(anchor)
         if not bb_d:
             return {
                 "error": (
@@ -1928,18 +1929,29 @@ def register_symbol_edit_tools(mcp: FastMCP) -> None:
         x: float | None = None,
         y: float | None = None,
         rotation: int | None = None,
+        unit: int | None = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
-        """Move and/or rotate a placed schematic component.
+        """Move and/or rotate a placed schematic component by a delta.
 
         At least one of ``x``, ``y``, ``rotation`` must be provided; omitted
-        values are left unchanged. Coordinates are mm in KiCad screen
-        convention (**+Y is down**) and are auto-snapped to the 1.27 mm
+        axes are left unchanged. ``x``/``y`` are **deltas** in mm (KiCad
+        screen convention, **+Y is down**), each auto-snapped to the 1.27 mm
         (50-mil) grid so pins remain on KiCad's standard schematic grid and
-        existing wires stay connected. Rotation is absolute (0/90/180/270°).
-        All units sharing the reference are moved together, and Reference /
-        Value field positions shift by the same delta. A backup
-        (.kicad_sch.bak) is written before saving.
+        existing wires stay connected. ``rotation`` is a **delta** in
+        degrees, restricted to 0/90/180/270 and applied per unit as
+        ``(old + rotation) % 360``. Read the current anchor from
+        ``extract_schematic_netlist`` and subtract to compute an absolute
+        move as a delta.
+
+        When ``unit`` is omitted, all units sharing the reference shift by
+        the same delta, preserving the units' relative layout (whole moves
+        may be nudged to the nearest free area when the target region is
+        occupied — see ``position_adjusted``). With ``unit=N`` only that
+        unit moves/rotates (equivalent to moving a single symbol; no
+        overlap-avoidance search). Reference / Value field positions shift
+        by the same delta as the moved unit(s). A backup (.kicad_sch.bak)
+        is written before saving.
 
         Tip: to move a component to sit relative to another, prefer
         ``place_symbol_relative`` (handles bbox + clearance for you). To find
@@ -1948,14 +1960,20 @@ def register_symbol_edit_tools(mcp: FastMCP) -> None:
         Args:
             schematic_path: Path to the .kicad_sch file.
             reference: Reference designator (e.g. "R1") or a sheet name.
-            x: New X coordinate in mm (auto grid-snapped).
-            y: New Y coordinate in mm (auto grid-snapped).
-            rotation: New absolute rotation in degrees (0, 90, 180, or 270).
+            x: Delta X to apply in mm (auto grid-snapped).
+            y: Delta Y to apply in mm (auto grid-snapped).
+            rotation: Delta rotation in degrees; one of 0, 90, 180, or 270
+                (each moved unit becomes ``old + rotation``, normalized to
+                0-359).
+            unit: Which unit of a multi-unit symbol to move/rotate (positive
+                int, e.g. 1 or 2); omitted moves all units by the same delta.
 
         Returns:
-            dict with keys: success, reference, position ({x, y} after grid
-            snap), rotation, units_updated, body_bbox (world-space union of
-            unit bboxes after the move; ``None`` for graphics-less symbols).
+            dict with keys: success, reference, unit, position ({x, y} of
+            the first moved unit's anchor after the move), rotation
+            (absolute rotation of that unit), units_updated, body_bbox
+            (world-space union of the moved units' bboxes after the move;
+            ``None`` for graphics-less symbols).
         """
         if not schematic_path.endswith(".kicad_sch"):
             return {"error": f"Not a .kicad_sch file: {schematic_path!r}"}
@@ -1971,6 +1989,8 @@ def register_symbol_edit_tools(mcp: FastMCP) -> None:
             return {"error": f"y must be a finite number (got {y!r})"}
         if rotation is not None and rotation not in (0, 90, 180, 270):
             return {"error": f"rotation must be 0, 90, 180, or 270 (got {rotation!r})"}
+        if unit is not None and (not isinstance(unit, int) or isinstance(unit, bool) or unit < 1):
+            return {"error": f"unit must be a positive integer (got {unit!r})"}
 
         try:
             sch = safe_schematic(schematic_path)
@@ -1982,14 +2002,27 @@ def register_symbol_edit_tools(mcp: FastMCP) -> None:
             try:
                 for sym in sch.symbol:
                     try:
-                        if sym.property.Reference.value == reference:
-                            units.append(sym)
+                        if sym.property.Reference.value != reference:
+                            continue
                     except AttributeError:
                         continue
+                    if unit is not None:
+                        try:
+                            sym_unit = int(sym.unit.value)
+                        except (AttributeError, ValueError, TypeError):
+                            sym_unit = 1
+                        if sym_unit != unit:
+                            continue
+                    units.append(sym)
             except AttributeError:
                 pass
 
             if not units:
+                if unit is not None:
+                    return {
+                        "error": f"Reference {reference!r} has no unit {unit}",
+                        "success": False,
+                    }
                 from kcaa.tools.sheet_tools import (
                     _do_update_sheet_symbol,
                     _list_sheet_symbols_impl,
@@ -2006,13 +2039,35 @@ def register_symbol_edit_tools(mcp: FastMCP) -> None:
                 if sheet_info is not None:
                     if rotation is not None:
                         return {"error": "rotation is not supported for sheet symbols"}
+                    # _do_update_sheet_symbol is absolute-position; convert
+                    # the requested deltas against the sheet's current anchor.
+                    sheet_pos = sheet_info.get("position") or {}
+                    abs_x = abs_y = None
+                    if x is not None:
+                        if sheet_pos.get("x") is None:
+                            return {
+                                "error": (
+                                    f"Cannot apply delta x={x!r}: sheet {reference!r} "
+                                    "has no current position"
+                                )
+                            }
+                        abs_x = float(sheet_pos["x"]) + x
+                    if y is not None:
+                        if sheet_pos.get("y") is None:
+                            return {
+                                "error": (
+                                    f"Cannot apply delta y={y!r}: sheet {reference!r} "
+                                    "has no current position"
+                                )
+                            }
+                        abs_y = float(sheet_pos["y"]) + y
                     sheet_result = _do_update_sheet_symbol(
                         schematic_path=schematic_path,
                         sheet_identifier=reference,
                         sheet_name=None,
                         sheet_file=None,
-                        x=x,
-                        y=y,
+                        x=abs_x,
+                        y=abs_y,
                         width=None,
                         height=None,
                     )
@@ -2031,23 +2086,34 @@ def register_symbol_edit_tools(mcp: FastMCP) -> None:
                     }
                 return {"error": f"No symbol or sheet named {reference!r} found"}
 
-            # Compute the target position (grid-snapped), then nudge it to
-            # avoid overlap with other symbols/sheets if needed.
+            # Deltas are snapped to the 1.27 mm grid before application, so
+            # the resulting absolute anchor stays on-grid for on-grid
+            # symbols. Overlap avoidance runs in absolute coordinates
+            # (candidate = current anchor + snapped delta), then the final
+            # applied delta is whatever reaches the chosen absolute spot.
             first_at = units[0].at.value
-            raw_new_x = _align_to_grid(x) if x is not None else float(first_at[0])
-            raw_new_y = _align_to_grid(y) if y is not None else float(first_at[1])
+            aligned_dx = _align_to_grid(x) if x is not None else 0.0
+            aligned_dy = _align_to_grid(y) if y is not None else 0.0
+            raw_new_x = float(first_at[0]) + aligned_dx
+            raw_new_y = float(first_at[1]) + aligned_dy
             final_new_x = raw_new_x
             final_new_y = raw_new_y
-            position_adjusted = False
-            if x is not None or y is not None:
+            overlap_adjusted = False
+            grid_snapped = (x is not None and abs(aligned_dx - x) > 1e-6) or (
+                y is not None and abs(aligned_dy - y) > 1e-6
+            )
+            # Whole-component moves may nudge to free space; per-unit moves
+            # are precise operations on the unit's own footprint, so the
+            # union-bbox search does not apply.
+            if (x is not None or y is not None) and unit is None:
                 try:
                     from kcaa.tools.placement_helpers import _find_free_area_impl
                     from kcaa.tools.sheet_tools import _has_position_conflict
-                    from kcaa.utils.netlist_parser import extract_netlist
+                    from kcaa.utils.netlist_parser import component_body_bbox, extract_netlist
 
                     netlist = extract_netlist(schematic_path)
                     comp_info = (netlist.get("components") or {}).get(reference)
-                    bb_d = comp_info.get("body_bbox") if comp_info else None
+                    bb_d = component_body_bbox(comp_info) if comp_info else None
                     if bb_d:
                         bbox_w = float(bb_d["max_x"]) - float(bb_d["min_x"])
                         bbox_h = float(bb_d["max_y"]) - float(bb_d["min_y"])
@@ -2080,6 +2146,7 @@ def register_symbol_edit_tools(mcp: FastMCP) -> None:
                             bbox_w,
                             bbox_h,
                             exclude_uuid=sym_uuid,
+                            exclude_refs={reference},
                         )
                         if has_conflict:
                             log.info(
@@ -2098,6 +2165,7 @@ def register_symbol_edit_tools(mcp: FastMCP) -> None:
                                 prefer_near={"x": raw_new_x, "y": raw_new_y},
                                 max_candidates=1,
                                 exclude_uuid=sym_uuid,
+                                exclude_refs={reference},
                             )
                             cand = (free.get("candidates") or [{}])[0]
                             origin = cand.get("origin")
@@ -2114,7 +2182,7 @@ def register_symbol_edit_tools(mcp: FastMCP) -> None:
                                 if abs(adj_x - raw_new_x) > 1e-6 or abs(adj_y - raw_new_y) > 1e-6:
                                     final_new_x = _align_to_grid(adj_x)
                                     final_new_y = _align_to_grid(adj_y)
-                                    position_adjusted = True
+                                    overlap_adjusted = True
                                     log.info(
                                         "move_component: adjusted to nearest free (%s, %s) "
                                         "from requested (%s, %s) (ref=%s)",
@@ -2133,13 +2201,22 @@ def register_symbol_edit_tools(mcp: FastMCP) -> None:
                     )
                     pass
 
+            # Every scoped unit shifts by the same final delta (grid-snapped request,
+            # possibly adjusted to free space). Rotation is a per-unit delta,
+            # so each unit ends at (old + rotation) % 360 — relative unit
+            # orientations survive whole-component moves.
+            anchor_at2 = units[0].at.value
+            delta_x = final_new_x - float(anchor_at2[0])
+            delta_y = final_new_y - float(anchor_at2[1])
+
             for sym in units:
                 at = sym.at.value
                 old_x = at[0]
                 old_y = at[1]
-                new_x = final_new_x if (x is not None) else old_x
-                new_y = final_new_y if (y is not None) else old_y
-                new_rot = rotation if rotation is not None else (at[2] if len(at) > 2 else 0)
+                new_x = old_x + delta_x
+                new_y = old_y + delta_y
+                old_rot = at[2] if len(at) > 2 else 0
+                new_rot = (old_rot + rotation) % 360 if rotation is not None else old_rot
                 dx = new_x - old_x
                 dy = new_y - old_y
                 sym.at.value = [new_x, new_y, new_rot]
@@ -2228,9 +2305,11 @@ def register_symbol_edit_tools(mcp: FastMCP) -> None:
                     body_bbox = _placed_world_bbox(lib_raw, placements)
             except Exception:
                 body_bbox = None
+            position_adjusted = overlap_adjusted or grid_snapped
             out: dict[str, Any] = {
                 "success": True,
                 "reference": reference,
+                "unit": unit,
                 "position": {"x": final_at[0], "y": final_at[1]},
                 "rotation": final_at[2] if len(final_at) > 2 else 0,
                 "units_updated": len(units),
@@ -2239,7 +2318,7 @@ def register_symbol_edit_tools(mcp: FastMCP) -> None:
                 "file_modified": schematic_path,
                 "backup_path": schematic_path + ".bak",
             }
-            if position_adjusted:
+            if overlap_adjusted:
                 out["requested_position"] = {"x": raw_new_x, "y": raw_new_y}
                 out["note"] = "Position adjusted to nearest free area to avoid overlap."
             return out
