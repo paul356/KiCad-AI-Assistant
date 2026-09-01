@@ -7,6 +7,8 @@ Unit tests for:
 
 import os
 
+import pytest
+
 from kcaa.utils.footprint_database import (
     FootprintDatabase,
     FootprintRecord,
@@ -870,7 +872,7 @@ class TestFpSyncTools:
         )
         monkeypatch.setattr(
             "kcaa.tools.pcb_library_tools.get_footprint_index_manager",
-            lambda project_path=None: mgr,
+            lambda project_path=None, project_id=None: mgr,
         )
 
         with _tool_module._fp_sync_lock:
@@ -909,7 +911,7 @@ class TestFpSyncTools:
         )
         monkeypatch.setattr(
             "kcaa.tools.pcb_library_tools.get_footprint_index_manager",
-            lambda project_path=None: mgr,
+            lambda project_path=None, project_id=None: mgr,
         )
 
         with _tool_module._fp_sync_lock:
@@ -972,3 +974,29 @@ class TestFpSyncTools:
         assert result["percent_complete"] == 50
         assert result["running"] is True
         assert result["current_library"] == "Lib50"
+
+
+class TestGetFootprintIndexManager:
+    """The factory accepts a canonical ``project_id`` without re-deriving it."""
+
+    def _factory_module(self):
+        return __import__(
+            "kcaa.utils.footprint_index_manager", fromlist=["get_footprint_index_manager"]
+        )
+
+    def test_project_id_used_verbatim(self, tmp_path, monkeypatch):
+        """A canonical project_id must scope directly: no dirname re-derivation."""
+        mod = self._factory_module()
+        monkeypatch.setattr(mod, "_singleton", None)
+        mgr = mod.get_footprint_index_manager(project_id="/tmp/SomeProject")
+        assert mgr._project_id == "/tmp/SomeProject"
+        assert mgr._project_path is None
+
+    def test_rejects_both_project_path_and_id(self, tmp_path, monkeypatch):
+        mod = self._factory_module()
+        monkeypatch.setattr(mod, "_singleton", None)
+        with pytest.raises(ValueError):
+            mod.get_footprint_index_manager(
+                project_path="/tmp/SomeProject/proj.kicad_pro",
+                project_id="/tmp/SomeProject",
+            )

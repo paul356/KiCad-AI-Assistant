@@ -86,19 +86,32 @@ class FootprintIndexManager:
         Path to the SQLite database file.  Defaults to the package-local
         ``footprint_db/kicad_footprints.db``.
     project_path:
-        Optional path to a ``.kicad_pro`` file; the project-local
-        fp-lib-table is read in addition to the global one.
+        Optional path to a ``.kicad_pro`` or ``.kicad_pcb`` project file;
+        used to locate the project-local fp-lib-table and to derive the
+        project identifier (the realpath of the project directory) that
+        scopes index reads and writes.
+    project_id:
+        Optional project identifier, already in canonical form (``"```` '
+        '':`` globally scoped).  Pass either *project_path* or *project_id*,
+        never both; *project_id* avoids re-deriving it from a path by callers
+        that only need the scoped manager.
     """
 
     def __init__(
         self,
         db_path: "str | Path | None" = None,
         project_path: str | None = None,
+        *,
+        project_id: str | None = None,
     ):
+        if project_path is not None and project_id is not None:
+            raise ValueError("Pass either project_path or project_id, not both")
         resolved = Path(db_path) if db_path else _DEFAULT_DB_PATH
         self._db = FootprintDatabase(str(resolved))
         self._project_path = project_path
-        self._project_id = normalize_project_id(project_path)
+        self._project_id = (
+            project_id if project_id is not None else normalize_project_id(project_path)
+        )
 
     # ------------------------------------------------------------------
     # Sync
@@ -422,12 +435,17 @@ _singleton_lock = threading.Lock()
 
 def get_footprint_index_manager(
     project_path: str | None = None,
+    *,
+    project_id: str | None = None,
 ) -> FootprintIndexManager:
     """Return the module-level FootprintIndexManager singleton.
 
     On first call the manager is created with the default DB path.
     If ``project_path`` is provided it is forwarded to
     ``build_effective_library_list`` so project-local libraries are included.
+    *project_id*, when given, scopes the manager to that canonical project
+    identifier directly (no path involved); pass either it or
+    ``project_path``, never both.
 
     Thread-safe (double-checked locking).
     """
@@ -435,8 +453,11 @@ def get_footprint_index_manager(
     if _singleton is None:
         with _singleton_lock:
             if _singleton is None:
-                _singleton = FootprintIndexManager(project_path=project_path)
+                _singleton = FootprintIndexManager(project_path=project_path, project_id=project_id)
     elif project_path is not None:
         _singleton._project_path = project_path
         _singleton._project_id = normalize_project_id(project_path)
+    elif project_id is not None:
+        _singleton._project_path = None
+        _singleton._project_id = project_id
     return _singleton

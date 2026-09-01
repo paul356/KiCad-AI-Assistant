@@ -183,7 +183,7 @@ def project(tmp_path, monkeypatch):
     # swap the factory for a temp-DB manager (never the real user DB).
     monkeypatch.setattr(
         "kcaa.tools.pcb_library_tools.get_footprint_index_manager",
-        lambda project_path=None: index_mgr,
+        lambda project_path=None, project_id=None: index_mgr,
     )
     return {
         "tmp_path": str(tmp_path),

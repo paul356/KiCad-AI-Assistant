@@ -465,7 +465,7 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
             # exists in the index (any project) or the global fp-lib-table.
             # library_name_exists is deliberately cross-project, so no
             # project-scoped stats guard.
-            mgr = get_footprint_index_manager(None)
+            mgr = get_footprint_index_manager(project_id="")
             if mgr.library_name_exists(nickname) or nickname in {
                 lib["nickname"] for lib in build_effective_library_list(None)
             }:
@@ -703,10 +703,14 @@ def _collect_existing_names(pcb_path: str | None) -> set[str]:
     Prefers the footprint index database scoped to the project (global plus
     project-local libraries; consistent with ``sync_footprint_index`` results).
     Falls back to a live fp-lib-table scan when the index is empty.
+
+    *pcb_path* may be ``.kicad_pro`` or ``.kicad_pcb``; the project identity
+    is ``normalize_project_id(pcb_path)`` — the same canonical id
+    ``sync_footprint_index`` derives from the project file.
     """
     existing: set[str] = set()
     try:
-        mgr = get_footprint_index_manager(pcb_path)
+        mgr = get_footprint_index_manager(project_id=normalize_project_id(pcb_path))
         if mgr.get_stats().footprint_count > 0:
             existing = mgr.get_all_footprint_names()
         else:
@@ -765,7 +769,7 @@ def _index_library_entry(
     number of footprints stored, or -1 on failure.
     """
     try:
-        return get_footprint_index_manager(None).index_library(
+        return get_footprint_index_manager(project_id="").index_library(
             library,
             library_dir,
             raw_uri=raw_uri,
