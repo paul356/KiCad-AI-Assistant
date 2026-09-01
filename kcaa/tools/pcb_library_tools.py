@@ -14,7 +14,7 @@ from typing import Any
 from fastmcp import Context, FastMCP
 
 from kcaa.utils.config import config
-from kcaa.utils.footprint_index_manager import get_footprint_index_manager
+from kcaa.utils.footprint_index_manager import get_footprint_index_manager, normalize_project_id
 from kcaa.utils.fp_lib_table_utils import (
     get_user_fp_lib_table_path,
     register_library_in_table,
@@ -105,7 +105,7 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
     async def sync_footprint_index(
-        project_path: str | None = None,
+        project_path: str,
         force: bool = False,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
@@ -116,13 +116,17 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
         minutes because it parses all .kicad_mod files.  Subsequent calls are
         incremental (only changed libraries are re-read).
 
+        Indexed libraries are scoped to the project: global user/system
+        fp-lib-table libraries plus the project's own fp-lib-table.  Rows
+        belonging to other projects are never touched.
+
         After calling this tool, use ``get_footprint_sync_status`` to monitor
         progress and check when the sync completes.  Do NOT call
         ``sync_footprint_index`` again while a sync is already running.
 
         Args:
-            project_path: Optional path to a .kicad_pro file; its project-local
-                fp-lib-table is included in the sync.
+            project_path: Path to a .kicad_pro file (or .kicad_pcb); the
+                project's directory is used to scope the index.
             force: If True, reparse every library regardless of cached state.
                 Use only when the database is messed up.
             ctx: MCP context for progress reporting.
@@ -191,18 +195,19 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
     async def list_footprint_libraries(
-        project_path: str | None,
+        project_path: str,
         ctx: Context | None,
     ) -> dict[str, Any]:
-        """List all available KiCad footprint libraries.
+        """List all available KiCad footprint libraries scoped to a project.
 
         Returns libraries from the footprint index if it has been built;
         falls back to a live fp-lib-table scan otherwise.  Run
-        ``sync_footprint_index`` first to populate the index.
+        ``sync_footprint_index`` first to populate the index.  Only global
+        libraries plus the project's own fp-lib-table entries are listed.
 
         Args:
-            project_path: Optional path to a .kicad_pro file; if given the
-                project-local fp-lib-table is included.
+            project_path: Path to a .kicad_pro file (or .kicad_pcb); its
+                directory identifies the project scope.
             ctx: MCP context for progress reporting.
 
         Returns:
@@ -259,21 +264,22 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
     @mcp.tool()
     async def search_footprints(
         query: str,
-        project_path: str | None,
+        project_path: str,
         ctx: Context | None,
         max_results: int = 50,
     ) -> dict[str, Any]:
         """Search for footprints by name, description, or tags.
 
         Uses the footprint index (built by ``sync_footprint_index``) for fast
-        full-text search across all indexed libraries.  If the index is empty,
-        falls back to a slower live scan of .kicad_mod files.
+        full-text search across global plus the project's own libraries.
+        If the index is empty, falls back to a slower live scan of .kicad_mod
+        files.  Other projects' libraries are never searched.
 
         Args:
             query: Search string matched against footprint name, description,
                 and tags (case-insensitive).
-            project_path: Optional path to a .kicad_pro file for project-local
-                libraries.
+            project_path: Path to a .kicad_pro file (or .kicad_pcb); its
+                directory identifies the project scope.
             ctx: MCP context for progress reporting.
             max_results: Maximum number of results to return (default 50).
 
@@ -326,21 +332,24 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
     async def get_footprint_details(
         library_name: str,
         footprint_name: str,
-        project_path: str | None,
+        project_path: str,
         ctx: Context | None,
     ) -> dict[str, Any]:
         """Get detailed information about a specific footprint.
 
         Returns pad layout, courtyard bounding box, and metadata for a
         footprint identified by its library nickname and name.  Always reads
-        the .kicad_mod file directly for full detail.
+        the .kicad_mod file directly for full detail.  The lookup is scoped
+        to the project's global + project-local libraries; when a same-named
+        project library exists it takes precedence over the global one.
 
         Args:
             library_name: The library nickname (as shown in fp-lib-table),
                 e.g. ``"Resistor_SMD"``.
             footprint_name: The footprint name without extension, e.g.
                 ``"R_0402_1005Metric"``.
-            project_path: Optional path to a .kicad_pro for project-local libs.
+            project_path: Path to a .kicad_pro file (or .kicad_pcb); its
+                directory identifies the project scope.
             ctx: MCP context for progress reporting.
 
         Returns:
@@ -354,10 +363,18 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
 
         if db_stats.library_count > 0:
             lib_records = mgr.get_all_libraries()
+            project_id = normalize_project_id(project_path)
+            # Project-owned libraries take precedence over the global one
+            # with the same nickname.
             for rec in lib_records:
-                if rec.library_name == library_name:
+                if rec.library_name == library_name and rec.project == project_id:
                     lib_path = rec.dir_path
                     break
+            if lib_path is None:
+                for rec in lib_records:
+                    if rec.library_name == library_name:
+                        lib_path = rec.dir_path
+                        break
 
         if not lib_path:
             # Fallback: live fp-lib-table scan
@@ -444,17 +461,29 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
             nickname = sanitize_lib_nickname(name)
             if not nickname:
                 return {"error": f"Invalid library name: {name!r}"}
-            libs = build_effective_library_list(None)
-            by_nickname = {lib["nickname"] for lib in libs}
-            if nickname in by_nickname:
+            # Nicknames are globally unique: block any name that already
+            # exists in the index (any project) or the global fp-lib-table.
+            # library_name_exists is deliberately cross-project, so no
+            # project-scoped stats guard.
+            mgr = get_footprint_index_manager(None)
+            if mgr.library_name_exists(nickname) or nickname in {
+                lib["nickname"] for lib in build_effective_library_list(None)
+            }:
                 return {
                     "error": (
-                        f"Library '{nickname}' already exists in fp-lib-table; "
+                        f"Library '{nickname}' already exists; "
                         "use add_footprints_to_3rdparty_library to export into it."
                     )
                 }
             library_dir = os.path.join(_3rd_party_footprints_dir(), f"{nickname}.pretty")
-            os.makedirs(library_dir, exist_ok=True)
+            if os.path.exists(library_dir):
+                return {
+                    "error": (
+                        f"Directory already exists, refusing to recreate: {library_dir}. "
+                        "Use add_footprints_to_3rdparty_library to export into it."
+                    )
+                }
+            os.makedirs(library_dir, exist_ok=False)
             ver_tag = config.kicad_version.split(".")[0]
             uri = f"${{KICAD{ver_tag}_3RD_PARTY}}/footprints/{nickname}.pretty"
             table_path = get_user_fp_lib_table_path()
@@ -507,7 +536,10 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
         try:
             nodes, footprints, version = _collect_board_footprints(pcb_path)
             library_dir = _resolve_library_dir(library, pcb_path)
-            existing = _collect_existing_names(pcb_path)
+            # Never re-export: existing must cover every on-disk library, not
+            # just the indexed subset (a never-synced library would otherwise
+            # be re-exported/overwritten).
+            existing = _live_scan_existing_names(pcb_path)
             if ctx:
                 await ctx.info(
                     f"Exporting missing footprints to {library_dir} "
@@ -643,12 +675,30 @@ def _resolve_library_dir(library: str, pcb_path: str | None) -> str:
 
 
 def _collect_existing_names(pcb_path: str | None) -> set[str]:
-    """Return every footprint name already present in indexed libraries.
+    """Return every footprint name that already exists in libraries.
 
-    Reads the effective library list (project-local table plus global user
-    table, with ``${KIPRJMOD}`` / ``KICAD*`` URI expansion) and live-scans
-    each ``.pretty`` directory.  Purely in-memory — nothing is written to
-    the footprint database.
+    Prefers the footprint index database scoped to the project (global plus
+    project-local libraries; consistent with ``sync_footprint_index`` results).
+    Falls back to a live fp-lib-table scan when the index is empty.
+    """
+    existing: set[str] = set()
+    try:
+        mgr = get_footprint_index_manager(pcb_path)
+        if mgr.get_stats().footprint_count > 0:
+            existing = mgr.get_all_footprint_names()
+        else:
+            existing = _live_scan_existing_names(pcb_path)
+    except Exception as exc:
+        log.warning("Footprint index read failed (%s) — falling back to live scan", exc)
+        existing = _live_scan_existing_names(pcb_path)
+    return existing
+
+
+def _live_scan_existing_names(pcb_path: str | None) -> set[str]:
+    """Live-scan fallback: every footprint name across the effective library
+    list (project-local table plus global user table, ``${KIPRJMOD}`` /
+    ``KICAD*`` URI expanded).  Purely in-memory — nothing is written to the
+    footprint database.
     """
     names: set[str] = set()
     for lib in build_effective_library_list(pcb_path):

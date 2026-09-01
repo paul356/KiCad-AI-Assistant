@@ -155,6 +155,7 @@ def _parse_fp_lib_table_raw(table_path: str, env: dict[str, str]) -> list[dict[s
             elif key == "descr":
                 entry["description"] = val
         if entry["nickname"]:
+            entry["table_path"] = os.path.realpath(table_path)
             libraries.append(entry)
 
     return libraries

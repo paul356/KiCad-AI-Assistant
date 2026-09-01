@@ -343,13 +343,25 @@ class TestFindMissingFootprints:
         assert open(board, encoding="utf-8").read() == before
 
     def test_does_not_write_footprint_database(self, tools, tmp_path, project):
-        """The read path never touches the index DB (project-table libs stay
-        in memory only)."""
+        """The read path never writes to the index DB (it reads it)."""
         board = _make_board(tmp_path)
         result = _run(tools["find_missing_footprints"](pcb_path=board, ctx=None))
         assert "error" not in result, result
         assert project["index_mgr"].get_stats().footprint_count == 0
         assert project["index_mgr"].get_stats().library_count == 0
+
+    def test_uses_indexed_footprint_names_when_db_populated(self, tools, tmp_path, project):
+        """find_missing consumes the index DB: an indexed name is NOT missing,
+        even when the library directory is no longer live-scannable."""
+        board = _make_board(tmp_path)
+        project["index_mgr"].index_library("TestSys", project["system_lib"])
+        result = _run(tools["find_missing_footprints"](pcb_path=board, ctx=None))
+        assert "error" not in result, result
+        names = [fp["name"] for fp in result["missing"]]
+        assert "R_0402_1005Metric" not in names  # indexed → existing
+        assert "Sensor_Board_XYZ" in names
+        assert "Connector_Odd" in names
+        assert result["missing_count"] == 2
 
 
 class TestCreate3rdPartyLibrary:
@@ -377,6 +389,25 @@ class TestCreate3rdPartyLibrary:
         assert "TestSys" not in [
             lib.library_name for lib in project["index_mgr"].get_all_libraries()
         ]
+
+    def test_collision_with_indexed_other_project_library(self, tools, tmp_path, project):
+        """A nickname indexed under any project blocks creation."""
+        project["index_mgr"]._db.save_library(
+            "OtherProjLib", "u", "/x", "d", "c", [], project="/other/project"
+        )
+        result = _run(tools["create_3rdparty_footprint_library"](name="OtherProjLib", ctx=None))
+        assert "error" in result
+        assert "already exists" in result["error"]
+
+    def test_refuses_existing_directory(self, tools, tmp_path, project):
+        """A pre-existing <name>.pretty directory blocks creation."""
+        target = os.path.join(project["third_party"], "footprints", "Taken.pretty")
+        os.makedirs(target)
+        result = _run(tools["create_3rdparty_footprint_library"](name="Taken", ctx=None))
+        assert "error" in result
+        assert "Directory already exists" in result["error"]
+        assert "Taken" in result["error"]
+        assert not os.path.isfile(os.path.join(project["tmp_path"], "fp-lib-table.bak"))
 
     def test_creates_backup_of_table(self, tools, tmp_path, project):
         _run(tools["create_3rdparty_footprint_library"](name="MyVendor", ctx=None))

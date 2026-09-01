@@ -366,12 +366,129 @@ class TestFootprintDatabase:
         fp = db.get_footprint("Lib", "FP3D")
         assert fp.has_3d_model is True
 
-    def test_attr_round_trip(self, tmp_path):
+
+# Schema v2: project column (B scheme)
+# ---------------------------------------------------------------------------
+
+
+class TestSchemaV2ProjectColumn:
+    def test_v1_db_auto_migrates_on_open(self, tmp_path):
+        """A v1 database (no project column) gains it via ALTER, data kept."""
+        import sqlite3
+
+        db_path = tmp_path / "v1.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            "CREATE TABLE fp_libraries ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "library_name VARCHAR NOT NULL UNIQUE, "
+            "raw_uri VARCHAR NOT NULL DEFAULT '', "
+            "dir_path VARCHAR NOT NULL DEFAULT '', "
+            "description VARCHAR NOT NULL DEFAULT '', "
+            "checksum VARCHAR NOT NULL DEFAULT '', "
+            "footprint_count INTEGER NOT NULL DEFAULT 0, "
+            "last_indexed FLOAT NOT NULL DEFAULT 0.0)"
+        )
+        conn.execute(
+            "CREATE TABLE footprints ("
+            "library_name VARCHAR NOT NULL, "
+            "footprint_name VARCHAR NOT NULL, "
+            "library_id INTEGER NOT NULL, "
+            "description VARCHAR NOT NULL DEFAULT '', "
+            "tags VARCHAR NOT NULL DEFAULT '', "
+            "attr VARCHAR NOT NULL DEFAULT '', "
+            "pad_count INTEGER NOT NULL DEFAULT 0, "
+            "has_3d_model INTEGER NOT NULL DEFAULT 0, "
+            "PRIMARY KEY (library_name, footprint_name))"
+        )
+        conn.execute(
+            "INSERT INTO fp_libraries (library_name, raw_uri, dir_path) "
+            "VALUES ('OldLib', 'u', '/p')"
+        )
+        conn.commit()
+        conn.close()
+
+        # Opening through the ORM must add the column, keep the row, and
+        # default existing rows to the global scope (project='').
+        db = FootprintDatabase(str(db_path))
+        libs = db.get_all_libraries()
+        assert [lib.library_name for lib in libs] == ["OldLib"]
+        assert libs[0].project == ""
+
+        # v2 rows can be stored and project-scoped queries work.
+        db.save_library(
+            "ProjLib",
+            "u2",
+            "/p2",
+            "d2",
+            "c2",
+            [_make_record("ProjLib", "F1")],
+            project="/proj",
+        )
+        assert db.get_all_libraries(project="/proj")[0].library_name == "OldLib"
+        assert db.library_name_exists("ProjLib") is True
+
+    def test_project_scope_filters_queries(self, tmp_path):
         db = _make_db(tmp_path)
-        rec = _make_record("Lib", "FPth", attr="through_hole")
-        db.save_library("Lib", "u", "/p", "d", "c", [rec])
-        fp = db.get_footprint("Lib", "FPth")
-        assert fp.attr == "through_hole"
+        db.save_library("Global", "u", "/g", "d", "c", [_make_record("Global", "GF1")])
+        db.save_library("ProjA", "u", "/a", "d", "c", [_make_record("ProjA", "AF1")], project="/a")
+        db.save_library("ProjB", "u", "/b", "d", "c", [_make_record("ProjB", "BF1")], project="/b")
+
+        # No scope → everything.
+        assert {l.library_name for l in db.get_all_libraries(None)} == {
+            "Global",
+            "ProjA",
+            "ProjB",
+        }
+        # Project scope → global + that project only.
+        assert {l.library_name for l in db.get_all_libraries("/a")} == {"Global", "ProjA"}
+        assert {l.library_name for l in db.get_all_libraries("/b")} == {"Global", "ProjB"}
+        # Empty scope → global only.
+        assert [l.library_name for l in db.get_all_libraries("")] == ["Global"]
+
+        # Footnote queries follow the same scope.
+        assert {f.footprint_name for f in db.get_library_footprints("ProjA", "/a")} == {"AF1"}
+        assert db.get_library_footprints("ProjB", "/a") == []
+        assert db.get_footprint("ProjB", "BF1", "/a") is None
+        assert db.get_footprint("Global", "GF1", "/a") is not None
+
+    def test_project_scope_stats(self, tmp_path):
+        db = _make_db(tmp_path)
+        db.save_library("Global", "u", "/g", "d", "c", [_make_record("Global", "GF1")])
+        db.save_library("ProjA", "u", "/a", "d", "c", [_make_record("ProjA", "AF1")], project="/a")
+        stats_a = db.get_stats("/a")
+        assert stats_a.library_count == 2  # Global + ProjA
+        assert stats_a.footprint_count == 2
+        stats_g = db.get_stats("")
+        assert stats_g.library_count == 1  # global only
+        assert stats_g.footprint_count == 1
+
+    def test_project_scope_search_by_name(self, tmp_path):
+        db = _make_db(tmp_path)
+        db.save_library(
+            "ProjA", "u", "/a", "d", "c", [_make_record("ProjA", "Common_FP")], project="/a"
+        )
+        db.save_library(
+            "ProjB", "u", "/b", "d", "c", [_make_record("ProjB", "Common_FP")], project="/b"
+        )
+        names_a = {r.footprint_name for r in db.search_by_name("Common", project="/a")}
+        assert names_a == {"Common_FP"}
+        names_b = {r.footprint_name for r in db.search_by_name("Common", project="/b")}
+        assert names_b == {"Common_FP"}
+
+    def test_library_name_exists_ignores_project(self, tmp_path):
+        db = _make_db(tmp_path)
+        db.save_library("ProjLib", "u", "/p", "d", "c", [], project="/some/project")
+        assert db.library_name_exists("ProjLib") is True
+        assert db.library_name_exists("NeverSeen") is False
+
+    def test_get_all_footprint_names_scoped(self, tmp_path):
+        db = _make_db(tmp_path)
+        db.save_library("Global", "u", "/g", "d", "c", [_make_record("Global", "GF1")])
+        db.save_library("ProjA", "u", "/a", "d", "c", [_make_record("ProjA", "AF1")], project="/a")
+        assert db.get_all_footprint_names("/a") == {"GF1", "AF1"}
+        assert db.get_all_footprint_names("/b") == {"GF1"}
+        assert db.get_all_footprint_names("") == {"GF1"}
 
 
 # ---------------------------------------------------------------------------
@@ -611,10 +728,92 @@ class TestFootprintIndexManagerSync:
             "R_0603",
         ]
 
-    def test_index_library_missing_dir(self, tmp_path):
-        mgr = self._mgr(tmp_path)
-        assert mgr.index_library("Ghost", "/nonexistent/.pretty") == -1
-        assert mgr.get_stats().library_count == 0
+    def test_sync_tags_project_table_entries(self, tmp_path, monkeypatch):
+        """Entries whose table_path is the project fp-lib-table are stored
+        with the project id; others are stored as global (project="")."""
+        proj_dir = tmp_path / "proj"
+        proj_dir.mkdir()
+        proj_table = str(proj_dir / "fp-lib-table")
+        proj_lib = _make_pretty(proj_dir, "ProjLib", ["P_FP"])
+        _make_fp_lib_table(proj_table, [("ProjLib", proj_lib)])
+        global_table = str(tmp_path / "global-fp-lib-table")
+        global_lib = _make_pretty(tmp_path, "GlobalLib", ["G_FP"])
+        _make_fp_lib_table(global_table, [("GlobalLib", global_lib), ("GlobalLib", global_lib)])
+
+        def _effective(project_path=None):
+            return [
+                {
+                    "nickname": "ProjLib",
+                    "uri": proj_lib,
+                    "raw_uri": proj_lib,
+                    "description": "",
+                    "table_path": proj_table,
+                },
+                # A genuinely different table (global) — even inside the same
+                # synced list it stays global.
+                {
+                    "nickname": "GlobalLib",
+                    "uri": global_lib,
+                    "raw_uri": global_lib,
+                    "description": "",
+                    "table_path": global_table,
+                },
+            ]
+
+        monkeypatch.setattr(
+            "kcaa.utils.footprint_index_manager.build_effective_library_list",
+            _effective,
+        )
+        mgr = self._mgr(tmp_path, project_path=str(proj_dir / "proj.kicad_pro"))
+        stats = mgr.sync()
+        assert stats.added == 2
+
+        libs = mgr.get_all_libraries()
+        by_name = {lib.library_name: lib.project for lib in libs}
+        assert by_name["ProjLib"] == os.path.realpath(str(proj_dir))
+        assert by_name["GlobalLib"] == ""
+
+    def test_sync_does_not_delete_other_project_rows(self, tmp_path, monkeypatch):
+        """Syncing project B must never remove project A's indexed rows."""
+        # Real on-disk libraries so sync treats them as healthy.
+        proj_a_lib = _make_pretty(tmp_path, "ProjALib", ["A_FP"])
+        global_lib = _make_pretty(tmp_path, "GlobalLib", ["G_FP"])
+
+        # Pre-seed the DB directly to simulate a previously-synced project A
+        # plus a global library.
+        mgr = self._mgr(tmp_path, project_path=None)
+        mgr._db.save_library(
+            "ProjALib",
+            "u",
+            proj_a_lib,
+            "d",
+            "c",
+            [_make_record("ProjALib", "A_FP")],
+            project="/projA",
+        )
+        mgr._db.save_library(
+            "GlobalLib", "u", global_lib, "d", "c", [_make_record("GlobalLib", "G_FP")]
+        )
+
+        # Sync project B: effective list contains only B + global.
+        monkeypatch.setattr(
+            "kcaa.utils.footprint_index_manager.build_effective_library_list",
+            lambda project_path=None: [
+                {
+                    "nickname": "GlobalLib",
+                    "uri": global_lib,
+                    "raw_uri": global_lib,
+                    "description": "",
+                }
+            ],
+        )
+        mgr_b = self._mgr(tmp_path, project_path="/projB/proj.kicad_pro")
+        stats = mgr_b.sync()
+        # Global kept (still in table); ProjALib untouched by B's sync.
+        assert stats.removed == 0
+        names = {lib.library_name for lib in mgr_b._db.get_all_libraries(None)}
+        assert "ProjALib" in names
+        assert "GlobalLib" in names
 
     def test_index_library_update_after_file_add(self, tmp_path):
         lib_dir = _make_pretty(tmp_path, "Res", ["R_0402"])
@@ -742,7 +941,7 @@ class TestFpSyncTools:
             _tool_module.register_pcb_library_tools(mcp)
             tool = await mcp.get_tool("sync_footprint_index")
             assert tool is not None
-            result = await tool.fn()
+            result = await tool.fn(project_path="/tmp/proj.kicad_pro")
             return result
 
         result = asyncio.run(_call())

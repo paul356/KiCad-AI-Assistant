@@ -53,6 +53,19 @@ from kcaa.utils.config import config
 _DEFAULT_DB_PATH = Path(config.get_kcaa_data_dir()) / "kicad_footprints.db"
 
 
+def normalize_project_id(input: str | None) -> str:
+    """Canonical project identifier for a ``.kicad_pro``/``.kicad_pcb`` path.
+
+    Always the realpath of the parent directory, regardless of which file
+    kind was passed — sync (``.kicad_pro``) and find/add (``.kicad_pcb``)
+    therefore produce identical strings and project-scoped lookups match.
+    Empty string means "no project" (globals only).
+    """
+    if not input:
+        return ""
+    return os.path.realpath(os.path.dirname(input))
+
+
 @dataclass
 class SyncStats:
     added: int
@@ -85,6 +98,7 @@ class FootprintIndexManager:
         resolved = Path(db_path) if db_path else _DEFAULT_DB_PATH
         self._db = FootprintDatabase(str(resolved))
         self._project_path = project_path
+        self._project_id = normalize_project_id(project_path)
 
     # ------------------------------------------------------------------
     # Sync
@@ -122,15 +136,21 @@ class FootprintIndexManager:
         )
 
         entries = build_effective_library_list(self._project_path)
-        db_known = self._db.get_library_states()  # {library_name: (id, checksum, dir_path)}
+        # Only global + current-project libraries participate: other projects'
+        # rows must never be touched by this sync.
+        db_known = self._db.get_library_states(self._project_id)
         current_names: set[str] = set()
         total = len(entries)
+        project_table = os.path.join(self._project_id, "fp-lib-table") if self._project_id else None
 
         for i, entry in enumerate(entries):
             lib_name = entry["nickname"]
             raw_uri = entry.get("raw_uri", entry["uri"])
             dir_path = entry["uri"]  # resolved path to .pretty directory
             description = entry.get("description", "")
+            # Libraries listed in the project's own fp-lib-table belong to the
+            # project; everything else (global user/system tables) is global.
+            entry_project = self._project_id if entry.get("table_path") == project_table else ""
 
             if progress_callback is not None:
                 try:
@@ -169,7 +189,9 @@ class FootprintIndexManager:
                     continue
 
                 log.info(f"[{i + 1}/{total}] Updating: {lib_name}")
-                n = self._index_library(lib_name, raw_uri, dir_path, description, new_checksum)
+                n = self._index_library(
+                    lib_name, raw_uri, dir_path, description, new_checksum, entry_project
+                )
                 if n >= 0:
                     stats.updated += 1
                     stats.total_footprints += n
@@ -177,7 +199,9 @@ class FootprintIndexManager:
                     stats.failed += 1
             else:
                 log.info(f"[{i + 1}/{total}] Adding: {lib_name}")
-                n = self._index_library(lib_name, raw_uri, dir_path, description, new_checksum)
+                n = self._index_library(
+                    lib_name, raw_uri, dir_path, description, new_checksum, entry_project
+                )
                 if n >= 0:
                     stats.added += 1
                     stats.total_footprints += n
@@ -213,15 +237,17 @@ class FootprintIndexManager:
         dir_path: str,
         description: str = "",
         raw_uri: str = "",
+        project: str = "",
     ) -> int:
         """Index exactly one ``.pretty`` directory into the database.
 
         Narrow update for the PCB → library export tools: indexes a single
-        library directory without traversing the effective library list, so
-        project-local fp-lib-table libraries are never pulled into the
-        database by these tools.  Change detection (checksum) is shared with
-        ``sync``.
+        library directory without traversing the effective library list.
+        Change detection (checksum) is shared with ``sync``.
 
+        :param project: Project identifier for the row ("" = global 3rdparty
+            library).  Project-local fp-lib-table libraries are never pulled
+            into the database by this path.
         :returns: Number of footprints stored, or -1 on failure.
         """
         if not os.path.isdir(dir_path):
@@ -238,6 +264,7 @@ class FootprintIndexManager:
             dir_path,
             description,
             new_checksum,
+            project,
         )
 
     # ------------------------------------------------------------------
@@ -245,30 +272,51 @@ class FootprintIndexManager:
     # ------------------------------------------------------------------
 
     def search_footprints(self, query: str, limit: int = 50) -> list[FootprintRecord]:
-        """Full-text search across footprint names, descriptions, and tags."""
-        return self._db.search(query, limit=limit)
+        """Full-text search across footprint names, descriptions, and tags.
+
+        Scoped to the manager's project (global + project libraries).
+        """
+        return self._db.search(query, limit=limit, project=self._project_id)
 
     def search_by_name(
         self, name: str, exact: bool = False, limit: int = 50
     ) -> list[FootprintRecord]:
-        """Search footprints by name substring or exact match."""
-        return self._db.search_by_name(name, exact=exact, limit=limit)
+        """Search footprints by name substring or exact match, scoped to the
+        manager's project (global + project libraries)."""
+        return self._db.search_by_name(name, exact=exact, limit=limit, project=self._project_id)
 
     def get_footprint(self, library_name: str, footprint_name: str) -> FootprintRecord | None:
-        """Look up a single footprint by library nickname and name."""
-        return self._db.get_footprint(library_name, footprint_name)
+        """Look up a single footprint by library nickname and name, scoped to
+        the manager's project (global + project libraries)."""
+        return self._db.get_footprint(library_name, footprint_name, project=self._project_id)
 
     def get_library_footprints(self, library_name: str) -> list[FootprintRecord]:
-        """Return all indexed footprints for a library, ordered by name."""
-        return self._db.get_library_footprints(library_name)
+        """Return all indexed footprints for a library, ordered by name,
+        scoped to the manager's project (global + project libraries)."""
+        return self._db.get_library_footprints(library_name, project=self._project_id)
 
     def get_all_libraries(self) -> list[FpLibraryRecord]:
-        """Return all indexed library records, ordered by name."""
-        return self._db.get_all_libraries()
+        """Return all indexed library records, ordered by name, scoped to the
+        manager's project (global + project libraries)."""
+        return self._db.get_all_libraries(project=self._project_id)
+
+    def library_name_exists(self, library_name: str) -> bool:
+        """True if any indexed library (any project) has this nickname.
+
+        Nicknames are globally unique — used to block same-name library
+        creation regardless of project.
+        """
+        return self._db.library_name_exists(library_name)
+
+    def get_all_footprint_names(self) -> set[str]:
+        """Return every footprint name indexed in the manager's project scope
+        (global + project libraries)."""
+        return self._db.get_all_footprint_names(project=self._project_id)
 
     def get_stats(self) -> DbStats:
-        """Return summary statistics about the footprint database."""
-        return self._db.get_stats()
+        """Return summary statistics about the footprint database, scoped to
+        the manager's project (global + project libraries)."""
+        return self._db.get_stats(project=self._project_id)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -306,6 +354,7 @@ class FootprintIndexManager:
         dir_path: str,
         description: str,
         checksum: str,
+        project: str = "",
     ) -> int:
         """Parse all .kicad_mod files in dir_path and persist to the database.
         Returns the number of footprints stored, or -1 on error.
@@ -322,6 +371,7 @@ class FootprintIndexManager:
                 description=description,
                 checksum="",
                 footprints=[],
+                project=project,
             )
             return -1
 
@@ -332,6 +382,7 @@ class FootprintIndexManager:
             description=description,
             checksum=checksum,
             footprints=footprints,
+            project=project,
         )
         log.debug(f"  Indexed {n} footprints from {os.path.basename(dir_path)}")
         return n
@@ -387,4 +438,5 @@ def get_footprint_index_manager(
                 _singleton = FootprintIndexManager(project_path=project_path)
     elif project_path is not None:
         _singleton._project_path = project_path
+        _singleton._project_id = normalize_project_id(project_path)
     return _singleton
