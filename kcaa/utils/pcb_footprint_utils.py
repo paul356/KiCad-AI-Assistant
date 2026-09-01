@@ -14,6 +14,7 @@ from collections.abc import Iterator
 import copy
 import logging
 import os
+import re
 from typing import Any
 
 import sexpdata
@@ -291,6 +292,24 @@ def split_footprint_header(node: list[Any]) -> tuple[str | None, str]:
     return None, header
 
 
+_FOOTPRINT_NAME_RE = re.compile(r"^[A-Za-z0-9_.+-]+$")
+
+
+def is_safe_footprint_name(name: str) -> bool:
+    """True when *name* is safe to use as a ``<name>.kicad_mod`` filename.
+
+    Rejects empty names plus anything containing path separators, ``..``, or
+    characters outside ``[A-Za-z0-9_.+-]`` — the same set KiCad accepts in
+    footprint names.  Boards from collaborators can be crafted; never build a
+    target path from an unvalidated header string.
+    """
+    if not name:
+        return False
+    if name in ("..", "."):
+        return False
+    return _FOOTPRINT_NAME_RE.match(name) is not None
+
+
 def _child_at_rotation(child: list[Any]) -> float | None:
     """Return the explicit rotation of a child's ``at`` node, or None."""
     for sub in child:
@@ -420,7 +439,11 @@ def write_footprint_mod(library_dir: str, name: str, node: list[Any]) -> str:
     :returns: Path written.
     :raises FileExistsError: When the file already exists (never overwrite
         an existing footprint, per design decision).
+    :raises ValueError: When *name* is unsafe for a filename (path traversal
+        guard — see :func:`is_safe_footprint_name`).
     """
+    if not is_safe_footprint_name(name):
+        raise ValueError(f"Unsafe footprint name: {name!r}")
     os.makedirs(library_dir, exist_ok=True)
     path = os.path.join(library_dir, f"{name}.kicad_mod")
     if os.path.exists(path):

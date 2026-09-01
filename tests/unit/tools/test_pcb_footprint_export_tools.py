@@ -512,16 +512,83 @@ class TestExportFileContent:
             )
         )
         assert "error" not in result, result
-        mod_path = os.path.join(
-            project["third_party"], "footprints", "MyVendor.pretty", "Sensor_Board_XYZ.kicad_mod"
+
+
+class TestUnsafeFootprintNames:
+    """BLOCKER 2: crafted PCB headers must never reach the filesystem."""
+
+    def _board_with_name(self, tmp_path, header_name: str) -> str:
+        board = _make_board(tmp_path)
+        text = open(board, encoding="utf-8").read()
+        text = text.replace(
+            '(footprint "CustomLib:Sensor_Board_XYZ"', f'(footprint "{header_name}"'
         )
-        text = open(mod_path, encoding="utf-8").read()
-        assert '(footprint "Sensor_Board_XYZ"' in text
-        assert "(version 20260206)" in text
-        assert "\t(at " not in text  # no placement
-        assert "uuid" not in text
-        assert "(net " not in text  # no pad nets
-        assert '"Reference"' not in text
-        # rotation: pad 90-45=45, text 90+45=135
-        assert "(at -0.5 0.0 45.0)" in text
-        assert "(at 0 2.0 135.0)" in text
+        path = tmp_path / "evil.kicad_pcb"
+        path.write_text(text, encoding="utf-8")
+        return str(path)
+
+    def test_traversal_name_is_failed_not_written(self, tools, tmp_path, project):
+        _run(tools["create_3rdparty_footprint_library"](name="MyVendor", ctx=None))
+        board = self._board_with_name(tmp_path, "../../escape")
+        result = _run(
+            tools["add_footprints_to_3rdparty_library"](
+                pcb_path=board, library="MyVendor", ctx=None
+            )
+        )
+        assert "error" not in result, result
+        # R_0402 lives in TestSys (skipped); Connector_Odd exports fine;
+        # the crafted name is failed, not written.
+        assert result["exported_count"] == 1
+        names = {f["name"] for f in result["failed"]}
+        assert "../../escape" in names
+        # Nothing was written outside the library directory.
+        lib_dir = os.path.join(project["third_party"], "footprints", "MyVendor.pretty")
+        assert os.listdir(lib_dir) == ["Connector_Odd.kicad_mod"]
+        assert not os.path.isfile(os.path.join(tmp_path, "escape.kicad_mod"))
+        assert "escape.kicad_mod" not in os.listdir(lib_dir)
+
+    def test_empty_name_is_failed_not_written(self, tools, tmp_path, project):
+        _run(tools["create_3rdparty_footprint_library"](name="MyVendor", ctx=None))
+        board = self._board_with_name(tmp_path, "CustomLib:")
+        result = _run(
+            tools["add_footprints_to_3rdparty_library"](
+                pcb_path=board, library="MyVendor", ctx=None
+            )
+        )
+        assert "error" not in result, result
+        assert "" in {f["name"] for f in result["failed"]}
+        lib_dir = os.path.join(project["third_party"], "footprints", "MyVendor.pretty")
+        assert os.listdir(lib_dir) == ["Connector_Odd.kicad_mod"]  # no stray ".kicad_mod"
+
+    def test_write_footprint_mod_rejects_unsafe_name(self, tmp_path):
+        from kcaa.utils.pcb_footprint_utils import is_safe_footprint_name, write_footprint_mod
+
+        lib_dir = tmp_path / "Lib.pretty"
+        lib_dir.mkdir()
+        with pytest.raises(ValueError):
+            write_footprint_mod(str(lib_dir), "../../escape", ["footprint"])
+        with pytest.raises(ValueError):
+            write_footprint_mod(str(lib_dir), "", ["footprint"])
+        assert os.listdir(lib_dir) == []
+        # Sanity: an ordinary name still works.
+        assert is_safe_footprint_name("R_0402_1005Metric")
+        assert not is_safe_footprint_name("../up")
+        assert not is_safe_footprint_name("a/b")
+        assert not is_safe_footprint_name("")
+
+
+class TestCreateRollback:
+    """MINOR 2: a failed registration must not leave an orphaned .pretty dir."""
+
+    def test_registration_failure_removes_created_dir(self, tools, tmp_path, project, monkeypatch):
+        _run = asyncio.run
+        from kcaa.tools import pcb_library_tools
+
+        def _boom(*args, **kwargs):
+            raise ValueError("fp-lib-table is a single line")
+
+        monkeypatch.setattr(pcb_library_tools, "register_library_in_table", _boom)
+        result = _run(tools["create_3rdparty_footprint_library"](name="MyVendor", ctx=None))
+        assert "error" in result
+        lib_dir = os.path.join(project["third_party"], "footprints", "MyVendor.pretty")
+        assert not os.path.exists(lib_dir)

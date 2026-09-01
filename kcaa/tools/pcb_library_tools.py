@@ -23,6 +23,7 @@ from kcaa.utils.fp_lib_table_utils import (
 from kcaa.utils.pcb_footprint_utils import (
     get_fp_property,
     get_pcb_version,
+    is_safe_footprint_name,
     iter_footprint_nodes,
     normalize_footprint_for_library,
     split_footprint_header,
@@ -503,6 +504,14 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
             }
         except Exception as exc:
             log.error("create_3rdparty_footprint_library failed: %s", exc, exc_info=True)
+            # Roll back the empty directory we just created, otherwise a
+            # retry is refused ("Directory already exists") while the library
+            # is also absent from fp-lib-table — an unrecoverable dead end.
+            if "library_dir" in locals() and os.path.isdir(library_dir):
+                try:
+                    os.rmdir(library_dir)
+                except OSError:
+                    pass  # non-empty (indexed some footprints?) — leave for the user
             return {"error": str(exc)}
 
     @mcp.tool()
@@ -558,6 +567,17 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
                 _lib, name = split_footprint_header(node)
                 if name in seen_in_run:
                     skipped.append({"name": name, "reason": "duplicate in run"})
+                    continue
+                # Path-traversal guard: the name comes from the board file, and
+                # the target path is built from it.  Report rather than touch
+                # the filesystem with an unsafe name.
+                if not is_safe_footprint_name(name):
+                    failed.append(
+                        {
+                            "name": name,
+                            "reason": f"unsafe footprint name {name!r} (refusing to write)",
+                        }
+                    )
                     continue
                 # Refuse to overwrite: an existing target file is a failure,
                 # even when the name is already indexed (e.g. a previous run

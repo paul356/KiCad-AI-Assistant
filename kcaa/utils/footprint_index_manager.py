@@ -148,13 +148,18 @@ class FootprintIndexManager:
             elapsed_seconds=0.0,
         )
 
-        entries = build_effective_library_list(self._project_path)
+        # Capture the scope once into locals: sync runs in a background thread
+        # while other tool calls can re-scope the shared singleton manager, and
+        # this loop must not observe a mid-flight scope flip.
+        project_id = self._project_id
+        project_path = self._project_path
+        entries = build_effective_library_list(project_path)
         # Only global + current-project libraries participate: other projects'
         # rows must never be touched by this sync.
-        db_known = self._db.get_library_states(self._project_id)
+        db_known = self._db.get_library_states(project_id)
         current_names: set[str] = set()
         total = len(entries)
-        project_table = os.path.join(self._project_id, "fp-lib-table") if self._project_id else None
+        project_table = os.path.join(project_id, "fp-lib-table") if project_id else None
 
         for i, entry in enumerate(entries):
             lib_name = entry["nickname"]
@@ -163,7 +168,7 @@ class FootprintIndexManager:
             description = entry.get("description", "")
             # Libraries listed in the project's own fp-lib-table belong to the
             # project; everything else (global user/system tables) is global.
-            entry_project = self._project_id if entry.get("table_path") == project_table else ""
+            entry_project = project_id if entry.get("table_path") == project_table else ""
 
             if progress_callback is not None:
                 try:
@@ -454,10 +459,16 @@ def get_footprint_index_manager(
         with _singleton_lock:
             if _singleton is None:
                 _singleton = FootprintIndexManager(project_path=project_path, project_id=project_id)
-    elif project_path is not None:
-        _singleton._project_path = project_path
-        _singleton._project_id = normalize_project_id(project_path)
-    elif project_id is not None:
-        _singleton._project_path = None
-        _singleton._project_id = project_id
+    else:
+        # Re-scoping mutates the shared singleton's project attributes; the
+        # background sync thread reads them at launch and works for minutes.
+        # Take the lock so a re-scope is never observed mid-flight and the
+        # two attribute writes stay atomic as a pair.
+        with _singleton_lock:
+            if project_path is not None:
+                _singleton._project_path = project_path
+                _singleton._project_id = normalize_project_id(project_path)
+            elif project_id is not None:
+                _singleton._project_path = None
+                _singleton._project_id = project_id
     return _singleton

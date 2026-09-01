@@ -817,14 +817,97 @@ class TestFootprintIndexManagerSync:
         assert "ProjALib" in names
         assert "GlobalLib" in names
 
-    def test_index_library_update_after_file_add(self, tmp_path):
-        lib_dir = _make_pretty(tmp_path, "Res", ["R_0402"])
+
+class TestSyncScopeCapture:
+    """BLOCKER 1: sync must work from a captured scope, not live re-reads.
+
+    sync runs in a background thread while other tool calls re-scope the
+    shared singleton manager.  Once the loop starts, a scope flip must not
+    change which rows the remaining iterations read or write.
+    """
+
+    def _mgr(self, tmp_path) -> FootprintIndexManager:
+        return FootprintIndexManager(db_path=str(tmp_path / "cap.db"))
+
+    def test_sync_keeps_captured_scope_when_singleton_rescoped(self, tmp_path, monkeypatch):
+        """A concurrent re-scope mid-sync must not change what sync writes.
+
+        sync captures the project scope into locals at entry; a tool call
+        re-scoping the shared singleton during the loop (here: from the
+        progress callback, which runs mid-iteration) must not make the loop
+        store rows under the new id.
+        """
+        lib_dir = _make_pretty(tmp_path, "ProjLib", ["P_FP"])
+        _make_fp_lib_table(str(tmp_path / "fp-lib-table"), [("ProjLib", lib_dir)])
+
         mgr = self._mgr(tmp_path)
-        assert mgr.index_library("Res", lib_dir) == 1
-        with open(os.path.join(lib_dir, "R_0805.kicad_mod"), "w") as f:
-            f.write('(footprint "R_0805" (layer "F.Cu") (descr "new fp"))')
-        assert mgr.index_library("Res", lib_dir) == 2
-        assert mgr.get_stats().footprint_count == 2
+        mgr._project_path = "/projA/proj.kicad_pro"
+        mgr._project_id = "/projA"
+
+        def _effective(project_path=None):
+            return [
+                {
+                    "nickname": "ProjLib",
+                    "uri": lib_dir,
+                    "raw_uri": "${KIPRJMOD}/ProjLib.pretty",
+                    "description": "",
+                    # Belongs to the captured project's own table: a sync
+                    # scoped to /projA must store it under project /projA.
+                    "table_path": "/projA/fp-lib-table",
+                }
+            ]
+
+        def _flip_scope(current, total, library_name):
+            # Simulate a concurrent tool call re-scoping the shared singleton
+            # mid-sync: the loop has captured /projA and must keep it.
+            mgr._project_id = "/projB"
+
+        monkeypatch.setattr(
+            "kcaa.utils.footprint_index_manager.build_effective_library_list", _effective
+        )
+
+        stats = mgr.sync(progress_callback=_flip_scope)
+        # The library was stored under the captured /projA — the flip during
+        # the loop changed nothing.
+        assert stats.added == 1
+        rows = mgr._db.get_all_libraries(None)
+        assert [r.library_name for r in rows] == ["ProjLib"]
+        assert rows[0].project == "/projA"
+
+    def test_factory_rescope_is_locked(self, tmp_path, monkeypatch):
+        """The factory re-scope path runs under the singleton lock.
+
+        A re-scoping call on another thread must block until the lock is
+        released, so a background sync never observes a torn scope.
+        """
+        import threading
+
+        import kcaa.utils.footprint_index_manager as fim
+
+        monkeypatch.setattr(fim, "_singleton", None)
+        mgr = fim.get_footprint_index_manager(project_id="/p1")
+
+        results: list[FootprintIndexManager] = []
+        errors: list[BaseException] = []
+
+        def _rescope():
+            try:
+                results.append(fim.get_footprint_index_manager(project_id="/p2"))
+            except BaseException as exc:  # pragma: no cover - failure path
+                errors.append(exc)
+
+        with fim._singleton_lock:
+            t = threading.Thread(target=_rescope)
+            t.start()
+            t.join(timeout=0.5)
+            # Still blocked: the caller holds the lock.
+            assert t.is_alive()
+            assert results == []
+        # Lock released: the re-scope completes and takes effect.
+        t.join(timeout=2.0)
+        assert errors == []
+        assert results == [mgr]
+        assert mgr._project_id == "/p2"
 
 
 # ---------------------------------------------------------------------------
