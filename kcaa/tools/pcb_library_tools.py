@@ -514,11 +514,14 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
         """Export board footprints missing from libraries into a 3rdparty library.
 
         Writes each board-embedded footprint that exists in no indexed library
-        as a ``.kicad_mod`` file into the target library directory
-        (footprints already present there are skipped, never overwritten),
-        then updates the footprint database for exactly that library.
-        Project-local fp-lib-table libraries are never indexed by this tool.
-        The board file is never modified.
+        as a ``.kicad_mod`` file into the target library directory, then
+        updates the footprint database for exactly that library.  Project-local
+        fp-lib-table libraries are never indexed by this tool.  The board file
+        is never modified.
+
+        A footprint is reported as ``failed`` when its target file already
+        exists in the library directory — it is never overwritten.  A
+        footprint already present in another indexed library is ``skipped``.
 
         Args:
             pcb_path: Absolute path to the ``.kicad_pcb`` file.  Its
@@ -530,8 +533,10 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
 
         Returns:
             dict with ``library``, ``library_path``, ``exported`` (list of
-            paths), ``exported_count``, ``skipped`` (list of {name, reason}),
-            ``skipped_count``, ``indexed``; plus ``error`` on failure.
+            paths), ``exported_count``, ``failed`` (list of {name, reason} —
+            target file already exists, not overwritten), ``failed_count``,
+            ``skipped`` (list of {name, reason}), ``skipped_count``,
+            ``indexed``; plus ``error`` on failure.
         """
         try:
             nodes, footprints, version = _collect_board_footprints(pcb_path)
@@ -546,13 +551,30 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
                 )
 
             exported: list[str] = []
+            failed: list[dict[str, str]] = []
             skipped: list[dict[str, str]] = []
             seen_in_run: set[str] = set()
             for node in nodes:
-                lib, name = split_footprint_header(node)
-                if name in existing or name in seen_in_run:
-                    reason = "already in library" if name in existing else "duplicate in run"
-                    skipped.append({"name": name, "reason": reason})
+                _lib, name = split_footprint_header(node)
+                if name in seen_in_run:
+                    skipped.append({"name": name, "reason": "duplicate in run"})
+                    continue
+                # Refuse to overwrite: an existing target file is a failure,
+                # even when the name is already indexed (e.g. a previous run
+                # exported it into this same library).
+                target_path = os.path.join(library_dir, f"{name}.kicad_mod")
+                if os.path.exists(target_path):
+                    failed.append(
+                        {
+                            "name": name,
+                            "reason": (
+                                f"target file already exists: {target_path} (refusing to overwrite)"
+                            ),
+                        }
+                    )
+                    continue
+                if name in existing:
+                    skipped.append({"name": name, "reason": "already in library"})
                     continue
                 try:
                     path = write_footprint_mod(
@@ -561,7 +583,7 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
                         normalize_footprint_for_library(node, version, library),
                     )
                 except FileExistsError:
-                    skipped.append({"name": name, "reason": "already in library"})
+                    failed.append({"name": name, "reason": "target file already exists"})
                     continue
                 exported.append(path)
                 seen_in_run.add(name)
@@ -572,6 +594,8 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
                 "library_path": library_dir,
                 "exported": exported,
                 "exported_count": len(exported),
+                "failed": failed,
+                "failed_count": len(failed),
                 "skipped": skipped,
                 "skipped_count": len(skipped),
                 "indexed": indexed,

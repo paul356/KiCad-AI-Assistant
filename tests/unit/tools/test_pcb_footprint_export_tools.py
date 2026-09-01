@@ -21,6 +21,7 @@ from kcaa.utils.pcb_footprint_utils import (
 # Minimal board with three footprints:
 #   - CustomLib:Sensor_Board_XYZ  -> missing everywhere (candidate, 45° rotation)
 #   - Resistor_SMD:R_0402_1005Metric -> exists in the TestSys library, skipped
+#     when exporting elsewhere; failed when the target directory has it
 #   - CustomLib:Connector_Odd    -> missing everywhere (candidate)
 _BOARD = """\
 (kicad_pcb
@@ -465,8 +466,9 @@ class TestAddFootprints:
             )
         )
         assert second["exported_count"] == 0
-        assert second["skipped_count"] == 3  # R_0402 (in TestSys) + 2 already exported
-        assert all(s["reason"] == "already in library" for s in second["skipped"])
+        assert second["failed_count"] == 2  # Sensor_Board_XYZ, Connector_Odd
+        assert second["skipped_count"] == 1  # R_0402 lives in TestSys
+        assert all(s["reason"].startswith("target file already exists") for s in second["failed"])
 
     def test_unknown_library_errors(self, tools, tmp_path, project):
         board = _make_board(tmp_path)
@@ -486,6 +488,14 @@ class TestAddFootprints:
         assert "error" not in result, result
         assert result["library_path"] == project["system_lib"]
         assert os.path.isfile(os.path.join(project["system_lib"], "Sensor_Board_XYZ.kicad_mod"))
+        # R_0402 already exists in the target directory: reported as failed,
+        # never overwritten.
+        assert [f["name"] for f in result["failed"]] == ["R_0402_1005Metric"]
+        assert result["failed_count"] == 1
+        assert result["skipped_count"] == 0
+        r_0402_path = os.path.join(project["system_lib"], "R_0402_1005Metric.kicad_mod")
+        mod = open(r_0402_path, encoding="utf-8").read()
+        assert "(version" not in mod  # still the bare fixture, not an exported copy
         # indexing re-scans the whole target: R_0402 (fixture) + 2 exported
         assert result["indexed"] == 3
         libs = project["index_mgr"].get_all_libraries()
