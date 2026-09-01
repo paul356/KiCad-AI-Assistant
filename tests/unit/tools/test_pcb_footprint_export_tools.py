@@ -18,6 +18,10 @@ from kcaa.utils.pcb_footprint_utils import (
     split_footprint_header,
 )
 
+# Every footprint placed on the test board; used as the explicit
+# ``footprints`` argument for add_footprints_to_library.
+_BOARD_FOOTPRINTS = ["Sensor_Board_XYZ", "R_0402_1005Metric", "Connector_Odd"]
+
 # Minimal board with three footprints:
 #   - CustomLib:Sensor_Board_XYZ  -> missing everywhere (candidate, 45° rotation)
 #   - Resistor_SMD:R_0402_1005Metric -> exists in the TestSys library, skipped
@@ -183,7 +187,7 @@ def project(tmp_path, monkeypatch):
     # swap the factory for a temp-DB manager (never the real user DB).
     monkeypatch.setattr(
         "kcaa.tools.pcb_library_tools.get_footprint_index_manager",
-        lambda project_path=None, project_id=None: index_mgr,
+        lambda project_path=None: index_mgr,
     )
     return {
         "tmp_path": str(tmp_path),
@@ -367,7 +371,7 @@ class TestFindMissingFootprints:
 
 class TestCreate3rdPartyLibrary:
     def test_creates_and_registers(self, tools, tmp_path, project):
-        result = _run(tools["create_3rdparty_footprint_library"](name="MyVendor", ctx=None))
+        result = _run(tools["create_footprint_library"](name="MyVendor", ctx=None))
         assert "error" not in result, result
         assert result["library"] == "MyVendor"
         lib_dir = os.path.join(project["third_party"], "footprints", "MyVendor.pretty")
@@ -384,7 +388,7 @@ class TestCreate3rdPartyLibrary:
         assert [lib.library_name for lib in libs] == ["MyVendor"]
 
     def test_collision_errors(self, tools, tmp_path, project):
-        result = _run(tools["create_3rdparty_footprint_library"](name="TestSys", ctx=None))
+        result = _run(tools["create_footprint_library"](name="TestSys", ctx=None))
         assert "error" in result
         assert "already exists" in result["error"]
         assert "TestSys" not in [
@@ -396,7 +400,7 @@ class TestCreate3rdPartyLibrary:
         project["index_mgr"]._db.save_library(
             "OtherProjLib", "u", "/x", "d", "c", [], project="/other/project"
         )
-        result = _run(tools["create_3rdparty_footprint_library"](name="OtherProjLib", ctx=None))
+        result = _run(tools["create_footprint_library"](name="OtherProjLib", ctx=None))
         assert "error" in result
         assert "already exists" in result["error"]
 
@@ -404,26 +408,75 @@ class TestCreate3rdPartyLibrary:
         """A pre-existing <name>.pretty directory blocks creation."""
         target = os.path.join(project["third_party"], "footprints", "Taken.pretty")
         os.makedirs(target)
-        result = _run(tools["create_3rdparty_footprint_library"](name="Taken", ctx=None))
+        result = _run(tools["create_footprint_library"](name="Taken", ctx=None))
         assert "error" in result
         assert "Directory already exists" in result["error"]
         assert "Taken" in result["error"]
         assert not os.path.isfile(os.path.join(project["tmp_path"], "fp-lib-table.bak"))
 
-    def test_creates_backup_of_table(self, tools, tmp_path, project):
-        _run(tools["create_3rdparty_footprint_library"](name="MyVendor", ctx=None))
-        assert os.path.isfile(os.path.join(project["tmp_path"], "fp-lib-table.bak"))
+
+class TestCreateProjectLibrary:
+    """create_footprint_library's project_dir branch (${KIPRJMOD} scope)."""
+
+    def test_creates_project_local_library(self, tools, tmp_path, project):
+        proj_dir = tmp_path / "subproj"
+        proj_dir.mkdir()
+        result = _run(
+            tools["create_footprint_library"](name="ProjLib", project_dir=str(proj_dir), ctx=None)
+        )
+        assert "error" not in result, result
+        lib_dir = proj_dir / "ProjLib.pretty"
+        assert result["path"] == str(lib_dir)
+        assert os.path.isdir(lib_dir)
+        # Registered in the project's own fp-lib-table, created on demand.
+        table = proj_dir / "fp-lib-table"
+        assert result["table_path"] == str(table)
+        assert os.path.isfile(table)
+        table_text = table.read_text(encoding="utf-8")
+        assert 'name "ProjLib"' in table_text
+        assert "${KIPRJMOD}/ProjLib.pretty" in table_text
+        # Indexed under the project id (realpath of the project dir), so the
+        # library shows up in the project scope but not the global scope.
+        libs = project["index_mgr"]._db.get_all_libraries(project=None)
+        assert [lib.library_name for lib in libs] == ["ProjLib"]
+        assert libs[0].project == os.path.realpath(str(proj_dir))
+        global_libs = project["index_mgr"].get_all_libraries()
+        assert [lib.library_name for lib in global_libs] == []
+
+    def test_missing_project_dir_errors(self, tools, tmp_path, project):
+        result = _run(
+            tools["create_footprint_library"](
+                name="ProjLib", project_dir=str(tmp_path / "nope"), ctx=None
+            )
+        )
+        assert "error" in result
+        assert "Project directory not found" in result["error"]
+        # Nothing was created or indexed.
+        assert not (tmp_path / "nope").exists()
+        assert project["index_mgr"]._db.get_all_libraries(project=None) == []
+
+    def test_project_name_collides_with_global(self, tools, tmp_path, project):
+        """Nickname uniqueness is global: a project library can't shadow the
+        existing TestSys (registered in the global user fp-lib-table)."""
+        proj_dir = tmp_path / "subproj"
+        proj_dir.mkdir()
+        result = _run(
+            tools["create_footprint_library"](name="TestSys", project_dir=str(proj_dir), ctx=None)
+        )
+        assert "error" in result
+        assert "already exists" in result["error"]
+        assert not (proj_dir / "TestSys.pretty").exists()
 
 
 class TestAddFootprints:
     def test_exports_missing_to_3rdparty(self, tools, tmp_path, project):
         # Create the target library first, then export into it.
-        created = _run(tools["create_3rdparty_footprint_library"](name="MyVendor", ctx=None))
+        created = _run(tools["create_footprint_library"](name="MyVendor", ctx=None))
         assert "error" not in created, created
         board = _make_board(tmp_path)
         result = _run(
-            tools["add_footprints_to_3rdparty_library"](
-                pcb_path=board, library="MyVendor", ctx=None
+            tools["add_footprints_to_library"](
+                pcb_path=board, footprints=_BOARD_FOOTPRINTS, library="MyVendor", ctx=None
             )
         )
         assert "error" not in result, result
@@ -433,36 +486,38 @@ class TestAddFootprints:
         assert os.path.isfile(os.path.join(target, "Sensor_Board_XYZ.kicad_mod"))
         assert os.path.isfile(os.path.join(target, "Connector_Odd.kicad_mod"))
         assert not os.path.exists(os.path.join(target, "R_0402_1005Metric.kicad_mod"))
-        # Index updated for exactly this library.
-        assert result["indexed"] == 2
-        libs = project["index_mgr"].get_all_libraries()
+        # The fixture's fp-lib-table doubles as the project table (board and
+        # table share tmp_path), so the add's ownership check tags the
+        # library under the project, not the global scope.
+        libs = project["index_mgr"]._db.get_all_libraries(project=os.path.realpath(str(tmp_path)))
         assert [lib.library_name for lib in libs] == ["MyVendor"]
+        assert libs[0].project == os.path.realpath(str(tmp_path))
 
     def test_board_untouched(self, tools, tmp_path, project):
-        _run(tools["create_3rdparty_footprint_library"](name="MyVendor", ctx=None))
+        _run(tools["create_footprint_library"](name="MyVendor", ctx=None))
         board = _make_board(tmp_path)
         before = open(board, encoding="utf-8").read()
         _run(
-            tools["add_footprints_to_3rdparty_library"](
-                pcb_path=board, library="MyVendor", ctx=None
+            tools["add_footprints_to_library"](
+                pcb_path=board, footprints=_BOARD_FOOTPRINTS, library="MyVendor", ctx=None
             )
         )
         assert open(board, encoding="utf-8").read() == before
 
     def test_no_overwrite_on_second_run(self, tools, tmp_path, project):
-        _run(tools["create_3rdparty_footprint_library"](name="MyVendor", ctx=None))
+        _run(tools["create_footprint_library"](name="MyVendor", ctx=None))
         # Real-world premise: the index is built (sync) before exporting.
         project["index_mgr"].index_library("TestSys", project["system_lib"])
         board = _make_board(tmp_path)
         first = _run(
-            tools["add_footprints_to_3rdparty_library"](
-                pcb_path=board, library="MyVendor", ctx=None
+            tools["add_footprints_to_library"](
+                pcb_path=board, footprints=_BOARD_FOOTPRINTS, library="MyVendor", ctx=None
             )
         )
         assert first["exported_count"] == 2
         second = _run(
-            tools["add_footprints_to_3rdparty_library"](
-                pcb_path=board, library="MyVendor", ctx=None
+            tools["add_footprints_to_library"](
+                pcb_path=board, footprints=_BOARD_FOOTPRINTS, library="MyVendor", ctx=None
             )
         )
         assert second["exported_count"] == 0
@@ -470,20 +525,68 @@ class TestAddFootprints:
         assert second["skipped_count"] == 1  # R_0402 lives in TestSys
         assert all(s["reason"].startswith("target file already exists") for s in second["failed"])
 
-    def test_unknown_library_errors(self, tools, tmp_path, project):
+    def test_exports_only_requested_subset(self, tools, tmp_path, project):
+        """Only the explicit footprints list is exported — no full export."""
+        _run(tools["create_footprint_library"](name="MyVendor", ctx=None))
         board = _make_board(tmp_path)
         result = _run(
-            tools["add_footprints_to_3rdparty_library"](
-                pcb_path=board, library="NoSuchLib", ctx=None
+            tools["add_footprints_to_library"](
+                pcb_path=board,
+                footprints=["Connector_Odd"],
+                library="MyVendor",
+                ctx=None,
             )
         )
-        assert "error" in result
-        assert "not found" in result["error"]
+        assert "error" not in result, result
+        assert result["exported_count"] == 1
+        assert result["exported"] == [
+            os.path.join(
+                project["third_party"], "footprints", "MyVendor.pretty", "Connector_Odd.kicad_mod"
+            )
+        ]
+        target = os.path.join(project["third_party"], "footprints", "MyVendor.pretty")
+        assert os.path.isfile(os.path.join(target, "Connector_Odd.kicad_mod"))
+        assert not os.path.exists(os.path.join(target, "Sensor_Board_XYZ.kicad_mod"))
+
+    def test_not_on_board_is_skipped(self, tools, tmp_path, project):
+        """A requested name not placed on the board is skipped, never written."""
+        _run(tools["create_footprint_library"](name="MyVendor", ctx=None))
+        board = _make_board(tmp_path)
+        result = _run(
+            tools["add_footprints_to_library"](
+                pcb_path=board,
+                footprints=["NoSuchFootprint"],
+                library="MyVendor",
+                ctx=None,
+            )
+        )
+        assert "error" not in result, result
+        assert result["exported_count"] == 0
+        assert result["skipped_count"] == 1
+        assert result["skipped"] == [{"name": "NoSuchFootprint", "reason": "not on board"}]
+        target = os.path.join(project["third_party"], "footprints", "MyVendor.pretty")
+        assert os.listdir(target) == []
+
+    def test_empty_footprints_exports_nothing(self, tools, tmp_path, project):
+        """An empty footprints list is valid: no export, no error."""
+        _run(tools["create_footprint_library"](name="MyVendor", ctx=None))
+        board = _make_board(tmp_path)
+        result = _run(
+            tools["add_footprints_to_library"](
+                pcb_path=board, footprints=[], library="MyVendor", ctx=None
+            )
+        )
+        assert "error" not in result, result
+        assert result["exported_count"] == 0
+        assert result["failed_count"] == 0
+        assert result["skipped_count"] == 0
 
     def test_export_into_existing_user_library(self, tools, tmp_path, project):
         board = _make_board(tmp_path)
         result = _run(
-            tools["add_footprints_to_3rdparty_library"](pcb_path=board, library="TestSys", ctx=None)
+            tools["add_footprints_to_library"](
+                pcb_path=board, footprints=_BOARD_FOOTPRINTS, library="TestSys", ctx=None
+            )
         )
         assert "error" not in result, result
         assert result["library_path"] == project["system_lib"]
@@ -498,17 +601,17 @@ class TestAddFootprints:
         assert "(version" not in mod  # still the bare fixture, not an exported copy
         # indexing re-scans the whole target: R_0402 (fixture) + 2 exported
         assert result["indexed"] == 3
-        libs = project["index_mgr"].get_all_libraries()
+        libs = project["index_mgr"]._db.get_all_libraries(project=os.path.realpath(str(tmp_path)))
         assert [lib.library_name for lib in libs] == ["TestSys"]
 
 
 class TestExportFileContent:
     def test_exported_mod_is_valid_and_clean(self, tools, tmp_path, project):
-        _run(tools["create_3rdparty_footprint_library"](name="MyVendor", ctx=None))
+        _run(tools["create_footprint_library"](name="MyVendor", ctx=None))
         board = _make_board(tmp_path)
         result = _run(
-            tools["add_footprints_to_3rdparty_library"](
-                pcb_path=board, library="MyVendor", ctx=None
+            tools["add_footprints_to_library"](
+                pcb_path=board, footprints=_BOARD_FOOTPRINTS, library="MyVendor", ctx=None
             )
         )
         assert "error" not in result, result
@@ -528,11 +631,14 @@ class TestUnsafeFootprintNames:
         return str(path)
 
     def test_traversal_name_is_failed_not_written(self, tools, tmp_path, project):
-        _run(tools["create_3rdparty_footprint_library"](name="MyVendor", ctx=None))
+        _run(tools["create_footprint_library"](name="MyVendor", ctx=None))
         board = self._board_with_name(tmp_path, "../../escape")
         result = _run(
-            tools["add_footprints_to_3rdparty_library"](
-                pcb_path=board, library="MyVendor", ctx=None
+            tools["add_footprints_to_library"](
+                pcb_path=board,
+                footprints=["../../escape", "R_0402_1005Metric", "Connector_Odd"],
+                library="MyVendor",
+                ctx=None,
             )
         )
         assert "error" not in result, result
@@ -548,11 +654,14 @@ class TestUnsafeFootprintNames:
         assert "escape.kicad_mod" not in os.listdir(lib_dir)
 
     def test_empty_name_is_failed_not_written(self, tools, tmp_path, project):
-        _run(tools["create_3rdparty_footprint_library"](name="MyVendor", ctx=None))
+        _run(tools["create_footprint_library"](name="MyVendor", ctx=None))
         board = self._board_with_name(tmp_path, "CustomLib:")
         result = _run(
-            tools["add_footprints_to_3rdparty_library"](
-                pcb_path=board, library="MyVendor", ctx=None
+            tools["add_footprints_to_library"](
+                pcb_path=board,
+                footprints=["", "R_0402_1005Metric", "Connector_Odd"],
+                library="MyVendor",
+                ctx=None,
             )
         )
         assert "error" not in result, result
@@ -588,7 +697,7 @@ class TestCreateRollback:
             raise ValueError("fp-lib-table is a single line")
 
         monkeypatch.setattr(pcb_library_tools, "register_library_in_table", _boom)
-        result = _run(tools["create_3rdparty_footprint_library"](name="MyVendor", ctx=None))
+        result = _run(tools["create_footprint_library"](name="MyVendor", ctx=None))
         assert "error" in result
         lib_dir = os.path.join(project["third_party"], "footprints", "MyVendor.pretty")
         assert not os.path.exists(lib_dir)

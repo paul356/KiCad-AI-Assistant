@@ -7,8 +7,6 @@ Unit tests for:
 
 import os
 
-import pytest
-
 from kcaa.utils.footprint_database import (
     FootprintDatabase,
     FootprintRecord,
@@ -884,15 +882,14 @@ class TestSyncScopeCapture:
 
         import kcaa.utils.footprint_index_manager as fim
 
-        monkeypatch.setattr(fim, "_singleton", None)
-        mgr = fim.get_footprint_index_manager(project_id="/p1")
+        mgr = fim.get_footprint_index_manager(project_path="/p1/proj.kicad_pro")
 
         results: list[FootprintIndexManager] = []
         errors: list[BaseException] = []
 
         def _rescope():
             try:
-                results.append(fim.get_footprint_index_manager(project_id="/p2"))
+                results.append(fim.get_footprint_index_manager(project_path="/p2/other.kicad_pro"))
             except BaseException as exc:  # pragma: no cover - failure path
                 errors.append(exc)
 
@@ -955,7 +952,7 @@ class TestFpSyncTools:
         )
         monkeypatch.setattr(
             "kcaa.tools.pcb_library_tools.get_footprint_index_manager",
-            lambda project_path=None, project_id=None: mgr,
+            lambda project_path=None: mgr,
         )
 
         with _tool_module._fp_sync_lock:
@@ -994,7 +991,7 @@ class TestFpSyncTools:
         )
         monkeypatch.setattr(
             "kcaa.tools.pcb_library_tools.get_footprint_index_manager",
-            lambda project_path=None, project_id=None: mgr,
+            lambda project_path=None: mgr,
         )
 
         with _tool_module._fp_sync_lock:
@@ -1060,26 +1057,30 @@ class TestFpSyncTools:
 
 
 class TestGetFootprintIndexManager:
-    """The factory accepts a canonical ``project_id`` without re-deriving it."""
+    """The factory derives the project id from ``project_path``."""
 
     def _factory_module(self):
         return __import__(
             "kcaa.utils.footprint_index_manager", fromlist=["get_footprint_index_manager"]
         )
 
-    def test_project_id_used_verbatim(self, tmp_path, monkeypatch):
-        """A canonical project_id must scope directly: no dirname re-derivation."""
+    def test_project_path_derives_project_id(self, tmp_path, monkeypatch):
+        """project_path → id = realpath(parent dir); None → global scope."""
         mod = self._factory_module()
         monkeypatch.setattr(mod, "_singleton", None)
-        mgr = mod.get_footprint_index_manager(project_id="/tmp/SomeProject")
+        mgr = mod.get_footprint_index_manager(project_path="/tmp/SomeProject/proj.kicad_pro")
         assert mgr._project_id == "/tmp/SomeProject"
-        assert mgr._project_path is None
+        assert mgr._project_path == "/tmp/SomeProject/proj.kicad_pro"
+        global_mgr = mod.get_footprint_index_manager()
+        assert global_mgr._project_id == ""
+        assert global_mgr._project_path is None
 
-    def test_rejects_both_project_path_and_id(self, tmp_path, monkeypatch):
+    def test_factory_rescope_derives_id(self, tmp_path, monkeypatch):
+        """Re-scoping the singleton also re-derives the project id."""
         mod = self._factory_module()
         monkeypatch.setattr(mod, "_singleton", None)
-        with pytest.raises(ValueError):
-            mod.get_footprint_index_manager(
-                project_path="/tmp/SomeProject/proj.kicad_pro",
-                project_id="/tmp/SomeProject",
-            )
+        mgr = mod.get_footprint_index_manager(project_path="/p1/proj.kicad_pro")
+        assert mgr._project_id == "/p1"
+        mod.get_footprint_index_manager(project_path="/p2/other.kicad_pro")
+        assert mgr._project_id == "/p2"
+        assert mgr._project_path == "/p2/other.kicad_pro"
