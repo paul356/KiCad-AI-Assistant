@@ -536,10 +536,9 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
         try:
             nodes, footprints, version = _collect_board_footprints(pcb_path)
             library_dir = _resolve_library_dir(library, pcb_path)
-            # Never re-export: existing must cover every on-disk library, not
-            # just the indexed subset (a never-synced library would otherwise
-            # be re-exported/overwritten).
-            existing = _live_scan_existing_names(pcb_path)
+            # Same source of truth as find_missing_footprints: the index DB
+            # (project-scoped), with a live scan only when the index is empty.
+            existing = _collect_existing_names(pcb_path)
             if ctx:
                 await ctx.info(
                     f"Exporting missing footprints to {library_dir} "

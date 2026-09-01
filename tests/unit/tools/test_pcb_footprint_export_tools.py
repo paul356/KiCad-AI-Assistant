@@ -450,6 +450,8 @@ class TestAddFootprints:
 
     def test_no_overwrite_on_second_run(self, tools, tmp_path, project):
         _run(tools["create_3rdparty_footprint_library"](name="MyVendor", ctx=None))
+        # Real-world premise: the index is built (sync) before exporting.
+        project["index_mgr"].index_library("TestSys", project["system_lib"])
         board = _make_board(tmp_path)
         first = _run(
             tools["add_footprints_to_3rdparty_library"](

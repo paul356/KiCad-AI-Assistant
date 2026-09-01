@@ -34,9 +34,11 @@ description: "Footprint index sync, library listing, search, and inspection"
   missing footprint as a ``.kicad_mod`` file into the target library
   directory (footprints already present are skipped, never overwritten),
   then updates the footprint database for exactly that library.  The board
-  file is never modified.  Typical flow: ``find_missing_footprints`` to
-  preview, ``create_3rdparty_footprint_library`` once to set up a new
-  library, then ``add_footprints_to_3rdparty_library`` to populate it.
+  file is never modified.  "Already present" is judged from the same indexed
+  database as ``find_missing_footprints`` (build the index first).  Typical
+  flow: ``find_missing_footprints`` to preview,
+  ``create_3rdparty_footprint_library`` once to set up a new library, then
+  ``add_footprints_to_3rdparty_library`` to populate it.
 - Project paths may be given as ``.kicad_pro`` or ``.kicad_pcb`` files; the
   project identity is always the realpath of the parent directory, so all
   tools agree on which project a library belongs to.
