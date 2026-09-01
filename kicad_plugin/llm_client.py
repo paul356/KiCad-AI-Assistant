@@ -350,7 +350,7 @@ def _subprocess_env() -> dict[str, str]:
 # Used when in-process SSL is unavailable so streaming still works with the
 # same per-read socket timeout as the in-process path.
 # Protocol (one JSON payload per line, whitespace-separated kind prefix):
-#   SSE-DATA  {"content": "..."}  text delta -> on_text_delta
+#   SSE-DATA  {"content": "..."}  text delta -> on_stream_event
 #   SSE-DONE  {"finish_reason": ..., "message": {...}}
 #   SSE-ERROR {"kind": "exception", "error": "..."} |
 #             {"status": <http_code>, "body": "..."} |
@@ -595,7 +595,7 @@ def _subprocess_sse_stream(
     payload: bytes,
     timeout: float,
     fmt: str,
-    on_text_delta: Callable[[str], None] | None,
+    on_stream_event: Callable[[dict], None] | None,
 ) -> dict[str, Any]:
     """Stream an HTTP SSE response through the plugin-venv Python subprocess.
 
@@ -643,6 +643,12 @@ def _subprocess_sse_stream(
         proc.kill()
         return {"error": f"HTTPS request failed: {e}"}
 
+    if on_stream_event is not None:
+        try:
+            on_stream_event({"type": "text_start"})
+        except Exception as e:  # noqa: BLE001 -- UI callback errors must not kill the turn
+            log.error("Subprocess stream event callback error: %s", e)
+
     done: dict[str, Any] | None = None
     error_result: dict[str, Any] | None = None
     for raw in proc.stdout:
@@ -653,11 +659,11 @@ def _subprocess_sse_stream(
                 content = json.loads(body).get("content") or ""
             except json.JSONDecodeError:
                 continue
-            if content and on_text_delta is not None:
+            if content and on_stream_event is not None:
                 try:
-                    on_text_delta(content)
+                    on_stream_event({"type": "text_chunk", "content": content})
                 except Exception as e:  # noqa: BLE001 -- UI callback errors must not kill the turn
-                    log.debug("Subprocess text delta callback error: %s", e)
+                    log.error("Subprocess text delta callback error: %s", e)
         elif kind == "SSE-DONE" and body:
             try:
                 done = json.loads(body)
@@ -702,6 +708,12 @@ def _subprocess_sse_stream(
         message["tool_calls"] = done_message["tool_calls"]
     if done_message.get("reasoning_content"):
         message["reasoning_content"] = done_message["reasoning_content"]
+    if on_stream_event is not None:
+        try:
+            on_stream_event({"type": "text_end"})
+        except Exception as e:  # noqa: BLE001 -- UI callback errors must not kill the turn
+            log.error("Subprocess stream event callback error: %s", e)
+
     return {"finish_reason": done.get("finish_reason", "stop"), "message": message}
 
 
@@ -1545,7 +1557,7 @@ class LLMClient:
         try:
             on_tool_call(tool_name, args, result)
         except Exception as e:
-            log.debug("UI callback error in _emit_tool_callback: %s", e)  # must not break the loop
+            log.error("UI callback error in _emit_tool_callback: %s", e)  # must not break the loop
 
     def _execute_tool_with_policy(
         self,
@@ -1648,7 +1660,7 @@ class LLMClient:
         user_message: str,
         context_block: str,
         on_tool_call: Callable[[str, dict, Any], None] | None = None,
-        on_text_delta: Callable[[str], None] | None = None,
+        on_stream_event: Callable[[dict], None] | None = None,
         images: list[dict[str, Any]] | None = None,
     ) -> str:
         """
@@ -1659,8 +1671,8 @@ class LLMClient:
             context_block: Rendered KiCad context from context_bridge.
             on_tool_call:  Optional callback(tool_name, arguments, result) fired
                            after each tool execution — use this to update the UI.
-            on_text_delta: Optional callback(chunk) fired for each text chunk
-                           when streaming is active.
+            on_stream_event: Optional callback(evt) fired for each streaming
+                           lifecycle event: text_start / text_chunk / text_end.
             images:        Optional list of dicts {"media_type": "image/png",
                            "data": "<base64>"} attached to this user message.
 
@@ -1687,7 +1699,7 @@ class LLMClient:
 
         try:
             for _ in range(20):  # max 20 iterations (guard against infinite loops)
-                response = self._call_llm(system, tools, on_text_delta=on_text_delta)
+                response = self._call_llm(system, tools, on_stream_event=on_stream_event)
 
                 if response.get("error"):
                     reply = f"[LLM error] {response['error']}"
@@ -1819,7 +1831,7 @@ class LLMClient:
             for t in tools_raw
         ]
 
-    def _call_llm(self, system: str, tools: list[dict], on_text_delta=None) -> dict[str, Any]:
+    def _call_llm(self, system: str, tools: list[dict], on_stream_event=None) -> dict[str, Any]:
         """Dispatch to the configured LLM provider."""
         provider = self._settings.llm_provider
         tool_names = [t.get("function", {}).get("name", "?") for t in tools]
@@ -1839,15 +1851,15 @@ class LLMClient:
         max_retries = 5
         for attempt in range(max_retries):
             if provider == "ollama":
-                if on_text_delta is not None:
-                    response = self._stream_ollama(system, tools, on_text_delta)
+                if on_stream_event is not None:
+                    response = self._stream_ollama(system, tools, on_stream_event)
                 else:
                     response = self._call_ollama(system, tools)
-            elif on_text_delta is not None:
+            elif on_stream_event is not None:
                 if provider == "anthropic":
-                    response = self._stream_anthropic(system, tools, on_text_delta)
+                    response = self._stream_anthropic(system, tools, on_stream_event)
                 else:
-                    response = self._stream_openai(system, tools, on_text_delta)
+                    response = self._stream_openai(system, tools, on_stream_event)
             elif provider == "anthropic":
                 response = self._call_anthropic(system, tools)
             else:
@@ -1948,14 +1960,14 @@ class LLMClient:
                     )
         return blocks
 
-    def _stream_openai(self, system: str, tools: list[dict], on_text_delta) -> dict[str, Any]:
+    def _stream_openai(self, system: str, tools: list[dict], on_stream_event) -> dict[str, Any]:
         """Call OpenAI-compatible API with streaming enabled.
 
         Uses in-process urllib for true SSE streaming when SSL is available;
         otherwise relays the SSE stream through the plugin-venv Python
         subprocess (_subprocess_sse_stream).  Both paths stream — there is no
         non-streaming fallback here; _call_openai is used only by callers
-        that do not provide on_text_delta (e.g. history compaction).
+        that do not provide on_stream_event (e.g. history compaction).
         """
         global _current_reasoning
         _current_reasoning = []
@@ -1988,6 +2000,8 @@ class LLMClient:
                 with _urlopen_with_plugin_ca_retry(req, timeout=300) as resp:
                     _in_process_ssl = True
                     text_parts = []
+                    if on_stream_event is not None:
+                        on_stream_event({"type": "text_start"})
                     tool_calls_by_index: dict[int, dict] = {}
                     finish_reason = "stop"
 
@@ -2019,9 +2033,9 @@ class LLMClient:
                         if content:
                             text_parts.append(content)
                             try:
-                                on_text_delta(content)
+                                on_stream_event({"type": "text_chunk", "content": content})
                             except Exception as e:
-                                log.debug("Text delta callback error in streaming: %s", e)
+                                log.error("Text delta callback error in streaming: %s", e)
 
                         reasoning = delta.get("reasoning_content")
                         if reasoning:
@@ -2050,6 +2064,8 @@ class LLMClient:
                         message["tool_calls"] = tool_calls
                     if _current_reasoning:
                         message["reasoning_content"] = "".join(_current_reasoning)
+                    if on_stream_event is not None:
+                        on_stream_event({"type": "text_end"})
                     return {"finish_reason": finish_reason, "message": message}
 
             except urllib.error.HTTPError as e:
@@ -2064,7 +2080,7 @@ class LLMClient:
 
         # In-process SSL unavailable: stream via the plugin-venv Python subprocess.
         return _subprocess_sse_stream(
-            url, headers, payload, timeout=300, fmt="openai", on_text_delta=on_text_delta
+            url, headers, payload, timeout=300, fmt="openai", on_stream_event=on_stream_event
         )
 
     def _ollama_messages(self) -> list[dict[str, Any]]:
@@ -2097,7 +2113,7 @@ class LLMClient:
             out.append(converted)
         return out
 
-    def _stream_ollama(self, system: str, tools: list[dict], on_text_delta) -> dict[str, Any]:
+    def _stream_ollama(self, system: str, tools: list[dict], on_stream_event) -> dict[str, Any]:
         """Call Ollama native API with streaming enabled.
 
         Uses the Ollama /api/chat endpoint with ``stream: true``.
@@ -2127,6 +2143,8 @@ class LLMClient:
         try:
             with urllib.request.urlopen(req, timeout=300) as resp:  # nosec B310 -- localhost only
                 text_parts = []
+                if on_stream_event is not None:
+                    on_stream_event({"type": "text_start"})
                 tool_calls_by_index: dict[int, dict] = {}
                 finish_reason = "stop"
 
@@ -2151,9 +2169,9 @@ class LLMClient:
                     if content:
                         text_parts.append(content)
                         try:
-                            on_text_delta(content)
+                            on_stream_event({"type": "text_chunk", "content": content})
                         except Exception as e:
-                            log.debug("Text delta callback error in Ollama streaming: %s", e)
+                            log.error("Text delta callback error in Ollama streaming: %s", e)
 
                     for tc_delta in msg.get("tool_calls") or []:
                         idx = tc_delta.get("index", 0)
@@ -2176,6 +2194,8 @@ class LLMClient:
                 message: dict[str, Any] = {"content": "".join(text_parts)}
                 if tool_calls:
                     message["tool_calls"] = tool_calls
+                if on_stream_event is not None:
+                    on_stream_event({"type": "text_end"})
                 return {"finish_reason": finish_reason, "message": message}
 
         except urllib.error.URLError as e:
@@ -2183,14 +2203,14 @@ class LLMClient:
         except Exception as e:
             return {"error": f"Ollama streaming request failed: {e}"}
 
-    def _stream_anthropic(self, system: str, tools: list[dict], on_text_delta) -> dict[str, Any]:
+    def _stream_anthropic(self, system: str, tools: list[dict], on_stream_event) -> dict[str, Any]:
         """Call Anthropic API with streaming enabled.
 
         Uses in-process urllib for true SSE streaming when SSL is available;
         otherwise relays the SSE stream through the plugin-venv Python
         subprocess (_subprocess_sse_stream, fmt="anthropic").  Both paths
         stream — there is no non-streaming fallback here; _call_anthropic is
-        used only by callers without on_text_delta (e.g. history compaction).
+        used only by callers without on_stream_event (e.g. history compaction).
         """
         global _in_process_ssl
         import urllib.error
@@ -2233,6 +2253,8 @@ class LLMClient:
             try:
                 with _urlopen_with_plugin_ca_retry(req, timeout=300) as resp:
                     _in_process_ssl = True
+                    if on_stream_event is not None:
+                        on_stream_event({"type": "text_start"})
                     text_blocks: dict[int, str] = {}
                     tool_blocks: dict[int, dict] = {}
                     stop_reason = "end_turn"
@@ -2278,9 +2300,9 @@ class LLMClient:
                                 text_blocks[idx] = text_blocks.get(idx, "") + chunk
                                 if chunk:
                                     try:
-                                        on_text_delta(chunk)
+                                        on_stream_event({"type": "text_chunk", "content": chunk})
                                     except Exception as e:
-                                        log.debug("Anthropic text delta callback error: %s", e)
+                                        log.error("Anthropic text delta callback error: %s", e)
                             elif dtype == "input_json_delta":
                                 partial = delta.get("partial_json", "")
                                 if idx in tool_blocks:
@@ -2322,6 +2344,8 @@ class LLMClient:
                     finish = "tool_calls" if tool_calls else "stop"
                     if stop_reason == "max_tokens":
                         finish = "stop"
+                    if on_stream_event is not None:
+                        on_stream_event({"type": "text_end"})
                     return {"finish_reason": finish, "message": message_out}
 
             except urllib.error.HTTPError as e:
@@ -2336,7 +2360,7 @@ class LLMClient:
 
         # In-process SSL unavailable: stream via the plugin-venv Python subprocess.
         return _subprocess_sse_stream(
-            url, headers, encoded, timeout=300, fmt="anthropic", on_text_delta=on_text_delta
+            url, headers, encoded, timeout=300, fmt="anthropic", on_stream_event=on_stream_event
         )
 
     def _anthropic_headers(self) -> dict[str, str]:

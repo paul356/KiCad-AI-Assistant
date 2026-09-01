@@ -19,6 +19,8 @@ import os
 import threading
 from typing import Any
 
+from .stream_events import apply_stream_event, make_ai_entry
+
 log = logging.getLogger(__name__)
 
 try:
@@ -97,8 +99,18 @@ if _WX_AVAILABLE:
             self._busy = False
             # threading.Event for cancelling an in-progress LLM turn
             self._cancel_event: threading.Event | None = None
-            # Thread-safe buffer for streamed text chunks; drained by _stream_timer
-            self._stream_buffer: collections.deque = collections.deque()
+            # FIFO of stream-lifecycle events produced by the background LLM
+            # thread (text_start/text_chunk/text_end/tool_call/turn_end).
+            # The 50 ms _stream_timer is the ONLY consumer; it drains the
+            # queue in order and renders once per tick.
+            self._stream_events: collections.deque = collections.deque()
+            # Generation of the active turn.  Every event carries the
+            # generation it was emitted under; the consumer drops events of
+            # older turns (a cancelled turn's leftover text and turn_end).
+            self._event_gen: int = 0
+            # True once any text chunk of the active turn was consumed
+            # (replaces the old was_streamed / ai_turn_started tracking).
+            self._turn_had_text: bool = False
             # Set to True when at least one tool call happens during a turn
             self._tool_calls_made: bool = False
             # Set to True when any tool modifies a .kicad_sch file this turn
@@ -160,6 +172,12 @@ if _WX_AVAILABLE:
             self._watch_candidate: str | None = None
             self._watch_candidate_seen: bool = False
             self._project_watch_timer = wx.Timer(self)
+            # Version-based dirty tracking: _conv_version bumps on every
+            # conversation mutation; saves skip the write when the last
+            # successful save already covered the current version (a plain
+            # close must not rewrite — and re-stamp — the session file).
+            self._conv_version: int = 0
+            self._saved_conv_version: int = 0
 
             self._build_ui()
             self._start_server()
@@ -609,7 +627,7 @@ if _WX_AVAILABLE:
                 kipy_found = os.path.isdir(win_site)
             kipy_ok = kipy_found
             if not kipy_ok:
-                self._conv_entries.append(
+                self._append_entry(
                     {
                         "type": "status",
                         "text": (
@@ -658,7 +676,7 @@ if _WX_AVAILABLE:
         def _on_ipc_socket_checked(self, socket_exists: bool, checked_path: str) -> None:
             """Callback invoked on the UI thread after the async IPC socket check."""
             if not socket_exists:
-                self._conv_entries.append(
+                self._append_entry(
                     {
                         "type": "status",
                         "text": (
@@ -773,16 +791,10 @@ if _WX_AVAILABLE:
                 }
             )
             _user_entry = self._conv_entries[-1]
+            self._conv_version += 1
             self._attached_files.clear()
             self._refresh_attachments_bar()
             self._follow_output_to_bottom = True
-            # Persist on every user message: creates the file on the first
-            # message (so current.json exists before the AI responds) and makes
-            # the session durable immediately (also upgrading legacy v1 files
-            # to v2, since the user has now modified the session).
-            err = self._save_session_to_disk()
-            if err:
-                log.warning("Could not save session: %s", err)
             self._render_conversation(force_scroll_to_bottom=True)
             self._busy = True
             self._cancel_event = threading.Event()
@@ -793,27 +805,34 @@ if _WX_AVAILABLE:
             ctx = collect_context()
             context_block = context_to_system_prompt_block(ctx)
 
-            # Reset streaming state and start the flush timer
-            self._stream_buffer.clear()
+            # Reset streaming state and start the flush timer.  A new turn
+            # bumps the generation: events still in flight from a cancelled
+            # previous turn are then ignored by the consumer (see
+            # _on_stream_flush), while their tool cards still land.
+            self._stream_events.clear()
             self._pending_ai_text = ""
             self._stream_delta_chars = 0
             self._tool_calls_made = False
             self._schematic_edited = False
             self._pcb_edited = False
+            self._turn_had_text = False
+            self._event_gen += 1
             self._stream_timer.Start(50)  # flush every 50 ms → ~20 fps
 
-            state = {"ai_turn_started": False}
+            gen = self._event_gen
 
-            def _on_delta(chunk: str) -> None:
-                # Called from background thread — just push to buffer; timer handles UI
-                if self._cancel_event and self._cancel_event.is_set():
-                    if not state.get("cancel_dropped"):
-                        state["cancel_dropped"] = True
-                        log.debug("chat: dropping streamed chunks after cancel")
+            def _emit(evt: dict) -> None:
+                # Sole producer (background thread): every lifecycle event
+                # carries this turn's generation; FIFO order == occurrence
+                # order by construction.  Drop events if the panel has moved
+                # on (New Session / Clear bumped _event_gen) so a cancelled
+                # turn whose thread keeps streaming cannot grow the deque
+                # unbounded.
+                if gen != self._event_gen:
                     return
-                state["ai_turn_started"] = True
-                self._stream_delta_chars += len(chunk)
-                self._stream_buffer.append(chunk)
+                evt = dict(evt)
+                evt["_gen"] = gen
+                self._stream_events.append(evt)
 
             def _run():
                 log.info("Background _run: started")
@@ -851,21 +870,20 @@ if _WX_AVAILABLE:
                     reply = self._llm_client.run(
                         text_with_pdf,
                         context_block,
-                        on_tool_call=lambda name, args, result: wx.CallAfter(
-                            self._on_tool_call, name, args, result
+                        on_tool_call=lambda name, args, result: _emit(
+                            {"type": "tool_call", "name": name, "args": args, "result": result}
                         ),
-                        on_text_delta=_on_delta,
+                        on_stream_event=_emit,
                         images=images,
                     )
                 except Exception as e:
                     log.exception("LLM request failed")
                     reply = f"[Error] {e}"
-                log.info(
-                    "Background _run: finished (reply_len=%d, streamed=%s)",
-                    len(reply),
-                    state["ai_turn_started"],
-                )
-                wx.CallAfter(self._on_reply, reply, ctx, was_streamed=state["ai_turn_started"])
+                log.info("Background _run: finished (reply_len=%d)", len(reply))
+                # turn_end is the queue's final event: emitted after the
+                # reload_kicad / tool callbacks, so the consumer orders it
+                # strictly after the last text of the turn.
+                _emit({"type": "turn_end", "reply": reply, "ctx": ctx})
 
             threading.Thread(target=_run, daemon=True).start()
 
@@ -1377,57 +1395,110 @@ if _WX_AVAILABLE:
                 return f"[Error] {err}"
             return result.stdout or ""
 
-        def _on_reply(self, reply: str, ctx: dict, was_streamed: bool = False) -> None:
-            # Stop the flush timer and drain any remaining chunks
-            self._stream_timer.Stop()
-            self._on_stream_flush(None)
+        def _on_stream_flush(self, event) -> None:
+            """Consume the unified stream-event queue (main thread, 50 ms timer).
 
+            Sole consumer: drains ALL queued events in FIFO order (occurrence
+            order is guaranteed by the single background producer) and applies
+            each via the wx-free state machine in stream_events, then performs
+            one merged render per tick.  A ``text_end`` is therefore always
+            applied before the ``tool_call`` / ``turn_end`` events that follow
+            it — the race where an end-of-turn notification (``reload_kicad``)
+            finalised a draft that was still being filled through the old
+            50 ms text pipeline is structurally impossible.  Draft
+            finalisation is driven by the explicit ``text_end`` marker, never
+            by heuristics about pending text.
+
+            Output paths are unchanged: only the input pipeline moved into
+            the queue.  Non-stream events (status bar, project switch,
+            session load) still go through wx directly.
+            """
+
+            if not self._stream_events:
+                return
+            events = []
+            while self._stream_events:
+                try:
+                    events.append(self._stream_events.popleft())
+                except IndexError:
+                    break
+
+            draft_changed = False
+            entries_changed = False
+            turn_ended = False
+            turn_ctx: dict = {}
+            for evt in events:
+                etype = evt.get("type")
+                if evt.get("_gen", -1) != self._event_gen:
+                    # Stale turn (cancelled or replaced by a newer send or
+                    # session reset): drop its text and turn-end; its tool
+                    # cards still land (pre-refactor behaviour — the old
+                    # _on_tool_call always reached the UI).
+                    if etype != "tool_call":
+                        continue
+
+                st = apply_stream_event(
+                    pending=self._pending_ai_text,
+                    entries=self._conv_entries,
+                    tool_seq=self._tool_seq,
+                    tool_calls_made=self._tool_calls_made,
+                    turn_had_text=self._turn_had_text,
+                    delta_chars=self._stream_delta_chars,
+                    cancelled=self._cancel_event is not None and self._cancel_event.is_set(),
+                    evt=evt,
+                    timestamp=lambda: datetime.datetime.now().strftime("%H:%M:%S"),
+                )
+                self._pending_ai_text = st.pending
+                self._tool_seq = st.tool_seq
+                self._tool_calls_made = st.tool_calls_made
+                self._turn_had_text = st.turn_had_text
+                self._stream_delta_chars = st.delta_chars
+                draft_changed |= st.draft_changed
+                entries_changed |= st.entries_changed
+                if st.entries_changed:
+                    self._conv_version += 1
+                if etype == "turn_end":
+                    turn_ended = True
+                    turn_ctx = evt.get("ctx") or {}
+                if etype == "tool_call" and evt.get("name"):
+                    self._mark_tool_dirty(evt["name"])
+
+            # One merged render pass per tick: incremental stream update for
+            # the draft, then a full conversation render for new entries.
+            if draft_changed:
+                if self._use_webview:
+                    if self._shell_loaded and not self._stream_wrapper_visible:
+                        self._show_stream_wrapper()
+                    if not self._incremental_stream_update():
+                        # Deferred (lock busy / shell not loaded) or update
+                        # failed: _run_script already recorded _render_pending,
+                        # so a full rebuild will replay (and the next flush
+                        # re-shows stream text).
+                        log.warning(
+                            "chat: stream flush deferred render (pending=%d chars)",
+                            len(self._pending_ai_text),
+                        )
+                else:
+                    self._render_conversation(force_scroll_to_bottom=self._follow_output_to_bottom)
+            if entries_changed or turn_ended:
+                self._render_conversation(force_scroll_to_bottom=self._follow_output_to_bottom)
+
+            if turn_ended:
+                self._finish_turn(turn_ctx)
+
+        def _finish_turn(self, ctx: dict) -> None:
+            """Close out a finished turn: hide preview, reset state, save.
+
+            Takes over the tail of the old _on_reply — everything that is not
+            part of the pure event state machine in stream_events.
+            """
             log.info(
-                "chat: _on_reply was_streamed=%s reply_len=%d pending_len=%d "
-                "buffer_left=%d delta_chars=%d",
-                was_streamed,
-                len(reply),
+                "chat: turn finished pending_len=%d delta_chars=%d",
                 len(self._pending_ai_text),
-                len(self._stream_buffer),
                 getattr(self, "_stream_delta_chars", 0),
             )
-
-            # Hide streaming preview before appending the final entry
             if self._use_webview:
                 self._hide_stream_wrapper()
-
-            if not was_streamed:
-                entry = {
-                    "type": "ai",
-                    "text": reply,
-                    "timestamp": datetime.datetime.now().strftime("%H:%M:%S"),
-                }
-                self._conv_entries.append(entry)
-                if self._use_webview and self._shell_loaded:
-                    self._append_entry_js(entry, force_scroll_to_bottom=True)
-                else:
-                    self._render_conversation(force_scroll_to_bottom=True)
-            else:
-                # Finalise any remaining streamed text as a proper AI entry
-                if self._pending_ai_text:
-                    entry = {
-                        "type": "ai",
-                        "text": self._pending_ai_text,
-                        "timestamp": datetime.datetime.now().strftime("%H:%M:%S"),
-                    }
-                    log.info(
-                        "chat: finalising streamed entry text_len=%d tail=%r",
-                        len(entry["text"]),
-                        entry["text"][-80:],
-                    )
-                    self._conv_entries.append(entry)
-                    self._pending_ai_text = ""
-                    if self._use_webview and self._shell_loaded:
-                        self._append_entry_js(entry, force_scroll_to_bottom=True)
-                    else:
-                        self._render_conversation(force_scroll_to_bottom=True)
-            # Any deferral during the turn is flushed by the lock holder's
-            # release (_run_script), so no turn-end safety net is needed.
             self._busy = False
             self._cancel_event = None
             self._toggle_send_stop(busy=False)
@@ -1435,44 +1506,14 @@ if _WX_AVAILABLE:
             if self._tool_calls_made:
                 self._auto_refresh(ctx)
             self._follow_output_to_bottom = False
+            if not self._stream_events:
+                self._stream_timer.Stop()
             # Persist the completed turn so disk always holds the full
-            # conversation, including the streamed AI reply. On-exit autosave
-            # then only refreshes — no data depends on it.
+            # conversation.  Teardown persistence (Bug A) covers an
+            # in-flight close; this write covers the complete turn.
             err = self._save_session_to_disk()
             if err:
                 log.warning("Could not save session after reply: %s", err)
-
-        def _on_stream_flush(self, event) -> None:
-            """Drain the streaming buffer into the pending AI text (main thread, timer-driven)."""
-            if not self._stream_buffer:
-                return
-            parts = []
-            while self._stream_buffer:
-                try:
-                    parts.append(self._stream_buffer.popleft())
-                except IndexError:
-                    break
-            if not parts:
-                return
-            self._pending_ai_text += "".join(parts)
-
-            if self._use_webview:
-                # Show stream wrapper on first chunk
-                if self._shell_loaded and not self._stream_wrapper_visible:
-                    self._show_stream_wrapper()
-                # Incremental DOM update — should always succeed with shell loaded
-                if self._incremental_stream_update():
-                    return
-                # Deferred (lock busy / shell not loaded) or update failed:
-                # _run_script already recorded _render_pending, so a full
-                # rebuild will replay (and the next flush re-shows stream
-                # text).  Nothing to bookkeep here.
-                log.warning(
-                    "chat: stream flush deferred render (pending=%d chars)",
-                    len(self._pending_ai_text),
-                )
-            else:
-                self._render_conversation(force_scroll_to_bottom=self._follow_output_to_bottom)
 
         def _incremental_stream_update(self) -> bool:
             """Update streaming AI text via _updateStream JS call.
@@ -1521,7 +1562,7 @@ if _WX_AVAILABLE:
                     "WebView shell failed to load after %d retries — giving up",
                     self._shell_retry_count,
                 )
-                self._conv_entries.append(
+                self._append_entry(
                     {
                         "type": "status",
                         "text": (
@@ -1536,7 +1577,7 @@ if _WX_AVAILABLE:
             log.warning(
                 "WebView watchdog: shell load timed out (>5s), retry %d/3", self._shell_retry_count
             )
-            self._conv_entries.append(
+            self._append_entry(
                 {
                     "type": "status",
                     "text": (
@@ -1548,40 +1589,8 @@ if _WX_AVAILABLE:
             )
             wx.CallAfter(self._load_shell)
 
-        def _on_tool_call(self, name: str, args: dict, result: Any) -> None:
-            log.info(
-                "_on_tool_call: %s (shell_loaded=%s, entries=%d)",
-                name,
-                self._shell_loaded,
-                len(self._conv_entries),
-            )
-            # If there is pending streamed text that preceded this tool call,
-            # finalise it as an AI entry now so the timeline order is correct.
-            if self._pending_ai_text:
-                log.debug(
-                    "chat: mid-turn finalise of streamed text len=%d",
-                    len(self._pending_ai_text),
-                )
-                self._conv_entries.append({"type": "ai", "text": self._pending_ai_text})
-                self._pending_ai_text = ""
-            # Append as a permanent timeline entry so tool calls appear in
-            # chronological order alongside user and AI messages.
-            # Store full data — truncation for UI display happens at render time
-            # to preserve session data integrity.
-            self._tool_seq += 1
-            self._conv_entries.append(
-                {
-                    "type": "tool_call",
-                    "name": name,
-                    "args": args,
-                    "result": result,
-                    "_seq": self._tool_seq,
-                }
-            )
-            # Full update needed to clear pending-ai-text and show new entries
-            self._render_conversation(force_scroll_to_bottom=self._follow_output_to_bottom)
-            self._tool_calls_made = True
-            # Use tool_registry to determine if tool modified PCB/schematic files
+        def _mark_tool_dirty(self, name: str) -> None:
+            """Track whether a tool call modified the PCB/schematic on disk."""
             try:
                 from ..tool_registry import get_tool_policy
 
@@ -1595,6 +1604,17 @@ if _WX_AVAILABLE:
             elif policy and policy.path_arg == "schematic_path" and policy.mark_dirty:
                 self._schematic_edited = True
 
+        def _append_entry(self, entry: dict) -> None:
+            """Append a conversation entry and mark the conversation dirty.
+
+            Every status / autoroute-log append goes through here so the
+            version-based save gate (``_save_session_to_disk``) cannot skip a
+            write that should persist them.  AI / user entries that already
+            bump ``_conv_version`` at their call site may append directly.
+            """
+            self._conv_entries.append(entry)
+            self._conv_version += 1
+
         def _auto_refresh(self, ctx: dict) -> None:
             """Refresh the KiCad view automatically after tool calls."""
             if self._pcb_edited:
@@ -1602,7 +1622,7 @@ if _WX_AVAILABLE:
                     import pcbnew
 
                     pcbnew.Refresh()
-                    self._conv_entries.append(
+                    self._append_entry(
                         {
                             "type": "status",
                             "text": "⟳ Board view refreshed.",
@@ -1613,7 +1633,7 @@ if _WX_AVAILABLE:
                 except ImportError:
                     pass  # outside KiCad — silently skip
                 except Exception as e:
-                    self._conv_entries.append(
+                    self._append_entry(
                         {
                             "type": "status",
                             "text": f"⚠ Auto-refresh failed: {e}",
@@ -1623,7 +1643,7 @@ if _WX_AVAILABLE:
                     self._render_conversation(force_scroll_to_bottom=self._follow_output_to_bottom)
                     return
             if self._schematic_edited:
-                self._conv_entries.append(
+                self._append_entry(
                     {
                         "type": "status",
                         "text": "ℹ Schematic updated on disk — use File → Revert in the Schematic Editor to see the changes.",
@@ -1636,30 +1656,44 @@ if _WX_AVAILABLE:
             """Stop button: cancel the in-progress LLM turn."""
             if not self._busy or self._cancel_event is None:
                 return
-            log.info("_on_stop: cancelling LLM turn")
-            self._cancel_event.set()
-            # Drain stream buffer and finalise whatever text has arrived
-            self._stream_timer.Stop()
-            self._on_stream_flush(None)
+            # Drain any text chunks the producer already enqueued since the
+            # last timer tick before cancelling — otherwise the archived
+            # partial silently loses the tail received in the last tick
+            # window (the same truncation class Bug B fixes).  Only fold
+            # text_* of this turn; tool_call/turn_end are left for the timer.
+            gen = self._event_gen
+            for evt in list(self._stream_events):
+                if evt.get("_gen") != gen:
+                    continue
+                if evt.get("type") == "text_chunk":
+                    self._pending_ai_text += evt.get("content") or ""
+                    self._turn_had_text = True
+                    self._stream_delta_chars += len(evt.get("content") or "")
+            self._cancel_event.set()  # consumer drops subsequent text_* of this turn
             if self._use_webview:
                 self._hide_stream_wrapper()
+            # Finalise whatever text the consumer already moved into the draft.
+            # The queue keeps draining afterwards: later text events are
+            # dropped (cancel is set), tool cards still land, and the turn_end
+            # event clears the cancel flag when it arrives.
             if self._pending_ai_text:
-                entry = {
-                    "type": "ai",
-                    "text": self._pending_ai_text,
-                    "timestamp": datetime.datetime.now().strftime("%H:%M:%S"),
-                }
+                entry = make_ai_entry(
+                    self._pending_ai_text,
+                    datetime.datetime.now().strftime("%H:%M:%S"),
+                )
                 self._conv_entries.append(entry)
                 self._pending_ai_text = ""
+                self._conv_version += 1
                 if self._use_webview and self._shell_loaded:
                     self._append_entry_js(entry, force_scroll_to_bottom=True)
                 else:
                     self._render_conversation(force_scroll_to_bottom=True)
             self._busy = False
-            self._cancel_event = None
             self._toggle_send_stop(busy=False)
             # Persist what has been finalised so far — the turn was cancelled
-            # mid-flight and on-exit autosave is best-effort only.
+            # mid-flight and on-exit autosave is best-effort only.  Note the
+            # cancel event is intentionally left SET here; _finish_turn (via
+            # the turn_end event) resets it once the turn is truly drained.
             err = self._save_session_to_disk()
             if err:
                 log.warning("Could not save session after stop: %s", err)
@@ -1676,7 +1710,7 @@ if _WX_AVAILABLE:
             # Messages are blocked while the backend is down.
             self._server_ready = False
             self._sync_send_button_state()
-            self._conv_entries.append(
+            self._append_entry(
                 {
                     "type": "status",
                     "text": "↺ Restarting MCP backend…",
@@ -1693,7 +1727,7 @@ if _WX_AVAILABLE:
 
         def _on_restart_done(self, ok: bool) -> None:
             if ok:
-                self._conv_entries.append(
+                self._append_entry(
                     {
                         "type": "status",
                         "text": "✅ Backend restarted successfully.",
@@ -1707,7 +1741,7 @@ if _WX_AVAILABLE:
                 self._init_llm_client()
                 self._on_server_started(True)
             else:
-                self._conv_entries.append(
+                self._append_entry(
                     {
                         "type": "status",
                         "text": "❌ Backend failed to restart.",
@@ -1896,7 +1930,7 @@ if _WX_AVAILABLE:
                 board = None
 
             if board is None:
-                self._conv_entries.append(
+                self._append_entry(
                     {
                         "type": "status",
                         "text": "⚠ No board is currently open. Open a .kicad_pcb file before running Auto Route.",
@@ -2007,7 +2041,7 @@ if _WX_AVAILABLE:
                 _pcbnew.ExportSpecctraDSN(board, dsn_path)
             except Exception as exc:
                 shutil.rmtree(tmp_dir, ignore_errors=True)
-                self._conv_entries.append(
+                self._append_entry(
                     {
                         "type": "autoroute_log",
                         "success": False,
@@ -2021,7 +2055,7 @@ if _WX_AVAILABLE:
 
             if not os.path.isfile(dsn_path):
                 shutil.rmtree(tmp_dir, ignore_errors=True)
-                self._conv_entries.append(
+                self._append_entry(
                     {
                         "type": "autoroute_log",
                         "success": False,
@@ -2038,7 +2072,7 @@ if _WX_AVAILABLE:
             self._set_status("⏳ Auto-routing in progress…", self._C_WARN)
             self.Layout()
 
-            self._conv_entries.append(
+            self._append_entry(
                 {
                     "type": "status",
                     "text": "⏳ Auto Route started — running FreeRouting in background…",
@@ -2138,7 +2172,7 @@ if _WX_AVAILABLE:
                 )
 
             # ---- Append collapsible log entry ----
-            self._conv_entries.append(
+            self._append_entry(
                 {
                     "type": "autoroute_log",
                     "success": success,
@@ -2181,8 +2215,12 @@ if _WX_AVAILABLE:
 
             # Clear conversation and LLM history for the new session.
             self._stream_timer.Stop()
-            self._stream_buffer.clear()
+            self._stream_events.clear()
+            self._event_gen += 1
+            self._turn_had_text = False
+            self._stream_delta_chars = 0
             self._conv_entries.clear()
+            self._conv_version += 1
             self._pending_ai_text = ""
             self._current_session_file = None
             self._render_conversation()
@@ -2205,7 +2243,10 @@ if _WX_AVAILABLE:
 
             Sessions are stamped with the currently open KiCad project
             (schema v2), so a session never silently leaks into a different
-            project.  The stamp reflects the project active at save time.
+            project.  The stamp is the project watch's last-confirmed project
+            (``_active_project``), not a live probe: at teardown KiCad is
+            already exiting and ``pcbnew``/window-title probes return None,
+            which would clobber the session's project ownership (issue #108).
 
             If ``_current_session_file`` is already set the existing file is
             overwritten; otherwise a new timestamped file is created and
@@ -2214,6 +2255,13 @@ if _WX_AVAILABLE:
             Returns an error string on failure, None on success.
             """
             from .. import session_store as _sstore
+
+            # No conversation changes since the last successful save — skip
+            # the write entirely (and do not touch current.json).  A teardown
+            # save on a plain close is then a no-op instead of rewriting the
+            # file with a fresh timestamp / project stamp.
+            if self._conv_version == self._saved_conv_version:
+                return None
 
             if self._current_session_file:
                 filename = self._current_session_file
@@ -2228,12 +2276,13 @@ if _WX_AVAILABLE:
                     if self._llm_client
                     else []
                 ),
-                self._collect_active_project(),
+                self._active_project,
             )
             err = _sstore.save_session(self._settings.config_dir, filename, payload)
             if err:
                 return err
             _sstore.update_current_link(self._settings.config_dir, filename)
+            self._saved_conv_version = self._conv_version
             return None
 
         def _on_load_session(self, event) -> None:
@@ -2297,11 +2346,23 @@ if _WX_AVAILABLE:
                 wx.MessageBox(f"Could not load session:\n{err}", "Error", wx.OK | wx.ICON_ERROR)
                 return False
 
-            # Restore state
+            # Restore state.  Bump the generation so events still in flight
+            # from a previous turn are dropped by the consumer; if a turn was
+            # unexpectedly busy, leave it cancelled and clear the UI state.
             self._stream_timer.Stop()
-            self._stream_buffer.clear()
+            self._stream_events.clear()
+            self._event_gen += 1
+            self._turn_had_text = False
+            self._stream_delta_chars = 0
             self._pending_ai_text = ""
             self._conv_entries = data.get("conv_entries", [])
+            # Loaded content already matches this file on disk: mark it as
+            # saved so a plain close (no user edits) does not rewrite it.
+            self._saved_conv_version = self._conv_version
+            if self._busy:
+                self._busy = False
+                self._cancel_event = None
+                self._toggle_send_stop(busy=False)
             if self._llm_client:
                 self._llm_client.set_history(data.get("llm_history", []))
             # Track which file is now active; point current.json at it.
@@ -2462,12 +2523,50 @@ if _WX_AVAILABLE:
                 )
                 return
             self._stream_timer.Stop()
-            self._stream_buffer.clear()
+            self._stream_events.clear()
+            self._event_gen += 1
+            self._turn_had_text = False
+            self._stream_delta_chars = 0
             self._conv_entries.clear()
+            self._conv_version += 1
             self._pending_ai_text = ""
             self._render_conversation()
             if self._llm_client:
                 self._llm_client.reset()
+
+        def _finalise_and_save_on_teardown(self) -> None:
+            """Persist the draft + conversation before the panel goes away.
+
+            Bug A: the old code only saved at send / turn-end / stop, so an
+            in-flight turn's answer was lost when KiCad closed mid-turn.
+            Everything the stream consumer already moved into the draft or
+            the archive is finalised and written to disk here.
+            """
+            # Drain any text chunks the producer already enqueued since the
+            # last timer tick — the timer cannot fire between here and
+            # Destroy(), so without this fold the saved answer would lose the
+            # tail received in the last tick window (Bug A's guarantee).
+            gen = self._event_gen
+            for evt in list(self._stream_events):
+                if evt.get("_gen") != gen:
+                    continue
+                if evt.get("type") == "text_chunk":
+                    self._pending_ai_text += evt.get("content") or ""
+                    self._turn_had_text = True
+                    self._stream_delta_chars += len(evt.get("content") or "")
+            if self._pending_ai_text:
+                self._conv_entries.append(
+                    make_ai_entry(
+                        self._pending_ai_text,
+                        datetime.datetime.now().strftime("%H:%M:%S"),
+                    )
+                )
+                self._pending_ai_text = ""
+                self._conv_version += 1
+            if any(e["type"] in ("user", "ai") for e in self._conv_entries):
+                err = self._save_session_to_disk()
+                if err:
+                    log.warning("Could not save session on teardown: %s", err)
 
         def _on_close(self, event) -> None:
             """Panel close: user X hides; watchdog force-close tears down.
@@ -2489,6 +2588,7 @@ if _WX_AVAILABLE:
                 # An in-flight turn ends with the panel: ask it to stop
                 # writing before we tear down.
                 self._cancel_event.set()
+            self._finalise_and_save_on_teardown()
             self._server_mgr.stop()
             self.Destroy()
 
@@ -2514,6 +2614,7 @@ if _WX_AVAILABLE:
             if event.GetEventObject() is self:
                 if self._project_watch_timer is not None:
                     self._project_watch_timer.Stop()
+                self._finalise_and_save_on_teardown()
                 self._server_mgr.stop()
             event.Skip()
 
@@ -2563,6 +2664,7 @@ if _WX_AVAILABLE:
                 return
 
             self._conv_entries = conv
+            self._saved_conv_version = self._conv_version
             self._current_session_file = os.path.basename(path)
             if self._llm_client:
                 self._llm_client.set_history(history)
@@ -2729,7 +2831,7 @@ if _WX_AVAILABLE:
             self._js_running = False
             self._stream_wrapper_visible = False
             self._page_watchdog.Stop()
-            self._conv_entries.append(
+            self._append_entry(
                 {
                     "type": "status",
                     "text": f"⚠ WebView error: {description}. Retrying…",
