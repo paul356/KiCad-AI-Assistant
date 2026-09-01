@@ -191,27 +191,28 @@ def _collect_selected_symbols(
         return out
     for sym in symbols:
         try:
-            sx = float(sym.at[0])
-            sy = float(sym.at[1])
-            rot = int(sym.at[2]) if len(sym.at) >= 3 else 0
-            lib_id_raw = str(sym.lib_id)
+            at = _parsed_value_list(getattr(sym, "at", None))
+            sx = float(at[0])
+            sy = float(at[1])
+            rot = int(at[2]) if len(at) >= 3 else 0
+            lib_id_raw = _parsed_value_str(getattr(sym, "lib_id", None))
             ref = None
             value = None
-            uuid = sym.uuid if hasattr(sym, "uuid") else None
+            uuid = _parsed_value_str(getattr(sym, "uuid", None))
             for prop in sym.property:
                 if prop.name == "Reference":
                     ref = prop.value
                 elif prop.name == "Value":
                     value = prop.value
-        except (AttributeError, ValueError, TypeError):
+        except (AttributeError, ValueError, TypeError, IndexError):
             continue
         if not _point_in_bbox(sx, sy, bx, by, bw, bh):
             continue
-        lib_id = _normalise_lib_id(lib_id_raw)
         out.append(
             {
                 "at": [sx - dx, sy - dy, rot],
-                "lib_id": lib_id,
+                "lib_id": lib_id_raw,  # raw resolved form (e.g. "Device:R_Small") for lib lookup
+                "lib_id_symdir": _normalise_lib_id(lib_id_raw),
                 "reference": ref or "",
                 "value": value or "",
                 "uuid": uuid,
@@ -231,37 +232,119 @@ def _normalise_lib_id(lib_id: str) -> str:
     resolve inside the snippet.  The symdir form is portable; the resolved
     form would force the host project to have the same library alias.
     """
+    if not lib_id:
+        return lib_id
     if ":" in lib_id:
         return lib_id.split(":", 1)[1]
     return lib_id
 
 
+def _parsed_value_str(value: Any) -> str:
+    """Return the actual string value held by a skip ``ParsedValue``.
+
+    skip wraps leaf tokens in a ``ParsedValue`` whose ``__str__`` is the
+    debug-style ``"name = value"`` form (because the wrapper carries the
+    source-tree name alongside the value).  Callers that want to embed the
+    raw string in a new S-expression need ``.value`` — which the wrapper
+    exposes as a plain attribute — and a ``str()`` fallback for already-plain
+    values.
+    """
+    if value is None:
+        return ""
+    value_attr = getattr(value, "value", None)
+    if isinstance(value_attr, (str, int, float)):
+        return str(value_attr)
+    s = str(value)
+    if " = " in s:
+        return s.split(" = ", 1)[1].strip()
+    return s
+
+
+def _parsed_value_list(value: Any) -> list:
+    """Return the actual list value held by a skip ``ParsedValue``.
+
+    Like ``_parsed_value_str`` but for compound values such as
+    ``(at x y rot)``.  Returns an empty list on failure so callers can
+    skip the symbol cleanly.
+    """
+    if value is None:
+        return []
+    value_attr = getattr(value, "value", None)
+    if isinstance(value_attr, list):
+        return list(value_attr)
+    # Try to coerce a sexpdata list/tuple into a plain list.
+    try:
+        return list(value)
+    except TypeError:
+        return []
+
+
 def _extract_lib_symbols(sch: Any, lib_ids: set[str]) -> list[str]:
-    """Return raw S-expression text of every (symbol ...) block matching lib_ids."""
+    """Serialise every parent lib_symbol whose lib_id is in *lib_ids*.
+
+    Returns one S-expression string per match, including all child unit
+    definitions, so the snippet is fully self-contained when pasted.
+
+    skip internals:
+      - ``sch.lib_symbols._libsyms_by_id`` is a dict mapping the *resolved*
+        lib_id (``"Device:R_Small"``) → LibSymbol.
+      - ``sym.raw`` returns a ``sexpdata`` list (parent + children)
+      - ``sym.sexp`` / ``sym.name`` are ``None`` — do not call them
+
+    The caller's ``lib_ids`` may be in symdir form (``"R_Small"``) because
+    that is what we write into the snippet.  We match either form against
+    the library's resolved-form keys.
+
+    ``sexpdata.dumps(sym.raw)`` produces the KiCad-format string.
+    """
     if not lib_ids:
         return []
-    blocks: list[str] = []
+    import sexpdata
+
     try:
         ls = sch.lib_symbols
     except AttributeError:
-        return blocks
-    try:
-        sym_iter = ls.symbol if hasattr(ls, "symbol") else ls
-    except AttributeError:
-        return blocks
-    for sym in sym_iter:
+        return []
+    by_id = getattr(ls, "_libsyms_by_id", None) or {}
+
+    # Build a set of every form (resolved, symdir, bare) we might match.
+    wanted: set[str] = set(lib_ids)
+    for lib_id in list(lib_ids):
+        wanted.add(lib_id)
+        if ":" in lib_id:
+            wanted.add(lib_id.split(":", 1)[1])
+
+    blocks: list[str] = []
+    for lib_id, sym in by_id.items():
+        if lib_id not in wanted:
+            continue
         try:
-            name = str(sym.name) if hasattr(sym, "name") else None
+            raw = sym.raw
         except Exception:
-            name = None
-        if name is None:
             continue
-        if name not in lib_ids:
+        if raw is None:
             continue
         try:
-            blocks.append(sym.sexp)
-        except AttributeError:
-            pass
+            text = sexpdata.dumps(raw)
+        except Exception:
+            continue
+        # Rewrite the resolved-form lib_id (``"Device:R_Small"``) into the
+        # symdir form (``"R_Small"``) so the snippet does not depend on the
+        # host project's library-alias table.  Only rewrite at the symbol's
+        # own name token; child unit names (``"R_Small_0_1"`` etc.) are
+        # unaffected because they don't carry a library prefix.
+        if ":" in lib_id:
+            symdir = lib_id.split(":", 1)[1]
+            # Match the resolved form as the first quoted token after
+            # ``(symbol `` — anything else (child unit names, etc.) keeps
+            # its original text.
+            text = re.sub(
+                r'(\(symbol ")' + re.escape(lib_id) + r'(")',
+                r"\1" + symdir + r"\2",
+                text,
+                count=1,
+            )
+        blocks.append(text)
     return blocks
 
 
@@ -306,10 +389,13 @@ def _format_label(lbl: dict[str, Any]) -> str:
 
 def _format_symbol(s: dict[str, Any]) -> str:
     ax, ay, rot = s["at"]
-    lib_id = _sexp_escape(s["lib_id"])
+    # Prefer the symdir form for portability across host projects; fall back
+    # to the raw (resolved) form if the symdir key wasn't precomputed.
+    lib_id = _sexp_escape(s.get("lib_id_symdir") or s.get("lib_id") or "")
     ref = _sexp_escape(s["reference"] or "")
     value = _sexp_escape(s["value"] or "")
-    uuid_str = f' (uuid "{_sexp_escape(s["uuid"])}")' if s.get("uuid") else ""
+    uuid_raw = s.get("uuid") or ""
+    uuid_str = f' (uuid "{_sexp_escape(uuid_raw)}")' if uuid_raw else ""
     return (
         f'(symbol (lib_id "{lib_id}") (at {ax:.4f} {ay:.4f} {rot}) (unit 1) '
         f"(exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no) "
@@ -464,8 +550,11 @@ def register_snippet_tools(mcp: FastMCP) -> None:
                 sch, bbox_x, bbox_y, bbox_width, bbox_height, dx, dy
             )
 
-            # Collect the set of lib_ids we need to embed.
-            lib_ids = {s["lib_id"] for s in symbols}
+            # Collect the set of lib_ids we need to embed.  Use the raw
+            # (resolved) form here so the lookup against the library's
+            # _libsyms_by_id dict works; _extract_lib_symbols also accepts
+            # symdir-form as a fallback.
+            lib_ids = {s["lib_id"] for s in symbols if s.get("lib_id")}
             lib_blocks = _extract_lib_symbols(sch, lib_ids)
 
             notes: list[str] = []
@@ -546,12 +635,18 @@ def register_snippet_tools(mcp: FastMCP) -> None:
             raw = f.read()
 
         counts = {
-            "wires": len(re.findall(r"^\(wire\b", raw, flags=re.MULTILINE)),
-            "junctions": len(re.findall(r"^\(junction\b", raw, flags=re.MULTILINE)),
-            "labels": len(re.findall(r"^\(label\b", raw, flags=re.MULTILINE)),
-            "symbols": len(re.findall(r"^\(symbol\b", raw, flags=re.MULTILINE)),
+            "wires": len(re.findall(r"\(wire\b", raw)),
+            "junctions": len(re.findall(r"\(junction\b", raw)),
+            "labels": len(re.findall(r"\(label\b", raw)),
+            # Match `(symbol` at start of a line (lib_symbols section) OR
+            # `(symbol (lib_id ...)` (placed symbol with leading indent).
+            "symbols": len(
+                re.findall(
+                    r"(?:^|\s)\(symbol\b", raw, flags=re.MULTILINE
+                )
+            ),
             "lib_symbols": len(
-                re.findall(r'^\(symbol "([^"]+)"', raw, flags=re.MULTILINE)
+                re.findall(r'\(symbol "([^"]+)"', raw)
             ),
         }
 
