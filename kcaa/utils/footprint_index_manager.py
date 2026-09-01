@@ -207,6 +207,39 @@ class FootprintIndexManager:
         )
         return stats
 
+    def index_library(
+        self,
+        library_name: str,
+        dir_path: str,
+        description: str = "",
+        raw_uri: str = "",
+    ) -> int:
+        """Index exactly one ``.pretty`` directory into the database.
+
+        Narrow update for the PCB → library export tools: indexes a single
+        library directory without traversing the effective library list, so
+        project-local fp-lib-table libraries are never pulled into the
+        database by these tools.  Change detection (checksum) is shared with
+        ``sync``.
+
+        :returns: Number of footprints stored, or -1 on failure.
+        """
+        if not os.path.isdir(dir_path):
+            log.warning("index_library: not a directory: %s", dir_path)
+            return -1
+        try:
+            new_checksum = self._compute_dir_checksum(dir_path)
+        except OSError as exc:
+            log.warning("index_library: cannot fingerprint %s: %s", dir_path, exc)
+            return -1
+        return self._index_library(
+            library_name,
+            raw_uri or dir_path,
+            dir_path,
+            description,
+            new_checksum,
+        )
+
     # ------------------------------------------------------------------
     # Search / lookup passthrough
     # ------------------------------------------------------------------

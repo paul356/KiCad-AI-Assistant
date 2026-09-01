@@ -157,6 +157,14 @@ TOOL_POLICIES: dict[str, ToolPolicy] = {
     "list_footprint_libraries": ToolPolicy(kind="query"),
     "search_footprints": ToolPolicy(kind="query"),
     "get_footprint_details": ToolPolicy(kind="query"),
+    # PCB → library export tools
+    "find_missing_footprints": ToolPolicy(kind="query"),
+    "create_3rdparty_footprint_library": ToolPolicy(kind="file_mutation"),
+    "add_footprints_to_3rdparty_library": ToolPolicy(
+        kind="file_mutation",
+        path_arg="pcb_path",
+        auto_snapshot=True,
+    ),
     # PCB query tools
     "get_board_info": ToolPolicy(kind="query"),
     "list_footprints": ToolPolicy(kind="query"),

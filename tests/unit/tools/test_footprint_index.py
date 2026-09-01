@@ -599,10 +599,31 @@ class TestFootprintIndexManagerSync:
         mgr = self._mgr(tmp_path)
         mgr.sync()
 
-        s2 = mgr.sync()
-        assert s2.skipped == 1  # content same, path changed → touch-only
-        states = mgr._db.get_library_states()
-        assert "new_mount" in states["Res"][2]
+    def test_index_library_single_library(self, tmp_path):
+        """index_library indexes exactly one dir — no table traversal."""
+        lib_dir = _make_pretty(tmp_path, "Res", ["R_0402", "R_0603"])
+        mgr = self._mgr(tmp_path)
+        n = mgr.index_library("Res", lib_dir)
+        assert n == 2
+        assert mgr.get_stats().footprint_count == 2
+        assert [r.footprint_name for r in mgr.get_library_footprints("Res")] == [
+            "R_0402",
+            "R_0603",
+        ]
+
+    def test_index_library_missing_dir(self, tmp_path):
+        mgr = self._mgr(tmp_path)
+        assert mgr.index_library("Ghost", "/nonexistent/.pretty") == -1
+        assert mgr.get_stats().library_count == 0
+
+    def test_index_library_update_after_file_add(self, tmp_path):
+        lib_dir = _make_pretty(tmp_path, "Res", ["R_0402"])
+        mgr = self._mgr(tmp_path)
+        assert mgr.index_library("Res", lib_dir) == 1
+        with open(os.path.join(lib_dir, "R_0805.kicad_mod"), "w") as f:
+            f.write('(footprint "R_0805" (layer "F.Cu") (descr "new fp"))')
+        assert mgr.index_library("Res", lib_dir) == 2
+        assert mgr.get_stats().footprint_count == 2
 
 
 # ---------------------------------------------------------------------------

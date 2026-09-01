@@ -13,12 +13,28 @@ from typing import Any
 
 from fastmcp import Context, FastMCP
 
+from kcaa.utils.config import config
 from kcaa.utils.footprint_index_manager import get_footprint_index_manager
+from kcaa.utils.fp_lib_table_utils import (
+    get_user_fp_lib_table_path,
+    register_library_in_table,
+    sanitize_lib_nickname,
+)
+from kcaa.utils.pcb_footprint_utils import (
+    get_fp_property,
+    get_pcb_version,
+    iter_footprint_nodes,
+    normalize_footprint_for_library,
+    split_footprint_header,
+    write_footprint_mod,
+)
 from kcaa.utils.pcb_library_utils import (
     build_effective_library_list,
     find_fp_lib_tables,
     parse_kicad_mod,
+    scan_footprint_library,
 )
+from kcaa.utils.pcb_sexp_utils import load_pcb
 
 log = logging.getLogger(__name__)
 
@@ -363,6 +379,176 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
         info["file_path"] = mod_path
         return info
 
+    @mcp.tool()
+    async def find_missing_footprints(
+        pcb_path: str,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """List board footprints that exist in no indexed footprint library.
+
+        Read-only: compares the footprints embedded in the board against the
+        effective fp-lib-table library list (project-local table plus global
+        user table, including system libraries).  Footprints with no
+        same-named match anywhere are candidates for export into a
+        3rdparty library.
+
+        Args:
+            pcb_path: Absolute path to the ``.kicad_pcb`` file.  Its
+                directory is treated as the project directory (project-local
+                fp-lib-table and ``${KIPRJMOD}`` URIs are resolved from it).
+            ctx: MCP context (unused).
+
+        Returns:
+            dict with ``missing`` (list of {name, library, reference, value}),
+            ``missing_count``, ``existing`` and ``existing_count``; plus
+            ``error`` on failure.
+        """
+        try:
+            _, footprints, _ = _collect_board_footprints(pcb_path)
+            existing = _collect_existing_names(pcb_path)
+            missing = [fp for fp in footprints if fp["name"] not in existing]
+            return {
+                "missing": missing,
+                "missing_count": len(missing),
+                "existing": sorted(existing),
+                "existing_count": len(existing),
+            }
+        except Exception as exc:
+            log.error("find_missing_footprints failed: %s", exc, exc_info=True)
+            return {"error": str(exc)}
+
+    @mcp.tool()
+    async def create_3rdparty_footprint_library(
+        name: str,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Create and register a new 3rdparty footprint library.
+
+        Creates ``<name>.pretty`` under ``${KICAD10_3RD_PARTY}/footprints``,
+        registers it in the global user fp-lib-table (``.bak`` backup,
+        idempotent), and indexes exactly that library in the footprint
+        database so library-list and search tools see it immediately.
+        Project-local fp-lib-table files are never modified.
+
+        Args:
+            name: New library nickname (sanitized to fp-lib-table-safe
+                characters).
+            ctx: MCP context (unused).
+
+        Returns:
+            dict with ``library``, ``path``, ``table_path``, ``registered``,
+            ``indexed`` (int, footprints indexed; -1 on failure); plus
+            ``error`` on failure.
+        """
+        try:
+            nickname = sanitize_lib_nickname(name)
+            if not nickname:
+                return {"error": f"Invalid library name: {name!r}"}
+            libs = build_effective_library_list(None)
+            by_nickname = {lib["nickname"] for lib in libs}
+            if nickname in by_nickname:
+                return {
+                    "error": (
+                        f"Library '{nickname}' already exists in fp-lib-table; "
+                        "use add_footprints_to_3rdparty_library to export into it."
+                    )
+                }
+            library_dir = os.path.join(_3rd_party_footprints_dir(), f"{nickname}.pretty")
+            os.makedirs(library_dir, exist_ok=True)
+            ver_tag = config.kicad_version.split(".")[0]
+            uri = f"${{KICAD{ver_tag}_3RD_PARTY}}/footprints/{nickname}.pretty"
+            table_path = get_user_fp_lib_table_path()
+            result = register_library_in_table(
+                table_path,
+                nickname,
+                uri,
+                description=f"Created by KiCad MCP footprint export ({nickname})",
+            )
+            indexed = _index_library_entry(nickname, library_dir, raw_uri=uri)
+            return {
+                "library": nickname,
+                "path": library_dir,
+                "table_path": table_path,
+                "registered": bool(result.get("registered")),
+                "indexed": indexed,
+            }
+        except Exception as exc:
+            log.error("create_3rdparty_footprint_library failed: %s", exc, exc_info=True)
+            return {"error": str(exc)}
+
+    @mcp.tool()
+    async def add_footprints_to_3rdparty_library(
+        pcb_path: str,
+        library: str,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Export board footprints missing from libraries into a 3rdparty library.
+
+        Writes each board-embedded footprint that exists in no indexed library
+        as a ``.kicad_mod`` file into the target library directory
+        (footprints already present there are skipped, never overwritten),
+        then updates the footprint database for exactly that library.
+        Project-local fp-lib-table libraries are never indexed by this tool.
+        The board file is never modified.
+
+        Args:
+            pcb_path: Absolute path to the ``.kicad_pcb`` file.  Its
+                directory is treated as the project directory (project-local
+                fp-lib-table and ``${KIPRJMOD}`` URIs are resolved from it).
+            library: Nickname of the target 3rdparty library, as registered
+                in fp-lib-table.
+            ctx: MCP context for progress reporting.
+
+        Returns:
+            dict with ``library``, ``library_path``, ``exported`` (list of
+            paths), ``exported_count``, ``skipped`` (list of {name, reason}),
+            ``skipped_count``, ``indexed``; plus ``error`` on failure.
+        """
+        try:
+            nodes, footprints, version = _collect_board_footprints(pcb_path)
+            library_dir = _resolve_library_dir(library, pcb_path)
+            existing = _collect_existing_names(pcb_path)
+            if ctx:
+                await ctx.info(
+                    f"Exporting missing footprints to {library_dir} "
+                    f"({len(nodes)} board footprints, {len(existing)} indexed names)"
+                )
+
+            exported: list[str] = []
+            skipped: list[dict[str, str]] = []
+            seen_in_run: set[str] = set()
+            for node in nodes:
+                lib, name = split_footprint_header(node)
+                if name in existing or name in seen_in_run:
+                    reason = "already in library" if name in existing else "duplicate in run"
+                    skipped.append({"name": name, "reason": reason})
+                    continue
+                try:
+                    path = write_footprint_mod(
+                        library_dir,
+                        name,
+                        normalize_footprint_for_library(node, version, library),
+                    )
+                except FileExistsError:
+                    skipped.append({"name": name, "reason": "already in library"})
+                    continue
+                exported.append(path)
+                seen_in_run.add(name)
+
+            indexed = _index_library_entry(library, library_dir)
+            return {
+                "library": library,
+                "library_path": library_dir,
+                "exported": exported,
+                "exported_count": len(exported),
+                "skipped": skipped,
+                "skipped_count": len(skipped),
+                "indexed": indexed,
+            }
+        except Exception as exc:
+            log.error("add_footprints_to_3rdparty_library failed: %s", exc, exc_info=True)
+            return {"error": str(exc)}
+
 
 async def _live_search_footprints(
     query: str,
@@ -420,3 +606,97 @@ async def _live_search_footprints(
         "truncated": len(matches) >= max_results,
         "source": "live_scan",
     }
+
+
+# ---------------------------------------------------------------------------
+# PCB → 3rdparty library export helpers
+# ---------------------------------------------------------------------------
+
+
+def _3rd_party_footprints_dir() -> str:
+    """Return ``${KICAD10_3RD_PARTY}/footprints`` (resolved, absolute)."""
+    return os.path.join(config.kicad_3rd_party, "footprints")
+
+
+def _resolve_library_dir(library: str, pcb_path: str | None) -> str:
+    """Resolve a registered library nickname to its ``.pretty`` directory.
+
+    :raises ValueError: When the nickname is not in fp-lib-table, resolves to
+        a missing directory, or is read-only.
+    """
+    libs = build_effective_library_list(pcb_path)
+    by_nickname = {lib["nickname"]: lib for lib in libs}
+    if library not in by_nickname:
+        raise ValueError(
+            f"Library '{library}' not found in fp-lib-table. "
+            "Create it first with create_3rdparty_footprint_library."
+        )
+    lib_dir = by_nickname[library].get("uri", "")
+    if not lib_dir or not os.path.isdir(lib_dir):
+        raise ValueError(f"Library '{library}' resolves to a missing directory: {lib_dir}")
+    if not os.access(lib_dir, os.W_OK):
+        raise ValueError(
+            f"Library '{library}' is read-only or not writable: {lib_dir}. "
+            "Pick a writable 3rdparty library or create a new one."
+        )
+    return lib_dir
+
+
+def _collect_existing_names(pcb_path: str | None) -> set[str]:
+    """Return every footprint name already present in indexed libraries.
+
+    Reads the effective library list (project-local table plus global user
+    table, with ``${KIPRJMOD}`` / ``KICAD*`` URI expansion) and live-scans
+    each ``.pretty`` directory.  Purely in-memory — nothing is written to
+    the footprint database.
+    """
+    names: set[str] = set()
+    for lib in build_effective_library_list(pcb_path):
+        uri = lib.get("uri", "")
+        if uri and os.path.isdir(uri):
+            names.update(scan_footprint_library(uri))
+    return names
+
+
+def _collect_board_footprints(pcb_path: str) -> tuple[list[Any], list[dict[str, Any]], int]:
+    """Load the board and return (nodes, footprints dicts, version)."""
+    data = load_pcb(pcb_path)
+    version = get_pcb_version(data)
+    nodes: list[list[Any]] = []
+    footprints: list[dict[str, Any]] = []
+    for node in iter_footprint_nodes(data):
+        lib, name = split_footprint_header(node)
+        reference = get_fp_property(node, "Reference") or ""
+        value = get_fp_property(node, "Value") or ""
+        footprints.append(
+            {
+                "name": name,
+                "library": lib or "",
+                "reference": reference,
+                "value": value,
+            }
+        )
+        nodes.append(node)
+    return nodes, footprints, version
+
+
+def _index_library_entry(
+    library: str,
+    library_dir: str,
+    raw_uri: str = "",
+) -> int:
+    """Index exactly one library directory into the footprint database.
+
+    Narrow update (no full-table traversal): project-local fp-lib-table
+    libraries are never pulled into the database by this path.  Returns the
+    number of footprints stored, or -1 on failure.
+    """
+    try:
+        return get_footprint_index_manager(None).index_library(
+            library,
+            library_dir,
+            raw_uri=raw_uri,
+        )
+    except Exception as exc:
+        log.error("Footprint index update failed for %s: %s", library, exc, exc_info=True)
+        return -1
