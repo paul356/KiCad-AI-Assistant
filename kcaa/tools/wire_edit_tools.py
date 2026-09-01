@@ -255,11 +255,13 @@ def _segments_intersect(
     cx, cy, dx, dy = line
     # One horizontal, one vertical, crossing strictly interior to both.
     if abs(ay - by) < 1e-9 and abs(ax - bx) > 1e-9 and abs(cx - dx) < 1e-9 and abs(cy - dy) > 1e-9:
+        # Horizontal seg + vertical line. Crossing at (line.x, seg.y).
         vx, hy = cx, ay
         return _point_in_interior(vx, hy, ax, ay, bx, by, tol) and _point_in_interior(
             vx, hy, cx, cy, cx, dy, tol
         )
-    if abs(cx - dx) < 1e-9 and abs(cy - dy) > 1e-9 and abs(ay - by) < 1e-9 and abs(ax - bx) > 1e-9:
+    if abs(ax - bx) < 1e-9 and abs(ay - by) > 1e-9 and abs(cy - dy) < 1e-9 and abs(cx - dx) > 1e-9:
+        # Vertical seg + horizontal line. Crossing at (seg.x, line.y).
         vx, hy = ax, cy
         return _point_in_interior(vx, hy, cx, cy, dx, dy, tol) and _point_in_interior(
             vx, hy, ax, ay, ax, by, tol
@@ -526,6 +528,39 @@ def _segments_overlap(
         lo2, hi2 = min(cy, dy), max(cy, dy)
         return min(hi1, hi2) - max(lo1, lo2) > tol
     return False
+
+
+def _segment_crossing_point(
+    seg: tuple[float, float, float, float],
+    other: tuple[float, float, float, float],
+) -> tuple[float, float]:
+    """Return the geometric intersection of two axis-aligned segments.
+
+    Assumes the caller has already confirmed the segments intersect (via
+    ``_segments_intersect`` or ``_segments_overlap``).  Returns the
+    midpoint for a collinear overlap, or the unique crossing point for
+    a perpendicular T-intersection.  Never raises — degenerate inputs
+    fall back to the midpoint of the first segment.
+    """
+    ax, ay, bx, by = seg
+    cx, cy, dx, dy = other
+    # Perpendicular crossing: one is horizontal, one is vertical.
+    if abs(ay - by) < 1e-9 and abs(cy - dy) > 1e-9 and abs(cx - dx) < 1e-9:
+        return (cx, ay)
+    if abs(ax - bx) < 1e-9 and abs(ay - by) > 1e-9 and abs(cx - dx) < 1e-9:
+        return (ax, cy)
+    # Both horizontal — overlap midpoint.
+    if abs(ay - by) < 1e-9:
+        lo = max(min(ax, bx), min(cx, dx))
+        hi = min(max(ax, bx), max(cx, dx))
+        return ((lo + hi) / 2, ay)
+    # Both vertical — overlap midpoint.
+    if abs(ax - bx) < 1e-9:
+        lo = max(min(ay, by), min(cy, dy))
+        hi = min(max(ay, by), max(cy, dy))
+        return (ax, (lo + hi) / 2)
+    # Fallback (shouldn't be reached if caller verified intersection).
+    return ((ax + bx) / 2, (ay + by) / 2)
 
 
 def _route_overlaps_wires(
@@ -1839,6 +1874,246 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
                 "start": {"x": start_x, "y": start_y},
                 "end": {"x": end_x, "y": end_y},
             },
+            "junctions_added": junctions_added,
+            "file_modified": schematic_path,
+            "backup_path": schematic_path + ".bak",
+        }
+
+    @mcp.tool()
+    async def draw_wire_segments(
+        schematic_path: str,
+        segments: list[dict[str, float]],
+        auto_junctions: bool = True,
+        fail_on_overlap: bool = False,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Draw an explicit list of axis-aligned wire segments — no autorouter.
+
+        Each entry in ``segments`` is a dict with keys ``start_x``, ``start_y``,
+        ``end_x``, ``end_y`` (floats, mm, KiCad screen convention +Y down).
+        Each must be exactly horizontal (``start_y == end_y``) or vertical
+        (``start_x == end_x``). Diagonal segments are rejected up front.
+
+        This is the **explicit placement** tool. The caller specifies every
+        corner and the router does **not**:
+          * No obstacle avoidance — segments may run on top of pin symbols
+            or other wires if you put them there.
+          * No merging — collinear consecutive segments stay as separate
+            ``(wire ...)`` entries in the file.
+          * No smart lead-out — segments are written at the exact coordinates
+            given.
+
+        The LLM (or the user) is responsible for designing a valid path.
+
+        Junction behaviour (controlled by ``auto_junctions``, default True):
+
+        * If a segment endpoint lies on the **interior** of an existing wire
+          (or another newly added segment), a junction is placed and that
+          wire is split at the endpoint.
+        * If an endpoint coincides with an existing wire endpoint or a pin
+          that already has a wire, a junction is placed automatically.
+        * Set ``auto_junctions=False`` to disable both behaviours and write
+          only the segments themselves.
+
+        Collision behaviour (controlled by ``fail_on_overlap``, default False):
+
+        * When False, segments that overlap existing wires are still written
+          (the existing wire is split at every overlap point so KiCad's
+          ERC is happy).
+        * When True, any overlap is reported as an error and the schematic
+          is left untouched.
+
+        A backup (.kicad_sch.bak) is written before saving.
+
+        Args:
+            schematic_path: Absolute path to the target .kicad_sch file.
+            segments: List of wire specs. Each must contain ``start_x``,
+                ``start_y``, ``end_x``, ``end_y`` (floats, mm). Zero-length
+                segments are silently skipped.
+            auto_junctions: Place junctions where endpoints meet existing wires
+                or pins (default True).
+            fail_on_overlap: Return an error instead of splitting overlapping
+                existing wires (default False).
+
+        Returns:
+            dict with keys:
+                success (bool),
+                segments_requested (int),
+                segments_written (int),
+                segments_skipped (int)        -- zero-length or invalid entries
+                junctions_added (list of {x, y}),
+                overlaps_found (list of {x, y}) -- only when fail_on_overlap=True
+                file_modified (str),
+                backup_path (str).
+        """
+        if not schematic_path.endswith(".kicad_sch"):
+            return {"error": f"Not a .kicad_sch file: {schematic_path!r}"}
+        if not os.path.isfile(schematic_path):
+            return {"error": f"Schematic file not found: {schematic_path!r}"}
+        if not segments:
+            return {"error": "The 'segments' list must not be empty"}
+
+        # ---- Validate input ----
+        parsed: list[tuple[float, float, float, float]] = []
+        skipped = 0
+        invalid: list[str] = []
+        for i, spec in enumerate(segments):
+            try:
+                sx = float(spec["start_x"])
+                sy = float(spec["start_y"])
+                ex = float(spec["end_x"])
+                ey = float(spec["end_y"])
+            except (KeyError, TypeError, ValueError) as exc:
+                return {"error": f"Segment {i} is invalid: {exc}"}
+            for name, val in [("start_x", sx), ("start_y", sy), ("end_x", ex), ("end_y", ey)]:
+                if not math.isfinite(val):
+                    return {
+                        "error": f"Segment {i}: '{name}' must be finite (got {val})"
+                    }
+            if sx == ex and sy == ey:
+                skipped += 1
+                continue
+            if not (abs(sx - ex) < 1e-9 or abs(sy - ey) < 1e-9):
+                invalid.append(
+                    f"Segment {i} is diagonal: ({sx},{sy}) -> ({ex},{ey}). "
+                    "draw_wire_segments requires horizontal or vertical segments."
+                )
+                continue
+            parsed.append((sx, sy, ex, ey))
+
+        if invalid:
+            return {"error": "Invalid segments: " + "; ".join(invalid)}
+        if not parsed:
+            return {"error": "All segments were zero-length or invalid"}
+
+        # ---- Open schematic ----
+        try:
+            sch = safe_schematic(schematic_path)
+        except Exception as exc:
+            return {"error": f"Failed to open schematic: {exc}"}
+
+        tol = _PIN_COLLISION_TOL
+        junctions_added: list[dict[str, float]] = []
+        overlaps_found: list[dict[str, float]] = []
+        segments_written = 0
+
+        try:
+            existing_wires_pre = _collect_existing_wires(sch)
+
+            # ---- Split parsed into "already drawn" (skip) vs "new" (process) ----
+            # The already-drawn check runs BEFORE any schematic mutation so a
+            # second call with the same segments is a true no-op (no new junctions,
+            # no new wires, no save).  Matches either direction.
+            new_segments: list[tuple[float, float, float, float]] = []
+            for sx, sy, ex, ey in parsed:
+                already = any(
+                    (
+                        abs(ax - sx) <= tol
+                        and abs(ay - sy) <= tol
+                        and abs(bx - ex) <= tol
+                        and abs(by - ey) <= tol
+                    )
+                    or (
+                        abs(ax - ex) <= tol
+                        and abs(ay - ey) <= tol
+                        and abs(bx - sx) <= tol
+                        and abs(by - sy) <= tol
+                    )
+                    for ax, ay, bx, by in existing_wires_pre
+                )
+                if already:
+                    continue
+                new_segments.append((sx, sy, ex, ey))
+
+            # ---- Optional pre-check for overlaps (only on new segments) ----
+            if fail_on_overlap:
+                for sx, sy, ex, ey in new_segments:
+                    for wax, way, wbx, wby in existing_wires_pre:
+                        if _segments_intersect(
+                            (sx, sy, ex, ey), (wax, way, wbx, wby), tol
+                        ):
+                            ix, iy = _segment_crossing_point(
+                                (sx, sy, ex, ey), (wax, way, wbx, wby)
+                            )
+                            overlaps_found.append({"x": ix, "y": iy})
+                if overlaps_found:
+                    return {
+                        "error": (
+                            f"fail_on_overlap=True and {len(overlaps_found)} overlap(s) "
+                            "detected with existing wires. No segments written."
+                        ),
+                        "overlaps_found": overlaps_found,
+                    }
+
+            # ---- Pre-place junctions (optional, only for new segments) ----
+            if auto_junctions and new_segments:
+                # Collect unique junction candidates: every endpoint of every
+                # new segment, plus every perpendicular crossing point between
+                # a new segment and an existing wire, plus every crossing point
+                # between two new segments.  Each unique point becomes at most
+                # one junction; the helper handles "junction already exists"
+                # silently.
+                jx_set: set[tuple[float, float]] = set()
+                for sx, sy, ex, ey in new_segments:
+                    jx_set.add((sx, sy))
+                    jx_set.add((ex, ey))
+
+                # Perpendicular crossings between new segments and existing wires.
+                for sx, sy, ex, ey in new_segments:
+                    for wax, way, wbx, wby in existing_wires_pre:
+                        if _segments_intersect(
+                            (sx, sy, ex, ey), (wax, way, wbx, wby), tol
+                        ):
+                            ix, iy = _segment_crossing_point(
+                                (sx, sy, ex, ey), (wax, way, wbx, wby)
+                            )
+                            jx_set.add((round(ix, 4), round(iy, 4)))
+
+                # Crossings among the new segments themselves (e.g. two L-shapes
+                # sharing an interior point).  O(n^2) over *new_segments*.
+                for i in range(len(new_segments)):
+                    sx_i, sy_i, ex_i, ey_i = new_segments[i]
+                    for j in range(i + 1, len(new_segments)):
+                        sx_j, sy_j, ex_j, ey_j = new_segments[j]
+                        if _segments_intersect(
+                            (sx_i, sy_i, ex_i, ey_i),
+                            (sx_j, sy_j, ex_j, ey_j),
+                            tol,
+                        ):
+                            ix, iy = _segment_crossing_point(
+                                (sx_i, sy_i, ex_i, ey_i),
+                                (sx_j, sy_j, ex_j, ey_j),
+                            )
+                            jx_set.add((round(ix, 4), round(iy, 4)))
+
+                for jx, jy in jx_set:
+                    is_interior = any(
+                        _point_on_open_segment(jx, jy, ax, ay, bx, by, tol)
+                        for ax, ay, bx, by in existing_wires_pre
+                    )
+                    needs = is_interior or (
+                        _wire_connected_at(sch, jx, jy)
+                        and not _junction_exists_at(sch, jx, jy)
+                    )
+                    if needs and _add_junction_and_split(sch, jx, jy):
+                        junctions_added.append({"x": jx, "y": jy})
+
+            # ---- Write each new segment verbatim ----
+            for sx, sy, ex, ey in new_segments:
+                w = sch.wire.new()
+                w.start_at([sx, sy])
+                w.end_at([ex, ey])
+                segments_written += 1
+
+            save_schematic(schematic_path, sch)
+        except Exception as exc:
+            return {"error": f"Failed to draw wire segments: {exc}"}
+
+        return {
+            "success": True,
+            "segments_requested": len(segments),
+            "segments_written": segments_written,
+            "segments_skipped": skipped + (len(parsed) - segments_written),
             "junctions_added": junctions_added,
             "file_modified": schematic_path,
             "backup_path": schematic_path + ".bak",
