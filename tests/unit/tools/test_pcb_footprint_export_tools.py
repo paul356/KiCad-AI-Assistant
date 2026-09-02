@@ -581,6 +581,29 @@ class TestAddFootprints:
         assert result["failed_count"] == 0
         assert result["skipped_count"] == 0
 
+    def test_export_into_existing_user_library(self, tools, tmp_path, project):
+        board = _make_board(tmp_path)
+        result = _run(
+            tools["add_footprints_to_library"](
+                pcb_path=board, footprints=_BOARD_FOOTPRINTS, library="TestSys", ctx=None
+            )
+        )
+        assert "error" not in result, result
+        assert result["library_path"] == project["system_lib"]
+        assert os.path.isfile(os.path.join(project["system_lib"], "Sensor_Board_XYZ.kicad_mod"))
+        # R_0402 already exists in the target directory: reported as failed,
+        # never overwritten.
+        assert [f["name"] for f in result["failed"]] == ["R_0402_1005Metric"]
+        assert result["failed_count"] == 1
+        assert result["skipped_count"] == 0
+        r_0402_path = os.path.join(project["system_lib"], "R_0402_1005Metric.kicad_mod")
+        mod = open(r_0402_path, encoding="utf-8").read()
+        assert "(version" not in mod  # still the bare fixture, not an exported copy
+        # indexing re-scans the whole target: R_0402 (fixture) + 2 exported
+        assert result["indexed"] == 3
+        libs = project["index_mgr"]._db.get_all_libraries(project=os.path.realpath(str(tmp_path)))
+        assert [lib.library_name for lib in libs] == ["TestSys"]
+
     def test_global_target_library_keeps_global_ownership(self, tools, tmp_path, project):
         """A library registered in the global user table stays globally owned.
 
