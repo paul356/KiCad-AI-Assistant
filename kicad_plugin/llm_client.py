@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 import platform
 import random
+import secrets
 import subprocess  # nosec B404 -- controlled subprocess execution, no user input
 import time
 from typing import Any
@@ -948,6 +949,61 @@ class LLMClient:
     def set_history(self, history: list[dict[str, Any]]) -> None:
         """Replace conversation history when restoring a saved session."""
         self._history = list(history)
+
+    def invoke_framework_tool(
+        self,
+        tool_name: str,
+        args: dict[str, Any],
+        on_tool_call: Callable[[str, dict, Any], None] | None = None,
+    ) -> Any:
+        """Execute a framework-initiated tool call through the standard pipeline.
+
+        Reuses ``_execute_tool_with_policy`` — the same execution path as
+        LLM-driven calls (policy checks, snapshot bookkeeping, and the
+        ``on_tool_call`` UI callback).  The assistant message declaring the
+        call and the role="tool" result are appended to history as one
+        atomic pair afterwards, shaped exactly like ``run()`` output, so
+        ``_validate_history`` accepts it, the next request exposes it to the
+        LLM, and the session's ``llm_history`` persists it across reloads.
+
+        An execution exception is captured and recorded as a failed result
+        instead of propagating: the history pair stays complete and the UI
+        callback still fires with the error.
+
+        Use for background/framework calls (e.g. the auto footprint index
+        sync) that never pass through ``run()``.
+        """
+        call_id = f"fw-{tool_name}-{secrets.token_hex(4)}"
+        state = _ToolExecutionState()
+        try:
+            result = self._execute_tool_with_policy(tool_name, args, state, on_tool_call)
+        except Exception as exc:
+            log.error("Framework tool %s failed: %s", tool_name, exc, exc_info=True)
+            result = {"success": False, "error": str(exc)}
+            self._emit_tool_callback(on_tool_call, tool_name, args, result)
+        self._history.extend(
+            [
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": call_id,
+                            "type": "function",
+                            "function": {
+                                "name": tool_name,
+                                "arguments": json.dumps(args),
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": json.dumps(result),
+                },
+            ]
+        )
+        return result
 
     def _trim_history(self) -> None:
         """Drop oldest complete turns until history is within the cap.

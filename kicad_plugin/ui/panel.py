@@ -2674,17 +2674,33 @@ if _WX_AVAILABLE:
             """
 
             def _do_sync() -> None:
-                base_url = self._server_mgr.base_url
-                if not base_url:
-                    log.debug("footprint sync: no server base URL yet")
+                if self._llm_client is None:
+                    log.debug("footprint sync: no LLM client yet")
                     return
-                try:
-                    from ..llm_client import call_mcp_tool
 
-                    result = call_mcp_tool(
-                        base_url,
+                def _on_tool(name, args, result) -> None:
+                    wx.CallAfter(
+                        self._append_entry,
+                        {
+                            "type": "tool_call",
+                            "name": name,
+                            "args": args,
+                            "result": result,
+                        },
+                    )
+                    wx.CallAfter(
+                        self._render_conversation,
+                        force_scroll_to_bottom=self._follow_output_to_bottom,
+                    )
+
+                # Run through the standard LLMClient tool pipeline: the call
+                # itself (policy + UI callback) and a history pair that the
+                # next LLM request sees and llm_history persists.
+                try:
+                    result = self._llm_client.invoke_framework_tool(
                         "sync_footprint_index",
                         {"project_path": project_path},
+                        on_tool_call=_on_tool,
                     )
                 except Exception as exc:
                     log.warning("Auto footprint sync failed: %s", exc)
@@ -2692,22 +2708,6 @@ if _WX_AVAILABLE:
                 status = result.get("status")
                 if status == "already_running":
                     log.debug("footprint sync: already running — skipping")
-                    return
-                if status == "started":
-                    wx.CallAfter(
-                        self._append_entry,
-                        {
-                            "type": "status",
-                            "text": (
-                                "⟳ Footprint index sync started in the background for this project."
-                            ),
-                            "color_hex": self._C_WARN_HEX,
-                        },
-                    )
-                    wx.CallAfter(
-                        self._render_conversation,
-                        force_scroll_to_bottom=self._follow_output_to_bottom,
-                    )
                 elif result.get("success") is False or result.get("error"):
                     wx.CallAfter(
                         self._append_entry,
@@ -2723,7 +2723,20 @@ if _WX_AVAILABLE:
                         force_scroll_to_bottom=self._follow_output_to_bottom,
                     )
                 else:
-                    log.debug("Auto footprint sync returned unexpected status: %r", result)
+                    wx.CallAfter(
+                        self._append_entry,
+                        {
+                            "type": "status",
+                            "text": (
+                                "⟳ Footprint index sync started in the background for this project."
+                            ),
+                            "color_hex": self._C_WARN_HEX,
+                        },
+                    )
+                    wx.CallAfter(
+                        self._render_conversation,
+                        force_scroll_to_bottom=self._follow_output_to_bottom,
+                    )
 
             threading.Thread(target=_do_sync, daemon=True).start()
 

@@ -2226,3 +2226,80 @@ class TestAnnotateStaleQueries:
         client._annotate_stale_queries()
         tc1_result = [m for m in client._history if m.get("tool_call_id") == "tc1"][0]
         assert not tc1_result["content"].startswith(_STALE_MARKER)
+
+
+class TestInvokeFrameworkTool:
+    """Framework-initiated tool calls (auto footprint sync) reuse the LLM
+    tool pipeline: execution via _execute_tool_with_policy, history pair,
+    UI callback."""
+
+    def test_invoke_appends_assistant_tool_pair(self):
+        client = _make_client()
+        calls = []
+        with patch(
+            "kicad_plugin.llm_client.call_mcp_tool", return_value={"status": "started"}
+        ) as mock_call:
+            result = client.invoke_framework_tool(
+                "sync_footprint_index",
+                {"project_path": "/p"},
+                on_tool_call=lambda name, args, res: calls.append((name, args, res)),
+            )
+        assert result == {"status": "started"}
+        mock_call.assert_called_once()
+        # UI callback fired with the tool name / args / result
+        assert calls == [("sync_footprint_index", {"project_path": "/p"}, {"status": "started"})]
+        # History pair shaped like an LLM-driven tool round-trip
+        assert len(client._history) == 2
+        assistant, tool = client._history
+        assert assistant["role"] == "assistant"
+        assert assistant["tool_calls"][0]["function"]["name"] == "sync_footprint_index"
+        assert assistant["tool_calls"][0]["function"]["arguments"] == '{"project_path": "/p"}'
+        assert tool["role"] == "tool"
+        assert tool["tool_call_id"] == assistant["tool_calls"][0]["id"]
+        assert tool["content"] == '{"status": "started"}'
+
+    def test_invoke_survives_validate_history(self):
+        client = _make_client()
+        with patch("kicad_plugin.llm_client.call_mcp_tool", return_value={"status": "started"}):
+            client.invoke_framework_tool("sync_footprint_index", {"project_path": "/p"})
+        client._validate_history()
+        assert len(client._history) == 2
+
+    def test_invoke_persisted_via_get_history(self):
+        client = _make_client()
+        with patch("kicad_plugin.llm_client.call_mcp_tool", return_value={"status": "started"}):
+            client.invoke_framework_tool("sync_footprint_index", {"project_path": "/p"})
+        snapshot = client.get_history()
+        assert len(snapshot) == 2
+        assert snapshot[0]["role"] == "assistant"
+        assert snapshot[1]["role"] == "tool"
+
+    def test_invoke_after_user_turn_keeps_ordering(self):
+        client = _make_client()
+        client._history.append({"role": "user", "content": "hi"})
+        with patch("kicad_plugin.llm_client.call_mcp_tool", return_value={"status": "started"}):
+            client.invoke_framework_tool("sync_footprint_index", {})
+        roles = [m["role"] for m in client._history]
+        assert roles == ["user", "assistant", "tool"]
+
+    def test_invoke_failure_records_error_pair_and_fires_callback(self):
+        client = _make_client()
+        calls = []
+
+        def _boom(base_url, tool_name, args):
+            raise RuntimeError("backend down")
+
+        with patch("kicad_plugin.llm_client.call_mcp_tool", side_effect=_boom):
+            result = client.invoke_framework_tool(
+                "sync_footprint_index",
+                {"project_path": "/p"},
+                on_tool_call=lambda name, args, res: calls.append((name, args, res)),
+            )
+        # Exception captured as a failed result — no propagation
+        assert result["success"] is False
+        assert "backend down" in result["error"]
+        assert calls[0][2]["success"] is False
+        # History pair still complete so _validate_history does not strip it
+        assert len(client._history) == 2
+        client._validate_history()
+        assert len(client._history) == 2
