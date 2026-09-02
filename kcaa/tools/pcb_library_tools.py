@@ -427,8 +427,7 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
 
         Returns:
             dict with ``missing`` (list of {name, library, reference, value}),
-            ``missing_count``, ``existing`` and ``existing_count``; plus
-            ``error`` on failure.
+            ``missing_count``; plus ``error`` on failure.
         """
         try:
             _, footprints, _ = _collect_board_footprints(pcb_path)
@@ -437,8 +436,6 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
             return {
                 "missing": missing,
                 "missing_count": len(missing),
-                "existing": sorted(existing),
-                "existing_count": len(existing),
             }
         except Exception as exc:
             log.error("find_footprints_not_in_libraries failed: %s", exc, exc_info=True)
