@@ -53,6 +53,7 @@ class _FpSyncState:
     current_library: str = ""
     last_result: dict | None = None
     error: str | None = None
+    last_project_path: str | None = None
 
 
 _fp_sync_state = _FpSyncState()
@@ -61,6 +62,9 @@ _fp_sync_lock = threading.Lock()
 
 def _run_fp_sync_in_background(force: bool, project_path: str | None) -> None:
     """Target function executed in the background footprint sync thread."""
+
+    with _fp_sync_lock:
+        _fp_sync_state.last_project_path = normalize_project_id(project_path)
 
     def _progress(current: int, total: int, library_name: str) -> None:
         with _fp_sync_lock:
@@ -759,21 +763,32 @@ def _resolve_library_dir(library: str, pcb_path: str | None) -> tuple[str, str]:
 def _collect_existing_names(pcb_path: str | None) -> set[str]:
     """Return every footprint name that already exists in libraries.
 
-    Prefers the footprint index database scoped to the project (global plus
-    project-local libraries; consistent with ``sync_footprint_index`` results).
-    Falls back to a live fp-lib-table scan when the index is empty.
+    Prefers the footprint index database — but only when the current project's
+    sync has actually completed: a project whose sync never ran (or is still
+    running, or failed, or finished for a different project) cannot be
+    trusted, so the live fp-lib-table scan is used instead.  This avoids
+    trusting a partially-synced or stale database.
 
     *pcb_path* may be ``.kicad_pro`` or ``.kicad_pcb``; the project identity
     is ``normalize_project_id(pcb_path)`` — the same canonical id
-    ``sync_footprint_index`` derives from the project file.
+    ``sync_footprint_index`` stores in ``_fp_sync_state.last_project_path``.
     """
     existing: set[str] = set()
     try:
-        mgr = get_footprint_index_manager(project_path=pcb_path)
-        if mgr.get_stats().footprint_count > 0:
-            existing = mgr.get_all_footprint_names()
-        else:
+        with _fp_sync_lock:
+            running = _fp_sync_state.running
+            last_result = _fp_sync_state.last_result
+            last_project = _fp_sync_state.last_project_path
+        if (
+            running
+            or not last_result
+            or not last_result.get("success")
+            or last_project != normalize_project_id(pcb_path)
+        ):
             existing = _live_scan_existing_names(pcb_path)
+        else:
+            mgr = get_footprint_index_manager(project_path=pcb_path)
+            existing = mgr.get_all_footprint_names()
     except Exception as exc:
         log.warning("Footprint index read failed (%s) — falling back to live scan", exc)
         existing = _live_scan_existing_names(pcb_path)

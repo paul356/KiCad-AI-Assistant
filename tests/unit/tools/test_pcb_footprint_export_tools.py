@@ -7,6 +7,7 @@ Unit tests for the PCB → footprint library tools registered in
 
 import asyncio
 import os
+import shutil
 
 import pytest
 
@@ -390,11 +391,33 @@ class TestFindMissingFootprints:
         assert project["index_mgr"].get_stats().footprint_count == 0
         assert project["index_mgr"].get_stats().library_count == 0
 
-    def test_uses_indexed_footprint_names_when_db_populated(self, tools, tmp_path, project):
-        """find_missing consumes the index DB: an indexed name is NOT missing,
-        even when the library directory is no longer live-scannable."""
+    def test_uses_index_after_completed_sync_even_if_dir_gone(
+        self, tools, tmp_path, project, monkeypatch
+    ):
+        """After a completed sync for this project, find consumes the index DB:
+        an indexed name is NOT missing even when the library directory is no
+        longer live-scannable.  (A partially-synced DB must NOT be trusted —
+        covered by TestCollectExistingNames.)"""
+        import kcaa.tools.pcb_library_tools as _tool_module
+
         board = _make_board(tmp_path)
-        project["index_mgr"].index_library("TestSys", project["system_lib"])
+        proj_id = _tool_module.normalize_project_id(board)
+        lib_dir = project["system_lib"]
+
+        with _tool_module._fp_sync_lock:
+            _tool_module._fp_sync_state.last_result = None
+            _tool_module._fp_sync_state.error = None
+            _tool_module._fp_sync_state.last_project_path = None
+        _tool_module._run_fp_sync_in_background(True, board)
+        with _tool_module._fp_sync_lock:
+            assert _tool_module._fp_sync_state.last_result is not None
+            assert _tool_module._fp_sync_state.last_result["success"] is True
+            assert _tool_module._fp_sync_state.last_project_path == proj_id
+
+        # Index is complete; the library directory is no longer scannable.
+        shutil.rmtree(lib_dir)
+        assert not os.path.isdir(lib_dir)
+
         result = _run(tools["find_footprints_not_in_libraries"](pcb_path=board, ctx=None))
         assert "error" not in result, result
         names = [fp["name"] for fp in result["missing"]]

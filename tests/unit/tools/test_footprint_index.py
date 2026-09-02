@@ -926,6 +926,7 @@ class TestFpSyncTools:
             _tool_module._fp_sync_state.current_library = ""
             _tool_module._fp_sync_state.last_result = None
             _tool_module._fp_sync_state.error = None
+            _tool_module._fp_sync_state.last_project_path = None
 
     def test_background_sync_completes(self, tmp_path, monkeypatch):
         """_run_fp_sync_in_background updates state to done with last_result."""
@@ -1084,3 +1085,80 @@ class TestGetFootprintIndexManager:
         mod.get_footprint_index_manager(project_path="/p2/other.kicad_pro")
         assert mgr._project_id == "/p2"
         assert mgr._project_path == "/p2/other.kicad_pro"
+
+
+class TestCollectExistingNames:
+    """find's _collect_existing_names trusts the index only after a sync of
+    the *same* project completed; anything else (never ran, running, failed,
+    different project) falls back to the live fp-lib-table scan."""
+
+    def setup_method(self):
+        with _tool_module._fp_sync_lock:
+            _tool_module._fp_sync_state.running = False
+            _tool_module._fp_sync_state.last_result = None
+            _tool_module._fp_sync_state.error = None
+            _tool_module._fp_sync_state.last_project_path = None
+
+    def _call(
+        self,
+        monkeypatch,
+        pcb_path="/tmp/A/proj.kicad_pcb",
+        indexed=None,
+        live=None,
+    ):
+        """Run _collect_existing_names with a fake manager + fake live scan."""
+        indexed = indexed or {"indexed_a", "indexed_b"}
+        live = live or {"live_a"}
+
+        class _FakeMgr:
+            def get_all_footprint_names(self, project=None):
+                return set(indexed)
+
+            def get_stats(self, project=None):
+                return type("S", (), {"footprint_count": len(indexed)})()
+
+        monkeypatch.setattr(
+            "kcaa.tools.pcb_library_tools.get_footprint_index_manager",
+            lambda project_path=None: _FakeMgr(),
+        )
+        monkeypatch.setattr(
+            "kcaa.tools.pcb_library_tools._live_scan_existing_names",
+            lambda pcb_path=None: set(live),
+        )
+        return _tool_module._collect_existing_names(pcb_path)
+
+    def test_never_synced_falls_back_to_live_scan(self, monkeypatch):
+        """No sync record yet (fresh process) -> live scan, not the partial DB."""
+        assert self._call(monkeypatch) == {"live_a"}
+
+    def test_running_sync_falls_back_to_live_scan(self, monkeypatch):
+        with _tool_module._fp_sync_lock:
+            _tool_module._fp_sync_state.running = True
+        assert self._call(monkeypatch) == {"live_a"}
+
+    def test_failed_sync_falls_back_to_live_scan(self, monkeypatch):
+        with _tool_module._fp_sync_lock:
+            _tool_module._fp_sync_state.last_result = None
+            _tool_module._fp_sync_state.error = "boom"
+            _tool_module._fp_sync_state.last_project_path = "/tmp/A"
+        assert self._call(monkeypatch) == {"live_a"}
+
+    def test_sync_for_different_project_falls_back(self, monkeypatch):
+        """Index synced for project B cannot answer find for project A."""
+        with _tool_module._fp_sync_lock:
+            _tool_module._fp_sync_state.last_result = {"success": True}
+            _tool_module._fp_sync_state.last_project_path = "/tmp/B"
+        assert self._call(monkeypatch) == {"live_a"}
+
+    def test_completed_sync_for_same_project_uses_index(self, monkeypatch):
+        with _tool_module._fp_sync_lock:
+            _tool_module._fp_sync_state.last_result = {"success": True}
+            _tool_module._fp_sync_state.last_project_path = "/tmp/A"
+        assert self._call(monkeypatch) == {"indexed_a", "indexed_b"}
+
+    def test_global_sync_serves_global_find(self, monkeypatch):
+        """sync without project (""), find without project ("") -> index OK."""
+        with _tool_module._fp_sync_lock:
+            _tool_module._fp_sync_state.last_result = {"success": True}
+            _tool_module._fp_sync_state.last_project_path = ""
+        assert self._call(monkeypatch, pcb_path=None) == {"indexed_a", "indexed_b"}
