@@ -93,6 +93,7 @@ if _WX_AVAILABLE:
             self._server_mgr = server_mgr
             self._settings = settings
             self._llm_client: Any | None = None
+            self._fp_sync_pending: str | None = None
             # True once the MCP backend reported a successful start; the LLM
             # client is only created when this and panel display both hold.
             self._server_ready: bool = False
@@ -540,6 +541,11 @@ if _WX_AVAILABLE:
                     # up (panel shown early), inject the URL now.
                     if self._llm_client is not None:
                         self._llm_client.set_base_url(self._server_mgr.base_url)
+                    # Flush any footprint sync parked before the backend was up.
+                    if self._fp_sync_pending:
+                        project = self._fp_sync_pending
+                        self._fp_sync_pending = None
+                        self._start_footprint_sync(project)
                 else:
                     self._server_ready = False
                     self._set_status(
@@ -560,6 +566,10 @@ if _WX_AVAILABLE:
                 self._llm_client = LLMClient(self._settings, self._server_mgr.base_url)
                 self._autoload_session()
                 self._start_project_watch()
+                # Auto-sync the footprint index for the current project
+                # (deferred until the backend is up if needed).
+                if self._active_project:
+                    self._request_footprint_sync(self._active_project)
             except Exception as e:
                 import traceback
 
@@ -596,7 +606,7 @@ if _WX_AVAILABLE:
                         )
                         self._active_project = project
                         self._autoload_session()
-                        self._start_footprint_sync(project)
+                        self._request_footprint_sync(project)
                 except Exception:
                     log.debug("project re-sync on panel show failed", exc_info=True)
             event.Skip()
@@ -2490,7 +2500,7 @@ if _WX_AVAILABLE:
             self._autoload_session()
             # Refresh the footprint index for the newly active project so
             # find_footprints_not_in_libraries never reads a stale DB.
-            self._start_footprint_sync(project)
+            self._request_footprint_sync(project)
 
         def _prompt_project_session_choice(self, project_path: str | None) -> None:
             """Offer the open project's saved sessions after a skip.
@@ -2641,6 +2651,18 @@ if _WX_AVAILABLE:
                 self._finalise_and_save_on_teardown()
                 self._server_mgr.stop()
             event.Skip()
+
+        def _request_footprint_sync(self, project_path: str) -> None:
+            """Sync now when the backend is up, else park until it is ready.
+
+            Called from the first-show/auto-load path, which can run before
+            the MCP backend has reported ready; the parked project is
+            flushed by ``_on_server_started`` once the base URL exists.
+            """
+            if self._server_mgr.base_url:
+                self._start_footprint_sync(project_path)
+            else:
+                self._fp_sync_pending = project_path
 
         def _start_footprint_sync(self, project_path: str) -> None:
             """Start a background non-force footprint index sync for the project.
