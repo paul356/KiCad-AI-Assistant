@@ -756,71 +756,104 @@ if _WX_AVAILABLE:
         # ------------------------------------------------------------------ #
 
         def _on_send(self, event) -> None:
+            """Chat send button / Enter: route a user message (chat kind)."""
+            self._send_request("chat", {})
+
+        def _send_request(self, kind: str, payload: dict) -> None:
+            """Route a request through the shared turn pipeline.
+
+            kind == "chat": user chat message → LLM loop (original _on_send
+            flow: input clear, user entry, context collection, PDF
+            extraction).
+            kind == "tool_direct": framework tool call (e.g. the auto
+            footprint sync) — executed directly via LLMClient.run's
+            tool_direct branch, never sent to the LLM; only the tool call
+            pair lands in history so the next request sees it and
+            llm_history persists it.  The request itself is not stored.
+
+            Shared skeleton: busy guard, generation-scoped event queue,
+            background thread, turn_end → _finish_turn (session save, busy
+            reset).
+            """
             if self._busy or not self._llm_client:
                 log.debug(
-                    "_on_send: skipped (busy=%s, client=%s)",
+                    "_send_request(%s): skipped (busy=%s, client=%s)",
+                    kind,
                     self._busy,
                     self._llm_client is not None,
                 )
                 return
-            if not self._server_ready:
-                log.debug("_on_send: skipped (backend not ready)")
-                return
-            text = self._input.GetValue().strip()
-            images = self._encode_attached_images()
-            pdfs = [p for p, t in self._attached_files if t == "pdf"]
-            if not text and not images and not pdfs:
-                return
-            if images and not self._settings.llm_supports_vision:
+
+            ctx: dict = {}
+            context_block = ""
+            text = ""
+            images = []
+            pdfs = []
+            _user_entry: dict | None = None
+            if kind == "chat":
+                if not self._server_ready:
+                    log.debug("_on_send: skipped (backend not ready)")
+                    return
+                text = self._input.GetValue().strip()
+                images = self._encode_attached_images()
+                pdfs = [p for p, t in self._attached_files if t == "pdf"]
+                if not text and not images and not pdfs:
+                    return
+                if images and not self._settings.llm_supports_vision:
+                    log.info(
+                        "_on_send: blocked — %d image(s) but vision disabled in settings",
+                        len(images),
+                    )
+                    wx.MessageBox(
+                        "The current model is configured as not supporting vision. "
+                        'Enable "Model supports vision" in Settings or remove the attached '
+                        "image(s) before sending.",
+                        "Vision not enabled",
+                        wx.OK | wx.ICON_WARNING,
+                        self,
+                    )
+                    return
                 log.info(
-                    "_on_send: blocked — %d image(s) but vision disabled in settings",
+                    "_on_send: user message (%d chars, %d image(s), %d PDF(s), vision=%s)",
+                    len(text),
                     len(images),
+                    len(pdfs),
+                    self._settings.llm_supports_vision,
                 )
-                wx.MessageBox(
-                    "The current model is configured as not supporting vision. "
-                    'Enable "Model supports vision" in Settings or remove the attached '
-                    "image(s) before sending.",
-                    "Vision not enabled",
-                    wx.OK | wx.ICON_WARNING,
-                    self,
+                self._input.Clear()
+                display_text = text or "(attachment)"
+                if images:
+                    display_text += f"\n\n[📎 {len(images)} image(s) attached]"
+                if pdfs:
+                    display_text += f"\n\n[📄 {len(pdfs)} PDF(s) attached]"
+                # Placeholder — pdf_texts filled in after background extraction
+                self._conv_entries.append(
+                    {
+                        "type": "user",
+                        "text": display_text,
+                        "timestamp": datetime.datetime.now().strftime("%H:%M:%S"),
+                        "pdf_texts": [],
+                    }
                 )
-                return
-            log.info(
-                "_on_send: user message (%d chars, %d image(s), %d PDF(s), vision=%s)",
-                len(text),
-                len(images),
-                len(pdfs),
-                self._settings.llm_supports_vision,
-            )
-            self._input.Clear()
-            display_text = text or "(attachment)"
-            if images:
-                display_text += f"\n\n[📎 {len(images)} image(s) attached]"
-            if pdfs:
-                display_text += f"\n\n[📄 {len(pdfs)} PDF(s) attached]"
-            # Placeholder — pdf_texts filled in after background extraction
-            self._conv_entries.append(
-                {
-                    "type": "user",
-                    "text": display_text,
-                    "timestamp": datetime.datetime.now().strftime("%H:%M:%S"),
-                    "pdf_texts": [],
-                }
-            )
-            _user_entry = self._conv_entries[-1]
-            self._conv_version += 1
-            self._attached_files.clear()
-            self._refresh_attachments_bar()
-            self._follow_output_to_bottom = True
-            self._render_conversation(force_scroll_to_bottom=True)
+                _user_entry = self._conv_entries[-1]
+                self._conv_version += 1
+                self._attached_files.clear()
+                self._refresh_attachments_bar()
+                self._follow_output_to_bottom = True
+                self._render_conversation(force_scroll_to_bottom=True)
+
+            # Busy from here on: the turn owns the UI until turn_end.
             self._busy = True
             self._cancel_event = threading.Event()
             self._toggle_send_stop(busy=True)
 
             from ..context_bridge import collect_context, context_to_system_prompt_block
 
-            ctx = collect_context()
-            context_block = context_to_system_prompt_block(ctx)
+            if kind == "chat":
+                ctx = collect_context()
+                context_block = context_to_system_prompt_block(ctx)
+            else:
+                log.info("_send_request(tool_direct): %s", payload.get("name"))
 
             # Reset streaming state and start the flush timer.  A new turn
             # bumps the generation: events still in flight from a cancelled
@@ -851,55 +884,103 @@ if _WX_AVAILABLE:
                 evt["_gen"] = gen
                 self._stream_events.append(evt)
 
+            def _on_tool(name, args, result) -> None:
+                """UI callback for every tool execution in this turn."""
+                _emit({"type": "tool_call", "name": name, "args": args, "result": result})
+                if kind == "tool_direct" and name == "sync_footprint_index":
+                    # Mirror the old auto-sync status notices: started /
+                    # failed surface as status entries, already_running is
+                    # silent (the tool card alone tells the story).
+                    status = (result or {}).get("status") if isinstance(result, dict) else None
+                    if status == "already_running":
+                        log.debug("footprint sync: already running — skipping")
+                    elif isinstance(result, dict) and (
+                        result.get("success") is False or result.get("error")
+                    ):
+                        _emit(
+                            {
+                                "type": "status",
+                                "text": "⚠ Footprint index sync failed: %s"
+                                % (result.get("error") or result),
+                                "color_hex": self._C_ERR_HEX,
+                            }
+                        )
+                    else:
+                        _emit(
+                            {
+                                "type": "status",
+                                "text": (
+                                    "⟳ Footprint index sync started in the background "
+                                    "for this project."
+                                ),
+                                "color_hex": self._C_WARN_HEX,
+                            }
+                        )
+
             def _run():
-                log.info("Background _run: started")
+                log.info("Background _run (%s): started", kind)
                 try:
-                    # Extract PDF text before sending to LLM
-                    text_with_pdf = text
-                    if pdfs:
-                        self._set_status("⏳ Extracting PDF text…", self._C_WARN)
-                        pdf_texts: list[dict] = []
-                        pdf_blocks: list[str] = []
-                        for pdf_path in pdfs:
-                            extracted = self._extract_pdf_text(pdf_path)
-                            basename = os.path.basename(pdf_path)
-                            if extracted.startswith("[Error]"):
-                                log.error("PDF extraction failed: %s — %s", pdf_path, extracted)
-                                pdf_texts.append(
-                                    {"name": basename, "text": extracted, "error": True}
-                                )
-                                pdf_blocks.append(f"--- PDF: {basename} ---\n{extracted}")
-                            else:
-                                log.info("PDF extracted: %s → %d chars", basename, len(extracted))
-                                pdf_texts.append({"name": basename, "text": extracted})
-                                pdf_blocks.append(
-                                    f"--- PDF: {basename} "
-                                    f"(text extracted with page numbers) ---\n\n{extracted}"
-                                )
-                        self._set_status("Ready", self._C_OK)
-                        # Store extracted texts for UI display
-                        _user_entry["pdf_texts"] = pdf_texts
-                        if pdf_blocks:
-                            pdf_block = "\n\n".join(pdf_blocks)
-                            text_with_pdf = text + ("\n\n" if text else "") + pdf_block
-                        # Re-render so the collapsible PDF text appears
-                        wx.CallAfter(self._render_conversation, True)
-                    reply = self._llm_client.run(
-                        text_with_pdf,
-                        context_block,
-                        on_tool_call=lambda name, args, result: _emit(
-                            {"type": "tool_call", "name": name, "args": args, "result": result}
-                        ),
-                        on_stream_event=_emit,
-                        on_compacted=lambda notice: _emit(
-                            {"type": "status", "text": notice, "color_hex": self._C_WARN_HEX}
-                        ),
-                        images=images,
-                    )
+                    if kind == "chat":
+                        # Extract PDF text before sending to LLM
+                        text_with_pdf = text
+                        if pdfs:
+                            self._set_status("⏳ Extracting PDF text…", self._C_WARN)
+                            pdf_texts: list[dict] = []
+                            pdf_blocks: list[str] = []
+                            for pdf_path in pdfs:
+                                extracted = self._extract_pdf_text(pdf_path)
+                                basename = os.path.basename(pdf_path)
+                                if extracted.startswith("[Error]"):
+                                    log.error("PDF extraction failed: %s — %s", pdf_path, extracted)
+                                    pdf_texts.append(
+                                        {"name": basename, "text": extracted, "error": True}
+                                    )
+                                    pdf_blocks.append(f"--- PDF: {basename} ---\n{extracted}")
+                                else:
+                                    log.info(
+                                        "PDF extracted: %s → %d chars", basename, len(extracted)
+                                    )
+                                    pdf_texts.append({"name": basename, "text": extracted})
+                                    pdf_blocks.append(
+                                        f"--- PDF: {basename} "
+                                        f"(text extracted with page numbers) ---\n\n{extracted}"
+                                    )
+                            self._set_status("Ready", self._C_OK)
+                            # Store extracted texts for UI display
+                            if _user_entry is not None:
+                                _user_entry["pdf_texts"] = pdf_texts
+                            if pdf_blocks:
+                                pdf_block = "\n\n".join(pdf_blocks)
+                                text_with_pdf = text + ("\n\n" if text else "") + pdf_block
+                            # Re-render so the collapsible PDF text appears
+                            wx.CallAfter(self._render_conversation, True)
+                        reply = self._llm_client.run(
+                            text_with_pdf,
+                            context_block,
+                            on_tool_call=_on_tool,
+                            on_stream_event=_emit,
+                            on_compacted=lambda notice: _emit(
+                                {"type": "status", "text": notice, "color_hex": self._C_WARN_HEX}
+                            ),
+                            images=images,
+                        )
+                    else:  # tool_direct
+                        self._llm_client.run(
+                            {
+                                "kind": "tool_direct",
+                                "name": payload.get("name") or "",
+                                "arguments": payload.get("arguments") or {},
+                            },
+                            context_block,
+                            on_tool_call=_on_tool,
+                        )
+                        # tool_direct produces no assistant text: keep the
+                        # turn_end reply empty so no AI entry is rendered.
+                        reply = ""
                 except Exception as e:
                     log.exception("LLM request failed")
                     reply = f"[Error] {e}"
-                log.info("Background _run: finished (reply_len=%d)", len(reply))
+                log.info("Background _run (%s): finished (reply_len=%d)", kind, len(reply))
                 # turn_end is the queue's final event: emitted after the
                 # reload_kicad / tool callbacks, so the consumer orders it
                 # strictly after the last text of the turn.
@@ -2665,80 +2746,25 @@ if _WX_AVAILABLE:
                 self._fp_sync_pending = project_path
 
         def _start_footprint_sync(self, project_path: str) -> None:
-            """Start a background non-force footprint index sync for the project.
+            """Fire a non-force footprint index sync for the project.
 
             Fired on project open/switch so the index stays fresh for
-            ``find_footprints_not_in_libraries``; the server's sync tool
-            guards against duplicates (``already_running``).  A status entry
-            is appended to the conversation so the user sees the sync start.
+            ``find_footprints_not_in_libraries``; now runs through the same
+            chat entry as a user message (tool_direct request) instead of a
+            private thread, so it shares the busy guard, event stream and
+            turn lifecycle.  The call itself is never sent to the LLM — run()
+            executes it directly and records the assistant+tool pair in
+            history.  The server's sync tool guards against duplicates
+            (``already_running``).  Status updates are emitted from the
+            tool-call callback in ``_send_request``.
             """
-
-            def _do_sync() -> None:
-                if self._llm_client is None:
-                    log.debug("footprint sync: no LLM client yet")
-                    return
-
-                def _on_tool(name, args, result) -> None:
-                    wx.CallAfter(
-                        self._append_entry,
-                        {
-                            "type": "tool_call",
-                            "name": name,
-                            "args": args,
-                            "result": result,
-                        },
-                    )
-                    wx.CallAfter(
-                        self._render_conversation,
-                        force_scroll_to_bottom=self._follow_output_to_bottom,
-                    )
-
-                # Run through the standard LLMClient tool pipeline: the call
-                # itself (policy + UI callback) and a history pair that the
-                # next LLM request sees and llm_history persists.
-                try:
-                    result = self._llm_client.invoke_framework_tool(
-                        "sync_footprint_index",
-                        {"project_path": project_path},
-                        on_tool_call=_on_tool,
-                    )
-                except Exception as exc:
-                    log.warning("Auto footprint sync failed: %s", exc)
-                    return
-                status = result.get("status")
-                if status == "already_running":
-                    log.debug("footprint sync: already running — skipping")
-                elif result.get("success") is False or result.get("error"):
-                    wx.CallAfter(
-                        self._append_entry,
-                        {
-                            "type": "status",
-                            "text": "⚠ Footprint index sync failed: %s"
-                            % (result.get("error") or result),
-                            "color_hex": self._C_ERR_HEX,
-                        },
-                    )
-                    wx.CallAfter(
-                        self._render_conversation,
-                        force_scroll_to_bottom=self._follow_output_to_bottom,
-                    )
-                else:
-                    wx.CallAfter(
-                        self._append_entry,
-                        {
-                            "type": "status",
-                            "text": (
-                                "⟳ Footprint index sync started in the background for this project."
-                            ),
-                            "color_hex": self._C_WARN_HEX,
-                        },
-                    )
-                    wx.CallAfter(
-                        self._render_conversation,
-                        force_scroll_to_bottom=self._follow_output_to_bottom,
-                    )
-
-            threading.Thread(target=_do_sync, daemon=True).start()
+            self._send_request(
+                "tool_direct",
+                {
+                    "name": "sync_footprint_index",
+                    "arguments": {"project_path": project_path},
+                },
+            )
 
         # ------------------------------------------------------------------ #
         # Auto-load
