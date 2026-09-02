@@ -586,7 +586,18 @@ if _WX_AVAILABLE:
             elif event.IsShown():
                 try:
                     project = self._collect_active_project()
-                    if project != self._active_project and not self._busy:
+                    log.debug(
+                        "panel show: probe=%r active=%r busy=%r",
+                        project,
+                        self._active_project,
+                        self._busy,
+                    )
+                    if project is not None and project != self._active_project and not self._busy:
+                        log.info(
+                            "panel show: project re-sync %r -> %r; re-running restore flow",
+                            self._active_project,
+                            project,
+                        )
                         self._active_project = project
                         self._watch_candidate_seen = False
                         self._autoload_session()
@@ -2269,6 +2280,13 @@ if _WX_AVAILABLE:
                 ts = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
                 filename = f"session_{ts}.json"
                 self._current_session_file = filename
+            log.info(
+                "save session: file=%s stamp=%r (conv_version=%d saved=%d)",
+                filename,
+                self._active_project,
+                self._conv_version,
+                self._saved_conv_version,
+            )
             payload = _sstore.make_payload(
                 self._conv_entries,
                 (
@@ -2388,17 +2406,26 @@ if _WX_AVAILABLE:
 
                 proj = collect_context().get("active_project")
                 if proj:
+                    log.debug("project via collect_context: %s", proj)
                     return proj
-                for w in wx.GetTopLevelWindows():
+                windows = wx.GetTopLevelWindows()
+                log.debug(
+                    "project via collect_context: None — trying %d top-level window title(s)",
+                    len(windows),
+                )
+                for w in windows:
                     title = w.GetTitle()
                     if not title:
+                        log.debug("window title empty (class=%s)", type(w).__name__)
                         continue
                     p = project_path_from_title(title)
                     if p:
                         log.debug("project from window title %r -> %s", title, p)
                         return p
+                    log.debug("window title %r did not yield a project", title)
             except Exception:
                 log.debug("_collect_active_project failed", exc_info=True)
+            log.debug("_collect_active_project returning None")
             return None
 
         def _start_project_watch(self) -> None:
@@ -2411,6 +2438,10 @@ if _WX_AVAILABLE:
             if not self._project_watch_timer:
                 return
             self._active_project = self._collect_active_project()
+            log.info(
+                "project watch started: active=%r",
+                self._active_project,
+            )
             self._watch_candidate_seen = False
             self._project_watch_timer.Start(
                 1000
@@ -2437,18 +2468,42 @@ if _WX_AVAILABLE:
                 # applied exactly once, when the user looks at the panel.
                 return
             if self._busy:
+                log.debug(
+                    "project watch: busy — skip project poll (active=%r)",
+                    self._active_project,
+                )
                 return
             project = self._collect_active_project()
+            if project is None:
+                # Probing failed (GetBoard empty / no window-title match) —
+                # e.g. mid-project-switch.  Never downgrade a known project
+                # to None: keep the last valid value so session saves keep
+                # their project stamp.
+                log.debug(
+                    "project watch: probe returned None — keeping active=%r",
+                    self._active_project,
+                )
+                return
             if project == self._active_project:
                 self._watch_candidate_seen = False
                 return
             if not self._watch_candidate_seen:
+                log.debug(
+                    "project watch: first reading %r differs from active=%r; waiting for confirmation",
+                    project,
+                    self._active_project,
+                )
                 # First differing reading: remember it and wait for a second
                 # identical one before acting.
                 self._watch_candidate_seen = True
                 self._watch_candidate = project
                 return
             if project != self._watch_candidate:
+                log.debug(
+                    "project watch: flopping %r -> %r, re-armed",
+                    self._watch_candidate,
+                    project,
+                )
                 # Still flapping between values (project loading in
                 # background): re-arm with the latest reading.
                 self._watch_candidate = project
