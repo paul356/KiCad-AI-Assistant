@@ -973,9 +973,11 @@ class LLMClient:
         exposes it to the LLM, and the session's ``llm_history`` persists
         it across reloads.
 
-        If history is empty or would otherwise open with a non-user message,
-        a synthetic user message is prepended first: providers (Anthropic)
-        require the first message to have role "user".
+        If history is empty, a synthetic user message is prepended first:
+        providers (Anthropic) require the first message to have role
+        "user".  With non-empty history the first message is already a
+        user message (every chat turn and every restored session opens
+        with one), so no preamble is needed.
 
         An execution exception is captured and recorded as a failed result
         instead of propagating: the history pair stays complete and the UI
@@ -988,8 +990,11 @@ class LLMClient:
             return {"success": False, "error": "tool_direct request missing 'name'"}
         call_id = f"fw-{tool_name}-{secrets.token_hex(4)}"
 
-        # Providers require the first message to have role "user".
-        if not self._history or self._history[0].get("role") != "user":
+        # Providers require the first message to have role "user".  This
+        # only ever fires for an empty history: a framework call is the
+        # first thing in a fresh session.  Once any chat turn or session
+        # restore exists, history already opens with a user message.
+        if not self._history:
             self._history.insert(
                 0,
                 {
