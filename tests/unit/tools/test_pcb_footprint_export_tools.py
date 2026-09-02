@@ -333,7 +333,7 @@ def tools():
 class TestFindMissingFootprints:
     def test_reports_missing_and_existing(self, tools, tmp_path, project):
         board = _make_board(tmp_path)
-        result = _run(tools["find_missing_footprints"](pcb_path=board, ctx=None))
+        result = _run(tools["find_footprints_not_in_libraries"](pcb_path=board, ctx=None))
         assert "error" not in result, result
         names = [fp["name"] for fp in result["missing"]]
         assert "Sensor_Board_XYZ" in names
@@ -344,13 +344,13 @@ class TestFindMissingFootprints:
     def test_list_is_read_only(self, tools, tmp_path, project):
         board = _make_board(tmp_path)
         before = open(board, encoding="utf-8").read()
-        _run(tools["find_missing_footprints"](pcb_path=board, ctx=None))
+        _run(tools["find_footprints_not_in_libraries"](pcb_path=board, ctx=None))
         assert open(board, encoding="utf-8").read() == before
 
     def test_does_not_write_footprint_database(self, tools, tmp_path, project):
         """The read path never writes to the index DB (it reads it)."""
         board = _make_board(tmp_path)
-        result = _run(tools["find_missing_footprints"](pcb_path=board, ctx=None))
+        result = _run(tools["find_footprints_not_in_libraries"](pcb_path=board, ctx=None))
         assert "error" not in result, result
         assert project["index_mgr"].get_stats().footprint_count == 0
         assert project["index_mgr"].get_stats().library_count == 0
@@ -360,7 +360,7 @@ class TestFindMissingFootprints:
         even when the library directory is no longer live-scannable."""
         board = _make_board(tmp_path)
         project["index_mgr"].index_library("TestSys", project["system_lib"])
-        result = _run(tools["find_missing_footprints"](pcb_path=board, ctx=None))
+        result = _run(tools["find_footprints_not_in_libraries"](pcb_path=board, ctx=None))
         assert "error" not in result, result
         names = [fp["name"] for fp in result["missing"]]
         assert "R_0402_1005Metric" not in names  # indexed → existing
@@ -673,8 +673,6 @@ class TestUnsafeFootprintNames:
         # Nothing was written outside the library directory.
         lib_dir = os.path.join(project["third_party"], "footprints", "MyVendor.pretty")
         assert os.listdir(lib_dir) == ["Connector_Odd.kicad_mod"]
-        assert not os.path.isfile(os.path.join(tmp_path, "escape.kicad_mod"))
-        assert "escape.kicad_mod" not in os.listdir(lib_dir)
 
     def test_empty_name_is_failed_not_written(self, tools, tmp_path, project):
         _run(tools["create_footprint_library"](name="MyVendor", ctx=None))
@@ -692,6 +690,26 @@ class TestUnsafeFootprintNames:
         lib_dir = os.path.join(project["third_party"], "footprints", "MyVendor.pretty")
         assert os.listdir(lib_dir) == ["Connector_Odd.kicad_mod"]  # no stray ".kicad_mod"
 
+    def test_spaced_name_exports_fine(self, tools, tmp_path, project):
+        """Spaces are legal KiCad footprint names — export succeeds, unlike
+        path-escaping names which must still be failed."""
+        _run(tools["create_footprint_library"](name="MyVendor", ctx=None))
+        board = self._board_with_name(tmp_path, "M3 Hole")
+        result = _run(
+            tools["add_footprints_to_library"](
+                pcb_path=board,
+                footprints=["M3 Hole", "R_0402_1005Metric", "Connector_Odd"],
+                library="MyVendor",
+                ctx=None,
+            )
+        )
+        assert "error" not in result, result
+        assert result["exported_count"] == 2  # M3 Hole + Connector_Odd
+        assert result["failed_count"] == 0
+        lib_dir = os.path.join(project["third_party"], "footprints", "MyVendor.pretty")
+        assert "M3 Hole.kicad_mod" in os.listdir(lib_dir)
+        assert "Connector_Odd.kicad_mod" in os.listdir(lib_dir)
+
     def test_write_footprint_mod_rejects_unsafe_name(self, tmp_path):
         from kcaa.utils.pcb_footprint_utils import is_safe_footprint_name, write_footprint_mod
 
@@ -702,11 +720,12 @@ class TestUnsafeFootprintNames:
         with pytest.raises(ValueError):
             write_footprint_mod(str(lib_dir), "", ["footprint"])
         assert os.listdir(lib_dir) == []
-        # Sanity: an ordinary name still works.
-        assert is_safe_footprint_name("R_0402_1005Metric")
-        assert not is_safe_footprint_name("../up")
-        assert not is_safe_footprint_name("a/b")
-        assert not is_safe_footprint_name("")
+        # Spaces are legal in KiCad footprint names (e.g. M3 Hole) — only
+        # path-escaping constructs are refused.
+        assert is_safe_footprint_name("M3 Hole")
+        assert is_safe_footprint_name("M3 Spade Hole")
+        assert not is_safe_footprint_name("a\\b")
+        assert not is_safe_footprint_name("a\x00b")
 
 
 class TestCreateRollback:

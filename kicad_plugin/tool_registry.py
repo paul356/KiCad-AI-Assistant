@@ -158,7 +158,7 @@ TOOL_POLICIES: dict[str, ToolPolicy] = {
     "search_footprints": ToolPolicy(kind="query"),
     "get_footprint_details": ToolPolicy(kind="query"),
     # PCB → library export tools
-    "find_missing_footprints": ToolPolicy(kind="query"),
+    "find_footprints_not_in_libraries": ToolPolicy(kind="query"),
     "create_footprint_library": ToolPolicy(kind="file_mutation"),
     # Writes .kicad_mod files into the target library; the PCB itself is
     # never modified, so no PCB snapshot/dirty tracking is attached.

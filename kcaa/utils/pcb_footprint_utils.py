@@ -14,7 +14,6 @@ from collections.abc import Iterator
 import copy
 import logging
 import os
-import re
 from typing import Any
 
 import sexpdata
@@ -292,22 +291,25 @@ def split_footprint_header(node: list[Any]) -> tuple[str | None, str]:
     return None, header
 
 
-_FOOTPRINT_NAME_RE = re.compile(r"^[A-Za-z0-9_.+-]+$")
-
-
 def is_safe_footprint_name(name: str) -> bool:
-    """True when *name* is safe to use as a ``<name>.kicad_mod`` filename.
+    """True when *name* is safe as a ``<name>.kicad_mod`` filename.
 
-    Rejects empty names plus anything containing path separators, ``..``, or
-    characters outside ``[A-Za-z0-9_.+-]`` — the same set KiCad accepts in
-    footprint names.  Boards from collaborators can be crafted; never build a
-    target path from an unvalidated header string.
+    Blacklist approach: only the constructs that can escape or corrupt the
+    target path are rejected — empty names, ``.``/``..``, path separators
+    (``/`` and ``\\``), and NUL.  Everything else is allowed, including
+    spaces and non-ASCII, matching what KiCad accepts in footprint names
+    (e.g. ``M3 Hole``).  Boards from collaborators can be crafted; never
+    build a target path from an unvalidated header string.
     """
     if not name:
         return False
     if name in ("..", "."):
         return False
-    return _FOOTPRINT_NAME_RE.match(name) is not None
+    if "/" in name or "\\" in name:
+        return False
+    if "\x00" in name:
+        return False
+    return True
 
 
 def _child_at_rotation(child: list[Any]) -> float | None:

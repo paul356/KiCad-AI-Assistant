@@ -252,7 +252,7 @@ kcaa
 | `list_footprint_libraries` | 列出所有可用封装库 |
 | `search_footprints` | 按名称/描述/标签搜索封装 |
 | `get_footprint_details` | 获取封装详情（焊盘、边界框等） |
-| `find_missing_footprints` | 列出板上缺失于所有已索引库的封装 |
+| `find_footprints_not_in_libraries` | 列出板上缺失于所有已索引库的封装 |
 | `create_footprint_library` | 创建全局 3rdparty 或项目级封装库 |
 | `add_footprints_to_library` | 将显式指定的板载封装导出到库 |
 

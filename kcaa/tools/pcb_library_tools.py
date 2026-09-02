@@ -403,7 +403,7 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
         return info
 
     @mcp.tool()
-    async def find_missing_footprints(
+    async def find_footprints_not_in_libraries(
         pcb_path: str,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
@@ -437,7 +437,7 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
                 "existing_count": len(existing),
             }
         except Exception as exc:
-            log.error("find_missing_footprints failed: %s", exc, exc_info=True)
+            log.error("find_footprints_not_in_libraries failed: %s", exc, exc_info=True)
             return {"error": str(exc)}
 
     @mcp.tool()
@@ -546,11 +546,11 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
         """Export explicitly named board footprints into a footprint library.
 
         Writes each requested footprint (as reported by
-        ``find_missing_footprints``) into the target library directory as a
+        ``find_footprints_not_in_libraries``) into the target library directory as a
         ``.kicad_mod`` file, then updates the footprint database for exactly
         that library.  Only the listed footprints are considered — there is
         deliberately no "export every missing footprint" mode; call
-        ``find_missing_footprints`` first to see what is missing.  The board
+        ``find_footprints_not_in_libraries`` first to see what is missing.  The board
         file is never modified.
 
         A requested footprint is ``failed`` when its target file already
@@ -563,7 +563,7 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
                 directory is treated as the project directory (project-local
                 fp-lib-table and ``${KIPRJMOD}`` URIs are resolved from it).
             footprints: Names of the footprints to export, as returned by
-                ``find_missing_footprints``.
+                ``find_footprints_not_in_libraries``.
             library: Nickname of the target library, as registered in
                 fp-lib-table.
             ctx: MCP context for progress reporting.
@@ -584,7 +584,7 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
             project_id = normalize_project_id(pcb_path)
             project_table = os.path.join(project_id, "fp-lib-table")
             target_project = project_id if os.path.realpath(target_table) == project_table else ""
-            # Same source of truth as find_missing_footprints: the index DB
+            # Same source of truth as find_footprints_not_in_libraries: the index DB
             # (project-scoped), with a live scan only when the index is empty.
             existing = _collect_existing_names(pcb_path)
             board_names = {name for _, name in (split_footprint_header(node) for node in nodes)}
