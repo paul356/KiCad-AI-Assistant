@@ -167,10 +167,6 @@ if _WX_AVAILABLE:
             # switching projects can re-offer that project's saved sessions
             # (same flow as startup auto-restore). Started by _init_llm_client.
             self._active_project: str | None = None
-            # Project-switch confirmation: first differing reading is held
-            # here and only acted on when the next tick agrees.
-            self._watch_candidate: str | None = None
-            self._watch_candidate_seen: bool = False
             self._project_watch_timer = wx.Timer(self)
             # Version-based dirty tracking: _conv_version bumps on every
             # conversation mutation; saves skip the write when the last
@@ -586,9 +582,19 @@ if _WX_AVAILABLE:
             elif event.IsShown():
                 try:
                     project = self._collect_active_project()
-                    if project != self._active_project and not self._busy:
+                    log.debug(
+                        "panel show: probe=%r active=%r busy=%r",
+                        project,
+                        self._active_project,
+                        self._busy,
+                    )
+                    if project is not None and project != self._active_project and not self._busy:
+                        log.info(
+                            "panel show: project re-sync %r -> %r; re-running restore flow",
+                            self._active_project,
+                            project,
+                        )
                         self._active_project = project
-                        self._watch_candidate_seen = False
                         self._autoload_session()
                 except Exception:
                     log.debug("project re-sync on panel show failed", exc_info=True)
@@ -2269,6 +2275,13 @@ if _WX_AVAILABLE:
                 ts = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
                 filename = f"session_{ts}.json"
                 self._current_session_file = filename
+            log.info(
+                "save session: file=%s stamp=%r (conv_version=%d saved=%d)",
+                filename,
+                self._active_project,
+                self._conv_version,
+                self._saved_conv_version,
+            )
             payload = _sstore.make_payload(
                 self._conv_entries,
                 (
@@ -2411,7 +2424,10 @@ if _WX_AVAILABLE:
             if not self._project_watch_timer:
                 return
             self._active_project = self._collect_active_project()
-            self._watch_candidate_seen = False
+            log.info(
+                "project watch started: active=%r",
+                self._active_project,
+            )
             self._project_watch_timer.Start(
                 1000
             )  # 1 s poll: project switch is noticed quickly once a board signal is available
@@ -2425,10 +2441,10 @@ if _WX_AVAILABLE:
             instead of lingering; the panel opened in the new project
             auto-restores the right session on first display.
 
-            The project signal flaps during project load (GetBoard() stays
-            empty until the board is up, and the window-title fallback is
-            equally transient), so a switch is only acted on after two
-            consecutive identical readings.
+            A switch is acted on as soon as the probe returns a different
+            non-None project.  None readings (mid-switch GetBoard() empty,
+            window-title fallback missing) are deliberately ignored so the
+            last valid project is never downgraded.
             """
             if not self.IsShown():
                 # Panel dismissed: stay silent — no session dialogs from a
@@ -2437,29 +2453,30 @@ if _WX_AVAILABLE:
                 # applied exactly once, when the user looks at the panel.
                 return
             if self._busy:
+                log.debug(
+                    "project watch: busy — skip project poll (active=%r)",
+                    self._active_project,
+                )
                 return
             project = self._collect_active_project()
+            if project is None:
+                # Probing failed (GetBoard empty / no window-title match) —
+                # e.g. mid-project-switch.  Never downgrade a known project
+                # to None: keep the last valid value so session saves keep
+                # their project stamp.
+                log.debug(
+                    "project watch: probe returned None — keeping active=%r",
+                    self._active_project,
+                )
+                return
             if project == self._active_project:
-                self._watch_candidate_seen = False
-                return
-            if not self._watch_candidate_seen:
-                # First differing reading: remember it and wait for a second
-                # identical one before acting.
-                self._watch_candidate_seen = True
-                self._watch_candidate = project
-                return
-            if project != self._watch_candidate:
-                # Still flapping between values (project loading in
-                # background): re-arm with the latest reading.
-                self._watch_candidate = project
                 return
             log.info(
-                "Project switch confirmed: %s -> %s; switching session",
+                "Project switch detected: %s -> %s; switching session",
                 self._active_project,
                 project,
             )
             self._active_project = project
-            self._watch_candidate_seen = False
             # Keep this panel open and re-run the startup restore flow for
             # the new project: matching current.json is restored in place,
             # otherwise the new project's sessions are offered.  Never
