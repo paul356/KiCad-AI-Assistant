@@ -18,6 +18,16 @@ from kicad_plugin.llm_client import LLMClient, _subprocess_sse_stream
 from kicad_plugin.tool_registry import TOOL_POLICIES
 
 
+def _on_event_collect(chunks):
+    """Build an on_stream_event callback that records text chunks in order."""
+
+    def _on_stream_event(evt):
+        if evt.get("type") == "text_chunk":
+            chunks.append(evt["content"])
+
+    return _on_stream_event
+
+
 class _SSETestServer(ThreadingHTTPServer):
     """Threaded localhost server that answers POST with an SSE body."""
 
@@ -1125,7 +1135,7 @@ class TestStreaming:
         ]
         mock_resp = self._make_sse_response(sse_lines)
         with patch("urllib.request.urlopen", return_value=mock_resp) as m:
-            client._stream_anthropic("sys", [], on_text_delta=lambda c: None)
+            client._stream_anthropic("sys", [], on_stream_event=lambda evt: None)
 
         payload = json.loads(m.call_args[0][0].data)
         assert payload["max_tokens"] == llm_client._ANTHROPIC_DEFAULT_MAX_TOKENS
@@ -1141,11 +1151,34 @@ class TestStreaming:
         chunks = []
         mock_resp = self._make_sse_response(sse_lines)
         with patch("urllib.request.urlopen", return_value=mock_resp):
-            result = client._stream_openai("sys", [], on_text_delta=chunks.append)
+            result = client._stream_openai("sys", [], on_stream_event=_on_event_collect(chunks))
 
         assert chunks == ["Hello", " world"]
         assert result["message"]["content"] == "Hello world"
         assert result["finish_reason"] == "stop"
+
+    def test_stream_openai_emits_text_boundary_events(self):
+        """text_start precedes the chunks and text_end follows the last one —
+        the ordering guarantee the panel consumer relies on (Bug B)."""
+        client = _make_client()
+        sse_lines = [
+            'data: {"choices":[{"delta":{"content":"Hello"},"finish_reason":null}]}',
+            'data: {"choices":[{"delta":{"content":" world"},"finish_reason":"stop"}]}',
+            "data: [DONE]",
+        ]
+        events = []
+        mock_resp = self._make_sse_response(sse_lines)
+        with patch("urllib.request.urlopen", return_value=mock_resp):
+            result = client._stream_openai("sys", [], on_stream_event=events.append)
+
+        assert result["message"]["content"] == "Hello world"
+        assert [e["type"] for e in events] == [
+            "text_start",
+            "text_chunk",
+            "text_chunk",
+            "text_end",
+        ]
+        assert events[-1]["type"] == "text_end"
 
     def test_stream_openai_skips_empty_choices_chunk(self):
         """Mid-stream empty choices chunks (usage/keepalive) must not abort
@@ -1161,7 +1194,7 @@ class TestStreaming:
         chunks = []
         mock_resp = self._make_sse_response(sse_lines)
         with patch("urllib.request.urlopen", return_value=mock_resp):
-            result = client._stream_openai("sys", [], on_text_delta=chunks.append)
+            result = client._stream_openai("sys", [], on_stream_event=_on_event_collect(chunks))
 
         assert chunks == ["Checking"]
         tc = result["message"]["tool_calls"]
@@ -1193,7 +1226,7 @@ class TestStreaming:
             patch.object(llm_client, "_in_process_ssl", None),
             patch("urllib.request.urlopen", side_effect=err),
         ):
-            result = client._stream_openai("sys", [], on_text_delta=lambda c: None)
+            result = client._stream_openai("sys", [], on_stream_event=lambda evt: None)
 
         assert result["error"] == (
             'HTTP 400: {"code":"InvalidParameter","message":"Request body format invalid"}'
@@ -1211,7 +1244,7 @@ class TestStreaming:
         chunks = []
         mock_resp = self._make_sse_response(sse_lines)
         with patch("urllib.request.urlopen", return_value=mock_resp):
-            result = client._stream_openai("sys", [], on_text_delta=chunks.append)
+            result = client._stream_openai("sys", [], on_stream_event=_on_event_collect(chunks))
 
         assert chunks == []
         tc = result["message"]["tool_calls"]
@@ -1235,7 +1268,7 @@ class TestStreaming:
             patch.object(llm_client, "_in_process_ssl", None),
             patch("urllib.request.urlopen", side_effect=err),
         ):
-            result = client._stream_anthropic("sys", [], on_text_delta=lambda c: None)
+            result = client._stream_anthropic("sys", [], on_stream_event=lambda evt: None)
 
         assert result["error"] == (
             'HTTP 400: {"code":"InvalidParameter","message":"Request body format invalid"}'
@@ -1264,7 +1297,7 @@ class TestStreaming:
         chunks = []
         mock_resp = self._make_sse_response(sse_lines)
         with patch("urllib.request.urlopen", return_value=mock_resp):
-            result = client._stream_anthropic("sys", [], on_text_delta=chunks.append)
+            result = client._stream_anthropic("sys", [], on_stream_event=_on_event_collect(chunks))
 
         assert chunks == ["Hello", " AI"]
         assert result["message"]["content"] == "Hello AI"
@@ -1289,7 +1322,7 @@ class TestStreaming:
         chunks = []
         mock_resp = self._make_sse_response(sse_lines)
         with patch("urllib.request.urlopen", return_value=mock_resp):
-            result = client._stream_anthropic("sys", [], on_text_delta=chunks.append)
+            result = client._stream_anthropic("sys", [], on_stream_event=_on_event_collect(chunks))
 
         assert chunks == []
         tc = result["message"]["tool_calls"]
@@ -1328,7 +1361,7 @@ class TestStreaming:
                 return_value=subprocess_result,
             ) as mock_stream,
         ):
-            result = client._stream_openai("sys", [], on_text_delta=chunks.append)
+            result = client._stream_openai("sys", [], on_stream_event=_on_event_collect(chunks))
 
         mock_stream.assert_called_once()
         call_kwargs = mock_stream.call_args.kwargs
@@ -1365,7 +1398,7 @@ class TestStreaming:
                 return_value=subprocess_result,
             ) as mock_stream,
         ):
-            result = client._stream_anthropic("sys", [], on_text_delta=chunks.append)
+            result = client._stream_anthropic("sys", [], on_stream_event=_on_event_collect(chunks))
 
         mock_stream.assert_called_once()
         call_kwargs = mock_stream.call_args.kwargs
@@ -1373,22 +1406,48 @@ class TestStreaming:
         assert call_kwargs["timeout"] == 300
         assert result["message"]["tool_calls"] == [{"id": "tu1"}]
 
-    def test_run_passes_on_text_delta_to_call_llm(self):
+    def test_stream_anthropic_emits_text_boundary_events(self):
+        client = _make_client()
+        client._settings.llm_provider = "anthropic"
+        sse_lines = [
+            "event: content_block_start",
+            'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+            "event: content_block_delta",
+            'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}',
+            "event: content_block_delta",
+            'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" AI"}}',
+            "event: message_delta",
+            'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}',
+        ]
+        events = []
+        mock_resp = self._make_sse_response(sse_lines)
+        with patch("urllib.request.urlopen", return_value=mock_resp):
+            result = client._stream_anthropic("sys", [], on_stream_event=events.append)
+
+        assert result["message"]["content"] == "Hello AI"
+        assert [e["type"] for e in events] == [
+            "text_start",
+            "text_chunk",
+            "text_chunk",
+            "text_end",
+        ]
+
+    def test_run_passes_on_stream_event_to_call_llm(self):
         client = _make_client()
         final_response = {
             "finish_reason": "stop",
             "message": {"content": "done", "tool_calls": []},
         }
-        on_delta = MagicMock()
+        on_event = MagicMock()
         client._call_llm = MagicMock(return_value=final_response)
         client._fetch_tool_definitions = MagicMock(return_value=[])
 
-        result = client.run("hello", context_block="", on_text_delta=on_delta)
+        result = client.run("hello", context_block="", on_stream_event=on_event)
 
         assert result == "done"
-        # _call_llm must have been called with on_text_delta=on_delta
+        # _call_llm must have been called with on_stream_event=on_event
         call_kwargs = client._call_llm.call_args
-        assert call_kwargs.kwargs.get("on_text_delta") is on_delta
+        assert call_kwargs.kwargs.get("on_stream_event") is on_event
 
 
 class TestSubprocessSSEStream:
@@ -1417,7 +1476,7 @@ class TestSubprocessSSEStream:
                     payload=b'{"model":"t","stream":true}',
                     timeout=30,
                     fmt=fmt,
-                    on_text_delta=chunks.append,
+                    on_stream_event=_on_event_collect(chunks),
                 )
         finally:
             server.shutdown()
@@ -1505,8 +1564,10 @@ class TestSubprocessSSEStream:
         server = _SSETestServer(lines)
         seen = []
 
-        def boom(chunk):
-            seen.append(chunk)
+        def boom(evt):
+            content = evt.get("content")
+            if content:
+                seen.append(content)
             raise ValueError("ui hiccup")
 
         try:
@@ -1526,7 +1587,7 @@ class TestSubprocessSSEStream:
                     payload=b"{}",
                     timeout=30,
                     fmt="openai",
-                    on_text_delta=boom,
+                    on_stream_event=boom,
                 )
         finally:
             server.shutdown()
