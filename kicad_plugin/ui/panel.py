@@ -605,7 +605,7 @@ if _WX_AVAILABLE:
                             project,
                         )
                         self._active_project = project
-                        self._autoload_session()
+                        self._autoload_session(prompt_if_missing=True)
                         self._request_footprint_sync(project)
                 except Exception:
                     log.debug("project re-sync on panel show failed", exc_info=True)
@@ -2308,11 +2308,27 @@ if _WX_AVAILABLE:
                 return
 
             has_content = any(e["type"] in ("user", "ai") for e in self._conv_entries)
-            if has_content:
+            if not self._start_blank_session(save_first=has_content):
+                return
+
+        def _start_blank_session(self, save_first: bool) -> bool:
+            """Save (optionally) then clear everything for a blank session.
+
+            Shared by the New Session button and the "New session" entry in
+            the project session picker.  The picker path passes
+            ``save_first=False``: its session content is already persisted
+            turn-by-turn, and stamping it with the *new* ``_active_project``
+            would rewrite the old project's file ownership.
+            """
+            if save_first:
                 err = self._save_session_to_disk()
                 if err:
-                    wx.MessageBox(f"Could not save session:\n{err}", "Error", wx.OK | wx.ICON_ERROR)
-                    return
+                    wx.MessageBox(
+                        f"Could not save session:\n{err}",
+                        "Error",
+                        wx.OK | wx.ICON_ERROR,
+                    )
+                    return False
 
             # Clear conversation and LLM history for the new session.
             self._stream_timer.Stop()
@@ -2334,10 +2350,11 @@ if _WX_AVAILABLE:
             _sstore.remove_current_link(self._settings.config_dir)
 
             self._set_status(
-                "✅ New session started" + (" (previous session saved)" if has_content else ""),
+                "✅ New session started" + (" (previous session saved)" if save_first else ""),
                 self._C_OK,
             )
             self.Layout()
+            return True
 
         def _save_session_to_disk(self) -> str | None:
             """Write current conv_entries + history to disk and update current.json.
@@ -2578,7 +2595,7 @@ if _WX_AVAILABLE:
             # Destroy() the window — on a top-level wx.Frame that behaves as
             # a forced Close and cascaded into closing KiCad's project
             # windows.
-            self._autoload_session()
+            self._autoload_session(prompt_if_missing=True)
             # Refresh the footprint index for the newly active project so
             # find_footprints_not_in_libraries never reads a stale DB.
             self._request_footprint_sync(project)
@@ -2615,6 +2632,7 @@ if _WX_AVAILABLE:
                 title = d.get("title", "")[:50]
                 labels.append(f"{ts}  —  {title}")
 
+            labels.insert(0, "New session (start blank)")
             dlg = wx.SingleChoiceDialog(
                 self,
                 "Saved sessions for this project found — restore one?",
@@ -2626,8 +2644,11 @@ if _WX_AVAILABLE:
                 return
             idx = dlg.GetSelection()
             dlg.Destroy()
-            if 0 <= idx < len(candidates):
-                self._restore_session_file(candidates[idx])
+            if idx == 0:
+                self._start_blank_session(save_first=False)
+                return
+            if 1 <= idx < len(candidates) + 1:
+                self._restore_session_file(candidates[idx - 1])
 
         def _on_clear(self, event) -> None:
             if self._busy:
@@ -2770,7 +2791,7 @@ if _WX_AVAILABLE:
         # Auto-load
         # ------------------------------------------------------------------ #
 
-        def _autoload_session(self) -> None:
+        def _autoload_session(self, prompt_if_missing: bool = False) -> None:
             """Restore the session pointed to by ``current.json`` on startup.
 
             Project-aware since schema v2: a session is auto-restored only
@@ -2782,6 +2803,11 @@ if _WX_AVAILABLE:
             Only follows current.json — no glob fallback. This ensures "New
             Session" (which removes current.json) always starts blank.
 
+            When *prompt_if_missing* is set (project-switch paths) a missing
+            current.json is *not* treated as "stay blank": the open project's
+            saved sessions are offered instead — a New Session in one project
+            must not freeze the next project into a blank, unsaved state.
+
             Runs when the LLM client is initialised — on first panel display, or
             after a manual backend Restart.  Since every turn is persisted as
             it completes (send/reply/stop), the disk snapshot is always the
@@ -2791,6 +2817,8 @@ if _WX_AVAILABLE:
 
             path = _sstore.resolve_current_session(self._settings.config_dir)
             if path is None:
+                if prompt_if_missing:
+                    self._prompt_project_session_choice(self._collect_active_project())
                 return  # No current.json and no sessions dir — blank start.
 
             data, err = _sstore.load_session(path)
