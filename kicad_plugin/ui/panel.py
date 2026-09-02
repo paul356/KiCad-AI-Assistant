@@ -2356,6 +2356,38 @@ if _WX_AVAILABLE:
             self.Layout()
             return True
 
+        def _history_is_sync_only(self) -> bool:
+            """True when history is exactly the three messages an auto
+            footprint sync leaves behind: the synthetic user preamble, the
+            sync tool-call declaration, and its tool result.
+
+            The length check is the primary gate — any other turn count
+            means real messages were exchanged (user text, AI reply, or a
+            different tool), so the session must save normally.
+            """
+            from ..llm_client import FRAMEWORK_PREAMBLE
+
+            if self._llm_client is None:
+                return False
+            h = self._llm_client.get_history()
+            if len(h) != 3:
+                return False
+            # [0] synthetic user preamble
+            if h[0].get("role") != "user" or h[0].get("content") != FRAMEWORK_PREAMBLE:
+                return False
+            # [1] assistant declaring exactly the sync tool call
+            if h[1].get("role") != "assistant":
+                return False
+            tcs = h[1].get("tool_calls") or []
+            if len(tcs) != 1:
+                return False
+            if tcs[0].get("function", {}).get("name") != "sync_footprint_index":
+                return False
+            # [2] its tool result
+            if h[2].get("role") != "tool":
+                return False
+            return True
+
         def _save_session_to_disk(self) -> str | None:
             """Write current conv_entries + history to disk and update current.json.
 
@@ -2381,14 +2413,13 @@ if _WX_AVAILABLE:
             if self._conv_version == self._saved_conv_version:
                 return None
 
-            # Never create a session file for framework-only turns (e.g. a
-            # footprint sync landing in a fresh New Session): with no session
-            # file yet and no real user/ai conversation entries, the only
-            # content is tool/status cards — writing it would orphan a
-            # pointless file and point current.json at it.
-            if self._current_session_file is None and not any(
-                e["type"] in ("user", "ai") for e in self._conv_entries
-            ):
+            # A fresh New Session whose only history is the auto footprint
+            # sync (synthetic user preamble + sync tool pair) is not a real
+            # conversation: skip the write so it neither orphans a pointless
+            # session file nor repoints current.json at it.  Any real
+            # content (a user message, an AI reply, or any non-sync tool)
+            # fails the check and saves normally.
+            if self._current_session_file is None and self._history_is_sync_only():
                 return None
 
             if self._current_session_file:

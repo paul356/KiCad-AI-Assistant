@@ -25,6 +25,14 @@ from .tool_registry import get_missing_tool_policies, get_tool_policy
 
 log = logging.getLogger(__name__)
 
+# Synthetic user message prepended to history when a framework tool_direct
+# turn (e.g. auto footprint sync) would otherwise open the conversation with
+# an assistant tool-call message — providers require the first message to
+# have role "user".
+FRAMEWORK_PREAMBLE = (
+    "(A framework-initiated tool call ran before this conversation: see the tool result below.)"
+)
+
 # ------------------------------------------------------------------
 # P1  stale-query detection: category mappings
 # ------------------------------------------------------------------
@@ -986,10 +994,7 @@ class LLMClient:
                 0,
                 {
                     "role": "user",
-                    "content": (
-                        "(A framework-initiated tool call ran before this "
-                        "conversation: see the tool result below.)"
-                    ),
+                    "content": FRAMEWORK_PREAMBLE,
                 },
             )
 
