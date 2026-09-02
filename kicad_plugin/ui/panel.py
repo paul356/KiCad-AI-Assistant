@@ -2307,7 +2307,7 @@ if _WX_AVAILABLE:
                 )
                 return
 
-            has_content = any(e["type"] in ("user", "ai") for e in self._conv_entries)
+            has_content = self._session_has_real_content()
             if not self._start_blank_session(save_first=has_content):
                 return
 
@@ -2354,6 +2354,18 @@ if _WX_AVAILABLE:
                 self._C_OK,
             )
             self.Layout()
+            return True
+
+        def _session_has_real_content(self) -> bool:
+            """True when the session holds real conversation — user text or
+            an AI reply — as opposed to an empty session or a lone auto
+            footprint sync turn.  Shared by the save guard, the New Session
+            save-first check, and teardown persistence.
+            """
+            if not self._conv_entries:
+                return False
+            if self._history_is_sync_only():
+                return False
             return True
 
         def _history_is_sync_only(self) -> bool:
@@ -2413,13 +2425,14 @@ if _WX_AVAILABLE:
             if self._conv_version == self._saved_conv_version:
                 return None
 
-            # A fresh New Session whose only history is the auto footprint
-            # sync (synthetic user preamble + sync tool pair) is not a real
-            # conversation: skip the write so it neither orphans a pointless
-            # session file nor repoints current.json at it.  Any real
-            # content (a user message, an AI reply, or any non-sync tool)
-            # fails the check and saves normally.
-            if self._current_session_file is None and self._history_is_sync_only():
+            # A fresh New Session with no real conversation must not create
+            # a session file or repoint current.json at it — that would
+            # orphan a pointless file.  Two shapes are skipped: a completely
+            # empty session (nothing was said or done), and one holding only
+            # the auto footprint sync's tool turn (checked precisely against
+            # history below).  Any real content — a user message, an AI
+            # reply, or a non-sync tool call — saves normally.
+            if self._current_session_file is None and not self._session_has_real_content():
                 return None
 
             if self._current_session_file:
@@ -2740,7 +2753,7 @@ if _WX_AVAILABLE:
                 )
                 self._pending_ai_text = ""
                 self._conv_version += 1
-            if any(e["type"] in ("user", "ai") for e in self._conv_entries):
+            if self._session_has_real_content():
                 err = self._save_session_to_disk()
                 if err:
                     log.warning("Could not save session on teardown: %s", err)
