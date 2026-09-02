@@ -344,12 +344,15 @@ def _readjust_rotation(child: list[Any], fp_rotation: float) -> None:
     if fp_rotation == 0.0:
         return
     stored = _child_at_rotation(child)
-    if stored is None:
-        return
     child_type = _sym(child[0]) if len(child) > 0 else ""
     if child_type in _PAD_TYPES:
-        _set_child_at_rotation(child, stored - fp_rotation)
+        # A pad without an explicit angle reads back as axis-aligned in board
+        # space, i.e. an implied 0; re-express it in the footprint frame the
+        # same way an explicit angle would be.
+        _set_child_at_rotation(child, (stored if stored is not None else 0.0) - fp_rotation)
     elif child_type in _TEXT_TYPES:
+        if stored is None:
+            return
         _set_child_at_rotation(child, stored + fp_rotation)
 
 

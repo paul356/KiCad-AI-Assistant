@@ -271,6 +271,41 @@ class TestNormalizeForLibrary:
         assert reparsed[0] == "footprint" or str(reparsed[0]) == "footprint"
         assert str(reparsed[1]) == "Sensor_Board_XYZ"
 
+    def test_pad_without_angle_gets_negative_rotation(self):
+        """Pads with no explicit angle are axis-aligned in board space (implied
+        0) and must be re-expressed in the footprint frame: 0 - fp_rotation.
+        Regression: the board rotation was left un-applied to such pads, so
+        extracted footprints gained an extra rotation (e.g. an oval pin pad
+        ended up vertical instead of horizontal)."""
+        import sexpdata
+
+        board = sexpdata.loads(
+            '(kicad_pcb (footprint "CustomLib:A"'
+            '\t(layer "F.Cu")'
+            "\t(at 10.0 20.0 -90.0)"
+            '\t(pad "1" smd oval'
+            "\t\t(at -3.8 -6.75)"
+            "\t\t(size 0.3 1.4)"
+            '\t\t(layers "F.Cu" "F.Paste" "F.Mask")'
+            "\t)"
+            '\t(pad "2" smd rect'
+            "\t\t(at 0.0 0.0 270.0)"
+            "\t\t(size 3.61 6.35)"
+            '\t\t(layers "F.Cu" "F.Paste" "F.Mask")'
+            "\t)"
+            ")"
+            ")"
+        )
+        node = next(n for n in board if isinstance(n, list) and n and str(n[0]) == "footprint")
+        out = normalize_footprint_for_library(node, 20260206, "MyLib")
+        pads = {str(c[1]): c for c in out if isinstance(c, list) and c and str(c[0]) == "pad"}
+        at1 = next(s for s in pads["1"] if isinstance(s, list) and s and str(s[0]) == "at")
+        at2 = next(s for s in pads["2"] if isinstance(s, list) and s and str(s[0]) == "at")
+        # implied 0 - (-90) = 90
+        assert at1[3] == pytest.approx(90.0)
+        # explicit 270 - (-90) = 360 -> 0
+        assert at2[3] == pytest.approx(0.0)
+
 
 # ---------------------------------------------------------------------------
 # fp_lib_table_utils registration
