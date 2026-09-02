@@ -496,6 +496,19 @@ class FootprintDatabase:
             rows = session.execute(q).scalars().all()
         return set(rows)
 
+    def get_all_library_footprints(self, project: str | None = None) -> set[tuple[str, str]]:
+        """Return every ``(library_name, footprint_name)`` pair indexed in
+        *project* scope (global plus project libraries when given; everything
+        when ``None``)."""
+        q = select(_FootprintRow.library_name, _FootprintRow.footprint_name).join(
+            _FpLibraryRow, _FootprintRow.library_id == _FpLibraryRow.id
+        )
+        clause = self._project_scope_clause(project)
+        if clause is not None:
+            q = q.where(clause)
+        with self._Session() as session:
+            return set(session.execute(q).all())
+
     def get_stats(self, project: str | None = None) -> "DbStats":
         """Return summary statistics about the database, scoped to *project*
         (global plus project libraries when given; everything when ``None``)."""

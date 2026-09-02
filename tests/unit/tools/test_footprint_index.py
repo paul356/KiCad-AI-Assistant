@@ -1088,9 +1088,9 @@ class TestGetFootprintIndexManager:
 
 
 class TestCollectExistingNames:
-    """find's _collect_existing_names trusts the index only after a sync of
-    the *same* project completed; anything else (never ran, running, failed,
-    different project) falls back to the live fp-lib-table scan."""
+    """find's _collect_existing_footprints trusts the index only after a sync
+    of the *same* project completed; anything else (never ran, running,
+    failed, different project) falls back to the live fp-lib-table scan."""
 
     def setup_method(self):
         with _tool_module._fp_sync_lock:
@@ -1106,12 +1106,12 @@ class TestCollectExistingNames:
         indexed=None,
         live=None,
     ):
-        """Run _collect_existing_names with a fake manager + fake live scan."""
-        indexed = indexed or {"indexed_a", "indexed_b"}
-        live = live or {"live_a"}
+        """Run _collect_existing_footprints with a fake manager + fake live scan."""
+        indexed = indexed or {("LibA", "indexed_a"), ("LibA", "indexed_b")}
+        live = live or {("LibX", "live_a")}
 
         class _FakeMgr:
-            def get_all_footprint_names(self, project=None):
+            def get_all_library_footprints(self, project=None):
                 return set(indexed)
 
             def get_stats(self, project=None):
@@ -1122,43 +1122,46 @@ class TestCollectExistingNames:
             lambda project_path=None: _FakeMgr(),
         )
         monkeypatch.setattr(
-            "kcaa.tools.pcb_library_tools._live_scan_existing_names",
+            "kcaa.tools.pcb_library_tools._live_scan_existing_footprints",
             lambda pcb_path=None: set(live),
         )
-        return _tool_module._collect_existing_names(pcb_path)
+        return _tool_module._collect_existing_footprints(pcb_path)
 
     def test_never_synced_falls_back_to_live_scan(self, monkeypatch):
         """No sync record yet (fresh process) -> live scan, not the partial DB."""
-        assert self._call(monkeypatch) == {"live_a"}
+        assert self._call(monkeypatch) == {("LibX", "live_a")}
 
     def test_running_sync_falls_back_to_live_scan(self, monkeypatch):
         with _tool_module._fp_sync_lock:
             _tool_module._fp_sync_state.running = True
-        assert self._call(monkeypatch) == {"live_a"}
+        assert self._call(monkeypatch) == {("LibX", "live_a")}
 
     def test_failed_sync_falls_back_to_live_scan(self, monkeypatch):
         with _tool_module._fp_sync_lock:
             _tool_module._fp_sync_state.last_result = None
             _tool_module._fp_sync_state.error = "boom"
             _tool_module._fp_sync_state.last_project_path = "/tmp/A"
-        assert self._call(monkeypatch) == {"live_a"}
+        assert self._call(monkeypatch) == {("LibX", "live_a")}
 
     def test_sync_for_different_project_falls_back(self, monkeypatch):
         """Index synced for project B cannot answer find for project A."""
         with _tool_module._fp_sync_lock:
             _tool_module._fp_sync_state.last_result = {"success": True}
             _tool_module._fp_sync_state.last_project_path = "/tmp/B"
-        assert self._call(monkeypatch) == {"live_a"}
+        assert self._call(monkeypatch) == {("LibX", "live_a")}
 
     def test_completed_sync_for_same_project_uses_index(self, monkeypatch):
         with _tool_module._fp_sync_lock:
             _tool_module._fp_sync_state.last_result = {"success": True}
             _tool_module._fp_sync_state.last_project_path = "/tmp/A"
-        assert self._call(monkeypatch) == {"indexed_a", "indexed_b"}
+        assert self._call(monkeypatch) == {("LibA", "indexed_a"), ("LibA", "indexed_b")}
 
     def test_global_sync_serves_global_find(self, monkeypatch):
         """sync without project (""), find without project ("") -> index OK."""
         with _tool_module._fp_sync_lock:
             _tool_module._fp_sync_state.last_result = {"success": True}
             _tool_module._fp_sync_state.last_project_path = ""
-        assert self._call(monkeypatch, pcb_path=None) == {"indexed_a", "indexed_b"}
+        assert self._call(monkeypatch, pcb_path=None) == {
+            ("LibA", "indexed_a"),
+            ("LibA", "indexed_b"),
+        }

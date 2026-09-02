@@ -321,6 +321,11 @@ class FootprintIndexManager:
         (global + project libraries)."""
         return self._db.get_all_footprint_names(project=self._project_id)
 
+    def get_all_library_footprints(self) -> set[tuple[str, str]]:
+        """Return every ``(library_name, footprint_name)`` pair indexed in the
+        manager's project scope (global + project libraries)."""
+        return self._db.get_all_library_footprints(project=self._project_id)
+
     def get_stats(self) -> DbStats:
         """Return summary statistics about the footprint database, scoped to
         the manager's project (global + project libraries)."""

@@ -413,11 +413,18 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
     ) -> dict[str, Any]:
         """List board footprints that exist in no indexed footprint library.
 
-        Read-only: compares the footprints embedded in the board against the
-        effective fp-lib-table library list (project-local table plus global
-        user table, including system libraries).  Footprints with no
-        same-named match anywhere are candidates for export into a
-        3rdparty library.
+        Read-only: compares each footprint the board references (its
+        ``Library:Name`` pair, or bare ``Name`` for footprints stamped on the
+        board) against the libraries actually available — project-local fp-
+        lib-table, global user table, and indexed library database.  A
+        footprint whose referenced library is missing (or whose name exists
+        only in some *other* library) is reported as missing, since the board
+        cannot resolve it; sync the footprint index first for the database
+        to be authoritative.
+
+        Output is consolidated per ``(library, name)``: each entry lists all
+        board references using that footprint, so a population of e.g. ten
+        identical resistors appears once rather than as ten same-shaped rows.
 
         Args:
             pcb_path: Absolute path to the ``.kicad_pcb`` file.  Its
@@ -426,13 +433,35 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
             ctx: MCP context (unused).
 
         Returns:
-            dict with ``missing`` (list of {name, library, reference, value}),
-            ``missing_count``; plus ``error`` on failure.
+            dict with ``missing`` (list of {name, library, references,
+            reference_count, values}), ``missing_count``; plus ``error`` on
+            failure.
         """
         try:
             _, footprints, _ = _collect_board_footprints(pcb_path)
-            existing = _collect_existing_names(pcb_path)
-            missing = [fp for fp in footprints if fp["name"] not in existing]
+            existing = _collect_existing_footprints(pcb_path)
+            missing: list[dict[str, Any]] = []
+            merged: dict[tuple[str, str], dict[str, Any]] = {}
+            for fp in footprints:
+                lib, name = fp["library"], fp["name"]
+                if (lib, name) in existing:
+                    continue
+                key = (lib, name)
+                entry = merged.get(key)
+                if entry is None:
+                    entry = {
+                        "name": name,
+                        "library": lib,
+                        "references": [],
+                        "values": [],
+                    }
+                    merged[key] = entry
+                entry["references"].append(fp["reference"])
+                if fp["value"] and fp["value"] not in entry["values"]:
+                    entry["values"].append(fp["value"])
+            for entry in merged.values():
+                entry["reference_count"] = len(entry["references"])
+                missing.append(entry)
             return {
                 "missing": missing,
                 "missing_count": len(missing),
@@ -556,8 +585,8 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
 
         A requested footprint is ``failed`` when its target file already
         exists in the library directory (never overwritten), and ``skipped``
-        when it already exists in another indexed library or is not on the
-        board.
+        when the exact ``(library, name)`` pair the board references is
+        already indexed, or when the name is not on the board at all.
 
         Args:
             pcb_path: Absolute path to the ``.kicad_pcb`` file.  Its
@@ -585,14 +614,18 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
             project_id = normalize_project_id(pcb_path)
             project_table = os.path.join(project_id, "fp-lib-table")
             target_project = project_id if os.path.realpath(target_table) == project_table else ""
-            # Same source of truth as find_footprints_not_in_libraries: the index DB
-            # (project-scoped), with a live scan only when the index is empty.
-            existing = _collect_existing_names(pcb_path)
+            # Same source of truth as find_footprints_not_in_libraries: the
+            # (library, name) pairs in the index DB (project-scoped), with a
+            # live scan only when the index is empty.  A *name* is skipped
+            # only when the exact pair the board references is already
+            # available — a same-named footprint in some other library does
+            # not satisfy the board's reference.
+            existing = _collect_existing_footprints(pcb_path)
             board_names = {name for _, name in (split_footprint_header(node) for node in nodes)}
             if ctx:
                 await ctx.info(
                     f"Exporting missing footprints to {library_dir} "
-                    f"({len(footprints)} requested, {len(existing)} indexed names)"
+                    f"({len(footprints)} requested, {len(existing)} indexed footprints)"
                 )
 
             exported: list[str] = []
@@ -600,6 +633,10 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
             skipped: list[dict[str, str]] = []
             node_by_name = {
                 name: node for node in nodes for name in [split_footprint_header(node)[1]]
+            }
+            board_pair = {
+                name: (split_footprint_header(node)[0] or "", name)
+                for name, node in node_by_name.items()
             }
             for name in dict.fromkeys(footprints):  # dedupe, keep order
                 if name not in board_names:
@@ -631,7 +668,7 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
                         }
                     )
                     continue
-                if name in existing:
+                if board_pair[name] in existing:
                     skipped.append({"name": name, "reason": "already in library"})
                     continue
                 try:
@@ -757,8 +794,11 @@ def _resolve_library_dir(library: str, pcb_path: str | None) -> tuple[str, str]:
     return lib_dir, table_path
 
 
-def _collect_existing_names(pcb_path: str | None) -> set[str]:
-    """Return every footprint name that already exists in libraries.
+def _collect_existing_footprints(pcb_path: str | None) -> set[tuple[str, str]]:
+    """Return every ``(library, footprint_name)`` pair that already exists in
+    libraries — the *same-name-in-any-library* answer of the inherited tools
+    is deliberately not used here: a name alone cannot tell whether the
+    footprint the board references (``Library:Name``) is actually available.
 
     Prefers the footprint index database — but only when the current project's
     sync has actually completed: a project whose sync never ran (or is still
@@ -770,7 +810,7 @@ def _collect_existing_names(pcb_path: str | None) -> set[str]:
     is ``normalize_project_id(pcb_path)`` — the same canonical id
     ``sync_footprint_index`` stores in ``_fp_sync_state.last_project_path``.
     """
-    existing: set[str] = set()
+    existing: set[tuple[str, str]] = set()
     try:
         with _fp_sync_lock:
             running = _fp_sync_state.running
@@ -782,28 +822,30 @@ def _collect_existing_names(pcb_path: str | None) -> set[str]:
             or not last_result.get("success")
             or last_project != normalize_project_id(pcb_path)
         ):
-            existing = _live_scan_existing_names(pcb_path)
+            existing = _live_scan_existing_footprints(pcb_path)
         else:
             mgr = get_footprint_index_manager(project_path=pcb_path)
-            existing = mgr.get_all_footprint_names()
+            existing = mgr.get_all_library_footprints()
     except Exception as exc:
         log.warning("Footprint index read failed (%s) — falling back to live scan", exc)
-        existing = _live_scan_existing_names(pcb_path)
+        existing = _live_scan_existing_footprints(pcb_path)
     return existing
 
 
-def _live_scan_existing_names(pcb_path: str | None) -> set[str]:
-    """Live-scan fallback: every footprint name across the effective library
-    list (project-local table plus global user table, ``${KIPRJMOD}`` /
-    ``KICAD*`` URI expanded).  Purely in-memory — nothing is written to the
-    footprint database.
+def _live_scan_existing_footprints(pcb_path: str | None) -> set[tuple[str, str]]:
+    """Live-scan fallback: every ``(library, footprint_name)`` pair across the
+    effective library list (project-local table plus global user table,
+    ``${KIPRJMOD}`` / ``KICAD*`` URI expanded).  Purely in-memory — nothing
+    is written to the footprint database.
     """
-    names: set[str] = set()
+    pairs: set[tuple[str, str]] = set()
     for lib in build_effective_library_list(pcb_path):
         uri = lib.get("uri", "")
+        nickname = lib.get("nickname") or ""
         if uri and os.path.isdir(uri):
-            names.update(scan_footprint_library(uri))
-    return names
+            for name in scan_footprint_library(uri):
+                pairs.add((nickname, name))
+    return pairs
 
 
 def _collect_board_footprints(pcb_path: str) -> tuple[list[Any], list[dict[str, Any]], int]:

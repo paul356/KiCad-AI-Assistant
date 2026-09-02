@@ -67,7 +67,7 @@ _BOARD = """\
 \t\t(fp_text reference "U1" (at 0 2.0 90.0) (layer "F.SilkS"))
 \t\t(fp_text value "Sensor" (at 0 -2.0 90.0) (layer "F.Fab"))
 \t)
-\t(footprint "Resistor_SMD:R_0402_1005Metric"
+\t(footprint "TestSys:R_0402_1005Metric"
 \t\t(layer "F.Cu")
 \t\t(uuid "22222222-0000-0000-0000-000000000002")
 \t\t(at 20.0 30.0 0.0)
@@ -367,15 +367,35 @@ def tools():
 
 
 class TestFindMissingFootprints:
-    def test_reports_missing_and_existing(self, tools, tmp_path, project):
-        board = _make_board(tmp_path)
+    def test_consolidates_multiple_references(self, tools, tmp_path, project):
+        """Two board instances of the same (library, name) collapse into one
+        missing entry carrying both references, not two same-shaped rows."""
+        # A second full Sensor_Board_XYZ node (same lib:name, reference U2)
+        # inserted before the Connector_Odd node keeps the board valid S-expr.
+        u2_node = (
+            '\t(footprint "CustomLib:Sensor_Board_XYZ"\n'
+            '\t\t(layer "F.Cu")\n'
+            '\t\t(uuid "44444444-0000-0000-0000-000000000004")\n'
+            "\t\t(at 12.0 22.0 0.0)\n"
+            '\t\t(property "Reference" "U2")\n'
+            '\t\t(property "Value" "Sensor")\n'
+            '\t\t(fp_text reference "U2" (at 0 2.0 0.0) (layer "F.SilkS"))\n'
+            '\t\t(fp_text value "Sensor" (at 0 -2.0 0.0) (layer "F.Fab"))\n'
+            "\t)\n"
+        )
+        board_text = _BOARD.replace(
+            '\t(footprint "CustomLib:Connector_Odd"',
+            u2_node + '\t(footprint "CustomLib:Connector_Odd"',
+        )
+        board = str(tmp_path / "two_mods.kicad_pcb")
+        open(board, "w", encoding="utf-8").write(board_text)
         result = _run(tools["find_footprints_not_in_libraries"](pcb_path=board, ctx=None))
         assert "error" not in result, result
-        names = [fp["name"] for fp in result["missing"]]
-        assert "Sensor_Board_XYZ" in names
-        assert "Connector_Odd" in names
-        assert "R_0402_1005Metric" not in names  # in TestSys library
-        assert result["missing_count"] == 2
+        sensor = [fp for fp in result["missing"] if fp["name"] == "Sensor_Board_XYZ"]
+        assert len(sensor) == 1  # merged, not one row per instance
+        assert sorted(sensor[0]["references"]) == ["U1", "U2"]
+        assert sensor[0]["reference_count"] == 2
+        assert result["missing_count"] == 2  # Sensor_Board_XYZ + Connector_Odd
 
     def test_list_is_read_only(self, tools, tmp_path, project):
         board = _make_board(tmp_path)
