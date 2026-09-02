@@ -1444,7 +1444,7 @@ class LLMClient:
                 removed_count,
             )
 
-    def _maybe_compact(self, system_prompt: str) -> None:
+    def _maybe_compact(self, system_prompt: str, on_compacted=None) -> None:
         """Manage history purely by token budget.
 
         Under budget, history is left byte-identical (append-only growth), so
@@ -1497,8 +1497,12 @@ class LLMClient:
             200, int((target_post_compact - system_tokens - recent_tokens) * 4)
         )
 
-        self._compact_history(system_prompt, target_summary_chars)
+        compacted = self._compact_history(system_prompt, target_summary_chars)
         self._validate_history()  # compaction rebuilds history; verify integrity
+        if compacted and on_compacted is not None:
+            on_compacted(
+                "⟲ History compacted — earlier context summarised; recent turns kept verbatim."
+            )
 
         # Annotate stale query results among the preserved turns only — the
         # compacted prefix is summarized, so nothing earlier needs marking.
@@ -1661,6 +1665,7 @@ class LLMClient:
         context_block: str,
         on_tool_call: Callable[[str, dict, Any], None] | None = None,
         on_stream_event: Callable[[dict], None] | None = None,
+        on_compacted: Callable[[str], None] | None = None,
         images: list[dict[str, Any]] | None = None,
     ) -> str:
         """
@@ -1673,6 +1678,9 @@ class LLMClient:
                            after each tool execution — use this to update the UI.
             on_stream_event: Optional callback(evt) fired for each streaming
                            lifecycle event: text_start / text_chunk / text_end.
+            on_compacted:  Optional callback(notice) fired when history
+                           compaction summarised part of the conversation —
+                           the UI surfaces this as a chat notice.
             images:        Optional list of dicts {"media_type": "image/png",
                            "data": "<base64>"} attached to this user message.
 
@@ -1682,7 +1690,7 @@ class LLMClient:
         system = build_system_prompt(context_block)
         content = self._build_user_content(user_message, images)
         self._history.append({"role": "user", "content": content})
-        self._maybe_compact(system)
+        self._maybe_compact(system, on_compacted)
 
         tools = self._fetch_tool_definitions()
         missing_policies = get_missing_tool_policies(

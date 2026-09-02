@@ -186,3 +186,44 @@ def test_tool_call_entries_carry_seq_and_mark_tool_use():
 def test_make_ai_entry_shape():
     entry = make_ai_entry("answer text", "12:34:56")
     assert entry == {"type": "ai", "text": "answer text", "timestamp": "12:34:56"}
+
+
+def test_status_event_appends_status_entry():
+    """A status event (e.g. compacted-history notice) becomes a chat entry
+    with the rendering format used elsewhere (type/status + color_hex)."""
+    s = _state()
+    st = _apply(
+        s,
+        {
+            "type": "status",
+            "text": "⟲ History compacted — earlier context summarised.",
+            "color_hex": "#B8860B",
+        },
+    )
+    assert st.entries_changed is True
+    assert s["entries"] == [
+        {
+            "type": "status",
+            "text": "⟲ History compacted — earlier context summarised.",
+            "color_hex": "#B8860B",
+        }
+    ]
+    # Status notices never touch the draft / turn text state.
+    assert s["pending"] == ""
+    assert st.turn_had_text is False
+    assert st.draft_changed is False
+
+
+def test_status_event_defaults_color_when_omitted():
+    """Rendering falls back to the neutral colour when no color_hex is given."""
+    s = _state()
+    _apply(s, {"type": "status", "text": "notice"})
+    assert s["entries"] == [{"type": "status", "text": "notice", "color_hex": "#1E1E1E"}]
+
+
+def test_status_event_is_not_a_tool_call():
+    """Status events must not increment the tool sequence or mark tool use."""
+    s = _state()
+    _apply(s, {"type": "status", "text": "notice"})
+    assert s["tool_seq"] == 0
+    assert s["tool_calls_made"] is False

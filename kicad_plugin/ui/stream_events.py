@@ -29,6 +29,7 @@ from typing import Any
 #   {"type": "text_end"}                                response text complete -> finalise draft
 #   {"type": "tool_call", "name": str, "args": dict, "result": Any, "_seq": int}
 #   {"type": "turn_end", "reply": str}                  turn complete (takes over _on_reply)
+#   {"type": "status", "text": str, "color_hex": str}   transient system notice (e.g. compacted history)
 #
 # The panel tags every event with the generation of the turn it belongs to
 # (``_gen``) and drops events of older turns before calling apply_stream_event.
@@ -134,6 +135,17 @@ def apply_stream_event(
             # ``was_streamed=False`` branch of _on_reply.
             entries.append(make_ai_entry(reply, timestamp()))
             base.entries_changed = True
+        return base
+
+    if etype == "status":
+        entries.append(
+            {
+                "type": "status",
+                "text": evt.get("text", ""),
+                "color_hex": evt.get("color_hex", "#1E1E1E"),
+            }
+        )
+        base.entries_changed = True
         return base
 
     return base  # unknown event type — ignore

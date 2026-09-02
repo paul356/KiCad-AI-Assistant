@@ -596,6 +596,7 @@ if _WX_AVAILABLE:
                         )
                         self._active_project = project
                         self._autoload_session()
+                        self._start_footprint_sync(project)
                 except Exception:
                     log.debug("project re-sync on panel show failed", exc_info=True)
             event.Skip()
@@ -880,6 +881,9 @@ if _WX_AVAILABLE:
                             {"type": "tool_call", "name": name, "args": args, "result": result}
                         ),
                         on_stream_event=_emit,
+                        on_compacted=lambda notice: _emit(
+                            {"type": "status", "text": notice, "color_hex": self._C_WARN_HEX}
+                        ),
                         images=images,
                     )
                 except Exception as e:
@@ -2484,6 +2488,9 @@ if _WX_AVAILABLE:
             # a forced Close and cascaded into closing KiCad's project
             # windows.
             self._autoload_session()
+            # Refresh the footprint index for the newly active project so
+            # find_footprints_not_in_libraries never reads a stale DB.
+            self._start_footprint_sync(project)
 
         def _prompt_project_session_choice(self, project_path: str | None) -> None:
             """Offer the open project's saved sessions after a skip.
@@ -2634,6 +2641,69 @@ if _WX_AVAILABLE:
                 self._finalise_and_save_on_teardown()
                 self._server_mgr.stop()
             event.Skip()
+
+        def _start_footprint_sync(self, project_path: str) -> None:
+            """Start a background non-force footprint index sync for the project.
+
+            Fired on project open/switch so the index stays fresh for
+            ``find_footprints_not_in_libraries``; the server's sync tool
+            guards against duplicates (``already_running``).  A status entry
+            is appended to the conversation so the user sees the sync start.
+            """
+
+            def _do_sync() -> None:
+                base_url = self._server_mgr.base_url
+                if not base_url:
+                    log.debug("footprint sync: no server base URL yet")
+                    return
+                try:
+                    from ..llm_client import call_mcp_tool
+
+                    result = call_mcp_tool(
+                        base_url,
+                        "sync_footprint_index",
+                        {"project_path": project_path},
+                    )
+                except Exception as exc:
+                    log.warning("Auto footprint sync failed: %s", exc)
+                    return
+                status = result.get("status")
+                if status == "already_running":
+                    log.debug("footprint sync: already running — skipping")
+                    return
+                if status == "started":
+                    wx.CallAfter(
+                        self._append_entry,
+                        {
+                            "type": "status",
+                            "text": (
+                                "⟳ Footprint index sync started in the background for this project."
+                            ),
+                            "color_hex": self._C_WARN_HEX,
+                        },
+                    )
+                    wx.CallAfter(
+                        self._render_conversation,
+                        force_scroll_to_bottom=self._follow_output_to_bottom,
+                    )
+                elif result.get("success") is False or result.get("error"):
+                    wx.CallAfter(
+                        self._append_entry,
+                        {
+                            "type": "status",
+                            "text": "⚠ Footprint index sync failed: %s"
+                            % (result.get("error") or result),
+                            "color_hex": self._C_ERR_HEX,
+                        },
+                    )
+                    wx.CallAfter(
+                        self._render_conversation,
+                        force_scroll_to_bottom=self._follow_output_to_bottom,
+                    )
+                else:
+                    log.debug("Auto footprint sync returned unexpected status: %r", result)
+
+            threading.Thread(target=_do_sync, daemon=True).start()
 
         # ------------------------------------------------------------------ #
         # Auto-load
