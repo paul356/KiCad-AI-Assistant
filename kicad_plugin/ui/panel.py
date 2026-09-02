@@ -2307,8 +2307,7 @@ if _WX_AVAILABLE:
                 )
                 return
 
-            has_content = self._session_has_real_content()
-            if not self._start_blank_session(save_first=has_content):
+            if not self._start_blank_session(save_first=True):
                 return
 
         def _start_blank_session(self, save_first: bool) -> bool:
@@ -2320,6 +2319,7 @@ if _WX_AVAILABLE:
             turn-by-turn, and stamping it with the *new* ``_active_project``
             would rewrite the old project's file ownership.
             """
+            saved_previous = False
             if save_first:
                 err = self._save_session_to_disk()
                 if err:
@@ -2329,6 +2329,10 @@ if _WX_AVAILABLE:
                         wx.OK | wx.ICON_ERROR,
                     )
                     return False
+                # The save guard skips empty / sync-only sessions, so
+                # "previous session saved" must reflect what actually
+                # happened, not just that save_first was requested.
+                saved_previous = self._saved_conv_version == self._conv_version
 
             # Clear conversation and LLM history for the new session.
             self._stream_timer.Stop()
@@ -2350,7 +2354,7 @@ if _WX_AVAILABLE:
             _sstore.remove_current_link(self._settings.config_dir)
 
             self._set_status(
-                "✅ New session started" + (" (previous session saved)" if save_first else ""),
+                "✅ New session started" + (" (previous session saved)" if saved_previous else ""),
                 self._C_OK,
             )
             self.Layout()
@@ -2425,14 +2429,15 @@ if _WX_AVAILABLE:
             if self._conv_version == self._saved_conv_version:
                 return None
 
-            # A fresh New Session with no real conversation must not create
-            # a session file or repoint current.json at it — that would
-            # orphan a pointless file.  Two shapes are skipped: a completely
-            # empty session (nothing was said or done), and one holding only
-            # the auto footprint sync's tool turn (checked precisely against
-            # history below).  Any real content — a user message, an AI
-            # reply, or a non-sync tool call — saves normally.
-            if self._current_session_file is None and not self._session_has_real_content():
+            # A session with no real conversation must not be written or
+            # repointed — that would orphan a pointless file.  Two shapes
+            # are skipped: a completely empty session (nothing was said or
+            # done), and one holding only the auto footprint sync's tool
+            # turn (checked precisely against history below).  Any real
+            # content — a user message, an AI reply, or a non-sync tool
+            # call — saves normally.  Every caller (turn end, teardown,
+            # New Session) funnels through this single guard.
+            if not self._session_has_real_content():
                 return None
 
             if self._current_session_file:
@@ -2753,10 +2758,9 @@ if _WX_AVAILABLE:
                 )
                 self._pending_ai_text = ""
                 self._conv_version += 1
-            if self._session_has_real_content():
-                err = self._save_session_to_disk()
-                if err:
-                    log.warning("Could not save session on teardown: %s", err)
+            err = self._save_session_to_disk()
+            if err:
+                log.warning("Could not save session on teardown: %s", err)
 
         def _on_close(self, event) -> None:
             """Panel close: user X hides; watchdog force-close tears down.
