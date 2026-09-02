@@ -2401,26 +2401,17 @@ if _WX_AVAILABLE:
 
                 proj = collect_context().get("active_project")
                 if proj:
-                    log.debug("project via collect_context: %s", proj)
                     return proj
-                windows = wx.GetTopLevelWindows()
-                log.debug(
-                    "project via collect_context: None — trying %d top-level window title(s)",
-                    len(windows),
-                )
-                for w in windows:
+                for w in wx.GetTopLevelWindows():
                     title = w.GetTitle()
                     if not title:
-                        log.debug("window title empty (class=%s)", type(w).__name__)
                         continue
                     p = project_path_from_title(title)
                     if p:
                         log.debug("project from window title %r -> %s", title, p)
                         return p
-                    log.debug("window title %r did not yield a project", title)
             except Exception:
                 log.debug("_collect_active_project failed", exc_info=True)
-            log.debug("_collect_active_project returning None")
             return None
 
         def _start_project_watch(self) -> None:
