@@ -2381,6 +2381,16 @@ if _WX_AVAILABLE:
             if self._conv_version == self._saved_conv_version:
                 return None
 
+            # Never create a session file for framework-only turns (e.g. a
+            # footprint sync landing in a fresh New Session): with no session
+            # file yet and no real user/ai conversation entries, the only
+            # content is tool/status cards — writing it would orphan a
+            # pointless file and point current.json at it.
+            if self._current_session_file is None and not any(
+                e["type"] in ("user", "ai") for e in self._conv_entries
+            ):
+                return None
+
             if self._current_session_file:
                 filename = self._current_session_file
             else:
