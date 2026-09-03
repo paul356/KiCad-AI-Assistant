@@ -356,6 +356,148 @@ def _readjust_rotation(child: list[Any], fp_rotation: float) -> None:
         _set_child_at_rotation(child, stored + fp_rotation)
 
 
+def _mirror_child_y(child: list[Any]) -> None:
+    """Negate the Y coordinate of every position-bearing node in *child*.
+
+    Mirrors ``at``, ``start``, ``end``, ``mid``, ``center`` and ``pts`` (via
+    ``polygon``/``fill``) subnodes about the footprint's X axis — the geometry
+    half of a top-bottom flip, matching KiCad's library-frame mirroring.
+    """
+    for sub in child:
+        if not isinstance(sub, list) or len(sub) < 3:
+            continue
+        key = _sym(sub[0])
+        if key in ("at", "start", "end", "mid", "center") and len(sub) >= 3:
+            sub[2] = -float(sub[2]) + 0.0
+        elif key in ("pts", "polygon"):
+            _mirror_child_y(sub)
+        elif key == "fill" and any(
+            isinstance(s, list) and len(s) > 0 and _sym(s[0]) == "polygon" for s in sub
+        ):
+            _mirror_child_y(sub)
+        elif key == "xy":
+            sub[2] = -float(sub[2]) + 0.0
+
+
+def _swap_arc_start_end(child: list[Any]) -> None:
+    """Swap the coordinate values of an ``fp_arc`` node's ``start``/``end``.
+
+    KiCad's PCB_SHAPE::Flip mirrors an arc by negating all three points and
+    then swapping start/end; a plain Y-mirror reverses its direction.  Mirror
+    the geometry, then swap so the stored arc still sweeps the same way.
+    """
+    start_node = end_node = None
+    for sub in child:
+        if not (isinstance(sub, list) and len(sub) >= 3):
+            continue
+        key = _sym(sub[0])
+        if key == "start":
+            start_node = sub
+        elif key == "end":
+            end_node = sub
+    if start_node is not None and end_node is not None:
+        start_node[1], end_node[1] = end_node[1], start_node[1]
+        start_node[2], end_node[2] = end_node[2], start_node[2]
+
+
+def _clear_text_mirror(child: list[Any]) -> None:
+    """Remove the ``mirror`` entry from a text node's ``(effects … (justify …))``."""
+    for sub in child:
+        if not (isinstance(sub, list) and len(sub) > 0 and _sym(sub[0]) == "effects"):
+            continue
+        for eff in sub:
+            if not (isinstance(eff, list) and len(eff) > 0 and _sym(eff[0]) == "justify"):
+                continue
+            eff[:] = [
+                e
+                for e in eff
+                if not (e == "mirror" or (isinstance(e, sexpdata.Symbol) and str(e) == "mirror"))
+            ]
+
+
+def _ensure_unlocked(child: list[Any]) -> None:
+    """Add ``(unlocked yes)`` if the child (a text node) lacks one.
+
+    ``unlocked`` disables keep-upright in KiCad, so the upright angle chosen
+    by :func:`_flip_footprint_to_front` survives placement unchanged.
+    """
+    for sub in child:
+        if isinstance(sub, list) and len(sub) > 0 and _sym(sub[0]) == "unlocked":
+            return
+    child.append([sexpdata.Symbol("unlocked"), sexpdata.Symbol("yes")])
+
+
+def _flip_footprint_to_front(node: list[Any]) -> None:
+    """Transform a back-side (B.Cu) footprint node in place to the canonical
+    front-side library form: negate child Y (the geometry mirror), negate pad
+    angles, set text angles upright (90°) with keep-upright unlocked, and flip
+    every layer F↔B.  This is the exact inverse of KiCad placing the footprint
+    on the back side, so re-placing the exported library part on B.Cu yields
+    the original component.
+    """
+    for i in list(range(len(node) - 1, 1, -1)):
+        child = node[i]
+        if not (isinstance(child, list) and len(child) > 0):
+            continue
+        key = _sym(child[0])
+        if key in _PAD_TYPES:
+            _mirror_child_y(child)
+            stored = _child_at_rotation(child)
+            if stored is not None:
+                _set_child_at_rotation(child, -stored)
+        elif key in _TEXT_TYPES:
+            _mirror_child_y(child)
+            _set_child_at_rotation(child, 90.0)
+            _clear_text_mirror(child)
+            _ensure_unlocked(child)
+        elif key in ("fp_line", "fp_rect", "fp_circle", "fp_arc"):
+            _mirror_child_y(child)
+            if key == "fp_arc":
+                _swap_arc_start_end(child)
+        elif key == "fp_poly":
+            _mirror_child_y(child)
+        elif key == "zone":
+            # Zone outlines are stored in absolute board coordinates (the
+            # polygon here spans the footprint's placement origin, not a
+            # local frame), so they must not be mirrored or shifted when
+            # flipping the footprint.  The layer token is still flipped
+            # below so B.Cu -> F.Cu.
+            pass
+    _flip_layers_recursive(node)
+
+
+def _has_fp_text_of_type(node: list[Any], text_type: str) -> bool:
+    """True when *node* already contains an ``fp_text`` of *text_type*."""
+    for sub in node:
+        if (
+            isinstance(sub, list)
+            and len(sub) > 1
+            and _sym(sub[0]) == "fp_text"
+            and _sym(sub[1]) == text_type
+        ):
+            return True
+    return False
+
+
+def _property_to_fp_text(child: list[Any], prop_name: str, new_value: str) -> list[Any]:
+    """Convert a board ``property`` node to library ``fp_text`` form.
+
+    Board footprints carry the reference/value text as properties (with
+    ``(at …)``/``(layer …)``/``(effects …)``).  Library footprints use
+    ``fp_text`` instead.  The node's position, layer, and effects are kept so
+    the exported reference/value sits where the board displayed it; only the
+    header name/value change.
+    """
+    # The type token must serialize as a bare Symbol (``fp_text reference``),
+    # not a quoted string; a quoted type fails to parse in KiCad.
+    text_type = "reference" if prop_name == "Reference" else "value"
+    fp_text_node = [sexpdata.Symbol("fp_text"), sexpdata.Symbol(text_type), new_value]
+    for sub in child[3:]:
+        if isinstance(sub, list) and len(sub) > 0:
+            fp_text_node.append(sub)
+    return fp_text_node
+
+
 def normalize_footprint_for_library(
     fp_node: list[Any],
     pcb_version: int,
@@ -373,6 +515,9 @@ def normalize_footprint_for_library(
     node = copy.deepcopy(fp_node)
 
     _, name = split_footprint_header(node)
+    # Back-side footprint: exported as front-side form after mirroring, matching
+    # the all-front convention of KiCad library footprints.
+    flip_from_back = get_fp_layer(node) == "B.Cu"
     # Header: bare footprint name (no "Library:" prefix).
     node[1] = name
 
@@ -395,11 +540,21 @@ def normalize_footprint_for_library(
         elif key == "property":
             prop_name = child[1] if len(child) > 1 and isinstance(child[1], str) else ""
             if prop_name in _INSTANCE_PROPERTIES:
-                del node[i]
+                text_type = "reference" if prop_name == "Reference" else "value"
+                if _has_fp_text_of_type(node, text_type):
+                    # The board already carries the text as fp_text (older
+                    # format); drop the duplicate property copy.
+                    del node[i]
+                else:
+                    # Convert to the library's fp_text form, keeping the board
+                    # position/effects; value is normalized to REF** / name below.
+                    text_value = "REF**" if prop_name == "Reference" else name
+                    node[i] = _property_to_fp_text(child, prop_name, text_value)
+                    child_at_nodes.append(node[i])
             elif prop_name == "Footprint":
                 # Re-point at the new library (KiCad "Save Copy As" behavior).
                 child[2] = f"{new_library}:{name}"
-        elif key in ("pad", "fp_text"):
+        elif key in ("pad", "fp_text", "property"):
             child_at_nodes.append(child)
 
     # Re-express child rotations in the footprint's own frame.
@@ -413,10 +568,18 @@ def normalize_footprint_for_library(
                     del child[j]
         elif _sym(child[0]) == "fp_text":
             text_type = _sym(child[1]) if len(child) > 1 else ""
-            if text_type == "reference" and len(child) > 2:
-                child[2] = "REF**"
-            elif text_type == "value" and len(child) > 2:
-                child[2] = name
+            if text_type in ("reference", "value"):
+                # Text faces up (90°) uniformly, regardless of board rotation.
+                _set_child_at_rotation(child, 90.0)
+                if text_type == "reference" and len(child) > 2:
+                    child[2] = "REF**"
+                elif text_type == "value" and len(child) > 2:
+                    child[2] = name
+
+    # Restore a back-side footprint to the front-side library form: mirror
+    # geometry, negate pad angles, set text upright, flip layers F↔B.
+    if flip_from_back:
+        _flip_footprint_to_front(node)
 
     # Insert the format version right after the header name.
     node.insert(2, [sexpdata.Symbol("version"), pcb_version])

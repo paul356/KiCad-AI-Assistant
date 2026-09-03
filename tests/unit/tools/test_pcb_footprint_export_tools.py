@@ -247,20 +247,29 @@ class TestNormalizeForLibrary:
                         # pad stored 90° absolute -> local 90 - 45 = 45
                         assert sub[3] == pytest.approx(45.0)
 
-    def test_rotation_inverted_for_text(self):
+    def test_text_upright_and_position_kept(self):
+        """Reference/value text exports as fp_text at its board position,
+        uniformly upright (90°) regardless of the footprint's placement
+        rotation."""
         node = self._node()[0]
         out = normalize_footprint_for_library(node, 20260206, "MyLib")
-        for child in out:
-            if isinstance(child, list) and child and str(child[0]) == "fp_text":
-                for sub in child:
-                    if isinstance(sub, list) and sub and str(sub[0]) == "at":
-                        # text stored 90° (board-space readable) -> local 90 + 45 = 135
-                        assert sub[3] == pytest.approx(135.0)
-                        break
-                if child[1] and str(child[1]) == "reference":
-                    assert child[2] == "REF**"
-                elif child[1] and str(child[1]) == "value":
-                    assert child[2] == "Sensor_Board_XYZ"
+        texts = {str(c[1]): c for c in out if isinstance(c, list) and c and str(c[0]) == "fp_text"}
+        assert "reference" in texts
+        assert "value" in texts
+        for text_type, c in texts.items():
+            at = next(s for s in c if isinstance(s, list) and s and str(s[0]) == "at")
+            # uniform upright angle (90°), not board-space compensated
+            assert at[3] == pytest.approx(90.0)
+            if text_type == "reference":
+                assert c[2] == "REF**"
+            else:
+                assert c[2] == "Sensor_Board_XYZ"
+        # position: kept from the board (fp rot 45° does not shift x/y)
+        ref_at = next(
+            s for s in texts["reference"] if isinstance(s, list) and s and str(s[0]) == "at"
+        )
+        assert ref_at[1] == pytest.approx(0.0)
+        assert ref_at[2] == pytest.approx(2.0)
 
     def test_serialize_roundtrip(self):
         node = self._node()[0]
@@ -306,6 +315,163 @@ class TestNormalizeForLibrary:
         assert at1[3] == pytest.approx(90.0)
         # explicit 270 - (-90) = 360 -> 0
         assert at2[3] == pytest.approx(0.0)
+
+
+class TestNormalizeBackSideFlip:
+    """B.Cu board footprints are exported in front-side form: geometry Y
+    mirrored, pad angles negated, text upright (90°) with keep-upright
+    unlocked, layers flipped F↔B.  Re-placing such a library part on B.Cu
+    reproduces the original back-side component (KiCad flips layers/angles
+    again on placement)."""
+
+    def _node(self):
+        import sexpdata
+
+        board = sexpdata.loads(
+            "(kicad_pcb (version 20260830)"
+            '	(footprint "CustomLib:BACKFP"'
+            '		(layer "B.Cu")'
+            "		(at 12.0 34.0 180.0)"
+            '		(property "Reference" "R7" (at 0 1.5 270) (layer "B.SilkS"))'
+            '		(property "Value" "10k" (at 0 -1.5 270) (layer "B.SilkS"))'
+            '		(property "Datasheet" "" (at 0 0 270) (layer "B.Fab") (hide yes))'
+            '		(pad "1" smd rect'
+            "			(at -1.0 2.0 90.0)"
+            "			(size 1.0 2.0)"
+            '			(layers "B.Cu" "B.Paste" "B.Mask")'
+            '			(net "GND")'
+            "		)"
+            '		(pad "2" smd rect'
+            "			(at 1.0 -2.0 90.0)"
+            "			(size 1.0 2.0)"
+            '			(layers "B.Cu" "B.Paste" "B.Mask")'
+            "		)"
+            '		(fp_line (start 2.0 3.0) (end -2.0 3.0) (stroke (width 0.1) (type solid)) (layer "B.SilkS"))'
+            '		(fp_arc (start 4.0 5.0) (mid 3.5 3.5) (end 5.0 4.0) (stroke (width 0.1) (type solid)) (layer "B.Courtyard"))'
+            '		(fp_poly (pts (xy 6.0 7.0) (xy 7.0 7.0)) (stroke (width 0) (type default)) (layer "B.Fab"))'
+            "	)"
+            ")"
+        )
+        return next(n for n in board if isinstance(n, list) and n and str(n[0]) == "footprint")
+
+    def test_top_layer_flipped_to_front(self):
+        out = normalize_footprint_for_library(self._node(), 20260830, "MyLib")
+        layer = next(s for s in out if isinstance(s, list) and s and str(s[0]) == "layer")
+        assert str(layer[1]) == "F.Cu"
+
+    def test_pad_mirrored_and_angle_negated(self):
+        out = normalize_footprint_for_library(self._node(), 20260830, "MyLib")
+        pads = [c for c in out if isinstance(c, list) and c and str(c[0]) == "pad"]
+        assert len(pads) == 2
+        for pad in pads:
+            at = next(s for s in pad if isinstance(s, list) and s and str(s[0]) == "at")
+            assert at[3] == pytest.approx(90.0)
+            # layers flipped
+            layers = next(s for s in pad if isinstance(s, list) and s and str(s[0]) == "layers")
+            assert layers[1] == "F.Cu"
+            assert layers[2] == "F.Paste"
+            assert layers[3] == "F.Mask"
+            # nets stripped
+            subs = [str(s[0]) for s in pad if isinstance(s, list) and s]
+            assert "net" not in subs
+
+    def test_pad_y_mirrored_positions(self):
+        out = normalize_footprint_for_library(self._node(), 20260830, "MyLib")
+        pads = {str(c[1]): c for c in out if isinstance(c, list) and c and str(c[0]) == "pad"}
+        at1 = next(s for s in pads["1"] if isinstance(s, list) and s and str(s[0]) == "at")
+        at2 = next(s for s in pads["2"] if isinstance(s, list) and s and str(s[0]) == "at")
+        # source pad1 y=+2.0 -> mirrored -2.0; pad2 y=-2.0 -> +2.0
+        assert at1[2] == pytest.approx(-2.0)
+        assert at2[2] == pytest.approx(2.0)
+        # local rotation after fp_rotation 180: pad stored 90 -> 90-180=-90 -> negate -> 90
+        assert at1[3] == pytest.approx(90.0)
+        assert at2[3] == pytest.approx(90.0)
+
+    def test_text_upright_position_kept_unlocked(self):
+        """Reference/Value properties convert to fp_text, keep their board
+        position (Y mirrored for the back side), face up (90°), unlock
+        keep-upright, and flip layers; the board layer may come from source
+        (B.SilkS -> F.SilkS)."""
+        out = normalize_footprint_for_library(self._node(), 20260830, "MyLib")
+        texts = {str(c[1]): c for c in out if isinstance(c, list) and c and str(c[0]) == "fp_text"}
+        assert "reference" in texts
+        assert "value" in texts
+        ref = texts["reference"]
+        at = next(s for s in ref if isinstance(s, list) and s and str(s[0]) == "at")
+        # board position (0, 1.5) Y-mirrored to (0, -1.5); uniform 90°
+        assert at[1] == pytest.approx(0.0)
+        assert at[2] == pytest.approx(-1.5)
+        assert at[3] == pytest.approx(90.0)
+        assert ref[2] == "REF**"
+        # keep-upright unlocked
+        subs = [s for s in ref if isinstance(s, list) and s and str(s[0]) == "unlocked"]
+        assert subs, "unlocked missing"
+        assert str(subs[0][1]) == "yes"
+        # layer flipped B.SilkS -> F.SilkS
+        layer = next(s for s in ref if isinstance(s, list) and s and str(s[0]) == "layer")
+        assert str(layer[1]) == "F.SilkS"
+        # value text: name + mirrored position (0, -1.5) -> (0, 1.5)
+        val = texts["value"]
+        vat = next(s for s in val if isinstance(s, list) and s and str(s[0]) == "at")
+        assert vat[1] == pytest.approx(0.0)
+        assert vat[2] == pytest.approx(1.5)
+        assert val[2] == "BACKFP"
+
+    def test_graphics_mirrored_and_layers_flipped(self):
+        out = normalize_footprint_for_library(self._node(), 20260830, "MyLib")
+        line = next(c for c in out if isinstance(c, list) and c and str(c[0]) == "fp_line")
+        start = next(s for s in line if isinstance(s, list) and s and str(s[0]) == "start")
+        end = next(s for s in line if isinstance(s, list) and s and str(s[0]) == "end")
+        # Y mirrored: +3.0 -> -3.0
+        assert start[2] == pytest.approx(-3.0)
+        assert end[2] == pytest.approx(-3.0)
+        line_layer = next(s for s in line if isinstance(s, list) and s and str(s[0]) == "layer")
+        assert str(line_layer[1]) == "F.SilkS"
+
+        arc = next(c for c in out if isinstance(c, list) and c and str(c[0]) == "fp_arc")
+        a_start = next(s for s in arc if isinstance(s, list) and s and str(s[0]) == "start")
+        a_end = next(s for s in arc if isinstance(s, list) and s and str(s[0]) == "end")
+        a_mid = next(s for s in arc if isinstance(s, list) and s and str(s[0]) == "mid")
+        # KiCad semantics: values swapped after mirroring, so start holds the
+        # mirrored original end (5,-4) and end the mirrored original start (4,-5)
+        assert a_start[1] == pytest.approx(5.0)
+        assert a_start[2] == pytest.approx(-4.0)
+        assert a_end[1] == pytest.approx(4.0)
+        assert a_end[2] == pytest.approx(-5.0)
+        # mid mirrored
+        assert a_mid[2] == pytest.approx(-3.5)
+        arc_layer = next(s for s in arc if isinstance(s, list) and s and str(s[0]) == "layer")
+        assert str(arc_layer[1]) == "F.Courtyard"
+
+        poly = next(c for c in out if isinstance(c, list) and c and str(c[0]) == "fp_poly")
+        pts = next(s for s in poly if isinstance(s, list) and s and str(s[0]) == "pts")
+        xy1, xy2 = pts[1], pts[2]
+        assert xy1[2] == pytest.approx(-7.0)
+        assert xy2[2] == pytest.approx(-7.0)
+        poly_layer = next(s for s in poly if isinstance(s, list) and s and str(s[0]) == "layer")
+        assert str(poly_layer[1]) == "F.Fab"
+
+    def test_text_mirror_cleared(self):
+        import sexpdata
+
+        board = sexpdata.loads(
+            "(kicad_pcb (version 20260830)"
+            '	(footprint "CustomLib:MIRRORFP"'
+            '		(layer "B.Cu")'
+            "		(at 1.0 2.0 0.0)"
+            '		(fp_text user "LABEL" (at 0.5 0.5 90) (unlocked yes) (layer "B.SilkS")'
+            "			(effects (font (size 1.0 1.0)) (justify left bottom mirror)))"
+            "	)"
+            ")"
+        )
+        node = next(n for n in board if isinstance(n, list) and n and str(n[0]) == "footprint")
+        out = normalize_footprint_for_library(node, 20260830, "MyLib")
+        text = next(c for c in out if isinstance(c, list) and c and str(c[0]) == "fp_text")
+        dumped = str(text)
+        assert "mirror" not in dumped
+        assert "unlocked" in dumped
+        layer = next(s for s in text if isinstance(s, list) and s and str(s[0]) == "layer")
+        assert str(layer[1]) == "F.SilkS"
 
 
 # ---------------------------------------------------------------------------
