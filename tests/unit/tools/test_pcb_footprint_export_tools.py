@@ -258,18 +258,19 @@ class TestNormalizeForLibrary:
         assert "value" in texts
         for text_type, c in texts.items():
             at = next(s for s in c if isinstance(s, list) and s and str(s[0]) == "at")
-            # uniform upright angle (90°), not board-space compensated
-            assert at[3] == pytest.approx(90.0)
+            # uniform angle 0°, not board-space compensated
+            assert at[3] == pytest.approx(0.0)
             if text_type == "reference":
                 assert c[2] == "REF**"
             else:
                 assert c[2] == "Sensor_Board_XYZ"
-        # position: kept from the board (fp rot 45° does not shift x/y)
+        # position: board-space anchor un-rotated by fp rotation 45°:
+        # R(-45°)·(0, 2.0) = (1.414, 1.414)
         ref_at = next(
             s for s in texts["reference"] if isinstance(s, list) and s and str(s[0]) == "at"
         )
-        assert ref_at[1] == pytest.approx(0.0)
-        assert ref_at[2] == pytest.approx(2.0)
+        assert ref_at[1] == pytest.approx(2.0 * 0.70710678)
+        assert ref_at[2] == pytest.approx(2.0 * 0.70710678)
 
     def test_serialize_roundtrip(self):
         node = self._node()[0]
@@ -319,8 +320,7 @@ class TestNormalizeForLibrary:
 
 class TestNormalizeBackSideFlip:
     """B.Cu board footprints are exported in front-side form: geometry Y
-    mirrored, pad angles negated, text upright (90°) with keep-upright
-    unlocked, layers flipped F↔B.  Re-placing such a library part on B.Cu
+    mirrored, pad angles negated, text angles zeroed, layers flipped F↔B.  Re-placing such a library part on B.Cu
     reproduces the original back-side component (KiCad flips layers/angles
     again on placement)."""
 
@@ -389,7 +389,7 @@ class TestNormalizeBackSideFlip:
 
     def test_text_upright_position_kept_unlocked(self):
         """Reference/Value properties convert to fp_text, keep their board
-        position (Y mirrored for the back side), face up (90°), unlock
+        position (Y mirrored for the back side), angle 0°, unlock
         keep-upright, and flip layers; the board layer may come from source
         (B.SilkS -> F.SilkS)."""
         out = normalize_footprint_for_library(self._node(), 20260830, "MyLib")
@@ -398,10 +398,11 @@ class TestNormalizeBackSideFlip:
         assert "value" in texts
         ref = texts["reference"]
         at = next(s for s in ref if isinstance(s, list) and s and str(s[0]) == "at")
-        # board position (0, 1.5) Y-mirrored to (0, -1.5); uniform 90°
+        # board-space (0, 1.5) un-rotated by fp rot 180° -> (0, -1.5), then
+        # back-side Y mirror -> (0, 1.5); uniform angle 0°
         assert at[1] == pytest.approx(0.0)
-        assert at[2] == pytest.approx(-1.5)
-        assert at[3] == pytest.approx(90.0)
+        assert at[2] == pytest.approx(1.5)
+        assert at[3] == pytest.approx(0.0)
         assert ref[2] == "REF**"
         # keep-upright unlocked
         subs = [s for s in ref if isinstance(s, list) and s and str(s[0]) == "unlocked"]
@@ -413,8 +414,9 @@ class TestNormalizeBackSideFlip:
         # value text: name + mirrored position (0, -1.5) -> (0, 1.5)
         val = texts["value"]
         vat = next(s for s in val if isinstance(s, list) and s and str(s[0]) == "at")
+        # (0, -1.5) -> un-rotated (0, 1.5) -> B-side mirror (0, -1.5)
         assert vat[1] == pytest.approx(0.0)
-        assert vat[2] == pytest.approx(1.5)
+        assert vat[2] == pytest.approx(-1.5)
         assert val[2] == "BACKFP"
 
     def test_graphics_mirrored_and_layers_flipped(self):

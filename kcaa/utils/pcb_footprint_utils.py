@@ -13,6 +13,7 @@ and serializing/writing them without overwriting existing files.
 from collections.abc import Iterator
 import copy
 import logging
+import math
 import os
 from typing import Any
 
@@ -430,7 +431,7 @@ def _ensure_unlocked(child: list[Any]) -> None:
 def _flip_footprint_to_front(node: list[Any]) -> None:
     """Transform a back-side (B.Cu) footprint node in place to the canonical
     front-side library form: negate child Y (the geometry mirror), negate pad
-    angles, set text angles upright (90°) with keep-upright unlocked, and flip
+    angles, set text angles to 0°, and flip
     every layer F↔B.  This is the exact inverse of KiCad placing the footprint
     on the back side, so re-placing the exported library part on B.Cu yields
     the original component.
@@ -447,7 +448,7 @@ def _flip_footprint_to_front(node: list[Any]) -> None:
                 _set_child_at_rotation(child, -stored)
         elif key in _TEXT_TYPES:
             _mirror_child_y(child)
-            _set_child_at_rotation(child, 90.0)
+            _set_child_at_rotation(child, 0.0)
             _clear_text_mirror(child)
             _ensure_unlocked(child)
         elif key in ("fp_line", "fp_rect", "fp_circle", "fp_arc"):
@@ -496,6 +497,27 @@ def _property_to_fp_text(child: list[Any], prop_name: str, new_value: str) -> li
         if isinstance(sub, list) and len(sub) > 0:
             fp_text_node.append(sub)
     return fp_text_node
+
+
+def _rotate_child_at_about_origin(child: list[Any], angle_deg: float) -> None:
+    """Rotate a child node's ``at`` position about the footprint origin.
+
+    Board files written by Altium conversions store text anchors in
+    board-space orientation (a vector from the footprint origin along board
+    axes); the library needs them in the footprint frame, so rotate back by
+    ``-angle_deg`` (the footprint's own rotation).  Only the x/y position is
+    adjusted — the text angle is handled separately (forced to 0).
+    """
+    if abs(angle_deg) < 1e-9:
+        return
+    th = math.radians(-angle_deg)
+    cos_t, sin_t = math.cos(th), math.sin(th)
+    for sub in child:
+        if isinstance(sub, list) and len(sub) >= 3 and _sym(sub[0]) == "at":
+            x, y = float(sub[1]), float(sub[2])
+            sub[1] = x * cos_t - y * sin_t
+            sub[2] = x * sin_t + y * cos_t
+            return
 
 
 def normalize_footprint_for_library(
@@ -557,9 +579,13 @@ def normalize_footprint_for_library(
         elif key in ("pad", "fp_text", "property"):
             child_at_nodes.append(child)
 
-    # Re-express child rotations in the footprint's own frame.
+    # Re-express children in the footprint's own frame: un-rotate text
+    # anchors (Altium-converted boards store them in board-space orientation)
+    # and re-express rotations.
     for child in child_at_nodes:
         _readjust_rotation(child, fp_rotation)
+        if _sym(child[0]) in _TEXT_TYPES:
+            _rotate_child_at_about_origin(child, fp_rotation)
         if _sym(child[0]) == "pad":
             # Strip net connections (per-instance routing data).
             for j in list(range(len(child) - 1, -1, -1)):
@@ -570,7 +596,7 @@ def normalize_footprint_for_library(
             text_type = _sym(child[1]) if len(child) > 1 else ""
             if text_type in ("reference", "value"):
                 # Text faces up (90°) uniformly, regardless of board rotation.
-                _set_child_at_rotation(child, 90.0)
+                _set_child_at_rotation(child, 0.0)
                 if text_type == "reference" and len(child) > 2:
                     child[2] = "REF**"
                 elif text_type == "value" and len(child) > 2:
