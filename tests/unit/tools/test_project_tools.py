@@ -90,9 +90,12 @@ class TestGetProjectStructure:
         proj = tmp_path / "cyc"
         proj.mkdir()
         (proj / "cyc.kicad_pro").write_text("{}")
+        # Sheetname must precede Sheetfile: the shared skip-based walker
+        # (like KiCad itself) expects Sheetname first inside a sheet node.
         parent = (
             "(kicad_sch (version 20231120)\n"
             "  (sheet (at 0 0) (size 10 10)\n"
+            '    (property "Sheetname" "Parent" (at 0 0 0) (effects (font (size 1.27 1.27))))\n'
             '    (property "Sheetfile" "child.kicad_sch" (at 0 0 0) '
             "(effects (font (size 1.27 1.27))))\n"
             "  )\n"
@@ -101,6 +104,7 @@ class TestGetProjectStructure:
         child = (
             "(kicad_sch (version 20231120)\n"
             "  (sheet (at 0 0) (size 10 10)\n"
+            '    (property "Sheetname" "Child" (at 0 0 0) (effects (font (size 1.27 1.27))))\n'
             '    (property "Sheetfile" "cyc.kicad_sch" (at 0 0 0) '
             "(effects (font (size 1.27 1.27))))\n"
             "  )\n"

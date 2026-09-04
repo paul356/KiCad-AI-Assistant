@@ -5,69 +5,32 @@ Project management tools for KiCad.
 from collections.abc import Sequence
 import logging
 import os
-import re
 from typing import Any
 
 from fastmcp import FastMCP
 
+from kcaa.tools.sheet_tools import _build_sheet_tree
 from kcaa.utils.file_utils import get_project_files, load_project_json
 from kcaa.utils.kicad_utils import find_kicad_projects, open_kicad_project
 
-# Sheet-file reference: ``(property "Sheetfile" "child.kicad_sch" ...)`` inside
-# a ``(sheet ...)`` node.  Only the Sheetfile property names a file — symbol
-# fields and other properties never use this key.
-_SHEET_FILE_RE = re.compile(r'\(property\s+"Sheetfile"\s+"([^"]+)"')
 
-_MAX_SHEET_DEPTH = 10
-
-
-def _referenced_sheets(schematic_path: str) -> list[str]:
-    """Return absolute paths of the child sheets referenced by *schematic_path*.
-
-    Reads the ``(property "Sheetfile" "...")`` entries of the ``.kicad_sch``
-    file.  Relative paths resolve against the sheet's own directory (KiCad
-    convention).  Returns an empty list when the file cannot be read.
-    """
-    try:
-        with open(schematic_path, encoding="utf-8", errors="replace") as fh:
-            text = fh.read()
-    except OSError:
-        return []
-    parent_dir = os.path.dirname(os.path.abspath(schematic_path))
-    sheets = []
-    for match in _SHEET_FILE_RE.finditer(text):
-        raw = match.group(1)
-        path = raw if os.path.isabs(raw) else os.path.join(parent_dir, raw)
-        sheets.append(os.path.abspath(path))
-    return sheets
-
-
-def _sheet_tree(
-    root_schematic: str,
-    visited: set[str] | None = None,
-    depth: int = 0,
-) -> dict[str, Any]:
+def _sheet_tree(root_schematic: str) -> dict[str, Any]:
     """Build a nested sheet-hierarchy node rooted at *root_schematic*.
 
-    Each node is ``{"path": <absolute>, "children": [...]}``; ``children``
-    is omitted when the sheet has no sub-sheets.  Cycles (a child sheet
-    referencing an ancestor, including via symlinks) are cut by tracking
-    real paths, and recursion is depth-bounded, so each sheet appears
-    exactly once and the response stays bounded.
+    Delegates the recursive walk to the shared
+    :func:`~kcaa.tools.sheet_tools._build_sheet_tree` and maps each node
+    to the ``{"path", "children"}`` shape.  ``children`` is omitted when
+    the sheet has no sub-sheets, so leaves are ``{"path": ...}`` nodes.
     """
-    if visited is None:
-        visited = set()
-    node: dict[str, Any] = {"path": os.path.abspath(root_schematic)}
-    real = os.path.realpath(root_schematic)
-    if real in visited or depth >= _MAX_SHEET_DEPTH:
-        return node
-    visited.add(real)
-    children = [
-        _sheet_tree(child, visited, depth + 1) for child in _referenced_sheets(root_schematic)
-    ]
-    if children:
-        node["children"] = children
-    return node
+
+    def _map(node: dict[str, Any]) -> dict[str, Any]:
+        mapped: dict[str, Any] = {"path": os.path.abspath(node["file"])}
+        children = node.get("children")
+        if children:
+            mapped["children"] = [_map(child) for child in children]
+        return mapped
+
+    return _map(_build_sheet_tree(root_schematic))
 
 
 def register_project_tools(
