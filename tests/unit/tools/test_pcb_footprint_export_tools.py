@@ -247,6 +247,28 @@ class TestNormalizeForLibrary:
                         # pad stored 90° absolute -> local 90 - 45 = 45
                         assert sub[3] == pytest.approx(45.0)
 
+    def test_text_without_explicit_angle_gets_implied_rotation(self):
+        """A text whose ``at`` has no angle component reads as axis-aligned
+        (implied 0) in board space; re-expressing it in the footprint frame
+        yields 0 - fp_rotation, same as a pad's missing angle."""
+        import sexpdata as _sx
+
+        node = _sx.loads(
+            '(kicad_pcb (footprint "CustomLib:A"'
+            '  (layer "F.Cu")'
+            "  (at 10.0 20.0 45.0)"
+            '  (fp_text reference "U1" (at 0 1.5) (layer "F.SilkS"))'
+            ")"
+            ")"
+        )
+        node = next(n for n in node if isinstance(n, list) and n and str(n[0]) == "footprint")
+        out = normalize_footprint_for_library(node, 20260206, "MyLib")
+        texts = [c for c in out if isinstance(c, list) and c and str(c[0]) == "fp_text"]
+        assert len(texts) == 1
+        at = next(s for s in texts[0] if isinstance(s, list) and s and str(s[0]) == "at")
+        # implied 0 - fp_rotation 45 = -45, normalized to [0, 360) = 315
+        assert at[3] == pytest.approx(315.0)
+
     def test_text_rotation_and_justify_kept(self):
         """Reference/value fp_text keep the board's angle (un-rotated from
         board space: 90° - fp_rotation 45° = 45°) and its effects/justify:
@@ -293,11 +315,11 @@ class TestNormalizeForLibrary:
             else:
                 assert c[2] == "Sensor_Board_XYZ"
         # position: board-space anchor un-rotated by fp rotation 45°:
-        # R(-45°)·(0, 2.0) = (1.414, 1.414)
+        # R(-45°)·(0, 2.0) = (-1.414, 1.414)
         ref_at = next(
             s for s in texts["reference"] if isinstance(s, list) and s and str(s[0]) == "at"
         )
-        assert ref_at[1] == pytest.approx(2.0 * 0.70710678)
+        assert ref_at[1] == pytest.approx(-2.0 * 0.70710678)
         assert ref_at[2] == pytest.approx(2.0 * 0.70710678)
 
     def test_serialize_roundtrip(self):

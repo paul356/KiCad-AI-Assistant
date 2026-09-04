@@ -13,11 +13,12 @@ and serializing/writing them without overwriting existing files.
 from collections.abc import Iterator
 import copy
 import logging
-import math
 import os
 from typing import Any
 
 import sexpdata
+
+from kcaa.router.world_model import _rotate_ccw_on_screen
 
 log = logging.getLogger(__name__)
 
@@ -354,9 +355,9 @@ def _readjust_rotation(child: list[Any], fp_rotation: float) -> None:
         # same way an explicit angle would be.
         _set_child_at_rotation(child, (stored if stored is not None else 0.0) - fp_rotation)
     elif child_type in _TEXT_TYPES:
-        if stored is None:
-            return
-        _set_child_at_rotation(child, stored - fp_rotation)
+        # A text without an explicit angle is axis-aligned (implied 0),
+        # handled exactly like a pad's missing angle.
+        _set_child_at_rotation(child, (stored if stored is not None else 0.0) - fp_rotation)
 
 
 def _mirror_child_y(child: list[Any]) -> None:
@@ -446,15 +447,18 @@ def _flip_footprint_to_front(node: list[Any]) -> None:
         if key in _PAD_TYPES:
             _mirror_child_y(child)
             stored = _child_at_rotation(child)
-            if stored is not None:
-                _set_child_at_rotation(child, -stored)
+            # KiCad's PAD::Flip (TOP_BOTTOM) negates the pad orientation
+            # (SetFPRelativeOrientation(-GetFPRelativeOrientation())); a pad
+            # without an explicit angle reads as axis-aligned (0), so the
+            # negated 0 stays 0 and nothing is written.
+            _set_child_at_rotation(child, -(stored if stored is not None else 0.0))
         elif key in _TEXT_TYPES:
             _mirror_child_y(child)
             stored = _child_at_rotation(child)
-            if stored is not None:
-                # KiCad's PCB_TEXT::Flip (TOP_BOTTOM) maps angle -> 180-angle;
-                # re-flipping on B.Cu placement restores the original.
-                _set_child_at_rotation(child, 180.0 - stored)
+            # KiCad's PCB_TEXT::Flip (TOP_BOTTOM) maps angle -> 180-angle;
+            # re-flipping on B.Cu placement restores the original.  A text
+            # without an explicit angle reads as 0, so it stores 180.
+            _set_child_at_rotation(child, 180.0 - (stored if stored is not None else 0.0))
             _clear_text_mirror(child)
             _ensure_unlocked(child)
         elif key in ("fp_line", "fp_rect", "fp_circle", "fp_arc"):
@@ -511,18 +515,15 @@ def _rotate_child_at_about_origin(child: list[Any], angle_deg: float) -> None:
     Board files written by Altium conversions store text anchors in
     board-space orientation (a vector from the footprint origin along board
     axes); the library needs them in the footprint frame, so rotate back by
-    ``-angle_deg`` (the footprint's own rotation).  Only the x/y position is
-    adjusted — the text angle is handled separately (forced to 0).
+    the footprint's own rotation.  Only the x/y position is adjusted — the
+    text angle is handled separately.
     """
     if abs(angle_deg) < 1e-9:
         return
-    th = math.radians(-angle_deg)
-    cos_t, sin_t = math.cos(th), math.sin(th)
     for sub in child:
         if isinstance(sub, list) and len(sub) >= 3 and _sym(sub[0]) == "at":
             x, y = float(sub[1]), float(sub[2])
-            sub[1] = x * cos_t - y * sin_t
-            sub[2] = x * sin_t + y * cos_t
+            sub[1], sub[2] = _rotate_ccw_on_screen(x, y, -angle_deg)
             return
 
 
