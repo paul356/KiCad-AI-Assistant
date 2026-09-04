@@ -17,8 +17,6 @@ from kcaa.utils.kicad_utils import find_kicad_projects, open_kicad_project
 # fields and other properties never use this key.
 _SHEET_FILE_RE = re.compile(r'\(property\s+"Sheetfile"\s+"([^"]+)"')
 
-_THIRD_PARTY_DIR = "3rdparty"
-_MAX_THIRD_PARTY_ENTRIES = 200
 _MAX_SHEET_DEPTH = 10
 
 
@@ -50,47 +48,25 @@ def _sheet_tree(
 ) -> dict[str, Any]:
     """Build a nested sheet-hierarchy node rooted at *root_schematic*.
 
-    Each node is ``{"path": <absolute>, "children": [...]}``.  Cycles (a
-    child sheet referencing an ancestor, including via symlinks) are cut by
-    tracking real paths, and recursion is depth-bounded, so each sheet
-    appears exactly once and the response stays bounded.
+    Each node is ``{"path": <absolute>, "children": [...]}``; ``children``
+    is omitted when the sheet has no sub-sheets.  Cycles (a child sheet
+    referencing an ancestor, including via symlinks) are cut by tracking
+    real paths, and recursion is depth-bounded, so each sheet appears
+    exactly once and the response stays bounded.
     """
     if visited is None:
         visited = set()
-    node: dict[str, Any] = {"path": os.path.abspath(root_schematic), "children": []}
+    node: dict[str, Any] = {"path": os.path.abspath(root_schematic)}
     real = os.path.realpath(root_schematic)
     if real in visited or depth >= _MAX_SHEET_DEPTH:
         return node
     visited.add(real)
-    for child in _referenced_sheets(root_schematic):
-        node["children"].append(_sheet_tree(child, visited, depth + 1))
+    children = [
+        _sheet_tree(child, visited, depth + 1) for child in _referenced_sheets(root_schematic)
+    ]
+    if children:
+        node["children"] = children
     return node
-
-
-def _list_third_party_libraries(project_dir: str) -> list[dict[str, str]]:
-    """List symbol/footprint library files under the project's ``3rdparty/``.
-
-    Returns a bounded list of ``{"path", "kind"}`` entries, where kind is
-    ``"symbol"`` for ``.kicad_sym`` files and ``"footprint"`` for
-    ``.kicad_mod`` files.
-    """
-    tp_dir = os.path.join(project_dir, _THIRD_PARTY_DIR)
-    if not os.path.isdir(tp_dir):
-        return []
-    entries: list[dict[str, str]] = []
-    for root, dirs, fnames in os.walk(tp_dir):
-        depth = root[len(tp_dir) :].count(os.sep)
-        if depth >= 3:
-            dirs[:] = []  # bound the walk
-        for fname in sorted(fnames):
-            path = os.path.join(root, fname)
-            if fname.endswith(".kicad_mod"):
-                entries.append({"path": path, "kind": "footprint"})
-            elif fname.endswith(".kicad_sym"):
-                entries.append({"path": path, "kind": "symbol"})
-            if len(entries) >= _MAX_THIRD_PARTY_ENTRIES:
-                return entries
-    return entries
 
 
 def register_project_tools(mcp: FastMCP) -> None:
@@ -115,13 +91,11 @@ def register_project_tools(mcp: FastMCP) -> None:
         Returns the project metadata and flat file set, plus the layout an
         LLM needs to plan cross-file operations without guessing:
 
-        * ``sheets`` — the schematic sheet hierarchy: the root ``.kicad_sch``
-          and every hierarchical sub-sheet reachable through ``(sheet ...)``
-          references, as a nested tree of ``{"path", "children"}`` nodes with
-          absolute paths (cycle-free, depth-bounded).
-        * ``third_party`` — symbol (``.kicad_sym``) and footprint
-          (``.kicad_mod``) libraries under the project's ``3rdparty/``
-          directory (bounded list).
+        * ``sheets`` — the schematic sheet hierarchy: the root
+          ``.kicad_sch`` and every hierarchical sub-sheet reachable through
+          ``(sheet ...)`` references, as a nested tree of ``{"path",
+          "children"}`` nodes with absolute paths (cycle-free,
+          depth-bounded; ``children`` omitted when empty).
         * ``lib_tables`` — project-local ``sym-lib-table`` / ``fp-lib-table``
           paths, or None when absent.
 
@@ -130,7 +104,7 @@ def register_project_tools(mcp: FastMCP) -> None:
 
         Returns:
             dict with keys: name, path, directory, files, metadata, sheets,
-            third_party, lib_tables.
+            lib_tables.
         """
         if not os.path.exists(project_path):
             return {"error": f"Project not found: {project_path}"}
@@ -163,7 +137,6 @@ def register_project_tools(mcp: FastMCP) -> None:
             "files": files,
             "metadata": metadata,
             "sheets": sheets,
-            "third_party": _list_third_party_libraries(project_dir),
             "lib_tables": {
                 "sym_lib_table": sym_lib_table if os.path.isfile(sym_lib_table) else None,
                 "fp_lib_table": fp_lib_table if os.path.isfile(fp_lib_table) else None,

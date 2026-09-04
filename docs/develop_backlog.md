@@ -330,9 +330,8 @@ or exports.
   * ``sheets`` — the root ``.kicad_sch`` plus every hierarchical sub-sheet
     reachable through ``(sheet ...)`` ``Sheetfile`` references, as a nested
     ``{"path", "children"}`` tree (absolute paths, cycle-free via real-path
-    tracking, depth-bounded).
-  * ``third_party`` — symbol (``.kicad_sym``) and footprint
-    (``.kicad_mod``) libraries under the project's ``3rdparty/`` directory.
+    tracking, depth-bounded).  The ``children`` key is omitted for sheets
+    with no sub-sheets.
   * ``lib_tables`` — project-local ``sym-lib-table`` / ``fp-lib-table``
     paths, or None when absent.
 - Registered in ``kicad_plugin/tool_registry.py`` as a query policy with
@@ -341,7 +340,7 @@ or exports.
 ### Validation
 
 - Unit: `tests/unit/tools/test_project_tools.py` — sheet hierarchy follow
-  Sheetfile refs, cycles are cut, 3rdparty kinds are reported, absent
+  Sheetfile refs, cycles are cut, leaf sheets omit ``children``, absent
   tables are None.
 - System prompt tests (`tests/integration/test_skill_system.py`) are
   untouched and still pass.

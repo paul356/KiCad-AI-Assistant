@@ -2,12 +2,11 @@
 Tests for project management tools (project_tools.py).
 
 Builds a minimal multi-sheet KiCad project on disk and verifies that
-``get_project_structure`` reports the flat file set plus the sheet
-hierarchy, 3rdparty libraries, and lib-table presence.
+``get_project_structure`` reports the flat file set, the sheet
+hierarchy, and lib-table presence.
 """
 
 import json
-import os
 
 import pytest
 
@@ -28,11 +27,6 @@ def tmp_project(tmp_path):
     )
     (proj / "power.kicad_sch").write_text('(kicad_sch (version 20231120) (generator "test"))\n')
     (proj / "demo.kicad_pcb").write_text("(kicad_pcb (version 20231120))\n")
-    tp = proj / "3rdparty"
-    (tp / "libs").mkdir(parents=True)
-    (tp / "libs" / "analog.kicad_sym").write_text("(kicad_symbol_lib (version 20220914))\n")
-    (tp / "libs" / "r.pretty").mkdir()
-    (tp / "libs" / "r.pretty" / "R_0805.kicad_mod").write_text('(footprint "R_0805")\n')
     (proj / "sym-lib-table").write_text("(sym_lib_table (version 1))\n")
     (proj / "fp-lib-table").write_text("(fp_lib_table (version 1))\n")
     return proj / "demo.kicad_pro"
@@ -89,7 +83,7 @@ class TestGetProjectStructure:
         assert len(root["children"]) == 1
         child = root["children"][0]
         assert child["path"].endswith("power.kicad_sch")
-        assert child["children"] == []
+        assert "children" not in child
 
     def test_sheet_cycle_is_cut(self, tools, tmp_path):
         """A child sheet referencing its parent must not recurse forever."""
@@ -121,24 +115,18 @@ class TestGetProjectStructure:
         assert root["children"][0]["path"].endswith("child.kicad_sch")
         # Back-reference to the root appears as a leaf, not a new subtree.
         assert len(root["children"][0]["children"]) == 1
-        assert root["children"][0]["children"][0]["children"] == []
+        assert "children" not in root["children"][0]["children"][0]
 
-    def test_third_party_and_lib_tables(self, tools, tmp_project):
+    def test_lib_tables(self, tools, tmp_project):
         result = self._call(tools, str(tmp_project))
-        kinds = {
-            (os.path.basename(entry["path"]), entry["kind"]) for entry in result["third_party"]
-        }
-        assert ("analog.kicad_sym", "symbol") in kinds
-        assert ("R_0805.kicad_mod", "footprint") in kinds
         assert result["lib_tables"]["sym_lib_table"].endswith("sym-lib-table")
         assert result["lib_tables"]["fp_lib_table"].endswith("fp-lib-table")
 
-    def test_absent_third_party_and_tables_are_none(self, tools, tmp_path):
+    def test_absent_tables_are_none(self, tools, tmp_path):
         proj = tmp_path / "bare"
         proj.mkdir()
         (proj / "bare.kicad_pro").write_text("{}")
         (proj / "bare.kicad_sch").write_text("(kicad_sch (version 20231120))\n")
 
         result = self._call(tools, str(proj / "bare.kicad_pro"))
-        assert result["third_party"] == []
         assert result["lib_tables"] == {"sym_lib_table": None, "fp_lib_table": None}
