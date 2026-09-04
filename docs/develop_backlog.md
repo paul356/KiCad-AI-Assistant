@@ -2,7 +2,8 @@
 
 Known issues discovered during review but not fixed in the originating PR.
 Each entry records the evidence, the impact, and the proposed fix so the work
-can be picked up independently.
+can be picked up independently.  Resolved items are moved to the
+``## Resolved`` section at the bottom.
 
 ## NPTH oval/slot drill shapes are not supported
 
@@ -61,73 +62,6 @@ rotation plus the footprint rotation (verify which KiCad actually applies).
   the resolved slot extent.
 - Real board: ninja-keyboard history file with `(drill oval ...)` pads
   yields `drill`-kind obstacles.
-
----
-
-## Wire routing does not avoid label / power-tip / junction anchors
-
-**Status:** open (proposed; not tracked as a GitHub issue)
-
-### Symptom
-
-The schematic wire-routing tools (`kcaa/tools/wire_edit_tools.py`:
-`connect_points_with_wire`, `add_wire_to_schematic`, `connect_pins_with_wire`)
-build their obstacle set from only three kinds of geometry:
-
-- `_collect_existing_wires` — existing wire segments,
-- `_collect_all_pin_positions` — pin tips (incl. power-symbol pins),
-- `_collect_pin_symbol_stubs` — pin stub lines.
-
-**Labels never appear in the obstacle set.** `label` occurs in the file
-only in `connect_points_with_wire`'s docstring, as an optional *endpoint*
-input ("e.g. a net label position") — never as a path obstacle. The same
-holds for power-symbol tips (they are covered only because they are also
-pins) and for existing junction dots: none are anchor points the router
-avoids.
-
-### Evidence
-
-- Grep of `wire_edit_tools.py` shows exactly three
-  `_collect_*` obstacle builders, none of which read `label`,
-  `global_label`, `hierarchical_label`, `junction`, or the `#PWR?`
-  placement set beyond the generic pin walk.
-- The router's rejection gates (`_try_angle_config`:
-  pin-on-interior, stub overlap, wire overlap, pin-at-corner) have no
-  label/junction gate.
-- The KiCad connection semantics that make this harmful are now enforced
-  in `netlist_parser._build_netlist` Step 2c (issue #100 fix): a point
-  item (label, power tip, pin tip) anchored anywhere on a wire segment
-  joins that wire's net.
-
-### Impact
-
-A candidate route that passes **through** a label anchor (not at an
-endpoint) merges that label's net with the new wire's net in KiCad —
-an unintended short or a silently renamed net. The same applies to
-power-symbol tips and existing junction dots. `connect_points_with_wire`
-using a label position as a *deliberate* endpoint should stay allowed,
-but the tools have no way to distinguish (no anchor check at all).
-
-### Fix (proposed)
-
-1. New `_collect_anchor_points(sch)`: local / global / hierarchical
-   label anchors + power-symbol (`#PWR?` or `power:` lib_id) tips +
-   existing junction positions.
-2. Fold the anchors into the existing `obstacles` list so the current
-   `_PIN_COLLISION_TOL` (0.5 mm) on-segment circle check rejects routes
-   crossing them, same channel as pin positions.
-3. Endpoint exemption: a candidate endpoint that coincides with an
-   anchor coordinate (user explicitly routed to a label) is allowed,
-   mirroring the existing pin-endpoint / lead-stub exemption logic.
-
-### Validation
-
-- Unit: route between two pins whose straight path crosses a label
-  anchor → routing rejects or detours; same label anchor as an explicit
-  endpoint → route allowed.
-- Real board: MotorCell, route a test wire through the `SL_B` mid-wire
-  label anchor at (276.86, 197.9422) → rejected (today it would be
-  accepted and would quietly merge the `SL_B` net).
 
 ---
 
@@ -309,43 +243,112 @@ tool-collapse issue above).
 
 ---
 
-## Inject project structure at the end of the prompt
+## Resolved
 
-**Status:** open (proposed)
+### Wire routing does not avoid label / power-tip / junction anchors
 
-### Current state
+**Status:** resolved (2026-09-04) — fixed by PR #115 (commit `afa504d`); closes issue #114.
 
-- `build_system_prompt` (`kicad_plugin/llm_client.py`) is
-  `header + schematic + PCB + context_block`; `context_block` comes from
-  `context_bridge.collect_context()` and carries only the active
-  file paths and a few facts — not the project's file layout.
-- The prompt is token-budgeted: `tests/integration/test_skill_system.py`
-  caps it at ≤950 tokens (relaxed from 800), and
-  `docs/skill-system-design.md` already plans a `PromptBuilder` with a
-  layered, trimmed prompt.
+#### Symptom
 
-### Aim
+The schematic wire-routing tools (`kcaa/tools/wire_edit_tools.py`:
+`connect_points_with_wire`, `add_wire_to_schematic`, `connect_pins_with_wire`)
+build their obstacle set from only three kinds of geometry:
 
-Append a compact project overview at the **end** of the system prompt
-(after the context block): the project tree — root `.kicad_pro`, all
-`.kicad_sch` sheet files with their hierarchy, the `.kicad_pcb`,
-`3rdparty/` libraries — so the LLM can plan sheet edits, cross-file
-operations, and exports without guessing file layout.
+- `_collect_existing_wires` — existing wire segments,
+- `_collect_all_pin_positions` — pin tips (incl. power-symbol pins),
+- `_collect_pin_symbol_stubs` — pin stub lines.
 
-### Fix (proposed)
+**Labels never appear in the obstacle set.** `label` occurs in the file
+only in `connect_points_with_wire`'s docstring, as an optional *endpoint*
+input ("e.g. a net label position") — never as a path obstacle. The same
+holds for power-symbol tips (they are covered only because they are also
+pins) and for existing junction dots: none are anchor points the router
+avoids.
 
-1. New renderer (in `context_bridge.py` or `skill_system`): walk the
-   active project dir, emit a tree of design files + sym-lib-table /
-   fp-lib-table / 3rdparty entries; follow sheet references so the
-   hierarchy appears once.
-2. Append it last in `build_system_prompt` **after** `context_block`.
-   Guard the budget: emit only file names + one-line role per file, skip
-   content, and stay within the ≤950-token test; extend the caps if the
-   reviewed size justifies it.
+#### Evidence
 
-### Validation
+- Grep of `wire_edit_tools.py` shows exactly three
+  `_collect_*` obstacle builders, none of which read `label`,
+  `global_label`, `hierarchical_label`, `junction`, or the `#PWR?`
+  placement set beyond the generic pin walk.
+- The router's rejection gates (`_try_angle_config`:
+  pin-on-interior, stub overlap, wire overlap, pin-at-corner) have no
+  label/junction gate.
+- The KiCad connection semantics that make this harmful are now enforced
+  in `netlist_parser._build_netlist` Step 2c (issue #100 fix): a point
+  item (label, power tip, pin tip) anchored anywhere on a wire segment
+  joins that wire's net.
 
-- Unit: `tests/unit/plugin/test_context_bridge.py` — rendered tree
-  contains project root, each sheet, PCB path, 3rdparty dir.
-- Integration: `test_system_prompt_under_800_tokens` still passes with a
-  real multi-sheet project tree injected.
+#### Impact
+
+A candidate route that passes **through** a label anchor (not at an
+endpoint) merges that label's net with the new wire's net in KiCad —
+an unintended short or a silently renamed net. The same applies to
+power-symbol tips and existing junction dots. `connect_points_with_wire`
+using a label position as a *deliberate* endpoint should stay allowed,
+but the tools have no way to distinguish (no anchor check at all).
+
+#### Fix
+
+1. New `_collect_anchor_points(sch)`: local / global / hierarchical
+   label anchors + power-symbol (`#PWR?` or `power:` lib_id) tips +
+   existing junction positions.
+2. Fold the anchors into the existing `obstacles` list so the current
+   `_PIN_COLLISION_TOL` (0.5 mm) on-segment circle check rejects routes
+   crossing them, same channel as pin positions.
+3. Endpoint exemption: a candidate endpoint that coincides with an
+   anchor coordinate (user explicitly routed to a label) is allowed,
+   mirroring the existing pin-endpoint / lead-stub exemption logic.
+
+#### Validation
+
+- Unit: route between two pins whose straight path crosses a label
+  anchor → routing rejects or detours; same label anchor as an explicit
+  endpoint → route allowed.
+- Real board: MotorCell, route a test wire through the `SL_B` mid-wire
+  label anchor at (276.86, 197.9422) → rejected (today it would be
+  accepted and would quietly merge the `SL_B` net).
+
+---
+### Project layout accessible without touching the system prompt
+
+**Status:** resolved (2026-09-04) — implemented as a query tool, not a
+prompt change (PR #116).
+
+#### Decision
+
+The original plan (append a project tree to the end of `build_system_prompt`)
+was rejected: the system prompt must stay stable and token-budgeted.  The
+project layout is instead exposed through the MCP query tool
+``get_project_structure`` (``kcaa/tools/project_tools.py``), which the LLM
+calls on demand when it needs to plan sheet edits, cross-file operations,
+or exports.
+
+#### Implementation
+
+- ``get_project_structure`` now returns (in addition to the flat ``files``
+  set and metadata):
+  * ``sheets`` — the root ``.kicad_sch`` plus every hierarchical sub-sheet
+    reachable through ``(sheet ...)`` ``Sheetfile`` references, as a nested
+    ``{"path", "children"}`` tree (absolute paths, cycle-free via real-path
+    tracking, depth-bounded).  The ``children`` key is omitted for sheets
+    with no sub-sheets.
+  * ``lib_tables`` — project-local ``sym-lib-table`` / ``fp-lib-table``
+    paths, or None when absent.
+- Registered in ``kicad_plugin/tool_registry.py`` as a query policy with
+  ``path_arg="project_path"``.
+- Registered in the plugin server profile (``KICAD_MCP_PROFILE=plugin``)
+  via ``register_project_tools(mcp, tools=("get_project_structure",))``,
+  so the KiCad plugin's LLM can call it; the full-profile management
+  tools (``list_projects`` / ``open_project``) stay out of that profile.
+
+#### Validation
+
+- Unit: `tests/unit/tools/test_project_tools.py` — sheet hierarchy follow
+  Sheetfile refs, cycles are cut, leaf sheets omit ``children``, absent
+  tables are None.
+- Server profiles: `tests/unit/test_server_profiles.py` — plugin profile
+  exposes ``get_project_structure`` but not ``list_projects``/``open_project``.
+- System prompt tests (`tests/integration/test_skill_system.py`) are
+  untouched and still pass.

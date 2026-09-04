@@ -25,7 +25,11 @@ _TOOLS_DIR = _REPO_ROOT / "kcaa" / "tools"
 
 
 def _collect_kcaa_tools() -> set[str]:
-    """Scan all ``@mcp.tool()`` decorated functions under kcaa/tools/."""
+    """Scan all ``@mcp.tool()`` decorated functions under kcaa/tools/.
+
+    Also recognises the ``mcp.tool()(registry["name"])`` loop idiom used by
+    ``register_project_tools`` to register a selectable tool subset.
+    """
     tools: set[str] = set()
     for py_file in sorted(_TOOLS_DIR.rglob("*.py")):
         text = py_file.read_text(encoding="utf-8")
@@ -38,6 +42,8 @@ def _collect_kcaa_tools() -> set[str]:
             if re.search(r"\bname\s*=", m.group(1)):
                 continue
             tools.add(m.group(2))
+        for m in re.finditer(r'registry\["([^"]+)"\]\s*=', text):
+            tools.add(m.group(1))
     return tools
 
 

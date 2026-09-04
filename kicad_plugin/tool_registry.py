@@ -32,6 +32,8 @@ TOOL_POLICIES: dict[str, ToolPolicy] = {
     "extract_project_netlist": ToolPolicy(kind="query"),
     "extract_schematic_netlist": ToolPolicy(kind="query"),
     "find_component_connections": ToolPolicy(kind="query"),
+    # Project tools
+    "get_project_structure": ToolPolicy(kind="query", path_arg="project_path"),
     # Symbol tools
     "sync_symbol_index": ToolPolicy(kind="indexing"),
     "get_symbol_sync_status": ToolPolicy(kind="query"),

@@ -399,16 +399,17 @@ def _list_sheet_symbols_impl(schematic_path: str) -> dict[str, Any]:
     }
 
 
-def _get_sheet_hierarchy_impl(
-    schematic_path: str,
-    max_depth: int = 10,
-) -> dict[str, Any]:
-    """Implementation of get_sheet_hierarchy — recursive tree walk."""
-    if not schematic_path.endswith(".kicad_sch"):
-        return {"error": f"Not a .kicad_sch file: {schematic_path!r}"}
-    if not os.path.isfile(schematic_path):
-        return {"error": f"Schematic file not found: {schematic_path!r}"}
+def _build_sheet_tree(root_path: str, max_depth: int = 10) -> dict[str, Any]:
+    """Walk the hierarchical sheet tree rooted at *root_path*.
 
+    Shared by ``get_sheet_hierarchy`` and ``get_project_structure.sheets``
+    so both tools parse schematic hierarchy through the same
+    implementation.  Each node carries ``file``, optional ``sheet_name``,
+    ``sheet_count`` (number of direct children), and ``children`` only
+    when the sheet has sub-sheets.  Cycle, depth-cut, missing-file, and
+    parse-failure nodes carry ``cycle_detected`` / ``max_depth_reached``
+    / ``error`` markers.
+    """
     _visited: set[str] = set()
 
     def _resolve_child_path(parent: str, child_file: str) -> str | None:
@@ -460,17 +461,31 @@ def _get_sheet_hierarchy_impl(
                 if child_node:
                     children.append(child_node)
 
-        node["children"] = children
         node["sheet_count"] = len(children)
+        if children:
+            node["children"] = children
         return node
 
-    root = _walk(schematic_path, 0, None)
+    root = _walk(root_path, 0, None)
     # Remove internal tracking
     _visited.clear()
 
+    return root
+
+
+def _get_sheet_hierarchy_impl(
+    schematic_path: str,
+    max_depth: int = 10,
+) -> dict[str, Any]:
+    """Implementation of get_sheet_hierarchy — recursive tree walk."""
+    if not schematic_path.endswith(".kicad_sch"):
+        return {"error": f"Not a .kicad_sch file: {schematic_path!r}"}
+    if not os.path.isfile(schematic_path):
+        return {"error": f"Schematic file not found: {schematic_path!r}"}
+
     return {
         "root_schematic": schematic_path,
-        "hierarchy": root,
+        "hierarchy": _build_sheet_tree(schematic_path, max_depth),
     }
 
 
@@ -1172,10 +1187,11 @@ def register_sheet_tools(mcp: FastMCP) -> None:
         Returns:
             dict with keys:
                 - ``root_schematic`` (str): the root file that was read
-                - ``hierarchy`` (dict): tree node with ``file``,
-                  ``children`` (list of child nodes), and ``sheet_count``
-                  (number of direct children).  Each child node also
-                  carries ``sheet_name`` and ``file``.
+                - ``hierarchy`` (dict): tree node with ``file``, optional
+                  ``sheet_name``, ``sheet_count`` (number of direct
+                  children), and ``children`` — omitted when the sheet has
+                  no sub-sheets.  Each child node also carries ``file``
+                  and ``sheet_name`` when present.
         """
         return _get_sheet_hierarchy_impl(schematic_path, max_depth)
 

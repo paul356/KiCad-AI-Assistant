@@ -361,7 +361,7 @@ class TestGetSheetHierarchy:
         )
         for child in result["hierarchy"]["children"]:
             assert child["sheet_count"] == 0
-            assert child["children"] == []
+            assert "children" not in child
 
     def test_respects_max_depth(self, mcp_server):
         """max_depth=0 means root can list its children but those children are cut off."""
