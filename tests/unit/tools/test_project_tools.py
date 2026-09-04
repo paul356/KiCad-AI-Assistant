@@ -16,7 +16,9 @@ def tmp_project(tmp_path):
     """Build a minimal multi-sheet KiCad project on disk."""
     proj = tmp_path / "demo"
     proj.mkdir()
-    (proj / "demo.kicad_pro").write_text(json.dumps({"metadata": {"version": 1}}))
+    (proj / "demo.kicad_pro").write_text(
+        json.dumps({"meta": {"filename": "demo.kicad_pro", "version": 1}})
+    )
     (proj / "demo.kicad_sch").write_text(
         '(kicad_sch (version 20231120) (generator "test")\n'
         "  (sheet (at 0 0) (size 10 10)\n"
@@ -73,7 +75,7 @@ class TestGetProjectStructure:
         assert result["path"] == str(tmp_project)
         assert result["files"]["schematic"].endswith("demo.kicad_sch")
         assert result["files"]["pcb"].endswith("demo.kicad_pcb")
-        assert result["metadata"] == {"version": 1}
+        assert result["metadata"] == {"filename": "demo.kicad_pro", "version": 1}
 
     def test_sheet_hierarchy_follows_sheetfile_refs(self, tools, tmp_project):
         result = self._call(tools, str(tmp_project))

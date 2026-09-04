@@ -89,11 +89,12 @@ def register_project_tools(
         # Get related files
         files = get_project_files(project_path)
 
-        # Get project metadata
+        # KiCad stores project metadata under the ``meta`` key of the
+        # .kicad_pro JSON (``{filename, version}``); surface it as-is.
         metadata = {}
         project_data = load_project_json(project_path)
-        if project_data and "metadata" in project_data:
-            metadata = project_data["metadata"]
+        if project_data and "meta" in project_data:
+            metadata = project_data["meta"]
 
         # Schematic sheet hierarchy (root + hierarchical sub-sheets)
         sheets: list[dict[str, Any]] = []
