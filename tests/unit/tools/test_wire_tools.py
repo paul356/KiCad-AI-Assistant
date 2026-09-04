@@ -795,6 +795,178 @@ class TestConnectPinsWithWire:
 # ---------------------------------------------------------------------------
 
 
+class TestWireRoutingAvoidsAnchors:
+    """Routes must not cross label/junction anchor points (silent net-merge bug)."""
+
+    def _connect_pins(self, tools, sch_path):
+        return asyncio.run(
+            tools["connect_pins_with_wire"](
+                schematic_path=sch_path,
+                from_ref="R2",
+                from_pin="2",
+                to_ref="R3",
+                to_pin="2",
+            )
+        )
+
+    def _connect_points(self, tools, sch_path, sx, sy, ex, ey):
+        return asyncio.run(
+            tools["connect_points_with_wire"](
+                schematic_path=sch_path,
+                start_x=sx,
+                start_y=sy,
+                end_x=ex,
+                end_y=ey,
+            )
+        )
+
+    def _add_label(self, tools, sch_path, text, x, y, label_type="global"):
+        return asyncio.run(
+            tools["add_label_to_schematic"](
+                schematic_path=sch_path,
+                text=text,
+                x=x,
+                y=y,
+                angle=0,
+                label_type=label_type,
+            )
+        )
+
+    def _append_sheet(self, sch_path, x, y, angle, pins):
+        """Append a (sheet ...) symbol node with pins to a schematic file.
+
+        Pins are (name, px, py) offsets relative to the sheet origin.
+        """
+        import uuid
+
+        lines = [
+            f"  (sheet (at {x} {y} {angle}) (size 50.8 50.8)",
+            "    (stroke (width 0) (type dash) (color 0 0 0 0))",
+            "    (fill (type none))",
+            f'    (uuid "{uuid.uuid4()}")',
+            '    (property "Sheet name" "SUB" (at 0 0 0) (show_name no) (do_not_autoplace yes) (effects (font (size 1.27 1.27)) (justify left)))',
+            '    (property "Sheet file" "sub.kicad_sch" (at 0 0 0) (show_name no) (do_not_autoplace yes) (effects (font (size 1.27 1.27)) (justify left)))',
+        ]
+        for name, px, py in pins:
+            lines.append(
+                f'    (pin "{name}" input (at {px} {py} 0) (uuid "{uuid.uuid4()}") (effects (font (size 1.27 1.27)) (justify left)))'
+            )
+        lines.extend(
+            [
+                "    (instances",
+                '      (project "test"',
+                f'        (path "/00000000-0000-0000-0000-000000000000/{uuid.uuid4()}" (page "1"))',
+                "      )",
+                "    )",
+                "  )",
+            ]
+        )
+        text = Path(sch_path).read_text().rstrip()
+        assert text.endswith(")")
+        text = text[:-1]  # drop the root close paren; re-add after the sheet
+        Path(sch_path).write_text(text + "\n" + "\n".join(lines) + "\n)")
+
+    @staticmethod
+    def _wires_through(sch_path, px, py, tol=0.01):
+        """Return True if any saved wire has (px, py) on its interior."""
+        from kcaa.tools.wire_edit_tools import _point_on_open_segment
+
+        sch = skip.Schematic(sch_path)
+        for w in sch.wire:
+            ax = float(w.start.value[0])
+            ay = float(w.start.value[1])
+            bx = float(w.end.value[0])
+            by = float(w.end.value[1])
+            if _point_on_open_segment(px, py, ax, ay, bx, by, tol):
+                return True
+        return False
+
+    def test_collect_anchor_points_covers_labels_and_junctions(self, tools, tmp_sch):
+        """Local/global/hierarchical labels and junctions are all collected."""
+        from kcaa.tools.wire_edit_tools import _collect_anchor_points
+
+        self._add_label(tools, tmp_sch, "L1", 130.0, 102.54, label_type="local")
+        self._add_label(tools, tmp_sch, "G1", 140.0, 102.54, label_type="global")
+        self._add_label(tools, tmp_sch, "H1", 150.0, 102.54, label_type="hierarchical")
+        sch = skip.Schematic(tmp_sch)
+        j = sch.junction.new()
+        j.at.value = [160.0, 102.54]
+
+        anchors = list(_collect_anchor_points(sch))
+        expected = [(130.0, 102.54), (140.0, 102.54), (150.0, 102.54), (160.0, 102.54)]
+        for ex, ey in expected:
+            assert any(abs(ax - ex) < 1e-6 and abs(ay - ey) < 1e-6 for ax, ay in anchors), (
+                f"anchor ({ex}, {ey}) not collected from {anchors}"
+            )
+
+    def test_collect_anchor_points_covers_sheet_pins(self, tools, tmp_sch):
+        """Sheet-symbol pins are collected at world coordinates: sheet origin
+        plus the pin offset, rotated by the sheet-symbol angle."""
+        from kcaa.tools.wire_edit_tools import _collect_anchor_points
+
+        self._append_sheet(tmp_sch, 100.0, 102.54, 0, [("MID", 10.0, 0.0)])
+        self._append_sheet(tmp_sch, 200.0, 50.0, 180, [("ROT", 0.0, 10.0)])
+        sch = skip.Schematic(tmp_sch)
+
+        anchors = list(_collect_anchor_points(sch))
+        expected = [
+            (110.0, 102.54),  # MID at origin (100, 102.54) + offset (10, 0)
+            (200.0, 40.0),  # ROT at origin (200, 50) + offset rotated 180° -> (0, -10)
+        ]
+        for ex, ey in expected:
+            assert any(abs(ax - ex) < 1e-6 and abs(ay - ey) < 1e-6 for ax, ay in anchors), (
+                f"sheet anchor ({ex}, {ey}) not collected from {anchors}"
+            )
+
+    def test_route_crossing_sheet_pin_anchor_detours(self, tools, tmp_sch):
+        """Straight path from R2.pin2 to R3.pin2 (y=102.54) crosses a sheet
+        symbol pin anchored at (110, 102.54); the router must detour."""
+        self._append_sheet(tmp_sch, 100.0, 102.54, 0, [("MID", 10.0, 0.0)])
+        result = self._connect_pins(tools, tmp_sch)
+
+        assert "error" in result or result.get("success") is True, result
+        if "error" not in result:
+            assert not self._wires_through(tmp_sch, 110.0, 102.54), (
+                "route crossed the sheet pin anchor — KiCad would merge its net"
+            )
+
+    def test_route_to_sheet_pin_anchor_endpoint_allowed(self, tools, tmp_sch):
+        """Routing explicitly TO a sheet-symbol pin anchor stays allowed."""
+        self._append_sheet(tmp_sch, 100.0, 102.54, 0, [("TARGET", 10.0, 0.0)])
+        result = self._connect_points(tools, tmp_sch, 100.0, 102.54, 110.0, 102.54)
+
+        assert result.get("success") is True, result
+        sch = skip.Schematic(tmp_sch)
+        assert any(
+            abs(float(w.end.value[0]) - 110.0) < 1e-6 and abs(float(w.end.value[1]) - 102.54) < 1e-6
+            for w in sch.wire
+        ), "wire does not terminate at the sheet pin anchor endpoint"
+
+    def test_route_crossing_label_anchor_detours(self, tools, tmp_sch):
+        """Straight path from R2.pin2 to R3.pin2 (y=102.54) crosses a label at
+        (110, 102.54); the router must reject that candidate and detour."""
+        self._add_label(tools, tmp_sch, "MID", 110.0, 102.54)
+        result = self._connect_pins(tools, tmp_sch)
+
+        assert "error" in result or result.get("success") is True, result
+        if "error" not in result:
+            assert not self._wires_through(tmp_sch, 110.0, 102.54), (
+                "route crossed the label anchor — KiCad would merge its net"
+            )
+
+    def test_route_to_label_anchor_endpoint_allowed(self, tools, tmp_sch):
+        """Routing explicitly TO a label anchor (deliberate endpoint) stays allowed."""
+        self._add_label(tools, tmp_sch, "TARGET", 115.0, 102.54)
+        result = self._connect_points(tools, tmp_sch, 100.0, 102.54, 115.0, 102.54)
+
+        assert result.get("success") is True, result
+        sch = skip.Schematic(tmp_sch)
+        assert any(
+            abs(float(w.end.value[0]) - 115.0) < 1e-6 and abs(float(w.end.value[1]) - 102.54) < 1e-6
+            for w in sch.wire
+        ), "wire does not terminate at the label anchor endpoint"
+
+
 class TestDeleteWireFromSchematic:
     def _call(self, tools, schematic_path, wires, **kwargs):
         return asyncio.run(

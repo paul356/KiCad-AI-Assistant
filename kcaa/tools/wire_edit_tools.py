@@ -15,6 +15,7 @@ from typing import Any
 
 from fastmcp import Context, FastMCP
 
+from kcaa.utils.netlist_parser import _normalize_iterable
 from kcaa.utils.schematic_sexp_utils import save_schematic
 from kcaa.utils.skip_compat import safe_schematic
 from kcaa.utils.skip_helpers import sym_pin_world_coords
@@ -1314,6 +1315,82 @@ def _collect_all_pin_positions(sch: Any) -> list[tuple[float, float]]:
     return positions
 
 
+def _collect_anchor_points(sch: Any) -> list[tuple[float, float]]:
+    """Return schematic anchor points a wire must not pass through.
+
+    A local/global/hierarchical label or an existing junction dot anchored
+    anywhere on a wire segment joins that segment's net in KiCad (enforced
+    in ``netlist_parser._build_netlist`` Step 2c, issue #100 fix).  A
+    routed wire crossing such an anchor would silently merge nets, so the
+    anchors are folded into the router obstacle set.  Power-symbol tips are
+    already covered by ``_collect_all_pin_positions`` (power symbols expose
+    a pin at the tip) and are not duplicated here.
+
+    Sheet-symbol pins (the parent-side ports of hierarchical subsheets)
+    are collected too: they sit on the sheet-symbol edge and a wire
+    crossing one joins the subsheet's net, the same silent-merge hazard.
+
+    Route endpoints that coincide with an anchor (e.g. the user routed
+    explicitly to a net-label position or a sheet-symbol pin) stay
+    allowed: the collision gates use a strict segment-interior check and
+    exclude the overall route start/end.
+
+    Returns:
+        List of (x, y) anchor positions in schematic world coordinates.
+    """
+    anchors: list[tuple[float, float]] = []
+    try:
+        # Label wrappers differ: local/global expose an ``_elements`` list
+        # (LabelCollection), hierarchical_label is a single ParsedValue node
+        # — mirror ``_iter_schematic_labels`` and treat a node as a list of
+        # one.
+        for attr_name in ("label", "global_label", "hierarchical_label"):
+            coll = getattr(sch, attr_name, None)
+            if coll is None:
+                continue
+            elements = getattr(coll, "_elements", None)
+            labels = elements if isinstance(elements, list) else [coll]
+            for label in labels:
+                try:
+                    at = label.at.value
+                    anchors.append((float(at[0]), float(at[1])))
+                except (AttributeError, IndexError, TypeError, ValueError):
+                    continue
+    except AttributeError:
+        pass
+    try:
+        for j in sch.junction:
+            coords = j.at.value
+            anchors.append((float(coords[0]), float(coords[1])))
+    except (AttributeError, IndexError, TypeError, ValueError):
+        pass
+    try:
+        # Sheet-symbol pins are positioned relative to the sheet origin and
+        # rotate with the sheet symbol (KiCad semantic; ``sch.symbol`` does
+        # not contain sheet symbols, so they need their own walk).
+        for sheet in _normalize_iterable(getattr(sch, "sheet", None)):
+            try:
+                sat = list(sheet.at)
+                sx = float(sat[0])
+                sy = float(sat[1])
+                angle = float(sat[2]) if len(sat) > 2 else 0.0
+            except (AttributeError, IndexError, TypeError, ValueError):
+                continue
+            cos_a = math.cos(math.radians(angle))
+            sin_a = math.sin(math.radians(angle))
+            for pin in _normalize_iterable(getattr(sheet, "pin", None)):
+                try:
+                    pat = list(pin.at)
+                    px = float(pat[0])
+                    py = float(pat[1])
+                except (AttributeError, IndexError, TypeError, ValueError):
+                    continue
+                anchors.append((sx + px * cos_a - py * sin_a, sy + px * sin_a + py * cos_a))
+    except (AttributeError, IndexError, TypeError, ValueError):
+        pass
+    return anchors
+
+
 def _collect_all_pin_data(sch: Any) -> list[tuple[float, float, float]]:
     """Return the absolute schematic position and exit angle of every pin.
 
@@ -1623,7 +1700,7 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
 
         try:
             all_pin_data = _collect_all_pin_data(sch)
-            obstacles = [(x, y) for x, y, _ in all_pin_data]
+            obstacles = [(x, y) for x, y, _ in all_pin_data] + _collect_anchor_points(sch)
             existing_wires = _collect_existing_wires(sch)
             tol = _PIN_COLLISION_TOL
 
@@ -1937,7 +2014,7 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
             # the router correctly reject any inner-route candidate that would
             # pass *through* the end pin, which would otherwise produce a
             # self-overlapping backtrack wire.
-            obstacles = _collect_all_pin_positions(sch)
+            obstacles = _collect_all_pin_positions(sch) + _collect_anchor_points(sch)
             existing_wires = _collect_existing_wires(sch)
 
             # Smart routing: follow pin exit directions, avoid all other pins
