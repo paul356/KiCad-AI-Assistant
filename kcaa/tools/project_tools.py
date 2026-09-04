@@ -2,6 +2,7 @@
 Project management tools for KiCad.
 """
 
+from collections.abc import Sequence
 import logging
 import os
 import re
@@ -69,14 +70,23 @@ def _sheet_tree(
     return node
 
 
-def register_project_tools(mcp: FastMCP) -> None:
+def register_project_tools(
+    mcp: FastMCP,
+    tools: Sequence[str] = ("list_projects", "get_project_structure", "open_project"),
+) -> None:
     """Register project management tools with the MCP server.
 
     Args:
         mcp: The FastMCP server instance
-    """
+        tools: Names of the project tools to register.  Defaults to all
+            three; pass a subset (e.g. ``("get_project_structure",)``) to
+            expose individual tools on profiles that should stay lean.
 
-    @mcp.tool()
+    Raises:
+        ValueError: if a name in ``tools`` is not a known project tool.
+    """
+    registry: dict[str, Any] = {}
+
     def list_projects() -> list[dict[str, Any]]:
         """Find and list all KiCad projects on this system."""
         logging.info("Executing list_projects tool...")
@@ -84,7 +94,8 @@ def register_project_tools(mcp: FastMCP) -> None:
         logging.info(f"list_projects tool returning {len(projects)} projects.")
         return projects
 
-    @mcp.tool()
+    registry["list_projects"] = list_projects
+
     def get_project_structure(project_path: str) -> dict[str, Any]:
         """Get the structure and files of a KiCad project.
 
@@ -143,7 +154,15 @@ def register_project_tools(mcp: FastMCP) -> None:
             },
         }
 
-    @mcp.tool()
+    registry["get_project_structure"] = get_project_structure
+
     def open_project(project_path: str) -> dict[str, Any]:
         """Open a KiCad project in KiCad."""
         return open_kicad_project(project_path)
+
+    registry["open_project"] = open_project
+
+    for name in tools:
+        if name not in registry:
+            raise ValueError(f"Unknown project tool: {name!r}")
+        mcp.tool()(registry[name])

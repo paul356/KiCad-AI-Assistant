@@ -336,11 +336,17 @@ or exports.
     paths, or None when absent.
 - Registered in ``kicad_plugin/tool_registry.py`` as a query policy with
   ``path_arg="project_path"``.
+- Registered in the plugin server profile (``KICAD_MCP_PROFILE=plugin``)
+  via ``register_project_tools(mcp, tools=("get_project_structure",))``,
+  so the KiCad plugin's LLM can call it; the full-profile management
+  tools (``list_projects`` / ``open_project``) stay out of that profile.
 
 ### Validation
 
 - Unit: `tests/unit/tools/test_project_tools.py` — sheet hierarchy follow
   Sheetfile refs, cycles are cut, leaf sheets omit ``children``, absent
   tables are None.
+- Server profiles: `tests/unit/test_server_profiles.py` — plugin profile
+  exposes ``get_project_structure`` but not ``list_projects``/``open_project``.
 - System prompt tests (`tests/integration/test_skill_system.py`) are
   untouched and still pass.
