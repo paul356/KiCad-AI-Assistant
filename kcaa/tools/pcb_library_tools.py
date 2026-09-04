@@ -21,6 +21,7 @@ from kcaa.utils.fp_lib_table_utils import (
     sanitize_lib_nickname,
 )
 from kcaa.utils.pcb_footprint_utils import (
+    get_fp_layer,
     get_fp_property,
     get_pcb_version,
     is_safe_footprint_name,
@@ -631,9 +632,19 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
             exported: list[str] = []
             failed: list[dict[str, str]] = []
             skipped: list[dict[str, str]] = []
-            node_by_name = {
-                name: node for node in nodes for name in [split_footprint_header(node)[1]]
-            }
+            # Deterministic instance selection: when the board carries several
+            # footprints with the same name (e.g. 48x CAPC), export the
+            # front-side one when it exists (library parts are front-side
+            # form, so a B.Cu instance would need a flip that the F.Cu copy
+            # already matches), else the first instance in board order.
+            node_by_name: dict[str, list[Any]] = {}
+            for node in nodes:
+                name = split_footprint_header(node)[1]
+                current = node_by_name.get(name)
+                if current is None or (
+                    get_fp_layer(current) != "F.Cu" and get_fp_layer(node) == "F.Cu"
+                ):
+                    node_by_name[name] = node
             board_pair = {
                 name: (split_footprint_header(node)[0] or "", name)
                 for name, node in node_by_name.items()

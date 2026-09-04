@@ -260,6 +260,8 @@ class TestNormalizeForLibrary:
             at = next(s for s in c if isinstance(s, list) and s and str(s[0]) == "at")
             # uniform angle 0°, not board-space compensated
             assert at[3] == pytest.approx(0.0)
+            # anchor centered by omitting justify (library convention)
+            assert "justify" not in str(c)
             if text_type == "reference":
                 assert c[2] == "REF**"
             else:
@@ -404,6 +406,9 @@ class TestNormalizeBackSideFlip:
         assert at[2] == pytest.approx(1.5)
         assert at[3] == pytest.approx(0.0)
         assert ref[2] == "REF**"
+        # library convention: no justify — the anchor centers by omission
+        # (the board's "left bottom" would pin it to the lower-left corner)
+        assert "justify" not in str(ref)
         # keep-upright unlocked
         subs = [s for s in ref if isinstance(s, list) and s and str(s[0]) == "unlocked"]
         assert subs, "unlocked missing"
@@ -474,6 +479,71 @@ class TestNormalizeBackSideFlip:
         assert "unlocked" in dumped
         layer = next(s for s in text if isinstance(s, list) and s and str(s[0]) == "layer")
         assert str(layer[1]) == "F.SilkS"
+
+
+def _fp_layer(node) -> str:
+    layer = next((s for s in node if isinstance(s, list) and s and str(s[0]) == "layer"), None)
+    return str(layer[1]) if layer else ""
+
+
+class TestDeterministicInstanceSelection:
+    """Same-named board footprints export deterministically: the front-side
+    instance wins when one exists, else the first in board order — never an
+    arbitrary last one."""
+
+    def _board(self, layer_a: str, layer_b: str):
+        import sexpdata
+
+        return sexpdata.loads(
+            "(kicad_pcb (version 20260830)"
+            '	(footprint "CustomLib:DUP"'
+            f'		(layer "{layer_a}")'
+            "		(at 10.0 20.0 0.0)"
+            '		(property "Reference" "A1" (at 0 1.5 0) (layer "F.SilkS"))'
+            '		(fp_line (start 0 0) (end 1 0) (stroke (width 0.1) (type solid)) (layer "F.SilkS"))'
+            "	)"
+            '	(footprint "CustomLib:DUP"'
+            f'		(layer "{layer_b}")'
+            "		(at 30.0 40.0 90.0)"
+            '		(property "Reference" "B2" (at 0 -1.5 0) (layer "F.SilkS"))'
+            '		(fp_line (start 2 0) (end 3 0) (stroke (width 0.1) (type solid)) (layer "F.SilkS"))'
+            "	)"
+            ")"
+        )
+
+    def _fp_nodes(self, board):
+        return [n for n in board if isinstance(n, list) and n and str(n[0]) == "footprint"]
+
+    def _pick(self, nodes) -> list:
+        picked = None
+        for node in nodes:
+            is_front = _fp_layer(node) == "F.Cu"
+            if picked is None or (_fp_layer(picked) != "F.Cu" and is_front):
+                picked = node
+        return picked
+
+    def test_front_side_instance_wins_over_back_side(self):
+        """B.Cu instance first, F.Cu second: the F.Cu one is picked, so the
+        exported geometry is the second instance's (line start x=2), unflipped."""
+        board = self._board("B.Cu", "F.Cu")
+        picked = self._pick(self._fp_nodes(board))
+        assert _fp_layer(picked) == "F.Cu"
+        out = normalize_footprint_for_library(picked, 20260830, "MyLib")
+        line = next(c for c in out if isinstance(c, list) and c and str(c[0]) == "fp_line")
+        start = next(s for s in line if isinstance(s, list) and s and str(s[0]) == "start")
+        assert start[1] == pytest.approx(2.0)  # second instance, not the B.Cu first
+        assert start[2] == pytest.approx(0.0)
+
+    def test_back_side_only_takes_first_instance(self):
+        """Only B.Cu instances exist: the first in board order is picked
+        (line start x=0, not the second's x=2)."""
+        board = self._board("B.Cu", "B.Cu")
+        picked = self._pick(self._fp_nodes(board))
+        assert _fp_layer(picked) == "B.Cu"
+        out = normalize_footprint_for_library(picked, 20260830, "MyLib")
+        line = next(c for c in out if isinstance(c, list) and c and str(c[0]) == "fp_line")
+        start = next(s for s in line if isinstance(s, list) and s and str(s[0]) == "start")
+        assert start[1] == pytest.approx(0.0)  # first instance picked
 
 
 # ---------------------------------------------------------------------------

@@ -499,6 +499,23 @@ def _property_to_fp_text(child: list[Any], prop_name: str, new_value: str) -> li
     return fp_text_node
 
 
+def _drop_justify(child: list[Any]) -> None:
+    """Remove any ``(justify ...)`` entry from a text node's effects.
+
+    KiCad's library format centers text anchors by *omitting* justify: the
+    ``center`` token is not legal in ``(justify ...)`` (pcb_parser rejects
+    it) and the writer drops the clause entirely for centered text.  Keeping
+    the board's ``left bottom`` would pin the anchor to the text's
+    lower-left corner instead of its center.
+    """
+    for sub in child:
+        if not (isinstance(sub, list) and len(sub) > 0 and _sym(sub[0]) == "effects"):
+            continue
+        sub[:] = [
+            e for e in sub if not (isinstance(e, list) and len(e) > 0 and _sym(e[0]) == "justify")
+        ]
+
+
 def _rotate_child_at_about_origin(child: list[Any], angle_deg: float) -> None:
     """Rotate a child node's ``at`` position about the footprint origin.
 
@@ -595,8 +612,12 @@ def normalize_footprint_for_library(
         elif _sym(child[0]) == "fp_text":
             text_type = _sym(child[1]) if len(child) > 1 else ""
             if text_type in ("reference", "value"):
-                # Text faces up (90°) uniformly, regardless of board rotation.
+                # Text faces up (0°) uniformly, regardless of board rotation.
                 _set_child_at_rotation(child, 0.0)
+                # Library convention: center the anchor by omitting justify
+                # (the board's "left bottom" would pin it to the text's
+                # lower-left corner; "center" is not a legal token).
+                _drop_justify(child)
                 if text_type == "reference" and len(child) > 2:
                     child[2] = "REF**"
                 elif text_type == "value" and len(child) > 2:
