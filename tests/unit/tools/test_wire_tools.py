@@ -795,6 +795,101 @@ class TestConnectPinsWithWire:
 # ---------------------------------------------------------------------------
 
 
+class TestWireRoutingAvoidsAnchors:
+    """Routes must not cross label/junction anchor points (silent net-merge bug)."""
+
+    def _connect_pins(self, tools, sch_path):
+        return asyncio.run(
+            tools["connect_pins_with_wire"](
+                schematic_path=sch_path,
+                from_ref="R2",
+                from_pin="2",
+                to_ref="R3",
+                to_pin="2",
+            )
+        )
+
+    def _connect_points(self, tools, sch_path, sx, sy, ex, ey):
+        return asyncio.run(
+            tools["connect_points_with_wire"](
+                schematic_path=sch_path,
+                start_x=sx,
+                start_y=sy,
+                end_x=ex,
+                end_y=ey,
+            )
+        )
+
+    def _add_label(self, tools, sch_path, text, x, y, label_type="global"):
+        return asyncio.run(
+            tools["add_label_to_schematic"](
+                schematic_path=sch_path,
+                text=text,
+                x=x,
+                y=y,
+                angle=0,
+                label_type=label_type,
+            )
+        )
+
+    @staticmethod
+    def _wires_through(sch_path, px, py, tol=0.01):
+        """Return True if any saved wire has (px, py) on its interior."""
+        from kcaa.tools.wire_edit_tools import _point_on_open_segment
+
+        sch = skip.Schematic(sch_path)
+        for w in sch.wire:
+            ax = float(w.start.value[0])
+            ay = float(w.start.value[1])
+            bx = float(w.end.value[0])
+            by = float(w.end.value[1])
+            if _point_on_open_segment(px, py, ax, ay, bx, by, tol):
+                return True
+        return False
+
+    def test_collect_anchor_points_covers_labels_and_junctions(self, tools, tmp_sch):
+        """Local/global/hierarchical labels and junctions are all collected."""
+        from kcaa.tools.wire_edit_tools import _collect_anchor_points
+
+        self._add_label(tools, tmp_sch, "L1", 130.0, 102.54, label_type="local")
+        self._add_label(tools, tmp_sch, "G1", 140.0, 102.54, label_type="global")
+        self._add_label(tools, tmp_sch, "H1", 150.0, 102.54, label_type="hierarchical")
+        sch = skip.Schematic(tmp_sch)
+        j = sch.junction.new()
+        j.at.value = [160.0, 102.54]
+
+        anchors = list(_collect_anchor_points(sch))
+        expected = [(130.0, 102.54), (140.0, 102.54), (150.0, 102.54), (160.0, 102.54)]
+        for ex, ey in expected:
+            assert any(abs(ax - ex) < 1e-6 and abs(ay - ey) < 1e-6 for ax, ay in anchors), (
+                f"anchor ({ex}, {ey}) not collected from {anchors}"
+            )
+
+    def test_route_crossing_label_anchor_detours(self, tools, tmp_sch):
+        """Straight path from R2.pin2 to R3.pin2 (y=102.54) crosses a label at
+        (110, 102.54); the router must reject that candidate and detour."""
+        self._add_label(tools, tmp_sch, "MID", 110.0, 102.54)
+        result = self._connect_pins(tools, tmp_sch)
+
+        assert "error" in result or result.get("success") is True, result
+        if "error" not in result:
+            assert not self._wires_through(tmp_sch, 110.0, 102.54), (
+                "route crossed the label anchor — KiCad would merge its net"
+            )
+
+    def test_route_to_label_anchor_endpoint_allowed(self, tools, tmp_sch):
+        """Routing explicitly TO a label anchor (deliberate endpoint) stays allowed."""
+        self._add_label(tools, tmp_sch, "TARGET", 115.0, 102.54)
+        result = self._connect_points(tools, tmp_sch, 100.0, 102.54, 115.0, 102.54)
+
+        assert result.get("success") is True, result
+        sch = skip.Schematic(tmp_sch)
+        assert any(
+            abs(float(w.end.value[0]) - 115.0) < 1e-6 and abs(float(w.end.value[1]) - 102.54) < 1e-6
+            for w in sch.wire
+        ), "wire does not terminate at the label anchor endpoint"
+
+
 class TestDeleteWireFromSchematic:
     def _call(self, tools, schematic_path, wires, **kwargs):
         return asyncio.run(
