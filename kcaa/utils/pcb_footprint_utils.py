@@ -18,8 +18,6 @@ from typing import Any
 
 import sexpdata
 
-from kcaa.router.world_model import _rotate_ccw_on_screen
-
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -509,24 +507,6 @@ def _property_to_fp_text(child: list[Any], prop_name: str, new_value: str) -> li
     return fp_text_node
 
 
-def _rotate_child_at_about_origin(child: list[Any], angle_deg: float) -> None:
-    """Rotate a child node's ``at`` position about the footprint origin.
-
-    Board files written by Altium conversions store text anchors in
-    board-space orientation (a vector from the footprint origin along board
-    axes); the library needs them in the footprint frame, so rotate back by
-    the footprint's own rotation.  Only the x/y position is adjusted — the
-    text angle is handled separately.
-    """
-    if abs(angle_deg) < 1e-9:
-        return
-    for sub in child:
-        if isinstance(sub, list) and len(sub) >= 3 and _sym(sub[0]) == "at":
-            x, y = float(sub[1]), float(sub[2])
-            sub[1], sub[2] = _rotate_ccw_on_screen(x, y, -angle_deg)
-            return
-
-
 def normalize_footprint_for_library(
     fp_node: list[Any],
     pcb_version: int,
@@ -586,13 +566,12 @@ def normalize_footprint_for_library(
         elif key in ("pad", "fp_text", "property"):
             child_at_nodes.append(child)
 
-    # Re-express children in the footprint's own frame: un-rotate text
-    # anchors (Altium-converted boards store them in board-space orientation)
-    # and re-express rotations.
+    # Re-express child rotations in the footprint's own frame: the board
+    # stores text/pad angles in board space (they follow the footprint's
+    # rotation), so subtract fp_rotation.  Child at x/y are already
+    # footprint-local in the file format and are left untouched.
     for child in child_at_nodes:
         _readjust_rotation(child, fp_rotation)
-        if _sym(child[0]) in _TEXT_TYPES:
-            _rotate_child_at_about_origin(child, fp_rotation)
         if _sym(child[0]) == "pad":
             # Strip net connections (per-instance routing data).
             for j in list(range(len(child) - 1, -1, -1)):

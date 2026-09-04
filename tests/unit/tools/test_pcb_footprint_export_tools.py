@@ -314,13 +314,13 @@ class TestNormalizeForLibrary:
                 assert c[2] == "REF**"
             else:
                 assert c[2] == "Sensor_Board_XYZ"
-        # position: board-space anchor un-rotated by fp rotation 45°:
-        # R(-45°)·(0, 2.0) = (-1.414, 1.414)
+        # position: at x/y are footprint-local and do not follow the
+        # footprint's rotation; the library keeps them untouched.
         ref_at = next(
             s for s in texts["reference"] if isinstance(s, list) and s and str(s[0]) == "at"
         )
-        assert ref_at[1] == pytest.approx(-2.0 * 0.70710678)
-        assert ref_at[2] == pytest.approx(2.0 * 0.70710678)
+        assert ref_at[1] == pytest.approx(0.0)
+        assert ref_at[2] == pytest.approx(2.0)
 
     def test_serialize_roundtrip(self):
         node = self._node()[0]
@@ -451,10 +451,10 @@ class TestNormalizeBackSideFlip:
         assert "value" in texts
         ref = texts["reference"]
         at = next(s for s in ref if isinstance(s, list) and s and str(s[0]) == "at")
-        # board-space (0, 1.5) un-rotated by fp rot 180° -> (0, -1.5), then
-        # back-side Y mirror -> (0, 1.5); angle: 270 - 180 = 90, flip -> 90
+        # at x/y are footprint-local; the back-side flip only mirrors Y:
+        # (0, 1.5) -> (0, -1.5); angle: 270 - 180 = 90, flip -> 90
         assert at[1] == pytest.approx(0.0)
-        assert at[2] == pytest.approx(1.5)
+        assert at[2] == pytest.approx(-1.5)
         assert at[3] == pytest.approx(90.0)
         assert ref[2] == "REF**"
         # effects/justify carried over from the board, not dropped
@@ -475,12 +475,11 @@ class TestNormalizeBackSideFlip:
         # layer flipped B.SilkS -> F.SilkS
         layer = next(s for s in ref if isinstance(s, list) and s and str(s[0]) == "layer")
         assert str(layer[1]) == "F.SilkS"
-        # value text: name + mirrored position (0, -1.5) -> (0, 1.5)
+        # value text: name + back-side Y mirror (0, -1.5) -> (0, 1.5)
         val = texts["value"]
         vat = next(s for s in val if isinstance(s, list) and s and str(s[0]) == "at")
-        # (0, -1.5) -> un-rotated (0, 1.5) -> B-side mirror (0, -1.5)
         assert vat[1] == pytest.approx(0.0)
-        assert vat[2] == pytest.approx(-1.5)
+        assert vat[2] == pytest.approx(1.5)
         assert val[2] == "BACKFP"
 
     def test_graphics_mirrored_and_layers_flipped(self):
