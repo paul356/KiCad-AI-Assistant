@@ -832,6 +832,40 @@ class TestWireRoutingAvoidsAnchors:
             )
         )
 
+    def _append_sheet(self, sch_path, x, y, angle, pins):
+        """Append a (sheet ...) symbol node with pins to a schematic file.
+
+        Pins are (name, px, py) offsets relative to the sheet origin.
+        """
+        import uuid
+
+        lines = [
+            f"  (sheet (at {x} {y} {angle}) (size 50.8 50.8)",
+            "    (stroke (width 0) (type dash) (color 0 0 0 0))",
+            "    (fill (type none))",
+            f'    (uuid "{uuid.uuid4()}")',
+            '    (property "Sheet name" "SUB" (at 0 0 0) (show_name no) (do_not_autoplace yes) (effects (font (size 1.27 1.27)) (justify left)))',
+            '    (property "Sheet file" "sub.kicad_sch" (at 0 0 0) (show_name no) (do_not_autoplace yes) (effects (font (size 1.27 1.27)) (justify left)))',
+        ]
+        for name, px, py in pins:
+            lines.append(
+                f'    (pin "{name}" input (at {px} {py} 0) (uuid "{uuid.uuid4()}") (effects (font (size 1.27 1.27)) (justify left)))'
+            )
+        lines.extend(
+            [
+                "    (instances",
+                '      (project "test"',
+                f'        (path "/00000000-0000-0000-0000-000000000000/{uuid.uuid4()}" (page "1"))',
+                "      )",
+                "    )",
+                "  )",
+            ]
+        )
+        text = Path(sch_path).read_text().rstrip()
+        assert text.endswith(")")
+        text = text[:-1]  # drop the root close paren; re-add after the sheet
+        Path(sch_path).write_text(text + "\n" + "\n".join(lines) + "\n)")
+
     @staticmethod
     def _wires_through(sch_path, px, py, tol=0.01):
         """Return True if any saved wire has (px, py) on its interior."""
@@ -864,6 +898,49 @@ class TestWireRoutingAvoidsAnchors:
             assert any(abs(ax - ex) < 1e-6 and abs(ay - ey) < 1e-6 for ax, ay in anchors), (
                 f"anchor ({ex}, {ey}) not collected from {anchors}"
             )
+
+    def test_collect_anchor_points_covers_sheet_pins(self, tools, tmp_sch):
+        """Sheet-symbol pins are collected at world coordinates: sheet origin
+        plus the pin offset, rotated by the sheet-symbol angle."""
+        from kcaa.tools.wire_edit_tools import _collect_anchor_points
+
+        self._append_sheet(tmp_sch, 100.0, 102.54, 0, [("MID", 10.0, 0.0)])
+        self._append_sheet(tmp_sch, 200.0, 50.0, 180, [("ROT", 0.0, 10.0)])
+        sch = skip.Schematic(tmp_sch)
+
+        anchors = list(_collect_anchor_points(sch))
+        expected = [
+            (110.0, 102.54),  # MID at origin (100, 102.54) + offset (10, 0)
+            (200.0, 40.0),  # ROT at origin (200, 50) + offset rotated 180° -> (0, -10)
+        ]
+        for ex, ey in expected:
+            assert any(abs(ax - ex) < 1e-6 and abs(ay - ey) < 1e-6 for ax, ay in anchors), (
+                f"sheet anchor ({ex}, {ey}) not collected from {anchors}"
+            )
+
+    def test_route_crossing_sheet_pin_anchor_detours(self, tools, tmp_sch):
+        """Straight path from R2.pin2 to R3.pin2 (y=102.54) crosses a sheet
+        symbol pin anchored at (110, 102.54); the router must detour."""
+        self._append_sheet(tmp_sch, 100.0, 102.54, 0, [("MID", 10.0, 0.0)])
+        result = self._connect_pins(tools, tmp_sch)
+
+        assert "error" in result or result.get("success") is True, result
+        if "error" not in result:
+            assert not self._wires_through(tmp_sch, 110.0, 102.54), (
+                "route crossed the sheet pin anchor — KiCad would merge its net"
+            )
+
+    def test_route_to_sheet_pin_anchor_endpoint_allowed(self, tools, tmp_sch):
+        """Routing explicitly TO a sheet-symbol pin anchor stays allowed."""
+        self._append_sheet(tmp_sch, 100.0, 102.54, 0, [("TARGET", 10.0, 0.0)])
+        result = self._connect_points(tools, tmp_sch, 100.0, 102.54, 110.0, 102.54)
+
+        assert result.get("success") is True, result
+        sch = skip.Schematic(tmp_sch)
+        assert any(
+            abs(float(w.end.value[0]) - 110.0) < 1e-6 and abs(float(w.end.value[1]) - 102.54) < 1e-6
+            for w in sch.wire
+        ), "wire does not terminate at the sheet pin anchor endpoint"
 
     def test_route_crossing_label_anchor_detours(self, tools, tmp_sch):
         """Straight path from R2.pin2 to R3.pin2 (y=102.54) crosses a label at

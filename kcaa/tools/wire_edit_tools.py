@@ -15,6 +15,7 @@ from typing import Any
 
 from fastmcp import Context, FastMCP
 
+from kcaa.utils.netlist_parser import _normalize_iterable
 from kcaa.utils.schematic_sexp_utils import save_schematic
 from kcaa.utils.skip_compat import safe_schematic
 from kcaa.utils.skip_helpers import sym_pin_world_coords
@@ -1325,10 +1326,14 @@ def _collect_anchor_points(sch: Any) -> list[tuple[float, float]]:
     already covered by ``_collect_all_pin_positions`` (power symbols expose
     a pin at the tip) and are not duplicated here.
 
+    Sheet-symbol pins (the parent-side ports of hierarchical subsheets)
+    are collected too: they sit on the sheet-symbol edge and a wire
+    crossing one joins the subsheet's net, the same silent-merge hazard.
+
     Route endpoints that coincide with an anchor (e.g. the user routed
-    explicitly to a net-label position) stay allowed: the collision gates
-    use a strict segment-interior check and exclude the overall route
-    start/end.
+    explicitly to a net-label position or a sheet-symbol pin) stay
+    allowed: the collision gates use a strict segment-interior check and
+    exclude the overall route start/end.
 
     Returns:
         List of (x, y) anchor positions in schematic world coordinates.
@@ -1357,6 +1362,30 @@ def _collect_anchor_points(sch: Any) -> list[tuple[float, float]]:
         for j in sch.junction:
             coords = j.at.value
             anchors.append((float(coords[0]), float(coords[1])))
+    except (AttributeError, IndexError, TypeError, ValueError):
+        pass
+    try:
+        # Sheet-symbol pins are positioned relative to the sheet origin and
+        # rotate with the sheet symbol (KiCad semantic; ``sch.symbol`` does
+        # not contain sheet symbols, so they need their own walk).
+        for sheet in _normalize_iterable(getattr(sch, "sheet", None)):
+            try:
+                sat = list(sheet.at)
+                sx = float(sat[0])
+                sy = float(sat[1])
+                angle = float(sat[2]) if len(sat) > 2 else 0.0
+            except (AttributeError, IndexError, TypeError, ValueError):
+                continue
+            cos_a = math.cos(math.radians(angle))
+            sin_a = math.sin(math.radians(angle))
+            for pin in _normalize_iterable(getattr(sheet, "pin", None)):
+                try:
+                    pat = list(pin.at)
+                    px = float(pat[0])
+                    py = float(pat[1])
+                except (AttributeError, IndexError, TypeError, ValueError):
+                    continue
+                anchors.append((sx + px * cos_a - py * sin_a, sy + px * sin_a + py * cos_a))
     except (AttributeError, IndexError, TypeError, ValueError):
         pass
     return anchors
