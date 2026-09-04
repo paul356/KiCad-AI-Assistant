@@ -2,7 +2,8 @@
 
 Known issues discovered during review but not fixed in the originating PR.
 Each entry records the evidence, the impact, and the proposed fix so the work
-can be picked up independently.
+can be picked up independently.  Resolved items are moved to the
+``## Resolved`` section at the bottom.
 
 ## NPTH oval/slot drill shapes are not supported
 
@@ -61,73 +62,6 @@ rotation plus the footprint rotation (verify which KiCad actually applies).
   the resolved slot extent.
 - Real board: ninja-keyboard history file with `(drill oval ...)` pads
   yields `drill`-kind obstacles.
-
----
-
-## Wire routing does not avoid label / power-tip / junction anchors
-
-**Status:** open (proposed; not tracked as a GitHub issue)
-
-### Symptom
-
-The schematic wire-routing tools (`kcaa/tools/wire_edit_tools.py`:
-`connect_points_with_wire`, `add_wire_to_schematic`, `connect_pins_with_wire`)
-build their obstacle set from only three kinds of geometry:
-
-- `_collect_existing_wires` — existing wire segments,
-- `_collect_all_pin_positions` — pin tips (incl. power-symbol pins),
-- `_collect_pin_symbol_stubs` — pin stub lines.
-
-**Labels never appear in the obstacle set.** `label` occurs in the file
-only in `connect_points_with_wire`'s docstring, as an optional *endpoint*
-input ("e.g. a net label position") — never as a path obstacle. The same
-holds for power-symbol tips (they are covered only because they are also
-pins) and for existing junction dots: none are anchor points the router
-avoids.
-
-### Evidence
-
-- Grep of `wire_edit_tools.py` shows exactly three
-  `_collect_*` obstacle builders, none of which read `label`,
-  `global_label`, `hierarchical_label`, `junction`, or the `#PWR?`
-  placement set beyond the generic pin walk.
-- The router's rejection gates (`_try_angle_config`:
-  pin-on-interior, stub overlap, wire overlap, pin-at-corner) have no
-  label/junction gate.
-- The KiCad connection semantics that make this harmful are now enforced
-  in `netlist_parser._build_netlist` Step 2c (issue #100 fix): a point
-  item (label, power tip, pin tip) anchored anywhere on a wire segment
-  joins that wire's net.
-
-### Impact
-
-A candidate route that passes **through** a label anchor (not at an
-endpoint) merges that label's net with the new wire's net in KiCad —
-an unintended short or a silently renamed net. The same applies to
-power-symbol tips and existing junction dots. `connect_points_with_wire`
-using a label position as a *deliberate* endpoint should stay allowed,
-but the tools have no way to distinguish (no anchor check at all).
-
-### Fix (proposed)
-
-1. New `_collect_anchor_points(sch)`: local / global / hierarchical
-   label anchors + power-symbol (`#PWR?` or `power:` lib_id) tips +
-   existing junction positions.
-2. Fold the anchors into the existing `obstacles` list so the current
-   `_PIN_COLLISION_TOL` (0.5 mm) on-segment circle check rejects routes
-   crossing them, same channel as pin positions.
-3. Endpoint exemption: a candidate endpoint that coincides with an
-   anchor coordinate (user explicitly routed to a label) is allowed,
-   mirroring the existing pin-endpoint / lead-stub exemption logic.
-
-### Validation
-
-- Unit: route between two pins whose straight path crosses a label
-  anchor → routing rejects or detours; same label anchor as an explicit
-  endpoint → route allowed.
-- Real board: MotorCell, route a test wire through the `SL_B` mid-wire
-  label anchor at (276.86, 197.9422) → rejected (today it would be
-  accepted and would quietly merge the `SL_B` net).
 
 ---
 
@@ -309,12 +243,80 @@ tool-collapse issue above).
 
 ---
 
-## Project layout accessible without touching the system prompt
+## Resolved
+
+### Wire routing does not avoid label / power-tip / junction anchors
+
+**Status:** resolved (2026-09-04) — fixed by PR #115 (commit `afa504d`); closes issue #114.
+
+#### Symptom
+
+The schematic wire-routing tools (`kcaa/tools/wire_edit_tools.py`:
+`connect_points_with_wire`, `add_wire_to_schematic`, `connect_pins_with_wire`)
+build their obstacle set from only three kinds of geometry:
+
+- `_collect_existing_wires` — existing wire segments,
+- `_collect_all_pin_positions` — pin tips (incl. power-symbol pins),
+- `_collect_pin_symbol_stubs` — pin stub lines.
+
+**Labels never appear in the obstacle set.** `label` occurs in the file
+only in `connect_points_with_wire`'s docstring, as an optional *endpoint*
+input ("e.g. a net label position") — never as a path obstacle. The same
+holds for power-symbol tips (they are covered only because they are also
+pins) and for existing junction dots: none are anchor points the router
+avoids.
+
+#### Evidence
+
+- Grep of `wire_edit_tools.py` shows exactly three
+  `_collect_*` obstacle builders, none of which read `label`,
+  `global_label`, `hierarchical_label`, `junction`, or the `#PWR?`
+  placement set beyond the generic pin walk.
+- The router's rejection gates (`_try_angle_config`:
+  pin-on-interior, stub overlap, wire overlap, pin-at-corner) have no
+  label/junction gate.
+- The KiCad connection semantics that make this harmful are now enforced
+  in `netlist_parser._build_netlist` Step 2c (issue #100 fix): a point
+  item (label, power tip, pin tip) anchored anywhere on a wire segment
+  joins that wire's net.
+
+#### Impact
+
+A candidate route that passes **through** a label anchor (not at an
+endpoint) merges that label's net with the new wire's net in KiCad —
+an unintended short or a silently renamed net. The same applies to
+power-symbol tips and existing junction dots. `connect_points_with_wire`
+using a label position as a *deliberate* endpoint should stay allowed,
+but the tools have no way to distinguish (no anchor check at all).
+
+#### Fix
+
+1. New `_collect_anchor_points(sch)`: local / global / hierarchical
+   label anchors + power-symbol (`#PWR?` or `power:` lib_id) tips +
+   existing junction positions.
+2. Fold the anchors into the existing `obstacles` list so the current
+   `_PIN_COLLISION_TOL` (0.5 mm) on-segment circle check rejects routes
+   crossing them, same channel as pin positions.
+3. Endpoint exemption: a candidate endpoint that coincides with an
+   anchor coordinate (user explicitly routed to a label) is allowed,
+   mirroring the existing pin-endpoint / lead-stub exemption logic.
+
+#### Validation
+
+- Unit: route between two pins whose straight path crosses a label
+  anchor → routing rejects or detours; same label anchor as an explicit
+  endpoint → route allowed.
+- Real board: MotorCell, route a test wire through the `SL_B` mid-wire
+  label anchor at (276.86, 197.9422) → rejected (today it would be
+  accepted and would quietly merge the `SL_B` net).
+
+---
+### Project layout accessible without touching the system prompt
 
 **Status:** resolved (2026-09-04) — implemented as a query tool, not a
-prompt change.
+prompt change (PR #116).
 
-### Decision
+#### Decision
 
 The original plan (append a project tree to the end of `build_system_prompt`)
 was rejected: the system prompt must stay stable and token-budgeted.  The
@@ -323,7 +325,7 @@ project layout is instead exposed through the MCP query tool
 calls on demand when it needs to plan sheet edits, cross-file operations,
 or exports.
 
-### Implementation
+#### Implementation
 
 - ``get_project_structure`` now returns (in addition to the flat ``files``
   set and metadata):
@@ -341,7 +343,7 @@ or exports.
   so the KiCad plugin's LLM can call it; the full-profile management
   tools (``list_projects`` / ``open_project``) stay out of that profile.
 
-### Validation
+#### Validation
 
 - Unit: `tests/unit/tools/test_project_tools.py` — sheet hierarchy follow
   Sheetfile refs, cycles are cut, leaf sheets omit ``children``, absent
