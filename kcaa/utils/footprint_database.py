@@ -41,6 +41,7 @@ from sqlalchemy import (
     event,
     func,
     insert,
+    or_,
     select,
     text,
 )
@@ -64,6 +65,7 @@ class FpLibraryRecord:
     checksum: str  # SHA-256 of sorted "filename:mtime:size\n" manifest
     footprint_count: int
     last_indexed: float
+    project: str = ""  # "" = global library; otherwise project identifier
 
 
 @dataclass
@@ -100,6 +102,7 @@ class _FpLibraryRow(_Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     library_name = Column(String, nullable=False, unique=True)
+    project = Column(String, nullable=False, default="", server_default="''")
     raw_uri = Column(String, nullable=False, default="")
     dir_path = Column(String, nullable=False, default="")
     description = Column(String, nullable=False, default="")
@@ -199,6 +202,17 @@ class FootprintDatabase:
         """Create ORM tables and FTS5 virtual table / triggers."""
         _Base.metadata.create_all(self._engine)
         with self._engine.connect() as conn:
+            # Schema v2: fp_libraries gains a `project` column.  Old databases
+            # are upgraded in place (ALTER) — data is preserved.  v1 databases
+            # have no project column; anything newer already matches the ORM.
+            columns = conn.execute(text("PRAGMA table_info(fp_libraries)")).all()
+            col_names = {row[1] for row in columns}
+            if "project" not in col_names and columns:
+                log.info("footprint DB schema v1 → v2: adding fp_libraries.project column")
+                conn.execute(
+                    text("ALTER TABLE fp_libraries ADD COLUMN project VARCHAR NOT NULL DEFAULT ''")
+                )
+                conn.commit()
             try:
                 for statement in _DDL_FTS.split(";\n\n"):
                     stmt = statement.strip()
@@ -214,19 +228,24 @@ class FootprintDatabase:
     # Public API — state query (used by FootprintIndexManager for sync)
     # ------------------------------------------------------------------
 
-    def get_library_states(self) -> dict[str, tuple[int, str, str]]:
-        """Return a snapshot of all indexed libraries as
+    def get_library_states(self, project: str | None = None) -> dict[str, tuple[int, str, str]]:
+        """Return a snapshot of indexed libraries visible in *project* scope as
         ``{library_name: (id, checksum, dir_path)}``.
+
+        Scope = global libraries (``project=''``) plus the current project's
+        libraries when *project* is given; ``None`` returns everything.
         """
+        q = select(
+            _FpLibraryRow.id,
+            _FpLibraryRow.library_name,
+            _FpLibraryRow.checksum,
+            _FpLibraryRow.dir_path,
+        )
+        clause = self._project_scope_clause(project)
+        if clause is not None:
+            q = q.where(clause)
         with self._Session() as session:
-            rows = session.execute(
-                select(
-                    _FpLibraryRow.id,
-                    _FpLibraryRow.library_name,
-                    _FpLibraryRow.checksum,
-                    _FpLibraryRow.dir_path,
-                )
-            ).all()
+            rows = session.execute(q).all()
         return {row.library_name: (row.id, row.checksum, row.dir_path) for row in rows}
 
     # ------------------------------------------------------------------
@@ -241,6 +260,7 @@ class FootprintDatabase:
         description: str,
         checksum: str,
         footprints: list["FootprintRecord"],
+        project: str = "",
     ) -> int:
         """Insert or fully replace a library and its footprints.
         Returns the number of footprints stored.
@@ -253,6 +273,7 @@ class FootprintDatabase:
 
             lib_row = _FpLibraryRow(
                 library_name=library_name,
+                project=project,
                 raw_uri=raw_uri,
                 dir_path=dir_path,
                 description=description,
@@ -310,37 +331,81 @@ class FootprintDatabase:
     # Public API — search
     # ------------------------------------------------------------------
 
-    def search(self, query: str, limit: int = 50) -> list["FootprintRecord"]:
+    def search(
+        self, query: str, limit: int = 50, project: str | None = None
+    ) -> list["FootprintRecord"]:
         """Full-text search across footprint_name, description, and tags.
         Falls back to LIKE search if FTS5 is unavailable.
+
+        *project* scope = global libraries (``project=''``) plus that
+        project's libraries; ``None`` searches everything.
         """
         safe_query = self._fts_escape(query)
-        sql = text(
-            """
-            SELECT f.library_name, f.footprint_name, f.library_id,
-                   f.description, f.tags, f.attr, f.pad_count, f.has_3d_model
-            FROM footprints_fts fts
-            JOIN footprints f ON f.rowid = fts.rowid
-            WHERE footprints_fts MATCH :q
-            ORDER BY rank
-            LIMIT :lim
-            """
-        )
+        params: dict[str, object] = {"q": safe_query, "lim": limit}
+        if project == "":
+            # Project scope: global libraries only.
+            sql = text(
+                """
+                SELECT f.library_name, f.footprint_name, f.library_id,
+                       f.description, f.tags, f.attr, f.pad_count, f.has_3d_model
+                FROM footprints_fts fts
+                JOIN footprints f ON f.rowid = fts.rowid
+                JOIN fp_libraries lib ON f.library_id = lib.id
+                WHERE footprints_fts MATCH :q AND lib.project = ''
+                ORDER BY rank
+                LIMIT :lim
+                """
+            )
+        elif project:
+            # Project scope: global plus the given project's libraries.
+            params["proj"] = project
+            sql = text(
+                """
+                SELECT f.library_name, f.footprint_name, f.library_id,
+                       f.description, f.tags, f.attr, f.pad_count, f.has_3d_model
+                FROM footprints_fts fts
+                JOIN footprints f ON f.rowid = fts.rowid
+                JOIN fp_libraries lib ON f.library_id = lib.id
+                WHERE footprints_fts MATCH :q
+                  AND (lib.project = '' OR lib.project = :proj)
+                ORDER BY rank
+                LIMIT :lim
+                """
+            )
+        else:
+            # No scope: search everything.
+            sql = text(
+                """
+                SELECT f.library_name, f.footprint_name, f.library_id,
+                       f.description, f.tags, f.attr, f.pad_count, f.has_3d_model
+                FROM footprints_fts fts
+                JOIN footprints f ON f.rowid = fts.rowid
+                JOIN fp_libraries lib ON f.library_id = lib.id
+                WHERE footprints_fts MATCH :q
+                ORDER BY rank
+                LIMIT :lim
+                """
+            )
         try:
             with self._engine.connect() as conn:
-                rows = conn.execute(sql, {"q": safe_query, "lim": limit}).all()
+                rows = conn.execute(sql, params).all()
             return [self._row_to_footprint(r) for r in rows]
         except Exception:
             log.debug("FTS5 unavailable, falling back to LIKE search")
-            return self.search_by_name(query, limit=limit)
+            return self.search_by_name(query, limit=limit, project=project)
 
     def search_by_name(
         self,
         name: str,
         exact: bool = False,
         limit: int = 50,
+        project: str | None = None,
     ) -> list["FootprintRecord"]:
-        """Search footprints by name substring or exact match."""
+        """Search footprints by name substring or exact match.
+
+        *project* scope = global libraries (``project=''``) plus that
+        project's libraries; ``None`` searches everything.
+        """
         with self._Session() as session:
             q = select(_FootprintRow)
             if exact:
@@ -349,6 +414,10 @@ class FootprintDatabase:
                 q = q.where(
                     _FootprintRow.footprint_name.ilike(f"%{self._like_escape(name)}%", escape="\\")
                 )
+            clause = self._project_scope_clause(project)
+            if clause is not None:
+                q = q.join(_FpLibraryRow, _FootprintRow.library_id == _FpLibraryRow.id)
+                q = q.where(clause)
             rows = session.execute(q.limit(limit)).scalars().all()
         return [self._orm_to_footprint(r) for r in rows]
 
@@ -356,50 +425,104 @@ class FootprintDatabase:
     # Public API — lookup
     # ------------------------------------------------------------------
 
-    def get_footprint(self, library_name: str, footprint_name: str) -> "FootprintRecord | None":
-        """Look up a single footprint by (library_name, footprint_name)."""
+    def get_footprint(
+        self,
+        library_name: str,
+        footprint_name: str,
+        project: str | None = None,
+    ) -> "FootprintRecord | None":
+        """Look up a single footprint by (library_name, footprint_name),
+        scoped to *project* (global plus project libraries) when given."""
         with self._Session() as session:
-            row = session.execute(
-                select(_FootprintRow).where(
-                    _FootprintRow.library_name == library_name,
-                    _FootprintRow.footprint_name == footprint_name,
-                )
-            ).scalar_one_or_none()
+            q = select(_FootprintRow).where(
+                _FootprintRow.library_name == library_name,
+                _FootprintRow.footprint_name == footprint_name,
+            )
+            clause = self._project_scope_clause(project)
+            if clause is not None:
+                q = q.join(_FpLibraryRow, _FootprintRow.library_id == _FpLibraryRow.id)
+                q = q.where(clause)
+            row = session.execute(q).scalar_one_or_none()
         return self._orm_to_footprint(row) if row else None
 
-    def get_library_footprints(self, library_name: str) -> list["FootprintRecord"]:
-        """Return all footprints in a library, ordered by name."""
+    def get_library_footprints(
+        self, library_name: str, project: str | None = None
+    ) -> list["FootprintRecord"]:
+        """Return all footprints in a library, ordered by name, scoped to
+        *project* (global plus project libraries) when given."""
         with self._Session() as session:
-            rows = (
-                session.execute(
-                    select(_FootprintRow)
-                    .where(_FootprintRow.library_name == library_name)
-                    .order_by(_FootprintRow.footprint_name)
-                )
-                .scalars()
-                .all()
-            )
+            q = select(_FootprintRow).where(_FootprintRow.library_name == library_name)
+            clause = self._project_scope_clause(project)
+            if clause is not None:
+                q = q.join(_FpLibraryRow, _FootprintRow.library_id == _FpLibraryRow.id)
+                q = q.where(clause)
+            rows = session.execute(q.order_by(_FootprintRow.footprint_name)).scalars().all()
         return [self._orm_to_footprint(r) for r in rows]
 
-    def get_all_libraries(self) -> list["FpLibraryRecord"]:
-        """Return all indexed library records, ordered alphabetically."""
+    def get_all_libraries(self, project: str | None = None) -> list["FpLibraryRecord"]:
+        """Return indexed library records scoped to *project* (global plus
+        project libraries when given; everything when ``None``), ordered
+        alphabetically."""
+        q = select(_FpLibraryRow)
+        clause = self._project_scope_clause(project)
+        if clause is not None:
+            q = q.where(clause)
         with self._Session() as session:
-            rows = (
-                session.execute(select(_FpLibraryRow).order_by(_FpLibraryRow.library_name))
-                .scalars()
-                .all()
-            )
+            rows = session.execute(q.order_by(_FpLibraryRow.library_name)).scalars().all()
         return [self._orm_to_library(r) for r in rows]
 
-    def get_stats(self) -> "DbStats":
-        """Return summary statistics about the database."""
+    def library_name_exists(self, library_name: str) -> bool:
+        """True if any library row (any project) has this nickname.
+
+        Library nicknames are globally unique (a same-named library would be
+        shadowed in KiCad), so this deliberately does NOT scope by project.
+        """
         with self._Session() as session:
-            lib_count: int = session.execute(
-                select(func.count()).select_from(_FpLibraryRow)
-            ).scalar_one()
-            fp_count: int = session.execute(
-                select(func.count()).select_from(_FootprintRow)
-            ).scalar_one()
+            row = session.execute(
+                select(_FpLibraryRow.id).where(_FpLibraryRow.library_name == library_name)
+            ).first()
+        return row is not None
+
+    def get_all_footprint_names(self, project: str | None = None) -> set[str]:
+        """Return every footprint name indexed in *project* scope (global plus
+        project libraries when given; everything when ``None``)."""
+        q = select(_FootprintRow.footprint_name).join(
+            _FpLibraryRow, _FootprintRow.library_id == _FpLibraryRow.id
+        )
+        clause = self._project_scope_clause(project)
+        if clause is not None:
+            q = q.where(clause)
+        with self._Session() as session:
+            rows = session.execute(q).scalars().all()
+        return set(rows)
+
+    def get_all_library_footprints(self, project: str | None = None) -> set[tuple[str, str]]:
+        """Return every ``(library_name, footprint_name)`` pair indexed in
+        *project* scope (global plus project libraries when given; everything
+        when ``None``)."""
+        q = select(_FootprintRow.library_name, _FootprintRow.footprint_name).join(
+            _FpLibraryRow, _FootprintRow.library_id == _FpLibraryRow.id
+        )
+        clause = self._project_scope_clause(project)
+        if clause is not None:
+            q = q.where(clause)
+        with self._Session() as session:
+            return set(session.execute(q).all())
+
+    def get_stats(self, project: str | None = None) -> "DbStats":
+        """Return summary statistics about the database, scoped to *project*
+        (global plus project libraries when given; everything when ``None``)."""
+        lib_q = select(func.count()).select_from(_FpLibraryRow)
+        fp_q = select(func.count()).select_from(_FootprintRow)
+        clause = self._project_scope_clause(project)
+        if clause is not None:
+            lib_q = lib_q.where(clause)
+            fp_q = fp_q.join(_FpLibraryRow, _FootprintRow.library_id == _FpLibraryRow.id).where(
+                clause
+            )
+        with self._Session() as session:
+            lib_count: int = session.execute(lib_q).scalar_one()
+            fp_count: int = session.execute(fp_q).scalar_one()
             last_sync = session.execute(select(func.max(_FpLibraryRow.last_indexed))).scalar_one()
         return DbStats(
             library_count=lib_count,
@@ -431,6 +554,21 @@ class FootprintDatabase:
         return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
     @staticmethod
+    def _project_scope_clause(project: str | None = None):
+        """A WHERE clause fragment limiting rows to *project* scope.
+
+        Scope = global libraries (``project=''``) plus the given project's
+        libraries.  An empty string means global-only scope (filters out all
+        project-local rows); ``None`` (no project context) returns ``None``,
+        meaning the caller should not filter at all.
+        """
+        if project is None:
+            return None
+        if project == "":
+            return _FpLibraryRow.project == ""
+        return or_(_FpLibraryRow.project == "", _FpLibraryRow.project == project)
+
+    @staticmethod
     def _orm_to_footprint(row: _FootprintRow) -> "FootprintRecord":
         return FootprintRecord(
             library_name=row.library_name,
@@ -448,6 +586,7 @@ class FootprintDatabase:
         return FpLibraryRecord(
             id=row.id,
             library_name=row.library_name,
+            project=row.project,
             raw_uri=row.raw_uri,
             dir_path=row.dir_path,
             description=row.description,

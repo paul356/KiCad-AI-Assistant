@@ -633,7 +633,7 @@ class TestSyncFootprintIndex:
             "sync_footprint_index",
             {
                 "force": False,
-                "project_path": None,
+                "project_path": "/tmp/kicad-mcp-test.kicad_pro",
             },
         )
         assert result.get("status") in ("started", "already_running"), (
@@ -651,7 +651,7 @@ class TestSyncFootprintIndex:
             "sync_footprint_index",
             {
                 "force": True,
-                "project_path": None,
+                "project_path": "/tmp/kicad-mcp-test.kicad_pro",
             },
         )
         assert result.get("status") in ("started", "already_running")
@@ -692,7 +692,7 @@ class TestListFootprintLibraries:
             sid,
             "list_footprint_libraries",
             {
-                "project_path": None,
+                "project_path": "/tmp/kicad-mcp-test.kicad_pro",
             },
         )
         assert "libraries" in result
@@ -705,7 +705,7 @@ class TestListFootprintLibraries:
             sid,
             "list_footprint_libraries",
             {
-                "project_path": None,
+                "project_path": "/tmp/kicad-mcp-test.kicad_pro",
             },
         )
         assert result["count"] == len(result["libraries"])
@@ -717,7 +717,7 @@ class TestListFootprintLibraries:
             sid,
             "list_footprint_libraries",
             {
-                "project_path": None,
+                "project_path": "/tmp/kicad-mcp-test.kicad_pro",
             },
         )
         assert "error" not in result
@@ -732,7 +732,7 @@ class TestSearchFootprints:
             "search_footprints",
             {
                 "query": "resistor",
-                "project_path": None,
+                "project_path": "/tmp/kicad-mcp-test.kicad_pro",
                 "max_results": 5,
             },
         )
@@ -746,7 +746,7 @@ class TestSearchFootprints:
             "search_footprints",
             {
                 "query": "capacitor",
-                "project_path": None,
+                "project_path": "/tmp/kicad-mcp-test.kicad_pro",
                 "max_results": 5,
             },
         )
@@ -760,7 +760,7 @@ class TestSearchFootprints:
             "search_footprints",
             {
                 "query": "",
-                "project_path": None,
+                "project_path": "/tmp/kicad-mcp-test.kicad_pro",
                 "max_results": 5,
             },
         )
@@ -774,7 +774,7 @@ class TestSearchFootprints:
             "search_footprints",
             {
                 "query": "R_0402",
-                "project_path": None,
+                "project_path": "/tmp/kicad-mcp-test.kicad_pro",
                 "max_results": 3,
             },
         )
@@ -793,7 +793,7 @@ class TestGetFootprintDetails:
             {
                 "library_name": "__nonexistent_lib__",
                 "footprint_name": "R_0402",
-                "project_path": None,
+                "project_path": "/tmp/kicad-mcp-test.kicad_pro",
             },
         )
         assert "error" in result
@@ -808,7 +808,7 @@ class TestGetFootprintDetails:
             {
                 "library_name": "Resistor_SMD",
                 "footprint_name": "__nonexistent_footprint__",
-                "project_path": None,
+                "project_path": "/tmp/kicad-mcp-test.kicad_pro",
             },
         )
         assert "error" in result

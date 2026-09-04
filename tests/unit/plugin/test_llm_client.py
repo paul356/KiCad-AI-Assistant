@@ -2226,3 +2226,114 @@ class TestAnnotateStaleQueries:
         client._annotate_stale_queries()
         tc1_result = [m for m in client._history if m.get("tool_call_id") == "tc1"][0]
         assert not tc1_result["content"].startswith(_STALE_MARKER)
+
+
+class TestToolDirectRequest:
+    """Framework tool_direct requests route through run() but never reach the
+    LLM: executed directly, assistant+tool pair recorded in history, request
+    itself not stored."""
+
+    REQUEST = {
+        "kind": "tool_direct",
+        "name": "sync_footprint_index",
+        "arguments": {"project_path": "/p"},
+    }
+
+    def test_direct_executes_tool_and_records_pair(self):
+        client = _make_client()
+        calls = []
+        with patch(
+            "kicad_plugin.llm_client.call_mcp_tool", return_value={"status": "started"}
+        ) as mock_call:
+            result = client.run(
+                self.REQUEST,
+                "",
+                on_tool_call=lambda name, args, res: calls.append((name, args, res)),
+            )
+        assert result == {"status": "started"}
+        mock_call.assert_called_once()
+        # UI callback fired with the tool name / args / result
+        assert calls == [("sync_footprint_index", {"project_path": "/p"}, {"status": "started"})]
+        # History: synthetic user preamble + assistant/tool pair — no stale
+        # user residue for the request itself beyond the preamble.
+        assert len(client._history) == 3
+        assert client._history[0]["role"] == "user"
+        assistant, tool = client._history[1], client._history[2]
+        assert assistant["role"] == "assistant"
+        assert assistant["tool_calls"][0]["function"]["name"] == "sync_footprint_index"
+        assert assistant["tool_calls"][0]["function"]["arguments"] == '{"project_path": "/p"}'
+        assert tool["role"] == "tool"
+        assert tool["tool_call_id"] == assistant["tool_calls"][0]["id"]
+        assert tool["content"] == '{"status": "started"}'
+
+    def test_direct_appends_to_existing_user_history_without_preamble(self):
+        client = _make_client()
+        client._history.append({"role": "user", "content": "hi"})
+        with patch("kicad_plugin.llm_client.call_mcp_tool", return_value={"status": "started"}):
+            client.run(self.REQUEST, "")
+        roles = [m["role"] for m in client._history]
+        # No extra preamble: existing user message already opens the history
+        assert roles == ["user", "assistant", "tool"]
+
+    def test_direct_survives_validate_history(self):
+        client = _make_client()
+        with patch("kicad_plugin.llm_client.call_mcp_tool", return_value={"status": "started"}):
+            client.run(self.REQUEST, "")
+        client._validate_history()
+        assert len(client._history) == 3
+
+    def test_direct_persisted_via_get_history(self):
+        client = _make_client()
+        with patch("kicad_plugin.llm_client.call_mcp_tool", return_value={"status": "started"}):
+            client.run(self.REQUEST, "")
+        snapshot = client.get_history()
+        assert len(snapshot) == 3
+        assert snapshot[0]["role"] == "user"
+        assert snapshot[1]["role"] == "assistant"
+        assert snapshot[2]["role"] == "tool"
+
+    def test_direct_failure_records_error_pair_and_fires_callback(self):
+        client = _make_client()
+        calls = []
+
+        def _boom(base_url, tool_name, args):
+            raise RuntimeError("backend down")
+
+        with patch("kicad_plugin.llm_client.call_mcp_tool", side_effect=_boom):
+            result = client.run(
+                self.REQUEST,
+                "",
+                on_tool_call=lambda name, args, res: calls.append((name, args, res)),
+            )
+        # Exception captured as a failed result — no propagation
+        assert result["success"] is False
+        assert "backend down" in result["error"]
+        assert calls[0][2]["success"] is False
+        # History pair still complete so _validate_history does not strip it
+        assert len(client._history) == 3
+        client._validate_history()
+        assert len(client._history) == 3
+
+    def test_direct_anthropic_conversion_opens_with_user_and_alternates(self):
+        client = _make_client()
+        with patch("kicad_plugin.llm_client.call_mcp_tool", return_value={"status": "started"}):
+            client.run(self.REQUEST, "")
+            # next chat request appends a real user message after the pair
+            client._history.append({"role": "user", "content": "thanks"})
+        messages = client._build_anthropic_messages()
+        assert messages[0]["role"] == "user"
+        assert [m["role"] for m in messages].count("user") == 2
+        assert [m["role"] for m in messages].count("assistant") == 1
+        # tool result + following user text merged into one user message
+        last = messages[-1]
+        assert last["role"] == "user"
+        merged_text = "".join(b.get("text", "") for b in last["content"] if b.get("type") == "text")
+        assert "thanks" in merged_text
+
+    def test_direct_unknown_kind_still_treated_as_chat(self):
+        # A dict without kind == "tool_direct" is not a framework request;
+        # run() treats it as ordinary user text content rendering (dict str).
+        client = _make_client()
+        with patch("kicad_plugin.llm_client.call_mcp_tool", return_value={"status": "started"}):
+            reply = client.run({"not": "a request"}, "")
+        assert isinstance(reply, str)

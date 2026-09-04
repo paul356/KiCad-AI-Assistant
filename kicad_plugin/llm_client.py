@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 import platform
 import random
+import secrets
 import subprocess  # nosec B404 -- controlled subprocess execution, no user input
 import time
 from typing import Any
@@ -23,6 +24,14 @@ from typing import Any
 from .tool_registry import get_missing_tool_policies, get_tool_policy
 
 log = logging.getLogger(__name__)
+
+# Synthetic user message prepended to history when a framework tool_direct
+# turn (e.g. auto footprint sync) would otherwise open the conversation with
+# an assistant tool-call message — providers require the first message to
+# have role "user".
+FRAMEWORK_PREAMBLE = (
+    "(A framework-initiated tool call ran before this conversation: see the tool result below.)"
+)
 
 # ------------------------------------------------------------------
 # P1  stale-query detection: category mappings
@@ -949,6 +958,75 @@ class LLMClient:
         """Replace conversation history when restoring a saved session."""
         self._history = list(history)
 
+    def _run_tool_direct(
+        self,
+        request: dict[str, Any],
+        on_tool_call: Callable[[str, dict, Any], None] | None = None,
+    ) -> Any:
+        """Execute a framework tool_direct request (e.g. auto footprint sync).
+
+        The request itself is not a chat message: it is never sent to the
+        LLM and no user text is fabricated for it.  Only the tool call pair
+        — an assistant message declaring the call and the role="tool"
+        result — is appended to history, shaped exactly like ``run()``
+        output, so ``_validate_history`` accepts it, the next request
+        exposes it to the LLM, and the session's ``llm_history`` persists
+        it across reloads.
+
+        If history is empty, a synthetic user message is prepended first:
+        providers (Anthropic) require the first message to have role
+        "user".  With non-empty history the first message is already a
+        user message (every chat turn and every restored session opens
+        with one), so no preamble is needed.
+
+        An execution exception is captured and recorded as a failed result
+        instead of propagating: the history pair stays complete and the UI
+        callback still fires with the error.
+        """
+        tool_name = request.get("name") or ""
+        args = request.get("arguments") or {}
+        if not tool_name:
+            log.error("tool_direct: missing tool name")
+            return {"success": False, "error": "tool_direct request missing 'name'"}
+        call_id = f"fw-{tool_name}-{secrets.token_hex(4)}"
+
+        # Providers require the first message to have role "user".  This
+        # only ever fires for an empty history: a framework call is the
+        # first thing in a fresh session.  Once any chat turn or session
+        # restore exists, history already opens with a user message.
+        if not self._history:
+            self._history.insert(
+                0,
+                {
+                    "role": "user",
+                    "content": FRAMEWORK_PREAMBLE,
+                },
+            )
+
+        self._history.append(
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": call_id,
+                        "type": "function",
+                        "function": {"name": tool_name, "arguments": json.dumps(args)},
+                    }
+                ],
+            }
+        )
+        state = _ToolExecutionState()
+        try:
+            result = self._execute_tool_with_policy(tool_name, args, state, on_tool_call)
+        except Exception as exc:
+            log.error("Direct tool %s failed: %s", tool_name, exc, exc_info=True)
+            result = {"success": False, "error": str(exc)}
+            self._emit_tool_callback(on_tool_call, tool_name, args, result)
+        self._history.append(
+            {"role": "tool", "tool_call_id": call_id, "content": json.dumps(result)}
+        )
+        return result
+
     def _trim_history(self) -> None:
         """Drop oldest complete turns until history is within the cap.
 
@@ -1444,7 +1522,7 @@ class LLMClient:
                 removed_count,
             )
 
-    def _maybe_compact(self, system_prompt: str) -> None:
+    def _maybe_compact(self, system_prompt: str, on_compacted=None) -> None:
         """Manage history purely by token budget.
 
         Under budget, history is left byte-identical (append-only growth), so
@@ -1497,8 +1575,12 @@ class LLMClient:
             200, int((target_post_compact - system_tokens - recent_tokens) * 4)
         )
 
-        self._compact_history(system_prompt, target_summary_chars)
+        compacted = self._compact_history(system_prompt, target_summary_chars)
         self._validate_history()  # compaction rebuilds history; verify integrity
+        if compacted and on_compacted is not None:
+            on_compacted(
+                "⟲ History compacted — earlier context summarised; recent turns kept verbatim."
+            )
 
         # Annotate stale query results among the preserved turns only — the
         # compacted prefix is summarized, so nothing earlier needs marking.
@@ -1657,32 +1739,45 @@ class LLMClient:
 
     def run(
         self,
-        user_message: str,
+        user_message: str | dict[str, Any],
         context_block: str,
         on_tool_call: Callable[[str, dict, Any], None] | None = None,
         on_stream_event: Callable[[dict], None] | None = None,
+        on_compacted: Callable[[str], None] | None = None,
         images: list[dict[str, Any]] | None = None,
     ) -> str:
         """
         Run one engineer request through the agentic loop.
 
         Args:
-            user_message:  The engineer's chat message.
+            user_message:  The engineer's chat message, or a tool_direct
+                           request dict ({"kind": "tool_direct", "name": ...,
+                           "arguments": {...}}) for a framework-initiated
+                           tool call that skips the LLM entirely.
             context_block: Rendered KiCad context from context_bridge.
             on_tool_call:  Optional callback(tool_name, arguments, result) fired
                            after each tool execution — use this to update the UI.
             on_stream_event: Optional callback(evt) fired for each streaming
                            lifecycle event: text_start / text_chunk / text_end.
+            on_compacted:  Optional callback(notice) fired when history
+                           compaction summarised part of the conversation —
+                           the UI surfaces this as a chat notice.
             images:        Optional list of dicts {"media_type": "image/png",
                            "data": "<base64>"} attached to this user message.
 
         Returns:
             The final assistant text message for display.
         """
+        # Framework tool_direct request (e.g. auto footprint sync): route
+        # through run() so it shares the turn lifecycle, but never send it
+        # to the LLM — execute the call directly and record the tool pair.
+        if isinstance(user_message, dict) and user_message.get("kind") == "tool_direct":
+            return self._run_tool_direct(user_message, on_tool_call)
+
         system = build_system_prompt(context_block)
         content = self._build_user_content(user_message, images)
         self._history.append({"role": "user", "content": content})
-        self._maybe_compact(system)
+        self._maybe_compact(system, on_compacted)
 
         tools = self._fetch_tool_definitions()
         missing_policies = get_missing_tool_policies(
@@ -1896,7 +1991,11 @@ class LLMClient:
             m = self._history[i]
             role = m.get("role")
             if role == "tool":
-                # Batch all consecutive tool results into one user message
+                # Batch all consecutive tool results into one user message.
+                # A plain user text that follows directly (e.g. the next chat
+                # message after a tool_direct pair) is folded into the same
+                # user message as a text block: Anthropic requires strictly
+                # alternating user/assistant roles.
                 tool_results = []
                 while i < len(self._history) and self._history[i].get("role") == "tool":
                     t = self._history[i]
@@ -1907,6 +2006,11 @@ class LLMClient:
                             "content": t.get("content"),
                         }
                     )
+                    i += 1
+                if i < len(self._history) and self._history[i].get("role") == "user":
+                    content = self._history[i].get("content") or ""
+                    if isinstance(content, str) and content.strip():
+                        tool_results.append({"type": "text", "text": content})
                     i += 1
                 messages.append({"role": "user", "content": tool_results})
                 continue

@@ -157,6 +157,12 @@ TOOL_POLICIES: dict[str, ToolPolicy] = {
     "list_footprint_libraries": ToolPolicy(kind="query"),
     "search_footprints": ToolPolicy(kind="query"),
     "get_footprint_details": ToolPolicy(kind="query"),
+    # PCB → library export tools
+    "find_footprints_not_in_libraries": ToolPolicy(kind="query"),
+    "create_footprint_library": ToolPolicy(kind="file_mutation"),
+    # Writes .kicad_mod files into the target library; the PCB itself is
+    # never modified, so no PCB snapshot/dirty tracking is attached.
+    "add_footprints_to_library": ToolPolicy(kind="file_mutation"),
     # PCB query tools
     "get_board_info": ToolPolicy(kind="query"),
     "list_footprints": ToolPolicy(kind="query"),

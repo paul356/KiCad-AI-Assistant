@@ -4,11 +4,21 @@ Helpers for working with footprint S-expression nodes inside a PCB tree.
 Handles: locating footprints, reading/writing the `at` position, and
 reading/writing named `property` entries.  The layer-flip map used by
 flip_footprint also lives here.
+
+Also includes the PCB → library export helpers: iterating board-embedded
+footprint nodes, normalizing them into library-ready `.kicad_mod` nodes,
+and serializing/writing them without overwriting existing files.
 """
 
+from collections.abc import Iterator
+import copy
+import logging
+import os
 from typing import Any
 
 import sexpdata
+
+log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Layer flip map — F.* ↔ B.*
@@ -238,3 +248,392 @@ def _flip_layers_recursive(node: Any) -> None:
                         sub[j] = flipped
             else:
                 _flip_layers_recursive(sub)
+
+
+# ---------------------------------------------------------------------------
+# PCB → library export
+# ---------------------------------------------------------------------------
+
+# Node keys that are placement/identity data — never legal in a library file.
+_INSTANCE_ONLY_KEYS = {"at", "uuid", "tstamp", "tedit", "path"}
+# Properties that carry per-board-instance values.
+_INSTANCE_PROPERTIES = {"Reference", "Value"}
+
+
+def iter_footprint_nodes(data: list[Any]) -> Iterator[list[Any]]:
+    """Yield each top-level ``(footprint ...)`` node from a parsed PCB tree."""
+    for item in data:
+        if isinstance(item, list) and len(item) > 0 and _sym(item[0]) == "footprint":
+            yield item
+
+
+def get_pcb_version(data: list[Any]) -> int:
+    """Return the board-format version from the ``(version N)`` header."""
+    if len(data) > 1 and isinstance(data[1], list) and len(data[1]) > 1:
+        if _sym(data[1][0]) == "version":
+            try:
+                return int(data[1][1])
+            except (TypeError, ValueError):
+                pass
+    return 0
+
+
+def split_footprint_header(node: list[Any]) -> tuple[str | None, str]:
+    """Return ``(library_nickname, footprint_name)`` from a footprint node.
+
+    The header string is ``"Library:Name"`` when the footprint came from a
+    library, or just ``"Name"`` for footprints created on the board.
+    """
+    header = node[1] if len(node) > 1 and isinstance(node[1], str) else ""
+    if ":" in header:
+        lib, _, name = header.rpartition(":")
+        return (lib or None), name
+    return None, header
+
+
+def is_safe_footprint_name(name: str) -> bool:
+    """True when *name* is safe as a ``<name>.kicad_mod`` filename.
+
+    Blacklist approach: only the constructs that can escape or corrupt the
+    target path are rejected — empty names, ``.``/``..``, path separators
+    (``/`` and ``\\``), and NUL.  Everything else is allowed, including
+    spaces and non-ASCII, matching what KiCad accepts in footprint names
+    (e.g. ``M3 Hole``).  Boards from collaborators can be crafted; never
+    build a target path from an unvalidated header string.
+    """
+    if not name:
+        return False
+    if name in ("..", "."):
+        return False
+    if "/" in name or "\\" in name:
+        return False
+    if "\x00" in name:
+        return False
+    return True
+
+
+def _child_at_rotation(child: list[Any]) -> float | None:
+    """Return the explicit rotation of a child's ``at`` node, or None."""
+    for sub in child:
+        if isinstance(sub, list) and len(sub) >= 3 and _sym(sub[0]) == "at":
+            return float(sub[3]) if len(sub) > 3 else None
+    return None
+
+
+def _set_child_at_rotation(child: list[Any], rotation: float) -> None:
+    """Set (or append) the rotation component of a child's ``at`` node."""
+    rotation %= 360.0
+    for sub in child:
+        if isinstance(sub, list) and len(sub) >= 3 and _sym(sub[0]) == "at":
+            if len(sub) > 3:
+                sub[3] = rotation
+            elif rotation != 0.0:
+                sub.append(rotation)
+            return
+
+
+def _readjust_rotation(child: list[Any], fp_rotation: float) -> None:
+    """Re-express one child's rotation in the footprint's own frame.
+
+    Both pads and text store absolute board-space rotation (local +
+    fp_rotation); re-expressing in the footprint frame subtracts the
+    footprint's rotation.  For text this is the inverse of KiCad's Update
+    Footprints flow, which adds the footprint rotation back on placement, so
+    the exported angle survives an update unchanged.  Only children with an
+    explicit rotation component need adjustment; implied rotations rotate with
+    the footprint and are already relative.
+    """
+    if fp_rotation == 0.0:
+        return
+    stored = _child_at_rotation(child)
+    child_type = _sym(child[0]) if len(child) > 0 else ""
+    if child_type in _PAD_TYPES:
+        # A pad without an explicit angle reads back as axis-aligned in board
+        # space, i.e. an implied 0; re-express it in the footprint frame the
+        # same way an explicit angle would be.
+        _set_child_at_rotation(child, (stored if stored is not None else 0.0) - fp_rotation)
+    elif child_type in _TEXT_TYPES:
+        # A text without an explicit angle is axis-aligned (implied 0),
+        # handled exactly like a pad's missing angle.
+        _set_child_at_rotation(child, (stored if stored is not None else 0.0) - fp_rotation)
+
+
+def _mirror_child_y(child: list[Any]) -> None:
+    """Negate the Y coordinate of every position-bearing node in *child*.
+
+    Mirrors ``at``, ``start``, ``end``, ``mid``, ``center`` and ``pts`` (via
+    ``polygon``/``fill``) subnodes about the footprint's X axis — the geometry
+    half of a top-bottom flip, matching KiCad's library-frame mirroring.
+    """
+    for sub in child:
+        if not isinstance(sub, list) or len(sub) < 3:
+            continue
+        key = _sym(sub[0])
+        if key in ("at", "start", "end", "mid", "center") and len(sub) >= 3:
+            sub[2] = -float(sub[2]) + 0.0
+        elif key in ("pts", "polygon"):
+            _mirror_child_y(sub)
+        elif key == "fill" and any(
+            isinstance(s, list) and len(s) > 0 and _sym(s[0]) == "polygon" for s in sub
+        ):
+            _mirror_child_y(sub)
+        elif key == "xy":
+            sub[2] = -float(sub[2]) + 0.0
+
+
+def _swap_arc_start_end(child: list[Any]) -> None:
+    """Swap the coordinate values of an ``fp_arc`` node's ``start``/``end``.
+
+    KiCad's PCB_SHAPE::Flip mirrors an arc by negating all three points and
+    then swapping start/end; a plain Y-mirror reverses its direction.  Mirror
+    the geometry, then swap so the stored arc still sweeps the same way.
+    """
+    start_node = end_node = None
+    for sub in child:
+        if not (isinstance(sub, list) and len(sub) >= 3):
+            continue
+        key = _sym(sub[0])
+        if key == "start":
+            start_node = sub
+        elif key == "end":
+            end_node = sub
+    if start_node is not None and end_node is not None:
+        start_node[1], end_node[1] = end_node[1], start_node[1]
+        start_node[2], end_node[2] = end_node[2], start_node[2]
+
+
+def _clear_text_mirror(child: list[Any]) -> None:
+    """Remove the ``mirror`` entry from a text node's ``(effects … (justify …))``."""
+    for sub in child:
+        if not (isinstance(sub, list) and len(sub) > 0 and _sym(sub[0]) == "effects"):
+            continue
+        for eff in sub:
+            if not (isinstance(eff, list) and len(eff) > 0 and _sym(eff[0]) == "justify"):
+                continue
+            eff[:] = [
+                e
+                for e in eff
+                if not (e == "mirror" or (isinstance(e, sexpdata.Symbol) and str(e) == "mirror"))
+            ]
+
+
+def _ensure_unlocked(child: list[Any]) -> None:
+    """Add ``(unlocked yes)`` if the child (a text node) lacks one.
+
+    ``unlocked`` disables keep-upright in KiCad, so the upright angle chosen
+    by :func:`_flip_footprint_to_front` survives placement unchanged.
+    """
+    for sub in child:
+        if isinstance(sub, list) and len(sub) > 0 and _sym(sub[0]) == "unlocked":
+            return
+    child.append([sexpdata.Symbol("unlocked"), sexpdata.Symbol("yes")])
+
+
+def _flip_footprint_to_front(node: list[Any]) -> None:
+    """Transform a back-side (B.Cu) footprint node in place to the canonical
+    front-side library form: negate child Y (the geometry mirror), negate pad
+    angles, mirror text angles (180-angle), and flip
+    every layer F↔B.  This is the exact inverse of KiCad placing the footprint
+    on the back side, so re-placing the exported library part on B.Cu yields
+    the original component.
+    """
+    for i in list(range(len(node) - 1, 1, -1)):
+        child = node[i]
+        if not (isinstance(child, list) and len(child) > 0):
+            continue
+        key = _sym(child[0])
+        if key in _PAD_TYPES:
+            _mirror_child_y(child)
+            stored = _child_at_rotation(child)
+            # KiCad's PAD::Flip (TOP_BOTTOM) negates the pad orientation
+            # (SetFPRelativeOrientation(-GetFPRelativeOrientation())); a pad
+            # without an explicit angle reads as axis-aligned (0), so the
+            # negated 0 stays 0 and nothing is written.
+            _set_child_at_rotation(child, -(stored if stored is not None else 0.0))
+        elif key in _TEXT_TYPES:
+            _mirror_child_y(child)
+            stored = _child_at_rotation(child)
+            # KiCad's PCB_TEXT::Flip (TOP_BOTTOM) maps angle -> 180-angle;
+            # re-flipping on B.Cu placement restores the original.  A text
+            # without an explicit angle reads as 0, so it stores 180.
+            _set_child_at_rotation(child, 180.0 - (stored if stored is not None else 0.0))
+            _clear_text_mirror(child)
+            _ensure_unlocked(child)
+        elif key in ("fp_line", "fp_rect", "fp_circle", "fp_arc"):
+            _mirror_child_y(child)
+            if key == "fp_arc":
+                _swap_arc_start_end(child)
+        elif key == "fp_poly":
+            _mirror_child_y(child)
+        elif key == "zone":
+            # Zone outlines are stored in absolute board coordinates (the
+            # polygon here spans the footprint's placement origin, not a
+            # local frame), so they must not be mirrored or shifted when
+            # flipping the footprint.  The layer token is still flipped
+            # below so B.Cu -> F.Cu.
+            pass
+    _flip_layers_recursive(node)
+
+
+def _has_fp_text_of_type(node: list[Any], text_type: str) -> bool:
+    """True when *node* already contains an ``fp_text`` of *text_type*."""
+    for sub in node:
+        if (
+            isinstance(sub, list)
+            and len(sub) > 1
+            and _sym(sub[0]) == "fp_text"
+            and _sym(sub[1]) == text_type
+        ):
+            return True
+    return False
+
+
+def _property_to_fp_text(child: list[Any], prop_name: str, new_value: str) -> list[Any]:
+    """Convert a board ``property`` node to library ``fp_text`` form.
+
+    Board footprints carry the reference/value text as properties (with
+    ``(at …)``/``(layer …)``/``(effects …)``).  Library footprints use
+    ``fp_text`` instead.  The node's position, layer, and effects are kept so
+    the exported reference/value sits where the board displayed it; only the
+    header name/value change.
+    """
+    # The type token must serialize as a bare Symbol (``fp_text reference``),
+    # not a quoted string; a quoted type fails to parse in KiCad.
+    text_type = "reference" if prop_name == "Reference" else "value"
+    fp_text_node = [sexpdata.Symbol("fp_text"), sexpdata.Symbol(text_type), new_value]
+    for sub in child[3:]:
+        if isinstance(sub, list) and len(sub) > 0:
+            fp_text_node.append(sub)
+    return fp_text_node
+
+
+def normalize_footprint_for_library(
+    fp_node: list[Any],
+    pcb_version: int,
+    new_library: str,
+) -> list[Any]:
+    """Return a library-ready copy of a board footprint node.
+
+    :param fp_node: Parsed ``(footprint ...)`` node from the board.
+    :param pcb_version: Board file format version (becomes the library
+        footprint's ``version``).
+    :param new_library: Nickname of the target library; used for the
+        ``Footprint`` property.
+    :returns: A deep copy suitable for writing as ``.kicad_mod``.
+    """
+    node = copy.deepcopy(fp_node)
+
+    _, name = split_footprint_header(node)
+    # Back-side footprint: exported as front-side form after mirroring, matching
+    # the all-front convention of KiCad library footprints.
+    flip_from_back = get_fp_layer(node) == "B.Cu"
+    # Header: bare footprint name (no "Library:" prefix).
+    node[1] = name
+
+    # Capture placement rotation, then drop instance-only nodes.
+    fp_rotation = 0.0
+    child_at_nodes: list[list[Any]] = []
+    for i in list(range(len(node) - 1, 1, -1)):
+        child = node[i]
+        if not (isinstance(child, list) and len(child) > 0):
+            continue
+        key = _sym(child[0])
+        if key == "at" and len(child) >= 3:
+            try:
+                fp_rotation = float(child[3]) if len(child) > 3 else 0.0
+            except (TypeError, ValueError):
+                fp_rotation = 0.0
+            del node[i]
+        elif key in _INSTANCE_ONLY_KEYS:
+            del node[i]
+        elif key == "property":
+            prop_name = child[1] if len(child) > 1 and isinstance(child[1], str) else ""
+            if prop_name in _INSTANCE_PROPERTIES:
+                text_type = "reference" if prop_name == "Reference" else "value"
+                if _has_fp_text_of_type(node, text_type):
+                    # The board already carries the text as fp_text (older
+                    # format); drop the duplicate property copy.
+                    del node[i]
+                else:
+                    # Convert to the library's fp_text form, keeping the board
+                    # position/effects; value is normalized to REF** / name below.
+                    text_value = "REF**" if prop_name == "Reference" else name
+                    node[i] = _property_to_fp_text(child, prop_name, text_value)
+                    child_at_nodes.append(node[i])
+            elif prop_name == "Footprint":
+                # Re-point at the new library (KiCad "Save Copy As" behavior).
+                child[2] = f"{new_library}:{name}"
+        elif key in ("pad", "fp_text", "property"):
+            child_at_nodes.append(child)
+
+    # Re-express child rotations in the footprint's own frame: the board
+    # stores text/pad angles in board space (they follow the footprint's
+    # rotation), so subtract fp_rotation.  Child at x/y are already
+    # footprint-local in the file format and are left untouched.
+    for child in child_at_nodes:
+        _readjust_rotation(child, fp_rotation)
+        if _sym(child[0]) == "pad":
+            # Strip net connections (per-instance routing data).
+            for j in list(range(len(child) - 1, -1, -1)):
+                sub = child[j]
+                if isinstance(sub, list) and len(sub) > 0 and _sym(sub[0]) == "net":
+                    del child[j]
+        elif _sym(child[0]) == "fp_text":
+            text_type = _sym(child[1]) if len(child) > 1 else ""
+            if text_type in ("reference", "value"):
+                # Keep the board's text effects, justify, and un-rotated
+                # angle as-is: KiCad's Update Footprints copies the library
+                # text attributes onto the board, so the library must carry
+                # exactly what the board displayed to avoid a reset.
+                if text_type == "reference" and len(child) > 2:
+                    child[2] = "REF**"
+                elif text_type == "value" and len(child) > 2:
+                    child[2] = name
+
+    # Restore a back-side footprint to the front-side library form: mirror
+    # geometry, negate pad angles, set text upright, flip layers F↔B.
+    if flip_from_back:
+        _flip_footprint_to_front(node)
+
+    # Insert the format version right after the header name.
+    node.insert(2, [sexpdata.Symbol("version"), pcb_version])
+    return node
+
+
+def serialize_footprint_mod(node: list[Any]) -> str:
+    """Serialize a footprint node as ``.kicad_mod`` text.
+
+    KiCad layout: ``(footprint "Name"`` and the closing ``)`` on their own
+    lines, each child element on one tab-indented line — matching the format
+    KiCad itself writes for ``.kicad_mod`` files.
+    """
+    name = node[1] if len(node) > 1 else ""
+    lines = [f"(footprint {sexpdata.dumps(name)}"]
+    for child in node[2:]:
+        lines.append("\t" + sexpdata.dumps(child))
+    lines.append(")")
+    return "\n".join(lines) + "\n"
+
+
+def write_footprint_mod(library_dir: str, name: str, node: list[Any]) -> str:
+    """Write *node* to ``<library_dir>/<name>.kicad_mod`` (no overwrite).
+
+    :returns: Path written.
+    :raises FileExistsError: When the file already exists (never overwrite
+        an existing footprint, per design decision).
+    :raises ValueError: When *name* is unsafe for a filename (path traversal
+        guard — see :func:`is_safe_footprint_name`).
+    """
+    if not is_safe_footprint_name(name):
+        raise ValueError(f"Unsafe footprint name: {name!r}")
+    os.makedirs(library_dir, exist_ok=True)
+    path = os.path.join(library_dir, f"{name}.kicad_mod")
+    if os.path.exists(path):
+        raise FileExistsError(f"Footprint already exists: {path}")
+    text = serialize_footprint_mod(node)
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    os.replace(tmp_path, path)
+    log.info("Exported footprint %s -> %s", name, path)
+    return path
