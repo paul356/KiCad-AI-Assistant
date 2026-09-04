@@ -309,43 +309,39 @@ tool-collapse issue above).
 
 ---
 
-## Inject project structure at the end of the prompt
+## Project layout accessible without touching the system prompt
 
-**Status:** open (proposed)
+**Status:** resolved (2026-09-04) — implemented as a query tool, not a
+prompt change.
 
-### Current state
+### Decision
 
-- `build_system_prompt` (`kicad_plugin/llm_client.py`) is
-  `header + schematic + PCB + context_block`; `context_block` comes from
-  `context_bridge.collect_context()` and carries only the active
-  file paths and a few facts — not the project's file layout.
-- The prompt is token-budgeted: `tests/integration/test_skill_system.py`
-  caps it at ≤950 tokens (relaxed from 800), and
-  `docs/skill-system-design.md` already plans a `PromptBuilder` with a
-  layered, trimmed prompt.
+The original plan (append a project tree to the end of `build_system_prompt`)
+was rejected: the system prompt must stay stable and token-budgeted.  The
+project layout is instead exposed through the MCP query tool
+``get_project_structure`` (``kcaa/tools/project_tools.py``), which the LLM
+calls on demand when it needs to plan sheet edits, cross-file operations,
+or exports.
 
-### Aim
+### Implementation
 
-Append a compact project overview at the **end** of the system prompt
-(after the context block): the project tree — root `.kicad_pro`, all
-`.kicad_sch` sheet files with their hierarchy, the `.kicad_pcb`,
-`3rdparty/` libraries — so the LLM can plan sheet edits, cross-file
-operations, and exports without guessing file layout.
-
-### Fix (proposed)
-
-1. New renderer (in `context_bridge.py` or `skill_system`): walk the
-   active project dir, emit a tree of design files + sym-lib-table /
-   fp-lib-table / 3rdparty entries; follow sheet references so the
-   hierarchy appears once.
-2. Append it last in `build_system_prompt` **after** `context_block`.
-   Guard the budget: emit only file names + one-line role per file, skip
-   content, and stay within the ≤950-token test; extend the caps if the
-   reviewed size justifies it.
+- ``get_project_structure`` now returns (in addition to the flat ``files``
+  set and metadata):
+  * ``sheets`` — the root ``.kicad_sch`` plus every hierarchical sub-sheet
+    reachable through ``(sheet ...)`` ``Sheetfile`` references, as a nested
+    ``{"path", "children"}`` tree (absolute paths, cycle-free via real-path
+    tracking, depth-bounded).
+  * ``third_party`` — symbol (``.kicad_sym``) and footprint
+    (``.kicad_mod``) libraries under the project's ``3rdparty/`` directory.
+  * ``lib_tables`` — project-local ``sym-lib-table`` / ``fp-lib-table``
+    paths, or None when absent.
+- Registered in ``kicad_plugin/tool_registry.py`` as a query policy with
+  ``path_arg="project_path"``.
 
 ### Validation
 
-- Unit: `tests/unit/plugin/test_context_bridge.py` — rendered tree
-  contains project root, each sheet, PCB path, 3rdparty dir.
-- Integration: `test_system_prompt_under_800_tokens` still passes with a
-  real multi-sheet project tree injected.
+- Unit: `tests/unit/tools/test_project_tools.py` — sheet hierarchy follow
+  Sheetfile refs, cycles are cut, 3rdparty kinds are reported, absent
+  tables are None.
+- System prompt tests (`tests/integration/test_skill_system.py`) are
+  untouched and still pass.
