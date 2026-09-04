@@ -247,21 +247,47 @@ class TestNormalizeForLibrary:
                         # pad stored 90° absolute -> local 90 - 45 = 45
                         assert sub[3] == pytest.approx(45.0)
 
-    def test_text_upright_and_position_kept(self):
-        """Reference/value text exports as fp_text at its board position,
-        uniformly upright (90°) regardless of the footprint's placement
-        rotation."""
-        node = self._node()[0]
+    def test_text_rotation_and_justify_kept(self):
+        """Reference/value fp_text keep the board's angle (un-rotated from
+        board space: 90° - fp_rotation 45° = 45°) and its effects/justify:
+        KiCad's Update Footprints copies library text attributes onto the
+        board, so the library must carry exactly what the board displayed."""
+        import sexpdata as _sx
+
+        node = _sx.loads(
+            '(kicad_pcb (footprint "CustomLib:Sensor_Board_XYZ"'
+            '  (layer "F.Cu")'
+            "  (at 10.0 20.0 45.0)"
+            '  (fp_text reference "U1" (at 0 2.0 90.0) (layer "F.SilkS")'
+            "    (effects (font (size 1.524 1.524) (thickness 0.254)) (justify left bottom)))"
+            '  (fp_text value "Sensor" (at 0 -2.0 90.0) (layer "F.Fab")'
+            "    (effects (font (size 1.3 1.3) (thickness 0.2)) (justify left bottom)))"
+            ")"
+            ")"
+        )
+        node = next(n for n in node if isinstance(n, list) and n and str(n[0]) == "footprint")
         out = normalize_footprint_for_library(node, 20260206, "MyLib")
         texts = {str(c[1]): c for c in out if isinstance(c, list) and c and str(c[0]) == "fp_text"}
         assert "reference" in texts
         assert "value" in texts
         for text_type, c in texts.items():
             at = next(s for s in c if isinstance(s, list) and s and str(s[0]) == "at")
-            # uniform angle 0°, not board-space compensated
-            assert at[3] == pytest.approx(0.0)
-            # anchor centered by omitting justify (library convention)
-            assert "justify" not in str(c)
+            # board-space 90° re-expressed in footprint frame: 90 - 45 = 45
+            assert at[3] == pytest.approx(45.0)
+            # effects and justify carried over from the board, not dropped
+            effects = next(s for s in c if isinstance(s, list) and s and str(s[0]) == "effects")
+            assert [
+                e
+                for e in effects
+                if isinstance(e, list)
+                and e
+                and str(e[0]) == "justify"
+                and any(str(t) == "left" for t in e)
+                and any(str(t) == "bottom" for t in e)
+            ]
+            font = next(e for e in effects if isinstance(e, list) and e and str(e[0]) == "font")
+            size = next(s for s in font if isinstance(s, list) and s and str(s[0]) == "size")
+            assert float(size[1]) == pytest.approx(1.524) or float(size[1]) == pytest.approx(1.3)
             if text_type == "reference":
                 assert c[2] == "REF**"
             else:
@@ -334,8 +360,10 @@ class TestNormalizeBackSideFlip:
             '	(footprint "CustomLib:BACKFP"'
             '		(layer "B.Cu")'
             "		(at 12.0 34.0 180.0)"
-            '		(property "Reference" "R7" (at 0 1.5 270) (layer "B.SilkS"))'
-            '		(property "Value" "10k" (at 0 -1.5 270) (layer "B.SilkS"))'
+            '		(property "Reference" "R7" (at 0 1.5 270) (layer "B.SilkS")'
+            "			(effects (font (size 1.524 1.524) (thickness 0.254)) (justify left bottom)))"
+            '		(property "Value" "10k" (at 0 -1.5 270) (layer "B.SilkS")'
+            "			(effects (font (size 1.524 1.524) (thickness 0.254)) (justify left bottom)))"
             '		(property "Datasheet" "" (at 0 0 270) (layer "B.Fab") (hide yes))'
             '		(pad "1" smd rect'
             "			(at -1.0 2.0 90.0)"
@@ -389,11 +417,12 @@ class TestNormalizeBackSideFlip:
         assert at1[3] == pytest.approx(90.0)
         assert at2[3] == pytest.approx(90.0)
 
-    def test_text_upright_position_kept_unlocked(self):
+    def test_text_rotation_justify_mirror_kept_unlocked(self):
         """Reference/Value properties convert to fp_text, keep their board
-        position (Y mirrored for the back side), angle 0°, unlock
-        keep-upright, and flip layers; the board layer may come from source
-        (B.SilkS -> F.SilkS)."""
+        position (Y mirrored for the back side), angle re-expressed
+        (270 - fp_rot 180 = 90, then TOP_BOTTOM flip 180 - 90 = 90) with
+        effects/justify preserved, unlock keep-upright, and flip layers;
+        the board layer may come from source (B.SilkS -> F.SilkS)."""
         out = normalize_footprint_for_library(self._node(), 20260830, "MyLib")
         texts = {str(c[1]): c for c in out if isinstance(c, list) and c and str(c[0]) == "fp_text"}
         assert "reference" in texts
@@ -401,14 +430,22 @@ class TestNormalizeBackSideFlip:
         ref = texts["reference"]
         at = next(s for s in ref if isinstance(s, list) and s and str(s[0]) == "at")
         # board-space (0, 1.5) un-rotated by fp rot 180° -> (0, -1.5), then
-        # back-side Y mirror -> (0, 1.5); uniform angle 0°
+        # back-side Y mirror -> (0, 1.5); angle: 270 - 180 = 90, flip -> 90
         assert at[1] == pytest.approx(0.0)
         assert at[2] == pytest.approx(1.5)
-        assert at[3] == pytest.approx(0.0)
+        assert at[3] == pytest.approx(90.0)
         assert ref[2] == "REF**"
-        # library convention: no justify — the anchor centers by omission
-        # (the board's "left bottom" would pin it to the lower-left corner)
-        assert "justify" not in str(ref)
+        # effects/justify carried over from the board, not dropped
+        effects = next(s for s in ref if isinstance(s, list) and s and str(s[0]) == "effects")
+        assert [
+            e
+            for e in effects
+            if isinstance(e, list)
+            and e
+            and str(e[0]) == "justify"
+            and any(str(t) == "left" for t in e)
+            and any(str(t) == "bottom" for t in e)
+        ]
         # keep-upright unlocked
         subs = [s for s in ref if isinstance(s, list) and s and str(s[0]) == "unlocked"]
         assert subs, "unlocked missing"

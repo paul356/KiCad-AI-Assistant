@@ -336,11 +336,13 @@ def _set_child_at_rotation(child: list[Any], rotation: float) -> None:
 def _readjust_rotation(child: list[Any], fp_rotation: float) -> None:
     """Re-express one child's rotation in the footprint's own frame.
 
-    Pads carry absolute board-space rotation (local + fp_rotation); text nodes
-    carry the angle that keeps their label readable in board space (so their
-    stored value tracks ``-fp_rotation``).  Only children with an explicit
-    rotation component need adjustment; implied rotations rotate with the
-    footprint and are already relative.
+    Both pads and text store absolute board-space rotation (local +
+    fp_rotation); re-expressing in the footprint frame subtracts the
+    footprint's rotation.  For text this is the inverse of KiCad's Update
+    Footprints flow, which adds the footprint rotation back on placement, so
+    the exported angle survives an update unchanged.  Only children with an
+    explicit rotation component need adjustment; implied rotations rotate with
+    the footprint and are already relative.
     """
     if fp_rotation == 0.0:
         return
@@ -354,7 +356,7 @@ def _readjust_rotation(child: list[Any], fp_rotation: float) -> None:
     elif child_type in _TEXT_TYPES:
         if stored is None:
             return
-        _set_child_at_rotation(child, stored + fp_rotation)
+        _set_child_at_rotation(child, stored - fp_rotation)
 
 
 def _mirror_child_y(child: list[Any]) -> None:
@@ -431,7 +433,7 @@ def _ensure_unlocked(child: list[Any]) -> None:
 def _flip_footprint_to_front(node: list[Any]) -> None:
     """Transform a back-side (B.Cu) footprint node in place to the canonical
     front-side library form: negate child Y (the geometry mirror), negate pad
-    angles, set text angles to 0°, and flip
+    angles, mirror text angles (180-angle), and flip
     every layer F↔B.  This is the exact inverse of KiCad placing the footprint
     on the back side, so re-placing the exported library part on B.Cu yields
     the original component.
@@ -448,7 +450,11 @@ def _flip_footprint_to_front(node: list[Any]) -> None:
                 _set_child_at_rotation(child, -stored)
         elif key in _TEXT_TYPES:
             _mirror_child_y(child)
-            _set_child_at_rotation(child, 0.0)
+            stored = _child_at_rotation(child)
+            if stored is not None:
+                # KiCad's PCB_TEXT::Flip (TOP_BOTTOM) maps angle -> 180-angle;
+                # re-flipping on B.Cu placement restores the original.
+                _set_child_at_rotation(child, 180.0 - stored)
             _clear_text_mirror(child)
             _ensure_unlocked(child)
         elif key in ("fp_line", "fp_rect", "fp_circle", "fp_arc"):
@@ -497,23 +503,6 @@ def _property_to_fp_text(child: list[Any], prop_name: str, new_value: str) -> li
         if isinstance(sub, list) and len(sub) > 0:
             fp_text_node.append(sub)
     return fp_text_node
-
-
-def _drop_justify(child: list[Any]) -> None:
-    """Remove any ``(justify ...)`` entry from a text node's effects.
-
-    KiCad's library format centers text anchors by *omitting* justify: the
-    ``center`` token is not legal in ``(justify ...)`` (pcb_parser rejects
-    it) and the writer drops the clause entirely for centered text.  Keeping
-    the board's ``left bottom`` would pin the anchor to the text's
-    lower-left corner instead of its center.
-    """
-    for sub in child:
-        if not (isinstance(sub, list) and len(sub) > 0 and _sym(sub[0]) == "effects"):
-            continue
-        sub[:] = [
-            e for e in sub if not (isinstance(e, list) and len(e) > 0 and _sym(e[0]) == "justify")
-        ]
 
 
 def _rotate_child_at_about_origin(child: list[Any], angle_deg: float) -> None:
@@ -612,12 +601,10 @@ def normalize_footprint_for_library(
         elif _sym(child[0]) == "fp_text":
             text_type = _sym(child[1]) if len(child) > 1 else ""
             if text_type in ("reference", "value"):
-                # Text faces up (0°) uniformly, regardless of board rotation.
-                _set_child_at_rotation(child, 0.0)
-                # Library convention: center the anchor by omitting justify
-                # (the board's "left bottom" would pin it to the text's
-                # lower-left corner; "center" is not a legal token).
-                _drop_justify(child)
+                # Keep the board's text effects, justify, and un-rotated
+                # angle as-is: KiCad's Update Footprints copies the library
+                # text attributes onto the board, so the library must carry
+                # exactly what the board displayed to avoid a reset.
                 if text_type == "reference" and len(child) > 2:
                     child[2] = "REF**"
                 elif text_type == "value" and len(child) > 2:
