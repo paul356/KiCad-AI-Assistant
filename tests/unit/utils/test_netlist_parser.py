@@ -311,7 +311,7 @@ class TestExtractNetlistIntegrityCheck:
         # produced: file ends mid-expression with trailing close brackets missing.
         bad.write_bytes(b'(kicad_sch (version 20240101) (paper "A4"')
 
-        with pytest.raises(SchematicCorruptionError, match="unbalanced"):
+        with pytest.raises(SchematicCorruptionError, match="unclosed parens"):
             extract_netlist(str(bad))
 
     def test_missing_file_raises_filenotfound(self, tmp_path):
