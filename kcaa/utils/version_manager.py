@@ -116,12 +116,26 @@ def restore_version(file_path: str, version_id: str) -> dict[str, Any]:
     restore is undoable via another call to this function or via the
     snapshot just created).
 
+    The snapshot is validated structurally before it overwrites the
+    live file: an empty, truncated, or otherwise malformed snapshot
+    raises :class:`kcaa.utils.schematic_sexp_utils.SchematicCorruptionError`
+    and leaves the live file untouched.  This guards against restoring
+    a snapshot that was taken from a corrupt source — historically the
+    destination would silently inherit the corruption because
+    :func:`shutil.copy2` does no integrity check.
+
+    The restore itself is atomic: the snapshot bytes are written to a
+    ``.tmp`` sibling, validated again, and only then ``os.replace``d
+    over the live file.  If anything between the snapshot read and the
+    final replace fails, the original is left intact.
+
     :param file_path: Absolute path to the file to restore.
     :param version_id: The ``id`` value returned by :func:`list_versions`.
     :returns: Dict with keys ``restored_from`` (version_id) and
               ``backup_of_current`` (path of the snapshot taken before restore).
     :raises FileNotFoundError: If *file_path* or the requested snapshot does not exist.
-    :raises OSError: If the copy fails.
+    :raises kcaa.utils.schematic_sexp_utils.SchematicCorruptionError: If the snapshot is malformed.
+    :raises OSError: If the copy or rename fails.
     """
     file_path = os.path.abspath(file_path)
     if not os.path.isfile(file_path):
@@ -136,8 +150,31 @@ def restore_version(file_path: str, version_id: str) -> dict[str, Any]:
             f"Use list_versions() to see available versions."
         )
 
-    # Snapshot current state first so the restore is undoable
+    # Snapshot current state first so the restore is undoable.
     backup_path = save_version_snapshot(file_path)
 
-    shutil.copy2(snapshot_path, file_path)
+    # Read + validate the snapshot bytes BEFORE writing anything.
+    # _schematic_extensions holds the KiCad file extensions we validate
+    # structurally; everything else (text files, etc.) falls through
+    # to a plain copy.
+    from kcaa.utils.schematic_sexp_utils import validate_schematic_bytes
+
+    if file_path.endswith(".kicad_sch"):
+        with open(snapshot_path, "rb") as fh:
+            snapshot_bytes = fh.read()
+        validate_schematic_bytes(snapshot_bytes, source=snapshot_path)
+
+        # Atomic write: .tmp + os.replace so a mid-write failure can't
+        # leave the live file half-overwritten.
+        tmp_path = file_path + ".tmp"
+        with open(tmp_path, "wb") as fh:
+            fh.write(snapshot_bytes)
+        # Re-validate the .tmp (defense-in-depth — bit-rot in the tmp fs).
+        with open(tmp_path, "rb") as fh:
+            tmp_bytes = fh.read()
+        validate_schematic_bytes(tmp_bytes, source=tmp_path)
+        os.replace(tmp_path, file_path)
+    else:
+        shutil.copy2(snapshot_path, file_path)
+
     return {"restored_from": version_id, "backup_of_current": backup_path}

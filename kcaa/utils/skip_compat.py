@@ -92,8 +92,29 @@ def safe_schematic(path: str):
 
     Replacement for ``skip.Schematic(path)`` that forces UTF-8 decoding
     on platforms where the default locale is not UTF-8.
+
+    .. warning::
+       The UTF-8 context only covers the **read** path.  ``skip``'s
+       internal ``writeTree`` calls ``open(fpath, 'w')`` with **no
+       encoding argument**, so any code that calls ``sch.write(...)``
+       outside this function will hit the system default encoding —
+       which is ``cp1252``/``gbk`` on a non-UTF-8 Windows install and
+       can silently truncate trailing bytes.  Callers that write the
+       schematic back out must wrap the write in :func:`utf8_open_context`
+       themselves (or use :func:`kcaa.utils.schematic_sexp_utils.save_schematic`,
+       which does this for them).
     """
     import skip
 
     with _utf8_open_context():
         return skip.Schematic(path)
+
+
+def utf8_open_context():
+    """Public alias for :func:`_utf8_open_context`.
+
+    Use this to wrap any I/O that must read/write UTF-8 regardless of
+    the system locale — e.g. ``sch.write(tmp_path)`` in save helpers,
+    or any direct ``open()`` call on a KiCad file outside of skip.
+    """
+    return _utf8_open_context()

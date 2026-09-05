@@ -24,9 +24,16 @@ description: "Wire routing strategy, pin selection rules, junction handling"
 - For pins on the same net (e.g. all GND, all VCC), wire each new pin
   to the *closest already-wired pin on that net* rather than always
   going back to the same anchor — this keeps the net visually local.
-- Prefer connect_pins_with_wire over manual coordinate routing whenever
-  both endpoints are pins; it handles rotation and junction insertion for
-  you.  When endpoints are bare coordinates, use connect_points_with_wire.
+- Three wiring tools are available — pick by intent, not by preference:
+  - ``connect_pins_with_wire``: pin-to-pin, automatic routing. Picks the
+    best L/Z/W/snake/U path around obstacles. **Default for pin-to-pin.**
+  - ``connect_points_with_wire``: bare-coordinate endpoints, automatic
+    routing. **Default for coordinate-to-coordinate.**
+  - ``draw_wire_segments``: caller-specified segments written verbatim —
+    no routing, no merging, no obstacle avoidance. Use when you need an
+    exact shape (deliberate Z-route, junction-only T-tap, multi-segment
+    path) and accept responsibility for clearance. ``fail_on_overlap``
+    rejects batches that would cross existing wires.
   Always report failures to the user.
 - If the electrically-correct pin pair would produce a long or cluttered
   wire, consider **rotating or moving one of the components** instead of
