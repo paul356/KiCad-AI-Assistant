@@ -253,15 +253,12 @@ def _segments_intersect(
         return True
     ax, ay, bx, by = seg
     cx, cy, dx, dy = line
-    # One horizontal, one vertical, crossing strictly interior to both.
     if abs(ay - by) < 1e-9 and abs(ax - bx) > 1e-9 and abs(cx - dx) < 1e-9 and abs(cy - dy) > 1e-9:
-        # Horizontal seg + vertical line. Crossing at (line.x, seg.y).
         vx, hy = cx, ay
         return _point_in_interior(vx, hy, ax, ay, bx, by, tol) and _point_in_interior(
             vx, hy, cx, cy, cx, dy, tol
         )
     if abs(ax - bx) < 1e-9 and abs(ay - by) > 1e-9 and abs(cy - dy) < 1e-9 and abs(cx - dx) > 1e-9:
-        # Vertical seg + horizontal line. Crossing at (seg.x, line.y).
         vx, hy = ax, cy
         return _point_in_interior(vx, hy, cx, cy, dx, dy, tol) and _point_in_interior(
             vx, hy, ax, ay, ax, by, tol

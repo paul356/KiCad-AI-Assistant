@@ -284,3 +284,56 @@ class TestNetlistPinDirection:
             f"No pin in the fixture should have direction 'right' (all components at rotation=0 "
             f"with up/down pin directions), but got directions {directions!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Pre-flight integrity check in extract_netlist
+# ---------------------------------------------------------------------------
+
+
+class TestExtractNetlistIntegrityCheck:
+    """``extract_netlist`` must surface file corruption loudly, not silently.
+
+    Historically ``skip``'s parser accepted truncated files by ignoring
+    trailing content, which let downstream tools "succeed" against a
+    half-corrupt schematic. The pre-flight check in
+    :func:`kcaa.utils.netlist_parser.extract_netlist` now raises
+    :class:`SchematicCorruptionError` before handing the file to skip,
+    so the LLM sees a clear error instead of bogus analysis.
+    """
+
+    def test_truncated_file_raises_corruption_error(self, tmp_path):
+        from kcaa.utils.netlist_parser import extract_netlist
+        from kcaa.utils.schematic_sexp_utils import SchematicCorruptionError
+
+        bad = tmp_path / "truncated.kicad_sch"
+        # Same truncation shape that delete_wire_from_schematic historically
+        # produced: file ends mid-expression with trailing close brackets missing.
+        bad.write_bytes(b'(kicad_sch (version 20240101) (paper "A4"')
+
+        with pytest.raises(SchematicCorruptionError, match="unbalanced"):
+            extract_netlist(str(bad))
+
+    def test_missing_file_raises_filenotfound(self, tmp_path):
+        from kcaa.utils.netlist_parser import extract_netlist
+
+        missing = tmp_path / "does_not_exist.kicad_sch"
+        with pytest.raises(FileNotFoundError):
+            extract_netlist(str(missing))
+
+    def test_empty_file_raises_corruption_error(self, tmp_path):
+        from kcaa.utils.netlist_parser import extract_netlist
+        from kcaa.utils.schematic_sexp_utils import SchematicCorruptionError
+
+        empty = tmp_path / "empty.kicad_sch"
+        empty.write_bytes(b"")
+
+        with pytest.raises(SchematicCorruptionError, match="empty"):
+            extract_netlist(str(empty))
+
+    def test_valid_file_succeeds(self):
+        from kcaa.utils.netlist_parser import extract_netlist
+
+        result = extract_netlist(FIXTURE)
+        assert "error" not in result
+        assert result["component_count"] > 0

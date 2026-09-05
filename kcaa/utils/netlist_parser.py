@@ -9,6 +9,7 @@ import os
 import re
 from typing import Any
 
+from kcaa.utils.schematic_sexp_utils import check_schematic_integrity
 from kcaa.utils.skip_compat import safe_schematic
 from kcaa.utils.skip_helpers import sym_pin_world_coords
 from kcaa.utils.symbol_geometry import (
@@ -892,7 +893,20 @@ def extract_netlist(schematic_path: str) -> dict[str, Any]:
 
     Returns:
         Dictionary with netlist information
+
+    Raises:
+        kcaa.utils.schematic_sexp_utils.SchematicCorruptionError: If the
+            file is empty, has unbalanced brackets, or fails to parse as
+            an S-expression.  This check runs before ``skip`` opens the
+            file because skip's parser is lenient about trailing
+            truncation, which used to let downstream tools silently
+            succeed against a half-corrupt schematic.
+        FileNotFoundError: If *schematic_path* does not exist.
     """
+    # Pre-flight integrity check — surfaces corruption loudly instead of
+    # letting skip swallow trailing truncation.
+    check_schematic_integrity(schematic_path)
+
     try:
         parser = SchematicParser(schematic_path)
         return parser.parse()
