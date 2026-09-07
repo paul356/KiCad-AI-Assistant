@@ -261,7 +261,7 @@ collapsed the older row (or no-opped when that row was already closed).
 Real session files showed up to 147 duplicate ids and 23 seq-restart
 generations in a single conversation. WebView is the only path with
 folding; the `wx.html.HtmlWindow` fallback (`_tool_html_plain`) has never
-had it.
+had it (separate, still-open improvement).
 
 #### Fix
 
