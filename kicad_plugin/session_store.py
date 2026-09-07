@@ -168,6 +168,28 @@ def make_payload(
     }
 
 
+def max_tool_seq(conv_entries: list[dict], current: int = 0) -> int:
+    """Highest tool-call ``_seq`` present in *conv_entries*, at least *current*.
+
+    Session files persist each ``tool_call`` entry's ``_seq`` (see
+    ``make_payload``).  When a saved session is loaded into a fresh panel the
+    panel's counter starts at 0, so continuing to number new calls from 1
+    would duplicate the ``details`` ids of restored rows and break the
+    WebView collapse interaction.  Restore paths call this to continue
+    numbering above every id already in the DOM.
+
+    Never returns less than *current*: within one panel instance the counter
+    must stay monotonic even if a later restore loads an older (lower-seq)
+    session, or new calls would collide again.
+    """
+    top = current
+    for e in conv_entries:
+        seq = e.get("_seq")
+        if e.get("type") == "tool_call" and isinstance(seq, int) and seq > top:
+            top = seq
+    return top
+
+
 def save_session(config_dir: str, filename: str, payload: dict) -> str | None:
     """Write *payload* to sessions_dir/filename with owner-only perms.
 

@@ -29,7 +29,7 @@ const dom = new JSDOM(`<!DOCTYPE html>
   <details class="tools tool-details" id="tool_1" open="">
     <summary class="tool-summary"><span style="color:#2e7d32">&#10003;</span>
     <span style="color:#444;font-weight:600">&#8609; place_symbol</span></summary>
-    <div class="tool-body tool-entry tool-ok" data-details="tool_1">
+    <div class="tool-body tool-entry tool-ok">
       <span style="color:#444">args:</span><br><pre style="margin:2px 0">{"reference": "R1", "x": 100, "y": 200}</pre>
       <span style="color:#444">result:</span><br><pre style="margin:2px 0">{"success": true}</pre>
     </div>
@@ -38,7 +38,7 @@ const dom = new JSDOM(`<!DOCTYPE html>
   <details class="tools tool-details" id="tool_2">
     <summary class="tool-summary"><span style="color:#2e7d32">&#10003;</span>
     <span style="color:#444;font-weight:600">&#8609; add_wire</span></summary>
-    <div class="tool-body tool-entry tool-ok" data-details="tool_2">
+    <div class="tool-body tool-entry tool-ok">
       <span style="color:#444">args:</span><br><pre style="margin:2px 0">{"from": "R1-pad1", "to": "C1-pad2"}</pre>
       <span style="color:#444">result:</span><br><pre style="margin:2px 0">{"net_code": 33, "success": true}</pre>
     </div>
@@ -65,6 +65,13 @@ const sandbox = {
     NodeFilter: dom.window.NodeFilter,
     HTMLElement: dom.window.HTMLElement,
     console: console,
+    // Host globals absent from bare vm contexts but used by the shell's
+    // click-to-collapse handler.
+    setTimeout: (fn, ms) => setTimeout(fn, ms),
+    clearTimeout: (id) => clearTimeout(id),
+    getSelection: function() {
+        return dom.window.getSelection ? dom.window.getSelection() : { isCollapsed: true };
+    },
 };
 sandbox.window = sandbox; // circular: window === sandbox
 
@@ -202,7 +209,43 @@ section('10. Auto-expand collapsed details on match');
     assert(tool2After.hasAttribute('open'), 'tool_2 should be auto-expanded when match is inside it');
 }
 
-// ---- Summary ----
-console.log('\n' + '='.repeat(50));
-console.log(`Results: ${passed} passed, ${failed} failed (${passed + failed} total)`);
-process.exit(failed > 0 ? 1 : 0);
+// ---- Click-to-collapse ----
+(async function() {
+    section('11. Body click collapses an open tool row');
+    {
+        const tool1 = document.getElementById('tool_1');
+        assert(tool1.hasAttribute('open'), 'tool_1 should start open');
+        const body = tool1.querySelector('.tool-body');
+        body.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true, cancelable: true, button: 0 }));
+        // The collapse is deferred 250 ms as a double-click guard; give the
+        // timer time to fire.
+        await new Promise((resolve) => global.setTimeout(resolve, 350));
+        assert(!tool1.hasAttribute('open'), 'tool_1 should be collapsed after a body click');
+    }
+
+    section('12. Duplicate details ids: a body click closes only the clicked row');
+    {
+        const conv = document.getElementById('conversation');
+        // Mimic a session-restore id collision: two rows share one details id.
+        conv.insertAdjacentHTML('beforeend',
+            '<details class="tools tool-details" id="dup_row" open=""><summary class="tool-summary">first</summary>' +
+            '<div class="tool-body" id="dup_body_first">first body</div></details>' +
+            '<details class="tools tool-details" id="dup_row" open=""><summary class="tool-summary">second</summary>' +
+            '<div class="tool-body" id="dup_body_second">second body</div></details>');
+        const firstRow = document.getElementById('dup_body_first').closest('details');
+        const secondRow = document.getElementById('dup_body_second').closest('details');
+        document.getElementById('dup_body_second')
+            .dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true, cancelable: true, button: 0 }));
+        await new Promise((resolve) => global.setTimeout(resolve, 350));
+        assert(firstRow.hasAttribute('open'), 'earlier duplicate-id row must stay open (no wrong-target collapse)');
+        assert(!secondRow.hasAttribute('open'), 'clicked later row collapses despite the shared id');
+    }
+
+    // ---- Summary ----
+    console.log('\n' + '='.repeat(50));
+    console.log(`Results: ${passed} passed, ${failed} failed (${passed + failed} total)`);
+    process.exit(failed > 0 ? 1 : 0);
+})().catch((err) => {
+    console.error('Unhandled test error:', err);
+    process.exit(1);
+});

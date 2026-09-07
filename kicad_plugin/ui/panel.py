@@ -2540,6 +2540,10 @@ if _WX_AVAILABLE:
             self._stream_delta_chars = 0
             self._pending_ai_text = ""
             self._conv_entries = data.get("conv_entries", [])
+            # Continue numbering tool-call details ids above every id the
+            # restored entries already carry — a fresh panel starts the
+            # counter at 0 and would otherwise duplicate ids (issue #117).
+            self._tool_seq = _sstore.max_tool_seq(self._conv_entries, self._tool_seq)
             # Loaded content already matches this file on disk: mark it as
             # saved so a plain close (no user edits) does not rewrite it.
             self._saved_conv_version = self._conv_version
@@ -2898,6 +2902,7 @@ if _WX_AVAILABLE:
                 return
 
             self._conv_entries = conv
+            self._tool_seq = _sstore.max_tool_seq(self._conv_entries, self._tool_seq)
             self._saved_conv_version = self._conv_version
             self._current_session_file = os.path.basename(path)
             if self._llm_client:

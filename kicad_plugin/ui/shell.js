@@ -57,7 +57,7 @@ function _toolCallHtml(e) {
         + '<summary class="tool-summary"><span style="color:' + iconColor + '">' + icon + '</span> '
         + '<span style="color:#444;font-weight:600">\u21B3 ' + _escapeHtml(e.name)
         + '</span></summary>'
-        + '<div class="tool-body ' + css + '" data-details="' + uid + '">'
+        + '<div class="tool-body ' + css + '">'
         + '<span style="color:#444">args:</span><br><pre style="margin:2px 0">' + args + '</pre>'
         + '<span style="color:#444">result:</span><br>'
         + '<pre style="margin:2px 0;max-height:400px;overflow-y:auto">' + result + '</pre>'
@@ -92,7 +92,7 @@ function _pdfTextsHtml(pdfTexts) {
             + '<summary><span style="color:' + iconColor + '">' + icon + '</span> '
             + '<span style="color:#444;font-weight:600">\uD83D\uDCC4 ' + _escapeHtml(p.name)
             + '</span></summary>'
-            + '<div class="tool-body ' + css + '" data-details="' + uid + '">'
+            + '<div class="tool-body ' + css + '">'
             + '<pre style="margin:2px 0;max-height:300px;overflow-y:auto">'
             + _escapeHtml(p.text || '') + '</pre></div></details>';
     }
@@ -244,9 +244,11 @@ window._clearConversation = function() {
         if (_drag) return;  // genuine drag-select, not a click
         var sel = window.getSelection();
         if (sel && !sel.isCollapsed) return;  // active selection
-        var detailsId = toolBody.getAttribute('data-details');
-        if (!detailsId) return;
-        var details = document.getElementById(detailsId);
+        // Resolve the target by DOM position, never by id: getElementById
+        // returns the first match, so a duplicate details id (restored
+        // session restarts the seq counter) would collapse the wrong row —
+        // or no-op on an already closed earlier row.
+        var details = toolBody.closest('details.tools');
         if (!details || !details.open) return;
         // Defer: the first click of a double-click would collapse before the
         // dblclick event arrives; cancel the collapse when one follows.
