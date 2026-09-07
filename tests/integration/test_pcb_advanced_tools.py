@@ -204,14 +204,15 @@ class TestGetFootprintBbox:
             "get_footprint_bbox",
             {
                 "pcb_path": BOARD_FIXTURE,
-                "reference": "R1",
+                "references": ["R1"],
             },
         )
-        if "error" in result:
-            assert "courtyard" in result["error"].lower() or "geometry" in result["error"].lower()
+        entry = result["results"][0]
+        if "error" in entry:
+            assert "courtyard" in entry["error"].lower() or "geometry" in entry["error"].lower()
         else:
-            assert "bbox" in result
-            bbox = result["bbox"]
+            assert "bbox" in entry
+            bbox = entry["bbox"]
             assert "min_x" in bbox and "max_x" in bbox
             assert "min_y" in bbox and "max_y" in bbox
             assert bbox["width"] > 0
@@ -225,10 +226,11 @@ class TestGetFootprintBbox:
             "get_footprint_bbox",
             {
                 "pcb_path": BOARD_FIXTURE,
-                "reference": "U99",
+                "references": ["U99"],
             },
         )
-        assert "error" in result
+        assert result["failure_count"] == 1
+        assert "error" in result["results"][0]
 
 
 class TestGetBoardBoundingBox:

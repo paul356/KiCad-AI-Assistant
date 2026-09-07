@@ -14,8 +14,9 @@ description: "Property CRUD, reference renaming, label management, reference con
 - **check_reference_conflicts** — Find duplicate reference designators across the project hierarchy.
 
 # Recommended property workflow
-1. Call **list_symbol_properties(schematic_path, reference)** to see existing properties
-   (returns `{name, value}` pairs from the first unit of a multi-unit symbol).
+1. Call **list_symbol_properties(schematic_path, references)** to see existing
+   properties for one or more components (returns `{name, value}` pairs from
+   the first unit of each multi-unit symbol).
 2. Call **set_symbol_property(schematic_path, items)** to add or update.
    Each ``items`` entry is ``{"reference", "property_name", "property_value"}``
    (e.g. ``[{"reference": "R1", "property_name": "Value", "property_value":

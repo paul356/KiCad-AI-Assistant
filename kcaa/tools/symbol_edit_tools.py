@@ -1801,10 +1801,10 @@ def register_symbol_edit_tools(mcp: FastMCP) -> None:
     @mcp.tool()
     async def list_symbol_properties(
         schematic_path: str,
-        reference: str,
+        references: list[str],
         ctx: Context | None = None,
     ) -> dict[str, Any]:
-        """List all properties of a placed schematic component.
+        """List all properties of one or more placed schematic components.
 
         Returns every ``(property ...)`` entry found on the first unit of the
         component identified by *reference*.  All units of a multi-unit
@@ -1813,32 +1813,39 @@ def register_symbol_edit_tools(mcp: FastMCP) -> None:
 
         Args:
             schematic_path: Absolute path to the target .kicad_sch file.
-            reference: Reference designator of the component to inspect
-                (e.g. "R1", "U3").
+            references: Reference designators of the components to inspect
+                (e.g. ["R1", "U3"]).  Must be non-empty and unique.
 
         Returns:
-            dict with keys: success (bool), reference,
-            properties (list of {name (str), value (str)}).
+            dict with keys: success (bool — every component found),
+            results (list of per-component dicts: {success, reference,
+            properties (list of {name (str), value (str)})}, or
+            {reference, error} for components not found), count,
+            failure_count.
         """
         if not schematic_path.endswith(".kicad_sch"):
             return {"error": f"Not a .kicad_sch file: {schematic_path!r}"}
         if not os.path.isfile(schematic_path):
             return {"error": f"Schematic file not found: {schematic_path!r}"}
-        if not reference:
-            return {"error": "reference must not be empty"}
+        if not references:
+            return {"error": "references must not be empty"}
+        if any(not isinstance(r, str) or not r for r in references):
+            return {"error": "references must not contain empty designators"}
+        if len(set(references)) != len(references):
+            return {"error": "references must not contain duplicates"}
 
         try:
             sch = safe_schematic(schematic_path)
         except Exception as exc:
             return {"error": f"Failed to open schematic: {exc}"}
 
-        try:
+        def props_one(ref: str) -> dict[str, Any]:
             # Find the first unit with the given reference.
             first_unit: Any | None = None
             try:
                 for sym in sch.symbol:
                     try:
-                        if sym.property.Reference.value == reference:
+                        if sym.property.Reference.value == ref:
                             first_unit = sym
                             break
                     except AttributeError:
@@ -1847,7 +1854,10 @@ def register_symbol_edit_tools(mcp: FastMCP) -> None:
                 pass
 
             if first_unit is None:
-                return {"error": f"No symbol with reference {reference!r} found"}
+                return {
+                    "reference": ref,
+                    "error": f"No symbol with reference {ref!r} found",
+                }
 
             properties: list[dict[str, str]] = []
             try:
@@ -1863,13 +1873,23 @@ def register_symbol_edit_tools(mcp: FastMCP) -> None:
 
             return {
                 "success": True,
-                "reference": reference,
+                "reference": ref,
                 "properties": properties,
             }
 
+        try:
+            results = [props_one(ref) for ref in references]
         except Exception as exc:
             log.exception("Unexpected error in list_symbol_properties")
             return {"error": str(exc), "success": False}
+
+        failure_count = sum(1 for r in results if "error" in r)
+        return {
+            "success": failure_count == 0,
+            "results": results,
+            "count": len(results),
+            "failure_count": failure_count,
+        }
 
     @mcp.tool()
     async def delete_symbol_property(

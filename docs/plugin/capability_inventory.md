@@ -42,7 +42,7 @@ These are read-only tools. They must be used when the LLM is asked to add a comp
 | `add_symbol_to_schematic` | Place a new symbol at a given position |
 | `remove_symbol_from_schematic` | Remove one or more symbols by reference |
 | `set_symbol_property` | Update any property on one or more components (batch, partial-apply) |
-| `list_symbol_properties` | Read all properties of one component |
+| `list_symbol_properties` | Read all properties of one or more components (batch) |
 | `delete_symbol_property` | Remove a custom property |
 | `move_component` | Shift a component by a delta, optionally per unit |
 | `add_label_to_schematic` | Add a net label at a position |

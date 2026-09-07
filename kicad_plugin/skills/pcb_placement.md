@@ -6,8 +6,9 @@ description: "Footprint positioning, overlap check, group align/distribute opera
 # PCB placement workflow
 - Before placing, call **get_board_info** + **list_footprints** to understand
   the current layout.
-- Use **get_footprint_bbox** to get a footprint's courtyard bounding box in
-  world coordinates.  Use this to check for overlaps before positioning.
+- Use **get_footprint_bbox** (batch: `references` list) to get the courtyard
+  bounding box of one or more footprints in world coordinates.  Use this to
+  check for overlaps before positioning.
 - Use **get_board_bounding_box** to get the union bbox of all footprint
   courtyards — useful for sizing the board outline around all components.
 - Move or rotate footprints: **set_footprint_position(pcb_path, items)**.

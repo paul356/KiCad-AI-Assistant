@@ -199,40 +199,60 @@ class TestListFootprints:
 
 class TestGetFootprint:
     def test_returns_footprint_details(self, tools):
-        result = _run(tools["get_footprint"](pcb_path=BOARD_FIXTURE, reference="R1", ctx=None))
-        assert result["reference"] == "R1"
-        assert result["value"] == "10k"
+        result = _run(tools["get_footprint"](pcb_path=BOARD_FIXTURE, references=["R1"], ctx=None))
+        assert result["results"][0]["reference"] == "R1"
+        assert result["results"][0]["value"] == "10k"
 
     def test_returns_pads(self, tools):
-        result = _run(tools["get_footprint"](pcb_path=BOARD_FIXTURE, reference="R1", ctx=None))
-        pads = result["pads"]
+        result = _run(tools["get_footprint"](pcb_path=BOARD_FIXTURE, references=["R1"], ctx=None))
+        pads = result["results"][0]["pads"]
         assert len(pads) == 2
         pad_nums = {p["number"] for p in pads}
         assert pad_nums == {"1", "2"}
 
     def test_pad_includes_net(self, tools):
-        result = _run(tools["get_footprint"](pcb_path=BOARD_FIXTURE, reference="R1", ctx=None))
-        pad1 = next(p for p in result["pads"] if p["number"] == "1")
+        result = _run(tools["get_footprint"](pcb_path=BOARD_FIXTURE, references=["R1"], ctx=None))
+        pad1 = next(p for p in result["results"][0]["pads"] if p["number"] == "1")
         assert pad1["net_name"] == "VCC"
 
     def test_returns_error_on_missing_reference(self, tools):
-        result = _run(tools["get_footprint"](pcb_path=BOARD_FIXTURE, reference="U99", ctx=None))
-        assert "error" in result
+        result = _run(tools["get_footprint"](pcb_path=BOARD_FIXTURE, references=["U99"], ctx=None))
+        assert result["failure_count"] == 1
+        assert "error" in result["results"][0]
 
     def test_includes_edge_cuts_field(self, tools):
         """get_footprint returns an edge_cuts list (empty when none exist)."""
-        result = _run(tools["get_footprint"](pcb_path=BOARD_FIXTURE, reference="R1", ctx=None))
-        assert "edge_cuts" in result
-        assert isinstance(result["edge_cuts"], list)
+        result = _run(tools["get_footprint"](pcb_path=BOARD_FIXTURE, references=["R1"], ctx=None))
+        assert "edge_cuts" in result["results"][0]
+        assert isinstance(result["results"][0]["edge_cuts"], list)
+
+    def test_batch_returns_multiple(self, tools):
+        result = _run(
+            tools["get_footprint"](pcb_path=BOARD_FIXTURE, references=["R1", "C1"], ctx=None)
+        )
+        assert result.get("success") is True, result
+        assert result["count"] == 2
+        assert result["results"][0]["reference"] == "R1"
+        assert result["results"][1]["reference"] == "C1"
+        assert result["results"][1]["value"] == "100nF"
+
+    def test_duplicate_references_rejected(self, tools):
+        result = _run(
+            tools["get_footprint"](pcb_path=BOARD_FIXTURE, references=["R1", "R1"], ctx=None)
+        )
+        assert "error" in result
+        assert "duplicate" in result["error"]
 
 
 class TestGetFootprintBbox:
     def test_r1_bbox_no_rotation(self, tools, board_with_outline_copy):
         result = _run(
-            tools["get_footprint_bbox"](pcb_path=board_with_outline_copy, reference="R1", ctx=None)
+            tools["get_footprint_bbox"](
+                pcb_path=board_with_outline_copy, references=["R1"], ctx=None
+            )
         )
-        assert "bbox" in result
-        bbox = result["bbox"]
+        assert "bbox" in result["results"][0]
+        bbox = result["results"][0]["bbox"]
         assert bbox["min_x"] == pytest.approx(9.0)
         assert bbox["max_x"] == pytest.approx(11.0)
         assert bbox["min_y"] == pytest.approx(19.25)
@@ -241,10 +261,23 @@ class TestGetFootprintBbox:
     def test_not_found_returns_error(self, tools, board_with_outline_copy):
         result = _run(
             tools["get_footprint_bbox"](
-                pcb_path=board_with_outline_copy, reference="MISSING", ctx=None
+                pcb_path=board_with_outline_copy, references=["MISSING"], ctx=None
             )
         )
-        assert "error" in result
+        assert result["failure_count"] == 1
+        assert "error" in result["results"][0]
+
+    def test_batch_returns_bboxes(self, tools, board_with_outline_copy):
+        result = _run(
+            tools["get_footprint_bbox"](
+                pcb_path=board_with_outline_copy, references=["R1", "R3"], ctx=None
+            )
+        )
+        assert result["count"] == 2
+        assert "bbox" in result["results"][0]
+        for entry in result["results"]:
+            assert "reference" in entry
+            assert ("bbox" in entry) or ("error" in entry)
 
 
 class TestGetBoardBoundingBox:
@@ -425,8 +458,8 @@ class TestListVias:
 
 class TestGetFootprintPadSize:
     def test_pad_includes_size_fields(self, tools):
-        result = _run(tools["get_footprint"](pcb_path=BOARD_FIXTURE, reference="R1", ctx=None))
-        for pad in result["pads"]:
+        result = _run(tools["get_footprint"](pcb_path=BOARD_FIXTURE, references=["R1"], ctx=None))
+        for pad in result["results"][0]["pads"]:
             assert "local_w" in pad
             assert "local_h" in pad
             assert "world_w" in pad
@@ -438,8 +471,8 @@ class TestGetFootprintPadSize:
 
     def test_world_size_for_rotated_footprint(self, tools):
         """C1 is at 90°, pads are (size 0.5 0.5) square -> world_w == world_h."""
-        result = _run(tools["get_footprint"](pcb_path=BOARD_FIXTURE, reference="C1", ctx=None))
-        for pad in result["pads"]:
+        result = _run(tools["get_footprint"](pcb_path=BOARD_FIXTURE, references=["C1"], ctx=None))
+        for pad in result["results"][0]["pads"]:
             assert pad["world_w"] == pad["world_h"]
             assert pad["world_w"] > 0
 

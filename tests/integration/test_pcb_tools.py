@@ -259,50 +259,62 @@ class TestGetFootprint:
     def test_value_and_reference(self, mcp_server):
         port, sid = mcp_server
         result = _call_tool(
-            port, sid, "get_footprint", {"pcb_path": BOARD_FIXTURE, "reference": "R1"}
+            port, sid, "get_footprint", {"pcb_path": BOARD_FIXTURE, "references": ["R1"]}
         )
-        assert result.get("reference") == "R1"
-        assert result.get("value") == "10k"
+        assert result["results"][0].get("reference") == "R1"
+        assert result["results"][0].get("value") == "10k"
 
     def test_pad_count(self, mcp_server):
         port, sid = mcp_server
         result = _call_tool(
-            port, sid, "get_footprint", {"pcb_path": BOARD_FIXTURE, "reference": "R1"}
+            port, sid, "get_footprint", {"pcb_path": BOARD_FIXTURE, "references": ["R1"]}
         )
-        assert len(result.get("pads", [])) == 2
+        assert len(result["results"][0].get("pads", [])) == 2
 
     def test_pad_net_name(self, mcp_server):
         port, sid = mcp_server
         result = _call_tool(
-            port, sid, "get_footprint", {"pcb_path": BOARD_FIXTURE, "reference": "R1"}
+            port, sid, "get_footprint", {"pcb_path": BOARD_FIXTURE, "references": ["R1"]}
         )
-        pad1 = next(p for p in result["pads"] if p["number"] == "1")
+        pad1 = next(p for p in result["results"][0]["pads"] if p["number"] == "1")
         assert pad1["net_name"] == "VCC"
 
     def test_pad_coords_are_local(self, mcp_server):
         """Pads expose local_x/local_y (footprint-relative), not world coords."""
         port, sid = mcp_server
         result = _call_tool(
-            port, sid, "get_footprint", {"pcb_path": BOARD_FIXTURE, "reference": "R1"}
+            port, sid, "get_footprint", {"pcb_path": BOARD_FIXTURE, "references": ["R1"]}
         )
-        pad1 = next(p for p in result["pads"] if p["number"] == "1")
+        pad1 = next(p for p in result["results"][0]["pads"] if p["number"] == "1")
         assert "local_x" in pad1
         assert "local_y" in pad1
 
     def test_missing_reference_returns_error(self, mcp_server):
         port, sid = mcp_server
         result = _call_tool(
-            port, sid, "get_footprint", {"pcb_path": BOARD_FIXTURE, "reference": "U99"}
+            port, sid, "get_footprint", {"pcb_path": BOARD_FIXTURE, "references": ["U99"]}
         )
-        assert "error" in result
+        assert result["failure_count"] == 1
+        assert "error" in result["results"][0]
 
     def test_includes_edge_cuts_field(self, mcp_server):
         """get_footprint response carries an edge_cuts list over JSON-RPC."""
         port, sid = mcp_server
         result = _call_tool(
-            port, sid, "get_footprint", {"pcb_path": BOARD_FIXTURE, "reference": "R1"}
+            port, sid, "get_footprint", {"pcb_path": BOARD_FIXTURE, "references": ["R1"]}
         )
-        assert isinstance(result.get("edge_cuts"), list)
+        assert isinstance(result["results"][0].get("edge_cuts"), list)
+
+    def test_batch_returns_multiple(self, mcp_server):
+        port, sid = mcp_server
+        result = _call_tool(
+            port, sid, "get_footprint", {"pcb_path": BOARD_FIXTURE, "references": ["R1", "C1"]}
+        )
+        assert result.get("success") is True, result
+        assert result["count"] == 2
+        assert result["results"][0]["reference"] == "R1"
+        assert result["results"][1]["reference"] == "C1"
+        assert result["results"][1]["value"] == "100nF"
 
 
 class TestListNets:
@@ -480,8 +492,10 @@ class TestSetFootprintPosition:
         assert "error" in failed
         assert "U99" in failed["error"]
         # The successful target really was saved: re-read through the MCP.
-        reread = _call_tool(port, sid, "get_footprint", {"pcb_path": str(pcb), "reference": "R1"})
-        assert abs(reread["x"] - 99.0) < 0.001
+        reread = _call_tool(
+            port, sid, "get_footprint", {"pcb_path": str(pcb), "references": ["R1"]}
+        )
+        assert abs(reread["results"][0]["x"] - 99.0) < 0.001
 
     def test_duplicate_references_rejected(self, mcp_server, tmp_path):
         port, sid = mcp_server
@@ -636,8 +650,10 @@ class TestSetFootprintProperty:
                 "items": [{"reference": "R1", "property_name": "Value", "value": "47k"}],
             },
         )
-        result = _call_tool(port, sid, "get_footprint", {"pcb_path": str(pcb), "reference": "R1"})
-        assert result.get("value") == "47k"
+        result = _call_tool(
+            port, sid, "get_footprint", {"pcb_path": str(pcb), "references": ["R1"]}
+        )
+        assert result["results"][0].get("value") == "47k"
 
     def test_missing_property_returns_error(self, mcp_server, tmp_path):
         port, sid = mcp_server

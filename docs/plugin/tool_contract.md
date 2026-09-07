@@ -248,11 +248,14 @@ All tools in this group write a backup to `<schematic_path>.bak` before saving.
 
 ---
 
-#### `list_symbol_properties(schematic_path, reference)`
+#### `list_symbol_properties(schematic_path, references)`
 
-**Purpose:** Returns all properties and their values for one component. Use before `set_symbol_property` to discover existing field names.
+**Purpose:** Returns all properties and their values for one or more components. Use before `set_symbol_property` to discover existing field names.
 
-**Success response:** `{"success": true, "reference": "U1", "properties": {"Reference": "U1", "Value": "ATmega328P", ...}}`
+**Key parameters:**
+- `references` (`list[str]`) — one or more component designators, e.g. `["R1", "C2"]`. Must be non-empty and unique.
+
+**Success response:** `{"success": true, "results": [{"success": true, "reference": "R1", "properties": [{"name": "Reference", "value": "R1"}, {"name": "Value", "value": "10k"}]}], "count": 1, "failure_count": 0}`
 
 ---
 

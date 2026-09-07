@@ -10,8 +10,9 @@ description: "PCB query workflow: get_board_info, list_footprints, ratsnest, net
    (world mm), rotation (CCW+), and layer.  Filter with ``ref_prefix``
    (e.g. ``"R"``), ``bbox`` (``[xmin, ymin, xmax, ymax]``), or ``fields``
    (e.g. ``["reference", "x"]``); unknown field names are rejected.
-3. Call **get_footprint** for detailed info on a specific footprint: pad
-   numbers/types/nets, all properties, local pad coordinates, and
+3. Call **get_footprint** (batch: `references` list) for detailed info on one
+   or more footprints: pad numbers/types/nets, all properties, local pad
+   coordinates, and
    `edge_cuts` (fp_line/fp_arc/fp_circle/fp_curve items on the
    footprint's Edge.Cuts layer, in footprint-local mm — transform to
    world the same way as pads: CCW+ rotation, +Y down).

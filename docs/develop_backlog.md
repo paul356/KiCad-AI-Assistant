@@ -170,7 +170,7 @@ rotation plus the footprint rotation (verify which KiCad actually applies).
 
 ## Batch support for set_*/list_* tools
 
-**Status:** implemented (2026-09-07) — set tools batch-first
+**Status:** implemented (2026-09-07) — set/list/get tools batched
 (`set_symbol_property`, `set_footprint_position`, `set_footprint_property`),
 partial-apply per-ref results; list filters on `list_footprints` /
 `list_nets` / `list_vias` with unknown-field rejection; `list_tracks`
@@ -224,6 +224,12 @@ retained per maintainer decision)
    - `list_tracks` already filters by `net`+`layer`; fields projection
      skipped there (trace/segment grouping makes projection ambiguous).
    Unknown field names are rejected, not silently dropped.
+3. Per-object read tools batch too: `references: list[str]` replaces the
+   single `reference` on `get_footprint`, `get_footprint_bbox`
+   (`pcb_query_tools.py`) and `list_symbol_properties`
+   (`symbol_edit_tools.py`).  One file load, per-reference `results[]`
+   entries; missing references keep per-ref errors; duplicates/empty
+   entries/unknown designators rejected up front.
 
 ### Validation
 

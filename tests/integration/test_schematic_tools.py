@@ -346,15 +346,31 @@ class TestListComponentProperties:
             "list_symbol_properties",
             {
                 "schematic_path": SCH_FIXTURE,
-                "reference": "R1",
+                "references": ["R1"],
             },
         )
         assert "error" not in result, result
         assert result.get("success") is True
-        assert "properties" in result
-        prop_names = [p["name"] for p in result["properties"]]
+        assert "properties" in result["results"][0]
+        prop_names = [p["name"] for p in result["results"][0]["properties"]]
         assert "Reference" in prop_names
         assert "Value" in prop_names
+
+    def test_batch_multiple_references(self, mcp_server):
+        port, sid = mcp_server
+        result = _call_tool(
+            port,
+            sid,
+            "list_symbol_properties",
+            {
+                "schematic_path": SCH_FIXTURE,
+                "references": ["R1", "R2"],
+            },
+        )
+        assert result.get("success") is True, result
+        assert result["count"] == 2
+        assert result["results"][0]["reference"] == "R1"
+        assert result["results"][1]["reference"] == "R2"
 
     def test_nonexistent_reference_returns_error(self, mcp_server):
         port, sid = mcp_server
@@ -364,10 +380,11 @@ class TestListComponentProperties:
             "list_symbol_properties",
             {
                 "schematic_path": SCH_FIXTURE,
-                "reference": "U99",
+                "references": ["U99"],
             },
         )
-        assert "error" in result
+        assert result["failure_count"] == 1
+        assert "error" in result["results"][0]
 
     def test_nonexistent_file_returns_error(self, mcp_server):
         port, sid = mcp_server
@@ -377,7 +394,7 @@ class TestListComponentProperties:
             "list_symbol_properties",
             {
                 "schematic_path": "/nonexistent/schematic.kicad_sch",
-                "reference": "R1",
+                "references": ["R1"],
             },
         )
         assert "error" in result
@@ -568,11 +585,11 @@ class TestSetComponentProperty:
             "list_symbol_properties",
             {
                 "schematic_path": sch,
-                "reference": "R1",
+                "references": ["R1"],
             },
         )
         assert "error" not in result
-        val_prop = next(p for p in result["properties"] if p["name"] == "Value")
+        val_prop = next(p for p in result["results"][0]["properties"] if p["name"] == "Value")
         assert val_prop["value"] == "47k"
 
     def test_partial_apply_with_missing_reference(self, mcp_server, tmp_path):
@@ -603,9 +620,9 @@ class TestSetComponentProperty:
             port,
             sid,
             "list_symbol_properties",
-            {"schematic_path": sch, "reference": "R1"},
+            {"schematic_path": sch, "references": ["R1"]},
         )
-        val_prop = next(p for p in listed["properties"] if p["name"] == "Value")
+        val_prop = next(p for p in listed["results"][0]["properties"] if p["name"] == "Value")
         assert val_prop["value"] == "22k"
 
     def test_duplicate_references_rejected(self, mcp_server, tmp_path):
