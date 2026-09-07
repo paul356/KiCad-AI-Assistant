@@ -30,14 +30,14 @@ def register_pcb_placement_tools(mcp: FastMCP) -> None:
     @mcp.tool()
     async def set_footprint_position(
         pcb_path: str,
-        reference: str,
+        references: list[str],
         x: float | None,
         y: float | None,
         rotation: float | None,
         ctx: Context | None,
         force: bool = False,
     ) -> dict[str, Any]:
-        """Move and/or rotate a footprint on the PCB board.
+        """Move and/or rotate footprints on the PCB board.
 
         PCB coordinates are mm with +X right, **+Y down**, and rotation
         is in degrees, **CCW-positive on screen** (KiCad PCB convention —
@@ -60,11 +60,19 @@ def register_pcb_placement_tools(mcp: FastMCP) -> None:
         edge connectors flush with the board edge, press-fit connectors,
         or fiducials deliberately placed near other features).
 
-        A .kicad_pcb.bak backup is created before writing.
+        The same move/rotation is applied to every reference in
+        *references* in one parse + one save (single ``.bak``).  The
+        courtyard collision guard is evaluated per footprint against the
+        board state at that point in the batch (earlier references in this
+        call have already been moved).  Partial-apply: a footprint that
+        cannot be found or placed keeps its own error in ``results`` while
+        the remaining footprints are still applied and saved.  Duplicate or
+        empty entries in *references* are rejected up front.
 
         Args:
             pcb_path: Absolute path to the .kicad_pcb file.
-            reference: Footprint reference designator, e.g. ``"U1"``.
+            references: Footprint reference designators, e.g. ``["U1",
+                "R2"]``.
             x: New X coordinate in mm (world), or None to keep current.
             y: New Y coordinate in mm (world), or None to keep current.
             rotation: New rotation in degrees, CCW-positive on screen
@@ -79,75 +87,103 @@ def register_pcb_placement_tools(mcp: FastMCP) -> None:
         Returns:
             dict with:
 
-            - ``status``: ``"placed"`` on success, or
-              ``"placed_at_adjusted_position"`` when the requested spot was
-              occupied and the tool found the nearest free position.
-            - ``reference``: the footprint reference.
-            - ``moved_from``: ``{x, y, rotation}`` — position before this call.
-            - ``placed_at``: ``{x, y, rotation}`` — position the footprint was
-              actually placed at (may differ from the request when adjusted).
-            - ``requested_position``: ``{x, y, rotation}`` — only present when
-              ``status`` is ``"placed_at_adjusted_position"``; the original
-              requested coords that caused a collision.
-            - ``backup_path``, ``pcb_path``.
-            - ``warnings``: only when ``force=True`` and overlaps exist;
-              contains ``courtyard_overlaps`` (list of refs) and ``message``.
+            - ``success``: True when every footprint was placed.
+            - ``results``: per-footprint dicts — success entries carry the
+              single-target fields (``status``: ``"placed"`` or
+              ``"placed_at_adjusted_position"``; ``reference``;
+              ``moved_from`` ``{x, y, rotation}``; ``placed_at``
+              ``{x, y, rotation}``; ``requested_position`` when adjusted;
+              ``warnings`` when ``force=True`` and overlaps exist), failed
+              entries carry ``{reference, error, ...}``.
+            - ``count``, ``applied_count``, ``failure_count``.
+            - ``backup_path`` (None when nothing was moved), ``pcb_path``.
         """
         if x is None and y is None and rotation is None:
             return {"error": "At least one of x, y, rotation must be provided."}
+        if not references:
+            return {"error": "references must not be empty"}
+        if len(set(references)) != len(references):
+            return {"error": "references must not contain duplicates"}
+        if any(not ref for ref in references):
+            return {"error": "references must not contain empty designators"}
 
         data = load_pcb(pcb_path)
-        try:
-            fp = find_footprint(data, reference)
-        except KeyError as exc:
-            return {"error": str(exc)}
 
-        old_x, old_y, old_rot = get_fp_at(fp)
-        new_x = old_x if x is None else float(x)
-        new_y = old_y if y is None else float(y)
-        new_rot = old_rot if rotation is None else float(rotation)
-        req_x, req_y = new_x, new_y  # save before possible auto-adjustment
+        def place_one(ref: str) -> dict[str, Any]:
+            try:
+                fp = find_footprint(data, ref)
+            except KeyError as exc:
+                return {"error": str(exc), "reference": ref}
 
-        # Collision check (footprint vs footprint only; board bounds not enforced)
-        collisions = find_collisions(data, [(reference, new_x, new_y, new_rot)])
-        adjusted_position: tuple[float, float] | None = None
-        if collisions and not force:
-            free = find_nearest_free_position(data, reference, new_x, new_y, new_rot)
-            if free is None:
-                overlapping = collisions[0]["overlapping_with"]
-                return {
-                    "error": "Placement rejected: courtyard would overlap at the proposed position. Footprint was NOT moved.",
-                    "proposed_position_overlaps": overlapping,
-                    "proposed_position": {"x": new_x, "y": new_y, "rotation": new_rot},
-                    "current_position": {"x": old_x, "y": old_y, "rotation": old_rot},
-                    "hint": "No free spot found within 20 mm. You may need to move the interfering component first.",
+            old_x, old_y, old_rot = get_fp_at(fp)
+            new_x = old_x if x is None else float(x)
+            new_y = old_y if y is None else float(y)
+            new_rot = old_rot if rotation is None else float(rotation)
+            req_x, req_y = new_x, new_y  # save before possible auto-adjustment
+
+            # Collision check (footprint vs footprint only; board bounds not enforced)
+            collisions = find_collisions(data, [(ref, new_x, new_y, new_rot)])
+            adjusted_position: tuple[float, float] | None = None
+            if collisions and not force:
+                free = find_nearest_free_position(data, ref, new_x, new_y, new_rot)
+                if free is None:
+                    overlapping = collisions[0]["overlapping_with"]
+                    return {
+                        "error": "Placement rejected: courtyard would overlap at the proposed position. Footprint was NOT moved.",
+                        "reference": ref,
+                        "proposed_position_overlaps": overlapping,
+                        "proposed_position": {"x": new_x, "y": new_y, "rotation": new_rot},
+                        "current_position": {"x": old_x, "y": old_y, "rotation": old_rot},
+                        "hint": "No free spot found within 20 mm. You may need to move the interfering component first.",
+                    }
+                adjusted_position = free
+                new_x, new_y = free
+
+            set_fp_at(fp, new_x, new_y, new_rot)
+
+            result: dict[str, Any] = {
+                "success": True,
+                "status": "placed",
+                "reference": ref,
+                "moved_from": {"x": old_x, "y": old_y, "rotation": old_rot},
+                "placed_at": {"x": new_x, "y": new_y, "rotation": new_rot},
+            }
+            if adjusted_position is not None:
+                result["status"] = "placed_at_adjusted_position"
+                result["requested_position"] = {"x": req_x, "y": req_y, "rotation": new_rot}
+            if collisions and force:
+                result["warnings"] = {
+                    "courtyard_overlaps": collisions[0]["overlapping_with"],
+                    "message": "Footprint placed successfully at the new position. Courtyard overlaps detected (force=True was used).",
                 }
-            adjusted_position = free
-            new_x, new_y = free
+            return result
 
-        set_fp_at(fp, new_x, new_y, new_rot)
-        try:
-            backup_path = save_pcb(pcb_path, data)
-        except OSError as exc:
-            return {"error": f"Failed to write PCB file: {exc}"}
+        results: list[dict[str, Any]] = []
+        for ref in references:
+            try:
+                results.append(place_one(ref))
+            except Exception as exc:
+                log.warning("set_footprint_position: reference %r failed: %s", ref, exc)
+                results.append({"error": f"{ref}: {exc}", "reference": ref})
 
-        result: dict[str, Any] = {
-            "status": "placed",
-            "reference": reference,
-            "moved_from": {"x": old_x, "y": old_y, "rotation": old_rot},
-            "placed_at": {"x": new_x, "y": new_y, "rotation": new_rot},
+        applied_count = sum(1 for r in results if r.get("success"))
+
+        backup_path: str | None = None
+        if applied_count > 0:
+            try:
+                backup_path = save_pcb(pcb_path, data)
+            except OSError as exc:
+                return {"error": f"Failed to write PCB file: {exc}"}
+
+        return {
+            "success": applied_count == len(results) and len(results) > 0,
+            "results": results,
+            "count": len(results),
+            "applied_count": applied_count,
+            "failure_count": len(results) - applied_count,
             "backup_path": backup_path,
             "pcb_path": pcb_path,
         }
-        if adjusted_position is not None:
-            result["status"] = "placed_at_adjusted_position"
-            result["requested_position"] = {"x": req_x, "y": req_y, "rotation": new_rot}
-        if collisions and force:
-            result["warnings"] = {
-                "courtyard_overlaps": collisions[0]["overlapping_with"],
-                "message": "Footprint placed successfully at the new position. Courtyard overlaps detected (force=True was used).",
-            }
-        return result
 
     @mcp.tool()
     async def flip_footprint(

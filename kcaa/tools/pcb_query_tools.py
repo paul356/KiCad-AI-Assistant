@@ -35,6 +35,11 @@ from kcaa.utils.pcb_footprint_utils import (
 from kcaa.utils.pcb_sexp_utils import load_pcb
 
 log = logging.getLogger(__name__)
+# Field-name sets for list-tool ``fields`` projection.  Unknown names are
+# rejected up front, never silently dropped.
+_FOOTPRINT_FIELDS = frozenset({"reference", "value", "x", "y", "rotation", "layer"})
+_NET_FIELDS = frozenset({"net_id", "name", "pad_count", "netclass", "type"})
+_VIA_FIELDS = frozenset({"x", "y", "diameter", "drill", "layers", "net"})
 
 
 def _collect_top_level_nets(data: list[Any]) -> tuple[dict[int, str], dict[str, int]]:
@@ -194,8 +199,14 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
         }
 
     @mcp.tool()
-    async def list_footprints(pcb_path: str, ctx: Context | None) -> dict[str, Any]:
-        """List all footprints placed on a KiCad PCB board.
+    async def list_footprints(
+        pcb_path: str,
+        ctx: Context | None,
+        ref_prefix: str | None = None,
+        bbox: list[float] | None = None,
+        fields: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """List footprints placed on a KiCad PCB board, optionally filtered.
 
         PCB coordinate convention (used by every PCB tool): millimetres,
         +X right, **+Y down** (KiCad PCB front-view coords), and rotation
@@ -206,12 +217,32 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
         Args:
             pcb_path: Absolute path to the .kicad_pcb file.
             ctx: MCP context for progress reporting.
+            ref_prefix: Only footprints whose reference starts with this
+                prefix (e.g. ``"R"`` for resistors, ``"J"`` for
+                connectors).
+            bbox: Optional ``[xmin, ymin, xmax, ymax]`` in world mm —
+                only footprints whose **anchor** lies inside the
+                rectangle are returned.
+            fields: Optional subset of ``["reference", "value", "x",
+                "y", "rotation", "layer"]`` to return per footprint
+                (default: all).  Unknown names are rejected.
 
         Returns:
             dict with footprints: list of {reference, value, x, y (mm,
-            world), rotation (deg, CCW+), layer (e.g. "F.Cu"/"B.Cu")},
-            count.
+            world), rotation (deg, CCW+), layer (e.g. "F.Cu"/"B.Cu")}
+            (or the requested subset), count.
         """
+        if fields is not None:
+            unknown = set(fields) - _FOOTPRINT_FIELDS
+            if unknown:
+                return {
+                    "error": (
+                        f"Unknown fields: {sorted(unknown)}. Valid: {sorted(_FOOTPRINT_FIELDS)}"
+                    )
+                }
+        if bbox is not None and len(bbox) != 4:
+            return {"error": "bbox must be [xmin, ymin, xmax, ymax] (4 numbers)"}
+
         data = load_pcb(pcb_path)
         footprints = []
 
@@ -222,16 +253,25 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
             value = get_fp_property(item, "Value") or ""
             x, y, rot = get_fp_at(item)
             layer = get_fp_layer(item) or ""
-            footprints.append(
-                {
-                    "reference": ref,
-                    "value": value,
-                    "x": x,
-                    "y": y,
-                    "rotation": rot,
-                    "layer": layer,
-                }
-            )
+
+            if ref_prefix is not None and not ref.startswith(ref_prefix):
+                continue
+            if bbox is not None:
+                xmin, ymin, xmax, ymax = bbox
+                if not (xmin <= x <= xmax and ymin <= y <= ymax):
+                    continue
+
+            entry = {
+                "reference": ref,
+                "value": value,
+                "x": x,
+                "y": y,
+                "rotation": rot,
+                "layer": layer,
+            }
+            if fields is not None:
+                entry = {k: entry[k] for k in fields}
+            footprints.append(entry)
 
         return {"footprints": footprints, "count": len(footprints)}
 
@@ -486,8 +526,11 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
         pcb_path: str,
         ctx: Context | None,
         classify: bool = False,
+        name_prefix: str | None = None,
+        netclass: str | None = None,
+        fields: list[str] | None = None,
     ) -> dict[str, Any]:
-        """List all nets in a KiCad PCB board.
+        """List nets in a KiCad PCB board, optionally filtered.
 
         When *classify* is ``True``, each net also includes its
         **netclass** (resolved from the matching ``.kicad_pro`` via
@@ -500,11 +543,26 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
             classify: When ``True``, also resolve netclass and type.
                 Requires a ``.kicad_pro`` next to the ``.kicad_pcb``.
                 Default ``False`` for efficiency.
+            name_prefix: Only nets whose name starts with this prefix
+                (e.g. ``"VCC_"``).
+            netclass: Only nets in this net class.  Implies resolving
+                netclass for the listed nets (like ``classify=True``).
+            fields: Optional subset of ``["net_id", "name",
+                "pad_count", "netclass", "type"]`` to return per net
+                (default: all).  Unknown names are rejected; requesting
+                ``"netclass"``/``"type"`` implies classification.
 
         Returns:
             dict with nets: list of {net_id, name, pad_count,
-             netclass (str or None), type (str or None)}.
+             netclass (str or None), type (str or None)} (or the requested
+             subset), count.
         """
+        if fields is not None:
+            unknown = set(fields) - _NET_FIELDS
+            if unknown:
+                return {
+                    "error": (f"Unknown fields: {sorted(unknown)}. Valid: {sorted(_NET_FIELDS)}")
+                }
         data = load_pcb(pcb_path)
 
         net_id_to_name, net_name_to_id = _collect_top_level_nets(data)
@@ -535,10 +593,22 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
                         entry["pad_count"] += 1
 
         # Optional: resolve netclass & type from .kicad_pro
-        if classify:
+        need_classify = (
+            classify
+            or netclass is not None
+            or (fields is not None and bool({"netclass", "type"} & set(fields)))
+        )
+        if need_classify:
             _resolve_net_data(nets_by_name, pcb_path)
 
         nets = sorted(nets_by_name.values(), key=_net_sort_key)
+
+        if name_prefix is not None:
+            nets = [n for n in nets if n["name"].startswith(name_prefix)]
+        if netclass is not None:
+            nets = [n for n in nets if n.get("netclass") == netclass]
+        if fields is not None:
+            nets = [{k: n[k] for k in fields} for n in nets]
 
         return {"nets": nets, "count": len(nets)}
 
@@ -1322,8 +1392,9 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
         pcb_path: str,
         ctx: Context | None = None,
         net: str | None = None,
+        fields: list[str] | None = None,
     ) -> dict[str, Any]:
-        """List all through-hole vias on the PCB, optionally filtered.
+        """List through-hole vias on the PCB, optionally filtered.
 
         Returns every ``(via ...)`` entry with its position, size,
         drill, layers, and net.  When ``net`` is provided, only
@@ -1333,10 +1404,20 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
             pcb_path: Absolute path to the .kicad_pcb file.
             ctx: MCP context (unused).
             net: Optional net name filter.
+            fields: Optional subset of ``["x", "y", "diameter",
+                "drill", "layers", "net"]`` to return per via (default:
+                all).  Unknown names are rejected.
 
         Returns:
             dict with ``vias`` (list of via dicts) and ``count``.
         """
+        if fields is not None:
+            unknown = set(fields) - _VIA_FIELDS
+            if unknown:
+                return {
+                    "error": (f"Unknown fields: {sorted(unknown)}. Valid: {sorted(_VIA_FIELDS)}")
+                }
+
         data = load_pcb(pcb_path)
 
         vias: list[dict[str, Any]] = []
@@ -1362,16 +1443,17 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
             if net is not None and item_net != net:
                 continue
 
-            vias.append(
-                {
-                    "x": vx,
-                    "y": vy,
-                    "diameter": vs,
-                    "drill": vd,
-                    "layers": via_layers,
-                    "net": item_net,
-                }
-            )
+            entry = {
+                "x": vx,
+                "y": vy,
+                "diameter": vs,
+                "drill": vd,
+                "layers": via_layers,
+                "net": item_net,
+            }
+            if fields is not None:
+                entry = {k: entry[k] for k in fields}
+            vias.append(entry)
 
         return {"vias": vias, "count": len(vias)}
 

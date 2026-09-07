@@ -1499,42 +1499,52 @@ def register_symbol_edit_tools(mcp: FastMCP) -> None:
     @mcp.tool()
     async def set_symbol_property(
         schematic_path: str,
-        reference: str,
+        references: list[str],
         property_name: str,
         property_value: str,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
-        """Set or add a property on a placed schematic component.
+        """Set or add a property on placed schematic components.
 
-        If the property already exists on the component it is updated
-        in-place.  If it does not exist a new property is created by
-        cloning the existing ``Value`` property entry and renaming it.
-        The operation is applied to every unit that shares the given
-        reference designator.  A backup (.kicad_sch.bak) is written
-        before saving.
+        Applies the same property to every reference in *references* in one
+        parse + one save (single ``.bak``).  If the property already exists
+        on a component it is updated in-place; otherwise a new property is
+        created by cloning the existing ``Value`` property entry and
+        renaming it.  The operation is applied to every unit that shares
+        the given reference designator.
+
+        Partial-apply: a reference that cannot be found keeps its own error
+        in ``results`` while the remaining references are still applied and
+        saved.  Duplicate or empty entries in *references* are rejected up
+        front.
 
         Args:
             schematic_path: Absolute path to the target .kicad_sch file.
-            reference: Reference designator of the component to modify
-                (e.g. "R1", "U3").
+            references: Reference designators of the components to modify
+                (e.g. ["R1", "U3"]).
             property_name: Name of the property to set or create
                 (e.g. "Value", "Footprint", "MPN", "Manufacturer").
             property_value: The new value string for the property.
                 An empty string is a valid value and is permitted.
 
         Returns:
-            dict with keys: success (bool), reference, property_name,
-            property_value, units_updated (int), units_where_added (int),
-            units_where_updated (int), action ("updated", "added", or
-            "mixed" when some units already had the property and others
-            did not).
+            dict with keys: success (bool — every target applied),
+            results (list of per-reference dicts: {reference, success,
+            units_updated, units_where_updated, units_where_added,
+            action} or {reference, error}), property_name,
+            property_value, count, applied_count, failure_count,
+            file_modified, backup_path.
         """
         if not schematic_path.endswith(".kicad_sch"):
             return {"error": f"Not a .kicad_sch file: {schematic_path!r}"}
         if not os.path.isfile(schematic_path):
             return {"error": f"Schematic file not found: {schematic_path!r}"}
-        if not reference:
-            return {"error": "reference must not be empty"}
+        if not references:
+            return {"error": "references must not be empty"}
+        if len(set(references)) != len(references):
+            return {"error": "references must not contain duplicates"}
+        if any(not ref for ref in references):
+            return {"error": "references must not contain empty designators"}
         if not property_name:
             return {"error": "property_name must not be empty"}
 
@@ -1544,32 +1554,34 @@ def register_symbol_edit_tools(mcp: FastMCP) -> None:
             return {"error": f"Failed to open schematic: {exc}"}
 
         try:
-            # Collect all units with the given reference.
-            units: list[Any] = []
-            try:
-                for sym in sch.symbol:
-                    try:
-                        if sym.property.Reference.value == reference:
-                            units.append(sym)
-                    except AttributeError:
-                        continue
-            except AttributeError:
-                pass
 
-            if not units:
-                return {"error": f"No symbol with reference {reference!r} found"}
+            def apply_one(ref: str) -> dict[str, Any]:
+                """Apply the property to every unit sharing *ref*."""
+                units: list[Any] = []
+                try:
+                    for sym in sch.symbol:
+                        try:
+                            if sym.property.Reference.value == ref:
+                                units.append(sym)
+                        except AttributeError:
+                            continue
+                except AttributeError:
+                    pass
 
-            updated_count = 0
-            added_count = 0
-            for sym in units:
-                existing = _find_property_by_name(sym, property_name)
-                if existing is not None:
-                    existing.value = property_value
-                    updated_count += 1
-                else:
-                    # Clone the Value property to create a new entry with the
-                    # correct structure (at, effects), then rename and set it.
-                    try:
+                if not units:
+                    return {"error": f"No symbol with reference {ref!r} found", "reference": ref}
+
+                updated_count = 0
+                added_count = 0
+                for sym in units:
+                    existing = _find_property_by_name(sym, property_name)
+                    if existing is not None:
+                        existing.value = property_value
+                        updated_count += 1
+                    else:
+                        # Clone the Value property to create a new entry with
+                        # the correct structure (at, effects), then rename
+                        # and set it.
                         new_prop = sym.property.Value.clone()
                         new_prop.name = property_name
                         new_prop.value = property_value
@@ -1589,34 +1601,49 @@ def register_symbol_edit_tools(mcp: FastMCP) -> None:
                                     child.append([sexpdata.Symbol("hide"), sexpdata.Symbol("yes")])
                                     break
                         added_count += 1
-                    except Exception as exc:
-                        return {
-                            "error": f"Failed to add property {property_name!r} on unit {sym.unit.value if hasattr(sym, 'unit') else '?'}: {exc}"
-                        }
 
-            if added_count > 0 and updated_count > 0:
-                action = "mixed"
-            elif added_count > 0:
-                action = "added"
-            else:
-                action = "updated"
+                if added_count > 0 and updated_count > 0:
+                    action = "mixed"
+                elif added_count > 0:
+                    action = "added"
+                else:
+                    action = "updated"
 
-            try:
-                save_schematic(schematic_path, sch)
-            except Exception as exc:
-                return {"error": f"Failed to save schematic: {exc}"}
+                return {
+                    "success": True,
+                    "reference": ref,
+                    "units_updated": len(units),
+                    "units_where_updated": updated_count,
+                    "units_where_added": added_count,
+                    "action": action,
+                }
+
+            results: list[dict[str, Any]] = []
+            for ref in references:
+                try:
+                    results.append(apply_one(ref))
+                except Exception as exc:
+                    log.warning("set_symbol_property: reference %r failed: %s", ref, exc)
+                    results.append({"error": f"{ref}: {exc}", "reference": ref})
+
+            applied_count = sum(1 for r in results if r.get("success"))
+
+            if applied_count > 0:
+                try:
+                    save_schematic(schematic_path, sch)
+                except Exception as exc:
+                    return {"error": f"Failed to save schematic: {exc}"}
 
             return {
-                "success": True,
-                "reference": reference,
+                "success": applied_count == len(results) and len(results) > 0,
+                "results": results,
                 "property_name": property_name,
                 "property_value": property_value,
-                "units_updated": len(units),
-                "units_where_updated": updated_count,
-                "units_where_added": added_count,
-                "action": action,
-                "file_modified": schematic_path,
-                "backup_path": schematic_path + ".bak",
+                "count": len(results),
+                "applied_count": applied_count,
+                "failure_count": len(results) - applied_count,
+                "file_modified": schematic_path if applied_count > 0 else None,
+                "backup_path": schematic_path + ".bak" if applied_count > 0 else None,
             }
 
         except Exception as exc:

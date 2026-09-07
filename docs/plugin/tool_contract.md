@@ -237,13 +237,15 @@ All tools in this group write a backup to `<schematic_path>.bak` before saving.
 
 ---
 
-#### `set_symbol_property(schematic_path, reference, property_name, property_value)`
+#### `set_symbol_property(schematic_path, references, property_name, property_value)`
 
-**Purpose:** Sets or creates a named property on a placed component (e.g. `"Footprint"`, `"Value"`, `"MPN"`).
+**Purpose:** Sets or creates a named property on one or more placed components (e.g. `"Footprint"`, `"Value"`, `"MPN"`). All references are processed in one parse and one save (single `.bak`). Partial-apply: a reference that errors (e.g. unknown designator) keeps a per-reference error while the remaining properties are still written. Duplicate or empty entries in `references` are rejected up front.
 
-**Key parameters:** All `str`. `property_name` is case-sensitive and must match the KiCad field name exactly.
+**Key parameters:**
+- `references` (`list[str]`) — one or more reference designators, e.g. `["R1", "R2"]`.
+- `property_name`, `property_value` (`str`) — `property_name` is case-sensitive and must match the KiCad field name exactly.
 
-**Success response:** `{"success": true, "reference": "U1", "property": "Footprint", "value": "..."}`
+**Success response:** `{"success": true, "results": [{"success": true, "reference": "R1", "units_updated": 1, "units_where_updated": 0, "units_where_added": 1, "action": "added", "saved": true}], "count": 1, "applied_count": 1, "failure_count": 0, "file_modified": "...", "backup_path": "..."}`
 
 ---
 

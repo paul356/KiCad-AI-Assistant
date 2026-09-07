@@ -370,15 +370,15 @@ class TestSetFootprintPosition:
             "set_footprint_position",
             {
                 "pcb_path": str(pcb),
-                "reference": "R1",
+                "references": ["R1"],
                 "x": 50.0,
                 "y": 60.0,
                 "rotation": None,
             },
         )
         assert "error" not in result, result
-        assert abs(result["placed_at"]["x"] - 50.0) < 0.001
-        assert abs(result["placed_at"]["y"] - 60.0) < 0.001
+        assert abs(result["results"][0]["placed_at"]["x"] - 50.0) < 0.001
+        assert abs(result["results"][0]["placed_at"]["y"] - 60.0) < 0.001
 
     def test_preserves_unchanged_axis(self, mcp_server, tmp_path):
         port, sid = mcp_server
@@ -390,7 +390,7 @@ class TestSetFootprintPosition:
             "set_footprint_position",
             {
                 "pcb_path": str(pcb),
-                "reference": "R1",
+                "references": ["R1"],
                 "x": 99.0,
                 "y": None,
                 "rotation": None,
@@ -398,7 +398,7 @@ class TestSetFootprintPosition:
         )
         assert "error" not in result
         # y must be unchanged from fixture value (20.0)
-        assert abs(result["placed_at"]["y"] - 20.0) < 0.001
+        assert abs(result["results"][0]["placed_at"]["y"] - 20.0) < 0.001
 
     def test_creates_backup_file(self, mcp_server, tmp_path):
         port, sid = mcp_server
@@ -410,7 +410,7 @@ class TestSetFootprintPosition:
             "set_footprint_position",
             {
                 "pcb_path": str(pcb),
-                "reference": "R1",
+                "references": ["R1"],
                 "x": 1.0,
                 "y": 1.0,
                 "rotation": None,
@@ -430,15 +430,87 @@ class TestSetFootprintPosition:
             "set_footprint_position",
             {
                 "pcb_path": str(pcb),
-                "reference": "R1",
+                "references": ["R1"],
                 "x": 5.0,
                 "y": 5.0,
                 "rotation": None,
             },
         )
         assert "error" not in result
-        assert abs(result["moved_from"]["x"] - 10.0) < 0.001
-        assert abs(result["moved_from"]["y"] - 20.0) < 0.001
+        assert abs(result["results"][0]["moved_from"]["x"] - 10.0) < 0.001
+        assert abs(result["results"][0]["moved_from"]["y"] - 20.0) < 0.001
+
+    def test_moves_multiple_footprints(self, mcp_server, tmp_path):
+        port, sid = mcp_server
+        pcb = tmp_path / "board.kicad_pcb"
+        shutil.copy2(BOARD_FIXTURE, pcb)
+        result = _call_tool(
+            port,
+            sid,
+            "set_footprint_position",
+            {
+                "pcb_path": str(pcb),
+                "references": ["R1", "C1"],
+                "x": 33.0,
+                "y": 44.0,
+                "rotation": None,
+            },
+        )
+        assert result.get("success") is True, result
+        assert result["applied_count"] == 2
+        assert result["failure_count"] == 0
+        assert result["results"][0]["reference"] == "R1"
+        assert result["results"][1]["reference"] == "C1"
+        assert abs(result["results"][0]["placed_at"]["x"] - 33.0) < 0.001
+        assert abs(result["results"][1]["placed_at"]["x"] - 33.0) < 0.001
+
+    def test_partial_apply_reports_per_ref_errors(self, mcp_server, tmp_path):
+        port, sid = mcp_server
+        pcb = tmp_path / "board.kicad_pcb"
+        shutil.copy2(BOARD_FIXTURE, pcb)
+        result = _call_tool(
+            port,
+            sid,
+            "set_footprint_position",
+            {
+                "pcb_path": str(pcb),
+                "references": ["R1", "U99"],
+                "x": 99.0,
+                "y": 88.0,
+                "rotation": None,
+            },
+        )
+        assert result.get("success") is False
+        assert result["applied_count"] == 1
+        assert result["failure_count"] == 1
+        placed = result["results"][0]
+        assert placed.get("success") is True
+        assert abs(placed["placed_at"]["x"] - 99.0) < 0.001
+        failed = result["results"][1]
+        assert "error" in failed
+        assert "U99" in failed["error"]
+        # The successful target really was saved: re-read through the MCP.
+        reread = _call_tool(port, sid, "get_footprint", {"pcb_path": str(pcb), "reference": "R1"})
+        assert abs(reread["x"] - 99.0) < 0.001
+
+    def test_duplicate_references_rejected(self, mcp_server, tmp_path):
+        port, sid = mcp_server
+        pcb = tmp_path / "board.kicad_pcb"
+        shutil.copy2(BOARD_FIXTURE, pcb)
+        result = _call_tool(
+            port,
+            sid,
+            "set_footprint_position",
+            {
+                "pcb_path": str(pcb),
+                "references": ["R1", "R1"],
+                "x": 1.0,
+                "y": 1.0,
+                "rotation": None,
+            },
+        )
+        assert "error" in result
+        assert "duplicates" in result["error"]
 
     def test_missing_reference_returns_error(self, mcp_server, tmp_path):
         port, sid = mcp_server
@@ -450,13 +522,16 @@ class TestSetFootprintPosition:
             "set_footprint_position",
             {
                 "pcb_path": str(pcb),
-                "reference": "U99",
+                "references": ["U99"],
                 "x": 1.0,
                 "y": 1.0,
                 "rotation": None,
             },
         )
-        assert "error" in result
+        assert result.get("success") is False, result
+        assert result["results"][0]["reference"] == "U99"
+        assert "error" in result["results"][0]
+        assert result["applied_count"] == 0
 
     def test_no_args_returns_error(self, mcp_server, tmp_path):
         port, sid = mcp_server
@@ -468,7 +543,7 @@ class TestSetFootprintPosition:
             "set_footprint_position",
             {
                 "pcb_path": str(pcb),
-                "reference": "R1",
+                "references": ["R1"],
                 "x": None,
                 "y": None,
                 "rotation": None,
@@ -556,14 +631,14 @@ class TestSetFootprintProperty:
             "set_footprint_property",
             {
                 "pcb_path": str(pcb),
-                "reference": "R1",
+                "references": ["R1"],
                 "property_name": "Value",
                 "value": "22k",
             },
         )
         assert "error" not in result, result
-        assert result.get("new_value") == "22k"
-        assert result.get("previous_value") == "10k"
+        assert result["results"][0]["new_value"] == "22k"
+        assert result["results"][0]["previous_value"] == "10k"
 
     def test_update_persists_to_file(self, mcp_server, tmp_path):
         """After set, re-reading the PCB should reflect the new value."""
@@ -576,7 +651,7 @@ class TestSetFootprintProperty:
             "set_footprint_property",
             {
                 "pcb_path": str(pcb),
-                "reference": "R1",
+                "references": ["R1"],
                 "property_name": "Value",
                 "value": "47k",
             },
@@ -594,12 +669,14 @@ class TestSetFootprintProperty:
             "set_footprint_property",
             {
                 "pcb_path": str(pcb),
-                "reference": "R1",
+                "references": ["R1"],
                 "property_name": "NonExistentProp",
                 "value": "x",
             },
         )
-        assert "error" in result
+        assert result.get("success") is False, result
+        assert "error" in result["results"][0]
+        assert "NonExistentProp" in result["results"][0]["error"]
 
     def test_missing_reference_returns_error(self, mcp_server, tmp_path):
         port, sid = mcp_server
@@ -611,12 +688,14 @@ class TestSetFootprintProperty:
             "set_footprint_property",
             {
                 "pcb_path": str(pcb),
-                "reference": "U99",
+                "references": ["U99"],
                 "property_name": "Value",
                 "value": "x",
             },
         )
-        assert "error" in result
+        assert result.get("success") is False, result
+        assert result["results"][0]["reference"] == "U99"
+        assert "error" in result["results"][0]
 
 
 # ---------------------------------------------------------------------------

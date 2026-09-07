@@ -168,6 +168,34 @@ class TestListFootprints:
         j1 = next(fp for fp in result["footprints"] if fp["reference"] == "J1")
         assert j1["layer"] == "B.Cu"
 
+    def test_filter_by_ref_prefix(self, tools):
+        result = _run(tools["list_footprints"](pcb_path=BOARD_FIXTURE, ctx=None, ref_prefix="R"))
+        refs = {fp["reference"] for fp in result["footprints"]}
+        assert refs == {"R1"}
+
+    def test_filter_by_bbox(self, tools):
+        result = _run(
+            tools["list_footprints"](pcb_path=BOARD_FIXTURE, ctx=None, bbox=[9.5, 19.5, 10.5, 20.5])
+        )
+        refs = {fp["reference"] for fp in result["footprints"]}
+        assert refs == {"R1"}
+
+    def test_fields_projection(self, tools):
+        result = _run(
+            tools["list_footprints"](pcb_path=BOARD_FIXTURE, ctx=None, fields=["reference", "x"])
+        )
+        for fp in result["footprints"]:
+            assert set(fp) == {"reference", "x"}
+
+    def test_unknown_field_rejected(self, tools):
+        result = _run(tools["list_footprints"](pcb_path=BOARD_FIXTURE, ctx=None, fields=["bogus"]))
+        assert "error" in result
+        assert "bogus" in result["error"]
+
+    def test_bbox_length_rejected(self, tools):
+        result = _run(tools["list_footprints"](pcb_path=BOARD_FIXTURE, ctx=None, bbox=[1, 2, 3]))
+        assert "error" in result
+
 
 class TestGetFootprint:
     def test_returns_footprint_details(self, tools):
@@ -256,6 +284,22 @@ class TestListNets:
         assert names == {"VCC", "GND", "NET_A"}
         gnd = next(n for n in result["nets"] if n["name"] == "GND")
         assert gnd["pad_count"] > 0
+
+    def test_filter_by_name_prefix(self, tools):
+        result = _run(tools["list_nets"](pcb_path=BOARD_FIXTURE, ctx=None, name_prefix="V"))
+        assert {n["name"] for n in result["nets"]} == {"VCC"}
+
+    def test_fields_projection(self, tools):
+        result = _run(
+            tools["list_nets"](pcb_path=BOARD_FIXTURE, ctx=None, fields=["name", "pad_count"])
+        )
+        for n in result["nets"]:
+            assert set(n) == {"name", "pad_count"}
+
+    def test_unknown_field_rejected(self, tools):
+        result = _run(tools["list_nets"](pcb_path=BOARD_FIXTURE, ctx=None, fields=["bogus"]))
+        assert "error" in result
+        assert "bogus" in result["error"]
 
 
 class TestGetRatsnest:
@@ -368,6 +412,16 @@ class TestListVias:
         assert result["count"] == 1
         assert result["vias"][0]["net"] == "VCC"
 
+    def test_fields_projection(self, tools, board_with_tracks):
+        result = _run(tools["list_vias"](pcb_path=board_with_tracks, ctx=None, fields=["net", "x"]))
+        for v in result["vias"]:
+            assert set(v) == {"net", "x"}
+
+    def test_unknown_field_rejected(self, tools, board_with_tracks):
+        result = _run(tools["list_vias"](pcb_path=board_with_tracks, ctx=None, fields=["bogus"]))
+        assert "error" in result
+        assert "bogus" in result["error"]
+
 
 class TestGetFootprintPadSize:
     def test_pad_includes_size_fields(self, tools):
@@ -431,6 +485,33 @@ class TestListNetsClassify:
         assert nets["GND"]["type"] == "ground"
         assert nets["NET_A"]["netclass"] is None
         assert nets["NET_A"]["type"] == "signal"
+
+    def test_netclass_filter_implies_classification(self, tools, tmp_path):
+        dest = tmp_path / "test.kicad_pcb"
+        shutil.copy(BOARD_FIXTURE, dest)
+        pro = {
+            "net_settings": {
+                "classes": [{"name": "Power", "clearance": 0.3, "track_width": 0.5}],
+                "netclass_patterns": [{"netclass": "Power", "pattern": "VCC"}],
+            }
+        }
+        import json
+
+        pro_path = tmp_path / "test.kicad_pro"
+        with open(pro_path, "w") as f:
+            json.dump(pro, f)
+
+        result = _run(tools["list_nets"](pcb_path=str(dest), ctx=None, netclass="Power"))
+        assert {n["name"] for n in result["nets"]} == {"VCC"}
+
+        # fields=["name", "netclass"] without classify still resolves netclass
+        result2 = _run(
+            tools["list_nets"](pcb_path=str(dest), ctx=None, fields=["name", "netclass"])
+        )
+        for n in result2["nets"]:
+            assert set(n) == {"name", "netclass"}
+        by_name = {n["name"]: n for n in result2["nets"]}
+        assert by_name["VCC"]["netclass"] == "Power"
 
 
 class TestGetRatsnestZoneCoverage:

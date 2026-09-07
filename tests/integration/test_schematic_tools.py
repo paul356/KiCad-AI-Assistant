@@ -544,7 +544,7 @@ class TestSetComponentProperty:
             "set_symbol_property",
             {
                 "schematic_path": sch,
-                "reference": "R1",
+                "references": ["R1"],
                 "property_name": "Value",
                 "property_value": "22k",
             },
@@ -561,7 +561,7 @@ class TestSetComponentProperty:
             "set_symbol_property",
             {
                 "schematic_path": sch,
-                "reference": "R1",
+                "references": ["R1"],
                 "property_name": "Value",
                 "property_value": "47k",
             },
@@ -579,6 +579,55 @@ class TestSetComponentProperty:
         val_prop = next(p for p in result["properties"] if p["name"] == "Value")
         assert val_prop["value"] == "47k"
 
+    def test_partial_apply_with_missing_reference(self, mcp_server, tmp_path):
+        port, sid = mcp_server
+        sch = _copy_sch(tmp_path)
+        result = _call_tool(
+            port,
+            sid,
+            "set_symbol_property",
+            {
+                "schematic_path": sch,
+                "references": ["R1", "Z99"],
+                "property_name": "Value",
+                "property_value": "22k",
+            },
+        )
+        assert result.get("success") is False
+        assert result["applied_count"] == 1
+        assert result["failure_count"] == 1
+        assert result["results"][0]["reference"] == "R1"
+        assert result["results"][0]["action"] == "updated"
+        failed = result["results"][1]
+        assert failed["reference"] == "Z99"
+        assert "error" in failed
+        # The successful target was saved: R1 now shows 22k.
+        listed = _call_tool(
+            port,
+            sid,
+            "list_symbol_properties",
+            {"schematic_path": sch, "reference": "R1"},
+        )
+        val_prop = next(p for p in listed["properties"] if p["name"] == "Value")
+        assert val_prop["value"] == "22k"
+
+    def test_duplicate_references_rejected(self, mcp_server, tmp_path):
+        port, sid = mcp_server
+        sch = _copy_sch(tmp_path)
+        result = _call_tool(
+            port,
+            sid,
+            "set_symbol_property",
+            {
+                "schematic_path": sch,
+                "references": ["R1", "R1"],
+                "property_name": "Value",
+                "property_value": "22k",
+            },
+        )
+        assert "error" in result
+        assert "duplicates" in result["error"]
+
     def test_nonexistent_reference_returns_error(self, mcp_server, tmp_path):
         port, sid = mcp_server
         sch = _copy_sch(tmp_path)
@@ -588,12 +637,14 @@ class TestSetComponentProperty:
             "set_symbol_property",
             {
                 "schematic_path": sch,
-                "reference": "U99",
+                "references": ["U99"],
                 "property_name": "Value",
                 "property_value": "x",
             },
         )
-        assert "error" in result
+        assert result.get("success") is False, result
+        assert result["results"][0]["reference"] == "U99"
+        assert "error" in result["results"][0]
 
 
 class TestRemoveSymbolFromSchematic:

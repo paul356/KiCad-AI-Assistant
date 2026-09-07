@@ -68,7 +68,7 @@ class TestSetFootprintPosition:
     def test_moves_xy(self, tools, board_copy):
         result = _run(
             tools["set_footprint_position"](
-                pcb_path=board_copy, reference="R1", x=99.0, y=88.0, rotation=None, ctx=None
+                pcb_path=board_copy, references=["R1"], x=99.0, y=88.0, rotation=None, ctx=None
             )
         )
         assert "error" not in result
@@ -81,7 +81,7 @@ class TestSetFootprintPosition:
     def test_updates_rotation(self, tools, board_copy):
         result = _run(
             tools["set_footprint_position"](
-                pcb_path=board_copy, reference="R1", x=None, y=None, rotation=45.0, ctx=None
+                pcb_path=board_copy, references=["R1"], x=None, y=None, rotation=45.0, ctx=None
             )
         )
         assert "error" not in result
@@ -97,7 +97,7 @@ class TestSetFootprintPosition:
 
         _run(
             tools["set_footprint_position"](
-                pcb_path=board_copy, reference="R1", x=5.0, y=None, rotation=None, ctx=None
+                pcb_path=board_copy, references=["R1"], x=5.0, y=None, rotation=None, ctx=None
             )
         )
         data = load_pcb(board_copy)
@@ -110,7 +110,7 @@ class TestSetFootprintPosition:
     def test_creates_backup(self, tools, board_copy):
         result = _run(
             tools["set_footprint_position"](
-                pcb_path=board_copy, reference="R1", x=1.0, y=2.0, rotation=None, ctx=None
+                pcb_path=board_copy, references=["R1"], x=1.0, y=2.0, rotation=None, ctx=None
             )
         )
         assert "error" not in result
@@ -119,16 +119,17 @@ class TestSetFootprintPosition:
     def test_error_on_missing_reference(self, tools, board_copy):
         result = _run(
             tools["set_footprint_position"](
-                pcb_path=board_copy, reference="U99", x=1.0, y=None, rotation=None, ctx=None
+                pcb_path=board_copy, references=["U99"], x=1.0, y=None, rotation=None, ctx=None
             )
         )
-        assert "error" in result
-        assert "U99" in result["error"]
+        assert result.get("success") is False, result
+        assert result["results"][0]["reference"] == "U99"
+        assert "error" in result["results"][0]
 
     def test_error_when_no_coords_given(self, tools, board_copy):
         result = _run(
             tools["set_footprint_position"](
-                pcb_path=board_copy, reference="R1", x=None, y=None, rotation=None, ctx=None
+                pcb_path=board_copy, references=["R1"], x=None, y=None, rotation=None, ctx=None
             )
         )
         assert "error" in result
