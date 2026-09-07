@@ -170,12 +170,14 @@ rotation plus the footprint rotation (verify which KiCad actually applies).
 
 ## Batch support for set_*/list_* tools
 
-**Status:** implemented (2026-09-07) — set/list/get tools batched
+**Status:** implemented (2026-09-07) — set/get tools batched;
+`list_footprints` gains only a `ref_prefix` row filter
 (`set_symbol_property`, `set_footprint_position`, `set_footprint_property`),
-partial-apply per-ref results; list filters on `list_footprints` /
-`list_nets` / `list_vias` with unknown-field rejection; `list_tracks`
-keeps `net`+`layer` filters only (projection skipped; grouping makes it
-ambiguous). `set_net_class_rules` stays single-class; `set_design_rules` /
+partial-apply per-ref results; get reads (`get_footprint`,
+`get_footprint_bbox`, `list_symbol_properties`) take
+`references: list[str]`.  `list_nets`/`list_vias`/`list_tracks` unchanged
+(bbox/fields projections dropped 2026-09-07 as too complex for the
+payoff). `set_net_class_rules` stays single-class; `set_design_rules` /
 `set_board_outline_rect` non-per-object, out of scope.
 
 ### Current state
@@ -216,14 +218,10 @@ retained per maintainer decision)
    failures keep their per-ref error — per `docs/plugin/mutation_safety.md`).
    Duplicate references or unknown item fields are rejected.
    `set_net_class_rules` stays single-class.
-2. List tools get named query params, default `None` = current output:
-   - `list_footprints(ref_prefix, bbox=[xmin,ymin,xmax,ymax], fields)`
-   - `list_nets(name_prefix, netclass, fields)` — `netclass` filter
-     implies classify resolution
-   - `list_vias(fields)`
-   - `list_tracks` already filters by `net`+`layer`; fields projection
-     skipped there (trace/segment grouping makes projection ambiguous).
-   Unknown field names are rejected, not silently dropped.
+2. List tools stay lean (decided 2026-09-07 — filters/fields projection
+   judged too complex for the payoff): only `list_footprints` gains an
+   optional `ref_prefix` row filter (default `None` = all footprints).
+   `list_nets` (`classify`) and `list_vias` (`net`) are unchanged.
 3. Per-object read tools batch too: `references: list[str]` replaces the
    single `reference` on `get_footprint`, `get_footprint_bbox`
    (`pcb_query_tools.py`) and `list_symbol_properties`
@@ -235,8 +233,7 @@ retained per maintainer decision)
 
 - Unit: batch `set_symbol_property` over refs incl. one missing → one
   save, successes applied, per-ref errors reported; duplicate refs
-  rejected; `list_footprints` bbox/ref_prefix/fields; `list_nets`
-  netclass filter implies classification; `list_vias` fields.
+  rejected; `list_footprints` `ref_prefix` row filter.
 - Manual: script a 20-object edit against a board, compare tool calls
   and response size vs. today.
 
