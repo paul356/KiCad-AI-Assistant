@@ -219,6 +219,9 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
             world), rotation (deg, CCW+), layer (e.g. "F.Cu"/"B.Cu")},
             count.
         """
+        if ref_prefix is not None and not isinstance(ref_prefix, str):
+            return {"error": "ref_prefix must be a string"}
+
         data = load_pcb(pcb_path)
         footprints = []
 
@@ -226,12 +229,11 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
             if not (isinstance(item, list) and len(item) > 0 and _sym(item[0]) == "footprint"):
                 continue
             ref = get_fp_property(item, "Reference") or ""
+            if ref_prefix is not None and not ref.startswith(ref_prefix):
+                continue
             value = get_fp_property(item, "Value") or ""
             x, y, rot = get_fp_at(item)
             layer = get_fp_layer(item) or ""
-
-            if ref_prefix is not None and not ref.startswith(ref_prefix):
-                continue
 
             footprints.append(
                 {

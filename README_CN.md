@@ -286,7 +286,7 @@ kcaa
 
 | 工具 | 说明 |
 |------|------|
-| `set_footprint_position` | 移动/旋转单个封装 |
+| `set_footprint_position` | 批量移动/旋转一个或多个封装 |
 | `flip_footprint` | 将封装在顶层/底层之间翻转 |
 | `align_footprints` | 将封装对齐到同一坐标轴 |
 | `distribute_footprints` | 沿坐标轴等间距分布封装 |

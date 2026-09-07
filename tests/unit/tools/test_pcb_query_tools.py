@@ -256,6 +256,15 @@ class TestGetFootprintBbox:
             assert "reference" in entry
             assert ("bbox" in entry) or ("error" in entry)
 
+    def test_duplicate_references_rejected(self, tools, board_with_outline_copy):
+        result = _run(
+            tools["get_footprint_bbox"](
+                pcb_path=board_with_outline_copy, references=["R1", "R1"], ctx=None
+            )
+        )
+        assert "error" in result
+        assert "duplicate" in result["error"]
+
 
 class TestGetBoardBoundingBox:
     def test_returns_bbox_covering_all_fps(self, tools, board_with_outline_copy):

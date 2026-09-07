@@ -306,3 +306,52 @@ class TestSetFootprintProperty:
         assert result.get("success") is False, result
         assert "error" in result["results"][0]
         assert "NoSuchProp" in result["results"][0]["error"]
+
+    def test_unknown_item_field_rejected(self, tools, board_copy):
+        result = _run(
+            tools["set_footprint_property"](
+                pcb_path=board_copy,
+                items=[{"reference": "R1", "property_name": "Value", "value": "22k", "bogus": 1}],
+                ctx=None,
+            )
+        )
+        assert "error" in result
+        assert "bogus" in result["error"]
+
+    def test_duplicate_references_rejected(self, tools, board_copy):
+        result = _run(
+            tools["set_footprint_property"](
+                pcb_path=board_copy,
+                items=[
+                    {"reference": "R1", "property_name": "Value", "value": "22k"},
+                    {"reference": "R1", "property_name": "Value", "value": "33k"},
+                ],
+                ctx=None,
+            )
+        )
+        assert "error" in result
+        assert "duplicate" in result["error"]
+
+    def test_mixed_batch_partial_apply(self, tools, board_copy):
+        """One missing footprint fails per-item while the valid one is saved."""
+        result = _run(
+            tools["set_footprint_property"](
+                pcb_path=board_copy,
+                items=[
+                    {"reference": "R1", "property_name": "Value", "value": "22k"},
+                    {"reference": "U99", "property_name": "Value", "value": "x"},
+                ],
+                ctx=None,
+            )
+        )
+        assert result["success"] is False
+        assert result["applied_count"] == 1
+        assert result["failure_count"] == 1
+        assert "error" in result["results"][1]
+        assert result["backup_path"] is not None
+
+        from kcaa.utils.pcb_footprint_utils import find_footprint, get_fp_property
+        from kcaa.utils.pcb_sexp_utils import load_pcb
+
+        data = load_pcb(board_copy)
+        assert get_fp_property(find_footprint(data, "R1"), "Value") == "22k"

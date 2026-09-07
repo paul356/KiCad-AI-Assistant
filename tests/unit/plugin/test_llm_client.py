@@ -491,7 +491,10 @@ class TestRunIntegration:
                         "function": {
                             "name": "set_footprint_position",
                             "arguments": json.dumps(
-                                {"pcb_path": "/tmp/board.kicad_pcb", "reference": "R1", "x": 1.0}
+                                {
+                                    "pcb_path": "/tmp/board.kicad_pcb",
+                                    "items": [{"reference": "R1", "x": 1.0}],
+                                }
                             ),
                         },
                     }
@@ -522,7 +525,7 @@ class TestRunIntegration:
                 (
                     client._mcp_base_url,
                     "set_footprint_position",
-                    {"pcb_path": "/tmp/board.kicad_pcb", "reference": "R1", "x": 1.0},
+                    {"pcb_path": "/tmp/board.kicad_pcb", "items": [{"reference": "R1", "x": 1.0}]},
                 ),
             ),
             ((client._mcp_base_url, "reload_kicad", {"paths": ["/tmp/board.kicad_pcb"]}),),
@@ -607,7 +610,10 @@ class TestRunIntegration:
                         "function": {
                             "name": "set_footprint_position",
                             "arguments": json.dumps(
-                                {"pcb_path": "/tmp/board.kicad_pcb", "reference": "R1", "x": 1.0}
+                                {
+                                    "pcb_path": "/tmp/board.kicad_pcb",
+                                    "items": [{"reference": "R1", "x": 1.0}],
+                                }
                             ),
                         },
                     }
@@ -648,7 +654,10 @@ class TestRunIntegration:
                         "function": {
                             "name": "set_footprint_position",
                             "arguments": json.dumps(
-                                {"pcb_path": "/tmp/board.kicad_pcb", "reference": "R1", "x": 1.0}
+                                {
+                                    "pcb_path": "/tmp/board.kicad_pcb",
+                                    "items": [{"reference": "R1", "x": 1.0}],
+                                }
                             ),
                         },
                     }
@@ -689,7 +698,10 @@ class TestRunIntegration:
                         "function": {
                             "name": "set_footprint_position",
                             "arguments": json.dumps(
-                                {"pcb_path": "/tmp/board.kicad_pcb", "reference": "R1", "x": 1.0}
+                                {
+                                    "pcb_path": "/tmp/board.kicad_pcb",
+                                    "items": [{"reference": "R1", "x": 1.0}],
+                                }
                             ),
                         },
                     },
@@ -742,7 +754,10 @@ class TestRunIntegration:
                         "function": {
                             "name": "set_footprint_position",
                             "arguments": json.dumps(
-                                {"pcb_path": "/tmp/board.kicad_pcb", "reference": "R1", "x": 1.0}
+                                {
+                                    "pcb_path": "/tmp/board.kicad_pcb",
+                                    "items": [{"reference": "R1", "x": 1.0}],
+                                }
                             ),
                         },
                     },
@@ -786,7 +801,7 @@ class TestRunIntegration:
                 (
                     client._mcp_base_url,
                     "set_footprint_position",
-                    {"pcb_path": "/tmp/board.kicad_pcb", "reference": "R1", "x": 1.0},
+                    {"pcb_path": "/tmp/board.kicad_pcb", "items": [{"reference": "R1", "x": 1.0}]},
                 ),
             ),
             (
@@ -828,7 +843,10 @@ class TestRunIntegration:
                         "function": {
                             "name": "set_footprint_position",
                             "arguments": json.dumps(
-                                {"pcb_path": "/tmp/board.kicad_pcb", "reference": "R1", "x": 1.0}
+                                {
+                                    "pcb_path": "/tmp/board.kicad_pcb",
+                                    "items": [{"reference": "R1", "x": 1.0}],
+                                }
                             ),
                         },
                     }
@@ -859,7 +877,7 @@ class TestRunIntegration:
                 (
                     client._mcp_base_url,
                     "set_footprint_position",
-                    {"pcb_path": "/tmp/board.kicad_pcb", "reference": "R1", "x": 1.0},
+                    {"pcb_path": "/tmp/board.kicad_pcb", "items": [{"reference": "R1", "x": 1.0}]},
                 ),
             ),
             ((client._mcp_base_url, "reload_kicad", {"paths": ["/tmp/board.kicad_pcb"]}),),
@@ -878,7 +896,10 @@ class TestRunIntegration:
                         "function": {
                             "name": "set_footprint_position",
                             "arguments": json.dumps(
-                                {"pcb_path": "/tmp/board.kicad_pcb", "reference": "R1", "x": 1.0}
+                                {
+                                    "pcb_path": "/tmp/board.kicad_pcb",
+                                    "items": [{"reference": "R1", "x": 1.0}],
+                                }
                             ),
                         },
                     }

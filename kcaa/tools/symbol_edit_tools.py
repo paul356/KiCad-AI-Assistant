@@ -1643,6 +1643,17 @@ def register_symbol_edit_tools(mcp: FastMCP) -> None:
 
             applied_count = sum(1 for r in results if r.get("success"))
 
+            if applied_count < len(results):
+                # A failed item may have partially mutated the in-memory tree
+                # before raising (clone() attaches the new property, then the
+                # rename/hide steps could fail).  Rebuild from the pristine
+                # file and re-apply only the successful items so a reported
+                # failure never persists (partial-apply contract).
+                sch = safe_schematic(schematic_path)
+                for r, item in zip(results, items):
+                    if r.get("success"):
+                        apply_one(item["reference"], item["property_name"], item["property_value"])
+
             if applied_count > 0:
                 try:
                     save_schematic(schematic_path, sch)

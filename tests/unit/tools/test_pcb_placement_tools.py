@@ -18,6 +18,7 @@ from kcaa.utils.pcb_sexp_utils import load_pcb
 FIXTURE_DIR = os.path.join(os.path.dirname(__file__), "fixtures")
 BOARD_FIXTURE = os.path.join(FIXTURE_DIR, "test_board.kicad_pcb")
 BOARD_WITH_OUTLINE_FIXTURE = os.path.join(FIXTURE_DIR, "test_board_with_outline.kicad_pcb")
+GROUP_PLACEMENT_FIXTURE = os.path.join(FIXTURE_DIR, "test_group_placement.kicad_pcb")
 
 
 class _MockMCP:
@@ -57,6 +58,14 @@ def board_copy(tmp_path):
 def board_with_outline_copy(tmp_path):
     dest = tmp_path / "board_with_outline.kicad_pcb"
     shutil.copy(BOARD_WITH_OUTLINE_FIXTURE, dest)
+    return str(dest)
+
+
+@pytest.fixture
+def group_board_copy(tmp_path):
+    """Board with courtyard geometry (0603/SOD-123/USB-C), for collision tests."""
+    dest = tmp_path / "group_placement.kicad_pcb"
+    shutil.copy(GROUP_PLACEMENT_FIXTURE, dest)
     return str(dest)
 
 
@@ -145,6 +154,83 @@ class TestSetFootprintPosition:
             )
         )
         assert "error" in result
+
+    def test_unknown_item_field_rejected(self, tools, board_copy):
+        result = _run(
+            tools["set_footprint_position"](
+                pcb_path=board_copy,
+                items=[{"reference": "R1", "x": 1.0, "bogus": 1}],
+                ctx=None,
+            )
+        )
+        assert "error" in result
+        assert "bogus" in result["error"]
+
+    def test_non_numeric_coordinate_rejected_upfront(self, tools, board_copy):
+        result = _run(
+            tools["set_footprint_position"](
+                pcb_path=board_copy,
+                items=[{"reference": "R1", "x": "10"}],
+                ctx=None,
+            )
+        )
+        assert "error" in result
+        assert "non-numeric" in result["error"]
+
+    def test_force_false_adjusts_to_free_spot(self, tools, group_board_copy):
+        """Moving R1 onto R2's anchor collides; force=False auto-adjusts to
+        the nearest collision-free position."""
+        result = _run(
+            tools["set_footprint_position"](
+                pcb_path=group_board_copy,
+                items=[{"reference": "R1", "x": 96.52, "y": 90.17, "rotation": None}],
+                ctx=None,
+                force=False,
+            )
+        )
+        assert result.get("success") is True, result
+        entry = result["results"][0]
+        assert entry["status"] == "placed_at_adjusted_position"
+        assert entry["requested_position"]["x"] == pytest.approx(96.52)
+        assert entry["requested_position"]["y"] == pytest.approx(90.17)
+        assert entry["placed_at"]["x"] != pytest.approx(96.52) or entry["placed_at"][
+            "y"
+        ] != pytest.approx(90.17)
+
+    def test_force_true_places_with_warning(self, tools, group_board_copy):
+        result = _run(
+            tools["set_footprint_position"](
+                pcb_path=group_board_copy,
+                items=[{"reference": "R1", "x": 96.52, "y": 90.17, "rotation": None}],
+                ctx=None,
+                force=True,
+            )
+        )
+        assert result.get("success") is True, result
+        entry = result["results"][0]
+        assert entry["status"] == "placed"
+        assert "warnings" in entry
+        assert entry["warnings"]["courtyard_overlaps"]
+
+    def test_force_false_no_free_spot_returns_error(self, tools, group_board_copy, monkeypatch):
+        """No free spot within the search radius -> footprint is NOT moved."""
+        import kcaa.tools.pcb_placement_tools as placement_tools
+
+        monkeypatch.setattr(placement_tools, "find_nearest_free_position", lambda *a, **k: None)
+        result = _run(
+            tools["set_footprint_position"](
+                pcb_path=group_board_copy,
+                items=[{"reference": "R1", "x": 96.52, "y": 90.17, "rotation": None}],
+                ctx=None,
+                force=False,
+            )
+        )
+        assert result["failure_count"] == 1
+        assert "error" in result["results"][0]
+        data = load_pcb(group_board_copy)
+        x, y, _ = get_fp_at(find_footprint(data, "R1"))
+        assert x == pytest.approx(106.68)
+        assert y == pytest.approx(80.01)
 
 
 class TestFlipFootprint:

@@ -287,7 +287,7 @@ kcaa
 
 | Tool | Description |
 |------|-------------|
-| `set_footprint_position` | Move and/or rotate a single footprint |
+| `set_footprint_position` | Move and/or rotate one or more footprints (via `items`) |
 | `flip_footprint` | Flip a footprint between top and bottom layer |
 | `align_footprints` | Align footprints to the same axis |
 | `distribute_footprints` | Distribute footprints evenly along an axis |

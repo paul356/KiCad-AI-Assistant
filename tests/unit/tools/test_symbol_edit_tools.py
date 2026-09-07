@@ -606,6 +606,82 @@ class TestSetComponentProperty:
         )
         assert "error" in result
 
+    def test_unknown_item_field_rejected(self, tools, tmp_sch):
+        result = asyncio.run(
+            tools["set_symbol_property"](
+                schematic_path=tmp_sch,
+                items=[
+                    {
+                        "reference": "R1",
+                        "property_name": "Value",
+                        "property_value": "1k",
+                        "bogus": 1,
+                    }
+                ],
+            )
+        )
+        assert "error" in result
+        assert "bogus" in result["error"]
+
+    def test_partial_mutation_rolled_back_on_failure(self, tools, tmp_sch, monkeypatch):
+        """If applying an item fails mid-way, its partial tree mutation must
+        not reach the saved file (partial-apply contract)."""
+        import kcaa.tools.symbol_edit_tools as sym_tools
+
+        real_safe = sym_tools.safe_schematic
+        calls = {"n": 0}
+
+        def fake_safe(path):
+            calls["n"] += 1
+            sch = real_safe(path)
+            if calls["n"] == 1:
+                # First parse: make R2's clone SUCCEED (attaching a property
+                # to the tree — a genuine partial mutation) and then raise.
+                for sym in sch.symbol:
+                    try:
+                        if sym.property.Reference.value == "R2":
+                            orig_clone = sym.property.Value.clone
+
+                            def bad_clone(_orig_clone=orig_clone, *a, **k):
+                                _orig_clone(*a, **k)
+                                raise RuntimeError("simulated post-clone failure")
+
+                            sym.property.Value.clone = bad_clone
+                            break
+                    except AttributeError:
+                        continue
+            return sch
+
+        monkeypatch.setattr(sym_tools, "safe_schematic", fake_safe)
+
+        result = asyncio.run(
+            tools["set_symbol_property"](
+                schematic_path=tmp_sch,
+                items=[
+                    {"reference": "R1", "property_name": "Value", "property_value": "22k"},
+                    {"reference": "R2", "property_name": "MPN", "property_value": "X1"},
+                ],
+            )
+        )
+        assert result["applied_count"] == 1, result
+        assert result["failure_count"] == 1, result
+        assert "error" in result["results"][1]
+
+        # The written file must contain R1's change but NOT the failed
+        # item's partial residue (no stray duplicate Value/MPN on R2).
+        sch = skip.Schematic(tmp_sch)
+        for sym in sch.symbol:
+            try:
+                ref = sym.property.Reference.value
+            except AttributeError:
+                continue
+            if ref == "R1":
+                assert sym.property.Value.value == "22k"
+            elif ref == "R2":
+                names = [p.children[0] for p in sym.property]
+                assert names.count("Value") == 1, names
+                assert "MPN" not in names
+
     def test_invalid_extension_returns_error(self, tools):
         """A non-.kicad_sch path should be rejected immediately."""
         result = asyncio.run(

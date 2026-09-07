@@ -65,8 +65,9 @@ def register_pcb_placement_tools(mcp: FastMCP) -> None:
         the batch (earlier items in this call have already been moved).
         Partial-apply: a footprint that cannot be found or placed keeps its
         own error in ``results`` while the remaining footprints are still
-        applied and saved.  Empty, duplicate, or malformed items are
-        rejected up front.
+        applied and saved.  Empty or duplicate items are rejected up
+        front, and malformed items (non-numeric coordinates) are
+        rejected before anything is applied.
 
         Args:
             pcb_path: Absolute path to the .kicad_pcb file.
@@ -115,6 +116,10 @@ def register_pcb_placement_tools(mcp: FastMCP) -> None:
                 return {"error": "items must not contain empty or missing references"}
             if all(item.get(key) is None for key in ("x", "y", "rotation")):
                 return {"error": f"Item for '{ref}' must provide at least one of x, y, rotation"}
+            for key in ("x", "y", "rotation"):
+                val = item.get(key)
+                if val is not None and not isinstance(val, int | float):
+                    return {"error": f"Item for '{ref}' has non-numeric {key}: {val!r}"}
         refs = [item["reference"] for item in items]
         if len(set(refs)) != len(refs):
             return {"error": "items must not contain duplicate references"}
@@ -190,7 +195,16 @@ def register_pcb_placement_tools(mcp: FastMCP) -> None:
             try:
                 backup_path = save_pcb(pcb_path, data)
             except OSError as exc:
-                return {"error": f"Failed to write PCB file: {exc}"}
+                return {
+                    "error": f"Failed to write PCB file: {exc}",
+                    "success": False,
+                    "results": results,
+                    "count": len(results),
+                    "applied_count": applied_count,
+                    "failure_count": len(results) - applied_count,
+                    "backup_path": None,
+                    "pcb_path": pcb_path,
+                }
 
         return {
             "success": applied_count == len(results) and len(results) > 0,
