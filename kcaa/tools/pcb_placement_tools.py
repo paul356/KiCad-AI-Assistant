@@ -30,10 +30,7 @@ def register_pcb_placement_tools(mcp: FastMCP) -> None:
     @mcp.tool()
     async def set_footprint_position(
         pcb_path: str,
-        references: list[str],
-        x: float | None,
-        y: float | None,
-        rotation: float | None,
+        items: list[dict[str, Any]],
         ctx: Context | None,
         force: bool = False,
     ) -> dict[str, Any]:
@@ -46,8 +43,10 @@ def register_pcb_placement_tools(mcp: FastMCP) -> None:
         already aligned to your board grid (typical SMD work uses
         0.1 mm or 0.05 mm; through-hole often 1.27 mm / 50 mil).
 
-        Any of x, y, rotation may be omitted (None) to leave that value
-        unchanged.  At least one of them must be provided.
+        Each item in *items* is ``{"reference": ..., "x"?: ...,
+        "y"?: ..., "rotation"?: ...}``; an omitted coordinate key leaves
+        that value unchanged.  At least one of x/y/rotation must be
+        provided per item.
 
         By default (``force=False``) the tool automatically adjusts the
         position when the requested coordinates would cause a courtyard
@@ -60,23 +59,25 @@ def register_pcb_placement_tools(mcp: FastMCP) -> None:
         edge connectors flush with the board edge, press-fit connectors,
         or fiducials deliberately placed near other features).
 
-        The same move/rotation is applied to every reference in
-        *references* in one parse + one save (single ``.bak``).  The
-        courtyard collision guard is evaluated per footprint against the
-        board state at that point in the batch (earlier references in this
-        call have already been moved).  Partial-apply: a footprint that
-        cannot be found or placed keeps its own error in ``results`` while
-        the remaining footprints are still applied and saved.  Duplicate or
-        empty entries in *references* are rejected up front.
+        All items are processed in one parse + one save (single ``.bak``),
+        each with its own coordinates.  The courtyard collision guard is
+        evaluated per footprint against the board state at that point in
+        the batch (earlier items in this call have already been moved).
+        Partial-apply: a footprint that cannot be found or placed keeps its
+        own error in ``results`` while the remaining footprints are still
+        applied and saved.  Empty, duplicate, or malformed items are
+        rejected up front.
 
         Args:
             pcb_path: Absolute path to the .kicad_pcb file.
-            references: Footprint reference designators, e.g. ``["U1",
-                "R2"]``.
-            x: New X coordinate in mm (world), or None to keep current.
-            y: New Y coordinate in mm (world), or None to keep current.
-            rotation: New rotation in degrees, CCW-positive on screen
-                (any value; KiCad normalises). None to keep current.
+            items: List of per-footprint specs, e.g. ``[{"reference":
+                "U1", "x": 10.0, "y": 20.0}, {"reference": "R2",
+                "rotation": 45.0}]``.  Keys: ``reference`` (str,
+                required, unique), ``x``/``y`` (float, mm world),
+                ``rotation`` (float, degrees, CCW-positive on screen;
+                any value; KiCad normalises).  Omitted coordinate keys
+                leave that value unchanged; each item needs at least one
+                of x/y/rotation.
             force: Override the courtyard collision guard.  **Default
                 False — only set True when overlap is genuinely
                 intentional** (e.g. edge connectors, fiducials).  A
@@ -98,18 +99,33 @@ def register_pcb_placement_tools(mcp: FastMCP) -> None:
             - ``count``, ``applied_count``, ``failure_count``.
             - ``backup_path`` (None when nothing was moved), ``pcb_path``.
         """
-        if x is None and y is None and rotation is None:
-            return {"error": "At least one of x, y, rotation must be provided."}
-        if not references:
-            return {"error": "references must not be empty"}
-        if len(set(references)) != len(references):
-            return {"error": "references must not contain duplicates"}
-        if any(not ref for ref in references):
-            return {"error": "references must not contain empty designators"}
+        _ITEM_KEYS = {"reference", "x", "y", "rotation"}
+        if not items:
+            return {"error": "items must not be empty"}
+        for item in items:
+            if not isinstance(item, dict):
+                return {"error": "each item must be a dict with reference and coordinates"}
+            unknown = set(item) - _ITEM_KEYS
+            if unknown:
+                return {
+                    "error": f"Unknown item fields: {sorted(unknown)}. Valid: {sorted(_ITEM_KEYS)}"
+                }
+            ref = item.get("reference")
+            if not isinstance(ref, str) or not ref:
+                return {"error": "items must not contain empty or missing references"}
+            if all(item.get(key) is None for key in ("x", "y", "rotation")):
+                return {"error": f"Item for '{ref}' must provide at least one of x, y, rotation"}
+        refs = [item["reference"] for item in items]
+        if len(set(refs)) != len(refs):
+            return {"error": "items must not contain duplicate references"}
 
         data = load_pcb(pcb_path)
 
-        def place_one(ref: str) -> dict[str, Any]:
+        def place_one(item: dict[str, Any]) -> dict[str, Any]:
+            ref = item["reference"]
+            x = item.get("x")
+            y = item.get("y")
+            rotation = item.get("rotation")
             try:
                 fp = find_footprint(data, ref)
             except KeyError as exc:
@@ -159,9 +175,10 @@ def register_pcb_placement_tools(mcp: FastMCP) -> None:
             return result
 
         results: list[dict[str, Any]] = []
-        for ref in references:
+        for item in items:
+            ref = item["reference"]
             try:
-                results.append(place_one(ref))
+                results.append(place_one(item))
             except Exception as exc:
                 log.warning("set_footprint_position: reference %r failed: %s", ref, exc)
                 results.append({"error": f"{ref}: {exc}", "reference": ref})

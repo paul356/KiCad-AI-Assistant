@@ -16,9 +16,13 @@ description: "Property CRUD, reference renaming, label management, reference con
 # Recommended property workflow
 1. Call **list_symbol_properties(schematic_path, reference)** to see existing properties
    (returns `{name, value}` pairs from the first unit of a multi-unit symbol).
-2. Call **set_symbol_property(schematic_path, references, property_name, property_value)**
-   to add or update. ``references`` takes one or more designators (e.g. ``["R1"]``);
-   all units sharing a reference are updated together. Non-standard properties
+2. Call **set_symbol_property(schematic_path, items)** to add or update.
+   Each ``items`` entry is ``{"reference", "property_name", "property_value"}``
+   (e.g. ``[{"reference": "R1", "property_name": "Value", "property_value":
+   "22k"}, {"reference": "C1", "property_name": "MPN", "property_value":
+   "X7R"}]``); targets may carry different property/value pairs in one call,
+   and all units sharing a reference are updated together.  Non-standard
+   properties
    (anything besides Reference and Value) are hidden on the canvas by default.
    Each target returns `action` ("added", "updated", or "mixed") to tell you
    what happened per-unit.

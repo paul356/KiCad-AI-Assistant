@@ -544,9 +544,7 @@ class TestSetComponentProperty:
             "set_symbol_property",
             {
                 "schematic_path": sch,
-                "references": ["R1"],
-                "property_name": "Value",
-                "property_value": "22k",
+                "items": [{"reference": "R1", "property_name": "Value", "property_value": "22k"}],
             },
         )
         assert "error" not in result, result
@@ -561,9 +559,7 @@ class TestSetComponentProperty:
             "set_symbol_property",
             {
                 "schematic_path": sch,
-                "references": ["R1"],
-                "property_name": "Value",
-                "property_value": "47k",
+                "items": [{"reference": "R1", "property_name": "Value", "property_value": "47k"}],
             },
         )
         result = _call_tool(
@@ -588,9 +584,10 @@ class TestSetComponentProperty:
             "set_symbol_property",
             {
                 "schematic_path": sch,
-                "references": ["R1", "Z99"],
-                "property_name": "Value",
-                "property_value": "22k",
+                "items": [
+                    {"reference": "R1", "property_name": "Value", "property_value": "22k"},
+                    {"reference": "Z99", "property_name": "Value", "property_value": "22k"},
+                ],
             },
         )
         assert result.get("success") is False
@@ -620,13 +617,14 @@ class TestSetComponentProperty:
             "set_symbol_property",
             {
                 "schematic_path": sch,
-                "references": ["R1", "R1"],
-                "property_name": "Value",
-                "property_value": "22k",
+                "items": [
+                    {"reference": "R1", "property_name": "Value", "property_value": "22k"},
+                    {"reference": "R1", "property_name": "Value", "property_value": "22k"},
+                ],
             },
         )
         assert "error" in result
-        assert "duplicates" in result["error"]
+        assert "duplicate" in result["error"]
 
     def test_nonexistent_reference_returns_error(self, mcp_server, tmp_path):
         port, sid = mcp_server
@@ -637,9 +635,7 @@ class TestSetComponentProperty:
             "set_symbol_property",
             {
                 "schematic_path": sch,
-                "references": ["U99"],
-                "property_name": "Value",
-                "property_value": "x",
+                "items": [{"reference": "U99", "property_name": "Value", "property_value": "x"}],
             },
         )
         assert result.get("success") is False, result

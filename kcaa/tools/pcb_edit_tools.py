@@ -309,9 +309,7 @@ def register_pcb_edit_tools(mcp: FastMCP) -> None:
     @mcp.tool()
     async def set_footprint_property(
         pcb_path: str,
-        references: list[str],
-        property_name: str,
-        value: str,
+        items: list[dict[str, Any]],
         ctx: Context | None,
     ) -> dict[str, Any]:
         """Update a property on footprints of the PCB board.
@@ -319,21 +317,23 @@ def register_pcb_edit_tools(mcp: FastMCP) -> None:
         Common property names: ``Reference``, ``Value``, ``Datasheet``,
         ``Description``.  Custom user fields are also supported.
 
-        The same property is applied to every reference in *references* in
-        one parse + one save (single ``.bak``).  Partial-apply: a footprint
-        that cannot be found or lacks the property keeps its own error in
-        ``results`` while the remaining footprints are still applied and
-        saved.  Duplicate or empty entries in *references* are rejected up
-        front.
+        Each item in *items* carries its own property and value
+        (``{"reference": ..., "property_name": ..., "value": ...}``).
+        All items are processed in one parse + one save (single ``.bak``).
+        Partial-apply: a footprint that cannot be found or lacks the
+        property keeps its own error in ``results`` while the remaining
+        footprints are still applied and saved.  Empty, duplicate, or
+        malformed items are rejected up front.
 
         A .kicad_pcb.bak backup is created before writing.
 
         Args:
             pcb_path: Absolute path to the .kicad_pcb file.
-            references: Footprint reference designators, e.g. ``["R1",
-                "C3"]``.
-            property_name: Property to update (e.g. ``"Value"``).
-            value: New property value.
+            items: List of per-footprint specs, e.g. ``[{"reference":
+                "R1", "property_name": "Value", "value": "22k"}]``.
+                Keys: ``reference`` (str, required, unique),
+                ``property_name`` (str, required),
+                ``value`` (str, required).
 
         Returns:
             dict with: results (per-footprint {reference, property_name,
@@ -341,50 +341,69 @@ def register_pcb_edit_tools(mcp: FastMCP) -> None:
             success (all applied), count, applied_count, failure_count,
             backup_path, pcb_path.
         """
-        if not references:
-            return {"error": "references must not be empty"}
-        if len(set(references)) != len(references):
-            return {"error": "references must not contain duplicates"}
-        if any(not ref for ref in references):
-            return {"error": "references must not contain empty designators"}
+        _ITEM_KEYS = {"reference", "property_name", "value"}
+        if not items:
+            return {"error": "items must not be empty"}
+        for item in items:
+            if not isinstance(item, dict):
+                return {"error": "each item must be a dict with reference, property_name, value"}
+            unknown = set(item) - _ITEM_KEYS
+            if unknown:
+                return {
+                    "error": f"Unknown item fields: {sorted(unknown)}. Valid: {sorted(_ITEM_KEYS)}"
+                }
+            ref = item.get("reference")
+            if not isinstance(ref, str) or not ref:
+                return {"error": "items must not contain empty or missing references"}
+            if not isinstance(item.get("property_name"), str) or not item["property_name"]:
+                return {"error": "items must contain a non-empty property_name"}
+            if not isinstance(item.get("value"), str):
+                return {"error": "items must contain a string value"}
+        refs = [item["reference"] for item in items]
+        if len(set(refs)) != len(refs):
+            return {"error": "items must not contain duplicate references"}
 
         data = load_pcb(pcb_path)
 
-        def apply_one(ref: str) -> dict[str, Any]:
+        def apply_one(item: dict[str, Any]) -> dict[str, Any]:
+            ref = item["reference"]
+            name = item["property_name"]
+            val = item["value"]
             try:
                 fp = find_footprint(data, ref)
             except KeyError as exc:
                 return {"error": str(exc), "reference": ref}
 
-            old_value = get_fp_property(fp, property_name)
+            old_value = get_fp_property(fp, name)
             if old_value is None:
                 return {
                     "error": (
-                        f"Property '{property_name}' not found on footprint '{ref}'. "
+                        f"Property '{name}' not found on footprint '{ref}'. "
                         f"Use get_footprint to see available properties."
                     ),
                     "reference": ref,
                 }
 
-            updated = set_fp_property(fp, property_name, value)
+            updated = set_fp_property(fp, name, val)
             if not updated:
                 return {
-                    "error": f"Failed to update property '{property_name}' on '{ref}'.",
+                    "error": f"Failed to update property '{name}' on '{ref}'.",
                     "reference": ref,
                 }
 
             return {
                 "success": True,
                 "reference": ref,
-                "property_name": property_name,
+                "property_name": name,
                 "previous_value": old_value,
-                "new_value": value,
+                "new_value": val,
             }
 
         results: list[dict[str, Any]] = []
-        for ref in references:
+        for item in items:
+            ref = item["reference"]
             try:
-                results.append(apply_one(ref))
+                results.append(apply_one(item))
             except Exception as exc:
                 log.warning("set_footprint_property: reference %r failed: %s", ref, exc)
                 results.append({"error": f"{ref}: {exc}", "reference": ref})
@@ -401,7 +420,6 @@ def register_pcb_edit_tools(mcp: FastMCP) -> None:
         return {
             "success": applied_count == len(results) and len(results) > 0,
             "results": results,
-            "property_name": property_name,
             "count": len(results),
             "applied_count": applied_count,
             "failure_count": len(results) - applied_count,

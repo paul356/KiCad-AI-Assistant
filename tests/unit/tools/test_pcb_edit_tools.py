@@ -261,9 +261,7 @@ class TestSetFootprintProperty:
         result = _run(
             tools["set_footprint_property"](
                 pcb_path=board_copy,
-                references=["R1"],
-                property_name="Value",
-                value="22k",
+                items=[{"reference": "R1", "property_name": "Value", "value": "22k"}],
                 ctx=None,
             )
         )
@@ -278,7 +276,9 @@ class TestSetFootprintProperty:
     def test_creates_backup(self, tools, board_copy):
         result = _run(
             tools["set_footprint_property"](
-                pcb_path=board_copy, references=["R1"], property_name="Value", value="1k", ctx=None
+                pcb_path=board_copy,
+                items=[{"reference": "R1", "property_name": "Value", "value": "1k"}],
+                ctx=None,
             )
         )
         assert os.path.isfile(result["backup_path"])
@@ -286,7 +286,9 @@ class TestSetFootprintProperty:
     def test_error_on_missing_reference(self, tools, board_copy):
         result = _run(
             tools["set_footprint_property"](
-                pcb_path=board_copy, references=["U99"], property_name="Value", value="x", ctx=None
+                pcb_path=board_copy,
+                items=[{"reference": "U99", "property_name": "Value", "value": "x"}],
+                ctx=None,
             )
         )
         assert result.get("success") is False, result
@@ -297,9 +299,7 @@ class TestSetFootprintProperty:
         result = _run(
             tools["set_footprint_property"](
                 pcb_path=board_copy,
-                references=["R1"],
-                property_name="NoSuchProp",
-                value="x",
+                items=[{"reference": "R1", "property_name": "NoSuchProp", "value": "x"}],
                 ctx=None,
             )
         )

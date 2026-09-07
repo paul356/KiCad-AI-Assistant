@@ -370,10 +370,7 @@ class TestSetFootprintPosition:
             "set_footprint_position",
             {
                 "pcb_path": str(pcb),
-                "references": ["R1"],
-                "x": 50.0,
-                "y": 60.0,
-                "rotation": None,
+                "items": [{"reference": "R1", "x": 50.0, "y": 60.0}],
             },
         )
         assert "error" not in result, result
@@ -390,10 +387,7 @@ class TestSetFootprintPosition:
             "set_footprint_position",
             {
                 "pcb_path": str(pcb),
-                "references": ["R1"],
-                "x": 99.0,
-                "y": None,
-                "rotation": None,
+                "items": [{"reference": "R1", "x": 99.0}],
             },
         )
         assert "error" not in result
@@ -410,10 +404,7 @@ class TestSetFootprintPosition:
             "set_footprint_position",
             {
                 "pcb_path": str(pcb),
-                "references": ["R1"],
-                "x": 1.0,
-                "y": 1.0,
-                "rotation": None,
+                "items": [{"reference": "R1", "x": 1.0, "y": 1.0}],
             },
         )
         assert "error" not in result
@@ -430,10 +421,7 @@ class TestSetFootprintPosition:
             "set_footprint_position",
             {
                 "pcb_path": str(pcb),
-                "references": ["R1"],
-                "x": 5.0,
-                "y": 5.0,
-                "rotation": None,
+                "items": [{"reference": "R1", "x": 5.0, "y": 5.0}],
             },
         )
         assert "error" not in result
@@ -450,10 +438,10 @@ class TestSetFootprintPosition:
             "set_footprint_position",
             {
                 "pcb_path": str(pcb),
-                "references": ["R1", "C1"],
-                "x": 33.0,
-                "y": 44.0,
-                "rotation": None,
+                "items": [
+                    {"reference": "R1", "x": 33.0, "y": 44.0},
+                    {"reference": "C1", "x": 61.0, "y": 72.0},
+                ],
             },
         )
         assert result.get("success") is True, result
@@ -462,7 +450,9 @@ class TestSetFootprintPosition:
         assert result["results"][0]["reference"] == "R1"
         assert result["results"][1]["reference"] == "C1"
         assert abs(result["results"][0]["placed_at"]["x"] - 33.0) < 0.001
-        assert abs(result["results"][1]["placed_at"]["x"] - 33.0) < 0.001
+        assert abs(result["results"][0]["placed_at"]["y"] - 44.0) < 0.001
+        assert abs(result["results"][1]["placed_at"]["x"] - 61.0) < 0.001
+        assert abs(result["results"][1]["placed_at"]["y"] - 72.0) < 0.001
 
     def test_partial_apply_reports_per_ref_errors(self, mcp_server, tmp_path):
         port, sid = mcp_server
@@ -474,10 +464,10 @@ class TestSetFootprintPosition:
             "set_footprint_position",
             {
                 "pcb_path": str(pcb),
-                "references": ["R1", "U99"],
-                "x": 99.0,
-                "y": 88.0,
-                "rotation": None,
+                "items": [
+                    {"reference": "R1", "x": 99.0, "y": 88.0},
+                    {"reference": "U99", "x": 99.0, "y": 88.0},
+                ],
             },
         )
         assert result.get("success") is False
@@ -503,14 +493,14 @@ class TestSetFootprintPosition:
             "set_footprint_position",
             {
                 "pcb_path": str(pcb),
-                "references": ["R1", "R1"],
-                "x": 1.0,
-                "y": 1.0,
-                "rotation": None,
+                "items": [
+                    {"reference": "R1", "x": 1.0, "y": 1.0},
+                    {"reference": "R1", "x": 1.0, "y": 1.0},
+                ],
             },
         )
         assert "error" in result
-        assert "duplicates" in result["error"]
+        assert "duplicate" in result["error"]
 
     def test_missing_reference_returns_error(self, mcp_server, tmp_path):
         port, sid = mcp_server
@@ -522,10 +512,7 @@ class TestSetFootprintPosition:
             "set_footprint_position",
             {
                 "pcb_path": str(pcb),
-                "references": ["U99"],
-                "x": 1.0,
-                "y": 1.0,
-                "rotation": None,
+                "items": [{"reference": "U99", "x": 1.0, "y": 1.0}],
             },
         )
         assert result.get("success") is False, result
@@ -543,10 +530,7 @@ class TestSetFootprintPosition:
             "set_footprint_position",
             {
                 "pcb_path": str(pcb),
-                "references": ["R1"],
-                "x": None,
-                "y": None,
-                "rotation": None,
+                "items": [{"reference": "R1"}],
             },
         )
         assert "error" in result
@@ -631,9 +615,7 @@ class TestSetFootprintProperty:
             "set_footprint_property",
             {
                 "pcb_path": str(pcb),
-                "references": ["R1"],
-                "property_name": "Value",
-                "value": "22k",
+                "items": [{"reference": "R1", "property_name": "Value", "value": "22k"}],
             },
         )
         assert "error" not in result, result
@@ -651,9 +633,7 @@ class TestSetFootprintProperty:
             "set_footprint_property",
             {
                 "pcb_path": str(pcb),
-                "references": ["R1"],
-                "property_name": "Value",
-                "value": "47k",
+                "items": [{"reference": "R1", "property_name": "Value", "value": "47k"}],
             },
         )
         result = _call_tool(port, sid, "get_footprint", {"pcb_path": str(pcb), "reference": "R1"})
@@ -669,9 +649,7 @@ class TestSetFootprintProperty:
             "set_footprint_property",
             {
                 "pcb_path": str(pcb),
-                "references": ["R1"],
-                "property_name": "NonExistentProp",
-                "value": "x",
+                "items": [{"reference": "R1", "property_name": "NonExistentProp", "value": "x"}],
             },
         )
         assert result.get("success") is False, result
@@ -688,14 +666,34 @@ class TestSetFootprintProperty:
             "set_footprint_property",
             {
                 "pcb_path": str(pcb),
-                "references": ["U99"],
-                "property_name": "Value",
-                "value": "x",
+                "items": [{"reference": "U99", "property_name": "Value", "value": "x"}],
             },
         )
         assert result.get("success") is False, result
         assert result["results"][0]["reference"] == "U99"
         assert "error" in result["results"][0]
+
+    def test_different_values_per_item(self, mcp_server, tmp_path):
+        """Each items entry sets its own property value."""
+        port, sid = mcp_server
+        pcb = tmp_path / "board.kicad_pcb"
+        shutil.copy2(BOARD_FIXTURE, pcb)
+        result = _call_tool(
+            port,
+            sid,
+            "set_footprint_property",
+            {
+                "pcb_path": str(pcb),
+                "items": [
+                    {"reference": "R1", "property_name": "Value", "value": "22k"},
+                    {"reference": "C1", "property_name": "Value", "value": "33n"},
+                ],
+            },
+        )
+        assert result.get("success") is True, result
+        assert result["applied_count"] == 2
+        assert result["results"][0]["new_value"] == "22k"
+        assert result["results"][1]["new_value"] == "33n"
 
 
 # ---------------------------------------------------------------------------

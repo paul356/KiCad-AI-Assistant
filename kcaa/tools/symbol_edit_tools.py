@@ -1499,54 +1499,68 @@ def register_symbol_edit_tools(mcp: FastMCP) -> None:
     @mcp.tool()
     async def set_symbol_property(
         schematic_path: str,
-        references: list[str],
-        property_name: str,
-        property_value: str,
+        items: list[dict[str, Any]],
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Set or add a property on placed schematic components.
 
-        Applies the same property to every reference in *references* in one
-        parse + one save (single ``.bak``).  If the property already exists
-        on a component it is updated in-place; otherwise a new property is
+        Each *items* entry carries its own ``(property_name,
+        property_value)`` pair; all entries are applied in one parse + one
+        save (single ``.bak``).  If the property already exists on a
+        component it is updated in-place; otherwise a new property is
         created by cloning the existing ``Value`` property entry and
         renaming it.  The operation is applied to every unit that shares
         the given reference designator.
 
-        Partial-apply: a reference that cannot be found keeps its own error
-        in ``results`` while the remaining references are still applied and
-        saved.  Duplicate or empty entries in *references* are rejected up
-        front.
+        Partial-apply: an item whose reference cannot be found keeps its
+        own error in ``results`` while the remaining items are still
+        applied and saved.  Duplicate references, empty items, or unknown
+        item fields are rejected up front.
 
         Args:
             schematic_path: Absolute path to the target .kicad_sch file.
-            references: Reference designators of the components to modify
-                (e.g. ["R1", "U3"]).
-            property_name: Name of the property to set or create
-                (e.g. "Value", "Footprint", "MPN", "Manufacturer").
-            property_value: The new value string for the property.
-                An empty string is a valid value and is permitted.
+            items: List of per-component specs, e.g. ``[{"reference":
+                "R1", "property_name": "Value", "property_value": "22k"},
+                {"reference": "U3", "property_name": "MPN",
+                "property_value": "RC0402FR-0710KL"}]``.  Keys:
+                ``reference`` (str, required, unique), ``property_name``
+                (str, required), ``property_value`` (str, required; an
+                empty string is a valid value and is permitted).
 
         Returns:
             dict with keys: success (bool — every target applied),
             results (list of per-reference dicts: {reference, success,
             units_updated, units_where_updated, units_where_added,
-            action} or {reference, error}), property_name,
-            property_value, count, applied_count, failure_count,
-            file_modified, backup_path.
+            action} or {reference, error}), count, applied_count,
+            failure_count, file_modified, backup_path.
         """
         if not schematic_path.endswith(".kicad_sch"):
             return {"error": f"Not a .kicad_sch file: {schematic_path!r}"}
         if not os.path.isfile(schematic_path):
             return {"error": f"Schematic file not found: {schematic_path!r}"}
-        if not references:
-            return {"error": "references must not be empty"}
-        if len(set(references)) != len(references):
-            return {"error": "references must not contain duplicates"}
-        if any(not ref for ref in references):
-            return {"error": "references must not contain empty designators"}
-        if not property_name:
-            return {"error": "property_name must not be empty"}
+        _ITEM_KEYS = {"reference", "property_name", "property_value"}
+        if not items:
+            return {"error": "items must not be empty"}
+        for item in items:
+            if not isinstance(item, dict):
+                return {
+                    "error": "each item must be a dict with reference, property_name, property_value"
+                }
+            unknown = set(item) - _ITEM_KEYS
+            if unknown:
+                return {
+                    "error": f"Unknown item fields: {sorted(unknown)}. Valid: {sorted(_ITEM_KEYS)}"
+                }
+            ref = item.get("reference")
+            if not isinstance(ref, str) or not ref:
+                return {"error": "items must not contain empty or missing references"}
+            if not isinstance(item.get("property_name"), str) or not item["property_name"]:
+                return {"error": "items must contain a non-empty property_name"}
+            if not isinstance(item.get("property_value"), str):
+                return {"error": "items must contain a string property_value"}
+        refs = [item["reference"] for item in items]
+        if len(set(refs)) != len(refs):
+            return {"error": "items must not contain duplicate references"}
 
         try:
             sch = safe_schematic(schematic_path)
@@ -1555,7 +1569,7 @@ def register_symbol_edit_tools(mcp: FastMCP) -> None:
 
         try:
 
-            def apply_one(ref: str) -> dict[str, Any]:
+            def apply_one(ref: str, name: str, value: str) -> dict[str, Any]:
                 """Apply the property to every unit sharing *ref*."""
                 units: list[Any] = []
                 try:
@@ -1574,22 +1588,22 @@ def register_symbol_edit_tools(mcp: FastMCP) -> None:
                 updated_count = 0
                 added_count = 0
                 for sym in units:
-                    existing = _find_property_by_name(sym, property_name)
+                    existing = _find_property_by_name(sym, name)
                     if existing is not None:
-                        existing.value = property_value
+                        existing.value = value
                         updated_count += 1
                     else:
                         # Clone the Value property to create a new entry with
                         # the correct structure (at, effects), then rename
                         # and set it.
                         new_prop = sym.property.Value.clone()
-                        new_prop.name = property_name
-                        new_prop.value = property_value
+                        new_prop.name = name
+                        new_prop.value = value
                         # Non-standard properties are hidden by default in
                         # KiCad (only Reference and Value are visible on the
                         # canvas).  Inject (hide yes) into the effects node of
                         # the cloned property when needed.
-                        if property_name not in _STANDARD_VISIBLE_PROPERTIES:
+                        if name not in _STANDARD_VISIBLE_PROPERTIES:
                             raw_tree = new_prop._pv._tree
                             for child in raw_tree:
                                 if (
@@ -1619,9 +1633,10 @@ def register_symbol_edit_tools(mcp: FastMCP) -> None:
                 }
 
             results: list[dict[str, Any]] = []
-            for ref in references:
+            for item in items:
+                ref = item["reference"]
                 try:
-                    results.append(apply_one(ref))
+                    results.append(apply_one(ref, item["property_name"], item["property_value"]))
                 except Exception as exc:
                     log.warning("set_symbol_property: reference %r failed: %s", ref, exc)
                     results.append({"error": f"{ref}: {exc}", "reference": ref})
@@ -1637,8 +1652,6 @@ def register_symbol_edit_tools(mcp: FastMCP) -> None:
             return {
                 "success": applied_count == len(results) and len(results) > 0,
                 "results": results,
-                "property_name": property_name,
-                "property_value": property_value,
                 "count": len(results),
                 "applied_count": applied_count,
                 "failure_count": len(results) - applied_count,

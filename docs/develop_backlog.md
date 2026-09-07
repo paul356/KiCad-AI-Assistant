@@ -205,14 +205,17 @@ tool-collapse issue above).
 ### Fix (design agreed 2026-09-07 — batch-first, no backward-compat
 retained per maintainer decision)
 
-1. Set tools take a list directly: `references: list[str]` replaces the
-   single `reference` param on `set_symbol_property`,
-   `set_footprint_position`, `set_footprint_property`.  One parse + one
-   save per call, single `.bak`.  Per-target results in `results[]`;
-   partial-apply semantics (successful targets saved, failures keep their
-   per-ref error — per `docs/plugin/mutation_safety.md`).  Duplicate or
-   empty entries in `references` are rejected.  `set_net_class_rules`
-   stays single-class.
+1. Set tools switch to `items: list[dict]`: each self-contained entry
+   `{"reference", ...spec}` replaces the single `reference` + shared
+   property/value params on `set_symbol_property` (`property_name` +
+   `property_value`), `set_footprint_position` (`x`/`y`/`rotation`, each
+   optional but at least one required per entry), `set_footprint_property`
+   (`property_name` + `value`).  Targets may carry different values in one
+   call.  One parse + one save per call, single `.bak`.  Per-target results
+   in `results[]`; partial-apply semantics (successful targets saved,
+   failures keep their per-ref error — per `docs/plugin/mutation_safety.md`).
+   Duplicate references or unknown item fields are rejected.
+   `set_net_class_rules` stays single-class.
 2. List tools get named query params, default `None` = current output:
    - `list_footprints(ref_prefix, bbox=[xmin,ymin,xmax,ymax], fields)`
    - `list_nets(name_prefix, netclass, fields)` — `netclass` filter
