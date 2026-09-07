@@ -52,8 +52,7 @@ function _toolCallHtml(e) {
     var css = ok ? 'tool-entry tool-ok' : 'tool-entry tool-err';
     var args = typeof e.args === 'string' ? _escapeHtml(e.args) : _escapeHtml(JSON.stringify(e.args, null, 2));
     var result = typeof e.result === 'string' ? _escapeHtml(e.result) : _escapeHtml(JSON.stringify(e.result, null, 2));
-    var uid = 'tool_' + (e._seq || Math.random().toString(36).slice(2));
-    return '<details class="tools tool-details" id="' + uid + '" style="margin:2px 8px">'
+    return '<details class="tools tool-details" style="margin:2px 8px">'
         + '<summary class="tool-summary"><span style="color:' + iconColor + '">' + icon + '</span> '
         + '<span style="color:#444;font-weight:600">\u21B3 ' + _escapeHtml(e.name)
         + '</span></summary>'
@@ -87,8 +86,7 @@ function _pdfTextsHtml(pdfTexts) {
         var icon = p.error ? '\u2717' : '\u2713';
         var iconColor = p.error ? '#c62828' : '#2e7d32';
         var css = p.error ? 'tool-entry tool-err' : 'tool-entry tool-ok';
-        var uid = 'pdf_' + i + '_' + Math.random().toString(36).slice(2);
-        html += '<details class="tools" id="' + uid + '" style="margin:2px 0">'
+        html += '<details class="tools" style="margin:2px 0">'
             + '<summary><span style="color:' + iconColor + '">' + icon + '</span> '
             + '<span style="color:#444;font-weight:600">\uD83D\uDCC4 ' + _escapeHtml(p.name)
             + '</span></summary>'

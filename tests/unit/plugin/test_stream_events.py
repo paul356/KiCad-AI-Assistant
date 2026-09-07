@@ -11,7 +11,6 @@ def _state(**overrides):
     state = {
         "pending": "",
         "entries": [],
-        "tool_seq": 0,
         "tool_calls_made": False,
         "turn_had_text": False,
         "delta_chars": 0,
@@ -26,7 +25,6 @@ def _apply(state, evt):
     st = apply_stream_event(
         pending=state["pending"],
         entries=state["entries"],
-        tool_seq=state["tool_seq"],
         tool_calls_made=state["tool_calls_made"],
         turn_had_text=state["turn_had_text"],
         delta_chars=state["delta_chars"],
@@ -36,7 +34,6 @@ def _apply(state, evt):
     )
     state.update(
         pending=st.pending,
-        tool_seq=st.tool_seq,
         tool_calls_made=st.tool_calls_made,
         turn_had_text=st.turn_had_text,
         delta_chars=st.delta_chars,
@@ -157,7 +154,7 @@ def test_turn_end_defensive_finalise_of_leftover_draft():
     assert s["entries"] == [{"type": "ai", "text": "before", "timestamp": "00:00:00"}]
 
 
-def test_tool_call_entries_carry_seq_and_mark_tool_use():
+def test_tool_call_entries_mark_tool_use():
     s = _state()
     _apply(
         s,
@@ -179,7 +176,6 @@ def test_tool_call_entries_carry_seq_and_mark_tool_use():
     )
 
     assert s["tool_calls_made"] is True
-    assert [e["_seq"] for e in s["entries"]] == [1, 2]
     assert [e["name"] for e in s["entries"]] == ["edit_track", "reload_kicad"]
 
 
@@ -222,8 +218,7 @@ def test_status_event_defaults_color_when_omitted():
 
 
 def test_status_event_is_not_a_tool_call():
-    """Status events must not increment the tool sequence or mark tool use."""
+    """Status events must not mark tool use."""
     s = _state()
     _apply(s, {"type": "status", "text": "notice"})
-    assert s["tool_seq"] == 0
     assert s["tool_calls_made"] is False

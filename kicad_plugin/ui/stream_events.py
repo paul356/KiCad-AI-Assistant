@@ -27,7 +27,7 @@ from typing import Any
 #   {"type": "text_start"}                              ordering marker (no-op)
 #   {"type": "text_chunk", "content": str}              streamed content
 #   {"type": "text_end"}                                response text complete -> finalise draft
-#   {"type": "tool_call", "name": str, "args": dict, "result": Any, "_seq": int}
+#   {"type": "tool_call", "name": str, "args": dict, "result": Any}
 #   {"type": "turn_end", "reply": str}                  turn complete (takes over _on_reply)
 #   {"type": "status", "text": str, "color_hex": str}   transient system notice (e.g. compacted history)
 #
@@ -47,7 +47,6 @@ class TurnState:
     """Scalar turn state after applying one event."""
 
     pending: str = ""
-    tool_seq: int = 0
     tool_calls_made: bool = False
     turn_had_text: bool = False
     delta_chars: int = 0
@@ -60,7 +59,6 @@ def apply_stream_event(
     *,
     pending: str,
     entries: list,
-    tool_seq: int,
     tool_calls_made: bool,
     turn_had_text: bool,
     delta_chars: int,
@@ -79,7 +77,6 @@ def apply_stream_event(
     """
     base = TurnState(
         pending=pending,
-        tool_seq=tool_seq,
         tool_calls_made=tool_calls_made,
         turn_had_text=turn_had_text,
         delta_chars=delta_chars,
@@ -108,14 +105,12 @@ def apply_stream_event(
         return base
 
     if etype == "tool_call":
-        base.tool_seq = tool_seq + 1
         entries.append(
             {
                 "type": "tool_call",
                 "name": evt.get("name", "?"),
                 "args": evt.get("args"),
                 "result": evt.get("result"),
-                "_seq": base.tool_seq,
             }
         )
         base.tool_calls_made = True

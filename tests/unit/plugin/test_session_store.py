@@ -240,36 +240,3 @@ class TestRoundTrip:
         data, err = sstore.load_session(os.path.join(sessions, "session_bad.json"))
         assert data is None
         assert err is not None
-
-
-class TestMaxToolSeq:
-    """``max_tool_seq`` keeps tool-call details ids unique across restores."""
-
-    def test_empty_entries_keep_current(self):
-        assert sstore.max_tool_seq([], 0) == 0
-        assert sstore.max_tool_seq([], 7) == 7
-
-    def test_highest_tool_seq_wins(self):
-        entries = [
-            {"type": "user", "text": "q"},
-            {"type": "tool_call", "name": "a", "_seq": 3},
-            {"type": "tool_call", "name": "b", "_seq": 41},
-            {"type": "tool_call", "name": "c", "_seq": 9},
-        ]
-        assert sstore.max_tool_seq(entries) == 41
-
-    def test_never_lowers_current(self):
-        # Restoring an older (lower-seq) session must not pull the counter
-        # back down — new calls would collide with rows already in the DOM.
-        entries = [{"type": "tool_call", "name": "a", "_seq": 5}]
-        assert sstore.max_tool_seq(entries, 77) == 77
-
-    def test_ignores_entries_without_seq(self):
-        entries = [
-            {"type": "tool_call", "name": "legacy", "result": {}},  # pre-_seq file
-            {"type": "tool_call", "name": "s", "_seq": "12"},  # non-int ignored
-            {"type": "status", "text": "notice"},
-            {"type": "tool_call", "name": "s", "_seq": -1},  # never below current
-        ]
-        assert sstore.max_tool_seq(entries) == 0
-        assert sstore.max_tool_seq(entries, 3) == 3

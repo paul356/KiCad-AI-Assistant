@@ -221,20 +221,20 @@ had it (separate, still-open improvement).
 
 #### Fix
 
-1. `session_store.max_tool_seq(conv_entries, current)` — highest `_seq`
-   already present, never below `current`; both restore paths recompute
-   `self._tool_seq` so new ids continue above every restored id.
-2. `shell.js` collapse resolves the target via
+1. `shell.js` collapse now resolves the target via
    `toolBody.closest('details.tools')` (DOM position) instead of
-   `getElementById`, so even a residual duplicate id can never collapse
-   the wrong row; `data-details` attribute removed.
+   `getElementById`, and the whole `tool_<seq>` details-id mechanism is
+   removed (`_seq`/`_tool_seq` counter, session persistence, JS `uid`
+   generation and the `id`/`data-details` attributes): nothing addresses
+   tool rows by id anymore, so the id-collision failure class is
+   structurally gone and no restore-time counter bookkeeping is needed.
 
 #### Validation
 
-- Unit: `max_tool_seq` coverage (empty/legacy entries, monotonic guard,
-  non-int `_seq`); `test_shell_search.js` gains body-click collapse and
+- Unit: `test_shell_search.js` gains body-click collapse and
   duplicate-id regression (25/25) — the old `getElementById` path was
-  verified to fail the new assertions.
+  verified to fail the new assertions; `test_stream_events.py` updated
+  for the removed seq field.
 - Full unit suite: 1276 passed, 17 skipped; ruff clean.
 
 ---
