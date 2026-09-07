@@ -65,54 +65,6 @@ rotation plus the footprint rotation (verify which KiCad actually applies).
 
 ---
 
-## Tool-output collapse stops working in long sessions
-
-**Status:** open (reported)
-
-### Symptom
-
-Clicking a tool row to collapse its output sometimes does nothing,
-especially once the session has accumulated a lot of content.
-
-### Current implementation
-
-- WebView path (`kicad_plugin/ui/panel.py`, `_WEBVIEW_AVAILABLE`): tool
-  rows are HTML5 `<details>/<summary>`, collapsed by clicking the tool
-  body. The interaction is handled by `kicad_plugin/ui/shell.js`
-  `_installToolCollapse`, a document-level `mousedown` + 250 ms
-  `setTimeout` heuristic with drag/double-click/selection guards.
-  It is not the native `<summary>` toggle for the body click — only the
-  summary line is native.
-- Fallback path (no WebView): `_tool_html_plain` in `panel.py` renders a
-  compact inline summary with **no folding at all** ("no folding" in the
-  docstring) — the collapse affordance silently vanishes.
-
-### Suspected causes (to confirm before fixing)
-
-- The 250 ms click-vs-drag heuristic depends on event timing and the
-  pointer path; long DOMs slow `mousedown` handling and the jitter
-  threshold can misfire.
-- `_tool_html_plain` fallback gives no collapsing UI on systems without
-  WebView.
-
-### Fix (proposed)
-
-1. Switch the collapse toggle to the summary element (single native
-   `summary` click or its `toggle` event) instead of the body-click
-   heuristic; keep the selection-guard only where needed.
-2. Add `<details>/<summary>` folding (lightweight DOM, no JS dependency)
-   to the `wx.html.HtmlWindow` fallback path so behavior matches.
-3. Stress-test with a long session (100+ tool calls) in `test_shell_search.js`.
-
-### Validation
-
-- Unit/JS: `tests/unit/ui/test_shell_search.js` extended — collapse works
-  on a rendered session with hundreds of tool rows; search still
-  auto-expands collapsed details.
-- Manual: long real session, click collapse on an early tool row.
-
----
-
 ## Unify schematic/PCB version management and archive history
 
 **Status:** open (proposed)
@@ -245,6 +197,47 @@ tool-collapse issue above).
 
 ## Resolved
 
+### Tool-output collapse stops working in long sessions
+
+**Status:** resolved (2026-09-07) — fixed by PR #118 (commit `87e1a24`); closes issue #117.
+
+#### Root cause (confirmed)
+
+The collapse interaction depended on globally unique `details` ids. Tool
+rows get `id="tool_<seq>"` from a per-panel counter (`_seq`, assigned in
+`stream_events.apply_stream_event`). Session files persist each
+`tool_call` entry's `_seq` verbatim (`session_store.make_payload`), and
+the restore paths (`_autoload_session`, `_restore_session_file`) load
+those entries into a panel whose `self._tool_seq` was never recomputed —
+a fresh panel restarts the counter at 0, so new tool calls re-issued ids
+`tool_1..tool_K` that collided with restored rows. `shell.js` collapsed
+the row via `document.getElementById(data-details)`, which returns the
+first match in document order: after a restore, clicking a colliding row
+collapsed the older row (or no-opped when that row was already closed).
+Real session files showed up to 147 duplicate ids and 23 seq-restart
+generations in a single conversation. WebView is the only path with
+folding; the `wx.html.HtmlWindow` fallback (`_tool_html_plain`) has never
+had it (separate, still-open improvement).
+
+#### Fix
+
+1. `session_store.max_tool_seq(conv_entries, current)` — highest `_seq`
+   already present, never below `current`; both restore paths recompute
+   `self._tool_seq` so new ids continue above every restored id.
+2. `shell.js` collapse resolves the target via
+   `toolBody.closest('details.tools')` (DOM position) instead of
+   `getElementById`, so even a residual duplicate id can never collapse
+   the wrong row; `data-details` attribute removed.
+
+#### Validation
+
+- Unit: `max_tool_seq` coverage (empty/legacy entries, monotonic guard,
+  non-int `_seq`); `test_shell_search.js` gains body-click collapse and
+  duplicate-id regression (25/25) — the old `getElementById` path was
+  verified to fail the new assertions.
+- Full unit suite: 1276 passed, 17 skipped; ruff clean.
+
+---
 ### Wire routing does not avoid label / power-tip / junction anchors
 
 **Status:** resolved (2026-09-04) — fixed by PR #115 (commit `afa504d`); closes issue #114.
