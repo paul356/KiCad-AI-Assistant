@@ -2120,15 +2120,15 @@ if _WX_AVAILABLE:
             backup_path = ""
             if board_path and os.path.isfile(board_path):
                 try:
-                    from ..llm_client import call_mcp_tool
+                    from ..llm_client import _project_path_for, call_mcp_tool
 
                     result = call_mcp_tool(
                         self._server_mgr.base_url,
-                        "save_file_version",
-                        {"file_path": board_path},
+                        "save_project_version",
+                        {"project_file": _project_path_for(board_path)},
                     )
-                    backup_path = result.get("snapshot_path", "")
-                    log.info("autoroute: version snapshot saved to %s", backup_path)
+                    backup_path = result.get("archive_path", "")
+                    log.info("autoroute: project version snapshot saved to %s", backup_path)
                 except Exception as exc:
                     log.warning("autoroute: version snapshot failed: %s", exc)
                     backup_path = ""

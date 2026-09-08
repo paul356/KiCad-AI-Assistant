@@ -222,6 +222,19 @@ the existing per-file `MAX_VERSIONS` semantics.
 3. `.bak` stays the short-lived single-change safety net; KiCad's
    auto-pruned `.history/` stays independent.  `.gitignore` now excludes
    `**/.versions/`.
+4. **Legacy removal + framework migration (same PR, final form):** the
+   per-file tools (`save_file_version` / `list_file_versions` /
+   `restore_file_version`) and their manager functions
+   (`save_version_snapshot` / `list_versions` / `restore_version`) are
+   removed — the three project tools are the only versioning surface.
+   The plugin framework's auto-snapshot now calls `save_project_version`
+   (derived pro path, deduped per project per turn), rollback-history
+   pruning keys on `project_file` + `version_id` and prunes any turn that
+   touched any file of the restored project, the auto-route pre-routing
+   backup uses the project archive, and the tool-policy registry was
+   updated accordingly.
+5. Old `.versions/<basename>.<ts>` snapshots written by the removed tools
+   are no longer readable by any tool; the files are left on disk.
 
 #### Validation
 

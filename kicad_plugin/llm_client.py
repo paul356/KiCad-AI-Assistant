@@ -25,6 +25,24 @@ from .tool_registry import get_missing_tool_policies, get_tool_policy
 
 log = logging.getLogger(__name__)
 
+
+def _project_path_for(file_path: str) -> str:
+    """Return the .kicad_pro path of the project containing *file_path*.
+
+    Accepts a schematic, PCB or project file; the project path shares the
+    directory and the stem up to the ``.kicad_*`` suffix.
+    """
+    d = os.path.dirname(os.path.abspath(file_path))
+    name = os.path.basename(file_path)
+    for suffix in (".kicad_pro", ".kicad_sch", ".kicad_pcb"):
+        if name.endswith(suffix):
+            stem = name[: -len(suffix)]
+            break
+    else:
+        stem = os.path.splitext(name)[0]
+    return os.path.join(d, f"{stem}.kicad_pro")
+
+
 # Synthetic user message prepended to history when a framework tool_direct
 # turn (e.g. auto footprint sync) would otherwise open the conversation with
 # an assistant tool-call message — providers require the first message to
@@ -737,7 +755,7 @@ You are a KiCad assistant — modest, cautious, and proactive.
   for guidance. The user is more experienced at solving circuit design
   problems — defer to their judgment.
 - Edit schematics/PCBs via MCP tools.
-- Unless asked, never call `save_file_version`, `reload_kicad`,
+- Unless asked, never call `save_project_version`, `reload_kicad`,
   `check_kicad_ipc_connection`, or `save_document`.
 - The framework handles snapshots/reloads. Use ``list_skills()`` /
   ``get_skill(name)`` for guides.\
@@ -1212,17 +1230,17 @@ class LLMClient:
         return True
 
     def _prune_rollback_history(self) -> None:
-        """Prune tool-call turns invalidated by restore_file_version.
+        """Prune tool-call turns invalidated by restore_project_version.
 
-        When the LLM restores a file to an earlier version, every tool call that
-        mutated or queried that file between the save point and the restore is
-        now based on stale state — prune those turns.
+        When the LLM restores a project to an earlier version, every tool
+        call that mutated or queried any of its files between the save point
+        and the restore is now based on stale state — prune those turns.
 
         Handles nested restores: starts from the most recent restore and skips
         any restore whose messages fall inside an already-pruned range.
         """
         # ---- Build save-point lookup ------------------------------------------
-        # For each save_file_version tool result, record (file_path, version_id) → index.
+        # For each save_project_version result, record (project_file, version_id) → index.
         save_points: dict[tuple[str, str], int] = {}
         for i, msg in enumerate(self._history):
             if msg.get("role") != "tool":
@@ -1235,19 +1253,19 @@ class LLMClient:
             for tc in parent.get("tool_calls") or []:
                 if tc.get("id") != tc_id:
                     continue
-                if tc.get("function", {}).get("name") != "save_file_version":
+                if tc.get("function", {}).get("name") != "save_project_version":
                     continue
                 try:
                     args = json.loads(tc["function"].get("arguments", "{}"))
                     result = json.loads(msg.get("content", "{}"))
-                    fp = args.get("file_path", "")
+                    fp = args.get("project_file", "")
                     vid = result.get("version_id", "")
                     if fp and vid:
                         save_points[(fp, vid)] = i
                 except (json.JSONDecodeError, KeyError, TypeError):
                     pass
 
-        # ---- Scan from tail for restore_file_version -------------------------
+        # ---- Scan from tail for restore_project_version ----------------------
         marked: set[int] = set()  # indices to remove  (tool results)
         tool_call_removals: dict[int, list[str]] = {}  # assistant_idx → [tc_id, ...]
         i = len(self._history) - 1
@@ -1268,16 +1286,16 @@ class LLMClient:
             for tc in parent.get("tool_calls") or []:
                 if tc.get("id") != tc_id:
                     continue
-                if tc.get("function", {}).get("name") != "restore_file_version":
+                if tc.get("function", {}).get("name") != "restore_project_version":
                     continue
                 try:
                     args = json.loads(tc["function"].get("arguments", "{}"))
-                    file_path = args.get("file_path", "")
+                    project_file = args.get("project_file", "")
                     version_id = args.get("version_id", "")
                 except (json.JSONDecodeError, KeyError, TypeError):
                     break
 
-                save_idx = save_points.get((file_path, version_id))
+                save_idx = save_points.get((project_file, version_id))
                 if save_idx is None or save_idx >= i:
                     break  # Can't locate save point
 
@@ -1301,7 +1319,7 @@ class LLMClient:
                             tcj_args = json.loads(tcj["function"].get("arguments", "{}"))
                         except (json.JSONDecodeError, KeyError, TypeError):
                             continue
-                        if self._tool_touches_file(tcj_args, file_path):
+                        if self._tool_touches_project(tcj_args, project_file):
                             marked.add(j)
                             tool_call_removals.setdefault(pj, []).append(tcj_id)
                 break
@@ -1422,10 +1440,12 @@ class LLMClient:
             log.info("_annotate_stale_queries: tagged %d stale query result(s)", annotated)
 
     @staticmethod
-    def _tool_touches_file(args: dict[str, Any], file_path: str) -> bool:
-        """Return True if *args* reference *file_path* via any known file arg name."""
+    def _tool_touches_project(args: dict[str, Any], project_file: str) -> bool:
+        """Return True if *args* reference any file of *project_file*'s project."""
+        target = os.path.abspath(project_file)
         for key in ("file_path", "schematic_path", "pcb_path", "project_path"):
-            if args.get(key) == file_path:
+            value = args.get(key)
+            if value and os.path.abspath(_project_path_for(value)) == target:
                 return True
         return False
 
@@ -1662,7 +1682,8 @@ class LLMClient:
                         f"{policy.path_arg!r} argument."
                     ),
                 }
-            if path not in state.snapshotted_paths:
+            project_path = _project_path_for(path)
+            if project_path not in state.snapshotted_paths:
                 # Save the document in KiCad first to sync in-memory changes
                 # (e.g. from IPC operations) to disk before taking a snapshot.
                 save_args = {"file_path": path}
@@ -1675,20 +1696,20 @@ class LLMClient:
                         save_result.get("error", "unknown error"),
                     )
 
-                snapshot_args = {"file_path": path}
+                snapshot_args = {"project_file": project_path}
                 snapshot_result = call_mcp_tool(
-                    self._mcp_base_url, "save_file_version", snapshot_args
+                    self._mcp_base_url, "save_project_version", snapshot_args
                 )
                 self._emit_tool_callback(
-                    on_tool_call, "save_file_version", snapshot_args, snapshot_result
+                    on_tool_call, "save_project_version", snapshot_args, snapshot_result
                 )
                 if not self._tool_result_succeeded(snapshot_result):
                     error = snapshot_result.get("error", "unknown error")
                     return {
                         "success": False,
-                        "error": f"Failed to save file version before {tool_name}: {error}",
+                        "error": (f"Failed to save project version before {tool_name}: {error}"),
                     }
-                state.snapshotted_paths.add(path)
+                state.snapshotted_paths.add(project_path)
 
         result = call_mcp_tool(self._mcp_base_url, tool_name, args)
 
@@ -1709,7 +1730,7 @@ class LLMClient:
             return result
 
         if policy.track_snapshot and path:
-            state.snapshotted_paths.add(path)
+            state.snapshotted_paths.add(_project_path_for(path))
         if policy.clear_dirty_paths_arg:
             reload_paths = args.get(policy.clear_dirty_paths_arg, [])
             if isinstance(reload_paths, list):

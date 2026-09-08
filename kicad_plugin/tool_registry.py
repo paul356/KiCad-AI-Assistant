@@ -403,15 +403,15 @@ TOOL_POLICIES: dict[str, ToolPolicy] = {
     "update_pcb_from_schematic": ToolPolicy(kind="ipc_action"),
     "reload_kicad": ToolPolicy(kind="ui_refresh", clear_dirty_paths_arg="paths"),
     # Version tools
-    "save_file_version": ToolPolicy(
+    "save_project_version": ToolPolicy(
         kind="versioning",
-        path_arg="file_path",
+        path_arg="project_file",
         track_snapshot=True,
     ),
-    "list_file_versions": ToolPolicy(kind="versioning"),
-    "restore_file_version": ToolPolicy(
+    "list_project_versions": ToolPolicy(kind="versioning"),
+    "restore_project_version": ToolPolicy(
         kind="versioning",
-        path_arg="file_path",
+        path_arg="project_file",
         track_snapshot=True,
         mark_dirty=True,
     ),

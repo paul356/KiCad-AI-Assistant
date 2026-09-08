@@ -520,7 +520,13 @@ class TestRunIntegration:
         assert result == "done"
         assert mock_call_tool.call_args_list == [
             ((client._mcp_base_url, "save_document", {"file_path": "/tmp/board.kicad_pcb"}),),
-            ((client._mcp_base_url, "save_file_version", {"file_path": "/tmp/board.kicad_pcb"}),),
+            (
+                (
+                    client._mcp_base_url,
+                    "save_project_version",
+                    {"project_file": "/tmp/board.kicad_pro"},
+                ),
+            ),
             (
                 (
                     client._mcp_base_url,
@@ -532,7 +538,7 @@ class TestRunIntegration:
         ]
         assert [call.args[0] for call in on_tool_call.call_args_list] == [
             "save_document",
-            "save_file_version",
+            "save_project_version",
             "set_footprint_position",
             "reload_kicad",
         ]
@@ -578,7 +584,13 @@ class TestRunIntegration:
         assert result == "done"
         assert mock_call_tool.call_args_list == [
             ((client._mcp_base_url, "save_document", {"file_path": "/tmp/board.kicad_pcb"}),),
-            ((client._mcp_base_url, "save_file_version", {"file_path": "/tmp/board.kicad_pcb"}),),
+            (
+                (
+                    client._mcp_base_url,
+                    "save_project_version",
+                    {"project_file": "/tmp/board.kicad_pro"},
+                ),
+            ),
             (
                 (
                     client._mcp_base_url,
@@ -590,7 +602,7 @@ class TestRunIntegration:
         ]
         assert [call.args[0] for call in on_tool_call.call_args_list] == [
             "save_document",
-            "save_file_version",
+            "save_project_version",
             "pcb_route_pad_to_pad",
             "reload_kicad",
         ]
@@ -796,7 +808,13 @@ class TestRunIntegration:
         assert result == "done"
         assert mock_call_tool.call_args_list == [
             ((client._mcp_base_url, "save_document", {"file_path": "/tmp/board.kicad_pcb"}),),
-            ((client._mcp_base_url, "save_file_version", {"file_path": "/tmp/board.kicad_pcb"}),),
+            (
+                (
+                    client._mcp_base_url,
+                    "save_project_version",
+                    {"project_file": "/tmp/board.kicad_pro"},
+                ),
+            ),
             (
                 (
                     client._mcp_base_url,
@@ -814,7 +832,7 @@ class TestRunIntegration:
             ((client._mcp_base_url, "reload_kicad", {"paths": ["/tmp/board.kicad_pcb"]}),),
         ]
 
-    def test_explicit_save_file_version_is_reused_by_later_mutation(self):
+    def test_explicit_save_project_version_is_reused_by_later_mutation(self):
         client = _make_client()
         save_response = {
             "finish_reason": "tool_calls",
@@ -825,8 +843,8 @@ class TestRunIntegration:
                         "id": "tc1",
                         "type": "function",
                         "function": {
-                            "name": "save_file_version",
-                            "arguments": json.dumps({"file_path": "/tmp/board.kicad_pcb"}),
+                            "name": "save_project_version",
+                            "arguments": json.dumps({"project_file": "/tmp/board.kicad_pro"}),
                         },
                     }
                 ],
@@ -857,7 +875,7 @@ class TestRunIntegration:
         client._call_llm = MagicMock(side_effect=[save_response, mutate_response, final_response])
         client._fetch_tool_definitions = MagicMock(
             return_value=[
-                {"function": {"name": "save_file_version"}},
+                {"function": {"name": "save_project_version"}},
                 {"function": {"name": "set_footprint_position"}},
             ]
         )
@@ -872,7 +890,13 @@ class TestRunIntegration:
 
         assert result == "done"
         assert mock_call_tool.call_args_list == [
-            ((client._mcp_base_url, "save_file_version", {"file_path": "/tmp/board.kicad_pcb"}),),
+            (
+                (
+                    client._mcp_base_url,
+                    "save_project_version",
+                    {"project_file": "/tmp/board.kicad_pro"},
+                ),
+            ),
             (
                 (
                     client._mcp_base_url,
@@ -919,11 +943,19 @@ class TestRunIntegration:
         assert result == "done"
         assert mock_call_tool.call_args_list == [
             ((client._mcp_base_url, "save_document", {"file_path": "/tmp/board.kicad_pcb"}),),
-            ((client._mcp_base_url, "save_file_version", {"file_path": "/tmp/board.kicad_pcb"}),),
+            (
+                (
+                    client._mcp_base_url,
+                    "save_project_version",
+                    {"project_file": "/tmp/board.kicad_pro"},
+                ),
+            ),
         ]
         tool_result = json.loads(client._history[-2]["content"])
         assert tool_result["success"] is False
-        assert "Failed to save file version before set_footprint_position" in tool_result["error"]
+        assert (
+            "Failed to save project version before set_footprint_position" in tool_result["error"]
+        )
 
     def test_run_reports_missing_tool_policy_before_calling_llm(self):
         client = _make_client()
@@ -1651,7 +1683,7 @@ class TestPruneRollbackHistory:
           ("user", "text or dict")
           ("assistant", text)
           ("assistant+tc", [tool_call, ...])
-          ("tool+save", file_path, version_id, tool_call_id)  → save_file_version result
+          ("tool+save", file_path, version_id, tool_call_id)  → save_project_version result
           ("tool+restore", file_path, version_id, tool_call_id) → restore result
           ("tool+misc", tool_call_id, content_dict) → generic tool result
           ("tool", tool_call_id, "content_string")
@@ -1711,8 +1743,8 @@ class TestPruneRollbackHistory:
                     [
                         _tool_call(
                             "tc1",
-                            "restore_file_version",
-                            {"file_path": "f.sch", "version_id": "v999"},
+                            "restore_project_version",
+                            {"project_file": "f.kicad_pro", "version_id": "v999"},
                         )
                     ],
                 ),
@@ -1730,7 +1762,10 @@ class TestPruneRollbackHistory:
         history = self._make_history(
             [
                 ("user", "add resistor"),
-                ("assistant+tc", [_tool_call("s1", "save_file_version", {"file_path": "f.sch"})]),
+                (
+                    "assistant+tc",
+                    [_tool_call("s1", "save_project_version", {"project_file": "f.kicad_pro"})],
+                ),
                 ("tool+save", "f.sch", "v1", "s1"),
                 # Turn A – touches file
                 (
@@ -1747,8 +1782,8 @@ class TestPruneRollbackHistory:
                     [
                         _tool_call(
                             "rst",
-                            "restore_file_version",
-                            {"file_path": "f.sch", "version_id": "v1"},
+                            "restore_project_version",
+                            {"project_file": "f.kicad_pro", "version_id": "v1"},
                         )
                     ],
                 ),
@@ -1768,7 +1803,10 @@ class TestPruneRollbackHistory:
         history = self._make_history(
             [
                 ("user", "start"),
-                ("assistant+tc", [_tool_call("s1", "save_file_version", {"file_path": "f.sch"})]),
+                (
+                    "assistant+tc",
+                    [_tool_call("s1", "save_project_version", {"project_file": "f.kicad_pro"})],
+                ),
                 ("tool+save", "f.sch", "v1", "s1"),
                 # Turn touches f.sch
                 (
@@ -1788,8 +1826,8 @@ class TestPruneRollbackHistory:
                     [
                         _tool_call(
                             "rst",
-                            "restore_file_version",
-                            {"file_path": "f.sch", "version_id": "v1"},
+                            "restore_project_version",
+                            {"project_file": "f.kicad_pro", "version_id": "v1"},
                         )
                     ],
                 ),
@@ -1820,7 +1858,10 @@ class TestPruneRollbackHistory:
         history = self._make_history(
             [
                 ("user", "start"),
-                ("assistant+tc", [_tool_call("s1", "save_file_version", {"file_path": "f.sch"})]),
+                (
+                    "assistant+tc",
+                    [_tool_call("s1", "save_project_version", {"project_file": "f.kicad_pro"})],
+                ),
                 ("tool+save", "f.sch", "v1", "s1"),
                 # One turn with two tool_calls: only one touches f.sch
                 (
@@ -1839,8 +1880,8 @@ class TestPruneRollbackHistory:
                     [
                         _tool_call(
                             "rst",
-                            "restore_file_version",
-                            {"file_path": "f.sch", "version_id": "v1"},
+                            "restore_project_version",
+                            {"project_file": "f.kicad_pro", "version_id": "v1"},
                         ),
                     ],
                 ),
@@ -1867,7 +1908,10 @@ class TestPruneRollbackHistory:
             [
                 ("user", "start"),
                 # save v1
-                ("assistant+tc", [_tool_call("s1", "save_file_version", {"file_path": "f.sch"})]),
+                (
+                    "assistant+tc",
+                    [_tool_call("s1", "save_project_version", {"project_file": "f.kicad_pro"})],
+                ),
                 ("tool+save", "f.sch", "v1", "s1"),
                 # Turn T1
                 (
@@ -1876,7 +1920,10 @@ class TestPruneRollbackHistory:
                 ),
                 ("tool", "t1", '{"uuid": "T1"}'),
                 # save v2 (after T1)
-                ("assistant+tc", [_tool_call("s2", "save_file_version", {"file_path": "f.sch"})]),
+                (
+                    "assistant+tc",
+                    [_tool_call("s2", "save_project_version", {"project_file": "f.kicad_pro"})],
+                ),
                 ("tool+save", "f.sch", "v2", "s2"),
                 # Turn T2
                 (
@@ -1890,8 +1937,8 @@ class TestPruneRollbackHistory:
                     [
                         _tool_call(
                             "rst2",
-                            "restore_file_version",
-                            {"file_path": "f.sch", "version_id": "v2"},
+                            "restore_project_version",
+                            {"project_file": "f.kicad_pro", "version_id": "v2"},
                         )
                     ],
                 ),
@@ -1908,8 +1955,8 @@ class TestPruneRollbackHistory:
                     [
                         _tool_call(
                             "rst1",
-                            "restore_file_version",
-                            {"file_path": "f.sch", "version_id": "v1"},
+                            "restore_project_version",
+                            {"project_file": "f.kicad_pro", "version_id": "v1"},
                         )
                     ],
                 ),
@@ -1927,7 +1974,7 @@ class TestPruneRollbackHistory:
                 assert "version_id" in content or "restored_from" in content
             if m["role"] == "assistant" and m.get("tool_calls"):
                 names = [tc["function"]["name"] for tc in m["tool_calls"]]
-                assert all(n in ("save_file_version", "restore_file_version") for n in names)
+                assert all(n in ("save_project_version", "restore_project_version") for n in names)
 
     # ---- Multiple file paths -------------------------------------------------
 
@@ -1935,9 +1982,15 @@ class TestPruneRollbackHistory:
         history = self._make_history(
             [
                 ("user", "start"),
-                ("assistant+tc", [_tool_call("s1", "save_file_version", {"file_path": "a.sch"})]),
+                (
+                    "assistant+tc",
+                    [_tool_call("s1", "save_project_version", {"project_file": "a.kicad_pro"})],
+                ),
                 ("tool+save", "a.sch", "vA", "s1"),
-                ("assistant+tc", [_tool_call("s2", "save_file_version", {"file_path": "b.sch"})]),
+                (
+                    "assistant+tc",
+                    [_tool_call("s2", "save_project_version", {"project_file": "b.kicad_pro"})],
+                ),
                 ("tool+save", "b.sch", "vB", "s2"),
                 (
                     "assistant+tc",
@@ -1954,8 +2007,8 @@ class TestPruneRollbackHistory:
                     [
                         _tool_call(
                             "rst",
-                            "restore_file_version",
-                            {"file_path": "a.sch", "version_id": "vA"},
+                            "restore_project_version",
+                            {"project_file": "a.kicad_pro", "version_id": "vA"},
                         )
                     ],
                 ),
@@ -1973,14 +2026,22 @@ class TestPruneRollbackHistory:
                     if tc["function"]["name"] == "add_symbol_to_schematic":
                         assert args["file_path"] == "b.sch"
 
-    def test_restore_schematic_does_not_affect_pcb(self):
-        """Restoring a .sch file must not prune .kicad_pcb modifications."""
+    def test_restore_project_prunes_all_project_files(self):
+        """Restoring a project prunes turns touching ANY bundled file (sch or PCB).
+
+        The archive bundles the same-stem schematic + PCB + project file, so
+        a project restore invalidates tool calls against either file.
+        """
         history = self._make_history(
             [
                 ("user", "start"),
                 (
                     "assistant+tc",
-                    [_tool_call("s1", "save_file_version", {"file_path": "proj/main.kicad_sch"})],
+                    [
+                        _tool_call(
+                            "s1", "save_project_version", {"project_file": "proj/main.kicad_pro"}
+                        )
+                    ],
                 ),
                 ("tool+save", "proj/main.kicad_sch", "v1", "s1"),
                 # Schematic change
@@ -2005,8 +2066,8 @@ class TestPruneRollbackHistory:
                     [
                         _tool_call(
                             "rst",
-                            "restore_file_version",
-                            {"file_path": "proj/main.kicad_sch", "version_id": "v1"},
+                            "restore_project_version",
+                            {"project_file": "proj/main.kicad_pro", "version_id": "v1"},
                         )
                     ],
                 ),
@@ -2016,22 +2077,12 @@ class TestPruneRollbackHistory:
         client = _make_client()
         client._history = history
         client._prune_rollback_history()
-        # Schematic turn should be pruned
+        # Both the schematic and the PCB turns should be pruned
         for m in client._history:
             if m["role"] == "assistant" and m.get("tool_calls"):
                 names = [tc["function"]["name"] for tc in m["tool_calls"]]
                 assert "add_symbol_to_schematic" not in names
-        # PCB turn MUST survive
-        pcb_assistants = [
-            m
-            for m in client._history
-            if m["role"] == "assistant"
-            and m.get("tool_calls")
-            and any(tc["function"]["name"] == "add_footprint" for tc in m["tool_calls"])
-        ]
-        assert len(pcb_assistants) == 1
-        args = json.loads(pcb_assistants[0]["tool_calls"][0]["function"]["arguments"])
-        assert args["file_path"] == "proj/main.kicad_pcb"
+                assert "add_footprint" not in names
 
     def test_restore_shares_only_same_full_path(self):
         """Files with same stem but different paths are treated independently."""
@@ -2040,7 +2091,13 @@ class TestPruneRollbackHistory:
                 ("user", "start"),
                 (
                     "assistant+tc",
-                    [_tool_call("s1", "save_file_version", {"file_path": "proj/sub/leaf.sch"})],
+                    [
+                        _tool_call(
+                            "s1",
+                            "save_project_version",
+                            {"project_file": "proj/sub/leaf.kicad_pro"},
+                        )
+                    ],
                 ),
                 ("tool+save", "proj/sub/leaf.sch", "v1", "s1"),
                 # Change to leaf.sch in a different directory
@@ -2055,8 +2112,8 @@ class TestPruneRollbackHistory:
                     [
                         _tool_call(
                             "rst",
-                            "restore_file_version",
-                            {"file_path": "proj/sub/leaf.sch", "version_id": "v1"},
+                            "restore_project_version",
+                            {"project_file": "proj/sub/leaf.kicad_pro", "version_id": "v1"},
                         )
                     ],
                 ),
