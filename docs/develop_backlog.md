@@ -195,6 +195,72 @@ retained per maintainer decision)
 
 ---
 
+## LLM vision-guided routing loop
+
+**Status:** open (proposed)
+
+### Current state
+
+- Routing is one-shot/batch: the plugin auto-route exports the board to
+  DSN, runs FreeRouting headless and reimports the SES
+  (`kicad_plugin/autorouter.py`, `start_freerouting_thread`); the kcaa
+  router routes one net at a time over a world model (obstacles →
+  visibility graph → A*), but nothing inspects the routed result or
+  steers the router mid-flight. A congested corridor, a via farm or a
+  detour net is only caught afterwards by DRC (`run_drc_via_ipc`).
+- `generate_pcb_thumbnail(project_path)` (`kcaa/tools/export_tools.py`)
+  already renders the board to a PNG via kicad-cli, and `llm_client.py`
+  already carries multimodal turns (`_build_user_content` emits
+  OpenAI-style `image_url` blocks; converted for Anthropic/Ollama) — but
+  nothing feeds a tool-rendered raster back to the model.
+
+### Aim
+
+- Close the loop with LLM vision: render the board state → the LLM
+  inspects it (unrouted ratlines, congestion, DRC markers, crossing or
+  cramped traces, via density) → returns a short corrective routing plan
+  (nets/regions to rework and in what order) → the router/FreeRouting
+  applies it → re-render; repeat until the LLM judges the board clean.
+
+### Fix (proposed)
+
+1. **Raster into the loop**: let the review step call
+   `generate_pcb_thumbnail` (plus optional zoomed crop on a region from
+   the track bbox) and surface the returned PNG as an `images` entry on
+   the next turn, reusing the existing multimodal plumbing instead of
+   adding a parallel image path.
+2. **Vision review**: a schema-constrained prompt over the raster
+   returning e.g. `{ok: bool, rework: [{net, area, reason}],
+   congestion: [area]}`; parse strictly, reject free-form
+3. **Steering mapping**: map `rework` back to executable routing — net
+   order + tear-down-and-reroute list for `kcaa.router.router`
+   (per-net `build_world_model` calls already exist), or reorder /
+   `ignore_nets`-constrained FreeRouting passes (`autorouter.py` already
+   supports per-run net ignores).
+4. **Termination without silent fallback**: stop when the review returns
+   `ok` or an explicit iteration budget is exhausted; on budget
+   exhaustion report the last review (remaining issues) to the user
+   instead of looping forever or inventing a degraded path.
+
+### Open questions
+
+- Which configured backends are actually vision-capable, and does the
+  MCP tool-result → `images` wiring exist anywhere yet (thumbnail PNG
+  today returns a path/text, not a base64 content block)?
+- Visual review is a *hint*, not geometry truth — final acceptance must
+  stay with `run_drc_via_ipc`; the summary is a heuristic gate, not a
+  validation path.
+
+### Validation
+
+- Unit: review-output schema parsing and the review → net-order/reroute
+  steering mapping over a fixture board with a known congested corridor.
+- Integration: small 2-layer board with a deliberately congested corner;
+  run the loop on the MCP server and assert it converges (`ok`) or
+  reports unresolved nets within the iteration budget.
+
+---
+
 ## Resolved
 
 ### Unify schematic/PCB version management and archive history
