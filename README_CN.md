@@ -337,6 +337,9 @@ kcaa
 | `save_file_version` | 保存版本快照以便回退 |
 | `list_file_versions` | 列出已保存的版本快照 |
 | `restore_file_version` | 恢复到之前保存的版本 |
+| `save_project_version` | 保存项目版本归档（原理图+PCB+项目文件） |
+| `list_project_versions` | 列出已保存的项目版本归档 |
+| `restore_project_version` | 将项目文件一起恢复到已保存的归档 |
 | `generate_pcb_thumbnail` | 渲染 PCB 缩略图 |
 | `generate_project_thumbnail` | 渲染项目缩略图 |
 

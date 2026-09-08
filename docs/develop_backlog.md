@@ -81,50 +81,6 @@ rotation plus the footprint rotation (verify which KiCad actually applies).
 
 ---
 
-## Unify schematic/PCB version management and archive history
-
-**Status:** open (proposed)
-
-### Current state
-
-- `kcaa/tools/version_tools.py` snapshots a single file into the
-  project's `.versions/` directory (`save_file_version` /
-  `list_file_versions` / `restore_file_version`) — callers must invoke it
-  per file, and the two file kinds are managed independently.
-- Every edit tool (`symbol_edit_tools.py`, `wire_edit_tools.py`, …)
-  writes a `.kicad_sch.bak` before saving — one-shot, single-path.
-- KiCad itself maintains a per-file `.history/` folder; three separate
-  mechanisms coexist with no shared retention policy.
-
-### Aim
-
-- One versioning scheme covering both `.kicad_sch` and `.kicad_pcb` (and,
-  optionally, the whole project tree), so a restore can roll the project
-  back as a unit.
-- Compact storage: pack history files into one archive (`.tar.gz`/`.zip`)
-  per project instead of loose timestamped copies, with a retention
-  policy (keep-all, keep-last-N, daily/weekly) chosen by the user.
-
-### Fix (proposed)
-
-1. Extend `version_tools.py` with `save_project_version` /
-   `list_project_versions` / `restore_project_version` that snapshot the
-   schematic+PCB set (or whole project) as one archive entry.
-2. Route the per-edit `.bak` writes through the same archive writer, or
-   document explicitly that `.bak` stays a short-lived single-change
-   safety net while `.versions/` is the durable archive.
-3. Define how archived history interplays with KiCad's own `.history/`
-   (which KiCad auto-prunes) to avoid duplication.
-
-### Validation
-
-- Unit: `tests/unit/tools/test_version_tools.py` extended — project
-  archive contains consistent sch+pcb pairs; restore returns all files;
-  retention policy evicts correctly.
-- Manual: edit schematic + PCB, save versions, restore an older pair.
-
----
-
 ## Project-level symbol table with 3rdparty symbol export
 
 **Status:** open (proposed)
@@ -240,6 +196,42 @@ retained per maintainer decision)
 ---
 
 ## Resolved
+
+### Unify schematic/PCB version management and archive history
+
+**Status:** resolved (2026-09-08) — PR #121 (commits `20c088a`, `0bcb0fe`);
+closes issue #120.
+
+Schematic, PCB and `.kicad_pro` now share one version id and restore
+together as a consistent unit.  The `keep-all / daily-weekly` retention
+spectrum was trimmed to a parametrized keep-last-N (default 10) matching
+the existing per-file `MAX_VERSIONS` semantics.
+
+#### Implementation
+
+1. `kcaa/utils/version_manager.py` — `save_project_version` /
+   `list_project_versions` / `restore_project_version` pack the same-stem
+   `.kicad_sch` + `.kicad_pcb` + `.kicad_pro` into one `.tar.gz` under
+   `<project_dir>/.versions/project/` (`<stem>.project.<ts>.tar.gz`) with a
+   `.manifest.json` (per-file SHA-256) for dedup; restore archives the
+   current state first (undoable) and extracts over the project files.
+   Only files that currently exist are archived.
+2. `kcaa/tools/version_tools.py` — three MCP tools wrapping the manager,
+   registered in both profiles through the existing
+   `register_version_tools`.
+3. `.bak` stays the short-lived single-change safety net; KiCad's
+   auto-pruned `.history/` stays independent.  `.gitignore` now excludes
+   `**/.versions/`.
+
+#### Validation
+
+- Unit `tests/unit/tools/test_project_version_tools.py` (14): archive
+  bundles all three files, dedup reuse, distinct id on change, pro-only
+  project, keep-pruning, missing-file/OSError paths, restore round-trip
+  and undo via backup id.
+- Integration `tests/integration/test_version_tools.py` (6 new): save /
+  list / restore over the real MCP server.
+- Existing single-file version tests untouched and still pass.
 
 ### Tool-output collapse stops working in long sessions
 
