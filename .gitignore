@@ -73,6 +73,7 @@ fp-info-cache
 *.kicad_pcb-bak
 *.kicad_sch-bak
 *.kicad_pro-bak
+**/.versions/
 *.kicad_prl
 *.kicad_prl-bak
 *.kicad_sch.lck
