@@ -338,6 +338,9 @@ kcaa
 | `save_file_version` | Save a version snapshot for rollback |
 | `list_file_versions` | List saved version snapshots |
 | `restore_file_version` | Restore to a previously saved version |
+| `save_project_version` | Save a project version archive (schematic+PCB+project file) |
+| `list_project_versions` | List saved project version archives |
+| `restore_project_version` | Restore project files together to a saved archive |
 | `generate_pcb_thumbnail` | Render a PCB thumbnail image |
 | `generate_project_thumbnail` | Render a project thumbnail |
 
