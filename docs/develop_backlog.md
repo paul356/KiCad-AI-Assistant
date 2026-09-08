@@ -199,13 +199,13 @@ retained per maintainer decision)
 
 ### Unify schematic/PCB version management and archive history
 
-**Status:** resolved (2026-09-08) — PR #121 (commits `20c088a`, `0bcb0fe`);
-closes issue #120.
+**Status:** resolved (2026-09-08) — PR #121 (commits `20c088a`, `0bcb0fe`,
+`0e0e22f`); closes issue #120.
 
 Schematic, PCB and `.kicad_pro` now share one version id and restore
 together as a consistent unit.  The `keep-all / daily-weekly` retention
-spectrum was trimmed to a parametrized keep-last-N (default 10) matching
-the existing per-file `MAX_VERSIONS` semantics.
+spectrum was trimmed to a parametrized keep-last-N (default 10), the same
+default the removed per-file tools used.
 
 #### Implementation
 
@@ -244,7 +244,9 @@ the existing per-file `MAX_VERSIONS` semantics.
   and undo via backup id.
 - Integration `tests/integration/test_version_tools.py` (6 new): save /
   list / restore over the real MCP server.
-- Existing single-file version tests untouched and still pass.
+- The legacy unit test file (`tests/unit/tools/test_version_tools.py`) was
+  removed with the tools it tested; `test_llm_client.py` auto-snapshot and
+  rollback-pruning tests were migrated to the project scheme.
 
 ### Tool-output collapse stops working in long sessions
 
