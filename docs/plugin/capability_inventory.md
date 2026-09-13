@@ -87,11 +87,9 @@ These tools depend on `kicad-cli`, perform OS-level actions that belong to KiCad
 | `run_drc_check` | `drc_tools.py` | `kicad-cli` dependent; DRC is a separate milestone |
 | `get_drc_history` | `drc_tools.py` | `kicad-cli` dependent |
 | `generate_pcb_thumbnail` | `export_tools.py` | `kicad-cli` dependent |
-| `generate_project_thumbnail` | `export_tools.py` | `kicad-cli` dependent |
 | `analyze_bom` | `bom_tools.py` | `kicad-cli` dependent |
 | `export_bom_csv` | `bom_tools.py` | `kicad-cli` dependent |
 | `identify_circuit_patterns` | `pattern_tools.py` | Pattern recognition not needed for editing workflows |
-| `analyze_project_circuit_patterns` | `pattern_tools.py` | Same as above |
 | `validate_project_boundaries` | `validation_tools.py` | Not registered in `server.py`; not relevant to plugin editing profile |
 
 ---

@@ -226,7 +226,6 @@ kcaa
 | `extract_schematic_netlist` | Extract netlist from a schematic |
 | `find_component_connections` | Find all connections for a component |
 | `identify_circuit_patterns` | Identify common circuit patterns |
-| `analyze_project_circuit_patterns` | Analyze circuit patterns in a project |
 | `validate_project` | Basic validation of a KiCad project |
 | `validate_project_boundaries` | Validate component boundaries |
 | `generate_validation_report` | Generate a comprehensive validation report |
@@ -338,7 +337,6 @@ kcaa
 | `list_project_versions` | List saved project version archives |
 | `restore_project_version` | Restore project files together to a saved archive |
 | `generate_pcb_thumbnail` | Render a PCB thumbnail image |
-| `generate_project_thumbnail` | Render a project thumbnail |
 
 ### Skill System
 

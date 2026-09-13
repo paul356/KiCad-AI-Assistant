@@ -225,7 +225,6 @@ kcaa
 | `extract_schematic_netlist` | 从原理图提取网表 |
 | `find_component_connections` | 查找元件的所有连接 |
 | `identify_circuit_patterns` | 识别常见电路模式 |
-| `analyze_project_circuit_patterns` | 分析项目中的电路模式 |
 | `validate_project` | 项目基本验证 |
 | `validate_project_boundaries` | 验证元件边界 |
 | `generate_validation_report` | 生成综合验证报告 |
@@ -337,7 +336,6 @@ kcaa
 | `list_project_versions` | 列出已保存的项目版本归档 |
 | `restore_project_version` | 将项目文件一起恢复到已保存的归档 |
 | `generate_pcb_thumbnail` | 渲染 PCB 缩略图 |
-| `generate_project_thumbnail` | 渲染项目缩略图 |
 
 ### 技能系统
 

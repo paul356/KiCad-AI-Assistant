@@ -7,7 +7,6 @@ from typing import Any
 
 from fastmcp import Context, FastMCP
 
-from kcaa.utils.file_utils import get_project_files
 from kcaa.utils.netlist_parser import extract_netlist
 from kcaa.utils.pattern_recognition import (
     identify_amplifiers,
@@ -154,52 +153,4 @@ def register_pattern_tools(mcp: FastMCP) -> None:
         except Exception as e:
             if ctx:
                 ctx.info(f"Error identifying circuit patterns: {str(e)}")
-            return {"success": False, "error": str(e)}
-
-    @mcp.tool()
-    async def analyze_project_circuit_patterns(
-        project_path: str, ctx: Context | None
-    ) -> dict[str, Any]:
-        """Identify circuit patterns in a KiCad project's schematic.
-
-        Args:
-            project_path: Path to the KiCad project file (.kicad_pro)
-            ctx: MCP context for progress reporting
-
-        Returns:
-            Dictionary with identified circuit patterns
-        """
-        if not os.path.exists(project_path):
-            if ctx:
-                ctx.info(f"Project not found: {project_path}")
-            return {"success": False, "error": f"Project not found: {project_path}"}
-
-        # Report progress
-        if ctx:
-            await ctx.report_progress(10, 100)
-
-        # Get the schematic file
-        try:
-            files = get_project_files(project_path)
-
-            if "schematic" not in files:
-                if ctx:
-                    ctx.info("Schematic file not found in project")
-                return {"success": False, "error": "Schematic file not found in project"}
-
-            schematic_path = files["schematic"]
-            if ctx:
-                ctx.info(f"Found schematic file: {os.path.basename(schematic_path)}")
-
-            # Identify patterns in the schematic
-            result = await identify_circuit_patterns(schematic_path, ctx)
-
-            # Add project path to result
-            if "success" in result and result["success"]:
-                result["project_path"] = project_path
-
-            return result
-
-        except Exception as e:
-            ctx.info(f"Error analyzing project circuit patterns: {str(e)}")
             return {"success": False, "error": str(e)}
