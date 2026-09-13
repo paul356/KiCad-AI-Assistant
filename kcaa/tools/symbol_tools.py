@@ -229,7 +229,8 @@ def register_symbol_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
     async def sync_symbol_index(force: bool = False, ctx: Context | None = None) -> dict[str, Any]:
-        """Start syncing the symbol index database with the current KiCad symbol libraries.
+        """
+        Start syncing the symbol index database with the current KiCad symbol libraries.
 
         This tool returns immediately — the actual sync runs in a background thread
         to avoid tool call timeouts. The first sync can take several minutes because
@@ -273,7 +274,8 @@ def register_symbol_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
     async def get_symbol_sync_status(ctx: Context | None = None) -> dict[str, Any]:
-        """Return the current status of the background symbol index sync.
+        """
+        Return the current status of the background symbol index sync.
 
         Call this after sync_symbol_index to monitor progress. Poll every few
         seconds until 'running' is False. When running is False and last_result
@@ -297,7 +299,8 @@ def register_symbol_tools(mcp: FastMCP) -> None:
         limit: int = 50,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
-        """Full-text search across all indexed KiCad symbols.
+        """
+        Full-text search across all indexed KiCad symbols.
 
         Searches symbol name, description, and keywords. Results are ordered
         by relevance. Run sync_symbol_index first if the index is empty.
@@ -343,7 +346,8 @@ def register_symbol_tools(mcp: FastMCP) -> None:
         symbol_name: str,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
-        """Look up a single KiCad symbol by library and symbol name.
+        """
+        Look up a single KiCad symbol by library and symbol name.
 
         Returns symbol metadata plus a ``body_bbox`` describing the symbol's
         extent in **library coordinate space** (Y-up, mm). The bbox is the
@@ -395,7 +399,8 @@ def register_symbol_tools(mcp: FastMCP) -> None:
         offset: int = 0,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
-        """List KiCad symbol libraries from the index.
+        """
+        List KiCad symbol libraries from the index.
 
         **Always prefer** ``search_symbols`` when looking for a specific
         component — it searches names, descriptions, and keywords across all
@@ -476,7 +481,8 @@ def register_symbol_tools(mcp: FastMCP) -> None:
         offset: int = 0,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
-        """Return symbols in a specific KiCad symbol library.
+        """
+        Return symbols in a specific KiCad symbol library.
 
         **Prefer** ``search_symbols`` when looking for a specific component.
         Use this tool only to enumerate the contents of a *known* library.
@@ -527,7 +533,8 @@ def register_symbol_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
     async def get_symbol_index_stats(ctx: Context | None = None) -> dict[str, Any]:
-        """Return summary statistics about the symbol index database.
+        """
+        Return summary statistics about the symbol index database.
 
         Shows how many libraries and symbols are indexed, when the last sync
         ran, and where the database file is located.
