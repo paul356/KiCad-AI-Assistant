@@ -118,6 +118,22 @@ class TestSetBaseUrl:
         client.set_base_url("http://127.0.0.1:1234")
         assert client._mcp_base_url == "http://127.0.0.1:1234"
 
+    def test_url_change_invalidates_cached_registry(self):
+        client = _make_client()
+        client._tool_registry = {"get_board_info": _fake_tool_def("get_board_info")}
+        client._enabled_tools = {"get_board_info"}
+        client.set_base_url("http://127.0.0.1:7777")
+        assert client._tool_registry is None
+        assert client._enabled_tools == set()
+
+    def test_same_url_keeps_cached_registry(self):
+        client = _make_client()
+        client._tool_registry = {"get_board_info": _fake_tool_def("get_board_info")}
+        client._enabled_tools = {"get_board_info"}
+        client.set_base_url("http://127.0.0.1:9999")
+        assert client._tool_registry is not None
+        assert client._enabled_tools == {"get_board_info"}
+
 
 class TestDedupToolCalls:
     def test_no_change_when_no_tool_calls(self):
@@ -2556,6 +2572,64 @@ class TestToolLoading:
             "enable_tool", {"tools": ["get_board_info"]}, state, None
         )
         assert result["success"] is True
+
+    def test_mid_turn_enable_schema_in_next_request(self):
+        """P1: a tool enabled mid-turn must ship its schema in the NEXT request."""
+        client = _make_client()
+        client._tool_registry = {"get_board_info": _fake_tool_def("get_board_info")}
+        enable_resp = {
+            "finish_reason": "tool_calls",
+            "message": {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tc1",
+                        "type": "function",
+                        "function": {
+                            "name": "enable_tool",
+                            "arguments": json.dumps({"tools": ["get_board_info"]}),
+                        },
+                    }
+                ],
+            },
+        }
+        final_resp = {"finish_reason": "stop", "message": {"content": "done"}}
+        client._call_llm = MagicMock(side_effect=[enable_resp, final_resp])
+        with patch("kicad_plugin.llm_client.call_mcp_tool"):
+            result = client.run("use get_board_info", context_block="")
+        assert result == "done"
+        second_tools = client._call_llm.call_args_list[1].args[1]
+        assert [t["function"]["name"] for t in second_tools] == [
+            "enable_tool",
+            "disable_tool",
+            "get_tool_schema",
+            "get_board_info",
+        ]
+
+    def test_catalog_notice_when_registry_unavailable(self):
+        """P2: failed tools/list must surface, not run a catalog-less turn."""
+        client = _make_client()
+        client._tool_registry = None
+        client._fetch_tool_definitions = MagicMock(return_value=[])
+        block = client._build_tool_catalog_block()
+        assert "tool catalog unavailable" in block
+        assert "retry next turn" in block
+
+    def test_enable_tool_reports_unavailable_catalog(self):
+        client = _make_client()
+        client._tool_registry = None
+        client._fetch_tool_definitions = MagicMock(return_value=[])
+        result = client._execute_meta_tool("enable_tool", {"tools": ["get_board_info"]})
+        assert result["success"] is False
+        assert "unavailable" in result["error"]
+
+    def test_get_tool_schema_reports_unavailable_catalog(self):
+        client = _make_client()
+        client._tool_registry = None
+        client._fetch_tool_definitions = MagicMock(return_value=[])
+        result = client._execute_meta_tool("get_tool_schema", {"tool_name": "get_board_info"})
+        assert result["success"] is False
+        assert "unavailable" in result["error"]
 
 
 class TestContextBudgetIncludesTools:

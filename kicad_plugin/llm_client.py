@@ -252,9 +252,13 @@ _ANTHROPIC_DEFAULT_MAX_TOKENS = 65536
 #
 # The full tool catalog (110+ schemas) is expensive as a fixed per-request
 # cost (~46K estimated tokens). Instead of sending every schema with every
-# request, the client exposes two small discovery meta-tools and only sends
+# request, the client exposes three small discovery meta-tools and only sends
 # schemas the model explicitly loaded. The budget check in _maybe_compact
 # accounts for the loaded subset.
+#
+# The request tool list is rebuilt per loop iteration (see run()), so tools
+# enabled in a previous iteration have their full schema in the next request
+# — the "included in the next request" contract holds at request granularity.
 
 _META_TOOL_NAMES = frozenset({"enable_tool", "disable_tool", "get_tool_schema"})
 
@@ -1058,7 +1062,12 @@ class LLMClient:
         self._budget_warned: bool = False
 
     def reset(self) -> None:
-        """Clear conversation history, enabled-tool set, and one-shot warnings."""
+        """Clear conversation history, enabled-tool set, and one-shot warnings.
+
+        Must not be called while a turn is in flight on another thread: the
+        panel serializes chat turns, but other callers need their own
+        synchronization around run()/reset()/tool_direct.
+        """
         self._history = []
         self._enabled_tools.clear()
         self._fixed_overhead_warned = False
@@ -1071,7 +1080,17 @@ class LLMClient:
         The URL is only known once the backend has finished starting, which
         may happen after the client is created (e.g. on panel display before
         the backend came up).
+
+        The backend runs on a dynamically chosen port and may be restarted on
+        a new port (plugin ServerManager) without a client rebuild: a changed
+        URL invalidates the cached tool registry and enabled set so the next
+        turn refetches from the new endpoint instead of advertising tools the
+        current backend does (no longer) register.
         """
+        if url == self._mcp_base_url:
+            return
+        self._tool_registry = None
+        self._enabled_tools.clear()
         self._mcp_base_url = url
 
     def get_history(self) -> list[dict[str, Any]]:
@@ -1904,6 +1923,15 @@ class LLMClient:
         """
         if self._tool_registry is None:
             self._fetch_tool_definitions()
+        if self._tool_registry is None:
+            # tools/list failed (e.g. backend still starting): never silently
+            # run catalog-less — the LLM would enable against names it cannot
+            # know, burning the turn on "Unknown tool(s)" errors.
+            return (
+                "\n\n# Available tools\n"
+                "- (tool catalog unavailable: MCP server not reachable — "
+                "retry next turn)"
+            )
         registry = self._tool_registry or {}
         if not registry:
             return ""
@@ -1946,6 +1974,11 @@ class LLMClient:
             if self._tool_registry is None:
                 self._fetch_tool_definitions()
             registry = self._tool_registry or {}
+            if not registry:
+                return {
+                    "success": False,
+                    "error": "Tool catalog unavailable (MCP server not reachable) — retry next turn.",
+                }
             unknown = [t for t in names if t not in registry]
             if unknown:  # atomic: one bad name rejects the whole batch
                 return {
@@ -1989,6 +2022,11 @@ class LLMClient:
             if self._tool_registry is None:
                 self._fetch_tool_definitions()
             registry = self._tool_registry or {}
+            if not registry:
+                return {
+                    "success": False,
+                    "error": "Tool catalog unavailable (MCP server not reachable) — retry next turn.",
+                }
             if tool_name in registry:
                 if tool_name in self._enabled_tools:
                     return {
@@ -2136,6 +2174,10 @@ class LLMClient:
 
         try:
             for _ in range(20):  # max 20 iterations (guard against infinite loops)
+                # Rebuild the request tool list every iteration: tools enabled
+                # in a previous iteration must have their full schema in the
+                # NEXT request, not just in this loop's enabled-set (issue #129).
+                tools = self._build_request_tools()
                 response = self._call_llm(system, tools, on_stream_event=on_stream_event)
 
                 if response.get("error"):
