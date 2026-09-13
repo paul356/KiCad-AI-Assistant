@@ -26,6 +26,13 @@ def register_netlist_tools(mcp: FastMCP) -> None:
         This tool finds the schematic associated with a KiCad project
         and extracts its netlist information.
 
+        Thin wrapper over ``extract_schematic_netlist``: it locates the
+        project's schematic and delegates to it. Both tools return the same
+        analysis structure — they differ only in their parameters (a project
+        path here, a direct schematic path plus ``include_wire_topology``
+        there). This tool additionally adds a ``project_path`` key to the
+        result on success.
+
         Args:
             project_path: Path to the KiCad project file (.kicad_pro)
             ctx: MCP context for progress reporting
@@ -86,6 +93,10 @@ def register_netlist_tools(mcp: FastMCP) -> None:
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Extract component inventory, net analysis, and wire geometry for a KiCad schematic.
+
+        ``extract_project_netlist`` delegates here after locating the
+        project's schematic; both tools return the same analysis structure
+        and differ only in their parameters.
 
         A net is a named group of pins that are electrically connected by wires.
         For example, if R1/pin2, C1/pin1, and a GND power symbol are all joined
