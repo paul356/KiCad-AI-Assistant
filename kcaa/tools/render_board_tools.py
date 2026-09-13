@@ -21,7 +21,6 @@ matplotlib.use("Agg")
 from fastmcp import Context, FastMCP
 from fastmcp.utilities.types import Image
 import matplotlib.patches as mpatches  # noqa: E402
-import matplotlib.patheffects as pe  # noqa: E402
 import matplotlib.pyplot as plt  # noqa: E402
 
 from kcaa.utils.pcb_sexp_utils import load_pcb
@@ -39,7 +38,7 @@ _KICAD_LAYER_COLORS = {
 _BG_COLOR = "#17181D"
 _SILK_COLOR = "#E8E8E8"
 _COURTYARD_COLOR = "#A9C940"
-_RATSNEST_COLOR = "#1BE41B"
+_RATSNEST_COLOR = "#FFFFFF"
 _PAD_ALPHA = 0.9
 _ZONE_ALPHA = 0.4
 # Fractional zorder offset per copper layer (bottom of stackup first), so
@@ -747,11 +746,48 @@ def parse_board(pcb_path: str) -> BoardData:
     return board
 
 
-def _mst(
-    points: list[tuple[float, float]],
+def _dash_segments(
+    a: tuple[float, float],
+    b: tuple[float, float],
+    on_px: float,
+    off_px: float,
+    px: float,
 ) -> list[tuple[tuple[float, float], tuple[float, float]]]:
-    """Prim MST over points; returns segment list."""
+    """Split a straight a->b line into dash segments in data space.
+
+    Unlike a matplotlib linestyle (whose phase is tied to the whole polyline
+    length, so the tail can fall in an off gap), the first and last dashes
+    here are forced ``on`` so both line ends land exactly on the pads.
+    ``on_px``/``off_px`` are screen-pixel lengths; ``px`` is one pixel in
+    points (``72/dpi``), used only to convert lengths to data units on an
+    equal-aspect axes:
+        data_len = px_len_px * px * (25.4 / 72.0)
+    """
+    dx = b[0] - a[0]
+    dy = b[1] - a[1]
+    length = math.hypot(dx, dy)
+    if length <= 0:
+        return []
+    # 1 px = 1/72 inch = 1/72 * 25.4 mm; with equal aspect a pixel maps to
+    # the same mm in x and y, so px_len_px * mm_per_px converts to data units.
+    mm_per_px = px * 25.4 / 72.0
+    on = on_px * mm_per_px
+    off = off_px * mm_per_px
+    ux, uy = dx / length, dy / length
     segs: list[tuple[tuple[float, float], tuple[float, float]]] = []
+    t = 0.0
+    while t < length:
+        t1 = min(t + on, length)
+        segs.append(((a[0] + ux * t, a[1] + uy * t), (a[0] + ux * t1, a[1] + uy * t1)))
+        if t1 >= length:
+            break
+        t = t1 + off
+    return segs
+
+
+def _mst(points: list[tuple[float, float]]) -> list[tuple[int, int]]:
+    """Prim MST over points; returns index pairs (j, i) of selected edges."""
+    segs: list[tuple[int, int]] = []
     if len(points) < 2:
         return segs
     in_tree = [0]
@@ -766,7 +802,7 @@ def _mst(
         if best is None:
             raise RuntimeError("MST iteration failed to extend tree")
         _, j, i = best
-        segs.append((points[j], points[i]))
+        segs.append((j, i))
         in_tree.append(i)
         rest.remove(i)
     return segs
@@ -796,7 +832,8 @@ def _bounds(
         for p in e.get("pts", []):
             xs.append(p[0])
             ys.append(p[1])
-    for a, b in ratsnest:
+    for item in ratsnest:
+        a, b = item[0], item[1]
         xs += [a[0], b[0]]
         ys += [a[1], b[1]]
     for t in board.texts:
@@ -932,7 +969,7 @@ def render_board(
     board = parse_board(pcb_path)
 
     # Resolve requested pads to nets (name-based in KiCad 10).
-    requested: dict[str, list[tuple[float, float]]] = {}
+    requested: dict[str, list[tuple[tuple[float, float], tuple[str, ...]]]] = {}
     missing: list[str] = []
     for spec in connect_pads or []:
         ref, _, num = spec.partition(".")
@@ -945,9 +982,12 @@ def render_board(
             missing.append(spec)
             continue
         if found.net:
-            requested.setdefault(found.net, []).append(found.center)
+            requested.setdefault(found.net, []).append((found.center, tuple(found.copper_layers)))
 
-    ratsnest: list[tuple[tuple[float, float], tuple[float, float]]] = []
+    # Each ratsnest edge carries the copper layers shared by its endpoint
+    # pads (a route could exist there), so a single-layer render can draw it
+    # on the layer where both pads live.
+    ratsnest: list[tuple[tuple[float, float], tuple[float, float], set[str]]] = []
     pending_nets: list[str] = []
     routed_reported: list[str] = []
     for net, pts in sorted(requested.items()):
@@ -957,7 +997,13 @@ def render_board(
             routed_reported.append(net)
             continue
         pending_nets.append(net)
-        ratsnest.extend(_mst(pts))
+        centers = [p[0] for p in pts]
+        layers = [p[1] for p in pts]
+        for j, i in _mst(centers):
+            # Layers both endpoint pads share (a route could exist there);
+            # fall back to the union when the pads have no common layer.
+            shared = set(layers[j]) & set(layers[i])
+            ratsnest.append((centers[j], centers[i], shared or (set(layers[j]) | set(layers[i]))))
 
     # --- figure ---
     xmin, ymin, xmax, ymax = _bounds(board, ratsnest)
@@ -1098,16 +1144,31 @@ def render_board(
             zorder=_Z_SILK,
         )
 
-    # 7. Ratsnest on top.
-    for a, b in ratsnest:
-        ax.plot(
-            [a[0], b[0]],
-            [a[1], b[1]],
-            color=_RATSNEST_COLOR,
-            linewidth=2.4,
-            alpha=0.95,
-            zorder=_Z_RATSNEST,
-            path_effects=[pe.withStroke(linewidth=3.0, foreground=_BG_COLOR)],
+    # 7. Ratsnest on top; in a single-layer render only edges touching that
+    # layer (source or target pad) are drawn.  Hairline white dashes, like
+    # KiCad: manual segments keep both ends on the pads, and the width/dash
+    # lengths are pixel-scaled so they look the same at any dpi.
+    import matplotlib.collections as mcollections
+
+    px = 72.0 / dpi
+    rat_segs: list[tuple[tuple[float, float], tuple[float, float]]] = []
+    for item in ratsnest:
+        a, b, rlayers = item
+        if layer is not None and layer not in rlayers:
+            continue
+        rat_segs.extend(_dash_segments(a, b, 8, 5, px))
+    if rat_segs:
+        # 1.5 px hairline; do NOT clamp to a point-size floor, which would
+        # blow back up to ~5 px at the 1195 dpi this board renders at.
+        ax.add_collection(
+            mcollections.LineCollection(
+                rat_segs,
+                colors=_RATSNEST_COLOR,
+                linewidths=1.5 * px,
+                alpha=0.9,
+                zorder=_Z_RATSNEST,
+                transform=ax.transData,
+            )
         )
 
     buf = io.BytesIO()
