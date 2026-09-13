@@ -224,7 +224,6 @@ kcaa
 | Tool | Description |
 |------|-------------|
 | `extract_schematic_netlist` | Extract netlist from a schematic |
-| `extract_project_netlist` | Extract netlist for a whole project |
 | `find_component_connections` | Find all connections for a component |
 | `identify_circuit_patterns` | Identify common circuit patterns |
 | `analyze_project_circuit_patterns` | Analyze circuit patterns in a project |

@@ -29,7 +29,6 @@ class ToolPolicy:
 
 TOOL_POLICIES: dict[str, ToolPolicy] = {
     # Netlist tools
-    "extract_project_netlist": ToolPolicy(kind="query"),
     "extract_schematic_netlist": ToolPolicy(kind="query"),
     "find_component_connections": ToolPolicy(kind="query"),
     # Project tools

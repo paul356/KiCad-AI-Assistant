@@ -15,7 +15,6 @@ These tools are skip-based, have no `kicad-cli` dependency, and form the core of
 | Tool | Purpose |
 |------|---------|
 | `extract_schematic_netlist` | Read connectivity and components from one `.kicad_sch` file |
-| `extract_project_netlist` | Read connectivity across all sheets in a project |
 | `find_component_connections` | Find all nets connected to a specific component reference |
 
 These are **read-before-edit** tools. The LLM must call at least one of these before making changes to understand existing connectivity.
@@ -108,7 +107,6 @@ MCP resources are designed for MCP-client-driven browsing (e.g., Claude Desktop)
 | `kicad://schematic/{schematic_path}` | `resources/files.py` | Replaced by `extract_schematic_netlist` tool |
 | `kicad://project/{project_path}` | `resources/projects.py` | Replaced by plugin context bridge |
 | `kicad://netlist/{schematic_path}` | `resources/netlist_resources.py` | Replaced by `extract_schematic_netlist` tool |
-| `kicad://project_netlist/{project_path}` | `resources/netlist_resources.py` | Replaced by `extract_project_netlist` tool |
 | `kicad://component/{schematic_path}/{component_ref}` | `resources/netlist_resources.py` | Replaced by `find_component_connections` tool |
 | `kicad://bom/{project_path}` | `resources/bom_resources.py` | BOM features deferred |
 | `kicad://bom/{project_path}/csv` | `resources/bom_resources.py` | BOM features deferred |

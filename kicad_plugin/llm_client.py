@@ -65,7 +65,6 @@ QUERY_CATEGORY: dict[str, str] = {
     "get_symbol_pins": "symbol_pins",
     "check_reference_conflicts": "symbol_inventory",
     "list_labels_in_schematic": "labels",
-    "extract_project_netlist": "netlist",
     "extract_schematic_netlist": "netlist",
     "find_component_connections": "netlist",
     "get_schematic_sheet_info": "sheet_meta",

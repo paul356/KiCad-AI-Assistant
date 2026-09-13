@@ -20,83 +20,12 @@ def register_netlist_tools(mcp: FastMCP) -> None:
     """
 
     @mcp.tool()
-    async def extract_project_netlist(project_path: str, ctx: Context | None) -> dict[str, Any]:
-        """Extract netlist from a KiCad project's schematic.
-
-        This tool finds the schematic associated with a KiCad project
-        and extracts its netlist information.
-
-        Thin wrapper over ``extract_schematic_netlist``: it locates the
-        project's schematic and delegates to it. Both tools return the same
-        analysis structure — they differ only in their parameters (a project
-        path here, a direct schematic path plus ``include_wire_topology``
-        there). This tool additionally adds a ``project_path`` key to the
-        result on success.
-
-        Args:
-            project_path: Path to the KiCad project file (.kicad_pro)
-            ctx: MCP context for progress reporting
-
-        Returns:
-            Dictionary with netlist information
-        """
-        print(f"Extracting netlist for project: {project_path}")
-
-        if not os.path.exists(project_path):
-            print(f"Project not found: {project_path}")
-            if ctx:
-                ctx.info(f"Project not found: {project_path}")
-            return {"success": False, "error": f"Project not found: {project_path}"}
-
-        # Report progress
-        if ctx:
-            await ctx.report_progress(10, 100)
-
-        # Get the schematic file
-        try:
-            files = get_project_files(project_path)
-
-            if "schematic" not in files:
-                print("Schematic file not found in project")
-                if ctx:
-                    ctx.info("Schematic file not found in project")
-                return {"success": False, "error": "Schematic file not found in project"}
-
-            schematic_path = files["schematic"]
-            print(f"Found schematic file: {schematic_path}")
-            if ctx:
-                ctx.info(f"Found schematic file: {os.path.basename(schematic_path)}")
-
-            # Extract netlist
-            if ctx:
-                await ctx.report_progress(20, 100)
-
-            # Call the schematic netlist extraction
-            result = await extract_schematic_netlist(schematic_path, ctx=ctx)
-
-            # Add project path to result
-            if "success" in result and result["success"]:
-                result["project_path"] = project_path
-
-            return result
-
-        except Exception as e:
-            print(f"Error extracting project netlist: {str(e)}")
-            if ctx:
-                ctx.info(f"Error extracting project netlist: {str(e)}")
-            return {"success": False, "error": str(e)}
-
-    @mcp.tool()
     async def extract_schematic_netlist(
         schematic_path: str,
         include_wire_topology: bool = False,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Extract component inventory, net analysis, and wire geometry for a KiCad schematic.
-
-        ``extract_project_netlist`` delegates here after locating the
-        project's schematic; both tools return the same analysis structure
-        and differ only in their parameters.
 
         A net is a named group of pins that are electrically connected by wires.
         For example, if R1/pin2, C1/pin1, and a GND power symbol are all joined

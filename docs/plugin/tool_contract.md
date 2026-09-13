@@ -8,7 +8,6 @@
 
 | Tool | Module | Description |
 |---|---|---|
-| `extract_project_netlist` | `netlist_tools` | Extract netlist from the schematic associated with a `.kicad_pro` file |
 | `extract_schematic_netlist` | `netlist_tools` | Extract component inventory, nets, pin positions, and optionally wire topology from a `.kicad_sch` file |
 | `find_component_connections` | `netlist_tools` | List all electrical connections for a single reference designator |
 | `sync_symbol_index` | `symbol_tools` | Build or refresh the full-text symbol search index from installed KiCad libraries |
@@ -53,17 +52,6 @@ A typical LLM editing session follows this pattern:
 ## 3. Tool Groups
 
 ### 3.1 Netlist / Inspection Tools
-
-#### `extract_project_netlist(project_path)`
-
-**Purpose:** Convenience wrapper that locates the primary schematic for a `.kicad_pro` project and delegates to `extract_schematic_netlist`. Useful when the engineer provides a project path instead of a schematic path.
-
-**Key parameters:**
-- `project_path` (`str`) — absolute path to a `.kicad_pro` file.
-
-**Return shape:** Same as `extract_schematic_netlist` (see below).
-
-**When to use:** When only a project path is available; prefer `extract_schematic_netlist` directly when `active_schematic` is present in context.
 
 ---
 

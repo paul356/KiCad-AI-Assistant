@@ -223,7 +223,6 @@ kcaa
 | 工具 | 说明 |
 |------|------|
 | `extract_schematic_netlist` | 从原理图提取网表 |
-| `extract_project_netlist` | 提取整个项目的网表 |
 | `find_component_connections` | 查找元件的所有连接 |
 | `identify_circuit_patterns` | 识别常见电路模式 |
 | `analyze_project_circuit_patterns` | 分析项目中的电路模式 |

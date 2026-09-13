@@ -102,7 +102,7 @@ KiCad schematics can have hierarchical sheets. The tool surface works as follows
 
 ### Sheet path convention
 KiCad uses a sheet path like `/Sheet1/U1` to identify components in hierarchical designs. The netlist tools return these paths. When the LLM needs to edit a component in a subsheet, it should:
-1. Call `extract_project_netlist` to find which `.kicad_sch` file contains the component
+1. Look up the `.kicad_sch` file for that sheet from the `extract_schematic_netlist` result — sub-sheets appear as `type="sheet"` components carrying their file paths
 2. Use that file as `schematic_path` for editing tools
 
 ---
