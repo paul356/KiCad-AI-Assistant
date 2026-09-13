@@ -1910,8 +1910,10 @@ class LLMClient:
             return ""
         lines = []
         for tname, tdef in registry.items():  # registration order
-            desc = (tdef["function"].get("description") or "").strip().splitlines()
-            first_line = desc[0] if desc else ""
+            # First non-empty docstring line doubles as the summary; blank
+            # leading lines (docstrings that open with a newline) are skipped.
+            desc = (tdef["function"].get("description") or "").splitlines()
+            first_line = next((line.strip() for line in desc if line.strip()), "")
             # Keep the catalog compact: first sentence only, <= 100 chars.
             summary = first_line.split(".", 1)[0] + "." if "." in first_line else first_line
             lines.append(f"- {tname}: {summary[:100]}")

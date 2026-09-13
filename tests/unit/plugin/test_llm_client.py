@@ -2433,6 +2433,29 @@ class TestToolLoading:
         assert "thermal relief" not in block
         assert client._build_tool_catalog_block() == block  # deterministic per session
 
+    def test_catalog_uses_first_non_empty_docstring_line(self):
+        client = _make_client()
+        client._tool_registry = {
+            "sync_symbol_index": {
+                "type": "function",
+                "function": {
+                    "name": "sync_symbol_index",
+                    "description": (
+                        "\nStart building or refreshing the symbol library index. "
+                        "The sync runs in a background thread; poll "
+                        "get_symbol_sync_status to track progress."
+                    ),
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        }
+        block = client._build_tool_catalog_block()
+        # the blank first line is skipped; the first non-empty line renders
+        assert (
+            "- sync_symbol_index: Start building or refreshing the symbol library index." in block
+        )
+        assert "background thread" not in block
+
     def test_enable_tool_activates_batch_in_registration_order(self):
         client = _make_client()
         client._tool_registry = {

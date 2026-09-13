@@ -144,11 +144,11 @@ def test_registry_has_no_stale_entries() -> None:
 
 
 def _decorated_tool_functions() -> dict[str, str]:
-    """Map every ``@mcp.tool(...)``-decorated function name to its docstring
-    first line (cleaned). Uses ast so indentation/annotations are handled
-    reliably.
+    """Map every @mcp.tool()-decorated function name to the first non-empty
+    line of its docstring (cleaned). Uses ast so indentation/annotations are
+    handled reliably.
     """
-    first_lines: dict[str, str] = {}
+    summary_lines: dict[str, str] = {}
     for py_file in sorted(_TOOLS_DIR.rglob("*.py")):
         tree = ast.parse(py_file.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
@@ -165,28 +165,29 @@ def _decorated_tool_functions() -> dict[str, str]:
             if not decorated:
                 continue
             doc = ast.get_docstring(node, clean=False) or ""
-            first = (doc.splitlines() or [""])[0].strip()
-            first_lines[node.name] = first
-    return first_lines
+            first = next((ln.strip() for ln in doc.splitlines() if ln.strip()), "")
+            summary_lines[node.name] = first
+    return summary_lines
 
 
-def test_tools_have_valid_docstring_first_line() -> None:
-    """Every ""@mcp.tool()"" tool must have a non-empty, <= 100 char first line.
+def test_tools_have_valid_docstring_summary_line() -> None:
+    """Every @mcp.tool() tool must have a non-empty, <= 100 char docstring.
 
-    The prompt catalog renders the first docstring line as the tool summary
-    (issue #129); a blank first line would produce ``- name: `` and an
-    oversized one would be truncated mid-word in the catalog block.
+    The prompt catalog renders the first non-empty docstring line as the
+    tool summary (issue #129); a tool without any docstring text would
+    produce "- name: " and an oversized first line would be truncated
+    mid-word in the catalog block.
     """
-    first_lines = _decorated_tool_functions()
-    assert first_lines, "no @mcp.tool() tools found — scan is broken"
+    summary_lines = _decorated_tool_functions()
+    assert summary_lines, "no @mcp.tool() tools found - scan is broken"
 
     problems: list[str] = []
-    for name, first in sorted(first_lines.items()):
+    for name, first in sorted(summary_lines.items()):
         if not first:
-            problems.append(f"{name}: empty docstring first line")
+            problems.append(f"{name}: no non-empty docstring line")
         elif len(first) > 100:
-            problems.append(f"{name}: docstring first line too long ({len(first)} chars)")
+            problems.append(f"{name}: first docstring line too long ({len(first)} chars)")
     assert not problems, (
-        "Every tool's docstring first line must be non-empty and <= 100 chars "
+        "Every tool's first non-empty docstring line must be <= 100 chars "
         "(it is rendered as the tool summary in the prompt catalog):\n  " + "\n  ".join(problems)
     )
