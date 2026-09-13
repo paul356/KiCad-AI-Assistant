@@ -106,6 +106,51 @@ advice: <换层/换顺序/放弃该对>
 3. 成功 → 落盘 + 渲染新状态；失败 → 失败 viz + 原因回喂 VLM 换策略
 4. 输出评估指标：连成对/尝试对、每对轮次、失败后修正成功率
 
+## 方向校准（2026-09-13）：实验脚本只是验证，产品目标是插件内 VLM 引导布线
+
+`scripts/vlm_route_feedback.py` 定位为**验证垫脚石**：证明「VLM 看图 → 语义
+反馈 → 现有 router 执行 → 渲染反馈」闭环可行。真正目标是 **kicad_plugin 内
+用户说「帮我把 X 和 Y 连起来」→ VLM agentic 循环完成感知/决策/执行/失败换策略**，
+不依赖实验脚本。
+
+### 产品闭环（插件侧，复用现有工具面，零新后端工具）
+
+```
+用户：帮我把 J2.3 和 U4.52 连上
+  │
+  ▼
+LLMClient.run() agentic loop（llm_client.py，20 轮工具迭代，已支持多模态图片）
+  │
+  ├─ get_ratsnest             # 真·未连接 pad 对 + 世界坐标（数据，不靠 VLM 猜）
+  ├─ export_pcb_layer_image   # 复合/单层渲染，白虚线 ratsnest 标出待连对
+  ├─ pcb_route_pad_to_pad     # layer_hint / via_pairs / turn_penalty
+  └─ 失败 → 读错误文本 → 看图 → 换层/换策略重试（不静默重试）
+```
+
+- **感知与决策分离**：待连对一律来自 `get_ratsnest`（数据源），VLM 只做空间
+  决策（先连哪对、走哪层、失败换什么策略）。ratsnest 白虚线是图上的锚点索引，
+  与数据一一对应——不要求 VLM 从图里发现候选，也不要求它读懂 pad 文字。
+- **`_PROMPT_PCB`（llm_client.py:794，固定常量）需补「Routing workflow」小节**：
+  指明 get_ratsnest → 渲染看图 → pcb_route_pad_to_pad → 失败换策略的执行顺序。
+  否则 VLM 有工具但不知道流程。
+- **口径统一**：现脚本 `routable_pairs()` 是同 net pad 两两全组合（含已连通对），
+  与 `get_ratsnest`（真·未连对）不一致。脚本若继续用，需统一为真·未连对语义。
+
+### 流程 Skill 化 + skill 查找优化（考虑项）
+
+- 连线工作流宜抽成独立 skill（如 `pcb-routing`），**不动 `_PROMPT_PCB` 本体**：
+  系统提示词保持精简，按需 `get_skill` 惰性加载（复用 skill-system-design.md 的
+  Layer-2 机制；技能目录自动生成，新增即丢一个 `.md` 文件）。
+- **skill 查找优化**：现状 `_find_skill_file`（kcaa/tools/skill_tools.py）是
+  **精确名匹配** `candidate == name` ——别名/近义/大小写全不认，LLM 命名稍有
+  偏差就 not found 并回退到全量列表。候选改进（按成本排序）：
+  1. **归一化匹配**：小写化 + 去掉连字符/下划线做比较；
+  2. **别名表**：front-matter 增加 `aliases:`（`pcb-routing` ← route/连线/ratsnest），
+     目录与查找都读它；
+  3. **目录触发词**：`list_skills` 的 description 附典型触发词，降低 LLM 猜错名概率；
+  4. **未命中 top-k 建议**：按子串/词重叠给候选，而不是直接失败。
+- 实验脚本与 skill 角色分离：脚本负责「可调参研究」，skill 承载「产品流程编排」。
+
 ## 涉及文件
 
 - 新增：`scripts/vlm_route_feedback.py`
