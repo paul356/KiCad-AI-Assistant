@@ -1949,19 +1949,18 @@ class LLMClient:
             if evicted:
                 actions.append(f"tools trimmed: {', '.join(sorted(evicted))}")
 
-            def _seg(label: str, before: int, after: int) -> str:
-                if before == after:
-                    return f"{label} ≈{before}"
-                return f"{label} ≈{before}→≈{after}"
-
+            old_size = (
+                f"≈{used_before_evict} (system {system_tokens} + tools {tools_est_before} "
+                f"+ history {history_before})"
+            )
+            new_size = (
+                f"≈{used} (system {system_tokens} + tools {tools_est_tokens} "
+                f"+ history {history_tokens})"
+            )
             on_compacted(
                 "⟲ Context compressed for budget — "
                 + "; ".join(actions)
-                + f" ({_seg('system', system_tokens, system_tokens)} + "
-                + _seg("tools", tools_est_before, tools_est_tokens)
-                + " + "
-                + _seg("history", history_before, history_tokens)
-                + f" = ≈{used_before_evict} → ≈{used} tokens)"
+                + f". {old_size} => {new_size} tokens"
             )
         if (
             not compacted

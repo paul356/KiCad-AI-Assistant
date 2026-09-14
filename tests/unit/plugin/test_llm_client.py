@@ -3179,7 +3179,8 @@ class TestToolEviction:
         assert "tool_a" in notices[0] and "tool_b" in notices[0] and "tool_c" in notices[0]
         assert (
             re.search(
-                r"system ≈\d+ \+ tools ≈\d+→≈\d+ \+ history ≈\d+ = ≈\d+ → ≈\d+ tokens",
+                r"≈\d+ \(system \d+ \+ tools \d+ \+ history \d+\) => ≈\d+ "
+                r"\(system \d+ \+ tools \d+ \+ history \d+\) tokens",
                 notices[0],
             )
             is not None
