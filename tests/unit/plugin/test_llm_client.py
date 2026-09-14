@@ -451,8 +451,12 @@ class TestCompactHistory:
 
     def test_absorbs_recent_turns_when_preserved_block_over_budget(self):
         # Recent turns alone (~800 est tokens) exceed target_history_tokens:
-        # _compact_history must fold the oldest preserved turns into the prefix
-        # until the remaining block fits the joint budget.
+        # _compact_history must fold preserved turns into the prefix until the
+        # remaining block fits the joint budget.  Each recent turn is ~200
+        # tokens (heavy assistant answer) and the summary ceiling is 50 tokens,
+        # so a 60-token budget accepts no turn at all — even the newest turn is
+        # folded in and only the summary remains (issue #140: no "keep the
+        # final turn" floor).
         client = _make_client(keep_recent_turns=4)
         # prefix: 4 small turns; recent: 4 turns with heavy assistant answers
         client._history = []
@@ -462,7 +466,6 @@ class TestCompactHistory:
         for i in range(4):
             client._history.append(_user(f"recent q {i}"))
             client._history.append(_assistant("recent big a " + "x" * 800))  # ~200 tok
-        original = list(client._history)
 
         summary_response = {
             "finish_reason": "stop",
@@ -474,14 +477,68 @@ class TestCompactHistory:
             )
 
         assert result is True
-        # absorption folded turns until only the final turn (~200 tok) plus the
-        # summary (~50 tok) exceeds 60... loop keeps absorbing until the last
-        # turn remains, then stops (only the final turn left — keep verbatim).
-        assert len(client._history) == 1 + 2  # summary + final preserved turn
+        # entire history folded into the summary — nothing preserved verbatim
+        assert len(client._history) == 1
         assert client._history[0]["role"] == "user"
-        assert client._history[1:] == original[-2:]  # last turn untouched
-        # every earlier recent turn got folded into the prefix -> summarised
-        assert len([m for m in client._history[1:] if "[Session summary" in m["content"]]) == 0
+        assert "[Session summary" in client._history[0]["content"]
+
+    def test_absorption_keeps_turns_that_fit(self):
+        # Budget admits exactly the newest recent turns (each ~25 tokens): they
+        # stay verbatim, the older ones are folded into the prefix.
+        client = _make_client(keep_recent_turns=4)
+        client._history = []
+        for i in range(4):
+            client._history.append(_user(f"small q {i}"))
+            client._assistant_append = None
+            client._history.append(_assistant(f"small a {i}"))
+        for i in range(4):
+            client._history.append(_user(f"recent q {i}"))
+            client._history.append(_assistant("recent a " + "x" * 80))  # ~25 tok each
+        original_rows = [m["content"] for m in client._history]
+
+        summary_response = {
+            "finish_reason": "stop",
+            "message": {"content": "Summary of older context."},
+        }
+        # recent 4 turns ≈ 164 tokens + summary ceiling 50 -> budget 220 admits all
+        with patch.object(client, "_call_openai", return_value=summary_response):
+            result = client._compact_history(
+                "system", target_summary_chars=200, target_history_tokens=220
+            )
+
+        assert result is True
+        assert len(client._history) == 1 + 8  # summary + 4 recent turns
+        preserved_rows = [m["content"] for m in client._history[1:]]
+        assert preserved_rows == original_rows[-8:]
+
+    def test_absorption_partial_keeps_only_newest(self):
+        # Budget admits ~2 recent turns; older preserved turns fold into prefix.
+        client = _make_client(keep_recent_turns=4)
+        client._history = []
+        for i in range(4):
+            client._history.append(_user(f"small q {i}"))
+            client._history.append(_assistant(f"small a {i}"))
+        for i in range(4):
+            client._history.append(_user(f"recent q {i}"))
+            client._history.append(_assistant("recent a " + "x" * 80))  # ~25 tok each
+        original_rows = [m["content"] for m in client._history]
+
+        summary_response = {
+            "finish_reason": "stop",
+            "message": {"content": "Summary of older context."},
+        }
+        # budget 140: summary ceiling 50 -> split_tokens 90 admits exactly the
+        # newest 2 turns (2 x 41), a 3rd (123) would overrun
+        with patch.object(client, "_call_openai", return_value=summary_response):
+            result = client._compact_history(
+                "system", target_summary_chars=200, target_history_tokens=140
+            )
+
+        assert result is True
+        # summary + last 2 recent turns (2 x 2 rows = 4 messages)
+        assert len(client._history) == 1 + 4
+        preserved_rows = [m["content"] for m in client._history[1:]]
+        assert preserved_rows == original_rows[-4:]
 
     def test_preserves_all_recent_when_budget_covers_them(self):
         # Generous target_history_tokens: the preserved block already fits, so

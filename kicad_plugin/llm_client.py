@@ -1303,27 +1303,40 @@ class LLMClient:
 
         # ---- Budget-driven absorption of recent turns ----------------------
         # If the preserved block alone still exceeds the post-compaction
-        # budget, fold its oldest turns into the prefix until it fits (or the
-        # whole history is compactable).
+        # budget, fold the oldest preserved turns into the prefix until the
+        # remainder fits.  A single backward scan over complete turns computes
+        # the split point: prefix sums give each turn's token cost in O(1),
+        # and turns are kept from the newest backwards while the accumulated
+        # total stays within ``split_tokens`` (joint budget minus the summary
+        # ceiling).  There is no "keep the final turn" floor — when even the
+        # newest turn alone exceeds the budget the whole preserved block is
+        # folded in and only the summary is kept.
         if target_history_tokens is not None:
-            # The preserved recent block starts at split_idx (a user message).
-            # If it alone exceeds the post-compaction budget, absorb its oldest
-            # turns into the prefix until the remainder fits: split_idx advances
-            # to the next user message (the next turn boundary).  Loop is bounded
-            # because split_idx strictly increases; at most the whole history
-            # becomes the prefix.
-            while split_idx < len(self._history):
-                recent_tokens = self._estimate_tokens(self._history[split_idx:])
-                # the summary itself will take up to target_summary_chars/4 tokens
-                if recent_tokens + target_summary_chars // 4 <= target_history_tokens:
-                    break
-                # next turn boundary after the oldest preserved turn
-                nxt = split_idx + 1
-                while nxt < len(self._history) and self._history[nxt].get("role") != "user":
-                    nxt += 1
-                if nxt >= len(self._history):
-                    break  # only the final turn left — keep it verbatim
-                split_idx = nxt
+            split_tokens = max(1, target_history_tokens - target_summary_chars // 4)
+            # prefix sums of message sizes (one pass)
+            cum = [0] * (len(self._history) + 1)
+            for idx, m in enumerate(self._history):
+                cum[idx + 1] = cum[idx] + len(json.dumps(m))
+            acc = 0
+            new_split = len(self._history)
+            i = len(self._history) - 1
+            while i >= split_idx:
+                if self._history[i].get("role") == "assistant":
+                    # turn ends at this assistant message; find its user opener
+                    j = i - 1
+                    while j >= split_idx and self._history[j].get("role") != "user":
+                        j -= 1
+                    if j < split_idx:
+                        break  # turn opens before the recent block — stop
+                    turn_tokens = (cum[i + 1] - cum[j]) // 4
+                    if acc + turn_tokens > split_tokens:
+                        break  # this and all older turns fold into the prefix
+                    acc += turn_tokens
+                    new_split = j
+                    i = j - 1
+                else:
+                    i -= 1
+            split_idx = new_split
 
         prefix = self._history[:split_idx]
         if len(prefix) < 4:
