@@ -52,18 +52,30 @@ class TestSchemaV2:
         payload = sstore.make_payload(
             [{"type": "user", "text": "hello"}], [{"role": "user"}], PROJECT_A
         )
-        assert payload["version"] == 2
+        assert payload["version"] == 3
         assert payload["project_path"] == PROJECT_A
         assert payload["title"] == "hello"
         assert "timestamp" in payload
         assert payload["conv_entries"] == [{"type": "user", "text": "hello"}]
         assert payload["llm_history"] == [{"role": "user"}]
+        assert payload["enabled_tools"] == []
+
+    def test_make_payload_persists_enabled_tools(self):
+        payload = sstore.make_payload(
+            [{"type": "user", "text": "hi"}],
+            [],
+            PROJECT_A,
+            ["get_board_info", "save_project_version"],
+        )
+        assert payload["version"] == 3
+        assert payload["enabled_tools"] == ["get_board_info", "save_project_version"]
 
     def test_make_payload_defaults(self):
         payload = sstore.make_payload([{"type": "ai", "text": "hi"}], [], None)
-        assert payload["version"] == 2
+        assert payload["version"] == 3
         assert payload["project_path"] is None
         assert payload["title"] == "session"
+        assert payload["enabled_tools"] == []
 
     def test_title_uses_first_user_message(self):
         payload = sstore.make_payload(
@@ -221,9 +233,27 @@ class TestRoundTrip:
         data, err2 = sstore.load_session(path)
         assert err2 is None
         assert data is not None
-        assert data["version"] == 2
+        assert data["version"] == 3
         assert data["project_path"] == PROJECT_A
         assert data["conv_entries"] == [{"type": "user", "text": "q"}]
+        assert data["enabled_tools"] == []
+
+    def test_save_then_load_v3_with_enabled_tools(self, tmp_path):
+        payload = sstore.make_payload(
+            [{"type": "user", "text": "q"}],
+            [{"role": "user"}],
+            PROJECT_A,
+            ["save_project_version", "extract_schematic_netlist"],
+        )
+        err = sstore.save_session(str(tmp_path), "session_y.json", payload)
+        assert err is None
+        data, err2 = sstore.load_session(
+            os.path.join(sstore.sessions_dir(str(tmp_path)), "session_y.json")
+        )
+        assert err2 is None
+        assert data is not None
+        assert data["version"] == 3
+        assert data["enabled_tools"] == ["save_project_version", "extract_schematic_netlist"]
 
     def test_load_missing_file(self, tmp_path):
         data, err = sstore.load_session(
@@ -240,3 +270,23 @@ class TestRoundTrip:
         data, err = sstore.load_session(os.path.join(sessions, "session_bad.json"))
         assert data is None
         assert err is not None
+
+
+class TestEnabledToolsCompat:
+    def test_legacy_v1_no_field_yields_empty(self):
+        # v1 payloads have neither project_path nor enabled_tools
+        assert sstore.session_enabled_tools({"version": 1, "llm_history": []}) == []
+
+    def test_legacy_v2_no_field_yields_empty(self):
+        # A v2 file written before #136 has no enabled_tools key at all
+        assert sstore.session_enabled_tools({"version": 2, "project_path": PROJECT_A}) == []
+
+    def test_v3_field_round_trips(self):
+        session = {"version": 3, "enabled_tools": ["a", "b"]}
+        assert sstore.session_enabled_tools(session) == ["a", "b"]
+
+    def test_empty_field_yields_empty(self):
+        assert sstore.session_enabled_tools({"version": 3, "enabled_tools": []}) == []
+
+    def test_none_data_yields_empty(self):
+        assert sstore.session_enabled_tools(None) == []

@@ -1097,9 +1097,19 @@ class LLMClient:
         """Return a copy of the conversation history for session persistence."""
         return list(self._history)
 
-    def set_history(self, history: list[dict[str, Any]]) -> None:
-        """Replace conversation history when restoring a saved session."""
-        self._history = list(history)
+    def get_enabled_tools(self) -> list[str]:
+        """Return the currently enabled tool names (sorted, stable) for persistence."""
+        return sorted(self._enabled_tools)
+
+    def set_enabled_tools(self, names: list[str]) -> None:
+        """Replace the enabled tool set when restoring a saved session.
+
+        Unconditionally adopts *names*: matched against the catalog lazily —
+        ``_build_request_tools`` already filters by ``registry`` membership,
+        so names for tools not yet fetched stay inert until the catalog is
+        available (same semantics as the fresh-session path).
+        """
+        self._enabled_tools = set(names)
 
     def _run_tool_direct(
         self,

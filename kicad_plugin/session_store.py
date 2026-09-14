@@ -1,4 +1,4 @@
-"""Session persistence for the KiCad AI Assistant (schema v2).
+"""Session persistence for the KiCad AI Assistant (schema v3).
 
 Schema history
 --------------
@@ -13,9 +13,17 @@ open at save time::
     {"version": 2, "project_path", "title", "timestamp",
      "conv_entries", "llm_history"}
 
+v3 (current): adds ``enabled_tools`` — the sorted names of the tool schemas
+enabled at save time, restored so the previously active tool set ships again
+(issue #136).  Legacy v1/v2 files lack the field; their enabled set
+initialises empty::
+
+    {"version": 3, "project_path", "title", "timestamp",
+     "conv_entries", "llm_history", "enabled_tools"}
+
 Project scoping rules
 ---------------------
-- A v2 session is owned by exactly one project (``project_path``).
+- A v2+ session is owned by exactly one project (``project_path``).
 - A v1 file (missing ``project_path``) is *legacy*: it must never be
   auto-restored into a project, and is not offered in project-scoped lookups.
   It stays loadable via the manual Load Session dialog in the UI.
@@ -34,7 +42,7 @@ import os
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SESSIONS_DIRNAME = "kicad_ai_sessions"
 CURRENT_LINK_NAME = "current.json"
@@ -92,6 +100,17 @@ def load_session(path: str) -> tuple[dict | None, str | None]:
             return json.load(f), None
     except (OSError, ValueError) as e:
         return None, str(e)
+
+
+def session_enabled_tools(session: dict | None) -> list[str]:
+    """Enabled tool names saved with *session*; [] for legacy files.
+
+    v1/v2 files have no ``enabled_tools`` field, so their enabled set
+    initialises empty on restore (same as a fresh session) — issue #136.
+    """
+    if not session:
+        return []
+    return list(session.get("enabled_tools") or [])
 
 
 def session_project_path(session: dict | None) -> str | None:
@@ -156,8 +175,14 @@ def make_payload(
     conv_entries: list[dict],
     llm_history: list,
     project_path: str | None,
+    enabled_tools: list[str] | None = None,
 ) -> dict:
-    """Build the on-disk schema v2 payload for a session."""
+    """Build the on-disk schema v3 payload for a session.
+
+    ``enabled_tools`` (sorted tool names active at save time, issue #136) is
+    persisted so a restored session ships the previously enabled schemas
+    again.  ``None`` (legacy callers) writes an empty list.
+    """
     return {
         "version": SCHEMA_VERSION,
         "project_path": project_path,
@@ -165,6 +190,7 @@ def make_payload(
         "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
         "conv_entries": conv_entries,
         "llm_history": llm_history,
+        "enabled_tools": list(enabled_tools or []),
     }
 
 

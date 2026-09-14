@@ -2804,3 +2804,59 @@ class TestToolEviction:
             result = client.run("new question", context_block="")
         assert "Context window overflow" in result
         client._call_llm.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Enabled-tool persistence API (issue #136)
+# ---------------------------------------------------------------------------
+
+
+class TestEnabledToolsPersistence:
+    def test_get_returns_sorted_stable(self):
+        client = _make_client()
+        client._enabled_tools = {"zebra", "alpha", "middle"}
+        assert client.get_enabled_tools() == ["alpha", "middle", "zebra"]
+
+    def test_set_replaces_enabled_set(self):
+        client = _make_client()
+        client._enabled_tools = {"old_a", "old_b"}
+        client.set_enabled_tools(["new_x", "new_y"])
+        assert client._enabled_tools == {"new_x", "new_y"}
+        assert client.get_enabled_tools() == ["new_x", "new_y"]
+
+    def test_set_empty_clears(self):
+        client = _make_client()
+        client._enabled_tools = {"a", "b"}
+        client.set_enabled_tools([])
+        assert client._enabled_tools == set()
+
+    def test_names_inert_until_registry_loaded(self):
+        # Restoring a session may precede the catalog fetch: enabled names for
+        # unloaded tools must not appear in the request (or crash) until the
+        # registry has them — same semantics as a fresh session.
+        client = _make_client()
+        client.set_enabled_tools(["future_tool"])
+        assert client._build_request_tools() == list(llm_client._META_TOOL_DEFS)
+        client._tool_registry = {"future_tool": _fake_tool_def("future_tool")}
+        names = [t["function"]["name"] for t in client._build_request_tools()]
+        assert names == ["enable_tool", "disable_tool", "get_tool_schema", "future_tool"]
+
+    def test_restored_set_participates_in_budget(self):
+        client = _make_client()
+        client._tool_registry = {
+            "big_tool": _fake_tool_def("big_tool", description="x" * 4_000),
+        }
+        client.set_enabled_tools(["big_tool"])
+        assert client._enabled_tools_est_tokens() > 0
+
+    def test_evicted_tool_absent_from_get(self):
+        # #133 eviction is persistent within the session; the persisted set
+        # must reflect it so a later save does not resurrect evicted schemas.
+        client = _make_client()
+        client._tool_registry = {
+            "tool_a": _fake_tool_def("tool_a"),
+            "tool_b": _fake_tool_def("tool_b"),
+        }
+        client._enabled_tools = {"tool_a", "tool_b"}
+        client._evict_tools_to_target(target_tokens=0, current_used=1_000)
+        assert client.get_enabled_tools() == []
