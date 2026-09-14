@@ -2463,6 +2463,7 @@ if _WX_AVAILABLE:
                     else []
                 ),
                 self._active_project,
+                (self._llm_client.get_enabled_tools() if self._llm_client else []),
             )
             err = _sstore.save_session(self._settings.config_dir, filename, payload)
             if err:
@@ -2551,6 +2552,9 @@ if _WX_AVAILABLE:
                 self._toggle_send_stop(busy=False)
             if self._llm_client:
                 self._llm_client.set_history(data.get("llm_history", []))
+                # Restore the enabled tool set saved with the session; legacy
+                # files (no field) initialize empty — same as a fresh session.
+                self._llm_client.set_enabled_tools(_sstore.session_enabled_tools(data))
             # Track which file is now active; point current.json at it.
             self._current_session_file = os.path.basename(path)
             _sstore.update_current_link(self._settings.config_dir, self._current_session_file)
