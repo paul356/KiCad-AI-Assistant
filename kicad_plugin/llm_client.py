@@ -246,6 +246,12 @@ _current_reasoning: list[str] = []
 # that truncates a tool-calling response.
 _ANTHROPIC_DEFAULT_MAX_TOKENS = 65536
 
+# Minimum summary size (chars) guaranteed during compaction. Large enough to
+# carry user intent + agreed plan + completed steps (~200 tokens) instead of
+# being starved to a couple of clipped sentences when the preserved block
+# alone nearly fills the history budget (issue #140).
+_COMPACTION_SUMMARY_FLOOR_CHARS = 800
+
 # ------------------------------------------------------------------
 # On-demand tool loading (issue #129)
 # ------------------------------------------------------------------
@@ -1256,14 +1262,21 @@ class LLMClient:
         tool turns are dropped before summarising so both the transcript and
         the preserved block stay lean.
 
-        Identifies the last ``self._keep_recent_turns`` complete assistant turns
-        as the "recent" block that is preserved verbatim.  Everything before
-        those turns is the compactable prefix.
+        The tail "pending" block — messages after the last assistant reply,
+        i.e. the unanswered user question that just triggered run() — is
+        always preserved verbatim and never counts toward the
+        ``keep_recent_turns`` budget. Folding the live question into the
+        summary is the original #140 bug.
 
-        When ``target_history_tokens`` is given and the preserved recent block
-        alone would still exceed it, the oldest recent turns are folded into
-        the prefix until the remainder fits — i.e. the preserved turns are
-        compacted too instead of overflowing the window.
+        When ``target_history_tokens`` is given, the most recent
+        ``keep_recent_turns`` user turns (user->user boundary; does not include
+        the pending block) are kept verbatim from the newest backwards while
+        their cumulative size fits ``target_history_tokens`` minus the pending
+        block and an 800-char summary floor. Turns that don't fit fold into the
+        compactable prefix. The summary budget is then recomputed from the
+        ACTUAL preserved-block size, so folding turns releases space back to
+        the summary — the pre-deduction cycle that pinned the summary at the
+        200-char floor while the question was being dropped (#140) is broken.
 
         Builds a text-only transcript of the prefix (user/assistant text only;
         tool names noted inline; raw tool results omitted) and asks the LLM to
@@ -1280,67 +1293,81 @@ class LLMClient:
 
         Returns True on success, False if nothing was compacted or an error occurred.
         """
-        # Dedup is a compaction sub-step: drop superseded tool turns so the
-        # transcript and the preserved block are as small as possible.
         self._dedup_tool_calls()
 
-        # ---- Identify the split point (oldest of the recent turns) ----------
-        turns_found = 0
-        split_idx = len(self._history)  # index of first message in "recent" block
-        i = len(self._history) - 1
-        while i >= 0 and turns_found < self._keep_recent_turns:
-            if self._history[i].get("role") == "assistant":
-                split_idx = i
-                turns_found += 1
+        if not self._history:
+            return False  # nothing to compact
+
+        # ---- Locate the tail pending block --------------------------------
+        # The pending block is the run of unanswered user messages at the very
+        # tail of history — the live question(s) that just triggered run().
+        # It is always preserved verbatim and never counts toward the
+        # keep_recent_turns budget: folding the live question into the summary
+        # is the original #140 bug.
+        # Trailing tool messages (tool results with no following assistant
+        # reply) are NOT pending — they belong to the preceding assistant turn
+        # and may be folded into the prefix by absorption.
+        pending_start = len(self._history)
+        while pending_start > 0:
+            if self._history[pending_start - 1].get("role") == "user":
+                pending_start -= 1
+            else:
+                break
+
+        # ---- Identify the split point ------------------------------------
+        # The tail pending block (last assistant reply → end) is always
+        # preserved verbatim — it is the unanswered user question that just
+        # triggered run(). Folding it into the summary is the original #140
+        # bug. It does not count toward keep_recent_turns.
+        #
+        # From the pending block backwards, keep up to keep_recent_turns
+        # complete user turns (user->user boundary; includes each turn's
+        # assistant reply and trailing tool-result messages). When a joint
+        # history budget is given, fold turns that don't fit into the prefix;
+        # otherwise keep them all (only budget-less callers reach here).
+        cum = [0] * (len(self._history) + 1)
+        for idx, m in enumerate(self._history):
+            cum[idx + 1] = cum[idx] + len(json.dumps(m))
+
+        if target_history_tokens is None:
+            split_chars = None  # no budget — keep all recent turns
+        else:
+            pending_tokens = self._estimate_tokens(self._history[pending_start:])
+            summary_floor_tokens = _COMPACTION_SUMMARY_FLOOR_CHARS // 4
+            split_chars = max(
+                4, (target_history_tokens - pending_tokens - summary_floor_tokens) * 4
+            )
+
+        new_split = pending_start  # pending always preserved
+        acc = 0
+        turns_kept = 0
+        i = pending_start - 1
+        while i >= 0 and turns_kept < self._keep_recent_turns:
+            if self._history[i].get("role") == "user":
+                turn_chars = cum[new_split] - cum[i]
+                if split_chars is not None and acc + turn_chars > split_chars:
+                    break  # this and all older turns fold in
+                acc += turn_chars
+                new_split = i
+                turns_kept += 1
             i -= 1
+        split_idx = new_split
 
-        # Walk back to include the user message that opened this oldest recent turn
-        j = split_idx - 1
-        while j >= 0 and self._history[j].get("role") != "user":
-            j -= 1
-        if j >= 0:
-            split_idx = j
-
-        # ---- Budget-driven absorption of recent turns ----------------------
-        # If the preserved block alone still exceeds the post-compaction
-        # budget, fold the oldest preserved turns into the prefix until the
-        # remainder fits.  A single backward scan over complete turns computes
-        # the split point: prefix sums give each turn's size in O(1), and turns
-        # are kept from the newest backwards while the accumulated size stays
-        # within ``split_chars`` (the joint budget, token ceiling times four).
-        # A turn spans [user opener, next preserved turn opener) — never
-        # [user, its assistant] — so trailing tool-result messages after the
-        # assistant are counted in the same turn (the normal trigger shape for
-        # issue #140 is a tool call whose results just landed).  There is no
-        # "keep the final turn" floor: when even the newest turn alone exceeds
-        # the budget the whole preserved block is folded in and only the
-        # summary is kept.
         if target_history_tokens is not None:
-            split_chars = max(4, (target_history_tokens - target_summary_chars // 4) * 4)
-            # prefix sums of message sizes (one pass)
-            cum = [0] * (len(self._history) + 1)
-            for idx, m in enumerate(self._history):
-                cum[idx + 1] = cum[idx] + len(json.dumps(m))
-            acc = 0
-            new_split = len(self._history)
-            i = len(self._history) - 1
-            while i >= split_idx:
-                if self._history[i].get("role") == "assistant":
-                    # turn ends at this assistant message; find its user opener
-                    j = i - 1
-                    while j >= split_idx and self._history[j].get("role") != "user":
-                        j -= 1
-                    if j < split_idx:
-                        break  # no user opener inside the recent block — stop
-                    turn_chars = cum[new_split] - cum[j]
-                    if acc + turn_chars > split_chars:
-                        break  # this and all older turns fold into the prefix
-                    acc += turn_chars
-                    new_split = j
-                    i = j - 1
-                else:
-                    i -= 1
-            split_idx = new_split
+            # Recompute summary budget from the actual preserved block so the
+            # account closes (summary + preserved == target_history_tokens
+            # modulo clamps). Folding turns shrinks preserved and grows the
+            # summary — this breaks the pre-deduction cycle that pinned the
+            # summary at the 800-char floor while the live question was being
+            # dropped (#140).
+            preserved_tokens = self._estimate_tokens(self._history[split_idx:])
+            target_summary_chars = max(
+                _COMPACTION_SUMMARY_FLOOR_CHARS,
+                min(
+                    int(self._context_tokens * 0.25 * 4),
+                    (target_history_tokens - preserved_tokens) * 4,
+                ),
+            )
 
         prefix = self._history[:split_idx]
         if len(prefix) < 4:
@@ -1893,40 +1920,18 @@ class LLMClient:
         compacted = False
         if used > target_post_compact:
             # ---- Still over target: compact history ------------------------
-            # _compact_history runs dedup as its first sub-step, keeps the
-            # recent turns verbatim, folds the oldest preserved turns into the
-            # summary when they alone would still exceed the target
-            # (absorption), and chunks oversized transcripts so no compaction
-            # call itself overflows the window.
-            # Estimate the cost of the recent turns we will always keep
-            i = len(self._history) - 1
-            turns_found = 0
-            split_idx = len(self._history)
-            while i >= 0 and turns_found < self._keep_recent_turns:
-                if self._history[i].get("role") == "assistant":
-                    split_idx = i
-                    turns_found += 1
-                i -= 1
-            # Walk back to include the user message that opened the oldest recent turn
-            j = split_idx - 1
-            while j >= 0 and self._history[j].get("role") != "user":
-                j -= 1
-            if j >= 0:
-                split_idx = j
-            recent_tokens = self._estimate_tokens(self._history[split_idx:])
-
-            target_summary_chars = max(
-                200,
-                int((target_post_compact - system_tokens - recent_tokens - tools_est_tokens) * 4),
-            )
-            # Joint budget: post-compaction history (summary + preserved turns)
-            # shares the target with the system prompt and the surviving tool
-            # schemas.  The absorption loop inside _compact_history uses this
-            # to fold recent turns into the summary when they alone overrun it.
+            # _compact_history runs dedup as its first sub-step, identifies the
+            # tail pending block (messages after the last assistant reply,
+            # i.e. the unanswered user question that just triggered run()),
+            # always preserves it verbatim, then folds recent turns into the
+            # prefix on a user->user boundary until they fit the joint budget.
+            # The summary budget is computed AFTER absorption from the actual
+            # preserved-block size — folding releases space back to the
+            # summary, so the question is never starved out of the prompt
+            # (issue #140). Chunks oversized transcripts so no compaction call
+            # itself overflows the window.
             target_history_tokens = max(0, target_post_compact - system_tokens - tools_est_tokens)
-            compacted = self._compact_history(
-                system_prompt, target_summary_chars, target_history_tokens
-            )
+            compacted = self._compact_history(system_prompt, 0, target_history_tokens)
             self._validate_history()  # compaction rebuilds history; verify integrity
 
             # Recompute after compaction: history shrank, so the estimate

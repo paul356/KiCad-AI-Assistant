@@ -501,10 +501,10 @@ class TestCompactHistory:
             "finish_reason": "stop",
             "message": {"content": "Summary of older context."},
         }
-        # recent 4 turns ≈ 164 tokens + summary ceiling 50 -> budget 220 admits all
+        # recent 4 turns ≈ 164 tokens + summary ceiling 50 -> budget 600 admits all: floor 200 + turns 164
         with patch.object(client, "_call_openai", return_value=summary_response):
             result = client._compact_history(
-                "system", target_summary_chars=200, target_history_tokens=220
+                "system", target_summary_chars=200, target_history_tokens=600
             )
 
         assert result is True
@@ -532,7 +532,7 @@ class TestCompactHistory:
         # newest 2 turns (2 x 41), a 3rd (123) would overrun
         with patch.object(client, "_call_openai", return_value=summary_response):
             result = client._compact_history(
-                "system", target_summary_chars=200, target_history_tokens=140
+                "system", target_summary_chars=200, target_history_tokens=300
             )
 
         assert result is True
@@ -540,6 +540,50 @@ class TestCompactHistory:
         assert len(client._history) == 1 + 4
         preserved_rows = [m["content"] for m in client._history[1:]]
         assert preserved_rows == original_rows[-4:]
+
+    def test_pending_question_preserved_when_preceding_turn_exceeds_budget(self):
+        # Regression for issue #140: the live user question at the tail of
+        # history must never be folded into the summary, even when the
+        # preceding turn alone exceeds the entire history budget (the 16:31
+        # session shape: a giant tool-result turn followed by a fresh user
+        # question). Old code merged the question into the preceding turn on a
+        # user→assistant boundary and broke on the first turn, dropping the
+        # question into an 800-char-clipped summary.
+        client = _make_client(keep_recent_turns=4)
+        client._history = []
+        # 4 small prefix turns
+        for i in range(4):
+            client._history.append(_user(f"old q {i}"))
+            client._history.append(_assistant(f"old a {i}"))
+        # One giant turn: user + assistant + huge tool result (~500 tok)
+        tc = [
+            {
+                "id": "tc1",
+                "type": "function",
+                "function": {"name": "list_tracks", "arguments": "{}"},
+            }
+        ]
+        client._history.append(_user("Please help understand this project."))
+        client._history.append(_assistant("pulling state", tool_calls=tc))
+        client._history.append(_tool("tc1", "x" * 2000))  # ~500 tok
+        # The live question — must be preserved verbatim
+        live_q = "How files in this project?"
+        client._history.append(_user(live_q))
+
+        summary_response = {
+            "finish_reason": "stop",
+            "message": {"content": "Summary of earlier context."},
+        }
+        with patch.object(client, "_call_openai", return_value=summary_response):
+            result = client._compact_history(
+                "system", target_summary_chars=200, target_history_tokens=100
+            )
+
+        assert result is True
+        # The live question must be in the preserved tail, not folded.
+        contents = [m.get("content") for m in client._history]
+        assert live_q in contents, f"live question lost: {contents}"
+        assert client._history[-1]["content"] == live_q
 
     def test_absorption_counts_tool_messages_in_turn(self):
         # A turn ends at its assistant's next sibling, not at the assistant
@@ -755,14 +799,11 @@ class TestMaybeCompact:
         with patch.object(client, "_compact_history", return_value=True) as mock_compact:
             client._maybe_compact("system")
         mock_compact.assert_called_once()
-        # Verify target_summary_chars was passed as a positive int
-        _, kwargs = (
-            mock_compact.call_args
-            if mock_compact.call_args.kwargs
-            else (mock_compact.call_args.args, {})
-        )
+        # target_summary_chars is no longer pre-deducted in _maybe_compact
+        # (it is computed inside _compact_history after absorption); the
+        # joint history budget is the value _maybe_compact passes.
         called_args = mock_compact.call_args.args
-        assert called_args[1] >= 200  # at least the minimum floor
+        assert called_args[2] > 0  # target_history_tokens is a positive int
 
     def test_history_unmodified_under_budget(self):
         """Under budget: history is append-only — no dedup, no annotation, no compaction."""
