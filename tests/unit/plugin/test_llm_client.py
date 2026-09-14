@@ -4,6 +4,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
 import json
 import os
+import re
 import ssl
 import sys
 import threading
@@ -2743,6 +2744,11 @@ class TestToolEviction:
         trimmed = [n for n in notices if "Tool set trimmed" in n]
         assert len(trimmed) == 1
         assert "tool_a" in trimmed[0] and "tool_b" in trimmed[0] and "tool_c" in trimmed[0]
+        # notice reports the post-eviction used token estimate
+        assert re.search(r"used ≈\d+ tokens", trimmed[0]) is not None
+        compacted = [n for n in notices if "History compacted" in n]
+        assert len(compacted) == 1
+        assert re.search(r"used ≈\d+ tokens", compacted[0]) is not None
 
     def test_window_overflow_returns_error_message(self):
         # context 2k -> budget 1.4k, target 980. History+system+meta alone

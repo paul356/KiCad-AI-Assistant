@@ -1769,6 +1769,7 @@ class LLMClient:
         # remaining lever is the enabled tool set (issue #133).
         history_tokens = self._estimate_tokens(self._history)
         used = system_tokens + history_tokens + tools_est_tokens
+        used_after_compact = used
         evicted = self._evict_tools_to_target(target_post_compact, used)
         if evicted:
             tools_est_tokens = (
@@ -1778,13 +1779,14 @@ class LLMClient:
 
         if compacted and on_compacted is not None:
             on_compacted(
-                "⟲ History compacted — earlier context summarised; recent turns kept verbatim."
+                "⟲ History compacted — earlier context summarised; recent turns kept verbatim. "
+                f"(used ≈{used_after_compact} tokens)"
             )
         if evicted and on_compacted is not None:
             on_compacted(
                 "Tool set trimmed for context budget — disabled: "
                 + ", ".join(sorted(evicted))
-                + ". Re-enable with enable_tool if needed."
+                + f". Re-enable with enable_tool if needed. (used ≈{used} tokens)"
             )
         if (
             not compacted
