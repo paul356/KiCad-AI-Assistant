@@ -246,6 +246,12 @@ _current_reasoning: list[str] = []
 # that truncates a tool-calling response.
 _ANTHROPIC_DEFAULT_MAX_TOKENS = 65536
 
+# Minimum summary size (chars) guaranteed during compaction. Large enough to
+# carry user intent + agreed plan + completed steps (~200 tokens) instead of
+# being starved to a couple of clipped sentences when the preserved block
+# alone nearly fills the history budget (issue #140).
+_COMPACTION_SUMMARY_FLOOR_CHARS = 800
+
 # ------------------------------------------------------------------
 # On-demand tool loading (issue #129)
 # ------------------------------------------------------------------
@@ -1244,38 +1250,124 @@ class LLMClient:
                 seen_tools.update(tool_names)
             i -= 1
 
-    def _compact_history(self, system_prompt: str, target_summary_chars: int) -> bool:
+    def _compact_history(
+        self,
+        system_prompt: str,
+        target_summary_chars: int,
+        target_history_tokens: int | None = None,
+    ) -> bool:
         """Summarise the oldest part of history into a single compact message.
 
-        Identifies the last ``self._keep_recent_turns`` complete assistant turns
-        as the "recent" block that is always preserved verbatim.  Everything before
-        those turns is the compactable prefix.
+        Runs ``_dedup_tool_calls`` first as a compaction sub-step: superseded
+        tool turns are dropped before summarising so both the transcript and
+        the preserved block stay lean.
+
+        The tail "pending" block — messages after the last assistant reply,
+        i.e. the unanswered user question that just triggered run() — is
+        always preserved verbatim and never counts toward the
+        ``keep_recent_turns`` budget. Folding the live question into the
+        summary is the original #140 bug.
+
+        When ``target_history_tokens`` is given, the most recent
+        ``keep_recent_turns`` user turns (user->user boundary; does not include
+        the pending block) are kept verbatim from the newest backwards while
+        their cumulative size fits ``target_history_tokens`` minus the pending
+        block and an 800-char summary floor. Turns that don't fit fold into the
+        compactable prefix. The summary budget is then recomputed from the
+        ACTUAL preserved-block size, so folding turns releases space back to
+        the summary — the pre-deduction cycle that pinned the summary at the
+        200-char floor while the question was being dropped (#140) is broken.
 
         Builds a text-only transcript of the prefix (user/assistant text only;
         tool names noted inline; raw tool results omitted) and asks the LLM to
-        summarise it with user intentions and agreements listed first.
-
-        The returned summary is hard-clipped to ``target_summary_chars`` at a
+        summarise it with user intentions and agreements listed first.  When
+        the transcript exceeds half the context window it is split at turn
+        boundaries (a single turn larger than the budget is hard-split) and
+        summarised incrementally: each chunk is summarised together with the
+        running summary of the previous chunks (map-reduce).  The summary is
+        capped at a quarter of the window and each chunk's budget subtracts
+        the running summary plus prompt overhead, so no compaction call can
+        itself overflow the window.
+        The final summary is hard-clipped to ``target_summary_chars`` at a
         word boundary before storing.
 
         Returns True on success, False if nothing was compacted or an error occurred.
         """
-        # ---- Identify the split point (oldest of the recent turns) ----------
-        turns_found = 0
-        split_idx = len(self._history)  # index of first message in "recent" block
-        i = len(self._history) - 1
-        while i >= 0 and turns_found < self._keep_recent_turns:
-            if self._history[i].get("role") == "assistant":
-                split_idx = i
-                turns_found += 1
-            i -= 1
+        self._dedup_tool_calls()
 
-        # Walk back to include the user message that opened this oldest recent turn
-        j = split_idx - 1
-        while j >= 0 and self._history[j].get("role") != "user":
-            j -= 1
-        if j >= 0:
-            split_idx = j
+        if not self._history:
+            return False  # nothing to compact
+
+        # ---- Locate the tail pending block --------------------------------
+        # The pending block is the run of unanswered user messages at the very
+        # tail of history — the live question(s) that just triggered run().
+        # It is always preserved verbatim and never counts toward the
+        # keep_recent_turns budget: folding the live question into the summary
+        # is the original #140 bug.
+        # Trailing tool messages (tool results with no following assistant
+        # reply) are NOT pending — they belong to the preceding assistant turn
+        # and may be folded into the prefix by absorption.
+        pending_start = len(self._history)
+        while pending_start > 0:
+            if self._history[pending_start - 1].get("role") == "user":
+                pending_start -= 1
+            else:
+                break
+
+        # ---- Identify the split point ------------------------------------
+        # The tail pending block (last assistant reply → end) is always
+        # preserved verbatim — it is the unanswered user question that just
+        # triggered run(). Folding it into the summary is the original #140
+        # bug. It does not count toward keep_recent_turns.
+        #
+        # From the pending block backwards, keep up to keep_recent_turns
+        # complete user turns (user->user boundary; includes each turn's
+        # assistant reply and trailing tool-result messages). When a joint
+        # history budget is given, fold turns that don't fit into the prefix;
+        # otherwise keep them all (only budget-less callers reach here).
+        cum = [0] * (len(self._history) + 1)
+        for idx, m in enumerate(self._history):
+            cum[idx + 1] = cum[idx] + len(json.dumps(m))
+
+        if target_history_tokens is None:
+            split_chars = None  # no budget — keep all recent turns
+        else:
+            pending_tokens = self._estimate_tokens(self._history[pending_start:])
+            summary_floor_tokens = _COMPACTION_SUMMARY_FLOOR_CHARS // 4
+            split_chars = max(
+                4, (target_history_tokens - pending_tokens - summary_floor_tokens) * 4
+            )
+
+        new_split = pending_start  # pending always preserved
+        acc = 0
+        turns_kept = 0
+        i = pending_start - 1
+        while i >= 0 and turns_kept < self._keep_recent_turns:
+            if self._history[i].get("role") == "user":
+                turn_chars = cum[new_split] - cum[i]
+                if split_chars is not None and acc + turn_chars > split_chars:
+                    break  # this and all older turns fold in
+                acc += turn_chars
+                new_split = i
+                turns_kept += 1
+            i -= 1
+        split_idx = new_split
+
+        if target_history_tokens is not None:
+            # Recompute summary budget from the actual preserved block so the
+            # account closes (summary + preserved == target_history_tokens
+            # modulo clamps). Folding turns shrinks preserved and grows the
+            # summary — this breaks the pre-deduction cycle that pinned the
+            # summary at the 800-char floor while the live question was being
+            # dropped (#140).
+            preserved_tokens = self._estimate_tokens(self._history[split_idx:])
+            target_summary_chars = max(
+                _COMPACTION_SUMMARY_FLOOR_CHARS,
+                min(
+                    int(self._context_tokens * 0.25 * 4),
+                    (target_history_tokens - preserved_tokens) * 4,
+                ),
+            )
 
         prefix = self._history[:split_idx]
         if len(prefix) < 4:
@@ -1302,49 +1394,109 @@ class LLMClient:
                     lines.append(f"Assistant called tools: {names}")
             # role=="tool" messages are omitted entirely
 
-        transcript = "\n".join(lines)
+        # ---- Window safety for every compaction call -------------------------
+        # Each compaction call sends preamble + running summary + chunk.
+        # Bound the summary at a quarter of the window and subtract summary
+        # plus prompt overhead from the per-chunk budget, so no single call
+        # exceeds half the window even at the worst case (issue #140).
+        target_summary_chars = min(target_summary_chars, int(self._context_tokens * 0.25 * 4))
+        head_overhead_chars = 800  # preamble + <session> delimiters, worst case
         target_words = max(50, target_summary_chars // 4)
-        compact_prompt = (
-            f"Summarize the following KiCad assistant session excerpt in approximately "
-            f"{target_words} words.\n"
-            "Structure your summary as follows:\n"
-            "1. User intentions and agreed proposals (list these first)\n"
-            "2. Any other relevant context\n\n"
-            "Drop intermediate tool roundtrips, failed attempts, superseded proposals, "
-            "and tool-returned data (placements, net lists, positions — those will be "
-            "re-fetched from tools when needed).\n\n"
-            f"<session>\n{transcript}\n</session>"
+
+        # ---- Chunked incremental summarisation ------------------------------
+        # Never send more than half the window per compaction call.  The
+        # transcript is split at line (turn) boundaries; each chunk is
+        # summarised together with the running summary of earlier chunks.
+        def _build_prompt(running_summary: str, chunk: str) -> str:
+            head = (
+                f"Summarize the following KiCad assistant session excerpt in approximately "
+                f"{target_words} words.\n"
+                "Structure your summary as follows:\n"
+                "1. User intentions and agreed proposals (list these first)\n"
+                "2. Any other relevant context\n\n"
+                "Drop intermediate tool roundtrips, failed attempts, superseded proposals, "
+                "and tool-returned data (placements, net lists, positions — those will be "
+                "re-fetched from tools when needed).\n\n"
+            )
+            if running_summary:
+                head += (
+                    f"Existing partial summary of earlier content:\n{running_summary}\n\n"
+                    "Now extend it with the following additional session content:\n\n"
+                )
+            return head + f"<session>\n{chunk}\n</session>"
+
+        max_chunk_chars = max(
+            1_000,
+            int(self._context_tokens * 0.5 * 4) - target_summary_chars - head_overhead_chars,
         )
+        chunks: list[list[str]] = []
+        cur_lines: list[str] = []
+        cur_len = 0
+        for line in lines:
+            if len(line) > max_chunk_chars:
+                # One turn alone overflows the per-call budget (e.g. a pasted
+                # document): flush the current chunk, hard-split the line at the
+                # character boundary so no compaction call exceeds half the
+                # window, keeping each part well-formed for summarising.
+                if cur_lines:
+                    chunks.append(cur_lines)
+                    cur_lines, cur_len = [], 0
+                for i in range(0, len(line), max_chunk_chars):
+                    chunks.append([line[i : i + max_chunk_chars]])
+                continue
+            if cur_lines and cur_len + len(line) > max_chunk_chars:
+                chunks.append(cur_lines)
+                cur_lines, cur_len = [], 0
+            cur_lines.append(line)
+            cur_len += len(line)
+        if cur_lines:
+            chunks.append(cur_lines)
 
-        # ---- Call LLM for the summary (no tools, short timeout) -------------
-        try:
-            provider = self._settings.llm_provider
-            compaction_history = [{"role": "user", "content": compact_prompt}]
-            # Temporarily swap history for the compaction call
-            original_history = self._history
-            self._history = compaction_history
-            if provider == "anthropic":
-                resp = self._call_anthropic(
-                    "You are a helpful assistant that summarizes conversations concisely.",
-                    [],
-                )
-            else:
-                resp = self._call_openai(
-                    "You are a helpful assistant that summarizes conversations concisely.",
-                    [],
-                )
-            self._history = original_history
-        except Exception as e:
-            self._history = original_history  # type: ignore[possibly-undefined]
-            log.warning("History compaction failed: %s", e)
-            return False
+        summary = ""
+        for chunk_lines in chunks:
+            compact_prompt = _build_prompt(summary, "\n".join(chunk_lines))
 
-        if resp.get("error"):
-            log.warning("History compaction LLM error: %s", resp["error"])
-            return False
+            # ---- Call LLM for this chunk (no tools, short timeout) ---------
+            try:
+                provider = self._settings.llm_provider
+                compaction_history = [{"role": "user", "content": compact_prompt}]
+                # Temporarily swap history for the compaction call
+                original_history = self._history
+                self._history = compaction_history
+                if provider == "anthropic":
+                    resp = self._call_anthropic(
+                        "You are a helpful assistant that summarizes conversations concisely.",
+                        [],
+                    )
+                else:
+                    resp = self._call_openai(
+                        "You are a helpful assistant that summarizes conversations concisely.",
+                        [],
+                    )
+                self._history = original_history
+            except Exception as e:
+                self._history = original_history  # type: ignore[possibly-undefined]
+                log.warning("History compaction failed: %s", e)
+                return False
 
-        summary = resp.get("message", {}).get("content") or ""
-        if not summary:
+            if resp.get("error"):
+                log.warning("History compaction LLM error: %s", resp["error"])
+                return False
+
+            summary = resp.get("message", {}).get("content") or ""
+            if not summary:
+                return False
+            # keep the running summary bounded so the loop terminates
+            if len(summary) > target_summary_chars:
+                clipped = summary[:target_summary_chars]
+                last_space = clipped.rfind(" ")
+                if last_space > target_summary_chars // 2:
+                    clipped = clipped[:last_space]
+                summary = clipped
+
+        if not chunks or not summary:
+            # prefix contained nothing summarisable (e.g. only tool messages)
+            # or the LLM returned no text — store nothing, report failure
             return False
 
         # ---- Hard-clip summary to target_summary_chars at a word boundary ---
@@ -1701,15 +1853,19 @@ class LLMClient:
         Assumes provider-side rendering order system → tools → history: the
         fixed head (system + catalog + meta-tools) is the byte-identical cache
         prefix. Keep it stable across turns — never reorder or repopulate the
-        enabled-tools segment mid-session; trimming only ever targets history,
-        except for the last-resort tool eviction described below.
+        enabled-tools segment mid-session; the only mutation the budget check
+        performs on the head is evicting enabled tool schemas (described
+        below), which is cheap to reverse with enable_tool.
 
-        When compaction alone cannot bring the estimated request back within
-        the compaction target (``_compact_target_threshold`` × window) because
-        enabled tool schemas dominate, the enabled set is trimmed from the tail
-        of the request list (stable catalog order; meta tools are never
-        evicted) until the target is met (issue #133).  If the request cannot
-        fit the real window (``llm_context_tokens``) even after eviction, this
+        When the budget is exceeded, enabled tool schemas are trimmed from the
+        tail of the request list first (stable catalog order; meta tools are
+        never evicted) down to the compaction target — tool schemas are cheap
+        and renewable, whereas conversation text is not (issue #133).  Only if
+        the request still exceeds the compaction target after eviction is the
+        history compacted (issue #133: eviction-first ordering); the preserved
+        recent turns are folded into the summary when they alone would overrun
+        the joint budget.  If the request cannot fit the real window
+        (``llm_context_tokens``) even after eviction and compaction, this
         returns an error string and the caller must not send the request.
 
         The one exception is ``_prune_rollback_history``: restoring an earlier
@@ -1745,46 +1901,18 @@ class LLMClient:
         if used <= budget:
             return  # well within limits — history stays append-only for cache
 
-        # ---- Over budget: cheapest saving first — drop superseded turns ----
-        self._dedup_tool_calls()
-        history_tokens = self._estimate_tokens(self._history)
-        used = system_tokens + history_tokens + tools_est_tokens
-        if used <= budget:
-            return  # dedup alone brought us back within budget
-
-        # ---- Still over budget: compact, then annotate preserved turns -----
-        # Estimate the cost of the recent turns we will always keep
-        i = len(self._history) - 1
-        turns_found = 0
-        split_idx = len(self._history)
-        while i >= 0 and turns_found < self._keep_recent_turns:
-            if self._history[i].get("role") == "assistant":
-                split_idx = i
-                turns_found += 1
-            i -= 1
-        # Walk back to include the user message that opened the oldest recent turn
-        j = split_idx - 1
-        while j >= 0 and self._history[j].get("role") != "user":
-            j -= 1
-        if j >= 0:
-            split_idx = j
-        recent_tokens = self._estimate_tokens(self._history[split_idx:])
-
+        # ---- Over budget: evict enabled tool schemas first -----------------
+        # Tool schemas are the cheapest, most renewable part of the request
+        # (re-enableable with enable_tool); conversation text is only compacted
+        # once the tool set has given all it can (issue #133).  Eviction stops
+        # at the compaction target — it never evicts meta tools.
         target_post_compact = self._context_tokens * self._compact_target_threshold
-        target_summary_chars = max(
-            200,
-            int((target_post_compact - system_tokens - recent_tokens - tools_est_tokens) * 4),
-        )
-
-        compacted = self._compact_history(system_prompt, target_summary_chars)
-        self._validate_history()  # compaction rebuilds history; verify integrity
-
-        # ---- Recompute after compaction: history shrank, so the estimate
-        # above is stale.  If we still exceed the compaction target, the only
-        # remaining lever is the enabled tool set (issue #133).
-        history_tokens = self._estimate_tokens(self._history)
-        used = system_tokens + history_tokens + tools_est_tokens
-        used_after_compact = used
+        # snapshot the initial estimates — eviction and compaction overwrite
+        # `tools_est_tokens` / `history_tokens` / `used` below; keep the
+        # originals for the single before -> after notice.
+        tools_est_before = tools_est_tokens
+        history_before = history_tokens
+        used_before_evict = used
         evicted = self._evict_tools_to_target(target_post_compact, used)
         if evicted:
             tools_est_tokens = (
@@ -1792,16 +1920,47 @@ class LLMClient:
             )
             used = system_tokens + history_tokens + tools_est_tokens
 
-        if compacted and on_compacted is not None:
-            on_compacted(
-                "⟲ History compacted — earlier context summarised; recent turns kept verbatim. "
-                f"(used ≈{used_after_compact} tokens)"
+        compacted = False
+        if used > target_post_compact:
+            # ---- Still over target: compact history ------------------------
+            # _compact_history runs dedup as its first sub-step, identifies the
+            # tail pending block (messages after the last assistant reply,
+            # i.e. the unanswered user question that just triggered run()),
+            # always preserves it verbatim, then folds recent turns into the
+            # prefix on a user->user boundary until they fit the joint budget.
+            # The summary budget is computed AFTER absorption from the actual
+            # preserved-block size — folding releases space back to the
+            # summary, so the question is never starved out of the prompt
+            # (issue #140). Chunks oversized transcripts so no compaction call
+            # itself overflows the window.
+            target_history_tokens = max(0, target_post_compact - system_tokens - tools_est_tokens)
+            compacted = self._compact_history(system_prompt, 0, target_history_tokens)
+            self._validate_history()  # compaction rebuilds history; verify integrity
+
+            # Recompute after compaction: history shrank, so the estimate
+            # above is stale.
+            history_tokens = self._estimate_tokens(self._history)
+            used = system_tokens + history_tokens + tools_est_tokens
+
+        if (evicted or compacted) and on_compacted is not None:
+            actions = []
+            if compacted:
+                actions.append("earlier context summarised; recent turns kept verbatim")
+            if evicted:
+                actions.append(f"tools trimmed: {', '.join(sorted(evicted))}")
+
+            old_size = (
+                f"≈{used_before_evict} (system {system_tokens} + tools {tools_est_before} "
+                f"+ history {history_before})"
             )
-        if evicted and on_compacted is not None:
+            new_size = (
+                f"≈{used} (system {system_tokens} + tools {tools_est_tokens} "
+                f"+ history {history_tokens})"
+            )
             on_compacted(
-                "Tool set trimmed for context budget — disabled: "
-                + ", ".join(sorted(evicted))
-                + f". Re-enable with enable_tool if needed. (used ≈{used} tokens)"
+                "⟲ Context compressed for budget — "
+                + "; ".join(actions)
+                + f". {old_size} => {new_size} tokens"
             )
         if (
             not compacted
