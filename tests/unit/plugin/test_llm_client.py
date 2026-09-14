@@ -2397,10 +2397,15 @@ class TestToolDirectRequest:
     def test_direct_unknown_kind_still_treated_as_chat(self):
         # A dict without kind == "tool_direct" is not a framework request;
         # run() treats it as ordinary user text content rendering (dict str).
+        # The chat path must never hit a real LLM endpoint in tests: stub it.
         client = _make_client()
+        client._call_llm = MagicMock(
+            return_value={"finish_reason": "stop", "message": {"content": "done"}}
+        )
         with patch("kicad_plugin.llm_client.call_mcp_tool", return_value={"status": "started"}):
             reply = client.run({"not": "a request"}, "")
         assert isinstance(reply, str)
+        client._call_llm.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
