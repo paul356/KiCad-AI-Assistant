@@ -1669,7 +1669,7 @@ class LLMClient:
 
     def _maybe_compact(
         self, system_prompt: str, on_compacted=None, on_warning=None, tools_est_tokens: int = 0
-    ) -> None:
+    ) -> str | None:
         """Manage history purely by token budget.
 
         Under budget, history is left byte-identical (append-only growth), so
@@ -1686,7 +1686,16 @@ class LLMClient:
         Assumes provider-side rendering order system → tools → history: the
         fixed head (system + catalog + meta-tools) is the byte-identical cache
         prefix. Keep it stable across turns — never reorder or repopulate the
-        enabled-tools segment mid-session; trimming only ever targets history.
+        enabled-tools segment mid-session; trimming only ever targets history,
+        except for the last-resort tool eviction described below.
+
+        When compaction alone cannot bring the estimated request back within
+        the compaction target (``_compact_target_threshold`` × window) because
+        enabled tool schemas dominate, the enabled set is trimmed from the tail
+        of the request list (stable catalog order; meta tools are never
+        evicted) until the target is met (issue #133).  If the request cannot
+        fit the real window (``llm_context_tokens``) even after eviction, this
+        returns an error string and the caller must not send the request.
 
         The one exception is ``_prune_rollback_history``: restoring an earlier
         file version invalidates prior tool turns, so those are removed every
@@ -1754,11 +1763,35 @@ class LLMClient:
 
         compacted = self._compact_history(system_prompt, target_summary_chars)
         self._validate_history()  # compaction rebuilds history; verify integrity
+
+        # ---- Recompute after compaction: history shrank, so the estimate
+        # above is stale.  If we still exceed the compaction target, the only
+        # remaining lever is the enabled tool set (issue #133).
+        history_tokens = self._estimate_tokens(self._history)
+        used = system_tokens + history_tokens + tools_est_tokens
+        evicted = self._evict_tools_to_target(target_post_compact, used)
+        if evicted:
+            tools_est_tokens = (
+                self._enabled_tools_est_tokens() + len(json.dumps(_META_TOOL_DEFS)) // 4
+            )
+            used = system_tokens + history_tokens + tools_est_tokens
+
         if compacted and on_compacted is not None:
             on_compacted(
                 "⟲ History compacted — earlier context summarised; recent turns kept verbatim."
             )
-        elif not compacted and not self._budget_warned and not self._fixed_overhead_warned:
+        if evicted and on_compacted is not None:
+            on_compacted(
+                "Tool set trimmed for context budget — disabled: "
+                + ", ".join(sorted(evicted))
+                + ". Re-enable with enable_tool if needed."
+            )
+        if (
+            not compacted
+            and not evicted
+            and not self._budget_warned
+            and not self._fixed_overhead_warned
+        ):
             self._budget_warned = True
             msg = (
                 f"Context budget exceeded but history is too short to compact (used ≈{used} "
@@ -1775,7 +1808,49 @@ class LLMClient:
 
         # Annotate stale query results among the preserved turns only — the
         # compacted prefix is summarized, so nothing earlier needs marking.
+        # Runs before the overflow abort: annotations persist in history and
+        # stay correct for whichever turn eventually sends a request.
         self._annotate_stale_queries()
+
+        # ---- Hard fail: even with every enabled tool evicted the request
+        # cannot fit the real window — surface the error, do not send.
+        if used > self._context_tokens:
+            msg = (
+                f"Context window overflow: request needs ≈{used} tokens but the window is "
+                f"{self._context_tokens} (system {system_tokens} + history {history_tokens} "
+                f"+ tools {tools_est_tokens}). Not sent — increase llm_context_tokens or "
+                "reduce the conversation length."
+            )
+            log.warning("%s", msg)
+            if on_warning is not None:
+                try:
+                    on_warning(msg)
+                except Exception as e:
+                    log.warning("on_warning callback failed: %s", e)
+            return msg
+
+        return None
+
+    def _evict_tools_to_target(self, target_tokens: int, current_used: int) -> list[str]:
+        """Evict enabled tool schemas from the tail of the request list.
+
+        Walks the stable catalog order used by ``_build_request_tools``
+        backwards (meta tools are never evicted) and disables schemas until
+        the estimated request size fits ``target_tokens`` or the enabled set
+        is empty.  Returns the names of the evicted tools.
+        """
+        registry = self._tool_registry or {}
+        order = [name for name in registry if name in self._enabled_tools]
+        evicted: list[str] = []
+        for name in reversed(order):
+            if current_used <= target_tokens:
+                break
+            if name in _META_TOOL_NAMES:
+                continue
+            self._enabled_tools.discard(name)
+            evicted.append(name)
+            current_used -= len(json.dumps(registry[name])) // 4
+        return evicted
 
     @staticmethod
     def _tool_result_succeeded(result: Any) -> bool:
@@ -2153,7 +2228,11 @@ class LLMClient:
         content = self._build_user_content(user_message, images)
         self._history.append({"role": "user", "content": content})
         tools_est = self._enabled_tools_est_tokens() + len(json.dumps(_META_TOOL_DEFS)) // 4
-        self._maybe_compact(system, on_compacted, on_warning=on_warning, tools_est_tokens=tools_est)
+        compact_error = self._maybe_compact(
+            system, on_compacted, on_warning=on_warning, tools_est_tokens=tools_est
+        )
+        if compact_error:
+            return f"[Error] {compact_error}"
 
         tools = self._build_request_tools()
         missing_policies = get_missing_tool_policies(
