@@ -1083,14 +1083,15 @@ class LLMClient:
 
         The backend runs on a dynamically chosen port and may be restarted on
         a new port (plugin ServerManager) without a client rebuild: a changed
-        URL invalidates the cached tool registry and enabled set so the next
-        turn refetches from the new endpoint instead of advertising tools the
-        current backend does (no longer) register.
+        URL invalidates the cached tool registry so the next turn refetches
+        from the new endpoint.  The enabled set is session state (persisted
+        with the session) and is kept; names the new endpoint no longer
+        registers are pruned lazily by ``_build_request_tools`` once the
+        catalog is refetched.
         """
         if url == self._mcp_base_url:
             return
         self._tool_registry = None
-        self._enabled_tools.clear()
         self._mcp_base_url = url
 
     def get_history(self) -> list[dict[str, Any]]:
@@ -2038,8 +2039,16 @@ class LLMClient:
         return "\n\n# Available tools\n" + "\n".join(lines)
 
     def _build_request_tools(self) -> list[dict[str, Any]]:
-        """Meta-tools plus enabled schemas, in stable catalog registration order."""
+        """Meta-tools plus enabled schemas, in stable catalog registration order.
+
+        Once the catalog is known, enabled names it no longer contains (tools
+        the backend stopped registering after a restart) are pruned, so session
+        persistence never keeps stale names.  With the catalog still unknown
+        the enabled set is left untouched (lazy schema adoption).
+        """
         registry = self._tool_registry or {}
+        if self._tool_registry is not None:
+            self._enabled_tools.intersection_update(registry)
         return list(_META_TOOL_DEFS) + [
             registry[name] for name in registry if name in self._enabled_tools
         ]

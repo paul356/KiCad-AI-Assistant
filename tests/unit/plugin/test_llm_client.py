@@ -125,7 +125,29 @@ class TestSetBaseUrl:
         client._enabled_tools = {"get_board_info"}
         client.set_base_url("http://127.0.0.1:7777")
         assert client._tool_registry is None
-        assert client._enabled_tools == set()
+        # The enabled set is session state and survives a URL change; stale
+        # names are pruned lazily by _build_request_tools once the catalog
+        # is refetched.
+        assert client._enabled_tools == {"get_board_info"}
+
+    def test_build_request_tools_prunes_stale_enabled(self):
+        client = _make_client()
+        client._tool_registry = {"get_board_info": _fake_tool_def("get_board_info")}
+        client._enabled_tools = {"get_board_info", "ghost_tool"}
+        tools = client._build_request_tools()
+        names = [t["function"]["name"] for t in tools]
+        assert "ghost_tool" not in names
+        assert "get_board_info" in names
+        assert client._enabled_tools == {"get_board_info"}
+
+    def test_build_request_tools_keeps_enabled_when_catalog_unknown(self):
+        client = _make_client()
+        client._tool_registry = None
+        client._enabled_tools = {"get_board_info", "ghost_tool"}
+        tools = client._build_request_tools()
+        # Registry not yet fetched: no pruning, lazy adoption holds.
+        assert client._enabled_tools == {"get_board_info", "ghost_tool"}
+        assert all(t["function"]["name"] not in ("get_board_info", "ghost_tool") for t in tools)
 
     def test_same_url_keeps_cached_registry(self):
         client = _make_client()
