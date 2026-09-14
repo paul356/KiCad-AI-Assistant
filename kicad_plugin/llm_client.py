@@ -1791,8 +1791,9 @@ class LLMClient:
         Assumes provider-side rendering order system → tools → history: the
         fixed head (system + catalog + meta-tools) is the byte-identical cache
         prefix. Keep it stable across turns — never reorder or repopulate the
-        enabled-tools segment mid-session; trimming only ever targets history,
-        except for the last-resort tool eviction described below.
+        enabled-tools segment mid-session; the only mutation the budget check
+        performs on the head is evicting enabled tool schemas (described
+        below), which is cheap to reverse with enable_tool.
 
         When the budget is exceeded, enabled tool schemas are trimmed from the
         tail of the request list first (stable catalog order; meta tools are
