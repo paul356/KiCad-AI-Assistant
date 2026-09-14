@@ -1907,15 +1907,18 @@ class LLMClient:
         # once the tool set has given all it can (issue #133).  Eviction stops
         # at the compaction target — it never evicts meta tools.
         target_post_compact = self._context_tokens * self._compact_target_threshold
+        # snapshot the initial estimates — eviction and compaction overwrite
+        # `tools_est_tokens` / `history_tokens` / `used` below; keep the
+        # originals for the single before -> after notice.
+        tools_est_before = tools_est_tokens
+        history_before = history_tokens
+        used_before_evict = used
         evicted = self._evict_tools_to_target(target_post_compact, used)
-        # snapshot right after eviction, before compaction mutates `used`
-        used_after_evict = used
         if evicted:
             tools_est_tokens = (
                 self._enabled_tools_est_tokens() + len(json.dumps(_META_TOOL_DEFS)) // 4
             )
             used = system_tokens + history_tokens + tools_est_tokens
-            used_after_evict = used
 
         compacted = False
         if used > target_post_compact:
@@ -1939,16 +1942,26 @@ class LLMClient:
             history_tokens = self._estimate_tokens(self._history)
             used = system_tokens + history_tokens + tools_est_tokens
 
-        if compacted and on_compacted is not None:
+        if (evicted or compacted) and on_compacted is not None:
+            actions = []
+            if compacted:
+                actions.append("earlier context summarised; recent turns kept verbatim")
+            if evicted:
+                actions.append(f"tools trimmed: {', '.join(sorted(evicted))}")
+
+            def _seg(label: str, before: int, after: int) -> str:
+                if before == after:
+                    return f"{label} ≈{before}"
+                return f"{label} ≈{before}→≈{after}"
+
             on_compacted(
-                "⟲ History compacted — earlier context summarised; recent turns kept verbatim. "
-                f"(used ≈{used} tokens)"
-            )
-        if evicted and on_compacted is not None:
-            on_compacted(
-                "Tool set trimmed for context budget — disabled: "
-                + ", ".join(sorted(evicted))
-                + f". Re-enable with enable_tool if needed. (used ≈{used_after_evict} tokens)"
+                "⟲ Context compressed for budget — "
+                + "; ".join(actions)
+                + f" ({_seg('system', system_tokens, system_tokens)} + "
+                + _seg("tools", tools_est_before, tools_est_tokens)
+                + " + "
+                + _seg("history", history_before, history_tokens)
+                + f" = ≈{used_before_evict} → ≈{used} tokens)"
             )
         if (
             not compacted

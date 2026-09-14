@@ -3173,12 +3173,18 @@ class TestToolEviction:
         assert err is None  # under the real window after eviction
         assert client._enabled_tools == set()  # all 3 evicted
         mock_compact.assert_not_called()  # eviction already reached the target
-        trimmed = [n for n in notices if "Tool set trimmed" in n]
-        assert len(trimmed) == 1
-        assert "tool_a" in trimmed[0] and "tool_b" in trimmed[0] and "tool_c" in trimmed[0]
-        # notice reports the post-eviction used token estimate
-        assert re.search(r"used ≈\d+ tokens", trimmed[0]) is not None
-        assert not any("History compacted" in n for n in notices)
+        # one consolidated notice: action + per-segment sizes + before -> after
+        assert len(notices) == 1
+        assert "Context compressed for budget" in notices[0]
+        assert "tool_a" in notices[0] and "tool_b" in notices[0] and "tool_c" in notices[0]
+        assert (
+            re.search(
+                r"system ≈\d+ \+ tools ≈\d+→≈\d+ \+ history ≈\d+ = ≈\d+ → ≈\d+ tokens",
+                notices[0],
+            )
+            is not None
+        )
+        assert "History compacted" not in notices[0]
 
     def test_maybe_compact_compacts_when_eviction_insufficient(self):
         # History dominates: even with every enabled tool evicted the request
