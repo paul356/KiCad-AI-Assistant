@@ -125,7 +125,29 @@ class TestSetBaseUrl:
         client._enabled_tools = {"get_board_info"}
         client.set_base_url("http://127.0.0.1:7777")
         assert client._tool_registry is None
-        assert client._enabled_tools == set()
+        # The enabled set is session state and survives a URL change; stale
+        # names are pruned lazily by _build_request_tools once the catalog
+        # is refetched.
+        assert client._enabled_tools == {"get_board_info"}
+
+    def test_build_request_tools_prunes_stale_enabled(self):
+        client = _make_client()
+        client._tool_registry = {"get_board_info": _fake_tool_def("get_board_info")}
+        client._enabled_tools = {"get_board_info", "ghost_tool"}
+        tools = client._build_request_tools()
+        names = [t["function"]["name"] for t in tools]
+        assert "ghost_tool" not in names
+        assert "get_board_info" in names
+        assert client._enabled_tools == {"get_board_info"}
+
+    def test_build_request_tools_keeps_enabled_when_catalog_unknown(self):
+        client = _make_client()
+        client._tool_registry = None
+        client._enabled_tools = {"get_board_info", "ghost_tool"}
+        tools = client._build_request_tools()
+        # Registry not yet fetched: no pruning, lazy adoption holds.
+        assert client._enabled_tools == {"get_board_info", "ghost_tool"}
+        assert all(t["function"]["name"] not in ("get_board_info", "ghost_tool") for t in tools)
 
     def test_same_url_keeps_cached_registry(self):
         client = _make_client()
@@ -336,6 +358,414 @@ class TestCompactHistory:
         assert result is False
         assert client._history == original
 
+    def test_dedup_runs_as_compaction_substep(self):
+        """Dedup is folded into _compact_history, not a _maybe_compact lever."""
+        client = _make_client(keep_recent_turns=4)
+        client._history = self._make_full_history(n_turns=8)
+        summary_response = {
+            "finish_reason": "stop",
+            "message": {"content": "User wants to place R1."},
+        }
+        with (
+            patch.object(client, "_dedup_tool_calls") as mock_dedup,
+            patch.object(client, "_call_openai", return_value=summary_response),
+        ):
+            result = client._compact_history("system", target_summary_chars=500)
+        assert result is True
+        mock_dedup.assert_called_once()
+
+    def test_chunks_oversized_transcript_across_multiple_calls(self):
+        # context 10k -> dedupe gate: no single compaction call may send more
+        # than half the window (10_000 * 0.5 * 4 = 20_000 chars).
+        client = _make_client(context_tokens=10_000, keep_recent_turns=4)
+        # 8 turns, ~8k chars per message -> prefix of 4 turns ~= 64k chars of
+        # transcript, well over the 20k per-call budget.
+        client._history = []
+        for i in range(8):
+            client._history.append(_user("q" + "x" * 8_000))
+            client._history.append(_assistant("a" + "y" * 8_000))
+        original_recent = client._history[-8:]  # last 4 turns
+
+        summary_response = {
+            "finish_reason": "stop",
+            "message": {"content": "User intends to place R1, C2 and connect GND."},
+        }
+        prompts = []
+        max_chunk_chars = int(10_000 * 0.5 * 4)
+
+        def _capture(system_prompt, tools):
+            # During the compaction call self._history holds the chunk prompt
+            prompts.append(client._history[0]["content"])
+            return summary_response
+
+        with patch.object(client, "_call_openai", side_effect=_capture) as mock_call:
+            result = client._compact_history("system", target_summary_chars=1000)
+
+        assert result is True
+        assert mock_call.call_count > 1, "oversized transcript must be chunked"
+        assert mock_call.call_count == 4  # 64k chars / 20k per chunk, line-aligned
+        for p in prompts:
+            chunk = p.split("<session>\n", 1)[1].rsplit("\n</session>", 1)[0]
+            assert len(chunk) <= max_chunk_chars  # per-call input stays within the gate
+        assert client._history[0]["role"] == "user"
+        assert "[Session summary" in client._history[0]["content"]
+        assert client._history[1:] == original_recent
+
+    def test_hard_splits_single_turn_larger_than_budget(self):
+        # One message alone exceeds the per-call budget: it must be hard-split
+        # so the compaction call still fits half the window.
+        client = _make_client(context_tokens=10_000, keep_recent_turns=2)
+        client._history = []
+        for i in range(3):
+            client._history.append(_user(f"pre q {i}"))
+            client._history.append(_assistant(f"pre a {i}"))
+        client._history.append(_user("QUESTION " + "x" * 45_000))  # > 20k gate
+        client._history.append(_assistant("mid a"))
+        for i in range(2):
+            client._history.append(_user(f"post q {i}"))
+            client._history.append(_assistant(f"post a {i}"))
+        # 10 messages: prefix = 6 messages (3 pre turns + QUESTION + mid a) >= 4,
+        # recent = last 2 turns preserved.
+        max_chunk_chars = int(10_000 * 0.5 * 4)
+        summary_response = {
+            "finish_reason": "stop",
+            "message": {"content": "User asked a long question."},
+        }
+        prompts = []
+
+        def _capture(system_prompt, tools):
+            prompts.append(client._history[0]["content"])
+            return summary_response
+
+        with patch.object(client, "_call_openai", side_effect=_capture) as mock_call:
+            result = client._compact_history("system", target_summary_chars=1000)
+
+        assert result is True
+        # 45k chars -> three hard-split segments (20k + 20k + 5k), each its own
+        # call, plus one call for the small pre-turn lines and one for the
+        # trailing "mid a" line.
+        assert mock_call.call_count == 5
+        for p in prompts:
+            chunk = p.split("<session>\n", 1)[1].rsplit("\n</session>", 1)[0]
+            assert len(chunk) <= max_chunk_chars
+
+    def test_absorbs_recent_turns_when_preserved_block_over_budget(self):
+        # Recent turns alone (~800 est tokens) exceed target_history_tokens:
+        # _compact_history must fold preserved turns into the prefix until the
+        # remaining block fits the joint budget.  Each recent turn is ~200
+        # tokens (heavy assistant answer) and the summary ceiling is 50 tokens,
+        # so a 60-token budget accepts no turn at all — even the newest turn is
+        # folded in and only the summary remains (issue #140: no "keep the
+        # final turn" floor).
+        client = _make_client(keep_recent_turns=4)
+        # prefix: 4 small turns; recent: 4 turns with heavy assistant answers
+        client._history = []
+        for i in range(4):
+            client._history.append(_user(f"small q {i}"))
+            client._history.append(_assistant(f"small a {i}"))
+        for i in range(4):
+            client._history.append(_user(f"recent q {i}"))
+            client._history.append(_assistant("recent big a " + "x" * 800))  # ~200 tok
+
+        summary_response = {
+            "finish_reason": "stop",
+            "message": {"content": "User worked through recent items."},
+        }
+        with patch.object(client, "_call_openai", return_value=summary_response):
+            result = client._compact_history(
+                "system", target_summary_chars=200, target_history_tokens=60
+            )
+
+        assert result is True
+        # entire history folded into the summary — nothing preserved verbatim
+        assert len(client._history) == 1
+        assert client._history[0]["role"] == "user"
+        assert "[Session summary" in client._history[0]["content"]
+
+    def test_absorption_keeps_turns_that_fit(self):
+        # Budget admits exactly the newest recent turns (each ~41 tokens:
+        # user+assistant pair incl. JSON overhead): they stay verbatim, the
+        # older ones are folded into the prefix.
+        client = _make_client(keep_recent_turns=4)
+        client._history = []
+        for i in range(4):
+            client._history.append(_user(f"small q {i}"))
+            client._assistant_append = None
+            client._history.append(_assistant(f"small a {i}"))
+        for i in range(4):
+            client._history.append(_user(f"recent q {i}"))
+            client._history.append(_assistant("recent a " + "x" * 80))  # ~41 tok/turn
+        original_rows = [m["content"] for m in client._history]
+
+        summary_response = {
+            "finish_reason": "stop",
+            "message": {"content": "Summary of older context."},
+        }
+        # recent 4 turns ≈ 164 tokens + summary ceiling 50 -> budget 600 admits all: floor 200 + turns 164
+        with patch.object(client, "_call_openai", return_value=summary_response):
+            result = client._compact_history(
+                "system", target_summary_chars=200, target_history_tokens=600
+            )
+
+        assert result is True
+        assert len(client._history) == 1 + 8  # summary + 4 recent turns
+        preserved_rows = [m["content"] for m in client._history[1:]]
+        assert preserved_rows == original_rows[-8:]
+
+    def test_absorption_partial_keeps_only_newest(self):
+        # Budget admits ~2 recent turns; older preserved turns fold into prefix.
+        client = _make_client(keep_recent_turns=4)
+        client._history = []
+        for i in range(4):
+            client._history.append(_user(f"small q {i}"))
+            client._history.append(_assistant(f"small a {i}"))
+        for i in range(4):
+            client._history.append(_user(f"recent q {i}"))
+            client._history.append(_assistant("recent a " + "x" * 80))  # ~41 tok/turn
+        original_rows = [m["content"] for m in client._history]
+
+        summary_response = {
+            "finish_reason": "stop",
+            "message": {"content": "Summary of older context."},
+        }
+        # budget 140: summary ceiling 50 -> split_tokens 90 admits exactly the
+        # newest 2 turns (2 x 41), a 3rd (123) would overrun
+        with patch.object(client, "_call_openai", return_value=summary_response):
+            result = client._compact_history(
+                "system", target_summary_chars=200, target_history_tokens=300
+            )
+
+        assert result is True
+        # summary + last 2 recent turns (2 x 2 rows = 4 messages)
+        assert len(client._history) == 1 + 4
+        preserved_rows = [m["content"] for m in client._history[1:]]
+        assert preserved_rows == original_rows[-4:]
+
+    def test_pending_question_preserved_when_preceding_turn_exceeds_budget(self):
+        # Regression for issue #140: the live user question at the tail of
+        # history must never be folded into the summary, even when the
+        # preceding turn alone exceeds the entire history budget (the 16:31
+        # session shape: a giant tool-result turn followed by a fresh user
+        # question). Old code merged the question into the preceding turn on a
+        # user→assistant boundary and broke on the first turn, dropping the
+        # question into an 800-char-clipped summary.
+        client = _make_client(keep_recent_turns=4)
+        client._history = []
+        # 4 small prefix turns
+        for i in range(4):
+            client._history.append(_user(f"old q {i}"))
+            client._history.append(_assistant(f"old a {i}"))
+        # One giant turn: user + assistant + huge tool result (~500 tok)
+        tc = [
+            {
+                "id": "tc1",
+                "type": "function",
+                "function": {"name": "list_tracks", "arguments": "{}"},
+            }
+        ]
+        client._history.append(_user("Please help understand this project."))
+        client._history.append(_assistant("pulling state", tool_calls=tc))
+        client._history.append(_tool("tc1", "x" * 2000))  # ~500 tok
+        # The live question — must be preserved verbatim
+        live_q = "How files in this project?"
+        client._history.append(_user(live_q))
+
+        summary_response = {
+            "finish_reason": "stop",
+            "message": {"content": "Summary of earlier context."},
+        }
+        with patch.object(client, "_call_openai", return_value=summary_response):
+            result = client._compact_history(
+                "system", target_summary_chars=200, target_history_tokens=100
+            )
+
+        assert result is True
+        # The live question must be in the preserved tail, not folded.
+        contents = [m.get("content") for m in client._history]
+        assert live_q in contents, f"live question lost: {contents}"
+        assert client._history[-1]["content"] == live_q
+
+    def test_absorption_counts_tool_messages_in_turn(self):
+        # A turn ends at its assistant's next sibling, not at the assistant
+        # itself: trailing tool-result messages must be counted in the turn's
+        # size.  Here the final turn is user+asst(tool_call)+tool(Drc result);
+        # tool alone is ~514 tok, so with the tool counted the turn (~566 tok)
+        # exceeds split_tokens (308) and the whole history folds into the
+        # summary; without counting the tool the turn (~51 tok) would "fit" and
+        # stay verbatim, understating the post-compaction size (issue #140).
+        client = _make_client(keep_recent_turns=1)
+        client._history = []
+        for i in range(3):
+            client._history.append(_user(f"small q {i}"))
+            client._history.append(_assistant(f"small a {i}"))
+        tc = [
+            {
+                "id": "tc1",
+                "type": "function",
+                "function": {"name": "route_pcb", "arguments": '{"net": "GND"}'},
+            }
+        ]
+        client._history.append(_user("fold q"))
+        client._history.append(_assistant("need routing", tool_calls=tc))
+        client._history.append(_tool("tc1", "DRC " + "x" * 2000))
+
+        summary_response = {
+            "finish_reason": "stop",
+            "message": {"content": "Summary of older context."},
+        }
+        with patch.object(client, "_call_openai", return_value=summary_response):
+            result = client._compact_history(
+                "system", target_summary_chars=200, target_history_tokens=358
+            )
+
+        assert result is True
+        # the 566-token turn does not fit split_tokens=308 -> everything folds
+        assert len(client._history) == 1
+        assert "[Session summary" in client._history[0]["content"]
+
+    def test_absorption_tool_turn_fits_when_budget_allows(self):
+        # Same turn shape, but a generous budget: the tool-carrying turn fits,
+        # so it stays verbatim after the summary (fix guard: counting tool
+        # messages must not over-reject turns that do fit).
+        client = _make_client(keep_recent_turns=1)
+        client._history = []
+        for i in range(3):
+            client._history.append(_user(f"small q {i}"))
+            client._history.append(_assistant(f"small a {i}"))
+        tc = [
+            {
+                "id": "tc1",
+                "type": "function",
+                "function": {"name": "route_pcb", "arguments": '{"net": "GND"}'},
+            }
+        ]
+        client._history.append(_user("fold q"))
+        client._history.append(_assistant("need routing", tool_calls=tc))
+        client._history.append(_tool("tc1", "DRC " + "x" * 2000))
+        original = [m["content"] for m in client._history]
+
+        summary_response = {
+            "finish_reason": "stop",
+            "message": {"content": "Summary of older context."},
+        }
+        with patch.object(client, "_call_openai", return_value=summary_response):
+            result = client._compact_history(
+                "system", target_summary_chars=200, target_history_tokens=2_000
+            )
+
+        assert result is True
+        assert len(client._history) == 1 + 3  # summary + full final turn
+        assert [m["content"] for m in client._history[1:]] == original[-3:]
+
+    def test_preserves_all_recent_when_budget_covers_them(self):
+        # Generous target_history_tokens: the preserved block already fits, so
+        # no absorption — identical shape to the no-absorption test.
+        client = _make_client(keep_recent_turns=4)
+        client._history = self._make_full_history(n_turns=8)
+        original_recent = client._history[-8:]
+        summary_response = {
+            "finish_reason": "stop",
+            "message": {"content": "User wants R1 placed."},
+        }
+        with patch.object(client, "_call_openai", return_value=summary_response):
+            result = client._compact_history(
+                "system", target_summary_chars=500, target_history_tokens=10_000
+            )
+        assert result is True
+        assert client._history[1:] == original_recent  # all 4 recent turns preserved
+
+    def test_large_running_summary_stays_within_half_window(self):
+        # A compaction call sends preamble + running summary + chunk.  Even
+        # when the LLM returns a near-maximum summary and the transcript is
+        # huge, every all call must stay within half the window.
+        client = _make_client(context_tokens=10_000, keep_recent_turns=4)
+        client._history = []
+        for i in range(8):
+            client._history.append(_user("q" + "x" * 8_000))
+            client._history.append(_assistant("a" + "y" * 8_000))
+
+        # summary near the target cap (context*0.25*4 chars = 10k chars)
+        big_summary = ("word " * 2_500)[:9_900]
+        summary_response = {
+            "finish_reason": "stop",
+            "message": {"content": big_summary},
+        }
+        prompts = []
+
+        def _capture(system_prompt, tools):
+            prompts.append(client._history[0]["content"])
+            return summary_response
+
+        with patch.object(client, "_call_openai", side_effect=_capture) as mock_call:
+            result = client._compact_history("system", target_summary_chars=10_000)
+
+        assert result is True
+        assert mock_call.call_count > 1
+        half_window_chars = int(10_000 * 0.5 * 4)  # 20 000
+        for p in prompts:
+            assert len(p) <= half_window_chars, (
+                f"compaction call exceeded half window: {len(p)} > {half_window_chars}"
+            )
+
+    def test_dedup_prunes_superseded_turns_inside_compaction(self):
+        # Real dedup (not mocked) must run as a compaction sub-step: the
+        # superseded tool turn is dropped before summarising, so its content
+        # never reaches the summarisation prompt nor the stored history.
+        client = _make_client(keep_recent_turns=4)
+        # 8 turns: tc1 (superseded) in the compactable prefix; tc3 (latest
+        # call to the same tool) inside the preserved recent block.  After
+        # dedup drops the tc1 turn, 7 turns remain — enough that the prefix
+        # is non-empty while the recent block still holds tc3.
+        client._history = [
+            _user("q1"),
+            _assistant(
+                "t1",
+                tool_calls=[
+                    {"id": "tc1", "function": {"name": "extract_netlist", "arguments": "{}"}}
+                ],
+            ),
+            _tool("tc1", "SUPERSEDED-NETLIST-CONTENT"),
+            _user("q2"),
+            _assistant("a2"),
+            _user("q3"),
+            _assistant("a3"),
+            _user("q4"),
+            _assistant("a4"),
+            _user("q5"),
+            _assistant(
+                "t5",
+                tool_calls=[
+                    {"id": "tc3", "function": {"name": "extract_netlist", "arguments": "{}"}}
+                ],
+            ),
+            _tool("tc3", "latest result"),
+            _user("q6"),
+            _assistant("a6"),
+            _user("q7"),
+            _assistant("a7"),
+        ]
+        prompts = []
+
+        def _capture(system_prompt, tools):
+            prompts.append(client._history[0]["content"])
+            return {"finish_reason": "stop", "message": {"content": "Session summary."}}
+
+        with patch.object(client, "_call_openai", side_effect=_capture):
+            result = client._compact_history("system", target_summary_chars=500)
+
+        assert result is True
+        # superseded turn (tc1) removed from stored history; the latest call
+        # (tc3, inside the preserved recent block) survives
+        tool_ids = [
+            tc["id"] for m in client._history if m.get("tool_calls") for tc in m["tool_calls"]
+        ]
+        assert tool_ids == ["tc3"]
+        assert client._history[0]["role"] == "user"  # summary message stored
+        assert "[Session summary" in client._history[0]["content"]
+        # superseded content must not have reached the summarisation prompt
+        for p in prompts:
+            assert "SUPERSEDED-NETLIST-CONTENT" not in p
+
 
 # ---------------------------------------------------------------------------
 # _maybe_compact unit tests
@@ -369,14 +799,11 @@ class TestMaybeCompact:
         with patch.object(client, "_compact_history", return_value=True) as mock_compact:
             client._maybe_compact("system")
         mock_compact.assert_called_once()
-        # Verify target_summary_chars was passed as a positive int
-        _, kwargs = (
-            mock_compact.call_args
-            if mock_compact.call_args.kwargs
-            else (mock_compact.call_args.args, {})
-        )
+        # target_summary_chars is no longer pre-deducted in _maybe_compact
+        # (it is computed inside _compact_history after absorption); the
+        # joint history budget is the value _maybe_compact passes.
         called_args = mock_compact.call_args.args
-        assert called_args[1] >= 200  # at least the minimum floor
+        assert called_args[2] > 0  # target_history_tokens is a positive int
 
     def test_history_unmodified_under_budget(self):
         """Under budget: history is append-only — no dedup, no annotation, no compaction."""
@@ -392,8 +819,8 @@ class TestMaybeCompact:
         mock_annotate.assert_not_called()
         mock_compact.assert_not_called()
 
-    def test_dedup_called_over_budget(self):
-        """Dedup runs only once the budget is exceeded."""
+    def test_dedup_not_called_at_budget_check(self):
+        """Dedup moved inside _compact_history; _maybe_compact never calls it directly."""
         client = _make_client(
             context_tokens=100, compact_threshold=0.70, compact_target=0.40, keep_recent_turns=2
         )
@@ -412,15 +839,17 @@ class TestMaybeCompact:
             patch.object(client, "_annotate_stale_queries"),
         ):
             client._maybe_compact("system")
-        mock_dedup.assert_called_once()
+        mock_dedup.assert_not_called()
 
     def test_dedup_can_avoid_compaction(self):
-        """Dedup alone can bring history back under budget — compact is skipped."""
+        """Dedup no longer a standalone budget lever: it runs inside _compact_history.
+
+        A superseded duplicate tool turn is therefore not pruned by
+        _maybe_compact itself; compaction is what handles over-budget.
+        """
         client = _make_client(
             context_tokens=200, compact_threshold=0.70, compact_target=0.40, keep_recent_turns=2
         )
-        # ~270 estimated tokens: over the 140 budget. tc1's big tool result is a
-        # superseded duplicate of tc2, so dedup drops that whole turn.
         client._history = [
             _user("q1"),
             _assistant(
@@ -440,14 +869,15 @@ class TestMaybeCompact:
             _tool("tc2", "y" * 200),
         ]
         with (
-            patch.object(client, "_compact_history") as mock_compact,
+            patch.object(client, "_compact_history", return_value=True) as mock_compact,
             patch.object(client, "_annotate_stale_queries") as mock_annotate,
         ):
             client._maybe_compact("system")
-        # tc1's turn was pruned, leaving ~120 tokens — back under budget
-        assert not any(m.get("tool_call_id") == "tc1" for m in client._history)
-        mock_compact.assert_not_called()
-        mock_annotate.assert_not_called()
+        # Over budget with no registered tools to evict → compaction runs and
+        # dedup happens inside it; the duplicate turn is still present here.
+        mock_compact.assert_called_once()
+        assert any(m.get("tool_call_id") == "tc1" for m in client._history)
+        mock_annotate.assert_called_once()
 
     def test_annotate_runs_after_compaction(self):
         """Stale annotation runs after compaction, on the preserved turns only."""
@@ -2643,7 +3073,7 @@ class TestContextBudgetIncludesTools:
         client = _make_client(context_tokens=10_000)  # budget = 7000
         client._history = [_user("q1"), _assistant("a1"), _user("q2")]
         calls = []
-        client._compact_history = lambda _system, _target: calls.append(1) or True
+        client._compact_history = lambda _system, _target, _target_history: calls.append(1) or True
         # Without tools this request would be well under budget (~1K tokens).
         client._maybe_compact("x" * 4_000, tools_est_tokens=6_000)
         assert calls
@@ -2652,7 +3082,7 @@ class TestContextBudgetIncludesTools:
         client = _make_client(context_tokens=10_000)
         client._history = [_user("q1"), _assistant("a1"), _user("q2")]
         calls = []
-        client._compact_history = lambda _system, _target: calls.append(1) or True
+        client._compact_history = lambda _system, _target, _target_history: calls.append(1) or True
         client._maybe_compact("x" * 4_000)
         assert not calls
 
@@ -2713,10 +3143,11 @@ class TestToolEviction:
         names = [t["function"]["name"] for t in client._build_request_tools()]
         assert names == ["enable_tool", "disable_tool", "get_tool_schema"]
 
-    def test_maybe_compact_evicts_when_compaction_insufficient(self):
+    def test_maybe_compact_evicts_first_reaches_target_skips_compaction(self):
         # context 10k -> budget 7k, compaction target 4.9k. History ~1.6k,
-        # system 1k, tools 3 x ~2k -> used ~8.9k. Mocked compaction does not
-        # shrink history, so eviction must trim the enabled set instead.
+        # system 1k, tools 3 x ~2k -> used ~8.9k. Eviction runs FIRST (issue
+        # #133) — dropping all three tools lands at ~2.8k, inside the target,
+        # so compaction is never attempted.
         client = _make_client(context_tokens=10_000)
         client._tool_registry = {
             "tool_a": _fake_tool_def("tool_a", description="x" * 8_000),
@@ -2735,20 +3166,57 @@ class TestToolEviction:
             _assistant("x" * 800),
         ]
         notices = []
-        with patch.object(client, "_compact_history", return_value=True):
+        with patch.object(client, "_compact_history") as mock_compact:
             err = client._maybe_compact(
                 "x" * 4_000, on_compacted=notices.append, tools_est_tokens=6_337
             )
         assert err is None  # under the real window after eviction
-        assert client._enabled_tools == set()  # all 3 evicted (~500 tok granularity)
-        trimmed = [n for n in notices if "Tool set trimmed" in n]
-        assert len(trimmed) == 1
-        assert "tool_a" in trimmed[0] and "tool_b" in trimmed[0] and "tool_c" in trimmed[0]
-        # notice reports the post-eviction used token estimate
-        assert re.search(r"used ≈\d+ tokens", trimmed[0]) is not None
-        compacted = [n for n in notices if "History compacted" in n]
-        assert len(compacted) == 1
-        assert re.search(r"used ≈\d+ tokens", compacted[0]) is not None
+        assert client._enabled_tools == set()  # all 3 evicted
+        mock_compact.assert_not_called()  # eviction already reached the target
+        # one consolidated notice: action + per-segment sizes + before -> after
+        assert len(notices) == 1
+        assert "Context compressed for budget" in notices[0]
+        assert "tool_a" in notices[0] and "tool_b" in notices[0] and "tool_c" in notices[0]
+        assert (
+            re.search(
+                r"≈\d+ \(system \d+ \+ tools \d+ \+ history \d+\) => ≈\d+ "
+                r"\(system \d+ \+ tools \d+ \+ history \d+\) tokens",
+                notices[0],
+            )
+            is not None
+        )
+        assert "History compacted" not in notices[0]
+
+    def test_maybe_compact_compacts_when_eviction_insufficient(self):
+        # History dominates: even with every enabled tool evicted the request
+        # stays above the 4.9k target, so compaction runs after eviction.
+        client = _make_client(context_tokens=10_000)
+        client._tool_registry = {
+            "tool_a": _fake_tool_def("tool_a", description="x" * 8_000),
+            "tool_b": _fake_tool_def("tool_b", description="x" * 8_000),
+            "tool_c": _fake_tool_def("tool_c", description="x" * 8_000),
+        }
+        client._enabled_tools = {"tool_a", "tool_b", "tool_c"}
+        client._history = [
+            _user("x" * 8_000),
+            _assistant("x" * 8_000),
+            _user("x" * 8_000),
+            _assistant("x" * 8_000),
+            _user("x" * 8_000),
+            _assistant("x" * 8_000),
+            _user("x" * 8_000),
+            _assistant("x" * 8_000),
+        ]
+        with patch.object(client, "_compact_history", return_value=True) as mock_compact:
+            err = client._maybe_compact("x" * 4_000, tools_est_tokens=6_337)
+        assert err is not None  # mocked compact does not shrink → still over window
+        assert client._enabled_tools == set()
+        mock_compact.assert_called_once()
+        # joint budget: target_history_tokens = target - system - surviving tools
+        # (no enabled tools remain, so only the fixed meta-tool overhead counts)
+        args = mock_compact.call_args.args
+        meta_tokens = len(json.dumps(llm_client._META_TOOL_DEFS)) // 4
+        assert args[2] == max(0, int(10_000 * 0.49) - 1_000 - meta_tokens)
 
     def test_window_overflow_returns_error_message(self):
         # context 2k -> budget 1.4k, target 980. History+system+meta alone
@@ -2804,3 +3272,93 @@ class TestToolEviction:
             result = client.run("new question", context_block="")
         assert "Context window overflow" in result
         client._call_llm.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Enabled-tool persistence API (issue #136)
+# ---------------------------------------------------------------------------
+
+
+class TestEnabledToolsPersistence:
+    def test_get_returns_sorted_stable(self):
+        client = _make_client()
+        client._enabled_tools = {"zebra", "alpha", "middle"}
+        assert client.get_enabled_tools() == ["alpha", "middle", "zebra"]
+
+    def test_set_replaces_enabled_set(self):
+        client = _make_client()
+        client._enabled_tools = {"old_a", "old_b"}
+        client.set_enabled_tools(["new_x", "new_y"])
+        assert client._enabled_tools == {"new_x", "new_y"}
+        assert client.get_enabled_tools() == ["new_x", "new_y"]
+
+    def test_set_empty_clears(self):
+        client = _make_client()
+        client._enabled_tools = {"a", "b"}
+        client.set_enabled_tools([])
+        assert client._enabled_tools == set()
+
+    def test_names_inert_until_registry_loaded(self):
+        # Restoring a session may precede the catalog fetch: enabled names for
+        # unloaded tools must not appear in the request (or crash) until the
+        # registry has them — same semantics as a fresh session.
+        client = _make_client()
+        client.set_enabled_tools(["future_tool"])
+        assert client._build_request_tools() == list(llm_client._META_TOOL_DEFS)
+        client._tool_registry = {"future_tool": _fake_tool_def("future_tool")}
+        names = [t["function"]["name"] for t in client._build_request_tools()]
+        assert names == ["enable_tool", "disable_tool", "get_tool_schema", "future_tool"]
+
+    def test_restored_set_participates_in_budget(self):
+        client = _make_client()
+        client._tool_registry = {
+            "big_tool": _fake_tool_def("big_tool", description="x" * 4_000),
+        }
+        client.set_enabled_tools(["big_tool"])
+        assert client._enabled_tools_est_tokens() > 0
+
+    def test_evicted_tool_absent_from_get(self):
+        # #133 eviction is persistent within the session; the persisted set
+        # must reflect it so a later save does not resurrect evicted schemas.
+        client = _make_client()
+        client._tool_registry = {
+            "tool_a": _fake_tool_def("tool_a"),
+            "tool_b": _fake_tool_def("tool_b"),
+        }
+        client._enabled_tools = {"tool_a", "tool_b"}
+        client._evict_tools_to_target(target_tokens=0, current_used=1_000)
+        assert client.get_enabled_tools() == []
+
+
+# ---------------------------------------------------------------------------
+# Regression: set_history must survive (issue #138 — deleted in #137, restore
+# paths in panel.py call it; no test covered it, so the break went unnoticed).
+# ---------------------------------------------------------------------------
+
+
+class TestSetHistoryRegression:
+    def test_set_history_restores_conversation(self):
+        client = _make_client()
+        client._history = [{"role": "user", "content": "old"}]
+        restored = [
+            {"role": "user", "content": "q1"},
+            {"role": "assistant", "content": "a1"},
+        ]
+        client.set_history(restored)
+        assert client._history == restored
+        assert client._history is not restored  # defensive copy
+
+    def test_set_history_empty_clears(self):
+        client = _make_client()
+        client._history = [{"role": "user", "content": "old"}]
+        client.set_history([])
+        assert client._history == []
+
+    def test_set_history_then_set_enabled_tools_sequence(self):
+        # The restore path order: set_history first, then the enabled set.
+        # Both must be independently replaceable without cross-talk.
+        client = _make_client()
+        client.set_history([{"role": "user", "content": "q"}])
+        client.set_enabled_tools(["alpha"])
+        assert client._history == [{"role": "user", "content": "q"}]
+        assert client.get_enabled_tools() == ["alpha"]
