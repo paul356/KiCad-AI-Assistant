@@ -125,7 +125,29 @@ class TestSetBaseUrl:
         client._enabled_tools = {"get_board_info"}
         client.set_base_url("http://127.0.0.1:7777")
         assert client._tool_registry is None
-        assert client._enabled_tools == set()
+        # The enabled set is session state and survives a URL change; stale
+        # names are pruned lazily by _build_request_tools once the catalog
+        # is refetched.
+        assert client._enabled_tools == {"get_board_info"}
+
+    def test_build_request_tools_prunes_stale_enabled(self):
+        client = _make_client()
+        client._tool_registry = {"get_board_info": _fake_tool_def("get_board_info")}
+        client._enabled_tools = {"get_board_info", "ghost_tool"}
+        tools = client._build_request_tools()
+        names = [t["function"]["name"] for t in tools]
+        assert "ghost_tool" not in names
+        assert "get_board_info" in names
+        assert client._enabled_tools == {"get_board_info"}
+
+    def test_build_request_tools_keeps_enabled_when_catalog_unknown(self):
+        client = _make_client()
+        client._tool_registry = None
+        client._enabled_tools = {"get_board_info", "ghost_tool"}
+        tools = client._build_request_tools()
+        # Registry not yet fetched: no pruning, lazy adoption holds.
+        assert client._enabled_tools == {"get_board_info", "ghost_tool"}
+        assert all(t["function"]["name"] not in ("get_board_info", "ghost_tool") for t in tools)
 
     def test_same_url_keeps_cached_registry(self):
         client = _make_client()
@@ -2860,3 +2882,37 @@ class TestEnabledToolsPersistence:
         client._enabled_tools = {"tool_a", "tool_b"}
         client._evict_tools_to_target(target_tokens=0, current_used=1_000)
         assert client.get_enabled_tools() == []
+
+
+# ---------------------------------------------------------------------------
+# Regression: set_history must survive (issue #138 — deleted in #137, restore
+# paths in panel.py call it; no test covered it, so the break went unnoticed).
+# ---------------------------------------------------------------------------
+
+
+class TestSetHistoryRegression:
+    def test_set_history_restores_conversation(self):
+        client = _make_client()
+        client._history = [{"role": "user", "content": "old"}]
+        restored = [
+            {"role": "user", "content": "q1"},
+            {"role": "assistant", "content": "a1"},
+        ]
+        client.set_history(restored)
+        assert client._history == restored
+        assert client._history is not restored  # defensive copy
+
+    def test_set_history_empty_clears(self):
+        client = _make_client()
+        client._history = [{"role": "user", "content": "old"}]
+        client.set_history([])
+        assert client._history == []
+
+    def test_set_history_then_set_enabled_tools_sequence(self):
+        # The restore path order: set_history first, then the enabled set.
+        # Both must be independently replaceable without cross-talk.
+        client = _make_client()
+        client.set_history([{"role": "user", "content": "q"}])
+        client.set_enabled_tools(["alpha"])
+        assert client._history == [{"role": "user", "content": "q"}]
+        assert client.get_enabled_tools() == ["alpha"]

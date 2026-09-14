@@ -2908,6 +2908,7 @@ if _WX_AVAILABLE:
             self._current_session_file = os.path.basename(path)
             if self._llm_client:
                 self._llm_client.set_history(history)
+                self._llm_client.set_enabled_tools(_sstore.session_enabled_tools(data))
             self._conv_entries.append(
                 {
                     "type": "status",
