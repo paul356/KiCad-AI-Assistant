@@ -613,6 +613,67 @@ class TestCompactHistory:
         assert len(client._history) == 1 + 3  # summary + full final turn
         assert [m["content"] for m in client._history[1:]] == original[-3:]
 
+    def test_absorption_never_folds_the_live_question(self):
+        # run() appends the user's message to history BEFORE compaction.  The
+        # absorption scan must never fold that trailing unanswered message
+        # into the prefix: even with a zero-token history budget (tools
+        # squeeze target_history_tokens to 0), the live question stays
+        # verbatim after the summary so the model still receives it.
+        client = _make_client(keep_recent_turns=4)
+        client._history = []
+        for i in range(4):
+            client._history.append(_user(f"small q {i}"))
+            client._history.append(_assistant(f"small a {i}"))
+        for i in range(2):
+            client._history.append(_user(f"recent q {i}"))
+            client._history.append(_assistant("recent big a " + "x" * 800))
+        client._history.append(_user("How files in this project?"))
+
+        summary_response = {
+            "finish_reason": "stop",
+            "message": {"content": "Earlier context."},
+        }
+        with patch.object(client, "_call_openai", return_value=summary_response):
+            result = client._compact_history(
+                "system", target_summary_chars=200, target_history_tokens=0
+            )
+
+        assert result is True
+        # summary + the live question, nothing else (everything it could fold
+        # was folded, but the unanswered user message is the current request)
+        assert len(client._history) == 2
+        assert client._history[0]["role"] == "user"
+        assert "[Session summary" in client._history[0]["content"]
+        assert client._history[1] == {"role": "user", "content": "How files in this project?"}
+
+    def test_absorption_keeps_recent_and_live_question_when_budget_allows(self):
+        # Generous budget: both recent turns and the trailing live question
+        # are preserved verbatim; only the oldest turns are summarised.
+        client = _make_client(keep_recent_turns=2)
+        client._history = []
+        for i in range(2):
+            client._history.append(_user(f"small q {i}"))
+            client._history.append(_assistant(f"small a {i}"))
+        for i in range(2):
+            client._history.append(_user(f"recent q {i}"))
+            client._history.append(_assistant("recent a " + "x" * 80))
+        client._history.append(_user("How files in this project?"))
+        original_tail = [m["content"] for m in client._history[-5:]]
+
+        summary_response = {
+            "finish_reason": "stop",
+            "message": {"content": "Summary of older context."},
+        }
+        with patch.object(client, "_call_openai", return_value=summary_response):
+            result = client._compact_history(
+                "system", target_summary_chars=200, target_history_tokens=2_000
+            )
+
+        assert result is True
+        # summary + 2 recent turns (4 msgs) + live question = 6
+        assert len(client._history) == 1 + 5
+        assert [m["content"] for m in client._history[1:]] == original_tail
+
     def test_preserves_all_recent_when_budget_covers_them(self):
         # Generous target_history_tokens: the preserved block already fits, so
         # no absorption — identical shape to the no-absorption test.
