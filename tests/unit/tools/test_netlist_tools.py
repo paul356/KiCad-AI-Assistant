@@ -169,50 +169,6 @@ NETLIST_WITH_REDUNDANT_WIRE = {
 # ---------------------------------------------------------------------------
 
 
-class TestExtractProjectNetlist:
-    def setup_method(self):
-        self.tools = _get_tools()
-        self.fn = self.tools["extract_project_netlist"]
-
-    @patch("kcaa.tools.netlist_tools.os.path.exists", return_value=False)
-    def test_project_not_found(self, mock_exists):
-        result = _run(self.fn("/nonexistent/project.kicad_pro", ctx=None))
-        assert result["success"] is False
-        assert "Project not found" in result["error"]
-
-    @patch("kcaa.tools.netlist_tools.os.path.exists", return_value=True)
-    @patch("kcaa.tools.netlist_tools.get_project_files", return_value={})
-    def test_schematic_not_in_project(self, mock_files, mock_exists):
-        result = _run(self.fn("/some/project.kicad_pro", ctx=None))
-        assert result["success"] is False
-        assert "Schematic file not found" in result["error"]
-
-    @patch("kcaa.tools.netlist_tools.os.path.exists", return_value=True)
-    @patch(
-        "kcaa.tools.netlist_tools.get_project_files",
-        return_value={"schematic": "/some/project.kicad_sch"},
-    )
-    @patch("kcaa.tools.netlist_tools.os.path.exists", return_value=True)
-    @patch("kcaa.tools.netlist_tools.extract_netlist", return_value=SAMPLE_NETLIST)
-    def test_success_delegates_to_schematic_netlist(
-        self, mock_extract, mock_exists2, mock_files, mock_exists
-    ):
-        result = _run(self.fn("/some/project.kicad_pro", ctx=None))
-        assert result["success"] is True
-        assert result["project_path"] == "/some/project.kicad_pro"
-        assert "analysis" in result
-
-    @patch("kcaa.tools.netlist_tools.os.path.exists", return_value=True)
-    @patch(
-        "kcaa.tools.netlist_tools.get_project_files",
-        side_effect=RuntimeError("corrupt project"),
-    )
-    def test_exception_in_get_project_files(self, mock_files, mock_exists):
-        result = _run(self.fn("/some/project.kicad_pro", ctx=None))
-        assert result["success"] is False
-        assert "corrupt project" in result["error"]
-
-
 # ---------------------------------------------------------------------------
 # extract_schematic_netlist
 # ---------------------------------------------------------------------------

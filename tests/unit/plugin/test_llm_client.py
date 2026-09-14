@@ -118,6 +118,22 @@ class TestSetBaseUrl:
         client.set_base_url("http://127.0.0.1:1234")
         assert client._mcp_base_url == "http://127.0.0.1:1234"
 
+    def test_url_change_invalidates_cached_registry(self):
+        client = _make_client()
+        client._tool_registry = {"get_board_info": _fake_tool_def("get_board_info")}
+        client._enabled_tools = {"get_board_info"}
+        client.set_base_url("http://127.0.0.1:7777")
+        assert client._tool_registry is None
+        assert client._enabled_tools == set()
+
+    def test_same_url_keeps_cached_registry(self):
+        client = _make_client()
+        client._tool_registry = {"get_board_info": _fake_tool_def("get_board_info")}
+        client._enabled_tools = {"get_board_info"}
+        client.set_base_url("http://127.0.0.1:9999")
+        assert client._tool_registry is not None
+        assert client._enabled_tools == {"get_board_info"}
+
 
 class TestDedupToolCalls:
     def test_no_change_when_no_tool_calls(self):
@@ -503,9 +519,7 @@ class TestRunIntegration:
         }
         final_response = {"finish_reason": "stop", "message": {"content": "done"}}
         client._call_llm = MagicMock(side_effect=[tool_response, final_response])
-        client._fetch_tool_definitions = MagicMock(
-            return_value=[{"function": {"name": "set_footprint_position"}}]
-        )
+        client._enabled_tools = {"set_footprint_position"}
         on_tool_call = MagicMock()
 
         with patch("kicad_plugin.llm_client.call_mcp_tool") as mock_call_tool:
@@ -567,9 +581,7 @@ class TestRunIntegration:
         }
         final_response = {"finish_reason": "stop", "message": {"content": "done"}}
         client._call_llm = MagicMock(side_effect=[tool_response, final_response])
-        client._fetch_tool_definitions = MagicMock(
-            return_value=[{"function": {"name": "pcb_route_pad_to_pad"}}]
-        )
+        client._enabled_tools = {"pcb_route_pad_to_pad"}
         on_tool_call = MagicMock()
 
         with patch("kicad_plugin.llm_client.call_mcp_tool") as mock_call_tool:
@@ -633,9 +645,7 @@ class TestRunIntegration:
             },
         }
         client._call_llm = MagicMock(side_effect=[tool_response, {"error": "API down"}])
-        client._fetch_tool_definitions = MagicMock(
-            return_value=[{"function": {"name": "set_footprint_position"}}]
-        )
+        client._enabled_tools = {"set_footprint_position"}
 
         with patch("kicad_plugin.llm_client.call_mcp_tool") as mock_call_tool:
             mock_call_tool.side_effect = [
@@ -677,9 +687,7 @@ class TestRunIntegration:
             },
         }
         client._call_llm = MagicMock(return_value=tool_response)  # never stops calling tools
-        client._fetch_tool_definitions = MagicMock(
-            return_value=[{"function": {"name": "set_footprint_position"}}]
-        )
+        client._enabled_tools = {"set_footprint_position"}
 
         with patch("kicad_plugin.llm_client.call_mcp_tool") as mock_call_tool:
             mock_call_tool.side_effect = lambda base, name, args: (
@@ -731,12 +739,7 @@ class TestRunIntegration:
             },
         }
         client._call_llm = MagicMock(side_effect=[tool_response])
-        client._fetch_tool_definitions = MagicMock(
-            return_value=[
-                {"function": {"name": "set_footprint_position"}},
-                {"function": {"name": "flip_footprint"}},
-            ]
-        )
+        client._enabled_tools = {"set_footprint_position", "flip_footprint"}
 
         with patch("kicad_plugin.llm_client.call_mcp_tool") as mock_call_tool:
             mock_call_tool.side_effect = [
@@ -788,12 +791,7 @@ class TestRunIntegration:
         }
         final_response = {"finish_reason": "stop", "message": {"content": "done"}}
         client._call_llm = MagicMock(side_effect=[tool_response, final_response])
-        client._fetch_tool_definitions = MagicMock(
-            return_value=[
-                {"function": {"name": "set_footprint_position"}},
-                {"function": {"name": "flip_footprint"}},
-            ]
-        )
+        client._enabled_tools = {"set_footprint_position", "flip_footprint"}
 
         with patch("kicad_plugin.llm_client.call_mcp_tool") as mock_call_tool:
             mock_call_tool.side_effect = [
@@ -873,12 +871,7 @@ class TestRunIntegration:
         }
         final_response = {"finish_reason": "stop", "message": {"content": "done"}}
         client._call_llm = MagicMock(side_effect=[save_response, mutate_response, final_response])
-        client._fetch_tool_definitions = MagicMock(
-            return_value=[
-                {"function": {"name": "save_project_version"}},
-                {"function": {"name": "set_footprint_position"}},
-            ]
-        )
+        client._enabled_tools = {"save_project_version", "set_footprint_position"}
 
         with patch("kicad_plugin.llm_client.call_mcp_tool") as mock_call_tool:
             mock_call_tool.side_effect = [
@@ -932,9 +925,7 @@ class TestRunIntegration:
         }
         final_response = {"finish_reason": "stop", "message": {"content": "done"}}
         client._call_llm = MagicMock(side_effect=[tool_response, final_response])
-        client._fetch_tool_definitions = MagicMock(
-            return_value=[{"function": {"name": "set_footprint_position"}}]
-        )
+        client._enabled_tools = {"set_footprint_position"}
 
         with patch("kicad_plugin.llm_client.call_mcp_tool") as mock_call_tool:
             mock_call_tool.return_value = {"success": False, "error": "disk full"}
@@ -957,19 +948,14 @@ class TestRunIntegration:
             "Failed to save project version before set_footprint_position" in tool_result["error"]
         )
 
-    def test_run_reports_missing_tool_policy_before_calling_llm(self):
+    def test_enable_tool_refuses_tools_without_policy(self):
+        """A tool with no execution policy must never become callable (issue #129)."""
         client = _make_client()
-        client._fetch_tool_definitions = MagicMock(
-            return_value=[{"function": {"name": "unknown_tool"}}]
-        )
-        client._call_llm = MagicMock()
-
-        result = client.run("hello", context_block="")
-
-        assert (
-            result == "[Framework error] Tool policy registry is missing entries for: unknown_tool"
-        )
-        client._call_llm.assert_not_called()
+        client._tool_registry = {"unknown_tool": _fake_tool_def("unknown_tool")}
+        result = client._execute_meta_tool("enable_tool", {"tools": ["unknown_tool"]})
+        assert result["success"] is False
+        assert "no execution policy" in result["error"]
+        assert "unknown_tool" not in client._enabled_tools
 
 
 class TestToolPolicyRegistry:
@@ -2415,3 +2401,267 @@ class TestToolDirectRequest:
         with patch("kicad_plugin.llm_client.call_mcp_tool", return_value={"status": "started"}):
             reply = client.run({"not": "a request"}, "")
         assert isinstance(reply, str)
+
+
+# ---------------------------------------------------------------------------
+# On-demand tool loading (issue #129)
+# ---------------------------------------------------------------------------
+
+
+def _fake_tool_def(name, description="does something", schema=None):
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": description,
+            "parameters": schema or {"type": "object", "properties": {}},
+        },
+    }
+
+
+class TestToolLoading:
+    def test_request_tools_meta_only_by_default(self):
+        client = _make_client()
+        tools = client._build_request_tools()
+        assert [t["function"]["name"] for t in tools] == [
+            "enable_tool",
+            "disable_tool",
+            "get_tool_schema",
+        ]
+
+    def test_catalog_block_renders_registered_tools(self):
+        client = _make_client()
+        client._tool_registry = {
+            "extract_schematic_netlist": _fake_tool_def(
+                "extract_schematic_netlist", "Extract the schematic netlist."
+            ),
+            "get_board_info": _fake_tool_def("get_board_info", "General board information."),
+            "add_zone": _fake_tool_def(
+                "add_zone",
+                "Add a copper zone to the PCB. Supports thermal relief, clearance tuning.",
+            ),
+        }
+        block = client._build_tool_catalog_block()
+        assert "- extract_schematic_netlist: Extract the schematic netlist." in block
+        assert "- get_board_info: General board information." in block
+        # only the first sentence of the registered description is rendered
+        assert "- add_zone: Add a copper zone to the PCB." in block
+        assert "thermal relief" not in block
+        assert client._build_tool_catalog_block() == block  # deterministic per session
+
+    def test_catalog_uses_first_non_empty_docstring_line(self):
+        client = _make_client()
+        client._tool_registry = {
+            "sync_symbol_index": {
+                "type": "function",
+                "function": {
+                    "name": "sync_symbol_index",
+                    "description": (
+                        "\nStart building or refreshing the symbol library index. "
+                        "The sync runs in a background thread; poll "
+                        "get_symbol_sync_status to track progress."
+                    ),
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        }
+        block = client._build_tool_catalog_block()
+        # the blank first line is skipped; the first non-empty line renders
+        assert (
+            "- sync_symbol_index: Start building or refreshing the symbol library index." in block
+        )
+        assert "background thread" not in block
+
+    def test_enable_tool_activates_batch_in_registration_order(self):
+        client = _make_client()
+        client._tool_registry = {
+            "extract_schematic_netlist": _fake_tool_def("extract_schematic_netlist"),
+            "get_board_info": _fake_tool_def("get_board_info"),
+            "add_zone": _fake_tool_def("add_zone"),
+        }
+        result = client._execute_meta_tool("enable_tool", {"tools": ["add_zone", "get_board_info"]})
+        assert result["success"] is True
+        names = [t["function"]["name"] for t in client._build_request_tools()]
+        # registration order wins over enable order
+        assert names == [
+            "enable_tool",
+            "disable_tool",
+            "get_tool_schema",
+            "get_board_info",
+            "add_zone",
+        ]
+
+    def test_disable_tool_removes_from_request(self):
+        client = _make_client()
+        client._tool_registry = {
+            "get_board_info": _fake_tool_def("get_board_info"),
+            "add_zone": _fake_tool_def("add_zone"),
+        }
+        client._enabled_tools = {"get_board_info", "add_zone"}
+        client._execute_meta_tool("disable_tool", {"tools": ["get_board_info"]})
+        names = [t["function"]["name"] for t in client._build_request_tools()]
+        assert names == ["enable_tool", "disable_tool", "get_tool_schema", "add_zone"]
+
+    def test_enable_tool_unknown_name_atomically_rejected(self):
+        client = _make_client()
+        client._tool_registry = {
+            "extract_schematic_netlist": _fake_tool_def("extract_schematic_netlist")
+        }
+        result = client._execute_meta_tool(
+            "enable_tool", {"tools": ["extract_schematic_nettlist", "get_board_info"]}
+        )
+        assert result["success"] is False
+        assert "extract_schematic_netlist" in result["suggestions"]["extract_schematic_nettlist"]
+        assert client._enabled_tools == set()  # atomic: nothing partially enabled
+
+    def test_enable_tool_batch_without_policy_atomically_rejected(self):
+        client = _make_client()
+        client._tool_registry = {
+            "get_board_info": _fake_tool_def("get_board_info"),
+            "unknown_tool": _fake_tool_def("unknown_tool"),
+        }
+        result = client._execute_meta_tool(
+            "enable_tool", {"tools": ["get_board_info", "unknown_tool"]}
+        )
+        assert result["success"] is False
+        assert "no execution policy" in result["error"]
+        assert client._enabled_tools == set()
+
+    def test_get_tool_schema_previews_disabled_tool_only(self):
+        client = _make_client()
+        client._tool_registry = {
+            "extract_schematic_netlist": _fake_tool_def("extract_schematic_netlist")
+        }
+        preview = client._execute_meta_tool(
+            "get_tool_schema", {"tool_name": "extract_schematic_netlist"}
+        )
+        assert preview["success"] is True
+        assert preview["enabled"] is False
+        assert client._enabled_tools == set()  # preview does not enable
+        client._enabled_tools = {"extract_schematic_netlist"}
+        blocked = client._execute_meta_tool(
+            "get_tool_schema", {"tool_name": "extract_schematic_netlist"}
+        )
+        assert blocked["success"] is False
+        assert "already enabled" in blocked["error"]
+
+    def test_unknown_schema_suggests_close_matches(self):
+        client = _make_client()
+        client._tool_registry = {
+            "extract_schematic_netlist": _fake_tool_def("extract_schematic_netlist")
+        }
+        result = client._execute_meta_tool(
+            "get_tool_schema", {"tool_name": "extract_schematic_nettlist"}
+        )
+        assert result["success"] is False
+        assert "extract_schematic_netlist" in result["suggestions"]
+
+    def test_unenabled_real_tool_rejected_without_network(self):
+        client = _make_client()
+        client._tool_registry = {"extract_netlist": _fake_tool_def("extract_netlist")}
+        state = llm_client._ToolExecutionState()
+        result = client._execute_or_reject_tool("extract_netlist", {}, state, None)
+        assert result["success"] is False
+        assert "not enabled" in result["error"]
+
+    def test_meta_tool_executed_locally(self):
+        client = _make_client()
+        client._tool_registry = {"get_board_info": _fake_tool_def("get_board_info")}
+        state = llm_client._ToolExecutionState()
+        result = client._execute_or_reject_tool(
+            "enable_tool", {"tools": ["get_board_info"]}, state, None
+        )
+        assert result["success"] is True
+
+    def test_mid_turn_enable_schema_in_next_request(self):
+        """P1: a tool enabled mid-turn must ship its schema in the NEXT request."""
+        client = _make_client()
+        client._tool_registry = {"get_board_info": _fake_tool_def("get_board_info")}
+        enable_resp = {
+            "finish_reason": "tool_calls",
+            "message": {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tc1",
+                        "type": "function",
+                        "function": {
+                            "name": "enable_tool",
+                            "arguments": json.dumps({"tools": ["get_board_info"]}),
+                        },
+                    }
+                ],
+            },
+        }
+        final_resp = {"finish_reason": "stop", "message": {"content": "done"}}
+        client._call_llm = MagicMock(side_effect=[enable_resp, final_resp])
+        with patch("kicad_plugin.llm_client.call_mcp_tool"):
+            result = client.run("use get_board_info", context_block="")
+        assert result == "done"
+        second_tools = client._call_llm.call_args_list[1].args[1]
+        assert [t["function"]["name"] for t in second_tools] == [
+            "enable_tool",
+            "disable_tool",
+            "get_tool_schema",
+            "get_board_info",
+        ]
+
+    def test_catalog_notice_when_registry_unavailable(self):
+        """P2: failed tools/list must surface, not run a catalog-less turn."""
+        client = _make_client()
+        client._tool_registry = None
+        client._fetch_tool_definitions = MagicMock(return_value=[])
+        block = client._build_tool_catalog_block()
+        assert "tool catalog unavailable" in block
+        assert "retry next turn" in block
+
+    def test_enable_tool_reports_unavailable_catalog(self):
+        client = _make_client()
+        client._tool_registry = None
+        client._fetch_tool_definitions = MagicMock(return_value=[])
+        result = client._execute_meta_tool("enable_tool", {"tools": ["get_board_info"]})
+        assert result["success"] is False
+        assert "unavailable" in result["error"]
+
+    def test_get_tool_schema_reports_unavailable_catalog(self):
+        client = _make_client()
+        client._tool_registry = None
+        client._fetch_tool_definitions = MagicMock(return_value=[])
+        result = client._execute_meta_tool("get_tool_schema", {"tool_name": "get_board_info"})
+        assert result["success"] is False
+        assert "unavailable" in result["error"]
+
+
+class TestContextBudgetIncludesTools:
+    def test_tools_est_push_over_budget_triggers_compaction(self):
+        client = _make_client(context_tokens=10_000)  # budget = 7000
+        client._history = [_user("q1"), _assistant("a1"), _user("q2")]
+        calls = []
+        client._compact_history = lambda _system, _target: calls.append(1) or True
+        # Without tools this request would be well under budget (~1K tokens).
+        client._maybe_compact("x" * 4_000, tools_est_tokens=6_000)
+        assert calls
+
+    def test_tools_est_excluded_does_not_compact(self):
+        client = _make_client(context_tokens=10_000)
+        client._history = [_user("q1"), _assistant("a1"), _user("q2")]
+        calls = []
+        client._compact_history = lambda _system, _target: calls.append(1) or True
+        client._maybe_compact("x" * 4_000)
+        assert not calls
+
+    def test_fixed_overhead_warning_fires_once(self):
+        client = _make_client(context_tokens=2_000)  # budget 1400 < system+meta
+        warned = []
+        client._maybe_compact("x" * 8_000, on_warning=warned.append)
+        client._maybe_compact("x" * 8_000, on_warning=warned.append)
+        client._maybe_compact("x" * 8_000, on_warning=warned.append)
+        assert len(warned) == 1
+
+    def test_budget_noop_warning_when_nothing_to_compact(self):
+        client = _make_client(context_tokens=100_000)  # budget 70_000
+        client._history = [_user("q1"), _assistant("a1"), _user("q2")]
+        warned = []
+        client._maybe_compact("x" * 4_000, on_warning=warned.append, tools_est_tokens=69_000)
+        assert len(warned) == 1
+        assert "too short to compact" in warned[0]

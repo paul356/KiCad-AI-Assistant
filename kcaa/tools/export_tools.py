@@ -99,15 +99,6 @@ def register_export_tools(mcp: FastMCP) -> None:
                 await ctx.info(f"Error: {str(e)}")
             return None
 
-    @mcp.tool()
-    async def generate_project_thumbnail(project_path: str, ctx: Context | None):
-        """Generate a thumbnail of a KiCad project's PCB layout (Alias for generate_pcb_thumbnail)."""
-        # This function now just calls the main CLI-based thumbnail generator
-        print(
-            f"generate_project_thumbnail called, redirecting to generate_pcb_thumbnail for {project_path}"
-        )
-        return await generate_pcb_thumbnail(project_path, ctx)
-
 
 # Helper functions for thumbnail generation
 async def generate_thumbnail_with_cli(pcb_file: str, ctx: Context | None):

@@ -261,6 +261,92 @@ retained per maintainer decision)
 
 ---
 
+## Router: `grid_resolution` not exposed through the MCP tool API
+
+**Status:** open (verified 2026-09-08 — issue #4 in
+`docs/plans/router-issues.md`)
+
+### Current state
+
+- `RouteRequest.grid_resolution` exists (`kcaa/router/router.py:164`,
+  default `None` → `GRID_RESOLUTION` = 0.025 mm) and is honoured by the
+  router (`router.py:453`, passed into `multi_layer_a_star` as the grid
+  size), so the field is functional end-to-end.
+- The MCP tool `pcb_route_pad_to_pad` (`kcaa/tools/pcb_routing_tools.py`)
+  exposes `width`, `layer_hint`, `via_pairs`, `turn_penalty` — but no
+  `grid_resolution` parameter.  Clients cannot request a finer grid via
+  the tool API.
+
+### Impact
+
+Fine-pitch routing (tight pad/component gaps the default grid resolution
+would miss) is not reachable from the MCP layer.  The capability exists
+in `RouteRequest` but is dead config for tool users.
+
+### Fix (proposed)
+
+Add `grid_resolution: float | None = None` to `pcb_route_pad_to_pad` and
+forward it into the built `RouteRequest`, mirroring how `turn_penalty` is
+threaded.  Document the parameter (mm; smaller = finer grid, more cells)
+in the tool docstring.
+
+### Validation
+
+- Unit: a tool call with `grid_resolution` set produces a `RouteRequest`
+  carrying that value; a call omitting it keeps the default.
+- Integration: route a fine-pitch fixture through the tool with the
+  default vs. a finer grid; the finer grid finds a path the default
+  misses (or the difference is observable in the viz dumps).
+
+---
+
+## Router: exit-point heuristic ignores arbitrary pad rotation
+
+**Status:** open (verified 2026-09-08 — issue #5 in
+`docs/plans/router-issues.md`, partially mitigated)
+
+### Current state
+
+- `_find_pad_size` (`kcaa/router/router.py:1439`) returns the pad `size`
+  node as stored — footprint-local `(w, h)`, unrotated.
+- Callers wrap it with `_world_size` (`router.py:338-342`), which only
+  swaps w/h for ±90° footprint rotations.
+- The exit/entry heuristic (`_replace_pad_path` / `_build_pad_wire`,
+  `router.py:1104/1150`; successor of the old `_pad_exit_points`) treats
+  the pad as an **axis-aligned AABB** of that size and emits an
+  axis-aligned exit wire to the AABB edge.
+- Obstacles are exact: `_pad_obstacle` rotates by `fp_rot` only
+  (`kcaa/router/world_model.py:404-407`), so routing validity is not
+  affected — only the pad exit/entry geometry.
+
+### Impact
+
+For footprints rotated at arbitrary angles (e.g. 30°, 45°), the real
+copper is a rotated rectangle inscribed in the AABB; the axis-aligned
+exit wire can leave the copper before reaching the AABB edge and picks a
+non-optimal direction.  No electrical/DRC error, but suboptimal exits on
+rotated footprints — will also matter once oval-slot pads (see the NPTH
+entry above) add rotated obstacles to the model.
+
+### Fix (proposed)
+
+Rotate the pad rectangle by `fp_rot` (reusing the exact transformation in
+`_pad_obstacle`) and compute the exit point as the intersection of the
+outward path direction with the rotated rect edge, instead of the AABB
+edge; keep the axis-aligned wire only for pads that are actually
+axis-aligned in world space.
+
+### Validation
+
+- Unit: pad with `fp_rot = 45°` — exit point lies on the rotated rectangle
+  edge (inside-copper check), and the current AABB behaviour fails the
+  same assertion.
+- Regression: existing router tests (single-layer and multi-layer) still
+  pass with axis-aligned pads; viz dumps (`_dump_viz`) show the exit wire
+  clipped to the rotated pad.
+
+---
+
 ## Resolved
 
 ### Unify schematic/PCB version management and archive history
