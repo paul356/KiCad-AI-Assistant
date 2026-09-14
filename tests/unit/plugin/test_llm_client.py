@@ -483,8 +483,9 @@ class TestCompactHistory:
         assert "[Session summary" in client._history[0]["content"]
 
     def test_absorption_keeps_turns_that_fit(self):
-        # Budget admits exactly the newest recent turns (each ~25 tokens): they
-        # stay verbatim, the older ones are folded into the prefix.
+        # Budget admits exactly the newest recent turns (each ~41 tokens:
+        # user+assistant pair incl. JSON overhead): they stay verbatim, the
+        # older ones are folded into the prefix.
         client = _make_client(keep_recent_turns=4)
         client._history = []
         for i in range(4):
@@ -493,7 +494,7 @@ class TestCompactHistory:
             client._history.append(_assistant(f"small a {i}"))
         for i in range(4):
             client._history.append(_user(f"recent q {i}"))
-            client._history.append(_assistant("recent a " + "x" * 80))  # ~25 tok each
+            client._history.append(_assistant("recent a " + "x" * 80))  # ~41 tok/turn
         original_rows = [m["content"] for m in client._history]
 
         summary_response = {
@@ -520,7 +521,7 @@ class TestCompactHistory:
             client._history.append(_assistant(f"small a {i}"))
         for i in range(4):
             client._history.append(_user(f"recent q {i}"))
-            client._history.append(_assistant("recent a " + "x" * 80))  # ~25 tok each
+            client._history.append(_assistant("recent a " + "x" * 80))  # ~41 tok/turn
         original_rows = [m["content"] for m in client._history]
 
         summary_response = {
@@ -539,6 +540,78 @@ class TestCompactHistory:
         assert len(client._history) == 1 + 4
         preserved_rows = [m["content"] for m in client._history[1:]]
         assert preserved_rows == original_rows[-4:]
+
+    def test_absorption_counts_tool_messages_in_turn(self):
+        # A turn ends at its assistant's next sibling, not at the assistant
+        # itself: trailing tool-result messages must be counted in the turn's
+        # size.  Here the final turn is user+asst(tool_call)+tool(Drc result);
+        # tool alone is ~514 tok, so with the tool counted the turn (~566 tok)
+        # exceeds split_tokens (308) and the whole history folds into the
+        # summary; without counting the tool the turn (~51 tok) would "fit" and
+        # stay verbatim, understating the post-compaction size (issue #140).
+        client = _make_client(keep_recent_turns=1)
+        client._history = []
+        for i in range(3):
+            client._history.append(_user(f"small q {i}"))
+            client._history.append(_assistant(f"small a {i}"))
+        tc = [
+            {
+                "id": "tc1",
+                "type": "function",
+                "function": {"name": "route_pcb", "arguments": '{"net": "GND"}'},
+            }
+        ]
+        client._history.append(_user("fold q"))
+        client._history.append(_assistant("need routing", tool_calls=tc))
+        client._history.append(_tool("tc1", "DRC " + "x" * 2000))
+
+        summary_response = {
+            "finish_reason": "stop",
+            "message": {"content": "Summary of older context."},
+        }
+        with patch.object(client, "_call_openai", return_value=summary_response):
+            result = client._compact_history(
+                "system", target_summary_chars=200, target_history_tokens=358
+            )
+
+        assert result is True
+        # the 566-token turn does not fit split_tokens=308 -> everything folds
+        assert len(client._history) == 1
+        assert "[Session summary" in client._history[0]["content"]
+
+    def test_absorption_tool_turn_fits_when_budget_allows(self):
+        # Same turn shape, but a generous budget: the tool-carrying turn fits,
+        # so it stays verbatim after the summary (fix guard: counting tool
+        # messages must not over-reject turns that do fit).
+        client = _make_client(keep_recent_turns=1)
+        client._history = []
+        for i in range(3):
+            client._history.append(_user(f"small q {i}"))
+            client._history.append(_assistant(f"small a {i}"))
+        tc = [
+            {
+                "id": "tc1",
+                "type": "function",
+                "function": {"name": "route_pcb", "arguments": '{"net": "GND"}'},
+            }
+        ]
+        client._history.append(_user("fold q"))
+        client._history.append(_assistant("need routing", tool_calls=tc))
+        client._history.append(_tool("tc1", "DRC " + "x" * 2000))
+        original = [m["content"] for m in client._history]
+
+        summary_response = {
+            "finish_reason": "stop",
+            "message": {"content": "Summary of older context."},
+        }
+        with patch.object(client, "_call_openai", return_value=summary_response):
+            result = client._compact_history(
+                "system", target_summary_chars=200, target_history_tokens=2_000
+            )
+
+        assert result is True
+        assert len(client._history) == 1 + 3  # summary + full final turn
+        assert [m["content"] for m in client._history[1:]] == original[-3:]
 
     def test_preserves_all_recent_when_budget_covers_them(self):
         # Generous target_history_tokens: the preserved block already fits, so
