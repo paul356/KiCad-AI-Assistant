@@ -4,6 +4,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
 import json
 import os
+import re
 import ssl
 import sys
 import threading
@@ -488,7 +489,7 @@ class TestRunIntegration:
         client._call_llm = MagicMock(return_value=final_response)
         client._fetch_tool_definitions = MagicMock(return_value=[])
 
-        with patch.object(client, "_maybe_compact") as mock_compact:
+        with patch.object(client, "_maybe_compact", return_value=None) as mock_compact:
             result = client.run("new question", context_block="")
 
         assert result == "done"
@@ -2397,10 +2398,15 @@ class TestToolDirectRequest:
     def test_direct_unknown_kind_still_treated_as_chat(self):
         # A dict without kind == "tool_direct" is not a framework request;
         # run() treats it as ordinary user text content rendering (dict str).
+        # The chat path must never hit a real LLM endpoint in tests: stub it.
         client = _make_client()
+        client._call_llm = MagicMock(
+            return_value={"finish_reason": "stop", "message": {"content": "done"}}
+        )
         with patch("kicad_plugin.llm_client.call_mcp_tool", return_value={"status": "started"}):
             reply = client.run({"not": "a request"}, "")
         assert isinstance(reply, str)
+        client._call_llm.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -2665,3 +2671,136 @@ class TestContextBudgetIncludesTools:
         client._maybe_compact("x" * 4_000, on_warning=warned.append, tools_est_tokens=69_000)
         assert len(warned) == 1
         assert "too short to compact" in warned[0]
+
+
+# ---------------------------------------------------------------------------
+# Tool eviction after failed compaction + window-overflow hard fail (#133)
+# ---------------------------------------------------------------------------
+
+
+class TestToolEviction:
+    def test_evicts_tail_tools_until_target_reached(self):
+        client = _make_client()
+        client._tool_registry = {
+            "tool_a": _fake_tool_def("tool_a", description="x" * 2_000),
+            "tool_b": _fake_tool_def("tool_b", description="x" * 2_000),
+            "tool_c": _fake_tool_def("tool_c", description="x" * 2_000),
+        }
+        client._enabled_tools = {"tool_a", "tool_b", "tool_c"}
+        # 3 tools x ~500 tokens each; start at 1200 -> evict c (700), then fit.
+        evicted = client._evict_tools_to_target(target_tokens=1_000, current_used=1_200)
+        assert evicted == ["tool_c"]  # tail of catalog order first
+        assert client._enabled_tools == {"tool_a", "tool_b"}
+
+    def test_evicts_all_when_target_unreachable(self):
+        client = _make_client()
+        client._tool_registry = {
+            "tool_a": _fake_tool_def("tool_a", description="x" * 2_000),
+            "tool_b": _fake_tool_def("tool_b", description="x" * 2_000),
+        }
+        client._enabled_tools = {"tool_a", "tool_b"}
+        evicted = client._evict_tools_to_target(target_tokens=0, current_used=1_200)
+        assert evicted == ["tool_b", "tool_a"]  # tail-first order preserved
+        assert client._enabled_tools == set()
+
+    def test_meta_tools_never_evicted(self):
+        client = _make_client()
+        client._tool_registry = {"real_a": _fake_tool_def("real_a", description="x" * 16_000)}
+        client._enabled_tools = {"real_a", *llm_client._META_TOOL_NAMES}
+        evicted = client._evict_tools_to_target(target_tokens=0, current_used=5_000_000)
+        assert evicted == ["real_a"]
+        assert client._enabled_tools == set(llm_client._META_TOOL_NAMES)
+        names = [t["function"]["name"] for t in client._build_request_tools()]
+        assert names == ["enable_tool", "disable_tool", "get_tool_schema"]
+
+    def test_maybe_compact_evicts_when_compaction_insufficient(self):
+        # context 10k -> budget 7k, compaction target 4.9k. History ~1.6k,
+        # system 1k, tools 3 x ~2k -> used ~8.9k. Mocked compaction does not
+        # shrink history, so eviction must trim the enabled set instead.
+        client = _make_client(context_tokens=10_000)
+        client._tool_registry = {
+            "tool_a": _fake_tool_def("tool_a", description="x" * 8_000),
+            "tool_b": _fake_tool_def("tool_b", description="x" * 8_000),
+            "tool_c": _fake_tool_def("tool_c", description="x" * 8_000),
+        }
+        client._enabled_tools = {"tool_a", "tool_b", "tool_c"}
+        client._history = [
+            _user("x" * 800),
+            _assistant("x" * 800),
+            _user("x" * 800),
+            _assistant("x" * 800),
+            _user("x" * 800),
+            _assistant("x" * 800),
+            _user("x" * 800),
+            _assistant("x" * 800),
+        ]
+        notices = []
+        with patch.object(client, "_compact_history", return_value=True):
+            err = client._maybe_compact(
+                "x" * 4_000, on_compacted=notices.append, tools_est_tokens=6_337
+            )
+        assert err is None  # under the real window after eviction
+        assert client._enabled_tools == set()  # all 3 evicted (~500 tok granularity)
+        trimmed = [n for n in notices if "Tool set trimmed" in n]
+        assert len(trimmed) == 1
+        assert "tool_a" in trimmed[0] and "tool_b" in trimmed[0] and "tool_c" in trimmed[0]
+        # notice reports the post-eviction used token estimate
+        assert re.search(r"used ≈\d+ tokens", trimmed[0]) is not None
+        compacted = [n for n in notices if "History compacted" in n]
+        assert len(compacted) == 1
+        assert re.search(r"used ≈\d+ tokens", compacted[0]) is not None
+
+    def test_window_overflow_returns_error_message(self):
+        # context 2k -> budget 1.4k, target 980. History+system+meta alone
+        # (~2.9k) exceed the real window even with every tool evicted.
+        client = _make_client(context_tokens=2_000)
+        client._tool_registry = {
+            "tool_a": _fake_tool_def("tool_a", description="x" * 8_000),
+            "tool_b": _fake_tool_def("tool_b", description="x" * 8_000),
+            "tool_c": _fake_tool_def("tool_c", description="x" * 8_000),
+        }
+        client._enabled_tools = {"tool_a", "tool_b", "tool_c"}
+        client._history = [
+            _user("x" * 800),
+            _assistant("x" * 800),
+            _user("x" * 800),
+            _assistant("x" * 800),
+            _user("x" * 800),
+            _assistant("x" * 800),
+            _user("x" * 800),
+            _assistant("x" * 800),
+        ]
+        warned = []
+        with patch.object(client, "_compact_history", return_value=True):
+            err = client._maybe_compact(
+                "x" * 4_000, on_warning=warned.append, tools_est_tokens=6_337
+            )
+        assert err is not None
+        assert "Context window overflow" in err
+        assert "Not sent" in err
+        assert len(warned) == 1
+        assert client._enabled_tools == set()
+
+    def test_run_aborts_without_sending_on_overflow(self):
+        client = _make_client(context_tokens=2_000)
+        client._tool_registry = {
+            "tool_a": _fake_tool_def("tool_a", description="x" * 8_000),
+            "tool_b": _fake_tool_def("tool_b", description="x" * 8_000),
+            "tool_c": _fake_tool_def("tool_c", description="x" * 8_000),
+        }
+        client._enabled_tools = {"tool_a", "tool_b", "tool_c"}
+        client._history = [
+            _user("x" * 800),
+            _assistant("x" * 800),
+            _user("x" * 800),
+            _assistant("x" * 800),
+            _user("x" * 800),
+            _assistant("x" * 800),
+            _user("x" * 800),
+            _assistant("x" * 800),
+        ]
+        client._call_llm = MagicMock()
+        with patch.object(client, "_compact_history", return_value=True):
+            result = client.run("new question", context_block="")
+        assert "Context window overflow" in result
+        client._call_llm.assert_not_called()
