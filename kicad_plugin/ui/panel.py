@@ -959,6 +959,9 @@ if _WX_AVAILABLE:
                             on_compacted=lambda notice: _emit(
                                 {"type": "status", "text": notice, "color_hex": self._C_WARN_HEX}
                             ),
+                            on_warning=lambda notice: _emit(
+                                {"type": "status", "text": notice, "color_hex": self._C_WARN_HEX}
+                            ),
                             images=images,
                         )
                     else:  # tool_direct
@@ -1688,9 +1691,13 @@ if _WX_AVAILABLE:
         def _mark_tool_dirty(self, name: str) -> None:
             """Track whether a tool call modified the PCB/schematic on disk."""
             try:
+                from ..llm_client import _META_TOOL_NAMES
                 from ..tool_registry import get_tool_policy
 
-                policy = get_tool_policy(name)
+                # Meta tools (enable_tool/disable_tool/get_tool_schema) are
+                # handled locally by the LLM client and are intentionally not
+                # in TOOL_POLICIES; they never touch the board files.
+                policy = get_tool_policy(name) if name not in _META_TOOL_NAMES else None
             except Exception as e:
                 log.error("Failed to get tool policy for %s: %s", name, e)
                 policy = None
