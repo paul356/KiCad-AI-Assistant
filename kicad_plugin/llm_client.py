@@ -1271,7 +1271,10 @@ class LLMClient:
         the transcript exceeds half the context window it is split at turn
         boundaries (a single turn larger than the budget is hard-split) and
         summarised incrementally: each chunk is summarised together with the
-        running summary of the previous chunks (map-reduce).
+        running summary of the previous chunks (map-reduce).  The summary is
+        capped at a quarter of the window and each chunk's budget subtracts
+        the running summary plus prompt overhead, so no compaction call can
+        itself overflow the window.
         The final summary is hard-clipped to ``target_summary_chars`` at a
         word boundary before storing.
 
@@ -1347,6 +1350,13 @@ class LLMClient:
                     lines.append(f"Assistant called tools: {names}")
             # role=="tool" messages are omitted entirely
 
+        # ---- Window safety for every compaction call -------------------------
+        # Each compaction call sends preamble + running summary + chunk.
+        # Bound the summary at a quarter of the window and subtract summary
+        # plus prompt overhead from the per-chunk budget, so no single call
+        # exceeds half the window even at the worst case (issue #140).
+        target_summary_chars = min(target_summary_chars, int(self._context_tokens * 0.25 * 4))
+        head_overhead_chars = 800  # preamble + <session> delimiters, worst case
         target_words = max(50, target_summary_chars // 4)
 
         # ---- Chunked incremental summarisation ------------------------------
@@ -1371,7 +1381,10 @@ class LLMClient:
                 )
             return head + f"<session>\n{chunk}\n</session>"
 
-        max_chunk_chars = int(self._context_tokens * 0.5 * 4)
+        max_chunk_chars = max(
+            1_000,
+            int(self._context_tokens * 0.5 * 4) - target_summary_chars - head_overhead_chars,
+        )
         chunks: list[list[str]] = []
         cur_lines: list[str] = []
         cur_len = 0
@@ -1436,6 +1449,11 @@ class LLMClient:
                 if last_space > target_summary_chars // 2:
                     clipped = clipped[:last_space]
                 summary = clipped
+
+        if not chunks or not summary:
+            # prefix contained nothing summarisable (e.g. only tool messages)
+            # or the LLM returned no text — store nothing, report failure
+            return False
 
         # ---- Hard-clip summary to target_summary_chars at a word boundary ---
         if len(summary) > target_summary_chars:
@@ -1846,11 +1864,14 @@ class LLMClient:
         # at the compaction target — it never evicts meta tools.
         target_post_compact = self._context_tokens * self._compact_target_threshold
         evicted = self._evict_tools_to_target(target_post_compact, used)
+        # snapshot right after eviction, before compaction mutates `used`
+        used_after_evict = used
         if evicted:
             tools_est_tokens = (
                 self._enabled_tools_est_tokens() + len(json.dumps(_META_TOOL_DEFS)) // 4
             )
             used = system_tokens + history_tokens + tools_est_tokens
+            used_after_evict = used
 
         compacted = False
         if used > target_post_compact:
@@ -1905,7 +1926,7 @@ class LLMClient:
             on_compacted(
                 "Tool set trimmed for context budget — disabled: "
                 + ", ".join(sorted(evicted))
-                + f". Re-enable with enable_tool if needed. (used ≈{used} tokens)"
+                + f". Re-enable with enable_tool if needed. (used ≈{used_after_evict} tokens)"
             )
         if (
             not compacted

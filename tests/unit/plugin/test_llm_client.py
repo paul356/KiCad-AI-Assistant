@@ -500,6 +500,98 @@ class TestCompactHistory:
         assert result is True
         assert client._history[1:] == original_recent  # all 4 recent turns preserved
 
+    def test_large_running_summary_stays_within_half_window(self):
+        # A compaction call sends preamble + running summary + chunk.  Even
+        # when the LLM returns a near-maximum summary and the transcript is
+        # huge, every all call must stay within half the window.
+        client = _make_client(context_tokens=10_000, keep_recent_turns=4)
+        client._history = []
+        for i in range(8):
+            client._history.append(_user("q" + "x" * 8_000))
+            client._history.append(_assistant("a" + "y" * 8_000))
+
+        # summary near the target cap (context*0.25*4 chars = 10k chars)
+        big_summary = ("word " * 2_500)[:9_900]
+        summary_response = {
+            "finish_reason": "stop",
+            "message": {"content": big_summary},
+        }
+        prompts = []
+
+        def _capture(system_prompt, tools):
+            prompts.append(client._history[0]["content"])
+            return summary_response
+
+        with patch.object(client, "_call_openai", side_effect=_capture) as mock_call:
+            result = client._compact_history("system", target_summary_chars=10_000)
+
+        assert result is True
+        assert mock_call.call_count > 1
+        half_window_chars = int(10_000 * 0.5 * 4)  # 20 000
+        for p in prompts:
+            assert len(p) <= half_window_chars, (
+                f"compaction call exceeded half window: {len(p)} > {half_window_chars}"
+            )
+
+    def test_dedup_prunes_superseded_turns_inside_compaction(self):
+        # Real dedup (not mocked) must run as a compaction sub-step: the
+        # superseded tool turn is dropped before summarising, so its content
+        # never reaches the summarisation prompt nor the stored history.
+        client = _make_client(keep_recent_turns=4)
+        # 8 turns: tc1 (superseded) in the compactable prefix; tc3 (latest
+        # call to the same tool) inside the preserved recent block.  After
+        # dedup drops the tc1 turn, 7 turns remain — enough that the prefix
+        # is non-empty while the recent block still holds tc3.
+        client._history = [
+            _user("q1"),
+            _assistant(
+                "t1",
+                tool_calls=[
+                    {"id": "tc1", "function": {"name": "extract_netlist", "arguments": "{}"}}
+                ],
+            ),
+            _tool("tc1", "SUPERSEDED-NETLIST-CONTENT"),
+            _user("q2"),
+            _assistant("a2"),
+            _user("q3"),
+            _assistant("a3"),
+            _user("q4"),
+            _assistant("a4"),
+            _user("q5"),
+            _assistant(
+                "t5",
+                tool_calls=[
+                    {"id": "tc3", "function": {"name": "extract_netlist", "arguments": "{}"}}
+                ],
+            ),
+            _tool("tc3", "latest result"),
+            _user("q6"),
+            _assistant("a6"),
+            _user("q7"),
+            _assistant("a7"),
+        ]
+        prompts = []
+
+        def _capture(system_prompt, tools):
+            prompts.append(client._history[0]["content"])
+            return {"finish_reason": "stop", "message": {"content": "Session summary."}}
+
+        with patch.object(client, "_call_openai", side_effect=_capture):
+            result = client._compact_history("system", target_summary_chars=500)
+
+        assert result is True
+        # superseded turn (tc1) removed from stored history; the latest call
+        # (tc3, inside the preserved recent block) survives
+        tool_ids = [
+            tc["id"] for m in client._history if m.get("tool_calls") for tc in m["tool_calls"]
+        ]
+        assert tool_ids == ["tc3"]
+        assert client._history[0]["role"] == "user"  # summary message stored
+        assert "[Session summary" in client._history[0]["content"]
+        # superseded content must not have reached the summarisation prompt
+        for p in prompts:
+            assert "SUPERSEDED-NETLIST-CONTENT" not in p
+
 
 # ---------------------------------------------------------------------------
 # _maybe_compact unit tests
