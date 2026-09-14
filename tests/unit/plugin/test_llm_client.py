@@ -2860,3 +2860,37 @@ class TestEnabledToolsPersistence:
         client._enabled_tools = {"tool_a", "tool_b"}
         client._evict_tools_to_target(target_tokens=0, current_used=1_000)
         assert client.get_enabled_tools() == []
+
+
+# ---------------------------------------------------------------------------
+# Regression: set_history must survive (issue #138 — deleted in #137, restore
+# paths in panel.py call it; no test covered it, so the break went unnoticed).
+# ---------------------------------------------------------------------------
+
+
+class TestSetHistoryRegression:
+    def test_set_history_restores_conversation(self):
+        client = _make_client()
+        client._history = [{"role": "user", "content": "old"}]
+        restored = [
+            {"role": "user", "content": "q1"},
+            {"role": "assistant", "content": "a1"},
+        ]
+        client.set_history(restored)
+        assert client._history == restored
+        assert client._history is not restored  # defensive copy
+
+    def test_set_history_empty_clears(self):
+        client = _make_client()
+        client._history = [{"role": "user", "content": "old"}]
+        client.set_history([])
+        assert client._history == []
+
+    def test_set_history_then_set_enabled_tools_sequence(self):
+        # The restore path order: set_history first, then the enabled set.
+        # Both must be independently replaceable without cross-talk.
+        client = _make_client()
+        client.set_history([{"role": "user", "content": "q"}])
+        client.set_enabled_tools(["alpha"])
+        assert client._history == [{"role": "user", "content": "q"}]
+        assert client.get_enabled_tools() == ["alpha"]
