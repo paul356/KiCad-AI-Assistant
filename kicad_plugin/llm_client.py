@@ -1321,19 +1321,9 @@ class LLMClient:
             cum = [0] * (len(self._history) + 1)
             for idx, m in enumerate(self._history):
                 cum[idx + 1] = cum[idx] + len(json.dumps(m))
-            # The live request — the newest user message that has no assistant
-            # reply yet (run() appends it right before compaction) — is never
-            # foldable: it must survive verbatim after the summary so the
-            # model still receives the question that triggered this request.
-            # Only a trailing user message gets this protection; a trailing
-            # assistant or tool message belongs to a complete turn and stays
-            # absorbable.
-            live_start = len(self._history)
-            if self._history and self._history[-1].get("role") == "user":
-                live_start = len(self._history) - 1
             acc = 0
-            new_split = live_start
-            i = live_start - 1
+            new_split = len(self._history)
+            i = len(self._history) - 1
             while i >= split_idx:
                 if self._history[i].get("role") == "assistant":
                     # turn ends at this assistant message; find its user opener
