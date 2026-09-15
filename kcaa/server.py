@@ -162,6 +162,7 @@ def _register_full_profile(mcp: FastMCP) -> None:
     from kcaa.tools.export_tools import register_export_tools
     from kcaa.tools.pattern_tools import register_pattern_tools
     from kcaa.tools.project_tools import register_project_tools
+    from kcaa.tools.render_board_tools import register_render_board_tools
 
     # Resources
     register_project_resources(mcp)
@@ -175,6 +176,7 @@ def _register_full_profile(mcp: FastMCP) -> None:
     register_project_tools(mcp)
     register_analysis_tools(mcp)
     register_export_tools(mcp)
+    register_render_board_tools(mcp)
     register_drc_tools(mcp)
     register_bom_tools(mcp)
     register_netlist_tools(mcp)
