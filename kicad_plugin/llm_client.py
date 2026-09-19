@@ -1000,13 +1000,27 @@ def call_mcp_tool(base_url: str, tool_name: str, arguments: dict[str, Any]) -> d
         return {"success": False, "error": body["error"].get("message", str(body["error"]))}
 
     result = body.get("result", {})
-    # FastMCP returns content as a list of {type, text} blocks
+    # FastMCP returns content as a list of {type, text} / {type, image} blocks
     content = result.get("content", [])
-    if content and isinstance(content, list) and content[0].get("type") == "text":
-        try:
-            return json.loads(content[0]["text"])
-        except json.JSONDecodeError:
-            return {"success": True, "text": content[0]["text"]}
+    image: dict[str, str] | None = None
+    if isinstance(content, list):
+        text = next((b for b in content if b.get("type") == "text"), None)
+        img = next((b for b in content if b.get("type") == "image"), None)
+        if img is not None:
+            image = {
+                "media_type": img.get("mimeType", "image/png"),
+                "data": img.get("data", ""),
+            }
+        if text is not None:
+            try:
+                out = json.loads(text.get("text", ""))
+            except json.JSONDecodeError:
+                out = {"success": True, "text": text.get("text", "")}
+            if isinstance(out, dict):
+                out["_image"] = image
+            return out
+    if image is not None:
+        return {"success": True, "_image": image}
     return result
 
 
@@ -2467,6 +2481,7 @@ class LLMClient:
                     msg_to_save["tool_calls"] = message["tool_calls"]
                 self._history.append(msg_to_save)
                 tool_results = []
+                result_images: list[dict[str, str]] = []
                 for tc in tool_calls:
                     name = tc["function"]["name"]
                     try:
@@ -2475,6 +2490,17 @@ class LLMClient:
                         args = {}
 
                     result = self._execute_or_reject_tool(name, args, state, on_tool_call)
+
+                    # Image-bearing tool results (e.g. export_pcb_layer_image)
+                    # carry the PNG as a separate MCP image block.  Peel it off
+                    # the JSON text payload and relay it as an OpenAI-style
+                    # image_url user message so every provider conversion
+                    # (_anthropic_content / _ollama_messages) can see the image.
+                    image = None
+                    if isinstance(result, dict) and result.get("_image"):
+                        image = result.pop("_image")
+                    if image:
+                        result_images.append(image)
 
                     tool_results.append(
                         {
@@ -2485,6 +2511,21 @@ class LLMClient:
                     )
 
                 self._history.extend(tool_results)
+                if result_images and self._settings.llm_supports_vision:
+                    self._history.append(
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": (f"data:{img['media_type']};base64,{img['data']}")
+                                    },
+                                }
+                                for img in result_images
+                            ],
+                        }
+                    )
             else:
                 reply = (
                     "[Error] Maximum tool-call iterations reached. Please try a simpler request."
@@ -2667,8 +2708,16 @@ class LLMClient:
                     i += 1
                 if i < len(self._history) and self._history[i].get("role") == "user":
                     content = self._history[i].get("content") or ""
-                    if isinstance(content, str) and content.strip():
-                        tool_results.append({"type": "text", "text": content})
+                    if isinstance(content, str):
+                        if content.strip():
+                            tool_results.append({"type": "text", "text": content})
+                    elif isinstance(content, list):
+                        # Multimodal follow-up (e.g. a rendered board image from
+                        # export_pcb_layer_image): convert OpenAI-style blocks
+                        # to Anthropic blocks and fold into the tool results.
+                        converted = self._anthropic_content(content)
+                        if isinstance(converted, list):
+                            tool_results.extend(converted)
                     i += 1
                 messages.append({"role": "user", "content": tool_results})
                 continue
