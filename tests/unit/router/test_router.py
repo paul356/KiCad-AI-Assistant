@@ -1157,3 +1157,206 @@ def test_plated_thru_hole_pad_still_pad_obstacle(tmp_path: Path) -> None:
     assert len(pads) == 1, "plated THT pad must remain a pad-kind obstacle"
     assert drills == [], "plated THT pad must not become a drill obstacle"
     assert pads[0].net == "VCC"
+
+
+# ---------------------------------------------------------------------------
+# PNS engine adapter (corner_mode / arcs / shoved tracks)
+# ---------------------------------------------------------------------------
+
+
+def _make_clear_board(tmp_path: Path) -> str:
+    """Minimal 2-pad single-layer board with no obstacles between them."""
+    pcb = """(kicad_pcb
+	(version 20260206)
+	(generator "test")
+	(layers
+		(0 "F.Cu" signal)
+		(44 "Edge.Cuts" user)
+	)
+	(net 0 "")
+	(net 1 "VCC")
+	(footprint "R"
+		(layer "F.Cu")
+		(at 30.0 30.0 0.0)
+		(property "Reference" "R1")
+		(pad "1" smd rect
+			(at -0.5 0.0)
+			(size 0.5 0.5)
+			(layers "F.Cu" "F.Mask")
+			(net 1 "VCC")
+		)
+	)
+	(footprint "C"
+		(layer "F.Cu")
+		(at 60.0 40.0 0.0)
+		(property "Reference" "C1")
+		(pad "1" smd rect
+			(at 0.0 -0.5)
+			(size 0.5 0.5)
+			(layers "F.Cu" "F.Mask")
+			(net 1 "VCC")
+		)
+	)
+	(gr_rect
+		(start 20.0 20.0)
+		(end 70.0 60.0)
+		(stroke (width 0.1) (type solid))
+		(fill none)
+		(layer "Edge.Cuts")
+	)
+)
+"""
+    pcb_path = tmp_path / "clear_board.kicad_pcb"
+    pcb_path.write_text(pcb)
+    return str(pcb_path)
+
+
+def _route_clear(req_extra: dict, tmp_path: Path):
+    from kcaa.router.router import RouteRequest, auto_route_pair
+
+    base = {
+        "pcb_path": _make_clear_board(tmp_path),
+        "ref_a": "R1",
+        "pad_a": "1",
+        "ref_b": "C1",
+        "pad_b": "1",
+        "net": "VCC",
+        "width": 0.2,
+        "clearance": 0.2,
+        "via_pairs": (),
+    }
+    base.update(req_extra)
+    return auto_route_pair(RouteRequest(**base))
+
+
+def test_engine_rounded45_emits_arc(tmp_path: Path) -> None:
+    """corner_mode=rounded45 on an unobstructed skeleton must produce
+    OutputArc nodes whose start point sits on the route start pad."""
+    result = _route_clear({"corner_mode": "rounded45"}, tmp_path)
+    assert len(result.arcs) == 1
+    a = result.arcs[0]
+    assert a.width == 0.2
+    assert a.layer == "F.Cu"
+    assert a.net == "VCC"
+    # Arc endpoints anchored on the skeleton legs.
+    assert a.start[1] == pytest.approx(30.0, abs=1e-3)
+    assert a.end == pytest.approx((60.0, 39.5), abs=1e-3)
+
+
+def test_engine_mitered45_no_arcs(tmp_path: Path) -> None:
+    result = _route_clear({"corner_mode": "mitered45"}, tmp_path)
+    assert result.arcs == []
+    assert len(result.segments) >= 2
+
+
+def test_engine_rounded90_arc(tmp_path: Path) -> None:
+    result = _route_clear({"corner_mode": "rounded90"}, tmp_path)
+    assert len(result.arcs) == 1
+
+
+def test_engine_corner_mode_echoed(tmp_path: Path) -> None:
+    result = _route_clear({"corner_mode": "rounded90"}, tmp_path)
+    assert result.corner_mode == "rounded90"
+
+
+def test_engine_invalid_corner_mode_raises(tmp_path: Path) -> None:
+    with pytest.raises(RouteFailure) as excinfo:
+        _route_clear({"corner_mode": "octagonal"}, tmp_path)
+    assert "corner_mode" in str(excinfo.value)
+
+
+def test_engine_empty_shoved_tracks_by_default(tmp_path: Path) -> None:
+    result = _route_clear({}, tmp_path)
+    assert result.shoved_tracks == []
+
+
+def test_engine_detour_linearizes_arc(tmp_path: Path) -> None:
+    """An obstacle on the skeleton forces a walkaround; the rounded arc
+    must be linearized (no OutputArc) and the path must clear the
+    obstacle by the DRC clearance."""
+    from shapely.geometry import LineString
+
+    pcb = """(kicad_pcb
+	(version 20260206)
+	(generator "test")
+	(layers
+		(0 "F.Cu" signal)
+		(44 "Edge.Cuts" user)
+	)
+	(net 0 "")
+	(net 1 "VCC")
+	(footprint "R"
+		(layer "F.Cu")
+		(at 30.0 30.0 0.0)
+		(property "Reference" "R1")
+		(pad "1" smd rect
+			(at -0.5 0.0)
+			(size 0.5 0.5)
+			(layers "F.Cu" "F.Mask")
+			(net 1 "VCC")
+		)
+	)
+	(footprint "C"
+		(layer "F.Cu")
+		(at 60.0 40.0 0.0)
+		(property "Reference" "C1")
+		(pad "1" smd rect
+			(at 0.0 -0.5)
+			(size 0.5 0.5)
+			(layers "F.Cu" "F.Mask")
+			(net 1 "VCC")
+		)
+	)
+	(footprint "BLOCK"
+		(layer "F.Cu")
+		(at 46.0 32.0 0.0)
+		(property "Reference" "U1")
+		(pad "1" smd rect
+			(at 0.0 0.0)
+			(size 4.0 4.0)
+			(layers "F.Cu" "F.Mask")
+			(net 2 "OTHER")
+		)
+	)
+	(gr_rect
+		(start 20.0 20.0)
+		(end 70.0 60.0)
+		(stroke (width 0.1) (type solid))
+		(fill none)
+		(layer "Edge.Cuts")
+	)
+)
+"""
+    pcb_path = tmp_path / "blocked_board.kicad_pcb"
+    pcb_path.write_text(pcb)
+    from kcaa.router.router import RouteRequest, auto_route_pair
+
+    result = auto_route_pair(
+        RouteRequest(
+            pcb_path=str(pcb_path),
+            ref_a="R1",
+            pad_a="1",
+            ref_b="C1",
+            pad_b="1",
+            net="VCC",
+            width=0.2,
+            clearance=0.2,
+            via_pairs=(),
+            corner_mode="rounded45",
+        )
+    )
+    assert result.arcs == []
+    # Every emitted segment clears the blocker by >= clearance.
+    blocker = _rounded_square((46.0, 32.0), 4.0)
+    for seg in result.segments:
+        line = LineString([(seg.x1, seg.y1), (seg.x2, seg.y2)])
+        assert line.distance(blocker) >= 0.2 - 0.01
+
+
+def _rounded_square(center: tuple[float, float], size: float):
+    """Axis-aligned square polygon (no rounding — clearance measured to the
+    copper edge)."""
+    from shapely.geometry import box
+
+    half = size / 2.0
+    return box(center[0] - half, center[1] - half, center[0] + half, center[1] + half)

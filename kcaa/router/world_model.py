@@ -49,6 +49,12 @@ class Obstacle:
     ``shape`` is the polygon **already buffered** by half the trace width
     (so a thin track is just a thick line). Additional clearance is applied
     by the query layer when checking visibility.
+
+    ``track_centerline`` / ``track_width`` are set only for ``track``
+    obstacles: the exact segment endpoints and width from the s-expr.
+    Geometric reverse-derivation from ``shape`` is unreliable when a track
+    is shorter than it is wide (the buffered rect's long axis flips), so
+    the PNS engine reads these instead.
     """
 
     shape: Polygon
@@ -56,6 +62,8 @@ class Obstacle:
     net: str | None
     kind: ObstacleKind
     ref: str | None = None  # footprint reference for diagnostics
+    track_centerline: tuple[tuple[float, float], tuple[float, float]] | None = None
+    track_width: float | None = None
 
 
 @dataclass
@@ -247,6 +255,7 @@ def _segment_obstacle(seg_node: list[Any], net_filter: str | None) -> Obstacle |
     x1, y1 = start
     x2, y2 = end
     half = width / 2.0
+    track_line = ((x1, y1), (x2, y2))
     if x1 == x2:
         minx, maxx = x1 - half, x1 + half
         miny, maxy = min(y1, y2), max(y1, y2)
@@ -259,12 +268,16 @@ def _segment_obstacle(seg_node: list[Any], net_filter: str | None) -> Obstacle |
             layers=frozenset({layer}),
             net=net,
             kind="track",
+            track_centerline=track_line,
+            track_width=width,
         )
     return Obstacle(
         shape=Polygon([(minx, miny), (maxx, miny), (maxx, maxy), (minx, maxy)]),
         layers=frozenset({layer}),
         net=net,
         kind="track",
+        track_centerline=track_line,
+        track_width=width,
     )
 
 

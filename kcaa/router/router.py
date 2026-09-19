@@ -49,7 +49,6 @@ from shapely.geometry import box as _shapely_box
 
 from kcaa.router.grid_a_star import (
     GRID_RESOLUTION,
-    hierarchical_a_star,
     multi_layer_a_star,
     path_to_nodes,
     shortcut_path,
@@ -57,10 +56,14 @@ from kcaa.router.grid_a_star import (
     snap_to_45_path_safe,
 )
 from kcaa.router.path_postprocess import (
+    OutputArc,
     OutputSegment,
     OutputVia,
     postprocess_path,
 )
+from kcaa.router.pns.direction45 import CornerMode
+from kcaa.router.pns.shove import TrackObstacle
+from kcaa.router.route_engine import PnsFailure, route_engine
 from kcaa.router.visibility_graph import RouteNode
 from kcaa.router.world_model import Obstacle, _get_net, build_world_model
 from kcaa.utils.pcb_sexp_utils import load_pcb
@@ -164,6 +167,7 @@ class RouteRequest:
     grid_resolution: float | None = None  # None -> GRID_RESOLUTION
     via_cost: float = 2.0  # mm penalty per via edge
     turn_penalty: float = 0.3  # mm penalty per direction change; 0 disables
+    corner_mode: str = "mitered45"  # mitered45 | rounded45 | rounded90 (mitered90)
 
 
 @dataclass
@@ -184,6 +188,9 @@ class RouteResult:
 
     segments: list[OutputSegment] = field(default_factory=list)
     vias: list[OutputVia] = field(default_factory=list)
+    arcs: list[OutputArc] = field(default_factory=list)
+    shoved_tracks: list[TrackObstacle] = field(default_factory=list)
+    corner_mode: str = "mitered45"
     start: tuple[float, float] = (0.0, 0.0)
     end: tuple[float, float] = (0.0, 0.0)
     layers_used: list[str] = field(default_factory=list)
@@ -593,42 +600,78 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
         _log_output_segments("final", segs)
         _dump_viz_segments("7-final", segs, _pad_viz, buffered, route_bbox)
 
+        # Multi-layer routing emits straight segments only; rounded
+        # corner arcs are a single-layer skeleton feature.
+        arcs_out: list[OutputArc] = []
+
         start_xy = (all_nodes[0].x, all_nodes[0].y)
         end_xy = (all_nodes[-1].x, all_nodes[-1].y)
         layers_used = _layers_used(all_nodes)
     else:
-        # -- Single-layer: hierarchical A* ---------------------------
+        # -- Single-layer: PNS engine (walkaround + shove) ------------
         # Only copper on the routing layer can block the track; other
         # layers are parallel physical planes and must not poison the
-        # grid (the multi-layer branch groups by layer for the same
-        # reason).
-        layer_obstacles = obstacles_by_layer[start_layer]
-        result = hierarchical_a_star(
-            layer_obstacles,
-            pad_a_xy,
-            pad_b_xy,
-            fine_resolution=grid_res,
-            route_bbox=route_bbox,
-            turn_penalty=req.turn_penalty,
-        )
-        if result.path is None:
+        # search.  The engine walks the BuildInitialTrace skeleton
+        # around fixed solids, then shoves movable tracks out of the
+        # way; it never uses the grid.
+        # The engine needs *unbuffered* obstacle shapes (it applies
+        # clearance + own half-width itself when building walkaround
+        # hulls).  World-model obstacles are already that; same-net pad
+        # copper (dropped by the world model so the route can land on
+        # its own pads) is re-added here as transit obstacles, unbuffered
+        # — a track may terminate on a pad but never run across its
+        # copper (a drill hole severs any crossing track).
+        engine_obstacles: list[Obstacle] = [o for o in model.obstacles if start_layer in o.layers]
+        for poly, players, _ref, _pname, center in _same_net_pad_polygons(data, req.net):
+            is_end = (
+                abs(center[0] - pad_a_xy[0]) < 1e-6 and abs(center[1] - pad_a_xy[1]) < 1e-6
+            ) or (abs(center[0] - pad_b_xy[0]) < 1e-6 and abs(center[1] - pad_b_xy[1]) < 1e-6)
+            if is_end and start_layer in players:
+                continue  # the route terminates on the endpoint pad
+            if start_layer in players:
+                engine_obstacles.append(
+                    Obstacle(
+                        shape=poly,
+                        layers=frozenset({start_layer}),
+                        net=req.net,
+                        kind="pad",
+                    )
+                )
+        corner_mode = _parse_corner_mode(req.corner_mode)
+        try:
+            eng = route_engine(
+                pad_a_xy,
+                pad_b_xy,
+                engine_obstacles,
+                track_width=width,
+                clearance=clearance,
+                corner_mode=corner_mode,
+            )
+        except PnsFailure as exc:
             # Dump the failure state so the blockage can be inspected
             # (same viz format as the success stages).
-            _dump_viz("fail-astar", [], _pad_viz, layer_obstacles, route_bbox)
+            _dump_viz("fail-pns", [], _pad_viz, buffered, route_bbox)
             raise RouteFailure(
                 f"No obstacle-avoiding path from {req.ref_a}/{req.pad_a} to "
-                f"{req.ref_b}/{req.pad_b} at {req.width or 0.5}mm "
-                f"track width on layer {start_layer}."
-            )
-        print(f"  [route] A*: {len(result.path)} pts  cells_visited={result.cells_visited}")
+                f"{req.ref_b}/{req.pad_b} at {width}mm track width on layer "
+                f"{start_layer}: {exc}"
+            ) from exc
+        print(
+            f"  [route] PNS: {len(eng.path)} pts"
+            f"  shoved={len(eng.shoved_tracks)}  arcs={len(eng.arcs)}"
+        )
 
-        # Strip layer_idx from the unified A* result.
-        raw_pts = [(x, y) for x, y, _ in result.path]
-        _dump_viz("0-astar", raw_pts, _pad_viz, buffered, route_bbox)
+        if eng.trace is not None:
+            # Embargo-free skeleton: emit anchor points and arcs straight
+            # from the trace (KiCad emits the skeleton for a clear route).
+            best_path_pts = eng.trace.points
+        else:
+            best_path_pts = eng.path
 
-        # ---- Discard A* path inside rectangular pads and replace with
-        #      axis-aligned wire (fence -> centre). ----
-        best_path_pts = raw_pts
+        _dump_viz("0-pns", best_path_pts, _pad_viz, buffered, route_bbox)
+
+        # ---- Replace scheme inside rectangular pads with an
+        #      axis-aligned wire (fence -> centre) ----
         if pad_a_size is not None:
             n_before = len(best_path_pts)
             best_path_pts = _replace_pad_path(best_path_pts, pad_a_xy, pad_a_size, from_center=True)
@@ -640,11 +683,6 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
             )
             _log_path("pad_b-replace", best_path_pts, n_before)
         _dump_viz("1-pad-replace", best_path_pts, _pad_viz, buffered, route_bbox)
-
-        # ---- Post-process: simplify -> shortcut -> snap45 ----
-        best_path_pts = _postprocess_layer_segment(
-            best_path_pts, buffered, route_bbox, grid_res, "", _pad_viz
-        )
 
         # ---- Align path endpoints with exact pad centres ----
         best_path_pts = _align_path_endpoints(
@@ -670,6 +708,56 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
             _pad_rects=_pad_rects or None,
         )
         segs = [s for s in segs if abs(s.x1 - s.x2) > 1e-6 or abs(s.y1 - s.y2) > 1e-6]
+
+        # Rounded skeleton arcs -> OutputArc nodes.  Valid only when
+        # walkaround/shove/pad-cleanup left the original skeleton anchors
+        # in place.  When arcs are emitted, skip mitering on the legs
+        # they join (postprocess miter would cut into the arc end).
+        arcs_out: list[OutputArc] = []
+        emit_arcs = (
+            eng.trace is not None
+            and len(best_path_pts) == len(eng.trace.points)
+            and all(_pt_eq(p, q) for p, q in zip(best_path_pts, eng.trace.points))
+        )
+        if emit_arcs:
+            if any(a is not None for a in eng.trace.arcs):
+                # Skeleton with arcs: emit straight legs + arcs directly,
+                # no mitering (the rounded corner already smooths the join).
+                segs = []
+                pts = eng.trace.points
+                for i in range(len(pts) - 1):
+                    arc_i = eng.trace.arcs[i] if i < len(eng.trace.arcs) else None
+                    if arc_i is not None:
+                        arcs_out.append(
+                            OutputArc(
+                                start=arc_i.start,
+                                mid=arc_i.mid,
+                                end=arc_i.end,
+                                width=width,
+                                layer=start_layer,
+                                net=req.net,
+                            )
+                        )
+                    else:
+                        x1, y1 = pts[i]
+                        x2, y2 = pts[i + 1]
+                        if abs(x1 - x2) > 1e-6 or abs(y1 - y2) > 1e-6:
+                            segs.append(
+                                OutputSegment(
+                                    x1=x1,
+                                    y1=y1,
+                                    x2=x2,
+                                    y2=y2,
+                                    width=width,
+                                    layer=start_layer,
+                                    net=req.net,
+                                )
+                            )
+            else:
+                # Mitered skeleton (no arcs): keep the mitered postprocess
+                # output; nothing further to emit.
+                pass
+
         _log_output_segments("final", segs)
         _dump_viz_segments("7-final", segs, _pad_viz, buffered, route_bbox)
 
@@ -706,6 +794,9 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
     return RouteResult(
         segments=segs,
         vias=vias,
+        arcs=arcs_out,
+        shoved_tracks=eng.shoved_tracks if start_layer == end_layer else [],
+        corner_mode=req.corner_mode,
         start=start_xy,
         end=end_xy,
         layers_used=layers_used,
@@ -748,6 +839,21 @@ def _seg_angle(x1: float, y1: float, x2: float, y2: float) -> float:
     coordinates, NOT the KiCad CCW file-angle convention (90=up).
     """
     return math.degrees(math.atan2(y2 - y1, x2 - x1)) % 360
+
+
+def _pt_eq(a: tuple[float, float], b: tuple[float, float], tol: float = 1e-6) -> bool:
+    """Point comparison within tolerance."""
+    return abs(a[0] - b[0]) <= tol and abs(a[1] - b[1]) <= tol
+
+
+def _parse_corner_mode(mode: str) -> CornerMode:
+    """Map a RouteRequest corner_mode string to its enum; invalid values
+    raise RouteFailure with the accepted set."""
+    try:
+        return CornerMode(mode)
+    except ValueError as exc:
+        accepted = ", ".join(sorted(m.value for m in CornerMode))
+        raise RouteFailure(f"Unknown corner_mode {mode!r}; expected one of: {accepted}") from exc
 
 
 def _log_path(label: str, pts: list[tuple[float, float]], prev_n: int | None = None) -> None:
