@@ -172,6 +172,7 @@ TOOL_POLICIES: dict[str, ToolPolicy] = {
     "get_ratsnest": ToolPolicy(kind="query"),
     "score_placement": ToolPolicy(kind="query"),
     "suggest_placement_order": ToolPolicy(kind="query"),
+    "export_pcb_layer_image": ToolPolicy(kind="query"),
     # PCB placement tools
     "set_footprint_position": ToolPolicy(
         kind="file_mutation",

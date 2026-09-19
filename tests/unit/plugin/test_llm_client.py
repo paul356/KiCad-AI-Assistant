@@ -81,6 +81,7 @@ def _make_client(
         llm_compact_threshold=compact_threshold,
         llm_compact_target_threshold=compact_target,
         llm_keep_recent_turns=keep_recent_turns,
+        llm_supports_vision=False,
     )
     return LLMClient(settings, mcp_base_url="http://127.0.0.1:9999")
 
@@ -1387,6 +1388,87 @@ class TestRunIntegration:
         assert result["success"] is False
         assert "no execution policy" in result["error"]
         assert "unknown_tool" not in client._enabled_tools
+
+    def test_tool_returned_image_injected_only_when_vision_enabled(self):
+        """A tool result with an MCP image block becomes an image_url user
+        message only when the model is configured to accept images; otherwise
+        the text report alone is kept (matches the UI attachment gate)."""
+        final_response = {"finish_reason": "stop", "message": {"content": "done"}}
+
+        def _image_result(*_args, **_kwargs) -> dict:
+            return {
+                "success": True,
+                "text": "board rendered",
+                "_image": {"media_type": "image/png", "data": "QUJD"},
+            }
+
+        # vision disabled (default) — image must NOT reach history
+        client = _make_client()
+        client._call_llm = MagicMock(
+            side_effect=[
+                {
+                    "finish_reason": "tool_calls",
+                    "message": {
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "tc1",
+                                "type": "function",
+                                "function": {
+                                    "name": "export_pcb_layer_image",
+                                    "arguments": json.dumps({"pcb_path": "/tmp/board.kicad_pcb"}),
+                                },
+                            }
+                        ],
+                    },
+                },
+                final_response,
+            ]
+        )
+        client._enabled_tools = {"export_pcb_layer_image"}
+        with patch("kicad_plugin.llm_client.call_mcp_tool", side_effect=_image_result) as mock_tool:
+            mock_tool.side_effect = _image_result
+            result = client.run("render the board", context_block="")
+
+        assert result == "done"
+        image_msgs = [m for m in client._history if isinstance(m.get("content"), list)]
+        assert image_msgs == [], "image must not be injected when vision is disabled"
+
+        # vision enabled — image_url user message appended after tool results
+        client = _make_client()
+        client._settings.llm_supports_vision = True
+        client._call_llm = MagicMock(
+            side_effect=[
+                {
+                    "finish_reason": "tool_calls",
+                    "message": {
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "tc1",
+                                "type": "function",
+                                "function": {
+                                    "name": "export_pcb_layer_image",
+                                    "arguments": json.dumps({"pcb_path": "/tmp/board.kicad_pcb"}),
+                                },
+                            }
+                        ],
+                    },
+                },
+                final_response,
+            ]
+        )
+        client._enabled_tools = {"export_pcb_layer_image"}
+        with patch("kicad_plugin.llm_client.call_mcp_tool", side_effect=_image_result) as mock_tool:
+            mock_tool.side_effect = _image_result
+            result = client.run("render the board", context_block="")
+
+        assert result == "done"
+        image_msgs = [m for m in client._history if isinstance(m.get("content"), list)]
+        assert len(image_msgs) == 1
+        blocks = image_msgs[0]["content"]
+        assert blocks[0]["type"] == "image_url"
+        assert blocks[0]["image_url"]["url"] == "data:image/png;base64,QUJD"
 
 
 class TestToolPolicyRegistry:

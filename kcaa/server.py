@@ -42,6 +42,7 @@ from kcaa.tools.pcb_routing_tools import register_pcb_routing_tools
 from kcaa.tools.pcb_zone_tools import register_pcb_zone_tools
 from kcaa.tools.placement_helpers import register_placement_helpers
 from kcaa.tools.project_tools import register_project_tools
+from kcaa.tools.render_board_tools import register_render_board_tools
 from kcaa.tools.schematic_group_tools import register_schematic_group_tools
 from kcaa.tools.sheet_tools import register_sheet_tools
 from kcaa.tools.skill_tools import register_skill_tools
@@ -132,6 +133,7 @@ def _register_plugin_profile(mcp: FastMCP) -> None:
     register_schematic_group_tools(mcp)
     register_pcb_zone_tools(mcp)
     register_pcb_routing_tools(mcp)
+    register_render_board_tools(mcp)
     register_kipy_tools(mcp)
     register_drc_tools(mcp)
     register_skill_tools(mcp)
@@ -175,6 +177,7 @@ def _register_full_profile(mcp: FastMCP) -> None:
     register_project_tools(mcp)
     register_analysis_tools(mcp)
     register_export_tools(mcp)
+    register_render_board_tools(mcp)
     register_drc_tools(mcp)
     register_bom_tools(mcp)
     register_netlist_tools(mcp)
