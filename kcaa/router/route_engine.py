@@ -18,7 +18,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 import math
 
-from kcaa.router.pns.direction45 import CornerMode, build_initial_trace
+from kcaa.router.pns.direction45 import ArcSeg, CornerMode, Trace, build_initial_trace
 from kcaa.router.pns.node import ObstacleNode
 from kcaa.router.pns.shove import ShoveResult, TrackObstacle, shove_path
 from kcaa.router.pns.walkaround import WalkFailure, walkaround_line
@@ -36,10 +36,19 @@ class PnsFailure(RuntimeError):
 
 @dataclass
 class EngineResult:
-    """Route polyline plus the tracks that were shoved out of the way."""
+    """Route polyline plus the tracks that were shoved out of the way.
+
+    ``trace`` is the untouched skeleton (with rounded-corner arcs) when
+    neither walkaround nor shove modified the route — the caller then
+    emits the skeleton's anchor points and arcs directly.  When the path
+    had to detour, ``trace`` is None and ``path`` carries the walked
+    polyline (KiCad linearizes arcs it detours around; see plan §3.3).
+    """
 
     path: list[tuple[float, float]]
     shoved_tracks: list[TrackObstacle] = field(default_factory=list)
+    arcs: list[ArcSeg] = field(default_factory=list)
+    trace: Trace | None = None
 
 
 def route_engine(
@@ -52,21 +61,39 @@ def route_engine(
 ) -> EngineResult:
     """Route ``start`` → ``end`` through the obstacle set with walkaround
     + shove, returning the final polyline and the pushed tracks."""
-    skeleton = build_initial_trace(start, end, corner_mode).as_polyline(arc_pts=16)
+    trace = build_initial_trace(start, end, corner_mode)
+    skeleton = trace.as_polyline(arc_pts=16)
 
     # Movable: simple rect tracks shovable at their endpoints' disposal.
     # Everything else (vias, pads, keepouts, arcs) is fixed.
+    # Prefer the exact segment endpoints recorded by the world model —
+    # reverse-deriving the centerline from the buffered rect flips the
+    # axis for tracks shorter than their width (0.2 mm tap-in segment
+    # inside a 0.5 mm pad entry).  Tracks with no metadata fall back to
+    # the rect-geometry derivation.  Sub-width tracks are left fixed:
+    # shoving a track shorter than it is wide has no well-defined
+    # displacement direction, so treat it as a solid.
     movable: list[TrackObstacle] = []
     movable_shapes: list[Obstacle] = []
     for obs in obstacles:
         if obs.kind != "track":
             continue
-        centerline = _track_centerline(obs.shape)
-        if centerline is None:
-            continue
+        if obs.track_centerline is not None and obs.track_width is not None:
+            centerline = list(obs.track_centerline)
+            width_obs = obs.track_width
+        else:
+            centerline = _track_centerline(obs.shape)
+            if centerline is None:
+                continue
+            width_obs = _track_width(obs.shape)
+        seg_len = math.hypot(
+            centerline[1][0] - centerline[0][0], centerline[1][1] - centerline[0][1]
+        )
+        if seg_len <= width_obs:
+            continue  # degenerate short tap-in: fixed solid, not shovable
         track = TrackObstacle(
             points=tuple(centerline),
-            width=_track_width(obs.shape),
+            width=width_obs,
             net=obs.net,
             layer=sorted(obs.layers)[0] if obs.layers else None,
         )
@@ -90,7 +117,20 @@ def route_engine(
     else:
         out_path = walked
         pushed = []
-    return EngineResult(path=out_path, shoved_tracks=pushed)
+
+    # Rounded skeleton arcs survive only when walkaround left the path
+    # untouched (a detour linearizes the arc it goes around).
+    arcs: list[ArcSeg] = []
+    kept_trace: Trace | None = None
+    if out_path == skeleton and not pushed:
+        arcs = [a for a in trace.arcs if a is not None]
+        kept_trace = trace
+    return EngineResult(
+        path=out_path,
+        shoved_tracks=pushed,
+        arcs=arcs,
+        trace=kept_trace,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -175,13 +215,16 @@ def _rect_medians(
 
 def _track_centerline(poly) -> list[tuple[float, float]] | None:
     """Centerline of a track-obstacle rect (long axis endpoints), or
-    None if the shape is not a simple 4-vertex rectangle (e.g. arcs)."""
+    None if the shape is not a simple 4-vertex rectangle (e.g. arcs) or
+    the axis is ambiguous (near-square)."""
     if poly is None or poly.is_empty or len(poly.exterior.coords) != 5:
         return None
     med = _rect_medians(poly)
     if med is None:
         return None
-    a, b, _, _ = med
+    a, b, long_len, short_len = med
+    if long_len <= 0.0 or short_len / long_len > 0.8:
+        return None  # near-square: direction is not well-defined
     return [a, b]
 
 
