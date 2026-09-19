@@ -15,6 +15,10 @@ Connect pads belonging to the same net with DRC-clean tracks.
    for a single copper layer, or ``connect_pads=["J1.2", "J2.2"]`` to overlay
    green ratsnest lines on the pads that still need connecting.  The tool
    returns the board PNG — inspect the image before routing.
+   **If the active model is not a vision model (vision disabled), skip this
+   render step entirely** — you cannot see the image, and its data is not
+   needed to route; rely on the get_ratsnest coordinates and the error
+   messages instead.
 3. Connect ONE pad pair at a time with **pcb_route_pad_to_pad**:
    ``ref_a``/``pad_a``/``ref_b``/``pad_b``/``net`` are required; pass
    ``layer_hint`` for thru-hole pads, ``via_pairs`` to allow layer
