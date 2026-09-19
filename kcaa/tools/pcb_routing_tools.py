@@ -18,7 +18,7 @@ from typing import Any
 from fastmcp import Context, FastMCP
 import sexpdata
 
-from kcaa.router.path_postprocess import OutputSegment, OutputVia
+from kcaa.router.path_postprocess import OutputArc, OutputSegment, OutputVia
 from kcaa.router.router import (
     RouteFailure,
     RouteRequest,
@@ -47,13 +47,16 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
         layer_hint: str | None = None,
         via_pairs: tuple[tuple[str, str], ...] | None = None,
         turn_penalty: float | None = None,
+        corner_mode: str = "mitered45",
     ) -> dict[str, Any]:
         """Connect two pads with an obstacle-avoiding track, optionally across layers.
 
-        Uses the no-shove PNS router: if the path is blocked by an existing
-        track or footprint courtyard, the call fails rather than moving
-        anything.  Run the placement tools first to clear the way, or call
-        again with a different ``layer_hint``.
+        Uses the PNS router: the route walks around fixed obstacles
+        (pads, vias, keepouts) and shoves movable tracks out of the way
+        (chain propagation, depth cap).  ``corner_mode`` picks the corner
+        style: ``mitered45`` (default) / ``mitered90`` for straight
+        corners, ``rounded45`` / ``rounded90`` for rounded-corner arcs
+        (emitted as ``(arc ...)`` nodes on an unobstructed skeleton).
 
         PCB coordinates: mm, +X right, **+Y down**, rotation
         **CCW-positive on screen** (KiCad PCB convention).
@@ -88,13 +91,19 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
             turn_penalty: Cost added when the path changes direction (mm).
                 ``None`` uses the default (0.3 mm).  Set to 0 for pure
                 shortest-path routing (more zigzag).
+            corner_mode: ``mitered45`` | ``rounded45`` | ``rounded90`` |
+                ``mitered90``.  Rounded modes emit arc track nodes on an
+                unobstructed skeleton (a detour linearizes them).
 
         Returns:
             dict with:
-                segment_count: number of segments written.
-                segments: list of dicts ``{x1, y1, x2, y2, width, layer, net}``.
-                via_count: number of vias written (0 for single-layer).
-                vias: list of dicts ``{x, y, diameter, drill, layers, net}``.
+                segment_count / segments: track segments written.
+                arc_count / arcs: rounded-corner arcs written
+                    (``{start, mid, end, width, layer, net}`` each).
+                shoved: list of tracks that were pushed out of the way
+                    (``{net, layer, width, points}`` each).
+                corner_mode: echoed corner_mode.
+                via_count / vias: vias written (0 for single-layer).
                 layers_used: ordered list of layers touched by the path.
                 start: ``(x, y)`` exit point of pad_a.
                 end: ``(x, y)`` entry point of pad_b.
@@ -116,6 +125,7 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
             width=width,
             via_pairs=via_pairs or (),
             turn_penalty=turn_penalty if turn_penalty is not None else 0.3,
+            corner_mode=corner_mode,
         )
         try:
             result = auto_route_pair(req)
@@ -124,10 +134,12 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
         except (FileNotFoundError, ValueError) as exc:
             return {"error": f"Routing input error: {exc}"}
 
-        # Load the PCB and append the new segments and vias.
+        # Load the PCB and append the new segments, arcs and vias.
         data = load_pcb(pcb_path)
         for seg in result.segments:
             data.append(_segment_to_sexp(seg))
+        for arc in result.arcs:
+            data.append(_arc_to_sexp(arc))
         for via in result.vias:
             data.append(_via_to_sexp(via))
         try:
@@ -149,6 +161,28 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
                 }
                 for s in result.segments
             ],
+            "arc_count": len(result.arcs),
+            "arcs": [
+                {
+                    "start": list(a.start),
+                    "mid": list(a.mid),
+                    "end": list(a.end),
+                    "width": a.width,
+                    "layer": a.layer,
+                    "net": a.net,
+                }
+                for a in result.arcs
+            ],
+            "shoved": [
+                {
+                    "net": t.net,
+                    "layer": t.layer,
+                    "points": [list(pt) for pt in t.points],
+                    "width": t.width,
+                }
+                for t in result.shoved_tracks
+            ],
+            "corner_mode": result.corner_mode,
             "via_count": len(result.vias),
             "vias": [
                 {
@@ -588,6 +622,19 @@ def _via_to_sexp(via: OutputVia) -> list:
         [sexpdata.Symbol("drill"), via.drill],
         layers_node,
         [sexpdata.Symbol("net"), via.net],
+    ]
+
+
+def _arc_to_sexp(arc: OutputArc) -> list:
+    """Build a (arc ...) node in KiCad's 3-point track form."""
+    return [
+        sexpdata.Symbol("arc"),
+        [sexpdata.Symbol("start"), arc.start[0], arc.start[1]],
+        [sexpdata.Symbol("mid"), arc.mid[0], arc.mid[1]],
+        [sexpdata.Symbol("end"), arc.end[0], arc.end[1]],
+        [sexpdata.Symbol("width"), arc.width],
+        [sexpdata.Symbol("layer"), arc.layer],
+        [sexpdata.Symbol("net"), arc.net],
     ]
 
 

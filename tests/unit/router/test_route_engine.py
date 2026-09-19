@@ -78,9 +78,9 @@ class TestRectExtraction:
         assert endpoints == {(0.0, 0.0), (10.0, 10.0)}
 
     def test_non_rect_shape_rejected(self):
-        poly = Polygon([(0, 0), (4, 0), (4, 4), (0, 4)])  # square: 2 equal medians, still rect
-        pts = _track_centerline(poly)
-        assert pts is not None
+        # Square: equal medians, direction ambiguous for a track — rejected.
+        square = Polygon([(0, 0), (4, 0), (4, 4), (0, 4)])
+        assert _track_centerline(square) is None
         # Non-4-vertex (arc buffer) shape rejected.
         arc = LineString([(0, 0), (1, 1), (2, 0)]).buffer(0.2, cap_style="round")
         assert len(arc.exterior.coords) != 5
@@ -178,6 +178,24 @@ class TestRouteEngine:
         d = LineString(pushed.points).distance(LineString(res.path))
         assert d >= CLR + W / 2 - 1e-6
 
+    def test_subwidth_short_track_is_fixed_not_shoved(self):
+        # A track shorter than its width (0.2 mm tap-in inside a 0.5 mm
+        # pad entry) has no well-defined shove direction.  The world
+        # model records its exact centerline + width; the engine treats
+        # it as a fixed solid and routes around it.
+        t = Obstacle(
+            shape=Polygon([(5 - W, -0.1), (5 + W, -0.1), (5 + W, 0.1), (5 - W, 0.1)]),
+            layers=frozenset({"F.Cu"}),
+            net="N2",
+            kind="track",
+            track_centerline=((5.0, -0.1), (5.0, 0.1)),  # 0.2 mm long, W wide
+            track_width=W,
+        )
+        res = route_engine((-8, 0), (8, 0), [_pad(0, 0), t], W, CLR)
+        assert res.shoved_tracks == []
+        assert res.path[0] == (-8, 0) and res.path[-1] == (8, 0)
+        assert LineString(res.path).distance(t.shape) >= CLR - 1e-6
+
     def test_arc_is_fixed_obstacle(self):
         # Arc-shaped track is not movable (no rect centerline): the
         # engine walks around it.
@@ -198,6 +216,46 @@ class TestRouteEngine:
         res45 = route_engine((-8, 0), (8, 8), [], W, CLR, corner_mode=CornerMode.MITERED_45)
         res90 = route_engine((-8, 0), (8, 8), [], W, CLR, corner_mode=CornerMode.MITERED_90)
         assert res45.path != res90.path
+
+    def test_rounded45_keeps_skeleton_arc(self):
+        # No obstacles: a rounded corner in the skeleton must surface as
+        # an EngineResult arc with a consistent radius through mid.
+        import math
+
+        from kcaa.router.pns.direction45 import CornerMode
+
+        res = route_engine((0, 0), (10, 5), [], W, CLR, corner_mode=CornerMode.ROUNDED_45)
+        assert len(res.arcs) == 1
+        a = res.arcs[0]
+        assert a.start == (0, 0)
+        # The arc spans the first skeleton leg; the remaining leg is a
+        # straight segment to the destination.
+        assert res.path[-1] == (10, 5)
+        cx, cy = a.center()
+        for pt in (a.start, a.mid, a.end):
+            r = math.hypot(pt[0] - cx, pt[1] - cy)
+            assert r == pytest.approx(a.radius)
+
+    def test_rounded45_detour_linearizes_arc(self):
+        # An obstacle on the way forces a walkaround; the arc is
+        # linearized (KiCad does not keep an arc through a detour).
+        from kcaa.router.pns.direction45 import CornerMode
+
+        wall = Obstacle(
+            shape=Polygon([(5, 0), (6, 0), (6, 6), (5, 6)]),
+            layers=frozenset({"F.Cu"}),
+            net=None,
+            kind="pad",
+        )
+        res = route_engine((0, 0), (10, 5), [wall], W, CLR, corner_mode=CornerMode.ROUNDED_45)
+        assert res.arcs == []
+        assert res.path[0] == (0, 0) and res.path[-1] == (10, 5)
+
+    def test_mitered45_never_emits_arcs(self):
+        from kcaa.router.pns.direction45 import CornerMode
+
+        res = route_engine((0, 0), (10, 5), [], W, CLR, corner_mode=CornerMode.MITERED_45)
+        assert res.arcs == []
 
 
 class TestMovableExtraction:
