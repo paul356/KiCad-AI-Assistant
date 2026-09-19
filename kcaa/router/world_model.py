@@ -124,6 +124,10 @@ def build_world_model(
             obs = _segment_obstacle(item, net_filter)
             if obs is not None:
                 model.obstacles.append(obs)
+        elif tag == "arc":
+            obs = _arc_obstacle(item, net_filter)
+            if obs is not None:
+                model.obstacles.append(obs)
         elif tag == "via":
             obs = _via_obstacle(item, net_filter)
             if obs is not None:
@@ -278,6 +282,58 @@ def _oriented_rect(x1: float, y1: float, x2: float, y2: float, width: float) -> 
             (x2 - px, y2 - py),
             (x1 - px, y1 - py),
         ]
+    )
+
+
+def _arc_obstacle(arc_node: list[Any], net_filter: str | None) -> Obstacle | None:
+    """Build a track obstacle from an ``arc`` node (3-point form).
+
+    KiCad 9+ ``(arc (start X Y) (mid X Y) (end X Y) (width W) (layer L)
+    (net N))`` — the arc is sampled to a polyline (via the PNS ArcSeg
+    3-point reconstruction) and buffered by half the width, mirroring
+    ``_segment_obstacle`` semantics.
+    """
+    start = _node_xy(arc_node, "start")
+    mid = _node_xy(arc_node, "mid")
+    end = _node_xy(arc_node, "end")
+    if start is None or mid is None or end is None:
+        return None
+    w_sub = _get_sub(arc_node, "width")
+    if w_sub is None or len(w_sub) < 2:
+        return None
+    try:
+        width = float(w_sub[1])
+    except (TypeError, ValueError):
+        return None
+    layer = _get_layer_str(arc_node)
+    if layer is None:
+        return None
+    net = _get_net(arc_node)
+    if net_filter is not None and net == net_filter:
+        # Same-net arcs don't block — part of the route being built.
+        return None
+
+    try:
+        from kcaa.router.pns.direction45 import ArcSeg
+
+        center = ArcSeg(start=start, mid=mid, end=end, radius=0.0).center()
+        radius = math.hypot(start[0] - center[0], start[1] - center[1])
+        if radius < 1e-9:
+            return None
+        arc = ArcSeg(start=start, mid=mid, end=end, radius=radius)
+        sample = arc.as_polyline(n=16)
+    except (ValueError, ZeroDivisionError):
+        return None
+    if len(sample) < 2:
+        return None
+    shape = LineString(sample).buffer(width / 2.0, cap_style="round")
+    if shape.is_empty:
+        return None
+    return Obstacle(
+        shape=shape,
+        layers=frozenset({layer}),
+        net=net,
+        kind="track",
     )
 
 
