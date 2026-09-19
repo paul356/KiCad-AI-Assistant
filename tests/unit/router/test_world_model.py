@@ -63,6 +63,7 @@ def _make_pcb(
     segments: list[list] | None = None,
     vias: list[list] | None = None,
     zones: list[list] | None = None,
+    arcs: list[list] | None = None,
 ) -> list:
     pcb = [
         _sym("kicad_pcb"),
@@ -71,6 +72,7 @@ def _make_pcb(
     ]
     pcb.extend(footprints or [])
     pcb.extend(segments or [])
+    pcb.extend(arcs or [])
     pcb.extend(vias or [])
     pcb.extend(zones or [])
     return pcb
@@ -232,6 +234,78 @@ class TestTrackObstacle:
         assert m.obstacles == []
         m2 = build_world_model(path, net_filter="GND")
         assert len(m2.obstacles) == 1
+
+
+# ---------------------------------------------------------------------------
+# Arc obstacles
+# ---------------------------------------------------------------------------
+
+
+class TestArcObstacle:
+    def test_arc_becomes_track_obstacle(self, tmp_path):
+        arc = [
+            _sym("arc"),
+            [_sym("start"), 0.0, 0.0],
+            [_sym("mid"), 1.0, 1.0],
+            [_sym("end"), 2.0, 0.0],
+            [_sym("width"), 0.3],
+            [_sym("layer"), "F.Cu"],
+            [_sym("net"), "VCC"],
+        ]
+        path = _write_pcb(tmp_path, _make_pcb(arcs=[arc]))
+        m = build_world_model(path)
+        assert len(m.obstacles) == 1
+        o = m.obstacles[0]
+        assert o.kind == "track"
+        assert o.layers == frozenset({"F.Cu"})
+        assert o.net == "VCC"
+        # The half-circle (0,0)->(2,0) r=1: buffered by width/2, must
+        # cover the mid point and be a solid filled polygon.
+        from shapely.geometry import Point
+
+        assert o.shape.covers(Point(1.0, 1.0))
+        assert o.shape.area > 0.0
+
+    def test_arc_net_filter(self, tmp_path):
+        arc = [
+            _sym("arc"),
+            [_sym("start"), 0.0, 0.0],
+            [_sym("mid"), 1.0, 1.0],
+            [_sym("end"), 2.0, 0.0],
+            [_sym("width"), 0.3],
+            [_sym("layer"), "F.Cu"],
+            [_sym("net"), "VCC"],
+        ]
+        path = _write_pcb(tmp_path, _make_pcb(arcs=[arc]))
+        assert build_world_model(path, net_filter="VCC").obstacles == []
+        assert len(build_world_model(path, net_filter="GND").obstacles) == 1
+
+    def test_degenerate_arc_skipped(self, tmp_path):
+        # Collinear points: no circle, must not crash and yield no obstacle.
+        arc = [
+            _sym("arc"),
+            [_sym("start"), 0.0, 0.0],
+            [_sym("mid"), 1.0, 0.0],
+            [_sym("end"), 2.0, 0.0],
+            [_sym("width"), 0.3],
+            [_sym("layer"), "F.Cu"],
+            [_sym("net"), "VCC"],
+        ]
+        path = _write_pcb(tmp_path, _make_pcb(arcs=[arc]))
+        m = build_world_model(path)
+        assert m.obstacles == []
+
+    def test_missing_width_arc_skipped(self, tmp_path):
+        arc = [
+            _sym("arc"),
+            [_sym("start"), 0.0, 0.0],
+            [_sym("mid"), 1.0, 1.0],
+            [_sym("end"), 2.0, 0.0],
+            [_sym("layer"), "F.Cu"],
+            [_sym("net"), "VCC"],
+        ]
+        path = _write_pcb(tmp_path, _make_pcb(arcs=[arc]))
+        assert build_world_model(path).obstacles == []
 
 
 # ---------------------------------------------------------------------------
