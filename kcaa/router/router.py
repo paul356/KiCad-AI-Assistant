@@ -49,6 +49,7 @@ from shapely.geometry import box as _shapely_box
 
 from kcaa.router.grid_a_star import (
     GRID_RESOLUTION,
+    hierarchical_a_star,
     multi_layer_a_star,
     path_to_nodes,
     shortcut_path,
@@ -149,6 +150,9 @@ class RouteRequest:
         turn_penalty: Distance-equivalent cost added when the path
             changes direction.  0 disables (pure shortest path).
             Default 0.3 mm ~ 3 cells at 0.1 mm resolution.
+        algorithm: Routing algorithm to use: ``astar`` (default,
+            grid-based A*) or ``pns`` (walkaround + shove engine).
+            A single route always uses exactly one algorithm.
     """
 
     pcb_path: str
@@ -167,6 +171,7 @@ class RouteRequest:
     grid_resolution: float | None = None  # None -> GRID_RESOLUTION
     via_cost: float = 2.0  # mm penalty per via edge
     turn_penalty: float = 0.3  # mm penalty per direction change; 0 disables
+    algorithm: str = "astar"  # astar (grid A*) | pns (walkaround + shove)
     corner_mode: str = "mitered45"  # mitered45 | rounded45 | rounded90 (mitered90)
 
 
@@ -184,6 +189,7 @@ class RouteResult:
         layers_used: The copper layers the route actually traversed, in
             order. Useful for callers that want to know whether a via
             was inserted (``len(layers_used) > 1``).
+        algorithm: The routing algorithm that produced this route.
     """
 
     segments: list[OutputSegment] = field(default_factory=list)
@@ -191,6 +197,7 @@ class RouteResult:
     arcs: list[OutputArc] = field(default_factory=list)
     shoved_tracks: list[TrackObstacle] = field(default_factory=list)
     corner_mode: str = "mitered45"
+    algorithm: str = "astar"
     start: tuple[float, float] = (0.0, 0.0)
     end: tuple[float, float] = (0.0, 0.0)
     layers_used: list[str] = field(default_factory=list)
@@ -216,6 +223,17 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
         RouteFailure: If no path is found or inputs are invalid.
     """
     data = load_pcb(req.pcb_path)
+
+    # Validate the routing algorithm selector early.
+    if req.algorithm not in ("astar", "pns"):
+        raise RouteFailure(
+            f"algorithm={req.algorithm!r} is invalid; supported values are "
+            f"'astar' (default, grid-based) and 'pns' (walkaround + shove)."
+        )
+
+    # Validate corner_mode early: both planners must reject an unknown
+    # value even though only the PNS engine renders arcs.
+    corner_mode = _parse_corner_mode(req.corner_mode)
 
     # Validate via_pairs against the PCB layers early.
     pcb_layers = _pcb_layer_names(data)
@@ -495,118 +513,209 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
                 )
             )
 
-    if start_layer != end_layer:
-        # -- Multi-layer: grid A* with via edges ----------------------
-        # Via-forbidden zones cover EVERY same-net pad, not just the two
-        # endpoint pads: a via on any same-net pad face is a DFM defect
-        # (solder wicking, annular-ring breakout).  Same-net pads are
-        # absent from the obstacle grid (the route must land on its own
-        # pads), so without this the via search would happily drop a via
-        # on a finger pad.
-        via_forbidden: list = []
-        for poly, _players, _ref, _pname, _center in _same_net_pad_polygons(data, req.net):
-            via_forbidden.append(poly)
-        ml_result = multi_layer_a_star(
-            obstacles_by_layer,
-            pad_a_xy,
-            pad_b_xy,
-            start_layer,
-            end_layer,
-            req.via_pairs,
-            route_bbox,
-            grid_res,
-            via_cost=req.via_cost,
-            via_forbidden_zones=via_forbidden or None,
-            turn_penalty=req.turn_penalty,
-        )
-        if ml_result.path is None:
-            # Dump the failure state so the blockage can be inspected.
-            _dump_viz("fail-multi-astar", [], _pad_viz, buffered, route_bbox)
-            raise RouteFailure(
-                f"No obstacle-avoiding multi-layer path from "
-                f"{req.ref_a}/{req.pad_a} to {req.ref_b}/{req.pad_b} at "
-                f"{width}mm track width ({start_layer} -> {end_layer})."
+    if req.algorithm == "astar":
+        # -- Grid A* (default) ---------------------------------------
+        if start_layer != end_layer:
+            # -- Multi-layer: grid A* with via edges ------------------
+            # Via-forbidden zones cover EVERY same-net pad, not just the two
+            # endpoint pads: a via on any same-net pad face is a DFM defect
+            # (solder wicking, annular-ring breakout).  Same-net pads are
+            # absent from the obstacle grid (the route must land on its own
+            # pads), so without this the via search would happily drop a via
+            # on a finger pad.
+            via_forbidden: list = []
+            for poly, _players, _ref, _pname, _center in _same_net_pad_polygons(data, req.net):
+                via_forbidden.append(poly)
+            ml_result = multi_layer_a_star(
+                obstacles_by_layer,
+                pad_a_xy,
+                pad_b_xy,
+                start_layer,
+                end_layer,
+                req.via_pairs,
+                route_bbox,
+                grid_res,
+                via_cost=req.via_cost,
+                via_forbidden_zones=via_forbidden or None,
+                turn_penalty=req.turn_penalty,
             )
-        print(
-            f"  [route] multi-layer A*: {len(ml_result.path)} pts"
-            f"  cells_visited={ml_result.cells_visited}"
-        )
+            if ml_result.path is None:
+                # Dump the failure state so the blockage can be inspected.
+                _dump_viz("fail-multi-astar", [], _pad_viz, buffered, route_bbox)
+                raise RouteFailure(
+                    f"No obstacle-avoiding multi-layer path from "
+                    f"{req.ref_a}/{req.pad_a} to {req.ref_b}/{req.pad_b} at "
+                    f"{width}mm track width ({start_layer} -> {end_layer})."
+                )
+            print(
+                f"  [route] multi-layer A*: {len(ml_result.path)} pts"
+                f"  cells_visited={ml_result.cells_visited}"
+            )
 
-        # Group GridNode by layer, run per-segment postprocess.
-        from itertools import groupby
+            # Group GridNode by layer, run per-segment postprocess.
+            from itertools import groupby
 
-        groups = [
-            (layer, list(grp)) for layer, grp in groupby(ml_result.path, key=lambda n: n.layer)
-        ]
-        all_nodes: list[RouteNode] = []
-        node_id = 0
-        for gi, (layer, nodes) in enumerate(groups):
-            pts = [(n.x, n.y) for n in nodes]
-            if len(pts) < 2:
-                # Single-point segment (e.g. layer transition without
-                # meaningful path on the layer).  Keep the point for
-                # via continuity but skip postprocessing.
-                for n in nodes:
-                    all_nodes.append(RouteNode(x=n.x, y=n.y, layer=layer, node_id=node_id))
+            groups = [
+                (layer, list(grp)) for layer, grp in groupby(ml_result.path, key=lambda n: n.layer)
+            ]
+            all_nodes: list[RouteNode] = []
+            node_id = 0
+            for gi, (layer, nodes) in enumerate(groups):
+                pts = [(n.x, n.y) for n in nodes]
+                if len(pts) < 2:
+                    # Single-point segment (e.g. layer transition without
+                    # meaningful path on the layer).  Keep the point for
+                    # via continuity but skip postprocessing.
+                    for n in nodes:
+                        all_nodes.append(RouteNode(x=n.x, y=n.y, layer=layer, node_id=node_id))
+                        node_id += 1
+                    continue
+                obs = obstacles_by_layer.get(layer, [])
+                prefix = f"layer-{layer}"
+                is_first = gi == 0
+                is_last = gi == len(groups) - 1
+
+                _dump_viz(f"{prefix}-0-astar", pts, _pad_viz, obs, route_bbox)
+
+                # Pad replacement (start/end segments only).
+                if is_first and pad_a_size is not None:
+                    n_before = len(pts)
+                    pts = _replace_pad_path(pts, pad_a_xy, pad_a_size, from_center=True)
+                    _log_path(f"{prefix}-pad-replace", pts, n_before)
+                elif is_last and pad_b_size is not None:
+                    n_before = len(pts)
+                    pts = _replace_pad_path(pts, pad_b_xy, pad_b_size, from_center=False)
+                    _log_path(f"{prefix}-pad-replace", pts, n_before)
+                _dump_viz(f"{prefix}-1-pad-replace", pts, _pad_viz, obs, route_bbox)
+
+                # Simplify -> shortcut -> snap45.
+                pts = _postprocess_layer_segment(pts, obs, route_bbox, grid_res, prefix, _pad_viz)
+
+                # Align endpoint to pad centre (start/end segments only).
+                if is_first and pad_a_size is not None:
+                    pts = _align_single_endpoint(
+                        pts, pad_a_xy, obs, route_bbox, grid_res, pad_a_size, from_center=True
+                    )
+                elif is_last and pad_b_size is not None:
+                    pts = _align_single_endpoint(
+                        pts, pad_b_xy, obs, route_bbox, grid_res, pad_b_size, from_center=False
+                    )
+                _dump_viz(f"{prefix}-6-align", pts, _pad_viz, obs, route_bbox)
+
+                for x, y in pts:
+                    all_nodes.append(RouteNode(x=x, y=y, layer=layer, node_id=node_id))
                     node_id += 1
-                continue
-            obs = obstacles_by_layer.get(layer, [])
-            prefix = f"layer-{layer}"
-            is_first = gi == 0
-            is_last = gi == len(groups) - 1
 
-            _dump_viz(f"{prefix}-0-astar", pts, _pad_viz, obs, route_bbox)
+            segs, vias = postprocess_path(
+                all_nodes,
+                width=width,
+                net=req.net,
+                max_miter_mm=req.max_miter_mm,
+                via_diameter_mm=via_diameter,
+                via_drill_mm=via_drill,
+                _obstacles=buffered,
+                _pad_rects=_pad_rects or None,
+            )
+            segs = [s for s in segs if abs(s.x1 - s.x2) > 1e-6 or abs(s.y1 - s.y2) > 1e-6]
+            _log_output_segments("final", segs)
+            _dump_viz_segments("7-final", segs, _pad_viz, buffered, route_bbox)
 
-            # Pad replacement (start/end segments only).
-            if is_first and pad_a_size is not None:
-                n_before = len(pts)
-                pts = _replace_pad_path(pts, pad_a_xy, pad_a_size, from_center=True)
-                _log_path(f"{prefix}-pad-replace", pts, n_before)
-            elif is_last and pad_b_size is not None:
-                n_before = len(pts)
-                pts = _replace_pad_path(pts, pad_b_xy, pad_b_size, from_center=False)
-                _log_path(f"{prefix}-pad-replace", pts, n_before)
-            _dump_viz(f"{prefix}-1-pad-replace", pts, _pad_viz, obs, route_bbox)
+            # Multi-layer routing emits straight segments only; rounded
+            # corner arcs are a single-layer skeleton feature.
+            arcs_out: list[OutputArc] = []
+            pushed: list[TrackObstacle] = []
 
-            # Simplify -> shortcut -> snap45.
-            pts = _postprocess_layer_segment(pts, obs, route_bbox, grid_res, prefix, _pad_viz)
-
-            # Align endpoint to pad centre (start/end segments only).
-            if is_first and pad_a_size is not None:
-                pts = _align_single_endpoint(
-                    pts, pad_a_xy, obs, route_bbox, grid_res, pad_a_size, from_center=True
+            start_xy = (all_nodes[0].x, all_nodes[0].y)
+            end_xy = (all_nodes[-1].x, all_nodes[-1].y)
+            layers_used = _layers_used(all_nodes)
+        else:
+            # -- Single-layer: hierarchical A* ------------------------
+            # Only copper on the routing layer can block the track; other
+            # layers are parallel physical planes and must not poison the
+            # grid (the multi-layer branch groups by layer for the same
+            # reason).
+            layer_obstacles = obstacles_by_layer[start_layer]
+            result = hierarchical_a_star(
+                layer_obstacles,
+                pad_a_xy,
+                pad_b_xy,
+                fine_resolution=grid_res,
+                route_bbox=route_bbox,
+                turn_penalty=req.turn_penalty,
+            )
+            if result.path is None:
+                _dump_viz("fail-astar", [], _pad_viz, layer_obstacles, route_bbox)
+                raise RouteFailure(
+                    f"No obstacle-avoiding path from {req.ref_a}/{req.pad_a} to "
+                    f"{req.ref_b}/{req.pad_b} at {width}mm track width on layer "
+                    f"{start_layer}."
                 )
-            elif is_last and pad_b_size is not None:
-                pts = _align_single_endpoint(
-                    pts, pad_b_xy, obs, route_bbox, grid_res, pad_b_size, from_center=False
+            print(
+                f"  [route] single-layer A*: {len(result.path)} pts"
+                f"  cells_visited={result.cells_visited}"
+            )
+
+            # Strip layer_idx from the unified A* result.
+            raw_pts = [(x, y) for x, y, _ in result.path]
+            _dump_viz("0-astar", raw_pts, _pad_viz, buffered, route_bbox)
+
+            # ---- Discard A* path inside rectangular pads and replace
+            #      with axis-aligned wire (fence -> centre). ----
+            best_path_pts = raw_pts
+            if pad_a_size is not None:
+                n_before = len(best_path_pts)
+                best_path_pts = _replace_pad_path(
+                    best_path_pts, pad_a_xy, pad_a_size, from_center=True
                 )
-            _dump_viz(f"{prefix}-6-align", pts, _pad_viz, obs, route_bbox)
+                _log_path("pad_a-replace", best_path_pts, n_before)
+            if pad_b_size is not None:
+                n_before = len(best_path_pts)
+                best_path_pts = _replace_pad_path(
+                    best_path_pts, pad_b_xy, pad_b_size, from_center=False
+                )
+                _log_path("pad_b-replace", best_path_pts, n_before)
+            _dump_viz("1-pad-replace", best_path_pts, _pad_viz, buffered, route_bbox)
 
-            for x, y in pts:
-                all_nodes.append(RouteNode(x=x, y=y, layer=layer, node_id=node_id))
-                node_id += 1
+            # ---- Post-process: simplify -> shortcut -> snap45 ----
+            best_path_pts = _postprocess_layer_segment(
+                best_path_pts, buffered, route_bbox, grid_res, "", _pad_viz
+            )
 
-        segs, vias = postprocess_path(
-            all_nodes,
-            width=width,
-            net=req.net,
-            max_miter_mm=req.max_miter_mm,
-            via_diameter_mm=via_diameter,
-            via_drill_mm=via_drill,
-            _obstacles=buffered,
-            _pad_rects=_pad_rects or None,
-        )
-        segs = [s for s in segs if abs(s.x1 - s.x2) > 1e-6 or abs(s.y1 - s.y2) > 1e-6]
-        _log_output_segments("final", segs)
-        _dump_viz_segments("7-final", segs, _pad_viz, buffered, route_bbox)
+            # ---- Align path endpoints with exact pad centres ----
+            best_path_pts = _align_path_endpoints(
+                best_path_pts,
+                pad_a_xy,
+                pad_b_xy,
+                buffered,
+                route_bbox,
+                grid_res,
+                pad_a_size=pad_a_size,
+                pad_b_size=pad_b_size,
+            )
+            _log_path("align-endpoints", best_path_pts)
+            _dump_viz("6-align-endpoints", best_path_pts, _pad_viz, buffered, route_bbox)
 
-        # Multi-layer routing emits straight segments only; rounded
-        # corner arcs are a single-layer skeleton feature.
-        arcs_out: list[OutputArc] = []
+            path_nodes = path_to_nodes(best_path_pts, start_layer)
+            segs, vias = postprocess_path(
+                path_nodes,
+                width=width,
+                net=req.net,
+                max_miter_mm=req.max_miter_mm,
+                _obstacles=buffered,
+                _pad_rects=_pad_rects or None,
+            )
+            segs = [s for s in segs if abs(s.x1 - s.x2) > 1e-6 or abs(s.y1 - s.y2) > 1e-6]
+            _log_output_segments("final", segs)
+            _dump_viz_segments("7-final", segs, _pad_viz, buffered, route_bbox)
 
-        start_xy = (all_nodes[0].x, all_nodes[0].y)
-        end_xy = (all_nodes[-1].x, all_nodes[-1].y)
-        layers_used = _layers_used(all_nodes)
+            # Single-layer A* emits straight segments only; rounded
+            # corner arcs are a PNS-skeleton feature.
+            arcs_out: list[OutputArc] = []
+            pushed: list[TrackObstacle] = []
+
+            start_xy = (path_nodes[0].x, path_nodes[0].y)
+            end_xy = (path_nodes[-1].x, path_nodes[-1].y)
+            layers_used = _layers_used(path_nodes)
     else:
         # -- Single-layer: PNS engine (walkaround + shove) ------------
         # Only copper on the routing layer can block the track; other
@@ -621,6 +730,14 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
         # its own pads) is re-added here as transit obstacles, unbuffered
         # — a track may terminate on a pad but never run across its
         # copper (a drill hole severs any crossing track).
+        # The PNS engine is single-layer only: multi-layer routes keep
+        # using the grid A* planner.  Reject the unsupported combo
+        # explicitly instead of silently degrading.
+        if start_layer != end_layer:
+            raise RouteFailure(
+                f"algorithm='pns' does not support multi-layer routing "
+                f"({start_layer} -> {end_layer}); use algorithm='astar'."
+            )
         engine_obstacles: list[Obstacle] = [o for o in model.obstacles if start_layer in o.layers]
         for poly, players, _ref, _pname, center in _same_net_pad_polygons(data, req.net):
             is_end = (
@@ -637,7 +754,7 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
                         kind="pad",
                     )
                 )
-        corner_mode = _parse_corner_mode(req.corner_mode)
+        # corner_mode already validated + parsed at entry (line 236).
         try:
             eng = route_engine(
                 pad_a_xy,
@@ -660,6 +777,7 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
             f"  [route] PNS: {len(eng.path)} pts"
             f"  shoved={len(eng.shoved_tracks)}  arcs={len(eng.arcs)}"
         )
+        pushed: list[TrackObstacle] = eng.shoved_tracks
 
         if eng.trace is not None:
             # Embargo-free skeleton: emit anchor points and arcs straight
@@ -795,8 +913,9 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
         segments=segs,
         vias=vias,
         arcs=arcs_out,
-        shoved_tracks=eng.shoved_tracks if start_layer == end_layer else [],
+        shoved_tracks=pushed,
         corner_mode=req.corner_mode,
+        algorithm=req.algorithm,
         start=start_xy,
         end=end_xy,
         layers_used=layers_used,

@@ -48,12 +48,15 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
         via_pairs: tuple[tuple[str, str], ...] | None = None,
         turn_penalty: float | None = None,
         corner_mode: str = "mitered45",
+        algorithm: str = "astar",
     ) -> dict[str, Any]:
         """Connect two pads with an obstacle-avoiding track, optionally across layers.
 
-        Uses the PNS router: the route walks around fixed obstacles
-        (pads, vias, keepouts) and shoves movable tracks out of the way
-        (chain propagation, depth cap).  ``corner_mode`` picks the corner
+        Uses ``algorithm`` to route: ``astar`` (default) runs the grid A*
+        planner (hierarchical grid on a single layer, multi-layer A* with
+        via edges across layers); ``pns`` runs the walkaround + shove
+        engine (single-layer only — combining ``pns`` with a multi-layer
+        route raises a RouteFailure).  ``corner_mode`` picks the corner
         style: ``mitered45`` (default) / ``mitered90`` for straight
         corners, ``rounded45`` / ``rounded90`` for rounded-corner arcs
         (emitted as ``(arc ...)`` nodes on an unobstructed skeleton).
@@ -94,6 +97,10 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
             corner_mode: ``mitered45`` | ``rounded45`` | ``rounded90`` |
                 ``mitered90``.  Rounded modes emit arc track nodes on an
                 unobstructed skeleton (a detour linearizes them).
+            algorithm: ``astar`` (default) grid-based A* planner;
+                ``pns`` walkaround + shove engine.  A route always uses
+                exactly one algorithm.  ``pns`` is single-layer only —
+                multi-layer routes must use ``astar``.
 
         Returns:
             dict with:
@@ -103,6 +110,7 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
                 shoved: list of tracks that were pushed out of the way
                     (``{net, layer, width, points}`` each).
                 corner_mode: echoed corner_mode.
+                algorithm: echoed algorithm (``astar`` | ``pns``).
                 via_count / vias: vias written (0 for single-layer).
                 layers_used: ordered list of layers touched by the path.
                 start: ``(x, y)`` exit point of pad_a.
@@ -126,6 +134,7 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
             via_pairs=via_pairs or (),
             turn_penalty=turn_penalty if turn_penalty is not None else 0.3,
             corner_mode=corner_mode,
+            algorithm=algorithm,
         )
         try:
             result = auto_route_pair(req)
@@ -183,6 +192,7 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
                 for t in result.shoved_tracks
             ],
             "corner_mode": result.corner_mode,
+            "algorithm": result.algorithm,
             "via_count": len(result.vias),
             "vias": [
                 {

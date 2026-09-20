@@ -1232,7 +1232,7 @@ def _route_clear(req_extra: dict, tmp_path: Path):
 def test_engine_rounded45_emits_arc(tmp_path: Path) -> None:
     """corner_mode=rounded45 on an unobstructed skeleton must produce
     OutputArc nodes whose start point sits on the route start pad."""
-    result = _route_clear({"corner_mode": "rounded45"}, tmp_path)
+    result = _route_clear({"corner_mode": "rounded45", "algorithm": "pns"}, tmp_path)
     assert len(result.arcs) == 1
     a = result.arcs[0]
     assert a.width == 0.2
@@ -1250,7 +1250,7 @@ def test_engine_mitered45_no_arcs(tmp_path: Path) -> None:
 
 
 def test_engine_rounded90_arc(tmp_path: Path) -> None:
-    result = _route_clear({"corner_mode": "rounded90"}, tmp_path)
+    result = _route_clear({"corner_mode": "rounded90", "algorithm": "pns"}, tmp_path)
     assert len(result.arcs) == 1
 
 
@@ -1360,3 +1360,126 @@ def _rounded_square(center: tuple[float, float], size: float):
 
     half = size / 2.0
     return box(center[0] - half, center[1] - half, center[0] + half, center[1] + half)
+
+
+# ---------------------------------------------------------------------------
+# algorithm selector — astar (default) vs pns, single route single algorithm
+# ---------------------------------------------------------------------------
+
+
+def _route_board_copy(tmp_path: Path, src: str = "test_routing_board.kicad_pcb") -> Path:
+    """Copy the routing fixture into tmp_path so board+project siblings travel
+    together."""
+    fixture = Path(__file__).resolve().parents[2] / "integration" / "fixtures" / src
+    dst = tmp_path / "board.kicad_pcb"
+    dst.write_text(Path(fixture).read_text())
+    pro = fixture.with_suffix(".kicad_pro")
+    if pro.exists():
+        (tmp_path / pro.name).write_text(Path(pro).read_text())
+    return dst
+
+
+def test_algorithm_astar_single_layer_routes(tmp_path: Path) -> None:
+    """algorithm='astar' on a single-layer pair restores the grid A*
+    behaviour (hierarchical A*); result echoes algorithm."""
+    dst = _route_board_copy(tmp_path)
+    result = auto_route_pair(
+        RouteRequest(
+            pcb_path=str(dst),
+            ref_a="R1",
+            pad_a="1",
+            ref_b="C1",
+            pad_b="1",
+            net="VCC",
+            width=0.25,
+            clearance=0.2,
+            algorithm="astar",
+        )
+    )
+    assert len(result.segments) > 0
+    assert result.vias == []
+    assert result.algorithm == "astar"
+
+
+def test_algorithm_default_is_astar(tmp_path: Path) -> None:
+    """Omitting algorithm routes with the grid A* planner (pure old
+    behaviour) and echoes 'astar'."""
+    dst = _route_board_copy(tmp_path)
+    result = auto_route_pair(
+        RouteRequest(
+            pcb_path=str(dst),
+            ref_a="R1",
+            pad_a="1",
+            ref_b="C1",
+            pad_b="1",
+            net="VCC",
+            width=0.25,
+            clearance=0.2,
+        )
+    )
+    assert len(result.segments) > 0
+    assert result.algorithm == "astar"
+
+
+def test_algorithm_pns_single_layer_echoes_pns(tmp_path: Path) -> None:
+    """algorithm='pns' routes the same pair with the walkaround + shove
+    engine and echoes 'pns'."""
+    dst = _route_board_copy(tmp_path)
+    result = auto_route_pair(
+        RouteRequest(
+            pcb_path=str(dst),
+            ref_a="R1",
+            pad_a="1",
+            ref_b="C1",
+            pad_b="1",
+            net="VCC",
+            width=0.25,
+            clearance=0.2,
+            algorithm="pns",
+        )
+    )
+    assert len(result.segments) > 0
+    assert result.algorithm == "pns"
+
+
+def test_algorithm_pns_rejects_multi_layer(tmp_path: Path) -> None:
+    """The PNS engine is single-layer only: a multi-layer pair must raise
+    RouteFailure instead of silently degrading to grid A*."""
+    dst = _route_board_copy(tmp_path)
+    req = RouteRequest(
+        pcb_path=str(dst),
+        ref_a="D1",
+        pad_a="1",
+        ref_b="R1",
+        pad_b="2",
+        net="GND",
+        width=0.25,
+        clearance=0.2,
+        algorithm="pns",
+        via_pairs=(("F.Cu", "B.Cu"), ("B.Cu", "In1.Cu")),
+    )
+    with pytest.raises(RouteFailure) as excinfo:
+        auto_route_pair(req)
+    msg = str(excinfo.value)
+    assert "pns" in msg
+    assert "multi-layer" in msg
+
+
+def test_algorithm_invalid_value_raises_route_failure(tmp_path: Path) -> None:
+    """An unknown algorithm value must fail loudly, not fall back to a
+    default planner."""
+    dst = _route_board_copy(tmp_path)
+    req = RouteRequest(
+        pcb_path=str(dst),
+        ref_a="R1",
+        pad_a="1",
+        ref_b="C1",
+        pad_b="1",
+        net="VCC",
+        width=0.25,
+        clearance=0.2,
+        algorithm="bogus",
+    )
+    with pytest.raises(RouteFailure) as excinfo:
+        auto_route_pair(req)
+    assert "algorithm" in str(excinfo.value).lower()
