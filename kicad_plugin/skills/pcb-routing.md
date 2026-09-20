@@ -22,18 +22,28 @@ Connect pads belonging to the same net with DRC-clean tracks.
    ``layer_hint`` for thru-hole pads, ``via_pairs`` to allow layer
    transitions, ``width`` when a non-netclass width is needed, and
    ``corner_mode`` to pick the corner style (``mitered45`` default,
-   ``rounded45``/``rounded90``/``mitered90`` available).
+   ``rounded45``/``rounded90``/``mitered90`` available).  Pass
+   ``algorithm`` to pick the engine: ``astar`` (default) for grid A*,
+   ``pns`` for the walkaround + shove engine.
 4. On a route failure, read the error message, look at the latest layer
    render, and retry with a different ``layer_hint``, a different pair, or a
    via transition.  Do not silently repeat the same call.
 5. Optionally add or delete vias with ``pcb_add_vias`` / ``pcb_delete_vias``
    after routing (e.g. ground stitching).
 
-## How routing works (PNS engine, no grid)
-Single-layer routing uses the built-in PNS engine (no A* grid path, no path
-grid concept).  The route walks around fixed obstacles (pads, vias,
-keepouts, other nets) and shoves movable tracks out of the way with chain
-propagation; multi-layer routes still use the layer-stack A* planner.
+## How routing works (algorithm switch)
+``pcb_route_pad_to_pad`` takes an ``algorithm`` argument; a single route
+always uses exactly one algorithm.  The response echoes ``algorithm``.
+
+- ``astar`` (default): grid-based A* planner.  Single-layer routes run
+  hierarchical grid A* (coarse pass + fine band); multi-layer routes run
+  multi-layer A* with via edges.  This is the classic router behaviour and
+  emits straight segments only — rounded-corner arcs are a PNS feature.
+- ``pns``: walkaround + shove engine (no A* grid).  The route walks around
+  fixed obstacles (pads, vias, keepouts, other nets) and shoves movable
+  tracks out of the way with chain propagation.  **Single-layer only** —
+  combining ``pns`` with a multi-layer pair raises a RouteFailure (via
+  transitions require ``astar``).
 
 ### corner_mode strategy
 - ``mitered45`` (default): 45-degree miter corners, straight segments.
