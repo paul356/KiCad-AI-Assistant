@@ -615,7 +615,9 @@ try:
                 if reasoning_part:
                     reasoning.append(reasoning_part)
                 for tc_delta in delta.get("tool_calls") or []:
-                    idx = tc_delta["index"]
+                    # Same tolerance as the in-process parser: gateways
+                    # (Gemini) may omit the tool-call index.
+                    idx = tc_delta.get("index", 0)
                     if idx not in tool_calls:
                         tool_calls[idx] = {
                             "id": "", "type": "function",
@@ -2791,6 +2793,11 @@ class LLMClient:
             url = base
         elif base.endswith("/v1"):
             url = f"{base}/chat/completions"
+        elif base.endswith("/openai"):
+            # Gemini's OpenAI-compatible shim: <v1beta/openai> already
+            # pins the API version, so the endpoint is .../chat/completions,
+            # not .../v1/chat/completions.
+            url = f"{base}/chat/completions"
         else:
             url = f"{base}/v1/chat/completions"
 
@@ -2853,7 +2860,11 @@ class LLMClient:
                             _current_reasoning.append(reasoning)
 
                         for tc_delta in delta.get("tool_calls") or []:
-                            idx = tc_delta["index"]
+                            # OpenAI-compatible gateways (e.g. Gemini's
+                            # v1beta/openai shim) may omit the per-delta
+                            # tool-call index; default to 0 (a single
+                            # function call) instead of raising KeyError.
+                            idx = tc_delta.get("index", 0)
                             if idx not in tool_calls_by_index:
                                 tool_calls_by_index[idx] = {
                                     "id": "",
@@ -3199,6 +3210,11 @@ class LLMClient:
         if "/chat/completions" in base:
             url = base
         elif base.endswith("/v1"):
+            url = f"{base}/chat/completions"
+        elif base.endswith("/openai"):
+            # Gemini's OpenAI-compatible shim: <v1beta/openai> already
+            # pins the API version, so the endpoint is .../chat/completions,
+            # not .../v1/chat/completions.
             url = f"{base}/chat/completions"
         else:
             url = f"{base}/v1/chat/completions"

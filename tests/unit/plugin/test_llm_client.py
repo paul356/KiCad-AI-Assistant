@@ -1806,6 +1806,63 @@ class TestStreaming:
         assert tc[0]["function"]["arguments"] == '{"x":1}'
         assert result["finish_reason"] == "tool_calls"
 
+    def test_stream_openai_tool_calls_without_index(self):
+        """Gemini's OpenAI-compatible shim omits the per-delta tool-call
+        ``index`` field; the parser must default it instead of KeyError."""
+        client = _make_client()
+        sse_lines = [
+            'data: {"choices":[{"delta":{"tool_calls":[{"id":"tc1","function":{"name":"add_wire","arguments":""}}]},"finish_reason":null}]}',
+            'data: {"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"{\\"x\\":"}}]},"finish_reason":null}]}',
+            'data: {"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"1}"}}]},"finish_reason":null}]}',
+            'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}',
+            "data: [DONE]",
+        ]
+        chunks = []
+        mock_resp = self._make_sse_response(sse_lines)
+        with patch("urllib.request.urlopen", return_value=mock_resp):
+            result = client._stream_openai("sys", [], on_stream_event=_on_event_collect(chunks))
+
+        assert chunks == []
+        tc = result["message"]["tool_calls"]
+        assert len(tc) == 1
+        assert tc[0]["id"] == "tc1"
+        assert tc[0]["function"]["name"] == "add_wire"
+        assert tc[0]["function"]["arguments"] == '{"x":1}'
+        assert result["finish_reason"] == "tool_calls"
+
+    def test_stream_openai_gemini_shim_url(self):
+        """A base URL that already ends in /openai (Gemini's shim) must
+        not gain a spurious /v1/ path segment: .../openai/chat/completions,
+        not .../openai/v1/chat/completions."""
+        client = _make_client()
+        client._settings.llm_base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
+        sse_lines = [
+            'data: {"choices":[{"delta":{"content":"Hello"},"finish_reason":null}]}',
+            'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}',
+            "data: [DONE]",
+        ]
+        mock_resp = self._make_sse_response(sse_lines)
+        with patch("urllib.request.urlopen", return_value=mock_resp) as m:
+            client._stream_openai("sys", [], on_stream_event=lambda evt: None)
+
+        url = m.call_args[0][0].full_url
+        assert url == ("https://generativelanguage.googleapis.com/v1beta/openai/chat/completions")
+
+    def test_call_openai_gemini_shim_url(self):
+        """Same endpoint fix for the non-streaming path (_call_openai),
+        used by history compaction / non-stream callers."""
+        client = _make_client()
+        client._settings.llm_base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
+        with patch(
+            "kicad_plugin.llm_client._https_post_json",
+            return_value=(200, '{"choices":[{"message":{"content":"hi"}}]}'),
+        ) as m:
+            result = client._call_openai("sys", [])
+
+        assert result["message"]["content"] == "hi"
+        url = m.call_args[0][0]
+        assert url == ("https://generativelanguage.googleapis.com/v1beta/openai/chat/completions")
+
     def test_stream_anthropic_http_error_includes_body(self):
         client = _make_client()
         client._settings.llm_provider = "anthropic"
