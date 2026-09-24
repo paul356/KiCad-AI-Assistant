@@ -41,9 +41,12 @@ always uses exactly one algorithm.  The response echoes ``algorithm``.
   emits straight segments only — rounded-corner arcs are a PNS feature.
 - ``pns``: walkaround + shove engine (no A* grid).  The route walks around
   fixed obstacles (pads, vias, keepouts, other nets) and shoves movable
-  tracks out of the way with chain propagation.  **Single-layer only** —
-  combining ``pns`` with a multi-layer pair raises a RouteFailure (via
-  transitions require ``astar``).
+  tracks out of the way with chain propagation.  A single-layer route may
+  emit rounded-corner arcs.  A multi-layer ``pns`` route resolves the
+  shortest start -> end layer path through ``via_pairs`` and routes one
+  walkaround + shove leg per layer, joined by through-vias DRC-validated
+  along the direct pad-to-pad line (no rounded arcs — arcs stay a
+  single-layer skeleton feature).
 
 ### corner_mode strategy
 - ``mitered45`` (default): 45-degree miter corners, straight segments.
