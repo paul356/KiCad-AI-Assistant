@@ -27,17 +27,27 @@ routing layer and runs a multi-layer A* that can insert via edges.
 Via edges cost 2.0 mm (configurable) -- this penalises vias so A* prefers
 routing on a single layer when possible.
 
+With ``algorithm="pns"`` multi-layer routes decompose into one
+walkaround + shove leg per layer (shortest layer path through
+``via_pairs``), joined by through-vias placed along the direct
+pad-to-pad line and DRC-validated (same-net pad faces, existing
+copper, board edge, hole-to-hole).  PNS legs emit straight segments
+only; rounded-corner arcs stay a single-layer skeleton feature.
+
 No shove
 --------
 
-This is the **no-shove** variant. If a route is blocked, we raise
-:class:`RouteFailure` rather than displacing existing tracks. That is enough
-for ~80% of "connect A to B" requests; the remaining cases need the user to
-move a track or add a via first.
+The A* planner is the **no-shove** variant: if a route is blocked it
+raises :class:`RouteFailure` rather than displacing existing tracks.
+That is enough for ~80% of "connect A to B" requests; the remaining
+cases need the user to move a track or add a via first -- or hand the
+request to the ``pns`` engine, which walks around fixed solids and
+shoves movable tracks of other nets instead of failing.
 """
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
 import json
 import logging
@@ -65,6 +75,7 @@ from kcaa.router.path_postprocess import (
 from kcaa.router.pns.direction45 import CornerMode
 from kcaa.router.pns.shove import TrackObstacle
 from kcaa.router.route_engine import PnsFailure, route_engine
+from kcaa.router.via_check import ProposedVia, check_vias
 from kcaa.router.visibility_graph import RouteNode
 from kcaa.router.world_model import Obstacle, _get_net, build_world_model
 from kcaa.utils.pcb_sexp_utils import load_pcb
@@ -717,171 +728,257 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
             end_xy = (path_nodes[-1].x, path_nodes[-1].y)
             layers_used = _layers_used(path_nodes)
     else:
-        # -- Single-layer: PNS engine (walkaround + shove) ------------
+        # -- PNS engine (walkaround + shove) ----------------------------
         # Only copper on the routing layer can block the track; other
         # layers are parallel physical planes and must not poison the
-        # search.  The engine walks the BuildInitialTrace skeleton
-        # around fixed solids, then shoves movable tracks out of the
-        # way; it never uses the grid.
-        # The engine needs *unbuffered* obstacle shapes (it applies
-        # clearance + own half-width itself when building walkaround
-        # hulls).  World-model obstacles are already that; same-net pad
-        # copper (dropped by the world model so the route can land on
-        # its own pads) is re-added here as transit obstacles, unbuffered
-        # — a track may terminate on a pad but never run across its
-        # copper (a drill hole severs any crossing track).
-        # The PNS engine is single-layer only: multi-layer routes keep
-        # using the grid A* planner.  Reject the unsupported combo
-        # explicitly instead of silently degrading.
-        if start_layer != end_layer:
-            raise RouteFailure(
-                f"algorithm='pns' does not support multi-layer routing "
-                f"({start_layer} -> {end_layer}); use algorithm='astar'."
-            )
-        engine_obstacles: list[Obstacle] = [o for o in model.obstacles if start_layer in o.layers]
-        for poly, players, _ref, _pname, center in _same_net_pad_polygons(data, req.net):
-            is_end = (
-                abs(center[0] - pad_a_xy[0]) < 1e-6 and abs(center[1] - pad_a_xy[1]) < 1e-6
-            ) or (abs(center[0] - pad_b_xy[0]) < 1e-6 and abs(center[1] - pad_b_xy[1]) < 1e-6)
-            if is_end and start_layer in players:
-                continue  # the route terminates on the endpoint pad
-            if start_layer in players:
-                engine_obstacles.append(
-                    Obstacle(
-                        shape=poly,
-                        layers=frozenset({start_layer}),
-                        net=req.net,
-                        kind="pad",
+        # engine.  Every same-net pad polygon becomes a transit obstacle
+        # the route may overlay (it is already connected).  The engine
+        # walks the BuildInitialTrace skeleton around fixed solids, then
+        # shoves movable tracks of other nets; it never uses the grid.
+        # Single-layer routes may emit rounded-corner arcs; multi-layer
+        # routes decompose into per-layer legs joined by through-vias
+        # placed along the direct pad-to-pad line (see below).
+        if start_layer == end_layer:
+            engine_obstacles: list[Obstacle] = [
+                o for o in model.obstacles if start_layer in o.layers
+            ]
+            for poly, players, _ref, _pname, center in _same_net_pad_polygons(data, req.net):
+                is_end = (
+                    abs(center[0] - pad_a_xy[0]) < 1e-6 and abs(center[1] - pad_a_xy[1]) < 1e-6
+                ) or (abs(center[0] - pad_b_xy[0]) < 1e-6 and abs(center[1] - pad_b_xy[1]) < 1e-6)
+                if is_end and start_layer in players:
+                    continue  # the route terminates on the endpoint pad
+                if start_layer in players:
+                    engine_obstacles.append(
+                        Obstacle(
+                            shape=poly,
+                            layers=frozenset({start_layer}),
+                            net=req.net,
+                            kind="pad",
+                        )
                     )
+            # corner_mode already validated + parsed at entry (line 236).
+            try:
+                eng = route_engine(
+                    pad_a_xy,
+                    pad_b_xy,
+                    engine_obstacles,
+                    track_width=width,
+                    clearance=clearance,
+                    corner_mode=corner_mode,
                 )
-        # corner_mode already validated + parsed at entry (line 236).
-        try:
-            eng = route_engine(
+            except PnsFailure as exc:
+                # Dump the failure state so the blockage can be inspected
+                # (same viz format as the success stages).
+                _dump_viz("fail-pns", [], _pad_viz, buffered, route_bbox)
+                raise RouteFailure(
+                    f"No obstacle-avoiding path from {req.ref_a}/{req.pad_a} to "
+                    f"{req.ref_b}/{req.pad_b} at {width}mm track width on layer "
+                    f"{start_layer}: {exc}"
+                ) from exc
+            print(
+                f"  [route] PNS: {len(eng.path)} pts"
+                f"  shoved={len(eng.shoved_tracks)}  arcs={len(eng.arcs)}"
+            )
+            pushed: list[TrackObstacle] = eng.shoved_tracks
+
+            if eng.trace is not None:
+                # Embargo-free skeleton: emit anchor points and arcs straight
+                # from the trace (KiCad emits the skeleton for a clear route).
+                best_path_pts = eng.trace.points
+            else:
+                best_path_pts = eng.path
+
+            _dump_viz("0-pns", best_path_pts, _pad_viz, buffered, route_bbox)
+
+            # ---- Replace scheme inside rectangular pads with an
+            #      axis-aligned wire (fence -> centre) ----
+            if pad_a_size is not None:
+                n_before = len(best_path_pts)
+                best_path_pts = _replace_pad_path(
+                    best_path_pts, pad_a_xy, pad_a_size, from_center=True
+                )
+                _log_path("pad_a-replace", best_path_pts, n_before)
+            if pad_b_size is not None:
+                n_before = len(best_path_pts)
+                best_path_pts = _replace_pad_path(
+                    best_path_pts, pad_b_xy, pad_b_size, from_center=False
+                )
+                _log_path("pad_b-replace", best_path_pts, n_before)
+            _dump_viz("1-pad-replace", best_path_pts, _pad_viz, buffered, route_bbox)
+
+            # ---- Align path endpoints with exact pad centres ----
+            best_path_pts = _align_path_endpoints(
+                best_path_pts,
                 pad_a_xy,
                 pad_b_xy,
-                engine_obstacles,
-                track_width=width,
-                clearance=clearance,
-                corner_mode=corner_mode,
+                buffered,
+                route_bbox,
+                grid_res,
+                pad_a_size=pad_a_size,
+                pad_b_size=pad_b_size,
             )
-        except PnsFailure as exc:
-            # Dump the failure state so the blockage can be inspected
-            # (same viz format as the success stages).
-            _dump_viz("fail-pns", [], _pad_viz, buffered, route_bbox)
-            raise RouteFailure(
-                f"No obstacle-avoiding path from {req.ref_a}/{req.pad_a} to "
-                f"{req.ref_b}/{req.pad_b} at {width}mm track width on layer "
-                f"{start_layer}: {exc}"
-            ) from exc
-        print(
-            f"  [route] PNS: {len(eng.path)} pts"
-            f"  shoved={len(eng.shoved_tracks)}  arcs={len(eng.arcs)}"
-        )
-        pushed: list[TrackObstacle] = eng.shoved_tracks
+            _log_path("align-endpoints", best_path_pts)
+            _dump_viz("6-align-endpoints", best_path_pts, _pad_viz, buffered, route_bbox)
 
-        if eng.trace is not None:
-            # Embargo-free skeleton: emit anchor points and arcs straight
-            # from the trace (KiCad emits the skeleton for a clear route).
-            best_path_pts = eng.trace.points
-        else:
-            best_path_pts = eng.path
-
-        _dump_viz("0-pns", best_path_pts, _pad_viz, buffered, route_bbox)
-
-        # ---- Replace scheme inside rectangular pads with an
-        #      axis-aligned wire (fence -> centre) ----
-        if pad_a_size is not None:
-            n_before = len(best_path_pts)
-            best_path_pts = _replace_pad_path(best_path_pts, pad_a_xy, pad_a_size, from_center=True)
-            _log_path("pad_a-replace", best_path_pts, n_before)
-        if pad_b_size is not None:
-            n_before = len(best_path_pts)
-            best_path_pts = _replace_pad_path(
-                best_path_pts, pad_b_xy, pad_b_size, from_center=False
+            path_nodes = path_to_nodes(best_path_pts, start_layer)
+            segs, vias = postprocess_path(
+                path_nodes,
+                width=width,
+                net=req.net,
+                max_miter_mm=req.max_miter_mm,
+                _obstacles=buffered,
+                _pad_rects=_pad_rects or None,
             )
-            _log_path("pad_b-replace", best_path_pts, n_before)
-        _dump_viz("1-pad-replace", best_path_pts, _pad_viz, buffered, route_bbox)
+            segs = [s for s in segs if abs(s.x1 - s.x2) > 1e-6 or abs(s.y1 - s.y2) > 1e-6]
 
-        # ---- Align path endpoints with exact pad centres ----
-        best_path_pts = _align_path_endpoints(
-            best_path_pts,
-            pad_a_xy,
-            pad_b_xy,
-            buffered,
-            route_bbox,
-            grid_res,
-            pad_a_size=pad_a_size,
-            pad_b_size=pad_b_size,
-        )
-        _log_path("align-endpoints", best_path_pts)
-        _dump_viz("6-align-endpoints", best_path_pts, _pad_viz, buffered, route_bbox)
-
-        path_nodes = path_to_nodes(best_path_pts, start_layer)
-        segs, vias = postprocess_path(
-            path_nodes,
-            width=width,
-            net=req.net,
-            max_miter_mm=req.max_miter_mm,
-            _obstacles=buffered,
-            _pad_rects=_pad_rects or None,
-        )
-        segs = [s for s in segs if abs(s.x1 - s.x2) > 1e-6 or abs(s.y1 - s.y2) > 1e-6]
-
-        # Rounded skeleton arcs -> OutputArc nodes.  Valid only when
-        # walkaround/shove/pad-cleanup left the original skeleton anchors
-        # in place.  When arcs are emitted, skip mitering on the legs
-        # they join (postprocess miter would cut into the arc end).
-        arcs_out: list[OutputArc] = []
-        emit_arcs = (
-            eng.trace is not None
-            and len(best_path_pts) == len(eng.trace.points)
-            and all(_pt_eq(p, q) for p, q in zip(best_path_pts, eng.trace.points))
-        )
-        if emit_arcs:
-            if any(a is not None for a in eng.trace.arcs):
-                # Skeleton with arcs: emit straight legs + arcs directly,
-                # no mitering (the rounded corner already smooths the join).
-                segs = []
-                pts = eng.trace.points
-                for i in range(len(pts) - 1):
-                    arc_i = eng.trace.arcs[i] if i < len(eng.trace.arcs) else None
-                    if arc_i is not None:
-                        arcs_out.append(
-                            OutputArc(
-                                start=arc_i.start,
-                                mid=arc_i.mid,
-                                end=arc_i.end,
-                                width=width,
-                                layer=start_layer,
-                                net=req.net,
-                            )
-                        )
-                    else:
-                        x1, y1 = pts[i]
-                        x2, y2 = pts[i + 1]
-                        if abs(x1 - x2) > 1e-6 or abs(y1 - y2) > 1e-6:
-                            segs.append(
-                                OutputSegment(
-                                    x1=x1,
-                                    y1=y1,
-                                    x2=x2,
-                                    y2=y2,
+            # Rounded skeleton arcs -> OutputArc nodes.  Valid only when
+            # walkaround/shove/pad-cleanup left the original skeleton anchors
+            # in place.  When arcs are emitted, skip mitering on the legs
+            # they join (postprocess miter would cut into the arc end).
+            arcs_out: list[OutputArc] = []
+            emit_arcs = (
+                eng.trace is not None
+                and len(best_path_pts) == len(eng.trace.points)
+                and all(_pt_eq(p, q) for p, q in zip(best_path_pts, eng.trace.points))
+            )
+            if emit_arcs:
+                if any(a is not None for a in eng.trace.arcs):
+                    # Skeleton with arcs: emit straight legs + arcs directly,
+                    # no mitering (the rounded corner already smooths the join).
+                    segs = []
+                    pts = eng.trace.points
+                    for i in range(len(pts) - 1):
+                        arc_i = eng.trace.arcs[i] if i < len(eng.trace.arcs) else None
+                        if arc_i is not None:
+                            arcs_out.append(
+                                OutputArc(
+                                    start=arc_i.start,
+                                    mid=arc_i.mid,
+                                    end=arc_i.end,
                                     width=width,
                                     layer=start_layer,
                                     net=req.net,
                                 )
                             )
-            else:
-                # Mitered skeleton (no arcs): keep the mitered postprocess
-                # output; nothing further to emit.
-                pass
+                        else:
+                            x1, y1 = pts[i]
+                            x2, y2 = pts[i + 1]
+                            if abs(x1 - x2) > 1e-6 or abs(y1 - y2) > 1e-6:
+                                segs.append(
+                                    OutputSegment(
+                                        x1=x1,
+                                        y1=y1,
+                                        x2=x2,
+                                        y2=y2,
+                                        width=width,
+                                        layer=start_layer,
+                                        net=req.net,
+                                    )
+                                )
+                else:
+                    # Mitered skeleton (no arcs): keep the mitered postprocess
+                    # output; nothing further to emit.
+                    pass
 
-        _log_output_segments("final", segs)
-        _dump_viz_segments("7-final", segs, _pad_viz, buffered, route_bbox)
+            _log_output_segments("final", segs)
+            _dump_viz_segments("7-final", segs, _pad_viz, buffered, route_bbox)
 
-        start_xy = (path_nodes[0].x, path_nodes[0].y)
-        end_xy = (path_nodes[-1].x, path_nodes[-1].y)
-        layers_used = _layers_used(path_nodes)
+            start_xy = (path_nodes[0].x, path_nodes[0].y)
+            end_xy = (path_nodes[-1].x, path_nodes[-1].y)
+            layers_used = _layers_used(path_nodes)
+        else:
+            # -- Multi-layer: per-leg walkaround + shove, vias on the
+            #    direct pad-to-pad line ---------------------------------
+            layer_seq = _resolve_layer_sequence(start_layer, end_layer, req.via_pairs)
+            n_trans = len(layer_seq) - 1
+            via_forbidden = [
+                poly for poly, _pl, _rf, _pn, _ctr in _same_net_pad_polygons(data, req.net)
+            ]
+            via_positions = _pick_via_positions(
+                pcb_path=req.pcb_path,
+                layer_seq=layer_seq,
+                start=pad_a_xy,
+                end=pad_b_xy,
+                via_forbidden=via_forbidden,
+                via_diameter=via_diameter,
+                via_drill=via_drill,
+                clearance=clearance,
+                net=req.net,
+            )
+            anchors = [pad_a_xy, *via_positions, pad_b_xy]
+            all_nodes: list[RouteNode] = []
+            node_id = 0
+            pushed = []
+            for li in range(n_trans + 1):
+                layer = layer_seq[li]
+                start_pt = anchors[li]
+                end_pt = anchors[li + 1]
+                if math.hypot(end_pt[0] - start_pt[0], end_pt[1] - start_pt[1]) < 1e-6:
+                    raise RouteFailure(
+                        f"PNS layer path {layer_seq} is too deep for the pad span "
+                        f"({pad_a_xy} -> {pad_b_xy}); reduce via transitions or "
+                        "split the route with waypoints."
+                    )
+                engine_obstacles = _layer_engine_obstacles(
+                    model,
+                    data,
+                    req,
+                    start_layer,
+                    end_layer,
+                    layer,
+                    pad_a_xy,
+                    pad_b_xy,
+                )
+                try:
+                    eng = route_engine(
+                        start_pt,
+                        end_pt,
+                        engine_obstacles,
+                        track_width=width,
+                        clearance=clearance,
+                        corner_mode=corner_mode,
+                    )
+                except PnsFailure as exc:
+                    _dump_viz("fail-pns", [], _pad_viz, buffered, route_bbox)
+                    raise RouteFailure(
+                        f"No obstacle-avoiding path from {req.ref_a}/{req.pad_a} to "
+                        f"{req.ref_b}/{req.pad_b} at {width}mm track width on layer "
+                        f"{layer} (leg {li + 1}/{n_trans + 1}): {exc}"
+                    ) from exc
+                print(
+                    f"  [route] PNS leg {li + 1}/{n_trans + 1} on {layer}: "
+                    f"{len(eng.path)} pts  shoved={len(eng.shoved_tracks)}"
+                )
+                pushed.extend(eng.shoved_tracks)
+                pts = list(eng.path)
+                if li == 0 and pad_a_size is not None:
+                    pts = _replace_pad_path(pts, pad_a_xy, pad_a_size, from_center=True)
+                elif li == n_trans and pad_b_size is not None:
+                    pts = _replace_pad_path(pts, pad_b_xy, pad_b_size, from_center=False)
+                for pi, (x, y) in enumerate(pts):
+                    if li > 0 and pi == 0:
+                        continue  # shared via anchor, already emitted
+                    all_nodes.append(RouteNode(x=x, y=y, layer=layer, node_id=node_id))
+                    node_id += 1
+            segs, vias = postprocess_path(
+                all_nodes,
+                width=width,
+                net=req.net,
+                max_miter_mm=req.max_miter_mm,
+                via_diameter_mm=via_diameter,
+                via_drill_mm=via_drill,
+                _obstacles=buffered,
+                _pad_rects=_pad_rects or None,
+            )
+            segs = [s_ for s_ in segs if abs(s_.x1 - s_.x2) > 1e-6 or abs(s_.y1 - s_.y2) > 1e-6]
+            # Rounded corner arcs stay a single-layer skeleton feature
+            # (same rule as the multi-layer A* branch): multi-layer routes
+            # emit straight segments + vias only.
+            arcs_out = []
+            start_xy = (all_nodes[0].x, all_nodes[0].y)
+            end_xy = (all_nodes[-1].x, all_nodes[-1].y)
+            layers_used = _layers_used(all_nodes)
 
     # Verify every emitted segment stays inside the board (Edge.Cuts).
     # We use a board polygon that is shrunk by width/2 on each side so the
@@ -1564,6 +1661,177 @@ def _layers_used(path: list) -> list[str]:
             out.append(layer)
             seen.add(layer)
     return out
+
+
+def _resolve_layer_sequence(
+    start_layer: str,
+    end_layer: str,
+    via_pairs: tuple[tuple[str, str], ...],
+) -> list[str]:
+    """Shortest start -> end layer path through the via-pair graph.
+
+    Every ``via_pairs`` (top, bottom) edge is traversable in both
+    directions and costs exactly one through-via.  Returns the layer
+    sequence that needs the fewest vias, ties broken by layer name.
+    """
+    if start_layer == end_layer:
+        return [start_layer]
+    graph: dict[str, list[str]] = {}
+    for top, bot in via_pairs:
+        graph.setdefault(top, [])
+        graph.setdefault(bot, [])
+        for a, b in ((top, bot), (bot, top)):
+            if b not in graph[a]:
+                graph[a].append(b)
+    for adj in graph.values():
+        adj.sort()  # deterministic tie-break
+    prev: dict[str, str] = {start_layer: ""}
+    queue: deque[str] = deque([start_layer])
+    while queue:
+        cur = queue.popleft()
+        if cur == end_layer:
+            break
+        for nxt in graph.get(cur, []):
+            if nxt not in prev:
+                prev[nxt] = cur
+                queue.append(nxt)
+    if end_layer not in prev:
+        raise RouteFailure(
+            f"no PNS layer path from {start_layer!r} to {end_layer!r} through "
+            f"via_pairs {via_pairs}; allow a via pair for the missing stack "
+            "transition (or use algorithm='astar')."
+        )
+    seq = [end_layer]
+    while seq[-1] != start_layer:
+        seq.append(prev[seq[-1]])
+    seq.reverse()
+    return seq
+
+
+def _pick_via_positions(
+    pcb_path: str,
+    layer_seq: list[str],
+    start: tuple[float, float],
+    end: tuple[float, float],
+    via_forbidden: list,
+    via_diameter: float,
+    via_drill: float,
+    clearance: float,
+    net: str,
+) -> list[tuple[float, float]]:
+    """Pick one through-via position per layer transition.
+
+    Base candidates are equally spaced along the direct start -> end
+    line; the first and last via sit at least ``1 / (n + 1)`` of the
+    span from either pad, so vias never land on the endpoint pads.
+    Candidates that fail DRC (same-net pad faces, existing copper, board
+    edge, hole-to-hole) are dodged with small offsets perpendicular and
+    parallel to the pad span.  Raises :class:`RouteFailure` when no
+    DRC-clean spot can be found on the corridor, or when the checks
+    cannot run at all (missing/malformed ``.kicad_pro`` — the via DRC
+    never silently degrades).
+    """
+    n_trans = len(layer_seq) - 1
+    if n_trans < 1:
+        return []
+    dx = end[0] - start[0]
+    dy = end[1] - start[1]
+    span = math.hypot(dx, dy)
+    if span < 1e-6:
+        raise RouteFailure("cannot place PNS vias: the two pads coincide")
+    ux, uy = dx / span, dy / span  # unit direction
+    px, py = -uy, ux  # unit perpendicular
+    step = via_diameter + max(clearance, 0.0) + 0.05
+    offsets = [
+        (0.0, 0.0),
+        (1.0, 0.0),
+        (-1.0, 0.0),
+        (0.0, 1.0),
+        (0.0, -1.0),
+        (1.0, 1.0),
+        (1.0, -1.0),
+        (-1.0, 1.0),
+        (-1.0, -1.0),
+        (2.0, 0.0),
+        (-2.0, 0.0),
+        (0.0, 2.0),
+        (0.0, -2.0),
+    ]
+    n_offsets = len(offsets)
+    proposed = [
+        ProposedVia(
+            x=start[0] + (t + 1) * dx / (n_trans + 1) + o[0] * step * px + o[1] * step * ux,
+            y=start[1] + (t + 1) * dy / (n_trans + 1) + o[0] * step * py + o[1] * step * uy,
+            diameter=via_diameter,
+            drill=via_drill,
+            layers=(layer_seq[t], layer_seq[t + 1]),
+            net=net,
+        )
+        for t in range(n_trans)
+        for o in offsets
+    ]
+    violations = check_vias(pcb_path, proposed)
+    hard = next((v for v in violations if v.index < 0), None)
+    if hard is not None:
+        # Project-level failure (missing/malformed .kicad_pro): check_vias
+        # reports it once at index -1, which no candidate matches.  Fail
+        # loudly instead of silently routing with unvalidated vias.
+        raise RouteFailure(f"cannot DRC-check PNS vias on net {net!r}: {hard.message}")
+    bad = {v.index for v in violations}
+    if via_forbidden:
+        from shapely.geometry import Point
+
+        for i, pv in enumerate(proposed):
+            pt = Point(pv.x, pv.y)
+            if any(poly.contains(pt) or poly.touches(pt) for poly in via_forbidden):
+                bad.add(i)
+    out: list[tuple[float, float]] = []
+    for t in range(n_trans):
+        chosen = next(
+            (
+                (proposed[t * n_offsets + k].x, proposed[t * n_offsets + k].y)
+                for k in range(n_offsets)
+                if t * n_offsets + k not in bad
+            ),
+            None,
+        )
+        if chosen is None:
+            raise RouteFailure(
+                f"no DRC-clean via spot on the direct pad-to-pad corridor for "
+                f"transition {layer_seq[t]} -> {layer_seq[t + 1]} on net "
+                f"{net!r}; move a track or split the route with waypoints."
+            )
+        out.append(chosen)
+    return out
+
+
+def _layer_engine_obstacles(
+    model,  # WorldModel
+    data: list,
+    req: RouteRequest,
+    start_layer: str,
+    end_layer: str,
+    layer: str,
+    pad_a_xy: tuple[float, float],
+    pad_b_xy: tuple[float, float],
+) -> list[Obstacle]:
+    """PNS obstacles for one leg: copper on ``layer`` plus same-net pads
+    the route may transit on that layer (endpoint pads exempted on their
+    own terminal layers)."""
+    engine_obstacles: list[Obstacle] = [o for o in model.obstacles if layer in o.layers]
+    for poly, players, _ref, _pname, center in _same_net_pad_polygons(data, req.net):
+        if layer not in players:
+            continue
+        is_end_a = abs(center[0] - pad_a_xy[0]) < 1e-6 and abs(center[1] - pad_a_xy[1]) < 1e-6
+        is_end_b = abs(center[0] - pad_b_xy[0]) < 1e-6 and abs(center[1] - pad_b_xy[1]) < 1e-6
+        if is_end_a and layer == start_layer:
+            continue  # the route terminates on this pad
+        if is_end_b and layer == end_layer:
+            continue
+        engine_obstacles.append(
+            Obstacle(shape=poly, layers=frozenset({layer}), net=req.net, kind="pad")
+        )
+    return engine_obstacles
 
 
 # ---------------------------------------------------------------------------

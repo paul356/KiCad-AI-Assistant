@@ -1442,27 +1442,231 @@ def test_algorithm_pns_single_layer_echoes_pns(tmp_path: Path) -> None:
     assert result.algorithm == "pns"
 
 
-def test_algorithm_pns_rejects_multi_layer(tmp_path: Path) -> None:
-    """The PNS engine is single-layer only: a multi-layer pair must raise
-    RouteFailure instead of silently degrading to grid A*."""
+def _x1_tht_on_b_cu() -> str:
+    """X1: a thru-hole endpoint pad on B.Cu at (62, 45), on net VCC."""
+    return (
+        "\n\t# ---- X1: THT endpoint pad on B.Cu ----\n"
+        '\t(footprint "user_add:edge-connector"\n'
+        '\t\t(layer "F.Cu")\n'
+        '\t\t(uuid "66666666-0000-0000-0000-000000000006")\n'
+        "\t\t(at 62.0 45.0 0.0)\n"
+        '\t\t(property "Reference" "X1")\n'
+        '\t\t(property "Value" "X1")\n'
+        '\t\t(pad "T" thru_hole circle\n'
+        "\t\t\t(at 0.0 0.0)\n"
+        "\t\t\t(size 1.6 1.6)\n"
+        "\t\t\t(drill 1.0)\n"
+        '\t\t\t(layers "*.Cu" "*.Mask")\n'
+        '\t\t\t(net 1 "VCC")\n'
+        "\t\t)\n"
+        "\t)\n"
+    )
+
+
+def _write_pns_board(tmp_path: Path, extra: str) -> Path:
+    """Fixture board + ``extra`` footprints, with the .kicad_pro paired
+    under the matching base name (PNS via placement DRC-checks against the
+    netclass rules)."""
+    dst = tmp_path / "board.kicad_pcb"
+    board = Path(_fixture_pcb()).read_text().rstrip()
+    assert board.endswith(")")
+    dst.write_text(board[:-1] + extra + ")\n")
+    shutil.copy(_PRO_FIXTURE, tmp_path / "board.kicad_pro")
+    return dst
+
+
+def test_pns_multi_layer_route_crosses_layers(tmp_path: Path) -> None:
+    """algorithm='pns' on a cross-layer pair (R1/1 F.Cu -> X1/T B.Cu routes
+    one walkaround + shove leg per layer, joined by a DRC-clean through-via
+    on the direct pad-to-pad line.  Multi-layer PNS emits straight segments
+    only (no rounded arcs), and the via never lands on a same-net pad."""
+    from shapely.geometry import Point, box
+
+    dst = _write_pns_board(tmp_path, _x1_tht_on_b_cu())
+
+    result = auto_route_pair(
+        RouteRequest(
+            pcb_path=str(dst),
+            ref_a="R1",
+            pad_a="1",
+            ref_b="X1",
+            pad_b="T",
+            net="VCC",
+            layer_hint="B.Cu",
+            width=0.25,
+            clearance=0.2,
+            algorithm="pns",
+        )
+    )
+    assert result.algorithm == "pns"
+    assert len(result.vias) >= 1
+    assert result.layers_used == ["F.Cu", "B.Cu"]
+    assert len(result.segments) > 0
+    # Multi-layer PNS emits straight segments only, like multi-layer A*.
+    assert result.arcs == []
+    # No via on any same-net pad copper (endpoint pads included): R1/1
+    # 0.5x0.5 at (29.5,30), C1/1 0.5x0.5 at (60,29.5), X1/T r=0.8 at (62,45).
+    same_net_pads = [
+        box(29.25, 29.75, 29.75, 30.25),
+        box(59.75, 29.25, 60.25, 29.75),
+        Point(62.0, 45.0).buffer(0.8),
+    ]
+    for via in result.vias:
+        pt = Point(via.x, via.y)
+        for i, poly in enumerate(same_net_pads):
+            assert not poly.contains(pt), (
+                f"PNS via at ({via.x:.3f},{via.y:.3f}) lands on a same-net pad polygon #{i}"
+            )
+
+
+def test_pns_multi_layer_via_not_on_same_net_pad(tmp_path: Path) -> None:
+    """The PNS via picker must avoid ALL same-net pad faces, not just the
+    two endpoint pads (DFM defect: solder wicking / annular-ring breakout).
+    Mirrors the multi-layer A* test of the same name."""
+    from shapely.geometry import Point, box
+
+    # X3: same-net SMD pads on F.Cu near the route corridor between
+    # R1/1 (29.5, 30) and X1/T (64, 45).  Neither pad is an endpoint;
+    # the PNS via must avoid both.
+    x3 = (
+        "\n\t# ---- X3: same-net SMD pads, via must avoid ----\n"
+        '\t(footprint "user_add:via-dodge"\n'
+        '\t\t(layer "F.Cu")\n'
+        '\t\t(uuid "99999999-0000-0000-0000-000000000009")\n'
+        "\t\t(at 45.0 40.0 0.0)\n"
+        '\t\t(property "Reference" "X3")\n'
+        '\t\t(property "Value" "X3")\n'
+        '\t\t(pad "1" smd rect\n'
+        "\t\t\t(at 0.0 0.0)\n"
+        "\t\t\t(size 2.0 2.0)\n"
+        '\t\t\t(layers "F.Cu" "F.Mask")\n'
+        '\t\t\t(net 1 "VCC")\n'
+        "\t\t)\n"
+        '\t\t(pad "2" smd rect\n'
+        "\t\t\t(at 5.0 0.0)\n"
+        "\t\t\t(size 2.0 2.0)\n"
+        '\t\t\t(layers "F.Cu" "F.Mask")\n'
+        '\t\t\t(net 1 "VCC")\n'
+        "\t\t)\n"
+        "\t)\n"
+    )
+    dst = _write_pns_board(tmp_path, x3 + _x1_tht_on_b_cu())
+
+    result = auto_route_pair(
+        RouteRequest(
+            pcb_path=str(dst),
+            ref_a="R1",
+            pad_a="1",
+            ref_b="X1",
+            pad_b="T",
+            net="VCC",
+            layer_hint="B.Cu",
+            width=0.25,
+            clearance=0.2,
+            algorithm="pns",
+        )
+    )
+    assert len(result.vias) > 0
+    # Pad copper rectangles (unbuffered, world coords): 2x2 at (45,40)
+    # and (50,40).
+    pad_rects = [box(44, 39, 46, 41), box(49, 39, 51, 41)]
+    for via in result.vias:
+        pt = Point(via.x, via.y)
+        for i, rect in enumerate(pad_rects):
+            assert not rect.contains(pt), (
+                f"PNS via at ({via.x:.3f},{via.y:.3f}) lands on X3/{i + 1} pad"
+            )
+
+
+def test_pns_multi_layer_unreachable_via_pairs(tmp_path: Path) -> None:
+    """When via_pairs cannot connect the start and end layers, the PNS
+    multi-layer branch must raise RouteFailure with the missing transition,
+    not guess a layer path."""
     dst = _route_board_copy(tmp_path)
     req = RouteRequest(
         pcb_path=str(dst),
-        ref_a="D1",
+        ref_a="D1",  # pad 1 on In1.Cu
         pad_a="1",
-        ref_b="R1",
+        ref_b="R1",  # pad 2 on F.Cu
         pad_b="2",
         net="GND",
         width=0.25,
         clearance=0.2,
         algorithm="pns",
-        via_pairs=(("F.Cu", "B.Cu"), ("B.Cu", "In1.Cu")),
+        via_pairs=(("F.Cu", "B.Cu"),),  # no edge touches In1.Cu
     )
     with pytest.raises(RouteFailure) as excinfo:
         auto_route_pair(req)
     msg = str(excinfo.value)
-    assert "pns" in msg
-    assert "multi-layer" in msg
+    assert "layer path" in msg
+    assert "In1.Cu" in msg
+    assert "F.Cu" in msg
+
+
+def test_pns_multi_layer_missing_pro_rejects_unvalidated_vias(
+    tmp_path: Path,
+) -> None:
+    """Via placement must stay strict when the .kicad_pro is missing: the
+    route cannot silently place vias without netclass/DRC data (check_vias
+    reports a project-level failure the candidate indices can't match)."""
+    src = _fixture_pcb()
+    dst = tmp_path / "board.kicad_pcb"
+    board = Path(src).read_text().rstrip()
+    assert board.endswith(")")
+    dst.write_text(board[:-1] + _x1_tht_on_b_cu() + ")\n")
+    # Deliberately no .kicad_pro next to the board.
+    req = RouteRequest(
+        pcb_path=str(dst),
+        ref_a="R1",
+        pad_a="1",
+        ref_b="X1",
+        pad_b="T",
+        net="VCC",
+        layer_hint="B.Cu",
+        width=0.25,  # explicit: skip width/clearance DRC lookup
+        clearance=0.2,
+        algorithm="pns",
+    )
+    with pytest.raises(RouteFailure) as excinfo:
+        auto_route_pair(req)
+    assert "cannot DRC-check PNS vias" in str(excinfo.value)
+
+
+def test_pns_multi_layer_three_legs_share_via_anchors(tmp_path: Path) -> None:
+    """A 2-via / 3-leg PNS route must share each via anchor XY across the
+    two legs it joins: every via touches a segment endpoint on BOTH of its
+    layers (the per-leg engine paths rendezvous at the placed via)."""
+    dst = _write_pns_board(tmp_path, _x1_tht_on_b_cu())
+
+    result = auto_route_pair(
+        RouteRequest(
+            pcb_path=str(dst),
+            ref_a="R1",
+            pad_a="1",
+            ref_b="X1",
+            pad_b="T",
+            net="VCC",
+            layer_hint="In1.Cu",
+            width=0.25,
+            clearance=0.2,
+            algorithm="pns",
+            via_pairs=(("F.Cu", "B.Cu"), ("B.Cu", "In1.Cu")),
+        )
+    )
+    assert result.layers_used == ["F.Cu", "B.Cu", "In1.Cu"]
+    assert len(result.vias) == 2
+    for via in result.vias:
+        for layer in via.layers:
+            touched = any(
+                (abs(s.x1 - via.x) < 1e-3 and abs(s.y1 - via.y) < 1e-3)
+                or (abs(s.x2 - via.x) < 1e-3 and abs(s.y2 - via.y) < 1e-3)
+                for s in result.segments
+                if s.layer == layer
+            )
+            assert touched, (
+                f"Via at ({via.x:.3f},{via.y:.3f}) on {via.layers} is not "
+                f"joined by a segment on layer {layer}"
+            )
 
 
 def test_algorithm_invalid_value_raises_route_failure(tmp_path: Path) -> None:
