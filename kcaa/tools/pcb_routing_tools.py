@@ -1,13 +1,15 @@
 """
 PCB routing tools for the KiCad MCP server.
 
-Exposes the no-shove PNS router as an MCP tool that connects two pads with
-a track on a single layer.  The tool writes the resulting segments and (if
-present) vias back to the .kicad_pcb file, with the usual ``.bak`` backup.
+Exposes the router as an MCP tool that connects two pads with a track,
+optionally across layers (through-vias on the direct pad-to-pad line).
+The tool writes the resulting segments and vias back to the .kicad_pcb
+file, with the usual ``.bak`` backup.
 
-This is the no-shove variant: if a route is blocked, the tool fails rather
-than displacing existing tracks.  Use the placement / edit tools to clear
-the path first, or call with a different layer.
+The ``pns`` engine walks around fixed solids and shoves movable tracks
+out of the way; if a route is blocked, the tool fails rather than
+guessing.  Use the placement / edit tools to clear the path first, or
+call with a different layer.
 """
 
 from __future__ import annotations
@@ -55,8 +57,12 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
         Uses ``algorithm`` to route: ``astar`` (default) runs the grid A*
         planner (hierarchical grid on a single layer, multi-layer A* with
         via edges across layers); ``pns`` runs the walkaround + shove
-        engine (single-layer only — combining ``pns`` with a multi-layer
-        route raises a RouteFailure).  ``corner_mode`` picks the corner
+        engine.  A multi-layer ``pns`` route decomposes into one
+        walkaround + shove leg per layer (shortest layer path through
+        ``via_pairs``), joined by through-vias DRC-validated along the
+        direct pad-to-pad line; multi-layer routes emit straight
+        segments only, so rounded-corner arcs stay a single-layer
+        skeleton feature.  ``corner_mode`` picks the corner
         style: ``mitered45`` (default) / ``mitered90`` for straight
         corners, ``rounded45`` / ``rounded90`` for rounded-corner arcs
         (emitted as ``(arc ...)`` nodes on an unobstructed skeleton).
@@ -99,8 +105,9 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
                 unobstructed skeleton (a detour linearizes them).
             algorithm: ``astar`` (default) grid-based A* planner;
                 ``pns`` walkaround + shove engine.  A route always uses
-                exactly one algorithm.  ``pns`` is single-layer only —
-                multi-layer routes must use ``astar``.
+                exactly one algorithm.  ``pns`` multi-layer routes are
+                one leg per layer joined by DRC-validated through-vias
+                on the direct pad-to-pad line (no rounded arcs).
 
         Returns:
             dict with:
