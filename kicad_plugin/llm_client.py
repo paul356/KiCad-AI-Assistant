@@ -2651,36 +2651,37 @@ class LLMClient:
                     response = self._stream_ollama(system, tools, on_stream_event)
                 else:
                     response = self._call_ollama(system, tools)
-            elif provider == "gemini":
-                # Gemini flows through the OpenAI-compatible endpoint, but we
-                # deliberately SKIP its SSE streaming path and always use the
-                # non-streaming call. Known compat-layer bugs (verified against
-                # googleapis/python-genai#2868 and discuss.ai.google.dev#60140):
-                #   1. stream deltas omit the tool_call index field -> parallel
-                #      tool calls collapse into one slot and names get
-                #      concatenated (e.g. "extract_schematic_netlistlist_...");
-                #   2. stream deltas omit the tool_call id -> empty id in the
-                #      next-turn history is rejected by the endpoint (HTTP 400);
-                #   3. finish_reason comes back "stop" instead of "tool_calls",
-                #      which makes OpenAI-protocol clients end the tool loop.
-                # A local-id generator is community-verified to work (non-empty
-                # id + matching tool_call_id), but it only fixes #2 and still
-                # leaves #1/#3, all three depend on a moving compat layer that
-                # Google is actively fixing, so a real streaming fix is on hold
-                # (see issue #145). Non-streaming responses carry a genuine
-                # model-issued id and finish_reason, so they are safe.
-                # Text lifecycle events are emulated below so the UI keeps its
-                # streaming feel.
-                response = self._call_openai(system, tools)
-                if on_stream_event is not None and not response.get("error"):
-                    on_stream_event({"type": "text_start"})
-                    content = response.get("message", {}).get("content")
-                    if content:
-                        on_stream_event({"type": "text_chunk", "content": content})
-                    on_stream_event({"type": "text_end"})
             elif on_stream_event is not None:
                 if provider == "anthropic":
                     response = self._stream_anthropic(system, tools, on_stream_event)
+                elif self._is_gemini_endpoint():
+                    # Google's OpenAI-compatible endpoint streams, but we
+                    # deliberately SKIP its SSE streaming path and always use
+                    # the non-streaming call. Known compat-layer bugs (verified
+                    # against googleapis/python-genai#2868 and
+                    # discuss.ai.google.dev#60140):
+                    #   1. stream deltas omit the tool_call index field ->
+                    #      parallel tool calls collapse into one slot and names
+                    #      get concatenated (e.g.
+                    #      "extract_schematic_netlistlist_...");
+                    #   2. stream deltas omit the tool_call id -> empty id in
+                    #      the next-turn history is rejected (HTTP 400);
+                    #   3. finish_reason comes back "stop" instead of
+                    #      "tool_calls", ending the tool loop prematurely.
+                    # A local-id generator is community-verified to work
+                    # (non-empty id + matching tool_call_id), but it only
+                    # fixes #2 and still leaves #1/#3; all three depend on a
+                    # moving compat layer Google is actively fixing, so a real
+                    # streaming fix is on hold (issue #145). Non-streaming
+                    # responses carry a genuine model-issued id and
+                    # finish_reason, so they are safe.
+                    response = self._call_openai(system, tools)
+                    if not response.get("error"):
+                        on_stream_event({"type": "text_start"})
+                        content = response.get("message", {}).get("content")
+                        if content:
+                            on_stream_event({"type": "text_chunk", "content": content})
+                        on_stream_event({"type": "text_end"})
                 else:
                     response = self._stream_openai(system, tools, on_stream_event)
             elif provider == "anthropic":
@@ -3222,6 +3223,15 @@ class LLMClient:
             headers["x-api-key"] = self._settings.llm_api_key
         return headers
 
+    def _is_gemini_endpoint(self) -> bool:
+        """True when the configured base URL targets Google's OpenAI-compatible
+        endpoint (generativelanguage.googleapis.com). Detection is URL-based
+        rather than provider-tagged because the SSE bugs this works around (see
+        _call_llm) belong to Google's compat layer, not to any local provider
+        label."""
+        base = (self._settings.llm_base_url or "https://api.openai.com").rstrip("/")
+        return "generativelanguage.googleapis.com" in base
+
     def _openai_headers(self) -> dict[str, str]:
         """Build headers for OpenAI-compatible endpoints with optional auth."""
         headers = {"Content-Type": "application/json"}
@@ -3231,10 +3241,6 @@ class LLMClient:
 
     def _call_openai(self, system: str, tools: list[dict]) -> dict[str, Any]:
         base = (self._settings.llm_base_url or "https://api.openai.com").rstrip("/")
-        # Gemini OpenAI-compatible shim: pick a sane default for the gemini
-        # provider so users only need to fill the API key.
-        if self._settings.llm_provider == "gemini" and not self._settings.llm_base_url:
-            base = "https://generativelanguage.googleapis.com/v1beta/openai"
         # Accept either a server root (e.g. "https://api.openai.com") or a
         # full endpoint URL (e.g. ".../v1/chat/completions").  Only append the
         # default path when the user hasn't already specified one.
@@ -3255,8 +3261,6 @@ class LLMClient:
             "messages": messages,
             "tools": tools or None,
         }
-        if self._settings.llm_provider == "gemini" and not self._settings.llm_model:
-            payload_dict["model"] = "gemini-2.5-flash"
         if self._max_tokens > 0:
             payload_dict["max_tokens"] = self._max_tokens
         payload = json.dumps(payload_dict).encode()

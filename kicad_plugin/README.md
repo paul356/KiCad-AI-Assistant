@@ -78,17 +78,20 @@ Settings are stored in the KiCad user config directory:
 
 | Setting | Description | Default |
 |---------|-------------|---------|
-| `llm_provider` | `openai`, `anthropic`, `ollama`, or `gemini` | `openai` |
+| `llm_provider` | `openai`, `anthropic`, or `ollama` | `openai` |
 | `llm_api_key` | API key; optional for unauthenticated compatible endpoints | (empty) |
 | `llm_model` | Model name | `gpt-4o` |
-| `llm_base_url` | Custom OpenAI, Anthropic, Ollama, or Gemini-compatible endpoint URL | (uses provider default) |
+| `llm_base_url` | Custom OpenAI, Anthropic, or Ollama-compatible endpoint URL | (uses provider default) |
 | `server_port` | Fixed port for MCP server (0 = auto) | `0` |
 | `show_tool_log` | Show tool-call log by default | `true` |
 
-**Gemini:** select `gemini` and fill in your Google API key — the default
-endpoint automatically points at `generativelanguage.googleapis.com`'s
-OpenAI-compatible API. Gemini responds non-streaming; the plugin emulates
-streaming text events so the UI keeps the same feel.
+**Gemini:** keep `llm_provider` as `openai` and set `llm_base_url` to
+`https://generativelanguage.googleapis.com/v1beta/openai` (plus your model,
+e.g. `gemini-2.5-flash`, in `llm_model`). The plugin detects the Google
+endpoint by URL — no separate provider entry needed — and responds
+non-streaming, because Google's OpenAI-compatible SSE stream omits tool-call
+`index` and `id` fields (which breaks multi-tool calls and the next-turn
+history). Streaming text events are emulated so the UI keeps the same feel.
 
 ## Available Tools (Milestone 1)
 

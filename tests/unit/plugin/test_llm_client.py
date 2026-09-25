@@ -9,7 +9,7 @@ import ssl
 import sys
 import threading
 import types
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 import urllib.error
 
 import pytest
@@ -1594,17 +1594,35 @@ class TestOpenAICompatibleRequests:
 
 
 # ---------------------------------------------------------------------------
-# Explicit gemini provider (issue #145): non-streaming OpenAI-compatible
-# calls + emulated text lifecycle events. Gemini's SSE stream omits tool_call
-# index AND id, breaking multi-tool aggregation and the next-turn history
-# (HTTP 400); the non-streaming response carries both.
+# Google OpenAI-compatible endpoint (issue #145): detected by BASE URL, not by
+# a provider tag. The plugin skips its SSE streaming path and uses
+# non-streaming calls + emulated text lifecycle events, because Google's
+# stream omits tool_call index AND id, breaking multi-tool aggregation and the
+# next-turn history (HTTP 400); the non-streaming response carries both.
 # ---------------------------------------------------------------------------
 
 
-class TestGeminiProvider:
-    def test_call_llm_gemini_non_streaming_emits_events(self):
+GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/openai"
+
+
+class TestGeminiEndpointDetection:
+    def test_is_gemini_endpoint_true_for_google_url(self):
         client = _make_client()
-        client._settings.llm_provider = "gemini"
+        client._settings.llm_base_url = GEMINI_BASE
+        assert client._is_gemini_endpoint() is True
+
+    def test_is_gemini_endpoint_false_for_other_urls(self):
+        client = _make_client()
+        for url in ("", "https://api.openai.com", "https://my-proxy.local/v1"):
+            client._settings.llm_base_url = url
+            assert client._is_gemini_endpoint() is False, url
+
+
+class TestGeminiEndpointNonStreaming:
+    def test_call_llm_gemini_url_non_streaming_emits_events(self):
+        client = _make_client()
+        client._settings.llm_provider = "openai"  # provider tag is irrelevant
+        client._settings.llm_base_url = GEMINI_BASE
         response = {
             "finish_reason": "stop",
             "message": {"role": "assistant", "content": "hello gemini"},
@@ -1627,7 +1645,7 @@ class TestGeminiProvider:
 
     def test_call_llm_gemini_tool_calls_kept_intact(self):
         client = _make_client()
-        client._settings.llm_provider = "gemini"
+        client._settings.llm_base_url = GEMINI_BASE
         tool_calls = [
             {
                 "index": 0,
@@ -1667,11 +1685,26 @@ class TestGeminiProvider:
 
         assert events == [{"type": "text_start"}, {"type": "text_end"}]
 
-    def test_call_openai_gemini_defaults(self):
+    def test_non_gemini_url_still_streams(self):
+        # URL detection must not change behavior for other OpenAI-compatible
+        # endpoints: they keep the real streaming path.
         client = _make_client()
-        client._settings.llm_provider = "gemini"
-        client._settings.llm_base_url = ""
-        client._settings.llm_model = ""
+        client._settings.llm_base_url = "https://my-proxy.local/v1"
+        with (
+            patch.object(client, "_call_openai") as mock_openai,
+            patch.object(client, "_stream_openai") as mock_stream,
+        ):
+            client._call_llm("sys", [], on_stream_event=lambda e: None)
+
+        mock_openai.assert_not_called()
+        mock_stream.assert_called_once_with("sys", [], ANY)
+
+    def test_call_openai_uses_configured_google_url(self):
+        # No implicit provider-based defaults anymore: the configured base URL
+        # is used as-is (chat/completions appended only when path is missing).
+        client = _make_client()
+        client._settings.llm_base_url = GEMINI_BASE
+        client._settings.llm_model = "gemini-2.5-flash"
         response = json.dumps(
             {"choices": [{"finish_reason": "stop", "message": {"content": "hi"}}]}
         )
@@ -1681,8 +1714,6 @@ class TestGeminiProvider:
         ) as post:
             client._call_openai("sys", [])
 
-        # Default base ends in /openai → endpoint is .../openai/chat/completions
-        # (no spurious /v1 segment), plus the default gemini model.
         url = post.call_args.args[0]
         assert url == "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
         payload = json.loads(post.call_args.args[2])
