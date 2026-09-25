@@ -9,7 +9,7 @@ import ssl
 import sys
 import threading
 import types
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 import urllib.error
 
 import pytest
@@ -81,6 +81,7 @@ def _make_client(
         llm_compact_threshold=compact_threshold,
         llm_compact_target_threshold=compact_target,
         llm_keep_recent_turns=keep_recent_turns,
+        llm_supports_vision=False,
     )
     return LLMClient(settings, mcp_base_url="http://127.0.0.1:9999")
 
@@ -1388,6 +1389,87 @@ class TestRunIntegration:
         assert "no execution policy" in result["error"]
         assert "unknown_tool" not in client._enabled_tools
 
+    def test_tool_returned_image_injected_only_when_vision_enabled(self):
+        """A tool result with an MCP image block becomes an image_url user
+        message only when the model is configured to accept images; otherwise
+        the text report alone is kept (matches the UI attachment gate)."""
+        final_response = {"finish_reason": "stop", "message": {"content": "done"}}
+
+        def _image_result(*_args, **_kwargs) -> dict:
+            return {
+                "success": True,
+                "text": "board rendered",
+                "_image": {"media_type": "image/png", "data": "QUJD"},
+            }
+
+        # vision disabled (default) — image must NOT reach history
+        client = _make_client()
+        client._call_llm = MagicMock(
+            side_effect=[
+                {
+                    "finish_reason": "tool_calls",
+                    "message": {
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "tc1",
+                                "type": "function",
+                                "function": {
+                                    "name": "export_pcb_layer_image",
+                                    "arguments": json.dumps({"pcb_path": "/tmp/board.kicad_pcb"}),
+                                },
+                            }
+                        ],
+                    },
+                },
+                final_response,
+            ]
+        )
+        client._enabled_tools = {"export_pcb_layer_image"}
+        with patch("kicad_plugin.llm_client.call_mcp_tool", side_effect=_image_result) as mock_tool:
+            mock_tool.side_effect = _image_result
+            result = client.run("render the board", context_block="")
+
+        assert result == "done"
+        image_msgs = [m for m in client._history if isinstance(m.get("content"), list)]
+        assert image_msgs == [], "image must not be injected when vision is disabled"
+
+        # vision enabled — image_url user message appended after tool results
+        client = _make_client()
+        client._settings.llm_supports_vision = True
+        client._call_llm = MagicMock(
+            side_effect=[
+                {
+                    "finish_reason": "tool_calls",
+                    "message": {
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "tc1",
+                                "type": "function",
+                                "function": {
+                                    "name": "export_pcb_layer_image",
+                                    "arguments": json.dumps({"pcb_path": "/tmp/board.kicad_pcb"}),
+                                },
+                            }
+                        ],
+                    },
+                },
+                final_response,
+            ]
+        )
+        client._enabled_tools = {"export_pcb_layer_image"}
+        with patch("kicad_plugin.llm_client.call_mcp_tool", side_effect=_image_result) as mock_tool:
+            mock_tool.side_effect = _image_result
+            result = client.run("render the board", context_block="")
+
+        assert result == "done"
+        image_msgs = [m for m in client._history if isinstance(m.get("content"), list)]
+        assert len(image_msgs) == 1
+        blocks = image_msgs[0]["content"]
+        assert blocks[0]["type"] == "image_url"
+        assert blocks[0]["image_url"]["url"] == "data:image/png;base64,QUJD"
+
 
 class TestToolPolicyRegistry:
     def test_registry_covers_plugin_tool_surface(self):
@@ -1509,6 +1591,143 @@ class TestOpenAICompatibleRequests:
             "Content-Type": "application/json",
             "anthropic-version": "2023-06-01",
         }
+
+
+# ---------------------------------------------------------------------------
+# Google OpenAI-compatible endpoint (issue #145): detected by BASE URL, not by
+# a provider tag. The plugin skips its SSE streaming path and uses
+# non-streaming calls + emulated text lifecycle events, because Google's
+# stream omits tool_call index AND id, breaking multi-tool aggregation and the
+# next-turn history (HTTP 400); the non-streaming response carries both.
+# ---------------------------------------------------------------------------
+
+
+GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/openai"
+
+
+class TestGeminiEndpointDetection:
+    def test_is_gemini_endpoint_true_for_google_url(self):
+        client = _make_client()
+        client._settings.llm_base_url = GEMINI_BASE
+        assert client._is_gemini_endpoint() is True
+
+    def test_is_gemini_endpoint_false_for_other_urls(self):
+        client = _make_client()
+        for url in ("", "https://api.openai.com", "https://my-proxy.local/v1"):
+            client._settings.llm_base_url = url
+            assert client._is_gemini_endpoint() is False, url
+
+
+class TestGeminiEndpointNonStreaming:
+    def test_call_llm_gemini_url_non_streaming_emits_events(self):
+        client = _make_client()
+        client._settings.llm_provider = "openai"  # provider tag is irrelevant
+        client._settings.llm_base_url = GEMINI_BASE
+        response = {
+            "finish_reason": "stop",
+            "message": {"role": "assistant", "content": "hello gemini"},
+        }
+        events = []
+        with (
+            patch.object(client, "_call_openai", return_value=response) as mock_openai,
+            patch.object(client, "_stream_openai") as mock_stream,
+        ):
+            result = client._call_llm("sys", [], on_stream_event=events.append)
+
+        mock_openai.assert_called_once_with("sys", [])
+        mock_stream.assert_not_called()
+        assert events == [
+            {"type": "text_start"},
+            {"type": "text_chunk", "content": "hello gemini"},
+            {"type": "text_end"},
+        ]
+        assert result["message"]["content"] == "hello gemini"
+
+    def test_call_llm_gemini_tool_calls_kept_intact(self):
+        client = _make_client()
+        client._settings.llm_base_url = GEMINI_BASE
+        tool_calls = [
+            {
+                "index": 0,
+                "id": "tc-gemini-1",
+                "type": "function",
+                "function": {"name": "extract_schematic_netlist", "arguments": "{}"},
+            },
+            {
+                "index": 1,
+                "id": "tc-gemini-2",
+                "type": "function",
+                "function": {"name": "list_footprints", "arguments": "{}"},
+            },
+        ]
+        response = {
+            "finish_reason": "tool_calls",
+            "message": {"role": "assistant", "content": None, "tool_calls": tool_calls},
+        }
+
+        with patch.object(client, "_call_openai", return_value=response):
+            result = client._call_llm("sys", [])
+
+        # Non-streaming tool_calls arrive whole: no name concatenation, ids intact.
+        assert result["message"]["tool_calls"] == tool_calls
+        assert len(result["message"]["tool_calls"]) == 2
+        names = [tc["function"]["name"] for tc in result["message"]["tool_calls"]]
+        assert names == ["extract_schematic_netlist", "list_footprints"]
+        ids = [tc["id"] for tc in result["message"]["tool_calls"]]
+        assert all(ids)
+        assert len(set(ids)) == 2
+
+        # Emulated event surface with no text content: lifecycle only, no
+        # empty text_chunk.
+        events = []
+        with patch.object(client, "_call_openai", return_value=response):
+            client._call_llm("sys", [], on_stream_event=events.append)
+
+        assert events == [{"type": "text_start"}, {"type": "text_end"}]
+
+    def test_non_gemini_url_still_streams(self):
+        # URL detection must not change behavior for other OpenAI-compatible
+        # endpoints: they keep the real streaming path.
+        client = _make_client()
+        client._settings.llm_base_url = "https://my-proxy.local/v1"
+        with (
+            patch.object(client, "_call_openai") as mock_openai,
+            patch.object(client, "_stream_openai") as mock_stream,
+        ):
+            client._call_llm("sys", [], on_stream_event=lambda e: None)
+
+        mock_openai.assert_not_called()
+        mock_stream.assert_called_once_with("sys", [], ANY)
+
+    def test_call_openai_uses_configured_google_url(self):
+        # No implicit provider-based defaults anymore: the configured base URL
+        # is used as-is (chat/completions appended only when path is missing).
+        client = _make_client()
+        client._settings.llm_base_url = GEMINI_BASE
+        client._settings.llm_model = "gemini-2.5-flash"
+        response = json.dumps(
+            {"choices": [{"finish_reason": "stop", "message": {"content": "hi"}}]}
+        )
+
+        with patch(
+            "kicad_plugin.llm_client._https_post_json", return_value=(200, response)
+        ) as post:
+            client._call_openai("sys", [])
+
+        url = post.call_args.args[0]
+        assert url == "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+        payload = json.loads(post.call_args.args[2])
+        assert payload["model"] == "gemini-2.5-flash"
+
+        # openai provider without a custom base URL is unchanged.
+        client2 = _make_client()
+        with patch(
+            "kicad_plugin.llm_client._https_post_json", return_value=(200, response)
+        ) as post2:
+            client2._call_openai("sys", [])
+
+        assert post2.call_args.args[0] == "https://api.openai.com/v1/chat/completions"
+        assert json.loads(post2.call_args.args[2])["model"] == "gpt-4o"
 
 
 class TestHttpsFallback:
@@ -1723,6 +1942,63 @@ class TestStreaming:
         assert tc[0]["function"]["name"] == "add_wire"
         assert tc[0]["function"]["arguments"] == '{"x":1}'
         assert result["finish_reason"] == "tool_calls"
+
+    def test_stream_openai_tool_calls_without_index(self):
+        """Gemini's OpenAI-compatible shim omits the per-delta tool-call
+        ``index`` field; the parser must default it instead of KeyError."""
+        client = _make_client()
+        sse_lines = [
+            'data: {"choices":[{"delta":{"tool_calls":[{"id":"tc1","function":{"name":"add_wire","arguments":""}}]},"finish_reason":null}]}',
+            'data: {"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"{\\"x\\":"}}]},"finish_reason":null}]}',
+            'data: {"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"1}"}}]},"finish_reason":null}]}',
+            'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}',
+            "data: [DONE]",
+        ]
+        chunks = []
+        mock_resp = self._make_sse_response(sse_lines)
+        with patch("urllib.request.urlopen", return_value=mock_resp):
+            result = client._stream_openai("sys", [], on_stream_event=_on_event_collect(chunks))
+
+        assert chunks == []
+        tc = result["message"]["tool_calls"]
+        assert len(tc) == 1
+        assert tc[0]["id"] == "tc1"
+        assert tc[0]["function"]["name"] == "add_wire"
+        assert tc[0]["function"]["arguments"] == '{"x":1}'
+        assert result["finish_reason"] == "tool_calls"
+
+    def test_stream_openai_gemini_shim_url(self):
+        """A base URL that already ends in /openai (Gemini's shim) must
+        not gain a spurious /v1/ path segment: .../openai/chat/completions,
+        not .../openai/v1/chat/completions."""
+        client = _make_client()
+        client._settings.llm_base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
+        sse_lines = [
+            'data: {"choices":[{"delta":{"content":"Hello"},"finish_reason":null}]}',
+            'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}',
+            "data: [DONE]",
+        ]
+        mock_resp = self._make_sse_response(sse_lines)
+        with patch("urllib.request.urlopen", return_value=mock_resp) as m:
+            client._stream_openai("sys", [], on_stream_event=lambda evt: None)
+
+        url = m.call_args[0][0].full_url
+        assert url == ("https://generativelanguage.googleapis.com/v1beta/openai/chat/completions")
+
+    def test_call_openai_gemini_shim_url(self):
+        """Same endpoint fix for the non-streaming path (_call_openai),
+        used by history compaction / non-stream callers."""
+        client = _make_client()
+        client._settings.llm_base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
+        with patch(
+            "kicad_plugin.llm_client._https_post_json",
+            return_value=(200, '{"choices":[{"message":{"content":"hi"}}]}'),
+        ) as m:
+            result = client._call_openai("sys", [])
+
+        assert result["message"]["content"] == "hi"
+        url = m.call_args[0][0]
+        assert url == ("https://generativelanguage.googleapis.com/v1beta/openai/chat/completions")
 
     def test_stream_anthropic_http_error_includes_body(self):
         client = _make_client()

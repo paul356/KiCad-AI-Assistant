@@ -615,7 +615,9 @@ try:
                 if reasoning_part:
                     reasoning.append(reasoning_part)
                 for tc_delta in delta.get("tool_calls") or []:
-                    idx = tc_delta["index"]
+                    # Same tolerance as the in-process parser: gateways
+                    # (Gemini) may omit the tool-call index.
+                    idx = tc_delta.get("index", 0)
                     if idx not in tool_calls:
                         tool_calls[idx] = {
                             "id": "", "type": "function",
@@ -1000,13 +1002,27 @@ def call_mcp_tool(base_url: str, tool_name: str, arguments: dict[str, Any]) -> d
         return {"success": False, "error": body["error"].get("message", str(body["error"]))}
 
     result = body.get("result", {})
-    # FastMCP returns content as a list of {type, text} blocks
+    # FastMCP returns content as a list of {type, text} / {type, image} blocks
     content = result.get("content", [])
-    if content and isinstance(content, list) and content[0].get("type") == "text":
-        try:
-            return json.loads(content[0]["text"])
-        except json.JSONDecodeError:
-            return {"success": True, "text": content[0]["text"]}
+    image: dict[str, str] | None = None
+    if isinstance(content, list):
+        text = next((b for b in content if b.get("type") == "text"), None)
+        img = next((b for b in content if b.get("type") == "image"), None)
+        if img is not None:
+            image = {
+                "media_type": img.get("mimeType", "image/png"),
+                "data": img.get("data", ""),
+            }
+        if text is not None:
+            try:
+                out = json.loads(text.get("text", ""))
+            except json.JSONDecodeError:
+                out = {"success": True, "text": text.get("text", "")}
+            if isinstance(out, dict):
+                out["_image"] = image
+            return out
+    if image is not None:
+        return {"success": True, "_image": image}
     return result
 
 
@@ -2467,6 +2483,7 @@ class LLMClient:
                     msg_to_save["tool_calls"] = message["tool_calls"]
                 self._history.append(msg_to_save)
                 tool_results = []
+                result_images: list[dict[str, str]] = []
                 for tc in tool_calls:
                     name = tc["function"]["name"]
                     try:
@@ -2475,6 +2492,17 @@ class LLMClient:
                         args = {}
 
                     result = self._execute_or_reject_tool(name, args, state, on_tool_call)
+
+                    # Image-bearing tool results (e.g. export_pcb_layer_image)
+                    # carry the PNG as a separate MCP image block.  Peel it off
+                    # the JSON text payload and relay it as an OpenAI-style
+                    # image_url user message so every provider conversion
+                    # (_anthropic_content / _ollama_messages) can see the image.
+                    image = None
+                    if isinstance(result, dict) and result.get("_image"):
+                        image = result.pop("_image")
+                    if image:
+                        result_images.append(image)
 
                     tool_results.append(
                         {
@@ -2485,6 +2513,21 @@ class LLMClient:
                     )
 
                 self._history.extend(tool_results)
+                if result_images and self._settings.llm_supports_vision:
+                    self._history.append(
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": (f"data:{img['media_type']};base64,{img['data']}")
+                                    },
+                                }
+                                for img in result_images
+                            ],
+                        }
+                    )
             else:
                 reply = (
                     "[Error] Maximum tool-call iterations reached. Please try a simpler request."
@@ -2611,6 +2654,34 @@ class LLMClient:
             elif on_stream_event is not None:
                 if provider == "anthropic":
                     response = self._stream_anthropic(system, tools, on_stream_event)
+                elif self._is_gemini_endpoint():
+                    # Google's OpenAI-compatible endpoint streams, but we
+                    # deliberately SKIP its SSE streaming path and always use
+                    # the non-streaming call. Known compat-layer bugs (verified
+                    # against googleapis/python-genai#2868 and
+                    # discuss.ai.google.dev#60140):
+                    #   1. stream deltas omit the tool_call index field ->
+                    #      parallel tool calls collapse into one slot and names
+                    #      get concatenated (e.g.
+                    #      "extract_schematic_netlistlist_...");
+                    #   2. stream deltas omit the tool_call id -> empty id in
+                    #      the next-turn history is rejected (HTTP 400);
+                    #   3. finish_reason comes back "stop" instead of
+                    #      "tool_calls", ending the tool loop prematurely.
+                    # A local-id generator is community-verified to work
+                    # (non-empty id + matching tool_call_id), but it only
+                    # fixes #2 and still leaves #1/#3; all three depend on a
+                    # moving compat layer Google is actively fixing, so a real
+                    # streaming fix is on hold (issue #145). Non-streaming
+                    # responses carry a genuine model-issued id and
+                    # finish_reason, so they are safe.
+                    response = self._call_openai(system, tools)
+                    if not response.get("error"):
+                        on_stream_event({"type": "text_start"})
+                        content = response.get("message", {}).get("content")
+                        if content:
+                            on_stream_event({"type": "text_chunk", "content": content})
+                        on_stream_event({"type": "text_end"})
                 else:
                     response = self._stream_openai(system, tools, on_stream_event)
             elif provider == "anthropic":
@@ -2667,8 +2738,16 @@ class LLMClient:
                     i += 1
                 if i < len(self._history) and self._history[i].get("role") == "user":
                     content = self._history[i].get("content") or ""
-                    if isinstance(content, str) and content.strip():
-                        tool_results.append({"type": "text", "text": content})
+                    if isinstance(content, str):
+                        if content.strip():
+                            tool_results.append({"type": "text", "text": content})
+                    elif isinstance(content, list):
+                        # Multimodal follow-up (e.g. a rendered board image from
+                        # export_pcb_layer_image): convert OpenAI-style blocks
+                        # to Anthropic blocks and fold into the tool results.
+                        converted = self._anthropic_content(content)
+                        if isinstance(converted, list):
+                            tool_results.extend(converted)
                     i += 1
                 messages.append({"role": "user", "content": tool_results})
                 continue
@@ -2742,6 +2821,11 @@ class LLMClient:
             url = base
         elif base.endswith("/v1"):
             url = f"{base}/chat/completions"
+        elif base.endswith("/openai"):
+            # Gemini's OpenAI-compatible shim: <v1beta/openai> already
+            # pins the API version, so the endpoint is .../chat/completions,
+            # not .../v1/chat/completions.
+            url = f"{base}/chat/completions"
         else:
             url = f"{base}/v1/chat/completions"
 
@@ -2804,7 +2888,11 @@ class LLMClient:
                             _current_reasoning.append(reasoning)
 
                         for tc_delta in delta.get("tool_calls") or []:
-                            idx = tc_delta["index"]
+                            # OpenAI-compatible gateways (e.g. Gemini's
+                            # v1beta/openai shim) may omit the per-delta
+                            # tool-call index; default to 0 (a single
+                            # function call) instead of raising KeyError.
+                            idx = tc_delta.get("index", 0)
                             if idx not in tool_calls_by_index:
                                 tool_calls_by_index[idx] = {
                                     "id": "",
@@ -3135,6 +3223,15 @@ class LLMClient:
             headers["x-api-key"] = self._settings.llm_api_key
         return headers
 
+    def _is_gemini_endpoint(self) -> bool:
+        """True when the configured base URL targets Google's OpenAI-compatible
+        endpoint (generativelanguage.googleapis.com). Detection is URL-based
+        rather than provider-tagged because the SSE bugs this works around (see
+        _call_llm) belong to Google's compat layer, not to any local provider
+        label. An empty base URL (default OpenAI endpoint) is not Gemini."""
+        base = (self._settings.llm_base_url or "").rstrip("/")
+        return "generativelanguage.googleapis.com" in base
+
     def _openai_headers(self) -> dict[str, str]:
         """Build headers for OpenAI-compatible endpoints with optional auth."""
         headers = {"Content-Type": "application/json"}
@@ -3150,6 +3247,11 @@ class LLMClient:
         if "/chat/completions" in base:
             url = base
         elif base.endswith("/v1"):
+            url = f"{base}/chat/completions"
+        elif base.endswith("/openai"):
+            # Gemini's OpenAI-compatible shim: <v1beta/openai> already
+            # pins the API version, so the endpoint is .../chat/completions,
+            # not .../v1/chat/completions.
             url = f"{base}/chat/completions"
         else:
             url = f"{base}/v1/chat/completions"
