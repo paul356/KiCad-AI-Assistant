@@ -85,14 +85,6 @@ Settings are stored in the KiCad user config directory:
 | `server_port` | Fixed port for MCP server (0 = auto) | `0` |
 | `show_tool_log` | Show tool-call log by default | `true` |
 
-**Gemini:** keep `llm_provider` as `openai` and set `llm_base_url` to
-`https://generativelanguage.googleapis.com/v1beta/openai` (plus your model,
-e.g. `gemini-2.5-flash`, in `llm_model`). The plugin detects the Google
-endpoint by URL — no separate provider entry needed — and responds
-non-streaming, because Google's OpenAI-compatible SSE stream omits tool-call
-`index` and `id` fields (which breaks multi-tool calls and the next-turn
-history). Streaming text events are emulated so the UI keeps the same feel.
-
 ## Available Tools (Milestone 1)
 
 The plugin exposes 25 schematic editing tools to the LLM:
