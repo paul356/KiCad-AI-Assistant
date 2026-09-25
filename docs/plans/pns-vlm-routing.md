@@ -1,9 +1,21 @@
-# VLM + Self-Built PNS Routing — Design Study (v2: engine replacement)
+# VLM + Self-Built PNS Routing — Design Study (v3: VLM+PNS collaboration)
 
-> Status: design study (no code yet). v2 supersedes the "A\* + shove fallback"
-> plan of v1: the goal is to **replace grid A\* with a KiCad-style PNS engine**
-> (walkaround + shove + 45°/arc skeleton), not to patch A\*.
-> Complements `docs/plans/vlm-feedback-routing.md` (VLM loop shipped).
+> Status: v2 engine **implemented** (multi-layer PNS + leg-internal arcs +
+> `options`/`corner_mode=rounded45` default, issue #143 / PR #144). v3 defines
+> the **VLM ↔ PNS collaboration interface**: anchor-chain control surface,
+> render-first failure feedback, dry-run + candidate selection.
+> Complements `docs/plans/vlm-feedback-routing.md` (v1 closed loop shipped).
+
+> **v3 changelog (2026-09-25)**
+> - Failure feedback is **render-first**: the image is the primary channel;
+>   structured data is only annotation on the image. Structured `RouteFailure`
+>   fields alone are not intuitive enough for a visual model.
+> - Control surface **collapsed to the anchor chain**: `waypoints` + explicit
+>   `vias` are the only spatial knobs the VLM needs. All engine-internal knobs
+>   (shove depth/nets, max_length, max_vias, net_kind, keepouts, preferred
+>   region) are dropped from the VLM-facing interface.
+> - Interaction paradigm: **PNS proposes all legal candidates, VLM selects**,
+>   via `dry_run` (no board write) + `candidates` (multi-solution render).
 
 ## 1. Decision: replace, don't patch
 
@@ -212,3 +224,128 @@ retry with different corner mode / layer — no A\* concepts in the prompt.
   `kcaa/tools/render_board_tools.py` (arc drawing),
   `kicad_plugin/skills/pcb-routing.md` (corner mode strategy)
 - Docs: this plan (v2)
+
+---
+
+# Part II — v3: VLM ↔ PNS collaboration design
+
+## 7. Collaboration model (anchored loop)
+
+Division of labor, restated with the anchor chain as the interface:
+
+- **VLM** (global, semantic, ~1mm positional precision): reads the rendered
+  board, emits an **ordered anchor chain** (pads, waypoints, vias), picks
+  layers/order, decides accept/retry/abandon from rendered evidence.
+- **PNS** (local, exact, DRC-guaranteed): consumes the anchor chain, performs
+  per-leg `BuildInitialTrace → walkaround → shove`, emits legal routes (or
+  rendered failure evidence).
+
+```
+① VLM sees whole-board render (pad labels)
+② emits anchor chain [pad_a, wp1, via1, pad_b] + layer/width + dry_run
+③ PNS routes leg by leg (anchors split legs — existing anchors[] mechanism,
+   router.py:913)
+④ result rendered back: success = green path; failure = grey attempted
+   skeleton + red-blocked obstacles + green anchors
+⑤ VLM reads the picture: adjust anchors / layer / order, or commit (dry_run=False)
+```
+
+This matches KiCad interactive routing itself: the human (VLM) clicks anchors,
+PNS owns the precise geometry between them.
+
+## 8. Render-first failure feedback (W1)
+
+Failure feedback is **image-primary**. Structured fields survive only as
+annotation text on the image. Rendering additions (all in existing renderers,
+zero routing changes):
+
+| Element | Visual | Source |
+|---|---|---|
+| Pad labels | `R5.1`, `C3.2` text at each pad (size ~0.4mm, leader to pad) | `render_board_tools.py` — implemented (W1) |
+| Attempted skeleton | grey semi-transparent polyline | engine stages / failure trace (`_dump_viz`) |
+| Blocking obstacles | red highlight ring/circle on the colliding track/footprint | `RouteFailure.blocking_items` or `_dump_viz` obstacles |
+| Anchors | green dots at pad/waypoint/via positions | anchor chain |
+
+Rendering entry points:
+
+- `kcaa/tools/render_board_tools.py::render_board` — pad labels (always on
+  for VLM-facing boards; optional via param, default on).
+- `scripts/render_viz.py` — already renders stage JSON with `obstacles` and
+  optional `candidates`; add failure-highlight mode (grey path + red ring) and
+  **candidate side-by-side** mode (W3, renderer PR ready now).
+- Implemented (W1): `kcaa/tools/render_route_state.py` — one-call render of
+  "route attempt with failure evidence" from a `RouteResult`/`RouteFailure`
+  + anchor chain — reused by the MCP tool and the VLM driver script.
+
+Acceptance criteria (W1): board render shows pad labels; a forced-failure
+fixture produces a PNG with grey attempted path + red-highlighted blocker +
+green anchors; existing render tests stay green.
+
+## 9. Anchor-chain control surface (W2)
+
+VLM-facing parameters — **the complete spatial vocabulary**:
+
+```python
+# pcb_route_pad_to_pad gains (via options dict):
+#   anchors: ordered list of anchor specs; empty = straight pad-to-pad (today)
+#   dry_run: bool (default True for VLM flows) — compute + render, do NOT write
+Anchorspec = (
+    {"kind": "waypoint", "pos": (x, y), "tol_mm": 1.0}   # pass near (x,y) ± tol
+  | {"kind": "via",      "pos": (x, y), "to_layer": "B.Cu"}  # explicit via site
+  | {"kind": "pad",      "ref": "R5", "pad": "1"}
+)
+```
+
+- **waypoint**: preferred pass-through zone. PNS routes the leg toward it;
+  if the tolerance circle is unreachable, drop the `tol_mm` violation into the
+  failure render (grey marker at the requested pos) instead of hard-failing.
+- **via**: explicit layer-switch anchor. PNS DRC-validates, micro-shifts if the
+  exact spot is blocked (shift ≤ tol_mm), reports the actual site. The engine
+  already splits legs at `anchors = [pad_a, *vias, pad_b]` (router.py:913) —
+  waypoints are just non-layer-switching members of the same chain.
+- **dry_run**: route + render + return, no board write. v1's
+  `pcb_route_pad_to_pad` saves unconditionally; dry_run guards VLM experiments.
+
+**Dropped from the VLM-facing surface** (were proposed in earlier drafts, now
+out): keepouts, preferred_region, shove_nets/shove_depth, max_length_mm,
+max_vias, net_kind. Waypoints express intent; PNS owns engine internals.
+
+## 10. Candidate selection (W3)
+
+**PNS proposes all legal candidates, VLM selects.**
+
+- `candidates: int` (default 1) — PNS runs the request with N strategy
+  variants (walkaround-only / +shove / waypoint-tolerance variants), all
+  DRC-legal, all cheap (ms). Returns N `RouteResult`s.
+- Renderer draws them **side by side** (same board, per-candidate pane, shared
+  obstacle backing) — `render_viz.py` already reads an optional `candidates`
+  list; W3 wires it and adds the side-by-side layout.
+- VLM picks by look/global fit; the chosen index is re-run with
+  `dry_run=False` to commit.
+
+## 11. Multi-pair planning (W4)
+
+```python
+plan_routes(pcb_path, [
+    {"ref_a":..., "pad_a":..., "ref_b":..., "pad_b":..., "net":..., "anchors": [...]},
+    ...,
+], dry_run=True)
+```
+
+- **Channel reservation**: VLM can add a waypoint-anchor "reserve this region
+  for later pairs" (expressed as a waypoint the current pair must pass
+  *outside* — same vocabulary, no new knob).
+- **Order + undo**: plan runs pair-by-pair dry; VLM reorders on rendered
+  evidence; only the final confirmed plan writes. Failed legs render their
+  evidence so the VLM re-plans specifically, not by guessing.
+
+## 12. Milestones (v3)
+
+| W | Scope | Exit criteria |
+|---|---|---|
+| W1 | Rendering upgrade: pad labels in `render_board`; failure-evidence render (grey skeleton + red blockers + green anchors) | labelled board render; forced-failure fixture → evidence PNG; render tests green |
+| W2 | `anchors` (waypoint/via/pad specs) + `dry_run` on `pcb_route_pad_to_pad`/options; failure render wired to raise | anchor-routed fixtures pass; dry_run leaves file byte-identical; failure PNG on blocked anchor leg |
+| W3 | `candidates: int` multi-route + side-by-side candidate render | N-candidate fixtures render side-by-side; DRC-legal each |
+| W4 | `plan_routes` multi-pair, dry-run tee, undo/reorder | multi-pair fixture: reorder works; only confirmed plan written |
+
+W1 is renderer-only (no routing changes) — safe first step; W2–W4 build on it.

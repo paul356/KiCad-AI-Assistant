@@ -3,8 +3,9 @@ Self-contained PCB board renderer (no kicad-cli dependency).
 
 Renders a composite image of a KiCad board with the KiCad default theme
 (dark background): courtyards, copper layers, board edge, silkscreen text,
-and — when requested — the green ratsnest of user-specified pads that are
-not yet routed.
+pad labels (``ref.number``, default on for VLM-facing renders), and — when
+requested — the green ratsnest of user-specified pads that are not yet
+routed.
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ matplotlib.use("Agg")
 from fastmcp import Context, FastMCP
 from fastmcp.utilities.types import Image
 import matplotlib.patches as mpatches  # noqa: E402
+import matplotlib.patheffects as mpatheffects  # noqa: E402
 import matplotlib.pyplot as plt  # noqa: E402
 
 from kcaa.utils.pcb_sexp_utils import load_pcb
@@ -63,6 +65,15 @@ _Z_VIA = 5
 _Z_EDGE = 6
 _Z_SILK = 7
 _Z_RATSNEST = 8
+_Z_PAD_LABEL = 9
+
+# Pad labels (ref.number) drawn next to each pad, default on.
+_PAD_LABEL_MM = 0.4  # glyph height, mm
+_PAD_LABEL_OFFSET_MM = 0.6  # distance from the pad center, mm
+# Dark text with a white stroke stays readable over any fill (dark
+# background, copper, silkscreen).
+_PAD_LABEL_COLOR = "#0F0F12"
+_PAD_LABEL_STROKE = "#FFFFFF"
 
 _PT_PER_MM = 72.0 / 25.4
 
@@ -945,74 +956,21 @@ def _draw_arc(ax, entry: dict, color: str, lw: float, alpha: float, zorder: int)
     )
 
 
-def render_board(
-    pcb_path: str,
-    connect_pads: list[str] | None = None,
-    dpi: int | None = None,
-    layer: str | None = None,
-) -> tuple[list[str], bytes, dict[str, Any]]:
-    """Render a board to (report_lines, png_bytes, report_dict).
+def _new_board_figure(
+    xmin: float, ymin: float, xmax: float, ymax: float, dpi: int
+) -> tuple[Any, Any, int]:
+    """Create the standard KiCad-theme board figure.
 
-    ``layer``: optional copper layer name (e.g. ``"F.Cu"``) to render a
-    single-layer image.  Only that layer's zones/pads/tracks are drawn;
-    vias, board edge, courtyards and silkscreen stay as reference.
-
-    ``dpi`` scales the PNG resolution directly (line widths and font sizes
-    are in mm units, so a higher dpi gives a sharper image of the same
-    layout).  Defaults to 200.
-
-    connect_pads: optional list of ``ref.pad`` specs (e.g. ``["J1.2", "J2.2"]``)
-    to draw ratsnest lines for — green, only for nets that are not yet routed.
+    The PNG resolution is scaled so the board is sharp at any size (min
+    1600px wide); the returned effective dpi is what callers must pass to
+    ``savefig``.
     """
-    if dpi is None:
-        dpi = 200
-    board = parse_board(pcb_path)
-
-    # Resolve requested pads to nets (name-based in KiCad 10).
-    requested: dict[str, list[tuple[tuple[float, float], tuple[str, ...]]]] = {}
-    missing: list[str] = []
-    for spec in connect_pads or []:
-        ref, _, num = spec.partition(".")
-        found = None
-        for p in board.pads:
-            if p.ref == ref and p.number == num:
-                found = p
-                break
-        if found is None:
-            missing.append(spec)
-            continue
-        if found.net:
-            requested.setdefault(found.net, []).append((found.center, tuple(found.copper_layers)))
-
-    # Each ratsnest edge carries the copper layers shared by its endpoint
-    # pads (a route could exist there), so a single-layer render can draw it
-    # on the layer where both pads live.
-    ratsnest: list[tuple[tuple[float, float], tuple[float, float], set[str]]] = []
-    pending_nets: list[str] = []
-    routed_reported: list[str] = []
-    for net, pts in sorted(requested.items()):
-        if len(pts) < 2:
-            continue
-        if net in board.routed_nets:
-            routed_reported.append(net)
-            continue
-        pending_nets.append(net)
-        centers = [p[0] for p in pts]
-        layers = [p[1] for p in pts]
-        for j, i in _mst(centers):
-            # Layers both endpoint pads share (a route could exist there);
-            # fall back to the union when the pads have no common layer.
-            shared = set(layers[j]) & set(layers[i])
-            ratsnest.append((centers[j], centers[i], shared or (set(layers[j]) | set(layers[i]))))
-
-    # --- figure ---
-    xmin, ymin, xmax, ymax = _bounds(board, ratsnest)
-    w_mm, h_mm = xmax - xmin, ymax - ymin
+    w_mm = xmax - xmin
     fig_w_in = w_mm / 25.4
     # Scale dpi so the output is sharp at any board size (min 1600px wide).
     if w_mm >= 0.1:
         dpi = max(dpi, int(1600 / fig_w_in))
-    fig, ax = plt.subplots(figsize=(fig_w_in, h_mm / 25.4), dpi=dpi)
+    fig, ax = plt.subplots(figsize=(fig_w_in, (ymax - ymin) / 25.4), dpi=dpi)
     ax.set_facecolor(_BG_COLOR)
     fig.patch.set_facecolor(_BG_COLOR)
     ax.set_xlim(xmin, xmax)
@@ -1020,7 +978,48 @@ def render_board(
     ax.invert_yaxis()  # KiCad PCB convention: +Y down.
     ax.set_aspect("equal")
     ax.axis("off")
+    return fig, ax, dpi
 
+
+def _draw_pad_label(ax: Any, p: Pad) -> None:
+    """Draw a ``ref.number`` label beside the pad center.
+
+    Offset right-up from the center; flips to left-down when the label
+    would run past the rendered frame.
+    """
+    cx, cy = p.center
+    label = f"{p.ref}.{p.number}"
+    dx = dy = _PAD_LABEL_OFFSET_MM
+    ha, va = "left", "bottom"
+    xlim = ax.get_xlim()
+    ylim = ax.get_ylim()
+    # Rough glyph advance so the frame check covers the whole string.
+    width_est = len(label) * 0.6 * _PAD_LABEL_MM
+    if cx + dx + width_est > xlim[1] or cy + dy + _PAD_LABEL_MM > ylim[1]:
+        dx = dy = -_PAD_LABEL_OFFSET_MM
+        ha, va = "right", "top"
+    ax.text(
+        cx + dx,
+        cy + dy,
+        label,
+        ha=ha,
+        va=va,
+        fontsize=_PAD_LABEL_MM * _PT_PER_MM,
+        color=_PAD_LABEL_COLOR,
+        zorder=_Z_PAD_LABEL,
+        path_effects=[mpatheffects.withStroke(linewidth=0.3, foreground=_PAD_LABEL_STROKE)],
+    )
+
+
+def _draw_board_layers(
+    ax: Any, board: BoardData, layer: str | None = None, show_pad_labels: bool = False
+) -> int:
+    """Draw the static board layers into ``ax`` — zones, courtyards, copper
+    pads and tracks, vias, board edge, silkscreen — with optional
+    ``ref.number`` pad labels on top.  Returns the number of labels drawn.
+    """
+
+    pad_labels_drawn = 0
     # 1. Filled copper zones (bottom of visual stack).
     # Plain semi-transparent layer color, clipped to the board outline so the
     # fill never spills past the board edge.
@@ -1081,6 +1080,9 @@ def render_board(
                     zorder=_Z_VIA,
                 )
             )
+        if show_pad_labels:
+            pad_labels_drawn += 1
+            _draw_pad_label(ax, p)
     for seg in board.tracks:
         slayer = seg["layer"]
         if layer is not None and slayer != layer:
@@ -1143,6 +1145,78 @@ def render_board(
             fontweight="bold" if t["bold"] else "normal",
             zorder=_Z_SILK,
         )
+    return pad_labels_drawn
+
+
+def render_board(
+    pcb_path: str,
+    connect_pads: list[str] | None = None,
+    dpi: int | None = None,
+    layer: str | None = None,
+    show_pad_labels: bool = True,
+) -> tuple[list[str], bytes, dict[str, Any]]:
+    """Render a board to (report_lines, png_bytes, report_dict).
+
+    ``layer``: optional copper layer name (e.g. ``"F.Cu"``) to render a
+    single-layer image.  Only that layer's zones/pads/tracks are drawn;
+    vias, board edge, courtyards and silkscreen stay as reference.
+
+    ``dpi`` scales the PNG resolution directly (line widths and font sizes
+    are in mm units, so a higher dpi gives a sharper image of the same
+    layout).  Defaults to 200.
+
+    ``show_pad_labels``: draw a ``ref.number`` label beside every pad
+    (default on — needed for visual-model workflows that name pads; pass
+    False for a clean image).
+
+    connect_pads: optional list of ``ref.pad`` specs (e.g. ``["J1.2", "J2.2"]``)
+    to draw ratsnest lines for — green, only for nets that are not yet routed.
+    """
+    if dpi is None:
+        dpi = 200
+    board = parse_board(pcb_path)
+
+    # Resolve requested pads to nets (name-based in KiCad 10).
+    requested: dict[str, list[tuple[tuple[float, float], tuple[str, ...]]]] = {}
+    missing: list[str] = []
+    for spec in connect_pads or []:
+        ref, _, num = spec.partition(".")
+        found = None
+        for p in board.pads:
+            if p.ref == ref and p.number == num:
+                found = p
+                break
+        if found is None:
+            missing.append(spec)
+            continue
+        if found.net:
+            requested.setdefault(found.net, []).append((found.center, tuple(found.copper_layers)))
+
+    # Each ratsnest edge carries the copper layers shared by its endpoint
+    # pads (a route could exist there), so a single-layer render can draw it
+    # on the layer where both pads live.
+    ratsnest: list[tuple[tuple[float, float], tuple[float, float], set[str]]] = []
+    pending_nets: list[str] = []
+    routed_reported: list[str] = []
+    for net, pts in sorted(requested.items()):
+        if len(pts) < 2:
+            continue
+        if net in board.routed_nets:
+            routed_reported.append(net)
+            continue
+        pending_nets.append(net)
+        centers = [p[0] for p in pts]
+        layers = [p[1] for p in pts]
+        for j, i in _mst(centers):
+            # Layers both endpoint pads share (a route could exist there);
+            # fall back to the union when the pads have no common layer.
+            shared = set(layers[j]) & set(layers[i])
+            ratsnest.append((centers[j], centers[i], shared or (set(layers[j]) | set(layers[i]))))
+
+    # --- figure ---
+    xmin, ymin, xmax, ymax = _bounds(board, ratsnest)
+    fig, ax, dpi = _new_board_figure(xmin, ymin, xmax, ymax, dpi)
+    pad_labels = _draw_board_layers(ax, board, layer=layer, show_pad_labels=show_pad_labels)
 
     # 7. Ratsnest on top; in a single-layer render only edges touching that
     # layer (source or target pad) are drawn.  Hairline white dashes, like
@@ -1177,6 +1251,7 @@ def render_board(
 
     report: dict[str, Any] = {
         "pads": len(board.pads),
+        "pad_labels": pad_labels,
         "copper_layers": board.copper_layers,
         "connect_pads_requested": len(connect_pads or []),
         "missing_pads": missing,
@@ -1205,6 +1280,7 @@ def register_render_board_tools(mcp: FastMCP) -> None:
         connect_pads: list[str] | None = None,
         output_dir: str | None = None,
         layer: str | None = None,
+        show_pad_labels: bool = True,
         ctx: Context | None = None,
     ) -> tuple[str, Image]:
         """Render a KiCad PCB to a PNG image (no kicad-cli needed).
@@ -1218,7 +1294,9 @@ def register_render_board_tools(mcp: FastMCP) -> None:
         reference.  When ``connect_pads`` is provided (e.g. ``["J1.2",
         "J2.2"]``) the *unrouted* nets joining those pads are drawn as green
         ratsnest lines so the model can see exactly which pads still need to
-        be connected.
+        be connected.  Every pad also gets a ``REF.PAD`` label (e.g. ``R5.1``)
+        so a visual model can name the pads it wants to route — pass
+        ``show_pad_labels=False`` for a clean image.
 
         Args:
             pcb_path: Path to the .kicad_pcb file.
@@ -1227,12 +1305,19 @@ def register_render_board_tools(mcp: FastMCP) -> None:
                 are drawn as green ratsnest.
             output_dir: Optional directory to write the PNG to.
             layer: Optional copper layer name for a single-layer render.
+            show_pad_labels: Draw a ``REF.PAD`` label beside every pad
+                (default True).
             ctx: FastMCP context for progress reporting.
 
         Returns:
             A text report plus the PNG image.
         """
-        lines, png, report = render_board(pcb_path, connect_pads=connect_pads, layer=layer)
+        lines, png, report = render_board(
+            pcb_path,
+            connect_pads=connect_pads,
+            layer=layer,
+            show_pad_labels=show_pad_labels,
+        )
         if output_dir:
             os.makedirs(output_dir, exist_ok=True)
             base = os.path.splitext(os.path.basename(pcb_path))[0]
