@@ -2654,6 +2654,34 @@ class LLMClient:
             elif on_stream_event is not None:
                 if provider == "anthropic":
                     response = self._stream_anthropic(system, tools, on_stream_event)
+                elif self._is_gemini_endpoint():
+                    # Google's OpenAI-compatible endpoint streams, but we
+                    # deliberately SKIP its SSE streaming path and always use
+                    # the non-streaming call. Known compat-layer bugs (verified
+                    # against googleapis/python-genai#2868 and
+                    # discuss.ai.google.dev#60140):
+                    #   1. stream deltas omit the tool_call index field ->
+                    #      parallel tool calls collapse into one slot and names
+                    #      get concatenated (e.g.
+                    #      "extract_schematic_netlistlist_...");
+                    #   2. stream deltas omit the tool_call id -> empty id in
+                    #      the next-turn history is rejected (HTTP 400);
+                    #   3. finish_reason comes back "stop" instead of
+                    #      "tool_calls", ending the tool loop prematurely.
+                    # A local-id generator is community-verified to work
+                    # (non-empty id + matching tool_call_id), but it only
+                    # fixes #2 and still leaves #1/#3; all three depend on a
+                    # moving compat layer Google is actively fixing, so a real
+                    # streaming fix is on hold (issue #145). Non-streaming
+                    # responses carry a genuine model-issued id and
+                    # finish_reason, so they are safe.
+                    response = self._call_openai(system, tools)
+                    if not response.get("error"):
+                        on_stream_event({"type": "text_start"})
+                        content = response.get("message", {}).get("content")
+                        if content:
+                            on_stream_event({"type": "text_chunk", "content": content})
+                        on_stream_event({"type": "text_end"})
                 else:
                     response = self._stream_openai(system, tools, on_stream_event)
             elif provider == "anthropic":
@@ -3194,6 +3222,15 @@ class LLMClient:
         if self._settings.llm_api_key:
             headers["x-api-key"] = self._settings.llm_api_key
         return headers
+
+    def _is_gemini_endpoint(self) -> bool:
+        """True when the configured base URL targets Google's OpenAI-compatible
+        endpoint (generativelanguage.googleapis.com). Detection is URL-based
+        rather than provider-tagged because the SSE bugs this works around (see
+        _call_llm) belong to Google's compat layer, not to any local provider
+        label. An empty base URL (default OpenAI endpoint) is not Gemini."""
+        base = (self._settings.llm_base_url or "").rstrip("/")
+        return "generativelanguage.googleapis.com" in base
 
     def _openai_headers(self) -> dict[str, str]:
         """Build headers for OpenAI-compatible endpoints with optional auth."""
