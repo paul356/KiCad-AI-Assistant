@@ -2651,6 +2651,19 @@ class LLMClient:
                     response = self._stream_ollama(system, tools, on_stream_event)
                 else:
                     response = self._call_ollama(system, tools)
+            elif provider == "gemini":
+                # Gemini flows through the OpenAI-compatible endpoint
+                # NON-streaming: its SSE stream omits tool_call index AND id,
+                # which breaks multi-tool aggregation and the next-turn
+                # history (HTTP 400). Emulate text lifecycle events so the
+                # UI still gets a streaming feel.
+                response = self._call_openai(system, tools)
+                if on_stream_event is not None and not response.get("error"):
+                    on_stream_event({"type": "text_start"})
+                    content = response.get("message", {}).get("content")
+                    if content:
+                        on_stream_event({"type": "text_chunk", "content": content})
+                    on_stream_event({"type": "text_end"})
             elif on_stream_event is not None:
                 if provider == "anthropic":
                     response = self._stream_anthropic(system, tools, on_stream_event)
@@ -3204,6 +3217,10 @@ class LLMClient:
 
     def _call_openai(self, system: str, tools: list[dict]) -> dict[str, Any]:
         base = (self._settings.llm_base_url or "https://api.openai.com").rstrip("/")
+        # Gemini OpenAI-compatible shim: pick a sane default for the gemini
+        # provider so users only need to fill the API key.
+        if self._settings.llm_provider == "gemini" and not self._settings.llm_base_url:
+            base = "https://generativelanguage.googleapis.com/v1beta/openai"
         # Accept either a server root (e.g. "https://api.openai.com") or a
         # full endpoint URL (e.g. ".../v1/chat/completions").  Only append the
         # default path when the user hasn't already specified one.
@@ -3224,6 +3241,8 @@ class LLMClient:
             "messages": messages,
             "tools": tools or None,
         }
+        if self._settings.llm_provider == "gemini" and not self._settings.llm_model:
+            payload_dict["model"] = "gemini-2.5-flash"
         if self._max_tokens > 0:
             payload_dict["max_tokens"] = self._max_tokens
         payload = json.dumps(payload_dict).encode()

@@ -1593,6 +1593,112 @@ class TestOpenAICompatibleRequests:
         }
 
 
+# ---------------------------------------------------------------------------
+# Explicit gemini provider (issue #145): non-streaming OpenAI-compatible
+# calls + emulated text lifecycle events. Gemini's SSE stream omits tool_call
+# index AND id, breaking multi-tool aggregation and the next-turn history
+# (HTTP 400); the non-streaming response carries both.
+# ---------------------------------------------------------------------------
+
+
+class TestGeminiProvider:
+    def test_call_llm_gemini_non_streaming_emits_events(self):
+        client = _make_client()
+        client._settings.llm_provider = "gemini"
+        response = {
+            "finish_reason": "stop",
+            "message": {"role": "assistant", "content": "hello gemini"},
+        }
+        events = []
+        with (
+            patch.object(client, "_call_openai", return_value=response) as mock_openai,
+            patch.object(client, "_stream_openai") as mock_stream,
+        ):
+            result = client._call_llm("sys", [], on_stream_event=events.append)
+
+        mock_openai.assert_called_once_with("sys", [])
+        mock_stream.assert_not_called()
+        assert events == [
+            {"type": "text_start"},
+            {"type": "text_chunk", "content": "hello gemini"},
+            {"type": "text_end"},
+        ]
+        assert result["message"]["content"] == "hello gemini"
+
+    def test_call_llm_gemini_tool_calls_kept_intact(self):
+        client = _make_client()
+        client._settings.llm_provider = "gemini"
+        tool_calls = [
+            {
+                "index": 0,
+                "id": "tc-gemini-1",
+                "type": "function",
+                "function": {"name": "extract_schematic_netlist", "arguments": "{}"},
+            },
+            {
+                "index": 1,
+                "id": "tc-gemini-2",
+                "type": "function",
+                "function": {"name": "list_footprints", "arguments": "{}"},
+            },
+        ]
+        response = {
+            "finish_reason": "tool_calls",
+            "message": {"role": "assistant", "content": None, "tool_calls": tool_calls},
+        }
+
+        with patch.object(client, "_call_openai", return_value=response):
+            result = client._call_llm("sys", [])
+
+        # Non-streaming tool_calls arrive whole: no name concatenation, ids intact.
+        assert result["message"]["tool_calls"] == tool_calls
+        assert len(result["message"]["tool_calls"]) == 2
+        names = [tc["function"]["name"] for tc in result["message"]["tool_calls"]]
+        assert names == ["extract_schematic_netlist", "list_footprints"]
+        ids = [tc["id"] for tc in result["message"]["tool_calls"]]
+        assert all(ids)
+        assert len(set(ids)) == 2
+
+        # Emulated event surface with no text content: lifecycle only, no
+        # empty text_chunk.
+        events = []
+        with patch.object(client, "_call_openai", return_value=response):
+            client._call_llm("sys", [], on_stream_event=events.append)
+
+        assert events == [{"type": "text_start"}, {"type": "text_end"}]
+
+    def test_call_openai_gemini_defaults(self):
+        client = _make_client()
+        client._settings.llm_provider = "gemini"
+        client._settings.llm_base_url = ""
+        client._settings.llm_model = ""
+        response = json.dumps(
+            {"choices": [{"finish_reason": "stop", "message": {"content": "hi"}}]}
+        )
+
+        with patch(
+            "kicad_plugin.llm_client._https_post_json", return_value=(200, response)
+        ) as post:
+            client._call_openai("sys", [])
+
+        # Default base ends in /openai → endpoint is .../openai/chat/completions
+        # (no spurious /v1 segment), plus the default gemini model.
+        url = post.call_args.args[0]
+        assert url == "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+        payload = json.loads(post.call_args.args[2])
+        assert payload["model"] == "gemini-2.5-flash"
+
+        # openai provider without a custom base URL is unchanged.
+        client2 = _make_client()
+        with patch(
+            "kicad_plugin.llm_client._https_post_json", return_value=(200, response)
+        ) as post2:
+            client2._call_openai("sys", [])
+
+        assert post2.call_args.args[0] == "https://api.openai.com/v1/chat/completions"
+        assert json.loads(post2.call_args.args[2])["model"] == "gpt-4o"
+
+
 class TestHttpsFallback:
     def test_certificate_error_retries_with_plugin_ca_bundle(self):
         certificate_error = ssl.SSLCertVerificationError(

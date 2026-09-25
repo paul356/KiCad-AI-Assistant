@@ -21,7 +21,7 @@ if _WX_AVAILABLE:
     class SettingsDialog(wx.Dialog):
         """Simple dialog for editing plugin settings."""
 
-        _PROVIDERS = ["openai", "anthropic", "ollama"]
+        _PROVIDERS = ["openai", "anthropic", "ollama", "gemini"]
         # Vertical gap between form rows in the FlexGridSizer (must match the
         # vgap literal used in _build_ui).
         _GRID_VGAP = 6

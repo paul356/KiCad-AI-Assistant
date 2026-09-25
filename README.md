@@ -130,7 +130,7 @@ All settings can be changed through **Options → Settings** in the plugin panel
 
 | Setting | Description | Default |
 |---------|-------------|---------|
-| `llm_provider` | LLM provider: `openai`, `anthropic`, or `custom` | `openai` |
+| `llm_provider` | LLM provider: `openai`, `anthropic`, `custom`, or `gemini` | `openai` |
 | `llm_api_key` | Your LLM API key (stored with owner-only permissions) | *(empty)* |
 | `llm_model` | Model name | `gpt-4o` |
 | `llm_base_url` | Custom endpoint URL (when `llm_provider` is `custom`) | *(provider default)* |
