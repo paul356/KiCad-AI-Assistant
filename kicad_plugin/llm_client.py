@@ -2652,11 +2652,25 @@ class LLMClient:
                 else:
                     response = self._call_ollama(system, tools)
             elif provider == "gemini":
-                # Gemini flows through the OpenAI-compatible endpoint
-                # NON-streaming: its SSE stream omits tool_call index AND id,
-                # which breaks multi-tool aggregation and the next-turn
-                # history (HTTP 400). Emulate text lifecycle events so the
-                # UI still gets a streaming feel.
+                # Gemini flows through the OpenAI-compatible endpoint, but we
+                # deliberately SKIP its SSE streaming path and always use the
+                # non-streaming call. Known compat-layer bugs (verified against
+                # googleapis/python-genai#2868 and discuss.ai.google.dev#60140):
+                #   1. stream deltas omit the tool_call index field -> parallel
+                #      tool calls collapse into one slot and names get
+                #      concatenated (e.g. "extract_schematic_netlistlist_...");
+                #   2. stream deltas omit the tool_call id -> empty id in the
+                #      next-turn history is rejected by the endpoint (HTTP 400);
+                #   3. finish_reason comes back "stop" instead of "tool_calls",
+                #      which makes OpenAI-protocol clients end the tool loop.
+                # A local-id generator is community-verified to work (non-empty
+                # id + matching tool_call_id), but it only fixes #2 and still
+                # leaves #1/#3, all three depend on a moving compat layer that
+                # Google is actively fixing, so a real streaming fix is on hold
+                # (see issue #145). Non-streaming responses carry a genuine
+                # model-issued id and finish_reason, so they are safe.
+                # Text lifecycle events are emulated below so the UI keeps its
+                # streaming feel.
                 response = self._call_openai(system, tools)
                 if on_stream_event is not None and not response.get("error"):
                     on_stream_event({"type": "text_start"})
