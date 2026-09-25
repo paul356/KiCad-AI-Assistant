@@ -3228,8 +3228,8 @@ class LLMClient:
         endpoint (generativelanguage.googleapis.com). Detection is URL-based
         rather than provider-tagged because the SSE bugs this works around (see
         _call_llm) belong to Google's compat layer, not to any local provider
-        label."""
-        base = (self._settings.llm_base_url or "https://api.openai.com").rstrip("/")
+        label. An empty base URL (default OpenAI endpoint) is not Gemini."""
+        base = (self._settings.llm_base_url or "").rstrip("/")
         return "generativelanguage.googleapis.com" in base
 
     def _openai_headers(self) -> dict[str, str]:
