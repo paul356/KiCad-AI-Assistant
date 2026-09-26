@@ -97,6 +97,84 @@ def board_with_tracks(tmp_path):
     return str(dest)
 
 
+_CLEAR_BOARD = """(kicad_pcb
+\t(version 20260206)
+\t(generator "test")
+\t(layers
+\t\t(0 "F.Cu" signal)
+\t\t(31 "B.Cu" signal)
+\t\t(44 "Edge.Cuts" user)
+\t)
+\t(net 0 "")
+\t(net 1 "VCC")
+\t(footprint "R"
+\t\t(layer "F.Cu")
+\t\t(at 30.0 30.0 0.0)
+\t\t(property "Reference" "R1")
+\t\t(pad "1" smd rect
+\t\t\t(at -0.5 0.0)
+\t\t\t(size 0.5 0.5)
+\t\t\t(layers "F.Cu" "F.Mask")
+\t\t\t(net 1 "VCC")
+\t\t)
+\t)
+\t(footprint "C"
+\t\t(layer "F.Cu")
+\t\t(at 60.0 40.0 0.0)
+\t\t(property "Reference" "C1")
+\t\t(pad "1" smd rect
+\t\t\t(at 0.0 -0.5)
+\t\t\t(size 0.5 0.5)
+\t\t\t(layers "F.Cu" "F.Mask")
+\t\t\t(net 1 "VCC")
+\t\t)
+\t)
+\t(gr_rect
+\t\t(start 20.0 20.0)
+\t\t(end 70.0 60.0)
+\t\t(stroke (width 0.1) (type solid))
+\t\t(fill none)
+\t\t(layer "Edge.Cuts")
+\t)
+)
+"""
+
+_CLEAR_PRO = """{
+  "board": {
+    "design_settings": {
+      "rules": {
+        "min_clearance": 0.2,
+        "min_track_width": 0.2
+      }
+    }
+  },
+  "net_settings": {
+    "classes": [
+      {
+        "name": "Default",
+        "clearance": 0.2,
+        "track_width": 0.25,
+        "via_diameter": 0.6,
+        "via_drill": 0.3
+      }
+    ]
+  }
+}
+"""
+
+
+@pytest.fixture
+def routable_board(tmp_path):
+    """Minimal 2-pad single-layer board with no obstacles between them,
+    plus a matching .kicad_pro (clearance resolution needs the project
+    file's design rules)."""
+    dest = tmp_path / "routing.kicad_pcb"
+    dest.write_text(_CLEAR_BOARD, encoding="utf-8")
+    pro = tmp_path / "routing.kicad_pro"
+    pro.write_text(_CLEAR_PRO, encoding="utf-8")
+    return str(dest)
+
+
 def _run(coro):
     return asyncio.run(coro)
 
@@ -205,3 +283,45 @@ class TestPcbDeleteVias:
         )
         assert result["deleted_count"] == 0
         assert len(result["not_found"]) >= 1
+
+
+class TestPcbRouteOptions:
+    """pcb_route_pad_to_pad: options dict + rounded45 default."""
+
+    def _route(self, tools, board, options=None):
+        return _run(
+            tools["pcb_route_pad_to_pad"](
+                pcb_path=board,
+                ref_a="R1",
+                pad_a="1",
+                ref_b="C1",
+                pad_b="1",
+                net="VCC",
+                ctx=None,
+                width=0.2,
+                algorithm="pns",
+                options=options,
+            )
+        )
+
+    def test_options_none_defaults_to_rounded45(self, tools, routable_board):
+        """Omitting ``options`` routes with corner_mode=rounded45: the
+        unobstructed single-layer PNS skeleton emits its fillet arc."""
+        result = self._route(tools, routable_board)
+        assert "error" not in result
+        assert result["corner_mode"] == "rounded45"
+        assert result["algorithm"] == "pns"
+        assert result["segment_count"] > 0
+        assert result["arc_count"] >= 1
+        assert result["arcs"][0]["layer"] == "F.Cu"
+        assert result["arcs"][0]["net"] == "VCC"
+
+    def test_options_mitered45_suppresses_arcs(self, tools, routable_board):
+        """options={'corner_mode': 'mitered45'} overrides the default:
+        the same route emits straight segments only."""
+        result = self._route(tools, routable_board, options={"corner_mode": "mitered45"})
+        assert "error" not in result
+        assert result["corner_mode"] == "mitered45"
+        assert result["segment_count"] > 0
+        assert result["arc_count"] == 0
+        assert result["arcs"] == []

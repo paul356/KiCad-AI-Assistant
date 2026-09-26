@@ -47,10 +47,8 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
         ctx: Context | None,
         width: float | None = None,
         layer_hint: str | None = None,
-        via_pairs: tuple[tuple[str, str], ...] | None = None,
-        turn_penalty: float | None = None,
-        corner_mode: str = "mitered45",
         algorithm: str = "astar",
+        options: dict | None = None,
     ) -> dict[str, Any]:
         """Connect two pads with an obstacle-avoiding track, optionally across layers.
 
@@ -60,12 +58,19 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
         engine.  A multi-layer ``pns`` route decomposes into one
         walkaround + shove leg per layer (shortest layer path through
         ``via_pairs``), joined by through-vias DRC-validated along the
-        direct pad-to-pad line; multi-layer routes emit straight
-        segments only, so rounded-corner arcs stay a single-layer
-        skeleton feature.  ``corner_mode`` picks the corner
-        style: ``mitered45`` (default) / ``mitered90`` for straight
-        corners, ``rounded45`` / ``rounded90`` for rounded-corner arcs
-        (emitted as ``(arc ...)`` nodes on an unobstructed skeleton).
+        direct pad-to-pad line.  Each leg emits rounded-corner arcs
+        (``rounded45``/``rounded90``) when its skeleton survives
+        walkaround/shove and the corner sits away from a via junction;
+        legs whose skeleton was disturbed, or whose fillet would end on
+        a via, fall back to straight segments — via junctions stay
+        straight-through connections.
+
+        ``options`` bundles the optional tuning knobs; omit it (or pass
+        ``{}``) for defaults.  ``corner_mode`` defaults to
+        ``rounded45`` — short fillets that read as rounds but barely
+        deviate from a 45-degree miter — and degrades to straight
+        segments on any detour or shove; switch to ``mitered45`` for
+        sharp corners or ``rounded90`` for larger-radius arcs.
 
         PCB coordinates: mm, +X right, **+Y down**, rotation
         **CCW-positive on screen** (KiCad PCB convention).
@@ -93,21 +98,31 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
             layer_hint: Preferred copper layer for thru-hole pads.  When
                 ``None`` (default) the router picks automatically.  Ignored
                 for SMD pads whose layer is fixed by the pad itself.
-            via_pairs: Optional tuple of ``(from_layer, to_layer)`` pairs
-                the router is allowed to use as via transitions.  Defaults
-                to ``(("F.Cu", "B.Cu"),)`` when the resolved layers differ;
-                ignored otherwise.
-            turn_penalty: Cost added when the path changes direction (mm).
-                ``None`` uses the default (0.3 mm).  Set to 0 for pure
-                shortest-path routing (more zigzag).
-            corner_mode: ``mitered45`` | ``rounded45`` | ``rounded90`` |
-                ``mitered90``.  Rounded modes emit arc track nodes on an
-                unobstructed skeleton (a detour linearizes them).
             algorithm: ``astar`` (default) grid-based A* planner;
                 ``pns`` walkaround + shove engine.  A route always uses
-                exactly one algorithm.  ``pns`` multi-layer routes are
-                one leg per layer joined by DRC-validated through-vias
-                on the direct pad-to-pad line (no rounded arcs).
+                exactly one algorithm.
+
+            options: Optional dict of advanced options, all optional:
+                ``corner_mode``: ``rounded45`` (default) | ``mitered45`` |
+                    ``rounded90`` | ``mitered90``.  Rounded modes emit arc
+                    track nodes on an unobstructed skeleton (a detour
+                    linearizes them).  ``rounded45`` fillets are short and
+                    hug the 45-degree miter; ``rounded90`` uses the full
+                    quarter-circle radius.
+                ``via_pairs``: tuple of ``(from_layer, to_layer)`` pairs;
+                    each pair is one allowed through-via layer transition
+                    edge, traversable in both directions.  Default
+                    ``(("F.Cu", "B.Cu"),)`` when the resolved layers
+                    differ; ignored otherwise.  On a 4-layer board
+                    (F.Cu / In1.Cu / In2.Cu / B.Cu) the default forbids
+                    landing on the inner layers; pass
+                    ``(("F.Cu", "In1.Cu"), ("In1.Cu", "In2.Cu"),
+                    ("In2.Cu", "B.Cu"))`` to force a step through the
+                    inner stack, or ``((("F.Cu", "B.Cu"),))`` alone to
+                    keep every transition a straight outer-to-outer jump.
+                ``turn_penalty``: cost added when the path changes
+                    direction (mm); default 0.3.  Set to 0 for pure
+                    shortest-path routing (more zigzag).
 
         Returns:
             dict with:
@@ -127,8 +142,13 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
 
             Or ``{"error": "<message>"}`` on failure.
         """
-        if via_pairs is None:
-            via_pairs = (("F.Cu", "B.Cu"),)
+        corner_mode = "rounded45"
+        via_pairs: tuple[tuple[str, str], ...] = (("F.Cu", "B.Cu"),)
+        turn_penalty = 0.3
+        if options:
+            via_pairs = options.get("via_pairs", via_pairs)
+            turn_penalty = options.get("turn_penalty", turn_penalty)
+            corner_mode = options.get("corner_mode", corner_mode)
         req = RouteRequest(
             pcb_path=pcb_path,
             ref_a=ref_a,
@@ -138,8 +158,8 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
             net=net,
             layer_hint=layer_hint,
             width=width,
-            via_pairs=via_pairs or (),
-            turn_penalty=turn_penalty if turn_penalty is not None else 0.3,
+            via_pairs=via_pairs,
+            turn_penalty=turn_penalty,
             corner_mode=corner_mode,
             algorithm=algorithm,
         )

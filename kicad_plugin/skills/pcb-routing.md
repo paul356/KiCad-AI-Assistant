@@ -19,12 +19,14 @@ Connect pads belonging to the same net with DRC-clean tracks.
    returns the board PNG — inspect the image before routing.
 3. Connect ONE pad pair at a time with **pcb_route_pad_to_pad**:
    ``ref_a``/``pad_a``/``ref_b``/``pad_b``/``net`` are required; pass
-   ``layer_hint`` for thru-hole pads, ``via_pairs`` to allow layer
-   transitions, ``width`` when a non-netclass width is needed, and
-   ``corner_mode`` to pick the corner style (``mitered45`` default,
-   ``rounded45``/``rounded90``/``mitered90`` available).  Pass
-   ``algorithm`` to pick the engine: ``astar`` (default) for grid A*,
-   ``pns`` for the walkaround + shove engine.
+   ``layer_hint`` for thru-hole pads, ``width`` when a non-netclass
+   width is needed, and ``algorithm`` to pick the engine: ``astar``
+   (default) for grid A*, ``pns`` for the walkaround + shove engine.
+   Advanced knobs go in the optional ``options`` dict — omit it for
+   defaults: ``options={"corner_mode": ...}`` (default ``rounded45``),
+   ``options={"via_pairs": (("F.Cu", "B.Cu"),)}`` to allow layer
+   transitions, ``options={"turn_penalty": 0.0}`` for pure
+   shortest-path routing.
 4. On a route failure, read the error message, look at the latest layer
    render, and retry with a different ``layer_hint``, a different pair, or a
    via transition.  Do not silently repeat the same call.
@@ -45,17 +47,32 @@ always uses exactly one algorithm.  The response echoes ``algorithm``.
   emit rounded-corner arcs.  A multi-layer ``pns`` route resolves the
   shortest start -> end layer path through ``via_pairs`` and routes one
   walkaround + shove leg per layer, joined by through-vias DRC-validated
-  along the direct pad-to-pad line (no rounded arcs — arcs stay a
-  single-layer skeleton feature).
+  along the direct pad-to-pad line.  Each leg emits its rounded-corner
+  arcs when the skeleton survives walkaround/shove and the corner sits
+  away from a via junction; legs whose skeleton was disturbed, or whose
+  fillet would end on a via, fall back to straight segments — via
+  junctions stay straight-through connections.
 
-### corner_mode strategy
-- ``mitered45`` (default): 45-degree miter corners, straight segments.
-- ``rounded45`` / ``rounded90``: rounded-corner arcs emitted as ``(arc ...)``
-  track nodes on an unobstructed skeleton.  A detour or shove linearizes an
-  arc back to segments (the response's ``arc_count`` drops to 0).
+### corner_mode strategy (options["corner_mode"])
+- ``rounded45`` (default): short rounded fillets that hug the 45-degree
+  miter—corner looks rounded but deviates little from a miter; emits
+  ``(arc ...)`` track nodes on an unobstructed skeleton.
+- ``mitered45``: sharp 45-degree miter corners, straight segments.  Use
+  when a rounded corner would fail or when pure straight geometry is
+  wanted.
+- ``rounded90``: quarter-circle radius arcs — the most rounded look, and
+  the longest arc eaten by any detour or shove.
 - ``mitered90``: Manhattan corners.
+- A detour or shove linearizes an arc back to segments (the response's
+  ``arc_count`` drops to 0), so rounded modes rarely fail outright —
+  retry with ``mitered45`` only when you must keep the route straight.
 - The response echoes ``corner_mode`` and reports ``arc_count``/``arcs``
   (start/mid/end/width/layer/net) and ``shoved`` (pushed tracks as
   net/layer/width/points).
-- If a rounded mode fails, retry with ``mitered45`` (arcs require the
-  unobstructed skeleton that a detour destroys) or a different ``layer_hint``.
+
+### options["via_pairs"] (layer transitions)
+Each ``(from_layer, to_layer)`` pair is one allowed through-via jump,
+traversable in both directions.  Default ``(("F.Cu", "B.Cu"),)``.  On a
+4-layer board this default forbids landing on inner layers; pass
+``(("F.Cu", "In1.Cu"), ("In1.Cu", "B.Cu"))`` to allow routing through
+the inner stack instead of jumping straight F<->B.
