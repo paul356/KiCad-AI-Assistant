@@ -1249,6 +1249,14 @@ def test_engine_mitered45_no_arcs(tmp_path: Path) -> None:
     assert len(result.segments) >= 2
 
 
+def test_engine_default_corner_mode_is_rounded45(tmp_path: Path) -> None:
+    """Omitting corner_mode defaults to rounded45: an unobstructed PNS
+    skeleton emits its fillet arc and the result echoes the default."""
+    result = _route_clear({"algorithm": "pns"}, tmp_path)
+    assert result.corner_mode == "rounded45"
+    assert len(result.arcs) == 1
+
+
 def test_engine_rounded90_arc(tmp_path: Path) -> None:
     result = _route_clear({"corner_mode": "rounded90", "algorithm": "pns"}, tmp_path)
     assert len(result.arcs) == 1
@@ -1478,8 +1486,9 @@ def _write_pns_board(tmp_path: Path, extra: str) -> Path:
 def test_pns_multi_layer_route_crosses_layers(tmp_path: Path) -> None:
     """algorithm='pns' on a cross-layer pair (R1/1 F.Cu -> X1/T B.Cu routes
     one walkaround + shove leg per layer, joined by a DRC-clean through-via
-    on the direct pad-to-pad line.  Multi-layer PNS emits straight segments
-    only (no rounded arcs), and the via never lands on a same-net pad."""
+    on the direct pad-to-pad line.  With an explicit mitered45 corner mode
+    the route stays straight (no arcs) and the via never lands on a
+    same-net pad."""
     from shapely.geometry import Point, box
 
     dst = _write_pns_board(tmp_path, _x1_tht_on_b_cu())
@@ -1496,13 +1505,14 @@ def test_pns_multi_layer_route_crosses_layers(tmp_path: Path) -> None:
             width=0.25,
             clearance=0.2,
             algorithm="pns",
+            corner_mode="mitered45",
         )
     )
     assert result.algorithm == "pns"
     assert len(result.vias) >= 1
     assert result.layers_used == ["F.Cu", "B.Cu"]
     assert len(result.segments) > 0
-    # Multi-layer PNS emits straight segments only, like multi-layer A*.
+    # mitered45 corners emit straight segments only.
     assert result.arcs == []
     # No via on any same-net pad copper (endpoint pads included): R1/1
     # 0.5x0.5 at (29.5,30), C1/1 0.5x0.5 at (60,29.5), X1/T r=0.8 at (62,45).
@@ -1667,6 +1677,71 @@ def test_pns_multi_layer_three_legs_share_via_anchors(tmp_path: Path) -> None:
                 f"Via at ({via.x:.3f},{via.y:.3f}) on {via.layers} is not "
                 f"joined by a segment on layer {layer}"
             )
+
+
+def test_pns_multi_layer_rounded45_emits_leg_arc(tmp_path: Path) -> None:
+    """Multi-layer PNS with corner_mode='rounded45' emits rounded-corner
+    arcs inside a leg whose skeleton survived walkaround/shove, and never
+    places an arc on a via junction: the via stays a straight-through
+    connection (the arc's start/mid/end avoid every via center)."""
+    # Route X1/T (THT pad, B.Cu) -> R1/1 (F.Cu): the B.Cu leg is
+    # unobstructed, so its rounded skeleton (interior corner) survives
+    # and a fillet arc is emitted on that leg.
+    dst = _write_pns_board(tmp_path, _x1_tht_on_b_cu())
+    result = auto_route_pair(
+        RouteRequest(
+            pcb_path=str(dst),
+            ref_a="X1",
+            pad_a="T",
+            ref_b="R1",
+            pad_b="1",
+            net="VCC",
+            layer_hint="B.Cu",
+            width=0.25,
+            clearance=0.2,
+            algorithm="pns",
+            corner_mode="rounded45",
+        )
+    )
+    assert result.algorithm == "pns"
+    assert len(result.vias) >= 1
+    assert len(result.arcs) >= 1
+    for arc in result.arcs:
+        assert arc.layer in ("F.Cu", "B.Cu", "In1.Cu")
+        assert arc.net == "VCC"
+        assert arc.width == pytest.approx(0.25)
+        for pt in (arc.start, arc.mid, arc.end):
+            for via in result.vias:
+                assert not (abs(pt[0] - via.x) < 1e-6 and abs(pt[1] - via.y) < 1e-6), (
+                    f"PNS arc point {pt} coincides with via center ({via.x:.3f}, {via.y:.3f})"
+                )
+
+
+def test_pns_multi_layer_mitered45_default_keeps_straight_segments(
+    tmp_path: Path,
+) -> None:
+    """The same multi-layer pair with corner_mode='mitered45' (the
+    default) emits straight segments + vias only — the rounded45 arc
+    behavior must not leak into the default output."""
+    dst = _write_pns_board(tmp_path, _x1_tht_on_b_cu())
+    result = auto_route_pair(
+        RouteRequest(
+            pcb_path=str(dst),
+            ref_a="X1",
+            pad_a="T",
+            ref_b="R1",
+            pad_b="1",
+            net="VCC",
+            layer_hint="B.Cu",
+            width=0.25,
+            clearance=0.2,
+            algorithm="pns",
+            corner_mode="mitered45",
+        )
+    )
+    assert len(result.vias) >= 1
+    assert len(result.segments) > 0
+    assert result.arcs == []
 
 
 def test_algorithm_invalid_value_raises_route_failure(tmp_path: Path) -> None:
