@@ -70,6 +70,7 @@ def test_project_file_for_missing_returns_none(tmp_path: Path) -> None:
 
 import os  # noqa: E402
 import shutil  # noqa: E402
+import tempfile  # noqa: E402
 
 _FIXTURE_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "integration", "fixtures")
 _BOARD_FIXTURE = os.path.normpath(os.path.join(_FIXTURE_DIR, "test_routing_board.kicad_pcb"))
@@ -2031,3 +2032,229 @@ def test_anchors_unknown_kind_raises(tmp_path: Path) -> None:
             {"algorithm": "pns", "anchors": [{"kind": "jump", "pos": (45.0, 30.0)}]},
             tmp_path,
         )
+
+
+# ---------------------------------------------------------------------------
+# W3 — PNS candidates (multi-variant routes) + A* failure evidence
+# ---------------------------------------------------------------------------
+
+
+def _make_clear_board_with_track(tmp_path: Path) -> str:
+    """Single-layer clear board plus one foreign-net GND track crossing the
+    direct pad-to-pad line, so walkaround and shove diverge."""
+    pcb_path = Path(_make_clear_board(tmp_path))
+    text = pcb_path.read_text()
+    text = text.replace('\t(net 1 "VCC")\n', '\t(net 1 "VCC")\n\t(net 2 "GND")\n')
+    text = text.rstrip()[:-1] + (
+        '\n\t(segment (start 40.0 25.0) (end 55.0 45.0) '
+        '(width 0.25) (layer "F.Cu") (net 2 "GND"))\n'
+    ) + ")\n"
+    pcb_path.write_text(text)
+    return str(pcb_path)
+
+
+def _route_candidates(
+    tmp_path: Path,
+    *,
+    candidates: int = 2,
+    track: bool = False,
+    algorithm: str = "pns",
+    waypoints: list[dict] | None = None,
+) -> RouteResult:
+    from kcaa.router.router import RouteRequest, auto_route_pair
+
+    pcb_path = _make_clear_board_with_track(tmp_path) if track else _make_clear_board(tmp_path)
+    req = {
+        "pcb_path": pcb_path,
+        "ref_a": "R1",
+        "pad_a": "1",
+        "ref_b": "C1",
+        "pad_b": "1",
+        "net": "VCC",
+        "width": 0.2,
+        "clearance": 0.2,
+        "via_pairs": (),
+        "algorithm": algorithm,
+        "corner_mode": "mitered45",
+        "candidates": candidates,
+    }
+    if waypoints:
+        req["anchors"] = waypoints
+    return auto_route_pair(RouteRequest(**req))
+
+
+def test_candidates_astar_rejected(tmp_path: Path) -> None:
+    """``candidates > 1`` is the PNS control surface; A* is single-shot."""
+    with pytest.raises(RouteFailure, match="only supported with algorithm"):
+        _route_candidates(tmp_path, candidates=2, algorithm="astar")
+
+
+def test_candidates_below_one_rejected(tmp_path: Path) -> None:
+    with pytest.raises(RouteFailure, match="candidates must be >= 1"):
+        _route_candidates(tmp_path, candidates=0)
+
+
+def test_candidates_default_no_variants(tmp_path: Path) -> None:
+    """candidates=1 (the default) keeps the single-route behavior: no
+    candidates list, no render."""
+    result = _route_candidates(tmp_path, candidates=1)
+    assert result.candidates == []
+    assert result.candidates_png is None
+    assert len(result.segments) >= 1
+
+
+def test_candidates_two_walkaround_and_shove(tmp_path: Path) -> None:
+    """A foreign track across the line yields two distinct variants:
+    walkaround-only (detour, nothing pushed) and walkaround+shove (track
+    displaced).  The primary top-level result is exactly candidate 1."""
+    result = _route_candidates(tmp_path, track=True, candidates=2)
+    assert [c["variant"] for c in result.candidates] == ["walkaround", "shove"]
+    wa, sh = result.candidates
+    # Shove displacement happens on the track, not the routed polyline:
+    # the variants differ in the shoved set (and usually the geometry).
+    assert wa["shoved"] == []
+    assert sh["shoved"], "shove variant must actually push the crossing track"
+    distinct = (
+        wa["segments"] != sh["segments"] or bool(wa["shoved"]) != bool(sh["shoved"])
+    )
+    assert distinct
+    # Primary == first candidate (backwards compatible).
+    assert result.shoved_tracks == []
+    assert list(result.start) == result.candidates[0]["start"]
+    assert list(result.end) == result.candidates[0]["end"]
+    assert list(result.layers_used) == result.candidates[0]["layers_used"]
+    assert result.via_sites == result.candidates[0]["via_sites"]
+    assert result.waypoint_violated == result.candidates[0]["waypoint_violated"]
+    all_tags = {c["variant"] for c in result.candidates}
+    assert all_tags <= {"walkaround", "shove"}
+
+
+def test_candidates_dedupe_collapses_identical(tmp_path: Path) -> None:
+    """On a clear board every variant produces the same skeleton (nothing
+    to detour, nothing to shove): the identical geometries dedupe to one
+    candidate even when three are requested."""
+    result = _route_candidates(tmp_path, candidates=3)
+    assert len(result.candidates) == 1
+    assert result.candidates[0]["variant"] == "walkaround"
+
+
+def test_candidates_waypoint_tol_variants_dedupe(tmp_path: Path) -> None:
+    """Waypoint-tolerance variants are informational today (W2 decision):
+    they share the shove geometry and must dedupe, never duplicate it."""
+    result = _route_candidates(
+        tmp_path,
+        track=True,
+        candidates=3,
+        waypoints=[{"kind": "waypoint", "pos": (45.0, 30.0)}],
+    )
+    tags = [c["variant"] for c in result.candidates]
+    assert 2 <= len(tags) <= 5
+    assert all(t in {"walkaround", "shove", "waypoint-tol-x0.5", "waypoint-tol-x1.0", "waypoint-tol-x2.0"} for t in tags)
+    # No two candidates share the same (geometry, pushed) fingerprint.
+    seen = set()
+    for c in result.candidates:
+        fp = (
+            tuple(tuple(s) for s in c["segments"]),
+            tuple(tuple(s) for s in c["arcs"]),
+            len(c["shoved"]),
+        )
+        assert fp not in seen
+        seen.add(fp)
+
+
+def test_candidates_two_renders_candidates_png(tmp_path: Path) -> None:
+    """candidates > 1 renders the side-by-side variant PNG next to the
+    request and returns its path (best-effort, always safe)."""
+    result = _route_candidates(tmp_path, track=True, candidates=2)
+    assert result.candidates_png
+    assert result.candidates_png.startswith(
+        os.path.join(tempfile.gettempdir(), "kcaa_candidates_")
+    )
+    assert os.path.exists(result.candidates_png)
+    assert os.path.getsize(result.candidates_png) > 0
+
+
+def _make_blocked_single_layer_board(tmp_path: Path) -> str:
+    """Single-layer clear board plus a foreign GND pad covering the R1.1
+    start pad entirely: the A* start cell is inside an obstacle, so the
+    search fails (grid_a_star refuses a blocked start)."""
+    pcb_path = Path(_make_clear_board(tmp_path))
+    text = pcb_path.read_text()
+    text = text.replace('\t(net 1 "VCC")\n', '\t(net 1 "VCC")\n\t(net 2 "GND")\n')
+    wall = (
+        '\t(footprint "W"\n'
+        '\t\t(layer "F.Cu")\n'
+        '\t\t(at 29.5 30.0 0.0)\n'
+        '\t\t(property "Reference" "W1")\n'
+        '\t\t(pad "1" smd rect\n'
+        '\t\t\t(at -0.5 0.0)\n'
+        '\t\t\t(size 6.0 6.0)\n'
+        '\t\t\t(layers "F.Cu" "F.Mask")\n'
+        '\t\t\t(net 2 "GND")\n'
+        "\t\t)\n"
+        "\t)\n"
+    )
+    text = text.rstrip()[:-1] + wall + ")\n"
+    pcb_path.write_text(text)
+    return str(pcb_path)
+
+
+def test_astar_single_layer_blocked_renders_evidence(tmp_path: Path) -> None:
+    """A foreign pad covering the start pad leaves A* no place to begin;
+    the failure must carry the rendered evidence PNG (appended after the
+    existing _dump_viz dump)."""
+    from kcaa.router.router import RouteRequest, auto_route_pair
+
+    with pytest.raises(RouteFailure) as excinfo:
+        auto_route_pair(
+            RouteRequest(
+                pcb_path=_make_blocked_single_layer_board(tmp_path),
+                ref_a="R1",
+                pad_a="1",
+                ref_b="C1",
+                pad_b="1",
+                net="VCC",
+                width=0.2,
+                clearance=0.2,
+                via_pairs=(),
+                algorithm="astar",
+            )
+        )
+    msg = str(excinfo.value)
+    assert "No obstacle-avoiding path from" in msg
+    assert "Failure evidence: " in msg
+    png = msg.split("Failure evidence: ", 1)[1].strip()
+    assert png.startswith(os.path.join(tempfile.gettempdir(), "kcaa_route_failure_"))
+    assert os.path.exists(png)
+
+
+@pytest.mark.skip(
+    reason=(
+        "No cheap multi-layer A* failure fixture: the search box auto-expands "
+        "to any obstacle that touches it, via edges may land inside a "
+        "single-layer enclosing ring and escape it on the far layer, and "
+        "endpoint-pad clearing punches holes in pad-covering walls — a "
+        "guaranteed blocked case needs a full maze.  W3 taskbook test 8 "
+        "allows skipping; the evidence-render chain is asserted by "
+        "test_astar_single_layer_blocked_renders_evidence."
+    )
+)
+def test_astar_multi_layer_blocked_renders_evidence(tmp_path: Path) -> None:
+    """Multi-layer A* failure evidence — skipped: no cheap blocked fixture
+    (see the skip reason); the single-layer failure evidence chain is
+    asserted above."""
+    board = _make_two_layer_board(tmp_path, extra="")
+    auto_route_pair(
+        RouteRequest(
+            pcb_path=str(board),
+            ref_a="R1",
+            pad_a="1",
+            ref_b="C1",
+            pad_b="1",
+            net="VCC",
+            width=0.2,
+            clearance=0.2,
+            via_pairs=(("F.Cu", "B.Cu"),),
+            algorithm="astar",
+        )
+    )
