@@ -138,6 +138,18 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
                 ``dry_run``: True -> route and return the full result
                     without writing anything to the PCB file (no reload,
                     no .bak; the file stays byte-identical).
+                ``candidates``: PNS multi-candidate knob: ``> 1`` asks
+                    the ``pns`` algorithm for that many alternative
+                    routes (cheap strategy variants: walkaround-only,
+                    walkaround+shove, then waypoint-tolerance scales
+                    when waypoints are present), deduped by geometry;
+                    the primary result is variant 1.  ``candidates > 1``
+                    with ``algorithm='astar'`` is rejected.  Default 1
+                    (single route, exactly the pre-W3 behavior).
+                    The side-by-side candidate PNG is rendered whenever
+                    ``candidates > 1`` (``dry_run`` included — the
+                    render reads the board file and writes only to the
+                    system temp dir).
 
         Returns:
             dict with:
@@ -159,6 +171,17 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
                 layers_used: ordered list of layers touched by the path.
                 start: ``(x, y)`` exit point of pad_a.
                 end: ``(x, y)`` entry point of pad_b.
+                candidates: present when ``candidates > 1``: the list of
+                    alternative routes (each serialized like the primary
+                    response, plus a ``"variant"`` tag); the primary
+                    top-level fields describe variant 1.
+                candidates_png: present when ``candidates > 1``
+                    (``dry_run`` included — the render reads the board
+                    file and writes only to the system temp dir): path
+                    of the side-by-side candidate render the VLM
+                    inspects to pick a variant.  VLM flow: re-run the
+                    chosen variant with ``candidates=1`` +
+                    ``dry_run=False`` to commit it.
                 backup_path: path to the ``.bak`` created before writing
                     (``None`` with ``dry_run``).
                 pcb_path: echo of the input path.
@@ -171,12 +194,14 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
         turn_penalty = 0.3
         anchors: list[dict] = []
         dry_run = False
+        candidates = 1
         if options:
             via_pairs = options.get("via_pairs", via_pairs)
             turn_penalty = options.get("turn_penalty", turn_penalty)
             corner_mode = options.get("corner_mode", corner_mode)
             anchors = options.get("anchors", anchors)
             dry_run = bool(options.get("dry_run", False))
+            candidates = int(options.get("candidates", candidates))
         req = RouteRequest(
             pcb_path=pcb_path,
             ref_a=ref_a,
@@ -192,6 +217,7 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
             algorithm=algorithm,
             anchors=anchors,
             dry_run=dry_run,
+            candidates=candidates,
         )
         try:
             result = auto_route_pair(req)
@@ -217,7 +243,7 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
             except OSError as exc:
                 return {"error": f"Failed to write PCB file: {exc}"}
 
-        return {
+        resp = {
             "segment_count": len(result.segments),
             "segments": [
                 {
@@ -282,6 +308,11 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
             "pcb_path": pcb_path,
             "dry_run": dry_run,
         }
+        if result.candidates:
+            resp["candidates"] = result.candidates
+        if result.candidates_png:
+            resp["candidates_png"] = result.candidates_png
+        return resp
 
     @mcp.tool()
     async def pcb_add_vias(

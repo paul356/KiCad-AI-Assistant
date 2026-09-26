@@ -184,6 +184,14 @@ class RouteRequest:
         dry_run: Route and return the result without writing anything to
             the PCB file.  The router never writes; this flag lets the
             tool layer skip its ``save_pcb`` step.
+        candidates: PNS multi-candidate knob: when > 1, auto_route_pair
+            runs the request as several cheap strategy variants
+            (walkaround-only, walkaround+shove, then waypoint-tolerance
+            scales when waypoint anchors are present), dedupes identical
+            geometries and returns them in
+            ``RouteResult.candidates``.  The primary result is the first
+            variant (backwards compatible).  Only the ``pns`` algorithm
+            accepts ``candidates``.
     """
 
     pcb_path: str
@@ -206,6 +214,7 @@ class RouteRequest:
     corner_mode: str = "rounded45"  # rounded45 (default) | mitered45 | rounded90 | mitered90
     anchors: list[dict] = field(default_factory=list)
     dry_run: bool = False  # tool-layer hint: skip save_pcb (router never writes)
+    candidates: int = 1  # PNS multi-candidate variants (>1 only; 1 = today)
 
 
 @dataclass
@@ -229,6 +238,11 @@ class RouteResult:
         via_sites: Emitted via anchors in request order: one dict per
             explicit via anchor with ``{"pos": [x, y], "to_layer": ...}``
             (the DRC-clean site actually used, possibly micro-shifted).
+        candidates: When the request carried ``candidates > 1``: the
+            serialized alternative routes (same shape as the tool-layer
+            response entries plus a ``"variant"`` tag); empty otherwise.
+        candidates_png: Path of the side-by-side candidate render
+            (``candidates > 1`` only), best-effort.
     """
 
     segments: list[OutputSegment] = field(default_factory=list)
@@ -243,6 +257,8 @@ class RouteResult:
     waypoint_violated: bool = False
     violated_waypoints: list[tuple[float, float]] = field(default_factory=list)
     via_sites: list[dict] = field(default_factory=list)
+    candidates: list[dict] = field(default_factory=list)
+    candidates_png: str | None = None  # side-by-side candidate render path
 
 
 # ---------------------------------------------------------------------------
@@ -280,6 +296,21 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
             f"anchors are only supported with algorithm='pns' (got "
             f"algorithm={req.algorithm!r}); route {req.ref_a}/{req.pad_a} -> "
             f"{req.ref_b}/{req.pad_b} needs to drop the anchors or use the "
+            "PNS engine"
+        )
+
+    # candidates is the PNS multi-candidate control surface (W3); the A*
+    # planner is single-shot.
+    if req.candidates < 1:
+        raise RouteFailure(
+            f"candidates must be >= 1 (got {req.candidates}); route "
+            f"{req.ref_a}/{req.pad_a} -> {req.ref_b}/{req.pad_b}"
+        )
+    if req.candidates > 1 and req.algorithm != "pns":
+        raise RouteFailure(
+            f"candidates are only supported with algorithm='pns' (got "
+            f"algorithm={req.algorithm!r}); route {req.ref_a}/{req.pad_a} -> "
+            f"{req.ref_b}/{req.pad_b} needs candidates=1 (default) or the "
             "PNS engine"
         )
 
@@ -570,6 +601,9 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
     waypoint_violated = False
     violated_waypoints: list[tuple[float, float]] = []
     via_sites: list[dict] = []
+    # Candidate variants (W3); populated by the PNS candidates path.
+    candidates_meta: list[dict] = []
+    candidates_png: str | None = None
 
     if req.algorithm == "astar":
         # -- Grid A* (default) ---------------------------------------
@@ -600,11 +634,21 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
             if ml_result.path is None:
                 # Dump the failure state so the blockage can be inspected.
                 _dump_viz("fail-multi-astar", [], _pad_viz, buffered, route_bbox)
-                raise RouteFailure(
+                msg = (
                     f"No obstacle-avoiding multi-layer path from "
                     f"{req.ref_a}/{req.pad_a} to {req.ref_b}/{req.pad_b} at "
                     f"{width}mm track width ({start_layer} -> {end_layer})."
                 )
+                png = _render_route_failure_evidence(
+                    req.pcb_path,
+                    chain=[pad_a_xy],
+                    attempted_end=pad_b_xy,
+                    layer=start_layer,
+                    obstacles=obstacles_by_layer[start_layer],
+                )
+                if png:
+                    msg += f"\nFailure evidence: {png}"
+                raise RouteFailure(msg)
             print(
                 f"  [route] multi-layer A*: {len(ml_result.path)} pts"
                 f"  cells_visited={ml_result.cells_visited}"
@@ -703,11 +747,21 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
             )
             if result.path is None:
                 _dump_viz("fail-astar", [], _pad_viz, layer_obstacles, route_bbox)
-                raise RouteFailure(
+                msg = (
                     f"No obstacle-avoiding path from {req.ref_a}/{req.pad_a} to "
                     f"{req.ref_b}/{req.pad_b} at {width}mm track width on layer "
                     f"{start_layer}."
                 )
+                png = _render_route_failure_evidence(
+                    req.pcb_path,
+                    chain=[pad_a_xy],
+                    attempted_end=pad_b_xy,
+                    layer=start_layer,
+                    obstacles=layer_obstacles,
+                )
+                if png:
+                    msg += f"\nFailure evidence: {png}"
+                raise RouteFailure(msg)
             print(
                 f"  [route] single-layer A*: {len(result.path)} pts"
                 f"  cells_visited={result.cells_visited}"
@@ -815,7 +869,9 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
         ) -> None:
             """Route one PNS leg (walkaround + shove) and feed its nodes
             into the shared postprocess pipeline.  ``li``/``n_legs`` are
-            only used in diagnostic messages."""
+            only used in diagnostic messages; the ``shove_enabled`` cell
+            (set per candidate round) selects the strategy variant
+            (walkaround-only vs walkaround + shove)."""
             nonlocal node_id
             leg_layers.append(layer)
             if math.hypot(end_pt[0] - start_pt[0], end_pt[1] - start_pt[1]) < 1e-6:
@@ -842,6 +898,7 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
                     track_width=width,
                     clearance=clearance,
                     corner_mode=corner_mode,
+                    shove=shove_enabled,
                 )
             except PnsFailure as exc:
                 _dump_viz("fail-pns", [], _pad_viz, buffered, route_bbox)
@@ -991,297 +1048,401 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
             end_xy = (all_nodes[-1].x, all_nodes[-1].y)
             layers_used = _layers_used(all_nodes)
 
-        if req.anchors:
-            # -- Anchor chain (waypoints / via anchors) ----------------
-            # Each anchor consumes one leg boundary: waypoints split the
-            # current leg layer, via anchors switch the leg layer at a
-            # DRC-validated through-via site.  Pad anchors raise
-            # "not supported yet"; the A* planner rejects anchors at entry.
-            via_forbidden = [
-                poly for poly, _pl, _rf, _pn, _ctr in _same_net_pad_polygons(data, req.net)
-            ]
-            pending_pos = pad_a_xy
-            pending_layer = start_layer
-            base_seq = (
-                _resolve_layer_sequence(start_layer, end_layer, req.via_pairs)
-                if start_layer != end_layer
-                else [start_layer]
-            )
-            n_legs = len(req.anchors) + 1
-            chain: list[tuple[float, float]] = [pad_a_xy]
-            for li, spec in enumerate(req.anchors):
-                kind = spec.get("kind")
-                if kind == "waypoint":
-                    wpt = _anchor_pos(spec, "waypoint")
-                    via_anchors.add(wpt)  # no fillet may end on the joint
-                    try:
-                        run_leg(pending_pos, wpt, pending_layer, li=li, n_legs=n_legs)
-                    except RouteFailure:
-                        # Soft stop: record + skip the waypoint, keep going.
-                        waypoint_violated = True
-                        violated_waypoints.append(wpt)
-                        continue
-                    pending_pos = wpt
-                    continue
-                if kind == "via":
-                    site_req = _anchor_pos(spec, "via")
-                    if spec.get("to_layer") is None:
-                        to_layer = _auto_via_target(base_seq, pending_layer, site_req)
-                    else:
-                        to_layer = str(spec["to_layer"])
-                    _validate_via_transition(
-                        pending_layer, to_layer, site_req, req, pcb_layers
+        # -- Candidate variants (W3) --------------------------------------
+        # candidates>1 re-runs the whole PNS branch once per cheap
+        # strategy variant (walkaround-only, walkaround+shove, then
+        # waypoint-tolerance scales when waypoints are present); the first
+        # successful variant is the primary result (backwards compatible),
+        # the rest are what the VLM chooses from.  Identical geometries
+        # dedupe, so the final list may be shorter than requested.
+        candidate_rounds: list[tuple] = []
+        seen_fps: set[tuple] = set()
+        last_failure: RouteFailure | None = None
+        for variant_tag, shove_enabled, waypoint_tol_scale in _pns_strategy_specs(
+            req.candidates, req.anchors
+        ):
+            # Reset per-variant leg state (run_leg/leg_layers/finalize_legs
+            # capture these cells; every variant re-runs the branch from
+            # scratch).  waypoint_tol_scale is informational today (W2
+            # decision) -- the waypoint-tol variants therefore dedupe
+            # against the shove variant until a tolerance semantics lands.
+            all_nodes = []
+            node_id = 0
+            pushed = []
+            direct_segs = []
+            direct_arcs = []
+            leg_layers = []
+            via_anchors = set()
+            waypoint_violated = False
+            violated_waypoints = []
+            via_sites = []
+            try:
+                if req.anchors:
+                    # -- Anchor chain (waypoints / via anchors) ----------------
+                    # Each anchor consumes one leg boundary: waypoints split the
+                    # current leg layer, via anchors switch the leg layer at a
+                    # DRC-validated through-via site.  Pad anchors raise
+                    # "not supported yet"; the A* planner rejects anchors at entry.
+                    via_forbidden = [
+                        poly for poly, _pl, _rf, _pn, _ctr in _same_net_pad_polygons(data, req.net)
+                    ]
+                    pending_pos = pad_a_xy
+                    pending_layer = start_layer
+                    base_seq = (
+                        _resolve_layer_sequence(start_layer, end_layer, req.via_pairs)
+                        if start_layer != end_layer
+                        else [start_layer]
                     )
-                    try:
-                        site = _pick_explicit_via_site(
-                            pcb_path=req.pcb_path,
-                            requested=site_req,
-                            from_layer=pending_layer,
-                            to_layer=to_layer,
-                            via_diameter=via_diameter,
-                            via_drill=via_drill,
-                            clearance=clearance,
-                            net=req.net,
-                            via_forbidden=via_forbidden,
-                            tol_mm=float(spec.get("tol_mm", 1.0)),
-                        )
-                    except RouteFailure as exc:
-                        # No DRC-clean site: render the blocking copper
-                        # around the request into the failure message.
-                        msg = str(exc)
-                        png = _render_route_failure_evidence(
-                            req.pcb_path,
-                            chain=chain,
-                            attempted_end=site_req,
-                            layer=pending_layer,
-                            obstacles=_layer_engine_obstacles(
-                                model,
-                                data,
-                                req,
-                                start_layer,
-                                end_layer,
+                    n_legs = len(req.anchors) + 1
+                    chain: list[tuple[float, float]] = [pad_a_xy]
+                    for li, spec in enumerate(req.anchors):
+                        kind = spec.get("kind")
+                        if kind == "waypoint":
+                            wpt = _anchor_pos(spec, "waypoint")
+                            via_anchors.add(wpt)  # no fillet may end on the joint
+                            try:
+                                run_leg(pending_pos, wpt, pending_layer, li=li, n_legs=n_legs)
+                            except RouteFailure:
+                                # Soft stop: record + skip the waypoint, keep going.
+                                waypoint_violated = True
+                                violated_waypoints.append(wpt)
+                                continue
+                            pending_pos = wpt
+                            continue
+                        if kind == "via":
+                            site_req = _anchor_pos(spec, "via")
+                            if spec.get("to_layer") is None:
+                                to_layer = _auto_via_target(base_seq, pending_layer, site_req)
+                            else:
+                                to_layer = str(spec["to_layer"])
+                            _validate_via_transition(
+                                pending_layer, to_layer, site_req, req, pcb_layers
+                            )
+                            try:
+                                site = _pick_explicit_via_site(
+                                    pcb_path=req.pcb_path,
+                                    requested=site_req,
+                                    from_layer=pending_layer,
+                                    to_layer=to_layer,
+                                    via_diameter=via_diameter,
+                                    via_drill=via_drill,
+                                    clearance=clearance,
+                                    net=req.net,
+                                    via_forbidden=via_forbidden,
+                                    tol_mm=float(spec.get("tol_mm", 1.0)),
+                                )
+                            except RouteFailure as exc:
+                                # No DRC-clean site: render the blocking copper
+                                # around the request into the failure message.
+                                msg = str(exc)
+                                png = _render_route_failure_evidence(
+                                    req.pcb_path,
+                                    chain=chain,
+                                    attempted_end=site_req,
+                                    layer=pending_layer,
+                                    obstacles=_layer_engine_obstacles(
+                                        model,
+                                        data,
+                                        req,
+                                        start_layer,
+                                        end_layer,
+                                        pending_layer,
+                                        pad_a_xy,
+                                        pad_b_xy,
+                                    ),
+                                )
+                                if png:
+                                    msg += f"\nFailure evidence: {png}"
+                                raise RouteFailure(msg) from exc
+                            via_anchors.add(site)
+                            via_sites.append({"pos": [site[0], site[1]], "to_layer": to_layer})
+                            chain.append(site)
+                            run_leg(
+                                pending_pos,
+                                site,
                                 pending_layer,
-                                pad_a_xy,
-                                pad_b_xy,
-                            ),
+                                li=li,
+                                n_legs=n_legs,
+                                render_evidence=True,
+                                evidence_ctx={"chain": list(chain)},
+                            )
+                            pending_pos = site
+                            pending_layer = to_layer
+                            continue
+                        if kind == "pad":
+                            raise RouteFailure(
+                                f"pad anchor {spec.get('ref', '?')}/{spec.get('pad', '?')} "
+                                "not supported yet; planned for the plan_routes milestone"
+                            )
+                        raise RouteFailure(
+                            f"unsupported anchor kind {kind!r}; expected 'waypoint', "
+                            "'via' or 'pad'"
                         )
-                        if png:
-                            msg += f"\nFailure evidence: {png}"
-                        raise RouteFailure(msg) from exc
-                    via_anchors.add(site)
-                    via_sites.append({"pos": [site[0], site[1]], "to_layer": to_layer})
-                    chain.append(site)
+                    if pending_layer != end_layer:
+                        raise RouteFailure(
+                            f"anchor chain ends on layer {pending_layer!r} but pad "
+                            f"{req.ref_b}/{req.pad_b} is on {end_layer!r}; add a via "
+                            "anchor that reaches the target layer (allowed via_pairs "
+                            f"{list(req.via_pairs)})"
+                        )
                     run_leg(
                         pending_pos,
-                        site,
+                        pad_b_xy,
                         pending_layer,
-                        li=li,
+                        li=len(req.anchors),
                         n_legs=n_legs,
                         render_evidence=True,
                         evidence_ctx={"chain": list(chain)},
                     )
-                    pending_pos = site
-                    pending_layer = to_layer
-                    continue
-                if kind == "pad":
-                    raise RouteFailure(
-                        f"pad anchor {spec.get('ref', '?')}/{spec.get('pad', '?')} "
-                        "not supported yet; planned for the plan_routes milestone"
-                    )
-                raise RouteFailure(
-                    f"unsupported anchor kind {kind!r}; expected 'waypoint', "
-                    "'via' or 'pad'"
-                )
-            if pending_layer != end_layer:
-                raise RouteFailure(
-                    f"anchor chain ends on layer {pending_layer!r} but pad "
-                    f"{req.ref_b}/{req.pad_b} is on {end_layer!r}; add a via "
-                    "anchor that reaches the target layer (allowed via_pairs "
-                    f"{list(req.via_pairs)})"
-                )
-            run_leg(
-                pending_pos,
-                pad_b_xy,
-                pending_layer,
-                li=len(req.anchors),
-                n_legs=n_legs,
-                render_evidence=True,
-                evidence_ctx={"chain": list(chain)},
-            )
-            finalize_legs()
-        elif start_layer == end_layer:
-            engine_obstacles: list[Obstacle] = [
-                o for o in model.obstacles if start_layer in o.layers
-            ]
-            for poly, players, _ref, _pname, center in _same_net_pad_polygons(data, req.net):
-                is_end = (
-                    abs(center[0] - pad_a_xy[0]) < 1e-6 and abs(center[1] - pad_a_xy[1]) < 1e-6
-                ) or (abs(center[0] - pad_b_xy[0]) < 1e-6 and abs(center[1] - pad_b_xy[1]) < 1e-6)
-                if is_end and start_layer in players:
-                    continue  # the route terminates on the endpoint pad
-                if start_layer in players:
-                    engine_obstacles.append(
-                        Obstacle(
-                            shape=poly,
-                            layers=frozenset({start_layer}),
-                            net=req.net,
-                            kind="pad",
-                        )
-                    )
-            # corner_mode already validated + parsed at entry (line 236).
-            try:
-                eng = route_engine(
-                    pad_a_xy,
-                    pad_b_xy,
-                    engine_obstacles,
-                    track_width=width,
-                    clearance=clearance,
-                    corner_mode=corner_mode,
-                )
-            except PnsFailure as exc:
-                # Dump the failure state so the blockage can be inspected
-                # (same viz format as the success stages).
-                _dump_viz("fail-pns", [], _pad_viz, buffered, route_bbox)
-                raise RouteFailure(
-                    f"No obstacle-avoiding path from {req.ref_a}/{req.pad_a} to "
-                    f"{req.ref_b}/{req.pad_b} at {width}mm track width on layer "
-                    f"{start_layer}: {exc}"
-                ) from exc
-            print(
-                f"  [route] PNS: {len(eng.path)} pts"
-                f"  shoved={len(eng.shoved_tracks)}  arcs={len(eng.arcs)}"
-            )
-            pushed: list[TrackObstacle] = eng.shoved_tracks
-
-            if eng.trace is not None:
-                # Embargo-free skeleton: emit anchor points and arcs straight
-                # from the trace (KiCad emits the skeleton for a clear route).
-                best_path_pts = eng.trace.points
-            else:
-                best_path_pts = eng.path
-
-            _dump_viz("0-pns", best_path_pts, _pad_viz, buffered, route_bbox)
-
-            # ---- Replace scheme inside rectangular pads with an
-            #      axis-aligned wire (fence -> centre) ----
-            if pad_a_size is not None:
-                n_before = len(best_path_pts)
-                best_path_pts = _replace_pad_path(
-                    best_path_pts, pad_a_xy, pad_a_size, from_center=True
-                )
-                _log_path("pad_a-replace", best_path_pts, n_before)
-            if pad_b_size is not None:
-                n_before = len(best_path_pts)
-                best_path_pts = _replace_pad_path(
-                    best_path_pts, pad_b_xy, pad_b_size, from_center=False
-                )
-                _log_path("pad_b-replace", best_path_pts, n_before)
-            _dump_viz("1-pad-replace", best_path_pts, _pad_viz, buffered, route_bbox)
-
-            # ---- Align path endpoints with exact pad centres ----
-            best_path_pts = _align_path_endpoints(
-                best_path_pts,
-                pad_a_xy,
-                pad_b_xy,
-                buffered,
-                route_bbox,
-                grid_res,
-                pad_a_size=pad_a_size,
-                pad_b_size=pad_b_size,
-            )
-            _log_path("align-endpoints", best_path_pts)
-            _dump_viz("6-align-endpoints", best_path_pts, _pad_viz, buffered, route_bbox)
-
-            path_nodes = path_to_nodes(best_path_pts, start_layer)
-            segs, vias = postprocess_path(
-                path_nodes,
-                width=width,
-                net=req.net,
-                max_miter_mm=req.max_miter_mm,
-                _obstacles=buffered,
-                _pad_rects=_pad_rects or None,
-            )
-            segs = [s for s in segs if abs(s.x1 - s.x2) > 1e-6 or abs(s.y1 - s.y2) > 1e-6]
-
-            # Rounded skeleton arcs -> OutputArc nodes.  Valid only when
-            # walkaround/shove/pad-cleanup left the original skeleton anchors
-            # in place.  When arcs are emitted, skip mitering on the legs
-            # they join (postprocess miter would cut into the arc end).
-            arcs_out: list[OutputArc] = []
-            emit_arcs = (
-                eng.trace is not None
-                and len(best_path_pts) == len(eng.trace.points)
-                and all(_pt_eq(p, q) for p, q in zip(best_path_pts, eng.trace.points))
-            )
-            if emit_arcs:
-                if any(a is not None for a in eng.trace.arcs):
-                    # Skeleton with arcs: emit straight legs + arcs directly,
-                    # no mitering (the rounded corner already smooths the join).
-                    segs = []
-                    pts = eng.trace.points
-                    for i in range(len(pts) - 1):
-                        arc_i = eng.trace.arcs[i] if i < len(eng.trace.arcs) else None
-                        if arc_i is not None:
-                            arcs_out.append(
-                                OutputArc(
-                                    start=arc_i.start,
-                                    mid=arc_i.mid,
-                                    end=arc_i.end,
-                                    width=width,
-                                    layer=start_layer,
+                    finalize_legs()
+                elif start_layer == end_layer:
+                    engine_obstacles: list[Obstacle] = [
+                        o for o in model.obstacles if start_layer in o.layers
+                    ]
+                    for poly, players, _ref, _pname, center in _same_net_pad_polygons(data, req.net):
+                        is_end = (
+                            abs(center[0] - pad_a_xy[0]) < 1e-6 and abs(center[1] - pad_a_xy[1]) < 1e-6
+                        ) or (abs(center[0] - pad_b_xy[0]) < 1e-6 and abs(center[1] - pad_b_xy[1]) < 1e-6)
+                        if is_end and start_layer in players:
+                            continue  # the route terminates on the endpoint pad
+                        if start_layer in players:
+                            engine_obstacles.append(
+                                Obstacle(
+                                    shape=poly,
+                                    layers=frozenset({start_layer}),
                                     net=req.net,
+                                    kind="pad",
                                 )
                             )
-                        else:
-                            x1, y1 = pts[i]
-                            x2, y2 = pts[i + 1]
-                            if abs(x1 - x2) > 1e-6 or abs(y1 - y2) > 1e-6:
-                                segs.append(
-                                    OutputSegment(
-                                        x1=x1,
-                                        y1=y1,
-                                        x2=x2,
-                                        y2=y2,
-                                        width=width,
-                                        layer=start_layer,
-                                        net=req.net,
+                    # corner_mode already validated + parsed at entry (line 236).
+                    try:
+                        eng = route_engine(
+                            pad_a_xy,
+                            pad_b_xy,
+                            engine_obstacles,
+                            track_width=width,
+                            clearance=clearance,
+                            corner_mode=corner_mode,
+                            shove=shove_enabled,
+                        )
+                    except PnsFailure as exc:
+                        # Dump the failure state so the blockage can be inspected
+                        # (same viz format as the success stages).
+                        _dump_viz("fail-pns", [], _pad_viz, buffered, route_bbox)
+                        raise RouteFailure(
+                            f"No obstacle-avoiding path from {req.ref_a}/{req.pad_a} to "
+                            f"{req.ref_b}/{req.pad_b} at {width}mm track width on layer "
+                            f"{start_layer}: {exc}"
+                        ) from exc
+                    print(
+                        f"  [route] PNS: {len(eng.path)} pts"
+                        f"  shoved={len(eng.shoved_tracks)}  arcs={len(eng.arcs)}"
+                    )
+                    pushed: list[TrackObstacle] = eng.shoved_tracks
+
+                    if eng.trace is not None:
+                        # Embargo-free skeleton: emit anchor points and arcs straight
+                        # from the trace (KiCad emits the skeleton for a clear route).
+                        best_path_pts = eng.trace.points
+                    else:
+                        best_path_pts = eng.path
+
+                    _dump_viz("0-pns", best_path_pts, _pad_viz, buffered, route_bbox)
+
+                    # ---- Replace scheme inside rectangular pads with an
+                    #      axis-aligned wire (fence -> centre) ----
+                    if pad_a_size is not None:
+                        n_before = len(best_path_pts)
+                        best_path_pts = _replace_pad_path(
+                            best_path_pts, pad_a_xy, pad_a_size, from_center=True
+                        )
+                        _log_path("pad_a-replace", best_path_pts, n_before)
+                    if pad_b_size is not None:
+                        n_before = len(best_path_pts)
+                        best_path_pts = _replace_pad_path(
+                            best_path_pts, pad_b_xy, pad_b_size, from_center=False
+                        )
+                        _log_path("pad_b-replace", best_path_pts, n_before)
+                    _dump_viz("1-pad-replace", best_path_pts, _pad_viz, buffered, route_bbox)
+
+                    # ---- Align path endpoints with exact pad centres ----
+                    best_path_pts = _align_path_endpoints(
+                        best_path_pts,
+                        pad_a_xy,
+                        pad_b_xy,
+                        buffered,
+                        route_bbox,
+                        grid_res,
+                        pad_a_size=pad_a_size,
+                        pad_b_size=pad_b_size,
+                    )
+                    _log_path("align-endpoints", best_path_pts)
+                    _dump_viz("6-align-endpoints", best_path_pts, _pad_viz, buffered, route_bbox)
+
+                    path_nodes = path_to_nodes(best_path_pts, start_layer)
+                    segs, vias = postprocess_path(
+                        path_nodes,
+                        width=width,
+                        net=req.net,
+                        max_miter_mm=req.max_miter_mm,
+                        _obstacles=buffered,
+                        _pad_rects=_pad_rects or None,
+                    )
+                    segs = [s for s in segs if abs(s.x1 - s.x2) > 1e-6 or abs(s.y1 - s.y2) > 1e-6]
+
+                    # Rounded skeleton arcs -> OutputArc nodes.  Valid only when
+                    # walkaround/shove/pad-cleanup left the original skeleton anchors
+                    # in place.  When arcs are emitted, skip mitering on the legs
+                    # they join (postprocess miter would cut into the arc end).
+                    arcs_out: list[OutputArc] = []
+                    emit_arcs = (
+                        eng.trace is not None
+                        and len(best_path_pts) == len(eng.trace.points)
+                        and all(_pt_eq(p, q) for p, q in zip(best_path_pts, eng.trace.points))
+                    )
+                    if emit_arcs:
+                        if any(a is not None for a in eng.trace.arcs):
+                            # Skeleton with arcs: emit straight legs + arcs directly,
+                            # no mitering (the rounded corner already smooths the join).
+                            segs = []
+                            pts = eng.trace.points
+                            for i in range(len(pts) - 1):
+                                arc_i = eng.trace.arcs[i] if i < len(eng.trace.arcs) else None
+                                if arc_i is not None:
+                                    arcs_out.append(
+                                        OutputArc(
+                                            start=arc_i.start,
+                                            mid=arc_i.mid,
+                                            end=arc_i.end,
+                                            width=width,
+                                            layer=start_layer,
+                                            net=req.net,
+                                        )
                                     )
-                                )
+                                else:
+                                    x1, y1 = pts[i]
+                                    x2, y2 = pts[i + 1]
+                                    if abs(x1 - x2) > 1e-6 or abs(y1 - y2) > 1e-6:
+                                        segs.append(
+                                            OutputSegment(
+                                                x1=x1,
+                                                y1=y1,
+                                                x2=x2,
+                                                y2=y2,
+                                                width=width,
+                                                layer=start_layer,
+                                                net=req.net,
+                                            )
+                                        )
+                        else:
+                            # Mitered skeleton (no arcs): keep the mitered postprocess
+                            # output; nothing further to emit.
+                            pass
+
+                    _log_output_segments("final", segs)
+                    _dump_viz_segments("7-final", segs, _pad_viz, buffered, route_bbox)
+
+                    start_xy = (path_nodes[0].x, path_nodes[0].y)
+                    end_xy = (path_nodes[-1].x, path_nodes[-1].y)
+                    layers_used = _layers_used(path_nodes)
                 else:
-                    # Mitered skeleton (no arcs): keep the mitered postprocess
-                    # output; nothing further to emit.
-                    pass
-
-            _log_output_segments("final", segs)
-            _dump_viz_segments("7-final", segs, _pad_viz, buffered, route_bbox)
-
-            start_xy = (path_nodes[0].x, path_nodes[0].y)
-            end_xy = (path_nodes[-1].x, path_nodes[-1].y)
-            layers_used = _layers_used(path_nodes)
-        else:
-            # -- Multi-layer: per-leg walkaround + shove, vias on the
-            #    direct pad-to-pad line ---------------------------------
-            layer_seq = _resolve_layer_sequence(start_layer, end_layer, req.via_pairs)
-            n_trans = len(layer_seq) - 1
-            via_forbidden = [
-                poly for poly, _pl, _rf, _pn, _ctr in _same_net_pad_polygons(data, req.net)
-            ]
-            via_positions = _pick_via_positions(
-                pcb_path=req.pcb_path,
-                layer_seq=layer_seq,
-                start=pad_a_xy,
-                end=pad_b_xy,
-                via_forbidden=via_forbidden,
-                via_diameter=via_diameter,
-                via_drill=via_drill,
-                clearance=clearance,
-                net=req.net,
+                    # -- Multi-layer: per-leg walkaround + shove, vias on the
+                    #    direct pad-to-pad line ---------------------------------
+                    layer_seq = _resolve_layer_sequence(start_layer, end_layer, req.via_pairs)
+                    n_trans = len(layer_seq) - 1
+                    via_forbidden = [
+                        poly for poly, _pl, _rf, _pn, _ctr in _same_net_pad_polygons(data, req.net)
+                    ]
+                    via_positions = _pick_via_positions(
+                        pcb_path=req.pcb_path,
+                        layer_seq=layer_seq,
+                        start=pad_a_xy,
+                        end=pad_b_xy,
+                        via_forbidden=via_forbidden,
+                        via_diameter=via_diameter,
+                        via_drill=via_drill,
+                        clearance=clearance,
+                        net=req.net,
+                    )
+                    anchors = [pad_a_xy, *via_positions, pad_b_xy]
+                    via_anchors = set(anchors[1:-1])
+                    for li in range(n_trans + 1):
+                        run_leg(anchors[li], anchors[li + 1], layer_seq[li], li=li, n_legs=n_trans + 1)
+                    finalize_legs()
+            except RouteFailure as exc:
+                last_failure = exc
+                continue
+            fp = _route_fingerprint(segs, arcs_out, vias, pushed)
+            if fp in seen_fps:
+                continue
+            seen_fps.add(fp)
+            candidate_rounds.append(
+                (
+                    variant_tag,
+                    segs,
+                    vias,
+                    arcs_out,
+                    pushed,
+                    start_xy,
+                    end_xy,
+                    list(layers_used),
+                    waypoint_violated,
+                    list(violated_waypoints),
+                    list(via_sites),
+                )
             )
-            anchors = [pad_a_xy, *via_positions, pad_b_xy]
-            via_anchors = set(anchors[1:-1])
-            for li in range(n_trans + 1):
-                run_leg(anchors[li], anchors[li + 1], layer_seq[li], li=li, n_legs=n_trans + 1)
-            finalize_legs()
+            if len(candidate_rounds) >= max(1, req.candidates):
+                break
+        if not candidate_rounds:
+            if last_failure is not None:
+                raise last_failure
+            raise RouteFailure("PNS routing produced no candidates")
+        # Primary result = the first candidate (backwards compatible).
+        (
+            _primary_variant,
+            segs,
+            vias,
+            arcs_out,
+            pushed,
+            start_xy,
+            end_xy,
+            layers_used,
+            waypoint_violated,
+            violated_waypoints,
+            via_sites,
+        ) = candidate_rounds[0]
+        if req.candidates > 1:
+            candidates_meta = [
+                _candidate_route_dict(
+                    segs=rt_segs,
+                    vias=rt_vias,
+                    arcs=rt_arcs,
+                    shoved=rt_pushed,
+                    corner_mode=req.corner_mode,
+                    algorithm=req.algorithm,
+                    start=rt_start,
+                    end=rt_end,
+                    layers_used=rt_layers,
+                    waypoint_violated=rt_wv,
+                    violated_waypoints=rt_vw,
+                    via_sites=rt_vs,
+                    variant=rt_tag,
+                )
+                for (
+                    rt_tag,
+                    rt_segs,
+                    rt_vias,
+                    rt_arcs,
+                    rt_pushed,
+                    rt_start,
+                    rt_end,
+                    rt_layers,
+                    rt_wv,
+                    rt_vw,
+                    rt_vs,
+                ) in candidate_rounds
+            ]
+            candidates_png = _render_candidates_png(req.pcb_path, candidates_meta)
 
     # Verify every emitted segment stays inside the board (Edge.Cuts).
     # We use a board polygon that is shrunk by width/2 on each side so the
@@ -1322,6 +1483,8 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
         waypoint_violated=waypoint_violated,
         violated_waypoints=violated_waypoints,
         via_sites=via_sites,
+        candidates=candidates_meta,
+        candidates_png=candidates_png,
     )
 
 
@@ -2150,6 +2313,151 @@ def _layer_engine_obstacles(
 _ANCHOR_SHIFT_STEP_MM = 0.2
 
 
+def _pns_strategy_specs(candidates: int, anchors: list[dict]):
+    """Yield one ``(variant_tag, shove_enabled, waypoint_tol_scale)`` per
+    PNS candidate variant (W3).
+
+    ``candidates <= 1`` — exactly today's single run.  Otherwise the cheap
+    strategy variants: walkaround-only (shove disabled), walkaround +
+    shove (the engine default), then — only when the request carries
+    waypoint anchors — waypoint-tolerance scales (waypoint ``tol_mm`` is
+    informational today, so those variants normally dedupe against the
+    shove variant; the spec stays for when a tolerance semantics lands).
+    """
+    if candidates <= 1:
+        yield ("default", True, 1.0)
+        return
+    yield ("walkaround", False, 1.0)
+    yield ("shove", True, 1.0)
+    if any(anchor.get("kind") == "waypoint" for anchor in anchors):
+        yield ("waypoint-tol-x0.5", True, 0.5)
+        yield ("waypoint-tol-x1.0", True, 1.0)
+        yield ("waypoint-tol-x2.0", True, 2.0)
+
+
+def _route_fingerprint(
+    segs: list[OutputSegment],
+    arcs: list[OutputArc],
+    vias: list[OutputVia],
+    shoved: list[TrackObstacle],
+) -> tuple:
+    """Deterministic geometry fingerprint for candidate deduplication.
+
+    The shove engine displaces tracks, not the routed path: the
+    walkaround-only and walkaround+shove variants share the same polyline
+    and differ only in the pushed-tracks list, so the fingerprint must
+    cover the shoved tracks too — otherwise every shove variant collides
+    with its walkaround twin and candidates collapse to one.
+    """
+    seg_fp = tuple(
+        sorted(
+            (s.layer, round(s.x1, 4), round(s.y1, 4), round(s.x2, 4), round(s.y2, 4))
+            for s in segs
+        )
+    )
+    arc_fp = tuple(
+        sorted(
+            (
+                a.layer,
+                round(a.start[0], 4),
+                round(a.start[1], 4),
+                round(a.mid[0], 4),
+                round(a.mid[1], 4),
+                round(a.end[0], 4),
+                round(a.end[1], 4),
+            )
+            for a in arcs
+        )
+    )
+    via_fp = tuple(sorted((round(v.x, 4), round(v.y, 4), v.layers) for v in vias))
+    shoved_fp = tuple(
+        sorted(
+            (t.layer, round(t.start[0], 4), round(t.start[1], 4))
+            for t in shoved
+        )
+    )
+    return (seg_fp, arc_fp, via_fp, shoved_fp)
+
+
+def _candidate_route_dict(
+    *,
+    segs: list[OutputSegment],
+    vias: list[OutputVia],
+    arcs: list[OutputArc],
+    shoved: list[TrackObstacle],
+    corner_mode: str,
+    algorithm: str,
+    start: tuple[float, float],
+    end: tuple[float, float],
+    layers_used: list[str],
+    waypoint_violated: bool,
+    violated_waypoints: list[tuple[float, float]],
+    via_sites: list[dict],
+    variant: str,
+) -> dict:
+    """Serialize one route variant for the ``candidates`` list — the same
+    shape the tool layer returns for a single route, plus the variant tag."""
+    return {
+        "variant": variant,
+        "segment_count": len(segs),
+        "segments": [
+            {
+                "x1": s.x1,
+                "y1": s.y1,
+                "x2": s.x2,
+                "y2": s.y2,
+                "width": s.width,
+                "layer": s.layer,
+                "net": s.net,
+            }
+            for s in segs
+        ],
+        "arc_count": len(arcs),
+        "arcs": [
+            {
+                "start": list(a.start),
+                "mid": list(a.mid),
+                "end": list(a.end),
+                "width": a.width,
+                "layer": a.layer,
+                "net": a.net,
+            }
+            for a in arcs
+        ],
+        "via_count": len(vias),
+        "vias": [
+            {
+                "x": v.x,
+                "y": v.y,
+                "diameter": v.diameter,
+                "drill": v.drill,
+                "layers": [v.layers[0], v.layers[1]],
+                "net": v.net,
+            }
+            for v in vias
+        ],
+        "shoved": [
+            {
+                "net": t.net,
+                "layer": t.layer,
+                "points": [list(pt) for pt in t.points],
+                "width": t.width,
+            }
+            for t in shoved
+        ],
+        "corner_mode": corner_mode,
+        "algorithm": algorithm,
+        "start": list(start),
+        "end": list(end),
+        "layers_used": list(layers_used),
+        "waypoint_violated": waypoint_violated,
+        "violated_waypoints": [list(pt) for pt in violated_waypoints],
+        "via_sites": [
+            {"pos": list(site["pos"]), "to_layer": site["to_layer"]} for site in via_sites
+        ],
+    }
+
+
 def _anchor_pos(spec: dict, kind: str) -> tuple[float, float]:
     """Validate + return the ``pos`` of an anchor spec as (x, y)."""
     pos = spec.get("pos")
@@ -2332,6 +2640,45 @@ def _render_route_failure_evidence(
         if not png:
             return None
         fname = f"kcaa_route_failure_{time.time_ns()}_{os.getpid()}.png"
+        out = os.path.join(tempfile.gettempdir(), fname)
+        with open(out, "wb") as fh:
+            fh.write(png)
+        return out
+    except Exception:  # evidence rendering must never mask the real error
+        return None
+
+
+def _render_candidates_png(
+    pcb_path: str,
+    candidates: list[dict],
+    anchors: list[dict] | None = None,
+) -> str | None:
+    """Render the candidate routes side-by-side to a PNG next to the
+    .kicad_pcb and return its path (best-effort).
+
+    ``candidates`` is the serialized variant list (see
+    ``_candidate_route_dict``: one dict per variant with ``variant``,
+    ``segments``, ``arcs`` and ``vias``).  ``anchors`` are the raw anchor
+    specs (their ``pos`` entries are shown as green markers).  Returns
+    ``None`` when rendering fails — candidates must never mask the route
+    result.
+    """
+    try:
+        from kcaa.tools.render_route_state import render_candidates
+
+        anchor_positions: list[tuple[float, float]] = []
+        for spec in anchors or []:
+            pos = spec.get("pos") if isinstance(spec, dict) else None
+            if isinstance(pos, (list, tuple)) and len(pos) >= 2:
+                anchor_positions.append((float(pos[0]), float(pos[1])))
+        _lines, png, _report = render_candidates(
+            pcb_path,
+            candidates=candidates,
+            anchors=anchor_positions,
+        )
+        if not png:
+            return None
+        fname = f"kcaa_candidates_{time.time_ns()}_{os.getpid()}.png"
         out = os.path.join(tempfile.gettempdir(), fname)
         with open(out, "wb") as fh:
             fh.write(png)
