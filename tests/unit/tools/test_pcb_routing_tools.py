@@ -325,3 +325,25 @@ class TestPcbRouteOptions:
         assert result["segment_count"] > 0
         assert result["arc_count"] == 0
         assert result["arcs"] == []
+
+    def test_dry_run_skips_write_and_echoes(self, tools, routable_board):
+        """dry_run=True routes and returns the full result but leaves the
+        PCB byte-identical (no reload, no .bak); a follow-up dry_run=False
+        on the same board writes (file changes)."""
+        before = open(routable_board, "rb").read()
+        dry = self._route(tools, routable_board, options={"dry_run": True})
+        assert "error" not in dry
+        assert dry["dry_run"] is True
+        assert dry["segment_count"] > 0
+        assert dry["backup_path"] is None
+        assert "waypoint_violated" in dry
+        assert "violated_waypoints" in dry
+        assert "via_sites" in dry
+        assert open(routable_board, "rb").read() == before
+
+        wet = self._route(tools, routable_board, options={"dry_run": False})
+        assert "error" not in wet
+        assert wet["dry_run"] is False
+        assert wet["segment_count"] > 0
+        assert wet["backup_path"] is not None
+        assert open(routable_board, "rb").read() != before

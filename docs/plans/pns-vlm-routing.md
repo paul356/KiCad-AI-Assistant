@@ -310,6 +310,18 @@ Anchorspec = (
 out): keepouts, preferred_region, shove_nets/shove_depth, max_length_mm,
 max_vias, net_kind. Waypoints express intent; PNS owns engine internals.
 
+> **Implemented (W2)**: `RouteRequest.anchors` / `RouteRequest.dry_run`
+> (router.py) + `options.anchors` / `options.dry_run` on
+> `pcb_route_pad_to_pad`.  Each anchor consumes one leg boundary (N anchors
+> → N+1 legs, one `run_leg` per pair); waypoints are soft (unreachable →
+> skipped, echoed via `waypoint_violated` / `violated_waypoints`);
+> via anchors DRC-clean + micro-shift within `tol_mm` (nearest clean site
+> reported in `via_sites`); `dry_run` skips the tool's load/save entirely
+> (byte-identical file).  A blocked pinned leg (incl. no DRC-clean via
+> spot) raises `RouteFailure` carrying the rendered evidence PNG
+> (`render_route_attempt` + `BlockingEvidence`).  Pad anchors still raise
+> "not supported yet" (W4 `plan_routes`).
+
 ## 10. Candidate selection (W3)
 
 **PNS proposes all legal candidates, VLM selects.**
@@ -344,7 +356,7 @@ plan_routes(pcb_path, [
 | W | Scope | Exit criteria |
 |---|---|---|
 | W1 | Rendering upgrade: pad labels in `render_board`; failure-evidence render (grey skeleton + red blockers + green anchors) | labelled board render; forced-failure fixture → evidence PNG; render tests green |
-| W2 | `anchors` (waypoint/via/pad specs) + `dry_run` on `pcb_route_pad_to_pad`/options; failure render wired to raise | anchor-routed fixtures pass; dry_run leaves file byte-identical; failure PNG on blocked anchor leg |
+| W2 | `anchors` (waypoint/via/pad specs) + `dry_run` on `pcb_route_pad_to_pad`/options; failure render wired to raise | anchor-routed fixtures pass; dry_run leaves file byte-identical; failure PNG on blocked anchor leg — **implemented** (1001 passed / 15 skipped baseline; 9 new anchor/dry-run tests) |
 | W3 | `candidates: int` multi-route + side-by-side candidate render | N-candidate fixtures render side-by-side; DRC-legal each |
 | W4 | `plan_routes` multi-pair, dry-run tee, undo/reorder | multi-pair fixture: reorder works; only confirmed plan written |
 
