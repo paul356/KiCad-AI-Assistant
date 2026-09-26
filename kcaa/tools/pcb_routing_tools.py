@@ -123,6 +123,21 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
                 ``turn_penalty``: cost added when the path changes
                     direction (mm); default 0.3.  Set to 0 for pure
                     shortest-path routing (more zigzag).
+                ``anchors``: anchor-chain control surface for the ``pns``
+                    algorithm (a list of dicts): either
+                    ``{"kind": "waypoint", "pos": [x, y], "tol_mm": 1.0}``
+                    — route through a soft pass-through point on the
+                    current layer (unreachable waypoints are recorded in
+                    ``waypoint_violated`` and skipped, never a failure) —
+                    or ``{"kind": "via", "pos": [x, y],
+                    "to_layer": "B.Cu"}`` — insert a DRC-validated
+                    through-via near ``pos``, micro-shifted within
+                    ``tol_mm`` when the exact spot is blocked.  N anchors
+                    split the route into N+1 legs.  ``{"kind": "pad",
+                    "ref": ..., "pad": ...}`` anchors are not supported yet.
+                ``dry_run``: True -> route and return the full result
+                    without writing anything to the PCB file (no reload,
+                    no .bak; the file stays byte-identical).
 
         Returns:
             dict with:
@@ -134,21 +149,34 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
                 corner_mode: echoed corner_mode.
                 algorithm: echoed algorithm (``astar`` | ``pns``).
                 via_count / vias: vias written (0 for single-layer).
+                via_sites: emitted via anchors, one dict per anchor:
+                    ``{"pos": [x, y], "to_layer": ...}`` (the actual
+                    DRC-clean site used, possibly micro-shifted).
+                waypoint_violated / violated_waypoints: True plus the
+                    ``(x, y)`` list when any waypoint anchor was
+                    unreachable and got skipped (the route still
+                    completed).
                 layers_used: ordered list of layers touched by the path.
                 start: ``(x, y)`` exit point of pad_a.
                 end: ``(x, y)`` entry point of pad_b.
-                backup_path: path to the ``.bak`` created before writing.
+                backup_path: path to the ``.bak`` created before writing
+                    (``None`` with ``dry_run``).
                 pcb_path: echo of the input path.
+                dry_run: echo of the ``dry_run`` option.
 
             Or ``{"error": "<message>"}`` on failure.
         """
         corner_mode = "rounded45"
         via_pairs: tuple[tuple[str, str], ...] = (("F.Cu", "B.Cu"),)
         turn_penalty = 0.3
+        anchors: list[dict] = []
+        dry_run = False
         if options:
             via_pairs = options.get("via_pairs", via_pairs)
             turn_penalty = options.get("turn_penalty", turn_penalty)
             corner_mode = options.get("corner_mode", corner_mode)
+            anchors = options.get("anchors", anchors)
+            dry_run = bool(options.get("dry_run", False))
         req = RouteRequest(
             pcb_path=pcb_path,
             ref_a=ref_a,
@@ -162,6 +190,8 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
             turn_penalty=turn_penalty,
             corner_mode=corner_mode,
             algorithm=algorithm,
+            anchors=anchors,
+            dry_run=dry_run,
         )
         try:
             result = auto_route_pair(req)
@@ -170,18 +200,22 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
         except (FileNotFoundError, ValueError) as exc:
             return {"error": f"Routing input error: {exc}"}
 
-        # Load the PCB and append the new segments, arcs and vias.
-        data = load_pcb(pcb_path)
-        for seg in result.segments:
-            data.append(_segment_to_sexp(seg))
-        for arc in result.arcs:
-            data.append(_arc_to_sexp(arc))
-        for via in result.vias:
-            data.append(_via_to_sexp(via))
-        try:
-            backup_path = save_pcb(pcb_path, data)
-        except OSError as exc:
-            return {"error": f"Failed to write PCB file: {exc}"}
+        # ---- Write path: dry_run short-circuits before reloading
+        #      (auto_route_pair already parsed the board) and never
+        #      creates the .bak or mutates the file.
+        backup_path: str | None = None
+        if not dry_run:
+            data = load_pcb(pcb_path)
+            for seg in result.segments:
+                data.append(_segment_to_sexp(seg))
+            for arc in result.arcs:
+                data.append(_arc_to_sexp(arc))
+            for via in result.vias:
+                data.append(_via_to_sexp(via))
+            try:
+                backup_path = save_pcb(pcb_path, data)
+            except OSError as exc:
+                return {"error": f"Failed to write PCB file: {exc}"}
 
         return {
             "segment_count": len(result.segments),
@@ -235,8 +269,18 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
             "layers_used": list(result.layers_used),
             "start": list(result.start),
             "end": list(result.end),
+            "via_sites": [
+                {
+                    "pos": list(site["pos"]),
+                    "to_layer": site["to_layer"],
+                }
+                for site in result.via_sites
+            ],
+            "waypoint_violated": result.waypoint_violated,
+            "violated_waypoints": [list(pt) for pt in result.violated_waypoints],
             "backup_path": backup_path,
             "pcb_path": pcb_path,
+            "dry_run": dry_run,
         }
 
     @mcp.tool()
