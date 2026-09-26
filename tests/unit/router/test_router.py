@@ -15,6 +15,7 @@ fall back to a guessed value.
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 
 import pytest
@@ -27,6 +28,7 @@ from kcaa.router.router import (
     ProFileMissing,
     RouteFailure,
     RouteRequest,
+    RouteResult,
     _check_segments_in_board,
     _check_vias_in_board,
     _default_clearance,
@@ -1762,3 +1764,270 @@ def test_algorithm_invalid_value_raises_route_failure(tmp_path: Path) -> None:
     with pytest.raises(RouteFailure) as excinfo:
         auto_route_pair(req)
     assert "algorithm" in str(excinfo.value).lower()
+
+
+# ---------------------------------------------------------------------------
+# Anchor chain (waypoints / via anchors) -- W2
+# ---------------------------------------------------------------------------
+
+
+def _make_two_layer_board(tmp_path: Path, extra: str = "") -> Path:
+    """Minimal clear board with F.Cu + B.Cu endpoint pads and a paired
+    .kicad_pro (netclass Default with via rules + design rules), so PNS
+    via placement DRC-checks resolve.  ``extra`` footprints are spliced
+    in before the final ``)``."""
+    pcb = """(kicad_pcb
+	(version 20260206)
+	(generator "test")
+	(layers
+		(0 "F.Cu" signal)
+		(31 "B.Cu" signal)
+		(44 "Edge.Cuts" user)
+	)
+	(net 0 "")
+	(net 1 "VCC")
+	(net 2 "GND")
+	(footprint "R"
+		(layer "F.Cu")
+		(at 30.0 30.0 0.0)
+		(property "Reference" "R1")
+		(pad "1" smd rect
+			(at -0.5 0.0)
+			(size 0.5 0.5)
+			(layers "F.Cu" "F.Mask")
+			(net 1 "VCC")
+		)
+	)
+	(footprint "C"
+		(layer "B.Cu")
+		(at 60.0 40.0 0.0)
+		(property "Reference" "C1")
+		(pad "1" smd rect
+			(at 0.0 -0.5)
+			(size 0.5 0.5)
+			(layers "B.Cu" "B.Mask")
+			(net 1 "VCC")
+		)
+	)
+	(gr_rect
+		(start 20.0 20.0)
+		(end 70.0 60.0)
+		(stroke (width 0.1) (type solid))
+		(fill none)
+		(layer "Edge.Cuts")
+	)
+)
+"""
+    dst = tmp_path / "two_layer.kicad_pcb"
+    dst.write_text(pcb.rstrip()[:-1] + extra + ")\n")
+    pro = {
+        "board": {
+            "design_settings": {
+                "rules": {
+                    "min_clearance": 0.2,
+                    "min_track_width": 0.2,
+                    "min_via_size": 0.5,
+                    "min_through_drill": 0.25,
+                }
+            }
+        },
+        "net_settings": {
+            "classes": [
+                {
+                    "name": "Default",
+                    "clearance": 0.2,
+                    "track_width": 0.25,
+                    "via_diameter": 0.8,
+                    "via_drill": 0.4,
+                }
+            ],
+            "netclass_patterns": [],
+        },
+    }
+    (tmp_path / "two_layer.kicad_pro").write_text(json.dumps(pro))
+    return dst
+
+
+def _route_pns_anchors(board: Path, anchors: list[dict]) -> RouteResult:
+    return auto_route_pair(
+        RouteRequest(
+            pcb_path=str(board),
+            ref_a="R1",
+            pad_a="1",
+            ref_b="C1",
+            pad_b="1",
+            net="VCC",
+            width=0.2,
+            clearance=0.2,
+            via_diameter=0.8,
+            via_drill=0.4,
+            algorithm="pns",
+            corner_mode="mitered45",
+            anchors=anchors,
+        )
+    )
+
+
+def test_anchors_waypoint_routes_through_point(tmp_path: Path) -> None:
+    """A waypoint anchor forces the single-layer route through its
+    tolerance circle; unreachable waypoints never fail the route."""
+    from shapely.geometry import LineString, Point
+
+    result = _route_clear(
+        {
+            "algorithm": "pns",
+            "corner_mode": "mitered45",
+            "anchors": [{"kind": "waypoint", "pos": (45.0, 30.0), "tol_mm": 1.0}],
+        },
+        tmp_path,
+    )
+    assert result.vias == []
+    assert result.layers_used == ["F.Cu"]
+    assert len(result.segments) > 0
+    wpt = Point(45.0, 30.0)
+    dists = [LineString([(s.x1, s.y1), (s.x2, s.y2)]).distance(wpt) for s in result.segments]
+    assert min(dists) <= 1.0 + 1e-6
+    assert result.waypoint_violated is False
+    assert result.violated_waypoints == []
+    assert result.via_sites == []
+
+
+def test_anchors_waypoint_unreachable_is_soft_skip(tmp_path, monkeypatch) -> None:
+    """A waypoint leg that fails (engine PnsFailure) is recorded as
+    violated and skipped; the route still completes end to end."""
+    from kcaa.router.route_engine import PnsFailure
+    from kcaa.router.route_engine import route_engine as real_engine
+    import kcaa.router.router as router_mod
+
+    calls = {"n": 0}
+
+    def flaky_engine(start, end, obstacles, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:  # the waypoint leg
+            raise PnsFailure("synthetic waypoint blockage")
+        return real_engine(start, end, obstacles, **kw)
+
+    monkeypatch.setattr(router_mod, "route_engine", flaky_engine)
+    result = _route_clear(
+        {
+            "algorithm": "pns",
+            "corner_mode": "mitered45",
+            "anchors": [{"kind": "waypoint", "pos": (45.0, 30.0), "tol_mm": 1.0}],
+        },
+        tmp_path,
+    )
+    assert calls["n"] == 2  # waypoint leg failed, final leg routed
+    assert result.waypoint_violated is True
+    assert result.violated_waypoints == [(45.0, 30.0)]
+    assert len(result.segments) > 0
+    # The route still ends on pad C1/1.
+    assert result.end == pytest.approx((60.0, 39.5), abs=1e-3)
+
+
+def test_anchors_via_explicit_cross_layer(tmp_path: Path) -> None:
+    """An explicit via anchor switches the leg layer at its requested
+    site: exactly one via, echoes the site + to_layer, route crosses."""
+    result = _route_pns_anchors(
+        _make_two_layer_board(tmp_path),
+        [{"kind": "via", "pos": (45.0, 35.0), "to_layer": "B.Cu"}],
+    )
+    assert len(result.vias) == 1
+    assert result.vias[0].x == pytest.approx(45.0, abs=1e-3)
+    assert result.vias[0].y == pytest.approx(35.0, abs=1e-3)
+    assert result.layers_used == ["F.Cu", "B.Cu"]
+    assert len(result.segments) > 0
+    assert len(result.via_sites) == 1
+    assert result.via_sites[0]["to_layer"] == "B.Cu"
+    assert result.via_sites[0]["pos"] == pytest.approx([45.0, 35.0], abs=1e-3)
+    assert result.waypoint_violated is False
+
+
+def test_anchors_via_shifts_off_blocked_site(tmp_path: Path) -> None:
+    """A via anchor requested exactly on same-net pad copper micro-shifts
+    to the nearest DRC-clean spot (within tol_mm) and routes anyway."""
+    from shapely.geometry import Point, box
+
+    same_net_pad = (
+        "\n\t(footprint \"user_add:site-blocker\"\n"
+        "\t\t(layer \"F.Cu\")\n"
+        "\t\t(at 45.0 40.0 0.0)\n"
+        "\t\t(property \"Reference\" \"X1\")\n"
+        "\t\t(pad \"1\" smd rect\n"
+        "\t\t\t(at 0.0 0.0)\n"
+        "\t\t\t(size 0.3 0.3)\n"
+        "\t\t\t(layers \"F.Cu\" \"F.Mask\")\n"
+        "\t\t\t(net 1 \"VCC\")\n"
+        "\t\t)\n"
+        "\t)\n"
+    )
+    board = _make_two_layer_board(tmp_path, extra=same_net_pad)
+    result = _route_pns_anchors(
+        board,
+        [{"kind": "via", "pos": (45.0, 40.0), "to_layer": "B.Cu"}],
+    )
+    assert len(result.via_sites) == 1
+    site_x, site_y = result.via_sites[0]["pos"]
+    assert (site_x, site_y) != pytest.approx((45.0, 40.0), abs=1e-6)
+    assert math.hypot(site_x - 45.0, site_y - 40.0) <= 1.0 + 1e-6
+    assert len(result.vias) == 1
+    # The emitted via must not land on the same-net pad copper.
+    pad = box(44.85, 39.85, 45.15, 40.15)
+    assert not pad.contains(Point(result.vias[0].x, result.vias[0].y))
+    assert len(result.segments) > 0
+
+
+def test_anchors_failure_renders_png_evidence(tmp_path: Path) -> None:
+    """A blocked via anchor with no DRC-clean spot inside tol_mm raises
+    RouteFailure carrying the path of a rendered failure-evidence PNG."""
+    foreign_blocker = (
+        "\n\t(footprint \"user_add:wall\"\n"
+        "\t\t(layer \"F.Cu\")\n"
+        "\t\t(at 45.0 40.0 0.0)\n"
+        "\t\t(property \"Reference\" \"X1\")\n"
+        "\t\t(pad \"1\" smd rect\n"
+        "\t\t\t(at 0.0 0.0)\n"
+        "\t\t\t(size 4.0 4.0)\n"
+        "\t\t\t(layers \"F.Cu\" \"F.Mask\")\n"
+        "\t\t\t(net 2 \"GND\")\n"
+        "\t\t)\n"
+        "\t)\n"
+    )
+    board = _make_two_layer_board(tmp_path, extra=foreign_blocker)
+    with pytest.raises(RouteFailure) as excinfo:
+        _route_pns_anchors(
+            board,
+            [{"kind": "via", "pos": (45.0, 40.0), "tol_mm": 1.0, "to_layer": "B.Cu"}],
+        )
+    msg = str(excinfo.value)
+    assert "no DRC-clean via spot" in msg
+    assert "Failure evidence: " in msg
+    png_path = msg.split("Failure evidence: ")[1].strip()
+    assert Path(png_path).exists()
+    assert png_path.endswith(".png")
+
+
+def test_anchors_pad_not_supported_yet(tmp_path: Path) -> None:
+    """Pad anchors are reserved (W4): the first pad anchor raises
+    'not supported yet' instead of half-working."""
+    with pytest.raises(RouteFailure, match="not supported yet"):
+        _route_clear(
+            {"algorithm": "pns", "anchors": [{"kind": "pad", "ref": "C1", "pad": "1"}]},
+            tmp_path,
+        )
+
+
+def test_anchors_require_pns_algorithm(tmp_path: Path) -> None:
+    """The A* planner must reject anchors loudly instead of ignoring them."""
+    with pytest.raises(RouteFailure, match="only supported with algorithm"):
+        _route_clear(
+            {"algorithm": "astar", "anchors": [{"kind": "waypoint", "pos": (45.0, 30.0)}]},
+            tmp_path,
+        )
+
+
+def test_anchors_unknown_kind_raises(tmp_path: Path) -> None:
+    with pytest.raises(RouteFailure, match="unsupported anchor kind"):
+        _route_clear(
+            {"algorithm": "pns", "anchors": [{"kind": "jump", "pos": (45.0, 30.0)}]},
+            tmp_path,
+        )
