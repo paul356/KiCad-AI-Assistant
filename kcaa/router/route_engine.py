@@ -58,9 +58,15 @@ def route_engine(
     track_width: float,
     clearance: float,
     corner_mode: CornerMode | str = CornerMode.MITERED_45,
+    shove: bool = True,
 ) -> EngineResult:
     """Route ``start`` → ``end`` through the obstacle set with walkaround
-    + shove, returning the final polyline and the pushed tracks."""
+    + shove, returning the final polyline and the pushed tracks.
+
+    ``shove=False`` runs the walkaround-only strategy (movable tracks are
+    treated as fixed solids and never displaced) — the W3 "walkaround"
+    candidate variant.  Default ``True`` is the pre-existing behavior.
+    """
     trace = build_initial_trace(start, end, corner_mode)
     skeleton = trace.as_polyline(arc_pts=16)
 
@@ -100,11 +106,19 @@ def route_engine(
         movable.append(track)
         movable_shapes.append(obs)
 
-    fixed = [o for o in obstacles if o not in movable_shapes]
-    node = ObstacleNode(fixed)
+    # Movable tracks are shove candidates only when shoving is enabled;
+    # the walkaround-only variant (W3 "walkaround" candidate) treats every
+    # track as a fixed solid and routes around it — DRC-clean, but the
+    # track is never displaced.
+    walk_obstacles = (
+        obstacles
+        if not shove
+        else [o for o in obstacles if o not in movable_shapes]
+    )
+    node = ObstacleNode(walk_obstacles)
     walked = _walkaround_solids(skeleton, node, track_width, clearance)
 
-    if movable:
+    if movable and shove:
         shoved: ShoveResult = shove_path(
             walked,
             movable,

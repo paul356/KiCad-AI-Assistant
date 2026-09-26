@@ -272,7 +272,8 @@ Rendering entry points:
   for VLM-facing boards; optional via param, default on).
 - `scripts/render_viz.py` — already renders stage JSON with `obstacles` and
   optional `candidates`; add failure-highlight mode (grey path + red ring) and
-  **candidate side-by-side** mode (W3, renderer PR ready now).
+  **candidate side-by-side** mode (W3 — implemented: `render_candidates` in
+  `render_route_state.py`, PNG in `RouteResult.candidates_png`).
 - Implemented (W1): `kcaa/tools/render_route_state.py` — one-call render of
   "route attempt with failure evidence" from a `RouteResult`/`RouteFailure`
   + anchor chain — reused by the MCP tool and the VLM driver script.
@@ -335,6 +336,23 @@ max_vias, net_kind. Waypoints express intent; PNS owns engine internals.
 - VLM picks by look/global fit; the chosen index is re-run with
   `dry_run=False` to commit.
 
+> **Implemented (W3)**: `RouteRequest.candidates` (router.py) +
+> `options.candidates` on `pcb_route_pad_to_pad`.  `candidates > 1` re-runs
+> the whole PNS branch once per cheap strategy variant —
+> walkaround-only (`shove=False`), walkaround+shove, then waypoint-tolerance
+> scales when waypoint anchors are present — deduped by a full geometry
+> fingerprint (segments + arcs + vias + shoved tracks; identical geometries
+> count as one candidate).  The primary top-level result is exactly the
+> first candidate (backwards compatible); the full list rides in
+> `RouteResult.candidates`, each entry serialized like the primary response
+> plus a `"variant"` tag.  `candidates > 1` with `algorithm='astar'` is
+> rejected.  `render_candidates` (render_route_state.py) draws the variants
+> side by side (`variant N — <tag>` panes, grey skeleton + via rings + green
+> anchor dots); its PNG path lands in `RouteResult.candidates_png`
+> (best-effort, `dry_run` included).  A* failure branches (single- and
+> multi-layer) also render the blocking-copper evidence PNG into the
+> `RouteFailure` message.
+
 ## 11. Multi-pair planning (W4)
 
 ```python
@@ -357,7 +375,7 @@ plan_routes(pcb_path, [
 |---|---|---|
 | W1 | Rendering upgrade: pad labels in `render_board`; failure-evidence render (grey skeleton + red blockers + green anchors) | labelled board render; forced-failure fixture → evidence PNG; render tests green |
 | W2 | `anchors` (waypoint/via/pad specs) + `dry_run` on `pcb_route_pad_to_pad`/options; failure render wired to raise | anchor-routed fixtures pass; dry_run leaves file byte-identical; failure PNG on blocked anchor leg — **implemented** (1001 passed / 15 skipped baseline; 9 new anchor/dry-run tests) |
-| W3 | `candidates: int` multi-route + side-by-side candidate render | N-candidate fixtures render side-by-side; DRC-legal each |
+| W3 | `candidates: int` multi-route + side-by-side candidate render | N-candidate fixtures render side-by-side; DRC-legal each — **implemented** (walkaround/shove variants dedupe by geometry; PNG render; A* failure evidence).  Tests: 15 new across `test_router.py` / `test_pcb_routing_tools.py` / `test_render_route_state.py` (14 passed; the multi-layer A* failure fixture is skipped: the search box auto-expands and via edges escape single-layer rings — see test comment); suite 1015 passed / 16 skipped |
 | W4 | `plan_routes` multi-pair, dry-run tee, undo/reorder | multi-pair fixture: reorder works; only confirmed plan written |
 
 W1 is renderer-only (no routing changes) — safe first step; W2–W4 build on it.

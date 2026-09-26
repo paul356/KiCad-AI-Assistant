@@ -221,3 +221,127 @@ def render_route_attempt(
             f"layer={item.layer or 'any'} kind={item.kind}"
         )
     return lines, buf.getvalue(), report
+
+
+def render_candidates(
+    pcb_path: str,
+    *,
+    candidates: list[dict],
+    anchors: list[tuple[float, float]] | None = None,
+    dpi: int = 200,
+) -> tuple[list[str], bytes, dict[str, Any]]:
+    """Render N PNS candidate routes side-by-side (W3).
+
+    One pane per candidate (a single candidate degenerates to the plain
+    single-pane board render): every pane draws the board layers, then
+    overlays that candidate's segments/arcs in the skeleton grey, its
+    vias as hollow rings, and a ``variant N — <tag>`` caption.  Green
+    numbered dots mark shared anchor positions.
+
+    ``candidates`` is the serialized variant list produced by
+    :func:`kcaa.router.router._candidate_route_dict` (one dict per
+    variant with ``variant``, ``segments``, ``arcs`` and ``vias``).
+
+    Returns ``(report_lines, png_bytes, report_dict)`` with
+    ``report["candidates"]`` = number of panes drawn.  Never raises:
+    empty/odd candidate entries render as empty panes.
+    """
+    cands = list(candidates)
+    n = max(len(cands), 1)  # one empty pane degenerates to a board render
+
+    board = parse_board(pcb_path)
+    xmin, ymin, xmax, ymax = _bounds(board, [])
+    w_mm = max(xmax - xmin, 0.1)
+    h_mm = max(ymax - ymin, 0.1)
+    single_w_in = w_mm / 25.4
+    fig_w_in = single_w_in * n
+    fig_h_in = h_mm / 25.4
+    # Same sharpness rule as _new_board_figure: min 1600px per pane wide.
+    eff_dpi = max(dpi, int(1600 / single_w_in))
+
+    fig, axes = plt.subplots(1, n, figsize=(fig_w_in, fig_h_in), dpi=eff_dpi)
+    if n == 1:
+        axes = [axes]
+    fig.patch.set_facecolor(_BG_COLOR)
+    for ax in axes:
+        ax.set_facecolor(_BG_COLOR)
+        ax.set_xlim(xmin, xmax)
+        ax.set_ylim(ymin, ymax)
+        ax.invert_yaxis()  # KiCad PCB convention: +Y down.
+        ax.set_aspect("equal")
+        ax.axis("off")
+
+    for idx, cand in enumerate(cands):
+        ax = axes[idx]
+        # Per-pane parse: pad shape Patches are singletons per BoardData,
+        # and matplotlib forbids attaching one artist to several axes.
+        _draw_board_layers(ax, parse_board(pcb_path), layer=None, show_pad_labels=False)
+
+        for s in cand.get("segments") or []:
+            ax.plot(
+                [s["x1"], s["x2"]],
+                [s["y1"], s["y2"]],
+                color=_SKELETON_COLOR,
+                linewidth=0.35 * _PT_PER_MM,
+                solid_capstyle="round",
+                zorder=_Z_SKELETON,
+            )
+        for a in cand.get("arcs") or []:
+            # OutputArc mid lies on the fillet arc: a 3-point polyline
+            # through start/mid/end approximates it for VLM inspection.
+            ax.plot(
+                [a["start"][0], a["mid"][0], a["end"][0]],
+                [a["start"][1], a["mid"][1], a["end"][1]],
+                color=_SKELETON_COLOR,
+                linewidth=0.35 * _PT_PER_MM,
+                solid_capstyle="round",
+                zorder=_Z_SKELETON,
+            )
+        for v in cand.get("vias") or []:
+            ax.add_patch(
+                mpatches.Circle(
+                    (v["x"], v["y"]),
+                    0.4,
+                    fill=False,
+                    edgecolor=_SKELETON_COLOR,
+                    linewidth=0.25 * _PT_PER_MM,
+                    zorder=_Z_SKELETON,
+                )
+            )
+        tag = cand.get("variant") or "?"
+        _annot_text(ax, xmin + 1.0, ymin + 1.0, f"variant {idx + 1} — {tag}", _SKELETON_COLOR, 0.5)
+
+        for i, a in enumerate(anchors or [], start=1):
+            ax.add_patch(
+                mpatches.Circle(
+                    a,
+                    0.3,
+                    facecolor=_ANCHOR_COLOR,
+                    edgecolor="white",
+                    linewidth=0.15,
+                    zorder=_Z_ANNOTATION,
+                )
+            )
+            _annot_text(ax, a[0] + 0.5, a[1] - 0.5, str(i), _ANCHOR_COLOR, 0.35)
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", facecolor=_BG_COLOR, dpi=eff_dpi)
+    plt.close(fig)
+
+    report: dict[str, Any] = {
+        "candidates": len(cands),
+        "pads": len(board.pads),
+        "copper_layers": board.copper_layers,
+    }
+    lines = [
+        f"Rendered {len(cands)} candidate route(s) on {os.path.basename(pcb_path)}: "
+        f"{len(board.pads)} pads."
+    ]
+    for idx, cand in enumerate(cands):
+        lines.append(
+            f"  variant {idx + 1}: variant={cand.get('variant') or '?'} "
+            f"segments={len(cand.get('segments') or [])} "
+            f"arcs={len(cand.get('arcs') or [])} "
+            f"vias={len(cand.get('vias') or [])}"
+        )
+    return lines, buf.getvalue(), report
