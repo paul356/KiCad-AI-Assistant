@@ -31,8 +31,12 @@ With ``algorithm="pns"`` multi-layer routes decompose into one
 walkaround + shove leg per layer (shortest layer path through
 ``via_pairs``), joined by through-vias placed along the direct
 pad-to-pad line and DRC-validated (same-net pad faces, existing
-copper, board edge, hole-to-hole).  PNS legs emit straight segments
-only; rounded-corner arcs stay a single-layer skeleton feature.
+copper, board edge, hole-to-hole).  A PNS leg emits its rounded-corner
+arcs (corner_mode ``rounded45``/``rounded90``) when the skeleton
+survived walkaround/shove and the corner sits away from a via junction;
+legs whose skeleton was disturbed, or whose fillet would end on a via,
+fall back to straight segments.  Via junctions themselves stay
+straight-through connections.
 
 No shove
 --------
@@ -183,7 +187,7 @@ class RouteRequest:
     via_cost: float = 2.0  # mm penalty per via edge
     turn_penalty: float = 0.3  # mm penalty per direction change; 0 disables
     algorithm: str = "astar"  # astar (grid A*) | pns (walkaround + shove)
-    corner_mode: str = "mitered45"  # mitered45 | rounded45 | rounded90 (mitered90)
+    corner_mode: str = "rounded45"  # rounded45 (default) | mitered45 | rounded90 | mitered90
 
 
 @dataclass
@@ -207,7 +211,7 @@ class RouteResult:
     vias: list[OutputVia] = field(default_factory=list)
     arcs: list[OutputArc] = field(default_factory=list)
     shoved_tracks: list[TrackObstacle] = field(default_factory=list)
-    corner_mode: str = "mitered45"
+    corner_mode: str = "rounded45"
     algorithm: str = "astar"
     start: tuple[float, float] = (0.0, 0.0)
     end: tuple[float, float] = (0.0, 0.0)
@@ -907,9 +911,15 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
                 net=req.net,
             )
             anchors = [pad_a_xy, *via_positions, pad_b_xy]
+            via_anchors = set(anchors[1:-1])
             all_nodes: list[RouteNode] = []
             node_id = 0
             pushed = []
+            # Per-leg direct emission: None -> the leg keeps the postprocess
+            # (mitered straight) output below; otherwise the skeleton
+            # segments / arcs emitted straight from eng.trace.
+            direct_segs: list[list[OutputSegment] | None] = []
+            direct_arcs: list[list[OutputArc] | None] = []
             for li in range(n_trans + 1):
                 layer = layer_seq[li]
                 start_pt = anchors[li]
@@ -956,7 +966,81 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
                     pts = _replace_pad_path(pts, pad_a_xy, pad_a_size, from_center=True)
                 elif li == n_trans and pad_b_size is not None:
                     pts = _replace_pad_path(pts, pad_b_xy, pad_b_size, from_center=False)
-                for pi, (x, y) in enumerate(pts):
+
+                # Per-leg rounded-corner arcs.  A leg emits its skeleton
+                # fillets + straight legs straight from the trace — skipping
+                # the postprocess miter, which would cut into the arc ends —
+                # when walkaround/shove and the pad cleanup left the skeleton
+                # anchors in place (the same rule as the single-layer
+                # emit_arcs check).  The via junction itself stays a
+                # straight-through connection (KiCad behavior): a leg whose
+                # fillet arc would end on a via anchor degrades to the
+                # mitered/straight postprocess path below.
+                emit_leg = False
+                if eng.trace is not None:
+                    leg_pts = list(eng.trace.points)
+                    if li == 0 and pad_a_size is not None:
+                        leg_pts = _replace_pad_path(leg_pts, pad_a_xy, pad_a_size, from_center=True)
+                    elif li == n_trans and pad_b_size is not None:
+                        leg_pts = _replace_pad_path(
+                            leg_pts, pad_b_xy, pad_b_size, from_center=False
+                        )
+                    emit_leg = (
+                        len(leg_pts) == len(eng.trace.points)
+                        and all(_pt_eq(p, q) for p, q in zip(leg_pts, eng.trace.points))
+                        and any(a is not None for a in eng.trace.arcs)
+                    )
+                    if emit_leg:
+                        for arc in eng.trace.arcs:
+                            if arc is None:
+                                continue
+                            for a_pt in (arc.start, arc.mid, arc.end):
+                                if any(_pt_eq(a_pt, va) for va in via_anchors):
+                                    emit_leg = False
+                                    break
+                            if not emit_leg:
+                                break
+                else:
+                    leg_pts = pts
+                if emit_leg:
+                    segs_li: list[OutputSegment] = []
+                    arcs_li: list[OutputArc] = []
+                    for i in range(len(leg_pts) - 1):
+                        arc_i = eng.trace.arcs[i] if i < len(eng.trace.arcs) else None
+                        if arc_i is not None:
+                            arcs_li.append(
+                                OutputArc(
+                                    start=arc_i.start,
+                                    mid=arc_i.mid,
+                                    end=arc_i.end,
+                                    width=width,
+                                    layer=layer,
+                                    net=req.net,
+                                )
+                            )
+                        else:
+                            x1, y1 = leg_pts[i]
+                            x2, y2 = leg_pts[i + 1]
+                            if abs(x1 - x2) > 1e-6 or abs(y1 - y2) > 1e-6:
+                                segs_li.append(
+                                    OutputSegment(
+                                        x1=x1,
+                                        y1=y1,
+                                        x2=x2,
+                                        y2=y2,
+                                        width=width,
+                                        layer=layer,
+                                        net=req.net,
+                                    )
+                                )
+                    direct_segs.append(segs_li)
+                    direct_arcs.append(arcs_li)
+                    node_pts = leg_pts
+                else:
+                    direct_segs.append(None)
+                    direct_arcs.append(None)
+                    node_pts = pts
+                for pi, (x, y) in enumerate(node_pts):
                     if li > 0 and pi == 0:
                         continue  # shared via anchor, already emitted
                     all_nodes.append(RouteNode(x=x, y=y, layer=layer, node_id=node_id))
@@ -972,10 +1056,27 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
                 _pad_rects=_pad_rects or None,
             )
             segs = [s_ for s_ in segs if abs(s_.x1 - s_.x2) > 1e-6 or abs(s_.y1 - s_.y2) > 1e-6]
-            # Rounded corner arcs stay a single-layer skeleton feature
-            # (same rule as the multi-layer A* branch): multi-layer routes
-            # emit straight segments + vias only.
-            arcs_out = []
+            # Per-leg assembly: legs with an intact rounded skeleton keep
+            # their direct skeleton segments + arcs; the rest keep the
+            # postprocess output (mitered straight segments on their layer).
+            if any(ls is not None for ls in direct_segs):
+                post_by_layer: dict[str, list[OutputSegment]] = {}
+                for s_ in segs:
+                    post_by_layer.setdefault(s_.layer, []).append(s_)
+                final_segs: list[OutputSegment] = []
+                arcs_out: list[OutputArc] = []
+                for li in range(n_trans + 1):
+                    layer = layer_seq[li]
+                    if direct_segs[li] is not None:
+                        final_segs.extend(direct_segs[li])
+                        arcs_out.extend(direct_arcs[li])
+                    else:
+                        final_segs.extend(post_by_layer.get(layer, []))
+                segs = final_segs
+            else:
+                # No leg emitted arcs: exactly the pre-existing multi-layer
+                # output (all postprocess segments, no arcs).
+                arcs_out = []
             start_xy = (all_nodes[0].x, all_nodes[0].y)
             end_xy = (all_nodes[-1].x, all_nodes[-1].y)
             layers_used = _layers_used(all_nodes)
