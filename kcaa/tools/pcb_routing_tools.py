@@ -1,13 +1,15 @@
 """
 PCB routing tools for the KiCad MCP server.
 
-Exposes the no-shove PNS router as an MCP tool that connects two pads with
-a track on a single layer.  The tool writes the resulting segments and (if
-present) vias back to the .kicad_pcb file, with the usual ``.bak`` backup.
+Exposes the router as an MCP tool that connects two pads with a track,
+optionally across layers (through-vias on the direct pad-to-pad line).
+The tool writes the resulting segments and vias back to the .kicad_pcb
+file, with the usual ``.bak`` backup.
 
-This is the no-shove variant: if a route is blocked, the tool fails rather
-than displacing existing tracks.  Use the placement / edit tools to clear
-the path first, or call with a different layer.
+The ``pns`` engine walks around fixed solids and shoves movable tracks
+out of the way; if a route is blocked, the tool fails rather than
+guessing.  Use the placement / edit tools to clear the path first, or
+call with a different layer.
 """
 
 from __future__ import annotations
@@ -18,7 +20,7 @@ from typing import Any
 from fastmcp import Context, FastMCP
 import sexpdata
 
-from kcaa.router.path_postprocess import OutputSegment, OutputVia
+from kcaa.router.path_postprocess import OutputArc, OutputSegment, OutputVia
 from kcaa.router.router import (
     RouteFailure,
     RouteRequest,
@@ -45,15 +47,30 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
         ctx: Context | None,
         width: float | None = None,
         layer_hint: str | None = None,
-        via_pairs: tuple[tuple[str, str], ...] | None = None,
-        turn_penalty: float | None = None,
+        algorithm: str = "astar",
+        options: dict | None = None,
     ) -> dict[str, Any]:
         """Connect two pads with an obstacle-avoiding track, optionally across layers.
 
-        Uses the no-shove PNS router: if the path is blocked by an existing
-        track or footprint courtyard, the call fails rather than moving
-        anything.  Run the placement tools first to clear the way, or call
-        again with a different ``layer_hint``.
+        Uses ``algorithm`` to route: ``astar`` (default) runs the grid A*
+        planner (hierarchical grid on a single layer, multi-layer A* with
+        via edges across layers); ``pns`` runs the walkaround + shove
+        engine.  A multi-layer ``pns`` route decomposes into one
+        walkaround + shove leg per layer (shortest layer path through
+        ``via_pairs``), joined by through-vias DRC-validated along the
+        direct pad-to-pad line.  Each leg emits rounded-corner arcs
+        (``rounded45``/``rounded90``) when its skeleton survives
+        walkaround/shove and the corner sits away from a via junction;
+        legs whose skeleton was disturbed, or whose fillet would end on
+        a via, fall back to straight segments — via junctions stay
+        straight-through connections.
+
+        ``options`` bundles the optional tuning knobs; omit it (or pass
+        ``{}``) for defaults.  ``corner_mode`` defaults to
+        ``rounded45`` — short fillets that read as rounds but barely
+        deviate from a 45-degree miter — and degrades to straight
+        segments on any detour or shove; switch to ``mitered45`` for
+        sharp corners or ``rounded90`` for larger-radius arcs.
 
         PCB coordinates: mm, +X right, **+Y down**, rotation
         **CCW-positive on screen** (KiCad PCB convention).
@@ -81,30 +98,110 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
             layer_hint: Preferred copper layer for thru-hole pads.  When
                 ``None`` (default) the router picks automatically.  Ignored
                 for SMD pads whose layer is fixed by the pad itself.
-            via_pairs: Optional tuple of ``(from_layer, to_layer)`` pairs
-                the router is allowed to use as via transitions.  Defaults
-                to ``(("F.Cu", "B.Cu"),)`` when the resolved layers differ;
-                ignored otherwise.
-            turn_penalty: Cost added when the path changes direction (mm).
-                ``None`` uses the default (0.3 mm).  Set to 0 for pure
-                shortest-path routing (more zigzag).
+            algorithm: ``astar`` (default) grid-based A* planner;
+                ``pns`` walkaround + shove engine.  A route always uses
+                exactly one algorithm.
+
+            options: Optional dict of advanced options, all optional:
+                ``corner_mode``: ``rounded45`` (default) | ``mitered45`` |
+                    ``rounded90`` | ``mitered90``.  Rounded modes emit arc
+                    track nodes on an unobstructed skeleton (a detour
+                    linearizes them).  ``rounded45`` fillets are short and
+                    hug the 45-degree miter; ``rounded90`` uses the full
+                    quarter-circle radius.
+                ``via_pairs``: tuple of ``(from_layer, to_layer)`` pairs;
+                    each pair is one allowed through-via layer transition
+                    edge, traversable in both directions.  Default
+                    ``(("F.Cu", "B.Cu"),)`` when the resolved layers
+                    differ; ignored otherwise.  On a 4-layer board
+                    (F.Cu / In1.Cu / In2.Cu / B.Cu) the default forbids
+                    landing on the inner layers; pass
+                    ``(("F.Cu", "In1.Cu"), ("In1.Cu", "In2.Cu"),
+                    ("In2.Cu", "B.Cu"))`` to force a step through the
+                    inner stack, or ``((("F.Cu", "B.Cu"),))`` alone to
+                    keep every transition a straight outer-to-outer jump.
+                ``turn_penalty``: cost added when the path changes
+                    direction (mm); default 0.3.  Set to 0 for pure
+                    shortest-path routing (more zigzag).
+                ``anchors``: anchor-chain control surface for the ``pns``
+                    algorithm (a list of dicts): either
+                    ``{"kind": "waypoint", "pos": [x, y], "tol_mm": 1.0}``
+                    — route through a soft pass-through point on the
+                    current layer (unreachable waypoints are recorded in
+                    ``waypoint_violated`` and skipped, never a failure) —
+                    or ``{"kind": "via", "pos": [x, y],
+                    "to_layer": "B.Cu"}`` — insert a DRC-validated
+                    through-via near ``pos``, micro-shifted within
+                    ``tol_mm`` when the exact spot is blocked.  N anchors
+                    split the route into N+1 legs.  ``{"kind": "pad",
+                    "ref": ..., "pad": ...}`` anchors are not supported yet.
+                ``dry_run``: True -> route and return the full result
+                    without writing anything to the PCB file (no reload,
+                    no .bak; the file stays byte-identical).
+                ``candidates``: PNS multi-candidate knob: ``> 1`` asks
+                    the ``pns`` algorithm for that many alternative
+                    routes (cheap strategy variants: walkaround-only,
+                    walkaround+shove, then waypoint-tolerance scales
+                    when waypoints are present), deduped by geometry;
+                    the primary result is variant 1.  ``candidates > 1``
+                    with ``algorithm='astar'`` is rejected.  Default 1
+                    (single route, exactly the pre-W3 behavior).
+                    The side-by-side candidate PNG is rendered whenever
+                    ``candidates > 1`` (``dry_run`` included — the
+                    render reads the board file and writes only to the
+                    system temp dir).
 
         Returns:
             dict with:
-                segment_count: number of segments written.
-                segments: list of dicts ``{x1, y1, x2, y2, width, layer, net}``.
-                via_count: number of vias written (0 for single-layer).
-                vias: list of dicts ``{x, y, diameter, drill, layers, net}``.
+                segment_count / segments: track segments written.
+                arc_count / arcs: rounded-corner arcs written
+                    (``{start, mid, end, width, layer, net}`` each).
+                shoved: list of tracks that were pushed out of the way
+                    (``{net, layer, width, points}`` each).
+                corner_mode: echoed corner_mode.
+                algorithm: echoed algorithm (``astar`` | ``pns``).
+                via_count / vias: vias written (0 for single-layer).
+                via_sites: emitted via anchors, one dict per anchor:
+                    ``{"pos": [x, y], "to_layer": ...}`` (the actual
+                    DRC-clean site used, possibly micro-shifted).
+                waypoint_violated / violated_waypoints: True plus the
+                    ``(x, y)`` list when any waypoint anchor was
+                    unreachable and got skipped (the route still
+                    completed).
                 layers_used: ordered list of layers touched by the path.
                 start: ``(x, y)`` exit point of pad_a.
                 end: ``(x, y)`` entry point of pad_b.
-                backup_path: path to the ``.bak`` created before writing.
+                candidates: present when ``candidates > 1``: the list of
+                    alternative routes (each serialized like the primary
+                    response, plus a ``"variant"`` tag); the primary
+                    top-level fields describe variant 1.
+                candidates_png: present when ``candidates > 1``
+                    (``dry_run`` included — the render reads the board
+                    file and writes only to the system temp dir): path
+                    of the side-by-side candidate render the VLM
+                    inspects to pick a variant.  VLM flow: re-run the
+                    chosen variant with ``candidates=1`` +
+                    ``dry_run=False`` to commit it.
+                backup_path: path to the ``.bak`` created before writing
+                    (``None`` with ``dry_run``).
                 pcb_path: echo of the input path.
+                dry_run: echo of the ``dry_run`` option.
 
             Or ``{"error": "<message>"}`` on failure.
         """
-        if via_pairs is None:
-            via_pairs = (("F.Cu", "B.Cu"),)
+        corner_mode = "rounded45"
+        via_pairs: tuple[tuple[str, str], ...] = (("F.Cu", "B.Cu"),)
+        turn_penalty = 0.3
+        anchors: list[dict] = []
+        dry_run = False
+        candidates = 1
+        if options:
+            via_pairs = options.get("via_pairs", via_pairs)
+            turn_penalty = options.get("turn_penalty", turn_penalty)
+            corner_mode = options.get("corner_mode", corner_mode)
+            anchors = options.get("anchors", anchors)
+            dry_run = bool(options.get("dry_run", False))
+            candidates = int(options.get("candidates", candidates))
         req = RouteRequest(
             pcb_path=pcb_path,
             ref_a=ref_a,
@@ -114,8 +211,13 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
             net=net,
             layer_hint=layer_hint,
             width=width,
-            via_pairs=via_pairs or (),
-            turn_penalty=turn_penalty if turn_penalty is not None else 0.3,
+            via_pairs=via_pairs,
+            turn_penalty=turn_penalty,
+            corner_mode=corner_mode,
+            algorithm=algorithm,
+            anchors=anchors,
+            dry_run=dry_run,
+            candidates=candidates,
         )
         try:
             result = auto_route_pair(req)
@@ -124,18 +226,24 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
         except (FileNotFoundError, ValueError) as exc:
             return {"error": f"Routing input error: {exc}"}
 
-        # Load the PCB and append the new segments and vias.
-        data = load_pcb(pcb_path)
-        for seg in result.segments:
-            data.append(_segment_to_sexp(seg))
-        for via in result.vias:
-            data.append(_via_to_sexp(via))
-        try:
-            backup_path = save_pcb(pcb_path, data)
-        except OSError as exc:
-            return {"error": f"Failed to write PCB file: {exc}"}
+        # ---- Write path: dry_run short-circuits before reloading
+        #      (auto_route_pair already parsed the board) and never
+        #      creates the .bak or mutates the file.
+        backup_path: str | None = None
+        if not dry_run:
+            data = load_pcb(pcb_path)
+            for seg in result.segments:
+                data.append(_segment_to_sexp(seg))
+            for arc in result.arcs:
+                data.append(_arc_to_sexp(arc))
+            for via in result.vias:
+                data.append(_via_to_sexp(via))
+            try:
+                backup_path = save_pcb(pcb_path, data)
+            except OSError as exc:
+                return {"error": f"Failed to write PCB file: {exc}"}
 
-        return {
+        resp = {
             "segment_count": len(result.segments),
             "segments": [
                 {
@@ -149,6 +257,29 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
                 }
                 for s in result.segments
             ],
+            "arc_count": len(result.arcs),
+            "arcs": [
+                {
+                    "start": list(a.start),
+                    "mid": list(a.mid),
+                    "end": list(a.end),
+                    "width": a.width,
+                    "layer": a.layer,
+                    "net": a.net,
+                }
+                for a in result.arcs
+            ],
+            "shoved": [
+                {
+                    "net": t.net,
+                    "layer": t.layer,
+                    "points": [list(pt) for pt in t.points],
+                    "width": t.width,
+                }
+                for t in result.shoved_tracks
+            ],
+            "corner_mode": result.corner_mode,
+            "algorithm": result.algorithm,
             "via_count": len(result.vias),
             "vias": [
                 {
@@ -164,9 +295,24 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
             "layers_used": list(result.layers_used),
             "start": list(result.start),
             "end": list(result.end),
+            "via_sites": [
+                {
+                    "pos": list(site["pos"]),
+                    "to_layer": site["to_layer"],
+                }
+                for site in result.via_sites
+            ],
+            "waypoint_violated": result.waypoint_violated,
+            "violated_waypoints": [list(pt) for pt in result.violated_waypoints],
             "backup_path": backup_path,
             "pcb_path": pcb_path,
+            "dry_run": dry_run,
         }
+        if result.candidates:
+            resp["candidates"] = result.candidates
+        if result.candidates_png:
+            resp["candidates_png"] = result.candidates_png
+        return resp
 
     @mcp.tool()
     async def pcb_add_vias(
@@ -588,6 +734,19 @@ def _via_to_sexp(via: OutputVia) -> list:
         [sexpdata.Symbol("drill"), via.drill],
         layers_node,
         [sexpdata.Symbol("net"), via.net],
+    ]
+
+
+def _arc_to_sexp(arc: OutputArc) -> list:
+    """Build a (arc ...) node in KiCad's 3-point track form."""
+    return [
+        sexpdata.Symbol("arc"),
+        [sexpdata.Symbol("start"), arc.start[0], arc.start[1]],
+        [sexpdata.Symbol("mid"), arc.mid[0], arc.mid[1]],
+        [sexpdata.Symbol("end"), arc.end[0], arc.end[1]],
+        [sexpdata.Symbol("width"), arc.width],
+        [sexpdata.Symbol("layer"), arc.layer],
+        [sexpdata.Symbol("net"), arc.net],
     ]
 
 

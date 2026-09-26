@@ -5,8 +5,10 @@ from __future__ import annotations
 import pytest
 
 from kcaa.router.path_postprocess import (
+    OutputArc,
     OutputSegment,
     OutputVia,
+    emit_arc_nodes,
     emit_segment_nodes,
     emit_via_nodes,
     postprocess,
@@ -98,6 +100,23 @@ class TestEmission:
         assert "F.Cu" in flat
         assert "B.Cu" in flat
         assert "GND" in flat
+
+    def test_emit_arc_node(self):
+        arc = OutputArc((0.0, 0.0), (2.0, 2.0), (4.0, 0.0), 0.25, "F.Cu", "VCC")
+        nodes = emit_arc_nodes([arc])
+        assert len(nodes) == 1
+        node = nodes[0]
+        assert str(node[0]) == "arc"
+        flat = str(node)
+        assert "F.Cu" in flat
+        assert "VCC" in flat
+        # 3-point form present: start/mid/end coordinates.
+        assert "0.0" in flat
+        assert "2.0" in flat
+        assert "4.0" in flat
+
+    def test_emit_arc_nodes_empty(self):
+        assert emit_arc_nodes([]) == []
 
 
 # ---------------------------------------------------------------------------

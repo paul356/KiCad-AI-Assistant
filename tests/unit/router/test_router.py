@@ -15,6 +15,7 @@ fall back to a guessed value.
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 
 import pytest
@@ -27,6 +28,7 @@ from kcaa.router.router import (
     ProFileMissing,
     RouteFailure,
     RouteRequest,
+    RouteResult,
     _check_segments_in_board,
     _check_vias_in_board,
     _default_clearance,
@@ -68,6 +70,7 @@ def test_project_file_for_missing_returns_none(tmp_path: Path) -> None:
 
 import os  # noqa: E402
 import shutil  # noqa: E402
+import tempfile  # noqa: E402
 
 _FIXTURE_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "integration", "fixtures")
 _BOARD_FIXTURE = os.path.normpath(os.path.join(_FIXTURE_DIR, "test_routing_board.kicad_pcb"))
@@ -1157,3 +1160,1101 @@ def test_plated_thru_hole_pad_still_pad_obstacle(tmp_path: Path) -> None:
     assert len(pads) == 1, "plated THT pad must remain a pad-kind obstacle"
     assert drills == [], "plated THT pad must not become a drill obstacle"
     assert pads[0].net == "VCC"
+
+
+# ---------------------------------------------------------------------------
+# PNS engine adapter (corner_mode / arcs / shoved tracks)
+# ---------------------------------------------------------------------------
+
+
+def _make_clear_board(tmp_path: Path) -> str:
+    """Minimal 2-pad single-layer board with no obstacles between them."""
+    pcb = """(kicad_pcb
+	(version 20260206)
+	(generator "test")
+	(layers
+		(0 "F.Cu" signal)
+		(44 "Edge.Cuts" user)
+	)
+	(net 0 "")
+	(net 1 "VCC")
+	(footprint "R"
+		(layer "F.Cu")
+		(at 30.0 30.0 0.0)
+		(property "Reference" "R1")
+		(pad "1" smd rect
+			(at -0.5 0.0)
+			(size 0.5 0.5)
+			(layers "F.Cu" "F.Mask")
+			(net 1 "VCC")
+		)
+	)
+	(footprint "C"
+		(layer "F.Cu")
+		(at 60.0 40.0 0.0)
+		(property "Reference" "C1")
+		(pad "1" smd rect
+			(at 0.0 -0.5)
+			(size 0.5 0.5)
+			(layers "F.Cu" "F.Mask")
+			(net 1 "VCC")
+		)
+	)
+	(gr_rect
+		(start 20.0 20.0)
+		(end 70.0 60.0)
+		(stroke (width 0.1) (type solid))
+		(fill none)
+		(layer "Edge.Cuts")
+	)
+)
+"""
+    pcb_path = tmp_path / "clear_board.kicad_pcb"
+    pcb_path.write_text(pcb)
+    return str(pcb_path)
+
+
+def _route_clear(req_extra: dict, tmp_path: Path):
+    from kcaa.router.router import RouteRequest, auto_route_pair
+
+    base = {
+        "pcb_path": _make_clear_board(tmp_path),
+        "ref_a": "R1",
+        "pad_a": "1",
+        "ref_b": "C1",
+        "pad_b": "1",
+        "net": "VCC",
+        "width": 0.2,
+        "clearance": 0.2,
+        "via_pairs": (),
+    }
+    base.update(req_extra)
+    return auto_route_pair(RouteRequest(**base))
+
+
+def test_engine_rounded45_emits_arc(tmp_path: Path) -> None:
+    """corner_mode=rounded45 on an unobstructed skeleton must produce
+    OutputArc nodes whose start point sits on the route start pad."""
+    result = _route_clear({"corner_mode": "rounded45", "algorithm": "pns"}, tmp_path)
+    assert len(result.arcs) == 1
+    a = result.arcs[0]
+    assert a.width == 0.2
+    assert a.layer == "F.Cu"
+    assert a.net == "VCC"
+    # Arc endpoints anchored on the skeleton legs.
+    assert a.start[1] == pytest.approx(30.0, abs=1e-3)
+    assert a.end == pytest.approx((60.0, 39.5), abs=1e-3)
+
+
+def test_engine_mitered45_no_arcs(tmp_path: Path) -> None:
+    result = _route_clear({"corner_mode": "mitered45"}, tmp_path)
+    assert result.arcs == []
+    assert len(result.segments) >= 2
+
+
+def test_engine_default_corner_mode_is_rounded45(tmp_path: Path) -> None:
+    """Omitting corner_mode defaults to rounded45: an unobstructed PNS
+    skeleton emits its fillet arc and the result echoes the default."""
+    result = _route_clear({"algorithm": "pns"}, tmp_path)
+    assert result.corner_mode == "rounded45"
+    assert len(result.arcs) == 1
+
+
+def test_engine_rounded90_arc(tmp_path: Path) -> None:
+    result = _route_clear({"corner_mode": "rounded90", "algorithm": "pns"}, tmp_path)
+    assert len(result.arcs) == 1
+
+
+def test_engine_corner_mode_echoed(tmp_path: Path) -> None:
+    result = _route_clear({"corner_mode": "rounded90"}, tmp_path)
+    assert result.corner_mode == "rounded90"
+
+
+def test_engine_invalid_corner_mode_raises(tmp_path: Path) -> None:
+    with pytest.raises(RouteFailure) as excinfo:
+        _route_clear({"corner_mode": "octagonal"}, tmp_path)
+    assert "corner_mode" in str(excinfo.value)
+
+
+def test_engine_empty_shoved_tracks_by_default(tmp_path: Path) -> None:
+    result = _route_clear({}, tmp_path)
+    assert result.shoved_tracks == []
+
+
+def test_engine_detour_linearizes_arc(tmp_path: Path) -> None:
+    """An obstacle on the skeleton forces a walkaround; the rounded arc
+    must be linearized (no OutputArc) and the path must clear the
+    obstacle by the DRC clearance."""
+    from shapely.geometry import LineString
+
+    pcb = """(kicad_pcb
+	(version 20260206)
+	(generator "test")
+	(layers
+		(0 "F.Cu" signal)
+		(44 "Edge.Cuts" user)
+	)
+	(net 0 "")
+	(net 1 "VCC")
+	(footprint "R"
+		(layer "F.Cu")
+		(at 30.0 30.0 0.0)
+		(property "Reference" "R1")
+		(pad "1" smd rect
+			(at -0.5 0.0)
+			(size 0.5 0.5)
+			(layers "F.Cu" "F.Mask")
+			(net 1 "VCC")
+		)
+	)
+	(footprint "C"
+		(layer "F.Cu")
+		(at 60.0 40.0 0.0)
+		(property "Reference" "C1")
+		(pad "1" smd rect
+			(at 0.0 -0.5)
+			(size 0.5 0.5)
+			(layers "F.Cu" "F.Mask")
+			(net 1 "VCC")
+		)
+	)
+	(footprint "BLOCK"
+		(layer "F.Cu")
+		(at 46.0 32.0 0.0)
+		(property "Reference" "U1")
+		(pad "1" smd rect
+			(at 0.0 0.0)
+			(size 4.0 4.0)
+			(layers "F.Cu" "F.Mask")
+			(net 2 "OTHER")
+		)
+	)
+	(gr_rect
+		(start 20.0 20.0)
+		(end 70.0 60.0)
+		(stroke (width 0.1) (type solid))
+		(fill none)
+		(layer "Edge.Cuts")
+	)
+)
+"""
+    pcb_path = tmp_path / "blocked_board.kicad_pcb"
+    pcb_path.write_text(pcb)
+    from kcaa.router.router import RouteRequest, auto_route_pair
+
+    result = auto_route_pair(
+        RouteRequest(
+            pcb_path=str(pcb_path),
+            ref_a="R1",
+            pad_a="1",
+            ref_b="C1",
+            pad_b="1",
+            net="VCC",
+            width=0.2,
+            clearance=0.2,
+            via_pairs=(),
+            corner_mode="rounded45",
+        )
+    )
+    assert result.arcs == []
+    # Every emitted segment clears the blocker by >= clearance.
+    blocker = _rounded_square((46.0, 32.0), 4.0)
+    for seg in result.segments:
+        line = LineString([(seg.x1, seg.y1), (seg.x2, seg.y2)])
+        assert line.distance(blocker) >= 0.2 - 0.01
+
+
+def _rounded_square(center: tuple[float, float], size: float):
+    """Axis-aligned square polygon (no rounding — clearance measured to the
+    copper edge)."""
+    from shapely.geometry import box
+
+    half = size / 2.0
+    return box(center[0] - half, center[1] - half, center[0] + half, center[1] + half)
+
+
+# ---------------------------------------------------------------------------
+# algorithm selector — astar (default) vs pns, single route single algorithm
+# ---------------------------------------------------------------------------
+
+
+def _route_board_copy(tmp_path: Path, src: str = "test_routing_board.kicad_pcb") -> Path:
+    """Copy the routing fixture into tmp_path so board+project siblings travel
+    together."""
+    fixture = Path(__file__).resolve().parents[2] / "integration" / "fixtures" / src
+    dst = tmp_path / "board.kicad_pcb"
+    dst.write_text(Path(fixture).read_text())
+    pro = fixture.with_suffix(".kicad_pro")
+    if pro.exists():
+        (tmp_path / pro.name).write_text(Path(pro).read_text())
+    return dst
+
+
+def test_algorithm_astar_single_layer_routes(tmp_path: Path) -> None:
+    """algorithm='astar' on a single-layer pair restores the grid A*
+    behaviour (hierarchical A*); result echoes algorithm."""
+    dst = _route_board_copy(tmp_path)
+    result = auto_route_pair(
+        RouteRequest(
+            pcb_path=str(dst),
+            ref_a="R1",
+            pad_a="1",
+            ref_b="C1",
+            pad_b="1",
+            net="VCC",
+            width=0.25,
+            clearance=0.2,
+            algorithm="astar",
+        )
+    )
+    assert len(result.segments) > 0
+    assert result.vias == []
+    assert result.algorithm == "astar"
+
+
+def test_algorithm_default_is_astar(tmp_path: Path) -> None:
+    """Omitting algorithm routes with the grid A* planner (pure old
+    behaviour) and echoes 'astar'."""
+    dst = _route_board_copy(tmp_path)
+    result = auto_route_pair(
+        RouteRequest(
+            pcb_path=str(dst),
+            ref_a="R1",
+            pad_a="1",
+            ref_b="C1",
+            pad_b="1",
+            net="VCC",
+            width=0.25,
+            clearance=0.2,
+        )
+    )
+    assert len(result.segments) > 0
+    assert result.algorithm == "astar"
+
+
+def test_algorithm_pns_single_layer_echoes_pns(tmp_path: Path) -> None:
+    """algorithm='pns' routes the same pair with the walkaround + shove
+    engine and echoes 'pns'."""
+    dst = _route_board_copy(tmp_path)
+    result = auto_route_pair(
+        RouteRequest(
+            pcb_path=str(dst),
+            ref_a="R1",
+            pad_a="1",
+            ref_b="C1",
+            pad_b="1",
+            net="VCC",
+            width=0.25,
+            clearance=0.2,
+            algorithm="pns",
+        )
+    )
+    assert len(result.segments) > 0
+    assert result.algorithm == "pns"
+
+
+def _x1_tht_on_b_cu() -> str:
+    """X1: a thru-hole endpoint pad on B.Cu at (62, 45), on net VCC."""
+    return (
+        "\n\t# ---- X1: THT endpoint pad on B.Cu ----\n"
+        '\t(footprint "user_add:edge-connector"\n'
+        '\t\t(layer "F.Cu")\n'
+        '\t\t(uuid "66666666-0000-0000-0000-000000000006")\n'
+        "\t\t(at 62.0 45.0 0.0)\n"
+        '\t\t(property "Reference" "X1")\n'
+        '\t\t(property "Value" "X1")\n'
+        '\t\t(pad "T" thru_hole circle\n'
+        "\t\t\t(at 0.0 0.0)\n"
+        "\t\t\t(size 1.6 1.6)\n"
+        "\t\t\t(drill 1.0)\n"
+        '\t\t\t(layers "*.Cu" "*.Mask")\n'
+        '\t\t\t(net 1 "VCC")\n'
+        "\t\t)\n"
+        "\t)\n"
+    )
+
+
+def _write_pns_board(tmp_path: Path, extra: str) -> Path:
+    """Fixture board + ``extra`` footprints, with the .kicad_pro paired
+    under the matching base name (PNS via placement DRC-checks against the
+    netclass rules)."""
+    dst = tmp_path / "board.kicad_pcb"
+    board = Path(_fixture_pcb()).read_text().rstrip()
+    assert board.endswith(")")
+    dst.write_text(board[:-1] + extra + ")\n")
+    shutil.copy(_PRO_FIXTURE, tmp_path / "board.kicad_pro")
+    return dst
+
+
+def test_pns_multi_layer_route_crosses_layers(tmp_path: Path) -> None:
+    """algorithm='pns' on a cross-layer pair (R1/1 F.Cu -> X1/T B.Cu routes
+    one walkaround + shove leg per layer, joined by a DRC-clean through-via
+    on the direct pad-to-pad line.  With an explicit mitered45 corner mode
+    the route stays straight (no arcs) and the via never lands on a
+    same-net pad."""
+    from shapely.geometry import Point, box
+
+    dst = _write_pns_board(tmp_path, _x1_tht_on_b_cu())
+
+    result = auto_route_pair(
+        RouteRequest(
+            pcb_path=str(dst),
+            ref_a="R1",
+            pad_a="1",
+            ref_b="X1",
+            pad_b="T",
+            net="VCC",
+            layer_hint="B.Cu",
+            width=0.25,
+            clearance=0.2,
+            algorithm="pns",
+            corner_mode="mitered45",
+        )
+    )
+    assert result.algorithm == "pns"
+    assert len(result.vias) >= 1
+    assert result.layers_used == ["F.Cu", "B.Cu"]
+    assert len(result.segments) > 0
+    # mitered45 corners emit straight segments only.
+    assert result.arcs == []
+    # No via on any same-net pad copper (endpoint pads included): R1/1
+    # 0.5x0.5 at (29.5,30), C1/1 0.5x0.5 at (60,29.5), X1/T r=0.8 at (62,45).
+    same_net_pads = [
+        box(29.25, 29.75, 29.75, 30.25),
+        box(59.75, 29.25, 60.25, 29.75),
+        Point(62.0, 45.0).buffer(0.8),
+    ]
+    for via in result.vias:
+        pt = Point(via.x, via.y)
+        for i, poly in enumerate(same_net_pads):
+            assert not poly.contains(pt), (
+                f"PNS via at ({via.x:.3f},{via.y:.3f}) lands on a same-net pad polygon #{i}"
+            )
+
+
+def test_pns_multi_layer_via_not_on_same_net_pad(tmp_path: Path) -> None:
+    """The PNS via picker must avoid ALL same-net pad faces, not just the
+    two endpoint pads (DFM defect: solder wicking / annular-ring breakout).
+    Mirrors the multi-layer A* test of the same name."""
+    from shapely.geometry import Point, box
+
+    # X3: same-net SMD pads on F.Cu near the route corridor between
+    # R1/1 (29.5, 30) and X1/T (64, 45).  Neither pad is an endpoint;
+    # the PNS via must avoid both.
+    x3 = (
+        "\n\t# ---- X3: same-net SMD pads, via must avoid ----\n"
+        '\t(footprint "user_add:via-dodge"\n'
+        '\t\t(layer "F.Cu")\n'
+        '\t\t(uuid "99999999-0000-0000-0000-000000000009")\n'
+        "\t\t(at 45.0 40.0 0.0)\n"
+        '\t\t(property "Reference" "X3")\n'
+        '\t\t(property "Value" "X3")\n'
+        '\t\t(pad "1" smd rect\n'
+        "\t\t\t(at 0.0 0.0)\n"
+        "\t\t\t(size 2.0 2.0)\n"
+        '\t\t\t(layers "F.Cu" "F.Mask")\n'
+        '\t\t\t(net 1 "VCC")\n'
+        "\t\t)\n"
+        '\t\t(pad "2" smd rect\n'
+        "\t\t\t(at 5.0 0.0)\n"
+        "\t\t\t(size 2.0 2.0)\n"
+        '\t\t\t(layers "F.Cu" "F.Mask")\n'
+        '\t\t\t(net 1 "VCC")\n'
+        "\t\t)\n"
+        "\t)\n"
+    )
+    dst = _write_pns_board(tmp_path, x3 + _x1_tht_on_b_cu())
+
+    result = auto_route_pair(
+        RouteRequest(
+            pcb_path=str(dst),
+            ref_a="R1",
+            pad_a="1",
+            ref_b="X1",
+            pad_b="T",
+            net="VCC",
+            layer_hint="B.Cu",
+            width=0.25,
+            clearance=0.2,
+            algorithm="pns",
+        )
+    )
+    assert len(result.vias) > 0
+    # Pad copper rectangles (unbuffered, world coords): 2x2 at (45,40)
+    # and (50,40).
+    pad_rects = [box(44, 39, 46, 41), box(49, 39, 51, 41)]
+    for via in result.vias:
+        pt = Point(via.x, via.y)
+        for i, rect in enumerate(pad_rects):
+            assert not rect.contains(pt), (
+                f"PNS via at ({via.x:.3f},{via.y:.3f}) lands on X3/{i + 1} pad"
+            )
+
+
+def test_pns_multi_layer_unreachable_via_pairs(tmp_path: Path) -> None:
+    """When via_pairs cannot connect the start and end layers, the PNS
+    multi-layer branch must raise RouteFailure with the missing transition,
+    not guess a layer path."""
+    dst = _route_board_copy(tmp_path)
+    req = RouteRequest(
+        pcb_path=str(dst),
+        ref_a="D1",  # pad 1 on In1.Cu
+        pad_a="1",
+        ref_b="R1",  # pad 2 on F.Cu
+        pad_b="2",
+        net="GND",
+        width=0.25,
+        clearance=0.2,
+        algorithm="pns",
+        via_pairs=(("F.Cu", "B.Cu"),),  # no edge touches In1.Cu
+    )
+    with pytest.raises(RouteFailure) as excinfo:
+        auto_route_pair(req)
+    msg = str(excinfo.value)
+    assert "layer path" in msg
+    assert "In1.Cu" in msg
+    assert "F.Cu" in msg
+
+
+def test_pns_multi_layer_missing_pro_rejects_unvalidated_vias(
+    tmp_path: Path,
+) -> None:
+    """Via placement must stay strict when the .kicad_pro is missing: the
+    route cannot silently place vias without netclass/DRC data (check_vias
+    reports a project-level failure the candidate indices can't match)."""
+    src = _fixture_pcb()
+    dst = tmp_path / "board.kicad_pcb"
+    board = Path(src).read_text().rstrip()
+    assert board.endswith(")")
+    dst.write_text(board[:-1] + _x1_tht_on_b_cu() + ")\n")
+    # Deliberately no .kicad_pro next to the board.
+    req = RouteRequest(
+        pcb_path=str(dst),
+        ref_a="R1",
+        pad_a="1",
+        ref_b="X1",
+        pad_b="T",
+        net="VCC",
+        layer_hint="B.Cu",
+        width=0.25,  # explicit: skip width/clearance DRC lookup
+        clearance=0.2,
+        algorithm="pns",
+    )
+    with pytest.raises(RouteFailure) as excinfo:
+        auto_route_pair(req)
+    assert "cannot DRC-check PNS vias" in str(excinfo.value)
+
+
+def test_pns_multi_layer_three_legs_share_via_anchors(tmp_path: Path) -> None:
+    """A 2-via / 3-leg PNS route must share each via anchor XY across the
+    two legs it joins: every via touches a segment endpoint on BOTH of its
+    layers (the per-leg engine paths rendezvous at the placed via)."""
+    dst = _write_pns_board(tmp_path, _x1_tht_on_b_cu())
+
+    result = auto_route_pair(
+        RouteRequest(
+            pcb_path=str(dst),
+            ref_a="R1",
+            pad_a="1",
+            ref_b="X1",
+            pad_b="T",
+            net="VCC",
+            layer_hint="In1.Cu",
+            width=0.25,
+            clearance=0.2,
+            algorithm="pns",
+            via_pairs=(("F.Cu", "B.Cu"), ("B.Cu", "In1.Cu")),
+        )
+    )
+    assert result.layers_used == ["F.Cu", "B.Cu", "In1.Cu"]
+    assert len(result.vias) == 2
+    for via in result.vias:
+        for layer in via.layers:
+            touched = any(
+                (abs(s.x1 - via.x) < 1e-3 and abs(s.y1 - via.y) < 1e-3)
+                or (abs(s.x2 - via.x) < 1e-3 and abs(s.y2 - via.y) < 1e-3)
+                for s in result.segments
+                if s.layer == layer
+            )
+            assert touched, (
+                f"Via at ({via.x:.3f},{via.y:.3f}) on {via.layers} is not "
+                f"joined by a segment on layer {layer}"
+            )
+
+
+def test_pns_multi_layer_rounded45_emits_leg_arc(tmp_path: Path) -> None:
+    """Multi-layer PNS with corner_mode='rounded45' emits rounded-corner
+    arcs inside a leg whose skeleton survived walkaround/shove, and never
+    places an arc on a via junction: the via stays a straight-through
+    connection (the arc's start/mid/end avoid every via center)."""
+    # Route X1/T (THT pad, B.Cu) -> R1/1 (F.Cu): the B.Cu leg is
+    # unobstructed, so its rounded skeleton (interior corner) survives
+    # and a fillet arc is emitted on that leg.
+    dst = _write_pns_board(tmp_path, _x1_tht_on_b_cu())
+    result = auto_route_pair(
+        RouteRequest(
+            pcb_path=str(dst),
+            ref_a="X1",
+            pad_a="T",
+            ref_b="R1",
+            pad_b="1",
+            net="VCC",
+            layer_hint="B.Cu",
+            width=0.25,
+            clearance=0.2,
+            algorithm="pns",
+            corner_mode="rounded45",
+        )
+    )
+    assert result.algorithm == "pns"
+    assert len(result.vias) >= 1
+    assert len(result.arcs) >= 1
+    for arc in result.arcs:
+        assert arc.layer in ("F.Cu", "B.Cu", "In1.Cu")
+        assert arc.net == "VCC"
+        assert arc.width == pytest.approx(0.25)
+        for pt in (arc.start, arc.mid, arc.end):
+            for via in result.vias:
+                assert not (abs(pt[0] - via.x) < 1e-6 and abs(pt[1] - via.y) < 1e-6), (
+                    f"PNS arc point {pt} coincides with via center ({via.x:.3f}, {via.y:.3f})"
+                )
+
+
+def test_pns_multi_layer_mitered45_default_keeps_straight_segments(
+    tmp_path: Path,
+) -> None:
+    """The same multi-layer pair with corner_mode='mitered45' (the
+    default) emits straight segments + vias only — the rounded45 arc
+    behavior must not leak into the default output."""
+    dst = _write_pns_board(tmp_path, _x1_tht_on_b_cu())
+    result = auto_route_pair(
+        RouteRequest(
+            pcb_path=str(dst),
+            ref_a="X1",
+            pad_a="T",
+            ref_b="R1",
+            pad_b="1",
+            net="VCC",
+            layer_hint="B.Cu",
+            width=0.25,
+            clearance=0.2,
+            algorithm="pns",
+            corner_mode="mitered45",
+        )
+    )
+    assert len(result.vias) >= 1
+    assert len(result.segments) > 0
+    assert result.arcs == []
+
+
+def test_algorithm_invalid_value_raises_route_failure(tmp_path: Path) -> None:
+    """An unknown algorithm value must fail loudly, not fall back to a
+    default planner."""
+    dst = _route_board_copy(tmp_path)
+    req = RouteRequest(
+        pcb_path=str(dst),
+        ref_a="R1",
+        pad_a="1",
+        ref_b="C1",
+        pad_b="1",
+        net="VCC",
+        width=0.25,
+        clearance=0.2,
+        algorithm="bogus",
+    )
+    with pytest.raises(RouteFailure) as excinfo:
+        auto_route_pair(req)
+    assert "algorithm" in str(excinfo.value).lower()
+
+
+# ---------------------------------------------------------------------------
+# Anchor chain (waypoints / via anchors) -- W2
+# ---------------------------------------------------------------------------
+
+
+def _make_two_layer_board(tmp_path: Path, extra: str = "") -> Path:
+    """Minimal clear board with F.Cu + B.Cu endpoint pads and a paired
+    .kicad_pro (netclass Default with via rules + design rules), so PNS
+    via placement DRC-checks resolve.  ``extra`` footprints are spliced
+    in before the final ``)``."""
+    pcb = """(kicad_pcb
+	(version 20260206)
+	(generator "test")
+	(layers
+		(0 "F.Cu" signal)
+		(31 "B.Cu" signal)
+		(44 "Edge.Cuts" user)
+	)
+	(net 0 "")
+	(net 1 "VCC")
+	(net 2 "GND")
+	(footprint "R"
+		(layer "F.Cu")
+		(at 30.0 30.0 0.0)
+		(property "Reference" "R1")
+		(pad "1" smd rect
+			(at -0.5 0.0)
+			(size 0.5 0.5)
+			(layers "F.Cu" "F.Mask")
+			(net 1 "VCC")
+		)
+	)
+	(footprint "C"
+		(layer "B.Cu")
+		(at 60.0 40.0 0.0)
+		(property "Reference" "C1")
+		(pad "1" smd rect
+			(at 0.0 -0.5)
+			(size 0.5 0.5)
+			(layers "B.Cu" "B.Mask")
+			(net 1 "VCC")
+		)
+	)
+	(gr_rect
+		(start 20.0 20.0)
+		(end 70.0 60.0)
+		(stroke (width 0.1) (type solid))
+		(fill none)
+		(layer "Edge.Cuts")
+	)
+)
+"""
+    dst = tmp_path / "two_layer.kicad_pcb"
+    dst.write_text(pcb.rstrip()[:-1] + extra + ")\n")
+    pro = {
+        "board": {
+            "design_settings": {
+                "rules": {
+                    "min_clearance": 0.2,
+                    "min_track_width": 0.2,
+                    "min_via_size": 0.5,
+                    "min_through_drill": 0.25,
+                }
+            }
+        },
+        "net_settings": {
+            "classes": [
+                {
+                    "name": "Default",
+                    "clearance": 0.2,
+                    "track_width": 0.25,
+                    "via_diameter": 0.8,
+                    "via_drill": 0.4,
+                }
+            ],
+            "netclass_patterns": [],
+        },
+    }
+    (tmp_path / "two_layer.kicad_pro").write_text(json.dumps(pro))
+    return dst
+
+
+def _route_pns_anchors(board: Path, anchors: list[dict]) -> RouteResult:
+    return auto_route_pair(
+        RouteRequest(
+            pcb_path=str(board),
+            ref_a="R1",
+            pad_a="1",
+            ref_b="C1",
+            pad_b="1",
+            net="VCC",
+            width=0.2,
+            clearance=0.2,
+            via_diameter=0.8,
+            via_drill=0.4,
+            algorithm="pns",
+            corner_mode="mitered45",
+            anchors=anchors,
+        )
+    )
+
+
+def test_anchors_waypoint_routes_through_point(tmp_path: Path) -> None:
+    """A waypoint anchor forces the single-layer route through its
+    tolerance circle; unreachable waypoints never fail the route."""
+    from shapely.geometry import LineString, Point
+
+    result = _route_clear(
+        {
+            "algorithm": "pns",
+            "corner_mode": "mitered45",
+            "anchors": [{"kind": "waypoint", "pos": (45.0, 30.0), "tol_mm": 1.0}],
+        },
+        tmp_path,
+    )
+    assert result.vias == []
+    assert result.layers_used == ["F.Cu"]
+    assert len(result.segments) > 0
+    wpt = Point(45.0, 30.0)
+    dists = [LineString([(s.x1, s.y1), (s.x2, s.y2)]).distance(wpt) for s in result.segments]
+    assert min(dists) <= 1.0 + 1e-6
+    assert result.waypoint_violated is False
+    assert result.violated_waypoints == []
+    assert result.via_sites == []
+
+
+def test_anchors_waypoint_unreachable_is_soft_skip(tmp_path, monkeypatch) -> None:
+    """A waypoint leg that fails (engine PnsFailure) is recorded as
+    violated and skipped; the route still completes end to end."""
+    from kcaa.router.route_engine import PnsFailure
+    from kcaa.router.route_engine import route_engine as real_engine
+    import kcaa.router.router as router_mod
+
+    calls = {"n": 0}
+
+    def flaky_engine(start, end, obstacles, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:  # the waypoint leg
+            raise PnsFailure("synthetic waypoint blockage")
+        return real_engine(start, end, obstacles, **kw)
+
+    monkeypatch.setattr(router_mod, "route_engine", flaky_engine)
+    result = _route_clear(
+        {
+            "algorithm": "pns",
+            "corner_mode": "mitered45",
+            "anchors": [{"kind": "waypoint", "pos": (45.0, 30.0), "tol_mm": 1.0}],
+        },
+        tmp_path,
+    )
+    assert calls["n"] == 2  # waypoint leg failed, final leg routed
+    assert result.waypoint_violated is True
+    assert result.violated_waypoints == [(45.0, 30.0)]
+    assert len(result.segments) > 0
+    # The route still ends on pad C1/1.
+    assert result.end == pytest.approx((60.0, 39.5), abs=1e-3)
+
+
+def test_anchors_via_explicit_cross_layer(tmp_path: Path) -> None:
+    """An explicit via anchor switches the leg layer at its requested
+    site: exactly one via, echoes the site + to_layer, route crosses."""
+    result = _route_pns_anchors(
+        _make_two_layer_board(tmp_path),
+        [{"kind": "via", "pos": (45.0, 35.0), "to_layer": "B.Cu"}],
+    )
+    assert len(result.vias) == 1
+    assert result.vias[0].x == pytest.approx(45.0, abs=1e-3)
+    assert result.vias[0].y == pytest.approx(35.0, abs=1e-3)
+    assert result.layers_used == ["F.Cu", "B.Cu"]
+    assert len(result.segments) > 0
+    assert len(result.via_sites) == 1
+    assert result.via_sites[0]["to_layer"] == "B.Cu"
+    assert result.via_sites[0]["pos"] == pytest.approx([45.0, 35.0], abs=1e-3)
+    assert result.waypoint_violated is False
+
+
+def test_anchors_via_shifts_off_blocked_site(tmp_path: Path) -> None:
+    """A via anchor requested exactly on same-net pad copper micro-shifts
+    to the nearest DRC-clean spot (within tol_mm) and routes anyway."""
+    from shapely.geometry import Point, box
+
+    same_net_pad = (
+        "\n\t(footprint \"user_add:site-blocker\"\n"
+        "\t\t(layer \"F.Cu\")\n"
+        "\t\t(at 45.0 40.0 0.0)\n"
+        "\t\t(property \"Reference\" \"X1\")\n"
+        "\t\t(pad \"1\" smd rect\n"
+        "\t\t\t(at 0.0 0.0)\n"
+        "\t\t\t(size 0.3 0.3)\n"
+        "\t\t\t(layers \"F.Cu\" \"F.Mask\")\n"
+        "\t\t\t(net 1 \"VCC\")\n"
+        "\t\t)\n"
+        "\t)\n"
+    )
+    board = _make_two_layer_board(tmp_path, extra=same_net_pad)
+    result = _route_pns_anchors(
+        board,
+        [{"kind": "via", "pos": (45.0, 40.0), "to_layer": "B.Cu"}],
+    )
+    assert len(result.via_sites) == 1
+    site_x, site_y = result.via_sites[0]["pos"]
+    assert (site_x, site_y) != pytest.approx((45.0, 40.0), abs=1e-6)
+    assert math.hypot(site_x - 45.0, site_y - 40.0) <= 1.0 + 1e-6
+    assert len(result.vias) == 1
+    # The emitted via must not land on the same-net pad copper.
+    pad = box(44.85, 39.85, 45.15, 40.15)
+    assert not pad.contains(Point(result.vias[0].x, result.vias[0].y))
+    assert len(result.segments) > 0
+
+
+def test_anchors_failure_renders_png_evidence(tmp_path: Path) -> None:
+    """A blocked via anchor with no DRC-clean spot inside tol_mm raises
+    RouteFailure carrying the path of a rendered failure-evidence PNG."""
+    foreign_blocker = (
+        "\n\t(footprint \"user_add:wall\"\n"
+        "\t\t(layer \"F.Cu\")\n"
+        "\t\t(at 45.0 40.0 0.0)\n"
+        "\t\t(property \"Reference\" \"X1\")\n"
+        "\t\t(pad \"1\" smd rect\n"
+        "\t\t\t(at 0.0 0.0)\n"
+        "\t\t\t(size 4.0 4.0)\n"
+        "\t\t\t(layers \"F.Cu\" \"F.Mask\")\n"
+        "\t\t\t(net 2 \"GND\")\n"
+        "\t\t)\n"
+        "\t)\n"
+    )
+    board = _make_two_layer_board(tmp_path, extra=foreign_blocker)
+    with pytest.raises(RouteFailure) as excinfo:
+        _route_pns_anchors(
+            board,
+            [{"kind": "via", "pos": (45.0, 40.0), "tol_mm": 1.0, "to_layer": "B.Cu"}],
+        )
+    msg = str(excinfo.value)
+    assert "no DRC-clean via spot" in msg
+    assert "Failure evidence: " in msg
+    png_path = msg.split("Failure evidence: ")[1].strip()
+    assert Path(png_path).exists()
+    assert png_path.endswith(".png")
+
+
+def test_anchors_pad_not_supported_yet(tmp_path: Path) -> None:
+    """Pad anchors are reserved (W4): the first pad anchor raises
+    'not supported yet' instead of half-working."""
+    with pytest.raises(RouteFailure, match="not supported yet"):
+        _route_clear(
+            {"algorithm": "pns", "anchors": [{"kind": "pad", "ref": "C1", "pad": "1"}]},
+            tmp_path,
+        )
+
+
+def test_anchors_require_pns_algorithm(tmp_path: Path) -> None:
+    """The A* planner must reject anchors loudly instead of ignoring them."""
+    with pytest.raises(RouteFailure, match="only supported with algorithm"):
+        _route_clear(
+            {"algorithm": "astar", "anchors": [{"kind": "waypoint", "pos": (45.0, 30.0)}]},
+            tmp_path,
+        )
+
+
+def test_anchors_unknown_kind_raises(tmp_path: Path) -> None:
+    with pytest.raises(RouteFailure, match="unsupported anchor kind"):
+        _route_clear(
+            {"algorithm": "pns", "anchors": [{"kind": "jump", "pos": (45.0, 30.0)}]},
+            tmp_path,
+        )
+
+
+# ---------------------------------------------------------------------------
+# W3 — PNS candidates (multi-variant routes) + A* failure evidence
+# ---------------------------------------------------------------------------
+
+
+def _make_clear_board_with_track(tmp_path: Path) -> str:
+    """Single-layer clear board plus one foreign-net GND track crossing the
+    direct pad-to-pad line, so walkaround and shove diverge."""
+    pcb_path = Path(_make_clear_board(tmp_path))
+    text = pcb_path.read_text()
+    text = text.replace('\t(net 1 "VCC")\n', '\t(net 1 "VCC")\n\t(net 2 "GND")\n')
+    text = text.rstrip()[:-1] + (
+        '\n\t(segment (start 40.0 25.0) (end 55.0 45.0) '
+        '(width 0.25) (layer "F.Cu") (net 2 "GND"))\n'
+    ) + ")\n"
+    pcb_path.write_text(text)
+    return str(pcb_path)
+
+
+def _route_candidates(
+    tmp_path: Path,
+    *,
+    candidates: int = 2,
+    track: bool = False,
+    algorithm: str = "pns",
+    waypoints: list[dict] | None = None,
+) -> RouteResult:
+    from kcaa.router.router import RouteRequest, auto_route_pair
+
+    pcb_path = _make_clear_board_with_track(tmp_path) if track else _make_clear_board(tmp_path)
+    req = {
+        "pcb_path": pcb_path,
+        "ref_a": "R1",
+        "pad_a": "1",
+        "ref_b": "C1",
+        "pad_b": "1",
+        "net": "VCC",
+        "width": 0.2,
+        "clearance": 0.2,
+        "via_pairs": (),
+        "algorithm": algorithm,
+        "corner_mode": "mitered45",
+        "candidates": candidates,
+    }
+    if waypoints:
+        req["anchors"] = waypoints
+    return auto_route_pair(RouteRequest(**req))
+
+
+def test_candidates_astar_rejected(tmp_path: Path) -> None:
+    """``candidates > 1`` is the PNS control surface; A* is single-shot."""
+    with pytest.raises(RouteFailure, match="only supported with algorithm"):
+        _route_candidates(tmp_path, candidates=2, algorithm="astar")
+
+
+def test_candidates_below_one_rejected(tmp_path: Path) -> None:
+    with pytest.raises(RouteFailure, match="candidates must be >= 1"):
+        _route_candidates(tmp_path, candidates=0)
+
+
+def test_candidates_default_no_variants(tmp_path: Path) -> None:
+    """candidates=1 (the default) keeps the single-route behavior: no
+    candidates list, no render."""
+    result = _route_candidates(tmp_path, candidates=1)
+    assert result.candidates == []
+    assert result.candidates_png is None
+    assert len(result.segments) >= 1
+
+
+def test_candidates_two_walkaround_and_shove(tmp_path: Path) -> None:
+    """A foreign track across the line yields two distinct variants:
+    walkaround-only (detour, nothing pushed) and walkaround+shove (track
+    displaced).  The primary top-level result is exactly candidate 1."""
+    result = _route_candidates(tmp_path, track=True, candidates=2)
+    assert [c["variant"] for c in result.candidates] == ["walkaround", "shove"]
+    wa, sh = result.candidates
+    # Shove displacement happens on the track, not the routed polyline:
+    # the variants differ in the shoved set (and usually the geometry).
+    assert wa["shoved"] == []
+    assert sh["shoved"], "shove variant must actually push the crossing track"
+    distinct = (
+        wa["segments"] != sh["segments"] or bool(wa["shoved"]) != bool(sh["shoved"])
+    )
+    assert distinct
+    # Primary == first candidate (backwards compatible).
+    assert result.shoved_tracks == []
+    assert list(result.start) == result.candidates[0]["start"]
+    assert list(result.end) == result.candidates[0]["end"]
+    assert list(result.layers_used) == result.candidates[0]["layers_used"]
+    assert result.via_sites == result.candidates[0]["via_sites"]
+    assert result.waypoint_violated == result.candidates[0]["waypoint_violated"]
+    all_tags = {c["variant"] for c in result.candidates}
+    assert all_tags <= {"walkaround", "shove"}
+
+
+def test_candidates_dedupe_collapses_identical(tmp_path: Path) -> None:
+    """On a clear board every variant produces the same skeleton (nothing
+    to detour, nothing to shove): the identical geometries dedupe to one
+    candidate even when three are requested."""
+    result = _route_candidates(tmp_path, candidates=3)
+    assert len(result.candidates) == 1
+    assert result.candidates[0]["variant"] == "walkaround"
+
+
+def test_candidates_waypoint_tol_variants_dedupe(tmp_path: Path) -> None:
+    """Waypoint-tolerance variants are informational today (W2 decision):
+    they share the shove geometry and must dedupe, never duplicate it."""
+    result = _route_candidates(
+        tmp_path,
+        track=True,
+        candidates=3,
+        waypoints=[{"kind": "waypoint", "pos": (45.0, 30.0)}],
+    )
+    tags = [c["variant"] for c in result.candidates]
+    assert 2 <= len(tags) <= 5
+    assert all(t in {"walkaround", "shove", "waypoint-tol-x0.5", "waypoint-tol-x1.0", "waypoint-tol-x2.0"} for t in tags)
+    # No two candidates share the same (geometry, pushed) fingerprint.
+    seen = set()
+    for c in result.candidates:
+        fp = (
+            tuple(tuple(s) for s in c["segments"]),
+            tuple(tuple(s) for s in c["arcs"]),
+            len(c["shoved"]),
+        )
+        assert fp not in seen
+        seen.add(fp)
+
+
+def test_candidates_two_renders_candidates_png(tmp_path: Path) -> None:
+    """candidates > 1 renders the side-by-side variant PNG next to the
+    request and returns its path (best-effort, always safe)."""
+    result = _route_candidates(tmp_path, track=True, candidates=2)
+    assert result.candidates_png
+    assert result.candidates_png.startswith(
+        os.path.join(tempfile.gettempdir(), "kcaa_candidates_")
+    )
+    assert os.path.exists(result.candidates_png)
+    assert os.path.getsize(result.candidates_png) > 0
+
+
+def _make_blocked_single_layer_board(tmp_path: Path) -> str:
+    """Single-layer clear board plus a foreign GND pad covering the R1.1
+    start pad entirely: the A* start cell is inside an obstacle, so the
+    search fails (grid_a_star refuses a blocked start)."""
+    pcb_path = Path(_make_clear_board(tmp_path))
+    text = pcb_path.read_text()
+    text = text.replace('\t(net 1 "VCC")\n', '\t(net 1 "VCC")\n\t(net 2 "GND")\n')
+    wall = (
+        '\t(footprint "W"\n'
+        '\t\t(layer "F.Cu")\n'
+        '\t\t(at 29.5 30.0 0.0)\n'
+        '\t\t(property "Reference" "W1")\n'
+        '\t\t(pad "1" smd rect\n'
+        '\t\t\t(at -0.5 0.0)\n'
+        '\t\t\t(size 6.0 6.0)\n'
+        '\t\t\t(layers "F.Cu" "F.Mask")\n'
+        '\t\t\t(net 2 "GND")\n'
+        "\t\t)\n"
+        "\t)\n"
+    )
+    text = text.rstrip()[:-1] + wall + ")\n"
+    pcb_path.write_text(text)
+    return str(pcb_path)
+
+
+def test_astar_single_layer_blocked_renders_evidence(tmp_path: Path) -> None:
+    """A foreign pad covering the start pad leaves A* no place to begin;
+    the failure must carry the rendered evidence PNG (appended after the
+    existing _dump_viz dump)."""
+    from kcaa.router.router import RouteRequest, auto_route_pair
+
+    with pytest.raises(RouteFailure) as excinfo:
+        auto_route_pair(
+            RouteRequest(
+                pcb_path=_make_blocked_single_layer_board(tmp_path),
+                ref_a="R1",
+                pad_a="1",
+                ref_b="C1",
+                pad_b="1",
+                net="VCC",
+                width=0.2,
+                clearance=0.2,
+                via_pairs=(),
+                algorithm="astar",
+            )
+        )
+    msg = str(excinfo.value)
+    assert "No obstacle-avoiding path from" in msg
+    assert "Failure evidence: " in msg
+    png = msg.split("Failure evidence: ", 1)[1].strip()
+    assert png.startswith(os.path.join(tempfile.gettempdir(), "kcaa_route_failure_"))
+    assert os.path.exists(png)
+
+
+@pytest.mark.skip(
+    reason=(
+        "No cheap multi-layer A* failure fixture: the search box auto-expands "
+        "to any obstacle that touches it, via edges may land inside a "
+        "single-layer enclosing ring and escape it on the far layer, and "
+        "endpoint-pad clearing punches holes in pad-covering walls — a "
+        "guaranteed blocked case needs a full maze.  W3 taskbook test 8 "
+        "allows skipping; the evidence-render chain is asserted by "
+        "test_astar_single_layer_blocked_renders_evidence."
+    )
+)
+def test_astar_multi_layer_blocked_renders_evidence(tmp_path: Path) -> None:
+    """Multi-layer A* failure evidence — skipped: no cheap blocked fixture
+    (see the skip reason); the single-layer failure evidence chain is
+    asserted above."""
+    board = _make_two_layer_board(tmp_path, extra="")
+    auto_route_pair(
+        RouteRequest(
+            pcb_path=str(board),
+            ref_a="R1",
+            pad_a="1",
+            ref_b="C1",
+            pad_b="1",
+            net="VCC",
+            width=0.2,
+            clearance=0.2,
+            via_pairs=(("F.Cu", "B.Cu"),),
+            algorithm="astar",
+        )
+    )

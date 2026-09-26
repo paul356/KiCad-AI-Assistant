@@ -12,7 +12,7 @@ await pcb_route_pad_to_pad(
     ref_a="R1", pad_a="2",
     ref_b="C1", pad_b="2",
     net="VCC",
-    layer="F.Cu",        # optional, default "F.Cu"
+    layer_hint="F.Cu",   # optional; preferred layer for thru-hole pads
     width=0.5,           # optional; uses netclass track width if omitted
 )
 ```
@@ -49,7 +49,7 @@ await pcb_route_pad_to_pad(
     ref_a="R1", pad_a="2",
     ref_b="U1", pad_b="5",
     net="VCC",
-    via_pairs=(("F.Cu", "B.Cu"), ("B.Cu", "In1.Cu")),
+    options={"via_pairs": (("F.Cu", "B.Cu"), ("B.Cu", "In1.Cu"))},
 )
 ```
 
