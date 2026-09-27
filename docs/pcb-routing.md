@@ -17,7 +17,7 @@ await pcb_route_pad_to_pad(
 )
 ```
 
-Interface v3: the VLM control knobs — ``anchors``, ``dry_run``,
+Interface v3: the VLM control knobs — ``waypoints``, ``dry_run``,
 ``strategy`` — are top-level parameters (defaults ``None`` / ``False`` /
 ``"shove"``); board-stable config and rare tweaks (``layer_hint``,
 ``corner_mode``, ``via_pairs``, ``turn_penalty``) bundle into

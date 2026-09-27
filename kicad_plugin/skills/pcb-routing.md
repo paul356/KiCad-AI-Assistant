@@ -24,7 +24,7 @@ Connect pads belonging to the same net with DRC-clean tracks.
    walkaround + shove engine.  The VLM control knobs are top-level:
    ``strategy="shove"|"walkaround"`` (PNS shove policy; ``"shove"``
    default, ``"auto"`` removed 2026-09-27),
-   ``anchors=[...]`` (waypoint/via anchor chain), ``dry_run=True``
+   ``waypoints=[...]`` (waypoint/via anchor chain), ``dry_run=True``
    (route + render without writing).  Board-stable config and rare
    tweaks go in the optional ``options`` dict — omit it for defaults:
    ``options={"corner_mode": ...}`` (default ``rounded45``),

@@ -443,7 +443,7 @@ class TestPcbRouteStrategy:
     def test_v3_top_level_defaults_match_old_behavior(self, tools, routable_board):
         """v3: with no top-level knobs and ``options=None`` the call
         behaves exactly like the old default: strategy shove (was the
-        ``auto`` default, identical path), no dry_run, no anchors (empty
+        ``auto`` default, identical path), no dry_run, no waypoints (empty
         via_sites), rounded45 corners, algorithm pns."""
         result = self._route(tools, routable_board)
         assert "error" not in result

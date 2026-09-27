@@ -170,7 +170,7 @@ class RouteRequest:
         algorithm: Routing algorithm to use: ``astar`` (default,
             grid-based A*) or ``pns`` (walkaround + shove engine).
             A single route always uses exactly one algorithm.
-        anchors: Anchor-chain control surface for the ``pns`` algorithm
+        waypoints: Anchor-chain control surface for the ``pns`` algorithm
             (ignored by ``astar``); each entry is a dict with a ``kind``:
             ``"waypoint"`` (``pos``, optional ``tol_mm``) forces the route
             through a soft pass-through point on the current leg layer
@@ -179,8 +179,8 @@ class RouteRequest:
             ``to_layer``) switches the leg layer at a DRC-validated
             through-via site near ``pos`` (micro-shifted within
             ``tol_mm``).  Any other kind (incl. ``"pad"``) is rejected
-            with ``RouteFailure`` "unsupported anchor kind".  Anchors
-            consume one leg each: N anchors split the route into N+1
+            with ``RouteFailure`` "unsupported anchor kind".  Waypoints
+            consume one leg each: N waypoints split the route into N+1
             legs.
         dry_run: Route and return the result without writing anything to
             the PCB file.  The router never writes; this flag lets the
@@ -211,7 +211,7 @@ class RouteRequest:
     turn_penalty: float = 0.3  # mm penalty per direction change; 0 disables
     algorithm: str = "astar"  # astar (grid A*) | pns (walkaround + shove)
     corner_mode: str = "rounded45"  # rounded45 (default) | mitered45 | rounded90 | mitered90
-    anchors: list[dict] = field(default_factory=list)
+    waypoints: list[dict] = field(default_factory=list)
     dry_run: bool = False  # tool-layer hint: skip save_pcb (router never writes)
     strategy: str = "shove"  # shove | walkaround (PNS shove-mode knob)
 
@@ -234,8 +234,8 @@ class RouteResult:
         waypoint_violated: True when at least one waypoint anchor was
             unreachable and got skipped (the route still reached pad_b).
         violated_waypoints: (x, y) of every skipped waypoint anchor.
-        via_sites: Emitted via anchors in request order: one dict per
-            explicit via anchor with ``{"pos": [x, y], "to_layer": ...}``
+        via_sites: Emitted via sites in request order: one dict per
+            explicit via waypoint with ``{"pos": [x, y], "to_layer": ...}``
             (the DRC-clean site actually used, possibly micro-shifted).
         strategy: Echo of the requested strategy knob.
         route_png: Path of a best-effort rendered image of the routed
@@ -290,13 +290,13 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
             f"'astar' (default, grid-based) and 'pns' (walkaround + shove)."
         )
 
-    # Anchors are the PNS anchor-chain control surface; the A* planner
+    # Waypoints are the PNS waypoint-chain control surface; the A* planner
     # must not silently ignore them.
-    if req.anchors and req.algorithm != "pns":
+    if req.waypoints and req.algorithm != "pns":
         raise RouteFailure(
-            f"anchors are only supported with algorithm='pns' (got "
+            f"waypoints are only supported with algorithm='pns' (got "
             f"algorithm={req.algorithm!r}); route {req.ref_a}/{req.pad_a} -> "
-            f"{req.ref_b}/{req.pad_b} needs to drop the anchors or use the "
+            f"{req.ref_b}/{req.pad_b} needs to drop the waypoints or use the "
             "PNS engine"
         )
 
@@ -590,13 +590,13 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
                 )
             )
 
-    # Anchor-chain results; populated by the PNS anchors path and echoed
+    # Anchor-chain results; populated by the PNS waypoints path and echoed
     # back as defaults everywhere else.
     waypoint_violated = False
     violated_waypoints: list[tuple[float, float]] = []
     via_sites: list[dict] = []
     # Anchor chain actually used, for the success render (A* has none):
-    # the PNS anchors path overwrites this with the real chain.
+    # the PNS waypoints path overwrites this with the real chain.
     used_chain: list[tuple[float, float]] = [pad_a_xy]
     route_png: str | None = None  # best-effort render of the routed track
     # (original, displaced) shove pairs collected from the engine; the
@@ -1051,12 +1051,12 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
             end_xy = (all_nodes[-1].x, all_nodes[-1].y)
             layers_used = _layers_used(all_nodes)
 
-        if req.anchors:
+        if req.waypoints:
             # -- Anchor chain (waypoints / via anchors) ----------------
             # Each anchor consumes one leg boundary: waypoints split the
             # current leg layer, via anchors switch the leg layer at a
             # DRC-validated through-via site.  The A* planner rejects
-            # anchors at entry.
+            # waypoints at entry.
             via_forbidden = [
                 poly for poly, _pl, _rf, _pn, _ctr in _same_net_pad_polygons(data, req.net)
             ]
@@ -1067,9 +1067,9 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
                 if start_layer != end_layer
                 else [start_layer]
             )
-            n_legs = len(req.anchors) + 1
+            n_legs = len(req.waypoints) + 1
             chain: list[tuple[float, float]] = [pad_a_xy]
-            for li, spec in enumerate(req.anchors):
+            for li, spec in enumerate(req.waypoints):
                 kind = spec.get("kind")
                 if kind == "waypoint":
                     wpt = _anchor_pos(spec, "waypoint")
@@ -1158,7 +1158,7 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
                 pending_pos,
                 pad_b_xy,
                 pending_layer,
-                li=len(req.anchors),
+                li=len(req.waypoints),
                 n_legs=n_legs,
                 render_evidence=True,
                 evidence_ctx={"chain": list(chain)},
