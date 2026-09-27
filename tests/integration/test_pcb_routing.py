@@ -496,8 +496,8 @@ class TestRoutingTool:
         assert "In1.Cu" in result["layers_used"]
 
     def test_single_layer_tool_smd_pads(self, pcb_copy):
-        # R1.1 and C1.1 are both SMD on F.Cu.  layer_hint="B.Cu" is
-        # ignored for SMD pads — route stays on F.Cu.
+        # R1.1 and C1.1 are both SMD on F.Cu.  options layer_hint="B.Cu"
+        # is ignored for SMD pads — route stays on F.Cu.
         mcp = self._make_mcp()
         result = self._call_tool(
             mcp,
@@ -510,7 +510,7 @@ class TestRoutingTool:
             net="VCC",
             ctx=None,
             width=0.25,
-            layer_hint="B.Cu",
+            options={"layer_hint": "B.Cu"},
         )
         assert "segment_count" in result
         assert result["via_count"] == 0

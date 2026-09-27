@@ -2007,10 +2007,11 @@ def test_anchors_failure_renders_png_evidence(tmp_path: Path) -> None:
     assert png_path.endswith(".png")
 
 
-def test_anchors_pad_not_supported_yet(tmp_path: Path) -> None:
-    """Pad anchors are reserved (W4): the first pad anchor raises
-    'not supported yet' instead of half-working."""
-    with pytest.raises(RouteFailure, match="not supported yet"):
+def test_anchors_pad_kind_rejected(tmp_path: Path) -> None:
+    """Pad anchors were removed (2026-09-27): ``kind="pad"`` is no
+    longer reserved — it falls through to the generic unsupported-kind
+    error like any unknown anchor kind."""
+    with pytest.raises(RouteFailure, match="unsupported anchor kind"):
         _route_clear(
             {"algorithm": "pns", "anchors": [{"kind": "pad", "ref": "C1", "pad": "1"}]},
             tmp_path,
@@ -2054,7 +2055,7 @@ def _make_clear_board_with_track(tmp_path: Path) -> str:
 def _route_strategy(
     tmp_path: Path,
     *,
-    strategy: str,
+    strategy: str = "shove",
     track: bool = False,
     algorithm: str = "pns",
 ) -> RouteResult:
@@ -2081,15 +2082,24 @@ def _route_strategy(
     )
 
 
-def test_strategy_default_auto_single_route(tmp_path: Path) -> None:
-    """``strategy`` defaults to ``"auto"``: a single route, exactly the
-    pre-W3 behavior (no variance fields, no variant list)."""
-    result = _route_strategy(tmp_path, strategy="auto")
-    assert result.strategy == "auto"
+def test_strategy_default_shove_single_route(tmp_path: Path) -> None:
+    """``strategy`` defaults to ``"shove"`` (the old ``auto`` default
+    mapped to the identical path): a single route, no variance fields,
+    no variant list."""
+    result = _route_strategy(tmp_path)
+    assert result.strategy == "shove"
     assert not hasattr(result, "candidates")  # candidates surface is gone
     assert not hasattr(result, "candidates_png")
     assert len(result.segments) >= 1
     assert result.algorithm == "pns"
+
+
+def test_strategy_auto_rejected(tmp_path: Path) -> None:
+    """``"auto"`` was removed (2026-09-27): it was identical to
+    ``"shove"`` and only confused the VLM — it now fails validation
+    like any unknown value."""
+    with pytest.raises(RouteFailure, match=r"strategy='auto' is invalid"):
+        _route_strategy(tmp_path, strategy="auto")
 
 
 def test_strategy_walkaround_detours_no_shove(tmp_path: Path) -> None:
@@ -2117,8 +2127,8 @@ def test_strategy_walkaround_detours_no_shove(tmp_path: Path) -> None:
 
 
 def test_strategy_shove_pushes_foreign_track(tmp_path: Path) -> None:
-    """``strategy="shove"`` (like auto) may displace the crossing track:
-    the shoved set is non-empty on the blocked fixture."""
+    """``strategy="shove"`` (the default) may displace the crossing
+    track: the shoved set is non-empty on the blocked fixture."""
     result = _route_strategy(tmp_path, strategy="shove", track=True)
     assert result.strategy == "shove"
     assert result.shoved_tracks, "shove strategy must actually push the crossing track"
@@ -2163,13 +2173,13 @@ def test_astar_moved_pairs_empty(tmp_path: Path) -> None:
 
 
 def test_strategy_invalid_value_rejected(tmp_path: Path) -> None:
-    """Values outside {auto, walkaround, shove} are rejected up front
+    """Values outside {shove, walkaround} are rejected up front
     with a clear message, regardless of the algorithm."""
     for req_extra in ({"strategy": "multi"}, {"strategy": ""}, {"strategy": "PnS"}):
         with pytest.raises(RouteFailure, match="strategy=") as excinfo:
             _route_clear(req_extra, tmp_path)
         assert "invalid" in str(excinfo.value)
-        assert "auto" in str(excinfo.value)
+        assert "shove" in str(excinfo.value)
 
     with pytest.raises(RouteFailure, match=r"strategy='multi' is invalid"):
         _route_clear({"strategy": "multi", "algorithm": "astar"}, tmp_path)
@@ -2178,7 +2188,7 @@ def test_strategy_invalid_value_rejected(tmp_path: Path) -> None:
 def test_single_route_renders_route_png(tmp_path: Path) -> None:
     """A successful single PNS route always carries a best-effort
     ``route_png`` of the routed track (the VLM feedback image)."""
-    result = _route_strategy(tmp_path, strategy="auto")
+    result = _route_strategy(tmp_path)
     assert result.route_png
     assert result.route_png.startswith(
         os.path.join(tempfile.gettempdir(), "kcaa_route_")

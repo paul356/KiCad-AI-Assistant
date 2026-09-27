@@ -19,17 +19,23 @@ Connect pads belonging to the same net with DRC-clean tracks.
    returns the board PNG — inspect the image before routing.
 3. Connect ONE pad pair at a time with **pcb_route_pad_to_pad**:
    ``ref_a``/``pad_a``/``ref_b``/``pad_b``/``net`` are required; pass
-   ``layer_hint`` for thru-hole pads, ``width`` when a non-netclass
-   width is needed, and ``algorithm`` to pick the engine: ``astar``
-   (default) for grid A*, ``pns`` for the walkaround + shove engine.
-   Advanced knobs go in the optional ``options`` dict — omit it for
-   defaults: ``options={"corner_mode": ...}`` (default ``rounded45``),
+   ``width`` when a non-netclass width is needed, and ``algorithm`` to
+   pick the engine: ``astar`` (default) for grid A*, ``pns`` for the
+   walkaround + shove engine.  The VLM control knobs are top-level:
+   ``strategy="shove"|"walkaround"`` (PNS shove policy; ``"shove"``
+   default, ``"auto"`` removed 2026-09-27),
+   ``anchors=[...]`` (waypoint/via anchor chain), ``dry_run=True``
+   (route + render without writing).  Board-stable config and rare
+   tweaks go in the optional ``options`` dict — omit it for defaults:
+   ``options={"corner_mode": ...}`` (default ``rounded45``),
+   ``options={"layer_hint": ...}`` for thru-hole pads,
    ``options={"via_pairs": (("F.Cu", "B.Cu"),)}`` to allow layer
    transitions, ``options={"turn_penalty": 0.0}`` for pure
    shortest-path routing.
 4. On a route failure, read the error message, look at the latest layer
-   render, and retry with a different ``layer_hint``, a different pair, or a
-   via transition.  Do not silently repeat the same call.
+   render, and retry with a different ``options["layer_hint"]``, a
+   different pair, or a via transition.  Do not silently repeat the
+   same call.
 5. Optionally add or delete vias with ``pcb_add_vias`` / ``pcb_delete_vias``
    after routing (e.g. ground stitching).
 
