@@ -16,7 +16,7 @@
 >   (shove depth/nets, max_length, max_vias, net_kind, keepouts, preferred
 >   region) are dropped from the VLM-facing interface.
 > - Interaction paradigm: **explicit strategy + always-on evidence** — the
->   VLM picks the `strategy` knob (`auto` / `walkaround` / `shove`)
+>   VLM picks the `strategy` knob (`shove` / `walkaround`)
 >   deliberately; every result carries a rendered `route_png` the VLM
 >   inspects instead of reading coordinates.  (The earlier
 >   "PNS proposes candidates, VLM selects" `candidates` design was dropped —
@@ -292,13 +292,15 @@ green anchors; existing render tests stay green.
 VLM-facing parameters — **the complete spatial vocabulary**:
 
 ```python
-# pcb_route_pad_to_pad gains (via options dict):
-#   anchors: ordered list of anchor specs; empty = straight pad-to-pad (today)
-#   dry_run: bool (default True for VLM flows) — compute + render, do NOT write
+# pcb_route_pad_to_pad (interface v3): VLM control knobs are TOP-LEVEL
+#   anchors: ordered list of anchor specs; None/empty = straight pad-to-pad
+#   dry_run: bool (default False) — compute + render, do NOT write
+#   strategy: "shove" | "walkaround" (PNS shove policy)
+#   layer_hint moved INTO options (rare tweak); options keeps
+#   corner_mode / via_pairs / turn_penalty
 Anchorspec = (
     {"kind": "waypoint", "pos": (x, y), "tol_mm": 1.0}   # pass near (x,y) ± tol
   | {"kind": "via",      "pos": (x, y), "to_layer": "B.Cu"}  # explicit via site
-  | {"kind": "pad",      "ref": "R5", "pad": "1"}
 )
 ```
 
@@ -317,16 +319,19 @@ out): keepouts, preferred_region, shove_nets/shove_depth, max_length_mm,
 max_vias, net_kind. Waypoints express intent; PNS owns engine internals.
 
 > **Implemented (W2)**: `RouteRequest.anchors` / `RouteRequest.dry_run`
-> (router.py) + `options.anchors` / `options.dry_run` on
-> `pcb_route_pad_to_pad`.  Each anchor consumes one leg boundary (N anchors
+> (router.py) + top-level `anchors` / `dry_run` on
+> `pcb_route_pad_to_pad` (v3: promoted out of `options`, same as
+> `strategy`).  Each anchor consumes one leg boundary (N anchors
 > → N+1 legs, one `run_leg` per pair); waypoints are soft (unreachable →
 > skipped, echoed via `waypoint_violated` / `violated_waypoints`);
 > via anchors DRC-clean + micro-shift within `tol_mm` (nearest clean site
 > reported in `via_sites`); `dry_run` skips the tool's load/save entirely
 > (byte-identical file).  A blocked pinned leg (incl. no DRC-clean via
 > spot) raises `RouteFailure` carrying the rendered evidence PNG
-> (`render_route_attempt` + `BlockingEvidence`).  Pad anchors still raise
-> "not supported yet" (pad anchors are outside the current scope — see §11).
+> (`render_route_attempt` + `BlockingEvidence`).  Anchor kinds are
+> exactly ``waypoint`` and ``via``; ``{"kind": "pad", ...}`` was removed
+> by decision (2026-09-27) — it fails validation with the generic
+> ``unsupported anchor kind`` error (no reserved half-state).
 
 ## 10. Explicit strategy knob + always-on render (W3) — candidates dropped
 
@@ -337,13 +342,15 @@ max_vias, net_kind. Waypoints express intent; PNS owns engine internals.
 > always-on rendered image of the single route, so the VLM sees what it
 > got (in dry_run previews and commits alike).
 
-- `strategy: str` on `RouteRequest` and the tool `options` — `"auto"`
-  (default; walkaround + shove, engine default depth), `"walkaround"`
-  (no movable push — `route_engine(max_shove_depth=0)`; foreign tracks
-  are fixed solids and the route detours, `shoved == []`), `"shove"`
-  (explicit shove, same as auto).  Values are validated up front;
-  A* has no shove stage and ignores the value (still validated).
-  Implemented.
+- `strategy: str` on `RouteRequest` and as a top-level
+  `pcb_route_pad_to_pad` parameter (v3; was inside `options`) — exactly
+  two values: `"shove"` (default; walkaround + shove, engine default
+  depth), `"walkaround"` (no movable push —
+  `route_engine(max_shove_depth=0)`; foreign tracks are fixed solids
+  and the route detours, `shoved == []`).  `"auto"` was removed
+  (2026-09-27): it mapped to the identical path as `"shove"` and only
+  confused the VLM.  Values are validated up front; A* has no shove
+  stage and ignores the value (still validated).  Implemented.
 - `RouteResult.route_png` / response `route_png` — **every** successful
   route (PNS and A*, dry_run and commit) carries a best-effort render of
   the routed track: the emitted segments/arcs are recomposed into a
@@ -365,15 +372,14 @@ max_vias, net_kind. Waypoints express intent; PNS owns engine internals.
 > add a whole plan-state machine (tee/rollback/reorder) for a benefit the
 > per-pair loop already covers for typical board sizes.  Keep the design
 > simple; revisit only if paired routing proves order-fragile in practice.
-> Pad anchors retain their "not supported yet" `RouteFailure` (see §9).
 
 ## 12. Milestones (v3)
 
 | W | Scope | Exit criteria |
 |---|---|---|
 | W1 | Rendering upgrade: pad labels in `render_board`; failure-evidence render (grey skeleton + red blockers + green anchors) | labelled board render; forced-failure fixture → evidence PNG; render tests green |
-| W2 | `anchors` (waypoint/via/pad specs) + `dry_run` on `pcb_route_pad_to_pad`/options; failure render wired to raise | anchor-routed fixtures pass; dry_run leaves file byte-identical; failure PNG on blocked anchor leg — **implemented** (1001 passed / 15 skipped baseline; 9 new anchor/dry-run tests) |
-| W3 | `strategy` knob (auto/walkaround/shove) + always-on `route_png` + A* failure evidence | strategy fixtures: walkaround detours a foreign track without pushing (`shoved == []`), shove pushes it; invalid values rejected; `route_png` present on PNS and A* success — **implemented** (the W3 `candidates` multi-route + side-by-side render was **dropped**, see §10; 13 candidates tests removed).  Tests: strategy/render tests across `test_router.py` / `test_pcb_routing_tools.py` / `test_render_route_state.py` (multi-layer A* failure fixture skipped: search box auto-expands and via edges escape single-layer rings — see test comment); suite 1016 passed / 16 skipped.  A* failure evidence kept |
+| W2 | `anchors` (waypoint/via specs) + `dry_run` on `pcb_route_pad_to_pad` (top-level since v3; were in `options`); failure render wired to raise | anchor-routed fixtures pass; dry_run leaves file byte-identical; failure PNG on blocked anchor leg — **implemented** (1001 passed / 15 skipped baseline; 9 new anchor/dry-run tests; `pad` anchor kind removed 2026-09-27) |
+| W3 | `strategy` knob (shove/walkaround; `auto` removed 2026-09-27) + always-on `route_png` + A* failure evidence; interface v3 promotes strategy/anchors/dry_run to top-level params, `layer_hint` into `options` | strategy fixtures: walkaround detours a foreign track without pushing (`shoved == []`), shove pushes it; `auto` rejected; invalid values rejected; `route_png` present on PNS and A* success — **implemented** (the W3 `candidates` multi-route + side-by-side render was **dropped**, see §10; 13 candidates tests removed).  Tests: strategy/render tests across `test_router.py` / `test_pcb_routing_tools.py` / `test_render_route_state.py` (multi-layer A* failure fixture skipped: search box auto-expands and via edges escape single-layer rings — see test comment); suite after v3 interface: 1023 passed / 16 skipped → new tool tests keep suite green.  A* failure evidence kept |
 | ~~W4~~ | ~~`plan_routes` multi-pair, dry-run tee, undo/reorder~~ — **dropped** 2026-09-26 (see §11): per-pair loop suffices | n/a |
 
 W1 is renderer-only (no routing changes) — safe first step; W2–W3 build on it.

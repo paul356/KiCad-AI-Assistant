@@ -48,8 +48,10 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
         net: str,
         ctx: Context | None,
         width: float | None = None,
-        layer_hint: str | None = None,
         algorithm: str = "astar",
+        anchors: list[dict] | None = None,
+        dry_run: bool = False,
+        strategy: str = "shove",
         options: dict | None = None,
     ) -> dict[str, Any]:
         """Connect two pads with an obstacle-avoiding track, optionally across layers.
@@ -74,6 +76,11 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
         segments on any detour or shove; switch to ``mitered45`` for
         sharp corners or ``rounded90`` for larger-radius arcs.
 
+        Interface v3: the VLM control surface — ``anchors``, ``dry_run``,
+        ``strategy`` — lives at the TOP LEVEL (the caller touches these
+        often); board-stable config and rare tweaks stay in ``options``,
+        which gained ``layer_hint`` (moved out of the top level).
+
         PCB coordinates: mm, +X right, **+Y down**, rotation
         **CCW-positive on screen** (KiCad PCB convention).
 
@@ -83,9 +90,8 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
         (see :mod:`kcaa.utils.pcb_design_rules`).
 
         Layer selection is automatic: SMD pads use their fixed layer;
-        thru-hole pads pick a shared copper layer, preferring
-        ``layer_hint``.  When both pads are thru-hole and share a layer,
-        the route stays on a single layer (no vias).
+        thru-hole pads pick a shared copper layer, preferring the
+        ``layer_hint`` option (see ``options`` below).
 
         Args:
             pcb_path: Absolute path to the .kicad_pcb file.
@@ -97,12 +103,33 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
             ctx: MCP context (unused).
             width: Override the netclass track width (mm).  ``None`` uses the
                 DRC default for the net.
-            layer_hint: Preferred copper layer for thru-hole pads.  When
-                ``None`` (default) the router picks automatically.  Ignored
-                for SMD pads whose layer is fixed by the pad itself.
             algorithm: ``astar`` (default) grid-based A* planner;
                 ``pns`` walkaround + shove engine.  A route always uses
                 exactly one algorithm.
+            anchors: Anchor-chain control surface for the ``pns``
+                algorithm (a list of dicts): either
+                ``{"kind": "waypoint", "pos": [x, y], "tol_mm": 1.0}``
+                — route through a soft pass-through point on the current
+                layer (unreachable waypoints are recorded in
+                ``waypoint_violated`` and skipped, never a failure) — or
+                ``{"kind": "via", "pos": [x, y], "to_layer": "B.Cu"}`` —
+                insert a DRC-validated through-via near ``pos``,
+                micro-shifted within ``tol_mm`` when the exact spot is
+                blocked.  N anchors split the route into N+1 legs.
+                Any other ``kind`` (incl. ``"pad"``) is rejected with
+                "unsupported anchor kind".
+            dry_run: True -> route and return the full result without
+                writing anything to the PCB file (no reload, no .bak;
+                the file stays byte-identical).  ``route_png`` is still
+                rendered (the render reads the board and writes only to
+                the system temp dir).
+            strategy: Explicit PNS shove-mode knob: ``"shove"`` (default;
+                walkaround + shove with the default depth),
+                ``"walkaround"`` (no movable push — foreign tracks are
+                treated as fixed obstacles and the route detours around
+                them).  Unknown values are rejected.  Only affects the
+                ``pns`` engine; ``astar`` ignores it (it has no shove
+                stage).
 
             options: Optional dict of advanced options, all optional:
                 ``corner_mode``: ``rounded45`` (default) | ``mitered45`` |
@@ -125,29 +152,10 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
                 ``turn_penalty``: cost added when the path changes
                     direction (mm); default 0.3.  Set to 0 for pure
                     shortest-path routing (more zigzag).
-                ``anchors``: anchor-chain control surface for the ``pns``
-                    algorithm (a list of dicts): either
-                    ``{"kind": "waypoint", "pos": [x, y], "tol_mm": 1.0}``
-                    — route through a soft pass-through point on the
-                    current layer (unreachable waypoints are recorded in
-                    ``waypoint_violated`` and skipped, never a failure) —
-                    or ``{"kind": "via", "pos": [x, y],
-                    "to_layer": "B.Cu"}`` — insert a DRC-validated
-                    through-via near ``pos``, micro-shifted within
-                    ``tol_mm`` when the exact spot is blocked.  N anchors
-                    split the route into N+1 legs.  ``{"kind": "pad",
-                    "ref": ..., "pad": ...}`` anchors are not supported yet.
-                ``dry_run``: True -> route and return the full result
-                    without writing anything to the PCB file (no reload,
-                    no .bak; the file stays byte-identical).
-                ``strategy``: explicit PNS shove-mode knob: ``"auto"``
-                    (default; walkaround + shove with the default depth),
-                    ``"walkaround"`` (no movable push — foreign tracks
-                    are treated as fixed obstacles and the route detours
-                    around them), ``"shove"`` (explicit shove, same as
-                    auto).  Unknown values are rejected.  Only affects
-                    the ``pns`` engine; ``astar`` ignores it (it has no
-                    shove stage).
+                ``layer_hint``: Preferred copper layer for thru-hole
+                    pads.  ``None`` (default) lets the router pick
+                    automatically.  Ignored for SMD pads whose layer is
+                    fixed by the pad itself.
 
         Returns:
             dict with:
@@ -191,21 +199,18 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
         corner_mode = "rounded45"
         via_pairs: tuple[tuple[str, str], ...] = (("F.Cu", "B.Cu"),)
         turn_penalty = 0.3
-        anchors: list[dict] = []
-        dry_run = False
-        strategy = "auto"
+        layer_hint: str | None = None
         if options:
             via_pairs = options.get("via_pairs", via_pairs)
             turn_penalty = options.get("turn_penalty", turn_penalty)
             corner_mode = options.get("corner_mode", corner_mode)
-            anchors = options.get("anchors", anchors)
-            dry_run = bool(options.get("dry_run", False))
-            strategy = options.get("strategy", strategy)
-        if strategy not in ("auto", "walkaround", "shove"):
+            layer_hint = options.get("layer_hint", layer_hint)
+        anchors = list(anchors or [])
+        if strategy not in ("shove", "walkaround"):
             return {
                 "error": (
                     f"strategy={strategy!r} is invalid; supported values are "
-                    "'auto' (default), 'walkaround' (no shove), 'shove'."
+                    "'shove' or 'walkaround'."
                 )
             }
         req = RouteRequest(

@@ -307,7 +307,7 @@ class TestPcbDeleteVias:
 class TestPcbRouteOptions:
     """pcb_route_pad_to_pad: options dict + rounded45 default."""
 
-    def _route(self, tools, board, options=None):
+    def _route(self, tools, board, options=None, **kwargs):
         return _run(
             tools["pcb_route_pad_to_pad"](
                 pcb_path=board,
@@ -320,6 +320,7 @@ class TestPcbRouteOptions:
                 width=0.2,
                 algorithm="pns",
                 options=options,
+                **kwargs,
             )
         )
 
@@ -334,6 +335,18 @@ class TestPcbRouteOptions:
         assert result["arc_count"] >= 1
         assert result["arcs"][0]["layer"] == "F.Cu"
         assert result["arcs"][0]["net"] == "VCC"
+
+    def test_options_layer_hint_accepted_via_options(self, tools, routable_board):
+        """v3: ``layer_hint`` moved into ``options``.  On an SMD-pad
+        fixture the hint is accepted without error and the route lands on
+        the fixed copper layer ("F.Cu") — no top-level layer_hint exists
+        anymore."""
+        result = self._route(
+            tools, routable_board, options={"layer_hint": "F.Cu"}
+        )
+        assert "error" not in result
+        assert result["layers_used"] == ["F.Cu"]
+        assert "layer_hint" not in result
 
     def test_options_mitered45_suppresses_arcs(self, tools, routable_board):
         """options={'corner_mode': 'mitered45'} overrides the default:
@@ -350,7 +363,7 @@ class TestPcbRouteOptions:
         PCB byte-identical (no reload, no .bak); a follow-up dry_run=False
         on the same board writes (file changes)."""
         before = open(routable_board, "rb").read()
-        dry = self._route(tools, routable_board, options={"dry_run": True})
+        dry = self._route(tools, routable_board, dry_run=True)
         assert "error" not in dry
         assert dry["dry_run"] is True
         assert dry["segment_count"] > 0
@@ -360,7 +373,7 @@ class TestPcbRouteOptions:
         assert "via_sites" in dry
         assert open(routable_board, "rb").read() == before
 
-        wet = self._route(tools, routable_board, options={"dry_run": False})
+        wet = self._route(tools, routable_board, dry_run=False)
         assert "error" not in wet
         assert wet["dry_run"] is False
         assert wet["segment_count"] > 0
@@ -370,7 +383,7 @@ class TestPcbRouteOptions:
 class TestPcbRouteStrategy:
     """pcb_route_pad_to_pad: the explicit strategy knob + always-on render."""
 
-    def _route(self, tools, board, options=None, algorithm="pns"):
+    def _route(self, tools, board, options=None, algorithm="pns", **kwargs):
         return _run(
             tools["pcb_route_pad_to_pad"](
                 pcb_path=board,
@@ -383,45 +396,66 @@ class TestPcbRouteStrategy:
                 width=0.2,
                 algorithm=algorithm,
                 options=options,
+                **kwargs,
             )
         )
 
-    def test_strategy_default_echoes_auto_with_route_png(self, tools, routable_board):
-        """No options: strategy echoes "auto" and the response always
+    def test_v3_top_level_defaults_match_old_behavior(self, tools, routable_board):
+        """v3: with no top-level knobs and ``options=None`` the call
+        behaves exactly like the old default: strategy shove (was the
+        ``auto`` default, identical path), no dry_run, no anchors (empty
+        via_sites), rounded45 corners, algorithm pns."""
+        result = self._route(tools, routable_board)
+        assert "error" not in result
+        assert result["strategy"] == "shove"
+        assert result["dry_run"] is False
+        assert result["via_sites"] == []
+        assert result["corner_mode"] == "rounded45"
+        assert result["algorithm"] == "pns"
+
+    def test_strategy_default_echoes_shove_with_route_png(self, tools, routable_board):
+        """No options: strategy echoes "shove" and the response always
         carries the single-route render path (field shape is
         str/None; the render itself is smoke-checked below)."""
         result = self._route(tools, routable_board)
         assert "error" not in result
-        assert result["strategy"] == "auto"
+        assert result["strategy"] == "shove"
         assert "route_png" in result
         assert "candidates" not in result
         assert "candidates_png" not in result
         assert result["segment_count"] > 0
         assert result["via_count"] == 0
 
+    def test_strategy_auto_rejected(self, tools, routable_board):
+        """``"auto"`` was removed (2026-09-27): it now fails validation
+        like any unknown value."""
+        result = self._route(tools, routable_board, strategy="auto")
+        assert "error" in result
+        assert "strategy='auto' is invalid" in result["error"]
+
     def test_strategy_walkaround_parsed_and_echoed(self, tools, routable_board):
-        result = self._route(tools, routable_board, options={"strategy": "walkaround"})
+        result = self._route(tools, routable_board, strategy="walkaround")
         assert "error" not in result
         assert result["strategy"] == "walkaround"
 
     def test_strategy_shove_parsed_and_echoed(self, tools, routable_board):
-        result = self._route(tools, routable_board, options={"strategy": "shove"})
+        result = self._route(tools, routable_board, strategy="shove")
         assert "error" not in result
         assert result["strategy"] == "shove"
 
     def test_strategy_invalid_value_rejected(self, tools, routable_board):
-        """Values outside {auto, walkaround, shove} fail with a clear
+        """Values outside {shove, walkaround} fail with a clear
         message instead of being silently ignored."""
-        result = self._route(tools, routable_board, options={"strategy": "multi"})
+        result = self._route(tools, routable_board, strategy="multi")
         assert "error" in result
         assert "strategy='multi' is invalid" in result["error"]
-        assert "'auto'" in result["error"]
+        assert "'shove'" in result["error"]
 
     def test_strategy_inert_for_astar(self, tools, routable_board):
         """A* has no shove stage: the value is accepted and echoed, not
         rejected."""
         result = self._route(
-            tools, routable_board, options={"strategy": "walkaround"}, algorithm="astar"
+            tools, routable_board, strategy="walkaround", algorithm="astar"
         )
         assert "error" not in result
         assert result["strategy"] == "walkaround"
@@ -442,7 +476,7 @@ class TestPcbRouteStrategy:
         reads the board and writes only temp files)."""
         before = open(routable_board, "rb").read()
         result = self._route(
-            tools, routable_board, options={"strategy": "auto", "dry_run": True}
+            tools, routable_board, strategy="shove", dry_run=True
         )
         assert "error" not in result
         assert result["dry_run"] is True
@@ -493,7 +527,7 @@ class TestPcbRouteStrategy:
         o4 = ccw((qx, qy), (rx, ry), (bx, by))
         return o1 * o2 < 0 and o3 * o4 < 0
 
-    def _route_vcc(self, tools, board, options):
+    def _route_vcc(self, tools, board, options=None, **kwargs):
         return _run(
             tools["pcb_route_pad_to_pad"](
                 pcb_path=board,
@@ -506,6 +540,7 @@ class TestPcbRouteStrategy:
                 width=0.2,
                 algorithm="pns",
                 options=options,
+                **kwargs,
             )
         )
 
@@ -514,7 +549,7 @@ class TestPcbRouteStrategy:
         from the file and the displaced polyline is written back, so the
         committed board no longer contains a GND track crossing the new
         VCC line."""
-        result = self._route_vcc(tools, crossing_board, options={"strategy": "shove"})
+        result = self._route_vcc(tools, crossing_board, strategy="shove")
         assert "error" not in result
         assert result["shoved"], "fixture must actually shove the GND track"
         # 1) original gone
@@ -548,7 +583,7 @@ class TestPcbRouteStrategy:
     def test_shove_written_segments_tile_displaced_polyline(self, tools, crossing_board):
         """Wherever the displaced polyline has intermediate vertices, the
         written segments tile it contiguously (p_i -> p_{i+1})."""
-        result = self._route_vcc(tools, crossing_board, options={"strategy": "shove"})
+        result = self._route_vcc(tools, crossing_board, strategy="shove")
         assert "error" not in result
         assert result["shoved"]
         pts = result["shoved"][0]["points"]
@@ -576,7 +611,7 @@ class TestPcbRouteStrategy:
         assert before[0]["start"] == (40.0, 25.0)
         assert before[0]["end"] == (55.0, 45.0)
         result = self._route_vcc(
-            tools, crossing_board, options={"strategy": "walkaround"}
+            tools, crossing_board, strategy="walkaround"
         )
         assert "error" not in result
         assert result["shoved"] == []
@@ -588,7 +623,7 @@ class TestPcbRouteStrategy:
         in the response (report-only, nothing written)."""
         before = open(crossing_board, "rb").read()
         result = self._route_vcc(
-            tools, crossing_board, options={"strategy": "shove", "dry_run": True}
+            tools, crossing_board, strategy="shove", dry_run=True
         )
         assert "error" not in result
         assert result["dry_run"] is True

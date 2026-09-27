@@ -178,18 +178,19 @@ class RouteRequest:
             and skipped, the route continues); ``"via"`` (``pos``,
             ``to_layer``) switches the leg layer at a DRC-validated
             through-via site near ``pos`` (micro-shifted within
-            ``tol_mm``); ``"pad"`` is reserved (raises ``RouteFailure``
-            "not supported yet").  Anchors consume one leg each: N anchors
-            split the route into N+1 legs.
+            ``tol_mm``).  Any other kind (incl. ``"pad"``) is rejected
+            with ``RouteFailure`` "unsupported anchor kind".  Anchors
+            consume one leg each: N anchors split the route into N+1
+            legs.
         dry_run: Route and return the result without writing anything to
             the PCB file.  The router never writes; this flag lets the
             tool layer skip its ``save_pcb`` step.
         strategy: Explicit PNS shove-mode knob (trailing request field):
-            ``"auto"`` (default, walkaround + shove with the default
+            ``"shove"`` (default — walkaround + shove with the default
             depth), ``"walkaround"`` (no movable push at all — foreign
-            tracks are treated as fixed obstacles), ``"shove"`` (same as
-            auto).  The A* planner has no shove stage and ignores the
-            value (the value itself is still validated).
+            tracks are treated as fixed obstacles and the route detours
+            around them).  The A* planner has no shove stage and ignores
+            the value (the value itself is still validated).
     """
 
     pcb_path: str
@@ -212,7 +213,7 @@ class RouteRequest:
     corner_mode: str = "rounded45"  # rounded45 (default) | mitered45 | rounded90 | mitered90
     anchors: list[dict] = field(default_factory=list)
     dry_run: bool = False  # tool-layer hint: skip save_pcb (router never writes)
-    strategy: str = "auto"  # auto | walkaround | shove (PNS shove-mode knob)
+    strategy: str = "shove"  # shove | walkaround (PNS shove-mode knob)
 
 
 @dataclass
@@ -253,7 +254,7 @@ class RouteResult:
     waypoint_violated: bool = False
     violated_waypoints: list[tuple[float, float]] = field(default_factory=list)
     via_sites: list[dict] = field(default_factory=list)
-    strategy: str = "auto"  # echo of the requested strategy knob
+    strategy: str = "shove"  # echo of the requested strategy knob
     route_png: str | None = None  # best-effort single-route render path
     # (original, displaced) shove pairs: the pre-shove track as it exists
     # in the PCB file and the pushed replacement.  The tool layer deletes
@@ -301,10 +302,10 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
 
     # Strategy is the explicit PNS shove-mode knob; validate the VALUE for
     # both planners (A* has no shove stage and silently ignores it).
-    if req.strategy not in ("auto", "walkaround", "shove"):
+    if req.strategy not in ("shove", "walkaround"):
         raise RouteFailure(
             f"strategy={req.strategy!r} is invalid; supported values are "
-            f"'auto' (default), 'walkaround' (no shove), 'shove'."
+            f"'shove' or 'walkaround'."
         )
 
     # Validate corner_mode early: both planners must reject an unknown
@@ -843,7 +844,7 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
         #    finalize_legs postprocesses the emitted nodes into the final
         #    segment/arc/via lists.
         # -- Strategy knob (trailing request field): walkaround = no
-        #    movable push (0 depth), auto/shove = default MAX_SHOVE_DEPTH.
+        #    movable push (0 depth), shove = default MAX_SHOVE_DEPTH.
         shove_depth: float | None = 0 if req.strategy == "walkaround" else None
         used_chain: list[tuple[float, float]] = [pad_a_xy]
         all_nodes: list[RouteNode] = []
@@ -1054,8 +1055,8 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
             # -- Anchor chain (waypoints / via anchors) ----------------
             # Each anchor consumes one leg boundary: waypoints split the
             # current leg layer, via anchors switch the leg layer at a
-            # DRC-validated through-via site.  Pad anchors raise
-            # "not supported yet"; the A* planner rejects anchors at entry.
+            # DRC-validated through-via site.  The A* planner rejects
+            # anchors at entry.
             via_forbidden = [
                 poly for poly, _pl, _rf, _pn, _ctr in _same_net_pad_polygons(data, req.net)
             ]
@@ -1142,14 +1143,9 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
                     pending_pos = site
                     pending_layer = to_layer
                     continue
-                if kind == "pad":
-                    raise RouteFailure(
-                        f"pad anchor {spec.get('ref', '?')}/{spec.get('pad', '?')} "
-                        "not supported yet; planned for the plan_routes milestone"
-                    )
                 raise RouteFailure(
-                    f"unsupported anchor kind {kind!r}; expected 'waypoint', "
-                    "'via' or 'pad'"
+                    f"unsupported anchor kind {kind!r}; expected 'waypoint' "
+                    "or 'via'"
                 )
             if pending_layer != end_layer:
                 raise RouteFailure(
