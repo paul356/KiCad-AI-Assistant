@@ -49,7 +49,7 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
         ctx: Context | None,
         width: float | None = None,
         algorithm: str = "astar",
-        anchors: list[dict] | None = None,
+        waypoints: list[dict] | None = None,
         dry_run: bool = False,
         strategy: str = "shove",
         options: dict | None = None,
@@ -76,7 +76,7 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
         segments on any detour or shove; switch to ``mitered45`` for
         sharp corners or ``rounded90`` for larger-radius arcs.
 
-        Interface v3: the VLM control surface — ``anchors``, ``dry_run``,
+        Interface v3: the VLM control surface — ``waypoints``, ``dry_run``,
         ``strategy`` — lives at the TOP LEVEL (the caller touches these
         often); board-stable config and rare tweaks stay in ``options``,
         which gained ``layer_hint`` (moved out of the top level).
@@ -106,7 +106,7 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
             algorithm: ``astar`` (default) grid-based A* planner;
                 ``pns`` walkaround + shove engine.  A route always uses
                 exactly one algorithm.
-            anchors: Anchor-chain control surface for the ``pns``
+            waypoints: Anchor-chain control surface for the ``pns``
                 algorithm (a list of dicts): either
                 ``{"kind": "waypoint", "pos": [x, y], "tol_mm": 1.0}``
                 — route through a soft pass-through point on the current
@@ -115,7 +115,7 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
                 ``{"kind": "via", "pos": [x, y], "to_layer": "B.Cu"}`` —
                 insert a DRC-validated through-via near ``pos``,
                 micro-shifted within ``tol_mm`` when the exact spot is
-                blocked.  N anchors split the route into N+1 legs.
+                blocked.  N waypoints split the route into N+1 legs.
                 Any other ``kind`` (incl. ``"pad"``) is rejected with
                 "unsupported anchor kind".
             dry_run: True -> route and return the full result without
@@ -167,7 +167,7 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
                 corner_mode: echoed corner_mode.
                 algorithm: echoed algorithm (``astar`` | ``pns``).
                 via_count / vias: vias written (0 for single-layer).
-                via_sites: emitted via anchors, one dict per anchor:
+                via_sites: emitted via sites, one dict per waypoint:
                     ``{"pos": [x, y], "to_layer": ...}`` (the actual
                     DRC-clean site used, possibly micro-shifted).
                 waypoint_violated / violated_waypoints: True plus the
@@ -205,7 +205,7 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
             turn_penalty = options.get("turn_penalty", turn_penalty)
             corner_mode = options.get("corner_mode", corner_mode)
             layer_hint = options.get("layer_hint", layer_hint)
-        anchors = list(anchors or [])
+        waypoints = list(waypoints or [])
         if strategy not in ("shove", "walkaround"):
             return {
                 "error": (
@@ -226,7 +226,7 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
             turn_penalty=turn_penalty,
             corner_mode=corner_mode,
             algorithm=algorithm,
-            anchors=anchors,
+            waypoints=waypoints,
             dry_run=dry_run,
             strategy=strategy,
         )

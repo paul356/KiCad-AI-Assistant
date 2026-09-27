@@ -488,7 +488,7 @@ class TestRoutingTool:
             pad_b="1",
             net="GND",
             ctx=None,
-            via_pairs=(("F.Cu", "B.Cu"), ("B.Cu", "In1.Cu")),
+            options={"via_pairs": (("F.Cu", "B.Cu"), ("B.Cu", "In1.Cu"))},
         )
         assert "segment_count" in result
         assert result["segment_count"] >= 1

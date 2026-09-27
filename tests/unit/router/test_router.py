@@ -1849,7 +1849,7 @@ def _make_two_layer_board(tmp_path: Path, extra: str = "") -> Path:
     return dst
 
 
-def _route_pns_anchors(board: Path, anchors: list[dict]) -> RouteResult:
+def _route_pns_waypoints(board: Path, waypoints: list[dict]) -> RouteResult:
     return auto_route_pair(
         RouteRequest(
             pcb_path=str(board),
@@ -1864,12 +1864,12 @@ def _route_pns_anchors(board: Path, anchors: list[dict]) -> RouteResult:
             via_drill=0.4,
             algorithm="pns",
             corner_mode="mitered45",
-            anchors=anchors,
+            waypoints=waypoints,
         )
     )
 
 
-def test_anchors_waypoint_routes_through_point(tmp_path: Path) -> None:
+def test_waypoints_waypoint_routes_through_point(tmp_path: Path) -> None:
     """A waypoint anchor forces the single-layer route through its
     tolerance circle; unreachable waypoints never fail the route."""
     from shapely.geometry import LineString, Point
@@ -1878,7 +1878,7 @@ def test_anchors_waypoint_routes_through_point(tmp_path: Path) -> None:
         {
             "algorithm": "pns",
             "corner_mode": "mitered45",
-            "anchors": [{"kind": "waypoint", "pos": (45.0, 30.0), "tol_mm": 1.0}],
+            "waypoints": [{"kind": "waypoint", "pos": (45.0, 30.0), "tol_mm": 1.0}],
         },
         tmp_path,
     )
@@ -1893,7 +1893,7 @@ def test_anchors_waypoint_routes_through_point(tmp_path: Path) -> None:
     assert result.via_sites == []
 
 
-def test_anchors_waypoint_unreachable_is_soft_skip(tmp_path, monkeypatch) -> None:
+def test_waypoints_waypoint_unreachable_is_soft_skip(tmp_path, monkeypatch) -> None:
     """A waypoint leg that fails (engine PnsFailure) is recorded as
     violated and skipped; the route still completes end to end."""
     from kcaa.router.route_engine import PnsFailure
@@ -1913,7 +1913,7 @@ def test_anchors_waypoint_unreachable_is_soft_skip(tmp_path, monkeypatch) -> Non
         {
             "algorithm": "pns",
             "corner_mode": "mitered45",
-            "anchors": [{"kind": "waypoint", "pos": (45.0, 30.0), "tol_mm": 1.0}],
+            "waypoints": [{"kind": "waypoint", "pos": (45.0, 30.0), "tol_mm": 1.0}],
         },
         tmp_path,
     )
@@ -1925,10 +1925,10 @@ def test_anchors_waypoint_unreachable_is_soft_skip(tmp_path, monkeypatch) -> Non
     assert result.end == pytest.approx((60.0, 39.5), abs=1e-3)
 
 
-def test_anchors_via_explicit_cross_layer(tmp_path: Path) -> None:
+def test_waypoints_via_explicit_cross_layer(tmp_path: Path) -> None:
     """An explicit via anchor switches the leg layer at its requested
     site: exactly one via, echoes the site + to_layer, route crosses."""
-    result = _route_pns_anchors(
+    result = _route_pns_waypoints(
         _make_two_layer_board(tmp_path),
         [{"kind": "via", "pos": (45.0, 35.0), "to_layer": "B.Cu"}],
     )
@@ -1943,7 +1943,7 @@ def test_anchors_via_explicit_cross_layer(tmp_path: Path) -> None:
     assert result.waypoint_violated is False
 
 
-def test_anchors_via_shifts_off_blocked_site(tmp_path: Path) -> None:
+def test_waypoints_via_shifts_off_blocked_site(tmp_path: Path) -> None:
     """A via anchor requested exactly on same-net pad copper micro-shifts
     to the nearest DRC-clean spot (within tol_mm) and routes anyway."""
     from shapely.geometry import Point, box
@@ -1962,7 +1962,7 @@ def test_anchors_via_shifts_off_blocked_site(tmp_path: Path) -> None:
         "\t)\n"
     )
     board = _make_two_layer_board(tmp_path, extra=same_net_pad)
-    result = _route_pns_anchors(
+    result = _route_pns_waypoints(
         board,
         [{"kind": "via", "pos": (45.0, 40.0), "to_layer": "B.Cu"}],
     )
@@ -1977,7 +1977,7 @@ def test_anchors_via_shifts_off_blocked_site(tmp_path: Path) -> None:
     assert len(result.segments) > 0
 
 
-def test_anchors_failure_renders_png_evidence(tmp_path: Path) -> None:
+def test_waypoints_failure_renders_png_evidence(tmp_path: Path) -> None:
     """A blocked via anchor with no DRC-clean spot inside tol_mm raises
     RouteFailure carrying the path of a rendered failure-evidence PNG."""
     foreign_blocker = (
@@ -1995,7 +1995,7 @@ def test_anchors_failure_renders_png_evidence(tmp_path: Path) -> None:
     )
     board = _make_two_layer_board(tmp_path, extra=foreign_blocker)
     with pytest.raises(RouteFailure) as excinfo:
-        _route_pns_anchors(
+        _route_pns_waypoints(
             board,
             [{"kind": "via", "pos": (45.0, 40.0), "tol_mm": 1.0, "to_layer": "B.Cu"}],
         )
@@ -2007,30 +2007,30 @@ def test_anchors_failure_renders_png_evidence(tmp_path: Path) -> None:
     assert png_path.endswith(".png")
 
 
-def test_anchors_pad_kind_rejected(tmp_path: Path) -> None:
-    """Pad anchors were removed (2026-09-27): ``kind="pad"`` is no
-    longer reserved — it falls through to the generic unsupported-kind
-    error like any unknown anchor kind."""
+def test_waypoints_pad_kind_rejected(tmp_path: Path) -> None:
+    """Pad ``kind`` waypoints were removed (2026-09-27): ``kind="pad"``
+    is no longer reserved — it falls through to the generic
+    unsupported-kind error like any unknown waypoint kind."""
     with pytest.raises(RouteFailure, match="unsupported anchor kind"):
         _route_clear(
-            {"algorithm": "pns", "anchors": [{"kind": "pad", "ref": "C1", "pad": "1"}]},
+            {"algorithm": "pns", "waypoints": [{"kind": "pad", "ref": "C1", "pad": "1"}]},
             tmp_path,
         )
 
 
-def test_anchors_require_pns_algorithm(tmp_path: Path) -> None:
-    """The A* planner must reject anchors loudly instead of ignoring them."""
+def test_waypoints_require_pns_algorithm(tmp_path: Path) -> None:
+    """The A* planner must reject waypoints loudly instead of ignoring them."""
     with pytest.raises(RouteFailure, match="only supported with algorithm"):
         _route_clear(
-            {"algorithm": "astar", "anchors": [{"kind": "waypoint", "pos": (45.0, 30.0)}]},
+            {"algorithm": "astar", "waypoints": [{"kind": "waypoint", "pos": (45.0, 30.0)}]},
             tmp_path,
         )
 
 
-def test_anchors_unknown_kind_raises(tmp_path: Path) -> None:
+def test_waypoints_unknown_kind_raises(tmp_path: Path) -> None:
     with pytest.raises(RouteFailure, match="unsupported anchor kind"):
         _route_clear(
-            {"algorithm": "pns", "anchors": [{"kind": "jump", "pos": (45.0, 30.0)}]},
+            {"algorithm": "pns", "waypoints": [{"kind": "jump", "pos": (45.0, 30.0)}]},
             tmp_path,
         )
 
