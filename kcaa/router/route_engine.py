@@ -49,6 +49,10 @@ class EngineResult:
     shoved_tracks: list[TrackObstacle] = field(default_factory=list)
     arcs: list[ArcSeg] = field(default_factory=list)
     trace: Trace | None = None
+    # (original, displaced) shove pairs — the pre-shove track (as it
+    # exists in the PCB file) and the pushed replacement — so the write
+    # path can persist the displacement.  Empty when nothing was pushed.
+    moved_pairs: list[tuple[TrackObstacle, TrackObstacle]] = field(default_factory=list)
 
 
 def route_engine(
@@ -58,14 +62,15 @@ def route_engine(
     track_width: float,
     clearance: float,
     corner_mode: CornerMode | str = CornerMode.MITERED_45,
-    shove: bool = True,
+    max_shove_depth: float | None = None,
 ) -> EngineResult:
     """Route ``start`` → ``end`` through the obstacle set with walkaround
     + shove, returning the final polyline and the pushed tracks.
 
-    ``shove=False`` runs the walkaround-only strategy (movable tracks are
-    treated as fixed solids and never displaced) — the W3 "walkaround"
-    candidate variant.  Default ``True`` is the pre-existing behavior.
+    ``max_shove_depth=0`` runs the walkaround-only strategy (movable
+    tracks are treated as fixed solids and never displaced).  ``None``
+    (default) is the pre-existing behavior: shove with
+    ``MAX_SHOVE_DEPTH`` as the chain cap.
     """
     trace = build_initial_trace(start, end, corner_mode)
     skeleton = trace.as_polyline(arc_pts=16)
@@ -106,31 +111,34 @@ def route_engine(
         movable.append(track)
         movable_shapes.append(obs)
 
-    # Movable tracks are shove candidates only when shoving is enabled;
-    # the walkaround-only variant (W3 "walkaround" candidate) treats every
-    # track as a fixed solid and routes around it — DRC-clean, but the
-    # track is never displaced.
+    # Movable tracks are shove candidates only when shoving is enabled
+    # (``max_shove_depth != 0``); the walkaround-only strategy treats
+    # every track as a fixed solid and routes around it — DRC-clean, but
+    # the track is never displaced.
+    shove_enabled = max_shove_depth != 0
     walk_obstacles = (
         obstacles
-        if not shove
+        if not shove_enabled
         else [o for o in obstacles if o not in movable_shapes]
     )
     node = ObstacleNode(walk_obstacles)
     walked = _walkaround_solids(skeleton, node, track_width, clearance)
 
-    if movable and shove:
+    if movable and shove_enabled:
         shoved: ShoveResult = shove_path(
             walked,
             movable,
             width=track_width,
             clearance=clearance,
-            max_depth=MAX_SHOVE_DEPTH,
+            max_depth=MAX_SHOVE_DEPTH if max_shove_depth is None else max_shove_depth,
         )
         out_path = shoved.path
         pushed = shoved.pushed
+        moved_pairs = shoved.moved_pairs
     else:
         out_path = walked
         pushed = []
+        moved_pairs = []
 
     # Rounded skeleton arcs survive only when walkaround left the path
     # untouched (a detour linearizes the arc it goes around).
@@ -144,6 +152,7 @@ def route_engine(
         shoved_tracks=pushed,
         arcs=arcs,
         trace=kept_trace,
+        moved_pairs=moved_pairs,
     )
 
 

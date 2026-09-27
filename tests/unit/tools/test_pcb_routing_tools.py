@@ -176,6 +176,24 @@ def routable_board(tmp_path):
     return str(dest)
 
 
+@pytest.fixture
+def crossing_board(tmp_path):
+    """routable_board plus one foreign-net GND track crossing the direct
+    pad-to-pad line — the shove-persistence fixture (the route between
+    R1.1 and C1.1 crosses it at (43.75, 30))."""
+    dest = tmp_path / "crossing.kicad_pcb"
+    text = _CLEAR_BOARD.replace('\t(net 1 "VCC")\n', '\t(net 1 "VCC")\n\t(net 2 "GND")\n')
+    seg = (
+        "\t(segment (start 40.0 25.0) (end 55.0 45.0) "
+        '(width 0.25) (layer "F.Cu") (net 2 "GND"))\n'
+    )
+    text = text.rstrip()[:-1] + seg + ")"
+    dest.write_text(text, encoding="utf-8")
+    pro = tmp_path / "crossing.kicad_pro"
+    pro.write_text(_CLEAR_PRO, encoding="utf-8")
+    return str(dest)
+
+
 def _run(coro):
     return asyncio.run(coro)
 
@@ -349,8 +367,8 @@ class TestPcbRouteOptions:
         assert wet["backup_path"] is not None
         assert open(routable_board, "rb").read() != before
 
-class TestPcbRouteCandidates:
-    """pcb_route_pad_to_pad: the PNS candidates control surface (W3)."""
+class TestPcbRouteStrategy:
+    """pcb_route_pad_to_pad: the explicit strategy knob + always-on render."""
 
     def _route(self, tools, board, options=None, algorithm="pns"):
         return _run(
@@ -368,53 +386,216 @@ class TestPcbRouteCandidates:
             )
         )
 
-    def test_candidates_default_response_shape_unchanged(self, tools, routable_board):
-        """candidates absent (or 1) must leave the response byte-identical
-        to today: no candidates / candidates_png keys, primary result
-        only."""
+    def test_strategy_default_echoes_auto_with_route_png(self, tools, routable_board):
+        """No options: strategy echoes "auto" and the response always
+        carries the single-route render path (field shape is
+        str/None; the render itself is smoke-checked below)."""
         result = self._route(tools, routable_board)
         assert "error" not in result
+        assert result["strategy"] == "auto"
+        assert "route_png" in result
         assert "candidates" not in result
         assert "candidates_png" not in result
         assert result["segment_count"] > 0
         assert result["via_count"] == 0
 
-    def test_candidates_two_returns_variants_and_png(self, tools, routable_board):
-        """candidates=2 on a clear board dedupes to a single variant but
-        still surfaces the candidates list and renders the side-by-side
-        PNG next to the request (best-effort)."""
-        result = self._route(tools, routable_board, options={"candidates": 2})
+    def test_strategy_walkaround_parsed_and_echoed(self, tools, routable_board):
+        result = self._route(tools, routable_board, options={"strategy": "walkaround"})
         assert "error" not in result
-        assert "candidates" in result
-        assert len(result["candidates"]) >= 1
-        assert result["candidates"][0]["variant"] == "walkaround"
-        assert "candidates_png" in result
-        assert result["candidates_png"].startswith(
-            os.path.join(tempfile.gettempdir(), "kcaa_candidates_")
-        )
-        assert os.path.exists(result["candidates_png"])
-        # Primary top-level result echoes candidate 1.
-        assert result["segments"] == result["candidates"][0]["segments"]
+        assert result["strategy"] == "walkaround"
 
-    def test_candidates_dry_run_still_renders_png(self, tools, routable_board):
-        """dry_run skips only the PCB write; best-effort candidate render
-        still fires (it reads the board and writes only temp files)."""
+    def test_strategy_shove_parsed_and_echoed(self, tools, routable_board):
+        result = self._route(tools, routable_board, options={"strategy": "shove"})
+        assert "error" not in result
+        assert result["strategy"] == "shove"
+
+    def test_strategy_invalid_value_rejected(self, tools, routable_board):
+        """Values outside {auto, walkaround, shove} fail with a clear
+        message instead of being silently ignored."""
+        result = self._route(tools, routable_board, options={"strategy": "multi"})
+        assert "error" in result
+        assert "strategy='multi' is invalid" in result["error"]
+        assert "'auto'" in result["error"]
+
+    def test_strategy_inert_for_astar(self, tools, routable_board):
+        """A* has no shove stage: the value is accepted and echoed, not
+        rejected."""
+        result = self._route(
+            tools, routable_board, options={"strategy": "walkaround"}, algorithm="astar"
+        )
+        assert "error" not in result
+        assert result["strategy"] == "walkaround"
+
+    def test_route_png_always_present_and_existing(self, tools, routable_board):
+        """The successful single route renders a real PNG (not just a
+        field): path points at an existing non-empty file."""
+        result = self._route(tools, routable_board)
+        assert "error" not in result
+        png = result["route_png"]
+        assert png, "best-effort render should produce a path on this fixture"
+        assert png.startswith(os.path.join(tempfile.gettempdir(), "kcaa_route_"))
+        assert os.path.exists(png)
+        assert os.path.getsize(png) > 0
+
+    def test_route_png_rendered_in_dry_run_too(self, tools, routable_board):
+        """dry_run skips only the PCB write; the render still fires (it
+        reads the board and writes only temp files)."""
         before = open(routable_board, "rb").read()
         result = self._route(
-            tools, routable_board, options={"candidates": 2, "dry_run": True}
+            tools, routable_board, options={"strategy": "auto", "dry_run": True}
         )
         assert "error" not in result
         assert result["dry_run"] is True
-        assert "candidates_png" in result
-        assert os.path.exists(result["candidates_png"])
+        png = result["route_png"]
+        assert png and os.path.exists(png)
         assert open(routable_board, "rb").read() == before
 
-    def test_candidates_with_astar_rejected(self, tools, routable_board):
-        """candidates > 1 is the PNS control surface; the A* planner
-        rejects it with the input error instead of ignoring it."""
-        result = self._route(
-            tools, routable_board, options={"candidates": 2}, algorithm="astar"
+    # -- Shove persistence -------------------------------------------------
+
+    @staticmethod
+    def _gnd_segments(pcb_path: str) -> list[dict]:
+        """All GND (net 2) track segments currently in the file."""
+        from kcaa.tools.pcb_routing_tools import _segment_fields
+        from kcaa.utils.pcb_sexp_utils import load_pcb
+
+        out = []
+        for node in load_pcb(pcb_path):
+            fields = _segment_fields(node)
+            if fields is not None and fields["net"] == "GND":
+                out.append(fields)
+        return out
+
+    @staticmethod
+    def _vcc_segments(pcb_path: str) -> list[dict]:
+        """All VCC track segments currently in the file."""
+        from kcaa.tools.pcb_routing_tools import _segment_fields
+        from kcaa.utils.pcb_sexp_utils import load_pcb
+
+        out = []
+        for node in load_pcb(pcb_path):
+            fields = _segment_fields(node)
+            if fields is not None and fields["net"] == "VCC":
+                out.append(fields)
+        return out
+
+    @staticmethod
+    def _segments_intersect(a: tuple, b: tuple) -> bool:
+        """True when line segments (p1,p2) and (q1,q2) cross properly."""
+        (ax, ay), (bx, by) = a
+        (qx, qy), (rx, ry) = b
+
+        def ccw(p, q, r):
+            return (q[1] - p[1]) * (r[0] - q[0]) - (q[0] - p[0]) * (r[1] - q[1])
+
+        o1 = ccw((ax, ay), (bx, by), (qx, qy))
+        o2 = ccw((ax, ay), (bx, by), (rx, ry))
+        o3 = ccw((qx, qy), (rx, ry), (ax, ay))
+        o4 = ccw((qx, qy), (rx, ry), (bx, by))
+        return o1 * o2 < 0 and o3 * o4 < 0
+
+    def _route_vcc(self, tools, board, options):
+        return _run(
+            tools["pcb_route_pad_to_pad"](
+                pcb_path=board,
+                ref_a="R1",
+                pad_a="1",
+                ref_b="C1",
+                pad_b="1",
+                net="VCC",
+                ctx=None,
+                width=0.2,
+                algorithm="pns",
+                options=options,
+            )
         )
-        assert "error" in result
-        assert "only supported with algorithm" in result["error"]
+
+    def test_shove_persists_displaced_gnd_track(self, tools, crossing_board):
+        """strategy=shove, non-dry_run: the original GND segment is REMOVED
+        from the file and the displaced polyline is written back, so the
+        committed board no longer contains a GND track crossing the new
+        VCC line."""
+        result = self._route_vcc(tools, crossing_board, options={"strategy": "shove"})
+        assert "error" not in result
+        assert result["shoved"], "fixture must actually shove the GND track"
+        # 1) original gone
+        gnd = self._gnd_segments(crossing_board)
+        assert gnd, "displaced GND track must be present"
+        assert not any(
+            abs(s["start"][0] - 40.0) <= 1e-6
+            and abs(s["start"][1] - 25.0) <= 1e-6
+            and abs(s["end"][0] - 55.0) <= 1e-6
+            and abs(s["end"][1] - 45.0) <= 1e-6
+            for s in gnd
+        ), "original GND segment (40,25)->(55,45) must be removed"
+        # 2) width/layer/net preserved
+        for s in gnd:
+            assert s["width"] == pytest.approx(0.25)
+            assert s["layer"] == "F.Cu"
+            assert s["net"] == "GND"
+        # 3) no carried GND segment crosses the routed VCC line(s)
+        vcc = [
+            (s["start"], s["end"])
+            for s in self._vcc_segments(crossing_board)
+        ]
+        assert vcc
+        for s in gnd:
+            line = (s["start"], s["end"])
+            for v in vcc:
+                assert not self._segments_intersect(line, v), (
+                    f"GND segment {line} still crosses routed VCC {v}"
+                )
+
+    def test_shove_written_segments_tile_displaced_polyline(self, tools, crossing_board):
+        """Wherever the displaced polyline has intermediate vertices, the
+        written segments tile it contiguously (p_i -> p_{i+1})."""
+        result = self._route_vcc(tools, crossing_board, options={"strategy": "shove"})
+        assert "error" not in result
+        assert result["shoved"]
+        pts = result["shoved"][0]["points"]
+        if len(pts) < 3:
+            return  # single-hop displacement: nothing to tile
+        gnd = self._gnd_segments(crossing_board)
+        start = (pts[0][0], pts[0][1])
+        cur = start
+        for p in pts[1:]:
+            nxt = (p[0], p[1])
+            assert any(
+                abs(s["start"][0] - cur[0]) <= 1e-6
+                and abs(s["start"][1] - cur[1]) <= 1e-6
+                and abs(s["end"][0] - nxt[0]) <= 1e-6
+                and abs(s["end"][1] - nxt[1]) <= 1e-6
+                for s in gnd
+            ), f"missing tiling segment {cur} -> {nxt}"
+            cur = nxt
+
+    def test_walkaround_leaves_gnd_track_untouched(self, tools, crossing_board):
+        """strategy=walkaround: no shove, no rewrite — the file still
+        contains the GND segment exactly at its original position."""
+        before = self._gnd_segments(crossing_board)
+        assert len(before) == 1
+        assert before[0]["start"] == (40.0, 25.0)
+        assert before[0]["end"] == (55.0, 45.0)
+        result = self._route_vcc(
+            tools, crossing_board, options={"strategy": "walkaround"}
+        )
+        assert "error" not in result
+        assert result["shoved"] == []
+        after = self._gnd_segments(crossing_board)
+        assert after == before, "walkaround must not touch the GND segment"
+
+    def test_shove_dry_run_persists_nothing_but_reports_pairs(self, tools, crossing_board):
+        """dry_run=True: file byte-identical, shoved pairs still reported
+        in the response (report-only, nothing written)."""
+        before = open(crossing_board, "rb").read()
+        result = self._route_vcc(
+            tools, crossing_board, options={"strategy": "shove", "dry_run": True}
+        )
+        assert "error" not in result
+        assert result["dry_run"] is True
+        assert result["shoved"], "dry_run must still report the pushed track"
+        assert open(crossing_board, "rb").read() == before
+        gnd = self._gnd_segments(crossing_board)
+        assert len(gnd) == 1
+        assert gnd[0]["start"] == (40.0, 25.0) and gnd[0]["end"] == (55.0, 45.0)
+
 

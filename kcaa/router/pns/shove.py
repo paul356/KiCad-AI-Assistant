@@ -69,6 +69,12 @@ class ShoveResult:
     path: list[tuple[float, float]]
     pushed: list[TrackObstacle] = field(default_factory=list)
     unchanged: list[TrackObstacle] = field(default_factory=list)
+    # (original, displaced) pairs — the pre-shove track as it exists in
+    # the PCB file and the pushed replacement.  One entry per pushed
+    # physical track (chain propagation pushes distinct tracks, the
+    # pushed track itself is never re-pushed).  ``pushed`` above stays
+    # list-of-displaced for backward compat.
+    moved_pairs: list[tuple[TrackObstacle, TrackObstacle]] = field(default_factory=list)
 
 
 def _hull_set(
@@ -247,6 +253,7 @@ def shove_path(
 
     # Worklist of (current_line, self_track) starting from the route.
     chains: list[tuple[list[tuple[float, float]], TrackObstacle | None]] = [(list(path), None)]
+    moved_pairs: list[tuple[TrackObstacle, TrackObstacle]] = []
     depth = 0
     while chains and depth < max_depth:
         cur_line, self_track = chains.pop()
@@ -269,6 +276,7 @@ def shove_path(
         remaining.remove(hit)
         remaining.append(pushed)
         moved.append(pushed)
+        moved_pairs.append((hit, pushed))
         chains.append((list(pushed.points), pushed))
         depth += 1
 
@@ -277,5 +285,6 @@ def shove_path(
         path=list(path),
         pushed=moved,
         unchanged=finalized,
+        moved_pairs=moved_pairs,
     )
     return result
