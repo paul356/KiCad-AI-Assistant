@@ -1035,13 +1035,19 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
                     post_by_layer.setdefault(s_.layer, []).append(s_)
                 final_segs: list[OutputSegment] = []
                 arcs_out = []
+                # Each layer's postprocess output covers the whole chain on
+                # that layer, so it must be consumed by exactly one non-direct
+                # leg — otherwise every same-layer non-direct leg extends a
+                # full copy of the track (N duplicate chains).
+                post_used: set[str] = set()
                 for li in range(len(direct_segs)):
                     layer = leg_layers[li]
                     if direct_segs[li] is not None:
                         final_segs.extend(direct_segs[li])
                         arcs_out.extend(direct_arcs[li])
-                    else:
+                    elif layer not in post_used:
                         final_segs.extend(post_by_layer.get(layer, []))
+                        post_used.add(layer)
                 segs = final_segs
             else:
                 # No leg emitted arcs: exactly the pre-existing multi-layer
