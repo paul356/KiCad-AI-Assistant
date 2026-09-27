@@ -14,6 +14,7 @@ call with a different layer.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 import logging
 from typing import Any
 
@@ -21,6 +22,7 @@ from fastmcp import Context, FastMCP
 import sexpdata
 
 from kcaa.router.path_postprocess import OutputArc, OutputSegment, OutputVia
+from kcaa.router.pns.shove import TrackObstacle
 from kcaa.router.router import (
     RouteFailure,
     RouteRequest,
@@ -138,18 +140,14 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
                 ``dry_run``: True -> route and return the full result
                     without writing anything to the PCB file (no reload,
                     no .bak; the file stays byte-identical).
-                ``candidates``: PNS multi-candidate knob: ``> 1`` asks
-                    the ``pns`` algorithm for that many alternative
-                    routes (cheap strategy variants: walkaround-only,
-                    walkaround+shove, then waypoint-tolerance scales
-                    when waypoints are present), deduped by geometry;
-                    the primary result is variant 1.  ``candidates > 1``
-                    with ``algorithm='astar'`` is rejected.  Default 1
-                    (single route, exactly the pre-W3 behavior).
-                    The side-by-side candidate PNG is rendered whenever
-                    ``candidates > 1`` (``dry_run`` included — the
-                    render reads the board file and writes only to the
-                    system temp dir).
+                ``strategy``: explicit PNS shove-mode knob: ``"auto"``
+                    (default; walkaround + shove with the default depth),
+                    ``"walkaround"`` (no movable push — foreign tracks
+                    are treated as fixed obstacles and the route detours
+                    around them), ``"shove"`` (explicit shove, same as
+                    auto).  Unknown values are rejected.  Only affects
+                    the ``pns`` engine; ``astar`` ignores it (it has no
+                    shove stage).
 
         Returns:
             dict with:
@@ -171,21 +169,22 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
                 layers_used: ordered list of layers touched by the path.
                 start: ``(x, y)`` exit point of pad_a.
                 end: ``(x, y)`` entry point of pad_b.
-                candidates: present when ``candidates > 1``: the list of
-                    alternative routes (each serialized like the primary
-                    response, plus a ``"variant"`` tag); the primary
-                    top-level fields describe variant 1.
-                candidates_png: present when ``candidates > 1``
-                    (``dry_run`` included — the render reads the board
-                    file and writes only to the system temp dir): path
-                    of the side-by-side candidate render the VLM
-                    inspects to pick a variant.  VLM flow: re-run the
-                    chosen variant with ``candidates=1`` +
-                    ``dry_run=False`` to commit it.
+                strategy: echo of the requested strategy knob.
+                route_png: path of the rendered single-route image (the
+                    VLM inspects it to see what was routed; ``None``
+                    only if the best-effort render failed).  Rendered
+                    for dry_run previews and commits alike — the render
+                    reads the board file and writes only to the system
+                    temp dir.
                 backup_path: path to the ``.bak`` created before writing
                     (``None`` with ``dry_run``).
                 pcb_path: echo of the input path.
                 dry_run: echo of the ``dry_run`` option.
+
+            VLM flow: preview with ``dry_run=True`` + ``route_png``,
+            then commit the same request with ``dry_run=False``;
+            ``strategy`` is the explicit knob that decides whether the
+            engine may shove tracks out of the way.
 
             Or ``{"error": "<message>"}`` on failure.
         """
@@ -194,14 +193,21 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
         turn_penalty = 0.3
         anchors: list[dict] = []
         dry_run = False
-        candidates = 1
+        strategy = "auto"
         if options:
             via_pairs = options.get("via_pairs", via_pairs)
             turn_penalty = options.get("turn_penalty", turn_penalty)
             corner_mode = options.get("corner_mode", corner_mode)
             anchors = options.get("anchors", anchors)
             dry_run = bool(options.get("dry_run", False))
-            candidates = int(options.get("candidates", candidates))
+            strategy = options.get("strategy", strategy)
+        if strategy not in ("auto", "walkaround", "shove"):
+            return {
+                "error": (
+                    f"strategy={strategy!r} is invalid; supported values are "
+                    "'auto' (default), 'walkaround' (no shove), 'shove'."
+                )
+            }
         req = RouteRequest(
             pcb_path=pcb_path,
             ref_a=ref_a,
@@ -217,7 +223,7 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
             algorithm=algorithm,
             anchors=anchors,
             dry_run=dry_run,
-            candidates=candidates,
+            strategy=strategy,
         )
         try:
             result = auto_route_pair(req)
@@ -238,6 +244,11 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
                 data.append(_arc_to_sexp(arc))
             for via in result.vias:
                 data.append(_via_to_sexp(via))
+            # Persist shoved-track displacements: delete the original
+            # file segment(s), append the displaced polyline as new
+            # segments (same width/layer/net).  Never touches the file
+            # under dry_run (short-circuited above).
+            _apply_shoved_tracks(data, result.moved_pairs)
             try:
                 backup_path = save_pcb(pcb_path, data)
             except OSError as exc:
@@ -304,14 +315,12 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
             ],
             "waypoint_violated": result.waypoint_violated,
             "violated_waypoints": [list(pt) for pt in result.violated_waypoints],
+            "strategy": result.strategy,
+            "route_png": result.route_png,
             "backup_path": backup_path,
             "pcb_path": pcb_path,
             "dry_run": dry_run,
         }
-        if result.candidates:
-            resp["candidates"] = result.candidates
-        if result.candidates_png:
-            resp["candidates_png"] = result.candidates_png
         return resp
 
     @mcp.tool()
@@ -712,6 +721,139 @@ def _get_net_name(net_node: list) -> str | None:
     else:
         return None
     return raw if isinstance(raw, str) else str(raw)
+
+
+def _segment_fields(node: list) -> dict | None:
+    """Extract ``{start, end, width, layer, net}`` from a ``(segment ...)`` node.
+
+    Returns ``None`` for anything that is not a segment node.  Field
+    order is not assumed (the node is scanned); ``net`` is the net *name*,
+    tolerating both KiCad 8 ``(net <id> "<name>")`` and KiCad 10
+    ``(net "<name>")``.
+    """
+    if not isinstance(node, list) or len(node) < 2 or node[0] != sexpdata.Symbol("segment"):
+        return None
+    fields: dict = {}
+    for sub in node[1:]:
+        if not isinstance(sub, list) or len(sub) < 2:
+            continue
+        key = sub[0]
+        if key == sexpdata.Symbol("start") and len(sub) >= 3:
+            fields["start"] = (float(sub[1]), float(sub[2]))
+        elif key == sexpdata.Symbol("end") and len(sub) >= 3:
+            fields["end"] = (float(sub[1]), float(sub[2]))
+        elif key == sexpdata.Symbol("width") and len(sub) >= 2:
+            fields["width"] = float(sub[1])
+        elif key == sexpdata.Symbol("layer") and len(sub) >= 2:
+            fields["layer"] = str(sub[1])
+        elif key == sexpdata.Symbol("net") and len(sub) >= 2:
+            fields["net"] = _get_net_name(sub)
+    if not all(k in fields for k in ("start", "end", "width", "layer")):
+        return None
+    return fields
+
+
+def _track_matches_segment(track: TrackObstacle, fields: dict, eps: float = 1e-6) -> bool:
+    """True when the file segment fields equal the track's geometry.
+
+    Full identity match (start/end/width/layer/net) so unrelated same-net
+    tracks sharing only the layer are never touched.  Endpoint order is
+    tolerated either way — a track read back from the file and pushed
+    through the engine keeps its direction, but a symmetric match is
+    unambiguous.
+    """
+    if abs(track.start[0] - fields["start"][0]) > eps or abs(track.start[1] - fields["start"][1]) > eps:
+        rev = (
+            abs(track.start[0] - fields["end"][0]) <= eps
+            and abs(track.start[1] - fields["end"][1]) <= eps
+            and abs(track.end[0] - fields["start"][0]) <= eps
+            and abs(track.end[1] - fields["start"][1]) <= eps
+        )
+        if not rev:
+            return False
+    else:
+        rev = False
+    if not rev and (abs(track.end[0] - fields["end"][0]) > eps or abs(track.end[1] - fields["end"][1]) > eps):
+        return False
+    if abs(track.width - fields["width"]) > eps:
+        return False
+    if fields["layer"] != track.layer:
+        return False
+    if track.net is not None and fields["net"] != track.net:
+        return False
+    return True
+
+
+def _displaced_to_segments(orig: TrackObstacle, displaced: TrackObstacle) -> list[list]:
+    """Serialize a displaced track as consecutive ``(segment ...)`` nodes.
+
+    Every consecutive point pair of the displaced centerline becomes one
+    segment with the original width/layer/net.  Zero-length hops are
+    skipped (the shove can emit coincident chain vertices).
+    """
+    segs: list[list] = []
+    pts = displaced.points
+    for i in range(len(pts) - 1):
+        x1, y1 = pts[i]
+        x2, y2 = pts[i + 1]
+        if abs(x1 - x2) <= 1e-9 and abs(y1 - y2) <= 1e-9:
+            continue
+        segs.append(
+            [
+                sexpdata.Symbol("segment"),
+                [sexpdata.Symbol("start"), x1, y1],
+                [sexpdata.Symbol("end"), x2, y2],
+                [sexpdata.Symbol("width"), displaced.width],
+                [sexpdata.Symbol("layer"), displaced.layer],
+                [sexpdata.Symbol("net"), displaced.net],
+            ]
+        )
+    return segs
+
+
+def _apply_shoved_tracks(
+    data: list,
+    moved_pairs: Sequence[tuple[TrackObstacle, TrackObstacle]],
+) -> None:
+    """Persist shoved-track displacements into the parsed board ``data``.
+
+    For every ``(original, displaced)`` pair: remove every file segment
+    identical to the original, then append the displaced polyline as new
+    segments.  Originals that are already gone from the file (e.g. a
+    track shoved twice in one multi-leg route) are simply not matched —
+    appending the displaced polyline is idempotent per final position.
+    """
+    kept: list = []
+    displaced_segs: list[list] = []
+    written: set[tuple | None] = set()
+    for node in data:
+        fields = _segment_fields(node)
+        if fields is not None and any(
+            _track_matches_segment(orig, fields) for orig, _disp in moved_pairs
+        ):
+            continue  # original track: replaced by the displaced polyline
+        kept.append(node)
+    for orig, displaced in moved_pairs:
+        for seg in _displaced_to_segments(orig, displaced):
+            seg_fields = _segment_fields(seg)
+            fp = (
+                None
+                if seg_fields is None
+                else (
+                    round(seg_fields["start"][0], 6),
+                    round(seg_fields["start"][1], 6),
+                    round(seg_fields["end"][0], 6),
+                    round(seg_fields["end"][1], 6),
+                    round(seg_fields["width"], 6),
+                    seg_fields["layer"],
+                    seg_fields["net"],
+                )
+            )
+            if fp in written:
+                continue  # duplicate displacement (multi-leg overlap)
+            written.add(fp)
+            displaced_segs.append(seg)
+    data[:] = kept + displaced_segs
 
 
 # ---------------------------------------------------------------------------

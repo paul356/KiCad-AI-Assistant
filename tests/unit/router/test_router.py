@@ -2037,8 +2037,6 @@ def test_anchors_unknown_kind_raises(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 # W3 — PNS candidates (multi-variant routes) + A* failure evidence
 # ---------------------------------------------------------------------------
-
-
 def _make_clear_board_with_track(tmp_path: Path) -> str:
     """Single-layer clear board plus one foreign-net GND track crossing the
     direct pad-to-pad line, so walkaround and shove diverge."""
@@ -2053,125 +2051,159 @@ def _make_clear_board_with_track(tmp_path: Path) -> str:
     return str(pcb_path)
 
 
-def _route_candidates(
+def _route_strategy(
     tmp_path: Path,
     *,
-    candidates: int = 2,
+    strategy: str,
     track: bool = False,
     algorithm: str = "pns",
-    waypoints: list[dict] | None = None,
 ) -> RouteResult:
     from kcaa.router.router import RouteRequest, auto_route_pair
 
-    pcb_path = _make_clear_board_with_track(tmp_path) if track else _make_clear_board(tmp_path)
-    req = {
-        "pcb_path": pcb_path,
-        "ref_a": "R1",
-        "pad_a": "1",
-        "ref_b": "C1",
-        "pad_b": "1",
-        "net": "VCC",
-        "width": 0.2,
-        "clearance": 0.2,
-        "via_pairs": (),
-        "algorithm": algorithm,
-        "corner_mode": "mitered45",
-        "candidates": candidates,
-    }
-    if waypoints:
-        req["anchors"] = waypoints
-    return auto_route_pair(RouteRequest(**req))
-
-
-def test_candidates_astar_rejected(tmp_path: Path) -> None:
-    """``candidates > 1`` is the PNS control surface; A* is single-shot."""
-    with pytest.raises(RouteFailure, match="only supported with algorithm"):
-        _route_candidates(tmp_path, candidates=2, algorithm="astar")
-
-
-def test_candidates_below_one_rejected(tmp_path: Path) -> None:
-    with pytest.raises(RouteFailure, match="candidates must be >= 1"):
-        _route_candidates(tmp_path, candidates=0)
-
-
-def test_candidates_default_no_variants(tmp_path: Path) -> None:
-    """candidates=1 (the default) keeps the single-route behavior: no
-    candidates list, no render."""
-    result = _route_candidates(tmp_path, candidates=1)
-    assert result.candidates == []
-    assert result.candidates_png is None
-    assert len(result.segments) >= 1
-
-
-def test_candidates_two_walkaround_and_shove(tmp_path: Path) -> None:
-    """A foreign track across the line yields two distinct variants:
-    walkaround-only (detour, nothing pushed) and walkaround+shove (track
-    displaced).  The primary top-level result is exactly candidate 1."""
-    result = _route_candidates(tmp_path, track=True, candidates=2)
-    assert [c["variant"] for c in result.candidates] == ["walkaround", "shove"]
-    wa, sh = result.candidates
-    # Shove displacement happens on the track, not the routed polyline:
-    # the variants differ in the shoved set (and usually the geometry).
-    assert wa["shoved"] == []
-    assert sh["shoved"], "shove variant must actually push the crossing track"
-    distinct = (
-        wa["segments"] != sh["segments"] or bool(wa["shoved"]) != bool(sh["shoved"])
+    pcb_path = (
+        _make_clear_board_with_track(tmp_path) if track else _make_clear_board(tmp_path)
     )
-    assert distinct
-    # Primary == first candidate (backwards compatible).
-    assert result.shoved_tracks == []
-    assert list(result.start) == result.candidates[0]["start"]
-    assert list(result.end) == result.candidates[0]["end"]
-    assert list(result.layers_used) == result.candidates[0]["layers_used"]
-    assert result.via_sites == result.candidates[0]["via_sites"]
-    assert result.waypoint_violated == result.candidates[0]["waypoint_violated"]
-    all_tags = {c["variant"] for c in result.candidates}
-    assert all_tags <= {"walkaround", "shove"}
-
-
-def test_candidates_dedupe_collapses_identical(tmp_path: Path) -> None:
-    """On a clear board every variant produces the same skeleton (nothing
-    to detour, nothing to shove): the identical geometries dedupe to one
-    candidate even when three are requested."""
-    result = _route_candidates(tmp_path, candidates=3)
-    assert len(result.candidates) == 1
-    assert result.candidates[0]["variant"] == "walkaround"
-
-
-def test_candidates_waypoint_tol_variants_dedupe(tmp_path: Path) -> None:
-    """Waypoint-tolerance variants are informational today (W2 decision):
-    they share the shove geometry and must dedupe, never duplicate it."""
-    result = _route_candidates(
-        tmp_path,
-        track=True,
-        candidates=3,
-        waypoints=[{"kind": "waypoint", "pos": (45.0, 30.0)}],
-    )
-    tags = [c["variant"] for c in result.candidates]
-    assert 2 <= len(tags) <= 5
-    assert all(t in {"walkaround", "shove", "waypoint-tol-x0.5", "waypoint-tol-x1.0", "waypoint-tol-x2.0"} for t in tags)
-    # No two candidates share the same (geometry, pushed) fingerprint.
-    seen = set()
-    for c in result.candidates:
-        fp = (
-            tuple(tuple(s) for s in c["segments"]),
-            tuple(tuple(s) for s in c["arcs"]),
-            len(c["shoved"]),
+    return auto_route_pair(
+        RouteRequest(
+            pcb_path=pcb_path,
+            ref_a="R1",
+            pad_a="1",
+            ref_b="C1",
+            pad_b="1",
+            net="VCC",
+            width=0.2,
+            clearance=0.2,
+            via_pairs=(),
+            algorithm=algorithm,
+            corner_mode="mitered45",
+            strategy=strategy,
         )
-        assert fp not in seen
-        seen.add(fp)
-
-
-def test_candidates_two_renders_candidates_png(tmp_path: Path) -> None:
-    """candidates > 1 renders the side-by-side variant PNG next to the
-    request and returns its path (best-effort, always safe)."""
-    result = _route_candidates(tmp_path, track=True, candidates=2)
-    assert result.candidates_png
-    assert result.candidates_png.startswith(
-        os.path.join(tempfile.gettempdir(), "kcaa_candidates_")
     )
-    assert os.path.exists(result.candidates_png)
-    assert os.path.getsize(result.candidates_png) > 0
+
+
+def test_strategy_default_auto_single_route(tmp_path: Path) -> None:
+    """``strategy`` defaults to ``"auto"``: a single route, exactly the
+    pre-W3 behavior (no variance fields, no variant list)."""
+    result = _route_strategy(tmp_path, strategy="auto")
+    assert result.strategy == "auto"
+    assert not hasattr(result, "candidates")  # candidates surface is gone
+    assert not hasattr(result, "candidates_png")
+    assert len(result.segments) >= 1
+    assert result.algorithm == "pns"
+
+
+def test_strategy_walkaround_detours_no_shove(tmp_path: Path) -> None:
+    """``strategy="walkaround"`` treats the foreign track as a fixed
+    solid: nothing is pushed (``shoved == []``) and the polyline detours
+    around it rather than crossing the direct line."""
+    result = _route_strategy(tmp_path, strategy="walkaround", track=True)
+    assert result.strategy == "walkaround"
+    assert result.shoved_tracks == []
+    a = (29.5, 30.0)
+    b = (60.0, 39.5)
+    assert len(result.segments) >= 2
+    pts = [(s.x1, s.y1) for s in result.segments] + [
+        (result.segments[-1].x2, result.segments[-1].y2)
+    ]
+    assert pts[0] == pytest.approx(a, abs=1e-3)
+    assert pts[-1] == pytest.approx(b, abs=1e-3)
+    # The busiest middle point must sit measurably off the direct line:
+    # a walkaround detour cannot keep the straight skeleton.
+    mid = pts[len(pts) // 2]
+    dist = abs(
+        (b[0] - a[0]) * (a[1] - mid[1]) - (b[1] - a[1]) * (a[0] - mid[0])
+    ) / math.hypot(b[0] - a[0], b[1] - a[1])
+    assert dist > 0.4
+
+
+def test_strategy_shove_pushes_foreign_track(tmp_path: Path) -> None:
+    """``strategy="shove"`` (like auto) may displace the crossing track:
+    the shoved set is non-empty on the blocked fixture."""
+    result = _route_strategy(tmp_path, strategy="shove", track=True)
+    assert result.strategy == "shove"
+    assert result.shoved_tracks, "shove strategy must actually push the crossing track"
+
+
+def test_shove_moved_pairs_report_original_and_displaced(tmp_path: Path) -> None:
+    """``RouteResult.moved_pairs`` carries exactly one (original,
+    displaced) pair: the original equals the fixture's GND segment
+    ((40,25)->(55,45)) and the displaced track actually moved."""
+    result = _route_strategy(tmp_path, strategy="shove", track=True)
+    assert len(result.moved_pairs) == 1
+    orig, displaced = result.moved_pairs[0]
+    # Original endpoints == the crossing fixture's GND segment.
+    assert orig.start == pytest.approx((40.0, 25.0), abs=1e-6)
+    assert orig.end == pytest.approx((55.0, 45.0), abs=1e-6)
+    assert orig.width == pytest.approx(0.25)
+    assert orig.layer == "F.Cu"
+    assert orig.net == "GND"
+    # Displaced differs from the original centerline (a shove re-walks
+    # the track around the route: same endpoints when the first push may
+    # not move them, intermediate vertices displaced).
+    assert displaced.points != orig.points
+    assert len(displaced.points) >= 2
+    # Identity metadata preserved for the writer.
+    assert displaced.width == pytest.approx(orig.width)
+    assert displaced.layer == orig.layer
+    assert displaced.net == orig.net
+    # Displaced == what the shoved serialization reports (writer feed).
+    assert result.shoved_tracks == [displaced]
+
+
+def test_walkaround_moved_pairs_empty(tmp_path: Path) -> None:
+    """walkaround has no shove: moved_pairs stays empty."""
+    result = _route_strategy(tmp_path, strategy="walkaround", track=True)
+    assert result.moved_pairs == []
+
+
+def test_astar_moved_pairs_empty(tmp_path: Path) -> None:
+    """A* has no shove stage: moved_pairs stays empty."""
+    result = _route_clear({"algorithm": "astar", "corner_mode": "mitered45"}, tmp_path)
+    assert result.moved_pairs == []
+
+
+def test_strategy_invalid_value_rejected(tmp_path: Path) -> None:
+    """Values outside {auto, walkaround, shove} are rejected up front
+    with a clear message, regardless of the algorithm."""
+    for req_extra in ({"strategy": "multi"}, {"strategy": ""}, {"strategy": "PnS"}):
+        with pytest.raises(RouteFailure, match="strategy=") as excinfo:
+            _route_clear(req_extra, tmp_path)
+        assert "invalid" in str(excinfo.value)
+        assert "auto" in str(excinfo.value)
+
+    with pytest.raises(RouteFailure, match=r"strategy='multi' is invalid"):
+        _route_clear({"strategy": "multi", "algorithm": "astar"}, tmp_path)
+
+
+def test_single_route_renders_route_png(tmp_path: Path) -> None:
+    """A successful single PNS route always carries a best-effort
+    ``route_png`` of the routed track (the VLM feedback image)."""
+    result = _route_strategy(tmp_path, strategy="auto")
+    assert result.route_png
+    assert result.route_png.startswith(
+        os.path.join(tempfile.gettempdir(), "kcaa_route_")
+    )
+    assert os.path.exists(result.route_png)
+    assert os.path.getsize(result.route_png) > 0
+
+
+def test_astar_success_renders_route_png(tmp_path: Path) -> None:
+    """A* success carries the same single-route render."""
+    result = _route_clear({"algorithm": "astar", "corner_mode": "mitered45"}, tmp_path)
+    assert result.route_png
+    assert os.path.exists(result.route_png)
+
+
+def test_astar_success_rounds_nothing_but_renders(tmp_path: Path) -> None:
+    """A* success renders even with waypoint/no-shove semantics absent;
+    ``strategy`` is inert for A* and only echoed."""
+    result = _route_clear(
+        {"algorithm": "astar", "corner_mode": "mitered45", "strategy": "walkaround"},
+        tmp_path,
+    )
+    assert result.strategy == "walkaround"
+    assert result.route_png
+    assert os.path.exists(result.route_png)
 
 
 def _make_blocked_single_layer_board(tmp_path: Path) -> str:
