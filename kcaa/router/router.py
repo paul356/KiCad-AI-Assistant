@@ -60,7 +60,7 @@ import os
 import tempfile
 import time
 
-from shapely.geometry import Polygon
+from shapely.geometry import LineString, Polygon
 from shapely.geometry import box as _shapely_box
 
 from kcaa.router.grid_a_star import (
@@ -173,15 +173,20 @@ class RouteRequest:
         waypoints: Anchor-chain control surface for the ``pns`` algorithm
             (ignored by ``astar``); each entry is a dict with a ``kind``:
             ``"waypoint"`` (``pos``, optional ``tol_mm``) forces the route
-            through a soft pass-through point on the current leg layer
-            (unreachable -> recorded in ``RouteResult.violated_waypoints``
-            and skipped, the route continues); ``"via"`` (``pos``,
-            ``to_layer``) switches the leg layer at a DRC-validated
-            through-via site near ``pos`` (micro-shifted within
-            ``tol_mm``).  Any other kind (incl. ``"pad"``) is rejected
-            with ``RouteFailure`` "unsupported anchor kind".  Waypoints
-            consume one leg each: N waypoints split the route into N+1
-            legs.
+            through a soft pass-through point on the current leg layer.
+            With ``tol_mm > 0`` the leg endpoint floats to a DRC-clean
+            spot inside the ``tol_mm``-radius circle around ``pos`` (soft
+            anchor), so the per-leg fillet arcs are no longer pinned onto
+            the waypoint joint and the corner renders rounded; omitting
+            ``tol_mm`` (or 0) keeps the legacy exact-anchor behavior.
+            Unreachable waypoints are recorded in
+            ``RouteResult.violated_waypoints`` and skipped, the route
+            continues; ``"via"`` (``pos``, ``to_layer``) switches the leg
+            layer at a DRC-validated through-via site near ``pos``
+            (micro-shifted within ``tol_mm``).  Any other kind (incl.
+            ``"pad"``) is rejected with ``RouteFailure`` "unsupported
+            anchor kind".  Waypoints consume one leg each: N waypoints
+            split the route into N+1 legs.
         dry_run: Route and return the result without writing anything to
             the PCB file.  The router never writes; this flag lets the
             tool layer skip its ``save_pcb`` step.
@@ -1075,102 +1080,253 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
             )
             n_legs = len(req.waypoints) + 1
             chain: list[tuple[float, float]] = [pad_a_xy]
-            for li, spec in enumerate(req.waypoints):
-                kind = spec.get("kind")
-                if kind == "waypoint":
-                    wpt = _anchor_pos(spec, "waypoint")
-                    via_anchors.add(wpt)  # no fillet may end on the joint
-                    try:
-                        run_leg(pending_pos, wpt, pending_layer, li=li, n_legs=n_legs)
-                    except RouteFailure:
-                        # Soft stop: record + skip the waypoint, keep going.
-                        waypoint_violated = True
-                        violated_waypoints.append(wpt)
-                        continue
-                    pending_pos = wpt
-                    continue
-                if kind == "via":
-                    site_req = _anchor_pos(spec, "via")
-                    if spec.get("to_layer") is None:
-                        to_layer = _auto_via_target(base_seq, pending_layer, site_req)
-                    else:
-                        to_layer = str(spec["to_layer"])
-                    _validate_via_transition(
-                        pending_layer, to_layer, site_req, req, pcb_layers
+            # -- Cocircular chain fast path ----------------------------
+            # A soft-anchored single-layer waypoint chain whose anchors
+            # all sit on one circle is a single continuous arc: emit one
+            # 3-point OutputArc covering the whole chain (pad lead-out ->
+            # waypoints -> pad lead-out) instead of the per-leg straight
+            # skeletons + fillet joints, which on a ring layout render as
+            # scalloped chord waves with arc/chord self-intersection leaf
+            # eyes.  Falls back to the per-leg path below on any doubt:
+            # fewer than 4 waypoints (any three anchors fit some circle,
+            # so cocircularity is not a real signal), a non-cocircular
+            # chain, an anchor outside the arc sweep, or an obstacle
+            # closer than clearance + width/2 to the emitted centerline
+            # -- the legacy behavior is preserved untouched.
+            cocircular = None
+            if (
+                start_layer == end_layer
+                and len(req.waypoints) >= 4
+                and all(
+                    spec.get("kind") == "waypoint"
+                    and float(spec.get("tol_mm", 0.0)) > 0.0
+                    for spec in req.waypoints
+                )
+            ):
+                wpt_pts = [_anchor_pos(spec, "waypoint") for spec in req.waypoints]
+                chain_pts = [pad_a_xy, *wpt_pts, pad_b_xy]
+                chain = list(chain_pts)  # exact-anchor chain for the render
+                tol_fit = max(float(spec["tol_mm"]) for spec in req.waypoints)
+                cocircular = _chain_cocircular_arc(chain_pts, tol_mm=tol_fit)
+            arc_emitted = False
+            if cocircular is not None:
+                arc_start, arc_mid, arc_end, (cxc, cyc, rad, a0, span) = cocircular
+                # DRC: the full centerline (pad lead-outs + densely
+                # sampled arc) must keep clearance + width/2 from every
+                # foreign obstacle on the layer -- model.obstacles is
+                # already net-filtered, so only foreign copper blocks.
+                # Same-net pads along the sweep are connection targets
+                # of this single continuous track, not obstacles (KiCad
+                # DRC never space-checks same-net copper), and are
+                # excluded here.  Forbidden: blocking the arc.
+                n_samples = max(
+                    256, int(math.ceil(abs(span) / (2.0 * math.pi) * 4096.0))
+                )
+                centerline: list[tuple[float, float]] = [pad_a_xy, arc_start]
+                for k in range(1, n_samples):
+                    ang = a0 + span * k / n_samples
+                    centerline.append(
+                        (cxc + rad * math.cos(ang), cyc + rad * math.sin(ang))
                     )
-                    try:
-                        site = _pick_explicit_via_site(
-                            pcb_path=req.pcb_path,
-                            requested=site_req,
-                            from_layer=pending_layer,
-                            to_layer=to_layer,
-                            via_diameter=via_diameter,
-                            via_drill=via_drill,
-                            clearance=clearance,
+                centerline.append(arc_end)
+                centerline.append(pad_b_xy)
+                arc_line = LineString(centerline)
+                arc_obstacles = _layer_engine_obstacles(
+                    model,
+                    data,
+                    req,
+                    start_layer,
+                    end_layer,
+                    start_layer,
+                    pad_a_xy,
+                    pad_b_xy,
+                    # Cocircular chain = one continuous track; same-net
+                    # pads (mid-chain pads included) are its connection
+                    # targets, not obstacles.  Foreign net copper still
+                    # blocks via model.obstacles above.
+                    include_same_net_pads=False,
+                )
+                margin = clearance + width / 2.0
+                if all(
+                    float(o.shape.distance(arc_line)) >= margin - 1e-4
+                    for o in arc_obstacles
+                ):
+                    # Chain sweep is clear: emit the lead-out segments
+                    # (only where the pad anchor floats off the circle)
+                    # plus the single covering arc.
+                    segs = []
+                    if not _pt_eq(arc_start, pad_a_xy):
+                        segs.append(
+                            OutputSegment(
+                                x1=pad_a_xy[0],
+                                y1=pad_a_xy[1],
+                                x2=arc_start[0],
+                                y2=arc_start[1],
+                                width=width,
+                                layer=start_layer,
+                                net=req.net,
+                            )
+                        )
+                    if not _pt_eq(arc_end, pad_b_xy):
+                        segs.append(
+                            OutputSegment(
+                                x1=arc_end[0],
+                                y1=arc_end[1],
+                                x2=pad_b_xy[0],
+                                y2=pad_b_xy[1],
+                                width=width,
+                                layer=start_layer,
+                                net=req.net,
+                            )
+                        )
+                    vias = []
+                    arcs_out = [
+                        OutputArc(
+                            start=arc_start,
+                            mid=arc_mid,
+                            end=arc_end,
+                            width=width,
+                            layer=start_layer,
                             net=req.net,
-                            via_forbidden=via_forbidden,
-                            tol_mm=float(spec.get("tol_mm", 1.0)),
                         )
-                    except RouteFailure as exc:
-                        # No DRC-clean site: render the blocking copper
-                        # around the request into the failure message.
-                        msg = str(exc)
-                        png = _render_route_failure_evidence(
-                            req.pcb_path,
-                            chain=chain,
-                            attempted_end=site_req,
-                            layer=pending_layer,
-                            obstacles=_layer_engine_obstacles(
-                                model,
-                                data,
-                                req,
-                                start_layer,
-                                end_layer,
-                                pending_layer,
-                                pad_a_xy,
-                                pad_b_xy,
-                            ),
-                        )
-                        if png:
-                            msg += f"\nFailure evidence: {png}"
-                        raise RouteFailure(msg) from exc
-                    via_anchors.add(site)
-                    via_sites.append({"pos": [site[0], site[1]], "to_layer": to_layer})
-                    chain.append(site)
-                    run_leg(
-                        pending_pos,
-                        site,
-                        pending_layer,
-                        li=li,
-                        n_legs=n_legs,
-                        render_evidence=True,
-                        evidence_ctx={"chain": list(chain)},
+                    ]
+                    pushed = []
+                    used_chain = list(chain)
+                    start_xy = pad_a_xy
+                    end_xy = pad_b_xy
+                    layers_used = [start_layer]
+                    print(
+                        f"  [route] cocircular chain: {len(chain_pts)} anchors on "
+                        f"r={rad:.3f} circle, span {abs(math.degrees(span)):.1f} deg "
+                        "-> single OutputArc"
                     )
-                    pending_pos = site
-                    pending_layer = to_layer
-                    continue
-                raise RouteFailure(
-                    f"unsupported anchor kind {kind!r}; expected 'waypoint' "
-                    "or 'via'"
+                    arc_emitted = True
+            if not arc_emitted:
+                for li, spec in enumerate(req.waypoints):
+                    kind = spec.get("kind")
+                    if kind == "waypoint":
+                        wpt = _anchor_pos(spec, "waypoint")
+                        via_anchors.add(wpt)  # no fillet may end on the joint
+                        # Soft anchor: with an explicit tol_mm > 0 the leg
+                        # endpoint floats to a DRC-clean spot inside the
+                        # tolerance circle around wpt, so the leg's fillet
+                        # arcs are no longer pinned onto the joint and the
+                        # corner renders rounded.  A blocked circle (or no /
+                        # zero tol_mm) falls back to the exact anchor --
+                        # legacy behavior, incl. the soft stop below.
+                        end_pt = wpt
+                        if "tol_mm" in spec and float(spec["tol_mm"]) > 0.0:
+                            soft = _waypoint_soft_end(
+                                wpt,
+                                tol_mm=float(spec["tol_mm"]),
+                                obstacles=_layer_engine_obstacles(
+                                    model,
+                                    data,
+                                    req,
+                                    start_layer,
+                                    end_layer,
+                                    pending_layer,
+                                    pad_a_xy,
+                                    pad_b_xy,
+                                ),
+                                track_width=width,
+                                clearance=clearance,
+                            )
+                            if soft is not None:
+                                end_pt = soft
+                        try:
+                            run_leg(pending_pos, end_pt, pending_layer, li=li, n_legs=n_legs)
+                        except RouteFailure:
+                            # Soft stop: record + skip the waypoint, keep going.
+                            waypoint_violated = True
+                            violated_waypoints.append(wpt)
+                            continue
+                        pending_pos = end_pt
+                        continue
+                    if kind == "via":
+                        site_req = _anchor_pos(spec, "via")
+                        if spec.get("to_layer") is None:
+                            to_layer = _auto_via_target(base_seq, pending_layer, site_req)
+                        else:
+                            to_layer = str(spec["to_layer"])
+                        _validate_via_transition(
+                            pending_layer, to_layer, site_req, req, pcb_layers
+                        )
+                        try:
+                            site = _pick_explicit_via_site(
+                                pcb_path=req.pcb_path,
+                                requested=site_req,
+                                from_layer=pending_layer,
+                                to_layer=to_layer,
+                                via_diameter=via_diameter,
+                                via_drill=via_drill,
+                                clearance=clearance,
+                                net=req.net,
+                                via_forbidden=via_forbidden,
+                                tol_mm=float(spec.get("tol_mm", 1.0)),
+                            )
+                        except RouteFailure as exc:
+                            # No DRC-clean site: render the blocking copper
+                            # around the request into the failure message.
+                            msg = str(exc)
+                            png = _render_route_failure_evidence(
+                                req.pcb_path,
+                                chain=chain,
+                                attempted_end=site_req,
+                                layer=pending_layer,
+                                obstacles=_layer_engine_obstacles(
+                                    model,
+                                    data,
+                                    req,
+                                    start_layer,
+                                    end_layer,
+                                    pending_layer,
+                                    pad_a_xy,
+                                    pad_b_xy,
+                                ),
+                            )
+                            if png:
+                                msg += f"\nFailure evidence: {png}"
+                            raise RouteFailure(msg) from exc
+                        via_anchors.add(site)
+                        via_sites.append(
+                            {"pos": [site[0], site[1]], "to_layer": to_layer}
+                        )
+                        chain.append(site)
+                        run_leg(
+                            pending_pos,
+                            site,
+                            pending_layer,
+                            li=li,
+                            n_legs=n_legs,
+                            render_evidence=True,
+                            evidence_ctx={"chain": list(chain)},
+                        )
+                        pending_pos = site
+                        pending_layer = to_layer
+                        continue
+                    raise RouteFailure(
+                        f"unsupported anchor kind {kind!r}; expected 'waypoint' "
+                        "or 'via'"
+                    )
+                if pending_layer != end_layer:
+                    raise RouteFailure(
+                        f"anchor chain ends on layer {pending_layer!r} but pad "
+                        f"{req.ref_b}/{req.pad_b} is on {end_layer!r}; add a via "
+                        "anchor that reaches the target layer (allowed via_pairs "
+                        f"{list(req.via_pairs)})"
+                    )
+                run_leg(
+                    pending_pos,
+                    pad_b_xy,
+                    pending_layer,
+                    li=len(req.waypoints),
+                    n_legs=n_legs,
+                    render_evidence=True,
+                    evidence_ctx={"chain": list(chain)},
                 )
-            if pending_layer != end_layer:
-                raise RouteFailure(
-                    f"anchor chain ends on layer {pending_layer!r} but pad "
-                    f"{req.ref_b}/{req.pad_b} is on {end_layer!r}; add a via "
-                    "anchor that reaches the target layer (allowed via_pairs "
-                    f"{list(req.via_pairs)})"
-                )
-            run_leg(
-                pending_pos,
-                pad_b_xy,
-                pending_layer,
-                li=len(req.waypoints),
-                n_legs=n_legs,
-                render_evidence=True,
-                evidence_ctx={"chain": list(chain)},
-            )
-            used_chain = list(chain)
-            finalize_legs()
+                used_chain = list(chain)
+                finalize_legs()
         elif start_layer == end_layer:
             engine_obstacles: list[Obstacle] = [
                 o for o in model.obstacles if start_layer in o.layers
@@ -2192,11 +2348,22 @@ def _layer_engine_obstacles(
     layer: str,
     pad_a_xy: tuple[float, float],
     pad_b_xy: tuple[float, float],
+    *,
+    include_same_net_pads: bool = True,
 ) -> list[Obstacle]:
     """PNS obstacles for one leg: copper on ``layer`` plus same-net pads
     the route may transit on that layer (endpoint pads exempted on their
-    own terminal layers)."""
+    own terminal layers).
+
+    ``include_same_net_pads=False`` skips the same-net pad set entirely:
+    the cocircular fast path emits one continuous track of which the
+    same-net pads (mid-chain pads included) are connection targets, not
+    obstacles -- KiCad DRC never space-checks same-net copper.  Foreign
+    copper (``model.obstacles``, already net-filtered to exclude this
+    net) still blocks either way."""
     engine_obstacles: list[Obstacle] = [o for o in model.obstacles if layer in o.layers]
+    if not include_same_net_pads:
+        return engine_obstacles
     for poly, players, _ref, _pname, center in _same_net_pad_polygons(data, req.net):
         if layer not in players:
             continue
@@ -2234,6 +2401,155 @@ def _anchor_pos(spec: dict, kind: str) -> tuple[float, float]:
             f"{kind} anchor 'pos' must be a [x, y] pair, got {pos!r}"
         ) from None
     return (x, y)
+
+
+def _waypoint_soft_end(
+    wpt: tuple[float, float],
+    tol_mm: float,
+    obstacles: list[Obstacle],
+    track_width: float,
+    clearance: float,
+) -> tuple[float, float] | None:
+    """Pick a DRC-clean floating endpoint for a soft waypoint anchor.
+
+    The leg endpoint drifts off ``wpt`` to ``wpt`` + a small offset inside
+    the ``tol_mm``-radius tolerance circle, so the per-leg skeleton fillet
+    arcs are no longer pinned onto the waypoint joint and the corner can
+    round.  Candidates walk outward ring by ring (axes first, diagonals
+    after, same order as the via-site search, so the closest clean spot
+    wins) and must keep the track centerline at least ``clearance +
+    track_width / 2`` away from every leg obstacle.  ``None`` when the
+    whole tolerance circle is blocked -- the caller falls back to the
+    exact waypoint anchor (legacy behavior)."""
+    if tol_mm <= 0.0:
+        return None
+    from shapely.geometry import Point
+
+    margin = clearance + track_width / 2.0
+    max_ring = max(1, int(math.ceil(tol_mm / _ANCHOR_SHIFT_STEP_MM)))
+    for ring in range(1, max_ring + 1):
+        off = ring * _ANCHOR_SHIFT_STEP_MM
+        candidates = (
+            [(dx, 0.0) for dx in (-off, off)]
+            + [(0.0, dy) for dy in (-off, off)]
+            + [(dx, dy) for dx in (-off, off) for dy in (-off, off)]
+        )
+        for dx, dy in candidates:
+            if math.hypot(dx, dy) > tol_mm + 1e-9:
+                continue  # keep every endpoint strictly inside the circle
+            cand = (wpt[0] + dx, wpt[1] + dy)
+            pt = Point(cand)
+            if all(float(o.shape.distance(pt)) >= margin for o in obstacles):
+                return cand
+    return None
+
+
+def _fit_circle(pts: list[tuple[float, float]]) -> tuple[float, float, float] | None:
+    """Least-squares (Kasa) circle fit over ``pts``.
+
+    Returns ``(cx, cy, r)`` of the best-fit circle.  Points that lie
+    exactly on one circle recover its exact center and radius up to
+    floating-point noise; fewer than 3 points, collinear runs, and
+    coincident points return ``None`` (no circle is defined).
+    """
+    n = len(pts)
+    if n < 3:
+        return None
+    nf = float(n)
+    sx = sy = sxx = syy = sxy = 0.0
+    for x, y in pts:
+        sx += x
+        sy += y
+        sxx += x * x
+        syy += y * y
+        sxy += x * y
+    mx, my = sx / nf, sy / nf
+    suu = sxx - 2.0 * mx * sx + nf * mx * mx
+    svv = syy - 2.0 * my * sy + nf * my * my
+    suv = sxy - mx * sy - my * sx + nf * mx * my
+    det = suu * svv - suv * suv
+    if abs(det) < 1e-12:
+        return None
+    suuu = suuv = suvv2 = svvv = 0.0
+    for x, y in pts:
+        u = x - mx
+        v = y - my
+        u2 = u * u
+        v2 = v * v
+        suuu += u * u2
+        suuv += u2 * v
+        suvv2 += u * v2
+        svvv += v * v2
+    b = (suuu + suvv2) / 2.0
+    c = (svvv + suuv) / 2.0
+    cxc = mx + (b * svv - suv * c) / det
+    cyc = my + (suu * c - suv * b) / det
+    r = sum(math.hypot(x - cxc, y - cyc) for x, y in pts) / nf
+    if r < 1e-9:
+        return None
+    return cxc, cyc, r
+
+
+def _chain_cocircular_arc(
+    chain_pts: list[tuple[float, float]],
+    tol_mm: float,
+) -> tuple[
+    tuple[float, float],
+    tuple[float, float],
+    tuple[float, float],
+    tuple[float, float, float, float, float],
+] | None:
+    """Covering 3-point arc for a cocircular waypoint chain.
+
+    ``chain_pts`` is the anchor chain in route order (start pad anchor,
+    waypoints, end pad anchor).  Fits a least-squares circle and, when
+    every anchor is within ``tol_mm`` of it and the start->end sweep
+    through the chain's middle anchor contains every interior anchor,
+    returns ``(arc_start, arc_mid, arc_end, (cx, cy, r, a0, span))``:
+    ``arc_start``/``arc_end`` are the on-circle lead-out anchors (radial
+    projections of the endpoint pad anchors), ``arc_mid`` the chain's
+    middle anchor, and ``span`` the signed angular sweep from ``a0`` that
+    the emitted arc covers (the direction chosen so it passes through
+    ``arc_mid``, matching the renderer's start/mid/end convention).
+    Returns ``None`` for degenerate or non-cocircular chains -- the
+    caller falls back to the per-leg polygon path untouched.
+    """
+    if len(chain_pts) < 4:
+        # Fewer than 4 anchors always fit some circle; not a meaningful
+        # cocircularity signal.
+        return None
+    fitted = _fit_circle(chain_pts)
+    if fitted is None:
+        return None
+    cxc, cyc, rad = fitted
+    for x, y in chain_pts:
+        if abs(math.hypot(x - cxc, y - cyc) - rad) > tol_mm + 1e-9:
+            return None
+    tau = 2.0 * math.pi
+    start_pt, end_pt = chain_pts[0], chain_pts[-1]
+    mid_pt = chain_pts[len(chain_pts) // 2]  # middle anchor: on the circle
+    a0 = math.atan2(start_pt[1] - cyc, start_pt[0] - cxc)
+    am = math.atan2(mid_pt[1] - cyc, mid_pt[0] - cxc)
+    a1 = math.atan2(end_pt[1] - cyc, end_pt[0] - cxc)
+    span = (a1 - a0) % tau
+    mid_off = (am - a0) % tau
+    if abs(span) < 1e-9:
+        return None  # endpoints on the same ray: no arc direction
+    if mid_off > span:
+        span -= tau  # sweep the other way so the arc passes through mid
+    # Endpoint anchors are the arc endpoints by construction (their
+    # radial projections sit at a0/a1); every interior anchor must lie
+    # inside the sweep or the arc would not cover the whole chain.
+    for x, y in chain_pts[1:-1]:
+        off = (math.atan2(y - cyc, x - cxc) - a0) % tau
+        if span >= 0.0:
+            if off > span + 1e-9:
+                return None  # an anchor sits outside the sweep: invalid arc
+        elif off < tau + span - 1e-9:
+            return None
+    arc_start = (cxc + rad * math.cos(a0), cyc + rad * math.sin(a0))
+    arc_end = (cxc + rad * math.cos(a1), cyc + rad * math.sin(a1))
+    return arc_start, mid_pt, arc_end, (cxc, cyc, rad, a0, span)
 
 
 def _auto_via_target(
