@@ -2035,6 +2035,44 @@ def test_waypoints_unknown_kind_raises(tmp_path: Path) -> None:
         )
 
 
+def test_waypoints_same_layer_legs_emit_each_segment_once(tmp_path: Path) -> None:
+    """finalize_legs must consume each layer's postprocess output once.
+
+    A single-layer rounded90 waypoint chain (one skeleton-direct leg plus
+    several waypoint legs on the same layer) used to extend the *whole*
+    layer's postprocess segments once per non-direct leg: every segment
+    came out N copies of the full chain (regression: 160 segs / 53 unique
+    on this layout, max 4 copies).  No (x1,y1,x2,y2,width,layer,net)
+    fingerprint may repeat — there is exactly one track geometry emitted.
+    """
+    result = _route_clear(
+        {
+            "algorithm": "pns",
+            "corner_mode": "rounded90",
+            "waypoints": [
+                {"kind": "waypoint", "pos": (40.0, 31.0), "tol_mm": 1.0},
+                {"kind": "waypoint", "pos": (50.0, 33.0), "tol_mm": 1.0},
+                {"kind": "waypoint", "pos": (55.0, 36.0), "tol_mm": 1.0},
+            ],
+        },
+        tmp_path,
+    )
+    assert result.waypoint_violated is False
+    assert result.end == pytest.approx((60.0, 39.5), abs=1e-3)
+    assert all(s.layer == "F.Cu" for s in result.segments)
+    # The chain is non-trivial: several legs of bent geometry, not an
+    # empty/point-to-point shortcut that would trivially pass.
+    assert len(result.segments) >= 10
+    fingerprints = [
+        (s.x1, s.y1, s.x2, s.y2, s.width, s.layer, s.net)
+        for s in result.segments
+    ]
+    assert len(fingerprints) == len(set(fingerprints)), (
+        "same-layer waypoint chain emitted duplicate segments: "
+        f"{len(fingerprints)} segs, {len(set(fingerprints))} unique"
+    )
+
+
 # ---------------------------------------------------------------------------
 # W3 — PNS candidates (multi-variant routes) + A* failure evidence
 # ---------------------------------------------------------------------------
