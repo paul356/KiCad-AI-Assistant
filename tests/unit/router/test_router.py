@@ -2060,9 +2060,13 @@ def test_waypoints_same_layer_legs_emit_each_segment_once(tmp_path: Path) -> Non
     assert result.waypoint_violated is False
     assert result.end == pytest.approx((60.0, 39.5), abs=1e-3)
     assert all(s.layer == "F.Cu" for s in result.segments)
-    # The chain is non-trivial: several legs of bent geometry, not an
-    # empty/point-to-point shortcut that would trivially pass.
-    assert len(result.segments) >= 10
+    # The chain is non-trivial: four rounded90 legs of bent geometry (each
+    # a straight leg + fillet arc), not an empty/point-to-point shortcut
+    # that would trivially pass.  The soft anchor keeps the skeleton alive
+    # so every leg emits a real arc; the old >=10-segment proxy counted
+    # the mitered polygon samples the joint-pinning bug produced instead.
+    assert len(result.arcs) >= 3
+    assert len(result.segments) >= 4
     fingerprints = [
         (s.x1, s.y1, s.x2, s.y2, s.width, s.layer, s.net)
         for s in result.segments
@@ -2070,6 +2074,501 @@ def test_waypoints_same_layer_legs_emit_each_segment_once(tmp_path: Path) -> Non
     assert len(fingerprints) == len(set(fingerprints)), (
         "same-layer waypoint chain emitted duplicate segments: "
         f"{len(fingerprints)} segs, {len(set(fingerprints))} unique"
+    )
+
+
+def test_waypoints_tol_mm_floats_joint_inside_circle(tmp_path: Path) -> None:
+    """tol_mm > 0 soft-anchors a waypoint: the leg joint that targets the
+    waypoint sits strictly inside the tolerance circle (not pinned onto
+    pos) and the route still reaches the far pad, violation-free."""
+    result = _route_clear(
+        {
+            "algorithm": "pns",
+            "corner_mode": "rounded90",
+            "waypoints": [{"kind": "waypoint", "pos": (45.0, 30.0), "tol_mm": 2.0}],
+        },
+        tmp_path,
+    )
+    assert result.waypoint_violated is False
+    assert result.violated_waypoints == []
+    assert result.end == pytest.approx((60.0, 39.5), abs=1e-3)
+    verts = [pt for s in result.segments for pt in ((s.x1, s.y1), (s.x2, s.y2))]
+    verts += [pt for a in result.arcs for pt in (a.start, a.mid, a.end)]
+    dists = [math.hypot(x - 45.0, y - 30.0) for x, y in verts]
+    d = min(dists)
+    assert d > 1e-6, "soft anchor must float off the exact waypoint pos"
+    assert d <= 2.0 + 1e-6, "joint must stay inside the tol_mm circle"
+
+
+def test_waypoints_soft_anchor_rounds_joints_with_arcs(tmp_path: Path) -> None:
+    """A large tol_mm keeps every waypoint leg's skeleton fillet alive:
+    each joint carries a real OutputArc ending inside the packet's
+    tolerance circle instead of being pinned onto the waypoint (which
+    suppressed every leg pre-fix: only the pad-terminated leg emitted an
+    arc and the chain rendered as a mitered polygon)."""
+    result = _route_clear(
+        {
+            "algorithm": "pns",
+            "corner_mode": "rounded90",
+            "waypoints": [
+                {"kind": "waypoint", "pos": (40.0, 31.0), "tol_mm": 1.5},
+                {"kind": "waypoint", "pos": (50.0, 33.0), "tol_mm": 1.5},
+                {"kind": "waypoint", "pos": (55.0, 36.0), "tol_mm": 1.5},
+            ],
+        },
+        tmp_path,
+    )
+    assert result.waypoint_violated is False
+    # Three waypoints split the route into four legs; each rounded90 leg
+    # emits its fillet arc (the pre-fix joint-pinning emitted exactly one).
+    assert len(result.arcs) >= 4
+    for wpt in ((40.0, 31.0), (50.0, 33.0), (55.0, 36.0)):
+        dists = [math.hypot(x - wpt[0], y - wpt[1]) for x, y in (a.end for a in result.arcs)]
+        d = min(dists)
+        assert d > 1e-6, f"arc must not be pinned onto joint {wpt}"
+        assert d <= 1.5 + 1e-6, f"arc must cover joint {wpt} inside tol_mm"
+
+
+def test_waypoints_without_tol_keep_exact_anchor(tmp_path: Path) -> None:
+    """Omitting tol_mm (or passing 0) keeps the legacy exact-anchor
+    behavior: the chain passes exactly through every waypoint and the
+    waypoint joints stay un-filleted (sharp-corner semantics unchanged)."""
+    from shapely.geometry import LineString, Point
+
+    for wpt_extra in ({}, {"tol_mm": 0.0}):
+        result = _route_clear(
+            {
+                "algorithm": "pns",
+                "corner_mode": "rounded90",
+                "waypoints": [
+                    {"kind": "waypoint", "pos": (40.0, 31.0), **wpt_extra},
+                    {"kind": "waypoint", "pos": (50.0, 33.0), **wpt_extra},
+                    {"kind": "waypoint", "pos": (55.0, 36.0), **wpt_extra},
+                ],
+            },
+            tmp_path,
+        )
+        assert result.waypoint_violated is False
+        # Every waypoint-pinned leg degrades to mitered/straight: only the
+        # pad-terminated final leg keeps its arc (pre-fix output shape).
+        assert len(result.arcs) == 1
+        segs = [LineString([(s.x1, s.y1), (s.x2, s.y2)]) for s in result.segments]
+        for wpt in ((40.0, 31.0), (50.0, 33.0), (55.0, 36.0)):
+            assert min(ln.distance(Point(*wpt)) for ln in segs) <= 1e-6, (
+                f"exact anchor must pass through {wpt}"
+            )
+
+
+def test_waypoints_tol_circle_blocked_falls_back_exact(tmp_path: Path) -> None:
+    """A waypoint whose tolerance circle is fully covered by foreign copper
+    fits no DRC-clean floating endpoint: the router falls back to the
+    exact anchor and routes byte-identically to the omitted-tol control
+    (the leg walkaround ends at the pad hull -- the same pre-existing
+    behavior, the waypoint is just passed through / continued)."""
+    pcb_path = Path(_make_clear_board(tmp_path))
+    text = pcb_path.read_text()
+    text = text.replace('\t(net 1 "VCC")\n', '\t(net 1 "VCC")\n\t(net 2 "GND")\n')
+    text = (
+        text.rstrip()[:-1]
+        + '\n\t(footprint "user_add:blocker"\n'
+        '\t\t(layer "F.Cu")\n'
+        "\t\t(at 45.0 30.0 0.0)\n"
+        '\t\t(property "Reference" "X1")\n'
+        '\t\t(pad "1" smd rect\n'
+        "\t\t\t(at 0.0 0.0)\n"
+        "\t\t\t(size 6.0 6.0)\n"
+        '\t\t\t(layers "F.Cu" "F.Mask")\n'
+        '\t\t\t(net 2 "GND")\n'
+        "\t\t)\n"
+        "\t)\n"
+        ")\n"
+    )
+    pcb_path.write_text(text)
+    base = {
+        "pcb_path": str(pcb_path),
+        "algorithm": "pns",
+        "corner_mode": "mitered45",
+    }
+    hard = _route_clear(
+        {**base, "waypoints": [{"kind": "waypoint", "pos": (45.0, 30.0), "tol_mm": 1.0}]},
+        tmp_path,
+    )
+    exact = _route_clear(
+        {**base, "waypoints": [{"kind": "waypoint", "pos": (45.0, 30.0)}]},
+        tmp_path,
+    )
+    assert hard.waypoint_violated == exact.waypoint_violated
+    assert hard.violated_waypoints == exact.violated_waypoints
+    assert hard.end == pytest.approx(exact.end, abs=1e-3)
+
+    def seg_fp(r) -> tuple:
+        return tuple(
+            sorted(
+                (round(s.x1, 6), round(s.y1, 6), round(s.x2, 6), round(s.y2, 6))
+                for s in r.segments
+            )
+        )
+
+    assert seg_fp(hard) == seg_fp(exact), "blocked tolerance circle must not drift: fall back to the exact anchor"
+
+
+# ---------------------------------------------------------------------------
+# W3b — cocircular waypoint chains emit one covering arc
+# ---------------------------------------------------------------------------
+_RING_CX, _RING_CY, _RING_R = 45.0, 35.0, 25.0
+
+
+def _ring_point(
+    theta_deg: float,
+    cx: float = _RING_CX,
+    cy: float = _RING_CY,
+    r: float = _RING_R,
+) -> tuple[float, float]:
+    """A point on the r=25 test ring centered at (45,35)."""
+    a = math.radians(theta_deg)
+    return (cx + r * math.cos(a), cy + r * math.sin(a))
+
+
+def _make_ring_board(
+    tmp_path: Path,
+    blocker: tuple[float, float] | None = None,
+    same_net_pad: tuple[float, float] | None = None,
+) -> str:
+    """Single-layer clear board with both pads centered exactly ON the
+    r=25 ring, so a cocircular chain's anchors (pads + waypoints) all fit
+    one circle.  ``blocker`` drops a 2x2 foreign-net pad onto the ring
+    sweep to veto the covering arc; ``same_net_pad`` drops a 2x2 pad on
+    the routed net (VCC) onto the ring sweep -- a connection target of
+    the single continuous arc, not an obstacle."""
+    blk = ""
+    if blocker is not None:
+        bx, by = blocker
+        blk = (
+            '\t(footprint "user_add:blocker"\n\t\t(layer "F.Cu")\n'
+            f"\t\t(at {bx} {by} 0.0)\n"
+            '\t\t(property "Reference" "X1")\n'
+            '\t\t(pad "1" smd rect\n\t\t\t(at 0.0 0.0)\n'
+            "\t\t\t(size 2.0 2.0)\n"
+            '\t\t\t(layers "F.Cu" "F.Mask")\n'
+            '\t\t\t(net 2 "GND")\n\t\t)\n\t)\n'
+        )
+    sn = ""
+    if same_net_pad is not None:
+        sx, sy = same_net_pad
+        sn = (
+            '\t(footprint "user_add:same_net"\n\t\t(layer "F.Cu")\n'
+            f"\t\t(at {sx} {sy} 0.0)\n"
+            '\t\t(property "Reference" "X2")\n'
+            '\t\t(pad "1" smd rect\n\t\t\t(at 0.0 0.0)\n'
+            "\t\t\t(size 2.0 2.0)\n"
+            '\t\t\t(layers "F.Cu" "F.Mask")\n'
+            '\t\t\t(net 1 "VCC")\n\t\t)\n\t)\n'
+        )
+    pcb = f"""(kicad_pcb
+\t(version 20260206)
+\t(generator "test")
+\t(layers
+\t\t(0 "F.Cu" signal)
+\t\t(44 "Edge.Cuts" user)
+\t)
+\t(net 0 "")
+\t(net 1 "VCC")
+\t(net 2 "GND")
+\t(footprint "R"
+\t\t(layer "F.Cu")
+\t\t(at 20.5 35.0 0.0)
+\t\t(property "Reference" "R1")
+\t\t(pad "1" smd rect
+\t\t\t(at -0.5 0.0)
+\t\t\t(size 0.5 0.5)
+\t\t\t(layers "F.Cu" "F.Mask")
+\t\t\t(net 1 "VCC")
+\t\t)
+\t)
+\t(footprint "C"
+\t\t(layer "F.Cu")
+\t\t(at 70.0 35.5 0.0)
+\t\t(property "Reference" "C1")
+\t\t(pad "1" smd rect
+\t\t\t(at 0.0 -0.5)
+\t\t\t(size 0.5 0.5)
+\t\t\t(layers "F.Cu" "F.Mask")
+\t\t\t(net 1 "VCC")
+\t\t)
+\t)
+\t(gr_rect
+\t\t(start 10.0 5.0)
+\t\t(end 80.0 65.0)
+\t\t(stroke (width 0.1) (type solid))
+\t\t(fill none)
+\t\t(layer "Edge.Cuts")
+\t)
+{blk}{sn})
+"""
+    pcb_path = tmp_path / "ring_board.kicad_pcb"
+    pcb_path.write_text(pcb)
+    return str(pcb_path)
+
+
+RING_WAYPOINT_ANGLES = (157.5, 135.0, 112.5, 90.0, 67.5, 45.0, 22.5)
+
+
+def _route_ring(
+    waypoints: list[dict],
+    tmp_path: Path,
+    blocker: tuple[float, float] | None = None,
+    same_net_pad: tuple[float, float] | None = None,
+):
+    """Route the ring board's R1/1 -> C1/1 pads through ``waypoints``
+    (rounded90 PNS, 0.2 mm width/clearance); ``blocker`` and
+    ``same_net_pad`` carry through to the fixture builder."""
+    from kcaa.router.router import RouteRequest, auto_route_pair
+
+    return auto_route_pair(
+        RouteRequest(
+            pcb_path=_make_ring_board(
+                tmp_path, blocker=blocker, same_net_pad=same_net_pad
+            ),
+            ref_a="R1",
+            pad_a="1",
+            ref_b="C1",
+            pad_b="1",
+            net="VCC",
+            width=0.2,
+            clearance=0.2,
+            via_pairs=(),
+            corner_mode="rounded90",
+            algorithm="pns",
+            waypoints=waypoints,
+        )
+    )
+
+
+def _arc_circumcenter(
+    start: tuple[float, float],
+    mid: tuple[float, float],
+    end: tuple[float, float],
+) -> tuple[float, float]:
+    """Circumcenter of a KiCad 3-point arc (shared with the renderer)."""
+    x1, y1 = start
+    x2, y2 = mid
+    x3, y3 = end
+    d = 2.0 * (x1 * (y2 - y3) + x2 * (y3 - y1) + x3 * (y1 - y2))
+    ux = (
+        (x1 * x1 + y1 * y1) * (y2 - y3)
+        + (x2 * x2 + y2 * y2) * (y3 - y1)
+        + (x3 * x3 + y3 * y3) * (y1 - y2)
+    ) / d
+    uy = (
+        (x1 * x1 + y1 * y1) * (x3 - x2)
+        + (x2 * x2 + y2 * y2) * (x1 - x3)
+        + (x3 * x3 + y3 * y3) * (x2 - x1)
+    ) / d
+    return ux, uy
+
+
+def _arc_signed_sweep(
+    start: tuple[float, float],
+    mid: tuple[float, float],
+    end: tuple[float, float],
+) -> float:
+    """Signed sweep of a 3-point arc, choosing the direction that passes
+    through mid (the renderer's convention); radians."""
+    cx, cy = _arc_circumcenter(start, mid, end)
+    tau = 2.0 * math.pi
+    a0 = math.atan2(start[1] - cy, start[0] - cx)
+    am = math.atan2(mid[1] - cy, mid[0] - cx)
+    a1 = math.atan2(end[1] - cy, end[0] - cx)
+    span = (a1 - a0) % tau
+    if ((am - a0) % tau) > span:
+        span -= tau
+    return span
+
+
+def _interior_angle(
+    p0: tuple[float, float],
+    p1: tuple[float, float],
+    p2: tuple[float, float],
+) -> float:
+    """Angle at ``p1`` between two polyline edges, in degrees."""
+    v1 = (p0[0] - p1[0], p0[1] - p1[1])
+    v2 = (p2[0] - p1[0], p2[1] - p1[1])
+    dot = v1[0] * v2[0] + v1[1] * v2[1]
+    n1 = math.hypot(v1[0], v1[1])
+    n2 = math.hypot(v2[0], v2[1])
+    cosv = max(-1.0, min(1.0, dot / (n1 * n2)))
+    return math.degrees(math.acos(cosv))
+
+
+def _route_polyline_with_arcs(result, n: int = 64) -> list[tuple[float, float]]:
+    """Recompose the emitted geometry (segments + sampled 3-point arcs)
+    into one polyline in route order, like the router's success render."""
+    pts: list[tuple[float, float]] = []
+    for s in result.segments:
+        if not pts:
+            pts.append((s.x1, s.y1))
+        pts.append((s.x2, s.y2))
+    if not pts and result.arcs:
+        pts.append(result.arcs[0].start)
+    attached = set()
+    changed = True
+    while changed:
+        changed = False
+        for i, a in enumerate(result.arcs):
+            if i in attached:
+                continue
+            if pts and math.hypot(a.start[0] - pts[-1][0], a.start[1] - pts[-1][1]) <= 1e-3:
+                cx, cy = _arc_circumcenter(a.start, a.mid, a.end)
+                rad = math.hypot(a.start[0] - cx, a.start[1] - cy)
+                span = _arc_signed_sweep(a.start, a.mid, a.end)
+                a0 = math.atan2(a.start[1] - cy, a.start[0] - cx)
+                for k in range(1, n + 1):
+                    ang = a0 + span * k / n
+                    pts.append((cx + rad * math.cos(ang), cy + rad * math.sin(ang)))
+                attached.add(i)
+                changed = True
+                break
+    for i, a in enumerate(result.arcs):
+        if i not in attached:
+            pts.append(a.start)
+            pts.append(a.mid)
+            pts.append(a.end)
+    return pts
+
+
+def _covering_arcs(result, on_radius: float = _RING_R) -> list:
+    """Emitted arcs whose start/mid/end all sit on the r=25 ring circle."""
+    out = []
+    for a in result.arcs:
+        if all(
+            abs(math.hypot(p[0] - _RING_CX, p[1] - _RING_CY) - on_radius) < 0.1
+            for p in (a.start, a.mid, a.end)
+        ):
+            out.append(a)
+    return out
+
+
+def test_waypoints_cocircular_chain_emits_covering_arc(tmp_path: Path) -> None:
+    """A soft-anchored chain whose anchors all lie on one circle (pads +
+    7 waypoints on the r=25 ring) emits a single 3-point OutputArc
+    covering the whole chain: start/mid/end sit on the fitted circle,
+    the sweep covers the chain, and the leg renders with no sharp corner
+    (the per-leg chord + fillet skeleton would kink at every waypoint)."""
+    anchors = [_ring_point(a) for a in RING_WAYPOINT_ANGLES]
+    waypoints = [
+        {"kind": "waypoint", "pos": list(pt), "tol_mm": 2.0} for pt in anchors
+    ]
+    result = _route_ring(waypoints, tmp_path)
+    assert result.waypoint_violated is False
+    assert result.violated_waypoints == []
+    assert result.end == pytest.approx((70.0, 35.0), abs=1e-3)
+    assert result.layers_used == ["F.Cu"]
+    assert len(result.arcs) >= 1, "cocircular chain must emit an arc"
+    cover = _covering_arcs(result)
+    assert len(cover) == 1, f"expected exactly one covering arc, got {len(cover)}"
+    a = cover[0]
+    assert a.width == 0.2 and a.layer == "F.Cu" and a.net == "VCC"
+    # The arc's sweep covers >= 80% of the chain's own angular span.
+    chain_span = abs(_arc_signed_sweep((20.0, 35.0), anchors[len(anchors) // 2], (70.0, 35.0)))
+    arc_span = abs(_arc_signed_sweep(a.start, a.mid, a.end))
+    assert arc_span >= 0.8 * chain_span - 1e-6, (
+        f"covering arc sweep {math.degrees(arc_span):.1f} deg < 80% of "
+        f"chain span {math.degrees(chain_span):.1f} deg"
+    )
+    # No sharp corner anywhere on the arc leg: consecutive polyline
+    # vertices (arc sampling) never form an angle below 170 deg.
+    pts = _route_polyline_with_arcs(result)
+    for p0, p1, p2 in zip(pts, pts[1:], pts[2:]):
+        ang = _interior_angle(p0, p1, p2)
+        assert ang >= 170.0 - 1e-6, f"arc leg has a sharp corner of {ang:.1f} deg at {p1}"
+
+
+def test_waypoints_non_cocircular_falls_back_to_polyline(tmp_path: Path) -> None:
+    """A chain that only approximates a circle (middle waypoint pushed
+    3 mm off the ring, beyond the 2.0 mm cocircularity tolerance) must
+    not emit the covering arc: the per-leg skeleton + fillet output takes
+    over unchanged and the route still reaches the far pad."""
+    anchors = [_ring_point(a) for a in RING_WAYPOINT_ANGLES]
+    waypoints = [{"kind": "waypoint", "pos": list(a), "tol_mm": 2.0} for a in anchors]
+    x, y = anchors[len(anchors) // 2]
+    dx, dy = x - _RING_CX, y - _RING_CY
+    norm = math.hypot(dx, dy)
+    waypoints[len(anchors) // 2]["pos"] = [x + 3.0 * dx / norm, y + 3.0 * dy / norm]
+    result = _route_ring(waypoints, tmp_path)
+    assert result.waypoint_violated is False
+    assert result.end == pytest.approx((70.0, 35.0), abs=1e-3)
+    assert len(result.segments) > 0, "fallback must route the per-leg polyline"
+    assert len(result.arcs) >= 1, "fallback keeps the per-leg fillet arcs"
+    # No emitted arc lies on the ring circle AND covers >= 80% of the
+    # chain span: the whole-chain arc must never fire off-circle.
+    for a in _covering_arcs(result):
+        span = abs(_arc_signed_sweep(a.start, a.mid, a.end))
+        assert span < 0.8 * math.pi - 1e-6, (
+            "non-cocircular chain must not emit a covering arc"
+        )
+
+
+def test_waypoints_cocircular_arc_blocked_falls_back(tmp_path: Path) -> None:
+    """A foreign-net pad sitting on the arc sweep vetoes the covering arc
+    (the arc centerline must keep clearance + width/2); the router falls
+    back to the per-leg path with no DRC conflict."""
+    waypoints = [
+        {"kind": "waypoint", "pos": list(_ring_point(a)), "tol_mm": 2.0}
+        for a in RING_WAYPOINT_ANGLES
+    ]
+    bx, by = _ring_point(112.5)  # on the ring sweep
+    result = _route_ring(waypoints, tmp_path, blocker=(bx, by))
+    assert result.waypoint_violated is False
+    assert result.violated_waypoints == []
+    assert result.end == pytest.approx((70.0, 35.0), abs=1e-3)
+    assert len(result.segments) > 0
+    for a in _covering_arcs(result):
+        span = abs(_arc_signed_sweep(a.start, a.mid, a.end))
+        assert span < 0.8 * math.pi - 1e-6, "blocked covering arc must fall back"
+    # Every emitted segment clears the blocker by >= clearance (the
+    # existing DRC convention for routed output).
+    from shapely.geometry import LineString
+
+    blocker = _rounded_square((bx, by), 2.0)
+    for s in result.segments:
+        line = LineString([(s.x1, s.y1), (s.x2, s.y2)])
+        assert line.distance(blocker) >= 0.2 - 0.01
+
+
+def test_waypoints_cocircular_chain_crossing_same_net_pad_still_emits_arc(
+    tmp_path: Path,
+) -> None:
+    """A same-net pad sitting exactly on the arc sweep (dead-on the fitted
+    circle, dist 0) does NOT veto the covering arc: the cocircular chain
+    is one continuous track and the same-net pad is its connection target,
+    not an obstacle (KiCad DRC never space-checks same-net copper).  This
+    is the full-moon failure mode -- every ring pad (same net) lies on the
+    sweep, so the arc must still emit with zero violations, unlike the
+    foreign-net blocker case."""
+    waypoints = [
+        {"kind": "waypoint", "pos": list(_ring_point(a)), "tol_mm": 2.0}
+        for a in RING_WAYPOINT_ANGLES
+    ]
+    sx, sy = _ring_point(112.5)  # same-net pad dead-on the ring sweep
+    result = _route_ring(waypoints, tmp_path, same_net_pad=(sx, sy))
+    assert result.waypoint_violated is False
+    assert result.violated_waypoints == []
+    assert result.end == pytest.approx((70.0, 35.0), abs=1e-3)
+    cover = _covering_arcs(result)
+    assert len(cover) == 1, (
+        "same-net pad on the sweep must not veto the covering arc "
+        f"(got {len(cover)} covering arcs)"
+    )
+    a = cover[0]
+    # The arc still covers >= 80% of the chain's angular span: the whole
+    # leg emits as one arc, same as the clear-board case.
+    chain_span = abs(
+        _arc_signed_sweep((20.0, 35.0), _ring_point(90.0), (70.0, 35.0))
+    )
+    arc_span = abs(_arc_signed_sweep(a.start, a.mid, a.end))
+    assert arc_span >= 0.8 * chain_span - 1e-6, (
+        f"covering arc sweep {math.degrees(arc_span):.1f} deg < 80% of "
+        f"chain span {math.degrees(chain_span):.1f} deg"
     )
 
 
