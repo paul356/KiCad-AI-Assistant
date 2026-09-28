@@ -178,7 +178,9 @@ class RouteRequest:
             spot inside the ``tol_mm``-radius circle around ``pos`` (soft
             anchor), so the per-leg fillet arcs are no longer pinned onto
             the waypoint joint and the corner renders rounded; omitting
-            ``tol_mm`` (or 0) keeps the legacy exact-anchor behavior.
+            ``tol_mm`` (or 0) keeps the exact anchor -- the chain is
+            pinned through the waypoint and the whole-chain tangent
+            fillet rounds the joint in place (rounded corner modes).
             Unreachable waypoints are recorded in
             ``RouteResult.violated_waypoints`` and skipped, the route
             continues; ``"via"`` (``pos``, ``to_layer``) switches the leg
@@ -861,8 +863,12 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
         direct_segs: list[list[OutputSegment] | None] = []
         direct_arcs: list[list[OutputArc] | None] = []
         leg_layers: list[str] = []
-        # Arc joints: a rounded fillet never ends on a via/waypoint joint.
+        # Arc joints: a rounded skeleton fillet never ends on a via/waypoint
+        # joint (the joint is rounded afterwards by the chain tangent fillet,
+        # which needs clean segment/segment joins).  Via anchors additionally
+        # stay straight-through (KiCad behavior): never filleted.
         via_anchors: set[tuple[float, float]] = set()
+        fillet_excluded: set[tuple[float, float]] = set()
 
         def run_leg(
             start_pt: tuple[float, float],
@@ -1062,6 +1068,226 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
             end_xy = (all_nodes[-1].x, all_nodes[-1].y)
             layers_used = _layers_used(all_nodes)
 
+        def apply_chain_fillets() -> None:
+            """Round the FINAL waypoint-chain output into a G1 chain
+            ("straight segment -> tangent arc -> straight ...") in the
+            rounded corner modes.
+
+            Every interior corner formed by two straight segments on the
+            same layer -- waypoint joints and residual postprocess
+            corners -- gets a tangent fillet arc whose endpoints sit
+            exactly on the two edges.  Corners already carrying a per-leg
+            skeleton arc are left alone (no double rounding), via joints
+            stay straight-through, and each fillet is DRC-checked against
+            the layer obstacles: the radius halves until the sampled arc
+            centerline keeps ``clearance + width/2`` from every obstacle,
+            and below the minimum radius the corner keeps its original
+            sharp geometry instead of risking a DRC conflict."""
+            nonlocal segs, arcs_out
+            if corner_mode not in (CornerMode.ROUNDED_45, CornerMode.ROUNDED_90):
+                return
+            if len(segs) < 2:
+                return
+            obstacles_cache: dict[str, list] = {}
+
+            def layer_obstacles(layer: str) -> list:
+                if layer not in obstacles_cache:
+                    obstacles_cache[layer] = _layer_engine_obstacles(
+                        model,
+                        data,
+                        req,
+                        start_layer,
+                        end_layer,
+                        layer,
+                        pad_a_xy,
+                        pad_b_xy,
+                    )
+                return obstacles_cache[layer]
+
+            def arc_clear(t1, mid, t2, r, c, layer: str) -> bool:
+                """True when the sampled fillet arc centerline keeps
+                clearance + width/2 from every obstacle on ``layer``."""
+                cx, cy = c
+                tau = 2.0 * math.pi
+                a0 = math.atan2(t1[1] - cy, t1[0] - cx)
+                am = math.atan2(mid[1] - cy, mid[0] - cx)
+                a1 = math.atan2(t2[1] - cy, t2[0] - cx)
+                span = (a1 - a0) % tau
+                if ((am - a0) % tau) > span:
+                    span -= tau
+                pts = [t1]
+                for k in range(1, 32):
+                    ang = a0 + span * k / 32.0
+                    pts.append((cx + r * math.cos(ang), cy + r * math.sin(ang)))
+                pts.append(t2)
+                arc_line = LineString(pts)
+                margin = clearance + width / 2.0
+                return all(
+                    float(o.shape.distance(arc_line)) >= margin - 1e-4
+                    for o in layer_obstacles(layer)
+                )
+
+            out: list[OutputSegment] = []
+            new_arcs: list[OutputArc] = []
+            tol = 1e-6
+            i = 0
+            pending: OutputSegment | None = None
+            while i < len(segs):
+                # ``pending`` is the trimmed tail of a previous fillet: its
+                # end coincides with the next segment's start, so it must be
+                # re-examined against that segment (a postprocessed waypoint
+                # joint produces TWO miter vertices; both need rounding).
+                s1 = pending if pending is not None else segs[i]
+                if pending is not None:
+                    pending = None
+                    s2_idx = i
+                else:
+                    s2_idx = i + 1
+                was_pending = s1 is not segs[i]
+                if s2_idx >= len(segs):
+                    if not was_pending:
+                        out.append(s1)
+                    break
+                s2 = segs[s2_idx]
+                if s1.layer != s2.layer:
+                    if was_pending:
+                        i += 1
+                    else:
+                        out.append(s1)
+                        i += 1
+                    continue
+                s1_pts = ((s1.x1, s1.y1), (s1.x2, s1.y2))
+                s2_pts = ((s2.x1, s2.y1), (s2.x2, s2.y2))
+                shared = [p for p in s1_pts if any(_pt_eq(p, q, tol) for q in s2_pts)]
+                if len(shared) != 1:
+                    # Not a clean segment/segment join (zero, duplicate or
+                    # arc-bridged): leave the corner untouched.
+                    if was_pending:
+                        i += 1
+                    else:
+                        out.append(s1)
+                        i += 1
+                    continue
+                jp = shared[0]
+                if any(_pt_eq(jp, va, tol) for va in fillet_excluded):
+                    # Via joint: straight-through.
+                    if was_pending:
+                        i += 1
+                    else:
+                        out.append(s1)
+                        i += 1
+                    continue
+                if any(
+                    _pt_eq(jp, ap, tol)
+                    for a in arcs_out
+                    for ap in (a.start, a.mid, a.end)
+                ):
+                    # The corner coincides with an already-emitted skeleton
+                    # arc (its endpoint or midpoint): that arc already
+                    # rounds the joint, so rounding again would create a
+                    # double fillet overlapping the emitted curve (e.g. a
+                    # direct leg's collapsed chord re-rounding the corner
+                    # its own skeleton arc already covers).
+                    if was_pending:
+                        i += 1
+                    else:
+                        out.append(s1)
+                        i += 1
+                    continue
+                a_pt = (s1.x2, s1.y2) if _pt_eq((s1.x1, s1.y1), jp, tol) else (s1.x1, s1.y1)
+                b_pt = (s2.x1, s2.y1) if _pt_eq((s2.x2, s2.y2), jp, tol) else (s2.x2, s2.y2)
+                first = _chain_fillet_arc(a_pt, jp, b_pt, _CHAIN_FILLET_RADIUS_MM)
+                if first is None:
+                    if was_pending:
+                        i += 1
+                    else:
+                        out.append(s1)
+                        i += 1
+                    continue
+                # DRC shrink: halve the radius until the arc clears the
+                # layer obstacles; below the minimum radius keep the
+                # sharp corner (never emit a violating arc).
+                accepted = None
+                r_probe = first[3]
+                while r_probe >= _CHAIN_FILLET_MIN_RADIUS_MM - 1e-12:
+                    res = _chain_fillet_arc(a_pt, jp, b_pt, r_probe)
+                    if res is None:
+                        break
+                    _t1, _mid, _t2, _r, _c = res
+                    if arc_clear(_t1, _mid, _t2, _r, _c, s1.layer):
+                        accepted = res
+                        break
+                    r_probe = _r / 2.0
+                if accepted is None:
+                    if was_pending:
+                        i += 1
+                    else:
+                        out.append(s1)
+                        i += 1
+                    continue
+                t1, mid, t2, _r_use, _c_use = accepted
+                if was_pending:
+                    # The pending segment was the previous fillet's
+                    # trimmed tail; the new fillet re-trims it, so the
+                    # stale copy must be replaced by the trim below.
+                    out.pop()
+                if not _pt_eq(a_pt, t1, tol):
+                    out.append(
+                        OutputSegment(
+                            x1=a_pt[0],
+                            y1=a_pt[1],
+                            x2=t1[0],
+                            y2=t1[1],
+                            width=width,
+                            layer=s1.layer,
+                            net=req.net,
+                        )
+                    )
+                new_arcs.append(
+                    OutputArc(
+                        start=t1,
+                        mid=mid,
+                        end=t2,
+                        width=width,
+                        layer=s1.layer,
+                        net=req.net,
+                    )
+                )
+                if not _pt_eq(t2, b_pt, tol):
+                    out.append(
+                        OutputSegment(
+                            x1=t2[0],
+                            y1=t2[1],
+                            x2=b_pt[0],
+                            y2=b_pt[1],
+                            width=width,
+                            layer=s2.layer,
+                            net=req.net,
+                        )
+                    )
+                # Advance past the consumed pair but keep the trimmed tail
+                # (T2->b_pt) as ``pending``: its end meets the next segment
+                # at b_pt and may form another corner that needs rounding.
+                i = s2_idx + 1 if not was_pending else i + 1
+                pending = out[-1] if not _pt_eq(t2, b_pt, tol) else None
+            segs = out
+            # Rebuild arcs_out in path order: existing (per-leg skeleton)
+            # arcs merged with the new fillet arcs, each anchored at the
+            # segment whose end its start point sits on (stable sort keeps
+            # the original relative order of the skeleton arcs).
+            anchored: list[tuple[int, int, OutputArc]] = []
+            for ai, a in enumerate(list(arcs_out) + new_arcs):
+                anchor = None
+                for si, s_ in enumerate(segs):
+                    if _pt_eq((s_.x2, s_.y2), a.start, tol):
+                        anchor = si
+                        break
+                if anchor is None:
+                    anchor = len(segs) + ai
+                anchored.append((anchor, ai, a))
+            anchored.sort(key=lambda t: (t[0], t[1]))
+            arcs_out = [a for _, _, a in anchored]
+
         if req.waypoints:
             # -- Anchor chain (waypoints / via anchors) ----------------
             # Each anchor consumes one leg boundary: waypoints split the
@@ -1206,14 +1432,21 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
                     kind = spec.get("kind")
                     if kind == "waypoint":
                         wpt = _anchor_pos(spec, "waypoint")
-                        via_anchors.add(wpt)  # no fillet may end on the joint
+                        # Keep waypoint joints as clean segment/segment
+                        # joins: a per-leg skeleton fillet may not END on
+                        # the joint (its arc is built without the next
+                        # leg's direction, so a joint-pinned arc would
+                        # kink).  The joint itself is rounded afterwards
+                        # by the chain tangent fillet (apply_chain_fillets).
+                        via_anchors.add(wpt)
                         # Soft anchor: with an explicit tol_mm > 0 the leg
                         # endpoint floats to a DRC-clean spot inside the
                         # tolerance circle around wpt, so the leg's fillet
                         # arcs are no longer pinned onto the joint and the
                         # corner renders rounded.  A blocked circle (or no /
-                        # zero tol_mm) falls back to the exact anchor --
-                        # legacy behavior, incl. the soft stop below.
+                        # zero tol_mm) falls back to the exact anchor:
+                        # the chain is pinned through the waypoint and the
+                        # chain tangent fillet rounds the joint in place.
                         end_pt = wpt
                         if "tol_mm" in spec and float(spec["tol_mm"]) > 0.0:
                             soft = _waypoint_soft_end(
@@ -1289,6 +1522,10 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
                                 msg += f"\nFailure evidence: {png}"
                             raise RouteFailure(msg) from exc
                         via_anchors.add(site)
+                        # A via junction stays a straight-through connection
+                        # (KiCad behavior): never rounded by the chain
+                        # tangent fillet.
+                        fillet_excluded.add(site)
                         via_sites.append(
                             {"pos": [site[0], site[1]], "to_layer": to_layer}
                         )
@@ -1327,6 +1564,10 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
                 )
                 used_chain = list(chain)
                 finalize_legs()
+                # G1 chain tangent fillet on the final output: rounds the
+                # waypoint joints (and any residual leg corners) with
+                # tangent arcs in the rounded corner modes.
+                apply_chain_fillets()
         elif start_layer == end_layer:
             engine_obstacles: list[Obstacle] = [
                 o for o in model.obstacles if start_layer in o.layers
@@ -2550,6 +2791,88 @@ def _chain_cocircular_arc(
     arc_start = (cxc + rad * math.cos(a0), cyc + rad * math.sin(a0))
     arc_end = (cxc + rad * math.cos(a1), cyc + rad * math.sin(a1))
     return arc_start, mid_pt, arc_end, (cxc, cyc, rad, a0, span)
+
+
+# ---------------------------------------------------------------------------
+# Chain tangent fillets (G1): round every interior corner of a waypoint
+# chain with an arc tangent to both adjacent legs
+# ---------------------------------------------------------------------------
+
+# Desired radius (mm) for the G1 chain fillet arcs.  A fillet replaces an
+# interior corner of a waypoint chain by a tangent arc whose endpoints sit
+# on the two legs; the radius is capped by the shorter leg (so the tangent
+# points always stay on the edges) and halves on DRC conflict.
+_CHAIN_FILLET_RADIUS_MM = 1.2
+# Corner angles above this (degrees) count as straight: no fillet.
+_CHAIN_FILLET_STRAIGHT_DEG = 170.0
+# Below this radius (mm) a fillet is refused and the corner keeps its
+# original sharp geometry rather than risking a DRC conflict.
+_CHAIN_FILLET_MIN_RADIUS_MM = 0.01
+
+
+def _chain_fillet_arc(
+    a: tuple[float, float],
+    joint: tuple[float, float],
+    b: tuple[float, float],
+    radius: float,
+) -> tuple[
+    tuple[float, float],
+    tuple[float, float],
+    tuple[float, float],
+    float,
+    tuple[float, float],
+] | None:
+    """Tangent fillet arc for the corner ``a -> joint -> b``.
+
+    Returns ``(arc_start, arc_mid, arc_end, r, center)``: the arc starts
+    and ends exactly on the two legs at distance ``r * cot(theta/2)``
+    from the joint (so it is tangent to both -- G1 continuous with the
+    surrounding straight segments), ``arc_mid`` is the 3-point arc's mid
+    (the circle point nearest the joint), ``r`` the used radius
+    ``min(radius, short-leg cap)`` and ``center`` the curvature center.
+    ``None`` when the corner is (near-)straight, degenerate, or too
+    sharp for the requested radius -- the caller keeps the sharp corner.
+    """
+    la = math.hypot(a[0] - joint[0], a[1] - joint[1])
+    lb = math.hypot(b[0] - joint[0], b[1] - joint[1])
+    if la < 1e-9 or lb < 1e-9:
+        return None
+    ua = ((a[0] - joint[0]) / la, (a[1] - joint[1]) / la)
+    ub = ((b[0] - joint[0]) / lb, (b[1] - joint[1]) / lb)
+    cos_t = max(-1.0, min(1.0, ua[0] * ub[0] + ua[1] * ub[1]))
+    theta = math.acos(cos_t)
+    if math.degrees(theta) > _CHAIN_FILLET_STRAIGHT_DEG:
+        return None  # near-straight: nothing to round
+    half = theta / 2.0
+    if math.sin(half) < 1e-12:
+        return None  # (near-)backtracking: no sane tangent circle
+    # Tangent offset L = r * cot(theta/2) must fit BOTH legs.
+    r_cap = min(la, lb) * math.tan(half) * 0.999
+    r = min(radius, r_cap)
+    if r < _CHAIN_FILLET_MIN_RADIUS_MM:
+        return None  # would round to a sliver: keep the sharp corner
+    l_off = r * math.cos(half) / math.sin(half)
+    t1 = (joint[0] + ua[0] * l_off, joint[1] + ua[1] * l_off)
+    t2 = (joint[0] + ub[0] * l_off, joint[1] + ub[1] * l_off)
+    # Center on the interior bisector, tangent to both legs.
+    bis = (ua[0] + ub[0], ua[1] + ub[1])
+    n = math.hypot(bis[0], bis[1])
+    if n < 1e-12:
+        return None
+    bis = (bis[0] / n, bis[1] / n)
+    dist = r / math.sin(half)
+    c = (joint[0] + bis[0] * dist, joint[1] + bis[1] * dist)
+    # Arc mid: the point on the arc closest to the joint (bisector of the
+    # short arc between the two tangent points, which is the corner-side
+    # arc; the radius vectors are < 180 deg apart, so the sum is nonzero).
+    v1 = (t1[0] - c[0], t1[1] - c[1])
+    v2 = (t2[0] - c[0], t2[1] - c[1])
+    mv = (v1[0] + v2[0], v1[1] + v2[1])
+    mn = math.hypot(mv[0], mv[1])
+    if mn < 1e-12:
+        return None
+    mid = (c[0] + mv[0] * r / mn, c[1] + mv[1] * r / mn)
+    return t1, mid, t2, r, c
 
 
 def _auto_via_target(

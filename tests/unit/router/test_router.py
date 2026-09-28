@@ -2130,11 +2130,11 @@ def test_waypoints_soft_anchor_rounds_joints_with_arcs(tmp_path: Path) -> None:
 
 
 def test_waypoints_without_tol_keep_exact_anchor(tmp_path: Path) -> None:
-    """Omitting tol_mm (or passing 0) keeps the legacy exact-anchor
-    behavior: the chain passes exactly through every waypoint and the
-    waypoint joints stay un-filleted (sharp-corner semantics unchanged)."""
-    from shapely.geometry import LineString, Point
-
+    """Omitting tol_mm (or passing 0) keeps the exact anchor: the chain
+    is pinned through the waypoint joints (no soft float) and the whole-
+    chain tangent fillet rounds every joint in place (the legacy sharp-
+    corner output -- a single pad-terminated arc -- is deliberately
+    gone: waypoint joints are exactly the corners the fillet rounds)."""
     for wpt_extra in ({}, {"tol_mm": 0.0}):
         result = _route_clear(
             {
@@ -2149,13 +2149,15 @@ def test_waypoints_without_tol_keep_exact_anchor(tmp_path: Path) -> None:
             tmp_path,
         )
         assert result.waypoint_violated is False
-        # Every waypoint-pinned leg degrades to mitered/straight: only the
-        # pad-terminated final leg keeps its arc (pre-fix output shape).
-        assert len(result.arcs) == 1
-        segs = [LineString([(s.x1, s.y1), (s.x2, s.y2)]) for s in result.segments]
+        # The pad-terminated final leg arc plus chain fillet arcs at the
+        # waypoint joints (pre-fix output had exactly one arc because
+        # waypoint joints stayed sharp miter corners -- now filleted).
+        assert len(result.arcs) >= 2
+        pts = _route_polyline_sampled(result)
         for wpt in ((40.0, 31.0), (50.0, 33.0), (55.0, 36.0)):
-            assert min(ln.distance(Point(*wpt)) for ln in segs) <= 1e-6, (
-                f"exact anchor must pass through {wpt}"
+            d = min(math.hypot(px - wpt[0], py - wpt[1]) for px, py in pts)
+            assert d <= 1.5 + 1e-6, (
+                f"exact anchor must keep the chain at {wpt}, polyline drifts {d:.2f} mm"
             )
 
 
@@ -2436,6 +2438,38 @@ def _route_polyline_with_arcs(result, n: int = 64) -> list[tuple[float, float]]:
     return pts
 
 
+def _route_polyline_sampled(result, n: int = 64) -> list[tuple[float, float]]:
+    """Recompose the emitted geometry (segments + arcs attached at the
+    running head) sampling every arc at ``n`` points, like the router's
+    own success render.
+
+    Unlike :func:`_route_polyline_with_arcs`, which only attaches an arc
+    when its start matches the running head, every emitted arc is
+    consumed here, so multi-arc chains (whole-chain tangent fillets)
+    resolve to their true centerline.  This is the G1 measurement used
+    by the chain-fillet tests."""
+    pts: list[tuple[float, float]] = []
+    unused = list(result.arcs)
+    for s in result.segments:
+        if not pts:
+            pts.append((s.x1, s.y1))
+        pts.append((s.x2, s.y2))
+        while unused and math.hypot(
+            unused[0].start[0] - pts[-1][0], unused[0].start[1] - pts[-1][1]
+        ) <= 1e-3:
+            a = unused.pop(0)
+            cx, cy = _arc_circumcenter(a.start, a.mid, a.end)
+            rad = math.hypot(a.start[0] - cx, a.start[1] - cy)
+            span = _arc_signed_sweep(a.start, a.mid, a.end)
+            a0 = math.atan2(a.start[1] - cy, a.start[0] - cx)
+            for k in range(1, n + 1):
+                ang = a0 + span * k / n
+                pts.append((cx + rad * math.cos(ang), cy + rad * math.sin(ang)))
+    for a in unused:  # headless arcs (defensive): append their anchors
+        pts.extend((a.start, a.mid, a.end))
+    return pts
+
+
 def _covering_arcs(result, on_radius: float = _RING_R) -> list:
     """Emitted arcs whose start/mid/end all sit on the r=25 ring circle."""
     out = []
@@ -2573,6 +2607,143 @@ def test_waypoints_cocircular_chain_crossing_same_net_pad_still_emits_arc(
 
 
 # ---------------------------------------------------------------------------
+# W3c — whole-chain tangent fillet (general waypoint chains)
+# ---------------------------------------------------------------------------
+
+
+def test_waypoints_chain_tangent_fillet_rounds_joints(tmp_path: Path) -> None:
+    """Non-cocircular waypoint chains get the whole-chain tangent fillet
+    in the rounded corner modes: an exact-anchor axis-aligned zigzag has
+    every interior joint rounded by tangent arcs, so the sampled
+    recomposed centerline contains no corner sharper than 170 deg (G1);
+    the mitered corner modes keep the same chain sharp."""
+    waypoints = [
+        {"kind": "waypoint", "pos": (45.0, 30.0)},
+        {"kind": "waypoint", "pos": (45.0, 42.0)},
+        {"kind": "waypoint", "pos": (60.0, 42.0)},
+    ]
+    rounded = _route_clear(
+        {"algorithm": "pns", "corner_mode": "rounded90", "waypoints": waypoints},
+        tmp_path,
+    )
+    assert rounded.waypoint_violated is False
+    assert rounded.end == pytest.approx((60.0, 39.5), abs=1e-3)
+    # The three 90 degree joints (each mitered into two 135 degree
+    # corners) are rounded: six tangent fillet arcs and no other arcs
+    # (the axis-aligned legs carry no skeleton arcs of their own).
+    assert len(rounded.arcs) == 6
+    pts = _route_polyline_sampled(rounded, n=128)
+    for p0, p1, p2 in zip(pts, pts[1:], pts[2:]):
+        ang = _interior_angle(p0, p1, p2)
+        assert ang >= 170.0 - 1e-6, (
+            f"filleted chain has a corner of {ang:.1f} deg at {p1}"
+        )
+    # Control: the same chain in the mitered corner mode stays sharp.
+    mitered = _route_clear(
+        {"algorithm": "pns", "corner_mode": "mitered45", "waypoints": waypoints},
+        tmp_path,
+    )
+    assert mitered.arcs == []
+    mpts = _route_polyline_sampled(mitered)
+    assert any(
+        _interior_angle(p0, p1, p2) < 170.0 - 1e-6
+        for p0, p1, p2 in zip(mpts, mpts[1:], mpts[2:])
+    ), "mitered control must keep its sharp miter corners"
+
+
+def test_waypoints_chain_fillet_drc_shrinks_falls_back(tmp_path: Path) -> None:
+    """The chain fillet is DRC-aware: a foreign-net pad near a joint
+    blocks the full-radius fillet arc, so the router halves the radius
+    until the arc keeps the clearance + width/2 centerline margin --
+    joints away from the blocker keep the full radius, shrinking never
+    breaks the G1 tangency, and the route still reaches the far pad
+    without a waypoint violation."""
+    from shapely.geometry import LineString, box
+
+    pcb_path = Path(_make_clear_board(tmp_path))
+    text = pcb_path.read_text()
+    text = text.replace('\t(net 1 "VCC")\n', '\t(net 1 "VCC")\n\t(net 2 "GND")\n')
+    text = (
+        text.rstrip()[:-1]
+        + '\n\t(footprint "user_add:blocker"\n'
+        '\t\t(layer "F.Cu")\n'
+        "\t\t(at 44.2 30.4 0.0)\n"
+        '\t\t(property "Reference" "X1")\n'
+        '\t\t(pad "1" smd rect\n'
+        "\t\t\t(at 0.0 0.0)\n"
+        "\t\t\t(size 0.2 0.2)\n"
+        '\t\t\t(layers "F.Cu" "F.Mask")\n'
+        '\t\t\t(net 2 "GND")\n'
+        "\t\t)\n"
+        "\t)\n"
+        ")\n"
+    )
+    pcb_path.write_text(text)
+    # Direct call: _route_clear re-writes the board and would wipe the
+    # blocker footprint from the file.
+    result = auto_route_pair(
+        RouteRequest(
+            pcb_path=str(pcb_path),
+            ref_a="R1",
+            pad_a="1",
+            ref_b="C1",
+            pad_b="1",
+            net="VCC",
+            width=0.2,
+            clearance=0.2,
+            via_pairs=(),
+            algorithm="pns",
+            corner_mode="rounded90",
+            waypoints=[
+                {"kind": "waypoint", "pos": (45.0, 30.0)},
+                {"kind": "waypoint", "pos": (45.0, 42.0)},
+                {"kind": "waypoint", "pos": (60.0, 42.0)},
+            ],
+        )
+    )
+    assert result.waypoint_violated is False
+    assert result.end == pytest.approx((60.0, 39.5), abs=1e-3)
+    blocker = box(44.1, 30.3, 44.3, 30.5)  # the 0.2 x 0.2 GND pad
+    margin = 0.3  # clearance (0.2) + half track width (0.1)
+    radii: list[float] = []
+    for a in result.arcs:
+        cx, cy = _arc_circumcenter(a.start, a.mid, a.end)
+        r = math.hypot(a.start[0] - cx, a.start[1] - cy)
+        a0 = math.atan2(a.start[1] - cy, a.start[0] - cx)
+        span = _arc_signed_sweep(a.start, a.mid, a.end)
+        line = LineString(
+            [a.start]
+            + [
+                (cx + r * math.cos(a0 + span * k / 96), cy + r * math.sin(a0 + span * k / 96))
+                for k in range(1, 96)
+            ]
+            + [a.end]
+        )
+        radii.append(r)
+        assert line.distance(blocker) >= margin - 1e-3, (
+            f"fillet arc r={r:.3f} violates the {margin:.1f} mm margin: "
+            f"{line.distance(blocker):.3f}"
+        )
+    for s in result.segments:
+        assert LineString([(s.x1, s.y1), (s.x2, s.y2)]).distance(blocker) >= margin - 1e-3, (
+            "chain segment violates the clearance margin"
+        )
+    # The joint next to the blocker had to shrink below the full radius
+    # while the joints away from it keep it.
+    assert any(r < 1.2 - 1e-6 for r in radii), "the blocked joint fillet must shrink"
+    assert any(abs(r - 1.2) < 1e-6 for r in radii), "unblocked joints keep the full radius"
+    # Shrinking must not break the G1 tangency anywhere.
+    pts = _route_polyline_sampled(result, n=128)
+    for p0, p1, p2 in zip(pts, pts[1:], pts[2:]):
+        ang = _interior_angle(p0, p1, p2)
+        assert ang >= 170.0 - 1e-6, (
+            f"filleted chain has a corner of {ang:.1f} deg at {p1}"
+        )
+
+
+
+
+# ---------------------------------------------------------------------------
 # W3 — PNS candidates (multi-variant routes) + A* failure evidence
 # ---------------------------------------------------------------------------
 def _make_clear_board_with_track(tmp_path: Path) -> str:
@@ -2707,8 +2878,6 @@ def test_astar_moved_pairs_empty(tmp_path: Path) -> None:
     """A* has no shove stage: moved_pairs stays empty."""
     result = _route_clear({"algorithm": "astar", "corner_mode": "mitered45"}, tmp_path)
     assert result.moved_pairs == []
-
-
 def test_strategy_invalid_value_rejected(tmp_path: Path) -> None:
     """Values outside {shove, walkaround} are rejected up front
     with a clear message, regardless of the algorithm."""
