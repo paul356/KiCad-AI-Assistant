@@ -34,3 +34,27 @@ description: "Footprint positioning, overlap check, group align/distribute opera
   footprints along X or Y; outermost positions are fixed.
 - **move_footprints_by_delta(pcb_path, references, dx, dy)** — shift a group
   by the same offset without changing their relative positions.
+
+# Adding / removing footprints
+- **add_footprints_to_pcb(pcb_path, footprints)** — place several footprints
+  in one call.  Each ``footprints`` entry is ``{"footprint", "reference",
+  "x", "y", "nets", "rotation"?: 0}`` where ``footprint`` is
+  ``"Library:Name"`` or a bare ``"Name"`` searched across fp-lib-table
+  libraries, and ``nets`` maps EVERY pad number (``"1"``, ``"2"``, ...) to
+  that pad's net name (``""`` = net 0 / unconnected).  A pad missing from
+  ``nets`` is a hard error for that item — a partial nets dict can never
+  silently land an uncovered pad on net 0 and short the part.  A net name
+  not in the board's net list is auto-added; unknown nets are never
+  created silently.  Unresolvable footprint, duplicate reference, missing
+  x/y, or unsafe names fail that item only; successful items are written
+  one at a time (atomic save + .bak).  Returns ``{success, results[],
+  placed_count, failed_count, failed[]}``.
+- **remove_footprints_from_pcb(pcb_path, references)** — remove footprints
+  by reference designator, all in one call.  Board loaded once; each
+  reference removed once in order; a repeated reference counts as not
+  found.  One atomic save + .bak only when at least one footprint was
+  removed; an all-not-found batch leaves the file untouched (``backup_path:
+  None``).  Dangling net definitions are left in place (KiCad tolerates
+  them; rewriting the net table risks breaking surviving footprints).
+  Returns ``{success, results[], removed_count, not_found_count,
+  not_found[], backup_path, pcb_path}``.
