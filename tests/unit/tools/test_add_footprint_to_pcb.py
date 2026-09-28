@@ -282,6 +282,78 @@ class TestPlacement:
             assert _pad_net(pad) == (4, "NEWNET")
 
 
+class TestPerPadNets:
+    def test_per_pad_different_nets(self, tools, board_copy, lib_dir):
+        result = _run(
+            tools["add_footprint_to_pcb"](
+                pcb_path=board_copy,
+                footprint="R_0402_1005Metric",
+                reference="R9",
+                x=20.0,
+                y=20.0,
+                pads={"1": "A", "2": "B"},
+                library=str(lib_dir),
+            )
+        )
+        assert "error" not in result, result
+        assert result["success"] is True
+        assert result["pad_count"] == 2
+        # Fallback net is None -> net 0; per-pad nets win.
+        assert result["net"] == ""
+        assert result["pads_net"] == [{"pad": "1", "net": "A"}, {"pad": "2", "net": "B"}]
+
+        nets = _nets(board_copy)
+        assert {"A", "B"} <= set(nets)
+        pads = _pads(_fp_node(board_copy, "R9"))
+        assert len(pads) == 2
+        pad1_net, pad2_net = _pad_net(pads[0]), _pad_net(pads[1])
+        assert pad1_net == (nets["A"], "A")
+        assert pad2_net == (nets["B"], "B")
+        assert pad1_net[0] != pad2_net[0]
+
+    def test_pads_partial_with_net_fallback(self, tools, board_copy, lib_dir):
+        result = _run(
+            tools["add_footprint_to_pcb"](
+                pcb_path=board_copy,
+                footprint="R_0402_1005Metric",
+                reference="R9",
+                x=20.0,
+                y=20.0,
+                pads={"1": "A"},
+                net="Z",
+                library=str(lib_dir),
+            )
+        )
+        assert "error" not in result, result
+        assert result["net"] == "Z"
+        assert result["pads_net"] == [{"pad": "1", "net": "A"}, {"pad": "2", "net": "Z"}]
+
+        nets = _nets(board_copy)
+        pads = _pads(_fp_node(board_copy, "R9"))
+        assert _pad_net(pads[0]) == (nets["A"], "A")
+        assert _pad_net(pads[1]) == (nets["Z"], "Z")
+        # Z auto-added after A -> distinct numbers.
+        assert nets["A"] != nets["Z"]
+
+    def test_both_none_is_net_zero(self, tools, board_copy, lib_dir):
+        result = _run(
+            tools["add_footprint_to_pcb"](
+                pcb_path=board_copy,
+                footprint="R_0402_1005Metric",
+                reference="R9",
+                x=20.0,
+                y=20.0,
+                net=None,
+                pads=None,
+                library=str(lib_dir),
+            )
+        )
+        assert "error" not in result, result
+        assert "pads_net" not in result
+        for pad in _pads(_fp_node(board_copy, "R9")):
+            assert _pad_net(pad) == (0, "")
+
+
 class TestValidation:
     def _board_bytes(self, path):
         with open(path, "rb") as fh:

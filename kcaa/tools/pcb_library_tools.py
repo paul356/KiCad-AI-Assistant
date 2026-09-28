@@ -430,6 +430,7 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
         y: float,
         rotation: float = 0.0,
         net: str | None = None,
+        pads: dict[str, str] | None = None,
         library: str | None = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
@@ -459,6 +460,13 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
         (unconnected); the ``(net 0 "")`` node is appended if the board lacks
         one.
 
+        Per-pad netting via ``pads``: pads listed in ``pads`` get their own
+        net name; every pad NOT listed falls back to the ``net`` argument
+        (same semantics as above, including ``net=None`` → net 0).  Use it to
+        place a multi-pad part whose pads belong to different nets in one
+        call instead of placing it once per net.  Both ``pads`` and ``net``
+        may be ``None`` (whole footprint on net 0).
+
         Validation — all fail with ``{"error": ...}`` WITHOUT touching the
         board file: missing/unparseable ``pcb_path``; unresolvable
         ``library`` / ``footprint`` (the error lists the scanned libraries);
@@ -475,7 +483,12 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
             y: Anchor Y in board mm (world, +Y down).
             rotation: CCW-positive rotation in degrees (KiCad file convention).
             net: Net name for all pads; auto-added to the board's net list
-                when missing.  ``None`` connects the pads to net 0.
+                when missing.  ``None`` connects the pads to net 0.  Also the
+                fallback net for pads not listed in ``pads``.
+            pads: Optional per-pad net overrides: map of pad number string
+                (``"1"``, ``"2"``, ...) to net name for that pad; pads not
+                listed fall back to ``net``.  Net names are auto-added to the
+                board's net list when missing.
             library: Optional restriction: library nickname, ``.pretty``
                 directory path, or directory name.
             ctx: MCP context for progress reporting.
@@ -483,8 +496,10 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
         Returns:
             dict with ``success``, ``reference``, ``footprint`` (the board
             header), ``placed_at``, ``rotation``, ``backup_path``,
-            ``pad_count``, ``net`` (the net name, or ``""`` for net 0), and an
-            optional ``warnings`` list; or ``error``.
+            ``pad_count``, ``net`` (the net name, or ``""`` for net 0), an
+            optional ``pads_net`` list (each pad's assigned net, present when
+            ``pads`` is given) and an optional ``warnings`` list; or
+            ``error``.
         """
         try:
             if not reference:
@@ -534,7 +549,17 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
             fp_node.append([sexpdata.Symbol("uuid"), str(uuid.uuid4())])
 
             net_no, net_name = _resolve_board_net(data, net)
-            pad_count = _apply_net_to_pads(fp_node, net_no, net_name)
+            pads_net_list: list[dict[str, str]] | None = None
+            if pads:
+                pad_nets = {
+                    str(pad_no): _resolve_board_net(data, pad_net)
+                    for pad_no, pad_net in pads.items()
+                }
+                pad_count, pads_net_list = _apply_nets_to_pads(
+                    fp_node, pad_nets, (net_no, net_name)
+                )
+            else:
+                pad_count = _apply_net_to_pads(fp_node, net_no, net_name)
             data.append(fp_node)
             try:
                 bak_path = save_pcb(pcb_path, data)
@@ -551,6 +576,8 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
                 "pad_count": pad_count,
                 "net": net_name,
             }
+            if pads_net_list is not None:
+                result["pads_net"] = pads_net_list
             outline_msg = _outline_warning(data, x, y)
             if outline_msg:
                 result["warnings"] = [outline_msg]
@@ -1351,6 +1378,41 @@ def _apply_net_to_pads(fp_node: list[Any], net_no: int, net_name: str) -> int:
             child.append(net_node)
         count += 1
     return count
+
+
+def _apply_nets_to_pads(
+    fp_node: list[Any],
+    pad_nets: dict[str, tuple[int, str]],
+    default_net: tuple[int, str],
+) -> tuple[int, list[dict[str, str]]]:
+    """Assign per-pad ``(net ...)`` nodes to *fp_node* in place.
+
+    Pads whose number is a key of *pad_nets* get that pad's
+    ``(net_no, net_name)``; every other pad gets *default_net* — the same
+    semantics as ``_apply_net_to_pads`` with the fallback net.  Replaces
+    pre-existing net sub-nodes.  Returns ``(pad_count, pad_net_list)`` where
+    *pad_net_list* maps each pad number (in pad order) to its assigned net
+    name (``""`` for net 0).
+    """
+    count = 0
+    pad_net_list: list[dict[str, str]] = []
+    for child in fp_node:
+        if not (isinstance(child, list) and len(child) > 0):
+            continue
+        if not (isinstance(child[0], sexpdata.Symbol) and _sym(child[0]) == "pad"):
+            continue
+        pad_no = _sym(child[1]) if len(child) > 1 else ""
+        net_no, net_name = pad_nets.get(pad_no, default_net)
+        net_node = [sexpdata.Symbol("net"), net_no, net_name]
+        for i, sub in enumerate(child):
+            if isinstance(sub, list) and len(sub) >= 1 and _sym(sub[0]) == "net":
+                child[i] = net_node
+                break
+        else:
+            child.append(net_node)
+        count += 1
+        pad_net_list.append({"pad": pad_no, "net": net_name})
+    return count, pad_net_list
 
 
 def _outline_warning(data: list[Any], x: float, y: float) -> str | None:
