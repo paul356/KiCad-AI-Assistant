@@ -1566,13 +1566,17 @@ class TestOpenAICompatibleRequests:
         assert client._openai_headers() == {
             "Content-Type": "application/json",
             "Authorization": "Bearer sk-test",
+            "User-Agent": llm_client._LLM_USER_AGENT,
         }
 
     def test_empty_api_key_omits_authorization(self):
         client = _make_client()
         client._settings.llm_api_key = ""
 
-        assert client._openai_headers() == {"Content-Type": "application/json"}
+        assert client._openai_headers() == {
+            "Content-Type": "application/json",
+            "User-Agent": llm_client._LLM_USER_AGENT,
+        }
 
     def test_api_key_adds_x_api_key(self):
         client = _make_client()
@@ -1581,6 +1585,7 @@ class TestOpenAICompatibleRequests:
             "Content-Type": "application/json",
             "anthropic-version": "2023-06-01",
             "x-api-key": "sk-test",
+            "User-Agent": llm_client._LLM_USER_AGENT,
         }
 
     def test_empty_api_key_omits_x_api_key(self):
@@ -1590,7 +1595,49 @@ class TestOpenAICompatibleRequests:
         assert client._anthropic_headers() == {
             "Content-Type": "application/json",
             "anthropic-version": "2023-06-01",
+            "User-Agent": llm_client._LLM_USER_AGENT,
         }
+
+    def test_openai_headers_user_agent_identifies_plugin(self):
+        client = _make_client()
+
+        ua = client._openai_headers()["User-Agent"]
+        assert "KiCad-AI-Assistant" in ua
+
+    def test_openai_headers_user_agent_without_api_key(self):
+        client = _make_client()
+        client._settings.llm_api_key = ""
+
+        ua = client._openai_headers()["User-Agent"]
+        assert "KiCad-AI-Assistant" in ua
+
+    def test_anthropic_headers_user_agent_identifies_plugin(self):
+        client = _make_client()
+
+        ua = client._anthropic_headers()["User-Agent"]
+        assert "KiCad-AI-Assistant" in ua
+
+    def test_anthropic_headers_user_agent_without_api_key(self):
+        client = _make_client()
+        client._settings.llm_api_key = ""
+
+        ua = client._anthropic_headers()["User-Agent"]
+        assert "KiCad-AI-Assistant" in ua
+
+    def test_user_agent_never_starts_with_python_urllib(self):
+        client = _make_client()
+        client._settings.llm_api_key = ""
+
+        for headers in (client._openai_headers(), client._anthropic_headers()):
+            assert not headers["User-Agent"].startswith("Python-urllib")
+
+    def test_both_builders_send_identical_user_agent(self):
+        client = _make_client()
+
+        openai_ua = client._openai_headers()["User-Agent"]
+        anthropic_ua = client._anthropic_headers()["User-Agent"]
+        assert openai_ua == anthropic_ua
+        assert anthropic_ua == llm_client._LLM_USER_AGENT
 
 
 # ---------------------------------------------------------------------------
