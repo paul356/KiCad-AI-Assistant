@@ -153,13 +153,13 @@ TOOL_POLICIES: dict[str, ToolPolicy] = {
         mark_dirty=True,
     ),
     # PCB library/index tools
-    "add_footprint_to_pcb": ToolPolicy(
+    "add_footprints_to_pcb": ToolPolicy(
         kind="file_mutation",
         path_arg="pcb_path",
         auto_snapshot=True,
         mark_dirty=True,
     ),
-    "remove_footprint_from_pcb": ToolPolicy(
+    "remove_footprints_from_pcb": ToolPolicy(
         kind="file_mutation",
         path_arg="pcb_path",
         auto_snapshot=True,

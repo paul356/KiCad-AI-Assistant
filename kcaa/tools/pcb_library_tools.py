@@ -127,19 +127,19 @@ async def _place_one_footprint(
     x: float | None,
     y: float | None,
     rotation: float,
-    library: str | None,
     ctx: Context | None = None,
 ) -> dict[str, Any]:
-    """Place exactly one footprint onto *pcb_path*; the shared single-place core.
+    """Place exactly one footprint onto *pcb_path*; the shared batch item core.
 
-    Used by both the single-footprint ``add_footprint_to_pcb`` entry point
-    and the batch ``footprints`` path so the two never drift apart.  *nets*
-    must name a net for EVERY pad of the placed footprint (``""`` = net 0 /
-    unconnected): a pad missing from *nets* is a hard error and nothing is
-    written — the part is never silently shorted onto a blanket or zero net.
-    Returns the dict the tool documents (``success``/``reference``/
-    ``placed_at``/... or ``error``); never raises — every failure mode
-    returns an error dict.
+    Used by the batch ``add_footprints_to_pcb`` path; the footprint is
+    resolved by ``footprint`` (``"Library:Name"`` or bare ``"Name"`` searched
+    across the fp-lib-table libraries — there is no tool- or item-level
+    library restriction).  *nets* must name a net for EVERY pad of the placed
+    footprint (``""`` = net 0 / unconnected): a pad missing from *nets* is a
+    hard error and nothing is written — the part is never silently shorted
+    onto a blanket or zero net.  Returns the dict the tool documents
+    (``success``/``reference``/``placed_at``/... or ``error``); never raises
+    — every failure mode returns an error dict.
     """
     try:
         if not reference:
@@ -168,7 +168,7 @@ async def _place_one_footprint(
                 }
 
         try:
-            header, mod_path, scanned = _find_footprint_mod_path(footprint, library, pcb_path)
+            header, mod_path, scanned = _find_footprint_mod_path(footprint, None, pcb_path)
         except ValueError as exc:
             return {"error": str(exc)}
 
@@ -247,30 +247,28 @@ async def _place_one_footprint(
             )
         return result
     except Exception as exc:
-        log.error("add_footprint_to_pcb failed: %s", exc, exc_info=True)
+        log.error("add_footprints_to_pcb item failed: %s", exc, exc_info=True)
         return {"error": str(exc)}
 
 
 async def _place_many_footprints(
     pcb_path: str,
     footprints: list[dict[str, Any]],
-    nets: dict[str, str],
-    library: str | None = None,
     ctx: Context | None = None,
 ) -> dict[str, Any]:
     """Place several footprints in one call, collecting per-item results.
 
-    Each dict in *footprints* mirrors the single-footprint arguments:
-    ``footprint``, ``reference``, ``x``, ``y``, required ``nets`` and
-    optional ``rotation``/``library`` (an item-level ``library`` overrides
-    the tool-level one).  The effective nets for an item come from the
-    item's ``nets`` when present, else the tool-level *nets*; whichever is
-    used must cover every pad of that item — otherwise the item fails with
-    "missing net for pad(s): ...".  Items are placed one at a time and the
-    result of every item is collected; a failing item never rolls back or
-    blocks the others — successful items are written to the board as they
-    go.  Returns ``{"success", "results", "placed_count", "failed_count",
-    "failed"}`` where ``success`` is True only when every item was placed.
+    The footprint-level placement arguments all live in each *footprints*
+    dict — ``footprint`` (``"Library:Name"`` or bare ``"Name"``), ``reference``,
+    ``x``, ``y``, optional ``rotation`` and the required ``nets``.  There is
+    no single-footprint mode and no tool-level defaults: every item must
+    carry a ``nets`` dict covering every pad of its footprint — a pad
+    missing from that dict fails the item with "missing net for pad(s): ..."
+    rather than silently landing on net 0.  Items are placed one at a time,
+    each writing its own save; a failing item never rolls back or blocks the
+    others.  Returns ``{"success", "results", "placed_count",
+    "failed_count", "failed"}`` where ``success`` is True only when every
+    item was placed.
     """
     results: list[dict[str, Any]] = []
     for item in footprints:
@@ -283,7 +281,7 @@ async def _place_many_footprints(
         try:
             x_val = item.get("x")
             y_val = item.get("y")
-            item_nets = item.get("nets", nets)
+            item_nets = item.get("nets")
             if not isinstance(item_nets, dict):
                 raise ValueError("nets must be an object mapping pad numbers to net names")
             res = await _place_one_footprint(
@@ -294,7 +292,6 @@ async def _place_many_footprints(
                 x=float(x_val) if x_val is not None else None,
                 y=float(y_val) if y_val is not None else None,
                 rotation=float(item.get("rotation") or 0.0),
-                library=item.get("library", library),
                 ctx=ctx,
             )
         except Exception as exc:
@@ -627,35 +624,23 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
         return info
 
     @mcp.tool()
-    async def add_footprint_to_pcb(
+    async def add_footprints_to_pcb(
         pcb_path: str,
-        nets: dict[str, str],
-        footprint: str | None = None,
-        reference: str | None = None,
-        x: float | None = None,
-        y: float | None = None,
-        rotation: float = 0.0,
-        footprints: list[dict[str, Any]] | None = None,
-        library: str | None = None,
+        footprints: list[dict[str, Any]],
         ctx: Context | None = None,
     ) -> dict[str, Any]:
-        """Place footprint(s) from a footprint library onto an existing board.
+        """Place several footprints from footprint libraries onto an existing board.
 
-        Two mutually exclusive modes:
-
-        * Single: place one footprint with ``footprint``, ``reference``,
-          ``x``, ``y`` (plus optional ``rotation``/``library``).
-        * Batch: ``footprints`` is a list of placement dicts, each with the
-          same fields (``footprint``, ``reference``, ``x``, ``y``, ``nets``
-          and optional ``rotation``/``library``).  Items are placed one at
-          a time and every item's result is collected; a failing item never
-          rolls back or blocks the others — successful items are written to
-          the board as they go.  Passing both the single args and
-          ``footprints`` is an error.
+        Pure batch: the ``footprints`` list carries every footprint-level
+        argument (``footprint``, ``reference``, ``x``, ``y``, ``rotation``,
+        ``nets``); there is no single-footprint mode and no tool-level
+        defaults.  Items are placed one at a time and every item's result is
+        collected; a failing item never rolls back or blocks the others —
+        successful items are written to the board as they go.
 
         Reads the ``.kicad_mod`` file of each requested footprint, appends it
         as a new ``(footprint ...)`` node to the ``.kicad_pcb`` board at the
-        given world position, and writes the board back after every placement
+        given world position, and writes the board back after every item
         (atomic write plus a ``.bak`` backup).  The library file is only read
         — nothing in the library is modified.  Placement tools like
         ``set_footprint_position`` only move footprints already on the board;
@@ -663,119 +648,79 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
 
         Footprint resolution: ``footprint`` may be ``"Library:Name"`` or a
         bare ``"Name"`` searched across every library resolved from
-        fp-lib-table (project table first, then the user table).  The
-        ``library`` argument restricts the search to one library, accepted
-        as a registered nickname, a ``.pretty`` directory path, or a
-        directory name (``"MyLib"`` / ``"MyLib.pretty"``).  The placed
-        footprint's board header is ``"Library:Name"`` when the library is
-        known from the ``footprint`` argument, else the bare name.
+        fp-lib-table (project table first, then the user table); there is no
+        library restriction argument — each footprint resolves by its own
+        ``Library:Name`` prefix or bare name.  The placed footprint's board
+        header is ``"Library:Name"`` when the ``footprint`` argument carries
+        the library prefix, else the bare name.
 
-        Netting — required, per-pad: the ``nets`` argument maps every pad
-        number (``"1"``, ``"2"``, ...) to that pad's net name.  A net name
+        Netting — required, per-pad: each item's ``nets`` argument maps every
+        pad number (``"1"``, ``"2"``, ...) to that pad's net name.  A net name
         that does not exist in the board's ``(net ...)`` list is auto-added
         with the next free net number (max + 1) — friendlier than failing,
         and matches drawing-demo boards that have no nets.  An empty string
         (or ``None``) as the net name means net 0 (unconnected); the
         ``(net 0 "")`` node is appended if the board lacks one.  A pad NOT
-        covered by ``nets`` is a hard error (``{"error": "missing net for
-        pad(s): ..."}``) and nothing is written — a partial nets dict can
-        never silently land an uncovered pad on net 0 and short the part.
+        covered by an item's ``nets`` is a hard error for that item
+        (``"missing net for pad(s): ..."``) and nothing is written for it —
+        a partial nets dict can never silently land an uncovered pad on net 0
+        and short the part.
 
         Validation — every item fails with an ``{"error": ...}`` WITHOUT
-        touching the board file (in batch mode only that item fails):
-        missing/unparseable ``pcb_path``; unresolvable ``library`` /
-        ``footprint`` (the error lists the scanned libraries); ``reference``
-        already present on the board (duplicate reference); unsafe footprint
-        names (path traversal); missing ``x``/``y``; ``nets`` not covering
-        every pad.  Placement outside the board outline (Edge.Cuts) is a
-        warning only — boards may legitimately have no outline, so it is
-        never a hard failure.
+        touching the board file (only that item fails): unparseable
+        ``pcb_path``; unresolvable ``footprint`` (the error lists the
+        scanned libraries); ``reference`` already present on the board
+        (duplicate reference); unsafe footprint names (path traversal);
+        missing ``x``/``y``; ``nets`` not covering every pad.  Placement
+        outside the board outline (Edge.Cuts) is a warning only — boards may
+        legitimately have no outline, so it is never a hard failure.
 
         Args:
             pcb_path: Path to the ``.kicad_pcb`` board to modify.
-            nets: Map of pad number string (``"1"``, ``"2"``, ...) to net
-                name for that pad; ``""`` (or ``None``) means net 0
-                (unconnected).  MUST cover every pad of the placed
-                footprint — a missing pad is an error and nothing is
-                written.  In batch mode each item may carry its own
-                ``nets``; item nets win over this tool-level one.
-            footprint: Single mode: footprint to place, ``"Library:Name"`` or
-                bare ``"Name"``.  Ignored when ``footprints`` is given.
-            reference: Single mode: board reference designator, e.g. ``"R9"``
-                (must be unique).  Ignored when ``footprints`` is given.
-            x: Single mode: anchor X in board mm (world, +X right).
-            y: Single mode: anchor Y in board mm (world, +Y down).
-            rotation: CCW-positive rotation in degrees (KiCad file convention).
-            footprints: Batch mode: list of placement dicts, each with
-                ``footprint``/``reference``/``x``/``y``/``nets`` and optional
-                ``rotation``/``library`` — same semantics as the single
-                arguments.  When given, the single-placement arguments must
-                be omitted (passing both is an error).
-            library: Optional restriction: library nickname, ``.pretty``
-                directory path, or directory name.  Applied to every item in
-                batch mode unless the item overrides it.
+            footprints: List of placement dicts, each with the footprint-
+                level arguments (all required unless noted):
+                ``footprint`` (``"Library:Name"`` or bare ``"Name"``),
+                ``reference`` (unique board reference designator, e.g.
+                ``"R9"``), ``x``/``y`` (anchor world mm, +Y down), ``nets``
+                (pad number string → net name; ``""``/``None`` = net 0;
+                MUST cover every pad of the footprint), and optional
+                ``rotation`` (CCW-positive degrees, default 0.0).
             ctx: MCP context for progress reporting.
 
         Returns:
-            Single mode: dict with ``success``, ``reference``, ``footprint``
-            (the board header), ``placed_at``, ``rotation``, ``backup_path``,
-            ``pad_count``, ``pads_net`` (list of ``{"pad", "net"}`` — the
-            net actually assigned to each pad, ``""`` for net 0) and an
-            optional ``warnings`` list; or ``error``.
-
-            Batch mode: dict with ``success`` (True only when every item was
-            placed), ``results`` (one entry per item, in order: ``success``,
-            ``reference`` and either ``result`` — the full single-mode
-            placement dict — or ``error``), ``placed_count``, ``failed_count``
-            and ``failed`` (list of ``{"reference", "error"}`` per failed
-            item).
+            dict with ``success`` (True only when every item was placed),
+            ``results`` (one entry per item, in order: ``success``,
+            ``reference`` and either ``result`` — the full placement dict
+            with ``success``/``reference``/``footprint``/``placed_at``/
+            ``rotation``/``backup_path``/``pad_count``/``pads_net`` and an
+            optional ``warnings`` list — or ``error``), ``placed_count``,
+            ``failed_count`` and ``failed`` (list of ``{"reference",
+            "error"}`` per failed item).
         """
-        if footprints is not None:
-            if footprint is not None or reference is not None or x is not None or y is not None:
-                return {
-                    "error": (
-                        "use either single footprint args (footprint/reference/x/y) "
-                        "or the footprints list, not both"
-                    )
-                }
-            return await _place_many_footprints(pcb_path, footprints, nets, library, ctx)
-        if footprint is None or reference is None or x is None or y is None:
-            return {
-                "error": (
-                    "footprint, reference, x and y are required when the "
-                    "footprints list is not used"
-                )
-            }
-        return await _place_one_footprint(
-            pcb_path, nets, footprint, reference, x, y, rotation, library, ctx
-        )
+        if not footprints:
+            return {"error": "footprints must be a non-empty list"}
+        return await _place_many_footprints(pcb_path, footprints, ctx)
 
     @mcp.tool()
-    async def remove_footprint_from_pcb(
+    async def remove_footprints_from_pcb(
         pcb_path: str,
-        reference: str | None = None,
-        references: list[str] | None = None,
+        references: list[str],
         ctx: Context | None = None,
     ) -> dict[str, Any]:
-        """Remove footprint(s) from an existing board by reference designator.
+        """Remove several footprints from an existing board by reference designator.
 
-        Two mutually exclusive modes:
+        Pure batch: ``references`` is the only designator input — there is no
+        single-footprint mode.  Each listed reference is removed one at a
+        time in list order and every item's result is collected; a failing
+        item never blocks the others (nothing rolls back — items already
+        removed stay removed).  The board is loaded once; each item removes
+        whichever matching ``(footprint ...)`` nodes remain, so a reference
+        listed twice removes the first occurrence and the second is reported
+        as not found.
 
-        * Single: remove one footprint with ``reference``.
-        * Batch: ``references`` is a list of reference designators, removed
-          one at a time in list order; every item's result is collected and
-          a failing item never blocks the others (nothing rolls back — items
-          already removed stay removed).  Passing both ``reference`` and
-          ``references`` is an error; passing neither is an error.
-
-        Finds the ``(footprint ...)`` node(s) whose ``Reference`` property
-        equals the requested designator and removes them from the board,
-        writing back with the usual atomic write plus a ``.bak`` backup.
-        In batch mode the board is loaded once; each item removes whatever
-        matching nodes remain, so a reference listed twice removes the first
-        occurrence and the second is reported as not found.  The board is
-        only written when at least one footprint was actually removed — an
-        all-not-found batch leaves the file untouched and returns
+        The board is only written when at least one footprint was actually
+        removed — one atomic save plus a ``.bak`` backup for the whole call —
+        and an all-not-found batch leaves the file untouched and returns
         ``removed_count`` 0 with ``backup_path`` ``None``.  When written,
         ``success`` is True if and only if every item was removed.
 
@@ -787,25 +732,14 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
 
         Args:
             pcb_path: Path to the ``.kicad_pcb`` board to modify.
-            reference: Single mode: board reference designator to remove,
-                e.g. ``"R9"``.  Required unless ``references`` is given.
-            references: Batch mode: list of board reference designators to
-                remove, in order; each entry is removed once and a repeated
-                entry then counts as not found.  Required unless
-                ``reference`` is given.  Mutually exclusive with
-                ``reference``.
+            references: List of board reference designators to remove, in
+                order; each entry is removed once and a repeated entry then
+                counts as not found.  Must be a non-empty list.
             ctx: MCP context for progress reporting.
 
         Returns:
-            Single mode: dict with ``success``, ``reference``, ``removed``
-            (number of footprint nodes actually removed, normally 1),
-            ``backup_path`` and ``pcb_path``; or ``error``.  A reference
-            that is not on the board is not an exception — it returns
-            ``{"success": False, "error": "footprint 'X' not found ...",
-            "removed": 0}`` and does not touch the file.
-
-            Batch mode: dict with ``success`` (True only when every item was
-            removed), ``results`` (one entry per item, in order: dict with
+            dict with ``success`` (True only when every item was removed),
+            ``results`` (one entry per item, in order: dict with
             ``reference``, ``success``, ``removed`` (0 or 1) and ``error``
             when the item was not found or invalid), ``removed_count``,
             ``not_found_count``, ``not_found`` (list of ``{"reference",
@@ -813,13 +747,8 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
             nothing was written) and ``pcb_path``.
         """
         try:
-            if reference and references:
-                return {"error": "use either reference or references, not both"}
-            if not reference and not references:
-                return {"error": "reference or references required"}
-
-            refs: list[str] = [reference] if reference else list(references)
-            is_batch = bool(references)
+            if not isinstance(references, list) or not references:
+                return {"error": "references must be a non-empty list"}
 
             try:
                 data = load_pcb(pcb_path)
@@ -828,41 +757,10 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
             if not data or not isinstance(data[0], sexpdata.Symbol) or _sym(data[0]) != "kicad_pcb":
                 return {"error": f"{pcb_path} does not look like a .kicad_pcb file"}
 
-            if not is_batch:
-                removed = 0
-                for node in list(iter_footprint_nodes(data)):
-                    if get_fp_property(node, "Reference") == reference:
-                        data.remove(node)
-                        removed += 1
-                if removed == 0:
-                    return {
-                        "success": False,
-                        "reference": reference,
-                        "removed": 0,
-                        "error": f"footprint '{reference}' not found on the board; nothing to remove",
-                        "pcb_path": pcb_path,
-                    }
-                try:
-                    bak_path = save_pcb(pcb_path, data)
-                except OSError as exc:
-                    return {"error": f"failed to write board: {exc}"}
-                if ctx:
-                    await ctx.info(
-                        f"Removed {removed} footprint node(s) with reference {reference} "
-                        f"from {pcb_path}"
-                    )
-                return {
-                    "success": True,
-                    "reference": reference,
-                    "removed": removed,
-                    "backup_path": bak_path,
-                    "pcb_path": pcb_path,
-                }
-
             results: list[dict[str, Any]] = []
             not_found: list[dict[str, Any]] = []
             removed_total = 0
-            for item in refs:
+            for item in references:
                 if not isinstance(item, str) or not item:
                     error = "reference must be a non-empty string"
                     ref_label = item if isinstance(item, str) else str(item)
@@ -907,7 +805,7 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
                 "pcb_path": pcb_path,
             }
         except Exception as exc:
-            log.error("remove_footprint_from_pcb failed: %s", exc, exc_info=True)
+            log.error("remove_footprints_from_pcb failed: %s", exc, exc_info=True)
             return {"error": str(exc)}
 
     @mcp.tool()
@@ -1439,7 +1337,7 @@ def _apply_nets_to_pads(
 
     Pads whose number is a key of *pad_nets* get that pad's
     ``(net_no, net_name)``; every other pad gets *default_net* — the
-    per-pad fallback of the ``add_footprint_to_pcb`` netting.  Replaces
+    per-pad fallback of the ``add_footprints_to_pcb`` netting.  Replaces
     pre-existing net sub-nodes.  Returns ``(pad_count, pad_net_list)`` where
     *pad_net_list* maps each pad number (in pad order) to its assigned net
     name (``""`` for net 0).
