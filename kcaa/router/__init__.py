@@ -15,7 +15,6 @@ Module map:
 
 * :mod:`kcaa.router.world_model`       — PCB → obstacle list
 * :mod:`kcaa.router.visibility_graph` — Obstacles → visibility graph
-* :mod:`kcaa.router.a_star`            — A\\* search on the graph
 * :mod:`kcaa.router.path_postprocess`  — Miter corners, segment emission
 * :mod:`kcaa.router.router`            — Orchestration / public API
 """
