@@ -168,7 +168,9 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
                 arc_count / arcs: rounded-corner arcs written
                     (``{start, mid, end, width, layer, net}`` each).
                 shoved: list of tracks that were pushed out of the way
-                    (``{net, layer, width, points}`` each).
+                    into clear space (``{net, layer, width, points}``
+                    each; endpoints stay pinned, and every displacement
+                    keeps DRC clearance from pads/vias/keepouts).
                 corner_mode: echoed corner_mode.
                 algorithm: echoed algorithm (``astar`` | ``pns``).
                 via_count / vias: vias written (0 for single-layer).
@@ -837,7 +839,19 @@ def _apply_shoved_tracks(
     segments.  Originals that are already gone from the file (e.g. a
     track shoved twice in one multi-leg route) are simply not matched —
     appending the displaced polyline is idempotent per final position.
+
+    The same original re-shoved by several legs collapses to its LAST
+    displacement (each original's file segment is deleted once; writing
+    every displaced polyline would fork/double the physical track).  The
+    router already collapses pairs before handing them over — this is
+    defense in depth for any other caller.
     """
+    collapsed: dict[tuple, tuple[TrackObstacle, TrackObstacle]] = {}
+    for orig, displaced in moved_pairs:
+        key = (orig.start, orig.end, orig.width, orig.layer, orig.net)
+        collapsed[key] = (orig, displaced)
+    moved_pairs = list(collapsed.values())
+
     kept: list = []
     displaced_segs: list[list] = []
     written: set[tuple | None] = set()

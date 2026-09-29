@@ -22,6 +22,25 @@
 >   "PNS proposes candidates, VLM selects" `candidates` design was dropped —
 >   see §10.)
 
+> **changelog (2026-09-29) — shove invariants**
+> - **Endpoints never move.**  Each movable obstacle is one file segment —
+>   moving its endpoints (KiCad's attempt>=2 `permitAdjustingEndpoints`)
+>   disconnected the physical track from its neighbours at the joint.  The
+>   shove chain now pins every pushed track's endpoints; a hull covering an
+>   endpoint fails the route loudly (`ShoveFailure`) instead of breaking a
+>   track.
+> - **Fixed-solid clearance.**  Displaced tracks are re-walked clear of every
+>   *fixed* solid (pads, vias, keepouts, openings, non-shovable tracks) with
+>   the DRC margin — the shove stage previously only checked other movable
+>   tracks, so a pushed track could be landed on a pad.  Unresolvable
+>   conflicts fail the route; same-net anchor copper is exempt (no DRC gap
+>   against one's own pads).
+> - **Last displacement wins.**  Multi-leg routes shove every leg against one
+>   board snapshot, so the same track can be displaced by several legs.  The
+>   result collapses `moved_pairs` to the LAST displacement per original
+>   (router + write path), and later legs shove against earlier legs' final
+>   copper — a doubled displacement would fork/disconnect the track.
+
 ## 1. Decision: replace, don't patch
 
 User directive: "not patching on top of A* — replace the current A* algorithm

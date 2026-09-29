@@ -63,6 +63,7 @@ def route_engine(
     clearance: float,
     corner_mode: CornerMode | str = CornerMode.MITERED_45,
     max_shove_depth: float | None = None,
+    extra_fixed: Sequence[Obstacle] = (),
 ) -> EngineResult:
     """Route ``start`` → ``end`` through the obstacle set with walkaround
     + shove, returning the final polyline and the pushed tracks.
@@ -71,6 +72,11 @@ def route_engine(
     tracks are treated as fixed solids and never displaced).  ``None``
     (default) is the pre-existing behavior: shove with
     ``MAX_SHOVE_DEPTH`` as the chain cap.
+
+    ``extra_fixed`` extends the fixed-solid set that *shoved* tracks must
+    keep clear of, without making the route walk around it (used by
+    multi-leg routes: the copper of earlier legs is same-net to the
+    route — legal to touch — but foreign to every shoved track).
     """
     trace = build_initial_trace(start, end, corner_mode)
     skeleton = trace.as_polyline(arc_pts=16)
@@ -123,6 +129,13 @@ def route_engine(
     walked = _walkaround_solids(skeleton, node, track_width, clearance)
 
     if movable and shove_enabled:
+        # Shoved tracks must also stay clear of every FIXED solid (pads,
+        # vias, keepouts, openings, non-shovable tracks): the shove stage
+        # only gauges other movable tracks, so without this a displaced
+        # track can be landed on top of a pad.  ``walk_obstacles`` is
+        # exactly the fixed set here; ``extra_fixed`` adds the route's
+        # own earlier-leg copper (foreign to every shoved track).
+        fixed = [*walk_obstacles, *extra_fixed]
         try:
             shoved: ShoveResult = shove_path(
                 walked,
@@ -130,6 +143,7 @@ def route_engine(
                 width=track_width,
                 clearance=clearance,
                 max_depth=MAX_SHOVE_DEPTH if max_shove_depth is None else max_shove_depth,
+                fixed_obstacles=fixed,
             )
         except ShoveFailure as exc:
             # The caller (auto_route_pair) only knows PnsFailure; a raw
