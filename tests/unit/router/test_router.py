@@ -2989,3 +2989,106 @@ def test_astar_multi_layer_blocked_renders_evidence(tmp_path: Path) -> None:
             algorithm="astar",
         )
     )
+
+
+# Board-edge A* regression: pads on / beyond the Edge.Cuts outline
+# ---------------------------------------------------------------------------
+
+
+def _edge_board(tmp_path: Path, r2_y: float = 15.0) -> Path:
+    """A 30x30 mm board with two same-net F.Cu SMD pads.
+
+    R1 sits exactly on the top Edge.Cuts line (y=30.0) -- its center-to-
+    edge distance is 0, far below the 0.125 mm half-width of the 0.25 mm
+    track: the condition that used to let A* emit an out-of-board first
+    segment and then fail the whole route at the board check.  R2 sits at
+    (20.0, r2_y).
+    """
+    board = (
+        "\t(layers\n"
+        '\t\t(0 "F.Cu" signal)\n'
+        '\t\t(31 "B.Cu" signal)\n'
+        "\t)\n"
+        '\t(net "N")\n'
+        '\t(footprint "test:edge"\n'
+        '\t\t(layer "F.Cu")\n'
+        "\t\t(at 10.0 30.0 0.0)\n"
+        '\t\t(property "Reference" "R1")\n'
+        '\t\t(property "Value" "edge")\n'
+        '\t\t(pad "1" smd rect\n'
+        "\t\t\t(at 0.0 0.0)\n"
+        "\t\t\t(size 1.0 1.0)\n"
+        '\t\t\t(layers "F.Cu" "F.Mask")\n'
+        '\t\t\t(net "N")\n'
+        "\t\t)\n"
+        "\t)\n"
+        '\t(footprint "test:edge"\n'
+        '\t\t(layer "F.Cu")\n'
+        f"\t\t(at 20.0 {r2_y} 0.0)\n"
+        '\t\t(property "Reference" "R2")\n'
+        '\t\t(property "Value" "target")\n'
+        '\t\t(pad "1" smd rect\n'
+        "\t\t\t(at 0.0 0.0)\n"
+        "\t\t\t(size 1.0 1.0)\n"
+        '\t\t\t(layers "F.Cu" "F.Mask")\n'
+        '\t\t\t(net "N")\n'
+        "\t\t)\n"
+        "\t)\n"
+        '\t(gr_line (start 0.0 0.0) (end 30.0 0.0) (layer "Edge.Cuts"))\n'
+        '\t(gr_line (start 30.0 0.0) (end 30.0 30.0) (layer "Edge.Cuts"))\n'
+        '\t(gr_line (start 30.0 30.0) (end 0.0 30.0) (layer "Edge.Cuts"))\n'
+        '\t(gr_line (start 0.0 30.0) (end 0.0 0.0) (layer "Edge.Cuts"))\n'
+    )
+    return _load_pcb_text(board, tmp_path)
+
+
+def test_astar_routes_inward_from_pad_on_board_edge(tmp_path: Path) -> None:
+    """A pad sitting on the Edge.Cuts line (gap < half the track width)
+    routes inward; A* must no longer emit the misleading out-of-board
+    first segment."""
+    pcb = _edge_board(tmp_path)
+    result = auto_route_pair(
+        RouteRequest(
+            pcb_path=str(pcb),
+            ref_a="R1",
+            pad_a="1",
+            ref_b="R2",
+            pad_b="1",
+            net="N",
+            width=0.25,
+            clearance=0.2,
+        )
+    )
+    assert len(result.segments) >= 1
+    # Start lands on the edge pad (within its 1x1 mm rect), end on pad B.
+    assert result.start == pytest.approx((10.0, 30.0), abs=0.2)
+    assert result.end == pytest.approx((20.0, 15.0), abs=0.01)
+    # No segment may leave the 30x30 board outline.
+    for seg in result.segments:
+        for x, y in ((seg.x1, seg.y1), (seg.x2, seg.y2)):
+            assert -0.001 <= x <= 30.001
+            assert -0.001 <= y <= 30.001
+
+
+def test_astar_pad_beyond_board_fails_with_board_bounds(tmp_path: Path) -> None:
+    """A pad physically outside the Edge.Cuts outline fails the search
+    cleanly, naming the board bounds, not the old misleading 'Segment 1
+    would extend outside' error."""
+    pcb = _edge_board(tmp_path, r2_y=45.0)  # 15 mm beyond the top edge
+    with pytest.raises(RouteFailure) as exc_info:
+        auto_route_pair(
+            RouteRequest(
+                pcb_path=str(pcb),
+                ref_a="R1",
+                pad_a="1",
+                ref_b="R2",
+                pad_b="1",
+                net="N",
+                width=0.25,
+                clearance=0.2,
+            )
+        )
+    err = str(exc_info.value)
+    assert "No obstacle-avoiding path" in err
+    assert "within board" in err
+    assert "Segment" not in err

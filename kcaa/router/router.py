@@ -560,6 +560,11 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
     route_bbox = (_x0, _y0, _x1, _y1)
     grid_res = req.grid_resolution or GRID_RESOLUTION
 
+    # Board-outline context for A* failure messages (empty when the board
+    # has no Edge.Cuts outline).  The same bbox fences the A* search so it
+    # cannot step outside the board.
+    _board_note = f" within board {model.board_bbox}" if model.board_bbox is not None else ""
+
     # ---- A* directly from pad centre to pad centre ----
     _ax, _ay = pad_a_xy
     _bx, _by = pad_b_xy
@@ -634,6 +639,7 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
                 via_cost=req.via_cost,
                 via_forbidden_zones=via_forbidden or None,
                 turn_penalty=req.turn_penalty,
+                fence_bbox=model.board_bbox,
             )
             if ml_result.path is None:
                 # Dump the failure state so the blockage can be inspected.
@@ -641,7 +647,8 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
                 msg = (
                     f"No obstacle-avoiding multi-layer path from "
                     f"{req.ref_a}/{req.pad_a} to {req.ref_b}/{req.pad_b} at "
-                    f"{width}mm track width ({start_layer} -> {end_layer})."
+                    f"{width}mm track width ({start_layer} -> {end_layer})"
+                    f"{_board_note}."
                 )
                 png = _render_route_failure_evidence(
                     req.pcb_path,
@@ -748,13 +755,14 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
                 fine_resolution=grid_res,
                 route_bbox=route_bbox,
                 turn_penalty=req.turn_penalty,
+                fence_bbox=model.board_bbox,
             )
             if result.path is None:
                 _dump_viz("fail-astar", [], _pad_viz, layer_obstacles, route_bbox)
                 msg = (
                     f"No obstacle-avoiding path from {req.ref_a}/{req.pad_a} to "
                     f"{req.ref_b}/{req.pad_b} at {width}mm track width on layer "
-                    f"{start_layer}."
+                    f"{start_layer}{_board_note}."
                 )
                 png = _render_route_failure_evidence(
                     req.pcb_path,
