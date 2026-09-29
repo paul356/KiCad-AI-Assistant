@@ -52,6 +52,7 @@ class TestPluginSettingsSaveLoad:
             config_dir=tmp_config_dir,
             llm_provider="anthropic",
             llm_api_key="sk-test",
+            llm_user_agent="python-requests/2.32.3",
             llm_model="claude-opus-4-5",
             server_port=8765,
             show_tool_log=False,
@@ -61,6 +62,7 @@ class TestPluginSettingsSaveLoad:
         loaded = PluginSettings.load(config_dir=tmp_config_dir)
         assert loaded.llm_provider == "anthropic"
         assert loaded.llm_api_key == "sk-test"
+        assert loaded.llm_user_agent == "python-requests/2.32.3"
         assert loaded.llm_model == "claude-opus-4-5"
         assert loaded.server_port == 8765
         assert loaded.show_tool_log is False

@@ -75,6 +75,7 @@ def _make_client(
     settings = types.SimpleNamespace(
         llm_provider="openai",
         llm_api_key="sk-test",
+        llm_user_agent="",
         llm_model="gpt-4o",
         llm_base_url="",
         llm_context_tokens=context_tokens,
@@ -1638,6 +1639,32 @@ class TestOpenAICompatibleRequests:
         anthropic_ua = client._anthropic_headers()["User-Agent"]
         assert openai_ua == anthropic_ua
         assert anthropic_ua == llm_client._LLM_USER_AGENT
+
+    def test_default_user_agent_is_builtin_constant(self):
+        client = _make_client()
+
+        assert client._openai_headers()["User-Agent"] == llm_client._LLM_USER_AGENT
+        assert client._anthropic_headers()["User-Agent"] == llm_client._LLM_USER_AGENT
+
+    def test_custom_user_agent_used_by_openai_headers(self):
+        client = _make_client()
+        client._settings.llm_user_agent = "python-requests/2.32.3"
+
+        assert client._openai_headers()["User-Agent"] == "python-requests/2.32.3"
+
+    def test_custom_user_agent_used_by_anthropic_headers(self):
+        client = _make_client()
+        client._settings.llm_user_agent = "python-requests/2.32.3"
+
+        assert client._anthropic_headers()["User-Agent"] == "python-requests/2.32.3"
+
+    def test_custom_user_agent_not_confused_with_urllib_default(self):
+        client = _make_client()
+        client._settings.llm_user_agent = "python-requests/2.32.3"
+
+        for headers in (client._openai_headers(), client._anthropic_headers()):
+            assert headers["User-Agent"] == "python-requests/2.32.3"
+            assert "Python-urllib" not in headers["User-Agent"]
 
 
 # ---------------------------------------------------------------------------

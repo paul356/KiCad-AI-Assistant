@@ -252,12 +252,13 @@ _ANTHROPIC_DEFAULT_MAX_TOKENS = 65536
 # alone nearly fills the history budget (issue #140).
 _COMPACTION_SUMMARY_FLOOR_CHARS = 800
 
-# User-Agent sent on OpenAI/Anthropic LLM requests. urllib's default
+# Default User-Agent sent on OpenAI/Anthropic LLM requests. urllib's default
 # "Python-urllib/x.y" is rejected with HTTP 403 by some OpenAI/Anthropic-
 # compatible gateways (OpenRouter, Groq, vLLM, LM Studio, corporate
 # proxies), so an explicit plugin-identifying header is required (issue
-# #149). Version literal must stay in sync with pyproject.toml (the plugin
-# package has no __version__).
+# #149). Users can override it via the llm_user_agent setting (review
+# comment on #150). Version literal must stay in sync with pyproject.toml
+# (the plugin package has no __version__).
 _LLM_USER_AGENT = "KiCad-AI-Assistant/0.2.5 (+https://github.com/paul356/KiCad-AI-Assistant)"
 
 # ------------------------------------------------------------------
@@ -3221,12 +3222,17 @@ class LLMClient:
             url, headers, encoded, timeout=300, fmt="anthropic", on_stream_event=on_stream_event
         )
 
+    def _user_agent(self) -> str:
+        """User-Agent for OpenAI/Anthropic requests: the configured value
+        when set, else the built-in default."""
+        return getattr(self._settings, "llm_user_agent", "") or _LLM_USER_AGENT
+
     def _anthropic_headers(self) -> dict[str, str]:
         """Build headers for Anthropic-compatible endpoints with optional auth."""
         headers = {
             "Content-Type": "application/json",
             "anthropic-version": "2023-06-01",
-            "User-Agent": _LLM_USER_AGENT,
+            "User-Agent": self._user_agent(),
         }
         if self._settings.llm_api_key:
             headers["x-api-key"] = self._settings.llm_api_key
@@ -3243,7 +3249,7 @@ class LLMClient:
 
     def _openai_headers(self) -> dict[str, str]:
         """Build headers for OpenAI-compatible endpoints with optional auth."""
-        headers = {"Content-Type": "application/json", "User-Agent": _LLM_USER_AGENT}
+        headers = {"Content-Type": "application/json", "User-Agent": self._user_agent()}
         if self._settings.llm_api_key:
             headers["Authorization"] = f"Bearer {self._settings.llm_api_key}"
         return headers

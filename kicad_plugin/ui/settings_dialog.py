@@ -76,6 +76,19 @@ if _WX_AVAILABLE:
             self._base_url = wx.TextCtrl(self, value=self._settings.llm_base_url)
             grid.Add(self._base_url, 1, wx.EXPAND)
 
+            # User-Agent
+            grid.Add(wx.StaticText(self, label="User-Agent:"), 0, wx.ALIGN_CENTER_VERTICAL)
+            self._user_agent = wx.TextCtrl(self, value=self._settings.llm_user_agent)
+            self._user_agent.SetHint(
+                "leave blank for plugin default (KiCad-AI-Assistant/0.2.5); e.g. python-requests/2.32.3"
+            )
+            self._user_agent.SetToolTip(
+                "User-Agent sent on OpenAI/Anthropic-compatible requests. Some gateways "
+                "reject urllib's default (Python-urllib/...); accepted values include "
+                "python-requests/2.32.3, curl/8.14.1. Leave blank for the plugin default."
+            )
+            grid.Add(self._user_agent, 1, wx.EXPAND)
+
             # Python executable
             grid.Add(wx.StaticText(self, label="Python executable:"), 0, wx.ALIGN_CENTER_VERTICAL)
             self._python = wx.TextCtrl(self, value=self._settings.python_executable)
@@ -192,6 +205,7 @@ if _WX_AVAILABLE:
             settings.llm_model = self._model.GetValue().strip()
             settings.llm_supports_vision = self._supports_vision.GetValue()
             settings.llm_base_url = self._base_url.GetValue().strip()
+            settings.llm_user_agent = self._user_agent.GetValue().strip()
             settings.python_executable = self._python.GetValue().strip()
             settings.server_port = self._port.GetValue()
             settings.show_tool_log = self._show_tool_log.GetValue()

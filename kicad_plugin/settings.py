@@ -80,6 +80,9 @@ class PluginSettings:
     # LLM provider
     llm_provider: str = "openai"  # "openai" | "anthropic" | "ollama"
     llm_api_key: str = field(default="", repr=False)  # never leak key in logs/repr
+    llm_user_agent: str = (
+        ""  # "" = built-in default; custom User-Agent for OpenAI/Anthropic requests
+    )
     llm_model: str = "gpt-4o"  # model name
     llm_supports_vision: bool = False  # whether the model accepts image input
     llm_base_url: str = (
