@@ -20,7 +20,7 @@ import math
 
 from kcaa.router.pns.direction45 import ArcSeg, CornerMode, Trace, build_initial_trace
 from kcaa.router.pns.node import ObstacleNode
-from kcaa.router.pns.shove import ShoveResult, TrackObstacle, shove_path
+from kcaa.router.pns.shove import ShoveFailure, ShoveResult, TrackObstacle, shove_path
 from kcaa.router.pns.walkaround import WalkFailure, walkaround_line
 from kcaa.router.world_model import Obstacle
 
@@ -123,13 +123,19 @@ def route_engine(
     walked = _walkaround_solids(skeleton, node, track_width, clearance)
 
     if movable and shove_enabled:
-        shoved: ShoveResult = shove_path(
-            walked,
-            movable,
-            width=track_width,
-            clearance=clearance,
-            max_depth=MAX_SHOVE_DEPTH if max_shove_depth is None else max_shove_depth,
-        )
+        try:
+            shoved: ShoveResult = shove_path(
+                walked,
+                movable,
+                width=track_width,
+                clearance=clearance,
+                max_depth=MAX_SHOVE_DEPTH if max_shove_depth is None else max_shove_depth,
+            )
+        except ShoveFailure as exc:
+            # The caller (auto_route_pair) only knows PnsFailure; a raw
+            # ShoveFailure would bubble past router and tool into
+            # FastMCP's "success: true + text error" wrapper.
+            raise PnsFailure(f"shove failed: {exc}") from exc
         out_path = shoved.path
         pushed = shoved.pushed
         moved_pairs = shoved.moved_pairs

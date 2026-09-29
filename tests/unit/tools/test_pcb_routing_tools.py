@@ -620,6 +620,26 @@ class TestPcbRouteStrategy:
         assert len(gnd) == 1
         assert gnd[0]["start"] == (40.0, 25.0) and gnd[0]["end"] == (55.0, 45.0)
 
+    def test_shove_failure_returns_error_with_evidence(self, tools, crossing_board, monkeypatch):
+        """A shove-stage ShoveFailure must surface as
+        {"error": ..., "route_png": ...} — never the FastMCP
+        success:true + text-error wrapper (and evidence still renders)."""
+        from kcaa.router.pns.shove import ShoveFailure
+        import kcaa.router.route_engine as re_mod
+
+        def _boom(*_args, **_kwargs):
+            raise ShoveFailure("cannot shove track (10, 20) -> (30, 40)")
+
+        monkeypatch.setattr(re_mod, "shove_path", _boom)
+        result = self._route_vcc(tools, crossing_board, strategy="shove", dry_run=True)
+        assert "error" in result
+        assert "success" not in result
+        assert "shove failed" in result["error"]
+        assert "cannot shove track" in result["error"]
+        png = result.get("route_png")
+        assert png is not None and os.path.isfile(png)
+        os.remove(png)
+
 
 # ── Route failure evidence render ──────────────────────────────────────
 
