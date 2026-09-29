@@ -324,11 +324,32 @@ def _snap45_line(
     — snapping must never create a DRC violation by itself (the final
     audit is the gate).
 
+    A candidate is also rejected when it turns the path back on itself:
+    the entry turn (previous segment -> first candidate leg) and the
+    exit turn (second candidate leg -> following segment) must both be
+    <= 90 degrees, keeping the polyline direction-continuous (no sharp
+    re-entry angles, which are DRC min-angle violations and route
+    surprises).  The fallback keeps the original segment even when its
+    neighbours turn more than 90 degrees — that geometry follows the
+    obstacle hull and is the cost of the walkaround, not a snapping
+    choice.  Corner smoothing (fillet arcs) is deliberately out of
+    scope until the polyline scheme is stable.
+
     Clear means: no *interior* entry into a hull (``touches``-only
     boundary riding is the walkaround's exact-margin placement and is
     legal).  First/last points are pinned, so a snapped displacement
     keeps the physical track connected.
     """
+
+    def _turn_le_90(a: tuple[float, float], b: tuple[float, float], c: tuple[float, float]) -> bool:
+        """True when the smallest angle at ``b`` from ``a`` to ``c`` is <= 90
+        degrees (zero-length legs count as no turn)."""
+        v1x, v1y = b[0] - a[0], b[1] - a[1]
+        v2x, v2y = c[0] - b[0], c[1] - b[1]
+        if math.hypot(v1x, v1y) < 1e-12 or math.hypot(v2x, v2y) < 1e-12:
+            return True
+        dot = v1x * v2x + v1y * v2y
+        return dot >= -1e-9 * math.hypot(v1x, v1y) * math.hypot(v2x, v2y)
 
     def _seg_clear(p1: tuple[float, float], p2: tuple[float, float]) -> bool:
         line = LineString([p1, p2])
@@ -344,9 +365,17 @@ def _snap45_line(
             continue
         chosen: tuple[float, float] | None = None
         for cx, cy in ((x2, y1), (x1, y2)):
-            if _seg_clear(out[-1], (cx, cy)) and _seg_clear((cx, cy), (x2, y2)):
-                chosen = (cx, cy)
-                break
+            corner = (cx, cy)
+            if not _seg_clear(out[-1], corner) or not _seg_clear(corner, (x2, y2)):
+                continue
+            # Direction-continuity: no >90-degree turn into or out of the
+            # corner (a Manhattan corner is its own 90-degree turn).
+            if len(out) >= 2 and not _turn_le_90(out[-2], out[-1], corner):
+                continue
+            if i + 1 < len(pts) and not _turn_le_90(corner, (x2, y2), pts[i + 1]):
+                continue
+            chosen = corner
+            break
         if chosen is not None:
             out.append(chosen)
         out.append((x2, y2))
