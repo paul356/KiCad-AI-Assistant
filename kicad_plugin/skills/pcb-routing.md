@@ -43,10 +43,23 @@ Connect pads belonging to the same net with DRC-clean tracks.
 ``pcb_route_pad_to_pad`` takes an ``algorithm`` argument; a single route
 always uses exactly one algorithm.  The response echoes ``algorithm``.
 
+Which one should you use?  Two callers, two flows:
+
+- **Non-vision callers** (human engineers, scripts, text-only agents):
+  keep the default ``algorithm="astar"`` — route the exact pad pairs from
+  ``get_ratsnest`` and read the structured response.  Straight segments,
+  no render loop required.
+- **Vision-capable agents** (a VLM that reads render images): use
+  ``algorithm="pns"`` for the walkaround + shove engine and drive it with
+  the visual loop below — read the board render, emit an anchor chain,
+  iterate on the rendered evidence.
+
 - ``astar`` (default): grid-based A* planner.  Single-layer routes run
   hierarchical grid A* (coarse pass + fine band); multi-layer routes run
   multi-layer A* with via edges.  This is the classic router behaviour and
   emits straight segments only — rounded-corner arcs are a PNS feature.
+  It is the recommended choice for non-vision callers: call it straight
+  pad-to-pad and read the result, no render loop needed.
 - ``pns``: walkaround + shove engine (no A* grid).  The route walks around
   fixed obstacles (pads, vias, keepouts, other nets) and shoves movable
   tracks out of the way with chain propagation.  A single-layer route may
@@ -83,13 +96,17 @@ traversable in both directions.  Default ``(("F.Cu", "B.Cu"),)``.  On a
 ``(("F.Cu", "In1.Cu"), ("In1.Cu", "B.Cu"))`` to allow routing through
 the inner stack instead of jumping straight F<->B.
 
-## VLM-aided routing loop
-Routing is a VLM-driven loop: you read the rendered board and make the
-global decisions (anchor chain, layers, order, accept or retry), while
-the routing engine owns the precise geometry between your anchors — the
-same split as interactive routing in KiCad, where the human clicks the
-anchors and the engine fills in the track between them.  Do not hand the
-router every track segment; hand it a route intent.
+## Visual-aided routing loop (VLM / vision-capable agents)
+This loop is for vision-capable callers — a VLM or any agent that reads
+render images.  Non-vision callers should stick with the default
+``algorithm="astar"`` and straight pad-to-pad calls (above); this loop
+buys nothing without the render.  The vision caller reads the rendered
+board and makes the global decisions (anchor chain, layers, order,
+accept or retry), while the routing engine owns the precise geometry
+between the anchors — the same split as interactive routing in KiCad,
+where the human clicks the anchors and the engine fills in the track
+between them.  Do not hand the router every track segment; hand it a
+route intent.
 
 1. **See the whole board first** — call ``export_pcb_layer_image`` on the
    current board state (pad labels like ``R5.1`` are rendered) and pick
