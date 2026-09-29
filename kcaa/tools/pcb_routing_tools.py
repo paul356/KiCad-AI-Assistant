@@ -37,6 +37,7 @@ from kcaa.router.router import (
 )
 from kcaa.router.via_check import ProposedVia, check_vias
 from kcaa.tools.render_route_state import render_route_attempt
+from kcaa.utils.config import model_supports_vision
 from kcaa.utils.pcb_sexp_utils import load_pcb, save_pcb
 
 log = logging.getLogger(__name__)
@@ -936,16 +937,18 @@ def _route_anchors(pcb_path: str, req: RouteRequest) -> list[tuple[float, float]
 def _route_payload(payload: dict, png_bytes: bytes | None = None) -> tuple[str, Image] | str:
     """Serialize a routing-tool payload to MCP content blocks.
 
-    Returns ``(json_text, Image)`` when a render is available — the text
-    block carries the result envelope, the image block carries the
-    rendered route/evidence PNG, exactly the shape the plugin's
-    ``call_mcp_tool`` splits into the result dict + ``_image`` field
-    (same convention as ``export_pcb_layer_image``).  Falls back to the
-    bare JSON text (no image) when no render exists; the payload itself
-    is unchanged in both cases.
+    Returns ``(json_text, Image)`` when a render is available AND the
+    calling model is vision-capable (``KICAD_MCP_SUPPORTS_VISION``, set
+    by the plugin from its vision setting) — the text block carries the
+    result envelope, the image block carries the rendered route/evidence
+    PNG, exactly the shape the plugin's ``call_mcp_tool`` splits into
+    the result dict + ``_image`` field (same convention as
+    ``export_pcb_layer_image``).  A text-only model gets the bare JSON
+    text (no image block, no render payload); the payload itself is
+    unchanged in both cases.
     """
     text = json.dumps(payload, ensure_ascii=False)
-    if png_bytes:
+    if png_bytes and model_supports_vision():
         return text, Image(data=png_bytes, format="png")
     return text
 

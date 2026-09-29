@@ -28,6 +28,7 @@ import matplotlib.patches as mpatches  # noqa: E402
 import matplotlib.patheffects as mpatheffects  # noqa: E402
 import matplotlib.pyplot as plt  # noqa: E402
 
+from kcaa.utils.config import model_supports_vision
 from kcaa.utils.pcb_sexp_utils import load_pcb
 
 # KiCad default theme approximations (same palette as scripts/vlm_route_feedback.py).
@@ -1801,7 +1802,7 @@ def register_render_board_tools(mcp: FastMCP) -> None:
         label_format: str = "number",
         show_footprint_refs: bool = True,
         ctx: Context | None = None,
-    ) -> tuple[str, Image]:
+    ) -> tuple[str, Image] | str:
         """Render a KiCad PCB to a PNG image (no kicad-cli needed).
 
         By default the composite shows all copper layers stacked in physical
@@ -1856,7 +1857,10 @@ def register_render_board_tools(mcp: FastMCP) -> None:
             ctx: FastMCP context for progress reporting.
 
         Returns:
-            A text report plus the PNG image.
+            A text report plus the PNG image (image block only when the
+            calling model is vision-capable — ``KICAD_MCP_SUPPORTS_VISION``
+            set by the plugin; a text-only model receives the report
+            without the image).
         """
         lines, png, report = render_board(
             pcb_path,
@@ -1875,4 +1879,10 @@ def register_render_board_tools(mcp: FastMCP) -> None:
             suffix = f"-{layer.replace('.', '-')}" if layer else ""
             with open(os.path.join(output_dir, f"{base}{suffix}.png"), "wb") as f:
                 f.write(png)
-        return "\n".join(lines) + f"\nreport={report}", Image(data=png, format="png")
+        report_text = "\n".join(lines) + f"\nreport={report}"
+        # Image block only for vision-capable models (the plugin passes
+        # KICAD_MCP_SUPPORTS_VISION); a text-only model gets the report
+        # without the PNG payload.
+        if model_supports_vision():
+            return report_text, Image(data=png, format="png")
+        return report_text
