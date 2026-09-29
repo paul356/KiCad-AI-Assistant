@@ -3,6 +3,7 @@ Unit tests for kcaa/tools/pcb_routing_tools.py (pcb_delete_tracks / pcb_delete_v
 """
 
 import asyncio
+import json
 import os
 import shutil
 import tempfile
@@ -202,6 +203,21 @@ def crossing_board(tmp_path):
 
 
 def _run(coro):
+    """Run a tool call and normalize the MCP content return to a dict.
+
+    ``pcb_route_pad_to_pad`` returns ``(json_text, Image)`` content
+    blocks (image dropped here — asserted separately via ``_run_raw``)
+    or bare JSON text; other tools return plain dicts."""
+    result = asyncio.run(coro)
+    if isinstance(result, tuple):
+        result = result[0]
+    if isinstance(result, str):
+        result = json.loads(result)
+    return result
+
+
+def _run_raw(coro):
+    """Run a tool call and return the raw MCP content untouched."""
     return asyncio.run(coro)
 
 
@@ -518,6 +534,36 @@ class TestPcbRouteStrategy:
         assert png and os.path.exists(png)
         assert open(routable_board, "rb").read() == before
 
+    def test_success_returns_image_content_block(self, tools, routable_board):
+        """The tool result carries (json_text, Image): the rendered route
+        PNG as an image content block — the plugin splits it into the
+        ``_image`` field the VLM actually sees (a path alone is never
+        relayed as image data)."""
+        from fastmcp.utilities.types import Image
+
+        raw = _run_raw(
+            tools["pcb_route_pad_to_pad"](
+                pcb_path=routable_board,
+                ref_a="R1",
+                pad_a="1",
+                ref_b="C1",
+                pad_b="1",
+                net="VCC",
+                ctx=None,
+                width=0.2,
+                algorithm="pns",
+            )
+        )
+        assert isinstance(raw, tuple) and len(raw) == 2
+        payload = json.loads(raw[0])
+        assert "error" not in payload
+        assert payload["strategy"] == "shove"
+        image = raw[1]
+        assert isinstance(image, Image)
+        assert image.data[:8] == b"\x89PNG\r\n\x1a\n"
+        if payload.get("route_png"):
+            os.remove(payload["route_png"])
+
     # -- Shove persistence -------------------------------------------------
 
     @staticmethod
@@ -765,6 +811,33 @@ class TestPcbRouteFailureEvidence:
         with open(png, "rb") as f:
             assert f.read(8) == b"\x89PNG\r\n\x1a\n"
         os.remove(png)
+
+    def test_failure_returns_image_content_block(self, tools, board_with_tracks):
+        """The failure envelope also carries the evidence PNG as an image
+        content block (the VLM must SEE the failed endpoints, not just a
+        temp path)."""
+        from fastmcp.utilities.types import Image
+
+        raw = _run_raw(
+            tools["pcb_route_pad_to_pad"](
+                pcb_path=board_with_tracks,
+                ref_a="R1",
+                pad_a="1",
+                ref_b="C99",
+                pad_b="1",
+                net="VCC",
+                width=0.25,
+                ctx=None,
+            )
+        )
+        assert isinstance(raw, tuple) and len(raw) == 2
+        payload = json.loads(raw[0])
+        assert "error" in payload
+        assert payload["route_png"] is not None
+        image = raw[1]
+        assert isinstance(image, Image)
+        assert image.data[:8] == b"\x89PNG\r\n\x1a\n"
+        os.remove(payload["route_png"])
 
     def test_failure_render_silent_when_render_unavailable(
         self, tools, board_with_tracks, monkeypatch

@@ -15,6 +15,7 @@ call with a different layer.
 from __future__ import annotations
 
 from collections.abc import Sequence
+import json
 import logging
 import os
 import tempfile
@@ -22,6 +23,7 @@ import time
 from typing import Any
 
 from fastmcp import Context, FastMCP
+from fastmcp.utilities.types import Image
 import sexpdata
 
 from kcaa.router.path_postprocess import OutputArc, OutputSegment, OutputVia
@@ -58,7 +60,7 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
         dry_run: bool = False,
         strategy: str = "shove",
         options: dict | None = None,
-    ) -> dict[str, Any]:
+    ) -> tuple[str, Image] | str:
         """Connect two pads with an obstacle-avoiding track, optionally across layers.
 
         Uses ``algorithm`` to route: ``astar`` (default) runs the grid A*
@@ -206,6 +208,13 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
             with the failed route's endpoint pads marked (``route_png`` is
             ``None`` when rendering is unavailable; the error is never
             masked by the render).
+
+            The tool result is an MCP text + image pair: the JSON envelope
+            described above is the text block, and the rendered route PNG
+            (success) or failure-evidence PNG (error) is an image content
+            block the plugin relays to the model as the ``_image`` field
+            — same convention as ``export_pcb_layer_image``.  When the
+            render is unavailable the result is the bare JSON text.
         """
         corner_mode = "rounded45"
         via_pairs: tuple[tuple[str, str], ...] = (("F.Cu", "B.Cu"),)
@@ -218,12 +227,14 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
             layer_hint = options.get("layer_hint", layer_hint)
         waypoints = list(waypoints or [])
         if strategy not in ("shove", "walkaround"):
-            return {
-                "error": (
-                    f"strategy={strategy!r} is invalid; supported values are "
-                    "'shove' or 'walkaround'."
-                )
-            }
+            return _route_payload(
+                {
+                    "error": (
+                        f"strategy={strategy!r} is invalid; supported values are "
+                        "'shove' or 'walkaround'."
+                    )
+                }
+            )
         req = RouteRequest(
             pcb_path=pcb_path,
             ref_a=ref_a,
@@ -244,12 +255,14 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
         try:
             result = auto_route_pair(req)
         except RouteFailure as exc:
-            return {"error": str(exc), "route_png": _route_failure_png(pcb_path, req)}
+            png_path, png_bytes = _route_failure_evidence(pcb_path, req)
+            return _route_payload({"error": str(exc), "route_png": png_path}, png_bytes)
         except (FileNotFoundError, ValueError) as exc:
-            return {
-                "error": f"Routing input error: {exc}",
-                "route_png": _route_failure_png(pcb_path, req),
-            }
+            png_path, png_bytes = _route_failure_evidence(pcb_path, req)
+            return _route_payload(
+                {"error": f"Routing input error: {exc}", "route_png": png_path},
+                png_bytes,
+            )
 
         # ---- Write path: dry_run short-circuits before reloading
         #      (auto_route_pair already parsed the board) and never
@@ -340,7 +353,8 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
             "pcb_path": pcb_path,
             "dry_run": dry_run,
         }
-        return resp
+        png_bytes = _png_bytes(result.route_png)
+        return _route_payload(resp, png_bytes)
 
     @mcp.tool()
     async def pcb_add_vias(
@@ -919,29 +933,58 @@ def _route_anchors(pcb_path: str, req: RouteRequest) -> list[tuple[float, float]
     return anchors
 
 
-def _route_failure_png(pcb_path: str, req: RouteRequest) -> str | None:
-    """Render a best-effort failure-evidence PNG; ``None`` when unavailable.
+def _route_payload(payload: dict, png_bytes: bytes | None = None) -> tuple[str, Image] | str:
+    """Serialize a routing-tool payload to MCP content blocks.
+
+    Returns ``(json_text, Image)`` when a render is available — the text
+    block carries the result envelope, the image block carries the
+    rendered route/evidence PNG, exactly the shape the plugin's
+    ``call_mcp_tool`` splits into the result dict + ``_image`` field
+    (same convention as ``export_pcb_layer_image``).  Falls back to the
+    bare JSON text (no image) when no render exists; the payload itself
+    is unchanged in both cases.
+    """
+    text = json.dumps(payload, ensure_ascii=False)
+    if png_bytes:
+        return text, Image(data=png_bytes, format="png")
+    return text
+
+
+def _png_bytes(png_path: str | None) -> bytes | None:
+    """Read a rendered PNG file back into bytes; ``None`` when absent."""
+    if not png_path:
+        return None
+    try:
+        with open(png_path, "rb") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def _route_failure_evidence(pcb_path: str, req: RouteRequest) -> tuple[str | None, bytes | None]:
+    """Render best-effort failure-evidence PNG; ``(path, bytes)`` or
+    ``(None, None)`` when unavailable.
 
     The image shows the current board with the failed route's endpoint
     pads marked; it is written to the system temp dir and its path
-    returned.  Rendering must never mask the original failure, so any
-    exception collapses to ``None``.
+    returned alongside the bytes.  Rendering must never mask the
+    original failure, so any exception collapses to ``(None, None)``.
     """
     try:
         _lines, png_bytes, _report = render_route_attempt(
             pcb_path, anchors=_route_anchors(pcb_path, req) or None
         )
         if not png_bytes:
-            return None
+            return None, None
         out = os.path.join(
             tempfile.gettempdir(),
             f"kcaa_route_{time.time_ns()}_{os.getpid()}.png",
         )
         with open(out, "wb") as f:
             f.write(png_bytes)
-        return out
+        return out, png_bytes
     except Exception:  # noqa: BLE001 - evidence must not mask the failure
-        return None
+        return None, None
 
 
 # ---------------------------------------------------------------------------
