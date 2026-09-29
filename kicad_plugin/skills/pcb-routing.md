@@ -45,11 +45,12 @@ always uses exactly one algorithm.  The response echoes ``algorithm``.
 
 Which one should you use?  Two callers, two flows:
 
-- **Non-vision callers** (human engineers, scripts, text-only agents):
+- **Non-vision callers** (scripts, text-only agents — no vision):
   keep the default ``algorithm="astar"`` — route the exact pad pairs from
   ``get_ratsnest`` and read the structured response.  Straight segments,
   no render loop required.
-- **Vision-capable agents** (a VLM that reads render images): use
+- **Vision-capable callers** (a VLM that reads render images, or a human
+  engineer looking at the render): use
   ``algorithm="pns"`` for the walkaround + shove engine and drive it with
   the visual loop below — read the board render, emit an anchor chain,
   iterate on the rendered evidence.
@@ -96,17 +97,17 @@ traversable in both directions.  Default ``(("F.Cu", "B.Cu"),)``.  On a
 ``(("F.Cu", "In1.Cu"), ("In1.Cu", "B.Cu"))`` to allow routing through
 the inner stack instead of jumping straight F<->B.
 
-## Visual-aided routing loop (VLM / vision-capable agents)
-This loop is for vision-capable callers — a VLM or any agent that reads
-render images.  Non-vision callers should stick with the default
-``algorithm="astar"`` and straight pad-to-pad calls (above); this loop
-buys nothing without the render.  The vision caller reads the rendered
-board and makes the global decisions (anchor chain, layers, order,
-accept or retry), while the routing engine owns the precise geometry
-between the anchors — the same split as interactive routing in KiCad,
-where the human clicks the anchors and the engine fills in the track
-between them.  Do not hand the router every track segment; hand it a
-route intent.
+## Visual-aided routing loop (vision-capable callers: VLM, human, or agent)
+This loop is for vision-capable callers — a VLM, a human engineer, or any
+agent that reads render images.  Non-vision callers (scripts, text-only
+agents) should stick with the default ``algorithm="astar"`` and straight
+pad-to-pad calls (above); this loop buys nothing without the render.
+The vision caller reads the rendered board and makes the global
+decisions (anchor chain, layers, order, accept or retry), while the
+routing engine owns the precise geometry between the anchors — the same
+split as interactive routing in KiCad, where the human clicks the
+anchors and the engine fills in the track between them.  Do not hand
+the router every track segment; hand it a route intent.
 
 1. **See the whole board first** — call ``export_pcb_layer_image`` on the
    current board state (pad labels like ``R5.1`` are rendered) and pick
