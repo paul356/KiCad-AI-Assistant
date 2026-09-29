@@ -952,6 +952,7 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
                     corner_mode=corner_mode,
                     max_shove_depth=shove_depth,
                     extra_fixed=extra_fixed,
+                    net=req.net,
                 )
             except PnsFailure as exc:
                 _dump_viz("fail-pns", [], _pad_viz, buffered, route_bbox)
@@ -1621,6 +1622,7 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
                     clearance=clearance,
                     corner_mode=corner_mode,
                     max_shove_depth=shove_depth,
+                    net=req.net,
                 )
             except PnsFailure as exc:
                 # Dump the failure state so the blockage can be inspected

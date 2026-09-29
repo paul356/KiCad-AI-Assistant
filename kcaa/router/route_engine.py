@@ -18,6 +18,9 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 import math
 
+from shapely.geometry import LineString, Polygon
+from shapely.strtree import STRtree
+
 from kcaa.router.pns.direction45 import ArcSeg, CornerMode, Trace, build_initial_trace
 from kcaa.router.pns.node import ObstacleNode
 from kcaa.router.pns.shove import ShoveFailure, ShoveResult, TrackObstacle, shove_path
@@ -26,6 +29,16 @@ from kcaa.router.world_model import Obstacle
 
 MAX_WALKAROUND_ITER = 64
 MAX_SHOVE_DEPTH = 4
+
+# Extra hull margin for the walkaround/shove placement stages.  A line
+# that RIDES a round hull boundary cuts inside the true clearance
+# envelope by the chord sagitta of the hull's arc sampling (default
+# Shapely quad_segs=8 => up to ~6 um for the hull radii used here).
+# The final DRC audit measures the true edge distance, so the placement
+# stages work on ``clearance + CLEARANCE_EPS`` and the audit on
+# ``clearance`` itself — the epsilon absorbs the sagitta instead of
+# fine-sampling every hull (which starves the walking state machine).
+CLEARANCE_EPS = 1e-2  # 10 um, > worst-case chord sagitta (~6 um)
 
 
 class PnsFailure(RuntimeError):
@@ -64,6 +77,7 @@ def route_engine(
     corner_mode: CornerMode | str = CornerMode.MITERED_45,
     max_shove_depth: float | None = None,
     extra_fixed: Sequence[Obstacle] = (),
+    net: str | None = None,
 ) -> EngineResult:
     """Route ``start`` → ``end`` through the obstacle set with walkaround
     + shove, returning the final polyline and the pushed tracks.
@@ -77,6 +91,21 @@ def route_engine(
     keep clear of, without making the route walk around it (used by
     multi-leg routes: the copper of earlier legs is same-net to the
     route — legal to touch — but foreign to every shoved track).
+
+    ``net`` is the route's net, used by the final DRC audit to exempt
+    same-net copper (the route's own pads / earlier legs): same-net
+    copper needs no gap.  ``None`` audits conservatively (no exemption).
+
+    Output contract: whatever leaves the engine is DRC-clean **or the
+    route fails loudly** —
+
+    * every polyline disturbed by walkaround/shove is re-snapped onto the
+      0/45/90 family (KiCad's optimizer-pass analogue; the untouched
+      skeleton keeps its fillet arcs), and
+    * a final all-copper audit re-checks route + every displacement
+      against the whole obstacle set at ``clearance``, raising
+      :class:`PnsFailure` on the first violation instead of writing DRY
+      errors.
     """
     trace = build_initial_trace(start, end, corner_mode)
     skeleton = trace.as_polyline(arc_pts=16)
@@ -126,7 +155,11 @@ def route_engine(
         obstacles if not shove_enabled else [o for o in obstacles if o not in movable_shapes]
     )
     node = ObstacleNode(walk_obstacles)
-    walked = _walkaround_solids(skeleton, node, track_width, clearance)
+    # Placement stages work on clearance + CLEARANCE_EPS so the final
+    # geometry is *strictly* clear; the audit below re-checks against the
+    # true clearance.
+    place_clearance = clearance + CLEARANCE_EPS
+    walked = _walkaround_solids(skeleton, node, track_width, place_clearance)
 
     if movable and shove_enabled:
         # Shoved tracks must also stay clear of every FIXED solid (pads,
@@ -141,7 +174,7 @@ def route_engine(
                 walked,
                 movable,
                 width=track_width,
-                clearance=clearance,
+                clearance=place_clearance,
                 max_depth=MAX_SHOVE_DEPTH if max_shove_depth is None else max_shove_depth,
                 fixed_obstacles=fixed,
             )
@@ -157,6 +190,106 @@ def route_engine(
         out_path = walked
         pushed = []
         moved_pairs = []
+
+    # Originals displaced from the file (their obstacle entries are gone).
+    orig_obstacle_ids: set[int] = set()
+    for i, track in enumerate(movable):
+        if any(track is orig for orig, _ in moved_pairs):
+            orig_obstacle_ids.add(id(movable_shapes[i]))
+
+    # ------------------------------------------------------------------
+    # KiCad optimizer analogue: re-snap disturbed polylines onto the
+    # 0/45/90 family.  The skeleton is born on the family (with optional
+    # fillet arcs); a line disturbed by walkaround/shove rides obstacle
+    # hulls and picks up arbitrary-angle chords.  Each snapped line keeps
+    # the DRC margin to the world it is given (exact-margin boundary
+    # riding allowed, same as the walkaround placement); a Manhattan
+    # corner that would not fit falls back to the original segment, so
+    # snapping never creates a violation by itself.  Skeleton-surviving
+    # legs (``out_path == skeleton``) keep their arcs (see below).
+    # ------------------------------------------------------------------
+    if moved_pairs:
+        disp_pts: list[list[tuple[float, float]]] = [
+            list(disp.points) for _orig, disp in moved_pairs
+        ]
+        stay_movable = [t for t in movable if not any(t is orig for orig, _ in moved_pairs)]
+        # Displaced tracks snap FIRST (world: fixed solids + route +
+        # other movables + other displacements, already-snapped positions
+        # for the ones processed earlier); the route snaps LAST.
+        for i, (_orig, disp) in enumerate(moved_pairs):
+            wk = disp.width
+            hulls: list[Polygon] = [
+                o.shape.buffer(place_clearance + wk / 2.0, cap_style="round")
+                for o in [*walk_obstacles, *extra_fixed]
+                if o.shape is not None and not o.shape.is_empty
+            ]
+            hulls.append(
+                LineString(out_path).buffer(
+                    track_width / 2.0 + place_clearance + wk / 2.0,
+                    cap_style="round",
+                )
+            )
+            for t in stay_movable:
+                hulls.append(
+                    LineString(t.points).buffer(
+                        t.width / 2.0 + place_clearance + wk / 2.0,
+                        cap_style="round",
+                    )
+                )
+            for j, (_oj, dj) in enumerate(moved_pairs):
+                if j == i:
+                    continue
+                hulls.append(
+                    LineString(disp_pts[j]).buffer(
+                        dj.width / 2.0 + place_clearance + wk / 2.0,
+                        cap_style="round",
+                    )
+                )
+            disp_pts[i] = _snap45_line(disp_pts[i], hulls)
+        moved_pairs = [
+            (
+                orig,
+                TrackObstacle(
+                    points=tuple(disp_pts[i]),
+                    width=disp.width,
+                    net=disp.net,
+                    layer=disp.layer,
+                ),
+            )
+            for i, (orig, disp) in enumerate(moved_pairs)
+        ]
+        pushed = [disp for _orig, disp in moved_pairs]
+
+    if out_path != skeleton:
+        route_hulls: list[Polygon] = [
+            o.shape.buffer(place_clearance + track_width / 2.0, cap_style="round")
+            for o in obstacles
+            if o.shape is not None and not o.shape.is_empty
+        ]
+        for _orig, disp in moved_pairs:
+            route_hulls.append(
+                LineString(disp.points).buffer(
+                    disp.width / 2.0 + place_clearance + track_width / 2.0,
+                    cap_style="round",
+                )
+            )
+        out_path = _snap45_line(out_path, route_hulls)
+
+    # Final all-copper DRC audit: the route and every displacement must
+    # keep ``clearance`` from every foreign-net copper item of the final
+    # state (fixed solids, unmoved tracks, other displacements, same-net
+    # excepted).  Any violation means the engine would write a DRC error
+    # — fail loudly instead.
+    _audit_final_copper(
+        out_path=out_path,
+        width=track_width,
+        net=net,
+        obstacles=obstacles,
+        extra_fixed=extra_fixed,
+        moved_pairs=moved_pairs,
+        orig_obstacle_ids=orig_obstacle_ids,
+        clearance=clearance,
+    )
 
     # Rounded skeleton arcs survive only when walkaround left the path
     # untouched (a detour linearizes the arc it goes around).
@@ -177,6 +310,117 @@ def route_engine(
 # ---------------------------------------------------------------------------
 # Internals
 # ---------------------------------------------------------------------------
+
+
+def _snap45_line(
+    pts: Sequence[tuple[float, float]],
+    hulls: Sequence[Polygon],
+) -> list[tuple[float, float]]:
+    """Replace every non-0/45/90 segment with a Manhattan corner.
+
+    For each offending segment both corner candidates ``(x2, y1)`` and
+    ``(x1, y2)`` are tried; the first whose two sub-segments stay clear
+    of every hull wins.  When neither fits, the original segment is kept
+    — snapping must never create a DRC violation by itself (the final
+    audit is the gate).
+
+    Clear means: no *interior* entry into a hull (``touches``-only
+    boundary riding is the walkaround's exact-margin placement and is
+    legal).  First/last points are pinned, so a snapped displacement
+    keeps the physical track connected.
+    """
+
+    def _seg_clear(p1: tuple[float, float], p2: tuple[float, float]) -> bool:
+        line = LineString([p1, p2])
+        return not any(line.intersects(h) and not line.touches(h) for h in hulls)
+
+    out: list[tuple[float, float]] = [pts[0]]
+    for i in range(1, len(pts)):
+        x1, y1 = out[-1]
+        x2, y2 = pts[i]
+        dx, dy = x2 - x1, y2 - y1
+        if abs(dx) < 1e-9 or abs(dy) < 1e-9 or abs(abs(dx) - abs(dy)) < 1e-9:
+            out.append((x2, y2))
+            continue
+        chosen: tuple[float, float] | None = None
+        for cx, cy in ((x2, y1), (x1, y2)):
+            if _seg_clear(out[-1], (cx, cy)) and _seg_clear((cx, cy), (x2, y2)):
+                chosen = (cx, cy)
+                break
+        if chosen is not None:
+            out.append(chosen)
+        out.append((x2, y2))
+    deduped: list[tuple[float, float]] = [out[0]]
+    for p in out[1:]:
+        if abs(p[0] - deduped[-1][0]) > 1e-9 or abs(p[1] - deduped[-1][1]) > 1e-9:
+            deduped.append(p)
+    if len(deduped) < 2:
+        return [pts[0], pts[-1]]
+    return deduped
+
+
+def _audit_final_copper(
+    out_path: Sequence[tuple[float, float]],
+    width: float,
+    net: str | None,
+    obstacles: Sequence[Obstacle],
+    extra_fixed: Sequence[Obstacle],
+    moved_pairs: Sequence[tuple[TrackObstacle, TrackObstacle]],
+    orig_obstacle_ids: set[int],
+    clearance: float,
+) -> None:
+    """Final post-shove DRC audit of the engine output.
+
+    The final copper state is: fixed solids + unmoved tracks (the
+    obstacle set minus the displaced originals), the earlier-leg copper
+    (``extra_fixed``), the displaced tracks in their final places, and
+    the route line itself.  Every audited line (route + displacements)
+    must keep ``clearance`` (edge-to-edge) from every foreign-net item;
+    equal non-None nets are exempt (same-net copper needs no gap, ``None``
+    nets are always audited).  Raises :class:`PnsFailure` on the first
+    violation — the engine never hands back a DRC-violating polyline.
+    """
+    displaced_copper: list[tuple[Polygon, str | None, str]] = [
+        (
+            LineString(disp.points).buffer(disp.width / 2.0, cap_style="round", quad_segs=512),
+            disp.net,
+            f"shoved track (net {disp.net})",
+        )
+        for _orig, disp in moved_pairs
+    ]
+    world: list[tuple[Polygon, str | None, str]] = [
+        (o.shape, o.net, f"{o.kind} (net {o.net})")
+        for o in obstacles
+        if (o.shape is not None and not o.shape.is_empty and id(o) not in orig_obstacle_ids)
+    ]
+    world.extend(
+        (o.shape, o.net, f"{o.kind} (net {o.net})")
+        for o in extra_fixed
+        if o.shape is not None and not o.shape.is_empty
+    )
+    world.extend(displaced_copper)
+
+    if not out_path or len(out_path) < 2:
+        return
+    route_copper = LineString(list(out_path)).buffer(width / 2.0, cap_style="round", quad_segs=512)
+    world.append((route_copper, net, f"route line (net {net})"))
+
+    tree = STRtree([w[0] for w in world])
+    auditees: list[tuple[Polygon, str | None, str]] = [(route_copper, net, "route line")]
+    auditees.extend(displaced_copper)
+    for poly, n, label in auditees:
+        for gi in tree.query(poly.buffer(clearance)):
+            other_poly, other_net, other_desc = world[gi]
+            if other_poly is poly:
+                continue
+            if n is not None and other_net is not None and n == other_net:
+                continue  # same net: no DRC gap required
+            d = float(poly.distance(other_poly))
+            if d < clearance - 1e-9:
+                raise PnsFailure(
+                    f"final DRC audit: {label} comes within {d:.4f} mm of "
+                    f"{other_desc} (needs {clearance} mm clearance)"
+                )
 
 
 def _walkaround_solids(

@@ -199,6 +199,32 @@ class TestShovePathEndpointPinning:
             assert disp.end == orig.end, f"{orig.net}: endpoint moved"
 
 
+class TestShoveDepthCap:
+    """The depth-cap drain: an unconverged chain fails loudly (KiCad
+    SH_INCOMPLETE) instead of writing a partially-shoved state."""
+
+    def test_zero_depth_with_live_collision_raises(self):
+        path = [(-5, 0), (5, 0)]
+        track = TrackObstacle(points=((0, -1), (0, 1)), width=0.2)
+        with pytest.raises(ShoveFailure, match="did not converge"):
+            shove_path(path, [track], width=0.2, clearance=0.1, max_depth=0)
+
+    def test_single_push_converges_within_depth_one(self):
+        path = [(-5, 0), (5, 0)]
+        track = TrackObstacle(points=((0, -1), (0, 1)), width=0.2, net="N2")
+        res = shove_path(path, [track], width=0.2, clearance=0.1, max_depth=1)
+        assert len(res.pushed) == 1
+        pushed = res.pushed[0]
+        # The push walks the track clear of the route (routed endpoints
+        # pinned), so the drain finds no live collision.  The direct
+        # shove call has no engine clearance epsilon: the track rides
+        # the route hull's chord (default arc sampling), so the margin
+        # has up to ~6 um of sagitta — assert with room to spare.
+        assert pushed.start == (0, -1) and pushed.end == (0, 1)
+        d = LineString(pushed.points).distance(LineString(path))
+        assert d >= 0.1 + 0.2 - 0.02, f"pushed track too close to route: {d:.4f}"
+
+
 class TestShovePathFixedSolids:
     def test_pushed_track_avoids_fixed_pad(self):
         """The shove walkaround only looks at other movable tracks: a
@@ -225,7 +251,12 @@ class TestShovePathFixedSolids:
         # Endpoints stay pinned while the line clears the pad copper.
         assert pushed.start == (0, -4) and pushed.end == (0, 4)
         d = LineString(pushed.points).distance(pad.shape)
-        assert d >= 0.2 - 1e-6, f"pushed track violates pad clearance: {d:.4f}"
+        # Direct shove call: no engine clearance epsilon, so the pushed
+        # line rides the pad hull's chord (default arc sampling) and the
+        # margin includes up to ~6 um of sagitta.  The engine adds
+        # CLEARANCE_EPS on top and the final audit re-checks the true
+        # margin — this unit only pins the pinning + rough clearance.
+        assert d >= 0.2 - 0.02, f"pushed track violates pad clearance: {d:.4f}"
 
     def test_same_net_pad_not_an_obstacle_for_pushed_track(self):
         """A pad on the pushed track's OWN net is its anchor, not a
