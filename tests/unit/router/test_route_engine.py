@@ -338,6 +338,25 @@ class TestSnap45Line:
         assert interior.length < 1e-6
         assert _segments_on_45(out)
 
+    def test_rejects_corner_that_turns_back_on_itself(self):
+        # The following segment runs at -120 deg from (4, 1) — both
+        # Manhattan corners are geometrically clear (no hulls), but each
+        # exit leg turns > 90 deg into it.  The corner must be refused
+        # even though snapping would be legal clearance-wise; direction
+        # continuity (no re-entry angle) wins, so the original segment
+        # survives untouched.
+        pts = [(0, 0), (4, 1), (3.5, 0.134)]
+        out = _snap45_line(pts, [])
+        assert out == pts
+
+    def test_corner_accepted_when_exit_turn_is_shallow(self):
+        # Follow-on segment continues at 0 deg: the (x2, y1) corner
+        # exits at 90 deg into it — exactly on the constraint boundary,
+        # so the corner is taken and the polyline stays on the family.
+        out = _snap45_line([(0, 0), (4, 1), (6, 1)], [])
+        assert out == [(0, 0), (4, 0), (4, 1), (6, 1)]
+        assert _segments_on_45(out)
+
 
 class TestFinalAudit:
     """The engine's final DRC audit hard-gates the output."""
