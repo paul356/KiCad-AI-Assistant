@@ -52,7 +52,13 @@ VALID_PIN_TYPES = (
     "unspecified",
 )
 VALID_PIN_DIRECTIONS = ("left", "right", "up", "down")
-_PIN_DIRECTION_ANGLE = {"left": 180, "right": 0, "up": 90, "down": 270}
+# KiCad pin angle convention (lib coordinates, +Y up): the angle is the
+# direction from the electrical (connection) tip back toward the body, so a
+# pin facing left is angle 0 (extends toward +X) and a pin facing up is
+# angle 270 (extends toward -Y).  Matches the R_Small fixture in
+# tests/unit/tools/fixtures/tools_test.kicad_sch (top pin (at 0 2.54 270),
+# bottom pin (at 0 -2.54 90)).
+_PIN_DIRECTION_ANGLE = {"left": 0, "right": 180, "up": 270, "down": 90}
 # Valid symbol names: alphanumerics/underscore, must not start with a digit.
 _SYMBOL_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
 _DEFAULT_BODY_WIDTH_MM = 6.35  # KiCad standard body width (250 mil)
@@ -1215,10 +1221,10 @@ def _build_lib_symbol_raw(
 
     Pin auto-layout (all offsets stay on the 1.27 mm / 50-mil grid):
 
-    * ``direction=left``  → pins face the body's left edge, angle 180
-    * ``direction=right`` → pins face the body's right edge, angle 0
-    * ``direction=up``    → pins face the body's top edge, angle 90
-    * ``direction=down``  → pins face the body's bottom edge, angle 270
+    * ``direction=left``  → pins face the body's left edge, angle 0
+    * ``direction=right`` → pins face the body's right edge, angle 180
+    * ``direction=up``    → pins face the body's top edge, angle 270
+    * ``direction=down``  → pins face the body's bottom edge, angle 90
 
     Pins on the same side are spaced 2.54 mm (100 mil) apart, centred on the
     body, in the order they appear in *pins*.  Each pin is 2.54 mm long with
@@ -1240,7 +1246,7 @@ def _build_lib_symbol_raw(
         per_side[pin["direction"]].append(pin)
 
     def _side_offsets(count: int) -> list[float]:
-        """Centred 2.54 mm-spaced offsets; every value is an odd 1.27 mm step."""
+        """Centred 2.54 mm-spaced offsets, every value on the 1.27 mm grid."""
         return [
             round((count - 1) * _PIN_PITCH_MM / 2.0 - i * _PIN_PITCH_MM, 4) for i in range(count)
         ]
@@ -1248,8 +1254,8 @@ def _build_lib_symbol_raw(
     # Horizontal pins (left/right) stick out along X, so the body height must
     # cover their Y span; vertical pins (up/down) stick out along Y, so the
     # body width must cover their X span.  Per-side arrays preserve the
-    # caller's pin order, first pin nearest the top (left/right) or left
-    # (up/down) of the body.
+    # caller's pin order: the first pin sits at the most positive offset —
+    # topmost for left/right sides, rightmost for up/down sides.
     left_y = _side_offsets(len(per_side["left"]))
     right_y = _side_offsets(len(per_side["right"]))
     up_x = _side_offsets(len(per_side["up"]))
@@ -1321,23 +1327,26 @@ def _build_lib_symbol_raw(
         [sexpdata.Symbol("duplicate_pin_numbers_are_jumpers"), sexpdata.Symbol("no")],
     ]
 
-    for prop_name, prop_value, prop_x, prop_y in (
-        ("Reference", reference_prefix, 0.635, 2.54),
-        ("Value", value, 0.635, -2.54),
-        ("Footprint", "", 0.0, 0.0),
-        ("Datasheet", "", 0.0, 0.0),
+    for prop_name, prop_value, prop_x, prop_y, prop_hidden in (
+        ("Reference", reference_prefix, 0.635, 2.54, False),
+        ("Value", value, 0.635, -2.54, False),
+        ("Footprint", "", 0.0, 0.0, True),
+        ("Datasheet", "", 0.0, 0.0, True),
     ):
-        top.append(
-            [
-                sexpdata.Symbol("property"),
-                prop_name,
-                prop_value,
-                [sexpdata.Symbol("at"), prop_x, prop_y, 0],
-                [sexpdata.Symbol("show_name"), sexpdata.Symbol("no")],
-                [sexpdata.Symbol("do_not_autoplace"), sexpdata.Symbol("no")],
-                _lib_effects(),
-            ]
-        )
+        prop_node: list = [
+            sexpdata.Symbol("property"),
+            prop_name,
+            prop_value,
+            [sexpdata.Symbol("at"), prop_x, prop_y, 0],
+            [sexpdata.Symbol("show_name"), sexpdata.Symbol("no")],
+            [sexpdata.Symbol("do_not_autoplace"), sexpdata.Symbol("no")],
+        ]
+        if prop_hidden:
+            # KiCad convention (see e.g. Device:R_Small in the test
+            # fixtures): Footprint/Datasheet are hidden on the canvas.
+            prop_node.append([sexpdata.Symbol("hide"), sexpdata.Symbol("yes")])
+        prop_node.append(_lib_effects())
+        top.append(prop_node)
 
     top.append(
         [
@@ -1420,8 +1429,13 @@ def _do_create_symbol(
         }
     if not pins:
         return {"error": "pins list must not be empty"}
-    if not isinstance(reference_prefix, str) or not reference_prefix:
-        return {"error": "reference_prefix must be a non-empty string"}
+    if not isinstance(reference_prefix, str) or not _SYMBOL_NAME_RE.match(reference_prefix):
+        return {
+            "error": (
+                f"Invalid reference_prefix {reference_prefix!r}: must match "
+                r"^[A-Za-z][A-Za-z0-9_]*$ (must start with a letter)"
+            )
+        }
 
     seen_numbers: set[str] = set()
     for i, pin in enumerate(pins):
@@ -1452,6 +1466,10 @@ def _do_create_symbol(
         name = pin.get("name")
         if name is not None and not isinstance(name, str):
             return {"error": f"pins[{i}]: name must be a string"}
+        # Normalize an explicit None to "" so sexpdata never serializes nil
+        # (pin.get("name", "") only covers a *missing* key).
+        if name is None:
+            pin["name"] = ""
 
     for label, v in (("body_width", body_width), ("body_height", body_height)):
         if v is not None and not math.isfinite(v):
@@ -1466,6 +1484,8 @@ def _do_create_symbol(
         return {"error": f"Coordinates must be finite numbers (got x={x}, y={y})"}
     if rotation not in (0, 90, 180, 270):
         return {"error": f"rotation must be 0, 90, 180, or 270 (got {rotation})"}
+    if value is not None and not isinstance(value, str):
+        return {"error": "value must be a string or None"}
 
     effective_value = value if value not in (None, "") else symbol_name
     table_name = "自定义"
@@ -1494,9 +1514,15 @@ def _do_create_symbol(
         str(sch_uuid_obj.value).lstrip("/") if sch_uuid_obj is not None else str(uuid.uuid4())
     )
 
+    if lib_id_str in sch.lib_symbols:
+        return {
+            "error": (
+                f"Symbol {lib_id_str!r} already exists in schematic lib_symbols; "
+                "use a different symbol_name or remove the existing definition first"
+            )
+        }
     try:
-        if lib_id_str not in sch.lib_symbols:
-            _add_lib_symbol(sch.lib_symbols, lib_sym_raw, table_name)
+        _add_lib_symbol(sch.lib_symbols, lib_sym_raw, table_name)
     except Exception as exc:
         return {"error": f"Failed to inject lib symbol: {exc}"}
 
@@ -1512,28 +1538,28 @@ def _do_create_symbol(
     }
 
     if placing:
-        x = _align_to_grid(float(x))
-        y = _align_to_grid(float(y))
-        reference = _next_reference(sch, reference_prefix, schematic_path=schematic_path)
-        project_name = _find_project_name(schematic_path)
-
-        # Shift the placement if any pin would land on an existing wire,
-        # mirroring add_symbol_to_schematic's wire-conflict avoidance.
         try:
-            existing_wires = [
-                (
-                    float(w.start.value[0]),
-                    float(w.start.value[1]),
-                    float(w.end.value[0]),
-                    float(w.end.value[1]),
-                )
-                for w in sch.wire
-            ]
-        except AttributeError:
-            existing_wires = []
-        x, y = _find_safe_placement(lib_sym_raw, x, y, rotation, existing_wires)
+            x = _align_to_grid(float(x))
+            y = _align_to_grid(float(y))
+            reference = _next_reference(sch, reference_prefix, schematic_path=schematic_path)
+            project_name = _find_project_name(schematic_path)
 
-        try:
+            # Shift the placement if any pin would land on an existing wire,
+            # mirroring add_symbol_to_schematic's wire-conflict avoidance.
+            try:
+                existing_wires = [
+                    (
+                        float(w.start.value[0]),
+                        float(w.start.value[1]),
+                        float(w.end.value[0]),
+                        float(w.end.value[1]),
+                    )
+                    for w in sch.wire
+                ]
+            except AttributeError:
+                existing_wires = []
+            x, y = _find_safe_placement(lib_sym_raw, x, y, rotation, existing_wires)
+
             placed_raw = _build_placed_symbol(
                 lib_id_str,
                 x,
@@ -1549,6 +1575,7 @@ def _do_create_symbol(
             )
             sch.new_from_list(placed_raw)
         except Exception as exc:
+            log.exception("Failed to place symbol instance")
             return {"error": f"Failed to place symbol instance: {exc}"}
         result["position"] = {"x": x, "y": y}
 
