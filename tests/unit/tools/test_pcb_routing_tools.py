@@ -319,6 +319,29 @@ class TestPcbDeleteVias:
         assert len(result["not_found"]) >= 1
 
 
+class TestModelVisionGate:
+    """KICAD_MCP_SUPPORTS_VISION parsing (image blocks at the source)."""
+
+    def _vision(self):
+        from kcaa.utils.config import model_supports_vision
+
+        return model_supports_vision()
+
+    def test_defaults_to_vision_when_unset(self, monkeypatch):
+        monkeypatch.delenv("KICAD_MCP_SUPPORTS_VISION", raising=False)
+        assert self._vision() is True
+
+    def test_explicit_disabled_values(self, monkeypatch):
+        for value in ("0", "false", "no", "off"):
+            monkeypatch.setenv("KICAD_MCP_SUPPORTS_VISION", value)
+            assert self._vision() is False, value
+
+    def test_enabled_values(self, monkeypatch):
+        for value in ("1", "true", "yes"):
+            monkeypatch.setenv("KICAD_MCP_SUPPORTS_VISION", value)
+            assert self._vision() is True, value
+
+
 class TestPcbRouteOptions:
     """pcb_route_pad_to_pad: options dict + rounded45 default."""
 
@@ -521,6 +544,33 @@ class TestPcbRouteStrategy:
         image = raw[1]
         assert isinstance(image, Image)
         assert image.data[:8] == b"\x89PNG\r\n\x1a\n"
+        if payload.get("route_png"):
+            os.remove(payload["route_png"])
+
+    def test_success_omits_image_block_for_text_only_model(
+        self, tools, routable_board, monkeypatch
+    ):
+        """A text-only model (plugin sets KICAD_MCP_SUPPORTS_VISION=0)
+        must receive the bare JSON text — no image content block, no
+        PNG payload — instead of a block the client has to strip."""
+        monkeypatch.setenv("KICAD_MCP_SUPPORTS_VISION", "0")
+        raw = _run_raw(
+            tools["pcb_route_pad_to_pad"](
+                pcb_path=routable_board,
+                ref_a="R1",
+                pad_a="1",
+                ref_b="C1",
+                pad_b="1",
+                net="VCC",
+                ctx=None,
+                width=0.2,
+                algorithm="pns",
+            )
+        )
+        assert isinstance(raw, str), f"expected a bare text block, got {type(raw).__name__}"
+        payload = json.loads(raw)
+        assert "error" not in payload
+        assert payload["strategy"] == "shove"
         if payload.get("route_png"):
             os.remove(payload["route_png"])
 
