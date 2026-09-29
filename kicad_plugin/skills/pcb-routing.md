@@ -82,3 +82,35 @@ traversable in both directions.  Default ``(("F.Cu", "B.Cu"),)``.  On a
 4-layer board this default forbids landing on inner layers; pass
 ``(("F.Cu", "In1.Cu"), ("In1.Cu", "B.Cu"))`` to allow routing through
 the inner stack instead of jumping straight F<->B.
+
+## VLM-aided routing loop
+Routing is a VLM-driven loop: you read the rendered board and make the
+global decisions (anchor chain, layers, order, accept or retry), while
+the routing engine owns the precise geometry between your anchors — the
+same split as interactive routing in KiCad, where the human clicks the
+anchors and the engine fills in the track between them.  Do not hand the
+router every track segment; hand it a route intent.
+
+1. **See the whole board first** — call ``export_pcb_layer_image`` on the
+   current board state (pad labels like ``R5.1`` are rendered) and pick
+   which pads of the net to connect and in what order.
+2. **Emit an anchor chain** — call ``pcb_route_pad_to_pad`` with
+   ``waypoints=[pad_a, wp1, via1, pad_b]`` (the waypoint/via anchor chain),
+   the working layer and width, and ``dry_run=True``.  The waypoints split
+   the route into legs, and the vias land where you put them, not where
+   the engine guessed.
+3. **The engine routes leg by leg** — each leg is planned in order
+   (skeleton → walkaround → shove), with every between-leg via checked
+   against the design rules before the next leg starts.
+4. **Read the rendered evidence** — the image returned is the verdict:
+   green = the routed path, grey = the skeleton it attempted, red = the
+   obstacles that blocked it, green dots = your anchors.  Treat the
+   structured fields as caption text on the image and decide from the
+   picture.
+5. **Adjust, then commit** — failure feedback is image-first: see where
+   the grey attempt collides with a red blocker, then change the plan at
+   the decision level — move or insert waypoints, drop an anchor to
+   change the via position or the leg split, switch layers or
+   ``via_pairs``, reorder the chain — and re-run the loop.  Repeat until
+   the render shows the route you want, then re-send the same call with
+   ``dry_run=False`` to write it to the board.
