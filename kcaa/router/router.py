@@ -311,8 +311,7 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
     # both planners (A* has no shove stage and silently ignores it).
     if req.strategy not in ("shove", "walkaround"):
         raise RouteFailure(
-            f"strategy={req.strategy!r} is invalid; supported values are "
-            f"'shove' or 'walkaround'."
+            f"strategy={req.strategy!r} is invalid; supported values are 'shove' or 'walkaround'."
         )
 
     # Validate corner_mode early: both planners must reject an unknown
@@ -958,9 +957,7 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
                 if li == 0 and pad_a_size is not None:
                     leg_pts = _replace_pad_path(leg_pts, pad_a_xy, pad_a_size, from_center=True)
                 elif li == n_legs - 1 and pad_b_size is not None:
-                    leg_pts = _replace_pad_path(
-                        leg_pts, pad_b_xy, pad_b_size, from_center=False
-                    )
+                    leg_pts = _replace_pad_path(leg_pts, pad_b_xy, pad_b_size, from_center=False)
                 emit_leg = (
                     len(leg_pts) == len(eng.trace.points)
                     and all(_pt_eq(p, q) for p, q in zip(leg_pts, eng.trace.points))
@@ -1177,11 +1174,7 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
                         out.append(s1)
                         i += 1
                     continue
-                if any(
-                    _pt_eq(jp, ap, tol)
-                    for a in arcs_out
-                    for ap in (a.start, a.mid, a.end)
-                ):
+                if any(_pt_eq(jp, ap, tol) for a in arcs_out for ap in (a.start, a.mid, a.end)):
                     # The corner coincides with an already-emitted skeleton
                     # arc (its endpoint or midpoint): that arc already
                     # rounds the joint, so rounding again would create a
@@ -1324,8 +1317,7 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
                 start_layer == end_layer
                 and len(req.waypoints) >= 4
                 and all(
-                    spec.get("kind") == "waypoint"
-                    and float(spec.get("tol_mm", 0.0)) > 0.0
+                    spec.get("kind") == "waypoint" and float(spec.get("tol_mm", 0.0)) > 0.0
                     for spec in req.waypoints
                 )
             ):
@@ -1345,15 +1337,11 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
                 # of this single continuous track, not obstacles (KiCad
                 # DRC never space-checks same-net copper), and are
                 # excluded here.  Forbidden: blocking the arc.
-                n_samples = max(
-                    256, int(math.ceil(abs(span) / (2.0 * math.pi) * 4096.0))
-                )
+                n_samples = max(256, int(math.ceil(abs(span) / (2.0 * math.pi) * 4096.0)))
                 centerline: list[tuple[float, float]] = [pad_a_xy, arc_start]
                 for k in range(1, n_samples):
                     ang = a0 + span * k / n_samples
-                    centerline.append(
-                        (cxc + rad * math.cos(ang), cyc + rad * math.sin(ang))
-                    )
+                    centerline.append((cxc + rad * math.cos(ang), cyc + rad * math.sin(ang)))
                 centerline.append(arc_end)
                 centerline.append(pad_b_xy)
                 arc_line = LineString(centerline)
@@ -1373,10 +1361,7 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
                     include_same_net_pads=False,
                 )
                 margin = clearance + width / 2.0
-                if all(
-                    float(o.shape.distance(arc_line)) >= margin - 1e-4
-                    for o in arc_obstacles
-                ):
+                if all(float(o.shape.distance(arc_line)) >= margin - 1e-4 for o in arc_obstacles):
                     # Chain sweep is clear: emit the lead-out segments
                     # (only where the pad anchor floats off the circle)
                     # plus the single covering arc.
@@ -1482,9 +1467,7 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
                             to_layer = _auto_via_target(base_seq, pending_layer, site_req)
                         else:
                             to_layer = str(spec["to_layer"])
-                        _validate_via_transition(
-                            pending_layer, to_layer, site_req, req, pcb_layers
-                        )
+                        _validate_via_transition(pending_layer, to_layer, site_req, req, pcb_layers)
                         try:
                             site = _pick_explicit_via_site(
                                 pcb_path=req.pcb_path,
@@ -1526,9 +1509,7 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
                         # (KiCad behavior): never rounded by the chain
                         # tangent fillet.
                         fillet_excluded.add(site)
-                        via_sites.append(
-                            {"pos": [site[0], site[1]], "to_layer": to_layer}
-                        )
+                        via_sites.append({"pos": [site[0], site[1]], "to_layer": to_layer})
                         chain.append(site)
                         run_leg(
                             pending_pos,
@@ -1543,8 +1524,7 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
                         pending_layer = to_layer
                         continue
                     raise RouteFailure(
-                        f"unsupported anchor kind {kind!r}; expected 'waypoint' "
-                        "or 'via'"
+                        f"unsupported anchor kind {kind!r}; expected 'waypoint' or 'via'"
                     )
                 if pending_layer != end_layer:
                     raise RouteFailure(
@@ -1773,7 +1753,9 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
     # Best-effort single-route render (VLM feedback): recompose the
     # final polyline from the emitted geometry and render it on the
     # board.  Failure to render must never mask the route result.
-    route_png = _render_route_png(req.pcb_path, pts=_route_polyline(segs, arcs_out), anchors=used_chain)
+    route_png = _render_route_png(
+        req.pcb_path, pts=_route_polyline(segs, arcs_out), anchors=used_chain
+    )
 
     return RouteResult(
         segments=segs,
@@ -2638,9 +2620,7 @@ def _anchor_pos(spec: dict, kind: str) -> tuple[float, float]:
     try:
         x, y = float(pos[0]), float(pos[1])
     except (TypeError, ValueError, IndexError):
-        raise RouteFailure(
-            f"{kind} anchor 'pos' must be a [x, y] pair, got {pos!r}"
-        ) from None
+        raise RouteFailure(f"{kind} anchor 'pos' must be a [x, y] pair, got {pos!r}") from None
     return (x, y)
 
 
@@ -2734,12 +2714,15 @@ def _fit_circle(pts: list[tuple[float, float]]) -> tuple[float, float, float] | 
 def _chain_cocircular_arc(
     chain_pts: list[tuple[float, float]],
     tol_mm: float,
-) -> tuple[
-    tuple[float, float],
-    tuple[float, float],
-    tuple[float, float],
-    tuple[float, float, float, float, float],
-] | None:
+) -> (
+    tuple[
+        tuple[float, float],
+        tuple[float, float],
+        tuple[float, float],
+        tuple[float, float, float, float, float],
+    ]
+    | None
+):
     """Covering 3-point arc for a cocircular waypoint chain.
 
     ``chain_pts`` is the anchor chain in route order (start pad anchor,
@@ -2815,13 +2798,16 @@ def _chain_fillet_arc(
     joint: tuple[float, float],
     b: tuple[float, float],
     radius: float,
-) -> tuple[
-    tuple[float, float],
-    tuple[float, float],
-    tuple[float, float],
-    float,
-    tuple[float, float],
-] | None:
+) -> (
+    tuple[
+        tuple[float, float],
+        tuple[float, float],
+        tuple[float, float],
+        float,
+        tuple[float, float],
+    ]
+    | None
+):
     """Tangent fillet arc for the corner ``a -> joint -> b``.
 
     Returns ``(arc_start, arc_mid, arc_end, r, center)``: the arc starts
