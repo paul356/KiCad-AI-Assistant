@@ -29,6 +29,7 @@ import math
 from shapely.geometry import LineString, Point, Polygon
 
 from kcaa.router.pns.walkaround import WalkFailure, walkaround_line
+from kcaa.router.world_model import Obstacle
 
 # KiCad c_ENDPOINT_ON_HULL_THRESHOLD = 1000 nm (internal units are nm).
 ENDPOINT_ON_HULL_THRESHOLD_MM = 1000.0 * 1e-6
@@ -155,6 +156,107 @@ def _shove_line_to_hull_set(
     return path
 
 
+def _line_len(pts: Sequence[tuple[float, float]]) -> float:
+    return sum(math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(pts, pts[1:]))
+
+
+def _shove_clear_of_fixed(
+    line_pts: Sequence[tuple[float, float]],
+    fixed: Sequence[Obstacle],
+    width: float,
+    clearance: float,
+    track_net: str | None,
+    max_iter: int = 16,
+) -> list[tuple[float, float]] | None:
+    """Walk ``line_pts`` clear of every fixed solid with DRC margin.
+
+    The shove stage only gauges *other movable tracks* — the displaced
+    polyline is never checked against pads/vias/keepouts/non-shovable
+    tracks, so a pushed track can be landed on top of a pad.  This
+    closes that hole: the line is re-walked (both orientations, shorter
+    wins, same machinery as the route-level walkaround) around the
+    buffered hull of the first fixed obstacle it crosses, iterating
+    until no obstacle remains.
+
+    Obstacle shapes already carry their own half-width where applicable
+    (track/arc obstacles); the buffer adds ``clearance + width/2``, the
+    exact DRC margin for the pushed track (pad/via copper is raw, so the
+    same margin formula is correct for them too).
+
+    Endpoints are pinned: the shove chain moves one file segment at a
+    time, so a displaced track must keep its exact endpoints or the
+    physical track it belongs to is disconnected.  A fixed hull covering
+    an endpoint (or a walk that would pull it) fails the shove instead
+    of corrupting connectivity.  Same-net copper (``obs.net ==
+    track_net``) is skipped — that is the track's own anchors (pads,
+    vias), which it must keep touching, with no DRC gap required.
+
+    Returns the cleaned polyline, or ``None`` when no walk succeeds or
+    the endpoint pin cannot be honored.
+    """
+    margin = clearance + width / 2.0
+    hulls: list[Polygon] = []
+    for obs in fixed:
+        if track_net is not None and obs.net is not None and obs.net == track_net:
+            continue  # own-net anchor copper: no clearance required
+        shape = obs.shape
+        if shape is None or shape.is_empty:
+            continue
+        # Fine arc sampling (quad_segs=512 => ~0.2 nm chord sagitta on a
+        # 0.2 mm radius, below KiCad's 1 nm coordinate resolution): the
+        # walked line RIDES the hull boundary, and a coarse buffer would
+        # leave the pushed track up to ~0.25 um inside the true
+        # clearance envelope (sagitta of the default 8-segment arc).
+        hulls.append(shape.buffer(margin, cap_style="round", quad_segs=512))
+
+    pts = list(line_pts)
+    first, last = pts[0], pts[-1]
+
+    def pinned(candidate: Sequence[tuple[float, float]]) -> bool:
+        if not candidate:
+            return False
+        return (
+            math.hypot(candidate[0][0] - first[0], candidate[0][1] - first[1]) < 1e-8
+            and math.hypot(candidate[-1][0] - last[0], candidate[-1][1] - last[1]) < 1e-8
+        )
+
+    for _ in range(max_iter):
+        query = LineString(pts)
+        hit: Polygon | None = None
+        for h in hulls:
+            # Collision = the line enters the hull INTERIOR.  A line
+            # riding the hull boundary (the walkaround's exact-margin
+            # placement) touches it but must not re-trigger the walk —
+            # intersects-without-touching is that predicate (covers
+            # crossing, containment and endpoint-in-hull alike).
+            if query.intersects(h) and not query.touches(h):
+                hit = h
+                break
+        if hit is None:
+            if not pinned(pts):
+                return None
+            # Re-pin to the exact original floats so the written joints
+            # are byte-identical to the neighbouring segments.
+            pts[0], pts[-1] = first, last
+            if not LineString(pts).is_simple:
+                return None
+            return pts
+        best: list[tuple[float, float]] | None = None
+        for cw in (True, False):
+            try:
+                walked = walkaround_line(pts, hit, cw=cw)
+            except WalkFailure:
+                continue
+            if not pinned(walked):
+                continue
+            if best is None or _line_len(walked) < _line_len(best):
+                best = walked
+        if best is None:
+            return None
+        pts = best
+    return None
+
+
 def shove_obstacle_line(
     cur_line: Sequence[tuple[float, float]],
     obstacle: TrackObstacle,
@@ -214,6 +316,7 @@ def shove_path(
     width: float,
     clearance: float,
     max_depth: int = MAX_SHOVE_DEPTH,
+    fixed_obstacles: Sequence[Obstacle] = (),
 ) -> ShoveResult:
     """Shove ``path`` clear of ``movable_tracks`` via chain propagation.
 
@@ -223,6 +326,28 @@ def shove_path(
     the next one (pushLineStack recursion).  The caller's ``path`` does
     not move — the tracks do.  Depth cap; any failure unwinds the whole
     chain (KiCad SH_INCOMPLETE).
+
+    Two hard invariants keep every displacement DRC-clean and
+    connectivity-preserving:
+
+    * **Pinned endpoints.**  Each movable obstacle is one file segment;
+      its endpoints are the junctions/anchors of the physical track.  A
+      pushed segment therefore never moves its endpoints (KiCad moves
+      endpoints only in the attempt>=2 ``permitAdjustingEndpoints``
+      path, which is disabled here) — moving them would leave a gap to
+      the neighbouring segments of the same track.  A hull that covers
+      an endpoint simply fails the shove.
+    * **Fixed-solid clearance.**  Displaced polylines are re-walked clear
+      of every *fixed* obstacle (pads, vias, keepouts, openings,
+      non-shovable tracks) with the DRC margin — the shove walkaround
+      alone only ever looks at other movable tracks, so without this a
+      pushed track could be landed on a pad.  An unresolvable conflict
+      raises :class:`ShoveFailure` (whole route fails loudly) instead of
+      writing a DRC violation.
+
+    ``fixed_obstacles`` carries that fixed set (pads/vias/keepouts/
+    non-shovable tracks plus, for multi-leg routes, the copper of
+    earlier legs — route net, hence foreign to every shoved track).
     """
     remaining = list(movable_tracks)
     moved: list[TrackObstacle] = []
@@ -262,17 +387,39 @@ def shove_path(
             continue  # this chain resolved; nothing more to push
         # A pushed track may itself collide with others: it becomes the
         # current line for the next push (chain propagation).
-        permit = depth >= 1
         pushed = shove_obstacle_line(
             cur_line,
             hit,
             width,
             clearance,
-            permit_moving_start=permit,
-            permit_moving_end=permit,
+            permit_moving_start=False,
+            permit_moving_end=False,
         )
         if pushed is None:
             raise ShoveFailure(f"cannot shove track {hit.start} -> {hit.end}")
+        # Every pushed track must also clear the FIXED solids (pads,
+        # vias, keepouts, non-shovable tracks, earlier-leg route copper)
+        # — the push walkaround only checks other movable tracks.
+        if fixed_obstacles:
+            clean = _shove_clear_of_fixed(
+                pushed.points,
+                fixed_obstacles,
+                width=pushed.width,
+                clearance=clearance,
+                track_net=hit.net,
+            )
+            if clean is None:
+                raise ShoveFailure(
+                    f"shoved track {hit.start} -> {hit.end} cannot clear fixed "
+                    "copper (pad/via/keepout); widen the gap, move the "
+                    "obstacle, or use strategy='walkaround'"
+                )
+            pushed = TrackObstacle(
+                points=tuple(clean),
+                width=pushed.width,
+                net=pushed.net,
+                layer=pushed.layer,
+            )
         remaining.remove(hit)
         remaining.append(pushed)
         moved.append(pushed)

@@ -681,6 +681,65 @@ class TestPcbRouteStrategy:
         os.remove(png)
 
 
+# ── Shove write path (defense in depth) ────────────────────────────────
+
+
+def test_apply_shoved_tracks_collapses_repeated_original() -> None:
+    """``_apply_shoved_tracks`` with the same original shoved twice (a
+    multi-leg route re-shoves a track from the board snapshot) must write
+    ONLY the last displacement — both polylines would fork/double the
+    physical track.  The router collapses pairs first; this guards any
+    other caller."""
+    import sexpdata
+
+    from kcaa.router.pns.shove import TrackObstacle
+    from kcaa.tools.pcb_routing_tools import _apply_shoved_tracks, _segment_fields
+
+    orig = TrackObstacle(points=((40.0, 25.0), (55.0, 45.0)), width=0.25, net="GND", layer="F.Cu")
+    d1 = TrackObstacle(
+        points=((40.0, 25.0), (42.0, 32.0), (55.0, 45.0)), width=0.25, net="GND", layer="F.Cu"
+    )
+    d2 = TrackObstacle(
+        points=((40.0, 25.0), (44.0, 30.0), (55.0, 45.0)), width=0.25, net="GND", layer="F.Cu"
+    )
+
+    def seg(x1, y1, x2, y2, width, layer, net):
+        return [
+            sexpdata.Symbol("segment"),
+            [sexpdata.Symbol("start"), x1, y1],
+            [sexpdata.Symbol("end"), x2, y2],
+            [sexpdata.Symbol("width"), width],
+            [sexpdata.Symbol("layer"), layer],
+            [sexpdata.Symbol("net"), net],
+        ]
+
+    data = [
+        seg(1.0, 1.0, 2.0, 1.0, 0.2, "F.Cu", "VCC"),
+        seg(40.0, 25.0, 55.0, 45.0, 0.25, "F.Cu", "GND"),
+    ]
+    _apply_shoved_tracks(data, [(orig, d1), (orig, d2)])
+    fields = [f for f in (_segment_fields(n) for n in data) if f is not None]
+    gnd = [f for f in fields if f["net"] == "GND"]
+    # Original gone; only d2's two hops present (d1's fork never written).
+    assert all(
+        not (abs(f["start"][0] - 40.0) <= 1e-6 and abs(f["end"][0] - 55.0) <= 1e-6) for f in gnd
+    )
+    assert len(gnd) == 2
+    hops = {
+        (
+            round(f["start"][0], 6),
+            round(f["start"][1], 6),
+            round(f["end"][0], 6),
+            round(f["end"][1], 6),
+        )
+        for f in gnd
+    }
+    assert hops == {(40.0, 25.0, 44.0, 30.0), (44.0, 30.0, 55.0, 45.0)}
+    # The unrelated VCC segment is untouched.
+    vcc = [f for f in fields if f["net"] == "VCC"]
+    assert len(vcc) == 1 and vcc[0]["start"] == (1.0, 1.0) and vcc[0]["end"] == (2.0, 1.0)
+
+
 # ── Route failure evidence render ──────────────────────────────────────
 
 

@@ -2851,6 +2851,32 @@ def test_shove_moved_pairs_report_original_and_displaced(tmp_path: Path) -> None
     assert result.shoved_tracks == [displaced]
 
 
+def test_collapse_moved_pairs_keeps_last_displacement() -> None:
+    """A track shoved by two legs (all PNS legs shove against one board
+    snapshot) must collapse to its LAST displacement: the write path
+    deletes the original segment once and appends the displaced polyline
+    — with both displacements it would fork/double the physical track."""
+    from kcaa.router.pns.shove import TrackObstacle
+    from kcaa.router.router import _collapse_moved_pairs
+
+    orig = TrackObstacle(points=((40.0, 25.0), (55.0, 45.0)), width=0.25, net="GND", layer="F.Cu")
+    d1 = TrackObstacle(
+        points=((40.0, 25.0), (42.0, 32.0), (55.0, 45.0)), width=0.25, net="GND", layer="F.Cu"
+    )
+    d2 = TrackObstacle(
+        points=((40.0, 25.0), (44.0, 30.0), (55.0, 45.0)), width=0.25, net="GND", layer="F.Cu"
+    )
+    other = TrackObstacle(points=((5.0, 5.0), (9.0, 5.0)), width=0.2, net="N2", layer="F.Cu")
+    o2 = TrackObstacle(
+        points=((5.0, 5.0), (7.0, 3.0), (9.0, 5.0)), width=0.2, net="N2", layer="F.Cu"
+    )
+    out = _collapse_moved_pairs([(orig, d1), (orig, d2), (other, o2)])
+    assert len(out) == 2
+    by_orig = {p[0]: p[1] for p in out}
+    assert by_orig[orig] is d2
+    assert by_orig[other] is o2
+
+
 def test_walkaround_moved_pairs_empty(tmp_path: Path) -> None:
     """walkaround has no shove: moved_pairs stays empty."""
     result = _route_strategy(tmp_path, strategy="walkaround", track=True)

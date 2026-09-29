@@ -177,3 +177,91 @@ class TestShovePath:
     def test_max_depth_constant_is_finite(self):
         assert MAX_SHOVE_DEPTH >= 2
         assert HULL_FAILURE_EXPANSION_STEP_MM > 0
+
+
+class TestShovePathEndpointPinning:
+    def test_chain_propagation_never_moves_endpoints(self):
+        """Regression: the chain enabled endpoint adjustment from depth 1
+        on (KiCad's attempt>=2 permitAdjustingEndpoints).  A pushed file
+        segment whose endpoints move no longer meets its neighbours — the
+        physical track is disconnected.  Every pushed track must keep its
+        exact endpoints at every chain depth."""
+        path = [(-10, 0), (10, 0)]
+        # A is hit at depth 0; A's pushed line then pushes B at depth 1.
+        tracks = [
+            TrackObstacle(points=((0, -3), (0, 3)), width=0.2, net="A"),
+            TrackObstacle(points=((0.25, -5), (0.25, 5)), width=0.2, net="B"),
+        ]
+        res = shove_path(path, tracks, width=0.2, clearance=0.1)
+        assert len(res.pushed) == 2, "the chain must push both A and B"
+        for orig, disp in res.moved_pairs:
+            assert disp.start == orig.start, f"{orig.net}: endpoint moved"
+            assert disp.end == orig.end, f"{orig.net}: endpoint moved"
+
+
+class TestShovePathFixedSolids:
+    def test_pushed_track_avoids_fixed_pad(self):
+        """The shove walkaround only looks at other movable tracks: a
+        pushed track can be landed on a pad.  The fixed-solid stage must
+        walk every displacement around pads/vias with the DRC margin."""
+        from shapely.geometry import box
+
+        from kcaa.router.world_model import Obstacle
+
+        path = [(-8, 0), (8, 0)]
+        t1 = TrackObstacle(points=((0, -4), (0, 4)), width=0.2, net="N1")
+        # The route hugs y=0; the pushed track lands on one side of its
+        # 0.3 half-width hull, where this pad sits (pad top -0.2
+        # overlaps the pushed jog y in [-0.3, 0.3] on both sides).
+        pad = Obstacle(
+            shape=box(-1.0, -1.6, 1.0, -0.2),
+            layers=frozenset({"F.Cu"}),
+            net="N9",
+            kind="pad",
+        )
+        res = shove_path(path, [t1], width=0.2, clearance=0.1, fixed_obstacles=[pad])
+        assert len(res.pushed) == 1
+        pushed = res.pushed[0]
+        # Endpoints stay pinned while the line clears the pad copper.
+        assert pushed.start == (0, -4) and pushed.end == (0, 4)
+        d = LineString(pushed.points).distance(pad.shape)
+        assert d >= 0.2 - 1e-6, f"pushed track violates pad clearance: {d:.4f}"
+
+    def test_same_net_pad_not_an_obstacle_for_pushed_track(self):
+        """A pad on the pushed track's OWN net is its anchor, not a
+        clearance obstacle: same-net copper needs no DRC gap."""
+        from shapely.geometry import box
+
+        from kcaa.router.world_model import Obstacle
+
+        path = [(-8, 0), (8, 0)]
+        t1 = TrackObstacle(points=((0, -4), (0, 4)), width=0.2, net="N1")
+        pad = Obstacle(
+            shape=box(0.0, -0.6, 0.6, 0.6),
+            layers=frozenset({"F.Cu"}),
+            net="N1",  # same net as the pushed track
+            kind="pad",
+        )
+        res = shove_path(path, [t1], width=0.2, clearance=0.1, fixed_obstacles=[pad])
+        assert len(res.pushed) == 1
+
+    def test_shove_fails_when_fixed_pad_blocks(self):
+        """A fixed solid covering an endpoint (or the whole push
+        corridor) must fail the route loudly — a DRC violation is never
+        written."""
+        from shapely.geometry import box
+
+        from kcaa.router.world_model import Obstacle
+
+        path = [(-8, 0), (8, 0)]
+        t1 = TrackObstacle(points=((0, -4), (0, 4)), width=0.2, net="N1")
+        # The pad's clearance hull (top/bottom +0.2) swallows the pushed
+        # track's pinned endpoints: no walk can preserve them.
+        pad = Obstacle(
+            shape=box(-1.0, -4.5, 1.0, 4.5),
+            layers=frozenset({"F.Cu"}),
+            net="N9",
+            kind="pad",
+        )
+        with pytest.raises(ShoveFailure):
+            shove_path(path, [t1], width=0.2, clearance=0.1, fixed_obstacles=[pad])

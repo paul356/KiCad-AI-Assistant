@@ -52,6 +52,7 @@ shoves movable tracks of other nets instead of failing.
 from __future__ import annotations
 
 from collections import deque
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 import json
 import logging
@@ -60,7 +61,7 @@ import os
 import tempfile
 import time
 
-from shapely.geometry import LineString, Polygon
+from shapely.geometry import LineString, Point, Polygon
 from shapely.geometry import box as _shapely_box
 
 from kcaa.router.grid_a_star import (
@@ -864,6 +865,13 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
         all_nodes: list[RouteNode] = []
         node_id = 0
         pushed = []
+        # Multi-leg shove safety: every leg's final polyline (and every
+        # through-via site) is handed to the LATER legs' shove stage as
+        # fixed copper — same net as the route (the route may touch it),
+        # foreign to every shoved track.  Without this, a track displaced
+        # by leg k can be re-landed onto leg 1..k-1 copper by a later leg,
+        # or the write path would fork the track (see _collapse_moved_pairs).
+        prev_leg_polylines: list[tuple[str, list[tuple[float, float]]]] = []
         # Per-leg direct emission: None -> the leg keeps the postprocess
         # (mitered straight) output below; otherwise the skeleton
         # segments / arcs emitted straight from eng.trace.
@@ -910,6 +918,30 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
                 pad_a_xy,
                 pad_b_xy,
             )
+            # Earlier legs' copper is fixed for the shove stage of this
+            # leg (buffered by the route half-width, mirroring track
+            # obstacle shapes).  Same-net to the route — the route walks
+            # right over it — but foreign to every shoved track, which
+            # must keep full DRC margin from it.
+            extra_fixed: list[Obstacle] = [
+                Obstacle(
+                    shape=LineString(pts).buffer(width / 2.0, cap_style="round"),
+                    layers=frozenset({layer}),
+                    net=req.net,
+                    kind="track",
+                )
+                for prev_layer, pts in prev_leg_polylines
+                if prev_layer == layer and len(pts) >= 2
+            ]
+            for va in via_anchors:
+                extra_fixed.append(
+                    Obstacle(
+                        shape=Point(va[0], va[1]).buffer(via_diameter / 2.0),
+                        layers=frozenset({layer}),
+                        net=req.net,
+                        kind="via",
+                    )
+                )
             try:
                 eng = route_engine(
                     start_pt,
@@ -919,6 +951,7 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
                     clearance=clearance,
                     corner_mode=corner_mode,
                     max_shove_depth=shove_depth,
+                    extra_fixed=extra_fixed,
                 )
             except PnsFailure as exc:
                 _dump_viz("fail-pns", [], _pad_viz, buffered, route_bbox)
@@ -1026,6 +1059,9 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
                     continue  # shared via anchor, already emitted
                 all_nodes.append(RouteNode(x=x, y=y, layer=layer, node_id=node_id))
                 node_id += 1
+            # This leg's final geometry becomes fixed copper for the shove
+            # stage of every later leg (see the extra_fixed block above).
+            prev_leg_polylines.append((layer, list(node_pts)))
 
         def finalize_legs() -> None:
             """Postprocess the emitted leg nodes and re-assemble per-leg
@@ -1765,6 +1801,14 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
         req.pcb_path, pts=_route_polyline(segs, arcs_out), anchors=used_chain
     )
 
+    # A foreign track shoved by two legs (all PNS legs shove against the
+    # same model snapshot) has one authoritative displacement: the LAST.
+    # Earlier displaced polylines must never reach the file — the write
+    # path deletes the original segment once and would otherwise append
+    # both forks, doubling/disconnecting the physical track.
+    moved_pairs = _collapse_moved_pairs(moved_pairs)
+    pushed = [disp for _orig, disp in moved_pairs]
+
     return RouteResult(
         segments=segs,
         vias=vias,
@@ -1782,6 +1826,26 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
         route_png=route_png,
         moved_pairs=moved_pairs,
     )
+
+
+def _collapse_moved_pairs(
+    moved_pairs: Sequence[tuple[TrackObstacle, TrackObstacle]],
+) -> list[tuple[TrackObstacle, TrackObstacle]]:
+    """Collapse repeated shoves of the same original track to the last.
+
+    Multi-leg PNS routes run every leg against one board snapshot, so a
+    track displaced by an early leg can be re-displaced by a later leg
+    starting from its ORIGINAL position.  Each original therefore appears
+    in ``moved_pairs`` once per leg that hit it; only its LAST
+    displacement is authoritative.  The write path deletes the original
+    file segment once and would otherwise append every displaced
+    polyline — a forked, disconnected track.
+    """
+    last: dict[tuple, tuple[TrackObstacle, TrackObstacle]] = {}
+    for orig, disp in moved_pairs:
+        key = (orig.start, orig.end, orig.width, orig.layer, orig.net)
+        last[key] = (orig, disp)
+    return list(last.values())
 
 
 def connect_with_via(

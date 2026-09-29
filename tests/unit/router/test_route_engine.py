@@ -193,6 +193,26 @@ class TestRouteEngine:
         with pytest.raises(PnsFailure, match="shove failed"):
             route_engine((-8, 0), (8, 0), [_pad(0, 0), t], W, CLR)
 
+    def test_shoved_track_stays_off_pad(self):
+        """The route stays straight (the pad below it is outside the
+        walkaround detection margin) while the movable track is pushed
+        onto the pad's side of the route hull.  The shove stage must walk
+        the displaced track around the pad with the DRC margin
+        (regression: shoved tracks used to be placed on top of pads)."""
+        pad = Obstacle(
+            shape=Polygon([(-1.0, -1.6), (1.0, -1.6), (1.0, -0.2), (-1.0, -0.2)]),
+            layers=frozenset({"F.Cu"}),
+            net="N9",
+            kind="pad",
+        )
+        t = _track_obs(0, -4, 4, "N2")
+        res = route_engine((-8, 0), (8, 0), [pad, t], W, CLR)
+        assert len(res.shoved_tracks) == 1
+        pushed = res.shoved_tracks[0]
+        assert pushed.start == (0, -4) and pushed.end == (0, 4)  # pinned
+        d = LineString(pushed.points).distance(pad.shape)
+        assert d >= CLR + W / 2 - 1e-6, f"pushed track violates pad clearance: {d:.4f}"
+
     def test_subwidth_short_track_is_fixed_not_shoved(self):
         # A track shorter than its width (0.2 mm tap-in inside a 0.5 mm
         # pad entry) has no well-defined shove direction.  The world
