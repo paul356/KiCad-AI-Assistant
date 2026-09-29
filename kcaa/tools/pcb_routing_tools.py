@@ -892,7 +892,7 @@ def _route_anchors(pcb_path: str, req: RouteRequest) -> list[tuple[float, float]
         try:
             center = _find_pad_center(data, ref, pad)
         except Exception:  # noqa: BLE001
-            continue
+            continue  # nosec B112 — pad lookup failed; skip anchor, evidence must not mask the route failure
         if center is not None:
             anchors.append((float(center[0]), float(center[1])))
     return anchors
