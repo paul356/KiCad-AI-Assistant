@@ -19,6 +19,7 @@ import sexpdata
 import skip
 
 from kcaa.tools.symbol_edit_tools import (
+    _DEFAULT_PIN_LENGTH_MM,
     _build_lib_symbol_raw,
     _extract_lib_pin_positions,
     _lib_pins_world,
@@ -226,6 +227,29 @@ class TestCreateSymbolDefinition:
             )
         ]
         assert prop_names[:4] == ["Reference", "Value", "Footprint", "Datasheet"]
+        # Footprint/Datasheet carry (hide yes); Reference/Value stay visible.
+        prop_hide = {
+            child[1]: any(
+                isinstance(c, list)
+                and len(c) >= 2
+                and isinstance(c[0], sexpdata.Symbol)
+                and c[0].value() == "hide"
+                for c in child[2:]
+            )
+            for child in raw[2:]
+            if (
+                isinstance(child, list)
+                and len(child) >= 2
+                and isinstance(child[0], sexpdata.Symbol)
+                and child[0].value() == "property"
+            )
+        }
+        assert prop_hide == {
+            "Reference": False,
+            "Value": False,
+            "Footprint": True,
+            "Datasheet": True,
+        }
 
     def test_define_only_creates_no_placed_instance(self, tools, tmp_sch):
         """Without x/y there must be no placed symbol using the new lib_id."""
@@ -256,13 +280,17 @@ class TestLibSymbolLayout:
         assert lefts_sorted[0] == (-5.715, 1.27)
         assert lefts_sorted[1] == (-5.715, -1.27)
         assert rights[0] == (5.715, 0.0)
-        # Pin offset coordinates stay on the 1.27 mm grid.
+        # Along-side pin offsets stay on the 1.27 mm (50-mil) grid — the strict
+        # contract of _side_offsets (2.54 mm pitch, centred).  The body-normal
+        # coordinate ±(half_w + pin_length) is necessarily a half-grid multiple
+        # for the 6.35 mm body (half_w = 2.5 x 1.27); it is not part of the
+        # offset contract, so it must NOT be excused with a 0.635 mm backdoor.
         for px, py in positions:
-            for v in (px, py):
-                assert (
-                    abs(v / 1.27 - round(v / 1.27)) < 1e-6
-                    or abs(v / 0.635 - round(v / 0.635)) < 1e-6
-                ), (px, py)
+            if abs(px) > abs(py):  # left/right pin: y is the offset axis
+                v = py
+            else:  # up/down pin: x is the offset axis
+                v = px
+            assert abs(v / 1.27 - round(v / 1.27)) < 1e-6, (px, py)
 
     def test_inner_ends_land_on_body_edge(self):
         raw, _ = _build_lib_symbol_raw("MYOP", PINS_2IN_1OUT, "U", "MYOP")
@@ -280,14 +308,19 @@ class TestLibSymbolLayout:
                 ):
                     px, py = float(child[1]), float(child[2])
                     angle = int(child[3]) if len(child) >= 4 else 0
-                    # Inner end = connection point pulled back by 2.54 mm
-                    # toward the body; must sit exactly on a body edge.
-                    if angle in (0, 180):  # horizontal pin (left/right)
-                        inner = px - 2.54 if px > 0 else px + 2.54
-                        assert inner in (min_x, max_x), (node, inner)
-                    else:  # vertical pin (up/down)
-                        inner = py - 2.54 if py > 0 else py + 2.54
-                        assert inner in (max_y, min_y), (node, inner)
+                    # Stub inner end = connection point + length along the pin
+                    # angle (KiCad convention: angle points tip→body, lib
+                    # coords Y-up).  It must land exactly on a body edge —
+                    # this is what makes the "inner end exactly on the body
+                    # edge" claim in _build_lib_symbol_raw true for the
+                    # generated geometry.
+                    rad = math.radians(angle)
+                    inner_x = round(px + _DEFAULT_PIN_LENGTH_MM * math.cos(rad), 4)
+                    inner_y = round(py + _DEFAULT_PIN_LENGTH_MM * math.sin(rad), 4)
+                    on_edge = (inner_x in (min_x, max_x) and min_y <= inner_y <= max_y) or (
+                        inner_y in (min_y, max_y) and min_x <= inner_x <= max_x
+                    )
+                    assert on_edge, (node, inner_x, inner_y)
 
     def test_body_override_used_and_too_small_enlarged(self):
         raw, warnings = _build_lib_symbol_raw(
@@ -323,13 +356,13 @@ class TestLibSymbolLayout:
             ][0]
             x, y, angle = float(at[1]), float(at[2]), int(at[3])
             if number == "1":
-                assert x < 0 and y == 0.0 and angle == 180
+                assert x < 0 and y == 0.0 and angle == 0
             elif number == "2":
-                assert x > 0 and y == 0.0 and angle == 0
+                assert x > 0 and y == 0.0 and angle == 180
             elif number == "3":
-                assert y > 0 and x == 0.0 and angle == 90
+                assert y > 0 and x == 0.0 and angle == 270
             else:
-                assert y < 0 and x == 0.0 and angle == 270
+                assert y < 0 and x == 0.0 and angle == 90
 
     def test_placed_pins_world_positions_on_expected_sides(self):
         raw, _ = _build_lib_symbol_raw("MYOP", PINS_2IN_1OUT, "U", "MYOP")
@@ -523,3 +556,68 @@ class TestCreateSymbolValidation:
         result = _call_create(tools, missing, symbol_name="MYOP", pins=PINS_2IN_1OUT)
         assert "error" in result
         assert "success" not in result
+
+    def test_duplicate_symbol_name_returns_error(self, tools, tmp_sch):
+        first = _call_create(tools, tmp_sch, symbol_name="MYOP", pins=PINS_2IN_1OUT)
+        assert first.get("success") is True
+        # A second call with the same name must not silently re-define.
+        second = _call_create(tools, tmp_sch, symbol_name="MYOP", pins=PINS_2IN_1OUT)
+        assert "error" in second
+        assert "already exists in schematic lib_symbols" in second["error"]
+        assert "success" not in second
+
+    def test_non_string_value_returns_error(self, tools, tmp_sch):
+        result = _call_create(
+            tools,
+            tmp_sch,
+            symbol_name="MYOP",
+            pins=PINS_2IN_1OUT,
+            value=123,
+        )
+        assert "error" in result
+        assert "success" not in result
+
+    def test_invalid_reference_prefix_returns_error(self, tools, tmp_sch):
+        for bad in ("1U", "U-1", "U 1", "U.1", ""):
+            result = _call_create(
+                tools,
+                tmp_sch,
+                symbol_name="MYOP",
+                pins=PINS_2IN_1OUT,
+                reference_prefix=bad,
+            )
+            assert "error" in result, bad
+            assert "success" not in result, bad
+        ok = _call_create(
+            tools,
+            tmp_sch,
+            symbol_name="MYOP",
+            pins=PINS_2IN_1OUT,
+            reference_prefix="U2_1",
+        )
+        assert ok.get("success") is True
+
+    def test_none_pin_name_renders_as_empty(self, tools, tmp_sch):
+        """An explicit name=None must serialize as "" (never as nil)."""
+        result = _call_create(
+            tools,
+            tmp_sch,
+            symbol_name="MYOP",
+            pins=[{"number": "1", "name": None, "type": "input", "direction": "left"}],
+        )
+        assert result.get("success") is True, result
+        sch = skip.Schematic(tmp_sch)  # round-trip proves the file parsed
+        raw = _lib_symbol_raw(sch, LIB_ID)
+        assert raw is not None
+        node = _pin_at(raw, "1")
+        name_node = [
+            c
+            for c in node[1:]
+            if (
+                isinstance(c, list)
+                and len(c) >= 2
+                and isinstance(c[0], sexpdata.Symbol)
+                and c[0].value() == "name"
+            )
+        ][0]
+        assert name_node[1] == ""
