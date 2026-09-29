@@ -202,12 +202,15 @@ def _shove_clear_of_fixed(
         shape = obs.shape
         if shape is None or shape.is_empty:
             continue
-        # Fine arc sampling (quad_segs=512 => ~0.2 nm chord sagitta on a
-        # 0.2 mm radius, below KiCad's 1 nm coordinate resolution): the
-        # walked line RIDES the hull boundary, and a coarse buffer would
-        # leave the pushed track up to ~0.25 um inside the true
-        # clearance envelope (sagitta of the default 8-segment arc).
-        hulls.append(shape.buffer(margin, cap_style="round", quad_segs=512))
+        # Default arc sampling: the walked line RIDES the hull boundary
+        # and cuts inside the true clearance envelope by the chord
+        # sagitta (~4 um at these margins), but the engine's placement
+        # stages run on ``clearance + CLEARANCE_EPS`` which absorbs it.
+        # Fine sampling (quad_segs=512) would do the same with no
+        # sagitta — but it bloats the hull ring to thousands of
+        # vertices, and the walkaround ring traversal (iteration budget
+        # 1000) then fails whenever the walk must span a long arc.
+        hulls.append(shape.buffer(margin, cap_style="round"))
 
     pts = list(line_pts)
     first, last = pts[0], pts[-1]
@@ -426,6 +429,23 @@ def shove_path(
         moved_pairs.append((hit, pushed))
         chains.append((list(pushed.points), pushed))
         depth += 1
+
+    # Depth cap hit: drain what is left of the chain and verify each
+    # entry still collides (entries can go stale — the track that
+    # triggered the push may have been moved by a later step).  Any live
+    # collision means the shove is incomplete: KiCad returns
+    # SH_INCOMPLETE and unwinds the whole set.  Writing the
+    # partially-shoved state would leave the route or a displaced track
+    # touching an unhandled neighbour — fail loudly instead.
+    while chains:
+        cur_line, self_track = chains.pop()
+        if colliding_with(cur_line, self_track) is not None:
+            raise ShoveFailure(
+                f"shove chain did not converge within depth {max_depth}: a "
+                "collision remains between a displaced track and an "
+                "unhandled neighbour; widen the gap or use "
+                "strategy='walkaround'"
+            )
 
     finalized = [t for t in remaining if t not in moved]
     result = ShoveResult(

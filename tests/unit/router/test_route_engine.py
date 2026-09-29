@@ -7,11 +7,13 @@ import math
 import pytest
 from shapely.geometry import LineString, Polygon
 
-from kcaa.router.pns.shove import ShoveFailure
+from kcaa.router.pns.shove import ShoveFailure, TrackObstacle
 from kcaa.router.route_engine import (
     PnsFailure,
+    _audit_final_copper,
     _path_len,
     _rect_medians,
+    _snap45_line,
     _track_centerline,
     _walkaround_solids,
     route_engine,
@@ -291,6 +293,148 @@ class TestRouteEngine:
 
         res = route_engine((0, 0), (10, 5), [], W, CLR, corner_mode=CornerMode.MITERED_45)
         assert res.arcs == []
+
+
+def _segments_on_45(pts) -> bool:
+    """True when every segment of ``pts`` lies on the 0/45/90 family."""
+    for a, b in zip(pts, pts[1:]):
+        dx, dy = abs(b[0] - a[0]), abs(b[1] - a[1])
+        if dx > 1e-6 and dy > 1e-6 and abs(dx - dy) > 1e-6:
+            return False
+    return True
+
+
+class TestSnap45Line:
+    """Disturbed polylines are re-snapped onto the 0/45/90 family."""
+
+    def test_keeps_0_45_90_segments_untouched(self):
+        pts = [(0, 0), (2, 0), (4, 2), (4, 6)]
+        assert _snap45_line(pts, []) == pts
+
+    def test_diagonal_replaced_with_manhattan_corner(self):
+        # 14-degree segment: the (x2, y1) corner fits, both legs land on
+        # the family, endpoints are pinned.
+        out = _snap45_line([(0, 0), (4, 1)], [])
+        assert out == [(0, 0), (4, 0), (4, 1)]
+        assert out[0] == (0, 0) and out[-1] == (4, 1)
+        assert _segments_on_45(out)
+
+    def test_falls_back_to_original_when_both_corners_blocked(self):
+        from shapely.geometry import box
+
+        hulls = [box(3.9, -0.2, 4.3, 0.4), box(3.8, 0.9, 4.4, 1.3)]
+        out = _snap45_line([(0, 0), (4, 1)], hulls)
+        # Neither corner is legal; snapping must keep the original
+        # segment (the final audit is the gate, never the snap).
+        assert out == [(0, 0), (4, 1)]
+
+    def test_snapped_result_never_enters_a_hull(self):
+        from shapely.geometry import box
+
+        h = box(-0.2, 1.4, 0.2, 2.2)
+        out = _snap45_line([(0, 0), (4, 1)], [h])
+        line = LineString(out)
+        interior = line.intersection(h).difference(h.boundary)
+        assert interior.length < 1e-6
+        assert _segments_on_45(out)
+
+
+class TestFinalAudit:
+    """The engine's final DRC audit hard-gates the output."""
+
+    def _pad(self, net: str | None = "N2") -> Obstacle:
+        return Obstacle(
+            shape=Polygon([(-0.4, -0.4), (0.4, -0.4), (0.4, 0.4), (-0.4, 0.4)]),
+            layers=frozenset({"F.Cu"}),
+            net=net,
+            kind="pad",
+        )
+
+    def test_route_crossing_foreign_pad_raises(self):
+        with pytest.raises(PnsFailure, match="final DRC audit"):
+            _audit_final_copper([(-8, 0), (8, 0)], W, None, [self._pad("N2")], [], [], set(), CLR)
+
+    def test_same_net_route_and_pad_not_audited(self):
+        # Equal non-None nets need no gap (the route legitimately touches
+        # its own pads / earlier-leg copper).
+        _audit_final_copper([(-8, 0), (8, 0)], W, "VCC", [self._pad("VCC")], [], [], set(), CLR)
+
+    def test_none_nets_are_audited(self):
+        # An unknown route net is not exempted from an unknown obstacle.
+        with pytest.raises(PnsFailure, match="final DRC audit"):
+            _audit_final_copper([(-8, 0), (8, 0)], W, None, [self._pad(None)], [], [], set(), CLR)
+
+    def test_displaced_track_violation_raises(self):
+        # A displacement left inside the route copper fails the audit.
+        orig = TrackObstacle(points=((0, -4), (0, 4)), width=W, net="N2", layer="F.Cu")
+        disp = TrackObstacle(points=((0.05, -4), (0.05, 4)), width=W, net="N2", layer="F.Cu")
+        with pytest.raises(PnsFailure, match="final DRC audit"):
+            _audit_final_copper([(-8, 0), (8, 0)], W, None, [], [], [(orig, disp)], set(), CLR)
+
+    def test_displaced_original_position_not_audited(self):
+        # The obstacle entry of a displaced track is gone from the file;
+        # the route may pass over its ORIGINAL location.  Only the final
+        # displacement (clear of the route here) is audited.
+        obs = Obstacle(
+            shape=Polygon([(-0.1, -4.1), (0.1, -4.1), (0.1, 4.1), (-0.1, 4.1)]),
+            layers=frozenset({"F.Cu"}),
+            net="N2",
+            kind="track",
+        )
+        orig = TrackObstacle(points=((0, -4), (0, 4)), width=W, net="N2", layer="F.Cu")
+        # Displaced clear of the route (horizontal at y=5).
+        disp = TrackObstacle(points=((-4, 5), (4, 5)), width=W, net="N2", layer="F.Cu")
+        _audit_final_copper(
+            [(-8, 0), (8, 0)],
+            W,
+            None,
+            [obs],
+            [],
+            [(orig, disp)],
+            {id(obs)},
+            CLR,
+        )
+
+
+class TestSnap45Engine:
+    """Engine-level guarantee: snap + audit keep the output clean."""
+
+    def test_same_net_extra_fixed_is_not_audited(self):
+        # Early-leg copper is same-net to the route — touching it is
+        # legal, and the audit must not flag it (nor the walkaround walk
+        # around it).
+        pad = Obstacle(
+            shape=Polygon([(-0.4, -0.4), (0.4, -0.4), (0.4, 0.4), (-0.4, 0.4)]),
+            layers=frozenset({"F.Cu"}),
+            net="VCC",
+            kind="pad",
+        )
+        res = route_engine((-8, 0), (8, 0), [], W, CLR, net="VCC", extra_fixed=[pad])
+        assert res.path == [(-8, 0), (8, 0)]
+
+    def test_foreign_extra_fixed_overlap_fails_audit(self):
+        # Foreign copper under the route: the engine must refuse to hand
+        # back a DRC-violating path (PnsFailure, surfaced as the tool's
+        # error return).
+        pad = Obstacle(
+            shape=Polygon([(-0.4, -0.4), (0.4, -0.4), (0.4, 0.4), (-0.4, 0.4)]),
+            layers=frozenset({"F.Cu"}),
+            net="N2",
+            kind="pad",
+        )
+        with pytest.raises(PnsFailure, match="final DRC audit"):
+            route_engine((-8, 0), (8, 0), [], W, CLR, net="VCC", extra_fixed=[pad])
+
+    def test_snapped_detour_and_push_stay_clear(self):
+        # A detour + displacement that used to shave ~15 um off the true
+        # clearance envelope now passes the audit with the real margin.
+        t = _track_obs(0.0, -4.0, 4.0, "N2")
+        res = route_engine((-8, 0), (8, 0), [_pad(0, -1.5, half=0.4), t], W, CLR)
+        assert len(res.shoved_tracks) == 1
+        pushed = res.shoved_tracks[0]
+        assert pushed.start == (0, -4) and pushed.end == (0, 4)
+        d = LineString(pushed.points).distance(_pad(0, -1.5, half=0.4).shape)
+        assert d >= CLR + W / 2 - 1e-6, f"pushed track too close to pad: {d:.4f}"
 
 
 class TestMovableExtraction:
