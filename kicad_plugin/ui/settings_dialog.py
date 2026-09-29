@@ -37,7 +37,7 @@ if _WX_AVAILABLE:
         _GRID_VGAP = 6
 
         def __init__(self, parent, settings) -> None:
-            super().__init__(parent, title="AI Assistant Settings", size=(670, 620))
+            super().__init__(parent, title="AI Assistant Settings", size=(560, 620))
             self._settings = settings
             self._build_ui()
 
