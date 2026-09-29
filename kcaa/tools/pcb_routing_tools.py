@@ -767,7 +767,10 @@ def _track_matches_segment(track: TrackObstacle, fields: dict, eps: float = 1e-6
     through the engine keeps its direction, but a symmetric match is
     unambiguous.
     """
-    if abs(track.start[0] - fields["start"][0]) > eps or abs(track.start[1] - fields["start"][1]) > eps:
+    if (
+        abs(track.start[0] - fields["start"][0]) > eps
+        or abs(track.start[1] - fields["start"][1]) > eps
+    ):
         rev = (
             abs(track.start[0] - fields["end"][0]) <= eps
             and abs(track.start[1] - fields["end"][1]) <= eps
@@ -778,7 +781,9 @@ def _track_matches_segment(track: TrackObstacle, fields: dict, eps: float = 1e-6
             return False
     else:
         rev = False
-    if not rev and (abs(track.end[0] - fields["end"][0]) > eps or abs(track.end[1] - fields["end"][1]) > eps):
+    if not rev and (
+        abs(track.end[0] - fields["end"][0]) > eps or abs(track.end[1] - fields["end"][1]) > eps
+    ):
         return False
     if abs(track.width - fields["width"]) > eps:
         return False

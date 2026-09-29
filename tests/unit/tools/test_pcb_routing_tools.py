@@ -192,8 +192,7 @@ def crossing_board(tmp_path):
     dest = tmp_path / "crossing.kicad_pcb"
     text = _CLEAR_BOARD.replace('\t(net 1 "VCC")\n', '\t(net 1 "VCC")\n\t(net 2 "GND")\n')
     seg = (
-        "\t(segment (start 40.0 25.0) (end 55.0 45.0) "
-        '(width 0.25) (layer "F.Cu") (net 2 "GND"))\n'
+        '\t(segment (start 40.0 25.0) (end 55.0 45.0) (width 0.25) (layer "F.Cu") (net 2 "GND"))\n'
     )
     text = text.rstrip()[:-1] + seg + ")"
     dest.write_text(text, encoding="utf-8")
@@ -381,9 +380,7 @@ class TestPcbRouteOptions:
         fixture the hint is accepted without error and the route lands on
         the fixed copper layer ("F.Cu") — no top-level layer_hint exists
         anymore."""
-        result = self._route(
-            tools, routable_board, options={"layer_hint": "F.Cu"}
-        )
+        result = self._route(tools, routable_board, options={"layer_hint": "F.Cu"})
         assert "error" not in result
         assert result["layers_used"] == ["F.Cu"]
         assert "layer_hint" not in result
@@ -419,6 +416,7 @@ class TestPcbRouteOptions:
         assert wet["segment_count"] > 0
         assert wet["backup_path"] is not None
         assert open(routable_board, "rb").read() != before
+
 
 class TestPcbRouteStrategy:
     """pcb_route_pad_to_pad: the explicit strategy knob + always-on render."""
@@ -494,9 +492,7 @@ class TestPcbRouteStrategy:
     def test_strategy_inert_for_astar(self, tools, routable_board):
         """A* has no shove stage: the value is accepted and echoed, not
         rejected."""
-        result = self._route(
-            tools, routable_board, strategy="walkaround", algorithm="astar"
-        )
+        result = self._route(tools, routable_board, strategy="walkaround", algorithm="astar")
         assert "error" not in result
         assert result["strategy"] == "walkaround"
 
@@ -515,9 +511,7 @@ class TestPcbRouteStrategy:
         """dry_run skips only the PCB write; the render still fires (it
         reads the board and writes only temp files)."""
         before = open(routable_board, "rb").read()
-        result = self._route(
-            tools, routable_board, strategy="shove", dry_run=True
-        )
+        result = self._route(tools, routable_board, strategy="shove", dry_run=True)
         assert "error" not in result
         assert result["dry_run"] is True
         png = result["route_png"]
@@ -608,10 +602,7 @@ class TestPcbRouteStrategy:
             assert s["layer"] == "F.Cu"
             assert s["net"] == "GND"
         # 3) no carried GND segment crosses the routed VCC line(s)
-        vcc = [
-            (s["start"], s["end"])
-            for s in self._vcc_segments(crossing_board)
-        ]
+        vcc = [(s["start"], s["end"]) for s in self._vcc_segments(crossing_board)]
         assert vcc
         for s in gnd:
             line = (s["start"], s["end"])
@@ -650,9 +641,7 @@ class TestPcbRouteStrategy:
         assert len(before) == 1
         assert before[0]["start"] == (40.0, 25.0)
         assert before[0]["end"] == (55.0, 45.0)
-        result = self._route_vcc(
-            tools, crossing_board, strategy="walkaround"
-        )
+        result = self._route_vcc(tools, crossing_board, strategy="walkaround")
         assert "error" not in result
         assert result["shoved"] == []
         after = self._gnd_segments(crossing_board)
@@ -662,9 +651,7 @@ class TestPcbRouteStrategy:
         """dry_run=True: file byte-identical, shoved pairs still reported
         in the response (report-only, nothing written)."""
         before = open(crossing_board, "rb").read()
-        result = self._route_vcc(
-            tools, crossing_board, strategy="shove", dry_run=True
-        )
+        result = self._route_vcc(tools, crossing_board, strategy="shove", dry_run=True)
         assert "error" not in result
         assert result["dry_run"] is True
         assert result["shoved"], "dry_run must still report the pushed track"
@@ -672,5 +659,3 @@ class TestPcbRouteStrategy:
         gnd = self._gnd_segments(crossing_board)
         assert len(gnd) == 1
         assert gnd[0]["start"] == (40.0, 25.0) and gnd[0]["end"] == (55.0, 45.0)
-
-

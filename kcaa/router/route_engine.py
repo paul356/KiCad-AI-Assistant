@@ -117,9 +117,7 @@ def route_engine(
     # the track is never displaced.
     shove_enabled = max_shove_depth != 0
     walk_obstacles = (
-        obstacles
-        if not shove_enabled
-        else [o for o in obstacles if o not in movable_shapes]
+        obstacles if not shove_enabled else [o for o in obstacles if o not in movable_shapes]
     )
     node = ObstacleNode(walk_obstacles)
     walked = _walkaround_solids(skeleton, node, track_width, clearance)

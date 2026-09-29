@@ -24,9 +24,7 @@ from kcaa.utils.pcb_footprint_utils import (
 )
 from kcaa.utils.pcb_sexp_utils import load_pcb
 
-FIXTURE_DIR = os.path.join(
-    os.path.dirname(__file__), "..", "..", "integration", "fixtures"
-)
+FIXTURE_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "integration", "fixtures")
 BOARD_FIXTURE = os.path.join(FIXTURE_DIR, "test_routing_board.kicad_pcb")
 OUTLINE_BOARD_FIXTURE = os.path.join(
     os.path.dirname(__file__), "fixtures", "test_board_with_outline.kicad_pcb"
@@ -193,23 +191,27 @@ def _add_one(tools, pcb_path, footprint, reference, x, y, nets=UNCONNECTED, rota
     return _add(
         tools,
         pcb_path,
-        [{"footprint": footprint, "reference": reference, "x": x, "y": y,
-          "rotation": rotation, "nets": nets}],
+        [
+            {
+                "footprint": footprint,
+                "reference": reference,
+                "x": x,
+                "y": y,
+                "rotation": rotation,
+                "nets": nets,
+            }
+        ],
     )
 
 
 def _remove(tools, pcb_path, *references):
     """Call remove_footprints_from_pcb (pure batch) and return the dict."""
-    return _run(
-        tools["remove_footprints_from_pcb"](pcb_path=pcb_path, references=list(references))
-    )
+    return _run(tools["remove_footprints_from_pcb"](pcb_path=pcb_path, references=list(references)))
 
 
 class TestPlacement:
     def test_places_bare_name_from_project_table(self, tools, board_with_table):
-        res = _add_one(
-            tools, board_with_table, "R_0402_1005Metric", "R9", 20.0, 25.0
-        )
+        res = _add_one(tools, board_with_table, "R_0402_1005Metric", "R9", 20.0, 25.0)
         assert "error" not in res, res
         assert res["success"] is True
         result = res["results"][0]["result"]
@@ -230,9 +232,7 @@ class TestPlacement:
         assert get_fp_property(_fp_node(board_with_table, "R1"), "Reference") == "R1"
 
     def test_places_lib_colon_name(self, tools, board_with_table):
-        res = _add_one(
-            tools, board_with_table, "TestLib:R_0402_1005Metric", "R7", 10.0, 10.0
-        )
+        res = _add_one(tools, board_with_table, "TestLib:R_0402_1005Metric", "R7", 10.0, 10.0)
         assert "error" not in res, res
         assert res["success"] is True
         node = _fp_node(board_with_table, "R7")
@@ -245,8 +245,14 @@ class TestPlacement:
         # positions; the stored pad (at ...) keeps LOCAL coordinates with the
         # absolute rotation field = footprint rotation (KiCad convention).
         res = _add_one(
-            tools, board_with_table, "R_0402_1005Metric", "R9", 50.0, 40.0,
-            nets={"1": "A", "2": "B"}, rotation=45.0,
+            tools,
+            board_with_table,
+            "R_0402_1005Metric",
+            "R9",
+            50.0,
+            40.0,
+            nets={"1": "A", "2": "B"},
+            rotation=45.0,
         )
         assert "error" not in res, res
         assert res["success"] is True
@@ -268,7 +274,12 @@ class TestPlacement:
 
     def test_assigns_same_existing_net_to_all_pads(self, tools, board_with_table):
         res = _add_one(
-            tools, board_with_table, "R_0402_1005Metric", "R9", 20.0, 20.0,
+            tools,
+            board_with_table,
+            "R_0402_1005Metric",
+            "R9",
+            20.0,
+            20.0,
             nets={"1": "VCC", "2": "VCC"},
         )
         assert "error" not in res, res
@@ -282,7 +293,12 @@ class TestPlacement:
     def test_auto_adds_missing_net(self, tools, board_with_table):
         assert "NEWNET" not in _nets(board_with_table)
         res = _add_one(
-            tools, board_with_table, "R_0402_1005Metric", "R9", 20.0, 20.0,
+            tools,
+            board_with_table,
+            "R_0402_1005Metric",
+            "R9",
+            20.0,
+            20.0,
             nets={"1": "NEWNET", "2": "NEWNET"},
         )
         assert "error" not in res, res
@@ -296,7 +312,12 @@ class TestPlacement:
 class TestNets:
     def test_different_nets_per_pad(self, tools, board_with_table):
         res = _add_one(
-            tools, board_with_table, "R_0402_1005Metric", "R9", 20.0, 20.0,
+            tools,
+            board_with_table,
+            "R_0402_1005Metric",
+            "R9",
+            20.0,
+            20.0,
             nets={"1": "A", "2": "B"},
         )
         assert "error" not in res, res
@@ -316,7 +337,12 @@ class TestNets:
 
     def test_named_net_and_net_zero(self, tools, board_with_table):
         res = _add_one(
-            tools, board_with_table, "R_0402_1005Metric", "R9", 20.0, 20.0,
+            tools,
+            board_with_table,
+            "R_0402_1005Metric",
+            "R9",
+            20.0,
+            20.0,
             nets={"1": "A", "2": ""},
         )
         assert "error" not in res, res
@@ -331,9 +357,7 @@ class TestNets:
         assert _pad_net(pads[1]) == (0, "")
 
     def test_all_net_zero_via_empty_strings(self, tools, board_with_table):
-        res = _add_one(
-            tools, board_with_table, "R_0402_1005Metric", "R9", 20.0, 20.0
-        )
+        res = _add_one(tools, board_with_table, "R_0402_1005Metric", "R9", 20.0, 20.0)
         assert "error" not in res, res
         assert res["results"][0]["result"]["pads_net"] == [
             {"pad": "1", "net": ""},
@@ -345,7 +369,12 @@ class TestNets:
 
     def test_none_net_value_means_net_zero(self, tools, board_with_table):
         res = _add_one(
-            tools, board_with_table, "R_0402_1005Metric", "R9", 20.0, 20.0,
+            tools,
+            board_with_table,
+            "R_0402_1005Metric",
+            "R9",
+            20.0,
+            20.0,
             nets={"1": "A", "2": None},
         )
         assert "error" not in res, res
@@ -359,7 +388,12 @@ class TestNets:
     def test_missing_pad_net_is_hard_error_no_write(self, tools, board_with_table):
         before = _board_bytes(board_with_table)
         res = _add_one(
-            tools, board_with_table, "R_0402_1005Metric", "R9", 20.0, 20.0,
+            tools,
+            board_with_table,
+            "R_0402_1005Metric",
+            "R9",
+            20.0,
+            20.0,
             nets={"1": "A"},
         )
         assert res["success"] is False
@@ -368,16 +402,12 @@ class TestNets:
         assert _board_bytes(board_with_table) == before
         assert not os.path.exists(board_with_table + ".bak")
         data = load_pcb(board_with_table)
-        assert all(
-            get_fp_property(n, "Reference") != "R9" for n in iter_footprint_nodes(data)
-        )
+        assert all(get_fp_property(n, "Reference") != "R9" for n in iter_footprint_nodes(data))
 
 
 class TestRemoveFootprint:
     def _place(self, tools, board_path, ref, x, y, nets=UNCONNECTED):
-        return _add_one(
-            tools, board_path, "R_0402_1005Metric", ref, x, y, nets=nets
-        )
+        return _add_one(tools, board_path, "R_0402_1005Metric", ref, x, y, nets=nets)
 
     def _refs(self, board_path):
         data = load_pcb(board_path)
@@ -429,9 +459,7 @@ class TestRemoveFootprint:
 
     def test_remove_empty_references_is_error_no_write(self, tools, board_copy):
         before = _board_bytes(board_copy)
-        result = _run(
-            tools["remove_footprints_from_pcb"](pcb_path=board_copy, references=[])
-        )
+        result = _run(tools["remove_footprints_from_pcb"](pcb_path=board_copy, references=[]))
         assert "error" in result
         assert "non-empty" in result["error"]
         assert _board_bytes(board_copy) == before
@@ -458,9 +486,7 @@ class TestRemoveFootprint:
 
 class TestBatchRemove:
     def _place(self, tools, board_path, ref, x, y, nets=UNCONNECTED):
-        return _add_one(
-            tools, board_path, "R_0402_1005Metric", ref, x, y, nets=nets
-        )
+        return _add_one(tools, board_path, "R_0402_1005Metric", ref, x, y, nets=nets)
 
     def _refs(self, board_path):
         data = load_pcb(board_path)
@@ -557,12 +583,27 @@ class TestBatchPlacement:
             tools,
             board_with_table,
             [
-                {"footprint": "R_0402_1005Metric", "reference": "R9", "x": 20.0, "y": 20.0,
-                 "nets": {"1": "BATCH_A", "2": "BATCH_A"}},
-                {"footprint": "NoSuchPart", "reference": "R10", "x": 30.0, "y": 20.0,
-                 "nets": {"1": "BATCH_B", "2": "BATCH_B"}},
-                {"footprint": "R_0402_1005Metric", "reference": "R11", "x": 40.0, "y": 20.0,
-                 "nets": {"1": "BATCH_A", "2": "BATCH_A"}},
+                {
+                    "footprint": "R_0402_1005Metric",
+                    "reference": "R9",
+                    "x": 20.0,
+                    "y": 20.0,
+                    "nets": {"1": "BATCH_A", "2": "BATCH_A"},
+                },
+                {
+                    "footprint": "NoSuchPart",
+                    "reference": "R10",
+                    "x": 30.0,
+                    "y": 20.0,
+                    "nets": {"1": "BATCH_B", "2": "BATCH_B"},
+                },
+                {
+                    "footprint": "R_0402_1005Metric",
+                    "reference": "R11",
+                    "x": 40.0,
+                    "y": 20.0,
+                    "nets": {"1": "BATCH_A", "2": "BATCH_A"},
+                },
             ],
         )
         assert "error" not in res, res
@@ -584,12 +625,17 @@ class TestBatchPlacement:
         assert "not found" in res["results"][1]["error"]
         assert res["results"][2]["success"] is True
 
-        refs = [get_fp_property(n, "Reference") for n in iter_footprint_nodes(load_pcb(board_with_table))]
+        refs = [
+            get_fp_property(n, "Reference")
+            for n in iter_footprint_nodes(load_pcb(board_with_table))
+        ]
         assert "R9" in refs and "R11" in refs
         assert "R10" not in refs  # failed item never landed
         nets = _nets(board_with_table)
         assert nets.get("BATCH_A") is not None
-        for pad in _pads(_fp_node(board_with_table, "R9")) + _pads(_fp_node(board_with_table, "R11")):
+        for pad in _pads(_fp_node(board_with_table, "R9")) + _pads(
+            _fp_node(board_with_table, "R11")
+        ):
             assert _pad_net(pad) == (nets["BATCH_A"], "BATCH_A")
 
     def test_batch_all_ok(self, tools, board_with_table):
@@ -597,10 +643,21 @@ class TestBatchPlacement:
             tools,
             board_with_table,
             [
-                {"footprint": "R_0402_1005Metric", "reference": "R7", "x": 10.0, "y": 10.0,
-                 "nets": {"1": "A", "2": "B"}},
-                {"footprint": "R_0402_1005Metric", "reference": "R8", "x": 12.0, "y": 10.0,
-                 "rotation": 90.0, "nets": {"1": "C", "2": "D"}},
+                {
+                    "footprint": "R_0402_1005Metric",
+                    "reference": "R7",
+                    "x": 10.0,
+                    "y": 10.0,
+                    "nets": {"1": "A", "2": "B"},
+                },
+                {
+                    "footprint": "R_0402_1005Metric",
+                    "reference": "R8",
+                    "x": 12.0,
+                    "y": 10.0,
+                    "rotation": 90.0,
+                    "nets": {"1": "C", "2": "D"},
+                },
             ],
         )
         assert "error" not in res, res
@@ -614,17 +671,30 @@ class TestBatchPlacement:
             tools,
             board_with_table,
             [
-                {"footprint": "R_0402_1005Metric", "reference": "R9", "x": 20.0, "y": 20.0,
-                 "nets": {"1": "A", "2": "A"}},
-                {"footprint": "R_0402_1005Metric", "reference": "R10", "x": 30.0, "y": 20.0,
-                 "nets": {"1": "B"}},  # covers pad 1 only -> item fails
+                {
+                    "footprint": "R_0402_1005Metric",
+                    "reference": "R9",
+                    "x": 20.0,
+                    "y": 20.0,
+                    "nets": {"1": "A", "2": "A"},
+                },
+                {
+                    "footprint": "R_0402_1005Metric",
+                    "reference": "R10",
+                    "x": 30.0,
+                    "y": 20.0,
+                    "nets": {"1": "B"},
+                },  # covers pad 1 only -> item fails
             ],
         )
         assert res["placed_count"] == 1
         assert res["failed_count"] == 1
         assert "missing net for pad(s): 2" in res["failed"][0]["error"]
         assert res["failed"][0]["reference"] == "R10"
-        refs = [get_fp_property(n, "Reference") for n in iter_footprint_nodes(load_pcb(board_with_table))]
+        refs = [
+            get_fp_property(n, "Reference")
+            for n in iter_footprint_nodes(load_pcb(board_with_table))
+        ]
         assert "R9" in refs and "R10" not in refs
 
     def test_batch_item_missing_nets_fails_that_item(self, tools, board_with_table):
@@ -632,15 +702,23 @@ class TestBatchPlacement:
             tools,
             board_with_table,
             [
-                {"footprint": "R_0402_1005Metric", "reference": "R9", "x": 20.0, "y": 20.0,
-                 "nets": {"1": "A", "2": "A"}},
+                {
+                    "footprint": "R_0402_1005Metric",
+                    "reference": "R9",
+                    "x": 20.0,
+                    "y": 20.0,
+                    "nets": {"1": "A", "2": "A"},
+                },
                 {"footprint": "R_0402_1005Metric", "reference": "R10", "x": 30.0, "y": 20.0},
             ],
         )
         assert res["placed_count"] == 1
         assert res["failed_count"] == 1
         assert "nets must be an object" in res["failed"][0]["error"]
-        refs = [get_fp_property(n, "Reference") for n in iter_footprint_nodes(load_pcb(board_with_table))]
+        refs = [
+            get_fp_property(n, "Reference")
+            for n in iter_footprint_nodes(load_pcb(board_with_table))
+        ]
         assert "R9" in refs and "R10" not in refs
 
     def test_batch_duplicate_reference_fails_that_item(self, tools, board_with_table):
@@ -648,16 +726,29 @@ class TestBatchPlacement:
             tools,
             board_with_table,
             [
-                {"footprint": "R_0402_1005Metric", "reference": "R9", "x": 20.0, "y": 20.0,
-                 "nets": UNCONNECTED},
-                {"footprint": "R_0402_1005Metric", "reference": "R9", "x": 30.0, "y": 20.0,
-                 "nets": UNCONNECTED},
+                {
+                    "footprint": "R_0402_1005Metric",
+                    "reference": "R9",
+                    "x": 20.0,
+                    "y": 20.0,
+                    "nets": UNCONNECTED,
+                },
+                {
+                    "footprint": "R_0402_1005Metric",
+                    "reference": "R9",
+                    "x": 30.0,
+                    "y": 20.0,
+                    "nets": UNCONNECTED,
+                },
             ],
         )
         assert res["placed_count"] == 1
         assert res["failed_count"] == 1
         assert "already exists" in res["failed"][0]["error"]
-        refs = [get_fp_property(n, "Reference") for n in iter_footprint_nodes(load_pcb(board_with_table))]
+        refs = [
+            get_fp_property(n, "Reference")
+            for n in iter_footprint_nodes(load_pcb(board_with_table))
+        ]
         assert refs.count("R9") == 1
 
     def test_batch_missing_x_y_and_junk_item(self, tools, board_with_table):
@@ -665,9 +756,18 @@ class TestBatchPlacement:
             tools,
             board_with_table,
             [
-                {"footprint": "R_0402_1005Metric", "reference": "R9", "x": 20.0, "y": 20.0,
-                 "nets": UNCONNECTED},
-                {"footprint": "R_0402_1005Metric", "reference": "R10", "nets": UNCONNECTED},  # missing x/y
+                {
+                    "footprint": "R_0402_1005Metric",
+                    "reference": "R9",
+                    "x": 20.0,
+                    "y": 20.0,
+                    "nets": UNCONNECTED,
+                },
+                {
+                    "footprint": "R_0402_1005Metric",
+                    "reference": "R10",
+                    "nets": UNCONNECTED,
+                },  # missing x/y
                 "not-an-object",
             ],
         )
@@ -684,8 +784,13 @@ class TestBatchPlacement:
         items = []
         for i, ref in enumerate(("R9", "R10")):
             items.append(
-                {"footprint": "R_0402_1005Metric", "reference": ref, "x": 20.0 + 10.0 * i,
-                 "y": 20.0, "nets": {"1": "SHARED_NEW", "2": "SHARED_NEW"}}
+                {
+                    "footprint": "R_0402_1005Metric",
+                    "reference": ref,
+                    "x": 20.0 + 10.0 * i,
+                    "y": 20.0,
+                    "nets": {"1": "SHARED_NEW", "2": "SHARED_NEW"},
+                }
             )
         res = _add(tools, board_with_table, items)
         assert "error" not in res, res
@@ -701,10 +806,20 @@ class TestBatchPlacement:
             tools,
             outline_board_with_table,
             [
-                {"footprint": "R_0402_1005Metric", "reference": "R9", "x": 25.0, "y": 20.0,
-                 "nets": UNCONNECTED},
-                {"footprint": "R_0402_1005Metric", "reference": "R10", "x": 5000.0, "y": 5000.0,
-                 "nets": UNCONNECTED},
+                {
+                    "footprint": "R_0402_1005Metric",
+                    "reference": "R9",
+                    "x": 25.0,
+                    "y": 20.0,
+                    "nets": UNCONNECTED,
+                },
+                {
+                    "footprint": "R_0402_1005Metric",
+                    "reference": "R10",
+                    "x": 5000.0,
+                    "y": 5000.0,
+                    "nets": UNCONNECTED,
+                },
             ],
         )
         assert "error" not in res, res
@@ -719,8 +834,16 @@ class TestBatchPlacement:
         res = _add(
             tools,
             board_with_table,
-            [{"footprint": "R_0402_1005Metric", "reference": "R9", "x": 20.0, "y": 20.0,
-              "nets": UNCONNECTED, "library": "Whatever"}],
+            [
+                {
+                    "footprint": "R_0402_1005Metric",
+                    "reference": "R9",
+                    "x": 20.0,
+                    "y": 20.0,
+                    "nets": UNCONNECTED,
+                    "library": "Whatever",
+                }
+            ],
         )
         assert "error" not in res, res
         assert res["success"] is True
@@ -754,7 +877,9 @@ class TestValidation:
         assert _board_bytes(board_copy) == before
 
     def test_missing_pcb_file_rejected(self, tools, tmp_path):
-        res = _add_one(tools, str(tmp_path / "missing.kicad_pcb"), "R_0402_1005Metric", "R9", 20.0, 20.0)
+        res = _add_one(
+            tools, str(tmp_path / "missing.kicad_pcb"), "R_0402_1005Metric", "R9", 20.0, 20.0
+        )
         assert res["success"] is False
         assert "cannot read board" in res["failed"][0]["error"]
 

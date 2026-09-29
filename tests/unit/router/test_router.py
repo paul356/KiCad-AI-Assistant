@@ -1949,15 +1949,15 @@ def test_waypoints_via_shifts_off_blocked_site(tmp_path: Path) -> None:
     from shapely.geometry import Point, box
 
     same_net_pad = (
-        "\n\t(footprint \"user_add:site-blocker\"\n"
-        "\t\t(layer \"F.Cu\")\n"
+        '\n\t(footprint "user_add:site-blocker"\n'
+        '\t\t(layer "F.Cu")\n'
         "\t\t(at 45.0 40.0 0.0)\n"
-        "\t\t(property \"Reference\" \"X1\")\n"
-        "\t\t(pad \"1\" smd rect\n"
+        '\t\t(property "Reference" "X1")\n'
+        '\t\t(pad "1" smd rect\n'
         "\t\t\t(at 0.0 0.0)\n"
         "\t\t\t(size 0.3 0.3)\n"
-        "\t\t\t(layers \"F.Cu\" \"F.Mask\")\n"
-        "\t\t\t(net 1 \"VCC\")\n"
+        '\t\t\t(layers "F.Cu" "F.Mask")\n'
+        '\t\t\t(net 1 "VCC")\n'
         "\t\t)\n"
         "\t)\n"
     )
@@ -1981,15 +1981,15 @@ def test_waypoints_failure_renders_png_evidence(tmp_path: Path) -> None:
     """A blocked via anchor with no DRC-clean spot inside tol_mm raises
     RouteFailure carrying the path of a rendered failure-evidence PNG."""
     foreign_blocker = (
-        "\n\t(footprint \"user_add:wall\"\n"
-        "\t\t(layer \"F.Cu\")\n"
+        '\n\t(footprint "user_add:wall"\n'
+        '\t\t(layer "F.Cu")\n'
         "\t\t(at 45.0 40.0 0.0)\n"
-        "\t\t(property \"Reference\" \"X1\")\n"
-        "\t\t(pad \"1\" smd rect\n"
+        '\t\t(property "Reference" "X1")\n'
+        '\t\t(pad "1" smd rect\n'
         "\t\t\t(at 0.0 0.0)\n"
         "\t\t\t(size 4.0 4.0)\n"
-        "\t\t\t(layers \"F.Cu\" \"F.Mask\")\n"
-        "\t\t\t(net 2 \"GND\")\n"
+        '\t\t\t(layers "F.Cu" "F.Mask")\n'
+        '\t\t\t(net 2 "GND")\n'
         "\t\t)\n"
         "\t)\n"
     )
@@ -2067,10 +2067,7 @@ def test_waypoints_same_layer_legs_emit_each_segment_once(tmp_path: Path) -> Non
     # the mitered polygon samples the joint-pinning bug produced instead.
     assert len(result.arcs) >= 3
     assert len(result.segments) >= 4
-    fingerprints = [
-        (s.x1, s.y1, s.x2, s.y2, s.width, s.layer, s.net)
-        for s in result.segments
-    ]
+    fingerprints = [(s.x1, s.y1, s.x2, s.y2, s.width, s.layer, s.net) for s in result.segments]
     assert len(fingerprints) == len(set(fingerprints)), (
         "same-layer waypoint chain emitted duplicate segments: "
         f"{len(fingerprints)} segs, {len(set(fingerprints))} unique"
@@ -2171,8 +2168,7 @@ def test_waypoints_tol_circle_blocked_falls_back_exact(tmp_path: Path) -> None:
     text = pcb_path.read_text()
     text = text.replace('\t(net 1 "VCC")\n', '\t(net 1 "VCC")\n\t(net 2 "GND")\n')
     text = (
-        text.rstrip()[:-1]
-        + '\n\t(footprint "user_add:blocker"\n'
+        text.rstrip()[:-1] + '\n\t(footprint "user_add:blocker"\n'
         '\t\t(layer "F.Cu")\n'
         "\t\t(at 45.0 30.0 0.0)\n"
         '\t\t(property "Reference" "X1")\n'
@@ -2206,12 +2202,13 @@ def test_waypoints_tol_circle_blocked_falls_back_exact(tmp_path: Path) -> None:
     def seg_fp(r) -> tuple:
         return tuple(
             sorted(
-                (round(s.x1, 6), round(s.y1, 6), round(s.x2, 6), round(s.y2, 6))
-                for s in r.segments
+                (round(s.x1, 6), round(s.y1, 6), round(s.x2, 6), round(s.y2, 6)) for s in r.segments
             )
         )
 
-    assert seg_fp(hard) == seg_fp(exact), "blocked tolerance circle must not drift: fall back to the exact anchor"
+    assert seg_fp(hard) == seg_fp(exact), (
+        "blocked tolerance circle must not drift: fall back to the exact anchor"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2328,9 +2325,7 @@ def _route_ring(
 
     return auto_route_pair(
         RouteRequest(
-            pcb_path=_make_ring_board(
-                tmp_path, blocker=blocker, same_net_pad=same_net_pad
-            ),
+            pcb_path=_make_ring_board(tmp_path, blocker=blocker, same_net_pad=same_net_pad),
             ref_a="R1",
             pad_a="1",
             ref_b="C1",
@@ -2454,9 +2449,10 @@ def _route_polyline_sampled(result, n: int = 64) -> list[tuple[float, float]]:
         if not pts:
             pts.append((s.x1, s.y1))
         pts.append((s.x2, s.y2))
-        while unused and math.hypot(
-            unused[0].start[0] - pts[-1][0], unused[0].start[1] - pts[-1][1]
-        ) <= 1e-3:
+        while (
+            unused
+            and math.hypot(unused[0].start[0] - pts[-1][0], unused[0].start[1] - pts[-1][1]) <= 1e-3
+        ):
             a = unused.pop(0)
             cx, cy = _arc_circumcenter(a.start, a.mid, a.end)
             rad = math.hypot(a.start[0] - cx, a.start[1] - cy)
@@ -2489,9 +2485,7 @@ def test_waypoints_cocircular_chain_emits_covering_arc(tmp_path: Path) -> None:
     the sweep covers the chain, and the leg renders with no sharp corner
     (the per-leg chord + fillet skeleton would kink at every waypoint)."""
     anchors = [_ring_point(a) for a in RING_WAYPOINT_ANGLES]
-    waypoints = [
-        {"kind": "waypoint", "pos": list(pt), "tol_mm": 2.0} for pt in anchors
-    ]
+    waypoints = [{"kind": "waypoint", "pos": list(pt), "tol_mm": 2.0} for pt in anchors]
     result = _route_ring(waypoints, tmp_path)
     assert result.waypoint_violated is False
     assert result.violated_waypoints == []
@@ -2537,9 +2531,7 @@ def test_waypoints_non_cocircular_falls_back_to_polyline(tmp_path: Path) -> None
     # chain span: the whole-chain arc must never fire off-circle.
     for a in _covering_arcs(result):
         span = abs(_arc_signed_sweep(a.start, a.mid, a.end))
-        assert span < 0.8 * math.pi - 1e-6, (
-            "non-cocircular chain must not emit a covering arc"
-        )
+        assert span < 0.8 * math.pi - 1e-6, "non-cocircular chain must not emit a covering arc"
 
 
 def test_waypoints_cocircular_arc_blocked_falls_back(tmp_path: Path) -> None:
@@ -2590,15 +2582,12 @@ def test_waypoints_cocircular_chain_crossing_same_net_pad_still_emits_arc(
     assert result.end == pytest.approx((70.0, 35.0), abs=1e-3)
     cover = _covering_arcs(result)
     assert len(cover) == 1, (
-        "same-net pad on the sweep must not veto the covering arc "
-        f"(got {len(cover)} covering arcs)"
+        f"same-net pad on the sweep must not veto the covering arc (got {len(cover)} covering arcs)"
     )
     a = cover[0]
     # The arc still covers >= 80% of the chain's angular span: the whole
     # leg emits as one arc, same as the clear-board case.
-    chain_span = abs(
-        _arc_signed_sweep((20.0, 35.0), _ring_point(90.0), (70.0, 35.0))
-    )
+    chain_span = abs(_arc_signed_sweep((20.0, 35.0), _ring_point(90.0), (70.0, 35.0)))
     arc_span = abs(_arc_signed_sweep(a.start, a.mid, a.end))
     assert arc_span >= 0.8 * chain_span - 1e-6, (
         f"covering arc sweep {math.degrees(arc_span):.1f} deg < 80% of "
@@ -2635,9 +2624,7 @@ def test_waypoints_chain_tangent_fillet_rounds_joints(tmp_path: Path) -> None:
     pts = _route_polyline_sampled(rounded, n=128)
     for p0, p1, p2 in zip(pts, pts[1:], pts[2:]):
         ang = _interior_angle(p0, p1, p2)
-        assert ang >= 170.0 - 1e-6, (
-            f"filleted chain has a corner of {ang:.1f} deg at {p1}"
-        )
+        assert ang >= 170.0 - 1e-6, f"filleted chain has a corner of {ang:.1f} deg at {p1}"
     # Control: the same chain in the mitered corner mode stays sharp.
     mitered = _route_clear(
         {"algorithm": "pns", "corner_mode": "mitered45", "waypoints": waypoints},
@@ -2646,8 +2633,7 @@ def test_waypoints_chain_tangent_fillet_rounds_joints(tmp_path: Path) -> None:
     assert mitered.arcs == []
     mpts = _route_polyline_sampled(mitered)
     assert any(
-        _interior_angle(p0, p1, p2) < 170.0 - 1e-6
-        for p0, p1, p2 in zip(mpts, mpts[1:], mpts[2:])
+        _interior_angle(p0, p1, p2) < 170.0 - 1e-6 for p0, p1, p2 in zip(mpts, mpts[1:], mpts[2:])
     ), "mitered control must keep its sharp miter corners"
 
 
@@ -2664,8 +2650,7 @@ def test_waypoints_chain_fillet_drc_shrinks_falls_back(tmp_path: Path) -> None:
     text = pcb_path.read_text()
     text = text.replace('\t(net 1 "VCC")\n', '\t(net 1 "VCC")\n\t(net 2 "GND")\n')
     text = (
-        text.rstrip()[:-1]
-        + '\n\t(footprint "user_add:blocker"\n'
+        text.rstrip()[:-1] + '\n\t(footprint "user_add:blocker"\n'
         '\t\t(layer "F.Cu")\n'
         "\t\t(at 44.2 30.4 0.0)\n"
         '\t\t(property "Reference" "X1")\n'
@@ -2736,11 +2721,7 @@ def test_waypoints_chain_fillet_drc_shrinks_falls_back(tmp_path: Path) -> None:
     pts = _route_polyline_sampled(result, n=128)
     for p0, p1, p2 in zip(pts, pts[1:], pts[2:]):
         ang = _interior_angle(p0, p1, p2)
-        assert ang >= 170.0 - 1e-6, (
-            f"filleted chain has a corner of {ang:.1f} deg at {p1}"
-        )
-
-
+        assert ang >= 170.0 - 1e-6, f"filleted chain has a corner of {ang:.1f} deg at {p1}"
 
 
 # ---------------------------------------------------------------------------
@@ -2752,10 +2733,14 @@ def _make_clear_board_with_track(tmp_path: Path) -> str:
     pcb_path = Path(_make_clear_board(tmp_path))
     text = pcb_path.read_text()
     text = text.replace('\t(net 1 "VCC")\n', '\t(net 1 "VCC")\n\t(net 2 "GND")\n')
-    text = text.rstrip()[:-1] + (
-        '\n\t(segment (start 40.0 25.0) (end 55.0 45.0) '
-        '(width 0.25) (layer "F.Cu") (net 2 "GND"))\n'
-    ) + ")\n"
+    text = (
+        text.rstrip()[:-1]
+        + (
+            "\n\t(segment (start 40.0 25.0) (end 55.0 45.0) "
+            '(width 0.25) (layer "F.Cu") (net 2 "GND"))\n'
+        )
+        + ")\n"
+    )
     pcb_path.write_text(text)
     return str(pcb_path)
 
@@ -2769,9 +2754,7 @@ def _route_strategy(
 ) -> RouteResult:
     from kcaa.router.router import RouteRequest, auto_route_pair
 
-    pcb_path = (
-        _make_clear_board_with_track(tmp_path) if track else _make_clear_board(tmp_path)
-    )
+    pcb_path = _make_clear_board_with_track(tmp_path) if track else _make_clear_board(tmp_path)
     return auto_route_pair(
         RouteRequest(
             pcb_path=pcb_path,
@@ -2828,9 +2811,9 @@ def test_strategy_walkaround_detours_no_shove(tmp_path: Path) -> None:
     # The busiest middle point must sit measurably off the direct line:
     # a walkaround detour cannot keep the straight skeleton.
     mid = pts[len(pts) // 2]
-    dist = abs(
-        (b[0] - a[0]) * (a[1] - mid[1]) - (b[1] - a[1]) * (a[0] - mid[0])
-    ) / math.hypot(b[0] - a[0], b[1] - a[1])
+    dist = abs((b[0] - a[0]) * (a[1] - mid[1]) - (b[1] - a[1]) * (a[0] - mid[0])) / math.hypot(
+        b[0] - a[0], b[1] - a[1]
+    )
     assert dist > 0.4
 
 
@@ -2878,6 +2861,8 @@ def test_astar_moved_pairs_empty(tmp_path: Path) -> None:
     """A* has no shove stage: moved_pairs stays empty."""
     result = _route_clear({"algorithm": "astar", "corner_mode": "mitered45"}, tmp_path)
     assert result.moved_pairs == []
+
+
 def test_strategy_invalid_value_rejected(tmp_path: Path) -> None:
     """Values outside {shove, walkaround} are rejected up front
     with a clear message, regardless of the algorithm."""
@@ -2896,9 +2881,7 @@ def test_single_route_renders_route_png(tmp_path: Path) -> None:
     ``route_png`` of the routed track (the VLM feedback image)."""
     result = _route_strategy(tmp_path)
     assert result.route_png
-    assert result.route_png.startswith(
-        os.path.join(tempfile.gettempdir(), "kcaa_route_")
-    )
+    assert result.route_png.startswith(os.path.join(tempfile.gettempdir(), "kcaa_route_"))
     assert os.path.exists(result.route_png)
     assert os.path.getsize(result.route_png) > 0
 
@@ -2932,11 +2915,11 @@ def _make_blocked_single_layer_board(tmp_path: Path) -> str:
     wall = (
         '\t(footprint "W"\n'
         '\t\t(layer "F.Cu")\n'
-        '\t\t(at 29.5 30.0 0.0)\n'
+        "\t\t(at 29.5 30.0 0.0)\n"
         '\t\t(property "Reference" "W1")\n'
         '\t\t(pad "1" smd rect\n'
-        '\t\t\t(at -0.5 0.0)\n'
-        '\t\t\t(size 6.0 6.0)\n'
+        "\t\t\t(at -0.5 0.0)\n"
+        "\t\t\t(size 6.0 6.0)\n"
         '\t\t\t(layers "F.Cu" "F.Mask")\n'
         '\t\t\t(net 2 "GND")\n'
         "\t\t)\n"
