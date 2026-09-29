@@ -16,6 +16,13 @@ log = logging.getLogger(__name__)
 _SETTINGS_FILENAME = "kicad_ai_assistant.json"
 
 
+# Default User-Agent for OpenAI/Anthropic requests. Chosen from the values
+# proven accepted (HTTP 200) at opencode.ai's edge in issue #149; urllib's
+# default "Python-urllib/x.y" is rejected there (HTTP 403). A plugin-branded
+# UA is intentionally NOT the default (review on #150).
+DEFAULT_LLM_USER_AGENT = "python-requests/2.32.3"
+
+
 def _detect_kicad_version() -> str | None:
     """Detect KiCad version for the plugin context.
 
@@ -80,9 +87,7 @@ class PluginSettings:
     # LLM provider
     llm_provider: str = "openai"  # "openai" | "anthropic" | "ollama"
     llm_api_key: str = field(default="", repr=False)  # never leak key in logs/repr
-    llm_user_agent: str = (
-        ""  # "" = built-in default; custom User-Agent for OpenAI/Anthropic requests
-    )
+    llm_user_agent: str = DEFAULT_LLM_USER_AGENT  # UA for OpenAI/Anthropic requests
     llm_model: str = "gpt-4o"  # model name
     llm_supports_vision: bool = False  # whether the model accepts image input
     llm_base_url: str = (
@@ -151,6 +156,10 @@ class PluginSettings:
             for key, value in data.items():
                 if hasattr(inst, key) and key != "config_dir":
                     setattr(inst, key, value)
+            # Legacy configs stored "" as the old default UA; migrate them to
+            # the proven default so they don't fall back to the plugin UA.
+            if inst.llm_user_agent == "":
+                inst.llm_user_agent = DEFAULT_LLM_USER_AGENT
             log.debug(f"Settings loaded from {inst.settings_path}")
         except (OSError, json.JSONDecodeError) as e:
             log.warning(f"Could not load settings ({e}); using defaults")

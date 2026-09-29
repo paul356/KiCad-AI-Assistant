@@ -22,12 +22,22 @@ if _WX_AVAILABLE:
         """Simple dialog for editing plugin settings."""
 
         _PROVIDERS = ["openai", "anthropic", "ollama"]
+        # User-Agents proven accepted (HTTP 200) at opencode.ai's edge in
+        # issue #149; urllib's default (Python-urllib/...) is rejected (403).
+        _USER_AGENTS = [
+            "python-requests/2.32.3",
+            "Go-http-client/1.1",
+            "okhttp/4.9.0",
+            "axios/1.7.0",
+            "curl/8.14.1",
+            "Mozilla/5.0",
+        ]
         # Vertical gap between form rows in the FlexGridSizer (must match the
         # vgap literal used in _build_ui).
         _GRID_VGAP = 6
 
         def __init__(self, parent, settings) -> None:
-            super().__init__(parent, title="AI Assistant Settings", size=(600, 620))
+            super().__init__(parent, title="AI Assistant Settings", size=(760, 620))
             self._settings = settings
             self._build_ui()
 
@@ -87,14 +97,25 @@ if _WX_AVAILABLE:
 
             # User-Agent
             grid.Add(wx.StaticText(scrolled, label="User-Agent:"), 0, wx.ALIGN_CENTER_VERTICAL)
-            self._user_agent = wx.TextCtrl(scrolled, value=self._settings.llm_user_agent)
-            self._user_agent.SetHint(
-                "leave blank for plugin default (KiCad-AI-Assistant/0.2.5); e.g. python-requests/2.32.3"
-            )
+            self._user_agent = wx.Choice(scrolled, choices=self._USER_AGENTS)
+            current_ua = self._settings.llm_user_agent
+            if current_ua in self._USER_AGENTS:
+                self._user_agent.SetSelection(self._USER_AGENTS.index(current_ua))
+            elif current_ua:
+                # Older configs may hold a custom UA outside the proven list;
+                # keep it visible and selected so the user can review it.
+                choices = list(self._USER_AGENTS) + [current_ua]
+                self._user_agent.Set(choices)
+                self._user_agent.SetSelection(len(choices) - 1)
+                log.info("Custom User-Agent %r preserved in the dropdown", current_ua)
+            else:
+                # Empty (legacy default): the proven default is pre-selected.
+                self._user_agent.SetSelection(0)
             self._user_agent.SetToolTip(
-                "User-Agent sent on OpenAI/Anthropic-compatible requests. Some gateways "
-                "reject urllib's default (Python-urllib/...); accepted values include "
-                "python-requests/2.32.3, curl/8.14.1. Leave blank for the plugin default."
+                "User-Agent sent on OpenAI/Anthropic-compatible requests. All values "
+                "in this list were confirmed accepted (HTTP 200) at opencode.ai's "
+                "edge in issue #149; urllib's default (Python-urllib/...) is "
+                "rejected (HTTP 403)."
             )
             grid.Add(self._user_agent, 1, wx.EXPAND)
 
@@ -216,7 +237,7 @@ if _WX_AVAILABLE:
             settings.llm_model = self._model.GetValue().strip()
             settings.llm_supports_vision = self._supports_vision.GetValue()
             settings.llm_base_url = self._base_url.GetValue().strip()
-            settings.llm_user_agent = self._user_agent.GetValue().strip()
+            settings.llm_user_agent = self._user_agent.GetStringSelection()
             settings.python_executable = self._python.GetValue().strip()
             settings.server_port = self._port.GetValue()
             settings.show_tool_log = self._show_tool_log.GetValue()

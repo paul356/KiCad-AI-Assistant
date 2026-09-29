@@ -23,6 +23,10 @@ class TestPluginSettingsDefaults:
         s = PluginSettings()
         assert s.llm_model == "gpt-4o"
 
+    def test_default_user_agent_is_proven_python_requests(self):
+        s = PluginSettings()
+        assert s.llm_user_agent == "python-requests/2.32.3"
+
     def test_default_port_is_zero(self):
         s = PluginSettings()
         assert s.server_port == 0
@@ -70,6 +74,15 @@ class TestPluginSettingsSaveLoad:
     def test_load_missing_file_returns_defaults(self, tmp_config_dir):
         loaded = PluginSettings.load(config_dir=tmp_config_dir)
         assert loaded.llm_provider == "openai"
+
+    def test_load_migrates_empty_user_agent_to_proven_default(self, tmp_config_dir):
+        """Configs written before the proven-UA default stored "" — loading
+        must migrate them so requests don't fall back to the plugin UA."""
+        s = PluginSettings(config_dir=tmp_config_dir, llm_user_agent="")
+        s.save()
+
+        loaded = PluginSettings.load(config_dir=tmp_config_dir)
+        assert loaded.llm_user_agent == "python-requests/2.32.3"
 
     def test_load_corrupt_file_returns_defaults(self, tmp_config_dir):
         s = PluginSettings(config_dir=tmp_config_dir)

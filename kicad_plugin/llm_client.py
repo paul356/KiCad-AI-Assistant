@@ -252,13 +252,14 @@ _ANTHROPIC_DEFAULT_MAX_TOKENS = 65536
 # alone nearly fills the history budget (issue #140).
 _COMPACTION_SUMMARY_FLOOR_CHARS = 800
 
-# Default User-Agent sent on OpenAI/Anthropic LLM requests. urllib's default
-# "Python-urllib/x.y" is rejected with HTTP 403 by some OpenAI/Anthropic-
-# compatible gateways (OpenRouter, Groq, vLLM, LM Studio, corporate
-# proxies), so an explicit plugin-identifying header is required (issue
-# #149). Users can override it via the llm_user_agent setting (review
-# comment on #150). Version literal must stay in sync with pyproject.toml
-# (the plugin package has no __version__).
+# Fallback User-Agent for OpenAI/Anthropic requests, used only when the
+# llm_user_agent setting is empty (e.g. a legacy in-memory settings object).
+# urllib's default "Python-urllib/x.y" is rejected with HTTP 403 by some
+# OpenAI/Anthropic-compatible gateways (OpenRouter, Groq, vLLM, LM Studio,
+# corporate proxies). The user-facing default is the proven
+# "python-requests/2.32.3" from PluginSettings ("Don't use kicad plugin as a
+# type of agent" — review on #150). Version literal must stay in sync with
+# pyproject.toml (the plugin package has no __version__).
 _LLM_USER_AGENT = "KiCad-AI-Assistant/0.2.5 (+https://github.com/paul356/KiCad-AI-Assistant)"
 
 # ------------------------------------------------------------------
@@ -3223,8 +3224,10 @@ class LLMClient:
         )
 
     def _user_agent(self) -> str:
-        """User-Agent for OpenAI/Anthropic requests: the configured value
-        when set, else the built-in default."""
+        """User-Agent for OpenAI/Anthropic requests: the llm_user_agent
+        setting value (defaults to the proven python-requests UA, issue
+        #149). The plugin constant is only a safety net for empty settings
+        (legacy in-memory objects)."""
         return getattr(self._settings, "llm_user_agent", "") or _LLM_USER_AGENT
 
     def _anthropic_headers(self) -> dict[str, str]:
