@@ -36,6 +36,30 @@ log = logging.getLogger(__name__)
 VALID_LABEL_TYPES = ("local", "global", "hierarchical")
 VALID_SHAPES = ("input", "output", "bidirectional", "tri_state", "passive")
 
+# Vocabulary for create_symbol-generated library definitions.
+VALID_PIN_TYPES = (
+    "input",
+    "output",
+    "bidirectional",
+    "tri_state",
+    "passive",
+    "free",
+    "no_connect",
+    "power_in",
+    "power_out",
+    "open_collector",
+    "open_emitter",
+    "unspecified",
+)
+VALID_PIN_DIRECTIONS = ("left", "right", "up", "down")
+_PIN_DIRECTION_ANGLE = {"left": 180, "right": 0, "up": 90, "down": 270}
+# Valid symbol names: alphanumerics/underscore, must not start with a digit.
+_SYMBOL_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
+_DEFAULT_BODY_WIDTH_MM = 6.35  # KiCad standard body width (250 mil)
+_DEFAULT_PIN_LENGTH_MM = 2.54  # 100 mil, KiCad default pin length
+_PIN_PITCH_MM = 2.54  # 100 mil centre spacing between pins on one side
+_BODY_HEIGHT_PADDING_MM = 2.54  # auto-height margin above/below the pin span
+
 
 def _angle_to_direction(angle_deg: int | float) -> str:
     """Convert a label/pin at-angle to a human-readable direction string.
@@ -1161,6 +1185,382 @@ def _add_lib_symbol(lib_symbols_wrapper: Any, lib_sym_raw: list, table_name: str
 
 
 # ---------------------------------------------------------------------------
+# create_symbol: build a new lib symbol definition from scratch
+# ---------------------------------------------------------------------------
+
+
+def _lib_effects(font_size: float = 1.27) -> list:
+    """Return a ``(effects (font (size s s)))`` node for pins/properties."""
+    return [
+        sexpdata.Symbol("effects"),
+        [sexpdata.Symbol("font"), [sexpdata.Symbol("size"), font_size, font_size]],
+    ]
+
+
+def _build_lib_symbol_raw(
+    symbol_name: str,
+    pins: list[dict],
+    reference_prefix: str,
+    value: str,
+    body_width: float | None = None,
+    body_height: float | None = None,
+) -> tuple[list, list[str]]:
+    """Build a self-contained KiCad 10 ``(symbol ...)`` lib definition.
+
+    The returned raw list lives in the KiCad library coordinate system
+    (origin at the body centre, **+Y up**), matches the on-disk format KiCad
+    writes for ``.kicad_sch`` lib_symbols blocks, and carries a single
+    electrical unit (``NAME_1_1``) holding every pin plus a shared graphics
+    unit (``NAME_0_1``) with the body rectangle.
+
+    Pin auto-layout (all offsets stay on the 1.27 mm / 50-mil grid):
+
+    * ``direction=left``  → pins face the body's left edge, angle 180
+    * ``direction=right`` → pins face the body's right edge, angle 0
+    * ``direction=up``    → pins face the body's top edge, angle 90
+    * ``direction=down``  → pins face the body's bottom edge, angle 270
+
+    Pins on the same side are spaced 2.54 mm (100 mil) apart, centred on the
+    body, in the order they appear in *pins*.  Each pin is 2.54 mm long with
+    its inner end exactly on the body edge and the electrical (connection)
+    end pointing outward.  Body size defaults to 6.35 mm wide with the height
+    derived from the pin span; explicit *body_width* / *body_height* are used
+    when given but are enlarged if they would not contain every pin's inner
+    end (a warning is appended in that case).
+
+    Returns the raw list and a warnings list.
+    """
+    warnings: list[str] = []
+
+    # Partition pins per side, preserving the caller's ordering within each
+    # side so pin 1 sits at the top of a vertical side and ordering follows
+    # the `pins` array.
+    per_side: dict[str, list[dict]] = {d: [] for d in VALID_PIN_DIRECTIONS}
+    for pin in pins:
+        per_side[pin["direction"]].append(pin)
+
+    def _side_offsets(count: int) -> list[float]:
+        """Centred 2.54 mm-spaced offsets; every value is an odd 1.27 mm step."""
+        return [
+            round((count - 1) * _PIN_PITCH_MM / 2.0 - i * _PIN_PITCH_MM, 4) for i in range(count)
+        ]
+
+    # Horizontal pins (left/right) stick out along X, so the body height must
+    # cover their Y span; vertical pins (up/down) stick out along Y, so the
+    # body width must cover their X span.  Per-side arrays preserve the
+    # caller's pin order, first pin nearest the top (left/right) or left
+    # (up/down) of the body.
+    left_y = _side_offsets(len(per_side["left"]))
+    right_y = _side_offsets(len(per_side["right"]))
+    up_x = _side_offsets(len(per_side["up"]))
+    down_x = _side_offsets(len(per_side["down"]))
+    req_h_span = 0.0
+    for side_offsets in (left_y, right_y):
+        req_h_span = max(req_h_span, max((abs(v) for v in side_offsets), default=0.0))
+    req_w_span = 0.0
+    for side_offsets in (up_x, down_x):
+        req_w_span = max(req_w_span, max((abs(v) for v in side_offsets), default=0.0))
+
+    required_w = 2.0 * req_w_span
+    required_h = 2.0 * req_h_span
+
+    if body_width is not None:
+        width = body_width
+        if width < required_w:
+            warnings.append(
+                f"body_width {width} too small to contain vertical pins; using {required_w}"
+            )
+            width = required_w
+    else:
+        width = max(_DEFAULT_BODY_WIDTH_MM, required_w)
+
+    if body_height is not None:
+        height = body_height
+        if height < required_h:
+            warnings.append(
+                f"body_height {height} too small to contain horizontal pins; using {required_h}"
+            )
+            height = required_h
+    else:
+        height = max(required_h + _BODY_HEIGHT_PADDING_MM, _PIN_PITCH_MM)
+
+    half_w = round(width / 2.0, 4)
+    half_h = round(height / 2.0, 4)
+
+    # Pin electrical (connection) ends in lib coordinates, inner end on edge.
+    pin_nodes: list[list] = []
+    for direction, side_offsets in (("left", left_y), ("right", right_y)):
+        angle = _PIN_DIRECTION_ANGLE[direction]
+        sign_x = -1.0 if direction == "left" else 1.0
+        base_x = sign_x * (half_w + _DEFAULT_PIN_LENGTH_MM)
+        for pin, off in zip(per_side[direction], side_offsets):
+            pin_nodes.append(_build_pin_node(pin, base_x, off, angle))
+    for direction, sign_y, side_offsets in (
+        ("up", 1.0, up_x),
+        ("down", -1.0, down_x),
+    ):
+        angle = _PIN_DIRECTION_ANGLE[direction]
+        base_y = sign_y * (half_h + _DEFAULT_PIN_LENGTH_MM)
+        for pin, off in zip(per_side[direction], side_offsets):
+            pin_nodes.append(_build_pin_node(pin, off, base_y, angle))
+
+    # Reference/Value sit just outside the body on the right, like KiCad's
+    # own auto-placed fields; Footprint/Datasheet carry empty defaults.
+    top: list = [
+        sexpdata.Symbol("symbol"),
+        symbol_name,
+        [
+            sexpdata.Symbol("pin_names"),
+            [sexpdata.Symbol("offset"), 0.254],
+            [sexpdata.Symbol("hide"), sexpdata.Symbol("yes")],
+        ],
+        [sexpdata.Symbol("exclude_from_sim"), sexpdata.Symbol("no")],
+        [sexpdata.Symbol("in_bom"), sexpdata.Symbol("yes")],
+        [sexpdata.Symbol("on_board"), sexpdata.Symbol("yes")],
+        [sexpdata.Symbol("in_pos_files"), sexpdata.Symbol("yes")],
+        [sexpdata.Symbol("duplicate_pin_numbers_are_jumpers"), sexpdata.Symbol("no")],
+    ]
+
+    for prop_name, prop_value, prop_x, prop_y in (
+        ("Reference", reference_prefix, 0.635, 2.54),
+        ("Value", value, 0.635, -2.54),
+        ("Footprint", "", 0.0, 0.0),
+        ("Datasheet", "", 0.0, 0.0),
+    ):
+        top.append(
+            [
+                sexpdata.Symbol("property"),
+                prop_name,
+                prop_value,
+                [sexpdata.Symbol("at"), prop_x, prop_y, 0],
+                [sexpdata.Symbol("show_name"), sexpdata.Symbol("no")],
+                [sexpdata.Symbol("do_not_autoplace"), sexpdata.Symbol("no")],
+                _lib_effects(),
+            ]
+        )
+
+    top.append(
+        [
+            sexpdata.Symbol("symbol"),
+            f"{symbol_name}_0_1",
+            [
+                sexpdata.Symbol("rectangle"),
+                [sexpdata.Symbol("start"), -half_w, half_h],
+                [sexpdata.Symbol("end"), half_w, -half_h],
+                [
+                    sexpdata.Symbol("stroke"),
+                    [sexpdata.Symbol("width"), 0.254],
+                    [sexpdata.Symbol("type"), sexpdata.Symbol("default")],
+                ],
+                [
+                    sexpdata.Symbol("fill"),
+                    [sexpdata.Symbol("type"), sexpdata.Symbol("background")],
+                ],
+            ],
+        ]
+    )
+    top.append([sexpdata.Symbol("symbol"), f"{symbol_name}_1_1", *pin_nodes])
+    top.append([sexpdata.Symbol("embedded_fonts"), sexpdata.Symbol("no")])
+
+    return top, warnings
+
+
+def _build_pin_node(pin: dict, pin_x: float, pin_y: float, angle: int) -> list:
+    """Build one ``(pin <type> line (at x y angle) (length L) ...)`` node.
+
+    *pin_x* / *pin_y* are the electrical (connection) end, which is the outer
+    end; the 2.54 mm pin line runs from there back onto the body edge.
+    """
+    return [
+        sexpdata.Symbol("pin"),
+        sexpdata.Symbol(pin["type"]),
+        sexpdata.Symbol("line"),
+        [sexpdata.Symbol("at"), pin_x, pin_y, angle],
+        [sexpdata.Symbol("length"), _DEFAULT_PIN_LENGTH_MM],
+        [
+            sexpdata.Symbol("name"),
+            pin.get("name", ""),
+            _lib_effects(),
+        ],
+        [sexpdata.Symbol("number"), pin["number"], _lib_effects()],
+    ]
+
+
+def _do_create_symbol(
+    schematic_path: str,
+    symbol_name: str,
+    pins: list[dict],
+    reference_prefix: str = "U",
+    value: str | None = None,
+    body_width: float | None = None,
+    body_height: float | None = None,
+    x: float | None = None,
+    y: float | None = None,
+    rotation: int = 0,
+    fields_autoplaced: bool = True,
+) -> dict[str, Any]:
+    """Core implementation of ``create_symbol``.
+
+    Validates inputs, builds a fresh lib symbol definition, injects it into
+    the schematic's lib_symbols block, optionally places one instance, writes
+    the file (with a .bak backup) and returns a result dict.  All failures
+    return ``{"error": ...}`` without a success key (matching the
+    create_symbol contract).
+    """
+    if not schematic_path.endswith(".kicad_sch"):
+        return {"error": f"Not a .kicad_sch file: {schematic_path!r}"}
+    if not os.path.isfile(schematic_path):
+        return {"error": f"Schematic file not found: {schematic_path!r}"}
+    if not isinstance(symbol_name, str) or not _SYMBOL_NAME_RE.match(symbol_name):
+        return {
+            "error": (
+                f"Invalid symbol_name {symbol_name!r}: must match "
+                r"^[A-Za-z][A-Za-z0-9_]*$ (no leading digit)"
+            )
+        }
+    if not pins:
+        return {"error": "pins list must not be empty"}
+    if not isinstance(reference_prefix, str) or not reference_prefix:
+        return {"error": "reference_prefix must be a non-empty string"}
+
+    seen_numbers: set[str] = set()
+    for i, pin in enumerate(pins):
+        if not isinstance(pin, dict):
+            return {"error": f"pins[{i}] must be a dict with number/name/type/direction"}
+        number = pin.get("number")
+        if not isinstance(number, str) or not number:
+            return {"error": f"pins[{i}]: number must be a non-empty string"}
+        if number in seen_numbers:
+            return {"error": f"Duplicate pin number {number!r}"}
+        seen_numbers.add(number)
+        pin_type = pin.get("type")
+        if pin_type not in VALID_PIN_TYPES:
+            return {
+                "error": (
+                    f"pins[{i}]: invalid type {pin_type!r}; valid types: "
+                    f"{', '.join(VALID_PIN_TYPES)}"
+                )
+            }
+        direction = pin.get("direction")
+        if direction not in VALID_PIN_DIRECTIONS:
+            return {
+                "error": (
+                    f"pins[{i}]: invalid direction {direction!r}; valid "
+                    f"directions: {', '.join(VALID_PIN_DIRECTIONS)}"
+                )
+            }
+        name = pin.get("name")
+        if name is not None and not isinstance(name, str):
+            return {"error": f"pins[{i}]: name must be a string"}
+
+    for label, v in (("body_width", body_width), ("body_height", body_height)):
+        if v is not None and not math.isfinite(v):
+            return {"error": f"{label} must be a finite number (got {v})"}
+        if v is not None and v <= 0:
+            return {"error": f"{label} must be positive (got {v})"}
+
+    placing = x is not None or y is not None
+    if placing and (x is None or y is None):
+        return {"error": "x and y must be provided together (or both omitted to define only)"}
+    if placing and (not math.isfinite(x) or not math.isfinite(y)):
+        return {"error": f"Coordinates must be finite numbers (got x={x}, y={y})"}
+    if rotation not in (0, 90, 180, 270):
+        return {"error": f"rotation must be 0, 90, 180, or 270 (got {rotation})"}
+
+    effective_value = value if value not in (None, "") else symbol_name
+    table_name = "自定义"
+    lib_id_str = f"{table_name}:{symbol_name}"
+
+    try:
+        lib_sym_raw, warnings = _build_lib_symbol_raw(
+            symbol_name=symbol_name,
+            pins=pins,
+            reference_prefix=reference_prefix,
+            value=effective_value,
+            body_width=body_width,
+            body_height=body_height,
+        )
+    except Exception as exc:
+        log.exception("Failed to build lib symbol definition")
+        return {"error": f"Failed to build lib symbol definition: {exc}"}
+
+    try:
+        sch = safe_schematic(schematic_path)
+    except Exception as exc:
+        return {"error": f"Failed to open schematic: {exc}"}
+
+    sch_uuid_obj = getattr(sch, "uuid", None)
+    sch_uuid = (
+        str(sch_uuid_obj.value).lstrip("/") if sch_uuid_obj is not None else str(uuid.uuid4())
+    )
+
+    try:
+        if lib_id_str not in sch.lib_symbols:
+            _add_lib_symbol(sch.lib_symbols, lib_sym_raw, table_name)
+    except Exception as exc:
+        return {"error": f"Failed to inject lib symbol: {exc}"}
+
+    result: dict[str, Any] = {
+        "success": True,
+        "lib_id": lib_id_str,
+        "units_added": _get_unit_count(lib_sym_raw),
+        "pin_count": len(pins),
+        "position": None,
+        "file_modified": schematic_path,
+        "backup_path": schematic_path + ".bak",
+        "warnings": warnings,
+    }
+
+    if placing:
+        x = _align_to_grid(float(x))
+        y = _align_to_grid(float(y))
+        reference = _next_reference(sch, reference_prefix, schematic_path=schematic_path)
+        project_name = _find_project_name(schematic_path)
+
+        # Shift the placement if any pin would land on an existing wire,
+        # mirroring add_symbol_to_schematic's wire-conflict avoidance.
+        try:
+            existing_wires = [
+                (
+                    float(w.start.value[0]),
+                    float(w.start.value[1]),
+                    float(w.end.value[0]),
+                    float(w.end.value[1]),
+                )
+                for w in sch.wire
+            ]
+        except AttributeError:
+            existing_wires = []
+        x, y = _find_safe_placement(lib_sym_raw, x, y, rotation, existing_wires)
+
+        try:
+            placed_raw = _build_placed_symbol(
+                lib_id_str,
+                x,
+                y,
+                rotation,
+                1,
+                reference,
+                effective_value,
+                sch_uuid,
+                project_name,
+                lib_sym_raw,
+                fields_autoplaced=fields_autoplaced,
+            )
+            sch.new_from_list(placed_raw)
+        except Exception as exc:
+            return {"error": f"Failed to place symbol instance: {exc}"}
+        result["position"] = {"x": x, "y": y}
+
+    try:
+        save_schematic(schematic_path, sch)
+    except Exception as exc:
+        return {"error": f"Failed to save schematic: {exc}"}
+
+    return result
+
+
+# ---------------------------------------------------------------------------
 # MCP tool registration
 # ---------------------------------------------------------------------------
 
@@ -1231,6 +1631,90 @@ def register_symbol_edit_tools(mcp: FastMCP) -> None:
             y=y,
             rotation=rotation,
             value=value,
+            fields_autoplaced=fields_autoplaced,
+        )
+
+    @mcp.tool()
+    async def create_symbol(
+        schematic_path: str,
+        symbol_name: str,
+        pins: list[dict],
+        reference_prefix: str = "U",
+        value: str | None = None,
+        body_width: float | None = None,
+        body_height: float | None = None,
+        x: float | None = None,
+        y: float | None = None,
+        rotation: int = 0,
+        fields_autoplaced: bool = True,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Create a brand-new symbol definition and inject it into a schematic.
+
+        Unlike ``add_symbol_to_schematic`` (which pulls an *existing*
+        definition from the indexed libraries), this tool generates a fresh
+        single-unit symbol from the ``pins`` description: a rectangular body
+        of 6.35 mm default width (or explicit ``body_width`` / ``body_height``)
+        with one pin per entry, laid out automatically.
+
+        Pin ``direction`` picks the body side the pin faces on:
+        ``left`` / ``right`` / ``up`` / ``down``; pins on one side are spaced
+        2.54 mm (100 mil) apart in the order given.  Coordinates follow the
+        KiCad screen convention (**+Y is down**); placement coordinates are
+        auto-snapped to the 1.27 mm (50-mil) grid so connection points align
+        with KiCad's standard schematic grid.  Pin ``type`` must be one of:
+        ``input``, ``output``, ``bidirectional``, ``tri_state``, ``passive``,
+        ``free``, ``no_connect``, ``power_in``, ``power_out``,
+        ``open_collector``, ``open_emitter``, ``unspecified``.
+
+        The new definition is registered under lib_id ``"自定义:NAME"``
+        (``自定义`` = "custom" library table).  When ``x`` and ``y`` are given
+        (both must be provided), a placed instance is added with the reference
+        auto-assigned as the next free ``<reference_prefix><N>``; otherwise
+        only the lib_symbols definition is injected and ``position`` is None.
+
+        Args:
+            schematic_path: Absolute path to the target .kicad_sch file.
+            symbol_name: Name for the new symbol. Must match
+                ``^[A-Za-z][A-Za-z0-9_]*$`` (no leading digit).
+            pins: List of pin dicts, each ``{"number": str, "name": str,
+                "type": str, "direction": str}``.  ``number`` must be unique.
+                ``name`` is optional (defaults to "").  ``type`` and
+                ``direction`` take the values listed above.
+            reference_prefix: Reference prefix for placed instances with
+                auto-assigned numbers (e.g. "U" → U1, U2). Defaults to "U".
+            value: Value property text. Defaults to ``symbol_name``.
+            body_width: Body width in mm (default 6.35). Enlarged if too
+                small for the pins.
+            body_height: Body height in mm (default derived from the pin
+                span). Enlarged if too small for the pins.
+            x: Placement X in mm (screen +X right); must be given together
+                with ``y`` to place an instance.
+            y: Placement Y in mm (screen **+Y down**); must be given together
+                with ``x`` to place an instance.
+            rotation: Placement rotation, one of 0/90/180/270. Ignored when
+                not placing.
+            fields_autoplaced: When True (default) mark the placed instance
+                ``(fields_autoplaced yes)`` so KiCad re-flows field positions.
+                Ignored when not placing.
+
+        Returns:
+            dict with keys: success (bool), lib_id, units_added, pin_count,
+            position ({"x", "y"} when placed, else None), file_modified,
+            backup_path, warnings.  On failure returns ``{"error": ...}``
+            without a success key.
+        """
+        return _do_create_symbol(
+            schematic_path=schematic_path,
+            symbol_name=symbol_name,
+            pins=pins,
+            reference_prefix=reference_prefix,
+            value=value,
+            body_width=body_width,
+            body_height=body_height,
+            x=x,
+            y=y,
+            rotation=rotation,
             fields_autoplaced=fields_autoplaced,
         )
 
