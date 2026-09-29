@@ -16,6 +16,9 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 import logging
+import os
+import tempfile
+import time
 from typing import Any
 
 from fastmcp import Context, FastMCP
@@ -26,10 +29,12 @@ from kcaa.router.pns.shove import TrackObstacle
 from kcaa.router.router import (
     RouteFailure,
     RouteRequest,
+    _find_pad_center,
     auto_route_pair,
     connect_with_via,
 )
 from kcaa.router.via_check import ProposedVia, check_vias
+from kcaa.tools.render_route_state import render_route_attempt
 from kcaa.utils.pcb_sexp_utils import load_pcb, save_pcb
 
 log = logging.getLogger(__name__)
@@ -194,7 +199,11 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
             ``strategy`` is the explicit knob that decides whether the
             engine may shove tracks out of the way.
 
-            Or ``{"error": "<message>"}`` on failure.
+            Or ``{"error": "<message>", "route_png": "<path>"}`` on failure:
+            the error message plus a best-effort PNG of the current board
+            with the failed route's endpoint pads marked (``route_png`` is
+            ``None`` when rendering is unavailable; the error is never
+            masked by the render).
         """
         corner_mode = "rounded45"
         via_pairs: tuple[tuple[str, str], ...] = (("F.Cu", "B.Cu"),)
@@ -233,9 +242,12 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
         try:
             result = auto_route_pair(req)
         except RouteFailure as exc:
-            return {"error": str(exc)}
+            return {"error": str(exc), "route_png": _route_failure_png(pcb_path, req)}
         except (FileNotFoundError, ValueError) as exc:
-            return {"error": f"Routing input error: {exc}"}
+            return {
+                "error": f"Routing input error: {exc}",
+                "route_png": _route_failure_png(pcb_path, req),
+            }
 
         # ---- Write path: dry_run short-circuits before reloading
         #      (auto_route_pair already parsed the board) and never
@@ -857,6 +869,58 @@ def _apply_shoved_tracks(
             written.add(fp)
             displaced_segs.append(seg)
     data[:] = kept + displaced_segs
+
+
+# ---------------------------------------------------------------------------
+# Failure evidence render (best-effort)
+# ---------------------------------------------------------------------------
+
+
+def _route_anchors(pcb_path: str, req: RouteRequest) -> list[tuple[float, float]]:
+    """Best-effort anchor points (resolved pad centres) for failure evidence.
+
+    Resolves the two endpoint pad centres from the board; a pad that
+    cannot be located is simply skipped — the evidence render must never
+    mask the original routing failure.
+    """
+    anchors: list[tuple[float, float]] = []
+    try:
+        data = load_pcb(pcb_path)
+    except Exception:  # noqa: BLE001 - evidence must not mask the failure
+        return anchors
+    for ref, pad in ((req.ref_a, req.pad_a), (req.ref_b, req.pad_b)):
+        try:
+            center = _find_pad_center(data, ref, pad)
+        except Exception:  # noqa: BLE001
+            continue
+        if center is not None:
+            anchors.append((float(center[0]), float(center[1])))
+    return anchors
+
+
+def _route_failure_png(pcb_path: str, req: RouteRequest) -> str | None:
+    """Render a best-effort failure-evidence PNG; ``None`` when unavailable.
+
+    The image shows the current board with the failed route's endpoint
+    pads marked; it is written to the system temp dir and its path
+    returned.  Rendering must never mask the original failure, so any
+    exception collapses to ``None``.
+    """
+    try:
+        _lines, png_bytes, _report = render_route_attempt(
+            pcb_path, anchors=_route_anchors(pcb_path, req) or None
+        )
+        if not png_bytes:
+            return None
+        out = os.path.join(
+            tempfile.gettempdir(),
+            f"kcaa_route_{time.time_ns()}_{os.getpid()}.png",
+        )
+        with open(out, "wb") as f:
+            f.write(png_bytes)
+        return out
+    except Exception:  # noqa: BLE001 - evidence must not mask the failure
+        return None
 
 
 # ---------------------------------------------------------------------------

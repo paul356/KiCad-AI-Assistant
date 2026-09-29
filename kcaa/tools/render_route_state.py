@@ -9,7 +9,7 @@ pns-vlm-routing.md Part II §8).
 
 Pure functions, no MCP registration needed.  Reuses the board drawing
 facilities from :mod:`kcaa.tools.render_board_tools` (``parse_board``,
-``_new_board_figure``, ``_draw_board_layers``).
+``_bounds``, ``_new_board_figure``, ``_draw_board_layers``).
 """
 
 from __future__ import annotations

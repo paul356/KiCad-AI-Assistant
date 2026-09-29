@@ -959,11 +959,10 @@ def _draw_arc(ax, entry: dict, color: str, lw: float, alpha: float, zorder: int)
 def _new_board_figure(
     xmin: float, ymin: float, xmax: float, ymax: float, dpi: int
 ) -> tuple[Any, Any, int]:
-    """Create the standard KiCad-theme board figure.
+    """Create a board figure/axes in KiCad convention (+Y down, dark bg).
 
-    The PNG resolution is scaled so the board is sharp at any size (min
-    1600px wide); the returned effective dpi is what callers must pass to
-    ``savefig``.
+    Returns ``(fig, ax, eff_dpi)`` where ``eff_dpi`` is ``dpi`` raised so
+    the output is sharp at any board size (min 1600 px wide).
     """
     w_mm = xmax - xmin
     fig_w_in = w_mm / 25.4
@@ -1215,7 +1214,7 @@ def render_board(
 
     # --- figure ---
     xmin, ymin, xmax, ymax = _bounds(board, ratsnest)
-    fig, ax, dpi = _new_board_figure(xmin, ymin, xmax, ymax, dpi)
+    fig, ax, eff_dpi = _new_board_figure(xmin, ymin, xmax, ymax, dpi)
     pad_labels = _draw_board_layers(ax, board, layer=layer, show_pad_labels=show_pad_labels)
 
     # 7. Ratsnest on top; in a single-layer render only edges touching that
@@ -1224,7 +1223,7 @@ def render_board(
     # lengths are pixel-scaled so they look the same at any dpi.
     import matplotlib.collections as mcollections
 
-    px = 72.0 / dpi
+    px = 72.0 / eff_dpi
     rat_segs: list[tuple[tuple[float, float], tuple[float, float]]] = []
     for item in ratsnest:
         a, b, rlayers = item
@@ -1246,7 +1245,7 @@ def render_board(
         )
 
     buf = io.BytesIO()
-    fig.savefig(buf, format="png", facecolor=_BG_COLOR, dpi=dpi)
+    fig.savefig(buf, format="png", facecolor=_BG_COLOR, dpi=eff_dpi)
     plt.close(fig)
 
     report: dict[str, Any] = {

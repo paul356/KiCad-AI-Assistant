@@ -619,3 +619,54 @@ class TestPcbRouteStrategy:
         gnd = self._gnd_segments(crossing_board)
         assert len(gnd) == 1
         assert gnd[0]["start"] == (40.0, 25.0) and gnd[0]["end"] == (55.0, 45.0)
+
+
+# ── Route failure evidence render ──────────────────────────────────────
+
+
+class TestPcbRouteFailureEvidence:
+    def test_route_failure_returns_error_and_png(self, tools, board_with_tracks):
+        result = _run(
+            tools["pcb_route_pad_to_pad"](
+                pcb_path=board_with_tracks,
+                ref_a="R1",
+                pad_a="1",
+                ref_b="C99",
+                pad_b="1",
+                net="VCC",
+                width=0.25,
+                ctx=None,
+            )
+        )
+        assert "error" in result
+        png = result.get("route_png")
+        assert png is not None
+        assert os.path.isfile(png)
+        assert png.startswith(os.path.join(tempfile.gettempdir(), "kcaa_route_"))
+        with open(png, "rb") as f:
+            assert f.read(8) == b"\x89PNG\r\n\x1a\n"
+        os.remove(png)
+
+    def test_failure_render_silent_when_render_unavailable(
+        self, tools, board_with_tracks, monkeypatch
+    ):
+        import kcaa.tools.pcb_routing_tools as prt
+
+        def _boom(*_args, **_kwargs):
+            raise RuntimeError("no display")
+
+        monkeypatch.setattr(prt, "render_route_attempt", _boom)
+        result = _run(
+            tools["pcb_route_pad_to_pad"](
+                pcb_path=board_with_tracks,
+                ref_a="R1",
+                pad_a="1",
+                ref_b="C99",
+                pad_b="1",
+                net="VCC",
+                width=0.25,
+                ctx=None,
+            )
+        )
+        assert "error" in result
+        assert result["route_png"] is None
