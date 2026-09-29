@@ -7,6 +7,7 @@ import math
 import pytest
 from shapely.geometry import LineString, Polygon
 
+from kcaa.router.pns.shove import ShoveFailure
 from kcaa.router.route_engine import (
     PnsFailure,
     _path_len,
@@ -177,6 +178,20 @@ class TestRouteEngine:
         assert pushed.start == (5, -3) and pushed.end == (5, 3)
         d = LineString(pushed.points).distance(LineString(res.path))
         assert d >= CLR + W / 2 - 1e-6
+
+    def test_shove_failure_surfaces_as_pns_failure(self, monkeypatch):
+        """A shove-stage ShoveFailure must come out as PnsFailure — the
+        auto_route_pair contract knows PnsFailure, not the raw shove
+        exception (which would bubble past router and tool into
+        FastMCP's success:true + text-error wrapper)."""
+        t = _track_obs(5, -3, 3, "N2")
+
+        def _boom(*_args, **_kwargs):
+            raise ShoveFailure("cannot shove track (1, 2) -> (3, 4)")
+
+        monkeypatch.setattr("kcaa.router.route_engine.shove_path", _boom)
+        with pytest.raises(PnsFailure, match="shove failed"):
+            route_engine((-8, 0), (8, 0), [_pad(0, 0), t], W, CLR)
 
     def test_subwidth_short_track_is_fixed_not_shoved(self):
         # A track shorter than its width (0.2 mm tap-in inside a 0.5 mm
