@@ -304,6 +304,21 @@ def _segments_on_45(pts) -> bool:
     return True
 
 
+def _turns_le_45(pts) -> bool:
+    """True when every consecutive turn of ``pts`` is <= 45 degrees."""
+    for a, b, c in zip(pts, pts[1:], pts[2:]):
+        v1x, v1y = b[0] - a[0], b[1] - a[1]
+        v2x, v2y = c[0] - b[0], c[1] - b[1]
+        l1 = math.hypot(v1x, v1y)
+        l2 = math.hypot(v2x, v2y)
+        if l1 < 1e-12 or l2 < 1e-12:
+            continue
+        dot = v1x * v2x + v1y * v2y
+        if dot < (math.sqrt(0.5) - 1e-6) * l1 * l2:
+            return False
+    return True
+
+
 class TestSnap45Line:
     """Disturbed polylines are re-snapped onto the 0/45/90 family."""
 
@@ -311,21 +326,23 @@ class TestSnap45Line:
         pts = [(0, 0), (2, 0), (4, 2), (4, 6)]
         assert _snap45_line(pts, []) == pts
 
-    def test_diagonal_replaced_with_manhattan_corner(self):
-        # 14-degree segment: the (x2, y1) corner fits, both legs land on
-        # the family, endpoints are pinned.
+    def test_diagonal_replaced_with_short_leg_hook(self):
+        # 14-degree segment: the 45-family short-leg hook (3 mm axis
+        # leg + 1 mm 45-degree leg) replaces it; the turn is 45 degrees,
+        # endpoints are pinned — a KiCad-style miter shoulder, no L.
         out = _snap45_line([(0, 0), (4, 1)], [])
-        assert out == [(0, 0), (4, 0), (4, 1)]
+        assert out == [(0, 0), (3, 0), (4, 1)]
         assert out[0] == (0, 0) and out[-1] == (4, 1)
         assert _segments_on_45(out)
 
-    def test_falls_back_to_original_when_both_corners_blocked(self):
+    def test_falls_back_to_original_when_hook_blocked(self):
         from shapely.geometry import box
 
         hulls = [box(3.9, -0.2, 4.3, 0.4), box(3.8, 0.9, 4.4, 1.3)]
         out = _snap45_line([(0, 0), (4, 1)], hulls)
-        # Neither corner is legal; snapping must keep the original
-        # segment (the final audit is the gate, never the snap).
+        # The hook (axis leg under, 45 leg over) is blocked like every
+        # family alternative; snapping must keep the original segment
+        # (the final audit is the gate, never the snap).
         assert out == [(0, 0), (4, 1)]
 
     def test_snapped_result_never_enters_a_hull(self):
@@ -338,24 +355,38 @@ class TestSnap45Line:
         assert interior.length < 1e-6
         assert _segments_on_45(out)
 
-    def test_rejects_corner_that_turns_back_on_itself(self):
-        # The following segment runs at -120 deg from (4, 1) — both
-        # Manhattan corners are geometrically clear (no hulls), but each
-        # exit leg turns > 90 deg into it.  The corner must be refused
-        # even though snapping would be legal clearance-wise; direction
-        # continuity (no re-entry angle) wins, so the original segment
-        # survives untouched.
+    def test_rejects_hook_that_turns_back_on_itself(self):
+        # The following segment runs at -120 deg from (4, 1) — the hook
+        # is geometrically clear (no hulls), but its 45-degree exit leg
+        # turns 165 deg into it.  The hook must be refused even though
+        # snapping would be legal clearance-wise; direction continuity
+        # (no re-entry angle) wins, so the original segment survives.
         pts = [(0, 0), (4, 1), (3.5, 0.134)]
         out = _snap45_line(pts, [])
         assert out == pts
 
-    def test_corner_accepted_when_exit_turn_is_shallow(self):
-        # Follow-on segment continues at 0 deg: the (x2, y1) corner
-        # exits at 90 deg into it — exactly on the constraint boundary,
-        # so the corner is taken and the polyline stays on the family.
+    def test_hook_accepted_when_exit_turn_is_shallow(self):
+        # Follow-on segment continues at 0 deg: the hook's 45-degree
+        # exit leg turns exactly 45 deg into it — on the constraint
+        # boundary, so the hook is taken and the polyline stays on the
+        # family.
         out = _snap45_line([(0, 0), (4, 1), (6, 1)], [])
-        assert out == [(0, 0), (4, 0), (4, 1), (6, 1)]
+        assert out == [(0, 0), (3, 0), (4, 1), (6, 1)]
         assert _segments_on_45(out)
+
+    def test_family_gap_gets_automatic_miter_shoulder(self):
+        # 0-degree run then a shallow kink then a 90-degree run: the
+        # family slots force the intermediate 45-degree legs
+        # (KiCad's miter shoulder) with zero explicit miter parameter.
+        pts = [(0, 0), (20, 0), (20.4, 0.4), (20.4, 10)]
+        out = _snap45_line(pts, [])
+        assert out[0] == (0, 0) and out[-1] == (20.4, 10)
+        # The kink (20,0)->(20.4,0.4) is not family: each turn is <= 45
+        # degrees and every segment stays on the family — the axis legs
+        # join through a 45-degree leg, never a direct 90.
+        assert _segments_on_45(out)
+        assert _turns_le_45(out)
+        assert (20.0, 0.0) in out[:-1]
 
 
 class TestFinalAudit:

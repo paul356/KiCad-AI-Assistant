@@ -316,24 +316,27 @@ def _snap45_line(
     pts: Sequence[tuple[float, float]],
     hulls: Sequence[Polygon],
 ) -> list[tuple[float, float]]:
-    """Replace every non-0/45/90 segment with a Manhattan corner.
+    """Replace every non-family segment with a 45-family short-leg corner.
 
-    For each offending segment both corner candidates ``(x2, y1)`` and
-    ``(x1, y2)`` are tried; the first whose two sub-segments stay clear
-    of every hull wins.  When neither fits, the original segment is kept
-    — snapping must never create a DRC violation by itself (the final
-    audit is the gate).
+    The candidate is the *shortest* 45-family hook between the two
+    points: one long leg on the axis (0/90) plus a 45-degree short leg.
+    Because every step stays in the family and the turn angle is exactly
+    45 degrees, an L-shaped (90-degree) corner can never be produced —
+    slots between family directions force the intermediate 45-degree
+    segment, which is precisely the miter shoulder KiCad's optimizer
+    emits.  No explicit miter/radius parameter is needed: the shoulder
+    length falls out of the geometry.
 
-    A candidate is also rejected when it turns the path back on itself:
-    the entry turn (previous segment -> first candidate leg) and the
-    exit turn (second candidate leg -> following segment) must both be
-    <= 90 degrees, keeping the polyline direction-continuous (no sharp
-    re-entry angles, which are DRC min-angle violations and route
-    surprises).  The fallback keeps the original segment even when its
-    neighbours turn more than 90 degrees — that geometry follows the
-    obstacle hull and is the cost of the walkaround, not a snapping
-    choice.  Corner smoothing (fillet arcs) is deliberately out of
-    scope until the polyline scheme is stable.
+    The candidate is accepted only when both legs stay clear of every
+    hull, and when the entry turn (previous segment -> first leg) and
+    the exit turn (second leg -> following segment) are each <= 45
+    degrees — direction-continuity, no re-entry angles (DRC min-angle
+    class).  When no candidate fits, the original segment is kept —
+    snapping must never create a DRC violation by itself (the final
+    audit is the gate).  Fallback geometry that follows a hull may keep
+    larger turns: that is the cost of the walkaround, not a snapping
+    choice.  Corner smoothing (fillet arcs) is deliberately out of scope
+    until the polyline scheme is stable.
 
     Clear means: no *interior* entry into a hull (``touches``-only
     boundary riding is the walkaround's exact-margin placement and is
@@ -341,15 +344,19 @@ def _snap45_line(
     keeps the physical track connected.
     """
 
-    def _turn_le_90(a: tuple[float, float], b: tuple[float, float], c: tuple[float, float]) -> bool:
-        """True when the smallest angle at ``b`` from ``a`` to ``c`` is <= 90
-        degrees (zero-length legs count as no turn)."""
+    def _turn_le_45(a: tuple[float, float], b: tuple[float, float], c: tuple[float, float]) -> bool:
+        """True when the smallest angle at ``b`` from ``a`` to ``c`` is
+        <= 45 degrees (zero-length legs count as no turn)."""
         v1x, v1y = b[0] - a[0], b[1] - a[1]
         v2x, v2y = c[0] - b[0], c[1] - b[1]
-        if math.hypot(v1x, v1y) < 1e-12 or math.hypot(v2x, v2y) < 1e-12:
+        l1 = math.hypot(v1x, v1y)
+        l2 = math.hypot(v2x, v2y)
+        if l1 < 1e-12 or l2 < 1e-12:
             return True
         dot = v1x * v2x + v1y * v2y
-        return dot >= -1e-9 * math.hypot(v1x, v1y) * math.hypot(v2x, v2y)
+        # cos(45 deg) = sqrt(0.5); tolerance absorbs float noise at the
+        # boundary without admitting > 45-degree turns.
+        return dot >= (math.sqrt(0.5) - 1e-9) * l1 * l2
 
     def _seg_clear(p1: tuple[float, float], p2: tuple[float, float]) -> bool:
         line = LineString([p1, p2])
@@ -363,19 +370,20 @@ def _snap45_line(
         if abs(dx) < 1e-9 or abs(dy) < 1e-9 or abs(abs(dx) - abs(dy)) < 1e-9:
             out.append((x2, y2))
             continue
+        # Shortest 45-family hook: long axis leg then 45-degree leg.
+        # Unique for a non-family segment — the mirror walk overshoots
+        # the target, so no other candidate exists.
+        if abs(dx) > abs(dy):
+            mid = (x2 - math.copysign(abs(dy), dx), y1)
+        else:
+            mid = (x1, y2 - math.copysign(abs(dx), dy))
         chosen: tuple[float, float] | None = None
-        for cx, cy in ((x2, y1), (x1, y2)):
-            corner = (cx, cy)
-            if not _seg_clear(out[-1], corner) or not _seg_clear(corner, (x2, y2)):
-                continue
-            # Direction-continuity: no >90-degree turn into or out of the
-            # corner (a Manhattan corner is its own 90-degree turn).
-            if len(out) >= 2 and not _turn_le_90(out[-2], out[-1], corner):
-                continue
-            if i + 1 < len(pts) and not _turn_le_90(corner, (x2, y2), pts[i + 1]):
-                continue
-            chosen = corner
-            break
+        if _seg_clear(out[-1], mid) and _seg_clear(mid, (x2, y2)):
+            # Direction-continuity: no >45-degree turn into or out of
+            # the hook (the hook's own axis->45 turn is exactly 45).
+            if len(out) < 2 or _turn_le_45(out[-2], out[-1], mid):
+                if i + 1 >= len(pts) or _turn_le_45(mid, (x2, y2), pts[i + 1]):
+                    chosen = mid
         if chosen is not None:
             out.append(chosen)
         out.append((x2, y2))
