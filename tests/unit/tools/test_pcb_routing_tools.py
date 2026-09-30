@@ -57,6 +57,14 @@ _SEGMENTS_SNIPPET = """
 \t\t(layers "F.Cu" "B.Cu")
 \t\t(net "GND")
 \t)
+\t(arc
+\t\t(start 70.0 10.0)
+\t\t(mid 70.4 10.3)
+\t\t(end 71.0 10.6)
+\t\t(width 0.25)
+\t\t(layer "F.Cu")
+\t\t(net "NET_A")
+\t)
 """
 
 
@@ -166,6 +174,38 @@ class TestPcbDeleteTracks:
         )
         assert result["deleted_count"] == 1
         assert result["backup_path"] is not None
+
+    def test_delete_arc_node_by_endpoints(self, tools, board_with_tracks):
+        """Arc track nodes delete by their start/end endpoints: the router
+        reported rounded corners as x1/y1..x2/y2, so callers pass exactly
+        the arc's two ends (regression: the old collector only scanned
+        ``(segment ...)`` nodes and reported arcs not_found)."""
+        result = _run(
+            tools["pcb_delete_tracks"](
+                pcb_path=board_with_tracks,
+                segments=[{"x1": 70.0, "y1": 10.0, "x2": 71.0, "y2": 10.6}],
+                ctx=None,
+            )
+        )
+        assert result["deleted_count"] == 1
+        assert result["matched_count"] == 1
+        assert result["backup_path"] is not None
+        # The arc is gone from the file; the straight segments survive.
+        text = open(board_with_tracks, encoding="utf-8").read()
+        assert "(start 70.0 10.0)" not in text
+        assert "(start 10.0 20.0)" in text
+
+    def test_arc_endpoints_reversed_still_match(self, tools, board_with_tracks):
+        """Endpoint order is irrelevant for arcs, same as segments."""
+        result = _run(
+            tools["pcb_delete_tracks"](
+                pcb_path=board_with_tracks,
+                segments=[{"x1": 71.0, "y1": 10.6, "x2": 70.0, "y2": 10.0}],
+                ctx=None,
+            )
+        )
+        assert result["deleted_count"] == 1
+        assert len(result.get("not_found", [])) == 0
 
 
 class TestPcbDeleteVias:

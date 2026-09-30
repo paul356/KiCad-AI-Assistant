@@ -291,9 +291,11 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
         """Delete specific track segments by their endpoint coordinates.
 
         Each element of ``segments`` is a dict with ``x1``, ``y1``, ``x2``,
-        ``y2`` and optional ``layer``.  A matching ``(segment ...)`` entry is
-        removed when both endpoints match within 0.01 mm and (if specified)
-        the layer matches.
+        ``y2`` and optional ``layer``.  A matching ``(segment ...)`` or
+        ``(arc ...)`` entry is removed when both endpoints match within
+        0.01 mm (either direction) and (if specified) the layer matches.
+        Arc tracks match on their start/end endpoints — pass the arc's
+        two ends as reported by the router (the mid point is ignored).
 
         A ``.bak`` backup is created before any modification.  An empty
         match list (``[]``) is a no-op — no backup, no write.  Returns the
@@ -302,8 +304,9 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
 
         Args:
             pcb_path: Absolute path to the .kicad_pcb file.
-            segments: List of segment descriptors, each with
-                ``x1``, ``y1``, ``x2``, ``y2`` and optional ``layer``.
+            segments: List of track descriptors, each with
+                ``x1``, ``y1``, ``x2``, ``y2`` and optional ``layer``
+                (matches straight segments and arc tracks alike).
             ctx: MCP context (unused).
 
         Returns:
@@ -324,12 +327,16 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
         data = load_pcb(pcb_path)
         tol = 0.01  # mm
 
-        # Collect existing (segment ...) items with their endpoint info.
+        # Collect existing (segment ...) and (arc ...) items with their
+        # endpoint info.  Arc track nodes share the (start) / (end) fields,
+        # so endpoint matching is identical; the mid point is not used for
+        # lookup (a caller deleting a rounded corner passes the arc's two
+        # endpoints, exactly what the router reported as the segment).
         existing: list[tuple[list, float, float, float, float, str | None]] = []
         for item in data:
             if not (isinstance(item, list) and len(item) > 0):
                 continue
-            if not _is_sym(item[0], "segment"):
+            if not (_is_sym(item[0], "segment") or _is_sym(item[0], "arc")):
                 continue
             start_node = _find_sub(item, "start")
             end_node = _find_sub(item, "end")
