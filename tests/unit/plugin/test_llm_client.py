@@ -3757,3 +3757,36 @@ class TestSetHistoryRegression:
         client.set_enabled_tools(["alpha"])
         assert client._history == [{"role": "user", "content": "q"}]
         assert client.get_enabled_tools() == ["alpha"]
+
+
+# ---------------------------------------------------------------------------
+# call_mcp_tool: _image key contract
+# ---------------------------------------------------------------------------
+
+
+class TestCallMcpToolImageKey:
+    """call_mcp_tool must carry the PNG only when the server actually
+    returned an image block: a result that has no image must not get a
+    distracting ``_image: null`` key (the old unconditional injection)."""
+
+    def _mock_call(self, content_blocks):
+        resp = MagicMock()
+        resp.read.return_value = json.dumps({"result": {"content": content_blocks}}).encode()
+        resp.__enter__.return_value = resp
+        with patch("urllib.request.urlopen", return_value=resp):
+            return llm_client.call_mcp_tool("http://127.0.0.1:9", "some_tool", {})
+
+    def test_text_only_result_has_no_image_key(self):
+        out = self._mock_call([{"type": "text", "text": json.dumps({"ok": 1})}])
+        assert out == {"ok": 1}
+        assert "_image" not in out
+
+    def test_image_block_result_carries_image_key(self):
+        out = self._mock_call(
+            [
+                {"type": "text", "text": json.dumps({"ok": 1})},
+                {"type": "image", "mimeType": "image/png", "data": "QUJD"},
+            ]
+        )
+        assert out["ok"] == 1
+        assert out["_image"] == {"media_type": "image/png", "data": "QUJD"}
