@@ -340,6 +340,138 @@ def test_final_path_drc_rejects_adjusted_geometry_violation() -> None:
 
 
 # ---------------------------------------------------------------------------
+# dense-pad connector routing: legal routes must succeed, covered pads must fail
+# ---------------------------------------------------------------------------
+
+
+def _make_dense_board(tmp_path: Path, x1_at: tuple[float, float]) -> Path:
+    """R1/1 -> C1/1 (both VCC) with a foreign-net pad X1 near the start pad."""
+    x, y = x1_at
+    pcb = f"""(kicad_pcb
+	(version 20260206)
+	(generator "dense-pad-test")
+	(layers
+		(0 "F.Cu" signal)
+		(44 "Edge.Cuts" user)
+	)
+	(net 0 "")
+	(net 1 "VCC")
+	(net 2 "GND")
+	(footprint "R"
+		(layer "F.Cu")
+		(at 30.0 30.0 0.0)
+		(property "Reference" "R1")
+		(pad "1" smd rect
+			(at -0.5 0.0)
+			(size 0.5 0.5)
+			(layers "F.Cu" "F.Mask")
+			(net 1 "VCC")
+		)
+		(pad "2" smd rect
+			(at 0.5 0.0)
+			(size 0.5 0.5)
+			(layers "F.Cu" "F.Mask")
+			(net 1 "VCC")
+		)
+	)
+	(footprint "C"
+		(layer "F.Cu")
+		(at 60.0 40.0 0.0)
+		(property "Reference" "C1")
+		(pad "1" smd rect
+			(at 0.0 -0.5)
+			(size 0.5 0.5)
+			(layers "F.Cu" "F.Mask")
+			(net 1 "VCC")
+		)
+	)
+	(footprint "X"
+		(layer "F.Cu")
+		(at {x} {y} 0.0)
+		(property "Reference" "X1")
+		(pad "1" smd rect
+			(at 0.0 0.0)
+			(size 0.5 0.5)
+			(layers "F.Cu" "F.Mask")
+			(net 2 "GND")
+		)
+	)
+	(gr_rect
+		(start 20.0 20.0)
+		(end 70.0 60.0)
+		(stroke (width 0.1) (type solid))
+		(fill none)
+		(layer "Edge.Cuts")
+	)
+)
+"""
+    pcb_path = tmp_path / "dense.kicad_pcb"
+    pcb_path.write_text(pcb)
+    return pcb_path
+
+
+def _min_edge_clearance_to_x1(
+    res: RouteResult, x1_at: tuple[float, float], width: float = 0.2
+) -> float:
+    """Exact polyline-edge-to-pad-edge clearance (the audit's semantics)."""
+    from shapely.geometry import LineString, box
+
+    x, y = x1_at
+    x1 = box(x - 0.25, y - 0.25, x + 0.25, y + 0.25)
+    best = float("inf")
+    for s in res.segments:
+        gap = LineString([(s.x1, s.y1), (s.x2, s.y2)]).distance(x1) - width / 2.0
+        best = min(best, float(gap))
+    return best
+
+
+@pytest.mark.parametrize("algorithm", ["astar", "pns"])
+def test_dense_pad_connector_routes_with_legal_clearance(tmp_path: Path, algorithm: str) -> None:
+    """A neighbouring foreign pad 0.5 mm from the start pad leaves a legal
+    gap: both engines must still route R1/1 -> C1/1, and every segment
+    must clear the pad by >= 0.1 mm (the final path DRC gate)."""
+    pcb = _make_dense_board(tmp_path, (30.5, 30.0))
+    res = auto_route_pair(
+        RouteRequest(
+            pcb_path=str(pcb),
+            ref_a="R1",
+            pad_a="1",
+            ref_b="C1",
+            pad_b="1",
+            net="VCC",
+            width=0.2,
+            clearance=0.1,
+            algorithm=algorithm,
+            via_pairs=(),
+        )
+    )
+    assert _min_edge_clearance_to_x1(res, (30.5, 30.0)) >= 0.1 - 1e-9
+    assert len(res.segments) >= 2
+
+
+@pytest.mark.parametrize("algorithm", ["astar", "pns"])
+def test_dense_pad_connector_covered_start_fails(tmp_path: Path, algorithm: str) -> None:
+    """X1 covering the start pad leaves no legal departure direction: both
+    engines must fail loudly instead of writing a short."""
+    pcb = _make_dense_board(tmp_path, (29.5, 30.0))
+    with pytest.raises(RouteFailure):
+        auto_route_pair(
+            RouteRequest(
+                pcb_path=str(pcb),
+                ref_a="R1",
+                pad_a="1",
+                ref_b="C1",
+                pad_b="1",
+                net="VCC",
+                width=0.2,
+                clearance=0.1,
+                algorithm=algorithm,
+                via_pairs=(),
+            )
+        )
+
+
+# ---------------------------------------------------------------------------
 # _check_segments_in_board
 # ---------------------------------------------------------------------------
 
