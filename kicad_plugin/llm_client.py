@@ -1387,12 +1387,18 @@ class LLMClient:
             # summary at the 800-char floor while the live question was being
             # dropped (#140).
             preserved_tokens = self._estimate_tokens(self._history[split_idx:])
-            target_summary_chars = max(
-                _COMPACTION_SUMMARY_FLOOR_CHARS,
-                min(
-                    int(self._context_tokens * 0.25 * 4),
-                    (target_history_tokens - preserved_tokens) * 4,
-                ),
+            # int() is the final gate: context_tokens * float threshold in
+            # _maybe_compact is snapped, but the min() above could still
+            # select the float operand if that ever regresses — a float
+            # summary budget would crash `summary[:target_summary_chars]`.
+            target_summary_chars = int(
+                max(
+                    _COMPACTION_SUMMARY_FLOOR_CHARS,
+                    min(
+                        int(self._context_tokens * 0.25 * 4),
+                        (target_history_tokens - preserved_tokens) * 4,
+                    ),
+                )
             )
 
         prefix = self._history[:split_idx]
@@ -1932,7 +1938,13 @@ class LLMClient:
         # (re-enableable with enable_tool); conversation text is only compacted
         # once the tool set has given all it can (issue #133).  Eviction stops
         # at the compaction target — it never evicts meta tools.
-        target_post_compact = self._context_tokens * self._compact_target_threshold
+        # Context * float threshold is a float; snap to int so every
+        # downstream budget (target_history_tokens, _compact_history's
+        # summary chars) stays an integer.  A float target_history_tokens
+        # leaks into `summary[:target_summary_chars]` as a slice index and
+        # crashes with "slice indices must be integers" (the min() against
+        # the int window cap only sometimes lands on the int side).
+        target_post_compact = int(self._context_tokens * self._compact_target_threshold)
         # snapshot the initial estimates — eviction and compaction overwrite
         # `tools_est_tokens` / `history_tokens` / `used` below; keep the
         # originals for the single before -> after notice.
