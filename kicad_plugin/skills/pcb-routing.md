@@ -20,8 +20,10 @@ Connect pads belonging to the same net with DRC-clean tracks.
 3. Connect ONE pad pair at a time with **pcb_route_pad_to_pad**:
    ``ref_a``/``pad_a``/``ref_b``/``pad_b``/``net`` are required; pass
    ``width`` when a non-netclass width is needed, and ``algorithm`` to
-   pick the engine: ``astar`` (default) for grid A*, ``pns`` for the
-   walkaround + shove engine.  The VLM control knobs are top-level:
+   pick the engine: omitted, ``pcb_route_pad_to_pad`` auto-selects by
+   model — vision-capable models get ``pns`` (walkaround + shove),
+   text-only models get ``astar`` (grid A*); pass ``algorithm``
+   explicitly to override.  The VLM control knobs are top-level:
    ``strategy="shove"|"walkaround"`` (PNS shove policy; ``"shove"``
    default, ``"auto"`` removed 2026-09-27),
    ``waypoints=[...]`` (waypoint/via anchor chain), ``dry_run=True``
@@ -43,35 +45,40 @@ Connect pads belonging to the same net with DRC-clean tracks.
 ``pcb_route_pad_to_pad`` takes an ``algorithm`` argument; a single route
 always uses exactly one algorithm.  The response echoes ``algorithm``.
 
-Which one should you use?  Two callers, two flows:
+Which one should you use?  The default follows the calling model:
 
-- **Non-vision callers** (scripts, text-only agents — no vision):
-  keep the default ``algorithm="astar"`` — route the exact pad pairs from
-  ``get_ratsnest`` and read the structured response.  Straight segments,
-  no render loop required.
 - **Vision-capable callers** (a VLM that reads render images, or a human
-  engineer looking at the render): use
-  ``algorithm="pns"`` for the walkaround + shove engine and drive it with
-  the visual loop below — read the board render, emit an anchor chain,
-  iterate on the rendered evidence.
+  engineer looking at the render): the auto-default ``algorithm="pns"``
+  drives the walkaround + shove engine with the visual loop below —
+  read the board render, emit an anchor chain, iterate on the rendered
+  evidence.
+- **Non-vision callers** (scripts, text-only agents — no vision): the
+  auto-default ``algorithm="astar"`` routes exact pad pairs with the
+  grid A* planner and returns structured straight segments — no render
+  loop required.
+- Either caller may pass ``algorithm`` explicitly to override the
+  model-based default.
 
-- ``astar`` (default): grid-based A* planner.  Single-layer routes run
+- ``pns``: walkaround + shove engine (no A* grid).  The route
+  walks around fixed obstacles (pads, vias, keepouts, other nets) and
+  shoves movable tracks out of the way with chain propagation.  A
+  single-layer route may emit rounded-corner arcs (rounded corner
+  modes); the default ``mitered45`` emits plain 0/45/90 segments only —
+  closest to KiCad's optimizer output.  A multi-layer ``pns`` route
+  resolves the shortest start -> end layer path through ``via_pairs``
+  and routes one walkaround + shove leg per layer, joined by
+  through-vias DRC-validated along the direct pad-to-pad line.  Each
+  leg emits its rounded-corner arcs when the skeleton survives
+  walkaround/shove and the corner sits away from a via junction; legs
+  whose skeleton was disturbed, or whose fillet would end on a via,
+  fall back to straight segments — via junctions stay
+  straight-through connections.
+- ``astar``: grid-based A* planner.  Single-layer routes run
   hierarchical grid A* (coarse pass + fine band); multi-layer routes run
   multi-layer A* with via edges.  This is the classic router behaviour and
   emits straight segments only — rounded-corner arcs are a PNS feature.
-  It is the recommended choice for non-vision callers: call it straight
-  pad-to-pad and read the result, no render loop needed.
-- ``pns``: walkaround + shove engine (no A* grid).  The route walks around
-  fixed obstacles (pads, vias, keepouts, other nets) and shoves movable
-  tracks out of the way with chain propagation.  A single-layer route may
-  emit rounded-corner arcs.  A multi-layer ``pns`` route resolves the
-  shortest start -> end layer path through ``via_pairs`` and routes one
-  walkaround + shove leg per layer, joined by through-vias DRC-validated
-  along the direct pad-to-pad line.  Each leg emits its rounded-corner
-  arcs when the skeleton survives walkaround/shove and the corner sits
-  away from a via junction; legs whose skeleton was disturbed, or whose
-  fillet would end on a via, fall back to straight segments — via
-  junctions stay straight-through connections.
+  The auto-default for text-only callers, which route pad-to-pad
+  directly and read the structured result.
 
 ### corner_mode strategy (options["corner_mode"])
 - ``mitered45`` (default): sharp 45-degree miter corners, straight
@@ -100,8 +107,9 @@ the inner stack instead of jumping straight F<->B.
 ## Visual-aided routing loop (vision-capable callers: VLM, human, or agent)
 This loop is for vision-capable callers — a VLM, a human engineer, or any
 agent that reads render images.  Non-vision callers (scripts, text-only
-agents) should stick with the default ``algorithm="astar"`` and straight
-pad-to-pad calls (above); this loop buys nothing without the render.
+agents) already get the ``astar`` default automatically and should stick
+with straight pad-to-pad calls (above); this loop buys nothing without
+the render.
 The vision caller reads the rendered board and makes the global
 decisions (anchor chain, layers, order, accept or retry), while the
 routing engine owns the precise geometry between the anchors — the same

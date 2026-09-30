@@ -458,6 +458,44 @@ class TestPcbRouteStrategy:
         assert "error" not in result
         assert result["strategy"] == "shove"
         assert "route_png" in result
+
+
+class TestAlgorithmDefaultByVision:
+    """pcb_route_pad_to_pad algorithm defaults track the calling model:
+    vision-capable -> pns, text-only -> astar; an explicit value wins."""
+
+    def _route(self, tools, board, **kwargs):
+        return _run(
+            tools["pcb_route_pad_to_pad"](
+                pcb_path=board,
+                ref_a="R1",
+                pad_a="1",
+                ref_b="C1",
+                pad_b="1",
+                net="VCC",
+                ctx=None,
+                width=0.2,
+                **kwargs,
+            )
+        )
+
+    def test_vision_model_defaults_to_pns(self, tools, routable_board, monkeypatch):
+        monkeypatch.setenv("KICAD_MCP_SUPPORTS_VISION", "1")
+        result = self._route(tools, routable_board)
+        assert "error" not in result
+        assert result["algorithm"] == "pns"
+
+    def test_text_model_defaults_to_astar(self, tools, routable_board, monkeypatch):
+        monkeypatch.setenv("KICAD_MCP_SUPPORTS_VISION", "0")
+        result = self._route(tools, routable_board)
+        assert "error" not in result
+        assert result["algorithm"] == "astar"
+
+    def test_explicit_algorithm_wins_over_vision(self, tools, routable_board, monkeypatch):
+        monkeypatch.setenv("KICAD_MCP_SUPPORTS_VISION", "1")
+        result = self._route(tools, routable_board, algorithm="astar")
+        assert "error" not in result
+        assert result["algorithm"] == "astar"
         assert "candidates" not in result
         assert "candidates_png" not in result
         assert result["segment_count"] > 0
