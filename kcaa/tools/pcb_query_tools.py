@@ -1065,14 +1065,19 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
         net: str | None = None,
         layer: str | None = None,
     ) -> dict[str, Any]:
-        """List all track segments on the PCB, grouped by trace connectivity.
+        """List all track segments and arcs on the PCB, grouped by trace connectivity.
 
-        Returns segments grouped into **traces** — two segments belong to
-        the same trace when they share an endpoint (within 0.01 mm).
-        Segments within each trace are ordered end-to-end as polylines.
-        A trace with a T-junction branches into multiple polylines.
+        Returns segments and arcs grouped into **traces** — two items belong
+        to the same trace when they share an endpoint (within 0.01 mm).
+        Arc entries are parsed from KiCad ``(arc ...)`` nodes
+        (``start``/``mid``/``end``) and their endpoints participate in
+        connectivity exactly like straight segment endpoints, so a rounded
+        PNS arc merges with adjacent straight segments into one trace.
+        Items within each trace are ordered end-to-end as polylines
+        (arcs are represented by their start→end chord).  A trace with a
+        T-junction branches into multiple polylines.
 
-        When ``net`` and/or ``layer`` are provided, only matching segments
+        When ``net`` and/or ``layer`` are provided, only matching items
         are considered (and traces that cross layers or nets don't merge).
 
         Args:
@@ -1086,19 +1091,27 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
                 traces: list of trace groups.  Each trace has ``polylines``
                     (list of point-lists) and shared metadata
                     ``width``, ``layer``, ``net``.
-                segment_count: total number of segments.
+                segment_count: total number of items (segments + arcs).
                 trace_count: number of connected trace groups.
+
+        Each trace's ``segments`` entries carry ``kind`` (``"segment"`` or
+        ``"arc"``); arc entries also carry ``mid`` so the arc geometry can
+        be rebuilt by upper layers.
         """
         data = load_pcb(pcb_path)
         tol = 0.01  # mm — same as delete tools
 
-        # ── Collect all raw segment entries ──────────────────────────
+        # ── Collect all raw segment/arc entries ──────────────────────
         raw_segs: list[dict[str, Any]] = []
         for item in data:
-            if not (isinstance(item, list) and len(item) > 0 and _sym(item[0]) == "segment"):
+            if not (
+                isinstance(item, list) and len(item) > 0 and _sym(item[0]) in ("segment", "arc")
+            ):
                 continue
+            kind = _sym(item[0])
             start_node = _find_sub_pq(item, "start")
             end_node = _find_sub_pq(item, "end")
+            mid_node = _find_sub_pq(item, "mid") if kind == "arc" else None
             width_node = _find_sub_pq(item, "width")
             layer_node = _find_sub_pq(item, "layer")
             net_node = _find_sub_pq(item, "net")
@@ -1126,6 +1139,20 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
             if layer is not None and item_layer != layer:
                 continue
 
+            mid: tuple[float, float] | None = None
+            if mid_node is not None and len(mid_node) >= 3:
+                mx = (
+                    float(mid_node[1])
+                    if not isinstance(mid_node[1], str)
+                    else float(str(mid_node[1]))
+                )
+                my = (
+                    float(mid_node[2])
+                    if not isinstance(mid_node[2], str)
+                    else float(str(mid_node[2]))
+                )
+                mid = (mx, my)
+
             raw_segs.append(
                 {
                     "x1": sx,
@@ -1135,6 +1162,8 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
                     "width": sw,
                     "layer": item_layer,
                     "net": item_net,
+                    "kind": kind,
+                    "mid": mid,
                 }
             )
 
@@ -1142,8 +1171,8 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
             return {"traces": [], "segment_count": 0, "trace_count": 0}
 
         # ── Collect pad centre positions (world coords) ──────────────
-        # Segments that meet at a pad centre are NOT connected (the
-        # connection goes through the pad, not directly segment-to-segment).
+        # Items that meet at a pad centre are NOT connected (the
+        # connection goes through the pad, not directly item-to-item).
         # Also build a reverse lookup: (rounded_x, rounded_y) → pad info.
         pad_centres: set[tuple[float, float]] = set()
         pad_at: dict[tuple[float, float], list[dict[str, Any]]] = {}
@@ -1183,10 +1212,11 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
                 )
 
         # ── Build adjacency ──────────────────────────────────────────
-        # Each segment has two endpoints (a, b).  Two segments share an
-        # endpoint if any endpoint pair is within tol — *unless* that
+        # Each item (segment/arc) has two endpoints (a, b); for arcs the
+        # endpoints are the start/end points of the arc.  Two items share
+        # an endpoint if any endpoint pair is within tol — *unless* that
         # point is a pad centre (connection goes through the pad, not
-        # directly segment-to-segment).
+        # directly item-to-item).
         n = len(raw_segs)
         adj: list[list[int]] = [[] for _ in range(n)]
 
@@ -1329,13 +1359,22 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
                 for i in range(len(poly) - 1):
                     a, b = poly[i], poly[i + 1]
                     for s in raw_segs:
+                        seg_entry: dict[str, Any]
                         if (
                             abs(s["x1"] - a[0]) < tol
                             and abs(s["y1"] - a[1]) < tol
                             and abs(s["x2"] - b[0]) < tol
                             and abs(s["y2"] - b[1]) < tol
                         ):
-                            segs_in_poly.append({"start": a, "end": b, "width": s["width"]})
+                            seg_entry = {
+                                "start": a,
+                                "end": b,
+                                "width": s["width"],
+                                "kind": s["kind"],
+                            }
+                            if s["mid"] is not None:
+                                seg_entry["mid"] = s["mid"]
+                            segs_in_poly.append(seg_entry)
                             break
                         elif (
                             abs(s["x1"] - b[0]) < tol
@@ -1343,7 +1382,15 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
                             and abs(s["x2"] - a[0]) < tol
                             and abs(s["y2"] - a[1]) < tol
                         ):
-                            segs_in_poly.append({"start": a, "end": b, "width": s["width"]})
+                            seg_entry = {
+                                "start": a,
+                                "end": b,
+                                "width": s["width"],
+                                "kind": s["kind"],
+                            }
+                            if s["mid"] is not None:
+                                seg_entry["mid"] = s["mid"]
+                            segs_in_poly.append(seg_entry)
                             break
                 polylines_out.append(segs_in_poly)
 

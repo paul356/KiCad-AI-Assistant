@@ -69,6 +69,45 @@ def board_with_tracks(tmp_path):
     return str(dest)
 
 
+_ARCS_SNIPPET = """
+\t(arc
+\t\t(start 20.0 20.0)
+\t\t(mid 24.0 25.0)
+\t\t(end 20.0 30.0)
+\t\t(width 0.25)
+\t\t(layer "F.Cu")
+\t\t(net "VCC")
+\t)
+\t(segment
+\t\t(start 20.0 30.0)
+\t\t(end 20.0 40.0)
+\t\t(width 0.25)
+\t\t(layer "F.Cu")
+\t\t(net "VCC")
+\t)
+\t(arc
+\t\t(start 30.0 10.0)
+\t\t(mid 31.0 11.0)
+\t\t(end 32.0 10.0)
+\t\t(width 0.50)
+\t\t(layer "B.Cu")
+\t\t(net "GND")
+\t)
+"""
+
+
+@pytest.fixture
+def board_with_arcs(tmp_path):
+    """Copy base board and append segment/arc entries before the final ``)``."""
+    dest = tmp_path / "board_with_arcs.kicad_pcb"
+    shutil.copy(BOARD_FIXTURE, dest)
+    text = dest.read_text(encoding="utf-8")
+    idx = text.rstrip().rfind(")")
+    text = text[:idx] + _ARCS_SNIPPET + text[idx:]
+    dest.write_text(text, encoding="utf-8")
+    return str(dest)
+
+
 @pytest.fixture
 def board_no_net_table(tmp_path):
     dest = tmp_path / "board_no_net_table.kicad_pcb"
@@ -396,6 +435,56 @@ class TestListTracks:
         for trace in result["traces"]:
             assert "pads" in trace
             assert isinstance(trace["pads"], list)
+
+    def test_arcs_counted_as_segments(self, tools, board_with_arcs):
+        """board_with_arcs = 1 base segment + 2 arcs + 1 added segment."""
+        result = _run(tools["list_tracks"](pcb_path=board_with_arcs, ctx=None))
+        assert result["segment_count"] == 4
+        assert result["trace_count"] == 2  # VCC chain + isolated GND arc
+
+    def test_arc_entries_have_kind_and_mid(self, tools, board_with_arcs):
+        result = _run(tools["list_tracks"](pcb_path=board_with_arcs, ctx=None))
+        segs = [seg for trace in result["traces"] for seg in trace["segments"]]
+        assert sorted(seg["kind"] for seg in segs) == ["arc", "arc", "segment", "segment"]
+        arc_segs = [seg for seg in segs if seg["kind"] == "arc"]
+        assert arc_segs[0]["mid"] == (24.0, 25.0)
+        assert arc_segs[1]["mid"] == (31.0, 11.0)
+        for arc in arc_segs:
+            assert arc["start"] != arc["end"]
+        segment_segs = [seg for seg in segs if seg["kind"] == "segment"]
+        assert all("mid" not in seg for seg in segment_segs)
+
+    def test_arc_merges_with_adjacent_segment(self, tools, board_with_arcs):
+        """The VCC arc spans (20,20)-(20,30); the base segment ends at
+        (20,20) and the added segment starts at (20,30), so all three
+        merge into a single trace."""
+        result = _run(tools["list_tracks"](pcb_path=board_with_arcs, ctx=None))
+        vcc_traces = [t for t in result["traces"] if t["net"] == "VCC"]
+        gnd_traces = [t for t in result["traces"] if t["net"] == "GND"]
+        assert len(vcc_traces) == 1
+        assert len(gnd_traces) == 1
+        assert vcc_traces[0]["segment_count"] == 3
+        kinds = {seg["kind"] for seg in vcc_traces[0]["segments"]}
+        assert kinds == {"segment", "arc"}
+        assert gnd_traces[0]["segment_count"] == 1
+        assert gnd_traces[0]["segments"][0]["kind"] == "arc"
+
+    def test_arc_net_and_layer_filters(self, tools, board_with_arcs):
+        result = _run(tools["list_tracks"](pcb_path=board_with_arcs, ctx=None, net="GND"))
+        assert result["segment_count"] == 1
+        assert result["trace_count"] == 1
+        assert all(t["net"] == "GND" for t in result["traces"])
+
+        result = _run(tools["list_tracks"](pcb_path=board_with_arcs, ctx=None, layer="B.Cu"))
+        assert result["segment_count"] == 1
+        assert result["trace_count"] == 1
+        assert all(t["layer"] == "B.Cu" for t in result["traces"])
+        assert result["traces"][0]["segments"][0]["kind"] == "arc"
+
+        result = _run(tools["list_tracks"](pcb_path=board_with_arcs, ctx=None, layer="F.Cu"))
+        assert result["segment_count"] == 3
+        assert result["trace_count"] == 1
+        assert all(t["layer"] == "F.Cu" for t in result["traces"])
 
 
 class TestListVias:
