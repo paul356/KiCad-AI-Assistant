@@ -61,6 +61,37 @@ def _strip_images_from_history(history: list[dict]) -> list[dict]:
     return stripped
 
 
+_IMAGE_PREVIEW_BYTES = 16
+
+
+def _elide_tool_result_image(result: Any) -> Any:
+    """Shallow-copy a tool result for UI display, eliding base64 image data.
+
+    Tools that render a PNG (e.g. ``export_pcb_layer_image``) return the
+    payload as a ``_image`` dict of ``{media_type, data}`` — tens of
+    thousands of base64 characters that would flood the tool card and the
+    persisted session.  The copy keeps only the first few bytes of the
+    payload plus a byte-length marker so the UI still shows that an image
+    was returned.  The caller's original dict is never mutated: the LLM
+    history consumes the full payload afterwards (``run_engineer_request``
+    pops ``_image`` after the ``on_tool_call`` callback).
+    """
+    if not isinstance(result, dict):
+        return result
+    img = result.get("_image")
+    if not isinstance(img, dict) or not isinstance(img.get("data"), str):
+        return result
+    data = img["data"]
+    if len(data) <= _IMAGE_PREVIEW_BYTES:
+        return result
+    out = dict(result)
+    out["_image"] = {
+        **img,
+        "data": f"{data[:_IMAGE_PREVIEW_BYTES]}…[{len(data)} bytes]",
+    }
+    return out
+
+
 if _WX_AVAILABLE:
 
     class _FileDropTarget(wx.FileDropTarget):
@@ -883,7 +914,14 @@ if _WX_AVAILABLE:
 
             def _on_tool(name, args, result) -> None:
                 """UI callback for every tool execution in this turn."""
-                _emit({"type": "tool_call", "name": name, "args": args, "result": result})
+                _emit(
+                    {
+                        "type": "tool_call",
+                        "name": name,
+                        "args": args,
+                        "result": _elide_tool_result_image(result),
+                    }
+                )
                 if kind == "tool_direct" and name == "sync_footprint_index":
                     # Mirror the old auto-sync status notices: started /
                     # failed surface as status entries, already_running is
