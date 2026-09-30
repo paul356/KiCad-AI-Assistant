@@ -906,6 +906,58 @@ class TestMaybeCompact:
             client._maybe_compact("system")
         assert call_order == ["compact", "annotate"]
 
+    def test_budget_parameters_stay_integer(self):
+        """context_tokens * float threshold must not leak a float into the
+        compaction budget: `summary[:target_summary_chars]` with a float
+        slice crashes with "slice indices must be integers" (regression:
+        the pre-fix target_post_compact was float, and the min() against
+        the int window cap sometimes picked the float side)."""
+        client = _make_client(
+            context_tokens=100, compact_threshold=0.70, compact_target=0.40, keep_recent_turns=2
+        )
+        big_content = "x" * 400  # ~100 tokens each
+        client._history = [
+            _user(big_content),
+            _assistant(big_content),
+            _user(big_content),
+            _assistant(big_content),
+            _user(big_content),
+            _assistant(big_content),
+        ]
+        with patch.object(client, "_compact_history", return_value=True) as mock_compact:
+            client._maybe_compact("system")
+        called_args = mock_compact.call_args.args
+        assert isinstance(called_args[2], int), called_args[2]
+
+    def test_compaction_real_path_never_float_slices(self):
+        """The full _maybe_compact -> _compact_history path survives a
+        history that overflows the budget: the live LLM call we patch is
+        the compaction summariser, so the real _compact_history code runs
+        (float-free slices) instead of a mocked return."""
+        client = _make_client(
+            context_tokens=100, compact_threshold=0.70, compact_target=0.40, keep_recent_turns=2
+        )
+        big_content = "x" * 4000  # far over the 70-token threshold
+        client._history = [
+            _user(big_content),
+            _assistant(big_content),
+            _user(big_content),
+            _assistant(big_content),
+            _user(big_content),
+            _assistant(big_content),
+        ]
+        # Compaction's own LLM call must succeed (short fake response).
+        with patch.object(client, "_call_openai") as mock_openai:
+            mock_openai.return_value = {"message": {"content": "summarised context"}}
+            # Tools estimation walks the registry; a bare client is fine —
+            # registry is None so zero tools.
+            err = client._maybe_compact("system")
+        assert err is None or err.startswith("[Error]")
+        # History collapsed to summary + preserved recent turns (compaction
+        # actually ran, reached the slice site).
+        assert client._history[0]["role"] == "user"
+        assert "[Session summary" in client._history[0]["content"]
+
 
 # ---------------------------------------------------------------------------
 # run() integration
