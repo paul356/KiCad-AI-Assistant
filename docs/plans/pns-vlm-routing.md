@@ -1,7 +1,7 @@
 # VLM + Self-Built PNS Routing — Design Study (v3: VLM+PNS collaboration)
 
 > Status: v2 engine **implemented** (multi-layer PNS + leg-internal arcs +
-> `options`/`corner_mode=rounded45` default, issue #143 / PR #144). v3 defines
+> `options`/`corner_mode=mitered45` default, issue #143 / PR #144). v3 defines
 > the **VLM ↔ PNS collaboration interface**: anchor-chain control surface,
 > render-first failure feedback, an explicit `strategy` knob
 > (auto/walkaround/shove) and an always-on `route_png` render.
