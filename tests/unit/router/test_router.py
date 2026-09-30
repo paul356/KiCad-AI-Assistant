@@ -1563,7 +1563,7 @@ def _rounded_square(center: tuple[float, float], size: float):
 
 
 # ---------------------------------------------------------------------------
-# algorithm selector — astar (default) vs pns, single route single algorithm
+# algorithm selector — pns vs astar, single route single algorithm
 # ---------------------------------------------------------------------------
 
 
@@ -1602,8 +1602,8 @@ def test_algorithm_astar_single_layer_routes(tmp_path: Path) -> None:
 
 
 def test_algorithm_default_is_astar(tmp_path: Path) -> None:
-    """Omitting algorithm routes with the grid A* planner (pure old
-    behaviour) and echoes 'astar'."""
+    """Omitting algorithm at the router layer routes with grid A* (the
+    tool layer is what selects pns for vision models)."""
     dst = _route_board_copy(tmp_path)
     result = auto_route_pair(
         RouteRequest(

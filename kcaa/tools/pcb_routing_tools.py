@@ -56,7 +56,7 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
         net: str,
         ctx: Context | None,
         width: float | None = None,
-        algorithm: str = "astar",
+        algorithm: str | None = None,
         waypoints: list[dict] | None = None,
         dry_run: bool = False,
         strategy: str = "shove",
@@ -64,10 +64,11 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
     ) -> tuple[str, Image] | str:
         """Connect two pads with an obstacle-avoiding track, optionally across layers.
 
-        Uses ``algorithm`` to route: ``astar`` (default) runs the grid A*
-        planner (hierarchical grid on a single layer, multi-layer A* with
-        via edges across layers); ``pns`` runs the walkaround + shove
-        engine.  A multi-layer ``pns`` route decomposes into one
+        Uses ``algorithm`` to route: omitted, it auto-selects by model —
+        ``pns`` (walkaround + shove engine) for vision-capable models,
+        ``astar`` (grid A* planner) for text-only models (see
+        ``KICAD_MCP_SUPPORTS_VISION``).  Passing an explicit value always
+        wins.  A multi-layer ``pns`` route decomposes into one
         walkaround + shove leg per layer (shortest layer path through
         ``via_pairs``), joined by through-vias DRC-validated along the
         direct pad-to-pad line.  Each leg emits rounded-corner arcs
@@ -111,9 +112,11 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
             ctx: MCP context (unused).
             width: Override the netclass track width (mm).  ``None`` uses the
                 DRC default for the net.
-            algorithm: ``astar`` (default) grid-based A* planner;
-                ``pns`` walkaround + shove engine.  A route always uses
-                exactly one algorithm.
+            algorithm: ``pns`` (walkaround + shove engine) or ``astar``
+                (grid-based A* planner); ``None`` (default) auto-selects:
+                ``pns`` for vision-capable models, ``astar`` for
+                text-only models.  A route always uses exactly one
+                algorithm.
             waypoints: Anchor-chain control surface for the ``pns``
                 algorithm (a list of dicts): either
                 ``{"kind": "waypoint", "pos": [x, y], "tol_mm": 1.0}``
@@ -226,6 +229,12 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
             corner_mode = options.get("corner_mode", corner_mode)
             layer_hint = options.get("layer_hint", layer_hint)
         waypoints = list(waypoints or [])
+        if algorithm is None:
+            # Vision-capable models drive the visual routing loop (PNS
+            # walkaround + shove, render feedback); text-only models get
+            # the deterministic grid A* planner.  The plugin sets
+            # KICAD_MCP_SUPPORTS_VISION when spawning the server.
+            algorithm = "pns" if model_supports_vision() else "astar"
         if strategy not in ("shove", "walkaround"):
             return _route_payload(
                 {

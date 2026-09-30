@@ -169,9 +169,11 @@ class RouteRequest:
         turn_penalty: Distance-equivalent cost added when the path
             changes direction.  0 disables (pure shortest path).
             Default 0.3 mm ~ 3 cells at 0.1 mm resolution.
-        algorithm: Routing algorithm to use: ``astar`` (default,
-            grid-based A*) or ``pns`` (walkaround + shove engine).
-            A single route always uses exactly one algorithm.
+        algorithm: Routing algorithm to use: ``pns`` (walkaround + shove
+            engine) or ``astar`` (grid-based A*).  Defaults to ``astar``
+            here; the tool layer picks ``pns`` for vision-capable models
+            unless an explicit value is given.  A single route always
+            uses exactly one algorithm.
         waypoints: Anchor-chain control surface for the ``pns`` algorithm
             (ignored by ``astar``); each entry is a dict with a ``kind``:
             ``"waypoint"`` (``pos``, optional ``tol_mm``) forces the route
@@ -218,7 +220,7 @@ class RouteRequest:
     grid_resolution: float | None = None  # None -> GRID_RESOLUTION
     via_cost: float = 2.0  # mm penalty per via edge
     turn_penalty: float = 0.3  # mm penalty per direction change; 0 disables
-    algorithm: str = "astar"  # astar (grid A*) | pns (walkaround + shove)
+    algorithm: str = "astar"  # astar (grid A*) | pns (walkaround + shove); tool layer picks pns for vision models
     corner_mode: str = "mitered45"  # mitered45 (default) | rounded45 | rounded90 | mitered90
     waypoints: list[dict] = field(default_factory=list)
     dry_run: bool = False  # tool-layer hint: skip save_pcb (router never writes)
@@ -296,7 +298,7 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
     if req.algorithm not in ("astar", "pns"):
         raise RouteFailure(
             f"algorithm={req.algorithm!r} is invalid; supported values are "
-            f"'astar' (default, grid-based) and 'pns' (walkaround + shove)."
+            f"'pns' (walkaround + shove) and 'astar' (grid-based)."
         )
 
     # Waypoints are the PNS waypoint-chain control surface; the A* planner
@@ -617,7 +619,7 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
     moved_pairs: list[tuple[TrackObstacle, TrackObstacle]] = []
 
     if req.algorithm == "astar":
-        # -- Grid A* (default) ---------------------------------------
+        # -- Grid A* ---------------------------------------------
         if start_layer != end_layer:
             # -- Multi-layer: grid A* with via edges ------------------
             # Via-forbidden zones cover EVERY same-net pad, not just the two
@@ -2652,7 +2654,7 @@ def _resolve_layer_sequence(
         raise RouteFailure(
             f"no PNS layer path from {start_layer!r} to {end_layer!r} through "
             f"via_pairs {via_pairs}; allow a via pair for the missing stack "
-            "transition (or use algorithm='astar')."
+            "transition (or switch to algorithm='astar')."
         )
     seq = [end_layer]
     while seq[-1] != start_layer:
