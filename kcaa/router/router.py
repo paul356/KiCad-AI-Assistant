@@ -81,7 +81,7 @@ from kcaa.router.path_postprocess import (
 )
 from kcaa.router.pns.direction45 import CornerMode
 from kcaa.router.pns.shove import TrackObstacle
-from kcaa.router.route_engine import PnsFailure, route_engine
+from kcaa.router.route_engine import PnsFailure, _audit_final_copper, route_engine
 from kcaa.router.via_check import ProposedVia, check_vias
 from kcaa.router.visibility_graph import RouteNode
 from kcaa.router.world_model import Obstacle, _get_net, build_world_model
@@ -716,6 +716,25 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
                     )
                 _dump_viz(f"{prefix}-6-align", pts, _pad_viz, obs, route_bbox)
 
+                # No adjustment escapes DRC: re-audit this layer's final
+                # polyline after pad replacement + alignment (the A*
+                # grid check ran before these steps, on cell data).
+                _final_path_drc(
+                    pts,
+                    width,
+                    clearance,
+                    req.net,
+                    [o for o in model.obstacles if layer in o.layers],
+                    [],
+                    [],
+                    set(),
+                    req,
+                    layer,
+                    _pad_viz,
+                    obs,
+                    route_bbox,
+                )
+
                 for x, y in pts:
                     all_nodes.append(RouteNode(x=x, y=y, layer=layer, node_id=node_id))
                     node_id += 1
@@ -819,6 +838,25 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
             )
             _log_path("align-endpoints", best_path_pts)
             _dump_viz("6-align-endpoints", best_path_pts, _pad_viz, buffered, route_bbox)
+
+            # No adjustment escapes DRC: re-audit the final polyline
+            # after pad replacement + alignment (which the engine audit,
+            # if any, ran before these steps).
+            _final_path_drc(
+                best_path_pts,
+                width,
+                clearance,
+                req.net,
+                [o for o in model.obstacles if start_layer in o.layers],
+                [],
+                [],
+                set(),
+                req,
+                start_layer,
+                _pad_viz,
+                buffered,
+                route_bbox,
+            )
 
             path_nodes = path_to_nodes(best_path_pts, start_layer)
             segs, vias = postprocess_path(
@@ -1060,6 +1098,26 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
                     continue  # shared via anchor, already emitted
                 all_nodes.append(RouteNode(x=x, y=y, layer=layer, node_id=node_id))
                 node_id += 1
+            # No adjustment escapes DRC: re-audit this leg's final
+            # polyline after pad replacement (the engine audit ran on
+            # ``eng.path`` before that step, and the later legs are not
+            # routed yet — the earlier ones are fixed copper via
+            # ``extra_fixed`` and audited against this leg).
+            _final_path_drc(
+                node_pts,
+                width,
+                clearance,
+                req.net,
+                engine_obstacles,
+                extra_fixed,
+                moved_pairs,
+                eng.orig_obstacle_ids,
+                req,
+                layer,
+                _pad_viz,
+                buffered,
+                route_bbox,
+            )
             # This leg's final geometry becomes fixed copper for the shove
             # stage of every later leg (see the extra_fixed block above).
             prev_leg_polylines.append((layer, list(node_pts)))
@@ -1679,6 +1737,25 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
             _log_path("align-endpoints", best_path_pts)
             _dump_viz("6-align-endpoints", best_path_pts, _pad_viz, buffered, route_bbox)
 
+            # No adjustment escapes DRC: re-audit the final polyline
+            # after pad replacement + alignment (the engine audit ran on
+            # ``eng.path`` before these steps).
+            _final_path_drc(
+                best_path_pts,
+                width,
+                clearance,
+                req.net,
+                engine_obstacles,
+                [],
+                moved_pairs,
+                eng.orig_obstacle_ids,
+                req,
+                start_layer,
+                _pad_viz,
+                buffered,
+                route_bbox,
+            )
+
             path_nodes = path_to_nodes(best_path_pts, start_layer)
             segs, vias = postprocess_path(
                 path_nodes,
@@ -2252,6 +2329,50 @@ def _align_path_endpoints(
         from_center=False,
     )
     return path
+
+
+def _final_path_drc(
+    pts: list[tuple[float, float]],
+    width: float,
+    clearance: float,
+    net: str | None,
+    obstacles: Sequence[Obstacle],
+    extra_fixed: Sequence[Obstacle],
+    moved_pairs: Sequence[tuple[TrackObstacle, TrackObstacle]],
+    orig_obstacle_ids: set[int],
+    req: RouteRequest,
+    layer: str,
+    pad_viz: list,
+    buffered: list,
+    route_bbox: tuple[float, float, float, float],
+) -> None:
+    """Audit the FINAL polyline — after every post-engine adjustment —
+    against the world model.
+
+    The engine audits its own output, but the ``_replace_pad_path`` /
+    ``_align_*`` steps run afterwards and are exempt from it; their
+    endpoint segments are exactly what can be pushed onto a neighbouring
+    pad (e.g. a dense connector's pad).  Re-running the audit here closes
+    that gap: adjusted geometry that violates DRC fails the route instead
+    of being written to the board.  No adjustment escapes a final check.
+    """
+    try:
+        _audit_final_copper(
+            out_path=pts,
+            width=width,
+            net=net,
+            obstacles=obstacles,
+            extra_fixed=extra_fixed,
+            moved_pairs=moved_pairs,
+            orig_obstacle_ids=orig_obstacle_ids,
+            clearance=clearance,
+        )
+    except PnsFailure as exc:
+        _dump_viz("fail-final-drc", pts, pad_viz, buffered, route_bbox)
+        raise RouteFailure(
+            f"Final DRC check failed for {req.ref_a}/{req.pad_a} -> "
+            f"{req.ref_b}/{req.pad_b} on {layer}: {exc}"
+        ) from exc
 
 
 def _replace_pad_path(
