@@ -283,6 +283,62 @@ def test_auto_route_pair_explicit_width_skips_drc(tmp_path: Path) -> None:
     assert len(result.segments) > 0
 
 
+def test_final_path_drc_rejects_adjusted_geometry_violation() -> None:
+    """Regression: pad replacement / endpoint alignment ran after the
+    engine audit, so adjusted endpoint segments could be written on top
+    of a neighbouring foreign pad (dense connectors).  The final audit
+    must fail such a route instead of writing the violation."""
+    from shapely.geometry import box
+
+    from kcaa.router.router import _final_path_drc
+    from kcaa.router.world_model import Obstacle
+
+    req = RouteRequest(
+        pcb_path="board.kicad_pcb",
+        ref_a="A",
+        pad_a="1",
+        ref_b="B",
+        pad_b="1",
+        net="N",
+    )
+    foreign = [
+        Obstacle(shape=box(4.0, -0.3, 6.0, 0.3), layers=frozenset({"F.Cu"}), net="O", kind="pad")
+    ]
+    # Route crossing the foreign pad: the final audit must fail loudly.
+    with pytest.raises(RouteFailure, match="Final DRC check failed"):
+        _final_path_drc(
+            [(0, 0), (10, 0)],
+            0.2,
+            0.1,
+            "N",
+            foreign,
+            [],
+            [],
+            set(),
+            req,
+            "F.Cu",
+            [],
+            [],
+            (0, 0, 10, 10),
+        )
+    # Route clear of the pad passes.
+    _final_path_drc(
+        [(0, 2), (10, 2)],
+        0.2,
+        0.1,
+        "N",
+        foreign,
+        [],
+        [],
+        set(),
+        req,
+        "F.Cu",
+        [],
+        [],
+        (0, 0, 10, 10),
+    )
+
+
 # ---------------------------------------------------------------------------
 # _check_segments_in_board
 # ---------------------------------------------------------------------------

@@ -66,6 +66,11 @@ class EngineResult:
     # exists in the PCB file) and the pushed replacement — so the write
     # path can persist the displacement.  Empty when nothing was pushed.
     moved_pairs: list[tuple[TrackObstacle, TrackObstacle]] = field(default_factory=list)
+    # identity (``id()``) of the obstacle entries whose tracks were
+    # displaced — the final audit exempts their original (now
+    # copper-free) locations.  Needed by callers that re-audit the
+    # polyline after their own post-engine adjustments.
+    orig_obstacle_ids: set[int] = field(default_factory=set)
 
 
 def route_engine(
@@ -304,6 +309,7 @@ def route_engine(
         arcs=arcs,
         trace=kept_trace,
         moved_pairs=moved_pairs,
+        orig_obstacle_ids=orig_obstacle_ids,
     )
 
 
