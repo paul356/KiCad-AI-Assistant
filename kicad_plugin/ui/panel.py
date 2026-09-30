@@ -914,6 +914,17 @@ if _WX_AVAILABLE:
 
             def _on_tool(name, args, result) -> None:
                 """UI callback for every tool execution in this turn."""
+                _img = result.get("_image") if isinstance(result, dict) else None
+                if isinstance(_img, dict):
+                    _img_desc = f"dict(data_len={len(_img.get('data', ''))})"
+                else:
+                    _img_desc = repr(_img)
+                log.info(
+                    "tool_call_flow panel_on_tool: name=%s result_keys=%s _image=%s",
+                    name,
+                    sorted(result.keys()) if isinstance(result, dict) else type(result).__name__,
+                    _img_desc,
+                )
                 _emit(
                     {
                         "type": "tool_call",
