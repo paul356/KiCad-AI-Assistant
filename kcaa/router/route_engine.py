@@ -224,7 +224,7 @@ def route_engine(
         for i, (_orig, disp) in enumerate(moved_pairs):
             wk = disp.width
             hulls: list[Polygon] = [
-                o.shape.buffer(place_clearance + wk / 2.0, cap_style="round")
+                _family_hull(o.shape, place_clearance + wk / 2.0)
                 for o in [*walk_obstacles, *extra_fixed]
                 if o.shape is not None and not o.shape.is_empty
             ]
@@ -236,18 +236,18 @@ def route_engine(
             )
             for t in stay_movable:
                 hulls.append(
-                    LineString(t.points).buffer(
+                    _family_hull(
+                        LineString(t.points),
                         t.width / 2.0 + place_clearance + wk / 2.0,
-                        cap_style="round",
                     )
                 )
             for j, (_oj, dj) in enumerate(moved_pairs):
                 if j == i:
                     continue
                 hulls.append(
-                    LineString(disp_pts[j]).buffer(
+                    _family_hull(
+                        LineString(disp_pts[j]),
                         dj.width / 2.0 + place_clearance + wk / 2.0,
-                        cap_style="round",
                     )
                 )
             disp_pts[i] = _snap45_line(disp_pts[i], hulls)
@@ -267,7 +267,7 @@ def route_engine(
 
     if out_path != skeleton:
         route_hulls: list[Polygon] = [
-            o.shape.buffer(place_clearance + track_width / 2.0, cap_style="round")
+            _family_hull(o.shape, place_clearance + track_width / 2.0)
             for o in obstacles
             if o.shape is not None and not o.shape.is_empty
         ]
@@ -399,7 +399,136 @@ def _snap45_line(
             deduped.append(p)
     if len(deduped) < 2:
         return [pts[0], pts[-1]]
-    return deduped
+    return _merge_family_chain(deduped)
+
+
+def _merge_family_chain(pts: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    """Merge runs of consecutive segments in the same 0/45/90 slot.
+
+    A polyline that snaps onto the family can still carry redundant
+    vertices: walkaround rides obstacle hulls densely and snap45 turns
+    each chord into a family hook, so a straight run on one family
+    direction ends up split into many short collinear segments.  Every
+    interior vertex between two segments that share the same direction
+    slot (V/V, H/H, or same-sign D/D) lies exactly on the line between
+    its neighbors — dropping it changes nothing geometrically, so no
+    DRC re-check is needed (the final audit already ran on this line
+    and still sees the identical copper).  First/last points are pinned
+    (pads / via anchors stay connected).
+
+    This is the "merge collinear / 45-degree chain" pass of KiCad's
+    optimizer that the engine previously skipped: the walked path kept
+    one vertex per hull-sample chord (tens of 2-30 um segments where
+    there is one straight leg).
+    """
+    if len(pts) < 3:
+        return pts
+
+    def _slot(p: tuple[float, float], q: tuple[float, float]) -> int | None:
+        dx = q[0] - p[0]
+        dy = q[1] - p[1]
+        if abs(dx) < 1e-9 and abs(dy) < 1e-9:
+            return None
+        if abs(dx) < 1e-9:
+            return 0  # V
+        if abs(dy) < 1e-9:
+            return 1  # H
+        if abs(abs(dx) - abs(dy)) < 1e-6:
+            return 2 if dx * dy > 0 else 3  # D+ / D-
+        return None  # not on the family (should not happen post-snap)
+
+    out: list[tuple[float, float]] = [pts[0]]
+    for i in range(1, len(pts)):
+        prev_slot = _slot(out[-1], pts[i])
+        next_slot = _slot(pts[i], pts[i + 1]) if i + 1 < len(pts) else None
+        if prev_slot is not None and prev_slot == next_slot:
+            continue  # same family direction on both sides: drop the vertex
+        out.append(pts[i])
+    if len(out) < 2:
+        return [pts[0], pts[-1]]
+    return out
+
+
+def _clip_halfplane(
+    verts: list[tuple[float, float]],
+    nx: float,
+    ny: float,
+    s: float,
+) -> list[tuple[float, float]]:
+    """Sutherland–Hodgman clip of a convex CCW ring by ``n·p <= s``."""
+    out: list[tuple[float, float]] = []
+    n = len(verts)
+    for i in range(n):
+        cur = verts[i]
+        nxt = verts[(i + 1) % n]
+        d_cur = nx * cur[0] + ny * cur[1] - s
+        d_nxt = nx * nxt[0] + ny * nxt[1] - s
+        if d_cur <= 0:
+            out.append(cur)
+        if (d_cur > 0) != (d_nxt > 0):
+            t = d_cur / (d_cur - d_nxt)
+            out.append((cur[0] + t * (nxt[0] - cur[0]), cur[1] + t * (nxt[1] - cur[1])))
+    return out
+
+
+def _outer_family_polygon(poly: Polygon, margin: float = 0.0) -> Polygon | None:
+    """45-family outer octagon covering ``poly`` (plus ``margin``).
+
+    Take the support half-plane in each of the 8 family normals
+    (0/45/90/135/… degrees) and intersect them.  The result is a convex
+    polygon whose every edge is a 0/45/90-family line and that contains
+    ``poly`` — a walkaround that rides this octagon produces family
+    directions only.  Returns None when clipping degenerates.
+    """
+    if poly is None or poly.is_empty:
+        return None
+    big = 1e6
+    clip: list[tuple[float, float]] = [
+        (-big, -big),
+        (big, -big),
+        (big, big),
+        (-big, big),
+    ]
+    coords = [(c[0], c[1]) for c in poly.exterior.coords]
+    for k in range(8):
+        ang = math.radians(k * 45.0)
+        nx, ny = math.cos(ang), math.sin(ang)
+        s = max(nx * x + ny * y for x, y in coords) + margin
+        clip = _clip_halfplane(clip, nx, ny, s)
+        if len(clip) < 3:
+            return None
+    if len(clip) < 3:
+        return None
+    return Polygon(clip)
+
+
+def _family_hull(shape, margin: float) -> Polygon:
+    """Walkaround/shove hull snapped onto the 0/45/90 family.
+
+    The buffered shape (round-cap pads/vias, rounded track ends, keepout
+    solids) is covered by its 45-family outer octagon, so the detector
+    walks along family edges and every resulting segment is already
+    0/45/90 — no per-segment re-snap needed.  A long thin hull (a track
+    being routed around) inflates beyond the guard ratio, so its
+    original rounded-rect unlock hull is kept instead: the octagon
+    would force a needlessly wide detour, and the track centerline is
+    already a single straight run the walkaround rides without
+    chopping.  The final DRC audit still measures against the true
+    obstacle shapes, so a slightly larger hull can only add margin.
+
+    The guard ratio 1.35: a circle's outer octagon is ~1.055x the
+    round's area, an axis-aligned square's octagon ~1.2x; anything
+    above 1.35 is a long strip whose octagon detour is excessive.
+    """
+    hull = shape.buffer(margin, cap_style="round")
+    if hull.is_empty:
+        return hull
+    oct_ = _outer_family_polygon(hull)
+    if oct_ is None or len(oct_.exterior.coords) < 4:
+        return hull
+    if oct_.area <= hull.area * 1.35:
+        return oct_
+    return hull
 
 
 def _audit_final_copper(
@@ -489,7 +618,10 @@ def _walkaround_solids(
         obs = hit.obstacle
         # Obstacle shape already carries its own half-width; add the
         # route half-width + clearance so the walked line gets DRC margin.
-        hull = obs.shape.buffer(hull_margin, cap_style="round")
+        # The hull is snapped onto the 0/45/90 family (outer octagon):
+        # walking family edges yields family-only segments, so no
+        # arbitrary-angle chords remain on the detour.
+        hull = _family_hull(obs.shape, hull_margin)
         if hull.is_empty:
             raise PnsFailure(f"obstacle {obs.kind} has an empty hull")
         best: list[tuple[float, float]] | None = None

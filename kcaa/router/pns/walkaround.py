@@ -230,6 +230,7 @@ def walkaround_line(
     append_v = True
     iter_limit = 1000
     target_indexp = len(pnew) - 1
+    projected_end = False
 
     while v is not None and v.indexp != target_indexp:
         iter_limit -= 1
@@ -289,6 +290,7 @@ def walkaround_line(
                     proj = _project_point_to_segment(last_point, v.pos, v_next.pos)
                     if proj is not None and (not out or not _near(out[-1], proj)):
                         out.append(proj)
+                    projected_end = True
                     append_v = False
                     break
                 last_dst = d
@@ -313,6 +315,13 @@ def walkaround_line(
 
     if not cleaned or not _near(cleaned[0], path[0]):
         raise WalkFailure("walkaround lost the path start point")
+    # The traversal must actually arrive at the end point.  The only
+    # legitimate early exit is the ``in_last`` projection (end point
+    # inside the hull, finished at the nearest hull side); a visited-loop
+    # break otherwise returns a prefix of the path that never reaches
+    # ``path[-1]`` — always a failure, never a route.
+    if not projected_end and (v is None or v.indexp != target_indexp):
+        raise WalkFailure("walkaround looped back before reaching the path end point")
     return cleaned
 
 

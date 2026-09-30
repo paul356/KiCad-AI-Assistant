@@ -27,7 +27,7 @@ Connect pads belonging to the same net with DRC-clean tracks.
    ``waypoints=[...]`` (waypoint/via anchor chain), ``dry_run=True``
    (route + render without writing).  Board-stable config and rare
    tweaks go in the optional ``options`` dict — omit it for defaults:
-   ``options={"corner_mode": ...}`` (default ``rounded45``),
+   ``options={"corner_mode": ...}`` (default ``mitered45``),
    ``options={"layer_hint": ...}`` for thru-hole pads,
    ``options={"via_pairs": (("F.Cu", "B.Cu"),)}`` to allow layer
    transitions, ``options={"turn_penalty": 0.0}`` for pure
@@ -74,12 +74,12 @@ Which one should you use?  Two callers, two flows:
   junctions stay straight-through connections.
 
 ### corner_mode strategy (options["corner_mode"])
-- ``rounded45`` (default): short rounded fillets that hug the 45-degree
-  miter—corner looks rounded but deviates little from a miter; emits
+- ``mitered45`` (default): sharp 45-degree miter corners, straight
+  0/45/90 segments — closest to KiCad's optimizer output, and the fewest
+  track nodes.
+- ``rounded45``: short rounded fillets that hug the 45-degree miter —
+  corner looks rounded but deviates little from a miter; emits
   ``(arc ...)`` track nodes on an unobstructed skeleton.
-- ``mitered45``: sharp 45-degree miter corners, straight segments.  Use
-  when a rounded corner would fail or when pure straight geometry is
-  wanted.
 - ``rounded90``: quarter-circle radius arcs — the most rounded look, and
   the longest arc eaten by any detour or shove.
 - ``mitered90``: Manhattan corners.

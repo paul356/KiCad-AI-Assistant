@@ -1440,12 +1440,13 @@ def test_engine_mitered45_no_arcs(tmp_path: Path) -> None:
     assert len(result.segments) >= 2
 
 
-def test_engine_default_corner_mode_is_rounded45(tmp_path: Path) -> None:
-    """Omitting corner_mode defaults to rounded45: an unobstructed PNS
-    skeleton emits its fillet arc and the result echoes the default."""
+def test_engine_default_corner_mode_is_mitered45(tmp_path: Path) -> None:
+    """Omitting corner_mode defaults to mitered45: an unobstructed PNS
+    skeleton emits plain 0/45/90 segments (no arcs) and the result
+    echoes the default."""
     result = _route_clear({"algorithm": "pns"}, tmp_path)
-    assert result.corner_mode == "rounded45"
-    assert len(result.arcs) == 1
+    assert result.corner_mode == "mitered45"
+    assert len(result.arcs) == 0
 
 
 def test_engine_rounded90_arc(tmp_path: Path) -> None:

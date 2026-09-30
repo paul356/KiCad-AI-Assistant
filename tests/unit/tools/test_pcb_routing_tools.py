@@ -343,7 +343,7 @@ class TestModelVisionGate:
 
 
 class TestPcbRouteOptions:
-    """pcb_route_pad_to_pad: options dict + rounded45 default."""
+    """pcb_route_pad_to_pad: options dict + mitered45 default."""
 
     def _route(self, tools, board, options=None, **kwargs):
         return _run(
@@ -362,17 +362,17 @@ class TestPcbRouteOptions:
             )
         )
 
-    def test_options_none_defaults_to_rounded45(self, tools, routable_board):
-        """Omitting ``options`` routes with corner_mode=rounded45: the
-        unobstructed single-layer PNS skeleton emits its fillet arc."""
+    def test_options_none_defaults_to_mitered45(self, tools, routable_board):
+        """Omitting ``options`` routes with corner_mode=mitered45: the
+        unobstructed single-layer PNS skeleton emits plain 0/45/90
+        segments, no arcs."""
         result = self._route(tools, routable_board)
         assert "error" not in result
-        assert result["corner_mode"] == "rounded45"
+        assert result["corner_mode"] == "mitered45"
         assert result["algorithm"] == "pns"
         assert result["segment_count"] > 0
-        assert result["arc_count"] >= 1
-        assert result["arcs"][0]["layer"] == "F.Cu"
-        assert result["arcs"][0]["net"] == "VCC"
+        assert result["arc_count"] == 0
+        assert result["arcs"] == []
 
     def test_options_layer_hint_accepted_via_options(self, tools, routable_board):
         """v3: ``layer_hint`` moved into ``options``.  On an SMD-pad
@@ -441,13 +441,13 @@ class TestPcbRouteStrategy:
         """v3: with no top-level knobs and ``options=None`` the call
         behaves exactly like the old default: strategy shove (was the
         ``auto`` default, identical path), no dry_run, no waypoints (empty
-        via_sites), rounded45 corners, algorithm pns."""
+        via_sites), mitered45 corners, algorithm pns."""
         result = self._route(tools, routable_board)
         assert "error" not in result
         assert result["strategy"] == "shove"
         assert result["dry_run"] is False
         assert result["via_sites"] == []
-        assert result["corner_mode"] == "rounded45"
+        assert result["corner_mode"] == "mitered45"
         assert result["algorithm"] == "pns"
 
     def test_strategy_default_echoes_shove_with_route_png(self, tools, routable_board):

@@ -31,11 +31,12 @@ With ``algorithm="pns"`` multi-layer routes decompose into one
 walkaround + shove leg per layer (shortest layer path through
 ``via_pairs``), joined by through-vias placed along the direct
 pad-to-pad line and DRC-validated (same-net pad faces, existing
-copper, board edge, hole-to-hole).  A PNS leg emits its rounded-corner
-arcs (corner_mode ``rounded45``/``rounded90``) when the skeleton
-survived walkaround/shove and the corner sits away from a via junction;
-legs whose skeleton was disturbed, or whose fillet would end on a via,
-fall back to straight segments.  Via junctions themselves stay
+copper, board edge, hole-to-hole).  A PNS leg emits rounded-corner
+arcs (corner_mode ``rounded45``/``rounded90``, both opt-in — the
+default ``mitered45`` stays all-straight) when the skeleton survived
+walkaround/shove and the corner sits away from a via junction; legs
+whose skeleton was disturbed, or whose fillet would end on a via, fall
+back to straight segments.  Via junctions themselves stay
 straight-through connections.
 
 No shove
@@ -218,7 +219,7 @@ class RouteRequest:
     via_cost: float = 2.0  # mm penalty per via edge
     turn_penalty: float = 0.3  # mm penalty per direction change; 0 disables
     algorithm: str = "astar"  # astar (grid A*) | pns (walkaround + shove)
-    corner_mode: str = "rounded45"  # rounded45 (default) | mitered45 | rounded90 | mitered90
+    corner_mode: str = "mitered45"  # mitered45 (default) | rounded45 | rounded90 | mitered90
     waypoints: list[dict] = field(default_factory=list)
     dry_run: bool = False  # tool-layer hint: skip save_pcb (router never writes)
     strategy: str = "shove"  # shove | walkaround (PNS shove-mode knob)
@@ -254,7 +255,7 @@ class RouteResult:
     vias: list[OutputVia] = field(default_factory=list)
     arcs: list[OutputArc] = field(default_factory=list)
     shoved_tracks: list[TrackObstacle] = field(default_factory=list)
-    corner_mode: str = "rounded45"
+    corner_mode: str = "mitered45"
     algorithm: str = "astar"
     start: tuple[float, float] = (0.0, 0.0)
     end: tuple[float, float] = (0.0, 0.0)

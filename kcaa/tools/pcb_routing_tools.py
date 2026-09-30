@@ -79,10 +79,10 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
 
         ``options`` bundles the optional tuning knobs; omit it (or pass
         ``{}``) for defaults.  ``corner_mode`` defaults to
-        ``rounded45`` — short fillets that read as rounds but barely
-        deviate from a 45-degree miter — and degrades to straight
-        segments on any detour or shove; switch to ``mitered45`` for
-        sharp corners or ``rounded90`` for larger-radius arcs.
+        ``mitered45`` — sharp 45-degree corners on plain 0/45/90
+        segments (closest to KiCad's optimizer output); switch to
+        ``rounded45`` for short fillets or ``rounded90`` for larger
+        fillet arcs.
 
         Interface v3: the VLM control surface — ``waypoints``, ``dry_run``,
         ``strategy`` — lives at the TOP LEVEL (the caller touches these
@@ -140,12 +140,11 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
                 stage).
 
             options: Optional dict of advanced options, all optional:
-                ``corner_mode``: ``rounded45`` (default) | ``mitered45`` |
+                ``corner_mode``: ``mitered45`` (default) | ``rounded45`` |
                     ``rounded90`` | ``mitered90``.  Rounded modes emit arc
                     track nodes on an unobstructed skeleton (a detour
-                    linearizes them).  ``rounded45`` fillets are short and
-                    hug the 45-degree miter; ``rounded90`` uses the full
-                    quarter-circle radius.
+                    linearizes them).  ``mitered45`` emits plain 0/45/90
+                    segments — the closest to KiCad's optimizer output.
                 ``via_pairs``: tuple of ``(from_layer, to_layer)`` pairs;
                     each pair is one allowed through-via layer transition
                     edge, traversable in both directions.  Default
@@ -217,7 +216,7 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
             — same convention as ``export_pcb_layer_image``.  When the
             render is unavailable the result is the bare JSON text.
         """
-        corner_mode = "rounded45"
+        corner_mode = "mitered45"
         via_pairs: tuple[tuple[str, str], ...] = (("F.Cu", "B.Cu"),)
         turn_penalty = 0.3
         layer_hint: str | None = None

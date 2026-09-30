@@ -5,12 +5,14 @@ from __future__ import annotations
 import math
 
 import pytest
+import shapely.affinity
 from shapely.geometry import LineString, Polygon
 
 from kcaa.router.pns.shove import ShoveFailure, TrackObstacle
 from kcaa.router.route_engine import (
     PnsFailure,
     _audit_final_copper,
+    _family_hull,
     _path_len,
     _rect_medians,
     _snap45_line,
@@ -319,6 +321,21 @@ def _turns_le_45(pts) -> bool:
     return True
 
 
+def _turns_in_family(pts) -> bool:
+    """True when every consecutive turn of ``pts`` is exactly 45 or 90
+    degrees (a legal PCB corner; no sub-degree kinks allowed)."""
+    for a, b, c in zip(pts, pts[1:], pts[2:]):
+        d1 = math.atan2(b[1] - a[1], b[0] - a[0])
+        d2 = math.atan2(c[1] - b[1], c[0] - b[0])
+        turn = abs(math.degrees((d2 - d1) % 180))
+        turn = min(turn, 180 - turn)
+        if turn < 1e-6:
+            continue
+        if not (abs(turn - 45) < 1e-4 or abs(turn - 90) < 1e-4):
+            return False
+    return True
+
+
 class TestSnap45Line:
     """Disturbed polylines are re-snapped onto the 0/45/90 family."""
 
@@ -494,3 +511,113 @@ class TestMovableExtraction:
         assert med is not None
         assert med[2] == pytest.approx(6.0)  # long axis length
         assert med[3] == pytest.approx(W)
+
+
+class TestFamilyHull:
+    """Walkaround hulls ride the 0/45/90 family (outer octagon)."""
+
+    def test_round_pad_hull_is_octagon_on_family(self):
+        from shapely.geometry import Point
+
+        pad = Obstacle(
+            shape=Point(0, 0).buffer(1.0),
+            layers=frozenset({"F.Cu"}),
+            net=None,
+            kind="pad",
+        )
+        hull = _family_hull(pad.shape, 0.1)
+        assert hull.area > pad.shape.area  # outer, not inner
+        coords = list(hull.exterior.coords)[:-1]
+        assert len(coords) == 8
+        for a, b in zip(coords, coords[1:] + coords[:1]):
+            dx, dy = abs(b[0] - a[0]), abs(b[1] - a[1])
+            if dx > 1e-6 and dy > 1e-6:
+                assert abs(dx - dy) < 1e-6, "octagon edge not on 45-degree family"
+        # Hull keeps DRC margin: far enough from the pad center at least.
+        assert hull.distance(Point(0, 0)) == pytest.approx(0, abs=1e-6)
+
+    def test_narrow_strip_keeps_original_hull(self):
+        # A long thin obstacle at an off-family angle (a 30-degree track
+        # being routed around) must not balloon into a wide octagon — the
+        # area-ratio guard keeps the buffered rounded-rect hull.
+        wall = Polygon([(-0.3, -5), (0.3, -5), (0.3, 5), (-0.3, 5)])
+        wall = shapely.affinity.rotate(wall, 30, origin=(0, 0))
+        hull = _family_hull(wall, 0.1)
+        direct = wall.buffer(0.1, cap_style="round")
+        # The octagon would widen the strip crosswise (~2x the buffered
+        # width); the guard returns the original rounded hull instead.
+        assert hull.area <= direct.area * 1.05
+
+
+class TestDetourSegmentReduction:
+    """Walkaround around a round obstacle must not splinter into tens of
+    micro-segments — the family hull keeps the detour on 0/45/90 with
+    few segments (the observed 26-segment bug)."""
+
+    def _route_around_pad(self):
+        from shapely.geometry import Point
+
+        pad = Obstacle(
+            shape=Point(0, 0).buffer(1.0),
+            layers=frozenset({"F.Cu"}),
+            net=None,
+            kind="pad",
+        )
+        return route_engine((-8, 0), (8, 0), [pad], W, CLR)
+
+    def test_detour_all_segments_on_45_family(self):
+        res = self._route_around_pad()
+        out = res.path
+        assert out[0] == (-8, 0) and out[-1] == (8, 0)
+        # Engine-level: snap45 + family hull keep every segment on the
+        # 0/45/90 family, and every turn is a legal 45 or 90 (a raw
+        # round-hull detour used to carry sub-degree chords).
+        assert _segments_on_45(out)
+        assert _turns_in_family(out)
+
+    def test_detour_has_few_segments(self):
+        res = self._route_around_pad()
+        out = res.path
+        n = len(
+            [1 for a, b in zip(out, out[1:]) if abs(a[0] - b[0]) > 1e-9 or abs(a[1] - b[1]) > 1e-9]
+        )
+        # Family octagon detour: 2 straight legs + 3 octagon edges + 2
+        # exit legs max.  The pre-fix bug emitted 60+ micro-segments
+        # (walkaround chord sampling + no family merge).
+        assert n <= 8, f"detour splintered into {n} segments"
+
+
+class TestWalkaroundEndsAtTarget:
+    """The walkaround traversal must arrive at the path end point (a
+    visited-loop break that returns a prefix was a silent bug)."""
+
+    def test_loop_prefix_fails_loudly(self):
+        from kcaa.router.pns.node import ObstacleNode
+
+        # Canyon: central wall + caps above/below.  The family hull's
+        # straight edges let the graph walk enter a visited loop instead
+        # of raising on a stuck vertex; the engine must surface that as a
+        # PnsFailure rather than hand back a truncated path.
+        walls = [
+            Obstacle(
+                shape=Polygon([(-0.3, -5), (0.3, -5), (0.3, 5), (-0.3, 5)]),
+                layers=frozenset({"F.Cu"}),
+                net=None,
+                kind="pad",
+            ),
+            Obstacle(
+                shape=Polygon([(-5, 3), (5, 3), (5, 3.3), (-5, 3.3)]),
+                layers=frozenset({"F.Cu"}),
+                net=None,
+                kind="pad",
+            ),
+            Obstacle(
+                shape=Polygon([(-5, -3.3), (5, -3.3), (5, -3), (-5, -3)]),
+                layers=frozenset({"F.Cu"}),
+                net=None,
+                kind="pad",
+            ),
+        ]
+        node = ObstacleNode(walls)
+        with pytest.raises(PnsFailure):
+            _walkaround_solids([(-8, 0), (8, 0)], node, W, CLR)
