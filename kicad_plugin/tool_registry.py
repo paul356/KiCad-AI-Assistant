@@ -49,6 +49,12 @@ TOOL_POLICIES: dict[str, ToolPolicy] = {
         auto_snapshot=True,
         mark_dirty=True,
     ),
+    "create_symbol": ToolPolicy(
+        kind="file_mutation",
+        path_arg="schematic_path",
+        auto_snapshot=True,
+        mark_dirty=True,
+    ),
     "place_symbol_relative": ToolPolicy(
         kind="file_mutation",
         path_arg="schematic_path",
