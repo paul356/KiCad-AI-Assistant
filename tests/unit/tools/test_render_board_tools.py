@@ -1,10 +1,11 @@
 """Unit tests for kcaa/tools/render_board_tools.py.
 
-Covers the #152 render enhancements (pad-label drawing baseline, label
-collision avoidance, region / zoom rendering, pad-coordinate reporting)
-and circle shape support (gr_circle / fp_circle parsing with center
-coordinate, bounding box with circular geometry, multi-layer rendering,
-and robust drawing of malformed entries).
+Covers the #152 render enhancements (pad-label drawing baseline with
+short labels and an in-frame flip near the frame edges, label collision
+avoidance, region / zoom rendering, footprint reference labels and
+pad-coordinate reporting) and circle shape support (gr_circle / fp_circle
+parsing with center coordinate, bounding box with circular geometry,
+multi-layer rendering, and robust drawing of malformed entries).
 """
 
 import asyncio
@@ -271,6 +272,52 @@ def test_render_board_with_circles(tmp_path):
         assert report["copper_layers"] == ["F.Cu", "B.Cu"]
 
 
+def _silk_ref_board_path(tmp_path) -> str:
+    """One footprint ("U7") with pads at (10,0)/(20,0) and a silkscreen
+    reference text anchored at (0,0) — away from the pads, so a region zoom
+    around the pads excludes the silk text while full-board views show it.
+    """
+    lines = [
+        "(kicad_pcb",
+        "\t(version 20260206)",
+        '\t(generator "pcbnew")',
+        '\t(generator_version "10.0")',
+        "\t(general",
+        "\t\t(thickness 1.6)",
+        "\t)",
+        '\t(paper "A4")',
+        "\t(layers",
+        '\t\t(0 "F.Cu" signal)',
+        '\t\t(31 "B.Cu" signal)',
+        "\t)",
+        '\t(footprint "Resistor_SMD:R_0402_1005Metric"',
+        '\t\t(layer "F.Cu")',
+        '\t\t(uuid "00000000-0000-0000-0000-0000000000f0")',
+        "\t\t(at 0 0 0)",
+        '\t\t(property "Reference" "U7")',
+        '\t\t(property "Value" "R")',
+        '\t\t(fp_text reference "U7" (at 0 0) (layer "F.SilkS")',
+        "\t\t\t(effects (font (size 1 1) (thickness 0.15)))",
+        "\t\t)",
+        '\t\t(pad "1" smd rect',
+        "\t\t\t(at 10 0)",
+        "\t\t\t(size 0.5 0.5)",
+        '\t\t\t(layers "F.Cu" "F.Paste" "F.Mask")',
+        "\t\t)",
+        '\t\t(pad "2" smd rect',
+        "\t\t\t(at 20 0)",
+        "\t\t\t(size 0.5 0.5)",
+        '\t\t\t(layers "F.Cu" "F.Paste" "F.Mask")',
+        "\t\t)",
+        "\t)",
+        ")",
+    ]
+    path = tmp_path / "silk_ref.kicad_pcb"
+    with open(path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    return str(path)
+
+
 class TestRenderBoardBaseline:
     def test_default_render_report_keys(self):
         lines, png, report = render_board(BOARD_FIXTURE)
@@ -285,6 +332,8 @@ class TestRenderBoardBaseline:
         assert report["pad_labels"] > 0
         assert report["label_collisions"] >= 0
         assert isinstance(report["label_skipped"], list)
+        assert report["footprint_refs"] == 3  # R1/C1/J1 (fixture has no silk refs)
+        assert report["footprint_refs_skipped"] == []
         assert len(report["region_bbox"]) == 4
         assert _png_size(png)[0] > 0
         assert len(lines) >= 1
@@ -294,6 +343,8 @@ class TestRenderBoardBaseline:
         assert report["pad_labels"] == 0
         assert report["label_collisions"] == 0
         assert report["label_skipped"] == []
+        # Turning pad labels off does not kill the footprint refs.
+        assert report["footprint_refs"] == 3
 
     def test_connect_pads_and_layer_still_work(self):
         _, _, report = render_board(BOARD_FIXTURE, connect_pads=["J1.1", "R1.2"], layer="F.Cu")
@@ -400,6 +451,162 @@ class TestPadCoords:
         by_ref = {(p.ref, p.number): p for p in board.pads}
         for c in report["pads_coords"]:
             assert "B.Cu" in by_ref[(c["ref"], c["number"])].copper_layers
+            # Single-layer render reports the layer it actually shows.
+            assert c["layer"] == "B.Cu"
+
+    def test_coords_filtered_to_region(self, tmp_path):
+        # Sparse pads at (0,0), (10,0), (0,10), (10,10): only R2.1 fits the box.
+        _, _, report = render_board(
+            _sparse_board_path(tmp_path),
+            include_pad_coords=True,
+            region=[5.5, -1.0, 15.5, 1.0],
+        )
+        assert [(c["ref"], c["number"]) for c in report["pads_coords"]] == [("R2", "1")]
+        assert report["pads_coords"][0]["layer"] == "F.Cu"
+
+
+class TestPadLabelPlacement:
+    """The label flips stay in-frame when a pad sits near the frame edge.
+
+    The y axis is inverted (KiCad +Y down): "up" is decreasing data y, so a
+    right-up label box spans x [cx+off, cx+off+w], y [cy-off-h, cy-off].
+    """
+
+    REGION = (0.0, 0.0, 20.0, 20.0)
+
+    def _box(self, cx: float, cy: float) -> tuple[float, float, float, float]:
+        import matplotlib.pyplot as plt
+
+        from kcaa.tools.render_board_tools import (
+            Pad,
+            _draw_pad_label,
+            _label_data_bbox,
+            _new_board_figure,
+        )
+
+        xmin, ymin, xmax, ymax = self.REGION
+        fig, ax, _, _ = _new_board_figure(xmin, ymin, xmax, ymax, 200)
+        try:
+            renderer = fig.canvas.get_renderer()
+            pad = Pad(
+                ref="R",
+                number="10",
+                net=None,
+                center=(cx, cy),
+                copper_layers=["F.Cu"],
+                shape=None,
+            )
+            artist = _draw_pad_label(ax, pad)
+            return _label_data_bbox(ax, artist, renderer)
+        finally:
+            plt.close(fig)
+
+    def _assert_in_frame(self, box) -> None:
+        xmin, ymin, xmax, ymax = self.REGION
+        assert box[0] >= xmin and box[2] <= xmax, f"label out of x range: {box}"
+        assert box[1] >= ymin and box[3] <= ymax, f"label out of y range: {box}"
+
+    def test_interior_pad_label_right_of_and_above_center(self):
+        box = self._box(10.0, 10.0)
+        # Right-up box: left edge right of the pad, top edge above it.
+        assert box[0] >= 10.0 and box[3] <= 10.0
+        self._assert_in_frame(box)
+
+    def test_near_right_edge_flips_left_down(self):
+        box = self._box(19.4, 10.0)  # right-up would poke past x_max
+        assert box[2] <= 19.4 and box[1] >= 10.0
+        self._assert_in_frame(box)
+
+    def test_near_top_edge_flips_left_down(self):
+        box = self._box(10.0, 0.4)  # right-up would poke past y_min
+        assert box[2] <= 10.0 and box[1] >= 0.4  # left of / below the pad
+        self._assert_in_frame(box)
+
+    def test_top_left_corner_stays_in_frame(self):
+        box = self._box(0.4, 0.4)  # both primary sides poke out -> right-down
+        self._assert_in_frame(box)
+
+    def test_top_right_corner_stays_in_frame(self):
+        box = self._box(19.4, 0.4)
+        self._assert_in_frame(box)
+
+    def test_bottom_right_corner_stays_in_frame(self):
+        box = self._box(19.6, 19.6)  # both primary sides poke out -> left-up
+        self._assert_in_frame(box)
+
+    def test_near_left_edge_keeps_right_up(self):
+        box = self._box(0.4, 10.0)  # right-up extends right: still fits
+        assert box[0] >= 0.4 and box[3] <= 10.0
+        self._assert_in_frame(box)
+
+    def test_near_bottom_edge_keeps_right_up(self):
+        box = self._box(10.0, 19.6)  # right-up extends up: still fits
+        assert box[0] >= 10.0 and box[3] <= 19.6
+        self._assert_in_frame(box)
+
+
+class TestPadLabelFormats:
+    def _texts(self, tmp_path, label_format: str = "number") -> set[str]:
+        import matplotlib.pyplot as plt
+
+        from kcaa.tools.render_board_tools import (
+            _bounds,
+            _draw_board_layers,
+            _new_board_figure,
+        )
+
+        board = parse_board(_sparse_board_path(tmp_path))
+        xmin, ymin, xmax, ymax = _bounds(board, [])
+        fig, ax, _, _ = _new_board_figure(xmin, ymin, xmax, ymax, 200)
+        try:
+            _draw_board_layers(ax, board, show_pad_labels=True, label_format=label_format)
+            return {t.get_text() for t in ax.texts}
+        finally:
+            plt.close(fig)
+
+    def test_default_labels_are_short_numbers(self, tmp_path):
+        texts = self._texts(tmp_path)
+        assert "1" in texts  # short number label
+        assert "R1.1" not in texts
+        assert all("." not in t for t in texts)
+
+    def test_ref_number_format_keeps_legacy_labels(self, tmp_path):
+        texts = self._texts(tmp_path, label_format="ref.number")
+        assert "R1.1" in texts
+        assert any("." in t for t in texts)
+
+    def test_unknown_format_rejected(self, tmp_path):
+        with pytest.raises(ValueError, match="label_format"):
+            self._texts(tmp_path, label_format="bogus")
+
+
+class TestFootprintRefs:
+    # test_board.kicad_pcb carries no silkscreen reference texts, so refs
+    # are re-drawn for every footprint that shows pads.
+    def test_drawn_for_every_footprint_by_default(self):
+        _, _, report = render_board(BOARD_FIXTURE)
+        assert report["footprint_refs"] == 3
+        assert report["footprint_refs_skipped"] == []
+
+    def test_disabled_flag_zeroes_refs(self):
+        _, _, report = render_board(BOARD_FIXTURE, show_footprint_refs=False)
+        assert report["footprint_refs"] == 0
+        assert report["footprint_refs_skipped"] == []
+
+    def test_refs_only_for_footprints_with_rendered_pads(self):
+        # B.Cu render keeps only thru-hole J1 pads -> only J1 gets a ref.
+        _, _, report = render_board(BOARD_FIXTURE, layer="B.Cu")
+        assert report["footprint_refs"] == 1
+
+    def test_deduped_against_visible_silkscreen_ref(self, tmp_path):
+        _, _, report = render_board(_silk_ref_board_path(tmp_path))
+        assert report["footprint_refs"] == 0  # silk "U7" already on screen
+
+    def test_redrawn_when_region_excludes_silk_ref(self, tmp_path):
+        # Region box holds only U7's pads; the silk text anchored at (0,0)
+        # is filtered out, so the ref is re-drawn above the pad centroid.
+        _, _, report = render_board(_silk_ref_board_path(tmp_path), region=[8.0, -2.0, 22.0, 2.0])
+        assert report["footprint_refs"] == 1
 
 
 class TestToolRegistration:
@@ -412,10 +619,14 @@ class TestToolRegistration:
             "label_scale",
             "region",
             "include_pad_coords",
+            "label_format",
+            "show_footprint_refs",
         ):
             assert param in sig.parameters
         assert sig.parameters["show_pad_labels"].default is True
         assert sig.parameters["include_pad_coords"].default is False
+        assert sig.parameters["label_format"].default == "number"
+        assert sig.parameters["show_footprint_refs"].default is True
 
     def test_tool_returns_report_and_image(self, tmp_path):
         tools = _get_tools()

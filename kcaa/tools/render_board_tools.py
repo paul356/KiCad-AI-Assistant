@@ -81,6 +81,15 @@ _PAD_LABEL_STROKE = "#FFFFFF"
 # the glyph height per side) touches an already-placed label is skipped.
 _LABEL_GAP_FRACTION = 0.15
 
+# Footprint-level reference labels (e.g. "U11"), drawn once per footprint
+# only when its silkscreen reference text is not already visible in this
+# render.  Bigger than pad labels and silk-gray so they read as a
+# footprint, not a pad.
+_FP_REF_SCALE = 1.5  # glyph height multiplier vs pad labels
+_FP_REF_COLOR = _SILK_COLOR
+_FP_REF_STROKE = _PAD_LABEL_COLOR
+_FP_REF_ALPHA = 0.9
+
 _PT_PER_MM = 72.0 / 25.4
 
 
@@ -468,6 +477,7 @@ def _parse_text(
         pname = str(node[1])
         if pname not in ("Reference", "Value"):
             return None
+        text_kind = "reference" if pname == "Reference" else "value"
         label = str(node[2]) if len(node) > 2 else ""
         for sub in node:
             if isinstance(sub, list) and _sym(sub[0]) == "hide":
@@ -476,6 +486,7 @@ def _parse_text(
         kind = _sym(node[1])
         if kind not in ("reference", "value", "user"):
             return None
+        text_kind = kind
         label = str(node[2]) if len(node) > 2 else ""
         if label == "${REFERENCE}":
             label = ref
@@ -510,6 +521,7 @@ def _parse_text(
                             bold = True
     return {
         "kind": "text",
+        "text_kind": text_kind,
         "label": label,
         "at": _wpt(fp, at[0], at[1]),
         "rot": rot,
@@ -1033,26 +1045,81 @@ def _new_board_figure(
     return fig, ax, dpi, mm_per_px
 
 
-def _draw_pad_label(
-    ax: Any, p: Pad, fontsize_mm: float = _PAD_LABEL_MM, offset_mm: float = _PAD_LABEL_OFFSET_MM
-) -> Any:
-    """Draw a ``ref.number`` label beside the pad center.
+def _pad_label_text(p: Pad, label_format: str) -> str:
+    """Label text for a pad: ``"number"`` -> just the pad number, the #144
+    default ``"ref.number"`` -> ``REF.PAD``."""
+    if label_format == "number":
+        return p.number
+    if label_format == "ref.number":
+        return f"{p.ref}.{p.number}"
+    raise ValueError(f"label_format must be 'number' or 'ref.number', got {label_format!r}")
 
-    Offset right-up from the center; flips to left-down when the label
-    would run past the rendered frame.  Returns the Text artist so the
-    caller can measure its box for collision avoidance.
+
+def _draw_pad_label(
+    ax: Any,
+    p: Pad,
+    fontsize_mm: float = _PAD_LABEL_MM,
+    offset_mm: float = _PAD_LABEL_OFFSET_MM,
+    label_format: str = "number",
+) -> Any:
+    """Draw the pad label beside the pad center.
+
+    Tries right-up placement first, then left-down, right-down, left-up:
+    the first box that fits inside the rendered frame wins (a pad in a
+    frame corner never loses its label).  The y axis is inverted (KiCad
+    +Y down), so "up" is the direction of decreasing data y.  Returns the
+    Text artist so the caller can measure its box for collision avoidance.
     """
     cx, cy = p.center
-    label = f"{p.ref}.{p.number}"
-    dx = dy = offset_mm
-    ha, va = "left", "bottom"
-    xlim = ax.get_xlim()
-    ylim = ax.get_ylim()
-    # Rough glyph advance so the frame check covers the whole string.
+    label = _pad_label_text(p, label_format)
     width_est = len(label) * 0.6 * fontsize_mm
-    if cx + dx + width_est > xlim[1] or cy + dy + fontsize_mm > ylim[1]:
-        dx = dy = -offset_mm
-        ha, va = "right", "top"
+    height = fontsize_mm
+    x_left, x_right = ax.get_xlim()  # left, right frame edges in data mm
+    # Inverted axis: get_ylim() returns (ymax, ymin) — the bottom edge
+    # first, the top edge second.
+    y_bottom, y_top = ax.get_ylim()
+    # Placements, box spans in data mm, each guarded by its in-frame check
+    # ("right" = +x, "up" = -y, "down" = +y with the inverted axis):
+    #   right-up:   x [cx+off, cx+off+w],  y [cy-off-h, cy-off]
+    #   left-down:  x [cx-off-w, cx-off],  y [cy+off, cy+off+h]
+    #   right-down: x [cx+off, cx+off+w],  y [cy+off, cy+off+h]
+    #   left-up:    x [cx-off-w, cx-off],  y [cy-off-h, cy-off]
+    placements = (
+        (
+            offset_mm,
+            -offset_mm,
+            "left",
+            "bottom",
+            cx + offset_mm + width_est <= x_right and cy - offset_mm - height >= y_top,
+        ),
+        (
+            -offset_mm,
+            offset_mm,
+            "right",
+            "top",
+            cx - offset_mm - width_est >= x_left and cy + offset_mm + height <= y_bottom,
+        ),
+        (
+            offset_mm,
+            offset_mm,
+            "left",
+            "top",
+            cx + offset_mm + width_est <= x_right and cy + offset_mm + height <= y_bottom,
+        ),
+        (
+            -offset_mm,
+            -offset_mm,
+            "right",
+            "bottom",
+            cx - offset_mm - width_est >= x_left and cy - offset_mm - height >= y_top,
+        ),
+    )
+    # A label box can exceed the whole frame on a tiny region zoom; fall
+    # back to right-up rather than raise.
+    dx, dy, ha, va = next(
+        ((d, o, h, v) for d, o, h, v, fits in placements if fits),
+        (offset_mm, -offset_mm, "left", "bottom"),
+    )
     return ax.text(
         cx + dx,
         cy + dy,
@@ -1095,14 +1162,18 @@ def _draw_board_layers(
     layer: str | None = None,
     show_pad_labels: bool = False,
     label_scale: float = 1.0,
-) -> tuple[int, int, list[str]]:
+    label_format: str = "number",
+    show_footprint_refs: bool = True,
+) -> tuple[int, int, list[str], int, list[str]]:
     """Draw the static board layers into ``ax`` — zones, courtyards, copper
-    pads and tracks, vias, board edge, silkscreen — with optional
-    ``ref.number`` pad labels on top.
+    pads and tracks, vias, board edge, silkscreen — with optional pad
+    labels and footprint reference labels on top.
 
-    Labels are collision-avoided: a label whose box overlaps an
-    already-placed one is skipped.  Returns ``(labels_drawn,
-    labels_skipped, skipped_refs)``.
+    Pad labels are collision-avoided: a label whose box overlaps an
+    already-placed one is skipped.  Footprint refs (one per footprint,
+    only when its silkscreen reference is not already rendered) share the
+    same placement boxes.  Returns ``(labels_drawn, label_collisions,
+    skipped_pad_refs, fp_refs_drawn, skipped_fp_refs)``.
     """
     fontsize_mm = _PAD_LABEL_MM * label_scale
     offset_mm = _PAD_LABEL_OFFSET_MM * label_scale
@@ -1174,7 +1245,9 @@ def _draw_board_layers(
                 )
             )
         if show_pad_labels:
-            artist = _draw_pad_label(ax, p, fontsize_mm=fontsize_mm, offset_mm=offset_mm)
+            artist = _draw_pad_label(
+                ax, p, fontsize_mm=fontsize_mm, offset_mm=offset_mm, label_format=label_format
+            )
             if renderer is None:
                 renderer = ax.figure.canvas.get_renderer()
             box = _label_data_bbox(ax, artist, renderer)
@@ -1252,7 +1325,96 @@ def _draw_board_layers(
             zorder=_Z_SILK,
         )
 
-    return pad_labels_drawn, label_collisions, label_skipped
+    # 7. Footprint reference labels — one per footprint whose silkscreen
+    # reference is NOT already drawn in this render (full-board views draw
+    # the reference silk itself; single-layer / region views may filter it
+    # out).  Anchored at the footprint's drawn-pad centroid, tried above /
+    # below / left / right until one fits next to the pad labels; bigger
+    # and silk-gray so it reads as the footprint, not a pad.  Shares the
+    # pad-label collision boxes.
+    if show_footprint_refs:
+        fp_refs_drawn = 0
+        fp_refs_skipped: list[str] = []
+        # Silkscreen reference labels that this render will actually show
+        # (same silk side and inside the rendered frame — a reference text
+        # outside a region zoom is filtered out, so its footprint gets a
+        # re-drawn label instead).
+        x_frame_left, x_frame_right = ax.get_xlim()
+        y_frame_bottom, y_frame_top = ax.get_ylim()  # inverted: (ymax, ymin)
+        silk_rendered_refs: set[str] = set()
+        for t in board.texts:
+            if t.get("text_kind") != "reference":
+                continue
+            if layer is not None and t["layer"].split(".")[0] != layer.split(".")[0]:
+                continue
+            tx, ty = t["at"]
+            if not (x_frame_left <= tx <= x_frame_right and y_frame_top <= ty <= y_frame_bottom):
+                continue
+            silk_rendered_refs.add(t["label"])
+        # Footprint anchor: centroid of the pads actually drawn above (a
+        # footprint shows only when at least one of its pads is rendered).
+        fp_pts: dict[str, list[tuple[float, float]]] = {}
+        for p in board.pads:
+            if p.shape is None:
+                continue
+            if layer is not None and layer not in p.copper_layers:
+                continue
+            fp_pts.setdefault(p.ref, []).append(p.center)
+        for ref in sorted(fp_pts):
+            if not ref or ref == "?" or ref in silk_rendered_refs:
+                continue
+            cx = sum(pt[0] for pt in fp_pts[ref]) / len(fp_pts[ref])
+            cy = sum(pt[1] for pt in fp_pts[ref]) / len(fp_pts[ref])
+            if not (x_frame_left <= cx <= x_frame_right and y_frame_top <= cy <= y_frame_bottom):
+                continue  # footprint outside the rendered frame: nothing to label
+            if renderer is None:
+                renderer = ax.figure.canvas.get_renderer()
+            gap = fontsize_mm * _LABEL_GAP_FRACTION
+            # Try above / below / left / right of the centroid: pad labels
+            # already claim one side of the footprint, so a fixed anchor
+            # would collide with them and read as a skip.
+            fp_h = fontsize_mm * _FP_REF_SCALE
+            drawn = False
+            for dx, dy, ha, va in (
+                (0.0, -offset_mm, "center", "bottom"),  # above the centroid
+                (0.0, offset_mm, "center", "top"),  # below
+                (-offset_mm, 0.0, "right", "center"),  # left
+                (offset_mm, 0.0, "left", "center"),  # right
+            ):
+                artist = ax.text(
+                    cx + dx,
+                    cy + dy,
+                    ref,
+                    ha=ha,
+                    va=va,
+                    fontsize=fp_h * _PT_PER_MM,
+                    color=_FP_REF_COLOR,
+                    alpha=_FP_REF_ALPHA,
+                    zorder=_Z_PAD_LABEL,
+                    path_effects=[
+                        mpatheffects.withStroke(linewidth=0.3, foreground=_FP_REF_STROKE)
+                    ],
+                )
+                box = _label_data_bbox(ax, artist, renderer)
+                in_frame = (
+                    x_frame_left <= box[0]
+                    and box[2] <= x_frame_right
+                    and y_frame_top <= box[1]
+                    and box[3] <= y_frame_bottom
+                )
+                if in_frame and not any(_bbox_overlaps(box, placed, gap) for placed in label_boxes):
+                    label_boxes.append(box)
+                    fp_refs_drawn += 1
+                    drawn = True
+                    break
+                artist.remove()
+            if not drawn:
+                fp_refs_skipped.append(ref)
+    else:
+        fp_refs_drawn = 0
+        fp_refs_skipped: list[str] = []
+
+    return pad_labels_drawn, label_collisions, label_skipped, fp_refs_drawn, fp_refs_skipped
 
 
 def _validate_region(region: list[float] | None) -> tuple[float, float, float, float] | None:
@@ -1281,6 +1443,8 @@ def render_board(
     label_scale: float = 1.0,
     region: list[float] | None = None,
     include_pad_coords: bool = False,
+    label_format: str = "number",
+    show_footprint_refs: bool = True,
 ) -> tuple[list[str], bytes, dict[str, Any]]:
     """Render a board to (report_lines, png_bytes, report_dict).
 
@@ -1292,11 +1456,15 @@ def render_board(
     are in mm units, so a higher dpi gives a sharper image of the same
     layout).  Defaults to 200.
 
-    ``show_pad_labels``: draw a ``ref.number`` label beside every pad
-    (default on — needed for visual-model workflows that name pads; pass
-    False for a clean image).  A label that would collide with an
-    already-placed one is skipped; the skipped count and refs are reported
-    as ``label_collisions`` / ``label_skipped``.
+    ``show_pad_labels``: draw a pad label beside every pad (default on —
+    needed for visual-model workflows that name pads; pass False for a
+    clean image).  A label that would collide with an already-placed one
+    is skipped; the skipped count and refs are reported as
+    ``label_collisions`` / ``label_skipped``.
+
+    ``label_format``: pad label text — ``"number"`` (default) draws just
+    the pad number (``"10"``); ``"ref.number"`` draws ``REF.PAD``
+    (``"U11.10"``) like the pre-#152 renderer.
 
     ``label_scale``: scale the pad-label glyph size and offset (1.0 = the
     default 0.4 mm glyphs); pass < 1.0 to fit smaller labels on dense
@@ -1309,9 +1477,19 @@ def render_board(
     so a region still renders >= 1600 px wide (full-board sharpness).
 
     ``include_pad_coords``: also report machine-usable pad coordinates
-    ``pads_coords`` (ref, number, net, center [x, y] mm, layer — the
-    topmost copper layer, filtered to ``layer`` when one is given) so a
+    ``pads_coords`` (ref, number, net, center [x, y] mm, layer) so a
     caller can verify "what I see == what the tools will operate on".
+    Pads outside the rendered frame (``region``) or the rendered layer are
+    excluded, and ``layer`` is the copper layer the pad is shown on in
+    this image (the render layer in single-layer views, else the pad's
+    topmost copper layer).
+
+    ``show_footprint_refs``: draw one reference label per footprint (e.g.
+    ``U11``, silk-gray and larger than pad labels) above the footprint —
+    but only when its silkscreen reference text is not already rendered in
+    this view, so full-board renders never double-print a reference.
+    Overlapping refs are skipped; skipped refs are reported as
+    ``footprint_refs_skipped``.
 
     connect_pads: optional list of ``ref.pad`` specs (e.g. ``["J1.2", "J2.2"]``)
     to draw ratsnest lines for — green, only for nets that are not yet routed.
@@ -1365,8 +1543,20 @@ def render_board(
         region_bbox = _bounds(board, ratsnest)
     xmin, ymin, xmax, ymax = region_bbox
     fig, ax, eff_dpi, mm_per_px = _new_board_figure(xmin, ymin, xmax, ymax, dpi)
-    pad_labels, label_collisions, label_skipped = _draw_board_layers(
-        ax, board, layer=layer, show_pad_labels=show_pad_labels, label_scale=label_scale
+    (
+        pad_labels,
+        label_collisions,
+        label_skipped,
+        fp_refs_drawn,
+        fp_refs_skipped,
+    ) = _draw_board_layers(
+        ax,
+        board,
+        layer=layer,
+        show_pad_labels=show_pad_labels,
+        label_scale=label_scale,
+        label_format=label_format,
+        show_footprint_refs=show_footprint_refs,
     )
 
     # 7. Ratsnest on top; in a single-layer render only edges touching that
@@ -1405,6 +1595,8 @@ def render_board(
         "pad_labels": pad_labels,
         "label_collisions": label_collisions,
         "label_skipped": label_skipped,
+        "footprint_refs": fp_refs_drawn,
+        "footprint_refs_skipped": fp_refs_skipped,
         "region_bbox": list(region_bbox),
         "copper_layers": board.copper_layers,
         "connect_pads_requested": len(connect_pads or []),
@@ -1413,13 +1605,17 @@ def render_board(
         "routed_nets": routed_reported,
     }
     if include_pad_coords:
-        # Board-mm pad centers (KiCad +Y down); "layer" is the topmost
-        # copper layer the renderer paints, and pads are filtered to the
-        # rendered ``layer`` when one is requested so the coords describe
-        # exactly what the image shows.
+        # Board-mm pad centers (KiCad +Y down) restricted to what the image
+        # actually shows: pads outside the rendered frame (region_bbox) or
+        # outside the rendered ``layer`` are excluded, and ``layer`` names
+        # the copper layer the pad is shown on in this image (the render
+        # layer in single-layer views, else the pad's topmost copper layer).
         pads_coords: list[dict[str, Any]] = []
+        rx_min, ry_min, rx_max, ry_max = region_bbox
         for p in board.pads:
             if layer is not None and layer not in p.copper_layers:
+                continue
+            if not (rx_min <= p.center[0] <= rx_max and ry_min <= p.center[1] <= ry_max):
                 continue
             pads_coords.append(
                 {
@@ -1427,7 +1623,9 @@ def render_board(
                     "number": p.number,
                     "net": p.net,
                     "center": [p.center[0], p.center[1]],
-                    "layer": p.copper_layers[0] if p.copper_layers else None,
+                    "layer": layer
+                    if layer is not None
+                    else (p.copper_layers[0] if p.copper_layers else None),
                 }
             )
         report["pads_coords"] = pads_coords
@@ -1440,6 +1638,8 @@ def render_board(
             f"pad labels: skipped {label_collisions} overlapping label(s) "
             f"({', '.join(label_skipped)})."
         )
+    if fp_refs_skipped:
+        lines.append(f"footprint refs: skipped {', '.join(fp_refs_skipped)} (overlapping).")
     if connect_pads:
         lines.append(
             f"connect_pads: missing={missing or 'none'}; "
@@ -1462,6 +1662,8 @@ def register_render_board_tools(mcp: FastMCP) -> None:
         label_scale: float = 1.0,
         region: list[float] | None = None,
         include_pad_coords: bool = False,
+        label_format: str = "number",
+        show_footprint_refs: bool = True,
         ctx: Context | None = None,
     ) -> tuple[str, Image]:
         """Render a KiCad PCB to a PNG image (no kicad-cli needed).
@@ -1469,9 +1671,10 @@ def register_render_board_tools(mcp: FastMCP) -> None:
         By default the composite shows all copper layers stacked in physical
         order (F.Cu red on top, B.Cu blue below), courtyards, the board edge
         and reference silkscreen on a dark KiCad-style background.  Each pad
-        also gets a ``REF.PAD`` label (e.g. ``R5.1``) so a visual model can
+        also gets a short ``PAD`` label (e.g. ``10``) so a visual model can
         name the pads it wants to route — pass ``show_pad_labels=False`` for
-        a clean image.  In dense areas overlapping labels are skipped and
+        a clean image, or ``label_format="ref.number"`` for ``REF.PAD``
+        labels.  In dense areas overlapping labels are skipped and
         reported (``label_collisions`` / ``label_skipped``) instead of
         smearing into an unreadable band.
 
@@ -1488,7 +1691,9 @@ def register_render_board_tools(mcp: FastMCP) -> None:
         sharpness — use it to read a dense pad row or inspect short traces.
         ``include_pad_coords=True`` returns machine-usable pad coordinates
         (``pads_coords``) in board mm so the model can act on exactly what
-        it sees.
+        it sees.  ``show_footprint_refs`` draws one reference label per
+        footprint (e.g. ``U11``) when its silkscreen reference is not
+        already visible in the view.
 
         Args:
             pcb_path: Path to the .kicad_pcb file.
@@ -1497,15 +1702,21 @@ def register_render_board_tools(mcp: FastMCP) -> None:
                 are drawn as green ratsnest.
             output_dir: Optional directory to write the PNG to.
             layer: Optional copper layer name for a single-layer render.
-            show_pad_labels: Draw a ``REF.PAD`` label beside every pad
-                (default True; overlapping labels in dense areas are
-                skipped and counted in the report).
+            show_pad_labels: Draw a pad label beside every pad (default
+                True; overlapping labels in dense areas are skipped and
+                counted in the report).
             label_scale: Scale factor for pad-label glyph size and offset
                 (default 1.0 = 0.4 mm glyphs); use < 1.0 on dense boards.
             region: Optional zoom box [x_min, y_min, x_max, y_max] in board
                 mm (KiCad +Y down); rendered frame equals this box.
             include_pad_coords: Include ``pads_coords`` (ref, number, net,
-                center, layer) in the report (default False).
+                center, layer) in the report (default False).  Only pads
+                inside the rendered frame/layer are listed.
+            label_format: Pad label text — ``"number"`` (default) or
+                ``"ref.number"``.
+            show_footprint_refs: Draw one reference label per footprint
+                when its silkscreen reference text is not already visible
+                (default True).
             ctx: FastMCP context for progress reporting.
 
         Returns:
@@ -1519,6 +1730,8 @@ def register_render_board_tools(mcp: FastMCP) -> None:
             label_scale=label_scale,
             region=region,
             include_pad_coords=include_pad_coords,
+            label_format=label_format,
+            show_footprint_refs=show_footprint_refs,
         )
         if output_dir:
             os.makedirs(output_dir, exist_ok=True)
