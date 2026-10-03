@@ -524,12 +524,20 @@ def _parse_shape(shape: list, fp: tuple[float, float, float]) -> dict | None:
     start = _node_coord(shape, "start")
     end = _node_coord(shape, "end")
     mid = _node_coord(shape, "mid")
+    center = _node_coord(shape, "center")
     if start:
         entry["start"] = _wpt(fp, start[0], start[1])
     if end:
         entry["end"] = _wpt(fp, end[0], end[1])
     if mid:
         entry["mid"] = _wpt(fp, mid[0], mid[1])
+    if center:
+        entry["center"] = _wpt(fp, center[0], center[1])
+    if kind in ("fp_circle", "gr_circle"):
+        if "center" in entry and "start" not in entry:
+            entry["start"] = entry["center"]
+        elif "start" in entry and "center" not in entry:
+            entry["center"] = entry["start"]
     if kind in ("fp_poly", "gr_poly"):
         pts = []
         for sub in shape:
@@ -820,6 +828,14 @@ def _bounds(
         xs += [seg["start"][0], seg["end"][0]]
         ys += [seg["start"][1], seg["end"][1]]
     for e in board.edges:
+        if "center" in e:
+            c = e["center"]
+            xs.append(c[0])
+            ys.append(c[1])
+            if "end" in e:
+                r = math.hypot(e["end"][0] - c[0], e["end"][1] - c[1])
+                xs.extend([c[0] - r, c[0] + r])
+                ys.extend([c[1] - r, c[1] + r])
         if "start" in e:
             xs.append(e["start"][0])
             ys.append(e["start"][1])
@@ -847,44 +863,50 @@ def _bounds(
 
 def _draw_shape(ax, entry: dict, color: str, lw: float, alpha: float, zorder: int) -> None:
     """Draw a shape entry (already in world coordinates)."""
-    kind = entry["kind"]
+    kind = entry.get("kind")
     if kind in ("fp_line", "gr_line"):
-        ax.plot(
-            [entry["start"][0], entry["end"][0]],
-            [entry["start"][1], entry["end"][1]],
-            color=color,
-            linewidth=lw,
-            alpha=alpha,
-            zorder=zorder,
-        )
+        s, e = entry.get("start"), entry.get("end")
+        if s is not None and e is not None:
+            ax.plot(
+                [s[0], e[0]],
+                [s[1], e[1]],
+                color=color,
+                linewidth=lw,
+                alpha=alpha,
+                zorder=zorder,
+            )
     elif kind in ("fp_rect", "gr_rect"):
-        s, e = entry["start"], entry["end"]
-        ax.add_patch(
-            mpatches.Rectangle(
-                s,
-                e[0] - s[0],
-                e[1] - s[1],
-                fill=False,
-                edgecolor=color,
-                linewidth=lw,
-                alpha=alpha,
-                zorder=zorder,
+        s, e = entry.get("start"), entry.get("end")
+        if s is not None and e is not None:
+            ax.add_patch(
+                mpatches.Rectangle(
+                    s,
+                    e[0] - s[0],
+                    e[1] - s[1],
+                    fill=False,
+                    edgecolor=color,
+                    linewidth=lw,
+                    alpha=alpha,
+                    zorder=zorder,
+                )
             )
-        )
     elif kind in ("fp_circle", "gr_circle"):
-        c = entry["start"]
-        e = entry["end"]
-        ax.add_patch(
-            mpatches.Circle(
-                c,
-                math.hypot(e[0] - c[0], e[1] - c[1]),
-                fill=False,
-                edgecolor=color,
-                linewidth=lw,
-                alpha=alpha,
-                zorder=zorder,
-            )
-        )
+        c = entry.get("center") or entry.get("start")
+        e = entry.get("end")
+        if c is not None and e is not None:
+            r = math.hypot(e[0] - c[0], e[1] - c[1])
+            if r > 0:
+                ax.add_patch(
+                    mpatches.Circle(
+                        c,
+                        r,
+                        fill=False,
+                        edgecolor=color,
+                        linewidth=lw,
+                        alpha=alpha,
+                        zorder=zorder,
+                    )
+                )
     elif kind in ("fp_poly", "gr_poly"):
         pts = entry.get("pts", [])
         if len(pts) >= 2:
@@ -905,7 +927,9 @@ def _draw_shape(ax, entry: dict, color: str, lw: float, alpha: float, zorder: in
 
 def _draw_arc(ax, entry: dict, color: str, lw: float, alpha: float, zorder: int) -> None:
     """Draw a KiCad arc (start/mid/end on the circle) as sampled polyline."""
-    s, m, e = entry["start"], entry["mid"], entry["end"]
+    s, m, e = entry.get("start"), entry.get("mid"), entry.get("end")
+    if s is None or m is None or e is None:
+        return
     (x1, y1), (x2, y2), (x3, y3) = s, m, e
     d = 2 * (x1 * (y2 - y3) + x2 * (y3 - y1) + x3 * (y1 - y2))
     if abs(d) < 1e-12:
