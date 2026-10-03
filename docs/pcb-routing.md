@@ -12,10 +12,18 @@ await pcb_route_pad_to_pad(
     ref_a="R1", pad_a="2",
     ref_b="C1", pad_b="2",
     net="VCC",
-    layer="F.Cu",        # optional, default "F.Cu"
-    width=0.5,           # optional; uses netclass track width if omitted
+    width=0.5,                      # optional; uses netclass track width if omitted
+    options={"layer_hint": "F.Cu"}, # optional; preferred layer for thru-hole pads
 )
 ```
+
+Interface v3: the VLM control knobs — ``waypoints``, ``dry_run``,
+``strategy`` — are top-level parameters (defaults ``None`` / ``False`` /
+``"shove"``); board-stable config and rare tweaks (``layer_hint``,
+``corner_mode``, ``via_pairs``, ``turn_penalty``) bundle into
+``options``.  ``strategy`` accepts exactly ``"shove"`` (default) or
+``"walkaround"``; ``"auto"`` was removed 2026-09-27 (it was identical
+to ``"shove"``).
 
 The router walks the pad-exit points of `R1.2` and `C1.2` and A*'s a
 visibility graph over the obstacle-free regions.  The track is added
@@ -49,14 +57,15 @@ await pcb_route_pad_to_pad(
     ref_a="R1", pad_a="2",
     ref_b="U1", pad_b="5",
     net="VCC",
-    via_pairs=(("F.Cu", "B.Cu"), ("B.Cu", "In1.Cu")),
+    options={"via_pairs": (("F.Cu", "B.Cu"), ("B.Cu", "In1.Cu"))},
 )
 ```
 
 Layer selection is automatic: SMD/connect pads use their fixed layer;
-thru-hole pads (`*.Cu`) pick a shared copper layer, preferring
-`layer_hint` when it is valid.  When both pads are thru-hole and share
-a layer, the route stays on a single layer (no vias).
+thru-hole pads (`*.Cu`) pick a shared copper layer, preferring the
+`options["layer_hint"]` value when it is valid.  When both pads are
+thru-hole and share a layer, the route stays on a single layer (no
+vias).
 
 ### Response shape
 

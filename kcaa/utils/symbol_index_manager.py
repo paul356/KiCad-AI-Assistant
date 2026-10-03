@@ -412,7 +412,7 @@ class SymbolIndexManager:
             return []
         elements = library_file.symbol
         # Could be a single ParsedValue, a plain list, or an ElementCollection.
-        if isinstance(elements, (list, skip.collection.ElementCollection)):
+        if isinstance(elements, (list | skip.collection.ElementCollection)):
             return elements
         return [elements]
 

@@ -200,9 +200,19 @@ class TestRoutingTool:
 
     def _call_tool(self, mcp, name: str, **kwargs):
         import asyncio
+        import json
 
         tool = asyncio.run(mcp.get_tool(name))
-        return asyncio.run(tool.fn(**kwargs))
+        raw = asyncio.run(tool.fn(**kwargs))
+        # Routing tools return an MCP ``(text, Image)`` content pair; the
+        # text block carries the JSON payload (same convention as
+        # ``export_pcb_layer_image``).  Via/other tools still return a
+        # plain dict payload.
+        if isinstance(raw, dict):
+            return raw
+        if isinstance(raw, tuple):
+            raw = raw[0]
+        return json.loads(raw)
 
     def test_tool_writes_segments_to_pcb(self, pcb_copy):
         mcp = self._make_mcp()
@@ -488,7 +498,7 @@ class TestRoutingTool:
             pad_b="1",
             net="GND",
             ctx=None,
-            via_pairs=(("F.Cu", "B.Cu"), ("B.Cu", "In1.Cu")),
+            options={"via_pairs": (("F.Cu", "B.Cu"), ("B.Cu", "In1.Cu"))},
         )
         assert "segment_count" in result
         assert result["segment_count"] >= 1
@@ -496,8 +506,8 @@ class TestRoutingTool:
         assert "In1.Cu" in result["layers_used"]
 
     def test_single_layer_tool_smd_pads(self, pcb_copy):
-        # R1.1 and C1.1 are both SMD on F.Cu.  layer_hint="B.Cu" is
-        # ignored for SMD pads — route stays on F.Cu.
+        # R1.1 and C1.1 are both SMD on F.Cu.  options layer_hint="B.Cu"
+        # is ignored for SMD pads — route stays on F.Cu.
         mcp = self._make_mcp()
         result = self._call_tool(
             mcp,
@@ -510,7 +520,7 @@ class TestRoutingTool:
             net="VCC",
             ctx=None,
             width=0.25,
-            layer_hint="B.Cu",
+            options={"layer_hint": "B.Cu"},
         )
         assert "segment_count" in result
         assert result["via_count"] == 0

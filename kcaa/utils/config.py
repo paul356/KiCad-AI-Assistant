@@ -610,6 +610,26 @@ class ServerConfig:
 
 
 # ---------------------------------------------------------------------------
+# Module-level vision capability
+# ---------------------------------------------------------------------------
+
+
+def model_supports_vision() -> bool:
+    """Whether the MCP server should attach image blocks to tool results.
+
+    The KiCad plugin is the only caller that knows the model: it passes
+    ``KICAD_MCP_SUPPORTS_VISION=1|0`` when spawning the server (see
+    ``server_manager._build_env``).  Absent (standalone MCP clients such
+    as Claude Desktop) defaults to *True* so vision-capable clients keep
+    receiving rendered images; a text-only model must set it to ``0`` to
+    suppress image data at the source instead of paying the render +
+    payload cost client-side stripping.
+    """
+    raw = os.environ.get("KICAD_MCP_SUPPORTS_VISION", "1").strip().lower()
+    return raw not in ("", "0", "false", "no", "off")
+
+
+# ---------------------------------------------------------------------------
 # Module-level singleton instance
 # ---------------------------------------------------------------------------
 

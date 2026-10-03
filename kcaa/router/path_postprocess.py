@@ -59,6 +59,23 @@ class OutputSegment:
 
 
 @dataclass
+class OutputArc:
+    """A single track arc in KiCad's 3-point form (start/mid/end).
+
+    Mirrors ``(arc (start X Y) (mid X Y) (end X Y) (width W)
+    (layer L) (net N))``; ``mid`` is any point the arc passes through
+    (not the center).
+    """
+
+    start: tuple[float, float]
+    mid: tuple[float, float]
+    end: tuple[float, float]
+    width: float
+    layer: str
+    net: str
+
+
+@dataclass
 class OutputVia:
     """A single via ready to be emitted as a S-expression node."""
 
@@ -260,6 +277,24 @@ def emit_segment_nodes(segments: list[OutputSegment]) -> list[list[Any]]:
                 [sexpdata.Symbol("width"), s.width],
                 [sexpdata.Symbol("layer"), s.layer],
                 [sexpdata.Symbol("net"), s.net],
+            ]
+        )
+    return nodes
+
+
+def emit_arc_nodes(arcs: list[OutputArc]) -> list[list[Any]]:
+    """Convert a list of :class:`OutputArc` into raw ``arc`` sexp nodes."""
+    nodes: list[list[Any]] = []
+    for a in arcs:
+        nodes.append(
+            [
+                sexpdata.Symbol("arc"),
+                [sexpdata.Symbol("start"), a.start[0], a.start[1]],
+                [sexpdata.Symbol("mid"), a.mid[0], a.mid[1]],
+                [sexpdata.Symbol("end"), a.end[0], a.end[1]],
+                [sexpdata.Symbol("width"), a.width],
+                [sexpdata.Symbol("layer"), a.layer],
+                [sexpdata.Symbol("net"), a.net],
             ]
         )
     return nodes
