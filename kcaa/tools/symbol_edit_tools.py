@@ -1227,7 +1227,10 @@ def _build_lib_symbol_raw(
     * ``direction=down``  → pins face the body's bottom edge, angle 90
 
     Pins on the same side are spaced 2.54 mm (100 mil) apart, centred on the
-    body, in the order they appear in *pins*.  Each pin is 2.54 mm long with
+    body, in counter-clockwise order: reading the side from the top (left
+    side) or the right (up side) downward/leftward — first pin topmost on
+    ``left``, bottommost on ``right``, rightmost on ``up``, leftmost on
+    ``down`` (KiCad DIP convention).  Each pin is 2.54 mm long with
     its inner end exactly on the body edge and the electrical (connection)
     end pointing outward.  Body size defaults to 6.35 mm wide with the height
     derived from the pin span; explicit *body_width* / *body_height* are used
@@ -1254,12 +1257,13 @@ def _build_lib_symbol_raw(
     # Horizontal pins (left/right) stick out along X, so the body height must
     # cover their Y span; vertical pins (up/down) stick out along Y, so the
     # body width must cover their X span.  Per-side arrays preserve the
-    # caller's pin order: the first pin sits at the most positive offset —
-    # topmost for left/right sides, rightmost for up/down sides.
+    # caller's pin order in counter-clockwise direction: the first pin sits
+    # topmost on the left side, bottommost on the right side, rightmost on
+    # the up side, and leftmost on the down side (KiCad DIP convention).
     left_y = _side_offsets(len(per_side["left"]))
-    right_y = _side_offsets(len(per_side["right"]))
+    right_y = _side_offsets(len(per_side["right"]))[::-1]
     up_x = _side_offsets(len(per_side["up"]))
-    down_x = _side_offsets(len(per_side["down"]))
+    down_x = _side_offsets(len(per_side["down"]))[::-1]
     req_h_span = 0.0
     for side_offsets in (left_y, right_y):
         req_h_span = max(req_h_span, max((abs(v) for v in side_offsets), default=0.0))

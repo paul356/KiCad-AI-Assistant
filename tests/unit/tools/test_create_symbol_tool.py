@@ -292,6 +292,42 @@ class TestLibSymbolLayout:
                 v = px
             assert abs(v / 1.27 - round(v / 1.27)) < 1e-6, (px, py)
 
+    def test_pin_order_counter_clockwise(self):
+        # CCW order: left top->down, down left->right, right bottom->up,
+        # up right->left.  Pin numbers in `pins` order must map accordingly.
+        pins = [
+            {"number": "1", "name": "L1", "type": "input", "direction": "left"},
+            {"number": "2", "name": "L2", "type": "input", "direction": "left"},
+            {"number": "3", "name": "D1", "type": "input", "direction": "down"},
+            {"number": "4", "name": "D2", "type": "input", "direction": "down"},
+            {"number": "5", "name": "R1", "type": "output", "direction": "right"},
+            {"number": "6", "name": "R2", "type": "output", "direction": "right"},
+            {"number": "7", "name": "U1", "type": "output", "direction": "up"},
+            {"number": "8", "name": "U2", "type": "output", "direction": "up"},
+        ]
+        raw, warnings = _build_lib_symbol_raw("MYOP", pins, "U", "MYOP")
+        assert warnings == []
+        nodes = _pin_nodes(raw)
+        node_at = {}
+        for node in nodes:
+            num = None
+            at = None
+            for child in node:
+                if isinstance(child, list) and child and isinstance(child[0], sexpdata.Symbol):
+                    if child[0].value() == "number":
+                        num = child[1]
+                    elif child[0].value() == "at":
+                        at = (float(child[1]), float(child[2]))
+            node_at[num] = at
+        l1, l2 = node_at["1"], node_at["2"]  # left: topmost first
+        assert l1[1] > l2[1]
+        d1, d2 = node_at["3"], node_at["4"]  # down: leftmost first
+        assert d1[0] < d2[0]
+        r1, r2 = node_at["5"], node_at["6"]  # right: bottommost first
+        assert r1[1] < r2[1]
+        u1, u2 = node_at["7"], node_at["8"]  # up: rightmost first
+        assert u1[0] > u2[0]
+
     def test_inner_ends_land_on_body_edge(self):
         raw, _ = _build_lib_symbol_raw("MYOP", PINS_2IN_1OUT, "U", "MYOP")
         min_x, max_y, max_x, min_y = _rect_bounds(raw)
