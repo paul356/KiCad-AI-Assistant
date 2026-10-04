@@ -14,6 +14,8 @@ import math
 import os
 import struct
 
+import matplotlib.colors as mcolors
+import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
 import pytest
 
@@ -21,8 +23,11 @@ FIXTURE_DIR = os.path.join(os.path.dirname(__file__), "fixtures")
 BOARD_FIXTURE = os.path.join(FIXTURE_DIR, "test_board.kicad_pcb")
 
 from kcaa.tools.render_board_tools import (  # noqa: E402
+    _BG_COLOR,
     BoardData,
+    _board_outline,
     _bounds,
+    _draw_board_layers,
     _draw_shape,
     _parse_shape,
     parse_board,
@@ -316,6 +321,103 @@ def _silk_ref_board_path(tmp_path) -> str:
     with open(path, "w") as f:
         f.write("\n".join(lines) + "\n")
     return str(path)
+
+
+def _cutout_board_path(tmp_path) -> str:
+    """Board with a rect outline (gr_line chain), an internal gr_rect
+    opening, a footprint-level fp_rect opening (LED window), plus a corner
+    gr_circle sitting exactly on the outline corner (a rounding, not a
+    hole) — the fixture for Edge.Cuts cutout rendering.
+    """
+    lines = [
+        "(kicad_pcb",
+        "\t(version 20260206)",
+        '\t(generator "pcbnew")',
+        '\t(generator_version "10.0")',
+        "\t(general",
+        "\t\t(thickness 1.6)",
+        "\t)",
+        '\t(paper "A4")',
+        "\t(layers",
+        '\t\t(0 "F.Cu" signal)',
+        '\t\t(31 "B.Cu" signal)',
+        '\t\t(44 "Edge.Cuts" user)',
+        "\t)",
+        # Outer outline: 100 x 60 mm rectangle.
+        '\t(gr_line (start 0 0) (end 100 0) (stroke (width 0.1) (type solid)) (layer "Edge.Cuts"))',
+        '\t(gr_line (start 100 0) (end 100 60) (stroke (width 0.1) (type solid)) (layer "Edge.Cuts"))',
+        '\t(gr_line (start 100 60) (end 0 60) (stroke (width 0.1) (type solid)) (layer "Edge.Cuts"))',
+        '\t(gr_line (start 0 60) (end 0 0) (stroke (width 0.1) (type solid)) (layer "Edge.Cuts"))',
+        # Corner rounding circle: center on the outline corner.
+        '\t(gr_circle (center 0 0) (end 5 0) (stroke (width 0.1) (type solid)) (layer "Edge.Cuts"))',
+        # Internal rectangular opening.
+        '\t(gr_rect (start 40 20) (end 50 30) (stroke (width 0.1) (type solid)) (layer "Edge.Cuts"))',
+        # Internal circular opening.
+        '\t(gr_circle (center 80 50) (end 83 50) (stroke (width 0.1) (type solid)) (layer "Edge.Cuts"))',
+        # Footprint-level rectangular opening (Smart LED window).
+        '\t(footprint "Test:LED"',
+        '\t\t(layer "F.Cu")',
+        '\t\t(uuid "00000000-0000-0000-0000-0000000000a1")',
+        "\t\t(at 70 40 0)",
+        '\t\t(fp_rect (start -3 -2) (end 3 2) (stroke (width 0.1) (type solid)) (layer "Edge.Cuts"))',
+        "\t)",
+        ")",
+    ]
+    path = tmp_path / "cutout.kicad_pcb"
+    with open(path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    return str(path)
+
+
+class TestEdgeCutoutHoles:
+    """Edge.Cuts internal openings render as background-colored holes."""
+
+    @pytest.fixture
+    def board(self, tmp_path):
+        return parse_board(_cutout_board_path(tmp_path))
+
+    def _bg_filled(self, ax):
+        bg = mcolors.to_rgba(_BG_COLOR)
+        return [p for p in ax.patches if p.get_fill() and p.get_facecolor() == bg]
+
+    def test_outline_recovered_with_cutouts(self, board):
+        # gr_circle/gr_rect among the edges must not break outline recovery.
+        outline = _board_outline(board)
+        assert outline is not None
+        xs = [p[0] for p in outline]
+        ys = [p[1] for p in outline]
+        assert min(xs) == 0.0 and max(xs) == 100.0
+        assert min(ys) == 0.0 and max(ys) == 60.0
+
+    def test_internal_rects_filled_with_background(self, board):
+        fig, ax = plt.subplots()
+        _draw_board_layers(ax, board)
+        rects = [p for p in self._bg_filled(ax) if isinstance(p, mpatches.Rectangle)]
+        # gr_rect (40,20)-(50,30) and fp_rect (67,38)-(73,42) both filled.
+        assert len(rects) == 2
+        xys = sorted((p.get_xy()[0], p.get_xy()[1]) for p in rects)
+        assert xys == [(40.0, 20.0), (67.0, 38.0)]
+        plt.close(fig)
+
+    def test_internal_circle_filled_with_background(self, board):
+        fig, ax = plt.subplots()
+        _draw_board_layers(ax, board)
+        fills = [p for p in self._bg_filled(ax) if isinstance(p, mpatches.Circle)]
+        assert len(fills) == 1
+        assert fills[0].center == (80.0, 50.0)
+        plt.close(fig)
+
+    def test_outline_corner_circle_not_filled(self, board):
+        fig, ax = plt.subplots()
+        _draw_board_layers(ax, board)
+        corner = [
+            p for p in ax.patches if isinstance(p, mpatches.Circle) and p.center == (0.0, 0.0)
+        ]
+        assert len(corner) == 1
+        assert not corner[0].get_fill()  # ring only — no hole on the outline
+        filled_circles = [p for p in self._bg_filled(ax) if isinstance(p, mpatches.Circle)]
+        assert all(p.center != (0.0, 0.0) for p in filled_circles)
+        plt.close(fig)
 
 
 class TestRenderBoardBaseline:

@@ -154,19 +154,59 @@ def _arc_points(start: tuple, mid: tuple, end: tuple, n: int = 32) -> list[tuple
     ]
 
 
+_CLOSED_EDGE_KINDS = ("fp_rect", "gr_rect", "fp_circle", "gr_circle", "fp_poly", "gr_poly")
+
+
+def _closed_shape_polygon(entry: dict) -> list[tuple[float, float]] | None:
+    """Closed polygon of an Edge.Cuts shape (rect/circle/poly), or None."""
+    kind = entry.get("kind")
+    if kind in ("fp_rect", "gr_rect"):
+        s, e = entry.get("start"), entry.get("end")
+        if s is None or e is None:
+            return None
+        x0, y0 = s
+        x1, y1 = e
+        return [(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)]
+    if kind in ("fp_circle", "gr_circle"):
+        c = entry.get("center")
+        e = entry.get("end")
+        if c is None or e is None:
+            return None
+        r = math.hypot(e[0] - c[0], e[1] - c[1])
+        if r <= 0:
+            return None
+        return [
+            (c[0] + r * math.cos(2 * math.pi * i / 48), c[1] + r * math.sin(2 * math.pi * i / 48))
+            for i in range(49)
+        ]
+    if kind in ("fp_poly", "gr_poly"):
+        pts = entry.get("pts", [])
+        if len(pts) < 3:
+            return None
+        return list(pts) + [pts[0]]
+    return None
+
+
 def _board_outline(board) -> list[tuple[float, float]] | None:
-    """Closed outline of the board from Edge.Cuts, or None if not closed."""
+    """Closed outline of the board from Edge.Cuts, or None if not closed.
+
+    Closed shapes (rect/circle/poly) never belong to the outline segment
+    chain — they are cutouts, or the whole outline when the board edge is
+    a single shape (e.g. a gr_rect from set_board_outline_rect).
+    """
     segs: list[list[tuple[float, float]]] = []
+    closed: list[dict] = []
     for e in board.edges:
         kind = e.get("kind")
         if kind == "gr_line":
             segs.append([e["start"], e["end"]])
         elif kind == "gr_arc":
             segs.append(_arc_points(e["start"], e["mid"], e["end"]))
-        elif kind in ("gr_rect", "gr_circle", "gr_poly"):
-            # Not a simple segment chain; skip — outline clipping is best effort.
-            return None
+        elif kind in _CLOSED_EDGE_KINDS:
+            closed.append(e)
     if not segs:
+        if len(closed) == 1:
+            return _closed_shape_polygon(closed[0])
         return None
     pts = list(segs[0])
     remaining = segs[1:]
@@ -200,6 +240,96 @@ def _clip_patch(ax, outline: list[tuple[float, float]]):
     patch = mpatches.PathPatch(path, transform=ax.transData, facecolor="none", edgecolor="none")
     ax.add_patch(patch)
     return patch
+
+
+def _closed_shape_centroid(entry: dict) -> tuple[float, float] | None:
+    """Centroid of a closed Edge.Cuts shape — the point tested against the
+    board outline to decide whether the shape is an internal opening."""
+    kind = entry.get("kind")
+    if kind in ("fp_rect", "gr_rect"):
+        s, e = entry.get("start"), entry.get("end")
+        if s is None or e is None:
+            return None
+        return ((s[0] + e[0]) / 2, (s[1] + e[1]) / 2)
+    if kind in ("fp_circle", "gr_circle"):
+        return entry.get("center")
+    if kind in ("fp_poly", "gr_poly"):
+        pts = entry.get("pts", [])
+        if not pts:
+            return None
+        return (sum(p[0] for p in pts) / len(pts), sum(p[1] for p in pts) / len(pts))
+    return None
+
+
+def _point_in_polygon(pt: tuple[float, float], poly: list[tuple[float, float]]) -> bool:
+    """Strict point-in-polygon by ray casting (outline in board mm).
+
+    A point on the outline itself is NOT inside: shapes that sit on the
+    board boundary (corner roundings, edge notches) are part of the outer
+    edge and must not be painted as holes.
+    """
+    x, y = pt
+    n = len(poly)
+    # Reject points essentially on the boundary (well below any rendered
+    # pixel size) before ray casting, which is ambiguous on the outline.
+    eps = 1e-6
+    for i in range(n):
+        x1, y1 = poly[i]
+        x2, y2 = poly[(i + 1) % n]
+        dx, dy = x2 - x1, y2 - y1
+        denom = math.hypot(dx, dy)
+        if denom == 0:
+            continue
+        dist = abs(dx * (y1 - y) - dy * (x1 - x)) / denom
+        if dist < eps:
+            return False
+    inside = False
+    for i in range(n):
+        x1, y1 = poly[i]
+        x2, y2 = poly[(i + 1) % n]
+        if (y1 > y) != (y2 > y) and x < (x2 - x1) * (y - y1) / (y2 - y1) + x1:
+            inside = not inside
+    return inside
+
+
+def _edge_cutout_fill(ax: Any, entry: dict, outline: list[tuple[float, float]] | None) -> None:
+    """Paint an internal Edge.Cuts opening as a hole: background-colored
+    fill over whatever copper sits beneath, mirroring thru-hole drill
+    openings.  The yellow edge ring is drawn separately by the outline
+    pass, so the two never overlap.
+    """
+    if outline is None:
+        return
+    centroid = _closed_shape_centroid(entry)
+    if centroid is None or not _point_in_polygon(centroid, outline):
+        return
+    kind = entry.get("kind")
+    if kind in ("fp_rect", "gr_rect"):
+        s, e = entry.get("start"), entry.get("end")
+        if s is None or e is None:
+            return
+        patch = mpatches.Rectangle(
+            s, e[0] - s[0], e[1] - s[1], facecolor=_BG_COLOR, edgecolor="none", zorder=_Z_VIA
+        )
+    elif kind in ("fp_circle", "gr_circle"):
+        c = entry.get("center") or entry.get("start")
+        e = entry.get("end")
+        if c is None or e is None:
+            return
+        r = math.hypot(e[0] - c[0], e[1] - c[1])
+        if r <= 0:
+            return
+        patch = mpatches.Circle(c, r, facecolor=_BG_COLOR, edgecolor="none", zorder=_Z_VIA)
+    elif kind in ("fp_poly", "gr_poly"):
+        pts = entry.get("pts", [])
+        if len(pts) < 3:
+            return
+        patch = mpatches.Polygon(
+            pts, closed=True, facecolor=_BG_COLOR, edgecolor="none", zorder=_Z_VIA
+        )
+    else:
+        return
+    ax.add_patch(patch)
 
 
 def _is_courtyard(layer: str) -> bool:
@@ -1303,8 +1433,14 @@ def _draw_board_layers(
                 )
             )
 
-    # 5. Board edge (Edge.Cuts).
+    # 5. Board edge (Edge.Cuts).  Internal closed openings (LED windows,
+    # sensor apertures, cutouts) render as holes: a background-colored
+    # fill under the yellow ring, like a thru-hole drill opening.  Shapes
+    # that sit on the board outline itself (corner roundings, edge
+    # notches) are part of the boundary and stay as pure outlines.
     for e in board.edges:
+        if e.get("kind") in _CLOSED_EDGE_KINDS:
+            _edge_cutout_fill(ax, e, outline)
         _draw_shape(ax, e, _layer_color("Edge.Cuts"), 1.0, 1.0, _Z_EDGE)
 
     # 6. Silkscreen text (top of the visual stack), only on its own side.
