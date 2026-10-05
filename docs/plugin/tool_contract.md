@@ -260,7 +260,7 @@ The `lib_id` is `<library>:<symbol_name>`. Calling with a `symbol_name` that alr
 
 **Key parameters:**
 - `schematic_path` (`str`) — absolute path to the source `.kicad_sch`.
-- `symbols` (`list[str]`) — plain names (`"MYOP"`) or fully-qualified lib_ids (`"自定义:MYOP"`, `"Device:R"`). Plain names match every cached entry whose local name (after the last `:`) equals them.
+- `symbols` (`list[str]`) — fully-qualified lib_ids (`"自定义:MYOP"`, `"Device:R"`). Matching is exact on the full lib_id; plain names are rejected (`failed` with reason `must_be_lib_id`).
 - `library` (`str`) — target library nickname (must already exist).
 
 Entries already present in the target library are reported in `skipped` (never overwritten); entries not present in the schematic are reported in `failed`. The library is re-indexed afterwards.

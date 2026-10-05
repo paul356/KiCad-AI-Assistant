@@ -143,15 +143,22 @@ class TestAddSymbolToLibrary:
         assert result["exported"] == ["TestLib:C"]
         assert result["exported_count"] == 1
 
-    def test_plain_name_matches_local_part(self, tools, env, tmp_sch):
+    def test_plain_name_rejected(self, tools, env, tmp_sch):
+        """Strict lib_id matching: plain names are rejected, not fuzzy-matched."""
         result = _run(
             tools["add_symbols_to_library"],
             schematic_path=tmp_sch,
             symbols=["R_Small"],
             library=env["lib"],
         )
-        assert "error" not in result, result
-        assert result["exported"] == ["TestLib:R_Small"]
+        assert result["exported"] == []
+        assert result["failed"] == [
+            {
+                "symbol": "R_Small",
+                "reason": "must_be_lib_id (plain names are not matched; use 'Library:Name')",
+            }
+        ]
+        assert result["failed_count"] == 1
 
     def test_duplicate_export_is_skipped_not_overwritten(self, tools, env, tmp_sch):
         first = _run(
@@ -176,11 +183,11 @@ class TestAddSymbolToLibrary:
         result = _run(
             tools["add_symbols_to_library"],
             schematic_path=tmp_sch,
-            symbols=["Ghost"],
+            symbols=["Ghost:Missing"],
             library=env["lib"],
         )
         assert result["exported"] == []
-        assert result["failed"] == [{"symbol": "Ghost", "reason": "not_in_schematic"}]
+        assert result["failed"] == [{"symbol": "Ghost:Missing", "reason": "not_in_schematic"}]
         assert result["failed_count"] == 1
 
     def test_unknown_library_returns_error(self, tools, env, tmp_sch):

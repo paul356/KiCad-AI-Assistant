@@ -276,12 +276,12 @@ def _do_add_symbol_to_library(
     library (``.kicad_sym``).
 
     Read-only with respect to the schematic: the source file is never
-    modified.  ``symbols`` may contain either plain names (``MYOP``) or
-    fully-qualified lib_ids (``自定义:MYOP`` / ``Device:R``); plain names
-    match any cached entry whose local name (after the last ``:``) equals
-    them.  Entries already present in the target library are reported in
-    ``skipped`` (never overwritten); entries not present in the schematic are
-    reported in ``failed``.  The target library is re-indexed afterwards.
+    modified.  ``symbols`` entries must be fully-qualified lib_ids
+    (``自定义:MYOP`` / ``Device:R``) — plain names are rejected, matching is
+    exact on the full lib_id.  Entries already present in the target library
+    are reported in ``skipped`` (never overwritten); entries not present in
+    the schematic are reported in ``failed``.  The target library is
+    re-indexed afterwards.
     """
     if not symbols:
         return {"error": "symbols list must not be empty"}
@@ -301,40 +301,34 @@ def _do_add_symbol_to_library(
 
     cached = _extract_cached_raw_entries(sch)
     cached_by_id = dict(cached)
-    # Plain-name index: last segment after ':' (or whole id when no ':').
-    cached_by_local: dict[str, list[tuple[str, list]]] = {}
-    for lib_id, raw in cached:
-        cached_by_local.setdefault(lib_id.split(":")[-1], []).append((lib_id, raw))
 
     exported: list[str] = []
     failed: list[dict[str, str]] = []
     skipped: list[dict[str, str]] = []
 
     for requested in symbols:
-        if ":" in requested:
-            raw = cached_by_id.get(requested)
-            if raw is None:
-                failed.append({"symbol": requested, "reason": "not_in_schematic"})
-                continue
-            local_name = requested.split(":")[-1]
-            candidates: list[tuple[str, list]] = [(requested, raw)]
-        else:
-            candidates = cached_by_local.get(requested, [])
-            if not candidates:
-                failed.append({"symbol": requested, "reason": "not_in_schematic"})
-                continue
-            local_name = requested
-        for lib_id, raw in candidates:
-            if not is_safe_symbol_name(local_name):
-                failed.append({"symbol": lib_id, "reason": "unsafe_symbol_name"})
-                continue
-            try:
-                append_symbol_to_library(lib_file, raw, local_name)
-                exported.append(f"{library}:{local_name}")
-                break
-            except SymbolNameExistsError:
-                skipped.append({"symbol": lib_id, "reason": "already_in_library"})
-                continue
+        if ":" not in requested:
+            failed.append(
+                {
+                    "symbol": requested,
+                    "reason": "must_be_lib_id (plain names are not matched; use 'Library:Name')",
+                }
+            )
+            continue
+        raw = cached_by_id.get(requested)
+        if raw is None:
+            failed.append({"symbol": requested, "reason": "not_in_schematic"})
+            continue
+        local_name = requested.split(":")[-1]
+        if not is_safe_symbol_name(local_name):
+            failed.append({"symbol": requested, "reason": "unsafe_symbol_name"})
+            continue
+        try:
+            append_symbol_to_library(lib_file, raw, local_name)
+            exported.append(f"{library}:{local_name}")
+        except SymbolNameExistsError:
+            skipped.append({"symbol": requested, "reason": "already_in_library"})
+            continue
 
     # Refresh the index so search_symbols/list_symbol_libraries see the new file.
     indexed = _index_symbol_library(library, lib_file)
@@ -2335,17 +2329,17 @@ def register_symbol_edit_tools(mcp: FastMCP) -> None:
         modified) and appends the raw definition of each requested symbol to
         the ``.kicad_sym`` file of *library*.
 
-        ``symbols`` entries may be plain names (``"MYOP"``) or
-        fully-qualified lib_ids (``"自定义:MYOP"``, ``"Device:R"``); plain
-        names match every cached entry whose local name (after the last
-        ``:``) equals them.  Entries already present in the target library
+        ``symbols`` entries must be fully-qualified lib_ids (``"自定义:MYOP"``,
+        ``"Device:R"``) — matching is exact on the full lib_id; plain names
+        are rejected.  Entries already present in the target library
         are reported in ``skipped`` (never overwritten); entries not present
         in the schematic are reported in ``failed``.  The library is
         re-indexed afterwards.
 
         Args:
             schematic_path: Absolute path to the source .kicad_sch file.
-            symbols: Non-empty list of symbol names / lib_ids to export.
+            symbols: Non-empty list of fully-qualified lib_ids (``Library:Name``)
+                to export.
             library: Target library nickname (must already exist, e.g. via
                 ``create_symbol_library``).
 
