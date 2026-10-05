@@ -316,6 +316,21 @@ class FootprintIndexManager:
         """
         return self._db.library_name_exists(library_name)
 
+    def remove_library(self, library_name: str) -> bool:
+        """Drop one library (and its footprints) from the index database.
+
+        Only the index entry is removed — the ``.pretty`` directory and the
+        fp-lib-table entry are left untouched (callers own those).
+
+        :param library_name: Library nickname to remove.
+        :returns: True when a matching row was deleted.
+        """
+        for rec in self.get_all_libraries():
+            if rec.library_name == library_name:
+                self._db.delete_library(rec.id)
+                return True
+        return False
+
     def get_all_footprint_names(self) -> set[str]:
         """Return every footprint name indexed in the manager's project scope
         (global + project libraries)."""

@@ -272,3 +272,154 @@ class TestFindSymbolsNotInLibraries:
         )
         assert "error" in result
         assert "success" not in result
+
+
+# ---------------------------------------------------------------------------
+# remove_symbol_from_library
+# ---------------------------------------------------------------------------
+
+
+def _seed_library(env, tools, tmp_sch, symbols=("Device:R_Small", "Device:C")):
+    """Export fixture cached symbols into env's library; return their plain names."""
+    result = _run(
+        tools["add_symbol_to_library"],
+        schematic_path=tmp_sch,
+        symbols=list(symbols),
+        library=env["lib"],
+    )
+    assert "error" not in result, result
+    return [s.split(":")[-1] for s in result["exported"]]
+
+
+class TestRemoveSymbolFromLibrary:
+    def test_removes_one_symbol(self, tools, env, tmp_sch):
+        names = _seed_library(env, tools, tmp_sch)
+        assert "R_Small" in names
+
+        result = _run(
+            tools["remove_symbol_from_library"],
+            library=env["lib"],
+            symbols=["R_Small"],
+        )
+        assert "error" not in result, result
+        assert result["removed"] == ["TestLib:R_Small"]
+        assert result["removed_count"] == 1
+        assert result["failed"] == []
+        assert result["indexed"] == 1
+
+        from kcaa.utils.symbol_library_utils import list_library_symbols
+
+        lib_symbols = list_library_symbols(env["lib_path"])
+        assert "R_Small" not in lib_symbols
+        assert "C" in lib_symbols  # sibling untouched
+
+    def test_batch_removes_multiple(self, tools, env, tmp_sch):
+        _seed_library(env, tools, tmp_sch)
+        result = _run(
+            tools["remove_symbol_from_library"],
+            library=env["lib"],
+            symbols=["R_Small", "C"],
+        )
+        assert result["removed_count"] == 2
+        assert set(result["removed"]) == {"TestLib:R_Small", "TestLib:C"}
+        from kcaa.utils.symbol_library_utils import list_library_symbols
+
+        assert list_library_symbols(env["lib_path"]) == []
+
+    def test_missing_symbol_reported_in_failed(self, tools, env, tmp_sch):
+        _seed_library(env, tools, tmp_sch)
+        result = _run(
+            tools["remove_symbol_from_library"],
+            library=env["lib"],
+            symbols=["R_Small", "Ghost"],
+        )
+        assert result["removed"] == ["TestLib:R_Small"]
+        assert result["failed"] == [
+            {"symbol": "Ghost", "reason": "not_in_library ('Ghost' not a top-level symbol)"}
+        ]
+        # valid name still removed — no partial-commit ambiguity
+
+    def test_unsafe_name_rejected(self, tools, env):
+        result = _run(
+            tools["remove_symbol_from_library"],
+            library=env["lib"],
+            symbols=["../evil"],
+        )
+        assert result["removed"] == []
+        assert result["failed"] == [{"symbol": "../evil", "reason": "unsafe_symbol_name"}]
+
+    def test_unknown_library_returns_error(self, tools, env):
+        result = _run(
+            tools["remove_symbol_from_library"],
+            library="NoSuchLib",
+            symbols=["R_Small"],
+        )
+        assert "error" in result
+        assert "success" not in result
+
+    def test_empty_symbols_returns_error(self, tools, env):
+        result = _run(tools["remove_symbol_from_library"], library=env["lib"], symbols=[])
+        assert "error" in result
+
+    def test_remove_last_symbol_leaves_valid_empty_library(self, tools, env, tmp_sch):
+        _seed_library(env, tools, tmp_sch)
+        _run(tools["remove_symbol_from_library"], library=env["lib"], symbols=["R_Small", "C"])
+        text = Path(env["lib_path"]).read_text()
+        assert text.strip().endswith(")")
+        from kcaa.utils.symbol_library_utils import list_library_symbols
+
+        assert list_library_symbols(env["lib_path"]) == []
+
+
+# ---------------------------------------------------------------------------
+# delete_symbol_library
+# ---------------------------------------------------------------------------
+
+
+class TestDeleteSymbolLibrary:
+    def test_deletes_empty_library(self, tools, env):
+        # env created TestLib empty.
+        result = _run(tools["delete_symbol_library"], library=env["lib"])
+        assert "error" not in result, result
+        assert result["deleted"] is True
+        assert result["unregistered"] is True
+        assert result["index_removed"] is True
+        assert not os.path.exists(env["lib_path"])
+        # Table entry dropped (a .bak copy of the table exists).
+        table_text = Path(env["table_path"]).read_text()
+        assert 'name "TestLib"' not in table_text
+        assert os.path.isfile(env["table_path"] + ".bak")
+
+    def test_refuses_non_empty_library(self, tools, env, tmp_sch):
+        _seed_library(env, tools, tmp_sch)
+        result = _run(tools["delete_symbol_library"], library=env["lib"])
+        assert "error" in result, result
+        assert "not empty" in result["error"]
+        assert "success" not in result
+        # Library file and symbols survive untouched.
+        assert os.path.isfile(env["lib_path"])
+        from kcaa.utils.symbol_library_utils import list_library_symbols
+
+        assert len(list_library_symbols(env["lib_path"])) == 2
+
+    def test_empty_then_delete_flow(self, tools, env, tmp_sch):
+        _seed_library(env, tools, tmp_sch)
+        removed = _run(
+            tools["remove_symbol_from_library"],
+            library=env["lib"],
+            symbols=["R_Small", "C"],
+        )
+        assert removed["removed_count"] == 2
+        deleted = _run(tools["delete_symbol_library"], library=env["lib"])
+        assert "error" not in deleted, deleted
+        assert deleted["deleted"] is True
+        assert not os.path.exists(env["lib_path"])
+
+    def test_unknown_library_returns_error(self, tools, env):
+        result = _run(tools["delete_symbol_library"], library="NoSuchLib")
+        assert "error" in result
+        assert "success" not in result
+
+    def test_deleted_library_absent_from_index(self, tools, env):
+        _run(tools["delete_symbol_library"], library=env["lib"])
+        assert env["index_mgr"].get_library_by_name("TestLib") is None

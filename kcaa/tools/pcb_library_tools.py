@@ -19,6 +19,7 @@ from kcaa.utils.fp_lib_table_utils import (
     get_user_fp_lib_table_path,
     register_library_in_table,
     sanitize_lib_nickname,
+    unregister_library_in_table,
 )
 from kcaa.utils.pcb_footprint_utils import (
     get_fp_layer,
@@ -707,6 +708,177 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
             }
         except Exception as exc:
             log.error("add_footprints_to_library failed: %s", exc, exc_info=True)
+            return {"error": str(exc)}
+
+    @mcp.tool()
+    async def remove_footprints_from_library(
+        library: str,
+        footprints: list[str],
+        project_dir: str | None = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Remove named footprints from a footprint library.
+
+        Removes the named ``.kicad_mod`` files from the target library
+        directory and re-indexes the library so the removed footprints
+        disappear from search.  Only the library directory is modified —
+        the board (PCB) is never touched.
+
+        A requested footprint is ``failed`` when it is not present in the
+        library directory or its name is unsafe (path-traversal guard).
+        Valid names are removed even when other entries fail — there is no
+        partial-commit ambiguity.
+
+        Args:
+            library: Nickname of the target library as registered in
+                fp-lib-table.
+            footprints: Names of the footprints to remove (e.g.
+                ["MYOP"]).  Must contain at least one entry.
+            project_dir: Optional project directory used to resolve
+                project-local libraries (``${KIPRJMOD}``).  Omit for
+                global libraries.
+
+        Returns:
+            dict with keys: library, library_path, removed (list of names),
+            removed_count, failed (list of {name, reason}), failed_count,
+            indexed; plus ``error`` on failure.
+        """
+        try:
+            if not footprints:
+                return {"error": "footprints list must not be empty"}
+            library_dir, target_table = _resolve_library_dir(library, project_dir)
+            removed: list[str] = []
+            failed: list[dict[str, str]] = []
+            for name in dict.fromkeys(footprints):  # dedupe, keep order
+                if not is_safe_footprint_name(name):
+                    failed.append(
+                        {
+                            "name": name,
+                            "reason": f"unsafe footprint name {name!r} (refusing to remove)",
+                        }
+                    )
+                    continue
+                target_path = os.path.join(library_dir, f"{name}.kicad_mod")
+                if not os.path.isfile(target_path):
+                    failed.append(
+                        {
+                            "name": name,
+                            "reason": "not in library",
+                        }
+                    )
+                    continue
+                try:
+                    os.remove(target_path)
+                except OSError as exc:
+                    failed.append({"name": name, "reason": f"remove_failed: {exc}"})
+                    continue
+                removed.append(name)
+
+            # Ownership scope mirrors add_footprints_to_library: a library
+            # registered in the project fp-lib-table is indexed under the
+            # project, a global one under "".
+            target_project = ""
+            if project_dir:
+                project_id = os.path.realpath(project_dir)
+                project_table = os.path.join(project_id, "fp-lib-table")
+                if os.path.realpath(target_table) == project_table:
+                    target_project = project_id
+            indexed = _index_library_entry(library, library_dir, project_id=target_project)
+            return {
+                "library": library,
+                "library_path": library_dir,
+                "removed": removed,
+                "removed_count": len(removed),
+                "failed": failed,
+                "failed_count": len(failed),
+                "indexed": indexed,
+            }
+        except Exception as exc:
+            log.error("remove_footprints_from_library failed: %s", exc, exc_info=True)
+            return {"error": str(exc)}
+
+    @mcp.tool()
+    async def delete_footprint_library(
+        library: str,
+        project_dir: str | None = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Delete an **empty** footprint library (directory, table, index).
+
+        Refuses with an ``error`` when the target ``.pretty`` directory
+        still contains any ``.kicad_mod`` footprint — only empty libraries
+        can be deleted.  Empty it first with
+        ``remove_footprints_from_library``.
+
+        On success the ``.pretty`` directory is removed, its fp-lib-table
+        entry is dropped (a ``.bak`` copy of the table is written), and the
+        library is removed from the footprint index.
+
+        Args:
+            library: Nickname of the library as registered in fp-lib-table.
+            project_dir: Project directory when *library* is a project-local
+                library (``${KIPRJMOD}`` URI).  Omit for global libraries.
+
+        Returns:
+            dict with keys: library, path, table_path, unregistered,
+            table_backup, index_removed, deleted; plus ``error`` on
+            failure.
+        """
+        try:
+            library_dir, target_table = _resolve_library_dir(library, project_dir)
+            mod_files = [f for f in os.listdir(library_dir) if f.endswith(".kicad_mod")]
+            if mod_files:
+                return {
+                    "error": (
+                        f"Library '{library}' is not empty "
+                        f"({len(mod_files)} footprint(s): "
+                        f"{', '.join(sorted(mod_files))}); refusing to delete. "
+                        "Use remove_footprints_from_library first."
+                    )
+                }
+
+            unregistered = False
+            backup_path: str | None = None
+            if target_table and os.path.isfile(target_table):
+                table_result = unregister_library_in_table(target_table, library)
+                unregistered = bool(table_result.get("unregistered"))
+                backup_path = table_result.get("backup_path")
+
+            try:
+                os.rmdir(library_dir)
+            except OSError as exc:
+                log.error(
+                    "delete_footprint_library: cannot remove %s: %s",
+                    library_dir,
+                    exc,
+                    exc_info=True,
+                )
+                return {
+                    "error": f"Failed to remove library directory: {library_dir} ({exc})",
+                    "table_unregistered": unregistered,
+                    "table_backup": backup_path,
+                }
+
+            index_removed = False
+            try:
+                index_removed = get_footprint_index_manager().remove_library(library)
+            except Exception as exc:
+                log.error(
+                    "delete_footprint_library: index cleanup failed for %s: %s",
+                    library,
+                    exc,
+                )
+            return {
+                "library": library,
+                "path": library_dir,
+                "table_path": target_table,
+                "unregistered": unregistered,
+                "table_backup": backup_path,
+                "index_removed": index_removed,
+                "deleted": True,
+            }
+        except Exception as exc:
+            log.error("delete_footprint_library failed: %s", exc, exc_info=True)
             return {"error": str(exc)}
 
 

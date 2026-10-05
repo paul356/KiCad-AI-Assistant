@@ -487,8 +487,23 @@ class SymbolIndexManager:
         return self._db.get_all_libraries()
 
     def get_library_by_name(self, name: str) -> LibraryRecord | None:
-        """Look up a library record by library name."""
+        """Look up a single library record by library_name."""
         return self._db.get_library_by_name(name)
+
+    def remove_library(self, library_name: str) -> bool:
+        """Drop one library (and its symbols) from the index database.
+
+        Only the index entry is removed — the ``.kicad_sym`` file and the
+        sym-lib-table entry are left untouched (callers own those).
+
+        :param library_name: Library nickname to remove.
+        :returns: True when a matching row was deleted.
+        """
+        rec = self._db.get_library_by_name(library_name)
+        if rec is None:
+            return False
+        self._db.delete_library(rec.id)
+        return True
 
     # ------------------------------------------------------------------
     # Narrow single-library indexing (library write tools)

@@ -371,3 +371,103 @@ def append_symbol_to_library(file_path: str, lib_sym_raw: list, symbol_name: str
 
 class SymbolNameExistsError(ValueError):
     """Raised when appending a symbol whose name already exists in a library."""
+
+
+class SymbolNotFoundError(ValueError):
+    """Raised when removing a symbol that is not a top-level symbol in a library."""
+
+
+def _balanced_close(text: str, start: int) -> int:
+    """Return the index just past the closing paren of the s-expr starting at *start*.
+
+    Quote-aware: parentheses inside quoted strings do not count.  Returns -1
+    when the text is unbalanced.
+    """
+    depth = 0
+    in_str = False
+    i = start
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if in_str:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == '"':
+                in_str = False
+            i += 1
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return -1
+
+
+def remove_symbol_from_library_file(file_path: str, symbol_name: str) -> str:
+    """Remove one top-level ``(symbol ...)`` node from a .kicad_sym library.
+
+    Only the named top-level definition is removed; sub-symbols (units) of
+    other symbols and the library header are untouched.  A backup (``.bak``)
+    is written before saving.  Refuses to remove a symbol that does not
+    exist — ``SymbolNotFoundError`` is raised instead.
+
+    :param file_path: Absolute path to the library file (must exist).
+    :param symbol_name: Plain (unqualified) symbol name to remove.
+    :returns: Absolute path written.
+    :raises FileNotFoundError: When *file_path* does not exist.
+    :raises ValueError: When *symbol_name* is not a safe library symbol name.
+    :raises SymbolNotFoundError: When *symbol_name* is not a top-level
+        symbol of the library.
+    """
+    if not os.path.isfile(file_path):
+        raise FileNotFoundError(f"Library file not found: {file_path}")
+    if not is_safe_symbol_name(symbol_name):
+        raise ValueError(f"Unsafe symbol name {symbol_name!r} (refusing to edit)")
+
+    with open(file_path, encoding="utf-8") as fh:
+        text = fh.read()
+
+    needle = f'(symbol "{symbol_name}"'
+    lines = text.splitlines(keepends=True)
+    line_starts: list[int] = []
+    offset = 0
+    for ln in lines:
+        line_starts.append(offset)
+        offset += len(ln)
+
+    # Top-level symbols use a 2-space indent in the pretty layout; nested
+    # (sub-symbol) nodes use 4+ spaces and header lines never start with
+    # ``(symbol``.  The exact ``(symbol "NAME"`` needle never matches a
+    # sub-symbol (``NAME_0_1``) because the closing quote differs.
+    node_start: int | None = None
+    node_line_end: int | None = None
+    for i, ln in enumerate(lines):
+        if not ln.startswith("  ") or ln.startswith("    "):
+            continue
+        if needle in ln and ln.lstrip().startswith(needle):
+            end = _balanced_close(text, line_starts[i] + (len(ln) - len(ln.lstrip())))
+            if end == -1:
+                continue
+            node_start = line_starts[i]
+            nxt = text.find("\n", end)
+            node_line_end = nxt + 1 if nxt != -1 else len(text)
+            break
+
+    if node_start is None or node_line_end is None:
+        raise SymbolNotFoundError(
+            f"Symbol '{symbol_name}' not found in library {os.path.basename(file_path)}"
+        )
+
+    new_text = text[:node_start] + text[node_line_end:]
+    shutil.copy2(file_path, file_path + ".bak")
+    tmp_path = file_path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as fh:
+        fh.write(new_text)
+    os.replace(tmp_path, file_path)
+    return os.path.abspath(file_path)

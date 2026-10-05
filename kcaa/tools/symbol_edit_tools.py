@@ -24,6 +24,7 @@ from kcaa.utils.skip_compat import safe_schematic
 from kcaa.utils.sym_lib_table_utils import (
     get_user_sym_lib_table_path,
     register_library_in_table,
+    unregister_library_in_table,
 )
 from kcaa.utils.symbol_extractor import extract_lib_symbol_raw
 from kcaa.utils.symbol_geometry import (
@@ -36,11 +37,13 @@ from kcaa.utils.symbol_index_manager import SymbolIndexManager
 from kcaa.utils.symbol_index_reader import SymbolIndexReader
 from kcaa.utils.symbol_library_utils import (
     SymbolNameExistsError,
+    SymbolNotFoundError,
     append_symbol_to_library,
     build_effective_symbol_library_list,
     create_empty_library_file,
     is_safe_symbol_name,
     list_library_symbols,
+    remove_symbol_from_library_file,
     resolve_symbol_library,
     sanitize_lib_nickname,
 )
@@ -345,6 +348,136 @@ def _do_add_symbol_to_library(
         "skipped": skipped,
         "skipped_count": len(skipped),
         "indexed": indexed,
+    }
+
+
+def _do_remove_symbol_from_library(
+    library: str,
+    symbols: list[str],
+    project_dir: str | None = None,
+) -> dict[str, Any]:
+    """Remove named symbol definitions from an existing symbol library.
+
+    Only the library ``.kicad_sym`` file is modified — no schematic is ever
+    touched.  Each requested plain symbol name must exist as a top-level
+    definition of the library; missing or unsafe names are reported in
+    ``failed`` (no partial state: every valid name is removed, the rest are
+    reported).  The library is re-indexed afterwards.
+
+    Removing the *last* symbol of a library leaves a valid empty library
+    file; deleting the library itself is a separate tool
+    (``delete_symbol_library``).
+    """
+    if not symbols:
+        return {"error": "symbols list must not be empty"}
+    if not isinstance(symbols, list) or not all(isinstance(s, str) and s for s in symbols):
+        return {"error": "symbols must be a non-empty list of non-empty strings"}
+
+    try:
+        lib = resolve_symbol_library(library, project_path=project_dir)
+    except ValueError as exc:
+        return {"error": str(exc)}
+    lib_file = lib["path"]
+
+    available = set(list_library_symbols(lib_file))
+    removed: list[str] = []
+    failed: list[dict[str, str]] = []
+
+    for name in dict.fromkeys(symbols):  # dedupe, keep order
+        if not is_safe_symbol_name(name):
+            failed.append({"symbol": name, "reason": "unsafe_symbol_name"})
+            continue
+        if name not in available:
+            failed.append(
+                {"symbol": name, "reason": f"not_in_library ({name!r} not a top-level symbol)"}
+            )
+            continue
+        try:
+            remove_symbol_from_library_file(lib_file, name)
+        except SymbolNotFoundError:
+            failed.append({"symbol": name, "reason": "not_in_library"})
+            continue
+        except Exception as exc:
+            log.error("remove_symbol_from_library_file failed for %s: %s", name, exc, exc_info=True)
+            failed.append({"symbol": name, "reason": f"remove_failed: {exc}"})
+            continue
+        removed.append(f"{library}:{name}")
+        available.discard(name)
+
+    # Refresh the index so removed symbols disappear from search.
+    indexed = _index_symbol_library(library, lib_file)
+    return {
+        "library": library,
+        "library_path": lib_file,
+        "removed": removed,
+        "removed_count": len(removed),
+        "failed": failed,
+        "failed_count": len(failed),
+        "indexed": indexed,
+    }
+
+
+def _do_delete_symbol_library(
+    library: str,
+    project_dir: str | None = None,
+) -> dict[str, Any]:
+    """Delete an **empty** symbol library: file, table entry, and index.
+
+    Refuses (``error``) when the library still contains any top-level
+    symbol — delete_symbol_library only ever removes empty libraries; use
+    ``remove_symbol_from_library`` first to empty it.  A ``.bak`` copy of
+    the sym-lib-table is written when the table entry is dropped.
+    """
+    try:
+        lib = resolve_symbol_library(library, project_path=project_dir)
+    except ValueError as exc:
+        return {"error": str(exc)}
+    lib_file = lib["path"]
+    table_path = lib["table_path"]
+
+    remaining = list_library_symbols(lib_file)
+    if remaining:
+        return {
+            "error": (
+                f"Library '{library}' is not empty "
+                f"({len(remaining)} symbol(s): {', '.join(sorted(remaining))}); "
+                "refusing to delete. Use remove_symbol_from_library first."
+            )
+        }
+
+    unregistered = False
+    backup_path: str | None = None
+    if table_path and os.path.isfile(table_path):
+        result = unregister_library_in_table(table_path, library)
+        unregistered = bool(result.get("unregistered"))
+        backup_path = result.get("backup_path")
+
+    try:
+        os.remove(lib_file)
+        with contextlib.suppress(OSError):
+            os.remove(lib_file + ".bak")
+    except OSError as exc:
+        log.error("delete_symbol_library: cannot remove %s: %s", lib_file, exc, exc_info=True)
+        return {
+            "error": f"Failed to remove library file: {lib_file} ({exc})",
+            "table_unregistered": unregistered,
+            "table_backup": backup_path,
+        }
+
+    index_removed = False
+    try:
+        index_removed = _get_index_manager().remove_library(library)
+    except Exception as exc:
+        log.error("delete_symbol_library: index cleanup failed for %s: %s", library, exc)
+
+    return {
+        "library": library,
+        "path": lib_file,
+        "table_path": table_path,
+        "unregistered": unregistered,
+        "table_backup": backup_path,
+        "index_removed": index_removed,
+        "deleted": True,
     }
 
 
@@ -2254,6 +2387,67 @@ def register_symbol_edit_tools(mcp: FastMCP) -> None:
             references, reference_count), missing_count.
         """
         return _do_find_symbols_not_in_libraries(schematic_path=schematic_path)
+
+    @mcp.tool()
+    async def remove_symbol_from_library(
+        library: str,
+        symbols: list[str],
+        project_dir: str | None = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Remove named symbol definitions from an existing symbol library.
+
+        Modifies only the library ``.kicad_sym`` file — no schematic is
+        ever touched.  Each requested plain symbol name must exist as a
+        top-level definition of *library*; missing or unsafe names are
+        reported in ``failed`` (valid names are still removed).  The
+        library is re-indexed so removed symbols disappear from search.
+
+        Removing the *last* symbol leaves a valid empty library file; use
+        ``delete_symbol_library`` (empty-library-only) to remove the
+        library itself.
+
+        Args:
+            library: Nickname of the target library as registered in
+                sym-lib-table.
+            symbols: Plain symbol names to remove (e.g. ["NINJA_IO"]).
+                Must contain at least one entry.
+            project_dir: Optional project directory used to resolve
+                project-local libraries (``${KIPRJMOD}``).  Omit for
+                global libraries.
+
+        Returns:
+            dict with keys: library, library_path, removed (list of
+            ``Library:Name``), removed_count, failed (list of {symbol,
+            reason}), failed_count, indexed; plus ``error`` on failure.
+        """
+        return _do_remove_symbol_from_library(
+            library=library, symbols=symbols, project_dir=project_dir
+        )
+
+    @mcp.tool()
+    async def delete_symbol_library(
+        library: str,
+        project_dir: str | None = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Delete an **empty** symbol library (file, table entry, index).
+
+        Refuses with an ``error`` when the library still contains any
+        top-level symbol — only empty libraries can be deleted.  Empty it
+        first with ``remove_symbol_from_library``.
+
+        Args:
+            library: Nickname of the library as registered in sym-lib-table.
+            project_dir: Project directory when *library* is a project-local
+                library (``${KIPRJMOD}`` URI).  Omit for global libraries.
+
+        Returns:
+            dict with keys: library, path, table_path, unregistered,
+            table_backup, index_removed, deleted; plus ``error`` on
+            failure.
+        """
+        return _do_delete_symbol_library(library=library, project_dir=project_dir)
 
     @mcp.tool()
     async def remove_symbol_from_schematic(

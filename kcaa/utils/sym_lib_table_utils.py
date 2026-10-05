@@ -132,3 +132,74 @@ def register_library_in_table(
         "table_path": table_path,
         "backup_path": backup_path,
     }
+
+
+def unregister_library_in_table(
+    table_path: str,
+    nickname: str,
+) -> dict[str, Any]:
+    """Remove the ``(lib ...)`` entry for *nickname* from *table_path*.
+
+    Only the matching entry is dropped; all other entries keep their
+    original formatting (pretty layout is filtered line-by-line, the rare
+    compact single-line layout is re-serialized).  Backs up the table to
+    ``.bak`` before writing.
+
+    :param table_path: Absolute path to the sym-lib-table file.
+    :param nickname: Library nickname whose entry should be removed.
+    :returns: dict with ``unregistered`` (bool), ``table_path``, and optional
+        ``backup_path`` / ``reason`` (``table not found``,
+        ``not_registered``).
+    """
+    table_path = os.path.abspath(table_path)
+    nickname = sanitize_lib_nickname(nickname)
+    if not nickname:
+        return {"unregistered": False, "reason": "nickname empty after sanitization"}
+    if not os.path.isfile(table_path):
+        return {"unregistered": False, "reason": "table not found", "table_path": table_path}
+
+    with open(table_path, encoding="utf-8") as fh:
+        original = fh.read()
+    needle = f'name "{nickname}"'
+    if needle not in original:
+        return {"unregistered": False, "table_path": table_path, "reason": "not_registered"}
+
+    if _last_line_is_closing_paren(original):
+        lines = original.splitlines(keepends=True)
+        kept = [ln for ln in lines if not (ln.strip().startswith("(lib ") and needle in ln)]
+        new_text = "".join(kept)
+    else:
+        log.warning(
+            "sym-lib-table %s is single-line; re-serializing to drop entry",
+            table_path,
+        )
+        data = sexpdata.loads(original)
+        kept_data = [
+            child
+            for child in data
+            if not (
+                isinstance(child, list)
+                and len(child) >= 2
+                and child[0] == sexpdata.Symbol("lib")
+                and any(
+                    isinstance(entry, list)
+                    and len(entry) >= 2
+                    and entry[0] == sexpdata.Symbol("name")
+                    and str(entry[1]) == nickname
+                    for entry in child
+                )
+            )
+        ]
+        new_text = sexpdata.dumps(kept_data, pretty_print=True, indent_as="\t") + "\n"
+
+    backup_path = table_path + ".bak"
+    shutil.copy2(table_path, backup_path)
+    tmp_path = table_path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as fh:
+        fh.write(new_text)
+    os.replace(tmp_path, table_path)
+    return {
+        "unregistered": True,
+        "table_path": table_path,
+        "backup_path": backup_path,
+    }

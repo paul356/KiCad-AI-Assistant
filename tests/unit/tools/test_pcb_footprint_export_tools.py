@@ -1117,3 +1117,138 @@ class TestCreateRollback:
         assert "error" in result
         lib_dir = os.path.join(project["third_party"], "footprints", "MyVendor.pretty")
         assert not os.path.exists(lib_dir)
+
+
+# ---------------------------------------------------------------------------
+# remove_footprints_from_library / delete_footprint_library
+# ---------------------------------------------------------------------------
+
+
+def _empty_vendor(tools, project) -> str:
+    result = _run(tools["create_footprint_library"](name="MyVendor", ctx=None))
+    assert "error" not in result, result
+    return os.path.join(project["third_party"], "footprints", "MyVendor.pretty")
+
+
+class TestRemoveFootprintsFromLibrary:
+    def test_removes_named_footprints(self, tools, tmp_path, project):
+        vendor = _empty_vendor(tools, project)
+        board = _make_board(tmp_path)
+        exported = _run(
+            tools["add_footprints_to_library"](
+                pcb_path=board,
+                footprints=["Sensor_Board_XYZ", "Connector_Odd"],
+                library="MyVendor",
+                ctx=None,
+            )
+        )
+        assert exported["exported_count"] == 2, exported
+        assert os.path.isfile(os.path.join(vendor, "Sensor_Board_XYZ.kicad_mod"))
+
+        result = _run(
+            tools["remove_footprints_from_library"](
+                library="MyVendor", footprints=["Sensor_Board_XYZ"], ctx=None
+            )
+        )
+        assert "error" not in result, result
+        assert result["removed"] == ["Sensor_Board_XYZ"]
+        assert result["removed_count"] == 1
+        assert result["failed"] == []
+        assert result["indexed"] == 1  # only Connector_Odd remains
+
+        assert not os.path.exists(os.path.join(vendor, "Sensor_Board_XYZ.kicad_mod"))
+        assert os.path.isfile(os.path.join(vendor, "Connector_Odd.kicad_mod"))
+        # Index reflects the removal: Connector_Odd still there, XYZ gone.
+        fp = project["index_mgr"].get_footprint("MyVendor", "Connector_Odd")
+        assert fp is not None
+        assert project["index_mgr"].get_footprint("MyVendor", "Sensor_Board_XYZ") is None
+
+    def test_missing_footprint_reported_in_failed(self, tools, tmp_path, project):
+        vendor = _empty_vendor(tools, project)
+        board = _make_board(tmp_path)
+        _run(
+            tools["add_footprints_to_library"](
+                pcb_path=board, footprints=["Connector_Odd"], library="MyVendor", ctx=None
+            )
+        )
+        result = _run(
+            tools["remove_footprints_from_library"](
+                library="MyVendor", footprints=["Connector_Odd", "Ghost"], ctx=None
+            )
+        )
+        assert result["removed"] == ["Connector_Odd"]
+        assert result["failed"] == [{"name": "Ghost", "reason": "not in library"}]
+        assert os.listdir(vendor) == []
+
+    def test_unknown_library_returns_error(self, tools):
+        result = _run(
+            tools["remove_footprints_from_library"](library="NoSuchLib", footprints=["X"], ctx=None)
+        )
+        assert "error" in result
+        assert "success" not in result
+
+    def test_empty_footprints_returns_error(self, tools, project):
+        result = _run(
+            tools["remove_footprints_from_library"](library="TestSys", footprints=[], ctx=None)
+        )
+        assert "error" in result
+
+
+class TestDeleteFootprintLibrary:
+    def test_deletes_empty_library(self, tools, project):
+        _run(tools["create_footprint_library"](name="MyVendor", ctx=None))
+        lib_dir = os.path.join(project["third_party"], "footprints", "MyVendor.pretty")
+        assert os.path.isdir(lib_dir)
+
+        result = _run(tools["delete_footprint_library"](library="MyVendor", ctx=None))
+        assert "error" not in result, result
+        assert result["deleted"] is True
+        assert result["unregistered"] is True
+        assert result["index_removed"] is True
+        assert not os.path.exists(lib_dir)
+        # fp-lib-table entry dropped.
+        table_text = open(project["table"], encoding="utf-8").read()
+        assert 'name "MyVendor"' not in table_text
+        assert 'name "TestSys"' in table_text  # sibling entry kept
+        assert project["index_mgr"].library_name_exists("MyVendor") is False
+
+    def test_refuses_non_empty_library(self, tools, tmp_path, project):
+        vendor = _empty_vendor(tools, project)
+        board = _make_board(tmp_path)
+        _run(
+            tools["add_footprints_to_library"](
+                pcb_path=board, footprints=["Connector_Odd"], library="MyVendor", ctx=None
+            )
+        )
+        result = _run(tools["delete_footprint_library"](library="MyVendor", ctx=None))
+        assert "error" in result, result
+        assert "not empty" in result["error"]
+        assert "success" not in result
+        assert os.path.isdir(vendor)
+        assert os.path.isfile(os.path.join(vendor, "Connector_Odd.kicad_mod"))
+        assert "MyVendor" in open(project["table"], encoding="utf-8").read()
+
+    def test_empty_then_delete_flow(self, tools, tmp_path, project):
+        _run(tools["create_footprint_library"](name="MyVendor", ctx=None))
+        lib_dir = os.path.join(project["third_party"], "footprints", "MyVendor.pretty")
+        board = _make_board(tmp_path)
+        _run(
+            tools["add_footprints_to_library"](
+                pcb_path=board, footprints=["Connector_Odd"], library="MyVendor", ctx=None
+            )
+        )
+        removed = _run(
+            tools["remove_footprints_from_library"](
+                library="MyVendor", footprints=["Connector_Odd"], ctx=None
+            )
+        )
+        assert removed["removed_count"] == 1
+        deleted = _run(tools["delete_footprint_library"](library="MyVendor", ctx=None))
+        assert "error" not in deleted, deleted
+        assert deleted["deleted"] is True
+        assert not os.path.exists(lib_dir)
+
+    def test_unknown_library_returns_error(self, tools):
+        result = _run(tools["delete_footprint_library"](library="NoSuchLib", ctx=None))
+        assert "error" in result
+        assert "success" not in result

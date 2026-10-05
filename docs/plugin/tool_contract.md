@@ -23,6 +23,8 @@
 | `create_symbol` | `symbol_edit_tools` | Generate a new symbol definition into an existing library (optionally place one instance) |
 | `add_symbol_to_library` | `symbol_edit_tools` | Export cached symbols from a schematic into a library |
 | `find_symbols_not_in_libraries` | `symbol_edit_tools` | List schematic symbols missing from all available libraries |
+| `remove_symbol_from_library` | `symbol_edit_tools` | Remove named symbol definitions from an existing library |
+| `delete_symbol_library` | `symbol_edit_tools` | Delete an **empty** symbol library (file + table entry + index) |
 | `remove_symbol_from_schematic` | `symbol_edit_tools` | Remove one or more components by reference designator |
 | `set_symbol_property` | `symbol_edit_tools` | Set or create a named property (e.g. `Value`, `Footprint`) on a component |
 | `list_symbol_properties` | `symbol_edit_tools` | Return all properties for a component |
@@ -275,6 +277,32 @@ Entries already present in the target library are reported in `skipped` (never o
 - `schematic_path` (`str`) — absolute path to the `.kicad_sch` to inspect.
 
 **Success response:** `{"missing": [{"name": "MYOP", "library": "自定义", "references": ["U1"], "reference_count": 1}], "missing_count": 1}`
+
+---
+
+#### `remove_symbol_from_library(library, symbols)`
+
+**Purpose:** Removes named symbol definitions from an existing symbol library (`.kicad_sym`). Only the library file is modified — no schematic is ever touched. Each requested plain symbol name must exist as a top-level definition; missing or unsafe names are reported in `failed` (valid names are still removed — no partial-commit ambiguity). The library is re-indexed so removed symbols disappear from search. Removing the *last* symbol leaves a valid empty library file.
+
+**Key parameters:**
+- `library` (`str`) — nickname of the target library (must exist in sym-lib-table).
+- `symbols` (`list[str]`) — plain symbol names to remove (e.g. `["NINJA_IO"]`). Must be non-empty.
+
+**Success response:** `{"library": "MyLib", "library_path": "...", "removed": ["MyLib:MYOP"], "removed_count": 1, "failed": [], "failed_count": 0, "indexed": 0}`
+
+---
+
+#### `delete_symbol_library(library, project_dir=None)`
+
+**Purpose:** Deletes an **empty** symbol library: the `.kicad_sym` file, its sym-lib-table entry (with `.bak` backup of the table), and its index entries. Refuses with `error` while the library still contains any top-level symbol — empty it first with `remove_symbol_from_library`. This tool never deletes a non-empty library.
+
+**Key parameters:**
+- `library` (`str`) — nickname of the library to delete.
+- `project_dir` (`str`, optional) — project directory when the library is project-local (`${KIPRJMOD}` URI). Omit for global libraries.
+
+**Success response:** `{"library": "MyLib", "path": "...", "table_path": "...", "unregistered": true, "table_backup": "...", "index_removed": true, "deleted": true}`
+
+**Non-empty refusal:** `{"error": "Library 'MyLib' is not empty (2 symbol(s): A, B); refusing to delete. Use remove_symbol_from_library first."}`
 
 ---
 

@@ -7,6 +7,7 @@ Unit tests for:
 
 import os
 
+from kcaa.utils import pcb_library_utils
 from kcaa.utils.footprint_database import (
     FootprintDatabase,
     FootprintRecord,
@@ -232,6 +233,27 @@ class TestBuildEffectiveLibraryList:
     def test_returns_list(self):
         entries = build_effective_library_list()
         assert isinstance(entries, list)
+
+    def test_project_dir_accepted_directly(self, tmp_path, monkeypatch):
+        """A project *directory* (not a .kicad_pro file) must resolve the
+        project-local fp-lib-table too — delete/remove library tools pass
+        project_dir straight through."""
+        lib_dir = _make_pretty(tmp_path, "Proj", ["R_Proj"])
+        table = tmp_path / "fp-lib-table"
+        table.write_text(
+            "(fp_lib_table\n  (version 7)\n"
+            f'  (lib (name "Proj") (type "KiCad") (uri "{lib_dir}") (options "") (descr "project"))\n'
+            ")"
+        )
+        # No global tables: isolate config dirs so only the project table counts.
+        monkeypatch.setattr(
+            pcb_library_utils,
+            "_default_kicad_config_dirs",
+            lambda: [str(tmp_path / "no-such-config")],
+        )
+        entries = build_effective_library_list(str(tmp_path))
+        nicknames = [e["nickname"] for e in entries]
+        assert "Proj" in nicknames
 
 
 # ---------------------------------------------------------------------------
