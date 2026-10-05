@@ -1,5 +1,5 @@
 """Tests for the symbol-library MCP tools:
-``add_symbol_to_library`` and ``find_symbols_not_in_libraries``
+``add_symbols_to_library`` and ``find_symbols_not_in_libraries``
 (kcaa.tools.symbol_edit_tools).
 
 Both tools are read-only with respect to the schematic: they never modify
@@ -106,14 +106,14 @@ def _run(tool, **kwargs):
 
 
 # ---------------------------------------------------------------------------
-# add_symbol_to_library
+# add_symbols_to_library
 # ---------------------------------------------------------------------------
 
 
 class TestAddSymbolToLibrary:
     def test_exports_cached_symbol(self, tools, env, tmp_sch):
         result = _run(
-            tools["add_symbol_to_library"],
+            tools["add_symbols_to_library"],
             schematic_path=tmp_sch,
             symbols=["Device:R_Small"],
             library=env["lib"],
@@ -131,10 +131,10 @@ class TestAddSymbolToLibrary:
         assert "R_Small" in list_library_symbols(env["lib_path"])
 
     def test_any_cached_symbol_not_just_custom(self, tools, env, tmp_sch):
-        """add_symbol_to_library handles *any* cached symbol (user said so),
+        """add_symbols_to_library handles *any* cached symbol (user said so),
         not only ones created via create_symbol (自定义:...)."""
         result = _run(
-            tools["add_symbol_to_library"],
+            tools["add_symbols_to_library"],
             schematic_path=tmp_sch,
             symbols=["Device:C"],
             library=env["lib"],
@@ -145,7 +145,7 @@ class TestAddSymbolToLibrary:
 
     def test_plain_name_matches_local_part(self, tools, env, tmp_sch):
         result = _run(
-            tools["add_symbol_to_library"],
+            tools["add_symbols_to_library"],
             schematic_path=tmp_sch,
             symbols=["R_Small"],
             library=env["lib"],
@@ -155,14 +155,14 @@ class TestAddSymbolToLibrary:
 
     def test_duplicate_export_is_skipped_not_overwritten(self, tools, env, tmp_sch):
         first = _run(
-            tools["add_symbol_to_library"],
+            tools["add_symbols_to_library"],
             schematic_path=tmp_sch,
             symbols=["Device:R_Small"],
             library=env["lib"],
         )
         assert first["exported_count"] == 1
         second = _run(
-            tools["add_symbol_to_library"],
+            tools["add_symbols_to_library"],
             schematic_path=tmp_sch,
             symbols=["Device:R_Small"],
             library=env["lib"],
@@ -174,7 +174,7 @@ class TestAddSymbolToLibrary:
 
     def test_missing_symbol_reported_in_failed(self, tools, env, tmp_sch):
         result = _run(
-            tools["add_symbol_to_library"],
+            tools["add_symbols_to_library"],
             schematic_path=tmp_sch,
             symbols=["Ghost"],
             library=env["lib"],
@@ -185,7 +185,7 @@ class TestAddSymbolToLibrary:
 
     def test_unknown_library_returns_error(self, tools, env, tmp_sch):
         result = _run(
-            tools["add_symbol_to_library"],
+            tools["add_symbols_to_library"],
             schematic_path=tmp_sch,
             symbols=["Device:R_Small"],
             library="NoSuchLib",
@@ -195,7 +195,7 @@ class TestAddSymbolToLibrary:
 
     def test_empty_symbols_returns_error(self, tools, env, tmp_sch):
         result = _run(
-            tools["add_symbol_to_library"],
+            tools["add_symbols_to_library"],
             schematic_path=tmp_sch,
             symbols=[],
             library=env["lib"],
@@ -211,7 +211,7 @@ class TestAddSymbolToLibrary:
         before = sch_path.read_bytes()
 
         _run(
-            tools["add_symbol_to_library"],
+            tools["add_symbols_to_library"],
             schematic_path=str(sch_path),
             symbols=["Device:R_Small", "Device:C"],
             library=env["lib"],
@@ -221,7 +221,7 @@ class TestAddSymbolToLibrary:
 
     def test_two_symbols_batch_export(self, tools, env, tmp_sch):
         result = _run(
-            tools["add_symbol_to_library"],
+            tools["add_symbols_to_library"],
             schematic_path=tmp_sch,
             symbols=["Device:R_Small", "Device:C"],
             library=env["lib"],
@@ -282,7 +282,7 @@ class TestFindSymbolsNotInLibraries:
 def _seed_library(env, tools, tmp_sch, symbols=("Device:R_Small", "Device:C")):
     """Export fixture cached symbols into env's library; return their plain names."""
     result = _run(
-        tools["add_symbol_to_library"],
+        tools["add_symbols_to_library"],
         schematic_path=tmp_sch,
         symbols=list(symbols),
         library=env["lib"],

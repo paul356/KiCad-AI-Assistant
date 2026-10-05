@@ -21,7 +21,7 @@
 | `add_symbol_to_schematic` | `symbol_edit_tools` | Place a library symbol onto a schematic |
 | `create_symbol_library` | `symbol_edit_tools` | Create a new `.kicad_sym` library and register it in sym-lib-table |
 | `create_symbol` | `symbol_edit_tools` | Generate a new symbol definition into an existing library (optionally place one instance) |
-| `add_symbol_to_library` | `symbol_edit_tools` | Export cached symbols from a schematic into a library |
+| `add_symbols_to_library` | `symbol_edit_tools` | Export cached symbols from a schematic into a library |
 | `find_symbols_not_in_libraries` | `symbol_edit_tools` | List schematic symbols missing from all available libraries |
 | `remove_symbols_from_library` | `symbol_edit_tools` | Remove named symbol definitions from an existing library |
 | `delete_symbols_library` | `symbol_edit_tools` | Delete an **empty** symbol library (file + table entry + index) |
@@ -254,7 +254,7 @@ The `lib_id` is `<library>:<symbol_name>`. Calling with a `symbol_name` that alr
 
 ---
 
-#### `add_symbol_to_library(schematic_path, symbols, library)`
+#### `add_symbols_to_library(schematic_path, symbols, library)`
 
 **Purpose:** Copies raw symbol definitions from a schematic's `lib_symbols` cache into an existing library (`.kicad_sym`). Read-only with respect to the schematic — the source file is never modified. Handles **any** cached symbol, not just `create_symbol`-generated ones.
 
@@ -271,7 +271,7 @@ Entries already present in the target library are reported in `skipped` (never o
 
 #### `find_symbols_not_in_libraries(schematic_path)`
 
-**Purpose:** Read-only discovery. Compares the `lib_id` of every symbol instance referenced by the schematic against the libraries actually available (project sym-lib-table, global user table, system libraries) and returns the symbols whose `(library, name)` resolves to nothing, consolidated per symbol with the reference designators that use it. Use before `add_symbol_to_library` to see which cached custom symbols still need exporting.
+**Purpose:** Read-only discovery. Compares the `lib_id` of every symbol instance referenced by the schematic against the libraries actually available (project sym-lib-table, global user table, system libraries) and returns the symbols whose `(library, name)` resolves to nothing, consolidated per symbol with the reference designators that use it. Use before `add_symbols_to_library` to see which cached custom symbols still need exporting.
 
 **Key parameters:**
 - `schematic_path` (`str`) — absolute path to the `.kicad_sch` to inspect.

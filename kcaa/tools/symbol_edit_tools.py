@@ -166,7 +166,7 @@ def _do_create_symbol_library(
     if any(lib["nickname"] == nickname for lib in effective):
         return {
             "error": (
-                f"Library '{nickname}' already exists; use add_symbol_to_library to export into it."
+                f"Library '{nickname}' already exists; use add_symbols_to_library to export into it."
             )
         }
 
@@ -188,7 +188,7 @@ def _do_create_symbol_library(
             return {
                 "error": (
                     f"Library file already exists, refusing to recreate: {library_file}. "
-                    "Use add_symbol_to_library to export into it."
+                    "Use add_symbols_to_library to export into it."
                 )
             }
         create_empty_library_file(library_file)
@@ -2323,7 +2323,7 @@ def register_symbol_edit_tools(mcp: FastMCP) -> None:
         return _do_create_symbol_library(name=name, project_dir=project_dir)
 
     @mcp.tool()
-    async def add_symbol_to_library(
+    async def add_symbols_to_library(
         schematic_path: str,
         symbols: list[str],
         library: str,
@@ -2374,7 +2374,7 @@ def register_symbol_edit_tools(mcp: FastMCP) -> None:
         Symbols whose ``(library, name)`` resolves to nothing are returned,
         consolidated per symbol with the reference designators that use it.
 
-        Use this before ``add_symbol_to_library`` to see which cached custom
+        Use this before ``add_symbols_to_library`` to see which cached custom
         symbols still need exporting.  ``create_symbol``-generated symbols
         only exist in the schematic cache until exported; placing them into
         a library makes them reusable and index-searchable.
