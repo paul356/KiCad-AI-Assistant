@@ -19,7 +19,10 @@
 | `get_symbol_index_stats` | `symbol_tools` | Return aggregate counts for the index |
 | `get_symbol_pins` | `symbol_tools` | Return pin list (number, name, type, direction) for one symbol |
 | `add_symbol_to_schematic` | `symbol_edit_tools` | Place a library symbol onto a schematic |
-| `create_symbol` | `symbol_edit_tools` | Define a new symbol in the schematic's `lib_symbols` (optionally place one instance) |
+| `create_symbol_library` | `symbol_edit_tools` | Create a new `.kicad_sym` library and register it in sym-lib-table |
+| `create_symbol` | `symbol_edit_tools` | Generate a new symbol definition into an existing library (optionally place one instance) |
+| `add_symbol_to_library` | `symbol_edit_tools` | Export cached symbols from a schematic into a library |
+| `find_symbols_not_in_libraries` | `symbol_edit_tools` | List schematic symbols missing from all available libraries |
 | `remove_symbol_from_schematic` | `symbol_edit_tools` | Remove one or more components by reference designator |
 | `set_symbol_property` | `symbol_edit_tools` | Set or create a named property (e.g. `Value`, `Footprint`) on a component |
 | `list_symbol_properties` | `symbol_edit_tools` | Return all properties for a component |
@@ -215,25 +218,63 @@ All tools in this group write a backup to `<schematic_path>.bak` before saving.
 
 ---
 
-#### `create_symbol(schematic_path, symbol_name, pins, reference_prefix="U", value=None, body_width=None, body_height=None, x=None, y=None, rotation=0, fields_autoplaced=True)`
+#### `create_symbol_library(name, project_dir=None)`
 
-**Purpose:** Defines a brand-new symbol (rectangular body + one pin per entry) directly in the schematic's `lib_symbols` block, optionally placing a single instance at `x`/`y`. Unlike `add_symbol_to_schematic`, no library lookup is needed — the definition is generated from the `pins` argument. Call with `x`/`y` omitted to only define the symbol.
+**Purpose:** Creates a new empty symbol library (`.kicad_sym`) and registers it in sym-lib-table, making it the target for the new library-aware `create_symbol`. Call this **before** `create_symbol` — that tool now requires an existing library.
 
 **Key parameters:**
-- `schematic_path` (`str`) — absolute path to `.kicad_sch`.
-- `symbol_name` (`str`) — new symbol name; must match `^[A-Za-z][A-Za-z0-9_]*$` (no leading digit).
-- `pins` (`list[dict]`) — one entry per pin: `{"number": "1", "name": "IN", "type": "input", "direction": "left"}`. `type` must be in the pin-type whitelist: `input`, `output`, `bidirectional`, `tri_state`, `passive`, `free`, `no_connect`, `power_in`, `power_out`, `open_collector`, `open_emitter`, `unspecified`. `direction` must be `left`, `right`, `up`, or `down`. `number` must be a non-empty, unique string; `name` must be a string or `None` (rendered as empty).
-- `reference_prefix` (`str`) — reference prefix for a placed instance's auto-assigned number (e.g. `U` → `U1`, `U2`); must match `^[A-Za-z][A-Za-z0-9_]*$` (must start with a letter). Defaults to `"U"`.
+- `name` (`str`) — library nickname (sanitised to sym-lib-table-safe characters).
+- `project_dir` (`str | None`) — when given, the library file is created inside the project directory and registered in the project's `sym-lib-table` (created if absent) with a `${KIPRJMOD}` URI. When omitted, the library is created under `${KICADxx_3RD_PARTY}/symbols` and registered in the global user sym-lib-table.
+
+The library is created empty and indexed immediately, so `search_symbols` / `list_symbol_libraries` see it. Fails if the name is invalid, the library or file already exists (no silent overwrite), or the project directory does not exist.
+
+**Success response:** `{"library": "MyLib", "path": "/abs/MyLib.kicad_sym", "table_path": "/abs/sym-lib-table", "registered": true, "indexed": 0}`
+
+---
+
+#### `create_symbol(library, symbol_name, pins, reference_prefix="U", value=None, body_width=None, body_height=None)`
+
+**Purpose:** Defines a brand-new symbol (rectangular body + one pin per entry) into an existing **user symbol library** (`.kicad_sym`) — **definition-only**. The schematic is never touched. To place an instance of the new symbol afterwards, call `add_symbol_to_schematic` (or `place_symbol_relative`) with `library_name` + `symbol_name`. Unlike `add_symbol_to_schematic`, no external library lookup is needed — the definition is generated from the `pins` argument. `library` must already exist — call `create_symbol_library` first.
+
+**Key parameters:**
+- `library` (`str`) — target library nickname; **must already exist** (create it with `create_symbol_library` first). Resolved through sym-lib-table.
+- `symbol_name` (`str`) — new symbol name; must match `^[A-Za-z][A-Za-z0-9_]*$` (no leading digit). Must **not** already exist in the library — no overwrite.
+- `pins` (`list[dict]`) — one entry per pin: `{"number": "1", "name": "IN", "type": "input", "direction": "left"}`. `type` must be in the pin-type whitelist: `input`, `output`, `bidirectional`, `tri_state`, `passive`, `free`, `no_connect`, `power_in`, `power_out`, `open_collector`, `open_emitter`, `unspecified`. `direction` must be `left`, `right`, `up`, or `down`. `number` must be a non-empty, unique string; `name` must be a string or `None` (rendered as empty). Pins on one side are laid out in counter-clockwise order (KiCad DIP convention), 2.54 mm (100 mil) apart.
+- `reference_prefix` (`str`) — prefix for the symbol's default `Reference` property (e.g. `U`); must match `^[A-Za-z][A-Za-z0-9_]*$` (must start with a letter). Defaults to `"U"`.
 - `value` (`str | None`) — overrides the `Value` property; defaults to `symbol_name`.
 - `body_width` / `body_height` (`float | None`) — body size in mm; omitted → default width 6.35 mm / height derived from the pin span. Enlarged (with a warning) if too small to contain the pins.
-- `x`, `y` (`float | None`) — optional placement position in mm; snapped to the 1.27 mm (50-mil) grid. Must be given together or both omitted. Pins on one side are spaced 2.54 mm (100 mil) apart, centred on the body.
-- `rotation` (`int`) — `0`, `90`, `180`, or `270`.
 
-The definition is registered under the fixed library table ``自定义`` ("custom"), so the `lib_id` is always ``自定义:<symbol_name>``. Calling again with a `symbol_name` that already exists in `lib_symbols` fails — there is no silent overwrite.
+The `lib_id` is `<library>:<symbol_name>`. Calling with a `symbol_name` that already exists in the library fails — there is no silent overwrite.
 
-**Success response:** `{"success": true, "lib_id": "自定义:MYOP", "units_added": 1, "pin_count": N, "position": {"x": ..., "y": ...} | None, "file_modified": "...", "backup_path": "...", "warnings": [...]}`
+**Success response:** `{"success": true, "lib_id": "MyLib:MYOP", "library": "MyLib", "library_path": "/abs/MyLib.kicad_sym", "units_added": 1, "pin_count": N, "warnings": [...]}`
 
 **Failure response:** `{"error": "<message>"}` — note there is **no `success` key at all** in failures (unlike `add_symbol_to_schematic`, whose failures are `{"success": false, "error": ...}`). Treat any response containing `"error"` as a failure.
+
+---
+
+#### `add_symbol_to_library(schematic_path, symbols, library)`
+
+**Purpose:** Copies raw symbol definitions from a schematic's `lib_symbols` cache into an existing library (`.kicad_sym`). Read-only with respect to the schematic — the source file is never modified. Handles **any** cached symbol, not just `create_symbol`-generated ones.
+
+**Key parameters:**
+- `schematic_path` (`str`) — absolute path to the source `.kicad_sch`.
+- `symbols` (`list[str]`) — plain names (`"MYOP"`) or fully-qualified lib_ids (`"自定义:MYOP"`, `"Device:R"`). Plain names match every cached entry whose local name (after the last `:`) equals them.
+- `library` (`str`) — target library nickname (must already exist).
+
+Entries already present in the target library are reported in `skipped` (never overwritten); entries not present in the schematic are reported in `failed`. The library is re-indexed afterwards.
+
+**Success response:** `{"library": "MyLib", "library_path": "...", "exported": ["MyLib:MYOP"], "exported_count": 1, "failed": [], "failed_count": 0, "skipped": [], "skipped_count": 0, "indexed": 1}`
+
+---
+
+#### `find_symbols_not_in_libraries(schematic_path)`
+
+**Purpose:** Read-only discovery. Compares the `lib_id` of every symbol instance referenced by the schematic against the libraries actually available (project sym-lib-table, global user table, system libraries) and returns the symbols whose `(library, name)` resolves to nothing, consolidated per symbol with the reference designators that use it. Use before `add_symbol_to_library` to see which cached custom symbols still need exporting.
+
+**Key parameters:**
+- `schematic_path` (`str`) — absolute path to the `.kicad_sch` to inspect.
+
+**Success response:** `{"missing": [{"name": "MYOP", "library": "自定义", "references": ["U1"], "reference_count": 1}], "missing_count": 1}`
 
 ---
 

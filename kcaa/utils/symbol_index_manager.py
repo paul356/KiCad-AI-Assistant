@@ -491,6 +491,39 @@ class SymbolIndexManager:
         return self._db.get_library_by_name(name)
 
     # ------------------------------------------------------------------
+    # Narrow single-library indexing (library write tools)
+    # ------------------------------------------------------------------
+
+    def index_library(self, library_name: str, file_path: str) -> int:
+        """Index exactly one ``.kicad_sym`` file into the database.
+
+        Narrow update for the schematic → library export tools: indexes a
+        single library file without traversing the effective library list.
+
+        :param library_name: Library nickname as it appears in sym-lib-table
+            (for directory-style libraries the caller passes the composed
+            ``TableName/FileBaseName`` form, matching ``sync``).
+        :param file_path: Absolute path to the ``.kicad_sym`` file.
+        :returns: Number of symbols stored, or -1 on failure.
+        """
+        if not os.path.isfile(file_path):
+            log.warning("index_library: not a file: %s", file_path)
+            return -1
+        try:
+            stat = os.stat(file_path)
+        except OSError as exc:
+            log.warning("index_library: cannot stat %s: %s", file_path, exc)
+            return -1
+        checksum = self._compute_checksum(file_path)
+        return self._index_library(
+            library_name,
+            file_path,
+            stat.st_mtime,
+            stat.st_size,
+            checksum,
+        )
+
+    # ------------------------------------------------------------------
     # Statistics
     # ------------------------------------------------------------------
 

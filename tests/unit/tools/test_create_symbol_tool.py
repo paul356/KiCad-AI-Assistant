@@ -1,35 +1,31 @@
 """Tests for the create_symbol MCP tool (kcaa.tools.symbol_edit_tools).
 
-Like the rest of the symbol_edit tests, disk-writing tests operate on a
-temporary copy of tests/unit/tools/tools_test.kicad_sch so the fixture is
-never modified.  The tool builds a brand-new lib symbol definition from
-``pins`` and injects it under lib_id "自定义:NAME"; no index or library
-fixture is involved.
+The tool is a pure library writer: it defines a brand-new lib symbol and
+appends it to an existing ``.kicad_sym`` library, never touching a
+schematic.  Disk-writing tests run in an isolated environment: the KiCad
+config dir, 3rd-party symbols dir, sym-lib-table, and symbol index DB are
+all redirected into a per-test tmp_path via monkeypatch, so the real user
+environment is never touched.
 """
 
 import asyncio
 import math
 import os
-from pathlib import Path
-import shutil
-import tempfile
 
 import pytest
 import sexpdata
-import skip
 
 from kcaa.tools.symbol_edit_tools import (
     _DEFAULT_PIN_LENGTH_MM,
     _build_lib_symbol_raw,
+    _do_create_symbol_library,
     _extract_lib_pin_positions,
     _lib_pins_world,
 )
 
 # ---------------------------------------------------------------------------
-# Paths / fixtures
+# Fixtures
 # ---------------------------------------------------------------------------
-
-SCHEMATIC_PATH = str(Path(__file__).parent / "fixtures/tools_test.kicad_sch")
 
 # 2 inputs on the left + 1 output on the right (taskbook example).
 PINS_2IN_1OUT = [
@@ -38,19 +34,8 @@ PINS_2IN_1OUT = [
     {"number": "3", "name": "OUT", "type": "output", "direction": "right"},
 ]
 
-LIB_ID = "自定义:MYOP"
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def _make_temp_copy() -> str:
-    tmp = tempfile.NamedTemporaryFile(suffix=".kicad_sch", delete=False, dir=tempfile.gettempdir())
-    tmp.close()
-    shutil.copy(SCHEMATIC_PATH, tmp.name)
-    return tmp.name
+LIB = "TestLib"
+LIB_ID = "TestLib:MYOP"
 
 
 class _MockMCP:
@@ -81,19 +66,70 @@ def tools():
 
 
 @pytest.fixture()
-def tmp_sch():
-    """Yield a temp copy of the schematic, then clean up."""
-    path = _make_temp_copy()
-    yield path
-    for p in [path, path + ".bak"]:
-        if os.path.exists(p):
-            os.unlink(p)
+def env(tmp_path, monkeypatch):
+    """Isolated symbol-library environment with one pre-created lib ``TestLib``.
+
+    Redirects: KiCad config dir -> tmp_path (sym-lib-table lives here),
+    ``${KICAD{ver}_3RD_PARTY}`` -> tmp_path/3rdparty, symbol index DB ->
+    tmp_path/symbol_test.db.  The library is created via the real
+    ``_do_create_symbol_library`` so table registration and indexing are
+    exercised end-to-end.
+    """
+    from kcaa.utils import pcb_library_utils
+    from kcaa.utils.config import config
+
+    third_party = tmp_path / "3rdparty"
+    third_party.mkdir()
+    (third_party / "symbols").mkdir()
+
+    monkeypatch.setattr(pcb_library_utils, "_default_kicad_config_dirs", lambda: [str(tmp_path)])
+    monkeypatch.setattr(config, "_kicad_3rd_party", str(third_party))
+    # ${KICAD10_3RD_PARTY} URIs are expanded via os.environ (ServerConfig
+    # builds a fresh instance), so set the env var — not just the singleton.
+    monkeypatch.setenv("KICAD10_3RD_PARTY", str(third_party))
+    monkeypatch.setattr(
+        "kcaa.tools.symbol_edit_tools._3rd_party_symbols_dir",
+        lambda: str(third_party / "symbols"),
+    )
+    # Isolate the symbol index: tools use the module-level singleton, so
+    # swap the factory for a temp-DB manager (never the real user DB).
+    from kcaa.utils.config import ServerConfig
+    from kcaa.utils.symbol_index_manager import SymbolIndexManager
+    from kcaa.utils.symbol_index_reader import SymbolIndexReader
+
+    index_mgr = SymbolIndexManager(
+        SymbolIndexReader(ServerConfig()), db_path=str(tmp_path / "symbol_test.db")
+    )
+    monkeypatch.setattr("kcaa.tools.symbol_edit_tools._get_index_manager", lambda: index_mgr)
+
+    created = _do_create_symbol_library(LIB)
+    assert "error" not in created, created
+    return {
+        "tmp_path": str(tmp_path),
+        "lib": LIB,
+        "lib_path": created["path"],
+        "table_path": created["table_path"],
+        "index_mgr": index_mgr,
+    }
 
 
-def _lib_symbol_raw(sch, lib_id: str):
-    """Return the raw (symbol ...) lib entry for *lib_id* from a reloaded sch."""
-    for entry in sch.lib_symbols._pv._tree:
-        if isinstance(entry, list) and len(entry) >= 2 and entry[1] == lib_id:
+# ---------------------------------------------------------------------------
+# Helpers (operate on raw sexpdata from the .kicad_sym file)
+# ---------------------------------------------------------------------------
+
+
+def _lib_symbol_raw(lib_path: str, name: str):
+    """Return the raw ``(symbol NAME ...)`` node from a .kicad_sym file."""
+    with open(lib_path, encoding="utf-8") as fh:
+        data = sexpdata.loads(fh.read())
+    for entry in data:
+        if (
+            isinstance(entry, list)
+            and len(entry) >= 2
+            and isinstance(entry[0], sexpdata.Symbol)
+            and entry[0].value() == "symbol"
+            and entry[1] == name
+        ):
             return entry
     return None
 
@@ -113,6 +149,8 @@ def _find_unit_node(lib_raw, name: str):
 
 def _pin_nodes(lib_raw):
     unit = _find_unit_node(lib_raw, "MYOP_1_1")
+    if unit is None:
+        unit = _find_unit_node(lib_raw, "MYOP_0_1")
     return [
         child
         for child in unit[2:]
@@ -175,98 +213,127 @@ def _rect_bounds(lib_raw) -> tuple[float, float, float, float]:
     return (start[0], start[1], end[0], end[1])  # min_x, max_y, max_x, min_y
 
 
-def _placed_symbols(sch, lib_id: str = LIB_ID):
-    out = []
-    for sym in sch.symbol:
-        try:
-            if sym.lib_id.value == lib_id:
-                out.append(sym)
-        except AttributeError:
-            continue
+def _properties(lib_raw):
+    """Return {name: {text, hide}} for the top-level property nodes.
+
+    Node shape: ``(property "Name" "value" (at ...) ... (hide yes)?)``
+    """
+    out = {}
+    for child in lib_raw[2:]:
+        if (
+            isinstance(child, list)
+            and len(child) >= 2
+            and isinstance(child[0], sexpdata.Symbol)
+            and child[0].value() == "property"
+        ):
+            text = child[2] if len(child) >= 3 and isinstance(child[2], str) else ""
+            hide = any(
+                isinstance(sub, list)
+                and sub
+                and isinstance(sub[0], sexpdata.Symbol)
+                and sub[0].value() == "hide"
+                for sub in child[2:]
+            )
+            out[child[1]] = {"text": text, "hide": hide}
     return out
 
 
-def _call_create(tools, tmp_sch, **kwargs):
-    return asyncio.run(tools["create_symbol"](schematic_path=tmp_sch, **kwargs))
+def _call_create(tools, env, **kwargs):
+    if "library" not in kwargs:
+        kwargs["library"] = env["lib"]
+    return asyncio.run(tools["create_symbol"](**kwargs))
 
 
 # ---------------------------------------------------------------------------
-# Definition building
+# Library definition (pure writer — no schematic involvement)
 # ---------------------------------------------------------------------------
 
 
 class TestCreateSymbolDefinition:
-    def test_injects_definition_and_reports_metadata(self, tools, tmp_sch):
-        result = _call_create(tools, tmp_sch, symbol_name="MYOP", pins=PINS_2IN_1OUT)
+    def test_writes_definition_and_reports_metadata(self, tools, env):
+        result = _call_create(tools, env, symbol_name="MYOP", pins=PINS_2IN_1OUT)
         assert result.get("success") is True, result
         assert result["lib_id"] == LIB_ID
+        assert result["library"] == LIB
+        assert result["library_path"] == env["lib_path"]
         assert result["pin_count"] == 3
         assert result["units_added"] == 1
-        assert result["position"] is None
-        assert result["file_modified"] == tmp_sch
-        assert result["backup_path"] == tmp_sch + ".bak"
         assert result["warnings"] == []
+        # Pure library writer: no schematic keys at all.
+        for key in ("position", "file_modified", "backup_path"):
+            assert key not in result, key
 
-    def test_file_round_trips_through_skip(self, tools, tmp_sch):
-        """After writing, skip re-parses the file and sees the new definition."""
-        _call_create(tools, tmp_sch, symbol_name="MYOP", pins=PINS_2IN_1OUT)
-        sch = skip.Schematic(tmp_sch)
-        assert LIB_ID in sch.lib_symbols
-        raw = _lib_symbol_raw(sch, LIB_ID)
+    def test_definition_survives_sexpdata_round_trip(self, tools, env):
+        _call_create(tools, env, symbol_name="MYOP", pins=PINS_2IN_1OUT)
+        raw = _lib_symbol_raw(env["lib_path"], "MYOP")
         assert raw is not None
         assert len(_pin_nodes(raw)) == 3
-        # Properties Reference/Value/Footprint/Datasheet are present.
-        prop_names = [
+
+    def test_no_placed_units_in_library_entry(self, tools, env):
+        """The library entry is a plain definition — no (symbol ...) instances."""
+        _call_create(tools, env, symbol_name="MYOP", pins=PINS_2IN_1OUT)
+        raw = _lib_symbol_raw(env["lib_path"], "MYOP")
+        unit_names = [
             child[1]
             for child in raw[2:]
             if (
                 isinstance(child, list)
                 and len(child) >= 2
                 and isinstance(child[0], sexpdata.Symbol)
-                and child[0].value() == "property"
+                and child[0].value() == "symbol"
             )
         ]
-        assert prop_names[:4] == ["Reference", "Value", "Footprint", "Datasheet"]
-        # Footprint/Datasheet carry (hide yes); Reference/Value stay visible.
-        prop_hide = {
-            child[1]: any(
-                isinstance(c, list)
-                and len(c) >= 2
-                and isinstance(c[0], sexpdata.Symbol)
-                and c[0].value() == "hide"
-                for c in child[2:]
-            )
-            for child in raw[2:]
-            if (
-                isinstance(child, list)
-                and len(child) >= 2
-                and isinstance(child[0], sexpdata.Symbol)
-                and child[0].value() == "property"
-            )
-        }
-        assert prop_hide == {
-            "Reference": False,
-            "Value": False,
-            "Footprint": True,
-            "Datasheet": True,
-        }
+        assert unit_names == ["MYOP_0_1", "MYOP_1_1"]
 
-    def test_define_only_creates_no_placed_instance(self, tools, tmp_sch):
-        """Without x/y there must be no placed symbol using the new lib_id."""
-        before = len(list(skip.Schematic(tmp_sch).symbol))
-        _call_create(tools, tmp_sch, symbol_name="MYOP", pins=PINS_2IN_1OUT)
-        sch = skip.Schematic(tmp_sch)
-        assert len(list(sch.symbol)) == before
-        assert _placed_symbols(sch) == []
+    def test_properties_present_and_visibility(self, tools, env):
+        _call_create(tools, env, symbol_name="MYOP", pins=PINS_2IN_1OUT)
+        props = _properties(_lib_symbol_raw(env["lib_path"], "MYOP"))
+        assert list(props)[:4] == ["Reference", "Value", "Footprint", "Datasheet"]
+        assert props["Reference"]["text"] == "U"
+        assert props["Value"]["text"] == "MYOP"
+        assert props["Footprint"]["hide"] is True
+        assert props["Datasheet"]["hide"] is True
 
-    def test_creates_backup(self, tools, tmp_sch):
-        _call_create(tools, tmp_sch, symbol_name="MYOP", pins=PINS_2IN_1OUT)
-        assert os.path.exists(tmp_sch + ".bak")
+    def test_value_override_used(self, tools, env):
+        _call_create(tools, env, symbol_name="MYOP", pins=PINS_2IN_1OUT, value="AMPLIFIER")
+        props = _properties(_lib_symbol_raw(env["lib_path"], "MYOP"))
+        assert props["Value"]["text"] == "AMPLIFIER"
+
+    def test_library_file_backup_created(self, tools, env):
+        _call_create(tools, env, symbol_name="MYOP", pins=PINS_2IN_1OUT)
+        # append_symbol_to_library snapshots the library before editing.
+        assert os.path.exists(env["lib_path"] + ".bak")
+
+    def test_schematic_untouched(self, tools, env, tmp_path):
+        """A plain definition call must not create or modify any schematic."""
+        probe = tmp_path / "probe.kicad_sch"
+        probe.write_text('(kicad_sch (version 20231120) (generator "probe"))\n')
+        before = probe.read_bytes()
+        _call_create(tools, env, symbol_name="MYOP", pins=PINS_2IN_1OUT)
+        assert probe.read_bytes() == before
+        assert not (tmp_path / "probe.kicad_sch.bak").exists()
+
+    def test_multiple_symbols_append_to_same_library(self, tools, env):
+        first = _call_create(tools, env, symbol_name="MYOP", pins=PINS_2IN_1OUT)
+        assert first.get("success") is True
+        second = _call_create(
+            tools,
+            env,
+            symbol_name="MYOP2",
+            pins=[{"number": "1", "name": "A", "type": "input", "direction": "left"}],
+        )
+        assert second.get("success") is True, second
+        from kcaa.utils.symbol_library_utils import list_library_symbols
+
+        assert sorted(list_library_symbols(env["lib_path"])) == ["MYOP", "MYOP2"]
+
+
+# ---------------------------------------------------------------------------
+# Lib symbol layout (direct checks on _build_lib_symbol_raw, Y-up lib coords)
+# ---------------------------------------------------------------------------
 
 
 class TestLibSymbolLayout:
-    """Direct checks on _build_lib_symbol_raw geometry (lib coords, Y-up)."""
-
     def test_pin_layout_geometry(self):
         raw, warnings = _build_lib_symbol_raw("MYOP", PINS_2IN_1OUT, "U", "MYOP")
         assert warnings == []
@@ -348,8 +415,7 @@ class TestLibSymbolLayout:
                     # angle (KiCad convention: angle points tip→body, lib
                     # coords Y-up).  It must land exactly on a body edge —
                     # this is what makes the "inner end exactly on the body
-                    # edge" claim in _build_lib_symbol_raw true for the
-                    # generated geometry.
+                    # edge" claim in _build_lib_symbol_raw true.
                     rad = math.radians(angle)
                     inner_x = round(px + _DEFAULT_PIN_LENGTH_MM * math.cos(rad), 4)
                     inner_y = round(py + _DEFAULT_PIN_LENGTH_MM * math.sin(rad), 4)
@@ -400,7 +466,7 @@ class TestLibSymbolLayout:
             else:
                 assert y < 0 and x == 0.0 and angle == 90
 
-    def test_placed_pins_world_positions_on_expected_sides(self):
+    def test_lib_pins_world_positions_on_expected_sides(self):
         raw, _ = _build_lib_symbol_raw("MYOP", PINS_2IN_1OUT, "U", "MYOP")
         world = _lib_pins_world(raw, 100.0, 100.0, 0)
         assert len(world) == 3
@@ -411,213 +477,104 @@ class TestLibSymbolLayout:
 
 
 # ---------------------------------------------------------------------------
-# Placement
-# ---------------------------------------------------------------------------
-
-
-class TestCreateSymbolPlacement:
-    def test_place_assigns_next_reference(self, tools, tmp_sch):
-        result = _call_create(
-            tools,
-            tmp_sch,
-            symbol_name="MYOP",
-            pins=PINS_2IN_1OUT,
-            x=100.0,
-            y=100.0,
-        )
-        assert result.get("success") is True, result
-        pos = result["position"]
-        assert pos is not None
-        # Placement is auto-snapped to the 1.27mm (50-mil) grid.
-        assert abs(pos["x"] / 1.27 - round(pos["x"] / 1.27)) < 1e-6
-        assert abs(pos["y"] / 1.27 - round(pos["y"] / 1.27)) < 1e-6
-        sch = skip.Schematic(tmp_sch)
-        placed = _placed_symbols(sch)
-        assert len(placed) == 1
-        sym = placed[0]
-        assert sym.property.Reference.value == "U1"
-        assert sym.property.Value.value == "MYOP"
-        # Pin world coords land left/right of the instance, as designed.
-        raw = _lib_symbol_raw(sch, LIB_ID)
-        world = _lib_pins_world(raw, pos["x"], pos["y"], 0)
-        assert sum(1 for p in world if p[0] < pos["x"]) == 2
-        assert sum(1 for p in world if p[0] > pos["x"]) == 1
-
-    def test_place_offsets_grid(self, tools, tmp_sch):
-        result = _call_create(
-            tools,
-            tmp_sch,
-            symbol_name="MYOP",
-            pins=[{"number": "1", "name": "A", "type": "input", "direction": "left"}],
-            x=100.1,
-            y=99.9,
-        )
-        assert result.get("success") is True, result
-        px, py = result["position"]["x"], result["position"]["y"]
-        assert abs(px / 1.27 - round(px / 1.27)) < 1e-6
-        assert abs(py / 1.27 - round(py / 1.27)) < 1e-6
-
-    def test_value_override_used(self, tools, tmp_sch):
-        result = _call_create(
-            tools,
-            tmp_sch,
-            symbol_name="MYOP",
-            pins=PINS_2IN_1OUT,
-            x=200.0,
-            y=120.0,
-            value="AMPLIFIER",
-        )
-        assert result.get("success") is True, result
-        sch = skip.Schematic(tmp_sch)
-        assert _placed_symbols(sch)[0].property.Value.value == "AMPLIFIER"
-
-
-# ---------------------------------------------------------------------------
 # Validation failures — always {"error": ...} without "success"
 # ---------------------------------------------------------------------------
 
 
 class TestCreateSymbolValidation:
-    def test_empty_pins_returns_error(self, tools, tmp_sch):
-        result = _call_create(tools, tmp_sch, symbol_name="MYOP", pins=[])
+    def test_missing_library_returns_error(self, tools, env):
+        result = _call_create(
+            tools, env, library="NoSuchLib", symbol_name="MYOP", pins=PINS_2IN_1OUT
+        )
+        assert "error" in result
+        assert "success" not in result
+        assert "create_symbol_library" in result["error"]
+        assert "NoSuchLib" in result["error"]
+
+    def test_duplicate_symbol_name_returns_error(self, tools, env):
+        first = _call_create(tools, env, symbol_name="MYOP", pins=PINS_2IN_1OUT)
+        assert first.get("success") is True
+        # A second call with the same name must not silently overwrite.
+        second = _call_create(tools, env, symbol_name="MYOP", pins=PINS_2IN_1OUT)
+        assert "error" in second
+        assert "already exists" in second["error"]
+        assert "success" not in second
+
+    def test_empty_pins_returns_error(self, tools, env):
+        result = _call_create(tools, env, symbol_name="MYOP", pins=[])
         assert "error" in result
         assert "success" not in result
 
-    def test_invalid_direction_returns_error(self, tools, tmp_sch):
+    def test_invalid_direction_returns_error(self, tools, env):
         result = _call_create(
             tools,
-            tmp_sch,
+            env,
             symbol_name="MYOP",
             pins=[{"number": "1", "name": "A", "type": "input", "direction": "diagonal"}],
         )
         assert "error" in result
         assert "success" not in result
 
-    def test_invalid_type_returns_error(self, tools, tmp_sch):
+    def test_invalid_type_returns_error(self, tools, env):
         result = _call_create(
             tools,
-            tmp_sch,
+            env,
             symbol_name="MYOP",
             pins=[{"number": "1", "name": "A", "type": "analog", "direction": "left"}],
         )
         assert "error" in result
         assert "success" not in result
 
-    def test_duplicate_pin_number_returns_error(self, tools, tmp_sch):
+    def test_duplicate_pin_number_returns_error(self, tools, env):
         pins = [
             {"number": "1", "name": "A", "type": "input", "direction": "left"},
             {"number": "1", "name": "B", "type": "output", "direction": "right"},
         ]
-        result = _call_create(tools, tmp_sch, symbol_name="MYOP", pins=pins)
+        result = _call_create(tools, env, symbol_name="MYOP", pins=pins)
         assert "error" in result
         assert "success" not in result
 
-    def test_invalid_symbol_name_returns_error(self, tools, tmp_sch):
+    def test_invalid_symbol_name_returns_error(self, tools, env):
         for bad in ("1MYOP", "MY-OP", "MY OP", "MY.OP"):
-            result = _call_create(tools, tmp_sch, symbol_name=bad, pins=PINS_2IN_1OUT)
+            result = _call_create(tools, env, symbol_name=bad, pins=PINS_2IN_1OUT)
             assert "error" in result, bad
             assert "success" not in result, bad
         # A valid all-alphanumeric name passes.
-        ok = _call_create(tools, tmp_sch, symbol_name="MYOP2", pins=PINS_2IN_1OUT)
+        ok = _call_create(tools, env, symbol_name="MYOP2", pins=PINS_2IN_1OUT)
         assert ok.get("success") is True
 
-    def test_x_without_y_returns_error(self, tools, tmp_sch):
-        result = _call_create(tools, tmp_sch, symbol_name="MYOP", pins=PINS_2IN_1OUT, x=100.0)
-        assert "error" in result
-        assert "success" not in result
-
-    def test_y_without_x_returns_error(self, tools, tmp_sch):
-        result = _call_create(tools, tmp_sch, symbol_name="MYOP", pins=PINS_2IN_1OUT, y=100.0)
-        assert "error" in result
-        assert "success" not in result
-
-    def test_invalid_rotation_returns_error(self, tools, tmp_sch):
+    def test_non_finite_body_size_returns_error(self, tools, env):
         result = _call_create(
-            tools,
-            tmp_sch,
-            symbol_name="MYOP",
-            pins=PINS_2IN_1OUT,
-            x=100.0,
-            y=100.0,
-            rotation=45,
+            tools, env, symbol_name="MYOP", pins=PINS_2IN_1OUT, body_width=math.nan
         )
         assert "error" in result
         assert "success" not in result
 
-    def test_non_finite_coordinate_returns_error(self, tools, tmp_sch):
+    def test_empty_number_returns_error(self, tools, env):
         result = _call_create(
             tools,
-            tmp_sch,
-            symbol_name="MYOP",
-            pins=PINS_2IN_1OUT,
-            x=math.inf,
-            y=100.0,
-        )
-        assert "error" in result
-        assert "success" not in result
-
-    def test_non_finite_body_size_returns_error(self, tools, tmp_sch):
-        result = _call_create(
-            tools,
-            tmp_sch,
-            symbol_name="MYOP",
-            pins=PINS_2IN_1OUT,
-            body_width=math.nan,
-        )
-        assert "error" in result
-        assert "success" not in result
-
-    def test_empty_number_returns_error(self, tools, tmp_sch):
-        result = _call_create(
-            tools,
-            tmp_sch,
+            env,
             symbol_name="MYOP",
             pins=[{"number": "", "name": "A", "type": "input", "direction": "left"}],
         )
         assert "error" in result
         assert "success" not in result
 
-    def test_non_dict_pin_returns_error(self, tools, tmp_sch):
-        result = _call_create(tools, tmp_sch, symbol_name="MYOP", pins=["1", "2"])
+    def test_non_dict_pin_returns_error(self, tools, env):
+        result = _call_create(tools, env, symbol_name="MYOP", pins=["1", "2"])
         assert "error" in result
         assert "success" not in result
 
-    def test_invalid_extension_returns_error(self, tools):
-        result = _call_create(tools, "/tmp/nope.txt", symbol_name="MYOP", pins=PINS_2IN_1OUT)
+    def test_non_string_value_returns_error(self, tools, env):
+        result = _call_create(tools, env, symbol_name="MYOP", pins=PINS_2IN_1OUT, value=123)
         assert "error" in result
         assert "success" not in result
 
-    def test_missing_file_returns_error(self, tools, tmp_sch):
-        missing = tmp_sch + ".missing.kicad_sch"
-        result = _call_create(tools, missing, symbol_name="MYOP", pins=PINS_2IN_1OUT)
-        assert "error" in result
-        assert "success" not in result
-
-    def test_duplicate_symbol_name_returns_error(self, tools, tmp_sch):
-        first = _call_create(tools, tmp_sch, symbol_name="MYOP", pins=PINS_2IN_1OUT)
-        assert first.get("success") is True
-        # A second call with the same name must not silently re-define.
-        second = _call_create(tools, tmp_sch, symbol_name="MYOP", pins=PINS_2IN_1OUT)
-        assert "error" in second
-        assert "already exists in schematic lib_symbols" in second["error"]
-        assert "success" not in second
-
-    def test_non_string_value_returns_error(self, tools, tmp_sch):
-        result = _call_create(
-            tools,
-            tmp_sch,
-            symbol_name="MYOP",
-            pins=PINS_2IN_1OUT,
-            value=123,
-        )
-        assert "error" in result
-        assert "success" not in result
-
-    def test_invalid_reference_prefix_returns_error(self, tools, tmp_sch):
+    def test_invalid_reference_prefix_returns_error(self, tools, env):
         for bad in ("1U", "U-1", "U 1", "U.1", ""):
             result = _call_create(
                 tools,
-                tmp_sch,
+                env,
                 symbol_name="MYOP",
                 pins=PINS_2IN_1OUT,
                 reference_prefix=bad,
@@ -626,24 +583,23 @@ class TestCreateSymbolValidation:
             assert "success" not in result, bad
         ok = _call_create(
             tools,
-            tmp_sch,
+            env,
             symbol_name="MYOP",
             pins=PINS_2IN_1OUT,
             reference_prefix="U2_1",
         )
         assert ok.get("success") is True
 
-    def test_none_pin_name_renders_as_empty(self, tools, tmp_sch):
+    def test_none_pin_name_renders_as_empty(self, tools, env):
         """An explicit name=None must serialize as "" (never as nil)."""
         result = _call_create(
             tools,
-            tmp_sch,
+            env,
             symbol_name="MYOP",
             pins=[{"number": "1", "name": None, "type": "input", "direction": "left"}],
         )
         assert result.get("success") is True, result
-        sch = skip.Schematic(tmp_sch)  # round-trip proves the file parsed
-        raw = _lib_symbol_raw(sch, LIB_ID)
+        raw = _lib_symbol_raw(env["lib_path"], "MYOP")
         assert raw is not None
         node = _pin_at(raw, "1")
         name_node = [
@@ -657,3 +613,59 @@ class TestCreateSymbolValidation:
             )
         ][0]
         assert name_node[1] == ""
+
+
+# ---------------------------------------------------------------------------
+# create_symbol_library
+# ---------------------------------------------------------------------------
+
+
+class TestCreateSymbolLibrary:
+    def test_create_library_and_register(self, tools, env):
+        result = asyncio.run(tools["create_symbol_library"](name="SecondLib"))
+        assert "error" not in result, result
+        assert result["library"] == "SecondLib"
+        assert result["registered"] is True
+        path = result["path"]
+        assert path.endswith("SecondLib.kicad_sym")
+        assert os.path.isfile(path)
+        assert os.path.isfile(result["table_path"])
+        # Empty library parses as a valid kicad_symbol_lib root.
+        from kcaa.utils.symbol_library_utils import list_library_symbols
+
+        assert list_library_symbols(path) == []
+
+    def test_duplicate_library_returns_error(self, tools, env):
+        result = asyncio.run(tools["create_symbol_library"](name=LIB))
+        assert "error" in result
+        assert "already exists" in result["error"]
+        assert "success" not in result
+
+    def test_invalid_name_returns_error(self, tools, env):
+        # Only names that sanitize to nothing are rejected; names like
+        # "1Lib" or "My Lib" are sanitized to legal nicknames (matches
+        # footprint-library semantics).
+        for bad in ("", "   ", "///", "*#!@", "___"):
+            result = asyncio.run(tools["create_symbol_library"](name=bad))
+            assert "error" in result, repr(bad)
+            assert "success" not in result, repr(bad)
+        # Sanitizable names normalize and succeed.
+        for ok in ("1Lib", "My Lib"):
+            result = asyncio.run(tools["create_symbol_library"](name=ok))
+            assert "error" not in result, (ok, result)
+
+    def test_missing_project_dir_returns_error(self, tools, env):
+        result = asyncio.run(
+            tools["create_symbol_library"](name="ProjLib", project_dir="/no/such/dir")
+        )
+        assert "error" in result
+        assert "success" not in result
+
+    def test_created_library_is_writeable_by_create_symbol(self, tools, env):
+        created = asyncio.run(tools["create_symbol_library"](name="SecondLib"))
+        assert "error" not in created, created
+        result = _call_create(
+            tools, env, library="SecondLib", symbol_name="MYOP", pins=PINS_2IN_1OUT
+        )
+        assert result.get("success") is True, result
+        assert result["lib_id"] == "SecondLib:MYOP"
