@@ -53,7 +53,7 @@ TOOL_POLICIES: dict[str, ToolPolicy] = {
     "create_symbol_library": ToolPolicy(kind="file_mutation"),
     "add_symbols_to_library": ToolPolicy(kind="file_mutation"),
     "remove_symbols_from_library": ToolPolicy(kind="file_mutation"),
-    "delete_symbols_library": ToolPolicy(kind="file_mutation"),
+    "delete_symbol_library": ToolPolicy(kind="file_mutation"),
     "find_symbols_not_in_libraries": ToolPolicy(kind="query"),
     "place_symbol_relative": ToolPolicy(
         kind="file_mutation",

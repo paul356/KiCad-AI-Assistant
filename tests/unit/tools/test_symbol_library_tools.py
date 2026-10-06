@@ -379,14 +379,14 @@ class TestRemoveSymbolFromLibrary:
 
 
 # ---------------------------------------------------------------------------
-# delete_symbols_library
+# delete_symbol_library
 # ---------------------------------------------------------------------------
 
 
 class TestDeleteSymbolLibrary:
     def test_deletes_empty_library(self, tools, env):
         # env created TestLib empty.
-        result = _run(tools["delete_symbols_library"], library=env["lib"])
+        result = _run(tools["delete_symbol_library"], library=env["lib"])
         assert "error" not in result, result
         assert result["deleted"] is True
         assert result["unregistered"] is True
@@ -399,7 +399,7 @@ class TestDeleteSymbolLibrary:
 
     def test_refuses_non_empty_library(self, tools, env, tmp_sch):
         _seed_library(env, tools, tmp_sch)
-        result = _run(tools["delete_symbols_library"], library=env["lib"])
+        result = _run(tools["delete_symbol_library"], library=env["lib"])
         assert "error" in result, result
         assert "not empty" in result["error"]
         assert "success" not in result
@@ -417,16 +417,16 @@ class TestDeleteSymbolLibrary:
             symbols=["R_Small", "C"],
         )
         assert removed["removed_count"] == 2
-        deleted = _run(tools["delete_symbols_library"], library=env["lib"])
+        deleted = _run(tools["delete_symbol_library"], library=env["lib"])
         assert "error" not in deleted, deleted
         assert deleted["deleted"] is True
         assert not os.path.exists(env["lib_path"])
 
     def test_unknown_library_returns_error(self, tools, env):
-        result = _run(tools["delete_symbols_library"], library="NoSuchLib")
+        result = _run(tools["delete_symbol_library"], library="NoSuchLib")
         assert "error" in result
         assert "success" not in result
 
     def test_deleted_library_absent_from_index(self, tools, env):
-        _run(tools["delete_symbols_library"], library=env["lib"])
+        _run(tools["delete_symbol_library"], library=env["lib"])
         assert env["index_mgr"].get_library_by_name("TestLib") is None

@@ -360,7 +360,7 @@ def _do_remove_symbol_from_library(
 
     Removing the *last* symbol of a library leaves a valid empty library
     file; deleting the library itself is a separate tool
-    (``delete_symbols_library``).
+    (``delete_symbol_library``).
     """
     if not symbols:
         return {"error": "symbols list must not be empty"}
@@ -418,7 +418,7 @@ def _do_delete_symbol_library(
     """Delete an **empty** symbol library: file, table entry, and index.
 
     Refuses (``error``) when the library still contains any top-level
-    symbol — delete_symbols_library only ever removes empty libraries; use
+    symbol — delete_symbol_library only ever removes empty libraries; use
     ``remove_symbols_from_library`` first to empty it.  A ``.bak`` copy of
     the sym-lib-table is written when the table entry is dropped.
     """
@@ -451,7 +451,7 @@ def _do_delete_symbol_library(
         with contextlib.suppress(OSError):
             os.remove(lib_file + ".bak")
     except OSError as exc:
-        log.error("delete_symbols_library: cannot remove %s: %s", lib_file, exc, exc_info=True)
+        log.error("delete_symbol_library: cannot remove %s: %s", lib_file, exc, exc_info=True)
         return {
             "error": f"Failed to remove library file: {lib_file} ({exc})",
             "table_unregistered": unregistered,
@@ -462,7 +462,7 @@ def _do_delete_symbol_library(
     try:
         index_removed = _get_index_manager().remove_library(library)
     except Exception as exc:
-        log.error("delete_symbols_library: index cleanup failed for %s: %s", library, exc)
+        log.error("delete_symbol_library: index cleanup failed for %s: %s", library, exc)
 
     return {
         "library": library,
@@ -2398,7 +2398,7 @@ def register_symbol_edit_tools(mcp: FastMCP) -> None:
         library is re-indexed so removed symbols disappear from search.
 
         Removing the *last* symbol leaves a valid empty library file; use
-        ``delete_symbols_library`` (empty-library-only) to remove the
+        ``delete_symbol_library`` (empty-library-only) to remove the
         library itself.
 
         Args:
@@ -2420,7 +2420,7 @@ def register_symbol_edit_tools(mcp: FastMCP) -> None:
         )
 
     @mcp.tool()
-    async def delete_symbols_library(
+    async def delete_symbol_library(
         library: str,
         project_dir: str | None = None,
         ctx: Context | None = None,

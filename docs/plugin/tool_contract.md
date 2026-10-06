@@ -24,7 +24,7 @@
 | `add_symbols_to_library` | `symbol_edit_tools` | Export cached symbols from a schematic into a library |
 | `find_symbols_not_in_libraries` | `symbol_edit_tools` | List schematic symbols missing from all available libraries |
 | `remove_symbols_from_library` | `symbol_edit_tools` | Remove named symbol definitions from an existing library |
-| `delete_symbols_library` | `symbol_edit_tools` | Delete an **empty** symbol library (file + table entry + index) |
+| `delete_symbol_library` | `symbol_edit_tools` | Delete an **empty** symbol library (file + table entry + index) |
 | `remove_symbol_from_schematic` | `symbol_edit_tools` | Remove one or more components by reference designator |
 | `set_symbol_property` | `symbol_edit_tools` | Set or create a named property (e.g. `Value`, `Footprint`) on a component |
 | `list_symbol_properties` | `symbol_edit_tools` | Return all properties for a component |
@@ -292,7 +292,7 @@ Entries already present in the target library are reported in `skipped` (never o
 
 ---
 
-#### `delete_symbols_library(library, project_dir=None)`
+#### `delete_symbol_library(library, project_dir=None)`
 
 **Purpose:** Deletes an **empty** symbol library: the `.kicad_sym` file, its sym-lib-table entry (with `.bak` backup of the table), and its index entries. Refuses with `error` while the library still contains any top-level symbol — empty it first with `remove_symbols_from_library`. This tool never deletes a non-empty library.
 
