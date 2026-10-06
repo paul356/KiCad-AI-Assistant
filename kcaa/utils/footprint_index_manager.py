@@ -322,10 +322,16 @@ class FootprintIndexManager:
         Only the index entry is removed — the ``.pretty`` directory and the
         fp-lib-table entry are left untouched (callers own those).
 
+        Match is deliberately cross-project: library nicknames are globally
+        unique (see ``library_name_exists``), so a project-scoped manager
+        must still be able to drop the row regardless of which project scope
+        created it.  The symbol-side manager (``SymbolIndexManager``) does
+        the same via ``get_library_by_name``.
+
         :param library_name: Library nickname to remove.
         :returns: True when a matching row was deleted.
         """
-        for rec in self.get_all_libraries():
+        for rec in self._db.get_all_libraries(project=None):
             if rec.library_name == library_name:
                 self._db.delete_library(rec.id)
                 return True

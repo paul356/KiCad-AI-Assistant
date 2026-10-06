@@ -1187,3 +1187,32 @@ class TestCollectExistingNames:
             ("LibA", "indexed_a"),
             ("LibA", "indexed_b"),
         }
+
+
+class TestFootprintIndexManagerRemoveLibrary:
+    """remove_library must find rows across project scopes (nicknames are
+    globally unique) — regression for delete_footprint_library leaving
+    project-scoped rows behind when the manager is global-scoped."""
+
+    def test_removes_project_scoped_row_from_global_manager(self, tmp_path):
+        db_path = tmp_path / "fp.db"
+        # create a library row under a project scope
+        proj_mgr = FootprintIndexManager(db_path=str(db_path), project_path="/tmp/someproj")
+        proj_mgr._db.save_library(
+            "ProjLib",
+            "${KIPRJMOD}/ProjLib.pretty",
+            "/tmp/someproj/ProjLib.pretty",
+            "desc",
+            "csum",
+            [_make_record("ProjLib", "FP1")],
+        )
+        assert proj_mgr._db.get_library_states(project=None)["ProjLib"]
+
+        # a *global-scoped* manager must still be able to drop it
+        global_mgr = FootprintIndexManager(db_path=str(db_path))
+        assert global_mgr.remove_library("ProjLib") is True
+        assert "ProjLib" not in global_mgr._db.get_library_states(project=None)
+
+    def test_remove_missing_returns_false(self, tmp_path):
+        mgr = FootprintIndexManager(db_path=str(tmp_path / "fp.db"))
+        assert mgr.remove_library("NoSuchLib") is False
