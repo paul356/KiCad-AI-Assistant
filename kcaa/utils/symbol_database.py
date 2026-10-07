@@ -141,6 +141,13 @@ CREATE TRIGGER IF NOT EXISTS symbols_ad AFTER DELETE ON symbols BEGIN
     VALUES ('delete', old.rowid, old.library_name, old.symbol_name, old.description, old.keywords);
 END;
 
+CREATE TRIGGER IF NOT EXISTS symbols_au AFTER UPDATE ON symbols BEGIN
+    INSERT INTO symbols_fts(symbols_fts, rowid, library_name, symbol_name, description, keywords)
+    VALUES ('delete', old.rowid, old.library_name, old.symbol_name, old.description, old.keywords);
+    INSERT INTO symbols_fts(rowid, library_name, symbol_name, description, keywords)
+    VALUES (new.rowid, new.library_name, new.symbol_name, new.description, new.keywords);
+END;
+
 """
 
 

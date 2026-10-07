@@ -344,3 +344,68 @@ class TestFTSSearch:
     def test_search_no_match(self):
         results = self.db.search("xyzzy_no_match_ever")
         assert results == []
+
+
+# ---------------------------------------------------------------------------
+# FTS AFTER UPDATE trigger — in-place row updates must not drift the index
+# ---------------------------------------------------------------------------
+
+
+class TestFTSUpdateTrigger:
+    """A raw UPDATE on the symbols table (no save_library round trip) must
+    keep symbols_fts in sync: stale tokens disappear, new tokens appear."""
+
+    @pytest.fixture(autouse=True)
+    def _populate(self, db):
+        self.db = db
+        db.save_library(
+            "Dev",
+            "/tmp/dev.kicad_sym",
+            1.0,
+            100,
+            "",
+            _make_symbols(
+                "Dev",
+                [
+                    ("R", "Resistor", "R resistor passive", 2),
+                    ("C", "Capacitor", "C capacitor passive", 2),
+                ],
+            ),
+        )
+
+    def test_update_refreshes_fts_description(self):
+        from sqlalchemy import text as sql_text
+
+        with self.db._engine.connect() as conn:
+            conn.execute(
+                sql_text("UPDATE symbols SET description = 'new token XYZ' WHERE symbol_name = 'R'")
+            )
+            conn.commit()
+
+        # The new description token is searchable with the full new row.
+        found = self.db.search("XYZ")
+        assert any(
+            r.symbol_name == "R" and r.description == "new token XYZ" for r in found
+        )
+
+        # A second in-place update removes the previous description token.
+        with self.db._engine.connect() as conn:
+            conn.execute(
+                sql_text(
+                    "UPDATE symbols SET description = 'scrubbed clean' WHERE symbol_name = 'R'"
+                )
+            )
+            conn.commit()
+        assert self.db.search("XYZ") == []
+        assert any(r.symbol_name == "R" for r in self.db.search("scrubbed"))
+
+    def test_update_refreshes_fts_keywords(self):
+        from sqlalchemy import text as sql_text
+
+        # 'KWX' appears in no other column — only the keywords column is
+        # indexed with it, so it isolates the keywords-update path.
+        with self.db._engine.connect() as conn:
+            conn.execute(
+                sql_text("UPDATE symbols SET keywords = 'special KWX' WHERE symbol_name = 'C'")
+            )
+            conn.commit()
