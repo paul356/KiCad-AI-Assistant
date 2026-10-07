@@ -385,9 +385,7 @@ class TestFTSUpdateTrigger:
 
         # The new description token is searchable with the full new row.
         found = self.db.search("XYZ")
-        assert any(
-            r.symbol_name == "R" and r.description == "new token XYZ" for r in found
-        )
+        assert any(r.symbol_name == "R" and r.description == "new token XYZ" for r in found)
 
         # A second in-place update removes the previous description token.
         with self.db._engine.connect() as conn:
@@ -410,6 +408,8 @@ class TestFTSUpdateTrigger:
                 sql_text("UPDATE symbols SET keywords = 'special KWX' WHERE symbol_name = 'C'")
             )
             conn.commit()
+
+
 # Project scope (schema v2) — the libraries.project column
 # ---------------------------------------------------------------------------
 

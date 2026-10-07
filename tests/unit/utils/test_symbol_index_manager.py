@@ -236,8 +236,15 @@ class TestRemoveLibrary:
         from kcaa.utils.symbol_database import SymbolRecord
 
         def _make_symbol(lib: str, name: str) -> SymbolRecord:
-            return SymbolRecord(library_name=lib, symbol_name=name, library_id=-1,
-                                description="", keywords="", pin_count=0, file_index=0)
+            return SymbolRecord(
+                library_name=lib,
+                symbol_name=name,
+                library_id=-1,
+                description="",
+                keywords="",
+                pin_count=0,
+                file_index=0,
+            )
 
         # Simulate sync() output for a system symdir library: one row per
         # .kicad_sym file inside the directory, keyed nickname/stem.
@@ -256,9 +263,12 @@ class TestRemoveLibrary:
         # removal must report False and leave the system rows untouched.
         assert self.mgr.remove_library("MCU_ST_STM32F7") is False
         remaining = {lib.library_name for lib in self.mgr.get_all_libraries()}
-        assert remaining == {"TestDevice", "TestPower",
-                             "MCU_ST_STM32F7/STM32F722ICKx",
-                             "MCU_ST_STM32F7/STM32F723ZETx"}
+        assert remaining == {
+            "TestDevice",
+            "TestPower",
+            "MCU_ST_STM32F7/STM32F722ICKx",
+            "MCU_ST_STM32F7/STM32F723ZETx",
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -335,9 +345,7 @@ class TestProjectScopeSync:
         _, _, proj_mgr = self._project_fixture(tmp_path)
         proj_mgr.sync()
 
-        global_mgr = SymbolIndexManager(
-            SymbolIndexReader(_FixtureConfig()), db_path=":memory:"
-        )
+        global_mgr = SymbolIndexManager(SymbolIndexReader(_FixtureConfig()), db_path=":memory:")
         stats = global_mgr.sync()
         assert stats.removed == 0
         assert stats.added == 2  # TestDevice + TestPower, its own global copies
@@ -376,9 +384,7 @@ class TestProjectScopeSync:
         row = proj_mgr.get_library_by_name("ProjLib")
         assert row is not None and row.project == proj_real
 
-        global_mgr = SymbolIndexManager(
-            SymbolIndexReader(_FixtureConfig()), db_path=":memory:"
-        )
+        global_mgr = SymbolIndexManager(SymbolIndexReader(_FixtureConfig()), db_path=":memory:")
         global_mgr.index_library("TestDevice", os.path.join(FIXTURES_DIR, "test_device.kicad_sym"))
         assert global_mgr.get_library_by_name("TestDevice").project == ""
 
@@ -398,9 +404,7 @@ class TestProjectScopeSync:
             project_path=proj_real,
         )
         proj_mgr.sync()
-        global_mgr = SymbolIndexManager(
-            SymbolIndexReader(_FixtureConfig()), db_path=db_path
-        )
+        global_mgr = SymbolIndexManager(SymbolIndexReader(_FixtureConfig()), db_path=db_path)
         assert proj_mgr.get_library_by_name("ProjLib").project == proj_real
 
         # Global-scoped remove must NOT delete the project-owned row.
@@ -478,9 +482,7 @@ class TestReindexOwnership:
         re-attribute its row to the caller's project: index_library receives
         the derived ownership ("" ) explicitly."""
         db_path = tmp_path / "shared.db"
-        global_mgr = SymbolIndexManager(
-            SymbolIndexReader(_FixtureConfig()), db_path=db_path
-        )
+        global_mgr = SymbolIndexManager(SymbolIndexReader(_FixtureConfig()), db_path=db_path)
         global_mgr.sync()
         device_path = os.path.join(FIXTURES_DIR, "test_device.kicad_sym")
         assert global_mgr.get_library_by_name("TestDevice").project == ""
@@ -585,9 +587,7 @@ class TestProjectSymbolCollision:
             mgr_a._db.get_library_states("")
         ) == {os.path.join(proj_a, "XLib.kicad_sym")}
         # …and the global scope sees neither project's XLib.
-        global_mgr = SymbolIndexManager(
-            SymbolIndexReader(_FixtureConfig()), db_path=db_path
-        )
+        global_mgr = SymbolIndexManager(SymbolIndexReader(_FixtureConfig()), db_path=db_path)
         assert global_mgr.get_library_by_name("XLib") is None
 
 
@@ -605,9 +605,7 @@ class TestProjectShadowSync:
 
     def test_shadowing_project_sync_keeps_global_row(self, tmp_path):
         db_path = tmp_path / "shared.db"
-        global_mgr = SymbolIndexManager(
-            SymbolIndexReader(_FixtureConfig()), db_path=db_path
-        )
+        global_mgr = SymbolIndexManager(SymbolIndexReader(_FixtureConfig()), db_path=db_path)
         global_mgr.sync()
         global_path = os.path.join(FIXTURES_DIR, "test_device.kicad_sym")
         assert global_mgr.get_library_by_name("TestDevice").file_path == global_path
@@ -637,9 +635,7 @@ class TestProjectShadowSync:
         assert stats.removed == 0
 
         # Global row survives, still owned by the global scope.
-        fresh_global = SymbolIndexManager(
-            SymbolIndexReader(_FixtureConfig()), db_path=db_path
-        )
+        fresh_global = SymbolIndexManager(SymbolIndexReader(_FixtureConfig()), db_path=db_path)
         g_row = fresh_global.get_library_by_name("TestDevice")
         assert g_row is not None
         assert g_row.project == ""
@@ -674,16 +670,12 @@ class TestSyncExistenceGuard:
         PROJECT-scoped sync — the user's normal workflow must manage global
         leftovers too."""
         db_path = tmp_path / "shared.db"
-        global_mgr = SymbolIndexManager(
-            SymbolIndexReader(_FixtureConfig()), db_path=db_path
-        )
+        global_mgr = SymbolIndexManager(SymbolIndexReader(_FixtureConfig()), db_path=db_path)
         global_mgr.sync()
 
         # Index an extra GLOBAL library straight into the DB…
         global_lib = tmp_path / "GLib.kicad_sym"
-        global_lib.write_text(
-            (FIXTURES_DIR / "test_device.kicad_sym").read_text(encoding="utf-8")
-        )
+        global_lib.write_text((FIXTURES_DIR / "test_device.kicad_sym").read_text(encoding="utf-8"))
         global_mgr.index_library("GLib", str(global_lib))
         assert global_mgr.get_library_by_name("GLib") is not None
         assert global_mgr.get_library_by_name("GLib").project == ""
@@ -716,9 +708,7 @@ class TestSyncExistenceGuard:
         assert stats.removed == 1  # exactly the gone GLib row
 
         # The global leftover is gone from every scope.
-        fresh_global = SymbolIndexManager(
-            SymbolIndexReader(_FixtureConfig()), db_path=db_path
-        )
+        fresh_global = SymbolIndexManager(SymbolIndexReader(_FixtureConfig()), db_path=db_path)
         assert fresh_global.get_library_by_name("GLib") is None
         assert proj_mgr.get_library_by_name("GLib") is None
 
@@ -729,9 +719,7 @@ class TestSyncExistenceGuard:
         symbol_name)); the live global file is never deleted by the
         shadowing project sync."""
         db_path = tmp_path / "shared.db"
-        global_mgr = SymbolIndexManager(
-            SymbolIndexReader(_FixtureConfig()), db_path=db_path
-        )
+        global_mgr = SymbolIndexManager(SymbolIndexReader(_FixtureConfig()), db_path=db_path)
         global_mgr.sync()
         global_path = os.path.join(FIXTURES_DIR, "test_device.kicad_sym")
 
@@ -760,9 +748,7 @@ class TestSyncExistenceGuard:
         assert stats.removed == 0  # global row's file still exists -> kept
 
         # Both rows coexist…
-        fresh_global = SymbolIndexManager(
-            SymbolIndexReader(_FixtureConfig()), db_path=db_path
-        )
+        fresh_global = SymbolIndexManager(SymbolIndexReader(_FixtureConfig()), db_path=db_path)
         g_row = fresh_global.get_library_by_name("TestDevice")
         assert g_row is not None
         assert g_row.project == ""

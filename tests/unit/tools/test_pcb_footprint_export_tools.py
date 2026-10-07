@@ -1200,9 +1200,7 @@ class TestRemoveFootprintsFromLibrary:
 
         sys_dir = tmp_path / "system" / "footprints"
         sys_dir.mkdir(parents=True)
-        (sys_dir / "SysFp.kicad_mod").write_text(
-            '(footprint "SysFp")', encoding="utf-8"
-        )
+        (sys_dir / "SysFp.kicad_mod").write_text('(footprint "SysFp")', encoding="utf-8")
         table = _make_fp_lib_table(tmp_path, [("SysFp", str(sys_dir))])
         # Re-route the fixture's table lookup to the table that registers SysFp.
         monkeypatch.setattr(
@@ -1212,9 +1210,7 @@ class TestRemoveFootprintsFromLibrary:
         monkeypatch.setattr(config, "_kicad_footprint_dir", str(sys_dir))
 
         result = _run(
-            tools["remove_footprints_from_library"](
-                library="SysFp", footprints=["SysFp"], ctx=None
-            )
+            tools["remove_footprints_from_library"](library="SysFp", footprints=["SysFp"], ctx=None)
         )
         assert "error" in result, result
         assert "system library" in result["error"]
@@ -1309,9 +1305,7 @@ class TestDeleteFootprintLibrary:
         _make_fp_lib_table(tmp_path, [("Manual", lib_dir)])
 
         result = _run(
-            tools["delete_footprint_library"](
-                library="Manual", project_dir=str(tmp_path), ctx=None
-            )
+            tools["delete_footprint_library"](library="Manual", project_dir=str(tmp_path), ctx=None)
         )
         assert "error" in result, result
         assert "user library location" in result["error"]

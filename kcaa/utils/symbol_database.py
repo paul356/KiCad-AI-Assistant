@@ -284,7 +284,8 @@ class SymbolDatabase:
     # ------------------------------------------------------------------
 
     def get_library_states(
-        self, project: str | None = None,
+        self,
+        project: str | None = None,
     ) -> dict[str, tuple[int, float, int, str, str]]:
         """
         Return a snapshot of indexed libraries visible in *project* scope as
@@ -405,9 +406,7 @@ class SymbolDatabase:
     # Public API — search
     # ------------------------------------------------------------------
 
-    def search(
-        self, query: str, limit: int = 50, project: str | None = None
-    ) -> list[SymbolRecord]:
+    def search(self, query: str, limit: int = 50, project: str | None = None) -> list[SymbolRecord]:
         """
         Full-text search across symbol_name, description, and keywords.
         Returns results ordered by FTS5 rank (best match first).
@@ -532,14 +531,18 @@ class SymbolDatabase:
         if not ids:
             return []
         with self._Session() as session:
-            rows = session.execute(
-                select(_SymbolRow)
-                .where(
-                    _SymbolRow.library_name == library_name,
-                    _SymbolRow.library_id.in_(ids),
+            rows = (
+                session.execute(
+                    select(_SymbolRow)
+                    .where(
+                        _SymbolRow.library_name == library_name,
+                        _SymbolRow.library_id.in_(ids),
+                    )
+                    .order_by(_SymbolRow.file_index)
                 )
-                .order_by(_SymbolRow.file_index)
-            ).scalars().all()
+                .scalars()
+                .all()
+            )
         return [self._orm_to_symbol(r) for r in rows]
 
     def get_all_symbols(self, project: str | None = None) -> list[SymbolRecord]:
@@ -551,9 +554,11 @@ class SymbolDatabase:
             q = q.join(_LibraryRow, _SymbolRow.library_id == _LibraryRow.id)
             q = q.where(clause)
         with self._Session() as session:
-            rows = session.execute(
-                q.order_by(_SymbolRow.library_name, _SymbolRow.file_index)
-            ).scalars().all()
+            rows = (
+                session.execute(q.order_by(_SymbolRow.library_name, _SymbolRow.file_index))
+                .scalars()
+                .all()
+            )
         return [self._orm_to_symbol(r) for r in rows]
 
     def get_all_libraries(self, project: str | None = None) -> list[LibraryRecord]:
@@ -586,9 +591,7 @@ class SymbolDatabase:
             if project == "":
                 q = q.where(_LibraryRow.project == "")
             elif project is not None:
-                q = q.where(
-                    or_(_LibraryRow.project == "", _LibraryRow.project == project)
-                )
+                q = q.where(or_(_LibraryRow.project == "", _LibraryRow.project == project))
             pairs = session.execute(q).all()
         if project is None:
             return [p[0] for p in pairs]
@@ -598,9 +601,7 @@ class SymbolDatabase:
                 return proj_ids
         return [p[0] for p in pairs if p[1] == ""]
 
-    def get_library_by_name(
-        self, name: str, project: str | None = None
-    ) -> LibraryRecord | None:
+    def get_library_by_name(self, name: str, project: str | None = None) -> LibraryRecord | None:
         """Look up a single library record by library_name, scoped to
         *project* when given.  In a project scope a project-owned row
         shadows a same-nickname global row (see ``_effective_library_ids``);
@@ -616,9 +617,7 @@ class SymbolDatabase:
             else:
                 # Shadow semantics: the project's own row wins over the global
                 # row of the same nickname.
-                q = q.where(
-                    or_(_LibraryRow.project == "", _LibraryRow.project == project)
-                )
+                q = q.where(or_(_LibraryRow.project == "", _LibraryRow.project == project))
                 rows = session.execute(q).scalars().all()
                 if not rows:
                     return None

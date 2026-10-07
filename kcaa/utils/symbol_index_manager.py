@@ -551,7 +551,9 @@ class SymbolIndexManager:
     def list_all_symbols(self) -> list[str]:
         """Return all symbol keys as 'library_name:symbol_name' strings,
         scoped to the manager's project (global + project libraries)."""
-        return [f"{s.library_name}:{s.symbol_name}" for s in self._db.get_all_symbols(self._project_id)]
+        return [
+            f"{s.library_name}:{s.symbol_name}" for s in self._db.get_all_symbols(self._project_id)
+        ]
 
     def get_all_libraries(self) -> list[LibraryRecord]:
         """Return all indexed library records, scoped to the manager's
@@ -603,9 +605,7 @@ class SymbolIndexManager:
     # Narrow single-library indexing (library write tools)
     # ------------------------------------------------------------------
 
-    def index_library(
-        self, library_name: str, file_path: str, project: str | None = None
-    ) -> int:
+    def index_library(self, library_name: str, file_path: str, project: str | None = None) -> int:
         """Index exactly one ``.kicad_sym`` file into the database.
 
         Narrow update for the schematic → library export tools: indexes a

@@ -61,9 +61,7 @@ class TestFTSUpdateTrigger:
 
         # The new description token is searchable with the full new row.
         found = self.db.search("XYZ")
-        assert any(
-            f.footprint_name == "R_0402" and f.description == "new token XYZ" for f in found
-        )
+        assert any(f.footprint_name == "R_0402" and f.description == "new token XYZ" for f in found)
 
         # A second in-place update removes the previous description token.
         with self.db._engine.connect() as conn:

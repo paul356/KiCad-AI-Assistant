@@ -738,9 +738,7 @@ class TestProjectPathScoping:
 
         with self._patch_mgr() as mock_get_mgr:
             mock_get_mgr.return_value.get_library_symbols.return_value = [rec]
-            result = _call(
-                "get_library_symbols", library_name="ProjLib", project_path="/p/X"
-            )
+            result = _call("get_library_symbols", library_name="ProjLib", project_path="/p/X")
 
         assert result["success"] is True
         assert result["total"] == 1
@@ -783,7 +781,10 @@ class TestProjectPathScoping:
             result = _call("sync_symbol_index", project_path="/p/X")
 
         assert result["status"] == "started"
-        target, args = mock_thread_cls.call_args.kwargs["target"], mock_thread_cls.call_args.kwargs["args"]
+        target, args = (
+            mock_thread_cls.call_args.kwargs["target"],
+            mock_thread_cls.call_args.kwargs["args"],
+        )
         assert target.__name__ == "_run_sync_in_background"
         assert args == (False, "/p/X")
 
@@ -797,8 +798,9 @@ class TestProjectPathScoping:
             "ProjLib_" + S("R"),
             [S("pin"), S("passive"), S("line"), [S("at"), 0, 0, 0], [S("number"), "1"]],
         ]
-        with self._patch_mgr() as mock_get_mgr, patch(
-            "kcaa.tools.symbol_tools.extract_lib_symbol_raw", return_value=raw
+        with (
+            self._patch_mgr() as mock_get_mgr,
+            patch("kcaa.tools.symbol_tools.extract_lib_symbol_raw", return_value=raw),
         ):
             sym_rec = MagicMock()
             sym_rec.file_index = 0

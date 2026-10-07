@@ -141,9 +141,7 @@ class TestSymbolIndexReaderLibraries:
 
     def test_entries_carry_table_path(self):
         libs = self.reader.get_libraries()
-        expected = os.path.realpath(
-            str(FIXTURES_DIR / "sym-lib-table")
-        )
+        expected = os.path.realpath(str(FIXTURES_DIR / "sym-lib-table"))
         assert all(lib.table_path == expected for lib in libs)
 
 
@@ -200,9 +198,7 @@ class TestGetLibrariesProjectMerge:
         reader = SymbolIndexReader(_TableConfig(global_path), project_dir=str(proj_dir))
         entries = reader.get_libraries()
         by_name = {e.name: e for e in entries}
-        assert by_name["ProjOnly"].uri == os.path.join(
-            str(proj_dir), "local.kicad_sym"
-        )
+        assert by_name["ProjOnly"].uri == os.path.join(str(proj_dir), "local.kicad_sym")
 
     def test_no_project_dir_skips_project_merge(self, tmp_path):
         global_path = _write_global_table(tmp_path)

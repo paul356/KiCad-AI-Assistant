@@ -171,9 +171,7 @@ def _is_user_library_location(path: str, project_dir: str | None) -> bool:
     if project_dir:
         candidates.append(os.path.realpath(project_dir))
     real = os.path.realpath(path)
-    return any(
-        real == cand or real.startswith(cand + os.sep) for cand in candidates
-    )
+    return any(real == cand or real.startswith(cand + os.sep) for cand in candidates)
 
 
 def _target_project_of(table_path: str, project_dir: str | None) -> str:
@@ -210,9 +208,7 @@ def _index_symbol_library(
     lookup.
     """
     try:
-        return _get_index_manager(project_dir).index_library(
-            library, file_path, project=project
-        )
+        return _get_index_manager(project_dir).index_library(library, file_path, project=project)
     except Exception as exc:
         log.error("Symbol index update failed for %s: %s", library, exc, exc_info=True)
         return -1
@@ -564,9 +560,7 @@ def _do_delete_symbol_library(
             # otherwise).  A same-nickname row of another project is never
             # touched.
             target_project = _target_project_of(table_path, project_dir)
-            return _get_index_manager(project_dir).remove_library(
-                library, project=target_project
-            )
+            return _get_index_manager(project_dir).remove_library(library, project=target_project)
         except Exception as exc:
             log.error("delete_symbol_library: index cleanup failed for %s: %s", library, exc)
             return False
@@ -595,7 +589,9 @@ def _do_delete_symbol_library(
             # The file is already gone: never report success.  Still attempt
             # index cleanup, then say exactly what was removed vs left.
             log.error(
-                "delete_symbol_library: unregister failed for %s: %s", library, exc,
+                "delete_symbol_library: unregister failed for %s: %s",
+                library,
+                exc,
                 exc_info=True,
             )
             return {
@@ -2149,9 +2145,7 @@ def _do_create_symbol(
     # Refresh the index so search_symbols sees the new symbol — reindexed
     # under the library's OWN ownership (a global library stays global).
     target_project = _target_project_of(lib["table_path"], project_dir)
-    _index_symbol_library(
-        library, lib_file, project_dir=project_dir, project=target_project
-    )
+    _index_symbol_library(library, lib_file, project_dir=project_dir, project=target_project)
 
     return result
 

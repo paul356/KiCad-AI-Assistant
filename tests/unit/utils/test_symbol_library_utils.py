@@ -18,22 +18,17 @@ class TestRemoveSymbolFromLibraryFile:
         lib.write_text(
             "(kicad_symbol_lib\n"
             "  (version 20220914)\n"
-            "  (symbol \"A\"\n"
+            '  (symbol "A"\n'
             "    (in_bom yes)\n"
             "  )\n"
-            "  (symbol \"B\"\n"
+            '  (symbol "B"\n'
             "    (in_bom yes)\n"
             "  )\n"
             ")\n"
         )
         remove_symbol_from_library_file(str(lib), "A")
         assert lib.read_text() == (
-            "(kicad_symbol_lib\n"
-            "  (version 20220914)\n"
-            "  (symbol \"B\"\n"
-            "    (in_bom yes)\n"
-            "  )\n"
-            ")\n"
+            '(kicad_symbol_lib\n  (version 20220914)\n  (symbol "B"\n    (in_bom yes)\n  )\n)\n'
         )
         assert list_library_symbols(str(lib)) == ["B"]
         assert (tmp_path / "lib.kicad_sym.bak").is_file()
@@ -48,14 +43,14 @@ class TestRemoveSymbolFromLibraryFile:
             "  (symbol BARE\n"
             "    (in_bom yes)\n"
             "  )\n"
-            "  (symbol \"QUOTED\"\n"
+            '  (symbol "QUOTED"\n'
             "    (in_bom yes)\n"
             "  )\n"
             ")\n"
         )
         remove_symbol_from_library_file(str(lib), "BARE")
         text = lib.read_text()
-        assert 'QUOTED' in text
+        assert "QUOTED" in text
         assert "BARE" not in text
         assert list_library_symbols(str(lib)) == ["QUOTED"]
 
@@ -66,19 +61,19 @@ class TestRemoveSymbolFromLibraryFile:
         lib.write_text(
             "(kicad_symbol_lib\n"
             "  (version 20220914)\n"
-            "(symbol \"A\" (in_bom yes))\n"
-            "    (symbol \"DEEP\"\n"
+            '(symbol "A" (in_bom yes))\n'
+            '    (symbol "DEEP"\n'
             "      (in_bom yes)\n"
             "    )\n"
-            "  (symbol \"B\" (in_bom yes))\n"
+            '  (symbol "B" (in_bom yes))\n'
             ")\n"
         )
         remove_symbol_from_library_file(str(lib), "DEEP")
         assert lib.read_text() == (
             "(kicad_symbol_lib\n"
             "  (version 20220914)\n"
-            "(symbol \"A\" (in_bom yes))\n"
-            "  (symbol \"B\" (in_bom yes))\n"
+            '(symbol "A" (in_bom yes))\n'
+            '  (symbol "B" (in_bom yes))\n'
             ")\n"
         )
 
@@ -86,12 +81,7 @@ class TestRemoveSymbolFromLibraryFile:
         """An absent name raises SymbolNotFoundError without touching the
         file or writing any backup."""
         lib = tmp_path / "lib.kicad_sym"
-        lib.write_text(
-            "(kicad_symbol_lib\n"
-            "  (version 20220914)\n"
-            "  (symbol \"A\" (in_bom yes))\n"
-            ")\n"
-        )
+        lib.write_text('(kicad_symbol_lib\n  (version 20220914)\n  (symbol "A" (in_bom yes))\n)\n')
         before = lib.read_text()
         with pytest.raises(SymbolNotFoundError):
             remove_symbol_from_library_file(str(lib), "Ghost")

@@ -302,7 +302,7 @@ class TestFindSymbolsNotInLibraries:
             Path(path).write_text(
                 "(kicad_symbol_lib\n"
                 "  (version 20220914)\n"
-                f"  (symbol \"{name}\"\n"
+                f'  (symbol "{name}"\n'
                 "    (in_bom yes)\n"
                 "    (on_board yes)\n"
                 "  )\n"
@@ -516,7 +516,7 @@ class TestDeleteSymbolLibrary:
             "  (symbol BARE\n"
             "    (in_bom yes)\n"
             "  )\n"
-            "  (symbol \"QUOTED\"\n"
+            '  (symbol "QUOTED"\n'
             "    (in_bom yes)\n"
             "  )\n"
             ")\n"
@@ -612,12 +612,7 @@ class TestSystemLibraryGuard:
         manual_dir.mkdir()
         manual_file = manual_dir / "ManualLib.kicad_sym"
         manual_file.write_text(
-            "(kicad_symbol_lib\n"
-            "  (version 20220914)\n"
-            "  (symbol M\n"
-            "    (in_bom yes)\n"
-            "  )\n"
-            ")\n"
+            "(kicad_symbol_lib\n  (version 20220914)\n  (symbol M\n    (in_bom yes)\n  )\n)\n"
         )
         register_library_in_table(
             env["table_path"],
@@ -727,9 +722,7 @@ class TestOwnershipScopedIndexWrites:
         """Fix 1 regression: exporting cached symbols from a project into a
         GLOBAL library must NOT re-attribute its index row to the project —
         the row's project stays '' and no other scope owns it."""
-        _, proj_real, index_mgr_global, _ = self._project_env(
-            tmp_path, monkeypatch, env
-        )
+        _, proj_real, index_mgr_global, _ = self._project_env(tmp_path, monkeypatch, env)
         sch = str(tmp_path / "proj" / "tools_test.kicad_sch")
         assert (_find_project_dir(sch)) is not None, "project marker missing"
 
@@ -753,9 +746,7 @@ class TestOwnershipScopedIndexWrites:
         """Fix 3(c): deleting a project library through the global manager
         (project_dir=None) cannot resolve it, so the index row survives."""
 
-        proj, proj_real, _, index_mgr_proj = self._project_env(
-            tmp_path, monkeypatch, env
-        )
+        proj, proj_real, _, index_mgr_proj = self._project_env(tmp_path, monkeypatch, env)
         created = _do_create_symbol_library("ProjOwned", project_dir=str(proj))
         assert "error" not in created, created
         assert index_mgr_proj.get_library_by_name("ProjOwned").project == proj_real
@@ -771,15 +762,11 @@ class TestOwnershipScopedIndexWrites:
     ):
         """Fix 3: delete_symbol_library with the project context removes the
         project-owned row (and only it)."""
-        proj, proj_real, _, index_mgr_proj = self._project_env(
-            tmp_path, monkeypatch, env
-        )
+        proj, proj_real, _, index_mgr_proj = self._project_env(tmp_path, monkeypatch, env)
         created = _do_create_symbol_library("ProjOwned", project_dir=str(proj))
         assert "error" not in created, created
 
-        result = _run(
-            tools["delete_symbol_library"], library="ProjOwned", project_dir=str(proj)
-        )
+        result = _run(tools["delete_symbol_library"], library="ProjOwned", project_dir=str(proj))
         assert "error" not in result, result
         assert result["deleted"] is True
         assert index_mgr_proj.get_library_by_name("ProjOwned") is None
@@ -792,9 +779,7 @@ class TestOwnershipScopedIndexWrites:
 
 
 class TestCreateSymbolLibraryProjectScope:
-    def test_project_create_scopes_index_row_and_survives_global_sync(
-        self, tmp_path, monkeypatch
-    ):
+    def test_project_create_scopes_index_row_and_survives_global_sync(self, tmp_path, monkeypatch):
         """Creating a project library indexes it under the project scope;
         the row is invisible to the global-scope manager and a subsequent
         global sync does not remove it."""
@@ -820,9 +805,7 @@ class TestCreateSymbolLibraryProjectScope:
         proj_dir.mkdir()
         proj_real = os.path.realpath(str(proj_dir))
 
-        index_mgr_global = SymbolIndexManager(
-            SymbolIndexReader(ServerConfig()), db_path=":memory:"
-        )
+        index_mgr_global = SymbolIndexManager(SymbolIndexReader(ServerConfig()), db_path=":memory:")
         index_mgr_proj = SymbolIndexManager(
             SymbolIndexReader(ServerConfig(), project_dir=proj_real),
             db_path=":memory:",
@@ -917,9 +900,7 @@ class TestDeleteDanglingState:
 
 
 class TestCreateSymbolProjectContext:
-    def test_create_symbol_into_project_library(
-        self, tools, env, tmp_path, monkeypatch
-    ):
+    def test_create_symbol_into_project_library(self, tools, env, tmp_path, monkeypatch):
         """create_symbol(project_dir=...) appends into a project-local
         library and reindexes it under the project scope."""
         helper = TestOwnershipScopedIndexWrites()
@@ -957,9 +938,7 @@ class TestCreateSymbolProjectContext:
         """Backward compat: project_dir omitted still resolves global-only
         (a project-local lib is not visible, so create refuses)."""
         helper = TestOwnershipScopedIndexWrites()
-        proj, proj_real, _, index_mgr_proj = helper._project_env(
-            tmp_path, monkeypatch, env
-        )
+        proj, proj_real, _, index_mgr_proj = helper._project_env(tmp_path, monkeypatch, env)
         created = _do_create_symbol_library("ProjSym", project_dir=str(proj))
         assert "error" not in created, created
 

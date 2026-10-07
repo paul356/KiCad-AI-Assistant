@@ -1022,9 +1022,7 @@ def _is_user_library_location(path: str, project_dir: str | None) -> bool:
     if project_dir:
         candidates.append(os.path.realpath(project_dir))
     real = os.path.realpath(path)
-    return any(
-        real == cand or real.startswith(cand + os.sep) for cand in candidates
-    )
+    return any(real == cand or real.startswith(cand + os.sep) for cand in candidates)
 
 
 def _resolve_library_dir(library: str, pcb_path: str | None) -> tuple[str, str]:
