@@ -207,3 +207,51 @@ class TestLookupAfterSync:
         assert len(libs) == 2
         names = {lib.library_name for lib in libs}
         assert names == {"TestDevice", "TestPower"}
+
+
+# ---------------------------------------------------------------------------
+# remove_library (file-style exact + directory-style prefix)
+# ---------------------------------------------------------------------------
+
+
+class TestRemoveLibrary:
+    def setup_method(self):
+        self.mgr = _make_manager()
+        self.mgr.sync()
+
+    def test_remove_exact_file_style_library(self):
+        """Bare-nickname (file-style) libraries still match exactly."""
+        assert self.mgr.remove_library("TestDevice") is True
+        assert self.mgr.get_library_by_name("TestDevice") is None
+        assert self.mgr.get_library_symbols("TestDevice") == []
+
+    def test_remove_missing_returns_false(self):
+        assert self.mgr.remove_library("NoSuchLib") is False
+
+    def test_remove_directory_style_prefix_rows(self):
+        """Directory-style (symdir) libraries are indexed as rows keyed
+        ``<nickname>/<file-stem>``; removing the bare nickname must drop
+        every row under that prefix (regression: previously the exact
+        lookup missed them and the rows lingered until next sync)."""
+        from kcaa.utils.symbol_database import SymbolRecord
+
+        def _make_symbol(lib: str, name: str) -> SymbolRecord:
+            return SymbolRecord(library_name=lib, symbol_name=name, library_id=-1,
+                                description="", keywords="", pin_count=0, file_index=0)
+
+        # Simulate sync() output for a symdir library: one row per .kicad_sym
+        # file inside the directory, keyed nickname/stem.
+        for stem in ("STM32F722ICKx", "STM32F723ZETx"):
+            self.mgr._db.save_library(
+                f"MCU_ST_STM32F7/{stem}",
+                f"/usr/share/kicad/symbols/MCU_ST_STM32F7.kicad_symdir/{stem}.kicad_sym",
+                100.0,
+                100,
+                "20220914",
+                [_make_symbol(f"MCU_ST_STM32F7/{stem}", stem)],
+                "csum",
+            )
+
+        assert self.mgr.remove_library("MCU_ST_STM32F7") is True
+        remaining = [lib.library_name for lib in self.mgr.get_all_libraries()]
+        assert not any(name.startswith("MCU_ST_STM32F7/") for name in remaining)

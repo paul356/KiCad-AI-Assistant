@@ -496,14 +496,33 @@ class SymbolIndexManager:
         Only the index entry is removed — the ``.kicad_sym`` file and the
         sym-lib-table entry are left untouched (callers own those).
 
-        :param library_name: Library nickname to remove.
-        :returns: True when a matching row was deleted.
+        Directory-style (KiCad 10 symdir) libraries are indexed under the
+        composed key ``<nickname>/<file-stem>`` (one row per .kicad_sym
+        file, see ``sync``).  Deleting such a library therefore removes
+        **every row** whose key starts with ``<nickname>/``; plain
+        file-style libraries match the bare nickname exactly.  A library
+        with no matching rows yields ``False``.
+
+        :param library_name: Library nickname to remove (with or without the
+            ``/stem`` suffix — both resolve to the same library).
+        :returns: True when at least one matching row was deleted.
         """
+        # Exact match: file-style libraries (bare nickname) — unchanged.
         rec = self._db.get_library_by_name(library_name)
-        if rec is None:
-            return False
-        self._db.delete_library(rec.id)
-        return True
+        if rec is not None:
+            self._db.delete_library(rec.id)
+            return True
+
+        # Prefix fallback: directory-style libraries are stored as
+        # "<nickname>/<file-stem>", so removing the whole library means
+        # removing every row under that nickname prefix.
+        prefix = f"{library_name}/"
+        deleted = False
+        for rec in self._db.get_all_libraries():
+            if rec.library_name.startswith(prefix):
+                self._db.delete_library(rec.id)
+                deleted = True
+        return deleted
 
     # ------------------------------------------------------------------
     # Narrow single-library indexing (library write tools)
