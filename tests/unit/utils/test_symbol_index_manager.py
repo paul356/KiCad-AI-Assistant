@@ -1,8 +1,8 @@
-"""
-Tests for SymbolIndexManager — orchestrates sym-lib-table reading, .kicad_sym
+"""Tests for SymbolIndexManager — orchestrates sym-lib-table reading, .kicad_sym
 parsing, and database storage through sync() and search/lookup methods.
 """
 
+import os
 from pathlib import Path
 
 from kcaa.utils.config import ServerConfig
@@ -259,3 +259,137 @@ class TestRemoveLibrary:
         assert remaining == {"TestDevice", "TestPower",
                              "MCU_ST_STM32F7/STM32F722ICKx",
                              "MCU_ST_STM32F7/STM32F723ZETx"}
+
+
+# ---------------------------------------------------------------------------
+# Project scope — project tables are indexed with the project set, and syncs
+# in one scope never touch other scopes' rows.
+# ---------------------------------------------------------------------------
+
+
+class TestProjectScopeSync:
+    """Project-scoped managers write project-local rows (project set) while
+    the appended global entries stay global.  A sync in one scope must never
+    drop rows belonging to another scope."""
+
+    def _project_fixture(self, tmp_path):
+        """A project dir with its own sym-lib-table listing one project
+        library (a copy of the fixture device file)."""
+        proj_dir = tmp_path / "proj"
+        proj_dir.mkdir()
+        (proj_dir / "ProjLib.kicad_sym").write_text(
+            (FIXTURES_DIR / "test_device.kicad_sym").read_text(encoding="utf-8")
+        )
+        (proj_dir / "sym-lib-table").write_text(
+            "(sym_lib_table\n  (version 1)\n"
+            '  (lib (name "ProjLib") (type "KiCad") (uri "${KIPRJMOD}/ProjLib.kicad_sym")'
+            '(options "") (descr "Project library"))\n)\n',
+            encoding="utf-8",
+        )
+        proj_real = os.path.realpath(str(proj_dir))
+        proj_mgr = SymbolIndexManager(
+            SymbolIndexReader(_FixtureConfig(), project_dir=proj_real),
+            db_path=":memory:",
+            project_path=proj_real,
+        )
+        return proj_dir, proj_real, proj_mgr
+
+    def test_project_sync_indexes_project_and_global_rows(self, tmp_path):
+        """Project table entry gets the project scope; appended global
+        entries (TestDevice, TestPower) stay in the global scope."""
+        _, proj_real, proj_mgr = self._project_fixture(tmp_path)
+        stats = proj_mgr.sync()
+        assert stats.added == 3  # ProjLib (project) + TestDevice + TestPower (global)
+        assert stats.failed == 0
+
+        proj_row = proj_mgr.get_library_by_name("ProjLib")
+        assert proj_row is not None
+        assert proj_row.project == proj_real
+        g_device = proj_mgr.get_library_by_name("TestDevice")
+        assert g_device.project == ""
+
+        # Project scope sees global + its own rows (that is what the incremental
+        # skip in a project-scoped sync relies on)…
+        assert set(proj_mgr._db.get_library_states(proj_real)) == {
+            os.path.join(proj_real, "ProjLib.kicad_sym"),
+            os.path.join(FIXTURES_DIR, "test_device.kicad_sym"),
+            os.path.join(FIXTURES_DIR, "test_power.kicad_sym"),
+        }
+        # …while the global scope sees only its own rows.
+        assert set(proj_mgr._db.get_library_states("")) == {
+            os.path.join(FIXTURES_DIR, "test_device.kicad_sym"),
+            os.path.join(FIXTURES_DIR, "test_power.kicad_sym"),
+        }
+
+    def test_incremental_project_sync_skips_unchanged(self, tmp_path):
+        _, _, proj_mgr = self._project_fixture(tmp_path)
+        proj_mgr.sync()
+        stats = proj_mgr.sync()
+        assert stats.skipped == 3
+        assert stats.added == 0
+        assert stats.removed == 0
+
+    def test_global_sync_preserves_project_rows(self, tmp_path):
+        """A global-scope sync (project-less reader) must not drop rows that
+        a project-scoped manager created."""
+        _, _, proj_mgr = self._project_fixture(tmp_path)
+        proj_mgr.sync()
+
+        global_mgr = SymbolIndexManager(
+            SymbolIndexReader(_FixtureConfig()), db_path=":memory:"
+        )
+        stats = global_mgr.sync()
+        assert stats.removed == 0
+        assert stats.added == 2  # TestDevice + TestPower, its own global copies
+
+        # Project row is intact and still project-scoped.
+        assert proj_mgr.get_library_by_name("ProjLib") is not None
+        assert proj_mgr.get_library_by_name("ProjLib").project == os.path.realpath(
+            str(tmp_path / "proj")
+        )
+        # And invisible to the global-scope manager.
+        assert global_mgr.get_library_by_name("ProjLib") is None
+
+    def test_project_sync_preserves_other_project_rows(self, tmp_path):
+        """Syncs of one project never touch another project's rows."""
+        _, proj_real_a, proj_mgr_a = self._project_fixture(tmp_path)
+        proj_mgr_a.sync()
+
+        # A second, unrelated project directory.
+        proj_b = tmp_path / "projb"
+        proj_b.mkdir()
+        proj_b_real = os.path.realpath(str(proj_b))
+        proj_mgr_b = SymbolIndexManager(
+            SymbolIndexReader(_FixtureConfig(), project_dir=proj_b_real),
+            db_path=":memory:",
+            project_path=proj_b_real,
+        )
+        # No sym-lib-table in proj_b -> only the global fixture entries.
+        stats = proj_mgr_b.sync()
+        assert stats.added == 2
+        assert stats.removed == 0
+        assert proj_mgr_a.get_library_by_name("ProjLib") is not None
+
+    def test_narrow_index_library_writes_manager_scope(self, tmp_path):
+        _, proj_real, proj_mgr = self._project_fixture(tmp_path)
+        proj_mgr.index_library("ProjLib", os.path.join(proj_real, "ProjLib.kicad_sym"))
+        row = proj_mgr.get_library_by_name("ProjLib")
+        assert row is not None and row.project == proj_real
+
+        global_mgr = SymbolIndexManager(
+            SymbolIndexReader(_FixtureConfig()), db_path=":memory:"
+        )
+        global_mgr.index_library("TestDevice", os.path.join(FIXTURES_DIR, "test_device.kicad_sym"))
+        assert global_mgr.get_library_by_name("TestDevice").project == ""
+
+    def test_remove_library_is_cross_project(self, tmp_path):
+        """remove_library matches by nickname regardless of scope, so a
+        project-scoped manager can drop rows created in another scope."""
+        _, proj_real, proj_mgr = self._project_fixture(tmp_path)
+        proj_mgr.sync()
+        global_mgr = SymbolIndexManager(
+            SymbolIndexReader(_FixtureConfig()), db_path=":memory:"
+        )
+        assert proj_mgr.remove_library("ProjLib") is True
+        assert proj_mgr.get_library_by_name("ProjLib") is None
+        assert global_mgr.remove_library("ProjLib") is False
