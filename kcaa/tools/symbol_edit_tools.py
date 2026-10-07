@@ -254,14 +254,6 @@ def _cached_lib_symbol_raw(sch: Any, lib_id: str):
     return getattr(pv, "_tree", None) if pv is not None else None
 
 
-def _cached_lib_symbol_ids(sch: Any) -> list[str]:
-    """Return every lib_id currently cached in the schematic's lib_symbols."""
-    try:
-        return list(sch.lib_symbols._libsyms_by_id.keys())
-    except AttributeError:
-        return []
-
-
 def _extract_cached_raw_entries(sch: Any) -> list[tuple[str, list]]:
     """Return ``(lib_id, raw)`` pairs for every entry in the schematic's
     lib_symbols cache (id = fully-qualified stored name, e.g. ``"Device:R"``
@@ -487,11 +479,9 @@ def _do_delete_symbol_library(
 
     unregistered = False
     backup_path: str | None = None
-    if table_path and os.path.isfile(table_path):
-        result = unregister_library_in_table(table_path, library)
-        unregistered = bool(result.get("unregistered"))
-        backup_path = result.get("backup_path")
 
+    # Remove the file before touching sym-lib-table: if removal fails, the
+    # table entry is still intact (no partially-deleted state).
     try:
         os.remove(lib_file)
         with contextlib.suppress(OSError):
@@ -503,6 +493,11 @@ def _do_delete_symbol_library(
             "table_unregistered": unregistered,
             "table_backup": backup_path,
         }
+
+    if table_path and os.path.isfile(table_path):
+        result = unregister_library_in_table(table_path, library)
+        unregistered = bool(result.get("unregistered"))
+        backup_path = result.get("backup_path")
 
     index_removed = False
     try:

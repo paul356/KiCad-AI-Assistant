@@ -864,11 +864,10 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
 
             unregistered = False
             backup_path: str | None = None
-            if target_table and os.path.isfile(target_table):
-                table_result = unregister_library_in_table(target_table, library)
-                unregistered = bool(table_result.get("unregistered"))
-                backup_path = table_result.get("backup_path")
 
+            # Remove the directory before touching fp-lib-table: if removal
+            # fails, the table entry is still intact (no partially-deleted
+            # state).
             try:
                 os.rmdir(library_dir)
             except OSError as exc:
@@ -883,6 +882,11 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
                     "table_unregistered": unregistered,
                     "table_backup": backup_path,
                 }
+
+            if target_table and os.path.isfile(target_table):
+                table_result = unregister_library_in_table(target_table, library)
+                unregistered = bool(table_result.get("unregistered"))
+                backup_path = table_result.get("backup_path")
 
             index_removed = False
             try:

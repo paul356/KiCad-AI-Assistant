@@ -25,6 +25,8 @@
 | `find_symbols_not_in_libraries` | `symbol_edit_tools` | List schematic symbols missing from all available libraries |
 | `remove_symbols_from_library` | `symbol_edit_tools` | Remove named symbol definitions from an existing library |
 | `delete_symbol_library` | `symbol_edit_tools` | Delete an **empty** symbol library (file + table entry + index) |
+| `remove_footprints_from_library` | `pcb_library_tools` | Remove named footprints from an existing footprint library |
+| `delete_footprint_library` | `pcb_library_tools` | Delete an **empty** footprint library (directory + table entry + index) |
 | `remove_symbol_from_schematic` | `symbol_edit_tools` | Remove one or more components by reference designator |
 | `set_symbol_property` | `symbol_edit_tools` | Set or create a named property (e.g. `Value`, `Footprint`) on a component |
 | `list_symbol_properties` | `symbol_edit_tools` | Return all properties for a component |
@@ -303,6 +305,32 @@ Entries already present in the target library are reported in `skipped` (never o
 **Success response:** `{"library": "MyLib", "path": "...", "table_path": "...", "unregistered": true, "table_backup": "...", "index_removed": true, "deleted": true}`
 
 **Non-empty refusal:** `{"error": "Library 'MyLib' is not empty (2 symbol(s): A, B); refusing to delete. Use remove_symbols_from_library first."}`
+
+---
+
+#### `remove_footprints_from_library(library, footprints, project_dir=None)`
+
+**Purpose:** Removes named footprint definitions (`.kicad_mod` files) from an existing footprint library (`.pretty` directory). Only the library directory is modified — the board (PCB) is never touched. Each requested plain footprint name must exist in the library directory; missing or unsafe names are reported in `failed` (valid names are still removed — no partial-commit ambiguity). The library is re-indexed so removed footprints disappear from search. Removing the *last* footprint leaves a valid empty library directory.
+
+**Key parameters:**
+- `library` (`str`) — nickname of the target library (must exist in fp-lib-table).
+- `footprints` (`list[str]`) — plain footprint names to remove (e.g. `["MYOP"]`). Must be non-empty.
+
+**Success response:** `{"library": "MyLib", "library_path": "...", "removed": ["MyLib:MYOP"], "removed_count": 1, "failed": [], "failed_count": 0, "indexed": 0}`
+
+---
+
+#### `delete_footprint_library(library, project_dir=None)`
+
+**Purpose:** Deletes an **empty** footprint library: the `.pretty` directory, its fp-lib-table entry (with `.bak` backup of the table), and its index entries. Refuses with `error` while the library directory still contains any `.kicad_mod` footprint — empty it first with `remove_footprints_from_library`. This tool never deletes a non-empty library.
+
+**Key parameters:**
+- `library` (`str`) — nickname of the library to delete.
+- `project_dir` (`str`, optional) — project directory when the library is project-local (`${KIPRJMOD}` URI). Omit for global libraries.
+
+**Success response:** `{"library": "MyLib", "path": "...", "table_path": "...", "unregistered": true, "table_backup": "...", "index_removed": true, "deleted": true}`
+
+**Non-empty refusal:** `{"error": "Library 'MyLib' is not empty (2 footprint(s): A.kicad_mod, B.kicad_mod); refusing to delete. Use remove_footprints_from_library first."}`
 
 ---
 

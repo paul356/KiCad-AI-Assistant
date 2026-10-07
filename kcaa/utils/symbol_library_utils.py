@@ -414,6 +414,51 @@ def _balanced_close(text: str, start: int) -> int:
     return -1
 
 
+def _root_children_spans(text: str) -> list[tuple[int, int]]:
+    """Return (start, end) text spans of the root node's direct children.
+
+    The outermost root s-expr is expanded; every nested node is consumed
+    whole.  Comments (``;`` to end of line) are skipped so a ``(`` inside a
+    comment is never mistaken for a node start.  Returns [] when the text
+    has no root, or the layout cannot be scanned reliably.
+    """
+    i = 0
+    n = len(text)
+    root_open = -1
+    while i < n:
+        ch = text[i]
+        if ch == ";":
+            nl = text.find("\n", i)
+            i = n if nl == -1 else nl + 1
+            continue
+        if ch == "(":
+            root_open = i
+            break
+        i += 1
+    if root_open == -1:
+        return []
+    root_close = _balanced_close(text, root_open)
+    if root_close == -1:
+        return []
+    spans: list[tuple[int, int]] = []
+    i = root_open + 1
+    while i < root_close:
+        ch = text[i]
+        if ch == ";":
+            nl = text.find("\n", i)
+            i = root_close if nl == -1 or nl >= root_close else nl + 1
+            continue
+        if ch == "(":
+            close = _balanced_close(text, i)
+            if close == -1 or close > root_close:
+                return []
+            spans.append((i, close))
+            i = close
+            continue
+        i += 1
+    return spans
+
+
 def remove_symbol_from_library_file(file_path: str, symbol_name: str) -> str:
     """Remove one top-level ``(symbol ...)`` node from a .kicad_sym library.
 
@@ -421,6 +466,12 @@ def remove_symbol_from_library_file(file_path: str, symbol_name: str) -> str:
     other symbols and the library header are untouched.  A backup (``.bak``)
     is written before saving.  Refuses to remove a symbol that does not
     exist — ``SymbolNotFoundError`` is raised instead.
+
+    The node is located by parsing the file (same sexpdata walk as
+    :func:`list_library_symbols`) and matching its top-level name, so quoted
+    (``(symbol "A" ...)``) and bare-atom (``(symbol A ...)``) names work
+    regardless of indentation.  Only the matched node's text is spliced out
+    — the rest of the file stays byte-identical.
 
     :param file_path: Absolute path to the library file (must exist).
     :param symbol_name: Plain (unqualified) symbol name to remove.
@@ -438,38 +489,51 @@ def remove_symbol_from_library_file(file_path: str, symbol_name: str) -> str:
     with open(file_path, encoding="utf-8") as fh:
         text = fh.read()
 
-    needle = f'(symbol "{symbol_name}"'
-    lines = text.splitlines(keepends=True)
-    line_starts: list[int] = []
-    offset = 0
-    for ln in lines:
-        line_starts.append(offset)
-        offset += len(ln)
-
-    # Top-level symbols use a 2-space indent in the pretty layout; nested
-    # (sub-symbol) nodes use 4+ spaces and header lines never start with
-    # ``(symbol``.  The exact ``(symbol "NAME"`` needle never matches a
-    # sub-symbol (``NAME_0_1``) because the closing quote differs.
-    node_start: int | None = None
-    node_line_end: int | None = None
-    for i, ln in enumerate(lines):
-        if not ln.startswith("  ") or ln.startswith("    "):
-            continue
-        if needle in ln and ln.lstrip().startswith(needle):
-            end = _balanced_close(text, line_starts[i] + (len(ln) - len(ln.lstrip())))
-            if end == -1:
-                continue
-            node_start = line_starts[i]
-            nxt = text.find("\n", end)
-            node_line_end = nxt + 1 if nxt != -1 else len(text)
-            break
-
-    if node_start is None or node_line_end is None:
+    try:
+        data = sexpdata.loads(text)
+    except Exception:
+        data = None
+    if not (isinstance(data, list) and len(data) >= 1):
         raise SymbolNotFoundError(
             f"Symbol '{symbol_name}' not found in library {os.path.basename(file_path)}"
         )
 
-    new_text = text[:node_start] + text[node_line_end:]
+    match_index: int | None = None
+    for index, child in enumerate(data[1:]):
+        if (
+            isinstance(child, list)
+            and len(child) >= 2
+            and isinstance(child[0], (sexpdata.Symbol, str))
+            and str(child[0]) == "symbol"
+            and isinstance(child[1], (sexpdata.Symbol, str))
+            and str(child[1]) == symbol_name
+        ):
+            match_index = index
+            break
+    if match_index is None:
+        raise SymbolNotFoundError(
+            f"Symbol '{symbol_name}' not found in library {os.path.basename(file_path)}"
+        )
+
+    spans = _root_children_spans(text)
+    if len(spans) != len(data) - 1:
+        raise SymbolNotFoundError(
+            f"Symbol '{symbol_name}' not found in library {os.path.basename(file_path)}"
+        )
+    node_start, node_close = spans[match_index]
+
+    # Splice the node's whole line out: from the start of its line through
+    # the close paren plus one trailing newline, so no blank line is left.
+    # Everything outside that region stays byte-identical.
+    line_start = text.rfind("\n", 0, node_start) + 1
+    remove_end = node_close
+    j = remove_end
+    while j < len(text) and text[j] in " \t":
+        j += 1
+    if j < len(text) and text[j] == "\n":
+        remove_end = j + 1
+
+    new_text = text[:line_start] + text[remove_end:]
     shutil.copy2(file_path, file_path + ".bak")
     tmp_path = file_path + ".tmp"
     with open(tmp_path, "w", encoding="utf-8") as fh:
