@@ -156,10 +156,11 @@ class TestTouchLibrary:
         lib = db.get_library_by_name("Lib")
         db.touch_library(lib.id, 999.0, 200, "xyz")
         states = db.get_library_states()
-        _id, mtime, size, checksum = states["/tmp/lib.kicad_sym"]
+        _id, mtime, size, checksum, project = states["/tmp/lib.kicad_sym"]
         assert mtime == 999.0
         assert size == 200
         assert checksum == "xyz"
+        assert project == ""
 
 
 # ---------------------------------------------------------------------------

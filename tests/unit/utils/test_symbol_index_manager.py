@@ -518,3 +518,143 @@ class TestReindexOwnership:
         )
         assert n == 2
         assert proj_mgr.get_library_by_name("TestDevice").project == proj_real
+
+
+# ---------------------------------------------------------------------------
+# P1a: symbol uniqueness is per library ROW (library_id), not per nickname —
+# two projects with same-nickname libraries and overlapping symbol names
+# must both sync without an IntegrityError.
+# ---------------------------------------------------------------------------
+
+
+class TestProjectSymbolCollision:
+    """Repro 1 (Review-2 P1): project A syncs lib 'XLib' with symbol 'SYM',
+    then project B syncs the same nickname with the same symbol names —
+    both syncs succeed and both rows + symbols coexist in one database."""
+
+    def _project_with_lib(self, tmp_path, name):
+        """A project dir whose sym-lib-table declares `name` (a copy of the
+        fixture device file: symbols R, C), plus its scoped manager over the
+        shared DB file."""
+        db_path = tmp_path / "shared.db"
+        proj_dir = tmp_path / name
+        proj_dir.mkdir()
+        (proj_dir / "XLib.kicad_sym").write_text(
+            (FIXTURES_DIR / "test_device.kicad_sym").read_text(encoding="utf-8")
+        )
+        (proj_dir / "sym-lib-table").write_text(
+            "(sym_lib_table\n  (version 1)\n"
+            '  (lib (name "XLib") (type "KiCad") (uri "${KIPRJMOD}/XLib.kicad_sym")'
+            '(options "") (descr "Project library"))\n)\n',
+            encoding="utf-8",
+        )
+        proj_real = os.path.realpath(str(proj_dir))
+        mgr = SymbolIndexManager(
+            SymbolIndexReader(_FixtureConfig(), project_dir=proj_real),
+            db_path=db_path,
+            project_path=proj_real,
+        )
+        return proj_real, mgr, db_path
+
+    def test_two_projects_same_nickname_symbols_coexist(self, tmp_path):
+        proj_a, mgr_a, _ = self._project_with_lib(tmp_path, "projA")
+        proj_b, mgr_b, db_path = self._project_with_lib(tmp_path, "projB")
+
+        stats_a = mgr_a.sync()
+        assert stats_a.failed == 0
+        assert stats_a.added == 3  # XLib (project A) + TestDevice + TestPower (global)
+
+        # Second project, same nickname and same symbol names — the old
+        # (library_name, symbol_name) PK raised IntegrityError here.
+        stats_b = mgr_b.sync()
+        assert stats_b.failed == 0
+        assert stats_b.added == 1  # XLib (project B) only
+
+        # Both project rows coexist, each owning its own symbols.
+        row_a = mgr_a.get_library_by_name("XLib")
+        row_b = mgr_b.get_library_by_name("XLib")
+        assert row_a is not None and row_a.project == proj_a
+        assert row_b is not None and row_b.project == proj_b
+        assert row_a.id != row_b.id
+
+        assert {s.symbol_name for s in mgr_a.get_library_symbols("XLib")} == {"R", "C"}
+        assert {s.symbol_name for s in mgr_b.get_library_symbols("XLib")} == {"R", "C"}
+
+        # Exactly one row is visible in each project scope…
+        assert set(mgr_a._db.get_library_states(proj_a)) - set(
+            mgr_a._db.get_library_states("")
+        ) == {os.path.join(proj_a, "XLib.kicad_sym")}
+        # …and the global scope sees neither project's XLib.
+        global_mgr = SymbolIndexManager(
+            SymbolIndexReader(_FixtureConfig()), db_path=db_path
+        )
+        assert global_mgr.get_library_by_name("XLib") is None
+
+
+# ---------------------------------------------------------------------------
+# P1b: a project sync that shadows a global nickname must NOT delete the
+# global row (the shadowed path is absent from the project's current table,
+# but the global row is shared state).
+# ---------------------------------------------------------------------------
+
+
+class TestProjectShadowSync:
+    """Repro 2 (Review-2 P1): global 'TestDevice' (fixture R/C) indexed;
+    project P shadows the nickname with a different file → after P's sync
+    the global row must still be listed in the global scope."""
+
+    def test_shadowing_project_sync_keeps_global_row(self, tmp_path):
+        db_path = tmp_path / "shared.db"
+        global_mgr = SymbolIndexManager(
+            SymbolIndexReader(_FixtureConfig()), db_path=db_path
+        )
+        global_mgr.sync()
+        global_path = os.path.join(FIXTURES_DIR, "test_device.kicad_sym")
+        assert global_mgr.get_library_by_name("TestDevice").file_path == global_path
+
+        # Project P shadows "TestDevice" with its own file (symbols VCC/GND).
+        proj_dir = tmp_path / "proj"
+        proj_dir.mkdir()
+        proj_real = os.path.realpath(str(proj_dir))
+        (proj_dir / "Shadow.kicad_sym").write_text(
+            (FIXTURES_DIR / "test_power.kicad_sym").read_text(encoding="utf-8")
+        )
+        (proj_dir / "sym-lib-table").write_text(
+            "(sym_lib_table\n  (version 1)\n"
+            '  (lib (name "TestDevice") (type "KiCad") (uri "${KIPRJMOD}/Shadow.kicad_sym")'
+            '(options "") (descr "Project shadow"))\n)\n',
+            encoding="utf-8",
+        )
+        proj_mgr = SymbolIndexManager(
+            SymbolIndexReader(_FixtureConfig(), project_dir=proj_real),
+            db_path=db_path,
+            project_path=proj_real,
+        )
+        stats = proj_mgr.sync()
+        assert stats.failed == 0
+        # The project's own shadow row is added; global rows are untouched.
+        assert stats.added >= 1
+        assert stats.removed == 0
+
+        # Global row survives, still owned by the global scope.
+        fresh_global = SymbolIndexManager(
+            SymbolIndexReader(_FixtureConfig()), db_path=db_path
+        )
+        g_row = fresh_global.get_library_by_name("TestDevice")
+        assert g_row is not None
+        assert g_row.project == ""
+        assert g_row.file_path == global_path
+        assert {s.symbol_name for s in fresh_global.get_library_symbols("TestDevice")} == {
+            "R",
+            "C",
+        }
+
+        # The project scope resolves the nickname to ITS row.
+        p_row = proj_mgr.get_library_by_name("TestDevice")
+        assert p_row is not None
+        assert p_row.project == proj_real
+        assert p_row.file_path == os.path.join(proj_real, "Shadow.kicad_sym")
+        assert {s.symbol_name for s in proj_mgr.get_library_symbols("TestDevice")} == {
+            "VCC",
+            "GND",
+        }

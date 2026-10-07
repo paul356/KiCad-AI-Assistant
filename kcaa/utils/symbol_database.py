@@ -29,6 +29,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    PrimaryKeyConstraint,
     String,
     create_engine,
     event,
@@ -108,17 +109,25 @@ class _LibraryRow(_Base):
 class _SymbolRow(_Base):
     __tablename__ = "symbols"
 
-    library_name = Column(String, nullable=False, primary_key=True)
-    symbol_name = Column(String, nullable=False, primary_key=True)
+    library_name = Column(String, nullable=False)
+    symbol_name = Column(String, nullable=False)
     library_id = Column(Integer, ForeignKey("libraries.id", ondelete="CASCADE"), nullable=False)
     description = Column(String, nullable=False, default="")
     keywords = Column(String, nullable=False, default="")
     pin_count = Column(Integer, nullable=False, default=0)
     file_index = Column(Integer, nullable=False, default=0)
 
+    # Uniqueness is scoped to the PARENT library row, not the bare nickname:
+    # same-nickname libraries in different projects own separate library
+    # rows (libraries.project), so (library_id, symbol_name) lets two
+    # projects hold overlapping symbol names without colliding.  The former
+    # PK (library_name, symbol_name) made the second project's sync() fail
+    # with an IntegrityError mid-run.
     __table_args__ = (
+        PrimaryKeyConstraint("library_id", "symbol_name"),
         Index("idx_sym_library_id", "library_id"),
         Index("idx_sym_name", "symbol_name"),
+        Index("idx_sym_library_name", "library_name"),
     )
 
 
@@ -175,11 +184,15 @@ class SymbolDatabase:
             connect_args={"check_same_thread": False},
         )
 
-        # Enable WAL mode and foreign keys on every new connection.
+        # Enable WAL mode, foreign keys, and a busy timeout on every new
+        # connection.  The busy timeout lets narrow reindex writes (symbol
+        # export tools) wait out a concurrent background sync instead of
+        # failing immediately with SQLITE_BUSY.
         @event.listens_for(self._engine, "connect")
         def _set_pragmas(conn, _record):
             conn.execute("PRAGMA journal_mode = WAL")
             conn.execute("PRAGMA foreign_keys = ON")
+            conn.execute("PRAGMA busy_timeout = 5000")
 
         self._Session = sessionmaker(bind=self._engine)
         self._apply_schema()
@@ -203,6 +216,58 @@ class SymbolDatabase:
                     text("ALTER TABLE libraries ADD COLUMN project VARCHAR NOT NULL DEFAULT ''")
                 )
                 conn.commit()
+
+            # Schema v3: symbols PK (library_name, symbol_name) →
+            # (library_id, symbol_name).  Same-nickname libraries across
+            # projects each own a libraries row, so symbol uniqueness must
+            # be per parent row; the old PK made the second project's sync()
+            # hit a UNIQUE constraint.  SQLite cannot alter a PK — rebuild
+            # the table.  Rowids are preserved so the FTS content table
+            # stays valid, then the FTS index is rebuilt for good measure.
+            # (Fresh databases created by create_all above already use v3.)
+            sym_columns = conn.execute(text("PRAGMA table_info(symbols)")).all()
+            sym_pk = [row[1] for row in sym_columns if row[5] > 0]
+            if sym_pk == ["library_name", "symbol_name"]:
+                log.info(
+                    "symbol DB schema v2 → v3: symbols PK "
+                    "(library_name, symbol_name) → (library_id, symbol_name)"
+                )
+                conn.execute(
+                    text(
+                        "CREATE TABLE symbols_new ("
+                        "  library_name VARCHAR NOT NULL,"
+                        "  symbol_name VARCHAR NOT NULL,"
+                        "  library_id INTEGER NOT NULL "
+                        "REFERENCES libraries (id) ON DELETE CASCADE,"
+                        "  description VARCHAR NOT NULL,"
+                        "  keywords VARCHAR NOT NULL,"
+                        "  pin_count INTEGER NOT NULL,"
+                        "  file_index INTEGER NOT NULL,"
+                        "  PRIMARY KEY (library_id, symbol_name)"
+                        ")"
+                    )
+                )
+                conn.execute(
+                    text(
+                        "INSERT INTO symbols_new "
+                        "(rowid, library_name, symbol_name, library_id, "
+                        " description, keywords, pin_count, file_index) "
+                        "SELECT rowid, library_name, symbol_name, library_id, "
+                        "       description, keywords, pin_count, file_index "
+                        "FROM symbols"
+                    )
+                )
+                conn.execute(text("DROP TABLE symbols"))
+                conn.execute(text("ALTER TABLE symbols_new RENAME TO symbols"))
+                conn.execute(text("CREATE INDEX idx_sym_library_id ON symbols (library_id)"))
+                conn.execute(text("CREATE INDEX idx_sym_name ON symbols (symbol_name)"))
+                conn.execute(text("CREATE INDEX idx_sym_library_name ON symbols (library_name)"))
+                try:
+                    conn.execute(text("INSERT INTO symbols_fts(symbols_fts) VALUES ('rebuild')"))
+                except Exception as exc:
+                    log.warning(f"symbols_fts rebuild failed after PK migration: {exc}")
+                conn.commit()
+
             try:
                 for statement in _DDL_FTS.split(";\n\n"):
                     stmt = statement.strip()
@@ -218,10 +283,14 @@ class SymbolDatabase:
     # Public API — state query (used by SymbolIndexManager for sync)
     # ------------------------------------------------------------------
 
-    def get_library_states(self, project: str | None = None) -> dict[str, tuple[int, float, int, str]]:
+    def get_library_states(
+        self, project: str | None = None,
+    ) -> dict[str, tuple[int, float, int, str, str]]:
         """
         Return a snapshot of indexed libraries visible in *project* scope as
-        ``{file_path: (id, mtime, file_size, checksum)}``.
+        ``{file_path: (id, mtime, file_size, checksum, project)}`` — the
+        last element is the row's OWNING scope (``''`` = global), which the
+        sync removal loop needs to avoid deleting rows it does not own.
 
         Scope = global libraries (``project=''``) plus the current project's
         libraries when *project* is given; ``None`` returns everything.
@@ -232,13 +301,17 @@ class SymbolDatabase:
             _LibraryRow.mtime,
             _LibraryRow.file_size,
             _LibraryRow.checksum,
+            _LibraryRow.project,
         )
         clause = self._project_scope_clause(project)
         if clause is not None:
             q = q.where(clause)
         with self._Session() as session:
             rows = session.execute(q).all()
-        return {row.file_path: (row.id, row.mtime, row.file_size, row.checksum) for row in rows}
+        return {
+            row.file_path: (row.id, row.mtime, row.file_size, row.checksum, row.project)
+            for row in rows
+        }
 
     # ------------------------------------------------------------------
     # Public API — write (used by SymbolIndexManager)
@@ -435,31 +508,38 @@ class SymbolDatabase:
         self, library_name: str, symbol_name: str, project: str | None = None
     ) -> SymbolRecord | None:
         """Look up a single symbol by (library_name, symbol_name), scoped to
-        *project* (global plus project libraries) when given."""
+        *project* when given — a project-owned library row shadows the
+        same-nickname global row (see ``_effective_library_ids``)."""
+        ids = self._effective_library_ids(library_name, project)
+        if not ids:
+            return None
         with self._Session() as session:
-            q = select(_SymbolRow).where(
-                _SymbolRow.library_name == library_name,
-                _SymbolRow.symbol_name == symbol_name,
-            )
-            clause = self._project_scope_clause(project)
-            if clause is not None:
-                q = q.join(_LibraryRow, _SymbolRow.library_id == _LibraryRow.id)
-                q = q.where(clause)
-            row = session.execute(q).scalar_one_or_none()
+            row = session.execute(
+                select(_SymbolRow).where(
+                    _SymbolRow.library_id.in_(ids),
+                    _SymbolRow.symbol_name == symbol_name,
+                )
+            ).scalar_one_or_none()
         return self._orm_to_symbol(row) if row else None
 
     def get_library_symbols(
         self, library_name: str, project: str | None = None
     ) -> list[SymbolRecord]:
         """Return all symbols in a library, ordered by their position in the
-        file, scoped to *project* (global plus project libraries) when given."""
+        file, scoped to *project* when given — a project-owned row shadows
+        the same-nickname global row (see ``_effective_library_ids``)."""
+        ids = self._effective_library_ids(library_name, project)
+        if not ids:
+            return []
         with self._Session() as session:
-            q = select(_SymbolRow).where(_SymbolRow.library_name == library_name)
-            clause = self._project_scope_clause(project)
-            if clause is not None:
-                q = q.join(_LibraryRow, _SymbolRow.library_id == _LibraryRow.id)
-                q = q.where(clause)
-            rows = session.execute(q.order_by(_SymbolRow.file_index)).scalars().all()
+            rows = session.execute(
+                select(_SymbolRow)
+                .where(
+                    _SymbolRow.library_name == library_name,
+                    _SymbolRow.library_id.in_(ids),
+                )
+                .order_by(_SymbolRow.file_index)
+            ).scalars().all()
         return [self._orm_to_symbol(r) for r in rows]
 
     def get_all_symbols(self, project: str | None = None) -> list[SymbolRecord]:
@@ -488,20 +568,63 @@ class SymbolDatabase:
             rows = session.execute(q.order_by(_LibraryRow.library_name)).scalars().all()
         return [self._orm_to_library(r) for r in rows]
 
+    def _effective_library_ids(self, library_name: str, project: str | None) -> list[int]:
+        """Ids of the *library_name* rows visible in *project* scope.
+
+        Shadow semantics (mirror of the index reader): within a project
+        scope the project's own row of a nickname shadows the global row —
+        KiCad lets a project sym-lib-table override a global library of the
+        same name, and the reader drops the shadowed global entry.  So a
+        project scope resolves to the project row(s) when any exist, else
+        the global row(s).  Global scope (``''``) → global rows only;
+        ``None`` → every matching row.
+        """
+        with self._Session() as session:
+            q = select(_LibraryRow.id, _LibraryRow.project).where(
+                _LibraryRow.library_name == library_name
+            )
+            if project == "":
+                q = q.where(_LibraryRow.project == "")
+            elif project is not None:
+                q = q.where(
+                    or_(_LibraryRow.project == "", _LibraryRow.project == project)
+                )
+            pairs = session.execute(q).all()
+        if project is None:
+            return [p[0] for p in pairs]
+        if project:
+            proj_ids = [p[0] for p in pairs if p[1] == project]
+            if proj_ids:
+                return proj_ids
+        return [p[0] for p in pairs if p[1] == ""]
+
     def get_library_by_name(
         self, name: str, project: str | None = None
     ) -> LibraryRecord | None:
         """Look up a single library record by library_name, scoped to
-        *project* (global plus project libraries) when given."""
+        *project* when given.  In a project scope a project-owned row
+        shadows a same-nickname global row (see ``_effective_library_ids``);
+        ``None`` returns the first matching row deterministically."""
         with self._Session() as session:
             q = select(_LibraryRow).where(_LibraryRow.library_name == name)
-            clause = self._project_scope_clause(project)
-            if clause is not None:
-                q = q.where(clause)
-            else:
+            if project is None:
                 # Un-scoped legacy lookup: same-nickname rows can exist across
                 # scopes — pick the first deterministically instead of raising.
                 q = q.order_by(_LibraryRow.id).limit(1)
+            elif project == "":
+                q = q.where(_LibraryRow.project == "")
+            else:
+                # Shadow semantics: the project's own row wins over the global
+                # row of the same nickname.
+                q = q.where(
+                    or_(_LibraryRow.project == "", _LibraryRow.project == project)
+                )
+                rows = session.execute(q).scalars().all()
+                if not rows:
+                    return None
+                proj_row = next((r for r in rows if r.project == project), None)
+                row = proj_row or rows[0]
+                return self._orm_to_library(row)
             row = session.execute(q).scalar_one_or_none()
         return self._orm_to_library(row) if row else None
 
@@ -527,17 +650,18 @@ class SymbolDatabase:
         self, library_name: str, symbol_name: str, project: str | None = None
     ) -> int | None:
         """Return the 0-based file_index of a symbol, or None if not found,
-        scoped to *project* (global plus project libraries) when given."""
+        scoped to *project* when given — a project-owned library row shadows
+        the same-nickname global row (see ``_effective_library_ids``)."""
+        ids = self._effective_library_ids(library_name, project)
+        if not ids:
+            return None
         with self._Session() as session:
-            q = select(_SymbolRow.file_index).where(
-                _SymbolRow.library_name == library_name,
-                _SymbolRow.symbol_name == symbol_name,
-            )
-            clause = self._project_scope_clause(project)
-            if clause is not None:
-                q = q.join(_LibraryRow, _SymbolRow.library_id == _LibraryRow.id)
-                q = q.where(clause)
-            row = session.execute(q).scalar_one_or_none()
+            row = session.execute(
+                select(_SymbolRow.file_index).where(
+                    _SymbolRow.library_id.in_(ids),
+                    _SymbolRow.symbol_name == symbol_name,
+                )
+            ).scalar_one_or_none()
         return int(row) if row is not None else None
 
     def get_stats(self, project: str | None = None) -> DbStats:

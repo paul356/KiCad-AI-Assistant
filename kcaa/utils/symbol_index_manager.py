@@ -186,7 +186,8 @@ class SymbolIndexManager:
         scope_id = self._project_id
         # Only global + current-project libraries participate: other projects'
         # rows must never be touched by this sync.
-        db_known = self._db.get_library_states(scope_id)  # {path: (id, mtime, size, checksum)}
+        # {path: (id, mtime, size, checksum, owning_project)}
+        db_known = self._db.get_library_states(scope_id)
         project_table = os.path.join(scope_id, "sym-lib-table") if scope_id else None
 
         current_paths: set[str] = set()
@@ -243,7 +244,7 @@ class SymbolIndexManager:
                 continue
 
             if path in db_known:
-                lib_id, db_mtime, db_size, db_checksum = db_known[path]
+                lib_id, db_mtime, db_size, db_checksum, _row_project = db_known[path]
 
                 if not force and db_mtime == cur_mtime and db_size == cur_size:
                     # Fast path: metadata identical → assume unchanged.
@@ -300,12 +301,22 @@ class SymbolIndexManager:
             except Exception as exc:
                 log.warning("progress_callback raised on completion: %s", exc)
 
-        # Remove libraries no longer in the table.
-        for path, (lib_id, _, _, _) in db_known.items():
-            if path not in current_paths:
-                log.info(f"Removing: {path}")
-                self._db.delete_library(lib_id)
-                stats.removed += 1
+        # Remove libraries no longer in the table.  Removal is ownership-
+        # aware: a project-scoped sync may only delete rows it OWNS
+        # (project == scope_id).  Global rows (project == '') are shared
+        # state — a project that shadows a global nickname (standard KiCad
+        # override) must never delete the global row just because the
+        # shadowed path is absent from this scope's current table.  The
+        # global sync (scope_id == '') sees only global rows and deletes
+        # them as before.
+        for path, (lib_id, _, _, _, row_project) in db_known.items():
+            if path in current_paths:
+                continue
+            if scope_id and row_project != scope_id:
+                continue
+            log.info(f"Removing: {path}")
+            self._db.delete_library(lib_id)
+            stats.removed += 1
 
         stats.elapsed_seconds = time.time() - t0
         log.info(
