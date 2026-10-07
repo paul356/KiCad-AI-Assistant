@@ -34,6 +34,7 @@ from sqlalchemy import (
     event,
     func,
     insert,
+    or_,
     select,
     text,
 )
@@ -58,6 +59,7 @@ class LibraryRecord:
     symbol_count: int
     last_indexed: float
     kicad_version: str
+    project: str = ""  # "" = global library; otherwise project identifier
 
 
 @dataclass
@@ -100,6 +102,7 @@ class _LibraryRow(_Base):
     symbol_count = Column(Integer, nullable=False, default=0)
     last_indexed = Column(Float, nullable=False, default=0.0)
     kicad_version = Column(String, nullable=False, default="")
+    project = Column(String, nullable=False, default="", server_default="''")
 
 
 class _SymbolRow(_Base):
@@ -189,6 +192,17 @@ class SymbolDatabase:
         """Create ORM tables and FTS5 virtual table / triggers."""
         _Base.metadata.create_all(self._engine)
         with self._engine.connect() as conn:
+            # Schema v2: libraries gains a `project` column.  Old databases
+            # are upgraded in place (ALTER) — data is preserved.  v1 databases
+            # have no project column; anything newer already matches the ORM.
+            columns = conn.execute(text("PRAGMA table_info(libraries)")).all()
+            col_names = {row[1] for row in columns}
+            if "project" not in col_names and columns:
+                log.info("symbol DB schema v1 → v2: adding libraries.project column")
+                conn.execute(
+                    text("ALTER TABLE libraries ADD COLUMN project VARCHAR NOT NULL DEFAULT ''")
+                )
+                conn.commit()
             try:
                 for statement in _DDL_FTS.split(";\n\n"):
                     stmt = statement.strip()
@@ -204,21 +218,26 @@ class SymbolDatabase:
     # Public API — state query (used by SymbolIndexManager for sync)
     # ------------------------------------------------------------------
 
-    def get_library_states(self) -> dict[str, tuple[int, float, int, str]]:
+    def get_library_states(self, project: str | None = None) -> dict[str, tuple[int, float, int, str]]:
         """
-        Return a snapshot of all indexed libraries as
+        Return a snapshot of indexed libraries visible in *project* scope as
         ``{file_path: (id, mtime, file_size, checksum)}``.
+
+        Scope = global libraries (``project=''``) plus the current project's
+        libraries when *project* is given; ``None`` returns everything.
         """
+        q = select(
+            _LibraryRow.id,
+            _LibraryRow.file_path,
+            _LibraryRow.mtime,
+            _LibraryRow.file_size,
+            _LibraryRow.checksum,
+        )
+        clause = self._project_scope_clause(project)
+        if clause is not None:
+            q = q.where(clause)
         with self._Session() as session:
-            rows = session.execute(
-                select(
-                    _LibraryRow.id,
-                    _LibraryRow.file_path,
-                    _LibraryRow.mtime,
-                    _LibraryRow.file_size,
-                    _LibraryRow.checksum,
-                )
-            ).all()
+            rows = session.execute(q).all()
         return {row.file_path: (row.id, row.mtime, row.file_size, row.checksum) for row in rows}
 
     # ------------------------------------------------------------------
@@ -234,6 +253,7 @@ class SymbolDatabase:
         kicad_version: str,
         symbols: list[SymbolRecord],
         checksum: str = "",
+        project: str = "",
     ) -> int:
         """
         Insert or fully replace a library and its symbols in one transaction.
@@ -257,6 +277,7 @@ class SymbolDatabase:
                 symbol_count=len(symbols),
                 last_indexed=now,
                 kicad_version=kicad_version,
+                project=project,
             )
             session.add(lib_row)
             session.flush()  # assigns lib_row.id
@@ -311,42 +332,85 @@ class SymbolDatabase:
     # Public API — search
     # ------------------------------------------------------------------
 
-    def search(self, query: str, limit: int = 50) -> list[SymbolRecord]:
+    def search(
+        self, query: str, limit: int = 50, project: str | None = None
+    ) -> list[SymbolRecord]:
         """
         Full-text search across symbol_name, description, and keywords.
         Returns results ordered by FTS5 rank (best match first).
         Falls back to LIKE search if FTS5 is unavailable.
+
+        *project* scope = global libraries (``project=''``) plus that
+        project's libraries; ``None`` searches everything.
         """
         safe_query = self._fts_escape(query)
-        sql = text(
-            """
-            SELECT s.library_name, s.symbol_name, s.library_id,
-                   s.description, s.keywords, s.pin_count, s.file_index
-            FROM symbols_fts f
-            JOIN symbols s ON s.rowid = f.rowid
-            WHERE symbols_fts MATCH :q
-            ORDER BY rank
-            LIMIT :lim
-            """
-        )
+        params: dict[str, object] = {"q": safe_query, "lim": limit}
+        if project == "":
+            # Project scope: global libraries only.
+            sql = text(
+                """
+                SELECT s.library_name, s.symbol_name, s.library_id,
+                       s.description, s.keywords, s.pin_count, s.file_index
+                FROM symbols_fts f
+                JOIN symbols s ON s.rowid = f.rowid
+                JOIN libraries lib ON s.library_id = lib.id
+                WHERE symbols_fts MATCH :q AND lib.project = ''
+                ORDER BY rank
+                LIMIT :lim
+                """
+            )
+        elif project:
+            # Project scope: global plus the given project's libraries.
+            params["proj"] = project
+            sql = text(
+                """
+                SELECT s.library_name, s.symbol_name, s.library_id,
+                       s.description, s.keywords, s.pin_count, s.file_index
+                FROM symbols_fts f
+                JOIN symbols s ON s.rowid = f.rowid
+                JOIN libraries lib ON s.library_id = lib.id
+                WHERE symbols_fts MATCH :q
+                  AND (lib.project = '' OR lib.project = :proj)
+                ORDER BY rank
+                LIMIT :lim
+                """
+            )
+        else:
+            # No scope: search everything.
+            sql = text(
+                """
+                SELECT s.library_name, s.symbol_name, s.library_id,
+                       s.description, s.keywords, s.pin_count, s.file_index
+                FROM symbols_fts f
+                JOIN symbols s ON s.rowid = f.rowid
+                JOIN libraries lib ON s.library_id = lib.id
+                WHERE symbols_fts MATCH :q
+                ORDER BY rank
+                LIMIT :lim
+                """
+            )
         try:
             with self._engine.connect() as conn:
-                rows = conn.execute(sql, {"q": safe_query, "lim": limit}).all()
+                rows = conn.execute(sql, params).all()
             return [self._row_to_symbol(r) for r in rows]
         except Exception:
             log.debug("FTS5 unavailable, falling back to LIKE search")
-            return self.search_by_name(query, limit=limit)
+            return self.search_by_name(query, limit=limit, project=project)
 
     def search_by_name(
         self,
         name: str,
         exact: bool = False,
         limit: int = 50,
+        project: str | None = None,
     ) -> list[SymbolRecord]:
         """
         Search symbols by name.
         exact=True  — case-insensitive exact match.
         exact=False — case-insensitive substring match.
+
+        *project* scope = global libraries (``project=''``) plus that
+        project's libraries; ``None`` searches everything.
         """
         with self._Session() as session:
             q = select(_SymbolRow)
@@ -356,6 +420,10 @@ class SymbolDatabase:
                 q = q.where(
                     _SymbolRow.symbol_name.ilike(f"%{self._like_escape(name)}%", escape="\\")
                 )
+            clause = self._project_scope_clause(project)
+            if clause is not None:
+                q = q.join(_LibraryRow, _SymbolRow.library_id == _LibraryRow.id)
+                q = q.where(clause)
             rows = session.execute(q.limit(limit)).scalars().all()
         return [self._orm_to_symbol(r) for r in rows]
 
@@ -363,81 +431,105 @@ class SymbolDatabase:
     # Public API — lookup
     # ------------------------------------------------------------------
 
-    def get_symbol(self, library_name: str, symbol_name: str) -> SymbolRecord | None:
-        """Look up a single symbol by (library_name, symbol_name)."""
+    def get_symbol(
+        self, library_name: str, symbol_name: str, project: str | None = None
+    ) -> SymbolRecord | None:
+        """Look up a single symbol by (library_name, symbol_name), scoped to
+        *project* (global plus project libraries) when given."""
         with self._Session() as session:
-            row = session.execute(
-                select(_SymbolRow).where(
-                    _SymbolRow.library_name == library_name,
-                    _SymbolRow.symbol_name == symbol_name,
-                )
-            ).scalar_one_or_none()
+            q = select(_SymbolRow).where(
+                _SymbolRow.library_name == library_name,
+                _SymbolRow.symbol_name == symbol_name,
+            )
+            clause = self._project_scope_clause(project)
+            if clause is not None:
+                q = q.join(_LibraryRow, _SymbolRow.library_id == _LibraryRow.id)
+                q = q.where(clause)
+            row = session.execute(q).scalar_one_or_none()
         return self._orm_to_symbol(row) if row else None
 
-    def get_library_symbols(self, library_name: str) -> list[SymbolRecord]:
-        """Return all symbols in a library, ordered by their position in the file."""
+    def get_library_symbols(
+        self, library_name: str, project: str | None = None
+    ) -> list[SymbolRecord]:
+        """Return all symbols in a library, ordered by their position in the
+        file, scoped to *project* (global plus project libraries) when given."""
         with self._Session() as session:
-            rows = (
-                session.execute(
-                    select(_SymbolRow)
-                    .where(_SymbolRow.library_name == library_name)
-                    .order_by(_SymbolRow.file_index)
-                )
-                .scalars()
-                .all()
-            )
+            q = select(_SymbolRow).where(_SymbolRow.library_name == library_name)
+            clause = self._project_scope_clause(project)
+            if clause is not None:
+                q = q.join(_LibraryRow, _SymbolRow.library_id == _LibraryRow.id)
+                q = q.where(clause)
+            rows = session.execute(q.order_by(_SymbolRow.file_index)).scalars().all()
         return [self._orm_to_symbol(r) for r in rows]
 
-    def get_all_symbols(self) -> list[SymbolRecord]:
-        """Return every indexed symbol, ordered by library then position."""
+    def get_all_symbols(self, project: str | None = None) -> list[SymbolRecord]:
+        """Return every indexed symbol, ordered by library then position,
+        scoped to *project* (global plus project libraries) when given."""
+        q = select(_SymbolRow)
+        clause = self._project_scope_clause(project)
+        if clause is not None:
+            q = q.join(_LibraryRow, _SymbolRow.library_id == _LibraryRow.id)
+            q = q.where(clause)
         with self._Session() as session:
-            rows = (
-                session.execute(
-                    select(_SymbolRow).order_by(_SymbolRow.library_name, _SymbolRow.file_index)
-                )
-                .scalars()
-                .all()
-            )
+            rows = session.execute(
+                q.order_by(_SymbolRow.library_name, _SymbolRow.file_index)
+            ).scalars().all()
         return [self._orm_to_symbol(r) for r in rows]
 
-    def get_all_libraries(self) -> list[LibraryRecord]:
-        """Return all indexed library records, ordered alphabetically."""
+    def get_all_libraries(self, project: str | None = None) -> list[LibraryRecord]:
+        """Return indexed library records scoped to *project* (global plus
+        project libraries when given; everything when ``None``), ordered
+        alphabetically."""
+        q = select(_LibraryRow)
+        clause = self._project_scope_clause(project)
+        if clause is not None:
+            q = q.where(clause)
         with self._Session() as session:
-            rows = (
-                session.execute(select(_LibraryRow).order_by(_LibraryRow.library_name))
-                .scalars()
-                .all()
-            )
+            rows = session.execute(q.order_by(_LibraryRow.library_name)).scalars().all()
         return [self._orm_to_library(r) for r in rows]
 
-    def get_library_by_name(self, name: str) -> LibraryRecord | None:
-        """Look up a single library record by library_name."""
+    def get_library_by_name(
+        self, name: str, project: str | None = None
+    ) -> LibraryRecord | None:
+        """Look up a single library record by library_name, scoped to
+        *project* (global plus project libraries) when given."""
         with self._Session() as session:
-            row = session.execute(
-                select(_LibraryRow).where(_LibraryRow.library_name == name)
-            ).scalar_one_or_none()
+            q = select(_LibraryRow).where(_LibraryRow.library_name == name)
+            clause = self._project_scope_clause(project)
+            if clause is not None:
+                q = q.where(clause)
+            row = session.execute(q).scalar_one_or_none()
         return self._orm_to_library(row) if row else None
 
-    def get_symbol_file_index(self, library_name: str, symbol_name: str) -> int | None:
-        """Return the 0-based file_index of a symbol, or None if not found."""
+    def get_symbol_file_index(
+        self, library_name: str, symbol_name: str, project: str | None = None
+    ) -> int | None:
+        """Return the 0-based file_index of a symbol, or None if not found,
+        scoped to *project* (global plus project libraries) when given."""
         with self._Session() as session:
-            row = session.execute(
-                select(_SymbolRow.file_index).where(
-                    _SymbolRow.library_name == library_name,
-                    _SymbolRow.symbol_name == symbol_name,
-                )
-            ).scalar_one_or_none()
+            q = select(_SymbolRow.file_index).where(
+                _SymbolRow.library_name == library_name,
+                _SymbolRow.symbol_name == symbol_name,
+            )
+            clause = self._project_scope_clause(project)
+            if clause is not None:
+                q = q.join(_LibraryRow, _SymbolRow.library_id == _LibraryRow.id)
+                q = q.where(clause)
+            row = session.execute(q).scalar_one_or_none()
         return int(row) if row is not None else None
 
-    def get_stats(self) -> DbStats:
-        """Return summary statistics about the database."""
+    def get_stats(self, project: str | None = None) -> DbStats:
+        """Return summary statistics about the database, scoped to *project*
+        (global plus project libraries when given; everything when ``None``)."""
+        lib_q = select(func.count()).select_from(_LibraryRow)
+        sym_q = select(func.count()).select_from(_SymbolRow)
+        clause = self._project_scope_clause(project)
+        if clause is not None:
+            lib_q = lib_q.where(clause)
+            sym_q = sym_q.join(_LibraryRow, _SymbolRow.library_id == _LibraryRow.id).where(clause)
         with self._Session() as session:
-            lib_count: int = session.execute(
-                select(func.count()).select_from(_LibraryRow)
-            ).scalar_one()
-            sym_count: int = session.execute(
-                select(func.count()).select_from(_SymbolRow)
-            ).scalar_one()
+            lib_count: int = session.execute(lib_q).scalar_one()
+            sym_count: int = session.execute(sym_q).scalar_one()
             last_sync = session.execute(select(func.max(_LibraryRow.last_indexed))).scalar_one()
         return DbStats(
             library_count=lib_count,
@@ -470,6 +562,21 @@ class SymbolDatabase:
         """Escape LIKE special characters in a user-supplied substring."""
         return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
+    @staticmethod
+    def _project_scope_clause(project: str | None = None):
+        """A WHERE clause fragment limiting rows to *project* scope.
+
+        Scope = global libraries (``project=''``) plus the given project's
+        libraries.  An empty string means global-only scope (filters out all
+        project-local rows); ``None`` (no project context) returns ``None``,
+        meaning the caller should not filter at all.
+        """
+        if project is None:
+            return None
+        if project == "":
+            return _LibraryRow.project == ""
+        return or_(_LibraryRow.project == "", _LibraryRow.project == project)
+
     # ------------------------------------------------------------------
     # Internal helpers — ORM row → public dataclass
     # ------------------------------------------------------------------
@@ -498,6 +605,7 @@ class SymbolDatabase:
             symbol_count=row.symbol_count,
             last_indexed=row.last_indexed,
             kicad_version=row.kicad_version,
+            project=row.project,
         )
 
     # FTS search returns raw DB rows (not ORM objects) — handle separately.
