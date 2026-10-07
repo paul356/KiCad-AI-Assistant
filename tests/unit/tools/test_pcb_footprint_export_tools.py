@@ -1193,6 +1193,33 @@ class TestRemoveFootprintsFromLibrary:
         )
         assert "error" in result
 
+    def test_refuses_system_footprint_library(self, tools, project, monkeypatch, tmp_path):
+        """remove_footprints_from_library must refuse a library that
+        resolves inside the KiCad system footprints dir."""
+        from kcaa.utils.config import config
+
+        sys_dir = tmp_path / "system" / "footprints"
+        sys_dir.mkdir(parents=True)
+        (sys_dir / "SysFp.kicad_mod").write_text(
+            '(footprint "SysFp")', encoding="utf-8"
+        )
+        table = _make_fp_lib_table(tmp_path, [("SysFp", str(sys_dir))])
+        # Re-route the fixture's table lookup to the table that registers SysFp.
+        monkeypatch.setattr(
+            "kcaa.utils.pcb_library_utils.find_fp_lib_tables",
+            lambda project_path=None: [table],
+        )
+        monkeypatch.setattr(config, "_kicad_footprint_dir", str(sys_dir))
+
+        result = _run(
+            tools["remove_footprints_from_library"](
+                library="SysFp", footprints=["SysFp"], ctx=None
+            )
+        )
+        assert "error" in result, result
+        assert "system library" in result["error"]
+        assert os.path.isfile(os.path.join(sys_dir, "SysFp.kicad_mod"))
+
 
 class TestDeleteFootprintLibrary:
     def test_deletes_empty_library(self, tools, project):
@@ -1252,3 +1279,23 @@ class TestDeleteFootprintLibrary:
         result = _run(tools["delete_footprint_library"](library="NoSuchLib", ctx=None))
         assert "error" in result
         assert "success" not in result
+
+    def test_refuses_system_footprint_library(self, tools, monkeypatch, tmp_path):
+        """delete_footprint_library must refuse a library that resolves
+        inside the KiCad system footprints dir, even when empty."""
+        from kcaa.utils.config import config
+
+        sys_dir = tmp_path / "system" / "footprints"
+        sys_dir.mkdir(parents=True)  # empty -> would otherwise be deletable
+        table = _make_fp_lib_table(tmp_path, [("SysFp", str(sys_dir))])
+        monkeypatch.setattr(
+            "kcaa.utils.pcb_library_utils.find_fp_lib_tables",
+            lambda project_path=None: [table],
+        )
+        monkeypatch.setattr(config, "_kicad_footprint_dir", str(sys_dir))
+
+        result = _run(tools["delete_footprint_library"](library="SysFp", ctx=None))
+        assert "error" in result, result
+        assert "system library" in result["error"]
+        assert "success" not in result
+        assert os.path.isdir(sys_dir)  # directory survives

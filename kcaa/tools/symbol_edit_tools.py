@@ -373,6 +373,15 @@ def _do_remove_symbol_from_library(
         return {"error": str(exc)}
     lib_file = lib["path"]
 
+    if config.is_system_library_path(lib_file):
+        return {
+            "error": (
+                f"Refusing to modify system library '{library}' "
+                f"(resolves to {lib_file}, inside the KiCad installation): "
+                "symbol library tools operate on user libraries only."
+            )
+        }
+
     available = set(list_library_symbols(lib_file))
     removed: list[str] = []
     failed: list[dict[str, str]] = []
@@ -428,6 +437,15 @@ def _do_delete_symbol_library(
         return {"error": str(exc)}
     lib_file = lib["path"]
     table_path = lib["table_path"]
+
+    if config.is_system_library_path(lib_file):
+        return {
+            "error": (
+                f"Refusing to delete system library '{library}' "
+                f"(resolves to {lib_file}, inside the KiCad installation): "
+                "delete_symbol_library operates on user libraries only."
+            )
+        }
 
     remaining = list_library_symbols(lib_file)
     if remaining:

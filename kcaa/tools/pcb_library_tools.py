@@ -747,6 +747,14 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
             if not footprints:
                 return {"error": "footprints list must not be empty"}
             library_dir, target_table = _resolve_library_dir(library, project_dir)
+            if config.is_system_library_path(library_dir):
+                return {
+                    "error": (
+                        f"Refusing to modify system library '{library}' "
+                        f"(resolves to {library_dir}, inside the KiCad installation): "
+                        "footprint library tools operate on user libraries only."
+                    )
+                }
             removed: list[str] = []
             failed: list[dict[str, str]] = []
             for name in dict.fromkeys(footprints):  # dedupe, keep order
@@ -826,6 +834,14 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
         """
         try:
             library_dir, target_table = _resolve_library_dir(library, project_dir)
+            if config.is_system_library_path(library_dir):
+                return {
+                    "error": (
+                        f"Refusing to delete system library '{library}' "
+                        f"(resolves to {library_dir}, inside the KiCad installation): "
+                        "delete_footprint_library operates on user libraries only."
+                    )
+                }
             mod_files = [f for f in os.listdir(library_dir) if f.endswith(".kicad_mod")]
             if mod_files:
                 return {

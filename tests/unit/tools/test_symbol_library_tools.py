@@ -287,8 +287,8 @@ class TestFindSymbolsNotInLibraries:
         ``nickname/stem`` while lookup used the bare nickname, so every
         symbol in such a library was reported missing.
         """
-        from kcaa.utils.symbol_library_utils import list_library_symbols
         from kcaa.utils.sym_lib_table_utils import register_library_in_table
+        from kcaa.utils.symbol_library_utils import list_library_symbols
 
         # Build a directory-type library "Device" with one .kicad_sym per symbol.
         device_dir = os.path.join(env["tmp_path"], "DeviceLib")
@@ -521,3 +521,79 @@ class TestDeleteSymbolLibrary:
         names = list_library_symbols(str(lib))
         assert "BARE" in names
         assert "QUOTED" in names
+
+
+# ---------------------------------------------------------------------------
+# System-library protection (never modify KiCad's own libraries)
+# ---------------------------------------------------------------------------
+
+
+class TestSystemLibraryGuard:
+    """delete/remove symbol library tools must refuse libraries that
+    resolve inside the KiCad installation (config.kicad_symbol_dir / ...).
+
+    User libraries live in 3rd-party or project dirs; the tools' contract
+    is "user libraries only" — system symdir/file libraries under
+    /usr/share/kicad (or the platform app dir) are off limits.
+    """
+
+    def _register_system_lib(self, env, sys_dir):
+        """Register and create a .kicad_sym that resolves inside sys_dir,
+        as if a system library were registered in sym-lib-table."""
+        from kcaa.utils.sym_lib_table_utils import register_library_in_table
+
+        sys_dir.mkdir(parents=True, exist_ok=True)
+        sys_file = sys_dir / "SysLib.kicad_sym"
+        sys_file.write_text(
+            "(kicad_symbol_lib\n"
+            "  (version 20220914)\n"
+            "  (symbol SYS1\n"
+            "    (in_bom yes)\n"
+            "    (on_board yes)\n"
+            "  )\n"
+            ")\n"
+        )
+        # Register in the global user table used by the env fixture.
+        table_path = env["table_path"]
+        register_library_in_table(
+            table_path,
+            "SysLib",
+            f"{sys_file}",
+            description="system test lib",
+        )
+        return str(sys_file)
+
+    def test_delete_refuses_system_library(self, tools, env, monkeypatch, tmp_path):
+        """delete_symbol_library on a library whose file lives inside the
+        KiCad system symbol dir must refuse with an error and not delete."""
+        from kcaa.utils.config import config
+
+        sys_dir = tmp_path / "system" / "symbols"
+        sys_file = self._register_system_lib(env, sys_dir)
+        monkeypatch.setattr(config, "_kicad_symbol_dir", str(sys_dir))
+
+        # delete_symbol_library: must refuse pre-flight (empty library too).
+        result = _run(tools["delete_symbol_library"], library="SysLib")
+        assert "error" in result, result
+        assert "system library" in result["error"]
+        assert os.path.isfile(sys_file)  # file survives
+
+    def test_remove_refuses_system_library(self, tools, env, monkeypatch, tmp_path):
+        """remove_symbols_from_library on a system library must refuse."""
+        from kcaa.utils.config import config
+
+        sys_dir = tmp_path / "system" / "symbols"
+        sys_file = self._register_system_lib(env, sys_dir)
+        monkeypatch.setattr(config, "_kicad_symbol_dir", str(sys_dir))
+
+        result = _run(tools["remove_symbols_from_library"], library="SysLib", symbols=["SYS1"])
+        assert "error" in result, result
+        assert "system library" in result["error"]
+        assert os.path.isfile(sys_file)
+
+    def test_user_library_inside_3rd_party_is_not_system(self, env):
+        """A library created by create_symbol_library (3rd-party dir) must
+        NOT be classified as a system library."""
+        from kcaa.utils.config import config
+
+        assert not config.is_system_library_path(env["lib_path"])
