@@ -175,11 +175,15 @@ class SymbolIndexManager:
             elapsed_seconds=0.0,
         )
 
-        # Capture the scope once into locals: sync runs while other tool
-        # calls can re-scope the shared singleton manager, and this loop must
-        # not observe a mid-flight scope flip.
+        # Capture the reader and the scope once into locals: sync runs in a
+        # background thread while other tool calls can re-scope the shared
+        # singleton manager (project id + reader are swapped together under
+        # the tool-side lock), and this loop must never observe a mid-flight
+        # flip.  The reader is pinned first so the entries and the scope id
+        # stay paired for the whole body.
+        lm = self._library_manager
+        entries = lm.get_libraries()
         scope_id = self._project_id
-        entries = self._library_manager.get_libraries()
         # Only global + current-project libraries participate: other projects'
         # rows must never be touched by this sync.
         db_known = self._db.get_library_states(scope_id)  # {path: (id, mtime, size, checksum)}
@@ -542,27 +546,37 @@ class SymbolIndexManager:
         manager's project (global + project libraries)."""
         return self._db.get_library_by_name(name, project=self._project_id)
 
-    def remove_library(self, library_name: str) -> bool:
+    def remove_library(self, library_name: str, project: str | None = None) -> bool:
         """Drop one library (and its symbols) from the index database.
 
         Only the index entry is removed — the ``.kicad_sym`` file and the
         sym-lib-table entry are left untouched (callers own those).
 
-        Matches by bare nickname.  Match is deliberately cross-project: a
-        project-scoped manager must still be able to drop a row regardless
-        of which project scope created it (mirrors
-        ``FootprintIndexManager.remove_library``).  User-facing library
-        tools only ever create **file-style** libraries (one ``.kicad_sym``
-        per library), which are indexed under the bare nickname, so exact
-        matching is sufficient.  Directory-style (symdir) rows keyed
-        ``<nickname>/<file-stem>`` belong to *system* libraries (e.g.
-        ``usr/share/kicad/symbols``) and are deliberately **not** matched:
-        delete tools must never touch system libraries.
+        **Ownership-scoped by default**: with *project* given (``""`` for a
+        global library, a project id for a project library), only the row
+        whose ``project`` matches **exactly** is removed — a same-nickname
+        row owned by another project is NEVER touched (the user-facing
+        delete path always derives the owning project from the library's
+        declaring sym-lib-table and passes it here).
+
+        With ``project=None`` the historic first-match-any-scope behavior is
+        kept for callers that do not know ownership (e.g. tests): the first
+        row matching the bare nickname is removed.
+
+        Directory-style (symdir) rows keyed ``<nickname>/<file-stem>`` belong
+        to *system* libraries (e.g. ``usr/share/kicad/symbols``) and are
+        deliberately **not** matched: delete tools must never touch system
+        libraries.
 
         :param library_name: Library nickname to remove.
+        :param project: Exact owning project (``""`` = global); ``None`` for
+            the legacy any-scope match.
         :returns: True when a matching row was deleted.
         """
-        rec = self._db.get_library_by_name(library_name, project=None)
+        if project is not None:
+            rec = self._db.get_library_by_name_exact(library_name, project)
+        else:
+            rec = self._db.get_library_by_name(library_name, project=None)
         if rec is None:
             return False
         self._db.delete_library(rec.id)
@@ -572,7 +586,9 @@ class SymbolIndexManager:
     # Narrow single-library indexing (library write tools)
     # ------------------------------------------------------------------
 
-    def index_library(self, library_name: str, file_path: str) -> int:
+    def index_library(
+        self, library_name: str, file_path: str, project: str | None = None
+    ) -> int:
         """Index exactly one ``.kicad_sym`` file into the database.
 
         Narrow update for the schematic → library export tools: indexes a
@@ -582,6 +598,11 @@ class SymbolIndexManager:
             (for directory-style libraries the caller passes the composed
             ``TableName/FileBaseName`` form, matching ``sync``).
         :param file_path: Absolute path to the ``.kicad_sym`` file.
+        :param project: Exact row ownership (``""`` = global, a project id =
+            that project).  Tools derive it from the library's declaring
+            sym-lib-table so a reindex never re-attributes a global
+            library to the caller's project.  ``None`` (legacy callers)
+            falls back to the manager's own scope.
         :returns: Number of symbols stored, or -1 on failure.
         """
         if not os.path.isfile(file_path):
@@ -593,13 +614,15 @@ class SymbolIndexManager:
             log.warning("index_library: cannot stat %s: %s", file_path, exc)
             return -1
         checksum = self._compute_checksum(file_path)
+        if project is None:
+            project = self._project_id
         return self._index_library(
             library_name,
             file_path,
             stat.st_mtime,
             stat.st_size,
             checksum,
-            project=self._project_id,
+            project=project,
         )
 
     # ------------------------------------------------------------------

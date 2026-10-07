@@ -382,14 +382,139 @@ class TestProjectScopeSync:
         global_mgr.index_library("TestDevice", os.path.join(FIXTURES_DIR, "test_device.kicad_sym"))
         assert global_mgr.get_library_by_name("TestDevice").project == ""
 
-    def test_remove_library_is_cross_project(self, tmp_path):
-        """remove_library matches by nickname regardless of scope, so a
-        project-scoped manager can drop rows created in another scope."""
+    def test_remove_library_by_ownership(self, tmp_path):
+        """Deleting matches by OWNERSHIP: a global-scoped remove (project="")
+        must never delete the project-owned row; the owning project's remove
+        deletes exactly its own row.  Legacy project=None still first-matches
+        any scope."""
+        db_path = tmp_path / "shared.db"
         _, proj_real, proj_mgr = self._project_fixture(tmp_path)
+        # Both managers share one database file — mirror of the tool-side
+        # singleton that re-scopes instead of using separate DBs.
+        proj_mgr._db.close()
+        proj_mgr = SymbolIndexManager(
+            SymbolIndexReader(_FixtureConfig(), project_dir=proj_real),
+            db_path=db_path,
+            project_path=proj_real,
+        )
         proj_mgr.sync()
         global_mgr = SymbolIndexManager(
-            SymbolIndexReader(_FixtureConfig()), db_path=":memory:"
+            SymbolIndexReader(_FixtureConfig()), db_path=db_path
         )
+        assert proj_mgr.get_library_by_name("ProjLib").project == proj_real
+
+        # Global-scoped remove must NOT delete the project-owned row.
+        assert global_mgr.remove_library("ProjLib", project="") is False
+        assert proj_mgr.get_library_by_name("ProjLib") is not None
+
+        # The owning project's remove deletes exactly its own row.
+        assert proj_mgr.remove_library("ProjLib", project=proj_real) is True
+        assert proj_mgr.get_library_by_name("ProjLib") is None
+
+        # Legacy project=None still first-matches across scopes.
+        proj_mgr.index_library("ProjLib", os.path.join(proj_real, "ProjLib.kicad_sym"))
         assert proj_mgr.remove_library("ProjLib") is True
         assert proj_mgr.get_library_by_name("ProjLib") is None
-        assert global_mgr.remove_library("ProjLib") is False
+
+
+# ---------------------------------------------------------------------------
+# remove_library ownership matrix — same-nickname rows across scopes
+# ---------------------------------------------------------------------------
+
+
+class TestRemoveLibraryOwnership:
+    """remove_library(project=X) deletes exactly the row owned by X — a
+    same-nickname row of another project (or the global scope) survives."""
+
+    def _seed(self, mgr):
+        db = mgr._db
+        db.save_library("Shared", "/g/Shared.kicad_sym", 1.0, 100, "", [], project="")
+        db.save_library("Shared", "/pA/Shared.kicad_sym", 1.0, 100, "", [], project="/pA")
+        db.save_library("Shared", "/pB/Shared.kicad_sym", 1.0, 100, "", [], project="/pB")
+
+    def test_delete_project_a_row_keeps_b_and_global(self):
+        mgr = _make_manager()
+        self._seed(mgr)
+        assert mgr.remove_library("Shared", project="/pA") is True
+        assert mgr._db.get_library_by_name_exact("Shared", "/pA") is None
+        assert mgr._db.get_library_by_name_exact("Shared", "/pB") is not None
+        assert mgr._db.get_library_by_name_exact("Shared", "") is not None
+
+    def test_delete_global_row_keeps_project_rows(self):
+        mgr = _make_manager()
+        self._seed(mgr)
+        assert mgr.remove_library("Shared", project="") is True
+        assert mgr._db.get_library_by_name_exact("Shared", "") is None
+        assert mgr._db.get_library_by_name_exact("Shared", "/pA") is not None
+        assert mgr._db.get_library_by_name_exact("Shared", "/pB") is not None
+
+    def test_unknown_ownership_removes_nothing(self):
+        mgr = _make_manager()
+        self._seed(mgr)
+        assert mgr.remove_library("Shared", project="/nope") is False
+        assert mgr._db.get_library_by_name_exact("Shared", "") is not None
+        assert mgr._db.get_library_by_name_exact("Shared", "/pA") is not None
+        assert mgr._db.get_library_by_name_exact("Shared", "/pB") is not None
+
+    def test_legacy_none_matches_any_scope(self):
+        mgr = _make_manager()
+        self._seed(mgr)
+        assert mgr.remove_library("Shared") is True
+        remaining = [
+            mgr._db.get_library_by_name_exact("Shared", scope) is not None
+            for scope in ("", "/pA", "/pB")
+        ]
+        assert remaining.count(True) == 2  # exactly one row dropped
+
+
+# ---------------------------------------------------------------------------
+# Reindex ownership — a narrow reindex must keep the library's OWN scope
+# ---------------------------------------------------------------------------
+
+
+class TestReindexOwnership:
+    def test_reindex_keeps_global_ownership(self, tmp_path):
+        """A project-scoped narrow reindex of a GLOBAL library file must not
+        re-attribute its row to the caller's project: index_library receives
+        the derived ownership ("" ) explicitly."""
+        db_path = tmp_path / "shared.db"
+        global_mgr = SymbolIndexManager(
+            SymbolIndexReader(_FixtureConfig()), db_path=db_path
+        )
+        global_mgr.sync()
+        device_path = os.path.join(FIXTURES_DIR, "test_device.kicad_sym")
+        assert global_mgr.get_library_by_name("TestDevice").project == ""
+
+        # The tool flow: a project-scoped manager reindexes the SAME file,
+        # but ownership is passed explicitly (declared in the global table),
+        # so the row stays global.
+        proj_dir = tmp_path / "proj"
+        proj_dir.mkdir()
+        proj_real = os.path.realpath(str(proj_dir))
+        proj_mgr = SymbolIndexManager(
+            SymbolIndexReader(_FixtureConfig(), project_dir=proj_real),
+            db_path=db_path,
+            project_path=proj_real,
+        )
+        n = proj_mgr.index_library("TestDevice", device_path, project="")
+        assert n == 2
+        assert global_mgr.get_library_by_name("TestDevice").project == ""
+        # And the project (or any other scope) does not own it.
+        assert global_mgr._db.get_library_by_name_exact("TestDevice", proj_real) is None
+
+    def test_reindex_without_explicit_project_uses_manager_scope(self, tmp_path):
+        """Legacy callers (project=None) fall back to the manager scope."""
+        db_path = tmp_path / "shared.db"
+        proj_dir = tmp_path / "proj"
+        proj_dir.mkdir()
+        proj_real = os.path.realpath(str(proj_dir))
+        proj_mgr = SymbolIndexManager(
+            SymbolIndexReader(_FixtureConfig(), project_dir=proj_real),
+            db_path=db_path,
+            project_path=proj_real,
+        )
+        n = proj_mgr.index_library(
+            "TestDevice", os.path.join(FIXTURES_DIR, "test_device.kicad_sym")
+        )
+        assert n == 2
+        assert proj_mgr.get_library_by_name("TestDevice").project == proj_real

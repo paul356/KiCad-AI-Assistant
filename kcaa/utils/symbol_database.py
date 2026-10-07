@@ -498,7 +498,29 @@ class SymbolDatabase:
             clause = self._project_scope_clause(project)
             if clause is not None:
                 q = q.where(clause)
+            else:
+                # Un-scoped legacy lookup: same-nickname rows can exist across
+                # scopes — pick the first deterministically instead of raising.
+                q = q.order_by(_LibraryRow.id).limit(1)
             row = session.execute(q).scalar_one_or_none()
+        return self._orm_to_library(row) if row else None
+
+    def get_library_by_name_exact(self, name: str, project: str) -> LibraryRecord | None:
+        """Look up a library row by nickname **and** exact project ownership.
+
+        Unlike ``get_library_by_name`` (scope-union: global + project), this
+        matches ``project`` exactly: ``""`` finds only the global row, a
+        project id only that project's row.  A same-nickname row owned by a
+        different project is never returned — used for ownership-scoped
+        deletes.
+        """
+        with self._Session() as session:
+            row = session.execute(
+                select(_LibraryRow).where(
+                    _LibraryRow.library_name == name,
+                    _LibraryRow.project == project,
+                )
+            ).scalar_one_or_none()
         return self._orm_to_library(row) if row else None
 
     def get_symbol_file_index(

@@ -562,6 +562,27 @@ class TestProjectScope:
         assert db.get_library_by_name("Shared", project="/pA").file_path == "/pA/Shared.kicad_sym"
         assert db.get_library_by_name("Shared", project="/pB").file_path == "/pB/Shared.kicad_sym"
 
+    def test_get_library_by_name_exact_ownership(self, db):
+        """get_library_by_name_exact matches nickname AND exact ownership —
+        never the scope-union — so ownership-scoped deletes can locate (and
+        only remove) the row of the owning scope."""
+        db.save_library("Shared", "/g/Shared.kicad_sym", 1.0, 100, "", [], project="")
+        db.save_library("Shared", "/pA/Shared.kicad_sym", 1.0, 100, "", [], project="/pA")
+        db.save_library("Shared", "/pB/Shared.kicad_sym", 1.0, 100, "", [], project="/pB")
+
+        assert db.get_library_by_name_exact("Shared", "").file_path == "/g/Shared.kicad_sym"
+        assert db.get_library_by_name_exact("Shared", "/pA").file_path == "/pA/Shared.kicad_sym"
+        assert db.get_library_by_name_exact("Shared", "/pB").file_path == "/pB/Shared.kicad_sym"
+        # A project scope must not see another project's (or the global) row.
+        assert db.get_library_by_name_exact("Shared", "/nope") is None
+        assert db.get_library_by_name_exact("NoSuch", "/pA") is None
+
+        # Deleting the global row leaves the project rows untouched.
+        db.delete_library(db.get_library_by_name_exact("Shared", "").id)
+        assert db.get_library_by_name_exact("Shared", "") is None
+        assert db.get_library_by_name_exact("Shared", "/pA") is not None
+        assert db.get_library_by_name_exact("Shared", "/pB") is not None
+
     def test_search_scope(self, db):
         self._populate(db)
         assert any(r.symbol_name == "A1" for r in db.search("sym", project="/pA"))
