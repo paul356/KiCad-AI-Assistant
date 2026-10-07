@@ -201,7 +201,7 @@ kcaa
 | Tool | Description |
 |------|-------------|
 | `add_symbol_to_schematic` | Place a symbol on the schematic |
-| `create_symbol` | Define and inject a new symbol into the schematic |
+| `create_symbol` | Define a new symbol into a symbol library (definition only — no schematic placement) |
 | `place_symbol_relative` | Place a symbol relative to an existing component |
 | `remove_symbol_from_schematic` | Remove placed symbol by reference |
 | `move_component` | Move and/or rotate a placed component |

@@ -521,11 +521,14 @@ def _do_find_symbols_not_in_libraries(schematic_path: str) -> dict[str, Any]:
         if not uri:
             continue
         if os.path.isdir(uri):
+            # Directory-type (KiCad 10 symdir) libraries: every .kicad_sym
+            # file inside is a symbol of the SAME nickname.  Aggregate all of
+            # them under the bare nickname so lookup by lib_id's library part
+            # (always "Nickname", see lib_id assembly below) hits correctly.
             for fname in sorted(os.listdir(uri)):
                 if fname.endswith(".kicad_sym"):
-                    stem = fname[: -len(".kicad_sym")]
                     for sym in list_library_symbols(os.path.join(uri, fname)):
-                        available.setdefault(f"{nickname}/{stem}", set()).add(sym)
+                        available.setdefault(nickname, set()).add(sym)
         elif os.path.isfile(uri):
             for sym in list_library_symbols(uri):
                 available.setdefault(nickname, set()).add(sym)

@@ -306,11 +306,16 @@ def list_library_symbols(file_path: str) -> list[str]:
         if (
             isinstance(child, list)
             and len(child) >= 2
-            and isinstance(child[0], sexpdata.Symbol)
-            and child[0].value() == "symbol"
-            and isinstance(child[1], str)
+            and isinstance(child[0], (sexpdata.Symbol, str))
+            and str(child[0]) == "symbol"
+            and isinstance(child[1], (sexpdata.Symbol, str))
         ):
-            names.append(child[1])
+            # Symbol subclasses str but Symbol('X') == 'X' is False, so the
+            # node MUST be normalized to a plain str — otherwise a bare-atom
+            # name slips past the delete non-empty guard / remove lookup even
+            # though it was counted.  str() on a quoted str is identity; on a
+            # Symbol it yields the atom text.
+            names.append(str(child[1]))
     return names
 
 

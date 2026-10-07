@@ -20,7 +20,7 @@
 | `get_symbol_pins` | `symbol_tools` | Return pin list (number, name, type, direction) for one symbol |
 | `add_symbol_to_schematic` | `symbol_edit_tools` | Place a library symbol onto a schematic |
 | `create_symbol_library` | `symbol_edit_tools` | Create a new `.kicad_sym` library and register it in sym-lib-table |
-| `create_symbol` | `symbol_edit_tools` | Generate a new symbol definition into an existing library (optionally place one instance) |
+| `create_symbol` | `symbol_edit_tools` | Generate a new symbol definition into an existing library (definition only — no schematic placement) |
 | `add_symbols_to_library` | `symbol_edit_tools` | Export cached symbols from a schematic into a library |
 | `find_symbols_not_in_libraries` | `symbol_edit_tools` | List schematic symbols missing from all available libraries |
 | `remove_symbols_from_library` | `symbol_edit_tools` | Remove named symbol definitions from an existing library |
@@ -280,7 +280,7 @@ Entries already present in the target library are reported in `skipped` (never o
 
 ---
 
-#### `remove_symbols_from_library(library, symbols)`
+#### `remove_symbols_from_library(library, symbols, project_dir=None)`
 
 **Purpose:** Removes named symbol definitions from an existing symbol library (`.kicad_sym`). Only the library file is modified — no schematic is ever touched. Each requested plain symbol name must exist as a top-level definition; missing or unsafe names are reported in `failed` (valid names are still removed — no partial-commit ambiguity). The library is re-indexed so removed symbols disappear from search. Removing the *last* symbol leaves a valid empty library file.
 

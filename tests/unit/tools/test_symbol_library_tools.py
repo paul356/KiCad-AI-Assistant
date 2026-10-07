@@ -280,6 +280,49 @@ class TestFindSymbolsNotInLibraries:
         assert "error" in result
         assert "success" not in result
 
+    def test_directory_type_library_no_false_missing(self, tools, env, tmp_sch):
+        """KiCad 10 symdir layout: nickname -> directory of .kicad_sym files.
+
+        Regression for the P1 where directory-type libraries were keyed as
+        ``nickname/stem`` while lookup used the bare nickname, so every
+        symbol in such a library was reported missing.
+        """
+        from kcaa.utils.symbol_library_utils import list_library_symbols
+        from kcaa.utils.sym_lib_table_utils import register_library_in_table
+
+        # Build a directory-type library "Device" with one .kicad_sym per symbol.
+        device_dir = os.path.join(env["tmp_path"], "DeviceLib")
+        os.makedirs(device_dir, exist_ok=True)
+        names = ["R_Small", "C"]
+        for name in names:
+            path = os.path.join(device_dir, f"{name}.kicad_sym")
+            Path(path).write_text(
+                "(kicad_symbol_lib\n"
+                "  (version 20220914)\n"
+                f"  (symbol \"{name}\"\n"
+                "    (in_bom yes)\n"
+                "    (on_board yes)\n"
+                "  )\n"
+                ")\n"
+            )
+            assert name in list_library_symbols(path)
+
+        reg = register_library_in_table(
+            os.path.join(env["tmp_path"], "sym-lib-table"),
+            "Device",
+            device_dir,
+            "directory-type test lib",
+        )
+        assert reg["registered"] is True, reg
+
+        result = _run(tools["find_symbols_not_in_libraries"], schematic_path=tmp_sch)
+        assert "error" not in result, result
+        names = {(m["library"], m["name"]) for m in result["missing"]}
+        # Device:R_Small / Device:C are present in the directory-type Device
+        # library — they must NOT be reported missing.
+        assert ("Device", "R_Small") not in names
+        assert ("Device", "C") not in names
+
 
 # ---------------------------------------------------------------------------
 # remove_symbols_from_library
@@ -430,3 +473,51 @@ class TestDeleteSymbolLibrary:
     def test_deleted_library_absent_from_index(self, tools, env):
         _run(tools["delete_symbol_library"], library=env["lib"])
         assert env["index_mgr"].get_library_by_name("TestLib") is None
+
+    def test_refuses_library_with_bare_atom_symbol_name(self, tools, env, tmp_sch):
+        """Regression: a symbol whose name node is an unquoted atom
+        (``(symbol FOO ...)`` instead of ``(symbol "FOO" ...)``) must still
+        block deletion — the non-empty guard parses both forms."""
+        # Reuse the seeded library, then rewrite its file with a bare-atom
+        # top-level symbol (as a hand-written/third-party file may contain).
+        _seed_library(env, tools, tmp_sch)
+        bare = (
+            "(kicad_symbol_lib\n"
+            "  (version 20220914)\n"
+            "  (symbol BARE\n"
+            "    (in_bom yes)\n"
+            "    (on_board yes)\n"
+            "  )\n"
+            ")\n"
+        )
+        Path(env["lib_path"]).write_text(bare)
+        from kcaa.utils.symbol_library_utils import list_library_symbols
+
+        assert "BARE" in list_library_symbols(env["lib_path"])
+
+        result = _run(tools["delete_symbol_library"], library=env["lib"])
+        assert "error" in result, result
+        assert "not empty" in result["error"]
+        assert "success" not in result
+        assert os.path.isfile(env["lib_path"])  # file survives
+
+    def test_bare_atom_symbol_counted_by_list_library_symbols(self, tmp_path):
+        """list_library_symbols recognizes both quoted (str) and unquoted
+        (sexpdata.Symbol) top-level symbol name forms."""
+        from kcaa.utils.symbol_library_utils import list_library_symbols
+
+        lib = tmp_path / "bare.kicad_sym"
+        lib.write_text(
+            "(kicad_symbol_lib\n"
+            "  (version 20220914)\n"
+            "  (symbol BARE\n"
+            "    (in_bom yes)\n"
+            "  )\n"
+            "  (symbol \"QUOTED\"\n"
+            "    (in_bom yes)\n"
+            "  )\n"
+            ")\n"
+        )
+        names = list_library_symbols(str(lib))
+        assert "BARE" in names
+        assert "QUOTED" in names
