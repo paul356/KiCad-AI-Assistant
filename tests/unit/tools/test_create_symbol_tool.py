@@ -100,7 +100,9 @@ def env(tmp_path, monkeypatch):
     index_mgr = SymbolIndexManager(
         SymbolIndexReader(ServerConfig()), db_path=str(tmp_path / "symbol_test.db")
     )
-    monkeypatch.setattr("kcaa.tools.symbol_edit_tools._get_index_manager", lambda: index_mgr)
+    monkeypatch.setattr(
+        "kcaa.tools.symbol_edit_tools._get_index_manager", lambda project_path=None: index_mgr
+    )
 
     created = _do_create_symbol_library(LIB)
     assert "error" not in created, created

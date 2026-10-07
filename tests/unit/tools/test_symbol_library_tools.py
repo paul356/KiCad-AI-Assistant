@@ -73,7 +73,9 @@ def env(tmp_path, monkeypatch):
     index_mgr = SymbolIndexManager(
         SymbolIndexReader(ServerConfig()), db_path=str(tmp_path / "symbol_test.db")
     )
-    monkeypatch.setattr("kcaa.tools.symbol_edit_tools._get_index_manager", lambda: index_mgr)
+    monkeypatch.setattr(
+        "kcaa.tools.symbol_edit_tools._get_index_manager", lambda project_path=None: index_mgr
+    )
 
     created = _do_create_symbol_library("TestLib")
     assert "error" not in created, created
@@ -635,3 +637,66 @@ class TestSystemLibraryGuard:
         assert "error" not in result, result
         assert result["deleted"] is True
         assert not os.path.isfile(env["lib_path"])
+
+
+# ---------------------------------------------------------------------------
+# Project-scope index wiring — create_symbol_library(project_dir=...) writes
+# a project-scoped index row that global syncs never drop.
+# ---------------------------------------------------------------------------
+
+
+class TestCreateSymbolLibraryProjectScope:
+    def test_project_create_scopes_index_row_and_survives_global_sync(
+        self, tmp_path, monkeypatch
+    ):
+        """Creating a project library indexes it under the project scope;
+        the row is invisible to the global-scope manager and a subsequent
+        global sync does not remove it."""
+        from kcaa.utils.config import ServerConfig
+        from kcaa.utils.symbol_index_manager import SymbolIndexManager
+        from kcaa.utils.symbol_index_reader import SymbolIndexReader
+
+        proj_dir = tmp_path / "proj"
+        proj_dir.mkdir()
+        proj_real = os.path.realpath(str(proj_dir))
+
+        index_mgr_global = SymbolIndexManager(
+            SymbolIndexReader(ServerConfig()), db_path=":memory:"
+        )
+        index_mgr_proj = SymbolIndexManager(
+            SymbolIndexReader(ServerConfig(), project_dir=proj_real),
+            db_path=":memory:",
+            project_path=proj_real,
+        )
+
+        def _dispatch(project_path=None):
+            if project_path is None:
+                return index_mgr_global
+            assert os.path.realpath(str(project_path)) == proj_real
+            return index_mgr_proj
+
+        monkeypatch.setattr("kcaa.tools.symbol_edit_tools._get_index_manager", _dispatch)
+        # Isolate the exists-check from the real user tables.
+        monkeypatch.setattr(
+            "kcaa.tools.symbol_edit_tools.build_effective_symbol_library_list",
+            lambda *a, **k: [],
+        )
+
+        result = _do_create_symbol_library("ProjLib", project_dir=proj_real)
+        assert "error" not in result, result
+
+        # Library file and project sym-lib-table were created in the project dir.
+        assert os.path.isfile(os.path.join(proj_real, "ProjLib.kicad_sym"))
+        table = Path(proj_real) / "sym-lib-table"
+        assert "${KIPRJMOD}/ProjLib.kicad_sym" in table.read_text(encoding="utf-8")
+
+        # Index row is project-scoped and invisible to the global manager.
+        proj_row = index_mgr_proj.get_library_by_name("ProjLib")
+        assert proj_row is not None
+        assert proj_row.project == proj_real
+        assert index_mgr_global.get_library_by_name("ProjLib") is None
+
+        # A global sync must not drop the project row.
+        stats = index_mgr_global.sync()
+        assert stats.removed == 0
+        assert index_mgr_proj.get_library_by_name("ProjLib") is not None

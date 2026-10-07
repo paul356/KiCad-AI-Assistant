@@ -11,6 +11,7 @@ import math
 import os
 from pathlib import Path
 import re
+import threading
 from typing import Any
 import uuid
 
@@ -19,7 +20,6 @@ import sexpdata
 
 from kcaa.tools.sheet_tools import _normalize_collection, _sheet_dict_from_wrapper
 from kcaa.utils.config import (
-    ServerConfig,
     config,
 )
 from kcaa.utils.schematic_sexp_utils import save_schematic
@@ -36,7 +36,7 @@ from kcaa.utils.symbol_geometry import (
     lib_bbox_to_world,
     union_bboxes,
 )
-from kcaa.utils.symbol_index_manager import SymbolIndexManager
+from kcaa.utils.symbol_index_manager import SymbolIndexManager, _project_dir_of
 from kcaa.utils.symbol_index_reader import SymbolIndexReader
 from kcaa.utils.symbol_library_utils import (
     SymbolNameExistsError,
@@ -116,14 +116,37 @@ def _iter_schematic_labels(sch: Any, attr_name: str) -> list[Any]:
 # ---------------------------------------------------------------------------
 
 _index_manager: SymbolIndexManager | None = None
+_index_lock = threading.Lock()
 
 
-def _get_index_manager() -> SymbolIndexManager:
+def _get_index_manager(project_path: str | None = None) -> SymbolIndexManager:
+    """Return the module-level SymbolIndexManager singleton, scoped to
+    *project_path* (a project directory, or a file inside one).
+
+    Re-scoping calls switch the singleton to the given project before
+    querying; ``None`` switches to the global scope (``""`` — global
+    libraries only).  Thread-safe (double-checked locking).
+
+    The project id and the library reader are swapped together under the
+    lock so a background sync never observes a half-switched scope.
+    """
     global _index_manager
     if _index_manager is None:
-        config = ServerConfig()
-        library_manager = SymbolIndexReader(config)
-        _index_manager = SymbolIndexManager(library_manager)
+        with _index_lock:
+            if _index_manager is None:
+                _index_manager = SymbolIndexManager(
+                    project_path=project_path,
+                )
+                _index_manager._library_manager = SymbolIndexReader(
+                    project_dir=_project_dir_of(project_path)
+                )
+    else:
+        with _index_lock:
+            _index_manager._project_path = project_path
+            _index_manager._project_id = _project_dir_of(project_path) or ""
+            _index_manager._library_manager = SymbolIndexReader(
+                project_dir=_project_dir_of(project_path)
+            )
     return _index_manager
 
 
@@ -153,10 +176,16 @@ def _is_user_library_location(path: str, project_dir: str | None) -> bool:
     )
 
 
-def _index_symbol_library(library: str, file_path: str) -> int:
-    """Index exactly one symbol library file; returns symbol count or -1."""
+def _index_symbol_library(
+    library: str, file_path: str, project_dir: str | None = None
+) -> int:
+    """Index exactly one symbol library file; returns symbol count or -1.
+
+    The index row is scoped to *project_dir* (global when None) so
+    project-local library rows are never written into the global scope.
+    """
     try:
-        return _get_index_manager().index_library(library, file_path)
+        return _get_index_manager(project_dir).index_library(library, file_path)
     except Exception as exc:
         log.error("Symbol index update failed for %s: %s", library, exc, exc_info=True)
         return -1
@@ -217,7 +246,7 @@ def _do_create_symbol_library(
             uri,
             description=f"Created by KiCad MCP symbol export ({nickname})",
         )
-        indexed = _index_symbol_library(nickname, library_file)
+        indexed = _index_symbol_library(nickname, library_file, project_dir=project_dir)
         return {
             "library": nickname,
             "path": library_file,
@@ -341,8 +370,12 @@ def _do_add_symbol_to_library(
             skipped.append({"symbol": requested, "reason": "already_in_library"})
             continue
 
-    # Refresh the index so search_symbols/list_symbol_libraries see the new file.
-    indexed = _index_symbol_library(library, lib_file)
+    # Refresh the index so search_symbols/list_symbol_libraries see the new
+    # file — scoped to the schematic's project when there is one.
+    proj_dir = _find_project_dir(schematic_path)
+    indexed = _index_symbol_library(
+        library, lib_file, project_dir=str(proj_dir) if proj_dir else None
+    )
     return {
         "library": library,
         "library_path": lib_file,
@@ -419,7 +452,7 @@ def _do_remove_symbol_from_library(
         available.discard(name)
 
     # Refresh the index so removed symbols disappear from search.
-    indexed = _index_symbol_library(library, lib_file)
+    indexed = _index_symbol_library(library, lib_file, project_dir=project_dir)
     return {
         "library": library,
         "library_path": lib_file,
@@ -501,7 +534,7 @@ def _do_delete_symbol_library(
 
     index_removed = False
     try:
-        index_removed = _get_index_manager().remove_library(library)
+        index_removed = _get_index_manager(project_dir).remove_library(library)
     except Exception as exc:
         log.error("delete_symbol_library: index cleanup failed for %s: %s", library, exc)
 

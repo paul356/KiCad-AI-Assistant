@@ -14,10 +14,9 @@ from typing import Any
 from fastmcp import Context, FastMCP
 import sexpdata
 
-from kcaa.utils.config import ServerConfig
 from kcaa.utils.symbol_extractor import extract_lib_symbol_raw
 from kcaa.utils.symbol_geometry import compute_unit_bboxes
-from kcaa.utils.symbol_index_manager import SymbolIndexManager
+from kcaa.utils.symbol_index_manager import SymbolIndexManager, _project_dir_of
 from kcaa.utils.symbol_index_reader import SymbolIndexReader
 
 log = logging.getLogger(__name__)
@@ -47,14 +46,37 @@ def _lib_angle_to_direction(angle_deg: int) -> str:
 
 # Module-level singleton so the DB connection is reused across tool calls.
 _index_manager: SymbolIndexManager | None = None
+_index_lock = threading.Lock()
 
 
-def _get_index_manager() -> SymbolIndexManager:
+def _get_index_manager(project_path: str | None = None) -> SymbolIndexManager:
+    """Return the module-level SymbolIndexManager singleton, scoped to
+    *project_path* (a project directory, or a file inside one).
+
+    Re-scoping calls switch the singleton to the given project before
+    querying; ``None`` switches to the global scope (``""`` — global
+    libraries only).  Thread-safe (double-checked locking).
+
+    The project id and the library reader are swapped together under the
+    lock so a background sync never observes a half-switched scope.
+    """
     global _index_manager
     if _index_manager is None:
-        config = ServerConfig()
-        library_reader = SymbolIndexReader(config)
-        _index_manager = SymbolIndexManager(library_reader)
+        with _index_lock:
+            if _index_manager is None:
+                _index_manager = SymbolIndexManager(
+                    project_path=project_path,
+                )
+                _index_manager._library_manager = SymbolIndexReader(
+                    project_dir=_project_dir_of(project_path)
+                )
+    else:
+        with _index_lock:
+            _index_manager._project_path = project_path
+            _index_manager._project_id = _project_dir_of(project_path) or ""
+            _index_manager._library_manager = SymbolIndexReader(
+                project_dir=_project_dir_of(project_path)
+            )
     return _index_manager
 
 
