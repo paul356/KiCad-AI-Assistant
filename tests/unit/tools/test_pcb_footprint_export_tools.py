@@ -1299,3 +1299,29 @@ class TestDeleteFootprintLibrary:
         assert "system library" in result["error"]
         assert "success" not in result
         assert os.path.isdir(sys_dir)  # directory survives
+
+    def test_refuses_library_outside_user_locations(self, tools, project, tmp_path):
+        """delete_footprint_library must refuse a library whose directory
+        does not live in a user library location (3rd-party footprints dir
+        or project dir) — even a valid, non-system user library."""
+        lib_dir = os.path.join(tmp_path.parent, "Manual.pretty")
+        os.makedirs(lib_dir)
+        _make_fp_lib_table(tmp_path, [("Manual", lib_dir)])
+
+        result = _run(
+            tools["delete_footprint_library"](
+                library="Manual", project_dir=str(tmp_path), ctx=None
+            )
+        )
+        assert "error" in result, result
+        assert "user library location" in result["error"]
+        assert "success" not in result
+        assert os.path.isdir(lib_dir)  # directory survives
+
+    def test_delete_accepts_mcp_created_library(self, tools, project):
+        """delete_footprint_library succeeds on a library created by
+        create_footprint_library (lives in the 3rd-party footprints dir)."""
+        _run(tools["create_footprint_library"](name="MyVendor", ctx=None))
+        result = _run(tools["delete_footprint_library"](library="MyVendor", ctx=None))
+        assert "error" not in result, result
+        assert result["deleted"] is True

@@ -597,3 +597,41 @@ class TestSystemLibraryGuard:
         from kcaa.utils.config import config
 
         assert not config.is_system_library_path(env["lib_path"])
+
+    def test_delete_refuses_library_outside_user_locations(self, tools, env, tmp_path):
+        """delete_symbol_library must refuse a library whose file does not
+        live in a user library location (3rd-party symbols dir or project
+        dir) — even a valid, non-system user file."""
+        from kcaa.utils.sym_lib_table_utils import register_library_in_table
+
+        # Hand-made user library file outside MCP write locations.
+        manual_dir = tmp_path / "manual_libs"
+        manual_dir.mkdir()
+        manual_file = manual_dir / "ManualLib.kicad_sym"
+        manual_file.write_text(
+            "(kicad_symbol_lib\n"
+            "  (version 20220914)\n"
+            "  (symbol M\n"
+            "    (in_bom yes)\n"
+            "  )\n"
+            ")\n"
+        )
+        register_library_in_table(
+            env["table_path"],
+            "ManualLib",
+            f"{manual_file}",
+            description="Hand-managed, not MCP created",
+        )
+
+        result = _run(tools["delete_symbol_library"], library="ManualLib")
+        assert "error" in result, result
+        assert "user library location" in result["error"]
+        assert os.path.isfile(manual_file)  # must survive
+
+    def test_delete_accepts_mcp_created_library(self, tools, env):
+        """delete_symbol_library succeeds on a library created by
+        create_symbol_library (lives in the 3rd-party symbols dir)."""
+        result = _run(tools["delete_symbol_library"], library=env["lib"])
+        assert "error" not in result, result
+        assert result["deleted"] is True
+        assert not os.path.isfile(env["lib_path"])

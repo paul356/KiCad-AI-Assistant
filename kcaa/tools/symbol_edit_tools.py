@@ -18,7 +18,10 @@ from fastmcp import Context, FastMCP
 import sexpdata
 
 from kcaa.tools.sheet_tools import _normalize_collection, _sheet_dict_from_wrapper
-from kcaa.utils.config import ServerConfig, config
+from kcaa.utils.config import (
+    ServerConfig,
+    config,
+)
 from kcaa.utils.schematic_sexp_utils import save_schematic
 from kcaa.utils.skip_compat import safe_schematic
 from kcaa.utils.sym_lib_table_utils import (
@@ -132,6 +135,22 @@ def _get_index_manager() -> SymbolIndexManager:
 def _3rd_party_symbols_dir() -> str:
     """Return ``${KICAD{ver}_3RD_PARTY}/symbols`` (resolved, absolute)."""
     return os.path.join(config.kicad_3rd_party, "symbols")
+
+
+def _is_user_library_location(path: str, project_dir: str | None) -> bool:
+    """True when *path* is a location the library create tool actually
+    writes to: the global 3rd-party symbols dir, or the project dir.
+
+    Keeps delete symmetric with create — delete only what create could
+    have produced — without relying on any descriptive metadata.
+    """
+    candidates = [os.path.realpath(_3rd_party_symbols_dir())]
+    if project_dir:
+        candidates.append(os.path.realpath(project_dir))
+    real = os.path.realpath(path)
+    return any(
+        real == cand or real.startswith(cand + os.sep) for cand in candidates
+    )
 
 
 def _index_symbol_library(library: str, file_path: str) -> int:
@@ -444,6 +463,15 @@ def _do_delete_symbol_library(
                 f"Refusing to delete system library '{library}' "
                 f"(resolves to {lib_file}, inside the KiCad installation): "
                 "delete_symbol_library operates on user libraries only."
+            )
+        }
+    if not _is_user_library_location(lib_file, project_dir):
+        return {
+            "error": (
+                f"Refusing to delete library '{library}': it does not live in "
+                "a user library location (delete_symbol_library only deletes "
+                "libraries it created — in the 3rd-party symbols dir or the "
+                "project dir)."
             )
         }
 

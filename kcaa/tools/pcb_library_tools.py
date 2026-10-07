@@ -842,6 +842,15 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
                         "delete_footprint_library operates on user libraries only."
                     )
                 }
+            if not _is_user_library_location(library_dir, project_dir):
+                return {
+                    "error": (
+                        f"Refusing to delete library '{library}': it does not live "
+                        "in a user library location (delete_footprint_library only "
+                        "deletes libraries it created — in the 3rd-party footprints "
+                        "dir or the project dir)."
+                    )
+                }
             mod_files = [f for f in os.listdir(library_dir) if f.endswith(".kicad_mod")]
             if mod_files:
                 return {
@@ -964,6 +973,22 @@ async def _live_search_footprints(
 def _3rd_party_footprints_dir() -> str:
     """Return ``${KICAD10_3RD_PARTY}/footprints`` (resolved, absolute)."""
     return os.path.join(config.kicad_3rd_party, "footprints")
+
+
+def _is_user_library_location(path: str, project_dir: str | None) -> bool:
+    """True when *path* is a location the library create tool actually
+    writes to: the global 3rd-party footprints dir, or the project dir.
+
+    Keeps delete symmetric with create — delete only what create could
+    have produced — without relying on any descriptive metadata.
+    """
+    candidates = [os.path.realpath(_3rd_party_footprints_dir())]
+    if project_dir:
+        candidates.append(os.path.realpath(project_dir))
+    real = os.path.realpath(path)
+    return any(
+        real == cand or real.startswith(cand + os.sep) for cand in candidates
+    )
 
 
 def _resolve_library_dir(library: str, pcb_path: str | None) -> tuple[str, str]:
