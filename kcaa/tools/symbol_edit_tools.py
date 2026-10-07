@@ -360,6 +360,14 @@ def _do_add_symbol_to_library(
     except ValueError as exc:
         return {"error": str(exc)}
     lib_file = lib["path"]
+    if config.is_system_library_path(lib_file):
+        return {
+            "error": (
+                f"Refusing to write to system library '{library}' "
+                f"(resolves to {lib_file}, inside the KiCad installation): "
+                "symbol library tools operate on user libraries only."
+            )
+        }
 
     try:
         sch = safe_schematic(schematic_path)
@@ -548,6 +556,21 @@ def _do_delete_symbol_library(
     unregistered = False
     backup_path: str | None = None
 
+    def _cleanup_index() -> bool:
+        """Best-effort index removal; never raises."""
+        try:
+            # Ownership-scoped: remove exactly the row owned by the library's
+            # declaring table (project row for a project library, global row
+            # otherwise).  A same-nickname row of another project is never
+            # touched.
+            target_project = _target_project_of(table_path, project_dir)
+            return _get_index_manager(project_dir).remove_library(
+                library, project=target_project
+            )
+        except Exception as exc:
+            log.error("delete_symbol_library: index cleanup failed for %s: %s", library, exc)
+            return False
+
     # Remove the file before touching sym-lib-table: if removal fails, the
     # table entry is still intact (no partially-deleted state).
     try:
@@ -558,32 +581,45 @@ def _do_delete_symbol_library(
         log.error("delete_symbol_library: cannot remove %s: %s", lib_file, exc, exc_info=True)
         return {
             "error": f"Failed to remove library file: {lib_file} ({exc})",
+            "file_removed": False,
             "table_unregistered": unregistered,
             "table_backup": backup_path,
         }
 
     if table_path and os.path.isfile(table_path):
-        result = unregister_library_in_table(table_path, library)
-        unregistered = bool(result.get("unregistered"))
-        backup_path = result.get("backup_path")
+        try:
+            result = unregister_library_in_table(table_path, library)
+            unregistered = bool(result.get("unregistered"))
+            backup_path = result.get("backup_path")
+        except Exception as exc:
+            # The file is already gone: never report success.  Still attempt
+            # index cleanup, then say exactly what was removed vs left.
+            log.error(
+                "delete_symbol_library: unregister failed for %s: %s", library, exc,
+                exc_info=True,
+            )
+            return {
+                "error": (
+                    f"Library file removed but its sym-lib-table entry could not "
+                    f"be unregistered ({exc}); the table entry (+ backup) remains."
+                ),
+                "library": library,
+                "path": lib_file,
+                "table_path": table_path,
+                "file_removed": True,
+                "table_unregistered": False,
+                "table_backup": backup_path,
+                "index_removed": _cleanup_index(),
+                "deleted": False,
+            }
 
-    index_removed = False
-    try:
-        # Ownership-scoped: remove exactly the row owned by the library's
-        # declaring table (project row for a project library, global row
-        # otherwise).  A same-nickname row of another project is never
-        # touched.
-        target_project = _target_project_of(table_path, project_dir)
-        index_removed = _get_index_manager(project_dir).remove_library(
-            library, project=target_project
-        )
-    except Exception as exc:
-        log.error("delete_symbol_library: index cleanup failed for %s: %s", library, exc)
+    index_removed = _cleanup_index()
 
     return {
         "library": library,
         "path": lib_file,
         "table_path": table_path,
+        "file_removed": True,
         "unregistered": unregistered,
         "table_backup": backup_path,
         "index_removed": index_removed,
@@ -1970,16 +2006,19 @@ def _do_create_symbol(
     value: str | None = None,
     body_width: float | None = None,
     body_height: float | None = None,
+    project_dir: str | None = None,
 ) -> dict[str, Any]:
     """Core implementation of ``create_symbol``.
 
     Validates inputs, builds a fresh lib symbol definition, and writes it
     into an existing user symbol library (``<library>.kicad_sym``, resolved
-    via sym-lib-table).  Creating a definition only — placing instances is
-    done separately with ``add_symbol_to_schematic``.  All failures return
-    ``{"error": ...}`` without a success key (matching the create_symbol
-    contract).  The library must already exist — create it first with
-    ``create_symbol_library``.
+    via sym-lib-table — through the *project_dir* scope when given, so a
+    project-local library can be targeted).  Creating a definition only —
+    placing instances is done separately with ``add_symbol_to_schematic``.
+    All failures return ``{"error": ...}`` without a success key (matching
+    the create_symbol contract).  The library must already exist — create
+    it first with ``create_symbol_library``.  System libraries (inside the
+    KiCad installation) are refused.
     """
     if not isinstance(library, str) or not library:
         return {"error": "library is required: create it first with create_symbol_library"}
@@ -2045,12 +2084,21 @@ def _do_create_symbol(
         return {"error": "value must be a string or None"}
 
     # Resolve the target library through sym-lib-table; it must already
-    # exist (create_symbol_library is the prerequisite).
+    # exist (create_symbol_library is the prerequisite).  With project_dir
+    # the lookup is scoped to global + that project's libraries.
     try:
-        lib = resolve_symbol_library(library)
+        lib = resolve_symbol_library(library, project_path=project_dir)
     except ValueError as exc:
         return {"error": str(exc)}
     lib_file = lib["path"]
+    if config.is_system_library_path(lib_file):
+        return {
+            "error": (
+                f"Refusing to write to system library '{library}' "
+                f"(resolves to {lib_file}, inside the KiCad installation): "
+                "symbol library tools operate on user libraries only."
+            )
+        }
     if not is_safe_symbol_name(symbol_name):
         return {"error": f"Unsafe symbol name {symbol_name!r} (refusing to write)"}
 
@@ -2098,8 +2146,12 @@ def _do_create_symbol(
         "warnings": warnings,
     }
 
-    # Refresh the index so search_symbols sees the new symbol.
-    _index_symbol_library(library, lib_file)
+    # Refresh the index so search_symbols sees the new symbol — reindexed
+    # under the library's OWN ownership (a global library stays global).
+    target_project = _target_project_of(lib["table_path"], project_dir)
+    _index_symbol_library(
+        library, lib_file, project_dir=project_dir, project=target_project
+    )
 
     return result
 
@@ -2187,6 +2239,7 @@ def register_symbol_edit_tools(mcp: FastMCP) -> None:
         value: str | None = None,
         body_width: float | None = None,
         body_height: float | None = None,
+        project_dir: str | None = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Create a brand-new symbol definition in a user symbol library.
@@ -2199,7 +2252,9 @@ def register_symbol_edit_tools(mcp: FastMCP) -> None:
 
         The definition is written into the ``.kicad_sym`` library named by
         ``library``, which must already exist — call ``create_symbol_library``
-        first.  The library is resolved through sym-lib-table.
+        first.  The library is resolved through sym-lib-table, scoped to the
+        project when *project_dir* is given (so a project-local library can
+        be targeted); system libraries are refused.
 
         This tool is definition-only: it never touches a schematic.  To place
         an instance of the new symbol, call ``add_symbol_to_schematic`` (or
@@ -2232,6 +2287,9 @@ def register_symbol_edit_tools(mcp: FastMCP) -> None:
                 small for the pins.
             body_height: Body height in mm (default derived from the pin
                 span). Enlarged if too small for the pins.
+            project_dir: Optional path to the project directory when the
+                target library is project-local (``${KIPRJMOD}`` URI).
+                Omit for global libraries.
 
         Returns:
             dict with keys: success (bool), lib_id, library, library_path,
@@ -2246,6 +2304,7 @@ def register_symbol_edit_tools(mcp: FastMCP) -> None:
             value=value,
             body_width=body_width,
             body_height=body_height,
+            project_dir=project_dir,
         )
 
     @mcp.tool()

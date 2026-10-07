@@ -1325,3 +1325,27 @@ class TestDeleteFootprintLibrary:
         result = _run(tools["delete_footprint_library"](library="MyVendor", ctx=None))
         assert "error" not in result, result
         assert result["deleted"] is True
+
+    def test_unregister_failure_reports_partial_state(self, tools, project, monkeypatch):
+        """P3-1: unregister_library_in_table raising after the directory was
+        removed must yield an error stating what was removed vs left, with
+        index cleanup still attempted."""
+        import kcaa.tools.pcb_library_tools as mod
+
+        _run(tools["create_footprint_library"](name="MyVendor", ctx=None))
+        lib_dir = os.path.join(project["third_party"], "footprints", "MyVendor.pretty")
+
+        def _boom(table_path, library, **kwargs):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(mod, "unregister_library_in_table", _boom)
+
+        result = _run(tools["delete_footprint_library"](library="MyVendor", ctx=None))
+        assert "error" in result, result
+        assert "fp-lib-table entry could not be unregistered" in result["error"]
+        assert result["file_removed"] is True
+        assert result["table_unregistered"] is False
+        assert result["deleted"] is False
+        assert not os.path.exists(lib_dir)  # directory was removed first
+        assert result["index_removed"] is True  # index cleanup still attempted
+        assert project["index_mgr"].library_name_exists("MyVendor") is False

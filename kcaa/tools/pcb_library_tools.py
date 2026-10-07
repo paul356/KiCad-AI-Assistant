@@ -865,6 +865,18 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
             unregistered = False
             backup_path: str | None = None
 
+            def _cleanup_index() -> bool:
+                """Best-effort index removal; never raises."""
+                try:
+                    return get_footprint_index_manager().remove_library(library)
+                except Exception as exc:
+                    log.error(
+                        "delete_footprint_library: index cleanup failed for %s: %s",
+                        library,
+                        exc,
+                    )
+                    return False
+
             # Remove the directory before touching fp-lib-table: if removal
             # fails, the table entry is still intact (no partially-deleted
             # state).
@@ -879,28 +891,48 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
                 )
                 return {
                     "error": f"Failed to remove library directory: {library_dir} ({exc})",
+                    "file_removed": False,
                     "table_unregistered": unregistered,
                     "table_backup": backup_path,
                 }
 
             if target_table and os.path.isfile(target_table):
-                table_result = unregister_library_in_table(target_table, library)
-                unregistered = bool(table_result.get("unregistered"))
-                backup_path = table_result.get("backup_path")
+                try:
+                    table_result = unregister_library_in_table(target_table, library)
+                    unregistered = bool(table_result.get("unregistered"))
+                    backup_path = table_result.get("backup_path")
+                except Exception as exc:
+                    # The directory is already gone: never report success.
+                    # Still attempt index cleanup, then say exactly what was
+                    # removed vs left.
+                    log.error(
+                        "delete_footprint_library: unregister failed for %s: %s",
+                        library,
+                        exc,
+                        exc_info=True,
+                    )
+                    return {
+                        "error": (
+                            f"Library directory removed but its fp-lib-table entry "
+                            f"could not be unregistered ({exc}); the table entry "
+                            "(+ backup) remains."
+                        ),
+                        "library": library,
+                        "path": library_dir,
+                        "table_path": target_table,
+                        "file_removed": True,
+                        "table_unregistered": False,
+                        "table_backup": backup_path,
+                        "index_removed": _cleanup_index(),
+                        "deleted": False,
+                    }
 
-            index_removed = False
-            try:
-                index_removed = get_footprint_index_manager().remove_library(library)
-            except Exception as exc:
-                log.error(
-                    "delete_footprint_library: index cleanup failed for %s: %s",
-                    library,
-                    exc,
-                )
+            index_removed = _cleanup_index()
             return {
                 "library": library,
                 "path": library_dir,
                 "table_path": target_table,
+                "file_removed": True,
                 "unregistered": unregistered,
                 "table_backup": backup_path,
                 "index_removed": index_removed,

@@ -639,6 +639,44 @@ class TestSystemLibraryGuard:
         assert result["deleted"] is True
         assert not os.path.isfile(env["lib_path"])
 
+    def test_create_refuses_system_library(self, tools, env, monkeypatch, tmp_path):
+        """create_symbol must refuse to write into a system library."""
+        from kcaa.utils.config import config
+        from kcaa.utils.symbol_library_utils import list_library_symbols
+
+        sys_dir = tmp_path / "system" / "symbols"
+        sys_file = self._register_system_lib(env, sys_dir)
+        monkeypatch.setattr(config, "_kicad_symbol_dir", str(sys_dir))
+
+        result = _run(
+            tools["create_symbol"],
+            library="SysLib",
+            symbol_name="NEW1",
+            pins=[{"number": "1", "name": "A", "type": "input", "direction": "left"}],
+        )
+        assert "error" in result, result
+        assert "system library" in result["error"]
+        assert "SYS1" in list_library_symbols(sys_file)  # file unchanged
+
+    def test_add_symbols_refuses_system_library(self, tools, env, tmp_sch, monkeypatch, tmp_path):
+        """add_symbols_to_library must refuse to write into a system library."""
+        from kcaa.utils.config import config
+        from kcaa.utils.symbol_library_utils import list_library_symbols
+
+        sys_dir = tmp_path / "system" / "symbols"
+        sys_file = self._register_system_lib(env, sys_dir)
+        monkeypatch.setattr(config, "_kicad_symbol_dir", str(sys_dir))
+
+        result = _run(
+            tools["add_symbols_to_library"],
+            schematic_path=tmp_sch,
+            symbols=["Device:R_Small"],
+            library="SysLib",
+        )
+        assert "error" in result, result
+        assert "system library" in result["error"]
+        assert "SYS1" in list_library_symbols(sys_file)  # file unchanged
+
 
 # ---------------------------------------------------------------------------
 # Ownership-scoped reindex + delete (Fix 1 / Fix 3)
@@ -760,6 +798,20 @@ class TestCreateSymbolLibraryProjectScope:
         """Creating a project library indexes it under the project scope;
         the row is invisible to the global-scope manager and a subsequent
         global sync does not remove it."""
+        # Point the KiCad config dir at tmp BEFORE constructing ServerConfig:
+        # the global-scope sync reads the config sym-lib-table, and on clean
+        # machines/CI the real ~/.config/kicad/<version> does not exist.
+        # A valid empty table makes the reader treat the global scope as
+        # "no global libraries" instead of raising FileNotFoundError.
+        kicad_config = tmp_path / "kicad-config"
+        kicad_config.mkdir()
+        (kicad_config / "sym-lib-table").write_text(
+            "(sym_lib_table\n  (version 1)\n)\n", encoding="utf-8"
+        )
+        monkeypatch.setenv("KICAD_CONFIG_DIR", str(kicad_config))
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+        monkeypatch.delenv("KICAD_SYMBOL_DIR", raising=False)
+
         from kcaa.utils.config import ServerConfig
         from kcaa.utils.symbol_index_manager import SymbolIndexManager
         from kcaa.utils.symbol_index_reader import SymbolIndexReader
@@ -808,3 +860,114 @@ class TestCreateSymbolLibraryProjectScope:
         stats = index_mgr_global.sync()
         assert stats.removed == 0
         assert index_mgr_proj.get_library_by_name("ProjLib") is not None
+
+
+# ---------------------------------------------------------------------------
+# P3-1: delete_symbol_library must not silently succeed (or hide the table
+# entry) when unregister fails after the file was already removed — it
+# reports file_removed/table_unregistered and still cleans the index.
+# ---------------------------------------------------------------------------
+
+
+class TestDeleteDanglingState:
+    def test_unregister_failure_reports_partial_state(self, tools, env, monkeypatch):
+        """unregister_library_in_table raising after file removal must yield
+        an error stating exactly what was removed vs left, with index
+        cleanup still attempted."""
+        import kcaa.tools.symbol_edit_tools as mod
+
+        def _boom(table_path, library, **kwargs):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(mod, "unregister_library_in_table", _boom)
+
+        result = _run(tools["delete_symbol_library"], library=env["lib"])
+        assert "error" in result, result
+        assert "sym-lib-table entry could not be unregistered" in result["error"]
+        assert result["file_removed"] is True
+        assert result["table_unregistered"] is False
+        assert result["deleted"] is False
+        # The file was removed before the unregister attempt…
+        assert not os.path.isfile(env["lib_path"])
+        # …and the index row was still cleaned up (table entry remains).
+        assert result["index_removed"] is True
+        assert env["index_mgr"].get_library_by_name("TestLib") is None
+        assert env["table_path"] and os.path.isfile(env["table_path"])
+
+    def test_unregister_returns_false_is_just_reported(self, tools, env, monkeypatch):
+        """unregister_library_in_table returning unregistered=false after
+        file removal is a reported, non-success state too."""
+        import kcaa.tools.symbol_edit_tools as mod
+
+        def _noop(table_path, library, **kwargs):
+            return {"unregistered": False}
+
+        monkeypatch.setattr(mod, "unregister_library_in_table", _noop)
+
+        result = _run(tools["delete_symbol_library"], library=env["lib"])
+        assert "error" not in result, result
+        assert result["deleted"] is True  # file gone + index cleaned
+        assert result["file_removed"] is True
+        assert result["unregistered"] is False  # table entry left, reported
+
+
+# ---------------------------------------------------------------------------
+# P3-2: create_symbol with project_dir targets a project-local library.
+# ---------------------------------------------------------------------------
+
+
+class TestCreateSymbolProjectContext:
+    def test_create_symbol_into_project_library(
+        self, tools, env, tmp_path, monkeypatch
+    ):
+        """create_symbol(project_dir=...) appends into a project-local
+        library and reindexes it under the project scope."""
+        helper = TestOwnershipScopedIndexWrites()
+        proj, proj_real, index_mgr_global, index_mgr_proj = helper._project_env(
+            tmp_path, monkeypatch, env
+        )
+
+        created = _do_create_symbol_library("ProjSym", project_dir=str(proj))
+        assert "error" not in created, created
+
+        result = _run(
+            tools["create_symbol"],
+            library="ProjSym",
+            symbol_name="MYOP",
+            pins=[{"number": "1", "name": "A", "type": "input", "direction": "left"}],
+            project_dir=str(proj),
+        )
+        assert "error" not in result, result
+        assert result.get("success") is True
+        assert result["library"] == "ProjSym"
+
+        from kcaa.utils.symbol_library_utils import list_library_symbols
+
+        assert "MYOP" in list_library_symbols(created["path"])
+
+        # Reindexed under the PROJECT scope — visible there, not globally.
+        proj_syms = {s.symbol_name for s in index_mgr_proj.get_library_symbols("ProjSym")}
+        assert "MYOP" in proj_syms
+        global_row = index_mgr_global.get_library_by_name("ProjSym")
+        assert global_row is None
+
+    def test_create_symbol_without_project_dir_keeps_global_default(
+        self, tools, env, tmp_path, monkeypatch
+    ):
+        """Backward compat: project_dir omitted still resolves global-only
+        (a project-local lib is not visible, so create refuses)."""
+        helper = TestOwnershipScopedIndexWrites()
+        proj, proj_real, _, index_mgr_proj = helper._project_env(
+            tmp_path, monkeypatch, env
+        )
+        created = _do_create_symbol_library("ProjSym", project_dir=str(proj))
+        assert "error" not in created, created
+
+        result = _run(
+            tools["create_symbol"],
+            library="ProjSym",
+            symbol_name="MYOP",
+            pins=[{"number": "1", "name": "A", "type": "input", "direction": "left"}],
+        )
+        assert "error" in result, result  # global scope cannot resolve it
+        assert index_mgr_proj.get_library_symbols("ProjSym") == []

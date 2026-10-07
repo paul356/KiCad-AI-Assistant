@@ -247,7 +247,7 @@ The library is created empty and indexed immediately, so `search_symbols` / `lis
 
 ---
 
-#### `create_symbol(library, symbol_name, pins, reference_prefix="U", value=None, body_width=None, body_height=None)`
+#### `create_symbol(library, symbol_name, pins, reference_prefix="U", value=None, body_width=None, body_height=None, project_dir=None)`
 
 **Purpose:** Defines a brand-new symbol (rectangular body + one pin per entry) into an existing **user symbol library** (`.kicad_sym`) — **definition-only**. The schematic is never touched. To place an instance of the new symbol afterwards, call `add_symbol_to_schematic` (or `place_symbol_relative`) with `library_name` + `symbol_name`. Unlike `add_symbol_to_schematic`, no external library lookup is needed — the definition is generated from the `pins` argument. `library` must already exist — call `create_symbol_library` first.
 
@@ -258,8 +258,9 @@ The library is created empty and indexed immediately, so `search_symbols` / `lis
 - `reference_prefix` (`str`) — prefix for the symbol's default `Reference` property (e.g. `U`); must match `^[A-Za-z][A-Za-z0-9_]*$` (must start with a letter). Defaults to `"U"`.
 - `value` (`str | None`) — overrides the `Value` property; defaults to `symbol_name`.
 - `body_width` / `body_height` (`float | None`) — body size in mm; omitted → default width 6.35 mm / height derived from the pin span. Enlarged (with a warning) if too small to contain the pins.
+- `project_dir` (`str | None`) — optional project directory when the target library is project-local (`${KIPRJMOD}` URI); the library is resolved in the global plus that project's scope. Omit for global libraries.
 
-The `lib_id` is `<library>:<symbol_name>`. Calling with a `symbol_name` that already exists in the library fails — there is no silent overwrite.
+The `lib_id` is `<library>:<symbol_name>`. Calling with a `symbol_name` that already exists in the library fails — there is no silent overwrite. Libraries inside the KiCad installation (system libraries) are refused with `{"error": ...}` — user libraries only.
 
 **Success response:** `{"success": true, "lib_id": "MyLib:MYOP", "library": "MyLib", "library_path": "/abs/MyLib.kicad_sym", "units_added": 1, "pin_count": N, "warnings": [...]}`
 
@@ -276,7 +277,7 @@ The `lib_id` is `<library>:<symbol_name>`. Calling with a `symbol_name` that alr
 - `symbols` (`list[str]`) — fully-qualified lib_ids (`"自定义:MYOP"`, `"Device:R"`). Matching is exact on the full lib_id; plain names are rejected (`failed` with reason `must_be_lib_id`).
 - `library` (`str`) — target library nickname (must already exist).
 
-Entries already present in the target library are reported in `skipped` (never overwritten); entries not present in the schematic are reported in `failed`. The library is re-indexed afterwards, keeping the row's **owning scope** — when the target library is declared in the project's sym-lib-table the index row stays project-owned, otherwise it stays global (never re-attributed to the project).
+Entries already present in the target library are reported in `skipped` (never overwritten); entries not present in the schematic are reported in `failed`. The library is re-indexed afterwards, keeping the row's **owning scope** — when the target library is declared in the project's sym-lib-table the index row stays project-owned, otherwise it stays global (never re-attributed to the project). Like `create_symbol`, a target library that resolves inside the KiCad installation is refused with `{"error": ...}` — user libraries only.
 
 **Success response:** `{"library": "MyLib", "library_path": "...", "exported": ["MyLib:MYOP"], "exported_count": 1, "failed": [], "failed_count": 0, "skipped": [], "skipped_count": 0, "indexed": 1}`
 
@@ -320,6 +321,8 @@ Entries already present in the target library are reported in `skipped` (never o
 
 **Non-empty refusal:** `{"error": "Library 'MyLib' is not empty (2 symbol(s): A, B); refusing to delete. Use remove_symbols_from_library first."}`
 
+**Partial-state failure:** if the file is removed but the sym-lib-table entry cannot be unregistered, the tool returns `{"error": ..., "file_removed": true, "table_unregistered": false, "index_removed": ..., "deleted": false}` — the index cleanup is still attempted and the error states exactly what was removed vs left; the tool never reports success in this state.
+
 ---
 
 #### `remove_footprints_from_library(library, footprints, project_dir=None)`
@@ -345,6 +348,8 @@ Entries already present in the target library are reported in `skipped` (never o
 **Success response:** `{"library": "MyLib", "path": "...", "table_path": "...", "unregistered": true, "table_backup": "...", "index_removed": true, "deleted": true}`
 
 **Non-empty refusal:** `{"error": "Library 'MyLib' is not empty (2 footprint(s): A.kicad_mod, B.kicad_mod); refusing to delete. Use remove_footprints_from_library first."}`
+
+**Partial-state failure:** if the directory is removed but the fp-lib-table entry cannot be unregistered, the tool returns `{"error": ..., "file_removed": true, "table_unregistered": false, "index_removed": ..., "deleted": false}` — the index cleanup is still attempted and the error states exactly what was removed vs left; the tool never reports success in this state.
 
 ---
 

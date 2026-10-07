@@ -197,6 +197,9 @@ class FootprintDatabase:
                 _logging.getLogger(__name__).warning(
                     "PRAGMA foreign_keys=ON not applied; got %r", fk_result
                 )
+            # Let narrow reindex writes wait out a concurrent background
+            # sync instead of failing immediately with SQLITE_BUSY.
+            conn.execute("PRAGMA busy_timeout = 5000")
 
         self._Session = sessionmaker(bind=self._engine)
         self._apply_schema()
