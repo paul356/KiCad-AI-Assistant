@@ -658,3 +658,127 @@ class TestProjectShadowSync:
             "VCC",
             "GND",
         }
+
+
+# ---------------------------------------------------------------------------
+# Round 4: removal is gated on the FILE actually being gone, not on row
+# ownership.  The user runs sync almost always WITH a project open, so a
+# project sync must also clean global leftovers — while a live global file
+# that is merely shadowed out of the project scope is never deleted.
+# ---------------------------------------------------------------------------
+
+
+class TestSyncExistenceGuard:
+    def test_project_sync_removes_global_leftover(self, tmp_path):
+        """A global library whose file was deleted is removed by a
+        PROJECT-scoped sync — the user's normal workflow must manage global
+        leftovers too."""
+        db_path = tmp_path / "shared.db"
+        global_mgr = SymbolIndexManager(
+            SymbolIndexReader(_FixtureConfig()), db_path=db_path
+        )
+        global_mgr.sync()
+
+        # Index an extra GLOBAL library straight into the DB…
+        global_lib = tmp_path / "GLib.kicad_sym"
+        global_lib.write_text(
+            (FIXTURES_DIR / "test_device.kicad_sym").read_text(encoding="utf-8")
+        )
+        global_mgr.index_library("GLib", str(global_lib))
+        assert global_mgr.get_library_by_name("GLib") is not None
+        assert global_mgr.get_library_by_name("GLib").project == ""
+
+        # …then the file disappears, as if the library was uninstalled.
+        global_lib.unlink()
+
+        # The user's normal workflow: a project-scoped sync.  Its table is
+        # unrelated (one live project lib) — the point is the project sync
+        # itself must clean the global leftover.
+        proj_dir = tmp_path / "proj"
+        proj_dir.mkdir()
+        (proj_dir / "ProjLib.kicad_sym").write_text(
+            (FIXTURES_DIR / "test_device.kicad_sym").read_text(encoding="utf-8")
+        )
+        (proj_dir / "sym-lib-table").write_text(
+            "(sym_lib_table\n  (version 1)\n"
+            '  (lib (name "ProjLib") (type "KiCad") (uri "${KIPRJMOD}/ProjLib.kicad_sym")'
+            '(options "") (descr "Project library"))\n)\n',
+            encoding="utf-8",
+        )
+        proj_real = os.path.realpath(str(proj_dir))
+        proj_mgr = SymbolIndexManager(
+            SymbolIndexReader(_FixtureConfig(), project_dir=proj_real),
+            db_path=db_path,
+            project_path=proj_real,
+        )
+        stats = proj_mgr.sync()
+        assert stats.failed == 0
+        assert stats.removed == 1  # exactly the gone GLib row
+
+        # The global leftover is gone from every scope.
+        fresh_global = SymbolIndexManager(
+            SymbolIndexReader(_FixtureConfig()), db_path=db_path
+        )
+        assert fresh_global.get_library_by_name("GLib") is None
+        assert proj_mgr.get_library_by_name("GLib") is None
+
+    def test_global_and_project_same_nickname_same_symbols_coexist(self, tmp_path):
+        """Global 'TestDevice' (symbols R, C) plus a project shadow whose
+        file also contains R and C — same nickname AND same symbol names.
+        Both sync fine and the rows coexist (PK is (library_id,
+        symbol_name)); the live global file is never deleted by the
+        shadowing project sync."""
+        db_path = tmp_path / "shared.db"
+        global_mgr = SymbolIndexManager(
+            SymbolIndexReader(_FixtureConfig()), db_path=db_path
+        )
+        global_mgr.sync()
+        global_path = os.path.join(FIXTURES_DIR, "test_device.kicad_sym")
+
+        # Project shadows "TestDevice" with a copy of the SAME file — exact
+        # same symbol names R, C (the old (library_name, symbol_name) PK
+        # raised IntegrityError on this insert).
+        proj_dir = tmp_path / "proj"
+        proj_dir.mkdir()
+        proj_real = os.path.realpath(str(proj_dir))
+        (proj_dir / "DeviceCopy.kicad_sym").write_text(
+            (FIXTURES_DIR / "test_device.kicad_sym").read_text(encoding="utf-8")
+        )
+        (proj_dir / "sym-lib-table").write_text(
+            "(sym_lib_table\n  (version 1)\n"
+            '  (lib (name "TestDevice") (type "KiCad") (uri "${KIPRJMOD}/DeviceCopy.kicad_sym")'
+            '(options "") (descr "Project copy"))\n)\n',
+            encoding="utf-8",
+        )
+        proj_mgr = SymbolIndexManager(
+            SymbolIndexReader(_FixtureConfig(), project_dir=proj_real),
+            db_path=db_path,
+            project_path=proj_real,
+        )
+        stats = proj_mgr.sync()
+        assert stats.failed == 0
+        assert stats.removed == 0  # global row's file still exists -> kept
+
+        # Both rows coexist…
+        fresh_global = SymbolIndexManager(
+            SymbolIndexReader(_FixtureConfig()), db_path=db_path
+        )
+        g_row = fresh_global.get_library_by_name("TestDevice")
+        assert g_row is not None
+        assert g_row.project == ""
+        assert g_row.file_path == global_path
+        assert {s.symbol_name for s in fresh_global.get_library_symbols("TestDevice")} == {
+            "R",
+            "C",
+        }
+
+        # …and the project scope resolves the nickname to its own row.
+        p_row = proj_mgr.get_library_by_name("TestDevice")
+        assert p_row is not None
+        assert p_row.project == proj_real
+        assert p_row.file_path == os.path.join(proj_real, "DeviceCopy.kicad_sym")
+        assert {s.symbol_name for s in proj_mgr.get_library_symbols("TestDevice")} == {
+            "R",
+            "C",
+        }
+        assert g_row.id != p_row.id

@@ -301,20 +301,26 @@ class SymbolIndexManager:
             except Exception as exc:
                 log.warning("progress_callback raised on completion: %s", exc)
 
-        # Remove libraries no longer in the table.  Removal is ownership-
-        # aware: a project-scoped sync may only delete rows it OWNS
-        # (project == scope_id).  Global rows (project == '') are shared
-        # state — a project that shadows a global nickname (standard KiCad
-        # override) must never delete the global row just because the
-        # shadowed path is absent from this scope's current table.  The
-        # global sync (scope_id == '') sees only global rows and deletes
-        # them as before.
-        for path, (lib_id, _, _, _, row_project) in db_known.items():
+        # Remove libraries no longer in the table.  Removal is gated on the
+        # file actually being GONE from disk — not on whether this scope
+        # "owns" the row.  A row whose file still exists was simply shadowed
+        # out of this scope's merged view by a same-nickname override
+        # (standard KiCad project-over-global precedence) or is invisible to
+        # this scope's reader; live files are never deleted.  db_known is
+        # already scope-limited to global + current project rows, so a
+        # project sync removes global leftovers (user's normal workflow) and
+        # rows of other projects never enter the loop.  The global sync
+        # (scope_id == '') behaves as before.
+        for path, (lib_id, _, _, _, _row_project) in db_known.items():
             if path in current_paths:
                 continue
-            if scope_id and row_project != scope_id:
+            # File still on disk -> not a leftover; it was shadowed out of
+            # this scope's merged view by a same-nickname override or is
+            # simply invisible to this scope's reader.  Never delete live
+            # files.
+            if os.path.exists(path):
                 continue
-            log.info(f"Removing: {path}")
+            log.info(f"Removing (file gone): {path}")
             self._db.delete_library(lib_id)
             stats.removed += 1
 
