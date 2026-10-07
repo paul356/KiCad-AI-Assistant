@@ -228,19 +228,19 @@ class TestRemoveLibrary:
     def test_remove_missing_returns_false(self):
         assert self.mgr.remove_library("NoSuchLib") is False
 
-    def test_remove_directory_style_prefix_rows(self):
-        """Directory-style (symdir) libraries are indexed as rows keyed
-        ``<nickname>/<file-stem>``; removing the bare nickname must drop
-        every row under that prefix (regression: previously the exact
-        lookup missed them and the rows lingered until next sync)."""
+    def test_remove_does_not_touch_system_symdir_rows(self):
+        """Directory-style (symdir) rows keyed ``<nickname>/<file-stem>``
+        belong to *system* symbol libraries (e.g. ``usr/share/kicad/symbols``).
+        remove_library matches the bare nickname exactly, so it must **not**
+        match those rows — delete tools never touch system libraries."""
         from kcaa.utils.symbol_database import SymbolRecord
 
         def _make_symbol(lib: str, name: str) -> SymbolRecord:
             return SymbolRecord(library_name=lib, symbol_name=name, library_id=-1,
                                 description="", keywords="", pin_count=0, file_index=0)
 
-        # Simulate sync() output for a symdir library: one row per .kicad_sym
-        # file inside the directory, keyed nickname/stem.
+        # Simulate sync() output for a system symdir library: one row per
+        # .kicad_sym file inside the directory, keyed nickname/stem.
         for stem in ("STM32F722ICKx", "STM32F723ZETx"):
             self.mgr._db.save_library(
                 f"MCU_ST_STM32F7/{stem}",
@@ -252,6 +252,10 @@ class TestRemoveLibrary:
                 "csum",
             )
 
-        assert self.mgr.remove_library("MCU_ST_STM32F7") is True
-        remaining = [lib.library_name for lib in self.mgr.get_all_libraries()]
-        assert not any(name.startswith("MCU_ST_STM32F7/") for name in remaining)
+        # The bare nickname has no exact row (rows are nickname/stem), so
+        # removal must report False and leave the system rows untouched.
+        assert self.mgr.remove_library("MCU_ST_STM32F7") is False
+        remaining = {lib.library_name for lib in self.mgr.get_all_libraries()}
+        assert remaining == {"TestDevice", "TestPower",
+                             "MCU_ST_STM32F7/STM32F722ICKx",
+                             "MCU_ST_STM32F7/STM32F723ZETx"}

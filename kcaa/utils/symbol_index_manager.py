@@ -496,33 +496,22 @@ class SymbolIndexManager:
         Only the index entry is removed — the ``.kicad_sym`` file and the
         sym-lib-table entry are left untouched (callers own those).
 
-        Directory-style (KiCad 10 symdir) libraries are indexed under the
-        composed key ``<nickname>/<file-stem>`` (one row per .kicad_sym
-        file, see ``sync``).  Deleting such a library therefore removes
-        **every row** whose key starts with ``<nickname>/``; plain
-        file-style libraries match the bare nickname exactly.  A library
-        with no matching rows yields ``False``.
+        Matches by bare nickname.  User-facing library tools only ever
+        create **file-style** libraries (one ``.kicad_sym`` per library),
+        which are indexed under the bare nickname, so exact matching is
+        sufficient.  Directory-style (symdir) rows keyed
+        ``<nickname>/<file-stem>`` belong to *system* libraries (e.g.
+        ``usr/share/kicad/symbols``) and are deliberately **not** matched:
+        delete tools must never touch system libraries.
 
-        :param library_name: Library nickname to remove (with or without the
-            ``/stem`` suffix — both resolve to the same library).
-        :returns: True when at least one matching row was deleted.
+        :param library_name: Library nickname to remove.
+        :returns: True when a matching row was deleted.
         """
-        # Exact match: file-style libraries (bare nickname) — unchanged.
         rec = self._db.get_library_by_name(library_name)
-        if rec is not None:
-            self._db.delete_library(rec.id)
-            return True
-
-        # Prefix fallback: directory-style libraries are stored as
-        # "<nickname>/<file-stem>", so removing the whole library means
-        # removing every row under that nickname prefix.
-        prefix = f"{library_name}/"
-        deleted = False
-        for rec in self._db.get_all_libraries():
-            if rec.library_name.startswith(prefix):
-                self._db.delete_library(rec.id)
-                deleted = True
-        return deleted
+        if rec is None:
+            return False
+        self._db.delete_library(rec.id)
+        return True
 
     # ------------------------------------------------------------------
     # Narrow single-library indexing (library write tools)
