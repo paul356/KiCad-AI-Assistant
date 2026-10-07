@@ -137,11 +137,13 @@ express an absolute move as a delta.
 
 ### 3.2 Symbol Index Tools
 
-#### `sync_symbol_index(force=False)`
+#### `sync_symbol_index(force=False, project_path=None)`
 
 **Purpose:** Scans all installed KiCad symbol libraries and populates the local full-text search index. Must be called at least once before `search_symbols` will return results.
 
-**Key parameters:** `force` (`bool`) — when `True`, rebuilds even if the index appears current.
+**Key parameters:**
+- `force` (`bool`) — when `True`, rebuilds even if the index appears current.
+- `project_path` (`str | None`) — optional path to a project directory or a file inside it (e.g. the schematic). Syncs global plus that project's libraries; other projects' rows are never touched. Omit for the global scope only.
 
 ---
 
@@ -151,12 +153,13 @@ express an absolute move as a delta.
 
 ---
 
-#### `search_symbols(query, limit=50)`
+#### `search_symbols(query, project_path=None, limit=50)`
 
 **Purpose:** Full-text search across symbol name, description, and keywords in the index.
 
 **Key parameters:**
 - `query` (`str`) — search string (e.g. `"NPN transistor"`, `"STM32F4"`).
+- `project_path` (`str | None`) — optional path to a project directory or a file inside it. Global plus that project's libraries are searched; other projects' libraries are never shown. Omit for global libraries only.
 - `limit` (`int`, default `50`) — maximum results.
 
 **Return shape:** `{"success": true, "count": N, "symbols": [{"library_name": "...", "name": "...", "description": "...", "pin_count": N}, ...]}`
@@ -165,37 +168,45 @@ express an absolute move as a delta.
 
 ---
 
-#### `get_symbol(library_name, symbol_name)`
+#### `get_symbol(library_name, symbol_name, project_path=None)`
 
 **Purpose:** Retrieve the full symbol definition including all properties and pin details.
 
-**Key parameters:** `library_name` and `symbol_name` exactly as returned by `search_symbols`.
+**Key parameters:**
+- `library_name` and `symbol_name` exactly as returned by `search_symbols`.
+- `project_path` (`str | None`) — optional path to a project directory or a file inside it. The lookup is scoped to global plus that project's libraries; other projects' libraries are never matched. Omit for global only.
 
 ---
 
-#### `list_symbol_libraries()`
+#### `list_symbol_libraries(table=None, limit=200, offset=0, project_path=None)`
 
-**Purpose:** Returns names and file paths for all known symbol libraries. Useful for exploration when `search_symbols` returns no results.
+**Purpose:** Returns names and file paths for all known symbol libraries in scope (global plus the given project's, when `project_path` is set). Useful for exploration when `search_symbols` returns no results.
+
+**Key parameters:** `table`, `limit`, `offset` — paging/drill-down as described in the tool docstring; `project_path` scopes the listing exactly like `search_symbols`.
 
 ---
 
-#### `get_library_symbols(library_name)`
+#### `get_library_symbols(library_name, limit=50, offset=0, project_path=None)`
 
 **Purpose:** Lists every symbol inside a specific library. Use to browse a library after identifying it via `list_symbol_libraries`.
 
-**Key parameters:** `library_name` — same format as above (`"TableName/FileBaseName"`).
+**Key parameters:**
+- `library_name` — same format as above (`"TableName/FileBaseName"`).
+- `project_path` (`str | None`) — scopes the lookup to global plus that project's libraries; other projects' libraries are never matched.
 
 ---
 
-#### `get_symbol_index_stats()`
+#### `get_symbol_index_stats(project_path=None)`
 
-**Purpose:** Returns aggregate statistics (total symbols, total libraries, index size). Diagnostic only.
+**Purpose:** Returns aggregate statistics (total symbols, total libraries, index size) for the scoped index (global plus the given project's, when `project_path` is set). Diagnostic only.
 
 ---
 
-#### `get_symbol_pins(library_name, symbol_name)`
+#### `get_symbol_pins(library_name, symbol_name, project_path=None)`
 
 **Purpose:** Returns the pin list (number, name, electrical type, direction) for a symbol without fetching the full definition. Use when planning wiring before placing a component.
+
+**Key parameters:** `library_name`, `symbol_name` as returned by `search_symbols`; `project_path` scopes the lookup like `get_symbol`.
 
 ---
 
@@ -265,7 +276,7 @@ The `lib_id` is `<library>:<symbol_name>`. Calling with a `symbol_name` that alr
 - `symbols` (`list[str]`) — fully-qualified lib_ids (`"自定义:MYOP"`, `"Device:R"`). Matching is exact on the full lib_id; plain names are rejected (`failed` with reason `must_be_lib_id`).
 - `library` (`str`) — target library nickname (must already exist).
 
-Entries already present in the target library are reported in `skipped` (never overwritten); entries not present in the schematic are reported in `failed`. The library is re-indexed afterwards.
+Entries already present in the target library are reported in `skipped` (never overwritten); entries not present in the schematic are reported in `failed`. The library is re-indexed afterwards, keeping the row's **owning scope** — when the target library is declared in the project's sym-lib-table the index row stays project-owned, otherwise it stays global (never re-attributed to the project).
 
 **Success response:** `{"library": "MyLib", "library_path": "...", "exported": ["MyLib:MYOP"], "exported_count": 1, "failed": [], "failed_count": 0, "skipped": [], "skipped_count": 0, "indexed": 1}`
 
@@ -289,6 +300,7 @@ Entries already present in the target library are reported in `skipped` (never o
 **Key parameters:**
 - `library` (`str`) — nickname of the target library (must exist in sym-lib-table).
 - `symbols` (`list[str]`) — plain symbol names to remove (e.g. `["NINJA_IO"]`). Must be non-empty.
+- `project_dir` (`str | None`) — project directory when the library is project-local; scopes the re-index so the project-owned row (not a same-nickname row of another project or the global scope) is updated.
 
 **Success response:** `{"library": "MyLib", "library_path": "...", "removed": ["MyLib:MYOP"], "removed_count": 1, "failed": [], "failed_count": 0, "indexed": 0}`
 
@@ -301,6 +313,8 @@ Entries already present in the target library are reported in `skipped` (never o
 **Key parameters:**
 - `library` (`str`) — nickname of the library to delete.
 - `project_dir` (`str`, optional) — project directory when the library is project-local (`${KIPRJMOD}` URI). Omit for global libraries.
+
+**Ownership:** the index delete matches by **ownership** — with `project_dir` set, only the project-owned row is removed; a same-nickname library of another project (or the global scope) is never touched. Without it, the library must resolve in the global scope.
 
 **Success response:** `{"library": "MyLib", "path": "...", "table_path": "...", "unregistered": true, "table_backup": "...", "index_removed": true, "deleted": true}`
 
