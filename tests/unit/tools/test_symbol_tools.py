@@ -8,7 +8,7 @@ are fully self-contained and do not require a real KiCad installation.
 import asyncio
 import os
 import threading
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import sexpdata
 
@@ -660,3 +660,158 @@ class TestParseLibPins:
         pins = self._parse(fake_raw)
         assert len(pins) == 3
         assert [p["number"] for p in pins].count("3") == 1
+
+
+# ---------------------------------------------------------------------------
+# project_path scope propagation (Fix 2)
+# ---------------------------------------------------------------------------
+
+
+class TestProjectPathScoping:
+    """Read tools forward project_path to a project-scoped index manager so
+    the project's libraries become visible — and never a project_path member
+    leaks into the response payloads."""
+
+    @staticmethod
+    def _patch_mgr():
+        return patch("kcaa.tools.symbol_tools._get_index_manager")
+
+    def test_get_symbol_uses_project_index(self):
+        rec = MagicMock()
+        rec.library_name = "ProjLib"
+        rec.symbol_name = "R"
+        rec.description = "Resistor"
+        rec.keywords = "res"
+        rec.pin_count = 2
+
+        with self._patch_mgr() as mock_get_mgr:
+            mock_get_mgr.return_value.get_symbol.return_value = rec
+            result = _call(
+                "get_symbol", library_name="ProjLib", symbol_name="R", project_path="/p/X"
+            )
+
+        assert result["success"] is True
+        assert result["name"] == "R"
+        assert result["library_name"] == "ProjLib"
+        # The tool AND the raw-symbol loader both resolve the project scope.
+        assert mock_get_mgr.call_args_list == [call("/p/X"), call("/p/X")]
+        assert "project_path" not in result
+
+    def test_search_symbols_uses_project_index(self):
+        rec = MagicMock()
+        rec.library_name = "ProjLib"
+        rec.symbol_name = "R"
+        rec.description = "Resistor"
+        rec.keywords = "res"
+        rec.pin_count = 2
+
+        with self._patch_mgr() as mock_get_mgr:
+            mock_get_mgr.return_value.search_symbols.return_value = [rec]
+            result = _call("search_symbols", query="res", project_path="/p/X")
+
+        assert result["success"] is True
+        assert result["count"] == 1
+        mock_get_mgr.assert_called_once_with("/p/X")
+        assert "project_path" not in result
+
+    def test_list_libraries_uses_project_index(self):
+        lib = MagicMock()
+        lib.library_name = "ProjLib"
+        lib.symbol_count = 3
+
+        with self._patch_mgr() as mock_get_mgr:
+            mock_get_mgr.return_value.get_all_libraries.return_value = [lib]
+            result = _call("list_symbol_libraries", project_path="/p/X")
+
+        assert result["success"] is True
+        assert result["mode"] == "tables"
+        mock_get_mgr.assert_called_once_with("/p/X")
+        assert not any("project_path" in row for row in result["tables"])
+
+    def test_get_library_symbols_uses_project_index(self):
+        rec = MagicMock()
+        rec.library_name = "ProjLib"
+        rec.symbol_name = "R"
+        rec.description = "Resistor"
+        rec.keywords = "res"
+        rec.pin_count = 2
+
+        with self._patch_mgr() as mock_get_mgr:
+            mock_get_mgr.return_value.get_library_symbols.return_value = [rec]
+            result = _call(
+                "get_library_symbols", library_name="ProjLib", project_path="/p/X"
+            )
+
+        assert result["success"] is True
+        assert result["total"] == 1
+        assert len(result["symbols"]) == 1
+        mock_get_mgr.assert_called_once_with("/p/X")
+        assert "project_path" not in result
+
+    def test_get_symbol_index_stats_uses_project_index(self):
+        stats = MagicMock()
+        stats.library_count = 4
+        stats.symbol_count = 100
+        stats.last_sync = None
+        stats.db_path = "/tmp/db.sqlite"
+
+        with self._patch_mgr() as mock_get_mgr:
+            mock_get_mgr.return_value.get_statistics.return_value = stats
+            result = _call("get_symbol_index_stats", project_path="/p/X")
+
+        assert result["success"] is True
+        assert result["library_count"] == 4
+        assert result["symbol_count"] == 100
+        mock_get_mgr.assert_called_once_with("/p/X")
+        assert "project_path" not in result
+
+    def test_sync_forwards_project_path(self):
+        """Sync scoping reaches the background thread as
+        _run_sync_in_background(force, project_path)."""
+        import kcaa.tools.symbol_tools as mod
+
+        with mod._sync_lock:
+            mod._sync_state.running = False
+            mod._sync_state.current = 0
+            mod._sync_state.total = 0
+            mod._sync_state.current_library = ""
+            mod._sync_state.error = None
+
+        with patch.object(threading, "Thread") as mock_thread_cls:
+            mock_thread = MagicMock()
+            mock_thread_cls.return_value = mock_thread
+            result = _call("sync_symbol_index", project_path="/p/X")
+
+        assert result["status"] == "started"
+        target, args = mock_thread_cls.call_args.kwargs["target"], mock_thread_cls.call_args.kwargs["args"]
+        assert target.__name__ == "_run_sync_in_background"
+        assert args == (False, "/p/X")
+
+        with mod._sync_lock:
+            mod._sync_state.running = False
+
+    def test_get_symbol_pins_uses_project_index(self):
+        S = sexpdata.Symbol
+        raw = [
+            S("symbol"),
+            "ProjLib_" + S("R"),
+            [S("pin"), S("passive"), S("line"), [S("at"), 0, 0, 0], [S("number"), "1"]],
+        ]
+        with self._patch_mgr() as mock_get_mgr, patch(
+            "kcaa.tools.symbol_tools.extract_lib_symbol_raw", return_value=raw
+        ):
+            sym_rec = MagicMock()
+            sym_rec.file_index = 0
+            lib_rec = MagicMock()
+            lib_rec.file_path = "/p/X/ProjLib.kicad_sym"
+            lib_rec.mtime = 1.0
+            lib_rec.file_size = 100
+            mock_get_mgr.return_value.get_symbol.return_value = sym_rec
+            mock_get_mgr.return_value.get_library_by_name.return_value = lib_rec
+            result = _call(
+                "get_symbol_pins", library_name="ProjLib", symbol_name="R", project_path="/p/X"
+            )
+
+        assert result["success"] is True
+        mock_get_mgr.assert_called_once_with("/p/X")
+        assert "project_path" not in result

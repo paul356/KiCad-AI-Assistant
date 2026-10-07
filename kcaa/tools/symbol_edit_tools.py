@@ -176,16 +176,43 @@ def _is_user_library_location(path: str, project_dir: str | None) -> bool:
     )
 
 
+def _target_project_of(table_path: str, project_dir: str | None) -> str:
+    """Ownership of a library declared in *table_path*.
+
+    Mirrors the footprint derivation (``pcb_library_tools``): a library
+    declared in the project's own ``sym-lib-table`` belongs to the project
+    (its project id), anything else (global user/system table) belongs to
+    the global scope (``""``).
+    """
+    proj_real = _project_dir_of(project_dir) if project_dir else None
+    if (
+        proj_real
+        and table_path
+        and os.path.realpath(table_path) == os.path.join(proj_real, "sym-lib-table")
+    ):
+        return proj_real
+    return ""
+
+
 def _index_symbol_library(
-    library: str, file_path: str, project_dir: str | None = None
+    library: str,
+    file_path: str,
+    project_dir: str | None = None,
+    project: str | None = None,
 ) -> int:
     """Index exactly one symbol library file; returns symbol count or -1.
 
-    The index row is scoped to *project_dir* (global when None) so
-    project-local library rows are never written into the global scope.
+    *project* is the exact row ownership (``""`` = global, project id = that
+    project), derived from the library's declaring sym-lib-table so a
+    reindex never re-attributes a library to the caller's project.  When
+    None, the manager's own scope is used (kept for callers that do not
+    derive ownership).  *project_dir* selects the manager scope for the
+    lookup.
     """
     try:
-        return _get_index_manager(project_dir).index_library(library, file_path)
+        return _get_index_manager(project_dir).index_library(
+            library, file_path, project=project
+        )
     except Exception as exc:
         log.error("Symbol index update failed for %s: %s", library, exc, exc_info=True)
         return -1
@@ -371,10 +398,13 @@ def _do_add_symbol_to_library(
             continue
 
     # Refresh the index so search_symbols/list_symbol_libraries see the new
-    # file — scoped to the schematic's project when there is one.
+    # file — reindexed under the library's OWN ownership (a global library
+    # edited from a project schematic must stay global).
     proj_dir = _find_project_dir(schematic_path)
+    proj_dir_str = str(proj_dir) if proj_dir else None
+    target_project = _target_project_of(lib["table_path"], proj_dir_str)
     indexed = _index_symbol_library(
-        library, lib_file, project_dir=str(proj_dir) if proj_dir else None
+        library, lib_file, project_dir=proj_dir_str, project=target_project
     )
     return {
         "library": library,
@@ -451,8 +481,13 @@ def _do_remove_symbol_from_library(
         removed.append(f"{library}:{name}")
         available.discard(name)
 
-    # Refresh the index so removed symbols disappear from search.
-    indexed = _index_symbol_library(library, lib_file, project_dir=project_dir)
+    # Refresh the index so removed symbols disappear from search —
+    # reindexed under the library's OWN ownership (a global library edited
+    # through a project path must stay global).
+    target_project = _target_project_of(lib["table_path"], project_dir)
+    indexed = _index_symbol_library(
+        library, lib_file, project_dir=project_dir, project=target_project
+    )
     return {
         "library": library,
         "library_path": lib_file,
@@ -534,7 +569,14 @@ def _do_delete_symbol_library(
 
     index_removed = False
     try:
-        index_removed = _get_index_manager(project_dir).remove_library(library)
+        # Ownership-scoped: remove exactly the row owned by the library's
+        # declaring table (project row for a project library, global row
+        # otherwise).  A same-nickname row of another project is never
+        # touched.
+        target_project = _target_project_of(table_path, project_dir)
+        index_removed = _get_index_manager(project_dir).remove_library(
+            library, project=target_project
+        )
     except Exception as exc:
         log.error("delete_symbol_library: index cleanup failed for %s: %s", library, exc)
 

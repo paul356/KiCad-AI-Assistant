@@ -99,8 +99,12 @@ _sync_state = _SyncState()
 _sync_lock = threading.Lock()
 
 
-def _run_sync_in_background(force: bool) -> None:
-    """Target function executed in the background sync thread."""
+def _run_sync_in_background(force: bool, project_path: str | None = None) -> None:
+    """Target function executed in the background sync thread.
+
+    When *project_path* is given the sync is scoped to that project
+    (project + global libraries); otherwise the global scope is synced.
+    """
 
     def _progress(current: int, total: int, library_name: str) -> None:
         with _sync_lock:
@@ -109,7 +113,7 @@ def _run_sync_in_background(force: bool) -> None:
             _sync_state.current_library = library_name
 
     try:
-        mgr = _get_index_manager()
+        mgr = _get_index_manager(project_path)
         stats = mgr.sync(force=force, progress_callback=_progress)
         result = {
             "success": True,
@@ -135,9 +139,17 @@ def _run_sync_in_background(force: bool) -> None:
             _sync_state.current_library = ""
 
 
-def _load_lib_symbol_raw(library_name: str, symbol_name: str):
-    """Look up + extract the raw lib-symbol S-expression, or return (None, error)."""
-    mgr = _get_index_manager()
+def _load_lib_symbol_raw(
+    library_name: str,
+    symbol_name: str,
+    project_path: str | None = None,
+):
+    """Look up + extract the raw lib-symbol S-expression, or return (None, error).
+
+    Resolves the library in the *project_path* scope (global + that project's
+    libraries); other projects' libraries are never matched.
+    """
+    mgr = _get_index_manager(project_path)
     sym_rec = mgr.get_symbol(library_name, symbol_name)
     if sym_rec is None:
         return None, f"Symbol '{library_name}:{symbol_name}' not found in index."
@@ -250,7 +262,11 @@ def register_symbol_tools(mcp: FastMCP) -> None:
     """Register symbol library tools with the MCP server."""
 
     @mcp.tool()
-    async def sync_symbol_index(force: bool = False, ctx: Context | None = None) -> dict[str, Any]:
+    async def sync_symbol_index(
+        force: bool = False,
+        project_path: str | None = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
         """
         Start syncing the symbol index database with the current KiCad symbol libraries.
 
@@ -265,6 +281,10 @@ def register_symbol_tools(mcp: FastMCP) -> None:
         Args:
             force: If True, reparse every library regardless of whether it changed. This can take
                    a long time to complete. Use force=True only when the database is messed up.
+            project_path: Optional path to a project directory or a file inside it
+                (e.g. the schematic).  Global + that project's libraries are
+                synced; other projects' rows are never touched.  Omit for the
+                global scope only.
         """
         with _sync_lock:
             if _sync_state.running:
@@ -285,7 +305,9 @@ def register_symbol_tools(mcp: FastMCP) -> None:
         if ctx:
             await ctx.info("Starting symbol index sync in background thread...")
 
-        t = threading.Thread(target=_run_sync_in_background, args=(force,), daemon=True)
+        t = threading.Thread(
+            target=_run_sync_in_background, args=(force, project_path), daemon=True
+        )
         t.start()
         log.info("Background symbol sync thread started.")
         return {
@@ -318,6 +340,7 @@ def register_symbol_tools(mcp: FastMCP) -> None:
     @mcp.tool()
     async def search_symbols(
         query: str,
+        project_path: str | None = None,
         limit: int = 50,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
@@ -329,6 +352,10 @@ def register_symbol_tools(mcp: FastMCP) -> None:
 
         Args:
             query: Search string (e.g. "resistor", "NPN transistor", "STM32").
+            project_path: Optional path to a project directory or a file
+                inside it (e.g. the schematic).  Global plus that project's
+                libraries are searched; other projects' libraries are never
+                shown.  Omit for global libraries only.
             limit: Maximum number of results to return (default 50).
 
         Returns:
@@ -341,7 +368,7 @@ def register_symbol_tools(mcp: FastMCP) -> None:
             - ``name``: the exact value to pass as ``symbol_name``.
         """
         try:
-            mgr = _get_index_manager()
+            mgr = _get_index_manager(project_path)
             results = mgr.search_symbols(query, limit=limit)
             return {
                 "success": True,
@@ -366,6 +393,7 @@ def register_symbol_tools(mcp: FastMCP) -> None:
     async def get_symbol(
         library_name: str,
         symbol_name: str,
+        project_path: str | None = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """
@@ -387,9 +415,13 @@ def register_symbol_tools(mcp: FastMCP) -> None:
                 this is ``"TableName/FileBaseName"`` (e.g. ``"Device/R_Small"``)
                 not just the table name (e.g. not ``"Device"``).
             symbol_name:  The symbol name within the library (e.g. "R").
+            project_path: Optional path to a project directory or a file
+                inside it (e.g. the schematic).  The lookup is scoped to
+                global plus that project's libraries; other projects'
+                libraries are never matched.  Omit for global only.
         """
         try:
-            mgr = _get_index_manager()
+            mgr = _get_index_manager(project_path)
             symbol = mgr.get_symbol(library_name, symbol_name)
             if symbol is None:
                 return {
@@ -404,7 +436,7 @@ def register_symbol_tools(mcp: FastMCP) -> None:
                 "keywords": symbol.keywords,
                 "pin_count": symbol.pin_count,
             }
-            raw, err = _load_lib_symbol_raw(library_name, symbol_name)
+            raw, err = _load_lib_symbol_raw(library_name, symbol_name, project_path)
             if raw is not None:
                 summary = _bbox_summary(raw)
                 if summary is not None:
@@ -419,6 +451,7 @@ def register_symbol_tools(mcp: FastMCP) -> None:
         table: str | None = None,
         limit: int = 200,
         offset: int = 0,
+        project_path: str | None = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """
@@ -442,11 +475,15 @@ def register_symbol_tools(mcp: FastMCP) -> None:
                     Omit to get the top-level table summary.
             limit:  Maximum entries to return (default 200, max 500).
             offset: 0-based entry offset for pagination (default 0).
+            project_path: Optional path to a project directory or a file
+                inside it (e.g. the schematic).  Global plus that project's
+                libraries are listed; other projects' libraries are never
+                shown.  Omit for global libraries only.
         """
         try:
             limit = min(max(1, limit), 500)
             offset = max(0, offset)
-            mgr = _get_index_manager()
+            mgr = _get_index_manager(project_path)
             libraries = mgr.get_all_libraries()
 
             if table is None:
@@ -501,6 +538,7 @@ def register_symbol_tools(mcp: FastMCP) -> None:
         library_name: str,
         limit: int = 50,
         offset: int = 0,
+        project_path: str | None = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """
@@ -520,11 +558,15 @@ def register_symbol_tools(mcp: FastMCP) -> None:
                 just the table name (e.g. not ``"Device"``).
             limit:  Maximum symbols to return (default 50, max 200).
             offset: 0-based symbol offset for pagination (default 0).
+            project_path: Optional path to a project directory or a file
+                inside it (e.g. the schematic).  The library is looked up in
+                global plus that project's scope; other projects' libraries
+                are never matched.  Omit for global only.
         """
         try:
             limit = min(max(1, limit), 200)
             offset = max(0, offset)
-            mgr = _get_index_manager()
+            mgr = _get_index_manager(project_path)
             symbols = mgr.get_library_symbols(library_name)
             if not symbols:
                 return {
@@ -554,15 +596,24 @@ def register_symbol_tools(mcp: FastMCP) -> None:
             return {"success": False, "error": str(e)}
 
     @mcp.tool()
-    async def get_symbol_index_stats(ctx: Context | None = None) -> dict[str, Any]:
+    async def get_symbol_index_stats(
+        project_path: str | None = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
         """
         Return summary statistics about the symbol index database.
 
         Shows how many libraries and symbols are indexed, when the last sync
         ran, and where the database file is located.
+
+        Args:
+            project_path: Optional path to a project directory or a file
+                inside it.  Counts cover global plus that project's
+                libraries; other projects' rows are excluded.  Omit for the
+                global scope only.
         """
         try:
-            mgr = _get_index_manager()
+            mgr = _get_index_manager(project_path)
             stats = mgr.get_statistics()
             return {
                 "success": True,
@@ -579,6 +630,7 @@ def register_symbol_tools(mcp: FastMCP) -> None:
     async def get_symbol_pins(
         library_name: str,
         symbol_name: str,
+        project_path: str | None = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Return detailed pin information for a KiCad library symbol.
@@ -606,6 +658,10 @@ def register_symbol_tools(mcp: FastMCP) -> None:
             library_name: The library name as returned by ``search_symbols``
                 (e.g. ``"Device/R"`` for KiCad 10 symdir-style libraries).
             symbol_name: The symbol name within the library (e.g. ``"R"``).
+            project_path: Optional path to a project directory or a file
+                inside it (e.g. the schematic).  The library is looked up in
+                global plus that project's scope; other projects' libraries
+                are never matched.  Omit for global only.
 
         Returns:
             dict with keys: success, library_name, symbol_name, pin_count,
@@ -614,7 +670,7 @@ def register_symbol_tools(mcp: FastMCP) -> None:
             (per-unit bboxes when multi-unit).
         """
         try:
-            lib_sym_raw, err = _load_lib_symbol_raw(library_name, symbol_name)
+            lib_sym_raw, err = _load_lib_symbol_raw(library_name, symbol_name, project_path)
             if lib_sym_raw is None:
                 return {"success": False, "error": err}
 

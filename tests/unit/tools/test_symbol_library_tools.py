@@ -17,6 +17,7 @@ import pytest
 from kcaa.tools.symbol_edit_tools import (
     _do_add_symbol_to_library,
     _do_create_symbol_library,
+    _find_project_dir,
 )
 
 FIXTURE_SCH = str(
@@ -637,6 +638,113 @@ class TestSystemLibraryGuard:
         assert "error" not in result, result
         assert result["deleted"] is True
         assert not os.path.isfile(env["lib_path"])
+
+
+# ---------------------------------------------------------------------------
+# Ownership-scoped reindex + delete (Fix 1 / Fix 3)
+# ---------------------------------------------------------------------------
+
+
+class TestOwnershipScopedIndexWrites:
+    """Editing a library must keep its OWN index ownership: a GLOBAL library
+    edited from a project schematic stays global; deleting matches by
+    ownership so another project's same-nickname row is never touched."""
+
+    def _project_env(self, tmp_path, monkeypatch, env):
+        """A project dir (with same-stem .kicad_pro + schematic copy) whose
+        manager shares the env index DB with the global manager."""
+        import os
+
+        from kcaa.utils.config import ServerConfig
+        from kcaa.utils.symbol_index_manager import SymbolIndexManager
+        from kcaa.utils.symbol_index_reader import SymbolIndexReader
+
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        proj_real = os.path.realpath(str(proj))
+        (proj / "tools_test.kicad_pro").write_text("")
+        sch = proj / "tools_test.kicad_sch"
+        shutil.copy(FIXTURE_SCH, sch)
+
+        index_mgr_global = env["index_mgr"]  # db: tmp_path/symbol_test.db
+        index_mgr_proj = SymbolIndexManager(
+            SymbolIndexReader(ServerConfig(), project_dir=proj_real),
+            db_path=str(tmp_path / "symbol_test.db"),
+            project_path=proj_real,
+        )
+
+        def _dispatch(project_path=None):
+            if project_path is None:
+                return index_mgr_global
+            if os.path.realpath(str(project_path)) == proj_real:
+                return index_mgr_proj
+            raise AssertionError(f"unexpected project path: {project_path}")
+
+        monkeypatch.setattr("kcaa.tools.symbol_edit_tools._get_index_manager", _dispatch)
+        return proj, proj_real, index_mgr_global, index_mgr_proj
+
+    def test_edit_global_library_from_project_keeps_row_global(
+        self, tools, env, tmp_path, monkeypatch
+    ):
+        """Fix 1 regression: exporting cached symbols from a project into a
+        GLOBAL library must NOT re-attribute its index row to the project —
+        the row's project stays '' and no other scope owns it."""
+        _, proj_real, index_mgr_global, _ = self._project_env(
+            tmp_path, monkeypatch, env
+        )
+        sch = str(tmp_path / "proj" / "tools_test.kicad_sch")
+        assert (_find_project_dir(sch)) is not None, "project marker missing"
+
+        result = _run(
+            tools["add_symbols_to_library"],
+            schematic_path=sch,
+            symbols=["Device:R_Small"],
+            library="TestLib",
+        )
+        assert "error" not in result, result
+
+        row = index_mgr_global.get_library_by_name("TestLib")
+        assert row is not None and row.project == ""
+        # The project does not own it either — only the global scope does.
+        assert index_mgr_global._db.get_library_by_name_exact("TestLib", proj_real) is None
+        assert index_mgr_global._db.get_library_by_name_exact("TestLib", "") is not None
+
+    def test_delete_project_library_without_project_dir_keeps_row(
+        self, tools, env, tmp_path, monkeypatch
+    ):
+        """Fix 3(c): deleting a project library through the global manager
+        (project_dir=None) cannot resolve it, so the index row survives."""
+
+        proj, proj_real, _, index_mgr_proj = self._project_env(
+            tmp_path, monkeypatch, env
+        )
+        created = _do_create_symbol_library("ProjOwned", project_dir=str(proj))
+        assert "error" not in created, created
+        assert index_mgr_proj.get_library_by_name("ProjOwned").project == proj_real
+
+        # No project context: the project table is out of scope → resolution
+        # error, and the row (visible only in the project scope) stays.
+        result = _run(tools["delete_symbol_library"], library="ProjOwned")
+        assert "error" in result, result
+        assert index_mgr_proj.get_library_by_name("ProjOwned") is not None
+
+    def test_delete_project_library_with_project_dir_removes_own_row(
+        self, tools, env, tmp_path, monkeypatch
+    ):
+        """Fix 3: delete_symbol_library with the project context removes the
+        project-owned row (and only it)."""
+        proj, proj_real, _, index_mgr_proj = self._project_env(
+            tmp_path, monkeypatch, env
+        )
+        created = _do_create_symbol_library("ProjOwned", project_dir=str(proj))
+        assert "error" not in created, created
+
+        result = _run(
+            tools["delete_symbol_library"], library="ProjOwned", project_dir=str(proj)
+        )
+        assert "error" not in result, result
+        assert result["deleted"] is True
+        assert index_mgr_proj.get_library_by_name("ProjOwned") is None
 
 
 # ---------------------------------------------------------------------------
