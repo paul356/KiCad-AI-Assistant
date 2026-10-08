@@ -40,6 +40,19 @@ MAX_SHOVE_DEPTH = 4
 # fine-sampling every hull (which starves the walking state machine).
 CLEARANCE_EPS = 1e-2  # 10 um, > worst-case chord sagitta (~6 um)
 
+# Walkaround trigger distance.  The audit measures the route COPPER
+# (centerline buffered by half the track width) against obstacle edges,
+# so the walkaround must start detouring when the copper -- not the raw
+# centerline -- comes within ``clearance``.  A bend's round join sweeps
+# the copper ``width/2`` past the centerline, so a corner whose
+# centerline sits in ``(clearance, clearance + width/2)`` of an obstacle
+# is a real DRC violation even though a centerline-only probe never
+# sees it.  ``_walkaround_solids`` therefore probes at
+# ``clearance + width/2`` and verifies the closest hit against the
+# buffered line; the walkaround hull additionally carries
+# CLEARANCE_EPS, so bounded lines keep strictly more than ``clearance``
+# and never re-trigger.
+
 
 class PnsFailure(RuntimeError):
     """Engine could not produce a valid path (walkaround stuck / shove
@@ -162,9 +175,12 @@ def route_engine(
     node = ObstacleNode(walk_obstacles)
     # Placement stages work on clearance + CLEARANCE_EPS so the final
     # geometry is *strictly* clear; the audit below re-checks against the
-    # true clearance.
+    # true clearance.  The walkaround applies the epsilon to its hull
+    # margin itself and triggers on the copper-true clearance (see
+    # ``_walkaround_solids``); the shove stage below keeps using
+    # ``place_clearance``.
     place_clearance = clearance + CLEARANCE_EPS
-    walked = _walkaround_solids(skeleton, node, track_width, place_clearance)
+    walked = _walkaround_solids(skeleton, node, track_width, clearance)
 
     if movable and shove_enabled:
         # Shoved tracks must also stay clear of every FIXED solid (pads,
@@ -604,17 +620,40 @@ def _walkaround_solids(
 ) -> list[tuple[float, float]]:
     """Bump the path around every fixed solid until collision-free.
 
-    Each iteration: nearest obstacle within demargin, walk its hull both
-    CW and CCW, keep the shorter result; repeat.  Mirrors KiCad's
-    WALKAROUND::Route single-step loop.
+    Each iteration: nearest obstacle within the copper trigger distance,
+    walk its hull both CW and CCW, keep the shorter result; repeat.
+    Mirrors KiCad's WALKAROUND::Route single-step loop.
+
+    The trigger mirrors the final DRC audit exactly: it fires when the
+    route COPPER (the centerline buffered by half the track width, round
+    caps) comes within ``clearance`` of an obstacle edge.  A bend's
+    round join sweeps the copper ``width/2`` beyond the centerline, so a
+    corner may violate clearance while its centerline is still clear of
+    a centerline-only probe.  Because copper distance equals
+    ``max(0, centerline distance - width/2)`` for round caps, every
+    candidate whose copper can reach ``clearance`` sits within
+    ``clearance + width/2`` of the centerline — probe there, then verify
+    the closest hit against the buffered line.  If the closest candidate
+    is boundary-clean (copper exactly at ``clearance``), every farther
+    one is cleaner too (distance is monotone), so the loop can stop.
+
+    The walk hull is inflated by ``clearance + width/2 + CLEARANCE_EPS``
+    so a bounded line keeps strictly more than ``clearance`` edge-to-edge
+    and never re-triggers the probe on the same obstacle.
     """
     pts = list(path)
-    hull_margin = clearance + track_width / 2.0
-    check_margin = clearance
+    half_w = track_width / 2.0
+    hull_margin = clearance + CLEARANCE_EPS + half_w
+    probe = clearance + half_w
     for _ in range(max_iter):
-        hit = node.nearest(pts, dfence=check_margin)
+        hit = node.nearest(pts, dfence=probe)
         if hit is None:
             return pts
+        if (
+            LineString(pts).buffer(half_w, cap_style="round").distance(hit.obstacle.shape)
+            >= clearance - 1e-9
+        ):
+            return pts  # closest candidate is boundary-clean: all are clean
         obs = hit.obstacle
         # Obstacle shape already carries its own half-width; add the
         # route half-width + clearance so the walked line gets DRC margin.

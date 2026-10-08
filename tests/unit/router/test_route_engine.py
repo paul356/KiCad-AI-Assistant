@@ -120,6 +120,43 @@ class TestWalkaroundSolids:
         for pad in (_pad(-3, 0), _pad(3, 0)):
             assert LineString(out).distance(pad.shape) >= CLR - 1e-6
 
+    def test_bend_corner_within_copper_margin_triggers_detour(self):
+        """A 45-degree bend whose CENTERLINE stays clear of the pad can
+        still violate clearance: the round join sweeps the route copper
+        width/2 past the corner point.  The trigger must measure the
+        buffered copper (same geometry as the final DRC audit), not the
+        raw centerline.
+
+        Geometry: path (-10,0) -> (0,0) -> (0.5,-0.5) bends at the
+        origin; a 0.4x0.4 pad sits with its top-left corner at (0.1,0.1),
+        i.e. sqrt(0.02) ~ 0.1414 from the bend point.  That is inside
+        (CLR, CLR + W/2) = (0.1, 0.2): a centerline-only probe at CLR
+        would miss it, yet the copper edge (0.1414 - W/2 = 0.0414) is
+        well under CLR.
+        """
+        from kcaa.router.pns.node import ObstacleNode
+
+        pad = _pad(0.3, 0.3, half=0.2)
+        node = ObstacleNode([pad])
+        # Sanity: centerline distance from the bend to the pad lies in
+        # the probe band (CLR, CLR + W/2) -- the regression window.
+        centerline_d = LineString([(-10, 0), (0, 0), (0.5, -0.5)]).distance(pad.shape)
+        assert CLR < centerline_d < CLR + W / 2
+        copper_d = (
+            LineString([(-10, 0), (0, 0), (0.5, -0.5)])
+            .buffer(W / 2, cap_style="round")
+            .distance(pad.shape)
+        )
+        assert copper_d < CLR  # the copper really violates clearance
+
+        out = _walkaround_solids([(-10, 0), (0, 0), (0.5, -0.5)], node, W, CLR)
+        assert out[0] == (-10, 0) and out[-1] == (0.5, -0.5)
+        out_copper = LineString(out).buffer(W / 2, cap_style="round")
+        assert out_copper.distance(pad.shape) >= CLR - 1e-9
+        # The detour must be real -- the skeleton bend was inside the
+        # violation band, so returning it unchanged would fail the audit.
+        assert len(out) > 3 or out != [(-10, 0), (0, 0), (0.5, -0.5)]
+
     def test_unwalkable_raises(self):
         from kcaa.router.pns.node import ObstacleNode
 
@@ -168,6 +205,23 @@ class TestRouteEngine:
         assert res.path[0] == (-8, 0) and res.path[-1] == (8, 0)
         assert LineString(res.path).distance(_pad(0, 0).shape) >= CLR - 1e-6
         assert res.shoved_tracks == []
+
+    def test_bend_corner_clearance_audit_passes(self):
+        """Engine-level regression: a route whose bend corner is clear of
+        a pad by centerline yet within the copper violation band must
+        detour and pass the final DRC audit instead of raising
+        PnsFailure -- the walkaround trigger used to measure only the
+        centerline at ``clearance``, letting the round join cut into the
+        clearance envelope."""
+        pad = _pad(0.3, 0.3, half=0.2)
+        skeleton = [(-10, 0), (0, 0), (0.5, -0.5)]
+        centerline_d = LineString(skeleton).distance(pad.shape)
+        assert CLR < centerline_d < CLR + W / 2  # the regression window
+        res = route_engine((-10, 0), (0.5, -0.5), [pad], W, CLR)
+        assert res.path[0] == (-10, 0) and res.path[-1] == (0.5, -0.5)
+        copper = LineString(res.path).buffer(W / 2, cap_style="round")
+        assert copper.distance(pad.shape) >= CLR - 1e-9
+        assert res.path != skeleton  # the skeleton bend was not clean
 
     def test_track_is_shoved_not_detoured(self):
         # The route stays straight; the movable track is pushed to the
