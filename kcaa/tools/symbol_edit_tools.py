@@ -126,7 +126,12 @@ def _get_index_manager(project_path: str | None = None) -> SymbolIndexManager:
 
     Re-scoping calls switch the singleton to the given project before
     querying; ``None`` switches to the global scope (``""`` — global
-    libraries only).  Thread-safe (double-checked locking).
+    libraries only).  The lock covers the scope swap only: the subsequent
+    queries on the returned manager run outside the lock, so a concurrent
+    re-scope in another thread (e.g. a background sync) can shift the
+    manager's project between a swap and its query.  The async tool paths
+    that call this never yield between the two, so in-process requests do
+    not interleave; thread-based callers should not rely on a stable scope.
 
     The project id and the library reader are swapped together under the
     lock so a background sync never observes a half-switched scope.

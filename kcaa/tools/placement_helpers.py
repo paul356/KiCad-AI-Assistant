@@ -206,7 +206,9 @@ def _find_free_area_impl(
 
     if width is None or height is None:
         return {
-            "error": ("width and height are required unless for_library/for_symbol are provided")
+            "error": (
+                "width and height are required unless both for_library and for_symbol are provided"
+            )
         }
     if width <= 0 or height <= 0:
         return {"error": "width and height must be positive"}
