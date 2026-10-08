@@ -279,6 +279,25 @@ class SymbolDatabase:
                     f"FTS5 not available in this SQLite build — full-text search disabled. ({exc})"
                 )
 
+            try:
+                # Heal: a legacy DB written by an FTS5-less build has symbol
+                # rows but no symbols_fts, so the 'rebuild' attempt inside
+                # the PK migration above failed ("no such table") and the DDL
+                # loop just created an EMPTY index.  search() falls back to
+                # LIKE only on exceptions, not on empty results, so the index
+                # must be repopulated here — do so whenever symbol rows exist
+                # but the FTS index holds no documents.  (COUNT(*) on the FTS
+                # table itself reads its CONTENT table, so the index size
+                # must come from the docsize shadow table.)
+                fts_docs = conn.execute(text("SELECT COUNT(*) FROM symbols_fts_docsize")).scalar()
+                sym_count = conn.execute(text("SELECT COUNT(*) FROM symbols")).scalar()
+                if fts_docs == 0 and sym_count > 0:
+                    log.info(f"symbol DB heal: rebuilding empty symbols_fts ({sym_count} rows)")
+                    conn.execute(text("INSERT INTO symbols_fts(symbols_fts) VALUES ('rebuild')"))
+                    conn.commit()
+            except Exception as exc:
+                log.warning(f"symbols_fts heal failed: {exc}")
+
     # ------------------------------------------------------------------
     # Public API — state query (used by SymbolIndexManager for sync)
     # ------------------------------------------------------------------

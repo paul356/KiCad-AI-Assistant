@@ -480,6 +480,64 @@ class TestProjectScopeMigration:
         finally:
             d.close()
 
+    def test_v2_db_without_fts_heals_empty_index_on_open(self, tmp_path):
+        """A v2 DB built by an FTS5-less build has symbol rows but no
+        symbols_fts: the in-migration 'rebuild' fails harmlessly, the DDL
+        loop then creates an EMPTY index, and the heal repopulates it — so
+        search() returns rows without waiting for a row rewrite."""
+        import sqlite3
+
+        db_path = tmp_path / "nofts.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.executescript(
+            """
+            CREATE TABLE libraries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                library_name VARCHAR NOT NULL,
+                file_path VARCHAR NOT NULL UNIQUE,
+                file_size INTEGER NOT NULL DEFAULT 0,
+                mtime FLOAT NOT NULL DEFAULT 0.0,
+                checksum VARCHAR NOT NULL DEFAULT '',
+                symbol_count INTEGER NOT NULL DEFAULT 0,
+                last_indexed FLOAT NOT NULL DEFAULT 0.0,
+                kicad_version VARCHAR NOT NULL DEFAULT '',
+                project VARCHAR NOT NULL DEFAULT '');
+            CREATE TABLE symbols (
+                library_name VARCHAR NOT NULL,
+                symbol_name VARCHAR NOT NULL,
+                library_id INTEGER NOT NULL,
+                description VARCHAR NOT NULL DEFAULT '',
+                keywords VARCHAR NOT NULL DEFAULT '',
+                pin_count INTEGER NOT NULL DEFAULT 0,
+                file_index INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (library_name, symbol_name));
+            INSERT INTO libraries (library_name, file_path, symbol_count)
+            VALUES ('OldLib', '/old.kicad_sym', 2);
+            INSERT INTO symbols (library_name, symbol_name, library_id, description, keywords, pin_count, file_index)
+            VALUES ('OldLib', 'R', 1, 'Resistor', 'res', 2, 0),
+                   ('OldLib', 'C', 1, 'Capacitor', 'cap', 2, 1);
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        d = SymbolDatabase(str(db_path))
+        try:
+            # The v2 → v3 PK migration ran; search must find the rows via
+            # the healed FTS index (not the LIKE fallback, which only fires
+            # on exceptions, never on empty results).
+            results = d.search("Resistor")
+            assert any(r.symbol_name == "R" for r in results)
+            assert {s.symbol_name for s in d.get_library_symbols("OldLib")} == {"R", "C"}
+        finally:
+            d.close()
+
+        conn = sqlite3.connect(str(db_path))
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        assert "symbols_fts" in tables
+        assert conn.execute("SELECT COUNT(*) FROM symbols_fts").fetchone()[0] == 2
+        conn.close()
+
 
 class TestProjectScope:
     def _populate(self, db):
