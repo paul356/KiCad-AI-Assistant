@@ -163,7 +163,7 @@ def _find_free_area_impl(
             from kcaa.tools.symbol_edit_tools import _get_index_manager
             from kcaa.utils.symbol_extractor import extract_lib_symbol_raw
 
-            mgr = _get_index_manager()
+            mgr = _get_index_manager(schematic_path)
             lib_rec = mgr.get_library_by_name(for_library)
             if lib_rec is None:
                 return {"error": f"Library '{for_library}' not found in index"}
