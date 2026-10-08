@@ -355,7 +355,13 @@ def register_symbol_tools(mcp: FastMCP) -> None:
             project_path: Optional path to a project directory or a file
                 inside it (e.g. the schematic).  Global plus that project's
                 libraries are searched; other projects' libraries are never
-                shown.  Omit for global libraries only.
+                shown.  Omit for global libraries only.  Within a project
+                scope, a same-nickname global+project library pair
+                enumerates as BOTH rows (union scope): a search can return
+                the same ``library_name`` twice, with each row's symbols.
+                Single-library lookups (``get_symbol``,
+                ``get_library_symbols``) instead resolve such a pair to the
+                project row (shadow).
             limit: Maximum number of results to return (default 50).
 
         Returns:
@@ -418,7 +424,12 @@ def register_symbol_tools(mcp: FastMCP) -> None:
             project_path: Optional path to a project directory or a file
                 inside it (e.g. the schematic).  The lookup is scoped to
                 global plus that project's libraries; other projects'
-                libraries are never matched.  Omit for global only.
+                libraries are never matched.  Omit for global only.  Within
+                a project scope, a same-nickname global+project library
+                pair resolves to the PROJECT row (shadow) — the global
+                row's symbols are not merged.  Enumeration/search tools
+                (``search_symbols``, ``list_symbol_libraries``) instead show
+                such a pair as both rows (union).
         """
         try:
             mgr = _get_index_manager(project_path)
@@ -478,7 +489,12 @@ def register_symbol_tools(mcp: FastMCP) -> None:
             project_path: Optional path to a project directory or a file
                 inside it (e.g. the schematic).  Global plus that project's
                 libraries are listed; other projects' libraries are never
-                shown.  Omit for global libraries only.
+                shown.  Omit for global libraries only.  Within a project
+                scope, a same-nickname global+project library pair lists as
+                BOTH rows (union scope) — the nickname can appear twice.
+                Single-library lookups (``get_symbol``,
+                ``get_library_symbols``) instead resolve such a pair to the
+                project row (shadow).
         """
         try:
             limit = min(max(1, limit), 500)
@@ -561,7 +577,12 @@ def register_symbol_tools(mcp: FastMCP) -> None:
             project_path: Optional path to a project directory or a file
                 inside it (e.g. the schematic).  The library is looked up in
                 global plus that project's scope; other projects' libraries
-                are never matched.  Omit for global only.
+                are never matched.  Omit for global only.  Within a project
+                scope, a same-nickname global+project library pair resolves
+                to the PROJECT row (shadow) — the global row's symbols are
+                not merged.  Enumeration/search tools (``search_symbols``,
+                ``list_symbol_libraries``) instead show such a pair as both
+                rows (union).
         """
         try:
             limit = min(max(1, limit), 200)
@@ -610,7 +631,9 @@ def register_symbol_tools(mcp: FastMCP) -> None:
             project_path: Optional path to a project directory or a file
                 inside it.  Counts cover global plus that project's
                 libraries; other projects' rows are excluded.  Omit for the
-                global scope only.
+                global scope only.  Within a project scope, a same-nickname
+                global+project library pair is counted as TWO rows (union
+                scope).
         """
         try:
             mgr = _get_index_manager(project_path)
@@ -661,7 +684,9 @@ def register_symbol_tools(mcp: FastMCP) -> None:
             project_path: Optional path to a project directory or a file
                 inside it (e.g. the schematic).  The library is looked up in
                 global plus that project's scope; other projects' libraries
-                are never matched.  Omit for global only.
+                are never matched.  Omit for global only.  Within a project
+                scope, a same-nickname global+project library pair resolves
+                to the PROJECT row (shadow), like ``get_symbol``.
 
         Returns:
             dict with keys: success, library_name, symbol_name, pin_count,
