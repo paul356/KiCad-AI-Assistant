@@ -161,7 +161,7 @@ def render_route_attempt(
         ymin = min(ymin, min(ys_ovl) - 2.0)
         xmax = max(xmax, max(xs_ovl) + 2.0)
         ymax = max(ymax, max(ys_ovl) + 2.0)
-    fig, ax, eff_dpi = _new_board_figure(xmin, ymin, xmax, ymax, dpi)
+    fig, ax, eff_dpi, _mm_per_px = _new_board_figure(xmin, ymin, xmax, ymax, dpi)
 
     _draw_board_layers(ax, board, layer=None, show_pad_labels=False)
 

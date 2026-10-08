@@ -764,6 +764,8 @@ class TestExportPcbLayerImageVisionGate:
         pytest.importorskip("fastmcp")
         from fastmcp import FastMCP
 
+        from kcaa.tools.render_board_tools import register_render_board_tools
+
         mcp = FastMCP(name="test-render")
         register_render_board_tools(mcp)
         return mcp
