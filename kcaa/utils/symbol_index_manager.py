@@ -476,7 +476,7 @@ class SymbolIndexManager:
             return []
         elements = library_file.symbol
         # Could be a single ParsedValue, a plain list, or an ElementCollection.
-        if isinstance(elements, (list, skip.collection.ElementCollection)):
+        if isinstance(elements, list | skip.collection.ElementCollection):
             return elements
         return [elements]
 
@@ -554,6 +554,11 @@ class SymbolIndexManager:
         return [
             f"{s.library_name}:{s.symbol_name}" for s in self._db.get_all_symbols(self._project_id)
         ]
+
+    def get_all_symbol_pairs(self) -> set[tuple[str, str]]:
+        """Return every indexed ``(library_name, symbol_name)`` pair, scoped
+        to the manager's project (global + project libraries)."""
+        return self._db.get_all_symbol_pairs(self._project_id)
 
     def get_all_libraries(self) -> list[LibraryRecord]:
         """Return all indexed library records, scoped to the manager's

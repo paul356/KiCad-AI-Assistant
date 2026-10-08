@@ -580,6 +580,26 @@ class SymbolDatabase:
             )
         return [self._orm_to_symbol(r) for r in rows]
 
+    def get_all_symbol_pairs(self, project: str | None = None) -> set[tuple[str, str]]:
+        """Return every ``(library_name, symbol_name)`` pair indexed in
+        *project* scope (global plus project libraries when given; everything
+        when ``None``).
+
+        Union scope: same-nickname global and project rows both appear
+        (mirrors ``FootprintDatabase.get_all_library_footprints``).  KiCad 10
+        symdir libraries are indexed as ``<nickname>/<file-stem>`` rows, so a
+        schematic ``X:Y`` resolves via either ``(X, Y)`` (file-type library)
+        or ``(X/Y, Y)`` (symdir file).
+        """
+        q = select(_SymbolRow.library_name, _SymbolRow.symbol_name).join(
+            _LibraryRow, _SymbolRow.library_id == _LibraryRow.id
+        )
+        clause = self._project_scope_clause(project)
+        if clause is not None:
+            q = q.where(clause)
+        with self._Session() as session:
+            return set(session.execute(q).all())
+
     def get_all_libraries(self, project: str | None = None) -> list[LibraryRecord]:
         """Return indexed library records scoped to *project* (global plus
         project libraries when given; everything when ``None``), ordered

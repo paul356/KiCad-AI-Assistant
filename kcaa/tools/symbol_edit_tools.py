@@ -4,6 +4,7 @@ Provides tools to add symbols to KiCad schematics by combining
 the symbol index DB, the streaming extractor, and the skip library.
 """
 
+import asyncio
 import contextlib
 import copy
 import logging
@@ -623,6 +624,24 @@ def _do_delete_symbol_library(
     }
 
 
+def _parse_available_symbols(uri: str) -> set[str]:
+    """Return the symbol names available at *uri* (a .kicad_sym file or a
+    KiCad 10 symdir directory of .kicad_sym files).
+
+    Directory-type libraries aggregate every ``.kicad_sym`` file under the
+    bare nickname so lookup by lib_id's library part (always "Nickname", see
+    lib_id assembly below) hits correctly.
+    """
+    names: set[str] = set()
+    if os.path.isdir(uri):
+        for fname in sorted(os.listdir(uri)):
+            if fname.endswith(".kicad_sym"):
+                names.update(list_library_symbols(os.path.join(uri, fname)))
+    elif os.path.isfile(uri):
+        names.update(list_library_symbols(uri))
+    return names
+
+
 def _do_find_symbols_not_in_libraries(schematic_path: str) -> dict[str, Any]:
     """List schematic symbols whose library definition exists in no indexed
     symbol library.
@@ -660,41 +679,87 @@ def _do_find_symbols_not_in_libraries(schematic_path: str) -> dict[str, Any]:
     if not instances:
         return {"missing": [], "missing_count": 0}
 
-    # Available libraries: nickname + resolved path (project tables first).
-    libs = build_effective_symbol_library_list(project_path=schematic_path)
-    available: dict[str, set[str]] = {}
-    for lib in libs:
-        nickname = lib["nickname"]
-        uri = lib.get("uri", "")
-        if not uri:
-            continue
-        if os.path.isdir(uri):
-            # Directory-type (KiCad 10 symdir) libraries: every .kicad_sym
-            # file inside is a symbol of the SAME nickname.  Aggregate all of
-            # them under the bare nickname so lookup by lib_id's library part
-            # (always "Nickname", see lib_id assembly below) hits correctly.
-            for fname in sorted(os.listdir(uri)):
-                if fname.endswith(".kicad_sym"):
-                    for sym in list_library_symbols(os.path.join(uri, fname)):
-                        available.setdefault(nickname, set()).add(sym)
-        elif os.path.isfile(uri):
-            for sym in list_library_symbols(uri):
-                available.setdefault(nickname, set()).add(sym)
+    # Preferred source of truth: the symbol index database — but only when
+    # the current project's sync has actually completed.  Trusting a sync
+    # that is still running, failed, or finished for a different project
+    # would wrongly report symbols missing; when in doubt, live-scan instead.
+    # Mirrors ``pcb_library_tools._collect_existing_footprints``.
+    from kcaa.tools.symbol_tools import _sync_lock, _sync_state
+
+    pairs: set[tuple[str, str]] | None = None
+    try:
+        with _sync_lock:
+            running = _sync_state.running
+            last_result = _sync_state.last_result
+            last_project = _sync_state.last_project_path
+        if not (
+            running
+            or not last_result
+            or not last_result.get("success")
+            or last_project != _project_dir_of(schematic_path)
+        ):
+            pairs = _get_index_manager(schematic_path).get_all_symbol_pairs()
+    except Exception as exc:
+        log.warning("Symbol index read failed (%s) — falling back to live scan", exc)
+        pairs = None
 
     missing: list[dict[str, Any]] = []
     merged: dict[tuple[str, str], dict[str, Any]] = {}
-    for lib_id, ref in instances:
-        library, _, name = lib_id.partition(":")
-        if not library or not name:
-            continue
-        if library in available and name in available[library]:
-            continue
-        key = (library, name)
-        entry = merged.get(key)
-        if entry is None:
-            entry = {"name": name, "library": library, "references": []}
-            merged[key] = entry
-        entry["references"].append(ref)
+
+    if pairs is not None:
+        # Index DB is authoritative.  A lib_id ``X:Y`` resolves when either
+        # the file-type row ``(X, Y)`` exists, or the KiCad 10 symdir row
+        # ``(X/Y, Y)`` exists (nickname directory contains ``Y.kicad_sym``).
+        # Union scope — same-nickname global and project rows both match,
+        # deliberately NOT applying shadow semantics (footprint side does the
+        # same).  Each query is microsecond-fast versus the old live parse of
+        # every registered library (~60s, which stalled the whole MCP server).
+        for lib_id, ref in instances:
+            library, _, name = lib_id.partition(":")
+            if not library or not name:
+                continue
+            if (library, name) in pairs or (f"{library}/{name}", name) in pairs:
+                continue
+            key = (library, name)
+            entry = merged.get(key)
+            if entry is None:
+                entry = {"name": name, "library": library, "references": []}
+                merged[key] = entry
+            entry["references"].append(ref)
+    else:
+        # Live fallback: parse ONLY the libraries the schematic actually
+        # references.  Parsing every registered library (system +
+        # 3rd-party) means reading tens of thousands of .kicad_sym files
+        # per call (~60s on a stock KiCad install), which stalls the MCP
+        # server far past the client's request timeout.  A symbol can only
+        # be "found" in a library its lib_id names, so the referenced
+        # subset yields exactly the same missing set.
+        libs = build_effective_symbol_library_list(project_path=schematic_path)
+        lib_lookup = {lib["nickname"]: lib.get("uri", "") for lib in libs}
+        available: dict[str, set[str]] = {}
+        for library in {lib_id.partition(":")[0] for lib_id, _ in instances}:
+            if not library:
+                continue
+            uri = lib_lookup.get(library, "")
+            if not uri:
+                # Library not registered anywhere -> every symbol from it is
+                # missing; nothing to parse.
+                continue
+            if library not in available:
+                available[library] = _parse_available_symbols(uri)
+        for lib_id, ref in instances:
+            library, _, name = lib_id.partition(":")
+            if not library or not name:
+                continue
+            if library in available and name in available[library]:
+                continue
+            key = (library, name)
+            entry = merged.get(key)
+            if entry is None:
+                entry = {"name": name, "library": library, "references": []}
+                merged[key] = entry
+            entry["references"].append(ref)
+
     for entry in merged.values():
         entry["reference_count"] = len(entry["references"])
         missing.append(entry)
@@ -2552,7 +2617,9 @@ def register_symbol_edit_tools(mcp: FastMCP) -> None:
             dict with keys: missing (list of dicts with name, library,
             references, reference_count), missing_count.
         """
-        return _do_find_symbols_not_in_libraries(schematic_path=schematic_path)
+        return await asyncio.to_thread(
+            _do_find_symbols_not_in_libraries, schematic_path=schematic_path
+        )
 
     @mcp.tool()
     async def remove_symbols_from_library(

@@ -93,6 +93,7 @@ class _SyncState:
     current_library: str = ""
     last_result: dict | None = None
     error: str | None = None
+    last_project_path: str | None = None
 
 
 _sync_state = _SyncState()
@@ -111,6 +112,9 @@ def _run_sync_in_background(force: bool, project_path: str | None = None) -> Non
             _sync_state.current = current
             _sync_state.total = total
             _sync_state.current_library = library_name
+
+    with _sync_lock:
+        _sync_state.last_project_path = _project_dir_of(project_path)
 
     try:
         mgr = _get_index_manager(project_path)

@@ -326,6 +326,80 @@ class TestFindSymbolsNotInLibraries:
         assert ("Device", "R_Small") not in names
         assert ("Device", "C") not in names
 
+    def test_uses_index_after_completed_sync_even_if_dir_gone(
+        self, tools, env, tmp_sch, monkeypatch
+    ):
+        """After a completed sync for this project, the index DB is
+        authoritative: an indexed symbol is NOT missing even when its library
+        directory is no longer live-scannable.  A partial/stale sync must not
+        be trusted (the live fallback covers that — see the other tests).
+
+        Mirrors the footprint-side
+        ``test_uses_index_after_completed_sync_even_if_dir_gone``.
+        """
+        import kcaa.tools.symbol_tools as sym_tools
+        from kcaa.utils.sym_lib_table_utils import register_library_in_table
+        from kcaa.utils.symbol_index_manager import SymbolIndexManager, _project_dir_of
+        from kcaa.utils.symbol_index_reader import SymbolIndexReader
+
+        # Route the background sync at the same isolated index DB the tool
+        # queries.  The sync manager needs a reader that sees the *project*
+        # table (the env fixture's manager reads only the global table), so
+        # build one pinned to the project dir; both managers share the same
+        # temp DB file.
+        project_dir = _project_dir_of(tmp_sch)
+        sync_mgr = SymbolIndexManager(
+            SymbolIndexReader(project_dir=project_dir),
+            db_path=os.path.join(env["tmp_path"], "symbol_test.db"),
+        )
+        monkeypatch.setattr(
+            "kcaa.tools.symbol_tools._get_index_manager", lambda project_path=None: sync_mgr
+        )
+
+        # Registered directory-type library "Device" containing only R_Small
+        # (the fixture schematic references Device:R_Small and Device:C).
+        device_dir = os.path.join(env["tmp_path"], "DeviceLib")
+        os.makedirs(device_dir, exist_ok=True)
+        Path(os.path.join(device_dir, "R_Small.kicad_sym")).write_text(
+            "(kicad_symbol_lib\n"
+            "  (version 20220914)\n"
+            '  (symbol "R_Small"\n'
+            "    (in_bom yes)\n"
+            "    (on_board yes)\n"
+            "  )\n"
+            ")\n"
+        )
+        reg = register_library_in_table(
+            os.path.join(env["tmp_path"], "sym-lib-table"),
+            "Device",
+            device_dir,
+            "directory-type test lib",
+        )
+        assert reg["registered"] is True, reg
+
+        # Run a real background sync scoped to this schematic, and wait for it.
+        with sym_tools._sync_lock:
+            sym_tools._sync_state.last_result = None
+            sym_tools._sync_state.error = None
+            sym_tools._sync_state.last_project_path = None
+        sym_tools._run_sync_in_background(True, tmp_sch)
+        with sym_tools._sync_lock:
+            assert sym_tools._sync_state.last_result is not None
+            assert sym_tools._sync_state.last_result["success"] is True
+            assert sym_tools._sync_state.last_project_path == _project_dir_of(tmp_sch)
+
+        # Library directory gone — the live path can no longer see R_Small;
+        # only the (now-trusted) index can.
+        shutil.rmtree(device_dir)
+        assert not os.path.isdir(device_dir)
+
+        result = _run(tools["find_symbols_not_in_libraries"], schematic_path=tmp_sch)
+        assert "error" not in result, result
+        names = {(m["library"], m["name"]) for m in result["missing"]}
+        assert ("Device", "R_Small") not in names  # indexed -> exists
+        assert ("Device", "C") in names  # never indexed -> missing
+        assert result["missing_count"] == 1
+
 
 # ---------------------------------------------------------------------------
 # remove_symbols_from_library
