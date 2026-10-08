@@ -62,6 +62,7 @@ _MANDATORY_SOURCES: frozenset[str] = frozenset(
         "pcb_library_tools.py",
         "pcb_zone_tools.py",
         "drc_tools.py",
+        "erc_tools.py",
         "no_connect_tools.py",
     }
 )

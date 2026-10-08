@@ -260,6 +260,7 @@ kcaa
 |------|-------------|
 | `extract_schematic_netlist` | Extract netlist from a schematic |
 | `find_component_connections` | Find all connections for a component |
+| `run_erc` | Run Electrical Rules Check (headless `kicad-cli`) and return violations |
 | `identify_circuit_patterns` | Identify common circuit patterns |
 | `validate_project` | Basic validation of a KiCad project |
 | `validate_project_boundaries` | Validate component boundaries |
