@@ -961,7 +961,7 @@ def _do_add_symbol(
         lib_id_str = f"{table_name}:{symbol_name}"
         effective_value = value or symbol_name
 
-        mgr = _get_index_manager()
+        mgr = _get_index_manager(schematic_path)
         lib_rec = mgr.get_library_by_name(library_name)
         if lib_rec is None:
             return {
@@ -993,7 +993,9 @@ def _do_add_symbol(
 
         # Expand (extends ...) symbols into self-contained definitions so that
         # the injected lib_symbol has full geometry and pin sub-symbols.
-        lib_sym_raw = _resolve_extends_symbol(lib_sym_raw, library_name)
+        lib_sym_raw = _resolve_extends_symbol(
+            lib_sym_raw, library_name, project_path=schematic_path
+        )
 
         try:
             sch = safe_schematic(schematic_path)
@@ -1667,7 +1669,9 @@ def _get_extends_base_name(lib_sym_raw: list) -> str | None:
     return None
 
 
-def _resolve_extends_symbol(lib_sym_raw: list, library_name: str) -> list:
+def _resolve_extends_symbol(
+    lib_sym_raw: list, library_name: str, project_path: str | None = None
+) -> list:
     """Resolve an ``(extends ...)`` lib symbol into a fully self-contained definition.
 
     KiCad's ``.kicad_symdir`` format stores variant symbols (e.g.
@@ -1692,6 +1696,11 @@ def _resolve_extends_symbol(lib_sym_raw: list, library_name: str) -> list:
 
     Returns *lib_sym_raw* unchanged if no ``(extends ...)`` clause is present
     or if the base symbol cannot be resolved (a warning is logged).
+
+    Args:
+        project_path: Optional project directory or file inside one, used to
+            scope the index lookup so base symbols in project-local
+            libraries resolve.
     """
     base_name = _get_extends_base_name(lib_sym_raw)
     if base_name is None:
@@ -1704,7 +1713,7 @@ def _resolve_extends_symbol(lib_sym_raw: list, library_name: str) -> list:
     parts = library_name.split("/", 1)
     base_lib_name = f"{parts[0]}/{base_name}" if len(parts) >= 2 else library_name
 
-    mgr = _get_index_manager()
+    mgr = _get_index_manager(project_path)
     base_sym_rec = mgr.get_symbol(base_lib_name, base_name)
     base_lib_rec = mgr.get_library_by_name(base_lib_name)
 
@@ -2240,6 +2249,9 @@ def register_symbol_edit_tools(mcp: FastMCP) -> None:
         Looks up the symbol in the index database, extracts its definition
         from the library file, injects it into the schematic's lib_symbols
         block, and inserts a placed instance for every unit of the symbol.
+        The library is resolved scoped to the target schematic's project
+        (project sym-lib-table libraries included), matching how
+        ``search_symbols`` reports them.
         Coordinates are mm in KiCad screen convention (**+Y is down**) and
         are auto-snapped to the 1.27 mm (50-mil) grid so pins land on KiCad's
         standard schematic grid and wires can connect to them. A backup
@@ -2438,7 +2450,7 @@ def register_symbol_edit_tools(mcp: FastMCP) -> None:
 
         # We need the new symbol's lib bbox to centre it correctly.
         try:
-            mgr = _get_index_manager()
+            mgr = _get_index_manager(schematic_path)
             lib_rec = mgr.get_library_by_name(library_name)
             if lib_rec is None:
                 return {"error": f"Library '{library_name}' not found in index"}
