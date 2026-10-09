@@ -241,11 +241,32 @@ def route_engine(
         node = ObstacleNode(walk_obstacles)
         walked: list[tuple[float, float]] | None = None
         walk_err: PnsFailure | None = None
-        try:
-            walked = _walkaround_solids(skeleton, node, track_width, clearance, frames=frames)
-        except PnsFailure as exc:
-            walk_err = exc
-            walked = None
+        # Lane-first: when the direct line itself is genuinely blocked
+        # (its copper would violate clearance — the same test walkaround
+        # uses before detouring), prefer the shortest fully-clear
+        # straight lane offset from it over per-obstacle walkaround,
+        # which snakes through the row.  A boundary-clean direct line
+        # (copper exactly at clearance) is not blocked — it stays the
+        # clean direct line, so lane search must not replace it with an
+        # offset stub pair.
+        nearest_hit = node.nearest([start, end], dfence=clearance + track_width / 2.0)
+        direct_blocked = nearest_hit is not None and (
+            LineString([start, end])
+            .buffer(track_width / 2.0, cap_style="round")
+            .distance(nearest_hit.obstacle.shape)
+            < clearance - 1e-9
+        )
+        lane = (
+            _try_parallel_lane(start, end, node, track_width, clearance) if direct_blocked else None
+        )
+        if lane is not None:
+            walked = lane
+        else:
+            try:
+                walked = _walkaround_solids(skeleton, node, track_width, clearance, frames=frames)
+            except PnsFailure as exc:
+                walk_err = exc
+                walked = None
 
         # Optimization 1 — shove-first fallback.  KiCad's SHOVE
         # semantics: when walkaround cannot find a detour, do not give
@@ -1022,6 +1043,69 @@ def _audit_final_copper(
                     f"final DRC audit: {label} comes within {d:.4f} mm of "
                     f"{other_desc} (needs {clearance} mm clearance)"
                 )
+
+
+def _try_parallel_lane(
+    start: tuple[float, float],
+    end: tuple[float, float],
+    node: ObstacleNode,
+    track_width: float,
+    clearance: float,
+    max_offset: float = 4.0,
+    step: float = 0.4,
+) -> list[tuple[float, float]] | None:
+    """Try a DRC-clean straight lane offset from the direct line.
+
+    When the direct line brushes a row of solids (a THT pad column, a
+    keepout strip), per-obstacle walkaround snakes through the row even
+    when a parallel lane a few tenths of a millimetre off to the side is
+    completely clear.  Prefer that lane: shift the whole line by the
+    smallest worked offset along its normal and emit
+    ``[start, start+off, end+off, end]`` — a straight hug instead of a
+    zig-zag.
+
+    Returns the shortest clean lane (smallest ``|off|``) or ``None``
+    when no tested offset keeps ``clearance`` edge-to-edge from every
+    obstacle.  Offsets are tried from ``step`` outward in both normal
+    directions, so the chosen lane hugs the requested line as closely as
+    possible.
+    """
+    dx = end[0] - start[0]
+    dy = end[1] - start[1]
+    length = math.hypot(dx, dy)
+    if length < 1e-9:
+        return None
+    ux, uy = dx / length, dy / length
+    nx, ny = -uy, ux  # unit normal to the direct line
+    margin = clearance + track_width / 2.0
+
+    # Whole-line clearance check: every segment of the candidate three-
+    # segment polyline ([start, s2] normal stub, [s2, e2] parallel lane,
+    # [e2, end] normal stub) must keep the margin from all solids.
+    def _lane_clear(s2: tuple[float, float], e2: tuple[float, float]) -> bool:
+        lane = LineString([start, s2, e2, end])
+        for o in node.obstacles():
+            if o.shape is None or o.shape.is_empty:
+                continue
+            if float(o.shape.distance(lane)) < margin - 1e-9:
+                return False
+        return True
+
+    hops = int(math.ceil(max_offset / step))
+    best: list[tuple[float, float]] | None = None
+    best_mag = math.inf
+    for i in range(1, hops + 1):
+        for sign in (1.0, -1.0):
+            off = sign * i * step
+            s2 = (start[0] + nx * off, start[1] + ny * off)
+            e2 = (end[0] + nx * off, end[1] + ny * off)
+            if not _lane_clear(s2, e2):
+                continue
+            mag = abs(off)
+            if mag < best_mag:
+                best_mag = mag
+                best = [start, s2, e2, end]
+    return best
 
 
 def _walkaround_solids(

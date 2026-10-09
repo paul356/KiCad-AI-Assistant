@@ -2961,6 +2961,79 @@ def test_waypoints_chain_fillet_drc_shrinks_falls_back(tmp_path: Path) -> None:
         assert ang >= 170.0 - 1e-6, f"filleted chain has a corner of {ang:.1f} deg at {p1}"
 
 
+def test_pns_parallel_lane_preferred_over_snake_detour(tmp_path: Path) -> None:
+    """A direct line that brushes a solid row uses the shortest clean
+    parallel lane instead of per-obstacle walkaround (a snake through
+    the row).
+
+    The board forces the case the lane-first pass exists for: R1 -> C1
+    is a straight vertical run whose centerline crosses three GND pads
+    stacked on top of each other.  Walkaround would bump the line around
+    every pad hull (a long zig-zag hugging the row); the lane pass
+    instead shifts the whole line sideways by the smallest offset whose
+    parallel run is fully clear, emitting one straight vertical segment
+    off to the side."""
+    from shapely.geometry import LineString, box
+
+    pcb_path = Path(_make_clear_board(tmp_path))
+    text = pcb_path.read_text()
+    text = text.replace('\t(net 1 "VCC")\n', '\t(net 1 "VCC")\n\t(net 2 "GND")\n')
+    # Move C1 to (30, 60) and R1's pad to the footprint origin so the
+    # net runs straight up the x=30 column.
+    text = text.replace("(at 60.0 40.0 0.0)", "(at 30.0 60.0 0.0)")
+    text = text.replace(
+        '\t\t(pad "1" smd rect\n\t\t\t(at 0.0 -0.5)\n',
+        '\t\t(pad "1" smd rect\n\t\t\t(at 0.0 0.0)\n',
+    )
+    blocker_rows = "".join(
+        '\t(footprint "user_add:blk"\n'
+        '\t\t(layer "F.Cu")\n'
+        f"\t\t(at 30.0 {y} 0.0)\n"
+        f'\t\t(property "Reference" "X{i}")\n'
+        '\t\t(pad "1" smd rect\n'
+        "\t\t\t(at 0.0 0.0)\n"
+        "\t\t\t(size 0.8 0.8)\n"
+        '\t\t\t(layers "F.Cu" "F.Mask")\n'
+        '\t\t\t(net 2 "GND")\n'
+        "\t\t)\n"
+        "\t)\n"
+        for i, y in enumerate((40.0, 45.0, 50.0), start=1)
+    )
+    text = text.rstrip()[:-1] + blocker_rows + ")\n"
+    pcb_path.write_text(text)
+    result = _route_clear(
+        {
+            "ref_a": "R1",
+            "pad_a": "1",
+            "ref_b": "C1",
+            "pad_b": "1",
+            "corner_mode": "mitered45",
+        },
+        tmp_path,
+    )
+    # The route must not snake through the three-pad row: the lane pass
+    # emits one straight offset run (2 segments) plus the two normal
+    # stubs, and no pad-hull bumps ever occur.
+    assert len(result.segments) <= 4, (
+        f"expected a straight lane, got {len(result.segments)} segments"
+    )
+    # The straight run sits clear of every blocker: one segment spans
+    # most of the column at x > 30.5 (the row blocks x=30; the lane
+    # clears it with the 0.3 margin).
+    row = [box(29.6, y - 0.4, 30.4, y + 0.4) for y in (40.0, 45.0, 50.0)]
+    margin = 0.3  # clearance (0.2) + half track width (0.1)
+    lanes = [
+        (s.x1, s.y1, s.x2, s.y2)
+        for s in result.segments
+        if min(abs(x - 30.0) for x in (s.x1, s.x2)) > 0.3
+    ]
+    assert lanes, "no segment leaves the blocked x=30 column to a side lane"
+    for x1, y1, x2, y2 in lanes:
+        assert LineString([(x1, y1), (x2, y2)]).distance(row[0] | row[1] | row[2]) >= (
+            margin - 1e-3
+        ), "lane segment violates the clearance margin"
+
+
 # ---------------------------------------------------------------------------
 # W3 — PNS candidates (multi-variant routes) + A* failure evidence
 # ---------------------------------------------------------------------------
