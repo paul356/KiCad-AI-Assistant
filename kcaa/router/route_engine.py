@@ -18,7 +18,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 import math
 
-from shapely.geometry import LineString, Polygon
+from shapely.geometry import LineString, Point, Polygon
 from shapely.strtree import STRtree
 
 from kcaa.router.pns.direction45 import ArcSeg, CornerMode, Trace, build_initial_trace
@@ -66,6 +66,13 @@ class PnsFailure(RuntimeError):
     displacements successfully completed *before* the failure — the
     caller (router) dumps these so the failure state is inspectable in
     the viz pipeline.
+
+    ``frames`` optionally carries the *process* leading to the failure:
+    one entry per walkaround iteration / shove hit / promote round, each
+    ``{"stage": str, "path": [...], "hit": str|None, "note": str}``.
+    Router dumps each frame as its own viz stage (``fail-pns-000``,
+    ``fail-pns-001``, ...) so the failure is rendered as a sequence,
+    not a single snapshot.
     """
 
     def __init__(
@@ -75,11 +82,13 @@ class PnsFailure(RuntimeError):
         last_path: list[tuple[float, float]] | None = None,
         last_hit: str | None = None,
         shoved_pairs: list[tuple[TrackObstacle, TrackObstacle]] | None = None,
+        frames: list[dict] | None = None,
     ):
         super().__init__(message)
         self.last_path = last_path
         self.last_hit = last_hit
         self.shoved_pairs = shoved_pairs if shoved_pairs is not None else []
+        self.frames = frames if frames is not None else []
 
 
 @dataclass
@@ -186,15 +195,7 @@ def route_engine(
         movable.append(track)
         movable_shapes.append(obs)
 
-    # Movable tracks are shove candidates only when shoving is enabled
-    # (``max_shove_depth != 0``); the walkaround-only strategy treats
-    # every track as a fixed solid and routes around it — DRC-clean, but
-    # the track is never displaced.
     shove_enabled = max_shove_depth != 0
-    walk_obstacles = (
-        obstacles if not shove_enabled else [o for o in obstacles if o not in movable_shapes]
-    )
-    node = ObstacleNode(walk_obstacles)
     # Placement stages work on clearance + CLEARANCE_EPS so the final
     # geometry is *strictly* clear; the audit below re-checks against the
     # true clearance.  The walkaround applies the epsilon to its hull
@@ -202,115 +203,223 @@ def route_engine(
     # ``_walkaround_solids``); the shove stage below keeps using
     # ``place_clearance``.
     place_clearance = clearance + CLEARANCE_EPS
-    walked: list[tuple[float, float]] | None = None
-    walk_err: PnsFailure | None = None
-    try:
-        walked = _walkaround_solids(skeleton, node, track_width, clearance)
-    except PnsFailure as exc:
-        walk_err = exc
-        walked = None
-
-    # Optimization 1 — shove-first fallback.  KiCad's SHOVE semantics:
-    # when walkaround cannot find a detour, do not give up — let the
-    # line run straight and *push* the movable tracks that block it
-    # (chain propagation, each pushed track kept clear of fixed solids).
-    # After the push, the current line may still cross fixed copper, so
-    # walkaround is retried.  Two honest limits:
-    #   * the retry starts from the failure state (``walk_err.last_path``
-    #     — the oscillation's last line, not the plain skeleton), so it
-    #     is a genuinely different initial condition, and
-    #   * a pure fixed-solid lockup (e.g. p7→J1/12's pad ↔ sub-width-
-    #     track oscillation) cannot be opened by shove — fixed solids
-    #     are never displaced — but the attempt is made explicitly and
-    #     BOTH stages' intermediate state is carried to the caller for
-    #     the viz dump.  A space competition in which movable tracks
-    #     are part of the blockage is resolved here.
-    shove_done = False
-    if walked is None and movable and shove_enabled:
-        shove_done = True
-        seed = list(walk_err.last_path) if walk_err.last_path else list(skeleton)
-        try:
-            first: ShoveResult = shove_path(
-                seed,
-                movable,
-                width=track_width,
-                clearance=place_clearance,
-                max_depth=MAX_SHOVE_DEPTH if max_shove_depth is None else max_shove_depth,
-                fixed_obstacles=[*walk_obstacles, *extra_fixed],
+    # Tracks that the shove cannot move are promoted to fixed solids and
+    # the pass is retried — KiCad's semantics: shove what can be shoved,
+    # walk around the rest.  Every promotion pins at least one track, so
+    # the loop terminates (a track whose endpoint sits on its pad, e.g.
+    # the first p7→J1/12 segment at U11/p7, has no legal displacement).
+    promoted: set[int] = set()
+    out_path: list[tuple[float, float]] | None = None
+    pushed: list[TrackObstacle] = []
+    moved_pairs: list[tuple[TrackObstacle, TrackObstacle]] = []
+    movable_active: list[TrackObstacle] = []
+    # Failure-process trace: one frame per walkaround iteration / shove
+    # hit / promote round so the failure dumps (and renders) as a
+    # sequence, with the hit track's fixed endpoints marked.
+    frames: list[dict] = []
+    while True:
+        movable_active = [t for i, t in enumerate(movable) if i not in promoted]
+        movable_shapes_active = [s for i, s in enumerate(movable_shapes) if i not in promoted]
+        if promoted:
+            frames.append(
+                {
+                    "stage": f"promote-round-{len(frames):02d}",
+                    "path": list(out_path if out_path is not None else skeleton),
+                    "hit": f"pinned {len(promoted)} movable track segment(s) as fixed",
+                    "note": f"promoted segments: {sorted(promoted)}",
+                }
             )
-            # shove_path never moves the caller's path: the current line
-            # is still the seed polyline.  It may now cross fixed
-            # solids; clear those — the retry starts from the *failed*
-            # line (not the skeleton), so when movable tracks were part
-            # of the lockup, the pushed state can converge where the
-            # first pass did not.
-            walked = _walkaround_solids(seed, node, track_width, clearance)
-            out_path = walked
-            pushed = first.pushed
-            moved_pairs = first.moved_pairs
-        except ShoveFailure as exc:
-            raise PnsFailure(
-                f"walkaround failed ({walk_err}); shove-first also failed: {exc}",
-                last_path=walk_err.last_path,
-                last_hit=walk_err.last_hit,
-                shoved_pairs=exc.moved_pairs,
-            ) from walk_err
+        # Movable tracks are shove candidates only when shoving is
+        # enabled (``max_shove_depth != 0``); the walkaround-only
+        # strategy treats every track as a fixed solid and routes around
+        # it — DRC-clean, but the track is never displaced.
+        walk_obstacles = (
+            obstacles
+            if not shove_enabled
+            else [o for o in obstacles if o not in movable_shapes_active]
+        )
+        node = ObstacleNode(walk_obstacles)
+        walked: list[tuple[float, float]] | None = None
+        walk_err: PnsFailure | None = None
+        try:
+            walked = _walkaround_solids(skeleton, node, track_width, clearance, frames=frames)
         except PnsFailure as exc:
-            raise PnsFailure(
-                f"walkaround failed ({walk_err}); shove-first pushed "
-                f"{len(first.moved_pairs)} track(s) but the route still "
-                f"cannot clear fixed solids: {exc}",
-                last_path=walk_err.last_path,
-                last_hit=walk_err.last_hit,
-                shoved_pairs=list(first.moved_pairs),
-            ) from walk_err
-    elif walked is None:
-        # No movable tracks (or shove disabled): propagate the original
-        # walkaround failure with its state attached.
-        raise walk_err
+            walk_err = exc
+            walked = None
 
-    if movable and shove_enabled and not shove_done:
-        # Shoved tracks must also stay clear of every FIXED solid (pads,
-        # vias, keepouts, openings, non-shovable tracks): the shove stage
-        # only gauges other movable tracks, so without this a displaced
-        # track can be landed on top of a pad.  ``walk_obstacles`` is
-        # exactly the fixed set here; ``extra_fixed`` adds the route's
-        # own earlier-leg copper (foreign to every shoved track).
-        fixed = [*walk_obstacles, *extra_fixed]
-        try:
-            shoved: ShoveResult = shove_path(
-                walked,
-                movable,
-                width=track_width,
-                clearance=place_clearance,
-                max_depth=MAX_SHOVE_DEPTH if max_shove_depth is None else max_shove_depth,
-                fixed_obstacles=fixed,
-            )
-        except ShoveFailure as exc:
-            # The caller (auto_route_pair) only knows PnsFailure; a raw
-            # ShoveFailure would bubble past router and tool into
-            # FastMCP's "success: true + text error" wrapper.  Carry the
-            # partial shove state so the failure dump shows what had
-            # already been displaced.
-            raise PnsFailure(
-                f"shove failed: {exc}",
-                last_path=list(walked),
-                last_hit=exc.hit.net if exc.hit is not None and exc.hit.net else None,
-                shoved_pairs=exc.moved_pairs,
-            ) from exc
-        out_path = shoved.path
-        pushed = shoved.pushed
-        moved_pairs = shoved.moved_pairs
-    else:
-        out_path = walked
-        pushed = []
-        moved_pairs = []
+        # Optimization 1 — shove-first fallback.  KiCad's SHOVE
+        # semantics: when walkaround cannot find a detour, do not give
+        # up — let the line run straight and *push* the movable tracks
+        # that block it (chain propagation, each pushed track kept clear
+        # of fixed solids).  After the push, the current line may still
+        # cross fixed copper, so walkaround is retried.  Honest limits:
+        #   * the retry starts from the failure state
+        #     (``walk_err.last_path`` — the oscillation's last line, not
+        #     the plain skeleton), so it is a genuinely different
+        #     initial condition, and
+        #   * a pure fixed-solid lockup cannot be opened by shove —
+        #     fixed solids are never displaced — but the attempt is made
+        #     explicitly and BOTH stages' intermediate state is carried
+        #     to the caller for the viz dump.  A space competition in
+        #     which movable tracks are part of the blockage is resolved
+        #     here.
+        shove_done = False
+        if walked is None and movable_active and shove_enabled:
+            shove_done = True
+            seed = list(walk_err.last_path) if walk_err.last_path else list(skeleton)
+            try:
+                first: ShoveResult = shove_path(
+                    seed,
+                    movable_active,
+                    width=track_width,
+                    clearance=place_clearance,
+                    max_depth=MAX_SHOVE_DEPTH if max_shove_depth is None else max_shove_depth,
+                    fixed_obstacles=[*walk_obstacles, *extra_fixed],
+                )
+                # shove_path never moves the caller's path: the current
+                # line is still the seed polyline.  It may now cross
+                # fixed solids; clear those — the retry starts from the
+                # *failed* line (not the skeleton), so when movable
+                # tracks were part of the lockup, the pushed state can
+                # converge where the first pass did not.
+                walked = _walkaround_solids(seed, node, track_width, clearance, frames=frames)
+                out_path = walked
+                pushed = first.pushed
+                moved_pairs = first.moved_pairs
+            except ShoveFailure as exc:
+                # A track the shove cannot move (pad-pinned endpoint,
+                # fixed-solid block) is promoted to fixed and the pass
+                # retries around it; without a hit there is nothing to
+                # promote, so surface the merged failure.
+                if exc.hit is not None:
+                    hit_desc = (
+                        f"track {exc.hit.start} -> {exc.hit.end}"
+                        if hasattr(exc.hit, "start") and hasattr(exc.hit, "end")
+                        else f"track obstacle ({exc.hit.net or ''})"
+                    )
+                    frames.append(
+                        {
+                            "stage": f"shove-hit-{len(frames):02d}",
+                            "path": list(exc.cur_line or seed),
+                            "hit": hit_desc,
+                            "note": f"shove could not move track: {exc}",
+                            "pinned": _pinned_endpoints(exc.hit, walk_obstacles),
+                        }
+                    )
+                if exc.hit is not None and _promote_track_group(exc.hit, movable, promoted):
+                    continue
+                raise PnsFailure(
+                    f"walkaround failed ({walk_err}); shove-first also failed: {exc}",
+                    last_path=walk_err.last_path,
+                    last_hit=walk_err.last_hit,
+                    shoved_pairs=exc.moved_pairs,
+                    frames=frames,
+                ) from walk_err
+            except PnsFailure as exc:
+                raise PnsFailure(
+                    f"walkaround failed ({walk_err}); shove-first pushed "
+                    f"{len(first.moved_pairs)} track(s) but the route still "
+                    f"cannot clear fixed solids: {exc}",
+                    last_path=walk_err.last_path,
+                    last_hit=walk_err.last_hit,
+                    shoved_pairs=list(first.moved_pairs),
+                    frames=frames,
+                ) from exc
+        elif walked is None:
+            # No movable tracks (or shove disabled): propagate the
+            # original walkaround failure with its state attached.
+            raise walk_err from None
+
+        if movable_active and shove_enabled and not shove_done:
+            # Shoved tracks must also stay clear of every FIXED solid
+            # (pads, vias, keepouts, openings, non-shovable tracks): the
+            # shove stage only gauges other movable tracks, so without
+            # this a displaced track can be landed on top of a pad.
+            # ``walk_obstacles`` is exactly the fixed set here;
+            # ``extra_fixed`` adds the route's own earlier-leg copper
+            # (foreign to every shoved track).
+            fixed = [*walk_obstacles, *extra_fixed]
+            try:
+                shoved: ShoveResult = shove_path(
+                    walked,
+                    movable_active,
+                    width=track_width,
+                    clearance=place_clearance,
+                    max_depth=MAX_SHOVE_DEPTH if max_shove_depth is None else max_shove_depth,
+                    fixed_obstacles=fixed,
+                )
+            except ShoveFailure as exc:
+                # Same promotion path as the fallback: a pad-pinned
+                # track (or one that cannot clear fixed copper) becomes
+                # a fixed solid and the pass retries around it.
+                if exc.hit is not None:
+                    hit_desc = (
+                        f"track {exc.hit.start} -> {exc.hit.end}"
+                        if hasattr(exc.hit, "start") and hasattr(exc.hit, "end")
+                        else f"track obstacle ({exc.hit.net or ''})"
+                    )
+                    frames.append(
+                        {
+                            "stage": f"shove-hit-{len(frames):02d}",
+                            "path": list(exc.cur_line or walked),
+                            "hit": hit_desc,
+                            "note": f"main shove could not move track: {exc}",
+                            "pinned": _pinned_endpoints(exc.hit, walk_obstacles),
+                        }
+                    )
+                if exc.hit is not None and _promote_track_group(exc.hit, movable, promoted):
+                    continue
+                # The caller (auto_route_pair) only knows PnsFailure; a
+                # raw ShoveFailure would bubble past router and tool
+                # into FastMCP's "success: true + text error" wrapper.
+                # Carry the partial shove state so the failure dump
+                # shows what had already been displaced.
+                raise PnsFailure(
+                    f"shove failed: {exc}",
+                    last_path=list(walked),
+                    last_hit=exc.hit.net if exc.hit is not None and exc.hit.net else None,
+                    shoved_pairs=exc.moved_pairs,
+                    frames=frames,
+                ) from exc
+            out_path = shoved.path
+            pushed = shoved.pushed
+            moved_pairs = shoved.moved_pairs
+        else:
+            out_path = walked
+            pushed = []
+            moved_pairs = []
+        break
 
     # Originals displaced from the file (their obstacle entries are gone).
+    # Geometric match against the shoved LINEs, not identity: the merged
+    # chain object differs from the movable segments it was built from.
+    def _chain_contains(chain: TrackObstacle, seg: TrackObstacle) -> bool:
+        """True when ``seg`` is one segment (consecutive point pair) of
+        ``chain`` — the write path matches file segments against the
+        shoved LINE geometrically, since the merged chain object is not
+        identity-equal to the movable segments it was built from."""
+        if chain.net is not None and seg.net is not None and chain.net != seg.net:
+            return False
+        pts = chain.points
+        for a, b in zip(pts, pts[1:]):
+            if (
+                abs(a[0] - seg.start[0]) <= 1e-6
+                and abs(a[1] - seg.start[1]) <= 1e-6
+                and abs(b[0] - seg.end[0]) <= 1e-6
+                and abs(b[1] - seg.end[1]) <= 1e-6
+            ) or (
+                abs(a[0] - seg.end[0]) <= 1e-6
+                and abs(a[1] - seg.end[1]) <= 1e-6
+                and abs(b[0] - seg.start[0]) <= 1e-6
+                and abs(b[1] - seg.start[1]) <= 1e-6
+            ):
+                return True
+        return False
+
     orig_obstacle_ids: set[int] = set()
-    for i, track in enumerate(movable):
-        if any(track is orig for orig, _ in moved_pairs):
-            orig_obstacle_ids.add(id(movable_shapes[i]))
+    for i, track in enumerate(movable_active):
+        if any(_chain_contains(orig, track) for orig, _ in moved_pairs):
+            orig_obstacle_ids.add(id(movable_shapes_active[i]))
 
     # ------------------------------------------------------------------
     # KiCad optimizer analogue: re-snap disturbed polylines onto the
@@ -327,7 +436,9 @@ def route_engine(
         disp_pts: list[list[tuple[float, float]]] = [
             list(disp.points) for _orig, disp in moved_pairs
         ]
-        stay_movable = [t for t in movable if not any(t is orig for orig, _ in moved_pairs)]
+        stay_movable = [
+            t for t in movable if not any(_chain_contains(orig, t) for orig, _ in moved_pairs)
+        ]
         # Displaced tracks snap FIRST (world: fixed solids + route +
         # other movables + other displacements, already-snapped positions
         # for the ones processed earlier); the route snaps LAST.
@@ -612,6 +723,91 @@ def _outer_family_polygon(poly: Polygon, margin: float = 0.0) -> Polygon | None:
     return Polygon(clip)
 
 
+def _pinned_endpoints(
+    hit: TrackObstacle,
+    fixed: Sequence[Obstacle],
+) -> list[dict]:
+    """Which endpoints of ``hit`` lie inside fixed copper (pads/vias).
+
+    A shove failure on a segment whose endpoint sits on a pad is a
+    *pinned-endpoint* failure: the segment cannot translate without
+    snapping that endpoint off its pad (KiCad's via-anchored rule).  The
+    returned list (one entry per pinned endpoint: ``{"x", "y", "pad"}``)
+    is dumped into the failure frames so the renderer can mark the
+    locked points on the figure.
+    """
+    eps = 1e-6
+    pinned: list[dict] = []
+    pts: list[tuple[float, float]] = []
+    if hasattr(hit, "start") and hasattr(hit, "end"):
+        pts = [hit.start, hit.end]
+    elif hasattr(hit, "points") and hit.points:
+        pts = list(hit.points)
+    for pt in pts:
+        for o in fixed:
+            if o.shape is None or o.shape.is_empty:
+                continue
+            if o.kind not in ("pad", "via"):
+                continue
+            if o.shape.distance(Point(*pt)) <= eps:
+                pinned.append({"x": pt[0], "y": pt[1], "pad": o.ref or o.net or ""})
+    return pinned
+
+
+def _promote_track_group(
+    hit: TrackObstacle,
+    movable: Sequence[TrackObstacle],
+    promoted: set[int],
+) -> bool:
+    """Promote ``hit`` and every connected segment of its physical track
+    to the fixed set.
+
+    A single logical track is stored as consecutive file segments; its
+    segments share the net and touch at endpoints.  Shoving one segment
+    of such a chain while leaving its neighbours in place would tear the
+    track apart, so the whole chain is promoted together.  Returns True
+    when at least one track was newly pinned (the caller retries the
+    walkaround+shove pass), False when there is nothing left to promote.
+    """
+    eps = 1e-6
+    if not hasattr(hit, "points") or not hasattr(hit, "net"):
+        return False  # not a shovable track; nothing to pin
+    group: list[int] = []
+    frontier: list[TrackObstacle] = [hit]
+    seen: set[TrackObstacle] = set()
+    while frontier:
+        cur = frontier.pop()
+        if cur in seen:
+            continue
+        seen.add(cur)
+        for i, t in enumerate(movable):
+            if i in promoted or t in seen:
+                continue
+            if t.net != cur.net:
+                continue
+            # Touching endpoints (either direction) mark the same
+            # physical track; also accept a midpoint-on-segment touch so
+            # a route that lands exactly on another segment's interior
+            # pins the whole line.
+            touches = any(
+                math.hypot(a[0] - b[0], a[1] - b[1]) <= eps for a in cur.points for b in t.points
+            )
+            if touches:
+                group.append(i)
+                frontier.append(t)
+    # The hit itself is part of the chain and must be fixed too —
+    # otherwise it stays movable, the walkaround keeps treating it as
+    # pushable (and does not detour around it), and the same shove hit
+    # repeats forever with nothing left to promote.
+    for i, t in enumerate(movable):
+        if i not in promoted and t is hit:
+            group.append(i)
+            break
+    newly = [i for i in group if i not in promoted]
+    promoted.update(newly)
+    return bool(newly)
+
+
 def _family_hull(shape, margin: float) -> Polygon:
     """Walkaround/shove hull snapped onto the 0/45/90 family.
 
@@ -711,12 +907,17 @@ def _walkaround_solids(
     track_width: float,
     clearance: float,
     max_iter: int = MAX_WALKAROUND_ITER,
+    frames: list[dict] | None = None,
 ) -> list[tuple[float, float]]:
     """Bump the path around every fixed solid until collision-free.
 
     Each iteration: nearest obstacle within the copper trigger distance,
     walk its hull both CW and CCW, keep the shorter result; repeat.
     Mirrors KiCad's WALKAROUND::Route single-step loop.
+
+    ``frames`` optionally accumulates one entry per iteration
+    (``{"stage", "path", "hit", "note"}``) so a failure renders as a
+    process sequence, and the hit track's pinned endpoints are visible.
 
     The trigger mirrors the final DRC audit exactly: it fires when the
     route COPPER (the centerline buffered by half the track width, round
@@ -739,8 +940,19 @@ def _walkaround_solids(
     half_w = track_width / 2.0
     hull_margin = clearance + CLEARANCE_EPS + half_w
     probe = clearance + half_w
-    for _ in range(max_iter):
+    for it in range(max_iter):
         hit = node.nearest(pts, dfence=probe)
+        if frames is not None:
+            frames.append(
+                {
+                    "stage": f"walk-iter-{it:02d}",
+                    "path": list(pts),
+                    "hit": f"{hit.obstacle.kind} {hit.obstacle.ref or hit.obstacle.net or ''}".strip()
+                    if hit is not None
+                    else None,
+                    "note": f"walkaround iteration {it}",
+                }
+            )
         if hit is None:
             return pts
         if (
@@ -760,6 +972,7 @@ def _walkaround_solids(
                 f"obstacle {obs.kind} has an empty hull",
                 last_path=list(pts),
                 last_hit=f"{obs.kind} {obs.ref or obs.net or ''}".strip(),
+                frames=frames,
             )
         best: list[tuple[float, float]] | None = None
         for cw in (True, False):
@@ -774,6 +987,7 @@ def _walkaround_solids(
                 f"cannot walk around {obs.kind} obstacle {obs.ref}",
                 last_path=list(pts),
                 last_hit=f"{obs.kind} {obs.ref or obs.net or ''}".strip(),
+                frames=frames,
             )
         pts = best
     hit = node.nearest(pts, dfence=probe)
@@ -783,6 +997,7 @@ def _walkaround_solids(
         last_hit=f"{hit.obstacle.kind} {hit.obstacle.ref or hit.obstacle.net or ''}".strip()
         if hit is not None
         else None,
+        frames=frames,
     )
 
 

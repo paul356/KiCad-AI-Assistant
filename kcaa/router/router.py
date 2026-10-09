@@ -1720,13 +1720,31 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
                     net=req.net,
                 )
             except PnsFailure as exc:
-                # Dump the failure state so the blockage can be inspected
-                # (same viz format as the success stages).  ``last_path``
-                # carries the walkaround/shove line as it stood at failure
-                # — a real polyline, not an empty placeholder — and
-                # ``shoved_pairs`` the tracks already displaced.
+                # Dump the failure PROCESS so the blockage can be
+                # inspected — one viz stage per walkaround iteration /
+                # shove hit / promote round (``fail-pns-000`` through
+                # ``fail-pns-NNN``), plus the final state.  ``last_path``
+                # carries the walkaround/shove line as it stood at
+                # failure — a real polyline, not an empty placeholder —
+                # and ``shoved_pairs`` the tracks already displaced.  A
+                # study of the failure reads the frames in order: how
+                # the path crept, which track stopped the shove, and
+                # which of its endpoints were pinned by pads.
+                fail_frames = list(exc.frames or [])
+                if fail_frames:
+                    for fi, fr in enumerate(fail_frames):
+                        _dump_viz(
+                            f"fail-pns-{fi:03d}",
+                            fr.get("path") or [],
+                            _pad_viz,
+                            buffered,
+                            route_bbox,
+                            pinned=fr.get("pinned"),
+                            note=fr.get("note"),
+                            hit=fr.get("hit"),
+                        )
                 _dump_viz(
-                    "fail-pns",
+                    "fail-pns-final",
                     exc.last_path or [],
                     _pad_viz,
                     buffered,
@@ -2191,6 +2209,9 @@ def _dump_viz(
     route_bbox: tuple[float, float, float, float],
     *,
     shoved: list[dict] | None = None,
+    pinned: list[dict] | None = None,
+    note: str | None = None,
+    hit: dict | None = None,
 ) -> None:
     """Dump path, pad rects, and obstacles to a JSON file for rendering.
 
@@ -2198,6 +2219,16 @@ def _dump_viz(
     of ``{"net": str, "from": [[x, y], ...], "to": [[x, y], ...]}`` —
     each moved track's original and final polyline.  ``render_viz.py``
     draws those in a distinct color next to the route's current line.
+
+    ``pinned`` optionally carries the endpoints of the hit track that
+    sit inside fixed pads — ``[{"x", "y", "pad"}]`` — so the renderer
+    can mark the locked points (the reason the shove could not move the
+    track) on the failure frames.
+
+    ``note`` optionally carries the frame's stage note (e.g. which
+    segments were promoted in a promote round); ``hit`` carries the
+    shove hit obstacle's description.  Both are written verbatim for
+    the renderer/forensics.
 
     Only writes when ``config.viz_dump_enabled`` is ``True`` (set via
     ``KCAA_DUMP_ROUTE_PIPELINE=1`` in ``.env``).
@@ -2220,6 +2251,10 @@ def _dump_viz(
         ],
         "route_bbox": list(route_bbox),
     }
+    if note:
+        data["note"] = note
+    if hit:
+        data["hit"] = hit
     if shoved:
         data["shoved"] = [
             {
@@ -2558,8 +2593,17 @@ def _replace_pad_path(
                 fx, fy = path[k - 1]
                 ox, oy = path[k]
                 keep = _build_pad_wire(cx, cy, fx, fy, ox, oy, minx, maxx, miny, maxy)
-                # keep = [projection, fence]
-                return keep + path[k:]
+                # keep = [projection, fence].  The caller keeps the pad
+                # centre: the wire must start exactly at the centre, so a
+                # subsequent endpoint alignment has no X/Y translation to
+                # do.  Without this the whole leading leg gets translated
+                # and can be pushed onto copper the engine already shoved
+                # around (see _build_pad_wire docstring).
+                wire = [(cx, cy)]
+                if not _pt_eq(keep[0], center):
+                    wire.append(keep[0])
+                wire.append(keep[1])
+                return wire + path[k:]
         return path
     else:
         for k in range(len(path) - 2, -1, -1):
@@ -2568,7 +2612,11 @@ def _replace_pad_path(
                 ox, oy = path[k]
                 # Same (center, fence) order -- reverse so path reads [fence, projection].
                 keep = _build_pad_wire(cx, cy, fx, fy, ox, oy, minx, maxx, miny, maxy)
-                return path[: k + 1] + keep[::-1]
+                # Symmetric: pad wire must end exactly at the pad centre.
+                wire = keep[::-1]
+                if not _pt_eq(wire[-1], center):
+                    wire.append((cx, cy))
+                return path[: k + 1] + wire
         return path
 
 
