@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 import io
 import math
 import os
+import struct
 from typing import Any
 
 import matplotlib
@@ -1138,7 +1139,12 @@ _MAX_SAFE_DPI = 4000
 
 
 def _new_board_figure(
-    xmin: float, ymin: float, xmax: float, ymax: float, dpi: int
+    xmin: float,
+    ymin: float,
+    xmax: float,
+    ymax: float,
+    dpi: int,
+    min_width_px: int | None = None,
 ) -> tuple[Any, Any, int, float]:
     """Create a board figure/axes in KiCad convention (+Y down, dark bg).
 
@@ -1149,7 +1155,16 @@ def _new_board_figure(
     pixel-constant decorations like ratsnest dashes).  The rendered width
     is >= ``_MIN_RENDER_WIDTH_PX`` at any board size, so a narrow region
     zooms at full-board sharpness.
+
+    ``min_width_px``: optional pixel-width floor for the rendered image;
+    ``None`` keeps the default ``_MIN_RENDER_WIDTH_PX`` (1600) sharpness
+    floor.  Budget-limited callers can pass a smaller target (e.g. 1024)
+    to downscale the PNG — the dpi scaling and figure-growth logic apply
+    to the given floor exactly as to the default.  Degenerate values are
+    sanity-floored to >= 1 so a non-positive input still renders.
     """
+    min_width_px = _MIN_RENDER_WIDTH_PX if min_width_px is None else min_width_px
+    min_width_px = max(1, min_width_px)
     w_mm = xmax - xmin
     h_mm = ymax - ymin
     fig_w_in = w_mm / 25.4
@@ -1157,11 +1172,11 @@ def _new_board_figure(
     # Scale dpi so the output is sharp at any board size (min 1600px wide);
     # clamp the floor so the Agg renderer never sees an extreme dpi.
     if w_mm >= 0.1:
-        dpi = max(dpi, min(int(_MIN_RENDER_WIDTH_PX / fig_w_in), _MAX_SAFE_DPI))
-        if fig_w_in * dpi < _MIN_RENDER_WIDTH_PX:
+        dpi = max(dpi, min(int(min_width_px / fig_w_in), _MAX_SAFE_DPI))
+        if fig_w_in * dpi < min_width_px:
             # Cap bound: grow the figure inches (both axes by the same
             # factor -> board aspect preserved) to hit the pixel target.
-            scale = _MIN_RENDER_WIDTH_PX / (fig_w_in * dpi)
+            scale = min_width_px / (fig_w_in * dpi)
             fig_w_in *= scale
             fig_h_in *= scale
     fig, ax = plt.subplots(figsize=(fig_w_in, fig_h_in), dpi=dpi)
@@ -1582,6 +1597,7 @@ def render_board(
     include_pad_coords: bool = False,
     label_format: str = "number",
     show_footprint_refs: bool = True,
+    min_width_px: int | None = None,
 ) -> tuple[list[str], bytes, dict[str, Any]]:
     """Render a board to (report_lines, png_bytes, report_dict).
 
@@ -1630,6 +1646,11 @@ def render_board(
 
     connect_pads: optional list of ``ref.pad`` specs (e.g. ``["J1.2", "J2.2"]``)
     to draw ratsnest lines for — green, only for nets that are not yet routed.
+
+    ``min_width_px``: optional pixel-width floor for the rendered image
+    (``None`` = the default 1600 sharpness floor; pass e.g. 1024 to
+    downscale for budget-limited iterations).  The actual rendered width
+    is echoed back in the report as ``render_width_px``.
     """
     if dpi is None:
         dpi = 200
@@ -1679,7 +1700,9 @@ def render_board(
     if region_bbox is None:
         region_bbox = _bounds(board, ratsnest)
     xmin, ymin, xmax, ymax = region_bbox
-    fig, ax, eff_dpi, mm_per_px = _new_board_figure(xmin, ymin, xmax, ymax, dpi)
+    fig, ax, eff_dpi, mm_per_px = _new_board_figure(
+        xmin, ymin, xmax, ymax, dpi, min_width_px=min_width_px
+    )
     (
         pad_labels,
         label_collisions,
@@ -1725,10 +1748,15 @@ def render_board(
 
     buf = io.BytesIO()
     fig.savefig(buf, format="png", facecolor=_BG_COLOR, dpi=eff_dpi)
+
+    # PNG IHDR: 8-byte signature + 4-byte length + "IHDR" + 4-byte width.
+    png_bytes = buf.getvalue()
+    render_width_px = struct.unpack(">I", png_bytes[16:20])[0]
     plt.close(fig)
 
     report: dict[str, Any] = {
         "pads": len(board.pads),
+        "render_width_px": render_width_px,
         "pad_labels": pad_labels,
         "label_collisions": label_collisions,
         "label_skipped": label_skipped,
@@ -1783,7 +1811,7 @@ def render_board(
             f"pending (unrouted) nets={pending_nets or 'none'}; "
             f"already routed nets={routed_reported or 'none'}."
         )
-    return lines, buf.getvalue(), report
+    return lines, png_bytes, report
 
 
 def register_render_board_tools(mcp: FastMCP) -> None:
@@ -1801,6 +1829,7 @@ def register_render_board_tools(mcp: FastMCP) -> None:
         include_pad_coords: bool = False,
         label_format: str = "number",
         show_footprint_refs: bool = True,
+        min_width_px: int | None = None,
         ctx: Context | None = None,
     ) -> tuple[str, Image] | str:
         """Render a KiCad PCB to a PNG image (no kicad-cli needed).
@@ -1832,6 +1861,12 @@ def register_render_board_tools(mcp: FastMCP) -> None:
         footprint (e.g. ``U11``) when its silkscreen reference is not
         already visible in the view.
 
+        ``min_width_px``: optional pixel-width floor for the PNG
+        (``None`` = the default 1600 sharpness floor).  Pass a smaller
+        value (e.g. 1024) to downscale the image when the vision budget is
+        limited; the full text report (pad coords, nets, labels) is always
+        returned regardless of image size.
+
         Args:
             pcb_path: Path to the .kicad_pcb file.
             connect_pads: Optional list of ``REF.PAD`` specs to check.  Nets
@@ -1854,6 +1889,10 @@ def register_render_board_tools(mcp: FastMCP) -> None:
             show_footprint_refs: Draw one reference label per footprint
                 when its silkscreen reference text is not already visible
                 (default True).
+            min_width_px: Pixel-width floor for the PNG, or None for the
+                default 1600 sharpness floor; pass a smaller value (e.g.
+                1024) to downscale for budget-limited vision iterations.
+                The text report is unaffected by downscaling.
             ctx: FastMCP context for progress reporting.
 
         Returns:
@@ -1872,6 +1911,7 @@ def register_render_board_tools(mcp: FastMCP) -> None:
             include_pad_coords=include_pad_coords,
             label_format=label_format,
             show_footprint_refs=show_footprint_refs,
+            min_width_px=min_width_px,
         )
         if output_dir:
             os.makedirs(output_dir, exist_ok=True)

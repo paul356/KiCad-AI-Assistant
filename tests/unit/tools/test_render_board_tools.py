@@ -526,6 +526,56 @@ class TestRegionRendering:
             render_board(_sparse_board_path(tmp_path), region=bad)
 
 
+class TestMinRenderWidth:
+    """The ``min_width_px`` downscaling knob (default behavior unchanged)."""
+
+    def render(self, tmp_path, **kwargs):
+        return render_board(_sparse_board_path(tmp_path), **kwargs)
+
+    def test_default_renders_at_1600_floor(self, tmp_path):
+        _, png, report = self.render(tmp_path)
+        width, _ = _png_size(png)
+        assert width >= 1590  # 1600 floor; int() truncates one px at most
+        assert report["render_width_px"] == width  # audit field matches bytes
+
+    def test_none_behaves_like_default(self, tmp_path):
+        default = self.render(tmp_path)
+        explicit_none = self.render(tmp_path, min_width_px=None)
+        assert explicit_none[1] == default[1]
+        assert explicit_none[2] == default[2]
+
+    def test_downscaled_render_in_range_and_report_unchanged(self, tmp_path):
+        default_lines, default_png, default_report = self.render(tmp_path)
+        lines, png, report = self.render(tmp_path, min_width_px=1024)
+        width, _ = _png_size(png)
+        # Downscaled: strictly below the 1600 floor but >= the 1024 target
+        # (dpi rounding may nudge a pixel up, never below).
+        assert 1024 <= width < 1600
+        assert report["render_width_px"] == width
+        # The text envelope stays authoritative: pad labels / net info are
+        # identical to the default render regardless of image size.
+        assert lines == default_lines
+        assert report["pads"] == default_report["pads"]
+        assert report["pad_labels"] == default_report["pad_labels"]
+
+    def test_downscaled_render_keeps_pad_coords(self, tmp_path):
+        _, _, default_report = self.render(tmp_path, include_pad_coords=True)
+        _, _, report = self.render(tmp_path, min_width_px=1024, include_pad_coords=True)
+        assert report["pads_coords"] == default_report["pads_coords"]
+
+    @pytest.mark.parametrize("min_width_px", [1, 0, -5])
+    def test_degenerate_floor_clamped_without_crash(self, tmp_path, min_width_px):
+        # A floor below the natural dpi render must not crash; it collapses
+        # to a 1 px floor (no dpi bump, no figure growth) and stays small.
+        _, png, report = self.render(tmp_path, min_width_px=min_width_px)
+        width, _ = _png_size(png)
+        assert 0 < width < 1600
+        assert report["render_width_px"] == width
+        # All degenerate values land on the same clamped render.
+        _, ref_png, _ = self.render(tmp_path, min_width_px=1)
+        assert png == ref_png
+
+
 class TestPadCoords:
     def test_centers_match_parsed_board(self, tmp_path):
         path = _sparse_board_path(tmp_path)
@@ -723,12 +773,14 @@ class TestToolRegistration:
             "include_pad_coords",
             "label_format",
             "show_footprint_refs",
+            "min_width_px",
         ):
             assert param in sig.parameters
         assert sig.parameters["show_pad_labels"].default is True
         assert sig.parameters["include_pad_coords"].default is False
         assert sig.parameters["label_format"].default == "number"
         assert sig.parameters["show_footprint_refs"].default is True
+        assert sig.parameters["min_width_px"].default is None
 
     def test_tool_returns_report_and_image(self, tmp_path):
         tools = _get_tools()
@@ -742,6 +794,24 @@ class TestToolRegistration:
         assert "report=" in report_text
         assert "pads_coords" in report_text
         assert img.data[:8] == b"\x89PNG\r\n\x1a\n"
+
+    def test_tool_downscales_image_but_keeps_text_report(self, tmp_path):
+        tools = _get_tools()
+        report_text, img = _run(
+            tools["export_pcb_layer_image"](
+                pcb_path=_sparse_board_path(tmp_path),
+                include_pad_coords=True,
+                min_width_px=1024,
+                ctx=None,
+            )
+        )
+        width, _ = _png_size(img.data)
+        assert 1024 <= width < 1600
+        # Pad coordinates / net info stay in the text envelope.
+        assert "pads_coords" in report_text
+        assert "R1" in report_text
+        assert "Rendered" in report_text
+        assert "report=" in report_text
 
 
 class TestExportPcbLayerImageVisionGate:
