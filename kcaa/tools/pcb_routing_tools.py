@@ -174,9 +174,15 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
                 arc_count / arcs: rounded-corner arcs written
                     (``{start, mid, end, width, layer, net}`` each).
                 shoved: list of tracks that were pushed out of the way
-                    into clear space (``{net, layer, width, points}``
-                    each; endpoints stay pinned, and every displacement
-                    keeps DRC clearance from pads/vias/keepouts).
+                    into clear space (``{net, layer, width, points,
+                    source_points}`` each; endpoints stay pinned, and
+                    every displacement keeps DRC clearance from
+                    pads/vias/keepouts).  ``points`` is the exact chain
+                    persisted to the board file — straight legs, and the
+                    circular corners re-emitted as 45-degree-family
+                    segments, never arc nodes — while ``source_points``
+                    is the un-collapsed walkaround polyline the shove
+                    returned.
                 corner_mode: echoed corner_mode.
                 algorithm: echoed algorithm (``astar`` | ``pns``).
                 via_count / vias: vias written (0 for single-layer).
@@ -324,12 +330,19 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
             ],
             "shoved": [
                 {
-                    "net": t.net,
-                    "layer": t.layer,
-                    "points": [list(pt) for pt in t.points],
-                    "width": t.width,
+                    "net": disp.net,
+                    "layer": disp.layer,
+                    "width": disp.width,
+                    # The exact chain the write path persists (45-degree
+                    # family segments for the circular corners) — NOT the
+                    # dense walkaround polyline.  `source_points` keeps
+                    # the un-collapsed displacement for inspection.
+                    "points": [
+                        [float(x), float(y)] for x, y in _displaced_chain_points(orig, disp)
+                    ],
+                    "source_points": [list(pt) for pt in disp.points],
                 }
-                for t in result.shoved_tracks
+                for orig, disp in result.moved_pairs
             ],
             "corner_mode": result.corner_mode,
             "algorithm": result.algorithm,
@@ -1368,6 +1381,27 @@ def _displaced_to_segments(orig: TrackObstacle, displaced: TrackObstacle) -> lis
         nodes.append(_track_node("segment", pts[i], pts[i + 1], None, displaced))
         i += 1
     return nodes
+
+
+def _displaced_chain_points(
+    orig: TrackObstacle, displaced: TrackObstacle
+) -> list[tuple[float, float]]:
+    """The persisted vertex chain for a displaced track.
+
+    ``_displaced_to_segments`` collapses the dense walkaround polyline
+    (straight legs, 45-degree-family corner chain).  This returns the
+    head-to-tail vertex sequence of exactly what the write path persists,
+    so the tool response ``shoved[].points`` matches the board file —
+    not the un-collapsed source polyline.
+    """
+    nodes = _displaced_to_segments(orig, displaced)
+    if not nodes:
+        return list(displaced.points)
+    pts: list[tuple[float, float]] = [(nodes[0][1][1], nodes[0][1][2])]
+    for node in nodes[1:]:
+        pts.append((node[1][1], node[1][2]))
+    pts.append((nodes[-1][2][1], nodes[-1][2][2]))
+    return pts
 
 
 def _apply_shoved_tracks(

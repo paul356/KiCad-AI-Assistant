@@ -783,28 +783,41 @@ class TestAlgorithmDefaultByVision:
                 )
 
     def test_shove_written_segments_cover_displaced_polyline(self, tools, crossing_board):
-        """The written GND nodes (segments and arc nodes) coalesce the
-        displaced hull polyline end-to-end: every intermediate vertex is
-        either absorbed into a collinear segment or a circular arc, no
-        vertex is dropped, and the chain is head-to-tail continuous.
+        """The written GND nodes coalesce the displaced hull polyline
+        end-to-end: every intermediate vertex is absorbed into a
+        collinear segment or a 45-degree-family corner chain, no vertex
+        is dropped, and the chain is head-to-tail continuous.  The tool
+        response MUST report this persisted chain (``shoved[].points``),
+        not the un-collapsed walkaround polyline.
         (Regression guard: a dense shove corner used to be written as
         one bitty segment per vertex pair.)"""
         result = self._route_vcc(tools, crossing_board, strategy="shove")
         assert "error" not in result
         assert result["shoved"]
-        pts = [tuple(p) for p in result["shoved"][0]["points"]]
-        if len(pts) < 3:
+        # points = chain PERSISTED to the file; source_points = the raw
+        # walkaround polyline the shove returned.
+        chain = [tuple(p) for p in result["shoved"][0]["points"]]
+        src = [tuple(p) for p in result["shoved"][0]["source_points"]]
+        if len(src) < 3:
             return  # single-hop displacement: nothing to coalesce
         nodes = self._gnd_nodes(crossing_board)
         assert nodes, "displaced GND track must be present"
+        # The reported chain must be exactly the file nodes' head-to-tail
+        # vertex walk — the response reflects what is written, not the
+        # un-collapsed polyline.
+        file_chain = [nodes[0]["start"]] + [n["end"] for n in nodes]
+        assert len(chain) >= 2 and chain == file_chain, (
+            f"response chain ({len(chain)} pts) does not match written nodes ({len(file_chain)} pts)\n"
+            f"response: {chain}\nfile: {file_chain}"
+        )
         # Coalescing must actually reduce the node count (the whole point
         # of the collapse: ~50 dense vertices -> a handful of nodes).
-        assert len(nodes) < len(pts) // 2, (
-            f"expected coalescing, got {len(nodes)} nodes for {len(pts)} vertices"
+        assert len(nodes) < len(src) // 2, (
+            f"expected coalescing, got {len(nodes)} nodes for {len(src)} vertices"
         )
         # Chain must be head-to-tail continuous, matching the polyline.
-        assert nodes[0]["start"] == pts[0], "first node must start at polyline head"
-        assert nodes[-1]["end"] == pts[-1], "last node must end at polyline tail"
+        assert nodes[0]["start"] == src[0], "first node must start at polyline head"
+        assert nodes[-1]["end"] == src[-1], "last node must end at polyline tail"
         for prev, nxt in zip(nodes, nodes[1:]):
             assert prev["end"] == nxt["start"], (
                 f"gap between nodes {prev['end']} and {nxt['start']}"
@@ -822,15 +835,15 @@ class TestAlgorithmDefaultByVision:
             coords.append(s["start"])
         coords.append(nodes[-1]["end"])
         line = LineString(coords)
-        for p in pts:
+        for p in src:
             d = line.distance(Point(p[0], p[1]))
             assert d <= 0.1, (
                 f"polyline vertex {p} not covered by written GND nodes (off by {d * 1000:.0f}um)"
             )
         # Node chain must reach the polyline endpoints (the coalesced
         # routing matches the shoved geometry start/end exactly).
-        assert nodes[0]["start"] == pts[0]
-        assert nodes[-1]["end"] == pts[-1]
+        assert nodes[0]["start"] == src[0]
+        assert nodes[-1]["end"] == src[-1]
 
     def test_walkaround_leaves_gnd_track_untouched(self, tools, crossing_board):
         """strategy=walkaround: no shove, no rewrite — the file still
