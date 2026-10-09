@@ -809,47 +809,24 @@ class TestAlgorithmDefaultByVision:
             assert prev["end"] == nxt["start"], (
                 f"gap between nodes {prev['end']} and {nxt['start']}"
             )
-        # Every polyline vertex must lie on the coalesced path: on a
-        # segment leg, or on the arc's circle between its endpoints.
-        import math
+        # Every polyline vertex must be covered by the coalesced chain:
+        # segments absorb collinear runs, and the circular corner is
+        # re-emitted as a 45-degree-family chain that hugs the fitted
+        # circle from OUTSIDE (the arc's center side is the obstacle, so
+        # an inner chord would bite clearance).  A vertex therefore lies
+        # within the fit tolerance of the chain, not necessarily on it.
+        from shapely.geometry import LineString, Point
 
-        from kcaa.tools.pcb_routing_tools import _circle_from_three
-
-        def _on_arc(p, start, mid, end):
-            circ = _circle_from_three(start, mid, end)
-            if circ is None:
-                return False
-            c, r = circ
-            # Vertices sit on the fitted circle within the fit tolerance
-            # (~13um measured); 0.1mm is a generous but discriminating
-            # bound (a straight leg point is hundreds of microns off).
-            if abs(math.hypot(p[0] - c[0], p[1] - c[1]) - r) > 0.1:
-                return False
-            a0 = math.atan2(start[1] - c[1], start[0] - c[0])
-            a1 = math.atan2(end[1] - c[1], end[0] - c[0])
-            ap = math.atan2(p[1] - c[1], p[0] - c[0])
-            span = (a1 - a0) % (2 * math.pi)
-            rel = (ap - a0) % (2 * math.pi)
-            return rel <= span + 1e-9 or span > math.pi - 1e-9
-
+        coords = []
+        for s in nodes:
+            coords.append(s["start"])
+        coords.append(nodes[-1]["end"])
+        line = LineString(coords)
         for p in pts:
-            on = False
-            for s in nodes:
-                if "mid" in s:
-                    if _on_arc(p, s["start"], s["mid"], s["end"]):
-                        on = True
-                        break
-                else:
-                    (x1, y1), (x2, y2) = s["start"], s["end"]
-                    cross = (p[0] - x1) * (y2 - y1) - (p[1] - y1) * (x2 - x1)
-                    if abs(cross) > 1e-5:
-                        continue
-                    if min(x1, x2) - 1e-5 <= p[0] <= max(x1, x2) + 1e-5 and (
-                        min(y1, y2) - 1e-5 <= p[1] <= max(y1, y2) + 1e-5
-                    ):
-                        on = True
-                        break
-            assert on, f"polyline vertex {p} not covered by written GND nodes"
+            d = line.distance(Point(p[0], p[1]))
+            assert d <= 0.1, (
+                f"polyline vertex {p} not covered by written GND nodes (off by {d * 1000:.0f}um)"
+            )
         # Node chain must reach the polyline endpoints (the coalesced
         # routing matches the shoved geometry start/end exactly).
         assert nodes[0]["start"] == pts[0]
@@ -1064,10 +1041,11 @@ class TestDisplacedSegmentsArcCollapse:
             out.append((float(p[0]), float(p[1])))
         return out
 
-    def test_circular_run_collapses_to_arc(self):
+    def test_circular_run_collapses_to_45_segments(self):
         """~90° arc sampled densely (with 45° polygonization zigzags, as
-        the hull walkaround produces) must come out as ONE arc node, not
-        ~20 slivers."""
+        the hull walkaround produces) must come out as a handful of
+        45-degree-family segment nodes — NEVER an arc node (a written
+        arc cannot be shoved by a later route)."""
         import math
 
         from kcaa.tools.pcb_routing_tools import _displaced_to_segments
@@ -1094,16 +1072,43 @@ class TestDisplacedSegmentsArcCollapse:
         disp = self._track(*pts)
         nodes = _displaced_to_segments(orig, disp)
         kinds = [n[0].value() for n in nodes]
-        assert kinds.count("arc") == 1, f"expected one arc, got {kinds}"
+        assert "arc" not in kinds, f"must never emit arc nodes, got {kinds}"
+        assert all(k == "segment" for k in kinds), kinds
         assert len(nodes) < len(pts) // 2, (
             f"coalescing failed: {len(nodes)} nodes for {len(pts)} samples"
         )
-        # The single arc must span the whole run (start at pts[0], end at pts[-1]).
-        arc = nodes[kinds.index("arc")]
-        start = (arc[1][1], arc[1][2])
-        end = (arc[3][1], arc[3][2])
-        assert start == tuple(pts[0])
-        assert end == tuple(pts[-1])
+        # Head-to-tail continuous, 45-degree family directions, and
+        # consecutive legs differ by exactly 45 degrees.
+        dirs = []
+        for n in nodes:
+            s, e = n[1], n[2]
+            d = math.degrees(math.atan2(e[2] - s[2], e[1] - s[1])) % 180.0
+            assert abs(d - round(d / 45.0) * 45.0) < 1e-6, f"dir {d} not in 45 family"
+            dirs.append(d)
+        for a_, b_ in zip(dirs, dirs[1:]):
+            diff = min(abs(b_ - a_), 180.0 - abs(b_ - a_))
+            assert abs(diff - 45.0) < 1e-6, f"adjacent dirs {a_},{b_} differ {diff}, not 45"
+        # The chain must span the whole run (start at pts[0], end at pts[-1]).
+        assert (nodes[0][1][1], nodes[0][1][2]) == tuple(pts[0])
+        assert (nodes[-1][2][1], nodes[-1][2][2]) == tuple(pts[-1])
+        # Chain must not bite clearance: the 45-family chain approximates
+        # the circle from OUTSIDE, so every point of the chain stays at
+        # least as far from the center as the innermost original sample
+        # (the router's clearance was computed against those samples).
+        # (A constant point-to-chain distance would scale with r — the
+        # 45-deg chord sagitta grows with radius — so measure the
+        # DRC-relevant invariant instead.)
+        chain_pts = []
+        for n in nodes:
+            s, e = n[1], n[2]
+            for k in range(21):
+                chain_pts.append((s[1] + (e[1] - s[1]) * k / 20.0, s[2] + (e[2] - s[2]) * k / 20.0))
+        cx_, cy_ = 100.0, 100.0
+        r_chain = min(math.hypot(x - cx_, y - cy_) for x, y in chain_pts)
+        r_samples = min(math.hypot(p[0] - cx_, p[1] - cy_) for p in pts)
+        assert r_chain >= r_samples - 0.02, (
+            f"chain intrudes toward center: chain {r_chain:.4f} vs samples {r_samples:.4f}"
+        )
 
     def test_collinear_run_collapses_to_segment(self):
         """A straight leg with many interior samples must be one segment."""

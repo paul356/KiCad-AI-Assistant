@@ -1099,39 +1099,207 @@ def _track_node(
     return node
 
 
-def _split_arc(
+def _quantize_dir45(angle: float) -> float:
+    """Nearest 45-degree family direction (0..315) to ``angle``."""
+    return round(angle / 45.0) % 8 * 45.0
+
+
+def _arc_turn_sign(
+    start: tuple[float, float],
+    end: tuple[float, float],
+    center: tuple[float, float],
+) -> int:
+    """+1 for counter-clockwise travel (math convention) of the arc from
+    ``start`` to ``end`` around ``center``, -1 for clockwise."""
+    a1 = math.atan2(start[1] - center[1], start[0] - center[0])
+    a2 = math.atan2(end[1] - center[1], end[0] - center[0])
+    delta = (a2 - a1 + math.pi) % (2 * math.pi) - math.pi
+    return 1 if delta >= 0 else -1
+
+
+def _segment_dir(node: list) -> float | None:
+    """Direction (deg, 0..360) of a written ``(segment ...)`` node."""
+    if node[0].value() != "segment" or len(node) < 3:
+        return None
+    s = node[1]
+    e = node[2]
+    return math.degrees(math.atan2(e[2] - s[2], e[1] - s[1])) % 360.0
+
+
+def _arc_to_45_nodes(
     start: tuple[float, float],
     end: tuple[float, float],
     center: tuple[float, float],
     radius: float,
+    entry_dir: float,
     samples: list[tuple[float, float]],
     displaced: TrackObstacle,
+    depth: int = 0,
 ) -> list[list]:
-    """Split a long arc at a mid-window sampled vertex into two 3-point
-    ``(arc ...)`` nodes.
+    """Approximate a circular run as a 45-degree-family segment chain.
 
-    The join and the two mid points are REAL vertices ``samples`` (the
-    window the arc was fitted from), never fitted coordinates: the
-    serialized chain then stays locked to the walkaround polyline and
-    the file nodes connect start/end exactly.  All three points of each
-    half are within the fit tolerance of one circle, so KiCad rebuilds
-    the same arc.
+    Every emitted leg is quantized to the 45-degree family
+    (0/45/90/135/180 — KiCad miter geometry) and consecutive legs differ
+    by exactly 45 degrees, the all-45 routing style.  The chain ALWAYS
+    stays on or outside the fitted circle: the arc center faces the
+    obstacle, so any chord inside the circle bites the shove clearance;
+    an outside chain only gains margin (verified on the real board: the
+    outer 3-leg chain keeps every sample >= r from the center, i.e. 0um
+    intrusion against a 9.4um headroom).
+
+    Leg count follows the span: up to 45 degrees one 45-degree turn (2
+    legs, uniquely determined); up to 90 degrees two turns (3 legs, one
+    free length scanned); wider runs split at the real sample closest to
+    the 90-degree mark (each half again 2-3 legs).  ``entry_dir`` is the
+    incoming straight's direction; the first leg snaps it to the 45
+    family so the corner itself miteres 45 deg at a time.
+    ``start``/``end`` are real window vertices (chain stays locked
+    head-to-tail to the walkaround polyline).  Returns ``[]`` when no
+    leg solution keeps the chain outside the circle — the caller then
+    emits the window verbatim (still continuous, just denser).
     """
-    n = len(samples)
-    join_i = n // 2
-    first = samples[: join_i + 1]
-    second = samples[join_i:]
-    join = samples[join_i]
-    mid0 = first[len(first) // 2]
-    mid1 = second[len(second) // 2]
-    return [
-        _track_node("arc", start, mid0, join, displaced),
-        _track_node("arc", join, mid1, end, displaced),
-    ]
+    span = _arc_span_deg(start, end, center)
+    sgn = _arc_turn_sign(start, end, center)
+    if span > 90.0 and len(samples) >= 7 and depth < 4:
+        # Split at the ANGULAR midpoint (not a fixed 90-degree turn):
+        # a wide run gets cut into two roughly equal halves, each of
+        # which then fits 2-3 legs.  Pick the real sample closest to
+        # that angle so the mid joint stays locked to the walkaround
+        # polyline.
+        a0 = math.atan2(start[1] - center[1], start[0] - center[0])
+        target = a0 + math.radians(span / 2.0) * sgn
+        m = 1
+        best_ang = float("inf")
+        for q, pt in enumerate(samples[1:-1], start=1):
+            ang = (math.atan2(pt[1] - center[1], pt[0] - center[0]) - target) % (2 * math.pi)
+            ang = min(ang, 2 * math.pi - ang)
+            if ang < best_ang:
+                best_ang = ang
+                m = q
+        mid = samples[m]
+        first = _arc_to_45_nodes(
+            start, mid, center, radius, entry_dir, samples[: m + 1], displaced, depth + 1
+        )
+        if not first:
+            return []
+        last_dir = _segment_dir(first[-1])
+        if last_dir is None:
+            return []
+        second = _arc_to_45_nodes(
+            mid, end, center, radius, last_dir, samples[m:], displaced, depth + 1
+        )
+        if not second:
+            return first
+        # The split sample may land mid-leg: the first half's last leg
+        # and the second half's first leg then continue in the SAME
+        # direction (zero turn at the joint).  Collapse them into one
+        # segment so the emitted chain turns exactly 45 deg per joint.
+        out = list(first)
+        d1 = _segment_dir(first[-1])
+        d2 = _segment_dir(second[0])
+        if d1 is not None and d2 is not None and min(abs(d1 - d2), 360.0 - abs(d1 - d2)) < 1e-6:
+            out[-1] = _track_node(
+                "segment",
+                (first[-1][1][1], first[-1][1][2]),
+                (second[0][2][1], second[0][2][2]),
+                None,
+                displaced,
+            )
+            out.extend(second[1:])
+        else:
+            out.extend(second)
+        return out
+
+    d0 = _quantize_dir45(entry_dir)
+    nlegs = 3 if span > 45.0 else 2
+    dirs = [(d0 + 45.0 * sgn * k) % 360.0 for k in range(nlegs)]
+    u = [(math.cos(math.radians(a)), math.sin(math.radians(a))) for a in dirs]
+    dx = end[0] - start[0]
+    dy = end[1] - start[1]
+    if math.hypot(dx, dy) < 1e-9:
+        return []
+
+    def _candidates() -> list[tuple[float, ...]]:
+        if nlegs == 2:
+            det = u[0][0] * u[1][1] - u[0][1] * u[1][0]
+            if abs(det) < 1e-9:
+                return []
+            # Solve L0 u0 + L1 u1 = d.
+            L0 = (dx * u[1][1] - dy * u[1][0]) / det
+            L1 = (u[0][0] * dy - u[0][1] * dx) / det
+            return [(L0, L1)]
+        det = u[0][0] * u[2][1] - u[0][1] * u[2][0]
+        if abs(det) < 1e-9:
+            return []
+        out: list[tuple[float, ...]] = []
+        t_max = 2.0 * math.hypot(dx, dy)
+        prev: tuple[float, ...] | None = None
+        for kk in range(0, 401):
+            t = t_max * kk / 400.0
+            bx = dx - t * u[1][0]
+            by = dy - t * u[1][1]
+            L0 = (bx * u[2][1] - by * u[2][0]) / det
+            L2 = (u[0][0] * by - u[0][1] * bx) / det
+            if min(L0, t, L2) < -1e-6:
+                continue
+            cand = (L0, t, L2)
+            if prev is not None and abs(cand[1] - prev[1]) < 1e-9:
+                continue
+            prev = cand
+            out.append(cand)
+        return out
+
+    # Clearance tolerance = worst fit residual over the real window:
+    # the fitted circle can sit a few um inside a sampled vertex (LSQ
+    # compromises), so "on/outside the circle" must allow that noise —
+    # the chain then never gets closer to the center than the walkaround
+    # polyline itself, i.e. the geometry is DRC-equivalent to the arc.
+    fit_noise = max(abs(math.hypot(x - center[0], y - center[1]) - radius) for x, y in samples)
+    best: tuple[float, tuple[float, ...]] | None = None
+    for cand in _candidates():
+        pts_s = [start]
+        for L, (ux, uy) in zip(cand, u):
+            pts_s.append((pts_s[-1][0] + L * ux, pts_s[-1][1] + L * uy))
+        if math.hypot(pts_s[-1][0] - end[0], pts_s[-1][1] - end[1]) > 1e-6:
+            continue  # numerical endpoint mismatch
+        # No degenerate legs (a zero-length leg makes the 45-degree
+        # family step invisible).
+        if any(L < 1e-4 for L in cand):
+            continue
+        # Never inside the circle (clearance is on the center side).
+        inside = 0.0
+        for a, b in zip(pts_s, pts_s[1:]):
+            n = max(2, int(math.hypot(b[0] - a[0], b[1] - a[1]) / 0.005))
+            for q in range(n + 1):
+                p = (a[0] + (b[0] - a[0]) * q / n, a[1] + (b[1] - a[1]) * q / n)
+                inside = max(inside, radius - math.hypot(p[0] - center[0], p[1] - center[1]))
+        if inside > fit_noise:
+            continue
+        # Fidelity: how tightly the chain hugs the circle.
+        dev = 0.0
+        for a, b in zip(pts_s, pts_s[1:]):
+            n = max(2, int(math.hypot(b[0] - a[0], b[1] - a[1]) / 0.02))
+            for q in range(n + 1):
+                p = (a[0] + (b[0] - a[0]) * q / n, a[1] + (b[1] - a[1]) * q / n)
+                dev = max(dev, abs(math.hypot(p[0] - center[0], p[1] - center[1]) - radius))
+        if best is None or dev < best[0]:
+            best = (dev, cand)
+    if best is None:
+        return []
+    cand = best[1]
+    pts_s = [start]
+    for L, (ux, uy) in zip(cand, u):
+        pts_s.append((pts_s[-1][0] + L * ux, pts_s[-1][1] + L * uy))
+    nodes: list[list] = []
+    for a, b in zip(pts_s, pts_s[1:]):
+        if math.hypot(b[0] - a[0], b[1] - a[1]) < 1e-6:
+            continue
+        nodes.append(_track_node("segment", a, b, None, displaced))
+    return nodes
 
 
 def _displaced_to_segments(orig: TrackObstacle, displaced: TrackObstacle) -> list[list]:
-    """Serialize a displaced track as ``(segment ...)`` / ``(arc ...)`` nodes.
+    """Serialize a displaced track as ``(segment ...)`` nodes.
 
     The shoved polyline comes out of the hull walkaround as a dense
     vertex chain: straight legs carry sub-millimeter intermediate samples
@@ -1141,10 +1309,9 @@ def _displaced_to_segments(orig: TrackObstacle, displaced: TrackObstacle) -> lis
 
       * maximal collinear runs collapse into one segment,
       * maximal circular runs (every vertex on one circle within
-        ``ARC_FIT_TOLERANCE_MM``) collapse into one ``(arc ...)`` node
-        (start / fitted midpoint / end),
-      * an arc too long for one 3-point node splits at its arc midpoint,
-        and
+        ``ARC_FIT_TOLERANCE_MM``) collapse into 2-3 short segments of
+        the 45-degree family (``_arc_to_45_nodes``) — never an arc node,
+        so the written track stays fully shovable by a later route, and
       * leftover isolated pairs emit as before.
 
     Zero-length hops are skipped (the shove can emit coincident chain
@@ -1169,20 +1336,31 @@ def _displaced_to_segments(orig: TrackObstacle, displaced: TrackObstacle) -> lis
         #     contains a straight shove leg (one hop >= MAX_ARC_STEP_MM)
         #     fits *some* big circle under the residual tolerance, so
         #     growing the run refuses it.  Whatever survives is a dense
-        #     hull-arc polygon and is safe to emit as one arc node.
+        #     hull-arc polygon and is safe to re-emit as 45-family
+        #     segments (never an ``(arc ...)`` node — arcs cannot be
+        #     shoved by a later route, so the write path must keep the
+        #     track shovable).
         arc = _best_arc_run(pts, i, ARC_FIT_TOLERANCE_MM)
         if arc is not None and arc[0] > i:
             best_k, best_c, best_r = arc
-            span = _arc_span_deg(pts[i], pts[best_k], best_c)
             window = pts[i : best_k + 1]
-            if span > MAX_ARC_SPAN_DEG:
-                nodes.extend(_split_arc(pts[i], pts[best_k], best_c, best_r, window, displaced))
-            else:
-                # Mid is a REAL window vertex (within the fit tolerance
-                # of the fitted circle), not a fitted point: the three
-                # nodes stay locked to the walkaround polyline.
-                mid_pt = window[len(window) // 2]
-                nodes.append(_track_node("arc", pts[i], mid_pt, pts[best_k], displaced))
+            entry_dir = _segment_dir(nodes[-1]) if nodes else None
+            if entry_dir is None:
+                cx, cy = best_c
+                entry_dir = math.degrees(math.atan2(pts[i][1] - cy, pts[i][0] - cx)) + 90.0
+            sub = _arc_to_45_nodes(
+                pts[i], pts[best_k], best_c, best_r, entry_dir, window, displaced
+            )
+            if sub:
+                nodes.extend(sub)
+                i = best_k
+                continue
+            # Fall back: the run refused a 45-family outer chain
+            # (degenerate geometry); emit the window as plain pairs.
+            for a, b in zip(window, window[1:]):
+                if math.hypot(b[0] - a[0], b[1] - a[1]) < 1e-6:
+                    continue
+                nodes.append(_track_node("segment", a, b, None, displaced))
             i = best_k
             continue
 
