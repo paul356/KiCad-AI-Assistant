@@ -1,8 +1,10 @@
 # PCB Routing Guide
 
-The KiCad MCP server provides a **no-shove PNS router** that connects
-two pads with an obstacle-avoiding track.  It is exposed through the
-`pcb_route_pad_to_pad` MCP tool.
+The KiCad MCP server provides a **PNS router** that connects two pads
+with an obstacle-avoiding track; the default ``"shove"`` strategy
+*pushes* blocking movable tracks out of the way (whole line, pad-
+anchored endpoints pinned) when a detour alone cannot clear the
+corridor.  It is exposed through the `pcb_route_pad_to_pad` MCP tool.
 
 ## Single-layer routing
 
