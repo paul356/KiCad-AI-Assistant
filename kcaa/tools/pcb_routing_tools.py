@@ -17,6 +17,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 import json
 import logging
+import math
 import os
 import tempfile
 import time
@@ -795,6 +796,57 @@ def _segment_fields(node: list) -> dict | None:
     return fields
 
 
+def _node_fingerprint(node: list) -> tuple | None:
+    """Deduplication identity for a written ``(segment ...)``/``(arc ...)``.
+
+    ``_segment_fields`` deliberately ignores arc nodes (it describes a
+    segment for removal matching).  The write path must dedupe arcs too:
+    a shoved corner coalesces into *several* arc nodes and every one
+    must survive, while an identical node written twice (multi-leg
+    overlap) must collapse.  Fingerprint includes start/end/mid so two
+    distinct arc halves are never considered duplicates; ``None`` for
+    nodes outside the two track shapes.
+    """
+    if not isinstance(node, list) or len(node) < 2:
+        return None
+    # sexpdata.Symbol subclasses ``str`` but overrides equality, so
+    # ``node[0] in ("segment", "arc")`` is False for a Symbol; always
+    # compare the .value() string.
+    kind = node[0].value() if isinstance(node[0], sexpdata.Symbol) else node[0]
+    if kind not in ("segment", "arc"):
+        return None
+    fields: dict = {}
+    for sub in node[1:]:
+        if not isinstance(sub, list) or len(sub) < 2:
+            continue
+        key = sub[0]
+        if isinstance(key, sexpdata.Symbol):
+            key = key.value()
+        if key == "start" and len(sub) >= 3:
+            fields["start"] = (round(float(sub[1]), 6), round(float(sub[2]), 6))
+        elif key == "mid" and len(sub) >= 3:
+            fields["mid"] = (round(float(sub[1]), 6), round(float(sub[2]), 6))
+        elif key == "end" and len(sub) >= 3:
+            fields["end"] = (round(float(sub[1]), 6), round(float(sub[2]), 6))
+        elif key == "width" and len(sub) >= 2:
+            fields["width"] = round(float(sub[1]), 6)
+        elif key == "layer" and len(sub) >= 2:
+            fields["layer"] = str(sub[1])
+        elif key == "net" and len(sub) >= 2:
+            fields["net"] = _get_net_name(sub)
+    if not all(k in fields for k in ("start", "end", "width", "layer")):
+        return None
+    return (
+        kind,
+        fields.get("start"),
+        fields.get("mid"),  # None for segments
+        fields.get("end"),
+        fields.get("width"),
+        fields.get("layer"),
+        fields.get("net"),
+    )
+
+
 def _track_matches_segment(track: TrackObstacle, fields: dict, eps: float = 1e-6) -> bool:
     """True when the file segment fields equal a segment of the track.
 
@@ -832,31 +884,312 @@ def _track_matches_segment(track: TrackObstacle, fields: dict, eps: float = 1e-6
     return False
 
 
-def _displaced_to_segments(orig: TrackObstacle, displaced: TrackObstacle) -> list[list]:
-    """Serialize a displaced track as consecutive ``(segment ...)`` nodes.
+# A walkaround arc's sampled vertices stay within this of one circle.
+# The real-board shove arc (r=0.717mm, 69.3deg) fits to <=12um; a 45deg
+# chord across it would be ~110um deep and violate the ~9um DRC headroom,
+# so the arc must round-trip as a KiCad (arc ...) node, not a straight
+# cut or a chain of slivers.
+ARC_FIT_TOLERANCE_MM = 25.0 * 1e-3
+# Longest collinear run before splitting (guard against giga-vertices).
+MAX_STRAIGHT_RUN_PTS = 16
+# An arc spanning more than this cannot be faithfully encoded by one
+# 3-point (arc ...) node (the three points would be nigh-collinear on a
+# ~180deg arc, making the circumcircle degenerate); split such arcs.
+MAX_ARC_SPAN_DEG = 165.0
+# Minimum vertices a circular run must span to count as an arc (three
+# points always define *a* circle; five make the fit meaningful).
+MIN_ARC_PTS = 5
+# Arc samples from the hull walkaround are densely polygonized: every
+# step is <=~0.3mm, typically 10-40um.  A straight shove leg between
+# far-apart vertices (1.6mm+) fits *some* big circle (r~2.7mm) with
+# residual under ARC_FIT_TOLERANCE_MM, so a bare residual check lets a
+# "straight + diagonal + straight" window masquerade as one arc and
+# swallow the corner geometry.  One hop of MAX_ARC_STEP_MM or more in
+# the window is a leg, not an arc sample.
+MAX_ARC_STEP_MM = 0.5
 
-    Every consecutive point pair of the displaced centerline becomes one
-    segment with the original width/layer/net.  Zero-length hops are
-    skipped (the shove can emit coincident chain vertices).
+
+def _collinear_k(
+    pts: list[tuple[float, float]],
+    i: int,
+    k: int,
+    eps: float = 1e-6,
+) -> bool:
+    """True when vertex ``k`` lies on the line through ``pts[i]``..``pts[k-1]``.
+
+    Uses the normalized cross product of the cumulative direction; the
+    tolerance is an angle (radians), so long runs of a true line stay
+    merged while a 45deg corner (cross ~ 0.7) breaks the run.
     """
-    segs: list[list] = []
-    pts = displaced.points
-    for i in range(len(pts) - 1):
-        x1, y1 = pts[i]
-        x2, y2 = pts[i + 1]
-        if abs(x1 - x2) <= 1e-9 and abs(y1 - y2) <= 1e-9:
+    a = pts[i]
+    b = pts[k - 1]
+    c = pts[k]
+    len_ab = math.hypot(b[0] - a[0], b[1] - a[1])
+    len_bc = math.hypot(c[0] - b[0], c[1] - b[1])
+    denom = max(len_ab * len_bc, 1e-12)
+    cross = abs((b[0] - a[0]) * (c[1] - b[1]) - (b[1] - a[1]) * (c[0] - b[0]))
+    return cross / denom <= eps
+
+
+def _circle_from_three(
+    a: tuple[float, float],
+    b: tuple[float, float],
+    c: tuple[float, float],
+) -> tuple[tuple[float, float], float] | None:
+    """Circumcenter + radius of the circle through ``a``, ``b``, ``c``.
+
+    ``None`` when the three points are (nearly) collinear — their
+    circumcircle is degenerate.
+    """
+    d = 2.0 * (a[0] * (b[1] - c[1]) + b[0] * (c[1] - a[1]) + c[0] * (a[1] - b[1]))
+    if abs(d) < 1e-12:
+        return None
+    a2 = a[0] * a[0] + a[1] * a[1]
+    b2 = b[0] * b[0] + b[1] * b[1]
+    c2 = c[0] * c[0] + c[1] * c[1]
+    ux = (a2 * (b[1] - c[1]) + b2 * (c[1] - a[1]) + c2 * (a[1] - b[1])) / d
+    uy = (a2 * (c[0] - b[0]) + b2 * (a[0] - c[0]) + c2 * (b[0] - a[0])) / d
+    r = math.hypot(a[0] - ux, a[1] - uy)
+    return (ux, uy), r
+
+
+def _arc_span_deg(
+    start: tuple[float, float],
+    end: tuple[float, float],
+    center: tuple[float, float],
+) -> float:
+    """Signed angle between ``start`` and ``end`` around ``center``."""
+    cx, cy = center
+    a1 = math.atan2(start[1] - cy, start[0] - cx)
+    a2 = math.atan2(end[1] - cy, end[0] - cx)
+    span = (a2 - a1 + math.pi) % (2 * math.pi) - math.pi
+    return math.degrees(abs(span))
+
+
+def _fit_circle_lsq(
+    pts: list[tuple[float, float]],
+) -> tuple[tuple[float, float], float] | None:
+    """Least-squares circle through ``pts`` (center, radius).
+
+    Minimizes the algebraic fit ``x^2+y^2+Dx+Ey+F=0`` via normal
+    equations on mean-centered coordinates.  Mean-centering is not
+    optional: the raw normal matrix has entries like ``sum x^4 ~ 1e9``
+    against a constant row of ``n ~ 1e2`` (condition number ~ 1e12),
+    which amplifies round-off into a wrong circle.  In centered
+    coordinates every moment is O(span^2) and the fit is stable.
+
+    ``None`` when the points are (nearly) collinear (radius blows up).
+    """
+    n = len(pts)
+    if n < 3:
+        return None
+    mx = sum(p[0] for p in pts) / n
+    my = sum(p[1] for p in pts) / n
+    # Normal equations for a x^2 + b xy + c y^2 + ... on centered points:
+    # solve  [Sxx  Sxy  Sx ] [D]   [ -Sx3  ]
+    #        [Sxy  Syy  Sy ] [E] = [ -Sy3  ]
+    #        [Sx   Sy   n  ] [F]   [ -(Sxx+Syy) ]
+    # with Sx3 = sum x*(x^2+y^2), Sy3 = sum y*(x^2+y^2).  The naive
+    # split of ``sum x*(x^2+y^2)`` into ``sum x^3 + sum x y^2`` invites
+    # double-counting bugs; keep the single rotated moment instead.
+    S = {"x": 0.0, "y": 0.0, "xx": 0.0, "yy": 0.0, "xy": 0.0, "x3": 0.0, "y3": 0.0}
+    for px, py in pts:
+        x = px - mx
+        y = py - my
+        S["x"] += x
+        S["y"] += y
+        S["xx"] += x * x
+        S["yy"] += y * y
+        S["xy"] += x * y
+        r2 = x * x + y * y
+        S["x3"] += x * r2
+        S["y3"] += y * r2
+    a = [[S["xx"], S["xy"], S["x"]], [S["xy"], S["yy"], S["y"]], [S["x"], S["y"], float(n)]]
+    b = [-S["x3"], -S["y3"], -(S["xx"] + S["yy"])]
+    # Gaussian elimination with partial pivoting (3x3).
+    for col in range(3):
+        piv = max(range(col, 3), key=lambda r: abs(a[r][col]))
+        if abs(a[piv][col]) < 1e-12:
+            return None
+        a[col], a[piv] = a[piv], a[col]
+        b[col], b[piv] = b[piv], b[col]
+        for r in range(3):
+            if r == col:
+                continue
+            f = a[r][col] / a[col][col]
+            for c in range(col, 3):
+                a[r][c] -= f * a[col][c]
+            b[r] -= f * b[col]
+    d = b[0] / a[0][0]
+    e = b[1] / a[1][1]
+    f = b[2] / a[2][2]
+    cx = -d / 2.0 + mx
+    cy = -e / 2.0 + my
+    radius = math.sqrt(max(d * d / 4.0 + e * e / 4.0 - f, 0.0))
+    if radius < 1e-9 or radius > 1e4:
+        return None
+    return (cx, cy), radius
+
+
+def _best_arc_run(
+    pts: list[tuple[float, float]],
+    i: int,
+    tolerance: float,
+) -> tuple[int, tuple[float, float], float] | None:
+    """Longest circular run ``[i..k]`` with ``>= MIN_ARC_PTS`` vertices.
+
+    The circle is fit by least squares over the WHOLE window (not three
+    anchor points): a hull arc is polygonized with ~13um of noise per
+    vertex, and a 3-point circumcircle is anchor-sensitive at that
+    noise, shedding vertices or swallowing a straight leg.  Growing the
+    window re-fits over all samples; the first k whose window no longer
+    fits one circle stops the run.
+
+    A residual check alone is not enough: two long straight legs joined
+    by a short diagonal fit one big circle (r~2.7mm) with every vertex
+    inside ARC_FIT_TOLERANCE_MM, swallowing the corner geometry.  The
+    step-length gate rejects that: a hull arc never hops
+    MAX_ARC_STEP_MM+ in one sample, a shove leg does.
+
+    Returns ``(k, center, radius)`` or ``None``.
+    """
+    n = len(pts)
+    best: tuple[int, tuple[float, float], float] | None = None
+    for k in range(i + MIN_ARC_PTS - 1, n):
+        # One hop of MAX_ARC_STEP_MM+ anywhere in the window is a
+        # straight leg, not an arc sample; stop growing (a later vertex
+        # cannot repair the length evidence).
+        if any(
+            math.hypot(pts[t + 1][0] - pts[t][0], pts[t + 1][1] - pts[t][1]) > MAX_ARC_STEP_MM
+            for t in range(i, k)
+        ):
+            break
+        circ = _fit_circle_lsq(pts[i : k + 1])
+        if circ is None:
+            break
+        center, radius = circ
+        if all(
+            abs(math.hypot(x - center[0], y - center[1]) - radius) <= tolerance
+            for x, y in pts[i : k + 1]
+        ):
+            best = (k, center, radius)
+        else:
+            break
+    return best
+
+
+def _track_node(
+    kind: str,
+    p1: tuple[float, float],
+    p2: tuple[float, float],
+    p3: tuple[float, float] | None,
+    displaced: TrackObstacle,
+) -> list:
+    """Build a ``(segment ...)`` or ``(arc start mid end ...)`` sexp node."""
+    node = [sexpdata.Symbol(kind)]
+    node.append([sexpdata.Symbol("start"), p1[0], p1[1]])
+    if kind == "arc":
+        node.append([sexpdata.Symbol("mid"), p2[0], p2[1]])
+        node.append([sexpdata.Symbol("end"), p3[0], p3[1]])  # type: ignore[index]
+    else:
+        node.append([sexpdata.Symbol("end"), p2[0], p2[1]])
+    node.append([sexpdata.Symbol("width"), displaced.width])
+    node.append([sexpdata.Symbol("layer"), displaced.layer])
+    node.append([sexpdata.Symbol("net"), displaced.net])
+    return node
+
+
+def _split_arc(
+    start: tuple[float, float],
+    end: tuple[float, float],
+    center: tuple[float, float],
+    radius: float,
+    samples: list[tuple[float, float]],
+    displaced: TrackObstacle,
+) -> list[list]:
+    """Split a long arc at a mid-window sampled vertex into two 3-point
+    ``(arc ...)`` nodes.
+
+    The join and the two mid points are REAL vertices ``samples`` (the
+    window the arc was fitted from), never fitted coordinates: the
+    serialized chain then stays locked to the walkaround polyline and
+    the file nodes connect start/end exactly.  All three points of each
+    half are within the fit tolerance of one circle, so KiCad rebuilds
+    the same arc.
+    """
+    n = len(samples)
+    join_i = n // 2
+    first = samples[: join_i + 1]
+    second = samples[join_i:]
+    join = samples[join_i]
+    mid0 = first[len(first) // 2]
+    mid1 = second[len(second) // 2]
+    return [
+        _track_node("arc", start, mid0, join, displaced),
+        _track_node("arc", join, mid1, end, displaced),
+    ]
+
+
+def _displaced_to_segments(orig: TrackObstacle, displaced: TrackObstacle) -> list[list]:
+    """Serialize a displaced track as ``(segment ...)`` / ``(arc ...)`` nodes.
+
+    The shoved polyline comes out of the hull walkaround as a dense
+    vertex chain: straight legs carry sub-millimeter intermediate samples
+    and a corner becomes ~20-100 vertices on one circle.  Emitting every
+    pair as its own ``(segment ...)`` floods the board file with slivers
+    (KiCad shows the corner as a mass of tiny tracks).  Instead:
+
+      * maximal collinear runs collapse into one segment,
+      * maximal circular runs (every vertex on one circle within
+        ``ARC_FIT_TOLERANCE_MM``) collapse into one ``(arc ...)`` node
+        (start / fitted midpoint / end),
+      * an arc too long for one 3-point node splits at its arc midpoint,
+        and
+      * leftover isolated pairs emit as before.
+
+    Zero-length hops are skipped (the shove can emit coincident chain
+    vertices).
+    """
+    nodes: list[list] = []
+    pts = list(displaced.points)
+    n = len(pts)
+    i = 0
+    while i < n - 1:
+        # --- Collinear run: extend while pts[k] stays on the line.
+        j = i + 1
+        while j < n - 1 and j - i < MAX_STRAIGHT_RUN_PTS and _collinear_k(pts, i, j + 1):
+            j += 1
+        if j > i + 1:
+            nodes.append(_track_node("segment", pts[i], pts[j], None, displaced))
+            i = j
             continue
-        segs.append(
-            [
-                sexpdata.Symbol("segment"),
-                [sexpdata.Symbol("start"), x1, y1],
-                [sexpdata.Symbol("end"), x2, y2],
-                [sexpdata.Symbol("width"), displaced.width],
-                [sexpdata.Symbol("layer"), displaced.layer],
-                [sexpdata.Symbol("net"), displaced.net],
-            ]
-        )
-    return segs
+
+        # --- Circular run from here.  The step-length gate inside
+        #     ``_best_arc_run`` already refutes legs: a window that
+        #     contains a straight shove leg (one hop >= MAX_ARC_STEP_MM)
+        #     fits *some* big circle under the residual tolerance, so
+        #     growing the run refuses it.  Whatever survives is a dense
+        #     hull-arc polygon and is safe to emit as one arc node.
+        arc = _best_arc_run(pts, i, ARC_FIT_TOLERANCE_MM)
+        if arc is not None and arc[0] > i:
+            best_k, best_c, best_r = arc
+            span = _arc_span_deg(pts[i], pts[best_k], best_c)
+            window = pts[i : best_k + 1]
+            if span > MAX_ARC_SPAN_DEG:
+                nodes.extend(_split_arc(pts[i], pts[best_k], best_c, best_r, window, displaced))
+            else:
+                # Mid is a REAL window vertex (within the fit tolerance
+                # of the fitted circle), not a fitted point: the three
+                # nodes stay locked to the walkaround polyline.
+                mid_pt = window[len(window) // 2]
+                nodes.append(_track_node("arc", pts[i], mid_pt, pts[best_k], displaced))
+            i = best_k
+            continue
+
+        # --- Isolated pair (straight leg between two far vertices).
+        nodes.append(_track_node("segment", pts[i], pts[i + 1], None, displaced))
+        i += 1
+    return nodes
 
 
 def _apply_shoved_tracks(
@@ -895,20 +1228,7 @@ def _apply_shoved_tracks(
         kept.append(node)
     for orig, displaced in moved_pairs:
         for seg in _displaced_to_segments(orig, displaced):
-            seg_fields = _segment_fields(seg)
-            fp = (
-                None
-                if seg_fields is None
-                else (
-                    round(seg_fields["start"][0], 6),
-                    round(seg_fields["start"][1], 6),
-                    round(seg_fields["end"][0], 6),
-                    round(seg_fields["end"][1], 6),
-                    round(seg_fields["width"], 6),
-                    seg_fields["layer"],
-                    seg_fields["net"],
-                )
-            )
+            fp = _node_fingerprint(seg)
             if fp in written:
                 continue  # duplicate displacement (multi-leg overlap)
             written.add(fp)

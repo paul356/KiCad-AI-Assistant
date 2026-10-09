@@ -668,6 +668,43 @@ class TestAlgorithmDefaultByVision:
         return out
 
     @staticmethod
+    def _gnd_nodes(pcb_path: str) -> list[dict]:
+        """All GND (net 2) track nodes in the file — segments AND arcs.
+
+        Arc nodes carry ``mid``; segment nodes do not.  ``start``,
+        ``end``, ``width``, ``layer``, ``net`` are shared."""
+        from kcaa.utils.pcb_sexp_utils import load_pcb
+
+        out = []
+        for node in load_pcb(pcb_path):
+            if not isinstance(node, list) or not node:
+                continue
+            kind = node[0].value() if hasattr(node[0], "value") else node[0]
+            if kind not in ("segment", "arc"):
+                continue
+            fields: dict = {}
+            for sub in node[1:]:
+                if not isinstance(sub, list) or len(sub) < 2:
+                    continue
+                key = sub[0].value() if hasattr(sub[0], "value") else sub[0]
+                if key == "start" and len(sub) >= 3:
+                    fields["start"] = (float(sub[1]), float(sub[2]))
+                elif key == "end" and len(sub) >= 3:
+                    fields["end"] = (float(sub[1]), float(sub[2]))
+                elif key == "mid" and len(sub) >= 3:
+                    fields["mid"] = (float(sub[1]), float(sub[2]))
+                elif key == "width" and len(sub) >= 2:
+                    fields["width"] = float(sub[1])
+                elif key == "layer" and len(sub) >= 2:
+                    fields["layer"] = str(sub[1])
+                elif key == "net" and len(sub) >= 2:
+                    fields["net"] = str(sub[-1])
+            if {"start", "end", "width", "layer", "net"} <= set(fields):
+                if fields["net"] == "GND":
+                    out.append(fields)
+        return out
+
+    @staticmethod
     def _vcc_segments(pcb_path: str) -> list[dict]:
         """All VCC track segments currently in the file."""
         from kcaa.tools.pcb_routing_tools import _segment_fields
@@ -745,28 +782,78 @@ class TestAlgorithmDefaultByVision:
                     f"GND segment {line} still crosses routed VCC {v}"
                 )
 
-    def test_shove_written_segments_tile_displaced_polyline(self, tools, crossing_board):
-        """Wherever the displaced polyline has intermediate vertices, the
-        written segments tile it contiguously (p_i -> p_{i+1})."""
+    def test_shove_written_segments_cover_displaced_polyline(self, tools, crossing_board):
+        """The written GND nodes (segments and arc nodes) coalesce the
+        displaced hull polyline end-to-end: every intermediate vertex is
+        either absorbed into a collinear segment or a circular arc, no
+        vertex is dropped, and the chain is head-to-tail continuous.
+        (Regression guard: a dense shove corner used to be written as
+        one bitty segment per vertex pair.)"""
         result = self._route_vcc(tools, crossing_board, strategy="shove")
         assert "error" not in result
         assert result["shoved"]
-        pts = result["shoved"][0]["points"]
+        pts = [tuple(p) for p in result["shoved"][0]["points"]]
         if len(pts) < 3:
-            return  # single-hop displacement: nothing to tile
-        gnd = self._gnd_segments(crossing_board)
-        start = (pts[0][0], pts[0][1])
-        cur = start
-        for p in pts[1:]:
-            nxt = (p[0], p[1])
-            assert any(
-                abs(s["start"][0] - cur[0]) <= 1e-6
-                and abs(s["start"][1] - cur[1]) <= 1e-6
-                and abs(s["end"][0] - nxt[0]) <= 1e-6
-                and abs(s["end"][1] - nxt[1]) <= 1e-6
-                for s in gnd
-            ), f"missing tiling segment {cur} -> {nxt}"
-            cur = nxt
+            return  # single-hop displacement: nothing to coalesce
+        nodes = self._gnd_nodes(crossing_board)
+        assert nodes, "displaced GND track must be present"
+        # Coalescing must actually reduce the node count (the whole point
+        # of the collapse: ~50 dense vertices -> a handful of nodes).
+        assert len(nodes) < len(pts) // 2, (
+            f"expected coalescing, got {len(nodes)} nodes for {len(pts)} vertices"
+        )
+        # Chain must be head-to-tail continuous, matching the polyline.
+        assert nodes[0]["start"] == pts[0], "first node must start at polyline head"
+        assert nodes[-1]["end"] == pts[-1], "last node must end at polyline tail"
+        for prev, nxt in zip(nodes, nodes[1:]):
+            assert prev["end"] == nxt["start"], (
+                f"gap between nodes {prev['end']} and {nxt['start']}"
+            )
+        # Every polyline vertex must lie on the coalesced path: on a
+        # segment leg, or on the arc's circle between its endpoints.
+        import math
+
+        from kcaa.tools.pcb_routing_tools import _circle_from_three
+
+        def _on_arc(p, start, mid, end):
+            circ = _circle_from_three(start, mid, end)
+            if circ is None:
+                return False
+            c, r = circ
+            # Vertices sit on the fitted circle within the fit tolerance
+            # (~13um measured); 0.1mm is a generous but discriminating
+            # bound (a straight leg point is hundreds of microns off).
+            if abs(math.hypot(p[0] - c[0], p[1] - c[1]) - r) > 0.1:
+                return False
+            a0 = math.atan2(start[1] - c[1], start[0] - c[0])
+            a1 = math.atan2(end[1] - c[1], end[0] - c[0])
+            ap = math.atan2(p[1] - c[1], p[0] - c[0])
+            span = (a1 - a0) % (2 * math.pi)
+            rel = (ap - a0) % (2 * math.pi)
+            return rel <= span + 1e-9 or span > math.pi - 1e-9
+
+        for p in pts:
+            on = False
+            for s in nodes:
+                if "mid" in s:
+                    if _on_arc(p, s["start"], s["mid"], s["end"]):
+                        on = True
+                        break
+                else:
+                    (x1, y1), (x2, y2) = s["start"], s["end"]
+                    cross = (p[0] - x1) * (y2 - y1) - (p[1] - y1) * (x2 - x1)
+                    if abs(cross) > 1e-5:
+                        continue
+                    if min(x1, x2) - 1e-5 <= p[0] <= max(x1, x2) + 1e-5 and (
+                        min(y1, y2) - 1e-5 <= p[1] <= max(y1, y2) + 1e-5
+                    ):
+                        on = True
+                        break
+            assert on, f"polyline vertex {p} not covered by written GND nodes"
+        # Node chain must reach the polyline endpoints (the coalesced
+        # routing matches the shoved geometry start/end exactly).
+        assert nodes[0]["start"] == pts[0]
+        assert nodes[-1]["end"] == pts[-1]
 
     def test_walkaround_leaves_gnd_track_untouched(self, tools, crossing_board):
         """strategy=walkaround: no shove, no rewrite — the file still
@@ -950,3 +1037,120 @@ class TestPcbRouteFailureEvidence:
         )
         assert "error" in result
         assert result["route_png"] is None
+
+
+class TestDisplacedSegmentsArcCollapse:
+    """Serialize a shoved hull polyline without flooding the board file.
+
+    The walkaround emits a dense vertex chain: straight legs carry
+    sub-millimeter samples and a corner is ~20-100 vertices of one
+    circle.  ``_displaced_to_segments`` must coalesce collinear runs
+    into one segment and circular runs into one 3-point arc node (the
+    file then holds a handful of nodes instead of one per vertex pair).
+    """
+
+    @staticmethod
+    def _track(*points):
+        from kcaa.router.pns.shove import TrackObstacle
+
+        return TrackObstacle(points=tuple(points), width=0.2, net="GND", layer="F.Cu")
+
+    @staticmethod
+    def _nodes_to_shapes(poly):
+        """Collapse consecutive collinear coordinates so we can compare
+        shapes by their breakpoints (start point of each node)."""
+        out = []
+        for p in poly:
+            out.append((float(p[0]), float(p[1])))
+        return out
+
+    def test_circular_run_collapses_to_arc(self):
+        """~90° arc sampled densely (with 45° polygonization zigzags, as
+        the hull walkaround produces) must come out as ONE arc node, not
+        ~20 slivers."""
+        import math
+
+        from kcaa.tools.pcb_routing_tools import _displaced_to_segments
+
+        cx, cy, r = 100.0, 100.0, 2.0
+        pts = []
+        angles = []
+        a = -45.0
+        while a <= 45.0:
+            angles.append(math.radians(a))
+            a += 3.0
+        # Zigzags: offset every other sample slightly so the chord is not
+        # perfectly circular (hull polygonization), then keep all samples
+        # within 15µm of the true circle.
+        for n, ang in enumerate(angles):
+            x = cx + r * math.cos(ang)
+            y = cy + r * math.sin(ang)
+            if n % 2:
+                x += 0.008
+                y -= 0.008
+            pts.append((x, y))
+        assert len(pts) >= 12
+        orig = self._track((90.0, 97.5), (107.0, 103.0))  # straight-ish original
+        disp = self._track(*pts)
+        nodes = _displaced_to_segments(orig, disp)
+        kinds = [n[0].value() for n in nodes]
+        assert kinds.count("arc") == 1, f"expected one arc, got {kinds}"
+        assert len(nodes) < len(pts) // 2, (
+            f"coalescing failed: {len(nodes)} nodes for {len(pts)} samples"
+        )
+        # The single arc must span the whole run (start at pts[0], end at pts[-1]).
+        arc = nodes[kinds.index("arc")]
+        start = (arc[1][1], arc[1][2])
+        end = (arc[3][1], arc[3][2])
+        assert start == tuple(pts[0])
+        assert end == tuple(pts[-1])
+
+    def test_collinear_run_collapses_to_segment(self):
+        """A straight leg with many interior samples must be one segment."""
+        from kcaa.tools.pcb_routing_tools import _displaced_to_segments
+
+        pts = [(10.0 + 0.5 * k, 20.0) for k in range(10)]
+        orig = self._track((10.0, 20.0), (15.0, 20.0))
+        disp = self._track(*pts)
+        nodes = _displaced_to_segments(orig, disp)
+        assert len(nodes) == 1
+        assert nodes[0][0].value() == "segment"
+        s = (nodes[0][1][1], nodes[0][1][2])
+        e = (nodes[0][2][1], nodes[0][2][2])
+        assert s == (10.0, 20.0)
+        assert e == (14.5, 20.0)
+
+    def test_coincident_vertices_skipped(self):
+        """Zero-length hops (coincident chain vertices the shove can
+        emit) must not become zero-length segments."""
+        from kcaa.tools.pcb_routing_tools import _displaced_to_segments
+
+        pts = [(10.0, 20.0), (10.0, 20.0), (12.0, 20.0), (12.0, 20.0), (14.0, 20.0)]
+        orig = self._track((10.0, 20.0), (14.0, 20.0))
+        disp = self._track(*pts)
+        nodes = _displaced_to_segments(orig, disp)
+        # All duplicate hops absorbed into the single collinear segment.
+        assert len(nodes) == 1
+        assert nodes[0][0].value() == "segment"
+        s = (nodes[0][1][1], nodes[0][1][2])
+        e = (nodes[0][2][1], nodes[0][2][2])
+        assert s == (10.0, 20.0)
+        assert e == (14.0, 20.0)
+
+    def test_zigzag_does_not_become_arc(self):
+        """A true 45° miter zigzag (alternating +45/-45 turns, net zero)
+        is a straight-ish leg, not a circle: it must NOT be collapsed
+        into a giant fake arc."""
+        from kcaa.tools.pcb_routing_tools import _displaced_to_segments
+
+        pts = []
+        x, y = 0.0, 0.0
+        for k in range(8):
+            x += 0.5
+            y += 0.25 if k % 2 == 0 else -0.25
+            pts.append((x, y))
+        orig = self._track((0.0, 0.0), (4.0, 0.0))
+        disp = self._track(*pts)
+        nodes = _displaced_to_segments(orig, disp)
+        kinds = [n[0].value() for n in nodes]
+        assert "arc" not in kinds, f"zigzag must not collapse into an arc, got {kinds}"
