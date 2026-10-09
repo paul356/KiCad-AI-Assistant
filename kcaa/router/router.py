@@ -1667,12 +1667,18 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
                         f"unsupported anchor kind {kind!r}; expected 'waypoint' or 'via'"
                     )
                 if pending_layer != end_layer:
-                    raise RouteFailure(
-                        f"anchor chain ends on layer {pending_layer!r} but pad "
-                        f"{req.ref_b}/{req.pad_b} is on {end_layer!r}; add a via "
-                        "anchor that reaches the target layer (allowed via_pairs "
-                        f"{list(req.via_pairs)})"
-                    )
+                    # A thru-hole terminal pad carries copper on every
+                    # layer, so an anchor chain ending on ANY of its
+                    # copper layers is a valid terminus -- only an SMD
+                    # pad (fixed to one layer) must match ``end_layer``
+                    # exactly.
+                    if _find_pad_center(data, req.ref_b, req.pad_b, pending_layer) is None:
+                        raise RouteFailure(
+                            f"anchor chain ends on layer {pending_layer!r} but pad "
+                            f"{req.ref_b}/{req.pad_b} is on {end_layer!r}; add a via "
+                            "anchor that reaches the target layer (allowed via_pairs "
+                            f"{list(req.via_pairs)})"
+                        )
                 run_leg(
                     pending_pos,
                     pad_b_xy,
@@ -2996,10 +3002,14 @@ def _layer_engine_obstacles(
             continue
         is_end_a = abs(center[0] - pad_a_xy[0]) < 1e-6 and abs(center[1] - pad_a_xy[1]) < 1e-6
         is_end_b = abs(center[0] - pad_b_xy[0]) < 1e-6 and abs(center[1] - pad_b_xy[1]) < 1e-6
-        if is_end_a and layer == start_layer:
+        # A thru-hole terminal pad carries copper on every layer (the
+        # ``layer in players`` filter above already passed), so an
+        # anchor chain may terminate on it from ANY of its copper
+        # layers -- not only the layer ``_resolve_layers`` picked as
+        # the nominal end.  An SMD pad only ever reaches this point on
+        # its single fixed layer, so the exemption stays precise.
+        if is_end_a or is_end_b:
             continue  # the route terminates on this pad
-        if is_end_b and layer == end_layer:
-            continue
         engine_obstacles.append(
             Obstacle(shape=poly, layers=frozenset({layer}), net=req.net, kind="pad")
         )

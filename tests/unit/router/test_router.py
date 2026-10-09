@@ -1721,13 +1721,61 @@ def test_pns_multi_layer_route_crosses_layers(tmp_path: Path) -> None:
             )
 
 
+def test_pns_anchor_chain_terminates_on_tht_any_copper_layer(tmp_path: Path) -> None:
+    """A thru-hole endpoint pad has copper on every layer, so an explicit
+    via-anchor chain may terminate on it from ANY of its copper layers --
+    not only the layer ``_resolve_layers`` picked as the nominal end.
+
+    Reported bug: R1/1 is SMD on F.Cu (fixed), X1/T is THT; with no
+    layer_hint the shared layer is F.Cu, so ``end_layer`` resolves to
+    F.Cu.  A user-driven via chain F.Cu -> B.Cu then had to re-via back
+    to F.Cu (a stub) because (a) the chain-end check demanded
+    ``pending_layer == end_layer`` and (b) the B.Cu leg's obstacle set
+    did not exempt the THT endpoint on B.Cu -- the pad was walked around
+    as an obstacle instead of being terminated on.  Both are wrong for a
+    THT pad: it must accept the chain on B.Cu directly (one via, no F.Cu
+    stub)."""
+    dst = _write_pns_board(tmp_path, _x1_tht_on_b_cu())
+
+    result = auto_route_pair(
+        RouteRequest(
+            pcb_path=str(dst),
+            ref_a="R1",
+            pad_a="1",
+            ref_b="X1",
+            pad_b="T",
+            net="VCC",
+            # No layer_hint: shared layer = F.Cu, so end_layer resolves
+            # to F.Cu even though X1/T is THT on all copper layers.
+            width=0.25,
+            clearance=0.2,
+            algorithm="pns",
+            corner_mode="mitered45",
+            waypoints=[{"kind": "via", "pos": (45.0, 35.0), "to_layer": "B.Cu"}],
+        )
+    )
+    # One via (F.Cu -> B.Cu), no re-via stub back to F.Cu.
+    assert len(result.vias) == 1
+    assert result.vias[0].layers == ("F.Cu", "B.Cu")
+    assert result.layers_used == ["F.Cu", "B.Cu"]
+    assert result.waypoint_violated is False
+    # The route terminates on the THT pad at world (62, 45) on B.Cu, not
+    # on a re-via to F.Cu near it.
+    assert result.end == pytest.approx((62.0, 45.0), abs=0.1)
+    b_segs = [s for s in result.segments if s.layer == "B.Cu"]
+    assert b_segs, "B.Cu leg must terminate on the THT pad"
+    assert any(abs(s.x2 - 62.0) < 0.1 and abs(s.y2 - 45.0) < 0.1 for s in b_segs), (
+        "a B.Cu segment must end exactly on the THT pad centre"
+    )
+    assert result.arcs == []
+
+
 def test_pns_multi_layer_via_not_on_same_net_pad(tmp_path: Path) -> None:
     """The PNS via picker must avoid ALL same-net pad faces, not just the
     two endpoint pads (DFM defect: solder wicking / annular-ring breakout).
     Mirrors the multi-layer A* test of the same name."""
     from shapely.geometry import Point, box
 
-    # X3: same-net SMD pads on F.Cu near the route corridor between
     # R1/1 (29.5, 30) and X1/T (64, 45).  Neither pad is an endpoint;
     # the PNS via must avoid both.
     x3 = (
