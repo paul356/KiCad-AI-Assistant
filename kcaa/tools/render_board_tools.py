@@ -1131,9 +1131,15 @@ def _draw_arc(ax, entry: dict, color: str, lw: float, alpha: float, zorder: int)
 
 
 _MIN_RENDER_WIDTH_PX = 1600  # sharpness floor for any rendered width
+# Hard ceiling for the pixel-width floor: the figure-growth branch below
+# would otherwise honor any caller value, and an extreme ``min_width_px``
+# (e.g. 100000) would allocate a huge Agg buffer even though the dpi clamp
+# already capped the resolution.  4x the sharpness floor is far beyond any
+# practical render while keeping the buffer small.
+_MAX_RENDER_WIDTH_PX = 4 * _MIN_RENDER_WIDTH_PX
 # Matplotlib's Agg renderer allocates path buffers that explode with the
 # dpi value itself; past ~40k dpi it raises MemoryError (std::bad_alloc)
-# on tiny figures.  When the 1600 px floor needs a higher dpi, the figure
+# on tiny figures.  When the pixel floor needs a higher dpi, the figure
 # grows in inches instead (same pixel output, safe dpi).
 _MAX_SAFE_DPI = 4000
 
@@ -1153,24 +1159,30 @@ def _new_board_figure(
     mm_per_px)``: ``eff_dpi`` is the dpi actually used for savefig and
     ``mm_per_px`` the true scale of the rendered image (used to size
     pixel-constant decorations like ratsnest dashes).  The rendered width
-    is >= ``_MIN_RENDER_WIDTH_PX`` at any board size, so a narrow region
+    is >= the pixel-width floor in effect (``min_width_px``, default
+    ``_MIN_RENDER_WIDTH_PX`` = 1600) at any board size, so a narrow region
     zooms at full-board sharpness.
 
     ``min_width_px``: optional pixel-width floor for the rendered image;
     ``None`` keeps the default ``_MIN_RENDER_WIDTH_PX`` (1600) sharpness
     floor.  Budget-limited callers can pass a smaller target (e.g. 1024)
     to downscale the PNG — the dpi scaling and figure-growth logic apply
-    to the given floor exactly as to the default.  Degenerate values are
-    sanity-floored to >= 1 so a non-positive input still renders.
+    to the given floor exactly as to the default.  Values are clamped to
+    ``[1, _MAX_RENDER_WIDTH_PX]`` so a non-positive input still renders
+    and an extreme input cannot trigger a giant Agg buffer.
     """
     min_width_px = _MIN_RENDER_WIDTH_PX if min_width_px is None else min_width_px
-    min_width_px = max(1, min_width_px)
+    # Clamp to a sane range: at least 1 px, at most the hard ceiling, so a
+    # degenerate or extreme caller value can neither collapse the render
+    # nor allocate an unbounded Agg buffer via figure growth.
+    min_width_px = min(max(1, min_width_px), _MAX_RENDER_WIDTH_PX)
     w_mm = xmax - xmin
     h_mm = ymax - ymin
     fig_w_in = w_mm / 25.4
     fig_h_in = h_mm / 25.4
-    # Scale dpi so the output is sharp at any board size (min 1600px wide);
-    # clamp the floor so the Agg renderer never sees an extreme dpi.
+    # Scale dpi so the output is sharp at any board size (at least the
+    # pixel floor wide); clamp the floor so the Agg renderer never sees an
+    # extreme dpi.
     if w_mm >= 0.1:
         dpi = max(dpi, min(int(min_width_px / fig_w_in), _MAX_SAFE_DPI))
         if fig_w_in * dpi < min_width_px:
@@ -1627,7 +1639,8 @@ def render_board(
     y_max]`` in mm (KiCad +Y down) to zoom into.  The rendered frame
     becomes exactly this box — returned as ``region_bbox`` so a caller can
     map the crop back into full-board space — and the dpi floor is raised
-    so a region still renders >= 1600 px wide (full-board sharpness).
+    so a region still renders >= the ``min_width_px`` floor wide (default
+    1600 px, full-board sharpness).
 
     ``include_pad_coords``: also report machine-usable pad coordinates
     ``pads_coords`` (ref, number, net, center [x, y] mm, layer) so a

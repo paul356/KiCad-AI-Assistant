@@ -8,6 +8,7 @@ parsing with center coordinate, bounding box with circular geometry,
 multi-layer rendering, and robust drawing of malformed entries).
 """
 
+import ast
 import asyncio
 import inspect
 import math
@@ -24,6 +25,7 @@ BOARD_FIXTURE = os.path.join(FIXTURE_DIR, "test_board.kicad_pcb")
 
 from kcaa.tools.render_board_tools import (  # noqa: E402
     _BG_COLOR,
+    _MAX_RENDER_WIDTH_PX,
     BoardData,
     _board_outline,
     _bounds,
@@ -548,9 +550,10 @@ class TestMinRenderWidth:
         default_lines, default_png, default_report = self.render(tmp_path)
         lines, png, report = self.render(tmp_path, min_width_px=1024)
         width, _ = _png_size(png)
-        # Downscaled: strictly below the 1600 floor but >= the 1024 target
-        # (dpi rounding may nudge a pixel up, never below).
-        assert 1024 <= width < 1600
+        # Downscaled: strictly below the 1600 floor but at the 1024 target
+        # (int() dpi truncation can shave one px, same slack as the 1590
+        # default-floor assertion).
+        assert 1023 <= width < 1600
         assert report["render_width_px"] == width
         # The text envelope stays authoritative: pad labels / net info are
         # identical to the default render regardless of image size.
@@ -573,6 +576,20 @@ class TestMinRenderWidth:
         assert report["render_width_px"] == width
         # All degenerate values land on the same clamped render.
         _, ref_png, _ = self.render(tmp_path, min_width_px=1)
+        assert png == ref_png
+
+    @pytest.mark.parametrize("min_width_px", [8_000, 100_000])
+    def test_extreme_floor_clamped_to_max_width(self, tmp_path, min_width_px):
+        # The figure-growth branch would otherwise honor a 100000 px floor
+        # (32 GB RGBA buffer -> OOM) even though the dpi clamp capped the
+        # resolution; the floor must be capped at _MAX_RENDER_WIDTH_PX.
+        _, png, report = self.render(tmp_path, min_width_px=min_width_px)
+        width, _ = _png_size(png)
+        assert min_width_px > _MAX_RENDER_WIDTH_PX > 1600  # inputs exceed the ceiling
+        assert width <= _MAX_RENDER_WIDTH_PX
+        assert report["render_width_px"] == width
+        # Any value past the ceiling lands on the same capped render.
+        _, ref_png, _ = self.render(tmp_path, min_width_px=_MAX_RENDER_WIDTH_PX + 1)
         assert png == ref_png
 
 
@@ -806,7 +823,10 @@ class TestToolRegistration:
             )
         )
         width, _ = _png_size(img.data)
-        assert 1024 <= width < 1600
+        assert 1023 <= width < 1600
+        # The text-envelope report agrees with the actual PNG bytes.
+        tail = report_text.split("report=", 1)[1]
+        assert ast.literal_eval(tail)["render_width_px"] == width
         # Pad coordinates / net info stay in the text envelope.
         assert "pads_coords" in report_text
         assert "R1" in report_text
