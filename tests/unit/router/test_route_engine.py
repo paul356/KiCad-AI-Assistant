@@ -12,6 +12,7 @@ from kcaa.router.pns.shove import ShoveFailure, TrackObstacle
 from kcaa.router.route_engine import (
     PnsFailure,
     _audit_final_copper,
+    _coalesce_stub_pairs,
     _family_hull,
     _path_len,
     _rect_medians,
@@ -458,6 +459,59 @@ class TestSnap45Line:
         assert _segments_on_45(out)
         assert _turns_le_45(out)
         assert (20.0, 0.0) in out[:-1]
+
+
+class TestCoalesceStubPairs:
+    """Walkaround stub pairs (two ~0.04 mm zigzag segments) are absorbed
+    into the long family legs flanking them."""
+
+    def test_repro_stub_pair_absorbed(self):
+        # Exact repro: the walked path passed the hull corner within a
+        # hair, so two stub segments (135-deg sliver + 90-deg return)
+        # appeared between the vertical and diagonal legs.
+        pts = [
+            (116.78, 80.49),  # long vertical leg
+            (116.78, 79.8083),  # a — hull corner
+            (116.8093, 79.7790),  # b — 135-deg sliver
+            (116.8093, 79.7376),  # c — 90-deg return
+            (117.3976, 79.1493),  # long diagonal leg
+        ]
+        out = _coalesce_stub_pairs(pts)
+        assert len(out) == 3
+        # No segment is shorter than the stub threshold (all absorbed).
+        for i in range(len(out) - 1):
+            d = math.hypot(out[i + 1][0] - out[i][0], out[i + 1][1] - out[i][1])
+            assert d >= 0.12 - 1e-9
+        assert _segments_on_45(out)
+
+    def test_unflanked_stub_pair_kept(self):
+        # No long leg before the pair: coalescing must leave the path
+        # alone (a stub at the very start cannot be absorbed backwards).
+        pts = [
+            (0.0, 0.0),
+            (0.0293, -0.0293),
+            (0.0293, -0.0707),
+            (1.0, 1.0),
+        ]
+        assert _coalesce_stub_pairs(pts) == pts
+
+    def test_parallel_legs_pair_kept(self):
+        # The two flanking legs are parallel (a real lateral step, not a
+        # hull corner graze): no single intersection exists, keep pair.
+        pts = [
+            (0.0, 0.0),
+            (0.0, 0.5),
+            (0.0293, 0.5),
+            (0.0293, 0.5414),
+            (0.0293, 1.0),
+        ]
+        out = _coalesce_stub_pairs(pts)
+        assert out == pts
+
+    def test_degenerate_short_pair_kept(self):
+        # Two stubs at the very end of the path with no follower.
+        pts = [(0.0, 0.0), (10.0, 0.0), (10.03, 0.03), (10.03, 0.07)]
+        assert _coalesce_stub_pairs(pts) == pts
 
 
 class TestFinalAudit:

@@ -501,6 +501,36 @@ def route_engine(
             )
         out_path = _snap45_line(out_path, route_hulls)
 
+    # Coalesce the walkaround's stub pairs.  When a polyline passes
+    # within a hair of a family hull corner, the graph traversal emits a
+    # pair of ~0.04 mm segments (e.g. a 45° hull-edge sliver plus the
+    # axial return onto the original line) whose combined direction is
+    # halfway between two family slots.  merge_family_chain can't touch
+    # them (not collinear) and snap45 can't realign the pair into one
+    # family run — they would survive to the output as a visible zigzag.
+    # Absorb each pair into the long family legs flanking it; the merged
+    # point lies on both flanking lines so the restart stays on the
+    # family.  The final copper audit below is the DRC gate — a merged
+    # candidate that violates net clearance keeps the original path.
+    if out_path != skeleton:
+        merged = _coalesce_stub_pairs(out_path)
+        merged = _merge_family_chain(merged)
+        if merged != out_path:
+            try:
+                _audit_final_copper(
+                    out_path=merged,
+                    width=track_width,
+                    net=net,
+                    obstacles=obstacles,
+                    extra_fixed=extra_fixed,
+                    moved_pairs=moved_pairs,
+                    orig_obstacle_ids=orig_obstacle_ids,
+                    clearance=clearance,
+                )
+                out_path = merged
+            except PnsFailure:
+                pass  # merged line would violate DRC: keep walked path
+
     # Final all-copper DRC audit: the route and every displacement must
     # keep ``clearance`` from every foreign-net copper item of the final
     # state (fixed solids, unmoved tracks, other displacements, same-net
@@ -621,6 +651,99 @@ def _snap45_line(
     if len(deduped) < 2:
         return [pts[0], pts[-1]]
     return _merge_family_chain(deduped)
+
+
+def _coalesce_stub_pairs(
+    pts: Sequence[tuple[float, float]],
+    max_stub: float = 0.12,
+) -> list[tuple[float, float]]:
+    """Absorb a walkaround stub pair into the long legs flanking it.
+
+    When a polyline passes within a hair of a family hull corner, the
+    graph traversal emits a pair of very short segments — one 45-degree
+    hull-edge sliver plus the axial/diagonal return onto the original
+    line (e.g. ``116.78,79.8083 -> 116.8093,79.779 -> 116.8093,79.7376``,
+    both ~0.041 mm).  Their combined direction is halfway between two
+    family slots, so ``_merge_family_chain`` keeps them (not collinear)
+    and ``_snap45_line`` cannot realign the pair into one family run —
+    they would survive to the output as a visible zigzag.
+
+    The pair (a -> b -> c) is absorbed into its neighbors: extend the
+    long leg *before* ``a`` and the long leg *after* ``c`` until the
+    two extension lines meet at ``p``; replacing [a, b, c] with [p]
+    merges both micro-segments into one diagonal whose endpoints lie on
+    the two flanking family lines (no off-family direction introduced).
+    When the pair is not flanked by two long family legs the pair is
+    kept — coalescing must never rewrite a legitimate short feature.
+
+    The candidate is later DRC-audited; if the merged line violates net
+    clearance the caller keeps the original path, so this pass is
+    strictly an improvement (fewer segments) or a no-op.
+    """
+    if len(pts) < 4:
+        return list(pts)
+
+    def _slot(p: tuple[float, float], q: tuple[float, float]) -> int | None:
+        dx = q[0] - p[0]
+        dy = q[1] - p[1]
+        if abs(dx) < 1e-9 and abs(dy) < 1e-9:
+            return None
+        if abs(dx) < 1e-9:
+            return 0  # V
+        if abs(dy) < 1e-9:
+            return 1  # H
+        if abs(abs(dx) - abs(dy)) < 1e-6:
+            return 2 if dx * dy > 0 else 3  # D+ / D-
+        return None
+
+    out = list(pts)
+    i = 1
+    while i < len(out) - 2:
+        a = out[i - 1]
+        b = out[i]
+        c = out[i + 1]
+        d_ab = math.hypot(b[0] - a[0], b[1] - a[1])
+        d_bc = math.hypot(c[0] - b[0], c[1] - b[1])
+        if d_ab >= max_stub or d_bc >= max_stub:
+            i += 1
+            continue
+        if i < 2 or i + 2 >= len(out):
+            i += 1
+            continue  # needs a sane long leg before a and after c
+        prev = out[i - 2]
+        nxt = out[i + 2]
+        leg1 = (a[0] - prev[0], a[1] - prev[1])
+        leg2 = (nxt[0] - c[0], nxt[1] - c[1])
+        if _slot(prev, a) is None or _slot(c, nxt) is None:
+            i += 1
+            continue  # flanking legs must stay on the family
+        # Extend leg1 (prev -> a) beyond a and leg2 (c -> nxt) beyond c;
+        # their intersection becomes the merged point p.
+        det = leg1[0] * leg2[1] - leg1[1] * leg2[0]
+        if abs(det) < 1e-12:
+            i += 1
+            continue  # parallel legs: the pair is a real step, keep it
+        # Solve prev + t1*leg1 == c + t2*leg2  (t1 counts from prev,
+        # extended past a when t1 > 1; t2 counts from c, extended past c
+        # when t2 < 1 keeps p -> nxt pointing along leg2).
+        ox, oy = c[0] - prev[0], c[1] - prev[1]
+        t1 = (ox * leg2[1] - oy * leg2[0]) / det
+        t2 = (ox * leg1[1] - oy * leg1[0]) / det
+        if t1 < 1.0 - 1e-9 or t2 > 1.0 + 1e-9:
+            i += 1
+            continue  # intersection is not ahead of a on leg1 / before nxt on leg2
+        if t1 * math.hypot(*leg1) < 1e-9:
+            i += 1
+            continue
+        p = (prev[0] + t1 * leg1[0], prev[1] + t1 * leg1[1])
+        # Keep a little distance sanity: the merge point must not fly
+        # off catastrophically (a degenerate hull sliver would).
+        if math.hypot(p[0] - a[0], p[1] - a[1]) > 4 * max_stub:
+            i += 1
+            continue
+        out[i - 1 : i + 2] = [p]
+        i = max(1, i - 1)  # re-check the new vertex against its neighbors
+    return out
 
 
 def _merge_family_chain(pts: list[tuple[float, float]]) -> list[tuple[float, float]]:
