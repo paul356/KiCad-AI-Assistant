@@ -796,39 +796,40 @@ def _segment_fields(node: list) -> dict | None:
 
 
 def _track_matches_segment(track: TrackObstacle, fields: dict, eps: float = 1e-6) -> bool:
-    """True when the file segment fields equal the track's geometry.
+    """True when the file segment fields equal a segment of the track.
 
-    Full identity match (start/end/width/layer/net) so unrelated same-net
-    tracks sharing only the layer are never touched.  Endpoint order is
-    tolerated either way — a track read back from the file and pushed
-    through the engine keeps its direction, but a symmetric match is
-    unambiguous.
+    The shoved track is a whole LINE (a physical track stored as
+    consecutive file segments); ``track.points`` may hold many segments,
+    and the file entry matches when its start/end equal ANY consecutive
+    point pair (either direction) — the write path then knows exactly
+    which file segment was displaced.  Full identity match
+    (start/end/width/layer/net) so unrelated same-net tracks sharing
+    only the layer are never touched.
     """
-    if (
-        abs(track.start[0] - fields["start"][0]) > eps
-        or abs(track.start[1] - fields["start"][1]) > eps
-    ):
-        rev = (
-            abs(track.start[0] - fields["end"][0]) <= eps
-            and abs(track.start[1] - fields["end"][1]) <= eps
-            and abs(track.end[0] - fields["start"][0]) <= eps
-            and abs(track.end[1] - fields["start"][1]) <= eps
+    pts = track.points
+    for a, b in zip(pts, pts[1:]):
+        fwd = (
+            abs(a[0] - fields["start"][0]) <= eps
+            and abs(a[1] - fields["start"][1]) <= eps
+            and abs(b[0] - fields["end"][0]) <= eps
+            and abs(b[1] - fields["end"][1]) <= eps
         )
-        if not rev:
-            return False
-    else:
-        rev = False
-    if not rev and (
-        abs(track.end[0] - fields["end"][0]) > eps or abs(track.end[1] - fields["end"][1]) > eps
-    ):
-        return False
-    if abs(track.width - fields["width"]) > eps:
-        return False
-    if fields["layer"] != track.layer:
-        return False
-    if track.net is not None and fields["net"] != track.net:
-        return False
-    return True
+        rev = (
+            abs(a[0] - fields["end"][0]) <= eps
+            and abs(a[1] - fields["end"][1]) <= eps
+            and abs(b[0] - fields["start"][0]) <= eps
+            and abs(b[1] - fields["start"][1]) <= eps
+        )
+        if not (fwd or rev):
+            continue
+        if abs(track.width - fields["width"]) > eps:
+            continue
+        if fields["layer"] != track.layer:
+            continue
+        if track.net is not None and fields["net"] != track.net:
+            continue
+        return True
+    return False
 
 
 def _displaced_to_segments(orig: TrackObstacle, displaced: TrackObstacle) -> list[list]:

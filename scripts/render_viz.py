@@ -239,6 +239,34 @@ def _render_scene(data: dict, out_path: str, highlight: int | None = None) -> No
                 fontweight="bold",
             )
 
+    # Pinned endpoints: the hit track's points that sit inside fixed pads
+    # — the reason the shove cannot move that track.  Red X + pad label.
+    for pin in data.get("pinned") or []:
+        px, py = pin["x"], pin["y"]
+        ax.plot(
+            [px - 0.15, px + 0.15],
+            [py - 0.15, py + 0.15],
+            color="#d62728",
+            linewidth=2.0,
+            zorder=7,
+        )
+        ax.plot(
+            [px - 0.15, px + 0.15],
+            [py + 0.15, py - 0.15],
+            color="#d62728",
+            linewidth=2.0,
+            zorder=7,
+        )
+        ax.annotate(
+            f"pinned@{pin.get('pad', '')}",
+            (px, py),
+            textcoords="offset points",
+            xytext=(6, -8),
+            fontsize=8,
+            color="#d62728",
+            fontweight="bold",
+        )
+
     # Zoom bounds: min/max extent of ALL segments (path + candidate routes),
     # padded by a buffer so wire collisions outside the pads stay visible.
     # (Pads seed the view when a stage has no segments, e.g. lead-rejected pairs.)
@@ -256,6 +284,9 @@ def _render_scene(data: dict, out_path: str, highlight: int | None = None) -> No
             for p in poly:
                 all_xs.append(p[0])
                 all_ys.append(p[1])
+    for pin in data.get("pinned") or []:
+        all_xs.extend([pin["x"] - 0.3, pin["x"] + 0.3])
+        all_ys.extend([pin["y"] - 0.3, pin["y"] + 0.3])
     margin = 3.0  # mm buffer around the visible extent
     ax.set_xlim(min(all_xs) - margin, max(all_xs) + margin)
     ax.set_ylim(min(all_ys) - margin, max(all_ys) + margin)
