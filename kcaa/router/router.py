@@ -1708,7 +1708,17 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
             else:
                 best_path_pts = eng.path
 
-            _dump_viz("0-pns", best_path_pts, _pad_viz, buffered, route_bbox)
+            _dump_viz(
+                "0-pns",
+                best_path_pts,
+                _pad_viz,
+                buffered,
+                route_bbox,
+                shoved=[
+                    {"net": orig.net, "from": orig.points, "to": disp.points}
+                    for orig, disp in eng.moved_pairs
+                ],
+            )
 
             # ---- Replace scheme inside rectangular pads with an
             #      axis-aligned wire (fence -> centre) ----
@@ -2047,8 +2057,15 @@ def _dump_viz(
     pad_viz: list[tuple[str, tuple[float, float, float, float]]],
     obstacles: list,
     route_bbox: tuple[float, float, float, float],
+    *,
+    shoved: list[dict] | None = None,
 ) -> None:
     """Dump path, pad rects, and obstacles to a JSON file for rendering.
+
+    ``shoved`` optionally carries the PNS shove displacements as a list
+    of ``{"net": str, "from": [[x, y], ...], "to": [[x, y], ...]}`` —
+    each moved track's original and final polyline.  ``render_viz.py``
+    draws those in a distinct color next to the route's current line.
 
     Only writes when ``config.viz_dump_enabled`` is ``True`` (set via
     ``KCAA_DUMP_ROUTE_PIPELINE=1`` in ``.env``).
@@ -2071,6 +2088,15 @@ def _dump_viz(
         ],
         "route_bbox": list(route_bbox),
     }
+    if shoved:
+        data["shoved"] = [
+            {
+                "net": d.get("net", ""),
+                "from": [(x, y) for x, y in d["from"]],
+                "to": [(x, y) for x, y in d["to"]],
+            }
+            for d in shoved
+        ]
     with open(fname, "w") as f:
         json.dump(data, f)
     print(f"  [viz] dumped {fname}")

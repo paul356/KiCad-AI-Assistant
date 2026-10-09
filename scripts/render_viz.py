@@ -57,6 +57,7 @@ def _render_scene(data: dict, out_path: str, highlight: int | None = None) -> No
     obstacles = data.get("obstacles", [])
     candidates = data.get("candidates") or []
     notes = data.get("notes") or ""
+    shoved = data.get("shoved") or []
 
     fig, ax = plt.subplots(1, 1, figsize=(14, 10))
     ax.set_aspect("equal")
@@ -111,6 +112,38 @@ def _render_scene(data: dict, out_path: str, highlight: int | None = None) -> No
         xs = [c[0] for c in coords]
         ys = [c[1] for c in coords]
         ax.fill(xs, ys, alpha=0.3, color="#666666", linewidth=0.4, edgecolor="#999999")
+
+    # Shoved tracks (PNS shove displacements): original polyline faint
+    # dashed gray, displaced polyline thick orange, net label at midpoint.
+    for entry in shoved:
+        frm = entry.get("from") or []
+        to = entry.get("to") or []
+        net = entry.get("net") or ""
+        if len(frm) >= 2:
+            fseg = [
+                [(frm[i][0], frm[i][1]), (frm[i + 1][0], frm[i + 1][1])]
+                for i in range(len(frm) - 1)
+            ]
+            flc = LineCollection(fseg, colors="#999999", linewidths=1.0, alpha=0.5, zorder=3)
+            flc.set_linestyle("dashed")
+            ax.add_collection(flc)
+        if len(to) >= 2:
+            tseg = [
+                [(to[i][0], to[i][1]), (to[i + 1][0], to[i + 1][1])] for i in range(len(to) - 1)
+            ]
+            tlc = LineCollection(tseg, colors="#ff7f0e", linewidths=4.0, alpha=0.95, zorder=4)
+            ax.add_collection(tlc)
+            if net:
+                mid = tseg[len(tseg) // 2][1]
+                ax.annotate(
+                    f"shoved: {net}",
+                    mid,
+                    textcoords="offset points",
+                    xytext=(3, -10),
+                    fontsize=8,
+                    color="#b35a00",
+                    fontweight="bold",
+                )
 
     # Rejected routing candidates (schematic dumps): thin lines + reason labels.
     for i, cand in enumerate(candidates):
@@ -218,6 +251,11 @@ def _render_scene(data: dict, out_path: str, highlight: int | None = None) -> No
         for s in cand.get("segments", []):
             all_xs.extend([s[0], s[2]])
             all_ys.extend([s[1], s[3]])
+    for entry in shoved:
+        for poly in (entry.get("from") or [], entry.get("to") or []):
+            for p in poly:
+                all_xs.append(p[0])
+                all_ys.append(p[1])
     margin = 3.0  # mm buffer around the visible extent
     ax.set_xlim(min(all_xs) - margin, max(all_xs) + margin)
     ax.set_ylim(min(all_ys) - margin, max(all_ys) + margin)
@@ -240,6 +278,8 @@ def _render_scene(data: dict, out_path: str, highlight: int | None = None) -> No
         mpatches.Patch(color="#d62728", label="45° diag"),
         mpatches.Patch(color="#7f7f7f", label="Other"),
         mpatches.Patch(color="#ff7f0e", alpha=0.3, label="Pad AABB"),
+        mpatches.Patch(color="#ff7f0e", label="Shoved track (displaced)"),
+        mpatches.Patch(color="#999999", alpha=0.5, label="Shoved track (original)"),
         mpatches.Patch(color="#d62728", alpha=0.45, label="Rejected candidate"),
         mpatches.Patch(color="#999999", alpha=0.35, label="Other candidates"),
     ]
