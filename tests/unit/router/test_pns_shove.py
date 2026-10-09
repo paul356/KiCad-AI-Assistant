@@ -168,11 +168,29 @@ class TestShovePath:
         assert res.path == path
 
     def test_depth_cap_raises(self):
-        # A track that cannot be shoved at all (endpoints stuck in hull)
-        # raises ShoveFailure even though the chain could recurse.
-        t1 = TrackObstacle(points=((0, 0.001), (0, 0.002)), width=0.2)
+        # A track whose pad-anchored endpoints sit deep in the hull
+        # cannot be shoved (the anchor pins move nothing out of the way)
+        # and raises ShoveFailure even though the chain could recurse.
+        from shapely.geometry import box
+
+        from kcaa.router.world_model import Obstacle
+
+        t1 = TrackObstacle(points=((0, 0.001), (0, 0.002)), width=0.2, net="N1")
+        # Both endpoints lie on pad copper -> anchored, immovable.
+        pad = Obstacle(
+            shape=box(-0.1, -0.1, 0.1, 0.1),
+            layers=frozenset({"F.Cu"}),
+            net="N9",
+            kind="pad",
+        )
         with pytest.raises(ShoveFailure):
-            shove_path([(-2, 0), (2, 0)], [t1], width=0.2, clearance=0.1)
+            shove_path(
+                [(-2, 0), (2, 0)],
+                [t1],
+                width=0.2,
+                clearance=0.1,
+                fixed_obstacles=[pad],
+            )
 
     def test_max_depth_constant_is_finite(self):
         assert MAX_SHOVE_DEPTH >= 2
@@ -296,3 +314,82 @@ class TestShovePathFixedSolids:
         )
         with pytest.raises(ShoveFailure):
             shove_path(path, [t1], width=0.2, clearance=0.1, fixed_obstacles=[pad])
+
+
+class TestShovePathTrackChain:
+    """A physical track spans multiple file segments; SHOVE must push
+    the WHOLE LINE, not the single colliding segment.  Only pad/via
+    anchored LINE endpoints are pinned — every other vertex is free to
+    move so segment lengths adjust (KiCad permitAdjustingEndpoints)."""
+
+    def _two_seg_chain(self, net="N1"):
+        # L-shaped physical track: horizontal + vertical segment.
+        return [
+            TrackObstacle(points=((0, -3), (0, 0)), width=0.2, net=net),
+            TrackObstacle(points=((0, 0), (2, 0)), width=0.2, net=net),
+        ]
+
+    def test_hit_on_one_segment_pushes_whole_chain(self):
+        """Route crosses the vertical segment; the horizontal segment of
+        the same track must be displaced too — the LINE is never torn."""
+
+        path = [(-5, -3), (5, -3)]  # crosses (0, -3)->(0, 0) at (0, -3)
+        tracks = self._two_seg_chain()
+        res = shove_path(path, tracks, width=0.2, clearance=0.1)
+        assert len(res.pushed) == 1, "one physical track = one displacement"
+        ((orig, disp),) = res.moved_pairs
+        # The displaced LINE contains both original segments' vertices.
+        assert len(orig.points) == 3, "chain merged into one LINE"
+        assert (0, 0) in orig.points, "chain joint kept"
+        # Displaced line is still one connected polyline away from route.
+        assert len(disp.points) >= 3
+        d = LineString(disp.points).distance(LineString(path))
+        assert d >= 0.2 + 0.1 - 0.02, f"pushed chain too close to route: {d:.4f}"
+
+    def test_anchored_endpoints_kept_free_end_moves(self):
+        """Endpoints sitting on pad copper are pinned; the free chain
+        end is pulled to the hull — KiCad's anchored-vs-free split."""
+        from shapely.geometry import box
+
+        from kcaa.router.world_model import Obstacle
+
+        path = [(-5, 0), (5, 0)]  # hull near y=0
+        # L-chain: vertical leg (0,-3)->(0,0), horizontal leg (0,0)->(2,0).
+        tracks = [
+            TrackObstacle(points=((0, -3), (0, 0)), width=0.2, net="N1"),
+            TrackObstacle(points=((0, 0), (2, 0)), width=0.2, net="N1"),
+        ]
+        # Anchor the vertical leg's bottom end on a pad far from the hull.
+        pad = Obstacle(
+            shape=box(-0.2, -3.2, 0.2, -2.8),
+            layers=frozenset({"F.Cu"}),
+            net="N1",  # own-net anchor: no DRC gap required
+            kind="pad",
+        )
+        res = shove_path(path, tracks, width=0.2, clearance=0.1, fixed_obstacles=[pad])
+        assert len(res.pushed) == 1
+        ((orig, disp),) = res.moved_pairs
+        # Merged chain: (0,-3)-(0,0)-(2,0); the anchored end stays put.
+        assert orig.start == (0, -3) and orig.end == (2, 0)
+        assert disp.start == (0, -3), "anchored endpoint must not move"
+        # The free end rides the route hull (pulled off y=0).
+        assert abs(disp.points[-1][1]) > 0.05, f"free end not displaced: {disp.points}"
+
+    def test_whole_chain_promoted_on_failure(self):
+        """When the anchored LINE cannot clear a fixed solid, the entire
+        chain fails (ShoveFailure), never a torn half-push."""
+        from shapely.geometry import box
+
+        from kcaa.router.world_model import Obstacle
+
+        path = [(-5, -3), (5, -3)]
+        tracks = self._two_seg_chain()
+        # Pad blocks the free end (2, 0) with its clearance hull.
+        pad = Obstacle(
+            shape=box(1.7, -0.25, 2.3, 0.25),
+            layers=frozenset({"F.Cu"}),
+            net="PAD",
+            kind="pad",
+        )
+        with pytest.raises(ShoveFailure):
+            shove_path(path, tracks, width=0.2, clearance=0.1, fixed_obstacles=[pad])

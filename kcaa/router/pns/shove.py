@@ -33,8 +33,13 @@ from kcaa.router.world_model import Obstacle
 
 # KiCad c_ENDPOINT_ON_HULL_THRESHOLD = 1000 nm (internal units are nm).
 ENDPOINT_ON_HULL_THRESHOLD_MM = 1000.0 * 1e-6
-# KiCad cHullFailureExpansionFactor = 1000 nm.
+# KiCad c_HULL_FAILURE_EXPANSION_FACTOR = 1000 nm.
 HULL_FAILURE_EXPANSION_STEP_MM = 1000.0 * 1e-6
+# Walkaround arc samples cut inside the true hull envelope by the chord
+# sagitta (~6 um at routable margins); the engine's placement stages run
+# on ``clearance + CLEARANCE_EPS`` (10 um) which absorbs it.  A finished
+# line deeper inside a hull than this rode through it, not round it.
+HULL_CROSS_TOLERANCE_MM = 10.0 * 1e-3
 MAX_SHOVE_DEPTH = 4
 
 
@@ -150,30 +155,235 @@ def _shove_line_to_hull_set(
     obstacle_line: Sequence[tuple[float, float]],
     hulls: Sequence[Polygon],
     clockwise: bool,
+    keep_start: bool = True,
+    keep_end: bool = True,
 ) -> list[tuple[float, float]] | None:
     """Re-walk ``obstacle_line`` along the outside of the hull set.
 
     Returns the new polyline or ``None`` when no walk succeeds (any hull
-    walk failing aborts the attempt).  Endpoints must be preserved —
-    endpoint adjustment is handled by the caller via ``permitAdjusting*``.
+    walk failing aborts the attempt).  Endpoints are preserved only when
+    the caller pins them (``keep_start``/``keep_end``); a free endpoint
+    (not anchored to a pad/via) may be pulled by the walkaround — that
+    is KiCad's ``permitAdjustingEndpoints`` semantics, where a LINE's
+    non-anchored ends ride the hull ring on later attempts.
     """
     path = list(obstacle_line)
     orig = list(obstacle_line)
+    # The hulls overlap at route corners: every segment of the caller's
+    # line gets its own buffer, and adjacent buffers share the joint's
+    # round cap.  A single walk of each hull in turn can land the line
+    # back on the boundary of an earlier hull whose cap arcs through a
+    # later hull's interior, so the finished polyline crosses the route
+    # it was shoved away from.  KiCad merges the hulls into one graph and
+    # walks it once; re-walking the hulls until no pass changes the line
+    # is the polyline equivalent — a pass that changes nothing cannot
+    # have slid the line inside any hull (a hull walk only ever moves a
+    # line outward from that hull's interior).  Keep an explicit final
+    # outside check as a belt: a stuck oscillation would otherwise hand
+    # a route-crossing line to the DRC audit.
+    max_walks = len(hulls) * 4 + 4
+    for _ in range(max_walks):
+        changed = False
+        for hull in hulls:
+            try:
+                walked = walkaround_line(path, hull, cw=clockwise)
+            except WalkFailure:
+                return None
+            if len(walked) != len(path) or any(
+                math.hypot(a[0] - b[0], a[1] - b[1]) > 1e-9 for a, b in zip(walked, path)
+            ):
+                changed = True
+                path = walked
+        if not changed:
+            break
+    final_line = LineString(path)
+    # A line that ends up riding a hull boundary is legal: the boundary
+    # sits exactly ``clearance + half-widths`` from the route centre,
+    # and the walk's arc samples cut inside the true envelope only by
+    # the chord sagitta (~6 um).  ``crosses/within`` reject that — the
+    # finished line is a few um inside the hull while still DRC-clean
+    # (the engine's place stages run on clearance + CLEARANCE_EPS).
+    # Reject only deep penetration: shrink each hull by the sagitta
+    # tolerance; intersecting the core means the line truly cut through
+    # the hull instead of walking round it (a stuck oscillation between
+    # the overlapping corner hulls).
     for hull in hulls:
-        try:
-            walked = walkaround_line(path, hull, cw=clockwise)
-        except WalkFailure:
+        core = hull.buffer(-HULL_CROSS_TOLERANCE_MM)
+        if core.is_empty:
+            continue
+        if final_line.intersects(core):
             return None
-        path = walked
-    # Endpoints must be preserved (KiCad checks CPoint(0)/CLastPoint).
-    if not path or math.hypot(path[0][0] - orig[0][0], path[0][1] - orig[0][1]) > 1e-9:
+    if keep_start and (
+        not path or math.hypot(path[0][0] - orig[0][0], path[0][1] - orig[0][1]) > 1e-9
+    ):
         return None
-    if not path or math.hypot(path[-1][0] - orig[-1][0], path[-1][1] - orig[-1][1]) > 1e-9:
+    if keep_end and (
+        not path or math.hypot(path[-1][0] - orig[-1][0], path[-1][1] - orig[-1][1]) > 1e-9
+    ):
         return None
     # Must not self-intersect (KiCad path.SelfIntersecting()).
     if not LineString(path).is_simple:
         return None
     return path
+
+
+def _merge_track_chain(
+    hit: TrackObstacle,
+    movable: Sequence[TrackObstacle],
+    eps: float = 1e-6,
+) -> tuple[TrackObstacle, list[TrackObstacle]]:
+    """Merge ``hit`` with every connected segment of its physical track.
+
+    A logical track is stored as consecutive file segments sharing the
+    net and touching at endpoints (KiCad tracks the same way).  SHOVE
+    pushes a whole LINE — moving one segment alone would tear it from
+    its neighbours, so the colliding segment is expanded into the full
+    chain it belongs to and that line is shoved as one obstacle.
+
+    Returns ``(merged_line, original_segments)``; a lone segment (no
+    same-net endpoint-touching neighbour) is returned unchanged.
+    """
+    group: list[TrackObstacle] = []
+    seen: set[int] = set()
+    frontier: list[TrackObstacle] = [hit]
+    while frontier:
+        cur = frontier.pop()
+        if id(cur) in seen:
+            continue
+        seen.add(id(cur))
+        group.append(cur)
+        for t in movable:
+            if id(t) in seen or t.net != cur.net:
+                continue
+            if any(
+                math.hypot(a[0] - b[0], a[1] - b[1]) <= eps for a in cur.points for b in t.points
+            ):
+                frontier.append(t)
+    if len(group) == 1:
+        return hit, group
+    pts = _order_track_chain(group, eps)
+    merged = TrackObstacle(
+        points=tuple(pts),
+        width=hit.width,
+        net=hit.net,
+        layer=hit.layer,
+    )
+    return merged, group
+
+
+def _order_track_chain(
+    group: list[TrackObstacle],
+    eps: float = 1e-6,
+) -> list[tuple[float, float]]:
+    """Order a connected segment group into one polyline chain.
+
+    Builds endpoint adjacency and walks from a free end through each
+    segment exactly once (a physical track is a linear chain).  A branch
+    (more than one continuation at a joint, e.g. a T-junction) stops the
+    walk conservatively — the shoved LINE must stay linear.
+    """
+    n = len(group)
+    if n == 1:
+        return list(group[0].points)
+    # adj[i] = [(j, shared_point), ...]
+    adj: list[list[tuple[int, tuple[float, float]]]] = [[] for _ in range(n)]
+
+    def _shared(i: int, j: int) -> list[tuple[float, float]]:
+        out = []
+        for a in group[i].points:
+            for b in group[j].points:
+                if math.hypot(a[0] - b[0], a[1] - b[1]) <= eps:
+                    out.append(a)
+        return out
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            if group[i].net != group[j].net:
+                continue
+            shared = _shared(i, j)
+            if shared:
+                adj[i].append((j, shared[0]))
+                adj[j].append((i, shared[0]))
+
+    def used_point(i: int) -> list[tuple[float, float]]:
+        return [s for _, s in adj[i]]
+
+    # Start at a segment with a free endpoint (chain head), else any.
+    start = 0
+    for i in range(n):
+        used = used_point(i)
+        if any(
+            not any(math.hypot(p[0] - s[0], p[1] - s[1]) <= eps for s in used)
+            for p in group[i].points
+        ):
+            start = i
+            break
+
+    pts: list[tuple[float, float]] = []
+    visited: set[int] = set()
+    cur: int | None = start
+    enter: tuple[float, float] | None = None  # point used to enter cur
+    while cur is not None and cur not in visited:
+        visited.add(cur)
+        endpoints = list(group[cur].points)
+        if enter is not None:
+            other = next(
+                (p for p in endpoints if math.hypot(p[0] - enter[0], p[1] - enter[1]) > eps),
+                endpoints[-1],
+            )
+            pts.append(other)
+        else:
+            # Chain head (or any start segment): orient it so the LAST
+            # emitted point is a joint with the next segment.  Extending
+            # both endpoints blindly can leave a free end trailing, and
+            # then ``nxt`` (matched against the trailing point) finds
+            # nothing — the walk dies with a two-point stub.  Emit the
+            # free end first, the shared joint last.
+            joints = [s for _, s in adj[cur]]
+            if joints and any(
+                math.hypot(endpoints[-1][0] - s[0], endpoints[-1][1] - s[1]) <= eps for s in joints
+            ):
+                pts.extend(endpoints)  # last point is already a joint
+            elif joints:
+                # reverse: free end first, shared joint last
+                pts.extend([endpoints[-1], endpoints[0]])
+            else:
+                pts.extend(endpoints)  # truly isolated segment
+        last = pts[-1]
+        # Next: an unvisited neighbour sharing our last point.
+        nxt: tuple[int, tuple[float, float]] | None = None
+        for j, s in adj[cur]:
+            if j in visited:
+                continue
+            if math.hypot(s[0] - last[0], s[1] - last[1]) <= eps:
+                if nxt is not None:
+                    return pts  # branch: keep the walked part only
+                nxt = (j, last)
+        if nxt is None:
+            break
+        cur, enter = nxt
+    return pts
+
+
+def _endpoint_anchored(
+    pt: tuple[float, float],
+    fixed: Sequence[Obstacle],
+    eps: float = 1e-6,
+) -> bool:
+    """True when ``pt`` sits inside a fixed pad/via.
+
+    A pad/via anchored endpoint is the physical anchor of the LINE —
+    it cannot move (KiCad via-anchored rule); every other point of the
+    track is free to be pulled by the shove walkaround.
+    """
+    for o in fixed:
+        if o.kind not in ("pad", "via"):
+            continue
+        if o.shape is None or o.shape.is_empty:
+            continue
+        if o.shape.distance(Point(*pt)) <= eps:
+            return True
+    return False
 
 
 def _line_len(pts: Sequence[tuple[float, float]]) -> float:
@@ -187,6 +397,8 @@ def _shove_clear_of_fixed(
     clearance: float,
     track_net: str | None,
     max_iter: int = 16,
+    keep_start: bool = True,
+    keep_end: bool = True,
 ) -> list[tuple[float, float]] | None:
     """Walk ``line_pts`` clear of every fixed solid with DRC margin.
 
@@ -203,24 +415,54 @@ def _shove_clear_of_fixed(
     exact DRC margin for the pushed track (pad/via copper is raw, so the
     same margin formula is correct for them too).
 
-    Endpoints are pinned: the shove chain moves one file segment at a
-    time, so a displaced track must keep its exact endpoints or the
-    physical track it belongs to is disconnected.  A fixed hull covering
-    an endpoint (or a walk that would pull it) fails the shove instead
-    of corrupting connectivity.  Same-net copper (``obs.net ==
-    track_net``) is skipped — that is the track's own anchors (pads,
-    vias), which it must keep touching, with no DRC gap required.
+    Endpoints that are anchored (``keep_start``/``keep_end``) are
+    pinned: they are the physical anchors of the LINE (pad/via copper)
+    and the displaced track must keep them or it snaps off its pads.  A
+    fixed hull covering a pinned endpoint (or a walk that would pull it)
+    fails the shove instead of corrupting connectivity.  Free endpoints
+    may be moved by the walkaround — KiCad's permitAdjustingEndpoints
+    semantics, and the reason an anchor-point check lives here and not
+    on every chain vertex.  Same-net copper (``obs.net == track_net``)
+    is skipped — that is the track's own anchors (pads, vias), which it
+    must keep touching, with no DRC gap required.
 
-    Returns the cleaned polyline, or ``None`` when no walk succeeds or
-    the endpoint pin cannot be honored.
+    Returns the cleaned polyline, or ``None`` when no walk succeeds or a
+    pinned endpoint cannot be honored.
     """
     margin = clearance + width / 2.0
     hulls: list[Polygon] = []
+    pts = list(line_pts)
+    first_pt = pts[0] if pts else None
+    last_pt = pts[-1] if pts else None
     for obs in fixed:
         if track_net is not None and obs.net is not None and obs.net == track_net:
             continue  # own-net anchor copper: no clearance required
         shape = obs.shape
         if shape is None or shape.is_empty:
+            continue
+        # A pinned LINE endpoint sits ON its anchor pad/via — that
+        # copper is the track's own connection target, never an
+        # obstacle to clear.  The net test alone is not enough: a THT
+        # pad's solder-side copy can carry ``net=None`` in the file
+        # (same physical pad, both faces), so skip any fixed solid
+        # covering a kept endpoint by geometry *when it is anonymous
+        # net* — the only case where the net test can miss it.  A
+        # foreign-net pad that happens to cover the endpoint stays an
+        # obstacle (tests pin this: a fixed pad swallowing a pushed
+        # track's endpoints must fail the shove).
+        if (
+            keep_start
+            and obs.net is None
+            and first_pt is not None
+            and shape.distance(Point(*first_pt)) <= 1e-8
+        ):
+            continue
+        if (
+            keep_end
+            and obs.net is None
+            and last_pt is not None
+            and shape.distance(Point(*last_pt)) <= 1e-8
+        ):
             continue
         # Default arc sampling: the walked line RIDES the hull boundary
         # and cuts inside the true clearance envelope by the chord
@@ -232,16 +474,21 @@ def _shove_clear_of_fixed(
         # 1000) then fails whenever the walk must span a long arc.
         hulls.append(shape.buffer(margin, cap_style="round"))
 
-    pts = list(line_pts)
     first, last = pts[0], pts[-1]
 
     def pinned(candidate: Sequence[tuple[float, float]]) -> bool:
         if not candidate:
             return False
-        return (
-            math.hypot(candidate[0][0] - first[0], candidate[0][1] - first[1]) < 1e-8
-            and math.hypot(candidate[-1][0] - last[0], candidate[-1][1] - last[1]) < 1e-8
-        )
+        ok = True
+        if keep_start and (
+            math.hypot(candidate[0][0] - first[0], candidate[0][1] - first[1]) >= 1e-8
+        ):
+            ok = False
+        if keep_end and (
+            math.hypot(candidate[-1][0] - last[0], candidate[-1][1] - last[1]) >= 1e-8
+        ):
+            ok = False
+        return ok
 
     for _ in range(max_iter):
         query = LineString(pts)
@@ -260,7 +507,10 @@ def _shove_clear_of_fixed(
                 return None
             # Re-pin to the exact original floats so the written joints
             # are byte-identical to the neighbouring segments.
-            pts[0], pts[-1] = first, last
+            if keep_start:
+                pts[0] = first
+            if keep_end:
+                pts[-1] = last
             if not LineString(pts).is_simple:
                 return None
             return pts
@@ -296,7 +546,7 @@ def shove_obstacle_line(
     (KiCad: ``attempt >= 2`` && not via-anchored).  Returns the moved
     track, or ``None`` when no attempt succeeds.
     """
-    line = [obstacle.start, obstacle.end]
+    line = list(obstacle.points)
     extra = 0.0
     for attempt in range(3):
         hulls = _hull_set(cur_line, width, clearance, obstacle.width, extra)
@@ -304,6 +554,8 @@ def shove_obstacle_line(
             return None
         # KiCad: permitAdjustingEndpoints gates the whole block, and
         # shoveLineToHullSet only pulls endpoints on attempts >= 2.
+        # Before attempt 2 even a free endpoint must hold (the LINE is
+        # moved as a whole on the first tries, endpoints stay).
         attempt_line = list(line)
         adjust = (attempt >= 2) and (permit_moving_start or permit_moving_end)
         if adjust and len(attempt_line) >= 2:
@@ -317,18 +569,42 @@ def shove_obstacle_line(
                     attempt_line[-1] = p1
         # 4 orientations: clockwise toggles each attempt, traversal
         # inverts from attempt 2 on (KiCad shoveLineToHullSet loop).
+        # KiCad tries every orientation and keeps the *shortest* valid
+        # result (clockwise toggles per attempt, traversal inverted from
+        # attempt 2 on).  Returning the first success is not enough: on a
+        # real board one walk direction can detour around a huge pad
+        # while the opposite direction slips the LINE the short way past
+        # the colliding segment.  Collect all valid orientations and take
+        # the minimum-length polyline — same semantic as KiCad's
+        # shoveLineToHullSet loop.
+        best: TrackObstacle | None = None
+        best_len = float("inf")
         for invert in (False, True):
             for clockwise in (True, False):
                 ordered = list(reversed(hulls)) if invert else list(hulls)
-                pushed_line = _shove_line_to_hull_set(attempt_line, ordered, clockwise)
+                pushed_line = _shove_line_to_hull_set(
+                    attempt_line,
+                    ordered,
+                    clockwise,
+                    # Anchored endpoints never move; free endpoints may
+                    # ride the hull ring once endpoint adjustment is
+                    # unlocked (attempt >= 2).
+                    keep_start=True if attempt < 2 else not permit_moving_start,
+                    keep_end=True if attempt < 2 else not permit_moving_end,
+                )
                 if pushed_line is None:
                     continue
-                return TrackObstacle(
-                    points=tuple(pushed_line),
-                    width=obstacle.width,
-                    net=obstacle.net,
-                    layer=obstacle.layer,
-                )
+                length = _line_len(pushed_line)
+                if length < best_len:
+                    best_len = length
+                    best = TrackObstacle(
+                        points=tuple(pushed_line),
+                        width=obstacle.width,
+                        net=obstacle.net,
+                        layer=obstacle.layer,
+                    )
+        if best is not None:
+            return best
         extra += HULL_FAILURE_EXPANSION_STEP_MM
     return None
 
@@ -350,16 +626,20 @@ def shove_path(
     not move — the tracks do.  Depth cap; any failure unwinds the whole
     chain (KiCad SH_INCOMPLETE).
 
+    A pushed obstacle is the *whole physical track*: consecutive file
+    segments sharing the net and touching at endpoints are merged into
+    one LINE (KiCad tracks a track as a LINE of segments and SHOVE moves
+    the LINE).  Only pad/via-anchored endpoints of that LINE are pinned
+    (``_endpoint_anchored``); every other vertex — the mid-chain joints
+    and any free end — may be pulled by the walkaround, so segment
+    lengths adjust naturally (no artificial per-segment endpoint locks).
+
     Two hard invariants keep every displacement DRC-clean and
     connectivity-preserving:
 
-    * **Pinned endpoints.**  Each movable obstacle is one file segment;
-      its endpoints are the junctions/anchors of the physical track.  A
-      pushed segment therefore never moves its endpoints (KiCad moves
-      endpoints only in the attempt>=2 ``permitAdjustingEndpoints``
-      path, which is disabled here) — moving them would leave a gap to
-      the neighbouring segments of the same track.  A hull that covers
-      an endpoint simply fails the shove.
+    * **Anchor pinning.**  A LINE endpoint sitting on pad/via copper is
+      the physical anchor of the track; it never moves (the attempt>=2
+      ``permitAdjustingEndpoints`` path applies only to free ends).
     * **Fixed-solid clearance.**  Displaced polylines are re-walked clear
       of every *fixed* obstacle (pads, vias, keepouts, openings,
       non-shovable tracks) with the DRC margin — the shove walkaround
@@ -408,22 +688,32 @@ def shove_path(
         hit = colliding_with(cur_line, self_track)
         if hit is None:
             continue  # this chain resolved; nothing more to push
+        # Merge the colliding segment with its physical-track neighbours:
+        # SHOVE displaces the whole LINE, one segment alone would tear
+        # the track.  Only the LINE ends are anchor-checked; the merged
+        # chain's interior joints are free to move with the walk.
+        line_chain, chain_segments = _merge_track_chain(hit, remaining)
+        if fixed_obstacles:
+            keep_start = _endpoint_anchored(line_chain.start, fixed_obstacles)
+            keep_end = _endpoint_anchored(line_chain.end, fixed_obstacles)
+        else:
+            keep_start = keep_end = False
         # A pushed track may itself collide with others: it becomes the
         # current line for the next push (chain propagation).
         pushed = shove_obstacle_line(
             cur_line,
-            hit,
+            line_chain,
             width,
             clearance,
-            permit_moving_start=False,
-            permit_moving_end=False,
+            permit_moving_start=not keep_start,
+            permit_moving_end=not keep_end,
         )
         if pushed is None:
             raise ShoveFailure(
-                f"cannot shove track {hit.start} -> {hit.end}",
+                f"cannot shove track {line_chain.start} -> {line_chain.end}",
                 moved_pairs=list(moved_pairs),
                 cur_line=list(cur_line),
-                hit=hit,
+                hit=line_chain,
             )
         # Every pushed track must also clear the FIXED solids (pads,
         # vias, keepouts, non-shovable tracks, earlier-leg route copper)
@@ -434,16 +724,18 @@ def shove_path(
                 fixed_obstacles,
                 width=pushed.width,
                 clearance=clearance,
-                track_net=hit.net,
+                track_net=line_chain.net,
+                keep_start=keep_start,
+                keep_end=keep_end,
             )
             if clean is None:
                 raise ShoveFailure(
-                    f"shoved track {hit.start} -> {hit.end} cannot clear fixed "
-                    "copper (pad/via/keepout); widen the gap, move the "
+                    f"shoved track {line_chain.start} -> {line_chain.end} cannot clear "
+                    "fixed copper (pad/via/keepout); widen the gap, move the "
                     "obstacle, or use strategy='walkaround'",
                     moved_pairs=list(moved_pairs),
                     cur_line=list(cur_line),
-                    hit=hit,
+                    hit=line_chain,
                 )
             pushed = TrackObstacle(
                 points=tuple(clean),
@@ -451,10 +743,13 @@ def shove_path(
                 net=pushed.net,
                 layer=pushed.layer,
             )
-        remaining.remove(hit)
+        for seg in chain_segments:
+            remaining.remove(seg)
         remaining.append(pushed)
         moved.append(pushed)
-        moved_pairs.append((hit, pushed))
+        # moved_pairs records the whole LINE (original file chain) and
+        # its displacement — the write path matches per-segment.
+        moved_pairs.append((line_chain, pushed))
         chains.append((list(pushed.points), pushed))
         depth += 1
 
