@@ -675,3 +675,212 @@ class TestWalkaroundEndsAtTarget:
         node = ObstacleNode(walls)
         with pytest.raises(PnsFailure):
             _walkaround_solids([(-8, 0), (8, 0)], node, W, CLR)
+
+
+class TestPnsFailureState:
+    """PnsFailure carries the failure现场: last-path polyline, last-hit
+    description, and the shove displacements completed before failure."""
+
+    def test_walkaround_failure_carries_last_path(self):
+        from kcaa.router.pns.node import ObstacleNode
+
+        # Canyon: walkaround cannot converge; the failure must keep the
+        # oscillation's last line (non-empty) for the viz dump.
+        walls = [
+            Obstacle(
+                shape=Polygon([(-0.3, -5), (0.3, -5), (0.3, 5), (-0.3, 5)]),
+                layers=frozenset({"F.Cu"}),
+                net=None,
+                kind="pad",
+            ),
+            Obstacle(
+                shape=Polygon([(-5, 3), (5, 3), (5, 3.3), (-5, 3.3)]),
+                layers=frozenset({"F.Cu"}),
+                net=None,
+                kind="pad",
+            ),
+            Obstacle(
+                shape=Polygon([(-5, -3.3), (5, -3.3), (5, -3), (-5, -3)]),
+                layers=frozenset({"F.Cu"}),
+                net=None,
+                kind="pad",
+            ),
+        ]
+        node = ObstacleNode(walls)
+        with pytest.raises(PnsFailure) as excinfo:
+            _walkaround_solids([(-8, 0), (8, 0)], node, W, CLR)
+        exc = excinfo.value
+        assert exc.last_path is not None and len(exc.last_path) >= 2
+        assert exc.last_path[0] == (-8, 0) and exc.last_path[-1] == (8, 0)
+        assert exc.last_hit is not None  # obstacle that blocked the last step
+
+    def test_walkaround_raises_without_state_ok(self):
+        # Legacy raise sites (plain PnsFailure(msg)) must still work and
+        # default the state fields to None / empty.
+        with pytest.raises(PnsFailure) as excinfo:
+            raise PnsFailure("legacy")
+        exc = excinfo.value
+        assert exc.last_path is None
+        assert exc.last_hit is None
+        assert exc.shoved_pairs == []
+
+
+class TestShoveFailureState:
+    """ShoveFailure carries moved-pairs / current-line / hit for the
+    partial-shove dump."""
+
+    def test_cannot_shove_carries_state(self, monkeypatch):
+        t = _track_obs(5, -3, 3, "N2")
+
+        def _boom(*_args, **_kwargs):
+            raise ShoveFailure(
+                "cannot shove track (1, 2) -> (3, 4)",
+                moved_pairs=[(t, t)],
+                cur_line=[(0, 0), (1, 0)],
+                hit=t,
+            )
+
+        monkeypatch.setattr("kcaa.router.route_engine.shove_path", _boom)
+        with pytest.raises(PnsFailure) as excinfo:
+            route_engine((-8, 0), (8, 0), [_pad(0, 0), t], W, CLR)
+        exc = excinfo.value
+        assert exc.shoved_pairs == [(t, t)]  # partial displacements survive
+        assert "shove failed" in str(exc)
+
+
+class TestFallbackShoveFirst:
+    """Optimization 1: walkaround failure falls back to shove-first —
+    the straight line pushes movable tracks instead of dying, and the
+    shove's partial state is surfaced on failure."""
+
+    def test_fallback_runs_shove_on_walkaround_failure(self, monkeypatch):
+        # Canyon walls block walkaround; a movable vertical track sits in
+        # the straight line's path.  The engine must attempt shove of the
+        # track (which itself fails cleanly because the track cannot
+        # clear the canyon) and surface BOTH failure causes with the
+        # shove state attached — never a bare "walkaround did not
+        # converge".
+        t = _track_obs(0.0, -2.0, 2.0, "N2")
+        walls = [
+            Obstacle(
+                shape=Polygon([(-0.3, -5), (0.3, -5), (0.3, 5), (-0.3, 5)]),
+                layers=frozenset({"F.Cu"}),
+                net=None,
+                kind="pad",
+            ),
+            Obstacle(
+                shape=Polygon([(-5, 3), (5, 3), (5, 3.3), (-5, 3.3)]),
+                layers=frozenset({"F.Cu"}),
+                net=None,
+                kind="pad",
+            ),
+            Obstacle(
+                shape=Polygon([(-5, -3.3), (5, -3.3), (5, -3), (-5, -3)]),
+                layers=frozenset({"F.Cu"}),
+                net=None,
+                kind="pad",
+            ),
+        ]
+        calls: list[list] = []
+
+        # Capture the walkaround failure line first — the fallback must
+        # seed shove with THAT line, not the plain skeleton (an
+        # identical retry is the dead-code regression this pins).
+        with pytest.raises(PnsFailure) as walk_probe:
+            route_engine((-8, 0), (8, 0), walls, W, CLR)
+        failed_line = list(walk_probe.value.last_path)
+        assert failed_line != [(-8, 0), (8, 0)]  # genuinely a detour state
+
+        def _recording_shove(path, movable, **_kw):
+            calls.append(["shove", list(path)])
+            raise ShoveFailure("cannot shove track X", moved_pairs=[(t, t)])
+
+        monkeypatch.setattr("kcaa.router.route_engine.shove_path", _recording_shove)
+        with pytest.raises(PnsFailure) as excinfo:
+            route_engine((-8, 0), (8, 0), [*walls, t], W, CLR)
+        exc = excinfo.value
+        assert len(calls) == 1  # shove ran exactly once in the fallback
+        assert calls[0][1] == failed_line  # seeded from failure state
+        # Both cause messages are present.
+        assert "walkaround failed" in str(exc)
+        assert "shove-first also failed" in str(exc)
+        assert exc.shoved_pairs == [(t, t)]
+
+    def test_shove_succeeds_but_retry_walkaround_fails(self, monkeypatch):
+        # Shove completes (displacing one track) yet the fixed canyon
+        # still blocks the retry walkaround: the merged failure must
+        # carry the displacements that DID happen — the dump shows
+        # partial progress instead of an empty board.
+        from kcaa.router.pns.shove import ShoveResult
+
+        t = _track_obs(0.0, -2.0, 2.0, "N2")
+        walls = [
+            Obstacle(
+                shape=Polygon([(-0.3, -5), (0.3, -5), (0.3, 5), (-0.3, 5)]),
+                layers=frozenset({"F.Cu"}),
+                net=None,
+                kind="pad",
+            ),
+            Obstacle(
+                shape=Polygon([(-5, 3), (5, 3), (5, 3.3), (-5, 3.3)]),
+                layers=frozenset({"F.Cu"}),
+                net=None,
+                kind="pad",
+            ),
+            Obstacle(
+                shape=Polygon([(-5, -3.3), (5, -3.3), (5, -3), (-5, -3)]),
+                layers=frozenset({"F.Cu"}),
+                net=None,
+                kind="pad",
+            ),
+        ]
+
+        def _successful_shove(path, movable, **_kw):
+            return ShoveResult(
+                path=list(path),
+                pushed=[t],
+                moved_pairs=[(t, t)],
+            )
+
+        monkeypatch.setattr("kcaa.router.route_engine.shove_path", _successful_shove)
+        with pytest.raises(PnsFailure) as excinfo:
+            route_engine((-8, 0), (8, 0), [*walls, t], W, CLR)
+        exc = excinfo.value
+        assert "shove-first pushed" in str(exc)
+        assert exc.shoved_pairs == [(t, t)]
+
+    def test_no_fallback_without_movable_tracks(self, monkeypatch):
+        # Pure fixed lockup, no movable: walkaround failure surfaces
+        # directly, shove is never invoked.
+        walls = [
+            Obstacle(
+                shape=Polygon([(-0.3, -5), (0.3, -5), (0.3, 5), (-0.3, 5)]),
+                layers=frozenset({"F.Cu"}),
+                net=None,
+                kind="pad",
+            ),
+            Obstacle(
+                shape=Polygon([(-5, 3), (5, 3), (5, 3.3), (-5, 3.3)]),
+                layers=frozenset({"F.Cu"}),
+                net=None,
+                kind="pad",
+            ),
+            Obstacle(
+                shape=Polygon([(-5, -3.3), (5, -3.3), (5, -3), (-5, -3)]),
+                layers=frozenset({"F.Cu"}),
+                net=None,
+                kind="pad",
+            ),
+        ]
+        calls: list[list] = []
+
+        def _recording_shove(*_args, **_kw):
+            calls.append(["shove"])
+            raise AssertionError("shove must not run without movable tracks")
+
+        monkeypatch.setattr("kcaa.router.route_engine.shove_path", _recording_shove)
+        with pytest.raises(PnsFailure) as excinfo:
+            route_engine((-8, 0), (8, 0), walls, W, CLR)
+        exc = excinfo.value
+        assert calls == []
+        assert "walkaround" in str(exc)

@@ -57,7 +57,29 @@ CLEARANCE_EPS = 1e-2  # 10 um, > worst-case chord sagitta (~6 um)
 class PnsFailure(RuntimeError):
     """Engine could not produce a valid path (walkaround stuck / shove
     incomplete) — the caller surfaces this as a RouteFailure with real
-    cause."""
+    cause.
+
+    ``last_path`` optionally carries the polyline the walkaround was
+    working on when it failed (non-empty for oscillation / stuck
+    failures), ``last_hit`` a human description of the obstacle that
+    triggered the last walkaround, and ``shoved_pairs`` the shove
+    displacements successfully completed *before* the failure — the
+    caller (router) dumps these so the failure state is inspectable in
+    the viz pipeline.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        last_path: list[tuple[float, float]] | None = None,
+        last_hit: str | None = None,
+        shoved_pairs: list[tuple[TrackObstacle, TrackObstacle]] | None = None,
+    ):
+        super().__init__(message)
+        self.last_path = last_path
+        self.last_hit = last_hit
+        self.shoved_pairs = shoved_pairs if shoved_pairs is not None else []
 
 
 @dataclass
@@ -180,9 +202,74 @@ def route_engine(
     # ``_walkaround_solids``); the shove stage below keeps using
     # ``place_clearance``.
     place_clearance = clearance + CLEARANCE_EPS
-    walked = _walkaround_solids(skeleton, node, track_width, clearance)
+    walked: list[tuple[float, float]] | None = None
+    walk_err: PnsFailure | None = None
+    try:
+        walked = _walkaround_solids(skeleton, node, track_width, clearance)
+    except PnsFailure as exc:
+        walk_err = exc
+        walked = None
 
-    if movable and shove_enabled:
+    # Optimization 1 — shove-first fallback.  KiCad's SHOVE semantics:
+    # when walkaround cannot find a detour, do not give up — let the
+    # line run straight and *push* the movable tracks that block it
+    # (chain propagation, each pushed track kept clear of fixed solids).
+    # After the push, the current line may still cross fixed copper, so
+    # walkaround is retried.  Two honest limits:
+    #   * the retry starts from the failure state (``walk_err.last_path``
+    #     — the oscillation's last line, not the plain skeleton), so it
+    #     is a genuinely different initial condition, and
+    #   * a pure fixed-solid lockup (e.g. p7→J1/12's pad ↔ sub-width-
+    #     track oscillation) cannot be opened by shove — fixed solids
+    #     are never displaced — but the attempt is made explicitly and
+    #     BOTH stages' intermediate state is carried to the caller for
+    #     the viz dump.  A space competition in which movable tracks
+    #     are part of the blockage is resolved here.
+    shove_done = False
+    if walked is None and movable and shove_enabled:
+        shove_done = True
+        seed = list(walk_err.last_path) if walk_err.last_path else list(skeleton)
+        try:
+            first: ShoveResult = shove_path(
+                seed,
+                movable,
+                width=track_width,
+                clearance=place_clearance,
+                max_depth=MAX_SHOVE_DEPTH if max_shove_depth is None else max_shove_depth,
+                fixed_obstacles=[*walk_obstacles, *extra_fixed],
+            )
+            # shove_path never moves the caller's path: the current line
+            # is still the seed polyline.  It may now cross fixed
+            # solids; clear those — the retry starts from the *failed*
+            # line (not the skeleton), so when movable tracks were part
+            # of the lockup, the pushed state can converge where the
+            # first pass did not.
+            walked = _walkaround_solids(seed, node, track_width, clearance)
+            out_path = walked
+            pushed = first.pushed
+            moved_pairs = first.moved_pairs
+        except ShoveFailure as exc:
+            raise PnsFailure(
+                f"walkaround failed ({walk_err}); shove-first also failed: {exc}",
+                last_path=walk_err.last_path,
+                last_hit=walk_err.last_hit,
+                shoved_pairs=exc.moved_pairs,
+            ) from walk_err
+        except PnsFailure as exc:
+            raise PnsFailure(
+                f"walkaround failed ({walk_err}); shove-first pushed "
+                f"{len(first.moved_pairs)} track(s) but the route still "
+                f"cannot clear fixed solids: {exc}",
+                last_path=walk_err.last_path,
+                last_hit=walk_err.last_hit,
+                shoved_pairs=list(first.moved_pairs),
+            ) from walk_err
+    elif walked is None:
+        # No movable tracks (or shove disabled): propagate the original
+        # walkaround failure with its state attached.
+        raise walk_err
+
+    if movable and shove_enabled and not shove_done:
         # Shoved tracks must also stay clear of every FIXED solid (pads,
         # vias, keepouts, openings, non-shovable tracks): the shove stage
         # only gauges other movable tracks, so without this a displaced
@@ -202,8 +289,15 @@ def route_engine(
         except ShoveFailure as exc:
             # The caller (auto_route_pair) only knows PnsFailure; a raw
             # ShoveFailure would bubble past router and tool into
-            # FastMCP's "success: true + text error" wrapper.
-            raise PnsFailure(f"shove failed: {exc}") from exc
+            # FastMCP's "success: true + text error" wrapper.  Carry the
+            # partial shove state so the failure dump shows what had
+            # already been displaced.
+            raise PnsFailure(
+                f"shove failed: {exc}",
+                last_path=list(walked),
+                last_hit=exc.hit.net if exc.hit is not None and exc.hit.net else None,
+                shoved_pairs=exc.moved_pairs,
+            ) from exc
         out_path = shoved.path
         pushed = shoved.pushed
         moved_pairs = shoved.moved_pairs
@@ -662,7 +756,11 @@ def _walkaround_solids(
         # arbitrary-angle chords remain on the detour.
         hull = _family_hull(obs.shape, hull_margin)
         if hull.is_empty:
-            raise PnsFailure(f"obstacle {obs.kind} has an empty hull")
+            raise PnsFailure(
+                f"obstacle {obs.kind} has an empty hull",
+                last_path=list(pts),
+                last_hit=f"{obs.kind} {obs.ref or obs.net or ''}".strip(),
+            )
         best: list[tuple[float, float]] | None = None
         for cw in (True, False):
             try:
@@ -672,9 +770,20 @@ def _walkaround_solids(
             if best is None or _path_len(walked) < _path_len(best):
                 best = walked
         if best is None:
-            raise PnsFailure(f"cannot walk around {obs.kind} obstacle {obs.ref}")
+            raise PnsFailure(
+                f"cannot walk around {obs.kind} obstacle {obs.ref}",
+                last_path=list(pts),
+                last_hit=f"{obs.kind} {obs.ref or obs.net or ''}".strip(),
+            )
         pts = best
-    raise PnsFailure(f"walkaround did not converge in {max_iter} iterations")
+    hit = node.nearest(pts, dfence=probe)
+    raise PnsFailure(
+        f"walkaround did not converge in {max_iter} iterations",
+        last_path=list(pts),
+        last_hit=f"{hit.obstacle.kind} {hit.obstacle.ref or hit.obstacle.net or ''}".strip()
+        if hit is not None
+        else None,
+    )
 
 
 def _path_len(pts: Sequence[tuple[float, float]]) -> float:

@@ -37,6 +37,7 @@ to)``; the diameter / drill are taken from the project netclass
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Any
 
 import sexpdata
@@ -393,11 +394,22 @@ def _apply_miters(
             out.append(a)
             continue
 
+        # The miter diagonal M→N is m√2 long.  A shoulder short enough
+        # to make M→N **shorter than the track width** would emit a
+        # sub-width segment (a degenerate stub that later shove passes
+        # classify as a fixed solid).  Floor the shoulder so the
+        # diagonal is always ≥ width; a corner whose legs are too short
+        # keeps the original 90° angle instead.
+        shoulder_min = a.width / math.sqrt(2.0)
+        if m_max < shoulder_min:
+            out.append(a)
+            continue
+
         # Find the largest miter length ≤ m_max whose 45° diagonal is
         # obstacle-free and doesn't encroach on no-diagonal zones.
         m = m_max
         chosen_m: float | None = None
-        while m >= 1e-3:
+        while m >= shoulder_min:
             # Point M: back along A by *m* from the corner.
             if a_h:
                 mx = cx - m if a.x2 > a.x1 else cx + m

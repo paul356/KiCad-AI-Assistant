@@ -719,6 +719,12 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
                     )
                 _dump_viz(f"{prefix}-6-align", pts, _pad_viz, obs, route_bbox)
 
+                # The alignment step can snap the endpoint into a
+                # sub-width tap-in (a leg shorter than the track width) —
+                # merge such stubs away before the final audit.
+                pts = _drop_subwidth_points(pts, width, clearance, obs, req.net)
+                _dump_viz(f"{prefix}-7-no-subwidth", pts, _pad_viz, obs, route_bbox)
+
                 # No adjustment escapes DRC: re-audit this layer's final
                 # polyline after pad replacement + alignment (the A*
                 # grid check ran before these steps, on cell data).
@@ -841,6 +847,18 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
             )
             _log_path("align-endpoints", best_path_pts)
             _dump_viz("6-align-endpoints", best_path_pts, _pad_viz, buffered, route_bbox)
+
+            # The alignment step can snap the endpoint into a sub-width
+            # tap-in (a leg shorter than the track width) — merge such
+            # stubs away before the final audit.
+            best_path_pts = _drop_subwidth_points(
+                best_path_pts,
+                width,
+                clearance,
+                [o for o in model.obstacles if start_layer in o.layers],
+                req.net,
+            )
+            _dump_viz("7-no-subwidth", best_path_pts, _pad_viz, buffered, route_bbox)
 
             # No adjustment escapes DRC: re-audit the final polyline
             # after pad replacement + alignment (which the engine audit,
@@ -996,7 +1014,19 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
                     net=req.net,
                 )
             except PnsFailure as exc:
-                _dump_viz("fail-pns", [], _pad_viz, buffered, route_bbox)
+                _dump_viz(
+                    "fail-pns",
+                    exc.last_path or [],
+                    _pad_viz,
+                    buffered,
+                    route_bbox,
+                    shoved=[
+                        {"net": orig.net, "from": orig.points, "to": disp.points}
+                        for orig, disp in exc.shoved_pairs
+                    ]
+                    if exc.shoved_pairs
+                    else None,
+                )
                 msg = (
                     f"No obstacle-avoiding path from {req.ref_a}/{req.pad_a} to "
                     f"{req.ref_b}/{req.pad_b} at {width}mm track width on layer "
@@ -1105,7 +1135,11 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
             # polyline after pad replacement (the engine audit ran on
             # ``eng.path`` before that step, and the later legs are not
             # routed yet — the earlier ones are fixed copper via
-            # ``extra_fixed`` and audited against this leg).
+            # ``extra_fixed`` and audited against this leg).  Merge any
+            # sub-width tap-in stubs first (legs shorter than the track
+            # width would be classified as fixed solids by a later
+            # shove pass).
+            node_pts = _drop_subwidth_points(node_pts, width, clearance, engine_obstacles, req.net)
             _final_path_drc(
                 node_pts,
                 width,
@@ -1687,8 +1721,23 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
                 )
             except PnsFailure as exc:
                 # Dump the failure state so the blockage can be inspected
-                # (same viz format as the success stages).
-                _dump_viz("fail-pns", [], _pad_viz, buffered, route_bbox)
+                # (same viz format as the success stages).  ``last_path``
+                # carries the walkaround/shove line as it stood at failure
+                # — a real polyline, not an empty placeholder — and
+                # ``shoved_pairs`` the tracks already displaced.
+                _dump_viz(
+                    "fail-pns",
+                    exc.last_path or [],
+                    _pad_viz,
+                    buffered,
+                    route_bbox,
+                    shoved=[
+                        {"net": orig.net, "from": orig.points, "to": disp.points}
+                        for orig, disp in exc.shoved_pairs
+                    ]
+                    if exc.shoved_pairs
+                    else None,
+                )
                 raise RouteFailure(
                     f"No obstacle-avoiding path from {req.ref_a}/{req.pad_a} to "
                     f"{req.ref_b}/{req.pad_b} at {width}mm track width on layer "
@@ -1749,6 +1798,18 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
             )
             _log_path("align-endpoints", best_path_pts)
             _dump_viz("6-align-endpoints", best_path_pts, _pad_viz, buffered, route_bbox)
+
+            # The alignment step can snap the endpoint into a sub-width
+            # tap-in (a leg shorter than the track width) — merge such
+            # stubs away before the final audit.
+            best_path_pts = _drop_subwidth_points(
+                best_path_pts,
+                width,
+                clearance,
+                engine_obstacles,
+                req.net,
+            )
+            _dump_viz("7-no-subwidth", best_path_pts, _pad_viz, buffered, route_bbox)
 
             # No adjustment escapes DRC: re-audit the final polyline
             # after pad replacement + alignment (the engine audit ran on
@@ -1981,6 +2042,77 @@ def _seg_angle(x1: float, y1: float, x2: float, y2: float) -> float:
 def _pt_eq(a: tuple[float, float], b: tuple[float, float], tol: float = 1e-6) -> bool:
     """Point comparison within tolerance."""
     return abs(a[0] - b[0]) <= tol and abs(a[1] - b[1]) <= tol
+
+
+def _drop_subwidth_points(
+    pts: list[tuple[float, float]],
+    width: float,
+    clearance: float,
+    obstacles: Sequence[Obstacle],
+    net: str | None,
+) -> list[tuple[float, float]]:
+    """Merge endpoint tap-in stubs shorter than the track width.
+
+    The planner (A* endpoint alignment, PNS pad alignment) can emit a
+    tap-in leg of length <= ``width`` (a "sub-width" segment) when it
+    pulls the endpoint toward a pad centre.  Such a segment is a
+    degenerate stub: it prints poorly and would be classified as a
+    *fixed* (non-shovable) obstacle by a later shove pass.
+
+    Only the FIRST and LAST legs are candidates — a middle leg that
+    happens to be short is usually a walkaround sampling point hugging
+    an obstacle hull, and must not be merged away (the merged line
+    would cut into the obstacle's clearance).  A candidate merge is
+    applied only when the merged leg keeps ``clearance`` from every
+    obstacle itself; otherwise the original stub is kept — it is the
+    geometry the engine deliberately produced to stay clear, and a
+    DRC-clean short leg beats a merged one that the final audit would
+    reject.  The caller re-audits the final polyline regardless (no
+    adjustment escapes it).
+    """
+    if len(pts) < 3:
+        return list(pts)
+    out = list(pts)
+
+    def _merge_clear(a: tuple[float, float], b: tuple[float, float]) -> bool:
+        from shapely.geometry import LineString
+        from shapely.strtree import STRtree
+
+        hulls = [o.shape for o in obstacles if o.shape is not None and not o.shape.is_empty]
+        if not hulls:
+            return True
+        copper = LineString([a, b]).buffer(width / 2.0, cap_style="round", quad_segs=512)
+        tree = STRtree(hulls)
+        for gi in tree.query(copper.buffer(clearance)):
+            other = hulls[gi]
+            other_net = obstacles[gi].net
+            if net is not None and other_net is not None and net == other_net:
+                continue  # same net: no DRC gap required
+            if copper.distance(other) < clearance - 1e-9:
+                return False
+        return True
+
+    # Head: merge away leading stubs while the merged leg stays clear.
+    while len(out) >= 3:
+        a = out[0]
+        b = out[2]
+        if math.hypot(out[1][0] - a[0], out[1][1] - a[1]) > width:
+            break
+        if not _merge_clear(a, b):
+            break
+        del out[1]
+
+    # Tail: merge away trailing stubs while the merged leg stays clear.
+    while len(out) >= 3:
+        a = out[-3]
+        b = out[-1]
+        if math.hypot(out[-2][0] - b[0], out[-2][1] - b[1]) > width:
+            break
+        if not _merge_clear(a, b):
+            break
+        del out[-2]
+
+    return out
 
 
 def _parse_corner_mode(mode: str) -> CornerMode:

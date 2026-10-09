@@ -39,7 +39,27 @@ MAX_SHOVE_DEPTH = 4
 
 
 class ShoveFailure(RuntimeError):
-    """Raised when the shove set cannot be completed (KiCad SH_INCOMPLETE)."""
+    """Raised when the shove set cannot be completed (KiCad SH_INCOMPLETE).
+
+    ``moved_pairs`` carries the displacements finished *before* the
+    failure (empty when nothing had been pushed yet), ``cur_line`` the
+    current line that triggered the failing collision, and ``hit`` a
+    description of the track that could not be pushed — the engine and
+    router use these to dump the partial shove state for inspection.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        moved_pairs: list[tuple[TrackObstacle, TrackObstacle]] | None = None,
+        cur_line: list[tuple[float, float]] | None = None,
+        hit: TrackObstacle | None = None,
+    ):
+        super().__init__(message)
+        self.moved_pairs = moved_pairs if moved_pairs is not None else []
+        self.cur_line = cur_line
+        self.hit = hit
 
 
 @dataclass(frozen=True)
@@ -399,7 +419,12 @@ def shove_path(
             permit_moving_end=False,
         )
         if pushed is None:
-            raise ShoveFailure(f"cannot shove track {hit.start} -> {hit.end}")
+            raise ShoveFailure(
+                f"cannot shove track {hit.start} -> {hit.end}",
+                moved_pairs=list(moved_pairs),
+                cur_line=list(cur_line),
+                hit=hit,
+            )
         # Every pushed track must also clear the FIXED solids (pads,
         # vias, keepouts, non-shovable tracks, earlier-leg route copper)
         # — the push walkaround only checks other movable tracks.
@@ -415,7 +440,10 @@ def shove_path(
                 raise ShoveFailure(
                     f"shoved track {hit.start} -> {hit.end} cannot clear fixed "
                     "copper (pad/via/keepout); widen the gap, move the "
-                    "obstacle, or use strategy='walkaround'"
+                    "obstacle, or use strategy='walkaround'",
+                    moved_pairs=list(moved_pairs),
+                    cur_line=list(cur_line),
+                    hit=hit,
                 )
             pushed = TrackObstacle(
                 points=tuple(clean),
@@ -444,7 +472,9 @@ def shove_path(
                 f"shove chain did not converge within depth {max_depth}: a "
                 "collision remains between a displaced track and an "
                 "unhandled neighbour; widen the gap or use "
-                "strategy='walkaround'"
+                "strategy='walkaround'",
+                moved_pairs=list(moved_pairs),
+                cur_line=list(cur_line),
             )
 
     finalized = [t for t in remaining if t not in moved]
