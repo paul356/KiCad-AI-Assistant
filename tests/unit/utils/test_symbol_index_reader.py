@@ -1,7 +1,9 @@
 """
-Tests for SymbolIndexReader — reads sym-lib-table and expands ${VAR} in URIs.
+Tests for SymbolIndexReader — reads sym-lib-table and expands ${VAR} in URIs,
+including project-table merging (project wins) and ${KIPRJMOD} expansion.
 """
 
+import os
 from pathlib import Path
 
 import pytest
@@ -38,6 +40,53 @@ class _MissingTableConfig(ServerConfig):
 
     def get_env_vars(self) -> dict:
         return {}
+
+
+class _TableConfig(ServerConfig):
+    """ServerConfig pointing at a caller-supplied global sym-lib-table."""
+
+    def __init__(self, table_path):
+        super().__init__()
+        self._table = str(table_path)
+
+    @property
+    def symbol_table_file(self) -> str:
+        return self._table
+
+    def get_env_vars(self) -> dict:
+        return {"KICAD_TEST_FIXTURES_DIR": str(FIXTURES_DIR)}
+
+
+GLOBAL_TABLE = (
+    "(sym_lib_table\n"
+    '  (lib (name "TestDevice") (type "KiCad") (uri "${KICAD_TEST_FIXTURES_DIR}/test_device.kicad_sym")'
+    '(options "") (descr "global device"))\n'
+    '  (lib (name "TestPower") (type "KiCad") (uri "${KICAD_TEST_FIXTURES_DIR}/test_power.kicad_sym")'
+    '(options "") (descr "global power"))\n'
+    ")\n"
+)
+
+
+def _write_global_table(tmp_path) -> str:
+    table = tmp_path / "sym-lib-table"
+    table.write_text(GLOBAL_TABLE, encoding="utf-8")
+    return str(table)
+
+
+def _project_table(tmp_path, extra_uri: str) -> str:
+    """A project sym-lib-table: project win on TestDevice + one project-only
+    library pointing at *extra_uri*."""
+    table = os.path.join(str(tmp_path), "sym-lib-table")
+    with open(table, "w", encoding="utf-8") as f:
+        f.write(
+            "(sym_lib_table\n"
+            f'  (lib (name "TestDevice") (type "KiCad") (uri "{extra_uri}")'
+            '(options "") (descr "project device"))\n'
+            f'  (lib (name "ProjOnly") (type "KiCad") (uri "${{KIPRJMOD}}/local.kicad_sym")'
+            '(options "") (descr "project local"))\n'
+            ")\n"
+        )
+    return table
 
 
 class TestSymbolIndexReaderLibraries:
@@ -90,6 +139,11 @@ class TestSymbolIndexReaderLibraries:
         power = next(lib for lib in libs if lib.name == "TestPower")
         assert power.uri.endswith("test_power.kicad_sym")
 
+    def test_entries_carry_table_path(self):
+        libs = self.reader.get_libraries()
+        expected = os.path.realpath(str(FIXTURES_DIR / "sym-lib-table"))
+        assert all(lib.table_path == expected for lib in libs)
+
 
 class TestSymbolIndexReaderMissingTable:
     def test_missing_table_raises_file_not_found(self):
@@ -101,3 +155,56 @@ class TestSymbolIndexReaderMissingTable:
         # SymbolIndexReader() with no args should construct without error.
         reader = SymbolIndexReader()
         assert reader is not None
+
+    def test_reader_with_project_dir_falls_back_to_global(self, tmp_path):
+        global_path = _write_global_table(tmp_path)
+        empty_proj = tmp_path / "proj"
+        empty_proj.mkdir()
+        reader = SymbolIndexReader(_TableConfig(global_path), project_dir=str(empty_proj))
+        entries = reader.get_libraries()
+        assert {e.name for e in entries} == {"TestDevice", "TestPower"}
+
+
+class TestGetLibrariesProjectMerge:
+    def test_project_table_parsed_first_and_wins(self, tmp_path):
+        global_path = _write_global_table(tmp_path)
+        proj_dir = tmp_path / "proj"
+        proj_dir.mkdir()
+        _project_table(proj_dir, "${KICAD_TEST_FIXTURES_DIR}/test_power.kicad_sym")
+
+        reader = SymbolIndexReader(_TableConfig(global_path), project_dir=str(proj_dir))
+        entries = reader.get_libraries()
+        names = [(e.name, e.descr) for e in entries]
+        # Project wins on TestDevice (different URI target and descr), the
+        # project-only lib is present, and TestPower comes from the global table.
+        assert ("TestDevice", "project device") in names
+        assert ("ProjOnly", "project local") in names
+        assert ("TestPower", "global power") in names
+        assert len(entries) == 3
+
+        by_name = {e.name: e for e in entries}
+        assert by_name["TestDevice"].uri.endswith("test_power.kicad_sym")
+        assert by_name["TestDevice"].table_path == os.path.realpath(
+            os.path.join(str(proj_dir), "sym-lib-table")
+        )
+        assert by_name["TestPower"].table_path == os.path.realpath(global_path)
+
+    def test_kiprjmod_expands_to_project_dir(self, tmp_path):
+        global_path = _write_global_table(tmp_path)
+        proj_dir = tmp_path / "proj"
+        proj_dir.mkdir()
+        _project_table(proj_dir, "${KICAD_TEST_FIXTURES_DIR}/test_power.kicad_sym")
+
+        reader = SymbolIndexReader(_TableConfig(global_path), project_dir=str(proj_dir))
+        entries = reader.get_libraries()
+        by_name = {e.name: e for e in entries}
+        assert by_name["ProjOnly"].uri == os.path.join(str(proj_dir), "local.kicad_sym")
+
+    def test_no_project_dir_skips_project_merge(self, tmp_path):
+        global_path = _write_global_table(tmp_path)
+        reader = SymbolIndexReader(_TableConfig(global_path))
+        entries = reader.get_libraries()
+        by_name = {e.name: e for e in entries}
+        # Global TestDevice is used (no project table to override it).
+        assert by_name["TestDevice"].descr == "global device"
+        assert "ProjOnly" not in by_name

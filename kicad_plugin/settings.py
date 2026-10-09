@@ -85,7 +85,7 @@ class PluginSettings:
     """All user-configurable settings for the KiCad AI Assistant plugin."""
 
     # LLM provider
-    llm_provider: str = "openai"  # "openai" | "anthropic" | "ollama"
+    llm_provider: str = "openai"  # "openai" | "anthropic" | "ollama" | "bedrock"
     llm_api_key: str = field(default="", repr=False)  # never leak key in logs/repr
     llm_user_agent: str = DEFAULT_LLM_USER_AGENT  # UA for OpenAI/Anthropic requests
     llm_model: str = "gpt-4o"  # model name
@@ -93,6 +93,15 @@ class PluginSettings:
     llm_base_url: str = (
         ""  # custom API endpoint (overrides provider default, e.g. http://localhost:11434)
     )
+
+    # Amazon Bedrock (provider == "bedrock"). Calls go to the Bedrock
+    # OpenAI-compatible endpoint. Auth is auto-selected: if an AWS access
+    # key id + secret are set, requests are signed with AWS SigV4; otherwise
+    # the API Key field (llm_api_key) is sent as a Bedrock API key (bearer).
+    llm_aws_region: str = "us-east-1"  # region for the bedrock-runtime endpoint
+    llm_aws_access_key_id: str = ""  # AWS access key id (SigV4 auth)
+    llm_aws_secret_access_key: str = field(default="", repr=False)  # AWS secret (SigV4 auth)
+    llm_aws_session_token: str = field(default="", repr=False)  # optional STS session token
 
     # MCP server
     server_port: int = 0  # 0 = auto-select a free port at startup

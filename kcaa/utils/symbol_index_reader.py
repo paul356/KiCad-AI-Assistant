@@ -29,6 +29,7 @@ class LibraryTableEntry:
     uri: str  # fully expanded (no ${VAR} placeholders)
     options: str
     descr: str
+    table_path: str = ""  # sym-lib-table file the entry came from
 
 
 # ---------------------------------------------------------------------------
@@ -37,28 +38,51 @@ class LibraryTableEntry:
 
 
 class SymbolIndexReader:
-    """Reads the KiCad sym-lib-table file and returns its library entries."""
+    """Reads the KiCad sym-lib-table file(s) and returns library entries."""
 
-    def __init__(self, config: ServerConfig | None = None):
+    def __init__(
+        self,
+        config: ServerConfig | None = None,
+        project_dir: str | None = None,
+    ):
         self._config = config or ServerConfig()
+        self._project_dir = project_dir
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
     def get_libraries(self) -> list[LibraryTableEntry]:
-        """Parse the sym-lib-table file and return all library entries."""
-        return self._parse_table()
+        """Parse sym-lib-table file(s) and return all library entries.
+
+        With a project directory whose ``sym-lib-table`` exists, the project
+        table is parsed first, then the global user table; duplicate
+        nicknames keep the project entry (project wins over global).  Without
+        a project table only the global table is read.
+        """
+        entries: list[LibraryTableEntry] = []
+        seen: set[str] = set()
+        if self._project_dir:
+            project_table = os.path.join(self._project_dir, "sym-lib-table")
+            if os.path.isfile(project_table):
+                entries.extend(self._parse_table_file(project_table, visited=set()))
+                seen = {e.name for e in entries}
+
+        global_path = self._config.symbol_table_file
+        if global_path and os.path.exists(global_path):
+            for entry in self._parse_table_file(global_path, visited=set()):
+                if entry.name not in seen:
+                    entries.append(entry)
+            return entries
+
+        if entries:
+            # Project table only — a global user table is absent.
+            return entries
+        raise FileNotFoundError(f"sym-lib-table not found: {global_path}")
 
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
-
-    def _parse_table(self) -> list[LibraryTableEntry]:
-        path = self._config.symbol_table_file
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"sym-lib-table not found: {path}")
-        return self._parse_table_file(path, visited=set())
 
     def _parse_table_file(
         self,
@@ -105,7 +129,7 @@ class SymbolIndexReader:
             descr = lib.descr.value if hasattr(lib, "descr") and hasattr(lib.descr, "value") else ""
 
             if uri:
-                uri = self._expand_env_vars(uri)
+                uri = self._expand_env_vars(uri, self._project_dir)
 
             # KiCad 10+: a "Table" entry redirects to another sym-lib-table file.
             if lib_type.lower() == "table":
@@ -128,6 +152,7 @@ class SymbolIndexReader:
                     uri=uri,
                     options=options,
                     descr=descr,
+                    table_path=real_path,
                 )
             )
 
@@ -136,9 +161,17 @@ class SymbolIndexReader:
         )
         return entries
 
-    def _expand_env_vars(self, path: str) -> str:
-        """Replace ${VAR_NAME} placeholders using the configured env vars."""
-        for var, value in self._config.get_env_vars().items():
+    def _expand_env_vars(self, path: str, project_dir: str | None = None) -> str:
+        """Replace ${VAR_NAME} placeholders using the configured env vars.
+
+        ``${KIPRJMOD}`` resolves to *project_dir* when a project is in
+        context (same single addition as ``pcb_library_utils._build_env_map``);
+        all other variables keep the current env behavior.
+        """
+        env = dict(self._config.get_env_vars())
+        if project_dir:
+            env["KIPRJMOD"] = project_dir
+        for var, value in env.items():
             path = path.replace("${" + var + "}", value)
         # Normalise mixed \ and / separators on Windows.
         path = os.path.normpath(path)

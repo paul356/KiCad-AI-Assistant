@@ -28,10 +28,12 @@ from fastmcp import FastMCP
 # loading kicad-cli-dependent modules when running in plugin mode.
 from kcaa.context import kicad_lifespan
 from kcaa.tools.drc_tools import register_drc_tools
+from kcaa.tools.erc_tools import register_erc_tools
 from kcaa.tools.kipy_tools import register_kipy_tools
 
 # Plugin profile tools — always imported (skip-based, no kicad-cli dependency)
 from kcaa.tools.netlist_tools import register_netlist_tools
+from kcaa.tools.no_connect_tools import register_no_connect_tools
 from kcaa.tools.pcb_edit_tools import register_pcb_edit_tools
 from kcaa.tools.pcb_group_tools import register_pcb_group_tools
 from kcaa.tools.pcb_library_tools import register_pcb_library_tools
@@ -123,6 +125,7 @@ def _register_plugin_profile(mcp: FastMCP) -> None:
     register_symbol_edit_tools(mcp)
     register_sheet_tools(mcp)
     register_wire_edit_tools(mcp)
+    register_no_connect_tools(mcp)
     register_pcb_library_tools(mcp)
     register_pcb_query_tools(mcp)
     register_pcb_placement_tools(mcp)
@@ -136,6 +139,7 @@ def _register_plugin_profile(mcp: FastMCP) -> None:
     register_render_board_tools(mcp)
     register_kipy_tools(mcp)
     register_drc_tools(mcp)
+    register_erc_tools(mcp)
     register_skill_tools(mcp)
     register_version_tools(mcp)
 
@@ -179,6 +183,7 @@ def _register_full_profile(mcp: FastMCP) -> None:
     register_export_tools(mcp)
     register_render_board_tools(mcp)
     register_drc_tools(mcp)
+    register_erc_tools(mcp)
     register_bom_tools(mcp)
     register_netlist_tools(mcp)
     register_pattern_tools(mcp)
@@ -186,6 +191,7 @@ def _register_full_profile(mcp: FastMCP) -> None:
     register_symbol_edit_tools(mcp)
     register_sheet_tools(mcp)
     register_wire_edit_tools(mcp)
+    register_no_connect_tools(mcp)
     register_pcb_library_tools(mcp)
     register_pcb_query_tools(mcp)
     register_pcb_placement_tools(mcp)

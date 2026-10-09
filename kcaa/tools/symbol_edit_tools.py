@@ -4,6 +4,7 @@ Provides tools to add symbols to KiCad schematics by combining
 the symbol index DB, the streaming extractor, and the skip library.
 """
 
+import asyncio
 import contextlib
 import copy
 import logging
@@ -11,6 +12,7 @@ import math
 import os
 from pathlib import Path
 import re
+import threading
 from typing import Any
 import uuid
 
@@ -18,9 +20,16 @@ from fastmcp import Context, FastMCP
 import sexpdata
 
 from kcaa.tools.sheet_tools import _normalize_collection, _sheet_dict_from_wrapper
-from kcaa.utils.config import ServerConfig
+from kcaa.utils.config import (
+    config,
+)
 from kcaa.utils.schematic_sexp_utils import save_schematic
 from kcaa.utils.skip_compat import safe_schematic
+from kcaa.utils.sym_lib_table_utils import (
+    get_user_sym_lib_table_path,
+    register_library_in_table,
+    unregister_library_in_table,
+)
 from kcaa.utils.symbol_extractor import extract_lib_symbol_raw
 from kcaa.utils.symbol_geometry import (
     BBox,
@@ -28,13 +37,55 @@ from kcaa.utils.symbol_geometry import (
     lib_bbox_to_world,
     union_bboxes,
 )
-from kcaa.utils.symbol_index_manager import SymbolIndexManager
+from kcaa.utils.symbol_index_manager import SymbolIndexManager, _project_dir_of
 from kcaa.utils.symbol_index_reader import SymbolIndexReader
+from kcaa.utils.symbol_library_utils import (
+    SymbolNameExistsError,
+    SymbolNotFoundError,
+    append_symbol_to_library,
+    build_effective_symbol_library_list,
+    create_empty_library_file,
+    is_safe_symbol_name,
+    list_library_symbols,
+    remove_symbol_from_library_file,
+    resolve_symbol_library,
+    sanitize_lib_nickname,
+)
 
 log = logging.getLogger(__name__)
 
 VALID_LABEL_TYPES = ("local", "global", "hierarchical")
 VALID_SHAPES = ("input", "output", "bidirectional", "tri_state", "passive")
+
+# Vocabulary for create_symbol-generated library definitions.
+VALID_PIN_TYPES = (
+    "input",
+    "output",
+    "bidirectional",
+    "tri_state",
+    "passive",
+    "free",
+    "no_connect",
+    "power_in",
+    "power_out",
+    "open_collector",
+    "open_emitter",
+    "unspecified",
+)
+VALID_PIN_DIRECTIONS = ("left", "right", "up", "down")
+# KiCad pin angle convention (lib coordinates, +Y up): the angle is the
+# direction from the electrical (connection) tip back toward the body, so a
+# pin facing left is angle 0 (extends toward +X) and a pin facing up is
+# angle 270 (extends toward -Y).  Matches the R_Small fixture in
+# tests/unit/tools/fixtures/tools_test.kicad_sch (top pin (at 0 2.54 270),
+# bottom pin (at 0 -2.54 90)).
+_PIN_DIRECTION_ANGLE = {"left": 0, "right": 180, "up": 270, "down": 90}
+# Valid symbol names: alphanumerics/underscore, must not start with a digit.
+_SYMBOL_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
+_DEFAULT_BODY_WIDTH_MM = 6.35  # KiCad standard body width (250 mil)
+_DEFAULT_PIN_LENGTH_MM = 2.54  # 100 mil, KiCad default pin length
+_PIN_PITCH_MM = 2.54  # 100 mil centre spacing between pins on one side
+_BODY_HEIGHT_PADDING_MM = 2.54  # auto-height margin above/below the pin span
 
 
 def _angle_to_direction(angle_deg: int | float) -> str:
@@ -66,15 +117,659 @@ def _iter_schematic_labels(sch: Any, attr_name: str) -> list[Any]:
 # ---------------------------------------------------------------------------
 
 _index_manager: SymbolIndexManager | None = None
+_index_lock = threading.Lock()
 
 
-def _get_index_manager() -> SymbolIndexManager:
+def _get_index_manager(project_path: str | None = None) -> SymbolIndexManager:
+    """Return the module-level SymbolIndexManager singleton, scoped to
+    *project_path* (a project directory, or a file inside one).
+
+    Re-scoping calls switch the singleton to the given project before
+    querying; ``None`` switches to the global scope (``""`` — global
+    libraries only).  The lock covers the scope swap only: the subsequent
+    queries on the returned manager run outside the lock, so a concurrent
+    re-scope in another thread (e.g. a background sync) can shift the
+    manager's project between a swap and its query.  The async tool paths
+    that call this never yield between the two, so in-process requests do
+    not interleave; thread-based callers should not rely on a stable scope.
+
+    The project id and the library reader are swapped together under the
+    lock so a background sync never observes a half-switched scope.
+    """
     global _index_manager
     if _index_manager is None:
-        config = ServerConfig()
-        library_manager = SymbolIndexReader(config)
-        _index_manager = SymbolIndexManager(library_manager)
+        with _index_lock:
+            if _index_manager is None:
+                _index_manager = SymbolIndexManager(
+                    project_path=project_path,
+                )
+                _index_manager._library_manager = SymbolIndexReader(
+                    project_dir=_project_dir_of(project_path)
+                )
+    else:
+        with _index_lock:
+            _index_manager._project_path = project_path
+            _index_manager._project_id = _project_dir_of(project_path) or ""
+            _index_manager._library_manager = SymbolIndexReader(
+                project_dir=_project_dir_of(project_path)
+            )
     return _index_manager
+
+
+# ---------------------------------------------------------------------------
+# Symbol library tools (create library / add to library / find missing)
+# ---------------------------------------------------------------------------
+
+
+def _3rd_party_symbols_dir() -> str:
+    """Return ``${KICAD{ver}_3RD_PARTY}/symbols`` (resolved, absolute)."""
+    return os.path.join(config.kicad_3rd_party, "symbols")
+
+
+def _is_user_library_location(path: str, project_dir: str | None) -> bool:
+    """True when *path* is a location the library create tool actually
+    writes to: the global 3rd-party symbols dir, or the project dir.
+
+    Keeps delete symmetric with create — delete only what create could
+    have produced — without relying on any descriptive metadata.
+    """
+    candidates = [os.path.realpath(_3rd_party_symbols_dir())]
+    if project_dir:
+        candidates.append(os.path.realpath(project_dir))
+    real = os.path.realpath(path)
+    return any(real == cand or real.startswith(cand + os.sep) for cand in candidates)
+
+
+def _target_project_of(table_path: str, project_dir: str | None) -> str:
+    """Ownership of a library declared in *table_path*.
+
+    Mirrors the footprint derivation (``pcb_library_tools``): a library
+    declared in the project's own ``sym-lib-table`` belongs to the project
+    (its project id), anything else (global user/system table) belongs to
+    the global scope (``""``).
+    """
+    proj_real = _project_dir_of(project_dir) if project_dir else None
+    if (
+        proj_real
+        and table_path
+        and os.path.realpath(table_path) == os.path.join(proj_real, "sym-lib-table")
+    ):
+        return proj_real
+    return ""
+
+
+def _index_symbol_library(
+    library: str,
+    file_path: str,
+    project_dir: str | None = None,
+    project: str | None = None,
+) -> int:
+    """Index exactly one symbol library file; returns symbol count or -1.
+
+    *project* is the exact row ownership (``""`` = global, project id = that
+    project), derived from the library's declaring sym-lib-table so a
+    reindex never re-attributes a library to the caller's project.  When
+    None, the manager's own scope is used (kept for callers that do not
+    derive ownership).  *project_dir* selects the manager scope for the
+    lookup.
+    """
+    try:
+        return _get_index_manager(project_dir).index_library(library, file_path, project=project)
+    except Exception as exc:
+        log.error("Symbol index update failed for %s: %s", library, exc, exc_info=True)
+        return -1
+
+
+def _do_create_symbol_library(
+    name: str,
+    project_dir: str | None = None,
+) -> dict[str, Any]:
+    """Create and register a new symbol library (``.kicad_sym``).
+
+    Global 3rdparty form (default): creates ``<name>.kicad_sym`` under
+    ``${KICAD{ver}_3RD_PARTY}/symbols`` and registers it in the global user
+    sym-lib-table.  Project form (``project_dir`` given): creates
+    ``<project_dir>/<name>.kicad_sym`` and registers it in the project's
+    ``sym-lib-table`` (created if absent).  Either way the library file is
+    created empty and indexed immediately.
+
+    All failures return ``{"error": ...}`` without a success key.
+    """
+    nickname = sanitize_lib_nickname(name)
+    if not nickname:
+        return {"error": f"Invalid library name: {name!r}"}
+
+    effective = build_effective_symbol_library_list(project_dir)
+    if any(lib["nickname"] == nickname for lib in effective):
+        return {
+            "error": (
+                f"Library '{nickname}' already exists; use add_symbols_to_library to export into it."
+            )
+        }
+
+    library_file: str | None = None
+    try:
+        if project_dir:
+            if not os.path.isdir(project_dir):
+                return {"error": f"Project directory not found: {project_dir}"}
+            library_file = os.path.join(project_dir, f"{nickname}.kicad_sym")
+            uri = f"${{KIPRJMOD}}/{nickname}.kicad_sym"
+            table_path = os.path.join(project_dir, "sym-lib-table")
+        else:
+            library_file = os.path.join(_3rd_party_symbols_dir(), f"{nickname}.kicad_sym")
+            ver_tag = config.kicad_version.split(".")[0]
+            uri = f"${{KICAD{ver_tag}_3RD_PARTY}}/symbols/{nickname}.kicad_sym"
+            table_path = get_user_sym_lib_table_path()
+
+        if os.path.exists(library_file):
+            return {
+                "error": (
+                    f"Library file already exists, refusing to recreate: {library_file}. "
+                    "Use add_symbols_to_library to export into it."
+                )
+            }
+        create_empty_library_file(library_file)
+        registered = register_library_in_table(
+            table_path,
+            nickname,
+            uri,
+            description=f"Created by KiCad MCP symbol export ({nickname})",
+        )
+        indexed = _index_symbol_library(nickname, library_file, project_dir=project_dir)
+        return {
+            "library": nickname,
+            "path": library_file,
+            "table_path": table_path,
+            "registered": bool(registered.get("registered")),
+            "indexed": indexed,
+        }
+    except Exception as exc:
+        log.error("create_symbol_library failed: %s", exc, exc_info=True)
+        if library_file and os.path.exists(library_file):
+            try:
+                os.unlink(library_file)
+                if os.path.exists(library_file + ".bak"):
+                    os.unlink(library_file + ".bak")
+            except OSError:
+                pass
+        return {"error": str(exc)}
+
+
+def _cached_lib_symbol_raw(sch: Any, lib_id: str):
+    """Return the raw ``(symbol ...)`` sexpdata list for *lib_id* from the
+    schematic's lib_symbols cache, or None when absent.
+
+    Handles both native skip ``LibSymbol`` wrappers and raw lists injected
+    via :func:`_add_lib_symbol` (before a write+reload round trip).
+    """
+    try:
+        wrapper = sch.lib_symbols._libsyms_by_id.get(lib_id)
+    except AttributeError:
+        return None
+    if isinstance(wrapper, list):
+        return wrapper
+    pv = getattr(wrapper, "_pv", None) if wrapper is not None else None
+    return getattr(pv, "_tree", None) if pv is not None else None
+
+
+def _extract_cached_raw_entries(sch: Any) -> list[tuple[str, list]]:
+    """Return ``(lib_id, raw)`` pairs for every entry in the schematic's
+    lib_symbols cache (id = fully-qualified stored name, e.g. ``"Device:R"``
+    or ``"自定义:MYOP"``)."""
+    entries: list[tuple[str, list]] = []
+    try:
+        tree = sch.lib_symbols._pv._tree
+    except AttributeError:
+        tree = []
+    for entry in tree:
+        if not (isinstance(entry, list) and len(entry) >= 2 and isinstance(entry[1], str)):
+            continue
+        # entry itself is the raw list when injected, or a LibSymbol wrapper
+        # when loaded by skip — unwrap to the raw list.
+        raw = (
+            entry
+            if isinstance(entry[0], sexpdata.Symbol)
+            else _cached_lib_symbol_raw(sch, entry[1])
+        )
+        if raw is not None:
+            entries.append((entry[1], raw))
+    return entries
+
+
+def _do_add_symbol_to_library(
+    schematic_path: str,
+    symbols: list[str],
+    library: str,
+) -> dict[str, Any]:
+    """Copy selected cached symbols from a schematic into an existing symbol
+    library (``.kicad_sym``).
+
+    Read-only with respect to the schematic: the source file is never
+    modified.  ``symbols`` entries must be fully-qualified lib_ids
+    (``自定义:MYOP`` / ``Device:R``) — plain names are rejected, matching is
+    exact on the full lib_id.  Entries already present in the target library
+    are reported in ``skipped`` (never overwritten); entries not present in
+    the schematic are reported in ``failed``.  The target library is
+    re-indexed afterwards.
+    """
+    if not symbols:
+        return {"error": "symbols list must not be empty"}
+    if not isinstance(symbols, list) or not all(isinstance(s, str) and s for s in symbols):
+        return {"error": "symbols must be a non-empty list of non-empty strings"}
+
+    try:
+        lib = resolve_symbol_library(library, project_path=schematic_path)
+    except ValueError as exc:
+        return {"error": str(exc)}
+    lib_file = lib["path"]
+    if config.is_system_library_path(lib_file):
+        return {
+            "error": (
+                f"Refusing to write to system library '{library}' "
+                f"(resolves to {lib_file}, inside the KiCad installation): "
+                "symbol library tools operate on user libraries only."
+            )
+        }
+
+    try:
+        sch = safe_schematic(schematic_path)
+    except Exception as exc:
+        return {"error": f"Failed to open schematic: {exc}"}
+
+    cached = _extract_cached_raw_entries(sch)
+    cached_by_id = dict(cached)
+
+    exported: list[str] = []
+    failed: list[dict[str, str]] = []
+    skipped: list[dict[str, str]] = []
+
+    for requested in symbols:
+        if ":" not in requested:
+            failed.append(
+                {
+                    "symbol": requested,
+                    "reason": "must_be_lib_id (plain names are not matched; use 'Library:Name')",
+                }
+            )
+            continue
+        raw = cached_by_id.get(requested)
+        if raw is None:
+            failed.append({"symbol": requested, "reason": "not_in_schematic"})
+            continue
+        local_name = requested.split(":")[-1]
+        if not is_safe_symbol_name(local_name):
+            failed.append({"symbol": requested, "reason": "unsafe_symbol_name"})
+            continue
+        try:
+            append_symbol_to_library(lib_file, raw, local_name)
+            exported.append(f"{library}:{local_name}")
+        except SymbolNameExistsError:
+            skipped.append({"symbol": requested, "reason": "already_in_library"})
+            continue
+
+    # Refresh the index so search_symbols/list_symbol_libraries see the new
+    # file — reindexed under the library's OWN ownership (a global library
+    # edited from a project schematic must stay global).
+    proj_dir = _find_project_dir(schematic_path)
+    proj_dir_str = str(proj_dir) if proj_dir else None
+    target_project = _target_project_of(lib["table_path"], proj_dir_str)
+    indexed = _index_symbol_library(
+        library, lib_file, project_dir=proj_dir_str, project=target_project
+    )
+    return {
+        "library": library,
+        "library_path": lib_file,
+        "exported": exported,
+        "exported_count": len(exported),
+        "failed": failed,
+        "failed_count": len(failed),
+        "skipped": skipped,
+        "skipped_count": len(skipped),
+        "indexed": indexed,
+    }
+
+
+def _do_remove_symbol_from_library(
+    library: str,
+    symbols: list[str],
+    project_dir: str | None = None,
+) -> dict[str, Any]:
+    """Remove named symbol definitions from an existing symbol library.
+
+    Only the library ``.kicad_sym`` file is modified — no schematic is ever
+    touched.  Each requested plain symbol name must exist as a top-level
+    definition of the library; missing or unsafe names are reported in
+    ``failed`` (no partial state: every valid name is removed, the rest are
+    reported).  The library is re-indexed afterwards.
+
+    Removing the *last* symbol of a library leaves a valid empty library
+    file; deleting the library itself is a separate tool
+    (``delete_symbol_library``).
+    """
+    if not symbols:
+        return {"error": "symbols list must not be empty"}
+    if not isinstance(symbols, list) or not all(isinstance(s, str) and s for s in symbols):
+        return {"error": "symbols must be a non-empty list of non-empty strings"}
+
+    try:
+        lib = resolve_symbol_library(library, project_path=project_dir)
+    except ValueError as exc:
+        return {"error": str(exc)}
+    lib_file = lib["path"]
+
+    if config.is_system_library_path(lib_file):
+        return {
+            "error": (
+                f"Refusing to modify system library '{library}' "
+                f"(resolves to {lib_file}, inside the KiCad installation): "
+                "symbol library tools operate on user libraries only."
+            )
+        }
+
+    available = set(list_library_symbols(lib_file))
+    removed: list[str] = []
+    failed: list[dict[str, str]] = []
+
+    for name in dict.fromkeys(symbols):  # dedupe, keep order
+        if not is_safe_symbol_name(name):
+            failed.append({"symbol": name, "reason": "unsafe_symbol_name"})
+            continue
+        if name not in available:
+            failed.append(
+                {"symbol": name, "reason": f"not_in_library ({name!r} not a top-level symbol)"}
+            )
+            continue
+        try:
+            remove_symbol_from_library_file(lib_file, name)
+        except SymbolNotFoundError:
+            failed.append({"symbol": name, "reason": "not_in_library"})
+            continue
+        except Exception as exc:
+            log.error("remove_symbol_from_library_file failed for %s: %s", name, exc, exc_info=True)
+            failed.append({"symbol": name, "reason": f"remove_failed: {exc}"})
+            continue
+        removed.append(f"{library}:{name}")
+        available.discard(name)
+
+    # Refresh the index so removed symbols disappear from search —
+    # reindexed under the library's OWN ownership (a global library edited
+    # through a project path must stay global).
+    target_project = _target_project_of(lib["table_path"], project_dir)
+    indexed = _index_symbol_library(
+        library, lib_file, project_dir=project_dir, project=target_project
+    )
+    return {
+        "library": library,
+        "library_path": lib_file,
+        "removed": removed,
+        "removed_count": len(removed),
+        "failed": failed,
+        "failed_count": len(failed),
+        "indexed": indexed,
+    }
+
+
+def _do_delete_symbol_library(
+    library: str,
+    project_dir: str | None = None,
+) -> dict[str, Any]:
+    """Delete an **empty** symbol library: file, table entry, and index.
+
+    Refuses (``error``) when the library still contains any top-level
+    symbol — delete_symbol_library only ever removes empty libraries; use
+    ``remove_symbols_from_library`` first to empty it.  A ``.bak`` copy of
+    the sym-lib-table is written when the table entry is dropped.
+    """
+    try:
+        lib = resolve_symbol_library(library, project_path=project_dir)
+    except ValueError as exc:
+        return {"error": str(exc)}
+    lib_file = lib["path"]
+    table_path = lib["table_path"]
+
+    if config.is_system_library_path(lib_file):
+        return {
+            "error": (
+                f"Refusing to delete system library '{library}' "
+                f"(resolves to {lib_file}, inside the KiCad installation): "
+                "delete_symbol_library operates on user libraries only."
+            )
+        }
+    if not _is_user_library_location(lib_file, project_dir):
+        return {
+            "error": (
+                f"Refusing to delete library '{library}': it does not live in "
+                "a user library location (delete_symbol_library only deletes "
+                "libraries it created — in the 3rd-party symbols dir or the "
+                "project dir)."
+            )
+        }
+
+    remaining = list_library_symbols(lib_file)
+    if remaining:
+        return {
+            "error": (
+                f"Library '{library}' is not empty "
+                f"({len(remaining)} symbol(s): {', '.join(sorted(remaining))}); "
+                "refusing to delete. Use remove_symbols_from_library first."
+            )
+        }
+
+    unregistered = False
+    backup_path: str | None = None
+
+    def _cleanup_index() -> bool:
+        """Best-effort index removal; never raises."""
+        try:
+            # Ownership-scoped: remove exactly the row owned by the library's
+            # declaring table (project row for a project library, global row
+            # otherwise).  A same-nickname row of another project is never
+            # touched.
+            target_project = _target_project_of(table_path, project_dir)
+            return _get_index_manager(project_dir).remove_library(library, project=target_project)
+        except Exception as exc:
+            log.error("delete_symbol_library: index cleanup failed for %s: %s", library, exc)
+            return False
+
+    # Remove the file before touching sym-lib-table: if removal fails, the
+    # table entry is still intact (no partially-deleted state).
+    try:
+        os.remove(lib_file)
+        with contextlib.suppress(OSError):
+            os.remove(lib_file + ".bak")
+    except OSError as exc:
+        log.error("delete_symbol_library: cannot remove %s: %s", lib_file, exc, exc_info=True)
+        return {
+            "error": f"Failed to remove library file: {lib_file} ({exc})",
+            "file_removed": False,
+            "table_unregistered": unregistered,
+            "table_backup": backup_path,
+        }
+
+    if table_path and os.path.isfile(table_path):
+        try:
+            result = unregister_library_in_table(table_path, library)
+            unregistered = bool(result.get("unregistered"))
+            backup_path = result.get("backup_path")
+        except Exception as exc:
+            # The file is already gone: never report success.  Still attempt
+            # index cleanup, then say exactly what was removed vs left.
+            log.error(
+                "delete_symbol_library: unregister failed for %s: %s",
+                library,
+                exc,
+                exc_info=True,
+            )
+            return {
+                "error": (
+                    f"Library file removed but its sym-lib-table entry could not "
+                    f"be unregistered ({exc}); the table entry (+ backup) remains."
+                ),
+                "library": library,
+                "path": lib_file,
+                "table_path": table_path,
+                "file_removed": True,
+                "table_unregistered": False,
+                "table_backup": backup_path,
+                "index_removed": _cleanup_index(),
+                "deleted": False,
+            }
+
+    index_removed = _cleanup_index()
+
+    return {
+        "library": library,
+        "path": lib_file,
+        "table_path": table_path,
+        "file_removed": True,
+        "unregistered": unregistered,
+        "table_backup": backup_path,
+        "index_removed": index_removed,
+        "deleted": True,
+    }
+
+
+def _parse_available_symbols(uri: str) -> set[str]:
+    """Return the symbol names available at *uri* (a .kicad_sym file or a
+    KiCad 10 symdir directory of .kicad_sym files).
+
+    Directory-type libraries aggregate every ``.kicad_sym`` file under the
+    bare nickname so lookup by lib_id's library part (always "Nickname", see
+    lib_id assembly below) hits correctly.
+    """
+    names: set[str] = set()
+    if os.path.isdir(uri):
+        for fname in sorted(os.listdir(uri)):
+            if fname.endswith(".kicad_sym"):
+                names.update(list_library_symbols(os.path.join(uri, fname)))
+    elif os.path.isfile(uri):
+        names.update(list_library_symbols(uri))
+    return names
+
+
+def _do_find_symbols_not_in_libraries(schematic_path: str) -> dict[str, Any]:
+    """List schematic symbols whose library definition exists in no indexed
+    symbol library.
+
+    Read-only: compares the lib_id of every symbol instance referenced by
+    the schematic (``Library:Name`` pairs) against the libraries actually
+    available — project-local sym-lib-table, global user table, and the
+    indexed library database.  Output is consolidated per ``(library,
+    name)``, listing the references using it.
+    """
+    try:
+        sch = safe_schematic(schematic_path)
+    except Exception as exc:
+        return {"error": f"Failed to open schematic: {exc}"}
+
+    # Instances plus their reference designators.
+    instances: list[tuple[str, str]] = []  # (lib_id, reference)
+    try:
+        for sym in sch.symbol:
+            ref = ""
+            try:
+                ref = sym.property.Reference.value or ""
+            except AttributeError:
+                pass
+            try:
+                lib_id = sym.lib_id.value
+            except AttributeError:
+                continue
+            if not lib_id:
+                continue
+            instances.append((lib_id, ref))
+    except AttributeError:
+        pass
+
+    if not instances:
+        return {"missing": [], "missing_count": 0}
+
+    # Preferred source of truth: the symbol index database — but only when
+    # the current project's sync has actually completed.  Trusting a sync
+    # that is still running, failed, or finished for a different project
+    # would wrongly report symbols missing; when in doubt, live-scan instead.
+    # Mirrors ``pcb_library_tools._collect_existing_footprints``.
+    from kcaa.tools.symbol_tools import _sync_lock, _sync_state
+
+    pairs: set[tuple[str, str]] | None = None
+    try:
+        with _sync_lock:
+            running = _sync_state.running
+            last_result = _sync_state.last_result
+            last_project = _sync_state.last_project_path
+        if not (
+            running
+            or not last_result
+            or not last_result.get("success")
+            or last_project != _project_dir_of(schematic_path)
+        ):
+            pairs = _get_index_manager(schematic_path).get_all_symbol_pairs()
+    except Exception as exc:
+        log.warning("Symbol index read failed (%s) — falling back to live scan", exc)
+        pairs = None
+
+    missing: list[dict[str, Any]] = []
+    merged: dict[tuple[str, str], dict[str, Any]] = {}
+
+    if pairs is not None:
+        # Index DB is authoritative.  A lib_id ``X:Y`` resolves when either
+        # the file-type row ``(X, Y)`` exists, or the KiCad 10 symdir row
+        # ``(X/Y, Y)`` exists (nickname directory contains ``Y.kicad_sym``).
+        # Union scope — same-nickname global and project rows both match,
+        # deliberately NOT applying shadow semantics (footprint side does the
+        # same).  Each query is microsecond-fast versus the old live parse of
+        # every registered library (~60s, which stalled the whole MCP server).
+        for lib_id, ref in instances:
+            library, _, name = lib_id.partition(":")
+            if not library or not name:
+                continue
+            if (library, name) in pairs or (f"{library}/{name}", name) in pairs:
+                continue
+            key = (library, name)
+            entry = merged.get(key)
+            if entry is None:
+                entry = {"name": name, "library": library, "references": []}
+                merged[key] = entry
+            entry["references"].append(ref)
+    else:
+        # Live fallback: parse ONLY the libraries the schematic actually
+        # references.  Parsing every registered library (system +
+        # 3rd-party) means reading tens of thousands of .kicad_sym files
+        # per call (~60s on a stock KiCad install), which stalls the MCP
+        # server far past the client's request timeout.  A symbol can only
+        # be "found" in a library its lib_id names, so the referenced
+        # subset yields exactly the same missing set.
+        libs = build_effective_symbol_library_list(project_path=schematic_path)
+        lib_lookup = {lib["nickname"]: lib.get("uri", "") for lib in libs}
+        available: dict[str, set[str]] = {}
+        for library in {lib_id.partition(":")[0] for lib_id, _ in instances}:
+            if not library:
+                continue
+            uri = lib_lookup.get(library, "")
+            if not uri:
+                # Library not registered anywhere -> every symbol from it is
+                # missing; nothing to parse.
+                continue
+            if library not in available:
+                available[library] = _parse_available_symbols(uri)
+        for lib_id, ref in instances:
+            library, _, name = lib_id.partition(":")
+            if not library or not name:
+                continue
+            if library in available and name in available[library]:
+                continue
+            key = (library, name)
+            entry = merged.get(key)
+            if entry is None:
+                entry = {"name": name, "library": library, "references": []}
+                merged[key] = entry
+            entry["references"].append(ref)
+
+    for entry in merged.values():
+        entry["reference_count"] = len(entry["references"])
+        missing.append(entry)
+
+    return {"missing": missing, "missing_count": len(missing)}
 
 
 # ---------------------------------------------------------------------------
@@ -271,7 +966,7 @@ def _do_add_symbol(
         lib_id_str = f"{table_name}:{symbol_name}"
         effective_value = value or symbol_name
 
-        mgr = _get_index_manager()
+        mgr = _get_index_manager(schematic_path)
         lib_rec = mgr.get_library_by_name(library_name)
         if lib_rec is None:
             return {
@@ -303,7 +998,9 @@ def _do_add_symbol(
 
         # Expand (extends ...) symbols into self-contained definitions so that
         # the injected lib_symbol has full geometry and pin sub-symbols.
-        lib_sym_raw = _resolve_extends_symbol(lib_sym_raw, library_name)
+        lib_sym_raw = _resolve_extends_symbol(
+            lib_sym_raw, library_name, project_path=schematic_path
+        )
 
         try:
             sch = safe_schematic(schematic_path)
@@ -977,7 +1674,9 @@ def _get_extends_base_name(lib_sym_raw: list) -> str | None:
     return None
 
 
-def _resolve_extends_symbol(lib_sym_raw: list, library_name: str) -> list:
+def _resolve_extends_symbol(
+    lib_sym_raw: list, library_name: str, project_path: str | None = None
+) -> list:
     """Resolve an ``(extends ...)`` lib symbol into a fully self-contained definition.
 
     KiCad's ``.kicad_symdir`` format stores variant symbols (e.g.
@@ -1002,6 +1701,11 @@ def _resolve_extends_symbol(lib_sym_raw: list, library_name: str) -> list:
 
     Returns *lib_sym_raw* unchanged if no ``(extends ...)`` clause is present
     or if the base symbol cannot be resolved (a warning is logged).
+
+    Args:
+        project_path: Optional project directory or file inside one, used to
+            scope the index lookup so base symbols in project-local
+            libraries resolve.
     """
     base_name = _get_extends_base_name(lib_sym_raw)
     if base_name is None:
@@ -1014,7 +1718,7 @@ def _resolve_extends_symbol(lib_sym_raw: list, library_name: str) -> list:
     parts = library_name.split("/", 1)
     base_lib_name = f"{parts[0]}/{base_name}" if len(parts) >= 2 else library_name
 
-    mgr = _get_index_manager()
+    mgr = _get_index_manager(project_path)
     base_sym_rec = mgr.get_symbol(base_lib_name, base_name)
     base_lib_rec = mgr.get_library_by_name(base_lib_name)
 
@@ -1161,6 +1865,371 @@ def _add_lib_symbol(lib_symbols_wrapper: Any, lib_sym_raw: list, table_name: str
 
 
 # ---------------------------------------------------------------------------
+# create_symbol: build a new lib symbol definition from scratch
+# ---------------------------------------------------------------------------
+
+
+def _lib_effects(font_size: float = 1.27) -> list:
+    """Return a ``(effects (font (size s s)))`` node for pins/properties."""
+    return [
+        sexpdata.Symbol("effects"),
+        [sexpdata.Symbol("font"), [sexpdata.Symbol("size"), font_size, font_size]],
+    ]
+
+
+def _build_lib_symbol_raw(
+    symbol_name: str,
+    pins: list[dict],
+    reference_prefix: str,
+    value: str,
+    body_width: float | None = None,
+    body_height: float | None = None,
+) -> tuple[list, list[str]]:
+    """Build a self-contained KiCad 10 ``(symbol ...)`` lib definition.
+
+    The returned raw list lives in the KiCad library coordinate system
+    (origin at the body centre, **+Y up**), matches the on-disk format KiCad
+    writes for ``.kicad_sch`` lib_symbols blocks, and carries a single
+    electrical unit (``NAME_1_1``) holding every pin plus a shared graphics
+    unit (``NAME_0_1``) with the body rectangle.
+
+    Pin auto-layout (all offsets stay on the 1.27 mm / 50-mil grid):
+
+    * ``direction=left``  → pins face the body's left edge, angle 0
+    * ``direction=right`` → pins face the body's right edge, angle 180
+    * ``direction=up``    → pins face the body's top edge, angle 270
+    * ``direction=down``  → pins face the body's bottom edge, angle 90
+
+    Pins on the same side are spaced 2.54 mm (100 mil) apart, centred on the
+    body, in counter-clockwise order: reading the side from the top (left
+    side) or the right (up side) downward/leftward — first pin topmost on
+    ``left``, bottommost on ``right``, rightmost on ``up``, leftmost on
+    ``down`` (KiCad DIP convention).  Each pin is 2.54 mm long with
+    its inner end exactly on the body edge and the electrical (connection)
+    end pointing outward.  Body size defaults to 6.35 mm wide with the height
+    derived from the pin span; explicit *body_width* / *body_height* are used
+    when given but are enlarged if they would not contain every pin's inner
+    end (a warning is appended in that case).
+
+    Returns the raw list and a warnings list.
+    """
+    warnings: list[str] = []
+
+    # Partition pins per side, preserving the caller's ordering within each
+    # side so pin 1 sits at the top of a vertical side and ordering follows
+    # the `pins` array.
+    per_side: dict[str, list[dict]] = {d: [] for d in VALID_PIN_DIRECTIONS}
+    for pin in pins:
+        per_side[pin["direction"]].append(pin)
+
+    def _side_offsets(count: int) -> list[float]:
+        """Centred 2.54 mm-spaced offsets, every value on the 1.27 mm grid."""
+        return [
+            round((count - 1) * _PIN_PITCH_MM / 2.0 - i * _PIN_PITCH_MM, 4) for i in range(count)
+        ]
+
+    # Horizontal pins (left/right) stick out along X, so the body height must
+    # cover their Y span; vertical pins (up/down) stick out along Y, so the
+    # body width must cover their X span.  Per-side arrays preserve the
+    # caller's pin order in counter-clockwise direction: the first pin sits
+    # topmost on the left side, bottommost on the right side, rightmost on
+    # the up side, and leftmost on the down side (KiCad DIP convention).
+    left_y = _side_offsets(len(per_side["left"]))
+    right_y = _side_offsets(len(per_side["right"]))[::-1]
+    up_x = _side_offsets(len(per_side["up"]))
+    down_x = _side_offsets(len(per_side["down"]))[::-1]
+    req_h_span = 0.0
+    for side_offsets in (left_y, right_y):
+        req_h_span = max(req_h_span, max((abs(v) for v in side_offsets), default=0.0))
+    req_w_span = 0.0
+    for side_offsets in (up_x, down_x):
+        req_w_span = max(req_w_span, max((abs(v) for v in side_offsets), default=0.0))
+
+    required_w = 2.0 * req_w_span
+    required_h = 2.0 * req_h_span
+
+    if body_width is not None:
+        width = body_width
+        if width < required_w:
+            warnings.append(
+                f"body_width {width} too small to contain vertical pins; using {required_w}"
+            )
+            width = required_w
+    else:
+        width = max(_DEFAULT_BODY_WIDTH_MM, required_w)
+
+    if body_height is not None:
+        height = body_height
+        if height < required_h:
+            warnings.append(
+                f"body_height {height} too small to contain horizontal pins; using {required_h}"
+            )
+            height = required_h
+    else:
+        height = max(required_h + _BODY_HEIGHT_PADDING_MM, _PIN_PITCH_MM)
+
+    half_w = round(width / 2.0, 4)
+    half_h = round(height / 2.0, 4)
+
+    # Pin electrical (connection) ends in lib coordinates, inner end on edge.
+    pin_nodes: list[list] = []
+    for direction, side_offsets in (("left", left_y), ("right", right_y)):
+        angle = _PIN_DIRECTION_ANGLE[direction]
+        sign_x = -1.0 if direction == "left" else 1.0
+        base_x = sign_x * (half_w + _DEFAULT_PIN_LENGTH_MM)
+        for pin, off in zip(per_side[direction], side_offsets):
+            pin_nodes.append(_build_pin_node(pin, base_x, off, angle))
+    for direction, sign_y, side_offsets in (
+        ("up", 1.0, up_x),
+        ("down", -1.0, down_x),
+    ):
+        angle = _PIN_DIRECTION_ANGLE[direction]
+        base_y = sign_y * (half_h + _DEFAULT_PIN_LENGTH_MM)
+        for pin, off in zip(per_side[direction], side_offsets):
+            pin_nodes.append(_build_pin_node(pin, off, base_y, angle))
+
+    # Reference/Value sit just outside the body on the right, like KiCad's
+    # own auto-placed fields; Footprint/Datasheet carry empty defaults.
+    top: list = [
+        sexpdata.Symbol("symbol"),
+        symbol_name,
+        [
+            sexpdata.Symbol("pin_names"),
+            [sexpdata.Symbol("offset"), 0.254],
+            [sexpdata.Symbol("hide"), sexpdata.Symbol("yes")],
+        ],
+        [sexpdata.Symbol("exclude_from_sim"), sexpdata.Symbol("no")],
+        [sexpdata.Symbol("in_bom"), sexpdata.Symbol("yes")],
+        [sexpdata.Symbol("on_board"), sexpdata.Symbol("yes")],
+        [sexpdata.Symbol("in_pos_files"), sexpdata.Symbol("yes")],
+        [sexpdata.Symbol("duplicate_pin_numbers_are_jumpers"), sexpdata.Symbol("no")],
+    ]
+
+    for prop_name, prop_value, prop_x, prop_y, prop_hidden in (
+        ("Reference", reference_prefix, 0.635, 2.54, False),
+        ("Value", value, 0.635, -2.54, False),
+        ("Footprint", "", 0.0, 0.0, True),
+        ("Datasheet", "", 0.0, 0.0, True),
+    ):
+        prop_node: list = [
+            sexpdata.Symbol("property"),
+            prop_name,
+            prop_value,
+            [sexpdata.Symbol("at"), prop_x, prop_y, 0],
+            [sexpdata.Symbol("show_name"), sexpdata.Symbol("no")],
+            [sexpdata.Symbol("do_not_autoplace"), sexpdata.Symbol("no")],
+        ]
+        if prop_hidden:
+            # KiCad convention (see e.g. Device:R_Small in the test
+            # fixtures): Footprint/Datasheet are hidden on the canvas.
+            prop_node.append([sexpdata.Symbol("hide"), sexpdata.Symbol("yes")])
+        prop_node.append(_lib_effects())
+        top.append(prop_node)
+
+    top.append(
+        [
+            sexpdata.Symbol("symbol"),
+            f"{symbol_name}_0_1",
+            [
+                sexpdata.Symbol("rectangle"),
+                [sexpdata.Symbol("start"), -half_w, half_h],
+                [sexpdata.Symbol("end"), half_w, -half_h],
+                [
+                    sexpdata.Symbol("stroke"),
+                    [sexpdata.Symbol("width"), 0.254],
+                    [sexpdata.Symbol("type"), sexpdata.Symbol("default")],
+                ],
+                [
+                    sexpdata.Symbol("fill"),
+                    [sexpdata.Symbol("type"), sexpdata.Symbol("background")],
+                ],
+            ],
+        ]
+    )
+    top.append([sexpdata.Symbol("symbol"), f"{symbol_name}_1_1", *pin_nodes])
+    top.append([sexpdata.Symbol("embedded_fonts"), sexpdata.Symbol("no")])
+
+    return top, warnings
+
+
+def _build_pin_node(pin: dict, pin_x: float, pin_y: float, angle: int) -> list:
+    """Build one ``(pin <type> line (at x y angle) (length L) ...)`` node.
+
+    *pin_x* / *pin_y* are the electrical (connection) end, which is the outer
+    end; the 2.54 mm pin line runs from there back onto the body edge.
+    """
+    return [
+        sexpdata.Symbol("pin"),
+        sexpdata.Symbol(pin["type"]),
+        sexpdata.Symbol("line"),
+        [sexpdata.Symbol("at"), pin_x, pin_y, angle],
+        [sexpdata.Symbol("length"), _DEFAULT_PIN_LENGTH_MM],
+        [
+            sexpdata.Symbol("name"),
+            pin.get("name", ""),
+            _lib_effects(),
+        ],
+        [sexpdata.Symbol("number"), pin["number"], _lib_effects()],
+    ]
+
+
+def _do_create_symbol(
+    library: str,
+    symbol_name: str,
+    pins: list[dict],
+    reference_prefix: str = "U",
+    value: str | None = None,
+    body_width: float | None = None,
+    body_height: float | None = None,
+    project_dir: str | None = None,
+) -> dict[str, Any]:
+    """Core implementation of ``create_symbol``.
+
+    Validates inputs, builds a fresh lib symbol definition, and writes it
+    into an existing user symbol library (``<library>.kicad_sym``, resolved
+    via sym-lib-table — through the *project_dir* scope when given, so a
+    project-local library can be targeted).  Creating a definition only —
+    placing instances is done separately with ``add_symbol_to_schematic``.
+    All failures return ``{"error": ...}`` without a success key (matching
+    the create_symbol contract).  The library must already exist — create
+    it first with ``create_symbol_library``.  System libraries (inside the
+    KiCad installation) are refused.
+    """
+    if not isinstance(library, str) or not library:
+        return {"error": "library is required: create it first with create_symbol_library"}
+    if isinstance(symbol_name, str) and not _SYMBOL_NAME_RE.match(symbol_name):
+        return {
+            "error": (
+                f"Invalid symbol_name {symbol_name!r}: must match "
+                r"^[A-Za-z][A-Za-z0-9_]*$ (no leading digit)"
+            )
+        }
+    if not isinstance(symbol_name, str):
+        return {"error": "symbol_name must be a string"}
+    if not pins:
+        return {"error": "pins list must not be empty"}
+    if not isinstance(reference_prefix, str) or not _SYMBOL_NAME_RE.match(reference_prefix):
+        return {
+            "error": (
+                f"Invalid reference_prefix {reference_prefix!r}: must match "
+                r"^[A-Za-z][A-Za-z0-9_]*$ (must start with a letter)"
+            )
+        }
+
+    seen_numbers: set[str] = set()
+    for i, pin in enumerate(pins):
+        if not isinstance(pin, dict):
+            return {"error": f"pins[{i}] must be a dict with number/name/type/direction"}
+        number = pin.get("number")
+        if not isinstance(number, str) or not number:
+            return {"error": f"pins[{i}]: number must be a non-empty string"}
+        if number in seen_numbers:
+            return {"error": f"Duplicate pin number {number!r}"}
+        seen_numbers.add(number)
+        pin_type = pin.get("type")
+        if pin_type not in VALID_PIN_TYPES:
+            return {
+                "error": (
+                    f"pins[{i}]: invalid type {pin_type!r}; valid types: "
+                    f"{', '.join(VALID_PIN_TYPES)}"
+                )
+            }
+        direction = pin.get("direction")
+        if direction not in VALID_PIN_DIRECTIONS:
+            return {
+                "error": (
+                    f"pins[{i}]: invalid direction {direction!r}; valid "
+                    f"directions: {', '.join(VALID_PIN_DIRECTIONS)}"
+                )
+            }
+        name = pin.get("name")
+        if name is not None and not isinstance(name, str):
+            return {"error": f"pins[{i}]: name must be a string"}
+        # Normalize an explicit None to "" so sexpdata never serializes nil
+        # (pin.get("name", "") only covers a *missing* key).
+        if name is None:
+            pin["name"] = ""
+
+    for label, v in (("body_width", body_width), ("body_height", body_height)):
+        if v is not None and not math.isfinite(v):
+            return {"error": f"{label} must be a finite number (got {v})"}
+        if v is not None and v <= 0:
+            return {"error": f"{label} must be positive (got {v})"}
+    if value is not None and not isinstance(value, str):
+        return {"error": "value must be a string or None"}
+
+    # Resolve the target library through sym-lib-table; it must already
+    # exist (create_symbol_library is the prerequisite).  With project_dir
+    # the lookup is scoped to global + that project's libraries.
+    try:
+        lib = resolve_symbol_library(library, project_path=project_dir)
+    except ValueError as exc:
+        return {"error": str(exc)}
+    lib_file = lib["path"]
+    if config.is_system_library_path(lib_file):
+        return {
+            "error": (
+                f"Refusing to write to system library '{library}' "
+                f"(resolves to {lib_file}, inside the KiCad installation): "
+                "symbol library tools operate on user libraries only."
+            )
+        }
+    if not is_safe_symbol_name(symbol_name):
+        return {"error": f"Unsafe symbol name {symbol_name!r} (refusing to write)"}
+
+    effective_value = value if value not in (None, "") else symbol_name
+    lib_id_str = f"{library}:{symbol_name}"
+
+    try:
+        lib_sym_raw, warnings = _build_lib_symbol_raw(
+            symbol_name=symbol_name,
+            pins=pins,
+            reference_prefix=reference_prefix,
+            value=effective_value,
+            body_width=body_width,
+            body_height=body_height,
+        )
+    except Exception as exc:
+        log.exception("Failed to build lib symbol definition")
+        return {"error": f"Failed to build lib symbol definition: {exc}"}
+
+    # Library-level no-overwrite: a symbol with the same name in the target
+    # library is a hard error (never overwrite, matching add_symbol contract).
+    if symbol_name in list_library_symbols(lib_file):
+        return {
+            "error": (
+                f"Symbol '{symbol_name}' already exists in library '{library}' "
+                "(refusing to overwrite)"
+            )
+        }
+
+    try:
+        append_symbol_to_library(lib_file, lib_sym_raw, symbol_name)
+    except SymbolNameExistsError as exc:
+        return {"error": str(exc)}
+    except Exception as exc:
+        log.error("Failed to append symbol to library %s: %s", library, exc)
+        return {"error": f"Failed to write symbol to library: {exc}"}
+
+    result: dict[str, Any] = {
+        "success": True,
+        "lib_id": lib_id_str,
+        "library": library,
+        "library_path": lib_file,
+        "units_added": _get_unit_count(lib_sym_raw),
+        "pin_count": len(pins),
+        "warnings": warnings,
+    }
+
+    # Refresh the index so search_symbols sees the new symbol — reindexed
+    # under the library's OWN ownership (a global library stays global).
+    target_project = _target_project_of(lib["table_path"], project_dir)
+    _index_symbol_library(library, lib_file, project_dir=project_dir, project=target_project)
+
+    return result
+
+
+# ---------------------------------------------------------------------------
 # MCP tool registration
 # ---------------------------------------------------------------------------
 
@@ -1185,6 +2254,9 @@ def register_symbol_edit_tools(mcp: FastMCP) -> None:
         Looks up the symbol in the index database, extracts its definition
         from the library file, injects it into the schematic's lib_symbols
         block, and inserts a placed instance for every unit of the symbol.
+        The library is resolved scoped to the target schematic's project
+        (project sym-lib-table libraries included), matching how
+        ``search_symbols`` reports them.
         Coordinates are mm in KiCad screen convention (**+Y is down**) and
         are auto-snapped to the 1.27 mm (50-mil) grid so pins land on KiCad's
         standard schematic grid and wires can connect to them. A backup
@@ -1232,6 +2304,83 @@ def register_symbol_edit_tools(mcp: FastMCP) -> None:
             rotation=rotation,
             value=value,
             fields_autoplaced=fields_autoplaced,
+        )
+
+    @mcp.tool()
+    async def create_symbol(
+        library: str,
+        symbol_name: str,
+        pins: list[dict],
+        reference_prefix: str = "U",
+        value: str | None = None,
+        body_width: float | None = None,
+        body_height: float | None = None,
+        project_dir: str | None = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Create a brand-new symbol definition in a user symbol library.
+
+        Unlike ``add_symbol_to_schematic`` (which pulls an *existing*
+        definition from the indexed libraries), this tool generates a fresh
+        single-unit symbol from the ``pins`` description: a rectangular body
+        of 6.35 mm default width (or explicit ``body_width`` / ``body_height``)
+        with one pin per entry, laid out automatically.
+
+        The definition is written into the ``.kicad_sym`` library named by
+        ``library``, which must already exist — call ``create_symbol_library``
+        first.  The library is resolved through sym-lib-table, scoped to the
+        project when *project_dir* is given (so a project-local library can
+        be targeted); system libraries are refused.
+
+        This tool is definition-only: it never touches a schematic.  To place
+        an instance of the new symbol, call ``add_symbol_to_schematic`` (or
+        ``place_symbol_relative``) afterwards.
+
+        Pin ``direction`` picks the body side the pin faces on:
+        ``left`` / ``right`` / ``up`` / ``down``; pins on one side are spaced
+        2.54 mm (100 mil) apart in counter-clockwise order (KiCad DIP
+        convention).  Pin ``type`` must be one of: ``input``, ``output``,
+        ``bidirectional``, ``tri_state``, ``passive``, ``free``,
+        ``no_connect``, ``power_in``, ``power_out``, ``open_collector``,
+        ``open_emitter``, ``unspecified``.
+
+        The definition is registered under lib_id ``<library>:NAME``.
+
+        Args:
+            library: Name of the target symbol library (must already exist,
+                create it with ``create_symbol_library`` first).
+            symbol_name: Name for the new symbol. Must match
+                ``^[A-Za-z][A-Za-z0-9_]*$`` (no leading digit).  Must not
+                already exist in the library (no overwrite).
+            pins: List of pin dicts, each ``{"number": str, "name": str,
+                "type": str, "direction": str}``.  ``number`` must be unique.
+                ``name`` is optional (defaults to "").  ``type`` and
+                ``direction`` take the values listed above.
+            reference_prefix: Reference prefix for the symbol's default
+                reference property (e.g. "U" → U?). Defaults to "U".
+            value: Value property text. Defaults to ``symbol_name``.
+            body_width: Body width in mm (default 6.35). Enlarged if too
+                small for the pins.
+            body_height: Body height in mm (default derived from the pin
+                span). Enlarged if too small for the pins.
+            project_dir: Optional path to the project directory when the
+                target library is project-local (``${KIPRJMOD}`` URI).
+                Omit for global libraries.
+
+        Returns:
+            dict with keys: success (bool), lib_id, library, library_path,
+            units_added, pin_count, warnings.  On failure returns
+            ``{"error": ...}`` without a success key.
+        """
+        return _do_create_symbol(
+            library=library,
+            symbol_name=symbol_name,
+            pins=pins,
+            reference_prefix=reference_prefix,
+            value=value,
+            body_width=body_width,
+            body_height=body_height,
+            project_dir=project_dir,
         )
 
     @mcp.tool()
@@ -1306,7 +2455,7 @@ def register_symbol_edit_tools(mcp: FastMCP) -> None:
 
         # We need the new symbol's lib bbox to centre it correctly.
         try:
-            mgr = _get_index_manager()
+            mgr = _get_index_manager(schematic_path)
             lib_rec = mgr.get_library_by_name(library_name)
             if lib_rec is None:
                 return {"error": f"Library '{library_name}' not found in index"}
@@ -1384,6 +2533,171 @@ def register_symbol_edit_tools(mcp: FastMCP) -> None:
             result["anchor_bbox"] = bb_d
             result["side"] = side
         return result
+
+    @mcp.tool()
+    async def create_symbol_library(
+        name: str,
+        project_dir: str | None = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Create a new symbol library (``.kicad_sym``) and register it.
+
+        Global form (default): creates ``<name>.kicad_sym`` under
+        ``${KICAD..3RD_PARTY}/symbols`` and registers it in the global user
+        sym-lib-table.  Project form (``project_dir`` given): creates
+        ``<project_dir>/<name>.kicad_sym`` and registers it in the project's
+        ``sym-lib-table`` (created if absent) with a ``${KIPRJMOD}`` URI.
+
+        The library is created empty and indexed immediately, so
+        ``search_symbols`` / ``list_symbol_libraries`` see it.  Call this
+        **before** ``create_symbol`` — the latter requires an existing
+        library.
+
+        Fails (``{"error": ...}``) if the name is invalid, the library or
+        file already exists (no silent overwrite), or the project directory
+        does not exist.
+
+        Args:
+            name: Library nickname (sanitised to sym-lib-table-safe chars).
+            project_dir: Optional project directory; when given the library
+                is created project-local instead of in the global 3rd-party
+                symbols directory.
+
+        Returns:
+            dict with keys: library (nickname), path (library file),
+            table_path (sym-lib-table file written), registered (bool),
+            indexed (symbol count in the index).
+        """
+        return _do_create_symbol_library(name=name, project_dir=project_dir)
+
+    @mcp.tool()
+    async def add_symbols_to_library(
+        schematic_path: str,
+        symbols: list[str],
+        library: str,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Copy symbols from a schematic's lib_symbols cache into a library.
+
+        Reads the target schematic (read-only — the schematic is never
+        modified) and appends the raw definition of each requested symbol to
+        the ``.kicad_sym`` file of *library*.
+
+        ``symbols`` entries must be fully-qualified lib_ids (``"自定义:MYOP"``,
+        ``"Device:R"``) — matching is exact on the full lib_id; plain names
+        are rejected.  Entries already present in the target library
+        are reported in ``skipped`` (never overwritten); entries not present
+        in the schematic are reported in ``failed``.  The library is
+        re-indexed afterwards.
+
+        Args:
+            schematic_path: Absolute path to the source .kicad_sch file.
+            symbols: Non-empty list of fully-qualified lib_ids (``Library:Name``)
+                to export.
+            library: Target library nickname (must already exist, e.g. via
+                ``create_symbol_library``).
+
+        Returns:
+            dict with keys: library, library_path, exported (list of
+            ``<library>:<name>``), exported_count, failed (list of
+            dicts with symbol/reason), failed_count, skipped, skipped_count,
+            indexed.
+        """
+        return _do_add_symbol_to_library(
+            schematic_path=schematic_path,
+            symbols=symbols,
+            library=library,
+        )
+
+    @mcp.tool()
+    async def find_symbols_not_in_libraries(
+        schematic_path: str,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """List schematic symbols missing from all available symbol libraries.
+
+        Read-only discovery: compares the lib_id of every symbol instance
+        referenced by the schematic against the libraries actually available
+        (project sym-lib-table, global user table, plus system libraries).
+        Symbols whose ``(library, name)`` resolves to nothing are returned,
+        consolidated per symbol with the reference designators that use it.
+
+        Use this before ``add_symbols_to_library`` to see which cached custom
+        symbols still need exporting.  ``create_symbol``-generated symbols
+        only exist in the schematic cache until exported; placing them into
+        a library makes them reusable and index-searchable.
+
+        Args:
+            schematic_path: Absolute path to the .kicad_sch file to inspect.
+
+        Returns:
+            dict with keys: missing (list of dicts with name, library,
+            references, reference_count), missing_count.
+        """
+        return await asyncio.to_thread(
+            _do_find_symbols_not_in_libraries, schematic_path=schematic_path
+        )
+
+    @mcp.tool()
+    async def remove_symbols_from_library(
+        library: str,
+        symbols: list[str],
+        project_dir: str | None = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Remove named symbol definitions from an existing symbol library.
+
+        Modifies only the library ``.kicad_sym`` file — no schematic is
+        ever touched.  Each requested plain symbol name must exist as a
+        top-level definition of *library*; missing or unsafe names are
+        reported in ``failed`` (valid names are still removed).  The
+        library is re-indexed so removed symbols disappear from search.
+
+        Removing the *last* symbol leaves a valid empty library file; use
+        ``delete_symbol_library`` (empty-library-only) to remove the
+        library itself.
+
+        Args:
+            library: Nickname of the target library as registered in
+                sym-lib-table.
+            symbols: Plain symbol names to remove (e.g. ["NINJA_IO"]).
+                Must contain at least one entry.
+            project_dir: Optional project directory used to resolve
+                project-local libraries (``${KIPRJMOD}``).  Omit for
+                global libraries.
+
+        Returns:
+            dict with keys: library, library_path, removed (list of
+            ``Library:Name``), removed_count, failed (list of {symbol,
+            reason}), failed_count, indexed; plus ``error`` on failure.
+        """
+        return _do_remove_symbol_from_library(
+            library=library, symbols=symbols, project_dir=project_dir
+        )
+
+    @mcp.tool()
+    async def delete_symbol_library(
+        library: str,
+        project_dir: str | None = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Delete an **empty** symbol library (file, table entry, index).
+
+        Refuses with an ``error`` when the library still contains any
+        top-level symbol — only empty libraries can be deleted.  Empty it
+        first with ``remove_symbols_from_library``.
+
+        Args:
+            library: Nickname of the library as registered in sym-lib-table.
+            project_dir: Project directory when *library* is a project-local
+                library (``${KIPRJMOD}`` URI).  Omit for global libraries.
+
+        Returns:
+            dict with keys: library, path, table_path, unregistered,
+            table_backup, index_removed, deleted; plus ``error`` on
+            failure.
+        """
+        return _do_delete_symbol_library(library=library, project_dir=project_dir)
 
     @mcp.tool()
     async def remove_symbol_from_schematic(

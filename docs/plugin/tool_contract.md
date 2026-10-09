@@ -19,6 +19,14 @@
 | `get_symbol_index_stats` | `symbol_tools` | Return aggregate counts for the index |
 | `get_symbol_pins` | `symbol_tools` | Return pin list (number, name, type, direction) for one symbol |
 | `add_symbol_to_schematic` | `symbol_edit_tools` | Place a library symbol onto a schematic |
+| `create_symbol_library` | `symbol_edit_tools` | Create a new `.kicad_sym` library and register it in sym-lib-table |
+| `create_symbol` | `symbol_edit_tools` | Generate a new symbol definition into an existing library (definition only — no schematic placement) |
+| `add_symbols_to_library` | `symbol_edit_tools` | Export cached symbols from a schematic into a library |
+| `find_symbols_not_in_libraries` | `symbol_edit_tools` | List schematic symbols missing from all available libraries |
+| `remove_symbols_from_library` | `symbol_edit_tools` | Remove named symbol definitions from an existing library |
+| `delete_symbol_library` | `symbol_edit_tools` | Delete an **empty** symbol library (file + table entry + index) |
+| `remove_footprints_from_library` | `pcb_library_tools` | Remove named footprints from an existing footprint library |
+| `delete_footprint_library` | `pcb_library_tools` | Delete an **empty** footprint library (directory + table entry + index) |
 | `remove_symbol_from_schematic` | `symbol_edit_tools` | Remove one or more components by reference designator |
 | `set_symbol_property` | `symbol_edit_tools` | Set or create a named property (e.g. `Value`, `Footprint`) on a component |
 | `list_symbol_properties` | `symbol_edit_tools` | Return all properties for a component |
@@ -129,11 +137,13 @@ express an absolute move as a delta.
 
 ### 3.2 Symbol Index Tools
 
-#### `sync_symbol_index(force=False)`
+#### `sync_symbol_index(force=False, project_path=None)`
 
 **Purpose:** Scans all installed KiCad symbol libraries and populates the local full-text search index. Must be called at least once before `search_symbols` will return results.
 
-**Key parameters:** `force` (`bool`) — when `True`, rebuilds even if the index appears current.
+**Key parameters:**
+- `force` (`bool`) — when `True`, rebuilds even if the index appears current.
+- `project_path` (`str | None`) — optional path to a project directory or a file inside it (e.g. the schematic). Syncs global plus that project's libraries; other projects' rows are never touched. Omit for the global scope only.
 
 ---
 
@@ -143,12 +153,13 @@ express an absolute move as a delta.
 
 ---
 
-#### `search_symbols(query, limit=50)`
+#### `search_symbols(query, project_path=None, limit=50)`
 
 **Purpose:** Full-text search across symbol name, description, and keywords in the index.
 
 **Key parameters:**
 - `query` (`str`) — search string (e.g. `"NPN transistor"`, `"STM32F4"`).
+- `project_path` (`str | None`) — optional path to a project directory or a file inside it. Global plus that project's libraries are searched; other projects' libraries are never shown. Omit for global libraries only.
 - `limit` (`int`, default `50`) — maximum results.
 
 **Return shape:** `{"success": true, "count": N, "symbols": [{"library_name": "...", "name": "...", "description": "...", "pin_count": N}, ...]}`
@@ -157,37 +168,45 @@ express an absolute move as a delta.
 
 ---
 
-#### `get_symbol(library_name, symbol_name)`
+#### `get_symbol(library_name, symbol_name, project_path=None)`
 
 **Purpose:** Retrieve the full symbol definition including all properties and pin details.
 
-**Key parameters:** `library_name` and `symbol_name` exactly as returned by `search_symbols`.
+**Key parameters:**
+- `library_name` and `symbol_name` exactly as returned by `search_symbols`.
+- `project_path` (`str | None`) — optional path to a project directory or a file inside it. The lookup is scoped to global plus that project's libraries; other projects' libraries are never matched. Omit for global only.
 
 ---
 
-#### `list_symbol_libraries()`
+#### `list_symbol_libraries(table=None, limit=200, offset=0, project_path=None)`
 
-**Purpose:** Returns names and file paths for all known symbol libraries. Useful for exploration when `search_symbols` returns no results.
+**Purpose:** Returns names and file paths for all known symbol libraries in scope (global plus the given project's, when `project_path` is set). Useful for exploration when `search_symbols` returns no results.
+
+**Key parameters:** `table`, `limit`, `offset` — paging/drill-down as described in the tool docstring; `project_path` scopes the listing exactly like `search_symbols`.
 
 ---
 
-#### `get_library_symbols(library_name)`
+#### `get_library_symbols(library_name, limit=50, offset=0, project_path=None)`
 
 **Purpose:** Lists every symbol inside a specific library. Use to browse a library after identifying it via `list_symbol_libraries`.
 
-**Key parameters:** `library_name` — same format as above (`"TableName/FileBaseName"`).
+**Key parameters:**
+- `library_name` — same format as above (`"TableName/FileBaseName"`).
+- `project_path` (`str | None`) — scopes the lookup to global plus that project's libraries; other projects' libraries are never matched.
 
 ---
 
-#### `get_symbol_index_stats()`
+#### `get_symbol_index_stats(project_path=None)`
 
-**Purpose:** Returns aggregate statistics (total symbols, total libraries, index size). Diagnostic only.
+**Purpose:** Returns aggregate statistics (total symbols, total libraries, index size) for the scoped index (global plus the given project's, when `project_path` is set). Diagnostic only.
 
 ---
 
-#### `get_symbol_pins(library_name, symbol_name)`
+#### `get_symbol_pins(library_name, symbol_name, project_path=None)`
 
 **Purpose:** Returns the pin list (number, name, electrical type, direction) for a symbol without fetching the full definition. Use when planning wiring before placing a component.
+
+**Key parameters:** `library_name`, `symbol_name` as returned by `search_symbols`; `project_path` scopes the lookup like `get_symbol`.
 
 ---
 
@@ -211,6 +230,126 @@ All tools in this group write a backup to `<schematic_path>.bak` before saving.
 **Success response:** `{"success": true, "reference": "R3", "units_placed": 1, "position": {"x": ..., "y": ...}}`
 
 **Failure response:** `{"success": false, "error": "<message>"}`
+
+---
+
+#### `create_symbol_library(name, project_dir=None)`
+
+**Purpose:** Creates a new empty symbol library (`.kicad_sym`) and registers it in sym-lib-table, making it the target for the new library-aware `create_symbol`. Call this **before** `create_symbol` — that tool now requires an existing library.
+
+**Key parameters:**
+- `name` (`str`) — library nickname (sanitised to sym-lib-table-safe characters).
+- `project_dir` (`str | None`) — when given, the library file is created inside the project directory and registered in the project's `sym-lib-table` (created if absent) with a `${KIPRJMOD}` URI. When omitted, the library is created under `${KICADxx_3RD_PARTY}/symbols` and registered in the global user sym-lib-table.
+
+The library is created empty and indexed immediately, so `search_symbols` / `list_symbol_libraries` see it. Fails if the name is invalid, the library or file already exists (no silent overwrite), or the project directory does not exist.
+
+**Success response:** `{"library": "MyLib", "path": "/abs/MyLib.kicad_sym", "table_path": "/abs/sym-lib-table", "registered": true, "indexed": 0}`
+
+---
+
+#### `create_symbol(library, symbol_name, pins, reference_prefix="U", value=None, body_width=None, body_height=None, project_dir=None)`
+
+**Purpose:** Defines a brand-new symbol (rectangular body + one pin per entry) into an existing **user symbol library** (`.kicad_sym`) — **definition-only**. The schematic is never touched. To place an instance of the new symbol afterwards, call `add_symbol_to_schematic` (or `place_symbol_relative`) with `library_name` + `symbol_name`. Unlike `add_symbol_to_schematic`, no external library lookup is needed — the definition is generated from the `pins` argument. `library` must already exist — call `create_symbol_library` first.
+
+**Key parameters:**
+- `library` (`str`) — target library nickname; **must already exist** (create it with `create_symbol_library` first). Resolved through sym-lib-table.
+- `symbol_name` (`str`) — new symbol name; must match `^[A-Za-z][A-Za-z0-9_]*$` (no leading digit). Must **not** already exist in the library — no overwrite.
+- `pins` (`list[dict]`) — one entry per pin: `{"number": "1", "name": "IN", "type": "input", "direction": "left"}`. `type` must be in the pin-type whitelist: `input`, `output`, `bidirectional`, `tri_state`, `passive`, `free`, `no_connect`, `power_in`, `power_out`, `open_collector`, `open_emitter`, `unspecified`. `direction` must be `left`, `right`, `up`, or `down`. `number` must be a non-empty, unique string; `name` must be a string or `None` (rendered as empty). Pins on one side are laid out in counter-clockwise order (KiCad DIP convention), 2.54 mm (100 mil) apart.
+- `reference_prefix` (`str`) — prefix for the symbol's default `Reference` property (e.g. `U`); must match `^[A-Za-z][A-Za-z0-9_]*$` (must start with a letter). Defaults to `"U"`.
+- `value` (`str | None`) — overrides the `Value` property; defaults to `symbol_name`.
+- `body_width` / `body_height` (`float | None`) — body size in mm; omitted → default width 6.35 mm / height derived from the pin span. Enlarged (with a warning) if too small to contain the pins.
+- `project_dir` (`str | None`) — optional project directory when the target library is project-local (`${KIPRJMOD}` URI); the library is resolved in the global plus that project's scope. Omit for global libraries.
+
+The `lib_id` is `<library>:<symbol_name>`. Calling with a `symbol_name` that already exists in the library fails — there is no silent overwrite. Libraries inside the KiCad installation (system libraries) are refused with `{"error": ...}` — user libraries only.
+
+**Success response:** `{"success": true, "lib_id": "MyLib:MYOP", "library": "MyLib", "library_path": "/abs/MyLib.kicad_sym", "units_added": 1, "pin_count": N, "warnings": [...]}`
+
+**Failure response:** `{"error": "<message>"}` — note there is **no `success` key at all** in failures (unlike `add_symbol_to_schematic`, whose failures are `{"success": false, "error": ...}`). Treat any response containing `"error"` as a failure.
+
+---
+
+#### `add_symbols_to_library(schematic_path, symbols, library)`
+
+**Purpose:** Copies raw symbol definitions from a schematic's `lib_symbols` cache into an existing library (`.kicad_sym`). Read-only with respect to the schematic — the source file is never modified. Handles **any** cached symbol, not just `create_symbol`-generated ones.
+
+**Key parameters:**
+- `schematic_path` (`str`) — absolute path to the source `.kicad_sch`.
+- `symbols` (`list[str]`) — fully-qualified lib_ids (`"自定义:MYOP"`, `"Device:R"`). Matching is exact on the full lib_id; plain names are rejected (`failed` with reason `must_be_lib_id`).
+- `library` (`str`) — target library nickname (must already exist).
+
+Entries already present in the target library are reported in `skipped` (never overwritten); entries not present in the schematic are reported in `failed`. The library is re-indexed afterwards, keeping the row's **owning scope** — when the target library is declared in the project's sym-lib-table the index row stays project-owned, otherwise it stays global (never re-attributed to the project). Like `create_symbol`, a target library that resolves inside the KiCad installation is refused with `{"error": ...}` — user libraries only.
+
+**Success response:** `{"library": "MyLib", "library_path": "...", "exported": ["MyLib:MYOP"], "exported_count": 1, "failed": [], "failed_count": 0, "skipped": [], "skipped_count": 0, "indexed": 1}`
+
+---
+
+#### `find_symbols_not_in_libraries(schematic_path)`
+
+**Purpose:** Read-only discovery. Compares the `lib_id` of every symbol instance referenced by the schematic against the libraries actually available (project sym-lib-table, global user table, system libraries) and returns the symbols whose `(library, name)` resolves to nothing, consolidated per symbol with the reference designators that use it. Use before `add_symbols_to_library` to see which cached custom symbols still need exporting.
+
+**Key parameters:**
+- `schematic_path` (`str`) — absolute path to the `.kicad_sch` to inspect.
+
+**Success response:** `{"missing": [{"name": "MYOP", "library": "自定义", "references": ["U1"], "reference_count": 1}], "missing_count": 1}`
+
+---
+
+#### `remove_symbols_from_library(library, symbols, project_dir=None)`
+
+**Purpose:** Removes named symbol definitions from an existing symbol library (`.kicad_sym`). Only the library file is modified — no schematic is ever touched. Each requested plain symbol name must exist as a top-level definition; missing or unsafe names are reported in `failed` (valid names are still removed — no partial-commit ambiguity). The library is re-indexed so removed symbols disappear from search. Removing the *last* symbol leaves a valid empty library file.
+
+**Key parameters:**
+- `library` (`str`) — nickname of the target library (must exist in sym-lib-table).
+- `symbols` (`list[str]`) — plain symbol names to remove (e.g. `["NINJA_IO"]`). Must be non-empty.
+- `project_dir` (`str | None`) — project directory when the library is project-local; scopes the re-index so the project-owned row (not a same-nickname row of another project or the global scope) is updated.
+
+**Success response:** `{"library": "MyLib", "library_path": "...", "removed": ["MyLib:MYOP"], "removed_count": 1, "failed": [], "failed_count": 0, "indexed": 0}`
+
+---
+
+#### `delete_symbol_library(library, project_dir=None)`
+
+**Purpose:** Deletes an **empty** symbol library: the `.kicad_sym` file, its sym-lib-table entry (with `.bak` backup of the table), and its index entries. Refuses with `error` while the library still contains any top-level symbol — empty it first with `remove_symbols_from_library`. This tool never deletes a non-empty library.
+
+**Key parameters:**
+- `library` (`str`) — nickname of the library to delete.
+- `project_dir` (`str`, optional) — project directory when the library is project-local (`${KIPRJMOD}` URI). Omit for global libraries.
+
+**Ownership:** the index delete matches by **ownership** — with `project_dir` set, only the project-owned row is removed; a same-nickname library of another project (or the global scope) is never touched. Without it, the library must resolve in the global scope.
+
+**Success response:** `{"library": "MyLib", "path": "...", "table_path": "...", "unregistered": true, "table_backup": "...", "index_removed": true, "deleted": true}`
+
+**Non-empty refusal:** `{"error": "Library 'MyLib' is not empty (2 symbol(s): A, B); refusing to delete. Use remove_symbols_from_library first."}`
+
+**Partial-state failure:** if the file is removed but the sym-lib-table entry cannot be unregistered, the tool returns `{"error": ..., "file_removed": true, "table_unregistered": false, "index_removed": ..., "deleted": false}` — the index cleanup is still attempted and the error states exactly what was removed vs left; the tool never reports success in this state.
+
+---
+
+#### `remove_footprints_from_library(library, footprints, project_dir=None)`
+
+**Purpose:** Removes named footprint definitions (`.kicad_mod` files) from an existing footprint library (`.pretty` directory). Only the library directory is modified — the board (PCB) is never touched. Each requested plain footprint name must exist in the library directory; missing or unsafe names are reported in `failed` (valid names are still removed — no partial-commit ambiguity). The library is re-indexed so removed footprints disappear from search. Removing the *last* footprint leaves a valid empty library directory.
+
+**Key parameters:**
+- `library` (`str`) — nickname of the target library (must exist in fp-lib-table).
+- `footprints` (`list[str]`) — plain footprint names to remove (e.g. `["MYOP"]`). Must be non-empty.
+
+**Success response:** `{"library": "MyLib", "library_path": "...", "removed": ["MyLib:MYOP"], "removed_count": 1, "failed": [], "failed_count": 0, "indexed": 0}`
+
+---
+
+#### `delete_footprint_library(library, project_dir=None)`
+
+**Purpose:** Deletes an **empty** footprint library: the `.pretty` directory, its fp-lib-table entry (with `.bak` backup of the table), and its index entries. Refuses with `error` while the library directory still contains any `.kicad_mod` footprint — empty it first with `remove_footprints_from_library`. This tool never deletes a non-empty library.
+
+**Key parameters:**
+- `library` (`str`) — nickname of the library to delete.
+- `project_dir` (`str`, optional) — project directory when the library is project-local (`${KIPRJMOD}` URI). Omit for global libraries.
+
+**Success response:** `{"library": "MyLib", "path": "...", "table_path": "...", "unregistered": true, "table_backup": "...", "index_removed": true, "deleted": true}`
+
+**Non-empty refusal:** `{"error": "Library 'MyLib' is not empty (2 footprint(s): A.kicad_mod, B.kicad_mod); refusing to delete. Use remove_footprints_from_library first."}`
+
+**Partial-state failure:** if the directory is removed but the fp-lib-table entry cannot be unregistered, the tool returns `{"error": ..., "file_removed": true, "table_unregistered": false, "index_removed": ..., "deleted": false}` — the index cleanup is still attempted and the error states exactly what was removed vs left; the tool never reports success in this state.
 
 ---
 

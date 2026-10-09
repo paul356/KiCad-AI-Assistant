@@ -1,14 +1,11 @@
 """
-Write-side helpers for KiCad fp-lib-table files.
+Write-side helpers for KiCad sym-lib-table files.
 
-The read side (parsing, env expansion, library listing) lives in
-``kcaa.utils.pcb_library_utils``.  This module adds the write primitive
-needed to register a newly created user footprint library: a surgical,
-format-preserving append of a ``(lib ...)`` entry with a ``.bak`` backup.
-
-The append is intentionally text-based instead of a full sexpdata
-re-serialization so that untouched library entries keep their original
-formatting and the diff stays minimal.
+Mirror of ``kcaa.utils.fp_lib_table_utils`` for the symbol library table:
+a surgical, format-preserving append of a ``(lib ...)`` entry with a
+``.bak`` backup.  sym-lib-table has no ``(version N)`` header (unlike
+fp-lib-table's ``(version 7)``), so a fresh table is just ``(sym_lib_table
+...(lib ...))``.
 """
 
 from __future__ import annotations
@@ -21,18 +18,16 @@ from typing import Any
 
 import sexpdata
 
-from kcaa.utils import pcb_library_utils
-
 log = logging.getLogger(__name__)
 
-# Characters KiCad accepts in fp-lib-table nicknames.  Slashes, backslashes,
+# Characters KiCad accepts in sym-lib-table nicknames.  Slashes, backslashes,
 # colons and whitespace are excluded because they would break the table and
 # file paths.
 _SAFE_CHARS_RE = re.compile(r"[^A-Za-z0-9_.+-]")
 
 
 def sanitize_lib_nickname(nickname: str) -> str:
-    """Return *nickname* with characters unsafe for fp-lib-table entries removed.
+    """Return *nickname* with characters unsafe for sym-lib-table entries removed.
 
     :param nickname: Proposed library nickname.
     :returns: Sanitized nickname (may be empty when nothing usable remains).
@@ -40,14 +35,16 @@ def sanitize_lib_nickname(nickname: str) -> str:
     return _SAFE_CHARS_RE.sub("_", nickname).strip("_")
 
 
-def get_user_fp_lib_table_path() -> str:
-    """Return the global user fp-lib-table path (may not exist yet).
+def get_user_sym_lib_table_path() -> str:
+    """Return the global user sym-lib-table path (may not exist yet).
 
     Uses the highest-priority KiCad config directory, mirroring the order in
-    ``kpcaa.utils.pcb_library_utils._default_kicad_config_dirs()``.
+    ``kcaa.utils.pcb_library_utils._default_kicad_config_dirs()``.
     """
+    from kcaa.utils import pcb_library_utils
+
     dirs = pcb_library_utils._default_kicad_config_dirs()
-    return os.path.join(dirs[0], "fp-lib-table") if dirs else ""
+    return os.path.join(dirs[0], "sym-lib-table") if dirs else ""
 
 
 def _entry_text(nickname: str, uri: str, description: str = "") -> str:
@@ -79,13 +76,13 @@ def register_library_in_table(
 ) -> dict[str, Any]:
     """Append a ``(lib ...)`` entry to *table_path* without disturbing the rest.
 
-    Creates the table with a ``(fp_lib_table (version 7) ...)`` header when it
-    does not exist.  Backs up an existing file to ``.bak`` before writing.
-    If *nickname* is already registered the table is left untouched.
+    Creates the table with a ``(sym_lib_table ...)`` header when it does not
+    exist.  Backs up an existing file to ``.bak`` before writing.  If
+    *nickname* is already registered the table is left untouched.
 
-    :param table_path: Absolute path to the fp-lib-table file.
+    :param table_path: Absolute path to the sym-lib-table file.
     :param nickname: Library nickname to register (sanitized internally).
-    :param uri: Library URI, e.g. ``${KICAD10_3RD_PARTY}/footprints/X.pretty``.
+    :param uri: Library URI, e.g. ``${KICAD10_3RD_PARTY}/symbols/X.kicad_sym``.
     :param description: Optional ``descr`` text for the entry.
     :returns: dict with ``registered`` (bool), ``table_path``, and optional
         ``backup_path`` / ``reason``.
@@ -106,7 +103,7 @@ def register_library_in_table(
             return {"registered": False, "table_path": table_path, "reason": "already_registered"}
         text = original.rstrip()
         if not text.endswith(")"):
-            raise ValueError(f"Malformed fp-lib-table (no closing paren): {table_path}")
+            raise ValueError(f"Malformed sym-lib-table (no closing paren): {table_path}")
         if _last_line_is_closing_paren(original):
             # Pretty layout: insert a new entry line before the final ")".
             idx = original.rfind("\n)")
@@ -114,7 +111,7 @@ def register_library_in_table(
         else:
             # Compact single-line layout: re-serialize with sexpdata.
             log.warning(
-                "fp-lib-table %s is single-line; re-serializing to append entry",
+                "sym-lib-table %s is single-line; re-serializing to append entry",
                 table_path,
             )
             data = sexpdata.loads(original)
@@ -124,7 +121,7 @@ def register_library_in_table(
         shutil.copy2(table_path, backup_path)
     else:
         os.makedirs(os.path.dirname(table_path) or ".", exist_ok=True)
-        new_text = "(fp_lib_table\n\t(version 7)\n\t" + entry + "\n)\n"
+        new_text = "(sym_lib_table\n\t" + entry + "\n)\n"
 
     tmp_path = table_path + ".tmp"
     with open(tmp_path, "w", encoding="utf-8") as fh:
@@ -148,7 +145,7 @@ def unregister_library_in_table(
     compact single-line layout is re-serialized).  Backs up the table to
     ``.bak`` before writing.
 
-    :param table_path: Absolute path to the fp-lib-table file.
+    :param table_path: Absolute path to the sym-lib-table file.
     :param nickname: Library nickname whose entry should be removed.
     :returns: dict with ``unregistered`` (bool), ``table_path``, and optional
         ``backup_path`` / ``reason`` (``table not found``,
@@ -173,7 +170,7 @@ def unregister_library_in_table(
         new_text = "".join(kept)
     else:
         log.warning(
-            "fp-lib-table %s is single-line; re-serializing to drop entry",
+            "sym-lib-table %s is single-line; re-serializing to drop entry",
             table_path,
         )
         data = sexpdata.loads(original)

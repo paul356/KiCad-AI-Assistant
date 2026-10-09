@@ -393,6 +393,38 @@ class TestFindFreeArea:
         for k in ("min_x", "min_y", "max_x", "max_y"):
             assert abs(bb[k] - cb[k]) <= 1.27, (k, bb[k], cb[k])
 
+    def test_for_library_resolved_in_schematic_project_scope(self, tmp_sch):
+        """find_free_area looks for_library/for_symbol up scoped to the
+        schematic's project, so project-sym-lib-table libraries resolve.
+
+        A global-scope lookup must NOT be used: project-local libraries are
+        invisible there (issue #167) — the lookup must carry the schematic
+        path so the index manager scopes to the project.
+        """
+        tools = _placement_tools()
+        calls: list[str | None] = []
+
+        def dispatch(project_path: str | None = None):
+            calls.append(project_path)
+            if project_path is None:
+                global_mgr = MagicMock()
+                global_mgr.get_library_by_name.return_value = None
+                global_mgr.get_symbol.return_value = None
+                return global_mgr
+            return _make_mock_manager()
+
+        with patch("kcaa.tools.symbol_edit_tools._get_index_manager", side_effect=dispatch):
+            out = tools["find_free_area"](
+                tmp_sch,
+                for_library="ProjectLib:R",
+                for_symbol=_SYM_NAME,
+                max_candidates=1,
+            )
+        assert out["candidates"], out
+        # The scope-carrying call must reach the manager factory; no
+        # unscoped (global-only) call may have satisfied the lookup.
+        assert calls and calls[0] == tmp_sch
+
 
 # ---------------------------------------------------------------------------
 # place_symbol_relative + bbox in returns
@@ -470,6 +502,49 @@ class TestPlaceSymbolRelative:
             )
         )
         assert "error" in out
+
+    def test_relative_lookup_scoped_to_schematic_project(self, tmp_sch):
+        """place_symbol_relative's inspector lookup must be scoped to the
+        schematic's project (issue #167): the manager factory must receive
+        the schematic path, not an unscoped (global-only) lookup that
+        cannot see project-local libraries."""
+        comps = _component_tools()
+        calls: list[str | None] = []
+
+        def dispatch(project_path: str | None = None):
+            calls.append(project_path)
+            if project_path is None:
+                global_mgr = MagicMock()
+                global_mgr.get_library_by_name.return_value = None
+                global_mgr.get_symbol.return_value = None
+                return global_mgr
+            return _make_mock_manager()
+
+        with patch("kcaa.tools.symbol_edit_tools._get_index_manager", side_effect=dispatch):
+            anchor = asyncio.run(
+                comps["add_symbol_to_schematic"](
+                    schematic_path=tmp_sch,
+                    library_name=_LIB_NAME,
+                    symbol_name=_SYM_NAME,
+                    x=120.0,
+                    y=80.0,
+                )
+            )
+            assert anchor["success"], anchor
+            placed = asyncio.run(
+                comps["place_symbol_relative"](
+                    schematic_path=tmp_sch,
+                    library_name=_LIB_NAME,
+                    symbol_name=_SYM_NAME,
+                    anchor_reference=anchor["reference_assigned"],
+                    side="right",
+                    gap=2.54,
+                )
+            )
+        assert placed.get("success"), placed
+        # The inspector lookup must be scoped to the schematic's project,
+        # not global (a None-scope call would mean global-only index).
+        assert tmp_sch in calls, f"no scoped lookup occurred: {calls}"
 
     def test_multi_unit_prediction_unions_every_unit(self):
         """Regression: place_symbol_relative must predict the union of EVERY

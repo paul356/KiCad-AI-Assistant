@@ -1117,3 +1117,229 @@ class TestCreateRollback:
         assert "error" in result
         lib_dir = os.path.join(project["third_party"], "footprints", "MyVendor.pretty")
         assert not os.path.exists(lib_dir)
+
+
+# ---------------------------------------------------------------------------
+# remove_footprints_from_library / delete_footprint_library
+# ---------------------------------------------------------------------------
+
+
+def _empty_vendor(tools, project) -> str:
+    result = _run(tools["create_footprint_library"](name="MyVendor", ctx=None))
+    assert "error" not in result, result
+    return os.path.join(project["third_party"], "footprints", "MyVendor.pretty")
+
+
+class TestRemoveFootprintsFromLibrary:
+    def test_removes_named_footprints(self, tools, tmp_path, project):
+        vendor = _empty_vendor(tools, project)
+        board = _make_board(tmp_path)
+        exported = _run(
+            tools["add_footprints_to_library"](
+                pcb_path=board,
+                footprints=["Sensor_Board_XYZ", "Connector_Odd"],
+                library="MyVendor",
+                ctx=None,
+            )
+        )
+        assert exported["exported_count"] == 2, exported
+        assert os.path.isfile(os.path.join(vendor, "Sensor_Board_XYZ.kicad_mod"))
+
+        result = _run(
+            tools["remove_footprints_from_library"](
+                library="MyVendor", footprints=["Sensor_Board_XYZ"], ctx=None
+            )
+        )
+        assert "error" not in result, result
+        assert result["removed"] == ["Sensor_Board_XYZ"]
+        assert result["removed_count"] == 1
+        assert result["failed"] == []
+        assert result["indexed"] == 1  # only Connector_Odd remains
+
+        assert not os.path.exists(os.path.join(vendor, "Sensor_Board_XYZ.kicad_mod"))
+        assert os.path.isfile(os.path.join(vendor, "Connector_Odd.kicad_mod"))
+        # Index reflects the removal: Connector_Odd still there, XYZ gone.
+        fp = project["index_mgr"].get_footprint("MyVendor", "Connector_Odd")
+        assert fp is not None
+        assert project["index_mgr"].get_footprint("MyVendor", "Sensor_Board_XYZ") is None
+
+    def test_missing_footprint_reported_in_failed(self, tools, tmp_path, project):
+        vendor = _empty_vendor(tools, project)
+        board = _make_board(tmp_path)
+        _run(
+            tools["add_footprints_to_library"](
+                pcb_path=board, footprints=["Connector_Odd"], library="MyVendor", ctx=None
+            )
+        )
+        result = _run(
+            tools["remove_footprints_from_library"](
+                library="MyVendor", footprints=["Connector_Odd", "Ghost"], ctx=None
+            )
+        )
+        assert result["removed"] == ["Connector_Odd"]
+        assert result["failed"] == [{"name": "Ghost", "reason": "not in library"}]
+        assert os.listdir(vendor) == []
+
+    def test_unknown_library_returns_error(self, tools):
+        result = _run(
+            tools["remove_footprints_from_library"](library="NoSuchLib", footprints=["X"], ctx=None)
+        )
+        assert "error" in result
+        assert "success" not in result
+
+    def test_empty_footprints_returns_error(self, tools, project):
+        result = _run(
+            tools["remove_footprints_from_library"](library="TestSys", footprints=[], ctx=None)
+        )
+        assert "error" in result
+
+    def test_refuses_system_footprint_library(self, tools, project, monkeypatch, tmp_path):
+        """remove_footprints_from_library must refuse a library that
+        resolves inside the KiCad system footprints dir."""
+        from kcaa.utils.config import config
+
+        sys_dir = tmp_path / "system" / "footprints"
+        sys_dir.mkdir(parents=True)
+        (sys_dir / "SysFp.kicad_mod").write_text('(footprint "SysFp")', encoding="utf-8")
+        table = _make_fp_lib_table(tmp_path, [("SysFp", str(sys_dir))])
+        # Re-route the fixture's table lookup to the table that registers SysFp.
+        monkeypatch.setattr(
+            "kcaa.utils.pcb_library_utils.find_fp_lib_tables",
+            lambda project_path=None: [table],
+        )
+        monkeypatch.setattr(config, "_kicad_footprint_dir", str(sys_dir))
+
+        result = _run(
+            tools["remove_footprints_from_library"](library="SysFp", footprints=["SysFp"], ctx=None)
+        )
+        assert "error" in result, result
+        assert "system library" in result["error"]
+        assert os.path.isfile(os.path.join(sys_dir, "SysFp.kicad_mod"))
+
+
+class TestDeleteFootprintLibrary:
+    def test_deletes_empty_library(self, tools, project):
+        _run(tools["create_footprint_library"](name="MyVendor", ctx=None))
+        lib_dir = os.path.join(project["third_party"], "footprints", "MyVendor.pretty")
+        assert os.path.isdir(lib_dir)
+
+        result = _run(tools["delete_footprint_library"](library="MyVendor", ctx=None))
+        assert "error" not in result, result
+        assert result["deleted"] is True
+        assert result["unregistered"] is True
+        assert result["index_removed"] is True
+        assert not os.path.exists(lib_dir)
+        # fp-lib-table entry dropped.
+        table_text = open(project["table"], encoding="utf-8").read()
+        assert 'name "MyVendor"' not in table_text
+        assert 'name "TestSys"' in table_text  # sibling entry kept
+        assert project["index_mgr"].library_name_exists("MyVendor") is False
+
+    def test_refuses_non_empty_library(self, tools, tmp_path, project):
+        vendor = _empty_vendor(tools, project)
+        board = _make_board(tmp_path)
+        _run(
+            tools["add_footprints_to_library"](
+                pcb_path=board, footprints=["Connector_Odd"], library="MyVendor", ctx=None
+            )
+        )
+        result = _run(tools["delete_footprint_library"](library="MyVendor", ctx=None))
+        assert "error" in result, result
+        assert "not empty" in result["error"]
+        assert "success" not in result
+        assert os.path.isdir(vendor)
+        assert os.path.isfile(os.path.join(vendor, "Connector_Odd.kicad_mod"))
+        assert "MyVendor" in open(project["table"], encoding="utf-8").read()
+
+    def test_empty_then_delete_flow(self, tools, tmp_path, project):
+        _run(tools["create_footprint_library"](name="MyVendor", ctx=None))
+        lib_dir = os.path.join(project["third_party"], "footprints", "MyVendor.pretty")
+        board = _make_board(tmp_path)
+        _run(
+            tools["add_footprints_to_library"](
+                pcb_path=board, footprints=["Connector_Odd"], library="MyVendor", ctx=None
+            )
+        )
+        removed = _run(
+            tools["remove_footprints_from_library"](
+                library="MyVendor", footprints=["Connector_Odd"], ctx=None
+            )
+        )
+        assert removed["removed_count"] == 1
+        deleted = _run(tools["delete_footprint_library"](library="MyVendor", ctx=None))
+        assert "error" not in deleted, deleted
+        assert deleted["deleted"] is True
+        assert not os.path.exists(lib_dir)
+
+    def test_unknown_library_returns_error(self, tools):
+        result = _run(tools["delete_footprint_library"](library="NoSuchLib", ctx=None))
+        assert "error" in result
+        assert "success" not in result
+
+    def test_refuses_system_footprint_library(self, tools, monkeypatch, tmp_path):
+        """delete_footprint_library must refuse a library that resolves
+        inside the KiCad system footprints dir, even when empty."""
+        from kcaa.utils.config import config
+
+        sys_dir = tmp_path / "system" / "footprints"
+        sys_dir.mkdir(parents=True)  # empty -> would otherwise be deletable
+        table = _make_fp_lib_table(tmp_path, [("SysFp", str(sys_dir))])
+        monkeypatch.setattr(
+            "kcaa.utils.pcb_library_utils.find_fp_lib_tables",
+            lambda project_path=None: [table],
+        )
+        monkeypatch.setattr(config, "_kicad_footprint_dir", str(sys_dir))
+
+        result = _run(tools["delete_footprint_library"](library="SysFp", ctx=None))
+        assert "error" in result, result
+        assert "system library" in result["error"]
+        assert "success" not in result
+        assert os.path.isdir(sys_dir)  # directory survives
+
+    def test_refuses_library_outside_user_locations(self, tools, project, tmp_path):
+        """delete_footprint_library must refuse a library whose directory
+        does not live in a user library location (3rd-party footprints dir
+        or project dir) — even a valid, non-system user library."""
+        lib_dir = os.path.join(tmp_path.parent, "Manual.pretty")
+        os.makedirs(lib_dir)
+        _make_fp_lib_table(tmp_path, [("Manual", lib_dir)])
+
+        result = _run(
+            tools["delete_footprint_library"](library="Manual", project_dir=str(tmp_path), ctx=None)
+        )
+        assert "error" in result, result
+        assert "user library location" in result["error"]
+        assert "success" not in result
+        assert os.path.isdir(lib_dir)  # directory survives
+
+    def test_delete_accepts_mcp_created_library(self, tools, project):
+        """delete_footprint_library succeeds on a library created by
+        create_footprint_library (lives in the 3rd-party footprints dir)."""
+        _run(tools["create_footprint_library"](name="MyVendor", ctx=None))
+        result = _run(tools["delete_footprint_library"](library="MyVendor", ctx=None))
+        assert "error" not in result, result
+        assert result["deleted"] is True
+
+    def test_unregister_failure_reports_partial_state(self, tools, project, monkeypatch):
+        """P3-1: unregister_library_in_table raising after the directory was
+        removed must yield an error stating what was removed vs left, with
+        index cleanup still attempted."""
+        import kcaa.tools.pcb_library_tools as mod
+
+        _run(tools["create_footprint_library"](name="MyVendor", ctx=None))
+        lib_dir = os.path.join(project["third_party"], "footprints", "MyVendor.pretty")
+
+        def _boom(table_path, library, **kwargs):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(mod, "unregister_library_in_table", _boom)
+
+        result = _run(tools["delete_footprint_library"](library="MyVendor", ctx=None))
+        assert "error" in result, result
+        assert "fp-lib-table entry could not be unregistered" in result["error"]
+        assert result["file_removed"] is True
+        assert result["table_unregistered"] is False
+        assert result["deleted"] is False
+        assert not os.path.exists(lib_dir)  # directory was removed first
+        assert result["index_removed"] is True  # index cleanup still attempted
+        assert project["index_mgr"].library_name_exists("MyVendor") is False

@@ -7,6 +7,7 @@ Unit tests for:
 
 import os
 
+from kcaa.utils import pcb_library_utils
 from kcaa.utils.footprint_database import (
     FootprintDatabase,
     FootprintRecord,
@@ -232,6 +233,27 @@ class TestBuildEffectiveLibraryList:
     def test_returns_list(self):
         entries = build_effective_library_list()
         assert isinstance(entries, list)
+
+    def test_project_dir_accepted_directly(self, tmp_path, monkeypatch):
+        """A project *directory* (not a .kicad_pro file) must resolve the
+        project-local fp-lib-table too — delete/remove library tools pass
+        project_dir straight through."""
+        lib_dir = _make_pretty(tmp_path, "Proj", ["R_Proj"])
+        table = tmp_path / "fp-lib-table"
+        table.write_text(
+            "(fp_lib_table\n  (version 7)\n"
+            f'  (lib (name "Proj") (type "KiCad") (uri "{lib_dir}") (options "") (descr "project"))\n'
+            ")"
+        )
+        # No global tables: isolate config dirs so only the project table counts.
+        monkeypatch.setattr(
+            pcb_library_utils,
+            "_default_kicad_config_dirs",
+            lambda: [str(tmp_path / "no-such-config")],
+        )
+        entries = build_effective_library_list(str(tmp_path))
+        nicknames = [e["nickname"] for e in entries]
+        assert "Proj" in nicknames
 
 
 # ---------------------------------------------------------------------------
@@ -1165,3 +1187,32 @@ class TestCollectExistingNames:
             ("LibA", "indexed_a"),
             ("LibA", "indexed_b"),
         }
+
+
+class TestFootprintIndexManagerRemoveLibrary:
+    """remove_library must find rows across project scopes (nicknames are
+    globally unique) — regression for delete_footprint_library leaving
+    project-scoped rows behind when the manager is global-scoped."""
+
+    def test_removes_project_scoped_row_from_global_manager(self, tmp_path):
+        db_path = tmp_path / "fp.db"
+        # create a library row under a project scope
+        proj_mgr = FootprintIndexManager(db_path=str(db_path), project_path="/tmp/someproj")
+        proj_mgr._db.save_library(
+            "ProjLib",
+            "${KIPRJMOD}/ProjLib.pretty",
+            "/tmp/someproj/ProjLib.pretty",
+            "desc",
+            "csum",
+            [_make_record("ProjLib", "FP1")],
+        )
+        assert proj_mgr._db.get_library_states(project=None)["ProjLib"]
+
+        # a *global-scoped* manager must still be able to drop it
+        global_mgr = FootprintIndexManager(db_path=str(db_path))
+        assert global_mgr.remove_library("ProjLib") is True
+        assert "ProjLib" not in global_mgr._db.get_library_states(project=None)
+
+    def test_remove_missing_returns_false(self, tmp_path):
+        mgr = FootprintIndexManager(db_path=str(tmp_path / "fp.db"))
+        assert mgr.remove_library("NoSuchLib") is False

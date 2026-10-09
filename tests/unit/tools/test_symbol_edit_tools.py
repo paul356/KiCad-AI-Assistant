@@ -283,6 +283,72 @@ class TestAddSymbolToSchematic:
             )
         assert "error" in result
 
+    def test_library_resolved_in_schematic_project_scope(self, tools, tmp_sch):
+        """add_symbol_to_schematic looks the library up scoped to the
+        schematic's project, so project-sym-lib-table libraries resolve.
+
+        A global-scope lookup must NOT be used: project-local libraries are
+        invisible there (issue #167) — the lookup must carry the schematic
+        path so the index manager scopes to the project.
+        """
+        calls: list[str | None] = []
+
+        def dispatch(project_path: str | None = None):
+            calls.append(project_path)
+            if project_path is None:
+                global_mgr = MagicMock()
+                global_mgr.get_library_by_name.return_value = None
+                global_mgr.get_symbol.return_value = None
+                return global_mgr
+            return _make_mock_manager()
+
+        with patch("kcaa.tools.symbol_edit_tools._get_index_manager", side_effect=dispatch):
+            result = asyncio.run(
+                tools["add_symbol_to_schematic"](
+                    schematic_path=tmp_sch,
+                    library_name="ProjectLib:R",
+                    symbol_name=_SYM_NAME,
+                    x=50.0,
+                    y=50.0,
+                )
+            )
+        assert result.get("success") is True, result
+        # The scope-carrying call must reach the manager factory; no
+        # unscoped (global-only) call may have satisfied the lookup.
+        assert calls and calls[0] == tmp_sch
+
+    def test_extends_resolution_scoped_to_project(self):
+        """_resolve_extends_symbol must look the (extends ...) base symbol
+        up in the project scope, so a base living in a project-local
+        library resolves (issue #167). A global-scope lookup would miss
+        it and silently inject an incomplete definition."""
+        from sexpdata import Symbol as Sexp
+
+        from kcaa.tools.symbol_edit_tools import _resolve_extends_symbol
+
+        variant = [Sexp("symbol"), "Variant", [Sexp("extends"), "BaseR"]]
+        calls: list[str | None] = []
+
+        def dispatch(project_path: str | None = None):
+            calls.append(project_path)
+            if project_path is None:
+                global_mgr = MagicMock()
+                global_mgr.get_symbol.return_value = None
+                global_mgr.get_library_by_name.return_value = None
+                return global_mgr
+            return _make_mock_manager()
+
+        with patch("kcaa.tools.symbol_edit_tools._get_index_manager", side_effect=dispatch):
+            _resolve_extends_symbol(
+                variant, "ProjectLib:Variant", project_path="/work/proj/sch.kicad_sch"
+            )
+
+        # The base lookup must be scoped to the given project; an unscoped
+        # call (project_path=None) would mean the global index was queried.
+        assert calls, "extends base lookup never reached the manager factory"
+        assert all(c is not None for c in calls), f"unscoped lookup used: {calls}"
+        assert "/work/proj/sch.kicad_sch" in calls
+
 
 # ---------------------------------------------------------------------------
 # TestRemoveSymbolFromSchematic

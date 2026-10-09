@@ -505,6 +505,27 @@ class ServerConfig:
         """Path to the KiCad footprint library directory."""
         return self._kicad_footprint_dir
 
+    def is_system_library_path(self, path: str) -> bool:
+        """Return True when *path* lives inside a KiCad **system** library
+        directory — the symbols/footprints shipped with the application.
+
+        User-facing library tools (create/remove/delete) must never modify
+        system libraries: they are read-only reference content owned by the
+        KiCad installation, not user data.  The check resolves symlinks
+        (``realpath``) so it cannot be bypassed via ``/usr/share/kicad``
+        aliases or symlinked user directories.
+        """
+        if not path:
+            return False
+        real = os.path.realpath(path)
+        for sys_dir in (self._kicad_symbol_dir, self._kicad_footprint_dir):
+            if not sys_dir:
+                continue
+            sys_real = os.path.realpath(sys_dir)
+            if real == sys_real or real.startswith(sys_real + os.sep):
+                return True
+        return False
+
     @property
     def kicad_3rd_party(self) -> str:
         """Path to the KiCad 3rd-party packages directory."""

@@ -39,6 +39,21 @@ from kcaa.utils.config import config
 _DEFAULT_DB_PATH = Path(config.get_kcaa_data_dir()) / "kicad_symbols.db"
 
 
+def _project_dir_of(project_path: str | None) -> str | None:
+    """Canonical project directory for a project path, or None.
+
+    Symbol-side analogue of ``footprint_index_manager.normalize_project_id``
+    (same realpath-of-directory result), but accepting the *directories*
+    that symbol tools pass directly — a directory is used as-is, a file is
+    reduced to its parent.  ``None`` (or empty) means "no project".
+    """
+    if not project_path:
+        return None
+    if os.path.isdir(project_path):
+        return os.path.realpath(project_path)
+    return os.path.realpath(os.path.dirname(project_path))
+
+
 # ---------------------------------------------------------------------------
 # SyncStats
 # ---------------------------------------------------------------------------
@@ -111,9 +126,14 @@ class SymbolIndexManager:
 
     def __init__(
         self,
-        library_manager: SymbolIndexReader,
+        library_manager: SymbolIndexReader | None = None,
         db_path: str | Path | None = None,
+        project_path: str | None = None,
     ):
+        self._project_path = project_path
+        self._project_id = _project_dir_of(project_path) or ""
+        if library_manager is None:
+            library_manager = SymbolIndexReader(project_dir=_project_dir_of(project_path))
         self._library_manager = library_manager
         resolved = Path(db_path) if db_path else _DEFAULT_DB_PATH
         self._db = SymbolDatabase(str(resolved))
@@ -155,35 +175,53 @@ class SymbolIndexManager:
             elapsed_seconds=0.0,
         )
 
-        entries = self._library_manager.get_libraries()
-        db_known = self._db.get_library_states()  # {path: (id, mtime, size, checksum)}
+        # Capture the reader and the scope once into locals: sync runs in a
+        # background thread while other tool calls can re-scope the shared
+        # singleton manager (project id + reader are swapped together under
+        # the tool-side lock), and this loop must never observe a mid-flight
+        # flip.  The reader is pinned first so the entries and the scope id
+        # stay paired for the whole body.
+        lm = self._library_manager
+        entries = lm.get_libraries()
+        scope_id = self._project_id
+        # Only global + current-project libraries participate: other projects'
+        # rows must never be touched by this sync.
+        # {path: (id, mtime, size, checksum, owning_project)}
+        db_known = self._db.get_library_states(scope_id)
+        project_table = os.path.join(scope_id, "sym-lib-table") if scope_id else None
 
         current_paths: set[str] = set()
 
         # Expand entries into (library_name, file_path) pairs.
         # KiCad 10 sym-lib-table entries may point to a directory (.kicad_symdir)
         # containing multiple .kicad_sym files rather than a single .kicad_sym file.
-        all_file_entries: list[tuple[str, str]] = []  # (library_name, file_path)
+        all_file_entries: list[tuple[str, str, str]] = []  # (library_name, file_path, project)
         for entry in entries:
             raw_path = entry.uri
             if not raw_path:
                 continue
+            # Libraries listed in the project's own sym-lib-table belong to
+            # the project; everything else (global user/system tables) is
+            # global.
+            entry_project = scope_id if entry.table_path == project_table else ""
             if os.path.isdir(raw_path):
                 try:
                     for fname in sorted(os.listdir(raw_path)):
                         if fname.endswith(".kicad_sym"):
                             stem = fname[: -len(".kicad_sym")]
                             lib_name = f"{entry.name}/{stem}"
-                            all_file_entries.append((lib_name, os.path.join(raw_path, fname)))
+                            all_file_entries.append(
+                                (lib_name, os.path.join(raw_path, fname), entry_project)
+                            )
                 except OSError as exc:
                     log.warning(f"Cannot list directory {raw_path}: {exc}")
                     stats.failed += 1
             else:
-                all_file_entries.append((entry.name, raw_path))
+                all_file_entries.append((entry.name, raw_path, entry_project))
 
         total = len(all_file_entries)
 
-        for i, (lib_name, path) in enumerate(all_file_entries):
+        for i, (lib_name, path, entry_project) in enumerate(all_file_entries):
             if progress_callback is not None:
                 try:
                     progress_callback(i, total, lib_name)
@@ -206,7 +244,7 @@ class SymbolIndexManager:
                 continue
 
             if path in db_known:
-                lib_id, db_mtime, db_size, db_checksum = db_known[path]
+                lib_id, db_mtime, db_size, db_checksum, _row_project = db_known[path]
 
                 if not force and db_mtime == cur_mtime and db_size == cur_size:
                     # Fast path: metadata identical → assume unchanged.
@@ -232,6 +270,7 @@ class SymbolIndexManager:
                     cur_size,
                     new_checksum,
                     diagnose=diagnose,
+                    project=entry_project,
                 )
                 if n >= 0:
                     stats.updated += 1
@@ -248,6 +287,7 @@ class SymbolIndexManager:
                     cur_size,
                     new_checksum,
                     diagnose=diagnose,
+                    project=entry_project,
                 )
                 if n >= 0:
                     stats.added += 1
@@ -261,12 +301,28 @@ class SymbolIndexManager:
             except Exception as exc:
                 log.warning("progress_callback raised on completion: %s", exc)
 
-        # Remove libraries no longer in the table.
-        for path, (lib_id, _, _, _) in db_known.items():
-            if path not in current_paths:
-                log.info(f"Removing: {path}")
-                self._db.delete_library(lib_id)
-                stats.removed += 1
+        # Remove libraries no longer in the table.  Removal is gated on the
+        # file actually being GONE from disk — not on whether this scope
+        # "owns" the row.  A row whose file still exists was simply shadowed
+        # out of this scope's merged view by a same-nickname override
+        # (standard KiCad project-over-global precedence) or is invisible to
+        # this scope's reader; live files are never deleted.  db_known is
+        # already scope-limited to global + current project rows, so a
+        # project sync removes global leftovers (user's normal workflow) and
+        # rows of other projects never enter the loop.  The global sync
+        # (scope_id == '') behaves as before.
+        for path, (lib_id, _, _, _, _row_project) in db_known.items():
+            if path in current_paths:
+                continue
+            # File still on disk -> not a leftover; it was shadowed out of
+            # this scope's merged view by a same-nickname override or is
+            # simply invisible to this scope's reader.  Never delete live
+            # files.
+            if os.path.exists(path):
+                continue
+            log.info(f"Removing (file gone): {path}")
+            self._db.delete_library(lib_id)
+            stats.removed += 1
 
         stats.elapsed_seconds = time.time() - t0
         log.info(
@@ -286,6 +342,7 @@ class SymbolIndexManager:
         file_size: int,
         checksum: str,
         diagnose: bool = False,
+        project: str = "",
     ) -> int:
         """
         Parse a .kicad_sym file and persist the extracted symbols.
@@ -298,7 +355,14 @@ class SymbolIndexManager:
             return -1
 
         n = self._db.save_library(
-            library_name, file_path, mtime, file_size, kicad_version, symbols, checksum
+            library_name,
+            file_path,
+            mtime,
+            file_size,
+            kicad_version,
+            symbols,
+            checksum,
+            project=project,
         )
         log.info(f"  Indexed {n} symbols from {os.path.basename(file_path)}")
         return n
@@ -412,7 +476,7 @@ class SymbolIndexManager:
             return []
         elements = library_file.symbol
         # Could be a single ParsedValue, a plain list, or an ElementCollection.
-        if isinstance(elements, (list, skip.collection.ElementCollection)):
+        if isinstance(elements, list | skip.collection.ElementCollection):
             return elements
         return [elements]
 
@@ -450,8 +514,10 @@ class SymbolIndexManager:
         """
         Full-text search across symbol name, description, and keywords.
         Results are ordered by relevance (FTS5 rank).
+
+        Scoped to the manager's project (global + project libraries).
         """
-        return self._db.search(query, limit=limit)
+        return self._db.search(query, limit=limit, project=self._project_id)
 
     def search_by_name(
         self,
@@ -463,40 +529,132 @@ class SymbolIndexManager:
         Search symbols by name.
         exact=True  — case-insensitive whole-name match.
         exact=False — case-insensitive substring match.
+
+        Scoped to the manager's project (global + project libraries).
         """
-        return self._db.search_by_name(name, exact=exact, limit=limit)
+        return self._db.search_by_name(name, exact=exact, limit=limit, project=self._project_id)
 
     # ------------------------------------------------------------------
     # Lookup
     # ------------------------------------------------------------------
 
     def get_symbol(self, library_name: str, symbol_name: str) -> SymbolRecord | None:
-        """Look up a single symbol by library and symbol name."""
-        return self._db.get_symbol(library_name, symbol_name)
+        """Look up a single symbol by library and symbol name, scoped to the
+        manager's project (global + project libraries)."""
+        return self._db.get_symbol(library_name, symbol_name, project=self._project_id)
 
     def get_library_symbols(self, library_name: str) -> list[SymbolRecord]:
-        """Return all symbols in a library, ordered by position in file."""
-        return self._db.get_library_symbols(library_name)
+        """Return all symbols in a library, ordered by position in file,
+        scoped to the manager's project (global + project libraries)."""
+        return self._db.get_library_symbols(library_name, project=self._project_id)
 
     def list_all_symbols(self) -> list[str]:
-        """Return all symbol keys as 'library_name:symbol_name' strings."""
-        return [f"{s.library_name}:{s.symbol_name}" for s in self._db.get_all_symbols()]
+        """Return all symbol keys as 'library_name:symbol_name' strings,
+        scoped to the manager's project (global + project libraries)."""
+        return [
+            f"{s.library_name}:{s.symbol_name}" for s in self._db.get_all_symbols(self._project_id)
+        ]
+
+    def get_all_symbol_pairs(self) -> set[tuple[str, str]]:
+        """Return every indexed ``(library_name, symbol_name)`` pair, scoped
+        to the manager's project (global + project libraries)."""
+        return self._db.get_all_symbol_pairs(self._project_id)
 
     def get_all_libraries(self) -> list[LibraryRecord]:
-        """Return all indexed library records."""
-        return self._db.get_all_libraries()
+        """Return all indexed library records, scoped to the manager's
+        project (global + project libraries)."""
+        return self._db.get_all_libraries(project=self._project_id)
 
     def get_library_by_name(self, name: str) -> LibraryRecord | None:
-        """Look up a library record by library name."""
-        return self._db.get_library_by_name(name)
+        """Look up a single library record by library_name, scoped to the
+        manager's project (global + project libraries)."""
+        return self._db.get_library_by_name(name, project=self._project_id)
+
+    def remove_library(self, library_name: str, project: str | None = None) -> bool:
+        """Drop one library (and its symbols) from the index database.
+
+        Only the index entry is removed — the ``.kicad_sym`` file and the
+        sym-lib-table entry are left untouched (callers own those).
+
+        **Ownership-scoped by default**: with *project* given (``""`` for a
+        global library, a project id for a project library), only the row
+        whose ``project`` matches **exactly** is removed — a same-nickname
+        row owned by another project is NEVER touched (the user-facing
+        delete path always derives the owning project from the library's
+        declaring sym-lib-table and passes it here).
+
+        With ``project=None`` the historic first-match-any-scope behavior is
+        kept for callers that do not know ownership (e.g. tests): the first
+        row matching the bare nickname is removed.
+
+        Directory-style (symdir) rows keyed ``<nickname>/<file-stem>`` belong
+        to *system* libraries (e.g. ``usr/share/kicad/symbols``) and are
+        deliberately **not** matched: delete tools must never touch system
+        libraries.
+
+        :param library_name: Library nickname to remove.
+        :param project: Exact owning project (``""`` = global); ``None`` for
+            the legacy any-scope match.
+        :returns: True when a matching row was deleted.
+        """
+        if project is not None:
+            rec = self._db.get_library_by_name_exact(library_name, project)
+        else:
+            rec = self._db.get_library_by_name(library_name, project=None)
+        if rec is None:
+            return False
+        self._db.delete_library(rec.id)
+        return True
+
+    # ------------------------------------------------------------------
+    # Narrow single-library indexing (library write tools)
+    # ------------------------------------------------------------------
+
+    def index_library(self, library_name: str, file_path: str, project: str | None = None) -> int:
+        """Index exactly one ``.kicad_sym`` file into the database.
+
+        Narrow update for the schematic → library export tools: indexes a
+        single library file without traversing the effective library list.
+
+        :param library_name: Library nickname as it appears in sym-lib-table
+            (for directory-style libraries the caller passes the composed
+            ``TableName/FileBaseName`` form, matching ``sync``).
+        :param file_path: Absolute path to the ``.kicad_sym`` file.
+        :param project: Exact row ownership (``""`` = global, a project id =
+            that project).  Tools derive it from the library's declaring
+            sym-lib-table so a reindex never re-attributes a global
+            library to the caller's project.  ``None`` (legacy callers)
+            falls back to the manager's own scope.
+        :returns: Number of symbols stored, or -1 on failure.
+        """
+        if not os.path.isfile(file_path):
+            log.warning("index_library: not a file: %s", file_path)
+            return -1
+        try:
+            stat = os.stat(file_path)
+        except OSError as exc:
+            log.warning("index_library: cannot stat %s: %s", file_path, exc)
+            return -1
+        checksum = self._compute_checksum(file_path)
+        if project is None:
+            project = self._project_id
+        return self._index_library(
+            library_name,
+            file_path,
+            stat.st_mtime,
+            stat.st_size,
+            checksum,
+            project=project,
+        )
 
     # ------------------------------------------------------------------
     # Statistics
     # ------------------------------------------------------------------
 
     def get_statistics(self) -> DbStats:
-        """Return library and symbol counts from the database."""
-        return self._db.get_stats()
+        """Return library and symbol counts from the database, scoped to the
+        manager's project (global + project libraries)."""
+        return self._db.get_stats(project=self._project_id)
 
     # ------------------------------------------------------------------
     # Lifecycle

@@ -316,6 +316,31 @@ class FootprintIndexManager:
         """
         return self._db.library_name_exists(library_name)
 
+    def remove_library(self, library_name: str) -> bool:
+        """Drop one library (and its footprints) from the index database.
+
+        Only the index entry is removed — the ``.pretty`` directory and the
+        fp-lib-table entry are left untouched (callers own those).
+
+        Match is deliberately cross-project: library nicknames are globally
+        unique (see ``library_name_exists``), so a project-scoped manager
+        must still be able to drop the row regardless of which project scope
+        created it.  By contrast the symbol-side manager
+        (``SymbolIndexManager``) matches by exact ownership via
+        ``get_library_by_name_exact`` — its ``remove_library(library,
+        project=X)`` deletes only the row owned by X (or the global row for
+        ``project=""``), because symbol nicknames are NOT globally unique
+        across projects.
+
+        :param library_name: Library nickname to remove.
+        :returns: True when a matching row was deleted.
+        """
+        for rec in self._db.get_all_libraries(project=None):
+            if rec.library_name == library_name:
+                self._db.delete_library(rec.id)
+                return True
+        return False
+
     def get_all_footprint_names(self) -> set[str]:
         """Return every footprint name indexed in the manager's project scope
         (global + project libraries)."""

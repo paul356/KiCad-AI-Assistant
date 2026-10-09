@@ -151,6 +151,13 @@ CREATE TRIGGER IF NOT EXISTS footprints_ad AFTER DELETE ON footprints BEGIN
     VALUES ('delete', old.rowid, old.library_name, old.footprint_name, old.description, old.tags);
 END;
 
+CREATE TRIGGER IF NOT EXISTS footprints_au AFTER UPDATE ON footprints BEGIN
+    INSERT INTO footprints_fts(footprints_fts, rowid, library_name, footprint_name, description, tags)
+    VALUES ('delete', old.rowid, old.library_name, old.footprint_name, old.description, old.tags);
+    INSERT INTO footprints_fts(rowid, library_name, footprint_name, description, tags)
+    VALUES (new.rowid, new.library_name, new.footprint_name, new.description, new.tags);
+END;
+
 """
 
 
@@ -190,6 +197,9 @@ class FootprintDatabase:
                 _logging.getLogger(__name__).warning(
                     "PRAGMA foreign_keys=ON not applied; got %r", fk_result
                 )
+            # Let narrow reindex writes wait out a concurrent background
+            # sync instead of failing immediately with SQLITE_BUSY.
+            conn.execute("PRAGMA busy_timeout = 5000")
 
         self._Session = sessionmaker(bind=self._engine)
         self._apply_schema()

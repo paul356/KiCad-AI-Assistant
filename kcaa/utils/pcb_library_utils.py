@@ -47,13 +47,15 @@ def _default_kicad_config_dirs() -> list[str]:
 def find_fp_lib_tables(project_path: str | None = None) -> list[str]:
     """Return a list of fp-lib-table file paths that exist on this system.
 
-    :param project_path: Optional path to a project directory; if given, the
-        project-local fp-lib-table is searched first.
+    :param project_path: Optional path to a project directory or to a
+        project file (e.g. ``.kicad_pro`` / ``.kicad_pcb``) inside one;
+        if given, the project-local fp-lib-table is searched first.
     :returns: List of existing fp-lib-table paths, most-specific first.
     """
     tables: list[str] = []
     if project_path:
-        proj_table = os.path.join(os.path.dirname(project_path), "fp-lib-table")
+        proj_dir = project_path if os.path.isdir(project_path) else os.path.dirname(project_path)
+        proj_table = os.path.join(proj_dir, "fp-lib-table")
         if os.path.isfile(proj_table):
             tables.append(proj_table)
 
@@ -217,13 +219,16 @@ def build_effective_library_list(
     ``type="Table"`` indirections, and deduplicates by nickname — the first
     occurrence wins (project libraries override global ones).
 
-    :param project_path: Optional path to a ``.kicad_pro`` file; its directory
-        is checked for a project-local fp-lib-table and used to resolve
-        ``${KIPRJMOD}`` in library URIs.
+    :param project_path: Optional path to a ``.kicad_pro`` file or to a
+        project directory: its directory is checked for a project-local
+        fp-lib-table and used to resolve ``${KIPRJMOD}`` in library URIs.
     :returns: List of dicts: ``nickname``, ``type``, ``uri`` (resolved),
         ``raw_uri`` (unexpanded), ``description``.
     """
-    project_dir = os.path.dirname(project_path) if project_path else None
+    if project_path and os.path.isdir(project_path):
+        project_dir = project_path
+    else:
+        project_dir = os.path.dirname(project_path) if project_path else None
     table_paths = find_fp_lib_tables(project_path)
     seen_nicknames: set = set()
     result: list[dict[str, str]] = []
