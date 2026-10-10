@@ -124,7 +124,7 @@ user config directory). **Not** in `.env`.
 
 | Variable | Description |
 |---|---|
-| `KICAD_MCP_LLM_PROVIDER` | `"openai"` \| `"anthropic"` \| `"custom"` |
+| `KICAD_MCP_LLM_PROVIDER` | `"openai"` \| `"anthropic"` \| `"ollama"` \| `"bedrock"` |
 | `KICAD_MCP_LLM_API_KEY` | API key for the chosen provider |
 | `KICAD_MCP_LLM_MODEL` | Model name, e.g. `"gpt-4o"` or `"claude-opus-4-5"` |
 | `KICAD_MCP_SERVER_PORT` | Fixed port (default: auto-select) |

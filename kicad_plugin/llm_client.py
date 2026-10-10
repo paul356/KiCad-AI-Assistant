@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
+import datetime
 import difflib
 import json
 import logging
@@ -661,6 +662,105 @@ except Exception as e:
 """
 
 
+def _aws_sigv4_headers(
+    method: str,
+    url: str,
+    region: str,
+    service: str,
+    access_key: str,
+    secret_key: str,
+    session_token: str,
+    payload: bytes,
+    base_headers: dict[str, str],
+    now: datetime.datetime | None = None,
+) -> dict[str, str]:
+    """Sign an HTTP request with AWS Signature Version 4 (stdlib only).
+
+    Returns ``base_headers`` augmented with the ``Authorization``,
+    ``X-Amz-Date`` (and, when a session token is supplied,
+    ``X-Amz-Security-Token``) headers Bedrock requires. Implemented with
+    ``hashlib``/``hmac`` so the plugin keeps its no-SDK, urllib-only design
+    (boto3 does not run cleanly inside KiCad's embedded Python). The signed
+    headers are static for the exact ``payload`` bytes, so they survive the
+    subprocess HTTPS/SSE fallbacks unchanged.
+    """
+    import hashlib
+    import hmac
+    import urllib.parse
+
+    parsed = urllib.parse.urlsplit(url)
+    host = parsed.netloc
+    # SigV4 canonical URI: for every service except S3, the already-URL-encoded
+    # path is URI-encoded a SECOND time (AWS re-encodes the received path when
+    # it verifies the signature). This is a no-op for paths with no percent-
+    # or reserved characters, so the common inference-profile ids (e.g.
+    # "us.anthropic.claude-opus-5-5") are unaffected; it matters for versioned
+    # model ids whose ':' is sent as "%3A" and must be signed as "%253A".
+    canonical_uri = urllib.parse.quote(parsed.path or "/", safe="/~")
+    canonical_querystring = parsed.query  # empty for the Bedrock invoke endpoint
+
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    amz_date = now.strftime("%Y%m%dT%H%M%SZ")
+    date_stamp = now.strftime("%Y%m%d")
+
+    payload_hash = hashlib.sha256(payload).hexdigest()
+
+    # Headers covered by the signature. Keys must be lowercase and sorted.
+    signed: dict[str, str] = {"host": host, "x-amz-date": amz_date}
+    content_type = base_headers.get("Content-Type")
+    if content_type:
+        signed["content-type"] = content_type
+    if session_token:
+        signed["x-amz-security-token"] = session_token
+    sorted_keys = sorted(signed)
+    canonical_headers = "".join(f"{k}:{signed[k]}\n" for k in sorted_keys)
+    signed_headers = ";".join(sorted_keys)
+
+    canonical_request = "\n".join(
+        [
+            method,
+            canonical_uri,
+            canonical_querystring,
+            canonical_headers,
+            signed_headers,
+            payload_hash,
+        ]
+    )
+
+    algorithm = "AWS4-HMAC-SHA256"
+    credential_scope = f"{date_stamp}/{region}/{service}/aws4_request"
+    string_to_sign = "\n".join(
+        [
+            algorithm,
+            amz_date,
+            credential_scope,
+            hashlib.sha256(canonical_request.encode()).hexdigest(),
+        ]
+    )
+
+    def _hmac(key: bytes, msg: str) -> bytes:
+        return hmac.new(key, msg.encode(), hashlib.sha256).digest()
+
+    k_date = _hmac(("AWS4" + secret_key).encode(), date_stamp)
+    k_region = _hmac(k_date, region)
+    k_service = _hmac(k_region, service)
+    k_signing = _hmac(k_service, "aws4_request")
+    signature = hmac.new(k_signing, string_to_sign.encode(), hashlib.sha256).hexdigest()
+
+    authorization = (
+        f"{algorithm} Credential={access_key}/{credential_scope}, "
+        f"SignedHeaders={signed_headers}, Signature={signature}"
+    )
+
+    out = dict(base_headers)
+    out["Host"] = host
+    out["X-Amz-Date"] = amz_date
+    out["Authorization"] = authorization
+    if session_token:
+        out["X-Amz-Security-Token"] = session_token
+    return out
+
+
 def _https_post_json(
     url: str,
     headers: dict[str, str],
@@ -1071,6 +1171,9 @@ class LLMClient:
     Supports:
       - provider="openai"    → OpenAI chat completions API (and compatible endpoints)
       - provider="anthropic" → Anthropic messages API
+      - provider="ollama"    → Ollama native API
+      - provider="bedrock"   → Amazon Bedrock OpenAI-compatible endpoint
+                               (Bedrock API key bearer token, or AWS SigV4)
     """
 
     def __init__(self, settings, mcp_base_url: str) -> None:
@@ -1497,6 +1600,11 @@ class LLMClient:
                 self._history = compaction_history
                 if provider == "anthropic":
                     resp = self._call_anthropic(
+                        "You are a helpful assistant that summarizes conversations concisely.",
+                        [],
+                    )
+                elif provider == "bedrock":
+                    resp = self._call_bedrock(
                         "You are a helpful assistant that summarizes conversations concisely.",
                         [],
                     )
@@ -2684,6 +2792,11 @@ class LLMClient:
                     response = self._stream_ollama(system, tools, on_stream_event)
                 else:
                     response = self._call_ollama(system, tools)
+            elif provider == "bedrock":
+                if on_stream_event is not None:
+                    response = self._stream_bedrock(system, tools, on_stream_event)
+                else:
+                    response = self._call_bedrock(system, tools)
             elif on_stream_event is not None:
                 if provider == "anthropic":
                     response = self._stream_anthropic(system, tools, on_stream_event)
@@ -2843,24 +2956,8 @@ class LLMClient:
         non-streaming fallback here; _call_openai is used only by callers
         that do not provide on_stream_event (e.g. history compaction).
         """
-        global _current_reasoning
-        _current_reasoning = []
-        global _in_process_ssl
-        import urllib.error
-        import urllib.request
-
-        base = (self._settings.llm_base_url or "https://api.openai.com").rstrip("/")
-        if "/chat/completions" in base:
-            url = base
-        elif base.endswith("/v1"):
-            url = f"{base}/chat/completions"
-        elif base.endswith("/openai"):
-            # Gemini's OpenAI-compatible shim: <v1beta/openai> already
-            # pins the API version, so the endpoint is .../chat/completions,
-            # not .../v1/chat/completions.
-            url = f"{base}/chat/completions"
-        else:
-            url = f"{base}/v1/chat/completions"
+        base = self._settings.llm_base_url or "https://api.openai.com"
+        url = self._openai_endpoint_url(base)
 
         messages = [{"role": "system", "content": system}] + self._history
         payload = json.dumps(
@@ -2872,6 +2969,21 @@ class LLMClient:
             }
         ).encode()
         headers = self._openai_headers()
+        return self._stream_openai_request(url, headers, payload, on_stream_event)
+
+    def _stream_openai_request(
+        self, url: str, headers: dict[str, str], payload: bytes, on_stream_event
+    ) -> dict[str, Any]:
+        """Stream and parse an OpenAI-compatible SSE response.
+
+        Shared by _stream_openai and _stream_bedrock: the caller supplies the
+        resolved URL, headers (bearer or SigV4-signed) and request body.
+        """
+        global _current_reasoning
+        _current_reasoning = []
+        global _in_process_ssl
+        import urllib.error
+        import urllib.request
 
         if _in_process_ssl is not False:
             req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
@@ -3280,32 +3392,44 @@ class LLMClient:
             headers["Authorization"] = f"Bearer {self._settings.llm_api_key}"
         return headers
 
-    def _call_openai(self, system: str, tools: list[dict]) -> dict[str, Any]:
-        base = (self._settings.llm_base_url or "https://api.openai.com").rstrip("/")
-        # Accept either a server root (e.g. "https://api.openai.com") or a
-        # full endpoint URL (e.g. ".../v1/chat/completions").  Only append the
-        # default path when the user hasn't already specified one.
+    @staticmethod
+    def _openai_endpoint_url(base: str) -> str:
+        """Resolve the chat-completions URL for an OpenAI-compatible base.
+
+        Accepts either a server root (e.g. "https://api.openai.com") or a
+        full endpoint URL (e.g. ".../v1/chat/completions"); only appends the
+        default path when the user hasn't already specified one.
+        """
+        base = base.rstrip("/")
         if "/chat/completions" in base:
-            url = base
-        elif base.endswith("/v1"):
-            url = f"{base}/chat/completions"
-        elif base.endswith("/openai"):
+            return base
+        if base.endswith("/v1"):
+            return f"{base}/chat/completions"
+        if base.endswith("/openai"):
             # Gemini's OpenAI-compatible shim: <v1beta/openai> already
             # pins the API version, so the endpoint is .../chat/completions,
             # not .../v1/chat/completions.
-            url = f"{base}/chat/completions"
-        else:
-            url = f"{base}/v1/chat/completions"
+            return f"{base}/chat/completions"
+        return f"{base}/v1/chat/completions"
+
+    def _openai_payload(self, system: str, tools: list[dict], stream: bool) -> bytes:
+        """Build the OpenAI-compatible chat-completions request body."""
         messages = [{"role": "system", "content": system}] + self._history
         payload_dict: dict[str, Any] = {
             "model": self._settings.llm_model,
             "messages": messages,
             "tools": tools or None,
         }
+        if stream:
+            payload_dict["stream"] = True
         if self._max_tokens > 0:
             payload_dict["max_tokens"] = self._max_tokens
-        payload = json.dumps(payload_dict).encode()
-        headers = self._openai_headers()
+        return json.dumps(payload_dict).encode()
+
+    def _openai_request(
+        self, url: str, headers: dict[str, str], payload: bytes, label: str = "OpenAI"
+    ) -> dict[str, Any]:
+        """POST an OpenAI-compatible request and parse the (non-streaming) reply."""
         try:
             status, text = _https_post_json(url, headers, payload, timeout=300)
         except RuntimeError as e:
@@ -3316,19 +3440,108 @@ class LLMClient:
         try:
             body = json.loads(text)
         except json.JSONDecodeError as e:
-            return {"error": f"Invalid JSON from OpenAI: {e}"}
+            return {"error": f"Invalid JSON from {label}: {e}"}
 
         if not isinstance(body, dict):
-            return {"error": f"Unexpected response from OpenAI: {text[:200]}"}
+            return {"error": f"Unexpected response from {label}: {text[:200]}"}
 
         _choices = body.get("choices") or []
         if not _choices:
-            return {"error": "OpenAI response contained no choices"}
+            return {"error": f"{label} response contained no choices"}
         choice = _choices[0]
         return {
             "finish_reason": choice.get("finish_reason", "stop"),
             "message": choice.get("message", {}),
         }
+
+    def _call_openai(self, system: str, tools: list[dict]) -> dict[str, Any]:
+        base = self._settings.llm_base_url or "https://api.openai.com"
+        url = self._openai_endpoint_url(base)
+        payload = self._openai_payload(system, tools, stream=False)
+        headers = self._openai_headers()
+        return self._openai_request(url, headers, payload)
+
+    def _bedrock_region(self) -> str:
+        return (getattr(self._settings, "llm_aws_region", "") or "us-east-1").strip()
+
+    def _bedrock_base_url(self) -> str:
+        """Default base URL for Amazon Bedrock's runtime endpoint.
+
+        An explicit llm_base_url still overrides this (e.g. a VPC endpoint).
+        Bedrock's OpenAI-compatible endpoint only serves the OpenAI OSS
+        models, so Claude requests use the native InvokeModel API under this
+        host; the model-specific path is appended per request.
+        """
+        return f"https://bedrock-runtime.{self._bedrock_region()}.amazonaws.com"
+
+    def _bedrock_headers(self, url: str, payload: bytes) -> dict[str, str]:
+        """Headers for a Bedrock request, choosing the auth method.
+
+        If an AWS access key id + secret are configured, the request is signed
+        with SigV4; otherwise the API Key field is sent as a Bedrock API key
+        (bearer token). Signing needs the final payload bytes, so this is
+        called after the body is built (unlike _openai_headers).
+        """
+        base = {"Content-Type": "application/json", "User-Agent": self._user_agent()}
+        access = (getattr(self._settings, "llm_aws_access_key_id", "") or "").strip()
+        secret = (getattr(self._settings, "llm_aws_secret_access_key", "") or "").strip()
+        if access and secret:
+            token = (getattr(self._settings, "llm_aws_session_token", "") or "").strip()
+            return _aws_sigv4_headers(
+                "POST", url, self._bedrock_region(), "bedrock", access, secret, token, payload, base
+            )
+        if self._settings.llm_api_key:
+            base["Authorization"] = f"Bearer {self._settings.llm_api_key}"
+        return base
+
+    def _bedrock_invoke_url(self) -> str:
+        """Build the Bedrock InvokeModel URL for the configured model.
+
+        The model id becomes a path segment, so characters like ':' in
+        versioned ids (e.g. "...-v1:0") are percent-encoded.
+        """
+        import urllib.parse
+
+        base = (self._settings.llm_base_url or self._bedrock_base_url()).rstrip("/")
+        model_id = urllib.parse.quote(self._settings.llm_model, safe="")
+        return f"{base}/model/{model_id}/invoke"
+
+    def _call_bedrock(self, system: str, tools: list[dict]) -> dict[str, Any]:
+        """Call a Claude model on Amazon Bedrock via the native InvokeModel API.
+
+        Bedrock accepts the Anthropic Messages body (with "anthropic_version"
+        instead of a top-level "model") and returns the Anthropic response
+        shape, so the message/tool conversion and response parsing are shared
+        with _call_anthropic.
+        """
+        url = self._bedrock_invoke_url()
+        payload = self._anthropic_base_payload(system, tools)
+        payload["anthropic_version"] = "bedrock-2023-05-31"
+        encoded = json.dumps(payload).encode()
+        headers = self._bedrock_headers(url, encoded)
+        try:
+            status, text = _https_post_json(url, headers, encoded, timeout=300)
+        except RuntimeError as e:
+            return {"error": str(e)}
+        return self._parse_anthropic_response(status, text, "Bedrock")
+
+    def _stream_bedrock(self, system: str, tools: list[dict], on_stream_event) -> dict[str, Any]:
+        """Stream a Bedrock response.
+
+        Bedrock's streaming endpoint uses AWS binary event-stream framing
+        rather than SSE, which the plugin's urllib/subprocess transport can't
+        decode. So we make a single non-streaming InvokeModel call and replay
+        the result through on_stream_event (same approach as the Gemini
+        workaround in _call_llm).
+        """
+        response = self._call_bedrock(system, tools)
+        if not response.get("error") and on_stream_event is not None:
+            on_stream_event({"type": "text_start"})
+            content = response.get("message", {}).get("content")
+            if content:
+                on_stream_event({"type": "text_chunk", "content": content})
+            on_stream_event({"type": "text_end"})
+        return response
 
     def _call_ollama(self, system: str, tools: list[dict]) -> dict[str, Any]:
         """Call Ollama native API (non-streaming).
@@ -3376,17 +3589,14 @@ class LLMClient:
             "message": msg,
         }
 
-    def _call_anthropic(self, system: str, tools: list[dict]) -> dict[str, Any]:
-        base = (self._settings.llm_base_url or "https://api.anthropic.com").rstrip("/")
-        # Accept full endpoint URL or bare hostname — only append the default
-        # path when the user hasn't already specified one.
-        if "/v1/messages" in base:
-            url = base
-        elif base.endswith("/v1"):
-            url = f"{base}/messages"
-        else:
-            url = f"{base}/v1/messages"
-        # Convert OpenAI tool format to Anthropic format
+    def _anthropic_base_payload(self, system: str, tools: list[dict]) -> dict[str, Any]:
+        """Build the shared Anthropic Messages payload (no model field).
+
+        Reused by the direct Anthropic API path (_call_anthropic) and the
+        Amazon Bedrock InvokeModel path (_call_bedrock), which send the same
+        message/tool shape and differ only in how the model is identified
+        (top-level "model" vs. the URL plus "anthropic_version").
+        """
         anthropic_tools = [
             {
                 "name": t["function"]["name"],
@@ -3395,34 +3605,33 @@ class LLMClient:
             }
             for t in tools
         ]
-        messages = self._build_anthropic_messages()
-
         payload: dict[str, Any] = {
-            "model": self._settings.llm_model,
             "system": system,
-            "messages": messages,
+            "messages": self._build_anthropic_messages(),
             # Anthropic API requires max_tokens on every request; compatible
             # gateways reject requests without it (400 InvalidParameter).
             "max_tokens": self._max_tokens or _ANTHROPIC_DEFAULT_MAX_TOKENS,
         }
         if anthropic_tools:
             payload["tools"] = anthropic_tools
-        encoded = json.dumps(payload).encode()
-        headers = self._anthropic_headers()
-        try:
-            status, text = _https_post_json(url, headers, encoded, timeout=300)
-        except RuntimeError as e:
-            return {"error": str(e)}
+        return payload
 
+    @staticmethod
+    def _parse_anthropic_response(status: int, text: str, label: str) -> dict[str, Any]:
+        """Parse an Anthropic Messages response into the internal format.
+
+        Shared by the Anthropic API and Bedrock InvokeModel paths, which
+        return the identical response body shape.
+        """
         if status >= 400:
             return {"error": f"HTTP {status}: {text[:200]}"}
         try:
             body = json.loads(text)
         except json.JSONDecodeError as e:
-            return {"error": f"Invalid JSON from Anthropic: {e}"}
+            return {"error": f"Invalid JSON from {label}: {e}"}
 
         if not isinstance(body, dict):
-            return {"error": f"Unexpected response from Anthropic: {text[:200]}"}
+            return {"error": f"Unexpected response from {label}: {text[:200]}"}
 
         content_blocks_resp = body.get("content", [])
         text_blocks = [b.get("text", "") for b in content_blocks_resp if b.get("type") == "text"]
@@ -3444,3 +3653,23 @@ class LLMClient:
             "finish_reason": "tool_calls" if tool_use_blocks else "stop",
             "message": message,
         }
+
+    def _call_anthropic(self, system: str, tools: list[dict]) -> dict[str, Any]:
+        base = (self._settings.llm_base_url or "https://api.anthropic.com").rstrip("/")
+        # Accept full endpoint URL or bare hostname — only append the default
+        # path when the user hasn't already specified one.
+        if "/v1/messages" in base:
+            url = base
+        elif base.endswith("/v1"):
+            url = f"{base}/messages"
+        else:
+            url = f"{base}/v1/messages"
+        payload = self._anthropic_base_payload(system, tools)
+        payload["model"] = self._settings.llm_model
+        encoded = json.dumps(payload).encode()
+        headers = self._anthropic_headers()
+        try:
+            status, text = _https_post_json(url, headers, encoded, timeout=300)
+        except RuntimeError as e:
+            return {"error": str(e)}
+        return self._parse_anthropic_response(status, text, "Anthropic")

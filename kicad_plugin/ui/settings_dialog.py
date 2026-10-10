@@ -21,7 +21,21 @@ if _WX_AVAILABLE:
     class SettingsDialog(wx.Dialog):
         """Simple dialog for editing plugin settings."""
 
-        _PROVIDERS = ["openai", "anthropic", "ollama"]
+        _PROVIDERS = ["openai", "anthropic", "ollama", "bedrock"]
+        # Suggested default model per provider. Used only to pre-fill the Model
+        # field when switching providers if it is empty or still holds another
+        # provider's default — a custom entry is never overwritten. The Bedrock
+        # default uses the US cross-region inference-profile prefix
+        # ("us.anthropic.<id>"), which newer Claude models on Bedrock require
+        # for on-demand throughput; swap the prefix for your region (e.g.
+        # "eu."/"apac.") or drop it to a plain "anthropic.<id>" if your account
+        # supports direct on-demand access.
+        _DEFAULT_MODELS = {
+            "openai": "gpt-4o",
+            "anthropic": "claude-opus-5-5",
+            "ollama": "llama3.1",
+            "bedrock": "us.anthropic.claude-opus-5-5",
+        }
         # User-Agents proven accepted (HTTP 200) at opencode.ai's edge in
         # issue #149; urllib's default (Python-urllib/...) is rejected (403).
         _USER_AGENTS = [
@@ -64,6 +78,7 @@ if _WX_AVAILABLE:
                 else 0
             )
             self._provider.SetSelection(idx)
+            self._provider.Bind(wx.EVT_CHOICE, self._on_provider_changed)
             grid.Add(self._provider, 1, wx.EXPAND)
 
             # API Key
@@ -100,6 +115,63 @@ if _WX_AVAILABLE:
             )
             self._base_url = wx.TextCtrl(self._scrolled, value=self._settings.llm_base_url)
             grid.Add(self._base_url, 1, wx.EXPAND)
+
+            # --- Amazon Bedrock (shown only when Provider = bedrock) ---
+            # Leave the AWS credential fields blank to authenticate with a
+            # Bedrock API key (put it in the API Key field above); fill them in
+            # to sign requests with AWS SigV4 instead. The label+field widgets
+            # are tracked in self._aws_rows so they can be shown/hidden by
+            # provider (see _update_aws_visibility).
+            self._aws_rows: list[tuple[wx.Window, wx.Window]] = []
+
+            region_label = wx.StaticText(self._scrolled, label="AWS Region:")
+            grid.Add(region_label, 0, wx.ALIGN_CENTER_VERTICAL)
+            self._aws_region = wx.TextCtrl(
+                self._scrolled, value=getattr(self._settings, "llm_aws_region", "") or ""
+            )
+            self._aws_region.SetHint("us-east-1")
+            self._aws_region.SetToolTip(
+                "Bedrock only. AWS region for the bedrock-runtime endpoint "
+                "(e.g. us-east-1). Also used for SigV4 signing."
+            )
+            grid.Add(self._aws_region, 1, wx.EXPAND)
+            self._aws_rows.append((region_label, self._aws_region))
+
+            access_label = wx.StaticText(self._scrolled, label="AWS Access Key ID:")
+            grid.Add(access_label, 0, wx.ALIGN_CENTER_VERTICAL)
+            self._aws_access_key_id = wx.TextCtrl(
+                self._scrolled, value=getattr(self._settings, "llm_aws_access_key_id", "") or ""
+            )
+            self._aws_access_key_id.SetToolTip(
+                "Bedrock only. Leave blank to use a Bedrock API key (API Key field). "
+                "Set this plus the secret key to authenticate with AWS SigV4."
+            )
+            grid.Add(self._aws_access_key_id, 1, wx.EXPAND)
+            self._aws_rows.append((access_label, self._aws_access_key_id))
+
+            secret_label = wx.StaticText(self._scrolled, label="AWS Secret Access Key:")
+            grid.Add(secret_label, 0, wx.ALIGN_CENTER_VERTICAL)
+            self._aws_secret_access_key = wx.TextCtrl(
+                self._scrolled,
+                value=getattr(self._settings, "llm_aws_secret_access_key", "") or "",
+                style=wx.TE_PASSWORD,
+            )
+            self._aws_secret_access_key.SetToolTip("Bedrock only. AWS secret key for SigV4 auth.")
+            grid.Add(self._aws_secret_access_key, 1, wx.EXPAND)
+            self._aws_rows.append((secret_label, self._aws_secret_access_key))
+
+            token_label = wx.StaticText(self._scrolled, label="AWS Session Token:")
+            grid.Add(token_label, 0, wx.ALIGN_CENTER_VERTICAL)
+            self._aws_session_token = wx.TextCtrl(
+                self._scrolled,
+                value=getattr(self._settings, "llm_aws_session_token", "") or "",
+                style=wx.TE_PASSWORD,
+            )
+            self._aws_session_token.SetToolTip(
+                "Bedrock only. Optional STS session token for temporary AWS credentials."
+            )
+            grid.Add(self._aws_session_token, 1, wx.EXPAND)
+            self._aws_rows.append((token_label, self._aws_session_token))
 
             # User-Agent
             grid.Add(
@@ -237,6 +309,14 @@ if _WX_AVAILABLE:
             for child in self._scrolled.GetChildren():
                 child.Bind(wx.EVT_MOUSEWHEEL, self._on_scroll_wheel)
 
+            # Apply the provider's default model on open too, so a stored
+            # provider whose Model field still holds another provider's default
+            # (e.g. bedrock + leftover "gpt-4o") is corrected without needing to
+            # toggle the dropdown. Also set the AWS fields' visibility to match
+            # the stored provider.
+            self._maybe_fill_default_model()
+            self._update_aws_visibility()
+
         def _on_scroll_wheel(self, event) -> None:
             """Scroll the form by the wheel's rotation; never touch focus."""
             steps = event.GetWheelRotation() / (event.GetWheelDelta() or 120)
@@ -245,6 +325,39 @@ if _WX_AVAILABLE:
             # 12 units (~60 px, roughly 3 form rows).
             self._scrolled.Scroll(x, y - int(round(steps * 12)))
             event.StopPropagation()
+
+        def _on_provider_changed(self, event) -> None:
+            """React to a provider selection change: suggest a default model
+            and show/hide the Bedrock-only AWS fields."""
+            self._maybe_fill_default_model()
+            self._update_aws_visibility()
+
+        def _update_aws_visibility(self) -> None:
+            """Show the AWS/Bedrock credential rows only for the bedrock
+            provider; hide them (without clearing their values) otherwise, then
+            reflow the scrolled form."""
+            show = self._PROVIDERS[self._provider.GetSelection()] == "bedrock"
+            for label, field in self._aws_rows:
+                label.Show(show)
+                field.Show(show)
+            self._scrolled.Layout()
+            self._scrolled.FitInside()
+
+        def _maybe_fill_default_model(self) -> None:
+            """Pre-fill the Model field with the selected provider's default.
+
+            Runs both on dialog open and when the provider changes. Only
+            pre-fills when the Model field is empty or still holds one of the
+            known per-provider defaults, so a model the user typed is never
+            overwritten.
+            """
+            provider = self._PROVIDERS[self._provider.GetSelection()]
+            default = self._DEFAULT_MODELS.get(provider)
+            if not default:
+                return
+            current = self._model.GetValue().strip()
+            if current == "" or current in self._DEFAULT_MODELS.values():
+                self._model.SetValue(default)
 
         def apply_to(self, settings) -> bool:
             """Write dialog values back to settings object.
@@ -267,6 +380,10 @@ if _WX_AVAILABLE:
             settings.llm_model = self._model.GetValue().strip()
             settings.llm_supports_vision = self._supports_vision.GetValue()
             settings.llm_base_url = self._base_url.GetValue().strip()
+            settings.llm_aws_region = self._aws_region.GetValue().strip()
+            settings.llm_aws_access_key_id = self._aws_access_key_id.GetValue().strip()
+            settings.llm_aws_secret_access_key = self._aws_secret_access_key.GetValue().strip()
+            settings.llm_aws_session_token = self._aws_session_token.GetValue().strip()
             settings.llm_user_agent = self._user_agent.GetValue().strip()
             settings.python_executable = self._python.GetValue().strip()
             settings.server_port = self._port.GetValue()

@@ -106,6 +106,20 @@ TOOL_POLICIES: dict[str, ToolPolicy] = {
         mark_dirty=True,
     ),
     "check_reference_conflicts": ToolPolicy(kind="query"),
+    # No-connect flag tools
+    "add_no_connect": ToolPolicy(
+        kind="file_mutation",
+        path_arg="schematic_path",
+        auto_snapshot=True,
+        mark_dirty=True,
+    ),
+    "list_no_connects": ToolPolicy(kind="query"),
+    "remove_no_connect": ToolPolicy(
+        kind="file_mutation",
+        path_arg="schematic_path",
+        auto_snapshot=True,
+        mark_dirty=True,
+    ),
     # Sheet tools
     "list_sheet_symbols": ToolPolicy(kind="query"),
     "get_sheet_hierarchy": ToolPolicy(kind="query"),
@@ -365,6 +379,11 @@ TOOL_POLICIES: dict[str, ToolPolicy] = {
     "run_drc_check": ToolPolicy(
         kind="ipc_action",
         path_arg="project_path",
+    ),
+    # ERC tool (headless kicad-cli, read-only)
+    "run_erc": ToolPolicy(
+        kind="query",
+        path_arg="schematic_path",
     ),
     "get_effective_design_rules": ToolPolicy(
         kind="query",

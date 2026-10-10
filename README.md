@@ -12,7 +12,7 @@ Tested on **KiCad 10.0 / Linux & Windows**.
   - [Table of Contents](#table-of-contents)
   - [Prerequisites](#prerequisites)
   - [Installation](#installation)
-    - [1. Clone the repository](#1-clone-the-repository)
+    - [1. Clone the repository (optional)](#1-clone-the-repository-optional)
     - [2. Install the plugin](#2-install-the-plugin)
     - [3. Create the plugin virtual environment](#3-create-the-plugin-virtual-environment)
     - [4. Load the plugin in KiCad](#4-load-the-plugin-in-kicad)
@@ -31,8 +31,8 @@ Tested on **KiCad 10.0 / Linux & Windows**.
     - [PCB Placement](#pcb-placement)
     - [PCB Groups](#pcb-groups)
     - [PCB Zones](#pcb-zones)
-    - [DRC & Design Rules](#drc--design-rules)
-    - [Versioning & Export](#versioning--export)
+    - [DRC \& Design Rules](#drc--design-rules)
+    - [Versioning \& Export](#versioning--export)
     - [Skill System](#skill-system)
     - [KiCad IPC](#kicad-ipc)
   - [Project Structure](#project-structure)
@@ -45,7 +45,7 @@ Tested on **KiCad 10.0 / Linux & Windows**.
 - KiCad 10.0 or higher
 - [`uv`](https://github.com/astral-sh/uv) — manages the Python virtual environment and installs the correct Python version automatically
   - `curl -Lsf https://astral.sh/uv/install.sh | sh`
-- An API key for OpenAI, Anthropic, or a compatible LLM provider
+- An API key for OpenAI, Anthropic, Amazon Bedrock, or a compatible LLM provider (Ollama needs none)
 
 ## Installation
 
@@ -54,8 +54,8 @@ Tested on **KiCad 10.0 / Linux & Windows**.
 Only needed if you want to build the plugin from source or contribute to the project. Skip this step if you're downloading the pre-built plugin from the Releases page.
 
 ```bash
-git clone https://github.com/paul356/kcaa.git
-cd kcaa
+git clone https://github.com/paul356/KiCad-AI-Assistant.git
+cd KiCad-AI-Assistant
 ```
 
 ### 2. Install the plugin
@@ -65,6 +65,13 @@ Download `kicad_ai_assistant.zip` from the [Releases page](https://github.com/pa
 **Linux:**
 ```bash
 KICAD_PLUGIN_DIR=~/.local/share/kicad/10.0/scripting/plugins
+mkdir -p "$KICAD_PLUGIN_DIR"
+unzip kicad_ai_assistant.zip -d "$KICAD_PLUGIN_DIR"
+```
+
+**macOS:**
+```bash
+KICAD_PLUGIN_DIR=~/Documents/KiCad/10.0/scripting/plugins
 mkdir -p "$KICAD_PLUGIN_DIR"
 unzip kicad_ai_assistant.zip -d "$KICAD_PLUGIN_DIR"
 ```
@@ -86,6 +93,11 @@ make dist-plugin          # produces dist/kicad_ai_assistant.zip
 KICAD_PLUGIN_DIR=~/.local/share/kicad/10.0/scripting/plugins
 mkdir -p "$KICAD_PLUGIN_DIR"
 unzip dist/kicad_ai_assistant.zip -d "$KICAD_PLUGIN_DIR"
+
+# macOS:
+KICAD_PLUGIN_DIR=~/Documents/KiCad/10.0/scripting/plugins
+mkdir -p "$KICAD_PLUGIN_DIR"
+unzip dist/kicad_ai_assistant.zip -d "$KICAD_PLUGIN_DIR"
 ```
 
 ### 3. Create the plugin virtual environment
@@ -95,6 +107,12 @@ Run the setup script from inside the installed plugin directory to create a `.ve
 **Linux:**
 ```bash
 cd ~/.local/share/kicad/10.0/scripting/plugins/kicad_ai_assistant
+./setup_plugin.sh
+```
+
+**macOS:**
+```bash
+cd ~/Documents/KiCad/10.0/scripting/plugins/kicad_ai_assistant
 ./setup_plugin.sh
 ```
 
@@ -130,14 +148,27 @@ All settings can be changed through **Options → Settings** in the plugin panel
 
 | Setting | Description | Default |
 |---------|-------------|---------|
-| `llm_provider` | LLM provider: `openai`, `anthropic`, or `custom` | `openai` |
-| `llm_api_key` | Your LLM API key (stored with owner-only permissions) | *(empty)* |
-| `llm_model` | Model name | `gpt-4o` |
-| `llm_base_url` | Custom endpoint URL (when `llm_provider` is `custom`) | *(provider default)* |
+| `llm_provider` | LLM provider: `openai`, `anthropic`, `ollama`, or `bedrock` | `openai` |
+| `llm_api_key` | Your LLM API key (stored with owner-only permissions). For `bedrock`, a Bedrock API key used as a bearer token | *(empty)* |
+| `llm_model` | Model name. For `bedrock`, a Bedrock model or inference-profile id — newer Claude models need the cross-region profile form, e.g. `us.anthropic.claude-opus-5-5` (swap `us.` for your region) | `gpt-4o` |
+| `llm_base_url` | Custom endpoint URL (overrides the provider default) | *(provider default)* |
+| `llm_aws_region` | AWS region for the Bedrock endpoint (also used for SigV4 signing) | `us-east-1` |
+| `llm_aws_access_key_id` | AWS access key id — set this (plus the secret) to use SigV4 instead of a Bedrock API key | *(empty)* |
+| `llm_aws_secret_access_key` | AWS secret access key for SigV4 auth | *(empty)* |
+| `llm_aws_session_token` | Optional STS session token for temporary AWS credentials | *(empty)* |
 | `server_port` | Fixed port for the built-in MCP server (`0` = auto) | `0` |
 | `show_tool_log` | Show tool-call log panel by default | `true` |
 | `llm_context_tokens` | Total context window size in tokens | `128000` |
 | `llm_compact_threshold` | Trigger context compaction at this usage fraction | `0.70` |
+
+### Amazon Bedrock
+
+Bedrock requests go to the native Bedrock Runtime `InvokeModel` API (not the OpenAI-compatible endpoint, which only serves non-Claude models), using the Anthropic Messages format. Authentication is chosen automatically:
+
+- **Bedrock API key** — leave the AWS credential fields blank and put the key in `llm_api_key`; it is sent as a bearer token.
+- **AWS SigV4** — set `llm_aws_access_key_id` + `llm_aws_secret_access_key` (and optionally `llm_aws_session_token`); requests are signed with SigV4 for the configured `llm_aws_region`.
+
+Use a model id enabled in your account/region — the cross-region inference-profile ids work well, e.g. `us.anthropic.claude-opus-5-5` or a versioned id like `us.anthropic.claude-sonnet-4-5-20250929-v1:0`. List yours with `aws bedrock list-inference-profiles --region <region>`. Responses are streamed to the chat panel in a single block, since Bedrock's streaming uses a binary framing the plugin's transport does not decode.
 
 ## Standalone MCP Server
 
@@ -217,6 +248,9 @@ kcaa
 | `add_label_to_schematic` | Add a local net label |
 | `list_labels_in_schematic` | List all local net labels |
 | `delete_label_from_schematic` | Delete net labels |
+| `add_no_connect` | Add a no-connect flag at a pin coordinate |
+| `list_no_connects` | List all no-connect flags |
+| `remove_no_connect` | Remove no-connect flag(s) by coordinate |
 | `get_schematic_sheet_info` | Get drawing area, paper size, and grid |
 | `find_free_area` | Find candidate areas for placing a block |
 
@@ -226,6 +260,7 @@ kcaa
 |------|-------------|
 | `extract_schematic_netlist` | Extract netlist from a schematic |
 | `find_component_connections` | Find all connections for a component |
+| `run_erc` | Run Electrical Rules Check (headless `kicad-cli`) and return violations |
 | `identify_circuit_patterns` | Identify common circuit patterns |
 | `validate_project` | Basic validation of a KiCad project |
 | `validate_project_boundaries` | Validate component boundaries |

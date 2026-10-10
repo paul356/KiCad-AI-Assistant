@@ -1,5 +1,6 @@
 """Tests for LLMClient history management (dedup + compaction)."""
 
+import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
 import json
@@ -3790,3 +3791,160 @@ class TestCallMcpToolImageKey:
         )
         assert out["ok"] == 1
         assert out["_image"] == {"media_type": "image/png", "data": "QUJD"}
+
+
+# Amazon Bedrock provider: OpenAI-compatible endpoint with bearer (Bedrock
+# API key) or AWS SigV4 auth.
+# ---------------------------------------------------------------------------
+
+
+def _make_bedrock_client(**overrides):
+    client = _make_client()
+    client._settings.llm_provider = "bedrock"
+    client._settings.llm_model = "anthropic.claude-3-5-sonnet-20241022-v2:0"
+    client._settings.llm_api_key = ""
+    client._settings.llm_aws_region = "us-east-1"
+    client._settings.llm_aws_access_key_id = ""
+    client._settings.llm_aws_secret_access_key = ""
+    client._settings.llm_aws_session_token = ""
+    for k, v in overrides.items():
+        setattr(client._settings, k, v)
+    return client
+
+
+class TestAwsSigV4Headers:
+    _NOW = datetime.datetime(2026, 1, 2, 3, 4, 5, tzinfo=datetime.timezone.utc)
+
+    def _sign(self, payload=b'{"a":1}', token="", now=None):
+        return llm_client._aws_sigv4_headers(
+            "POST",
+            "https://bedrock-runtime.us-east-1.amazonaws.com/model/anthropic.claude-opus-5-5/invoke",
+            "us-east-1",
+            "bedrock",
+            "AKIDEXAMPLE",
+            "SECRETKEY",
+            token,
+            payload,
+            {"Content-Type": "application/json"},
+            now=now or self._NOW,
+        )
+
+    def test_authorization_structure(self):
+        h = self._sign()
+        assert h["Authorization"].startswith("AWS4-HMAC-SHA256 ")
+        assert (
+            "Credential=AKIDEXAMPLE/20260102/us-east-1/bedrock/aws4_request" in h["Authorization"]
+        )
+        # host, content-type and x-amz-date are signed (sorted order)
+        assert "SignedHeaders=content-type;host;x-amz-date" in h["Authorization"]
+        assert h["X-Amz-Date"] == "20260102T030405Z"
+        assert h["Host"] == "bedrock-runtime.us-east-1.amazonaws.com"
+        assert "Signature=" in h["Authorization"]
+
+    def test_signing_is_deterministic(self):
+        assert self._sign()["Authorization"] == self._sign()["Authorization"]
+
+    def test_different_payload_changes_signature(self):
+        assert self._sign(b'{"a":1}')["Authorization"] != self._sign(b'{"a":2}')["Authorization"]
+
+    def test_session_token_signed_and_sent(self):
+        h = self._sign(token="SESSION123")
+        assert h["X-Amz-Security-Token"] == "SESSION123"
+        assert "x-amz-security-token" in h["Authorization"]
+
+
+class TestBedrockHeaders:
+    def test_base_url_from_region(self):
+        client = _make_bedrock_client(llm_aws_region="eu-west-1")
+        assert client._bedrock_base_url() == "https://bedrock-runtime.eu-west-1.amazonaws.com"
+
+    def test_base_url_defaults_region(self):
+        client = _make_bedrock_client(llm_aws_region="")
+        assert "us-east-1" in client._bedrock_base_url()
+
+    def test_bearer_when_no_aws_creds(self):
+        client = _make_bedrock_client(llm_api_key="bdrk-key")
+        headers = client._bedrock_headers("https://x/y", b"{}")
+        assert headers["Authorization"] == "Bearer bdrk-key"
+        assert "X-Amz-Date" not in headers
+
+    def test_sigv4_when_aws_creds_present(self):
+        client = _make_bedrock_client(
+            llm_api_key="ignored-when-sigv4",
+            llm_aws_access_key_id="AKID",
+            llm_aws_secret_access_key="SECRET",
+        )
+        url = (
+            "https://bedrock-runtime.us-east-1.amazonaws.com/model/anthropic.claude-opus-5-5/invoke"
+        )
+        headers = client._bedrock_headers(url, b"{}")
+        assert headers["Authorization"].startswith("AWS4-HMAC-SHA256 ")
+        assert "X-Amz-Date" in headers
+
+    def test_no_auth_header_when_nothing_configured(self):
+        client = _make_bedrock_client()
+        headers = client._bedrock_headers("https://x/y", b"{}")
+        assert "Authorization" not in headers
+
+
+class TestBedrockDispatch:
+    def test_non_streaming_routes_to_call_bedrock(self):
+        client = _make_bedrock_client()
+        with patch.object(
+            client, "_call_bedrock", return_value={"finish_reason": "stop", "message": {}}
+        ) as m:
+            client._call_llm("system", [])
+        m.assert_called_once()
+
+    def test_streaming_routes_to_stream_bedrock(self):
+        client = _make_bedrock_client()
+        with patch.object(
+            client, "_stream_bedrock", return_value={"finish_reason": "stop", "message": {}}
+        ) as m:
+            client._call_llm("system", [], on_stream_event=lambda e: None)
+        m.assert_called_once()
+
+    def test_call_bedrock_posts_to_native_invoke_endpoint(self):
+        # Model id with a ':' must be percent-encoded in the URL path.
+        client = _make_bedrock_client(
+            llm_api_key="bdrk-key",
+            llm_model="anthropic.claude-3-5-sonnet-20241022-v2:0",
+        )
+        captured = {}
+
+        def fake_post(url, headers, body, timeout):
+            captured["url"] = url
+            captured["headers"] = headers
+            captured["body"] = json.loads(body)
+            # Bedrock returns the Anthropic Messages response shape.
+            return 200, json.dumps(
+                {"content": [{"type": "text", "text": "hi there"}], "stop_reason": "end_turn"}
+            )
+
+        with patch.object(llm_client, "_https_post_json", side_effect=fake_post):
+            out = client._call_bedrock("sys", [])
+
+        assert captured["url"] == (
+            "https://bedrock-runtime.us-east-1.amazonaws.com"
+            "/model/anthropic.claude-3-5-sonnet-20241022-v2%3A0/invoke"
+        )
+        # Anthropic-style body: anthropic_version present, no top-level model.
+        assert captured["body"]["anthropic_version"] == "bedrock-2023-05-31"
+        assert "model" not in captured["body"]
+        assert captured["headers"]["Authorization"] == "Bearer bdrk-key"
+        assert out["finish_reason"] == "stop"
+        assert out["message"]["content"] == "hi there"
+
+    def test_stream_bedrock_replays_result_through_callback(self):
+        client = _make_bedrock_client(llm_api_key="bdrk-key")
+        events = []
+        with patch.object(
+            client,
+            "_call_bedrock",
+            return_value={"finish_reason": "stop", "message": {"content": "hello world"}},
+        ):
+            out = client._stream_bedrock("sys", [], events.append)
+        types = [e["type"] for e in events]
+        assert types == ["text_start", "text_chunk", "text_end"]
+        assert events[1]["content"] == "hello world"
+        assert out["finish_reason"] == "stop"
