@@ -1558,24 +1558,51 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
                         # chain tangent fillet rounds the joint in place.
                         end_pt = wpt
                         if "tol_mm" in spec and float(spec["tol_mm"]) > 0.0:
-                            soft = _waypoint_soft_end(
-                                wpt,
-                                tol_mm=float(spec["tol_mm"]),
-                                obstacles=_layer_engine_obstacles(
-                                    model,
-                                    data,
-                                    req,
-                                    start_layer,
-                                    end_layer,
-                                    pending_layer,
-                                    pad_a_xy,
-                                    pad_b_xy,
-                                ),
-                                track_width=width,
-                                clearance=clearance,
+                            wpt_obstacles = _layer_engine_obstacles(
+                                model,
+                                data,
+                                req,
+                                start_layer,
+                                end_layer,
+                                pending_layer,
+                                pad_a_xy,
+                                pad_b_xy,
                             )
-                            if soft is not None:
-                                end_pt = soft
+                            # Soft-anchor drift is a rounded-corner-mode
+                            # feature: it frees the per-leg fillet arcs
+                            # from the waypoint joint so the corner can
+                            # round.  In the mitered modes the drift has
+                            # no benefit and is visibly harmful: the leg
+                            # endpoint leaves the exact waypoint (and the
+                            # pad axis), and the walkaround bridges the
+                            # offset with a sub-width 45° tap-in (a
+                            # "spike" z-step) that the post-miter keeps
+                            # because its diagonal ≥ width.  Keep the
+                            # exact anchor while it is DRC-clean; fall
+                            # back to the drift only when the waypoint
+                            # itself is blocked (tolerance still honored,
+                            # route still succeeds).
+                            need_drift = corner_mode in (
+                                CornerMode.ROUNDED_45,
+                                CornerMode.ROUNDED_90,
+                            )
+                            if not need_drift:
+                                margin = clearance + width / 2.0
+                                wpt_pt = Point(wpt)
+                                need_drift = not all(
+                                    float(o.shape.distance(wpt_pt)) >= margin - 1e-9
+                                    for o in wpt_obstacles
+                                )
+                            if need_drift:
+                                soft = _waypoint_soft_end(
+                                    wpt,
+                                    tol_mm=float(spec["tol_mm"]),
+                                    obstacles=wpt_obstacles,
+                                    track_width=width,
+                                    clearance=clearance,
+                                )
+                                if soft is not None:
+                                    end_pt = soft
                         try:
                             run_leg(pending_pos, end_pt, pending_layer, li=li, n_legs=n_legs)
                         except RouteFailure:

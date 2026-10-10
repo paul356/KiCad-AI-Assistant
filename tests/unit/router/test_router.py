@@ -2253,6 +2253,42 @@ def test_waypoints_pad_kind_rejected(tmp_path: Path) -> None:
         )
 
 
+def test_waypoints_mitered45_keeps_exact_anchor_no_spike(tmp_path: Path) -> None:
+    """A soft waypoint (tol_mm>0) on the corner axis must NOT drift the
+    leg endpoint off the axis under mitered45: the walkaround would
+    bridge the offset with a sub-width 45° tap-in (a "spike" z-step),
+    exactly the U11 p4 artifact on the matrix-bit-card board.  The
+    exact anchor is kept while DRC-clean, so every emitted segment is a
+    full 0/45/90-family run (≥ width here: pads 9.5mm apart)."""
+    result = _route_clear(
+        {
+            "algorithm": "pns",
+            "corner_mode": "mitered45",
+            # Clear-board pads: R1/1 at (29.5, 30.0), C1/1 at (60.0, 39.5).
+            # (29.5, 39.5) is the L-corner: same x as the start pad (a
+            # vertical lead-out) and same y as the end pad (horizontal
+            # run) — the geometry that previously produced the spike.
+            "waypoints": [{"kind": "waypoint", "pos": (29.5, 39.5), "tol_mm": 1.0}],
+        },
+        tmp_path,
+    )
+    assert result.waypoint_violated is False
+    assert result.via_sites == []
+    segs = result.segments
+    assert len(segs) >= 2
+    for s in segs:
+        dx = abs(s.x2 - s.x1)
+        dy = abs(s.y2 - s.y1)
+        length = math.hypot(dx, dy)
+        assert length >= 0.5, (
+            f"sub-width tap-in segment {length:.4f}mm: ({s.x1:.3f},{s.y1:.3f})->({s.x2:.3f},{s.y2:.3f})"
+        )
+        # Every run must stay in the 0/45/90 family (no arbitrary-angle stub).
+        assert dx < 1e-6 or dy < 1e-6 or abs(dx - dy) < 1e-6, (
+            f"non-45°-family segment ({dx:.4f},{dy:.4f})"
+        )
+
+
 def test_waypoints_require_pns_algorithm(tmp_path: Path) -> None:
     """The A* planner must reject waypoints loudly instead of ignoring them."""
     with pytest.raises(RouteFailure, match="only supported with algorithm"):
