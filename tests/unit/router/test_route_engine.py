@@ -339,6 +339,33 @@ class TestRouteEngine:
         assert shrink.covers(LineString(res.path))
         assert res.path[0] == (2, 5) and res.path[-1] == (18, 5)
 
+    def test_lane_output_is_always_family(self):
+        """Regression: the parallel-lane exploration used to emit stubs
+        along the DIRECT line's normal — an arbitrary angle when the
+        endpoints are off-axis (matrix board U11/p1 -> J1/2 on B.Cu:
+        the lane emitted 7.56/97.54-degree segments).  The lane must
+        decompose the end-to-end displacement onto the 0/45/90 family
+        axes instead, so every non-skeleton route stays on the family.
+        """
+        import math
+
+        # Off-axis direct line (21.8 deg against horizontal) with a pad
+        # column off to the side: the lane is the chosen exploration.
+        pad = Obstacle(
+            shape=Polygon([(5.0, -2.0), (7.0, -2.0), (7.0, 4.0), (5.0, 4.0)]),
+            layers=frozenset({"F.Cu"}),
+            net=None,
+            kind="pad",
+        )
+        res = route_engine((-8, 0), (12, 8), [pad], W, CLR)
+        assert res.path[0] == (-8, 0) and res.path[-1] == (12, 8)
+        for (x1, y1), (x2, y2) in zip(res.path, res.path[1:]):
+            ang = abs(math.degrees(math.atan2(y2 - y1, x2 - x1)))
+            # distance to the nearest family direction (0/45/90/135 mod 180)
+            rem = ang % 45.0
+            d = min(rem, 45.0 - rem)
+            assert d < 1e-6, f"segment ({x1},{y1})->({x2},{y2}) at {ang:.2f} deg"
+
     def test_corner_mode_affects_skeleton(self):
         from kcaa.router.pns.direction45 import CornerMode
 

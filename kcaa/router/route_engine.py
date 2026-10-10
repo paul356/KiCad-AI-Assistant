@@ -1150,29 +1150,33 @@ def _try_parallel_lane(
     When the direct line brushes a row of solids (a THT pad column, a
     keepout strip), per-obstacle walkaround snakes through the row even
     when a parallel lane a few tenths of a millimetre off to the side is
-    completely clear.  Prefer that lane: shift the whole line by the
-    smallest worked offset along its normal and emit
-    ``[start, start+off, end+off, end]`` — a straight hug instead of a
-    zig-zag.
+    completely clear.  Prefer that lane: shift the whole line along the
+    family axes and emit ``[start, s2, e2, end]`` — a straight hug
+    instead of a zig-zag.
 
-    Returns the shortest clean lane (smallest ``|off|``) or ``None``
-    when no tested offset keeps ``clearance`` edge-to-edge from every
-    obstacle.  Offsets are tried from ``step`` outward in both normal
-    directions, so the chosen lane hugs the requested line as closely as
-    possible.
+    The lane ALWAYS consists of 0/45/90-family segments: the end-to-end
+    displacement is decomposed onto one family direction ``u`` and its
+    perpendicular family normal ``v`` (``end - start = u*a + v*b``).
+    The candidate is ``[start, start+v*b1, start+v*b1+u*a, end]`` — the
+    two stubs run on ``v``, the main run on ``u`` — so every emitted
+    angle is a family angle no matter how oblique the direct line is
+    (a normal-offset lane of an arbitrary-angle line would emit
+    arbitrary-angle stubs, breaking the mitered45 output contract).
+
+    Returns the shortest clean lane (smallest ``|b1|``) or ``None`` when
+    no tested offset in any family orientation keeps ``clearance``
+    edge-to-edge from every obstacle.
     """
     dx = end[0] - start[0]
     dy = end[1] - start[1]
     length = math.hypot(dx, dy)
     if length < 1e-9:
         return None
-    ux, uy = dx / length, dy / length
-    nx, ny = -uy, ux  # unit normal to the direct line
     margin = clearance + track_width / 2.0
 
     # Whole-line clearance check: every segment of the candidate three-
-    # segment polyline ([start, s2] normal stub, [s2, e2] parallel lane,
-    # [e2, end] normal stub) must keep the margin from all solids.
+    # segment polyline ([start, s2] v-stub, [s2, e2] u-run, [e2, end]
+    # v-stub) must keep the margin from all solids.
     def _lane_clear(s2: tuple[float, float], e2: tuple[float, float]) -> bool:
         lane = LineString([start, s2, e2, end])
         for o in node.obstacles():
@@ -1184,17 +1188,28 @@ def _try_parallel_lane(
 
     hops = int(math.ceil(max_offset / step))
     best: list[tuple[float, float]] | None = None
-    best_mag = math.inf
-    for i in range(1, hops + 1):
-        for sign in (1.0, -1.0):
-            off = sign * i * step
-            s2 = (start[0] + nx * off, start[1] + ny * off)
-            e2 = (end[0] + nx * off, end[1] + ny * off)
+    best_key = math.inf  # total polyline length (stubs + main run)
+    for th in (0.0, math.pi / 4.0, math.pi / 2.0, 3.0 * math.pi / 4.0):
+        ux, uy = math.cos(th), math.sin(th)
+        a = dx * ux + dy * uy
+        if abs(a) < 1e-9:
+            continue  # no projection on this axis: lane degenerates
+        vx, vy = -uy, ux  # perpendicular family normal
+        b = dx * vx + dy * vy
+        for i in range(-hops, hops + 1):
+            off = i * step
+            s2 = (start[0] + vx * off, start[1] + vy * off)
+            e2 = (s2[0] + ux * a, s2[1] + uy * a)
             if not _lane_clear(s2, e2):
                 continue
-            mag = abs(off)
-            if mag < best_mag:
-                best_mag = mag
+            # Cost = the whole lane (both v-stubs + the u-run): among
+            # clean candidates the shortest path wins, so a diagonal
+            # family axis is only chosen when it is genuinely shorter
+            # than the axial one, not merely because its stub pair is
+            # smaller.
+            length = abs(off) + abs(a) + abs(b - off)
+            if length < best_key:
+                best_key = length
                 best = [start, s2, e2, end]
     return best
 
