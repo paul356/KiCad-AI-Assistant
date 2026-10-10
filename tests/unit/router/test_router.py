@@ -70,7 +70,6 @@ def test_project_file_for_missing_returns_none(tmp_path: Path) -> None:
 
 import os  # noqa: E402
 import shutil  # noqa: E402
-import tempfile  # noqa: E402
 
 _FIXTURE_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "integration", "fixtures")
 _BOARD_FIXTURE = os.path.normpath(os.path.join(_FIXTURE_DIR, "test_routing_board.kicad_pcb"))
@@ -2238,10 +2237,9 @@ def test_waypoints_failure_renders_png_evidence(tmp_path: Path) -> None:
         )
     msg = str(excinfo.value)
     assert "no DRC-clean via spot" in msg
-    assert "Failure evidence: " in msg
-    png_path = msg.split("Failure evidence: ")[1].strip()
-    assert Path(png_path).exists()
-    assert png_path.endswith(".png")
+    # No temp-file path in the message: failure evidence is an image
+    # content block at the tool layer (P2-1).
+    assert "Failure evidence" not in msg
 
 
 def test_waypoints_pad_kind_rejected(tmp_path: Path) -> None:
@@ -3039,14 +3037,20 @@ def test_pns_parallel_lane_preferred_over_snake_detour(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 def _make_clear_board_with_track(tmp_path: Path) -> str:
     """Single-layer clear board plus one foreign-net GND track crossing the
-    direct pad-to-pad line, so walkaround and shove diverge."""
+    direct pad-to-pad line, so walkaround and shove diverge.
+
+    The track is a 45-degree-family segment: P1-1 forbids writing
+    arbitrary-angle copper, and a shove of an off-family track could
+    never snap back onto the family — it would be promoted instead of
+    shoved.  A family-angle track is the fixture that actually exercises
+    the shove write path."""
     pcb_path = Path(_make_clear_board(tmp_path))
     text = pcb_path.read_text()
     text = text.replace('\t(net 1 "VCC")\n', '\t(net 1 "VCC")\n\t(net 2 "GND")\n')
     text = (
         text.rstrip()[:-1]
         + (
-            "\n\t(segment (start 40.0 25.0) (end 55.0 45.0) "
+            "\n\t(segment (start 40.0 25.0) (end 55.0 40.0) "
             '(width 0.25) (layer "F.Cu") (net 2 "GND"))\n'
         )
         + ")\n"
@@ -3144,7 +3148,7 @@ def test_shove_moved_pairs_report_original_and_displaced(tmp_path: Path) -> None
     orig, displaced = result.moved_pairs[0]
     # Original endpoints == the crossing fixture's GND segment.
     assert orig.start == pytest.approx((40.0, 25.0), abs=1e-6)
-    assert orig.end == pytest.approx((55.0, 45.0), abs=1e-6)
+    assert orig.end == pytest.approx((55.0, 40.0), abs=1e-6)
     assert orig.width == pytest.approx(0.25)
     assert orig.layer == "F.Cu"
     assert orig.net == "GND"
@@ -3213,20 +3217,22 @@ def test_strategy_invalid_value_rejected(tmp_path: Path) -> None:
 
 
 def test_single_route_renders_route_png(tmp_path: Path) -> None:
-    """A successful single PNS route always carries a best-effort
-    ``route_png`` of the routed track (the VLM feedback image)."""
+    """A successful single PNS route always carries the best-effort
+    ``route_png`` bytes of the routed track (in memory, no temp file —
+    the VLM feedback image rides the image content block)."""
     result = _route_strategy(tmp_path)
     assert result.route_png
-    assert result.route_png.startswith(os.path.join(tempfile.gettempdir(), "kcaa_route_"))
-    assert os.path.exists(result.route_png)
-    assert os.path.getsize(result.route_png) > 0
+    assert isinstance(result.route_png, bytes)
+    assert result.route_png[:8] == b"\x89PNG\r\n\x1a\n"
+    assert len(result.route_png) > 0
 
 
 def test_astar_success_renders_route_png(tmp_path: Path) -> None:
-    """A* success carries the same single-route render."""
+    """A* success carries the same single-route render bytes."""
     result = _route_clear({"algorithm": "astar", "corner_mode": "mitered45"}, tmp_path)
     assert result.route_png
-    assert os.path.exists(result.route_png)
+    assert isinstance(result.route_png, bytes)
+    assert result.route_png[:8] == b"\x89PNG\r\n\x1a\n"
 
 
 def test_astar_success_rounds_nothing_but_renders(tmp_path: Path) -> None:
@@ -3238,7 +3244,8 @@ def test_astar_success_rounds_nothing_but_renders(tmp_path: Path) -> None:
     )
     assert result.strategy == "walkaround"
     assert result.route_png
-    assert os.path.exists(result.route_png)
+    assert isinstance(result.route_png, bytes)
+    assert result.route_png[:8] == b"\x89PNG\r\n\x1a\n"
 
 
 def _make_blocked_single_layer_board(tmp_path: Path) -> str:
@@ -3289,10 +3296,9 @@ def test_astar_single_layer_blocked_renders_evidence(tmp_path: Path) -> None:
         )
     msg = str(excinfo.value)
     assert "No obstacle-avoiding path from" in msg
-    assert "Failure evidence: " in msg
-    png = msg.split("Failure evidence: ", 1)[1].strip()
-    assert png.startswith(os.path.join(tempfile.gettempdir(), "kcaa_route_failure_"))
-    assert os.path.exists(png)
+    # Failure evidence is an image content block at the tool layer; the
+    # router error message must NOT leak a temp-file path (P2-1).
+    assert "Failure evidence" not in msg
 
 
 @pytest.mark.skip(

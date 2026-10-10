@@ -198,6 +198,23 @@ async def _place_one_footprint(
             and _sym(child[0]) == "pad"
         ]
         pad_nets_by_num = {str(pad_no): net_name for pad_no, net_name in nets.items()}
+        # A net name must be a string.  A model JSON slip (numeric value
+        # for "net") would otherwise serialize an orphan ``(net N 12)``
+        # node with no name — a malformed declaration KiCad rejects —
+        # plus the pad's ``(net 3 12)`` reference.  Reject the item with
+        # a clear error before any write.
+        bad_nets: list[str] = [
+            str(pad_no)
+            for pad_no, net_name in pad_nets_by_num.items()
+            if not isinstance(net_name, str | type(None))
+        ]
+        if bad_nets:
+            return {
+                "error": (
+                    f"net name must be a string (pad(s) {', '.join(bad_nets)} got "
+                    f"a non-string value)"
+                )
+            }
         missing = [p for p in pad_numbers if p not in pad_nets_by_num]
         if missing:
             return {
@@ -1544,24 +1561,41 @@ def _find_footprint_mod_path(
     )
 
 
-def _resolve_board_net(data: list[Any], name: str | None) -> tuple[int, str]:
+def _resolve_board_net(data: list[Any], name: str | None) -> tuple[int | None, str]:
     """Return ``(net_number, net_name)`` to assign to a new footprint's pads.
 
     With a *name*: the number of the matching ``(net N "name")`` node, or the
     name is auto-added with number max+1 (1 when the board has no nets).
     With ``None``: ``(0, "")`` — KiCad net 0, unconnected — appending a
     ``(net 0 "")`` node when the board does not have one.
+
+    Name-match comes first — boards written by KiCad 10 may hold numberless
+    ``(net "GND")`` nodes (id elided) and ``int()`` on such a node raises
+    ValueError, so the id is parsed leniently.  An existing net whose *name*
+    matches is returned (never duplicated), with ``net_number=None`` for a
+    numberless match — the caller then writes a pad reference in the same
+    numberless form the board already uses.  A fresh name always appends its
+    own numbered declaration.
     """
-    nets: list[tuple[int, str]] = []
+    nets: list[tuple[int | None, str]] = []
     for item in data:
-        if not (isinstance(item, list) and len(item) >= 3):
+        if not (isinstance(item, list) and len(item) >= 2):
             continue
         if not (isinstance(item[0], sexpdata.Symbol) and _sym(item[0]) == "net"):
             continue
-        try:
-            nets.append((int(item[1]), _sym(item[2])))
-        except (TypeError, ValueError):
+        net_name: str | None = None
+        for v in item[1:]:
+            if isinstance(v, str):
+                net_name = v
+        if net_name is None:
             continue
+        raw_id = item[1]
+        net_no: int | None = None
+        if isinstance(raw_id, int):
+            net_no = raw_id
+        elif isinstance(raw_id, str) and raw_id.lstrip("-").isdigit():
+            net_no = int(raw_id)
+        nets.append((net_no, net_name))
 
     if name is None:
         if not any(no == 0 for no, _ in nets):
@@ -1570,24 +1604,27 @@ def _resolve_board_net(data: list[Any], name: str | None) -> tuple[int, str]:
     for net_no, net_name in nets:
         if net_name == name:
             return net_no, name
-    next_no = max((net_no for net_no, _ in nets), default=0) + 1
+    next_no = max((net_no for net_no, _ in nets if net_no is not None), default=0) + 1
     data.append([sexpdata.Symbol("net"), next_no, name])
     return next_no, name
 
 
 def _apply_nets_to_pads(
     fp_node: list[Any],
-    pad_nets: dict[str, tuple[int, str]],
-    default_net: tuple[int, str],
+    pad_nets: dict[str, tuple[int | None, str]],
+    default_net: tuple[int | None, str],
 ) -> tuple[int, list[dict[str, str]]]:
     """Assign per-pad ``(net ...)`` nodes to *fp_node* in place.
 
     Pads whose number is a key of *pad_nets* get that pad's
     ``(net_no, net_name)``; every other pad gets *default_net* — the
     per-pad fallback of the ``add_footprints_to_pcb`` netting.  Replaces
-    pre-existing net sub-nodes.  Returns ``(pad_count, pad_net_list)`` where
-    *pad_net_list* maps each pad number (in pad order) to its assigned net
-    name (``""`` for net 0).
+    pre-existing net sub-nodes.  A ``net_no`` of ``None`` writes the
+    numberless KiCad 10 form ``(net "GND")`` (the board's own net
+    declaration carries no id, so the pad reference mirrors it).
+
+    Returns ``(pad_count, pad_net_list)`` where *pad_net_list* maps each
+    pad number (in pad order) to its assigned net name (``""`` for net 0).
     """
     count = 0
     pad_net_list: list[dict[str, str]] = []
@@ -1598,7 +1635,10 @@ def _apply_nets_to_pads(
             continue
         pad_no = _sym(child[1]) if len(child) > 1 else ""
         net_no, net_name = pad_nets.get(pad_no, default_net)
-        net_node = [sexpdata.Symbol("net"), net_no, net_name]
+        if net_no is None:
+            net_node = [sexpdata.Symbol("net"), net_name]
+        else:
+            net_node = [sexpdata.Symbol("net"), net_no, net_name]
         for i, sub in enumerate(child):
             if isinstance(sub, list) and len(sub) >= 1 and _sym(sub[0]) == "net":
                 child[i] = net_node

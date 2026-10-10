@@ -82,6 +82,107 @@ class _MockMCP:
         return decorator
 
 
+class TestSegmentFields:
+    """P2-3: ``_segment_fields`` must tolerate malformed numeric fields on a
+    hand-edited board — a bad coordinate returns None (node skipped) instead
+    of raising through the delete/route write paths."""
+
+    def _node(self, *children):
+        import sexpdata
+
+        return [sexpdata.Symbol("segment"), *children]
+
+    def _seg(self, start=(0.0, 0.0), end=(1.0, 1.0), width=0.2, layer="F.Cu", net=None):
+        import sexpdata
+
+        parts = [
+            [sexpdata.Symbol("start"), start[0], start[1]],
+            [sexpdata.Symbol("end"), end[0], end[1]],
+            [sexpdata.Symbol("width"), width],
+            [sexpdata.Symbol("layer"), layer],
+        ]
+        if net is not None:
+            parts.append(
+                [sexpdata.Symbol("net"), net[0], net[1]]
+                if len(net) == 2
+                else [sexpdata.Symbol("net"), net[0]]
+            )
+        return self._node(*parts)
+
+    def test_well_formed(self):
+        from kcaa.tools.pcb_routing_tools import _segment_fields
+
+        fields = _segment_fields(self._seg(net=(2, "GND")))
+        assert fields == {
+            "start": (0.0, 0.0),
+            "end": (1.0, 1.0),
+            "width": 0.2,
+            "layer": "F.Cu",
+            "net": "GND",
+        }
+
+    def test_kicad10_numberless_net(self):
+        from kcaa.tools.pcb_routing_tools import _segment_fields
+
+        fields = _segment_fields(self._seg(net=("GND",)))
+        assert fields["net"] == "GND"
+
+    def test_malformed_start_coordinate_returns_none(self):
+        from kcaa.tools.pcb_routing_tools import _segment_fields
+
+        node = self._seg()
+        node[1][1] = "not-a-number"
+        assert _segment_fields(node) is None
+
+    def test_malformed_end_coordinate_returns_none(self):
+        from kcaa.tools.pcb_routing_tools import _segment_fields
+
+        node = self._seg()
+        node[2][2] = None
+        assert _segment_fields(node) is None
+
+    def test_malformed_width_returns_none(self):
+        from kcaa.tools.pcb_routing_tools import _segment_fields
+
+        node = self._seg()
+        node[3][1] = "wide"
+        assert _segment_fields(node) is None
+
+    def test_missing_required_fields_returns_none(self):
+        from kcaa.tools.pcb_routing_tools import _segment_fields
+
+        assert _segment_fields(self._seg(width=None)) is None
+
+    def test_non_segment_node_returns_none(self):
+        import sexpdata
+
+        from kcaa.tools.pcb_routing_tools import _segment_fields
+
+        assert _segment_fields([sexpdata.Symbol("via")]) is None
+        assert _segment_fields("not-a-list") is None
+
+    def test_field_order_not_assumed(self):
+        import sexpdata
+
+        from kcaa.tools.pcb_routing_tools import _segment_fields
+
+        node = [
+            sexpdata.Symbol("segment"),
+            [sexpdata.Symbol("net"), 2, "GND"],
+            [sexpdata.Symbol("layer"), "F.Cu"],
+            [sexpdata.Symbol("width"), 0.5],
+            [sexpdata.Symbol("end"), 3.0, 4.0],
+            [sexpdata.Symbol("start"), 1.0, 2.0],
+        ]
+        assert _segment_fields(node) == {
+            "start": (1.0, 2.0),
+            "end": (3.0, 4.0),
+            "width": 0.5,
+            "layer": "F.Cu",
+            "net": "GND",
+        }
+
+
 def _get_tools() -> dict:
     from kcaa.tools.pcb_routing_tools import register_pcb_routing_tools
 
@@ -189,11 +290,17 @@ def routable_board(tmp_path):
 def crossing_board(tmp_path):
     """routable_board plus one foreign-net GND track crossing the direct
     pad-to-pad line — the shove-persistence fixture (the route between
-    R1.1 and C1.1 crosses it at (43.75, 30))."""
+    R1.1 and C1.1 crosses it at (43.75, 30)).
+
+    The track is a 45-degree-family segment: P1-1 forbids writing
+    arbitrary-angle copper, and a shove of an off-family track could
+    never snap back onto the family — it would be promoted instead of
+    shoved.  A family-angle track is the fixture that actually exercises
+    the shove write path."""
     dest = tmp_path / "crossing.kicad_pcb"
     text = _CLEAR_BOARD.replace('\t(net 1 "VCC")\n', '\t(net 1 "VCC")\n\t(net 2 "GND")\n')
     seg = (
-        '\t(segment (start 40.0 25.0) (end 55.0 45.0) (width 0.25) (layer "F.Cu") (net 2 "GND"))\n'
+        '\t(segment (start 40.0 25.0) (end 55.0 40.0) (width 0.25) (layer "F.Cu") (net 2 "GND"))\n'
     )
     text = text.rstrip()[:-1] + seg + ")"
     dest.write_text(text, encoding="utf-8")
@@ -492,12 +599,13 @@ class TestPcbRouteStrategy:
 
     def test_strategy_default_echoes_shove_with_route_png(self, tools, routable_board):
         """No options: strategy echoes "shove" and the response always
-        carries the single-route render path (field shape is
-        str/None; the render itself is smoke-checked below)."""
+        carries the ``route_png`` field (None — the render rides the
+        image content block, never a temp path; bytes smoke-checked
+        below)."""
         result = self._route(tools, routable_board)
         assert "error" not in result
         assert result["strategy"] == "shove"
-        assert "route_png" in result
+        assert result["route_png"] is None
 
 
 class TestAlgorithmDefaultByVision:
@@ -574,25 +682,60 @@ class TestAlgorithmDefaultByVision:
         assert result["strategy"] == "walkaround"
 
     def test_route_png_always_present_and_existing(self, tools, routable_board):
-        """The successful single route renders a real PNG (not just a
-        field): path points at an existing non-empty file."""
-        result = self._route(tools, routable_board)
-        assert "error" not in result
-        png = result["route_png"]
-        assert png, "best-effort render should produce a path on this fixture"
-        assert png.startswith(os.path.join(tempfile.gettempdir(), "kcaa_route_"))
-        assert os.path.exists(png)
-        assert os.path.getsize(png) > 0
+        """The successful single route renders real PNG bytes delivered
+        as the image content block (no temp file; nothing on disk)."""
+        from fastmcp.utilities.types import Image
+
+        raw = _run_raw(
+            tools["pcb_route_pad_to_pad"](
+                pcb_path=routable_board,
+                ref_a="R1",
+                pad_a="1",
+                ref_b="C1",
+                pad_b="1",
+                net="VCC",
+                ctx=None,
+                width=0.2,
+                algorithm="pns",
+            )
+        )
+        assert isinstance(raw, tuple) and len(raw) == 2
+        payload = json.loads(raw[0])
+        assert "error" not in payload
+        assert payload["route_png"] is None  # render rides the image block
+        image = raw[1]
+        assert isinstance(image, Image)
+        assert image.data[:8] == b"\x89PNG\r\n\x1a\n"
+        assert len(image.data) > 0
 
     def test_route_png_rendered_in_dry_run_too(self, tools, routable_board):
-        """dry_run skips only the PCB write; the render still fires (it
-        reads the board and writes only temp files)."""
+        """dry_run skips only the PCB write; the render still fires (in
+        memory, nothing written to disk)."""
+        from fastmcp.utilities.types import Image
+
         before = open(routable_board, "rb").read()
-        result = self._route(tools, routable_board, strategy="shove", dry_run=True)
-        assert "error" not in result
-        assert result["dry_run"] is True
-        png = result["route_png"]
-        assert png and os.path.exists(png)
+        raw = _run_raw(
+            tools["pcb_route_pad_to_pad"](
+                pcb_path=routable_board,
+                ref_a="R1",
+                pad_a="1",
+                ref_b="C1",
+                pad_b="1",
+                net="VCC",
+                ctx=None,
+                width=0.2,
+                algorithm="pns",
+                strategy="shove",
+                dry_run=True,
+            )
+        )
+        assert isinstance(raw, tuple) and len(raw) == 2
+        payload = json.loads(raw[0])
+        assert "error" not in payload
+        assert payload["dry_run"] is True
+        assert payload["route_png"] is None
+        assert isinstance(raw[1], Image)
+        assert raw[1].data[:8] == b"\x89PNG\r\n\x1a\n"
         assert open(routable_board, "rb").read() == before
 
     def test_success_returns_image_content_block(self, tools, routable_board):
@@ -622,8 +765,6 @@ class TestAlgorithmDefaultByVision:
         image = raw[1]
         assert isinstance(image, Image)
         assert image.data[:8] == b"\x89PNG\r\n\x1a\n"
-        if payload.get("route_png"):
-            os.remove(payload["route_png"])
 
     def test_success_omits_image_block_for_text_only_model(
         self, tools, routable_board, monkeypatch
@@ -649,8 +790,7 @@ class TestAlgorithmDefaultByVision:
         payload = json.loads(raw)
         assert "error" not in payload
         assert payload["strategy"] == "shove"
-        if payload.get("route_png"):
-            os.remove(payload["route_png"])
+        assert payload["route_png"] is None
 
     # -- Shove persistence -------------------------------------------------
 
@@ -764,9 +904,9 @@ class TestAlgorithmDefaultByVision:
             abs(s["start"][0] - 40.0) <= 1e-6
             and abs(s["start"][1] - 25.0) <= 1e-6
             and abs(s["end"][0] - 55.0) <= 1e-6
-            and abs(s["end"][1] - 45.0) <= 1e-6
+            and abs(s["end"][1] - 40.0) <= 1e-6
             for s in gnd
-        ), "original GND segment (40,25)->(55,45) must be removed"
+        ), "original GND segment (40,25)->(55,40) must be removed"
         # 2) width/layer/net preserved
         for s in gnd:
             assert s["width"] == pytest.approx(0.25)
@@ -811,8 +951,14 @@ class TestAlgorithmDefaultByVision:
             f"response: {chain}\nfile: {file_chain}"
         )
         # Coalescing must actually reduce the node count (the whole point
-        # of the collapse: ~50 dense vertices -> a handful of nodes).
-        assert len(nodes) < len(src) // 2, (
+        # of the collapse: a dense walkaround polyline -> a handful of
+        # nodes).  The square-capped family hull yields a displacement
+        # that is already sparse (one node per straight leg, ~len(src)-1
+        # for an N-corner chain), so the bound used to be len(src)//2
+        # only while round caps left arc samples to collapse.  The real
+        # regression this guards is the bitty write — one node per
+        # vertex pair — which is only excluded by strict reduction.
+        assert len(nodes) < len(src), (
             f"expected coalescing, got {len(nodes)} nodes for {len(src)} vertices"
         )
         # Chain must be head-to-tail continuous, matching the polyline.
@@ -851,7 +997,7 @@ class TestAlgorithmDefaultByVision:
         before = self._gnd_segments(crossing_board)
         assert len(before) == 1
         assert before[0]["start"] == (40.0, 25.0)
-        assert before[0]["end"] == (55.0, 45.0)
+        assert before[0]["end"] == (55.0, 40.0)
         result = self._route_vcc(tools, crossing_board, strategy="walkaround")
         assert "error" not in result
         assert result["shoved"] == []
@@ -869,12 +1015,15 @@ class TestAlgorithmDefaultByVision:
         assert open(crossing_board, "rb").read() == before
         gnd = self._gnd_segments(crossing_board)
         assert len(gnd) == 1
-        assert gnd[0]["start"] == (40.0, 25.0) and gnd[0]["end"] == (55.0, 45.0)
+        assert gnd[0]["start"] == (40.0, 25.0) and gnd[0]["end"] == (55.0, 40.0)
 
     def test_shove_failure_returns_error_with_evidence(self, tools, crossing_board, monkeypatch):
         """A shove-stage ShoveFailure must surface as
-        {"error": ..., "route_png": ...} — never the FastMCP
-        success:true + text-error wrapper (and evidence still renders)."""
+        {"error": ..., "route_png": null} — never the FastMCP
+        success:true + text-error wrapper (and evidence still renders
+        as the image block)."""
+        from fastmcp.utilities.types import Image
+
         from kcaa.router.pns.shove import ShoveFailure
         import kcaa.router.route_engine as re_mod
 
@@ -882,14 +1031,29 @@ class TestAlgorithmDefaultByVision:
             raise ShoveFailure("cannot shove track (10, 20) -> (30, 40)")
 
         monkeypatch.setattr(re_mod, "shove_path", _boom)
-        result = self._route_vcc(tools, crossing_board, strategy="shove", dry_run=True)
-        assert "error" in result
-        assert "success" not in result
-        assert "shove failed" in result["error"]
-        assert "cannot shove track" in result["error"]
-        png = result.get("route_png")
-        assert png is not None and os.path.isfile(png)
-        os.remove(png)
+        raw = _run_raw(
+            tools["pcb_route_pad_to_pad"](
+                pcb_path=crossing_board,
+                ref_a="R1",
+                pad_a="1",
+                ref_b="C1",
+                pad_b="1",
+                net="VCC",
+                width=0.2,
+                ctx=None,
+                strategy="shove",
+                dry_run=True,
+            )
+        )
+        assert isinstance(raw, tuple) and len(raw) == 2
+        payload = json.loads(raw[0])
+        assert "error" in payload
+        assert "success" not in payload
+        assert "shove failed" in payload["error"]
+        assert "cannot shove track" in payload["error"]
+        assert payload.get("route_png") is None
+        assert isinstance(raw[1], Image)
+        assert raw[1].data[:8] == b"\x89PNG\r\n\x1a\n"
 
 
 # ── Shove write path (defense in depth) ────────────────────────────────
@@ -956,31 +1120,6 @@ def test_apply_shoved_tracks_collapses_repeated_original() -> None:
 
 class TestPcbRouteFailureEvidence:
     def test_route_failure_returns_error_and_png(self, tools, board_with_tracks):
-        result = _run(
-            tools["pcb_route_pad_to_pad"](
-                pcb_path=board_with_tracks,
-                ref_a="R1",
-                pad_a="1",
-                ref_b="C99",
-                pad_b="1",
-                net="VCC",
-                width=0.25,
-                ctx=None,
-            )
-        )
-        assert "error" in result
-        png = result.get("route_png")
-        assert png is not None
-        assert os.path.isfile(png)
-        assert png.startswith(os.path.join(tempfile.gettempdir(), "kcaa_route_"))
-        with open(png, "rb") as f:
-            assert f.read(8) == b"\x89PNG\r\n\x1a\n"
-        os.remove(png)
-
-    def test_failure_returns_image_content_block(self, tools, board_with_tracks):
-        """The failure envelope also carries the evidence PNG as an image
-        content block (the VLM must SEE the failed endpoints, not just a
-        temp path)."""
         from fastmcp.utilities.types import Image
 
         raw = _run_raw(
@@ -998,21 +1137,43 @@ class TestPcbRouteFailureEvidence:
         assert isinstance(raw, tuple) and len(raw) == 2
         payload = json.loads(raw[0])
         assert "error" in payload
-        assert payload["route_png"] is not None
+        assert payload.get("route_png") is None
+        assert isinstance(raw[1], Image)
+        assert raw[1].data[:8] == b"\x89PNG\r\n\x1a\n"
+
+    def test_failure_returns_image_content_block(self, tools, board_with_tracks):
+        """The failure envelope also carries the evidence PNG as an image
+        content block (the VLM must SEE the failed endpoints — there is
+        no temp-file path in the payload)."""
+        from fastmcp.utilities.types import Image
+
+        raw = _run_raw(
+            tools["pcb_route_pad_to_pad"](
+                pcb_path=board_with_tracks,
+                ref_a="R1",
+                pad_a="1",
+                ref_b="C99",
+                pad_b="1",
+                net="VCC",
+                width=0.25,
+                ctx=None,
+            )
+        )
+        assert isinstance(raw, tuple) and len(raw) == 2
+        payload = json.loads(raw[0])
+        assert "error" in payload
+        assert payload["route_png"] is None
         image = raw[1]
         assert isinstance(image, Image)
         assert image.data[:8] == b"\x89PNG\r\n\x1a\n"
-        os.remove(payload["route_png"])
 
-    def test_failure_render_silent_when_render_unavailable(
-        self, tools, board_with_tracks, monkeypatch
-    ):
-        import kcaa.tools.pcb_routing_tools as prt
+    def test_failure_no_temp_file_left_behind(self, tools, board_with_tracks, monkeypatch):
+        """Failed routes write no PNG to the shared temp dir — the render
+        rides the image content block in memory.  A persistent server
+        must not accumulate world-readable board-layout files."""
+        import glob
 
-        def _boom(*_args, **_kwargs):
-            raise RuntimeError("no display")
-
-        monkeypatch.setattr(prt, "render_route_attempt", _boom)
+        before = set(glob.glob(os.path.join(tempfile.gettempdir(), "kcaa_route_*")))
         result = _run(
             tools["pcb_route_pad_to_pad"](
                 pcb_path=board_with_tracks,
@@ -1026,7 +1187,64 @@ class TestPcbRouteFailureEvidence:
             )
         )
         assert "error" in result
-        assert result["route_png"] is None
+        after = set(glob.glob(os.path.join(tempfile.gettempdir(), "kcaa_route_*")))
+        assert after == before
+
+    def test_failure_render_silent_when_render_unavailable(
+        self, tools, board_with_tracks, monkeypatch
+    ):
+        import kcaa.tools.pcb_routing_tools as prt
+
+        def _boom(*_args, **_kwargs):
+            raise RuntimeError("no display")
+
+        monkeypatch.setattr(prt, "render_route_attempt", _boom)
+        raw = _run_raw(
+            tools["pcb_route_pad_to_pad"](
+                pcb_path=board_with_tracks,
+                ref_a="R1",
+                pad_a="1",
+                ref_b="C99",
+                pad_b="1",
+                net="VCC",
+                width=0.25,
+                ctx=None,
+            )
+        )
+        assert isinstance(raw, str)
+        payload = json.loads(raw)
+        assert "error" in payload
+        assert payload["route_png"] is None
+
+    def test_failure_render_skipped_for_text_only_model(
+        self, tools, board_with_tracks, monkeypatch
+    ):
+        """Text-only models skip failure-evidence rendering entirely:
+        no render cost, no image block."""
+        monkeypatch.setenv("KICAD_MCP_SUPPORTS_VISION", "0")
+        import kcaa.tools.pcb_routing_tools as prt
+
+        called = {"n": 0}
+
+        def _counter(*_args, **_kwargs):
+            called["n"] += 1
+            raise RuntimeError("no display")
+
+        monkeypatch.setattr(prt, "render_route_attempt", _counter)
+        raw = _run_raw(
+            tools["pcb_route_pad_to_pad"](
+                pcb_path=board_with_tracks,
+                ref_a="R1",
+                pad_a="1",
+                ref_b="C99",
+                pad_b="1",
+                net="VCC",
+                width=0.25,
+                ctx=None,
+            )
+        )
+        assert isinstance(raw, str)
+        assert called["n"] == 0
 
 
 class TestDisplacedSegmentsArcCollapse:

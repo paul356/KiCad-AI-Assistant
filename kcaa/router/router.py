@@ -59,8 +59,6 @@ import json
 import logging
 import math
 import os
-import tempfile
-import time
 
 from shapely.geometry import LineString, Point, Polygon
 from shapely.geometry import box as _shapely_box
@@ -249,8 +247,11 @@ class RouteResult:
             explicit via waypoint with ``{"pos": [x, y], "to_layer": ...}``
             (the DRC-clean site actually used, possibly micro-shifted).
         strategy: Echo of the requested strategy knob.
-        route_png: Path of a best-effort rendered image of the routed
-            track (single route; `None` if rendering failed).
+        route_png: PNG bytes of a best-effort rendered image of the
+            routed track (single route; `None` if rendering failed or
+            the model is text-only).  In memory only — the tool layer
+            attaches it as an image content block; no temp file is
+            written.
     """
 
     segments: list[OutputSegment] = field(default_factory=list)
@@ -266,7 +267,7 @@ class RouteResult:
     violated_waypoints: list[tuple[float, float]] = field(default_factory=list)
     via_sites: list[dict] = field(default_factory=list)
     strategy: str = "shove"  # echo of the requested strategy knob
-    route_png: str | None = None  # best-effort single-route render path
+    route_png: bytes | None = None  # best-effort single-route render bytes
     # (original, displaced) shove pairs: the pre-shove track as it exists
     # in the PCB file and the pushed replacement.  The tool layer deletes
     # the original file segment(s) and writes the displaced polyline.
@@ -665,15 +666,6 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
                     f"{width}mm track width ({start_layer} -> {end_layer})"
                     f"{_board_note}."
                 )
-                png = _render_route_failure_evidence(
-                    req.pcb_path,
-                    chain=[pad_a_xy],
-                    attempted_end=pad_b_xy,
-                    layer=start_layer,
-                    obstacles=obstacles_by_layer[start_layer],
-                )
-                if png:
-                    msg += f"\nFailure evidence: {png}"
                 raise RouteFailure(msg)
             print(
                 f"  [route] multi-layer A*: {len(ml_result.path)} pts"
@@ -804,15 +796,6 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
                     f"{req.ref_b}/{req.pad_b} at {width}mm track width on layer "
                     f"{start_layer}{_board_note}."
                 )
-                png = _render_route_failure_evidence(
-                    req.pcb_path,
-                    chain=[pad_a_xy],
-                    attempted_end=pad_b_xy,
-                    layer=start_layer,
-                    obstacles=layer_obstacles,
-                )
-                if png:
-                    msg += f"\nFailure evidence: {png}"
                 raise RouteFailure(msg)
             print(
                 f"  [route] single-layer A*: {len(result.path)} pts"
@@ -962,8 +945,6 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
             *,
             li: int,
             n_legs: int,
-            render_evidence: bool = False,
-            evidence_ctx: dict | None = None,
         ) -> None:
             """Route one PNS leg (walkaround + shove) and feed its nodes
             into the shared postprocess pipeline.  ``li``/``n_legs`` are
@@ -1044,16 +1025,6 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
                     f"{req.ref_b}/{req.pad_b} at {width}mm track width on layer "
                     f"{layer} (leg {li + 1}/{n_legs}): {exc}"
                 )
-                if render_evidence and evidence_ctx:
-                    png = _render_route_failure_evidence(
-                        req.pcb_path,
-                        chain=evidence_ctx["chain"],
-                        attempted_end=end_pt,
-                        layer=layer,
-                        obstacles=engine_obstacles,
-                    )
-                    if png:
-                        msg += f"\nFailure evidence: {png}"
                 raise RouteFailure(msg) from exc
             print(
                 f"  [route] PNS leg {li + 1}/{n_legs} on {layer}: "
@@ -1637,24 +1608,6 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
                             # No DRC-clean site: render the blocking copper
                             # around the request into the failure message.
                             msg = str(exc)
-                            png = _render_route_failure_evidence(
-                                req.pcb_path,
-                                chain=chain,
-                                attempted_end=site_req,
-                                layer=pending_layer,
-                                obstacles=_layer_engine_obstacles(
-                                    model,
-                                    data,
-                                    req,
-                                    start_layer,
-                                    end_layer,
-                                    pending_layer,
-                                    pad_a_xy,
-                                    pad_b_xy,
-                                ),
-                            )
-                            if png:
-                                msg += f"\nFailure evidence: {png}"
                             raise RouteFailure(msg) from exc
                         via_anchors.add(site)
                         # A via junction stays a straight-through connection
@@ -1669,8 +1622,6 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
                             pending_layer,
                             li=li,
                             n_legs=n_legs,
-                            render_evidence=True,
-                            evidence_ctx={"chain": list(chain)},
                         )
                         pending_pos = site
                         pending_layer = to_layer
@@ -1697,8 +1648,6 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
                     pending_layer,
                     li=len(req.waypoints),
                     n_legs=n_legs,
-                    render_evidence=True,
-                    evidence_ctx={"chain": list(chain)},
                 )
                 used_chain = list(chain)
                 finalize_legs()
@@ -3421,66 +3370,6 @@ def _pick_explicit_via_site(
     )
 
 
-def _render_route_failure_evidence(
-    pcb_path: str,
-    *,
-    chain: list[tuple[float, float]],
-    attempted_end: tuple[float, float],
-    layer: str,
-    obstacles: list[Obstacle],
-) -> str | None:
-    """Render the failed route attempt to a PNG next to the .kicad_pcb.
-
-    Best-effort: any rendering problem degrades to ``None`` so the
-    original :class:`RouteFailure` is never masked.  Blocking items are
-    the engine obstacles of the failed leg (red rings, all shapes at most
-    one per footprint/track), plus the attempted chain (blue) ending at
-    the goal of the failed leg.
-    """
-    try:
-        from kcaa.tools.render_route_state import BlockingEvidence, render_route_attempt
-
-        blockers: list[BlockingEvidence] = []
-        for ob in obstacles[:40]:
-            shape = ob.shape
-            if shape is None or shape.is_empty:
-                continue
-            if shape.geom_type == "Polygon":
-                pts = [(float(x), float(y)) for x, y in shape.exterior.coords]
-            elif shape.geom_type == "MultiPolygon":
-                biggest = max(shape.geoms, key=lambda g: g.area)
-                pts = [(float(x), float(y)) for x, y in biggest.exterior.coords]
-            else:
-                continue
-            kind = "via" if ob.kind == "via" else "footprint" if ob.kind == "pad" else "track"
-            blockers.append(
-                BlockingEvidence(
-                    ref=ob.ref or "obstacle",
-                    net=ob.net,
-                    layer=layer,
-                    point=pts[0],
-                    kind=kind,
-                    points=pts,
-                )
-            )
-        attempted_path = [*chain, attempted_end]
-        lines, png, _report = render_route_attempt(
-            pcb_path,
-            attempted_path=attempted_path,
-            blocking_items=blockers,
-            anchors=chain,
-        )
-        if not png:
-            return None
-        fname = f"kcaa_route_failure_{time.time_ns()}_{os.getpid()}.png"
-        out = os.path.join(tempfile.gettempdir(), fname)
-        with open(out, "wb") as fh:
-            fh.write(png)
-        return out
-    except Exception:  # evidence rendering must never mask the real error
-        return None
-
-
 def _route_polyline(
     segs: list[OutputSegment],
     arcs: list[OutputArc],
@@ -3517,13 +3406,21 @@ def _render_route_png(
     *,
     pts: list[tuple[float, float]],
     anchors: list[tuple[float, float]],
-) -> str | None:
+) -> bytes | None:
     """Best-effort single-route render for the VLM feedback loop.
 
     Renders the routed polyline on the board (grey track + green anchor
-    dots) and returns the PNG path; ``None`` when rendering fails —
+    dots) and returns the PNG bytes; ``None`` when rendering fails or
+    the calling model is text-only (``KICAD_MCP_SUPPORTS_VISION=0``) —
     success rendering must never mask the route result.
+
+    Bytes only, no temp file: the tool layer attaches them to the
+    result as an image content block and nothing lingers on disk.
     """
+    from kcaa.utils.config import model_supports_vision
+
+    if not model_supports_vision():
+        return None
     try:
         from kcaa.tools.render_route_state import render_route_attempt
 
@@ -3533,13 +3430,7 @@ def _render_route_png(
             blocking_items=[],
             anchors=anchors,
         )
-        if not png:
-            return None
-        fname = f"kcaa_route_{time.time_ns()}_{os.getpid()}.png"
-        out = os.path.join(tempfile.gettempdir(), fname)
-        with open(out, "wb") as fh:
-            fh.write(png)
-        return out
+        return png
     except Exception:  # rendering must never mask the route result
         return None
 

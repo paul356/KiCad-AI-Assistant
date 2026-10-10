@@ -22,7 +22,7 @@ from kcaa.utils.pcb_footprint_utils import (
     get_fp_property,
     iter_footprint_nodes,
 )
-from kcaa.utils.pcb_sexp_utils import load_pcb
+from kcaa.utils.pcb_sexp_utils import load_pcb, save_pcb
 
 FIXTURE_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "integration", "fixtures")
 BOARD_FIXTURE = os.path.join(FIXTURE_DIR, "test_routing_board.kicad_pcb")
@@ -401,6 +401,66 @@ class TestNets:
         # Nothing written: file bytes identical, no backup, no footprint.
         assert _board_bytes(board_with_table) == before
         assert not os.path.exists(board_with_table + ".bak")
+        data = load_pcb(board_with_table)
+        assert all(get_fp_property(n, "Reference") != "R9" for n in iter_footprint_nodes(data))
+
+    def test_numberless_board_net_matches_numberless_form(self, tools, tmp_path, lib_dir):
+        """KiCad 10 boards may declare ``(net "GND")`` without a numeric id.
+        Placing onto an existing numberless net must reuse it in the same
+        numberless form (``(net "GND")`` on the pad) instead of int()-ing
+        the id (ValueError before the fix) or inventing a numbered twin."""
+        board = tmp_path / "numberless.kicad_pcb"
+        shutil.copy(BOARD_FIXTURE, board)
+        (tmp_path / "fp-lib-table").write_text(FP_TABLE)
+        data = load_pcb(str(board))
+        for item in data:
+            if isinstance(item, list) and len(item) >= 2 and _sym(item[0]) == "net":
+                if isinstance(item[1], int):
+                    del item[1]
+        save_pcb(str(board), data)
+
+        res = _add_one(
+            tools,
+            str(board),
+            "R_0402_1005Metric",
+            "R9",
+            20.0,
+            20.0,
+            nets={"1": "GND", "2": ""},
+        )
+        assert "error" not in res, res
+        assert res["results"][0]["result"]["pads_net"] == [
+            {"pad": "1", "net": "GND"},
+            {"pad": "2", "net": ""},
+        ]
+        # The net declaration is not duplicated and stays numberless.
+        data = load_pcb(str(board))
+        net_nodes = [i for i in data if isinstance(i, list) and _sym(i[0]) == "net"]
+        gnd_decls = [n for n in net_nodes if len(n) >= 2 and _sym(n[-1]) == "GND"]
+        assert len(gnd_decls) == 1
+        assert not isinstance(gnd_decls[0][1], int)
+        pad1 = _pads(_fp_node(str(board), "R9"))[0]
+        net_node = next(c for c in pad1 if isinstance(c, list) and _sym(c[0]) == "net")
+        assert len(net_node) == 2 and _sym(net_node[1]) == "GND"
+
+    def test_numeric_net_value_rejected_no_write(self, tools, board_with_table):
+        """P2-2: a JSON slip with a numeric ``net`` value must fail the item
+        with a clear error before any write — it would otherwise serialize
+        an orphan ``(net N 12)`` declaration KiCad rejects."""
+        before = _board_bytes(board_with_table)
+        res = _add_one(
+            tools,
+            board_with_table,
+            "R_0402_1005Metric",
+            "R9",
+            20.0,
+            20.0,
+            nets={"1": 12, "2": ""},
+        )
+        assert res["success"] is False
+        assert "net name must be a string" in res["failed"][0]["error"]
+        assert "pad(s) 1" in res["failed"][0]["error"]
+        assert _board_bytes(board_with_table) == before
         data = load_pcb(board_with_table)
         assert all(get_fp_property(n, "Reference") != "R9" for n in iter_footprint_nodes(data))
 

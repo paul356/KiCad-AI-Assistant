@@ -226,11 +226,13 @@ class TestRouteEngine:
         assert res.path != skeleton  # the skeleton bend was not clean
 
     def test_track_is_shoved_not_detoured(self):
-        # The route stays straight; the movable track is pushed to the
-        # side instead.
+        # Straight route, no detour: the movable track crosses the route
+        # and is pushed around it; the displacement snaps onto the
+        # 0/45/90 family (square-capped route hull walks straight legs,
+        # no arc samples — the P1-1 gate must accept it).
         t = _track_obs(5, -3, 3, "N2")
-        res = route_engine((-8, 0), (8, 0), [_pad(0, 0), t], W, CLR)
-        # Straight-ish route: the track is shoved, no walkaround of it.
+        res = route_engine((-8, 0), (8, 0), [t], W, CLR)
+        # Straight route: the track is shoved, no walkaround of it.
         assert res.path[0] == (-8, 0) and res.path[-1] == (8, 0)
         assert len(res.shoved_tracks) == 1
         pushed = res.shoved_tracks[0]
@@ -238,6 +240,35 @@ class TestRouteEngine:
         assert pushed.start == (5, -3) and pushed.end == (5, 3)
         d = LineString(pushed.points).distance(LineString(res.path))
         assert d >= CLR + W / 2 - 1e-6
+        from kcaa.router.route_engine import _line_is_family
+
+        assert _line_is_family(list(pushed.points))  # P1-1 family contract
+
+    def test_pad_on_route_promotes_crossing_track(self):
+        """P1-1 interplay: when a pad sits on the direct line the route
+        must detour, and the shoved track would have to ride the
+        detour's round-join corners (arc samples 45-snapping cannot
+        family), the engine must NOT emit that copper — it promotes the
+        track to fixed and walks the route around it (KiCad's
+        shove-failure semantics).  Regression: the old fallback kept
+        the walked route while the movable track stayed in place, and
+        the audit then exempted it (``orig_obstacle_ids`` left over) —
+        a real DRC violation was written."""
+        t = _track_obs(5, -3, 3, "N2")
+        res = route_engine((-8, 0), (8, 0), [_pad(0, 0), t], W, CLR)
+        assert res.path[0] == (-8, 0) and res.path[-1] == (8, 0)
+        from kcaa.router.route_engine import _line_is_family
+
+        assert _line_is_family(list(res.path))
+        # Route clear of the pad.
+        assert LineString(res.path).distance(_pad(0, 0).shape) >= CLR - 1e-6
+        # Either the track was family-cleanly shoved, or it was kept
+        # (promoted) and the route went around it — never both missing,
+        # and never a shove that writes off-family copper.
+        if res.shoved_tracks:
+            assert _line_is_family(list(res.shoved_tracks[0].points))
+        else:
+            assert LineString(res.path).distance(t.shape) >= CLR - 1e-6
 
     def test_shove_failure_surfaces_as_pns_failure(self, monkeypatch):
         """A shove-stage ShoveFailure must come out as PnsFailure — the
@@ -253,12 +284,86 @@ class TestRouteEngine:
         with pytest.raises(PnsFailure, match="shove failed"):
             route_engine((-8, 0), (8, 0), [_pad(0, 0), t], W, CLR)
 
+    def test_off_family_displaced_track_is_promoted_not_written(self, monkeypatch):
+        """P1-1: a displaced track whose snapped polyline still carries an
+        arbitrary-angle segment (snap45's fallback keeps an unsnappable
+        chord verbatim) must NOT be written — the family gate catches it,
+        promotes the track to fixed, and retries the pass around it.  The
+        old behavior (HEAD) wrote the arbitrary-angle copper straight to
+        the file; the failed fallback discarded the displacement but kept
+        the walked route with the promotable track still in place."""
+        from kcaa.router.route_engine import _snap45_line as real_snap45
+
+        t = _track_obs(5, -3, 3, "N2")
+        injections = {"n": 0}
+
+        def _rotten_snap(pts, hulls):
+            # First snap is the displaced track (route snap happens after
+            # the moved-pairs processing).  Snap fine, then inject an
+            # off-family hop (2:1 slope — 26.5 deg, no family slot) the
+            # fallback could have kept between two vertices.
+            injections["n"] += 1
+            snapped = real_snap45(pts, hulls)
+            if injections["n"] == 1 and len(snapped) >= 3:
+                return [
+                    snapped[0],
+                    snapped[1],
+                    (snapped[1][0] + 1.0, snapped[1][1] + 0.5),
+                    snapped[-1],
+                ]
+            return snapped
+
+        monkeypatch.setattr("kcaa.router.route_engine._snap45_line", _rotten_snap)
+        res = route_engine((-8, 0), (8, 0), [_pad(0, 0), t], W, CLR)
+        # The gate must have caught the injected hop: the route ends up
+        # around the (promoted) track, never carrying off-family copper.
+        from kcaa.router.route_engine import _line_is_family
+
+        assert res.path[0] == (-8, 0) and res.path[-1] == (8, 0)
+        assert _line_is_family(list(res.path))
+        assert LineString(res.path).distance(t.shape) >= CLR - 1e-6
+        for pushed in res.shoved_tracks:
+            assert _line_is_family(list(pushed.points))
+
+    def test_off_family_without_promotion_fails_loudly(self, monkeypatch):
+        """P1-1: if the family gate fails and there is nothing left to
+        promote (the offending track cannot be pinned), the engine must
+        raise instead of writing arbitrary-angle copper.  ``_promote``
+        failing stands in for an exhausted promote set."""
+        from kcaa.router.route_engine import _snap45_line as real_snap45
+
+        t = _track_obs(5, -3, 3, "N2")
+        injections = {"n": 0}
+
+        def _rotten_snap(pts, hulls):
+            injections["n"] += 1
+            snapped = real_snap45(pts, hulls)
+            if injections["n"] == 1 and len(snapped) >= 3:
+                return [
+                    snapped[0],
+                    snapped[1],
+                    (snapped[1][0] + 1.0, snapped[1][1] + 0.5),
+                    snapped[-1],
+                ]
+            return snapped
+
+        def _no_promote(*_args, **_kwargs):
+            return False
+
+        monkeypatch.setattr("kcaa.router.route_engine._snap45_line", _rotten_snap)
+        monkeypatch.setattr("kcaa.router.route_engine._promote_track_group", _no_promote)
+        with pytest.raises(PnsFailure, match="0/45/90"):
+            route_engine((-8, 0), (8, 0), [_pad(0, 0), t], W, CLR)
+
     def test_shoved_track_stays_off_pad(self):
-        """The route stays straight (the pad below it is outside the
-        walkaround detection margin) while the movable track is pushed
-        onto the pad's side of the route hull.  The shove stage must walk
-        the displaced track around the pad with the DRC margin
-        (regression: shoved tracks used to be placed on top of pads)."""
+        """P1-1/P1-2 interplay: a movable track crossing the route with a
+        pad beside the corridor cannot be shoved onto the 0/45/90 family
+        (the walkaround around the pad+route cluster arc-samples), so the
+        engine promotes it and walks the route around the cluster — the
+        DRC margin to the pad is kept by the final line either way.
+        Regression: shoved tracks used to be placed on top of pads; and
+        the failed fallback kept a walked route that crossed the
+        unpromoted track."""
         pad = Obstacle(
             shape=Polygon([(-1.0, -1.6), (1.0, -1.6), (1.0, -0.2), (-1.0, -0.2)]),
             layers=frozenset({"F.Cu"}),
@@ -267,11 +372,38 @@ class TestRouteEngine:
         )
         t = _track_obs(0, -4, 4, "N2")
         res = route_engine((-8, 0), (8, 0), [pad, t], W, CLR)
+        from kcaa.router.route_engine import _line_is_family
+
+        assert _line_is_family(list(res.path))
+        d = LineString(res.path).distance(pad.shape)
+        assert d >= CLR - 1e-6, f"route violates pad clearance: {d:.4f}"
+        d = LineString(res.path).distance(t.shape)
+        assert d >= CLR - 1e-6, f"route violates track clearance: {d:.4f}"
+        for pushed in res.shoved_tracks:
+            d = LineString(pushed.points).distance(pad.shape)
+            assert d >= CLR + W / 2 - 1e-6, f"pushed track violates pad clearance: {d:.4f}"
+
+    def test_family_shove_keeps_offline_pad_clearance(self):
+        """Positive P1-1 path: a shove that CAN be 45-snapped stays a
+        shove (no promote), and the displaced track keeps DRC margin
+        from a pad off the route corridor."""
+        pad = Obstacle(
+            shape=Polygon([(9.0, 1.2), (11.0, 1.2), (11.0, 2.2), (9.0, 2.2)]),
+            layers=frozenset({"F.Cu"}),
+            net="N9",
+            kind="pad",
+        )
+        t = _track_obs(0, -4, 4, "N2")
+        res = route_engine((-8, 0), (8, 0), [pad, t], W, CLR)
         assert len(res.shoved_tracks) == 1
         pushed = res.shoved_tracks[0]
-        assert pushed.start == (0, -4) and pushed.end == (0, 4)  # pinned
+        from kcaa.router.route_engine import _line_is_family
+
+        assert _line_is_family(list(pushed.points))  # P1-1 family contract
         d = LineString(pushed.points).distance(pad.shape)
         assert d >= CLR + W / 2 - 1e-6, f"pushed track violates pad clearance: {d:.4f}"
+        d = LineString(pushed.points).distance(LineString(res.path))
+        assert d >= CLR + W / 2 - 1e-6
 
     def test_subwidth_short_track_is_fixed_not_shoved(self):
         # A track shorter than its width (0.2 mm tap-in inside a 0.5 mm
@@ -663,14 +795,37 @@ class TestSnap45Engine:
             route_engine((-8, 0), (8, 0), [], W, CLR, net="VCC", extra_fixed=[pad])
 
     def test_snapped_detour_and_push_stay_clear(self):
-        # A detour + displacement that used to shave ~15 um off the true
-        # clearance envelope now passes the audit with the real margin.
+        """A detour + displacement that used to shave ~15 um off the true
+        clearance envelope now passes the audit with the real margin.
+        When the corridor pad makes the push un-45-snappable, the engine
+        promotes and detours on the family with real clearance on both
+        solids."""
         t = _track_obs(0.0, -4.0, 4.0, "N2")
         res = route_engine((-8, 0), (8, 0), [_pad(0, -1.5, half=0.4), t], W, CLR)
+        from kcaa.router.route_engine import _line_is_family
+
+        assert _line_is_family(list(res.path))
+        d = LineString(res.path).distance(_pad(0, -1.5, half=0.4).shape)
+        assert d >= CLR - 1e-6, f"route too close to pad: {d:.4f}"
+        d = LineString(res.path).distance(t.shape)
+        assert d >= CLR - 1e-6, f"route too close to track: {d:.4f}"
+        for pushed in res.shoved_tracks:
+            assert _line_is_family(list(pushed.points))
+            d = LineString(pushed.points).distance(_pad(0, -1.5, half=0.4).shape)
+            assert d >= CLR + W / 2 - 1e-6, f"pushed track too close to pad: {d:.4f}"
+
+    def test_family_shove_with_corridor_pad_stays_clear(self):
+        """Positive P1-1: corridor pad off the route line, shove is
+        45-snappable — displaced track keeps the DRC margin to the pad."""
+        t = _track_obs(0.0, -4.0, 4.0, "N2")
+        pad = _pad(9, 1.7, half=0.4)
+        res = route_engine((-8, 0), (8, 0), [pad, t], W, CLR)
         assert len(res.shoved_tracks) == 1
         pushed = res.shoved_tracks[0]
-        assert pushed.start == (0, -4) and pushed.end == (0, 4)
-        d = LineString(pushed.points).distance(_pad(0, -1.5, half=0.4).shape)
+        from kcaa.router.route_engine import _line_is_family
+
+        assert _line_is_family(list(pushed.points))
+        d = LineString(pushed.points).distance(pad.shape)
         assert d >= CLR + W / 2 - 1e-6, f"pushed track too close to pad: {d:.4f}"
 
 
@@ -1080,3 +1235,83 @@ class TestVisibilityDetour:
         assert res.path[0] == (-8, 0) and res.path[-1] == (8, 0)
         for wall in walls:
             assert LineString(res.path).distance(wall.shape) >= CLR - 1e-6
+
+
+class TestLineIsFamily:
+    """P1-1 gate: every emitted copper segment must sit on a
+    0/45/90/135 slot — the mitered45 output contract, checked on
+    displaced tracks after snapping."""
+
+    def test_family_lines_are_family(self):
+        from kcaa.router.route_engine import _line_is_family
+
+        assert _line_is_family([(0, 0), (10, 0)])  # H
+        assert _line_is_family([(0, 0), (0, 10)])  # V
+        assert _line_is_family([(0, 0), (10, 10)])  # D+
+        assert _line_is_family([(0, 0), (10, -10)])  # D-
+        assert _line_is_family([(0, 0), (3, 3), (3, 8), (9, 8)])  # D/V/H chain
+
+    def test_arbitrary_angle_line_rejected(self):
+        from kcaa.router.route_engine import _line_is_family
+
+        # 26.565 deg (1:2 slope) — nowhere near a family slot.
+        assert not _line_is_family([(0, 0), (4, 2)])
+        # 68 deg-ish mixed chain with one off-family hop.
+        assert not _line_is_family([(0, 0), (4, 0), (4.5, 2.1), (9, 2.1)])
+
+    def test_empty_and_single_point_trivially_family(self):
+        from kcaa.router.route_engine import _line_is_family
+
+        # No segments to violate the family.
+        assert _line_is_family([])
+        assert _line_is_family([(1, 2)])
+
+
+class TestRouteCenterlineObstacle:
+    """P1-2: the route's own copper joins the fixed set shoved tracks
+    are cleared against — a push that lands inside the route's DRC
+    envelope must fail the shove, not the final audit."""
+
+    def test_centerline_buffers_to_copper_obstacle(self):
+        from shapely.geometry import Point
+
+        from kcaa.router.route_engine import _route_centerline_obstacle
+
+        obs = _route_centerline_obstacle([(0.0, 0.0), (10.0, 0.0)], width=0.2, net="VCC")
+        assert obs.kind == "track"
+        assert obs.net == "VCC"
+        assert obs.shape.geom_type == "Polygon"
+        # centerline buffered by half-width: copper covers the centerline.
+        assert obs.shape.covers(Point(5.0, 0.0))
+        assert obs.shape.distance(Point(5.0, 0.2)) <= 0.101  # half width + buffer
+
+    def test_shove_clear_of_fixed_rejects_route_overlap(self):
+        """A pushed track riding inside the route's DRC envelope must
+        come back ``None`` — the final-audit-only gap is gone (P1-2)."""
+        from kcaa.router.pns.shove import _shove_clear_of_fixed
+        from kcaa.router.route_engine import _route_centerline_obstacle
+
+        route = _route_centerline_obstacle([(-10.0, 0.0), (10.0, 0.0)], width=W, net="VCC")
+        # Pushed track 0.05 mm off the route centerline: inside the
+        # route copper half-width (0.1) — overlap, must fail.
+        assert (
+            _shove_clear_of_fixed(
+                [(-10.0, 0.05), (10.0, 0.05)],
+                [route],
+                width=W,
+                clearance=CLR,
+                track_net="GND",
+            )
+            is None
+        )
+        # Pushed track 0.5 mm off: outside copper (0.1) + clearance
+        # (0.1) — the DRC margin is satisfied, line unmodified (hull
+        # envelope is 0.3; 0.5 clears it).
+        clean = _shove_clear_of_fixed(
+            [(-10.0, 0.5), (10.0, 0.5)],
+            [route],
+            width=W,
+            clearance=CLR,
+            track_net="GND",
+        )
+        assert clean == [(-10.0, 0.5), (10.0, 0.5)]

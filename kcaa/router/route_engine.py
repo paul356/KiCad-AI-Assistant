@@ -240,6 +240,36 @@ def route_engine(
     pushed: list[TrackObstacle] = []
     moved_pairs: list[tuple[TrackObstacle, TrackObstacle]] = []
     movable_active: list[TrackObstacle] = []
+
+    # Originals displaced from the file (their obstacle entries are
+    # gone).  Geometric match against the shoved LINEs, not identity:
+    # the merged chain object differs from the movable segments it was
+    # built from.  Used after every pass to map displaced chains back to
+    # their file segments (audit exemption) and to the movable track
+    # being promoted when a displacement cannot be 45-snapped.
+    def _chain_contains(chain: TrackObstacle, seg: TrackObstacle) -> bool:
+        """True when ``seg`` is one segment (consecutive point pair) of
+        ``chain`` — the write path matches file segments against the
+        shoved LINE geometrically, since the merged chain object is not
+        identity-equal to the movable segments it was built from."""
+        if chain.net is not None and seg.net is not None and chain.net != seg.net:
+            return False
+        pts = chain.points
+        for a, b in zip(pts, pts[1:]):
+            if (
+                abs(a[0] - seg.start[0]) <= 1e-6
+                and abs(a[1] - seg.start[1]) <= 1e-6
+                and abs(b[0] - seg.end[0]) <= 1e-6
+                and abs(b[1] - seg.end[1]) <= 1e-6
+            ) or (
+                abs(a[0] - seg.end[0]) <= 1e-6
+                and abs(a[1] - seg.end[1]) <= 1e-6
+                and abs(b[0] - seg.start[0]) <= 1e-6
+                and abs(b[1] - seg.start[1]) <= 1e-6
+            ):
+                return True
+        return False
+
     # Failure-process trace: one frame per walkaround iteration / shove
     # hit / promote round so the failure dumps (and renders) as a
     # sequence, with the hit track's fixed endpoints marked.
@@ -362,7 +392,11 @@ def route_engine(
                     width=track_width,
                     clearance=place_clearance,
                     max_depth=MAX_SHOVE_DEPTH if max_shove_depth is None else max_shove_depth,
-                    fixed_obstacles=[*walk_obstacles, *extra_fixed],
+                    fixed_obstacles=[
+                        *walk_obstacles,
+                        *extra_fixed,
+                        _route_centerline_obstacle(seed, track_width, net),
+                    ],
                 )
                 # shove_path never moves the caller's path: the current
                 # line is still the seed polyline.  It may now cross
@@ -436,8 +470,15 @@ def route_engine(
             # this a displaced track can be landed on top of a pad.
             # ``walk_obstacles`` is exactly the fixed set here;
             # ``extra_fixed`` adds the route's own earlier-leg copper
-            # (foreign to every shoved track).
-            fixed = [*walk_obstacles, *extra_fixed]
+            # (foreign to every shoved track), and the route centerline
+            # is added as copper too — a pushed track must hold DRC
+            # clearance from the route itself, or the final audit
+            # rejects the whole route (P1-2).
+            fixed = [
+                *walk_obstacles,
+                *extra_fixed,
+                _route_centerline_obstacle(walked, track_width, net),
+            ]
             try:
                 shoved: ShoveResult = shove_path(
                     walked,
@@ -488,103 +529,173 @@ def route_engine(
             out_path = walked
             pushed = []
             moved_pairs = []
+
+        # ------------------------------------------------------------------
+        # KiCad optimizer analogue: re-snap disturbed polylines onto the
+        # 0/45/90 family.  The skeleton is born on the family (with
+        # optional fillet arcs); a line disturbed by walkaround/shove
+        # rides obstacle hulls and picks up arbitrary-angle chords.  Each
+        # snapped line keeps the DRC margin to the world it is given
+        # (exact-margin boundary riding allowed, same as the walkaround
+        # placement); a Manhattan corner that would not fit falls back to
+        # the original segment, so snapping never creates a violation by
+        # itself.  Skeleton-surviving legs (``out_path == skeleton``)
+        # keep their arcs (see below).
+        # ------------------------------------------------------------------
+        if moved_pairs:
+            disp_pts: list[list[tuple[float, float]]] = [
+                list(disp.points) for _orig, disp in moved_pairs
+            ]
+            stay_movable = [
+                t for t in movable if not any(_chain_contains(orig, t) for orig, _ in moved_pairs)
+            ]
+            # Displaced tracks snap FIRST (world: fixed solids + route +
+            # other movables + other displacements, already-snapped
+            # positions for the ones processed earlier); the route snaps
+            # LAST.
+            for i, (_orig, disp) in enumerate(moved_pairs):
+                wk = disp.width
+                hulls: list[Polygon] = [
+                    _family_hull(o.shape, place_clearance + wk / 2.0)
+                    for o in [*walk_obstacles, *extra_fixed]
+                    if o.shape is not None and not o.shape.is_empty
+                ]
+                hulls.append(
+                    LineString(out_path).buffer(
+                        track_width / 2.0 + place_clearance + wk / 2.0,
+                        cap_style="round",
+                    )
+                )
+                for t in stay_movable:
+                    hulls.append(
+                        _family_hull(
+                            LineString(t.points),
+                            t.width / 2.0 + place_clearance + wk / 2.0,
+                        )
+                    )
+                for j, (_oj, dj) in enumerate(moved_pairs):
+                    if j == i:
+                        continue
+                    hulls.append(
+                        _family_hull(
+                            LineString(disp_pts[j]),
+                            dj.width / 2.0 + place_clearance + wk / 2.0,
+                        )
+                    )
+                disp_pts[i] = _snap45_line(disp_pts[i], hulls)
+
+            # Family contract on displaced tracks: snap45 keeps an
+            # unsnappable chord verbatim (fallback), and — unlike the
+            # route polyline below — a displaced track previously went
+            # straight to the file, so arbitrary-angle segments could
+            # leak out.  Run the same coalesce+merge pipeline the route
+            # gets; a merged candidate is DRC-audited (a violation keeps
+            # the snapped line, same as the route side).
+            #
+            # When a displaced track still carries a non-family segment
+            # after both passes there is no DRC-clean family solution
+            # for it, and the mitered45 contract forbids writing it.
+            # The track is PROMOTED to a fixed solid and the pass retries
+            # around it (KiCad's shove-failure semantics) — the route
+            # then walks around the track instead of riding it, which is
+            # legal, family-clean, and DRC-audited.  This beats both
+            # keeping the walked route (which was computed on a world
+            # WITHOUT the movable track, so it can cross the very copper
+            # it was supposed to avoid) and failing the whole leg for
+            # geometry that genuinely has a low-cost detour.  Only when
+            # every movable track has already been promoted does the
+            # shove-failure path raise (nothing left to retry with).
+            gate_failed: int | None = None
+            for i, (_orig, disp) in enumerate(moved_pairs):
+                snapped = list(disp_pts[i])
+                merged = _coalesce_stub_pairs(snapped)
+                merged = _merge_family_chain(merged)
+                if merged != snapped:
+                    merged_pairs = [
+                        (
+                            o,
+                            TrackObstacle(
+                                points=tuple(merged if j == i else disp_pts[j]),
+                                width=d.width,
+                                net=d.net,
+                                layer=d.layer,
+                            ),
+                        )
+                        for j, (o, d) in enumerate(moved_pairs)
+                    ]
+                    try:
+                        _audit_final_copper(
+                            out_path=out_path,
+                            width=track_width,
+                            net=net,
+                            obstacles=obstacles,
+                            extra_fixed=extra_fixed,
+                            moved_pairs=merged_pairs,
+                            orig_obstacle_ids={
+                                id(movable_shapes_active[k])
+                                for k, track in enumerate(movable_active)
+                                if any(_chain_contains(orig2, track) for orig2, _ in moved_pairs)
+                            },
+                            clearance=clearance,
+                        )
+                        disp_pts[i] = merged
+                    except PnsFailure:
+                        pass  # merged line would violate DRC: keep snapped
+                if not _line_is_family(disp_pts[i]):
+                    gate_failed = i
+                    break
+            if gate_failed is not None:
+                hit_chain = moved_pairs[gate_failed][0]
+                if _promote_track_group(hit_chain, movable, promoted):
+                    frames.append(
+                        {
+                            "stage": f"family-promote-{len(frames):02d}",
+                            "path": list(disp_pts[gate_failed]),
+                            "hit": (
+                                f"track {hit_chain.start} -> {hit_chain.end}"
+                                if hasattr(hit_chain, "start") and hasattr(hit_chain, "end")
+                                else f"track obstacle ({hit_chain.net or ''})"
+                            ),
+                            "note": (
+                                f"shoved track {hit_chain.net} snapped off the "
+                                "0/45/90 family; promoting it and retrying "
+                                "around it"
+                            ),
+                            "obstacles": [*walk_obstacles, *extra_fixed],
+                        }
+                    )
+                    continue
+                raise PnsFailure(
+                    f"shoved track {hit_chain.net} snapped off the 0/45/90 "
+                    "family (a segment cannot be placed at a family angle; "
+                    "widen the gap or use strategy='walkaround')",
+                    last_path=list(disp_pts[gate_failed]),
+                    frames=frames,
+                )
+            moved_pairs = [
+                (
+                    orig,
+                    TrackObstacle(
+                        points=tuple(disp_pts[i]),
+                        width=disp.width,
+                        net=disp.net,
+                        layer=disp.layer,
+                    ),
+                )
+                for i, (orig, disp) in enumerate(moved_pairs)
+            ]
+            pushed = [disp for _orig, disp in moved_pairs]
         break
 
-    # Originals displaced from the file (their obstacle entries are gone).
-    # Geometric match against the shoved LINEs, not identity: the merged
-    # chain object differs from the movable segments it was built from.
-    def _chain_contains(chain: TrackObstacle, seg: TrackObstacle) -> bool:
-        """True when ``seg`` is one segment (consecutive point pair) of
-        ``chain`` — the write path matches file segments against the
-        shoved LINE geometrically, since the merged chain object is not
-        identity-equal to the movable segments it was built from."""
-        if chain.net is not None and seg.net is not None and chain.net != seg.net:
-            return False
-        pts = chain.points
-        for a, b in zip(pts, pts[1:]):
-            if (
-                abs(a[0] - seg.start[0]) <= 1e-6
-                and abs(a[1] - seg.start[1]) <= 1e-6
-                and abs(b[0] - seg.end[0]) <= 1e-6
-                and abs(b[1] - seg.end[1]) <= 1e-6
-            ) or (
-                abs(a[0] - seg.end[0]) <= 1e-6
-                and abs(a[1] - seg.end[1]) <= 1e-6
-                and abs(b[0] - seg.start[0]) <= 1e-6
-                and abs(b[1] - seg.start[1]) <= 1e-6
-            ):
-                return True
-        return False
-
+    # Originals displaced are exempt from the audit (their file entries
+    # are replaced by the pushed lines).  Geometric match against the
+    # shoved LINEs: the merged chain object differs from the movable
+    # segments it was built from, so match by segment coordinates, not
+    # identity.
     orig_obstacle_ids: set[int] = set()
     for i, track in enumerate(movable_active):
         if any(_chain_contains(orig, track) for orig, _ in moved_pairs):
             orig_obstacle_ids.add(id(movable_shapes_active[i]))
-
-    # ------------------------------------------------------------------
-    # KiCad optimizer analogue: re-snap disturbed polylines onto the
-    # 0/45/90 family.  The skeleton is born on the family (with optional
-    # fillet arcs); a line disturbed by walkaround/shove rides obstacle
-    # hulls and picks up arbitrary-angle chords.  Each snapped line keeps
-    # the DRC margin to the world it is given (exact-margin boundary
-    # riding allowed, same as the walkaround placement); a Manhattan
-    # corner that would not fit falls back to the original segment, so
-    # snapping never creates a violation by itself.  Skeleton-surviving
-    # legs (``out_path == skeleton``) keep their arcs (see below).
-    # ------------------------------------------------------------------
-    if moved_pairs:
-        disp_pts: list[list[tuple[float, float]]] = [
-            list(disp.points) for _orig, disp in moved_pairs
-        ]
-        stay_movable = [
-            t for t in movable if not any(_chain_contains(orig, t) for orig, _ in moved_pairs)
-        ]
-        # Displaced tracks snap FIRST (world: fixed solids + route +
-        # other movables + other displacements, already-snapped positions
-        # for the ones processed earlier); the route snaps LAST.
-        for i, (_orig, disp) in enumerate(moved_pairs):
-            wk = disp.width
-            hulls: list[Polygon] = [
-                _family_hull(o.shape, place_clearance + wk / 2.0)
-                for o in [*walk_obstacles, *extra_fixed]
-                if o.shape is not None and not o.shape.is_empty
-            ]
-            hulls.append(
-                LineString(out_path).buffer(
-                    track_width / 2.0 + place_clearance + wk / 2.0,
-                    cap_style="round",
-                )
-            )
-            for t in stay_movable:
-                hulls.append(
-                    _family_hull(
-                        LineString(t.points),
-                        t.width / 2.0 + place_clearance + wk / 2.0,
-                    )
-                )
-            for j, (_oj, dj) in enumerate(moved_pairs):
-                if j == i:
-                    continue
-                hulls.append(
-                    _family_hull(
-                        LineString(disp_pts[j]),
-                        dj.width / 2.0 + place_clearance + wk / 2.0,
-                    )
-                )
-            disp_pts[i] = _snap45_line(disp_pts[i], hulls)
-        moved_pairs = [
-            (
-                orig,
-                TrackObstacle(
-                    points=tuple(disp_pts[i]),
-                    width=disp.width,
-                    net=disp.net,
-                    layer=disp.layer,
-                ),
-            )
-            for i, (orig, disp) in enumerate(moved_pairs)
-        ]
-        pushed = [disp for _orig, disp in moved_pairs]
 
     if out_path != skeleton:
         route_hulls: list[Polygon] = [
@@ -679,6 +790,70 @@ def route_engine(
 # ---------------------------------------------------------------------------
 # Internals
 # ---------------------------------------------------------------------------
+
+
+def _route_centerline_obstacle(
+    pts: Sequence[tuple[float, float]],
+    width: float,
+    net: str | None,
+) -> Obstacle:
+    """The current route polyline as a fixed copper obstacle.
+
+    Shoved tracks must keep DRC clearance from the *route* itself, not
+    only from pads/vias/keepouts: ``shove_path`` pushes tracks around
+    the route hull but its acceptance tolerance (10 um deep-penetration
+    slack) lets a pushed track ride tens of um into the route's
+    clearance envelope, and the final audit then rejects the whole
+    route for a gap the old grid-A* engine never created.  Feeding the
+    route centerline (buffered by half its width, per ``Obstacle.shape``
+    convention) into the fixed set makes ``_shove_clear_of_fixed`` walk
+    each pushed track clear of the route with the exact DRC margin —
+    the audit then passes on boards the push can actually clear.
+
+    Caps are SQUARE, not round: the walkaround that displaces a track
+    around this hull emits straight legs when the cap edges are
+    straight, and a square cap covers the round cap it replaces (the
+    semicircle is inscribed), so no pushed track gains clearance by the
+    swap — the audit's round-cap copper still governs.  A round cap
+    would sample the arc into dense micro-segments that snap45 cannot
+    put back on the 0/45/90 family (P1-1 gate would fail the shove even
+    though the push itself is legal).
+    """
+
+    return Obstacle(
+        shape=LineString(pts).buffer(width / 2.0, cap_style="square"),
+        layers=frozenset(),
+        net=net,
+        kind="track",
+    )
+
+
+def _line_is_family(
+    pts: Sequence[tuple[float, float]],
+    tol: float = 1e-6,
+) -> bool:
+    """True when every segment of ``pts`` lies on a 0/45/90/135 slot.
+
+    The mitered45 output contract: every copper segment the engine emits
+    must run at 0, 45, 90 or 135 degrees.  Used to verify displaced
+    tracks after snapping — ``_snap45_line`` keeps an unsnappable chord
+    verbatim (see its docstring), and a displaced track would otherwise
+    reach the file as arbitrary-angle copper with no audit gate.  A line
+    with fewer than two points has no segments, so it cannot violate the
+    family (trivially true).
+    """
+    it = iter(pts)
+    try:
+        x1, y1 = next(it)
+    except StopIteration:
+        return True
+    for x2, y2 in it:
+        dx = x2 - x1
+        dy = y2 - y1
+        if abs(dx) > tol and abs(dy) > tol and abs(abs(dx) - abs(dy)) > tol:
+            return False
+        x1, y1 = x2, y2
+    return True
 
 
 def _snap45_line(

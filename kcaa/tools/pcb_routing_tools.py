@@ -18,9 +18,6 @@ from collections.abc import Sequence
 import json
 import logging
 import math
-import os
-import tempfile
-import time
 from typing import Any
 
 from fastmcp import Context, FastMCP
@@ -132,9 +129,8 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
                 "unsupported anchor kind".
             dry_run: True -> route and return the full result without
                 writing anything to the PCB file (no reload, no .bak;
-                the file stays byte-identical).  ``route_png`` is still
-                rendered (the render reads the board and writes only to
-                the system temp dir).
+                the file stays byte-identical).  ``route_png`` renders
+                still fire (in memory; nothing is written to disk).
             strategy: Explicit PNS shove-mode knob: ``"shove"`` (default;
                 walkaround + shove with the default depth),
                 ``"walkaround"`` (no movable push — foreign tracks are
@@ -197,27 +193,30 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
                 start: ``(x, y)`` exit point of pad_a.
                 end: ``(x, y)`` entry point of pad_b.
                 strategy: echo of the requested strategy knob.
-                route_png: path of the rendered single-route image (the
-                    VLM inspects it to see what was routed; ``None``
-                    only if the best-effort render failed).  Rendered
-                    for dry_run previews and commits alike — the render
-                    reads the board file and writes only to the system
-                    temp dir.
+                route_png: always ``None`` in the JSON envelope — the best-effort
+                    rendered route image is delivered as the image
+                    content block the model inspects (bytes in memory;
+                    no temp file on disk).  Rendered for dry_run
+                    previews and commits alike.
                 backup_path: path to the ``.bak`` created before writing
                     (``None`` with ``dry_run``).
                 pcb_path: echo of the input path.
                 dry_run: echo of the ``dry_run`` option.
+                route_png: ``None`` — the render is delivered as the
+                    image content block, never as a temp-file path (a
+                    persistent server must not leak board-layout PNGs
+                    into the shared temp dir).
 
-            VLM flow: preview with ``dry_run=True`` + ``route_png``,
-            then commit the same request with ``dry_run=False``;
-            ``strategy`` is the explicit knob that decides whether the
-            engine may shove tracks out of the way.
+            VLM flow: preview with ``dry_run=True``, then commit the
+            same request with ``dry_run=False``; ``strategy`` is the
+            explicit knob that decides whether the engine may shove
+            tracks out of the way.
 
-            Or ``{"error": "<message>", "route_png": "<path>"}`` on failure:
+            Or ``{"error": "<message>", "route_png": null}`` on failure:
             the error message plus a best-effort PNG of the current board
             with the failed route's endpoint pads marked (``route_png`` is
-            ``None`` when rendering is unavailable; the error is never
-            masked by the render).
+            always ``None``; the render rides the image content block,
+            and the error is never masked by the render).
 
             The tool result is an MCP text + image pair: the JSON envelope
             described above is the text block, and the rendered route PNG
@@ -271,12 +270,12 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
         try:
             result = auto_route_pair(req)
         except RouteFailure as exc:
-            png_path, png_bytes = _route_failure_evidence(pcb_path, req)
-            return _route_payload({"error": str(exc), "route_png": png_path}, png_bytes)
+            png_bytes = _route_failure_evidence(pcb_path, req)
+            return _route_payload({"error": str(exc), "route_png": None}, png_bytes)
         except (FileNotFoundError, ValueError) as exc:
-            png_path, png_bytes = _route_failure_evidence(pcb_path, req)
+            png_bytes = _route_failure_evidence(pcb_path, req)
             return _route_payload(
-                {"error": f"Routing input error: {exc}", "route_png": png_path},
+                {"error": f"Routing input error: {exc}", "route_png": None},
                 png_bytes,
             )
 
@@ -371,12 +370,12 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
             "waypoint_violated": result.waypoint_violated,
             "violated_waypoints": [list(pt) for pt in result.violated_waypoints],
             "strategy": result.strategy,
-            "route_png": result.route_png,
+            "route_png": None,
             "backup_path": backup_path,
             "pcb_path": pcb_path,
             "dry_run": dry_run,
         }
-        png_bytes = _png_bytes(result.route_png)
+        png_bytes = result.route_png
         return _route_payload(resp, png_bytes)
 
     @mcp.tool()
@@ -782,10 +781,11 @@ def _get_net_name(net_node: list) -> str | None:
 def _segment_fields(node: list) -> dict | None:
     """Extract ``{start, end, width, layer, net}`` from a ``(segment ...)`` node.
 
-    Returns ``None`` for anything that is not a segment node.  Field
-    order is not assumed (the node is scanned); ``net`` is the net *name*,
-    tolerating both KiCad 8 ``(net <id> "<name>")`` and KiCad 10
-    ``(net "<name>")``.
+    Returns ``None`` for anything that is not a segment node, and for a
+    segment whose numeric fields cannot be parsed (malformed coordinates
+    in a hand-edited board).  Field order is not assumed (the node is
+    scanned); ``net`` is the net *name*, tolerating both KiCad 8
+    ``(net <id> "<name>")`` and KiCad 10 ``(net "<name>")``.
     """
     if not isinstance(node, list) or len(node) < 2 or node[0] != sexpdata.Symbol("segment"):
         return None
@@ -794,16 +794,22 @@ def _segment_fields(node: list) -> dict | None:
         if not isinstance(sub, list) or len(sub) < 2:
             continue
         key = sub[0]
-        if key == sexpdata.Symbol("start") and len(sub) >= 3:
-            fields["start"] = (float(sub[1]), float(sub[2]))
-        elif key == sexpdata.Symbol("end") and len(sub) >= 3:
-            fields["end"] = (float(sub[1]), float(sub[2]))
-        elif key == sexpdata.Symbol("width") and len(sub) >= 2:
-            fields["width"] = float(sub[1])
-        elif key == sexpdata.Symbol("layer") and len(sub) >= 2:
-            fields["layer"] = str(sub[1])
-        elif key == sexpdata.Symbol("net") and len(sub) >= 2:
-            fields["net"] = _get_net_name(sub)
+        try:
+            if key == sexpdata.Symbol("start") and len(sub) >= 3:
+                fields["start"] = (float(sub[1]), float(sub[2]))
+            elif key == sexpdata.Symbol("end") and len(sub) >= 3:
+                fields["end"] = (float(sub[1]), float(sub[2]))
+            elif key == sexpdata.Symbol("width") and len(sub) >= 2:
+                fields["width"] = float(sub[1])
+            elif key == sexpdata.Symbol("layer") and len(sub) >= 2:
+                fields["layer"] = str(sub[1])
+            elif key == sexpdata.Symbol("net") and len(sub) >= 2:
+                fields["net"] = _get_net_name(sub)
+        except (TypeError, ValueError):
+            # Malformed numeric field (hand-edited board): treat the
+            # node as unparseable rather than crashing the route write
+            # path — the world model tolerates the same and skips.
+            return None
     if not all(k in fields for k in ("start", "end", "width", "layer")):
         return None
     return fields
@@ -1494,41 +1500,28 @@ def _route_payload(payload: dict, png_bytes: bytes | None = None) -> tuple[str, 
     return text
 
 
-def _png_bytes(png_path: str | None) -> bytes | None:
-    """Read a rendered PNG file back into bytes; ``None`` when absent."""
-    if not png_path:
-        return None
-    try:
-        with open(png_path, "rb") as f:
-            return f.read()
-    except OSError:
-        return None
-
-
-def _route_failure_evidence(pcb_path: str, req: RouteRequest) -> tuple[str | None, bytes | None]:
-    """Render best-effort failure-evidence PNG; ``(path, bytes)`` or
-    ``(None, None)`` when unavailable.
+def _route_failure_evidence(pcb_path: str, req: RouteRequest) -> bytes | None:
+    """Render best-effort failure-evidence PNG bytes; ``None`` when
+    unavailable.
 
     The image shows the current board with the failed route's endpoint
-    pads marked; it is written to the system temp dir and its path
-    returned alongside the bytes.  Rendering must never mask the
-    original failure, so any exception collapses to ``(None, None)``.
+    pads marked.  Bytes only — the tool payload attaches them as an
+    image content block; no temp file is written (a persistent server
+    would otherwise leave a board-layout PNG in the shared temp dir for
+    its lifetime, world-readable).  Rendering must never mask the
+    original failure, so any exception collapses to ``None``.
     """
+    from kcaa.utils.config import model_supports_vision
+
+    if not model_supports_vision():
+        return None
     try:
         _lines, png_bytes, _report = render_route_attempt(
             pcb_path, anchors=_route_anchors(pcb_path, req) or None
         )
-        if not png_bytes:
-            return None, None
-        out = os.path.join(
-            tempfile.gettempdir(),
-            f"kcaa_route_{time.time_ns()}_{os.getpid()}.png",
-        )
-        with open(out, "wb") as f:
-            f.write(png_bytes)
-        return out, png_bytes
+        return png_bytes
     except Exception:  # noqa: BLE001 - evidence must not mask the failure
-        return None, None
+        return None
 
 
 # ---------------------------------------------------------------------------

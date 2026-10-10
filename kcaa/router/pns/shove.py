@@ -123,7 +123,7 @@ def _hull_set(
     for a, b in zip(pts, pts[1:]):
         if math.hypot(b[0] - a[0], b[1] - a[1]) < 1e-12:
             continue
-        hulls.append(LineString([a, b]).buffer(half, cap_style="round"))
+        hulls.append(LineString([a, b]).buffer(half, cap_style="square"))
     return hulls
 
 
@@ -494,12 +494,23 @@ def _shove_clear_of_fixed(
         query = LineString(pts)
         hit: Polygon | None = None
         for h in hulls:
-            # Collision = the line enters the hull INTERIOR.  A line
-            # riding the hull boundary (the walkaround's exact-margin
-            # placement) touches it but must not re-trigger the walk —
-            # intersects-without-touching is that predicate (covers
-            # crossing, containment and endpoint-in-hull alike).
-            if query.intersects(h) and not query.touches(h):
+            # Collision = the line penetrates the hull core.  The hull
+            # boundary sits exactly ``clearance + half-widths`` from the
+            # route centre, and a walked line RIDES that boundary —
+            # legal placement — while its arc samples cut inside the
+            # true envelope only by the chord sagitta (~6 um).  Using
+            # plain ``intersects`` (or ``intersects and not touches``)
+            # would flag the riding line as colliding (float sagitta
+            # reads as penetration), trigger a re-walk that can never
+            # converge and fail a legal shove.  Shrink the hull by the
+            # sagitta tolerance and test the core — the same predicate
+            # as the shove walkaround (``_shove_line_to_hull_set``);
+            # only deep penetration — the line really cutting through a
+            # fixed solid instead of walking round it — rejects.
+            core = h.buffer(-HULL_CROSS_TOLERANCE_MM)
+            if core.is_empty:
+                continue
+            if query.intersects(core):
                 hit = h
                 break
         if hit is None:
