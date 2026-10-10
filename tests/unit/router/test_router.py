@@ -3216,10 +3216,12 @@ def test_strategy_invalid_value_rejected(tmp_path: Path) -> None:
         _route_clear({"strategy": "multi", "algorithm": "astar"}, tmp_path)
 
 
-def test_single_route_renders_route_png(tmp_path: Path) -> None:
-    """A successful single PNS route always carries the best-effort
-    ``route_png`` bytes of the routed track (in memory, no temp file —
-    the VLM feedback image rides the image content block)."""
+def test_single_route_renders_route_png(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A successful single PNS route renders the best-effort
+    ``route_png`` bytes of the routed track when rendering is enabled
+    (KICAD_MCP_RENDER_ROUTE_PNG=1; in memory, no temp file — the VLM
+    feedback image rides the image content block)."""
+    monkeypatch.setenv("KICAD_MCP_RENDER_ROUTE_PNG", "1")
     result = _route_strategy(tmp_path)
     assert result.route_png
     assert isinstance(result.route_png, bytes)
@@ -3227,17 +3229,21 @@ def test_single_route_renders_route_png(tmp_path: Path) -> None:
     assert len(result.route_png) > 0
 
 
-def test_astar_success_renders_route_png(tmp_path: Path) -> None:
+def test_astar_success_renders_route_png(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A* success carries the same single-route render bytes."""
+    monkeypatch.setenv("KICAD_MCP_RENDER_ROUTE_PNG", "1")
     result = _route_clear({"algorithm": "astar", "corner_mode": "mitered45"}, tmp_path)
     assert result.route_png
     assert isinstance(result.route_png, bytes)
     assert result.route_png[:8] == b"\x89PNG\r\n\x1a\n"
 
 
-def test_astar_success_rounds_nothing_but_renders(tmp_path: Path) -> None:
+def test_astar_success_rounds_nothing_but_renders(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A* success renders even with waypoint/no-shove semantics absent;
     ``strategy`` is inert for A* and only echoed."""
+    monkeypatch.setenv("KICAD_MCP_RENDER_ROUTE_PNG", "1")
     result = _route_clear(
         {"algorithm": "astar", "corner_mode": "mitered45", "strategy": "walkaround"},
         tmp_path,

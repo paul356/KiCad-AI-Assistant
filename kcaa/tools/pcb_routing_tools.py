@@ -129,9 +129,9 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
                 "unsupported anchor kind".
             dry_run: True -> route and return the full result without
                 writing anything to the PCB file (no reload, no .bak;
-                the file stays byte-identical).  Route renders still
-                fire (in memory; nothing is written to disk) unless
-                disabled via ``KICAD_MCP_RENDER_ROUTE_PNG=0``.
+                the file stays byte-identical).  Route renders fire only
+                when enabled (``KICAD_MCP_RENDER_ROUTE_PNG=1``; default
+                off) — in memory, nothing written to disk.
             strategy: Explicit PNS shove-mode knob: ``"shove"`` (default;
                 walkaround + shove with the default depth),
                 ``"walkaround"`` (no movable push — foreign tracks are
@@ -201,9 +201,10 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
 
             The rendered route image is delivered as the image content
             block the model inspects (bytes in memory; no temp file on
-            disk) — the JSON envelope never carries a ``route_png`` key
-            — rendered for dry_run previews and commits alike, unless
-            disabled (``KICAD_MCP_RENDER_ROUTE_PNG=0``).
+            disk) — the JSON envelope never carries a ``route_png`` key.
+            Rendering is off by default and enabled with
+            ``KICAD_MCP_RENDER_ROUTE_PNG=1`` (a text-only model gets no
+            render regardless).
 
             VLM flow: preview with ``dry_run=True``, then commit the
             same request with ``dry_run=False``; ``strategy`` is the
@@ -1482,14 +1483,15 @@ def _route_payload(payload: dict, png_bytes: bytes | None = None) -> tuple[str, 
     """Serialize a routing-tool payload to MCP content blocks.
 
     Returns ``(json_text, Image)`` when a render is available AND route
-    rendering is enabled (``KICAD_MCP_RENDER_ROUTE_PNG``, default on;
-    also off for text-only models via ``KICAD_MCP_SUPPORTS_VISION``) —
-    the text block carries the result envelope, the image block carries
-    the rendered route/evidence PNG, exactly the shape the plugin's
-    ``call_mcp_tool`` splits into the result dict + ``_image`` field
-    (same convention as ``export_pcb_layer_image``).  When rendering is
-    disabled or the render failed the result is the bare JSON text
-    (no image block); the payload itself is unchanged in both cases.
+    rendering is explicitly enabled (``KICAD_MCP_RENDER_ROUTE_PNG=1``;
+    off by default, and always off for text-only models via
+    ``KICAD_MCP_SUPPORTS_VISION``) — the text block carries the result
+    envelope, the image block carries the rendered route/evidence PNG,
+    exactly the shape the plugin's ``call_mcp_tool`` splits into the
+    result dict + ``_image`` field (same convention as
+    ``export_pcb_layer_image``).  When rendering is disabled or the
+    render failed the result is the bare JSON text (no image block);
+    the payload itself is unchanged in both cases.
     """
     text = json.dumps(payload, ensure_ascii=False)
     if png_bytes and render_route_png_enabled():
@@ -1507,8 +1509,8 @@ def _route_failure_evidence(pcb_path: str, req: RouteRequest) -> bytes | None:
     would otherwise leave a board-layout PNG in the shared temp dir for
     its lifetime, world-readable).  Rendering must never mask the
     original failure, so any exception collapses to ``None``; skipped
-    entirely when route rendering is disabled (``KICAD_MCP_RENDER_
-    ROUTE_PNG=0`` or a text-only model).
+    unless explicitly enabled (``KICAD_MCP_RENDER_ROUTE_PNG=1``, default
+    off; a text-only model is always off).
     """
     from kcaa.utils.config import render_route_png_enabled
 

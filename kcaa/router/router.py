@@ -248,10 +248,11 @@ class RouteResult:
             (the DRC-clean site actually used, possibly micro-shifted).
         strategy: Echo of the requested strategy knob.
         route_png: PNG bytes of a best-effort rendered image of the
-            routed track (single route; ``None`` if rendering failed or
-            disabled — text-only model, or ``KICAD_MCP_RENDER_ROUTE_PNG=0``).
-            In memory only — the tool layer attaches it as an image
-            content block; no temp file is written.
+            routed track (single route; ``None`` unless rendering was
+            explicitly enabled — text-only model always none, and
+            vision models opt in with ``KICAD_MCP_RENDER_ROUTE_PNG=1``,
+            default off).  In memory only — the tool layer attaches it
+            as an image content block; no temp file is written.
     """
 
     segments: list[OutputSegment] = field(default_factory=list)
@@ -3411,10 +3412,11 @@ def _render_route_png(
 
     Renders the routed polyline on the board (grey track + green anchor
     dots) and returns the PNG bytes; ``None`` when rendering fails or
-    route rendering is disabled (``KICAD_MCP_SUPPORTS_VISION=0`` for a
-    text-only model, or ``KICAD_MCP_RENDER_ROUTE_PNG=0`` to skip the
-    render for speed) — success rendering must never mask the route
-    result.
+    route rendering is disabled — off by default for vision models too
+    (``KICAD_MCP_RENDER_ROUTE_PNG=1`` opts in, ``=0``/unset skips for
+    speed; a text-only model is always off via
+    ``KICAD_MCP_SUPPORTS_VISION``) — success rendering must never mask
+    the route result.
 
     Bytes only, no temp file: the tool layer attaches them to the
     result as an image content block and nothing lingers on disk.

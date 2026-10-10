@@ -680,10 +680,12 @@ class TestAlgorithmDefaultByVision:
         assert "error" not in result
         assert result["strategy"] == "walkaround"
 
-    def test_route_png_always_present_and_existing(self, tools, routable_board):
-        """The successful single route renders real PNG bytes delivered
-        as the image content block (no temp file; nothing on disk), and
-        the JSON envelope carries no ``route_png`` key."""
+    def test_route_png_always_present_and_existing(self, tools, routable_board, monkeypatch):
+        """With rendering enabled (KICAD_MCP_RENDER_ROUTE_PNG=1) the
+        successful single route renders real PNG bytes delivered as the
+        image content block (no temp file; nothing on disk), and the
+        JSON envelope carries no ``route_png`` key."""
+        monkeypatch.setenv("KICAD_MCP_RENDER_ROUTE_PNG", "1")
         from fastmcp.utilities.types import Image
 
         raw = _run_raw(
@@ -708,9 +710,10 @@ class TestAlgorithmDefaultByVision:
         assert image.data[:8] == b"\x89PNG\r\n\x1a\n"
         assert len(image.data) > 0
 
-    def test_route_png_rendered_in_dry_run_too(self, tools, routable_board):
-        """dry_run skips only the PCB write; the render still fires (in
-        memory, nothing written to disk)."""
+    def test_route_png_rendered_in_dry_run_too(self, tools, routable_board, monkeypatch):
+        """dry_run skips only the PCB write; with rendering enabled the
+        render still fires (in memory, nothing written to disk)."""
+        monkeypatch.setenv("KICAD_MCP_RENDER_ROUTE_PNG", "1")
         from fastmcp.utilities.types import Image
 
         before = open(routable_board, "rb").read()
@@ -738,11 +741,12 @@ class TestAlgorithmDefaultByVision:
         assert raw[1].data[:8] == b"\x89PNG\r\n\x1a\n"
         assert open(routable_board, "rb").read() == before
 
-    def test_success_returns_image_content_block(self, tools, routable_board):
+    def test_success_returns_image_content_block(self, tools, routable_board, monkeypatch):
         """The tool result carries (json_text, Image): the rendered route
         PNG as an image content block — the plugin splits it into the
         ``_image`` field the VLM actually sees (a path alone is never
         relayed as image data)."""
+        monkeypatch.setenv("KICAD_MCP_RENDER_ROUTE_PNG", "1")
         from fastmcp.utilities.types import Image
 
         raw = _run_raw(
@@ -792,10 +796,42 @@ class TestAlgorithmDefaultByVision:
         assert payload["strategy"] == "shove"
         assert "route_png" not in payload
 
+    def test_success_skips_render_by_default(self, tools, routable_board, monkeypatch):
+        """Rendering is off by default (KICAD_MCP_RENDER_ROUTE_PNG
+        unset): no render at all — bare JSON text, no image block —
+        while the vision model still defaults to the pns algorithm."""
+        import kcaa.tools.render_route_state as render_mod
+
+        called = {"n": 0}
+
+        def _counter(*_args, **_kwargs):
+            called["n"] += 1
+            return None
+
+        monkeypatch.setattr(render_mod, "render_route_attempt", _counter)
+        raw = _run_raw(
+            tools["pcb_route_pad_to_pad"](
+                pcb_path=routable_board,
+                ref_a="R1",
+                pad_a="1",
+                ref_b="C1",
+                pad_b="1",
+                net="VCC",
+                ctx=None,
+                width=0.2,
+                algorithm="pns",
+            )
+        )
+        assert isinstance(raw, str), f"expected bare text, got {type(raw).__name__}"
+        payload = json.loads(raw)
+        assert "error" not in payload
+        assert payload["algorithm"] == "pns"  # vision default unaffected
+        assert "route_png" not in payload
+        assert called["n"] == 0  # render never invoked
+
     def test_success_skips_render_when_render_toggle_off(self, tools, routable_board, monkeypatch):
-        """KICAD_MCP_RENDER_ROUTE_PNG=0: no render at all — bare JSON
-        text, no image block — while the vision model still defaults to
-        the pns algorithm."""
+        """Explicit KICAD_MCP_RENDER_ROUTE_PNG=0 also skips the render
+        (redundant with the default; kept as the explicit off form)."""
         import kcaa.tools.render_route_state as render_mod
 
         monkeypatch.setenv("KICAD_MCP_RENDER_ROUTE_PNG", "0")
@@ -828,7 +864,7 @@ class TestAlgorithmDefaultByVision:
 
     def test_success_render_resume_with_toggle_on(self, tools, routable_board, monkeypatch):
         """Explicit KICAD_MCP_RENDER_ROUTE_PNG=1 restores the image
-        block (default when unset; the toggle round-trips)."""
+        block (the opt-in path; the toggle round-trips)."""
         from fastmcp.utilities.types import Image
 
         monkeypatch.setenv("KICAD_MCP_RENDER_ROUTE_PNG", "1")
@@ -1076,8 +1112,10 @@ class TestAlgorithmDefaultByVision:
 
     def test_shove_failure_returns_error_with_evidence(self, tools, crossing_board, monkeypatch):
         """A shove-stage ShoveFailure must surface as
-        {"error": ...} — no success wrapper, no ``route_png`` key (the
-        evidence still renders as the image block)."""
+        {"error": ...} — no success wrapper, no ``route_png`` key (with
+        rendering enabled the evidence still renders as the image
+        block)."""
+        monkeypatch.setenv("KICAD_MCP_RENDER_ROUTE_PNG", "1")
         from fastmcp.utilities.types import Image
 
         from kcaa.router.pns.shove import ShoveFailure
@@ -1175,7 +1213,8 @@ def test_apply_shoved_tracks_collapses_repeated_original() -> None:
 
 
 class TestPcbRouteFailureEvidence:
-    def test_route_failure_returns_error_and_png(self, tools, board_with_tracks):
+    def test_route_failure_returns_error_and_png(self, tools, board_with_tracks, monkeypatch):
+        monkeypatch.setenv("KICAD_MCP_RENDER_ROUTE_PNG", "1")
         from fastmcp.utilities.types import Image
 
         raw = _run_raw(
@@ -1197,10 +1236,11 @@ class TestPcbRouteFailureEvidence:
         assert isinstance(raw[1], Image)
         assert raw[1].data[:8] == b"\x89PNG\r\n\x1a\n"
 
-    def test_failure_returns_image_content_block(self, tools, board_with_tracks):
+    def test_failure_returns_image_content_block(self, tools, board_with_tracks, monkeypatch):
         """The failure envelope also carries the evidence PNG as an image
         content block (the VLM must SEE the failed endpoints — the
         payload carries no ``route_png`` key, no temp-file path)."""
+        monkeypatch.setenv("KICAD_MCP_RENDER_ROUTE_PNG", "1")
         from fastmcp.utilities.types import Image
 
         raw = _run_raw(
@@ -1249,6 +1289,10 @@ class TestPcbRouteFailureEvidence:
     def test_failure_render_silent_when_render_unavailable(
         self, tools, board_with_tracks, monkeypatch
     ):
+        """With rendering enabled, a render crash must not mask the
+        failure: bare JSON error text, no image block, no exception
+        escaping the tool."""
+        monkeypatch.setenv("KICAD_MCP_RENDER_ROUTE_PNG", "1")
         import kcaa.tools.pcb_routing_tools as prt
 
         def _boom(*_args, **_kwargs):
@@ -1302,14 +1346,12 @@ class TestPcbRouteFailureEvidence:
         assert isinstance(raw, str)
         assert called["n"] == 0
 
-    def test_failure_skips_render_when_render_toggle_off(
-        self, tools, board_with_tracks, monkeypatch
-    ):
-        """KICAD_MCP_RENDER_ROUTE_PNG=0 skips the failure-evidence
-        render too: bare JSON error text, no image block."""
+    def test_failure_skips_render_by_default(self, tools, board_with_tracks, monkeypatch):
+        """Rendering is off by default: the failure-evidence render is
+        skipped too — bare JSON error text, no image block, no render
+        call."""
         import kcaa.tools.pcb_routing_tools as prt
 
-        monkeypatch.setenv("KICAD_MCP_RENDER_ROUTE_PNG", "0")
         called = {"n": 0}
 
         def _counter(*_args, **_kwargs):
