@@ -498,10 +498,21 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
     # terminal layers so the track can start/end at their centres.
     pad_half = width / 2.0 + clearance
     _sn_shapes: list = []
-    for poly, players, _ref, _pname, center in _same_net_pad_polygons(data, req.net):
-        is_end = (abs(center[0] - pad_a_xy[0]) < 1e-6 and abs(center[1] - pad_a_xy[1]) < 1e-6) or (
-            abs(center[0] - pad_b_xy[0]) < 1e-6 and abs(center[1] - pad_b_xy[1]) < 1e-6
-        )
+    _same_net = _same_net_pad_polygons(data, req.net)
+    _end_a_bbox = _endpoint_union_bbox(_same_net, req.ref_a, req.pad_a, pad_a_xy)
+    _end_b_bbox = _endpoint_union_bbox(_same_net, req.ref_b, req.pad_b, pad_b_xy)
+    for poly, players, _ref, _pname, center in _same_net:
+        # Endpoint exemption is geometric, not center-based: a THT custom
+        # terminal pad declared as main + ``connect`` sub-shapes has
+        # sub-shape centers that differ from the terminal center, so a
+        # center-equality test would treat the route's own landing pad
+        # sub-shapes (which overlap the primary pad bbox) as transit
+        # obstacles and block the A* start/end cell.  Same-named
+        # edge-connector fingers elsewhere never overlap the endpoint
+        # bbox and stay genuine obstacles.
+        is_end = _same_net_part_of_endpoint(
+            _ref, _pname, poly, req.ref_a, req.pad_a, _end_a_bbox
+        ) or _same_net_part_of_endpoint(_ref, _pname, poly, req.ref_b, req.pad_b, _end_b_bbox)
         buf = poly.buffer(pad_half)
         if buf.is_empty or not buf.is_valid:
             continue
@@ -1698,10 +1709,15 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
             engine_obstacles: list[Obstacle] = [
                 o for o in model.obstacles if start_layer in o.layers
             ]
-            for poly, players, _ref, _pname, center in _same_net_pad_polygons(data, req.net):
-                is_end = (
-                    abs(center[0] - pad_a_xy[0]) < 1e-6 and abs(center[1] - pad_a_xy[1]) < 1e-6
-                ) or (abs(center[0] - pad_b_xy[0]) < 1e-6 and abs(center[1] - pad_b_xy[1]) < 1e-6)
+            same_net_pads = _same_net_pad_polygons(data, req.net)
+            end_a_bbox = _endpoint_union_bbox(same_net_pads, req.ref_a, req.pad_a, pad_a_xy)
+            end_b_bbox = _endpoint_union_bbox(same_net_pads, req.ref_b, req.pad_b, pad_b_xy)
+            for poly, players, _ref, _pname, _center in same_net_pads:
+                is_end = _same_net_part_of_endpoint(
+                    _ref, _pname, poly, req.ref_a, req.pad_a, end_a_bbox
+                ) or _same_net_part_of_endpoint(
+                    _ref, _pname, poly, req.ref_b, req.pad_b, end_b_bbox
+                )
                 if is_end and start_layer in players:
                     continue  # the route terminates on the endpoint pad
                 if start_layer in players:
@@ -2997,17 +3013,24 @@ def _layer_engine_obstacles(
     engine_obstacles: list[Obstacle] = [o for o in model.obstacles if layer in o.layers]
     if not include_same_net_pads:
         return engine_obstacles
-    for poly, players, _ref, _pname, center in _same_net_pad_polygons(data, req.net):
+    same_net_pads = _same_net_pad_polygons(data, req.net)
+    end_a_bbox = _endpoint_union_bbox(same_net_pads, req.ref_a, req.pad_a, pad_a_xy)
+    end_b_bbox = _endpoint_union_bbox(same_net_pads, req.ref_b, req.pad_b, pad_b_xy)
+    for poly, players, p_ref, pname, center in same_net_pads:
         if layer not in players:
             continue
-        is_end_a = abs(center[0] - pad_a_xy[0]) < 1e-6 and abs(center[1] - pad_a_xy[1]) < 1e-6
-        is_end_b = abs(center[0] - pad_b_xy[0]) < 1e-6 and abs(center[1] - pad_b_xy[1]) < 1e-6
+        is_end_a = _same_net_part_of_endpoint(p_ref, pname, poly, req.ref_a, req.pad_a, end_a_bbox)
+        is_end_b = _same_net_part_of_endpoint(p_ref, pname, poly, req.ref_b, req.pad_b, end_b_bbox)
         # A thru-hole terminal pad carries copper on every layer (the
         # ``layer in players`` filter above already passed), so an
         # anchor chain may terminate on it from ANY of its copper
         # layers -- not only the layer ``_resolve_layers`` picked as
         # the nominal end.  An SMD pad only ever reaches this point on
         # its single fixed layer, so the exemption stays precise.
+        # The exemption is geometric, not name-based: a THT terminal
+        # pad declared as several sub-shapes (main + ``connect``) is
+        # exempted as a whole via bbox overlap, while a same-named
+        # edge-connector finger elsewhere stays a real obstacle.
         if is_end_a or is_end_b:
             continue  # the route terminates on this pad
         engine_obstacles.append(
@@ -3704,7 +3727,7 @@ def _find_pad_node(
     return None
 
 
-_ALL_COPPER = {"F.Cu", "B.Cu", "In1.Cu", "In2.Cu", "In3.Cu", "In4.Cu"}
+_ALL_COPPER = ("F.Cu", "B.Cu", "In1.Cu", "In2.Cu", "In3.Cu", "In4.Cu")
 
 
 def _pad_layers(pad_node: list) -> list[str]:
@@ -3719,6 +3742,65 @@ def _pad_layers(pad_node: list) -> list[str]:
                 else:
                     layers.append(name)
     return layers
+
+
+def _bbox_overlaps(
+    a: tuple[float, float, float, float], b: tuple[float, float, float, float]
+) -> bool:
+    """True when two axis-aligned bboxes (minx, miny, maxx, maxy) overlap."""
+    return not (a[2] < b[0] or b[2] < a[0] or a[3] < b[1] or b[3] < a[1])
+
+
+def _same_net_part_of_endpoint(
+    p_ref: str,
+    pname: str,
+    poly,
+    req_ref: str,
+    req_pad: str,
+    end_bbox: tuple[float, float, float, float] | None,
+) -> bool:
+    """True when (``p_ref``, ``pname``, ``poly``) is part of the endpoint
+    pad instance the route lands on.
+
+    A THT custom terminal pad is declared as several sub-shapes (main
+    pad + ``connect`` pad) whose centers differ, so a center-equality
+    exemption misses the connect sub-shape and the router treats its own
+    landing pad as an obstacle.  Sub-shapes of the same pad overlap the
+    primary pad's bbox; a same-named edge-connector finger elsewhere on
+    the board never overlaps it and stays a genuine obstacle.
+    """
+    if p_ref != req_ref or pname != req_pad:
+        return False
+    return end_bbox is not None and _bbox_overlaps(poly.bounds, end_bbox)
+
+
+def _endpoint_union_bbox(
+    same_net_pads: list,
+    ref: str,
+    pad_name: str,
+    xy: tuple[float, float],
+) -> tuple[float, float, float, float] | None:
+    """Union bbox of every same-(``ref``, ``pad_name``) pad sub-shape
+    covering the terminal point ``xy``.  The primary pad always contains
+    its own center; its overlapping ``connect`` sibling joins the union
+    (shares a bbox boundary), so the union covers the whole terminal
+    instance and the sibling is exempted together with it."""
+    parts = [
+        poly.bounds
+        for poly, _pl, r, n, _c in same_net_pads
+        if r == ref
+        and n == pad_name
+        and poly.bounds[0] - 1e-6 <= xy[0] <= poly.bounds[2] + 1e-6
+        and poly.bounds[1] - 1e-6 <= xy[1] <= poly.bounds[3] + 1e-6
+    ]
+    if not parts:
+        return None
+    return (
+        min(b[0] for b in parts),
+        min(b[1] for b in parts),
+        max(b[2] for b in parts),
+        max(b[3] for b in parts),
+    )
 
 
 def _resolve_layers(

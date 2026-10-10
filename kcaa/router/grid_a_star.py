@@ -33,7 +33,7 @@ from dataclasses import dataclass
 import heapq
 import math
 
-from shapely.geometry import LineString, Point
+from shapely.geometry import LineString, Point, box
 
 # Grid resolution (mm per cell).
 # 0.1 mm is a good balance: it captures fine-pitch pin gaps (~0.5 mm → 5 cells)
@@ -108,16 +108,31 @@ class GridMap:
     # ── coordinate helpers ──────────────────────────────────────────
 
     def to_grid(self, x: float, y: float) -> tuple[int, int]:
-        """World coordinate → (col, row)."""
-        gx = round((x - self.origin_x) / self.resolution)
-        gy = round((y - self.origin_y) / self.resolution)
+        """World coordinate → (col, row).
+
+        Cell ``g``'s centre is at ``origin + (g + 0.5) * resolution``
+        (see :meth:`to_world`), so the inverse mapping subtracts half a
+        cell before rounding: ``round((x - origin) / res - 0.5)`` picks
+        the cell whose centre is nearest, and ``to_grid(to_world(g))``
+        round-trips exactly.
+        """
+        gx = round((x - self.origin_x) / self.resolution - 0.5)
+        gy = round((y - self.origin_y) / self.resolution - 0.5)
         return int(gx), int(gy)
 
     def to_world(self, gx: int, gy: int) -> tuple[float, float]:
-        """(col, row) → world coordinate (cell centre)."""
+        """(col, row) → world coordinate (cell centre).
+
+        Rasterisation marks a cell blocked by testing the cell's centre
+        against obstacle polygons; A* walks cell centres, so the path
+        output must be the same cell centres (not the corner).  A path
+        built from corners sits ``resolution / 2`` closer to every
+        obstacle than the grid promised, which passes the grid check and
+        then fails the true clearance audit.
+        """
         return (
-            gx * self.resolution + self.origin_x,
-            gy * self.resolution + self.origin_y,
+            (gx + 0.5) * self.resolution + self.origin_x,
+            (gy + 0.5) * self.resolution + self.origin_y,
         )
 
     def in_bounds(self, gx: int, gy: int) -> bool:
@@ -150,7 +165,7 @@ def build_grid_map(
     Each obstacle is a ``shapely`` Polygon stored as the ``.shape``
     attribute of whatever object is in the list (typically
     :class:`~kcaa.router.world_model.Obstacle`).  A cell is BLOCKED if
-    its centre falls inside **any** obstacle shape.
+    its square footprint intersects **any** obstacle shape.
 
     When ``fence_bbox`` is given, cells whose centre lies **outside** it
     are also blocked: the search can never step past the fence even
@@ -198,7 +213,12 @@ def build_grid_map(
             shapes.append(s)
 
     # Rasterise: iterate over each obstacle's bounding box and mark
-    # cells whose centre falls inside the obstacle polygon.
+    # cells whose square footprint intersects the obstacle polygon.
+    # A centre-point test would let an 8-direction diagonal segment cross
+    # an obstacle corner (cells on both sides free, the segment between
+    # them clips the corner) and pass the grid check only to fail the
+    # true clearance audit.  The cell-square test blocks any cell the
+    # obstacle touches, so every walked segment keeps its promised gap.
     for shp in shapes:
         bxmin, bymin, bxmax, bymax = shp.bounds
         gx0 = max(0, int(math.floor((bxmin - origin_x) / resolution)))
@@ -212,7 +232,13 @@ def build_grid_map(
                 if blocked[gy * width + gx]:
                     continue
                 wx = gx * resolution + origin_x + resolution / 2
-                if shp.contains(Point(wx, cy)):
+                cell = box(
+                    wx - resolution / 2,
+                    cy - resolution / 2,
+                    wx + resolution / 2,
+                    cy + resolution / 2,
+                )
+                if shp.intersects(cell):
                     blocked[gy * width + gx] = True
 
     # Board fence: block every cell whose centre is outside fence_bbox.
