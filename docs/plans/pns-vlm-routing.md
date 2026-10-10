@@ -3,8 +3,12 @@
 > Status: v2 engine **implemented** (multi-layer PNS + leg-internal arcs +
 > `options`/`corner_mode=mitered45` default, issue #143 / PR #144). v3 defines
 > the **VLM ↔ PNS collaboration interface**: anchor-chain control surface,
-> render-first failure feedback, an explicit `strategy` knob
-> (auto/walkaround/shove) and an always-on `route_png` render.
+> render-first failure feedback and an always-on `route_png` render.
+> 2026-10-10: VLM-facing interface simplified — the `strategy` knob and the
+> `corner_mode`/`grid_resolution` options were **removed** from
+> `RouteRequest`/`pcb_route_pad_to_pad`; clearance/via sizing come from the
+> board's design rules/netclasses, corners are fixed mitered45, shove depth
+> fixed at the engine default.
 > Complements `docs/plans/vlm-feedback-routing.md` (v1 closed loop shipped).
 
 > **v3 changelog (2026-09-25)**
@@ -15,12 +19,12 @@
 >   `vias` are the only spatial knobs the VLM needs. All engine-internal knobs
 >   (shove depth/nets, max_length, max_vias, net_kind, keepouts, preferred
 >   region) are dropped from the VLM-facing interface.
-> - Interaction paradigm: **explicit strategy + always-on evidence** — the
->   VLM picks the `strategy` knob (`shove` / `walkaround`)
->   deliberately; every result carries a rendered `route_png` the VLM
->   inspects instead of reading coordinates.  (The earlier
->   "PNS proposes candidates, VLM selects" `candidates` design was dropped —
->   see §10.)
+> - Interaction paradigm: **always-on evidence** — every result carries a
+>   rendered `route_png` the VLM inspects instead of reading coordinates.
+>   (The earlier "PNS proposes candidates, VLM selects" `candidates` design
+>   was dropped — see §10; the explicit `strategy` knob added 2026-09-27 was
+>   itself removed 2026-10-10 as a knob VLM uses poorly — the engine always
+>   shoves at the default depth.)
 
 > **changelog (2026-09-29) — shove invariants**
 > - **Endpoints never move.**  Each movable obstacle is one file segment —
@@ -63,8 +67,9 @@ skeleton trace (DIRECTION_45::BuildInitialTrace port)
 ```
 
 No grid, no `grid_resolution`, no cell-visit heuristics, no snap-back-to-grid
-jitter. Paths live in continuous coordinates; corners are 45° mitered or
-rounded arcs from the start.
+jitter. Paths live in continuous coordinates; corners are 45° mitered (fixed:
+rounded arcs are emitted post-shove where the miter survives — the corner
+mode is not a VLM knob).
 
 ## 2. KiCad PNS engine anatomy (verified against master source)
 
@@ -188,8 +193,10 @@ build world model + buffer obstacle space   (unchanged)
       raise RouteFailure(str(exc))                      # VLM sees real cause
 ```
 
-`corner_mode` is a new `RouteRequest` field (`mitered45` default,
-`rounded45`/`rounded90` opt-in; `grid_resolution` becomes inert).
+Dispatch flow: the router always builds a mitered45 skeleton; the
+engine may re-emit arcs where the miter survives shove.  `corner_mode`
+is NOT a `RouteRequest` field anymore (removed 2026-10-10 — fixed
+mitered45); `grid_resolution` is inert/fixed at `GRID_RESOLUTION`.
 
 ### 3.4 World-model gap: arcs as obstacles
 
@@ -205,10 +212,11 @@ block correctly. Vias/tracks/pads unchanged.
 
 ### 3.6 VLM collaboration (unchanged from v1)
 
-Division of labor stays: VLM decides pair/layer/strategy; engine executes.
-`allow_shove` becomes default-on (engine *is* the shove); tool response gains
-`shoved`, `corner_mode`. `pcb-routing` skill updated: render after failure,
-retry with different corner mode / layer — no A\* concepts in the prompt.
+Division of labor stays: VLM decides pair/layer/chain; engine executes.
+Shove is default-on (engine *is* the shove); the response carries
+`shoved` and echoes `corner_mode` (`mitered45`, fixed).  `pcb-routing`
+skill updated: render after failure, retry with a different layer /
+waypoints — no A\* concepts in the prompt.
 
 ## 4. Milestones
 

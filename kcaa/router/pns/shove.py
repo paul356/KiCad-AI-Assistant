@@ -742,8 +742,8 @@ def shove_path(
             if clean is None:
                 raise ShoveFailure(
                     f"shoved track {line_chain.start} -> {line_chain.end} cannot clear "
-                    "fixed copper (pad/via/keepout); widen the gap, move the "
-                    "obstacle, or use strategy='walkaround'",
+                    "fixed copper (pad/via/keepout); widen the gap or move the "
+                    "obstacle",
                     moved_pairs=list(moved_pairs),
                     cur_line=list(cur_line),
                     hit=line_chain,
@@ -777,8 +777,7 @@ def shove_path(
             raise ShoveFailure(
                 f"shove chain did not converge within depth {max_depth}: a "
                 "collision remains between a displaced track and an "
-                "unhandled neighbour; widen the gap or use "
-                "strategy='walkaround'",
+                "unhandled neighbour; widen the gap",
                 moved_pairs=list(moved_pairs),
                 cur_line=list(cur_line),
             )

@@ -113,6 +113,49 @@ def _base_pro() -> dict:
     }
 
 
+def _min_pro_dict(
+    *,
+    clearance: float = 0.2,
+    track_width: float = 0.25,
+    via_diameter: float = 0.6,
+    via_drill: float = 0.3,
+) -> dict:
+    """Minimal .kicad_pro payload: design rules (min_clearance) + a Default
+    netclass with track width and via sizing, so DRC lookups resolve for
+    throwaway single-/double-layer test boards."""
+    return {
+        "board": {
+            "design_settings": {
+                "rules": {
+                    "min_clearance": clearance,
+                    "min_track_width": track_width,
+                    "min_via_size": via_diameter,
+                    "min_through_drill": via_drill,
+                }
+            }
+        },
+        "net_settings": {
+            "classes": [
+                {
+                    "name": "Default",
+                    "track_width": track_width,
+                    "clearance": clearance,
+                    "via_diameter": via_diameter,
+                    "via_drill": via_drill,
+                }
+            ],
+            "netclass_patterns": [],
+        },
+    }
+
+
+def _write_min_pro(pcb_path: Path, **kwargs: float) -> None:
+    """Write a matching ``<base>.kicad_pro`` next to ``pcb_path`` (same
+    base name — the router matches by prefix) so clearance/via DRC lookups
+    resolve.  ``kwargs`` go to :func:`_min_pro_dict`."""
+    (pcb_path.with_suffix(".kicad_pro")).write_text(json.dumps(_min_pro_dict(**kwargs)))
+
+
 def test_default_track_width_uses_netclass_pattern(tmp_path: Path) -> None:
     payload = _base_pro()
     payload["net_settings"]["classes"].append(
@@ -259,9 +302,10 @@ def test_auto_route_pair_translates_pro_missing_into_route_failure(tmp_path: Pat
     assert "width=" in msg  # the hint to pass width= explicitly
 
 
-def test_auto_route_pair_explicit_width_skips_drc(tmp_path: Path) -> None:
-    """When the user passes width= explicitly, missing .kicad_pro must not
-    block routing — that's the whole point of the explicit override."""
+def test_auto_route_pair_explicit_width_still_needs_pro_for_clearance(tmp_path: Path) -> None:
+    """Clearance is no longer a request knob: even with width= passed
+    explicitly, a missing .kicad_pro blocks routing because clearance
+    always comes from the design rules."""
     src = _fixture_pcb()
     dst = tmp_path / "board.kicad_pcb"
     dst.write_text(Path(src).read_text())
@@ -275,11 +319,10 @@ def test_auto_route_pair_explicit_width_skips_drc(tmp_path: Path) -> None:
         pad_b="1",
         net="VCC",
         width=0.3,
-        clearance=0.2,
     )
-    # Should NOT raise — both DRC lookups are skipped.
-    result = auto_route_pair(req)
-    assert len(result.segments) > 0
+    with pytest.raises(RouteFailure) as excinfo:
+        auto_route_pair(req)
+    assert "clearance" in str(excinfo.value).lower()
 
 
 def test_final_path_drc_rejects_adjusted_geometry_violation() -> None:
@@ -406,6 +449,7 @@ def _make_dense_board(tmp_path: Path, x1_at: tuple[float, float]) -> Path:
 """
     pcb_path = tmp_path / "dense.kicad_pcb"
     pcb_path.write_text(pcb)
+    _write_min_pro(pcb_path, clearance=0.1)
     return pcb_path
 
 
@@ -439,7 +483,6 @@ def test_dense_pad_connector_routes_with_legal_clearance(tmp_path: Path, algorit
             pad_b="1",
             net="VCC",
             width=0.2,
-            clearance=0.1,
             algorithm=algorithm,
             via_pairs=(),
         )
@@ -463,7 +506,6 @@ def test_dense_pad_connector_covered_start_fails(tmp_path: Path, algorithm: str)
                 pad_b="1",
                 net="VCC",
                 width=0.2,
-                clearance=0.1,
                 algorithm=algorithm,
                 via_pairs=(),
             )
@@ -566,6 +608,7 @@ def test_auto_route_pair_warns_when_no_edge_cuts(
     )
     dst = tmp_path / "board.kicad_pcb"
     dst.write_text(no_edge_cuts)
+    shutil.copy(_PRO_FIXTURE, tmp_path / "board.kicad_pro")
 
     req = RouteRequest(
         pcb_path=str(dst),
@@ -575,7 +618,6 @@ def test_auto_route_pair_warns_when_no_edge_cuts(
         pad_b="1",
         net="VCC",
         width=0.3,
-        clearance=0.2,
     )
     with caplog.at_level("WARNING", logger="kcaa.router.router"):
         result = auto_route_pair(req)
@@ -605,7 +647,6 @@ def test_unknown_layer_in_pcb_raises_route_failure(tmp_path: Path) -> None:
         pad_b="1",
         net="VCC",
         width=0.3,
-        clearance=0.2,
         via_pairs=(("F.Cu", "In2.Cu"),),  # 4-layer fixture has no In2.Cu
     )
     with pytest.raises(RouteFailure) as excinfo:
@@ -619,6 +660,7 @@ def test_smd_pad_layer_hint_ignored_route_on_pad_layer(tmp_path: Path) -> None:
     src = _fixture_pcb()
     dst = tmp_path / "board.kicad_pcb"
     dst.write_text(Path(src).read_text())
+    shutil.copy(_PRO_FIXTURE, tmp_path / "board.kicad_pro")
 
     # R1.1 / C1.1 are SMD on F.Cu in the fixture; layer_hint="B.Cu" is
     # ignored for SMD pads (layer is fixed), so the route stays on F.Cu
@@ -631,7 +673,6 @@ def test_smd_pad_layer_hint_ignored_route_on_pad_layer(tmp_path: Path) -> None:
         pad_b="1",
         net="VCC",
         width=0.3,
-        clearance=0.2,
         layer_hint="B.Cu",  # ignored for SMD pads; route stays F.Cu
     )
     # R1.1 / C1.1 are SMD on F.Cu — route should succeed on F.Cu.
@@ -813,7 +854,6 @@ def test_smd_pad_layer_is_fixed(pcb_copy):
         pad_b="1",
         net="VCC",
         width=0.25,
-        clearance=0.2,
         layer_hint="B.Cu",  # ignored — SMD pads are on F.Cu
     )
     result = auto_route_pair(req)
@@ -859,6 +899,7 @@ def test_duplicate_pad_name_resolves_to_layer_matching_pad(tmp_path: Path) -> No
         "\t)\n"
     )
     dst.write_text(board[:-1] + x1 + ")\n")
+    shutil.copy(_PRO_FIXTURE, tmp_path / "board.kicad_pro")
 
     data = load_pcb(str(dst))
     # F.Cu resolves to the first pad; B.Cu skips it and finds the thru-hole
@@ -879,7 +920,6 @@ def test_duplicate_pad_name_resolves_to_layer_matching_pad(tmp_path: Path) -> No
         net="VCC",
         layer_hint="B.Cu",
         width=0.25,
-        clearance=0.2,
     )
     result = auto_route_pair(req)
     # The route must end on the thru-hole pad at world (62+2, 45), not on
@@ -941,6 +981,7 @@ def test_multi_layer_via_not_on_same_net_pad(tmp_path: Path) -> None:
         "\t)\n"
     )
     dst.write_text(board[:-1] + x3 + ")\n")
+    shutil.copy(_PRO_FIXTURE, tmp_path / "board.kicad_pro")
 
     # R1/1 F.Cu -> X1/T B.Cu (both VCC).  A via is unavoidable (layer
     # change).  The via must not land on X3/1 (45,40) or X3/2 (50,40).
@@ -953,7 +994,6 @@ def test_multi_layer_via_not_on_same_net_pad(tmp_path: Path) -> None:
         net="VCC",
         layer_hint="B.Cu",
         width=0.25,
-        clearance=0.2,
     )
     result = auto_route_pair(req)
     assert len(result.vias) > 0
@@ -999,6 +1039,7 @@ def test_multi_layer_route_avoids_same_net_tht_hole(tmp_path: Path) -> None:
         "\t)\n"
     )
     dst.write_text(board[:-1] + x2 + ")\n")
+    shutil.copy(_PRO_FIXTURE, tmp_path / "board.kicad_pro")
 
     # R1/1 (29.5, 30) F.Cu -> C1/1 (60, 29.5) F.Cu, both VCC.
     # Without the hole obstacle, A* would run a track at y≈30 through
@@ -1012,7 +1053,6 @@ def test_multi_layer_route_avoids_same_net_tht_hole(tmp_path: Path) -> None:
         net="VCC",
         # Both R1/1 and C1/1 are SMD on F.Cu → single-layer route.
         width=0.25,
-        clearance=0.2,
     )
     result = auto_route_pair(req)
     assert len(result.segments) > 0
@@ -1069,6 +1109,7 @@ def _board_with_bay_connector(tmp_path: Path) -> Path:
         "\t)\n"
     )
     dst.write_text(board[:-1] + x1 + ")\n")
+    shutil.copy(_PRO_FIXTURE, tmp_path / "board.kicad_pro")
     return dst
 
 
@@ -1098,7 +1139,6 @@ def test_auto_route_pair_reaches_pad_in_footprint_drawn_bay(tmp_path: Path) -> N
         net="VCC",
         # R1/1 SMD F.Cu → X1/T THT; both share F.Cu → single-layer.
         width=0.25,
-        clearance=0.2,
     )
     result = auto_route_pair(req)
     assert result.end == pytest.approx((64.0, 62.0), abs=0.02)
@@ -1131,6 +1171,7 @@ def _board_with_opening(tmp_path: Path, rect: tuple[float, float, float, float])
         "\t)\n"
     )
     dst.write_text(board[:-1] + opening + ")\n")
+    shutil.copy(_PRO_FIXTURE, tmp_path / "board.kicad_pro")
     return dst
 
 
@@ -1166,7 +1207,6 @@ def test_auto_route_pair_detours_around_internal_opening(tmp_path: Path) -> None
         pad_b="1",
         net="VCC",
         width=0.25,
-        clearance=0.2,
     )
     result = auto_route_pair(req)
     assert len(result.segments) > 0
@@ -1201,7 +1241,6 @@ def test_auto_route_pair_detours_around_tall_opening(tmp_path: Path) -> None:
         pad_b="1",
         net="VCC",
         width=0.25,
-        clearance=0.2,
     )
     result = auto_route_pair(req)
     assert len(result.segments) > 0
@@ -1227,7 +1266,6 @@ def test_auto_route_pair_rejects_pads_on_different_nets(tmp_path: Path) -> None:
         pad_b="1",  # C1/1 is on VCC
         net="NET_A",  # matches neither pad -> early rejection
         width=0.25,
-        clearance=0.2,
     )
     with pytest.raises(RouteFailure, match="cannot route between different nets"):
         auto_route_pair(req)
@@ -1398,6 +1436,7 @@ def _make_clear_board(tmp_path: Path) -> str:
 """
     pcb_path = tmp_path / "clear_board.kicad_pcb"
     pcb_path.write_text(pcb)
+    _write_min_pro(pcb_path)
     return str(pcb_path)
 
 
@@ -1412,56 +1451,34 @@ def _route_clear(req_extra: dict, tmp_path: Path):
         "pad_b": "1",
         "net": "VCC",
         "width": 0.2,
-        "clearance": 0.2,
         "via_pairs": (),
     }
     base.update(req_extra)
     return auto_route_pair(RouteRequest(**base))
 
 
-def test_engine_rounded45_emits_arc(tmp_path: Path) -> None:
-    """corner_mode=rounded45 on an unobstructed skeleton must produce
-    OutputArc nodes whose start point sits on the route start pad."""
-    result = _route_clear({"corner_mode": "rounded45", "algorithm": "pns"}, tmp_path)
-    assert len(result.arcs) == 1
-    a = result.arcs[0]
-    assert a.width == 0.2
-    assert a.layer == "F.Cu"
-    assert a.net == "VCC"
-    # Arc endpoints anchored on the skeleton legs.
-    assert a.start[1] == pytest.approx(30.0, abs=1e-3)
-    assert a.end == pytest.approx((60.0, 39.5), abs=1e-3)
-
-
 def test_engine_mitered45_no_arcs(tmp_path: Path) -> None:
-    result = _route_clear({"corner_mode": "mitered45"}, tmp_path)
+    """The engine is fixed to mitered45 corners: an unobstructed PNS
+    skeleton emits plain 0/45/90 segments, never arc nodes."""
+    result = _route_clear({"algorithm": "pns"}, tmp_path)
     assert result.arcs == []
     assert len(result.segments) >= 2
 
 
 def test_engine_default_corner_mode_is_mitered45(tmp_path: Path) -> None:
-    """Omitting corner_mode defaults to mitered45: an unobstructed PNS
-    skeleton emits plain 0/45/90 segments (no arcs) and the result
-    echoes the default."""
+    """Corner mode is fixed at mitered45: an unobstructed PNS skeleton
+    emits plain 0/45/90 segments (no arcs) and the result echoes the
+    fixed value."""
     result = _route_clear({"algorithm": "pns"}, tmp_path)
     assert result.corner_mode == "mitered45"
     assert len(result.arcs) == 0
 
 
-def test_engine_rounded90_arc(tmp_path: Path) -> None:
-    result = _route_clear({"corner_mode": "rounded90", "algorithm": "pns"}, tmp_path)
-    assert len(result.arcs) == 1
-
-
 def test_engine_corner_mode_echoed(tmp_path: Path) -> None:
-    result = _route_clear({"corner_mode": "rounded90"}, tmp_path)
-    assert result.corner_mode == "rounded90"
-
-
-def test_engine_invalid_corner_mode_raises(tmp_path: Path) -> None:
-    with pytest.raises(RouteFailure) as excinfo:
-        _route_clear({"corner_mode": "octagonal"}, tmp_path)
-    assert "corner_mode" in str(excinfo.value)
+    """The result echoes the fixed mitered45 corner mode regardless of
+    request (corner mode is no longer a request knob)."""
+    result = _route_clear({"algorithm": "pns"}, tmp_path)
+    assert result.corner_mode == "mitered45"
 
 
 def test_engine_empty_shoved_tracks_by_default(tmp_path: Path) -> None:
@@ -1469,9 +1486,9 @@ def test_engine_empty_shoved_tracks_by_default(tmp_path: Path) -> None:
     assert result.shoved_tracks == []
 
 
-def test_engine_detour_linearizes_arc(tmp_path: Path) -> None:
-    """An obstacle on the skeleton forces a walkaround; the rounded arc
-    must be linearized (no OutputArc) and the path must clear the
+def test_engine_detour_linearizes_skeleton(tmp_path: Path) -> None:
+    """An obstacle on the skeleton forces a walkaround; the output stays
+    straight (mitered corners, no OutputArc) and the path must clear the
     obstacle by the DRC clearance."""
     from shapely.geometry import LineString
 
@@ -1528,6 +1545,7 @@ def test_engine_detour_linearizes_arc(tmp_path: Path) -> None:
 """
     pcb_path = tmp_path / "blocked_board.kicad_pcb"
     pcb_path.write_text(pcb)
+    _write_min_pro(pcb_path)
     from kcaa.router.router import RouteRequest, auto_route_pair
 
     result = auto_route_pair(
@@ -1539,9 +1557,7 @@ def test_engine_detour_linearizes_arc(tmp_path: Path) -> None:
             pad_b="1",
             net="VCC",
             width=0.2,
-            clearance=0.2,
             via_pairs=(),
-            corner_mode="rounded45",
         )
     )
     assert result.arcs == []
@@ -1574,7 +1590,7 @@ def _route_board_copy(tmp_path: Path, src: str = "test_routing_board.kicad_pcb")
     dst.write_text(Path(fixture).read_text())
     pro = fixture.with_suffix(".kicad_pro")
     if pro.exists():
-        (tmp_path / pro.name).write_text(Path(pro).read_text())
+        (dst.with_suffix(".kicad_pro")).write_text(Path(pro).read_text())
     return dst
 
 
@@ -1591,7 +1607,6 @@ def test_algorithm_astar_single_layer_routes(tmp_path: Path) -> None:
             pad_b="1",
             net="VCC",
             width=0.25,
-            clearance=0.2,
             algorithm="astar",
         )
     )
@@ -1613,7 +1628,6 @@ def test_algorithm_default_is_astar(tmp_path: Path) -> None:
             pad_b="1",
             net="VCC",
             width=0.25,
-            clearance=0.2,
         )
     )
     assert len(result.segments) > 0
@@ -1633,7 +1647,6 @@ def test_algorithm_pns_single_layer_echoes_pns(tmp_path: Path) -> None:
             pad_b="1",
             net="VCC",
             width=0.25,
-            clearance=0.2,
             algorithm="pns",
         )
     )
@@ -1694,9 +1707,7 @@ def test_pns_multi_layer_route_crosses_layers(tmp_path: Path) -> None:
             net="VCC",
             layer_hint="B.Cu",
             width=0.25,
-            clearance=0.2,
             algorithm="pns",
-            corner_mode="mitered45",
         )
     )
     assert result.algorithm == "pns"
@@ -1747,9 +1758,7 @@ def test_pns_anchor_chain_terminates_on_tht_any_copper_layer(tmp_path: Path) -> 
             # No layer_hint: shared layer = F.Cu, so end_layer resolves
             # to F.Cu even though X1/T is THT on all copper layers.
             width=0.25,
-            clearance=0.2,
             algorithm="pns",
-            corner_mode="mitered45",
             waypoints=[{"kind": "via", "pos": (45.0, 35.0), "to_layer": "B.Cu"}],
         )
     )
@@ -1811,7 +1820,6 @@ def test_pns_multi_layer_via_not_on_same_net_pad(tmp_path: Path) -> None:
             net="VCC",
             layer_hint="B.Cu",
             width=0.25,
-            clearance=0.2,
             algorithm="pns",
         )
     )
@@ -1840,7 +1848,6 @@ def test_pns_multi_layer_unreachable_via_pairs(tmp_path: Path) -> None:
         pad_b="2",
         net="GND",
         width=0.25,
-        clearance=0.2,
         algorithm="pns",
         via_pairs=(("F.Cu", "B.Cu"),),  # no edge touches In1.Cu
     )
@@ -1855,9 +1862,11 @@ def test_pns_multi_layer_unreachable_via_pairs(tmp_path: Path) -> None:
 def test_pns_multi_layer_missing_pro_rejects_unvalidated_vias(
     tmp_path: Path,
 ) -> None:
-    """Via placement must stay strict when the .kicad_pro is missing: the
-    route cannot silently place vias without netclass/DRC data (check_vias
-    reports a project-level failure the candidate indices can't match)."""
+    """Routing a PNS pair without a .kicad_pro must fail loudly: the
+    route cannot silently place vias without netclass/DRC data.  Width
+    is explicit, so the failure surfaces at the next DRC lookup —
+    clearance (which always comes from the design rules, never a
+    request knob)."""
     src = _fixture_pcb()
     dst = tmp_path / "board.kicad_pcb"
     board = Path(src).read_text().rstrip()
@@ -1872,13 +1881,12 @@ def test_pns_multi_layer_missing_pro_rejects_unvalidated_vias(
         pad_b="T",
         net="VCC",
         layer_hint="B.Cu",
-        width=0.25,  # explicit: skip width/clearance DRC lookup
-        clearance=0.2,
+        width=0.25,  # explicit: skip width lookup
         algorithm="pns",
     )
     with pytest.raises(RouteFailure) as excinfo:
         auto_route_pair(req)
-    assert "cannot DRC-check PNS vias" in str(excinfo.value)
+    assert "clearance" in str(excinfo.value).lower()
 
 
 def test_pns_multi_layer_three_legs_share_via_anchors(tmp_path: Path) -> None:
@@ -1897,7 +1905,6 @@ def test_pns_multi_layer_three_legs_share_via_anchors(tmp_path: Path) -> None:
             net="VCC",
             layer_hint="In1.Cu",
             width=0.25,
-            clearance=0.2,
             algorithm="pns",
             via_pairs=(("F.Cu", "B.Cu"), ("B.Cu", "In1.Cu")),
         )
@@ -1918,50 +1925,12 @@ def test_pns_multi_layer_three_legs_share_via_anchors(tmp_path: Path) -> None:
             )
 
 
-def test_pns_multi_layer_rounded45_emits_leg_arc(tmp_path: Path) -> None:
-    """Multi-layer PNS with corner_mode='rounded45' emits rounded-corner
-    arcs inside a leg whose skeleton survived walkaround/shove, and never
-    places an arc on a via junction: the via stays a straight-through
-    connection (the arc's start/mid/end avoid every via center)."""
-    # Route X1/T (THT pad, B.Cu) -> R1/1 (F.Cu): the B.Cu leg is
-    # unobstructed, so its rounded skeleton (interior corner) survives
-    # and a fillet arc is emitted on that leg.
-    dst = _write_pns_board(tmp_path, _x1_tht_on_b_cu())
-    result = auto_route_pair(
-        RouteRequest(
-            pcb_path=str(dst),
-            ref_a="X1",
-            pad_a="T",
-            ref_b="R1",
-            pad_b="1",
-            net="VCC",
-            layer_hint="B.Cu",
-            width=0.25,
-            clearance=0.2,
-            algorithm="pns",
-            corner_mode="rounded45",
-        )
-    )
-    assert result.algorithm == "pns"
-    assert len(result.vias) >= 1
-    assert len(result.arcs) >= 1
-    for arc in result.arcs:
-        assert arc.layer in ("F.Cu", "B.Cu", "In1.Cu")
-        assert arc.net == "VCC"
-        assert arc.width == pytest.approx(0.25)
-        for pt in (arc.start, arc.mid, arc.end):
-            for via in result.vias:
-                assert not (abs(pt[0] - via.x) < 1e-6 and abs(pt[1] - via.y) < 1e-6), (
-                    f"PNS arc point {pt} coincides with via center ({via.x:.3f}, {via.y:.3f})"
-                )
-
-
 def test_pns_multi_layer_mitered45_default_keeps_straight_segments(
     tmp_path: Path,
 ) -> None:
-    """The same multi-layer pair with corner_mode='mitered45' (the
-    default) emits straight segments + vias only — the rounded45 arc
-    behavior must not leak into the default output."""
+    """The fixed mitered45 corner mode keeps the multi-layer PNS output
+    straight: segments + vias only, never fillet arcs (corner shape is
+    no longer a request knob)."""
     dst = _write_pns_board(tmp_path, _x1_tht_on_b_cu())
     result = auto_route_pair(
         RouteRequest(
@@ -1973,9 +1942,7 @@ def test_pns_multi_layer_mitered45_default_keeps_straight_segments(
             net="VCC",
             layer_hint="B.Cu",
             width=0.25,
-            clearance=0.2,
             algorithm="pns",
-            corner_mode="mitered45",
         )
     )
     assert len(result.vias) >= 1
@@ -1995,7 +1962,6 @@ def test_algorithm_invalid_value_raises_route_failure(tmp_path: Path) -> None:
         pad_b="1",
         net="VCC",
         width=0.25,
-        clearance=0.2,
         algorithm="bogus",
     )
     with pytest.raises(RouteFailure) as excinfo:
@@ -2095,11 +2061,7 @@ def _route_pns_waypoints(board: Path, waypoints: list[dict]) -> RouteResult:
             pad_b="1",
             net="VCC",
             width=0.2,
-            clearance=0.2,
-            via_diameter=0.8,
-            via_drill=0.4,
             algorithm="pns",
-            corner_mode="mitered45",
             waypoints=waypoints,
         )
     )
@@ -2113,7 +2075,6 @@ def test_waypoints_waypoint_routes_through_point(tmp_path: Path) -> None:
     result = _route_clear(
         {
             "algorithm": "pns",
-            "corner_mode": "mitered45",
             "waypoints": [{"kind": "waypoint", "pos": (45.0, 30.0), "tol_mm": 1.0}],
         },
         tmp_path,
@@ -2148,7 +2109,6 @@ def test_waypoints_waypoint_unreachable_is_soft_skip(tmp_path, monkeypatch) -> N
     result = _route_clear(
         {
             "algorithm": "pns",
-            "corner_mode": "mitered45",
             "waypoints": [{"kind": "waypoint", "pos": (45.0, 30.0), "tol_mm": 1.0}],
         },
         tmp_path,
@@ -2263,7 +2223,6 @@ def test_waypoints_mitered45_keeps_exact_anchor_no_spike(tmp_path: Path) -> None
     result = _route_clear(
         {
             "algorithm": "pns",
-            "corner_mode": "mitered45",
             # Clear-board pads: R1/1 at (29.5, 30.0), C1/1 at (60.0, 39.5).
             # (29.5, 39.5) is the L-corner: same x as the start pad (a
             # vertical lead-out) and same y as the end pad (horizontal
@@ -2309,7 +2268,7 @@ def test_waypoints_unknown_kind_raises(tmp_path: Path) -> None:
 def test_waypoints_same_layer_legs_emit_each_segment_once(tmp_path: Path) -> None:
     """finalize_legs must consume each layer's postprocess output once.
 
-    A single-layer rounded90 waypoint chain (one skeleton-direct leg plus
+    A single-layer waypoint chain (one skeleton-direct leg plus
     several waypoint legs on the same layer) used to extend the *whole*
     layer's postprocess segments once per non-direct leg: every segment
     came out N copies of the full chain (regression: 160 segs / 53 unique
@@ -2319,7 +2278,6 @@ def test_waypoints_same_layer_legs_emit_each_segment_once(tmp_path: Path) -> Non
     result = _route_clear(
         {
             "algorithm": "pns",
-            "corner_mode": "rounded90",
             "waypoints": [
                 {"kind": "waypoint", "pos": (40.0, 31.0), "tol_mm": 1.0},
                 {"kind": "waypoint", "pos": (50.0, 33.0), "tol_mm": 1.0},
@@ -2331,12 +2289,8 @@ def test_waypoints_same_layer_legs_emit_each_segment_once(tmp_path: Path) -> Non
     assert result.waypoint_violated is False
     assert result.end == pytest.approx((60.0, 39.5), abs=1e-3)
     assert all(s.layer == "F.Cu" for s in result.segments)
-    # The chain is non-trivial: four rounded90 legs of bent geometry (each
-    # a straight leg + fillet arc), not an empty/point-to-point shortcut
-    # that would trivially pass.  The soft anchor keeps the skeleton alive
-    # so every leg emits a real arc; the old >=10-segment proxy counted
-    # the mitered polygon samples the joint-pinning bug produced instead.
-    assert len(result.arcs) >= 3
+    # The chain is non-trivial: four PNS legs of bent geometry, not an
+    # empty/point-to-point shortcut that would trivially pass.
     assert len(result.segments) >= 4
     fingerprints = [(s.x1, s.y1, s.x2, s.y2, s.width, s.layer, s.net) for s in result.segments]
     assert len(fingerprints) == len(set(fingerprints)), (
@@ -2345,69 +2299,15 @@ def test_waypoints_same_layer_legs_emit_each_segment_once(tmp_path: Path) -> Non
     )
 
 
-def test_waypoints_tol_mm_floats_joint_inside_circle(tmp_path: Path) -> None:
-    """tol_mm > 0 soft-anchors a waypoint: the leg joint that targets the
-    waypoint sits strictly inside the tolerance circle (not pinned onto
-    pos) and the route still reaches the far pad, violation-free."""
-    result = _route_clear(
-        {
-            "algorithm": "pns",
-            "corner_mode": "rounded90",
-            "waypoints": [{"kind": "waypoint", "pos": (45.0, 30.0), "tol_mm": 2.0}],
-        },
-        tmp_path,
-    )
-    assert result.waypoint_violated is False
-    assert result.violated_waypoints == []
-    assert result.end == pytest.approx((60.0, 39.5), abs=1e-3)
-    verts = [pt for s in result.segments for pt in ((s.x1, s.y1), (s.x2, s.y2))]
-    verts += [pt for a in result.arcs for pt in (a.start, a.mid, a.end)]
-    dists = [math.hypot(x - 45.0, y - 30.0) for x, y in verts]
-    d = min(dists)
-    assert d > 1e-6, "soft anchor must float off the exact waypoint pos"
-    assert d <= 2.0 + 1e-6, "joint must stay inside the tol_mm circle"
-
-
-def test_waypoints_soft_anchor_rounds_joints_with_arcs(tmp_path: Path) -> None:
-    """A large tol_mm keeps every waypoint leg's skeleton fillet alive:
-    each joint carries a real OutputArc ending inside the packet's
-    tolerance circle instead of being pinned onto the waypoint (which
-    suppressed every leg pre-fix: only the pad-terminated leg emitted an
-    arc and the chain rendered as a mitered polygon)."""
-    result = _route_clear(
-        {
-            "algorithm": "pns",
-            "corner_mode": "rounded90",
-            "waypoints": [
-                {"kind": "waypoint", "pos": (40.0, 31.0), "tol_mm": 1.5},
-                {"kind": "waypoint", "pos": (50.0, 33.0), "tol_mm": 1.5},
-                {"kind": "waypoint", "pos": (55.0, 36.0), "tol_mm": 1.5},
-            ],
-        },
-        tmp_path,
-    )
-    assert result.waypoint_violated is False
-    # Three waypoints split the route into four legs; each rounded90 leg
-    # emits its fillet arc (the pre-fix joint-pinning emitted exactly one).
-    assert len(result.arcs) >= 4
-    for wpt in ((40.0, 31.0), (50.0, 33.0), (55.0, 36.0)):
-        dists = [math.hypot(x - wpt[0], y - wpt[1]) for x, y in (a.end for a in result.arcs)]
-        d = min(dists)
-        assert d > 1e-6, f"arc must not be pinned onto joint {wpt}"
-        assert d <= 1.5 + 1e-6, f"arc must cover joint {wpt} inside tol_mm"
-
-
 def test_waypoints_without_tol_keep_exact_anchor(tmp_path: Path) -> None:
     """Omitting tol_mm (or passing 0) keeps the exact anchor: the chain
-    is pinned through the waypoint joints (no soft float) and the whole-
-    chain tangent fillet rounds every joint in place (the legacy sharp-
-    corner output -- a single pad-terminated arc -- is deliberately
-    gone: waypoint joints are exactly the corners the fillet rounds)."""
+    is pinned through the waypoint joints (no soft float).  The corner
+    mode is fixed at mitered45, so the polyline stays sharp (no fillet
+    arcs) while still passing through every waypoint joint."""
     for wpt_extra in ({}, {"tol_mm": 0.0}):
         result = _route_clear(
             {
                 "algorithm": "pns",
-                "corner_mode": "rounded90",
                 "waypoints": [
                     {"kind": "waypoint", "pos": (40.0, 31.0), **wpt_extra},
                     {"kind": "waypoint", "pos": (50.0, 33.0), **wpt_extra},
@@ -2417,10 +2317,7 @@ def test_waypoints_without_tol_keep_exact_anchor(tmp_path: Path) -> None:
             tmp_path,
         )
         assert result.waypoint_violated is False
-        # The pad-terminated final leg arc plus chain fillet arcs at the
-        # waypoint joints (pre-fix output had exactly one arc because
-        # waypoint joints stayed sharp miter corners -- now filleted).
-        assert len(result.arcs) >= 2
+        assert result.arcs == [], "mitered45 waypoint chains emit no arcs"
         pts = _route_polyline_sampled(result)
         for wpt in ((40.0, 31.0), (50.0, 33.0), (55.0, 36.0)):
             d = min(math.hypot(px - wpt[0], py - wpt[1]) for px, py in pts)
@@ -2456,7 +2353,6 @@ def test_waypoints_tol_circle_blocked_falls_back_exact(tmp_path: Path) -> None:
     base = {
         "pcb_path": str(pcb_path),
         "algorithm": "pns",
-        "corner_mode": "mitered45",
     }
     hard = _route_clear(
         {**base, "waypoints": [{"kind": "waypoint", "pos": (45.0, 30.0), "tol_mm": 1.0}]},
@@ -2577,6 +2473,7 @@ def _make_ring_board(
 """
     pcb_path = tmp_path / "ring_board.kicad_pcb"
     pcb_path.write_text(pcb)
+    _write_min_pro(pcb_path)
     return str(pcb_path)
 
 
@@ -2590,7 +2487,7 @@ def _route_ring(
     same_net_pad: tuple[float, float] | None = None,
 ):
     """Route the ring board's R1/1 -> C1/1 pads through ``waypoints``
-    (rounded90 PNS, 0.2 mm width/clearance); ``blocker`` and
+    (mitered45 PNS, 0.2 mm width/clearance); ``blocker`` and
     ``same_net_pad`` carry through to the fixture builder."""
     from kcaa.router.router import RouteRequest, auto_route_pair
 
@@ -2603,9 +2500,7 @@ def _route_ring(
             pad_b="1",
             net="VCC",
             width=0.2,
-            clearance=0.2,
             via_pairs=(),
-            corner_mode="rounded90",
             algorithm="pns",
             waypoints=waypoints,
         )
@@ -2797,7 +2692,8 @@ def test_waypoints_non_cocircular_falls_back_to_polyline(tmp_path: Path) -> None
     assert result.waypoint_violated is False
     assert result.end == pytest.approx((70.0, 35.0), abs=1e-3)
     assert len(result.segments) > 0, "fallback must route the per-leg polyline"
-    assert len(result.arcs) >= 1, "fallback keeps the per-leg fillet arcs"
+    # Corner mode is fixed at mitered45: the fallback stays all-straight
+    # (no per-leg fillet arcs, and no covering arc on the ring circle).
     # No emitted arc lies on the ring circle AND covers >= 80% of the
     # chain span: the whole-chain arc must never fire off-circle.
     for a in _covering_arcs(result):
@@ -2872,127 +2768,26 @@ def test_waypoints_cocircular_chain_crossing_same_net_pad_still_emits_arc(
 
 
 def test_waypoints_chain_tangent_fillet_rounds_joints(tmp_path: Path) -> None:
-    """Non-cocircular waypoint chains get the whole-chain tangent fillet
-    in the rounded corner modes: an exact-anchor axis-aligned zigzag has
-    every interior joint rounded by tangent arcs, so the sampled
-    recomposed centerline contains no corner sharper than 170 deg (G1);
-    the mitered corner modes keep the same chain sharp."""
+    """Corner mode is fixed at mitered45, so non-cocircular waypoint
+    chains stay sharp: an exact-anchor axis-aligned zigzag emits no
+    fillet arcs and the sampled recomposed centerline keeps its sharp
+    miter corners at every interior joint."""
     waypoints = [
         {"kind": "waypoint", "pos": (45.0, 30.0)},
         {"kind": "waypoint", "pos": (45.0, 42.0)},
         {"kind": "waypoint", "pos": (60.0, 42.0)},
     ]
-    rounded = _route_clear(
-        {"algorithm": "pns", "corner_mode": "rounded90", "waypoints": waypoints},
-        tmp_path,
-    )
-    assert rounded.waypoint_violated is False
-    assert rounded.end == pytest.approx((60.0, 39.5), abs=1e-3)
-    # The three 90 degree joints (each mitered into two 135 degree
-    # corners) are rounded: six tangent fillet arcs and no other arcs
-    # (the axis-aligned legs carry no skeleton arcs of their own).
-    assert len(rounded.arcs) == 6
-    pts = _route_polyline_sampled(rounded, n=128)
-    for p0, p1, p2 in zip(pts, pts[1:], pts[2:]):
-        ang = _interior_angle(p0, p1, p2)
-        assert ang >= 170.0 - 1e-6, f"filleted chain has a corner of {ang:.1f} deg at {p1}"
-    # Control: the same chain in the mitered corner mode stays sharp.
     mitered = _route_clear(
-        {"algorithm": "pns", "corner_mode": "mitered45", "waypoints": waypoints},
+        {"algorithm": "pns", "waypoints": waypoints},
         tmp_path,
     )
+    assert mitered.waypoint_violated is False
+    assert mitered.end == pytest.approx((60.0, 39.5), abs=1e-3)
     assert mitered.arcs == []
     mpts = _route_polyline_sampled(mitered)
     assert any(
         _interior_angle(p0, p1, p2) < 170.0 - 1e-6 for p0, p1, p2 in zip(mpts, mpts[1:], mpts[2:])
-    ), "mitered control must keep its sharp miter corners"
-
-
-def test_waypoints_chain_fillet_drc_shrinks_falls_back(tmp_path: Path) -> None:
-    """The chain fillet is DRC-aware: a foreign-net pad near a joint
-    blocks the full-radius fillet arc, so the router halves the radius
-    until the arc keeps the clearance + width/2 centerline margin --
-    joints away from the blocker keep the full radius, shrinking never
-    breaks the G1 tangency, and the route still reaches the far pad
-    without a waypoint violation."""
-    from shapely.geometry import LineString, box
-
-    pcb_path = Path(_make_clear_board(tmp_path))
-    text = pcb_path.read_text()
-    text = text.replace('\t(net 1 "VCC")\n', '\t(net 1 "VCC")\n\t(net 2 "GND")\n')
-    text = (
-        text.rstrip()[:-1] + '\n\t(footprint "user_add:blocker"\n'
-        '\t\t(layer "F.Cu")\n'
-        "\t\t(at 44.2 30.4 0.0)\n"
-        '\t\t(property "Reference" "X1")\n'
-        '\t\t(pad "1" smd rect\n'
-        "\t\t\t(at 0.0 0.0)\n"
-        "\t\t\t(size 0.2 0.2)\n"
-        '\t\t\t(layers "F.Cu" "F.Mask")\n'
-        '\t\t\t(net 2 "GND")\n'
-        "\t\t)\n"
-        "\t)\n"
-        ")\n"
-    )
-    pcb_path.write_text(text)
-    # Direct call: _route_clear re-writes the board and would wipe the
-    # blocker footprint from the file.
-    result = auto_route_pair(
-        RouteRequest(
-            pcb_path=str(pcb_path),
-            ref_a="R1",
-            pad_a="1",
-            ref_b="C1",
-            pad_b="1",
-            net="VCC",
-            width=0.2,
-            clearance=0.2,
-            via_pairs=(),
-            algorithm="pns",
-            corner_mode="rounded90",
-            waypoints=[
-                {"kind": "waypoint", "pos": (45.0, 30.0)},
-                {"kind": "waypoint", "pos": (45.0, 42.0)},
-                {"kind": "waypoint", "pos": (60.0, 42.0)},
-            ],
-        )
-    )
-    assert result.waypoint_violated is False
-    assert result.end == pytest.approx((60.0, 39.5), abs=1e-3)
-    blocker = box(44.1, 30.3, 44.3, 30.5)  # the 0.2 x 0.2 GND pad
-    margin = 0.3  # clearance (0.2) + half track width (0.1)
-    radii: list[float] = []
-    for a in result.arcs:
-        cx, cy = _arc_circumcenter(a.start, a.mid, a.end)
-        r = math.hypot(a.start[0] - cx, a.start[1] - cy)
-        a0 = math.atan2(a.start[1] - cy, a.start[0] - cx)
-        span = _arc_signed_sweep(a.start, a.mid, a.end)
-        line = LineString(
-            [a.start]
-            + [
-                (cx + r * math.cos(a0 + span * k / 96), cy + r * math.sin(a0 + span * k / 96))
-                for k in range(1, 96)
-            ]
-            + [a.end]
-        )
-        radii.append(r)
-        assert line.distance(blocker) >= margin - 1e-3, (
-            f"fillet arc r={r:.3f} violates the {margin:.1f} mm margin: "
-            f"{line.distance(blocker):.3f}"
-        )
-    for s in result.segments:
-        assert LineString([(s.x1, s.y1), (s.x2, s.y2)]).distance(blocker) >= margin - 1e-3, (
-            "chain segment violates the clearance margin"
-        )
-    # The joint next to the blocker had to shrink below the full radius
-    # while the joints away from it keep it.
-    assert any(r < 1.2 - 1e-6 for r in radii), "the blocked joint fillet must shrink"
-    assert any(abs(r - 1.2) < 1e-6 for r in radii), "unblocked joints keep the full radius"
-    # Shrinking must not break the G1 tangency anywhere.
-    pts = _route_polyline_sampled(result, n=128)
-    for p0, p1, p2 in zip(pts, pts[1:], pts[2:]):
-        ang = _interior_angle(p0, p1, p2)
-        assert ang >= 170.0 - 1e-6, f"filleted chain has a corner of {ang:.1f} deg at {p1}"
+    ), "mitered chain must keep its sharp miter corners"
 
 
 def test_pns_parallel_lane_preferred_over_snake_detour(tmp_path: Path) -> None:
@@ -3041,7 +2836,6 @@ def test_pns_parallel_lane_preferred_over_snake_detour(tmp_path: Path) -> None:
             "pad_a": "1",
             "ref_b": "C1",
             "pad_b": "1",
-            "corner_mode": "mitered45",
         },
         tmp_path,
     )
@@ -3098,7 +2892,6 @@ def _make_clear_board_with_track(tmp_path: Path) -> str:
 def _route_strategy(
     tmp_path: Path,
     *,
-    strategy: str = "shove",
     track: bool = False,
     algorithm: str = "pns",
 ) -> RouteResult:
@@ -3114,19 +2907,15 @@ def _route_strategy(
             pad_b="1",
             net="VCC",
             width=0.2,
-            clearance=0.2,
             via_pairs=(),
             algorithm=algorithm,
-            corner_mode="mitered45",
-            strategy=strategy,
         )
     )
 
 
 def test_strategy_default_shove_single_route(tmp_path: Path) -> None:
-    """``strategy`` defaults to ``"shove"`` (the old ``auto`` default
-    mapped to the identical path): a single route, no variance fields,
-    no variant list."""
+    """The PNS strategy is fixed at ``"shove"`` (depth defaults): a
+    single route, no variance fields, no variant list."""
     result = _route_strategy(tmp_path)
     assert result.strategy == "shove"
     assert not hasattr(result, "candidates")  # candidates surface is gone
@@ -3135,42 +2924,10 @@ def test_strategy_default_shove_single_route(tmp_path: Path) -> None:
     assert result.algorithm == "pns"
 
 
-def test_strategy_auto_rejected(tmp_path: Path) -> None:
-    """``"auto"`` was removed (2026-09-27): it was identical to
-    ``"shove"`` and only confused the VLM — it now fails validation
-    like any unknown value."""
-    with pytest.raises(RouteFailure, match=r"strategy='auto' is invalid"):
-        _route_strategy(tmp_path, strategy="auto")
-
-
-def test_strategy_walkaround_detours_no_shove(tmp_path: Path) -> None:
-    """``strategy="walkaround"`` treats the foreign track as a fixed
-    solid: nothing is pushed (``shoved == []``) and the polyline detours
-    around it rather than crossing the direct line."""
-    result = _route_strategy(tmp_path, strategy="walkaround", track=True)
-    assert result.strategy == "walkaround"
-    assert result.shoved_tracks == []
-    a = (29.5, 30.0)
-    b = (60.0, 39.5)
-    assert len(result.segments) >= 2
-    pts = [(s.x1, s.y1) for s in result.segments] + [
-        (result.segments[-1].x2, result.segments[-1].y2)
-    ]
-    assert pts[0] == pytest.approx(a, abs=1e-3)
-    assert pts[-1] == pytest.approx(b, abs=1e-3)
-    # The busiest middle point must sit measurably off the direct line:
-    # a walkaround detour cannot keep the straight skeleton.
-    mid = pts[len(pts) // 2]
-    dist = abs((b[0] - a[0]) * (a[1] - mid[1]) - (b[1] - a[1]) * (a[0] - mid[0])) / math.hypot(
-        b[0] - a[0], b[1] - a[1]
-    )
-    assert dist > 0.4
-
-
 def test_strategy_shove_pushes_foreign_track(tmp_path: Path) -> None:
-    """``strategy="shove"`` (the default) may displace the crossing
-    track: the shoved set is non-empty on the blocked fixture."""
-    result = _route_strategy(tmp_path, strategy="shove", track=True)
+    """The fixed shove strategy may displace the crossing track: the
+    shoved set is non-empty on the blocked fixture."""
+    result = _route_strategy(tmp_path, track=True)
     assert result.strategy == "shove"
     assert result.shoved_tracks, "shove strategy must actually push the crossing track"
 
@@ -3179,7 +2936,7 @@ def test_shove_moved_pairs_report_original_and_displaced(tmp_path: Path) -> None
     """``RouteResult.moved_pairs`` carries exactly one (original,
     displaced) pair: the original equals the fixture's GND segment
     ((40,25)->(55,45)) and the displaced track actually moved."""
-    result = _route_strategy(tmp_path, strategy="shove", track=True)
+    result = _route_strategy(tmp_path, track=True)
     assert len(result.moved_pairs) == 1
     orig, displaced = result.moved_pairs[0]
     # Original endpoints == the crossing fixture's GND segment.
@@ -3227,29 +2984,10 @@ def test_collapse_moved_pairs_keeps_last_displacement() -> None:
     assert by_orig[other] is o2
 
 
-def test_walkaround_moved_pairs_empty(tmp_path: Path) -> None:
-    """walkaround has no shove: moved_pairs stays empty."""
-    result = _route_strategy(tmp_path, strategy="walkaround", track=True)
-    assert result.moved_pairs == []
-
-
 def test_astar_moved_pairs_empty(tmp_path: Path) -> None:
     """A* has no shove stage: moved_pairs stays empty."""
-    result = _route_clear({"algorithm": "astar", "corner_mode": "mitered45"}, tmp_path)
+    result = _route_clear({"algorithm": "astar"}, tmp_path)
     assert result.moved_pairs == []
-
-
-def test_strategy_invalid_value_rejected(tmp_path: Path) -> None:
-    """Values outside {shove, walkaround} are rejected up front
-    with a clear message, regardless of the algorithm."""
-    for req_extra in ({"strategy": "multi"}, {"strategy": ""}, {"strategy": "PnS"}):
-        with pytest.raises(RouteFailure, match="strategy=") as excinfo:
-            _route_clear(req_extra, tmp_path)
-        assert "invalid" in str(excinfo.value)
-        assert "shove" in str(excinfo.value)
-
-    with pytest.raises(RouteFailure, match=r"strategy='multi' is invalid"):
-        _route_clear({"strategy": "multi", "algorithm": "astar"}, tmp_path)
 
 
 def test_single_route_renders_route_png(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -3268,7 +3006,7 @@ def test_single_route_renders_route_png(tmp_path: Path, monkeypatch: pytest.Monk
 def test_astar_success_renders_route_png(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A* success carries the same single-route render bytes."""
     monkeypatch.setenv("KICAD_MCP_RENDER_ROUTE_PNG", "1")
-    result = _route_clear({"algorithm": "astar", "corner_mode": "mitered45"}, tmp_path)
+    result = _route_clear({"algorithm": "astar"}, tmp_path)
     assert result.route_png
     assert isinstance(result.route_png, bytes)
     assert result.route_png[:8] == b"\x89PNG\r\n\x1a\n"
@@ -3278,13 +3016,10 @@ def test_astar_success_rounds_nothing_but_renders(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A* success renders even with waypoint/no-shove semantics absent;
-    ``strategy`` is inert for A* and only echoed."""
+    the fixed strategy is only echoed."""
     monkeypatch.setenv("KICAD_MCP_RENDER_ROUTE_PNG", "1")
-    result = _route_clear(
-        {"algorithm": "astar", "corner_mode": "mitered45", "strategy": "walkaround"},
-        tmp_path,
-    )
-    assert result.strategy == "walkaround"
+    result = _route_clear({"algorithm": "astar"}, tmp_path)
+    assert result.strategy == "shove"
     assert result.route_png
     assert isinstance(result.route_png, bytes)
     assert result.route_png[:8] == b"\x89PNG\r\n\x1a\n"
@@ -3331,7 +3066,6 @@ def test_astar_single_layer_blocked_renders_evidence(tmp_path: Path) -> None:
                 pad_b="1",
                 net="VCC",
                 width=0.2,
-                clearance=0.2,
                 via_pairs=(),
                 algorithm="astar",
             )
@@ -3368,7 +3102,6 @@ def test_astar_multi_layer_blocked_renders_evidence(tmp_path: Path) -> None:
             pad_b="1",
             net="VCC",
             width=0.2,
-            clearance=0.2,
             via_pairs=(("F.Cu", "B.Cu"),),
             algorithm="astar",
         )
@@ -3381,12 +3114,7 @@ def test_astar_multi_layer_blocked_renders_evidence(tmp_path: Path) -> None:
 
 def _edge_board(tmp_path: Path, r2_y: float = 15.0) -> Path:
     """A 30x30 mm board with two same-net F.Cu SMD pads.
-
-    R1 sits exactly on the top Edge.Cuts line (y=30.0) -- its center-to-
-    edge distance is 0, far below the 0.125 mm half-width of the 0.25 mm
-    track: the condition that used to let A* emit an out-of-board first
-    segment and then fail the whole route at the board check.  R2 sits at
-    (20.0, r2_y).
+    …
     """
     board = (
         "\t(layers\n"
@@ -3423,7 +3151,9 @@ def _edge_board(tmp_path: Path, r2_y: float = 15.0) -> Path:
         '\t(gr_line (start 30.0 30.0) (end 0.0 30.0) (layer "Edge.Cuts"))\n'
         '\t(gr_line (start 0.0 30.0) (end 0.0 0.0) (layer "Edge.Cuts"))\n'
     )
-    return _load_pcb_text(board, tmp_path)
+    pcb = _load_pcb_text(board, tmp_path)
+    _write_min_pro(pcb)
+    return pcb
 
 
 def test_astar_routes_inward_from_pad_on_board_edge(tmp_path: Path) -> None:
@@ -3440,7 +3170,6 @@ def test_astar_routes_inward_from_pad_on_board_edge(tmp_path: Path) -> None:
             pad_b="1",
             net="N",
             width=0.25,
-            clearance=0.2,
         )
     )
     assert len(result.segments) >= 1
@@ -3469,7 +3198,6 @@ def test_astar_pad_beyond_board_fails_with_board_bounds(tmp_path: Path) -> None:
                 pad_b="1",
                 net="N",
                 width=0.25,
-                clearance=0.2,
             )
         )
     err = str(exc_info.value)

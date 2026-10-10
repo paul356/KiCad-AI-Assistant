@@ -668,7 +668,7 @@ def route_engine(
                 raise PnsFailure(
                     f"shoved track {hit_chain.net} snapped off the 0/45/90 "
                     "family (a segment cannot be placed at a family angle; "
-                    "widen the gap or use strategy='walkaround')",
+                    "widen the gap)",
                     last_path=list(disp_pts[gate_failed]),
                     frames=frames,
                 )

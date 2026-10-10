@@ -57,7 +57,6 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
         algorithm: str | None = None,
         waypoints: list[dict] | None = None,
         dry_run: bool = False,
-        strategy: str = "shove",
         options: dict | None = None,
     ) -> tuple[str, Image] | str:
         """Connect two pads with an obstacle-avoiding track, optionally across layers.
@@ -69,24 +68,19 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
         wins.  A multi-layer ``pns`` route decomposes into one
         walkaround + shove leg per layer (shortest layer path through
         ``via_pairs``), joined by through-vias DRC-validated along the
-        direct pad-to-pad line.  Each leg emits rounded-corner arcs
-        (``rounded45``/``rounded90``) when its skeleton survives
-        walkaround/shove and the corner sits away from a via junction;
-        legs whose skeleton was disturbed, or whose fillet would end on
-        a via, fall back to straight segments — via junctions stay
-        straight-through connections.
+        direct pad-to-pad line.  Corner shape is fixed (mitered45) —
+        the engine always uses its default shove depth; a route writes
+        only straight segments, never arc nodes.
 
         ``options`` bundles the optional tuning knobs; omit it (or pass
-        ``{}``) for defaults.  ``corner_mode`` defaults to
-        ``mitered45`` — sharp 45-degree corners on plain 0/45/90
-        segments (closest to KiCad's optimizer output); switch to
-        ``rounded45`` for short fillets or ``rounded90`` for larger
-        fillet arcs.
+        ``{}``) for defaults.  Board-stable config lives here;
+        clearing, via sizing, corner shape, and shove depth are NOT
+        knobs — they come from the board's design rules and netclasses.
 
-        Interface v3: the VLM control surface — ``waypoints``, ``dry_run``,
-        ``strategy`` — lives at the TOP LEVEL (the caller touches these
-        often); board-stable config and rare tweaks stay in ``options``,
-        which gained ``layer_hint`` (moved out of the top level).
+        Interface v3: the VLM control surface — ``waypoints``, ``dry_run``
+        — lives at the TOP LEVEL (the caller touches these often);
+        board-stable config and rare tweaks stay in ``options``
+        (``via_pairs``, ``turn_penalty``, ``layer_hint``).
 
         PCB coordinates: mm, +X right, **+Y down**, rotation
         **CCW-positive on screen** (KiCad PCB convention).
@@ -132,20 +126,8 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
                 the file stays byte-identical).  Route renders fire only
                 when enabled (``KICAD_MCP_RENDER_ROUTE_PNG=1``; default
                 off) — in memory, nothing written to disk.
-            strategy: Explicit PNS shove-mode knob: ``"shove"`` (default;
-                walkaround + shove with the default depth),
-                ``"walkaround"`` (no movable push — foreign tracks are
-                treated as fixed obstacles and the route detours around
-                them).  Unknown values are rejected.  Only affects the
-                ``pns`` engine; ``astar`` ignores it (it has no shove
-                stage).
 
             options: Optional dict of advanced options, all optional:
-                ``corner_mode``: ``mitered45`` (default) | ``rounded45`` |
-                    ``rounded90`` | ``mitered90``.  Rounded modes emit arc
-                    track nodes on an unobstructed skeleton (a detour
-                    linearizes them).  ``mitered45`` emits plain 0/45/90
-                    segments — the closest to KiCad's optimizer output.
                 ``via_pairs``: tuple of ``(from_layer, to_layer)`` pairs;
                     each pair is one allowed through-via layer transition
                     edge, traversable in both directions.  Default
@@ -180,7 +162,8 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
                     segments, never arc nodes — while ``source_points``
                     is the un-collapsed walkaround polyline the shove
                     returned.
-                corner_mode: echoed corner_mode.
+                corner_mode: echo of the fixed corner mode
+                    (``mitered45``).
                 algorithm: echoed algorithm (``astar`` | ``pns``).
                 via_count / vias: vias written (0 for single-layer).
                 via_sites: emitted via sites, one dict per waypoint:
@@ -193,7 +176,7 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
                 layers_used: ordered list of layers touched by the path.
                 start: ``(x, y)`` exit point of pad_a.
                 end: ``(x, y)`` entry point of pad_b.
-                strategy: echo of the requested strategy knob.
+                strategy: echo of the fixed PNS strategy (``"shove"``).
                 backup_path: path to the ``.bak`` created before writing
                     (``None`` with ``dry_run``).
                 pcb_path: echo of the input path.
@@ -207,9 +190,7 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
             render regardless).
 
             VLM flow: preview with ``dry_run=True``, then commit the
-            same request with ``dry_run=False``; ``strategy`` is the
-            explicit knob that decides whether the engine may shove
-            tracks out of the way.
+            same request with ``dry_run=False``.
 
             Or ``{"error": "<message>"}`` on failure: the error message
             plus a best-effort PNG of the current board with the failed
@@ -224,14 +205,12 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
             — same convention as ``export_pcb_layer_image``.  When the
             render is unavailable the result is the bare JSON text.
         """
-        corner_mode = "mitered45"
         via_pairs: tuple[tuple[str, str], ...] = (("F.Cu", "B.Cu"),)
         turn_penalty = 0.3
         layer_hint: str | None = None
         if options:
             via_pairs = options.get("via_pairs", via_pairs)
             turn_penalty = options.get("turn_penalty", turn_penalty)
-            corner_mode = options.get("corner_mode", corner_mode)
             layer_hint = options.get("layer_hint", layer_hint)
         waypoints = list(waypoints or [])
         if algorithm is None:
@@ -240,15 +219,6 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
             # the deterministic grid A* planner.  The plugin sets
             # KICAD_MCP_SUPPORTS_VISION when spawning the server.
             algorithm = "pns" if model_supports_vision() else "astar"
-        if strategy not in ("shove", "walkaround"):
-            return _route_payload(
-                {
-                    "error": (
-                        f"strategy={strategy!r} is invalid; supported values are "
-                        "'shove' or 'walkaround'."
-                    )
-                }
-            )
         req = RouteRequest(
             pcb_path=pcb_path,
             ref_a=ref_a,
@@ -260,11 +230,9 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
             width=width,
             via_pairs=via_pairs,
             turn_penalty=turn_penalty,
-            corner_mode=corner_mode,
             algorithm=algorithm,
             waypoints=waypoints,
             dry_run=dry_run,
-            strategy=strategy,
         )
         try:
             result = auto_route_pair(req)

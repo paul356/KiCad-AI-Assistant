@@ -531,9 +531,10 @@ class TestPcbRouteOptions:
         assert result["layers_used"] == ["F.Cu"]
         assert "layer_hint" not in result
 
-    def test_options_mitered45_suppresses_arcs(self, tools, routable_board):
-        """options={'corner_mode': 'mitered45'} overrides the default:
-        the same route emits straight segments only."""
+    def test_options_corner_mode_ignored_fixed_mitered45(self, tools, routable_board):
+        """Corner mode is NOT an options knob: passing it is harmless
+        and the route still emits straight segments only (the fixed
+        mitered45 corner shape)."""
         result = self._route(tools, routable_board, options={"corner_mode": "mitered45"})
         assert "error" not in result
         assert result["corner_mode"] == "mitered45"
@@ -648,38 +649,6 @@ class TestAlgorithmDefaultByVision:
         assert result["segment_count"] > 0
         assert result["via_count"] == 0
 
-    def test_strategy_auto_rejected(self, tools, routable_board):
-        """``"auto"`` was removed (2026-09-27): it now fails validation
-        like any unknown value."""
-        result = self._route(tools, routable_board, strategy="auto")
-        assert "error" in result
-        assert "strategy='auto' is invalid" in result["error"]
-
-    def test_strategy_walkaround_parsed_and_echoed(self, tools, routable_board):
-        result = self._route(tools, routable_board, strategy="walkaround")
-        assert "error" not in result
-        assert result["strategy"] == "walkaround"
-
-    def test_strategy_shove_parsed_and_echoed(self, tools, routable_board):
-        result = self._route(tools, routable_board, strategy="shove")
-        assert "error" not in result
-        assert result["strategy"] == "shove"
-
-    def test_strategy_invalid_value_rejected(self, tools, routable_board):
-        """Values outside {shove, walkaround} fail with a clear
-        message instead of being silently ignored."""
-        result = self._route(tools, routable_board, strategy="multi")
-        assert "error" in result
-        assert "strategy='multi' is invalid" in result["error"]
-        assert "'shove'" in result["error"]
-
-    def test_strategy_inert_for_astar(self, tools, routable_board):
-        """A* has no shove stage: the value is accepted and echoed, not
-        rejected."""
-        result = self._route(tools, routable_board, strategy="walkaround", algorithm="astar")
-        assert "error" not in result
-        assert result["strategy"] == "walkaround"
-
     def test_route_png_always_present_and_existing(self, tools, routable_board, monkeypatch):
         """With rendering enabled (KICAD_MCP_RENDER_ROUTE_PNG=1) the
         successful single route renders real PNG bytes delivered as the
@@ -728,7 +697,6 @@ class TestAlgorithmDefaultByVision:
                 ctx=None,
                 width=0.2,
                 algorithm="pns",
-                strategy="shove",
                 dry_run=True,
             )
         )
@@ -987,7 +955,7 @@ class TestAlgorithmDefaultByVision:
         from the file and the displaced polyline is written back, so the
         committed board no longer contains a GND track crossing the new
         VCC line."""
-        result = self._route_vcc(tools, crossing_board, strategy="shove")
+        result = self._route_vcc(tools, crossing_board)
         assert "error" not in result
         assert result["shoved"], "fixture must actually shove the GND track"
         # 1) original gone
@@ -1024,7 +992,7 @@ class TestAlgorithmDefaultByVision:
         not the un-collapsed walkaround polyline.
         (Regression guard: a dense shove corner used to be written as
         one bitty segment per vertex pair.)"""
-        result = self._route_vcc(tools, crossing_board, strategy="shove")
+        result = self._route_vcc(tools, crossing_board)
         assert "error" not in result
         assert result["shoved"]
         # points = chain PERSISTED to the file; source_points = the raw
@@ -1084,24 +1052,11 @@ class TestAlgorithmDefaultByVision:
         assert nodes[0]["start"] == src[0]
         assert nodes[-1]["end"] == src[-1]
 
-    def test_walkaround_leaves_gnd_track_untouched(self, tools, crossing_board):
-        """strategy=walkaround: no shove, no rewrite — the file still
-        contains the GND segment exactly at its original position."""
-        before = self._gnd_segments(crossing_board)
-        assert len(before) == 1
-        assert before[0]["start"] == (40.0, 25.0)
-        assert before[0]["end"] == (55.0, 40.0)
-        result = self._route_vcc(tools, crossing_board, strategy="walkaround")
-        assert "error" not in result
-        assert result["shoved"] == []
-        after = self._gnd_segments(crossing_board)
-        assert after == before, "walkaround must not touch the GND segment"
-
     def test_shove_dry_run_persists_nothing_but_reports_pairs(self, tools, crossing_board):
         """dry_run=True: file byte-identical, shoved pairs still reported
         in the response (report-only, nothing written)."""
         before = open(crossing_board, "rb").read()
-        result = self._route_vcc(tools, crossing_board, strategy="shove", dry_run=True)
+        result = self._route_vcc(tools, crossing_board, dry_run=True)
         assert "error" not in result
         assert result["dry_run"] is True
         assert result["shoved"], "dry_run must still report the pushed track"
@@ -1135,7 +1090,6 @@ class TestAlgorithmDefaultByVision:
                 net="VCC",
                 width=0.2,
                 ctx=None,
-                strategy="shove",
                 dry_run=True,
             )
         )

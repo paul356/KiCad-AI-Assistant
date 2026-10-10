@@ -98,7 +98,7 @@ class ProFileMissing(RuntimeError):
 
     The router needs the project file to look up netclass settings for
     width/clearance. Either create the project file in KiCad, or pass
-    ``width=`` and ``clearance=`` explicitly in :class:`RouteRequest`.
+    ``width=`` explicitly in :class:`RouteRequest`.
     """
 
 
@@ -122,8 +122,6 @@ class NetClassUnresolved(RuntimeError):
 class DesignRulesUnavailable(RuntimeError):
     """The board's design rules cannot be read, or ``min_clearance`` is
     missing.
-
-    Pass ``clearance=`` explicitly in :class:`RouteRequest` to override.
     """
 
 
@@ -152,15 +150,6 @@ class RouteRequest:
             explicit tuple to restrict transitions (e.g. to forbid inner-
             layer vias on a 4-layer board).
         width: Track width; ``None`` -> resolve from netclass.
-        clearance: Minimum clearance to obstacles; ``None`` -> resolve from
-            the board's design rules.
-        via_diameter / via_drill: Through-via dimensions; ``None`` ->
-            resolve from netclass.
-        max_miter_mm: Maximum corner miter extension before falling back
-            to a sharp 90 deg  corner.
-        grid_resolution: Grid cell size in mm for the walkability grid.
-            Smaller values give finer paths but more cells.  ``None``
-            uses the default (0.025 mm).
         via_cost: Distance-equivalent penalty for taking a via edge in
             multi-layer A*.  Higher values discourage unnecessary stack
             vias.  Default 2.0 mm.
@@ -176,14 +165,11 @@ class RouteRequest:
             (ignored by ``astar``); each entry is a dict with a ``kind``:
             ``"waypoint"`` (``pos``, optional ``tol_mm``) forces the route
             through a soft pass-through point on the current leg layer.
-            With ``tol_mm > 0`` the leg endpoint floats to a DRC-clean
-            spot inside the ``tol_mm``-radius circle around ``pos`` (soft
-            anchor), so the per-leg fillet arcs are no longer pinned onto
-            the waypoint joint and the corner renders rounded; omitting
-            ``tol_mm`` (or 0) keeps the exact anchor -- the chain is
-            pinned through the waypoint and the whole-chain tangent
-            fillet rounds the joint in place (rounded corner modes).
-            Unreachable waypoints are recorded in
+            With ``tol_mm > 0`` the leg endpoint may float to a DRC-clean
+            spot inside the ``tol_mm``-radius circle around ``pos`` when
+            the exact anchor is blocked; omitting ``tol_mm`` (or 0) pins
+            the exact anchor (kept while DRC-clean, skipped when
+            unreachable).  Unreachable waypoints are recorded in
             ``RouteResult.violated_waypoints`` and skipped, the route
             continues; ``"via"`` (``pos``, ``to_layer``) switches the leg
             layer at a DRC-validated through-via site near ``pos``
@@ -194,12 +180,11 @@ class RouteRequest:
         dry_run: Route and return the result without writing anything to
             the PCB file.  The router never writes; this flag lets the
             tool layer skip its ``save_pcb`` step.
-        strategy: Explicit PNS shove-mode knob (trailing request field):
-            ``"shove"`` (default — walkaround + shove with the default
-            depth), ``"walkaround"`` (no movable push at all — foreign
-            tracks are treated as fixed obstacles and the route detours
-            around them).  The A* planner has no shove stage and ignores
-            the value (the value itself is still validated).
+
+        Clearing / via sizing / corner shape are NOT request knobs: they
+        are always resolved from the board's design rules and netclasses
+        (``clearance``, ``via_diameter``/``via_drill``) or fixed engine
+        defaults (mitered45 corners, default grid, shove enabled).
     """
 
     pcb_path: str
@@ -211,18 +196,11 @@ class RouteRequest:
     layer_hint: str | None = None
     via_pairs: tuple[tuple[str, str], ...] = (("F.Cu", "B.Cu"),)
     width: float | None = None  # if None, use DRC default for the net
-    clearance: float | None = None
-    via_diameter: float | None = None
-    via_drill: float | None = None
-    max_miter_mm: float = 1.0
-    grid_resolution: float | None = None  # None -> GRID_RESOLUTION
     via_cost: float = 2.0  # mm penalty per via edge
     turn_penalty: float = 0.3  # mm penalty per direction change; 0 disables
     algorithm: str = "astar"  # astar (grid A*) | pns (walkaround + shove); tool layer picks pns for vision models
-    corner_mode: str = "mitered45"  # mitered45 (default) | rounded45 | rounded90 | mitered90
     waypoints: list[dict] = field(default_factory=list)
     dry_run: bool = False  # tool-layer hint: skip save_pcb (router never writes)
-    strategy: str = "shove"  # shove | walkaround (PNS shove-mode knob)
 
 
 @dataclass
@@ -246,7 +224,9 @@ class RouteResult:
         via_sites: Emitted via sites in request order: one dict per
             explicit via waypoint with ``{"pos": [x, y], "to_layer": ...}``
             (the DRC-clean site actually used, possibly micro-shifted).
-        strategy: Echo of the requested strategy knob.
+        strategy: Echo of the fixed PNS strategy (always ``"shove"``).
+        corner_mode: Echo of the fixed corner mode (always
+            ``"mitered45"``).
         route_png: PNG bytes of a best-effort rendered image of the
             routed track (single route; ``None`` unless rendering was
             explicitly enabled — text-only model always none, and
@@ -313,16 +293,9 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
             "PNS engine"
         )
 
-    # Strategy is the explicit PNS shove-mode knob; validate the VALUE for
-    # both planners (A* has no shove stage and silently ignores it).
-    if req.strategy not in ("shove", "walkaround"):
-        raise RouteFailure(
-            f"strategy={req.strategy!r} is invalid; supported values are 'shove' or 'walkaround'."
-        )
-
-    # Validate corner_mode early: both planners must reject an unknown
-    # value even though only the PNS engine renders arcs.
-    corner_mode = _parse_corner_mode(req.corner_mode)
+    # Corner shape is fixed: mitered45 corners with the default shove depth.
+    corner_mode = CornerMode.MITERED_45
+    shove_depth: float | None = None  # None = default MAX_SHOVE_DEPTH
 
     # Validate via_pairs against the PCB layers early.
     pcb_layers = _pcb_layer_names(data)
@@ -358,21 +331,12 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
                 f"Cannot determine track width for net {req.net!r}: {exc}. "
                 f"Pass width= explicitly in RouteRequest to skip DRC lookup."
             ) from exc
-    clearance = req.clearance
-    if clearance is None:
-        try:
-            clearance = _default_clearance(req.pcb_path, net=req.net)
-        except (ProFileMissing, ProFileMalformed, DesignRulesUnavailable) as exc:
-            raise RouteFailure(
-                f"Cannot determine clearance: {exc}. "
-                f"Pass clearance= explicitly in RouteRequest to skip DRC lookup."
-            ) from exc
-    via_diameter = req.via_diameter
-    if via_diameter is None:
-        via_diameter = _resolve_via_diameter(req.pcb_path, net=req.net)
-    via_drill = req.via_drill
-    if via_drill is None:
-        via_drill = _resolve_via_drill(req.pcb_path, net=req.net)
+    try:
+        clearance = _default_clearance(req.pcb_path, net=req.net)
+    except (ProFileMissing, ProFileMalformed, DesignRulesUnavailable) as exc:
+        raise RouteFailure(f"Cannot determine clearance: {exc}.") from exc
+    via_diameter = _resolve_via_diameter(req.pcb_path, net=req.net)
+    via_drill = _resolve_via_drill(req.pcb_path, net=req.net)
 
     # Pad center coordinates. The layer keeps center and size on the SAME
     # pad when a footprint declares several pads with one name.
@@ -575,7 +539,7 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
                 _x0, _y0, _x1, _y1 = _nx0, _ny0, _nx1, _ny1
                 _grew = True
     route_bbox = (_x0, _y0, _x1, _y1)
-    grid_res = req.grid_resolution or GRID_RESOLUTION
+    grid_res = GRID_RESOLUTION
 
     # Board-outline context for A* failure messages (empty when the board
     # has no Edge.Cuts outline).  The same bbox fences the A* search so it
@@ -756,7 +720,7 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
                 all_nodes,
                 width=width,
                 net=req.net,
-                max_miter_mm=req.max_miter_mm,
+                max_miter_mm=1.0,
                 via_diameter_mm=via_diameter,
                 via_drill_mm=via_drill,
                 _obstacles=buffered,
@@ -879,7 +843,7 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
                 path_nodes,
                 width=width,
                 net=req.net,
-                max_miter_mm=req.max_miter_mm,
+                max_miter_mm=1.0,
                 _obstacles=buffered,
                 _pad_rects=_pad_rects or None,
             )
@@ -912,9 +876,7 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
         #    routes one skeleton pair and feeds the shared node pipeline;
         #    finalize_legs postprocesses the emitted nodes into the final
         #    segment/arc/via lists.
-        # -- Strategy knob (trailing request field): walkaround = no
-        #    movable push (0 depth), shove = default MAX_SHOVE_DEPTH.
-        shove_depth: float | None = 0 if req.strategy == "walkaround" else None
+        # -- Shove depth: fixed default MAX_SHOVE_DEPTH (shove enabled).
         used_chain: list[tuple[float, float]] = [pad_a_xy]
         all_nodes: list[RouteNode] = []
         node_id = 0
@@ -950,8 +912,7 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
             """Route one PNS leg (walkaround + shove) and feed its nodes
             into the shared postprocess pipeline.  ``li``/``n_legs`` are
             only used in diagnostic messages; the ``shove_depth`` cell
-            (set from the trailing ``strategy`` knob: 0 = walkaround-only,
-            None = default shove depth) selects the engine variant."""
+            (fixed default shove depth) selects the engine variant."""
             nonlocal node_id
             leg_layers.append(layer)
             if math.hypot(end_pt[0] - start_pt[0], end_pt[1] - start_pt[1]) < 1e-6:
@@ -1151,7 +1112,7 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
                 all_nodes,
                 width=width,
                 net=req.net,
-                max_miter_mm=req.max_miter_mm,
+                max_miter_mm=1.0,
                 via_diameter_mm=via_diameter,
                 via_drill_mm=via_drill,
                 _obstacles=buffered,
@@ -1707,7 +1668,7 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
                             kind="pad",
                         )
                     )
-            # corner_mode already validated + parsed at entry (line 236).
+            # corner_mode fixed at entry: mitered45.
             try:
                 eng = route_engine(
                     pad_a_xy,
@@ -1859,7 +1820,7 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
                 path_nodes,
                 width=width,
                 net=req.net,
-                max_miter_mm=req.max_miter_mm,
+                max_miter_mm=1.0,
                 _obstacles=buffered,
                 _pad_rects=_pad_rects or None,
             )
@@ -1991,7 +1952,7 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
         vias=vias,
         arcs=arcs_out,
         shoved_tracks=pushed,
-        corner_mode=req.corner_mode,
+        corner_mode="mitered45",
         algorithm=req.algorithm,
         start=start_xy,
         end=end_xy,
@@ -1999,7 +1960,7 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
         waypoint_violated=waypoint_violated,
         violated_waypoints=violated_waypoints,
         via_sites=via_sites,
-        strategy=req.strategy,
+        strategy="shove",
         route_png=route_png,
         moved_pairs=moved_pairs,
     )
@@ -2137,16 +2098,6 @@ def _drop_subwidth_points(
         del out[-2]
 
     return out
-
-
-def _parse_corner_mode(mode: str) -> CornerMode:
-    """Map a RouteRequest corner_mode string to its enum; invalid values
-    raise RouteFailure with the accepted set."""
-    try:
-        return CornerMode(mode)
-    except ValueError as exc:
-        accepted = ", ".join(sorted(m.value for m in CornerMode))
-        raise RouteFailure(f"Unknown corner_mode {mode!r}; expected one of: {accepted}") from exc
 
 
 def _log_path(label: str, pts: list[tuple[float, float]], prev_n: int | None = None) -> None:

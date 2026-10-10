@@ -263,40 +263,23 @@ retained per maintainer decision)
 
 ## Router: `grid_resolution` not exposed through the MCP tool API
 
-**Status:** open (verified 2026-09-08 — issue #4 in
-`docs/plans/router-issues.md`)
+**Status:** resolved 2026-10-10 — the field was **removed from
+`RouteRequest`** (simplify the VLM-facing interface): the router always
+uses `GRID_RESOLUTION` (0.025 mm).  Intentional: VLM callers cannot
+tune the grid, and the default resolution covers the routed boards.
 
-### Current state
+### History (closed)
 
-- `RouteRequest.grid_resolution` exists (`kcaa/router/router.py:164`,
-  default `None` → `GRID_RESOLUTION` = 0.025 mm) and is honoured by the
-  router (`router.py:453`, passed into `multi_layer_a_star` as the grid
-  size), so the field is functional end-to-end.
-- The MCP tool `pcb_route_pad_to_pad` (`kcaa/tools/pcb_routing_tools.py`)
-  exposes `width`, `layer_hint`, `via_pairs`, `turn_penalty` — but no
-  `grid_resolution` parameter.  Clients cannot request a finer grid via
-  the tool API.
-
-### Impact
-
-Fine-pitch routing (tight pad/component gaps the default grid resolution
-would miss) is not reachable from the MCP layer.  The capability exists
-in `RouteRequest` but is dead config for tool users.
-
-### Fix (proposed)
-
-Add `grid_resolution: float | None = None` to `pcb_route_pad_to_pad` and
-forward it into the built `RouteRequest`, mirroring how `turn_penalty` is
-threaded.  Document the parameter (mm; smaller = finer grid, more cells)
-in the tool docstring.
-
-### Validation
-
-- Unit: a tool call with `grid_resolution` set produces a `RouteRequest`
-  carrying that value; a call omitting it keeps the default.
-- Integration: route a fine-pitch fixture through the tool with the
-  default vs. a finer grid; the finer grid finds a path the default
-  misses (or the difference is observable in the viz dumps).
+- `RouteRequest.grid_resolution` existed (default `None` → `GRID_RESOLUTION`
+  = 0.025 mm) and was honoured by the router (passed into
+  `multi_layer_a_star` as the grid size), so the field was functional
+  end-to-end.
+- The MCP tool `pcb_route_pad_to_pad` exposed `width`, `layer_hint`,
+  `via_pairs`, `turn_penalty` — but no `grid_resolution` parameter.
+  Clients could not request a finer grid via the tool API.
+- Rejected fix: adding `grid_resolution` to the tool.  Fine-pitch
+  routing stays on the default grid; revisit with an actual failing
+  fine-pitch board if one appears.
 
 ---
 

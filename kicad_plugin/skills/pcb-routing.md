@@ -1,7 +1,7 @@
 ---
 name: pcb-routing
 priority: 95
-description: "PCB pad-to-pad routing workflow: get_ratsnest, export_pcb_layer_image, pcb_route_pad_to_pad, corner_mode, failure retry"
+description: "PCB pad-to-pad routing workflow: get_ratsnest, export_pcb_layer_image, pcb_route_pad_to_pad, failure retry"
 ---
 # PCB routing workflow
 Connect pads belonging to the same net with DRC-clean tracks.
@@ -24,16 +24,16 @@ Connect pads belonging to the same net with DRC-clean tracks.
    model — vision-capable models get ``pns`` (walkaround + shove),
    text-only models get ``astar`` (grid A*); pass ``algorithm``
    explicitly to override.  The VLM control knobs are top-level:
-   ``strategy="shove"|"walkaround"`` (PNS shove policy; ``"shove"``
-   default, ``"auto"`` removed 2026-09-27),
    ``waypoints=[...]`` (waypoint/via anchor chain), ``dry_run=True``
    (route + render without writing).  Board-stable config and rare
    tweaks go in the optional ``options`` dict — omit it for defaults:
-   ``options={"corner_mode": ...}`` (default ``mitered45``),
    ``options={"layer_hint": ...}`` for thru-hole pads,
    ``options={"via_pairs": (("F.Cu", "B.Cu"),)}`` to allow layer
    transitions, ``options={"turn_penalty": 0.0}`` for pure
-   shortest-path routing.
+   shortest-path routing.  Clearance and via sizing always come from
+   the board's design rules and netclasses; corner shape and shove
+   depth are fixed engine defaults (mitered45, shove enabled) — no
+   knobs to pass.
 4. On a route failure, read the error message, look at the latest layer
    render, and retry with a different ``options["layer_hint"]``, a
    different pair, or a via transition.  Do not silently repeat the
@@ -61,18 +61,19 @@ Which one should you use?  The default follows the calling model:
 
 - ``pns``: walkaround + shove engine (no A* grid).  The route
   walks around fixed obstacles (pads, vias, keepouts, other nets) and
-  shoves movable tracks out of the way with chain propagation.  A
-  single-layer route may emit rounded-corner arcs (rounded corner
-  modes); the default ``mitered45`` emits plain 0/45/90 segments only —
-  closest to KiCad's optimizer output.  A multi-layer ``pns`` route
+  shoves movable tracks out of the way with chain propagation.  Corner
+  shape is fixed: 45-degree miter corners on plain 0/45/90 segments
+  (closest to KiCad's optimizer output); a single-layer route emits
+  rounded-corner arcs when the skeleton survives walkaround/shove and
+  the corner sits away from a via junction (the response's
+  ``arc_count``/``arcs`` report them).  A multi-layer ``pns`` route
   resolves the shortest start -> end layer path through ``via_pairs``
   and routes one walkaround + shove leg per layer, joined by
   through-vias DRC-validated along the direct pad-to-pad line.  Each
-  leg emits its rounded-corner arcs when the skeleton survives
-  walkaround/shove and the corner sits away from a via junction; legs
-  whose skeleton was disturbed, or whose fillet would end on a via,
-  fall back to straight segments — via junctions stay
-  straight-through connections.
+  leg emits its arcs when the skeleton survives walkaround/shove and
+  the corner sits away from a via junction; legs whose skeleton was
+  disturbed, or whose fillet would end on a via, fall back to straight
+  segments — via junctions stay straight-through connections.
 - ``astar``: grid-based A* planner.  Single-layer routes run
   hierarchical grid A* (coarse pass + fine band); multi-layer routes run
   multi-layer A* with via edges.  This is the classic router behaviour and
@@ -80,22 +81,15 @@ Which one should you use?  The default follows the calling model:
   The auto-default for text-only callers, which route pad-to-pad
   directly and read the structured result.
 
-### corner_mode strategy (options["corner_mode"])
-- ``mitered45`` (default): sharp 45-degree miter corners, straight
-  0/45/90 segments — closest to KiCad's optimizer output, and the fewest
-  track nodes.
-- ``rounded45``: short rounded fillets that hug the 45-degree miter —
-  corner looks rounded but deviates little from a miter; emits
-  ``(arc ...)`` track nodes on an unobstructed skeleton.
-- ``rounded90``: quarter-circle radius arcs — the most rounded look, and
-  the longest arc eaten by any detour or shove.
-- ``mitered90``: Manhattan corners.
-- A detour or shove linearizes an arc back to segments (the response's
-  ``arc_count`` drops to 0), so rounded modes rarely fail outright —
-  retry with ``mitered45`` only when you must keep the route straight.
-- The response echoes ``corner_mode`` and reports ``arc_count``/``arcs``
-  (start/mid/end/width/layer/net) and ``shoved`` (pushed tracks as
-  net/layer/width/points).
+### Corner shape (fixed: mitered45)
+Sharp 45-degree miter corners on plain 0/45/90 segments — the fewest
+track nodes, closest to KiCad's optimizer output.  The engine may emit
+``(arc ...)`` track nodes on an unobstructed skeleton after a
+successful walkaround/shove leg; a detour or shove linearizes an arc
+back to segments (``arc_count`` drops to 0).  The response echoes
+``corner_mode`` (always ``"mitered45"``) and reports
+``arc_count``/``arcs`` (start/mid/end/width/layer/net) and ``shoved``
+(pushed tracks as net/layer/width/points).
 
 ### options["via_pairs"] (layer transitions)
 Each ``(from_layer, to_layer)`` pair is one allowed through-via jump,
