@@ -510,9 +510,9 @@ class TestPcbRouteOptions:
         )
 
     def test_options_none_defaults_to_mitered45(self, tools, routable_board):
-        """Omitting ``options`` routes with corner_mode=mitered45: the
-        unobstructed single-layer PNS skeleton emits plain 0/45/90
-        segments, no arcs."""
+        """Omitting ``options`` routes with the fixed mitered45 corner
+        shape: the unobstructed single-layer PNS skeleton emits plain
+        0/45/90 segments, no arcs."""
         result = self._route(tools, routable_board)
         assert "error" not in result
         assert result["corner_mode"] == "mitered45"
@@ -566,7 +566,8 @@ class TestPcbRouteOptions:
 
 
 class TestPcbRouteStrategy:
-    """pcb_route_pad_to_pad: the explicit strategy knob + always-on render."""
+    """pcb_route_pad_to_pad: strategy is fixed (shove) and echoed as a
+    constant; render/PNG behaviour is covered under vision default."""
 
     def _route(self, tools, board, options=None, algorithm="pns", **kwargs):
         return _run(
@@ -587,9 +588,9 @@ class TestPcbRouteStrategy:
 
     def test_v3_top_level_defaults_match_old_behavior(self, tools, routable_board):
         """v3: with no top-level knobs and ``options=None`` the call
-        behaves exactly like the old default: strategy shove (was the
-        ``auto`` default, identical path), no dry_run, no waypoints (empty
-        via_sites), mitered45 corners, algorithm pns."""
+        behaves exactly like the old default: strategy shove (the fixed
+        choice — the ``auto`` default was identical), no dry_run, no
+        waypoints (empty via_sites), mitered45 corners, algorithm pns."""
         result = self._route(tools, routable_board)
         assert "error" not in result
         assert result["strategy"] == "shove"
@@ -951,7 +952,7 @@ class TestAlgorithmDefaultByVision:
         )
 
     def test_shove_persists_displaced_gnd_track(self, tools, crossing_board):
-        """strategy=shove, non-dry_run: the original GND segment is REMOVED
+        """Non-dry-run: the original GND segment is REMOVED
         from the file and the displaced polyline is written back, so the
         committed board no longer contains a GND track crossing the new
         VCC line."""

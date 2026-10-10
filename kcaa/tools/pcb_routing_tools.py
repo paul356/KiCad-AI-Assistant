@@ -69,8 +69,13 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
         walkaround + shove leg per layer (shortest layer path through
         ``via_pairs``), joined by through-vias DRC-validated along the
         direct pad-to-pad line.  Corner shape is fixed (mitered45) —
-        the engine always uses its default shove depth; a route writes
-        only straight segments, never arc nodes.
+        the engine always uses its default shove depth.  A pns route
+        normally writes only straight 0/45/90 segments; the single
+        exception is a cocircular waypoint chain (≥4 soft waypoints on
+        one circle), which the engine emits as one covering arc
+        (reported in ``arc_count``/``arcs``) when DRC-clear.  A
+        multi-layer leg never emits arcs — its skeleton arcs are
+        linearized (see plan §3.3).
 
         ``options`` bundles the optional tuning knobs; omit it (or pass
         ``{}``) for defaults.  Board-stable config lives here;

@@ -19,13 +19,15 @@ await pcb_route_pad_to_pad(
 )
 ```
 
-Interface v3: the VLM control knobs — ``waypoints``, ``dry_run``,
-``strategy`` — are top-level parameters (defaults ``None`` / ``False`` /
-``"shove"``); board-stable config and rare tweaks (``layer_hint``,
-``corner_mode``, ``via_pairs``, ``turn_penalty``) bundle into
-``options``.  ``strategy`` accepts exactly ``"shove"`` (default) or
-``"walkaround"``; ``"auto"`` was removed 2026-09-27 (it was identical
-to ``"shove"``).
+Interface v3: the VLM control knobs — ``waypoints``, ``dry_run`` — are
+top-level parameters (defaults ``None`` / ``False``); board-stable
+config and rare tweaks (``layer_hint``, ``via_pairs``,
+``turn_penalty``) bundle into ``options``.  The strategy is fixed:
+``"shove"`` (the walkaround-only variant and the ``strategy`` /
+``corner_mode`` / ``clearance`` / via-size / ``grid_resolution``
+parameters were removed 2026-10-10 — corner shape is fixed mitered45,
+and clearance/via sizes resolve from the board's design rules and
+netclasses).
 
 The router walks the pad-exit points of `R1.2` and `C1.2` and A*'s a
 visibility graph over the obstacle-free regions.  The track is added

@@ -31,13 +31,13 @@ With ``algorithm="pns"`` multi-layer routes decompose into one
 walkaround + shove leg per layer (shortest layer path through
 ``via_pairs``), joined by through-vias placed along the direct
 pad-to-pad line and DRC-validated (same-net pad faces, existing
-copper, board edge, hole-to-hole).  A PNS leg emits rounded-corner
-arcs (corner_mode ``rounded45``/``rounded90``, both opt-in — the
-default ``mitered45`` stays all-straight) when the skeleton survived
-walkaround/shove and the corner sits away from a via junction; legs
-whose skeleton was disturbed, or whose fillet would end on a via, fall
-back to straight segments.  Via junctions themselves stay
-straight-through connections.
+copper, board edge, hole-to-hole).  Corner shape is fixed: every PNS
+leg emits straight 0/45/90 segments — the corner mode is not a request
+knob anymore, and a multi-layer leg never emits arcs (its skeleton
+fillet arcs are linearized).  The only arc a route can still emit is
+the single covering arc of a cocircular waypoint chain (see
+``auto_route_pair``); via junctions themselves stay straight-through
+connections.
 
 No shove
 --------
@@ -867,9 +867,11 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
         # the route may overlay (it is already connected).  The engine
         # walks the BuildInitialTrace skeleton around fixed solids, then
         # shoves movable tracks of other nets; it never uses the grid.
-        # Single-layer routes may emit rounded-corner arcs; multi-layer
-        # routes decompose into per-layer legs joined by through-vias
-        # placed along the direct pad-to-pad line (see below).
+        # Single-layer routes may emit rounded-corner arcs only when a
+        # rounded corner mode is active (fixed mitered45 leaves the
+        # skeleton arc-free); multi-layer routes decompose into per-layer
+        # legs joined by through-vias placed along the direct pad-to-pad
+        # line (see below).
         #
         # -- Per-leg machinery shared by the multi-layer path and the
         #    anchor-chain path below (a leg is a leg in both): run_leg
@@ -1000,7 +1002,10 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
             elif li == n_legs - 1 and pad_b_size is not None:
                 pts = _replace_pad_path(pts, pad_b_xy, pad_b_size, from_center=False)
 
-            # Per-leg rounded-corner arcs.  A leg emits its skeleton
+            # Per-leg rounded-corner arcs (rounded corner modes only —
+            # mitered45 skeletons carry no trace arcs, so emit_leg
+            # stays False and legs fall through to the straight
+            # postprocess below).  A leg emits its skeleton
             # fillets + straight legs straight from the trace — skipping
             # the postprocess miter, which would cut into the arc ends —
             # when walkaround/shove and the pad cleanup left the skeleton

@@ -67,9 +67,11 @@ skeleton trace (DIRECTION_45::BuildInitialTrace port)
 ```
 
 No grid, no `grid_resolution`, no cell-visit heuristics, no snap-back-to-grid
-jitter. Paths live in continuous coordinates; corners are 45° mitered (fixed:
-rounded arcs are emitted post-shove where the miter survives — the corner
-mode is not a VLM knob).
+jitter. Paths live in continuous coordinates; corners are 45° mitered (fixed).
+The engine emits no skeleton arcs under mitered45 — the only `(arc ...)` a
+route can still produce is the single covering arc of a cocircular waypoint
+chain (≥4 soft waypoints on one circle, DRC-clear), and multi-layer legs
+linearize their skeleton fillets entirely (arcs never survive a via junction).
 
 ## 2. KiCad PNS engine anatomy (verified against master source)
 
@@ -193,10 +195,13 @@ build world model + buffer obstacle space   (unchanged)
       raise RouteFailure(str(exc))                      # VLM sees real cause
 ```
 
-Dispatch flow: the router always builds a mitered45 skeleton; the
-engine may re-emit arcs where the miter survives shove.  `corner_mode`
-is NOT a `RouteRequest` field anymore (removed 2026-10-10 — fixed
-mitered45); `grid_resolution` is inert/fixed at `GRID_RESOLUTION`.
+Dispatch flow: the router always builds a mitered45 skeleton, so the
+engine never emits skeleton arcs (kept `route_engine` corner modes
+rounded45/rounded90 are unreachable from the public API; the only arc
+emitted end-to-end is a cocircular waypoint chain's covering arc).
+`corner_mode` is NOT a `RouteRequest` field anymore (removed
+2026-10-10 — fixed mitered45); `grid_resolution` is inert/fixed at
+`GRID_RESOLUTION`.
 
 ### 3.4 World-model gap: arcs as obstacles
 
@@ -322,9 +327,11 @@ VLM-facing parameters — **the complete spatial vocabulary**:
 # pcb_route_pad_to_pad (interface v3): VLM control knobs are TOP-LEVEL
 #   waypoints: ordered list of waypoint specs; None/empty = straight pad-to-pad
 #   dry_run: bool (default False) — compute + render, do NOT write
-#   strategy: "shove" | "walkaround" (PNS shove policy)
+#   strategy fixed "shove" (removed 2026-10-10 — no walkaround variant)
 #   layer_hint moved INTO options (rare tweak); options keeps
-#   corner_mode / via_pairs / turn_penalty
+#   via_pairs / turn_penalty (corner_mode / clearance / via sizes /
+#   grid_resolution removed 2026-10-10 — fixed mitered45, resolved
+#   from the board's design rules and netclasses)
 Anchorspec = (
     {"kind": "waypoint", "pos": (x, y), "tol_mm": 1.0}   # pass near (x,y) ± tol
   | {"kind": "via",      "pos": (x, y), "to_layer": "B.Cu"}  # explicit via site

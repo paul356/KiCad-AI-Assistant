@@ -63,17 +63,18 @@ Which one should you use?  The default follows the calling model:
   walks around fixed obstacles (pads, vias, keepouts, other nets) and
   shoves movable tracks out of the way with chain propagation.  Corner
   shape is fixed: 45-degree miter corners on plain 0/45/90 segments
-  (closest to KiCad's optimizer output); a single-layer route emits
-  rounded-corner arcs when the skeleton survives walkaround/shove and
-  the corner sits away from a via junction (the response's
-  ``arc_count``/``arcs`` report them).  A multi-layer ``pns`` route
+  (closest to KiCad's optimizer output); the engine emits no skeleton
+  arcs under this mode, so a plain route reports ``arc_count`` 0.  The
+  one exception is a cocircular waypoint chain (≥4 soft waypoints
+  lying on one circle): the pns fast path emits the chain as a single
+  covering ``(arc ...)`` node when the sweep is DRC-clear (reported in
+  ``arc_count``/``arcs``).  A multi-layer ``pns`` route
   resolves the shortest start -> end layer path through ``via_pairs``
   and routes one walkaround + shove leg per layer, joined by
   through-vias DRC-validated along the direct pad-to-pad line.  Each
-  leg emits its arcs when the skeleton survives walkaround/shove and
-  the corner sits away from a via junction; legs whose skeleton was
-  disturbed, or whose fillet would end on a via, fall back to straight
-  segments — via junctions stay straight-through connections.
+  leg stays straight segments — skeleton fillet arcs are linearized in
+  multi-layer legs (see plan §3.3) — and via junctions stay
+  straight-through connections.
 - ``astar``: grid-based A* planner.  Single-layer routes run
   hierarchical grid A* (coarse pass + fine band); multi-layer routes run
   multi-layer A* with via edges.  This is the classic router behaviour and
@@ -83,13 +84,15 @@ Which one should you use?  The default follows the calling model:
 
 ### Corner shape (fixed: mitered45)
 Sharp 45-degree miter corners on plain 0/45/90 segments — the fewest
-track nodes, closest to KiCad's optimizer output.  The engine may emit
-``(arc ...)`` track nodes on an unobstructed skeleton after a
-successful walkaround/shove leg; a detour or shove linearizes an arc
-back to segments (``arc_count`` drops to 0).  The response echoes
-``corner_mode`` (always ``"mitered45"``) and reports
-``arc_count``/``arcs`` (start/mid/end/width/layer/net) and ``shoved``
-(pushed tracks as net/layer/width/points).
+track nodes, closest to KiCad's optimizer output.  The pns engine emits
+no skeleton arcs under mitered45: a plain route's ``arc_count`` is 0.
+The single exception is a cocircular waypoint chain, which emits one
+covering ``(arc ...)`` node (start/mid/end) when DRC-clear; a detour,
+shove, or multi-layer leg linearizes everything back to segments
+(``arc_count`` drops to 0).  The response echoes ``corner_mode``
+(always ``"mitered45"``) and reports ``arc_count``/``arcs``
+(start/mid/end/width/layer/net) and ``shoved`` (pushed tracks as
+net/layer/width/points).
 
 ### options["via_pairs"] (layer transitions)
 Each ``(from_layer, to_layer)`` pair is one allowed through-via jump,

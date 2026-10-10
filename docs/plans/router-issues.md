@@ -21,13 +21,19 @@ routes `start_layer != end_layer` through it with via edges
 same-net pad polygons). MCP tool `pcb_route_pad_to_pad` exposes
 `via_pairs` / `turn_penalty`.
 
-## 4. Smaller grid resolution for fine-pitch routing — OPEN (verified 2026-09-08)
+## 4. Smaller grid resolution for fine-pitch routing — RESOLVED 2026-10-10 (verified 2026-09-08)
 
 0.1mm grid may miss narrow gaps between tightly packed pads.
 `RouteRequest.grid_resolution` (router.py:164, default None -> 0.025 mm) is
 honoured by the router (router.py:453), but `pcb_route_pad_to_pad`
 (pcb_routing_tools.py:33-44) still exposes no `grid_resolution` parameter.
 Tracked in docs/develop_backlog.md.
+
+Resolution: the pns replacement dropped `grid_resolution` from
+`RouteRequest` entirely (2026-10-10) — the engine is gridless
+(continuous-coordinate walkaround/shove), and the A* planner's grid is
+fixed at `GRID_RESOLUTION`.  Fine-pitch handling is now the pns engine's
+responsibility, not a caller knob.  See docs/plans/pns-vlm-routing.md §1.
 
 ## 5. `_find_pad_size` returns raw unrotated size — OPEN, partially mitigated (verified 2026-09-08)
 
