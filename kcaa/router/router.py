@@ -248,10 +248,10 @@ class RouteResult:
             (the DRC-clean site actually used, possibly micro-shifted).
         strategy: Echo of the requested strategy knob.
         route_png: PNG bytes of a best-effort rendered image of the
-            routed track (single route; `None` if rendering failed or
-            the model is text-only).  In memory only — the tool layer
-            attaches it as an image content block; no temp file is
-            written.
+            routed track (single route; ``None`` if rendering failed or
+            disabled — text-only model, or ``KICAD_MCP_RENDER_ROUTE_PNG=0``).
+            In memory only — the tool layer attaches it as an image
+            content block; no temp file is written.
     """
 
     segments: list[OutputSegment] = field(default_factory=list)
@@ -625,7 +625,7 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
     # Anchor chain actually used, for the success render (A* has none):
     # the PNS waypoints path overwrites this with the real chain.
     used_chain: list[tuple[float, float]] = [pad_a_xy]
-    route_png: str | None = None  # best-effort render of the routed track
+    route_png: bytes | None = None  # best-effort render of the routed track
     # (original, displaced) shove pairs collected from the engine; the
     # write path persists them (A* has no shove -> stays empty).
     moved_pairs: list[tuple[TrackObstacle, TrackObstacle]] = []
@@ -3411,15 +3411,17 @@ def _render_route_png(
 
     Renders the routed polyline on the board (grey track + green anchor
     dots) and returns the PNG bytes; ``None`` when rendering fails or
-    the calling model is text-only (``KICAD_MCP_SUPPORTS_VISION=0``) —
-    success rendering must never mask the route result.
+    route rendering is disabled (``KICAD_MCP_SUPPORTS_VISION=0`` for a
+    text-only model, or ``KICAD_MCP_RENDER_ROUTE_PNG=0`` to skip the
+    render for speed) — success rendering must never mask the route
+    result.
 
     Bytes only, no temp file: the tool layer attaches them to the
     result as an image content block and nothing lingers on disk.
     """
-    from kcaa.utils.config import model_supports_vision
+    from kcaa.utils.config import render_route_png_enabled
 
-    if not model_supports_vision():
+    if not render_route_png_enabled():
         return None
     try:
         from kcaa.tools.render_route_state import render_route_attempt

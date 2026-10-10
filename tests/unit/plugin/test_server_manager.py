@@ -109,6 +109,15 @@ class TestServerManager:
         env = mgr._build_env(1234)
         assert env["KICAD_MCP_SUPPORTS_VISION"] == "1"
 
+    def test_build_env_passes_render_toggle_through(self, monkeypatch):
+        """KICAD_MCP_RENDER_ROUTE_PNG rides the KICAD* passthrough so a
+        user can disable route rendering from the parent environment
+        (the server-side kill switch, default on)."""
+        monkeypatch.setenv("KICAD_MCP_RENDER_ROUTE_PNG", "0")
+        mgr = self._make_manager()
+        env = mgr._build_env(1234)
+        assert env["KICAD_MCP_RENDER_ROUTE_PNG"] == "0"
+
     def test_build_command_uses_python_module(self):
         mgr = self._make_manager()
         cmd = mgr._build_command()

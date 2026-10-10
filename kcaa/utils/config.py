@@ -650,6 +650,24 @@ def model_supports_vision() -> bool:
     return raw not in ("", "0", "false", "no", "off")
 
 
+def render_route_png_enabled() -> bool:
+    """Whether route/evidence PNGs are rendered and returned.
+
+    Independent kill-switch on top of :func:`model_supports_vision`: a
+    vision-capable model may still disable the per-route render (which
+    is by far the slowest part of a routing call) with
+    ``KICAD_MCP_RENDER_ROUTE_PNG=0``.  Defaults to *on* when unset.  A
+    text-only model is always off — the base capability check gates it.
+    The render toggle never changes the output *fields* (the JSON
+    envelope has no ``route_png`` key either way); it only decides
+    whether an image content block is attached to the tool result.
+    """
+    if not model_supports_vision():
+        return False
+    raw = os.environ.get("KICAD_MCP_RENDER_ROUTE_PNG", "1").strip().lower()
+    return raw not in ("", "0", "false", "no", "off")
+
+
 # ---------------------------------------------------------------------------
 # Module-level singleton instance
 # ---------------------------------------------------------------------------

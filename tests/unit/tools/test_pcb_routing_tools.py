@@ -598,14 +598,13 @@ class TestPcbRouteStrategy:
         assert result["algorithm"] == "pns"
 
     def test_strategy_default_echoes_shove_with_route_png(self, tools, routable_board):
-        """No options: strategy echoes "shove" and the response always
-        carries the ``route_png`` field (None — the render rides the
-        image content block, never a temp path; bytes smoke-checked
-        below)."""
+        """No options: strategy echoes "shove", and the JSON envelope
+        never carries a ``route_png`` key — the render rides the image
+        content block (bytes smoke-checked below), never a temp path."""
         result = self._route(tools, routable_board)
         assert "error" not in result
         assert result["strategy"] == "shove"
-        assert result["route_png"] is None
+        assert "route_png" not in result
 
 
 class TestAlgorithmDefaultByVision:
@@ -683,7 +682,8 @@ class TestAlgorithmDefaultByVision:
 
     def test_route_png_always_present_and_existing(self, tools, routable_board):
         """The successful single route renders real PNG bytes delivered
-        as the image content block (no temp file; nothing on disk)."""
+        as the image content block (no temp file; nothing on disk), and
+        the JSON envelope carries no ``route_png`` key."""
         from fastmcp.utilities.types import Image
 
         raw = _run_raw(
@@ -702,7 +702,7 @@ class TestAlgorithmDefaultByVision:
         assert isinstance(raw, tuple) and len(raw) == 2
         payload = json.loads(raw[0])
         assert "error" not in payload
-        assert payload["route_png"] is None  # render rides the image block
+        assert "route_png" not in payload  # render rides the image block
         image = raw[1]
         assert isinstance(image, Image)
         assert image.data[:8] == b"\x89PNG\r\n\x1a\n"
@@ -733,7 +733,7 @@ class TestAlgorithmDefaultByVision:
         payload = json.loads(raw[0])
         assert "error" not in payload
         assert payload["dry_run"] is True
-        assert payload["route_png"] is None
+        assert "route_png" not in payload
         assert isinstance(raw[1], Image)
         assert raw[1].data[:8] == b"\x89PNG\r\n\x1a\n"
         assert open(routable_board, "rb").read() == before
@@ -790,7 +790,64 @@ class TestAlgorithmDefaultByVision:
         payload = json.loads(raw)
         assert "error" not in payload
         assert payload["strategy"] == "shove"
-        assert payload["route_png"] is None
+        assert "route_png" not in payload
+
+    def test_success_skips_render_when_render_toggle_off(self, tools, routable_board, monkeypatch):
+        """KICAD_MCP_RENDER_ROUTE_PNG=0: no render at all — bare JSON
+        text, no image block — while the vision model still defaults to
+        the pns algorithm."""
+        import kcaa.tools.render_route_state as render_mod
+
+        monkeypatch.setenv("KICAD_MCP_RENDER_ROUTE_PNG", "0")
+        called = {"n": 0}
+
+        def _counter(*_args, **_kwargs):
+            called["n"] += 1
+            return None
+
+        monkeypatch.setattr(render_mod, "render_route_attempt", _counter)
+        raw = _run_raw(
+            tools["pcb_route_pad_to_pad"](
+                pcb_path=routable_board,
+                ref_a="R1",
+                pad_a="1",
+                ref_b="C1",
+                pad_b="1",
+                net="VCC",
+                ctx=None,
+                width=0.2,
+                algorithm="pns",
+            )
+        )
+        assert isinstance(raw, str), f"expected bare text, got {type(raw).__name__}"
+        payload = json.loads(raw)
+        assert "error" not in payload
+        assert payload["algorithm"] == "pns"  # vision default unaffected
+        assert "route_png" not in payload
+        assert called["n"] == 0  # render never invoked
+
+    def test_success_render_resume_with_toggle_on(self, tools, routable_board, monkeypatch):
+        """Explicit KICAD_MCP_RENDER_ROUTE_PNG=1 restores the image
+        block (default when unset; the toggle round-trips)."""
+        from fastmcp.utilities.types import Image
+
+        monkeypatch.setenv("KICAD_MCP_RENDER_ROUTE_PNG", "1")
+        raw = _run_raw(
+            tools["pcb_route_pad_to_pad"](
+                pcb_path=routable_board,
+                ref_a="R1",
+                pad_a="1",
+                ref_b="C1",
+                pad_b="1",
+                net="VCC",
+                ctx=None,
+                width=0.2,
+                algorithm="pns",
+            )
+        )
+        assert isinstance(raw, tuple) and len(raw) == 2
+        assert isinstance(raw[1], Image)
+        assert raw[1].data[:8] == b"\x89PNG\r\n\x1a\n"
 
     # -- Shove persistence -------------------------------------------------
 
@@ -1019,9 +1076,8 @@ class TestAlgorithmDefaultByVision:
 
     def test_shove_failure_returns_error_with_evidence(self, tools, crossing_board, monkeypatch):
         """A shove-stage ShoveFailure must surface as
-        {"error": ..., "route_png": null} — never the FastMCP
-        success:true + text-error wrapper (and evidence still renders
-        as the image block)."""
+        {"error": ...} — no success wrapper, no ``route_png`` key (the
+        evidence still renders as the image block)."""
         from fastmcp.utilities.types import Image
 
         from kcaa.router.pns.shove import ShoveFailure
@@ -1051,7 +1107,7 @@ class TestAlgorithmDefaultByVision:
         assert "success" not in payload
         assert "shove failed" in payload["error"]
         assert "cannot shove track" in payload["error"]
-        assert payload.get("route_png") is None
+        assert "route_png" not in payload
         assert isinstance(raw[1], Image)
         assert raw[1].data[:8] == b"\x89PNG\r\n\x1a\n"
 
@@ -1137,14 +1193,14 @@ class TestPcbRouteFailureEvidence:
         assert isinstance(raw, tuple) and len(raw) == 2
         payload = json.loads(raw[0])
         assert "error" in payload
-        assert payload.get("route_png") is None
+        assert "route_png" not in payload
         assert isinstance(raw[1], Image)
         assert raw[1].data[:8] == b"\x89PNG\r\n\x1a\n"
 
     def test_failure_returns_image_content_block(self, tools, board_with_tracks):
         """The failure envelope also carries the evidence PNG as an image
-        content block (the VLM must SEE the failed endpoints — there is
-        no temp-file path in the payload)."""
+        content block (the VLM must SEE the failed endpoints — the
+        payload carries no ``route_png`` key, no temp-file path)."""
         from fastmcp.utilities.types import Image
 
         raw = _run_raw(
@@ -1162,7 +1218,7 @@ class TestPcbRouteFailureEvidence:
         assert isinstance(raw, tuple) and len(raw) == 2
         payload = json.loads(raw[0])
         assert "error" in payload
-        assert payload["route_png"] is None
+        assert "route_png" not in payload
         image = raw[1]
         assert isinstance(image, Image)
         assert image.data[:8] == b"\x89PNG\r\n\x1a\n"
@@ -1214,7 +1270,7 @@ class TestPcbRouteFailureEvidence:
         assert isinstance(raw, str)
         payload = json.loads(raw)
         assert "error" in payload
-        assert payload["route_png"] is None
+        assert "route_png" not in payload
 
     def test_failure_render_skipped_for_text_only_model(
         self, tools, board_with_tracks, monkeypatch
@@ -1244,6 +1300,39 @@ class TestPcbRouteFailureEvidence:
             )
         )
         assert isinstance(raw, str)
+        assert called["n"] == 0
+
+    def test_failure_skips_render_when_render_toggle_off(
+        self, tools, board_with_tracks, monkeypatch
+    ):
+        """KICAD_MCP_RENDER_ROUTE_PNG=0 skips the failure-evidence
+        render too: bare JSON error text, no image block."""
+        import kcaa.tools.pcb_routing_tools as prt
+
+        monkeypatch.setenv("KICAD_MCP_RENDER_ROUTE_PNG", "0")
+        called = {"n": 0}
+
+        def _counter(*_args, **_kwargs):
+            called["n"] += 1
+            return None
+
+        monkeypatch.setattr(prt, "render_route_attempt", _counter)
+        raw = _run_raw(
+            tools["pcb_route_pad_to_pad"](
+                pcb_path=board_with_tracks,
+                ref_a="R1",
+                pad_a="1",
+                ref_b="C99",
+                pad_b="1",
+                net="VCC",
+                width=0.25,
+                ctx=None,
+            )
+        )
+        assert isinstance(raw, str)
+        payload = json.loads(raw)
+        assert "error" in payload
+        assert "route_png" not in payload
         assert called["n"] == 0
 
 
