@@ -118,6 +118,13 @@ class EngineResult:
     orig_obstacle_ids: set[int] = field(default_factory=set)
 
 
+def _line_in_board(pts: Sequence[tuple[float, float]], board_limit: Polygon) -> bool:
+    """True iff the whole polyline (centerline) lies inside ``board_limit``."""
+    if not pts:
+        return True
+    return board_limit.covers(LineString(pts))
+
+
 def route_engine(
     start: tuple[float, float],
     end: tuple[float, float],
@@ -128,6 +135,7 @@ def route_engine(
     max_shove_depth: float | None = None,
     extra_fixed: Sequence[Obstacle] = (),
     net: str | None = None,
+    board_outline: Polygon | None = None,
 ) -> EngineResult:
     """Route ``start`` → ``end`` through the obstacle set with walkaround
     + shove, returning the final polyline and the pushed tracks.
@@ -146,6 +154,12 @@ def route_engine(
     same-net copper (the route's own pads / earlier legs): same-net
     copper needs no gap.  ``None`` audits conservatively (no exemption).
 
+    ``board_outline`` is the Edge.Cuts outer boundary polygon.  When
+    given, every exploration (lane / walkaround / detour) is confined to
+    it: a candidate polyline that leaves the outline is rejected instead
+    of being emitted, and the final audit re-checks the route against it
+    so a detour can never escape the board.
+
     Output contract: whatever leaves the engine is DRC-clean **or the
     route fails loudly** —
 
@@ -159,6 +173,18 @@ def route_engine(
     """
     trace = build_initial_trace(start, end, corner_mode)
     skeleton = trace.as_polyline(arc_pts=16)
+
+    # Edge.Cuts constraint: the route COPPER must stay inside the outer
+    # outline, so the centerline is confined to the outline shrunk by
+    # half the track width (mirrors ``_check_segments_in_board``).  A
+    # degenerate outline (board narrower than the track) removes the
+    # constraint — the tool-layer audit reports it.
+    if board_outline is not None and not board_outline.is_empty:
+        board_limit = board_outline.buffer(-(track_width / 2.0))
+        if board_limit is None or board_limit.is_empty:
+            board_limit = None
+    else:
+        board_limit = None
 
     # Movable: simple rect tracks shovable at their endpoints' disposal.
     # Everything else (vias, pads, keepouts, arcs) is fixed.
@@ -263,11 +289,28 @@ def route_engine(
         lane = (
             _try_parallel_lane(start, end, node, track_width, clearance) if direct_blocked else None
         )
+        if lane is not None and board_limit is not None and not _line_in_board(lane, board_limit):
+            lane = None  # a lane leaving the board outline is not a route
         if lane is not None:
             walked = lane
         else:
             try:
                 walked = _walkaround_solids(skeleton, node, track_width, clearance, frames=frames)
+                if (
+                    walked is not None
+                    and board_limit is not None
+                    and not _line_in_board(walked, board_limit)
+                ):
+                    # The walked line escapes the board outline — not a
+                    # viable route; let the shove-first fallback see the
+                    # failure state and fail loudly instead of emitting
+                    # copper that the file audit would reject.
+                    walk_err = PnsFailure(
+                        "walkaround left the Edge.Cuts outline",
+                        last_path=list(walked),
+                        frames=frames,
+                    )
+                    walked = None
             except PnsFailure as exc:
                 walk_err = exc
                 walked = None
@@ -289,6 +332,7 @@ def route_engine(
                     track_width,
                     clearance,
                     frames=frames,
+                    board_limit=board_limit,
                 )
 
         # Optimization 1 — shove-first fallback.  KiCad's SHOVE
@@ -327,6 +371,16 @@ def route_engine(
                 # tracks were part of the lockup, the pushed state can
                 # converge where the first pass did not.
                 walked = _walkaround_solids(seed, node, track_width, clearance, frames=frames)
+                if (
+                    walked is not None
+                    and board_limit is not None
+                    and not _line_in_board(walked, board_limit)
+                ):
+                    raise PnsFailure(
+                        "walkaround left the Edge.Cuts outline after shove",
+                        last_path=list(walked),
+                        frames=frames,
+                    )
                 out_path = walked
                 pushed = first.pushed
                 moved_pairs = first.moved_pairs
@@ -592,6 +646,18 @@ def route_engine(
         orig_obstacle_ids=orig_obstacle_ids,
         clearance=clearance,
     )
+
+    # Edge.Cuts containment: a route that escaped the outline would be
+    # caught by the tool-layer audit after the fact; fail here with the
+    # proper "no path" semantics so the caller never sees a route that
+    # exits the board.
+    if board_limit is not None and not _line_in_board(out_path, board_limit):
+        raise PnsFailure(
+            f"route left the Edge.Cuts outline (centerline not fully inside "
+            f"board shrunk by {track_width / 2.0:.4f} mm)",
+            last_path=list(out_path),
+            frames=frames,
+        )
 
     # Rounded skeleton arcs survive only when walkaround left the path
     # untouched (a detour linearizes the arc it goes around).
@@ -1245,6 +1311,7 @@ def _visibility_detour(
     track_width: float,
     clearance: float,
     frames: list[dict] | None = None,
+    board_limit: Polygon | None = None,
 ) -> list[tuple[float, float]] | None:
     """Multi-bend detour via the visibility graph.
 
@@ -1306,6 +1373,7 @@ def _visibility_detour(
         end,
         start_layer=layer,
         end_layer=layer,
+        board_limit=board_limit,
     )
     ids = graph.shortest_path(0, 1)
     if not ids:

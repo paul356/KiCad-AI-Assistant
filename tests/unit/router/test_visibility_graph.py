@@ -236,6 +236,59 @@ class TestMultiLayer:
         assert abs(g.via_cost_fn(1) - 7.5) < 1e-9
 
 
+class TestBoardLimit:
+    """board_limit confines every graph edge to the Edge.Cuts outline."""
+
+    def test_edge_crossing_limit_is_not_visible(self):
+        # Board outline is a 10x10 square from (0,0); direct line runs
+        # along the x axis inside it.  An obstacle below y=0 is mostly
+        # inside the board, but its detour bends to a vertex at (5,-2),
+        # OUTSIDE the outline; that vertex's edges must be dropped, so
+        # the direct line (clear of obstacles within the board) stays
+        # the shortest path instead of detouring out of the board.
+        board = Polygon([(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)])
+        obs = _rect_obstacle(4.0, -2.5, 6.0, -0.5)  # sits below the board edge
+        g = build_visibility_graph([obs], ["F"], (1.0, 5.0), (9.0, 5.0), board_limit=board)
+        ids = g.shortest_path(0, 1)
+        assert ids is not None
+        # Every segment lies fully inside the board polygon.
+        pts = [(g.nodes[i].x, g.nodes[i].y) for i in ids]
+        for a, b in zip(pts, pts[1:]):
+            assert board.covers(LineString([a, b])), f"edge {a}->{b} leaves the board"
+
+    def test_limit_removes_out_of_board_detour(self):
+        # Center obstacle forces a detour; with a narrow board the only
+        # free lane lies outside the outline, so no connecting path
+        # exists WITHIN the board and shortest_path must return None.
+        board = Polygon([(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)])
+        # Wall from y=0 to y=10 blocks the corridor completely; the top
+        # detour vertex (at y>10) would lie outside the board.
+        wall = Obstacle(
+            shape=Polygon([(4.0, 0.0), (6.0, 0.0), (6.0, 10.0), (4.0, 10.0)]),
+            layers=frozenset({"F"}),
+            net=None,
+            kind="pad",
+        )
+        g_no_limit = build_visibility_graph([wall], ["F"], (1.0, 5.0), (9.0, 5.0))
+        assert g_no_limit.shortest_path(0, 1) is not None  # detours over the top
+        g_limit = build_visibility_graph([wall], ["F"], (1.0, 5.0), (9.0, 5.0), board_limit=board)
+        # The top vertices sit at y=10 (the wall's corners); the
+        # shortest path over them hugs the boundary and is *allowed*
+        # (covers includes the boundary).  So the connection survives.
+        ids = g_limit.shortest_path(0, 1)
+        assert ids is not None
+        pts = [(g_limit.nodes[i].x, g_limit.nodes[i].y) for i in ids]
+        for a, b in zip(pts, pts[1:]):
+            assert board.covers(LineString([a, b]))
+
+    def test_start_outside_limit_yields_no_edges(self):
+        board = Polygon([(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)])
+        # Start at x=-1 is outside the board: every edge from it must
+        # be dropped, so the graph has no start->end connection.
+        g = build_visibility_graph([], ["F"], (-1.0, 5.0), (9.0, 5.0), board_limit=board)
+        assert g.shortest_path(0, 1) is None
+
+
 class TestShortestPath:
     def test_direct_edge_no_obstacles(self):
         g = build_visibility_graph([], ["F"], (0.0, 0.0), (10.0, 0.0))

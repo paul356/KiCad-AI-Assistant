@@ -305,6 +305,40 @@ class TestRouteEngine:
         assert res.path[0] == (-6, 0) and res.path[-1] == (6, 0)
         assert LineString(res.path).distance(arc.shape) >= CLR - 1e-6
 
+    def test_board_outline_confines_detour_to_board(self):
+        """Engine-level regression for the F.Cu board-outline fix: with a
+        board polygon whose edge blocks the direct line (detour would
+        leave the outline), the engine must NOT emit an out-of-board
+        route — it must fail with PnsFailure instead of a path whose
+        copper exits the Edge.Cuts boundary."""
+        # Board 20x10 (0..20, 0..10); the direct line y=5 crosses a pad
+        # wall; detouring over the top would leave y>10.
+        board = Polygon([(0.0, 0.0), (20.0, 0.0), (20.0, 10.0), (0.0, 10.0)])
+        wall = Obstacle(
+            shape=Polygon([(9.0, 0.0), (11.0, 0.0), (11.0, 10.0), (9.0, 10.0)]),
+            layers=frozenset({"F.Cu"}),
+            net=None,
+            kind="pad",
+        )
+        with pytest.raises(PnsFailure, match="walkaround"):
+            route_engine((2, 5), (18, 5), [wall], W, CLR, board_outline=board)
+
+    def test_board_outline_allows_path_inside(self):
+        """A clear lane below a wall stays inside the outline and the
+        engine returns a path that never leaves the board."""
+        board = Polygon([(0.0, 0.0), (20.0, 0.0), (20.0, 10.0), (0.0, 10.0)])
+        wall = Obstacle(
+            shape=Polygon([(9.0, 3.0), (11.0, 3.0), (11.0, 10.0), (9.0, 10.0)]),
+            layers=frozenset({"F.Cu"}),
+            net=None,
+            kind="pad",
+        )
+        res = route_engine((2, 5), (18, 5), [wall], W, CLR, board_outline=board)
+        # Route stays entirely inside the board.
+        shrink = board.buffer(-(W / 2.0 + 1e-9))
+        assert shrink.covers(LineString(res.path))
+        assert res.path[0] == (2, 5) and res.path[-1] == (18, 5)
+
     def test_corner_mode_affects_skeleton(self):
         from kcaa.router.pns.direction45 import CornerMode
 

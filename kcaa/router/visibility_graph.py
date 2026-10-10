@@ -32,7 +32,7 @@ from dataclasses import dataclass, field
 import math
 
 from rtree import index
-from shapely.geometry import LineString
+from shapely.geometry import LineString, Point, Polygon
 
 from kcaa.router.world_model import Obstacle
 
@@ -178,49 +178,54 @@ def build_visibility_graph(
     via_cost_fn: Callable[[int], float] = DEFAULT_VIA_COST_FN,
     start_layer: str | None = None,
     end_layer: str | None = None,
+    board_limit: Polygon | None = None,
 ) -> VisibilityGraph:
     """Construct a multi-layer visibility graph.
 
-    The graph contains per-layer track edges and cross-layer via edges:
+        The graph contains per-layer track edges and cross-layer via edges:
 
-    1. **Per-layer nodes**: on each layer, candidate nodes are the start, end
-       and the vertices of obstacles that sit on that layer.
-    2. **Per-layer track edges**: visibility connections between same-layer
-       nodes whose straight line crosses no obstacle on that layer.
-    3. **Cross-layer via nodes**: an (x, y) is via-legal if it lies **outside
-       every obstacle on every routing layer**. For every via-legal (x, y)
-       that is missing from a layer, a node is added on that layer.
-    4. **Via edges**: for each via-legal (x, y) and every pair in
-       ``via_pairs`` whose two layers both have a node at that (x, y), add a
-       via edge with cost ``via_cost_fn(via_count_so_far)``.
+        1. **Per-layer nodes**: on each layer, candidate nodes are the start, end
+           and the vertices of obstacles that sit on that layer.
+        2. **Per-layer track edges**: visibility connections between same-layer
+           nodes whose straight line crosses no obstacle on that layer.
+        3. **Cross-layer via nodes**: an (x, y) is via-legal if it lies **outside
+           every obstacle on every routing layer**. For every via-legal (x, y)
+           that is missing from a layer, a node is added on that layer.
+        4. **Via edges**: for each via-legal (x, y) and every pair in
+           ``via_pairs`` whose two layers both have a node at that (x, y), add a
+           via edge with cost ``via_cost_fn(via_count_so_far)``.
 
-    Same-net obstacles (``net is not None``) are not added as obstacles and
-    their vertices are also excluded from the graph — a track should not be
-    told to "go around" itself.
+        Same-net obstacles (``net is not None``) are not added as obstacles and
+        their vertices are also excluded from the graph — a track should not be
+        told to "go around" itself.
 
     Args:
-        obstacles: All obstacles; only those whose ``layers`` overlap with
-            ``layers`` participate.
-        layers: Routing layers (e.g. ``["F.Cu", "B.Cu"]``).
-        start: Start point in world coordinates.
-        end: End point in world coordinates.
-        via_pairs: Optional list of ``(top_layer, bottom_layer)`` tuples.
-            Via edges are only added for these layer pairs. Empty / ``None``
-            disables via edges entirely.
-        via_cost_fn: Function ``(n_vias_so_far) -> float`` giving the cost
-            of a via edge when the running via count is ``n_vias_so_far``.
-        start_layer: Layer the start point lives on.  When ``None`` the
-            start is added to every routing layer (legacy behaviour, which
-            creates a phantom goal at the start point on every other
-            layer).  When set, the start node is added only to this
-            layer — the canonical start is ``node_id == 0``.
-        end_layer: Layer the end point lives on.  When ``None`` the end is
-            added to every routing layer.  When set, the end node is
-            added only to this layer — the canonical goal is
-            ``node_id == 1``.
+            obstacles: All obstacles; only those whose ``layers`` overlap with
+                ``layers`` participate.
+            layers: Routing layers (e.g. ``["F.Cu", "B.Cu"]``).
+            start: Start point in world coordinates.
+            end: End point in world coordinates.
+            via_pairs: Optional list of ``(top_layer, bottom_layer)`` tuples.
+                Via edges are only added for these layer pairs. Empty / ``None``
+                disables via edges entirely.
+            via_cost_fn: Function ``(n_vias_so_far) -> float`` giving the cost
+                of a via edge when the running via count is ``n_vias_so_far``.
+            start_layer: Layer the start point lives on.  When ``None`` the
+                start is added to every routing layer (legacy behaviour, which
+                creates a phantom goal at the start point on every other
+                layer).  When set, the start node is added only to this
+                layer — the canonical start is ``node_id == 0``.
+            end_layer: Layer the end point lives on.  When ``None`` the end
+                is added to every routing layer.  When set, the end node is
+                added only to this layer — the canonical goal is
+                ``node_id == 1``.
+            board_limit: Optional polygon inside which every graph edge must
+                lie (e.g. the Edge.Cuts outer outline inflated by the route
+                margin).  An edge that crosses outside it is not visible, so
+                a shortest path can never leave the board.
 
-    Returns:
-        A :class:`VisibilityGraph`.
+        Returns:
+            A :class:`VisibilityGraph`.
     """
     via_pairs = list(via_pairs or [])
     if not layers:
@@ -322,6 +327,8 @@ def build_visibility_graph(
                 a = nodes[i]
                 b = nodes[j]
                 if _is_visible(a, b, layer_obs, rtree_idx):
+                    if board_limit is not None and not _edge_inside_limit(a, b, board_limit):
+                        continue
                     graph.add_edge(a.node_id, b.node_id)
 
     # Identify via-legal (x, y) positions: the union of all candidate (x, y)
@@ -334,6 +341,8 @@ def build_visibility_graph(
         all_pts.update(pts)
     via_legal: set[tuple[float, float]] = set()
     for pt in all_pts:
+        if board_limit is not None and not board_limit.covers(Point(pt[0], pt[1])):
+            continue
         if all(_is_free(pt, layer_obs, eps) for layer_obs in per_layer_obs.values()):
             via_legal.add(pt)
 
@@ -368,6 +377,17 @@ def build_visibility_graph(
 # ---------------------------------------------------------------------------
 # Visibility
 # ---------------------------------------------------------------------------
+
+
+def _edge_inside_limit(a: RouteNode, b: RouteNode, board_limit: Polygon) -> bool:
+    """True iff the segment a→b lies fully inside ``board_limit``.
+
+    A strict ``covers`` check: the segment may touch the boundary but
+    must not leave the polygon.  This is the Edge.Cuts board constraint
+    for detours — a route must never escape the outline.
+    """
+    seg = LineString([(a.x, a.y), (b.x, b.y)])
+    return board_limit.covers(seg)
 
 
 def _is_visible(

@@ -72,6 +72,7 @@ class WorldModel:
 
     obstacles: list[Obstacle] = field(default_factory=list)
     board_bbox: tuple[float, float, float, float] | None = None  # (minx, miny, maxx, maxy)
+    board_outline: Polygon | None = None  # Edge.Cuts outer outline (world coords)
 
     def on_layer(self, layer: str) -> list[Obstacle]:
         """Return obstacles present on ``layer``."""
@@ -110,6 +111,7 @@ def build_world_model(
     data = load_pcb(pcb_path)
     model = WorldModel()
     model.board_bbox = _board_bbox(data)
+    model.board_outline = _board_outline(data)
 
     for item in data:
         if not _is_list(item):
@@ -653,27 +655,16 @@ def _board_bbox(data: list[Any]) -> tuple[float, float, float, float] | None:
 
 
 # ---------------------------------------------------------------------------
-# Edge.Cuts openings (cutouts / routing slots inside the board)
+# Edge.Cuts outline and openings (cutouts / routing slots inside the board)
 # ---------------------------------------------------------------------------
 
 
-def _edge_cuts_openings(data: list[Any]) -> list[Polygon]:
-    """Closed Edge.Cuts loops strictly inside the board outline.
+def _edge_cuts_faces(data: list[Any]) -> list[Polygon]:
+    """Polygonised Edge.Cuts faces in world coordinates.
 
-    KiCad draws internal cutouts (routing slots, mounting windows) as
-    closed loops on the Edge.Cuts layer that lie wholly inside the outer
-    outline.  A track routed across such a loop physically spans a hole in
-    the substrate -- fabrication-invalid copper.  Open notches that touch
-    the outer boundary (e.g. an edge-connector card bay) are NOT openings:
-    they are part of the outline, and the AABB fence handles them.
-
-    The outer outline is the polygonized face with maximum area; every
-    interior ring of that face is one opening loop.  Panel files with
-    several disjoint outlines are handled by collecting interior rings
-    from every face, not just the largest.
-
-    Returns [] when the outline is absent, open, or degenerate (same
-    workflow state as a missing ``_board_bbox``).
+    The outer outline is the face with maximum area; every interior ring
+    of a face is an opening loop.  Panel files with several disjoint
+    outlines yield several faces.
     """
     lines: list[LineString] = []
 
@@ -711,9 +702,45 @@ def _edge_cuts_openings(data: list[Any]) -> list[Polygon]:
     if not lines:
         return []
     merged = unary_union(lines)
-    faces = list(polygonize(merged))
+    return [p for p in polygonize(merged) if p.is_valid and not p.is_empty and p.area > 0]
+
+
+def _board_outline(data: list[Any]) -> Polygon | None:
+    """Return the Edge.Cuts outer outline as a polygon, or None.
+
+    The outer outline is the maximum-area polygonised face.  Panel files
+    with several disjoint outlines are not a single outer outline; the
+    router treats each face as its own boundary and falls back to the
+    AABB fence in that case (``None`` here means "no single outline").
+    """
+    faces = _edge_cuts_faces(data)
     if not faces:
-        return []
+        return None
+    outer = max(faces, key=lambda f: f.area)
+    if not outer.is_valid or outer.is_empty:
+        return None
+    return outer
+
+
+def _edge_cuts_openings(data: list[Any]) -> list[Polygon]:
+    """Closed Edge.Cuts loops strictly inside the board outline.
+
+    KiCad draws internal cutouts (routing slots, mounting windows) as
+    closed loops on the Edge.Cuts layer that lie wholly inside the outer
+    outline.  A track routed across such a loop physically spans a hole in
+    the substrate -- fabrication-invalid copper.  Open notches that touch
+    the outer boundary (e.g. an edge-connector card bay) are NOT openings:
+    they are part of the outline, and the AABB fence handles them.
+
+    The outer outline is the polygonized face with maximum area; every
+    interior ring of that face is one opening loop.  Panel files with
+    several disjoint outlines are handled by collecting interior rings
+    from every face, not just the largest.
+
+    Returns [] when the outline is absent, open, or degenerate (same
+    workflow state as a missing ``_board_bbox``).
+    """
+    faces = _edge_cuts_faces(data)
     # Every closed loop that is interior to *any* face is an opening.
     # Taking interiors from all faces (not just the max-area one) also
     # covers panel files with several disjoint board outlines.
