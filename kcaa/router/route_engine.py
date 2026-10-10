@@ -25,6 +25,7 @@ from kcaa.router.pns.direction45 import ArcSeg, CornerMode, Trace, build_initial
 from kcaa.router.pns.node import ObstacleNode
 from kcaa.router.pns.shove import ShoveFailure, ShoveResult, TrackObstacle, shove_path
 from kcaa.router.pns.walkaround import WalkFailure, walkaround_line
+from kcaa.router.visibility_graph import build_visibility_graph
 from kcaa.router.world_model import Obstacle
 
 MAX_WALKAROUND_ITER = 64
@@ -220,15 +221,6 @@ def route_engine(
     while True:
         movable_active = [t for i, t in enumerate(movable) if i not in promoted]
         movable_shapes_active = [s for i, s in enumerate(movable_shapes) if i not in promoted]
-        if promoted:
-            frames.append(
-                {
-                    "stage": f"promote-round-{len(frames):02d}",
-                    "path": list(out_path if out_path is not None else skeleton),
-                    "hit": f"pinned {len(promoted)} movable track segment(s) as fixed",
-                    "note": f"promoted segments: {sorted(promoted)}",
-                }
-            )
         # Movable tracks are shove candidates only when shoving is
         # enabled (``max_shove_depth != 0``); the walkaround-only
         # strategy treats every track as a fixed solid and routes around
@@ -238,6 +230,18 @@ def route_engine(
             if not shove_enabled
             else [o for o in obstacles if o not in movable_shapes_active]
         )
+        if promoted:
+            frames.append(
+                {
+                    "stage": f"promote-round-{len(frames):02d}",
+                    "path": list(out_path if out_path is not None else skeleton),
+                    "hit": f"pinned {len(promoted)} movable track segment(s) as fixed",
+                    "note": f"promoted segments: {sorted(promoted)}",
+                    # The walk set this round: movable tracks (not yet
+                    # promoted) are excluded, everything else is solid.
+                    "obstacles": list(walk_obstacles),
+                }
+            )
         node = ObstacleNode(walk_obstacles)
         walked: list[tuple[float, float]] | None = None
         walk_err: PnsFailure | None = None
@@ -267,6 +271,25 @@ def route_engine(
             except PnsFailure as exc:
                 walk_err = exc
                 walked = None
+            # Optimization 0 — visibility-graph detour.  Lane probes a
+            # straight parallel offset and walkaround hugs single
+            # obstacle hulls; when the blockage is a *cluster* (the J1
+            # THT pad column fused with a bundle of parallel tracks)
+            # both single-context searches fail — the free lane runs
+            # around the whole cluster, never beside its surface.  The
+            # visibility graph over every obstacle (movable tracks
+            # included — a genuine last resort before shove) finds the
+            # global family-only detour; the shove stage below then has
+            # nothing left to push, exactly like the proven A* result.
+            if walked is None:
+                walked = _visibility_detour(
+                    start,
+                    end,
+                    ObstacleNode(list(obstacles)),
+                    track_width,
+                    clearance,
+                    frames=frames,
+                )
 
         # Optimization 1 — shove-first fallback.  KiCad's SHOVE
         # semantics: when walkaround cannot find a detour, do not give
@@ -325,6 +348,7 @@ def route_engine(
                             "hit": hit_desc,
                             "note": f"shove could not move track: {exc}",
                             "pinned": _pinned_endpoints(exc.hit, walk_obstacles),
+                            "obstacles": list(walk_obstacles),
                         }
                     )
                 if exc.hit is not None and _promote_track_group(exc.hit, movable, promoted):
@@ -386,6 +410,7 @@ def route_engine(
                             "hit": hit_desc,
                             "note": f"main shove could not move track: {exc}",
                             "pinned": _pinned_endpoints(exc.hit, walk_obstacles),
+                            "obstacles": list(walk_obstacles),
                         }
                     )
                 if exc.hit is not None and _promote_track_group(exc.hit, movable, promoted):
@@ -1158,6 +1183,11 @@ def _walkaround_solids(
                     if hit is not None
                     else None,
                     "note": f"walkaround iteration {it}",
+                    # The obstacle set the engine actually consults at
+                    # this iteration (movable tracks excluded after
+                    # promote rounds) — the dump renders THESE, not the
+                    # static board model, so a hit is attributable.
+                    "obstacles": list(node.obstacles()),
                 }
             )
         if hit is None:
@@ -1206,6 +1236,98 @@ def _walkaround_solids(
         else None,
         frames=frames,
     )
+
+
+def _visibility_detour(
+    start: tuple[float, float],
+    end: tuple[float, float],
+    node: ObstacleNode,
+    track_width: float,
+    clearance: float,
+    frames: list[dict] | None = None,
+) -> list[tuple[float, float]] | None:
+    """Multi-bend detour via the visibility graph.
+
+    Lane probes a straight parallel offset; walkaround hugs one obstacle
+    at a time.  Both are single-context searches: when the direct line
+    is blocked by a *cluster* (a THT pad column, a bundle of parallel
+    tracks), the free lane may lie around the whole cluster, not just
+    beside the surface of the nearest member, and neither search looks
+    there.  The visibility graph over ``node``'s obstacles — every
+    obstacle-family hull, connected by clear-of-obstacles segments —
+    finds the global geometric shortest path with any number of bends.
+
+    The graph is built over the family-hull octagons (``margin =
+    clearance + width/2``), so every graph edge is already DRC-clean:
+    vertices sit at the hull (which carries the route margin) and edges
+    are the straight runs between them that cross no hull.  Octagon
+    vertices are 0/45/90-family so the detour is family-only, exactly
+    like the walkaround hulls.  Returns the polyline ``[start, ..., end]``
+    or ``None`` when the graph has no start→end connection (start/end in
+    different connected components — a genuine enclosure).
+    """
+    from kcaa.router.world_model import Obstacle as _Obstacle
+
+    margin = clearance + CLEARANCE_EPS + track_width / 2.0
+    try:
+        obs = node.obstacles()
+    except Exception:
+        return None
+    layers: dict[str, None] = {}
+    for o in obs:
+        for l in o.layers:
+            layers[l] = None
+    if not layers:
+        return None
+    # The engine runs one layer at a time; if a stray obstacle carries a
+    # foreign layer the graph builder would filter it out anyway.
+    layer = next(iter(layers))
+    hulls: list[_Obstacle] = []
+    for o in obs:
+        if o.shape is None or o.shape.is_empty:
+            continue
+        hull = _family_hull(o.shape, margin)
+        if hull.is_empty:
+            continue
+        hulls.append(
+            _Obstacle(
+                shape=hull,
+                layers=frozenset({layer}),
+                net=None,  # graph builder treats net-carrying solids as "route" copper
+                kind=o.kind,
+            )
+        )
+    if not hulls:
+        return None
+    graph = build_visibility_graph(
+        hulls,
+        [layer],
+        start,
+        end,
+        start_layer=layer,
+        end_layer=layer,
+    )
+    ids = graph.shortest_path(0, 1)
+    if not ids:
+        return None
+    pts = [(graph.nodes[i].x, graph.nodes[i].y) for i in ids]
+    # A detour must actually detour: a direct sightline would have been
+    # caught by ``direct_blocked``/walkaround; if the graph still yields
+    # the two-point skeleton (start,end) it means the direct line is
+    # clear under the graph's hull metric but not ours — reject.
+    if len(pts) <= 2:
+        return None
+    if frames is not None:
+        frames.append(
+            {
+                "stage": f"vis-graph-{len(frames):02d}",
+                "path": list(pts),
+                "hit": None,
+                "note": f"visibility-graph detour ({len(pts)} pts)",
+                "obstacles": list(obs),
+            }
+        )
+    return pts
 
 
 def _path_len(pts: Sequence[tuple[float, float]]) -> float:

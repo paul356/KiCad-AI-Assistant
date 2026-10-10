@@ -1759,7 +1759,12 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
                             f"fail-pns-{fi:03d}",
                             fr.get("path") or [],
                             _pad_viz,
-                            buffered,
+                            # The engine's ACTUAL walk set at this frame
+                            # (movable tracks excluded after promote
+                            # rounds), not the static board model — so a
+                            # hit renders against the obstacles the
+                            # engine consulted.
+                            fr.get("obstacles") or buffered,
                             route_bbox,
                             pinned=fr.get("pinned"),
                             note=fr.get("note"),
@@ -1769,7 +1774,7 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
                     "fail-pns-final",
                     exc.last_path or [],
                     _pad_viz,
-                    buffered,
+                    fail_frames[-1].get("obstacles") or buffered if fail_frames else buffered,
                     route_bbox,
                     shoved=[
                         {"net": orig.net, "from": orig.points, "to": disp.points}

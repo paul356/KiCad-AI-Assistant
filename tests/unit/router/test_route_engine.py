@@ -18,6 +18,7 @@ from kcaa.router.route_engine import (
     _rect_medians,
     _snap45_line,
     _track_centerline,
+    _visibility_detour,
     _walkaround_solids,
     route_engine,
 )
@@ -814,6 +815,10 @@ class TestFallbackShoveFirst:
         # clear the canyon) and surface BOTH failure causes with the
         # shove state attached — never a bare "walkaround did not
         # converge".
+        # The visibility detour (Optimization 0) resolves this canyon
+        # outright, so it is isolated here: this test pins the shove-
+        # first fallback contract alone.
+        monkeypatch.setattr("kcaa.router.route_engine._visibility_detour", lambda *_a, **_k: None)
         t = _track_obs(0.0, -2.0, 2.0, "N2")
         walls = [
             Obstacle(
@@ -865,6 +870,9 @@ class TestFallbackShoveFirst:
         # still blocks the retry walkaround: the merged failure must
         # carry the displacements that DID happen — the dump shows
         # partial progress instead of an empty board.
+        # The visibility detour would resolve the canyon first, so it is
+        # isolated: this pins the shove-first retry contract.
+        monkeypatch.setattr("kcaa.router.route_engine._visibility_detour", lambda *_a, **_k: None)
         from kcaa.router.pns.shove import ShoveResult
 
         t = _track_obs(0.0, -2.0, 2.0, "N2")
@@ -906,6 +914,9 @@ class TestFallbackShoveFirst:
     def test_no_fallback_without_movable_tracks(self, monkeypatch):
         # Pure fixed lockup, no movable: walkaround failure surfaces
         # directly, shove is never invoked.
+        # The visibility detour would resolve the canyon first, so it is
+        # isolated: this pins the no-movable failure contract.
+        monkeypatch.setattr("kcaa.router.route_engine._visibility_detour", lambda *_a, **_k: None)
         walls = [
             Obstacle(
                 shape=Polygon([(-0.3, -5), (0.3, -5), (0.3, 5), (-0.3, 5)]),
@@ -938,3 +949,73 @@ class TestFallbackShoveFirst:
         exc = excinfo.value
         assert calls == []
         assert "walkaround" in str(exc)
+
+
+class TestVisibilityDetour:
+    """Optimization 0: visibility-graph multi-bend detour — the engine's
+    third exploration, used when both lane and single-obstacle
+    walkaround cannot see the free corridor around a whole cluster.
+    """
+
+    def test_detour_around_pad_row(self):
+        from kcaa.router.pns.node import ObstacleNode
+
+        # A vertical wall of pads blocks the direct line; the detour
+        # must bend around the whole row (any number of bends) and keep
+        # clearance from every pad.
+        pads = [_pad(0, y, half=0.3) for y in (-2, 0, 2)]
+        node = ObstacleNode(pads)
+        out = _visibility_detour((-8, 0), (8, 0), node, W, CLR)
+        assert out is not None
+        assert out[0] == (-8, 0) and out[-1] == (8, 0)
+        assert len(out) > 2  # a real detour, not the straight line
+        for pad in pads:
+            assert LineString(out).distance(pad.shape) >= CLR - 1e-6
+
+    def test_detour_none_for_clear_sightline(self):
+        from kcaa.router.pns.node import ObstacleNode
+
+        # The detour's None contract: when the graph yields only the
+        # direct start→end edge (a clear sightline), the detour
+        # function refuses it — a detour must actually detour, and the
+        # engine keeps the plain skeleton for clear lines.
+        empty_node = ObstacleNode([])
+        assert _visibility_detour((-8, 0), (8, 0), empty_node, W, CLR) is None
+
+    def test_engine_resolves_canyon_via_detour(self):
+        # The canyon that used to be an unwalkable lockup (pinned by
+        # TestWalkaroundSolids::test_unwalkable_raises at the single-
+        # obstacle level) is now routed successfully by the engine,
+        # because the visibility detour sees the way around the whole
+        # wall cluster.  Endpoints kept, clearance kept.
+        walls = [
+            Obstacle(
+                shape=Polygon([(-0.3, -5), (0.3, -5), (0.3, 5), (-0.3, 5)]),
+                layers=frozenset({"F.Cu"}),
+                net=None,
+                kind="pad",
+            ),
+            Obstacle(
+                shape=Polygon([(-5, 3), (5, 3), (5, 3.3), (-5, 3.3)]),
+                layers=frozenset({"F.Cu"}),
+                net=None,
+                kind="pad",
+            ),
+            Obstacle(
+                shape=Polygon([(-5, -3.3), (5, -3.3), (5, -3), (-5, -3)]),
+                layers=frozenset({"F.Cu"}),
+                net=None,
+                kind="pad",
+            ),
+        ]
+        # First pin the old failure: the canyon really does block the
+        # walkaround on its own (isolated detour), so this geometry is
+        # the regression window.
+        from kcaa.router.pns.node import ObstacleNode
+
+        with pytest.raises(PnsFailure):
+            _walkaround_solids([(-8, 0), (8, 0)], ObstacleNode(walls), W, CLR)
+        res = route_engine((-8, 0), (8, 0), walls, W, CLR)
+        assert res.path[0] == (-8, 0) and res.path[-1] == (8, 0)
+        for wall in walls:
+            assert LineString(res.path).distance(wall.shape) >= CLR - 1e-6

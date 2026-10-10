@@ -102,6 +102,67 @@ class VisibilityGraph:
     def neighbors(self, nid: int) -> Iterable[int]:
         return self.adj.get(nid, ())
 
+    def shortest_path(self, start_id: int, end_id: int) -> list[int] | None:
+        """A* over the graph: node id sequence from ``start_id`` to
+        ``end_id`` (inclusive), or ``None`` when the graph is not
+        connected.
+
+        Track-edge cost is Euclidean distance; via-edge cost is
+        ``via_cost_fn(n_vias_taken_so_far)``, which makes the search
+        prefer tracks over vias unless a via actually shortens the route
+        by more than its penalty.  The heuristic is Euclidean distance
+        to the goal (via edges never shorten the geometric distance, so
+        the heuristic stays admissible).
+        """
+        import heapq
+
+        if start_id == end_id:
+            return [start_id]
+        if start_id not in self.adj or end_id not in self.adj:
+            return None
+        pos = {n.node_id: (n.x, n.y) for n in self.nodes}
+        gx, gy = pos[end_id]
+
+        dist: dict[tuple[int, int], float] = {}
+        prev: dict[tuple[int, int], tuple[int, int]] = {}
+        start_state = (start_id, 0)
+        dist[start_state] = 0.0
+        pq: list[tuple[float, float, tuple[int, int]]] = [(0.0, 0.0, start_state)]
+        best: tuple[int, int] | None = None
+        while pq:
+            f, g_cur, state = heapq.heappop(pq)
+            if state[0] == end_id:
+                best = state
+                break
+            if g_cur > dist.get(state, math.inf) + 1e-12:
+                continue
+            nid, vcount = state
+            nx_, ny_ = pos[nid]
+            for nb in self.neighbors(nid):
+                vx, vy = pos[nb]
+                step = math.hypot(nx_ - vx, ny_ - vy)
+                nvcount = vcount
+                if self.is_via_edge(nid, nb):
+                    step += self.via_cost_fn(vcount)
+                    nvcount = vcount + 1
+                nstate = (nb, nvcount)
+                nd = dist[state] + step
+                if nd < dist.get(nstate, math.inf) - 1e-12:
+                    dist[nstate] = nd
+                    prev[nstate] = state
+                    h = math.hypot(vx - gx, vy - gy)
+                    heapq.heappush(pq, (nd + h, nd, nstate))
+        if best is None:
+            return None
+        ids: list[int] = []
+        state: tuple[int, int] = best
+        while state != start_state:
+            ids.append(state[0])
+            state = prev[state]
+        ids.append(start_id)
+        ids.reverse()
+        return ids
+
 
 # ---------------------------------------------------------------------------
 # Construction
