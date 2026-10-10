@@ -1576,6 +1576,14 @@ def _resolve_board_net(data: list[Any], name: str | None) -> tuple[int | None, s
     numberless match — the caller then writes a pad reference in the same
     numberless form the board already uses.  A fresh name always appends its
     own numbered declaration.
+
+    The id is only ever the numeric first element of a KiCad 8
+    ``(net <id> "<name>")`` node.  A digital-string FIRST element in a
+    two-element numberless node is the *name*, not an id: ``(net "3")``
+    declares a net *named* ``"3"`` on KiCad 10, so treating it as id 3 would
+    make the pad reference write ``(net 3 "3")`` — numbered form — against a
+    declaration that carries no id, a dangling reference KiCad cannot
+    resolve.
     """
     nets: list[tuple[int | None, str]] = []
     for item in data:
@@ -1593,8 +1601,6 @@ def _resolve_board_net(data: list[Any], name: str | None) -> tuple[int | None, s
         net_no: int | None = None
         if isinstance(raw_id, int):
             net_no = raw_id
-        elif isinstance(raw_id, str) and raw_id.lstrip("-").isdigit():
-            net_no = int(raw_id)
         nets.append((net_no, net_name))
 
     if name is None:

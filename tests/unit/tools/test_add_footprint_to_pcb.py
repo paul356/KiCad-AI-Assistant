@@ -443,6 +443,74 @@ class TestNets:
         net_node = next(c for c in pad1 if isinstance(c, list) and _sym(c[0]) == "net")
         assert len(net_node) == 2 and _sym(net_node[1]) == "GND"
 
+    def test_numberless_digit_name_net_stays_numberless(self, tools, tmp_path, lib_dir):
+        """P3-1: a numberless net whose NAME is a pure digit string —
+        ``(net "7")`` — must keep the numberless pad reference
+        ``(net "7")``.  The id column of a numberless node is empty, so a
+        digit-string name must never be misread as a numeric id: writing
+        the numbered form ``(net 7 "7")`` against a declaration that
+        carries no id creates a dangling reference KiCad cannot resolve."""
+        board = tmp_path / "numberless_digit.kicad_pcb"
+        shutil.copy(BOARD_FIXTURE, board)
+        (tmp_path / "fp-lib-table").write_text(FP_TABLE)
+        data = load_pcb(str(board))
+        net_nodes = [i for i in data if isinstance(i, list) and len(i) >= 2 and _sym(i[0]) == "net"]
+        assert net_nodes, "fixture board must declare nets"
+        # Strip the numeric id from EVERY declaration and rename the
+        # first (and only the first) to a digit string.
+        for i, item in enumerate(data):
+            if isinstance(item, list) and len(item) >= 2 and _sym(item[0]) == "net":
+                if isinstance(item[1], int):
+                    del item[1]
+        net_nodes = [i for i in data if isinstance(i, list) and _sym(i[0]) == "net"]
+        net_nodes[0][-1] = "7"
+        save_pcb(str(board), data)
+
+        res = _add_one(
+            tools,
+            str(board),
+            "R_0402_1005Metric",
+            "R9",
+            20.0,
+            20.0,
+            nets={"1": "7", "2": ""},
+        )
+        assert "error" not in res, res
+        assert res["results"][0]["result"]["pads_net"] == [
+            {"pad": "1", "net": "7"},
+            {"pad": "2", "net": ""},
+        ]
+        # One declaration for "7", still numberless; pad references the
+        # numberless (net "7") form, never an invented (net 7 "7").
+        data = load_pcb(str(board))
+        net_nodes = [i for i in data if isinstance(i, list) and _sym(i[0]) == "net"]
+        seven_decls = [n for n in net_nodes if len(n) >= 2 and _sym(n[-1]) == "7"]
+        assert len(seven_decls) == 1
+        assert not isinstance(seven_decls[0][1], int)
+        pad1 = _pads(_fp_node(str(board), "R9"))[0]
+        net_node = next(c for c in pad1 if isinstance(c, list) and _sym(c[0]) == "net")
+        assert len(net_node) == 2 and _sym(net_node[1]) == "7"
+        assert not isinstance(net_node[1], int)
+
+    def test_resolve_board_net_digit_name_numberless(self):
+        """P3-1 unit: ``_resolve_board_net`` keeps a numberless digit-name
+        net numberless (``net_number=None``), matches it by name, and does
+        not invent a numbered twin."""
+        import sexpdata
+
+        from kcaa.tools.pcb_library_tools import _resolve_board_net
+
+        board = [[sexpdata.Symbol("net"), "7"], [sexpdata.Symbol("net"), "GND"]]
+        no, name = _resolve_board_net(board, "7")
+        assert no is None and name == "7"
+        # Match by name, declaration not duplicated.
+        assert len([n for n in board if _sym(n[-1]) == "7"]) == 1
+        # A numbered KiCad 8 declaration with a digit-string name still
+        # resolves through its int id.
+        board2 = [[sexpdata.Symbol("net"), 3, "GND"], [sexpdata.Symbol("net"), 7, "7"]]
+        no2, name2 = _resolve_board_net(board2, "7")
+        assert no2 == 7 and name2 == "7"
+
     def test_numeric_net_value_rejected_no_write(self, tools, board_with_table):
         """P2-2: a JSON slip with a numeric ``net`` value must fail the item
         with a clear error before any write — it would otherwise serialize
