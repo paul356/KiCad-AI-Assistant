@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 import io
 import math
 import os
+import struct
 from typing import Any
 
 import matplotlib
@@ -1130,15 +1131,67 @@ def _draw_arc(ax, entry: dict, color: str, lw: float, alpha: float, zorder: int)
 
 
 _MIN_RENDER_WIDTH_PX = 1600  # sharpness floor for any rendered width
+# Hard ceiling for the pixel-width floor: the figure-growth branch below
+# would otherwise honor any caller value, and an extreme ``min_width_px``
+# (e.g. 100000) would allocate a huge Agg buffer even though the dpi clamp
+# already capped the resolution.  4x the sharpness floor is far beyond any
+# practical render while keeping the buffer small.
+_MAX_RENDER_WIDTH_PX = 4 * _MIN_RENDER_WIDTH_PX
 # Matplotlib's Agg renderer allocates path buffers that explode with the
 # dpi value itself; past ~40k dpi it raises MemoryError (std::bad_alloc)
-# on tiny figures.  When the 1600 px floor needs a higher dpi, the figure
+# on tiny figures.  When the pixel floor needs a higher dpi, the figure
 # grows in inches instead (same pixel output, safe dpi).
 _MAX_SAFE_DPI = 4000
+# Reference render for per-image context-cost estimates (issue #170): a
+# default sharpness-floor board render is ~1600x1490 px, ~118 KB, ≈ 1.5-4k
+# vision tokens per image (≈ 39k token equivalents when base64-encoded as
+# text).  Pixel-ratio scaling of that reference yields the reported range.
+_REF_RENDER_WIDTH_PX = 1600
+_REF_RENDER_HEIGHT_PX = 1490
+_REF_VISION_TOKENS_LOW = 1500
+_REF_VISION_TOKENS_HIGH = 4000
+
+
+def _png_size(data: bytes) -> tuple[int, int]:
+    """Pixel size (width, height) of a PNG payload from its IHDR chunk."""
+    return struct.unpack(">II", data[16:24])
+
+
+def estimate_image_token_cost(png_bytes: bytes) -> dict[str, int]:
+    """Estimate the context cost of a rendered PNG for a vision loop.
+
+    Returns an accounting dict (never decodes the image):
+
+    * ``width`` / ``height`` — IHDR pixel size.
+    * ``png_bytes`` — payload size in bytes.
+    * ``base64_text_tokens`` — token equivalent of the base64-encoded
+      image as a text block (4 base64 chars ≈ 1 token; the issue's ~39k
+      figure for the ~118 KB reference render).
+    * ``vision_tokens_low`` / ``vision_tokens_high`` — estimated native
+      vision-token range, scaled by pixel ratio from the issue reference
+      render (1600x1490 px ≈ 1.5-4k vision tokens).
+    """
+    width, height = _png_size(png_bytes)
+    # base64 length = 4 chars per 3 bytes; tokens ≈ chars / 4.
+    base64_text_tokens = math.ceil((math.ceil(len(png_bytes) / 3) * 4) / 4)
+    ratio = (width * height) / (_REF_RENDER_WIDTH_PX * _REF_RENDER_HEIGHT_PX)
+    return {
+        "width": width,
+        "height": height,
+        "png_bytes": len(png_bytes),
+        "base64_text_tokens": base64_text_tokens,
+        "vision_tokens_low": max(1, round(_REF_VISION_TOKENS_LOW * ratio)),
+        "vision_tokens_high": max(1, round(_REF_VISION_TOKENS_HIGH * ratio)),
+    }
 
 
 def _new_board_figure(
-    xmin: float, ymin: float, xmax: float, ymax: float, dpi: int
+    xmin: float,
+    ymin: float,
+    xmax: float,
+    ymax: float,
+    dpi: int,
+    min_width_px: int | None = None,
 ) -> tuple[Any, Any, int, float]:
     """Create a board figure/axes in KiCad convention (+Y down, dark bg).
 
@@ -1147,21 +1200,36 @@ def _new_board_figure(
     mm_per_px)``: ``eff_dpi`` is the dpi actually used for savefig and
     ``mm_per_px`` the true scale of the rendered image (used to size
     pixel-constant decorations like ratsnest dashes).  The rendered width
-    is >= ``_MIN_RENDER_WIDTH_PX`` at any board size, so a narrow region
+    is >= the pixel-width floor in effect (``min_width_px``, default
+    ``_MIN_RENDER_WIDTH_PX`` = 1600) at any board size, so a narrow region
     zooms at full-board sharpness.
+
+    ``min_width_px``: optional pixel-width floor for the rendered image;
+    ``None`` keeps the default ``_MIN_RENDER_WIDTH_PX`` (1600) sharpness
+    floor.  Budget-limited callers can pass a smaller target (e.g. 1024)
+    to downscale the PNG — the dpi scaling and figure-growth logic apply
+    to the given floor exactly as to the default.  Values are clamped to
+    ``[1, _MAX_RENDER_WIDTH_PX]`` so a non-positive input still renders
+    and an extreme input cannot trigger a giant Agg buffer.
     """
+    min_width_px = _MIN_RENDER_WIDTH_PX if min_width_px is None else min_width_px
+    # Clamp to a sane range: at least 1 px, at most the hard ceiling, so a
+    # degenerate or extreme caller value can neither collapse the render
+    # nor allocate an unbounded Agg buffer via figure growth.
+    min_width_px = min(max(1, min_width_px), _MAX_RENDER_WIDTH_PX)
     w_mm = xmax - xmin
     h_mm = ymax - ymin
     fig_w_in = w_mm / 25.4
     fig_h_in = h_mm / 25.4
-    # Scale dpi so the output is sharp at any board size (min 1600px wide);
-    # clamp the floor so the Agg renderer never sees an extreme dpi.
+    # Scale dpi so the output is sharp at any board size (at least the
+    # pixel floor wide); clamp the floor so the Agg renderer never sees an
+    # extreme dpi.
     if w_mm >= 0.1:
-        dpi = max(dpi, min(int(_MIN_RENDER_WIDTH_PX / fig_w_in), _MAX_SAFE_DPI))
-        if fig_w_in * dpi < _MIN_RENDER_WIDTH_PX:
+        dpi = max(dpi, min(int(min_width_px / fig_w_in), _MAX_SAFE_DPI))
+        if fig_w_in * dpi < min_width_px:
             # Cap bound: grow the figure inches (both axes by the same
             # factor -> board aspect preserved) to hit the pixel target.
-            scale = _MIN_RENDER_WIDTH_PX / (fig_w_in * dpi)
+            scale = min_width_px / (fig_w_in * dpi)
             fig_w_in *= scale
             fig_h_in *= scale
     fig, ax = plt.subplots(figsize=(fig_w_in, fig_h_in), dpi=dpi)
@@ -1582,6 +1650,7 @@ def render_board(
     include_pad_coords: bool = False,
     label_format: str = "number",
     show_footprint_refs: bool = True,
+    min_width_px: int | None = None,
 ) -> tuple[list[str], bytes, dict[str, Any]]:
     """Render a board to (report_lines, png_bytes, report_dict).
 
@@ -1611,7 +1680,8 @@ def render_board(
     y_max]`` in mm (KiCad +Y down) to zoom into.  The rendered frame
     becomes exactly this box — returned as ``region_bbox`` so a caller can
     map the crop back into full-board space — and the dpi floor is raised
-    so a region still renders >= 1600 px wide (full-board sharpness).
+    so a region still renders >= the ``min_width_px`` floor wide (default
+    1600 px, full-board sharpness).
 
     ``include_pad_coords``: also report machine-usable pad coordinates
     ``pads_coords`` (ref, number, net, center [x, y] mm, layer) so a
@@ -1630,6 +1700,11 @@ def render_board(
 
     connect_pads: optional list of ``ref.pad`` specs (e.g. ``["J1.2", "J2.2"]``)
     to draw ratsnest lines for — green, only for nets that are not yet routed.
+
+    ``min_width_px``: optional pixel-width floor for the rendered image
+    (``None`` = the default 1600 sharpness floor; pass e.g. 1024 to
+    downscale for budget-limited iterations).  The actual rendered width
+    is echoed back in the report as ``render_width_px``.
     """
     if dpi is None:
         dpi = 200
@@ -1679,7 +1754,9 @@ def render_board(
     if region_bbox is None:
         region_bbox = _bounds(board, ratsnest)
     xmin, ymin, xmax, ymax = region_bbox
-    fig, ax, eff_dpi, mm_per_px = _new_board_figure(xmin, ymin, xmax, ymax, dpi)
+    fig, ax, eff_dpi, mm_per_px = _new_board_figure(
+        xmin, ymin, xmax, ymax, dpi, min_width_px=min_width_px
+    )
     (
         pad_labels,
         label_collisions,
@@ -1725,10 +1802,14 @@ def render_board(
 
     buf = io.BytesIO()
     fig.savefig(buf, format="png", facecolor=_BG_COLOR, dpi=eff_dpi)
+
+    png_bytes = buf.getvalue()
+    render_width_px, _ = _png_size(png_bytes)
     plt.close(fig)
 
     report: dict[str, Any] = {
         "pads": len(board.pads),
+        "render_width_px": render_width_px,
         "pad_labels": pad_labels,
         "label_collisions": label_collisions,
         "label_skipped": label_skipped,
@@ -1783,7 +1864,7 @@ def render_board(
             f"pending (unrouted) nets={pending_nets or 'none'}; "
             f"already routed nets={routed_reported or 'none'}."
         )
-    return lines, buf.getvalue(), report
+    return lines, png_bytes, report
 
 
 def register_render_board_tools(mcp: FastMCP) -> None:
@@ -1801,6 +1882,7 @@ def register_render_board_tools(mcp: FastMCP) -> None:
         include_pad_coords: bool = False,
         label_format: str = "number",
         show_footprint_refs: bool = True,
+        min_width_px: int | None = None,
         ctx: Context | None = None,
     ) -> tuple[str, Image] | str:
         """Render a KiCad PCB to a PNG image (no kicad-cli needed).
@@ -1832,6 +1914,12 @@ def register_render_board_tools(mcp: FastMCP) -> None:
         footprint (e.g. ``U11``) when its silkscreen reference is not
         already visible in the view.
 
+        ``min_width_px``: optional pixel-width floor for the PNG
+        (``None`` = the default 1600 sharpness floor).  Pass a smaller
+        value (e.g. 1024) to downscale the image when the vision budget is
+        limited; the full text report (pad coords, nets, labels) is always
+        returned regardless of image size.
+
         Args:
             pcb_path: Path to the .kicad_pcb file.
             connect_pads: Optional list of ``REF.PAD`` specs to check.  Nets
@@ -1854,6 +1942,10 @@ def register_render_board_tools(mcp: FastMCP) -> None:
             show_footprint_refs: Draw one reference label per footprint
                 when its silkscreen reference text is not already visible
                 (default True).
+            min_width_px: Pixel-width floor for the PNG, or None for the
+                default 1600 sharpness floor; pass a smaller value (e.g.
+                1024) to downscale for budget-limited vision iterations.
+                The text report is unaffected by downscaling.
             ctx: FastMCP context for progress reporting.
 
         Returns:
@@ -1872,6 +1964,7 @@ def register_render_board_tools(mcp: FastMCP) -> None:
             include_pad_coords=include_pad_coords,
             label_format=label_format,
             show_footprint_refs=show_footprint_refs,
+            min_width_px=min_width_px,
         )
         if output_dir:
             os.makedirs(output_dir, exist_ok=True)

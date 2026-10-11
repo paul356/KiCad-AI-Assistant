@@ -3401,6 +3401,12 @@ def _render_route_png(
     ``KICAD_MCP_SUPPORTS_VISION``) — success rendering must never mask
     the route result.
 
+    The feedback image downscales to ~1024 px wide by default (issue
+    #170): route-loop frames are context cost, and 1024 px is enough for
+    the VLM to read pad labels and trace geometry.  Full-resolution 1600
+    px stays the default of the standalone ``render_board`` /
+    ``export_pcb_layer_image`` path.
+
     Bytes only, no temp file: the tool layer attaches them to the
     result as an image content block and nothing lingers on disk.
     """
@@ -3416,6 +3422,7 @@ def _render_route_png(
             attempted_path=pts,
             blocking_items=[],
             anchors=anchors,
+            min_width_px=1024,
         )
         return png
     except Exception:  # rendering must never mask the route result

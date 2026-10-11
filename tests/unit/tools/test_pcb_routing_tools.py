@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import shutil
+import struct
 import tempfile
 
 import pytest
@@ -326,6 +327,11 @@ def _run(coro):
 def _run_raw(coro):
     """Run a tool call and return the raw MCP content untouched."""
     return asyncio.run(coro)
+
+
+def _png_size(data: bytes) -> tuple[int, int]:
+    assert data[:8] == b"\x89PNG\r\n\x1a\n", "expected a PNG payload"
+    return struct.unpack(">II", data[16:24])
 
 
 class TestPcbDeleteTracks:
@@ -1164,11 +1170,120 @@ def test_apply_shoved_tracks_collapses_repeated_original() -> None:
     assert len(vcc) == 1 and vcc[0]["start"] == (1.0, 1.0) and vcc[0]["end"] == (2.0, 1.0)
 
 
+class TestRouteRenderContextAccounting:
+    """Issue #170 direction 2: image token accounting + frame budget.
+
+    The route-feedback image rides ``(json_text, Image)`` content with a
+    ``render_image`` cost block in the text envelope; the budget env
+    (KICAD_MCP_ROUTE_FRAME_BUDGET) gates attachment per call.
+    """
+
+    @pytest.fixture
+    def png(self, routable_board) -> bytes:
+        from kcaa.tools.render_route_state import render_route_attempt
+
+        _lines, png, _report = render_route_attempt(routable_board, min_width_px=1024)
+        return png
+
+    def test_without_png_keeps_envelope_shape(self, monkeypatch, png):
+        from kcaa.tools.pcb_routing_tools import _route_payload
+
+        monkeypatch.setenv("KICAD_MCP_RENDER_ROUTE_PNG", "1")
+        payload = {"strategy": "shove", "segments": [[0.0, 0.0, 1.0, 1.0]]}
+        raw = _route_payload(payload, None)
+        assert isinstance(raw, str)
+        assert json.loads(raw) == payload  # no render_image, shape untouched
+
+    def test_render_toggle_off_omits_image_and_field(self, monkeypatch, png):
+        from kcaa.tools.pcb_routing_tools import _route_payload
+
+        monkeypatch.setenv("KICAD_MCP_RENDER_ROUTE_PNG", "0")
+        raw = _route_payload({"ok": True}, png)
+        assert isinstance(raw, str)
+        assert "render_image" not in raw
+
+    def test_image_block_reports_cost_in_envelope(self, monkeypatch, png):
+        from kcaa.tools.pcb_routing_tools import _route_payload
+
+        monkeypatch.setenv("KICAD_MCP_RENDER_ROUTE_PNG", "1")
+        payload = {"ok": True, "net": "VCC"}
+        raw = _route_payload(payload, png)
+        assert isinstance(raw, tuple) and len(raw) == 2
+        envelope = json.loads(raw[0])
+        from kcaa.tools.render_board_tools import estimate_image_token_cost
+
+        expected = estimate_image_token_cost(png)
+        expected["frame_budget"] = 1
+        # Text envelope and attached bytes must agree on the estimate.
+        assert envelope["render_image"] == expected
+        # The numeric route data stays authoritative in the envelope.
+        assert envelope["net"] == "VCC" and envelope["ok"] is True
+        assert raw[1].data == png
+
+    @pytest.mark.parametrize("budget_env, expect_image", [("0", False), ("1", True), ("2", True)])
+    def test_frame_budget_gate(self, monkeypatch, png, budget_env, expect_image):
+        from kcaa.tools.pcb_routing_tools import _route_payload
+
+        monkeypatch.setenv("KICAD_MCP_RENDER_ROUTE_PNG", "1")
+        monkeypatch.setenv("KICAD_MCP_ROUTE_FRAME_BUDGET", budget_env)
+        raw = _route_payload({"ok": True}, png)
+        if expect_image:
+            assert isinstance(raw, tuple) and len(raw) == 2
+            # One call yields at most one frame; a larger configured budget
+            # reports the in-effect cap.
+            assert json.loads(raw[0])["render_image"]["frame_budget"] == 1
+        else:
+            assert isinstance(raw, str)
+            assert "render_image" not in raw
+
+    def test_frame_budget_non_numeric_defaults_to_one(self, monkeypatch, png):
+        from kcaa.tools.pcb_routing_tools import _route_payload
+
+        monkeypatch.setenv("KICAD_MCP_RENDER_ROUTE_PNG", "1")
+        monkeypatch.setenv("KICAD_MCP_ROUTE_FRAME_BUDGET", "lots")
+        raw = _route_payload({"ok": True}, png)
+        assert isinstance(raw, tuple) and len(raw) == 2
+        assert json.loads(raw[0])["render_image"]["frame_budget"] == 1
+
+    def test_tool_success_png_downscaled_and_cost_reported(
+        self, tools, routable_board, monkeypatch
+    ):
+        """End-to-end: the routed route PNG downscales to ~1024 px and the
+        envelope reports the exact cost of the attached image."""
+        monkeypatch.setenv("KICAD_MCP_RENDER_ROUTE_PNG", "1")
+        from fastmcp.utilities.types import Image
+
+        raw = _run_raw(
+            tools["pcb_route_pad_to_pad"](
+                pcb_path=routable_board,
+                ref_a="R1",
+                pad_a="1",
+                ref_b="C1",
+                pad_b="1",
+                net="VCC",
+                ctx=None,
+                width=0.2,
+                algorithm="pns",
+            )
+        )
+        assert isinstance(raw, tuple) and len(raw) == 2
+        width, _ = _png_size(raw[1].data)
+        assert 1023 <= width < 1600  # route default downscale, not the 1600 floor
+        payload = json.loads(raw[0])
+        from kcaa.tools.render_board_tools import estimate_image_token_cost
+
+        expected = estimate_image_token_cost(raw[1].data)
+        expected["frame_budget"] = 1
+        assert payload["render_image"] == expected
+        assert payload["strategy"] == "shove"  # numeric result still present
+        assert isinstance(raw[1], Image)
+
+
 # ── Route failure evidence render ──────────────────────────────────────
 
 
 class TestPcbRouteFailureEvidence:
-    def test_route_failure_returns_error_and_png(self, tools, board_with_tracks, monkeypatch):
+    def test_failure_returns_error_and_png(self, tools, board_with_tracks, monkeypatch):
         monkeypatch.setenv("KICAD_MCP_RENDER_ROUTE_PNG", "1")
         from fastmcp.utilities.types import Image
 
@@ -1190,6 +1305,33 @@ class TestPcbRouteFailureEvidence:
         assert "route_png" not in payload
         assert isinstance(raw[1], Image)
         assert raw[1].data[:8] == b"\x89PNG\r\n\x1a\n"
+
+    def test_failure_evidence_png_downscaled_and_cost_reported(
+        self, tools, board_with_tracks, monkeypatch
+    ):
+        """Failure-evidence frames use the same ~1024 px route downscale
+        default and report their cost in the envelope."""
+        monkeypatch.setenv("KICAD_MCP_RENDER_ROUTE_PNG", "1")
+
+        raw = _run_raw(
+            tools["pcb_route_pad_to_pad"](
+                pcb_path=board_with_tracks,
+                ref_a="R1",
+                pad_a="1",
+                ref_b="C99",
+                pad_b="1",
+                net="VCC",
+                width=0.25,
+                ctx=None,
+            )
+        )
+        assert isinstance(raw, tuple) and len(raw) == 2
+        width, _ = _png_size(raw[1].data)
+        assert 1023 <= width < 1600
+        payload = json.loads(raw[0])
+        assert "error" in payload
+        assert payload["render_image"]["width"] == width
+        assert payload["render_image"]["frame_budget"] == 1
 
     def test_failure_returns_image_content_block(self, tools, board_with_tracks, monkeypatch):
         """The failure envelope also carries the evidence PNG as an image

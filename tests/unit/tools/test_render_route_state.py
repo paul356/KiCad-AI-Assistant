@@ -4,6 +4,7 @@ failure-evidence rendering in render_route_state.
 """
 
 import os
+import struct
 
 from kcaa.tools.render_board_tools import render_board
 from kcaa.tools.render_route_state import (
@@ -76,3 +77,26 @@ def test_render_route_attempt_blocking_render():
     assert with_blocker[2]["blocking_items"] == 1
     # The red highlight must actually change pixels vs the plain render.
     assert with_blocker[1] != base
+
+
+def _png_size(data: bytes) -> tuple[int, int]:
+    assert data[:8] == b"\x89PNG\r\n\x1a\n", "expected a PNG payload"
+    return struct.unpack(">II", data[16:24])
+
+
+def test_render_route_attempt_downscales_with_min_width():
+    # Route-feedback renders target ~1024 px (issue #170): below the 1600
+    # sharpness floor, still at the requested width.
+    _, png, report = render_route_attempt(FIXTURE, min_width_px=1024)
+    width, _ = _png_size(png)
+    assert 1023 <= width < 1600
+    assert report["render_width_px"] == width
+
+
+def test_render_route_attempt_reports_default_width():
+    # Default (min_width_px=None) keeps the 1600 sharpness floor, and the
+    # report carries the actual rendered width.
+    _, png, report = render_route_attempt(FIXTURE, dpi=200)
+    width, _ = _png_size(png)
+    assert width >= 1590
+    assert report["render_width_px"] == width

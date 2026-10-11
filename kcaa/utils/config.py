@@ -669,6 +669,27 @@ def render_route_png_enabled() -> bool:
     return raw in ("1", "true", "yes", "on")
 
 
+def route_frame_budget() -> int:
+    """Per-call cap on image frames attached to one routing-tool result.
+
+    ``KICAD_MCP_ROUTE_FRAME_BUDGET`` (default ``1``): a single
+    ``pcb_route_pad_to_pad`` call produces at most one frame today — the
+    routed route PNG or the failure evidence, never both — so the budget
+    in effect is ``min(parsed, 1)``; ``0`` suppresses the image block
+    entirely (text envelope only).  Session- or loop-level frame counting
+    would require state on the plugin side: the MCP server tools are
+    stateless single calls, so the per-call cap + the envelope's
+    ``frame_budget`` report is the accounting this side can truthfully
+    provide.  Non-numeric or negative values fall back to the default.
+    """
+    raw = os.environ.get("KICAD_MCP_ROUTE_FRAME_BUDGET", "1").strip()
+    try:
+        budget = int(raw)
+    except ValueError:
+        return 1
+    return max(0, min(budget, 1))
+
+
 # ---------------------------------------------------------------------------
 # Module-level singleton instance
 # ---------------------------------------------------------------------------

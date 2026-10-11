@@ -8,6 +8,7 @@ parsing with center coordinate, bounding box with circular geometry,
 multi-layer rendering, and robust drawing of malformed entries).
 """
 
+import ast
 import asyncio
 import inspect
 import math
@@ -24,12 +25,14 @@ BOARD_FIXTURE = os.path.join(FIXTURE_DIR, "test_board.kicad_pcb")
 
 from kcaa.tools.render_board_tools import (  # noqa: E402
     _BG_COLOR,
+    _MAX_RENDER_WIDTH_PX,
     BoardData,
     _board_outline,
     _bounds,
     _draw_board_layers,
     _draw_shape,
     _parse_shape,
+    estimate_image_token_cost,
     parse_board,
     render_board,
 )
@@ -526,6 +529,102 @@ class TestRegionRendering:
             render_board(_sparse_board_path(tmp_path), region=bad)
 
 
+class TestEstimateImageTokenCost:
+    """Per-image context accounting for renders attached to tool results."""
+
+    def _png(self, tmp_path):
+        _, png, _ = render_board(_sparse_board_path(tmp_path))
+        return png
+
+    def test_reports_geometry_and_bytes(self, tmp_path):
+        png = self._png(tmp_path)
+        cost = estimate_image_token_cost(png)
+        width, height = _png_size(png)
+        assert cost["width"] == width
+        assert cost["height"] == height
+        assert cost["png_bytes"] == len(png)
+        assert width >= 1590  # default render: 1600 sharpness floor
+
+    def test_text_token_equivalent(self, tmp_path):
+        png = self._png(tmp_path)
+        cost = estimate_image_token_cost(png)
+        # base64: 4 chars per 3 bytes; each 4-char group ≈ 1 token.
+        assert cost["base64_text_tokens"] == math.ceil(len(png) / 3)
+
+    def test_vision_range_scales_with_pixels(self, tmp_path):
+        png = self._png(tmp_path)
+        cost = estimate_image_token_cost(png)
+        ratio = (cost["width"] * cost["height"]) / (1600 * 1490)
+        assert cost["vision_tokens_low"] == max(1, round(1500 * ratio))
+        assert cost["vision_tokens_high"] == max(1, round(4000 * ratio))
+        assert cost["vision_tokens_low"] <= cost["vision_tokens_high"]
+
+
+class TestMinRenderWidth:
+    """The ``min_width_px`` downscaling knob (default behavior unchanged)."""
+
+    def render(self, tmp_path, **kwargs):
+        return render_board(_sparse_board_path(tmp_path), **kwargs)
+
+    def test_default_renders_at_1600_floor(self, tmp_path):
+        _, png, report = self.render(tmp_path)
+        width, _ = _png_size(png)
+        assert width >= 1590  # 1600 floor; int() truncates one px at most
+        assert report["render_width_px"] == width  # audit field matches bytes
+
+    def test_none_behaves_like_default(self, tmp_path):
+        default = self.render(tmp_path)
+        explicit_none = self.render(tmp_path, min_width_px=None)
+        assert explicit_none[1] == default[1]
+        assert explicit_none[2] == default[2]
+
+    def test_downscaled_render_in_range_and_report_unchanged(self, tmp_path):
+        default_lines, default_png, default_report = self.render(tmp_path)
+        lines, png, report = self.render(tmp_path, min_width_px=1024)
+        width, _ = _png_size(png)
+        # Downscaled: strictly below the 1600 floor but at the 1024 target
+        # (int() dpi truncation can shave one px, same slack as the 1590
+        # default-floor assertion).
+        assert 1023 <= width < 1600
+        assert report["render_width_px"] == width
+        # The text envelope stays authoritative: pad labels / net info are
+        # identical to the default render regardless of image size.
+        assert lines == default_lines
+        assert report["pads"] == default_report["pads"]
+        assert report["pad_labels"] == default_report["pad_labels"]
+
+    def test_downscaled_render_keeps_pad_coords(self, tmp_path):
+        _, _, default_report = self.render(tmp_path, include_pad_coords=True)
+        _, _, report = self.render(tmp_path, min_width_px=1024, include_pad_coords=True)
+        assert report["pads_coords"] == default_report["pads_coords"]
+
+    @pytest.mark.parametrize("min_width_px", [1, 0, -5])
+    def test_degenerate_floor_clamped_without_crash(self, tmp_path, min_width_px):
+        # A floor below the natural dpi render must not crash; it collapses
+        # to a 1 px floor (no dpi bump, no figure growth) and stays small.
+        _, png, report = self.render(tmp_path, min_width_px=min_width_px)
+        width, _ = _png_size(png)
+        assert 0 < width < 1600
+        assert report["render_width_px"] == width
+        # All degenerate values land on the same clamped render.
+        _, ref_png, _ = self.render(tmp_path, min_width_px=1)
+        assert png == ref_png
+
+    @pytest.mark.parametrize("min_width_px", [8_000, 100_000])
+    def test_extreme_floor_clamped_to_max_width(self, tmp_path, min_width_px):
+        # The figure-growth branch would otherwise honor a 100000 px floor
+        # (32 GB RGBA buffer -> OOM) even though the dpi clamp capped the
+        # resolution; the floor must be capped at _MAX_RENDER_WIDTH_PX.
+        _, png, report = self.render(tmp_path, min_width_px=min_width_px)
+        width, _ = _png_size(png)
+        assert min_width_px > _MAX_RENDER_WIDTH_PX > 1600  # inputs exceed the ceiling
+        assert width <= _MAX_RENDER_WIDTH_PX
+        assert report["render_width_px"] == width
+        # Any value past the ceiling lands on the same capped render.
+        _, ref_png, _ = self.render(tmp_path, min_width_px=_MAX_RENDER_WIDTH_PX + 1)
+        assert png == ref_png
+
+
 class TestPadCoords:
     def test_centers_match_parsed_board(self, tmp_path):
         path = _sparse_board_path(tmp_path)
@@ -723,12 +822,14 @@ class TestToolRegistration:
             "include_pad_coords",
             "label_format",
             "show_footprint_refs",
+            "min_width_px",
         ):
             assert param in sig.parameters
         assert sig.parameters["show_pad_labels"].default is True
         assert sig.parameters["include_pad_coords"].default is False
         assert sig.parameters["label_format"].default == "number"
         assert sig.parameters["show_footprint_refs"].default is True
+        assert sig.parameters["min_width_px"].default is None
 
     def test_tool_returns_report_and_image(self, tmp_path):
         tools = _get_tools()
@@ -742,6 +843,27 @@ class TestToolRegistration:
         assert "report=" in report_text
         assert "pads_coords" in report_text
         assert img.data[:8] == b"\x89PNG\r\n\x1a\n"
+
+    def test_tool_downscales_image_but_keeps_text_report(self, tmp_path):
+        tools = _get_tools()
+        report_text, img = _run(
+            tools["export_pcb_layer_image"](
+                pcb_path=_sparse_board_path(tmp_path),
+                include_pad_coords=True,
+                min_width_px=1024,
+                ctx=None,
+            )
+        )
+        width, _ = _png_size(img.data)
+        assert 1023 <= width < 1600
+        # The text-envelope report agrees with the actual PNG bytes.
+        tail = report_text.split("report=", 1)[1]
+        assert ast.literal_eval(tail)["render_width_px"] == width
+        # Pad coordinates / net info stay in the text envelope.
+        assert "pads_coords" in report_text
+        assert "R1" in report_text
+        assert "Rendered" in report_text
+        assert "report=" in report_text
 
 
 class TestExportPcbLayerImageVisionGate:
