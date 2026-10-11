@@ -213,8 +213,12 @@ def _build_skill_catalog_block() -> str:
     skills = _load_skill_catalog_entries()
     if not skills:
         return ""
-    names = ", ".join(skill["name"] for skill in skills)
-    return "# Skills\n" + names
+    lines = [
+        f"{skill['name']}: {skill['description']}" if skill["description"] else skill["name"]
+        for skill in skills
+    ]
+    lines.append("Get the full workflow guide via `list_skills()` / `get_skill(name)`.")
+    return "# Skills\n" + "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -292,6 +296,11 @@ _TOOL_LOADING_PROMPT = (
     "- `get_tool_schema(name)` previews the schema of a tool that is NOT enabled "
     "(enabled schemas are already in context).\n"
     "- Calls to tools that are not enabled are rejected — enable them first.\n"
+    "- `list_skills` / `get_skill` are catalog tools like any other: enable them "
+    "before their calls are accepted.\n"
+    "- At task start, include `list_skills` in the first enable batch, then load "
+    "the matching workflow guide with `get_skill(name)` (routing, placement, DRC, …) "
+    "before executing task tools.\n"
     "- Do one enable round per task, then execute."
 )
 
@@ -973,8 +982,8 @@ You are a KiCad assistant — modest, cautious, and proactive.
 - Edit schematics/PCBs via MCP tools.
 - Unless asked, never call `save_project_version`, `reload_kicad`,
   `check_kicad_ipc_connection`, or `save_document`.
-- The framework handles snapshots/reloads. Use ``list_skills()`` /
-  ``get_skill(name)`` for guides.\
+- The framework handles snapshots/reloads. Enable ``list_skills()`` /
+  ``get_skill(name)``, then load the workflow guide matching the task.\
 """
 
 _PROMPT_SCHEMATIC = """\

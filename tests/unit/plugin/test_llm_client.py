@@ -3464,6 +3464,58 @@ class TestToolLoading:
         assert "unavailable" in result["error"]
 
 
+# ---------------------------------------------------------------------------
+# System-prompt wiring for on-demand skill discovery (list_skills/get_skill)
+# ---------------------------------------------------------------------------
+
+
+def _write_skill_file(skills_dir, name, description, priority="50"):
+    """Write a skill markdown file with front matter into *skills_dir*."""
+    (skills_dir / f"{name}.md").write_text(
+        f"---\nname: {name}\npriority: {priority}\ndescription: \"{description}\"\n---\n"
+        f"# {name}\nBody of {name}.\n",
+        encoding="utf-8",
+    )
+
+
+class TestSkillPrompt:
+    """Prompt must surface skill names+descriptions and teach skill tool loading."""
+
+    def test_catalog_block_lists_name_and_description(self, tmp_path):
+        skills_dir = tmp_path / "skills"
+        skills_dir.mkdir()
+        _write_skill_file(skills_dir, "pcb-routing", "Routing workflow guide", "95")
+        _write_skill_file(skills_dir, "drc-rules", "DRC rules reference", "45")
+        with patch.object(llm_client, "_SKILLS_DIR", skills_dir):
+            block = llm_client._build_skill_catalog_block()
+        assert "# Skills" in block
+        assert "pcb-routing: Routing workflow guide" in block
+        assert "drc-rules: DRC rules reference" in block
+
+    def test_catalog_block_points_to_get_skill(self, tmp_path):
+        skills_dir = tmp_path / "skills"
+        skills_dir.mkdir()
+        _write_skill_file(skills_dir, "pcb-routing", "Routing workflow guide")
+        with patch.object(llm_client, "_SKILLS_DIR", skills_dir):
+            block = llm_client._build_skill_catalog_block()
+        assert "list_skills()" in block
+        assert "get_skill(name)" in block
+
+    def test_skill_catalog_block_empty_when_no_skills(self, tmp_path):
+        with patch.object(llm_client, "_SKILLS_DIR", tmp_path / "missing"):
+            assert llm_client._build_skill_catalog_block() == ""
+
+    def test_tool_loading_prompt_covers_skill_tools(self):
+        prompt = llm_client._TOOL_LOADING_PROMPT
+        assert "list_skills" in prompt
+        assert "get_skill" in prompt
+        # Both must be enabled before they are callable, like any other tool.
+        assert "enable them before their calls are accepted" in prompt
+        # The protocol tells the model to load the matching guide at task start.
+        assert "workflow guide" in prompt
+        assert "first enable batch" in prompt
+
+
 class TestContextBudgetIncludesTools:
     def test_tools_est_push_over_budget_triggers_compaction(self):
         client = _make_client(context_tokens=10_000)  # budget = 7000
