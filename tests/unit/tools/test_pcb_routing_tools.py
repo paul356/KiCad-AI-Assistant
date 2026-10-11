@@ -1220,9 +1220,7 @@ class TestRouteRenderContextAccounting:
         assert envelope["net"] == "VCC" and envelope["ok"] is True
         assert raw[1].data == png
 
-    @pytest.mark.parametrize(
-        "budget_env, expect_image", [("0", False), ("1", True), ("2", True)]
-    )
+    @pytest.mark.parametrize("budget_env, expect_image", [("0", False), ("1", True), ("2", True)])
     def test_frame_budget_gate(self, monkeypatch, png, budget_env, expect_image):
         from kcaa.tools.pcb_routing_tools import _route_payload
 

@@ -529,9 +529,6 @@ class TestRegionRendering:
             render_board(_sparse_board_path(tmp_path), region=bad)
 
 
-
-
-
 class TestEstimateImageTokenCost:
     """Per-image context accounting for renders attached to tool results."""
 
