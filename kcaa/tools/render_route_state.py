@@ -32,6 +32,7 @@ from kcaa.tools.render_board_tools import (
     _bounds,
     _draw_board_layers,
     _new_board_figure,
+    _png_size,
     parse_board,
 )
 
@@ -123,6 +124,7 @@ def render_route_attempt(
     blocking_items: list[BlockingEvidence] | None = None,
     anchors: list[tuple[float, float]] | None = None,
     dpi: int = 200,
+    min_width_px: int | None = None,
 ) -> tuple[list[str], bytes, dict[str, Any]]:
     """Render a board with route-attempt evidence overlayed.
 
@@ -131,12 +133,16 @@ def render_route_attempt(
     * ``blocking_items`` — red highlights at the obstacles that blocked the
       route, each with a ``ref / net`` text label.
     * ``anchors`` — green dots numbered 1..N at pad/waypoint/via positions.
+    * ``min_width_px`` — optional pixel-width floor for the rendered image
+      (``None`` = the default 1600 sharpness floor; the route-feedback
+      callers pass 1024 to downscale for the budget-limited vision loop).
 
     Any or all of these may be empty or missing: the result then degenerates
     to a plain board render (never errors).
 
     Returns ``(report_lines, png_bytes, report_dict)`` like
-    :func:`kcaa.tools.render_board_tools.render_board`.
+    :func:`kcaa.tools.render_board_tools.render_board` — the report carries
+    the actual rendered width as ``render_width_px``.
     """
     board = parse_board(pcb_path)
 
@@ -161,7 +167,9 @@ def render_route_attempt(
         ymin = min(ymin, min(ys_ovl) - 2.0)
         xmax = max(xmax, max(xs_ovl) + 2.0)
         ymax = max(ymax, max(ys_ovl) + 2.0)
-    fig, ax, eff_dpi, _mm_per_px = _new_board_figure(xmin, ymin, xmax, ymax, dpi)
+    fig, ax, eff_dpi, _mm_per_px = _new_board_figure(
+        xmin, ymin, xmax, ymax, dpi, min_width_px=min_width_px
+    )
 
     _draw_board_layers(ax, board, layer=None, show_pad_labels=False)
 
@@ -198,12 +206,15 @@ def render_route_attempt(
 
     buf = io.BytesIO()
     fig.savefig(buf, format="png", facecolor=_BG_COLOR, dpi=eff_dpi)
+    png_bytes = buf.getvalue()
+    render_width_px, _ = _png_size(png_bytes)
     plt.close(fig)
 
     blocking = blocking_items or []
     anchors_ = anchors or []
     report: dict[str, Any] = {
         "pads": len(board.pads),
+        "render_width_px": render_width_px,
         "copper_layers": board.copper_layers,
         "attempted_path_points": len(pts),
         "blocking_items": len(blocking),
@@ -220,4 +231,4 @@ def render_route_attempt(
             f"  blocker: {label} at ({item.point[0]:.3f},{item.point[1]:.3f}) "
             f"layer={item.layer or 'any'} kind={item.kind}"
         )
-    return lines, buf.getvalue(), report
+    return lines, png_bytes, report
