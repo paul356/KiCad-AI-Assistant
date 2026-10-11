@@ -216,6 +216,25 @@ if _WX_AVAILABLE:
             )
             grid.Add(self._port, 1, wx.EXPAND)
 
+            # MCP tool-call timeout
+            grid.Add(
+                wx.StaticText(self._scrolled, label="MCP tool timeout (s):"),
+                0,
+                wx.ALIGN_CENTER_VERTICAL,
+            )
+            self._mcp_timeout = wx.SpinCtrl(
+                self._scrolled,
+                min=1,
+                max=3600,
+                initial=getattr(self._settings, "mcp_tool_timeout_seconds", 300),
+            )
+            self._mcp_timeout.SetToolTip(
+                "Per-call wall-clock deadline for MCP tool calls (e.g. PCB routing). "
+                "When a tool does not finish within this many seconds the chat turn "
+                "ends with an explicit timeout error instead of silently waiting."
+            )
+            grid.Add(self._mcp_timeout, 1, wx.EXPAND)
+
             # Show tool log
             grid.Add(
                 wx.StaticText(self._scrolled, label="Show tool log by default:"),
@@ -387,6 +406,7 @@ if _WX_AVAILABLE:
             settings.llm_user_agent = self._user_agent.GetValue().strip()
             settings.python_executable = self._python.GetValue().strip()
             settings.server_port = self._port.GetValue()
+            settings.mcp_tool_timeout_seconds = self._mcp_timeout.GetValue()
             settings.show_tool_log = self._show_tool_log.GetValue()
             settings.llm_context_tokens = self._context_tokens.GetValue()
             settings.llm_compact_threshold = compact_threshold

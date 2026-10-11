@@ -157,6 +157,7 @@ All settings can be changed through **Options → Settings** in the plugin panel
 | `llm_aws_secret_access_key` | AWS secret access key for SigV4 auth | *(empty)* |
 | `llm_aws_session_token` | Optional STS session token for temporary AWS credentials | *(empty)* |
 | `server_port` | Fixed port for the built-in MCP server (`0` = auto) | `0` |
+| `mcp_tool_timeout_seconds` | Per-call deadline (s) for MCP tool calls (e.g. PCB routing); longer calls end the turn with an explicit timeout error | `300` |
 | `show_tool_log` | Show tool-call log panel by default | `true` |
 | `llm_context_tokens` | Total context window size in tokens | `128000` |
 | `llm_compact_threshold` | Trigger context compaction at this usage fraction | `0.70` |

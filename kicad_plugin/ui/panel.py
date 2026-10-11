@@ -933,6 +933,20 @@ if _WX_AVAILABLE:
                         "result": _elide_tool_result_image(result),
                     }
                 )
+                if isinstance(result, dict) and (
+                    result.get("interrupted") or result.get("timed_out")
+                ):
+                    # Issue #176: a tool call that timed out or was interrupted
+                    # by Stop must surface an explicit error in the chat even
+                    # when the turn already streamed partial text (the
+                    # turn_end reply is dropped in that case).
+                    _emit(
+                        {
+                            "type": "status",
+                            "text": result.get("error") or f"tool call {name} did not complete",
+                            "color_hex": self._C_ERR_HEX,
+                        }
+                    )
                 if kind == "tool_direct" and name == "sync_footprint_index":
                     # Mirror the old auto-sync status notices: started /
                     # failed surface as status entries, already_running is
@@ -1012,6 +1026,7 @@ if _WX_AVAILABLE:
                                 {"type": "status", "text": notice, "color_hex": self._C_WARN_HEX}
                             ),
                             images=images,
+                            cancel_event=self._cancel_event,
                         )
                     else:  # tool_direct
                         self._llm_client.run(
