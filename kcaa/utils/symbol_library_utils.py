@@ -306,9 +306,9 @@ def list_library_symbols(file_path: str) -> list[str]:
         if (
             isinstance(child, list)
             and len(child) >= 2
-            and isinstance(child[0], (sexpdata.Symbol, str))
+            and isinstance(child[0], sexpdata.Symbol | str)
             and str(child[0]) == "symbol"
-            and isinstance(child[1], (sexpdata.Symbol, str))
+            and isinstance(child[1], sexpdata.Symbol | str)
         ):
             # Symbol subclasses str but Symbol('X') == 'X' is False, so the
             # node MUST be normalized to a plain str — otherwise a bare-atom
@@ -503,9 +503,9 @@ def remove_symbol_from_library_file(file_path: str, symbol_name: str) -> str:
         if (
             isinstance(child, list)
             and len(child) >= 2
-            and isinstance(child[0], (sexpdata.Symbol, str))
+            and isinstance(child[0], sexpdata.Symbol | str)
             and str(child[0]) == "symbol"
-            and isinstance(child[1], (sexpdata.Symbol, str))
+            and isinstance(child[1], sexpdata.Symbol | str)
             and str(child[1]) == symbol_name
         ):
             match_index = index

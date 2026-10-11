@@ -33,7 +33,7 @@ from dataclasses import dataclass
 import heapq
 import math
 
-from shapely.geometry import LineString, Point
+from shapely.geometry import LineString, Point, box
 
 # Grid resolution (mm per cell).
 # 0.1 mm is a good balance: it captures fine-pitch pin gaps (~0.5 mm → 5 cells)
@@ -97,19 +97,42 @@ class GridMap:
     origin_y: float
     blocked: list[bool]
 
+    # ``True`` for cells blocked because their centre lies outside the
+    # board fence (``build_grid_map(fence_bbox=...)``), as opposed to
+    # obstacle coverage.  ``None`` when no fence was applied.
+    # ``grid_a_star`` relocates A* anchors that land on fence-blocked
+    # cells (an edge-connector pad may straddle the outline) but keeps
+    # obstacle-blocked anchors failing the search.
+    fence_blocked: list[bool] | None = None
+
     # ── coordinate helpers ──────────────────────────────────────────
 
     def to_grid(self, x: float, y: float) -> tuple[int, int]:
-        """World coordinate → (col, row)."""
-        gx = round((x - self.origin_x) / self.resolution)
-        gy = round((y - self.origin_y) / self.resolution)
+        """World coordinate → (col, row).
+
+        Cell ``g``'s centre is at ``origin + (g + 0.5) * resolution``
+        (see :meth:`to_world`), so the inverse mapping subtracts half a
+        cell before rounding: ``round((x - origin) / res - 0.5)`` picks
+        the cell whose centre is nearest, and ``to_grid(to_world(g))``
+        round-trips exactly.
+        """
+        gx = round((x - self.origin_x) / self.resolution - 0.5)
+        gy = round((y - self.origin_y) / self.resolution - 0.5)
         return int(gx), int(gy)
 
     def to_world(self, gx: int, gy: int) -> tuple[float, float]:
-        """(col, row) → world coordinate (cell centre)."""
+        """(col, row) → world coordinate (cell centre).
+
+        Rasterisation marks a cell blocked by testing the cell's centre
+        against obstacle polygons; A* walks cell centres, so the path
+        output must be the same cell centres (not the corner).  A path
+        built from corners sits ``resolution / 2`` closer to every
+        obstacle than the grid promised, which passes the grid check and
+        then fails the true clearance audit.
+        """
         return (
-            gx * self.resolution + self.origin_x,
-            gy * self.resolution + self.origin_y,
+            (gx + 0.5) * self.resolution + self.origin_x,
+            (gy + 0.5) * self.resolution + self.origin_y,
         )
 
     def in_bounds(self, gx: int, gy: int) -> bool:
@@ -135,13 +158,24 @@ def build_grid_map(
     board_bbox: tuple[float, float, float, float] | None,
     resolution: float = GRID_RESOLUTION,
     margin: float = 2.0,
+    fence_bbox: tuple[float, float, float, float] | None = None,
 ) -> GridMap:
     """Rasterise *obstacles* onto a uniform grid.
 
     Each obstacle is a ``shapely`` Polygon stored as the ``.shape``
     attribute of whatever object is in the list (typically
     :class:`~kcaa.router.world_model.Obstacle`).  A cell is BLOCKED if
-    its centre falls inside **any** obstacle shape.
+    its square footprint intersects **any** obstacle shape.
+
+    When ``fence_bbox`` is given, cells whose centre lies **outside** it
+    are also blocked: the search can never step past the fence even
+    though the grid extent (and margin) covers it.  The router passes the
+    board's Edge.Cuts bbox here so A* cannot wander into the margin
+    around the board and emit an out-of-board first segment.  The fence
+    uses the cell centre, so an edge-connector pad whose centre sits on
+    the outline keeps a free terminus cell (pad copper is a legal
+    endpoint, exempted elsewhere); the segment-level board check still
+    verifies the copper stays inside.
 
     Args:
         obstacles: Iterable of objects with a ``.shape`` (``Polygon``).
@@ -149,6 +183,8 @@ def build_grid_map(
             When ``None`` a 100×100 mm area is assumed.
         resolution: Grid cell size in mm.
         margin: Extra space (mm) around the board bbox.
+        fence_bbox: Optional ``(min_x, min_y, max_x, max_y)`` restricting
+            free cells to its interior (default: no restriction).
 
     Returns:
         A populated :class:`GridMap`.
@@ -175,18 +211,14 @@ def build_grid_map(
         s = getattr(obs, "shape", obs)
         if s is not None and not s.is_empty:
             shapes.append(s)
-    if not shapes:
-        return GridMap(
-            width=width,
-            height=height,
-            resolution=resolution,
-            origin_x=origin_x,
-            origin_y=origin_y,
-            blocked=blocked,
-        )
 
     # Rasterise: iterate over each obstacle's bounding box and mark
-    # cells whose centre falls inside the obstacle polygon.
+    # cells whose square footprint intersects the obstacle polygon.
+    # A centre-point test would let an 8-direction diagonal segment cross
+    # an obstacle corner (cells on both sides free, the segment between
+    # them clips the corner) and pass the grid check only to fail the
+    # true clearance audit.  The cell-square test blocks any cell the
+    # obstacle touches, so every walked segment keeps its promised gap.
     for shp in shapes:
         bxmin, bymin, bxmax, bymax = shp.bounds
         gx0 = max(0, int(math.floor((bxmin - origin_x) / resolution)))
@@ -200,8 +232,33 @@ def build_grid_map(
                 if blocked[gy * width + gx]:
                     continue
                 wx = gx * resolution + origin_x + resolution / 2
-                if shp.contains(Point(wx, cy)):
+                cell = box(
+                    wx - resolution / 2,
+                    cy - resolution / 2,
+                    wx + resolution / 2,
+                    cy + resolution / 2,
+                )
+                if shp.intersects(cell):
                     blocked[gy * width + gx] = True
+
+    # Board fence: block every cell whose centre is outside fence_bbox.
+    fence_blocked: list[bool] | None = None
+    if fence_bbox is not None:
+        fence_blocked = [False] * (width * height)
+        fmin_x, fmin_y, fmax_x, fmax_y = fence_bbox
+        for gy in range(height):
+            cy = gy * resolution + origin_y + resolution / 2
+            if cy < fmin_y or cy > fmax_y:
+                row = gy * width
+                for gx in range(width):
+                    blocked[row + gx] = True
+                    fence_blocked[row + gx] = True
+                continue
+            for gx in range(width):
+                wx = gx * resolution + origin_x + resolution / 2
+                if wx < fmin_x or wx > fmax_x:
+                    blocked[gy * width + gx] = True
+                    fence_blocked[gy * width + gx] = True
 
     return GridMap(
         width=width,
@@ -210,6 +267,7 @@ def build_grid_map(
         origin_x=origin_x,
         origin_y=origin_y,
         blocked=blocked,
+        fence_blocked=fence_blocked,
     )
 
 
@@ -242,6 +300,55 @@ def _octile_dist(gx: int, gy: int, ex: int, ey: int) -> float:
     if dx > dy:
         return _DIAG_COST * dy + (dx - dy)
     return _DIAG_COST * dx + (dy - dx)
+
+
+# How far an A* start/end anchor may be relocated (in cells) to reach the
+# nearest walkable cell.  10 cells = 1 mm at the default 0.1 mm resolution:
+# enough to absorb an edge-connector pad whose centre sits exactly on (or
+# marginally outside) the Edge.Cuts line, while a pad that is truly beyond
+# the board still fails the search instead of being rescued from far away.
+_RELOCATE_RADIUS_CELLS = 10
+
+
+def _nearest_free_cell(
+    gx: int,
+    gy: int,
+    grid: GridMap,
+    max_radius: int = _RELOCATE_RADIUS_CELLS,
+) -> tuple[int, int]:
+    """Return the closest free cell to ``(gx, gy)`` within ``max_radius``.
+
+    The closest cell is found by expanding square rings outward, so the
+    result is deterministic.  Falls back to the original cell when no
+    free cell exists in range — the caller's ``is_free`` guard then
+    fails the search with ``path=None``.
+    """
+    if grid.is_free(gx, gy):
+        return gx, gy
+    for r in range(1, max_radius + 1):
+        for dy in range(-r, r + 1):
+            for dx in range(-r, r + 1):
+                if abs(dx) != r and abs(dy) != r:
+                    continue  # ring only, not the already-visited interior
+                nx, ny = gx + dx, gy + dy
+                if grid.in_bounds(nx, ny) and grid.is_free(nx, ny):
+                    return nx, ny
+    return gx, gy
+
+
+def _clamp_to_walkable(gx: int, gy: int, grid: GridMap) -> tuple[int, int]:
+    """Relocate an A* anchor blocked by the board fence to a free cell.
+
+    A start/end on a *fence*-blocked cell (outside the Edge.Cuts outline)
+    moves to the nearest free cell — an edge-connector pad may straddle
+    the outline.  An anchor blocked by a real obstacle stays put, so the
+    search fails as before instead of silently bypassing a keepout.
+    """
+    if grid.is_free(gx, gy):
+        return gx, gy
+    if grid.fence_blocked is not None and grid.fence_blocked[gy * grid.width + gx]:
+        return _nearest_free_cell(gx, gy, grid)
+    return gx, gy
 
 
 def grid_a_star(
@@ -295,6 +402,18 @@ def grid_a_star(
     sy = max(0, min(H - 1, sy))
     ex = max(0, min(W - 1, ex))
     ey = max(0, min(H - 1, ey))
+
+    # Clamp to the nearest walkable cell.  An anchor that lands on a
+    # fence-blocked cell (board margin — e.g. an edge-connector pad whose
+    # centre sits on the Edge.Cuts line) moves to the closest free cell
+    # so the search still finds the board interior; the router
+    # post-process re-anchors the route onto the exact pad centres
+    # afterwards.  Anchors blocked by a real obstacle keep their cell and
+    # fail the search (no silent bypass of keepouts).  When no free cell
+    # exists nearby, the clamped cell is kept and the is_free guards
+    # below fail the search.
+    sx, sy = _clamp_to_walkable(sx, sy, grids[start_layer_idx])
+    ex, ey = _clamp_to_walkable(ex, ey, grids[end_layer_idx])
 
     if not grids[start_layer_idx].is_free(sx, sy):
         return AStarResult(path=None)
@@ -455,6 +574,7 @@ def hierarchical_a_star(
     fine_resolution: float = GRID_RESOLUTION,
     route_bbox: tuple[float, float, float, float] | None = None,
     turn_penalty: float = _TURN_PENALTY,
+    fence_bbox: tuple[float, float, float, float] | None = None,
 ) -> AStarResult:
     """Run hierarchical A* with auto-detection of single-pass vs two-pass.
 
@@ -468,6 +588,10 @@ def hierarchical_a_star(
         end_world: ``(x, y)`` in mm.
         fine_resolution: Grid cell size in mm for the fine pass.
         route_bbox: ``(min_x, min_y, max_x, max_y)`` of the route area.
+        turn_penalty: Turn-penalty distance equivalent (mm).
+        fence_bbox: Optional board bbox; cells outside it are blocked in
+            every pass (including the fine band, which may extend past
+            the board), so the search cannot step outside the board.
 
     Returns:
         :class:`AStarResult`.
@@ -489,11 +613,11 @@ def hierarchical_a_star(
     fine_cells = int(math.ceil(bw / fine_resolution)) * int(math.ceil(bh / fine_resolution))
 
     if fine_cells < _SINGLE_PASS_THRESHOLD:
-        grid = build_grid_map(obstacles, bbox, resolution=fine_resolution)
+        grid = build_grid_map(obstacles, bbox, resolution=fine_resolution, fence_bbox=fence_bbox)
         return grid_a_star([grid], start_world, end_world, turn_penalty=turn_penalty)
 
     coarse_res = fine_resolution * COARSE_FACTOR
-    coarse_grid = build_grid_map(obstacles, bbox, resolution=coarse_res)
+    coarse_grid = build_grid_map(obstacles, bbox, resolution=coarse_res, fence_bbox=fence_bbox)
     coarse_result = grid_a_star([coarse_grid], start_world, end_world, turn_penalty=turn_penalty)
     if coarse_result.path is None:
         return AStarResult(path=None, cells_visited=coarse_result.cells_visited)
@@ -509,7 +633,7 @@ def hierarchical_a_star(
         min(bbox[3], band[3]),
     )
 
-    fine_grid = build_grid_map(obstacles, band, resolution=fine_resolution)
+    fine_grid = build_grid_map(obstacles, band, resolution=fine_resolution, fence_bbox=fence_bbox)
     result = grid_a_star([fine_grid], start_world, end_world, turn_penalty=turn_penalty)
     if result.path is not None:
         result.cells_visited += coarse_result.cells_visited
@@ -569,6 +693,7 @@ def multi_layer_a_star(
     via_cost: float = _VIA_COST,
     via_forbidden_zones: list | None = None,
     turn_penalty: float = _TURN_PENALTY,
+    fence_bbox: tuple[float, float, float, float] | None = None,
 ) -> MultiLayerAStarResult:
     """Run A* across multiple copper layers.
 
@@ -587,6 +712,8 @@ def multi_layer_a_star(
         via_cost: Distance-equivalent cost per via transition.
         via_forbidden_zones: ``shapely`` Polygon list where vias are
             forbidden (e.g. start/end pad AABBs).
+        fence_bbox: Optional board bbox; cells outside it are blocked on
+            every layer grid.
 
     Returns:
         :class:`MultiLayerAStarResult`.
@@ -598,7 +725,9 @@ def multi_layer_a_star(
     grids_list: list[GridMap] = []
     for layer in layers:
         obs = obstacles_by_layer.get(layer, [])
-        grids_list.append(build_grid_map(obs, route_bbox, resolution=fine_resolution))
+        grids_list.append(
+            build_grid_map(obs, route_bbox, resolution=fine_resolution, fence_bbox=fence_bbox)
+        )
 
     # Build via adjacency index.
     via_from: dict[int, set[int]] = {}

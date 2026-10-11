@@ -1,8 +1,10 @@
 # PCB Routing Guide
 
-The KiCad MCP server provides a **no-shove PNS router** that connects
-two pads with an obstacle-avoiding track.  It is exposed through the
-`pcb_route_pad_to_pad` MCP tool.
+The KiCad MCP server provides a **PNS router** that connects two pads
+with an obstacle-avoiding track; the default ``"shove"`` strategy
+*pushes* blocking movable tracks out of the way (whole line, pad-
+anchored endpoints pinned) when a detour alone cannot clear the
+corridor.  It is exposed through the `pcb_route_pad_to_pad` MCP tool.
 
 ## Single-layer routing
 
@@ -12,10 +14,20 @@ await pcb_route_pad_to_pad(
     ref_a="R1", pad_a="2",
     ref_b="C1", pad_b="2",
     net="VCC",
-    layer="F.Cu",        # optional, default "F.Cu"
-    width=0.5,           # optional; uses netclass track width if omitted
+    width=0.5,                      # optional; uses netclass track width if omitted
+    options={"layer_hint": "F.Cu"}, # optional; preferred layer for thru-hole pads
 )
 ```
+
+Interface v3: the VLM control knobs — ``waypoints``, ``dry_run`` — are
+top-level parameters (defaults ``None`` / ``False``); board-stable
+config and rare tweaks (``layer_hint``, ``via_pairs``,
+``turn_penalty``) bundle into ``options``.  The strategy is fixed:
+``"shove"`` (the walkaround-only variant and the ``strategy`` /
+``corner_mode`` / ``clearance`` / via-size / ``grid_resolution``
+parameters were removed 2026-10-10 — corner shape is fixed mitered45,
+and clearance/via sizes resolve from the board's design rules and
+netclasses).
 
 The router walks the pad-exit points of `R1.2` and `C1.2` and A*'s a
 visibility graph over the obstacle-free regions.  The track is added
@@ -49,14 +61,15 @@ await pcb_route_pad_to_pad(
     ref_a="R1", pad_a="2",
     ref_b="U1", pad_b="5",
     net="VCC",
-    via_pairs=(("F.Cu", "B.Cu"), ("B.Cu", "In1.Cu")),
+    options={"via_pairs": (("F.Cu", "B.Cu"), ("B.Cu", "In1.Cu"))},
 )
 ```
 
 Layer selection is automatic: SMD/connect pads use their fixed layer;
-thru-hole pads (`*.Cu`) pick a shared copper layer, preferring
-`layer_hint` when it is valid.  When both pads are thru-hole and share
-a layer, the route stays on a single layer (no vias).
+thru-hole pads (`*.Cu`) pick a shared copper layer, preferring the
+`options["layer_hint"]` value when it is valid.  When both pads are
+thru-hole and share a layer, the route stays on a single layer (no
+vias).
 
 ### Response shape
 

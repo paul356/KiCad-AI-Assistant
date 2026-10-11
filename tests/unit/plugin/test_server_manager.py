@@ -50,6 +50,7 @@ class TestServerManager:
             resolved_log_dir=log_dir,
             python_executable="",  # required by _resolve_python()
             config_dir="/tmp",  # cwd for .env discovery
+            llm_supports_vision=False,  # default settings: text-only
         )
         return ServerManager(settings)
 
@@ -87,6 +88,35 @@ class TestServerManager:
         mgr = self._make_manager(log_dir="")
         env = mgr._build_env(1234)
         assert "KICAD_MCP_LOG_DIR" not in env
+
+    def test_build_env_vision_flag_text_only(self):
+        # Default settings: llm_supports_vision=False -> the server must
+        # suppress image blocks at the source (model_supports_vision).
+        mgr = self._make_manager()
+        env = mgr._build_env(1234)
+        assert env["KICAD_MCP_SUPPORTS_VISION"] == "0"
+
+    def test_build_env_vision_flag_vision_model(self):
+        settings = types.SimpleNamespace(
+            server_port=0,
+            server_log_dir="",
+            resolved_log_dir="",
+            python_executable="",
+            config_dir="/tmp",
+            llm_supports_vision=True,
+        )
+        mgr = ServerManager(settings)
+        env = mgr._build_env(1234)
+        assert env["KICAD_MCP_SUPPORTS_VISION"] == "1"
+
+    def test_build_env_passes_render_toggle_through(self, monkeypatch):
+        """KICAD_MCP_RENDER_ROUTE_PNG rides the KICAD* passthrough so a
+        user can disable route rendering from the parent environment
+        (the server-side kill switch, default on)."""
+        monkeypatch.setenv("KICAD_MCP_RENDER_ROUTE_PNG", "0")
+        mgr = self._make_manager()
+        env = mgr._build_env(1234)
+        assert env["KICAD_MCP_RENDER_ROUTE_PNG"] == "0"
 
     def test_build_command_uses_python_module(self):
         mgr = self._make_manager()

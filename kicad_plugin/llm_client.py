@@ -1128,7 +1128,7 @@ def call_mcp_tool(base_url: str, tool_name: str, arguments: dict[str, Any]) -> d
                 out = json.loads(text.get("text", ""))
             except json.JSONDecodeError:
                 out = {"success": True, "text": text.get("text", "")}
-            if isinstance(out, dict):
+            if isinstance(out, dict) and image is not None:
                 out["_image"] = image
             return out
     if image is not None:
@@ -2285,6 +2285,17 @@ class LLMClient:
         if policy.post_process is not None:
             result = policy.post_process(result)
 
+        _img = result.get("_image") if isinstance(result, dict) else None
+        if isinstance(_img, dict):
+            _img_desc = f"dict(data_len={len(_img.get('data', ''))})"
+        else:
+            _img_desc = repr(_img)
+        log.info(
+            "tool_call_flow emit_pre: name=%s result_keys=%s _image=%s",
+            tool_name,
+            sorted(result.keys()) if isinstance(result, dict) else type(result).__name__,
+            _img_desc,
+        )
         self._emit_tool_callback(on_tool_call, tool_name, args, result)
 
         # Mark the path dirty even when the tool call fails: a failed edit may

@@ -5,13 +5,16 @@ Provides tools to list available footprint libraries, search footprints
 by name or description, and retrieve detailed footprint metadata.
 """
 
+import copy
 from dataclasses import dataclass
 import logging
 import os
 import threading
 from typing import Any
+import uuid
 
 from fastmcp import Context, FastMCP
+import sexpdata
 
 from kcaa.utils.config import config
 from kcaa.utils.footprint_index_manager import get_footprint_index_manager, normalize_project_id
@@ -21,6 +24,7 @@ from kcaa.utils.fp_lib_table_utils import (
     sanitize_lib_nickname,
     unregister_library_in_table,
 )
+from kcaa.utils.pcb_board_utils import get_edge_cuts_items
 from kcaa.utils.pcb_footprint_utils import (
     get_fp_layer,
     get_fp_property,
@@ -28,7 +32,9 @@ from kcaa.utils.pcb_footprint_utils import (
     is_safe_footprint_name,
     iter_footprint_nodes,
     normalize_footprint_for_library,
+    set_fp_at,
     split_footprint_header,
+    upsert_fp_property,
     write_footprint_mod,
 )
 from kcaa.utils.pcb_library_utils import (
@@ -37,9 +43,16 @@ from kcaa.utils.pcb_library_utils import (
     parse_kicad_mod,
     scan_footprint_library,
 )
-from kcaa.utils.pcb_sexp_utils import load_pcb
+from kcaa.utils.pcb_sexp_utils import load_pcb, save_pcb
 
 log = logging.getLogger(__name__)
+
+
+def _sym(value: Any) -> str:
+    """Return the string form of a sexpdata Symbol or plain string."""
+    if isinstance(value, sexpdata.Symbol):
+        return str(value)
+    return str(value)
 
 
 # ---------------------------------------------------------------------------
@@ -105,6 +118,226 @@ def _run_fp_sync_in_background(force: bool, project_path: str | None) -> None:
         with _fp_sync_lock:
             _fp_sync_state.running = False
             _fp_sync_state.current_library = ""
+
+
+async def _place_one_footprint(
+    pcb_path: str,
+    nets: dict[str, str],
+    footprint: str | None,
+    reference: str | None,
+    x: float | None,
+    y: float | None,
+    rotation: float,
+    ctx: Context | None = None,
+) -> dict[str, Any]:
+    """Place exactly one footprint onto *pcb_path*; the shared batch item core.
+
+    Used by the batch ``add_footprints_to_pcb`` path; the footprint is
+    resolved by ``footprint`` (``"Library:Name"`` or bare ``"Name"`` searched
+    across the fp-lib-table libraries — there is no tool- or item-level
+    library restriction).  *nets* must name a net for EVERY pad of the placed
+    footprint (``""`` = net 0 / unconnected): a pad missing from *nets* is a
+    hard error and nothing is written — the part is never silently shorted
+    onto a blanket or zero net.  Returns the dict the tool documents
+    (``success``/``reference``/``placed_at``/... or ``error``); never raises
+    — every failure mode returns an error dict.
+    """
+    try:
+        if not reference:
+            return {"error": "reference must be a non-empty string"}
+        if not footprint:
+            return {"error": "footprint must be a non-empty string"}
+        if x is None or y is None:
+            return {"error": "x and y are required"}
+        x = float(x)
+        y = float(y)
+        rotation = float(rotation)
+        try:
+            data = load_pcb(pcb_path)
+        except (FileNotFoundError, ValueError, OSError) as exc:
+            return {"error": f"cannot read board: {exc}"}
+        if not data or not isinstance(data[0], sexpdata.Symbol) or _sym(data[0]) != "kicad_pcb":
+            return {"error": f"{pcb_path} does not look like a .kicad_pcb file"}
+
+        for node in iter_footprint_nodes(data):
+            if get_fp_property(node, "Reference") == reference:
+                return {
+                    "error": (
+                        f"reference '{reference}' already exists on the board "
+                        f"({reference} is placed elsewhere); pick a unique reference"
+                    )
+                }
+
+        try:
+            header, mod_path, scanned = _find_footprint_mod_path(footprint, None, pcb_path)
+        except ValueError as exc:
+            return {"error": str(exc)}
+
+        try:
+            with open(mod_path, encoding="utf-8") as fh:
+                mod_data = sexpdata.loads(fh.read())
+        except (OSError, ValueError, TypeError) as exc:
+            return {"error": f"cannot parse footprint file {mod_path}: {exc}"}
+        if (
+            not isinstance(mod_data, list)
+            or len(mod_data) < 2
+            or not isinstance(mod_data[0], sexpdata.Symbol)
+            or _sym(mod_data[0]) not in ("footprint", "module")
+        ):
+            return {"error": f"{mod_path} is not a KiCad footprint file"}
+
+        # Every pad of the footprint must be covered by nets — a missing pad
+        # is a hard error so a partial nets dict can never silently land the
+        # uncovered pad on net 0 (the whole-point of the required nets API).
+        pad_numbers = [
+            _sym(child[1])
+            for child in mod_data
+            if isinstance(child, list)
+            and len(child) > 1
+            and isinstance(child[0], sexpdata.Symbol)
+            and _sym(child[0]) == "pad"
+        ]
+        pad_nets_by_num = {str(pad_no): net_name for pad_no, net_name in nets.items()}
+        # A net name must be a string.  A model JSON slip (numeric value
+        # for "net") would otherwise serialize an orphan ``(net N 12)``
+        # node with no name — a malformed declaration KiCad rejects —
+        # plus the pad's ``(net 3 12)`` reference.  Reject the item with
+        # a clear error before any write.
+        bad_nets: list[str] = [
+            str(pad_no)
+            for pad_no, net_name in pad_nets_by_num.items()
+            if not isinstance(net_name, str | type(None))
+        ]
+        if bad_nets:
+            return {
+                "error": (
+                    f"net name must be a string (pad(s) {', '.join(bad_nets)} got "
+                    f"a non-string value)"
+                )
+            }
+        missing = [p for p in pad_numbers if p not in pad_nets_by_num]
+        if missing:
+            return {
+                "error": f"missing net for pad(s): {', '.join(missing)}",
+            }
+
+        # Board footprint node: keep every library item (fp_line, fp_text,
+        # pads, model ...), then add the board-instance data on top.
+        fp_node: list[Any] = [mod_data[0], header]
+        fp_node.extend(copy.deepcopy(mod_data[2:]))
+        set_fp_at(fp_node, x, y, rotation)
+        upsert_fp_property(fp_node, "Reference", reference)
+        fp_node.append([sexpdata.Symbol("uuid"), str(uuid.uuid4())])
+
+        # "" (or None) in nets -> net 0; named nets resolve or auto-add to the
+        # board's (net ...) list.  Sorted so auto-added numbers are stable.
+        pad_nets = {
+            pad_no: _resolve_board_net(data, net_name if net_name else None)
+            for pad_no, net_name in sorted(pad_nets_by_num.items())
+        }
+        pad_count, pads_net_list = _apply_nets_to_pads(fp_node, pad_nets, (0, ""))
+        data.append(fp_node)
+        try:
+            bak_path = save_pcb(pcb_path, data)
+        except OSError as exc:
+            return {"error": f"failed to write board: {exc}"}
+
+        result: dict[str, Any] = {
+            "success": True,
+            "reference": reference,
+            "footprint": header,
+            "placed_at": [x, y],
+            "rotation": rotation,
+            "backup_path": bak_path,
+            "pad_count": pad_count,
+            "pads_net": pads_net_list,
+        }
+        outline_msg = _outline_warning(data, x, y)
+        if outline_msg:
+            result["warnings"] = [outline_msg]
+        if ctx:
+            net_summary = ", ".join(
+                f"{entry['pad']}={entry['net'] or '0'}" for entry in pads_net_list
+            )
+            await ctx.info(
+                f"Placed {header} as {reference} at ({x}, {y}) rot {rotation} "
+                f"({pad_count} pads; nets {net_summary})"
+            )
+        return result
+    except Exception as exc:
+        log.error("add_footprints_to_pcb item failed: %s", exc, exc_info=True)
+        return {"error": str(exc)}
+
+
+async def _place_many_footprints(
+    pcb_path: str,
+    footprints: list[dict[str, Any]],
+    ctx: Context | None = None,
+) -> dict[str, Any]:
+    """Place several footprints in one call, collecting per-item results.
+
+    The footprint-level placement arguments all live in each *footprints*
+    dict — ``footprint`` (``"Library:Name"`` or bare ``"Name"``), ``reference``,
+    ``x``, ``y``, optional ``rotation`` and the required ``nets``.  There is
+    no single-footprint mode and no tool-level defaults: every item must
+    carry a ``nets`` dict covering every pad of its footprint — a pad
+    missing from that dict fails the item with "missing net for pad(s): ..."
+    rather than silently landing on net 0.  Items are placed one at a time,
+    each writing its own save; a failing item never rolls back or blocks the
+    others.  Returns ``{"success", "results", "placed_count",
+    "failed_count", "failed"}`` where ``success`` is True only when every
+    item was placed.
+    """
+    results: list[dict[str, Any]] = []
+    for item in footprints:
+        ref = str(item.get("reference") or "") if isinstance(item, dict) else ""
+        if not isinstance(item, dict):
+            results.append(
+                {"success": False, "reference": "", "error": "footprint spec must be an object"}
+            )
+            continue
+        try:
+            x_val = item.get("x")
+            y_val = item.get("y")
+            item_nets = item.get("nets")
+            if not isinstance(item_nets, dict):
+                raise ValueError("nets must be an object mapping pad numbers to net names")
+            res = await _place_one_footprint(
+                pcb_path,
+                nets=item_nets,
+                footprint=item.get("footprint"),
+                reference=item.get("reference"),
+                x=float(x_val) if x_val is not None else None,
+                y=float(y_val) if y_val is not None else None,
+                rotation=float(item.get("rotation") or 0.0),
+                ctx=ctx,
+            )
+        except Exception as exc:
+            log.error("place_many item (%s) failed: %s", ref, exc, exc_info=True)
+            res = {"error": str(exc)}
+        if res.get("success") is True and "error" not in res:
+            results.append({"success": True, "reference": ref, "result": res})
+        else:
+            results.append(
+                {
+                    "success": False,
+                    "reference": ref,
+                    "error": res.get("error") or "placement failed",
+                }
+            )
+
+    placed = [r for r in results if r["success"]]
+    failed = [r for r in results if not r["success"]]
+    return {
+        "success": not failed,
+        "results": results,
+        "placed_count": len(placed),
+        "failed_count": len(failed),
+        "failed": [
+            {"reference": r["reference"], "error": r.get("error", "placement failed")}
+            for r in failed
+        ],
+    }
 
 
 def register_pcb_library_tools(mcp: FastMCP) -> None:
@@ -407,6 +640,191 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
         info["library_path"] = lib_path
         info["file_path"] = mod_path
         return info
+
+    @mcp.tool()
+    async def add_footprints_to_pcb(
+        pcb_path: str,
+        footprints: list[dict[str, Any]],
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Place several footprints from footprint libraries onto an existing board.
+
+        Pure batch: the ``footprints`` list carries every footprint-level
+        argument (``footprint``, ``reference``, ``x``, ``y``, ``rotation``,
+        ``nets``); there is no single-footprint mode and no tool-level
+        defaults.  Items are placed one at a time and every item's result is
+        collected; a failing item never rolls back or blocks the others —
+        successful items are written to the board as they go.
+
+        Reads the ``.kicad_mod`` file of each requested footprint, appends it
+        as a new ``(footprint ...)`` node to the ``.kicad_pcb`` board at the
+        given world position, and writes the board back after every item
+        (atomic write plus a ``.bak`` backup).  The library file is only read
+        — nothing in the library is modified.  Placement tools like
+        ``set_footprint_position`` only move footprints already on the board;
+        this tool adds new ones.
+
+        Footprint resolution: ``footprint`` may be ``"Library:Name"`` or a
+        bare ``"Name"`` searched across every library resolved from
+        fp-lib-table (project table first, then the user table); there is no
+        library restriction argument — each footprint resolves by its own
+        ``Library:Name`` prefix or bare name.  The placed footprint's board
+        header is ``"Library:Name"`` when the ``footprint`` argument carries
+        the library prefix, else the bare name.
+
+        Netting — required, per-pad: each item's ``nets`` argument maps every
+        pad number (``"1"``, ``"2"``, ...) to that pad's net name.  A net name
+        that does not exist in the board's ``(net ...)`` list is auto-added
+        with the next free net number (max + 1) — friendlier than failing,
+        and matches drawing-demo boards that have no nets.  An empty string
+        (or ``None``) as the net name means net 0 (unconnected); the
+        ``(net 0 "")`` node is appended if the board lacks one.  A pad NOT
+        covered by an item's ``nets`` is a hard error for that item
+        (``"missing net for pad(s): ..."``) and nothing is written for it —
+        a partial nets dict can never silently land an uncovered pad on net 0
+        and short the part.
+
+        Validation — every item fails with an ``{"error": ...}`` WITHOUT
+        touching the board file (only that item fails): unparseable
+        ``pcb_path``; unresolvable ``footprint`` (the error lists the
+        scanned libraries); ``reference`` already present on the board
+        (duplicate reference); unsafe footprint names (path traversal);
+        missing ``x``/``y``; ``nets`` not covering every pad.  Placement
+        outside the board outline (Edge.Cuts) is a warning only — boards may
+        legitimately have no outline, so it is never a hard failure.
+
+        Args:
+            pcb_path: Path to the ``.kicad_pcb`` board to modify.
+            footprints: List of placement dicts, each with the footprint-
+                level arguments (all required unless noted):
+                ``footprint`` (``"Library:Name"`` or bare ``"Name"``),
+                ``reference`` (unique board reference designator, e.g.
+                ``"R9"``), ``x``/``y`` (anchor world mm, +Y down), ``nets``
+                (pad number string → net name; ``""``/``None`` = net 0;
+                MUST cover every pad of the footprint), and optional
+                ``rotation`` (CCW-positive degrees, default 0.0).
+            ctx: MCP context for progress reporting.
+
+        Returns:
+            dict with ``success`` (True only when every item was placed),
+            ``results`` (one entry per item, in order: ``success``,
+            ``reference`` and either ``result`` — the full placement dict
+            with ``success``/``reference``/``footprint``/``placed_at``/
+            ``rotation``/``backup_path``/``pad_count``/``pads_net`` and an
+            optional ``warnings`` list — or ``error``), ``placed_count``,
+            ``failed_count`` and ``failed`` (list of ``{"reference",
+            "error"}`` per failed item).
+        """
+        if not footprints:
+            return {"error": "footprints must be a non-empty list"}
+        return await _place_many_footprints(pcb_path, footprints, ctx)
+
+    @mcp.tool()
+    async def remove_footprints_from_pcb(
+        pcb_path: str,
+        references: list[str],
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Remove several footprints from an existing board by reference designator.
+
+        Pure batch: ``references`` is the only designator input — there is no
+        single-footprint mode.  Each listed reference is removed one at a
+        time in list order and every item's result is collected; a failing
+        item never blocks the others (nothing rolls back — items already
+        removed stay removed).  The board is loaded once; each item removes
+        whichever matching ``(footprint ...)`` nodes remain, so a reference
+        listed twice removes the first occurrence and the second is reported
+        as not found.
+
+        The board is only written when at least one footprint was actually
+        removed — one atomic save plus a ``.bak`` backup for the whole call —
+        and an all-not-found batch leaves the file untouched and returns
+        ``removed_count`` 0 with ``backup_path`` ``None``.  When written,
+        ``success`` is True if and only if every item was removed.
+
+        The board's ``(net ...)`` definitions are deliberately kept as-is
+        after a removal: KiCad tolerates net definitions with no pad
+        references (dangling nets), and rewriting the net table risks
+        breaking net references of the footprints that stay.  Cleanup of
+        now-unused nets is left to KiCad's normal board maintenance.
+
+        Args:
+            pcb_path: Path to the ``.kicad_pcb`` board to modify.
+            references: List of board reference designators to remove, in
+                order; each entry is removed once and a repeated entry then
+                counts as not found.  Must be a non-empty list.
+            ctx: MCP context for progress reporting.
+
+        Returns:
+            dict with ``success`` (True only when every item was removed),
+            ``results`` (one entry per item, in order: dict with
+            ``reference``, ``success``, ``removed`` (0 or 1) and ``error``
+            when the item was not found or invalid), ``removed_count``,
+            ``not_found_count``, ``not_found`` (list of ``{"reference",
+            "error"}`` per failed item), ``backup_path`` (``None`` when
+            nothing was written) and ``pcb_path``.
+        """
+        try:
+            if not isinstance(references, list) or not references:
+                return {"error": "references must be a non-empty list"}
+
+            try:
+                data = load_pcb(pcb_path)
+            except (FileNotFoundError, ValueError, OSError) as exc:
+                return {"error": f"cannot read board: {exc}"}
+            if not data or not isinstance(data[0], sexpdata.Symbol) or _sym(data[0]) != "kicad_pcb":
+                return {"error": f"{pcb_path} does not look like a .kicad_pcb file"}
+
+            results: list[dict[str, Any]] = []
+            not_found: list[dict[str, Any]] = []
+            removed_total = 0
+            for item in references:
+                if not isinstance(item, str) or not item:
+                    error = "reference must be a non-empty string"
+                    ref_label = item if isinstance(item, str) else str(item)
+                    results.append(
+                        {"reference": ref_label, "success": False, "removed": 0, "error": error}
+                    )
+                    not_found.append({"reference": ref_label, "error": error})
+                    continue
+                n = 0
+                for node in list(iter_footprint_nodes(data)):
+                    if get_fp_property(node, "Reference") == item:
+                        data.remove(node)
+                        n += 1
+                if n == 0:
+                    error = f"footprint '{item}' not found on the board; nothing to remove"
+                    results.append(
+                        {"reference": item, "success": False, "removed": 0, "error": error}
+                    )
+                    not_found.append({"reference": item, "error": error})
+                else:
+                    results.append({"reference": item, "success": True, "removed": 1})
+                    removed_total += 1
+
+            backup_path: str | None = None
+            if removed_total > 0:
+                try:
+                    backup_path = save_pcb(pcb_path, data)
+                except OSError as exc:
+                    return {"error": f"failed to write board: {exc}"}
+            if ctx and removed_total > 0:
+                await ctx.info(
+                    f"Removed {removed_total} footprint(s) from {pcb_path}; "
+                    f"{len(not_found)} not found"
+                )
+            return {
+                "success": removed_total > 0 and not not_found,
+                "results": results,
+                "removed_count": removed_total,
+                "not_found_count": len(not_found),
+                "not_found": not_found,
+                "backup_path": backup_path,
+                "pcb_path": pcb_path,
+            }
+        except Exception as exc:
+            log.error("remove_footprints_from_pcb failed: %s", exc, exc_info=True)
+            return {"error": str(exc)}
 
     @mcp.tool()
     async def find_footprints_not_in_libraries(
@@ -1050,6 +1468,225 @@ def _resolve_library_dir(library: str, pcb_path: str | None) -> tuple[str, str]:
             "Pick a writable library or create a new one."
         )
     return lib_dir, table_path
+
+
+def _fmt_library_list(libs: list[dict[str, str]]) -> str:
+    """Render a library list for error messages: ``nick -> uri`` pairs."""
+    if not libs:
+        return "(no fp-lib-table libraries found)"
+    return "; ".join(f"{lib['nickname']} -> {lib['uri']}" for lib in libs)
+
+
+def _find_footprint_mod_path(
+    footprint: str,
+    library: str | None,
+    pcb_path: str | None,
+) -> tuple[str, str, list[dict[str, str]]]:
+    """Resolve ``footprint`` to the ``.kicad_mod`` file to place on a board.
+
+    ``footprint`` may be ``"Library:Name"`` or a bare ``"Name"``.  When bare,
+    the search covers every library from ``build_effective_library_list``
+    unless ``library`` restricts it.  ``library`` accepts a registered
+    nickname, an existing ``.pretty`` directory path, or a directory name
+    (``"MyLib"`` / ``"MyLib.pretty"``).
+
+    :param footprint: ``"Library:Name"`` or bare footprint name.
+    :param library: Optional restriction (nickname, dir path, or dir name).
+    :param pcb_path: Board path scoping project fp-lib-table resolution.
+    :returns: ``(header, mod_path, scanned)`` — the board header to write
+        (``"Library:Name"`` when the caller named the library, else the bare
+        name), the resolved ``.kicad_mod`` path, and the effective library
+        list for error messages.
+    :raises ValueError: On unsafe names, unknown library, or unknown footprint
+        (the message lists the libraries searched).
+    """
+    if ":" in footprint:
+        lib_name, _, fp_name = footprint.rpartition(":")
+    else:
+        lib_name, fp_name = None, footprint
+
+    if not fp_name or not is_safe_footprint_name(fp_name):
+        raise ValueError(
+            f"unsafe footprint name {footprint!r} (refusing to place); "
+            "footprint must be 'Library:Name' or 'Name'"
+        )
+
+    libs = build_effective_library_list(pcb_path)
+    lib_by_nick = {lib["nickname"]: lib for lib in libs}
+
+    # Candidate library directories as (label, dir) pairs.
+    candidates: list[tuple[str, str]] = []
+    if library:
+        if library in lib_by_nick:
+            candidates.append((library, lib_by_nick[library]["uri"]))
+        elif os.path.isdir(library):
+            candidates.append((library, os.path.abspath(library)))
+        else:
+            for nick, lib in lib_by_nick.items():
+                base = os.path.basename(lib["uri"])
+                if base == library or base == library + ".pretty":
+                    candidates.append((nick, lib["uri"]))
+            if not candidates:
+                raise ValueError(
+                    f"library {library!r} not found (expected a registered nickname, "
+                    f"a .pretty directory path, or a directory name); scanned libraries: "
+                    f"{_fmt_library_list(libs)}"
+                )
+    if lib_name is not None:
+        if library and library not in lib_by_nick and os.path.isdir(library):
+            raise ValueError(
+                f"footprint '{footprint}' names library '{lib_name}' but library= "
+                f"is a directory path ({library}); pick one"
+            )
+        if lib_name not in lib_by_nick:
+            raise ValueError(
+                f"library '{lib_name}' not found in fp-lib-table; scanned libraries: "
+                f"{_fmt_library_list(libs)}"
+            )
+        candidates = [(lib_name, lib_by_nick[lib_name]["uri"])]
+    elif not candidates:  # bare name, no restriction: search everything
+        candidates = [(lib["nickname"], lib["uri"]) for lib in libs]
+
+    for label, lib_dir in candidates:
+        if not lib_dir or not os.path.isdir(lib_dir):
+            continue
+        mod_candidate = os.path.join(lib_dir, f"{fp_name}.kicad_mod")
+        if os.path.isfile(mod_candidate):
+            header = f"{lib_name}:{fp_name}" if lib_name else fp_name
+            return header, mod_candidate, libs
+
+    raise ValueError(
+        f"footprint '{footprint}' not found in the scanned libraries: "
+        f"{_fmt_library_list([{'nickname': label, 'uri': lib_dir} for label, lib_dir in candidates])}"
+    )
+
+
+def _resolve_board_net(data: list[Any], name: str | None) -> tuple[int | None, str]:
+    """Return ``(net_number, net_name)`` to assign to a new footprint's pads.
+
+    With a *name*: the number of the matching ``(net N "name")`` node, or the
+    name is auto-added with number max+1 (1 when the board has no nets).
+    With ``None``: ``(0, "")`` — KiCad net 0, unconnected — appending a
+    ``(net 0 "")`` node when the board does not have one.
+
+    Name-match comes first — boards written by KiCad 10 may hold numberless
+    ``(net "GND")`` nodes (id elided) and ``int()`` on such a node raises
+    ValueError, so the id is parsed leniently.  An existing net whose *name*
+    matches is returned (never duplicated), with ``net_number=None`` for a
+    numberless match — the caller then writes a pad reference in the same
+    numberless form the board already uses.  A fresh name always appends its
+    own numbered declaration.
+
+    The id is only ever the numeric first element of a KiCad 8
+    ``(net <id> "<name>")`` node.  A digital-string FIRST element in a
+    two-element numberless node is the *name*, not an id: ``(net "3")``
+    declares a net *named* ``"3"`` on KiCad 10, so treating it as id 3 would
+    make the pad reference write ``(net 3 "3")`` — numbered form — against a
+    declaration that carries no id, a dangling reference KiCad cannot
+    resolve.
+    """
+    nets: list[tuple[int | None, str]] = []
+    for item in data:
+        if not (isinstance(item, list) and len(item) >= 2):
+            continue
+        if not (isinstance(item[0], sexpdata.Symbol) and _sym(item[0]) == "net"):
+            continue
+        net_name: str | None = None
+        for v in item[1:]:
+            if isinstance(v, str):
+                net_name = v
+        if net_name is None:
+            continue
+        raw_id = item[1]
+        net_no: int | None = None
+        if isinstance(raw_id, int):
+            net_no = raw_id
+        nets.append((net_no, net_name))
+
+    if name is None:
+        if not any(no == 0 for no, _ in nets):
+            data.append([sexpdata.Symbol("net"), 0, ""])
+        return 0, ""
+    for net_no, net_name in nets:
+        if net_name == name:
+            return net_no, name
+    next_no = max((net_no for net_no, _ in nets if net_no is not None), default=0) + 1
+    data.append([sexpdata.Symbol("net"), next_no, name])
+    return next_no, name
+
+
+def _apply_nets_to_pads(
+    fp_node: list[Any],
+    pad_nets: dict[str, tuple[int | None, str]],
+    default_net: tuple[int | None, str],
+) -> tuple[int, list[dict[str, str]]]:
+    """Assign per-pad ``(net ...)`` nodes to *fp_node* in place.
+
+    Pads whose number is a key of *pad_nets* get that pad's
+    ``(net_no, net_name)``; every other pad gets *default_net* — the
+    per-pad fallback of the ``add_footprints_to_pcb`` netting.  Replaces
+    pre-existing net sub-nodes.  A ``net_no`` of ``None`` writes the
+    numberless KiCad 10 form ``(net "GND")`` (the board's own net
+    declaration carries no id, so the pad reference mirrors it).
+
+    Returns ``(pad_count, pad_net_list)`` where *pad_net_list* maps each
+    pad number (in pad order) to its assigned net name (``""`` for net 0).
+    """
+    count = 0
+    pad_net_list: list[dict[str, str]] = []
+    for child in fp_node:
+        if not (isinstance(child, list) and len(child) > 0):
+            continue
+        if not (isinstance(child[0], sexpdata.Symbol) and _sym(child[0]) == "pad"):
+            continue
+        pad_no = _sym(child[1]) if len(child) > 1 else ""
+        net_no, net_name = pad_nets.get(pad_no, default_net)
+        if net_no is None:
+            net_node = [sexpdata.Symbol("net"), net_name]
+        else:
+            net_node = [sexpdata.Symbol("net"), net_no, net_name]
+        for i, sub in enumerate(child):
+            if isinstance(sub, list) and len(sub) >= 1 and _sym(sub[0]) == "net":
+                child[i] = net_node
+                break
+        else:
+            child.append(net_node)
+        count += 1
+        pad_net_list.append({"pad": pad_no, "net": net_name})
+    return count, pad_net_list
+
+
+def _outline_warning(data: list[Any], x: float, y: float) -> str | None:
+    """Return a warning string when (x, y) lies outside the board outline.
+
+    Conservative bounding-box check over the Edge.Cuts graphic items; boards
+    without an outline (or without usable geometry) return ``None``.  This is
+    deliberately warn-only — outline-less boards are legal.
+    """
+    items = get_edge_cuts_items(data)
+    if not items:
+        return None
+    xs: list[float] = []
+    ys: list[float] = []
+    for item in items:
+        for key, target in (("x1", xs), ("x2", xs), ("start_x", xs), ("mid_x", xs), ("end_x", xs)):
+            if key in item:
+                target.append(item[key])
+        for key, target in (("y1", ys), ("y2", ys), ("start_y", ys), ("mid_y", ys), ("end_y", ys)):
+            if key in item:
+                target.append(item[key])
+        for key, target in (("cx", xs), ("cy", ys), ("ex", xs), ("ey", ys)):
+            if key in item:
+                target.append(item[key])
+    if not xs or not ys:
+        return None
+    eps = 1e-6
+    if x < min(xs) - eps or x > max(xs) + eps or y < min(ys) - eps or y > max(ys) + eps:
+        return (
+            f"placement ({x:.2f}, {y:.2f}) lies outside the board outline bounding "
+            f"box ({min(xs):.2f}, {min(ys):.2f}) - ({max(xs):.2f}, {max(ys):.2f})"
+        )
+    return None
 
 
 def _collect_existing_footprints(pcb_path: str | None) -> set[tuple[str, str]]:

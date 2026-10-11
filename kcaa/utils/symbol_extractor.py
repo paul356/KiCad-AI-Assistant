@@ -176,7 +176,7 @@ def _fallback_path(file_path: str, symbol_name: str) -> list:
         raise ValueError(f"No symbols found in {file_path!r}")
 
     elements = library_file.symbol
-    if isinstance(elements, (list, skip.collection.ElementCollection)):
+    if isinstance(elements, (list | skip.collection.ElementCollection)):
         sym_iter = elements
     else:
         # Library contains exactly one symbol — SourceFile returns it directly.

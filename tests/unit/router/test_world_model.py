@@ -63,6 +63,7 @@ def _make_pcb(
     segments: list[list] | None = None,
     vias: list[list] | None = None,
     zones: list[list] | None = None,
+    arcs: list[list] | None = None,
 ) -> list:
     pcb = [
         _sym("kicad_pcb"),
@@ -71,6 +72,7 @@ def _make_pcb(
     ]
     pcb.extend(footprints or [])
     pcb.extend(segments or [])
+    pcb.extend(arcs or [])
     pcb.extend(vias or [])
     pcb.extend(zones or [])
     return pcb
@@ -93,12 +95,14 @@ class TestEmptyPcb:
         m = build_world_model(path)
         assert m.obstacles == []
         assert m.board_bbox is None
+        assert m.board_outline is None
         assert m.nets() == set()
 
     def test_model_dataclass_defaults(self):
         m = WorldModel()
         assert m.obstacles == []
         assert m.board_bbox is None
+        assert m.board_outline is None
 
 
 # ---------------------------------------------------------------------------
@@ -235,6 +239,78 @@ class TestTrackObstacle:
 
 
 # ---------------------------------------------------------------------------
+# Arc obstacles
+# ---------------------------------------------------------------------------
+
+
+class TestArcObstacle:
+    def test_arc_becomes_track_obstacle(self, tmp_path):
+        arc = [
+            _sym("arc"),
+            [_sym("start"), 0.0, 0.0],
+            [_sym("mid"), 1.0, 1.0],
+            [_sym("end"), 2.0, 0.0],
+            [_sym("width"), 0.3],
+            [_sym("layer"), "F.Cu"],
+            [_sym("net"), "VCC"],
+        ]
+        path = _write_pcb(tmp_path, _make_pcb(arcs=[arc]))
+        m = build_world_model(path)
+        assert len(m.obstacles) == 1
+        o = m.obstacles[0]
+        assert o.kind == "track"
+        assert o.layers == frozenset({"F.Cu"})
+        assert o.net == "VCC"
+        # The half-circle (0,0)->(2,0) r=1: buffered by width/2, must
+        # cover the mid point and be a solid filled polygon.
+        from shapely.geometry import Point
+
+        assert o.shape.covers(Point(1.0, 1.0))
+        assert o.shape.area > 0.0
+
+    def test_arc_net_filter(self, tmp_path):
+        arc = [
+            _sym("arc"),
+            [_sym("start"), 0.0, 0.0],
+            [_sym("mid"), 1.0, 1.0],
+            [_sym("end"), 2.0, 0.0],
+            [_sym("width"), 0.3],
+            [_sym("layer"), "F.Cu"],
+            [_sym("net"), "VCC"],
+        ]
+        path = _write_pcb(tmp_path, _make_pcb(arcs=[arc]))
+        assert build_world_model(path, net_filter="VCC").obstacles == []
+        assert len(build_world_model(path, net_filter="GND").obstacles) == 1
+
+    def test_degenerate_arc_skipped(self, tmp_path):
+        # Collinear points: no circle, must not crash and yield no obstacle.
+        arc = [
+            _sym("arc"),
+            [_sym("start"), 0.0, 0.0],
+            [_sym("mid"), 1.0, 0.0],
+            [_sym("end"), 2.0, 0.0],
+            [_sym("width"), 0.3],
+            [_sym("layer"), "F.Cu"],
+            [_sym("net"), "VCC"],
+        ]
+        path = _write_pcb(tmp_path, _make_pcb(arcs=[arc]))
+        m = build_world_model(path)
+        assert m.obstacles == []
+
+    def test_missing_width_arc_skipped(self, tmp_path):
+        arc = [
+            _sym("arc"),
+            [_sym("start"), 0.0, 0.0],
+            [_sym("mid"), 1.0, 1.0],
+            [_sym("end"), 2.0, 0.0],
+            [_sym("layer"), "F.Cu"],
+            [_sym("net"), "VCC"],
+        ]
+        path = _write_pcb(tmp_path, _make_pcb(arcs=[arc]))
+        assert build_world_model(path).obstacles == []
+
+
+# ---------------------------------------------------------------------------
 # Via obstacles
 # ---------------------------------------------------------------------------
 
@@ -317,8 +393,109 @@ class TestKeepoutObstacle:
 
 
 # ---------------------------------------------------------------------------
-# Fixture integration
+# Edge.Cuts outer outline
 # ---------------------------------------------------------------------------
+
+
+def _gr_line(x1: float, y1: float, x2: float, y2: float) -> list:
+    return [
+        _sym("gr_line"),
+        [_sym("start"), x1, y1],
+        [_sym("end"), x2, y2],
+        [_sym("layer"), "Edge.Cuts"],
+    ]
+
+
+def _make_outline_pcb(gr: list[list] | None = None) -> list:
+    pcb = [
+        _sym("kicad_pcb"),
+        [_sym("version"), 20260206],
+        [_sym("generator"), "test"],
+    ]
+    for g in gr or []:
+        pcb.append(g)
+    return pcb
+
+
+class TestBoardOutline:
+    def test_rect_outline_is_polygonized(self, tmp_path):
+        # Rectangular board 10x5 from (0,0) drawn as a closed gr_line loop.
+        gr = [
+            _gr_line(0.0, 0.0, 10.0, 0.0),
+            _gr_line(10.0, 0.0, 10.0, 5.0),
+            _gr_line(10.0, 5.0, 0.0, 5.0),
+            _gr_line(0.0, 5.0, 0.0, 0.0),
+        ]
+        path = _write_pcb(tmp_path, _make_outline_pcb(gr))
+        m = build_world_model(path)
+        assert m.board_outline is not None
+        assert m.board_outline.bounds == (0.0, 0.0, 10.0, 5.0)
+        assert abs(m.board_outline.area - 50.0) < 1e-9
+
+    def test_no_edge_cuts_returns_none(self, tmp_path):
+        path = _write_pcb(tmp_path, _make_outline_pcb([]))
+        m = build_world_model(path)
+        assert m.board_outline is None
+
+    def test_open_loop_returns_none(self, tmp_path):
+        # Three sides only: not a closed face, polygonize yields nothing.
+        gr = [
+            _gr_line(0.0, 0.0, 10.0, 0.0),
+            _gr_line(10.0, 0.0, 10.0, 5.0),
+            _gr_line(10.0, 5.0, 0.0, 5.0),
+        ]
+        path = _write_pcb(tmp_path, _make_outline_pcb(gr))
+        m = build_world_model(path)
+        assert m.board_outline is None
+
+    def test_arc_corner_rounds_rect(self, tmp_path):
+        # Rect with a quarter-circle fillet on one corner: outline must
+        # still be a single face and its bounds cover the full rect.
+        import math
+
+        gr = [
+            _gr_line(0.0, 1.0, 0.0, 9.0),
+            _gr_line(0.0, 9.0, 1.0, 10.0),
+            _gr_line(1.0, 10.0, 9.0, 10.0),
+            _gr_line(9.0, 10.0, 10.0, 9.0),
+            _gr_line(10.0, 9.0, 10.0, 1.0),
+            # quarter arc from (10,1) to (9,0) with mid on the circle
+            [
+                _sym("gr_arc"),
+                [_sym("start"), 10.0, 1.0],
+                [_sym("mid"), 10.0 + 1.0 - math.sqrt(2) / 2.0, math.sqrt(2) / 2.0],
+                [_sym("end"), 9.0, 0.0],
+                [_sym("layer"), "Edge.Cuts"],
+            ],
+            _gr_line(9.0, 0.0, 1.0, 0.0),
+            _gr_line(1.0, 0.0, 0.0, 1.0),
+            _gr_line(0.0, 1.0, 0.0, 1.0),  # closure tail
+        ]
+        path = _write_pcb(tmp_path, _make_outline_pcb(gr))
+        m = build_world_model(path)
+        assert m.board_outline is not None
+        bx0, by0, bx1, by1 = m.board_outline.bounds
+        assert bx0 <= 0.05 and by0 <= 0.05 and bx1 >= 9.95 and by1 >= 9.95
+
+    def test_inner_cutout_not_the_outline(self, tmp_path):
+        # 10x5 rect + 2x1 slot inside: outline is the big face, slot is
+        # an opening (interior ring), never the outline itself.
+        gr = [
+            _gr_line(0.0, 0.0, 10.0, 0.0),
+            _gr_line(10.0, 0.0, 10.0, 5.0),
+            _gr_line(10.0, 5.0, 0.0, 5.0),
+            _gr_line(0.0, 5.0, 0.0, 0.0),
+            _gr_line(4.0, 2.0, 6.0, 2.0),
+            _gr_line(6.0, 2.0, 6.0, 3.0),
+            _gr_line(6.0, 3.0, 4.0, 3.0),
+            _gr_line(4.0, 3.0, 4.0, 2.0),
+        ]
+        path = _write_pcb(tmp_path, _make_outline_pcb(gr))
+        m = build_world_model(path)
+        assert m.board_outline is not None
+        # Polygon area excludes the interior ring: 50 - 2 slot = 48.
+        assert abs(m.board_outline.area - 48.0) < 1e-9
+        assert len(m.board_outline.interiors) == 1
 
 
 class TestRoutingFixture:

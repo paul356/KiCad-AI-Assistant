@@ -173,6 +173,18 @@ TOOL_POLICIES: dict[str, ToolPolicy] = {
         mark_dirty=True,
     ),
     # PCB library/index tools
+    "add_footprints_to_pcb": ToolPolicy(
+        kind="file_mutation",
+        path_arg="pcb_path",
+        auto_snapshot=True,
+        mark_dirty=True,
+    ),
+    "remove_footprints_from_pcb": ToolPolicy(
+        kind="file_mutation",
+        path_arg="pcb_path",
+        auto_snapshot=True,
+        mark_dirty=True,
+    ),
     "sync_footprint_index": ToolPolicy(kind="indexing"),
     "get_footprint_sync_status": ToolPolicy(kind="query"),
     "list_footprint_libraries": ToolPolicy(kind="query"),

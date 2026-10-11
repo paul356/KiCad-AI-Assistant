@@ -21,7 +21,10 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+import logging
 from typing import Any
+
+log = logging.getLogger(__name__)
 
 # Event payloads, produced in this order by the background thread:
 #   {"type": "text_start"}                              ordering marker (no-op)
@@ -105,6 +108,13 @@ def apply_stream_event(
         return base
 
     if etype == "tool_call":
+        _res = evt.get("result")
+        log.info(
+            "tool_call_flow stream_append: name=%s result_keys=%s _image_present=%s",
+            evt.get("name", "?"),
+            sorted(_res.keys()) if isinstance(_res, dict) else type(_res).__name__,
+            "_image" in _res if isinstance(_res, dict) else False,
+        )
         entries.append(
             {
                 "type": "tool_call",

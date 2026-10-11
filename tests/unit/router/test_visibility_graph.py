@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from shapely.geometry import Polygon
+import math
+
+from shapely.geometry import LineString, Polygon
 
 from kcaa.router.visibility_graph import (
     RouteNode,
@@ -232,3 +234,118 @@ class TestMultiLayer:
             via_cost_fn=lambda n: 7.5,
         )
         assert abs(g.via_cost_fn(1) - 7.5) < 1e-9
+
+
+class TestBoardLimit:
+    """board_limit confines every graph edge to the Edge.Cuts outline."""
+
+    def test_edge_crossing_limit_is_not_visible(self):
+        # Board outline is a 10x10 square from (0,0); direct line runs
+        # along the x axis inside it.  An obstacle below y=0 is mostly
+        # inside the board, but its detour bends to a vertex at (5,-2),
+        # OUTSIDE the outline; that vertex's edges must be dropped, so
+        # the direct line (clear of obstacles within the board) stays
+        # the shortest path instead of detouring out of the board.
+        board = Polygon([(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)])
+        obs = _rect_obstacle(4.0, -2.5, 6.0, -0.5)  # sits below the board edge
+        g = build_visibility_graph([obs], ["F"], (1.0, 5.0), (9.0, 5.0), board_limit=board)
+        ids = g.shortest_path(0, 1)
+        assert ids is not None
+        # Every segment lies fully inside the board polygon.
+        pts = [(g.nodes[i].x, g.nodes[i].y) for i in ids]
+        for a, b in zip(pts, pts[1:]):
+            assert board.covers(LineString([a, b])), f"edge {a}->{b} leaves the board"
+
+    def test_limit_removes_out_of_board_detour(self):
+        # Center obstacle forces a detour; with a narrow board the only
+        # free lane lies outside the outline, so no connecting path
+        # exists WITHIN the board and shortest_path must return None.
+        board = Polygon([(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)])
+        # Wall from y=0 to y=10 blocks the corridor completely; the top
+        # detour vertex (at y>10) would lie outside the board.
+        wall = Obstacle(
+            shape=Polygon([(4.0, 0.0), (6.0, 0.0), (6.0, 10.0), (4.0, 10.0)]),
+            layers=frozenset({"F"}),
+            net=None,
+            kind="pad",
+        )
+        g_no_limit = build_visibility_graph([wall], ["F"], (1.0, 5.0), (9.0, 5.0))
+        assert g_no_limit.shortest_path(0, 1) is not None  # detours over the top
+        g_limit = build_visibility_graph([wall], ["F"], (1.0, 5.0), (9.0, 5.0), board_limit=board)
+        # The top vertices sit at y=10 (the wall's corners); the
+        # shortest path over them hugs the boundary and is *allowed*
+        # (covers includes the boundary).  So the connection survives.
+        ids = g_limit.shortest_path(0, 1)
+        assert ids is not None
+        pts = [(g_limit.nodes[i].x, g_limit.nodes[i].y) for i in ids]
+        for a, b in zip(pts, pts[1:]):
+            assert board.covers(LineString([a, b]))
+
+    def test_start_outside_limit_yields_no_edges(self):
+        board = Polygon([(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)])
+        # Start at x=-1 is outside the board: every edge from it must
+        # be dropped, so the graph has no start->end connection.
+        g = build_visibility_graph([], ["F"], (-1.0, 5.0), (9.0, 5.0), board_limit=board)
+        assert g.shortest_path(0, 1) is None
+
+
+class TestShortestPath:
+    def test_direct_edge_no_obstacles(self):
+        g = build_visibility_graph([], ["F"], (0.0, 0.0), (10.0, 0.0))
+        ids = g.shortest_path(0, 1)
+        assert ids == [0, 1]
+        assert g.nodes[ids[0]].x == 0.0 and g.nodes[ids[-1]].x == 10.0
+
+    def test_detours_around_obstacle(self):
+        # Block the direct line with a 2x2 obstacle; the shortest path
+        # must bend around it (more than the 2 endpoints) and every hop
+        # must be a real graph edge.
+        obs = _rect_obstacle(4.0, -1.0, 6.0, 1.0)
+        g = build_visibility_graph([obs], ["F"], (0.0, 0.0), (10.0, 0.0))
+        ids = g.shortest_path(0, 1)
+        assert ids is not None and len(ids) >= 3
+        for a, b in zip(ids, ids[1:]):
+            assert b in g.adj[a], f"edge {a}->{b} is not real"
+        # Endpoints preserved.
+        assert g.nodes[ids[0]].x == 0.0 and g.nodes[ids[-1]].x == 10.0
+
+    def test_disconnected_returns_none(self):
+        # A ring (annulus) fully enclosing the end point: start is
+        # outside the outer boundary, end sits in the hole, and the
+        # ring interior separates them.  No visibility edge can cross
+        # the annulus, so start and end live in different components.
+        ring = Obstacle(
+            shape=Polygon(
+                [(5.0, -5.0), (15.0, -5.0), (15.0, 5.0), (5.0, 5.0)],
+                holes=[[(8.0, -2.0), (12.0, -2.0), (12.0, 2.0), (8.0, 2.0)]],
+            ),
+            layers=frozenset({"F"}),
+            net=None,
+            kind="keepout",
+        )
+        g = build_visibility_graph([ring], ["F"], (0.0, 0.0), (10.0, 0.0))
+        # Sanity: the direct segment really crosses the ring interior.
+        assert LineString([(0.0, 0.0), (10.0, 0.0)]).intersects(ring.shape)
+        assert g.shortest_path(0, 1) is None
+
+    def test_shortest_path_prefers_shorter_route(self):
+        # Asymmetric wall: it hangs far below the corridor but barely
+        # above it, so the only short detour is over the top; the
+        # bottom way around is long.  The path must take the top and
+        # stay close to the corridor length.
+        wall = Obstacle(
+            shape=Polygon([(3.0, -6.0), (7.0, -6.0), (7.0, 0.6), (3.0, 0.6)]),
+            layers=frozenset({"F"}),
+            net=None,
+            kind="pad",
+        )
+        g = build_visibility_graph([wall], ["F"], (0.0, 0.0), (10.0, 0.0))
+        ids = g.shortest_path(0, 1)
+        assert ids is not None
+        pts = [(g.nodes[i].x, g.nodes[i].y) for i in ids]
+        total = sum(math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(pts, pts[1:]))
+        # Direct corridor is 10.0; the top detour stays just over it.
+        assert 10.0 < total < 11.0
+        # And the bend sits on the top side (y > 0), not 6 mm down.
+        mids = pts[1:-1]
+        assert mids and all(y >= 0.5 for _x, y in mids)

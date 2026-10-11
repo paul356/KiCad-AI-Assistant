@@ -631,6 +631,45 @@ class ServerConfig:
 
 
 # ---------------------------------------------------------------------------
+# Module-level vision capability
+# ---------------------------------------------------------------------------
+
+
+def model_supports_vision() -> bool:
+    """Whether the MCP server should attach image blocks to tool results.
+
+    The KiCad plugin is the only caller that knows the model: it passes
+    ``KICAD_MCP_SUPPORTS_VISION=1|0`` when spawning the server (see
+    ``server_manager._build_env``).  Absent (standalone MCP clients such
+    as Claude Desktop) defaults to *True* so vision-capable clients keep
+    receiving rendered images; a text-only model must set it to ``0`` to
+    suppress image data at the source instead of paying the render +
+    payload cost client-side stripping.
+    """
+    raw = os.environ.get("KICAD_MCP_SUPPORTS_VISION", "1").strip().lower()
+    return raw not in ("", "0", "false", "no", "off")
+
+
+def render_route_png_enabled() -> bool:
+    """Whether route/evidence PNGs are rendered and returned.
+
+    Independent kill-switch on top of :func:`model_supports_vision`.
+    *Off by default* — the per-route render is the slowest part of a
+    routing call, so ``KICAD_MCP_RENDER_ROUTE_PNG=0`` is the baseline
+    and an explicit ``=1`` opts a vision-capable model into the rendered
+    image block.  A text-only model is always off — the base capability
+    check gates it.  The render toggle never changes the output *fields*
+    (the JSON envelope has no ``route_png`` key either way); it only
+    decides whether an image content block is attached to the tool
+    result.
+    """
+    if not model_supports_vision():
+        return False
+    raw = os.environ.get("KICAD_MCP_RENDER_ROUTE_PNG", "0").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+# ---------------------------------------------------------------------------
 # Module-level singleton instance
 # ---------------------------------------------------------------------------
 
