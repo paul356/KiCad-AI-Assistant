@@ -1158,6 +1158,9 @@ def call_mcp_tool(
         except json.JSONDecodeError as e:
             box["result"] = {"success": False, "error": f"Invalid JSON from MCP server: {e}"}
         except Exception as e:  # e.g. read timeout / disconnect escaping urlopen
+            # Log the failure kind only — never the arguments/payload, which
+            # can carry paths or other local context.
+            log.warning("MCP tool call %s failed: %s: %s", tool_name, type(e).__name__, e)
             box["result"] = {
                 "success": False,
                 "error": f"MCP tool call failed: {type(e).__name__}: {e}",
@@ -2394,7 +2397,9 @@ class LLMClient:
         for tc in tool_calls[from_index + 1 :]:
             name = tc["function"]["name"]
             try:
-                args = json.loads(tc["function"].get("arguments", "{}"))
+                # ``or "{}"`` also covers providers sending "arguments": null
+                # (json.loads(None) would otherwise raise TypeError).
+                args = json.loads(tc["function"].get("arguments") or "{}")
             except json.JSONDecodeError:
                 args = {}
             result: dict[str, Any] = {
@@ -2407,6 +2412,17 @@ class LLMClient:
             tool_results.append(
                 {"role": "tool", "tool_call_id": tc["id"], "content": json.dumps(result)}
             )
+
+    @staticmethod
+    def _failure_carrying_markers(result: dict[str, Any], error: str) -> dict[str, Any]:
+        """Synthesize a failure dict carrying *result*'s interrupted /
+        timed_out marker, so a Stop/deadline that lands during the snapshot
+        phase still aborts run()'s tool loop (issue #176)."""
+        out: dict[str, Any] = {"success": False, "error": error}
+        for flag in ("interrupted", "timed_out"):
+            if result.get(flag):
+                out[flag] = True
+        return out
 
     def _execute_tool_with_policy(
         self,
@@ -2443,6 +2459,16 @@ class LLMClient:
                 save_result = self._call_mcp_tool_guarded("save_document", save_args, cancel_event)
                 self._emit_tool_callback(on_tool_call, "save_document", save_args, save_result)
                 if not self._tool_result_succeeded(save_result):
+                    if save_result.get("interrupted") or save_result.get("timed_out"):
+                        # Stop / deadline landed during the pre-save: abort the
+                        # turn here.  Marching on would give the snapshot and
+                        # the main call fresh deadlines (doubling the timeout
+                        # window), and the run() loop only aborts on the marker.
+                        return self._failure_carrying_markers(
+                            save_result,
+                            f"Failed to save document before {tool_name}: "
+                            f"{save_result.get('error', 'unknown error')}",
+                        )
                     log.warning(
                         "save_document failed before %s: %s",
                         tool_name,
@@ -2458,10 +2484,10 @@ class LLMClient:
                 )
                 if not self._tool_result_succeeded(snapshot_result):
                     error = snapshot_result.get("error", "unknown error")
-                    return {
-                        "success": False,
-                        "error": (f"Failed to save project version before {tool_name}: {error}"),
-                    }
+                    return self._failure_carrying_markers(
+                        snapshot_result,
+                        f"Failed to save project version before {tool_name}: {error}",
+                    )
                 state.snapshotted_paths.add(project_path)
 
         result = self._call_mcp_tool_guarded(tool_name, args, cancel_event)
@@ -2889,7 +2915,7 @@ class LLMClient:
                 for idx, tc in enumerate(tool_calls):
                     name = tc["function"]["name"]
                     try:
-                        args = json.loads(tc["function"].get("arguments", "{}"))
+                        args = json.loads(tc["function"].get("arguments") or "{}")
                     except json.JSONDecodeError:
                         args = {}
 

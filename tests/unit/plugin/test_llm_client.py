@@ -1780,6 +1780,196 @@ class TestMCPToolTimeoutAndInterrupt:
         assert out["success"] is False
         assert type(exc).__name__ in out["error"]
 
+    def test_mixed_batch_timeout_records_all_and_skips_tail(self):
+        """[executed-ok, blocking timeout, tail]: the executed call is
+        recorded normally, the timeout aborts with [Error], and the tail
+        gets a synthesized 'not executed' result — no orphaned id."""
+        client = _make_client()
+        client._mcp_tool_timeout = 0.05
+        client._call_llm = MagicMock(
+            return_value={
+                "finish_reason": "tool_calls",
+                "message": {
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "tc1",
+                            "type": "function",
+                            "function": {"name": "get_board_info", "arguments": "{}"},
+                        },
+                        {
+                            "id": "tc2",
+                            "type": "function",
+                            "function": {"name": "get_board_info", "arguments": "{}"},
+                        },
+                        {
+                            "id": "tc3",
+                            "type": "function",
+                            "function": {"name": "get_board_info", "arguments": "{}"},
+                        },
+                    ],
+                },
+            }
+        )
+
+        def _transport(base_url, tool_name, args, timeout=None):
+            calls[0] += 1
+            if calls[0] == 1:
+                return {"success": True}
+            time.sleep(10)  # second call blocks past the deadline
+            raise AssertionError("blocking call must be abandoned on timeout")
+
+        calls = [0]
+        with patch(
+            "kicad_plugin.llm_client.call_mcp_tool", side_effect=_transport
+        ) as mock_call_tool:
+            result = client.run("do it", context_block="")
+
+        assert "[Error]" in result
+        assert mock_call_tool.call_count == 2  # tc1 ok, tc2 blocked; tc3 never executed
+        tool_results = self._assert_all_tool_call_ids_answered(client)
+        assert len(tool_results) == 3
+        assert json.loads(tool_results[0]["content"])["success"] is True
+        assert json.loads(tool_results[1]["content"])["timed_out"] is True
+        skipped = json.loads(tool_results[2]["content"])
+        assert skipped["success"] is False
+        assert "not executed" in skipped["error"]
+
+    def test_image_result_relayed_when_aborting_call_times_out(self):
+        """An image-bearing tool result that lands before the aborting call
+        is still peeled and relayed (vision enabled), the timeout aborts,
+        and the interrupted tail still gets its synthesized result."""
+        client = _make_client()
+        client._mcp_tool_timeout = 0.05
+        client._settings.llm_supports_vision = True
+        client._call_llm = MagicMock(
+            return_value={
+                "finish_reason": "tool_calls",
+                "message": {
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "tc1",
+                            "type": "function",
+                            "function": {"name": "get_board_info", "arguments": "{}"},
+                        },
+                        {
+                            "id": "tc2",
+                            "type": "function",
+                            "function": {"name": "get_board_info", "arguments": "{}"},
+                        },
+                        {
+                            "id": "tc3",
+                            "type": "function",
+                            "function": {"name": "get_board_info", "arguments": "{}"},
+                        },
+                    ],
+                },
+            }
+        )
+
+        def _transport(base_url, tool_name, args, timeout=None):
+            calls[0] += 1
+            if calls[0] == 1:
+                return {
+                    "success": True,
+                    "text": "board rendered",
+                    "_image": {"media_type": "image/png", "data": "QUJD"},
+                }
+            time.sleep(10)  # second call blocks past the deadline
+            raise AssertionError("blocking call must be abandoned on timeout")
+
+        calls = [0]
+        with patch(
+            "kicad_plugin.llm_client.call_mcp_tool", side_effect=_transport
+        ) as mock_call_tool:
+            result = client.run("do it", context_block="")
+
+        assert "[Error]" in result
+        assert mock_call_tool.call_count == 2
+        tool_results = self._assert_all_tool_call_ids_answered(client)
+        assert len(tool_results) == 3
+        # Image peeled off the executed call's recorded result...
+        first = json.loads(tool_results[0]["content"])
+        assert first["success"] is True
+        assert "_image" not in first
+        # ...and relayed as an image_url user message despite the aborted turn.
+        image_msgs = [m for m in client._history if isinstance(m.get("content"), list)]
+        assert len(image_msgs) == 1
+        assert image_msgs[0]["content"][0]["image_url"]["url"] == "data:image/png;base64,QUJD"
+        assert json.loads(tool_results[1]["content"])["timed_out"] is True
+        assert "not executed" in json.loads(tool_results[2]["content"])["error"]
+
+    def test_arguments_null_tail_does_not_typeerror(self):
+        """A provider sending 'arguments': null (both on the aborting call
+        and on the unexecuted tail) must not raise TypeError from
+        json.loads(None) in either the main loop or the skip helper."""
+        client = _make_client()
+        client._call_llm = MagicMock(
+            return_value={
+                "finish_reason": "tool_calls",
+                "message": {
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "tc1",
+                            "type": "function",
+                            "function": {"name": "get_board_info", "arguments": None},
+                        },
+                        {
+                            "id": "tc2",
+                            "type": "function",
+                            "function": {"name": "get_board_info", "arguments": None},
+                        },
+                    ],
+                },
+            }
+        )
+        cancel = threading.Event()
+        cancel.set()
+
+        with patch("kicad_plugin.llm_client.call_mcp_tool") as mock_call_tool:
+            result = client.run("do it", context_block="", cancel_event=cancel)
+
+        assert "[Interrupted]" in result
+        mock_call_tool.assert_not_called()
+        tool_results = self._assert_all_tool_call_ids_answered(client)
+        assert len(tool_results) == 2
+        for m in tool_results:
+            assert json.loads(m["content"])["interrupted"] is True
+
+    def test_snapshot_phase_timeout_aborts_turn_with_marker(self):
+        """A Stop/deadline landing during the pre-tool snapshot phase must
+        carry the marker: the turn aborts with [Error] and records
+        timed_out, and the main tool never runs with a fresh deadline."""
+        client = _make_client()
+        client._mcp_tool_timeout = 0.05
+        client._call_llm = MagicMock(
+            return_value=self._tool_response(
+                name="pcb_route_pad_to_pad",
+                args={"pcb_path": "/tmp/board.kicad_pcb", "pad1": "A1", "pad2": "B2"},
+            )
+        )
+        client._enabled_tools = {"pcb_route_pad_to_pad"}
+
+        def _block(base_url, tool_name, args, timeout=None):
+            time.sleep(10)
+            raise AssertionError("blocking call must be abandoned on timeout")
+
+        with patch("kicad_plugin.llm_client.call_mcp_tool") as mock_call_tool:
+            mock_call_tool.side_effect = _block  # save_document blocks
+            result = client.run("route A1 to B2", context_block="")
+
+        assert "[Error]" in result
+        assert "did not complete within" in result
+        assert mock_call_tool.call_count == 1  # save_document only; snapshot+tool skipped
+        tool_results = self._assert_all_tool_call_ids_answered(client)
+        assert len(tool_results) == 1
+        recorded = json.loads(tool_results[0]["content"])
+        assert recorded["success"] is False
+        assert recorded["timed_out"] is True
+        client._call_llm.assert_called_once()
+
 
 class TestToolPolicyRegistry:
     def test_registry_covers_plugin_tool_surface(self):
