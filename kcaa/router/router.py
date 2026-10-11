@@ -319,7 +319,11 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
                 f"None of the {len(ranked)} pads named {req.pad_b!r} on "
                 f"{req.ref_b} routed to {req.ref_a}/{req.pad_a}: " + " ".join(failures)
             )
-    data = load_pcb(req.pcb_path)
+        # Single-pad (or first-of-multi, no retry) path: reuse the board
+        # already parsed above instead of loading it a second time.
+        data = data0
+    else:
+        data = load_pcb(req.pcb_path)
 
     # Validate the routing algorithm selector early.
     if req.algorithm not in ("astar", "pns"):
