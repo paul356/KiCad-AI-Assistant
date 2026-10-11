@@ -1012,6 +1012,95 @@ def test_same_named_multi_pad_retries_blocked_first_candidate(tmp_path: Path) ->
     assert len(result.segments) > 0
 
 
+def test_multi_candidate_retry_uses_single_parse_and_shared_tree(tmp_path: Path) -> None:
+    """The multi-pad retry must parse the PCB once, not once per candidate:
+    the nested override call reuses the outer frame's tree.  And the shared
+    tree must not be contaminated by the first candidate's failed attempt —
+    the routing pipeline never mutates the parsed board (engines work on
+    separately-built obstacle grids), so the second candidate sees the same
+    board the first one did."""
+    src = _fixture_pcb()
+    dst = tmp_path / "board.kicad_pcb"
+    board = Path(src).read_text().rstrip()
+    assert board.endswith(")")
+    x1 = (
+        "\n\t# ---- X1: two 'T' pads on F.Cu; first sits in a keepout ----\n"
+        '\t(footprint "user_add:edge-connector"\n'
+        '\t\t(layer "F.Cu")\n'
+        '\t\t(uuid "77777777-0000-0000-0000-000000000007")\n'
+        "\t\t(at 60.0 44.0 0.0)\n"
+        '\t\t(property "Reference" "X1")\n'
+        '\t\t(property "Value" "X1")\n'
+        # First declared pad: covered by the keepout below, unroutable.
+        '\t\t(pad "T" smd rect\n'
+        "\t\t\t(at 2.0 1.0)\n"
+        "\t\t\t(size 1.0 1.0)\n"
+        '\t\t\t(layers "F.Cu" "F.Mask")\n'
+        '\t\t\t(net 1 "VCC")\n'
+        "\t\t)\n"
+        # Second declared pad: clear, trivially routable.
+        '\t\t(pad "T" smd rect\n'
+        "\t\t\t(at 5.0 1.0)\n"
+        "\t\t\t(size 1.0 1.0)\n"
+        '\t\t\t(layers "F.Cu" "F.Mask")\n'
+        '\t\t\t(net 1 "VCC")\n'
+        "\t\t)\n"
+        "\t)\n"
+        # Keepout covering the first 'T' pad (world 62,45) only.
+        "\t(zone\n"
+        '\t\t(zone_name "KO")\n'
+        '\t\t(layer "F.Cu")\n'
+        "\t\t(keepout\n"
+        '\t\t\t(tracks "not_allowed")\n'
+        "\t\t)\n"
+        "\t\t(polygon\n"
+        "\t\t\t(pts\n"
+        "\t\t\t\t(xy 60.0 43.0) (xy 64.0 43.0)\n"
+        "\t\t\t\t(xy 64.0 47.0) (xy 60.0 47.0)\n"
+        "\t\t\t)\n"
+        "\t\t)\n"
+        "\t)\n"
+    )
+    dst.write_text(board[:-1] + x1 + ")\n")
+    shutil.copy(_PRO_FIXTURE, tmp_path / "board.kicad_pro")
+
+    req = RouteRequest(
+        pcb_path=str(dst),
+        ref_a="R1",
+        pad_a="1",
+        ref_b="X1",
+        pad_b="T",
+        net="VCC",
+        layer_hint="F.Cu",
+        width=0.25,
+        algorithm="astar",
+    )
+
+    from unittest.mock import patch
+
+    from kcaa.router import router as _router_mod
+
+    real_load = _router_mod.load_pcb
+
+    # Production path (no data passed): the outer frame parses once; the
+    # nested override retry reuses that tree instead of parsing again.
+    with patch.object(_router_mod, "load_pcb", wraps=real_load) as mock_load:
+        result = auto_route_pair(req)
+    mock_load.assert_called_once()
+    assert result.end == pytest.approx((65.0, 45.0), abs=0.1)
+
+    # Explicitly pre-parsed tree: zero parses, and after the retry attempts
+    # the shared tree is byte-identical to a fresh parse — the first
+    # candidate's failed attempt mutated nothing, so the second candidate
+    # (which wins the route here) saw an uncontaminated board.
+    data = load_pcb(str(dst))
+    with patch.object(_router_mod, "load_pcb", wraps=real_load) as mock_load2:
+        result2 = auto_route_pair(req, data=data)
+    mock_load2.assert_not_called()
+    assert result2.end == pytest.approx((65.0, 45.0), abs=0.1)
+    assert data == load_pcb(str(dst))
+
+
 def test_all_multi_pad_candidates_blocked_fail_with_aggregate(tmp_path: Path) -> None:
     """#177: when EVERY same-named candidate is unroutable, the failure
     must name the candidate pad actually attempted (each one), not the

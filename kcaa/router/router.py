@@ -270,13 +270,23 @@ class RouteResult:
 # ---------------------------------------------------------------------------
 
 
-def auto_route_pair(req: RouteRequest) -> RouteResult:
+def auto_route_pair(req: RouteRequest, data: list | None = None) -> RouteResult:
     """Connect pad ``req.pad_a`` on ``req.ref_a`` to pad ``req.pad_b`` on
     ``req.ref_b`` on the same net ``req.net``.
 
     Layers are auto-resolved from pad types: SMD pads use their fixed
     layer; thru-hole pads use a shared copper layer (preferring
     ``req.layer_hint``).
+
+    *data* is an optional pre-parsed PCB S-expression tree.  When given it
+    is used instead of re-parsing ``req.pcb_path`` (the parser is skipped
+    entirely); when omitted the board is parsed here as before.  Nested
+    multi-candidate retry calls reuse the outer frame's tree, so a
+    multi-pad footprint parses the PCB once, not once per candidate.  The
+    tree is treated as read-only by the whole routing pipeline (all
+    consumers are pure lookups; routing happens on separately-built
+    obstacle grids), so sharing it across the retry candidates cannot
+    contaminate one candidate with another's attempt.
 
     Candidate selection for multi-pad footprints: when ``req.ref_b``
     declares several pads named ``req.pad_b`` (e.g. edge-connector
@@ -298,7 +308,7 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
     # A nested retry call carries the candidate resolved by the outer
     # frame; it must not re-enumerate (that would loop forever).
     if req.pad_b_override is None:
-        data0 = load_pcb(req.pcb_path)
+        data0 = data if data is not None else load_pcb(req.pcb_path)
         start_layer0, end_layer0 = _resolve_layers(data0, req)
         pad_a0 = _find_pad_center(data0, req.ref_a, req.pad_a, start_layer0)
         candidates = _collect_pad_candidates(data0, req.ref_b, req.pad_b, end_layer0)
@@ -313,7 +323,7 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
                     pad_b_override=(center, size, net, layers),
                 )
                 try:
-                    return auto_route_pair(sub)
+                    return auto_route_pair(sub, data=data0)
                 except RouteFailure as exc:
                     # One line per candidate: engine failure texts can
                     # run several sentences, and several candidates all
@@ -331,7 +341,7 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
         # already parsed above instead of loading it a second time.
         data = data0
     else:
-        data = load_pcb(req.pcb_path)
+        data = data if data is not None else load_pcb(req.pcb_path)
 
     # Validate the routing algorithm selector early.
     if req.algorithm not in ("astar", "pns"):
