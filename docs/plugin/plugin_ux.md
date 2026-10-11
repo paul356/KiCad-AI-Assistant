@@ -106,6 +106,8 @@ A per-tool approve/reject mode can be added in a later milestone. In that mode, 
 | Situation | Plugin Behaviour |
 |-----------|-----------------|
 | Tool returns `{"success": false}` | Error shown in tool call indicator; LLM receives the error and can retry or report |
+| MCP tool call exceeds the configured timeout (`mcp_tool_timeout_seconds`) | Explicit timeout error in the tool card; turn ends with a recorded error instead of hanging silently |
+| Stop pressed during a long tool call | Tool card shows "tool call … interrupted by user"; the interruption is recorded in the session |
 | MCP server not responding | Yellow warning banner: "Backend unavailable. [Restart]" |
 | LLM API error | Red notice in chat: "LLM request failed: `<reason>`" |
 | Schematic parse failure | Error shown in tool log; file is not written; backup is not needed |
@@ -120,6 +122,7 @@ Accessed via the ⚙ icon. Exposes:
 - API key input (stored securely in KiCad plugin settings)
 - Model selector
 - Show/hide tool log by default
+- MCP tool-call timeout (seconds) — deadline for long server tools; exceeded calls end the turn with an explicit error
 - Server log path (read-only display)
 
 ---

@@ -107,6 +107,11 @@ class PluginSettings:
     server_port: int = 0  # 0 = auto-select a free port at startup
     server_log_dir: str = ""  # "" = KiCad user config dir
     python_executable: str = ""  # "" = auto-detect (shutil.which("python3"))
+    # Per-call wall-clock deadline for MCP tool calls (seconds). Long server
+    # tools (e.g. PNS routing) may stream for minutes with no data; this
+    # bounds how long the chat turn waits and turns the deadline into an
+    # explicit error entry instead of a silent drop (issue #176).
+    mcp_tool_timeout_seconds: int = 300
 
     # UI preferences
     show_tool_log: bool = True  # show the tool-call log by default

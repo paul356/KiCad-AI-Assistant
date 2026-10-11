@@ -35,6 +35,10 @@ class TestPluginSettingsDefaults:
         s = PluginSettings()
         assert s.show_tool_log is True
 
+    def test_default_mcp_tool_timeout(self):
+        s = PluginSettings()
+        assert s.mcp_tool_timeout_seconds == 300
+
     def test_resolved_log_dir_falls_back_to_config_dir(self, tmp_config_dir):
         s = PluginSettings(config_dir=tmp_config_dir)
         assert s.resolved_log_dir == tmp_config_dir
