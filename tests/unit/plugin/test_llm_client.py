@@ -3449,13 +3449,51 @@ class TestToolLoading:
         assert "NOT enabled" in gts["description"]
         assert "tools" in gts["description"]
 
-    def test_unenabled_real_tool_rejected_without_network(self):
+    def test_unenabled_catalog_tool_executes_via_policy(self):
+        """PR #173 review: enable is not a call gate — unenabled tools run."""
         client = _make_client()
-        client._tool_registry = {"extract_netlist": _fake_tool_def("extract_netlist")}
+        client._tool_registry = {"get_board_info": _fake_tool_def("get_board_info")}
         state = llm_client._ToolExecutionState()
-        result = client._execute_or_reject_tool("extract_netlist", {}, state, None)
+        with patch(
+            "kicad_plugin.llm_client.call_mcp_tool",
+            return_value={"success": True, "info": "board data"},
+        ) as mock_call:
+            result = client._execute_or_reject_tool("get_board_info", {}, state, None)
+        assert result["success"] is True
+        assert mock_call.call_args.args[1] == "get_board_info"
+        assert client._enabled_tools == set()  # ran without ever being enabled
+
+    def test_enabled_tool_still_executes(self):
+        """Enabling stays supported and keeps the same execution path."""
+        client = _make_client()
+        client._tool_registry = {"get_board_info": _fake_tool_def("get_board_info")}
+        client._enabled_tools = {"get_board_info"}
+        state = llm_client._ToolExecutionState()
+        with patch(
+            "kicad_plugin.llm_client.call_mcp_tool",
+            return_value={"success": True, "info": "board data"},
+        ) as mock_call:
+            result = client._execute_or_reject_tool("get_board_info", {}, state, None)
+        assert result["success"] is True
+        assert mock_call.call_args.args[1] == "get_board_info"
+
+    def test_catalogued_tool_without_policy_rejected(self):
+        """Safety: a catalogued tool with no execution policy must not run."""
+        client = _make_client()
+        client._tool_registry = {"mystery_tool": _fake_tool_def("mystery_tool")}
+        state = llm_client._ToolExecutionState()
+        result = client._execute_or_reject_tool("mystery_tool", {}, state, None)
         assert result["success"] is False
-        assert "not enabled" in result["error"]
+        assert "no execution policy" in result["error"]
+
+    def test_unknown_tool_rejected(self):
+        """Hallucinated tool names outside the catalog are refused."""
+        client = _make_client()
+        client._tool_registry = {"get_board_info": _fake_tool_def("get_board_info")}
+        state = llm_client._ToolExecutionState()
+        result = client._execute_or_reject_tool("ghost_tool", {}, state, None)
+        assert result["success"] is False
+        assert "not in the catalog" in result["error"]
 
     def test_meta_tool_executed_locally(self):
         client = _make_client()
@@ -3563,6 +3601,8 @@ class TestSkillPrompt:
             block = llm_client._build_skill_catalog_block()
         assert "list_skills()" in block
         assert "get_skill(name)" in block
+        # Review: the catalog says list_skills lists how-to guides for MCP tools.
+        assert "how-to guides" in block
 
     def test_skill_catalog_block_empty_when_no_skills(self, tmp_path):
         with patch.object(llm_client, "_SKILLS_DIR", tmp_path / "missing"):
@@ -3570,13 +3610,11 @@ class TestSkillPrompt:
 
     def test_tool_loading_prompt_covers_skill_tools(self):
         prompt = llm_client._TOOL_LOADING_PROMPT
-        assert "list_skills" in prompt
-        assert "get_skill" in prompt
-        # Both must be enabled before they are callable, like any other tool.
-        assert "enable them before their calls are accepted" in prompt
-        # The protocol tells the model to load the matching guide at task start.
-        assert "workflow guide" in prompt
-        assert "first enable batch" in prompt
+        assert "list_skills()" in prompt
+        assert "get_skill(name)" in prompt
+        # Review: enable is optional — all catalog tools are callable as-is.
+        assert "callable immediately" in prompt
+        assert "optional" in prompt
 
     def test_catalog_block_maps_task_categories(self, tmp_path):
         skills_dir = tmp_path / "skills"
@@ -3594,11 +3632,15 @@ class TestSkillPrompt:
         prompt = llm_client._TOOL_LOADING_PROMPT
         assert "task's category" in prompt
         assert "get_skill(name)" in prompt
+        # Review: tell the model WHY skills matter — workflows/pitfalls that
+        # bare parameter schemas cannot convey.
+        assert "pitfalls" in prompt
+        assert "get_tool_schema" in prompt
 
     def test_tool_loading_prompt_prefers_schema_preview_over_enable(self):
         prompt = llm_client._TOOL_LOADING_PROMPT
         assert "get_tool_schema(tools=[" in prompt
-        assert "sparingly" in prompt
+        assert "WITHOUT enabling" in prompt
         assert "provider cache" in prompt
 
 

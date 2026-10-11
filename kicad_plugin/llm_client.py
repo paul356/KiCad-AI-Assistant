@@ -23,7 +23,7 @@ import subprocess  # nosec B404 -- controlled subprocess execution, no user inpu
 import time
 from typing import Any
 
-from .tool_registry import get_missing_tool_policies, get_tool_policy
+from .tool_registry import TOOL_POLICIES, get_missing_tool_policies, get_tool_policy
 
 log = logging.getLogger(__name__)
 
@@ -213,10 +213,10 @@ def _load_skill_catalog_entries() -> list[dict[str, str]]:
 # size-stable regardless of skill authoring; list_skills() remains the
 # authoritative, always-current catalog for everything else.
 _SKILL_CATEGORY_GUIDE = (
-    "Skills are organized by task category — enable `list_skills()`/`get_skill(name)` "
-    "and load the matching guide: routing→pcb-routing, "
-    "placement→pcb-placement/schematic-placement, DRC→drc-rules, "
-    "wiring→schematic-wiring, symbol→symbol-edit/symbol-library, "
+    "Skills are organized by task category — `list_skills()` lists the how-to "
+    "guides for MCP tools and `get_skill(name)` loads the one matching your "
+    "task: routing→pcb-routing, placement→pcb-placement/schematic-placement, "
+    "DRC→drc-rules, wiring→schematic-wiring, symbol→symbol-edit/symbol-library, "
     "geometry→pcb-outline/pcb-zone, footprint→pcb-footprint-library, query→pcb-query."
 )
 
@@ -292,24 +292,22 @@ _META_TOOL_NAMES = frozenset({"enable_tool", "disable_tool", "get_tool_schema"})
 
 _TOOL_LOADING_PROMPT = (
     "\n\n## Tool loading protocol\n"
-    "- Only enabled tools are callable; their schemas are included in every request.\n"
-    "- Call `enable_tool(tools=[...])` to activate a batch — schemas appear in the "
-    "next request, in catalog order.\n"
-    "- Plan ahead: enable every tool the task may need in ONE batch up front. Avoid "
-    "per-step toggling — each enable/disable rewrites the tools segment and loses "
-    "the provider cache on it.\n"
-    "- Keep tools enabled for the whole task; call `disable_tool` only once a tool is "
-    "clearly no longer needed.\n"
-    "- Prefer `get_tool_schema(tools=[...])` to preview schemas — it does NOT "
-    "enable, so the tools segment and its provider cache stay untouched. Use "
-    "`enable_tool` sparingly, only for tools you will call repeatedly.\n"
-    "- Calls to tools that are not enabled are rejected — enable them first.\n"
-    "- `list_skills` / `get_skill` are catalog tools like any other: enable them "
-    "before their calls are accepted.\n"
-    "- At task start, include `list_skills` in the first enable batch, then load "
-    "the workflow guide matching the task's category with `get_skill(name)` "
-    "(routing, placement, DRC, …) before executing task tools.\n"
-    "- Do one enable round per task, then execute."
+    "- All catalog tools are callable immediately — `enable_tool` is optional "
+    "and only pins a tool's schema into every request for repeated use.\n"
+    "- `enable_tool(tools=[...])` activates a batch; schemas appear in the next "
+    "request, in catalog order. `disable_tool` drops them when done.\n"
+    "- Prefer `get_tool_schema(tools=[...])` for parameter lookups — it previews "
+    "schemas WITHOUT enabling and never touches the tools segment or provider "
+    "cache; call `enable_tool` only for tools you will use repeatedly.\n"
+    "- Tool calls are rejected only for unknown names (not in the catalog) or "
+    "tools with no execution policy — otherwise they run directly.\n"
+    "- Workflow skills: `list_skills()` lists how-to guides for using MCP tools; "
+    "`get_skill(name)` loads the one matching your task's category (routing, "
+    "placement, DRC, …). Load it BEFORE executing task tools — the guides carry "
+    "the correct workflows and pitfalls (waypoints/vias, spacing, pin choice) "
+    "that bare `get_tool_schema` parameter schemas cannot convey.\n"
+    "- Avoid per-step enable/disable toggling — each one rewrites the tools "
+    "segment and loses the provider cache on it; do one enable round per task."
 )
 
 _META_TOOL_DEFS: list[dict[str, Any]] = [
@@ -361,9 +359,11 @@ _META_TOOL_DEFS: list[dict[str, Any]] = [
         "function": {
             "name": "get_tool_schema",
             "description": (
-                "Preview schemas of one or more tools that are NOT enabled — pass a "
-                "`tools` batch (or legacy single `tool_name`). Enabled tools are skipped; "
-                "their schema is already in context."
+                "Preview parameter schemas of one or more tools — all catalog tools are "
+                "callable regardless; use this mainly for tools that are NOT enabled "
+                "(their schema is absent from your request) so you call them with "
+                "correct arguments. Pass a `tools` batch (or legacy `tool_name`); "
+                "enabled tools are skipped (schema already in context)."
             ),
             "parameters": {
                 "type": "object",
@@ -2546,22 +2546,36 @@ class LLMClient:
         state: _ToolExecutionState,
         on_tool_call: Callable[[str, dict, Any], None] | None,
     ) -> dict[str, Any]:
-        """Dispatch one model tool call: meta tools locally, enabled tools via policy.
+        """Dispatch one model tool call: meta tools locally, real tools via policy.
 
-        Calls to real tools that were never enabled are rejected with a clear
-        instruction instead of executing with guessed arguments — crucial for
-        mutation tools.
+        Enable is not a call gate (PR #173 review): every catalog tool executes
+        through the framework policy path even when never enabled — enabling
+        only pins the schema into every request (cache/perf optimization).
+        Names outside the catalog and tools without an execution policy are
+        still refused, guarding against hallucinated names and unhandled
+        mutation semantics.
         """
         if name in _META_TOOL_NAMES:
             result = self._execute_meta_tool(name, args)
             self._emit_tool_callback(on_tool_call, name, args, result)
             return result
-        if name not in self._enabled_tools:
+        registry = self._tool_registry or {}
+        if registry and name not in registry:
             result = {
                 "success": False,
                 "error": (
-                    f"Tool {name!r} is not enabled — call enable_tool(tools=[{name!r}]) "
-                    "first; its schema will be included in the next request."
+                    f"Unknown tool {name!r} — it is not in the catalog; use exact "
+                    "names from the catalog above."
+                ),
+            }
+            self._emit_tool_callback(on_tool_call, name, args, result)
+            return result
+        if name not in TOOL_POLICIES:
+            result = {
+                "success": False,
+                "error": (
+                    f"Tool {name!r} has no execution policy (server/client mismatch) — "
+                    "refusing to execute it."
                 ),
             }
             self._emit_tool_callback(on_tool_call, name, args, result)
