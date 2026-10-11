@@ -195,13 +195,14 @@ def _decorated_tool_functions() -> dict[str, str]:
     return summary_lines
 
 
-def _collect_plugin_profile_tools() -> set[str]:
-    """Tools the plugin profile actually registers (kcaa/server.py).
+def _collect_profile_tools(register_fn: str) -> set[str]:
+    """Tools one server profile registration function (kcaa/server.py) exposes.
 
-    Mirrors ``_register_plugin_profile``: every ``register_*_tools(mcp)`` call
-    maps through the server's own imports to its tools module; each tool the
-    module exposes becomes part of the plugin surface. A ``tools=(...)``
-    keyword (project tools) restricts the surface to the listed subset.
+    Mirrors the profile's ``register_*_tools(mcp)`` calls: each call maps
+    through the server's own imports to its tools module, and every tool the
+    module exposes becomes part of the profile surface. A ``tools=(...)``
+    keyword (project tools in the plugin profile) restricts the surface to
+    the listed subset. Pure AST — never imports kcaa or builds a server.
     """
     server_path = _REPO_ROOT / "kcaa" / "server.py"
     server = ast.parse(server_path.read_text(encoding="utf-8"))
@@ -218,9 +219,7 @@ def _collect_plugin_profile_tools() -> set[str]:
             reg_to_module[alias.asname or alias.name] = module
 
     profile_fn = next(
-        n
-        for n in ast.walk(server)
-        if isinstance(n, ast.FunctionDef) and n.name == "_register_plugin_profile"
+        n for n in ast.walk(server) if isinstance(n, ast.FunctionDef) and n.name == register_fn
     )
     tools: set[str] = set()
     for stmt in profile_fn.body:
@@ -240,6 +239,16 @@ def _collect_plugin_profile_tools() -> set[str]:
         module_tools = _decorated_tool_functions_in(reg_to_module[reg_name])
         tools |= module_tools
     return tools
+
+
+def _collect_plugin_profile_tools() -> set[str]:
+    """Tools the plugin profile actually registers (kcaa/server.py)."""
+    return _collect_profile_tools("_register_plugin_profile")
+
+
+def _collect_full_profile_tools() -> set[str]:
+    """Tools the full profile actually registers (kcaa/server.py)."""
+    return _collect_profile_tools("_register_full_profile")
 
 
 def _decorated_tool_functions_in(module: str) -> set[str]:
@@ -286,6 +295,27 @@ def test_plugin_profile_tools_have_registry_entries() -> None:
     missing = sorted(plugin_tools - registered)
     assert not missing, (
         f"{len(missing)} plugin-profile tool(s) missing from "
+        f"tool_registry.py TOOL_POLICIES.\n"
+        f"Add entries to the TOOL_POLICIES dict at:\n"
+        f"  {_PLUGIN_REGISTRY}\n\n"
+        f"Missing:\n  " + "\n  ".join(missing)
+    )
+
+
+def test_full_profile_tools_have_registry_entries() -> None:
+    """Every tool the full profile exposes must be in TOOL_POLICIES.
+
+    The full profile (Claude Desktop etc.) registers project management,
+    validation, BOM, pattern and thumbnail tools on top of the plugin
+    surface. Those calls would be refused by the policy gate just the same,
+    so the derived full surface must stay covered by TOOL_POLICIES.
+    """
+    full_tools = _collect_full_profile_tools()
+    registered = _collect_registry_tools()
+
+    missing = sorted(full_tools - registered)
+    assert not missing, (
+        f"{len(missing)} full-profile tool(s) missing from "
         f"tool_registry.py TOOL_POLICIES.\n"
         f"Add entries to the TOOL_POLICIES dict at:\n"
         f"  {_PLUGIN_REGISTRY}\n\n"

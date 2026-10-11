@@ -217,7 +217,8 @@ _SKILL_CATEGORY_GUIDE = (
     "guides for MCP tools and `get_skill(name)` loads the one matching your "
     "task: routing→pcb-routing, placement→pcb-placement/schematic-placement, "
     "DRC→drc-rules, wiring→schematic-wiring, symbol→symbol-edit/symbol-library, "
-    "geometry→pcb-outline/pcb-zone, footprint→pcb-footprint-library, query→pcb-query."
+    "geometry→pcb-outline/pcb-zone, footprint→pcb-footprint-library, "
+    "query→pcb-query, sheet→sheet-management."
 )
 
 
