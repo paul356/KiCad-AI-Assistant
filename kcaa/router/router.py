@@ -205,7 +205,7 @@ class RouteRequest:
     pad_b_override: (
         tuple[
             tuple[float, float],  # pad_b center (world xy)
-            tuple[float, float],  # pad_b size (w, h)
+            tuple[float, float] | None,  # pad_b size (w, h); None = custom pad w/o (size ...)
             str | None,  # pad_b net
             frozenset[str],  # pad_b copper layers
         ]
@@ -305,6 +305,7 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
         if len(candidates) > 1:
             ranked = _rank_pad_candidates(candidates, pad_a0)
             failures: list[str] = []
+            seen_msgs: set[str] = set()
             for cand in ranked:
                 center, size, net, layers = cand
                 sub = replace(
@@ -314,10 +315,17 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
                 try:
                     return auto_route_pair(sub)
                 except RouteFailure as exc:
-                    failures.append(f"pad at ({center[0]:.3f}, {center[1]:.3f}): {exc}")
+                    # One line per candidate: engine failure texts can
+                    # run several sentences, and several candidates all
+                    # failing the same way would blow up the message.
+                    first_line = str(exc).splitlines()[0] if str(exc) else "route failed"
+                    msg = f"pad at ({center[0]:.3f}, {center[1]:.3f}): {first_line}"
+                    if msg not in seen_msgs:
+                        seen_msgs.add(msg)
+                        failures.append(msg)
             raise RouteFailure(
                 f"None of the {len(ranked)} pads named {req.pad_b!r} on "
-                f"{req.ref_b} routed to {req.ref_a}/{req.pad_a}: " + " ".join(failures)
+                f"{req.ref_b} routed to {req.ref_a}/{req.pad_a}: " + " ; ".join(failures)
             )
         # Single-pad (or first-of-multi, no retry) path: reuse the board
         # already parsed above instead of loading it a second time.
@@ -428,11 +436,26 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
             f"{start_layer!r}; cannot route from there."
         )
     pad_b_size_from_board = _find_pad_size(data, req.ref_b, req.pad_b, end_layer)
-    if pad_b_size_override is None and pad_b_size_from_board is None:
-        raise RouteFailure(
-            f"Pad {req.ref_b}/{req.pad_b} has no copper shape on layer "
-            f"{end_layer!r}; cannot route to there."
-        )
+    if req.pad_b_override is not None:
+        if pad_b_size_override is None:
+            # Candidate pinned by retry: it must carry its OWN size.  A
+            # custom pad without a (size ...) node cannot be resolved to
+            # a concrete pad shape -- fail this candidate honestly
+            # instead of silently borrowing a sibling pad's size (which
+            # would pad-AABB-clear the wrong footprint area).
+            raise RouteFailure(
+                f"Pad {req.ref_b}/{req.pad_b} candidate at "
+                f"({pad_b_xy[0]:.3f}, {pad_b_xy[1]:.3f}) declares no pad size; "
+                "cannot route to it."
+            )
+        pad_b_size = pad_b_size_override
+    else:
+        if pad_b_size_from_board is None:
+            raise RouteFailure(
+                f"Pad {req.ref_b}/{req.pad_b} has no copper shape on layer "
+                f"{end_layer!r}; cannot route to there."
+            )
+        pad_b_size = pad_b_size_from_board
 
     # Early net check: pads on different nets must not be routed together.
     # A foreign-net pad is an obstacle -- past the net check the world model
@@ -489,7 +512,8 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
         return local_w, local_h
 
     pad_a_size = _find_pad_size(data, req.ref_a, req.pad_a, start_layer)
-    pad_b_size = pad_b_size_override if pad_b_size_override is not None else pad_b_size_from_board
+    # pad_b_size was resolved by the guard above (override candidate's
+    # own size, or the first same-named pad's when no retry).
     pad_a_world_size = (
         _world_size(pad_a_size[0], pad_a_size[1], _fp_rotation(data, req.ref_a))
         if pad_a_size

@@ -1073,6 +1073,83 @@ def test_all_multi_pad_candidates_blocked_fail_with_aggregate(tmp_path: Path) ->
         auto_route_pair(req)
 
 
+def test_candidate_without_size_node_rejected_not_misresolved(tmp_path: Path) -> None:
+    """A custom pad may carry no ``(size ...)`` node.  In the retry
+    path, such a candidate must be rejected honestly -- not silently
+    borrow a sibling pad's size and pad-AABB-clear the wrong footprint
+    area (the per-candidate size contract)."""
+    src = _fixture_pcb()
+    dst = tmp_path / "board.kicad_pcb"
+    board = Path(src).read_text().rstrip()
+    assert board.endswith(")")
+    x1 = (
+        "\n\t# ---- X1: two 'T' pads, first w/ size, second custom w/o size ----\n"
+        '\t(footprint "user_add:edge-connector"\n'
+        '\t\t(layer "F.Cu")\n'
+        '\t\t(uuid "99999999-0000-0000-0000-000000000009")\n'
+        "\t\t(at 60.0 44.0 0.0)\n"
+        '\t\t(property "Reference" "X1")\n'
+        '\t\t(property "Value" "X1")\n'
+        # First candidate: normal pad, blocked by the keepout below.
+        '\t\t(pad "T" smd rect\n'
+        "\t\t\t(at 2.0 1.0)\n"
+        "\t\t\t(size 1.0 1.0)\n"
+        '\t\t\t(layers "F.Cu" "F.Mask")\n'
+        '\t\t\t(net 1 "VCC")\n'
+        "\t\t)\n"
+        # Second candidate: custom pad WITHOUT (size ...).  Fails the
+        # retry honestly instead of borrowing the first pad's size.
+        '\t\t(pad "T" smd custom\n'
+        "\t\t\t(at 5.0 1.0)\n"
+        '\t\t\t(layers "F.Cu" "F.Mask")\n'
+        '\t\t\t(net 1 "VCC")\n'
+        "\t\t)\n"
+        "\t)\n"
+        # Keepout covering the FIRST pad (world 62,45) only, so the
+        # retry must move on to the custom candidate.
+        "\t(zone\n"
+        '\t\t(zone_name "KO")\n'
+        '\t\t(layer "F.Cu")\n'
+        "\t\t(keepout\n"
+        '\t\t\t(tracks "not_allowed")\n'
+        "\t\t)\n"
+        "\t\t(polygon\n"
+        "\t\t\t(pts\n"
+        "\t\t\t\t(xy 60.0 43.0) (xy 64.0 43.0)\n"
+        "\t\t\t\t(xy 64.0 47.0) (xy 60.0 47.0)\n"
+        "\t\t\t)\n"
+        "\t\t)\n"
+        "\t)\n"
+    )
+    dst.write_text(board[:-1] + x1 + ")\n")
+    shutil.copy(_PRO_FIXTURE, tmp_path / "board.kicad_pro")
+
+    data = load_pcb(str(dst))
+    cands = _collect_pad_candidates(data, "X1", "T", "F.Cu")
+    assert len(cands) == 2
+    assert cands[0][1] == (1.0, 1.0)
+    assert cands[1][0] == pytest.approx((65.0, 45.0))
+    assert cands[1][1] is None  # custom pad carries no size
+
+    req = RouteRequest(
+        pcb_path=str(dst),
+        ref_a="R1",
+        pad_a="1",
+        ref_b="X1",
+        pad_b="T",
+        net="VCC",
+        layer_hint="F.Cu",
+        width=0.25,
+        algorithm="astar",
+    )
+    # Retry: first pad keepout-blocked, second pad size-less.  The
+    # aggregate must name the size gap for the custom candidate -- not a
+    # misleading "no copper shape" (its copper exists on F.Cu) nor a
+    # silently borrowed sibling size.
+    with pytest.raises(RouteFailure, match="declares no pad size"):
+        auto_route_pair(req)
+
+
 def test_multi_layer_via_not_on_same_net_pad(tmp_path: Path) -> None:
     """A via must never land on any same-net pad face (DFM defect:
     solder wicking / annular-ring breakout).  Via-forbidden zones
