@@ -31,6 +31,7 @@ from kcaa.router.router import (
     RouteResult,
     _check_segments_in_board,
     _check_vias_in_board,
+    _collect_pad_candidates,
     _default_clearance,
     _default_track_width,
     _find_footprint,
@@ -927,6 +928,149 @@ def test_duplicate_pad_name_resolves_to_layer_matching_pad(tmp_path: Path) -> No
     assert result.end == pytest.approx((64.0, 45.0), abs=0.1)
     assert result.layers_used == ["F.Cu", "B.Cu"]
     assert len(result.segments) > 0
+
+
+def test_same_named_multi_pad_retries_blocked_first_candidate(tmp_path: Path) -> None:
+    """#177: the first-declared of several same-named pads may sit in a
+    dead zone (here: a keepout covering it) while a later same-named pad
+    is trivially routable.  auto_route_pair must try every candidate on
+    the resolved layer and return a route to the routable one -- not fail
+    forever on the first declared pad."""
+    src = _fixture_pcb()
+    dst = tmp_path / "board.kicad_pcb"
+    board = Path(src).read_text().rstrip()
+    assert board.endswith(")")
+    x1 = (
+        "\n\t# ---- X1: two 'T' pads on F.Cu; first sits in a keepout ----\n"
+        '\t(footprint "user_add:edge-connector"\n'
+        '\t\t(layer "F.Cu")\n'
+        '\t\t(uuid "77777777-0000-0000-0000-000000000007")\n'
+        "\t\t(at 60.0 44.0 0.0)\n"
+        '\t\t(property "Reference" "X1")\n'
+        '\t\t(property "Value" "X1")\n'
+        # First declared pad: covered by the keepout below, unroutable.
+        '\t\t(pad "T" smd rect\n'
+        "\t\t\t(at 2.0 1.0)\n"
+        "\t\t\t(size 1.0 1.0)\n"
+        '\t\t\t(layers "F.Cu" "F.Mask")\n'
+        '\t\t\t(net 1 "VCC")\n'
+        "\t\t)\n"
+        # Second declared pad: clear, trivially routable.
+        '\t\t(pad "T" smd rect\n'
+        "\t\t\t(at 5.0 1.0)\n"
+        "\t\t\t(size 1.0 1.0)\n"
+        '\t\t\t(layers "F.Cu" "F.Mask")\n'
+        '\t\t\t(net 1 "VCC")\n'
+        "\t\t)\n"
+        "\t)\n"
+        # Keepout covering the first 'T' pad (world 62,45) only.
+        "\t(zone\n"
+        '\t\t(zone_name "KO")\n'
+        '\t\t(layer "F.Cu")\n'
+        "\t\t(keepout\n"
+        '\t\t\t(tracks "not_allowed")\n'
+        "\t\t)\n"
+        "\t\t(polygon\n"
+        "\t\t\t(pts\n"
+        "\t\t\t\t(xy 60.0 43.0) (xy 64.0 43.0)\n"
+        "\t\t\t\t(xy 64.0 47.0) (xy 60.0 47.0)\n"
+        "\t\t\t)\n"
+        "\t\t)\n"
+        "\t)\n"
+    )
+    dst.write_text(board[:-1] + x1 + ")\n")
+    shutil.copy(_PRO_FIXTURE, tmp_path / "board.kicad_pro")
+
+    data = load_pcb(str(dst))
+    # Both candidates on F.Cu, declared in order.
+    pads = _collect_pad_candidates(data, "X1", "T", "F.Cu")
+    assert len(pads) == 2
+    assert pads[0][0] == pytest.approx((62.0, 45.0))
+    assert pads[1][0] == pytest.approx((65.0, 45.0))
+    # The keepout really blocks F.Cu routing into the first pad's corner
+    # (world 62,45): the zone polygon covers it.
+    from shapely.geometry import Point, Polygon
+
+    ko = Polygon([(60, 43), (64, 43), (64, 47), (60, 47)])
+    assert ko.covers(Point(62, 45))
+    assert not ko.covers(Point(65, 45))
+
+    req = RouteRequest(
+        pcb_path=str(dst),
+        ref_a="R1",
+        pad_a="1",
+        ref_b="X1",
+        pad_b="T",
+        net="VCC",
+        layer_hint="F.Cu",
+        width=0.25,
+        algorithm="astar",
+    )
+    result = auto_route_pair(req)
+    # The route must land on the second (unblocked) pad at world (65,45).
+    assert result.end == pytest.approx((65.0, 45.0), abs=0.1)
+    assert len(result.segments) > 0
+
+
+def test_all_multi_pad_candidates_blocked_fail_with_aggregate(tmp_path: Path) -> None:
+    """#177: when EVERY same-named candidate is unroutable, the failure
+    must name the candidate pad actually attempted (each one), not the
+    first-declared pad in the abstract."""
+    src = _fixture_pcb()
+    dst = tmp_path / "board.kicad_pcb"
+    board = Path(src).read_text().rstrip()
+    assert board.endswith(")")
+    x1 = (
+        "\n\t# ---- X1: two 'T' pads on F.Cu, both inside the keepout ----\n"
+        '\t(footprint "user_add:edge-connector"\n'
+        '\t\t(layer "F.Cu")\n'
+        '\t\t(uuid "88888888-0000-0000-0000-000000000008")\n'
+        "\t\t(at 60.0 44.0 0.0)\n"
+        '\t\t(property "Reference" "X1")\n'
+        '\t\t(property "Value" "X1")\n'
+        '\t\t(pad "T" smd rect\n'
+        "\t\t\t(at 2.0 1.0)\n"
+        "\t\t\t(size 1.0 1.0)\n"
+        '\t\t\t(layers "F.Cu" "F.Mask")\n'
+        '\t\t\t(net 1 "VCC")\n'
+        "\t\t)\n"
+        '\t\t(pad "T" smd rect\n'
+        "\t\t\t(at 5.0 1.0)\n"
+        "\t\t\t(size 1.0 1.0)\n"
+        '\t\t\t(layers "F.Cu" "F.Mask")\n'
+        '\t\t\t(net 1 "VCC")\n'
+        "\t\t)\n"
+        "\t)\n"
+        "\t(zone\n"
+        '\t\t(zone_name "KO")\n'
+        '\t\t(layer "F.Cu")\n'
+        "\t\t(keepout\n"
+        '\t\t\t(tracks "not_allowed")\n'
+        "\t\t)\n"
+        "\t\t(polygon\n"
+        "\t\t\t(pts\n"
+        "\t\t\t\t(xy 58.0 42.0) (xy 67.0 42.0)\n"
+        "\t\t\t\t(xy 67.0 48.0) (xy 58.0 48.0)\n"
+        "\t\t\t)\n"
+        "\t\t)\n"
+        "\t)\n"
+    )
+    dst.write_text(board[:-1] + x1 + ")\n")
+    shutil.copy(_PRO_FIXTURE, tmp_path / "board.kicad_pro")
+
+    req = RouteRequest(
+        pcb_path=str(dst),
+        ref_a="R1",
+        pad_a="1",
+        ref_b="X1",
+        pad_b="T",
+        net="VCC",
+        layer_hint="F.Cu",
+        width=0.25,
+        algorithm="astar",
+    )
+    with pytest.raises(RouteFailure, match="None of the 2 pads named 'T'"):
+        auto_route_pair(req)
 
 
 def test_multi_layer_via_not_on_same_net_pad(tmp_path: Path) -> None:
