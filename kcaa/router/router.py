@@ -279,14 +279,19 @@ def auto_route_pair(req: RouteRequest, data: list | None = None) -> RouteResult:
     ``req.layer_hint``).
 
     *data* is an optional pre-parsed PCB S-expression tree.  When given it
-    is used instead of re-parsing ``req.pcb_path`` (the parser is skipped
-    entirely); when omitted the board is parsed here as before.  Nested
-    multi-candidate retry calls reuse the outer frame's tree, so a
-    multi-pad footprint parses the PCB once, not once per candidate.  The
-    tree is treated as read-only by the whole routing pipeline (all
-    consumers are pure lookups; routing happens on separately-built
-    obstacle grids), so sharing it across the retry candidates cannot
-    contaminate one candidate with another's attempt.
+    is used instead of the router's own ``load_pcb`` of ``req.pcb_path``;
+    when omitted the board is parsed here as before.  Nested
+    multi-candidate retry calls reuse the outer frame's tree, and the
+    world model is built from that same tree, so a multi-pad footprint
+    costs exactly ONE router-level board parse for the whole retry instead
+    of one per candidate.  Scope of the sharing: only the router's own PCB
+    parse (``load_pcb`` + the world model derived from it) is reused —
+    the .kicad_pro DRC loads (track width / clearance / via size) still
+    re-read their files per candidate, exactly as before.  The tree is
+    read-only across the router: every consumer is a pure lookup and the
+    engines operate on separately-built obstacle grids, so sharing it
+    across the retry candidates cannot contaminate one candidate with
+    another's attempt (the file is never written during routing).
 
     Candidate selection for multi-pad footprints: when ``req.ref_b``
     declares several pads named ``req.pad_b`` (e.g. edge-connector
@@ -495,6 +500,10 @@ def auto_route_pair(req: RouteRequest, data: list | None = None) -> RouteResult:
     model = build_world_model(
         req.pcb_path,
         net_filter=req.net,
+        # Same tree the geometry lookups above use: identical content by
+        # construction (the file is not written during routing) and it
+        # keeps the multi-candidate retry at one board parse total.
+        data=data,
     )
 
     # Shrink obstacles by half the trace width (so the track is centered on

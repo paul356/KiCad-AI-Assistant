@@ -90,6 +90,8 @@ class WorldModel:
 def build_world_model(
     pcb_path: str,
     net_filter: str | None = None,
+    *,
+    data: list | None = None,
 ) -> WorldModel:
     """Build a world model from a .kicad_pcb file.
 
@@ -104,11 +106,16 @@ def build_world_model(
         net_filter: If given, existing tracks/vias/pads on this net are
             *not* treated as obstacles (they belong to the route we're
             building).
+        data: Optional pre-parsed S-expression tree of *pcb_path*.  When
+            given, the internal ``load_pcb`` is skipped — the caller
+            parsed the same file, so the content is identical by
+            construction.  The tree is read-only here (obstacles are
+            freshly built shapely geometries).
 
     Returns:
         A populated :class:`WorldModel`.
     """
-    data = load_pcb(pcb_path)
+    data = data if data is not None else load_pcb(pcb_path)
     model = WorldModel()
     model.board_bbox = _board_bbox(data)
     model.board_outline = _board_outline(data)

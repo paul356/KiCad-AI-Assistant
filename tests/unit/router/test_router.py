@@ -1079,14 +1079,21 @@ def test_multi_candidate_retry_uses_single_parse_and_shared_tree(tmp_path: Path)
     from unittest.mock import patch
 
     from kcaa.router import router as _router_mod
+    from kcaa.router import world_model as _world_mod
 
     real_load = _router_mod.load_pcb
+    real_world_load = _world_mod.load_pcb
 
     # Production path (no data passed): the outer frame parses once; the
-    # nested override retry reuses that tree instead of parsing again.
-    with patch.object(_router_mod, "load_pcb", wraps=real_load) as mock_load:
+    # nested override retry AND the per-candidate world model reuse that
+    # tree instead of parsing again.
+    with (
+        patch.object(_router_mod, "load_pcb", wraps=real_load) as mock_load,
+        patch.object(_world_mod, "load_pcb", wraps=real_world_load) as mock_world_load,
+    ):
         result = auto_route_pair(req)
     mock_load.assert_called_once()
+    mock_world_load.assert_not_called()
     assert result.end == pytest.approx((65.0, 45.0), abs=0.1)
 
     # Explicitly pre-parsed tree: zero parses, and after the retry attempts
@@ -1094,9 +1101,13 @@ def test_multi_candidate_retry_uses_single_parse_and_shared_tree(tmp_path: Path)
     # candidate's failed attempt mutated nothing, so the second candidate
     # (which wins the route here) saw an uncontaminated board.
     data = load_pcb(str(dst))
-    with patch.object(_router_mod, "load_pcb", wraps=real_load) as mock_load2:
+    with (
+        patch.object(_router_mod, "load_pcb", wraps=real_load) as mock_load2,
+        patch.object(_world_mod, "load_pcb", wraps=real_world_load) as mock_world_load2,
+    ):
         result2 = auto_route_pair(req, data=data)
     mock_load2.assert_not_called()
+    mock_world_load2.assert_not_called()
     assert result2.end == pytest.approx((65.0, 45.0), abs=0.1)
     assert data == load_pcb(str(dst))
 
