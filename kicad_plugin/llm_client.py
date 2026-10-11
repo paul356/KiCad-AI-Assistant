@@ -2369,6 +2369,45 @@ class LLMClient:
                     "timed_out": True,
                 }
 
+    def _skip_remaining_tool_calls(
+        self,
+        tool_calls: list[dict[str, Any]],
+        from_index: int,
+        on_tool_call: Callable[[str, dict[str, Any], Any], None] | None,
+        tool_results: list[dict[str, Any]],
+        interrupted: bool,
+    ) -> None:
+        """Record synthetic results for tool calls skipped when a batch aborts.
+
+        When the aborting call (at *from_index*) was interrupted or timed
+        out, the rest of the batch is deliberately NOT executed.  Those
+        calls still need a recorded result entry: the assistant ``tool_calls``
+        message is already in *self._history*, and every ``tool_call_id`` in
+        it must have a matching ``role: "tool"`` result or the next turn's
+        provider request fails the tool_result pairing (issue #176).
+        """
+        reason = (
+            "interrupted by user"
+            if interrupted
+            else "not executed: a previous tool call in the batch timed out"
+        )
+        for tc in tool_calls[from_index + 1 :]:
+            name = tc["function"]["name"]
+            try:
+                args = json.loads(tc["function"].get("arguments", "{}"))
+            except json.JSONDecodeError:
+                args = {}
+            result: dict[str, Any] = {
+                "success": False,
+                "error": f"tool call {name} {reason}",
+            }
+            if interrupted:
+                result["interrupted"] = True
+            self._emit_tool_callback(on_tool_call, name, args, result)
+            tool_results.append(
+                {"role": "tool", "tool_call_id": tc["id"], "content": json.dumps(result)}
+            )
+
     def _execute_tool_with_policy(
         self,
         tool_name: str,
@@ -2847,7 +2886,7 @@ class LLMClient:
                 tool_results = []
                 result_images: list[dict[str, str]] = []
                 aborted_turn = False
-                for tc in tool_calls:
+                for idx, tc in enumerate(tool_calls):
                     name = tc["function"]["name"]
                     try:
                         args = json.loads(tc["function"].get("arguments", "{}"))
@@ -2900,6 +2939,17 @@ class LLMClient:
                             f"[Interrupted] {result['error']}"
                             if result.get("interrupted")
                             else f"[Error] {result['error']}"
+                        )
+                        # The rest of the batch is skipped (not executed):
+                        # every tool_call_id in the saved assistant message
+                        # must still get a recorded result, or the next turn's
+                        # provider request fails the tool_result pairing.
+                        self._skip_remaining_tool_calls(
+                            tool_calls,
+                            idx,
+                            on_tool_call,
+                            tool_results,
+                            interrupted=bool(result.get("interrupted")),
                         )
                         aborted_turn = True
                         break

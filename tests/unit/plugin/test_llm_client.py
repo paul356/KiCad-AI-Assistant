@@ -1,6 +1,7 @@
 """Tests for LLMClient history management (dedup + compaction)."""
 
 import datetime
+import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
 import json
@@ -1679,6 +1680,105 @@ class TestMCPToolTimeoutAndInterrupt:
         recorded = json.loads(tool_msgs[0]["content"])
         assert recorded["success"] is False
         assert "cannot shove track through U11" in recorded["error"]
+
+    def _two_call_response(self):
+        """A batch of two tool calls (client-side our tool ids)."""
+        return {
+            "finish_reason": "tool_calls",
+            "message": {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tc1",
+                        "type": "function",
+                        "function": {"name": "get_board_info", "arguments": "{}"},
+                    },
+                    {
+                        "id": "tc2",
+                        "type": "function",
+                        "function": {"name": "get_schematic_components", "arguments": "{}"},
+                    },
+                ],
+            },
+        }
+
+    def _assert_all_tool_call_ids_answered(self, client):
+        """Every tool_call_id in the saved assistant message must have a
+        matching tool result entry (Anthropic pairing contract)."""
+        assistant_msgs = [
+            m for m in client._history if m["role"] == "assistant" and m.get("tool_calls")
+        ]
+        assert len(assistant_msgs) == 1
+        assistant_ids = {tc["id"] for tc in assistant_msgs[0]["tool_calls"]}
+        tool_results = [m for m in client._history if m["role"] == "tool"]
+        assert assistant_ids == {t["tool_call_id"] for t in tool_results}
+        return tool_results
+
+    def test_interrupted_batch_records_results_for_every_tool_call(self):
+        """Stop mid-batch: the unexecuted calls still get recorded results,
+        so no tool_call_id is left orphaned in llm_history."""
+        client = _make_client()
+        client._call_llm = MagicMock(return_value=self._two_call_response())
+        cancel = threading.Event()
+        cancel.set()
+
+        with patch("kicad_plugin.llm_client.call_mcp_tool") as mock_call_tool:
+            result = client.run("do it", context_block="", cancel_event=cancel)
+
+        assert "[Interrupted]" in result
+        mock_call_tool.assert_not_called()  # nothing in the batch was executed
+        tool_results = self._assert_all_tool_call_ids_answered(client)
+        assert len(tool_results) == 2
+        for m in tool_results:
+            recorded = json.loads(m["content"])
+            assert recorded["success"] is False
+            assert recorded["interrupted"] is True
+        client._call_llm.assert_called_once()
+
+    def test_timeout_batch_records_skip_results_for_remaining_calls(self):
+        """A timeout abort leaves no orphaned tool_call_id either: the calls
+        after the failing one are recorded as not executed, and the
+        remaining tool is never invoked."""
+        client = _make_client()
+        client._mcp_tool_timeout = 0.05
+        client._call_llm = MagicMock(return_value=self._two_call_response())
+
+        def _block(base_url, tool_name, args, timeout=None):
+            time.sleep(10)
+            raise AssertionError("blocking call must be abandoned on timeout")
+
+        with patch("kicad_plugin.llm_client.call_mcp_tool") as mock_call_tool:
+            mock_call_tool.side_effect = _block
+            result = client.run("do it", context_block="")
+
+        assert "[Error]" in result
+        assert mock_call_tool.call_count == 1  # the 2nd call was never executed
+        tool_results = self._assert_all_tool_call_ids_answered(client)
+        assert len(tool_results) == 2
+        timed_out = json.loads(tool_results[0]["content"])
+        assert timed_out["timed_out"] is True
+        skipped = json.loads(tool_results[1]["content"])
+        assert skipped["success"] is False
+        assert "not executed" in skipped["error"]
+        assert "interrupted" not in skipped
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            ConnectionResetError("peer closed"),
+            ssl.SSLError(1, "tls fail"),
+            http.client.RemoteDisconnected("gone"),
+        ],
+    )
+    def test_transport_oserror_returns_failure_not_raise(self, exc):
+        """The worker's blanket exception handler must capture every
+        OSError-family transport failure — ConnectionResetError,
+        ssl.SSLError, RemoteDisconnected — into a structured failure instead
+        of letting it escape the turn (issue #176)."""
+        with patch("urllib.request.urlopen", side_effect=exc):
+            out = llm_client.call_mcp_tool("http://127.0.0.1:9", "pcb_route_pad_to_pad", {})
+        assert out["success"] is False
+        assert type(exc).__name__ in out["error"]
 
 
 class TestToolPolicyRegistry:
