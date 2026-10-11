@@ -3472,7 +3472,7 @@ class TestToolLoading:
 def _write_skill_file(skills_dir, name, description, priority="50"):
     """Write a skill markdown file with front matter into *skills_dir*."""
     (skills_dir / f"{name}.md").write_text(
-        f"---\nname: {name}\npriority: {priority}\ndescription: \"{description}\"\n---\n"
+        f'---\nname: {name}\npriority: {priority}\ndescription: "{description}"\n---\n'
         f"# {name}\nBody of {name}.\n",
         encoding="utf-8",
     )
