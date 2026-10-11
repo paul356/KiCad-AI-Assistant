@@ -3977,6 +3977,26 @@ class TestCallMcpToolImageKey:
         assert out["ok"] == 1
         assert out["_image"] == {"media_type": "image/png", "data": "QUJD"}
 
+    def test_socket_timeout_returns_failure_not_raise(self):
+        """#176: a slow MCP tool call makes ``urlopen`` raise
+        ``TimeoutError`` (a.k.a. socket.timeout).  That used to escape
+        call_mcp_tool -- the LLM turn was killed mid-reply with no tool
+        result recorded.  It must come back as a structured failure so
+        the model sees the timeout and keeps the turn alive."""
+        with patch("urllib.request.urlopen", side_effect=TimeoutError("timed out")):
+            out = llm_client.call_mcp_tool("http://127.0.0.1:9", "pcb_route_pad_to_pad", {})
+        assert out["success"] is False
+        assert "timed out" in out["error"]
+
+    def test_unreachable_server_still_returns_failure(self):
+        with patch(
+            "urllib.request.urlopen",
+            side_effect=urllib.error.URLError("connection refused"),
+        ):
+            out = llm_client.call_mcp_tool("http://127.0.0.1:9", "pcb_route_pad_to_pad", {})
+        assert out["success"] is False
+        assert "unreachable" in out["error"]
+
 
 # Amazon Bedrock provider: OpenAI-compatible endpoint with bearer (Bedrock
 # API key) or AWS SigV4 auth.

@@ -19,6 +19,7 @@ from pathlib import Path
 import platform
 import random
 import secrets
+import socket
 import subprocess  # nosec B404 -- controlled subprocess execution, no user input
 import time
 from typing import Any
@@ -1136,6 +1137,8 @@ def call_mcp_tool(base_url: str, tool_name: str, arguments: dict[str, Any]) -> d
             body = _parse_mcp_response_text(resp.read().decode())
     except urllib.error.URLError as e:
         return {"success": False, "error": f"MCP server unreachable: {e}"}
+    except (TimeoutError, socket.timeout) as e:  # noqa: UP041 -- socket.timeout alias kept for python < 3.10 doc value
+        return {"success": False, "error": f"MCP tool call timed out after 30s: {e}"}
     except json.JSONDecodeError as e:
         return {"success": False, "error": f"Invalid JSON from MCP server: {e}"}
 
