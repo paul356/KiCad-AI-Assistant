@@ -3588,10 +3588,15 @@ class TestSkillPrompt:
         with patch.object(llm_client, "_SKILLS_DIR", skills_dir):
             block = llm_client._build_skill_catalog_block()
         assert "# Skills" in block
-        # Names surface through the category → skill mapping; the per-skill
-        # description list was dropped for the system-prompt token budget.
+        # The per-skill "- name: description" list is part of the prompt again
+        # (2026-10: budget relaxed so the prompt is not over-compressed); the
+        # category guide and the list must surface the skill names together.
         assert "pcb-routing" in block
         assert "drc-rules" in block
+        # Regression guard: at least one full "- name: description" line must
+        # render, so the list cannot silently shrink back to the bare mapping.
+        assert "- pcb-routing: Routing workflow guide" in block
+        assert "- drc-rules: DRC rules reference" in block
 
     def test_catalog_block_points_to_get_skill(self, tmp_path):
         skills_dir = tmp_path / "skills"

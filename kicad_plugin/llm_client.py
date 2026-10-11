@@ -223,10 +223,22 @@ _SKILL_CATEGORY_GUIDE = (
 
 
 def _build_skill_catalog_block() -> str:
-    """Render the one-line skill category guide (empty when no skills exist)."""
-    if not _load_skill_catalog_entries():
+    """Render the category guide plus the full ``- name: description`` list.
+
+    Every line comes from the skill front-matter via ``_load_skill_catalog_entries()``
+    (name falls back to the stem, description omitted when absent), so the block
+    never drifts from the authored skills.
+    """
+    skills = _load_skill_catalog_entries()
+    if not skills:
         return ""
-    return "# Skills\n" + _SKILL_CATEGORY_GUIDE
+    lines = [
+        f"- {skill['name']}: {skill['description']}"
+        if skill["description"]
+        else f"- {skill['name']}"
+        for skill in skills
+    ]
+    return "# Skills\n" + _SKILL_CATEGORY_GUIDE + "\n" + "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------

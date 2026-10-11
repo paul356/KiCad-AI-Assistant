@@ -108,8 +108,12 @@ class TestPromptSizeRegression:
         context = "## Context\nactive_schematic: /tmp/test.kicad_sch"
         prompt = build_system_prompt(context)
         estimated_tokens = len(prompt) // 4
-        assert estimated_tokens <= 950, (
-            f"Prompt is {estimated_tokens} tokens, expected ≤ 950. "
+        # 2026-10: relaxed from 950 → 1400 to restore the per-skill
+        # - name: description list in the catalog block (measured 1190 tokens
+        # with the full list; ~210 headroom for future skill additions).
+        # Deliberate: the previous 950 cap forced over-compressing the prompt.
+        assert estimated_tokens <= 1400, (
+            f"Prompt is {estimated_tokens} tokens, expected ≤ 1400. "
             "System prompt grew too large — check for accidental additions."
         )
 
@@ -122,7 +126,10 @@ class TestPromptSizeRegression:
         estimated_tokens = len(prompt) // 4
         reduction_pct = (1 - estimated_tokens / baseline_tokens) * 100
         # 2026-06: relaxed from 60→58 to accommodate 4 extra skill catalog entries
-        assert reduction_pct >= 58, (
-            f"Token reduction is only {reduction_pct:.1f}%, expected ≥ 58%. "
+        # 2026-10: relaxed from 58→40 because the restored skill description
+        # list (measured 1190 tokens, 48.3% vs the 2300 baseline) intentionally
+        # spends more of the budget — over-compressing the prompt hurt usability.
+        assert reduction_pct >= 40, (
+            f"Token reduction is only {reduction_pct:.1f}%, expected ≥ 40%. "
             f"Current: {estimated_tokens} tokens, baseline: {baseline_tokens} tokens."
         )
