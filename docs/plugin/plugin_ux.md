@@ -122,7 +122,7 @@ Accessed via the ⚙ icon. Exposes:
 - API key input (stored securely in KiCad plugin settings)
 - Model selector
 - Show/hide tool log by default
-- MCP tool-call timeout (seconds) — deadline for long server tools; exceeded calls end the turn with an explicit error
+- MCP tool-call timeout (seconds) — deadline for long server tools; exceeded calls end the turn with an explicit error. Takes effect after the plugin restarts
 - Server log path (read-only display)
 
 ---

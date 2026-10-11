@@ -134,7 +134,7 @@ setup_plugin.bat
 | `llm_model` | 模型名称 | `gpt-4o` |
 | `llm_base_url` | 自定义接口地址（`llm_provider` 为 `custom` 时使用） | *(使用提供商默认值)* |
 | `server_port` | 内置 MCP 服务器固定端口（`0` = 自动选择） | `0` |
-| `mcp_tool_timeout_seconds` | MCP 工具调用的单次超时（秒）；超过后本轮对话以明确的超时错误结束 | `300` |
+| `mcp_tool_timeout_seconds` | MCP 工具调用的单次超时（秒）；超过后本轮对话以明确的超时错误结束。重启插件后生效 | `300` |
 | `show_tool_log` | 默认显示工具调用日志面板 | `true` |
 | `llm_context_tokens` | LLM 上下文窗口总 token 数 | `128000` |
 | `llm_compact_threshold` | 上下文使用率超过此比例时触发压缩 | `0.70` |
