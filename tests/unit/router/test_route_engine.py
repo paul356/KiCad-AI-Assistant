@@ -190,6 +190,48 @@ class TestWalkaroundSolids:
         with pytest.raises(PnsFailure):
             _walkaround_solids([(-8, 0), (8, 0)], node, W, CLR)
 
+    def test_oscillating_interlock_fails_fast(self, monkeypatch):
+        """A 2-cycle interlock (detour around obstacle A re-hits B and
+        vice versa) used to burn all ``MAX_WALKAROUND_ITER`` iterations
+        before failing.  The oscillation guard must detect the repeated
+        path signature and raise immediately instead."""
+        from kcaa.router import route_engine as re_mod
+        from kcaa.router.pns.node import ObstacleNode
+
+        node = ObstacleNode([_pad(0, 0)])
+        # Alternate between two distinct bent polylines -- the walkaround
+        # would flip between them forever (the pad<->track ping-pong).
+        calls = {"n": 0}
+
+        def pingpong(pts, hull, *, cw):
+            calls["n"] += 1
+            if calls["n"] % 2:
+                return [(-8, 0), (0, 0.5), (8, 0)]
+            return [(-8, 0), (0, -0.5), (8, 0)]
+
+        monkeypatch.setattr(re_mod, "walkaround_line", pingpong)
+        frames: list[dict] = []
+        with pytest.raises(PnsFailure, match="oscillating") as ei:
+            _walkaround_solids([(-8, 0), (8, 0)], node, W, CLR, frames=frames)
+        # Guard fires within a handful of iterations -- nowhere near the
+        # 64-iteration budget the old loop could burn.
+        assert calls["n"] < 12
+        assert len(frames) >= 2
+        # The failing polyline is a path we already emitted -- the guard
+        # detected the repeat rather than a generic stuck failure.
+        p = ei.value.last_path
+        sig = tuple(
+            (round((b[0] - a[0]) / 0.01), round((b[1] - a[1]) / 0.01)) for a, b in zip(p, p[1:])
+        )
+        earlier = [
+            tuple(
+                (round((b[0] - a[0]) / 0.01), round((b[1] - a[1]) / 0.01))
+                for a, b in zip(f["path"], f["path"][1:])
+            )
+            for f in frames
+        ]
+        assert sig in earlier
+
 
 class TestPathLen:
     def test_straight(self):

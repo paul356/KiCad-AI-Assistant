@@ -1428,6 +1428,26 @@ def _walkaround_solids(
     half_w = track_width / 2.0
     hull_margin = clearance + CLEARANCE_EPS + half_w
     probe = clearance + half_w
+    # Oscillation guard: two obstacles that interlock (e.g. a pad whose
+    # detour re-hits its own neighboring track) make greedy single-
+    # obstacle walking ping-pong between the same two polylines forever.
+    # Remember every visited path signature (per-segment dx/dy at viz
+    # precision); revisiting one means no progress is possible — fail
+    # fast instead of burning the whole ``max_iter`` budget (and the
+    # caller's wall clock) on a zero-progress 2-cycle.
+    seen_paths: set[tuple[tuple[int, int], ...]] = set()
+    # Snap segments to 0.01 mm — the same precision the viz dump uses,
+    # so a repeated signature is exactly the repeated path the frames
+    # show (a coarse snap could hide real detours; a finer one could
+    # fail to match two identical polylines after float noise).
+    _SNAP = 0.01
+
+    def _sig(p: list[tuple[float, float]]) -> tuple[tuple[int, int], ...]:
+        return tuple(
+            (round((b[0] - a[0]) / _SNAP), round((b[1] - a[1]) / _SNAP)) for a, b in zip(p, p[1:])
+        )
+
+    seen_paths.add(_sig(pts))
     for it in range(max_iter):
         hit = node.nearest(pts, dfence=probe)
         if frames is not None:
@@ -1483,6 +1503,22 @@ def _walkaround_solids(
                 frames=frames,
             )
         pts = best
+        # Oscillation guard: if this iteration's walk produced a polyline
+        # identical (at viz precision) to one we already emitted, the two
+        # obstacles interlock — walking around A detours into B and
+        # walking around B detours back into A.  Greedy single-obstacle
+        # walking can never leave that 2-cycle, so fail now instead of
+        # burning the remaining ``max_iter`` budget on the same two
+        # paths (mirrors the pad↔track ping-pong the viz frames show).
+        if _sig(pts) in seen_paths:
+            raise PnsFailure(
+                "walkaround oscillating between the same polylines "
+                "(two obstacles interlock; no progress possible)",
+                last_path=list(pts),
+                last_hit=f"{obs.kind} {obs.ref or obs.net or ''}".strip(),
+                frames=frames,
+            )
+        seen_paths.add(_sig(pts))
     hit = node.nearest(pts, dfence=probe)
     raise PnsFailure(
         f"walkaround did not converge in {max_iter} iterations",
