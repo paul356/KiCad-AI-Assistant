@@ -3515,6 +3515,23 @@ class TestSkillPrompt:
         assert "workflow guide" in prompt
         assert "first enable batch" in prompt
 
+    def test_catalog_block_maps_task_categories(self, tmp_path):
+        skills_dir = tmp_path / "skills"
+        skills_dir.mkdir()
+        _write_skill_file(skills_dir, "pcb-routing", "Routing workflow guide", "95")
+        with patch.object(llm_client, "_SKILLS_DIR", skills_dir):
+            block = llm_client._build_skill_catalog_block()
+        # The block tells the model skills are organized by task category and
+        # gives the category -> skill mapping for the common cases.
+        assert "organized by task category" in block
+        for needle in ("routing→pcb-routing", "placement→pcb-placement", "DRC→drc-rules"):
+            assert needle in block, f"catalog missing category mapping {needle!r}"
+
+    def test_tool_loading_prompt_loads_guide_per_category(self):
+        prompt = llm_client._TOOL_LOADING_PROMPT
+        assert "task's category" in prompt
+        assert "get_skill(name)" in prompt
+
 
 class TestContextBudgetIncludesTools:
     def test_tools_est_push_over_budget_triggers_compaction(self):

@@ -213,12 +213,19 @@ def _build_skill_catalog_block() -> str:
     skills = _load_skill_catalog_entries()
     if not skills:
         return ""
+    guide = (
+        "Skills are organized by task category — enable `list_skills()` / "
+        "`get_skill(name)` and load the guide matching your task: "
+        "routing→pcb-routing, placement→pcb-placement/schematic-placement, "
+        "DRC→drc-rules, wiring→schematic-wiring, symbol edit→symbol-edit, "
+        "symbol library→symbol-library, geometry→pcb-outline/pcb-zone, "
+        "footprint→pcb-footprint-library, query→pcb-query, sheets→sheet-management."
+    )
     lines = [
         f"{skill['name']}: {skill['description']}" if skill["description"] else skill["name"]
         for skill in skills
     ]
-    lines.append("Get the full workflow guide via `list_skills()` / `get_skill(name)`.")
-    return "# Skills\n" + "\n".join(lines)
+    return "# Skills\n" + guide + "\n" + "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -299,8 +306,8 @@ _TOOL_LOADING_PROMPT = (
     "- `list_skills` / `get_skill` are catalog tools like any other: enable them "
     "before their calls are accepted.\n"
     "- At task start, include `list_skills` in the first enable batch, then load "
-    "the matching workflow guide with `get_skill(name)` (routing, placement, DRC, …) "
-    "before executing task tools.\n"
+    "the workflow guide matching the task's category with `get_skill(name)` "
+    "(routing, placement, DRC, …) before executing task tools.\n"
     "- Do one enable round per task, then execute."
 )
 
