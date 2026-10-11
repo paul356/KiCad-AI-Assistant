@@ -1142,6 +1142,47 @@ _MAX_RENDER_WIDTH_PX = 4 * _MIN_RENDER_WIDTH_PX
 # on tiny figures.  When the pixel floor needs a higher dpi, the figure
 # grows in inches instead (same pixel output, safe dpi).
 _MAX_SAFE_DPI = 4000
+# Reference render for per-image context-cost estimates (issue #170): a
+# default sharpness-floor board render is ~1600x1490 px, ~118 KB, ≈ 1.5-4k
+# vision tokens per image (≈ 39k token equivalents when base64-encoded as
+# text).  Pixel-ratio scaling of that reference yields the reported range.
+_REF_RENDER_WIDTH_PX = 1600
+_REF_RENDER_HEIGHT_PX = 1490
+_REF_VISION_TOKENS_LOW = 1500
+_REF_VISION_TOKENS_HIGH = 4000
+
+
+def _png_size(data: bytes) -> tuple[int, int]:
+    """Pixel size (width, height) of a PNG payload from its IHDR chunk."""
+    return struct.unpack(">II", data[16:24])
+
+
+def estimate_image_token_cost(png_bytes: bytes) -> dict[str, int]:
+    """Estimate the context cost of a rendered PNG for a vision loop.
+
+    Returns an accounting dict (never decodes the image):
+
+    * ``width`` / ``height`` — IHDR pixel size.
+    * ``png_bytes`` — payload size in bytes.
+    * ``base64_text_tokens`` — token equivalent of the base64-encoded
+      image as a text block (4 base64 chars ≈ 1 token; the issue's ~39k
+      figure for the ~118 KB reference render).
+    * ``vision_tokens_low`` / ``vision_tokens_high`` — estimated native
+      vision-token range, scaled by pixel ratio from the issue reference
+      render (1600x1490 px ≈ 1.5-4k vision tokens).
+    """
+    width, height = _png_size(png_bytes)
+    # base64 length = 4 chars per 3 bytes; tokens ≈ chars / 4.
+    base64_text_tokens = math.ceil((math.ceil(len(png_bytes) / 3) * 4) / 4)
+    ratio = (width * height) / (_REF_RENDER_WIDTH_PX * _REF_RENDER_HEIGHT_PX)
+    return {
+        "width": width,
+        "height": height,
+        "png_bytes": len(png_bytes),
+        "base64_text_tokens": base64_text_tokens,
+        "vision_tokens_low": max(1, round(_REF_VISION_TOKENS_LOW * ratio)),
+        "vision_tokens_high": max(1, round(_REF_VISION_TOKENS_HIGH * ratio)),
+    }
 
 
 def _new_board_figure(
@@ -1762,9 +1803,8 @@ def render_board(
     buf = io.BytesIO()
     fig.savefig(buf, format="png", facecolor=_BG_COLOR, dpi=eff_dpi)
 
-    # PNG IHDR: 8-byte signature + 4-byte length + "IHDR" + 4-byte width.
     png_bytes = buf.getvalue()
-    render_width_px = struct.unpack(">I", png_bytes[16:20])[0]
+    render_width_px, _ = _png_size(png_bytes)
     plt.close(fig)
 
     report: dict[str, Any] = {

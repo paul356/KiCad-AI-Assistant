@@ -34,8 +34,13 @@ from kcaa.router.router import (
     connect_with_via,
 )
 from kcaa.router.via_check import ProposedVia, check_vias
+from kcaa.tools.render_board_tools import estimate_image_token_cost
 from kcaa.tools.render_route_state import render_route_attempt
-from kcaa.utils.config import model_supports_vision, render_route_png_enabled
+from kcaa.utils.config import (
+    model_supports_vision,
+    render_route_png_enabled,
+    route_frame_budget,
+)
 from kcaa.utils.pcb_sexp_utils import load_pcb, save_pcb
 
 log = logging.getLogger(__name__)
@@ -1458,16 +1463,30 @@ def _route_payload(payload: dict, png_bytes: bytes | None = None) -> tuple[str, 
     Returns ``(json_text, Image)`` when a render is available AND route
     rendering is explicitly enabled (``KICAD_MCP_RENDER_ROUTE_PNG=1``;
     off by default, and always off for text-only models via
-    ``KICAD_MCP_SUPPORTS_VISION``) — the text block carries the result
-    envelope, the image block carries the rendered route/evidence PNG,
-    exactly the shape the plugin's ``call_mcp_tool`` splits into the
-    result dict + ``_image`` field (same convention as
-    ``export_pcb_layer_image``).  When rendering is disabled or the
-    render failed the result is the bare JSON text (no image block);
-    the payload itself is unchanged in both cases.
+    ``KICAD_MCP_SUPPORTS_VISION``) AND the per-call frame budget allows
+    it (``KICAD_MCP_ROUTE_FRAME_BUDGET`` >= 1; default 1) — the text
+    block carries the result envelope, the image block carries the
+    rendered route/evidence PNG, exactly the shape the plugin's
+    ``call_mcp_tool`` splits into the result dict + ``_image`` field
+    (same convention as ``export_pcb_layer_image``).  When rendering is
+    disabled, the render failed, or the budget is zero the result is the
+    bare JSON text (no image block); the payload itself is unchanged.
+
+    With the image attached the envelope gains a ``render_image``
+    accounting block (width/height/bytes, estimated text and vision
+    token cost, and the in-effect ``frame_budget``) so the vision loop
+    can report — and budget — its context cost.  The estimate is taken
+    from the exact bytes attached, so the text envelope and the image
+    block always agree; the numeric route data stays authoritative in
+    the envelope text.
     """
     text = json.dumps(payload, ensure_ascii=False)
-    if png_bytes and render_route_png_enabled():
+    if png_bytes and render_route_png_enabled() and route_frame_budget() >= 1:
+        estimate = estimate_image_token_cost(png_bytes)
+        estimate["frame_budget"] = route_frame_budget()
+        envelope = dict(payload)
+        envelope["render_image"] = estimate
+        text = json.dumps(envelope, ensure_ascii=False)
         return text, Image(data=png_bytes, format="png")
     return text
 
@@ -1491,7 +1510,11 @@ def _route_failure_evidence(pcb_path: str, req: RouteRequest) -> bytes | None:
         return None
     try:
         _lines, png_bytes, _report = render_route_attempt(
-            pcb_path, anchors=_route_anchors(pcb_path, req) or None
+            pcb_path,
+            anchors=_route_anchors(pcb_path, req) or None,
+            # Evidence frames are loop context cost like the success PNG:
+            # downscale to ~1024 px instead of the 1600 sharpness floor.
+            min_width_px=1024,
         )
         return png_bytes
     except Exception:  # noqa: BLE001 - evidence must not mask the failure

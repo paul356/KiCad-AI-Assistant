@@ -32,6 +32,7 @@ from kcaa.tools.render_board_tools import (  # noqa: E402
     _draw_board_layers,
     _draw_shape,
     _parse_shape,
+    estimate_image_token_cost,
     parse_board,
     render_board,
 )
@@ -526,6 +527,40 @@ class TestRegionRendering:
     def test_invalid_region_raises(self, tmp_path, bad):
         with pytest.raises(ValueError, match="region"):
             render_board(_sparse_board_path(tmp_path), region=bad)
+
+
+
+
+
+class TestEstimateImageTokenCost:
+    """Per-image context accounting for renders attached to tool results."""
+
+    def _png(self, tmp_path):
+        _, png, _ = render_board(_sparse_board_path(tmp_path))
+        return png
+
+    def test_reports_geometry_and_bytes(self, tmp_path):
+        png = self._png(tmp_path)
+        cost = estimate_image_token_cost(png)
+        width, height = _png_size(png)
+        assert cost["width"] == width
+        assert cost["height"] == height
+        assert cost["png_bytes"] == len(png)
+        assert width >= 1590  # default render: 1600 sharpness floor
+
+    def test_text_token_equivalent(self, tmp_path):
+        png = self._png(tmp_path)
+        cost = estimate_image_token_cost(png)
+        # base64: 4 chars per 3 bytes; each 4-char group ≈ 1 token.
+        assert cost["base64_text_tokens"] == math.ceil(len(png) / 3)
+
+    def test_vision_range_scales_with_pixels(self, tmp_path):
+        png = self._png(tmp_path)
+        cost = estimate_image_token_cost(png)
+        ratio = (cost["width"] * cost["height"]) / (1600 * 1490)
+        assert cost["vision_tokens_low"] == max(1, round(1500 * ratio))
+        assert cost["vision_tokens_high"] == max(1, round(4000 * ratio))
+        assert cost["vision_tokens_low"] <= cost["vision_tokens_high"]
 
 
 class TestMinRenderWidth:
