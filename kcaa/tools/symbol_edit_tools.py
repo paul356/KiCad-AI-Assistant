@@ -28,6 +28,7 @@ from kcaa.utils.skip_compat import safe_schematic
 from kcaa.utils.sym_lib_table_utils import (
     get_user_sym_lib_table_path,
     register_library_in_table,
+    register_or_update_library_in_table,
     unregister_library_in_table,
 )
 from kcaa.utils.symbol_extractor import extract_lib_symbol_raw
@@ -426,6 +427,261 @@ def _do_add_symbol_to_library(
         "skipped": skipped,
         "skipped_count": len(skipped),
         "indexed": indexed,
+    }
+
+
+def _do_export_symbols_to_3rdparty(
+    schematic_path: str,
+    project_dir: str | None = None,
+) -> dict[str, Any]:
+    """Materialize every symbol the schematic uses into project-owned
+    ``3rdparty`` symbol libraries, registered in the project sym-lib-table.
+
+    Read-only with respect to the schematic: the source file is never
+    modified, backed up, or moved.  Each distinct ``lib_id`` the schematic
+    references that has an inline definition in its ``lib_symbols`` cache
+    is copied — raw, exactly like ``add_symbols_to_library`` — into
+    ``<project_dir>/3rdparty/``, grouped by library prefix (one
+    ``<prefix>.kicad_sym`` per prefix, nickname sanitized).  Every written
+    prefix is then registered in the project's ``sym-lib-table`` with a
+    ``${KIPRJMOD}/3rdparty/...`` URI so the schematic's existing lib_ids
+    keep resolving (the project entry wins over global — "pin the
+    version").  The library files are re-indexed afterwards.
+
+    Symbols with **no** inline body are never copied from an existing
+    library (copying a resolution from a library file would change
+    behavior): those already resolvable through a registered library are
+    reported ``skipped``, the rest ``failed``.  A prefix whose 3rdparty
+    copy is missing any used symbol is NOT re-pointed at the copy
+    (``register_reason`` "not_pinned: ...") so its other symbols keep
+    resolving through the libraries they resolve through today.
+
+    Idempotent: re-running skips symbols already present in the 3rdparty
+    libraries (never duplicated) and leaves a matching table entry alone.
+
+    :param schematic_path: Absolute path to the source .kicad_sch file.
+    :param project_dir: Project directory owning the ``3rdparty`` output;
+        when omitted it is derived from the schematic's matching
+        ``.kicad_pro`` marker.
+    :returns: dict with ``project_dir``, ``libraries`` (per-prefix dicts
+        mirroring ``add_symbols_to_library`` with ``library``,
+        ``library_path``, ``table_path``, ``registered``,
+        ``register_reason``, ``exported``, ``exported_count``, ``skipped``,
+        ``skipped_count``, ``failed``, ``failed_count``, ``indexed``,
+        ``written``), ``library_count``, plus flat ``exported`` list and
+        ``exported_count`` / ``skipped_count`` / ``failed_count`` totals;
+        ``error`` on failure.
+    """
+    # Resolve the target project directory: explicit param wins, else
+    # derive it from the schematic's .kicad_pro marker.
+    if project_dir:
+        if not os.path.isdir(project_dir):
+            return {"error": f"Project directory not found: {project_dir}"}
+        project_real = os.path.realpath(project_dir)
+    else:
+        derived = _find_project_dir(schematic_path)
+        if derived is None:
+            return {
+                "error": (
+                    "Could not determine the KiCad project directory for the "
+                    "schematic (no matching .kicad_pro/.kicad_sch pair found); "
+                    "pass project_dir explicitly."
+                )
+            }
+        project_real = os.path.realpath(str(derived))
+
+    try:
+        sch = safe_schematic(schematic_path)
+    except Exception as exc:
+        return {"error": f"Failed to open schematic: {exc}"}
+
+    # Distinct lib_ids actually referenced by the schematic.
+    used: list[str] = []
+    seen: set[str] = set()
+    try:
+        for sym in sch.symbol:
+            try:
+                lib_id = sym.lib_id.value
+            except AttributeError:
+                continue
+            if lib_id and lib_id not in seen:
+                seen.add(lib_id)
+                used.append(lib_id)
+    except AttributeError:
+        pass
+    if not used:
+        return {
+            "error": (
+                f"Schematic contains no symbol instances; nothing to export: {schematic_path}"
+            )
+        }
+
+    cached = dict(_extract_cached_raw_entries(sch))
+
+    # For lib_ids WITHOUT an inline body, decide skipped (already resolvable
+    # through a registered library — copying a resolution from an existing
+    # library would change behavior and is out of scope) vs failed (cannot
+    # be materialized).  Live-scan only the libraries those ids reference.
+    referenced = {lib_id.partition(":")[0] for lib_id in used if ":" in lib_id}
+    available: dict[str, set[str]] = {}
+    if referenced:
+        libs = build_effective_symbol_library_list(project_path=schematic_path)
+        lib_lookup = {lib.get("nickname", ""): lib.get("uri", "") for lib in libs}
+        for prefix in referenced:
+            uri = lib_lookup.get(prefix, "")
+            if uri:
+                available[prefix] = _parse_available_symbols(uri)
+
+    failed: list[dict[str, str]] = []
+    skipped: list[dict[str, str]] = []
+    groups: dict[str, list[tuple[str, str, list]]] = {}  # nickname -> entries
+    group_prefix: dict[str, str] = {}  # nickname -> raw prefix (reporting)
+    order: list[str] = []
+
+    for lib_id in used:
+        library, _, name = lib_id.partition(":")
+        raw = cached.get(lib_id)
+        if raw is None:
+            if library and name in available.get(library, set()):
+                skipped.append(
+                    {
+                        "symbol": lib_id,
+                        "reason": (
+                            "already_resolvable (no inline body; not copied from the "
+                            "existing library)"
+                        ),
+                    }
+                )
+            else:
+                failed.append({"symbol": lib_id, "reason": "no_inline_body"})
+            continue
+        if not library or not name:
+            failed.append({"symbol": lib_id, "reason": "malformed_lib_id"})
+            continue
+        if not is_safe_symbol_name(name):
+            failed.append({"symbol": lib_id, "reason": "unsafe_symbol_name"})
+            continue
+        nickname = sanitize_lib_nickname(library)
+        if not nickname:
+            failed.append({"symbol": lib_id, "reason": "invalid_library_prefix"})
+            continue
+        if nickname not in groups:
+            groups[nickname] = []
+            group_prefix[nickname] = library
+            order.append(nickname)
+        groups[nickname].append((lib_id, name, raw))
+
+    thirdparty_dir = os.path.join(project_real, "3rdparty")
+    os.makedirs(thirdparty_dir, exist_ok=True)
+    table_path = os.path.join(project_real, "sym-lib-table")
+
+    libraries: dict[str, Any] = {}
+    for nickname in order:
+        prefix = group_prefix[nickname]
+        entries = groups[nickname]
+        lib_file = os.path.join(thirdparty_dir, f"{nickname}.kicad_sym")
+        present = set(list_library_symbols(lib_file)) if os.path.isfile(lib_file) else set()
+
+        exported: list[str] = []
+        group_skipped: list[dict[str, str]] = []
+        group_failed: list[dict[str, str]] = []
+        to_append: list[tuple[str, str, list]] = []
+        for lib_id, name, raw in entries:
+            if name in present:
+                group_skipped.append({"symbol": lib_id, "reason": "already_in_library"})
+                skipped.append({"symbol": lib_id, "reason": "already_in_library"})
+                continue
+            to_append.append((lib_id, name, raw))
+
+        written = False
+        if to_append:
+            if not os.path.isfile(lib_file):
+                try:
+                    create_empty_library_file(lib_file)
+                except Exception as exc:
+                    log.error("create_empty_library_file failed: %s", exc, exc_info=True)
+                    for lib_id, _name, _raw in to_append:
+                        reason = f"create_failed: {exc}"
+                        group_failed.append({"symbol": lib_id, "reason": reason})
+                        failed.append({"symbol": lib_id, "reason": reason})
+                    to_append = []
+            for lib_id, name, raw in to_append:
+                try:
+                    append_symbol_to_library(lib_file, raw, name)
+                    exported.append(f"{nickname}:{name}")
+                    written = True
+                except SymbolNameExistsError:
+                    group_skipped.append({"symbol": lib_id, "reason": "already_in_library"})
+                    skipped.append({"symbol": lib_id, "reason": "already_in_library"})
+                except Exception as exc:
+                    log.error(
+                        "append_symbol_to_library failed for %s: %s", lib_id, exc, exc_info=True
+                    )
+                    reason = f"append_failed: {exc}"
+                    group_failed.append({"symbol": lib_id, "reason": reason})
+                    failed.append({"symbol": lib_id, "reason": reason})
+
+        file_exists = os.path.isfile(lib_file)
+        registered = False
+        register_reason: str | None = None
+        indexed = -1
+        if file_exists:
+            # Pin the prefix only when the copy holds EVERY used symbol of
+            # that prefix; otherwise re-pointing would orphan the missing
+            # ones (e.g. a bodyless-but-resolvable symbol that was skipped).
+            copy_names = set(list_library_symbols(lib_file))
+            missing = sorted(
+                lid
+                for lid in used
+                if lid.partition(":")[0] == prefix and lid.partition(":")[2] not in copy_names
+            )
+            if missing:
+                register_reason = "not_pinned: " + ", ".join(missing)
+            else:
+                reg = register_or_update_library_in_table(
+                    table_path,
+                    nickname,
+                    f"${{KIPRJMOD}}/3rdparty/{nickname}.kicad_sym",
+                    description=f"Created by KiCad MCP symbol export ({nickname})",
+                )
+                if reg.get("updated"):
+                    registered, register_reason = True, "updated"
+                elif reg.get("registered"):
+                    registered, register_reason = True, "registered"
+                elif reg.get("reason") == "already_registered":
+                    registered, register_reason = True, "already_registered"
+                else:
+                    register_reason = reg.get("reason") or "register_failed"
+            indexed = _index_symbol_library(
+                nickname, lib_file, project_dir=project_real, project=project_real
+            )
+
+        libraries[nickname] = {
+            "library": nickname,
+            "library_path": lib_file,
+            "table_path": table_path,
+            "registered": registered,
+            "register_reason": register_reason,
+            "exported": exported,
+            "exported_count": len(exported),
+            "skipped": group_skipped,
+            "skipped_count": len(group_skipped),
+            "failed": group_failed,
+            "failed_count": len(group_failed),
+            "indexed": indexed,
+            "written": written,
+        }
+
+    return {
+        "project_dir": project_real,
+        "libraries": libraries,
+        "library_count": len(libraries),
+        "exported": [e for lib in libraries.values() for e in lib["exported"]],
+        "exported_count": sum(lib["exported_count"] for lib in libraries.values()),
+        "skipped": skipped,
+        "skipped_count": len(skipped),
+        "failed": failed,
+        "failed_count": len(failed),
     }
 
 
@@ -2607,6 +2863,56 @@ def register_symbol_edit_tools(mcp: FastMCP) -> None:
             schematic_path=schematic_path,
             symbols=symbols,
             library=library,
+        )
+
+    @mcp.tool()
+    async def export_symbols_to_3rdparty(
+        schematic_path: str,
+        project_dir: str | None = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Export schematic-used symbols into project-owned 3rdparty libraries.
+
+        Materializes every symbol the schematic actually uses that has an
+        inline definition in its ``lib_symbols`` cache into project-owned
+        ``.kicad_sym`` libraries under ``<project_dir>/3rdparty/`` — one
+        library per lib_id prefix — and registers each prefix in the
+        project's ``sym-lib-table`` with a ``${KIPRJMOD}/3rdparty/...`` URI.
+        The project entry wins over global tables, so the schematic's
+        existing lib_ids keep resolving and the used symbol versions are
+        "pinned" for the project.  The schematic file is never modified.
+
+        Symbols without an inline body are not copied from existing
+        libraries: those already resolvable via a registered library are
+        reported ``skipped``, the rest ``failed``.  A prefix whose copy is
+        missing any used symbol is not re-pointed at the copy, so its other
+        symbols keep resolving as before.  Idempotent: re-running never
+        duplicates symbols (already-present ones are skipped) and leaves a
+        matching table entry alone.
+
+        Args:
+            schematic_path: Absolute path to the source .kicad_sch whose
+                used symbols are materialized (read-only).
+            project_dir: Project directory that owns the ``3rdparty``
+                output.  When omitted it is derived from a matching
+                ``.kicad_pro`` file next to the schematic (or its parent
+                dir); pass it explicitly when no project marker exists.
+
+        Returns:
+            dict with ``project_dir`` and ``libraries`` — one entry per
+            written prefix mirroring ``add_symbols_to_library`` (library,
+            library_path, table_path, registered, register_reason,
+            exported, exported_count, skipped, skipped_count, failed,
+            failed_count, indexed, written) — plus ``library_count`` and
+            flat ``exported`` / ``exported_count`` / ``skipped_count`` /
+            ``failed_count`` totals.  Returns ``{"error": ...}`` when the
+            schematic cannot be opened, the project dir cannot be
+            determined, or the schematic has no symbol instances.
+        """
+        return await asyncio.to_thread(
+            _do_export_symbols_to_3rdparty,
+            schematic_path=schematic_path,
+            project_dir=project_dir,
         )
 
     @mcp.tool()
