@@ -1708,6 +1708,200 @@ def test_plated_thru_hole_pad_still_pad_obstacle(tmp_path: Path) -> None:
     assert pads[0].net == "VCC"
 
 
+def test_npth_oval_drill_becomes_capsule_obstacle(tmp_path: Path) -> None:
+    """An oval NPTH drill ``(drill oval 2.5 2)`` must become a drill-kind
+    capsule obstacle whose bbox matches the KiCad slot extent: total
+    outer length 2.5 along the longer axis, width 2, centred on the pad's
+    world position."""
+    from kcaa.router.world_model import build_world_model
+
+    pcb = _load_pcb_text(
+        _fp_with_pad(
+            '\t(pad "" np_thru_hole oval\n'
+            "\t\t(at 0 0)\n"
+            "\t\t(size 3.2 2.5)\n"
+            "\t\t(drill oval 2.5 2)\n"
+            '\t\t(layers "*.Cu" "*.Mask")\n'
+            "\t)\n"
+        ),
+        tmp_path,
+    )
+    world = build_world_model(str(pcb), net_filter=None)
+    drills = [o for o in world.obstacles if o.kind == "drill"]
+    pads = [o for o in world.obstacles if o.kind == "pad"]
+    assert len(drills) == 1, f"expected one drill obstacle, got {len(drills)}"
+    assert pads == [], "NPTH must not produce a pad-kind obstacle"
+    d = drills[0]
+    assert d.layers == frozenset({"F.Cu", "B.Cu", "In1.Cu", "In2.Cu", "In3.Cu", "In4.Cu"})
+    assert d.net is None
+    # Major axis along X (2.5 > 2): outer extent 2.5 x 2 at (100, 100).
+    minx, miny, maxx, maxy = d.shape.bounds
+    assert (minx, miny) == pytest.approx((98.75, 99.0), abs=2e-2)
+    assert (maxx, maxy) == pytest.approx((101.25, 101.0), abs=2e-2)
+    assert (d.shape.centroid.x, d.shape.centroid.y) == pytest.approx((100.0, 100.0))
+    # Capsule area: pi * (2/2)^2 + length 0.5 * width 2.
+    assert d.shape.area == pytest.approx(3.14159 + 1.0, rel=0.02)
+
+
+def test_npth_oval_drill_rotated_with_pad_own_rotation(tmp_path: Path) -> None:
+    """The capsule axis follows the pad's own absolute rotation: an
+    ``(at 5 0 90)`` slot is 2.5 long along Y, 2 wide along X."""
+    from kcaa.router.world_model import build_world_model
+
+    pcb = _load_pcb_text(
+        _fp_with_pad(
+            '\t(pad "" np_thru_hole oval\n'
+            "\t\t(at 5 0 90)\n"
+            "\t\t(size 3.2 2.5)\n"
+            "\t\t(drill oval 2.5 2)\n"
+            '\t\t(layers "*.Cu" "*.Mask")\n'
+            "\t)\n"
+        ),
+        tmp_path,
+    )
+    world = build_world_model(str(pcb), net_filter=None)
+    drills = [o for o in world.obstacles if o.kind == "drill"]
+    assert len(drills) == 1
+    d = drills[0]
+    # Centre: fp origin (100,100) + local (5,0) at fp_rot 0.
+    assert (d.shape.centroid.x, d.shape.centroid.y) == pytest.approx((105.0, 100.0))
+    minx, miny, maxx, maxy = d.shape.bounds
+    assert (maxx - minx) == pytest.approx(2.0, abs=2e-2)
+    assert (maxy - miny) == pytest.approx(2.5, abs=2e-2)
+
+
+def test_npth_oval_drill_in_rotated_footprint(tmp_path: Path) -> None:
+    """KiCad 10 stores pad rotation as absolute board-space degrees: the
+    slot keeps its own 90° angle while its CENTRE follows the footprint
+    rotation (local (5,0) at fp_rot 90 lands at (100,95)).  Adding the
+    footprint rotation to the pad angle would double-count it."""
+    from kcaa.router.world_model import build_world_model
+
+    pcb = _load_pcb_text(
+        _fp_with_pad(
+            '\t(pad "" np_thru_hole oval\n'
+            "\t\t(at 5 0 90)\n"
+            "\t\t(size 3.2 2.5)\n"
+            "\t\t(drill oval 2.5 2)\n"
+            '\t\t(layers "*.Cu" "*.Mask")\n'
+            "\t)\n",
+            ref="X1",
+        ).replace("(at 100 100)", "(at 100 100 90)"),
+        tmp_path,
+    )
+    world = build_world_model(str(pcb), net_filter=None)
+    drills = [o for o in world.obstacles if o.kind == "drill"]
+    assert len(drills) == 1
+    d = drills[0]
+    assert (d.shape.centroid.x, d.shape.centroid.y) == pytest.approx((100.0, 95.0))
+    minx, miny, maxx, maxy = d.shape.bounds
+    assert (maxx - minx) == pytest.approx(2.0, abs=2e-2)
+    assert (maxy - miny) == pytest.approx(2.5, abs=2e-2)
+
+
+def test_npth_oval_drill_no_own_rotation_stays_axis_aligned(tmp_path: Path) -> None:
+    """A pad ``at`` without a rotation value is axis-aligned in board
+    space (KiCad 10: missing angle = absolute 0, "regardless of the
+    parent footprint orientation"), not rotated with the footprint."""
+    from kcaa.router.world_model import build_world_model
+
+    pcb = _load_pcb_text(
+        _fp_with_pad(
+            '\t(pad "" np_thru_hole oval\n'
+            "\t\t(at 5 0)\n"
+            "\t\t(size 3.2 2.5)\n"
+            "\t\t(drill oval 2.5 2)\n"
+            '\t\t(layers "*.Cu" "*.Mask")\n'
+            "\t)\n",
+            ref="X1",
+        ).replace("(at 100 100)", "(at 100 100 90)"),
+        tmp_path,
+    )
+    world = build_world_model(str(pcb), net_filter=None)
+    drills = [o for o in world.obstacles if o.kind == "drill"]
+    assert len(drills) == 1
+    d = drills[0]
+    assert (d.shape.centroid.x, d.shape.centroid.y) == pytest.approx((100.0, 95.0))
+    minx, miny, maxx, maxy = d.shape.bounds
+    assert (maxx - minx) == pytest.approx(2.5, abs=2e-2)
+    assert (maxy - miny) == pytest.approx(2.0, abs=2e-2)
+
+
+def test_npth_oval_drill_with_equal_width_length_is_circle(tmp_path: Path) -> None:
+    """``(drill oval w w)`` degenerates to a circle of radius w/2."""
+    from kcaa.router.world_model import build_world_model
+
+    pcb = _load_pcb_text(
+        _fp_with_pad(
+            '\t(pad "" np_thru_hole oval\n'
+            "\t\t(at 0 0)\n"
+            "\t\t(size 3.2 3.2)\n"
+            "\t\t(drill oval 2.5 2.5)\n"
+            '\t\t(layers "*.Cu" "*.Mask")\n'
+            "\t)\n"
+        ),
+        tmp_path,
+    )
+    world = build_world_model(str(pcb), net_filter=None)
+    drills = [o for o in world.obstacles if o.kind == "drill"]
+    assert len(drills) == 1
+    d = drills[0]
+    assert d.shape.area == pytest.approx(3.14159 * 1.25**2, rel=0.02)
+    minx, miny, maxx, maxy = d.shape.bounds
+    assert (maxx - minx) == pytest.approx(2.5, abs=2e-2)
+    assert (maxy - miny) == pytest.approx(2.5, abs=2e-2)
+
+
+def test_npth_oval_drill_malformed_skipped(tmp_path: Path) -> None:
+    """Missing/too-short/non-numeric oval drill nodes are skipped without
+    crashing — no drill obstacle, no pad obstacle."""
+    from kcaa.router.world_model import build_world_model
+
+    for drill_line in ["(drill oval)", "(drill oval 2.5)", "(drill oval 2.5 foo)"]:
+        pcb = _load_pcb_text(
+            _fp_with_pad(
+                '\t(pad "" np_thru_hole oval\n'
+                "\t\t(at 0 0)\n"
+                "\t\t(size 3.2 2.5)\n"
+                f"\t\t{drill_line}\n"
+                '\t\t(layers "*.Cu" "*.Mask")\n'
+                "\t)\n"
+            ),
+            tmp_path,
+        )
+        world = build_world_model(str(pcb), net_filter=None)
+        assert world.obstacles == [], f"{drill_line!r} must be skipped, got {world.obstacles}"
+
+
+def test_smd_pad_own_rotation_rotates_copper_rectangle(tmp_path: Path) -> None:
+    """A pad's own absolute rotation must rotate the rectangular copper
+    obstacle: size 2x1 at ``(at 0 0 90)`` yields a 1-wide x 2-tall world
+    rectangle (KiCad 10: pad at-angle applied directly, fp adds nothing)."""
+    from kcaa.router.world_model import build_world_model
+
+    pcb = _load_pcb_text(
+        _fp_with_pad(
+            '\t(pad "1" smd rect\n'
+            "\t\t(at 0 0 90)\n"
+            "\t\t(size 2 1)\n"
+            '\t\t(layers "F.Cu" "F.Paste" "F.Mask")\n'
+            "\t)\n"
+        ),
+        tmp_path,
+    )
+    world = build_world_model(str(pcb), net_filter=None)
+    pads = [o for o in world.obstacles if o.kind == "pad"]
+    assert len(pads) == 1
+    p = pads[0]
+    assert p.net is None
+    assert p.layers == frozenset({"F.Cu"})
+    minx, miny, maxx, maxy = p.shape.bounds
+    assert (maxx - minx) == pytest.approx(1.0, abs=2e-6)
+    assert (maxy - miny) == pytest.approx(2.0, abs=2e-6)
+    assert p.shape.area == pytest.approx(2.0, abs=2e-6)
+    assert (p.shape.centroid.x, p.shape.centroid.y) == pytest.approx((100.0, 100.0))
+
+
 # ---------------------------------------------------------------------------
 # PNS engine adapter (corner_mode / arcs / shoved tracks)
 # ---------------------------------------------------------------------------
