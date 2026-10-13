@@ -12,7 +12,7 @@ section; resolved items are moved to the ``## Fixed`` section at the bottom.
 **Status:** open (discovered while fixing the NPTH index bug) — tracked in
 https://github.com/paul356/KiCad-AI-Assistant/issues/182
 
-### Symptom
+#### Symptom
 
 `_npth_obstacle` only reads a single drill value:
 
@@ -25,7 +25,7 @@ is the `Symbol('oval')` tag, so `float()` raises `TypeError` and the
 function returns `None`. Oval/slot NPTH holes are silently dropped from the
 world model.
 
-### Evidence
+#### Evidence
 
 Real KiCad file `/home/user1/pcb/ninja-keyboard/.history/ninja-keyboard.kicad_pcb`:
 
@@ -38,7 +38,7 @@ Multiple `(drill oval w l)` nodes exist in the file history. The router
 would generate no obstacle for any of them. (The current
 `ninja-keyboard.kicad_pcb` uses 309 circular NPTH drills only.)
 
-### Semantics (resolved 2026-09-07, primary source KiCad master `pcbnew/pad.cpp`)
+#### Semantics (resolved 2026-09-07, primary source KiCad master `pcbnew/pad.cpp`)
 
 - **`l` is the total outer slot length** (including both end caps), not the
   center-to-center distance. `PAD::GetEffectiveDrillShape` builds the hole as
@@ -67,7 +67,7 @@ would generate no obstacle for any of them. (The current
   first unify this rotation pipeline — a rotated pad's copper obstacle
   itself is currently drawn at the wrong angle.
 
-### Fix (proposed)
+#### Fix (proposed)
 
 Shape the obstacle as a stadium/capsule: `LineString` between the two end
 circle centers, buffered by `width / 2` (shapely:
@@ -75,7 +75,7 @@ circle centers, buffered by `width / 2` (shapely:
 `d` depends on the resolved `l` semantics. Rotate by the pad's own `at`
 rotation plus the footprint rotation (verify which KiCad actually applies).
 
-### Validation
+#### Validation
 
 - Unit: NPTH oval pad node -> obstacle shape whose bounding box matches
   the resolved slot extent.
@@ -90,7 +90,7 @@ rotation plus the footprint rotation (verify which KiCad actually applies).
 (0.2.8); 3rdparty export write side open — tracked in
 https://github.com/paul356/KiCad-AI-Assistant/issues/184
 
-### Current state
+#### Current state
 
 - Project-table read is implemented: `kcaa/utils/symbol_index_reader.py`
   `get_libraries` parses a project-local `sym-lib-table` next to the
@@ -104,7 +104,7 @@ https://github.com/paul356/KiCad-AI-Assistant/issues/184
 - Placed symbols with inline `(lib_symbols ...)` bodies live only inside
   the `.kicad_sch`; they cannot be shared or versioned as libraries.
 
-### Aim
+#### Aim
 
 - A project-scoped symbol table (KiCad supports a project-local
   `sym-lib-table`) layered over the global one, so a project pins the
@@ -113,7 +113,7 @@ https://github.com/paul356/KiCad-AI-Assistant/issues/184
   under the project's `3rdparty/` directory and register them in the
   project symbol table.
 
-### Fix (proposed)
+#### Fix (proposed)
 
 1. `symbol_index_reader.py`: try the project `sym-lib-table` first, fall
    back to the global table — implemented (see Current state); surfacing
@@ -124,7 +124,7 @@ https://github.com/paul356/KiCad-AI-Assistant/issues/184
    keep the schematic's `lib_id` prefix resolvable — open, tracked in
    https://github.com/paul356/KiCad-AI-Assistant/issues/184.
 
-### Validation
+#### Validation
 
 - Unit: `tests/unit/utils/test_symbol_index_reader.py` extended — project
   table takes precedence, indirection still works.
@@ -138,7 +138,7 @@ https://github.com/paul356/KiCad-AI-Assistant/issues/184
 **Status:** partially implemented — raster feedback shipped (0.2.8);
 automated review/steering loop future
 
-### Current state
+#### Current state
 
 - Routing is one-shot/batch: the plugin auto-route exports the board to
   DSN, runs FreeRouting headless and reimports the SES
@@ -158,7 +158,7 @@ automated review/steering loop future
   `self._settings.llm_supports_vision` is enabled — the LLM can call
   those tools and get the PNG fed back into the multimodal turn.
 
-### Aim
+#### Aim
 
 - Close the loop with LLM vision: render the board state → the LLM
   inspects it (unrouted ratlines, congestion, DRC markers, crossing or
@@ -166,7 +166,7 @@ automated review/steering loop future
   (nets/regions to rework and in what order) → the router/FreeRouting
   applies it → re-render; repeat until the LLM judges the board clean.
 
-### Fix (proposed)
+#### Fix (proposed)
 
 1. **Raster into the loop** — implemented (see Current state): the
    review step can call `export_pcb_layer_image` /
@@ -187,7 +187,7 @@ automated review/steering loop future
    exhaustion report the last review (remaining issues) to the user
    instead of looping forever or inventing a degraded path.
 
-### Open questions
+#### Open questions
 
 - Which configured backends are actually vision-capable remains
   settings-driven (`llm_supports_vision`), and the automated
@@ -196,7 +196,7 @@ automated review/steering loop future
   stay with `run_drc_via_ipc`; the summary is a heuristic gate, not a
   validation path.
 
-### Validation
+#### Validation
 
 - Unit: review-output schema parsing and the review → net-order/reroute
   steering mapping over a fixture board with a known congested corridor.
@@ -212,7 +212,7 @@ automated review/steering loop future
 `docs/plans/router-issues.md`, partially mitigated) — tracked in
 https://github.com/paul356/KiCad-AI-Assistant/issues/183
 
-### Current state
+#### Current state
 
 - `_find_pad_size` (`kcaa/router/router.py:1439`) returns the pad `size`
   node as stored — footprint-local `(w, h)`, unrotated.
@@ -226,7 +226,7 @@ https://github.com/paul356/KiCad-AI-Assistant/issues/183
   (`kcaa/router/world_model.py:404-407`), so routing validity is not
   affected — only the pad exit/entry geometry.
 
-### Impact
+#### Impact
 
 For footprints rotated at arbitrary angles (e.g. 30°, 45°), the real
 copper is a rotated rectangle inscribed in the AABB; the axis-aligned
@@ -235,7 +235,7 @@ non-optimal direction.  No electrical/DRC error, but suboptimal exits on
 rotated footprints — will also matter once oval-slot pads (see the NPTH
 entry above) add rotated obstacles to the model.
 
-### Fix (proposed)
+#### Fix (proposed)
 
 Rotate the pad rectangle by `fp_rot` (reusing the exact transformation in
 `_pad_obstacle`) and compute the exit point as the intersection of the
@@ -243,7 +243,7 @@ outward path direction with the rotated rect edge, instead of the AABB
 edge; keep the axis-aligned wire only for pads that are actually
 axis-aligned in world space.
 
-### Validation
+#### Validation
 
 - Unit: pad with `fp_rot = 45°` — exit point lies on the rotated rectangle
   edge (inside-copper check), and the current AABB behaviour fails the
