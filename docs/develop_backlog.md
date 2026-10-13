@@ -2,14 +2,17 @@
 
 Known issues discovered during review but not fixed in the originating PR.
 Each entry records the evidence, the impact, and the proposed fix so the work
-can be picked up independently.  Resolved items are moved to the
-``## Resolved`` section at the bottom.
+can be picked up independently.  Open items live under the ``## Open Issues``
+section; resolved items are moved to the ``## Fixed`` section at the bottom.
 
-## NPTH oval/slot drill shapes are not supported
+## Open Issues
 
-**Status:** open (discovered while fixing the NPTH index bug)
+### NPTH oval/slot drill shapes are not supported
 
-### Symptom
+**Status:** open (discovered while fixing the NPTH index bug) — tracked in
+https://github.com/paul356/KiCad-AI-Assistant/issues/182
+
+#### Symptom
 
 `_npth_obstacle` only reads a single drill value:
 
@@ -22,7 +25,7 @@ is the `Symbol('oval')` tag, so `float()` raises `TypeError` and the
 function returns `None`. Oval/slot NPTH holes are silently dropped from the
 world model.
 
-### Evidence
+#### Evidence
 
 Real KiCad file `/home/user1/pcb/ninja-keyboard/.history/ninja-keyboard.kicad_pcb`:
 
@@ -35,7 +38,7 @@ Multiple `(drill oval w l)` nodes exist in the file history. The router
 would generate no obstacle for any of them. (The current
 `ninja-keyboard.kicad_pcb` uses 309 circular NPTH drills only.)
 
-### Semantics (resolved 2026-09-07, primary source KiCad master `pcbnew/pad.cpp`)
+#### Semantics (resolved 2026-09-07, primary source KiCad master `pcbnew/pad.cpp`)
 
 - **`l` is the total outer slot length** (including both end caps), not the
   center-to-center distance. `PAD::GetEffectiveDrillShape` builds the hole as
@@ -64,7 +67,7 @@ would generate no obstacle for any of them. (The current
   first unify this rotation pipeline — a rotated pad's copper obstacle
   itself is currently drawn at the wrong angle.
 
-### Fix (proposed)
+#### Fix (proposed)
 
 Shape the obstacle as a stadium/capsule: `LineString` between the two end
 circle centers, buffered by `width / 2` (shapely:
@@ -72,7 +75,7 @@ circle centers, buffered by `width / 2` (shapely:
 `d` depends on the resolved `l` semantics. Rotate by the pad's own `at`
 rotation plus the footprint rotation (verify which KiCad actually applies).
 
-### Validation
+#### Validation
 
 - Unit: NPTH oval pad node -> obstacle shape whose bounding box matches
   the resolved slot extent.
@@ -81,23 +84,27 @@ rotation plus the footprint rotation (verify which KiCad actually applies).
 
 ---
 
-## Project-level symbol table with 3rdparty symbol export
+### Project-level symbol table with 3rdparty symbol export
 
-**Status:** open (proposed)
+**Status:** part implemented — project `sym-lib-table` read shipped
+(0.2.8); 3rdparty export write side open — tracked in
+https://github.com/paul356/KiCad-AI-Assistant/issues/184
 
-### Current state
+#### Current state
 
-- Symbol lookup reads only the **global** `sym-lib-table`
-  (`kcaa/utils/symbol_index_reader.py`, path from
-  `config.ServerConfig.symbol_table_file` → `~/.config/kicad/<ver>/
-  sym-lib-table`; `Table`-type entries are followed recursively). There
-  is no project-level table next to the `.kicad_pro`.
+- Project-table read is implemented: `kcaa/utils/symbol_index_reader.py`
+  `get_libraries` parses a project-local `sym-lib-table` next to the
+  `.kicad_pro` **first** (project entries win) and falls back to the
+  global table (`config.ServerConfig.symbol_table_file` →
+  `~/.config/kicad/<ver>/sym-lib-table`; `Table`-type entries are
+  followed recursively). The `(lib_symbols ...)` inline placement is
+  unchanged.
 - `KICAD_3RD_PARTY` (third-party library dir, `config.py`) is only a
   default path constant — nothing writes symbols into it.
 - Placed symbols with inline `(lib_symbols ...)` bodies live only inside
   the `.kicad_sch`; they cannot be shared or versioned as libraries.
 
-### Aim
+#### Aim
 
 - A project-scoped symbol table (KiCad supports a project-local
   `sym-lib-table`) layered over the global one, so a project pins the
@@ -106,16 +113,18 @@ rotation plus the footprint rotation (verify which KiCad actually applies).
   under the project's `3rdparty/` directory and register them in the
   project symbol table.
 
-### Fix (proposed)
+#### Fix (proposed)
 
 1. `symbol_index_reader.py`: try the project `sym-lib-table` first, fall
-   back to the global table; surface which table each library came from.
+   back to the global table — implemented (see Current state); surfacing
+   which table each library came from is a possible follow-up.
 2. New `export_symbols_to_3rdparty` tool: collect distinct `lib_id`+symbol
    bodies used by the schematic(s), write one `.kicad_sym` per library
    into `3rdparty/`, generate/update the project `sym-lib-table`, and
-   keep the schematic's `lib_id` prefix resolvable.
+   keep the schematic's `lib_id` prefix resolvable — open, tracked in
+   https://github.com/paul356/KiCad-AI-Assistant/issues/184.
 
-### Validation
+#### Validation
 
 - Unit: `tests/unit/utils/test_symbol_index_reader.py` extended — project
   table takes precedence, indirection still works.
@@ -124,82 +133,12 @@ rotation plus the footprint rotation (verify which KiCad actually applies).
 
 ---
 
-## Batch support for set_*/list_* tools
+### LLM vision-guided routing loop
 
-**Status:** implemented (2026-09-07) — set/get tools batched;
-`list_footprints` gains only a `ref_prefix` row filter
-(`set_symbol_property`, `set_footprint_position`, `set_footprint_property`),
-partial-apply per-ref results; get reads (`get_footprint`,
-`get_footprint_bbox`, `list_symbol_properties`) take
-`references: list[str]`.  `list_nets`/`list_vias`/`list_tracks` unchanged
-(bbox/fields projections dropped 2026-09-07 as too complex for the
-payoff). `set_net_class_rules` stays single-class; `set_design_rules` /
-`set_board_outline_rect` non-per-object, out of scope.
+**Status:** partially implemented — raster feedback shipped (0.2.8);
+automated review/steering loop future
 
-### Current state
-
-- The set tools operate on one object per call:
-  `set_symbol_property` (`symbol_edit_tools.py`), `set_footprint_position`
-  (`pcb_placement_tools.py`), `set_footprint_property`
-  (`pcb_edit_tools.py`), `set_net_class_rules` (`drc_tools.py`) — each
-  takes a single target reference/class.  (`set_design_rules` takes a
-  project-level dict, `set_board_outline_rect` a single rectangle — both
-  non-per-object, out of scope.)
-- The list tools have limited filtering: `list_footprints`, `list_nets`
-  (only `classify`) return whole tables; `list_tracks`/`list_vias`
-  (`net`, tracks also `layer`) and `list_symbol_libraries`
-  (`limit`/`offset`) are partial — "all nets of one net class" or
-  "footprints near X" still requires fetching the full JSON.  Batch
-  precedent already exists: `assign_nets_to_class`, `align_footprints`
-  take `references: list[str]`.
-
-### Impact
-
-Multi-object edits (e.g. set the same property on 10 symbols, move 5
-footprints to a row) need N tool calls; large boards make list responses
-huge, inflating token use in long sessions (same pressure as the
-tool-collapse issue above).
-
-### Fix (design agreed 2026-09-07 — batch-first, no backward-compat
-retained per maintainer decision)
-
-1. Set tools switch to `items: list[dict]`: each self-contained entry
-   `{"reference", ...spec}` replaces the single `reference` + shared
-   property/value params on `set_symbol_property` (`property_name` +
-   `property_value`), `set_footprint_position` (`x`/`y`/`rotation`, each
-   optional but at least one required per entry), `set_footprint_property`
-   (`property_name` + `value`).  Targets may carry different values in one
-   call.  One parse + one save per call, single `.bak`.  Per-target results
-   in `results[]`; partial-apply semantics (successful targets saved,
-   failures keep their per-ref error — per `docs/plugin/mutation_safety.md`).
-   Duplicate references or unknown item fields are rejected.
-   `set_net_class_rules` stays single-class.
-2. List tools stay lean (decided 2026-09-07 — filters/fields projection
-   judged too complex for the payoff): only `list_footprints` gains an
-   optional `ref_prefix` row filter (default `None` = all footprints).
-   `list_nets` (`classify`) and `list_vias` (`net`) are unchanged.
-3. Per-object read tools batch too: `references: list[str]` replaces the
-   single `reference` on `get_footprint`, `get_footprint_bbox`
-   (`pcb_query_tools.py`) and `list_symbol_properties`
-   (`symbol_edit_tools.py`).  One file load, per-reference `results[]`
-   entries; missing references keep per-ref errors; duplicates/empty
-   entries/unknown designators rejected up front.
-
-### Validation
-
-- Unit: batch `set_symbol_property` over refs incl. one missing → one
-  save, successes applied, per-ref errors reported; duplicate refs
-  rejected; `list_footprints` `ref_prefix` row filter.
-- Manual: script a 20-object edit against a board, compare tool calls
-  and response size vs. today.
-
----
-
-## LLM vision-guided routing loop
-
-**Status:** open (proposed)
-
-### Current state
+#### Current state
 
 - Routing is one-shot/batch: the plugin auto-route exports the board to
   DSN, runs FreeRouting headless and reimports the SES
@@ -208,13 +147,18 @@ retained per maintainer decision)
   visibility graph → A*), but nothing inspects the routed result or
   steers the router mid-flight. A congested corridor, a via farm or a
   detour net is only caught afterwards by DRC (`run_drc_via_ipc`).
-- `generate_pcb_thumbnail(project_path)` (`kcaa/tools/export_tools.py`)
-  already renders the board to a PNG via kicad-cli, and `llm_client.py`
-  already carries multimodal turns (`_build_user_content` emits
-  OpenAI-style `image_url` blocks; converted for Anthropic/Ollama) — but
-  nothing feeds a tool-rendered raster back to the model.
+- Raster feedback is implemented: `export_pcb_layer_image`
+  (`kcaa/tools/render_board_tools.py`) returns an Image MCP content
+  block for vision-capable models (`return report_text,
+  Image(data=png, format="png")` when vision is enabled), and
+  `generate_pcb_thumbnail` (`kcaa/tools/export_tools.py`) renders the
+  board the same way. The tool loop in `kicad_plugin/llm_client.py`
+  `run()` (~lines 2900–2990) gathers `result_images` from tool results
+  and appends an images-carrying user message when
+  `self._settings.llm_supports_vision` is enabled — the LLM can call
+  those tools and get the PNG fed back into the multimodal turn.
 
-### Aim
+#### Aim
 
 - Close the loop with LLM vision: render the board state → the LLM
   inspects it (unrouted ratlines, congestion, DRC markers, crossing or
@@ -222,13 +166,14 @@ retained per maintainer decision)
   (nets/regions to rework and in what order) → the router/FreeRouting
   applies it → re-render; repeat until the LLM judges the board clean.
 
-### Fix (proposed)
+#### Fix (proposed)
 
-1. **Raster into the loop**: let the review step call
-   `generate_pcb_thumbnail` (plus optional zoomed crop on a region from
-   the track bbox) and surface the returned PNG as an `images` entry on
-   the next turn, reusing the existing multimodal plumbing instead of
-   adding a parallel image path.
+1. **Raster into the loop** — implemented (see Current state): the
+   review step can call `export_pcb_layer_image` /
+   `generate_pcb_thumbnail` and the returned PNG is fed back as an
+   `images` entry on the next turn via the existing multimodal plumbing
+   (no parallel image path was needed); an optional zoomed crop on a
+   region from the track bbox is a possible follow-up.
 2. **Vision review**: a schema-constrained prompt over the raster
    returning e.g. `{ok: bool, rework: [{net, area, reason}],
    congestion: [area]}`; parse strictly, reject free-form
@@ -242,16 +187,16 @@ retained per maintainer decision)
    exhaustion report the last review (remaining issues) to the user
    instead of looping forever or inventing a degraded path.
 
-### Open questions
+#### Open questions
 
-- Which configured backends are actually vision-capable, and does the
-  MCP tool-result → `images` wiring exist anywhere yet (thumbnail PNG
-  today returns a path/text, not a base64 content block)?
+- Which configured backends are actually vision-capable remains
+  settings-driven (`llm_supports_vision`), and the automated
+  review/steering loop (fix items 2–4) is not implemented yet.
 - Visual review is a *hint*, not geometry truth — final acceptance must
   stay with `run_drc_via_ipc`; the summary is a heuristic gate, not a
   validation path.
 
-### Validation
+#### Validation
 
 - Unit: review-output schema parsing and the review → net-order/reroute
   steering mapping over a fixture board with a known congested corridor.
@@ -261,34 +206,13 @@ retained per maintainer decision)
 
 ---
 
-## Router: `grid_resolution` not exposed through the MCP tool API
-
-**Status:** resolved 2026-10-10 — the field was **removed from
-`RouteRequest`** (simplify the VLM-facing interface): the router always
-uses `GRID_RESOLUTION` (0.025 mm).  Intentional: VLM callers cannot
-tune the grid, and the default resolution covers the routed boards.
-
-### History (closed)
-
-- `RouteRequest.grid_resolution` existed (default `None` → `GRID_RESOLUTION`
-  = 0.025 mm) and was honoured by the router (passed into
-  `multi_layer_a_star` as the grid size), so the field was functional
-  end-to-end.
-- The MCP tool `pcb_route_pad_to_pad` exposed `width`, `layer_hint`,
-  `via_pairs`, `turn_penalty` — but no `grid_resolution` parameter.
-  Clients could not request a finer grid via the tool API.
-- Rejected fix: adding `grid_resolution` to the tool.  Fine-pitch
-  routing stays on the default grid; revisit with an actual failing
-  fine-pitch board if one appears.
-
----
-
-## Router: exit-point heuristic ignores arbitrary pad rotation
+### Router: exit-point heuristic ignores arbitrary pad rotation
 
 **Status:** open (verified 2026-09-08 — issue #5 in
-`docs/plans/router-issues.md`, partially mitigated)
+`docs/plans/router-issues.md`, partially mitigated) — tracked in
+https://github.com/paul356/KiCad-AI-Assistant/issues/183
 
-### Current state
+#### Current state
 
 - `_find_pad_size` (`kcaa/router/router.py:1439`) returns the pad `size`
   node as stored — footprint-local `(w, h)`, unrotated.
@@ -302,7 +226,7 @@ tune the grid, and the default resolution covers the routed boards.
   (`kcaa/router/world_model.py:404-407`), so routing validity is not
   affected — only the pad exit/entry geometry.
 
-### Impact
+#### Impact
 
 For footprints rotated at arbitrary angles (e.g. 30°, 45°), the real
 copper is a rotated rectangle inscribed in the AABB; the axis-aligned
@@ -311,7 +235,7 @@ non-optimal direction.  No electrical/DRC error, but suboptimal exits on
 rotated footprints — will also matter once oval-slot pads (see the NPTH
 entry above) add rotated obstacles to the model.
 
-### Fix (proposed)
+#### Fix (proposed)
 
 Rotate the pad rectangle by `fp_rot` (reusing the exact transformation in
 `_pad_obstacle`) and compute the exit point as the intersection of the
@@ -319,7 +243,7 @@ outward path direction with the rotated rect edge, instead of the AABB
 edge; keep the axis-aligned wire only for pads that are actually
 axis-aligned in world space.
 
-### Validation
+#### Validation
 
 - Unit: pad with `fp_rot = 45°` — exit point lies on the rotated rectangle
   edge (inside-copper check), and the current AABB behaviour fails the
@@ -330,7 +254,7 @@ axis-aligned in world space.
 
 ---
 
-## Resolved
+## Fixed
 
 ### Unify schematic/PCB version management and archive history
 
@@ -531,3 +455,94 @@ or exports.
   exposes ``get_project_structure`` but not ``list_projects``/``open_project``.
 - System prompt tests (`tests/integration/test_skill_system.py`) are
   untouched and still pass.
+
+---
+### Batch support for set_*/list_* tools
+
+**Status:** resolved (2026-09-07) — set/get tools batched;
+`list_footprints` gains only a `ref_prefix` row filter
+(`set_symbol_property`, `set_footprint_position`, `set_footprint_property`),
+partial-apply per-ref results; get reads (`get_footprint`,
+`get_footprint_bbox`, `list_symbol_properties`) take
+`references: list[str]`.  `list_nets`/`list_vias`/`list_tracks` unchanged
+(bbox/fields projections dropped 2026-09-07 as too complex for the
+payoff). `set_net_class_rules` stays single-class; `set_design_rules` /
+`set_board_outline_rect` non-per-object, out of scope.
+
+#### Current state
+
+- The set tools operate on one object per call:
+  `set_symbol_property` (`symbol_edit_tools.py`), `set_footprint_position`
+  (`pcb_placement_tools.py`), `set_footprint_property`
+  (`pcb_edit_tools.py`), `set_net_class_rules` (`drc_tools.py`) — each
+  takes a single target reference/class.  (`set_design_rules` takes a
+  project-level dict, `set_board_outline_rect` a single rectangle — both
+  non-per-object, out of scope.)
+- The list tools have limited filtering: `list_footprints`, `list_nets`
+  (only `classify`) return whole tables; `list_tracks`/`list_vias`
+  (`net`, tracks also `layer`) and `list_symbol_libraries`
+  (`limit`/`offset`) are partial — "all nets of one net class" or
+  "footprints near X" still requires fetching the full JSON.  Batch
+  precedent already exists: `assign_nets_to_class`, `align_footprints`
+  take `references: list[str]`.
+
+#### Impact
+
+Multi-object edits (e.g. set the same property on 10 symbols, move 5
+footprints to a row) need N tool calls; large boards make list responses
+huge, inflating token use in long sessions (same pressure as the
+tool-collapse issue above).
+
+#### Fix (design agreed 2026-09-07 — batch-first, no backward-compat
+retained per maintainer decision)
+
+1. Set tools switch to `items: list[dict]`: each self-contained entry
+   `{"reference", ...spec}` replaces the single `reference` + shared
+   property/value params on `set_symbol_property` (`property_name` +
+   `property_value`), `set_footprint_position` (`x`/`y`/`rotation`, each
+   optional but at least one required per entry), `set_footprint_property`
+   (`property_name` + `value`).  Targets may carry different values in one
+   call.  One parse + one save per call, single `.bak`.  Per-target results
+   in `results[]`; partial-apply semantics (successful targets saved,
+   failures keep their per-ref error — per `docs/plugin/mutation_safety.md`).
+   Duplicate references or unknown item fields are rejected.
+   `set_net_class_rules` stays single-class.
+2. List tools stay lean (decided 2026-09-07 — filters/fields projection
+   judged too complex for the payoff): only `list_footprints` gains an
+   optional `ref_prefix` row filter (default `None` = all footprints).
+   `list_nets` (`classify`) and `list_vias` (`net`) are unchanged.
+3. Per-object read tools batch too: `references: list[str]` replaces the
+   single `reference` on `get_footprint`, `get_footprint_bbox`
+   (`pcb_query_tools.py`) and `list_symbol_properties`
+   (`symbol_edit_tools.py`).  One file load, per-reference `results[]`
+   entries; missing references keep per-ref errors; duplicates/empty
+   entries/unknown designators rejected up front.
+
+#### Validation
+
+- Unit: batch `set_symbol_property` over refs incl. one missing → one
+  save, successes applied, per-ref errors reported; duplicate refs
+  rejected; `list_footprints` `ref_prefix` row filter.
+- Manual: script a 20-object edit against a board, compare tool calls
+  and response size vs. today.
+
+---
+### Router: `grid_resolution` not exposed through the MCP tool API
+
+**Status:** resolved 2026-10-10 — the field was **removed from
+`RouteRequest`** (simplify the VLM-facing interface): the router always
+uses `GRID_RESOLUTION` (0.025 mm).  Intentional: VLM callers cannot
+tune the grid, and the default resolution covers the routed boards.
+
+#### History (closed)
+
+- `RouteRequest.grid_resolution` existed (default `None` → `GRID_RESOLUTION`
+  = 0.025 mm) and was honoured by the router (passed into
+  `multi_layer_a_star` as the grid size), so the field was functional
+  end-to-end.
+- The MCP tool `pcb_route_pad_to_pad` exposed `width`, `layer_hint`,
+  `via_pairs`, `turn_penalty` — but no `grid_resolution` parameter.
+  Clients could not request a finer grid via the tool API.
+- Rejected fix: adding `grid_resolution` to the tool.  Fine-pitch
+  routing stays on the default grid; revisit with an actual failing
+  fine-pitch board if one appears.
