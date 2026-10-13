@@ -36,9 +36,11 @@ from kcaa.router.router import (
     _default_track_width,
     _find_footprint,
     _find_pad_center,
+    _find_pad_rotation,
     _find_pad_size,
     _layers_used,
     _project_file_for,
+    _replace_pad_path,
     _routing_layers,
     auto_route_pair,
     connect_with_via,
@@ -3719,3 +3721,197 @@ def test_astar_pad_beyond_board_fails_with_board_bounds(tmp_path: Path) -> None:
     assert "No obstacle-avoiding path" in err
     assert "within board" in err
     assert "Segment" not in err
+
+
+# ---------------------------------------------------------------------------
+# Pad exit-wire geometry on rotated pads (#183)
+# ---------------------------------------------------------------------------
+
+_ROTATED_PAD_BOARD = """(kicad_pcb
+	(version 20260206)
+	(generator "test")
+	(layers
+		(0 "F.Cu" signal)
+		(44 "Edge.Cuts" user)
+	)
+	(net 0 "")
+	(net 1 "VCC")
+	(footprint "R"
+		(layer "F.Cu")
+		(at 30.0 30.0 45.0)
+		(property "Reference" "R1")
+		(pad "1" smd rect
+			(at 0.0 0.0 45.0)
+			(size 2.0 6.0)
+			(layers "F.Cu" "F.Mask")
+			(net 1 "VCC")
+		)
+	)
+	(footprint "C"
+		(layer "F.Cu")
+		(at 60.0 40.0 0.0)
+		(property "Reference" "C1")
+		(pad "1" smd rect
+			(at 0.0 0.0)
+			(size 2.0 2.0)
+			(layers "F.Cu" "F.Mask")
+			(net 1 "VCC")
+		)
+	)
+	(gr_rect
+		(start 20.0 20.0)
+		(end 70.0 60.0)
+		(stroke (width 0.1) (type solid))
+		(fill none)
+		(layer "Edge.Cuts")
+	)
+)
+"""
+
+
+def _rotated_rect_polygon(center: tuple[float, float], size: tuple[float, float], rot: float):
+    """World-space copper polygon of an axis-aligned pad rect rotated by
+    the pad's own absolute board-space angle ``rot`` about its centre.
+    Math is written out explicitly so the test reference is independent
+    of the router's rotation helpers."""
+    from shapely.geometry import Polygon
+
+    hw, hh = size[0] / 2.0, size[1] / 2.0
+    rad = math.radians(rot)
+    c, s = math.cos(rad), math.sin(rad)
+    corners = [
+        (c * -hw + s * -hh, -s * -hw + c * -hh),
+        (c * hw + s * -hh, -s * hw + c * -hh),
+        (c * hw + s * hh, -s * hw + c * hh),
+        (c * -hw + s * hh, -s * -hw + c * hh),
+    ]
+    return Polygon([(center[0] + x, center[1] + y) for x, y in corners])
+
+
+def test_replace_pad_path_rotated_pad_fence_on_copper_edge() -> None:
+    """#183: for a pad rotated at an arbitrary angle the exit-wire fence
+    must lie on the ROTATED pad rect (the real copper edge), not on the
+    oversized world AABB edge.  The pre-fix AABB behaviour fences on the
+    last-inside point, which can sit in an AABB corner OFF the copper."""
+    from shapely.geometry import Point
+
+    center = (0.0, 0.0)
+    size = (2.0, 6.0)  # half extents 1.0 x 3.0, rotated 45 deg
+    rot = 45.0
+    copper = _rotated_rect_polygon(center, size, rot)
+
+    # A* exits the cleared AABB through its top-right region: the last
+    # inside point (1, 3) is inside the AABB but OUTSIDE the 45-deg
+    # copper -- exactly the case the axis-aligned heuristic gets wrong.
+    outside = (1.5, 3.5)
+    path = [(0.0, 0.0), (1.0, 3.0), outside]
+
+    replaced = _replace_pad_path(path, center, size, from_center=True, rot=rot)
+    i = replaced.index(outside)
+    fence = replaced[i - 1]
+    assert copper.distance(Point(fence)) < 1e-6, (
+        f"exit fence {fence} must lie on the rotated copper edge"
+    )
+
+    # Pre-fix AABB behaviour (rot=0) fences on the last-inside AABB
+    # point (1, 3): demonstrate it would fail the same in-copper check.
+    old = _replace_pad_path(path, center, size, from_center=True)
+    i_old = old.index(outside)
+    old_fence = old[i_old - 1]
+    assert old_fence == (1.0, 3.0)
+    assert copper.distance(Point(old_fence)) > 1e-3, (
+        "AABB exit must be off the rotated copper (the bug this fixes)"
+    )
+
+    # Entry side (not from_center): the wire's first point after the
+    # outside run is the entrance on the rotated copper edge.
+    path_in = [(-2.0, -6.5), (-1.0, -3.0), (0.0, 0.0)]
+    replaced_in = _replace_pad_path(path_in, center, size, from_center=False, rot=rot)
+    assert replaced_in[0] == path_in[0]
+    entrance = replaced_in[1]
+    assert copper.distance(Point(entrance)) < 1e-6, (
+        f"entry fence {entrance} must lie on the rotated copper edge"
+    )
+
+
+@pytest.mark.parametrize("rot", [0.0, 90.0, 180.0, 270.0, -90.0, 360.0])
+def test_replace_pad_path_axis_aligned_rotations_identical(rot: float) -> None:
+    """#183: pads that ARE axis-aligned in world space (0/90/180/270,
+    including negative/overflow equivalents) must keep the legacy AABB
+    exit wire byte-identical -- the common case never changes."""
+    center = (0.0, 0.0)
+    size = (2.0, 6.0)
+    cases = [
+        ([(0.0, 0.0), (1.0, 3.0), (1.5, 3.5)], True),
+        ([(-2.0, -6.5), (-1.0, -3.0), (0.0, 0.0)], False),
+    ]
+    for path, from_center in cases:
+        legacy = _replace_pad_path(path, center, size, from_center)
+        assert _replace_pad_path(path, center, size, from_center, rot=rot) == legacy, (
+            f"rot={rot} must not change the pad wire for an axis-aligned pad"
+        )
+
+
+def test_rotated_footprint_pad_rotation_and_exit_fence(tmp_path: Path) -> None:
+    """#183: the full lookup chain -- footprint at 45° whose pad carries
+    its own absolute 45° rotation (KiCad 10 convention) -- threads the
+    pad's OWN rotation (not fp_rot, not a sum) into the exit wire, and
+    the fence lands on the rotated copper edge."""
+    pcb = tmp_path / "rot_board.kicad_pcb"
+    pcb.write_text(_ROTATED_PAD_BOARD)
+    data = load_pcb(str(pcb))
+
+    center = _find_pad_center(data, "R1", "1", "F.Cu")
+    size = _find_pad_size(data, "R1", "1", "F.Cu")
+    rot = _find_pad_rotation(data, "R1", "1", "F.Cu")
+    assert center == pytest.approx((30.0, 30.0))
+    assert size == (2.0, 6.0)
+    # The pad's ``at`` rotation is its OWN absolute board-space angle:
+    # the exact stored value, never fp_rot + pad_rot.
+    assert rot == 45.0
+
+    from shapely.geometry import Point
+
+    copper = _rotated_rect_polygon(tuple(center), size, rot)
+    # A* exits the cleared AABB towards C1 (right/up of the start pad).
+    outside = (center[0] + 1.5, center[1] + 3.5)
+    path = [tuple(center), (center[0] + 1.0, center[1] + 3.0), outside]
+    replaced = _replace_pad_path(path, tuple(center), size, from_center=True, rot=rot)
+    i = replaced.index(outside)
+    fence = replaced[i - 1]
+    assert copper.distance(Point(fence)) < 1e-6, (
+        f"exit fence {fence} must lie on the rotated copper edge"
+    )
+
+    # The AABB behaviour would fence on the last-inside point, off-copper.
+    old = _replace_pad_path(path, tuple(center), size, from_center=True)
+    i_old = old.index(outside)
+    assert copper.distance(Point(old[i_old - 1])) > 1e-3
+
+
+def test_auto_route_pair_routes_rotated_rect_pad(tmp_path: Path) -> None:
+    """#183 regression: a 45-degree-rotated rectangular pad still routes
+    (validity invariant -- obstacles are untouched) and the route lands
+    on both pad centres."""
+    pcb_path = tmp_path / "rot_board.kicad_pcb"
+    pcb_path.write_text(_ROTATED_PAD_BOARD)
+    _write_min_pro(pcb_path)
+    result = auto_route_pair(
+        RouteRequest(
+            pcb_path=str(pcb_path),
+            ref_a="R1",
+            pad_a="1",
+            ref_b="C1",
+            pad_b="1",
+            net="VCC",
+            width=0.2,
+            via_pairs=(),
+        )
+    )
+    assert len(result.segments) > 0
+    # Endpoint alignment may drag the start point by a few hundredths of
+    # a millimetre (pre-existing _align_path_endpoints leg translation),
+    # so the start is asserted loosely; the end pad centre is exact.
+    assert result.start == pytest.approx((30.0, 30.0), abs=0.05)
+    assert result.end == pytest.approx((60.0, 40.0), abs=1e-3)
+    assert result.layers_used == ["F.Cu"]
