@@ -7,7 +7,8 @@ can be picked up independently.  Resolved items are moved to the
 
 ## NPTH oval/slot drill shapes are not supported
 
-**Status:** open (discovered while fixing the NPTH index bug)
+**Status:** open (discovered while fixing the NPTH index bug) — tracked in
+https://github.com/paul356/KiCad-AI-Assistant/issues/182
 
 ### Symptom
 
@@ -83,15 +84,19 @@ rotation plus the footprint rotation (verify which KiCad actually applies).
 
 ## Project-level symbol table with 3rdparty symbol export
 
-**Status:** open (proposed)
+**Status:** part implemented — project `sym-lib-table` read shipped
+(0.2.8); 3rdparty export write side open — tracked in
+https://github.com/paul356/KiCad-AI-Assistant/issues/184
 
 ### Current state
 
-- Symbol lookup reads only the **global** `sym-lib-table`
-  (`kcaa/utils/symbol_index_reader.py`, path from
-  `config.ServerConfig.symbol_table_file` → `~/.config/kicad/<ver>/
-  sym-lib-table`; `Table`-type entries are followed recursively). There
-  is no project-level table next to the `.kicad_pro`.
+- Project-table read is implemented: `kcaa/utils/symbol_index_reader.py`
+  `get_libraries` parses a project-local `sym-lib-table` next to the
+  `.kicad_pro` **first** (project entries win) and falls back to the
+  global table (`config.ServerConfig.symbol_table_file` →
+  `~/.config/kicad/<ver>/sym-lib-table`; `Table`-type entries are
+  followed recursively). The `(lib_symbols ...)` inline placement is
+  unchanged.
 - `KICAD_3RD_PARTY` (third-party library dir, `config.py`) is only a
   default path constant — nothing writes symbols into it.
 - Placed symbols with inline `(lib_symbols ...)` bodies live only inside
@@ -109,11 +114,13 @@ rotation plus the footprint rotation (verify which KiCad actually applies).
 ### Fix (proposed)
 
 1. `symbol_index_reader.py`: try the project `sym-lib-table` first, fall
-   back to the global table; surface which table each library came from.
+   back to the global table — implemented (see Current state); surfacing
+   which table each library came from is a possible follow-up.
 2. New `export_symbols_to_3rdparty` tool: collect distinct `lib_id`+symbol
    bodies used by the schematic(s), write one `.kicad_sym` per library
    into `3rdparty/`, generate/update the project `sym-lib-table`, and
-   keep the schematic's `lib_id` prefix resolvable.
+   keep the schematic's `lib_id` prefix resolvable — open, tracked in
+   https://github.com/paul356/KiCad-AI-Assistant/issues/184.
 
 ### Validation
 
@@ -197,7 +204,8 @@ retained per maintainer decision)
 
 ## LLM vision-guided routing loop
 
-**Status:** open (proposed)
+**Status:** partially implemented — raster feedback shipped (0.2.8);
+automated review/steering loop future
 
 ### Current state
 
@@ -208,11 +216,16 @@ retained per maintainer decision)
   visibility graph → A*), but nothing inspects the routed result or
   steers the router mid-flight. A congested corridor, a via farm or a
   detour net is only caught afterwards by DRC (`run_drc_via_ipc`).
-- `generate_pcb_thumbnail(project_path)` (`kcaa/tools/export_tools.py`)
-  already renders the board to a PNG via kicad-cli, and `llm_client.py`
-  already carries multimodal turns (`_build_user_content` emits
-  OpenAI-style `image_url` blocks; converted for Anthropic/Ollama) — but
-  nothing feeds a tool-rendered raster back to the model.
+- Raster feedback is implemented: `export_pcb_layer_image`
+  (`kcaa/tools/render_board_tools.py`) returns an Image MCP content
+  block for vision-capable models (`return report_text,
+  Image(data=png, format="png")` when vision is enabled), and
+  `generate_pcb_thumbnail` (`kcaa/tools/export_tools.py`) renders the
+  board the same way. The tool loop in `kicad_plugin/llm_client.py`
+  `run()` (~lines 2900–2990) gathers `result_images` from tool results
+  and appends an images-carrying user message when
+  `self._settings.llm_supports_vision` is enabled — the LLM can call
+  those tools and get the PNG fed back into the multimodal turn.
 
 ### Aim
 
@@ -224,11 +237,12 @@ retained per maintainer decision)
 
 ### Fix (proposed)
 
-1. **Raster into the loop**: let the review step call
-   `generate_pcb_thumbnail` (plus optional zoomed crop on a region from
-   the track bbox) and surface the returned PNG as an `images` entry on
-   the next turn, reusing the existing multimodal plumbing instead of
-   adding a parallel image path.
+1. **Raster into the loop** — implemented (see Current state): the
+   review step can call `export_pcb_layer_image` /
+   `generate_pcb_thumbnail` and the returned PNG is fed back as an
+   `images` entry on the next turn via the existing multimodal plumbing
+   (no parallel image path was needed); an optional zoomed crop on a
+   region from the track bbox is a possible follow-up.
 2. **Vision review**: a schema-constrained prompt over the raster
    returning e.g. `{ok: bool, rework: [{net, area, reason}],
    congestion: [area]}`; parse strictly, reject free-form
@@ -244,9 +258,9 @@ retained per maintainer decision)
 
 ### Open questions
 
-- Which configured backends are actually vision-capable, and does the
-  MCP tool-result → `images` wiring exist anywhere yet (thumbnail PNG
-  today returns a path/text, not a base64 content block)?
+- Which configured backends are actually vision-capable remains
+  settings-driven (`llm_supports_vision`), and the automated
+  review/steering loop (fix items 2–4) is not implemented yet.
 - Visual review is a *hint*, not geometry truth — final acceptance must
   stay with `run_drc_via_ipc`; the summary is a heuristic gate, not a
   validation path.
@@ -286,7 +300,8 @@ tune the grid, and the default resolution covers the routed boards.
 ## Router: exit-point heuristic ignores arbitrary pad rotation
 
 **Status:** open (verified 2026-09-08 — issue #5 in
-`docs/plans/router-issues.md`, partially mitigated)
+`docs/plans/router-issues.md`, partially mitigated) — tracked in
+https://github.com/paul356/KiCad-AI-Assistant/issues/183
 
 ### Current state
 
