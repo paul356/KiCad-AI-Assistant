@@ -2,10 +2,12 @@
 
 Known issues discovered during review but not fixed in the originating PR.
 Each entry records the evidence, the impact, and the proposed fix so the work
-can be picked up independently.  Resolved items are moved to the
-``## Resolved`` section at the bottom.
+can be picked up independently.  Open items live under the ``## Open Issues``
+section; resolved items are moved to the ``## Fixed`` section at the bottom.
 
-## NPTH oval/slot drill shapes are not supported
+## Open Issues
+
+### NPTH oval/slot drill shapes are not supported
 
 **Status:** open (discovered while fixing the NPTH index bug) — tracked in
 https://github.com/paul356/KiCad-AI-Assistant/issues/182
@@ -82,7 +84,7 @@ rotation plus the footprint rotation (verify which KiCad actually applies).
 
 ---
 
-## Project-level symbol table with 3rdparty symbol export
+### Project-level symbol table with 3rdparty symbol export
 
 **Status:** part implemented — project `sym-lib-table` read shipped
 (0.2.8); 3rdparty export write side open — tracked in
@@ -131,78 +133,7 @@ https://github.com/paul356/KiCad-AI-Assistant/issues/184
 
 ---
 
-## Batch support for set_*/list_* tools
-
-**Status:** implemented (2026-09-07) — set/get tools batched;
-`list_footprints` gains only a `ref_prefix` row filter
-(`set_symbol_property`, `set_footprint_position`, `set_footprint_property`),
-partial-apply per-ref results; get reads (`get_footprint`,
-`get_footprint_bbox`, `list_symbol_properties`) take
-`references: list[str]`.  `list_nets`/`list_vias`/`list_tracks` unchanged
-(bbox/fields projections dropped 2026-09-07 as too complex for the
-payoff). `set_net_class_rules` stays single-class; `set_design_rules` /
-`set_board_outline_rect` non-per-object, out of scope.
-
-### Current state
-
-- The set tools operate on one object per call:
-  `set_symbol_property` (`symbol_edit_tools.py`), `set_footprint_position`
-  (`pcb_placement_tools.py`), `set_footprint_property`
-  (`pcb_edit_tools.py`), `set_net_class_rules` (`drc_tools.py`) — each
-  takes a single target reference/class.  (`set_design_rules` takes a
-  project-level dict, `set_board_outline_rect` a single rectangle — both
-  non-per-object, out of scope.)
-- The list tools have limited filtering: `list_footprints`, `list_nets`
-  (only `classify`) return whole tables; `list_tracks`/`list_vias`
-  (`net`, tracks also `layer`) and `list_symbol_libraries`
-  (`limit`/`offset`) are partial — "all nets of one net class" or
-  "footprints near X" still requires fetching the full JSON.  Batch
-  precedent already exists: `assign_nets_to_class`, `align_footprints`
-  take `references: list[str]`.
-
-### Impact
-
-Multi-object edits (e.g. set the same property on 10 symbols, move 5
-footprints to a row) need N tool calls; large boards make list responses
-huge, inflating token use in long sessions (same pressure as the
-tool-collapse issue above).
-
-### Fix (design agreed 2026-09-07 — batch-first, no backward-compat
-retained per maintainer decision)
-
-1. Set tools switch to `items: list[dict]`: each self-contained entry
-   `{"reference", ...spec}` replaces the single `reference` + shared
-   property/value params on `set_symbol_property` (`property_name` +
-   `property_value`), `set_footprint_position` (`x`/`y`/`rotation`, each
-   optional but at least one required per entry), `set_footprint_property`
-   (`property_name` + `value`).  Targets may carry different values in one
-   call.  One parse + one save per call, single `.bak`.  Per-target results
-   in `results[]`; partial-apply semantics (successful targets saved,
-   failures keep their per-ref error — per `docs/plugin/mutation_safety.md`).
-   Duplicate references or unknown item fields are rejected.
-   `set_net_class_rules` stays single-class.
-2. List tools stay lean (decided 2026-09-07 — filters/fields projection
-   judged too complex for the payoff): only `list_footprints` gains an
-   optional `ref_prefix` row filter (default `None` = all footprints).
-   `list_nets` (`classify`) and `list_vias` (`net`) are unchanged.
-3. Per-object read tools batch too: `references: list[str]` replaces the
-   single `reference` on `get_footprint`, `get_footprint_bbox`
-   (`pcb_query_tools.py`) and `list_symbol_properties`
-   (`symbol_edit_tools.py`).  One file load, per-reference `results[]`
-   entries; missing references keep per-ref errors; duplicates/empty
-   entries/unknown designators rejected up front.
-
-### Validation
-
-- Unit: batch `set_symbol_property` over refs incl. one missing → one
-  save, successes applied, per-ref errors reported; duplicate refs
-  rejected; `list_footprints` `ref_prefix` row filter.
-- Manual: script a 20-object edit against a board, compare tool calls
-  and response size vs. today.
-
----
-
-## LLM vision-guided routing loop
+### LLM vision-guided routing loop
 
 **Status:** partially implemented — raster feedback shipped (0.2.8);
 automated review/steering loop future
@@ -275,29 +206,7 @@ automated review/steering loop future
 
 ---
 
-## Router: `grid_resolution` not exposed through the MCP tool API
-
-**Status:** resolved 2026-10-10 — the field was **removed from
-`RouteRequest`** (simplify the VLM-facing interface): the router always
-uses `GRID_RESOLUTION` (0.025 mm).  Intentional: VLM callers cannot
-tune the grid, and the default resolution covers the routed boards.
-
-### History (closed)
-
-- `RouteRequest.grid_resolution` existed (default `None` → `GRID_RESOLUTION`
-  = 0.025 mm) and was honoured by the router (passed into
-  `multi_layer_a_star` as the grid size), so the field was functional
-  end-to-end.
-- The MCP tool `pcb_route_pad_to_pad` exposed `width`, `layer_hint`,
-  `via_pairs`, `turn_penalty` — but no `grid_resolution` parameter.
-  Clients could not request a finer grid via the tool API.
-- Rejected fix: adding `grid_resolution` to the tool.  Fine-pitch
-  routing stays on the default grid; revisit with an actual failing
-  fine-pitch board if one appears.
-
----
-
-## Router: exit-point heuristic ignores arbitrary pad rotation
+### Router: exit-point heuristic ignores arbitrary pad rotation
 
 **Status:** open (verified 2026-09-08 — issue #5 in
 `docs/plans/router-issues.md`, partially mitigated) — tracked in
@@ -345,7 +254,7 @@ axis-aligned in world space.
 
 ---
 
-## Resolved
+## Fixed
 
 ### Unify schematic/PCB version management and archive history
 
@@ -546,3 +455,94 @@ or exports.
   exposes ``get_project_structure`` but not ``list_projects``/``open_project``.
 - System prompt tests (`tests/integration/test_skill_system.py`) are
   untouched and still pass.
+
+---
+### Batch support for set_*/list_* tools
+
+**Status:** resolved (2026-09-07) — set/get tools batched;
+`list_footprints` gains only a `ref_prefix` row filter
+(`set_symbol_property`, `set_footprint_position`, `set_footprint_property`),
+partial-apply per-ref results; get reads (`get_footprint`,
+`get_footprint_bbox`, `list_symbol_properties`) take
+`references: list[str]`.  `list_nets`/`list_vias`/`list_tracks` unchanged
+(bbox/fields projections dropped 2026-09-07 as too complex for the
+payoff). `set_net_class_rules` stays single-class; `set_design_rules` /
+`set_board_outline_rect` non-per-object, out of scope.
+
+### Current state
+
+- The set tools operate on one object per call:
+  `set_symbol_property` (`symbol_edit_tools.py`), `set_footprint_position`
+  (`pcb_placement_tools.py`), `set_footprint_property`
+  (`pcb_edit_tools.py`), `set_net_class_rules` (`drc_tools.py`) — each
+  takes a single target reference/class.  (`set_design_rules` takes a
+  project-level dict, `set_board_outline_rect` a single rectangle — both
+  non-per-object, out of scope.)
+- The list tools have limited filtering: `list_footprints`, `list_nets`
+  (only `classify`) return whole tables; `list_tracks`/`list_vias`
+  (`net`, tracks also `layer`) and `list_symbol_libraries`
+  (`limit`/`offset`) are partial — "all nets of one net class" or
+  "footprints near X" still requires fetching the full JSON.  Batch
+  precedent already exists: `assign_nets_to_class`, `align_footprints`
+  take `references: list[str]`.
+
+### Impact
+
+Multi-object edits (e.g. set the same property on 10 symbols, move 5
+footprints to a row) need N tool calls; large boards make list responses
+huge, inflating token use in long sessions (same pressure as the
+tool-collapse issue above).
+
+### Fix (design agreed 2026-09-07 — batch-first, no backward-compat
+retained per maintainer decision)
+
+1. Set tools switch to `items: list[dict]`: each self-contained entry
+   `{"reference", ...spec}` replaces the single `reference` + shared
+   property/value params on `set_symbol_property` (`property_name` +
+   `property_value`), `set_footprint_position` (`x`/`y`/`rotation`, each
+   optional but at least one required per entry), `set_footprint_property`
+   (`property_name` + `value`).  Targets may carry different values in one
+   call.  One parse + one save per call, single `.bak`.  Per-target results
+   in `results[]`; partial-apply semantics (successful targets saved,
+   failures keep their per-ref error — per `docs/plugin/mutation_safety.md`).
+   Duplicate references or unknown item fields are rejected.
+   `set_net_class_rules` stays single-class.
+2. List tools stay lean (decided 2026-09-07 — filters/fields projection
+   judged too complex for the payoff): only `list_footprints` gains an
+   optional `ref_prefix` row filter (default `None` = all footprints).
+   `list_nets` (`classify`) and `list_vias` (`net`) are unchanged.
+3. Per-object read tools batch too: `references: list[str]` replaces the
+   single `reference` on `get_footprint`, `get_footprint_bbox`
+   (`pcb_query_tools.py`) and `list_symbol_properties`
+   (`symbol_edit_tools.py`).  One file load, per-reference `results[]`
+   entries; missing references keep per-ref errors; duplicates/empty
+   entries/unknown designators rejected up front.
+
+### Validation
+
+- Unit: batch `set_symbol_property` over refs incl. one missing → one
+  save, successes applied, per-ref errors reported; duplicate refs
+  rejected; `list_footprints` `ref_prefix` row filter.
+- Manual: script a 20-object edit against a board, compare tool calls
+  and response size vs. today.
+
+---
+### Router: `grid_resolution` not exposed through the MCP tool API
+
+**Status:** resolved 2026-10-10 — the field was **removed from
+`RouteRequest`** (simplify the VLM-facing interface): the router always
+uses `GRID_RESOLUTION` (0.025 mm).  Intentional: VLM callers cannot
+tune the grid, and the default resolution covers the routed boards.
+
+### History (closed)
+
+- `RouteRequest.grid_resolution` existed (default `None` → `GRID_RESOLUTION`
+  = 0.025 mm) and was honoured by the router (passed into
+  `multi_layer_a_star` as the grid size), so the field was functional
+  end-to-end.
+- The MCP tool `pcb_route_pad_to_pad` exposed `width`, `layer_hint`,
+  `via_pairs`, `turn_penalty` — but no `grid_resolution` parameter.
+  Clients could not request a finer grid via the tool API.
+- Rejected fix: adding `grid_resolution` to the tool.  Fine-pitch
+  routing stays on the default grid; revisit with an actual failing
+  fine-pitch board if one appears.
