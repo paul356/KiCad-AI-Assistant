@@ -469,7 +469,7 @@ partial-apply per-ref results; get reads (`get_footprint`,
 payoff). `set_net_class_rules` stays single-class; `set_design_rules` /
 `set_board_outline_rect` non-per-object, out of scope.
 
-### Current state
+#### Current state
 
 - The set tools operate on one object per call:
   `set_symbol_property` (`symbol_edit_tools.py`), `set_footprint_position`
@@ -486,14 +486,14 @@ payoff). `set_net_class_rules` stays single-class; `set_design_rules` /
   precedent already exists: `assign_nets_to_class`, `align_footprints`
   take `references: list[str]`.
 
-### Impact
+#### Impact
 
 Multi-object edits (e.g. set the same property on 10 symbols, move 5
 footprints to a row) need N tool calls; large boards make list responses
 huge, inflating token use in long sessions (same pressure as the
 tool-collapse issue above).
 
-### Fix (design agreed 2026-09-07 — batch-first, no backward-compat
+#### Fix (design agreed 2026-09-07 — batch-first, no backward-compat
 retained per maintainer decision)
 
 1. Set tools switch to `items: list[dict]`: each self-contained entry
@@ -518,7 +518,7 @@ retained per maintainer decision)
    entries; missing references keep per-ref errors; duplicates/empty
    entries/unknown designators rejected up front.
 
-### Validation
+#### Validation
 
 - Unit: batch `set_symbol_property` over refs incl. one missing → one
   save, successes applied, per-ref errors reported; duplicate refs
@@ -534,7 +534,7 @@ retained per maintainer decision)
 uses `GRID_RESOLUTION` (0.025 mm).  Intentional: VLM callers cannot
 tune the grid, and the default resolution covers the routed boards.
 
-### History (closed)
+#### History (closed)
 
 - `RouteRequest.grid_resolution` existed (default `None` → `GRID_RESOLUTION`
   = 0.025 mm) and was honoured by the router (passed into
