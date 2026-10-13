@@ -134,6 +134,117 @@ def register_library_in_table(
     }
 
 
+# Matches the ``(uri "…")`` token inside a single-line ``(lib ...)`` entry.
+_URI_RE = re.compile(r'\(uri\s+"([^"]*)"\)')
+
+
+def register_or_update_library_in_table(
+    table_path: str,
+    nickname: str,
+    uri: str,
+    description: str = "",
+) -> dict[str, Any]:
+    """Register *nickname* in *table_path*, updating an existing entry's URI.
+
+    Explicit register-or-update for callers that must guarantee a nickname
+    resolves to a specific URI (e.g. project-pinned export copies):
+
+    * nickname not registered -> appended, same as
+      ``register_library_in_table``;
+    * nickname registered with the *same* URI -> table left untouched
+      (``registered`` False, ``reason`` "already_registered");
+    * nickname registered with a *different* URI -> the entry is rewritten
+      in place (URI/descr replaced, other entries and formatting
+      preserved), the table is backed up to ``.bak`` and ``updated`` is
+      True.
+
+    :param table_path: Absolute path to the sym-lib-table file.
+    :param nickname: Library nickname to ensure is registered.
+    :param uri: Library URI, e.g. ``${KIPRJMOD}/3rdparty/X.kicad_sym``.
+    :param description: Optional ``descr`` text for the entry.
+    :returns: dict with ``registered`` (bool), ``table_path``, optional
+        ``backup_path`` / ``updated`` (bool), and optional ``reason``
+        (``nickname empty after sanitization``, ``already_registered``).
+    """
+    table_path = os.path.abspath(table_path)
+    nickname = sanitize_lib_nickname(nickname)
+    if not nickname:
+        return {"registered": False, "reason": "nickname empty after sanitization"}
+    if not os.path.isfile(table_path):
+        return register_library_in_table(table_path, nickname, uri, description)
+
+    with open(table_path, encoding="utf-8") as fh:
+        original = fh.read()
+    needle = f'name "{nickname}"'
+    if needle not in original:
+        return register_library_in_table(table_path, nickname, uri, description)
+
+    # Nickname already registered.  Keep the table untouched unless the
+    # stored URI actually differs from the requested one.  Entries are
+    # written single-line by register_library_in_table / this helper, so the
+    # uri token lives on the same line as the name token.
+    current_uri: str | None = None
+    for ln in original.splitlines():
+        if needle in ln:
+            match = _URI_RE.search(ln)
+            if match:
+                current_uri = match.group(1)
+            break
+    if current_uri == uri:
+        log.info("Library %r already registered in %s", nickname, table_path)
+        return {"registered": False, "table_path": table_path, "reason": "already_registered"}
+
+    entry = _entry_text(nickname, uri, description)
+    new_text: str | None = None
+    if _last_line_is_closing_paren(original):
+        lines = original.splitlines(keepends=True)
+        for i, ln in enumerate(lines):
+            if ln.strip().startswith("(lib ") and needle in ln:
+                lines[i] = "\t" + entry + "\n"
+                new_text = "".join(lines)
+                break
+    if new_text is None:
+        # Compact single-line or multi-line entry: re-serialize after
+        # swapping in the replacement entry node.
+        log.warning(
+            "sym-lib-table %s is single-line; re-serializing to update entry",
+            table_path,
+        )
+        data = sexpdata.loads(original)
+        replacement = sexpdata.loads(entry)
+        new_data = []
+        for child in data:
+            if (
+                isinstance(child, list)
+                and len(child) >= 2
+                and child[0] == sexpdata.Symbol("lib")
+                and any(
+                    isinstance(e, list)
+                    and len(e) >= 2
+                    and e[0] == sexpdata.Symbol("name")
+                    and str(e[1]) == nickname
+                    for e in child
+                )
+            ):
+                new_data.append(replacement)
+            else:
+                new_data.append(child)
+        new_text = sexpdata.dumps(new_data, pretty_print=True, indent_as="\t") + "\n"
+
+    backup_path = table_path + ".bak"
+    shutil.copy2(table_path, backup_path)
+    tmp_path = table_path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as fh:
+        fh.write(new_text)
+    os.replace(tmp_path, table_path)
+    return {
+        "registered": True,
+        "table_path": table_path,
+        "backup_path": backup_path,
+        "updated": True,
+    }
+
+
 def unregister_library_in_table(
     table_path: str,
     nickname: str,

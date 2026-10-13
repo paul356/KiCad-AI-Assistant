@@ -1024,3 +1024,289 @@ class TestCreateSymbolProjectContext:
         )
         assert "error" in result, result  # global scope cannot resolve it
         assert index_mgr_proj.get_library_symbols("ProjSym") == []
+
+
+# ---------------------------------------------------------------------------
+# export_symbols_to_3rdparty
+# ---------------------------------------------------------------------------
+
+
+def _export_instance(lib_id: str, ref: str, x: float, uuid: str) -> str:
+    """Render a minimal skip-parseable schematic symbol instance."""
+    value = lib_id.partition(":")[2]
+    return (
+        f'  (symbol (lib_id "{lib_id}") (at {x} 100.0 0) (unit 1) (body_style 1)\n'
+        "    (exclude_from_sim no) (in_bom yes) (on_board yes)"
+        " (in_pos_files yes) (dnp no) (fields_autoplaced yes)\n"
+        f'    (uuid "{uuid}")\n'
+        f'    (property "Reference" "{ref}" (at {x + 3} 99.0 0)'
+        " (show_name no) (do_not_autoplace no)"
+        " (effects (font (size 1.27 1.27))))\n"
+        f'    (property "Value" "{value}" (at {x + 3} 101.0 0)'
+        " (show_name no) (do_not_autoplace no)"
+        " (effects (font (size 1.27 1.27))))\n"
+        '    (pin "1" (number "1") (name "~"))\n'
+        '    (pin "2" (number "2") (name "~"))\n'
+        f'    (instances (project "demo" (path "/x" (reference "{ref}") (unit 1))))\n'
+        "  )\n"
+    )
+
+
+def _export_mixed_schematic_text(bodyless: tuple[str, ...] = ()) -> str:
+    """Render the export fixture: cached Device:R_Small / Device:C (from the
+    base fixture, resolved via the isolated global Device library in tests)
+    plus a cached custom inline symbol ``Custom:MYOP``, and one extra
+    instance per *bodyless* lib_id (referenced but WITHOUT a cache entry)."""
+    text = Path(FIXTURE_SCH).read_text(encoding="utf-8")
+    unit = (
+        '(symbol "MYOP_0_1" '
+        "(pin passive line (at 0 2.54 270) (length 0.762) "
+        '(name "" (effects (font (size 1.27 1.27)))) '
+        '(number "1" (effects (font (size 1.27 1.27))))) '
+        "(pin passive line (at 0 -2.54 90) (length 0.762) "
+        '(name "" (effects (font (size 1.27 1.27)))) '
+        '(number "2" (effects (font (size 1.27 1.27))))))'
+    )
+    custom_cache = (
+        ' (symbol "Custom:MYOP" (pin_numbers (hide yes))\n'
+        '  (property "Reference" "U" (at 0 0 0) (show_name no) (do_not_autoplace no)'
+        " (effects (font (size 1.27 1.27))))\n"
+        '  (property "Value" "MYOP" (at 0 0 0) (show_name no) (do_not_autoplace no)'
+        " (effects (font (size 1.27 1.27))))\n"
+        f"  {unit}\n"
+        "  (embedded_fonts no))"
+    )
+    marker = "(embedded_fonts no)))"
+    assert text.count(marker) == 1, "lib_symbols close marker moved"
+    text = text.replace(marker, "(embedded_fonts no))" + custom_cache + ")", 1)
+
+    instances = _export_instance("Custom:MYOP", "U1", 250.0, "11111111-2222-3333-4444-555555555555")
+    for i, lib_id in enumerate(bodyless):
+        instances += _export_instance(
+            lib_id,
+            f"U{2 + i}",
+            260.0 + i,
+            f"66666666-2222-3333-4444-{i:012d}",
+        )
+    return text.replace("(sheet_instances", instances + " (sheet_instances", 1)
+
+
+def _register_global_symbol_library(env: dict, nickname: str, names: tuple[str, ...]) -> str:
+    """Register a GLOBAL, file-style symbol library in the isolated env."""
+    from kcaa.utils.sym_lib_table_utils import register_library_in_table
+
+    lib_dir = Path(env["tmp_path"]) / f"global_{nickname.lower()}"
+    lib_dir.mkdir(exist_ok=True)
+    lib_file = lib_dir / f"{nickname}.kicad_sym"
+    symbols = "\n".join(
+        f'  (symbol "{n}" (in_bom yes) (on_board yes)'
+        ' (property "Reference" "X" (at 0 0 0) (effects (font (size 1.27 1.27))))'
+        f' (property "Value" "{n}" (at 0 0 0) (effects (font (size 1.27 1.27))))'
+        " (embedded_fonts no))"
+        for n in names
+    )
+    lib_file.write_text(
+        "(kicad_symbol_lib\n  (version 20220914)\n  (generator kicad_symbol_editor)\n"
+        f"{symbols}\n)\n",
+        encoding="utf-8",
+    )
+    reg = register_library_in_table(
+        os.path.join(env["tmp_path"], "sym-lib-table"),
+        nickname,
+        str(lib_file),
+        "global test library",
+    )
+    assert reg.get("registered"), reg
+    return str(lib_file)
+
+
+class TestExportSymbolsTo3rdparty:
+    """export_symbols_to_3rdparty materializes used cached symbols into
+    project-owned 3rdparty libraries, registers them in the project
+    sym-lib-table, and keeps existing lib_ids resolvable."""
+
+    @staticmethod
+    def _project(tmp_path, bodyless: tuple[str, ...] = ()) -> tuple[Path, str]:
+        """Project dir (same-stem .kicad_pro) holding the export fixture."""
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        (proj / "tools_test.kicad_pro").write_text("{}", encoding="utf-8")
+        sch = proj / "tools_test.kicad_sch"
+        sch.write_text(_export_mixed_schematic_text(bodyless), encoding="utf-8")
+        return proj, str(sch)
+
+    def test_exports_used_cached_symbols_and_pins_prefixes(self, tools, env, tmp_path):
+        """Symbols from a global library (Device:R_Small/Device:C) and a
+        custom inline symbol (Custom:MYOP) are both materialized; the
+        project table is re-pointed at the copies so the lib_ids keep
+        resolving (pin the version)."""
+        from kcaa.utils.config import ServerConfig
+        from kcaa.utils.symbol_index_reader import SymbolIndexReader
+
+        _register_global_symbol_library(env, "Device", ("R_Small", "C", "NE555"))
+        proj, sch = self._project(tmp_path)
+        proj_real = os.path.realpath(str(proj))
+        before = Path(sch).read_bytes()
+
+        result = _run(tools["export_symbols_to_3rdparty"], schematic_path=sch)
+        assert "error" not in result, result
+        assert result["project_dir"] == proj_real
+        assert result["library_count"] == 2
+        assert result["exported_count"] == 3
+        assert set(result["exported"]) == {"Device:R_Small", "Device:C", "Custom:MYOP"}
+        assert result["skipped"] == []
+        assert result["failed"] == []
+
+        device = result["libraries"]["Device"]
+        assert device["exported_count"] == 2
+        assert device["registered"] is True
+        assert device["register_reason"] == "registered"
+        assert device["written"] is True
+        assert device["library_path"] == os.path.join(proj_real, "3rdparty", "Device.kicad_sym")
+        assert device["table_path"] == os.path.join(proj_real, "sym-lib-table")
+        assert device["indexed"] == 2
+
+        custom = result["libraries"]["Custom"]
+        assert custom["exported"] == ["Custom:MYOP"]
+        assert custom["registered"] is True
+        assert custom["register_reason"] == "registered"
+        assert custom["indexed"] == 1
+
+        # The definitions really landed in the 3rdparty .kicad_sym files.
+        from kcaa.utils.symbol_library_utils import list_library_symbols
+
+        assert set(list_library_symbols(device["library_path"])) == {"R_Small", "C"}
+        assert set(list_library_symbols(custom["library_path"])) == {"MYOP"}
+
+        # Project sym-lib-table gained ${KIPRJMOD}/3rdparty URIs and the
+        # reader resolves the exported lib_ids through the project copy.
+        libs = SymbolIndexReader(ServerConfig(), project_dir=proj_real).get_libraries()
+        by_name = {e.name: e for e in libs}
+        assert {"Device", "Custom"} <= set(by_name)
+        assert by_name["Device"].uri == os.path.join(proj_real, "3rdparty", "Device.kicad_sym")
+        assert by_name["Device"].table_path == os.path.join(proj_real, "sym-lib-table")
+        assert by_name["Custom"].uri == os.path.join(proj_real, "3rdparty", "Custom.kicad_sym")
+
+        # The source schematic is never modified.
+        assert Path(sch).read_bytes() == before
+
+    def test_explicit_project_dir_and_validation(self, tools, env, tmp_path):
+        """project_dir may be passed explicitly; a missing dir errors."""
+        proj, sch = self._project(tmp_path)
+        result = _run(
+            tools["export_symbols_to_3rdparty"],
+            schematic_path=sch,
+            project_dir=str(proj),
+        )
+        assert result["project_dir"] == os.path.realpath(str(proj))
+
+        bad = _run(
+            tools["export_symbols_to_3rdparty"],
+            schematic_path=sch,
+            project_dir=str(tmp_path / "nope"),
+        )
+        assert "error" in bad
+        assert "Project directory not found" in bad["error"]
+
+    def test_bodyless_resolvable_symbol_skipped_prefix_not_pinned(self, tools, env, tmp_path):
+        """A used lib_id WITHOUT an inline body that already resolves via a
+        registered library is skipped (not copied from the library), and the
+        prefix is not re-pointed — its resolution is preserved."""
+        from kcaa.utils.symbol_library_utils import list_library_symbols
+
+        _register_global_symbol_library(env, "Device", ("R_Small", "C", "NE555"))
+        proj, sch = self._project(tmp_path, bodyless=("Device:NE555",))
+
+        result = _run(tools["export_symbols_to_3rdparty"], schematic_path=sch)
+        assert "error" not in result, result
+        assert any(
+            s["symbol"] == "Device:NE555" and s["reason"].startswith("already_resolvable")
+            for s in result["skipped"]
+        )
+
+        device = result["libraries"]["Device"]
+        assert device["registered"] is False
+        assert device["register_reason"].startswith("not_pinned")
+        assert "NE555" not in list_library_symbols(device["library_path"])
+        assert {"R_Small", "C"} <= set(list_library_symbols(device["library_path"]))
+
+        # The project table has NO Device entry, so Device:NE555 keeps
+        # resolving through the global library it already resolves via.
+        table_text = (proj / "sym-lib-table").read_text(encoding="utf-8")
+        assert 'name "Device"' not in table_text
+        assert 'name "Custom"' in table_text
+
+    def test_bodyless_unresolvable_symbol_failed(self, tools, env, tmp_path):
+        """A used lib_id without an inline body and without any registered
+        library is reported failed and never written."""
+        from kcaa.utils.symbol_library_utils import list_library_symbols
+
+        proj, sch = self._project(tmp_path, bodyless=("Device:NE555",))
+        result = _run(tools["export_symbols_to_3rdparty"], schematic_path=sch)
+        assert "error" not in result, result
+        assert any(
+            s["symbol"] == "Device:NE555" and s["reason"] == "no_inline_body"
+            for s in result["failed"]
+        )
+        device = result["libraries"]["Device"]
+        assert "NE555" not in list_library_symbols(device["library_path"])
+        assert device["registered"] is False
+        assert device["register_reason"].startswith("not_pinned")
+
+    def test_idempotent_rerun(self, tools, env, tmp_path):
+        """Re-running must not duplicate symbols: everything already present
+        is skipped, the table keeps a single entry per prefix, and the
+        result is stable."""
+        from kcaa.utils.symbol_library_utils import list_library_symbols
+
+        _register_global_symbol_library(env, "Device", ("R_Small", "C", "NE555"))
+        proj, sch = self._project(tmp_path)
+
+        first = _run(tools["export_symbols_to_3rdparty"], schematic_path=sch)
+        assert "error" not in first, first
+        second = _run(tools["export_symbols_to_3rdparty"], schematic_path=sch)
+        assert "error" not in second, second
+
+        assert second["exported"] == []
+        assert second["exported_count"] == 0
+        assert {s["symbol"] for s in second["skipped"]} == {
+            "Device:R_Small",
+            "Device:C",
+            "Custom:MYOP",
+        }
+        assert all(s["reason"] == "already_in_library" for s in second["skipped"])
+        assert second["skipped_count"] == first["exported_count"]
+        assert set(second["libraries"]) == {"Device", "Custom"}
+        assert second["libraries"]["Device"]["register_reason"] == "already_registered"
+        assert second["libraries"]["Device"]["registered"] is True
+
+        # No duplicated symbol definitions, no duplicated table entries.
+        device_path = second["libraries"]["Device"]["library_path"]
+        custom_path = second["libraries"]["Custom"]["library_path"]
+        assert set(list_library_symbols(device_path)) == {"R_Small", "C"}
+        assert set(list_library_symbols(custom_path)) == {"MYOP"}
+        table_text = (proj / "sym-lib-table").read_text(encoding="utf-8")
+        assert table_text.count('name "Device"') == 1
+        assert table_text.count('name "Custom"') == 1
+
+    def test_missing_schematic_returns_clean_error(self, tools, env, tmp_path):
+        """A missing schematic yields a clean error, not a crash."""
+        proj, _ = self._project(tmp_path)
+        result = _run(
+            tools["export_symbols_to_3rdparty"],
+            schematic_path=str(proj / "missing.kicad_sch"),
+        )
+        assert "error" in result
+        assert "Failed to open schematic" in result["error"]
+
+    def test_empty_schematic_returns_clean_error(self, tools, env, tmp_path):
+        """A schematic without symbol instances yields a clean error."""
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        (proj / "tools_test.kicad_pro").write_text("{}", encoding="utf-8")
+        sch = proj / "tools_test.kicad_sch"
+        sch.write_text('(kicad_sch (version 20240108) (generator "eeschema"))', encoding="utf-8")
+
+        result = _run(tools["export_symbols_to_3rdparty"], schematic_path=str(sch))
+        assert "error" in result
+        assert "no symbol instances" in result["error"]
