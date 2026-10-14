@@ -1971,6 +1971,165 @@ class TestMCPToolTimeoutAndInterrupt:
         client._call_llm.assert_called_once()
 
 
+class TestStatusPollBlocking:
+    """Issue #190: status polls for background operations must not burn the
+    turn's iteration cap.  When get_symbol_sync_status /
+    get_footprint_sync_status report the operation still running, the client
+    re-queries them client-side (bounded by the per-call timeout) and hands
+    the model the final snapshot, so the whole wait costs one poll round."""
+
+    def _tool_response(self, name="get_symbol_sync_status", args=None, call_id="tc1"):
+        return {
+            "finish_reason": "tool_calls",
+            "message": {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": call_id,
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": json.dumps(args or {}),
+                        },
+                    }
+                ],
+            },
+        }
+
+    def test_status_poll_blocks_until_op_finishes_without_extra_rounds(self):
+        """A background op that takes several poll snapshots completes inside
+        the model's single status call: no extra LLM rounds are consumed and
+        the recorded tool result is the final snapshot."""
+        client = _make_client()
+        client._call_llm = MagicMock(
+            side_effect=[
+                self._tool_response(),  # model polls the sync status
+                {"finish_reason": "stop", "message": {"content": "sync done"}},
+            ]
+        )
+        status_calls = {"n": 0}
+
+        def _status(base_url, tool_name, args, timeout=None):
+            if tool_name != "get_symbol_sync_status":
+                return {"success": True}
+            status_calls["n"] += 1
+            if status_calls["n"] < 3:
+                return {"running": True, "current": status_calls["n"], "total": 10}
+            return {
+                "running": False,
+                "current": 10,
+                "total": 10,
+                "last_result": {"symbols": 1234},
+            }
+
+        with (
+            patch("kicad_plugin.llm_client._STATUS_POLL_INTERVAL_SECONDS", 0.01),
+            patch("kicad_plugin.llm_client.call_mcp_tool", side_effect=_status),
+        ):
+            result = client.run("sync symbols", context_block="")
+
+        assert result == "sync done"
+        # The whole wait happened inside one model poll round: round 1 asks
+        # for the status, round 2 sees the finished sync and answers.
+        assert client._call_llm.call_count == 2
+        # Intermediate snapshots were polled client-side, not round-tripped
+        # through the model.
+        assert status_calls["n"] == 3
+        tool_results = [m for m in client._history if m["role"] == "tool"]
+        assert len(tool_results) == 1
+        recorded = json.loads(tool_results[0]["content"])
+        assert recorded["running"] is False
+        assert recorded["last_result"] == {"symbols": 1234}
+
+    def test_status_poll_when_op_already_done_does_not_block(self):
+        """A status call that reports the op finished is a plain single MCP
+        call: no client-side re-polling happens."""
+        client = _make_client()
+        client._call_llm = MagicMock(
+            side_effect=[
+                self._tool_response(),
+                {"finish_reason": "stop", "message": {"content": "ok"}},
+            ]
+        )
+
+        def _status(base_url, tool_name, args, timeout=None):
+            return {"running": False, "last_result": {"symbols": 5}}
+
+        with patch("kicad_plugin.llm_client.call_mcp_tool") as mock_call_tool:
+            mock_call_tool.side_effect = _status
+            result = client.run("sync symbols", context_block="")
+
+        assert result == "ok"
+        assert mock_call_tool.call_count == 1
+
+    def test_status_poll_budget_exhaustion_returns_last_snapshot(self):
+        """When the sync outlasts the wait budget the last snapshot is
+        returned (no error, no timeout marker) and the turn continues; the
+        model may poll again with a fresh budget."""
+        client = _make_client()
+        client._mcp_tool_timeout = 0.1
+        client._call_llm = MagicMock(
+            side_effect=[
+                self._tool_response(),
+                {"finish_reason": "stop", "message": {"content": "still syncing, try later"}},
+            ]
+        )
+
+        def _status(base_url, tool_name, args, timeout=None):
+            return {"running": True, "current": 5, "total": 10}
+
+        with (
+            patch("kicad_plugin.llm_client._STATUS_POLL_INTERVAL_SECONDS", 0.02),
+            patch("kicad_plugin.llm_client.call_mcp_tool", side_effect=_status),
+        ):
+            result = client.run("sync symbols", context_block="")
+
+        assert result == "still syncing, try later"
+        assert client._call_llm.call_count == 2
+        tool_results = [m for m in client._history if m["role"] == "tool"]
+        assert len(tool_results) == 1
+        recorded = json.loads(tool_results[0]["content"])
+        # Last snapshot, not a synthesized error.
+        assert recorded["running"] is True
+        assert recorded["current"] == 5
+        assert "timed_out" not in recorded
+        assert recorded.get("interrupted") is not True
+
+    def test_cancel_during_status_wait_aborts_turn(self):
+        """Pressing Stop while the client blocks on a running sync aborts the
+        turn immediately with the interruption recorded (issue #176
+        semantics), without waiting out another LLM round."""
+        client = _make_client()
+        client._call_llm = MagicMock(return_value=self._tool_response())
+        cancel = threading.Event()
+
+        def _status(base_url, tool_name, args, timeout=None):
+            return {"running": True, "current": 1, "total": 10}
+
+        def _press_stop():
+            time.sleep(0.05)
+            cancel.set()
+
+        with (
+            patch("kicad_plugin.llm_client._STATUS_POLL_INTERVAL_SECONDS", 0.02),
+            patch("kicad_plugin.llm_client.call_mcp_tool", side_effect=_status),
+        ):
+            stopper = threading.Thread(target=_press_stop)
+            stopper.start()
+            try:
+                result = client.run("sync symbols", context_block="", cancel_event=cancel)
+            finally:
+                stopper.join(timeout=2)
+
+        assert "[Interrupted]" in result
+        assert "get_symbol_sync_status interrupted by user" in result
+        tool_results = [m for m in client._history if m["role"] == "tool"]
+        assert len(tool_results) == 1
+        recorded = json.loads(tool_results[0]["content"])
+        assert recorded["interrupted"] is True
+        client._call_llm.assert_called_once()
+
+
 class TestToolPolicyRegistry:
     def test_registry_covers_plugin_tool_surface(self):
         """All TOOL_POLICIES entries must have valid ToolPolicy fields.

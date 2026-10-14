@@ -1296,6 +1296,32 @@ class _ToolExecutionState:
 
 
 # ---------------------------------------------------------------------------
+# Background-operation status polling (issue #190)
+# ---------------------------------------------------------------------------
+#
+# sync_symbol_index / sync_footprint_index return immediately and run in a
+# server-side thread; the model then polls get_symbol_sync_status /
+# get_footprint_sync_status until the operation finishes.  Each poll used to
+# be a full LLM round-trip against the turn's iteration cap, so a long sync
+# could starve the turn of iterations before any real work happened.  When a
+# mapped status tool reports the operation still running, the client now
+# blocks on it (see _wait_for_background_op) and hands the model the final
+# snapshot, so the whole wait costs one poll round.  Mapped tools must return
+# a dict with a truthy "running" key while the operation is in flight.
+_STATUS_POLL_TOOLS = frozenset({"get_symbol_sync_status", "get_footprint_sync_status"})
+
+# Interval between client-side re-queries while waiting for a background op.
+_STATUS_POLL_INTERVAL_SECONDS = 1.0
+
+# Iteration ceiling for the agentic loop.  This is a guard against an LLM
+# that never stops requesting tools, NOT a working budget: legitimate turns
+# need a handful of rounds (and status polling blocks client-side instead of
+# consuming rounds), so reaching the cap means the loop is genuinely stuck.
+# Raised from 20 so that long multi-step turns survive (issue #190).
+_MAX_ITERATIONS = 60
+
+
+# ---------------------------------------------------------------------------
 # OpenAI-compatible agentic loop
 # ---------------------------------------------------------------------------
 
@@ -2836,6 +2862,60 @@ class LLMClient:
             return result
         return self._execute_tool_with_policy(name, args, state, on_tool_call, cancel_event)
 
+    def _wait_for_background_op(
+        self,
+        tool_name: str,
+        args: dict[str, Any],
+        result: dict[str, Any],
+        cancel_event: threading.Event | None,
+    ) -> dict[str, Any]:
+        """Block on a background-operation status poll until it completes.
+
+        ``sync_symbol_index`` / ``sync_footprint_index`` return immediately
+        and run in a server-side thread; ``get_symbol_sync_status`` /
+        ``get_footprint_sync_status`` report progress.  If the first status
+        call reports the operation still running, this re-queries it here —
+        reusing the existing per-call timeout machinery — instead of letting
+        every status round-trip count against the turn's iteration cap, a
+        long sync could otherwise starve the turn (issue #190).
+
+        The result stays a plain status snapshot, so model-side poll logic is
+        unchanged (the model just sees a later point in the sync).  Stop
+        (cancel_event) and the per-call timeout budget are honoured; when the
+        budget runs out the last snapshot is returned and the model may poll
+        again with a fresh budget.  Never synthesizes an error.
+        """
+        deadline = time.monotonic() + self._mcp_tool_timeout
+        while result.get("running"):
+            if cancel_event is not None and cancel_event.is_set():
+                # Stop was pressed while blocked: abort the turn now (issue
+                # #176 semantics) instead of waiting out another LLM round.
+                return {
+                    "success": False,
+                    "error": f"tool call {tool_name} interrupted by user",
+                    "interrupted": True,
+                }
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                log.info(
+                    "Status wait budget (%g s) exhausted for %s; returning last "
+                    "snapshot so the model can poll again.",
+                    self._mcp_tool_timeout,
+                    tool_name,
+                )
+                break
+            time.sleep(min(_STATUS_POLL_INTERVAL_SECONDS, remaining))
+            if cancel_event is not None and cancel_event.is_set():
+                return {
+                    "success": False,
+                    "error": f"tool call {tool_name} interrupted by user",
+                    "interrupted": True,
+                }
+            result = self._call_mcp_tool_guarded(tool_name, args, cancel_event)
+            if result.get("interrupted") or result.get("timed_out"):
+                break
+        return result
+
     def _auto_reload_modified_files(
         self,
         state: _ToolExecutionState,
@@ -2935,7 +3015,7 @@ class LLMClient:
         is_final_text = False
 
         try:
-            for _ in range(20):  # max 20 iterations (guard against infinite loops)
+            for _ in range(_MAX_ITERATIONS):  # guard against infinite loops (issue #190)
                 # Rebuild the request tool list every iteration: tools enabled
                 # in a previous iteration must have their full schema in the
                 # NEXT request, not just in this loop's enabled-set (issue #129).
@@ -2989,6 +3069,20 @@ class LLMClient:
                         result = self._execute_or_reject_tool(
                             name, args, state, on_tool_call, cancel_event
                         )
+
+                    if (
+                        isinstance(result, dict)
+                        and name in _STATUS_POLL_TOOLS
+                        and result.get("running")
+                        and not result.get("interrupted")
+                        and not result.get("timed_out")
+                    ):
+                        # A status poll for a background operation that is still
+                        # running.  Block here (bounded by the per-call timeout)
+                        # instead of making the model burn one iteration per poll
+                        # round (issue #190); the result stays a plain status
+                        # snapshot, so model-side poll logic is unchanged.
+                        result = self._wait_for_background_op(name, args, result, cancel_event)
 
                     # Image-bearing tool results (e.g. export_pcb_layer_image)
                     # carry the PNG as a separate MCP image block.  Peel it off
