@@ -4443,6 +4443,92 @@ class TestCallMcpToolImageKey:
         assert "unreachable" in out["error"]
 
 
+# ---------------------------------------------------------------------------
+# call_mcp_tool: isError normalization (issue #195)
+# ---------------------------------------------------------------------------
+
+
+class TestCallMcpToolIsError:
+    """A FastMCP result with isError: true (e.g. a pydantic validation
+    failure) must normalize to success: False with a readable error —
+    never the old behavior of wrapping the error prose in success: True."""
+
+    def _mock_call(self, body):
+        resp = MagicMock()
+        resp.read.return_value = json.dumps(body).encode()
+        resp.__enter__.return_value = resp
+        with patch("urllib.request.urlopen", return_value=resp):
+            return llm_client.call_mcp_tool("http://127.0.0.1:9", "list_symbol_libraries", {})
+
+    def test_validation_error_is_failure_not_success(self):
+        """The observed FastMCP validation-failure shape: isError with a
+        prose text block ("Unexpected keyword argument: 'query'")."""
+        out = self._mock_call(
+            {
+                "result": {
+                    "isError": True,
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "1 validation error for call[list_symbol_libraries]\n"
+                                "query\n  Unexpected keyword argument "
+                                "[type=unexpected_keyword_argument, "
+                                "input_value='Switch', input_type=str]"
+                            ),
+                        }
+                    ],
+                }
+            }
+        )
+        assert out["success"] is False
+        assert "Unexpected keyword argument" in out["error"]
+
+    def test_multiple_text_blocks_are_joined(self):
+        out = self._mock_call(
+            {
+                "result": {
+                    "isError": True,
+                    "content": [
+                        {"type": "text", "text": "first failure"},
+                        {"type": "text", "text": "second failure"},
+                    ],
+                }
+            }
+        )
+        assert out["success"] is False
+        assert out["error"] == "first failure\nsecond failure"
+
+    def test_structured_content_error_preferred(self):
+        out = self._mock_call(
+            {
+                "result": {
+                    "isError": True,
+                    "structuredContent": {"error": "boom: bad argument"},
+                    "content": [{"type": "text", "text": "ignored prose"}],
+                }
+            }
+        )
+        assert out["success"] is False
+        assert out["error"] == "boom: bad argument"
+
+    def test_iserror_without_content_has_fallback_error(self):
+        out = self._mock_call({"result": {"isError": True}})
+        assert out["success"] is False
+        assert out["error"]
+
+    def test_success_result_with_iserror_false_unchanged(self):
+        out = self._mock_call(
+            {
+                "result": {
+                    "isError": False,
+                    "content": [{"type": "text", "text": json.dumps({"ok": 1})}],
+                }
+            }
+        )
+        assert out == {"ok": 1}
+
+
 # Amazon Bedrock provider: OpenAI-compatible endpoint with bearer (Bedrock
 # API key) or AWS SigV4 auth.
 # ---------------------------------------------------------------------------
