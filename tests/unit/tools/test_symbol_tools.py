@@ -296,6 +296,78 @@ class TestListSymbolLibraries:
         assert result["total"] == 0
         assert result["tables"] == []
 
+    def _make_lib(self, name, count):
+        lib = MagicMock()
+        lib.library_name = name
+        lib.file_path = f"/usr/share/kicad/symbols/{name}.kicad_sym"
+        lib.symbol_count = count
+        lib.kicad_version = "7.0"
+        return lib
+
+    def test_query_filters_table_names_case_insensitively(self):
+        mock_mgr = MagicMock()
+        mock_mgr.get_all_libraries.return_value = [
+            self._make_lib("Switch", 10),
+            self._make_lib("Switch_Rotary", 5),
+            self._make_lib("Device", 3),
+        ]
+
+        with patch("kcaa.tools.symbol_tools._get_index_manager", return_value=mock_mgr):
+            result = _call("list_symbol_libraries", query="switch")
+
+        assert result["success"] is True
+        assert result["mode"] == "tables"
+        assert result["query"] == "switch"
+        assert result["total"] == 2
+        assert [t["name"] for t in result["tables"]] == ["Switch", "Switch_Rotary"]
+
+    def test_query_filters_library_names_in_table_mode(self):
+        mock_mgr = MagicMock()
+        mock_mgr.get_all_libraries.return_value = [
+            self._make_lib("Switch/SW_SPDT", 2),
+            self._make_lib("Switch/SW_Push", 3),
+            self._make_lib("Switch/SW_Rotary", 4),
+        ]
+
+        with patch("kcaa.tools.symbol_tools._get_index_manager", return_value=mock_mgr):
+            result = _call("list_symbol_libraries", table="Switch", query="ROTARY")
+
+        assert result["success"] is True
+        assert result["mode"] == "libraries"
+        assert result["table"] == "Switch"
+        assert result["query"] == "ROTARY"
+        assert result["total"] == 1
+        assert [lib["name"] for lib in result["libraries"]] == ["Switch/SW_Rotary"]
+
+    def test_query_no_match_returns_empty_page(self):
+        mock_mgr = MagicMock()
+        mock_mgr.get_all_libraries.return_value = [
+            self._make_lib("Switch", 10),
+            self._make_lib("Device", 3),
+        ]
+
+        with patch("kcaa.tools.symbol_tools._get_index_manager", return_value=mock_mgr):
+            result = _call("list_symbol_libraries", table="Switch", query="zzz")
+
+        assert result["success"] is True
+        assert result["mode"] == "libraries"
+        assert result["total"] == 0
+        assert result["libraries"] == []
+
+    def test_query_none_matches_pre_query_output(self):
+        """Regression gate: query=None must keep the output byte-identical —
+        no extra 'query' key, same pagination over the full listing."""
+        fixture = [self._make_lib("Device", 500), self._make_lib("Connector", 300)]
+        mock_mgr = MagicMock()
+        mock_mgr.get_all_libraries.return_value = fixture
+
+        with patch("kcaa.tools.symbol_tools._get_index_manager", return_value=mock_mgr):
+            base = _call("list_symbol_libraries")
+            explicit_none = _call("list_symbol_libraries", query=None)
+
+        assert explicit_none == base
+        assert "query" not in explicit_none
+
 
 # ---------------------------------------------------------------------------
 # TestGetLibrarySymbols
