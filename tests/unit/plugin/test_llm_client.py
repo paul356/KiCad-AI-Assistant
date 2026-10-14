@@ -5,6 +5,7 @@ import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
 import json
+import logging
 import os
 import re
 import ssl
@@ -1145,9 +1146,10 @@ class TestRunIntegration:
             {"paths": ["/tmp/board.kicad_pcb"]},
         )
 
-    def test_max_iterations_exit_still_reloads_dirty_path(self):
+    def test_max_iterations_exit_still_reloads_dirty_path(self, caplog):
         """Hitting the iteration cap still flushes dirty paths via the shared
-        end-of-turn reload."""
+        end-of-turn reload, and logs a WARNING with the reply so the failure
+        is greppable in the plugin log (issue #191)."""
         client = _make_client()
         tool_response = {
             "finish_reason": "tool_calls",
@@ -1179,11 +1181,21 @@ class TestRunIntegration:
                 if name == "reload_kicad"
                 else {"success": True}
             )
-            result = client.run("move R1", context_block="")
+            # The plugin logger sets propagate=False (kicad_plugin/__init__),
+            # so pytest's root-level capture never sees the record; attach the
+            # capture handler to the client logger itself, as the plugin's own
+            # FileHandler would receive it.
+            logger = logging.getLogger("kicad_plugin.llm_client")
+            logger.addHandler(caplog.handler)
+            try:
+                with caplog.at_level("WARNING", logger="kicad_plugin.llm_client"):
+                    result = client.run("move R1", context_block="")
+            finally:
+                logger.removeHandler(caplog.handler)
 
-        assert (
-            result == "[Error] Maximum tool-call iterations reached. Please try a simpler request."
-        )
+        cap_reply = "[Error] Maximum tool-call iterations reached. Please try a simpler request."
+        assert result == cap_reply
+        assert cap_reply in caplog.text  # greppable failure in the plugin log
         assert mock_call_tool.call_args_list[-1][0][1] == "reload_kicad"
         assert mock_call_tool.call_args_list[-1][0][2] == {"paths": ["/tmp/board.kicad_pcb"]}
 

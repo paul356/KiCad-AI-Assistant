@@ -3072,7 +3072,9 @@ class LLMClient:
             system, on_compacted, on_warning=on_warning, tools_est_tokens=tools_est
         )
         if compact_error:
-            return f"[Error] {compact_error}"
+            reply = f"[Error] {compact_error}"
+            log.warning("LLM turn failed: %s", reply)
+            return reply
 
         tools = self._build_request_tools()
         missing_policies = get_missing_tool_policies(
@@ -3083,9 +3085,11 @@ class LLMClient:
             ]
         )
         if missing_policies:
-            return "[Framework error] Tool policy registry is missing entries for: " + ", ".join(
+            reply = "[Framework error] Tool policy registry is missing entries for: " + ", ".join(
                 missing_policies
             )
+            log.warning("LLM turn failed: %s", reply)
+            return reply
 
         state = _ToolExecutionState()
         reply: str | None = None
@@ -3101,6 +3105,7 @@ class LLMClient:
 
                 if response.get("error"):
                     reply = f"[LLM error] {response['error']}"
+                    log.warning("LLM turn failed: %s", reply)
                     break
 
                 message = response.get("message", {})
@@ -3199,6 +3204,7 @@ class LLMClient:
                             if result.get("interrupted")
                             else f"[Error] {result['error']}"
                         )
+                        log.warning("LLM turn failed: %s", reply)
                         # The rest of the batch is skipped (not executed):
                         # every tool_call_id in the saved assistant message
                         # must still get a recorded result, or the next turn's
@@ -3235,6 +3241,7 @@ class LLMClient:
                 reply = (
                     "[Error] Maximum tool-call iterations reached. Please try a simpler request."
                 )
+                log.warning("LLM turn failed: %s", reply)
         finally:
             # Single shared flush for every exit path (final reply, LLM error,
             # iteration cap, or an escaping exception): keep the KiCad reload in
@@ -3254,7 +3261,10 @@ class LLMClient:
 
         if is_final_text:
             self._history.append({"role": "assistant", "content": reply})
-        return reply if reply is not None else "[Error] Unknown failure."
+        if reply is None:
+            reply = "[Error] Unknown failure."
+            log.warning("LLM turn failed: %s", reply)
+        return reply
 
     @staticmethod
     def _build_user_content(

@@ -39,6 +39,24 @@ log = logging.getLogger(__name__)
 
 AI_ENTRY_TYPES = ("user", "ai")
 
+# Fatal-exit reply prefixes produced by llm_client.run().  Case-sensitive; a
+# reply opening with one of these must stay visible even when the turn already
+# streamed text (issue #191).  ``[Warning]`` / ``[Framework warning]`` are NOT
+# listed: no producer emits a turn reply that *starts* with them — warnings are
+# appended after the real reply (which keeps its own prefix) or travel the
+# separate ``on_warning`` status channel.
+_ERROR_REPLY_PREFIXES = ("[Error]", "[Interrupted]", "[LLM error]", "[Framework error]")
+
+# Colour for a turn-end error reply surfaced as a status notice — mirrors the
+# panel's _C_ERR_HEX.  Kept here (instead of importing panel, which is wx
+# bound) so the state machine stays importable without a display.
+STATUS_ERR_HEX = "#BE1E1E"
+
+
+def _is_error_reply(reply: str) -> bool:
+    """Return whether *reply* opens with a known failure prefix."""
+    return reply.startswith(_ERROR_REPLY_PREFIXES)
+
 
 def make_ai_entry(text: str, timestamp: str) -> dict[str, Any]:
     """Build a permanent AI conversation entry (rendering format unchanged)."""
@@ -133,13 +151,22 @@ def apply_stream_event(
             base.pending = ""
             base.entries_changed = True
         reply = evt.get("reply") or ""
-        if not turn_had_text and reply:
-            # Non-streamed turn (LLM/framework error, iteration cap, or a
-            # cancelled turn whose text never reached the draft): the reply
-            # is the only answer text this turn produced.  Mirrors the old
-            # ``was_streamed=False`` branch of _on_reply.
-            entries.append(make_ai_entry(reply, timestamp()))
-            base.entries_changed = True
+        if reply:
+            if not turn_had_text:
+                # Non-streamed turn (LLM/framework error, iteration cap, or a
+                # cancelled turn whose text never reached the draft): the reply
+                # is the only answer text this turn produced.  Mirrors the old
+                # ``was_streamed=False`` branch of _on_reply.
+                entries.append(make_ai_entry(reply, timestamp()))
+                base.entries_changed = True
+            elif _is_error_reply(reply):
+                # The draft above (or the ai entry archived at text_end) is
+                # the visible answer, so the reply is NOT appended as a second
+                # AI entry; a failure reply must still surface or the turn
+                # looks like the model silently stopped (issue #191).  Status
+                # notices are the distinct error bubble channel.
+                entries.append({"type": "status", "text": reply, "color_hex": STATUS_ERR_HEX})
+                base.entries_changed = True
         return base
 
     if etype == "status":

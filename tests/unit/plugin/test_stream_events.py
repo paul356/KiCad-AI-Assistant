@@ -1,6 +1,8 @@
 """Unit tests for the wx-free stream-lifecycle event state machine."""
 
-from kicad_plugin.ui.stream_events import apply_stream_event, make_ai_entry
+import pytest
+
+from kicad_plugin.ui.stream_events import STATUS_ERR_HEX, apply_stream_event, make_ai_entry
 
 
 def _ts() -> str:
@@ -152,6 +154,75 @@ def test_turn_end_defensive_finalise_of_leftover_draft():
     assert st.entries_changed is True
     assert s["pending"] == ""
     assert s["entries"] == [{"type": "ai", "text": "before", "timestamp": "00:00:00"}]
+
+
+def test_turn_end_error_reply_surfaces_as_status_when_text_streamed():
+    """Issue #191: a failing turn that already streamed (and archived) text
+    must still show the failure — the reply becomes a red status notice
+    instead of being silently dropped."""
+    s = _state()
+    _apply(s, {"type": "text_chunk", "content": "partial draft"})
+    _apply(s, {"type": "text_end"})
+    reply = "[Error] Maximum tool-call iterations reached. Please try a simpler request."
+    st = _apply(s, {"type": "turn_end", "reply": reply})
+
+    assert st.entries_changed is True
+    assert s["entries"] == [
+        {"type": "ai", "text": "partial draft", "timestamp": "00:00:00"},
+        {"type": "status", "text": reply, "color_hex": STATUS_ERR_HEX},
+    ]
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "[Error] tool call timed out",
+        "[Interrupted] tool call stopped by user",
+        "[LLM error] API down",
+        "[Framework error] Tool policy registry is missing entries for: x",
+    ],
+)
+def test_turn_end_error_prefixes_surface_as_status(reply):
+    """Every fatal-exit prefix produced by llm_client.run() surfaces once text
+    was streamed (case-sensitive, exactly as produced)."""
+    s = _state()
+    _apply(s, {"type": "text_chunk", "content": "draft"})
+    _apply(s, {"type": "turn_end", "reply": reply})
+
+    assert [e["type"] for e in s["entries"]] == ["ai", "status"]
+    assert s["entries"][-1]["text"] == reply
+    assert s["entries"][-1]["color_hex"] == STATUS_ERR_HEX
+
+
+def test_turn_end_error_reply_surfaces_after_cancel():
+    """A Stop press must not hide the outcome: the partial draft is finalised
+    as before and an error reply still lands as a status notice (issue #191)."""
+    s = _state()
+    _apply(s, {"type": "text_chunk", "content": "partial answer"})
+    s["cancelled"] = True
+    _apply(s, {"type": "text_chunk", "content": " more"})  # dropped while cancelled
+    _apply(s, {"type": "text_end"})  # skipped while cancelled
+    reply = "[Interrupted] tool call stopped by user"
+    st = _apply(s, {"type": "turn_end", "reply": reply})
+
+    assert st.entries_changed is True
+    assert s["entries"] == [
+        {"type": "ai", "text": "partial answer", "timestamp": "00:00:00"},
+        {"type": "status", "text": reply, "color_hex": STATUS_ERR_HEX},
+    ]
+
+
+def test_turn_end_non_error_reply_still_dropped_when_text_streamed():
+    """A normal reply after streamed text keeps the historical shape: the
+    streamed draft is the answer, the trailing reply is not appended
+    (issue #191 changes error replies only)."""
+    s = _state()
+    _apply(s, {"type": "text_chunk", "content": "final answer"})
+    _apply(s, {"type": "text_end"})
+    st = _apply(s, {"type": "turn_end", "reply": "final answer"})
+
+    assert st.entries_changed is False
+    assert s["entries"] == [{"type": "ai", "text": "final answer", "timestamp": "00:00:00"}]
 
 
 def test_tool_call_entries_mark_tool_use():
