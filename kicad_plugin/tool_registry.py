@@ -54,9 +54,6 @@ TOOL_POLICIES: dict[str, ToolPolicy] = {
     "create_symbol": ToolPolicy(kind="file_mutation"),
     "create_symbol_library": ToolPolicy(kind="file_mutation"),
     "add_symbols_to_library": ToolPolicy(kind="file_mutation"),
-    # Writes .kicad_sym files + the project sym-lib-table; the schematic
-    # itself is never modified, so no snapshot/dirty tracking is attached.
-    "export_symbols_to_3rdparty": ToolPolicy(kind="file_mutation"),
     "remove_symbols_from_library": ToolPolicy(kind="file_mutation"),
     "delete_symbol_library": ToolPolicy(kind="file_mutation"),
     "find_symbols_not_in_libraries": ToolPolicy(kind="query"),
