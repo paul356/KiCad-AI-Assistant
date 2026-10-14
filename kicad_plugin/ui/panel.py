@@ -980,6 +980,19 @@ if _WX_AVAILABLE:
 
             def _run():
                 log.info("Background _run (%s): started", kind)
+                # Imported here (not module level) to keep llm_client lazily
+                # loaded until a turn actually runs.
+                from ..llm_client import LLMTurnFailure
+
+                # Structured turn-failure signal (issue #191, Plan A): set by
+                # run()'s on_turn_failure callback on a fatal exit, None for a
+                # normal turn, so the UI never colors replies by text prefix.
+                failure: LLMTurnFailure | None = None
+
+                def _on_turn_failure(category: LLMTurnFailure) -> None:
+                    nonlocal failure
+                    failure = category
+
                 try:
                     if kind == "chat":
                         # Extract PDF text before sending to LLM
@@ -1028,6 +1041,7 @@ if _WX_AVAILABLE:
                             ),
                             images=images,
                             cancel_event=self._cancel_event,
+                            on_turn_failure=_on_turn_failure,
                         )
                     else:  # tool_direct
                         self._llm_client.run(
@@ -1045,11 +1059,19 @@ if _WX_AVAILABLE:
                 except Exception as e:
                     log.exception("LLM request failed")
                     reply = f"[Error] {e}"
+                    failure = LLMTurnFailure.UNKNOWN_FAILURE
                 log.info("Background _run (%s): finished (reply_len=%d)", kind, len(reply))
                 # turn_end is the queue's final event: emitted after the
                 # reload_kicad / tool callbacks, so the consumer orders it
                 # strictly after the last text of the turn.
-                _emit({"type": "turn_end", "reply": reply, "ctx": ctx})
+                _emit(
+                    {
+                        "type": "turn_end",
+                        "reply": reply,
+                        "failure": None if failure is None else failure.value,
+                        "ctx": ctx,
+                    }
+                )
 
             threading.Thread(target=_run, daemon=True).start()
 

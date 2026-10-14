@@ -39,12 +39,14 @@ log = logging.getLogger(__name__)
 
 AI_ENTRY_TYPES = ("user", "ai")
 
-# Fatal-exit reply prefixes produced by llm_client.run().  Case-sensitive; a
-# reply opening with one of these must stay visible even when the turn already
-# streamed text (issue #191).  ``[Warning]`` / ``[Framework warning]`` are NOT
-# listed: no producer emits a turn reply that *starts* with them — warnings are
-# appended after the real reply (which keeps its own prefix) or travel the
-# separate ``on_warning`` status channel.
+# Legacy fallback: fatal-exit reply prefixes produced by llm_client.run().
+# Case-sensitive; only consulted when the turn_end event carries no structured
+# ``failure`` key (legacy producers/tests — the panel has emitted the key
+# since issue #191 Plan A, so this is a pure backward-compat path).
+# ``[Warning]`` / ``[Framework warning]`` are NOT listed: no producer emits a
+# turn reply that *starts* with them — warnings are appended after the real
+# reply (which keeps its own prefix) or travel the separate ``on_warning``
+# status channel.
 _ERROR_REPLY_PREFIXES = ("[Error]", "[Interrupted]", "[LLM error]", "[Framework error]")
 
 # Colour for a turn-end error reply surfaced as a status notice — mirrors the
@@ -151,6 +153,8 @@ def apply_stream_event(
             base.pending = ""
             base.entries_changed = True
         reply = evt.get("reply") or ""
+        has_failure = "failure" in evt
+        failure = evt.get("failure")
         if reply:
             if not turn_had_text:
                 # Non-streamed turn (LLM/framework error, iteration cap, or a
@@ -159,12 +163,16 @@ def apply_stream_event(
                 # ``was_streamed=False`` branch of _on_reply.
                 entries.append(make_ai_entry(reply, timestamp()))
                 base.entries_changed = True
-            elif _is_error_reply(reply):
+            elif failure is not None or (not has_failure and _is_error_reply(reply)):
                 # The draft above (or the ai entry archived at text_end) is
                 # the visible answer, so the reply is NOT appended as a second
-                # AI entry; a failure reply must still surface or the turn
-                # looks like the model silently stopped (issue #191).  Status
-                # notices are the distinct error bubble channel.
+                # AI entry; a failure must still surface or the turn looks
+                # like the model silently stopped (issue #191).  A structured
+                # ``failure`` category (Plan A) always wins, regardless of
+                # reply text; prefix matching is only the legacy fallback for
+                # events without the key.  An explicit failure=None (normal
+                # turn) suppresses the fallback — the model may have
+                # legitimately written text starting with "[Error]".
                 entries.append({"type": "status", "text": reply, "color_hex": STATUS_ERR_HEX})
                 base.entries_changed = True
         return base

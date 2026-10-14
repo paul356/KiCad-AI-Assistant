@@ -20,7 +20,7 @@ import pytest
 
 from kicad_plugin import llm_client
 from kicad_plugin import session_store as sstore
-from kicad_plugin.llm_client import LLMClient, _subprocess_sse_stream
+from kicad_plugin.llm_client import LLMClient, LLMTurnFailure, _subprocess_sse_stream
 from kicad_plugin.settings import DEFAULT_LLM_USER_AGENT
 from kicad_plugin.tool_registry import TOOL_POLICIES
 
@@ -1130,6 +1130,7 @@ class TestRunIntegration:
         client._call_llm = MagicMock(side_effect=[tool_response, {"error": "API down"}])
         client._enabled_tools = {"set_footprint_position"}
 
+        failures = []
         with patch("kicad_plugin.llm_client.call_mcp_tool") as mock_call_tool:
             mock_call_tool.side_effect = [
                 {"success": True},  # save_document
@@ -1137,9 +1138,10 @@ class TestRunIntegration:
                 {"success": True, "pcb_path": "/tmp/board.kicad_pcb"},
                 {"success": True, "reloaded": ["/tmp/board.kicad_pcb"], "failed": []},
             ]
-            result = client.run("move R1", context_block="")
+            result = client.run("move R1", context_block="", on_turn_failure=failures.append)
 
         assert result == "[LLM error] API down"
+        assert failures == [LLMTurnFailure.LLM_ERROR]
         assert mock_call_tool.call_args_list[-1].args == (
             client._mcp_base_url,
             "reload_kicad",
@@ -1148,8 +1150,9 @@ class TestRunIntegration:
 
     def test_max_iterations_exit_still_reloads_dirty_path(self, caplog):
         """Hitting the iteration cap still flushes dirty paths via the shared
-        end-of-turn reload, and logs a WARNING with the reply so the failure
-        is greppable in the plugin log (issue #191)."""
+        end-of-turn reload, logs a WARNING with the reply so the failure is
+        greppable, and reports the structured ITERATION_CAP category
+        (issue #191)."""
         client = _make_client()
         tool_response = {
             "finish_reason": "tool_calls",
@@ -1175,6 +1178,7 @@ class TestRunIntegration:
         client._call_llm = MagicMock(return_value=tool_response)  # never stops calling tools
         client._enabled_tools = {"set_footprint_position"}
 
+        failures = []
         with patch("kicad_plugin.llm_client.call_mcp_tool") as mock_call_tool:
             mock_call_tool.side_effect = lambda base, name, args, timeout=None: (
                 {"success": True, "reloaded": ["/tmp/board.kicad_pcb"], "failed": []}
@@ -1189,15 +1193,52 @@ class TestRunIntegration:
             logger.addHandler(caplog.handler)
             try:
                 with caplog.at_level("WARNING", logger="kicad_plugin.llm_client"):
-                    result = client.run("move R1", context_block="")
+                    result = client.run(
+                        "move R1", context_block="", on_turn_failure=failures.append
+                    )
             finally:
                 logger.removeHandler(caplog.handler)
+
+        assert failures == [LLMTurnFailure.ITERATION_CAP]
 
         cap_reply = "[Error] Maximum tool-call iterations reached. Please try a simpler request."
         assert result == cap_reply
         assert cap_reply in caplog.text  # greppable failure in the plugin log
         assert mock_call_tool.call_args_list[-1][0][1] == "reload_kicad"
         assert mock_call_tool.call_args_list[-1][0][2] == {"paths": ["/tmp/board.kicad_pcb"]}
+
+    def test_compaction_error_fires_failure_callback(self):
+        """A compaction failure reports COMPACTION_ERROR through
+        on_turn_failure before any LLM call (issue #191, Plan A)."""
+        client = _make_client()
+        client._call_llm = MagicMock()
+        failures = []
+        with patch.object(client, "_maybe_compact", return_value="context window overflow"):
+            result = client.run("hi", context_block="", on_turn_failure=failures.append)
+
+        assert result == "[Error] context window overflow"
+        assert failures == [LLMTurnFailure.COMPACTION_ERROR]
+        client._call_llm.assert_not_called()
+
+    def test_framework_error_fires_failure_callback(self):
+        """A missing tool policy reports FRAMEWORK_ERROR through
+        on_turn_failure before any LLM call (issue #191, Plan A)."""
+        client = _make_client()
+        client._call_llm = MagicMock()
+        client._fetch_tool_definitions = MagicMock(return_value=[])
+        failures = []
+        with (
+            patch.object(client, "_maybe_compact", return_value=None),
+            patch(
+                "kicad_plugin.llm_client.get_missing_tool_policies",
+                return_value=["mystery_tool"],
+            ),
+        ):
+            result = client.run("hi", context_block="", on_turn_failure=failures.append)
+
+        assert "mystery_tool" in result
+        assert failures == [LLMTurnFailure.FRAMEWORK_ERROR]
+        client._call_llm.assert_not_called()
 
     def test_tool_exception_recorded_and_still_reloads_dirty_path(self):
         """A tool raising mid-turn no longer escapes run() (issue #176): the
@@ -1591,11 +1632,13 @@ class TestMCPToolTimeoutAndInterrupt:
             time.sleep(10)  # longer than the configured threshold
             raise AssertionError("blocking call must be abandoned on timeout")
 
+        failures = []
         with patch("kicad_plugin.llm_client.call_mcp_tool", side_effect=_block):
-            result = client.run("do it", context_block="")
+            result = client.run("do it", context_block="", on_turn_failure=failures.append)
 
         assert "[Error]" in result
         assert "did not complete within" in result
+        assert failures == [LLMTurnFailure.TIMED_OUT]
         tool_results = [m for m in client._history if m["role"] == "tool"]
         assert len(tool_results) == 1
         recorded = json.loads(tool_results[0]["content"])
@@ -1621,16 +1664,23 @@ class TestMCPToolTimeoutAndInterrupt:
             time.sleep(0.1)
             cancel.set()
 
+        failures = []
         with patch("kicad_plugin.llm_client.call_mcp_tool", side_effect=_block):
             stopper = threading.Thread(target=_press_stop)
             stopper.start()
             try:
-                result = client.run("do it", context_block="", cancel_event=cancel)
+                result = client.run(
+                    "do it",
+                    context_block="",
+                    cancel_event=cancel,
+                    on_turn_failure=failures.append,
+                )
             finally:
                 stopper.join(timeout=2)
 
         assert "[Interrupted]" in result
         assert "interrupted by user" in result
+        assert failures == [LLMTurnFailure.INTERRUPTED]
         tool_results = [m for m in client._history if m["role"] == "tool"]
         assert len(tool_results) == 1
         recorded = json.loads(tool_results[0]["content"])
@@ -3083,10 +3133,14 @@ class TestStreaming:
             "message": {"content": "done", "tool_calls": []},
         }
         on_event = MagicMock()
+        on_failure = MagicMock()
         client._call_llm = MagicMock(return_value=final_response)
         client._fetch_tool_definitions = MagicMock(return_value=[])
 
-        result = client.run("hello", context_block="", on_stream_event=on_event)
+        result = client.run(
+            "hello", context_block="", on_stream_event=on_event, on_turn_failure=on_failure
+        )
+        on_failure.assert_not_called()  # a normal turn reports no failure
 
         assert result == "done"
         # _call_llm must have been called with on_stream_event=on_event

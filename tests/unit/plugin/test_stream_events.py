@@ -225,6 +225,43 @@ def test_turn_end_non_error_reply_still_dropped_when_text_streamed():
     assert s["entries"] == [{"type": "ai", "text": "final answer", "timestamp": "00:00:00"}]
 
 
+def test_turn_end_structured_failure_surfaces_status_with_innocuous_reply():
+    """A structured failure category marks the turn failed even when the
+    reply text carries no error prefix — no text sniffing (Plan A)."""
+    s = _state()
+    _apply(s, {"type": "text_chunk", "content": "streamed answer"})
+    _apply(s, {"type": "text_end"})
+    st = _apply(s, {"type": "turn_end", "reply": "done", "failure": "iteration_cap"})
+
+    assert st.entries_changed is True
+    assert s["entries"] == [
+        {"type": "ai", "text": "streamed answer", "timestamp": "00:00:00"},
+        {"type": "status", "text": "done", "color_hex": STATUS_ERR_HEX},
+    ]
+
+
+def test_turn_end_failure_none_suppresses_legacy_prefix_matching():
+    """An explicit failure=None (normal turn) wins over error-looking reply
+    text: the model may legitimately write '[Error] ...' (Plan A)."""
+    s = _state()
+    _apply(s, {"type": "text_chunk", "content": "draft"})
+    _apply(s, {"type": "text_end"})
+    st = _apply(s, {"type": "turn_end", "reply": "[Error] not a real failure", "failure": None})
+
+    assert st.entries_changed is False
+    assert s["entries"] == [{"type": "ai", "text": "draft", "timestamp": "00:00:00"}]
+
+
+def test_turn_end_structured_failure_never_streamed_keeps_ai_entry():
+    """The structured category does not change the non-streamed path: the
+    reply is still the turn's ai entry, not a status notice."""
+    s = _state()
+    st = _apply(s, {"type": "turn_end", "reply": "[LLM error] API down", "failure": "llm_error"})
+
+    assert st.entries_changed is True
+    assert s["entries"] == [{"type": "ai", "text": "[LLM error] API down", "timestamp": "00:00:00"}]
+
+
 def test_tool_call_entries_mark_tool_use():
     s = _state()
     _apply(
