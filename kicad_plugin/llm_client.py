@@ -12,6 +12,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 import datetime
 import difflib
+from enum import Enum
 import json
 import logging
 import os
@@ -1379,6 +1380,36 @@ def _emit_wait_status_notice(
         on_stream_event({"type": "status", "text": text, "color_hex": _STATUS_EVENT_COLOR_HEX})
     except Exception as e:  # same contract as _emit_tool_callback
         log.error("status event callback error in _emit_wait_status_notice: %s", e)
+
+
+# Turn-failure categories (issue #191, Plan A)
+# ---------------------------------------------------------------------------
+
+
+class LLMTurnFailure(Enum):
+    """Structured category for a turn that ended without a final answer.
+
+    Reported through ``run()``'s ``on_turn_failure`` callback; the panel
+    carries the ``.value`` string on the turn_end event so the UI never has
+    to infer a failure by matching reply text.
+    """
+
+    COMPACTION_ERROR = "compaction_error"
+    FRAMEWORK_ERROR = "framework_error"
+    LLM_ERROR = "llm_error"
+    INTERRUPTED = "interrupted"
+    TIMED_OUT = "timed_out"
+    ITERATION_CAP = "iteration_cap"
+    UNKNOWN_FAILURE = "unknown_failure"
+
+
+def _signal_turn_failure(
+    on_turn_failure: Callable[[LLMTurnFailure], None] | None,
+    category: LLMTurnFailure,
+) -> None:
+    """Fire the turn-failure callback for a fatal exit, if one is wired up."""
+    if on_turn_failure is not None:
+        on_turn_failure(category)
 
 
 # ---------------------------------------------------------------------------
@@ -3024,6 +3055,7 @@ class LLMClient:
         on_warning: Callable[[str], None] | None = None,
         images: list[dict[str, Any]] | None = None,
         cancel_event: threading.Event | None = None,
+        on_turn_failure: Callable[[LLMTurnFailure], None] | None = None,
     ) -> str:
         """
         Run one engineer request through the agentic loop.
@@ -3044,6 +3076,13 @@ class LLMClient:
             on_warning:    Optional callback(notice) for one-shot context-window
                            diagnostics (fixed overhead over budget, budget
                            exceeded with nothing to compact).
+            on_turn_failure: Optional callback(category) fired once when the
+                           turn ends in a fatal failure (iteration cap, LLM
+                           error, tool interrupt/timeout, framework or
+                           compaction error).  Carries the structured
+                           LLMTurnFailure category so the UI does not have to
+                           infer failures from reply text (issue #191); NOT
+                           called when the turn completes normally.
             images:        Optional list of dicts {"media_type": "image/png",
                            "data": "<base64>"} attached to this user message.
             cancel_event:  Set by the UI Stop button.  Tool calls observe it
@@ -3072,7 +3111,10 @@ class LLMClient:
             system, on_compacted, on_warning=on_warning, tools_est_tokens=tools_est
         )
         if compact_error:
-            return f"[Error] {compact_error}"
+            reply = f"[Error] {compact_error}"
+            log.warning("LLM turn failed: %s", reply)
+            _signal_turn_failure(on_turn_failure, LLMTurnFailure.COMPACTION_ERROR)
+            return reply
 
         tools = self._build_request_tools()
         missing_policies = get_missing_tool_policies(
@@ -3083,9 +3125,12 @@ class LLMClient:
             ]
         )
         if missing_policies:
-            return "[Framework error] Tool policy registry is missing entries for: " + ", ".join(
+            reply = "[Framework error] Tool policy registry is missing entries for: " + ", ".join(
                 missing_policies
             )
+            log.warning("LLM turn failed: %s", reply)
+            _signal_turn_failure(on_turn_failure, LLMTurnFailure.FRAMEWORK_ERROR)
+            return reply
 
         state = _ToolExecutionState()
         reply: str | None = None
@@ -3101,6 +3146,8 @@ class LLMClient:
 
                 if response.get("error"):
                     reply = f"[LLM error] {response['error']}"
+                    log.warning("LLM turn failed: %s", reply)
+                    _signal_turn_failure(on_turn_failure, LLMTurnFailure.LLM_ERROR)
                     break
 
                 message = response.get("message", {})
@@ -3199,6 +3246,13 @@ class LLMClient:
                             if result.get("interrupted")
                             else f"[Error] {result['error']}"
                         )
+                        log.warning("LLM turn failed: %s", reply)
+                        _signal_turn_failure(
+                            on_turn_failure,
+                            LLMTurnFailure.INTERRUPTED
+                            if result.get("interrupted")
+                            else LLMTurnFailure.TIMED_OUT,
+                        )
                         # The rest of the batch is skipped (not executed):
                         # every tool_call_id in the saved assistant message
                         # must still get a recorded result, or the next turn's
@@ -3235,6 +3289,8 @@ class LLMClient:
                 reply = (
                     "[Error] Maximum tool-call iterations reached. Please try a simpler request."
                 )
+                log.warning("LLM turn failed: %s", reply)
+                _signal_turn_failure(on_turn_failure, LLMTurnFailure.ITERATION_CAP)
         finally:
             # Single shared flush for every exit path (final reply, LLM error,
             # iteration cap, or an escaping exception): keep the KiCad reload in
@@ -3254,7 +3310,11 @@ class LLMClient:
 
         if is_final_text:
             self._history.append({"role": "assistant", "content": reply})
-        return reply if reply is not None else "[Error] Unknown failure."
+        if reply is None:
+            reply = "[Error] Unknown failure."
+            log.warning("LLM turn failed: %s", reply)
+            _signal_turn_failure(on_turn_failure, LLMTurnFailure.UNKNOWN_FAILURE)
+        return reply
 
     @staticmethod
     def _build_user_content(
