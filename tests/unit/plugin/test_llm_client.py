@@ -2129,6 +2129,114 @@ class TestStatusPollBlocking:
         assert recorded["interrupted"] is True
         client._call_llm.assert_called_once()
 
+    def test_status_poll_emits_wait_notice_while_waiting(self):
+        """A blocking status-poll wait surfaces a transient "Waiting for …"
+        notice on the status channel (issue #190 follow-up): the user sees
+        polling progress instead of a silent block.  A short wait emits
+        exactly one notice — the immediate one; the 5 s rate window is never
+        crossed."""
+        client = _make_client()
+        client._call_llm = MagicMock(
+            side_effect=[
+                self._tool_response(),  # model polls the sync status
+                {"finish_reason": "stop", "message": {"content": "sync done"}},
+            ]
+        )
+        events: list[dict] = []
+        status_calls = {"n": 0}
+
+        def _status(base_url, tool_name, args, timeout=None):
+            status_calls["n"] += 1
+            if status_calls["n"] < 3:
+                return {"running": True, "current": status_calls["n"], "total": 10}
+            return {"running": False, "current": 10, "total": 10, "last_result": {"symbols": 1}}
+
+        with (
+            patch("kicad_plugin.llm_client._STATUS_POLL_INTERVAL_SECONDS", 0.01),
+            patch("kicad_plugin.llm_client.call_mcp_tool", side_effect=_status),
+        ):
+            result = client.run("sync symbols", context_block="", on_stream_event=events.append)
+
+        assert result == "sync done"
+        waiting = [
+            e
+            for e in events
+            if e.get("type") == "status"
+            and "Waiting for get_symbol_sync_status" in e.get("text", "")
+        ]
+        assert len(waiting) == 1
+        assert waiting[0]["text"] == "Waiting for get_symbol_sync_status… (0s) — sync in progress"
+        assert waiting[0]["color_hex"] == "#BE6400"
+        # The snapshot returned to the model is still the final one.
+        recorded = json.loads([m for m in client._history if m["role"] == "tool"][0]["content"])
+        assert recorded["running"] is False
+
+    def test_status_poll_emits_no_wait_notice_when_not_blocking(self):
+        """An op that is already done never emits a wait notice: the status
+        channel stays silent for a non-blocking poll."""
+        client = _make_client()
+        client._call_llm = MagicMock(
+            side_effect=[
+                self._tool_response(),
+                {"finish_reason": "stop", "message": {"content": "ok"}},
+            ]
+        )
+        events: list[dict] = []
+
+        def _status(base_url, tool_name, args, timeout=None):
+            return {"running": False, "last_result": {"symbols": 5}}
+
+        with patch("kicad_plugin.llm_client.call_mcp_tool") as mock_call_tool:
+            mock_call_tool.side_effect = _status
+            result = client.run("sync symbols", context_block="", on_stream_event=events.append)
+
+        assert result == "ok"
+        assert mock_call_tool.call_count == 1
+        assert [e for e in events if e.get("type") == "status"] == []
+
+    def test_status_poll_wait_notices_rate_limited_to_5s(self):
+        """Wait notices are rate-limited to one per 5 s of elapsed wait time
+        (plus the immediate first one) — the UI is not flooded once per poll.
+        Uses a fake clock so the 5 s cadence is deterministic."""
+        client = _make_client()
+        client._mcp_tool_timeout = 60
+        client._call_llm = MagicMock(
+            side_effect=[
+                self._tool_response(),
+                {"finish_reason": "stop", "message": {"content": "ok"}},
+            ]
+        )
+        events: list[dict] = []
+        fake_now = {"t": 0.0}
+
+        def _status(base_url, tool_name, args, timeout=None):
+            return {"running": True, "current": 1, "total": 10}
+
+        def _fake_sleep(seconds):
+            fake_now["t"] += seconds
+
+        def _fake_monotonic():
+            return fake_now["t"]
+
+        with (
+            patch("kicad_plugin.llm_client.call_mcp_tool", side_effect=_status),
+            patch("kicad_plugin.llm_client.time.sleep", side_effect=_fake_sleep),
+            patch("kicad_plugin.llm_client.time.monotonic", side_effect=_fake_monotonic),
+        ):
+            result = client.run("sync symbols", context_block="", on_stream_event=events.append)
+
+        assert result == "ok"
+        waiting = [
+            e
+            for e in events
+            if e.get("type") == "status"
+            and "Waiting for get_symbol_sync_status" in e.get("text", "")
+        ]
+        secs = [int(re.search(r"\((\d+)s\)", e["text"]).group(1)) for e in waiting]
+        # Wait runs the full 60 s budget; notices at t=0 then every 5 s.
+        assert secs == list(range(0, 60, 5))
+        assert all(e["color_hex"] == "#BE6400" for e in waiting)
+
 
 class TestToolPolicyRegistry:
     def test_registry_covers_plugin_tool_surface(self):

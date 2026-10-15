@@ -1313,12 +1313,49 @@ _STATUS_POLL_TOOLS = frozenset({"get_symbol_sync_status", "get_footprint_sync_st
 # Interval between client-side re-queries while waiting for a background op.
 _STATUS_POLL_INTERVAL_SECONDS = 1.0
 
+# Rate limit for the transient "Waiting for …" status notices emitted while
+# blocking on a background op: at most one notice per this many elapsed
+# seconds, plus one immediately when the wait starts (see
+# _wait_for_background_op), so the user sees polling begin right away instead
+# of a silent multi-minute block (issue #190 follow-up).
+_STATUS_EVENT_INTERVAL_SECONDS = 5.0
+
+# Notice colour for the wait status notices.  Matches the panel's
+# _C_WARN_HEX ("#BE6400"), the amber used for every transient notice
+# (panel.py defines it as an instance constant inside the wx-bound
+# AssistantPanel, so it is not importable here; keep the two in sync).
+_STATUS_EVENT_COLOR_HEX = "#BE6400"
+
 # Iteration ceiling for the agentic loop.  This is a guard against an LLM
 # that never stops requesting tools, NOT a working budget: legitimate turns
 # need a handful of rounds (and status polling blocks client-side instead of
 # consuming rounds), so reaching the cap means the loop is genuinely stuck.
 # Raised from 20 so that long multi-step turns survive (issue #190).
 _MAX_ITERATIONS = 60
+
+
+def _wait_status_text(tool_name: str, elapsed_seconds: int) -> str:
+    """One-line transient notice shown while blocking on a background op."""
+
+    return f"Waiting for {tool_name}… ({elapsed_seconds}s) — sync in progress"
+
+
+def _emit_wait_status_notice(
+    on_stream_event: Callable[[dict[str, Any]], None] | None, text: str
+) -> None:
+    """Emit one transient status notice for a background-op wait (issue #190).
+
+    Uses the same ``{"type": "status", text, color_hex}`` event channel the
+    panel renders as notices.  Mirrors _emit_tool_callback's exception
+    safety: a UI callback failure must never break the wait loop or the turn.
+    """
+
+    if not on_stream_event:
+        return
+    try:
+        on_stream_event({"type": "status", "text": text, "color_hex": _STATUS_EVENT_COLOR_HEX})
+    except Exception as e:  # same contract as _emit_tool_callback
+        log.error("status event callback error in _emit_wait_status_notice: %s", e)
 
 
 # ---------------------------------------------------------------------------
@@ -2868,6 +2905,7 @@ class LLMClient:
         args: dict[str, Any],
         result: dict[str, Any],
         cancel_event: threading.Event | None,
+        on_stream_event: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         """Block on a background-operation status poll until it completes.
 
@@ -2884,8 +2922,18 @@ class LLMClient:
         (cancel_event) and the per-call timeout budget are honoured; when the
         budget runs out the last snapshot is returned and the model may poll
         again with a fresh budget.  Never synthesizes an error.
+
+        While blocked, rate-limited transient status notices ("Waiting for
+        … (Ns)") are emitted through *on_stream_event* so the user sees
+        polling progress instead of a silent multi-minute block; nothing is
+        emitted once the wait ends (the result snapshot itself carries
+        completion).
         """
         deadline = time.monotonic() + self._mcp_tool_timeout
+        started = time.monotonic()
+        # Emit the first notice as soon as the wait begins (won't emit at all
+        # when the budget is already exhausted — remaining <= 0 below).
+        last_status_elapsed = -_STATUS_EVENT_INTERVAL_SECONDS
         while result.get("running"):
             if cancel_event is not None and cancel_event.is_set():
                 # Stop was pressed while blocked: abort the turn now (issue
@@ -2904,6 +2952,12 @@ class LLMClient:
                     tool_name,
                 )
                 break
+            elapsed = time.monotonic() - started
+            if elapsed - last_status_elapsed >= _STATUS_EVENT_INTERVAL_SECONDS:
+                _emit_wait_status_notice(
+                    on_stream_event, _wait_status_text(tool_name, int(elapsed))
+                )
+                last_status_elapsed = elapsed
             time.sleep(min(_STATUS_POLL_INTERVAL_SECONDS, remaining))
             if cancel_event is not None and cancel_event.is_set():
                 return {
@@ -3082,7 +3136,13 @@ class LLMClient:
                         # instead of making the model burn one iteration per poll
                         # round (issue #190); the result stays a plain status
                         # snapshot, so model-side poll logic is unchanged.
-                        result = self._wait_for_background_op(name, args, result, cancel_event)
+                        result = self._wait_for_background_op(
+                            name,
+                            args,
+                            result,
+                            cancel_event,
+                            on_stream_event=on_stream_event,
+                        )
 
                     # Image-bearing tool results (e.g. export_pcb_layer_image)
                     # carry the PNG as a separate MCP image block.  Peel it off
