@@ -19,6 +19,7 @@ import os
 import threading
 from typing import Any
 
+from .colors import ERR_HEX, WARN_HEX
 from .stream_events import apply_stream_event, make_ai_entry
 
 log = logging.getLogger(__name__)
@@ -228,8 +229,8 @@ if _WX_AVAILABLE:
         _C_AI_HEX = "#008250"
         _C_TOOL_HEX = "#787878"
         _C_OK_HEX = "#008C00"
-        _C_WARN_HEX = "#BE6400"
-        _C_ERR_HEX = "#BE1E1E"
+        _C_WARN_HEX = WARN_HEX  # from ui/colors.py (single source of truth)
+        _C_ERR_HEX = ERR_HEX  # from ui/colors.py (single source of truth)
         _BG_CONV_HEX = "#F5F7FC"
 
         @staticmethod

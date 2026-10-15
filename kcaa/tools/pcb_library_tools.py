@@ -409,8 +409,11 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
     async def get_footprint_sync_status(ctx: Context | None = None) -> dict[str, Any]:
         """Return the current status of the background footprint index sync.
 
-        Call this after ``sync_footprint_index`` to monitor progress.  Poll
-        every few seconds until ``running`` is False.
+        Call this after ``sync_footprint_index`` to monitor progress.  When
+        invoked from the assistant loop, the client blocks on this call until
+        the sync finishes (progress notices appear in the UI) and returns the
+        final snapshot; the tool itself always returns a plain status
+        snapshot and may be called again if it still shows ``running`` True.
 
         Returns:
             running: True while sync is in progress.

@@ -325,10 +325,14 @@ def register_symbol_tools(mcp: FastMCP) -> None:
         """
         Return the current status of the background symbol index sync.
 
-        Call this after sync_symbol_index to monitor progress. Poll every few
-        seconds until 'running' is False. When running is False and last_result
-        is present, the sync completed successfully. When running is False and
-        error is present, the sync failed.
+        Call this after sync_symbol_index to monitor progress.  When invoked
+        from the assistant loop, the client blocks on this call until the
+        sync finishes (progress notices appear in the UI) and returns the
+        final snapshot; the tool itself always returns a plain status
+        snapshot and may be called again if it still shows running True.
+        When running is False and last_result is present, the sync completed
+        successfully.  When running is False and error is present, the sync
+        failed.
         """
         with _sync_lock:
             state = {

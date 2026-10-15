@@ -26,6 +26,10 @@ from typing import Any
 
 from .tool_registry import TOOL_POLICIES, get_missing_tool_policies, get_tool_policy
 
+# Notice colour for wait progress; single source of truth is ui/colors.py
+# (shared with the panel), kept alias-local so call sites stay unchanged.
+from .ui.colors import WARN_HEX as _STATUS_EVENT_COLOR_HEX
+
 log = logging.getLogger(__name__)
 
 
@@ -1326,12 +1330,6 @@ _STATUS_POLL_INTERVAL_SECONDS = 1.0
 # sees polling begin right away instead of a silent multi-minute block
 # (issue #190 follow-up).
 _STATUS_EVENT_INTERVAL_SECONDS = 5.0
-
-# Notice colour for the wait status notices.  Matches the panel's
-# _C_WARN_HEX ("#BE6400"), the amber used for every transient notice
-# (panel.py defines it as an instance constant inside the wx-bound
-# AssistantPanel, so it is not importable here; keep the two in sync).
-_STATUS_EVENT_COLOR_HEX = "#BE6400"
 
 # Iteration ceiling for the agentic loop.  This is a guard against an LLM
 # that never stops requesting tools, NOT a working budget: legitimate turns
