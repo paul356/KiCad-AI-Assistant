@@ -4528,6 +4528,21 @@ class TestCallMcpToolIsError:
         )
         assert out == {"ok": 1}
 
+    def test_iserror_wins_over_decodable_json_text(self):
+        """A text block that parses as JSON must NOT be returned as
+        success when the server flagged isError — the failure wins over
+        the success-path json.loads (precedence pin, issue #195)."""
+        out = self._mock_call(
+            {
+                "result": {
+                    "isError": True,
+                    "content": [{"type": "text", "text": json.dumps({"ok": 1})}],
+                }
+            }
+        )
+        assert out["success"] is False
+        assert out["error"] == json.dumps({"ok": 1})
+
 
 # Amazon Bedrock provider: OpenAI-compatible endpoint with bearer (Bedrock
 # API key) or AWS SigV4 auth.

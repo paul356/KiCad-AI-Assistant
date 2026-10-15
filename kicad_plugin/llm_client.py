@@ -1126,7 +1126,9 @@ def _mcp_error_message(result: dict[str, Any]) -> str:
         texts = [
             block.get("text", "").strip()
             for block in content
-            if isinstance(block, dict) and block.get("type") == "text"
+            if isinstance(block, dict)
+            and block.get("type") == "text"
+            and isinstance(block.get("text"), str)
         ]
         joined = "\n".join(text for text in texts if text).strip()
         if joined:
@@ -1209,8 +1211,11 @@ def call_mcp_tool(
                 # FastMCP marks failed calls (e.g. pydantic validation
                 # errors) with isError: true.  Normalize those to a
                 # structured failure instead of wrapping the error prose
-                # in success: True (issue #195).
-                if result.get("isError") is True:
+                # in success: True (issue #195).  The spec types isError
+                # as a bool; tolerate a sloppy serializer's string/int
+                # truthy variants too — anything else (e.g. "false", 0,
+                # None) keeps the strict default: success path.
+                if result.get("isError") in (True, "true", "True", 1):
                     box["result"] = {
                         "success": False,
                         "error": _mcp_error_message(result),
@@ -1229,10 +1234,17 @@ def call_mcp_tool(
                                 "data": img.get("data", ""),
                             }
                         if text is not None:
+                            # Coerce a null/non-string text value so a
+                            # malformed block degrades to the non-JSON
+                            # fallback instead of letting TypeError
+                            # escape the worker thread.
+                            text_content = text.get("text")
+                            if not isinstance(text_content, str):
+                                text_content = ""
                             try:
-                                out = json.loads(text.get("text", ""))
+                                out = json.loads(text_content)
                             except json.JSONDecodeError:
-                                out = {"success": True, "text": text.get("text", "")}
+                                out = {"success": True, "text": text_content}
                             if isinstance(out, dict) and image is not None:
                                 out["_image"] = image
                             box["result"] = out
