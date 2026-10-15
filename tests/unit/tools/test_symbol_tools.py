@@ -355,6 +355,53 @@ class TestListSymbolLibraries:
         assert result["limit"] == 1
         assert len(result["libraries"]) == 1
 
+    def test_offset_beyond_end_returns_empty_page(self):
+        mock_mgr = MagicMock()
+        mock_mgr.get_all_libraries.return_value = [
+            self._make_lib(f"Lib{i:03d}", i) for i in range(250)
+        ]
+
+        with patch("kcaa.tools.symbol_tools._get_index_manager", return_value=mock_mgr):
+            result = _call("list_symbol_libraries", limit=200, offset=1000)
+
+        assert result["success"] is True
+        assert result["total"] == 250
+        assert result["libraries"] == []
+        assert result["truncated"] is False
+
+    def test_negative_offset_clamped_to_zero(self):
+        mock_mgr = MagicMock()
+        mock_mgr.get_all_libraries.return_value = [
+            self._make_lib(f"Lib{i:03d}", i) for i in range(250)
+        ]
+
+        with patch("kcaa.tools.symbol_tools._get_index_manager", return_value=mock_mgr):
+            result = _call("list_symbol_libraries", limit=200, offset=-5)
+
+        assert result["success"] is True
+        assert result["offset"] == 0
+        assert result["total"] == 250
+        assert result["truncated"] is True
+        assert len(result["libraries"]) == 200
+        assert result["libraries"][0]["name"] == "Lib000"
+        assert result["libraries"][-1]["name"] == "Lib199"
+
+    def test_last_page_boundary_not_truncated(self):
+        mock_mgr = MagicMock()
+        mock_mgr.get_all_libraries.return_value = [
+            self._make_lib(f"Lib{i:03d}", i) for i in range(250)
+        ]
+
+        with patch("kcaa.tools.symbol_tools._get_index_manager", return_value=mock_mgr):
+            result = _call("list_symbol_libraries", limit=100, offset=200)
+
+        assert result["success"] is True
+        assert result["total"] == 250
+        assert result["truncated"] is False
+        assert len(result["libraries"]) == 50
+        assert result["libraries"][0]["name"] == "Lib200"
+        assert result["libraries"][-1]["name"] == "Lib249"
+
 
 # ---------------------------------------------------------------------------
 # TestGetLibrarySymbols
