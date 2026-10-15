@@ -9,7 +9,7 @@ description: "Symbol index sync, full-text search, pin details, bbox geometry in
 - **search_symbols** — Full-text search across all indexed KiCad symbols (names, descriptions, keywords).
 - **get_symbol** — Look up a single symbol's metadata, pin count, and body_bbox (library Y-up space).
 - **get_symbol_pins** — Return detailed pin info: number, name, electrical type, wire-exit direction.
-- **list_symbol_libraries** — Browse the library tree (tables → libraries).
+- **list_symbol_libraries** — List all indexed symbol libraries (flat, paginated).
 - **get_library_symbols** — Enumerate symbols within a specific library.
 - **get_symbol_index_stats** — Summary statistics (library count, symbol count, last sync).
 

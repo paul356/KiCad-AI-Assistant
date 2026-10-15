@@ -256,18 +256,17 @@ class TestGetSymbol:
 class TestListSymbolLibraries:
     """Tests for list_symbol_libraries()."""
 
-    def test_returns_libraries(self):
-        lib1 = MagicMock()
-        lib1.library_name = "Device"
-        lib1.file_path = "/usr/share/kicad/symbols/Device.kicad_sym"
-        lib1.symbol_count = 500
-        lib1.kicad_version = "7.0"
+    def _make_lib(self, name, count):
+        lib = MagicMock()
+        lib.library_name = name
+        lib.file_path = f"/usr/share/kicad/symbols/{name}.kicad_sym"
+        lib.symbol_count = count
+        lib.kicad_version = "7.0"
+        return lib
 
-        lib2 = MagicMock()
-        lib2.library_name = "Connector"
-        lib2.file_path = "/usr/share/kicad/symbols/Connector.kicad_sym"
-        lib2.symbol_count = 300
-        lib2.kicad_version = "7.0"
+    def test_returns_libraries(self):
+        lib1 = self._make_lib("Device", 500)
+        lib2 = self._make_lib("Connector", 300)
 
         mock_mgr = MagicMock()
         mock_mgr.get_all_libraries.return_value = [lib1, lib2]
@@ -276,13 +275,18 @@ class TestListSymbolLibraries:
             result = _call("list_symbol_libraries")
 
         assert result["success"] is True
-        assert result["mode"] == "tables"
         assert result["total"] == 2
-        names = [t["name"] for t in result["tables"]]
+        assert result["offset"] == 0
+        assert result["limit"] == 200
+        assert result["truncated"] is False
+        assert "mode" not in result
+        names = [lib["name"] for lib in result["libraries"]]
         assert "Device" in names
         assert "Connector" in names
-        first = result["tables"][0]
-        assert "symbol_count" in first
+        first = result["libraries"][0]
+        assert first["name"] == "Device"
+        assert first["symbol_count"] == 500
+        assert first["file_path"] == "/usr/share/kicad/symbols/Device.kicad_sym"
 
     def test_empty_libraries(self):
         mock_mgr = MagicMock()
@@ -292,81 +296,64 @@ class TestListSymbolLibraries:
             result = _call("list_symbol_libraries")
 
         assert result["success"] is True
-        assert result["mode"] == "tables"
         assert result["total"] == 0
-        assert result["tables"] == []
-
-    def _make_lib(self, name, count):
-        lib = MagicMock()
-        lib.library_name = name
-        lib.file_path = f"/usr/share/kicad/symbols/{name}.kicad_sym"
-        lib.symbol_count = count
-        lib.kicad_version = "7.0"
-        return lib
-
-    def test_query_filters_table_names_case_insensitively(self):
-        mock_mgr = MagicMock()
-        mock_mgr.get_all_libraries.return_value = [
-            self._make_lib("Switch", 10),
-            self._make_lib("Switch_Rotary", 5),
-            self._make_lib("Device", 3),
-        ]
-
-        with patch("kcaa.tools.symbol_tools._get_index_manager", return_value=mock_mgr):
-            result = _call("list_symbol_libraries", query="switch")
-
-        assert result["success"] is True
-        assert result["mode"] == "tables"
-        assert result["query"] == "switch"
-        assert result["total"] == 2
-        assert [t["name"] for t in result["tables"]] == ["Switch", "Switch_Rotary"]
-
-    def test_query_filters_library_names_in_table_mode(self):
-        mock_mgr = MagicMock()
-        mock_mgr.get_all_libraries.return_value = [
-            self._make_lib("Switch/SW_SPDT", 2),
-            self._make_lib("Switch/SW_Push", 3),
-            self._make_lib("Switch/SW_Rotary", 4),
-        ]
-
-        with patch("kcaa.tools.symbol_tools._get_index_manager", return_value=mock_mgr):
-            result = _call("list_symbol_libraries", table="Switch", query="ROTARY")
-
-        assert result["success"] is True
-        assert result["mode"] == "libraries"
-        assert result["table"] == "Switch"
-        assert result["query"] == "ROTARY"
-        assert result["total"] == 1
-        assert [lib["name"] for lib in result["libraries"]] == ["Switch/SW_Rotary"]
-
-    def test_query_no_match_returns_empty_page(self):
-        mock_mgr = MagicMock()
-        mock_mgr.get_all_libraries.return_value = [
-            self._make_lib("Switch", 10),
-            self._make_lib("Device", 3),
-        ]
-
-        with patch("kcaa.tools.symbol_tools._get_index_manager", return_value=mock_mgr):
-            result = _call("list_symbol_libraries", table="Switch", query="zzz")
-
-        assert result["success"] is True
-        assert result["mode"] == "libraries"
-        assert result["total"] == 0
+        assert result["offset"] == 0
+        assert result["truncated"] is False
         assert result["libraries"] == []
+        assert "mode" not in result
 
-    def test_query_none_matches_pre_query_output(self):
-        """Regression gate: query=None must keep the output byte-identical —
-        no extra 'query' key, same pagination over the full listing."""
-        fixture = [self._make_lib("Device", 500), self._make_lib("Connector", 300)]
+    def test_pagination_slices_libraries(self):
         mock_mgr = MagicMock()
-        mock_mgr.get_all_libraries.return_value = fixture
+        mock_mgr.get_all_libraries.return_value = [
+            self._make_lib(f"Lib{i:03d}", i) for i in range(250)
+        ]
 
         with patch("kcaa.tools.symbol_tools._get_index_manager", return_value=mock_mgr):
-            base = _call("list_symbol_libraries")
-            explicit_none = _call("list_symbol_libraries", query=None)
+            first = _call("list_symbol_libraries", limit=200, offset=0)
 
-        assert explicit_none == base
-        assert "query" not in explicit_none
+        assert first["success"] is True
+        assert first["total"] == 250
+        assert first["truncated"] is True
+        assert len(first["libraries"]) == 200
+        assert first["libraries"][0]["name"] == "Lib000"
+        assert first["libraries"][-1]["name"] == "Lib199"
+
+        with patch("kcaa.tools.symbol_tools._get_index_manager", return_value=mock_mgr):
+            rest = _call("list_symbol_libraries", limit=200, offset=200)
+
+        assert rest["success"] is True
+        assert rest["total"] == 250
+        assert rest["truncated"] is False
+        assert len(rest["libraries"]) == 50
+        assert rest["libraries"][0]["name"] == "Lib200"
+        assert rest["libraries"][-1]["name"] == "Lib249"
+
+    def test_limit_is_clamped_to_max_500(self):
+        mock_mgr = MagicMock()
+        mock_mgr.get_all_libraries.return_value = [
+            self._make_lib(f"Lib{i:03d}", i) for i in range(600)
+        ]
+
+        with patch("kcaa.tools.symbol_tools._get_index_manager", return_value=mock_mgr):
+            result = _call("list_symbol_libraries", limit=1000)
+
+        assert result["success"] is True
+        assert result["limit"] == 500
+        assert len(result["libraries"]) == 500
+        assert result["truncated"] is True
+
+    def test_limit_minimum_is_1(self):
+        mock_mgr = MagicMock()
+        mock_mgr.get_all_libraries.return_value = [
+            self._make_lib(f"Lib{i:03d}", i) for i in range(10)
+        ]
+
+        with patch("kcaa.tools.symbol_tools._get_index_manager", return_value=mock_mgr):
+            result = _call("list_symbol_libraries", limit=0)
+
+        assert result["success"] is True
+        assert result["limit"] == 1
+        assert len(result["libraries"]) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -789,6 +776,7 @@ class TestProjectPathScoping:
     def test_list_libraries_uses_project_index(self):
         lib = MagicMock()
         lib.library_name = "ProjLib"
+        lib.file_path = "/p/X/ProjLib.kicad_sym"
         lib.symbol_count = 3
 
         with self._patch_mgr() as mock_get_mgr:
@@ -796,9 +784,11 @@ class TestProjectPathScoping:
             result = _call("list_symbol_libraries", project_path="/p/X")
 
         assert result["success"] is True
-        assert result["mode"] == "tables"
+        assert result["total"] == 1
+        assert result["libraries"][0]["name"] == "ProjLib"
+        assert result["libraries"][0]["file_path"] == "/p/X/ProjLib.kicad_sym"
         mock_get_mgr.assert_called_once_with("/p/X")
-        assert not any("project_path" in row for row in result["tables"])
+        assert not any("project_path" in row for row in result["libraries"])
 
     def test_get_library_symbols_uses_project_index(self):
         rec = MagicMock()
