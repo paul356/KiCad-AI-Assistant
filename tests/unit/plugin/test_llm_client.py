@@ -2127,7 +2127,10 @@ class TestStatusPollBlocking:
     def test_status_poll_budget_exhaustion_returns_last_snapshot(self):
         """When the sync outlasts the wait budget the last snapshot is
         returned (no error, no timeout marker) and the turn continues; the
-        model may poll again with a fresh budget."""
+        model may poll again with a fresh budget.  Budget exhaustion is not
+        a fatal exit, so the on_turn_failure callback must NOT fire (issue
+        #191: only the iteration-cap else-branch — reached when the model
+        re-polls past _MAX_ITERATIONS — reports a failure)."""
         client = _make_client()
         client._mcp_tool_timeout = 0.1
         client._call_llm = MagicMock(
@@ -2136,6 +2139,7 @@ class TestStatusPollBlocking:
                 {"finish_reason": "stop", "message": {"content": "still syncing, try later"}},
             ]
         )
+        failures: list = []
 
         def _status(base_url, tool_name, args, timeout=None):
             return {"running": True, "current": 5, "total": 10}
@@ -2144,9 +2148,10 @@ class TestStatusPollBlocking:
             patch("kicad_plugin.llm_client._STATUS_POLL_INTERVAL_SECONDS", 0.02),
             patch("kicad_plugin.llm_client.call_mcp_tool", side_effect=_status),
         ):
-            result = client.run("sync symbols", context_block="")
+            result = client.run("sync symbols", context_block="", on_turn_failure=failures.append)
 
         assert result == "still syncing, try later"
+        assert failures == []  # budget exhaustion is not a fatal exit
         assert client._call_llm.call_count == 2
         tool_results = [m for m in client._history if m["role"] == "tool"]
         assert len(tool_results) == 1
