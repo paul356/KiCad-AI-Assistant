@@ -156,21 +156,18 @@ def test_turn_end_defensive_finalise_of_leftover_draft():
     assert s["entries"] == [{"type": "ai", "text": "before", "timestamp": "00:00:00"}]
 
 
-def test_turn_end_error_reply_surfaces_as_status_when_text_streamed():
-    """Issue #191: a failing turn that already streamed (and archived) text
-    must still show the failure — the reply becomes a red status notice
-    instead of being silently dropped."""
+def test_turn_end_error_prefix_reply_dropped_without_failure_key():
+    """An error-prefixed reply without the structured ``failure`` key is a
+    normal turn: the archived draft is the answer and the trailing reply is
+    dropped — only a non-None ``failure`` can surface a red notice."""
     s = _state()
     _apply(s, {"type": "text_chunk", "content": "partial draft"})
     _apply(s, {"type": "text_end"})
     reply = "[Error] Maximum tool-call iterations reached. Please try a simpler request."
     st = _apply(s, {"type": "turn_end", "reply": reply})
 
-    assert st.entries_changed is True
-    assert s["entries"] == [
-        {"type": "ai", "text": "partial draft", "timestamp": "00:00:00"},
-        {"type": "status", "text": reply, "color_hex": STATUS_ERR_HEX},
-    ]
+    assert st.entries_changed is False
+    assert s["entries"] == [{"type": "ai", "text": "partial draft", "timestamp": "00:00:00"}]
 
 
 @pytest.mark.parametrize(
@@ -182,28 +179,29 @@ def test_turn_end_error_reply_surfaces_as_status_when_text_streamed():
         "[Framework error] Tool policy registry is missing entries for: x",
     ],
 )
-def test_turn_end_error_prefixes_surface_as_status(reply):
-    """Every fatal-exit prefix produced by llm_client.run() surfaces once text
-    was streamed (case-sensitive, exactly as produced)."""
+def test_turn_end_error_prefix_reply_ignored_without_failure_key(reply):
+    """Every legacy fatal-exit-looking prefix is inert without the structured
+    ``failure`` key: reply text is never inspected for failure detection."""
     s = _state()
     _apply(s, {"type": "text_chunk", "content": "draft"})
-    _apply(s, {"type": "turn_end", "reply": reply})
+    st = _apply(s, {"type": "turn_end", "reply": reply})
 
-    assert [e["type"] for e in s["entries"]] == ["ai", "status"]
-    assert s["entries"][-1]["text"] == reply
-    assert s["entries"][-1]["color_hex"] == STATUS_ERR_HEX
+    assert st.entries_changed is True  # draft finalised defensively
+    assert st.pending == ""
+    assert s["entries"] == [{"type": "ai", "text": "draft", "timestamp": "00:00:00"}]
 
 
 def test_turn_end_error_reply_surfaces_after_cancel():
     """A Stop press must not hide the outcome: the partial draft is finalised
-    as before and an error reply still lands as a status notice (issue #191)."""
+    as before and the structured interrupted category lands as a status
+    notice (issue #191)."""
     s = _state()
     _apply(s, {"type": "text_chunk", "content": "partial answer"})
     s["cancelled"] = True
     _apply(s, {"type": "text_chunk", "content": " more"})  # dropped while cancelled
     _apply(s, {"type": "text_end"})  # skipped while cancelled
     reply = "[Interrupted] tool call stopped by user"
-    st = _apply(s, {"type": "turn_end", "reply": reply})
+    st = _apply(s, {"type": "turn_end", "reply": reply, "failure": "interrupted"})
 
     assert st.entries_changed is True
     assert s["entries"] == [
@@ -214,8 +212,7 @@ def test_turn_end_error_reply_surfaces_after_cancel():
 
 def test_turn_end_non_error_reply_still_dropped_when_text_streamed():
     """A normal reply after streamed text keeps the historical shape: the
-    streamed draft is the answer, the trailing reply is not appended
-    (issue #191 changes error replies only)."""
+    streamed draft is the answer, the trailing reply is not appended."""
     s = _state()
     _apply(s, {"type": "text_chunk", "content": "final answer"})
     _apply(s, {"type": "text_end"})
@@ -240,9 +237,10 @@ def test_turn_end_structured_failure_surfaces_status_with_innocuous_reply():
     ]
 
 
-def test_turn_end_failure_none_suppresses_legacy_prefix_matching():
-    """An explicit failure=None (normal turn) wins over error-looking reply
-    text: the model may legitimately write '[Error] ...' (Plan A)."""
+def test_turn_end_failure_none_never_renders_error_status():
+    """A turn reporting failure=None is a normal turn: error-looking reply
+    text never triggers a red notice — only a non-None structured category
+    can (issue #191, prefix matching removed)."""
     s = _state()
     _apply(s, {"type": "text_chunk", "content": "draft"})
     _apply(s, {"type": "text_end"})
