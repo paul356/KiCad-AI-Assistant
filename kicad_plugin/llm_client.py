@@ -1101,6 +1101,41 @@ def _parse_mcp_response_text(text: str) -> dict[str, Any]:
     return json.loads(last_data)
 
 
+def _mcp_error_message(result: dict[str, Any]) -> str:
+    """Extract a readable message from a failed (``isError: true``) CallToolResult.
+
+    FastMCP pydantic validation failures arrive as prose in a text content
+    block; some servers additionally/alternatively attach a structured
+    payload.  Prefer a structured ``error``/``message`` when present, then
+    join the text blocks, and finally fall back to a concise marker.
+    """
+    structured = result.get("structuredContent")
+    if isinstance(structured, dict):
+        for key in ("error", "message"):
+            value = structured.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        try:
+            serialized = json.dumps(structured)
+        except (TypeError, ValueError):
+            serialized = ""
+        if serialized:
+            return serialized
+    content = result.get("content", [])
+    if isinstance(content, list):
+        texts = [
+            block.get("text", "").strip()
+            for block in content
+            if isinstance(block, dict)
+            and block.get("type") == "text"
+            and isinstance(block.get("text"), str)
+        ]
+        joined = "\n".join(text for text in texts if text).strip()
+        if joined:
+            return joined
+    return "MCP tool call failed (server reported isError)"
+
+
 def call_mcp_tool(
     base_url: str,
     tool_name: str,
@@ -1173,31 +1208,52 @@ def call_mcp_tool(
                 }
             else:
                 result = body.get("result", {})
-                # FastMCP returns content as a list of {type, text} / {type, image} blocks
-                content = result.get("content", [])
-                image: dict[str, str] | None = None
-                if isinstance(content, list):
-                    text = next((b for b in content if b.get("type") == "text"), None)
-                    img = next((b for b in content if b.get("type") == "image"), None)
-                    if img is not None:
-                        image = {
-                            "media_type": img.get("mimeType", "image/png"),
-                            "data": img.get("data", ""),
-                        }
-                    if text is not None:
-                        try:
-                            out = json.loads(text.get("text", ""))
-                        except json.JSONDecodeError:
-                            out = {"success": True, "text": text.get("text", "")}
-                        if isinstance(out, dict) and image is not None:
-                            out["_image"] = image
-                        box["result"] = out
-                    elif image is not None:
-                        box["result"] = {"success": True, "_image": image}
+                # FastMCP marks failed calls (e.g. pydantic validation
+                # errors) with isError: true.  Normalize those to a
+                # structured failure instead of wrapping the error prose
+                # in success: True (issue #195).  The spec types isError
+                # as a bool; tolerate a sloppy serializer's string/int
+                # truthy variants too — anything else (e.g. "false", 0,
+                # None) keeps the strict default: success path.
+                if result.get("isError") in (True, "true", "True", 1):
+                    box["result"] = {
+                        "success": False,
+                        "error": _mcp_error_message(result),
+                    }
+                else:
+                    # FastMCP returns content as a list of {type, text} /
+                    # {type, image} blocks
+                    content = result.get("content", [])
+                    image: dict[str, str] | None = None
+                    if isinstance(content, list):
+                        text = next((b for b in content if b.get("type") == "text"), None)
+                        img = next((b for b in content if b.get("type") == "image"), None)
+                        if img is not None:
+                            image = {
+                                "media_type": img.get("mimeType", "image/png"),
+                                "data": img.get("data", ""),
+                            }
+                        if text is not None:
+                            # Coerce a null/non-string text value so a
+                            # malformed block degrades to the non-JSON
+                            # fallback instead of letting TypeError
+                            # escape the worker thread.
+                            text_content = text.get("text")
+                            if not isinstance(text_content, str):
+                                text_content = ""
+                            try:
+                                out = json.loads(text_content)
+                            except json.JSONDecodeError:
+                                out = {"success": True, "text": text_content}
+                            if isinstance(out, dict) and image is not None:
+                                out["_image"] = image
+                            box["result"] = out
+                        elif image is not None:
+                            box["result"] = {"success": True, "_image": image}
+                        else:
+                            box["result"] = result
                     else:
                         box["result"] = result
-                else:
-                    box["result"] = result
         finally:
             box["done"] = True
 
