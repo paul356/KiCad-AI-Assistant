@@ -2129,12 +2129,12 @@ class TestStatusPollBlocking:
         assert recorded["interrupted"] is True
         client._call_llm.assert_called_once()
 
-    def test_status_poll_emits_wait_notice_while_waiting(self):
-        """A blocking status-poll wait surfaces a transient "Waiting for …"
-        notice on the status channel (issue #190 follow-up): the user sees
-        polling progress instead of a silent block.  A short wait emits
-        exactly one notice — the immediate one; the 5 s rate window is never
-        crossed."""
+    def test_status_poll_emits_progress_notice_while_waiting(self):
+        """A blocking status-poll wait surfaces a transient progress notice
+        ("Symbol sync: 1/10 — Device/R") on the status channel (issue #190):
+        the user sees real sync progress instead of a silent block.  A short
+        wait emits exactly one notice — the immediate one; the 5 s rate
+        window is never crossed."""
         client = _make_client()
         client._call_llm = MagicMock(
             side_effect=[
@@ -2148,7 +2148,12 @@ class TestStatusPollBlocking:
         def _status(base_url, tool_name, args, timeout=None):
             status_calls["n"] += 1
             if status_calls["n"] < 3:
-                return {"running": True, "current": status_calls["n"], "total": 10}
+                return {
+                    "running": True,
+                    "current": status_calls["n"],
+                    "total": 10,
+                    "current_library": "Device/R",
+                }
             return {"running": False, "current": 10, "total": 10, "last_result": {"symbols": 1}}
 
         with (
@@ -2158,15 +2163,13 @@ class TestStatusPollBlocking:
             result = client.run("sync symbols", context_block="", on_stream_event=events.append)
 
         assert result == "sync done"
-        waiting = [
-            e
-            for e in events
-            if e.get("type") == "status"
-            and "Waiting for get_symbol_sync_status" in e.get("text", "")
+        progress = [
+            e for e in events if e.get("type") == "status" and "Symbol sync:" in e.get("text", "")
         ]
-        assert len(waiting) == 1
-        assert waiting[0]["text"] == "Waiting for get_symbol_sync_status… (0s) — sync in progress"
-        assert waiting[0]["color_hex"] == "#BE6400"
+        assert len(progress) == 1
+        # The first notice surfaces the initial status snapshot.
+        assert progress[0]["text"] == "Symbol sync: 1/10 — Device/R"
+        assert progress[0]["color_hex"] == "#BE6400"
         # The snapshot returned to the model is still the final one.
         recorded = json.loads([m for m in client._history if m["role"] == "tool"][0]["content"])
         assert recorded["running"] is False
@@ -2194,10 +2197,11 @@ class TestStatusPollBlocking:
         assert mock_call_tool.call_count == 1
         assert [e for e in events if e.get("type") == "status"] == []
 
-    def test_status_poll_wait_notices_rate_limited_to_5s(self):
-        """Wait notices are rate-limited to one per 5 s of elapsed wait time
-        (plus the immediate first one) — the UI is not flooded once per poll.
-        Uses a fake clock so the 5 s cadence is deterministic."""
+    def test_status_poll_progress_notices_rate_limited_to_5s(self):
+        """Progress notices are rate-limited to one per 5 s of elapsed wait
+        time (plus the immediate first one) — the UI is not flooded once per
+        poll — and each notice surfaces the freshest progress seen.  Uses a
+        fake clock so the cadence is deterministic."""
         client = _make_client()
         client._mcp_tool_timeout = 60
         client._call_llm = MagicMock(
@@ -2206,11 +2210,18 @@ class TestStatusPollBlocking:
                 {"finish_reason": "stop", "message": {"content": "ok"}},
             ]
         )
-        events: list[dict] = []
+        events: list[tuple[float, dict]] = []
+        status_calls = {"n": 0}
         fake_now = {"t": 0.0}
 
         def _status(base_url, tool_name, args, timeout=None):
-            return {"running": True, "current": 1, "total": 10}
+            status_calls["n"] += 1
+            return {
+                "running": True,
+                "current": status_calls["n"],
+                "total": 100,
+                "current_library": "Device",
+            }
 
         def _fake_sleep(seconds):
             fake_now["t"] += seconds
@@ -2218,24 +2229,67 @@ class TestStatusPollBlocking:
         def _fake_monotonic():
             return fake_now["t"]
 
+        def _collect(evt):
+            events.append((fake_now["t"], evt))
+
         with (
             patch("kicad_plugin.llm_client.call_mcp_tool", side_effect=_status),
             patch("kicad_plugin.llm_client.time.sleep", side_effect=_fake_sleep),
             patch("kicad_plugin.llm_client.time.monotonic", side_effect=_fake_monotonic),
         ):
-            result = client.run("sync symbols", context_block="", on_stream_event=events.append)
+            result = client.run("sync symbols", context_block="", on_stream_event=_collect)
 
         assert result == "ok"
-        waiting = [
-            e
-            for e in events
-            if e.get("type") == "status"
-            and "Waiting for get_symbol_sync_status" in e.get("text", "")
+        progress = [
+            (t, e)
+            for (t, e) in events
+            if e.get("type") == "status" and "Symbol sync:" in e.get("text", "")
         ]
-        secs = [int(re.search(r"\((\d+)s\)", e["text"]).group(1)) for e in waiting]
         # Wait runs the full 60 s budget; notices at t=0 then every 5 s.
-        assert secs == list(range(0, 60, 5))
-        assert all(e["color_hex"] == "#BE6400" for e in waiting)
+        assert [t for t, _ in progress] == [float(k) for k in range(0, 60, 5)]
+        # Each notice carries the freshest snapshot: the emit at t=5*k saw
+        # the poll right before it (current = 5*k + 1).
+        currents = [
+            int(re.search(r"Symbol sync: (\d+)/100 — Device", e["text"]).group(1))
+            for _, e in progress
+        ]
+        assert currents == [5 * k + 1 for k in range(len(progress))]
+        assert all(e["color_hex"] == "#BE6400" for _, e in progress)
+
+    def test_wait_status_text_surfaces_progress_guards(self):
+        """The progress notice format guards total==0 ("preparing…") and a
+        missing/empty current_library (no trailing dash segment)."""
+        status = llm_client._wait_status_text
+        assert (
+            status(
+                "get_symbol_sync_status",
+                {"current": 342, "total": 1250, "current_library": "Device/R"},
+            )
+            == "Symbol sync: 342/1250 — Device/R"
+        )
+        assert (
+            status("get_symbol_sync_status", {"current": 342, "total": 1250, "current_library": ""})
+            == "Symbol sync: 342/1250"
+        )
+        assert (
+            status("get_symbol_sync_status", {"current": 0, "total": 0, "current_library": None})
+            == "Symbol sync: preparing…"
+        )
+        assert (
+            status(
+                "get_symbol_sync_status", {"current": 0, "total": 0, "current_library": "Device"}
+            )
+            == "Symbol sync: preparing… — Device"
+        )
+        assert (
+            status("get_footprint_sync_status", {"current": 0, "total": 0, "current_library": ""})
+            == "Footprint sync: preparing…"
+        )
+        # Unmapped name falls back to the raw tool name (defensive).
+        assert (
+            status("get_board_info", {"current": 1, "total": 2, "current_library": ""})
+            == "get_board_info: 1/2"
+        )
 
 
 class TestToolPolicyRegistry:

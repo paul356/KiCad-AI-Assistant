@@ -1308,16 +1308,23 @@ class _ToolExecutionState:
 # blocks on it (see _wait_for_background_op) and hands the model the final
 # snapshot, so the whole wait costs one poll round.  Mapped tools must return
 # a dict with a truthy "running" key while the operation is in flight.
-_STATUS_POLL_TOOLS = frozenset({"get_symbol_sync_status", "get_footprint_sync_status"})
+# _STATUS_POLL_LABELS maps each such tool to its user-facing label (used in
+# the progress notices) and is the single source of truth: the mapped set
+# derives from the keys, so names and labels can't drift.
+_STATUS_POLL_LABELS = {
+    "get_symbol_sync_status": "Symbol sync",
+    "get_footprint_sync_status": "Footprint sync",
+}
+_STATUS_POLL_TOOLS = frozenset(_STATUS_POLL_LABELS)
 
 # Interval between client-side re-queries while waiting for a background op.
 _STATUS_POLL_INTERVAL_SECONDS = 1.0
 
-# Rate limit for the transient "Waiting for …" status notices emitted while
-# blocking on a background op: at most one notice per this many elapsed
-# seconds, plus one immediately when the wait starts (see
-# _wait_for_background_op), so the user sees polling begin right away instead
-# of a silent multi-minute block (issue #190 follow-up).
+# Rate limit for the transient progress notices emitted while blocking on a
+# background op: at most one notice per this many elapsed seconds, plus one
+# immediately when the wait starts (see _wait_for_background_op), so the user
+# sees polling begin right away instead of a silent multi-minute block
+# (issue #190 follow-up).
 _STATUS_EVENT_INTERVAL_SECONDS = 5.0
 
 # Notice colour for the wait status notices.  Matches the panel's
@@ -1334,10 +1341,28 @@ _STATUS_EVENT_COLOR_HEX = "#BE6400"
 _MAX_ITERATIONS = 60
 
 
-def _wait_status_text(tool_name: str, elapsed_seconds: int) -> str:
-    """One-line transient notice shown while blocking on a background op."""
+def _wait_status_text(tool_name: str, result: dict[str, Any]) -> str:
+    """One-line transient notice with real sync progress (issue #190).
 
-    return f"Waiting for {tool_name}… ({elapsed_seconds}s) — sync in progress"
+    Surfaces the latest status snapshot's current/total counters and the
+    library currently being processed, e.g.
+    "Symbol sync: 342/1250 — Device/R".  Guards: total==0 (sync still
+    counting libraries) renders "preparing…" instead of a fraction, and a
+    missing/empty current_library drops the trailing dash segment.  The
+    label comes from _STATUS_POLL_LABELS (raw tool name if unmapped).
+    """
+
+    label = _STATUS_POLL_LABELS.get(tool_name, tool_name)
+    current = result.get("current")
+    total = result.get("total")
+    if total:
+        progress = f"{current if current is not None else 0}/{total}"
+    else:
+        progress = "preparing…"
+    library = result.get("current_library")
+    if library:
+        return f"{label}: {progress} — {library}"
+    return f"{label}: {progress}"
 
 
 def _emit_wait_status_notice(
@@ -2923,11 +2948,11 @@ class LLMClient:
         budget runs out the last snapshot is returned and the model may poll
         again with a fresh budget.  Never synthesizes an error.
 
-        While blocked, rate-limited transient status notices ("Waiting for
-        … (Ns)") are emitted through *on_stream_event* so the user sees
-        polling progress instead of a silent multi-minute block; nothing is
-        emitted once the wait ends (the result snapshot itself carries
-        completion).
+        While blocked, rate-limited transient status notices (e.g. "Symbol
+        sync: 342/1250 — Device/R") are emitted through *on_stream_event* so
+        the user sees real progress instead of a silent multi-minute block;
+        nothing is emitted once the wait ends (the result snapshot itself
+        carries completion).
         """
         deadline = time.monotonic() + self._mcp_tool_timeout
         started = time.monotonic()
@@ -2954,9 +2979,9 @@ class LLMClient:
                 break
             elapsed = time.monotonic() - started
             if elapsed - last_status_elapsed >= _STATUS_EVENT_INTERVAL_SECONDS:
-                _emit_wait_status_notice(
-                    on_stream_event, _wait_status_text(tool_name, int(elapsed))
-                )
+                # Progress from the newest snapshot seen so far (the initial
+                # policy result on the first pass, then each re-poll's).
+                _emit_wait_status_notice(on_stream_event, _wait_status_text(tool_name, result))
                 last_status_elapsed = elapsed
             time.sleep(min(_STATUS_POLL_INTERVAL_SECONDS, remaining))
             if cancel_event is not None and cancel_event.is_set():
