@@ -4486,6 +4486,175 @@ class TestSkillPrompt:
         assert "provider cache" in prompt
 
 
+# ---------------------------------------------------------------------------
+# Session-level loaded-skill tracking + dedupe (issue #203)
+# ---------------------------------------------------------------------------
+
+
+def _get_skill_call(call_id="tc1", name="pcb-routing"):
+    """A single get_skill tool-call object as a model would emit it."""
+    return {
+        "id": call_id,
+        "type": "function",
+        "function": {
+            "name": "get_skill",
+            "arguments": json.dumps({"name": name}),
+        },
+    }
+
+
+def _get_skill_response(name="pcb-routing", call_id="tc1"):
+    """LLM response declaring one get_skill tool call."""
+    return {
+        "finish_reason": "tool_calls",
+        "message": {"content": "", "tool_calls": [_get_skill_call(call_id, name)]},
+    }
+
+
+def _final_response():
+    return {"finish_reason": "stop", "message": {"content": "done"}}
+
+
+class TestLoadedSkillDedupe:
+    """get_skill calls record session state and dedupe on repeat (issue #203)."""
+
+    def test_first_get_skill_executes_and_records(self):
+        client = _make_client()
+        client._call_llm = MagicMock(side_effect=[_get_skill_response(), _final_response()])
+        client._fetch_tool_definitions = MagicMock(return_value=[])
+        with patch("kicad_plugin.llm_client.call_mcp_tool") as mock_call_tool:
+            mock_call_tool.return_value = {"success": True, "result": "routing body"}
+            result = client.run("load the routing skill", context_block="")
+
+        assert result == "done"
+        assert client._loaded_skills == {"pcb-routing"}
+        tool_messages = [m for m in client._history if m["role"] == "tool"]
+        assert len(tool_messages) == 1
+        assert "routing body" in tool_messages[0]["content"]
+
+    def test_repeat_get_skill_returns_hint_without_executing(self):
+        client = _make_client()
+        client._loaded_skills = {"pcb-routing"}
+        client._call_llm = MagicMock(side_effect=[_get_skill_response(), _final_response()])
+        client._fetch_tool_definitions = MagicMock(return_value=[])
+        with patch("kicad_plugin.llm_client.call_mcp_tool") as mock_call_tool:
+            result = client.run("load the routing skill again", context_block="")
+
+        assert result == "done"
+        mock_call_tool.assert_not_called()  # repeat load never hits the MCP server
+        tool_messages = [m for m in client._history if m["role"] == "tool"]
+        assert len(tool_messages) == 1
+        recorded = json.loads(tool_messages[0]["content"])
+        assert recorded["success"] is True
+        assert recorded["already_loaded"] is True
+        assert "already loaded" in recorded["message"]
+        assert "routing body" not in tool_messages[0]["content"]
+
+    def test_duplicate_calls_in_same_batch_deduped(self):
+        """Two get_skill calls in one batch: the first loads, the second dedupes."""
+        client = _make_client()
+        client._call_llm = MagicMock(
+            side_effect=[
+                {
+                    "finish_reason": "tool_calls",
+                    "message": {
+                        "content": "",
+                        "tool_calls": [
+                            _get_skill_call("tc1", "pcb-routing"),
+                            _get_skill_call("tc2", "pcb-routing"),
+                        ],
+                    },
+                },
+                _final_response(),
+            ]
+        )
+        client._fetch_tool_definitions = MagicMock(return_value=[])
+        with patch("kicad_plugin.llm_client.call_mcp_tool") as mock_call_tool:
+            mock_call_tool.return_value = {"success": True, "result": "routing body"}
+            result = client.run("load the routing skill", context_block="")
+
+        assert result == "done"
+        assert mock_call_tool.call_count == 1
+        tool_messages = [m for m in client._history if m["role"] == "tool"]
+        assert len(tool_messages) == 2
+        assert "routing body" in tool_messages[0]["content"]
+        assert json.loads(tool_messages[1]["content"])["already_loaded"] is True
+
+    def test_failed_get_skill_not_recorded(self):
+        client = _make_client()
+        client._call_llm = MagicMock(
+            side_effect=[_get_skill_response(name="bogus-skill"), _final_response()]
+        )
+        client._fetch_tool_definitions = MagicMock(return_value=[])
+        with patch("kicad_plugin.llm_client.call_mcp_tool") as mock_call_tool:
+            mock_call_tool.return_value = {
+                "success": False,
+                "error": "Skill 'bogus-skill' not found",
+            }
+            result = client.run("load the bogus skill", context_block="")
+
+        assert result == "done"
+        assert client._loaded_skills == set()
+
+    def test_dedup_hint_turn_never_masks_body_turn_in_history_dedup(self):
+        """A get_skill hint turn must not let _dedup_tool_calls delete the
+        body turn: the older turn carries the actual skill content, so it
+        survives even though a get_skill call was later seen again."""
+        client = _make_client()
+        client._history = [
+            _user("q1"),
+            _assistant("load", tool_calls=[_get_skill_call("tc1", "pcb-routing")]),
+            _tool("tc1", json.dumps({"success": True, "result": "routing body"})),
+            _user("q2"),
+            _assistant("load again", tool_calls=[_get_skill_call("tc2", "pcb-routing")]),
+            _tool(
+                "tc2",
+                json.dumps(
+                    {
+                        "success": True,
+                        "already_loaded": True,
+                        "message": "already loaded earlier in this session",
+                    }
+                ),
+            ),
+        ]
+        client._dedup_tool_calls()
+        contents = [m["content"] for m in client._history if m["role"] == "tool"]
+        assert any("routing body" in c for c in contents), "body turn was deleted"
+        tool_ids = [
+            tc["id"] for m in client._history if m.get("tool_calls") for tc in m["tool_calls"]
+        ]
+        assert "tc1" in tool_ids  # body turn survives next to the hint
+
+    def test_reset_clears_loaded_skills(self):
+        client = _make_client()
+        client._loaded_skills = {"pcb-routing"}
+        client.reset()
+        assert client._loaded_skills == set()
+
+    def test_set_history_rederives_loaded_skills(self):
+        """Restoring a persisted session restores the loaded-skill set."""
+        client = _make_client()
+        history = [
+            _user("q1"),
+            _assistant("load", tool_calls=[_get_skill_call("tc1", "pcb-routing")]),
+            _tool("tc1", json.dumps({"success": True, "result": "routing body"})),
+        ]
+        client.set_history(history)
+        assert client._loaded_skills == {"pcb-routing"}
+
+    def test_loaded_skills_block_renders_sorted_names_only(self):
+        client = _make_client()
+        assert client._build_loaded_skills_block() == ""
+        client._loaded_skills = {"pcb-zone", "pcb-routing"}
+        block = client._build_loaded_skills_block()
+        assert "pcb-routing" in block
+        assert "pcb-zone" in block
+        assert block.index("pcb-routing") < block.index("pcb-zone")  # alphabetical
+        # Never renders the bodies back — names only, so the block stays tiny.
+        assert "routing body" not in block
+
+
 class TestContextBudgetIncludesTools:
     def test_tools_est_push_over_budget_triggers_compaction(self):
         client = _make_client(context_tokens=10_000)  # budget = 7000
