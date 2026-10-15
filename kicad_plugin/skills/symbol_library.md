@@ -17,9 +17,13 @@ description: "Symbol index sync, full-text search, pin details, bbox geometry in
 1. **First time only**: call **sync_symbol_index()** to build the index. Returns immediately;
    the sync runs in a background thread. The first sync can take several minutes (parses all
    `.kicad_sym` files); subsequent calls are incremental.
-2. Poll with **get_symbol_sync_status()** every few seconds. When `running` is false and
-   `last_result` is present, the sync completed successfully. If `error` is present, it failed.
-   Do NOT call `sync_symbol_index` again while a sync is already running.
+2. Call **get_symbol_sync_status()** ONCE — the plugin client blocks on that
+   call until the background sync finishes (progress notices appear in the UI)
+   and returns the final snapshot, so there is no need to poll repeatedly.
+   If the returned snapshot still shows `running: true` (e.g. past a long
+   client timeout), you may call it again.  Completion: `running` false with
+   `last_result` present.  Failure: `error` present.  Do NOT call
+   `sync_symbol_index` again while a sync is already running.
 3. **Always prefer search_symbols** for finding components:
    `search_symbols(query="NPN transistor", limit=50)` returns `library_name` and `name`
    fields ready to pass to placement tools.

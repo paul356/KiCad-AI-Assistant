@@ -26,6 +26,10 @@ from typing import Any
 
 from .tool_registry import TOOL_POLICIES, get_missing_tool_policies, get_tool_policy
 
+# Notice colour for wait progress; single source of truth is ui/colors.py
+# (shared with the panel), kept alias-local so call sites stay unchanged.
+from .ui.colors import WARN_HEX as _STATUS_EVENT_COLOR_HEX
+
 log = logging.getLogger(__name__)
 
 
@@ -1293,6 +1297,88 @@ class _ToolExecutionState:
 
     snapshotted_paths: set[str] = field(default_factory=set)
     dirty_paths: set[str] = field(default_factory=set)
+
+
+# ---------------------------------------------------------------------------
+# Background-operation status polling (issue #190)
+# ---------------------------------------------------------------------------
+#
+# sync_symbol_index / sync_footprint_index return immediately and run in a
+# server-side thread; the model then polls get_symbol_sync_status /
+# get_footprint_sync_status until the operation finishes.  Each poll used to
+# be a full LLM round-trip against the turn's iteration cap, so a long sync
+# could starve the turn of iterations before any real work happened.  When a
+# mapped status tool reports the operation still running, the client now
+# blocks on it (see _wait_for_background_op) and hands the model the final
+# snapshot, so the whole wait costs one poll round.  Mapped tools must return
+# a dict with a truthy "running" key while the operation is in flight.
+# _STATUS_POLL_LABELS maps each such tool to its user-facing label (used in
+# the progress notices) and is the single source of truth: the mapped set
+# derives from the keys, so names and labels can't drift.
+_STATUS_POLL_LABELS = {
+    "get_symbol_sync_status": "Symbol sync",
+    "get_footprint_sync_status": "Footprint sync",
+}
+_STATUS_POLL_TOOLS = frozenset(_STATUS_POLL_LABELS)
+
+# Interval between client-side re-queries while waiting for a background op.
+_STATUS_POLL_INTERVAL_SECONDS = 1.0
+
+# Rate limit for the transient progress notices emitted while blocking on a
+# background op: at most one notice per this many elapsed seconds, plus one
+# immediately when the wait starts (see _wait_for_background_op), so the user
+# sees polling begin right away instead of a silent multi-minute block
+# (issue #190 follow-up).
+_STATUS_EVENT_INTERVAL_SECONDS = 5.0
+
+# Iteration ceiling for the agentic loop.  This is a guard against an LLM
+# that never stops requesting tools, NOT a working budget: legitimate turns
+# need a handful of rounds (and status polling blocks client-side instead of
+# consuming rounds), so reaching the cap means the loop is genuinely stuck.
+# Raised from 20 so that long multi-step turns survive (issue #190).
+_MAX_ITERATIONS = 60
+
+
+def _wait_status_text(tool_name: str, result: dict[str, Any]) -> str:
+    """One-line transient notice with real sync progress (issue #190).
+
+    Surfaces the latest status snapshot's current/total counters and the
+    library currently being processed, e.g.
+    "Symbol sync: 342/1250 — Device/R".  Guards: total==0 (sync still
+    counting libraries) renders "preparing…" instead of a fraction, and a
+    missing/empty current_library drops the trailing dash segment.  The
+    label comes from _STATUS_POLL_LABELS (raw tool name if unmapped).
+    """
+
+    label = _STATUS_POLL_LABELS.get(tool_name, tool_name)
+    current = result.get("current")
+    total = result.get("total")
+    if total:
+        progress = f"{current if current is not None else 0}/{total}"
+    else:
+        progress = "preparing…"
+    library = result.get("current_library")
+    if library:
+        return f"{label}: {progress} — {library}"
+    return f"{label}: {progress}"
+
+
+def _emit_wait_status_notice(
+    on_stream_event: Callable[[dict[str, Any]], None] | None, text: str
+) -> None:
+    """Emit one transient status notice for a background-op wait (issue #190).
+
+    Uses the same ``{"type": "status", text, color_hex}`` event channel the
+    panel renders as notices.  Mirrors _emit_tool_callback's exception
+    safety: a UI callback failure must never break the wait loop or the turn.
+    """
+
+    if not on_stream_event:
+        return
+    try:
+        on_stream_event({"type": "status", "text": text, "color_hex": _STATUS_EVENT_COLOR_HEX})
+    except Exception as e:  # same contract as _emit_tool_callback
+        log.error("status event callback error in _emit_wait_status_notice: %s", e)
 
 
 # ---------------------------------------------------------------------------
@@ -2836,6 +2922,77 @@ class LLMClient:
             return result
         return self._execute_tool_with_policy(name, args, state, on_tool_call, cancel_event)
 
+    def _wait_for_background_op(
+        self,
+        tool_name: str,
+        args: dict[str, Any],
+        result: dict[str, Any],
+        cancel_event: threading.Event | None,
+        on_stream_event: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
+        """Block on a background-operation status poll until it completes.
+
+        ``sync_symbol_index`` / ``sync_footprint_index`` return immediately
+        and run in a server-side thread; ``get_symbol_sync_status`` /
+        ``get_footprint_sync_status`` report progress.  If the first status
+        call reports the operation still running, this re-queries it here —
+        reusing the existing per-call timeout machinery — instead of letting
+        every status round-trip count against the turn's iteration cap, a
+        long sync could otherwise starve the turn (issue #190).
+
+        The result stays a plain status snapshot, so model-side poll logic is
+        unchanged (the model just sees a later point in the sync).  Stop
+        (cancel_event) and the per-call timeout budget are honoured; when the
+        budget runs out the last snapshot is returned and the model may poll
+        again with a fresh budget.  Never synthesizes an error.
+
+        While blocked, rate-limited transient status notices (e.g. "Symbol
+        sync: 342/1250 — Device/R") are emitted through *on_stream_event* so
+        the user sees real progress instead of a silent multi-minute block;
+        nothing is emitted once the wait ends (the result snapshot itself
+        carries completion).
+        """
+        deadline = time.monotonic() + self._mcp_tool_timeout
+        started = time.monotonic()
+        # Emit the first notice as soon as the wait begins (won't emit at all
+        # when the budget is already exhausted — remaining <= 0 below).
+        last_status_elapsed = -_STATUS_EVENT_INTERVAL_SECONDS
+        while result.get("running"):
+            if cancel_event is not None and cancel_event.is_set():
+                # Stop was pressed while blocked: abort the turn now (issue
+                # #176 semantics) instead of waiting out another LLM round.
+                return {
+                    "success": False,
+                    "error": f"tool call {tool_name} interrupted by user",
+                    "interrupted": True,
+                }
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                log.info(
+                    "Status wait budget (%g s) exhausted for %s; returning last "
+                    "snapshot so the model can poll again.",
+                    self._mcp_tool_timeout,
+                    tool_name,
+                )
+                break
+            elapsed = time.monotonic() - started
+            if elapsed - last_status_elapsed >= _STATUS_EVENT_INTERVAL_SECONDS:
+                # Progress from the newest snapshot seen so far (the initial
+                # policy result on the first pass, then each re-poll's).
+                _emit_wait_status_notice(on_stream_event, _wait_status_text(tool_name, result))
+                last_status_elapsed = elapsed
+            time.sleep(min(_STATUS_POLL_INTERVAL_SECONDS, remaining))
+            if cancel_event is not None and cancel_event.is_set():
+                return {
+                    "success": False,
+                    "error": f"tool call {tool_name} interrupted by user",
+                    "interrupted": True,
+                }
+            result = self._call_mcp_tool_guarded(tool_name, args, cancel_event)
+            if result.get("interrupted") or result.get("timed_out"):
+                break
+        return result
+
     def _auto_reload_modified_files(
         self,
         state: _ToolExecutionState,
@@ -2935,7 +3092,7 @@ class LLMClient:
         is_final_text = False
 
         try:
-            for _ in range(20):  # max 20 iterations (guard against infinite loops)
+            for _ in range(_MAX_ITERATIONS):  # guard against infinite loops (issue #190)
                 # Rebuild the request tool list every iteration: tools enabled
                 # in a previous iteration must have their full schema in the
                 # NEXT request, not just in this loop's enabled-set (issue #129).
@@ -2988,6 +3145,26 @@ class LLMClient:
                     else:
                         result = self._execute_or_reject_tool(
                             name, args, state, on_tool_call, cancel_event
+                        )
+
+                    if (
+                        isinstance(result, dict)
+                        and name in _STATUS_POLL_TOOLS
+                        and result.get("running")
+                        and not result.get("interrupted")
+                        and not result.get("timed_out")
+                    ):
+                        # A status poll for a background operation that is still
+                        # running.  Block here (bounded by the per-call timeout)
+                        # instead of making the model burn one iteration per poll
+                        # round (issue #190); the result stays a plain status
+                        # snapshot, so model-side poll logic is unchanged.
+                        result = self._wait_for_background_op(
+                            name,
+                            args,
+                            result,
+                            cancel_event,
+                            on_stream_event=on_stream_event,
                         )
 
                     # Image-bearing tool results (e.g. export_pcb_layer_image)
