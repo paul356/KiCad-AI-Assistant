@@ -8,10 +8,7 @@ Two server profiles are supported, selected via the KICAD_MCP_PROFILE environmen
 
   plugin            — registers the skip-based schematic/PCB editing tools
                      plus the ``get_project_structure`` query tool. No
-                     resources, no full prompt set, no kicad-cli-dependent
-                     tools.  Registers the skill catalog prompt so external
-                     MCP clients can discover workflow skills passively,
-                     without calling ``list_skills()`` (issue #203).
+                     resources, no prompts, no kicad-cli-dependent tools.
                      Intended for the KiCad plugin integration where the
                      plugin supplies project context directly and the LLM
                      drives editing via tool calls.
@@ -30,7 +27,6 @@ from fastmcp import FastMCP
 # Full-profile imports are deferred inside _register_full_profile() to avoid
 # loading kicad-cli-dependent modules when running in plugin mode.
 from kcaa.context import kicad_lifespan
-from kcaa.prompts.skill_prompt import register_skill_prompts
 from kcaa.tools.drc_tools import register_drc_tools
 from kcaa.tools.erc_tools import register_erc_tools
 from kcaa.tools.kipy_tools import register_kipy_tools
@@ -146,9 +142,6 @@ def _register_plugin_profile(mcp: FastMCP) -> None:
     register_erc_tools(mcp)
     register_skill_tools(mcp)
     register_version_tools(mcp)
-    # Skill catalog prompt (issue #203): gives external MCP clients passive
-    # visibility of the workflow-skill catalog without a list_skills() call.
-    register_skill_prompts(mcp)
 
 
 def _register_full_profile(mcp: FastMCP) -> None:
@@ -218,7 +211,6 @@ def _register_full_profile(mcp: FastMCP) -> None:
     register_drc_prompts(mcp)
     register_bom_prompts(mcp)
     register_pattern_prompts(mcp)
-    register_skill_prompts(mcp)
 
 
 def create_server(profile: ServerProfile = "full") -> FastMCP:

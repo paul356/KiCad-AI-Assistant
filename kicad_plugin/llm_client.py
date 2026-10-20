@@ -320,11 +320,13 @@ _TOOL_LOADING_PROMPT = (
     "cache; call `enable_tool` only for tools you will use repeatedly.\n"
     "- Tool calls are rejected only for unknown names (not in the catalog) or "
     "tools with no execution policy — otherwise they run directly.\n"
-    "- Workflow skills: `list_skills()` lists how-to guides for using MCP tools; "
-    "`get_skill(name)` loads the one matching your task's category (routing, "
-    "placement, DRC, …). Load it BEFORE executing task tools — the guides carry "
-    "the correct workflows and pitfalls (waypoints/vias, spacing, pin choice) "
-    "that bare `get_tool_schema` parameter schemas cannot convey.\n"
+    "- Workflow skills: `list_skills()` lists how-to guides for using MCP tools, "
+    "and `get_skill(name)` loads the one matching your task's category (routing, "
+    "placement, DRC, …). When a task matches one of the skills above or in the "
+    "# Skills section, you MUST call `get_skill(name)` and read the guide BEFORE "
+    "executing task tools — the guides carry the correct workflows and pitfalls "
+    "(waypoints/vias, spacing, pin choice) that bare `get_tool_schema` parameter "
+    "schemas cannot convey.\n"
     "- Avoid per-step enable/disable toggling — each one rewrites the tools "
     "segment and loses the provider cache on it; do one enable round per task."
 )
@@ -1447,11 +1449,6 @@ class LLMClient:
         # request head stays byte-identical across turns (cache-friendly).
         self._tool_registry: dict[str, dict[str, Any]] | None = None
         self._enabled_tools: set[str] = set()
-        # Session-level loaded-skill tracking (issue #203): names of skills
-        # whose full body was already injected via get_skill this session.
-        # A repeat get_skill(name) is deduped to a short pointer instead of
-        # re-fetching the body.
-        self._loaded_skills: set[str] = set()
         # One-shot context-window diagnostics (issue #129).
         self._fixed_overhead_warned: bool = False
         self._budget_warned: bool = False
@@ -1465,7 +1462,6 @@ class LLMClient:
         """
         self._history = []
         self._enabled_tools.clear()
-        self._loaded_skills.clear()
         self._fixed_overhead_warned = False
         self._budget_warned = False
         # self._tool_registry is kept: the tool catalog is stable per session.
@@ -1497,35 +1493,6 @@ class LLMClient:
     def set_history(self, history: list[dict[str, Any]]) -> None:
         """Replace conversation history when restoring a saved session."""
         self._history = list(history)
-        # Session-level loaded-skill state follows the restored transcript
-        # (issue #203): a restored get_skill pair keeps the skill marked
-        # loaded so the dedupe contract holds across session restores.
-        self._loaded_skills = self._scan_loaded_skills(self._history)
-
-    @staticmethod
-    def _scan_loaded_skills(history: list[dict[str, Any]]) -> set[str]:
-        """Collect skill names loaded via get_skill calls in *history*.
-
-        Walks assistant messages for get_skill tool calls and returns the set
-        of skill names.  Used when restoring a persisted session so
-        loaded-skill dedupe stays correct across restarts (issue #203).
-        """
-        loaded: set[str] = set()
-        for msg in history:
-            if msg.get("role") != "assistant":
-                continue
-            for tc in msg.get("tool_calls") or []:
-                fn = tc.get("function") or {}
-                if fn.get("name") != "get_skill":
-                    continue
-                try:
-                    args = json.loads(fn.get("arguments") or "{}")
-                except (TypeError, ValueError):
-                    continue
-                name = args.get("name")
-                if name:
-                    loaded.add(name)
-        return loaded
 
     def get_enabled_tools(self) -> list[str]:
         """Return the currently enabled tool names (sorted, stable) for persistence."""
@@ -1611,12 +1578,6 @@ class LLMClient:
         self._history.append(
             {"role": "tool", "tool_call_id": call_id, "content": json.dumps(result)}
         )
-        # Keep session loaded-skill state consistent for direct calls too
-        # (issue #203): a framework-initiated get_skill marks the skill loaded.
-        if tool_name == "get_skill" and self._tool_result_succeeded(result):
-            skill_name = args.get("name") or ""
-            if skill_name:
-                self._loaded_skills.add(skill_name)
         return result
 
     def _trim_history(self) -> None:
@@ -1654,13 +1615,6 @@ class LLMClient:
         that contains tool_calls plus all immediately-following role=="tool" messages.
         If every tool name in a turn has already been seen in a more-recent turn,
         the entire turn (assistant + its tool results) is deleted.
-
-        get_skill turns are exempt from deletion (issue #203): a repeated
-        get_skill call is deduped client-side into a short "already loaded"
-        hint, so the more-recent turn is content-poor.  Deleting the older
-        body turn would leave only the hint in context while the skill is
-        still reported loaded — the model would believe the body is present
-        when it is gone.
         """
         seen_tools: set[str] = set()
         i = len(self._history) - 1
@@ -1676,7 +1630,7 @@ class LLMClient:
                 while j < len(self._history) and self._history[j].get("role") == "tool":
                     j += 1
                 tool_names = {tc["function"]["name"] for tc in msg["tool_calls"]}
-                if tool_names.issubset(seen_tools) and "get_skill" not in tool_names:
+                if tool_names.issubset(seen_tools):
                     # All tools in this turn are superseded — drop the whole turn
                     del self._history[i:j]
                     i -= 1
@@ -2786,20 +2740,6 @@ class LLMClient:
             lines.append(f"- {tname}: {summary[:100]}")
         return "\n\n# Available tools\n" + "\n".join(lines)
 
-    def _build_loaded_skills_block(self) -> str:
-        """Render the session's already-loaded skills (omp getActiveSkills analog).
-
-        A tiny one-name-per-line block — unlike the skill bodies themselves,
-        which live in the history as get_skill tool results — so the model
-        knows which skills are already active and does not re-request them.
-        Empty when nothing was loaded, keeping the budget tests green.
-        """
-        if not self._loaded_skills:
-            return ""
-        return "\n\n## Loaded skills (already in your context)\n" + "\n".join(
-            f"- {name}" for name in sorted(self._loaded_skills)
-        )
-
     def _build_request_tools(self) -> list[dict[str, Any]]:
         """Meta-tools plus enabled schemas, in stable catalog registration order.
 
@@ -3165,7 +3105,6 @@ class LLMClient:
             build_system_prompt(context_block)
             + self._build_tool_catalog_block()
             + _TOOL_LOADING_PROMPT
-            + self._build_loaded_skills_block()
         )
         content = self._build_user_content(user_message, images)
         self._history.append({"role": "user", "content": content})
@@ -3252,33 +3191,10 @@ class LLMClient:
                             "interrupted": True,
                         }
                         self._emit_tool_callback(on_tool_call, name, args, result)
-                    elif name == "get_skill" and (args.get("name") or "") in self._loaded_skills:
-                        # Session-level dedupe (issue #203): the skill body was
-                        # already injected earlier in this session.  Answer with
-                        # a short pointer instead of re-fetching the full body —
-                        # no MCP round trip, no duplicated content in context.
-                        skill_name = args.get("name") or ""
-                        result = {
-                            "success": True,
-                            "already_loaded": True,
-                            "message": (
-                                f"Skill '{skill_name}' was already loaded earlier "
-                                f"in this session — its full content is in your "
-                                f"context. You do not need to load it again."
-                            ),
-                        }
-                        self._emit_tool_callback(on_tool_call, name, args, result)
                     else:
                         result = self._execute_or_reject_tool(
                             name, args, state, on_tool_call, cancel_event
                         )
-                        # Session-level loaded-skills tracking (issue #203):
-                        # record a successful get_skill so a repeat call in a
-                        # later turn is deduped instead of re-fetching.
-                        if name == "get_skill":
-                            loaded_name = args.get("name") or ""
-                            if loaded_name and self._tool_result_succeeded(result):
-                                self._loaded_skills.add(loaded_name)
 
                     if (
                         isinstance(result, dict)
