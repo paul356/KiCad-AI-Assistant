@@ -157,14 +157,90 @@ def set_fp_property(fp_node: list[Any], name: str, value: str) -> bool:
     return False
 
 
-def upsert_fp_property(fp_node: list[Any], name: str, value: str) -> None:
+def _fp_property_effects(node: list[Any]) -> list[Any] | None:
+    """Return the ``(effects ...)`` subnode of a property node, or None."""
+    for sub in node[3:]:
+        if isinstance(sub, list) and len(sub) > 0 and _sym(sub[0]) == "effects":
+            return sub
+    return None
+
+
+def _fp_property_is_hidden(node: list[Any]) -> bool:
+    """True when a property node carries a hide marker.
+
+    KiCad serializes footprint property visibility as a ``hide`` token.
+    Files written by current KiCad put it directly on the property node
+    (``(hide yes)``, or the legacy bare ``(hide)``); the classic form is a
+    ``(hide)`` token inside the node's ``(effects ...)`` block.  KiCad 8/9/10
+    all accept either.  A node with no hide token is visible.
+    """
+    for sub in node[3:]:
+        if not (isinstance(sub, list) and len(sub) > 0):
+            continue
+        key = _sym(sub[0])
+        if key == "hide":
+            if len(sub) > 1 and _sym(sub[1]) == "no":
+                continue
+            return True
+        if key == "effects":
+            for eff in sub[1:]:
+                is_hide = (isinstance(eff, sexpdata.Symbol) and str(eff) == "hide") or (
+                    isinstance(eff, list) and len(eff) > 0 and _sym(eff[0]) == "hide"
+                )
+                if is_hide and not (
+                    isinstance(eff, list) and len(eff) > 1 and _sym(eff[1]) == "no"
+                ):
+                    return True
+    return False
+
+
+def _set_fp_property_hidden(node: list[Any]) -> None:
+    """Mark a property node hidden, adding ``(effects (hide))`` if needed.
+
+    Idempotent: a node that already carries a hide marker (in either
+    accepted form) is left untouched.
+    """
+    if _fp_property_is_hidden(node):
+        return
+    effects = _fp_property_effects(node)
+    if effects is None:
+        node.append([sexpdata.Symbol("effects"), [sexpdata.Symbol("hide")]])
+    else:
+        effects.append([sexpdata.Symbol("hide")])
+
+
+def upsert_fp_property(fp_node: list[Any], name: str, value: str, *, hidden: bool = False) -> None:
     """Update a named property in a footprint node, or create it if absent.
 
     Unlike ``set_fp_property``, this never fails: if the property does not
     exist it is appended as a minimal ``(property name value)`` node.
+
+    When *hidden* is true the node is marked invisible on the PCB canvas by
+    adding an ``(effects (hide))`` marker — KiCad's serialization of the
+    hidden text flag.  A pre-existing node that is still visible gets the
+    marker added as well, so markers written by older servers are healed on
+    the next update.  Hidden is a presentation flag for agent-internal
+    metadata (e.g. the ``placement_group`` marker), never a value change.
+    With the default ``hidden=False`` the node's visibility is never
+    touched, keeping callers like the Reference designator exactly as
+    visible as before.
     """
-    if not set_fp_property(fp_node, name, value):
-        fp_node.append([sexpdata.Symbol("property"), name, value])
+    node = None
+    for sub in fp_node:
+        if isinstance(sub, list) and len(sub) >= 3 and _sym(sub[0]) == "property":
+            prop_name = sub[1] if isinstance(sub[1], str) else _sym(sub[1])
+            if prop_name == name:
+                node = sub
+                break
+    if node is None:
+        node = [sexpdata.Symbol("property"), name, value]
+        if hidden:
+            node.append([sexpdata.Symbol("effects"), [sexpdata.Symbol("hide")]])
+        fp_node.append(node)
+        return
+    node[2] = value
+    if hidden:
+        _set_fp_property_hidden(node)
 
 
 def get_fp_layer(fp_node: list[Any]) -> str | None:

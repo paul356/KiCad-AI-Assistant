@@ -34,7 +34,12 @@ from kcaa.tools.pcb_placement_helpers import (
     _get_fp_pads_world,
 )
 from kcaa.utils.pcb_board_utils import get_fp_courtyard_bbox
-from kcaa.utils.pcb_footprint_utils import find_footprint, get_fp_at
+from kcaa.utils.pcb_footprint_utils import (
+    _fp_property_is_hidden,
+    find_footprint,
+    get_fp_at,
+    get_fp_property,
+)
 from kcaa.utils.pcb_sexp_utils import load_pcb
 
 FIXTURE_PCB = os.path.join(os.path.dirname(__file__), "fixtures", "test_group_placement.kicad_pcb")
@@ -95,6 +100,51 @@ def board_copy(tmp_path):
     dest = tmp_path / "board.kicad_pcb"
     shutil.copy(FIXTURE_PCB, dest)
     return str(dest)
+
+
+# ---------------------------------------------------------------------------
+# assign_footprints_to_group — hidden placement_group marker
+# ---------------------------------------------------------------------------
+
+
+def _prop_node(fp: list, name: str) -> list | None:
+    """Return the ``property`` child node named *name* inside *fp*, or None."""
+    for sub in fp:
+        if isinstance(sub, list) and len(sub) >= 3 and str(sub[0]) == "property":
+            prop_name = sub[1] if isinstance(sub[1], str) else str(sub[1])
+            if prop_name == name:
+                return sub
+    return None
+
+
+class TestAssignToGroupHiddenMarker:
+    """assign_footprints_to_group must write the placement_group marker
+    hidden from the PCB canvas, while the Reference designator written by
+    the shared upsert path stays exactly as visible as before."""
+
+    def test_assigned_marker_is_hidden_on_reassigned_and_healed_nodes(self, tools, board_copy):
+        result = _run(
+            tools["assign_footprints_to_group"](
+                pcb_path=board_copy,
+                references=["J3", "R1"],
+                group_name="new_group",
+                ctx=None,
+            )
+        )
+        assert "error" not in result, result
+        data = load_pcb(board_copy)
+        for ref in ("J3", "R1"):
+            fp = find_footprint(data, ref)
+            marker = _prop_node(fp, "placement_group")
+            assert marker is not None
+            assert get_fp_property(fp, "placement_group") == "new_group"
+            assert _fp_property_is_hidden(marker) is True
+        # Reference must not gain a hide marker through the shared upsert.
+        for ref in ("J3", "R1"):
+            fp = find_footprint(data, ref)
+            reference = _prop_node(fp, "Reference")
+            assert reference is not None
+            assert _fp_property_is_hidden(reference) is False
 
 
 # ---------------------------------------------------------------------------

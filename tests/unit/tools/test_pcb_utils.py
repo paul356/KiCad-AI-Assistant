@@ -13,6 +13,7 @@ import pytest
 
 from kcaa.utils.pcb_footprint_utils import (
     LAYER_FLIP_MAP,
+    _fp_property_is_hidden,
     find_footprint,
     flip_fp_layers,
     get_fp_at,
@@ -20,6 +21,7 @@ from kcaa.utils.pcb_footprint_utils import (
     get_fp_property,
     set_fp_at,
     set_fp_property,
+    upsert_fp_property,
 )
 from kcaa.utils.pcb_sexp_utils import _serialize, load_pcb, save_pcb
 
@@ -176,6 +178,78 @@ class TestSetFpProperty:
     def test_returns_false_for_missing(self):
         fp = find_footprint(self.data, "R1")
         assert set_fp_property(fp, "NoSuchProp", "x") is False
+
+
+def _property_node(fp: list, name: str) -> list | None:
+    """Return the ``property`` child node named *name* inside *fp*, or None."""
+    for sub in fp:
+        if isinstance(sub, list) and len(sub) >= 3 and str(sub[0]) == "property":
+            prop_name = sub[1] if isinstance(sub[1], str) else str(sub[1])
+            if prop_name == name:
+                return sub
+    return None
+
+
+class TestUpsertFpProperty:
+    """Hidden-marker behavior of upsert_fp_property.
+
+    The ``hidden`` flag is the internal-metadata channel: only agent-internal
+    properties (placement_group) may use it; the shared callers with the
+    default ``hidden=False`` (Reference designator) must keep the exact
+    visibility they had before.
+    """
+
+    def setup_method(self):
+        self.data = load_pcb(BOARD_FIXTURE)
+        self.fp = find_footprint(self.data, "R1")
+
+    def test_creates_hidden_node_with_hide_marker(self):
+        upsert_fp_property(self.fp, "placement_group", "usb_c", hidden=True)
+        node = _property_node(self.fp, "placement_group")
+        assert node is not None
+        assert _fp_property_is_hidden(node) is True
+        # KiCad canonical hidden shape: (effects (hide)) inside the property.
+        assert (
+            _serialize([self.fp]).find('(property "placement_group" "usb_c" (effects (hide)))')
+            != -1
+        )
+
+    def test_creates_visible_node_without_hide_marker(self):
+        upsert_fp_property(self.fp, "placement_group", "usb_c")
+        node = _property_node(self.fp, "placement_group")
+        assert node is not None
+        assert get_fp_property(self.fp, "placement_group") == "usb_c"
+        assert all(not (isinstance(s, list) and s and str(s[0]) == "effects") for s in node[3:])
+
+    def test_update_preserves_hide_marker(self):
+        upsert_fp_property(self.fp, "placement_group", "usb_c", hidden=True)
+        upsert_fp_property(self.fp, "placement_group", "power", hidden=True)
+        node = _property_node(self.fp, "placement_group")
+        assert get_fp_property(self.fp, "placement_group") == "power"
+        assert _fp_property_is_hidden(node) is True
+        effects = [s for s in node[3:] if isinstance(s, list) and s and str(s[0]) == "effects"]
+        assert len(effects) == 1
+
+    def test_hidden_upsert_heals_existing_visible_node(self):
+        upsert_fp_property(self.fp, "placement_group", "usb_c")
+        upsert_fp_property(self.fp, "placement_group", "usb_c", hidden=True)
+        node = _property_node(self.fp, "placement_group")
+        assert _fp_property_is_hidden(node) is True
+
+    def test_default_upsert_leaves_existing_hidden_untouched(self):
+        upsert_fp_property(self.fp, "placement_group", "usb_c", hidden=True)
+        upsert_fp_property(self.fp, "placement_group", "power")
+        node = _property_node(self.fp, "placement_group")
+        assert _fp_property_is_hidden(node) is True
+        assert get_fp_property(self.fp, "placement_group") == "power"
+
+    def test_reference_default_stays_visible(self):
+        """The Reference designator path must never gain a hide marker."""
+        upsert_fp_property(self.fp, "Reference", "R1A")
+        node = _property_node(self.fp, "Reference")
+        assert get_fp_property(self.fp, "Reference") == "R1A"
+        assert _fp_property_is_hidden(node) is False
+        assert all(not (isinstance(s, list) and s and str(s[0]) == "effects") for s in node[3:])
 
 
 class TestFlipFpLayers:
