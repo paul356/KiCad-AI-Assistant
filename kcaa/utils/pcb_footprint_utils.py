@@ -157,22 +157,14 @@ def set_fp_property(fp_node: list[Any], name: str, value: str) -> bool:
     return False
 
 
-def _fp_property_effects(node: list[Any]) -> list[Any] | None:
-    """Return the ``(effects ...)`` subnode of a property node, or None."""
-    for sub in node[3:]:
-        if isinstance(sub, list) and len(sub) > 0 and _sym(sub[0]) == "effects":
-            return sub
-    return None
-
-
 def _fp_property_is_hidden(node: list[Any]) -> bool:
     """True when a property node carries a hide marker.
 
     KiCad serializes footprint property visibility as a ``hide`` token.
-    Files written by current KiCad put it directly on the property node
-    (``(hide yes)``, or the legacy bare ``(hide)``); the classic form is a
-    ``(hide)`` token inside the node's ``(effects ...)`` block.  KiCad 8/9/10
-    all accept either.  A node with no hide token is visible.
+    Files written by current KiCad (8/9/10) put it directly on the property
+    node as ``(hide yes)``; the legacy form, still read on input, is a bare
+    ``(hide)`` token inside the node's ``(effects ...)`` block.  A node with
+    no hide token (or an explicit ``(hide no)``) is visible.
     """
     for sub in node[3:]:
         if not (isinstance(sub, list) and len(sub) > 0):
@@ -195,18 +187,24 @@ def _fp_property_is_hidden(node: list[Any]) -> bool:
 
 
 def _set_fp_property_hidden(node: list[Any]) -> None:
-    """Mark a property node hidden, adding ``(effects (hide))`` if needed.
+    """Mark a property node hidden with a node-level ``(hide yes)`` marker.
 
-    Idempotent: a node that already carries a hide marker (in either
-    accepted form) is left untouched.
+    Matches what KiCad 10 itself writes: the marker is a direct child of the
+    property node, after any ``(at ...)``/``(layer ...)`` and before
+    ``(uuid ...)``/``(effects ...)``.  Idempotent: a node that already
+    carries a hide marker (in any accepted form) is left untouched.
     """
     if _fp_property_is_hidden(node):
         return
-    effects = _fp_property_effects(node)
-    if effects is None:
-        node.append([sexpdata.Symbol("effects"), [sexpdata.Symbol("hide")]])
-    else:
-        effects.append([sexpdata.Symbol("hide")])
+    hide = [sexpdata.Symbol("hide"), sexpdata.Symbol("yes")]
+    insert_at = len(node)
+    for index in range(3, len(node)):
+        sub = node[index]
+        if isinstance(sub, list) and len(sub) > 0 and _sym(sub[0]) in ("at", "layer"):
+            insert_at = index + 1
+        else:
+            break
+    node.insert(insert_at, hide)
 
 
 def upsert_fp_property(fp_node: list[Any], name: str, value: str, *, hidden: bool = False) -> None:
@@ -215,15 +213,15 @@ def upsert_fp_property(fp_node: list[Any], name: str, value: str, *, hidden: boo
     Unlike ``set_fp_property``, this never fails: if the property does not
     exist it is appended as a minimal ``(property name value)`` node.
 
-    When *hidden* is true the node is marked invisible on the PCB canvas by
-    adding an ``(effects (hide))`` marker — KiCad's serialization of the
-    hidden text flag.  A pre-existing node that is still visible gets the
-    marker added as well, so markers written by older servers are healed on
-    the next update.  Hidden is a presentation flag for agent-internal
-    metadata (e.g. the ``placement_group`` marker), never a value change.
-    With the default ``hidden=False`` the node's visibility is never
-    touched, keeping callers like the Reference designator exactly as
-    visible as before.
+    When *hidden* is true the node is marked invisible on the PCB canvas
+    with a node-level ``(hide yes)`` marker — the form KiCad 8/9/10 write
+    for hidden properties.  A pre-existing node that is still visible gets
+    the marker added as well, so markers written by older servers are
+    healed on the next update.  Hidden is a presentation flag for
+    agent-internal metadata (e.g. the ``placement_group`` marker), never a
+    value change.  With the default ``hidden=False`` the node's visibility
+    is never touched, keeping callers like the Reference designator exactly
+    as visible as before.
     """
     node = None
     for sub in fp_node:
@@ -235,7 +233,7 @@ def upsert_fp_property(fp_node: list[Any], name: str, value: str, *, hidden: boo
     if node is None:
         node = [sexpdata.Symbol("property"), name, value]
         if hidden:
-            node.append([sexpdata.Symbol("effects"), [sexpdata.Symbol("hide")]])
+            node.append([sexpdata.Symbol("hide"), sexpdata.Symbol("yes")])
         fp_node.append(node)
         return
     node[2] = value

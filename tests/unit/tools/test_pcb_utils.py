@@ -10,6 +10,7 @@ import os
 import shutil
 
 import pytest
+import sexpdata
 
 from kcaa.utils.pcb_footprint_utils import (
     LAYER_FLIP_MAP,
@@ -208,17 +209,16 @@ class TestUpsertFpProperty:
         node = _property_node(self.fp, "placement_group")
         assert node is not None
         assert _fp_property_is_hidden(node) is True
-        # KiCad canonical hidden shape: (effects (hide)) inside the property.
-        assert (
-            _serialize([self.fp]).find('(property "placement_group" "usb_c" (effects (hide)))')
-            != -1
-        )
+        # KiCad 10 canonical hidden shape: node-level (hide yes), a direct
+        # child of the property node.
+        assert _serialize([self.fp]).find('(property "placement_group" "usb_c" (hide yes))') != -1
 
     def test_creates_visible_node_without_hide_marker(self):
         upsert_fp_property(self.fp, "placement_group", "usb_c")
         node = _property_node(self.fp, "placement_group")
         assert node is not None
         assert get_fp_property(self.fp, "placement_group") == "usb_c"
+        assert _fp_property_is_hidden(node) is False
         assert all(not (isinstance(s, list) and s and str(s[0]) == "effects") for s in node[3:])
 
     def test_update_preserves_hide_marker(self):
@@ -227,14 +227,34 @@ class TestUpsertFpProperty:
         node = _property_node(self.fp, "placement_group")
         assert get_fp_property(self.fp, "placement_group") == "power"
         assert _fp_property_is_hidden(node) is True
-        effects = [s for s in node[3:] if isinstance(s, list) and s and str(s[0]) == "effects"]
-        assert len(effects) == 1
+        markers = [s for s in node[3:] if isinstance(s, list) and s and str(s[0]) == "hide"]
+        assert len(markers) == 1
+
+    def test_heal_adds_node_level_marker_after_at_and_layer(self):
+        """Healing an existing node places (hide yes) after at/layer, before
+        the trailing effects block — the order KiCad 10 writes."""
+        upsert_fp_property(self.fp, "placement_group", "usb_c")
+        node = _property_node(self.fp, "placement_group")
+        node.append([sexpdata.Symbol("at"), -1.5, 2.0])
+        node.append([sexpdata.Symbol("layer"), "F.Fab"])
+        node.append(
+            [
+                sexpdata.Symbol("effects"),
+                [sexpdata.Symbol("font"), [sexpdata.Symbol("size"), 1.27, 1.27]],
+            ]
+        )
+        upsert_fp_property(self.fp, "placement_group", "usb_c", hidden=True)
+        assert _fp_property_is_hidden(node) is True
+        keys = [str(s[0]) for s in node[3:] if isinstance(s, list) and s]
+        assert keys[:3] == ["at", "layer", "hide"]
+        assert "effects" in keys[3:]
 
     def test_hidden_upsert_heals_existing_visible_node(self):
         upsert_fp_property(self.fp, "placement_group", "usb_c")
         upsert_fp_property(self.fp, "placement_group", "usb_c", hidden=True)
         node = _property_node(self.fp, "placement_group")
         assert _fp_property_is_hidden(node) is True
+        assert _serialize([self.fp]).find('(property "placement_group" "usb_c" (hide yes))') != -1
 
     def test_default_upsert_leaves_existing_hidden_untouched(self):
         upsert_fp_property(self.fp, "placement_group", "usb_c", hidden=True)
@@ -250,6 +270,57 @@ class TestUpsertFpProperty:
         assert get_fp_property(self.fp, "Reference") == "R1A"
         assert _fp_property_is_hidden(node) is False
         assert all(not (isinstance(s, list) and s and str(s[0]) == "effects") for s in node[3:])
+
+
+class TestFpPropertyHiddenReadCompat:
+    """_fp_property_is_hidden must read every hide form KiCad has written.
+
+    Writer output: node-level ``(hide yes)``.  Real boards from older KiCad
+    or the previous server may carry ``(effects (hide))`` or bare ``(hide)``
+    — all of these are recognized as hidden on input.
+    """
+
+    def _prop(self, *children: list) -> list:
+        return [sexpdata.Symbol("property"), "placement_group", "g", *children]
+
+    def test_node_level_hide_yes(self):
+        assert (
+            _fp_property_is_hidden(self._prop([sexpdata.Symbol("hide"), sexpdata.Symbol("yes")]))
+            is True
+        )
+
+    def test_legacy_hide_inside_effects(self):
+        assert (
+            _fp_property_is_hidden(
+                self._prop([sexpdata.Symbol("effects"), [sexpdata.Symbol("hide")]])
+            )
+            is True
+        )
+
+    def test_legacy_hide_yes_inside_effects(self):
+        assert (
+            _fp_property_is_hidden(
+                self._prop(
+                    [
+                        sexpdata.Symbol("effects"),
+                        [sexpdata.Symbol("hide"), sexpdata.Symbol("yes")],
+                    ]
+                )
+            )
+            is True
+        )
+
+    def test_legacy_bare_hide_on_node(self):
+        assert _fp_property_is_hidden(self._prop([sexpdata.Symbol("hide")])) is True
+
+    def test_no_marker_is_visible(self):
+        assert _fp_property_is_hidden(self._prop()) is False
+
+    def test_hide_no_is_visible(self):
+        assert (
+            _fp_property_is_hidden(self._prop([sexpdata.Symbol("hide"), sexpdata.Symbol("no")]))
+            is False
+        )
 
 
 class TestFlipFpLayers:
