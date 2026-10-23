@@ -273,6 +273,52 @@ class TestUpsertFpProperty:
             != -1
         )
 
+    @pytest.mark.parametrize(
+        "extra_children",
+        [
+            # (hide no) inside the canonical segment.
+            (
+                [sexpdata.Symbol("at"), 0.0, 0.0],
+                [sexpdata.Symbol("layer"), "F.Fab"],
+                [sexpdata.Symbol("hide"), sexpdata.Symbol("no")],
+                [sexpdata.Symbol("uuid"), "7a3db89d-8dcf-4bd0-808e-2abe95a3086d"],
+                [sexpdata.Symbol("effects"), [sexpdata.Symbol("font"), 1.0]],
+            ),
+            # (hide no) between uuid and effects — past the walk break point.
+            (
+                [sexpdata.Symbol("at"), 0.0, 0.0],
+                [sexpdata.Symbol("layer"), "F.Fab"],
+                [sexpdata.Symbol("uuid"), "7a3db89d-8dcf-4bd0-808e-2abe95a3086d"],
+                [sexpdata.Symbol("hide"), sexpdata.Symbol("no")],
+                [sexpdata.Symbol("effects"), [sexpdata.Symbol("font"), 1.0]],
+            ),
+            # (hide no) after effects entirely.
+            (
+                [sexpdata.Symbol("at"), 0.0, 0.0],
+                [sexpdata.Symbol("layer"), "F.Fab"],
+                [sexpdata.Symbol("uuid"), "7a3db89d-8dcf-4bd0-808e-2abe95a3086d"],
+                [sexpdata.Symbol("effects"), [sexpdata.Symbol("font"), 1.0]],
+                [sexpdata.Symbol("hide"), sexpdata.Symbol("no")],
+            ),
+        ],
+        ids=["before_uuid", "after_uuid", "after_effects"],
+    )
+    def test_heal_hide_yes_is_always_trailing_hide(self, extra_children):
+        """Healing must leave (hide yes) as the LAST hide token in the node,
+        wherever a stale (hide no) sits — KiCad's last-token-wins parse."""
+        upsert_fp_property(self.fp, "placement_group", "usb_c")
+        node = _property_node(self.fp, "placement_group")
+        node.extend(extra_children)
+        upsert_fp_property(self.fp, "placement_group", "usb_c", hidden=True)
+        assert _fp_property_is_hidden(node) is True
+        serialized = sexpdata.dumps(node)
+        hide_no_at = serialized.find("(hide no)")
+        hide_yes_at = serialized.find("(hide yes)")
+        # The new marker is ordered after the stale one and is the trailing
+        # hide token in the node.
+        assert 0 <= hide_no_at < hide_yes_at
+        assert "(hide" not in serialized[hide_yes_at + len("(hide yes)") :]
+
     def test_hidden_upsert_heals_existing_visible_node(self):
         upsert_fp_property(self.fp, "placement_group", "usb_c")
         upsert_fp_property(self.fp, "placement_group", "usb_c", hidden=True)

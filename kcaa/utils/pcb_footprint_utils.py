@@ -191,12 +191,13 @@ def _set_fp_property_hidden(node: list[Any]) -> None:
 
     Matches what KiCad 10 itself writes: the marker is a direct child of the
     property node, after any ``(at ...)``/``(layer ...)`` and before
-    ``(uuid ...)``/``(effects ...)``.  The walk also keeps past any existing
-    hide token, so a stale hand-written ``(hide no)`` never ends up ordered
-    after the new ``(hide yes)`` — KiCad applies hide tokens sequentially
-    and the last one wins, so the new marker must be the trailing hide.
-    Idempotent: a node that already carries a hide marker (in any accepted
-    form) is left untouched.
+    ``(uuid ...)``/``(effects ...)``.  KiCad applies hide tokens
+    sequentially and the last one wins, so the new ``(hide yes)`` is always
+    the trailing hide token: the insertion anchor is the later of the walk
+    position and the slot right after the last hide token found anywhere in
+    the node's children — a stale hand-written ``(hide no)`` stays ordered
+    before it no matter where it sits.  Idempotent: a node that already
+    carries a hide marker (in any accepted form) is left untouched.
     """
     if _fp_property_is_hidden(node):
         return
@@ -215,6 +216,16 @@ def _set_fp_property_hidden(node: list[Any]) -> None:
         if key in ("at", "layer") or key == "hide":
             insert_at = index + 1
         else:
+            break
+    # Hand-written hide tokens can sit past the walk's break point (after
+    # uuid/effects); anchor after the LAST one in the node regardless.
+    for index in range(len(node) - 1, 2, -1):
+        sub = node[index]
+        is_hide = (isinstance(sub, sexpdata.Symbol) and str(sub) == "hide") or (
+            isinstance(sub, list) and len(sub) > 0 and _sym(sub[0]) == "hide"
+        )
+        if is_hide:
+            insert_at = max(insert_at, index + 1)
             break
     node.insert(insert_at, hide)
 
