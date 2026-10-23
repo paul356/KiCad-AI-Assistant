@@ -191,8 +191,12 @@ def _set_fp_property_hidden(node: list[Any]) -> None:
 
     Matches what KiCad 10 itself writes: the marker is a direct child of the
     property node, after any ``(at ...)``/``(layer ...)`` and before
-    ``(uuid ...)``/``(effects ...)``.  Idempotent: a node that already
-    carries a hide marker (in any accepted form) is left untouched.
+    ``(uuid ...)``/``(effects ...)``.  The walk also keeps past any existing
+    hide token, so a stale hand-written ``(hide no)`` never ends up ordered
+    after the new ``(hide yes)`` — KiCad applies hide tokens sequentially
+    and the last one wins, so the new marker must be the trailing hide.
+    Idempotent: a node that already carries a hide marker (in any accepted
+    form) is left untouched.
     """
     if _fp_property_is_hidden(node):
         return
@@ -200,7 +204,15 @@ def _set_fp_property_hidden(node: list[Any]) -> None:
     insert_at = len(node)
     for index in range(3, len(node)):
         sub = node[index]
-        if isinstance(sub, list) and len(sub) > 0 and _sym(sub[0]) in ("at", "layer"):
+        if isinstance(sub, sexpdata.Symbol):
+            if str(sub) == "hide":
+                insert_at = index + 1
+                continue
+            break
+        if not (isinstance(sub, list) and len(sub) > 0):
+            break
+        key = _sym(sub[0])
+        if key in ("at", "layer") or key == "hide":
             insert_at = index + 1
         else:
             break

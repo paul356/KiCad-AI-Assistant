@@ -249,6 +249,30 @@ class TestUpsertFpProperty:
         assert keys[:3] == ["at", "layer", "hide"]
         assert "effects" in keys[3:]
 
+    def test_heal_places_hide_yes_after_stray_hide_no(self):
+        """A stale hand-written `(hide no)` must not shadow the healed marker.
+
+        KiCad applies hide tokens sequentially — last one wins — so the new
+        `(hide yes)` must be ordered after an existing `(hide no)`.  Without
+        the order hardening this produced `(hide yes) (hide no)` (visible in
+        KiCad while reported hidden) when at/layer preceded the stray token.
+        """
+        upsert_fp_property(self.fp, "placement_group", "usb_c")
+        node = _property_node(self.fp, "placement_group")
+        node.append([sexpdata.Symbol("at"), 0.0, 0.0])
+        node.append([sexpdata.Symbol("layer"), "F.Fab"])
+        node.append([sexpdata.Symbol("hide"), sexpdata.Symbol("no")])
+        node.append([sexpdata.Symbol("uuid"), "7a3db89d-8dcf-4bd0-808e-2abe95a3086d"])
+        upsert_fp_property(self.fp, "placement_group", "usb_c", hidden=True)
+        assert _fp_property_is_hidden(node) is True
+        assert (
+            _serialize([self.fp]).find(
+                '(property "placement_group" "usb_c" (at 0.0 0.0) (layer "F.Fab") '
+                '(hide no) (hide yes) (uuid "7a3db89d-8dcf-4bd0-808e-2abe95a3086d"))'
+            )
+            != -1
+        )
+
     def test_hidden_upsert_heals_existing_visible_node(self):
         upsert_fp_property(self.fp, "placement_group", "usb_c")
         upsert_fp_property(self.fp, "placement_group", "usb_c", hidden=True)
