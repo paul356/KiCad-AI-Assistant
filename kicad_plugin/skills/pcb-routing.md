@@ -2,6 +2,7 @@
 name: pcb-routing
 priority: 95
 description: "PCB pad-to-pad routing workflow: get_ratsnest, export_pcb_layer_image, pcb_route_pad_to_pad, failure retry"
+tools: [get_ratsnest, export_pcb_layer_image, pcb_route_pad_to_pad, pcb_add_vias, pcb_delete_vias]
 ---
 # PCB routing workflow
 Connect pads belonging to the same net with DRC-clean tracks.

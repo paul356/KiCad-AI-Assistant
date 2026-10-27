@@ -2,6 +2,7 @@
 name: symbol-library
 priority: 80
 description: "Symbol index sync, full-text search, pin details, bbox geometry in library space"
+tools: [sync_symbol_index, get_symbol_sync_status, search_symbols, get_symbol, get_symbol_pins, list_symbol_libraries, get_library_symbols, get_symbol_index_stats]
 ---
 # Tools overview
 - **sync_symbol_index** — Start background sync of the symbol index database.

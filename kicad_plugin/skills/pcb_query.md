@@ -2,6 +2,7 @@
 name: pcb-query
 priority: 50
 description: "PCB query workflow: get_board_info, list_footprints, ratsnest, nets"
+tools: [get_board_info, list_footprints, get_footprint, list_nets, list_vias]
 ---
 # PCB query workflow
 1. Call **get_board_info** to learn layer stack, copper layer count, footprint

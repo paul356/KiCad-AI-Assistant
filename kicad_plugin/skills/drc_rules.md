@@ -2,6 +2,7 @@
 name: drc-rules
 priority: 45
 description: "Design rules, net classes, custom DRC constraints, net-to-class assignment, and DRC checker"
+tools: [get_effective_design_rules, set_design_rules, set_net_class_rules, assign_nets_to_class, remove_nets_from_class, delete_net_class, add_custom_rule, del_custom_rule, run_drc_check]
 ---
 # Tools overview
 - **get_effective_design_rules** — Read all design constraints: board minimums, net classes (with assigned nets), and custom rules.

@@ -203,3 +203,56 @@ class TestGetSkill:
         assert "name:" not in result
         assert "priority:" not in result
         assert "This is the body only." in result
+
+
+# ---------------------------------------------------------------------------
+# Frontmatter tools: list syntax (issue #208 auto-injection declarations)
+# ---------------------------------------------------------------------------
+
+
+class TestFrontMatterToolsParsing:
+    def test_bracket_list(self):
+        from kcaa.tools.skill_tools import _parse_front_matter
+
+        text = "---\nname: x\ntools: [a, b, c]\n---\nbody"
+        meta, body = _parse_front_matter(text)
+        assert meta["tools"] == ["a", "b", "c"]
+        assert body == "body"
+
+    def test_comma_separated(self):
+        from kcaa.tools.skill_tools import _parse_front_matter
+
+        text = "---\nname: x\ntools: a, b, c\n---\nbody"
+        meta, _ = _parse_front_matter(text)
+        assert meta["tools"] == ["a", "b", "c"]
+
+    def test_bracket_no_spaces(self):
+        from kcaa.tools.skill_tools import _parse_front_matter
+
+        text = "---\nname: x\ntools: [a,b,c]\n---\nbody"
+        meta, _ = _parse_front_matter(text)
+        assert meta["tools"] == ["a", "b", "c"]
+
+    def test_empty_tools_field(self):
+        from kcaa.tools.skill_tools import _parse_front_matter
+
+        text = "---\nname: x\ntools:\n---\nbody"
+        meta, _ = _parse_front_matter(text)
+        assert meta["tools"] == []
+
+    def test_missing_tools_field(self):
+        from kcaa.tools.skill_tools import _parse_front_matter
+
+        text = '---\nname: x\npriority: 50\ndescription: "d"\n---\nbody'
+        meta, _ = _parse_front_matter(text)
+        assert "tools" not in meta
+
+    def test_other_fields_untouched_by_tools_parsing(self):
+        from kcaa.tools.skill_tools import _parse_front_matter
+
+        text = '---\nname: x\ntools: [a, b]\npriority: 80\ndescription: "has: a colon"\n---\nbody'
+        meta, _ = _parse_front_matter(text)
+        assert meta["name"] == "x"
+        assert meta["priority"] == "80"
+        assert meta["description"] == "has: a colon"
+        assert meta["tools"] == ["a", "b"]

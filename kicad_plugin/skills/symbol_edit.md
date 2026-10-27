@@ -2,6 +2,7 @@
 name: symbol-edit
 priority: 65
 description: "Property CRUD, reference renaming, label management, reference conflict checking"
+tools: [set_symbol_property, rename_symbol, list_symbol_properties, delete_symbol_property, add_label_to_schematic, list_labels_in_schematic, delete_label_from_schematic, check_reference_conflicts]
 ---
 # Tools overview
 - **set_symbol_property** — Set or add a property on a placed schematic component.
