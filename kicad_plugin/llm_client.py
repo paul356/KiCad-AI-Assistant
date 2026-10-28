@@ -175,19 +175,40 @@ _SKILLS_DIR = Path(
 )
 
 
-def _parse_skill_front_matter(text: str) -> dict[str, str]:
-    """Return flat front-matter metadata from a skill Markdown file."""
+def _split_tools_value(value: str) -> list[str]:
+    """Split a frontmatter ``tools:`` value into a list of tool names.
+
+    Accepts YAML-ish bracket syntax (``[a, b, c]``) and bare comma-separated
+    lists (``a, b, c``); the bracket form is stripped before splitting so
+    both parse identically.  Empty/absent values yield ``[]``.
+    """
+    value = value.strip()
+    if value.startswith("[") and value.endswith("]"):
+        value = value[1:-1]
+    return [t.strip() for t in value.split(",") if t.strip()]
+
+
+def _parse_skill_front_matter(text: str) -> dict[str, Any]:
+    """Return flat front-matter metadata from a skill Markdown file.
+
+    The optional ``tools:`` field (issue #208) is parsed into a list of MCP
+    tool names; every other field stays a string.
+    """
     if not text.startswith("---"):
         return {}
     end = text.find("\n---", 3)
     if end == -1:
         return {}
-    meta: dict[str, str] = {}
+    meta: dict[str, Any] = {}
     for line in text[3:end].strip().splitlines():
         if ":" not in line:
             continue
         key, _, value = line.partition(":")
-        meta[key.strip()] = value.strip().strip('"').strip("'")
+        key = key.strip()
+        if key == "tools":
+            meta["tools"] = _split_tools_value(value)
+        else:
+            meta[key] = value.strip().strip('"').strip("'")
     return meta
 
 
@@ -245,6 +266,63 @@ def _build_skill_catalog_block() -> str:
         for skill in skills
     ]
     return "# Skills\n" + _SKILL_CATEGORY_GUIDE + "\n" + "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Issue #208: harness-side skill auto-injection.
+#
+# When the LLM calls a tool that a skill's frontmatter ``tools:`` field
+# declares, that skill's body is injected into history as a user-role message
+# (``[Skill guide: <name>]`` header), exactly once per session.  Skills
+# without ``tools:`` are never auto-injected — get_skill stays their only
+# load path (fallback preserved, tools untouched).
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _SkillRef:
+    """One frontmatter-declared auto-inject target: skill name + body file."""
+
+    name: str
+    body_path: Path
+
+
+def _load_skill_tool_mapping() -> dict[str, _SkillRef]:
+    """Map MCP tool name → declaring skill from every ``tools:`` frontmatter.
+
+    Iterates ``_SKILLS_DIR/*.md`` (sorted for determinism).  A skill without
+    a ``tools:`` field never appears in the mapping.  When several files
+    declare the same tool the last file (sorted by path) wins — authors must
+    not overlap declarations across skills.
+    """
+    mapping: dict[str, _SkillRef] = {}
+    if not _SKILLS_DIR.exists():
+        return mapping
+    for path in sorted(_SKILLS_DIR.glob("*.md")):
+        try:
+            meta = _parse_skill_front_matter(path.read_text(encoding="utf-8"))
+        except Exception:
+            log.warning("Failed to read skill file %s", path)
+            continue
+        name = meta.get("name") or path.stem.replace("_", "-")
+        for tool in meta.get("tools") or []:
+            mapping[tool] = _SkillRef(name=name, body_path=path)
+    return mapping
+
+
+def _skill_guide_body(path: Path) -> str:
+    """Return a skill file's body with the front-matter fence stripped.
+
+    Matches ``get_skill``'s output shape (skill_tools ``_parse_front_matter``
+    slices the same way), so model-facing skill content is identical whether
+    loaded on demand or auto-injected.
+    """
+    text = path.read_text(encoding="utf-8")
+    if text.startswith("---"):
+        end = text.find("\n---", 3)
+        if end != -1:
+            return text[end + 4 :].lstrip("\n")
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -1447,6 +1525,13 @@ class LLMClient:
         # request head stays byte-identical across turns (cache-friendly).
         self._tool_registry: dict[str, dict[str, Any]] | None = None
         self._enabled_tools: set[str] = set()
+        # Issue #208: frontmatter-declared tool→skill auto-inject state.  The
+        # mapping is derived from _SKILLS_DIR/*.md and built lazily on the
+        # first tool call; _injected_skills is session-scoped like the
+        # enabled-tool set (cleared by reset(), NOT rebuilt by set_history()).
+        self._skill_tool_map: dict[str, _SkillRef] | None = None
+        self._injected_skills: set[str] = set()
+        self._warned_missing_tool_skills: set[tuple[str, str]] = set()
         # One-shot context-window diagnostics (issue #129).
         self._fixed_overhead_warned: bool = False
         self._budget_warned: bool = False
@@ -1460,9 +1545,11 @@ class LLMClient:
         """
         self._history = []
         self._enabled_tools.clear()
+        self._injected_skills.clear()
         self._fixed_overhead_warned = False
         self._budget_warned = False
-        # self._tool_registry is kept: the tool catalog is stable per session.
+        # self._tool_registry and self._skill_tool_map are kept: the tool
+        # catalog and the skill mapping are stable per session.
 
     def set_base_url(self, url: str | None) -> None:
         """Set the MCP backend base URL after construction.
@@ -3045,6 +3132,85 @@ class LLMClient:
             return None
         return self._format_reload_failure(reload_result)
 
+    def _get_skill_tool_map(self) -> dict[str, _SkillRef]:
+        """Return the session's frontmatter tool→skill map, built on first use."""
+        if self._skill_tool_map is None:
+            self._skill_tool_map = _load_skill_tool_mapping()
+            self._warn_missing_declared_tools()
+        return self._skill_tool_map
+
+    def _warn_missing_declared_tools(self) -> None:
+        """Log (once per skill/tool pair) declared tools absent from the registry.
+
+        The mapping is author-declared and may drift from the live MCP
+        catalog; a stale name must never crash a turn.  Called at map build
+        time and again after every registry (re)fetch so a catalog populated
+        after the map was built still surfaces the warning.
+        """
+        registry = self._tool_registry
+        if registry is None or self._skill_tool_map is None:
+            return
+        for tool, ref in self._skill_tool_map.items():
+            if tool in registry:
+                continue
+            key = (ref.name, tool)
+            if key in self._warned_missing_tool_skills:
+                continue
+            self._warned_missing_tool_skills.add(key)
+            log.warning(
+                "Skill '%s' declares frontmatter tool '%s' that is not in the "
+                "MCP tool registry; auto-inject for that name is disabled",
+                ref.name,
+                tool,
+            )
+
+    def _inject_skill_guides(self, tool_calls: list[dict[str, Any]]) -> None:
+        """Append frontmatter-declared skill bodies to history, once per session.
+
+        Called right after a batch of tool results has been appended to
+        history, so the assistant ``tool_calls`` message stays contiguous
+        with its role:"tool" results (provider pairing requirement).  Only
+        tools that actually executed qualify — pre-execution rejections (name
+        absent from the catalog / missing execution policy, mirroring
+        ``_execute_or_reject_tool``) never trigger an injection.  Skills
+        without a ``tools:`` field are never injected; a repeated call to an
+        already-injected skill is a pure no-op.
+        """
+        if not tool_calls:
+            return
+        mapping = self._get_skill_tool_map()
+        if not mapping:
+            return
+        registry = self._tool_registry or {}
+        to_inject: list[_SkillRef] = []
+        seen: set[str] = set()
+        for tc in tool_calls:
+            name = tc.get("function", {}).get("name", "")
+            if name not in _META_TOOL_NAMES and (
+                name not in TOOL_POLICIES or (registry and name not in registry)
+            ):
+                continue
+            ref = mapping.get(name)
+            if ref is None or ref.name in self._injected_skills or ref.name in seen:
+                continue
+            seen.add(ref.name)
+            to_inject.append(ref)
+        for ref in to_inject:
+            try:
+                body = _skill_guide_body(ref.body_path)
+            except OSError as e:
+                log.warning("Skill auto-inject: cannot read %s: %s", ref.body_path, e)
+                continue
+            self._history.append(
+                {"role": "user", "content": f"[Skill guide: {ref.name}]\n\n{body}"}
+            )
+            self._injected_skills.add(ref.name)
+            log.info(
+                "Skill auto-inject: injected '%s' (%d chars) after first declared tool call",
+                ref.name,
+                len(body),
+            )
+
     def run(
         self,
         user_message: str | dict[str, Any],
@@ -3283,6 +3449,11 @@ class LLMClient:
                             ],
                         }
                     )
+                # Issue #208: auto-inject frontmatter-declared skill guides.
+                # Must run strictly after the whole tool-results batch — a
+                # user message between the assistant tool_calls message and
+                # its role:"tool" results breaks provider pairing validation.
+                self._inject_skill_guides(tool_calls)
                 if aborted_turn:
                     break
             else:
@@ -3388,6 +3559,10 @@ class LLMClient:
             for t in tools_raw
         ]
         self._tool_registry = {d["function"]["name"]: d for d in converted}
+        # The registry may have been populated after the skill map was built
+        # (first turn while the backend was still starting): surface the
+        # drift warning now that the catalog is known.
+        self._warn_missing_declared_tools()
         return converted
 
     def _call_llm(self, system: str, tools: list[dict], on_stream_event=None) -> dict[str, Any]:

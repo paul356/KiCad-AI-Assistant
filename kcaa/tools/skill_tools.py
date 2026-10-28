@@ -26,6 +26,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+from typing import Any
 
 from fastmcp import FastMCP
 
@@ -45,10 +46,24 @@ _DELETED_DIR = _SKILLS_DIR / ".deleted"
 _VALID_NAME_RE = re.compile(r"^[a-z][a-z0-9-]*$")
 
 
-def _parse_front_matter(text: str) -> tuple[dict[str, str], str]:
+def _split_tools_value(value: str) -> list[str]:
+    """Split a frontmatter ``tools:`` value into a list of tool names.
+
+    Accepts YAML-ish bracket syntax (``[a, b, c]``) and bare comma-separated
+    lists (``a, b, c``); the bracket form is stripped before splitting so
+    both parse identically.  Empty/absent values yield ``[]``.
+    """
+    value = value.strip()
+    if value.startswith("[") and value.endswith("]"):
+        value = value[1:-1]
+    return [t.strip() for t in value.split(",") if t.strip()]
+
+
+def _parse_front_matter(text: str) -> tuple[dict[str, Any], str]:
     """Return ``(meta, body)`` from a Markdown document with YAML front matter.
 
-    Only flat ``key: value`` pairs are parsed — no nested structures.
+    Only flat ``key: value`` pairs are parsed — no nested structures.  The
+    ``tools:`` field is parsed into a list of tool names (issue #208).
     If the document has no front-matter fence the meta dict is empty and the
     full text is returned as the body.
     """
@@ -59,11 +74,15 @@ def _parse_front_matter(text: str) -> tuple[dict[str, str], str]:
         return {}, text
     front_matter_str = text[3:end].strip()
     body = text[end + 4 :].lstrip("\n")
-    meta: dict[str, str] = {}
+    meta: dict[str, Any] = {}
     for line in front_matter_str.splitlines():
         if ":" in line:
             key, _, value = line.partition(":")
-            meta[key.strip()] = value.strip().strip('"').strip("'")
+            key = key.strip()
+            if key == "tools":
+                meta["tools"] = _split_tools_value(value)
+            else:
+                meta[key] = value.strip().strip('"').strip("'")
     return meta, body
 
 

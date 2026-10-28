@@ -2,6 +2,7 @@
 name: pcb-placement
 priority: 60
 description: "Footprint positioning, overlap check, group align/distribute operations"
+tools: [set_footprint_position, get_footprint_bbox, get_board_bounding_box, flip_footprint, set_footprint_property, align_footprints, distribute_footprints, move_footprints_by_delta, assign_footprints_to_group, add_footprints_to_pcb, remove_footprints_from_pcb]
 ---
 # PCB placement workflow
 - Before placing, call **get_board_info** + **list_footprints** to understand

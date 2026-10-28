@@ -2,6 +2,7 @@
 name: schematic-placement
 priority: 70
 description: "Symbol placement workflow, find_free_area, bbox geometry, spacing rules"
+tools: [extract_schematic_netlist, add_symbol_to_schematic, place_symbol_relative, move_component, find_free_area, get_schematic_sheet_info]
 ---
 # Geometry you get for free
 - get_symbol and get_symbol_pins return body_bbox + per-unit bboxes in

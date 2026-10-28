@@ -1482,7 +1482,8 @@ class TestRunIntegration:
                 {"project_file": "/tmp/board.kicad_pro"},
             ),
         ]
-        tool_result = json.loads(client._history[-2]["content"])
+        tool_results = [m for m in client._history if m["role"] == "tool"]
+        tool_result = json.loads(tool_results[0]["content"])
         assert tool_result["success"] is False
         assert (
             "Failed to save project version before set_footprint_position" in tool_result["error"]
@@ -5091,3 +5092,266 @@ class TestBedrockDispatch:
         assert types == ["text_start", "text_chunk", "text_end"]
         assert events[1]["content"] == "hello world"
         assert out["finish_reason"] == "stop"
+
+
+# ---------------------------------------------------------------------------
+# Issue #208: harness-side skill auto-injection via frontmatter tools:
+# ---------------------------------------------------------------------------
+
+
+def _write_declared_skill(skills_dir, name, tools, body="Body of the skill."):
+    """Write a skill file with a frontmatter ``tools:`` declaration."""
+    tools_line = f"tools: [{', '.join(tools)}]\n" if tools else ""
+    (skills_dir / f"{name}.md").write_text(
+        f'---\nname: {name}\npriority: "50"\ndescription: "{name} guide"\n'
+        f"{tools_line}---\n# {name}\n{body}\n",
+        encoding="utf-8",
+    )
+
+
+def _guide_messages(history):
+    """Return the user-role skill-guide messages injected into *history*."""
+    return [
+        m
+        for m in history
+        if m.get("role") == "user"
+        and isinstance(m.get("content"), str)
+        and m["content"].startswith("[Skill guide: ")
+    ]
+
+
+class TestSkillAutoInject:
+    """Frontmatter-declared skills must auto-inject into history after the
+    first call to one of their tools, exactly once per session (issue #208)."""
+
+    def _tool_response(self, name, tc_id="tc1", args=None):
+        return {
+            "finish_reason": "tool_calls",
+            "message": {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": tc_id,
+                        "type": "function",
+                        "function": {"name": name, "arguments": json.dumps(args or {})},
+                    }
+                ],
+            },
+        }
+
+    def _client_with_placement_tool(self, tmp_path):
+        """Client whose registry exposes set_footprint_position and whose
+        skills dir declares it for the pcb-placement skill.
+
+        Returns ``(client, skills_dir)``; the caller wraps its run in
+        ``with patch.object(llm_client, "_SKILLS_DIR", skills_dir):``.
+        """
+        client = _make_client()
+        client._tool_registry = {
+            "set_footprint_position": _fake_tool_def("set_footprint_position"),
+            "align_footprints": _fake_tool_def("align_footprints"),
+        }
+        client._enabled_tools = {"set_footprint_position"}
+        skills_dir = tmp_path / "skills"
+        skills_dir.mkdir()
+        _write_declared_skill(
+            skills_dir,
+            "pcb-placement",
+            ["set_footprint_position", "align_footprints"],
+            body="Place bodies must not overlap.",
+        )
+        return client, skills_dir
+
+    def _ok_server(self, *_args, **_kwargs):
+        return {"success": True}
+
+    def test_first_declared_tool_call_injects_skill_body(self, tmp_path):
+        """Red-green core: after a call to a declared tool, the skill body is
+        present in history as a user-role message positioned AFTER that
+        batch's tool results."""
+        client, skills_dir = self._client_with_placement_tool(tmp_path)
+        client._call_llm = MagicMock(
+            side_effect=[
+                self._tool_response(
+                    "set_footprint_position",
+                    args={
+                        "pcb_path": "/tmp/board.kicad_pcb",
+                        "items": [{"reference": "R1", "x": 1.0}],
+                    },
+                ),
+                {"finish_reason": "stop", "message": {"content": "done"}},
+            ]
+        )
+        with (
+            patch.object(llm_client, "_SKILLS_DIR", skills_dir),
+            patch("kicad_plugin.llm_client.call_mcp_tool", side_effect=self._ok_server),
+        ):
+            result = client.run("move R1", context_block="")
+
+        assert result == "done"
+        history = client.get_history()
+        guides = _guide_messages(history)
+        assert len(guides) == 1
+        assert "[Skill guide: pcb-placement]" in guides[0]["content"]
+        assert "Place bodies must not overlap." in guides[0]["content"]
+        # Positioned after the batch's tool-results message, not between the
+        # assistant tool_calls message and its results.
+        tool_idx = next(i for i, m in enumerate(history) if m["role"] == "tool")
+        guide_idx = next(i for i, m in enumerate(history) if m is guides[0])
+        assert guide_idx > tool_idx
+        assert client._injected_skills == {"pcb-placement"}
+
+    def test_repeat_trigger_injects_nothing(self, tmp_path):
+        """A second call to a declared tool in the same session is a pure
+        no-op: no body, no 'already loaded' note, no extra mutation."""
+        client, skills_dir = self._client_with_placement_tool(tmp_path)
+        args = {"pcb_path": "/tmp/board.kicad_pcb", "items": [{"reference": "R1", "x": 1.0}]}
+        client._call_llm = MagicMock(
+            side_effect=[
+                self._tool_response("set_footprint_position", tc_id="tc1", args=args),
+                self._tool_response("set_footprint_position", tc_id="tc2", args=args),
+                {"finish_reason": "stop", "message": {"content": "done"}},
+            ]
+        )
+        with (
+            patch.object(llm_client, "_SKILLS_DIR", skills_dir),
+            patch("kicad_plugin.llm_client.call_mcp_tool", side_effect=self._ok_server),
+        ):
+            result = client.run("move R1 again", context_block="")
+
+        assert result == "done"
+        assert len(_guide_messages(client.get_history())) == 1
+        assert client._injected_skills == {"pcb-placement"}
+
+    def test_skill_without_tools_never_injected(self, tmp_path):
+        """Skills without a frontmatter ``tools:`` field are never
+        auto-injected; get_skill remains their only load path."""
+        client = _make_client()
+        client._tool_registry = {"get_board_info": _fake_tool_def("get_board_info")}
+        client._enabled_tools = {"get_board_info"}
+        skills_dir = tmp_path / "skills"
+        skills_dir.mkdir()
+        _write_skill_file(skills_dir, "plain-skill", "Plain skill without tools")
+        with patch.object(llm_client, "_SKILLS_DIR", skills_dir):
+            client._call_llm = MagicMock(
+                side_effect=[
+                    self._tool_response("get_board_info", args={"pcb_path": "/tmp/b.kicad_pcb"}),
+                    {"finish_reason": "stop", "message": {"content": "ok"}},
+                ]
+            )
+            with patch("kicad_plugin.llm_client.call_mcp_tool", side_effect=self._ok_server):
+                result = client.run("inspect board", context_block="")
+
+        assert result == "ok"
+        assert _guide_messages(client.get_history()) == []
+        assert client._injected_skills == set()
+
+    def test_declared_tool_missing_from_registry_warns_not_crashes(self, tmp_path):
+        """A frontmatter-declared tool absent from the MCP registry yields a
+        warning at map load and is tolerated — no crash, no dropped entries."""
+        client = _make_client()
+        client._tool_registry = {"real_tool": _fake_tool_def("real_tool")}
+        skills_dir = tmp_path / "skills"
+        skills_dir.mkdir()
+        _write_declared_skill(skills_dir, "ghost-skill", ["real_tool", "ghost_tool"])
+
+        # kicad_plugin loggers do not propagate to the root (plugin logging
+        # sets propagate=False), so caplog never sees them — attach a capture
+        # handler straight to the module logger instead.
+        warnings: list[str] = []
+        handler = logging.Handler()
+        handler.emit = lambda record: warnings.append(record.getMessage())  # type: ignore[method-assign]
+        logger = logging.getLogger("kicad_plugin.llm_client")
+        logger.addHandler(handler)
+        try:
+            with patch.object(llm_client, "_SKILLS_DIR", skills_dir):
+                mapping = client._get_skill_tool_map()
+        finally:
+            logger.removeHandler(handler)
+
+        assert any("ghost_tool" in w and "ghost-skill" in w for w in warnings)
+        assert mapping["ghost_tool"].name == "ghost-skill"
+
+    def test_system_prompt_byte_identical_before_after_injection(self, tmp_path):
+        """Injection must never touch the system prompt (cache stability)."""
+        client, skills_dir = self._client_with_placement_tool(tmp_path)
+        args = {"pcb_path": "/tmp/board.kicad_pcb", "items": [{"reference": "R1", "x": 1.0}]}
+        client._call_llm = MagicMock(
+            side_effect=[
+                self._tool_response("set_footprint_position", tc_id="tc1", args=args),
+                self._tool_response("set_footprint_position", tc_id="tc2", args=args),
+                {"finish_reason": "stop", "message": {"content": "done"}},
+            ]
+        )
+        with (
+            patch.object(llm_client, "_SKILLS_DIR", skills_dir),
+            patch("kicad_plugin.llm_client.call_mcp_tool", side_effect=self._ok_server),
+        ):
+            client.run("move R1", context_block="")
+
+        systems = [call.args[0] for call in client._call_llm.call_args_list]
+        assert len(systems) == 3
+        assert systems[0] == systems[1] == systems[2]
+
+    def test_no_user_message_between_assistant_and_tool_results(self, tmp_path):
+        """Provider pairing stays intact: every assistant tool_calls message
+        is immediately followed by its role:'tool' results, even when a skill
+        guide was injected after the previous batch."""
+        client, skills_dir = self._client_with_placement_tool(tmp_path)
+        args = {"pcb_path": "/tmp/board.kicad_pcb", "items": [{"reference": "R1", "x": 1.0}]}
+        client._call_llm = MagicMock(
+            side_effect=[
+                self._tool_response("set_footprint_position", tc_id="tc1", args=args),
+                self._tool_response("set_footprint_position", tc_id="tc2", args=args),
+                {"finish_reason": "stop", "message": {"content": "done"}},
+            ]
+        )
+        with (
+            patch.object(llm_client, "_SKILLS_DIR", skills_dir),
+            patch("kicad_plugin.llm_client.call_mcp_tool", side_effect=self._ok_server),
+        ):
+            result = client.run("move R1", context_block="")
+
+        assert result == "done"
+        history = client.get_history()
+        for i, msg in enumerate(history):
+            if msg.get("role") != "assistant" or not msg.get("tool_calls"):
+                continue
+            # The very next message must be a tool result (no user message
+            # may sit between the assistant tool_calls and its results).
+            assert history[i + 1].get("role") == "tool"
+            expected = {tc["id"] for tc in msg["tool_calls"]}
+            j = i + 1
+            while j < len(history) and history[j].get("role") == "tool":
+                expected.discard(history[j].get("tool_call_id"))
+                j += 1
+            assert not expected, f"orphaned tool_call_ids in history: {expected}"
+
+
+class TestSkillFrontMatterToolsParsing:
+    """Frontmatter ``tools:`` list syntax parsing (issue #208)."""
+
+    def test_bracket_list(self):
+        text = "---\nname: x\ntools: [set_footprint_position, align_footprints]\n---\nbody"
+        meta = llm_client._parse_skill_front_matter(text)
+        assert meta["tools"] == ["set_footprint_position", "align_footprints"]
+
+    def test_comma_separated(self):
+        text = "---\nname: x\ntools: a, b, c\n---\nbody"
+        meta = llm_client._parse_skill_front_matter(text)
+        assert meta["tools"] == ["a", "b", "c"]
+
+    def test_bracket_no_spaces(self):
+        text = "---\nname: x\ntools: [a,b,c]\n---\nbody"
+        meta = llm_client._parse_skill_front_matter(text)
+        assert meta["tools"] == ["a", "b", "c"]
+
+    def test_empty_tools_field(self):
+        text = "---\nname: x\ntools:\n---\nbody"
+        meta = llm_client._parse_skill_front_matter(text)
+        assert meta["tools"] == []
+
+    def test_missing_tools_field(self):
+        text = '---\nname: x\npriority: 50\ndescription: "d"\n---\nbody'
+        meta = llm_client._parse_skill_front_matter(text)
+        assert "tools" not in meta
