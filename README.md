@@ -6,6 +6,8 @@ Tested on **KiCad 10.0 / Linux & Windows**.
 
 [![CI](https://github.com/paul356/KiCad-AI-Assistant/actions/workflows/ci.yml/badge.svg)](https://github.com/paul356/KiCad-AI-Assistant/actions/workflows/ci.yml)
 
+**Contributions welcome!** Bug reports, feature ideas, and pull requests are all appreciated — see [Contributing](#contributing) for how to get started.
+
 ## Table of Contents
 
 - [KiCad AI Assistant](#kicad-ai-assistant)
