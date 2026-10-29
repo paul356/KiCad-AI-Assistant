@@ -78,3 +78,25 @@ jobs:
 
     - name: Publish to PyPI
       uses: pypa/gh-action-pypi-publish@release/v1
+
+  # Attach the plugin zip and its checksum to the GitHub release so the
+  # in-panel updater has a verifiable download payload.
+  plugin-assets:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release'
+    permissions:
+      contents: write
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Build plugin zip
+      run: make dist-plugin
+
+    - name: Generate checksums
+      run: cd dist && sha256sum kicad_ai_assistant.zip > SHA256SUMS
+
+    - name: Upload release assets
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        TAG: ${{ github.event.release.tag_name }}
+      run: gh release upload "$TAG" dist/kicad_ai_assistant.zip dist/SHA256SUMS --clobber
