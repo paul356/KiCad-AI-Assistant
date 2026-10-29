@@ -17,8 +17,8 @@ import pytest
 
 from kicad_plugin import updater
 
-_ZIP_URL = "https://example.test/kicad_ai_assistant.zip"
-_SUMS_URL = "https://example.test/SHA256SUMS"
+_ZIP_URL = "https://objects.githubusercontent.com/kicad_ai_assistant.zip"
+_SUMS_URL = "https://github.com/paul356/KiCad-AI-Assistant/releases/download/v0.2.9/SHA256SUMS"
 
 
 class _FakeResponse:
@@ -96,7 +96,52 @@ def test_version_comparison_handles_prefix_and_suffix() -> None:
     assert not updater.is_newer("0.2.8", "0.2.9")
 
 
-# 2. check_latest ----------------------------------------------------------------
+@pytest.mark.parametrize(
+    "bad_version",
+    [
+        "1.0; rm -rf /",
+        "1.0 --index-url evil",
+        "../../x",
+        "",
+    ],
+)
+def test_unsafe_version_rejected(tmp_path: Path, bad_version: str) -> None:
+    plugin_dir = tmp_path / "kicad_ai_assistant"
+    plugin_dir.mkdir()
+
+    with pytest.raises(updater.UpdateError, match="Unsafe version"):
+        updater.install_update(tmp_path / "release.zip", plugin_dir, bad_version)
+
+    assert not (plugin_dir / ".backup").exists()
+
+
+# 2. URL validation --------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://api.github.com/repos/x",
+        "file:///etc/passwd",
+        "https://evil.example.com/kicad_ai_assistant.zip",
+        "https://api.github.com.evil.example.com/kicad_ai_assistant.zip",
+    ],
+)
+def test_url_validation_rejects_non_https_and_unknown_host(url: str) -> None:
+    with pytest.raises(updater.UpdateError, match="Refusing"):
+        updater._checked_url(url)
+
+
+def test_url_validation_accepts_github_hosts() -> None:
+    for url in (
+        updater.RELEASES_API,
+        "https://github.com/paul356/KiCad-AI-Assistant/releases/download/v0.2.9/kicad_ai_assistant.zip",
+        "https://objects.githubusercontent.com/kicad_ai_assistant.zip",
+    ):
+        assert updater._checked_url(url) == url
+
+
+# 3. check_latest ----------------------------------------------------------------
 
 
 def test_check_latest_parses_github_release(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -130,7 +175,7 @@ def test_check_latest_returns_none_on_failure(monkeypatch: pytest.MonkeyPatch, f
     assert updater.check_latest(timeout=0.01) is None
 
 
-# 3. Download + checksum ---------------------------------------------------------
+# 4. Download + checksum ---------------------------------------------------------
 
 
 def test_download_and_verify_accepts_matching_checksum(
@@ -160,7 +205,7 @@ def test_download_and_verify_rejects_checksum_mismatch(
     assert list(tmp_path.iterdir()) == []  # no partial zip left behind
 
 
-# 4. Successful install ----------------------------------------------------------
+# 5. Successful install ----------------------------------------------------------
 
 
 def test_install_update_replaces_tree_and_keeps_backup(
@@ -215,7 +260,7 @@ def test_install_update_replaces_tree_and_keeps_backup(
     ]
 
 
-# 5. Failure rolls back ----------------------------------------------------------
+# 6. Failure rolls back ----------------------------------------------------------
 
 
 def test_install_update_restores_previous_tree_on_extract_failure(
@@ -247,7 +292,7 @@ def test_install_update_restores_previous_tree_on_extract_failure(
     assert not called["run"]  # venv never touched after extract failed
 
 
-# 6. Dev-mode guard --------------------------------------------------------------
+# 7. Dev-mode guard --------------------------------------------------------------
 
 
 def test_install_update_refuses_git_checkout(
@@ -274,7 +319,7 @@ def test_install_update_refuses_git_checkout(
     assert not called["run"]
 
 
-# 7. Zip path traversal ----------------------------------------------------------
+# 8. Zip path traversal ----------------------------------------------------------
 
 
 def test_install_update_rejects_path_traversal(
@@ -300,7 +345,7 @@ def test_install_update_rejects_path_traversal(
     assert (plugin_dir / "__init__.py").read_text(encoding="utf-8") == "old init"
 
 
-# 8. Unwritable plugin dir -------------------------------------------------------
+# 9. Unwritable plugin dir -------------------------------------------------------
 
 
 @pytest.mark.skipif(

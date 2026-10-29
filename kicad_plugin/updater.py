@@ -21,8 +21,9 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
-import subprocess
+import subprocess  # nosec B404 - fixed argv, shell=False; runs only the plugin venv's uv/pip
 import tempfile
+from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 import zipfile
 
@@ -50,6 +51,18 @@ ProgressCallback = Callable[[int, int | None], None]
 
 _VERSION_RE = re.compile(r"^[vV]?(\d+(?:\.\d+)*)")
 _WINDOWS_ABS_RE = re.compile(r"^[A-Za-z]:")
+_SAFE_VERSION_RE = re.compile(r"^\d+(\.\d+)*([.-][A-Za-z0-9]+)*$")
+
+# urllib only receives GitHub URLs: the API, the release page host, and the
+# asset CDN.  _checked_url() rejects any other scheme or host before a
+# request is made.
+_ALLOWED_UPDATE_HOSTS = frozenset(
+    {
+        "api.github.com",
+        "github.com",
+        "objects.githubusercontent.com",
+    }
+)
 
 
 class UpdateError(RuntimeError):
@@ -108,6 +121,24 @@ def current_version(plugin_dir: str | os.PathLike[str]) -> str:
         return "0.0.0"
 
 
+def _validate_version(version: str) -> str:
+    """Reject version strings that could become extra pip arguments."""
+    if not _SAFE_VERSION_RE.fullmatch(str(version)):
+        raise UpdateError("Unsafe version string")
+    return version
+
+
+def _checked_url(url: str) -> str:
+    """Validate scheme and host before a URL reaches urllib."""
+    parsed = urlsplit(str(url))
+    if parsed.scheme != "https":
+        raise UpdateError(f"Refusing non-HTTPS update URL: {url!r}")
+    host = (parsed.hostname or "").lower()
+    if host not in _ALLOWED_UPDATE_HOSTS:
+        raise UpdateError(f"Refusing update URL with untrusted host: {url!r}")
+    return url
+
+
 # ---------------------------------------------------------------------------
 # Release check
 # ---------------------------------------------------------------------------
@@ -159,8 +190,8 @@ def check_latest(timeout: float = CHECK_TIMEOUT) -> UpdateInfo | None:
     can stay silent.
     """
     try:
-        request = Request(RELEASES_API, headers=_release_headers())
-        with urlopen(request, timeout=timeout) as response:
+        request = Request(_checked_url(RELEASES_API), headers=_release_headers())
+        with urlopen(request, timeout=timeout) as response:  # nosec B310 - URL validated above
             payload = response.read()
         return _update_from_release(json.loads(payload.decode("utf-8")))
     except (OSError, ValueError, UnicodeDecodeError):
@@ -220,8 +251,8 @@ def _response_total(response) -> int | None:
 
 def _fetch_text(url: str, timeout: float) -> str:
     try:
-        request = Request(url, headers={"User-Agent": USER_AGENT})
-        with urlopen(request, timeout=timeout) as response:
+        request = Request(_checked_url(url), headers={"User-Agent": USER_AGENT})
+        with urlopen(request, timeout=timeout) as response:  # nosec B310 - URL validated above
             return response.read().decode("utf-8")
     except (OSError, ValueError, UnicodeDecodeError) as exc:
         raise UpdateError(f"Download failed: {exc}") from exc
@@ -229,8 +260,8 @@ def _fetch_text(url: str, timeout: float) -> str:
 
 def _download_file(url: str, dest: Path, progress_cb: ProgressCallback | None) -> None:
     try:
-        request = Request(url, headers={"User-Agent": USER_AGENT})
-        with urlopen(request, timeout=DOWNLOAD_TIMEOUT) as response:
+        request = Request(_checked_url(url), headers={"User-Agent": USER_AGENT})
+        with urlopen(request, timeout=DOWNLOAD_TIMEOUT) as response:  # nosec B310 - URL validated above
             total = _response_total(response)
             received = 0
             with open(dest, "wb") as handle:
@@ -421,6 +452,7 @@ def _venv_python(plugin_dir: Path) -> Path | None:
 
 
 def _run_venv_install(plugin_dir: Path, new_version: str) -> None:
+    _validate_version(new_version)
     python = _venv_python(plugin_dir)
     if python is None:
         raise UpdateError(
@@ -437,7 +469,7 @@ def _run_venv_install(plugin_dir: Path, new_version: str) -> None:
     last_error = ""
     for command in commands:
         try:
-            completed = subprocess.run(
+            completed = subprocess.run(  # nosec B603 - argv list, shell=False, version validated
                 command,
                 capture_output=True,
                 text=True,
@@ -471,6 +503,7 @@ def install_update(
     """
     plugin_dir = Path(plugin_dir)
     zip_path = Path(zip_path)
+    _validate_version(new_version)
 
     if (plugin_dir / ".git").exists():
         raise UpdateError(
