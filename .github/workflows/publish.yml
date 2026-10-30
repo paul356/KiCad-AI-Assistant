@@ -92,6 +92,19 @@ jobs:
     - name: Build plugin zip
       run: make dist-plugin
 
+    - name: Verify plugin VERSION matches release tag
+      env:
+        TAG: ${{ github.event.release.tag_name }}
+      run: |
+        expected="${TAG#v}"
+        actual="$(unzip -p dist/kicad_ai_assistant.zip kicad_ai_assistant/VERSION | tr -d '[:space:]')"
+        echo "Release tag:   ${expected}"
+        echo "Plugin VERSION: ${actual}"
+        if [ -z "${actual}" ] || [ "${actual}" != "${expected}" ]; then
+          echo "::error::Plugin VERSION '${actual}' does not match release tag '${expected}'"
+          exit 1
+        fi
+
     - name: Generate checksums
       run: cd dist && sha256sum kicad_ai_assistant.zip > SHA256SUMS
 

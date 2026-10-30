@@ -1,7 +1,7 @@
 """Unit tests for the plugin updater.
 
 Every network and subprocess call is faked: no real HTTP, no real venv, and
-the updater never touches this checkout (install targets are tmp dirs).
+install targets are temporary directories.
 """
 
 from __future__ import annotations
@@ -9,8 +9,10 @@ from __future__ import annotations
 import hashlib
 import io
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+import shutil
 import subprocess
+import threading
 import zipfile
 
 import pytest
@@ -22,7 +24,7 @@ _SUMS_URL = "https://github.com/paul356/KiCad-AI-Assistant/releases/download/v0.
 
 
 class _FakeResponse:
-    """Minimal urlopen() response with a Content-Length header."""
+    """Minimal opener response with a Content-Length header."""
 
     def __init__(self, body: bytes) -> None:
         self._body = io.BytesIO(body)
@@ -39,7 +41,7 @@ class _FakeResponse:
         return False
 
 
-def _fake_urlopen(monkeypatch: pytest.MonkeyPatch, routes: dict[str, object]) -> None:
+def _fake_open(monkeypatch: pytest.MonkeyPatch, routes: dict[str, object]) -> None:
     def _open(request, timeout=None):
         url = request.full_url
         if url not in routes:
@@ -49,7 +51,7 @@ def _fake_urlopen(monkeypatch: pytest.MonkeyPatch, routes: dict[str, object]) ->
             raise entry
         return _FakeResponse(entry)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(updater, "urlopen", _open)
+    monkeypatch.setattr(updater, "_open_url", _open)
 
 
 def _zip_bytes(entries: dict[str, bytes]) -> bytes:
@@ -60,15 +62,35 @@ def _zip_bytes(entries: dict[str, bytes]) -> bytes:
     return buffer.getvalue()
 
 
-def _make_update(zip_payload: bytes) -> tuple[updater.UpdateInfo, str]:
+def _make_update(
+    zip_payload: bytes,
+    *,
+    checksum_url: str = _SUMS_URL,
+    zip_url: str = _ZIP_URL,
+) -> tuple[updater.UpdateInfo, str]:
     digest = hashlib.sha256(zip_payload).hexdigest()
     update = updater.UpdateInfo(
         version="0.2.9",
-        zip_url=_ZIP_URL,
-        checksum_url=_SUMS_URL,
+        zip_url=zip_url,
+        checksum_url=checksum_url,
         page_url="https://example.test/releases/v0.2.9",
     )
     return update, f"{digest}  kicad_ai_assistant.zip\n"
+
+
+def _release_zip() -> bytes:
+    return _zip_bytes(
+        {
+            "kicad_ai_assistant/__init__.py": b"new init",
+            "kicad_ai_assistant/VERSION": b"0.2.9",
+            "kicad_ai_assistant/ui/new_module.py": b"new ui",
+            "kicad_ai_assistant/README.md": b"new readme",
+        }
+    )
+
+
+def _site_packages(plugin_dir: Path) -> Path:
+    return plugin_dir / ".venv" / "lib" / "python3.10" / "site-packages"
 
 
 def _write_plugin(plugin_dir: Path, version: str = "0.2.8") -> Path:
@@ -80,20 +102,37 @@ def _write_plugin(plugin_dir: Path, version: str = "0.2.8") -> Path:
     venv_python = plugin_dir / ".venv" / "bin" / "python"
     venv_python.parent.mkdir(parents=True, exist_ok=True)
     venv_python.write_text("", encoding="utf-8")
+
+    site = _site_packages(plugin_dir)
+    (site / "kcaa").mkdir(parents=True)
+    (site / "kcaa" / "__init__.py").write_text('__version__ = "0.2.8"', encoding="utf-8")
+    dist_info = site / "kcaa-0.2.8.dist-info"
+    dist_info.mkdir()
+    (dist_info / "METADATA").write_text("Name: kcaa\nVersion: 0.2.8\n", encoding="utf-8")
     return venv_python
 
 
-# 1. Version parsing / comparison ------------------------------------------------
+def _completed(command, returncode: int, stdout: str = "", stderr: str = ""):
+    return subprocess.CompletedProcess(command, returncode, stdout, stderr)
 
 
-def test_version_comparison_handles_prefix_and_suffix() -> None:
-    assert updater._parse_version("0.2.8") == (0, 2, 8)
-    assert updater._parse_version("v0.2.9") == (0, 2, 9)
-    assert updater._parse_version("0.2.9-rc1") == (0, 2, 9)
+# 1. Version comparison ----------------------------------------------------------
+
+
+def test_version_comparison_handles_prefix_suffix_and_pep440() -> None:
     assert updater.is_newer("0.2.9", "0.2.8")
     assert updater.is_newer("v0.2.9", "0.2.8")
     assert not updater.is_newer("0.2.9", "v0.2.9")
     assert not updater.is_newer("0.2.8", "0.2.9")
+    # Repo tags such as v0.2.4-bugfix3 must order numerically.
+    assert updater.is_newer("0.2.4-bugfix3", "0.2.4-bugfix2")
+    assert not updater.is_newer("0.2.4-bugfix2", "0.2.4-bugfix3")
+    # A release candidate is older than the final release.
+    assert updater.is_newer("0.2.9", "0.2.9-rc1")
+    assert not updater.is_newer("0.2.9-rc1", "0.2.9")
+    # Local versions are ignored for comparison.
+    assert not updater.is_newer("0.2.9+abc", "0.2.9")
+    assert updater.is_newer("0.2.9", "0.2.8+abc")
 
 
 @pytest.mark.parametrize(
@@ -137,8 +176,48 @@ def test_url_validation_accepts_github_hosts() -> None:
         updater.RELEASES_API,
         "https://github.com/paul356/KiCad-AI-Assistant/releases/download/v0.2.9/kicad_ai_assistant.zip",
         "https://objects.githubusercontent.com/kicad_ai_assistant.zip",
+        "https://release-assets.githubusercontent.com/github-production-release-asset/x",
     ):
         assert updater._checked_url(url) == url
+
+
+def test_redirect_handler_rejects_unknown_host() -> None:
+    handler = updater._CheckedRedirectHandler()
+    with pytest.raises(updater.UpdateError, match="untrusted host"):
+        handler.redirect_request(None, None, 302, "Found", {}, "https://evil.example.com/x")
+
+
+def test_redirect_handler_allows_release_cdn() -> None:
+    handler = updater._CheckedRedirectHandler()
+    request = updater.Request("https://github.com/paul356/KiCad-AI-Assistant/releases")
+    redirected = handler.redirect_request(
+        request,
+        None,
+        302,
+        "Found",
+        {},
+        "https://release-assets.githubusercontent.com/github-production-release-asset/x",
+    )
+    assert redirected is not None
+    assert redirected.full_url.startswith("https://release-assets.githubusercontent.com/")
+
+
+def test_download_validates_url_at_request_time(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    update = updater.UpdateInfo(
+        version="0.2.9",
+        zip_url=_ZIP_URL,
+        checksum_url="https://evil.example.com/SHA256SUMS",
+        page_url=updater.RELEASE_PAGE,
+    )
+
+    def _no_network(*args, **kwargs):
+        pytest.fail("network was touched before URL validation")
+
+    monkeypatch.setattr(updater, "_open_url", _no_network)
+    with pytest.raises(updater.UpdateError, match="untrusted host"):
+        updater.download_and_verify(update, tmp_path)
 
 
 # 3. check_latest ----------------------------------------------------------------
@@ -151,7 +230,7 @@ def test_check_latest_parses_github_release(monkeypatch: pytest.MonkeyPatch) -> 
         b'{"name": "kicad_ai_assistant.zip", "browser_download_url": "' + _ZIP_URL.encode() + b'"},'
         b'{"name": "SHA256SUMS", "browser_download_url": "' + _SUMS_URL.encode() + b'"}]}'
     )
-    _fake_urlopen(monkeypatch, {updater.RELEASES_API: payload})
+    _fake_open(monkeypatch, {updater.RELEASES_API: payload})
 
     info = updater.check_latest()
 
@@ -171,7 +250,7 @@ def test_check_latest_parses_github_release(monkeypatch: pytest.MonkeyPatch) -> 
     ],
 )
 def test_check_latest_returns_none_on_failure(monkeypatch: pytest.MonkeyPatch, failure) -> None:
-    _fake_urlopen(monkeypatch, {updater.RELEASES_API: failure})
+    _fake_open(monkeypatch, {updater.RELEASES_API: failure})
     assert updater.check_latest(timeout=0.01) is None
 
 
@@ -183,7 +262,7 @@ def test_download_and_verify_accepts_matching_checksum(
 ) -> None:
     zip_payload = _zip_bytes({"kicad_ai_assistant/__init__.py": b"new"})
     update, sums = _make_update(zip_payload)
-    _fake_urlopen(monkeypatch, {_SUMS_URL: sums.encode(), _ZIP_URL: zip_payload})
+    _fake_open(monkeypatch, {_SUMS_URL: sums.encode(), _ZIP_URL: zip_payload})
 
     path = updater.download_and_verify(update, tmp_path)
 
@@ -197,7 +276,7 @@ def test_download_and_verify_rejects_checksum_mismatch(
     zip_payload = _zip_bytes({"kicad_ai_assistant/__init__.py": b"new"})
     update, _ = _make_update(zip_payload)
     bad_sums = f"{'0' * 64}  kicad_ai_assistant.zip\n"
-    _fake_urlopen(monkeypatch, {_SUMS_URL: bad_sums.encode(), _ZIP_URL: zip_payload})
+    _fake_open(monkeypatch, {_SUMS_URL: bad_sums.encode(), _ZIP_URL: zip_payload})
 
     with pytest.raises(updater.UpdateError, match="checksum mismatch"):
         updater.download_and_verify(update, tmp_path)
@@ -205,29 +284,67 @@ def test_download_and_verify_rejects_checksum_mismatch(
     assert list(tmp_path.iterdir()) == []  # no partial zip left behind
 
 
+def test_checksum_parser_accepts_dist_prefix_and_rejects_conflicts() -> None:
+    digest = "a" * 64
+    assert updater._lookup_checksum(
+        f"{digest}  dist/kicad_ai_assistant.zip\n", "kicad_ai_assistant.zip"
+    )
+    conflicting = f"{'a' * 64}  kicad_ai_assistant.zip\n{'b' * 64}  dist/kicad_ai_assistant.zip\n"
+    with pytest.raises(updater.UpdateError, match="Conflicting checksums"):
+        updater._lookup_checksum(conflicting, "kicad_ai_assistant.zip")
+
+
+def test_checksum_parser_ignores_malformed_decoy_lines() -> None:
+    digest = "c" * 64
+    text = (
+        f"{'d' * 64}  other.zip\n"
+        f"deadbeef  kicad_ai_assistant.zip\n"
+        f"{digest}  kicad_ai_assistant.zip\n"
+    )
+    assert updater._lookup_checksum(text, "kicad_ai_assistant.zip") == digest
+
+
+def test_fetch_text_rejects_oversized_body(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    zip_payload = _zip_bytes({"kicad_ai_assistant/__init__.py": b"new"})
+    update, _ = _make_update(zip_payload)
+    monkeypatch.setattr(updater, "_MAX_TEXT_BYTES", 8)
+    _fake_open(monkeypatch, {_SUMS_URL: b"x" * 9, _ZIP_URL: zip_payload})
+
+    with pytest.raises(updater.UpdateError, match="unexpectedly large"):
+        updater.download_and_verify(update, tmp_path)
+
+
+def test_download_stream_rejects_oversized_archive(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(updater, "_MAX_ARCHIVE_BYTES", 4)
+    _fake_open(monkeypatch, {_ZIP_URL: b"12345"})
+
+    with pytest.raises(updater.UpdateError, match="too large"):
+        updater._download_file(_ZIP_URL, tmp_path / "release.zip", None)
+
+
 # 5. Successful install ----------------------------------------------------------
 
 
-def test_install_update_replaces_tree_and_keeps_backup(
+def test_install_update_replaces_tree_updates_venv_and_keeps_backup(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     plugin_dir = tmp_path / "kicad_ai_assistant"
     venv_python = _write_plugin(plugin_dir)
-    zip_payload = _zip_bytes(
-        {
-            "kicad_ai_assistant/__init__.py": b"new init",
-            "kicad_ai_assistant/VERSION": b"0.2.9",
-            "kicad_ai_assistant/ui/new_module.py": b"new ui",
-        }
-    )
+    jar = plugin_dir / "freerouting-1.9.jar"
+    jar.write_bytes(b"jar-bytes")
     zip_path = tmp_path / "release.zip"
-    zip_path.write_bytes(zip_payload)
+    zip_path.write_bytes(_release_zip())
 
     commands: list[list[str]] = []
 
     def _fake_run(command, **kwargs):
-        commands.append(command)
-        return subprocess.CompletedProcess(command, 0, "", "")
+        # The plugin tree must be swapped before the venv package is touched.
+        assert (plugin_dir / "VERSION").read_text(encoding="utf-8") == "0.2.9"
+        assert (plugin_dir / ".backup").is_dir()
+        commands.append(list(command))
+        return _completed(command, 0)
 
     monkeypatch.setattr(updater.shutil, "which", lambda name: "/usr/bin/uv")
     monkeypatch.setattr(updater.subprocess, "run", _fake_run)
@@ -239,6 +356,7 @@ def test_install_update_replaces_tree_and_keeps_backup(
     assert (plugin_dir / "ui" / "new_module.py").exists()
     assert not (plugin_dir / "ui" / "greeting.py").exists()  # stale file removed
     assert venv_python.exists()  # .venv untouched by the tree swap
+    assert jar.read_bytes() == b"jar-bytes"  # setup_plugin artifact survives
 
     backups = list((plugin_dir / ".backup").iterdir())
     assert len(backups) == 1
@@ -246,21 +364,76 @@ def test_install_update_replaces_tree_and_keeps_backup(
     assert backup.name.startswith("0.2.8-")
     assert (backup / "__init__.py").read_text(encoding="utf-8") == "old init"
     assert (backup / "ui" / "greeting.py").read_text(encoding="utf-8") == "old ui"
-    assert not (backup / ".venv").exists()  # venv is excluded from backups
+    assert not (backup / ".venv").exists()  # venv tree is excluded
+    assert (backup / "_venv" / "kcaa-0.2.8.dist-info" / "METADATA").is_file()
+    assert not updater.has_pending_recovery(plugin_dir)
 
-    assert commands == [
-        [
-            "/usr/bin/uv",
-            "pip",
-            "install",
-            "--python",
-            str(venv_python),
-            "kcaa==0.2.9",
-        ]
-    ]
+    assert [
+        "/usr/bin/uv",
+        "pip",
+        "install",
+        "--python",
+        str(venv_python),
+        "kcaa==0.2.9",
+    ] in commands
 
 
-# 6. Failure rolls back ----------------------------------------------------------
+def test_install_update_rehashes_when_expected_digest_given(tmp_path: Path) -> None:
+    plugin_dir = tmp_path / "kicad_ai_assistant"
+    _write_plugin(plugin_dir)
+    zip_path = tmp_path / "release.zip"
+    zip_path.write_bytes(_release_zip())
+
+    with pytest.raises(updater.UpdateError, match="checksum mismatch"):
+        updater.install_update(
+            zip_path,
+            plugin_dir,
+            "0.2.9",
+            expected_sha256="0" * 64,
+        )
+
+    assert not (plugin_dir / ".backup").exists()
+    assert (plugin_dir / "VERSION").read_text(encoding="utf-8") == "0.2.8"
+
+
+# 6. Failure rolls back tree and venv -------------------------------------------
+
+
+def test_install_update_restores_tree_and_venv_on_venv_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    plugin_dir = tmp_path / "kicad_ai_assistant"
+    _write_plugin(plugin_dir)
+    site = _site_packages(plugin_dir)
+    zip_path = tmp_path / "release.zip"
+    zip_path.write_bytes(_release_zip())
+
+    def _fake_run(command, **kwargs):
+        if "pip" in command and "--version" in command:
+            return _completed(command, 0)
+        # Simulate a pip run that replaced kcaa and then died.
+        shutil.rmtree(site / "kcaa", ignore_errors=True)
+        (site / "kcaa").mkdir()
+        (site / "kcaa" / "__init__.py").write_text('__version__ = "0.2.9"', encoding="utf-8")
+        (site / "kcaa-0.2.9.dist-info").mkdir(exist_ok=True)
+        return _completed(command, 1, stderr="boom")
+
+    monkeypatch.setattr(updater.shutil, "which", lambda name: "/usr/bin/uv")
+    monkeypatch.setattr(updater.subprocess, "run", _fake_run)
+
+    with pytest.raises(updater.UpdateError) as excinfo:
+        updater.install_update(zip_path, plugin_dir, "0.2.9")
+
+    assert excinfo.value.restored is True
+    assert excinfo.value.backup_dir is not None
+    assert (plugin_dir / "VERSION").read_text(encoding="utf-8") == "0.2.8"
+    assert (plugin_dir / "__init__.py").read_text(encoding="utf-8") == "old init"
+    assert (plugin_dir / "ui" / "greeting.py").read_text(encoding="utf-8") == "old ui"
+    assert not (plugin_dir / "ui" / "new_module.py").exists()
+    assert (site / "kcaa" / "__init__.py").read_text(encoding="utf-8") == '__version__ = "0.2.8"'
+    assert (site / "kcaa-0.2.8.dist-info" / "METADATA").is_file()
+    assert not (site / "kcaa-0.2.9.dist-info").exists()
+    assert not updater.has_pending_recovery(plugin_dir)
 
 
 def test_install_update_restores_previous_tree_on_extract_failure(
@@ -272,6 +445,8 @@ def test_install_update_restores_previous_tree_on_extract_failure(
     sentinel.parent.mkdir()
     sentinel.write_bytes(b"\x00sentinel\xff")
     before = hashlib.sha256(sentinel.read_bytes()).hexdigest()
+    jar = plugin_dir / "freerouting-1.9.jar"
+    jar.write_bytes(b"jar-bytes")
 
     bad_zip = tmp_path / "broken.zip"
     bad_zip.write_bytes(b"this is not a zip archive")
@@ -287,12 +462,52 @@ def test_install_update_restores_previous_tree_on_extract_failure(
         updater.install_update(bad_zip, plugin_dir, "0.2.9")
 
     assert hashlib.sha256(sentinel.read_bytes()).hexdigest() == before
+    assert jar.read_bytes() == b"jar-bytes"
     assert (plugin_dir / "__init__.py").read_text(encoding="utf-8") == "old init"
     assert (plugin_dir / "ui" / "greeting.py").read_text(encoding="utf-8") == "old ui"
     assert not called["run"]  # venv never touched after extract failed
+    assert not updater.has_pending_recovery(plugin_dir)
 
 
-# 7. Dev-mode guard --------------------------------------------------------------
+def test_install_update_reports_inconsistent_state_when_restore_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    plugin_dir = tmp_path / "kicad_ai_assistant"
+    _write_plugin(plugin_dir)
+    bad_zip = tmp_path / "broken.zip"
+    bad_zip.write_bytes(b"not a zip")
+
+    def _fail_restore(*args, **kwargs):
+        raise OSError("files are locked")
+
+    monkeypatch.setattr(updater, "_restore_tree_from_backup", _fail_restore)
+
+    with pytest.raises(updater.UpdateError) as excinfo:
+        updater.install_update(bad_zip, plugin_dir, "0.2.9")
+
+    assert excinfo.value.restored is False
+    assert excinfo.value.backup_dir is not None
+    assert "inconsistent state" in str(excinfo.value)
+    assert updater.has_pending_recovery(plugin_dir)
+
+
+def test_install_update_aborts_when_cancel_event_is_set(tmp_path: Path) -> None:
+    plugin_dir = tmp_path / "kicad_ai_assistant"
+    _write_plugin(plugin_dir)
+    zip_path = tmp_path / "release.zip"
+    zip_path.write_bytes(_release_zip())
+    cancel = threading.Event()
+    cancel.set()
+
+    with pytest.raises(updater.UpdateError, match="cancelled"):
+        updater.install_update(zip_path, plugin_dir, "0.2.9", cancel_event=cancel)
+
+    assert (plugin_dir / "__init__.py").read_text(encoding="utf-8") == "old init"
+    assert not (plugin_dir / "ui" / "new_module.py").exists()
+    assert not updater.has_pending_recovery(plugin_dir)
+
+
+# 7. Dev-mode guard + pip fallback ----------------------------------------------
 
 
 def test_install_update_refuses_git_checkout(
@@ -319,33 +534,188 @@ def test_install_update_refuses_git_checkout(
     assert not called["run"]
 
 
-# 8. Zip path traversal ----------------------------------------------------------
-
-
-def test_install_update_rejects_path_traversal(
+def test_install_update_requires_pip_when_uv_missing(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    plugin_dir = tmp_path / "kicad_ai_assistant"
+    _write_plugin(plugin_dir)
+    zip_path = tmp_path / "release.zip"
+    zip_path.write_bytes(_release_zip())
+
+    monkeypatch.setattr(updater.shutil, "which", lambda name: None)
+    monkeypatch.setattr(
+        updater.subprocess,
+        "run",
+        lambda command, **kwargs: _completed(command, 1, stderr="No module named pip"),
+    )
+
+    with pytest.raises(updater.UpdateError, match="has no pip"):
+        updater.install_update(zip_path, plugin_dir, "0.2.9")
+
+    assert (plugin_dir / "__init__.py").read_text(encoding="utf-8") == "old init"
+
+
+# 8. Archive path safety ---------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "member",
+    [
+        "kicad_ai_assistant/C:/x",
+        "kicad_ai_assistant/C:\\x",
+        "kicad_ai_assistant//x",
+        "../evil.txt",
+        "/abs/x",
+    ],
+)
+def test_install_update_rejects_unsafe_archive_member(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, member: str
 ) -> None:
     plugin_dir = tmp_path / "kicad_ai_assistant"
     _write_plugin(plugin_dir)
     zip_payload = _zip_bytes(
         {
             "kicad_ai_assistant/__init__.py": b"new init",
-            "../evil.txt": b"escaped",
+            member: b"escaped",
         }
     )
     zip_path = tmp_path / "release.zip"
     zip_path.write_bytes(zip_payload)
 
-    monkeypatch.setattr(updater.subprocess, "run", lambda *a, **k: None)
+    monkeypatch.setattr(
+        updater.subprocess,
+        "run",
+        lambda *a, **k: pytest.fail("subprocess must not run"),
+    )
 
-    with pytest.raises(updater.UpdateError, match="Unsafe path"):
+    with pytest.raises(updater.UpdateError, match="Unsafe"):
         updater.install_update(zip_path, plugin_dir, "0.2.9")
 
     assert not (tmp_path / "evil.txt").exists()
     assert (plugin_dir / "__init__.py").read_text(encoding="utf-8") == "old init"
 
 
-# 9. Unwritable plugin dir -------------------------------------------------------
+def test_extract_rejects_archive_with_too_many_entries(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    plugin_dir = tmp_path / "kicad_ai_assistant"
+    _write_plugin(plugin_dir)
+    zip_path = tmp_path / "release.zip"
+    zip_path.write_bytes(_zip_bytes({f"kicad_ai_assistant/file{i}.py": b"x" for i in range(3)}))
+    monkeypatch.setattr(updater, "_MAX_ARCHIVE_ENTRIES", 2)
+    monkeypatch.setattr(updater.subprocess, "run", lambda *a, **k: pytest.fail("no pip"))
+
+    with pytest.raises(updater.UpdateError, match="too many entries"):
+        updater.install_update(zip_path, plugin_dir, "0.2.9")
+
+    assert (plugin_dir / "__init__.py").read_text(encoding="utf-8") == "old init"
+
+
+@pytest.mark.parametrize(
+    "member",
+    [
+        "../evil.txt",
+        "/abs/evil.txt",
+        "kicad_ai_assistant/../evil.txt",
+        "kicad_ai_assistant/..\\evil.txt",
+        "kicad_ai_assistant/C:/evil.txt",
+        "C:\\evil.txt",
+        "kicad_ai_assistant//evil.txt",
+        "kicad_ai_assistant/evil.txt:stream",
+    ],
+)
+def test_safe_member_rejects_unsafe_paths(member: str) -> None:
+    with pytest.raises(updater.UpdateError, match="Unsafe"):
+        updater._safe_member(member)
+
+
+def test_safe_member_accepts_relative_paths_and_skips_directories() -> None:
+    assert updater._safe_member("./kicad_ai_assistant/ui/panel.py") == PurePosixPath(
+        "kicad_ai_assistant/ui/panel.py"
+    )
+    assert updater._safe_member("kicad_ai_assistant/ui/") is None
+    assert updater._safe_member("__MACOSX/kicad_ai_assistant/x") is None
+
+
+def test_install_update_rejects_zip_version_mismatch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    plugin_dir = tmp_path / "kicad_ai_assistant"
+    _write_plugin(plugin_dir)
+    zip_path = tmp_path / "release.zip"
+    zip_path.write_bytes(
+        _zip_bytes(
+            {
+                "kicad_ai_assistant/__init__.py": b"new init",
+                "kicad_ai_assistant/VERSION": b"0.2.8",
+            }
+        )
+    )
+    monkeypatch.setattr(updater.subprocess, "run", lambda *a, **k: pytest.fail("no pip"))
+
+    with pytest.raises(updater.UpdateError, match="contains version"):
+        updater.install_update(zip_path, plugin_dir, "0.2.9")
+
+    assert (plugin_dir / "__init__.py").read_text(encoding="utf-8") == "old init"
+    assert (plugin_dir / "VERSION").read_text(encoding="utf-8") == "0.2.8"
+    assert not updater.has_pending_recovery(plugin_dir)
+
+
+def test_backup_name_sanitizes_legacy_version(tmp_path: Path) -> None:
+    plugin_dir = tmp_path / "kicad_ai_assistant"
+    _write_plugin(plugin_dir)
+
+    backup = updater._backup_tree(plugin_dir, "../../evil")
+
+    assert backup.parent == plugin_dir / ".backup"
+    assert ".." not in backup.name
+    assert backup.is_dir()
+
+
+# 9. Recovery --------------------------------------------------------------------
+
+
+def test_recover_incomplete_install_restores_newest_backup_and_marker(tmp_path: Path) -> None:
+    plugin_dir = tmp_path / "kicad_ai_assistant"
+    _write_plugin(plugin_dir)
+    backup_root = plugin_dir / ".backup"
+    backup = backup_root / "0.2.8-20260101-000000"
+    backup.mkdir(parents=True)
+    (backup / "__init__.py").write_text("restored", encoding="utf-8")
+    snapshot = backup / "_venv" / "kcaa-0.2.8.dist-info"
+    snapshot.mkdir(parents=True)
+    (snapshot / "METADATA").write_text("Name: kcaa\nVersion: 0.2.8\n", encoding="utf-8")
+    snapshot_pkg = backup / "_venv" / "kcaa"
+    snapshot_pkg.mkdir()
+    (snapshot_pkg / "__init__.py").write_text('__version__ = "0.2.8"', encoding="utf-8")
+    (backup_root / ".incomplete").write_text(backup.name, encoding="utf-8")
+
+    (plugin_dir / "__init__.py").write_text("broken", encoding="utf-8")
+
+    restored = updater.recover_incomplete_install(plugin_dir)
+
+    assert restored == backup
+    assert (plugin_dir / "__init__.py").read_text(encoding="utf-8") == "restored"
+    assert not (plugin_dir / "_venv").exists()
+    assert not updater.has_pending_recovery(plugin_dir)
+    assert not (plugin_dir / ".backup" / ".incomplete").exists()
+    assert (plugin_dir / ".venv" / "lib" / "python3.10" / "site-packages" / "kcaa").is_dir()
+
+
+def test_completed_marker_is_not_treated_as_interrupted(tmp_path: Path) -> None:
+    plugin_dir = tmp_path / "kicad_ai_assistant"
+    _write_plugin(plugin_dir)
+    marker = plugin_dir / ".backup" / ".incomplete"
+    marker.parent.mkdir(parents=True)
+    marker.write_text("complete", encoding="utf-8")
+
+    assert not updater.has_pending_recovery(plugin_dir)
+    with pytest.raises(updater.UpdateError, match="completed"):
+        updater.recover_incomplete_install(plugin_dir)
+    assert not marker.exists()
+
+
+# 10. Unwritable plugin dir ------------------------------------------------------
 
 
 @pytest.mark.skipif(
@@ -365,7 +735,8 @@ def test_install_update_rejects_unwritable_dir(
     try:
         with pytest.raises(updater.UpdateError, match="not writable"):
             updater.install_update(zip_path, plugin_dir, "0.2.9")
-        assert not (plugin_dir / ".backup").exists()
-        assert (plugin_dir / "__init__.py").read_text(encoding="utf-8") == "old init"
     finally:
         plugin_dir.chmod(0o700)
+
+    assert not (plugin_dir / ".backup").exists()
+    assert (plugin_dir / "__init__.py").read_text(encoding="utf-8") == "old init"
