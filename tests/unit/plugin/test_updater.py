@@ -61,6 +61,16 @@ def _zip_bytes(entries: dict[str, bytes]) -> bytes:
     return buffer.getvalue()
 
 
+def _symlink_zip_bytes(name: str, target: str) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        info = zipfile.ZipInfo(name)
+        info.create_system = 3  # Unix: external_attr carries the file mode
+        info.external_attr = 0o120777 << 16
+        archive.writestr(info, target)
+    return buffer.getvalue()
+
+
 def _make_update(
     zip_payload: bytes,
     *,
@@ -272,6 +282,55 @@ def test_check_latest_parses_github_release(monkeypatch: pytest.MonkeyPatch) -> 
     assert info.zip_url == _ZIP_URL
     assert info.checksum_url == _SUMS_URL
     assert info.page_url == "https://example.test/tag/v0.2.9"
+
+
+def _release_data(tag: str) -> dict[str, object]:
+    return {
+        "tag_name": tag,
+        "html_url": "https://example.test/tag/latest",
+        "assets": [
+            {"name": "kicad_ai_assistant.zip", "browser_download_url": _ZIP_URL},
+            {"name": "SHA256SUMS", "browser_download_url": _SUMS_URL},
+        ],
+    }
+
+
+def test_update_from_release_drops_pep440_local_segment() -> None:
+    info = updater._update_from_release(_release_data("v0.2.9+build"))
+
+    assert info is not None
+    assert info.version == "0.2.9"
+    assert updater.is_newer(info.version, "0.2.8")
+    assert updater._validate_version(info.version) == "0.2.9"
+
+
+@pytest.mark.parametrize("tag", ["v+", "+", "v", "   +  "])
+def test_update_from_release_rejects_tag_that_normalizes_to_empty(tag: str) -> None:
+    assert updater._update_from_release(_release_data(tag)) is None
+
+
+def test_check_latest_rejects_tag_with_only_local_segment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = (
+        b'{"tag_name": "v+", "assets": ['
+        b'{"name": "kicad_ai_assistant.zip", "browser_download_url": "' + _ZIP_URL.encode() + b'"},'
+        b'{"name": "SHA256SUMS", "browser_download_url": "' + _SUMS_URL.encode() + b'"}]}'
+    )
+    _fake_open(monkeypatch, {updater.RELEASES_API: payload})
+
+    assert updater.check_latest() is None
+
+
+@pytest.mark.parametrize(
+    ("tag", "expected"),
+    [("0.2.4-bugfix2", "0.2.4-bugfix2"), ("0.2.9-rc1", "0.2.9-rc1")],
+)
+def test_update_from_release_preserves_non_local_suffixes(tag: str, expected: str) -> None:
+    info = updater._update_from_release(_release_data(tag))
+
+    assert info is not None
+    assert info.version == expected
 
 
 @pytest.mark.parametrize(
@@ -782,6 +841,20 @@ def test_extract_rejects_archive_with_too_many_entries(
         updater.install_update(zip_path, plugin_dir, "0.2.9")
 
     assert (plugin_dir / "__init__.py").read_text(encoding="utf-8") == "old init"
+
+
+def test_extract_materializes_symlink_entry_as_regular_file(tmp_path: Path) -> None:
+    zip_path = tmp_path / "release.zip"
+    zip_path.write_bytes(_symlink_zip_bytes("kicad_ai_assistant/link", "/etc/passwd"))
+    dest = tmp_path / "extract"
+
+    updater._extract_zip(zip_path, dest)
+
+    extracted = dest / "link"
+    assert extracted.exists()
+    assert not extracted.is_symlink()
+    assert extracted.read_text(encoding="utf-8") == "/etc/passwd"
+    assert extracted.resolve().is_relative_to(dest.resolve())
 
 
 @pytest.mark.parametrize(

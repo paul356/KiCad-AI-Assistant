@@ -294,7 +294,12 @@ def _update_from_release(data: object) -> UpdateInfo | None:
     """Turn the GitHub ``releases/latest`` payload into an UpdateInfo."""
     if not isinstance(data, dict):
         return None
-    version = str(data.get("tag_name") or "").strip().lstrip("vV")
+    # Normalise once here: strip the tag prefix and any PEP 440 local
+    # segment (``v0.2.9+build`` -> ``0.2.9``).  install_update() validates
+    # strictly and rejects ``+``, so the release path must never offer a
+    # version it cannot install.  Non-local suffixes such as ``-rc1`` stay.
+    tag = str(data.get("tag_name") or "").strip().lstrip("vV")
+    version = tag.split("+", 1)[0].strip()
     if not version:
         return None
     assets = data.get("assets")
