@@ -90,6 +90,8 @@ def _release_zip() -> bytes:
 
 
 def _site_packages(plugin_dir: Path) -> Path:
+    if os.name == "nt":
+        return plugin_dir / ".venv" / "Lib" / "site-packages"
     return plugin_dir / ".venv" / "lib" / "python3.10" / "site-packages"
 
 
@@ -99,7 +101,10 @@ def _write_plugin(plugin_dir: Path, version: str = "0.2.8") -> Path:
     (plugin_dir / "__init__.py").write_text("old init", encoding="utf-8")
     (plugin_dir / "ui").mkdir(exist_ok=True)
     (plugin_dir / "ui" / "greeting.py").write_text("old ui", encoding="utf-8")
-    venv_python = plugin_dir / ".venv" / "bin" / "python"
+    if os.name == "nt":
+        venv_python = plugin_dir / ".venv" / "Scripts" / "python.exe"
+    else:
+        venv_python = plugin_dir / ".venv" / "bin" / "python"
     venv_python.parent.mkdir(parents=True, exist_ok=True)
     venv_python.write_text("", encoding="utf-8")
 
@@ -699,7 +704,9 @@ def test_recover_incomplete_install_restores_newest_backup_and_marker(tmp_path: 
     assert not (plugin_dir / "_venv").exists()
     assert not updater.has_pending_recovery(plugin_dir)
     assert not (plugin_dir / ".backup" / ".incomplete").exists()
-    assert (plugin_dir / ".venv" / "lib" / "python3.10" / "site-packages" / "kcaa").is_dir()
+    site_packages = _site_packages(plugin_dir)
+    assert site_packages.is_dir()
+    assert (site_packages / "kcaa").is_dir()
 
 
 def test_completed_marker_is_not_treated_as_interrupted(tmp_path: Path) -> None:
