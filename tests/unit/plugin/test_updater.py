@@ -10,7 +10,6 @@ import hashlib
 import io
 import os
 from pathlib import Path, PurePosixPath
-import shutil
 import subprocess
 import threading
 import zipfile
@@ -119,6 +118,35 @@ def _write_plugin(plugin_dir: Path, version: str = "0.2.8") -> Path:
 
 def _completed(command, returncode: int, stdout: str = "", stderr: str = ""):
     return subprocess.CompletedProcess(command, returncode, stdout, stderr)
+
+
+def _mock_uv(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    dry_run_returncode: int = 0,
+    dry_run_stderr: str = "",
+    install_returncode: int = 0,
+    install_stderr: str = "",
+    calls: list[list[str]] | None = None,
+    on_install=None,
+) -> None:
+    """Fake uv discovery and subprocess runs for pre-flight + install."""
+    monkeypatch.setattr(
+        updater.shutil,
+        "which",
+        lambda name: "/usr/bin/uv" if name == "uv" else None,
+    )
+
+    def _run(command, **kwargs):
+        if calls is not None:
+            calls.append(list(command))
+        if "--dry-run" in command:
+            return _completed(command, dry_run_returncode, stderr=dry_run_stderr)
+        if on_install is not None:
+            on_install(command)
+        return _completed(command, install_returncode, stderr=install_stderr)
+
+    monkeypatch.setattr(updater.subprocess, "run", _run)
 
 
 # 1. Version comparison ----------------------------------------------------------
@@ -344,15 +372,12 @@ def test_install_update_replaces_tree_updates_venv_and_keeps_backup(
 
     commands: list[list[str]] = []
 
-    def _fake_run(command, **kwargs):
+    def _on_install(command):
         # The plugin tree must be swapped before the venv package is touched.
         assert (plugin_dir / "VERSION").read_text(encoding="utf-8") == "0.2.9"
         assert (plugin_dir / ".backup").is_dir()
-        commands.append(list(command))
-        return _completed(command, 0)
 
-    monkeypatch.setattr(updater.shutil, "which", lambda name: "/usr/bin/uv")
-    monkeypatch.setattr(updater.subprocess, "run", _fake_run)
+    _mock_uv(monkeypatch, calls=commands, on_install=_on_install)
 
     updater.install_update(zip_path, plugin_dir, "0.2.9")
 
@@ -370,17 +395,30 @@ def test_install_update_replaces_tree_updates_venv_and_keeps_backup(
     assert (backup / "__init__.py").read_text(encoding="utf-8") == "old init"
     assert (backup / "ui" / "greeting.py").read_text(encoding="utf-8") == "old ui"
     assert not (backup / ".venv").exists()  # venv tree is excluded
-    assert (backup / "_venv" / "kcaa-0.2.8.dist-info" / "METADATA").is_file()
+    assert not (backup / "_venv").exists()  # no venv snapshot is taken
     assert not updater.has_pending_recovery(plugin_dir)
 
-    assert [
+    dry_run = [
+        "/usr/bin/uv",
+        "pip",
+        "install",
+        "--dry-run",
+        "--python",
+        str(venv_python),
+        "kcaa==0.2.9",
+    ]
+    install_command = [
         "/usr/bin/uv",
         "pip",
         "install",
         "--python",
         str(venv_python),
+        "--upgrade",
         "kcaa==0.2.9",
-    ] in commands
+    ]
+    assert dry_run in commands
+    assert install_command in commands
+    assert commands.index(dry_run) < commands.index(install_command)
 
 
 def test_install_update_rehashes_when_expected_digest_given(tmp_path: Path) -> None:
@@ -401,10 +439,10 @@ def test_install_update_rehashes_when_expected_digest_given(tmp_path: Path) -> N
     assert (plugin_dir / "VERSION").read_text(encoding="utf-8") == "0.2.8"
 
 
-# 6. Failure rolls back tree and venv -------------------------------------------
+# 6. Failure rolls back the plugin tree ----------------------------------------
 
 
-def test_install_update_restores_tree_and_venv_on_venv_failure(
+def test_install_update_restores_tree_when_venv_step_fails(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     plugin_dir = tmp_path / "kicad_ai_assistant"
@@ -413,32 +451,35 @@ def test_install_update_restores_tree_and_venv_on_venv_failure(
     zip_path = tmp_path / "release.zip"
     zip_path.write_bytes(_release_zip())
 
-    def _fake_run(command, **kwargs):
-        if "pip" in command and "--version" in command:
-            return _completed(command, 0)
-        # Simulate a pip run that replaced kcaa and then died.
-        shutil.rmtree(site / "kcaa", ignore_errors=True)
-        (site / "kcaa").mkdir()
-        (site / "kcaa" / "__init__.py").write_text('__version__ = "0.2.9"', encoding="utf-8")
-        (site / "kcaa-0.2.9.dist-info").mkdir(exist_ok=True)
-        return _completed(command, 1, stderr="boom")
-
-    monkeypatch.setattr(updater.shutil, "which", lambda name: "/usr/bin/uv")
-    monkeypatch.setattr(updater.subprocess, "run", _fake_run)
+    calls: list[list[str]] = []
+    _mock_uv(
+        monkeypatch,
+        install_returncode=1,
+        install_stderr="resolver exploded",
+        calls=calls,
+    )
 
     with pytest.raises(updater.UpdateError) as excinfo:
         updater.install_update(zip_path, plugin_dir, "0.2.9")
 
-    assert excinfo.value.restored is True
+    message = str(excinfo.value)
+    assert "kcaa package failed" in message
+    assert "setup_plugin.sh" in message
+    assert excinfo.value.restored is None
     assert excinfo.value.backup_dir is not None
     assert (plugin_dir / "VERSION").read_text(encoding="utf-8") == "0.2.8"
     assert (plugin_dir / "__init__.py").read_text(encoding="utf-8") == "old init"
     assert (plugin_dir / "ui" / "greeting.py").read_text(encoding="utf-8") == "old ui"
     assert not (plugin_dir / "ui" / "new_module.py").exists()
     assert (site / "kcaa" / "__init__.py").read_text(encoding="utf-8") == '__version__ = "0.2.8"'
-    assert (site / "kcaa-0.2.8.dist-info" / "METADATA").is_file()
-    assert not (site / "kcaa-0.2.9.dist-info").exists()
     assert not updater.has_pending_recovery(plugin_dir)
+
+    backups = list((plugin_dir / ".backup").iterdir())
+    assert len(backups) == 1
+    assert not (backups[0] / ".venv").exists()
+    assert not (backups[0] / "_venv").exists()
+    assert any("--dry-run" in command for command in calls)
+    assert any("--dry-run" not in command for command in calls)
 
 
 def test_install_update_restores_previous_tree_on_extract_failure(
@@ -456,12 +497,8 @@ def test_install_update_restores_previous_tree_on_extract_failure(
     bad_zip = tmp_path / "broken.zip"
     bad_zip.write_bytes(b"this is not a zip archive")
 
-    called = {"run": False}
-    monkeypatch.setattr(
-        updater.subprocess,
-        "run",
-        lambda *a, **k: called.__setitem__("run", True),
-    )
+    calls: list[list[str]] = []
+    _mock_uv(monkeypatch, calls=calls)
 
     with pytest.raises(updater.UpdateError, match="not a valid zip"):
         updater.install_update(bad_zip, plugin_dir, "0.2.9")
@@ -470,7 +507,7 @@ def test_install_update_restores_previous_tree_on_extract_failure(
     assert jar.read_bytes() == b"jar-bytes"
     assert (plugin_dir / "__init__.py").read_text(encoding="utf-8") == "old init"
     assert (plugin_dir / "ui" / "greeting.py").read_text(encoding="utf-8") == "old ui"
-    assert not called["run"]  # venv never touched after extract failed
+    assert calls and all("--dry-run" in command for command in calls)
     assert not updater.has_pending_recovery(plugin_dir)
 
 
@@ -486,23 +523,27 @@ def test_install_update_reports_inconsistent_state_when_restore_fails(
         raise OSError("files are locked")
 
     monkeypatch.setattr(updater, "_restore_tree_from_backup", _fail_restore)
+    _mock_uv(monkeypatch)
 
     with pytest.raises(updater.UpdateError) as excinfo:
         updater.install_update(bad_zip, plugin_dir, "0.2.9")
 
     assert excinfo.value.restored is False
     assert excinfo.value.backup_dir is not None
-    assert "inconsistent state" in str(excinfo.value)
+    assert "could not be fully restored" in str(excinfo.value)
     assert updater.has_pending_recovery(plugin_dir)
 
 
-def test_install_update_aborts_when_cancel_event_is_set(tmp_path: Path) -> None:
+def test_install_update_aborts_when_cancel_event_is_set(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     plugin_dir = tmp_path / "kicad_ai_assistant"
     _write_plugin(plugin_dir)
     zip_path = tmp_path / "release.zip"
     zip_path.write_bytes(_release_zip())
     cancel = threading.Event()
     cancel.set()
+    _mock_uv(monkeypatch)
 
     with pytest.raises(updater.UpdateError, match="cancelled"):
         updater.install_update(zip_path, plugin_dir, "0.2.9", cancel_event=cancel)
@@ -510,9 +551,13 @@ def test_install_update_aborts_when_cancel_event_is_set(tmp_path: Path) -> None:
     assert (plugin_dir / "__init__.py").read_text(encoding="utf-8") == "old init"
     assert not (plugin_dir / "ui" / "new_module.py").exists()
     assert not updater.has_pending_recovery(plugin_dir)
+    backups = list((plugin_dir / ".backup").iterdir())
+    assert len(backups) == 1
+    assert not (backups[0] / ".venv").exists()
+    assert not (backups[0] / "_venv").exists()
 
 
-# 7. Dev-mode guard + pip fallback ----------------------------------------------
+# 7. Dev-mode guard + uv pre-flight ---------------------------------------------
 
 
 def test_install_update_refuses_git_checkout(
@@ -539,7 +584,7 @@ def test_install_update_refuses_git_checkout(
     assert not called["run"]
 
 
-def test_install_update_requires_pip_when_uv_missing(
+def test_install_update_requires_uv_before_changes(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     plugin_dir = tmp_path / "kicad_ai_assistant"
@@ -551,13 +596,140 @@ def test_install_update_requires_pip_when_uv_missing(
     monkeypatch.setattr(
         updater.subprocess,
         "run",
-        lambda command, **kwargs: _completed(command, 1, stderr="No module named pip"),
+        lambda *a, **k: pytest.fail("subprocess must not run without uv"),
     )
 
-    with pytest.raises(updater.UpdateError, match="has no pip"):
+    with pytest.raises(updater.UpdateError, match="uv was not found"):
         updater.install_update(zip_path, plugin_dir, "0.2.9")
 
+    assert not (plugin_dir / ".backup").exists()
     assert (plugin_dir / "__init__.py").read_text(encoding="utf-8") == "old init"
+    assert (plugin_dir / "VERSION").read_text(encoding="utf-8") == "0.2.8"
+    assert not updater.has_pending_recovery(plugin_dir)
+
+
+def test_install_update_requires_existing_plugin_dir(tmp_path: Path) -> None:
+    missing = tmp_path / "missing"
+    zip_path = tmp_path / "release.zip"
+    zip_path.write_bytes(_release_zip())
+
+    with pytest.raises(updater.UpdateError, match="Plugin directory not found"):
+        updater.install_update(zip_path, missing, "0.2.9")
+
+    assert not missing.exists()
+
+
+def test_install_update_requires_venv_before_changes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    plugin_dir = tmp_path / "kicad_ai_assistant"
+    plugin_dir.mkdir()
+    (plugin_dir / "VERSION").write_text("0.2.8", encoding="utf-8")
+    (plugin_dir / "__init__.py").write_text("old init", encoding="utf-8")
+    zip_path = tmp_path / "release.zip"
+    zip_path.write_bytes(_release_zip())
+    monkeypatch.setattr(
+        updater.subprocess,
+        "run",
+        lambda *a, **k: pytest.fail("subprocess must not run without a venv"),
+    )
+
+    with pytest.raises(updater.UpdateError, match="virtual environment not found"):
+        updater.install_update(zip_path, plugin_dir, "0.2.9")
+
+    assert not (plugin_dir / ".backup").exists()
+    assert (plugin_dir / "__init__.py").read_text(encoding="utf-8") == "old init"
+    assert (plugin_dir / "VERSION").read_text(encoding="utf-8") == "0.2.8"
+
+
+def test_install_update_dry_run_failure_changes_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    plugin_dir = tmp_path / "kicad_ai_assistant"
+    _write_plugin(plugin_dir)
+    zip_path = tmp_path / "release.zip"
+    zip_path.write_bytes(_release_zip())
+
+    calls: list[list[str]] = []
+    _mock_uv(
+        monkeypatch,
+        dry_run_returncode=1,
+        dry_run_stderr="No solution found for kcaa==0.2.9",
+        calls=calls,
+    )
+
+    with pytest.raises(updater.UpdateError, match="pre-flight") as excinfo:
+        updater.install_update(zip_path, plugin_dir, "0.2.9")
+
+    assert "No solution found" in str(excinfo.value)
+    assert not (plugin_dir / ".backup").exists()
+    assert (plugin_dir / "__init__.py").read_text(encoding="utf-8") == "old init"
+    assert (plugin_dir / "VERSION").read_text(encoding="utf-8") == "0.2.8"
+    assert len(calls) == 1 and "--dry-run" in calls[0]
+    assert not updater.has_pending_recovery(plugin_dir)
+
+
+def test_preflight_retries_alternate_dry_run_placement(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    plugin_dir = tmp_path / "kicad_ai_assistant"
+    venv_python = _write_plugin(plugin_dir)
+    zip_path = tmp_path / "release.zip"
+    zip_path.write_bytes(_release_zip())
+    calls: list[list[str]] = []
+
+    def _run(command, **kwargs):
+        calls.append(list(command))
+        if "--dry-run" in command and command[3] == "--dry-run":
+            return _completed(command, 2, stderr="error: unexpected argument '--dry-run' found")
+        return _completed(command, 0)
+
+    monkeypatch.setattr(
+        updater.shutil, "which", lambda name: "/usr/bin/uv" if name == "uv" else None
+    )
+    monkeypatch.setattr(updater.subprocess, "run", _run)
+
+    updater.install_update(zip_path, plugin_dir, "0.2.9")
+
+    assert calls[0][3] == "--dry-run"
+    assert calls[1][3] == "--python" and calls[1][5] == "--dry-run"
+    assert calls[2] == [
+        "/usr/bin/uv",
+        "pip",
+        "install",
+        "--python",
+        str(venv_python),
+        "--upgrade",
+        "kcaa==0.2.9",
+    ]
+
+
+def test_preflight_skips_when_uv_rejects_dry_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    plugin_dir = tmp_path / "kicad_ai_assistant"
+    _write_plugin(plugin_dir)
+    zip_path = tmp_path / "release.zip"
+    zip_path.write_bytes(_release_zip())
+    calls: list[list[str]] = []
+
+    def _run(command, **kwargs):
+        calls.append(list(command))
+        if "--dry-run" in command:
+            return _completed(command, 2, stderr="error: unexpected argument '--dry-run' found")
+        return _completed(command, 0)
+
+    monkeypatch.setattr(
+        updater.shutil, "which", lambda name: "/usr/bin/uv" if name == "uv" else None
+    )
+    monkeypatch.setattr(updater.subprocess, "run", _run)
+
+    updater.install_update(zip_path, plugin_dir, "0.2.9")
+
+    assert (plugin_dir / "VERSION").read_text(encoding="utf-8") == "0.2.9"
+    assert len(calls) == 3
+    assert all("--dry-run" in command for command in calls[:2])
+    assert "--dry-run" not in calls[2]
 
 
 # 8. Archive path safety ---------------------------------------------------------
@@ -587,11 +759,7 @@ def test_install_update_rejects_unsafe_archive_member(
     zip_path = tmp_path / "release.zip"
     zip_path.write_bytes(zip_payload)
 
-    monkeypatch.setattr(
-        updater.subprocess,
-        "run",
-        lambda *a, **k: pytest.fail("subprocess must not run"),
-    )
+    _mock_uv(monkeypatch)
 
     with pytest.raises(updater.UpdateError, match="Unsafe"):
         updater.install_update(zip_path, plugin_dir, "0.2.9")
@@ -608,7 +776,7 @@ def test_extract_rejects_archive_with_too_many_entries(
     zip_path = tmp_path / "release.zip"
     zip_path.write_bytes(_zip_bytes({f"kicad_ai_assistant/file{i}.py": b"x" for i in range(3)}))
     monkeypatch.setattr(updater, "_MAX_ARCHIVE_ENTRIES", 2)
-    monkeypatch.setattr(updater.subprocess, "run", lambda *a, **k: pytest.fail("no pip"))
+    _mock_uv(monkeypatch)
 
     with pytest.raises(updater.UpdateError, match="too many entries"):
         updater.install_update(zip_path, plugin_dir, "0.2.9")
@@ -656,9 +824,9 @@ def test_install_update_rejects_zip_version_mismatch(
             }
         )
     )
-    monkeypatch.setattr(updater.subprocess, "run", lambda *a, **k: pytest.fail("no pip"))
+    _mock_uv(monkeypatch)
 
-    with pytest.raises(updater.UpdateError, match="contains version"):
+    with pytest.raises(updater.UpdateError, match="does not match"):
         updater.install_update(zip_path, plugin_dir, "0.2.9")
 
     assert (plugin_dir / "__init__.py").read_text(encoding="utf-8") == "old init"
@@ -687,12 +855,6 @@ def test_recover_incomplete_install_restores_newest_backup_and_marker(tmp_path: 
     backup = backup_root / "0.2.8-20260101-000000"
     backup.mkdir(parents=True)
     (backup / "__init__.py").write_text("restored", encoding="utf-8")
-    snapshot = backup / "_venv" / "kcaa-0.2.8.dist-info"
-    snapshot.mkdir(parents=True)
-    (snapshot / "METADATA").write_text("Name: kcaa\nVersion: 0.2.8\n", encoding="utf-8")
-    snapshot_pkg = backup / "_venv" / "kcaa"
-    snapshot_pkg.mkdir()
-    (snapshot_pkg / "__init__.py").write_text('__version__ = "0.2.8"', encoding="utf-8")
     (backup_root / ".incomplete").write_text(backup.name, encoding="utf-8")
 
     (plugin_dir / "__init__.py").write_text("broken", encoding="utf-8")
@@ -701,12 +863,10 @@ def test_recover_incomplete_install_restores_newest_backup_and_marker(tmp_path: 
 
     assert restored == backup
     assert (plugin_dir / "__init__.py").read_text(encoding="utf-8") == "restored"
-    assert not (plugin_dir / "_venv").exists()
     assert not updater.has_pending_recovery(plugin_dir)
     assert not (plugin_dir / ".backup" / ".incomplete").exists()
-    site_packages = _site_packages(plugin_dir)
-    assert site_packages.is_dir()
-    assert (site_packages / "kcaa").is_dir()
+    assert not (backup / ".venv").exists()
+    assert not (backup / "_venv").exists()
 
 
 def test_completed_marker_is_not_treated_as_interrupted(tmp_path: Path) -> None:
@@ -736,7 +896,7 @@ def test_install_update_rejects_unwritable_dir(
     _write_plugin(plugin_dir)
     zip_path = tmp_path / "release.zip"
     zip_path.write_bytes(b"unused")
-    monkeypatch.setattr(updater.subprocess, "run", lambda *a, **k: None)
+    _mock_uv(monkeypatch)
 
     plugin_dir.chmod(0o500)
     try:

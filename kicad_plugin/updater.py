@@ -5,10 +5,11 @@ and marshals results back onto the GUI thread with ``wx.CallAfter``.
 
 The update payload is the release zip (``kicad_ai_assistant.zip``) published
 by ``make dist-plugin`` together with a ``SHA256SUMS`` asset.  Installation
-swaps the plugin tree first, then refreshes ``kcaa`` inside the plugin's
-``.venv``.  The plugin tree is backed up before the swap and the installed
-``kcaa`` distribution is snapshotted at the same time; both are restored on
-failure.  An ``.incomplete`` marker keeps a crashed install recoverable.
+replaces the plugin tree (backed up beforehand and restored on failure) and
+then refreshes ``kcaa`` inside the plugin's ``.venv`` with ``uv``, which
+stages and renames its install atomically.  A pre-flight dry-run catches
+dependency/index errors before the plugin tree is touched.  An
+``.incomplete`` marker keeps a crashed install recoverable.
 """
 
 from __future__ import annotations
@@ -53,7 +54,6 @@ USER_AGENT = "KiCad-AI-Assistant-Updater"
 CHECK_TIMEOUT = 3.0
 DOWNLOAD_TIMEOUT = 60.0
 _VENV_TIMEOUT = 300.0
-_VENV_PROBE_TIMEOUT = 30.0
 _CHUNK_SIZE = 64 * 1024
 
 # Directories/patterns never copied into a backup, never deleted on restore,
@@ -68,8 +68,6 @@ _INCOMPLETE_MARKER = ".incomplete"
 # Written before removing the marker so a successful install can never be
 # rolled back merely because the marker file could not be deleted.
 _COMPLETE_MARKER = "complete"
-# Snapshot of site-packages/kcaa* inside the backup dir.
-_VENV_SNAPSHOT_DIR = "_venv"
 
 # Response/archive size guards.
 _MAX_TEXT_BYTES = 1024 * 1024
@@ -101,9 +99,10 @@ _VersionKey = tuple[int, tuple[int, ...], int, int, int, int, int, int]
 class UpdateError(RuntimeError):
     """A user-facing update failure.
 
-    ``restored`` is ``True`` when the previous plugin tree (and the kcaa
-    snapshot, if one was taken) was restored, ``False`` when the plugin is
-    in an inconsistent state, and ``None`` when no install step ran.
+    ``restored`` is ``True`` when the plugin tree was restored, ``False``
+    when the plugin tree is inconsistent, and ``None`` when no tree swap
+    happened or when the venv update failed after the tree was restored (the
+    venv state is deliberately not claimed).
     """
 
     def __init__(
@@ -563,7 +562,7 @@ def _restore_tree_from_backup(backup_dir: Path, plugin_dir: Path) -> None:
         backup_dir,
         plugin_dir,
         dirs_exist_ok=True,
-        ignore=shutil.ignore_patterns(_VENV_SNAPSHOT_DIR),
+        ignore=shutil.ignore_patterns(".venv", "_venv"),
     )
     log.warning("Restored plugin files from backup %s", backup_dir)
 
@@ -625,8 +624,6 @@ def recover_incomplete_install(plugin_dir: str | os.PathLike[str]) -> Path:
         raise UpdateError(f"Cannot recover: no backup found under {backup_root}.")
 
     _restore_tree_from_backup(backup_dir, plugin_dir)
-    if (backup_dir / _VENV_SNAPSHOT_DIR).is_dir():
-        _restore_venv_kcaa(plugin_dir, backup_dir)
     try:
         marker.unlink()
     except OSError as exc:
@@ -638,7 +635,7 @@ def recover_incomplete_install(plugin_dir: str | os.PathLike[str]) -> Path:
 
 
 # ---------------------------------------------------------------------------
-# venv kcaa snapshot / restore
+# venv discovery and uv update
 # ---------------------------------------------------------------------------
 
 
@@ -651,74 +648,6 @@ def _venv_python(plugin_dir: Path) -> Path | None:
         if candidate.is_file():
             return candidate
     return None
-
-
-def _venv_site_packages(python: Path) -> Path | None:
-    venv = python.parent.parent
-    if os.name == "nt":
-        candidate = venv / "Lib" / "site-packages"
-        return candidate if candidate.is_dir() else None
-    matches = sorted(venv.glob("lib/python*/site-packages"))
-    if matches:
-        return matches[0]
-    candidate = venv / "lib" / "site-packages"
-    return candidate if candidate.is_dir() else None
-
-
-def _kcaa_dist_entries(site_packages: Path) -> list[Path]:
-    entries = []
-    for entry in site_packages.iterdir():
-        name = entry.name
-        if name == "kcaa" or name.startswith("kcaa-"):
-            entries.append(entry)
-        elif name.startswith("kcaa") and name.endswith(".dist-info"):
-            entries.append(entry)
-    return entries
-
-
-def _copy_entry(source: Path, destination: Path) -> None:
-    if source.is_dir() and not source.is_symlink():
-        shutil.copytree(source, destination)
-    else:
-        shutil.copy2(source, destination)
-
-
-def _snapshot_venv_kcaa(plugin_dir: Path, backup_dir: Path) -> bool:
-    """Snapshot site-packages/kcaa* into the backup; True when a venv exists."""
-    python = _venv_python(plugin_dir)
-    if python is None:
-        return False
-    snapshot = backup_dir / _VENV_SNAPSHOT_DIR
-    snapshot.mkdir(parents=True, exist_ok=True)
-    site_packages = _venv_site_packages(python)
-    if site_packages is not None:
-        for entry in _kcaa_dist_entries(site_packages):
-            _copy_entry(entry, snapshot / entry.name)
-    return True
-
-
-def _restore_venv_kcaa(plugin_dir: Path, backup_dir: Path) -> None:
-    """Restore (or remove) the kcaa distribution from the venv snapshot."""
-    snapshot = backup_dir / _VENV_SNAPSHOT_DIR
-    if not snapshot.is_dir():
-        return
-    python = _venv_python(plugin_dir)
-    site_packages = _venv_site_packages(python) if python is not None else None
-    if site_packages is not None:
-        for entry in _kcaa_dist_entries(site_packages):
-            if entry.is_dir() and not entry.is_symlink():
-                shutil.rmtree(entry)
-            else:
-                entry.unlink()
-    entries = list(snapshot.iterdir())
-    if not entries:
-        return
-    if site_packages is None:
-        raise UpdateError(
-            "Cannot restore the kcaa package: the plugin venv site-packages directory is missing."
-        )
-    for entry in entries:
-        _copy_entry(entry, site_packages / entry.name)
 
 
 # ---------------------------------------------------------------------------
@@ -817,74 +746,108 @@ def _extract_zip(zip_path: Path, dest: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _venv_has_pip(python: Path) -> bool:
-    try:
-        completed = subprocess.run(  # nosec B603 - fixed argv list, shell=False
-            [str(python), "-m", "pip", "--version"],
-            capture_output=True,
-            text=True,
-            timeout=_VENV_PROBE_TIMEOUT,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    return completed.returncode == 0
+_UNSUPPORTED_FLAG_HINTS = (
+    "unexpected argument",
+    "unexpected option",
+    "unrecognised",
+    "unrecognized",
+    "unknown option",
+    "no such option",
+    "invalid option",
+)
 
 
-def _run_venv_install(plugin_dir: Path, new_version: str) -> None:
-    _validate_version(new_version)
-    python = _venv_python(plugin_dir)
-    if python is None:
-        raise UpdateError(
-            f"Plugin virtual environment not found under {plugin_dir / '.venv'}. "
-            "Reinstall the plugin zip or run setup_plugin to recreate it."
-        )
-
+def _require_uv() -> str:
     uv = shutil.which("uv")
-    commands: list[list[str]] = []
-    if uv:
-        commands.append([uv, "pip", "install", "--python", str(python), f"kcaa=={new_version}"])
-        if _venv_has_pip(python):
-            commands.append(
-                [str(python), "-m", "pip", "install", "--upgrade", f"kcaa=={new_version}"]
-            )
-    else:
-        if not _venv_has_pip(python):
-            raise UpdateError(
-                "uv was not found and this virtual environment has no pip. "
-                "Reinstall the plugin with setup_plugin.sh to recreate the environment."
-            )
-        commands.append([str(python), "-m", "pip", "install", "--upgrade", f"kcaa=={new_version}"])
+    if not uv:
+        raise UpdateError(
+            "uv was not found on PATH. Rerun setup_plugin.sh (or install uv) "
+            "and try the update again."
+        )
+    return uv
 
-    last_error = ""
-    for command in commands:
+
+def _command_error(completed: subprocess.CompletedProcess[str]) -> str:
+    output = (completed.stderr or completed.stdout or "").strip()
+    return output[-800:] or f"exit code {completed.returncode}"
+
+
+def _looks_like_unsupported_flag(output: str) -> bool:
+    lowered = output.lower()
+    return any(hint in lowered for hint in _UNSUPPORTED_FLAG_HINTS)
+
+
+def _dry_run_install(uv: str, python: Path, new_version: str) -> None:
+    """Run ``uv pip install --dry-run`` without mutating the venv."""
+    _validate_version(new_version)
+    package = f"kcaa=={new_version}"
+    attempts = (
+        [uv, "pip", "install", "--dry-run", "--python", str(python), package],
+        [uv, "pip", "install", "--python", str(python), "--dry-run", package],
+    )
+    for index, command in enumerate(attempts):
         try:
-            completed = subprocess.run(  # nosec B603 - argv list, shell=False, version validated
+            completed = subprocess.run(  # nosec B603 - fixed argv, version validated
                 command,
                 capture_output=True,
                 text=True,
                 timeout=_VENV_TIMEOUT,
                 check=False,
             )
-        except FileNotFoundError:
-            last_error = f"{command[0]} not found"
-            continue
         except (OSError, subprocess.TimeoutExpired) as exc:
-            last_error = str(exc)
-            continue
+            raise UpdateError(f"Update pre-flight failed: {exc}") from exc
         if completed.returncode == 0:
             return
-        output = (completed.stderr or completed.stdout or "").strip()
-        last_error = output[-800:] or f"exit code {completed.returncode}"
-        log.warning("kcaa upgrade command failed (%s): %s", command[0], last_error)
-    raise UpdateError(f"Could not update the kcaa package: {last_error}")
+        output = _command_error(completed)
+        if _looks_like_unsupported_flag(output):
+            if index == 0:
+                log.info("uv rejected the first --dry-run placement; retrying")
+                continue
+            log.warning("uv does not support --dry-run; skipping pre-flight: %s", output)
+            return
+        raise UpdateError(f"Update pre-flight failed: {output}")
 
 
-def _staged_version(staging: Path) -> str:
+def _run_venv_install(plugin_dir: Path, new_version: str) -> None:
+    """Install the validated ``kcaa`` version with uv (atomic rename)."""
+    _validate_version(new_version)
+    python = _venv_python(plugin_dir)
+    if python is None:
+        raise UpdateError(
+            f"Plugin virtual environment not found under {plugin_dir / '.venv'}. "
+            "Rerun setup_plugin.sh to recreate it."
+        )
+    uv = _require_uv()
+    command = [
+        uv,
+        "pip",
+        "install",
+        "--python",
+        str(python),
+        "--upgrade",
+        f"kcaa=={new_version}",
+    ]
     try:
-        return (staging / "VERSION").read_text(encoding="utf-8").strip()
+        completed = subprocess.run(  # nosec B603 - fixed argv, version validated
+            command,
+            capture_output=True,
+            text=True,
+            timeout=_VENV_TIMEOUT,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise UpdateError(f"Could not update the kcaa package: {exc}") from exc
+    if completed.returncode != 0:
+        raise UpdateError(f"Could not update the kcaa package: {_command_error(completed)}")
+
+
+def _verify_installed_version(plugin_dir: Path, expected: str) -> None:
+    try:
+        installed = (plugin_dir / "VERSION").read_text(encoding="utf-8").strip()
     except (OSError, UnicodeDecodeError) as exc:
-        raise UpdateError("Update archive does not contain a readable VERSION file.") from exc
+        raise UpdateError("Updated plugin is missing a readable VERSION file.") from exc
+    if installed != expected:
+        raise UpdateError(f"Updated plugin VERSION {installed!r} does not match {expected!r}.")
 
 
 def _check_cancel(cancel_event: Event | None) -> None:
@@ -904,17 +867,20 @@ def install_update(
     """Install a release zip over the plugin directory.
 
     Refuses git checkouts, unwritable directories, and leftovers from an
-    interrupted install.  After backing up the plugin tree and snapshotting
-    the installed kcaa distribution, the tree is replaced first and the venv
-    package second.  Any failure restores both; if a restore fails, the
-    backup is kept, the ``.incomplete`` marker remains, and ``UpdateError``
-    reports the inconsistent state.  Pass ``expected_sha256`` to re-verify a
-    zip obtained outside :func:`download_and_verify`.
+    interrupted install.  Before any filesystem change it resolves the
+    plugin venv, requires uv, and runs a dry-run install.  It then backs up
+    the plugin tree, replaces it, verifies VERSION, and updates ``kcaa`` with
+    uv.  The tree is restored on failure; if the venv step fails after the
+    swap, the error says the plugin files were restored but the package
+    update did not complete.  Pass ``expected_sha256`` to re-verify a zip
+    obtained outside :func:`download_and_verify`.
     """
     plugin_dir = Path(plugin_dir)
     zip_path = Path(zip_path)
     _validate_version(new_version)
 
+    if not plugin_dir.is_dir():
+        raise UpdateError(f"Plugin directory not found: {plugin_dir}")
     if (plugin_dir / ".git").exists():
         raise UpdateError(
             "This plugin directory is a git checkout; update it with 'git pull' "
@@ -925,7 +891,6 @@ def install_update(
             "A previous update did not finish. Restart KiCad to recover the "
             "previous version before updating again."
         )
-    _ensure_writable(plugin_dir)
 
     if expected_sha256 is not None:
         try:
@@ -935,15 +900,24 @@ def install_update(
         if not hmac.compare_digest(actual.lower(), str(expected_sha256).lower()):
             raise UpdateError("checksum mismatch for the update archive")
 
+    # Pre-flight: fail before backup/clear/copy when the venv or uv is
+    # missing, or when dependency/index resolution cannot succeed.
+    python = _venv_python(plugin_dir)
+    if python is None:
+        raise UpdateError(
+            f"Plugin virtual environment not found under {plugin_dir / '.venv'}. "
+            "Rerun setup_plugin.sh to recreate it."
+        )
+    uv = _require_uv()
+    _dry_run_install(uv, python, new_version)
+
+    _ensure_writable(plugin_dir)
+
     old_version = current_version(plugin_dir)
     try:
         backup_dir = _backup_tree(plugin_dir, old_version)
     except OSError as exc:
         raise UpdateError(f"Could not back up the current plugin: {exc}") from exc
-    try:
-        venv_snapshotted = _snapshot_venv_kcaa(plugin_dir, backup_dir)
-    except OSError as exc:
-        raise UpdateError(f"Could not snapshot the kcaa package: {exc}") from exc
 
     marker = _marker_path(plugin_dir)
     try:
@@ -952,48 +926,38 @@ def install_update(
         raise UpdateError(f"Could not record the interrupted-update marker: {exc}") from exc
 
     staging: Path | None = None
+    venv_started = False
     try:
-        _check_cancel(cancel_event)
         staging = Path(tempfile.mkdtemp(prefix="kcaa-install-"))
         _extract_zip(zip_path, staging)
-        staged_version = _staged_version(staging)
-        if staged_version != new_version:
-            raise UpdateError(
-                f"Update archive contains version {staged_version!r}, expected {new_version!r}."
-            )
         _check_cancel(cancel_event)
 
         shipped_root_files = {path.name for path in staging.iterdir() if path.is_file()}
         _clear_plugin_tree(plugin_dir, preserve_files=shipped_root_files)
-        _check_cancel(cancel_event)
         shutil.copytree(
             staging,
             plugin_dir,
             dirs_exist_ok=True,
             ignore=shutil.ignore_patterns(*_UNTOUCHED_DIRS),
         )
+        _verify_installed_version(plugin_dir, new_version)
         _notify(progress_cb, 2, 3)
 
+        venv_started = True
         _run_venv_install(plugin_dir, new_version)
         _notify(progress_cb, 3, 3)
-        _check_cancel(cancel_event)
     except Exception as exc:
         restore_errors: list[str] = []
         try:
             _restore_tree_from_backup(backup_dir, plugin_dir)
-        except Exception as tree_exc:  # noqa: BLE001 - report both failures
-            restore_errors.append(f"plugin files: {tree_exc}")
-        if venv_snapshotted:
-            try:
-                _restore_venv_kcaa(plugin_dir, backup_dir)
-            except Exception as venv_exc:  # noqa: BLE001 - report both failures
-                restore_errors.append(f"kcaa package: {venv_exc}")
+        except Exception as tree_exc:  # noqa: BLE001 - report restore failures
+            restore_errors.append(str(tree_exc))
 
         if restore_errors:
             detail = "; ".join(restore_errors)
             raise UpdateError(
-                f"Update failed: {exc}. The installation is in an inconsistent "
-                f"state; the backup is kept at {backup_dir}. Restore errors: {detail}",
+                f"Update failed: {exc}. The plugin files could not be fully "
+                f"restored; the backup is kept at {backup_dir}. Restore errors: {detail}",
                 restored=False,
                 backup_dir=backup_dir,
             ) from exc
@@ -1002,6 +966,14 @@ def install_update(
             marker.unlink()
         except OSError:
             log.warning("Could not clear the interrupted-update marker %s", marker)
+
+        if venv_started:
+            raise UpdateError(
+                "The plugin files were restored from the backup, but updating the "
+                f"kcaa package failed: {exc}. Retry the update or rerun setup_plugin.sh.",
+                restored=None,
+                backup_dir=backup_dir,
+            ) from exc
         if isinstance(exc, UpdateError):
             exc.restored = True
             exc.backup_dir = str(backup_dir)
