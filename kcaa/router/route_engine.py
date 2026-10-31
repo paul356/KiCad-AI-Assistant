@@ -742,6 +742,35 @@ def route_engine(
             except PnsFailure:
                 pass  # merged line would violate DRC: keep walked path
 
+        # Corner shouldering: a 45-family route must not carry 90-degree
+        # turns.  The walkaround (flat hull-edge entry) and the parallel
+        # lane (perpendicular stubs) both leave family segments meeting
+        # at 90 degrees, which every direction-only guard above accepts.
+        # Shoulder them after stub coalescing (so the passes do not fight
+        # over the same vertices); a candidate is kept only when it is
+        # family-clean, has no sub-width segment and passes the copper
+        # audit.  Manhattan corner modes are excluded: 90 degrees is the
+        # intended output there.
+        if corner_mode in (CornerMode.MITERED_45, CornerMode.ROUNDED_45):
+            shouldered = _shoulder_family_corners(
+                out_path, route_hulls, track_width, board_limit=board_limit
+            )
+            if shouldered != out_path:
+                try:
+                    _audit_final_copper(
+                        out_path=shouldered,
+                        width=track_width,
+                        net=net,
+                        obstacles=obstacles,
+                        extra_fixed=extra_fixed,
+                        moved_pairs=moved_pairs,
+                        orig_obstacle_ids=orig_obstacle_ids,
+                        clearance=clearance,
+                    )
+                    out_path = shouldered
+                except PnsFailure:
+                    pass  # shoulder would violate DRC: keep walked path
+
     # Final all-copper DRC audit: the route and every displacement must
     # keep ``clearance`` from every foreign-net copper item of the final
     # state (fixed solids, unmoved tracks, other displacements, same-net
@@ -1077,6 +1106,149 @@ def _merge_family_chain(pts: list[tuple[float, float]]) -> list[tuple[float, flo
         out.append(pts[i])
     if len(out) < 2:
         return [pts[0], pts[-1]]
+    return out
+
+
+def _shoulder_family_corners(
+    pts: Sequence[tuple[float, float]],
+    hulls: Sequence[Polygon],
+    width: float,
+    board_limit: Polygon | None = None,
+) -> list[tuple[float, float]]:
+    """Replace 90-degree family corners with 45-degree shoulders.
+
+    A walkaround that meets a family hull's flat edge perpendicularly
+    (or a parallel lane that shifts a straight run sideways) leaves the
+    path with two family legs meeting at 90 degrees.  Every *segment*
+    is on the 0/45/90 family, so ``_line_is_family``, ``_snap45_line``,
+    ``_merge_family_chain`` and ``_coalesce_stub_pairs`` all accept the
+    corner; a mitered45 route must nevertheless never emit one (#214).
+
+    For a corner ``a -> b -> c`` the two legs are shortened by ``t`` and
+    the cut points are joined by the 45-degree bisector ``[b - e*t,
+    b + x*t]`` (``e``/``x`` are the unit leg directions).  The emitted
+    shape is ``leg -> 45 shoulder -> leg``: two 45-degree turns instead
+    of one 90-degree turn, with both endpoints still on their original
+    lines (no off-family direction is introduced).  Geometrically this
+    slides the straight passage sideways by the shoulder offset, which
+    is exactly the missing "merge-obtuse / merge-step" optimizer move.
+
+    ``t`` is the largest offset the two legs allow, capped at
+    ``width / sqrt(2)`` so a *standalone* shoulder is never shorter than
+    the track width.  When a leg is shorter than the cap the cut point
+    lands on the adjacent vertex; if the following segment is collinear
+    with the bisector (the J3 pad geometry, where the shoulder rides
+    the hull's 45-degree chamfer) the family merge absorbs that vertex
+    and the emitted diagonal grows past the cap instead of emitting a
+    sub-width stub.
+
+    A shoulder is accepted only when the whole polyline stays on the
+    family, both new turns are <= 45 degrees, every *new* segment is at
+    least ``width`` long, the bisector stays clear of ``hulls`` (which
+    already carry the route margin, boundary riding allowed like the
+    walkaround), and the result stays inside ``board_limit``.  A corner
+    whose shoulder fails any test is left untouched, so this pass is
+    strictly an improvement or a no-op — the same policy as
+    ``_coalesce_stub_pairs``; the caller's final copper audit remains
+    the DRC gate.
+    """
+    out = list(pts)
+    if len(out) < 3 or width <= 0.0:
+        return out
+
+    t_cap = width / math.sqrt(2.0)
+
+    def _on_family(p: tuple[float, float], q: tuple[float, float]) -> bool:
+        dx, dy = q[0] - p[0], q[1] - p[1]
+        return abs(dx) < 1e-9 or abs(dy) < 1e-9 or abs(abs(dx) - abs(dy)) < 1e-6
+
+    def _turn(a: tuple[float, float], b: tuple[float, float], c: tuple[float, float]) -> float:
+        """Unsigned turn at ``b`` in degrees (zero-length legs count as 0)."""
+        v1x, v1y = b[0] - a[0], b[1] - a[1]
+        v2x, v2y = c[0] - b[0], c[1] - b[1]
+        l1 = math.hypot(v1x, v1y)
+        l2 = math.hypot(v2x, v2y)
+        if l1 < 1e-12 or l2 < 1e-12:
+            return 0.0
+        cos_t = (v1x * v2x + v1y * v2y) / (l1 * l2)
+        return math.degrees(math.acos(max(-1.0, min(1.0, cos_t))))
+
+    def _seg_clear(p: tuple[float, float], q: tuple[float, float]) -> bool:
+        line = LineString([p, q])
+        return not any(line.intersects(h) and not line.touches(h) for h in hulls)
+
+    def _key(p: tuple[float, float]) -> tuple[float, float]:
+        return (round(p[0], 6), round(p[1], 6))
+
+    def _new_segments_wide(cand: list[tuple[float, float]]) -> bool:
+        """Every segment this shoulder introduced is >= track width."""
+        existing = {frozenset((_key(a), _key(b))) for a, b in zip(out, out[1:])}
+        for a, b in zip(cand, cand[1:]):
+            if frozenset((_key(a), _key(b))) in existing:
+                continue
+            if math.hypot(b[0] - a[0], b[1] - a[1]) < width - 1e-9:
+                return False
+        return True
+
+    def _dedupe(seq: list[tuple[float, float]]) -> list[tuple[float, float]]:
+        deduped = [seq[0]]
+        for p in seq[1:]:
+            if abs(p[0] - deduped[-1][0]) > 1e-9 or abs(p[1] - deduped[-1][1]) > 1e-9:
+                deduped.append(p)
+        return deduped
+
+    max_steps = 4 * len(out) + 16
+    steps = 0
+    i = 1
+    while i < len(out) - 1 and steps < max_steps:
+        steps += 1
+        a, b, c = out[i - 1], out[i], out[i + 1]
+        if abs(_turn(a, b, c) - 90.0) > 1e-4 or not (_on_family(a, b) and _on_family(b, c)):
+            i += 1
+            continue
+        l1 = math.hypot(b[0] - a[0], b[1] - a[1])
+        l2 = math.hypot(c[0] - b[0], c[1] - b[1])
+        if l1 < 1e-9 or l2 < 1e-9:
+            i += 1
+            continue
+        ex, ey = (b[0] - a[0]) / l1, (b[1] - a[1]) / l1
+        xx, xy = (c[0] - b[0]) / l2, (c[1] - b[1]) / l2
+        t = min(t_cap, l1, l2)
+        a2 = (b[0] - ex * t, b[1] - ey * t)
+        c2 = (b[0] + xx * t, b[1] + xy * t)
+
+        # Cut point on the entry leg.  When it coincides with ``a`` the
+        # leg is fully consumed and ``a`` becomes the shoulder vertex:
+        # the turn there now runs from the outer neighbour to the
+        # bisector, so re-check it.
+        if abs(a2[0] - a[0]) <= 1e-9 and abs(a2[1] - a[1]) <= 1e-9:
+            if i >= 2 and _turn(out[i - 2], a, c2) > 45.0 + 1e-6:
+                i += 1
+                continue
+        elif _turn(a, a2, c2) > 45.0 + 1e-6:
+            i += 1
+            continue
+        # Same on the exit leg.
+        if abs(c2[0] - c[0]) <= 1e-9 and abs(c2[1] - c[1]) <= 1e-9:
+            if i + 2 < len(out) and _turn(a2, c, out[i + 2]) > 45.0 + 1e-6:
+                i += 1
+                continue
+        elif _turn(a2, c2, c) > 45.0 + 1e-6:
+            i += 1
+            continue
+
+        cand = _dedupe(out[:i] + [a2, c2] + out[i + 1 :])
+        cand = _merge_family_chain(cand)
+        if (
+            not _line_is_family(cand)
+            or not _seg_clear(a2, c2)
+            or not _new_segments_wide(cand)
+            or (board_limit is not None and not _line_in_board(cand, board_limit))
+        ):
+            i += 1
+            continue
+        out = cand
+        i = max(1, i - 1)  # the merge may have moved the neighbourhood
     return out
 
 
