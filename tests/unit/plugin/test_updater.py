@@ -195,6 +195,7 @@ def test_panel_update_branch_uses_tag_inequality(monkeypatch: pytest.MonkeyPatch
             pass
 
     fake_wx = types.ModuleType("wx")
+    fake_wx.__kcaa_fake_wx__ = True  # type: ignore[attr-defined]
     fake_html = types.ModuleType("wx.html")
     fake_html.HtmlWindow = _Dummy  # type: ignore[attr-defined]
     fake_html2 = types.ModuleType("wx.html2")
@@ -203,32 +204,35 @@ def test_panel_update_branch_uses_tag_inequality(monkeypatch: pytest.MonkeyPatch
     fake_wx.html2 = fake_html2  # type: ignore[attr-defined]
     fake_wx.__getattr__ = lambda name: _Dummy  # type: ignore[attr-defined]
 
+    module_names = ("wx", "wx.html", "wx.html2", "kicad_plugin.ui.panel")
+    missing = object()
+    saved_modules = {name: sys.modules.get(name, missing) for name in module_names}
     ui_pkg = sys.modules.get("kicad_plugin.ui")
     saved_panel_attr = getattr(ui_pkg, "panel", None) if ui_pkg is not None else None
-    monkeypatch.setitem(sys.modules, "wx", fake_wx)
-    monkeypatch.setitem(sys.modules, "wx.html", fake_html)
-    monkeypatch.setitem(sys.modules, "wx.html2", fake_html2)
-    monkeypatch.delitem(sys.modules, "kicad_plugin.ui.panel", raising=False)
-
-    panel = importlib.import_module("kicad_plugin.ui.panel")
-    assert panel._WX_AVAILABLE  # noqa: SLF001 - exercising the real branch
-    info = updater.UpdateInfo("0.2.9", _ZIP_URL, _SUMS_URL, updater.RELEASE_PAGE)
-
-    class _FakePanel:
-        def __init__(self) -> None:
-            self.labeled: list[str] = []
-            self.prompted: list[tuple[object, str]] = []
-
-        def _set_check_updates_enabled(self, enabled: bool) -> None:
-            pass
-
-        def _set_check_updates_label(self, version: str) -> None:
-            self.labeled.append(version)
-
-        def _prompt_upgrade(self, info: object, current: str) -> None:
-            self.prompted.append((info, current))
-
     try:
+        sys.modules["wx"] = fake_wx
+        sys.modules["wx.html"] = fake_html
+        sys.modules["wx.html2"] = fake_html2
+        sys.modules.pop("kicad_plugin.ui.panel", None)
+
+        panel = importlib.import_module("kicad_plugin.ui.panel")
+        assert panel._WX_AVAILABLE  # noqa: SLF001 - exercising the real branch
+        info = updater.UpdateInfo("0.2.9", _ZIP_URL, _SUMS_URL, updater.RELEASE_PAGE)
+
+        class _FakePanel:
+            def __init__(self) -> None:
+                self.labeled: list[str] = []
+                self.prompted: list[tuple[object, str]] = []
+
+            def _set_check_updates_enabled(self, enabled: bool) -> None:
+                pass
+
+            def _set_check_updates_label(self, version: str) -> None:
+                self.labeled.append(version)
+
+            def _prompt_upgrade(self, info: object, current: str) -> None:
+                self.prompted.append((info, current))
+
         calls: list[tuple[str, str]] = []
 
         def _unavailable(latest: str, current: str) -> bool:
@@ -254,11 +258,17 @@ def test_panel_update_branch_uses_tag_inequality(monkeypatch: pytest.MonkeyPatch
         assert fake_panel.prompted == [(info, "0.2.8")]
         assert fake_panel.labeled == ["0.2.9"]
     finally:
-        if ui_pkg is not None:
-            if saved_panel_attr is None:
-                delattr(ui_pkg, "panel")
+        for name, previous in saved_modules.items():
+            if previous is missing:
+                sys.modules.pop(name, None)
             else:
-                ui_pkg.panel = saved_panel_attr  # type: ignore[attr-defined]
+                sys.modules[name] = previous  # type: ignore[assignment]
+        current_ui_pkg = sys.modules.get("kicad_plugin.ui")
+        if current_ui_pkg is not None:
+            if saved_panel_attr is None:
+                current_ui_pkg.__dict__.pop("panel", None)
+            else:
+                current_ui_pkg.panel = saved_panel_attr  # type: ignore[attr-defined]
 
 
 @pytest.mark.parametrize(
@@ -1096,3 +1106,14 @@ def test_install_update_rejects_unwritable_dir(
 
     assert not (plugin_dir / ".backup").exists()
     assert (plugin_dir / "__init__.py").read_text(encoding="utf-8") == "old init"
+
+
+def test_fake_wx_does_not_leak_into_sys_modules() -> None:
+    """The fake wx panel import must not become process-global state."""
+    leaked = sys.modules.get("wx")
+    assert not getattr(leaked, "__kcaa_fake_wx__", False)
+
+    from kicad_plugin.ui import panel
+
+    if importlib.util.find_spec("wx") is None:
+        assert panel._WX_AVAILABLE is False  # noqa: SLF001
