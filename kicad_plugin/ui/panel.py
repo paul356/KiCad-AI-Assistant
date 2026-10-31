@@ -2314,6 +2314,7 @@ if _WX_AVAILABLE:
             error = ""
             restored: bool | None = None
             backup_dir: str | None = None
+            outcome = None
             try:
                 import tempfile
 
@@ -2323,7 +2324,7 @@ if _WX_AVAILABLE:
                     download = updater.download_and_verify(
                         info, tmp, progress_cb=self._update_progress_cb
                     )
-                    updater.install_update(
+                    outcome = updater.install_update(
                         download.path,
                         self._plugin_dir(),
                         info.version,
@@ -2336,7 +2337,7 @@ if _WX_AVAILABLE:
                 restored = getattr(exc, "restored", None)
                 backup_dir = getattr(exc, "backup_dir", None)
                 log.error("plugin update failed: %s", exc, exc_info=True)
-            wx.CallAfter(self._on_upgrade_finished, info, error, restored, backup_dir)
+            wx.CallAfter(self._on_upgrade_finished, info, error, restored, backup_dir, outcome)
 
         def _on_upgrade_finished(
             self,
@@ -2344,6 +2345,7 @@ if _WX_AVAILABLE:
             error: str,
             restored: bool | None,
             backup_dir: str | None,
+            outcome=None,
         ) -> None:
             self._update_in_progress = False
             self._update_cancel_event = None
@@ -2369,9 +2371,17 @@ if _WX_AVAILABLE:
                 return
 
             self._set_check_updates_label(None)
-            wx.MessageBox(
+            message = (
                 f"KiCad AI Assistant was updated to version {info.version}.\n\n"
-                "Restart KiCad to apply the update.",
+                "Restart KiCad to apply the update."
+            )
+            if outcome is not None and outcome.kcaa_skipped_reason == "editable":
+                message += (
+                    "\n\nkcaa is installed in editable mode and was left unchanged "
+                    "\u2014 update it yourself if needed."
+                )
+            wx.MessageBox(
+                message,
                 "Update complete",
                 wx.OK | wx.ICON_INFORMATION,
                 self,

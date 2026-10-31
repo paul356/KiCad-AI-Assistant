@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import importlib
 import io
+import json
 import os
 from pathlib import Path, PurePosixPath
 import subprocess
@@ -170,7 +171,11 @@ def _mock_uv(
                 raise result
             if result is None:
                 return _completed(command, 1)
-            return _completed(command, 0, stdout=f"{result}\n")
+            if isinstance(result, updater.InstalledKcaa):
+                payload = {"version": result.version, "editable": result.editable}
+            else:
+                payload = {"version": str(result), "editable": False}
+            return _completed(command, 0, stdout=f"{json.dumps(payload)}\n")
         if calls is not None:
             calls.append(list(command))
         if "--dry-run" in command:
@@ -282,6 +287,33 @@ def test_panel_update_branch_uses_tag_inequality(monkeypatch: pytest.MonkeyPatch
 
         assert fake_panel.prompted == [(info, "0.2.8")]
         assert fake_panel.labeled == ["0.2.9"]
+
+        messages: list[tuple[object, ...]] = []
+        fake_wx.MessageBox = lambda *args, **kwargs: messages.append(args)  # type: ignore[attr-defined]
+
+        class _FinishedPanel:
+            _update_progress_timer = None
+            _update_progress = None
+
+            def Enable(self) -> None:
+                pass
+
+            def _set_check_updates_label(self, version: str) -> None:
+                pass
+
+        panel.AssistantPanel._on_upgrade_finished(  # noqa: SLF001
+            _FinishedPanel(),
+            info,
+            "",
+            None,
+            None,
+            updater.InstallOutcome(False, "editable"),
+        )
+
+        assert len(messages) == 1
+        assert "kcaa is installed in editable mode and was left unchanged" in str(messages[0][0])
+        assert "update it yourself if needed" in str(messages[0][0])
+        assert "Restart KiCad" in str(messages[0][0])
     finally:
         for name, previous in saved_modules.items():
             if previous is missing:
@@ -587,8 +619,9 @@ def test_install_update_skips_venv_when_kcaa_matches(
         on_probe=probes.append,
     )
 
-    updater.install_update(zip_path, plugin_dir, "0.2.9")
+    outcome = updater.install_update(zip_path, plugin_dir, "0.2.9")
 
+    assert outcome == updater.InstallOutcome(False, "already-current")
     assert calls == []
     assert len(probes) == 1
     assert probes[0][1:2] == ["-c"]
@@ -596,6 +629,88 @@ def test_install_update_skips_venv_when_kcaa_matches(
     assert (plugin_dir / "VERSION").read_text(encoding="utf-8") == "0.2.9"
     assert (plugin_dir / "__init__.py").read_text(encoding="utf-8") == "new init"
     assert not updater.has_pending_recovery(plugin_dir)
+
+
+def test_install_update_skips_editable_kcaa_even_when_version_matches(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    plugin_dir = tmp_path / "kicad_ai_assistant"
+    _write_plugin(plugin_dir)
+    zip_path = tmp_path / "release.zip"
+    zip_path.write_bytes(_release_zip())
+    calls: list[list[str]] = []
+    _mock_uv(
+        monkeypatch,
+        uv_available=False,
+        calls=calls,
+        probe_results=[updater.InstalledKcaa("0.2.9", editable=True)],
+    )
+
+    outcome = updater.install_update(zip_path, plugin_dir, "0.2.9")
+
+    assert outcome == updater.InstallOutcome(False, "editable")
+    assert calls == []
+    assert (plugin_dir / "VERSION").read_text(encoding="utf-8") == "0.2.9"
+    assert (plugin_dir / "__init__.py").read_text(encoding="utf-8") == "new init"
+    assert not updater.has_pending_recovery(plugin_dir)
+
+
+def test_install_update_never_replaces_editable_kcaa_with_other_version(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    plugin_dir = tmp_path / "kicad_ai_assistant"
+    _write_plugin(plugin_dir)
+    zip_path = tmp_path / "release.zip"
+    zip_path.write_bytes(_release_zip())
+    calls: list[list[str]] = []
+    _mock_uv(
+        monkeypatch,
+        uv_available=False,
+        calls=calls,
+        probe_results=[updater.InstalledKcaa("0.2.8", editable=True)],
+    )
+
+    outcome = updater.install_update(zip_path, plugin_dir, "0.2.9")
+
+    assert outcome == updater.InstallOutcome(False, "editable")
+    assert calls == []
+    assert (plugin_dir / "VERSION").read_text(encoding="utf-8") == "0.2.9"
+    assert (plugin_dir / "__init__.py").read_text(encoding="utf-8") == "new init"
+    assert not updater.has_pending_recovery(plugin_dir)
+
+
+@pytest.mark.parametrize(
+    ("direct_url", "editable"),
+    [
+        (None, False),
+        ("{not json", False),
+        ('{"url": "file:///x", "dir_info": {"editable": true}}', True),
+        ('{"url": "file:///x", "dir_info": {"editable": false}}', False),
+    ],
+)
+def test_probe_script_detects_editable_direct_url(
+    tmp_path: Path, direct_url: str | None, editable: bool
+) -> None:
+    dist = tmp_path / "kcaa-0.2.9.dist-info"
+    dist.mkdir()
+    (dist / "METADATA").write_text(
+        "Metadata-Version: 2.1\nName: kcaa\nVersion: 0.2.9\n",
+        encoding="utf-8",
+    )
+    if direct_url is not None:
+        (dist / "direct_url.json").write_text(direct_url, encoding="utf-8")
+    completed = subprocess.run(
+        [sys.executable, "-S", "-c", updater._KVAA_PROBE_SCRIPT],
+        capture_output=True,
+        text=True,
+        check=True,
+        cwd=tmp_path,
+        env={**os.environ, "PYTHONPATH": str(tmp_path)},
+    )
+
+    payload = json.loads(completed.stdout)
+
+    assert payload == {"version": "0.2.9", "editable": editable}
 
 
 def test_install_update_installs_when_kcaa_is_older(
@@ -614,8 +729,9 @@ def test_install_update_installs_when_kcaa_is_older(
         on_probe=probes.append,
     )
 
-    updater.install_update(zip_path, plugin_dir, "0.2.9")
+    outcome = updater.install_update(zip_path, plugin_dir, "0.2.9")
 
+    assert outcome == updater.InstallOutcome(True, None)
     assert len(probes) == 2
     assert calls[0][3:4] == ["--dry-run"]
     assert any("kcaa==0.2.9" in command for command in calls)
@@ -995,7 +1111,11 @@ def test_preflight_retries_alternate_dry_run_placement(
     def _run(command, **kwargs):
         nonlocal installed
         if command[1:2] == ["-c"]:
-            return _completed(command, 0, stdout=f"{installed}\n")
+            return _completed(
+                command,
+                0,
+                stdout=json.dumps({"version": installed, "editable": False}) + "\n",
+            )
         calls.append(list(command))
         if "--dry-run" in command and command[3] == "--dry-run":
             return _completed(command, 2, stderr="error: unexpected argument '--dry-run' found")
@@ -1037,7 +1157,11 @@ def test_preflight_skips_when_uv_rejects_dry_run(
     def _run(command, **kwargs):
         nonlocal installed
         if command[1:2] == ["-c"]:
-            return _completed(command, 0, stdout=f"{installed}\n")
+            return _completed(
+                command,
+                0,
+                stdout=json.dumps({"version": installed, "editable": False}) + "\n",
+            )
         calls.append(list(command))
         if "--dry-run" in command:
             return _completed(command, 2, stderr="error: unexpected argument '--dry-run' found")
