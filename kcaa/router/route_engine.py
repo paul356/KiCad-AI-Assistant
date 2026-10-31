@@ -748,9 +748,11 @@ def route_engine(
         # at 90 degrees, which every direction-only guard above accepts.
         # Shoulder them after stub coalescing (so the passes do not fight
         # over the same vertices); a candidate is kept only when it is
-        # family-clean, has no sub-width segment and passes the copper
-        # audit.  Manhattan corner modes are excluded: 90 degrees is the
-        # intended output there.
+        # family-clean, introduces no sub-width segment and passes the
+        # copper audit.  Manhattan corner modes are excluded: 90 degrees
+        # is the intended output there.  The pass tries more than one
+        # shoulder offset per corner (see ``_shoulder_family_corners``),
+        # so a short leg does not silently leave the corner in place.
         if corner_mode in (CornerMode.MITERED_45, CornerMode.ROUNDED_45):
             shouldered = _shoulder_family_corners(
                 out_path, route_hulls, track_width, board_limit=board_limit
@@ -1133,22 +1135,37 @@ def _shoulder_family_corners(
     slides the straight passage sideways by the shoulder offset, which
     is exactly the missing "merge-obtuse / merge-step" optimizer move.
 
-    ``t`` is the largest offset the two legs allow, capped at
-    ``width / sqrt(2)`` so a *standalone* shoulder is never shorter than
-    the track width.  When a leg is shorter than the cap the cut point
-    lands on the adjacent vertex; if the following segment is collinear
+    ``t`` is chosen per corner from the offsets the two legs allow, and
+    each candidate is judged solely by the emitted geometry: try
+    ``min(t_cap, l1, l2)`` first (the smallest shoulder that is a full
+    track width when standalone), then ``min(l1, l2)`` (consume the
+    short leg so no sub-width remainder is left).  A candidate whose
+    leftover leg is narrower than the track is rejected by
+    ``_new_segments_wide`` and the next offset is tried — the offset
+    itself is never used as a legality proxy.  When a leg is consumed
+    down to its adjacent vertex and the following segment is collinear
     with the bisector (the J3 pad geometry, where the shoulder rides
     the hull's 45-degree chamfer) the family merge absorbs that vertex
-    and the emitted diagonal grows past the cap instead of emitting a
+    and the emitted diagonal grows past ``t_cap`` instead of emitting a
     sub-width stub.
+
+    Scope boundary: this is an *inward* cut — the bisector replaces the
+    corner on the side the turn wraps around.  When that side is
+    occupied by the hull (a walkaround entering a flat edge and turning
+    around the hull), an inward cut runs into the hull: ``_seg_clear``
+    rejects that candidate, and when no legal offset remains the corner
+    is left in place.  The pass removes every 90-degree corner that has
+    a free shoulder, not every such corner; an occupied inside is a
+    walkaround-geometry limitation, not a shouldering bug.
 
     A shoulder is accepted only when the whole polyline stays on the
     family, both new turns are <= 45 degrees, every *new* segment is at
-    least ``width`` long, the bisector stays clear of ``hulls`` (which
-    already carry the route margin, boundary riding allowed like the
-    walkaround), and the result stays inside ``board_limit``.  A corner
-    whose shoulder fails any test is left untouched, so this pass is
-    strictly an improvement or a no-op — the same policy as
+    least ``width`` long (pre-existing short segments are exempt, as
+    before), the bisector stays clear of ``hulls`` (which already carry
+    the route margin, boundary riding allowed like the walkaround), and
+    the result stays inside ``board_limit``.  A corner whose shoulder
+    fails every candidate is left untouched, so this pass is strictly
+    an improvement or a no-op — the same policy as
     ``_coalesce_stub_pairs``; the caller's final copper audit remains
     the DRC gate.
     """
@@ -1177,16 +1194,29 @@ def _shoulder_family_corners(
         line = LineString([p, q])
         return not any(line.intersects(h) and not line.touches(h) for h in hulls)
 
-    def _key(p: tuple[float, float]) -> tuple[float, float]:
-        return (round(p[0], 6), round(p[1], 6))
+    def _seg_key(
+        a: tuple[float, float], b: tuple[float, float]
+    ) -> tuple[tuple[float, float], tuple[float, float]]:
+        ka = (round(a[0], 6), round(a[1], 6))
+        kb = (round(b[0], 6), round(b[1], 6))
+        return (ka, kb) if ka <= kb else (kb, ka)
+
+    # Segments that were already short in the *input* are exempt from the
+    # width floor (the pass inherits them; it must not create new ones).
+    # Accepted shoulders only ever add segments that passed the floor,
+    # so this set never needs to grow as ``out`` changes.
+    short_existing = {
+        _seg_key(a, b)
+        for a, b in zip(out, out[1:])
+        if math.hypot(b[0] - a[0], b[1] - a[1]) < width - 1e-9
+    }
 
     def _new_segments_wide(cand: list[tuple[float, float]]) -> bool:
         """Every segment this shoulder introduced is >= track width."""
-        existing = {frozenset((_key(a), _key(b))) for a, b in zip(out, out[1:])}
         for a, b in zip(cand, cand[1:]):
-            if frozenset((_key(a), _key(b))) in existing:
+            if math.hypot(b[0] - a[0], b[1] - a[1]) >= width - 1e-9:
                 continue
-            if math.hypot(b[0] - a[0], b[1] - a[1]) < width - 1e-9:
+            if _seg_key(a, b) not in short_existing:
                 return False
         return True
 
@@ -1213,42 +1243,61 @@ def _shoulder_family_corners(
             continue
         ex, ey = (b[0] - a[0]) / l1, (b[1] - a[1]) / l1
         xx, xy = (c[0] - b[0]) / l2, (c[1] - b[1]) / l2
-        t = min(t_cap, l1, l2)
-        a2 = (b[0] - ex * t, b[1] - ey * t)
-        c2 = (b[0] + xx * t, b[1] + xy * t)
 
-        # Cut point on the entry leg.  When it coincides with ``a`` the
-        # leg is fully consumed and ``a`` becomes the shoulder vertex:
-        # the turn there now runs from the outer neighbour to the
-        # bisector, so re-check it.
-        if abs(a2[0] - a[0]) <= 1e-9 and abs(a2[1] - a[1]) <= 1e-9:
-            if i >= 2 and _turn(out[i - 2], a, c2) > 45.0 + 1e-6:
-                i += 1
-                continue
-        elif _turn(a, a2, c2) > 45.0 + 1e-6:
-            i += 1
-            continue
-        # Same on the exit leg.
-        if abs(c2[0] - c[0]) <= 1e-9 and abs(c2[1] - c[1]) <= 1e-9:
-            if i + 2 < len(out) and _turn(a2, c, out[i + 2]) > 45.0 + 1e-6:
-                i += 1
-                continue
-        elif _turn(a2, c2, c) > 45.0 + 1e-6:
-            i += 1
-            continue
+        # Candidate offsets, smallest first.  Only offsets that cut back
+        # *within* both legs are considered: t > l1/l2 would push the
+        # cut point beyond the adjacent vertex and turn the shoulder into
+        # a backtrack.  The width floor decides whether an offset is
+        # usable; t_cap is only the first guess, not a legality cap.
+        offsets: list[float] = []
+        for t in (min(t_cap, l1, l2), min(l1, l2)):
+            if t > 1e-9 and t <= l1 + 1e-9 and t <= l2 + 1e-9:
+                if not any(abs(t - u) <= 1e-9 for u in offsets):
+                    offsets.append(t)
 
-        cand = _dedupe(out[:i] + [a2, c2] + out[i + 1 :])
-        cand = _merge_family_chain(cand)
-        if (
-            not _line_is_family(cand)
-            or not _seg_clear(a2, c2)
-            or not _new_segments_wide(cand)
-            or (board_limit is not None and not _line_in_board(cand, board_limit))
-        ):
+        cand: list[tuple[float, float]] | None = None
+        for t in offsets:
+            a2 = (b[0] - ex * t, b[1] - ey * t)
+            c2 = (b[0] + xx * t, b[1] + xy * t)
+
+            # Cut point on the entry leg.  When it coincides with ``a``
+            # the leg is fully consumed and ``a`` becomes the shoulder
+            # vertex: the turn there now runs from the outer neighbour to
+            # the bisector, so re-check it.
+            if abs(a2[0] - a[0]) <= 1e-9 and abs(a2[1] - a[1]) <= 1e-9:
+                if i >= 2 and _turn(out[i - 2], a, c2) > 45.0 + 1e-6:
+                    continue
+            elif _turn(a, a2, c2) > 45.0 + 1e-6:
+                continue
+            # Same on the exit leg.
+            if abs(c2[0] - c[0]) <= 1e-9 and abs(c2[1] - c[1]) <= 1e-9:
+                if i + 2 < len(out) and _turn(a2, c, out[i + 2]) > 45.0 + 1e-6:
+                    continue
+            elif _turn(a2, c2, c) > 45.0 + 1e-6:
+                continue
+
+            trial = _dedupe(out[:i] + [a2, c2] + out[i + 1 :])
+            trial = _merge_family_chain(trial)
+            if (
+                not _line_is_family(trial)
+                or not _seg_clear(a2, c2)
+                or not _new_segments_wide(trial)
+                or (board_limit is not None and not _line_in_board(trial, board_limit))
+            ):
+                continue
+            cand = trial
+            break
+        if cand is None:
             i += 1
             continue
         out = cand
         i = max(1, i - 1)  # the merge may have moved the neighbourhood
+
+    # A fully-consumed leg can replace the last vertex by its recomputed
+    # cut point (equal to the input endpoint up to float noise); pin the
+    # physical anchors exactly.
+    out[0] = (pts[0][0], pts[0][1])
+    out[-1] = (pts[-1][0], pts[-1][1])
     return out
 
 
