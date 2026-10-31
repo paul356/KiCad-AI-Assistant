@@ -19,10 +19,16 @@ when the venv does not already contain the target ``kcaa`` version, refreshes
 its install atomically.  A matching ``kcaa`` version is left untouched, so a
 plugin-only upgrade works offline.  An editable ``kcaa`` install is also left
 untouched: replacing it with a wheel would silently detach the user's source
-tree, so the plugin tree upgrades while the venv step is skipped.  Otherwise a
-pre-flight dry-run catches dependency/index errors before the plugin tree is
-touched, and the installed version is re-probed afterwards.  An
-``.incomplete`` marker keeps a crashed install recoverable.
+tree, so the plugin tree upgrades while the venv step is skipped.  Editable
+detection follows PEP 610 only: ``direct_url.json`` with
+``dir_info.editable`` set to true.  Legacy ``setup.py develop`` installs
+(``.egg-link``, no ``direct_url.json``) and probe failures (missing
+venv/python, non-zero exit, timeout, unparseable output) are reported as
+non-editable.  Unknown therefore defaults to installing, which replaces a
+legacy editable install with a wheel; such users must manage ``kcaa``
+themselves.  Otherwise a pre-flight dry-run catches dependency/index errors
+before the plugin tree is touched, and the installed version is re-probed
+afterwards.  An ``.incomplete`` marker keeps a crashed install recoverable.
 """
 
 from __future__ import annotations
@@ -893,7 +899,7 @@ def install_update(
     *,
     cancel_event: Event | None = None,
     expected_sha256: str | None = None,
-) -> None:
+) -> InstallOutcome:
     """Install a release zip over the plugin directory.
 
     Refuses git checkouts, unwritable directories, and leftovers from an
@@ -902,13 +908,23 @@ def install_update(
     are never replaced: the plugin tree still upgrades, but uv and the venv
     step are skipped.  Otherwise, if the version differs from ``new_version``,
     it requires uv and runs a dry-run install; if it already matches, both are
-    skipped so a plugin-only upgrade works offline.  It then backs up the
-    plugin tree, replaces it, verifies VERSION, and updates ``kcaa`` only when
-    needed, re-probing afterwards.  The tree is restored on failure; if the
-    venv step fails after the swap, the error says the plugin files were
-    restored but the package update did not complete.  Returns an
-    :class:`InstallOutcome` describing whether ``kcaa`` was updated or why it
-    was skipped.  Pass ``expected_sha256`` to re-verify a zip obtained outside
+    skipped so a plugin-only upgrade works offline.  Skipping the venv command
+    also means dependency resolution is not re-run, so a damaged dependency
+    set is not repaired by an update; rerun ``setup_plugin.sh`` for a full
+    reinstall.  It then backs up the plugin tree, replaces it, verifies
+    VERSION, and updates ``kcaa`` only when needed, re-probing afterwards.
+    The tree is restored on failure; if the venv step fails after the swap,
+    the error says the plugin files were restored but the package update did
+    not complete.
+
+    Returns:
+        An :class:`InstallOutcome`.  ``kcaa_updated`` is true only after a
+        successful venv package refresh.  ``kcaa_skipped_reason`` is
+        ``"editable"`` when the venv install is editable and left for the
+        user, ``"already-current"`` when the installed version already
+        matches, and ``None`` after a successful refresh.
+
+    Pass ``expected_sha256`` to re-verify a zip obtained outside
     :func:`download_and_verify`.
     """
     plugin_dir = Path(plugin_dir)
