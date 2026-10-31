@@ -93,6 +93,13 @@ def _elide_tool_result_image(result: Any) -> Any:
     return out
 
 
+def _should_offer_update(latest: str, current: str) -> bool:
+    """Panel-side decision: offer an upgrade when the release tag differs."""
+    from .. import updater
+
+    return updater.is_update_available(latest, current)
+
+
 if _WX_AVAILABLE:
 
     class _FileDropTarget(wx.FileDropTarget):
@@ -2158,9 +2165,7 @@ if _WX_AVAILABLE:
                     )
                 return
 
-            from .. import updater
-
-            if not updater.is_newer(info.version, current):
+            if not _should_offer_update(info.version, current):
                 if manual:
                     wx.MessageBox(
                         f"You are running the latest version ({current}).",

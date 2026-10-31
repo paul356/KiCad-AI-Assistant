@@ -3,6 +3,10 @@
 Pure logic only: this module NEVER imports wx.  The panel owns every dialog
 and marshals results back onto the GUI thread with ``wx.CallAfter``.
 
+Update detection is tag inequality: GitHub's ``/releases/latest`` returns the
+newest non-draft, non-prerelease release by publish time, so a different
+release tag means an upgrade is available.
+
 The update payload is the release zip (``kicad_ai_assistant.zip``) published
 by ``make dist-plugin`` together with a ``SHA256SUMS`` asset.  Installation
 replaces the plugin tree (backed up beforehand and restored on failure) and
@@ -33,13 +37,6 @@ from time import monotonic
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 import zipfile
-
-try:  # KiCad's bundled Python may not ship packaging.
-    from packaging.version import InvalidVersion as _InvalidVersion
-    from packaging.version import Version as _PackagingVersion
-except ImportError:  # pragma: no cover - exercised only without packaging
-    _InvalidVersion = None
-    _PackagingVersion = None
 
 log = logging.getLogger(__name__)
 
@@ -93,8 +90,6 @@ _ALLOWED_UPDATE_HOSTS = frozenset(
     }
 )
 
-_VersionKey = tuple[int, tuple[int, ...], int, int, int, int, int, int]
-
 
 class UpdateError(RuntimeError):
     """A user-facing update failure.
@@ -132,95 +127,28 @@ class UpdateInfo:
 # ---------------------------------------------------------------------------
 
 
-def _pep440_key(version) -> _VersionKey:
-    """Build a total-order key from a packaging ``Version``."""
-    release = list(version.release)
-    while len(release) > 1 and release[-1] == 0:
-        release.pop()
-    pre = version.pre
-    post = version.post
-    dev = version.dev
-    if pre is not None:
-        phase = -2
-        label_rank = {"a": 0, "b": 1, "rc": 2}.get(pre[0], 3)
-        pre_num = pre[1]
-    elif post is not None:
-        phase = 1
-        label_rank = 0
-        pre_num = 0
-    elif dev is not None:
-        phase = -3
-        label_rank = 0
-        pre_num = 0
-    else:
-        phase = 0
-        label_rank = 0
-        pre_num = 0
-    return (
-        version.epoch,
-        tuple(release),
-        phase,
-        label_rank,
-        pre_num,
-        post if post is not None else 0,
-        # A dev release sorts below the same version without one.
-        0 if dev is None else -1,
-        dev if dev is not None else 0,
-    )
-
-
-def _fallback_version_key(raw: str) -> _VersionKey:
-    """Order versions packaging cannot parse (e.g. ``0.2.4-bugfix3``)."""
-    match = re.match(r"^(\d+(?:\.\d+)*)(.*)$", raw)
-    if match is None:
-        return (0, (), 0, 0, 0, 0, 0, 0)
-    release = [int(part) for part in match.group(1).split(".")]
-    while len(release) > 1 and release[-1] == 0:
-        release.pop()
-    suffix = match.group(2).strip(".-_")
-    if not suffix:
-        return (0, tuple(release), 0, 0, 0, 0, 0, 0)
-    token = re.match(r"^([A-Za-z]+)?(\d+)?$", suffix)
-    if token is None:
-        return (0, tuple(release), 1, 0, 0, 0, 0, 0)
-    label = (token.group(1) or "").lower()
-    number = int(token.group(2)) if token.group(2) else 0
-    pre_labels = {
-        "a": 0,
-        "alpha": 0,
-        "b": 1,
-        "beta": 1,
-        "c": 2,
-        "pre": 2,
-        "preview": 2,
-        "rc": 2,
-    }
-    if label in pre_labels:
-        return (0, tuple(release), -2, pre_labels[label], number, 0, 0, 0)
-    if label == "dev":
-        return (0, tuple(release), -3, 0, 0, 0, -1, number)
-    # post/rev/r and repo tags such as ``-bugfix3`` all order after the
-    # plain release; their number breaks the tie.
-    return (0, tuple(release), 1, 0, 0, number, 0, 0)
-
-
-def _parse_version(text: str) -> _VersionKey:
-    """Return a comparable key, normalising ``v`` prefixes and ``+local``."""
-    raw = str(text).strip()
+def _normalize_version(text: object) -> str:
+    """Strip whitespace, one leading ``v``, and a PEP 440 ``+local`` segment."""
+    raw = str(text or "").strip()
     if raw[:1] in ("v", "V"):
         raw = raw[1:]
-    raw = raw.split("+", 1)[0]
-    if _PackagingVersion is not None:
-        try:
-            return _pep440_key(_PackagingVersion(raw))
-        except _InvalidVersion:
-            pass
-    return _fallback_version_key(raw)
+    return raw.split("+", 1)[0].strip()
 
 
-def is_newer(candidate: str, current: str) -> bool:
-    """Return True when ``candidate`` is a strictly newer version."""
-    return _parse_version(candidate) > _parse_version(current)
+def is_update_available(latest: str, current: str) -> bool:
+    """True when the latest release tag differs from the installed version.
+
+    GitHub's ``/releases/latest`` is the newest non-draft, non-prerelease
+    release by publish time, so tag inequality is the update rule.  Known
+    limitation: a local build newer than the latest published release (for
+    example a development build) is offered a "downgrade"; that trade-off
+    keeps the check simple and avoids version-ordering edge cases.
+    """
+    latest_norm = _normalize_version(latest).lower()
+    current_norm = _normalize_version(current).lower()
+    if not latest_norm or not current_norm:
+        return False
+    return latest_norm != current_norm
 
 
 def current_version(plugin_dir: str | os.PathLike[str]) -> str:
@@ -298,8 +226,7 @@ def _update_from_release(data: object) -> UpdateInfo | None:
     # segment (``v0.2.9+build`` -> ``0.2.9``).  install_update() validates
     # strictly and rejects ``+``, so the release path must never offer a
     # version it cannot install.  Non-local suffixes such as ``-rc1`` stay.
-    tag = str(data.get("tag_name") or "").strip().lstrip("vV")
-    version = tag.split("+", 1)[0].strip()
+    version = _normalize_version(data.get("tag_name"))
     if not version:
         return None
     assets = data.get("assets")

@@ -159,23 +159,36 @@ def _mock_uv(
     monkeypatch.setattr(updater.subprocess, "run", _run)
 
 
-# 1. Version comparison ----------------------------------------------------------
+# 1. Update detection ------------------------------------------------------------
 
 
-def test_version_comparison_handles_prefix_suffix_and_pep440() -> None:
-    assert updater.is_newer("0.2.9", "0.2.8")
-    assert updater.is_newer("v0.2.9", "0.2.8")
-    assert not updater.is_newer("0.2.9", "v0.2.9")
-    assert not updater.is_newer("0.2.8", "0.2.9")
-    # Repo tags such as v0.2.4-bugfix3 must order numerically.
-    assert updater.is_newer("0.2.4-bugfix3", "0.2.4-bugfix2")
-    assert not updater.is_newer("0.2.4-bugfix2", "0.2.4-bugfix3")
-    # A release candidate is older than the final release.
-    assert updater.is_newer("0.2.9", "0.2.9-rc1")
-    assert not updater.is_newer("0.2.9-rc1", "0.2.9")
-    # Local versions are ignored for comparison.
-    assert not updater.is_newer("0.2.9+abc", "0.2.9")
-    assert updater.is_newer("0.2.9", "0.2.8+abc")
+@pytest.mark.parametrize(
+    ("latest", "current", "expected"),
+    [
+        ("0.2.9", "0.2.9", False),
+        ("v0.2.9", "0.2.9", False),
+        ("0.2.9+abc", "0.2.9", False),
+        ("0.2.9", "0.2.8", True),
+        ("0.2.4-bugfix2", "0.2.4-bugfix1", True),
+        ("", "0.2.9", False),
+        ("0.2.9", "", False),
+        ("   ", "0.2.9", False),
+        ("v+", "0.2.9", False),
+        ("0.2.9", "  v0.2.9+local  ", False),
+        ("0.2.9-RC1", "0.2.9-rc1", False),
+    ],
+)
+def test_is_update_available_compares_normalized_tags(
+    latest: str, current: str, expected: bool
+) -> None:
+    assert updater.is_update_available(latest, current) is expected
+
+
+def test_panel_update_branch_uses_tag_inequality() -> None:
+    from kicad_plugin.ui import panel
+
+    assert panel._should_offer_update("0.2.9", "0.2.8") is True
+    assert panel._should_offer_update("v0.2.9+local", "0.2.9") is False
 
 
 @pytest.mark.parametrize(
@@ -300,7 +313,7 @@ def test_update_from_release_drops_pep440_local_segment() -> None:
 
     assert info is not None
     assert info.version == "0.2.9"
-    assert updater.is_newer(info.version, "0.2.8")
+    assert updater.is_update_available(info.version, "0.2.8")
     assert updater._validate_version(info.version) == "0.2.9"
 
 
