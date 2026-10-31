@@ -1162,7 +1162,9 @@ def _shoulder_family_corners(
     family, both new turns are <= 45 degrees, every *new* segment is at
     least ``width`` long (pre-existing short segments are exempt, as
     before), the bisector stays clear of ``hulls`` (which already carry
-    the route margin, boundary riding allowed like the walkaround), and
+    the route margin; boundary contact and float-ulp overlap are allowed,
+    only penetration beyond a nanometre is rejected, as with the
+    walkaround), and
     the result stays inside ``board_limit``.  A corner whose shoulder
     fails every candidate is left untouched, so this pass is strictly
     an improvement or a no-op — the same policy as
@@ -1190,9 +1192,30 @@ def _shoulder_family_corners(
         cos_t = (v1x * v2x + v1y * v2y) / (l1 * l2)
         return math.degrees(math.acos(max(-1.0, min(1.0, cos_t))))
 
+    # Boundary riding is legal: the walkaround places segments on the
+    # hull margin, and a shoulder diagonal may ride a hull's 45-degree
+    # chamfer.  Comparing against the exact hull cannot distinguish "on
+    # the boundary" from "a float ulp inside" (``touches`` flips on the
+    # latter), so shrink each hull by ``penetration_eps`` and reject only
+    # overlap that survives the erosion.  The ``intersects`` probe keeps
+    # the common far-from-hull comparison cheap.
+    penetration_eps = 1e-9
+    eroded_hulls = [h.buffer(-penetration_eps) for h in hulls if not h.is_empty]
+
     def _seg_clear(p: tuple[float, float], q: tuple[float, float]) -> bool:
+        """True when ``p -> q`` does not cut into a hull.
+
+        Boundary contact and penetration up to ``penetration_eps`` are
+        allowed (float roundoff from the walkaround/merge placement);
+        anything that genuinely crosses the eroded hull is rejected.
+        """
         line = LineString([p, q])
-        return not any(line.intersects(h) and not line.touches(h) for h in hulls)
+        for h in eroded_hulls:
+            if h.is_empty or not h.intersects(line):
+                continue
+            if line.length - line.difference(h).length > penetration_eps:
+                return False
+        return True
 
     def _seg_key(
         a: tuple[float, float], b: tuple[float, float]

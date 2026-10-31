@@ -1149,6 +1149,58 @@ class TestFamilyCornerShouldering:
         chord = Polygon([(-0.62, -0.62), (-0.42, -0.62), (-0.42, -0.42), (-0.62, -0.42)])
         assert _shoulder_family_corners(pts, [near, chord], W) == pts
 
+    def test_bisector_grazing_a_hull_is_accepted(self):
+        # A shoulder endpoint can land ~1e-16 inside the inflated hull
+        # through float roundoff.  Boundary riding is legal (the
+        # walkaround places segments on the margin), so ``_seg_clear``
+        # must not turn that ulp into a rejected candidate.
+        from shapely.geometry import box
+
+        pts = [
+            (-2.632, 1.55),
+            (2.031, 1.55),
+            (2.031, -0.611),
+            (2.0, -0.642),
+            (2.0, -0.807),
+        ]
+        hull = _family_hull(box(2.341, -0.679, 2.641, 4.715), 0.31)
+        assert not _turns_le_45(pts)
+        out = _shoulder_family_corners(pts, [hull], W)
+        assert _turns_le_45(out)
+        assert _segments_on_45(out)
+        # The input already carries two sub-width pad stubs at the tail;
+        # only the shoulder-introduced segments are held to the floor.
+        for a, b in zip(out[:3], out[1:4]):
+            assert math.hypot(b[0] - a[0], b[1] - a[1]) >= W - 1e-9
+
+    def test_bisector_penetrating_a_hull_is_rejected(self):
+        # A visible cut into the hull must still reject the shoulder:
+        # both candidate diagonals cross it, so the corner is returned
+        # untouched (no exception, no DRC-breaking shoulder).
+        from shapely.geometry import box
+
+        pts = [(0.0, 0.0), (0.0, 0.3), (2.0, 0.3)]
+        cutting = box(0.10, 0.10, 0.30, 0.30)
+        assert _shoulder_family_corners(pts, [cutting], W) == pts
+
+    def test_boundary_riding_shoulder_is_not_penetration(self):
+        # The pass promises boundary riding.  The near candidate diagonal
+        # lies exactly on a hull edge and the wider candidate is blocked,
+        # so accepting the riding shoulder is the only way to fix the
+        # corner.  Measuring penetration against the *exact* hull counts
+        # a shared boundary edge as inside and would reject it.
+        from shapely.geometry import Polygon
+
+        pts = [(0.0, 0.0), (0.0, 1.0), (1.0, 1.0)]
+        t = W / math.sqrt(2.0)
+        riding = Polygon([(0.0, 1.0 - t), (t, 1.0), (0.4, 1.4)])
+        blocking = Polygon([(0.4, 0.4), (0.6, 0.4), (0.6, 0.6), (0.4, 0.6)])
+        out = _shoulder_family_corners(pts, [riding, blocking], W)
+        assert out != pts
+        assert _turns_le_45(out)
+        for a, b in zip(out, out[1:]):
+            assert math.hypot(b[0] - a[0], b[1] - a[1]) >= W - 1e-9
+
     def test_endpoints_are_pinned_exactly(self):
         # A fully-consumed exit leg replaces the last vertex with the
         # recomputed cut point, which can differ from the input endpoint
