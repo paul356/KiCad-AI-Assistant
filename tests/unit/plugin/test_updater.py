@@ -142,19 +142,44 @@ def _mock_uv(
     install_stderr: str = "",
     calls: list[list[str]] | None = None,
     on_install=None,
+    probe_results: list[object] | None = None,
+    on_probe=None,
+    uv_available: bool = True,
 ) -> None:
-    """Fake uv discovery and subprocess runs for pre-flight + install."""
+    """Fake uv discovery and subprocess runs for probe + pre-flight + install."""
+    probes = list(probe_results or [])
+    fake_installed: str | None = None
     monkeypatch.setattr(
         updater.shutil,
         "which",
-        lambda name: "/usr/bin/uv" if name == "uv" else None,
+        lambda name: "/usr/bin/uv" if uv_available and name == "uv" else None,
     )
 
     def _run(command, **kwargs):
+        nonlocal fake_installed
+        if command[1:2] == ["-c"]:
+            if on_probe is not None:
+                on_probe(command)
+            if probes:
+                result = probes.pop(0)
+            elif fake_installed is not None:
+                result = fake_installed
+            else:
+                result = None
+            if isinstance(result, BaseException):
+                raise result
+            if result is None:
+                return _completed(command, 1)
+            return _completed(command, 0, stdout=f"{result}\n")
         if calls is not None:
             calls.append(list(command))
         if "--dry-run" in command:
             return _completed(command, dry_run_returncode, stderr=dry_run_stderr)
+        if install_returncode == 0:
+            fake_installed = next(
+                (arg.split("==", 1)[1] for arg in command if arg.startswith("kcaa==")),
+                fake_installed,
+            )
         if on_install is not None:
             on_install(command)
         return _completed(command, install_returncode, stderr=install_stderr)
@@ -545,6 +570,111 @@ def test_install_update_preserves_root_log_files(
     assert log_file.read_text(encoding="utf-8") == "keep me"
 
 
+def test_install_update_skips_venv_when_kcaa_matches(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    plugin_dir = tmp_path / "kicad_ai_assistant"
+    _write_plugin(plugin_dir)
+    zip_path = tmp_path / "release.zip"
+    zip_path.write_bytes(_release_zip())
+    calls: list[list[str]] = []
+    probes: list[list[str]] = []
+    _mock_uv(
+        monkeypatch,
+        uv_available=False,  # an offline plugin-only upgrade must not need uv
+        calls=calls,
+        probe_results=["0.2.9"],
+        on_probe=probes.append,
+    )
+
+    updater.install_update(zip_path, plugin_dir, "0.2.9")
+
+    assert calls == []
+    assert len(probes) == 1
+    assert probes[0][1:2] == ["-c"]
+    assert "importlib.metadata" in probes[0][2]
+    assert (plugin_dir / "VERSION").read_text(encoding="utf-8") == "0.2.9"
+    assert (plugin_dir / "__init__.py").read_text(encoding="utf-8") == "new init"
+    assert not updater.has_pending_recovery(plugin_dir)
+
+
+def test_install_update_installs_when_kcaa_is_older(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    plugin_dir = tmp_path / "kicad_ai_assistant"
+    _write_plugin(plugin_dir)
+    zip_path = tmp_path / "release.zip"
+    zip_path.write_bytes(_release_zip())
+    calls: list[list[str]] = []
+    probes: list[list[str]] = []
+    _mock_uv(
+        monkeypatch,
+        calls=calls,
+        probe_results=["0.2.8", "0.2.9"],
+        on_probe=probes.append,
+    )
+
+    updater.install_update(zip_path, plugin_dir, "0.2.9")
+
+    assert len(probes) == 2
+    assert calls[0][3:4] == ["--dry-run"]
+    assert any("kcaa==0.2.9" in command for command in calls)
+    assert (plugin_dir / "VERSION").read_text(encoding="utf-8") == "0.2.9"
+
+
+def test_install_update_keeps_new_tree_when_kcaa_verification_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    plugin_dir = tmp_path / "kicad_ai_assistant"
+    _write_plugin(plugin_dir)
+    zip_path = tmp_path / "release.zip"
+    zip_path.write_bytes(_release_zip())
+    _mock_uv(monkeypatch, probe_results=["0.2.8", "0.2.8"])
+
+    with pytest.raises(updater.UpdateError, match="plugin files were updated.*kcaa") as excinfo:
+        updater.install_update(zip_path, plugin_dir, "0.2.9")
+
+    assert excinfo.value.restored is None
+    assert "not rolled back" in str(excinfo.value)
+    assert (plugin_dir / "VERSION").read_text(encoding="utf-8") == "0.2.9"
+    assert (plugin_dir / "__init__.py").read_text(encoding="utf-8") == "new init"
+    assert not updater.has_pending_recovery(plugin_dir)
+
+
+def test_install_update_installs_when_kcaa_is_missing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    plugin_dir = tmp_path / "kicad_ai_assistant"
+    _write_plugin(plugin_dir)
+    zip_path = tmp_path / "release.zip"
+    zip_path.write_bytes(_release_zip())
+    calls: list[list[str]] = []
+    _mock_uv(monkeypatch, calls=calls, probe_results=[None, "0.2.9"])
+
+    updater.install_update(zip_path, plugin_dir, "0.2.9")
+
+    assert any("kcaa==0.2.9" in command for command in calls)
+
+
+@pytest.mark.parametrize(
+    "probe_failure",
+    [OSError("probe failed"), subprocess.TimeoutExpired("python", 15.0)],
+)
+def test_install_update_installs_when_probe_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, probe_failure: Exception
+) -> None:
+    plugin_dir = tmp_path / "kicad_ai_assistant"
+    _write_plugin(plugin_dir)
+    zip_path = tmp_path / "release.zip"
+    zip_path.write_bytes(_release_zip())
+    calls: list[list[str]] = []
+    _mock_uv(monkeypatch, calls=calls, probe_results=[probe_failure, "0.2.9"])
+
+    updater.install_update(zip_path, plugin_dir, "0.2.9")
+
+    assert any("kcaa==0.2.9" in command for command in calls)
+
+
 def test_install_update_replaces_tree_updates_venv_and_keeps_backup(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -777,16 +907,13 @@ def test_install_update_requires_uv_before_changes(
     zip_path = tmp_path / "release.zip"
     zip_path.write_bytes(_release_zip())
 
-    monkeypatch.setattr(updater.shutil, "which", lambda name: None)
-    monkeypatch.setattr(
-        updater.subprocess,
-        "run",
-        lambda *a, **k: pytest.fail("subprocess must not run without uv"),
-    )
+    calls: list[list[str]] = []
+    _mock_uv(monkeypatch, uv_available=False, calls=calls)
 
     with pytest.raises(updater.UpdateError, match="uv was not found"):
         updater.install_update(zip_path, plugin_dir, "0.2.9")
 
+    assert calls == []  # no uv command ran
     assert not (plugin_dir / ".backup").exists()
     assert (plugin_dir / "__init__.py").read_text(encoding="utf-8") == "old init"
     assert (plugin_dir / "VERSION").read_text(encoding="utf-8") == "0.2.8"
@@ -863,10 +990,17 @@ def test_preflight_retries_alternate_dry_run_placement(
     zip_path.write_bytes(_release_zip())
     calls: list[list[str]] = []
 
+    installed = "0.2.8"
+
     def _run(command, **kwargs):
+        nonlocal installed
+        if command[1:2] == ["-c"]:
+            return _completed(command, 0, stdout=f"{installed}\n")
         calls.append(list(command))
         if "--dry-run" in command and command[3] == "--dry-run":
             return _completed(command, 2, stderr="error: unexpected argument '--dry-run' found")
+        if "--dry-run" not in command:
+            installed = "0.2.9"
         return _completed(command, 0)
 
     monkeypatch.setattr(
@@ -898,10 +1032,16 @@ def test_preflight_skips_when_uv_rejects_dry_run(
     zip_path.write_bytes(_release_zip())
     calls: list[list[str]] = []
 
+    installed = "0.2.8"
+
     def _run(command, **kwargs):
+        nonlocal installed
+        if command[1:2] == ["-c"]:
+            return _completed(command, 0, stdout=f"{installed}\n")
         calls.append(list(command))
         if "--dry-run" in command:
             return _completed(command, 2, stderr="error: unexpected argument '--dry-run' found")
+        installed = "0.2.9"
         return _completed(command, 0)
 
     monkeypatch.setattr(
