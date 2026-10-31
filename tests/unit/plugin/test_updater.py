@@ -7,11 +7,14 @@ install targets are temporary directories.
 from __future__ import annotations
 
 import hashlib
+import importlib
 import io
 import os
 from pathlib import Path, PurePosixPath
 import subprocess
+import sys
 import threading
+import types
 import zipfile
 
 import pytest
@@ -184,11 +187,78 @@ def test_is_update_available_compares_normalized_tags(
     assert updater.is_update_available(latest, current) is expected
 
 
-def test_panel_update_branch_uses_tag_inequality() -> None:
-    from kicad_plugin.ui import panel
+def test_panel_update_branch_uses_tag_inequality(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Execute the panel branch with a fake wx so the call site is exercised."""
 
-    assert panel._should_offer_update("0.2.9", "0.2.8") is True
-    assert panel._should_offer_update("v0.2.9+local", "0.2.9") is False
+    class _Dummy:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+    fake_wx = types.ModuleType("wx")
+    fake_html = types.ModuleType("wx.html")
+    fake_html.HtmlWindow = _Dummy  # type: ignore[attr-defined]
+    fake_html2 = types.ModuleType("wx.html2")
+    fake_html2.WebView = _Dummy  # type: ignore[attr-defined]
+    fake_wx.html = fake_html  # type: ignore[attr-defined]
+    fake_wx.html2 = fake_html2  # type: ignore[attr-defined]
+    fake_wx.__getattr__ = lambda name: _Dummy  # type: ignore[attr-defined]
+
+    ui_pkg = sys.modules.get("kicad_plugin.ui")
+    saved_panel_attr = getattr(ui_pkg, "panel", None) if ui_pkg is not None else None
+    monkeypatch.setitem(sys.modules, "wx", fake_wx)
+    monkeypatch.setitem(sys.modules, "wx.html", fake_html)
+    monkeypatch.setitem(sys.modules, "wx.html2", fake_html2)
+    monkeypatch.delitem(sys.modules, "kicad_plugin.ui.panel", raising=False)
+
+    panel = importlib.import_module("kicad_plugin.ui.panel")
+    assert panel._WX_AVAILABLE  # noqa: SLF001 - exercising the real branch
+    info = updater.UpdateInfo("0.2.9", _ZIP_URL, _SUMS_URL, updater.RELEASE_PAGE)
+
+    class _FakePanel:
+        def __init__(self) -> None:
+            self.labeled: list[str] = []
+            self.prompted: list[tuple[object, str]] = []
+
+        def _set_check_updates_enabled(self, enabled: bool) -> None:
+            pass
+
+        def _set_check_updates_label(self, version: str) -> None:
+            self.labeled.append(version)
+
+        def _prompt_upgrade(self, info: object, current: str) -> None:
+            self.prompted.append((info, current))
+
+    try:
+        calls: list[tuple[str, str]] = []
+
+        def _unavailable(latest: str, current: str) -> bool:
+            calls.append((latest, current))
+            return False
+
+        monkeypatch.setattr(updater, "is_update_available", _unavailable)
+        fake_panel = _FakePanel()
+        panel.AssistantPanel._on_update_check_done(  # noqa: SLF001
+            fake_panel, info, "0.2.8", False
+        )
+
+        assert calls == [("0.2.9", "0.2.8")]
+        assert fake_panel.prompted == []
+        assert fake_panel.labeled == []
+
+        monkeypatch.setattr(updater, "is_update_available", lambda latest, current: True)
+        fake_panel = _FakePanel()
+        panel.AssistantPanel._on_update_check_done(  # noqa: SLF001
+            fake_panel, info, "0.2.8", False
+        )
+
+        assert fake_panel.prompted == [(info, "0.2.8")]
+        assert fake_panel.labeled == ["0.2.9"]
+    finally:
+        if ui_pkg is not None:
+            if saved_panel_attr is None:
+                delattr(ui_pkg, "panel")
+            else:
+                ui_pkg.panel = saved_panel_attr  # type: ignore[attr-defined]
 
 
 @pytest.mark.parametrize(
@@ -346,6 +416,10 @@ def test_update_from_release_preserves_non_local_suffixes(tag: str, expected: st
     assert info.version == expected
 
 
+def test_update_from_release_rejects_uninstallable_tag() -> None:
+    assert updater._update_from_release(_release_data("0.2.9_final")) is None
+
+
 @pytest.mark.parametrize(
     "failure",
     [
@@ -369,10 +443,12 @@ def test_download_and_verify_accepts_matching_checksum(
     update, sums = _make_update(zip_payload)
     _fake_open(monkeypatch, {_SUMS_URL: sums.encode(), _ZIP_URL: zip_payload})
 
-    path = updater.download_and_verify(update, tmp_path)
+    download = updater.download_and_verify(update, tmp_path)
 
-    assert path == tmp_path / "kicad_ai_assistant.zip"
-    assert path.read_bytes() == zip_payload
+    assert isinstance(download, updater.VerifiedDownload)
+    assert download.path == tmp_path / "kicad_ai_assistant.zip"
+    assert download.sha256 == hashlib.sha256(zip_payload).hexdigest()
+    assert download.path.read_bytes() == zip_payload
 
 
 def test_download_and_verify_rejects_checksum_mismatch(
@@ -430,6 +506,33 @@ def test_download_stream_rejects_oversized_archive(
 
 
 # 5. Successful install ----------------------------------------------------------
+
+
+def test_verify_installed_version_normalizes_local_segment(tmp_path: Path) -> None:
+    plugin_dir = tmp_path / "plugin"
+    plugin_dir.mkdir()
+    (plugin_dir / "VERSION").write_text("0.2.9+local", encoding="utf-8")
+
+    updater._verify_installed_version(plugin_dir, "0.2.9")  # no raise
+
+    with pytest.raises(updater.UpdateError, match="does not match"):
+        updater._verify_installed_version(plugin_dir, "0.2.10")
+
+
+def test_install_update_preserves_root_log_files(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    plugin_dir = tmp_path / "kicad_ai_assistant"
+    _write_plugin(plugin_dir)
+    log_file = plugin_dir / "kicad-plugin.log"
+    log_file.write_text("keep me", encoding="utf-8")
+    zip_path = tmp_path / "release.zip"
+    zip_path.write_bytes(_release_zip())
+    _mock_uv(monkeypatch)
+
+    updater.install_update(zip_path, plugin_dir, "0.2.9")
+
+    assert log_file.read_text(encoding="utf-8") == "keep me"
 
 
 def test_install_update_replaces_tree_updates_venv_and_keeps_backup(

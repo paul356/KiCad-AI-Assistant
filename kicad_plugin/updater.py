@@ -4,8 +4,12 @@ Pure logic only: this module NEVER imports wx.  The panel owns every dialog
 and marshals results back onto the GUI thread with ``wx.CallAfter``.
 
 Update detection is tag inequality: GitHub's ``/releases/latest`` returns the
-newest non-draft, non-prerelease release by publish time, so a different
-release tag means an upgrade is available.
+newest non-draft, non-prerelease release by publish time, so any different
+release tag is offered.  A dev tree ahead of the latest release will therefore
+be offered a "downgrade".  ``0.2.9`` and ``0.2.9.0`` are different tags; an
+update loop is possible only when a hand-uploaded ``VERSION`` diverges from the
+release tag, because workflow-built releases are guarded by the CI
+tag-vs-VERSION check.
 
 The update payload is the release zip (``kicad_ai_assistant.zip``) published
 by ``make dist-plugin`` together with a ``SHA256SUMS`` asset.  Installation
@@ -57,9 +61,9 @@ _CHUNK_SIZE = 64 * 1024
 # and never taken from the update archive.
 _UNTOUCHED_DIRS = frozenset({".venv", ".backup", "__pycache__"})
 _BACKUP_IGNORES = frozenset({"*.log"})
-# Root artifacts written by setup_plugin.* that the release zip never ships.
-# They must survive both a successful update and a rollback.
-_PRESERVED_ROOT_GLOBS = ("freerouting*.jar",)
+# Root artifacts written by setup_plugin.* or runtime logs that the release
+# zip never ships.  They must survive both a successful update and a rollback.
+_PRESERVED_ROOT_GLOBS = ("freerouting*.jar", "*.log")
 # Recovery marker lives inside .backup; its content is the backup dir name.
 _INCOMPLETE_MARKER = ".incomplete"
 # Written before removing the marker so a successful install can never be
@@ -120,6 +124,14 @@ class UpdateInfo:
     zip_url: str
     checksum_url: str
     page_url: str
+
+
+@dataclass(frozen=True)
+class VerifiedDownload:
+    """A checksum-verified release archive and its SHA-256 digest."""
+
+    path: Path
+    sha256: str
 
 
 # ---------------------------------------------------------------------------
@@ -228,6 +240,11 @@ def _update_from_release(data: object) -> UpdateInfo | None:
     # version it cannot install.  Non-local suffixes such as ``-rc1`` stay.
     version = _normalize_version(data.get("tag_name"))
     if not version:
+        return None
+    try:
+        _validate_version(version)
+    except UpdateError:
+        # A tag install_update() would refuse must never be advertised.
         return None
     assets = data.get("assets")
     if not isinstance(assets, list):
@@ -369,10 +386,10 @@ def download_and_verify(
     update: UpdateInfo,
     dest_dir: str | os.PathLike[str],
     progress_cb: ProgressCallback | None = None,
-) -> Path:
+) -> VerifiedDownload:
     """Download the release zip and verify it against ``SHA256SUMS``.
 
-    Returns the path of the verified zip.  On a checksum mismatch no zip
+    Returns the verified path and digest.  On a checksum mismatch no zip
     (partial or otherwise) is left behind.
     """
     dest = Path(dest_dir)
@@ -399,7 +416,7 @@ def download_and_verify(
                 partial_path.unlink()
             except OSError:
                 log.debug("Could not remove partial download %s", partial_path)
-    return final_path
+    return VerifiedDownload(path=final_path, sha256=actual.lower())
 
 
 # ---------------------------------------------------------------------------
@@ -778,7 +795,9 @@ def _verify_installed_version(plugin_dir: Path, expected: str) -> None:
         installed = (plugin_dir / "VERSION").read_text(encoding="utf-8").strip()
     except (OSError, UnicodeDecodeError) as exc:
         raise UpdateError("Updated plugin is missing a readable VERSION file.") from exc
-    if installed != expected:
+    installed_norm = _normalize_version(installed).lower()
+    expected_norm = _normalize_version(expected).lower()
+    if not installed_norm or installed_norm != expected_norm:
         raise UpdateError(f"Updated plugin VERSION {installed!r} does not match {expected!r}.")
 
 

@@ -668,9 +668,12 @@ if _WX_AVAILABLE:
                 self._maybe_recover_interrupted_update()
             if event.IsShown() and not self._update_check_started:
                 # Silent, once-per-panel-lifetime release check.  Failures
-                # stay in the log; a found update prompts the user.
+                # stay in the log; a found update prompts the user.  Dev
+                # checkouts skip it (self-update refuses .git); the manual
+                # menu item still runs and surfaces that guard.
                 self._update_check_started = True
-                self._start_update_check(manual=False)
+                if not os.path.exists(os.path.join(self._plugin_dir(), ".git")):
+                    self._start_update_check(manual=False)
             event.Skip()
 
         # ------------------------------------------------------------------ #
@@ -2317,15 +2320,16 @@ if _WX_AVAILABLE:
                 from .. import updater
 
                 with tempfile.TemporaryDirectory(prefix="kcaa-update-") as tmp:
-                    zip_path = updater.download_and_verify(
+                    download = updater.download_and_verify(
                         info, tmp, progress_cb=self._update_progress_cb
                     )
                     updater.install_update(
-                        zip_path,
+                        download.path,
                         self._plugin_dir(),
                         info.version,
                         progress_cb=self._update_progress_cb,
                         cancel_event=self._update_cancel_event,
+                        expected_sha256=download.sha256,
                     )
             except Exception as exc:
                 error = str(exc) or exc.__class__.__name__
