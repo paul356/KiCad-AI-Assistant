@@ -516,6 +516,498 @@ def test_dense_pad_connector_covered_start_fails(tmp_path: Path, algorithm: str)
 
 
 # ---------------------------------------------------------------------------
+# #216: sub-width pad-exit stub absorbed end-to-end
+# ---------------------------------------------------------------------------
+
+_STUB_FIXTURE_START = (-3.4201679360683457, 3.7212679553332517)
+_STUB_FIXTURE_END = (4.787175092253532, 3.233789531661362)
+_STUB_FIXTURE_PADS = [
+    (2.568909405254894, 2.261991093591841, 0.5),
+    (-3.777712725048371, 0.6231032772597018, 0.25),
+    (-2.305097949850124, 3.8753303058456448, 0.15),
+]
+
+
+def _make_pad_exit_stub_board(tmp_path: Path) -> Path:
+    """R1/1 -> C1/1 with the #216 pad-exit stub geometry.
+
+    The three foreign pads are the sweep-derived fixture that makes the
+    engine finish with a 0.0875 mm vertical stub on the destination
+    anchor.  The endpoint pads are non-square so ``_replace_pad_path``
+    runs (``_is_rect`` rejects squares) and its wire can be audited for
+    an extra kink at the pad entry.
+    """
+    ax, ay = _STUB_FIXTURE_START
+    bx, by = _STUB_FIXTURE_END
+    foreign = ""
+    for i, (cx, cy, h) in enumerate(_STUB_FIXTURE_PADS):
+        foreign += f"""	(footprint "X"
+		(layer "F.Cu")
+		(at {cx} {cy} 0.0)
+		(property "Reference" "X{i + 1}")
+		(pad "1" smd rect
+			(at 0.0 0.0)
+			(size {2 * h} {2 * h})
+			(layers "F.Cu" "F.Mask")
+			(net 2 "GND")
+		)
+	)
+"""
+    pcb = f"""(kicad_pcb
+	(version 20260206)
+	(generator "pad-exit-stub-test")
+	(layers
+		(0 "F.Cu" signal)
+		(44 "Edge.Cuts" user)
+	)
+	(net 0 "")
+	(net 1 "VCC")
+	(net 2 "GND")
+	(footprint "R"
+		(layer "F.Cu")
+		(at {ax} {ay} 0.0)
+		(property "Reference" "R1")
+		(pad "1" smd rect
+			(at 0.0 0.0)
+			(size 0.8 0.3)
+			(layers "F.Cu" "F.Mask")
+			(net 1 "VCC")
+		)
+	)
+	(footprint "C"
+		(layer "F.Cu")
+		(at {bx} {by} 0.0)
+		(property "Reference" "C1")
+		(pad "1" smd rect
+			(at 0.0 0.0)
+			(size 0.8 0.3)
+			(layers "F.Cu" "F.Mask")
+			(net 1 "VCC")
+		)
+	)
+{foreign}	(gr_rect
+		(start -10.0 -10.0)
+		(end 10.0 10.0)
+		(stroke (width 0.1) (type solid))
+		(fill none)
+		(layer "Edge.Cuts")
+	)
+)
+"""
+    path = tmp_path / "stub.kicad_pcb"
+    path.write_text(pcb)
+    _write_min_pro(path, clearance=0.2)
+    return path
+
+
+def _turn_degrees(a, b, c) -> float:
+    v1 = (b[0] - a[0], b[1] - a[1])
+    v2 = (c[0] - b[0], c[1] - b[1])
+    l1 = math.hypot(*v1)
+    l2 = math.hypot(*v2)
+    if l1 < 1e-12 or l2 < 1e-12:
+        return 0.0
+    cos_t = (v1[0] * v2[0] + v1[1] * v2[1]) / (l1 * l2)
+    return math.degrees(math.acos(max(-1.0, min(1.0, cos_t))))
+
+
+def test_pad_exit_stub_absorbed_through_full_router(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The absorbed stub survives the pad-wire replacement cleanly.
+
+    The engine's pre-pass path ends with a 0.0875 mm vertical stub; the
+    absorption slides the horizontal run onto the destination anchor.
+    After ``_replace_pad_path`` / ``_align_path_endpoints`` the written
+    route must still start and end exactly on the pad centres, stay on
+    the 0/45/90 family, and keep every segment at full track width —
+    no 45-degree kink re-introduced at the pad entry."""
+    import kcaa.router.route_engine as route_engine_module
+
+    pcb = _make_pad_exit_stub_board(tmp_path)
+    recorded: list[tuple[list, list]] = []
+    real_absorb = route_engine_module._absorb_terminal_stubs
+
+    def recording_absorb(pts, *args, **kwargs):
+        out = real_absorb(pts, *args, **kwargs)
+        if list(out) != list(pts):
+            recorded.append((list(pts), list(out)))
+        return out
+
+    monkeypatch.setattr(route_engine_module, "_absorb_terminal_stubs", recording_absorb)
+
+    res = auto_route_pair(
+        RouteRequest(
+            pcb_path=str(pcb),
+            ref_a="R1",
+            pad_a="1",
+            ref_b="C1",
+            pad_b="1",
+            net="VCC",
+            width=0.2,
+            algorithm="pns",
+            via_pairs=(),
+        )
+    )
+
+    # The engine really did emit the stub the pass exists to remove.
+    assert recorded, "fixture no longer reproduces the pad-exit stub"
+    pre, post = recorded[0]
+    assert math.hypot(pre[-1][0] - pre[-2][0], pre[-1][1] - pre[-2][1]) == pytest.approx(
+        0.08747842367188996, abs=1e-9
+    )
+    assert post[-1] == pre[-1]
+
+    segs = [(s.x1, s.y1, s.x2, s.y2) for s in res.segments]
+    assert len(segs) == 2
+    pts = [(segs[0][0], segs[0][1])] + [(s[2], s[3]) for s in segs]
+    assert pts[0] == pytest.approx(_STUB_FIXTURE_START)
+    assert pts[-1] == pytest.approx(_STUB_FIXTURE_END)
+    for a, b in zip(pts, pts[1:]):
+        dx, dy = abs(b[0] - a[0]), abs(b[1] - a[1])
+        assert dx < 1e-9 or dy < 1e-9 or abs(dx - dy) < 1e-9
+        assert math.hypot(dx, dy) >= 0.2 - 1e-9
+    # One interior turn only, and it is the 45-degree family corner.
+    assert len(pts) - 2 == 1
+    assert _turn_degrees(*pts) == pytest.approx(45.0, abs=1e-6)
+
+
+def test_leg_boundary_merge_runs_on_the_concatenated_chain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#217 at router level: the merge sees the whole leg chain.
+
+    The staircase the issue reports spans a leg boundary (leg N ends at
+    the waypoint, leg N+1 starts from it), so the engine's per-leg pass
+    cannot reach it.  The router concatenates the legs and runs the same
+    module-level pass once per layer run, handing it the waypoint
+    anchors and the layer's clearance hulls; the returned chain is what
+    the emitted segments are built from.
+    """
+    import kcaa.router.router as router_module
+
+    calls: list[dict] = []
+    real_merge = router_module.merge_parallel_diagonals
+
+    def recording_merge(pts, hulls, width, **kwargs):
+        out = real_merge(pts, hulls, width, **kwargs)
+        calls.append({"pts": list(pts), "hulls": list(hulls), "width": width, **kwargs})
+        return out
+
+    monkeypatch.setattr(router_module, "merge_parallel_diagonals", recording_merge)
+    result = _route_clear(
+        {
+            "algorithm": "pns",
+            "waypoints": [
+                {"kind": "waypoint", "pos": (40.0, 31.0), "tol_mm": 0.0},
+                {"kind": "waypoint", "pos": (50.0, 33.0), "tol_mm": 0.25},
+                {"kind": "waypoint", "pos": (55.0, 36.0), "tol_mm": 0.5},
+            ],
+        },
+        tmp_path,
+    )
+
+    assert len(calls) == 1, "one merge call per layer run"
+    call = calls[0]
+    assert call["width"] == pytest.approx(0.2)
+    # Waypoint anchors travel with their tolerances, keeping the pin
+    # semantics: a candidate may not push a waypoint off its circle.
+    assert call["anchors"] == [
+        ((40.0, 31.0), 0.0),
+        ((50.0, 33.0), 0.25),
+        ((55.0, 36.0), 0.5),
+    ]
+    assert call["keep_anchor_vertices"] is True
+    assert call["board_limit"] is not None
+    assert call["pts"][0] == pytest.approx((29.5, 30.0))
+    assert call["pts"][-1] == pytest.approx((60.0, 39.5))
+    # Every waypoint is still on the emitted centerline.
+    pts = _route_polyline_sampled(result)
+    for wpt in ((40.0, 31.0), (50.0, 33.0), (55.0, 36.0)):
+        assert _point_polyline_distance(pts, wpt) <= 0.5 + 1e-6
+
+    # End-to-end shape: the leg-boundary staircases are gone (the three
+    # walks would otherwise emit 9 segments).  The zero-tolerance
+    # waypoint pins the first corner at (40, 31); the loose ones let the
+    # later corners slide onto the 45 runs.
+    emitted = [(s_.x1, s_.y1, s_.x2, s_.y2) for s_ in result.segments]
+    assert emitted == [
+        pytest.approx((29.5, 30.0, 39.0, 30.0)),
+        pytest.approx((39.0, 30.0, 42.0, 33.0)),
+        pytest.approx((42.0, 33.0, 52.0, 33.0)),
+        pytest.approx((52.0, 33.0, 58.5, 39.5)),
+        pytest.approx((58.5, 39.5, 60.0, 39.5)),
+    ]
+    assert _point_polyline_distance(
+        [(emitted[0][0], emitted[0][1])] + [(e[2], e[3]) for e in emitted], (40.0, 31.0)
+    ) == pytest.approx(0.0, abs=1e-9)
+
+
+def test_leg_boundary_merge_filters_same_net_copper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The merge hulls exclude the route's own net.
+
+    ``_layer_engine_obstacles`` re-adds same-net pads as transit
+    obstacles, so the mid-chain VCC pad is in the run's obstacle list.
+    Same-net copper is legal for the route to touch and the copper audit
+    exempts it, so the filter must drop it before the hulls are built —
+    without the filter the pad's hull reaches the pass (observed through
+    this hook) and can veto a legal merge.  ``_layer_engine_obstacles``
+    only ever contributes same-net *pads*, which is why the fixture pads
+    rather than traces."""
+    import kcaa.router.router as router_module
+
+    calls: list[dict] = []
+    real_hulls = router_module.family_hulls
+
+    def recording_hulls(obstacles, clearance, width, moved_pairs):
+        calls.append({"obstacles": list(obstacles)})
+        return real_hulls(obstacles, clearance, width, moved_pairs)
+
+    monkeypatch.setattr(router_module, "family_hulls", recording_hulls)
+    route = _make_mid_chain_same_net_pad_board(tmp_path)
+    auto_route_pair(
+        RouteRequest(
+            pcb_path=route,
+            ref_a="R1",
+            pad_a="1",
+            ref_b="C1",
+            pad_b="1",
+            net="VCC",
+            width=0.2,
+            via_pairs=(),
+            algorithm="pns",
+            waypoints=[
+                {"kind": "waypoint", "pos": (40.0, 31.0), "tol_mm": 0.0},
+                {"kind": "waypoint", "pos": (50.0, 33.0), "tol_mm": 0.25},
+                {"kind": "waypoint", "pos": (55.0, 36.0), "tol_mm": 0.5},
+            ],
+        )
+    )
+
+    assert len(calls) == 1, "one hull build per layer run"
+    assert [o.net for o in calls[0]["obstacles"]] == []
+
+
+def test_leg_boundary_merge_scopes_moved_pairs_per_layer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both merge call sites take the per-layer filtered moved set.
+
+    ``moved_pairs`` accumulates over every leg and layer, while this
+    run's hull build and audit are single-layer.  Regressing either call
+    site back to the raw ``moved_pairs`` is invisible in the emitted
+    route on today's fixtures (it only over-rejects), so the wiring is
+    pinned here: the set ``moved_pairs_for_layer`` returns must reach
+    ``family_hulls`` and the audit validator unchanged, and the helper
+    must be asked about this run's layer and the request net.
+    """
+    import kcaa.router.router as router_module
+
+    sentinel = [("scoped", "moved-set")]
+    seen: dict[str, object] = {}
+
+    def fake_filter(pairs, layer, net):
+        seen["filter"] = (list(pairs), layer, net)
+        return sentinel
+
+    def recording_hulls(obstacles, clearance, width, moved_pairs):
+        seen["hulls"] = moved_pairs
+        return []
+
+    def recording_audit(*, moved_pairs, **kwargs):
+        seen["audit"] = moved_pairs
+        return True
+
+    monkeypatch.setattr(router_module, "moved_pairs_for_layer", fake_filter)
+    monkeypatch.setattr(router_module, "family_hulls", recording_hulls)
+    monkeypatch.setattr(router_module, "_audit_final_copper", recording_audit)
+
+    _route_clear(
+        {
+            "algorithm": "pns",
+            "waypoints": [
+                {"kind": "waypoint", "pos": (40.0, 31.0), "tol_mm": 0.0},
+                {"kind": "waypoint", "pos": (50.0, 33.0), "tol_mm": 0.25},
+                {"kind": "waypoint", "pos": (55.0, 36.0), "tol_mm": 0.5},
+            ],
+        },
+        tmp_path,
+    )
+
+    assert seen["filter"] == ([], "F.Cu", "VCC")
+    assert seen["hulls"] is sentinel
+    assert seen["audit"] is sentinel
+
+
+def test_leg_boundary_merge_audit_vetoes_foreign_copper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The merge is judged by ``_audit_final_copper``, not only by hulls.
+
+    The hull set covers the audited clearance envelope, so this gate is
+    a safety net — it is pinned here through the call site: the audit
+    handed to the pass must accept the chain it was given and reject a
+    candidate that crosses a foreign trace."""
+    import kcaa.router.router as router_module
+
+    calls: list[dict] = []
+    real_merge = router_module.merge_parallel_diagonals
+
+    def recording_merge(pts, hulls, width, **kwargs):
+        out = real_merge(pts, hulls, width, **kwargs)
+        calls.append({"pts": list(pts), "hulls": list(hulls), **kwargs})
+        return out
+
+    monkeypatch.setattr(router_module, "merge_parallel_diagonals", recording_merge)
+    auto_route_pair(
+        RouteRequest(
+            pcb_path=_make_clear_board_with_track(tmp_path),
+            ref_a="R1",
+            pad_a="1",
+            ref_b="C1",
+            pad_b="1",
+            net="VCC",
+            width=0.2,
+            via_pairs=(),
+            algorithm="pns",
+            waypoints=[
+                {"kind": "waypoint", "pos": (40.0, 31.0), "tol_mm": 0.0},
+                {"kind": "waypoint", "pos": (50.0, 33.0), "tol_mm": 0.25},
+                {"kind": "waypoint", "pos": (55.0, 36.0), "tol_mm": 0.5},
+            ],
+        )
+    )
+
+    assert len(calls) == 1
+    call = calls[0]
+    assert call["hulls"], "the layer run's hulls must reach the pass"
+    audit = call["audit"]
+    assert audit is not None, "the merge must be audited like the engine does"
+    pts = call["pts"]
+    assert audit(list(pts)) is True
+    # (47.5, 32.5) sits on the GND trace; the two-segment shortcut
+    # through it is copper the DRC audit must reject.
+    assert audit([pts[0], (47.5, 32.5), pts[-1]]) is False
+
+
+def test_leg_boundary_merge_sees_a_chain_without_collinear_splits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pass is fed ``_dedupe`` + ``_merge_family_chain`` output.
+
+    A waypoint that lands mid-run splits the concatenated chain into two
+    collinear segments, which hides the ``[run, stair, run]`` patterns
+    the pass matches.  The pre-merge must fold the split away: the
+    chain handed to the pass has no collinear interior vertex, and the
+    mid-run waypoint is still exactly on the emitted centerline.
+    """
+    import kcaa.router.router as router_module
+
+    calls: list[dict] = []
+    real_merge = router_module.merge_parallel_diagonals
+
+    def recording_merge(pts, hulls, width, **kwargs):
+        out = real_merge(pts, hulls, width, **kwargs)
+        calls.append({"pts": list(pts)})
+        return out
+
+    monkeypatch.setattr(router_module, "merge_parallel_diagonals", recording_merge)
+    result = _route_clear(
+        {
+            "algorithm": "pns",
+            "waypoints": [
+                # (35, 30) sits mid-run on the first horizontal leg.
+                {"kind": "waypoint", "pos": (35.0, 30.0), "tol_mm": 0.0},
+                {"kind": "waypoint", "pos": (40.0, 31.0), "tol_mm": 0.0},
+                {"kind": "waypoint", "pos": (50.0, 33.0), "tol_mm": 0.25},
+                {"kind": "waypoint", "pos": (55.0, 36.0), "tol_mm": 0.5},
+            ],
+        },
+        tmp_path,
+    )
+
+    assert len(calls) == 1
+    pts = calls[0]["pts"]
+    for a, b, c in zip(pts, pts[1:], pts[2:]):
+        cross = (b[0] - a[0]) * (c[1] - b[1]) - (b[1] - a[1]) * (c[0] - b[0])
+        assert abs(cross) > 1e-12, f"collinear interior vertex {b} reached the pass"
+    assert _point_polyline_distance(_route_polyline_sampled(result), (35.0, 30.0)) == pytest.approx(
+        0.0, abs=1e-6
+    )
+
+
+def test_leg_boundary_merge_result_drives_the_emitted_segments(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pass's return value is used, not just observed: forcing it to
+    drop a vertex changes the emitted segment count."""
+    import kcaa.router.router as router_module
+
+    real_merge = router_module.merge_parallel_diagonals
+    seen: list[list] = []
+
+    def dropping_merge(pts, hulls, width, **kwargs):
+        out = real_merge(pts, hulls, width, **kwargs)
+        seen.append(list(out))
+        # Drop the second vertex: the emitted route must lose a segment.
+        if len(out) > 3:
+            out = [out[0], *out[2:]]
+        return out
+
+    request = {
+        "algorithm": "pns",
+        "waypoints": [
+            {"kind": "waypoint", "pos": (40.0, 31.0), "tol_mm": 0.0},
+            {"kind": "waypoint", "pos": (50.0, 33.0), "tol_mm": 0.0},
+        ],
+    }
+    control = _route_clear(request, tmp_path)
+    monkeypatch.setattr(router_module, "merge_parallel_diagonals", dropping_merge)
+    mutilated = _route_clear(request, tmp_path)
+    assert seen, "the merge did not run"
+    # The mutated chain is what the emitter used: the first corner is the
+    # waypoint joint (40, 31) instead of the (39, 30) corner the real
+    # pass produced.
+    assert (mutilated.segments[0].x2, mutilated.segments[0].y2) != (
+        control.segments[0].x2,
+        control.segments[0].y2,
+    )
+    assert (mutilated.segments[0].x2, mutilated.segments[0].y2) == pytest.approx((40.0, 31.0))
+
+
+def test_pad_entry_has_no_extra_corner_when_the_run_lands_on_the_pad_line(
+    tmp_path: Path,
+) -> None:
+    """#217: after the run moves onto the pad centre line the terminal
+    leg is one straight 45-degree diagonal into the pad centre.
+    ``_replace_pad_path`` must not re-insert an axis fence there (which
+    would put a 45/90 kink at the pad entry)."""
+    center = (120.05, 87.2)
+    size = (1.0, 1.45)
+    entry = [(118.57, 88.68), center]
+    out = _replace_pad_path(list(entry), center, size, from_center=False)
+    # No axis fence: the 45 run is kept and only the centre duplicate
+    # (harmless, dropped by the emitter) is added.
+    assert [p for i, p in enumerate(out) if p not in out[:i]] == entry
+    assert _turn_degrees(out[0], out[1], out[2]) == pytest.approx(0.0, abs=1e-9)
+
+
+def test_pad_entry_axis_fence_still_used_for_an_axis_entry(
+    tmp_path: Path,
+) -> None:
+    """Control for the test above: an axis entry still gets the standard
+    fence (the pad wire is not dead code)."""
+    center = (120.05, 87.2)
+    size = (1.0, 1.45)
+    axis_entry = [(118.57, 88.68), (120.05, 88.05), center]
+    out = _replace_pad_path(list(axis_entry), center, size, from_center=False)
+    assert out[-1] == pytest.approx(center)
+    assert len(out) >= len(axis_entry)
+
+
+# ---------------------------------------------------------------------------
 # _check_segments_in_board
 # ---------------------------------------------------------------------------
 
@@ -2837,9 +3329,15 @@ def test_waypoints_without_tol_keep_exact_anchor(tmp_path: Path) -> None:
         assert result.arcs == [], "mitered45 waypoint chains emit no arcs"
         pts = _route_polyline_sampled(result)
         for wpt in ((40.0, 31.0), (50.0, 33.0), (55.0, 36.0)):
-            d = min(math.hypot(px - wpt[0], py - wpt[1]) for px, py in pts)
-            assert d <= 1.5 + 1e-6, (
-                f"exact anchor must keep the chain at {wpt}, polyline drifts {d:.2f} mm"
+            # Measure the true point-to-centerline distance: the anchor
+            # may legitimately end up inside a merged straight run (the
+            # straight-run optimizer rewrites the waypoint stair), so the
+            # nearest *sampled* point is a sampling artefact.  What the
+            # pin promises is that the copper centre line passes through
+            # the waypoint exactly.
+            d = _point_polyline_distance(pts, wpt)
+            assert d <= 1e-6, (
+                f"exact anchor must keep the chain at {wpt}, polyline drifts {d:.4f} mm"
             )
 
 
@@ -3116,6 +3614,20 @@ def _route_polyline_with_arcs(result, n: int = 64) -> list[tuple[float, float]]:
     return pts
 
 
+def _point_polyline_distance(pts: list[tuple[float, float]], p: tuple[float, float]) -> float:
+    """Distance from ``p`` to the polyline through ``pts`` (0 on any segment)."""
+    best = math.inf
+    for a, b in zip(pts, pts[1:]):
+        dx, dy = b[0] - a[0], b[1] - a[1]
+        seg2 = dx * dx + dy * dy
+        if seg2 <= 1e-18:
+            best = min(best, math.hypot(p[0] - a[0], p[1] - a[1]))
+            continue
+        u = max(0.0, min(1.0, ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / seg2))
+        best = min(best, math.hypot(p[0] - (a[0] + u * dx), p[1] - (a[1] + u * dy)))
+    return best
+
+
 def _route_polyline_sampled(result, n: int = 64) -> list[tuple[float, float]]:
     """Recompose the emitted geometry (segments + arcs attached at the
     running head) sampling every arc at ``n`` points, like the router's
@@ -3382,6 +3894,27 @@ def test_pns_parallel_lane_preferred_over_snake_detour(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 # W3 — PNS candidates (multi-variant routes) + A* failure evidence
 # ---------------------------------------------------------------------------
+def _make_mid_chain_same_net_pad_board(tmp_path: Path) -> str:
+    """Clear board plus a *mid-chain* VCC pad off the routed corridor.
+
+    ``_layer_engine_obstacles`` re-adds same-net pads as transit
+    obstacles (the world model drops this net's copper), so this pad is
+    in the obstacle list the layer run hands the merge.  The router
+    filters it out again: same-net copper is legal for the route to
+    touch, and the DRC audit never space-checks it.  A foreign pad kept
+    in the list is the control."""
+    pcb_path = Path(_make_clear_board(tmp_path))
+    text = pcb_path.read_text()
+    block = text[text.index('\t(footprint "R"') : text.index('\t(footprint "C"')]
+    block = (
+        block.replace("(at 30.0 30.0 0.0)", "(at 55.0 34.5 0.0)")
+        .replace('"R1"', '"R2"')
+        .replace("(at -0.5 0.0)", "(at 0.0 0.0)")
+    )
+    pcb_path.write_text(text.replace("\t(gr_rect", block + "\t(gr_rect"))
+    return str(pcb_path)
+
+
 def _make_clear_board_with_track(tmp_path: Path) -> str:
     """Single-layer clear board plus one foreign-net GND track crossing the
     direct pad-to-pad line, so walkaround and shove diverge.

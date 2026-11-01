@@ -14,7 +14,7 @@ half-width plus clearance is applied here when building walkaround hulls
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 import math
 
@@ -698,18 +698,7 @@ def route_engine(
             orig_obstacle_ids.add(id(movable_shapes_active[i]))
 
     if out_path != skeleton:
-        route_hulls: list[Polygon] = [
-            _family_hull(o.shape, place_clearance + track_width / 2.0)
-            for o in obstacles
-            if o.shape is not None and not o.shape.is_empty
-        ]
-        for _orig, disp in moved_pairs:
-            route_hulls.append(
-                LineString(disp.points).buffer(
-                    disp.width / 2.0 + place_clearance + track_width / 2.0,
-                    cap_style="round",
-                )
-            )
+        route_hulls = family_hulls(obstacles, clearance, track_width, moved_pairs)
         out_path = _snap45_line(out_path, route_hulls)
 
     # Coalesce the walkaround's stub pairs.  When a polyline passes
@@ -772,6 +761,69 @@ def route_engine(
                     out_path = shouldered
                 except PnsFailure:
                     pass  # shoulder would violate DRC: keep walked path
+
+            # Sliding-run merge (#217): two parallel-but-offset 45-degree
+            # legs joined by an axis run become one diagonal plus the
+            # translated run — identical length, one fewer vertex.  Run
+            # last (the corner cut above can create exactly this shape)
+            # and gate every candidate on the same copper audit the
+            # caller applies, so a merge can never trade segments for a
+            # DRC error.
+
+            def _audit_candidate(cand: list[tuple[float, float]]) -> bool:
+                try:
+                    _audit_final_copper(
+                        out_path=cand,
+                        width=track_width,
+                        net=net,
+                        obstacles=obstacles,
+                        extra_fixed=extra_fixed,
+                        moved_pairs=moved_pairs,
+                        orig_obstacle_ids=orig_obstacle_ids,
+                        clearance=clearance,
+                    )
+                except PnsFailure:
+                    return False
+                return True
+
+            # Same-net copper imposes no spacing rule (the audit exempts
+            # it as well), so only obstacles that demand a gap bound a
+            # rewritten segment.  The walkaround/shoulder stages keep the
+            # net-inclusive ``route_hulls``; this narrower set gates the
+            # straight-run rewrites only.
+            clearance_hulls = route_hulls
+            if net is not None:
+                clearance_hulls = family_hulls(
+                    [o for o in obstacles if o.net != net],
+                    clearance,
+                    track_width,
+                    moved_pairs,
+                )
+
+            merged_diag = merge_parallel_diagonals(
+                out_path,
+                clearance_hulls,
+                track_width,
+                board_limit=board_limit,
+                audit=_audit_candidate,
+            )
+            if merged_diag != out_path:
+                out_path = merged_diag
+
+            # Terminal stub absorption (#216): a sub-width first/last
+            # segment is a residual connector between the pinned anchor
+            # and the nearest legal family run.  Slide that run onto the
+            # anchor's line when every gate — including the same copper
+            # audit — accepts; otherwise the stub is structural and stays.
+            absorbed = _absorb_terminal_stubs(
+                out_path,
+                clearance_hulls,
+                track_width,
+                board_limit=board_limit,
+                audit=_audit_candidate,
+            )
+            if absorbed != out_path:
+                out_path = absorbed
 
     # Final all-copper DRC audit: the route and every displacement must
     # keep ``clearance`` from every foreign-net copper item of the final
@@ -1064,6 +1116,15 @@ def _coalesce_stub_pairs(
     return out
 
 
+def _dedupe(seq: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    """Drop zero-length vertex repeats (leg boundaries can share a point)."""
+    deduped = [seq[0]]
+    for p in seq[1:]:
+        if abs(p[0] - deduped[-1][0]) > 1e-9 or abs(p[1] - deduped[-1][1]) > 1e-9:
+            deduped.append(p)
+    return deduped
+
+
 def _merge_family_chain(pts: list[tuple[float, float]]) -> list[tuple[float, float]]:
     """Merge runs of consecutive segments in the same 0/45/90 slot.
 
@@ -1109,6 +1170,38 @@ def _merge_family_chain(pts: list[tuple[float, float]]) -> list[tuple[float, flo
     if len(out) < 2:
         return [pts[0], pts[-1]]
     return out
+
+
+def _hull_clearer(hulls: Sequence[Polygon]):
+    """Build a ``clear(p, q)`` predicate that allows boundary riding.
+
+    The walkaround places segments on the hull margin, so a rewritten
+    segment may ride a hull's 45-degree chamfer or touch a hull corner.
+    Comparing against the exact hull cannot distinguish "on the
+    boundary" from "a float ulp inside" (``touches`` flips on the
+    latter), so shrink each hull by ``penetration_eps`` and reject only
+    overlap that survives the erosion.  The ``intersects`` probe keeps
+    the common far-from-hull comparison cheap.
+    """
+    penetration_eps = 1e-9
+    eroded_hulls = [h.buffer(-penetration_eps) for h in hulls if not h.is_empty]
+
+    def clear(p: tuple[float, float], q: tuple[float, float]) -> bool:
+        """True when ``p -> q`` does not cut into a hull.
+
+        Boundary contact and penetration up to ``penetration_eps`` are
+        allowed (float roundoff from the walkaround/merge placement);
+        anything that genuinely crosses the eroded hull is rejected.
+        """
+        line = LineString([p, q])
+        for h in eroded_hulls:
+            if h.is_empty or not h.intersects(line):
+                continue
+            if line.length - line.difference(h).length > penetration_eps:
+                return False
+        return True
+
+    return clear
 
 
 def _shoulder_family_corners(
@@ -1195,30 +1288,10 @@ def _shoulder_family_corners(
         cos_t = (v1x * v2x + v1y * v2y) / (l1 * l2)
         return math.degrees(math.acos(max(-1.0, min(1.0, cos_t))))
 
-    # Boundary riding is legal: the walkaround places segments on the
-    # hull margin, and a shoulder diagonal may ride a hull's 45-degree
-    # chamfer.  Comparing against the exact hull cannot distinguish "on
-    # the boundary" from "a float ulp inside" (``touches`` flips on the
-    # latter), so shrink each hull by ``penetration_eps`` and reject only
-    # overlap that survives the erosion.  The ``intersects`` probe keeps
-    # the common far-from-hull comparison cheap.
-    penetration_eps = 1e-9
-    eroded_hulls = [h.buffer(-penetration_eps) for h in hulls if not h.is_empty]
-
-    def _seg_clear(p: tuple[float, float], q: tuple[float, float]) -> bool:
-        """True when ``p -> q`` does not cut into a hull.
-
-        Boundary contact and penetration up to ``penetration_eps`` are
-        allowed (float roundoff from the walkaround/merge placement);
-        anything that genuinely crosses the eroded hull is rejected.
-        """
-        line = LineString([p, q])
-        for h in eroded_hulls:
-            if h.is_empty or not h.intersects(line):
-                continue
-            if line.length - line.difference(h).length > penetration_eps:
-                return False
-        return True
+    # Boundary riding is legal (see ``_hull_clearer``): the walkaround
+    # places segments on the hull margin and a shoulder diagonal may ride
+    # a hull's 45-degree chamfer.
+    _seg_clear = _hull_clearer(hulls)
 
     def _total_len(seq: list[tuple[float, float]]) -> float:
         """Sum of segment lengths (``_path_len`` is a vector norm, not this)."""
@@ -1249,13 +1322,6 @@ def _shoulder_family_corners(
             if _seg_key(a, b) not in short_existing:
                 return False
         return True
-
-    def _dedupe(seq: list[tuple[float, float]]) -> list[tuple[float, float]]:
-        deduped = [seq[0]]
-        for p in seq[1:]:
-            if abs(p[0] - deduped[-1][0]) > 1e-9 or abs(p[1] - deduped[-1][1]) > 1e-9:
-                deduped.append(p)
-        return deduped
 
     max_steps = 4 * len(out) + 16
     steps = 0
@@ -1333,6 +1399,661 @@ def _shoulder_family_corners(
     # A fully-consumed leg can replace the last vertex by its recomputed
     # cut point (equal to the input endpoint up to float noise); pin the
     # physical anchors exactly.
+    out[0] = (pts[0][0], pts[0][1])
+    out[-1] = (pts[-1][0], pts[-1][1])
+    return out
+
+
+def family_hulls(
+    obstacles: Sequence[Obstacle],
+    clearance: float,
+    width: float,
+    moved_pairs: Sequence[tuple[TrackObstacle, TrackObstacle]] = (),
+) -> list[Polygon]:
+    """Hulls the post-processing passes ride, built exactly like the
+    engine builds them.
+
+    Every obstacle shape is inflated by ``clearance + width / 2`` (plus
+    the placement epsilon) and snapped to the 45 family, so a segment
+    that stays outside the hull is at least ``clearance`` from the
+    obstacle's copper; a displaced track is hulled where it was moved
+    to.  ``router.py`` calls this with the same obstacle list it fed the
+    engine, so a merge after leg concatenation judges clearance against
+    the identical geometry.
+    """
+    place_clearance = clearance + CLEARANCE_EPS
+    hulls: list[Polygon] = [
+        _family_hull(o.shape, place_clearance + width / 2.0)
+        for o in obstacles
+        if o.shape is not None and not o.shape.is_empty
+    ]
+    for _orig, disp in moved_pairs:
+        hulls.append(
+            LineString(disp.points).buffer(
+                disp.width / 2.0 + place_clearance + width / 2.0,
+                cap_style="round",
+            )
+        )
+    return hulls
+
+
+def moved_pairs_for_layer(
+    moved_pairs: Sequence[tuple[TrackObstacle, TrackObstacle]],
+    layer: str,
+    net: str | None,
+) -> list[tuple[TrackObstacle, TrackObstacle]]:
+    """The displaced tracks a single-layer run must respect.
+
+    ``shove_path`` accumulates ``(original, displaced)`` pairs across
+    every leg and layer of a request.  A per-layer hull set and copper
+    audit must see this layer's foreign-net copper only: another
+    layer's displaced track cannot collide with a single-layer run, and
+    same-net copper imposes no spacing rule (the audit exempts it).
+    A pair with an unknown layer stays in: a hull that cannot be
+    attributed must keep blocking (over-rejection is the safe side).
+    A ``None`` net is kept for the same reason: ``_audit_final_copper``
+    exempts a net only when both nets are non-``None`` and equal, so an
+    unknown net is still audited and must still veto here.
+    """
+    return [
+        (orig, disp)
+        for orig, disp in moved_pairs
+        if (disp.layer is None or disp.layer == layer) and (disp.net is None or disp.net != net)
+    ]
+
+
+def merge_parallel_diagonals(
+    pts: Sequence[tuple[float, float]],
+    hulls: Sequence[Polygon],
+    width: float,
+    board_limit: Polygon | None = None,
+    audit: Callable[[list[tuple[float, float]]], bool] | None = None,
+    anchors: Sequence[tuple[tuple[float, float], float]] = (),
+    keep_anchor_vertices: bool = False,
+) -> list[tuple[float, float]]:
+    """Merge 45-family staircases that no vertex-local pass can reach (#217).
+
+    Two families, both emitting **one 45-degree diagonal plus the
+    flanking runs** instead of a stair:
+
+    *Family A — translate the axis run.*  ``[D, axis run, D]`` with both
+    diagonals in the same slot but on different supporting lines.  The
+    trailing line is the leading line translated by the run vector, so
+    any point ``q1`` on the leading line has ``q2 = q1 + v`` on the
+    trailing one: the total length is invariant.  Only the two
+    *consuming* translations are tried (forward: run advances to ``d``;
+    mirror: run retreats to ``a``); an intermediate ``q1`` keeps three
+    segments and leaves sub-width remainders.
+
+    *Family B — collapse a stair onto a hull tangent.*  ``[axis run,
+    stair..., axis run]`` with the two runs parallel: a stair that
+    crosses a pad corner (the waypoint-split #217 case) is replaced by
+    a single diagonal ``A -> B`` where ``A`` lies on the first run's
+    line and ``B`` on the second's, with ``B - A`` the family
+    displacement that reaches from one line to the other.  ``A`` slides
+    along its run and ``B`` moves with it, so the run one side loses
+    and the run the other side gains cancel: the length is invariant in
+    the slide, and the slide only chooses *where* the diagonal sits.
+    The legal placements are bounded by the hull tangencies, so the
+    candidates are the hull support extremes of the diagonal's normal
+    (both sides) — the placement through the existing vertices can sit
+    inside another solid's clearance envelope.  On the #217 waypoint
+    repro the naive merge rides at 0.1616 mm to /AD4 (audit FAIL) while
+    the nearest legal placement is the /AD4 hull tangent at 0.2100 mm
+    (CLEAN); that is exactly the ``x - y = 27.3016`` support value.
+
+    Families run in order A then B.  The guarantees are narrow and
+    exact: the segment count after each merge never increases (every
+    acceptance removes at least one vertex), the total length never
+    increases (A: equal; B: the chord is no longer than the stair it
+    replaces and the flank it consumes shrinks), and the minimum segment
+    length stays ``>= width``.  ``keep_anchor_vertices`` can add
+    collinear vertices back afterwards (one split per anchor, each half
+    ``>= width``, length unchanged), so the *returned* path may have
+    more segments than the input when anchors cut a merged segment.
+    The minimum itself *can* drop — a merge that shortens a flank can
+    leave a segment shorter than the path's previous minimum, as long as
+    it clears ``width`` — so this pass does not preserve the minimum the
+    way :func:`_absorb_terminal_stubs` does.  Density, not length, is
+    what changes; a candidate is accepted only when it passes every gate
+    below.
+
+    Acceptance: the whole candidate stays on the 0/45/90 family, every
+    segment is at least ``width`` (strict — this pass must never emit or
+    retain a sub-width segment), the moved segments clear the route
+    hulls (boundary riding allowed through :func:`_hull_clearer`), the
+    polyline stays inside ``board_limit``, every ``anchors`` entry
+    ``(point, tol)`` keeps ``distance(point, candidate) <= tol``, and
+    ``audit(candidate)`` — the caller's ``_audit_final_copper`` wrapper
+    — accepts it.  Both families also re-check the rewired joints stay
+    ``<= 45`` degrees, measured on the **candidate** so a slide that
+    lands a joint exactly on an untouched vertex still sees the real
+    turn (see ``_joint_turns_ok``).  Any failure keeps the original
+    path; endpoints are pinned exactly.
+
+    ``keep_anchor_vertices``: by default an anchor that survives inside
+    a merged segment is left as an interior point (distance 0 — the
+    path still passes through it).  When a caller requires the anchor
+    as a node, set this and any anchor resting on a merged segment is
+    re-inserted as a collinear split (only when both halves stay at
+    least ``width`` long, so the invariant above still holds).
+
+    Bounded and idempotent: one ``_scan_runs`` call walks at most
+    ``4 * len(pts) + 16`` vertices; one ``_scan_stairs`` call tries at
+    most ``2 * len(pts) ** 2 + 64`` flank pairs, each with at most
+    ``4 * len(hulls) + 4`` slides.  Those are *per-scan* caps.  Each
+    candidate attempt costs O(n) (``_dedupe`` plus the ``_joint_turns_ok``
+    lookup), so one stairs scan is O(n^3 * |hulls|), and the two scans
+    alternate for at most ``len(pts)`` rounds while a round keeps
+    changing something: the worst case is O(n^4 * |hulls|).  No tighter
+    bound is claimed — the caps count attempts, not accepted merges.
+    Observed on a staircase generator: 321 vertices 39 ms, 1281 vertices
+    514 ms, 2401 vertices 1.72 s (roughly quadratic on this shape, second
+    call 0 ms).  Acceptance is greedy (the first slide that passes wins)
+    and the joint gate is local, so a candidate refused for a transient
+    spike can leave a legal merge on the table — 54 of 41,127 merges in
+    a 60,000-path fuzz corpus, 52 of those old outputs carrying an
+    invalid turn, and 6 replaced outputs up to 0.94 mm longer — while
+    every returned path stays family/width/turn-valid.  A complete pass accepts each merge at most once per
+    removed vertex, and after a merge the scan restarts one vertex back,
+    so re-running the pass on its own output is a no-op.
+    """
+    out = list(pts)
+    if len(out) < 4 or width <= 0.0:
+        return out
+
+    def _slot(p: tuple[float, float], q: tuple[float, float]) -> int | None:
+        dx, dy = q[0] - p[0], q[1] - p[1]
+        if abs(dx) < 1e-9 and abs(dy) < 1e-9:
+            return None
+        if abs(dx) < 1e-9:
+            return 0  # V
+        if abs(dy) < 1e-9:
+            return 1  # H
+        if abs(abs(dx) - abs(dy)) < 1e-6:
+            return 2 if dx * dy > 0 else 3  # D+ / D-
+        return None
+
+    def _turn_deg(p: tuple[float, float], q: tuple[float, float], r: tuple[float, float]) -> float:
+        """Unsigned turn at ``q`` in degrees (zero-length legs count as 0)."""
+        v1x, v1y = q[0] - p[0], q[1] - p[1]
+        v2x, v2y = r[0] - q[0], r[1] - q[1]
+        l1 = math.hypot(v1x, v1y)
+        l2 = math.hypot(v2x, v2y)
+        if l1 < 1e-12 or l2 < 1e-12:
+            return 0.0
+        cos_t = (v1x * v2x + v1y * v2y) / (l1 * l2)
+        return math.degrees(math.acos(max(-1.0, min(1.0, cos_t))))
+
+    def _joint_turns_ok(
+        cand: list[tuple[float, float]],
+        joints: Sequence[tuple[float, float]],
+    ) -> bool:
+        """Every rewired joint keeps a turn ``<= 45`` in ``cand``.
+
+        Measuring against the *pre-merge* path is wrong when a slide
+        lands the joint exactly on an untouched vertex: the neighbour
+        there is then a zero-length leg, ``_turn_deg`` returns 0, and a
+        135-degree fold passes the gate unseen.  In the candidate the
+        dedupe drops the coincident vertex, so the measured turn is the
+        real one.  Endpoints have no turn to check (and a merge may
+        legitimately remove a pre-existing leg-boundary turn elsewhere,
+        which is why this is local to the two new joints and not a
+        whole-path gate).
+        """
+        for p in joints:
+            k = min(
+                range(len(cand)),
+                key=lambda z: (cand[z][0] - p[0]) ** 2 + (cand[z][1] - p[1]) ** 2,
+            )
+            if k == 0 or k == len(cand) - 1:
+                continue
+            if _turn_deg(cand[k - 1], cand[k], cand[k + 1]) > 45.0 + 1e-6:
+                return False
+        return True
+
+    def _total_len(seq: list[tuple[float, float]]) -> float:
+        return sum(math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(seq, seq[1:]))
+
+    _seg_clear = _hull_clearer(hulls)
+    anchor_pts = [(tuple(a), float(tol)) for a, tol in anchors]
+
+    def _anchor_ok(cand: list[tuple[float, float]]) -> bool:
+        if not anchor_pts:
+            return True
+        cand_line = LineString(cand)
+        return all(float(cand_line.distance(Point(*p))) <= tol + 1e-9 for p, tol in anchor_pts)
+
+    def _accept(
+        cand: list[tuple[float, float]],
+        moved: list[tuple[tuple[float, float], tuple[float, float]]],
+    ) -> bool:
+        if not _line_is_family(cand):
+            return False
+        for a, b in zip(cand, cand[1:]):
+            if math.hypot(b[0] - a[0], b[1] - a[1]) < width - 1e-9:
+                return False
+        if board_limit is not None and not _line_in_board(cand, board_limit):
+            return False
+        if not all(_seg_clear(a, b) for a, b in moved):
+            return False
+        if not _anchor_ok(cand):
+            return False
+        # No length gate is needed: both rewrites only remove copper.
+        # Family A translates a run (exact length), and Family B's chord
+        # is no longer than the stair it replaces while the flank that is
+        # consumed shrinks (progression gates) — so a merge can never
+        # lengthen the path.  The tests pin the exact totals.
+        return audit is None or audit(cand)
+
+    def _scan_runs() -> bool:
+        """Family A: translate the axis run of ``[D, axis run, D]``."""
+        nonlocal out
+        changed = False
+        max_steps = 4 * len(out) + 16
+        steps = 0
+        i = 1
+        while i < len(out) - 2 and steps < max_steps:
+            steps += 1
+            a, b, c, d = out[i - 1], out[i], out[i + 1], out[i + 2]
+            lead_slot = _slot(a, b)
+            run_slot = _slot(b, c)
+            trail_slot = _slot(c, d)
+            if lead_slot not in (2, 3) or lead_slot != trail_slot or run_slot not in (0, 1):
+                i += 1
+                continue
+            l1 = math.hypot(b[0] - a[0], b[1] - a[1])
+            l3 = math.hypot(d[0] - c[0], d[1] - c[1])
+            if l1 < 1e-9 or l3 < 1e-9:
+                i += 1
+                continue
+            u1 = ((b[0] - a[0]) / l1, (b[1] - a[1]) / l1)
+            u3 = ((d[0] - c[0]) / l3, (d[1] - c[1]) / l3)
+            run = (c[0] - b[0], c[1] - b[1])
+            # The two diagonals are parallel by construction (same slot)
+            # and necessarily offset: a collinear pair would need a
+            # zero-length run, which ``_slot`` rejects above.
+
+            accepted = False
+            # Forward: consume the trailing diagonal, ending the run at ``d``.
+            # ``q1 = d - run = c + l3*u3 - (c - b) = b + l3*u3`` and ``u3`` is
+            # parallel to ``u1`` (same slot), so ``q1`` lands on the ``a->b``
+            # line exactly; there is no separate collinearity test to make,
+            # and ``_line_is_family`` re-checks the emitted segment.
+            q1 = (d[0] - run[0], d[1] - run[1])
+            join_ok_f = i + 3 >= len(out) or _turn_deg(q1, d, out[i + 3]) <= 45.0 + 1e-6
+            if (
+                join_ok_f
+                and (q1[0] - a[0]) * u1[0] + (q1[1] - a[1]) * u1[1] >= width - 1e-9
+                and math.hypot(run[0], run[1]) >= width - 1e-9
+            ):
+                cand = _dedupe(out[:i] + [q1] + out[i + 2 :])
+                if len(cand) == len(out) - 1 and _accept(cand, [(a, q1), (q1, d)]):
+                    out = cand
+                    accepted = True
+            if not accepted:
+                # Mirror: consume the leading diagonal, starting the run at ``a``.
+                # ``q2 = a + run = b - l1*u1 + (c - b)`` sits on the ``c->d``
+                # line by the same algebra as the forward case.
+                q2 = (a[0] + run[0], a[1] + run[1])
+                join_ok_m = i < 2 or _turn_deg(out[i - 2], a, q2) <= 45.0 + 1e-6
+                if (
+                    join_ok_m
+                    and (d[0] - q2[0]) * u3[0] + (d[1] - q2[1]) * u3[1] >= width - 1e-9
+                    and math.hypot(run[0], run[1]) >= width - 1e-9
+                ):
+                    # out[:i] ends at ``a``: the leading diagonal a -> b is
+                    # consumed, the run starts at ``a`` and the trailing
+                    # diagonal is re-anchored at ``q2`` on its own line.
+                    cand = _dedupe(out[:i] + [q2] + out[i + 2 :])
+                    if len(cand) == len(out) - 1 and _accept(cand, [(a, q2), (q2, d)]):
+                        out = cand
+                        accepted = True
+            if accepted:
+                changed = True
+                i = max(1, i - 1)
+            else:
+                i += 1
+        return changed
+
+    # ---- Family B: collapse a stair onto one 45-degree diagonal ----
+    #
+    # For parallel axis runs at ``out[i-1:i]`` and ``out[j:j+1]`` the
+    # connecting stair ``out[i:j+1]`` is replaced by ``A -> B`` with
+    # ``B - A`` the family displacement reaching from one run's line to
+    # the other.  ``A = out[i] + t * e`` slides along the first run;
+    # every candidate has the same total length, so the smallest legal
+    # slide (nearest the untouched vertices) wins and the hull support
+    # values bound the legal region.
+    axis_normal = {0: (1.0, 0.0), 1: (0.0, 1.0)}  # perpendicular offset axis
+    # Support values (min/max of x+y and x-y over every hull) do not
+    # depend on the pair, only on the diagonal's normal, so cache them.
+    support_cache: dict[tuple[float, float], list[float]] = {}
+
+    def _hull_supports(nx: float, ny: float) -> list[float]:
+        key = (nx, ny)
+        cached = support_cache.get(key)
+        if cached is not None:
+            return cached
+        values: set[float] = set()
+        for h in hulls:
+            exterior = getattr(h, "exterior", None)
+            if exterior is None:
+                continue
+            cs = [nx * x + ny * y for x, y in exterior.coords]
+            if cs:
+                values.add(min(cs))
+                values.add(max(cs))
+        support_cache[key] = sorted(values)
+        return support_cache[key]
+
+    def _scan_stairs() -> bool:
+        nonlocal out
+        changed = False
+        max_pairs = 2 * len(out) * len(out) + 64
+        pairs = 0
+        i = 1
+        while i <= len(out) - 4 and pairs < max_pairs:
+            f1_slot = _slot(out[i - 1], out[i])
+            if f1_slot not in (0, 1):
+                i += 1
+                continue
+            n_perp = axis_normal[f1_slot]
+            prev_dir_len = math.hypot(out[i][0] - out[i - 1][0], out[i][1] - out[i - 1][1])
+            if prev_dir_len < 1e-9:
+                i += 1
+                continue
+            d1 = (
+                (out[i][0] - out[i - 1][0]) / prev_dir_len,
+                (out[i][1] - out[i - 1][1]) / prev_dir_len,
+            )
+            # Travel direction of the first run.  The slide parameter and
+            # the displacement's axial component follow it, so the merged
+            # diagonal keeps the path's heading (a run that travels -y
+            # needs the -y diagonal, not the mirror one).
+            e = d1
+            accepted = False
+            for j in range(i + 2, len(out) - 1):
+                if _slot(out[j], out[j + 1]) != f1_slot:
+                    continue
+                pairs += 1
+                if pairs >= max_pairs:
+                    break
+                next_dir_len = math.hypot(out[j + 1][0] - out[j][0], out[j + 1][1] - out[j][1])
+                if next_dir_len < 1e-9:
+                    continue
+                d2 = (
+                    (out[j + 1][0] - out[j][0]) / next_dir_len,
+                    (out[j + 1][1] - out[j][1]) / next_dir_len,
+                )
+                off = (out[j][0] - out[i][0]) * n_perp[0] + (out[j][1] - out[i][1]) * n_perp[1]
+                if abs(off) <= 1e-9:
+                    continue  # the runs are collinear: _merge_family_chain's job
+                for sgn in (1.0, -1.0):
+                    d_par = sgn * abs(off)
+                    disp = (off * n_perp[0] + d_par * e[0], off * n_perp[1] + d_par * e[1])
+                    disp_len = math.hypot(disp[0], disp[1])
+                    nl = (disp[1] / disp_len, -disp[0] / disp_len)
+                    denom = e[0] * nl[0] + e[1] * nl[1]
+                    if abs(denom) < 1e-9:
+                        continue
+                    c0 = out[i][0] * nl[0] + out[i][1] * nl[1]
+                    # Candidate slides: the untouched vertices first, then
+                    # every hull tangent on both sides (nearest first).  A
+                    # 45-degree normal has |nx| == |ny|, so the cached
+                    # unscaled supports map onto the unit-normal values by
+                    # one shared factor.
+                    sx = 1.0 if nl[0] >= 0.0 else -1.0
+                    sy = 1.0 if nl[1] >= 0.0 else -1.0
+                    scale = abs(nl[0])
+                    slides = [0.0]
+                    slides.extend((scale * c - c0) / denom for c in _hull_supports(sx, sy))
+                    slides.sort(key=abs)
+                    for t in slides:
+                        A = (out[i][0] + t * e[0], out[i][1] + t * e[1])
+                        B = (A[0] + disp[0], A[1] + disp[1])
+                        # Progression: A must not retreat behind the
+                        # flank's tail and B must not pass the next run's
+                        # head.  Touching is allowed (the dedupe then
+                        # drops the consumed flank / vertex).  The two
+                        # rewired joints are checked on the candidate —
+                        # the displacement is 45 degrees to the run, so
+                        # the only alternatives there are 45 and 135.
+                        if (A[0] - out[i - 1][0]) * d1[0] + (A[1] - out[i - 1][1]) * d1[1] < -1e-12:
+                            continue
+                        if (out[j + 1][0] - B[0]) * d2[0] + (out[j + 1][1] - B[1]) * d2[1] < -1e-12:
+                            continue
+                        # ``len(cand) < len(out)`` always holds without a
+                        # check: the pre-dedupe length is
+                        # ``len(out) + i - j + 1 <= len(out) - 1`` for
+                        # ``j >= i + 2`` and ``_dedupe`` only shrinks it.
+                        cand = _dedupe(out[:i] + [A, B] + out[j + 1 :])
+                        if not _joint_turns_ok(cand, (A, B)):
+                            continue
+                        if _accept(cand, [(out[i - 1], A), (A, B), (B, out[j + 1])]):
+                            out = cand
+                            accepted = True
+                            changed = True
+                            break
+                    if accepted:
+                        break
+                if accepted:
+                    break
+            if accepted:
+                i = max(1, i - 1)
+            else:
+                i += 1
+        return changed
+
+    # A collapse can expose the other family's pattern (a merged stair
+    # leaves a run/diagonal/run triple, and vice versa), so alternate
+    # until a full round changes nothing.  Each accepting round removes
+    # at least one vertex, hence at most ``len(pts)`` rounds.
+    for _round in range(max(1, len(pts))):
+        changed_a = _scan_runs()
+        changed_b = _scan_stairs()
+        if not changed_a and not changed_b:
+            break
+
+    if keep_anchor_vertices and anchor_pts:
+        out = _insert_collinear_anchors(out, anchor_pts, width)
+
+    # Physical anchors stay exact (a consumed leg may have sourced the
+    # new vertex from a float-noisy subtraction).
+    out[0] = (pts[0][0], pts[0][1])
+    out[-1] = (pts[-1][0], pts[-1][1])
+    return out
+
+
+def _insert_collinear_anchors(
+    pts: Sequence[tuple[float, float]],
+    anchors: Sequence[tuple[tuple[float, float], float]],
+    width: float,
+) -> list[tuple[float, float]]:
+    """Re-insert anchors resting on a segment as collinear split points.
+
+    ``merge_parallel_diagonals(keep_anchor_vertices=True)``: a merged
+    segment may pass exactly through an anchor that the caller needs as
+    a node (pin-exact pass-through semantics).  The split point is the
+    anchor's projection when it lies on the segment within its ``tol``;
+    a split is skipped when either half would be shorter than ``width``
+    (the pass's no-sub-width invariant wins over node identity).
+    """
+    out: list[tuple[float, float]] = [pts[0]]
+    for a, b in zip(pts, pts[1:]):
+        dx, dy = b[0] - a[0], b[1] - a[1]
+        seg_len2 = dx * dx + dy * dy
+        if seg_len2 <= 1e-18:
+            out.append(b)
+            continue
+        cuts: list[tuple[float, tuple[float, float]]] = []
+        for p, tol in anchors:
+            u = ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / seg_len2
+            if u <= 1e-9 or u >= 1.0 - 1e-9:
+                continue
+            proj = (a[0] + u * dx, a[1] + u * dy)
+            if math.hypot(proj[0] - p[0], proj[1] - p[1]) > tol + 1e-9:
+                continue
+            cuts.append((u, proj))
+        cuts.sort()
+        prev = a
+        for u, proj in cuts:
+            if (
+                math.hypot(proj[0] - prev[0], proj[1] - prev[1]) >= width - 1e-9
+                and math.hypot(b[0] - proj[0], b[1] - proj[1]) >= width - 1e-9
+            ):
+                out.append(proj)
+                prev = proj
+        out.append(b)
+    return out
+
+
+def _absorb_terminal_stubs(
+    pts: Sequence[tuple[float, float]],
+    hulls: Sequence[Polygon],
+    width: float,
+    board_limit: Polygon | None = None,
+    audit: Callable[[list[tuple[float, float]]], bool] | None = None,
+) -> list[tuple[float, float]]:
+    """Absorb a sub-width stub at either end into the adjacent run (#216).
+
+    The walkaround / lane / pad-exit stages can leave a path whose first
+    or last segment is shorter than the track width: the anchoring
+    family line (the run next to it) sits just off the pinned endpoint,
+    and the residual connector is the stub.  Unlike an interior chamfer
+    — which is the family transition around a hull and cannot go away
+    without moving the run off its clearance line — a *terminal* stub
+    can be absorbed by **sliding the adjacent run onto the anchor**: the
+    run's line is translated parallel to itself so it passes through the
+    pinned endpoint, and the run's far end is re-anchored onto the
+    neighbouring segment's supporting line.  This is the same
+    "translate a straight run off its supporting line" move as
+    :func:`merge_parallel_diagonals`; every vertex-local pass misses it.
+
+    The two shapes handled are ``[prev, p, q, E]`` (last segment
+    ``q -> E`` is the stub, ``p -> q`` the run) and ``[S, q, r, next]``
+    (first segment ``S -> q`` is the stub, ``q -> r`` the run).  The run
+    direction and both endpoint anchors are preserved exactly, so no new
+    turn is introduced: the join turn at the moved run end equals the
+    original turn there, and the stub's turn disappears with it.
+
+    A candidate is accepted only when it is family-clean, the minimum
+    segment length does **not decrease** (the stub is the usual
+    minimum, so this is the "absorb, do not trade one stub for another"
+    rule), the path does not get longer, both moved segments clear the
+    route hulls (boundary riding via :func:`_hull_clearer`), the
+    polyline stays inside ``board_limit``, and ``audit(candidate)``
+    accepts.  For family input the slide is never longer than the stub
+    path it replaces (the extension of the neighbouring segment is at
+    most ``|stub| * sqrt(2)`` and the run shrinks by the stub's
+    component along it), so the length check is a safety net, not a
+    selection criterion.  A stub whose run cannot slide onto the anchor
+    without entering a hull's clearance envelope is left in place — the
+    copper audit would reject that candidate — even when a *different*
+    (longer, re-routed) path could remove it.  Every gate is
+    improvement-or-no-op, like the other post-processing passes.
+
+    The remaining sub-width segments after this pass are structural:
+    a segment that has to reach a pinned pad-centre anchor from the
+    nearest legal family line (the anchor sits inside the clearance
+    envelope of every full-width family run, or the anchor pair's
+    ``|dx - dy|`` family residual is itself below the width).  Those are
+    pinned by tests; the pass never moves an anchor to hide them.
+
+    The progression checks (the re-anchored run must not retreat behind
+    its own tail or pass the stub) are a *direction* assertion: a fold
+    is also refused by the length gate, because folding a run back needs
+    the run nearly parallel to the neighbouring line, and the
+    re-anchored segment then grows with the run's offset.  They stay
+    local so the invariant does not depend on that derivation.
+
+    Idempotent and bounded: each acceptance removes one vertex, and the
+    scan stops after ``4 * len(pts) + 16`` attempts.
+    """
+    out = list(pts)
+    if len(out) < 4 or width <= 0.0:
+        return out
+
+    def _len(a: tuple[float, float], b: tuple[float, float]) -> float:
+        return math.hypot(b[0] - a[0], b[1] - a[1])
+
+    def _unit(p: tuple[float, float], q: tuple[float, float]) -> tuple[float, float] | None:
+        length = _len(p, q)
+        if length < 1e-12:
+            return None
+        return ((q[0] - p[0]) / length, (q[1] - p[1]) / length)
+
+    def _intersection(
+        pt: tuple[float, float],
+        u: tuple[float, float],
+        ref: tuple[float, float],
+        w: tuple[float, float],
+    ) -> tuple[float, float] | None:
+        """Intersection of the lines ``pt + t*u`` and ``ref + s*w``."""
+        det = u[0] * w[1] - u[1] * w[0]
+        if abs(det) < 1e-12:
+            return None  # parallel: the run cannot re-anchor onto this line
+        t = ((ref[0] - pt[0]) * w[1] - (ref[1] - pt[1]) * w[0]) / det
+        return (pt[0] + u[0] * t, pt[1] + u[1] * t)
+
+    def _dot(origin: tuple[float, float], p: tuple[float, float], u: tuple[float, float]) -> float:
+        return (p[0] - origin[0]) * u[0] + (p[1] - origin[1]) * u[1]
+
+    def _total_len(seq: list[tuple[float, float]]) -> float:
+        return sum(_len(a, b) for a, b in zip(seq, seq[1:]))
+
+    _seg_clear = _hull_clearer(hulls)
+
+    def _accept(
+        cand: list[tuple[float, float]],
+        moved: list[tuple[tuple[float, float], tuple[float, float]]],
+        min_len: float,
+    ) -> bool:
+        if len(cand) < 2 or not _line_is_family(cand):
+            return False
+        if min(_len(a, b) for a, b in zip(cand, cand[1:])) < min_len - 1e-9:
+            return False
+        if board_limit is not None and not _line_in_board(cand, board_limit):
+            return False
+        if not all(_seg_clear(a, b) for a, b in moved):
+            return False
+        if _total_len(cand) > _total_len(out) + 1e-9:
+            return False
+        return audit is None or audit(cand)
+
+    for _ in range(4 * len(out) + 16):
+        if len(out) < 4:
+            break  # nothing left to absorb against a run
+        min_len = min(_len(a, b) for a, b in zip(out, out[1:]))
+
+        # Trailing stub: [.., prev, p, q, E] with q -> E sub-width.
+        if _len(out[-2], out[-1]) < width - 1e-9:
+            e, q, p, prev = out[-1], out[-2], out[-3], out[-4]
+            u_run = _unit(p, q)
+            u_prev = _unit(prev, p)
+            if u_run is not None and u_prev is not None:
+                p2 = _intersection(e, u_run, prev, u_prev)
+                if p2 is not None and _dot(prev, p2, u_prev) > 1e-12 and _dot(p2, e, u_run) > 1e-12:
+                    cand = _dedupe(out[:-3] + [p2, e])
+                    if _accept(cand, [(prev, p2), (p2, e)], min_len):
+                        out = cand
+                        continue
+
+        # Leading stub: [S, q, r, next, ..] with S -> q sub-width.
+        if _len(out[0], out[1]) < width - 1e-9:
+            s, q, r, nxt = out[0], out[1], out[2], out[3]
+            u_run = _unit(q, r)
+            u_next = _unit(r, nxt)
+            if u_run is not None and u_next is not None:
+                r2 = _intersection(s, u_run, r, u_next)
+                if r2 is not None and _dot(s, r2, u_run) > 1e-12 and _dot(r2, nxt, u_next) > 1e-12:
+                    cand = _dedupe([s, r2] + out[3:])
+                    if _accept(cand, [(s, r2), (r2, nxt)], min_len):
+                        out = cand
+                        continue
+        break
+
+    # Anchors are never moved by construction; pin them anyway.
     out[0] = (pts[0][0], pts[0][1])
     out[-1] = (pts[-1][0], pts[-1][1])
     return out

@@ -80,7 +80,16 @@ from kcaa.router.path_postprocess import (
 )
 from kcaa.router.pns.direction45 import CornerMode
 from kcaa.router.pns.shove import TrackObstacle
-from kcaa.router.route_engine import PnsFailure, _audit_final_copper, route_engine
+from kcaa.router.route_engine import (
+    PnsFailure,
+    _audit_final_copper,
+    _dedupe,
+    _merge_family_chain,
+    family_hulls,
+    merge_parallel_diagonals,
+    moved_pairs_for_layer,
+    route_engine,
+)
 from kcaa.router.via_check import ProposedVia, check_vias
 from kcaa.router.visibility_graph import RouteNode
 from kcaa.router.world_model import Obstacle, _get_net, build_world_model
@@ -1023,6 +1032,10 @@ def auto_route_pair(req: RouteRequest, data: list | None = None) -> RouteResult:
         # by leg k can be re-landed onto leg 1..k-1 copper by a later leg,
         # or the write path would fork the track (see _collapse_moved_pairs).
         prev_leg_polylines: list[tuple[str, list[tuple[float, float]]]] = []
+        # Obstacle ids whose copper was displaced (the engine exempts
+        # their stale file positions from the audit); the post-leg merge
+        # audit needs the same exemption.
+        moved_origin_ids: set[int] = set()
         # Per-leg direct emission: None -> the leg keeps the postprocess
         # (mitered straight) output below; otherwise the skeleton
         # segments / arcs emitted straight from eng.trace.
@@ -1129,6 +1142,7 @@ def auto_route_pair(req: RouteRequest, data: list | None = None) -> RouteResult:
             )
             pushed.extend(eng.shoved_tracks)
             moved_pairs.extend(eng.moved_pairs)
+            moved_origin_ids.update(eng.orig_obstacle_ids)
             pts = list(eng.path)
             if li == 0 and pad_a_size is not None:
                 pts = _replace_pad_path(pts, pad_a_xy, pad_a_size, from_center=True, rot=pad_a_rot)
@@ -1246,10 +1260,135 @@ def auto_route_pair(req: RouteRequest, data: list | None = None) -> RouteResult:
             # stage of every later leg (see the extra_fixed block above).
             prev_leg_polylines.append((layer, list(node_pts)))
 
+        def merge_concatenated_legs() -> None:
+            """Merge 45-family staircases across leg boundaries (#217).
+
+            Each leg is optimized by the engine's own passes, but the
+            waypoint stair #217 reports spans a leg boundary: leg N ends
+            at the waypoint, leg N+1 starts from it, and the walkaround
+            bridges the pad corner with a sub-width z-step split over
+            both legs.  Per-leg merging cannot see it, so the same
+            module-level pass runs once on the concatenated centerline.
+
+            Leg-boundary vertices are merge candidates, not hard
+            constraints: a waypoint that survives as an interior point
+            of a merged segment still lies on the path (distance 0), and
+            the acceptance gate rejects any candidate that would push a
+            waypoint farther than its ``tol_mm``.  Via anchors stay
+            pinned automatically (they end one layer run and start the
+            next, and run endpoints are never merged away), as do the
+            pad centres that terminate the chain.
+
+            Obstacles and hulls are built exactly as the engine builds
+            them for that layer (``family_hulls``), and every candidate
+            is judged by the same ``_audit_final_copper`` the engine
+            applies, so a merge can never trade segments for a DRC
+            error.
+            """
+            nonlocal all_nodes
+            if corner_mode not in (CornerMode.MITERED_45, CornerMode.ROUNDED_45):
+                return
+            anchors = [
+                (_anchor_pos(spec, "waypoint"), float(spec.get("tol_mm", 0.0)))
+                for spec in req.waypoints
+                if spec.get("kind") == "waypoint"
+                and _anchor_pos(spec, "waypoint") not in violated_waypoints
+            ]
+            board_limit = None
+            if model.board_outline is not None and not model.board_outline.is_empty:
+                board_limit = model.board_outline.buffer(-(width / 2.0))
+                if board_limit.is_empty:
+                    board_limit = None
+            nodes = list(all_nodes)
+            changed = False
+            start = 0
+            while start < len(nodes):
+                layer = nodes[start].layer
+                stop = start
+                while stop + 1 < len(nodes) and nodes[stop + 1].layer == layer:
+                    stop += 1
+                pts = _merge_family_chain(_dedupe([(nd.x, nd.y) for nd in nodes[start : stop + 1]]))
+                if len(pts) >= 4:
+                    run_obstacles = _layer_engine_obstacles(
+                        model,
+                        data,
+                        req,
+                        start_layer,
+                        end_layer,
+                        layer,
+                        pad_a_xy,
+                        pad_b_xy,
+                    )
+
+                    # The hull set and audit are single-layer: only this
+                    # layer's foreign-net displaced tracks may veto.
+                    layer_moved = moved_pairs_for_layer(moved_pairs, layer, req.net)
+
+                    def audit_candidate(
+                        cand: list[tuple[float, float]],
+                        obstacles=run_obstacles,
+                        moved=layer_moved,
+                    ) -> bool:
+                        try:
+                            _audit_final_copper(
+                                out_path=cand,
+                                width=width,
+                                net=req.net,
+                                obstacles=obstacles,
+                                extra_fixed=(),
+                                moved_pairs=moved,
+                                orig_obstacle_ids=moved_origin_ids,
+                                clearance=clearance,
+                            )
+                        except PnsFailure:
+                            return False
+                        return True
+
+                    merged = merge_parallel_diagonals(
+                        pts,
+                        family_hulls(
+                            [o for o in run_obstacles if o.net != req.net],
+                            clearance,
+                            width,
+                            layer_moved,
+                        ),
+                        width,
+                        board_limit=board_limit,
+                        audit=audit_candidate,
+                        anchors=anchors,
+                        # A waypoint is an anchor, not just a tolerance
+                        # circle: keep its projection as a vertex so the
+                        # downstream miter/snap stages cannot slide the
+                        # emitted chain off it.
+                        keep_anchor_vertices=True,
+                    )
+                    if merged != pts:
+                        changed = True
+                        for k, (x, y) in enumerate(merged):
+                            nodes[start + k] = RouteNode(
+                                x=x,
+                                y=y,
+                                layer=layer,
+                                node_id=nodes[start + k].node_id,
+                            )
+                        del nodes[start + len(merged) : stop + 1]
+                start = stop + 1
+            all_nodes = nodes
+            if changed and anchors:
+                merged_line = LineString([(nd.x, nd.y) for nd in all_nodes])
+                for wpt, tol in anchors:
+                    print(
+                        f"  [route] merged leg boundary: waypoint "
+                        f"({wpt[0]:.3f}, {wpt[1]:.3f}) is "
+                        f"{float(merged_line.distance(Point(*wpt))):.4f} mm "
+                        f"from the centerline (tol {tol:.3f})"
+                    )
+
         def finalize_legs() -> None:
             """Postprocess the emitted leg nodes and re-assemble per-leg
             direct (skeleton) emission on top of the mitered output."""
             nonlocal segs, vias, arcs_out, start_xy, end_xy, layers_used
+            merge_concatenated_legs()
             segs, vias = postprocess_path(
                 all_nodes,
                 width=width,
