@@ -1472,10 +1472,8 @@ def test_install_update_accepts_canonical_kcaa_version_for_prerelease_tag(
 ) -> None:
     """A ``0.2.9-RC1`` tag installs cleanly when METADATA reports ``0.2.9rc1``.
 
-    Rebase note for #222: its mock drops ``probe_results`` and derives METADATA
-    from the raw install version.  After it lands, pass ``update_metadata=False``
-    and call ``_set_kcaa(plugin_dir, "0.2.9rc1")`` so this still simulates the
-    canonical METADATA spelling.
+    The install mock leaves the venv alone and the hook writes the canonical
+    spelling, matching what pip records in ``METADATA`` for the raw tag.
     """
     plugin_dir = tmp_path / "kicad_ai_assistant"
     _write_plugin(plugin_dir)
@@ -1489,11 +1487,15 @@ def test_install_update_accepts_canonical_kcaa_version_for_prerelease_tag(
         )
     )
     calls: list[list[str]] = []
+
+    def _record_canonical_metadata(command: list[str]) -> None:
+        _set_kcaa(plugin_dir, "0.2.9rc1")
+
     _mock_uv(
         monkeypatch,
         calls=calls,
-        # Before: an older release.  After: the canonical METADATA spelling.
-        probe_results=["0.2.8", "0.2.9rc1"],
+        update_metadata=False,
+        on_install=_record_canonical_metadata,
     )
 
     outcome = updater.install_update(zip_path, plugin_dir, "0.2.9-RC1")
@@ -1501,6 +1503,7 @@ def test_install_update_accepts_canonical_kcaa_version_for_prerelease_tag(
     assert outcome == updater.InstallOutcome(True, None)
     assert any("kcaa==0.2.9-RC1" in command for command in calls)
     assert (plugin_dir / "VERSION").read_text(encoding="utf-8") == "0.2.9-RC1"
+    assert updater.installed_kcaa_info(plugin_dir) == updater.InstalledKcaa("0.2.9rc1", False)
 
 
 def test_install_update_installs_when_kcaa_is_missing(
