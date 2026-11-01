@@ -10,12 +10,14 @@ import hashlib
 import importlib
 import io
 import json
+import logging
 import os
 from pathlib import Path, PurePosixPath
 import subprocess
 import sys
 import threading
 import types
+from urllib.error import URLError
 import zipfile
 
 import pytest
@@ -44,9 +46,12 @@ class _FakeResponse:
         return False
 
 
-def _fake_open(monkeypatch: pytest.MonkeyPatch, routes: dict[str, object]) -> None:
+def _fake_open(monkeypatch: pytest.MonkeyPatch, routes: dict[str, object]) -> list[str]:
+    calls: list[str] = []
+
     def _open(request, timeout=None):
         url = request.full_url
+        calls.append(url)
         if url not in routes:
             raise AssertionError(f"unexpected URL: {url}")
         entry = routes[url]
@@ -55,6 +60,7 @@ def _fake_open(monkeypatch: pytest.MonkeyPatch, routes: dict[str, object]) -> No
         return _FakeResponse(entry)  # type: ignore[arg-type]
 
     monkeypatch.setattr(updater, "_open_url", _open)
+    return calls
 
 
 def _zip_bytes(entries: dict[str, bytes]) -> bytes:
@@ -248,6 +254,7 @@ def test_panel_update_branch_uses_tag_inequality(monkeypatch: pytest.MonkeyPatch
         panel = importlib.import_module("kicad_plugin.ui.panel")
         assert panel._WX_AVAILABLE  # noqa: SLF001 - exercising the real branch
         info = updater.UpdateInfo("0.2.9", _ZIP_URL, _SUMS_URL, updater.RELEASE_PAGE)
+        result = updater.CheckResult(info, updater.CHECK_REASON_OK)
 
         class _FakePanel:
             def __init__(self) -> None:
@@ -272,7 +279,7 @@ def test_panel_update_branch_uses_tag_inequality(monkeypatch: pytest.MonkeyPatch
         monkeypatch.setattr(updater, "is_update_available", _unavailable)
         fake_panel = _FakePanel()
         panel.AssistantPanel._on_update_check_done(  # noqa: SLF001
-            fake_panel, info, "0.2.8", False
+            fake_panel, result, "0.2.8", False
         )
 
         assert calls == [("0.2.9", "0.2.8")]
@@ -282,7 +289,7 @@ def test_panel_update_branch_uses_tag_inequality(monkeypatch: pytest.MonkeyPatch
         monkeypatch.setattr(updater, "is_update_available", lambda latest, current: True)
         fake_panel = _FakePanel()
         panel.AssistantPanel._on_update_check_done(  # noqa: SLF001
-            fake_panel, info, "0.2.8", False
+            fake_panel, result, "0.2.8", False
         )
 
         assert fake_panel.prompted == [(info, "0.2.8")]
@@ -326,6 +333,35 @@ def test_panel_update_branch_uses_tag_inequality(monkeypatch: pytest.MonkeyPatch
                 current_ui_pkg.__dict__.pop("panel", None)
             else:
                 current_ui_pkg.panel = saved_panel_attr  # type: ignore[attr-defined]
+
+
+def test_panel_update_check_messages_distinguish_reasons() -> None:
+    from kicad_plugin.ui import panel
+
+    info = updater.UpdateInfo("0.2.9", _ZIP_URL, None, updater.RELEASE_PAGE)
+    network = panel._update_check_message(
+        updater.CheckResult(None, updater.CHECK_REASON_NETWORK), "0.2.8"
+    )
+    timeout = panel._update_check_message(
+        updater.CheckResult(None, updater.CHECK_REASON_TIMEOUT), "0.2.8"
+    )
+    metadata = panel._update_check_message(
+        updater.CheckResult(None, updater.CHECK_REASON_METADATA), "0.2.8"
+    )
+    latest = panel._update_check_message(
+        updater.CheckResult(info, updater.CHECK_REASON_OK), "0.2.9"
+    )
+    upgrade = panel._update_check_message(
+        updater.CheckResult(info, updater.CHECK_REASON_OK), "0.2.8"
+    )
+
+    assert "network connection" in network
+    assert network == timeout
+    assert "missing required files" in metadata
+    assert "network" not in metadata
+    assert metadata != network
+    assert latest == "You are running the latest version (0.2.9)."
+    assert upgrade is None
 
 
 @pytest.mark.parametrize(
@@ -413,7 +449,39 @@ def test_download_validates_url_at_request_time(
         updater.download_and_verify(update, tmp_path)
 
 
+def test_download_rejects_untrusted_zip_url(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The zip URL is validated on its own, even when there is no checksum."""
+    update = updater.UpdateInfo(
+        version="0.2.9",
+        zip_url="https://evil.example.com/kicad_ai_assistant.zip",
+        checksum_url=None,
+        page_url=updater.RELEASE_PAGE,
+    )
+    calls = _fake_open(monkeypatch, {})
+
+    with pytest.raises(updater.UpdateError, match="untrusted host"):
+        updater.download_and_verify(update, tmp_path)
+
+    assert calls == []  # the request is rejected before it reaches the opener
+    assert list(tmp_path.iterdir()) == []
+
+
 # 3. check_latest ----------------------------------------------------------------
+
+
+def _release_data(tag: str, *, checksum: bool = True) -> dict[str, object]:
+    assets: list[dict[str, str]] = [
+        {"name": "kicad_ai_assistant.zip", "browser_download_url": _ZIP_URL},
+    ]
+    if checksum:
+        assets.append({"name": "SHA256SUMS", "browser_download_url": _SUMS_URL})
+    return {
+        "tag_name": tag,
+        "html_url": "https://example.test/tag/latest",
+        "assets": assets,
+    }
 
 
 def test_check_latest_parses_github_release(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -425,8 +493,10 @@ def test_check_latest_parses_github_release(monkeypatch: pytest.MonkeyPatch) -> 
     )
     _fake_open(monkeypatch, {updater.RELEASES_API: payload})
 
-    info = updater.check_latest()
+    result = updater.check_latest()
 
+    assert result.reason == updater.CHECK_REASON_OK
+    info = result.info
     assert info is not None
     assert info.version == "0.2.9"
     assert info.zip_url == _ZIP_URL
@@ -434,15 +504,127 @@ def test_check_latest_parses_github_release(monkeypatch: pytest.MonkeyPatch) -> 
     assert info.page_url == "https://example.test/tag/v0.2.9"
 
 
-def _release_data(tag: str) -> dict[str, object]:
-    return {
-        "tag_name": tag,
-        "html_url": "https://example.test/tag/latest",
-        "assets": [
-            {"name": "kicad_ai_assistant.zip", "browser_download_url": _ZIP_URL},
-            {"name": "SHA256SUMS", "browser_download_url": _SUMS_URL},
-        ],
-    }
+def test_check_latest_accepts_release_without_checksum(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Releases that predate the SHA256SUMS upload step are still offered."""
+    payload = json.dumps(
+        {
+            "tag_name": "0.2.8",
+            "html_url": "https://example.test/tag/0.2.8",
+            "assets": [
+                {"name": "kicad_ai_assistant.zip", "browser_download_url": _ZIP_URL},
+            ],
+        }
+    ).encode()
+
+    _fake_open(monkeypatch, {updater.RELEASES_API: payload})
+
+    result = updater.check_latest()
+
+    assert result.reason == updater.CHECK_REASON_OK
+    assert result.info is not None
+    assert result.info.version == "0.2.8"
+    assert result.info.zip_url == _ZIP_URL
+    assert result.info.checksum_url is None
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        # No zip asset: nothing installable.
+        json.dumps(
+            {"tag_name": "0.2.9", "assets": []},
+        ).encode(),
+        # Same, but with an unrelated asset.
+        json.dumps(
+            {
+                "tag_name": "0.2.9",
+                "assets": [{"name": "SHA256SUMS", "browser_download_url": _SUMS_URL}],
+            }
+        ).encode(),
+        # Tag install_update() refuses.
+        json.dumps(_release_data("0.2.9_final")).encode(),
+        # Payload is not an object.
+        b'["not", "a", "release"]',
+        # Malformed JSON.
+        b"{not valid json",
+    ],
+)
+def test_check_latest_reports_metadata_for_unusable_release(
+    monkeypatch: pytest.MonkeyPatch, payload: bytes
+) -> None:
+    calls = _fake_open(monkeypatch, {updater.RELEASES_API: payload})
+
+    result = updater.check_latest()
+
+    assert result.info is None
+    assert result.reason == updater.CHECK_REASON_METADATA
+    assert len(calls) == 1  # metadata failures are not retried
+
+
+def test_check_latest_reports_oversized_metadata_as_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(updater, "_MAX_TEXT_BYTES", 8)
+    _fake_open(monkeypatch, {updater.RELEASES_API: b"{" + b"x" * 16 + b"}"})
+
+    result = updater.check_latest()
+
+    assert result.info is None
+    assert result.reason == updater.CHECK_REASON_METADATA
+
+
+def test_check_latest_reports_metadata_for_deeply_nested_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Deep JSON makes json.loads raise RecursionError, which must not escape.
+
+    The 400 kB body stays below the 1 MiB metadata cap, so it is the decoder,
+    not the size gate, that rejects it.
+    """
+    payload = b"[" * 200_000 + b"]" * 200_000
+    assert len(payload) < updater._MAX_TEXT_BYTES
+    calls = _fake_open(monkeypatch, {updater.RELEASES_API: payload})
+
+    result = updater.check_latest()
+
+    assert result.info is None
+    assert result.reason == updater.CHECK_REASON_METADATA
+    assert len(calls) == 1
+
+
+def test_check_latest_logs_unexpected_errors_at_warning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A programming error still reports ``network`` but is visible in the log."""
+
+    def _boom(*args, **kwargs):
+        raise AttributeError("simulated refactor bug")
+
+    records: list[logging.LogRecord] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    # The plugin logger hierarchy does not propagate to root, so attach the
+    # capture handler directly instead of using caplog.
+    logger = logging.getLogger(updater.log.name)
+    handler = _Capture()
+    logger.addHandler(handler)
+    monkeypatch.setattr(updater, "_open_url", _boom)
+    try:
+        result = updater.check_latest()
+    finally:
+        logger.removeHandler(handler)
+
+    assert result.info is None
+    assert result.reason == updater.CHECK_REASON_NETWORK
+    warnings = [record for record in records if record.levelno == logging.WARNING]
+    assert warnings
+    assert warnings[0].exc_info is not None
+    assert "unexpected" in warnings[0].getMessage().lower()
 
 
 def test_update_from_release_drops_pep440_local_segment() -> None:
@@ -452,6 +634,14 @@ def test_update_from_release_drops_pep440_local_segment() -> None:
     assert info.version == "0.2.9"
     assert updater.is_update_available(info.version, "0.2.8")
     assert updater._validate_version(info.version) == "0.2.9"
+
+
+def test_update_from_release_returns_info_without_checksum() -> None:
+    info = updater._update_from_release(_release_data("0.2.9", checksum=False))
+
+    assert info is not None
+    assert info.version == "0.2.9"
+    assert info.checksum_url is None
 
 
 @pytest.mark.parametrize("tag", ["v+", "+", "v", "   +  "])
@@ -469,7 +659,10 @@ def test_check_latest_rejects_tag_with_only_local_segment(
     )
     _fake_open(monkeypatch, {updater.RELEASES_API: payload})
 
-    assert updater.check_latest() is None
+    result = updater.check_latest()
+
+    assert result.info is None
+    assert result.reason == updater.CHECK_REASON_METADATA
 
 
 @pytest.mark.parametrize(
@@ -488,16 +681,45 @@ def test_update_from_release_rejects_uninstallable_tag() -> None:
 
 
 @pytest.mark.parametrize(
-    "failure",
+    ("failure", "reason", "attempts"),
     [
-        OSError("boom"),
-        TimeoutError("timed out"),
-        b"{not valid json",
+        (OSError("boom"), updater.CHECK_REASON_NETWORK, 1),
+        (TimeoutError("timed out"), updater.CHECK_REASON_TIMEOUT, 2),
+        (URLError("no route to host"), updater.CHECK_REASON_NETWORK, 2),
+        (b"{not valid json", updater.CHECK_REASON_METADATA, 1),
     ],
 )
-def test_check_latest_returns_none_on_failure(monkeypatch: pytest.MonkeyPatch, failure) -> None:
-    _fake_open(monkeypatch, {updater.RELEASES_API: failure})
-    assert updater.check_latest(timeout=0.01) is None
+def test_check_latest_reports_reason_without_raising(
+    monkeypatch: pytest.MonkeyPatch,
+    failure: object,
+    reason: str,
+    attempts: int,
+) -> None:
+    calls = _fake_open(monkeypatch, {updater.RELEASES_API: failure})
+
+    result = updater.check_latest(timeout=0.01)
+
+    assert result.info is None
+    assert result.reason == reason
+    assert len(calls) == attempts
+
+
+def test_check_latest_treats_rejected_url_as_network(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _reject(*args, **kwargs):
+        raise updater.UpdateError("Refusing to fetch from untrusted host")
+
+    monkeypatch.setattr(updater, "_open_url", _reject)
+
+    result = updater.check_latest()
+
+    assert result.info is None
+    assert result.reason == updater.CHECK_REASON_NETWORK
+
+
+def test_check_timeout_is_at_least_ten_seconds() -> None:
+    assert updater.CHECK_TIMEOUT >= 10.0
 
 
 # 4. Download + checksum ---------------------------------------------------------
@@ -530,6 +752,50 @@ def test_download_and_verify_rejects_checksum_mismatch(
         updater.download_and_verify(update, tmp_path)
 
     assert list(tmp_path.iterdir()) == []  # no partial zip left behind
+
+
+def test_download_and_verify_without_checksum_skips_only_comparison(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    zip_payload = _zip_bytes({"kicad_ai_assistant/__init__.py": b"new"})
+    update = updater.UpdateInfo(
+        version="0.2.9",
+        zip_url=_ZIP_URL,
+        checksum_url=None,
+        page_url=updater.RELEASE_PAGE,
+    )
+    calls = _fake_open(monkeypatch, {_ZIP_URL: zip_payload})
+
+    def _no_checksum_fetch(*args, **kwargs):
+        pytest.fail("checksum URL was fetched for a release without SHA256SUMS")
+
+    monkeypatch.setattr(updater, "_fetch_text", _no_checksum_fetch)
+
+    download = updater.download_and_verify(update, tmp_path)
+
+    assert isinstance(download, updater.VerifiedDownload)
+    assert download.path == tmp_path / "kicad_ai_assistant.zip"
+    assert download.sha256 == hashlib.sha256(zip_payload).hexdigest()
+    assert download.path.read_bytes() == zip_payload
+    assert calls == [_ZIP_URL]  # no request to a checksum URL
+
+
+def test_download_without_checksum_still_enforces_size_cap(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    update = updater.UpdateInfo(
+        version="0.2.9",
+        zip_url=_ZIP_URL,
+        checksum_url=None,
+        page_url=updater.RELEASE_PAGE,
+    )
+    _fake_open(monkeypatch, {_ZIP_URL: b"x" * 32})
+    monkeypatch.setattr(updater, "_MAX_ARCHIVE_BYTES", 8)
+
+    with pytest.raises(updater.UpdateError, match="too large"):
+        updater.download_and_verify(update, tmp_path)
+
+    assert list(tmp_path.iterdir()) == []  # partial download removed
 
 
 def test_checksum_parser_accepts_dist_prefix_and_rejects_conflicts() -> None:

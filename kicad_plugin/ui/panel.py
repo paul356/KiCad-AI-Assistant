@@ -100,6 +100,26 @@ def _should_offer_update(latest: str, current: str) -> bool:
     return updater.is_update_available(latest, current)
 
 
+def _update_check_message(result, current: str) -> str | None:
+    """Message for a finished manual update check, or None to offer an upgrade.
+
+    ``result`` is an ``updater.CheckResult``.  The wording distinguishes an
+    unusable release (``metadata``) from a transport failure (``network`` /
+    ``timeout``), so the panel never blames the connection for a release that
+    simply lacks the assets the updater needs.
+    """
+    from .. import updater
+
+    if result.info is None:
+        if result.reason == updater.CHECK_REASON_METADATA:
+            return "Could not check for updates: the latest release is missing required files."
+        return "Could not check for updates. Check your network connection and try again."
+
+    if _should_offer_update(result.info.version, current):
+        return None
+    return f"You are running the latest version ({current})."
+
+
 if _WX_AVAILABLE:
 
     class _FileDropTarget(wx.FileDropTarget):
@@ -2141,45 +2161,54 @@ if _WX_AVAILABLE:
             plugin_dir = self._plugin_dir()
 
             def _run():
-                info = None
+                result = None
                 current = ""
                 try:
                     from .. import updater
 
                     current = updater.current_version(plugin_dir)
-                    info = updater.check_latest()
+                    result = updater.check_latest()
                 except Exception:
                     log.debug("update check failed", exc_info=True)
-                wx.CallAfter(self._on_update_check_done, info, current, manual)
+                wx.CallAfter(self._on_update_check_done, result, current, manual)
 
             threading.Thread(target=_run, daemon=True).start()
 
-        def _on_update_check_done(self, info, current: str, manual: bool) -> None:
+        def _on_update_check_done(self, result, current: str, manual: bool) -> None:
             self._update_check_running = False
             self._set_check_updates_enabled(True)
 
-            if info is None:
+            from .. import updater
+
+            if result is None:
+                result = updater.CheckResult(info=None, reason=updater.CHECK_REASON_NETWORK)
+            log_fn = log.info if manual else log.debug
+            log_fn(
+                "update check: reason=%s version=%s",
+                result.reason,
+                result.info.version if result.info is not None else None,
+            )
+
+            message = _update_check_message(result, current)
+            if message is not None:
                 if manual:
+                    icon = (
+                        wx.ICON_INFORMATION
+                        if result.reason == updater.CHECK_REASON_OK
+                        else wx.ICON_WARNING
+                    )
                     wx.MessageBox(
-                        "Could not check for updates. Check your network connection and try again.",
+                        message,
                         "Check for Updates",
-                        wx.OK | wx.ICON_WARNING,
+                        wx.OK | icon,
                         self,
                     )
                 return
 
-            if not _should_offer_update(info.version, current):
-                if manual:
-                    wx.MessageBox(
-                        f"You are running the latest version ({current}).",
-                        "Check for Updates",
-                        wx.OK | wx.ICON_INFORMATION,
-                        self,
-                    )
+            if result.info is None:  # defensive: no upgrade without a release
                 return
-
-            self._set_check_updates_label(info.version)
-            self._prompt_upgrade(info, current)
+            self._set_check_updates_label(result.info.version)
+            self._prompt_upgrade(result.info, current)
 
         def _prompt_upgrade(self, info, current: str) -> None:
             dialog = wx.Dialog(self, wx.ID_ANY, "Update available", size=(480, 280))
