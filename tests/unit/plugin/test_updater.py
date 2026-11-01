@@ -6,6 +6,7 @@ install targets are temporary directories.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import hashlib
 import importlib
 import io
@@ -13,6 +14,7 @@ import json
 import logging
 import os
 from pathlib import Path, PurePosixPath
+import shutil
 import subprocess
 import sys
 import threading
@@ -108,10 +110,42 @@ def _release_zip() -> bytes:
     )
 
 
-def _site_packages(plugin_dir: Path) -> Path:
-    if os.name == "nt":
-        return plugin_dir / ".venv" / "Lib" / "site-packages"
-    return plugin_dir / ".venv" / "lib" / "python3.10" / "site-packages"
+def _site_packages(plugin_dir: Path, layout: tuple[str, ...] | None = None) -> Path:
+    """Path of the venv's site-packages under one supported venv layout."""
+    if layout is None:
+        if os.name == "nt":
+            layout = ("Lib", "site-packages")
+        else:
+            layout = ("lib", "python3.10", "site-packages")
+    return plugin_dir / ".venv" / Path(*layout)
+
+
+def _set_kcaa(
+    plugin_dir: Path,
+    version: str | None,
+    *,
+    editable: bool = False,
+    direct_url: str | None = None,
+) -> Path:
+    """Simulate the venv's installed ``kcaa`` metadata."""
+    site = _site_packages(plugin_dir)
+    for dist in site.glob("kcaa-*.dist-info"):
+        shutil.rmtree(dist)
+    if version is None:
+        return site
+    dist = site / f"kcaa-{version}.dist-info"
+    dist.mkdir(parents=True)
+    (dist / "METADATA").write_text(
+        f"Metadata-Version: 2.1\nName: kcaa\nVersion: {version}\n",
+        encoding="utf-8",
+    )
+    if direct_url is not None:
+        (dist / "direct_url.json").write_text(direct_url, encoding="utf-8")
+    elif editable:
+        (dist / "direct_url.json").write_text(
+            '{"url": "file:///src", "dir_info": {"editable": true}}', encoding="utf-8"
+        )
+    return site
 
 
 def _write_plugin(plugin_dir: Path, version: str = "0.2.8") -> Path:
@@ -127,17 +161,29 @@ def _write_plugin(plugin_dir: Path, version: str = "0.2.8") -> Path:
     venv_python.parent.mkdir(parents=True, exist_ok=True)
     venv_python.write_text("", encoding="utf-8")
 
-    site = _site_packages(plugin_dir)
+    site = _set_kcaa(plugin_dir, version)
     (site / "kcaa").mkdir(parents=True)
-    (site / "kcaa" / "__init__.py").write_text('__version__ = "0.2.8"', encoding="utf-8")
-    dist_info = site / "kcaa-0.2.8.dist-info"
-    dist_info.mkdir()
-    (dist_info / "METADATA").write_text("Name: kcaa\nVersion: 0.2.8\n", encoding="utf-8")
+    (site / "kcaa" / "__init__.py").write_text(f'__version__ = "{version}"', encoding="utf-8")
     return venv_python
 
 
 def _completed(command, returncode: int, stdout: str = "", stderr: str = ""):
     return subprocess.CompletedProcess(command, returncode, stdout, stderr)
+
+
+@contextmanager
+def _capture_logs(
+    caplog: pytest.LogCaptureFixture, logger: logging.Logger, level: int = logging.DEBUG
+):
+    """Capture one logger's records even though the plugin disables propagation."""
+    logger.addHandler(caplog.handler)
+    previous_level = logger.level
+    logger.setLevel(level)
+    try:
+        yield
+    finally:
+        logger.removeHandler(caplog.handler)
+        logger.setLevel(previous_level)
 
 
 def _mock_uv(
@@ -149,13 +195,15 @@ def _mock_uv(
     install_stderr: str = "",
     calls: list[list[str]] | None = None,
     on_install=None,
-    probe_results: list[object] | None = None,
-    on_probe=None,
+    update_metadata: bool = True,
     uv_available: bool = True,
 ) -> None:
-    """Fake uv discovery and subprocess runs for probe + pre-flight + install."""
-    probes = list(probe_results or [])
-    fake_installed: str | None = None
+    """Fake uv discovery and subprocess runs for pre-flight + install.
+
+    A successful install rewrites the simulated venv metadata the way uv
+    would, unless ``update_metadata`` is false (uv exits 0 but the venv is
+    left alone, which the post-install check must catch).
+    """
     monkeypatch.setattr(
         updater.shutil,
         "which",
@@ -163,34 +211,19 @@ def _mock_uv(
     )
 
     def _run(command, **kwargs):
-        nonlocal fake_installed
-        if command[1:2] == ["-c"]:
-            if on_probe is not None:
-                on_probe(command)
-            if probes:
-                result = probes.pop(0)
-            elif fake_installed is not None:
-                result = fake_installed
-            else:
-                result = None
-            if isinstance(result, BaseException):
-                raise result
-            if result is None:
-                return _completed(command, 1)
-            if isinstance(result, updater.InstalledKcaa):
-                payload = {"version": result.version, "editable": result.editable}
-            else:
-                payload = {"version": str(result), "editable": False}
-            return _completed(command, 0, stdout=f"{json.dumps(payload)}\n")
         if calls is not None:
             calls.append(list(command))
         if "--dry-run" in command:
             return _completed(command, dry_run_returncode, stderr=dry_run_stderr)
-        if install_returncode == 0:
-            fake_installed = next(
+        if install_returncode == 0 and update_metadata:
+            version = next(
                 (arg.split("==", 1)[1] for arg in command if arg.startswith("kcaa==")),
-                fake_installed,
+                None,
             )
+            python_arg = command[command.index("--python") + 1]
+            plugin_dir = Path(python_arg).parents[2]
+            if version is not None:
+                _set_kcaa(plugin_dir, version)
         if on_install is not None:
             on_install(command)
         return _completed(command, install_returncode, stderr=install_stderr)
@@ -223,8 +256,15 @@ def test_is_update_available_compares_normalized_tags(
     assert updater.is_update_available(latest, current) is expected
 
 
-def test_panel_update_branch_uses_tag_inequality(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Execute the panel branch with a fake wx so the call site is exercised."""
+@contextmanager
+def _panel_with_fake_wx():
+    """Import ``kicad_plugin.ui.panel`` against a stub ``wx`` module.
+
+    wx is not a test dependency, so the guarded branch is exercised with a
+    fake module; the panel is re-imported to take its ``_WX_AVAILABLE`` path.
+    Yields ``(panel_module, fake_wx)``; callers may replace any widget class
+    on ``fake_wx`` before driving the panel.
+    """
 
     class _Dummy:
         def __init__(self, *args, **kwargs) -> None:
@@ -232,13 +272,33 @@ def test_panel_update_branch_uses_tag_inequality(monkeypatch: pytest.MonkeyPatch
 
     fake_wx = types.ModuleType("wx")
     fake_wx.__kcaa_fake_wx__ = True  # type: ignore[attr-defined]
+    fake_wx.__getattr__ = lambda name: _Dummy  # type: ignore[attr-defined]
+    # Numeric flags and ids: the panel ORs them together (``wx.OK |
+    # wx.ICON_WARNING``), which a class sentinel would not support.
+    for name, value in {
+        "VERTICAL": 1,
+        "HORIZONTAL": 2,
+        "EXPAND": 4,
+        "ALL": 8,
+        "LEFT": 16,
+        "RIGHT": 32,
+        "BOTTOM": 64,
+        "ID_ANY": -1,
+        "ID_OK": 5100,
+        "ID_CANCEL": 5101,
+        "OK": 1 << 10,
+        "ICON_INFORMATION": 1 << 11,
+        "ICON_WARNING": 1 << 12,
+        "ICON_ERROR": 1 << 13,
+    }.items():
+        setattr(fake_wx, name, value)
+    fake_wx.EVT_BUTTON = object()  # type: ignore[attr-defined]
     fake_html = types.ModuleType("wx.html")
     fake_html.HtmlWindow = _Dummy  # type: ignore[attr-defined]
     fake_html2 = types.ModuleType("wx.html2")
     fake_html2.WebView = _Dummy  # type: ignore[attr-defined]
     fake_wx.html = fake_html  # type: ignore[attr-defined]
     fake_wx.html2 = fake_html2  # type: ignore[attr-defined]
-    fake_wx.__getattr__ = lambda name: _Dummy  # type: ignore[attr-defined]
 
     module_names = ("wx", "wx.html", "wx.html2", "kicad_plugin.ui.panel")
     missing = object()
@@ -250,25 +310,218 @@ def test_panel_update_branch_uses_tag_inequality(monkeypatch: pytest.MonkeyPatch
         sys.modules["wx.html"] = fake_html
         sys.modules["wx.html2"] = fake_html2
         sys.modules.pop("kicad_plugin.ui.panel", None)
-
         panel = importlib.import_module("kicad_plugin.ui.panel")
         assert panel._WX_AVAILABLE  # noqa: SLF001 - exercising the real branch
-        info = updater.UpdateInfo("0.2.9", _ZIP_URL, _SUMS_URL, updater.RELEASE_PAGE)
-        result = updater.CheckResult(info, updater.CHECK_REASON_OK)
+        yield panel, fake_wx
+    finally:
+        for name, previous in saved_modules.items():
+            if previous is missing:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = previous  # type: ignore[assignment]
+        current_ui_pkg = sys.modules.get("kicad_plugin.ui")
+        if current_ui_pkg is not None:
+            if saved_panel_attr is None:
+                current_ui_pkg.__dict__.pop("panel", None)
+            else:
+                current_ui_pkg.panel = saved_panel_attr  # type: ignore[attr-defined]
 
-        class _FakePanel:
-            def __init__(self) -> None:
-                self.labeled: list[str] = []
-                self.prompted: list[tuple[object, str]] = []
 
-            def _set_check_updates_enabled(self, enabled: bool) -> None:
-                pass
+_CANONICAL_SPELLINGS = [
+    # The reported case: a release tag hyphenating the pre-release.
+    ("0.2.9-RC1", "0.2.9rc1"),
+    ("0.2.9_rc1", "0.2.9rc1"),
+    ("0.2.9.rc1", "0.2.9rc1"),
+    ("0.2.9rc1", "0.2.9rc1"),
+    ("v0.2.9-RC1", "0.2.9rc1"),
+    ("V0.2.9rc1", "0.2.9rc1"),
+    ("  0.2.9-RC1  ", "0.2.9rc1"),
+    # Single-component releases: the canonical form attaches the suffix with
+    # no separator, so it must remain a valid allow-listed version.
+    ("1-rc1", "1rc1"),
+    ("1.rc1", "1rc1"),
+    ("1-a1", "1a1"),
+    ("1-alpha.1", "1a1"),
+    ("1b2", "1b2"),
+    ("1rc1.post1.dev2", "1rc1.post1.dev2"),
+    # Pre-release aliases and implicit release numbers.
+    ("1.0-rc", "1.0rc0"),
+    ("1.0.a", "1.0a0"),
+    ("1.0alpha", "1.0a0"),
+    ("1.0a", "1.0a0"),
+    ("1.0-beta2", "1.0b2"),
+    ("1.0b", "1.0b0"),
+    ("1.0c3", "1.0rc3"),
+    ("1.0preview4", "1.0rc4"),
+    ("1.0pre5", "1.0rc5"),
+    ("1.0RC01", "1.0rc1"),
+    # Post-release spellings and implicit numbers.
+    ("1.0post", "1.0.post0"),
+    ("1.0.post", "1.0.post0"),
+    ("1.0-1", "1.0.post1"),
+    ("1.0-r2", "1.0.post2"),
+    ("1.0rev3", "1.0.post3"),
+    # Development releases.
+    ("1.0-dev", "1.0.dev0"),
+    ("1.0dev2", "1.0.dev2"),
+    ("1.0a1.post2.dev3", "1.0a1.post2.dev3"),
+    # PEP 440 drops leading zeros from every numeric component.
+    ("1.02", "1.2"),
+    ("01.002.0003", "1.2.3"),
+    ("1.0.0", "1.0.0"),
+    # Local segments are dropped; unrecognised suffixes stay as-is.
+    ("0.2.9-RC1+local.1", "0.2.9rc1"),
+    ("0.2.9-bugfix1", "0.2.9-bugfix1"),
+]
 
-            def _set_check_updates_label(self, version: str) -> None:
-                self.labeled.append(version)
 
-            def _prompt_upgrade(self, info: object, current: str) -> None:
-                self.prompted.append((info, current))
+@pytest.mark.parametrize(("spelling", "canonical"), _CANONICAL_SPELLINGS)
+def test_normalize_version_canonicalizes_pep440(spelling: str, canonical: str) -> None:
+    assert updater._normalize_version(spelling) == canonical
+    assert updater._normalize_version(canonical) == canonical  # idempotent
+
+
+@pytest.mark.parametrize(("spelling", "canonical"), _CANONICAL_SPELLINGS)
+def test_canonical_versions_are_installable(spelling: str, canonical: str) -> None:
+    """Every canonicalised spelling must survive validation and release parsing."""
+    assert updater._validate_version(canonical) == canonical
+    info = updater._update_from_release(_release_data(spelling))
+    assert info is not None
+    assert info.version == canonical
+
+
+@pytest.mark.parametrize(
+    ("tag", "canonical"),
+    [("1-rc1", "1rc1"), ("1.rc1", "1rc1"), ("1-a1", "1a1"), ("1-alpha.1", "1a1")],
+)
+def test_single_component_prerelease_tags_round_trip(tag: str, canonical: str) -> None:
+    """Regression: canonicalisation must not make ``check_latest`` drop a release."""
+    assert updater._normalize_version(tag) == canonical
+    info = updater._update_from_release(_release_data(tag))
+    assert info is not None
+    assert info.version == canonical
+
+
+@pytest.mark.parametrize(
+    "version",
+    [
+        "1",
+        "0.2",
+        "0.2.9",
+        "0.2.9.0",
+        "0.2.9-rc1",
+        "0.2.9.rc1",
+        "0.2.4-bugfix2",
+        "1-1",
+        "1-rc-1",
+        "1-alpha.1",
+        "1-RC1",
+        "1.0.post1",
+        "1.0.dev2",
+    ],
+)
+def test_validate_version_keeps_accepting_legacy_tag_shapes(version: str) -> None:
+    assert updater._validate_version(version) == version
+
+
+@pytest.mark.parametrize(
+    "version",
+    [
+        "0.2.9_final",
+        "1.0+local",
+        "1rc1+local",
+        "1.0/2",
+        "1..0",
+        "",
+        "   ",
+        "1 0",
+        "not-a-version",
+        "1!2.0",
+        "-1",
+        "1-",
+        "1rc1_extra",
+    ],
+)
+def test_validate_version_rejects_hostile_strings(version: str) -> None:
+    with pytest.raises(updater.UpdateError, match="Unsafe version"):
+        updater._validate_version(version)
+
+
+@pytest.mark.parametrize("version", ["١rc١", "1rc1.post１", "０.２.９"])
+def test_validate_version_rejects_non_ascii_digits(version: str) -> None:
+    # The canonicaliser only understands ASCII digits, so these stay
+    # uncanonicalised.  They must never be advertised or reach install_update(),
+    # where pip would reject them at pre-flight.
+    assert updater._normalize_version(version) == version
+    with pytest.raises(updater.UpdateError, match="Unsafe version"):
+        updater._validate_version(version)
+    assert updater._update_from_release(_release_data(version)) is None
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (None, ""),
+        ("", ""),
+        ("   ", ""),
+        ("v+", ""),
+        ("  v  ", ""),
+        (0, "0"),
+        (5, "5"),
+        ("not-a-version", "not-a-version"),
+    ],
+)
+def test_normalize_version_never_raises_on_odd_input(value: object, expected: str) -> None:
+    assert updater._normalize_version(value) == expected
+
+
+@pytest.mark.parametrize(
+    ("latest", "current", "expected"),
+    [
+        ("0.2.9_rc1", "0.2.9-RC1", False),
+        ("0.2.9.rc1", "0.2.9rc1", False),
+        ("v0.2.9-RC1", "0.2.9rc1", False),
+        ("1.0-rc", "1.0rc0", False),
+        ("1.0.a", "1.0a0", False),
+        ("1.0-1", "1.0.post1", False),
+        ("0.2.9", "0.2.10", True),
+        ("0.2.9rc1", "0.2.9", True),
+        ("1.0a1", "1.0b1", True),
+    ],
+)
+def test_is_update_available_compares_canonical_versions(
+    latest: str, current: str, expected: bool
+) -> None:
+    assert updater.is_update_available(latest, current) is expected
+
+
+def test_version_comparison_does_not_coerce_numbers_to_floats() -> None:
+    assert updater._normalize_version("0.2.9") != updater._normalize_version("0.2.10")
+    assert updater.is_update_available("0.2.9", "0.2.10") is True
+
+
+def test_panel_update_branch_uses_tag_inequality(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Execute the panel branch with a fake wx so the call sites are exercised."""
+    info = updater.UpdateInfo("0.2.9", _ZIP_URL, _SUMS_URL, updater.RELEASE_PAGE)
+    result = updater.CheckResult(info, updater.CHECK_REASON_OK)
+
+    class _FakePanel:
+        def __init__(self) -> None:
+            self.labeled: list[str] = []
+            self.prompted: list[tuple[object, str]] = []
+
+        def _set_check_updates_enabled(self, enabled: bool) -> None:
+            pass
+
+        def _set_check_updates_label(self, version: str) -> None:
+            self.labeled.append(version)
+
+        def _prompt_upgrade(self, info: object, current: str) -> None:
+            self.prompted.append((info, current))
+
+    with _panel_with_fake_wx() as (panel, fake_wx):
+        messages: list[tuple[object, ...]] = []
+        fake_wx.MessageBox = lambda *args, **kwargs: messages.append(args)  # type: ignore[attr-defined]
 
         calls: list[tuple[str, str]] = []
 
@@ -295,8 +548,17 @@ def test_panel_update_branch_uses_tag_inequality(monkeypatch: pytest.MonkeyPatch
         assert fake_panel.prompted == [(info, "0.2.8")]
         assert fake_panel.labeled == ["0.2.9"]
 
-        messages: list[tuple[object, ...]] = []
-        fake_wx.MessageBox = lambda *args, **kwargs: messages.append(args)  # type: ignore[attr-defined]
+        # An editable kcaa blocks the offer even when a newer release exists.
+        fake_panel = _FakePanel()
+        messages.clear()
+        panel.AssistantPanel._on_update_check_done(  # noqa: SLF001
+            fake_panel, result, "0.2.8", True, True
+        )
+
+        assert fake_panel.prompted == []
+        assert fake_panel.labeled == []
+        assert len(messages) == 1
+        assert "editable mode (source checkout)" in str(messages[0][0])
 
         class _FinishedPanel:
             _update_progress_timer = None
@@ -308,31 +570,89 @@ def test_panel_update_branch_uses_tag_inequality(monkeypatch: pytest.MonkeyPatch
             def _set_check_updates_label(self, version: str) -> None:
                 pass
 
+        messages.clear()
         panel.AssistantPanel._on_upgrade_finished(  # noqa: SLF001
             _FinishedPanel(),
             info,
             "",
             None,
             None,
-            updater.InstallOutcome(False, "editable"),
         )
 
         assert len(messages) == 1
-        assert "kcaa is installed in editable mode and was left unchanged" in str(messages[0][0])
-        assert "update it yourself if needed" in str(messages[0][0])
+        assert "was updated to version 0.2.9" in str(messages[0][0])
         assert "Restart KiCad" in str(messages[0][0])
-    finally:
-        for name, previous in saved_modules.items():
-            if previous is missing:
-                sys.modules.pop(name, None)
-            else:
-                sys.modules[name] = previous  # type: ignore[assignment]
-        current_ui_pkg = sys.modules.get("kicad_plugin.ui")
-        if current_ui_pkg is not None:
-            if saved_panel_attr is None:
-                current_ui_pkg.__dict__.pop("panel", None)
-            else:
-                current_ui_pkg.panel = saved_panel_attr  # type: ignore[attr-defined]
+        assert "left unchanged" not in str(messages[0][0])
+
+
+def test_upgrade_dialog_is_content_fitted_not_fixed_height() -> None:
+    """The dialog derives its height from content; it has no fixed size."""
+    records: dict[str, object] = {"wraps": [], "buttons": [], "lifecycle": []}
+
+    class _StaticText:
+        def __init__(self, parent, id, label) -> None:
+            self.label = label
+            records["wraps"].append(None)
+
+        def Wrap(self, width) -> None:
+            records["wraps"][-1] = width
+
+    class _Sizer:
+        def __init__(self, orient) -> None:
+            self.orient = orient
+            self.items = []
+
+        def Add(self, item, proportion=0, flags=0, border=0) -> None:
+            self.items.append(item)
+
+        def AddStretchSpacer(self) -> None:
+            self.items.append(None)
+
+    class _Button:
+        def __init__(self, parent, id, label) -> None:
+            self.label = label
+            records["buttons"].append(label)
+
+        def Bind(self, event, handler) -> None:
+            pass
+
+    class _Dialog:
+        def __init__(self, parent, id, title, **kwargs) -> None:
+            self.title = title
+            records["size_kwarg"] = kwargs.get("size")
+
+        def SetSizerAndFit(self, sizer) -> None:
+            records["fitted"] = True
+            records["sizer_items"] = len(sizer.items)
+
+        def SetMinSize(self, size) -> None:
+            records["min_size"] = size
+
+        def CentreOnParent(self) -> None:
+            records["lifecycle"].append("centre")
+
+        def ShowModal(self):
+            records["lifecycle"].append("modal")
+            return 0
+
+        def Destroy(self) -> None:
+            records["lifecycle"].append("destroy")
+
+    info = updater.UpdateInfo("0.2.9", _ZIP_URL, None, updater.RELEASE_PAGE)
+    with _panel_with_fake_wx() as (panel, fake_wx):
+        fake_wx.Dialog = _Dialog  # type: ignore[attr-defined]
+        fake_wx.BoxSizer = _Sizer  # type: ignore[attr-defined]
+        fake_wx.StaticText = _StaticText  # type: ignore[attr-defined]
+        fake_wx.Button = _Button  # type: ignore[attr-defined]
+        panel.AssistantPanel._prompt_upgrade(object(), info, "0.2.8")  # noqa: SLF001
+
+    assert records["size_kwarg"] is None  # no fixed size that could clip
+    assert records["fitted"] is True
+    assert records["sizer_items"] == 3  # message, hint, button row
+    assert records["wraps"] == [440, 440]
+    assert records["min_size"] == (460, -1)
+    assert records["buttons"] == ["Upgrade now", "Later", "Open release page"]
+    assert records["lifecycle"] == ["centre", "modal", "destroy"]
 
 
 def test_panel_update_check_messages_distinguish_reasons() -> None:
@@ -362,6 +682,31 @@ def test_panel_update_check_messages_distinguish_reasons() -> None:
     assert metadata != network
     assert latest == "You are running the latest version (0.2.9)."
     assert upgrade is None
+
+
+def test_panel_update_check_message_blocks_editable_installs() -> None:
+    from kicad_plugin.ui import panel
+
+    info = updater.UpdateInfo("0.2.9", _ZIP_URL, None, updater.RELEASE_PAGE)
+    expected = (
+        "kcaa is installed in editable mode (source checkout); the panel will not "
+        "upgrade the plugin. Update the checkout and rerun setup_plugin.sh."
+    )
+
+    # Never None: an editable install must not open the upgrade dialog, even
+    # when the release differs from (or matches) the running version.
+    for current in ("0.2.8", "0.2.9"):
+        assert (
+            panel._update_check_message(
+                updater.CheckResult(info, updater.CHECK_REASON_OK), current, editable=True
+            )
+            == expected
+        )
+
+    assert (
+        panel._update_check_message(updater.CheckResult(info, updater.CHECK_REASON_OK), "0.2.9")
+        == "You are running the latest version (0.2.9)."
+    )
 
 
 @pytest.mark.parametrize(
@@ -667,9 +1012,9 @@ def test_check_latest_rejects_tag_with_only_local_segment(
 
 @pytest.mark.parametrize(
     ("tag", "expected"),
-    [("0.2.4-bugfix2", "0.2.4-bugfix2"), ("0.2.9-rc1", "0.2.9-rc1")],
+    [("0.2.4-bugfix2", "0.2.4-bugfix2"), ("0.2.9-rc1", "0.2.9rc1")],
 )
-def test_update_from_release_preserves_non_local_suffixes(tag: str, expected: str) -> None:
+def test_update_from_release_keeps_non_local_suffixes(tag: str, expected: str) -> None:
     info = updater._update_from_release(_release_data(tag))
 
     assert info is not None
@@ -873,110 +1218,213 @@ def test_install_update_skips_venv_when_kcaa_matches(
 ) -> None:
     plugin_dir = tmp_path / "kicad_ai_assistant"
     _write_plugin(plugin_dir)
+    _set_kcaa(plugin_dir, "0.2.9")
     zip_path = tmp_path / "release.zip"
     zip_path.write_bytes(_release_zip())
     calls: list[list[str]] = []
-    probes: list[list[str]] = []
     _mock_uv(
         monkeypatch,
         uv_available=False,  # an offline plugin-only upgrade must not need uv
         calls=calls,
-        probe_results=["0.2.9"],
-        on_probe=probes.append,
     )
 
     outcome = updater.install_update(zip_path, plugin_dir, "0.2.9")
 
     assert outcome == updater.InstallOutcome(False, "already-current")
     assert calls == []
-    assert len(probes) == 1
-    assert probes[0][1:2] == ["-c"]
-    assert "importlib.metadata" in probes[0][2]
     assert (plugin_dir / "VERSION").read_text(encoding="utf-8") == "0.2.9"
     assert (plugin_dir / "__init__.py").read_text(encoding="utf-8") == "new init"
     assert not updater.has_pending_recovery(plugin_dir)
 
 
-def test_install_update_skips_editable_kcaa_even_when_version_matches(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.parametrize("installed_version", ["0.2.8", "0.2.9"])
+def test_install_update_refuses_editable_kcaa_before_touching_anything(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, installed_version: str
 ) -> None:
     plugin_dir = tmp_path / "kicad_ai_assistant"
     _write_plugin(plugin_dir)
+    _set_kcaa(plugin_dir, installed_version, editable=True)
     zip_path = tmp_path / "release.zip"
     zip_path.write_bytes(_release_zip())
+    before = {path: path.read_bytes() for path in plugin_dir.rglob("*") if path.is_file()}
     calls: list[list[str]] = []
-    _mock_uv(
-        monkeypatch,
-        uv_available=False,
-        calls=calls,
-        probe_results=[updater.InstalledKcaa("0.2.9", editable=True)],
-    )
+    _mock_uv(monkeypatch, calls=calls)
 
-    outcome = updater.install_update(zip_path, plugin_dir, "0.2.9")
+    with pytest.raises(
+        updater.UpdateError,
+        match="kcaa is installed in editable mode; the plugin will not be upgraded",
+    ) as excinfo:
+        updater.install_update(zip_path, plugin_dir, "0.2.9")
 
-    assert outcome == updater.InstallOutcome(False, "editable")
-    assert calls == []
-    assert (plugin_dir / "VERSION").read_text(encoding="utf-8") == "0.2.9"
-    assert (plugin_dir / "__init__.py").read_text(encoding="utf-8") == "new init"
+    assert excinfo.value.restored is True
+    assert excinfo.value.backup_dir is None
+    assert calls == []  # no uv dry-run or install
+    assert not (plugin_dir / ".backup").exists()
     assert not updater.has_pending_recovery(plugin_dir)
-
-
-def test_install_update_never_replaces_editable_kcaa_with_other_version(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    plugin_dir = tmp_path / "kicad_ai_assistant"
-    _write_plugin(plugin_dir)
-    zip_path = tmp_path / "release.zip"
-    zip_path.write_bytes(_release_zip())
-    calls: list[list[str]] = []
-    _mock_uv(
-        monkeypatch,
-        uv_available=False,
-        calls=calls,
-        probe_results=[updater.InstalledKcaa("0.2.8", editable=True)],
-    )
-
-    outcome = updater.install_update(zip_path, plugin_dir, "0.2.9")
-
-    assert outcome == updater.InstallOutcome(False, "editable")
-    assert calls == []
-    assert (plugin_dir / "VERSION").read_text(encoding="utf-8") == "0.2.9"
-    assert (plugin_dir / "__init__.py").read_text(encoding="utf-8") == "new init"
-    assert not updater.has_pending_recovery(plugin_dir)
+    after = {path: path.read_bytes() for path in plugin_dir.rglob("*") if path.is_file()}
+    assert after == before  # nothing created, deleted, or rewritten
 
 
 @pytest.mark.parametrize(
     ("direct_url", "editable"),
     [
         (None, False),
+        ("", False),
         ("{not json", False),
         ('{"url": "file:///x", "dir_info": {"editable": true}}', True),
         ('{"url": "file:///x", "dir_info": {"editable": false}}', False),
+        ("null", False),
     ],
 )
-def test_probe_script_detects_editable_direct_url(
+def test_installed_kcaa_info_reads_venv_metadata(
     tmp_path: Path, direct_url: str | None, editable: bool
 ) -> None:
-    dist = tmp_path / "kcaa-0.2.9.dist-info"
-    dist.mkdir()
-    (dist / "METADATA").write_text(
-        "Metadata-Version: 2.1\nName: kcaa\nVersion: 0.2.9\n",
+    plugin_dir = tmp_path / "kicad_ai_assistant"
+    _write_plugin(plugin_dir)
+    _set_kcaa(plugin_dir, "0.2.9", direct_url=direct_url)
+
+    assert updater.installed_kcaa_info(plugin_dir) == updater.InstalledKcaa("0.2.9", editable)
+
+
+def test_installed_kcaa_info_ignores_body_text_and_unrelated_projects(tmp_path: Path) -> None:
+    plugin_dir = tmp_path / "kicad_ai_assistant"
+    _write_plugin(plugin_dir)
+    site = _set_kcaa(plugin_dir, None)
+    broken = site / "kcaa-9.9.9.dist-info"
+    broken.mkdir()
+    (broken / "METADATA").write_text(
+        "Metadata-Version: 2.1\nName: kcaa\nVersion:\n\nVersion: 9.9.9\n",
         encoding="utf-8",
     )
-    if direct_url is not None:
-        (dist / "direct_url.json").write_text(direct_url, encoding="utf-8")
-    completed = subprocess.run(
-        [sys.executable, "-S", "-c", updater._KVAA_PROBE_SCRIPT],
-        capture_output=True,
-        text=True,
-        check=True,
-        cwd=tmp_path,
-        env={**os.environ, "PYTHONPATH": str(tmp_path)},
+    other = site / "kcaa_tools-1.0.dist-info"
+    other.mkdir()
+    (other / "METADATA").write_text("Name: kcaa_tools\nVersion: 1.0\n", encoding="utf-8")
+
+    assert updater.installed_kcaa_info(plugin_dir) == updater.InstalledKcaa(None, False)
+
+
+def test_installed_kcaa_info_does_not_spawn_the_venv_interpreter(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    plugin_dir = tmp_path / "kicad_ai_assistant"
+    _write_plugin(plugin_dir)
+    _set_kcaa(plugin_dir, "0.2.9", editable=True)
+
+    def _no_spawn(*args, **kwargs):
+        raise AssertionError("kcaa detection must not spawn a process")
+
+    monkeypatch.setattr(updater.subprocess, "run", _no_spawn)
+
+    assert updater.installed_kcaa_info(plugin_dir) == updater.InstalledKcaa("0.2.9", True)
+
+
+@pytest.mark.parametrize(
+    ("installed", "newer"),
+    [
+        ("0.2.9", "0.2.10"),  # lexical and numeric order disagree
+        ("0.2.99", "0.3.0"),  # lexical order would keep 0.2.99
+    ],
+)
+def test_installed_kcaa_info_prefers_newest_metadata(
+    tmp_path: Path, installed: str, newer: str
+) -> None:
+    plugin_dir = tmp_path / "kicad_ai_assistant"
+    _write_plugin(plugin_dir)
+    _set_kcaa(plugin_dir, installed)
+    site = _site_packages(plugin_dir)
+    stale = site / f"kcaa-{newer}.dist-info"
+    stale.mkdir()
+    (stale / "METADATA").write_text(f"Name: kcaa\nVersion: {newer}\n", encoding="utf-8")
+
+    assert updater.installed_kcaa_info(plugin_dir) == updater.InstalledKcaa(newer, False)
+
+
+@pytest.mark.parametrize(
+    ("dist_name", "expected_version"),
+    [
+        ("kcaa-0.2.9.dist-info", "2.9"),
+        ("Kcaa-1.0.dist-info", "2.9"),  # case-insensitive project name
+        ("kcaa-0.2.9-py3.13.egg-info", "2.9"),  # easy_install layout
+        ("kcaa-extra-1.0.dist-info", None),  # second segment is not a version
+        ("kcaa_tools-1.0.dist-info", None),  # different project
+    ],
+)
+def test_kcaa_dist_dir_name_matching(
+    tmp_path: Path, dist_name: str, expected_version: str | None
+) -> None:
+    plugin_dir = tmp_path / "kicad_ai_assistant"
+    dist = _site_packages(plugin_dir) / dist_name
+    dist.mkdir(parents=True)
+    (dist / "METADATA").write_text("Name: kcaa\nVersion: 2.9\n", encoding="utf-8")
+
+    assert updater.installed_kcaa_info(plugin_dir) == updater.InstalledKcaa(expected_version, False)
+
+
+@pytest.mark.parametrize(
+    "layout",
+    [
+        ("Lib", "site-packages"),  # Windows
+        ("lib", "python3.12", "site-packages"),  # POSIX
+        ("lib64", "python3.12", "site-packages"),  # POSIX, lib64
+    ],
+)
+def test_installed_kcaa_info_reads_every_site_packages_layout(
+    tmp_path: Path, layout: tuple[str, ...]
+) -> None:
+    plugin_dir = tmp_path / "kicad_ai_assistant"
+    dist = _site_packages(plugin_dir, layout) / "kcaa-0.2.9.dist-info"
+    dist.mkdir(parents=True)
+    (dist / "METADATA").write_text("Name: kcaa\nVersion: 0.2.9\n", encoding="utf-8")
+
+    assert updater.installed_kcaa_info(plugin_dir) == updater.InstalledKcaa("0.2.9", False)
+
+
+def test_installed_kcaa_info_falls_back_to_pkg_info(tmp_path: Path) -> None:
+    plugin_dir = tmp_path / "kicad_ai_assistant"
+    dist = _site_packages(plugin_dir) / "kcaa-0.2.9.egg-info"
+    dist.mkdir(parents=True)
+    (dist / "PKG-INFO").write_text(
+        "Metadata-Version: 1.0\nName: kcaa\nVersion: 0.2.9\n", encoding="utf-8"
     )
 
-    payload = json.loads(completed.stdout)
+    assert updater.installed_kcaa_info(plugin_dir) == updater.InstalledKcaa("0.2.9", False)
 
-    assert payload == {"version": "0.2.9", "editable": editable}
+
+def test_installed_kcaa_info_reports_unreadable_metadata_as_unknown(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    plugin_dir = tmp_path / "kicad_ai_assistant"
+    dist = _site_packages(plugin_dir) / "kcaa-0.2.9.dist-info"
+    dist.mkdir(parents=True)
+    (dist / "METADATA").mkdir()  # reading it raises IsADirectoryError
+
+    with _capture_logs(caplog, updater.log):
+        assert updater.installed_kcaa_info(plugin_dir) == updater.InstalledKcaa(None, False)
+
+    # The cause, not merely "not found", reaches the log.  The strerror text
+    # is platform-specific (IsADirectoryError on POSIX, PermissionError on
+    # Windows), so assert the file name and the cause marker only.
+    assert "no usable version" in caplog.text
+    assert "METADATA:" in caplog.text
+
+
+def test_installed_kcaa_info_warns_about_duplicate_versions(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    plugin_dir = tmp_path / "kicad_ai_assistant"
+    _write_plugin(plugin_dir)
+    _set_kcaa(plugin_dir, "0.2.99")
+    site = _site_packages(plugin_dir)
+    stale = site / "kcaa-0.3.0.dist-info"
+    stale.mkdir()
+    (stale / "METADATA").write_text("Name: kcaa\nVersion: 0.3.0\n", encoding="utf-8")
+
+    with _capture_logs(caplog, updater.log, logging.WARNING):
+        info = updater.installed_kcaa_info(plugin_dir)
+
+    assert info == updater.InstalledKcaa("0.3.0", False)
+    assert "0.2.99, 0.3.0" in caplog.text
+    assert "using 0.3.0" in caplog.text
 
 
 def test_install_update_installs_when_kcaa_is_older(
@@ -984,24 +1432,19 @@ def test_install_update_installs_when_kcaa_is_older(
 ) -> None:
     plugin_dir = tmp_path / "kicad_ai_assistant"
     _write_plugin(plugin_dir)
+    _set_kcaa(plugin_dir, "0.2.8")
     zip_path = tmp_path / "release.zip"
     zip_path.write_bytes(_release_zip())
     calls: list[list[str]] = []
-    probes: list[list[str]] = []
-    _mock_uv(
-        monkeypatch,
-        calls=calls,
-        probe_results=["0.2.8", "0.2.9"],
-        on_probe=probes.append,
-    )
+    _mock_uv(monkeypatch, calls=calls)
 
     outcome = updater.install_update(zip_path, plugin_dir, "0.2.9")
 
     assert outcome == updater.InstallOutcome(True, None)
-    assert len(probes) == 2
     assert calls[0][3:4] == ["--dry-run"]
     assert any("kcaa==0.2.9" in command for command in calls)
     assert (plugin_dir / "VERSION").read_text(encoding="utf-8") == "0.2.9"
+    assert updater.installed_kcaa_info(plugin_dir) == updater.InstalledKcaa("0.2.9", False)
 
 
 def test_install_update_keeps_new_tree_when_kcaa_verification_fails(
@@ -1011,7 +1454,8 @@ def test_install_update_keeps_new_tree_when_kcaa_verification_fails(
     _write_plugin(plugin_dir)
     zip_path = tmp_path / "release.zip"
     zip_path.write_bytes(_release_zip())
-    _mock_uv(monkeypatch, probe_results=["0.2.8", "0.2.8"])
+    # uv reports success but the venv metadata is untouched.
+    _mock_uv(monkeypatch, update_metadata=False)
 
     with pytest.raises(updater.UpdateError, match="plugin files were updated.*kcaa") as excinfo:
         updater.install_update(zip_path, plugin_dir, "0.2.9")
@@ -1023,34 +1467,90 @@ def test_install_update_keeps_new_tree_when_kcaa_verification_fails(
     assert not updater.has_pending_recovery(plugin_dir)
 
 
+def test_install_update_accepts_canonical_kcaa_version_for_prerelease_tag(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A ``0.2.9-RC1`` tag installs cleanly when METADATA reports ``0.2.9rc1``.
+
+    The install mock leaves the venv alone and the hook writes the canonical
+    spelling, matching what pip records in ``METADATA`` for the raw tag.
+    """
+    plugin_dir = tmp_path / "kicad_ai_assistant"
+    _write_plugin(plugin_dir)
+    zip_path = tmp_path / "release.zip"
+    zip_path.write_bytes(
+        _zip_bytes(
+            {
+                "kicad_ai_assistant/__init__.py": b"new init",
+                "kicad_ai_assistant/VERSION": b"0.2.9-RC1",
+            }
+        )
+    )
+    calls: list[list[str]] = []
+
+    def _record_canonical_metadata(command: list[str]) -> None:
+        _set_kcaa(plugin_dir, "0.2.9rc1")
+
+    _mock_uv(
+        monkeypatch,
+        calls=calls,
+        update_metadata=False,
+        on_install=_record_canonical_metadata,
+    )
+
+    outcome = updater.install_update(zip_path, plugin_dir, "0.2.9-RC1")
+
+    assert outcome == updater.InstallOutcome(True, None)
+    assert any("kcaa==0.2.9-RC1" in command for command in calls)
+    assert (plugin_dir / "VERSION").read_text(encoding="utf-8") == "0.2.9-RC1"
+    assert updater.installed_kcaa_info(plugin_dir) == updater.InstalledKcaa("0.2.9rc1", False)
+
+
 def test_install_update_installs_when_kcaa_is_missing(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     plugin_dir = tmp_path / "kicad_ai_assistant"
     _write_plugin(plugin_dir)
+    _set_kcaa(plugin_dir, None)
     zip_path = tmp_path / "release.zip"
     zip_path.write_bytes(_release_zip())
     calls: list[list[str]] = []
-    _mock_uv(monkeypatch, calls=calls, probe_results=[None, "0.2.9"])
+    _mock_uv(monkeypatch, calls=calls)
 
     updater.install_update(zip_path, plugin_dir, "0.2.9")
 
     assert any("kcaa==0.2.9" in command for command in calls)
 
 
-@pytest.mark.parametrize(
-    "probe_failure",
-    [OSError("probe failed"), subprocess.TimeoutExpired("python", 15.0)],
-)
-def test_install_update_installs_when_probe_fails(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, probe_failure: Exception
+def test_install_update_installs_when_metadata_has_no_version(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     plugin_dir = tmp_path / "kicad_ai_assistant"
     _write_plugin(plugin_dir)
+    dist = _site_packages(plugin_dir) / "kcaa-0.2.8.dist-info"
+    (dist / "METADATA").write_text("Name: kcaa\n", encoding="utf-8")
     zip_path = tmp_path / "release.zip"
     zip_path.write_bytes(_release_zip())
     calls: list[list[str]] = []
-    _mock_uv(monkeypatch, calls=calls, probe_results=[probe_failure, "0.2.9"])
+    _mock_uv(monkeypatch, calls=calls)
+
+    updater.install_update(zip_path, plugin_dir, "0.2.9")
+
+    assert any("kcaa==0.2.9" in command for command in calls)
+
+
+def test_install_update_installs_when_metadata_is_unreadable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    plugin_dir = tmp_path / "kicad_ai_assistant"
+    _write_plugin(plugin_dir)
+    dist = _site_packages(plugin_dir) / "kcaa-0.2.8.dist-info"
+    (dist / "METADATA").unlink()
+    (dist / "METADATA").mkdir()  # reading it raises IsADirectoryError
+    zip_path = tmp_path / "release.zip"
+    zip_path.write_bytes(_release_zip())
+    calls: list[list[str]] = []
+    _mock_uv(monkeypatch, calls=calls)
 
     updater.install_update(zip_path, plugin_dir, "0.2.9")
 
@@ -1372,21 +1872,12 @@ def test_preflight_retries_alternate_dry_run_placement(
     zip_path.write_bytes(_release_zip())
     calls: list[list[str]] = []
 
-    installed = "0.2.8"
-
     def _run(command, **kwargs):
-        nonlocal installed
-        if command[1:2] == ["-c"]:
-            return _completed(
-                command,
-                0,
-                stdout=json.dumps({"version": installed, "editable": False}) + "\n",
-            )
         calls.append(list(command))
         if "--dry-run" in command and command[3] == "--dry-run":
             return _completed(command, 2, stderr="error: unexpected argument '--dry-run' found")
         if "--dry-run" not in command:
-            installed = "0.2.9"
+            _set_kcaa(plugin_dir, "0.2.9")
         return _completed(command, 0)
 
     monkeypatch.setattr(
@@ -1418,20 +1909,11 @@ def test_preflight_skips_when_uv_rejects_dry_run(
     zip_path.write_bytes(_release_zip())
     calls: list[list[str]] = []
 
-    installed = "0.2.8"
-
     def _run(command, **kwargs):
-        nonlocal installed
-        if command[1:2] == ["-c"]:
-            return _completed(
-                command,
-                0,
-                stdout=json.dumps({"version": installed, "editable": False}) + "\n",
-            )
         calls.append(list(command))
         if "--dry-run" in command:
             return _completed(command, 2, stderr="error: unexpected argument '--dry-run' found")
-        installed = "0.2.9"
+        _set_kcaa(plugin_dir, "0.2.9")
         return _completed(command, 0)
 
     monkeypatch.setattr(
