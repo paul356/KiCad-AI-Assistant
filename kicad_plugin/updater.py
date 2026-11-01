@@ -12,9 +12,11 @@ release tag, because workflow-built releases are guarded by the CI
 tag-vs-VERSION check.
 
 The update payload is the release zip (``kicad_ai_assistant.zip``) published
-by ``make dist-plugin`` together with a ``SHA256SUMS`` asset.  Installation
-replaces the plugin tree (backed up beforehand and restored on failure) and,
-when the venv does not already contain the target ``kcaa`` version, refreshes
+by ``make dist-plugin``.  Releases may also publish a ``SHA256SUMS`` asset;
+when it is absent the download still installs, with only the integrity
+comparison skipped.  Installation replaces the plugin tree (backed up
+beforehand and restored on failure) and, when the venv does not already
+contain the target ``kcaa`` version, refreshes
 ``kcaa`` inside the plugin's ``.venv`` with ``uv``, which stages and renames
 its install atomically.  A matching ``kcaa`` version is left untouched, so a
 plugin-only upgrade works offline.  An editable ``kcaa`` install is also left
@@ -49,6 +51,7 @@ import subprocess  # nosec B404 - fixed argv, shell=False; runs only the plugin 
 import tempfile
 from threading import Event
 from time import monotonic
+from urllib.error import URLError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 import zipfile
@@ -63,8 +66,17 @@ CHECKSUM_ASSET = "SHA256SUMS"
 ZIP_ROOT = "kicad_ai_assistant"
 
 USER_AGENT = "KiCad-AI-Assistant-Updater"
-CHECK_TIMEOUT = 3.0
+# The check runs on a daemon thread, so a generous timeout never blocks the UI.
+CHECK_TIMEOUT = 10.0
 DOWNLOAD_TIMEOUT = 60.0
+# One retry on a transient transport failure; metadata errors are not retried.
+_CHECK_ATTEMPTS = 2
+
+# check_latest() reason codes; callers pick a user-facing message from these.
+CHECK_REASON_OK = "ok"  # a usable release payload was found
+CHECK_REASON_NETWORK = "network"  # OSError/URLError, redirect/host rejection
+CHECK_REASON_TIMEOUT = "timeout"  # TimeoutError after the final attempt
+CHECK_REASON_METADATA = "metadata"  # payload unusable: bad JSON, no zip, bad tag, oversized
 _VENV_TIMEOUT = 300.0
 _PROBE_TIMEOUT = 15.0
 _CHUNK_SIZE = 64 * 1024
@@ -155,8 +167,20 @@ class UpdateInfo:
 
     version: str
     zip_url: str
-    checksum_url: str
+    checksum_url: str | None
     page_url: str
+
+
+@dataclass(frozen=True)
+class CheckResult:
+    """Outcome of :func:`check_latest`.
+
+    ``reason`` is one of the ``CHECK_REASON_*`` constants; ``info`` is set
+    only when ``reason`` is :data:`CHECK_REASON_OK`.
+    """
+
+    info: UpdateInfo | None
+    reason: str
 
 
 @dataclass(frozen=True)
@@ -177,7 +201,11 @@ class InstallOutcome:
 
 @dataclass(frozen=True)
 class VerifiedDownload:
-    """A checksum-verified release archive and its SHA-256 digest."""
+    """A downloaded release archive and its SHA-256 digest.
+
+    The digest is compared against ``SHA256SUMS`` when the release publishes
+    one; releases without that asset come back unverified.
+    """
 
     path: Path
     sha256: str
@@ -307,9 +335,9 @@ def _update_from_release(data: object) -> UpdateInfo | None:
         if name and url:
             urls[name] = url
     zip_url = urls.get(ZIP_ASSET)
-    checksum_url = urls.get(CHECKSUM_ASSET)
-    if not zip_url or not checksum_url:
-        # Without both the zip and its checksum there is no safe upgrade path.
+    checksum_url = urls.get(CHECKSUM_ASSET) or None
+    if not zip_url:
+        # A release without the zip has nothing installable to offer.
         return None
     page_url = str(data.get("html_url") or RELEASE_PAGE)
     return UpdateInfo(
@@ -320,25 +348,65 @@ def _update_from_release(data: object) -> UpdateInfo | None:
     )
 
 
-def check_latest(timeout: float = CHECK_TIMEOUT) -> UpdateInfo | None:
+def _fetch_release_payload(timeout: float) -> bytes:
+    """Fetch the raw ``releases/latest`` body through the checked opener."""
+    request = Request(_checked_url(RELEASES_API), headers=_release_headers())
+    with _open_url(request, timeout) as response:
+        return response.read(_MAX_TEXT_BYTES + 1)
+
+
+def check_latest(timeout: float = CHECK_TIMEOUT) -> CheckResult:
     """Ask GitHub for the latest release; NEVER raises.
 
-    Returns ``None`` on any network, redirect, or parse failure so a
-    background check can stay silent.
+    Returns a :class:`CheckResult` whose ``reason`` explains the outcome.
+    Transient transport failures (``TimeoutError``/``URLError``) are retried
+    once; a metadata failure is final because the payload will not change.
     """
+    payload: bytes | None = None
+    reason = CHECK_REASON_NETWORK
+    for attempt in range(1, _CHECK_ATTEMPTS + 1):
+        try:
+            payload = _fetch_release_payload(timeout)
+            break
+        except TimeoutError:
+            reason = CHECK_REASON_TIMEOUT
+        except URLError:
+            reason = CHECK_REASON_NETWORK
+        except UpdateError:
+            # _checked_url() / _CheckedRedirectHandler rejected the request.
+            log.debug("Update check rejected the release URL", exc_info=True)
+            reason = CHECK_REASON_NETWORK
+            break
+        except OSError:
+            # Other transport failures are not worth a second attempt.
+            log.debug("Update check failed", exc_info=True)
+            reason = CHECK_REASON_NETWORK
+            break
+        except Exception:  # noqa: BLE001 - never surface a background-check failure
+            log.debug("Update check failed unexpectedly", exc_info=True)
+            return CheckResult(info=None, reason=CHECK_REASON_NETWORK)
+        if attempt < _CHECK_ATTEMPTS:
+            log.debug("Update check failed (%s); retrying once", reason)
+
+    if payload is None:
+        log.debug("Update check gave up: reason=%s", reason)
+        return CheckResult(info=None, reason=reason)
+
     try:
-        request = Request(_checked_url(RELEASES_API), headers=_release_headers())
-        with _open_url(request, timeout) as response:
-            payload = response.read(_MAX_TEXT_BYTES + 1)
         if len(payload) > _MAX_TEXT_BYTES:
-            raise UpdateError("Release metadata is unexpectedly large")
-        return _update_from_release(json.loads(payload.decode("utf-8")))
-    except (OSError, ValueError, UnicodeDecodeError):
-        log.debug("Update check failed", exc_info=True)
-        return None
-    except Exception:  # noqa: BLE001 - never surface a background-check failure
-        log.debug("Update check failed unexpectedly", exc_info=True)
-        return None
+            raise ValueError("release metadata is unexpectedly large")
+        data = json.loads(payload.decode("utf-8"))
+    except ValueError:
+        log.debug("Update check received unparsable metadata", exc_info=True)
+        return CheckResult(info=None, reason=CHECK_REASON_METADATA)
+
+    info = _update_from_release(data)
+    if info is None:
+        log.debug("Update check received an unusable release payload")
+        return CheckResult(info=None, reason=CHECK_REASON_METADATA)
+
+    log.debug("Update check found release %s", info.version)
+    return CheckResult(info=info, reason=CHECK_REASON_OK)
 
 
 # ---------------------------------------------------------------------------
@@ -436,25 +504,36 @@ def download_and_verify(
     dest_dir: str | os.PathLike[str],
     progress_cb: ProgressCallback | None = None,
 ) -> VerifiedDownload:
-    """Download the release zip and verify it against ``SHA256SUMS``.
+    """Download the release zip, verifying it against ``SHA256SUMS`` when present.
 
-    Returns the verified path and digest.  On a checksum mismatch no zip
-    (partial or otherwise) is left behind.
+    Returns the verified path and digest.  When the release has no
+    ``SHA256SUMS`` asset the download still happens, the size cap and
+    deadline still apply, the digest is still returned, and only the
+    comparison is skipped.  On a checksum mismatch no zip (partial or
+    otherwise) is left behind.
     """
     dest = Path(dest_dir)
     dest.mkdir(parents=True, exist_ok=True)
 
-    sums_text = _fetch_text(update.checksum_url, DOWNLOAD_TIMEOUT)
-    expected = _lookup_checksum(sums_text, ZIP_ASSET)
-    if expected is None:
-        raise UpdateError(f"{CHECKSUM_ASSET} has no entry for {ZIP_ASSET}")
+    expected = None
+    if update.checksum_url is None:
+        log.info(
+            "Release %s has no %s asset; skipping checksum verification",
+            update.version,
+            CHECKSUM_ASSET,
+        )
+    else:
+        sums_text = _fetch_text(update.checksum_url, DOWNLOAD_TIMEOUT)
+        expected = _lookup_checksum(sums_text, ZIP_ASSET)
+        if expected is None:
+            raise UpdateError(f"{CHECKSUM_ASSET} has no entry for {ZIP_ASSET}")
 
     final_path = dest / ZIP_ASSET
     partial_path = dest / f"{ZIP_ASSET}.part"
     try:
         _download_file(update.zip_url, partial_path, progress_cb)
         actual = _sha256_file(partial_path)
-        if not hmac.compare_digest(actual.lower(), expected.lower()):
+        if expected is not None and not hmac.compare_digest(actual.lower(), expected.lower()):
             raise UpdateError(
                 f"checksum mismatch for {ZIP_ASSET}: expected {expected}, got {actual}"
             )
