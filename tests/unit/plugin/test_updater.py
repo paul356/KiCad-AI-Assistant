@@ -327,6 +327,95 @@ def _panel_with_fake_wx():
                 current_ui_pkg.panel = saved_panel_attr  # type: ignore[attr-defined]
 
 
+@pytest.mark.parametrize(
+    ("spelling", "canonical"),
+    [
+        # The reported case: a release tag hyphenating the pre-release.
+        ("0.2.9-RC1", "0.2.9rc1"),
+        ("0.2.9_rc1", "0.2.9rc1"),
+        ("0.2.9.rc1", "0.2.9rc1"),
+        ("0.2.9rc1", "0.2.9rc1"),
+        ("v0.2.9-RC1", "0.2.9rc1"),
+        ("V0.2.9rc1", "0.2.9rc1"),
+        ("  0.2.9-RC1  ", "0.2.9rc1"),
+        # Pre-release aliases and implicit release numbers.
+        ("1.0-rc", "1.0rc0"),
+        ("1.0.a", "1.0a0"),
+        ("1.0alpha", "1.0a0"),
+        ("1.0a", "1.0a0"),
+        ("1.0-beta2", "1.0b2"),
+        ("1.0b", "1.0b0"),
+        ("1.0c3", "1.0rc3"),
+        ("1.0preview4", "1.0rc4"),
+        ("1.0pre5", "1.0rc5"),
+        ("1.0RC01", "1.0rc1"),
+        # Post-release spellings and implicit numbers.
+        ("1.0post", "1.0.post0"),
+        ("1.0.post", "1.0.post0"),
+        ("1.0-1", "1.0.post1"),
+        ("1.0-r2", "1.0.post2"),
+        ("1.0rev3", "1.0.post3"),
+        # Development releases.
+        ("1.0-dev", "1.0.dev0"),
+        ("1.0dev2", "1.0.dev2"),
+        ("1.0a1.post2.dev3", "1.0a1.post2.dev3"),
+        # PEP 440 drops leading zeros from every numeric component.
+        ("1.02", "1.2"),
+        ("01.002.0003", "1.2.3"),
+        ("1.0.0", "1.0.0"),
+        # Local segments are dropped; unrecognised suffixes stay as-is.
+        ("0.2.9-RC1+local.1", "0.2.9rc1"),
+        ("0.2.9-bugfix1", "0.2.9-bugfix1"),
+        ("not-a-version", "not-a-version"),
+    ],
+)
+def test_normalize_version_canonicalizes_pep440(spelling: str, canonical: str) -> None:
+    assert updater._normalize_version(spelling) == canonical
+    assert updater._normalize_version(canonical) == canonical  # idempotent
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (None, ""),
+        ("", ""),
+        ("   ", ""),
+        ("v+", ""),
+        ("  v  ", ""),
+        (0, "0"),
+        (5, "5"),
+        ("not-a-version", "not-a-version"),
+    ],
+)
+def test_normalize_version_never_raises_on_odd_input(value: object, expected: str) -> None:
+    assert updater._normalize_version(value) == expected
+
+
+@pytest.mark.parametrize(
+    ("latest", "current", "expected"),
+    [
+        ("0.2.9_rc1", "0.2.9-RC1", False),
+        ("0.2.9.rc1", "0.2.9rc1", False),
+        ("v0.2.9-RC1", "0.2.9rc1", False),
+        ("1.0-rc", "1.0rc0", False),
+        ("1.0.a", "1.0a0", False),
+        ("1.0-1", "1.0.post1", False),
+        ("0.2.9", "0.2.10", True),
+        ("0.2.9rc1", "0.2.9", True),
+        ("1.0a1", "1.0b1", True),
+    ],
+)
+def test_is_update_available_compares_canonical_versions(
+    latest: str, current: str, expected: bool
+) -> None:
+    assert updater.is_update_available(latest, current) is expected
+
+
+def test_version_comparison_does_not_coerce_numbers_to_floats() -> None:
+    assert updater._normalize_version("0.2.9") != updater._normalize_version("0.2.10")
+    assert updater.is_update_available("0.2.9", "0.2.10") is True
+
+
 def test_panel_update_branch_uses_tag_inequality(monkeypatch: pytest.MonkeyPatch) -> None:
     """Execute the panel branch with a fake wx so the call sites are exercised."""
     info = updater.UpdateInfo("0.2.9", _ZIP_URL, _SUMS_URL, updater.RELEASE_PAGE)
@@ -839,9 +928,9 @@ def test_check_latest_rejects_tag_with_only_local_segment(
 
 @pytest.mark.parametrize(
     ("tag", "expected"),
-    [("0.2.4-bugfix2", "0.2.4-bugfix2"), ("0.2.9-rc1", "0.2.9-rc1")],
+    [("0.2.4-bugfix2", "0.2.4-bugfix2"), ("0.2.9-rc1", "0.2.9rc1")],
 )
-def test_update_from_release_preserves_non_local_suffixes(tag: str, expected: str) -> None:
+def test_update_from_release_keeps_non_local_suffixes(tag: str, expected: str) -> None:
     info = updater._update_from_release(_release_data(tag))
 
     assert info is not None
@@ -1292,6 +1381,36 @@ def test_install_update_keeps_new_tree_when_kcaa_verification_fails(
     assert (plugin_dir / "VERSION").read_text(encoding="utf-8") == "0.2.9"
     assert (plugin_dir / "__init__.py").read_text(encoding="utf-8") == "new init"
     assert not updater.has_pending_recovery(plugin_dir)
+
+
+def test_install_update_accepts_canonical_kcaa_version_for_prerelease_tag(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A ``0.2.9-RC1`` tag installs cleanly when METADATA reports ``0.2.9rc1``."""
+    plugin_dir = tmp_path / "kicad_ai_assistant"
+    _write_plugin(plugin_dir)
+    zip_path = tmp_path / "release.zip"
+    zip_path.write_bytes(
+        _zip_bytes(
+            {
+                "kicad_ai_assistant/__init__.py": b"new init",
+                "kicad_ai_assistant/VERSION": b"0.2.9-RC1",
+            }
+        )
+    )
+    calls: list[list[str]] = []
+    _mock_uv(
+        monkeypatch,
+        calls=calls,
+        # Before: an older release.  After: the canonical METADATA spelling.
+        probe_results=["0.2.8", "0.2.9rc1"],
+    )
+
+    outcome = updater.install_update(zip_path, plugin_dir, "0.2.9-RC1")
+
+    assert outcome == updater.InstallOutcome(True, None)
+    assert any("kcaa==0.2.9-RC1" in command for command in calls)
+    assert (plugin_dir / "VERSION").read_text(encoding="utf-8") == "0.2.9-RC1"
 
 
 def test_install_update_installs_when_kcaa_is_missing(

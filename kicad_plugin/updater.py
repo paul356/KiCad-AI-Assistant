@@ -214,12 +214,93 @@ class VerifiedDownload:
 # ---------------------------------------------------------------------------
 
 
+# Public subset of PEP 440 used for canonical comparison:
+# ``N(.N)*[{a|b|rc}N][.postN][.devN]``.  The local segment is stripped before
+# matching, and epochs (``1!2.0``) are deliberately unsupported because
+# ``_validate_version`` rejects ``!`` in release tags.
+_PEP440_PUBLIC_RE = re.compile(
+    r"""
+    (?P<release>[0-9]+(?:\.[0-9]+)*)
+    (?:
+        [-_.]?
+        (?P<pre_l>alpha|a|beta|b|preview|pre|c|rc)
+        [-_.]?
+        (?P<pre_n>[0-9]+)?
+    )?
+    (?:
+        (?:-(?P<post_n1>[0-9]+))
+        |
+        (?:
+            [-_.]?
+            (?P<post_l>post|rev|r)
+            [-_.]?
+            (?P<post_n2>[0-9]+)?
+        )
+    )?
+    (?:
+        [-_.]?
+        (?P<dev_l>dev)
+        [-_.]?
+        (?P<dev_n>[0-9]+)?
+    )?
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+# PEP 440 canonical pre-release spellings: alpha/beta/rc, with ``c``, ``pre``,
+# and ``preview`` as historical aliases for ``rc``.
+_PRE_RELEASE_SHORT = {
+    "a": "a",
+    "alpha": "a",
+    "b": "b",
+    "beta": "b",
+    "c": "rc",
+    "pre": "rc",
+    "preview": "rc",
+    "rc": "rc",
+}
+
+
+def _canonical_number(digits: str | None) -> str:
+    """Drop leading zeros from one PEP 440 numeric component."""
+    return (digits or "0").lstrip("0") or "0"
+
+
 def _normalize_version(text: object) -> str:
-    """Strip whitespace, one leading ``v``, and a PEP 440 ``+local`` segment."""
-    raw = str(text or "").strip()
+    """Return the PEP 440 canonical spelling used for version comparisons.
+
+    Surrounding whitespace, one leading ``v``, and a ``+local`` segment are
+    stripped as before.  The remaining public version is then canonicalised
+    per PEP 440: leading zeros in every numeric component are dropped
+    (``1.02`` -> ``1.2``), pre-release aliases collapse to ``a``/``b``/``rc``
+    (``0.2.9-RC1``/``0.2.9_rc1``/``0.2.9.rc1`` -> ``0.2.9rc1``), omitted
+    numbers become ``0`` (``1.0-rc`` -> ``1.0rc0``), ``post``/``rev``/``r``
+    and ``-N`` become ``.postN``, and ``dev`` becomes ``.devN``.
+
+    Deliberately not covered: epochs (left untouched), local-segment content
+    (stripped), and comparison semantics such as ordering or trailing-zero
+    equality.  Unparseable input is returned best-effort after the same
+    stripping and never raises.
+    """
+    raw = "" if text is None else str(text).strip()
     if raw[:1] in ("v", "V"):
         raw = raw[1:]
-    return raw.split("+", 1)[0].strip()
+    raw = raw.split("+", 1)[0].strip()
+    match = _PEP440_PUBLIC_RE.fullmatch(raw)
+    if match is None:
+        return raw
+
+    canonical = ".".join(_canonical_number(part) for part in match["release"].split("."))
+    pre_label = match["pre_l"]
+    if pre_label:
+        canonical += _PRE_RELEASE_SHORT[pre_label.lower()]
+        canonical += _canonical_number(match["pre_n"])
+    post_number = match["post_n1"] if match["post_n1"] is not None else match["post_n2"]
+    if post_number is not None or match["post_l"] is not None:
+        canonical += ".post" + _canonical_number(post_number)
+    if match["dev_l"] is not None:
+        canonical += ".dev" + _canonical_number(match["dev_n"])
+    return canonical
 
 
 def is_update_available(latest: str, current: str) -> bool:
@@ -310,9 +391,10 @@ def _update_from_release(data: object) -> UpdateInfo | None:
     if not isinstance(data, dict):
         return None
     # Normalise once here: strip the tag prefix and any PEP 440 local
-    # segment (``v0.2.9+build`` -> ``0.2.9``).  install_update() validates
+    # segment (``v0.2.9+build`` -> ``0.2.9``) and canonicalise the remaining
+    # spelling (``0.2.9-RC1`` -> ``0.2.9rc1``).  install_update() validates
     # strictly and rejects ``+``, so the release path must never offer a
-    # version it cannot install.  Non-local suffixes such as ``-rc1`` stay.
+    # version it cannot install.  Non-local suffixes such as ``rc1`` stay.
     version = _normalize_version(data.get("tag_name"))
     if not version:
         return None
