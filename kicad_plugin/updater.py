@@ -127,9 +127,10 @@ ProgressCallback = Callable[[int, int | None], None]
 # ``1rc1``, ``1rc1.post1.dev2``).  ``+local`` and epochs stay rejected.
 _SAFE_VERSION_RE = re.compile(
     r"^(?:"
-    r"\d+(?:\.\d+)*(?:[.-][A-Za-z0-9]+)*"
+    r"[0-9]+(?:\.[0-9]+)*(?:[.-][A-Za-z0-9]+)*"
     r"|"
-    r"\d+(?:\.\d+)*(?:a|b|rc)\d+(?:\.post\d+)?(?:\.dev\d+)?"
+    r"[0-9]+(?:\.[0-9]+)*(?:a|b|rc)[0-9]+"
+    r"(?:\.post[0-9]+)?(?:\.dev[0-9]+)?"
     r")$"
 )
 _SUM_LINE_RE = re.compile(r"^([0-9a-fA-F]{64})\s+\*?(?:dist/)?([^/\s]+)$")

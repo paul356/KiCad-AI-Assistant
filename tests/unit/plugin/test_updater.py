@@ -447,6 +447,17 @@ def test_validate_version_rejects_hostile_strings(version: str) -> None:
         updater._validate_version(version)
 
 
+@pytest.mark.parametrize("version", ["١rc١", "1rc1.post１", "０.２.９"])
+def test_validate_version_rejects_non_ascii_digits(version: str) -> None:
+    # The canonicaliser only understands ASCII digits, so these stay
+    # uncanonicalised.  They must never be advertised or reach install_update(),
+    # where pip would reject them at pre-flight.
+    assert updater._normalize_version(version) == version
+    with pytest.raises(updater.UpdateError, match="Unsafe version"):
+        updater._validate_version(version)
+    assert updater._update_from_release(_release_data(version)) is None
+
+
 @pytest.mark.parametrize(
     ("value", "expected"),
     [
