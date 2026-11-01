@@ -64,6 +64,17 @@ def _strip_images_from_history(history: list[dict]) -> list[dict]:
 
 _IMAGE_PREVIEW_BYTES = 16
 
+# Upgrade dialog width budget.  The labels wrap at ``_UPGRADE_DIALOG_WRAP`` and
+# the dialog height comes from the laid-out sizer, so no platform font/DPI can
+# clip the hint; the minimum width stops it collapsing to a narrow column.
+_UPGRADE_DIALOG_WRAP = 440
+_UPGRADE_DIALOG_MIN_WIDTH = 460
+
+_EDITABLE_INSTALL_MESSAGE = (
+    "kcaa is installed in editable mode (source checkout); the panel will not "
+    "upgrade the plugin. Update the checkout and rerun setup_plugin.sh."
+)
+
 
 def _elide_tool_result_image(result: Any) -> Any:
     """Shallow-copy a tool result for UI display, eliding base64 image data.
@@ -100,13 +111,15 @@ def _should_offer_update(latest: str, current: str) -> bool:
     return updater.is_update_available(latest, current)
 
 
-def _update_check_message(result, current: str) -> str | None:
+def _update_check_message(result, current: str, editable: bool = False) -> str | None:
     """Message for a finished manual update check, or None to offer an upgrade.
 
     ``result`` is an ``updater.CheckResult``.  The wording distinguishes an
     unusable release (``metadata``) from a transport failure (``network`` /
     ``timeout``), so the panel never blames the connection for a release that
-    simply lacks the assets the updater needs.
+    simply lacks the assets the updater needs.  ``editable`` is the plugin
+    venv's PEP 610 editable state; a source ``kcaa`` install is never offered
+    an in-panel upgrade, so it always gets a message (no dialog, no banner).
     """
     from .. import updater
 
@@ -115,6 +128,8 @@ def _update_check_message(result, current: str) -> str | None:
             return "Could not check for updates: the latest release is missing required files."
         return "Could not check for updates. Check your network connection and try again."
 
+    if editable:
+        return _EDITABLE_INSTALL_MESSAGE
     if _should_offer_update(result.info.version, current):
         return None
     return f"You are running the latest version ({current})."
@@ -2163,18 +2178,22 @@ if _WX_AVAILABLE:
             def _run():
                 result = None
                 current = ""
+                editable = False
                 try:
                     from .. import updater
 
                     current = updater.current_version(plugin_dir)
                     result = updater.check_latest()
+                    editable = updater.installed_kcaa_info(plugin_dir).editable
                 except Exception:
                     log.debug("update check failed", exc_info=True)
-                wx.CallAfter(self._on_update_check_done, result, current, manual)
+                wx.CallAfter(self._on_update_check_done, result, current, manual, editable)
 
             threading.Thread(target=_run, daemon=True).start()
 
-        def _on_update_check_done(self, result, current: str, manual: bool) -> None:
+        def _on_update_check_done(
+            self, result, current: str, manual: bool, editable: bool = False
+        ) -> None:
             self._update_check_running = False
             self._set_check_updates_enabled(True)
 
@@ -2184,12 +2203,13 @@ if _WX_AVAILABLE:
                 result = updater.CheckResult(info=None, reason=updater.CHECK_REASON_NETWORK)
             log_fn = log.info if manual else log.debug
             log_fn(
-                "update check: reason=%s version=%s",
+                "update check: reason=%s version=%s editable=%s",
                 result.reason,
                 result.info.version if result.info is not None else None,
+                editable,
             )
 
-            message = _update_check_message(result, current)
+            message = _update_check_message(result, current, editable=editable)
             if message is not None:
                 if manual:
                     icon = (
@@ -2211,7 +2231,7 @@ if _WX_AVAILABLE:
             self._prompt_upgrade(result.info, current)
 
         def _prompt_upgrade(self, info, current: str) -> None:
-            dialog = wx.Dialog(self, wx.ID_ANY, "Update available", size=(480, 280))
+            dialog = wx.Dialog(self, wx.ID_ANY, "Update available")
             sizer = wx.BoxSizer(wx.VERTICAL)
 
             message = wx.StaticText(
@@ -2219,7 +2239,7 @@ if _WX_AVAILABLE:
                 wx.ID_ANY,
                 f"Version {info.version} is available. You are running {current}.",
             )
-            message.Wrap(440)
+            message.Wrap(_UPGRADE_DIALOG_WRAP)
             sizer.Add(message, 0, wx.EXPAND | wx.ALL, 12)
 
             hint = wx.StaticText(
@@ -2228,7 +2248,7 @@ if _WX_AVAILABLE:
                 "The plugin files and its kcaa package will be updated. "
                 "KiCad must be restarted afterwards.",
             )
-            hint.Wrap(440)
+            hint.Wrap(_UPGRADE_DIALOG_WRAP)
             sizer.Add(hint, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 12)
 
             button_sizer = wx.BoxSizer(wx.HORIZONTAL)
@@ -2252,7 +2272,12 @@ if _WX_AVAILABLE:
 
             upgrade_btn.Bind(wx.EVT_BUTTON, _choose("upgrade"))
             page_btn.Bind(wx.EVT_BUTTON, _choose("page"))
-            dialog.SetSizer(sizer)
+            # The wrapped labels' height depends on the platform font/DPI, so
+            # the dialog is fitted to the laid-out sizer instead of a fixed
+            # height (which clipped the restart hint); the width floor keeps
+            # it from collapsing on a small font.
+            dialog.SetSizerAndFit(sizer)
+            dialog.SetMinSize((_UPGRADE_DIALOG_MIN_WIDTH, -1))
             dialog.CentreOnParent()
             dialog.ShowModal()
             dialog.Destroy()
@@ -2343,7 +2368,6 @@ if _WX_AVAILABLE:
             error = ""
             restored: bool | None = None
             backup_dir: str | None = None
-            outcome = None
             try:
                 import tempfile
 
@@ -2353,7 +2377,7 @@ if _WX_AVAILABLE:
                     download = updater.download_and_verify(
                         info, tmp, progress_cb=self._update_progress_cb
                     )
-                    outcome = updater.install_update(
+                    updater.install_update(
                         download.path,
                         self._plugin_dir(),
                         info.version,
@@ -2366,7 +2390,7 @@ if _WX_AVAILABLE:
                 restored = getattr(exc, "restored", None)
                 backup_dir = getattr(exc, "backup_dir", None)
                 log.error("plugin update failed: %s", exc, exc_info=True)
-            wx.CallAfter(self._on_upgrade_finished, info, error, restored, backup_dir, outcome)
+            wx.CallAfter(self._on_upgrade_finished, info, error, restored, backup_dir)
 
         def _on_upgrade_finished(
             self,
@@ -2374,7 +2398,6 @@ if _WX_AVAILABLE:
             error: str,
             restored: bool | None,
             backup_dir: str | None,
-            outcome=None,
         ) -> None:
             self._update_in_progress = False
             self._update_cancel_event = None
@@ -2404,11 +2427,6 @@ if _WX_AVAILABLE:
                 f"KiCad AI Assistant was updated to version {info.version}.\n\n"
                 "Restart KiCad to apply the update."
             )
-            if outcome is not None and outcome.kcaa_skipped_reason == "editable":
-                message += (
-                    "\n\nkcaa is installed in editable mode and was left unchanged "
-                    "\u2014 update it yourself if needed."
-                )
             wx.MessageBox(
                 message,
                 "Update complete",

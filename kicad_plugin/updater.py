@@ -19,20 +19,25 @@ beforehand and restored on failure) and, when the venv does not already
 contain the target ``kcaa`` version, refreshes
 ``kcaa`` inside the plugin's ``.venv`` with ``uv``, which stages and renames
 its install atomically.  A matching ``kcaa`` version is left untouched, so a
-plugin-only upgrade works offline.  An editable ``kcaa`` install is also left
-untouched: replacing it with a wheel would silently detach the user's source
-tree, so the plugin tree upgrades while the venv step is skipped.  Editable
-detection follows PEP 610 only: ``direct_url.json`` with
-``dir_info.editable`` set to true.  Legacy ``setup.py develop`` installs
-(``.egg-link``, no ``direct_url.json``) and missing metadata are reported as
-non-editable.  The venv state is read straight from ``site-packages``, never
-through a process spawn, so verification cannot be defeated by the host
-process failing to fork.  Unknown therefore defaults to installing, which
-replaces a legacy editable install with a wheel; such users must manage
-``kcaa`` themselves.  Otherwise a pre-flight dry-run catches dependency/index
-errors before the plugin tree is touched, and the installed version is
-re-read from the venv afterwards.  An ``.incomplete`` marker keeps a crashed
-install recoverable.
+plugin-only upgrade works offline.  An editable ``kcaa`` install blocks the
+upgrade entirely: swapping the plugin tree would leave release plugin code
+next to a source ``kcaa``, the mixed state editable detection exists to
+avoid, so ``install_update`` refuses before touching anything and the panel
+does not offer the upgrade.  Editable detection follows PEP 610 only:
+``direct_url.json`` with ``dir_info.editable`` set to true.  Legacy
+``setup.py develop`` installs (``.egg-link``, no ``direct_url.json``) and
+missing metadata are reported as non-editable.  The venv state is read
+straight from ``site-packages``, never through a process spawn, so
+verification cannot be defeated by the host process failing to fork.
+Unknown therefore defaults to installing, which replaces a legacy editable
+install with a wheel; such users must manage ``kcaa`` themselves.  When
+several ``kcaa`` metadata directories match, the newest numeric version
+wins and a warning names every distinct version found: a stale *newer*
+duplicate is exactly the case where the reader no longer agrees with what
+the venv interpreter would import, so it is logged rather than silent.
+Otherwise a pre-flight dry-run catches dependency/index errors before the
+plugin tree is touched, and the installed version is re-read from the venv
+afterwards.  An ``.incomplete`` marker keeps a crashed install recoverable.
 """
 
 from __future__ import annotations
@@ -135,10 +140,11 @@ _ALLOWED_UPDATE_HOSTS = frozenset(
 class UpdateError(RuntimeError):
     """A user-facing update failure.
 
-    ``restored`` is ``True`` when the plugin tree was restored, ``False``
-    when the plugin tree is inconsistent, and ``None`` when no tree swap
-    happened or when the venv update failed after the tree was restored (the
-    venv state is deliberately not claimed).
+    ``restored`` is ``True`` when the plugin tree is intact — restored after
+    a failure, or never touched because a pre-flight check refused — and
+    ``False`` when the plugin tree is inconsistent.  It is ``None`` when no
+    tree swap happened or when the venv update failed after the tree was
+    restored (the venv state is deliberately not claimed).
     """
 
     def __init__(
@@ -743,7 +749,16 @@ def _site_packages_dirs(plugin_dir: Path) -> list[Path]:
 
 
 def _kcaa_dist_dirs(site_dir: Path) -> list[Path]:
-    """Return ``kcaa`` metadata directories inside one ``site-packages``."""
+    """Return ``kcaa`` metadata directories inside one ``site-packages``.
+
+    The project is the first ``-``-separated segment of the stem, so
+    ``kcaa_tools-1.0.dist-info`` and ``kcaa-extra-1.0.dist-info`` do not
+    match whatever their METADATA says.  The second segment must be
+    version-shaped (start with a digit), which covers the easy_install
+    layout ``kcaa-0.2.9-py3.13.egg-info``.  A bare ``kcaa.egg-info`` never
+    matches: ``setup.py develop`` writes it into the project tree, not
+    ``site-packages``, so a legacy editable install stays "unknown".
+    """
     try:
         entries = sorted(site_dir.iterdir())
     except OSError:
@@ -754,26 +769,39 @@ def _kcaa_dist_dirs(site_dir: Path) -> list[Path]:
         suffix = next((item for item in _DIST_SUFFIXES if lowered.endswith(item)), None)
         if suffix is None or not entry.is_dir():
             continue
-        project = entry.name[: -len(suffix)].rsplit("-", 1)[0]
-        if project.replace("_", "-").strip().lower() == "kcaa":
-            found.append(entry)
+        segments = entry.name[: -len(suffix)].split("-")
+        if len(segments) < 2:
+            continue
+        if segments[0].lower() != "kcaa" or not segments[1][:1].isdigit():
+            continue
+        found.append(entry)
     return found
 
 
-def _dist_version(dist_dir: Path) -> str | None:
-    """Read the ``Version`` header from ``METADATA`` or ``PKG-INFO``."""
+def _dist_version(dist_dir: Path) -> tuple[str | None, str | None]:
+    """Read the ``Version:`` header line from ``METADATA`` or ``PKG-INFO``.
+
+    Only the header line itself is used: RFC 822 folding (a continuation
+    line) is not joined, because real metadata writers never fold this short
+    header.  Returns ``(version, problem)``; ``problem`` names every file
+    that was tried and why it yielded nothing (its ``OSError``, or a missing
+    header) so callers can log the cause rather than the outcome.
+    """
+    problems: list[str] = []
     for filename in ("METADATA", "PKG-INFO"):
         try:
             text = (dist_dir / filename).read_text(encoding="utf-8", errors="replace")
-        except OSError:
+        except OSError as exc:
+            problems.append(f"{filename}: {exc}")
             continue
         for line in text.splitlines():
             if not line.strip():
                 break  # end of headers; never match the free-text body
             header, _, value = line.partition(":")
             if header.strip().lower() == "version" and value.strip():
-                return value.strip()
-    return None
+                return value.strip(), None
+        problems.append(f"no Version: header in {filename}")
+    return None, "; ".join(problems)
 
 
 def _dist_is_editable(dist_dir: Path) -> bool:
@@ -792,7 +820,7 @@ def _version_sort_key(text: str) -> tuple[int, ...]:
     return tuple(int(part) if part.isdigit() else 0 for part in re.split(r"[.\-+_]", text))
 
 
-def installed_kcaa_info(plugin_dir: Path) -> InstalledKcaa:
+def installed_kcaa_info(plugin_dir: str | os.PathLike[str]) -> InstalledKcaa:
     """Return the venv's ``kcaa`` version and editable flag, or unknown.
 
     Metadata is read directly from the plugin venv's ``site-packages``, so no
@@ -800,23 +828,52 @@ def installed_kcaa_info(plugin_dir: Path) -> InstalledKcaa:
     the host process could not fork or the probe timed out.  A missing venv,
     missing/unreadable metadata, or a missing ``Version`` header means
     "unknown" rather than an error; callers fall back to installing.
+
+    Several matching metadata directories resolve to the newest numeric
+    version.  Every distinct version found is logged at warning level, since
+    a stale *newer* duplicate makes the answer disagree with what the venv
+    interpreter would import.
     """
+    plugin_dir = Path(plugin_dir)
+    site_dirs = _site_packages_dirs(plugin_dir)
     best_version: str | None = None
     best_editable = False
     best_key: tuple[int, ...] | None = None
-    for site_dir in _site_packages_dirs(Path(plugin_dir)):
-        for dist_dir in _kcaa_dist_dirs(site_dir):
-            version = _dist_version(dist_dir)
+    versions: list[str] = []
+    dist_count = 0
+    for site_dir in site_dirs:
+        dist_dirs = _kcaa_dist_dirs(site_dir)
+        if not dist_dirs:
+            log.debug("no kcaa metadata directory in %s", site_dir)
+            continue
+        dist_count += len(dist_dirs)
+        for dist_dir in dist_dirs:
+            version, problem = _dist_version(dist_dir)
             if version is None:
+                log.debug("kcaa metadata at %s has no usable version: %s", dist_dir, problem)
                 continue
+            versions.append(version)
             key = _version_sort_key(version)
             if best_key is None or key > best_key:
                 best_version, best_key = version, key
                 best_editable = _dist_is_editable(dist_dir)
     if best_version is None:
-        log.debug("kcaa metadata not found in the plugin venv under %s", plugin_dir)
-    else:
-        log.debug("kcaa in plugin venv: version=%s editable=%s", best_version, best_editable)
+        if not site_dirs:
+            log.debug("no site-packages directory under the plugin venv %s", plugin_dir)
+        elif dist_count == 0:
+            log.debug("kcaa metadata not found in the plugin venv under %s", plugin_dir)
+        else:
+            log.debug("no usable kcaa version in the plugin venv under %s", plugin_dir)
+        return InstalledKcaa(None)
+
+    distinct = sorted(set(versions), key=_version_sort_key)
+    if len(distinct) > 1:
+        log.warning(
+            "multiple kcaa metadata versions in the plugin venv (%s); using %s",
+            ", ".join(distinct),
+            best_version,
+        )
+    log.debug("kcaa in plugin venv: version=%s editable=%s", best_version, best_editable)
     return InstalledKcaa(version=best_version, editable=best_editable)
 
 
@@ -1040,9 +1097,10 @@ def install_update(
 
     Refuses git checkouts, unwritable directories, and leftovers from an
     interrupted install.  Before any filesystem change it resolves the
-    plugin venv and reads the installed ``kcaa`` state.  Editable installs
-    are never replaced: the plugin tree still upgrades, but uv and the venv
-    step are skipped.  Otherwise, if the version differs from ``new_version``,
+    plugin venv and reads the installed ``kcaa`` state.  An editable ``kcaa``
+    install is refused outright: the plugin tree is never swapped, so a
+    source checkout cannot end up with release plugin code next to a source
+    package.  Otherwise, if the version differs from ``new_version``,
     it requires uv and runs a dry-run install; if it already matches, both are
     skipped so a plugin-only upgrade works offline.  Skipping the venv command
     also means dependency resolution is not re-run, so a damaged dependency
@@ -1056,9 +1114,8 @@ def install_update(
     Returns:
         An :class:`InstallOutcome`.  ``kcaa_updated`` is true only after a
         successful venv package refresh.  ``kcaa_skipped_reason`` is
-        ``"editable"`` when the venv install is editable and left for the
-        user, ``"already-current"`` when the installed version already
-        matches, and ``None`` after a successful refresh.
+        ``"already-current"`` when the installed version already matches and
+        ``None`` after a successful refresh.
 
     Pass ``expected_sha256`` to re-verify a zip obtained outside
     :func:`download_and_verify`.
@@ -1088,10 +1145,9 @@ def install_update(
         if not hmac.compare_digest(actual.lower(), str(expected_sha256).lower()):
             raise UpdateError("checksum mismatch for the update archive")
 
-    # Pre-flight: fail before backup/clear/copy when the venv is missing or,
-    # only when the package actually needs replacing, when uv or dependency
-    # resolution cannot succeed.  A matching version or an editable install
-    # skips uv entirely.
+    # Pre-flight: fail before backup/clear/copy when the venv is missing, when
+    # kcaa is a source install, or, only when the package actually needs
+    # replacing, when uv or dependency resolution cannot succeed.
     python = _venv_python(plugin_dir)
     if python is None:
         raise UpdateError(
@@ -1099,17 +1155,20 @@ def install_update(
             "Rerun setup_plugin.sh to recreate it."
         )
     installed = installed_kcaa_info(plugin_dir)
-    needs_install = (
-        not installed.editable
-        and _normalize_version(installed.version or "").lower()
-        != _normalize_version(new_version).lower()
-    )
     if installed.editable:
-        skipped_reason: str | None = "editable"
-    elif needs_install:
-        skipped_reason = None
-    else:
-        skipped_reason = "already-current"
+        # Swapping the tree would leave release plugin code next to the
+        # user's source kcaa: refuse before anything is backed up or written.
+        raise UpdateError(
+            "kcaa is installed in editable mode; the plugin will not be upgraded "
+            "in-panel. Update the checkout and rerun setup_plugin.sh.",
+            restored=True,
+        )
+    # Textual comparison, not PEP 440: pre-release tags are not canonicalised
+    # (``0.2.9-RC1`` vs ``0.2.9rc1``); see issue #226.
+    needs_install = _normalize_version(installed.version or "").lower() != (
+        _normalize_version(new_version).lower()
+    )
+    skipped_reason: str | None = None if needs_install else "already-current"
     if needs_install:
         uv = _require_uv()
         _dry_run_install(uv, python, new_version)
@@ -1200,6 +1259,8 @@ def install_update(
     except OSError:
         log.warning("Could not clear the interrupted-update marker %s", marker)
     if needs_install and _normalize_version(installed_after_version or "").lower() != (
+        # Same textual comparison as the pre-flight; pre-release canonical
+        # form is issue #226.
         _normalize_version(new_version).lower()
     ):
         raise UpdateError(
