@@ -359,8 +359,13 @@ def check_latest(timeout: float = CHECK_TIMEOUT) -> CheckResult:
     """Ask GitHub for the latest release; NEVER raises.
 
     Returns a :class:`CheckResult` whose ``reason`` explains the outcome.
-    Transient transport failures (``TimeoutError``/``URLError``) are retried
-    once; a metadata failure is final because the payload will not change.
+
+    ``timeout`` bounds each attempt.  ``TimeoutError``/``URLError`` are retried
+    once, so a manual check can take up to ``2 * timeout`` (20 s with the
+    default :data:`CHECK_TIMEOUT`) plus metadata parsing.  urllib applies its
+    timeout per socket operation, not as a hard monotonic deadline, so the
+    wall-clock worst case is not strictly bounded by that figure.  A metadata
+    failure is final because the payload will not change.
     """
     payload: bytes | None = None
     reason = CHECK_REASON_NETWORK
@@ -383,7 +388,10 @@ def check_latest(timeout: float = CHECK_TIMEOUT) -> CheckResult:
             reason = CHECK_REASON_NETWORK
             break
         except Exception:  # noqa: BLE001 - never surface a background-check failure
-            log.debug("Update check failed unexpectedly", exc_info=True)
+            log.warning(
+                "Update check failed with an unexpected error; reporting it as a network failure",
+                exc_info=True,
+            )
             return CheckResult(info=None, reason=CHECK_REASON_NETWORK)
         if attempt < _CHECK_ATTEMPTS:
             log.debug("Update check failed (%s); retrying once", reason)
@@ -396,11 +404,13 @@ def check_latest(timeout: float = CHECK_TIMEOUT) -> CheckResult:
         if len(payload) > _MAX_TEXT_BYTES:
             raise ValueError("release metadata is unexpectedly large")
         data = json.loads(payload.decode("utf-8"))
-    except ValueError:
-        log.debug("Update check received unparsable metadata", exc_info=True)
+        # Deeply nested JSON can exhaust the stack in either the decoder or
+        # the payload walk; both mean the payload is unusable.
+        info = _update_from_release(data)
+    except (ValueError, RecursionError):
+        log.debug("Update check received unusable metadata", exc_info=True)
         return CheckResult(info=None, reason=CHECK_REASON_METADATA)
 
-    info = _update_from_release(data)
     if info is None:
         log.debug("Update check received an unusable release payload")
         return CheckResult(info=None, reason=CHECK_REASON_METADATA)

@@ -10,6 +10,7 @@ import hashlib
 import importlib
 import io
 import json
+import logging
 import os
 from pathlib import Path, PurePosixPath
 import subprocess
@@ -448,6 +449,25 @@ def test_download_validates_url_at_request_time(
         updater.download_and_verify(update, tmp_path)
 
 
+def test_download_rejects_untrusted_zip_url(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The zip URL is validated on its own, even when there is no checksum."""
+    update = updater.UpdateInfo(
+        version="0.2.9",
+        zip_url="https://evil.example.com/kicad_ai_assistant.zip",
+        checksum_url=None,
+        page_url=updater.RELEASE_PAGE,
+    )
+    calls = _fake_open(monkeypatch, {})
+
+    with pytest.raises(updater.UpdateError, match="untrusted host"):
+        updater.download_and_verify(update, tmp_path)
+
+    assert calls == []  # the request is rejected before it reaches the opener
+    assert list(tmp_path.iterdir()) == []
+
+
 # 3. check_latest ----------------------------------------------------------------
 
 
@@ -543,7 +563,7 @@ def test_check_latest_reports_metadata_for_unusable_release(
     assert len(calls) == 1  # metadata failures are not retried
 
 
-def test_check_latest_rejects_oversized_metadata_as_metadata(
+def test_check_latest_reports_oversized_metadata_as_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(updater, "_MAX_TEXT_BYTES", 8)
@@ -553,6 +573,58 @@ def test_check_latest_rejects_oversized_metadata_as_metadata(
 
     assert result.info is None
     assert result.reason == updater.CHECK_REASON_METADATA
+
+
+def test_check_latest_reports_metadata_for_deeply_nested_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Deep JSON makes json.loads raise RecursionError, which must not escape.
+
+    The 400 kB body stays below the 1 MiB metadata cap, so it is the decoder,
+    not the size gate, that rejects it.
+    """
+    payload = b"[" * 200_000 + b"]" * 200_000
+    assert len(payload) < updater._MAX_TEXT_BYTES
+    calls = _fake_open(monkeypatch, {updater.RELEASES_API: payload})
+
+    result = updater.check_latest()
+
+    assert result.info is None
+    assert result.reason == updater.CHECK_REASON_METADATA
+    assert len(calls) == 1
+
+
+def test_check_latest_logs_unexpected_errors_at_warning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A programming error still reports ``network`` but is visible in the log."""
+
+    def _boom(*args, **kwargs):
+        raise AttributeError("simulated refactor bug")
+
+    records: list[logging.LogRecord] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    # The plugin logger hierarchy does not propagate to root, so attach the
+    # capture handler directly instead of using caplog.
+    logger = logging.getLogger(updater.log.name)
+    handler = _Capture()
+    logger.addHandler(handler)
+    monkeypatch.setattr(updater, "_open_url", _boom)
+    try:
+        result = updater.check_latest()
+    finally:
+        logger.removeHandler(handler)
+
+    assert result.info is None
+    assert result.reason == updater.CHECK_REASON_NETWORK
+    warnings = [record for record in records if record.levelno == logging.WARNING]
+    assert warnings
+    assert warnings[0].exc_info is not None
+    assert "unexpected" in warnings[0].getMessage().lower()
 
 
 def test_update_from_release_drops_pep440_local_segment() -> None:
