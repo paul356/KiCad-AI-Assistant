@@ -516,6 +516,163 @@ def test_dense_pad_connector_covered_start_fails(tmp_path: Path, algorithm: str)
 
 
 # ---------------------------------------------------------------------------
+# #216: sub-width pad-exit stub absorbed end-to-end
+# ---------------------------------------------------------------------------
+
+_STUB_FIXTURE_START = (-3.4201679360683457, 3.7212679553332517)
+_STUB_FIXTURE_END = (4.787175092253532, 3.233789531661362)
+_STUB_FIXTURE_PADS = [
+    (2.568909405254894, 2.261991093591841, 0.5),
+    (-3.777712725048371, 0.6231032772597018, 0.25),
+    (-2.305097949850124, 3.8753303058456448, 0.15),
+]
+
+
+def _make_pad_exit_stub_board(tmp_path: Path) -> Path:
+    """R1/1 -> C1/1 with the #216 pad-exit stub geometry.
+
+    The three foreign pads are the sweep-derived fixture that makes the
+    engine finish with a 0.0875 mm vertical stub on the destination
+    anchor.  The endpoint pads are non-square so ``_replace_pad_path``
+    runs (``_is_rect`` rejects squares) and its wire can be audited for
+    an extra kink at the pad entry.
+    """
+    ax, ay = _STUB_FIXTURE_START
+    bx, by = _STUB_FIXTURE_END
+    foreign = ""
+    for i, (cx, cy, h) in enumerate(_STUB_FIXTURE_PADS):
+        foreign += f"""	(footprint "X"
+		(layer "F.Cu")
+		(at {cx} {cy} 0.0)
+		(property "Reference" "X{i + 1}")
+		(pad "1" smd rect
+			(at 0.0 0.0)
+			(size {2 * h} {2 * h})
+			(layers "F.Cu" "F.Mask")
+			(net 2 "GND")
+		)
+	)
+"""
+    pcb = f"""(kicad_pcb
+	(version 20260206)
+	(generator "pad-exit-stub-test")
+	(layers
+		(0 "F.Cu" signal)
+		(44 "Edge.Cuts" user)
+	)
+	(net 0 "")
+	(net 1 "VCC")
+	(net 2 "GND")
+	(footprint "R"
+		(layer "F.Cu")
+		(at {ax} {ay} 0.0)
+		(property "Reference" "R1")
+		(pad "1" smd rect
+			(at 0.0 0.0)
+			(size 0.8 0.3)
+			(layers "F.Cu" "F.Mask")
+			(net 1 "VCC")
+		)
+	)
+	(footprint "C"
+		(layer "F.Cu")
+		(at {bx} {by} 0.0)
+		(property "Reference" "C1")
+		(pad "1" smd rect
+			(at 0.0 0.0)
+			(size 0.8 0.3)
+			(layers "F.Cu" "F.Mask")
+			(net 1 "VCC")
+		)
+	)
+{foreign}	(gr_rect
+		(start -10.0 -10.0)
+		(end 10.0 10.0)
+		(stroke (width 0.1) (type solid))
+		(fill none)
+		(layer "Edge.Cuts")
+	)
+)
+"""
+    path = tmp_path / "stub.kicad_pcb"
+    path.write_text(pcb)
+    _write_min_pro(path, clearance=0.2)
+    return path
+
+
+def _turn_degrees(a, b, c) -> float:
+    v1 = (b[0] - a[0], b[1] - a[1])
+    v2 = (c[0] - b[0], c[1] - b[1])
+    l1 = math.hypot(*v1)
+    l2 = math.hypot(*v2)
+    if l1 < 1e-12 or l2 < 1e-12:
+        return 0.0
+    cos_t = (v1[0] * v2[0] + v1[1] * v2[1]) / (l1 * l2)
+    return math.degrees(math.acos(max(-1.0, min(1.0, cos_t))))
+
+
+def test_pad_exit_stub_absorbed_through_full_router(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The absorbed stub survives the pad-wire replacement cleanly.
+
+    The engine's pre-pass path ends with a 0.0875 mm vertical stub; the
+    absorption slides the horizontal run onto the destination anchor.
+    After ``_replace_pad_path`` / ``_align_path_endpoints`` the written
+    route must still start and end exactly on the pad centres, stay on
+    the 0/45/90 family, and keep every segment at full track width —
+    no 45-degree kink re-introduced at the pad entry."""
+    import kcaa.router.route_engine as route_engine_module
+
+    pcb = _make_pad_exit_stub_board(tmp_path)
+    recorded: list[tuple[list, list]] = []
+    real_absorb = route_engine_module._absorb_terminal_stubs
+
+    def recording_absorb(pts, *args, **kwargs):
+        out = real_absorb(pts, *args, **kwargs)
+        if list(out) != list(pts):
+            recorded.append((list(pts), list(out)))
+        return out
+
+    monkeypatch.setattr(route_engine_module, "_absorb_terminal_stubs", recording_absorb)
+
+    res = auto_route_pair(
+        RouteRequest(
+            pcb_path=str(pcb),
+            ref_a="R1",
+            pad_a="1",
+            ref_b="C1",
+            pad_b="1",
+            net="VCC",
+            width=0.2,
+            algorithm="pns",
+            via_pairs=(),
+        )
+    )
+
+    # The engine really did emit the stub the pass exists to remove.
+    assert recorded, "fixture no longer reproduces the pad-exit stub"
+    pre, post = recorded[0]
+    assert math.hypot(pre[-1][0] - pre[-2][0], pre[-1][1] - pre[-2][1]) == pytest.approx(
+        0.08747842367188996, abs=1e-9
+    )
+    assert post[-1] == pre[-1]
+
+    segs = [(s.x1, s.y1, s.x2, s.y2) for s in res.segments]
+    assert len(segs) == 2
+    pts = [(segs[0][0], segs[0][1])] + [(s[2], s[3]) for s in segs]
+    assert pts[0] == pytest.approx(_STUB_FIXTURE_START)
+    assert pts[-1] == pytest.approx(_STUB_FIXTURE_END)
+    for a, b in zip(pts, pts[1:]):
+        dx, dy = abs(b[0] - a[0]), abs(b[1] - a[1])
+        assert dx < 1e-9 or dy < 1e-9 or abs(dx - dy) < 1e-9
+        assert math.hypot(dx, dy) >= 0.2 - 1e-9
+    # One interior turn only, and it is the 45-degree family corner.
+    assert len(pts) - 2 == 1
+    assert _turn_degrees(*pts) == pytest.approx(45.0, abs=1e-6)
+
+
+# ---------------------------------------------------------------------------
 # _check_segments_in_board
 # ---------------------------------------------------------------------------
 
