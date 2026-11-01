@@ -790,6 +790,57 @@ def test_leg_boundary_merge_filters_same_net_copper(
     assert [o.net for o in calls[0]["obstacles"]] == []
 
 
+def test_leg_boundary_merge_scopes_moved_pairs_per_layer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both merge call sites take the per-layer filtered moved set.
+
+    ``moved_pairs`` accumulates over every leg and layer, while this
+    run's hull build and audit are single-layer.  Regressing either call
+    site back to the raw ``moved_pairs`` is invisible in the emitted
+    route on today's fixtures (it only over-rejects), so the wiring is
+    pinned here: the set ``moved_pairs_for_layer`` returns must reach
+    ``family_hulls`` and the audit validator unchanged, and the helper
+    must be asked about this run's layer and the request net.
+    """
+    import kcaa.router.router as router_module
+
+    sentinel = [("scoped", "moved-set")]
+    seen: dict[str, object] = {}
+
+    def fake_filter(pairs, layer, net):
+        seen["filter"] = (list(pairs), layer, net)
+        return sentinel
+
+    def recording_hulls(obstacles, clearance, width, moved_pairs):
+        seen["hulls"] = moved_pairs
+        return []
+
+    def recording_audit(*, moved_pairs, **kwargs):
+        seen["audit"] = moved_pairs
+        return True
+
+    monkeypatch.setattr(router_module, "moved_pairs_for_layer", fake_filter)
+    monkeypatch.setattr(router_module, "family_hulls", recording_hulls)
+    monkeypatch.setattr(router_module, "_audit_final_copper", recording_audit)
+
+    _route_clear(
+        {
+            "algorithm": "pns",
+            "waypoints": [
+                {"kind": "waypoint", "pos": (40.0, 31.0), "tol_mm": 0.0},
+                {"kind": "waypoint", "pos": (50.0, 33.0), "tol_mm": 0.25},
+                {"kind": "waypoint", "pos": (55.0, 36.0), "tol_mm": 0.5},
+            ],
+        },
+        tmp_path,
+    )
+
+    assert seen["filter"] == ([], "F.Cu", "VCC")
+    assert seen["hulls"] is sentinel
+    assert seen["audit"] is sentinel
+
+
 def test_leg_boundary_merge_audit_vetoes_foreign_copper(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

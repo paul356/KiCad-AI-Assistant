@@ -1675,12 +1675,21 @@ class TestMovedPairsForLayer:
         other_layer = self._pair("B.Cu", "GND", 2.0)
         same_net = self._pair("F.Cu", "VCC", 4.0)
         unknown_layer = self._pair(None, "GND", 6.0)
+        unknown_net = self._pair("F.Cu", None, 8.0)
         kept = moved_pairs_for_layer(
-            [same_layer_foreign, other_layer, same_net, unknown_layer],
+            [same_layer_foreign, other_layer, same_net, unknown_layer, unknown_net],
             "F.Cu",
             "VCC",
         )
-        assert kept == [same_layer_foreign, unknown_layer]
+        assert kept == [same_layer_foreign, unknown_layer, unknown_net]
+
+    def test_a_none_net_pair_is_not_dropped_by_a_none_request_net(self):
+        """``_audit_final_copper`` exempts a net only when both nets are
+        non-``None`` and equal, so an unknown net is still audited and
+        must still veto here (dropping it would hide copper the audit
+        will check)."""
+        unknown_net = self._pair("F.Cu", None)
+        assert moved_pairs_for_layer([unknown_net], "F.Cu", None) == [unknown_net]
 
 
 class TestParallelDiagonalMerge:

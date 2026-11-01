@@ -1451,11 +1451,14 @@ def moved_pairs_for_layer(
     same-net copper imposes no spacing rule (the audit exempts it).
     A pair with an unknown layer stays in: a hull that cannot be
     attributed must keep blocking (over-rejection is the safe side).
+    A ``None`` net is kept for the same reason: ``_audit_final_copper``
+    exempts a net only when both nets are non-``None`` and equal, so an
+    unknown net is still audited and must still veto here.
     """
     return [
         (orig, disp)
         for orig, disp in moved_pairs
-        if (disp.layer is None or disp.layer == layer) and disp.net != net
+        if (disp.layer is None or disp.layer == layer) and (disp.net is None or disp.net != net)
     ]
 
 
@@ -1500,10 +1503,14 @@ def merge_parallel_diagonals(
     (CLEAN); that is exactly the ``x - y = 27.3016`` support value.
 
     Families run in order A then B.  The guarantees are narrow and
-    exact: the segment count never increases (each merge removes at
-    least one vertex), the total length never increases (A: equal; B:
-    the chord is no longer than the stair it replaces and the flank it
-    consumes shrinks), and the minimum segment length stays ``>= width``.
+    exact: the segment count after each merge never increases (every
+    acceptance removes at least one vertex), the total length never
+    increases (A: equal; B: the chord is no longer than the stair it
+    replaces and the flank it consumes shrinks), and the minimum segment
+    length stays ``>= width``.  ``keep_anchor_vertices`` can add
+    collinear vertices back afterwards (one split per anchor, each half
+    ``>= width``, length unchanged), so the *returned* path may have
+    more segments than the input when anchors cut a merged segment.
     The minimum itself *can* drop — a merge that shortens a flank can
     leave a segment shorter than the path's previous minimum, as long as
     it clears ``width`` — so this pass does not preserve the minimum the
@@ -1534,13 +1541,22 @@ def merge_parallel_diagonals(
     Bounded and idempotent: one ``_scan_runs`` call walks at most
     ``4 * len(pts) + 16`` vertices; one ``_scan_stairs`` call tries at
     most ``2 * len(pts) ** 2 + 64`` flank pairs, each with at most
-    ``4 * len(hulls) + 4`` slides.  Those are *per-scan* caps: the two
-    scans alternate for at most ``len(pts)`` rounds while a round keeps
-    changing something, so the worst case is O(n^3) (measured: 321
-    vertices 24 ms, 2401 vertices 0.89 s).  A complete pass accepts each
-    merge at most once per removed vertex, and after a merge the scan
-    restarts one vertex back, so re-running the pass on its own output
-    is a no-op.
+    ``4 * len(hulls) + 4`` slides.  Those are *per-scan* caps.  Each
+    candidate attempt costs O(n) (``_dedupe`` plus the ``_joint_turns_ok``
+    lookup), so one stairs scan is O(n^3 * |hulls|), and the two scans
+    alternate for at most ``len(pts)`` rounds while a round keeps
+    changing something: the worst case is O(n^4 * |hulls|).  No tighter
+    bound is claimed — the caps count attempts, not accepted merges.
+    Observed on a staircase generator: 321 vertices 39 ms, 1281 vertices
+    514 ms, 2401 vertices 1.72 s (roughly quadratic on this shape, second
+    call 0 ms).  Acceptance is greedy (the first slide that passes wins)
+    and the joint gate is local, so a candidate refused for a transient
+    spike can leave a legal merge on the table — 54 of 41,127 merges in
+    a 60,000-path fuzz corpus, 52 of those old outputs carrying an
+    invalid turn, and 6 replaced outputs up to 0.94 mm longer — while
+    every returned path stays family/width/turn-valid.  A complete pass accepts each merge at most once per
+    removed vertex, and after a merge the scan restarts one vertex back,
+    so re-running the pass on its own output is a no-op.
     """
     out = list(pts)
     if len(out) < 4 or width <= 0.0:
