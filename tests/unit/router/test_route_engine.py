@@ -14,8 +14,10 @@ from kcaa.router.route_engine import (
     _audit_final_copper,
     _coalesce_stub_pairs,
     _family_hull,
+    _merge_family_chain,
     _path_len,
     _rect_medians,
+    _shoulder_family_corners,
     _snap45_line,
     _track_centerline,
     _visibility_detour,
@@ -952,6 +954,282 @@ class TestDetourSegmentReduction:
         # exit legs max.  The pre-fix bug emitted 60+ micro-segments
         # (walkaround chord sampling + no family merge).
         assert n <= 8, f"detour splintered into {n} segments"
+
+    def test_detour_has_no_ninety_degree_turns(self):
+        # The lane detour used to enter and leave the parallel run with
+        # two 90-degree corners; every segment was already on the family,
+        # so the direction-only contract accepted them.  The shouldering
+        # pass replaces each with a 45-degree bisector.
+        res = self._route_around_pad()
+        out = res.path
+        assert _turns_le_45(out)
+        for a, b in zip(out, out[1:]):
+            assert math.hypot(b[0] - a[0], b[1] - a[1]) >= W - 1e-9
+
+
+class TestFamilyCornerShouldering:
+    """#214: 45-family routes must not emit 90-degree interior turns.
+
+    ``_line_is_family`` constrains segment directions only, so a family
+    path can still meet at 90 degrees (walkaround through a hull's flat
+    edge, or a parallel-lane stub).  The shouldering pass cuts such a
+    corner with the 45-degree bisector, turning one 90-degree turn into
+    two 45-degree turns without leaving the family."""
+
+    # Exact issue geometry: J3 pad 5, U1.29 -> C3.2 on /RESET.
+    J3_CENTER = (119.84, 90.4)
+    J3_START = (118.98, 93.6275)
+    J3_END = (120.05, 87.20)
+
+    def _walked_j3_path(self):
+        """The walkaround path that reproduces #214.
+
+        The issue's board gives the engine a square pad footprint for
+        J3.5; its family hull's flat north edge is what the vertical
+        skeleton leg hits perpendicularly.  Driving the walkaround
+        directly keeps the lane optimisation (which shifts the whole
+        run sideways) out of the fixture.
+        """
+        from shapely.geometry import box
+
+        from kcaa.router.pns.direction45 import CornerMode, build_initial_trace
+        from kcaa.router.pns.node import ObstacleNode
+
+        half = 0.85
+        cx, cy = self.J3_CENTER
+        shape = box(cx - half, cy - half, cx + half, cy + half)
+        pad = Obstacle(shape=shape, layers=frozenset({"F.Cu"}), net="J3", kind="pad")
+        skeleton = build_initial_trace(
+            self.J3_START, self.J3_END, CornerMode.MITERED_45
+        ).as_polyline()
+        walked = _walkaround_solids(list(skeleton), ObstacleNode([pad]), W, 0.2)
+        hull = _family_hull(shape, 0.2 + 0.01 + W / 2.0)
+        walked = _snap45_line(walked, [hull])
+        walked = _coalesce_stub_pairs(walked)
+        return _merge_family_chain(walked), hull
+
+    def test_walkaround_flat_edge_reproduces_the_90_degree_corner(self):
+        """Characterisation fixture: the pre-fix walkaround output.
+
+        It pins the exact shape the shouldering pass exists to repair.
+        This is intentionally *not* a regression test — it asserts the
+        90-degree turn that the fix removes, so it must never be updated
+        to expect a clean path; the sibling test below covers the fix.
+        """
+        walked, _hull = self._walked_j3_path()
+        assert _segments_on_45(walked)
+        assert not _turns_le_45(walked)
+
+    def test_shouldering_removes_walkaround_ninety_degree_corners(self):
+        walked, hull = self._walked_j3_path()
+        out = _shoulder_family_corners(walked, [hull], W)
+        assert _turns_le_45(out)
+        assert _segments_on_45(out)
+        for a, b in zip(out, out[1:]):
+            assert math.hypot(b[0] - a[0], b[1] - a[1]) >= W - 1e-9
+        # The shoulder rides the hull's 45-degree chamfer: both cuts
+        # collapse into one long diagonal instead of a sub-width stub.
+        assert out[0] == self.J3_START and out[-1] == self.J3_END
+
+    def test_route_over_j3_pad_has_no_ninety_degree_turns(self):
+        # Acceptance fixture: exact J3 pad-5 geometry through the full
+        # engine (circle shape here; the shouldering pass must also fix
+        # the lane detour the engine prefers).
+        from shapely.geometry import Point
+
+        from kcaa.router.pns.direction45 import CornerMode
+
+        pad = Obstacle(
+            shape=Point(*self.J3_CENTER).buffer(0.85),
+            layers=frozenset({"F.Cu"}),
+            net="J3",
+            kind="pad",
+        )
+        res = route_engine(
+            self.J3_START,
+            self.J3_END,
+            [pad],
+            W,
+            0.2,
+            corner_mode=CornerMode.MITERED_45,
+        )
+        out = res.path
+        assert out[0] == self.J3_START and out[-1] == self.J3_END
+        assert _turns_le_45(out)
+        assert _segments_on_45(out)
+        for a, b in zip(out, out[1:]):
+            assert math.hypot(b[0] - a[0], b[1] - a[1]) >= W - 1e-9
+
+    def test_mitered90_keeps_manhattan_corners(self):
+        # 90-degree corners are the intended output in Manhattan modes;
+        # the shouldering pass must not fire there.
+        from shapely.geometry import Point
+
+        from kcaa.router.pns.direction45 import CornerMode
+
+        pad = Obstacle(
+            shape=Point(0, 0).buffer(1.0),
+            layers=frozenset({"F.Cu"}),
+            net=None,
+            kind="pad",
+        )
+        res = route_engine((-8, 0), (8, 0), [pad], W, CLR, corner_mode=CornerMode.MITERED_90)
+        assert not _turns_le_45(res.path)
+        assert _turns_in_family(res.path)
+
+    def test_rounded90_keeps_manhattan_corners(self):
+        # rounded90 is a Manhattan corner mode too; adding it to the
+        # shouldering gate would silently convert its 90s to 45s.
+        from shapely.geometry import Point
+
+        from kcaa.router.pns.direction45 import CornerMode
+
+        pad = Obstacle(
+            shape=Point(0, 0).buffer(1.0),
+            layers=frozenset({"F.Cu"}),
+            net=None,
+            kind="pad",
+        )
+        res = route_engine((-8, 0), (8, 0), [pad], W, CLR, corner_mode=CornerMode.ROUNDED_90)
+        assert not _turns_le_45(res.path)
+
+    def test_rounded45_route_is_shouldered(self):
+        # rounded45 is a 45-family mode: a detoured route (skeleton arcs
+        # do not survive a detour) must get the same shoulders.
+        from shapely.geometry import Point
+
+        from kcaa.router.pns.direction45 import CornerMode
+
+        pad = Obstacle(
+            shape=Point(0, 0).buffer(1.0),
+            layers=frozenset({"F.Cu"}),
+            net=None,
+            kind="pad",
+        )
+        res = route_engine((-8, 0), (8, 0), [pad], W, CLR, corner_mode=CornerMode.ROUNDED_45)
+        assert _turns_le_45(res.path)
+
+    def test_short_leg_is_consumed_instead_of_left_at_ninety(self):
+        # P1-1: the width floor judges the emitted geometry, not ``t``.
+        # Cutting the short leg fully (t = l1 = 0.3) leaves no sub-width
+        # remainder; the old width/sqrt(2) cap rejected that offset and
+        # kept the 90-degree corner.
+        pts = [(0.0, 0.0), (0.0, 0.3), (2.0, 0.3)]
+        out = _shoulder_family_corners(pts, [], W)
+        assert out == [(0.0, 0.0), (0.3, 0.3), (2.0, 0.3)]
+        assert _turns_le_45(out)
+        for a, b in zip(out, out[1:]):
+            assert math.hypot(b[0] - a[0], b[1] - a[1]) >= W - 1e-9
+
+    def test_prefers_the_shortest_legal_shoulder(self):
+        # Both offsets are legal for this corner: the minimal cut and the
+        # cut that consumes both equal legs (a straight 45-degree
+        # diagonal).  The shortest polyline must win, so a newly legal
+        # small shoulder cannot lengthen a corner a larger cut fixed.
+        pts = [(0.0, 0.0), (0.0, 2.0), (2.0, 2.0)]
+        out = _shoulder_family_corners(pts, [], W)
+        assert out == [(0.0, 0.0), (2.0, 2.0)]
+        assert _turns_le_45(out)
+
+    def test_fully_consumed_leg_guard_rejects_a_new_obtuse_turn(self):
+        # The t = l1 candidate consumes the entry leg and re-anchors the
+        # shoulder at A; the outer neighbour then meets the bisector at
+        # 90 degrees, so that candidate must be rejected.  No other
+        # offset is legal either: the corner is returned untouched.
+        pts = [(1.5, 0.5), (1.0, 0.0), (0.7, 0.0), (0.7, 1.0)]
+        assert _shoulder_family_corners(pts, [], W) == pts
+
+    def test_shoulder_that_leaves_the_board_is_rejected(self):
+        # The corner has a legal shoulder in free space, but the 45-degree
+        # cut leaves this concave board outline: keep the original path.
+        pts = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)]
+        board = Polygon(
+            [
+                (-1.0, -0.01),
+                (1.0, -0.01),
+                (1.0, 1.0),
+                (0.99, 1.0),
+                (0.99, 0.01),
+                (-1.0, 0.01),
+            ]
+        )
+        assert _shoulder_family_corners(pts, [], W, board_limit=board) == pts
+        # Sanity: the same corner shoulders when the board does not bite.
+        assert _shoulder_family_corners(pts, [], W) != pts
+
+    def test_no_shoulder_when_every_bisector_is_blocked(self):
+        # Both candidate offsets are blocked: the near cut (t_cap) and
+        # the fully-consumed-leg chord (t = l1).  The corner must be
+        # returned untouched (no exception, no DRC-breaking shoulder).
+        pts = [(-1.0, 0.0), (0.0, 0.0), (0.0, -1.0)]
+        near = Polygon([(-0.12, -0.12), (-0.02, -0.12), (-0.02, -0.02), (-0.12, -0.02)])
+        chord = Polygon([(-0.62, -0.62), (-0.42, -0.62), (-0.42, -0.42), (-0.62, -0.42)])
+        assert _shoulder_family_corners(pts, [near, chord], W) == pts
+
+    def test_bisector_grazing_a_hull_is_accepted(self):
+        # A shoulder endpoint can land ~1e-16 inside the inflated hull
+        # through float roundoff.  Boundary riding is legal (the
+        # walkaround places segments on the margin), so ``_seg_clear``
+        # must not turn that ulp into a rejected candidate.
+        from shapely.geometry import box
+
+        pts = [
+            (-2.632, 1.55),
+            (2.031, 1.55),
+            (2.031, -0.611),
+            (2.0, -0.642),
+            (2.0, -0.807),
+        ]
+        hull = _family_hull(box(2.341, -0.679, 2.641, 4.715), 0.31)
+        assert not _turns_le_45(pts)
+        out = _shoulder_family_corners(pts, [hull], W)
+        assert _turns_le_45(out)
+        assert _segments_on_45(out)
+        # The input already carries two sub-width pad stubs at the tail;
+        # only the shoulder-introduced segments are held to the floor.
+        for a, b in zip(out[:3], out[1:4]):
+            assert math.hypot(b[0] - a[0], b[1] - a[1]) >= W - 1e-9
+
+    def test_bisector_penetrating_a_hull_is_rejected(self):
+        # A visible cut into the hull must still reject the shoulder:
+        # both candidate diagonals cross it, so the corner is returned
+        # untouched (no exception, no DRC-breaking shoulder).
+        from shapely.geometry import box
+
+        pts = [(0.0, 0.0), (0.0, 0.3), (2.0, 0.3)]
+        cutting = box(0.10, 0.10, 0.30, 0.30)
+        assert _shoulder_family_corners(pts, [cutting], W) == pts
+
+    def test_boundary_riding_shoulder_is_not_penetration(self):
+        # The pass promises boundary riding.  The near candidate diagonal
+        # lies exactly on a hull edge and the wider candidate is blocked,
+        # so accepting the riding shoulder is the only way to fix the
+        # corner.  Measuring penetration against the *exact* hull counts
+        # a shared boundary edge as inside and would reject it.
+        from shapely.geometry import Polygon
+
+        pts = [(0.0, 0.0), (0.0, 1.0), (1.0, 1.0)]
+        t = W / math.sqrt(2.0)
+        riding = Polygon([(0.0, 1.0 - t), (t, 1.0), (0.4, 1.4)])
+        blocking = Polygon([(0.4, 0.4), (0.6, 0.4), (0.6, 0.6), (0.4, 0.6)])
+        out = _shoulder_family_corners(pts, [riding, blocking], W)
+        assert out != pts
+        assert _turns_le_45(out)
+        for a, b in zip(out, out[1:]):
+            assert math.hypot(b[0] - a[0], b[1] - a[1]) >= W - 1e-9
+
+    def test_endpoints_are_pinned_exactly(self):
+        # A fully-consumed exit leg replaces the last vertex with the
+        # recomputed cut point, which can differ from the input endpoint
+        # by float noise.  Physical anchors must be returned exactly.
+        s = 1.0 / math.sqrt(2.0)
+        b = (5.890022579825517, 0.34525830151341586)
+        c = (6.013252905139233, 0.22202797619969908)
+        pts = [(b[0] - s, b[1] - s), b, c]
+        out = _shoulder_family_corners(pts, [], W)
+        assert out[0] == pts[0]
+        assert out[-1] == pts[-1]
+        assert _turns_le_45(out)
 
 
 class TestWalkaroundEndsAtTarget:
