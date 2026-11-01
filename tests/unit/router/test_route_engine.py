@@ -6,7 +6,7 @@ import math
 
 import pytest
 import shapely.affinity
-from shapely.geometry import LineString, Polygon
+from shapely.geometry import LineString, Polygon, box
 
 from kcaa.router.pns.shove import ShoveFailure, TrackObstacle
 from kcaa.router.route_engine import (
@@ -16,7 +16,6 @@ from kcaa.router.route_engine import (
     _coalesce_stub_pairs,
     _family_hull,
     _merge_family_chain,
-    _merge_parallel_diagonals,
     _path_len,
     _rect_medians,
     _shoulder_family_corners,
@@ -24,6 +23,7 @@ from kcaa.router.route_engine import (
     _track_centerline,
     _visibility_detour,
     _walkaround_solids,
+    merge_parallel_diagonals,
     route_engine,
 )
 from kcaa.router.world_model import Obstacle
@@ -1679,7 +1679,7 @@ class TestParallelDiagonalMerge:
         assert len(shouldered) == 7  # the #214 shape: 6 segments
         assert _turns_le_45(shouldered)
 
-        out = _merge_parallel_diagonals(shouldered, [hull], W)
+        out = merge_parallel_diagonals(shouldered, [hull], W)
         assert len(out) == 6  # 5 segments
         assert _segments_on_45(out)
         assert _turns_le_45(out)
@@ -1722,8 +1722,8 @@ class TestParallelDiagonalMerge:
     def test_j3_merge_is_idempotent(self):
         walked, hull, _pad = _j3_walkaround_fixture()
         shouldered = _shoulder_family_corners(walked, [hull], W)
-        once = _merge_parallel_diagonals(shouldered, [hull], W)
-        assert _merge_parallel_diagonals(once, [hull], W) == once
+        once = merge_parallel_diagonals(shouldered, [hull], W)
+        assert merge_parallel_diagonals(once, [hull], W) == once
 
     def test_engine_j3_fixture_keeps_its_lane_route(self):
         """The engine prefers the 3-segment lane candidate at J3; the
@@ -1750,7 +1750,7 @@ class TestParallelDiagonalMerge:
             math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(out, out[1:])
         ) == pytest.approx(0.56569, abs=1e-4)
         assert out[0] == J3_START and out[-1] == J3_END
-        assert _merge_parallel_diagonals(out, [], W) == out
+        assert merge_parallel_diagonals(out, [], W) == out
 
     def test_mirror_candidate_merges_when_forward_is_blocked(self):
         """Both orderings are legal: when the hull blocks the forward
@@ -1760,12 +1760,12 @@ class TestParallelDiagonalMerge:
 
         pts = [(0.0, 0.0), (1.0, 1.0), (1.0, 3.0), (3.0, 5.0)]
         blocked = box(2.9, 3.9, 3.1, 4.1)  # on the forward run x=3, y in 3..5
-        out = _merge_parallel_diagonals(pts, [blocked], W)
+        out = merge_parallel_diagonals(pts, [blocked], W)
         assert out == [(0.0, 0.0), (0.0, 2.0), (3.0, 5.0)]
         assert _segments_on_45(out) and _turns_le_45(out)
         assert _polyline_len(out) == pytest.approx(_polyline_len(pts), abs=1e-9)
         # Control: in free space the forward candidate wins.
-        assert _merge_parallel_diagonals(pts, [], W) == [
+        assert merge_parallel_diagonals(pts, [], W) == [
             (0.0, 0.0),
             (3.0, 3.0),
             (3.0, 5.0),
@@ -1775,25 +1775,25 @@ class TestParallelDiagonalMerge:
         # D+ then D-: the lines are not parallel, so no single
         # translation makes them collinear.
         pts = [(0.0, 0.0), (0.5, 0.5), (2.0, 0.5), (2.5, 0.0)]
-        assert _merge_parallel_diagonals(pts, [], W) == pts
+        assert merge_parallel_diagonals(pts, [], W) == pts
 
     def test_diagonal_run_is_not_merged(self):
         # The middle segment must be an axis run; a diagonal run is a
         # different shape (and merging it would change the turn angles).
         pts = [(0.0, 0.0), (1.0, 1.0), (2.0, 2.0), (3.0, 1.0)]
-        assert _merge_parallel_diagonals(pts, [], W) == pts
+        assert merge_parallel_diagonals(pts, [], W) == pts
 
     def test_sub_width_run_is_rejected(self):
         # Track width gate: the translated run must stay a full-width
         # segment (the pass never emits a sub-width segment).
         pts = [(0.0, 0.0), (1.0, 1.0), (1.0, 1.1), (3.0, 3.1)]
-        assert _merge_parallel_diagonals(pts, [], W) == pts
+        assert merge_parallel_diagonals(pts, [], W) == pts
 
     def test_extension_shorter_than_width_is_rejected(self):
         # Both diagonals are shorter than the track width, so the
         # extended diagonal (l1 + l3) is sub-width in either ordering.
         pts = [(0.0, 0.0), (0.05, 0.05), (0.05, 2.05), (0.1, 2.1)]
-        assert _merge_parallel_diagonals(pts, [], W) == pts
+        assert merge_parallel_diagonals(pts, [], W) == pts
 
     def test_hull_penetrating_either_candidate_keeps_the_path(self):
         # One hull straddling both candidate diagonals (the forward's
@@ -1802,7 +1802,7 @@ class TestParallelDiagonalMerge:
         from shapely.geometry import box
 
         pts = [(0.0, 0.0), (1.0, 1.0), (1.0, 3.0), (3.0, 5.0)]
-        assert _merge_parallel_diagonals(pts, [box(0.5, 1.5, 2.5, 3.5)], W) == pts
+        assert merge_parallel_diagonals(pts, [box(0.5, 1.5, 2.5, 3.5)], W) == pts
 
     def test_board_limits_reject_the_moved_run(self):
         # Board follows the input corridor but a hole covers the
@@ -1816,27 +1816,43 @@ class TestParallelDiagonalMerge:
             .difference(box(2.8, 2.8, 3.2, 3.2))  # forward run vertex
             .difference(box(-0.2, 1.8, 0.2, 2.2))  # mirror run vertex
         )
-        assert _merge_parallel_diagonals(pts, [], W, board_limit=board) == pts
+        assert merge_parallel_diagonals(pts, [], W, board_limit=board) == pts
         # Control: without the hole the merge is accepted.
-        assert _merge_parallel_diagonals(pts, [], W, board_limit=LineString(pts).buffer(2.0)) != pts
+        assert merge_parallel_diagonals(pts, [], W, board_limit=LineString(pts).buffer(2.0)) != pts
 
     def test_preexisting_sub_width_segment_blocks_the_merge(self):
         # Unlike the shouldering pass, this one is strict: it must not
         # keep a sub-width segment anywhere in the emitted path.
         pts = [(0.0, 0.0), (1.0, 1.0), (1.0, 3.0), (3.0, 5.0), (3.0, 5.05)]
-        assert _merge_parallel_diagonals(pts, [], W) == pts
+        assert merge_parallel_diagonals(pts, [], W) == pts
 
     def test_audit_callback_vetoes_the_merge(self):
         pts = [(0.0, 0.0), (1.0, 1.0), (1.0, 3.0), (3.0, 5.0)]
-        assert _merge_parallel_diagonals(pts, [], W, audit=lambda cand: False) == pts
-        assert _merge_parallel_diagonals(pts, [], W, audit=lambda cand: True) != pts
+        assert merge_parallel_diagonals(pts, [], W, audit=lambda cand: False) == pts
+        assert merge_parallel_diagonals(pts, [], W, audit=lambda cand: True) != pts
+
+    def test_off_family_noise_is_not_amplified_by_the_translation(self):
+        """Candidate family gate: a sub-micron off-family input diagonal
+        (inside every tolerance) must not be *doubled* into real
+        off-family copper by the merge.  ``q1 = d - run`` inherits the
+        offset and re-emits it over the whole merged diagonal, so the
+        candidate family check is what keeps the 0/45/90 contract."""
+        pts = [(0.0, 0.0), (1.0, 1.0000009), (1.0, 2.0), (2.0, 3.0000009)]
+        out = merge_parallel_diagonals(pts, [], W)
+        assert out == pts
+        worst = max(
+            abs(abs(b[0] - a[0]) - abs(b[1] - a[1]))
+            for a, b in zip(out, out[1:])
+            if abs(b[0] - a[0]) > 1e-6 and abs(b[1] - a[1]) > 1e-6
+        )
+        assert worst <= 1e-6
 
     def test_forward_join_that_would_be_a_ninety_degree_turn_is_skipped(self):
         # Forward candidate: the run q1->d meets d->e at 90 degrees
         # (the diagonal it replaces met it at 45).  The mirror is legal,
         # so the merge still happens — with the mirror's shape.
         pts = [(0.0, 0.0), (1.0, 1.0), (1.0, 3.0), (3.0, 5.0), (4.0, 5.0)]
-        out = _merge_parallel_diagonals(pts, [], W)
+        out = merge_parallel_diagonals(pts, [], W)
         assert out == [(0.0, 0.0), (0.0, 2.0), (3.0, 5.0), (4.0, 5.0)]
         assert _turns_le_45(out)
 
@@ -1848,7 +1864,7 @@ class TestParallelDiagonalMerge:
 
         pts = [(0.0, 0.0), (1.0, 0.0), (2.0, 1.0), (2.0, 3.0), (4.0, 5.0)]
         blocked = box(3.9, 3.3, 4.1, 3.7)  # on the forward run x=4, y in 3..5
-        assert _merge_parallel_diagonals(pts, [blocked], W) == pts
+        assert merge_parallel_diagonals(pts, [blocked], W) == pts
 
     def test_staircase_merge_terminates_and_is_length_preserving(self):
         """Bounded scan (cap reported) on a long staircase.
@@ -1865,7 +1881,7 @@ class TestParallelDiagonalMerge:
             pts.append((x, y))  # D+
             y += 0.5
             pts.append((x, y))  # V run
-        out = _merge_parallel_diagonals(pts, [], W)
+        out = merge_parallel_diagonals(pts, [], W)
         assert len(out) < len(pts)
         assert _segments_on_45(out)
         assert _turns_le_45(out)
@@ -1873,7 +1889,213 @@ class TestParallelDiagonalMerge:
         for a, b in zip(out, out[1:]):
             assert math.hypot(b[0] - a[0], b[1] - a[1]) >= W - 1e-9
         assert out[0] == pts[0] and out[-1] == pts[-1]
-        assert _merge_parallel_diagonals(out, [], W) == out
+        assert merge_parallel_diagonals(out, [], W) == out
+
+
+class TestStairCollapse:
+    """#217: collapse a staircase between two parallel axis runs.
+
+    Unlike ``TestParallelDiagonalMerge`` (translate the run of a
+    ``[D, run, D]`` triple), this shape has no diagonals at all: two
+    parallel axis runs are joined by a stair.  Replacing the stair with
+    the single 45-degree diagonal joining the runs keeps the family and
+    length (the diagonal is exactly the stair's chord), and the slide of
+    the run is bounded by the hulls on the smaller-slide side.  A
+    vertex-local pass cannot see it, and a `t`-style corner cut cannot
+    reach it: the move translates a whole run.
+    """
+
+    STAIR = [
+        (0.0, 0.0),
+        (0.0, 1.0),
+        (1.0, 1.0),
+        (1.0, 2.0),
+        (2.0, 2.0),
+        (2.0, 3.0),
+    ]
+
+    def test_stair_collapses_to_one_diagonal(self):
+        out = merge_parallel_diagonals(self.STAIR, [], W)
+        assert out == [(0.0, 0.0), (0.0, 1.0), (2.0, 3.0)]
+        assert _segments_on_45(out)
+        assert _turns_le_45(out)
+        assert out[0] == self.STAIR[0] and out[-1] == self.STAIR[-1]
+        assert _polyline_len(out) <= _polyline_len(self.STAIR)
+        for a, b in zip(out, out[1:]):
+            assert math.hypot(b[0] - a[0], b[1] - a[1]) >= W - 1e-9
+        # Fixpoint: a second call is a no-op (the pass cannot drift).
+        assert merge_parallel_diagonals(out, [], W) == out
+
+    def test_long_stair_collapses_and_never_lengthens(self):
+        # A four-step staircase must fold in one call (the outer
+        # run/stair alternation reaches the fixpoint internally).
+        pts = [(0.0, 0.0)]
+        for k in range(1, 5):
+            pts += [(float(k - 1), float(k)), (float(k), float(k))]
+        pts.append((4.0, 5.0))
+        out = merge_parallel_diagonals(pts, [], W)
+        assert out == [(0.0, 0.0), (0.0, 1.0), (4.0, 5.0)]
+        assert _polyline_len(out) <= _polyline_len(pts)
+        assert merge_parallel_diagonals(out, [], W) == out
+
+    def test_slide_stops_on_the_hull_tangent(self):
+        """A hull covering the zero-slide diagonal forces the run to move;
+        the nearest legal placement rides the hull's 45-degree face."""
+        from shapely.geometry import LineString, box
+
+        blocking = box(0.9, 1.9, 1.3, 2.3)
+        blocked = _family_hull(blocking, 0.0)
+        assert LineString([(0.0, 1.0), (2.0, 3.0)]).intersects(blocking)
+        out = merge_parallel_diagonals(self.STAIR, [blocked], W)
+        assert out == [
+            (0.0, 0.0),
+            (0.0, pytest.approx(0.6, abs=1e-9)),
+            (2.0, pytest.approx(2.6, abs=1e-9)),
+            (2.0, 3.0),
+        ]
+        assert _segments_on_45(out) and _turns_le_45(out)
+        # The merged diagonal rides the hull boundary: boundary contact is
+        # legal, penetration is not.
+        merged = ((out[1][0], out[1][1]), (out[2][0], out[2][1]))
+        assert LineString(list(merged)).distance(blocked) == pytest.approx(0.0, abs=1e-9)
+        assert _polyline_len(out) <= _polyline_len(self.STAIR)
+
+    def test_hull_blocking_every_slide_keeps_the_stair(self):
+        from shapely.geometry import box
+
+        # Covers the corridor on both sides of every candidate line.
+        out = merge_parallel_diagonals(self.STAIR, [box(0.5, 0.5, 1.5, 2.5)], W)
+        assert out == self.STAIR
+
+    def test_board_limit_rejects_the_stair_slide(self):
+        from shapely.geometry import LineString
+
+        corridor = LineString(self.STAIR).buffer(0.05)
+        assert merge_parallel_diagonals(self.STAIR, [], W, board_limit=corridor) == self.STAIR
+        wide = LineString([(0.0, 0.0), (2.0, 3.0)]).buffer(2.0)
+        assert merge_parallel_diagonals(self.STAIR, [], W, board_limit=wide) != self.STAIR
+
+    def test_anchor_tolerance_gates_the_collapse(self):
+        from shapely.geometry import LineString, Point
+
+        # The collapsed diagonal passes 0.7071 mm from this anchor.
+        anchor = ((0.5, 2.5), 0.0)
+        out = merge_parallel_diagonals(self.STAIR, [], W, anchors=[anchor])
+        assert out == self.STAIR
+        assert LineString(out).distance(Point(0.5, 2.5)) == pytest.approx(0.7071, abs=1e-4)
+        loose = merge_parallel_diagonals(self.STAIR, [], W, anchors=[((0.5, 2.5), 0.71)])
+        assert len(loose) - 1 == 2
+
+    def test_keep_anchor_vertices_splits_the_merged_diagonal(self):
+        out = merge_parallel_diagonals(
+            self.STAIR,
+            [],
+            W,
+            anchors=[((0.5, 2.5), 0.8)],
+            keep_anchor_vertices=True,
+        )
+        # (1.0, 2.0) is the anchor's projection onto the merged line.
+        assert out == [(0.0, 0.0), (0.0, 1.0), (1.0, 2.0), (2.0, 3.0)]
+        assert merge_parallel_diagonals(out, [], W) == out
+
+    def test_reversed_travel_direction_is_not_collapsed(self):
+        # Same stair walked the other way: the diagonal must keep the
+        # travel direction, and the progression gates refuse the
+        # backwards slide.
+        pts = self.STAIR[::-1]
+        out = merge_parallel_diagonals(pts, [], W)
+        assert out == [(2.0, 3.0), (2.0, 2.0), (0.0, 0.0)]
+        assert out[0] == pts[0] and out[-1] == pts[-1]
+
+    def test_trailing_run_must_be_parallel_to_the_leading_run(self):
+        """Trailing-run slot gate.
+
+        Without it ``j`` may land on a *diagonal* that happens to accept
+        the 45-degree displacement, and the stair plus both flanks
+        collapse onto a shape that skips the walkaround's clearance
+        vertices (mutant: 6 points / 8.6569 mm instead of 7 / 11.8284).
+        """
+        pts = [
+            (0.0, 0.0),
+            (0.0, 1.0),
+            (1.0, 2.0),
+            (1.0, 5.0),
+            (-2.0, 5.0),
+            (-4.0, 5.0),
+            (-4.0, 4.0),
+            (-5.0, 4.0),
+        ]
+        hull = box(0.5, -2.0, 1.5, -1.0)
+        out = merge_parallel_diagonals(pts, [hull], W)
+        assert out == [
+            (0.0, 0.0),
+            (0.0, 1.0),
+            (1.0, 2.0),
+            (1.0, 5.0),
+            (-2.0, 5.0),
+            (-3.0, 4.0),
+            (-5.0, 4.0),
+        ]
+
+    def test_slide_cannot_retreat_behind_the_first_flank_tail(self):
+        """Progression gate on the first flank.
+
+        The flank vertices are the walkaround's clearance tangents in
+        the *full* obstacle set; the pass may only see a subset of it
+        (the router hands it same-net-filtered hulls), so it must never
+        slide the run back past the flank's tail — the mutant folds the
+        path onto ``(0, 0), (-1, 0), (-4, -3)``.
+        """
+        pts = [(0.0, 0.0), (1.0, 0.0), (1.0, -1.0), (-1.0, -3.0), (-4.0, -3.0)]
+        hulls = [box(1.0, 1.0, 2.0, 2.0), box(-2.0, -2.0, -1.0, -1.0)]
+        assert merge_parallel_diagonals(pts, hulls, W) == pts
+
+    def test_slide_cannot_pass_the_next_run_head(self):
+        """Progression gate on the second flank: ``B`` may not move past
+        the next run's head (mutant: ``(0, 0), (3, -3), (4, -3)``)."""
+        pts = [(0.0, 0.0), (2.0, 0.0), (4.0, 0.0), (5.0, 0.0), (5.0, -3.0), (4.0, -3.0)]
+        hulls = [box(-1.0, 1.0, 0.0, 2.0), box(0.5, 3.0, 1.5, 4.0)]
+        assert merge_parallel_diagonals(pts, hulls, W) == pts
+
+    def test_collapse_never_emits_a_spike_at_the_rewired_joints(self):
+        """Junction-turn gate.
+
+        The displacement is 45 degrees to the run, so the two rewired
+        joints can be 45 or 135 — a 135-degree joint is a copper spike
+        (mutant: ``(0, 0), (-3, 0), (-8, 5), (1, 5)``, 19.0711 mm versus
+        12.2426 mm).  Both joints must stay inside the family contract.
+        """
+        pts = [
+            (0.0, 0.0),
+            (-1.0, 1.0),
+            (-4.0, 1.0),
+            (-4.0, 3.0),
+            (-2.0, 3.0),
+            (0.0, 5.0),
+            (1.0, 5.0),
+        ]
+        assert merge_parallel_diagonals(pts, [], W) == pts
+
+    def test_staircase_benchmark_is_bounded(self):
+        """Iteration cap: one accepting round per removed vertex, each
+        round at most ``4*n+16`` run steps and ``2*n*n+64`` flank pairs.
+
+        A two-hundred-step staircase must fold without super-linear
+        blow-up and stay idempotent."""
+        n = 200
+        pts = [(0.0, 0.0)]
+        for k in range(1, n + 1):
+            pts += [(float(k - 1), float(k)), (float(k), float(k))]
+        out = merge_parallel_diagonals(pts, [], W)
+        # The whole staircase folds onto one diagonal; only the two runs
+        # that already lie on the 45 lines survive.
+        assert out == [
+            (0.0, 0.0),
+            (0.0, 1.0),
+            (199.0, 200.0),
+            (200.0, 200.0),
+        ]
+        assert merge_parallel_diagonals(out, [], W) == out
 
 
 class TestTerminalStubAbsorption:
@@ -1958,6 +2180,30 @@ class TestTerminalStubAbsorption:
         out = _absorb_terminal_stubs(self.STUB_PATH, [], W)
         assert out == [self.S, (-2.932689512396456, 3.233789531661362), self.E]
         assert _polyline_len(out) < _polyline_len(self.STUB_PATH)
+
+    def test_absorption_never_trades_a_stub_for_a_shorter_one(self):
+        """Min-length gate.
+
+        The slide can land the run's far end close to its anchor, which
+        replaces the 0.05 mm stub with a 0.035 mm one — the mutant
+        accepts ``(0, 0), (0.025, -0.025), (0.1, 0.05)``.  Absorb, do
+        not shuffle: the candidate's shortest segment must not fall
+        below the path's current minimum."""
+        pts = [(0.0, 0.0), (0.0, 0.05), (0.05, 0.0), (0.1, 0.05)]
+        assert _absorb_terminal_stubs(pts, [], W) == pts
+
+    def test_absorption_never_folds_the_path_backwards(self):
+        """Direction and length gates on a fold.
+
+        Sliding the run onto the anchor here would leave ``(0, 0),
+        (0, 0.1), (0.1, 0)``: the run reverses over the path (0.2 mm
+        against the original 0.1914 mm), so the candidate is refused
+        even though it drops a vertex.  The progression check refuses
+        the fold and the length gate refuses the growth — a route may
+        shorten or stay equal, never fold or grow."""
+        pts = [(0.0, 0.0), (0.0, 0.05), (0.05, 0.0), (0.1, 0.0)]
+        assert _absorb_terminal_stubs(pts, [], W) == pts
+        assert _polyline_len(pts) < 0.2
 
     def test_absorption_leaving_a_three_point_path_stops_safely(self):
         # After the slide the path is [anchor, run-end, next]: three
