@@ -24,6 +24,7 @@ from kcaa.router.route_engine import (
     _visibility_detour,
     _walkaround_solids,
     merge_parallel_diagonals,
+    moved_pairs_for_layer,
     route_engine,
 )
 from kcaa.router.world_model import Obstacle
@@ -1659,6 +1660,29 @@ def _polyline_len(pts) -> float:
     return sum(math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(pts, pts[1:]))
 
 
+class TestMovedPairsForLayer:
+    """A single-layer run only respects its own layer's foreign copper."""
+
+    @staticmethod
+    def _pair(layer, net, x=0.0):
+        return (
+            TrackObstacle(points=((x, 0.0), (x + 1.0, 0.0)), width=0.2, net=net, layer=layer),
+            TrackObstacle(points=((x, 1.0), (x + 1.0, 1.0)), width=0.2, net=net, layer=layer),
+        )
+
+    def test_keeps_only_this_layer_foreign_net_pairs(self):
+        same_layer_foreign = self._pair("F.Cu", "GND", 0.0)
+        other_layer = self._pair("B.Cu", "GND", 2.0)
+        same_net = self._pair("F.Cu", "VCC", 4.0)
+        unknown_layer = self._pair(None, "GND", 6.0)
+        kept = moved_pairs_for_layer(
+            [same_layer_foreign, other_layer, same_net, unknown_layer],
+            "F.Cu",
+            "VCC",
+        )
+        assert kept == [same_layer_foreign, unknown_layer]
+
+
 class TestParallelDiagonalMerge:
     """#217: merge ``[diagonal, axis run, parallel diagonal]``.
 
@@ -1865,6 +1889,31 @@ class TestParallelDiagonalMerge:
         pts = [(0.0, 0.0), (1.0, 0.0), (2.0, 1.0), (2.0, 3.0), (4.0, 5.0)]
         blocked = box(3.9, 3.3, 4.1, 3.7)  # on the forward run x=4, y in 3..5
         assert merge_parallel_diagonals(pts, [blocked], W) == pts
+
+    def test_mirror_slide_cannot_retreat_the_leading_diagonal(self):
+        """Family A sign gate.
+
+        Reachable from the router's concatenated chain: the forward
+        candidate re-anchors the trailing diagonal *behind* ``a``, which
+        would fold the merged path back over itself (mutant:
+        ``(-0.265686, -0.265686)`` in place of ``(0.3, 0.0)``).  The
+        input already carries a 135-degree leg-boundary turn at its tail,
+        which the pass must leave alone rather than widen.
+        """
+        pts = [
+            (-0.2, 0.0),
+            (0.0, 0.0),
+            (0.3, 0.3),
+            (0.6, 0.3),
+            (0.034314, -0.265686),
+        ]
+        out = merge_parallel_diagonals(pts, [], W)
+        assert out == [(-0.2, 0.0), (0.0, 0.0), (0.3, 0.0), (0.034314, -0.265686)]
+        assert _turns_le_45(out[:3])
+        # The pre-existing 135-degree boundary turn moves with the
+        # re-anchored diagonal and stays 135 (it is not the pass's turn
+        # to smooth); the pass only refuses to *add* one.
+        assert out[-1] == pts[-1]
 
     def test_staircase_merge_terminates_and_is_length_preserving(self):
         """Bounded scan (cap reported) on a long staircase.
@@ -2075,6 +2124,90 @@ class TestStairCollapse:
             (1.0, 5.0),
         ]
         assert merge_parallel_diagonals(pts, [], W) == pts
+
+    def test_slide_touching_the_next_run_head_still_checks_the_turn(self):
+        """Joint gate must be measured on the *candidate* (trailing joint).
+
+        The slide can land ``B`` exactly on the untouched next-run head;
+        measuring ``_turn_deg(A, B, out[j+1])`` then sees a zero-length
+        leg and returns 0 while the real turn at ``B`` is between
+        ``A->B`` and ``B->out[j+2]``.  Pre-fix the pass returned
+        ``[(0, 0), (0.3, 0), (5.1, 4.8), (4.6, 4.8)]``: a 135-degree
+        spike.  The repro is turn-``<= 45`` family input, so only the
+        joint check can refuse it.
+        """
+        pts = [
+            (0.0, 0.0),
+            (0.3, 0.0),
+            (1.1, -0.8),
+            (3.3, -0.8),
+            (4.6, 0.5),
+            (4.6, 2.5),
+            (6.1, 4.0),
+            (6.1, 4.3),
+            (5.6, 4.8),
+            (5.1, 4.8),
+            (4.6, 4.8),
+        ]
+        assert _turns_le_45(pts)
+        out = merge_parallel_diagonals(pts, [], W)
+        assert _turns_le_45(out)
+        assert _segments_on_45(out)
+        # The pass must still merge (the invariant is paid for by a
+        # refused slide, not by disabling the family on touch).
+        assert len(out) < len(pts)
+        assert merge_parallel_diagonals(out, [], W) == out
+
+    def test_slide_touching_the_flank_head_still_checks_the_turn(self):
+        """Same hole at the symmetric first joint (``A == out[i-1]``).
+
+        The hull tangency places the slide exactly on the first flank's
+        tail, so the dedupe drops ``A`` and the pre-merge wait sees a
+        zero-length leg (turn 0) while the real turn there is between
+        ``out[i-2]`` and ``B``: 90 degrees.  Pre-fix the pass emitted
+        ``[(0, 0), (-0.25, 0.25), (2.5, 3.0)]``; every other gate
+        (family, width, hull, board, audit) accepts that candidate, so
+        only the joint check refuses it.
+        """
+        pts = [
+            (0.0, 0.0),
+            (-0.25, 0.25),
+            (-0.25, 0.75),
+            (0.0, 1.0),
+            (1.0, 2.0),
+            (1.5, 2.5),
+            (1.7, 2.5),
+            (2.0, 2.5),
+            (2.25, 2.5),
+            (2.5, 2.75),
+            (2.5, 3.0),
+        ]
+        hulls = [_family_hull(box(2.18, 2.38, 2.48, 2.68), 0.0)]
+        assert _turns_le_45(pts)
+        out = merge_parallel_diagonals(pts, hulls, W)
+        assert out == pts
+
+    def test_anchor_split_refuses_a_sub_width_remainder(self):
+        """``keep_anchor_vertices`` width gate.
+
+        The anchor rests on the merged diagonal 0.0354 mm from its
+        start: splitting there would emit a sub-width segment, so the
+        node is dropped (mutant: ``(0.024999999999999956, 1.025)``
+        inserted, min segment 0.035355 mm) and the diagonal's endpoints
+        keep the pass's no-sub-width invariant.
+        """
+        out = merge_parallel_diagonals(
+            self.STAIR,
+            [],
+            W,
+            # Both ends of the merged diagonal, each 0.0354 mm inside:
+            # one split is refused by the leading-half gate, the other
+            # by the trailing-half gate.
+            anchors=[((0.025, 1.025), 0.0), ((1.975, 2.975), 0.0)],
+            keep_anchor_vertices=True,
+        )
+        assert out == [(0.0, 0.0), (0.0, 1.0), (2.0, 3.0)]
+        assert min(math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(out, out[1:])) >= W - 1e-9
 
     def test_staircase_benchmark_is_bounded(self):
         """Iteration cap: one accepting round per removed vertex, each

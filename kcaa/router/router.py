@@ -87,6 +87,7 @@ from kcaa.router.route_engine import (
     _merge_family_chain,
     family_hulls,
     merge_parallel_diagonals,
+    moved_pairs_for_layer,
     route_engine,
 )
 from kcaa.router.via_check import ProposedVia, check_vias
@@ -1319,9 +1320,14 @@ def auto_route_pair(req: RouteRequest, data: list | None = None) -> RouteResult:
                         pad_b_xy,
                     )
 
+                    # The hull set and audit are single-layer: only this
+                    # layer's foreign-net displaced tracks may veto.
+                    layer_moved = moved_pairs_for_layer(moved_pairs, layer, req.net)
+
                     def audit_candidate(
                         cand: list[tuple[float, float]],
                         obstacles=run_obstacles,
+                        moved=layer_moved,
                     ) -> bool:
                         try:
                             _audit_final_copper(
@@ -1330,7 +1336,7 @@ def auto_route_pair(req: RouteRequest, data: list | None = None) -> RouteResult:
                                 net=req.net,
                                 obstacles=obstacles,
                                 extra_fixed=(),
-                                moved_pairs=moved_pairs,
+                                moved_pairs=moved,
                                 orig_obstacle_ids=moved_origin_ids,
                                 clearance=clearance,
                             )
@@ -1344,7 +1350,7 @@ def auto_route_pair(req: RouteRequest, data: list | None = None) -> RouteResult:
                             [o for o in run_obstacles if o.net != req.net],
                             clearance,
                             width,
-                            moved_pairs,
+                            layer_moved,
                         ),
                         width,
                         board_limit=board_limit,

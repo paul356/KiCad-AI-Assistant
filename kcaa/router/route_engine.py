@@ -1437,6 +1437,28 @@ def family_hulls(
     return hulls
 
 
+def moved_pairs_for_layer(
+    moved_pairs: Sequence[tuple[TrackObstacle, TrackObstacle]],
+    layer: str,
+    net: str | None,
+) -> list[tuple[TrackObstacle, TrackObstacle]]:
+    """The displaced tracks a single-layer run must respect.
+
+    ``shove_path`` accumulates ``(original, displaced)`` pairs across
+    every leg and layer of a request.  A per-layer hull set and copper
+    audit must see this layer's foreign-net copper only: another
+    layer's displaced track cannot collide with a single-layer run, and
+    same-net copper imposes no spacing rule (the audit exempts it).
+    A pair with an unknown layer stays in: a hull that cannot be
+    attributed must keep blocking (over-rejection is the safe side).
+    """
+    return [
+        (orig, disp)
+        for orig, disp in moved_pairs
+        if (disp.layer is None or disp.layer == layer) and disp.net != net
+    ]
+
+
 def merge_parallel_diagonals(
     pts: Sequence[tuple[float, float]],
     hulls: Sequence[Polygon],
@@ -1477,10 +1499,17 @@ def merge_parallel_diagonals(
     the nearest legal placement is the /AD4 hull tangent at 0.2100 mm
     (CLEAN); that is exactly the ``x - y = 27.3016`` support value.
 
-    Families run in order A then B.  Both moves are length-neutral or
-    strictly shortening (A: equal; B: removes the stair's excess), so
-    density — not length — changes, and a candidate is accepted only
-    when it passes every gate below.
+    Families run in order A then B.  The guarantees are narrow and
+    exact: the segment count never increases (each merge removes at
+    least one vertex), the total length never increases (A: equal; B:
+    the chord is no longer than the stair it replaces and the flank it
+    consumes shrinks), and the minimum segment length stays ``>= width``.
+    The minimum itself *can* drop — a merge that shortens a flank can
+    leave a segment shorter than the path's previous minimum, as long as
+    it clears ``width`` — so this pass does not preserve the minimum the
+    way :func:`_absorb_terminal_stubs` does.  Density, not length, is
+    what changes; a candidate is accepted only when it passes every gate
+    below.
 
     Acceptance: the whole candidate stays on the 0/45/90 family, every
     segment is at least ``width`` (strict — this pass must never emit or
@@ -1489,9 +1518,11 @@ def merge_parallel_diagonals(
     polyline stays inside ``board_limit``, every ``anchors`` entry
     ``(point, tol)`` keeps ``distance(point, candidate) <= tol``, and
     ``audit(candidate)`` — the caller's ``_audit_final_copper`` wrapper
-    — accepts it.  Family A also re-checks the rewired join stays
-    ``<= 45`` degrees.  Any failure keeps the original path; endpoints
-    are pinned exactly.
+    — accepts it.  Both families also re-check the rewired joints stay
+    ``<= 45`` degrees, measured on the **candidate** so a slide that
+    lands a joint exactly on an untouched vertex still sees the real
+    turn (see ``_joint_turns_ok``).  Any failure keeps the original
+    path; endpoints are pinned exactly.
 
     ``keep_anchor_vertices``: by default an anchor that survives inside
     a merged segment is left as an interior point (distance 0 — the
@@ -1500,12 +1531,16 @@ def merge_parallel_diagonals(
     re-inserted as a collinear split (only when both halves stay at
     least ``width`` long, so the invariant above still holds).
 
-    Bounded and idempotent: family A scans at most ``4 * len(pts) + 16``
-    vertices; family B at most ``2 * len(pts) ** 2 + 64`` flank pairs
-    (each pair tries at most ``4 * len(hulls) + 4`` slides).  A complete
-    pass accepts each merge at most once per removed vertex, and after a
-    merge the scan restarts one vertex back, so re-running the pass on
-    its own output is a no-op.
+    Bounded and idempotent: one ``_scan_runs`` call walks at most
+    ``4 * len(pts) + 16`` vertices; one ``_scan_stairs`` call tries at
+    most ``2 * len(pts) ** 2 + 64`` flank pairs, each with at most
+    ``4 * len(hulls) + 4`` slides.  Those are *per-scan* caps: the two
+    scans alternate for at most ``len(pts)`` rounds while a round keeps
+    changing something, so the worst case is O(n^3) (measured: 321
+    vertices 24 ms, 2401 vertices 0.89 s).  A complete pass accepts each
+    merge at most once per removed vertex, and after a merge the scan
+    restarts one vertex back, so re-running the pass on its own output
+    is a no-op.
     """
     out = list(pts)
     if len(out) < 4 or width <= 0.0:
@@ -1523,16 +1558,6 @@ def merge_parallel_diagonals(
             return 2 if dx * dy > 0 else 3  # D+ / D-
         return None
 
-    def _on_line(
-        line_pt: tuple[float, float],
-        line_dir: tuple[float, float],
-        p: tuple[float, float],
-        tol: float = 1e-6,
-    ) -> bool:
-        """True when ``p`` lies on the line through ``line_pt`` along
-        ``line_dir`` (unit) within ``tol``."""
-        return abs((p[0] - line_pt[0]) * line_dir[1] - (p[1] - line_pt[1]) * line_dir[0]) <= tol
-
     def _turn_deg(p: tuple[float, float], q: tuple[float, float], r: tuple[float, float]) -> float:
         """Unsigned turn at ``q`` in degrees (zero-length legs count as 0)."""
         v1x, v1y = q[0] - p[0], q[1] - p[1]
@@ -1543,6 +1568,33 @@ def merge_parallel_diagonals(
             return 0.0
         cos_t = (v1x * v2x + v1y * v2y) / (l1 * l2)
         return math.degrees(math.acos(max(-1.0, min(1.0, cos_t))))
+
+    def _joint_turns_ok(
+        cand: list[tuple[float, float]],
+        joints: Sequence[tuple[float, float]],
+    ) -> bool:
+        """Every rewired joint keeps a turn ``<= 45`` in ``cand``.
+
+        Measuring against the *pre-merge* path is wrong when a slide
+        lands the joint exactly on an untouched vertex: the neighbour
+        there is then a zero-length leg, ``_turn_deg`` returns 0, and a
+        135-degree fold passes the gate unseen.  In the candidate the
+        dedupe drops the coincident vertex, so the measured turn is the
+        real one.  Endpoints have no turn to check (and a merge may
+        legitimately remove a pre-existing leg-boundary turn elsewhere,
+        which is why this is local to the two new joints and not a
+        whole-path gate).
+        """
+        for p in joints:
+            k = min(
+                range(len(cand)),
+                key=lambda z: (cand[z][0] - p[0]) ** 2 + (cand[z][1] - p[1]) ** 2,
+            )
+            if k == 0 or k == len(cand) - 1:
+                continue
+            if _turn_deg(cand[k - 1], cand[k], cand[k + 1]) > 45.0 + 1e-6:
+                return False
+        return True
 
     def _total_len(seq: list[tuple[float, float]]) -> float:
         return sum(math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(seq, seq[1:]))
@@ -1608,11 +1660,14 @@ def merge_parallel_diagonals(
 
             accepted = False
             # Forward: consume the trailing diagonal, ending the run at ``d``.
+            # ``q1 = d - run = c + l3*u3 - (c - b) = b + l3*u3`` and ``u3`` is
+            # parallel to ``u1`` (same slot), so ``q1`` lands on the ``a->b``
+            # line exactly; there is no separate collinearity test to make,
+            # and ``_line_is_family`` re-checks the emitted segment.
             q1 = (d[0] - run[0], d[1] - run[1])
             join_ok_f = i + 3 >= len(out) or _turn_deg(q1, d, out[i + 3]) <= 45.0 + 1e-6
             if (
                 join_ok_f
-                and _on_line(a, u1, q1)
                 and (q1[0] - a[0]) * u1[0] + (q1[1] - a[1]) * u1[1] >= width - 1e-9
                 and math.hypot(run[0], run[1]) >= width - 1e-9
             ):
@@ -1622,11 +1677,12 @@ def merge_parallel_diagonals(
                     accepted = True
             if not accepted:
                 # Mirror: consume the leading diagonal, starting the run at ``a``.
+                # ``q2 = a + run = b - l1*u1 + (c - b)`` sits on the ``c->d``
+                # line by the same algebra as the forward case.
                 q2 = (a[0] + run[0], a[1] + run[1])
                 join_ok_m = i < 2 or _turn_deg(out[i - 2], a, q2) <= 45.0 + 1e-6
                 if (
                     join_ok_m
-                    and _on_line(c, u3, q2)
                     and (d[0] - q2[0]) * u3[0] + (d[1] - q2[1]) * u3[1] >= width - 1e-9
                     and math.hypot(run[0], run[1]) >= width - 1e-9
                 ):
@@ -1744,21 +1800,19 @@ def merge_parallel_diagonals(
                         # flank's tail and B must not pass the next run's
                         # head.  Touching is allowed (the dedupe then
                         # drops the consumed flank / vertex).  The two
-                        # rewired joints must also stay inside the family
-                        # contract: the displacement is 45 degrees to the
-                        # run, so the only alternatives there are 45 and
-                        # 135.
+                        # rewired joints are checked on the candidate —
+                        # the displacement is 45 degrees to the run, so
+                        # the only alternatives there are 45 and 135.
                         if (A[0] - out[i - 1][0]) * d1[0] + (A[1] - out[i - 1][1]) * d1[1] < -1e-12:
                             continue
                         if (out[j + 1][0] - B[0]) * d2[0] + (out[j + 1][1] - B[1]) * d2[1] < -1e-12:
                             continue
-                        if (
-                            _turn_deg(out[i - 1], A, B) > 45.0 + 1e-6
-                            or _turn_deg(A, B, out[j + 1]) > 45.0 + 1e-6
-                        ):
-                            continue
+                        # ``len(cand) < len(out)`` always holds without a
+                        # check: the pre-dedupe length is
+                        # ``len(out) + i - j + 1 <= len(out) - 1`` for
+                        # ``j >= i + 2`` and ``_dedupe`` only shrinks it.
                         cand = _dedupe(out[:i] + [A, B] + out[j + 1 :])
-                        if len(cand) >= len(out):
+                        if not _joint_turns_ok(cand, (A, B)):
                             continue
                         if _accept(cand, [(out[i - 1], A), (A, B), (B, out[j + 1])]):
                             out = cand

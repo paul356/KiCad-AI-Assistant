@@ -220,13 +220,19 @@ shouldering stages keep the net-inclusive hull set.  Every accepted candidate
 still passes `_audit_final_copper` against the full obstacle set, so a rewrite
 can never trade segments for a DRC error.
 
-The router (`auto_route_pair`) repeats pass 3 once on the *concatenated* leg
-chain when the route has waypoints: the walkaround stair the issue reports
-spans a leg boundary, which no per-leg run can see.  Waypoint vertices are
-merge candidates (the waypoint simply becomes an interior point of the merged
-segment) and are handed to the pass as anchors, so a candidate that would push
-a waypoint farther than its `tol_mm` is rejected; `keep_anchor_vertices=True`
-re-inserts the projection as a vertex for the downstream emitter.
+The router (`auto_route_pair`) repeats pass 3 once per maximal same-layer run
+of the *concatenated* leg chain, for every `mitered45`/`rounded45` route —
+empty anchor list included, not only waypoint routes: the
+walkaround stair the issue reports spans a leg boundary, which no per-leg run
+can see, and dropping the repeat unless waypoints exist simply hid that case on
+waypoint-free routes.  Waypoint vertices are merge candidates (the waypoint
+simply becomes an interior point of the merged segment) and are handed to the
+pass as anchors, so a candidate that would push a waypoint farther than its
+`tol_mm` is rejected; `keep_anchor_vertices=True` re-inserts the projection as
+a vertex for the downstream emitter.  That call's hull set and audit are
+single-layer: `moved_pairs` is filtered to this layer and to foreign nets
+first, so a displaced track on another layer cannot veto a legal merge (pairs
+with an unknown layer stay in the set — over-rejecting is safe).
 
 Dispatch flow: the router always builds a mitered45 skeleton, so the
 engine never emits skeleton arcs (kept `route_engine` corner modes
