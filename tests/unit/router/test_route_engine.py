@@ -1009,6 +1009,13 @@ class TestFamilyCornerShouldering:
         return _merge_family_chain(walked), hull
 
     def test_walkaround_flat_edge_reproduces_the_90_degree_corner(self):
+        """Characterisation fixture: the pre-fix walkaround output.
+
+        It pins the exact shape the shouldering pass exists to repair.
+        This is intentionally *not* a regression test — it asserts the
+        90-degree turn that the fix removes, so it must never be updated
+        to expect a clean path; the sibling test below covers the fix.
+        """
         walked, _hull = self._walked_j3_path()
         assert _segments_on_45(walked)
         assert not _turns_le_45(walked)
@@ -1113,6 +1120,16 @@ class TestFamilyCornerShouldering:
         assert _turns_le_45(out)
         for a, b in zip(out, out[1:]):
             assert math.hypot(b[0] - a[0], b[1] - a[1]) >= W - 1e-9
+
+    def test_prefers_the_shortest_legal_shoulder(self):
+        # Both offsets are legal for this corner: the minimal cut and the
+        # cut that consumes both equal legs (a straight 45-degree
+        # diagonal).  The shortest polyline must win, so a newly legal
+        # small shoulder cannot lengthen a corner a larger cut fixed.
+        pts = [(0.0, 0.0), (0.0, 2.0), (2.0, 2.0)]
+        out = _shoulder_family_corners(pts, [], W)
+        assert out == [(0.0, 0.0), (2.0, 2.0)]
+        assert _turns_le_45(out)
 
     def test_fully_consumed_leg_guard_rejects_a_new_obtuse_turn(self):
         # The t = l1 candidate consumes the entry leg and re-anchors the

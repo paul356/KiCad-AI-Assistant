@@ -1136,18 +1136,17 @@ def _shoulder_family_corners(
     is exactly the missing "merge-obtuse / merge-step" optimizer move.
 
     ``t`` is chosen per corner from the offsets the two legs allow, and
-    each candidate is judged solely by the emitted geometry: try
-    ``min(t_cap, l1, l2)`` first (the smallest shoulder that is a full
-    track width when standalone), then ``min(l1, l2)`` (consume the
-    short leg so no sub-width remainder is left).  A candidate whose
+    each candidate is judged solely by the emitted geometry: the
+    candidate set is ``min(t_cap, l1, l2)`` (the smallest shoulder that
+    is a full track width when standalone) and ``min(l1, l2)`` (consume
+    the short leg so no sub-width remainder is left).  A candidate whose
     leftover leg is narrower than the track is rejected by
-    ``_new_segments_wide`` and the next offset is tried — the offset
-    itself is never used as a legality proxy.  When a leg is consumed
-    down to its adjacent vertex and the following segment is collinear
-    with the bisector (the J3 pad geometry, where the shoulder rides
-    the hull's 45-degree chamfer) the family merge absorbs that vertex
-    and the emitted diagonal grows past ``t_cap`` instead of emitting a
-    sub-width stub.
+    ``_new_segments_wide`` — the offset itself is never used as a
+    legality proxy.  When a leg is consumed down to its adjacent vertex
+    and the following segment is collinear with the bisector (the J3 pad
+    geometry, where the shoulder rides the hull's 45-degree chamfer) the
+    family merge absorbs that vertex and the emitted diagonal grows past
+    ``t_cap`` instead of emitting a sub-width stub.
 
     Scope boundary: this is an *inward* cut — the bisector replaces the
     corner on the side the turn wraps around.  When that side is
@@ -1164,12 +1163,16 @@ def _shoulder_family_corners(
     before), the bisector stays clear of ``hulls`` (which already carry
     the route margin; boundary contact and float-ulp overlap are allowed,
     only penetration beyond a nanometre is rejected, as with the
-    walkaround), and
-    the result stays inside ``board_limit``.  A corner whose shoulder
-    fails every candidate is left untouched, so this pass is strictly
-    an improvement or a no-op — the same policy as
-    ``_coalesce_stub_pairs``; the caller's final copper audit remains
-    the DRC gate.
+    walkaround), and the result stays inside ``board_limit``.  Among the
+    accepted offsets the shortest resulting polyline wins (ties: fewest
+    vertices, then smallest offset), and a corner is left untouched when
+    no candidate shortens the path, so a rewrite never lengthens the
+    polyline and never emits an unverified candidate — the same policy
+    as ``_coalesce_stub_pairs``.  That guarantee is per corner, not a
+    cross-version stability guarantee: more than one offset can be
+    legal, so a corner that an earlier engine version shouldered one way
+    may now take a different (still shorter) shoulder.  The caller's
+    final copper audit remains the DRC gate.
     """
     out = list(pts)
     if len(out) < 3 or width <= 0.0:
@@ -1216,6 +1219,10 @@ def _shoulder_family_corners(
             if line.length - line.difference(h).length > penetration_eps:
                 return False
         return True
+
+    def _total_len(seq: list[tuple[float, float]]) -> float:
+        """Sum of segment lengths (``_path_len`` is a vector norm, not this)."""
+        return sum(math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(seq, seq[1:]))
 
     def _seg_key(
         a: tuple[float, float], b: tuple[float, float]
@@ -1278,7 +1285,8 @@ def _shoulder_family_corners(
                 if not any(abs(t - u) <= 1e-9 for u in offsets):
                     offsets.append(t)
 
-        cand: list[tuple[float, float]] | None = None
+        best: list[tuple[float, float]] | None = None
+        best_key = (math.inf, 0, 0.0)
         for t in offsets:
             a2 = (b[0] - ex * t, b[1] - ey * t)
             c2 = (b[0] + xx * t, b[1] + xy * t)
@@ -1308,12 +1316,18 @@ def _shoulder_family_corners(
                 or (board_limit is not None and not _line_in_board(trial, board_limit))
             ):
                 continue
-            cand = trial
-            break
-        if cand is None:
+            # More than one offset can be legal (the minimal cut and the
+            # cut that consumes the short leg).  Prefer the shortest
+            # resulting polyline, so a newly legal small shoulder cannot
+            # lengthen a corner that a larger cut already fixed; then
+            # fewest vertices, then the smallest offset.
+            key = (_total_len(trial), len(trial), t)
+            if key < best_key:
+                best, best_key = trial, key
+        if best is None or best_key[0] >= _total_len(out) - 1e-12:
             i += 1
             continue
-        out = cand
+        out = best
         i = max(1, i - 1)  # the merge may have moved the neighbourhood
 
     # A fully-consumed leg can replace the last vertex by its recomputed
