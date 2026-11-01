@@ -1164,7 +1164,9 @@ if _WX_AVAILABLE:
             from a wx.Image filled with the panel background colour instead.
             """
             if bg is None:
-                bg = wx.WHITE
+                # Explicit RGB: wx.WHITE is a null placeholder when KiCad's
+                # embedded wxPython never created a wx.App (see issue #225).
+                bg = wx.Colour(255, 255, 255)
             data = bytes((bg.Red(), bg.Green(), bg.Blue())) * (size * size)
             img = wx.Image(size, size, data)
             bmp = wx.Bitmap(img)
@@ -1185,10 +1187,17 @@ if _WX_AVAILABLE:
             20      ●─╮   ╭─●  ●───╯  ╰───●  ← arc 3 endpoints (12,20)(16,20)
             26      ╰───────────╯        ← arc 1: large U (bottom)
             """
+            if bg is None:
+                bg = wx.Colour(255, 255, 255)
             bmp, mdc = AssistantPanel._new_icon_bitmap(size, bg)
             pen = wx.Pen(wx.Colour(90, 90, 90), 2)
             mdc.SetPen(pen)
-            mdc.SetBrush(wx.TRANSPARENT_BRUSH)
+            # wxGCDCImpl::DoDrawEllipticArc() calls wxBrush::GetStyle(), which
+            # asserts IsOk().  wx.TRANSPARENT_BRUSH is a null placeholder in
+            # KiCad's embedded wxPython (no Python wx.App ran OnPreInit), and
+            # wx.MemoryDC is GCDC-backed on wxGTK3, so using it aborts KiCad.
+            # Filling with the icon's own background is visually identical.
+            mdc.SetBrush(wx.Brush(bg))
 
             # Arc 1: Large bottom U (opening up)
             # Center (14,20), r=6, bbox (8,14,12,12)
