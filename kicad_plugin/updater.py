@@ -784,15 +784,16 @@ def _dist_version(dist_dir: Path) -> tuple[str | None, str | None]:
     Only the header line itself is used: RFC 822 folding (a continuation
     line) is not joined, because real metadata writers never fold this short
     header.  Returns ``(version, problem)``; ``problem`` names every file
-    that was tried and why it yielded nothing (its ``OSError``, or a missing
-    header) so callers can log the cause rather than the outcome.
+    that was tried and why it yielded nothing (the ``OSError`` type name and
+    message, or a missing header) so callers can log the cause rather than
+    the outcome.
     """
     problems: list[str] = []
     for filename in ("METADATA", "PKG-INFO"):
         try:
             text = (dist_dir / filename).read_text(encoding="utf-8", errors="replace")
         except OSError as exc:
-            problems.append(f"{filename}: {exc}")
+            problems.append(f"{filename}: {type(exc).__name__}: {exc}")
             continue
         for line in text.splitlines():
             if not line.strip():

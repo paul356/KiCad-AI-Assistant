@@ -1228,9 +1228,11 @@ def test_installed_kcaa_info_reports_unreadable_metadata_as_unknown(
     with _capture_logs(caplog, updater.log):
         assert updater.installed_kcaa_info(plugin_dir) == updater.InstalledKcaa(None, False)
 
-    # The cause, not merely "not found", reaches the log.
+    # The cause, not merely "not found", reaches the log.  The strerror text
+    # is platform-specific (IsADirectoryError on POSIX, PermissionError on
+    # Windows), so assert the file name and the cause marker only.
     assert "no usable version" in caplog.text
-    assert "Is a directory" in caplog.text
+    assert "METADATA:" in caplog.text
 
 
 def test_installed_kcaa_info_warns_about_duplicate_versions(
