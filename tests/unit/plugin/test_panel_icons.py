@@ -30,6 +30,7 @@ _FONTSTYLE_NORMAL = 90
 _FONTWEIGHT_BOLD = 92
 _BRUSHSTYLE_TRANSPARENT = 0
 _BRUSHSTYLE_SOLID = 1
+_PENSTYLE_SOLID = 100
 
 
 class _Colour:
@@ -89,15 +90,24 @@ class _Brush:
 
 
 class _Pen:
-    def __init__(self, colour: _Colour, width: int = 1) -> None:
+    def __init__(
+        self, colour: _Colour | None = None, width: int = 1, style: int | None = None
+    ) -> None:
         self._colour = colour
         self.width = width
+        if style is not None:
+            self.style = style
+        else:
+            self.style = _PENSTYLE_SOLID if colour is not None else None
 
     def IsOk(self) -> bool:
-        return True
+        return self._colour is not None and self._colour.IsOk() and self.style is not None
 
-    def GetColour(self) -> _Colour:
+    def GetColour(self) -> _Colour | None:
         return self._colour
+
+    def __repr__(self) -> str:
+        return f"Pen({self._colour!r}, width={self.width}, style={self.style!r})"
 
 
 class _Path:
@@ -119,6 +129,7 @@ class _GraphicsContext:
         self.dc = dc
         self.brushes: list[_Brush] = []
         self.pens: list[_Pen] = []
+        self.events: list[tuple[str, object]] = []
 
     @staticmethod
     def Create(dc: object) -> _GraphicsContext:
@@ -128,24 +139,26 @@ class _GraphicsContext:
 
     def SetBrush(self, brush: _Brush) -> None:
         self.brushes.append(brush)
+        self.events.append(("brush", brush))
 
     def SetPen(self, pen: _Pen) -> None:
         self.pens.append(pen)
+        self.events.append(("pen", pen))
 
     def CreatePath(self) -> _Path:
         return _Path()
 
     def DrawPath(self, path: _Path) -> None:
-        pass
+        self.events.append(("draw", path))
 
     def DrawEllipse(self, *args) -> None:
-        pass
+        self.events.append(("draw", args))
 
     def SetFont(self, *args) -> None:
         pass
 
     def DrawText(self, *args) -> None:
-        pass
+        self.events.append(("draw", args))
 
 
 class _MemoryDC:
@@ -157,6 +170,7 @@ class _MemoryDC:
         self.pens: list[_Pen] = []
         self.arcs: list[tuple[tuple, _Brush]] = []
         self.lines: list[tuple] = []
+        self.events: list[tuple[str, object]] = []
         _records.memory_dcs.append(self)
 
     def SelectObject(self, bitmap: object) -> None:
@@ -165,18 +179,22 @@ class _MemoryDC:
     def SetBrush(self, brush: _Brush) -> None:
         self.brushes.append(brush)
         self.brush = brush
+        self.events.append(("brush", brush))
 
     def SetPen(self, pen: _Pen) -> None:
         self.pens.append(pen)
+        self.events.append(("pen", pen))
 
     def DrawEllipticArc(self, *args) -> None:
         # Mirrors wxGCDCImpl::DoDrawEllipticArc() -> m_brush.GetStyle().
         if not self.brush.IsOk():
             raise AssertionError("wxBrush::GetStyle(): invalid brush")
         self.arcs.append((args, self.brush))
+        self.events.append(("draw", args))
 
     def DrawLine(self, *args) -> None:
         self.lines.append(args)
+        self.events.append(("draw", args))
 
 
 class _Image:
@@ -219,6 +237,7 @@ def _build_fake_wx() -> types.ModuleType:
     fake_wx.__kcaa_fake_wx__ = True  # type: ignore[attr-defined]
     fake_wx.BRUSHSTYLE_TRANSPARENT = _BRUSHSTYLE_TRANSPARENT  # type: ignore[attr-defined]
     fake_wx.BRUSHSTYLE_SOLID = _BRUSHSTYLE_SOLID  # type: ignore[attr-defined]
+    fake_wx.PENSTYLE_SOLID = _PENSTYLE_SOLID  # type: ignore[attr-defined]
     fake_wx.FONTFAMILY_DEFAULT = _FONTFAMILY_DEFAULT  # type: ignore[attr-defined]
     fake_wx.FONTSTYLE_NORMAL = _FONTSTYLE_NORMAL  # type: ignore[attr-defined]
     fake_wx.FONTWEIGHT_BOLD = _FONTWEIGHT_BOLD  # type: ignore[attr-defined]
@@ -235,6 +254,7 @@ def _build_fake_wx() -> types.ModuleType:
     # wxPython exposes these as null placeholders until a wx.App initializes
     # them; model them as invalid so any use fails the contract.
     fake_wx.TRANSPARENT_BRUSH = _Brush()  # type: ignore[attr-defined]
+    fake_wx.TRANSPARENT_PEN = _Pen()  # type: ignore[attr-defined]
     fake_wx.WHITE = _NullStockColour()  # type: ignore[attr-defined]
     fake_wx.__getattr__ = lambda name: _Dummy  # type: ignore[attr-defined]
 
@@ -304,6 +324,33 @@ def test_icon_brushes_are_valid_and_explicit(panel_mod, name: str) -> None:
         colour = brush.GetColour()
         assert colour.IsOk()
         assert all(isinstance(v, int) for v in (colour.Red(), colour.Green(), colour.Blue()))
+
+
+@pytest.mark.parametrize("name", ["attach", "send", "stop", "status", "pdf"])
+def test_icon_pens_are_valid_and_explicit(panel_mod, name: str) -> None:
+    panel, fake_wx, records = panel_mod
+
+    _build_icon(panel, name, fake_wx.Colour(*_BG))
+
+    drawing_targets = [
+        target
+        for target in records.memory_dcs + records.gcs
+        if any(event[0] == "draw" for event in target.events)
+    ]
+    assert drawing_targets, f"{name} icon drew nothing"
+    for target in drawing_targets:
+        first_draw = next(i for i, event in enumerate(target.events) if event[0] == "draw")
+        assert any(event[0] == "pen" for event in target.events[:first_draw]), (
+            f"{name} icon drew before setting a pen"
+        )
+        assert target.pens, f"{name} icon never set a pen"
+        for pen in target.pens:
+            assert pen is not fake_wx.TRANSPARENT_PEN
+            assert pen.IsOk()
+            assert pen.style == fake_wx.PENSTYLE_SOLID
+            colour = pen.GetColour()
+            assert colour.IsOk()
+            assert all(isinstance(v, int) for v in (colour.Red(), colour.Green(), colour.Blue()))
 
 
 def test_paperclip_arcs_fill_with_background_brush(panel_mod) -> None:
