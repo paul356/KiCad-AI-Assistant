@@ -327,51 +327,124 @@ def _panel_with_fake_wx():
                 current_ui_pkg.panel = saved_panel_attr  # type: ignore[attr-defined]
 
 
-@pytest.mark.parametrize(
-    ("spelling", "canonical"),
-    [
-        # The reported case: a release tag hyphenating the pre-release.
-        ("0.2.9-RC1", "0.2.9rc1"),
-        ("0.2.9_rc1", "0.2.9rc1"),
-        ("0.2.9.rc1", "0.2.9rc1"),
-        ("0.2.9rc1", "0.2.9rc1"),
-        ("v0.2.9-RC1", "0.2.9rc1"),
-        ("V0.2.9rc1", "0.2.9rc1"),
-        ("  0.2.9-RC1  ", "0.2.9rc1"),
-        # Pre-release aliases and implicit release numbers.
-        ("1.0-rc", "1.0rc0"),
-        ("1.0.a", "1.0a0"),
-        ("1.0alpha", "1.0a0"),
-        ("1.0a", "1.0a0"),
-        ("1.0-beta2", "1.0b2"),
-        ("1.0b", "1.0b0"),
-        ("1.0c3", "1.0rc3"),
-        ("1.0preview4", "1.0rc4"),
-        ("1.0pre5", "1.0rc5"),
-        ("1.0RC01", "1.0rc1"),
-        # Post-release spellings and implicit numbers.
-        ("1.0post", "1.0.post0"),
-        ("1.0.post", "1.0.post0"),
-        ("1.0-1", "1.0.post1"),
-        ("1.0-r2", "1.0.post2"),
-        ("1.0rev3", "1.0.post3"),
-        # Development releases.
-        ("1.0-dev", "1.0.dev0"),
-        ("1.0dev2", "1.0.dev2"),
-        ("1.0a1.post2.dev3", "1.0a1.post2.dev3"),
-        # PEP 440 drops leading zeros from every numeric component.
-        ("1.02", "1.2"),
-        ("01.002.0003", "1.2.3"),
-        ("1.0.0", "1.0.0"),
-        # Local segments are dropped; unrecognised suffixes stay as-is.
-        ("0.2.9-RC1+local.1", "0.2.9rc1"),
-        ("0.2.9-bugfix1", "0.2.9-bugfix1"),
-        ("not-a-version", "not-a-version"),
-    ],
-)
+_CANONICAL_SPELLINGS = [
+    # The reported case: a release tag hyphenating the pre-release.
+    ("0.2.9-RC1", "0.2.9rc1"),
+    ("0.2.9_rc1", "0.2.9rc1"),
+    ("0.2.9.rc1", "0.2.9rc1"),
+    ("0.2.9rc1", "0.2.9rc1"),
+    ("v0.2.9-RC1", "0.2.9rc1"),
+    ("V0.2.9rc1", "0.2.9rc1"),
+    ("  0.2.9-RC1  ", "0.2.9rc1"),
+    # Single-component releases: the canonical form attaches the suffix with
+    # no separator, so it must remain a valid allow-listed version.
+    ("1-rc1", "1rc1"),
+    ("1.rc1", "1rc1"),
+    ("1-a1", "1a1"),
+    ("1-alpha.1", "1a1"),
+    ("1b2", "1b2"),
+    ("1rc1.post1.dev2", "1rc1.post1.dev2"),
+    # Pre-release aliases and implicit release numbers.
+    ("1.0-rc", "1.0rc0"),
+    ("1.0.a", "1.0a0"),
+    ("1.0alpha", "1.0a0"),
+    ("1.0a", "1.0a0"),
+    ("1.0-beta2", "1.0b2"),
+    ("1.0b", "1.0b0"),
+    ("1.0c3", "1.0rc3"),
+    ("1.0preview4", "1.0rc4"),
+    ("1.0pre5", "1.0rc5"),
+    ("1.0RC01", "1.0rc1"),
+    # Post-release spellings and implicit numbers.
+    ("1.0post", "1.0.post0"),
+    ("1.0.post", "1.0.post0"),
+    ("1.0-1", "1.0.post1"),
+    ("1.0-r2", "1.0.post2"),
+    ("1.0rev3", "1.0.post3"),
+    # Development releases.
+    ("1.0-dev", "1.0.dev0"),
+    ("1.0dev2", "1.0.dev2"),
+    ("1.0a1.post2.dev3", "1.0a1.post2.dev3"),
+    # PEP 440 drops leading zeros from every numeric component.
+    ("1.02", "1.2"),
+    ("01.002.0003", "1.2.3"),
+    ("1.0.0", "1.0.0"),
+    # Local segments are dropped; unrecognised suffixes stay as-is.
+    ("0.2.9-RC1+local.1", "0.2.9rc1"),
+    ("0.2.9-bugfix1", "0.2.9-bugfix1"),
+]
+
+
+@pytest.mark.parametrize(("spelling", "canonical"), _CANONICAL_SPELLINGS)
 def test_normalize_version_canonicalizes_pep440(spelling: str, canonical: str) -> None:
     assert updater._normalize_version(spelling) == canonical
     assert updater._normalize_version(canonical) == canonical  # idempotent
+
+
+@pytest.mark.parametrize(("spelling", "canonical"), _CANONICAL_SPELLINGS)
+def test_canonical_versions_are_installable(spelling: str, canonical: str) -> None:
+    """Every canonicalised spelling must survive validation and release parsing."""
+    assert updater._validate_version(canonical) == canonical
+    info = updater._update_from_release(_release_data(spelling))
+    assert info is not None
+    assert info.version == canonical
+
+
+@pytest.mark.parametrize(
+    ("tag", "canonical"),
+    [("1-rc1", "1rc1"), ("1.rc1", "1rc1"), ("1-a1", "1a1"), ("1-alpha.1", "1a1")],
+)
+def test_single_component_prerelease_tags_round_trip(tag: str, canonical: str) -> None:
+    """Regression: canonicalisation must not make ``check_latest`` drop a release."""
+    assert updater._normalize_version(tag) == canonical
+    info = updater._update_from_release(_release_data(tag))
+    assert info is not None
+    assert info.version == canonical
+
+
+@pytest.mark.parametrize(
+    "version",
+    [
+        "1",
+        "0.2",
+        "0.2.9",
+        "0.2.9.0",
+        "0.2.9-rc1",
+        "0.2.9.rc1",
+        "0.2.4-bugfix2",
+        "1-1",
+        "1-rc-1",
+        "1-alpha.1",
+        "1-RC1",
+        "1.0.post1",
+        "1.0.dev2",
+    ],
+)
+def test_validate_version_keeps_accepting_legacy_tag_shapes(version: str) -> None:
+    assert updater._validate_version(version) == version
+
+
+@pytest.mark.parametrize(
+    "version",
+    [
+        "0.2.9_final",
+        "1.0+local",
+        "1rc1+local",
+        "1.0/2",
+        "1..0",
+        "",
+        "   ",
+        "1 0",
+        "not-a-version",
+        "1!2.0",
+        "-1",
+        "1-",
+        "1rc1_extra",
+    ],
+)
+def test_validate_version_rejects_hostile_strings(version: str) -> None:
+    with pytest.raises(updater.UpdateError, match="Unsafe version"):
+        updater._validate_version(version)
 
 
 @pytest.mark.parametrize(
@@ -1386,7 +1459,13 @@ def test_install_update_keeps_new_tree_when_kcaa_verification_fails(
 def test_install_update_accepts_canonical_kcaa_version_for_prerelease_tag(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A ``0.2.9-RC1`` tag installs cleanly when METADATA reports ``0.2.9rc1``."""
+    """A ``0.2.9-RC1`` tag installs cleanly when METADATA reports ``0.2.9rc1``.
+
+    Rebase note for #222: its mock drops ``probe_results`` and derives METADATA
+    from the raw install version.  After it lands, pass ``update_metadata=False``
+    and call ``_set_kcaa(plugin_dir, "0.2.9rc1")`` so this still simulates the
+    canonical METADATA spelling.
+    """
     plugin_dir = tmp_path / "kicad_ai_assistant"
     _write_plugin(plugin_dir)
     zip_path = tmp_path / "release.zip"

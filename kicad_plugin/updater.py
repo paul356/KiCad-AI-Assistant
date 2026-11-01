@@ -120,7 +120,18 @@ _MAX_ARCHIVE_BYTES = 200 * 1024 * 1024
 
 ProgressCallback = Callable[[int, int | None], None]
 
-_SAFE_VERSION_RE = re.compile(r"^\d+(\.\d+)*([.-][A-Za-z0-9]+)*$")
+# Allow-list for version strings that reach uv's argv and error messages.
+# The first branch keeps every legacy tag shape accepted before (``1-rc1``);
+# the second accepts the PEP 440 canonical spellings ``_normalize_version()``
+# can emit (attached pre-release with optional ``.postN``/``.devN``, e.g.
+# ``1rc1``, ``1rc1.post1.dev2``).  ``+local`` and epochs stay rejected.
+_SAFE_VERSION_RE = re.compile(
+    r"^(?:"
+    r"\d+(?:\.\d+)*(?:[.-][A-Za-z0-9]+)*"
+    r"|"
+    r"\d+(?:\.\d+)*(?:a|b|rc)\d+(?:\.post\d+)?(?:\.dev\d+)?"
+    r")$"
+)
 _SUM_LINE_RE = re.compile(r"^([0-9a-fA-F]{64})\s+\*?(?:dist/)?([^/\s]+)$")
 
 # urllib only receives GitHub URLs: the API, the release page host, and the
