@@ -13,6 +13,7 @@ import json
 import logging
 import os
 from pathlib import Path, PurePosixPath
+import shutil
 import subprocess
 import sys
 import threading
@@ -114,6 +115,34 @@ def _site_packages(plugin_dir: Path) -> Path:
     return plugin_dir / ".venv" / "lib" / "python3.10" / "site-packages"
 
 
+def _set_kcaa(
+    plugin_dir: Path,
+    version: str | None,
+    *,
+    editable: bool = False,
+    direct_url: str | None = None,
+) -> Path:
+    """Simulate the venv's installed ``kcaa`` metadata."""
+    site = _site_packages(plugin_dir)
+    for dist in site.glob("kcaa-*.dist-info"):
+        shutil.rmtree(dist)
+    if version is None:
+        return site
+    dist = site / f"kcaa-{version}.dist-info"
+    dist.mkdir(parents=True)
+    (dist / "METADATA").write_text(
+        f"Metadata-Version: 2.1\nName: kcaa\nVersion: {version}\n",
+        encoding="utf-8",
+    )
+    if direct_url is not None:
+        (dist / "direct_url.json").write_text(direct_url, encoding="utf-8")
+    elif editable:
+        (dist / "direct_url.json").write_text(
+            '{"url": "file:///src", "dir_info": {"editable": true}}', encoding="utf-8"
+        )
+    return site
+
+
 def _write_plugin(plugin_dir: Path, version: str = "0.2.8") -> Path:
     plugin_dir.mkdir(parents=True, exist_ok=True)
     (plugin_dir / "VERSION").write_text(version, encoding="utf-8")
@@ -127,12 +156,9 @@ def _write_plugin(plugin_dir: Path, version: str = "0.2.8") -> Path:
     venv_python.parent.mkdir(parents=True, exist_ok=True)
     venv_python.write_text("", encoding="utf-8")
 
-    site = _site_packages(plugin_dir)
+    site = _set_kcaa(plugin_dir, version)
     (site / "kcaa").mkdir(parents=True)
-    (site / "kcaa" / "__init__.py").write_text('__version__ = "0.2.8"', encoding="utf-8")
-    dist_info = site / "kcaa-0.2.8.dist-info"
-    dist_info.mkdir()
-    (dist_info / "METADATA").write_text("Name: kcaa\nVersion: 0.2.8\n", encoding="utf-8")
+    (site / "kcaa" / "__init__.py").write_text(f'__version__ = "{version}"', encoding="utf-8")
     return venv_python
 
 
@@ -149,13 +175,15 @@ def _mock_uv(
     install_stderr: str = "",
     calls: list[list[str]] | None = None,
     on_install=None,
-    probe_results: list[object] | None = None,
-    on_probe=None,
+    update_metadata: bool = True,
     uv_available: bool = True,
 ) -> None:
-    """Fake uv discovery and subprocess runs for probe + pre-flight + install."""
-    probes = list(probe_results or [])
-    fake_installed: str | None = None
+    """Fake uv discovery and subprocess runs for pre-flight + install.
+
+    A successful install rewrites the simulated venv metadata the way uv
+    would, unless ``update_metadata`` is false (uv exits 0 but the venv is
+    left alone, which the post-install check must catch).
+    """
     monkeypatch.setattr(
         updater.shutil,
         "which",
@@ -163,34 +191,19 @@ def _mock_uv(
     )
 
     def _run(command, **kwargs):
-        nonlocal fake_installed
-        if command[1:2] == ["-c"]:
-            if on_probe is not None:
-                on_probe(command)
-            if probes:
-                result = probes.pop(0)
-            elif fake_installed is not None:
-                result = fake_installed
-            else:
-                result = None
-            if isinstance(result, BaseException):
-                raise result
-            if result is None:
-                return _completed(command, 1)
-            if isinstance(result, updater.InstalledKcaa):
-                payload = {"version": result.version, "editable": result.editable}
-            else:
-                payload = {"version": str(result), "editable": False}
-            return _completed(command, 0, stdout=f"{json.dumps(payload)}\n")
         if calls is not None:
             calls.append(list(command))
         if "--dry-run" in command:
             return _completed(command, dry_run_returncode, stderr=dry_run_stderr)
-        if install_returncode == 0:
-            fake_installed = next(
+        if install_returncode == 0 and update_metadata:
+            version = next(
                 (arg.split("==", 1)[1] for arg in command if arg.startswith("kcaa==")),
-                fake_installed,
+                None,
             )
+            python_arg = command[command.index("--python") + 1]
+            plugin_dir = Path(python_arg).parents[2]
+            if version is not None:
+                _set_kcaa(plugin_dir, version)
         if on_install is not None:
             on_install(command)
         return _completed(command, install_returncode, stderr=install_stderr)
@@ -873,25 +886,20 @@ def test_install_update_skips_venv_when_kcaa_matches(
 ) -> None:
     plugin_dir = tmp_path / "kicad_ai_assistant"
     _write_plugin(plugin_dir)
+    _set_kcaa(plugin_dir, "0.2.9")
     zip_path = tmp_path / "release.zip"
     zip_path.write_bytes(_release_zip())
     calls: list[list[str]] = []
-    probes: list[list[str]] = []
     _mock_uv(
         monkeypatch,
         uv_available=False,  # an offline plugin-only upgrade must not need uv
         calls=calls,
-        probe_results=["0.2.9"],
-        on_probe=probes.append,
     )
 
     outcome = updater.install_update(zip_path, plugin_dir, "0.2.9")
 
     assert outcome == updater.InstallOutcome(False, "already-current")
     assert calls == []
-    assert len(probes) == 1
-    assert probes[0][1:2] == ["-c"]
-    assert "importlib.metadata" in probes[0][2]
     assert (plugin_dir / "VERSION").read_text(encoding="utf-8") == "0.2.9"
     assert (plugin_dir / "__init__.py").read_text(encoding="utf-8") == "new init"
     assert not updater.has_pending_recovery(plugin_dir)
@@ -902,15 +910,11 @@ def test_install_update_skips_editable_kcaa_even_when_version_matches(
 ) -> None:
     plugin_dir = tmp_path / "kicad_ai_assistant"
     _write_plugin(plugin_dir)
+    _set_kcaa(plugin_dir, "0.2.9", editable=True)
     zip_path = tmp_path / "release.zip"
     zip_path.write_bytes(_release_zip())
     calls: list[list[str]] = []
-    _mock_uv(
-        monkeypatch,
-        uv_available=False,
-        calls=calls,
-        probe_results=[updater.InstalledKcaa("0.2.9", editable=True)],
-    )
+    _mock_uv(monkeypatch, uv_available=False, calls=calls)
 
     outcome = updater.install_update(zip_path, plugin_dir, "0.2.9")
 
@@ -926,15 +930,11 @@ def test_install_update_never_replaces_editable_kcaa_with_other_version(
 ) -> None:
     plugin_dir = tmp_path / "kicad_ai_assistant"
     _write_plugin(plugin_dir)
+    _set_kcaa(plugin_dir, "0.2.8", editable=True)
     zip_path = tmp_path / "release.zip"
     zip_path.write_bytes(_release_zip())
     calls: list[list[str]] = []
-    _mock_uv(
-        monkeypatch,
-        uv_available=False,
-        calls=calls,
-        probe_results=[updater.InstalledKcaa("0.2.8", editable=True)],
-    )
+    _mock_uv(monkeypatch, uv_available=False, calls=calls)
 
     outcome = updater.install_update(zip_path, plugin_dir, "0.2.9")
 
@@ -949,34 +949,65 @@ def test_install_update_never_replaces_editable_kcaa_with_other_version(
     ("direct_url", "editable"),
     [
         (None, False),
+        ("", False),
         ("{not json", False),
         ('{"url": "file:///x", "dir_info": {"editable": true}}', True),
         ('{"url": "file:///x", "dir_info": {"editable": false}}', False),
+        ("null", False),
     ],
 )
-def test_probe_script_detects_editable_direct_url(
+def test_installed_kcaa_info_reads_venv_metadata(
     tmp_path: Path, direct_url: str | None, editable: bool
 ) -> None:
-    dist = tmp_path / "kcaa-0.2.9.dist-info"
-    dist.mkdir()
-    (dist / "METADATA").write_text(
-        "Metadata-Version: 2.1\nName: kcaa\nVersion: 0.2.9\n",
+    plugin_dir = tmp_path / "kicad_ai_assistant"
+    _write_plugin(plugin_dir)
+    _set_kcaa(plugin_dir, "0.2.9", direct_url=direct_url)
+
+    assert updater.installed_kcaa_info(plugin_dir) == updater.InstalledKcaa("0.2.9", editable)
+
+
+def test_installed_kcaa_info_ignores_body_text_and_unrelated_projects(tmp_path: Path) -> None:
+    plugin_dir = tmp_path / "kicad_ai_assistant"
+    _write_plugin(plugin_dir)
+    site = _set_kcaa(plugin_dir, None)
+    broken = site / "kcaa-9.9.9.dist-info"
+    broken.mkdir()
+    (broken / "METADATA").write_text(
+        "Metadata-Version: 2.1\nName: kcaa\nVersion:\n\nVersion: 9.9.9\n",
         encoding="utf-8",
     )
-    if direct_url is not None:
-        (dist / "direct_url.json").write_text(direct_url, encoding="utf-8")
-    completed = subprocess.run(
-        [sys.executable, "-S", "-c", updater._KVAA_PROBE_SCRIPT],
-        capture_output=True,
-        text=True,
-        check=True,
-        cwd=tmp_path,
-        env={**os.environ, "PYTHONPATH": str(tmp_path)},
-    )
+    other = site / "kcaa_tools-1.0.dist-info"
+    other.mkdir()
+    (other / "METADATA").write_text("Name: kcaa_tools\nVersion: 1.0\n", encoding="utf-8")
 
-    payload = json.loads(completed.stdout)
+    assert updater.installed_kcaa_info(plugin_dir) == updater.InstalledKcaa(None, False)
 
-    assert payload == {"version": "0.2.9", "editable": editable}
+
+def test_installed_kcaa_info_does_not_spawn_the_venv_interpreter(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    plugin_dir = tmp_path / "kicad_ai_assistant"
+    _write_plugin(plugin_dir)
+    _set_kcaa(plugin_dir, "0.2.9", editable=True)
+
+    def _no_spawn(*args, **kwargs):
+        raise AssertionError("kcaa detection must not spawn a process")
+
+    monkeypatch.setattr(updater.subprocess, "run", _no_spawn)
+
+    assert updater.installed_kcaa_info(plugin_dir) == updater.InstalledKcaa("0.2.9", True)
+
+
+def test_installed_kcaa_info_prefers_newest_metadata(tmp_path: Path) -> None:
+    plugin_dir = tmp_path / "kicad_ai_assistant"
+    _write_plugin(plugin_dir)
+    _set_kcaa(plugin_dir, "0.2.9")
+    site = _site_packages(plugin_dir)
+    stale = site / "kcaa-0.2.10.dist-info"
+    stale.mkdir()
+    (stale / "METADATA").write_text("Name: kcaa\nVersion: 0.2.10\n", encoding="utf-8")
+
+    assert updater.installed_kcaa_info(plugin_dir) == updater.InstalledKcaa("0.2.10", False)
 
 
 def test_install_update_installs_when_kcaa_is_older(
@@ -984,24 +1015,19 @@ def test_install_update_installs_when_kcaa_is_older(
 ) -> None:
     plugin_dir = tmp_path / "kicad_ai_assistant"
     _write_plugin(plugin_dir)
+    _set_kcaa(plugin_dir, "0.2.8")
     zip_path = tmp_path / "release.zip"
     zip_path.write_bytes(_release_zip())
     calls: list[list[str]] = []
-    probes: list[list[str]] = []
-    _mock_uv(
-        monkeypatch,
-        calls=calls,
-        probe_results=["0.2.8", "0.2.9"],
-        on_probe=probes.append,
-    )
+    _mock_uv(monkeypatch, calls=calls)
 
     outcome = updater.install_update(zip_path, plugin_dir, "0.2.9")
 
     assert outcome == updater.InstallOutcome(True, None)
-    assert len(probes) == 2
     assert calls[0][3:4] == ["--dry-run"]
     assert any("kcaa==0.2.9" in command for command in calls)
     assert (plugin_dir / "VERSION").read_text(encoding="utf-8") == "0.2.9"
+    assert updater.installed_kcaa_info(plugin_dir) == updater.InstalledKcaa("0.2.9", False)
 
 
 def test_install_update_keeps_new_tree_when_kcaa_verification_fails(
@@ -1011,7 +1037,8 @@ def test_install_update_keeps_new_tree_when_kcaa_verification_fails(
     _write_plugin(plugin_dir)
     zip_path = tmp_path / "release.zip"
     zip_path.write_bytes(_release_zip())
-    _mock_uv(monkeypatch, probe_results=["0.2.8", "0.2.8"])
+    # uv reports success but the venv metadata is untouched.
+    _mock_uv(monkeypatch, update_metadata=False)
 
     with pytest.raises(updater.UpdateError, match="plugin files were updated.*kcaa") as excinfo:
         updater.install_update(zip_path, plugin_dir, "0.2.9")
@@ -1028,29 +1055,28 @@ def test_install_update_installs_when_kcaa_is_missing(
 ) -> None:
     plugin_dir = tmp_path / "kicad_ai_assistant"
     _write_plugin(plugin_dir)
+    _set_kcaa(plugin_dir, None)
     zip_path = tmp_path / "release.zip"
     zip_path.write_bytes(_release_zip())
     calls: list[list[str]] = []
-    _mock_uv(monkeypatch, calls=calls, probe_results=[None, "0.2.9"])
+    _mock_uv(monkeypatch, calls=calls)
 
     updater.install_update(zip_path, plugin_dir, "0.2.9")
 
     assert any("kcaa==0.2.9" in command for command in calls)
 
 
-@pytest.mark.parametrize(
-    "probe_failure",
-    [OSError("probe failed"), subprocess.TimeoutExpired("python", 15.0)],
-)
-def test_install_update_installs_when_probe_fails(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, probe_failure: Exception
+def test_install_update_installs_when_metadata_is_unreadable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     plugin_dir = tmp_path / "kicad_ai_assistant"
     _write_plugin(plugin_dir)
+    dist = _site_packages(plugin_dir) / "kcaa-0.2.8.dist-info"
+    (dist / "METADATA").write_text("Name: kcaa\n", encoding="utf-8")
     zip_path = tmp_path / "release.zip"
     zip_path.write_bytes(_release_zip())
     calls: list[list[str]] = []
-    _mock_uv(monkeypatch, calls=calls, probe_results=[probe_failure, "0.2.9"])
+    _mock_uv(monkeypatch, calls=calls)
 
     updater.install_update(zip_path, plugin_dir, "0.2.9")
 
@@ -1372,21 +1398,12 @@ def test_preflight_retries_alternate_dry_run_placement(
     zip_path.write_bytes(_release_zip())
     calls: list[list[str]] = []
 
-    installed = "0.2.8"
-
     def _run(command, **kwargs):
-        nonlocal installed
-        if command[1:2] == ["-c"]:
-            return _completed(
-                command,
-                0,
-                stdout=json.dumps({"version": installed, "editable": False}) + "\n",
-            )
         calls.append(list(command))
         if "--dry-run" in command and command[3] == "--dry-run":
             return _completed(command, 2, stderr="error: unexpected argument '--dry-run' found")
         if "--dry-run" not in command:
-            installed = "0.2.9"
+            _set_kcaa(plugin_dir, "0.2.9")
         return _completed(command, 0)
 
     monkeypatch.setattr(
@@ -1418,20 +1435,11 @@ def test_preflight_skips_when_uv_rejects_dry_run(
     zip_path.write_bytes(_release_zip())
     calls: list[list[str]] = []
 
-    installed = "0.2.8"
-
     def _run(command, **kwargs):
-        nonlocal installed
-        if command[1:2] == ["-c"]:
-            return _completed(
-                command,
-                0,
-                stdout=json.dumps({"version": installed, "editable": False}) + "\n",
-            )
         calls.append(list(command))
         if "--dry-run" in command:
             return _completed(command, 2, stderr="error: unexpected argument '--dry-run' found")
-        installed = "0.2.9"
+        _set_kcaa(plugin_dir, "0.2.9")
         return _completed(command, 0)
 
     monkeypatch.setattr(

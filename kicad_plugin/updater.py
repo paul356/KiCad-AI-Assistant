@@ -24,13 +24,15 @@ untouched: replacing it with a wheel would silently detach the user's source
 tree, so the plugin tree upgrades while the venv step is skipped.  Editable
 detection follows PEP 610 only: ``direct_url.json`` with
 ``dir_info.editable`` set to true.  Legacy ``setup.py develop`` installs
-(``.egg-link``, no ``direct_url.json``) and probe failures (missing
-venv/python, non-zero exit, timeout, unparseable output) are reported as
-non-editable.  Unknown therefore defaults to installing, which replaces a
-legacy editable install with a wheel; such users must manage ``kcaa``
-themselves.  Otherwise a pre-flight dry-run catches dependency/index errors
-before the plugin tree is touched, and the installed version is re-probed
-afterwards.  An ``.incomplete`` marker keeps a crashed install recoverable.
+(``.egg-link``, no ``direct_url.json``) and missing metadata are reported as
+non-editable.  The venv state is read straight from ``site-packages``, never
+through a process spawn, so verification cannot be defeated by the host
+process failing to fork.  Unknown therefore defaults to installing, which
+replaces a legacy editable install with a wheel; such users must manage
+``kcaa`` themselves.  Otherwise a pre-flight dry-run catches dependency/index
+errors before the plugin tree is touched, and the installed version is
+re-read from the venv afterwards.  An ``.incomplete`` marker keeps a crashed
+install recoverable.
 """
 
 from __future__ import annotations
@@ -78,29 +80,19 @@ CHECK_REASON_NETWORK = "network"  # OSError/URLError, redirect/host rejection
 CHECK_REASON_TIMEOUT = "timeout"  # TimeoutError after the final attempt
 CHECK_REASON_METADATA = "metadata"  # payload unusable: bad JSON, no zip, bad tag, oversized
 _VENV_TIMEOUT = 300.0
-_PROBE_TIMEOUT = 15.0
 _CHUNK_SIZE = 64 * 1024
 
-# Runs inside the plugin venv: report kcaa's version and whether it is an
-# editable (source) install, using a single subprocess call.
-_KVAA_PROBE_SCRIPT = """\
-import importlib.metadata as m
-import json
-
-try:
-    dist = m.distribution("kcaa")
-except Exception:
-    print(json.dumps({"version": None, "editable": False}))
-else:
-    try:
-        raw = dist.read_text("direct_url.json")
-        direct = json.loads(raw) if raw else {}
-        info = direct.get("dir_info") if isinstance(direct, dict) else None
-        editable = isinstance(info, dict) and info.get("editable") is True
-    except Exception:
-        editable = False
-    print(json.dumps({"version": dist.version, "editable": editable}))
-"""
+# Installed ``kcaa`` metadata is read straight off the plugin venv's
+# ``site-packages``, the same files ``importlib.metadata`` reads.  Spawning
+# the venv interpreter instead made verification depend on fork/exec from a
+# large multi-threaded host process, so a single spawn hiccup reported a
+# correct install as "unknown version".
+_SITE_PACKAGE_GLOBS = (
+    "Lib/site-packages",
+    "lib/python*/site-packages",
+    "lib64/python*/site-packages",
+)
+_DIST_SUFFIXES = (".dist-info", ".egg-info")
 
 # Directories/patterns never copied into a backup, never deleted on restore,
 # and never taken from the update archive.
@@ -737,40 +729,95 @@ def _venv_python(plugin_dir: Path) -> Path | None:
     return None
 
 
+def _site_packages_dirs(plugin_dir: Path) -> list[Path]:
+    """Return the plugin venv's ``site-packages`` directories, if any."""
+    venv = plugin_dir / ".venv"
+    found: list[Path] = []
+    for pattern in _SITE_PACKAGE_GLOBS:
+        try:
+            candidates = sorted(venv.glob(pattern))
+        except OSError:
+            continue
+        found.extend(path for path in candidates if path.is_dir())
+    return found
+
+
+def _kcaa_dist_dirs(site_dir: Path) -> list[Path]:
+    """Return ``kcaa`` metadata directories inside one ``site-packages``."""
+    try:
+        entries = sorted(site_dir.iterdir())
+    except OSError:
+        return []
+    found: list[Path] = []
+    for entry in entries:
+        lowered = entry.name.lower()
+        suffix = next((item for item in _DIST_SUFFIXES if lowered.endswith(item)), None)
+        if suffix is None or not entry.is_dir():
+            continue
+        project = entry.name[: -len(suffix)].rsplit("-", 1)[0]
+        if project.replace("_", "-").strip().lower() == "kcaa":
+            found.append(entry)
+    return found
+
+
+def _dist_version(dist_dir: Path) -> str | None:
+    """Read the ``Version`` header from ``METADATA`` or ``PKG-INFO``."""
+    for filename in ("METADATA", "PKG-INFO"):
+        try:
+            text = (dist_dir / filename).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            if not line.strip():
+                break  # end of headers; never match the free-text body
+            header, _, value = line.partition(":")
+            if header.strip().lower() == "version" and value.strip():
+                return value.strip()
+    return None
+
+
+def _dist_is_editable(dist_dir: Path) -> bool:
+    """True for a PEP 610 editable (``direct_url.json``) install."""
+    try:
+        raw = (dist_dir / "direct_url.json").read_text(encoding="utf-8")
+        direct = json.loads(raw)
+    except (OSError, ValueError):
+        return False
+    info = direct.get("dir_info") if isinstance(direct, dict) else None
+    return isinstance(info, dict) and info.get("editable") is True
+
+
+def _version_sort_key(text: str) -> tuple[int, ...]:
+    """Numeric sort key so ``0.2.10`` ranks above ``0.2.9``."""
+    return tuple(int(part) if part.isdigit() else 0 for part in re.split(r"[.\-+_]", text))
+
+
 def installed_kcaa_info(plugin_dir: Path) -> InstalledKcaa:
     """Return the venv's ``kcaa`` version and editable flag, or unknown.
 
-    A missing venv/python, a non-zero exit, a timeout, or unparseable output
-    all mean "unknown" rather than an error; callers fall back to installing.
+    Metadata is read directly from the plugin venv's ``site-packages``, so no
+    interpreter subprocess is spawned: verification cannot fail merely because
+    the host process could not fork or the probe timed out.  A missing venv,
+    missing/unreadable metadata, or a missing ``Version`` header means
+    "unknown" rather than an error; callers fall back to installing.
     """
-    python = _venv_python(Path(plugin_dir))
-    if python is None:
-        return InstalledKcaa(None)
-    command = [str(python), "-c", _KVAA_PROBE_SCRIPT]
-    try:
-        completed = subprocess.run(  # nosec B603 - fixed argv, shell=False
-            command,
-            capture_output=True,
-            text=True,
-            timeout=_PROBE_TIMEOUT,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError):
-        return InstalledKcaa(None)
-    if completed.returncode != 0:
-        return InstalledKcaa(None)
-    try:
-        data = json.loads(completed.stdout)
-    except (TypeError, ValueError):
-        return InstalledKcaa(None)
-    if not isinstance(data, dict):
-        return InstalledKcaa(None)
-    version = data.get("version")
-    version_text = str(version).strip() if version else ""
-    return InstalledKcaa(
-        version=version_text or None,
-        editable=data.get("editable") is True,
-    )
+    best_version: str | None = None
+    best_editable = False
+    best_key: tuple[int, ...] | None = None
+    for site_dir in _site_packages_dirs(Path(plugin_dir)):
+        for dist_dir in _kcaa_dist_dirs(site_dir):
+            version = _dist_version(dist_dir)
+            if version is None:
+                continue
+            key = _version_sort_key(version)
+            if best_key is None or key > best_key:
+                best_version, best_key = version, key
+                best_editable = _dist_is_editable(dist_dir)
+    if best_version is None:
+        log.debug("kcaa metadata not found in the plugin venv under %s", plugin_dir)
+    else:
+        log.debug("kcaa in plugin venv: version=%s editable=%s", best_version, best_editable)
+    return InstalledKcaa(version=best_version, editable=best_editable)
 
 
 # ---------------------------------------------------------------------------
@@ -993,7 +1040,7 @@ def install_update(
 
     Refuses git checkouts, unwritable directories, and leftovers from an
     interrupted install.  Before any filesystem change it resolves the
-    plugin venv and probes the installed ``kcaa`` state.  Editable installs
+    plugin venv and reads the installed ``kcaa`` state.  Editable installs
     are never replaced: the plugin tree still upgrades, but uv and the venv
     step are skipped.  Otherwise, if the version differs from ``new_version``,
     it requires uv and runs a dry-run install; if it already matches, both are
@@ -1001,10 +1048,10 @@ def install_update(
     also means dependency resolution is not re-run, so a damaged dependency
     set is not repaired by an update; rerun ``setup_plugin.sh`` for a full
     reinstall.  It then backs up the plugin tree, replaces it, verifies
-    VERSION, and updates ``kcaa`` only when needed, re-probing afterwards.
-    The tree is restored on failure; if the venv step fails after the swap,
-    the error says the plugin files were restored but the package update did
-    not complete.
+    VERSION, and updates ``kcaa`` only when needed, re-reading the venv
+    metadata afterwards.  The tree is restored on failure; if the venv step
+    fails after the swap, the error says the plugin files were restored but
+    the package update did not complete.
 
     Returns:
         An :class:`InstallOutcome`.  ``kcaa_updated`` is true only after a
