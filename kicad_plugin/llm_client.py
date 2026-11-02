@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 import datetime
 import difflib
 from enum import Enum
+import ipaddress
 import json
 import logging
 import os
@@ -532,6 +533,90 @@ def _urlopen_with_plugin_ca_retry(request, timeout: float):
         return urllib.request.urlopen(  # nosec B310 -- user-configured LLM endpoint
             request, timeout=timeout, context=context
         )
+
+
+def _is_loopback_url(url: str) -> bool:
+    """Return whether *url* points at a loopback destination.
+
+    ``localhost`` is matched by name and ``127.0.0.0/8`` by parsed address.
+    A string prefix check is not enough: ``127.evil.com`` is a DNS name, not
+    a loopback address, and must keep using the system proxy.
+    """
+    import urllib.parse
+
+    try:
+        hostname = urllib.parse.urlsplit(url).hostname
+    except ValueError:
+        return False
+    if not hostname:
+        return False
+    host = hostname.lower()
+    if host in ("localhost", "::1", "0.0.0.0"):  # nosec B104 -- hostname, not a bind address
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _proxy_would_intercept(url: str) -> bool:
+    """Return whether the system proxy would be used for a loopback *url*.
+
+    Deliberately conservative: any configured HTTP or HTTPS proxy counts.
+    A false positive only sends a local request direct (harmless); a false
+    negative reproduces the Windows registry quirk where
+    ``ProxyOverride=<local>`` bypasses dotted-free names such as
+    ``localhost`` but not ``127.0.0.1`` (issue #230).
+    """
+    import urllib.request
+
+    if not _is_loopback_url(url):
+        return False
+    proxies = urllib.request.getproxies()
+    return bool(proxies.get("http") or proxies.get("https"))
+
+
+# Cached opener that ignores the system proxy.  Built at most once; plugin
+# threads (panel polling, IPC checks, streaming reads) may race for it.
+_loopback_opener: Any = None
+_loopback_opener_lock = threading.Lock()
+
+
+def _get_loopback_opener():
+    """Return the cached proxy-less opener used for loopback requests."""
+    global _loopback_opener
+    opener = _loopback_opener
+    if opener is None:
+        with _loopback_opener_lock:
+            if _loopback_opener is None:
+                import urllib.request
+
+                _loopback_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            opener = _loopback_opener
+    return opener
+
+
+def _urlopen(request, timeout: float, *, ca_retry: bool = False):
+    """Open *request*, bypassing the system proxy for loopback destinations.
+
+    Loopback requests use a cached ``ProxyHandler({})`` opener, but only
+    when a system proxy is configured and would otherwise intercept them.
+    Without a proxy, and for every outbound request, the existing behaviour
+    is unchanged: the global opener (system proxy) is used, with the plugin
+    CA fallback when *ca_retry* is set.
+
+    A global ``install_opener()`` is deliberately avoided: the plugin runs
+    inside KiCad's interpreter, so replacing the opener would change
+    ``urllib`` for the whole application.
+    """
+    import urllib.request
+
+    url = getattr(request, "full_url", request)
+    if isinstance(url, str) and _proxy_would_intercept(url):
+        return _get_loopback_opener().open(request, timeout=timeout)
+    if ca_retry:
+        return _urlopen_with_plugin_ca_retry(request, timeout)
+    return urllib.request.urlopen(request, timeout=timeout)  # nosec B310 -- caller controls the endpoint
 
 
 def _resolve_plugin_python() -> str | None:
@@ -1269,7 +1354,7 @@ def call_mcp_tool(
     def _post() -> None:
         """Run the HTTP POST + parse in the worker; never raises."""
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:  # nosec B310 -- MCP client, localhost only
+            with _urlopen(req, timeout) as resp:
                 body = _parse_mcp_response_text(resp.read().decode())
         except urllib.error.URLError as e:
             box["result"] = {"success": False, "error": f"MCP server unreachable: {e}"}
@@ -3539,7 +3624,7 @@ class LLMClient:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=10) as resp:  # nosec B310 -- MCP client, localhost only
+            with _urlopen(req, 10) as resp:
                 body = _parse_mcp_response_text(resp.read().decode())
         except Exception as e:
             log.warning(f"Could not fetch tool list: {e}")
@@ -3933,7 +4018,7 @@ class LLMClient:
 
         req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
         try:
-            with urllib.request.urlopen(req, timeout=300) as resp:  # nosec B310 -- localhost only
+            with _urlopen(req, 300) as resp:
                 text_parts = []
                 if on_stream_event is not None:
                     on_stream_event({"type": "text_start"})

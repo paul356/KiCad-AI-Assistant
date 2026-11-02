@@ -15,6 +15,7 @@ import time
 import types
 from unittest.mock import ANY, MagicMock, patch
 import urllib.error
+import urllib.request
 
 import pytest
 
@@ -23,6 +24,19 @@ from kicad_plugin import session_store as sstore
 from kicad_plugin.llm_client import LLMClient, LLMTurnFailure, _subprocess_sse_stream
 from kicad_plugin.settings import DEFAULT_LLM_USER_AGENT
 from kicad_plugin.tool_registry import TOOL_POLICIES
+
+
+@pytest.fixture(autouse=True)
+def _neutralize_system_proxy(monkeypatch):
+    """Make these unit tests independent of the host's proxy configuration.
+
+    Most tests here patch ``urllib.request.urlopen`` and drive loopback MCP
+    URLs.  With a real system proxy configured, production code correctly
+    takes the direct-opener path for those URLs and the patch would never be
+    reached.  Proxy handling itself is covered by ``TestLoopbackProxyBypass``
+    and ``TestProxyEndToEnd``.
+    """
+    monkeypatch.setattr(urllib.request, "getproxies", lambda: {})
 
 
 def _on_event_collect(chunks):
@@ -5355,3 +5369,350 @@ class TestSkillFrontMatterToolsParsing:
         text = '---\nname: x\npriority: 50\ndescription: "d"\n---\nbody'
         meta = llm_client._parse_skill_front_matter(text)
         assert "tools" not in meta
+
+
+# ---------------------------------------------------------------------------
+# Loopback proxy bypass (issue #230, defect A)
+# ---------------------------------------------------------------------------
+
+
+class TestLoopbackProxyBypass:
+    """``_urlopen`` must route loopback destinations direct only when the
+    system proxy would otherwise intercept them, and must leave every other
+    path byte-for-byte unchanged."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_loopback_opener(self, monkeypatch):
+        monkeypatch.setattr(llm_client, "_loopback_opener", None)
+
+    @staticmethod
+    def _request(url: str):
+        return urllib.request.Request(url, data=b"{}", method="POST")
+
+    def _use_fake_loopback_opener(self, monkeypatch):
+        """Install a fake cached opener and return ``(opener, calls)``."""
+        calls: list[tuple[object, float | None]] = []
+
+        class _Opener:
+            def open(self, request, timeout=None):
+                calls.append((request, timeout))
+                resp = MagicMock()
+                resp.read.return_value = b'{"ok": true}'
+                resp.__enter__.return_value = resp
+                return resp
+
+        opener = _Opener()
+        monkeypatch.setattr(llm_client, "_loopback_opener", opener)
+        return opener, calls
+
+    @pytest.mark.parametrize(
+        "proxies",
+        [
+            {"http": "http://proxy.example:8118"},
+            {"https": "http://proxy.example:8118"},
+            {"http": "http://proxy.example:8118", "https": "http://proxy.example:8118"},
+        ],
+    )
+    def test_loopback_with_proxy_uses_direct_opener(self, monkeypatch, proxies):
+        monkeypatch.setattr(urllib.request, "getproxies", lambda: proxies)
+        opener, calls = self._use_fake_loopback_opener(monkeypatch)
+        req = self._request("http://127.0.0.1:8043/mcp")
+
+        with patch("urllib.request.urlopen", side_effect=AssertionError("system opener used")):
+            out = llm_client._urlopen(req, 7)
+
+        assert out.read() == b'{"ok": true}'
+        assert calls == [(req, 7)]
+
+    def test_external_with_proxy_uses_default_opener(self, monkeypatch):
+        monkeypatch.setattr(urllib.request, "getproxies", lambda: {"http": "http://proxy:8118"})
+        _, loopback_calls = self._use_fake_loopback_opener(monkeypatch)
+        req = self._request("https://api.deepseek.com/v1/chat/completions")
+        sentinel = object()
+
+        with patch("urllib.request.urlopen", return_value=sentinel) as system_urlopen:
+            out = llm_client._urlopen(req, 9)
+
+        assert out is sentinel
+        system_urlopen.assert_called_once_with(req, timeout=9)
+        # The loopback opener must never be used for outbound traffic.
+        assert loopback_calls == []
+
+    def test_loopback_without_proxy_keeps_default_opener(self, monkeypatch):
+        monkeypatch.setattr(urllib.request, "getproxies", lambda: {})
+        _, loopback_calls = self._use_fake_loopback_opener(monkeypatch)
+        req = self._request("http://127.0.0.1:8043/mcp")
+        sentinel = object()
+
+        with patch("urllib.request.urlopen", return_value=sentinel) as system_urlopen:
+            out = llm_client._urlopen(req, 5)
+
+        assert out is sentinel
+        system_urlopen.assert_called_once_with(req, timeout=5)
+        assert loopback_calls == []
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "http://localhost/mcp",
+            "http://localhost:11434/api/chat",
+            "https://LOCALHOST:443/mcp",
+            "http://127.0.0.1:8043/mcp",
+            "http://127.1.2.3:99/mcp",
+            "http://[::1]:8080/mcp",
+            "http://0.0.0.0:1234/mcp",
+        ],
+    )
+    def test_is_loopback_url_accepts_loopback_hosts(self, url):
+        assert llm_client._is_loopback_url(url) is True
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "http://127.evil.com/mcp",
+            "http://127.0.0.1.evil.com/mcp",
+            "http://10.0.0.1/mcp",
+            "http://192.168.71.5:8118/",
+            "https://example.com/mcp",
+            "https://api.deepseek.com/v1/chat/completions",
+            "not a url",
+            "",
+        ],
+    )
+    def test_is_loopback_url_rejects_non_loopback_hosts(self, url):
+        assert llm_client._is_loopback_url(url) is False
+
+    def test_proxy_would_intercept_requires_both_conditions(self, monkeypatch):
+        monkeypatch.setattr(urllib.request, "getproxies", lambda: {"http": "http://proxy"})
+        assert llm_client._proxy_would_intercept("http://127.0.0.1:1/mcp") is True
+        assert llm_client._proxy_would_intercept("https://example.com/") is False
+
+        monkeypatch.setattr(urllib.request, "getproxies", lambda: {})
+        assert llm_client._proxy_would_intercept("http://127.0.0.1:1/mcp") is False
+
+    def test_loopback_opener_is_built_once_and_cached(self, monkeypatch):
+        built: list[tuple[object, ...]] = []
+        sentinel = object()
+
+        def _build(*handlers):
+            built.append(handlers)
+            return sentinel
+
+        monkeypatch.setattr(urllib.request, "build_opener", _build)
+
+        assert llm_client._get_loopback_opener() is sentinel
+        assert llm_client._get_loopback_opener() is sentinel
+        assert len(built) == 1
+        assert isinstance(built[0][0], urllib.request.ProxyHandler)
+        assert built[0][0].proxies == {}
+
+    def test_loopback_opener_build_is_thread_safe(self, monkeypatch):
+        import concurrent.futures
+
+        builds = 0
+        sentinel = object()
+
+        def _slow_build(*handlers):
+            nonlocal builds
+            builds += 1
+            time.sleep(0.01)
+            return sentinel
+
+        monkeypatch.setattr(urllib.request, "build_opener", _slow_build)
+
+        def _get():
+            return llm_client._get_loopback_opener()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
+            results = list(pool.map(lambda _: _get(), range(64)))
+
+        assert builds == 1
+        assert all(result is sentinel for result in results)
+
+    def test_non_loopback_ca_retry_path_is_still_used(self, monkeypatch):
+        monkeypatch.setattr(urllib.request, "getproxies", lambda: {"http": "http://proxy:8118"})
+        self._use_fake_loopback_opener(monkeypatch)
+        req = self._request("https://gateway.example/v1/chat/completions")
+        sentinel = object()
+
+        with (
+            patch.object(
+                llm_client, "_urlopen_with_plugin_ca_retry", return_value=sentinel
+            ) as ca_retry,
+            patch("urllib.request.urlopen", side_effect=AssertionError("default opener used")),
+        ):
+            out = llm_client._urlopen(req, 30, ca_retry=True)
+
+        assert out is sentinel
+        ca_retry.assert_called_once_with(req, 30)
+
+    def test_loopback_with_proxy_skips_ca_retry(self, monkeypatch):
+        monkeypatch.setattr(urllib.request, "getproxies", lambda: {"http": "http://proxy:8118"})
+        _, calls = self._use_fake_loopback_opener(monkeypatch)
+        req = self._request("http://127.0.0.1:8043/mcp")
+
+        with (
+            patch.object(
+                llm_client,
+                "_urlopen_with_plugin_ca_retry",
+                side_effect=AssertionError("CA retry must not run for loopback"),
+            ),
+            patch("urllib.request.urlopen", side_effect=AssertionError("system opener used")),
+        ):
+            llm_client._urlopen(req, 10, ca_retry=True)
+
+        assert [call[0] for call in calls] == [req]
+
+    def test_loopback_without_proxy_keeps_ca_retry_path(self, monkeypatch):
+        monkeypatch.setattr(urllib.request, "getproxies", lambda: {})
+        self._use_fake_loopback_opener(monkeypatch)
+        req = self._request("http://127.0.0.1:8043/mcp")
+        sentinel = object()
+
+        with (
+            patch.object(
+                llm_client, "_urlopen_with_plugin_ca_retry", return_value=sentinel
+            ) as ca_retry,
+            patch("urllib.request.urlopen", side_effect=AssertionError("default opener used")),
+        ):
+            out = llm_client._urlopen(req, 10, ca_retry=True)
+
+        assert out is sentinel
+        ca_retry.assert_called_once_with(req, 10)
+
+
+class _RecordingProxyServer(ThreadingHTTPServer):
+    """A local HTTP proxy stub that records absolute-URI and CONNECT requests.
+
+    ``do_CONNECT`` is implemented deliberately: HTTPS through a proxy needs
+    the CONNECT tunnel, and without it the client only sees
+    ``501 Unsupported method ('CONNECT')`` — a gap in the stub, not a
+    statement about the caller.
+    """
+
+    def __init__(self) -> None:
+        self.requests: list[tuple[str, str]] = []
+        self._records_lock = threading.Lock()
+        super().__init__(("127.0.0.1", 0), self._make_handler(), bind_and_activate=True)
+        self._thread = threading.Thread(target=self.serve_forever, daemon=True)
+        self._thread.start()
+
+    def record(self, method: str, path: str) -> None:
+        with self._records_lock:
+            self.requests.append((method, path))
+
+    @property
+    def url(self) -> str:
+        host, port = self.server_address[:2]
+        return f"http://{host}:{port}"
+
+    def _make_handler(self):
+        server = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def _answer(self, body: bytes = b"proxied") -> None:
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                server.record("GET", self.path)
+                self._answer()
+
+            def do_POST(self):
+                server.record("POST", self.path)
+                self._answer()
+
+            def do_CONNECT(self):
+                server.record("CONNECT", self.path)
+                self.send_response(200)
+                self.end_headers()
+
+        return Handler
+
+
+class _LoopbackTargetServer(ThreadingHTTPServer):
+    """A direct-only local endpoint that answers MCP-shaped POSTs."""
+
+    def __init__(self) -> None:
+        super().__init__(("127.0.0.1", 0), self._make_handler(), bind_and_activate=True)
+        self._thread = threading.Thread(target=self.serve_forever, daemon=True)
+        self._thread.start()
+
+    @property
+    def port(self) -> int:
+        return self.server_address[1]
+
+    def _make_handler(self):
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                body = b'{"ok": true}'
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        return Handler
+
+
+class TestProxyEndToEnd:
+    """Acceptance check for issue #230: a real fake proxy observes zero
+    loopback requests and exactly one external request."""
+
+    @pytest.fixture()
+    def proxy_and_target(self, monkeypatch):
+        proxy = _RecordingProxyServer()
+        target = _LoopbackTargetServer()
+        monkeypatch.setattr(llm_client, "_loopback_opener", None)
+        # urllib caches its default opener process-wide; earlier tests run
+        # with getproxies() stubbed to {}, so force a rebuild under this
+        # test's proxy environment.
+        monkeypatch.setattr(urllib.request, "_opener", None)
+        monkeypatch.setenv("http_proxy", proxy.url)
+        monkeypatch.setenv("https_proxy", proxy.url)
+        monkeypatch.delenv("no_proxy", raising=False)
+        monkeypatch.delenv("NO_PROXY", raising=False)
+        # The autouse fixture stubs getproxies out; use the real env reader
+        # so this test exercises the production decision end to end.
+        monkeypatch.setattr(urllib.request, "getproxies", urllib.request.getproxies_environment)
+        try:
+            yield proxy, target
+        finally:
+            proxy.shutdown()
+            proxy.server_close()
+            target.shutdown()
+            target.server_close()
+
+    def test_loopback_bypasses_proxy_and_external_still_uses_it(self, proxy_and_target):
+        proxy, target = proxy_and_target
+
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{target.port}/mcp",
+            data=b"{}",
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with llm_client._urlopen(req, 5) as resp:
+            assert resp.read() == b'{"ok": true}'
+        assert proxy.requests == []  # loopback never reached the proxy
+
+        external = urllib.request.Request("http://external.invalid/", method="GET")
+        with llm_client._urlopen(external, 5) as resp:
+            assert resp.read() == b"proxied"
+        assert proxy.requests == [("GET", "http://external.invalid/")]
+
+        https = urllib.request.Request("https://external.invalid/", method="GET")
+        with pytest.raises(urllib.error.URLError):
+            llm_client._urlopen(https, 5)
+        assert ("CONNECT", "external.invalid:443") in proxy.requests
+
+        loopback_hits = [r for r in proxy.requests if "127.0.0.1" in r[1]]
+        assert loopback_hits == []
