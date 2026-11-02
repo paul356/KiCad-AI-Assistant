@@ -2,6 +2,7 @@
 name: sheet-management
 priority: 55
 description: "Hierarchical sheet CRUD, sheet pins, hierarchy traversal, auto-placement on conflict"
+tools: [list_sheet_symbols, get_sheet_hierarchy, add_sheet_symbol, remove_sheet_symbol, update_sheet_symbol, add_sheet_pin, remove_sheet_pin]
 ---
 # Tools overview
 - **list_sheet_symbols** — List all sheet symbols on a schematic (read-only).

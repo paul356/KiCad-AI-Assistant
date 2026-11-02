@@ -178,11 +178,11 @@ express an absolute move as a delta.
 
 ---
 
-#### `list_symbol_libraries(table=None, limit=200, offset=0, project_path=None)`
+#### `list_symbol_libraries(limit=200, offset=0, project_path=None)`
 
-**Purpose:** Returns names and file paths for all known symbol libraries in scope (global plus the given project's, when `project_path` is set). Useful for exploration when `search_symbols` returns no results.
+**Purpose:** Returns one row per known symbol library in scope — `name`, `symbol_count`, `file_path` — as a flat, paginated list. Useful for exploration when `search_symbols` returns no results; looking for a specific component, prefer `search_symbols`.
 
-**Key parameters:** `table`, `limit`, `offset` — paging/drill-down as described in the tool docstring; `project_path` scopes the listing exactly like `search_symbols`.
+**Key parameters:** `limit` / `offset` — pagination as described in the tool docstring; `project_path` scopes the listing exactly like `search_symbols`. Watch the `truncated` field to know when more pages remain.
 
 ---
 

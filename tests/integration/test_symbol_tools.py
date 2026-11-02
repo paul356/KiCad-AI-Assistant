@@ -218,14 +218,13 @@ class TestListSymbolLibraries:
             sid,
             "list_symbol_libraries",
             {
-                "table": None,
                 "limit": 200,
                 "offset": 0,
             },
         )
         assert "success" in result
         if result.get("success"):
-            assert "tables" in result or "libraries" in result
+            assert "libraries" in result
             assert "total" in result
 
     def test_no_error_in_response(self, mcp_server):
@@ -235,7 +234,6 @@ class TestListSymbolLibraries:
             sid,
             "list_symbol_libraries",
             {
-                "table": None,
                 "limit": 200,
                 "offset": 0,
             },

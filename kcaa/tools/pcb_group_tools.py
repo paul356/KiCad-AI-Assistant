@@ -1092,7 +1092,7 @@ def register_pcb_group_tools(mcp: FastMCP) -> None:
             except KeyError:
                 not_found.append(ref)
                 continue
-            upsert_fp_property(fp, _GROUP_PROPERTY, group_name)
+            upsert_fp_property(fp, _GROUP_PROPERTY, group_name, hidden=True)
             assigned.append(ref)
 
         if not assigned:

@@ -355,3 +355,79 @@ class TestSetFootprintProperty:
 
         data = load_pcb(board_copy)
         assert get_fp_property(find_footprint(data, "R1"), "Value") == "22k"
+
+    def test_update_preserves_visible_property(self, tools, board_copy):
+        """set_footprint_property changes the value only; an existing visible
+        property must stay visible (no hide marker added)."""
+        from kcaa.utils.pcb_footprint_utils import (
+            _fp_property_is_hidden,
+            find_footprint,
+            get_fp_property,
+            upsert_fp_property,
+        )
+        from kcaa.utils.pcb_sexp_utils import load_pcb, save_pcb
+
+        data = load_pcb(board_copy)
+        upsert_fp_property(find_footprint(data, "R1"), "placement_group", "usb_c")
+        save_pcb(board_copy, data)
+
+        result = _run(
+            tools["set_footprint_property"](
+                pcb_path=board_copy,
+                items=[{"reference": "R1", "property_name": "placement_group", "value": "power"}],
+                ctx=None,
+            )
+        )
+        assert result.get("success") is True, result
+
+        data = load_pcb(board_copy)
+        fp = find_footprint(data, "R1")
+        assert get_fp_property(fp, "placement_group") == "power"
+        node = next(
+            s
+            for s in fp
+            if isinstance(s, list)
+            and len(s) >= 3
+            and str(s[0]) == "property"
+            and (s[1] if isinstance(s[1], str) else str(s[1])) == "placement_group"
+        )
+        assert node is not None
+        assert _fp_property_is_hidden(node) is False
+
+    def test_update_preserves_hidden_property(self, tools, board_copy):
+        """set_footprint_property must not remove the hide marker from an
+        existing hidden property."""
+        from kcaa.utils.pcb_footprint_utils import (
+            _fp_property_is_hidden,
+            find_footprint,
+            get_fp_property,
+            upsert_fp_property,
+        )
+        from kcaa.utils.pcb_sexp_utils import load_pcb, save_pcb
+
+        data = load_pcb(board_copy)
+        upsert_fp_property(find_footprint(data, "R1"), "placement_group", "usb_c", hidden=True)
+        save_pcb(board_copy, data)
+
+        result = _run(
+            tools["set_footprint_property"](
+                pcb_path=board_copy,
+                items=[{"reference": "R1", "property_name": "placement_group", "value": "power"}],
+                ctx=None,
+            )
+        )
+        assert result.get("success") is True, result
+
+        data = load_pcb(board_copy)
+        fp = find_footprint(data, "R1")
+        assert get_fp_property(fp, "placement_group") == "power"
+        node = next(
+            s
+            for s in fp
+            if isinstance(s, list)
+            and len(s) >= 3
+            and str(s[0]) == "property"
+            and (s[1] if isinstance(s[1], str) else str(s[1])) == "placement_group"
+        )
+        assert node is not None
+        assert _fp_property_is_hidden(node) is True

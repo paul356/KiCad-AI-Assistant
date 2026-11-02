@@ -12,6 +12,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 import datetime
 import difflib
+from enum import Enum
 import json
 import logging
 import os
@@ -25,6 +26,10 @@ import time
 from typing import Any
 
 from .tool_registry import TOOL_POLICIES, get_missing_tool_policies, get_tool_policy
+
+# Notice colour for wait progress; single source of truth is ui/colors.py
+# (shared with the panel), kept alias-local so call sites stay unchanged.
+from .ui.colors import WARN_HEX as _STATUS_EVENT_COLOR_HEX
 
 log = logging.getLogger(__name__)
 
@@ -170,19 +175,40 @@ _SKILLS_DIR = Path(
 )
 
 
-def _parse_skill_front_matter(text: str) -> dict[str, str]:
-    """Return flat front-matter metadata from a skill Markdown file."""
+def _split_tools_value(value: str) -> list[str]:
+    """Split a frontmatter ``tools:`` value into a list of tool names.
+
+    Accepts YAML-ish bracket syntax (``[a, b, c]``) and bare comma-separated
+    lists (``a, b, c``); the bracket form is stripped before splitting so
+    both parse identically.  Empty/absent values yield ``[]``.
+    """
+    value = value.strip()
+    if value.startswith("[") and value.endswith("]"):
+        value = value[1:-1]
+    return [t.strip() for t in value.split(",") if t.strip()]
+
+
+def _parse_skill_front_matter(text: str) -> dict[str, Any]:
+    """Return flat front-matter metadata from a skill Markdown file.
+
+    The optional ``tools:`` field (issue #208) is parsed into a list of MCP
+    tool names; every other field stays a string.
+    """
     if not text.startswith("---"):
         return {}
     end = text.find("\n---", 3)
     if end == -1:
         return {}
-    meta: dict[str, str] = {}
+    meta: dict[str, Any] = {}
     for line in text[3:end].strip().splitlines():
         if ":" not in line:
             continue
         key, _, value = line.partition(":")
-        meta[key.strip()] = value.strip().strip('"').strip("'")
+        key = key.strip()
+        if key == "tools":
+            meta["tools"] = _split_tools_value(value)
+        else:
+            meta[key] = value.strip().strip('"').strip("'")
     return meta
 
 
@@ -240,6 +266,63 @@ def _build_skill_catalog_block() -> str:
         for skill in skills
     ]
     return "# Skills\n" + _SKILL_CATEGORY_GUIDE + "\n" + "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Issue #208: harness-side skill auto-injection.
+#
+# When the LLM calls a tool that a skill's frontmatter ``tools:`` field
+# declares, that skill's body is injected into history as a user-role message
+# (``[Skill guide: <name>]`` header), exactly once per session.  Skills
+# without ``tools:`` are never auto-injected — get_skill stays their only
+# load path (fallback preserved, tools untouched).
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _SkillRef:
+    """One frontmatter-declared auto-inject target: skill name + body file."""
+
+    name: str
+    body_path: Path
+
+
+def _load_skill_tool_mapping() -> dict[str, _SkillRef]:
+    """Map MCP tool name → declaring skill from every ``tools:`` frontmatter.
+
+    Iterates ``_SKILLS_DIR/*.md`` (sorted for determinism).  A skill without
+    a ``tools:`` field never appears in the mapping.  When several files
+    declare the same tool the last file (sorted by path) wins — authors must
+    not overlap declarations across skills.
+    """
+    mapping: dict[str, _SkillRef] = {}
+    if not _SKILLS_DIR.exists():
+        return mapping
+    for path in sorted(_SKILLS_DIR.glob("*.md")):
+        try:
+            meta = _parse_skill_front_matter(path.read_text(encoding="utf-8"))
+        except Exception:
+            log.warning("Failed to read skill file %s", path)
+            continue
+        name = meta.get("name") or path.stem.replace("_", "-")
+        for tool in meta.get("tools") or []:
+            mapping[tool] = _SkillRef(name=name, body_path=path)
+    return mapping
+
+
+def _skill_guide_body(path: Path) -> str:
+    """Return a skill file's body with the front-matter fence stripped.
+
+    Matches ``get_skill``'s output shape (skill_tools ``_parse_front_matter``
+    slices the same way), so model-facing skill content is identical whether
+    loaded on demand or auto-injected.
+    """
+    text = path.read_text(encoding="utf-8")
+    if text.startswith("---"):
+        end = text.find("\n---", 3)
+        if end != -1:
+            return text[end + 4 :].lstrip("\n")
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -1101,6 +1184,41 @@ def _parse_mcp_response_text(text: str) -> dict[str, Any]:
     return json.loads(last_data)
 
 
+def _mcp_error_message(result: dict[str, Any]) -> str:
+    """Extract a readable message from a failed (``isError: true``) CallToolResult.
+
+    FastMCP pydantic validation failures arrive as prose in a text content
+    block; some servers additionally/alternatively attach a structured
+    payload.  Prefer a structured ``error``/``message`` when present, then
+    join the text blocks, and finally fall back to a concise marker.
+    """
+    structured = result.get("structuredContent")
+    if isinstance(structured, dict):
+        for key in ("error", "message"):
+            value = structured.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        try:
+            serialized = json.dumps(structured)
+        except (TypeError, ValueError):
+            serialized = ""
+        if serialized:
+            return serialized
+    content = result.get("content", [])
+    if isinstance(content, list):
+        texts = [
+            block.get("text", "").strip()
+            for block in content
+            if isinstance(block, dict)
+            and block.get("type") == "text"
+            and isinstance(block.get("text"), str)
+        ]
+        joined = "\n".join(text for text in texts if text).strip()
+        if joined:
+            return joined
+    return "MCP tool call failed (server reported isError)"
+
+
 def call_mcp_tool(
     base_url: str,
     tool_name: str,
@@ -1173,31 +1291,52 @@ def call_mcp_tool(
                 }
             else:
                 result = body.get("result", {})
-                # FastMCP returns content as a list of {type, text} / {type, image} blocks
-                content = result.get("content", [])
-                image: dict[str, str] | None = None
-                if isinstance(content, list):
-                    text = next((b for b in content if b.get("type") == "text"), None)
-                    img = next((b for b in content if b.get("type") == "image"), None)
-                    if img is not None:
-                        image = {
-                            "media_type": img.get("mimeType", "image/png"),
-                            "data": img.get("data", ""),
-                        }
-                    if text is not None:
-                        try:
-                            out = json.loads(text.get("text", ""))
-                        except json.JSONDecodeError:
-                            out = {"success": True, "text": text.get("text", "")}
-                        if isinstance(out, dict) and image is not None:
-                            out["_image"] = image
-                        box["result"] = out
-                    elif image is not None:
-                        box["result"] = {"success": True, "_image": image}
+                # FastMCP marks failed calls (e.g. pydantic validation
+                # errors) with isError: true.  Normalize those to a
+                # structured failure instead of wrapping the error prose
+                # in success: True (issue #195).  The spec types isError
+                # as a bool; tolerate a sloppy serializer's string/int
+                # truthy variants too — anything else (e.g. "false", 0,
+                # None) keeps the strict default: success path.
+                if result.get("isError") in (True, "true", "True", 1):
+                    box["result"] = {
+                        "success": False,
+                        "error": _mcp_error_message(result),
+                    }
+                else:
+                    # FastMCP returns content as a list of {type, text} /
+                    # {type, image} blocks
+                    content = result.get("content", [])
+                    image: dict[str, str] | None = None
+                    if isinstance(content, list):
+                        text = next((b for b in content if b.get("type") == "text"), None)
+                        img = next((b for b in content if b.get("type") == "image"), None)
+                        if img is not None:
+                            image = {
+                                "media_type": img.get("mimeType", "image/png"),
+                                "data": img.get("data", ""),
+                            }
+                        if text is not None:
+                            # Coerce a null/non-string text value so a
+                            # malformed block degrades to the non-JSON
+                            # fallback instead of letting TypeError
+                            # escape the worker thread.
+                            text_content = text.get("text")
+                            if not isinstance(text_content, str):
+                                text_content = ""
+                            try:
+                                out = json.loads(text_content)
+                            except json.JSONDecodeError:
+                                out = {"success": True, "text": text_content}
+                            if isinstance(out, dict) and image is not None:
+                                out["_image"] = image
+                            box["result"] = out
+                        elif image is not None:
+                            box["result"] = {"success": True, "_image": image}
+                        else:
+                            box["result"] = result
                     else:
                         box["result"] = result
-                else:
-                    box["result"] = result
         finally:
             box["done"] = True
 
@@ -1240,6 +1379,118 @@ class _ToolExecutionState:
 
 
 # ---------------------------------------------------------------------------
+# Background-operation status polling (issue #190)
+# ---------------------------------------------------------------------------
+#
+# sync_symbol_index / sync_footprint_index return immediately and run in a
+# server-side thread; the model then polls get_symbol_sync_status /
+# get_footprint_sync_status until the operation finishes.  Each poll used to
+# be a full LLM round-trip against the turn's iteration cap, so a long sync
+# could starve the turn of iterations before any real work happened.  When a
+# mapped status tool reports the operation still running, the client now
+# blocks on it (see _wait_for_background_op) and hands the model the final
+# snapshot, so the whole wait costs one poll round.  Mapped tools must return
+# a dict with a truthy "running" key while the operation is in flight.
+# _STATUS_POLL_LABELS maps each such tool to its user-facing label (used in
+# the progress notices) and is the single source of truth: the mapped set
+# derives from the keys, so names and labels can't drift.
+_STATUS_POLL_LABELS = {
+    "get_symbol_sync_status": "Symbol sync",
+    "get_footprint_sync_status": "Footprint sync",
+}
+_STATUS_POLL_TOOLS = frozenset(_STATUS_POLL_LABELS)
+
+# Interval between client-side re-queries while waiting for a background op.
+_STATUS_POLL_INTERVAL_SECONDS = 1.0
+
+# Rate limit for the transient progress notices emitted while blocking on a
+# background op: at most one notice per this many elapsed seconds, plus one
+# immediately when the wait starts (see _wait_for_background_op), so the user
+# sees polling begin right away instead of a silent multi-minute block
+# (issue #190 follow-up).
+_STATUS_EVENT_INTERVAL_SECONDS = 5.0
+
+# Iteration ceiling for the agentic loop.  This is a guard against an LLM
+# that never stops requesting tools, NOT a working budget: legitimate turns
+# need a handful of rounds (and status polling blocks client-side instead of
+# consuming rounds), so reaching the cap means the loop is genuinely stuck.
+# Raised from 20 so that long multi-step turns survive (issue #190).
+_MAX_ITERATIONS = 60
+
+
+def _wait_status_text(tool_name: str, result: dict[str, Any]) -> str:
+    """One-line transient notice with real sync progress (issue #190).
+
+    Surfaces the latest status snapshot's current/total counters and the
+    library currently being processed, e.g.
+    "Symbol sync: 342/1250 — Device/R".  Guards: total==0 (sync still
+    counting libraries) renders "preparing…" instead of a fraction, and a
+    missing/empty current_library drops the trailing dash segment.  The
+    label comes from _STATUS_POLL_LABELS (raw tool name if unmapped).
+    """
+
+    label = _STATUS_POLL_LABELS.get(tool_name, tool_name)
+    current = result.get("current")
+    total = result.get("total")
+    if total:
+        progress = f"{current if current is not None else 0}/{total}"
+    else:
+        progress = "preparing…"
+    library = result.get("current_library")
+    if library:
+        return f"{label}: {progress} — {library}"
+    return f"{label}: {progress}"
+
+
+def _emit_wait_status_notice(
+    on_stream_event: Callable[[dict[str, Any]], None] | None, text: str
+) -> None:
+    """Emit one transient status notice for a background-op wait (issue #190).
+
+    Uses the same ``{"type": "status", text, color_hex}`` event channel the
+    panel renders as notices.  Mirrors _emit_tool_callback's exception
+    safety: a UI callback failure must never break the wait loop or the turn.
+    """
+
+    if not on_stream_event:
+        return
+    try:
+        on_stream_event({"type": "status", "text": text, "color_hex": _STATUS_EVENT_COLOR_HEX})
+    except Exception as e:  # same contract as _emit_tool_callback
+        log.error("status event callback error in _emit_wait_status_notice: %s", e)
+
+
+# Turn-failure categories (issue #191, Plan A)
+# ---------------------------------------------------------------------------
+
+
+class LLMTurnFailure(Enum):
+    """Structured category for a turn that ended without a final answer.
+
+    Reported through ``run()``'s ``on_turn_failure`` callback; the panel
+    carries the ``.value`` string on the turn_end event so the UI never has
+    to infer a failure by matching reply text.
+    """
+
+    COMPACTION_ERROR = "compaction_error"
+    FRAMEWORK_ERROR = "framework_error"
+    LLM_ERROR = "llm_error"
+    INTERRUPTED = "interrupted"
+    TIMED_OUT = "timed_out"
+    ITERATION_CAP = "iteration_cap"
+    UNKNOWN_FAILURE = "unknown_failure"
+
+
+def _signal_turn_failure(
+    on_turn_failure: Callable[[LLMTurnFailure], None] | None,
+    category: LLMTurnFailure,
+) -> None:
+    """Fire the turn-failure callback for a fatal exit, if one is wired up."""
+    if on_turn_failure is not None:
+        on_turn_failure(category)
+
+
+# ---------------------------------------------------------------------------
 # OpenAI-compatible agentic loop
 # ---------------------------------------------------------------------------
 
@@ -1274,6 +1525,13 @@ class LLMClient:
         # request head stays byte-identical across turns (cache-friendly).
         self._tool_registry: dict[str, dict[str, Any]] | None = None
         self._enabled_tools: set[str] = set()
+        # Issue #208: frontmatter-declared tool→skill auto-inject state.  The
+        # mapping is derived from _SKILLS_DIR/*.md and built lazily on the
+        # first tool call; _injected_skills is session-scoped like the
+        # enabled-tool set (cleared by reset(), NOT rebuilt by set_history()).
+        self._skill_tool_map: dict[str, _SkillRef] | None = None
+        self._injected_skills: set[str] = set()
+        self._warned_missing_tool_skills: set[tuple[str, str]] = set()
         # One-shot context-window diagnostics (issue #129).
         self._fixed_overhead_warned: bool = False
         self._budget_warned: bool = False
@@ -1287,9 +1545,11 @@ class LLMClient:
         """
         self._history = []
         self._enabled_tools.clear()
+        self._injected_skills.clear()
         self._fixed_overhead_warned = False
         self._budget_warned = False
-        # self._tool_registry is kept: the tool catalog is stable per session.
+        # self._tool_registry and self._skill_tool_map are kept: the tool
+        # catalog and the skill mapping are stable per session.
 
     def set_base_url(self, url: str | None) -> None:
         """Set the MCP backend base URL after construction.
@@ -2780,6 +3040,77 @@ class LLMClient:
             return result
         return self._execute_tool_with_policy(name, args, state, on_tool_call, cancel_event)
 
+    def _wait_for_background_op(
+        self,
+        tool_name: str,
+        args: dict[str, Any],
+        result: dict[str, Any],
+        cancel_event: threading.Event | None,
+        on_stream_event: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
+        """Block on a background-operation status poll until it completes.
+
+        ``sync_symbol_index`` / ``sync_footprint_index`` return immediately
+        and run in a server-side thread; ``get_symbol_sync_status`` /
+        ``get_footprint_sync_status`` report progress.  If the first status
+        call reports the operation still running, this re-queries it here —
+        reusing the existing per-call timeout machinery — instead of letting
+        every status round-trip count against the turn's iteration cap, a
+        long sync could otherwise starve the turn (issue #190).
+
+        The result stays a plain status snapshot, so model-side poll logic is
+        unchanged (the model just sees a later point in the sync).  Stop
+        (cancel_event) and the per-call timeout budget are honoured; when the
+        budget runs out the last snapshot is returned and the model may poll
+        again with a fresh budget.  Never synthesizes an error.
+
+        While blocked, rate-limited transient status notices (e.g. "Symbol
+        sync: 342/1250 — Device/R") are emitted through *on_stream_event* so
+        the user sees real progress instead of a silent multi-minute block;
+        nothing is emitted once the wait ends (the result snapshot itself
+        carries completion).
+        """
+        deadline = time.monotonic() + self._mcp_tool_timeout
+        started = time.monotonic()
+        # Emit the first notice as soon as the wait begins (won't emit at all
+        # when the budget is already exhausted — remaining <= 0 below).
+        last_status_elapsed = -_STATUS_EVENT_INTERVAL_SECONDS
+        while result.get("running"):
+            if cancel_event is not None and cancel_event.is_set():
+                # Stop was pressed while blocked: abort the turn now (issue
+                # #176 semantics) instead of waiting out another LLM round.
+                return {
+                    "success": False,
+                    "error": f"tool call {tool_name} interrupted by user",
+                    "interrupted": True,
+                }
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                log.info(
+                    "Status wait budget (%g s) exhausted for %s; returning last "
+                    "snapshot so the model can poll again.",
+                    self._mcp_tool_timeout,
+                    tool_name,
+                )
+                break
+            elapsed = time.monotonic() - started
+            if elapsed - last_status_elapsed >= _STATUS_EVENT_INTERVAL_SECONDS:
+                # Progress from the newest snapshot seen so far (the initial
+                # policy result on the first pass, then each re-poll's).
+                _emit_wait_status_notice(on_stream_event, _wait_status_text(tool_name, result))
+                last_status_elapsed = elapsed
+            time.sleep(min(_STATUS_POLL_INTERVAL_SECONDS, remaining))
+            if cancel_event is not None and cancel_event.is_set():
+                return {
+                    "success": False,
+                    "error": f"tool call {tool_name} interrupted by user",
+                    "interrupted": True,
+                }
+            result = self._call_mcp_tool_guarded(tool_name, args, cancel_event)
+            if result.get("interrupted") or result.get("timed_out"):
+                break
+        return result
+
     def _auto_reload_modified_files(
         self,
         state: _ToolExecutionState,
@@ -2801,6 +3132,85 @@ class LLMClient:
             return None
         return self._format_reload_failure(reload_result)
 
+    def _get_skill_tool_map(self) -> dict[str, _SkillRef]:
+        """Return the session's frontmatter tool→skill map, built on first use."""
+        if self._skill_tool_map is None:
+            self._skill_tool_map = _load_skill_tool_mapping()
+            self._warn_missing_declared_tools()
+        return self._skill_tool_map
+
+    def _warn_missing_declared_tools(self) -> None:
+        """Log (once per skill/tool pair) declared tools absent from the registry.
+
+        The mapping is author-declared and may drift from the live MCP
+        catalog; a stale name must never crash a turn.  Called at map build
+        time and again after every registry (re)fetch so a catalog populated
+        after the map was built still surfaces the warning.
+        """
+        registry = self._tool_registry
+        if registry is None or self._skill_tool_map is None:
+            return
+        for tool, ref in self._skill_tool_map.items():
+            if tool in registry:
+                continue
+            key = (ref.name, tool)
+            if key in self._warned_missing_tool_skills:
+                continue
+            self._warned_missing_tool_skills.add(key)
+            log.warning(
+                "Skill '%s' declares frontmatter tool '%s' that is not in the "
+                "MCP tool registry; auto-inject for that name is disabled",
+                ref.name,
+                tool,
+            )
+
+    def _inject_skill_guides(self, tool_calls: list[dict[str, Any]]) -> None:
+        """Append frontmatter-declared skill bodies to history, once per session.
+
+        Called right after a batch of tool results has been appended to
+        history, so the assistant ``tool_calls`` message stays contiguous
+        with its role:"tool" results (provider pairing requirement).  Only
+        tools that actually executed qualify — pre-execution rejections (name
+        absent from the catalog / missing execution policy, mirroring
+        ``_execute_or_reject_tool``) never trigger an injection.  Skills
+        without a ``tools:`` field are never injected; a repeated call to an
+        already-injected skill is a pure no-op.
+        """
+        if not tool_calls:
+            return
+        mapping = self._get_skill_tool_map()
+        if not mapping:
+            return
+        registry = self._tool_registry or {}
+        to_inject: list[_SkillRef] = []
+        seen: set[str] = set()
+        for tc in tool_calls:
+            name = tc.get("function", {}).get("name", "")
+            if name not in _META_TOOL_NAMES and (
+                name not in TOOL_POLICIES or (registry and name not in registry)
+            ):
+                continue
+            ref = mapping.get(name)
+            if ref is None or ref.name in self._injected_skills or ref.name in seen:
+                continue
+            seen.add(ref.name)
+            to_inject.append(ref)
+        for ref in to_inject:
+            try:
+                body = _skill_guide_body(ref.body_path)
+            except OSError as e:
+                log.warning("Skill auto-inject: cannot read %s: %s", ref.body_path, e)
+                continue
+            self._history.append(
+                {"role": "user", "content": f"[Skill guide: {ref.name}]\n\n{body}"}
+            )
+            self._injected_skills.add(ref.name)
+            log.info(
+                "Skill auto-inject: injected '%s' (%d chars) after first declared tool call",
+                ref.name,
+                len(body),
+            )
+
     def run(
         self,
         user_message: str | dict[str, Any],
@@ -2811,6 +3221,7 @@ class LLMClient:
         on_warning: Callable[[str], None] | None = None,
         images: list[dict[str, Any]] | None = None,
         cancel_event: threading.Event | None = None,
+        on_turn_failure: Callable[[LLMTurnFailure], None] | None = None,
     ) -> str:
         """
         Run one engineer request through the agentic loop.
@@ -2831,6 +3242,13 @@ class LLMClient:
             on_warning:    Optional callback(notice) for one-shot context-window
                            diagnostics (fixed overhead over budget, budget
                            exceeded with nothing to compact).
+            on_turn_failure: Optional callback(category) fired once when the
+                           turn ends in a fatal failure (iteration cap, LLM
+                           error, tool interrupt/timeout, framework or
+                           compaction error).  Carries the structured
+                           LLMTurnFailure category so the UI does not have to
+                           infer failures from reply text (issue #191); NOT
+                           called when the turn completes normally.
             images:        Optional list of dicts {"media_type": "image/png",
                            "data": "<base64>"} attached to this user message.
             cancel_event:  Set by the UI Stop button.  Tool calls observe it
@@ -2859,7 +3277,10 @@ class LLMClient:
             system, on_compacted, on_warning=on_warning, tools_est_tokens=tools_est
         )
         if compact_error:
-            return f"[Error] {compact_error}"
+            reply = f"[Error] {compact_error}"
+            log.warning("LLM turn failed: %s", reply)
+            _signal_turn_failure(on_turn_failure, LLMTurnFailure.COMPACTION_ERROR)
+            return reply
 
         tools = self._build_request_tools()
         missing_policies = get_missing_tool_policies(
@@ -2870,16 +3291,19 @@ class LLMClient:
             ]
         )
         if missing_policies:
-            return "[Framework error] Tool policy registry is missing entries for: " + ", ".join(
+            reply = "[Framework error] Tool policy registry is missing entries for: " + ", ".join(
                 missing_policies
             )
+            log.warning("LLM turn failed: %s", reply)
+            _signal_turn_failure(on_turn_failure, LLMTurnFailure.FRAMEWORK_ERROR)
+            return reply
 
         state = _ToolExecutionState()
         reply: str | None = None
         is_final_text = False
 
         try:
-            for _ in range(20):  # max 20 iterations (guard against infinite loops)
+            for _ in range(_MAX_ITERATIONS):  # guard against infinite loops (issue #190)
                 # Rebuild the request tool list every iteration: tools enabled
                 # in a previous iteration must have their full schema in the
                 # NEXT request, not just in this loop's enabled-set (issue #129).
@@ -2888,6 +3312,8 @@ class LLMClient:
 
                 if response.get("error"):
                     reply = f"[LLM error] {response['error']}"
+                    log.warning("LLM turn failed: %s", reply)
+                    _signal_turn_failure(on_turn_failure, LLMTurnFailure.LLM_ERROR)
                     break
 
                 message = response.get("message", {})
@@ -2934,6 +3360,26 @@ class LLMClient:
                             name, args, state, on_tool_call, cancel_event
                         )
 
+                    if (
+                        isinstance(result, dict)
+                        and name in _STATUS_POLL_TOOLS
+                        and result.get("running")
+                        and not result.get("interrupted")
+                        and not result.get("timed_out")
+                    ):
+                        # A status poll for a background operation that is still
+                        # running.  Block here (bounded by the per-call timeout)
+                        # instead of making the model burn one iteration per poll
+                        # round (issue #190); the result stays a plain status
+                        # snapshot, so model-side poll logic is unchanged.
+                        result = self._wait_for_background_op(
+                            name,
+                            args,
+                            result,
+                            cancel_event,
+                            on_stream_event=on_stream_event,
+                        )
+
                     # Image-bearing tool results (e.g. export_pcb_layer_image)
                     # carry the PNG as a separate MCP image block.  Peel it off
                     # the JSON text payload and relay it as an OpenAI-style
@@ -2966,6 +3412,13 @@ class LLMClient:
                             if result.get("interrupted")
                             else f"[Error] {result['error']}"
                         )
+                        log.warning("LLM turn failed: %s", reply)
+                        _signal_turn_failure(
+                            on_turn_failure,
+                            LLMTurnFailure.INTERRUPTED
+                            if result.get("interrupted")
+                            else LLMTurnFailure.TIMED_OUT,
+                        )
                         # The rest of the batch is skipped (not executed):
                         # every tool_call_id in the saved assistant message
                         # must still get a recorded result, or the next turn's
@@ -2996,12 +3449,19 @@ class LLMClient:
                             ],
                         }
                     )
+                # Issue #208: auto-inject frontmatter-declared skill guides.
+                # Must run strictly after the whole tool-results batch — a
+                # user message between the assistant tool_calls message and
+                # its role:"tool" results breaks provider pairing validation.
+                self._inject_skill_guides(tool_calls)
                 if aborted_turn:
                     break
             else:
                 reply = (
                     "[Error] Maximum tool-call iterations reached. Please try a simpler request."
                 )
+                log.warning("LLM turn failed: %s", reply)
+                _signal_turn_failure(on_turn_failure, LLMTurnFailure.ITERATION_CAP)
         finally:
             # Single shared flush for every exit path (final reply, LLM error,
             # iteration cap, or an escaping exception): keep the KiCad reload in
@@ -3021,7 +3481,11 @@ class LLMClient:
 
         if is_final_text:
             self._history.append({"role": "assistant", "content": reply})
-        return reply if reply is not None else "[Error] Unknown failure."
+        if reply is None:
+            reply = "[Error] Unknown failure."
+            log.warning("LLM turn failed: %s", reply)
+            _signal_turn_failure(on_turn_failure, LLMTurnFailure.UNKNOWN_FAILURE)
+        return reply
 
     @staticmethod
     def _build_user_content(
@@ -3095,6 +3559,10 @@ class LLMClient:
             for t in tools_raw
         ]
         self._tool_registry = {d["function"]["name"]: d for d in converted}
+        # The registry may have been populated after the skill map was built
+        # (first turn while the backend was still starting): surface the
+        # drift warning now that the catalog is known.
+        self._warn_missing_declared_tools()
         return converted
 
     def _call_llm(self, system: str, tools: list[dict], on_stream_event=None) -> dict[str, Any]:

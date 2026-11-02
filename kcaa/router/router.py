@@ -80,7 +80,16 @@ from kcaa.router.path_postprocess import (
 )
 from kcaa.router.pns.direction45 import CornerMode
 from kcaa.router.pns.shove import TrackObstacle
-from kcaa.router.route_engine import PnsFailure, _audit_final_copper, route_engine
+from kcaa.router.route_engine import (
+    PnsFailure,
+    _audit_final_copper,
+    _dedupe,
+    _merge_family_chain,
+    family_hulls,
+    merge_parallel_diagonals,
+    moved_pairs_for_layer,
+    route_engine,
+)
 from kcaa.router.via_check import ProposedVia, check_vias
 from kcaa.router.visibility_graph import RouteNode
 from kcaa.router.world_model import Obstacle, _get_net, build_world_model
@@ -208,6 +217,7 @@ class RouteRequest:
             tuple[float, float] | None,  # pad_b size (w, h); None = custom pad w/o (size ...)
             str | None,  # pad_b net
             frozenset[str],  # pad_b copper layers
+            float,  # pad_b own absolute board-space rotation (KiCad 10)
         ]
         | None
     ) = None  # internal: candidate pad for auto-retry; not a user knob
@@ -322,10 +332,10 @@ def auto_route_pair(req: RouteRequest, data: list | None = None) -> RouteResult:
             failures: list[str] = []
             seen_msgs: set[str] = set()
             for cand in ranked:
-                center, size, net, layers = cand
+                center, size, net, layers, rot = cand
                 sub = replace(
                     req,
-                    pad_b_override=(center, size, net, layers),
+                    pad_b_override=(center, size, net, layers, rot),
                 )
                 try:
                     return auto_route_pair(sub, data=data0)
@@ -422,12 +432,14 @@ def auto_route_pair(req: RouteRequest, data: list | None = None) -> RouteResult:
         pad_b_size_override = req.pad_b_override[1]
         pad_b_net_override = req.pad_b_override[2]
         pad_b_layers_override = req.pad_b_override[3]
+        pad_b_rot_override = req.pad_b_override[4]
     else:
         # Regular (single-pad or first-of-multi) resolution.
         pad_b_xy = _find_pad_center(data, req.ref_b, req.pad_b, end_layer)
         pad_b_size_override = None
         pad_b_net_override = None
         pad_b_layers_override = None
+        pad_b_rot_override = None
     if pad_a_xy is None:
         if _find_pad_center(data, req.ref_a, req.pad_a) is None:
             raise RouteFailure(f"Pad {req.ref_a}/{req.pad_a} not found")
@@ -545,6 +557,20 @@ def auto_route_pair(req: RouteRequest, data: list | None = None) -> RouteResult:
     )
     pad_a_size = pad_a_world_size if pad_a_world_size and _is_rect(pad_a_world_size) else None
     pad_b_size = pad_b_world_size if pad_b_world_size and _is_rect(pad_b_world_size) else None
+
+    # Pad's own absolute board-space rotation (KiCad 10: a pad's ``at``
+    # rotation is an absolute angle, so it rotates the pad rectangle
+    # directly -- never fp_rot + pad_rot).  Threaded into the exit-wire
+    # builders so the wire is computed against the rotated pad rect
+    # instead of its world AABB.  Matching follows the SIZE resolution
+    # exactly: first same-named pad on the copper layer, or the pinned
+    # retry candidate's OWN rotation.
+    pad_a_rot = _find_pad_rotation(data, req.ref_a, req.pad_a, start_layer)
+    pad_b_rot = (
+        pad_b_rot_override
+        if req.pad_b_override is not None
+        else _find_pad_rotation(data, req.ref_b, req.pad_b, end_layer)
+    )
 
     # For multi-layer routing, clear the start/end pad areas from the
     # obstacle grid so A* can start from / end at the pad centres.
@@ -777,11 +803,15 @@ def auto_route_pair(req: RouteRequest, data: list | None = None) -> RouteResult:
                 # Pad replacement (start/end segments only).
                 if is_first and pad_a_size is not None:
                     n_before = len(pts)
-                    pts = _replace_pad_path(pts, pad_a_xy, pad_a_size, from_center=True)
+                    pts = _replace_pad_path(
+                        pts, pad_a_xy, pad_a_size, from_center=True, rot=pad_a_rot
+                    )
                     _log_path(f"{prefix}-pad-replace", pts, n_before)
                 elif is_last and pad_b_size is not None:
                     n_before = len(pts)
-                    pts = _replace_pad_path(pts, pad_b_xy, pad_b_size, from_center=False)
+                    pts = _replace_pad_path(
+                        pts, pad_b_xy, pad_b_size, from_center=False, rot=pad_b_rot
+                    )
                     _log_path(f"{prefix}-pad-replace", pts, n_before)
                 _dump_viz(f"{prefix}-1-pad-replace", pts, _pad_viz, obs, route_bbox)
 
@@ -889,13 +919,13 @@ def auto_route_pair(req: RouteRequest, data: list | None = None) -> RouteResult:
             if pad_a_size is not None:
                 n_before = len(best_path_pts)
                 best_path_pts = _replace_pad_path(
-                    best_path_pts, pad_a_xy, pad_a_size, from_center=True
+                    best_path_pts, pad_a_xy, pad_a_size, from_center=True, rot=pad_a_rot
                 )
                 _log_path("pad_a-replace", best_path_pts, n_before)
             if pad_b_size is not None:
                 n_before = len(best_path_pts)
                 best_path_pts = _replace_pad_path(
-                    best_path_pts, pad_b_xy, pad_b_size, from_center=False
+                    best_path_pts, pad_b_xy, pad_b_size, from_center=False, rot=pad_b_rot
                 )
                 _log_path("pad_b-replace", best_path_pts, n_before)
             _dump_viz("1-pad-replace", best_path_pts, _pad_viz, buffered, route_bbox)
@@ -1002,6 +1032,10 @@ def auto_route_pair(req: RouteRequest, data: list | None = None) -> RouteResult:
         # by leg k can be re-landed onto leg 1..k-1 copper by a later leg,
         # or the write path would fork the track (see _collapse_moved_pairs).
         prev_leg_polylines: list[tuple[str, list[tuple[float, float]]]] = []
+        # Obstacle ids whose copper was displaced (the engine exempts
+        # their stale file positions from the audit); the post-leg merge
+        # audit needs the same exemption.
+        moved_origin_ids: set[int] = set()
         # Per-leg direct emission: None -> the leg keeps the postprocess
         # (mitered straight) output below; otherwise the skeleton
         # segments / arcs emitted straight from eng.trace.
@@ -1108,11 +1142,12 @@ def auto_route_pair(req: RouteRequest, data: list | None = None) -> RouteResult:
             )
             pushed.extend(eng.shoved_tracks)
             moved_pairs.extend(eng.moved_pairs)
+            moved_origin_ids.update(eng.orig_obstacle_ids)
             pts = list(eng.path)
             if li == 0 and pad_a_size is not None:
-                pts = _replace_pad_path(pts, pad_a_xy, pad_a_size, from_center=True)
+                pts = _replace_pad_path(pts, pad_a_xy, pad_a_size, from_center=True, rot=pad_a_rot)
             elif li == n_legs - 1 and pad_b_size is not None:
-                pts = _replace_pad_path(pts, pad_b_xy, pad_b_size, from_center=False)
+                pts = _replace_pad_path(pts, pad_b_xy, pad_b_size, from_center=False, rot=pad_b_rot)
 
             # Per-leg rounded-corner arcs (rounded corner modes only —
             # mitered45 skeletons carry no trace arcs, so emit_leg
@@ -1130,9 +1165,13 @@ def auto_route_pair(req: RouteRequest, data: list | None = None) -> RouteResult:
             if eng.trace is not None:
                 leg_pts = list(eng.trace.points)
                 if li == 0 and pad_a_size is not None:
-                    leg_pts = _replace_pad_path(leg_pts, pad_a_xy, pad_a_size, from_center=True)
+                    leg_pts = _replace_pad_path(
+                        leg_pts, pad_a_xy, pad_a_size, from_center=True, rot=pad_a_rot
+                    )
                 elif li == n_legs - 1 and pad_b_size is not None:
-                    leg_pts = _replace_pad_path(leg_pts, pad_b_xy, pad_b_size, from_center=False)
+                    leg_pts = _replace_pad_path(
+                        leg_pts, pad_b_xy, pad_b_size, from_center=False, rot=pad_b_rot
+                    )
                 emit_leg = (
                     len(leg_pts) == len(eng.trace.points)
                     and all(_pt_eq(p, q) for p, q in zip(leg_pts, eng.trace.points))
@@ -1221,10 +1260,135 @@ def auto_route_pair(req: RouteRequest, data: list | None = None) -> RouteResult:
             # stage of every later leg (see the extra_fixed block above).
             prev_leg_polylines.append((layer, list(node_pts)))
 
+        def merge_concatenated_legs() -> None:
+            """Merge 45-family staircases across leg boundaries (#217).
+
+            Each leg is optimized by the engine's own passes, but the
+            waypoint stair #217 reports spans a leg boundary: leg N ends
+            at the waypoint, leg N+1 starts from it, and the walkaround
+            bridges the pad corner with a sub-width z-step split over
+            both legs.  Per-leg merging cannot see it, so the same
+            module-level pass runs once on the concatenated centerline.
+
+            Leg-boundary vertices are merge candidates, not hard
+            constraints: a waypoint that survives as an interior point
+            of a merged segment still lies on the path (distance 0), and
+            the acceptance gate rejects any candidate that would push a
+            waypoint farther than its ``tol_mm``.  Via anchors stay
+            pinned automatically (they end one layer run and start the
+            next, and run endpoints are never merged away), as do the
+            pad centres that terminate the chain.
+
+            Obstacles and hulls are built exactly as the engine builds
+            them for that layer (``family_hulls``), and every candidate
+            is judged by the same ``_audit_final_copper`` the engine
+            applies, so a merge can never trade segments for a DRC
+            error.
+            """
+            nonlocal all_nodes
+            if corner_mode not in (CornerMode.MITERED_45, CornerMode.ROUNDED_45):
+                return
+            anchors = [
+                (_anchor_pos(spec, "waypoint"), float(spec.get("tol_mm", 0.0)))
+                for spec in req.waypoints
+                if spec.get("kind") == "waypoint"
+                and _anchor_pos(spec, "waypoint") not in violated_waypoints
+            ]
+            board_limit = None
+            if model.board_outline is not None and not model.board_outline.is_empty:
+                board_limit = model.board_outline.buffer(-(width / 2.0))
+                if board_limit.is_empty:
+                    board_limit = None
+            nodes = list(all_nodes)
+            changed = False
+            start = 0
+            while start < len(nodes):
+                layer = nodes[start].layer
+                stop = start
+                while stop + 1 < len(nodes) and nodes[stop + 1].layer == layer:
+                    stop += 1
+                pts = _merge_family_chain(_dedupe([(nd.x, nd.y) for nd in nodes[start : stop + 1]]))
+                if len(pts) >= 4:
+                    run_obstacles = _layer_engine_obstacles(
+                        model,
+                        data,
+                        req,
+                        start_layer,
+                        end_layer,
+                        layer,
+                        pad_a_xy,
+                        pad_b_xy,
+                    )
+
+                    # The hull set and audit are single-layer: only this
+                    # layer's foreign-net displaced tracks may veto.
+                    layer_moved = moved_pairs_for_layer(moved_pairs, layer, req.net)
+
+                    def audit_candidate(
+                        cand: list[tuple[float, float]],
+                        obstacles=run_obstacles,
+                        moved=layer_moved,
+                    ) -> bool:
+                        try:
+                            _audit_final_copper(
+                                out_path=cand,
+                                width=width,
+                                net=req.net,
+                                obstacles=obstacles,
+                                extra_fixed=(),
+                                moved_pairs=moved,
+                                orig_obstacle_ids=moved_origin_ids,
+                                clearance=clearance,
+                            )
+                        except PnsFailure:
+                            return False
+                        return True
+
+                    merged = merge_parallel_diagonals(
+                        pts,
+                        family_hulls(
+                            [o for o in run_obstacles if o.net != req.net],
+                            clearance,
+                            width,
+                            layer_moved,
+                        ),
+                        width,
+                        board_limit=board_limit,
+                        audit=audit_candidate,
+                        anchors=anchors,
+                        # A waypoint is an anchor, not just a tolerance
+                        # circle: keep its projection as a vertex so the
+                        # downstream miter/snap stages cannot slide the
+                        # emitted chain off it.
+                        keep_anchor_vertices=True,
+                    )
+                    if merged != pts:
+                        changed = True
+                        for k, (x, y) in enumerate(merged):
+                            nodes[start + k] = RouteNode(
+                                x=x,
+                                y=y,
+                                layer=layer,
+                                node_id=nodes[start + k].node_id,
+                            )
+                        del nodes[start + len(merged) : stop + 1]
+                start = stop + 1
+            all_nodes = nodes
+            if changed and anchors:
+                merged_line = LineString([(nd.x, nd.y) for nd in all_nodes])
+                for wpt, tol in anchors:
+                    print(
+                        f"  [route] merged leg boundary: waypoint "
+                        f"({wpt[0]:.3f}, {wpt[1]:.3f}) is "
+                        f"{float(merged_line.distance(Point(*wpt))):.4f} mm "
+                        f"from the centerline (tol {tol:.3f})"
+                    )
+
         def finalize_legs() -> None:
             """Postprocess the emitted leg nodes and re-assemble per-leg
             direct (skeleton) emission on top of the mitered output."""
             nonlocal segs, vias, arcs_out, start_xy, end_xy, layers_used
+            merge_concatenated_legs()
             segs, vias = postprocess_path(
                 all_nodes,
                 width=width,
@@ -1884,13 +2048,13 @@ def auto_route_pair(req: RouteRequest, data: list | None = None) -> RouteResult:
             if pad_a_size is not None:
                 n_before = len(best_path_pts)
                 best_path_pts = _replace_pad_path(
-                    best_path_pts, pad_a_xy, pad_a_size, from_center=True
+                    best_path_pts, pad_a_xy, pad_a_size, from_center=True, rot=pad_a_rot
                 )
                 _log_path("pad_a-replace", best_path_pts, n_before)
             if pad_b_size is not None:
                 n_before = len(best_path_pts)
                 best_path_pts = _replace_pad_path(
-                    best_path_pts, pad_b_xy, pad_b_size, from_center=False
+                    best_path_pts, pad_b_xy, pad_b_size, from_center=False, rot=pad_b_rot
                 )
                 _log_path("pad_b-replace", best_path_pts, n_before)
             _dump_viz("1-pad-replace", best_path_pts, _pad_viz, buffered, route_bbox)
@@ -2658,10 +2822,18 @@ def _replace_pad_path(
     center: tuple[float, float],
     size: tuple[float, float],
     from_center: bool,
+    rot: float = 0.0,
 ) -> list[tuple[float, float]]:
     """Drop the A* path inside a rectangular pad and replace it with a
-    single axis-aligned wire.  Direction (horizontal vs vertical) is
-    determined by which AABB edge the first outside point is on."""
+    single exit wire.  Direction (horizontal vs vertical) is determined
+    by which edge of the pad's world AABB the first outside point is on,
+    EXCEPT that ``rot`` (the pad's own absolute board-space rotation,
+    KiCad 10 convention) rotates the exit geometry: for pads that are
+    axis-aligned in world space (rotation effectively 0/90/180/270) the
+    wire stays the legacy axis-aligned pair; for pads rotated at
+    arbitrary angles the wire's fence is the intersection of the outward
+    direction with the ROTATED pad rect (the real copper edge), so the
+    track stays on copper until the actual boundary."""
 
     w, h = size
     cx, cy = center
@@ -2674,7 +2846,7 @@ def _replace_pad_path(
             if not _inside_rect(path[k], center, hw, hh):
                 fx, fy = path[k - 1]
                 ox, oy = path[k]
-                keep = _build_pad_wire(cx, cy, fx, fy, ox, oy, minx, maxx, miny, maxy)
+                keep = _build_pad_wire(cx, cy, fx, fy, ox, oy, minx, maxx, miny, maxy, rot)
                 # keep = [projection, fence].  The caller keeps the pad
                 # centre: the wire must start exactly at the centre, so a
                 # subsequent endpoint alignment has no X/Y translation to
@@ -2693,7 +2865,7 @@ def _replace_pad_path(
                 fx, fy = path[k + 1]
                 ox, oy = path[k]
                 # Same (center, fence) order -- reverse so path reads [fence, projection].
-                keep = _build_pad_wire(cx, cy, fx, fy, ox, oy, minx, maxx, miny, maxy)
+                keep = _build_pad_wire(cx, cy, fx, fy, ox, oy, minx, maxx, miny, maxy, rot)
                 # Symmetric: pad wire must end exactly at the pad centre.
                 wire = keep[::-1]
                 if not _pt_eq(wire[-1], center):
@@ -2723,30 +2895,82 @@ def _build_pad_wire(
     maxx: float,
     miny: float,
     maxy: float,
+    rot: float = 0.0,
 ) -> list[tuple[float, float]]:
-    """Return ``[projection, fence]`` -- a single axis-aligned segment
-    along the AABB edge the outside point exits from.  The centre is
-    kept by the caller (``_replace_pad_path``), and the whole chain
-    is translated by ``_align_path_endpoints``."""
+    """Return ``[projection, fence]`` for the pad exit wire.
 
+    ``(x1, y1)`` is the pad centre, ``(x2, y2)`` the last point inside
+    the pad (first for the entry side), ``(ox, oy)`` the first outside
+    point, and the min/max extents bound the pad's world AABB.  ``rot``
+    is the pad's own absolute board-space rotation (KiCad 10: an
+    absolute angle --- never fp_rot + pad_rot).
+
+    Pads axis-aligned in world space (rotation effectively 0/90/180/270)
+    keep the legacy single axis-aligned pair ending on the AABB edge the
+    outside point leaves from (byte-identical output).  Pads rotated at
+    arbitrary angles get the fence at the intersection of the outward
+    ray (centre -> outside point) with the ROTATED pad rect -- the real
+    copper edge -- so the wire stays on copper until the boundary
+    instead of leaving it at the oversized AABB edge.
+
+    The centre is kept by the caller (``_replace_pad_path``), and the
+    whole chain is translated by ``_align_path_endpoints``."""
+
+    # Centre and last-inside point already share an axis: nothing to
+    # bend -- keep the direct pair (legacy behaviour).  For a rotated
+    # pad this point may sit off the copper, so the ray intersection
+    # below is used instead.
     if abs(x1 - x2) < 1e-6 or abs(y1 - y2) < 1e-6:
-        return [(x1, y1), (x2, y2)]
+        if abs(rot % 90.0) < 1e-6:
+            return [(x1, y1), (x2, y2)]
 
-    h_exit = ox <= minx or ox >= maxx
-    v_exit = oy <= miny or oy >= maxy
-    if h_exit and not v_exit:
-        horizontal = True
-    elif v_exit and not h_exit:
-        horizontal = False
-    else:
-        horizontal = abs(ox - x1) >= abs(oy - y1)
+    if abs(rot % 90.0) < 1e-6:
+        h_exit = ox <= minx or ox >= maxx
+        v_exit = oy <= miny or oy >= maxy
+        if h_exit and not v_exit:
+            horizontal = True
+        elif v_exit and not h_exit:
+            horizontal = False
+        else:
+            horizontal = abs(ox - x1) >= abs(oy - y1)
 
-    if horizontal:
-        # fence on left/right edge -> horizontal wire at fence_y
-        return [(x1, y2), (x2, y2)]
+        if horizontal:
+            # fence on left/right edge -> horizontal wire at fence_y
+            return [(x1, y2), (x2, y2)]
+        else:
+            # fence on top/bottom edge -> vertical wire at fence_x
+            return [(x2, y1), (x2, y2)]
+
+    # Rotated pad: the copper is the pad rect (half-extents hw/hh)
+    # rotated by ``rot`` about the centre, inscribed in the world AABB.
+    # Work in the pad's local frame (rotate the outward ray by -rot),
+    # where the rect is axis-aligned: the ray exits through the first
+    # face it meets, at distance t.  The centre is inside the rect and
+    # the outside point is outside it, so the ray always meets a face
+    # (t is finite).  On an exact corner tie (tx == ty) the exit is
+    # taken on the local x face -- deterministic.
+    hw, hh = (maxx - minx) / 2.0, (maxy - miny) / 2.0
+    rad = math.radians(rot)
+    c, s = math.cos(rad), math.sin(rad)
+    dx, dy = ox - x1, oy - y1
+    ldx, ldy = c * dx - s * dy, s * dx + c * dy
+    tx = hw / abs(ldx) if abs(ldx) > 1e-12 else math.inf
+    ty = hh / abs(ldy) if abs(ldy) > 1e-12 else math.inf
+    t = min(tx, ty)
+    lex, ley = t * ldx, t * ldy
+    wex, wey = _rotate(lex, ley, rot)
+    fence = (x1 + wex, y1 + wey)
+    if tx <= ty:
+        # Exits through the rect's local left/right face: the projection
+        # keeps the local x of the centre (mirrors the axis-aligned
+        # horizontal-wire case).
+        pwx, pwy = _rotate(0.0, ley, rot)
+        projection = (x1 + pwx, y1 + pwy)
     else:
-        # fence on top/bottom edge -> vertical wire at fence_x
-        return [(x2, y1), (x2, y2)]
+        # Exits through the rect's local top/bottom face.
+        pwx, pwy = _rotate(lex, 0.0, rot)
+        projection = (x1 + pwx, y1 + pwy)
+    return [projection, fence]
 
 
 # ---------------------------------------------------------------------------
@@ -3674,6 +3898,42 @@ def _find_pad_size(
     return None
 
 
+def _find_pad_rotation(
+    data: list,
+    ref: str,
+    pad_name: str,
+    layer: str,
+) -> float:
+    """Return the named pad's own absolute board-space rotation (``at`` rot).
+
+    KiCad 10 stores a pad's ``at`` rotation as an *absolute* board-space
+    angle (CCW-positive, same convention as the footprint's own file
+    rotation; see ``pcb_footprint_utils.py``), so this value rotates the
+    pad's rectangle directly -- the footprint rotation is NOT added.
+    ``0.0`` when the pad's ``at`` node has no explicit rotation.
+
+    Matching mirrors :func:`_find_pad_size`: the first same-named pad
+    whose copper covers ``layer`` wins, so size and rotation always come
+    from the SAME pad.
+    """
+    fp = _find_footprint(data, ref)
+    if fp is None:
+        return 0.0
+    for sub in fp:
+        if not _is_list(sub):
+            continue
+        if str(sub[0]) != "pad":
+            continue
+        if _get_pad_name(sub) != pad_name:
+            continue
+        if layer not in _pad_layers(sub):
+            # Another pad with this name may carry the requested layer.
+            continue
+        _, _, rot = _node_at3(sub)
+        return rot
+    return 0.0
+
+
 def _fp_rotation(data: list, ref: str) -> float:
     """Return the footprint's rotation angle, or 0.0 if not found."""
     fp = _find_footprint(data, ref)
@@ -3947,6 +4207,7 @@ def _collect_pad_candidates(
         tuple[float, float],  # pad size (w, h)
         str | None,  # net
         frozenset[str],  # copper layers
+        float,  # pad's own absolute board-space rotation (KiCad 10)
     ]
 ]:
     """All same-named pads on ``ref`` whose copper covers ``layer``.
@@ -3962,7 +4223,9 @@ def _collect_pad_candidates(
     if fp is None:
         return []
     fp_x, fp_y, fp_rot = _node_at3(fp)
-    out: list[tuple[tuple[float, float], tuple[float, float], str | None, frozenset[str]]] = []
+    out: list[
+        tuple[tuple[float, float], tuple[float, float], str | None, frozenset[str], float]
+    ] = []
     for sub in fp:
         if not _is_list(sub) or str(sub[0]) != "pad":
             continue
@@ -3988,14 +4251,19 @@ def _collect_pad_candidates(
                 size = (float(size_sub[1]), float(size_sub[2]))
             except (TypeError, ValueError):
                 size = None
-        out.append(((fp_x + wx, fp_y + wy), size, _get_net(sub), copper))
+        # Per-candidate rotation: the candidate's OWN ``at[3]`` (absolute
+        # board-space in KiCad 10), matching its own size above.
+        _, _, rot = _node_at3(sub)
+        out.append(((fp_x + wx, fp_y + wy), size, _get_net(sub), copper, rot))
     return out
 
 
 def _rank_pad_candidates(
-    candidates: list[tuple[tuple[float, float], tuple[float, float], str | None, frozenset[str]]],
+    candidates: list[
+        tuple[tuple[float, float], tuple[float, float], str | None, frozenset[str], float]
+    ],
     near: tuple[float, float] | None,
-) -> list[tuple[tuple[float, float], tuple[float, float], str | None, frozenset[str]]]:
+) -> list[tuple[tuple[float, float], tuple[float, float], str | None, frozenset[str], float]]:
     """Same-named pad candidates, closest-to-``near`` first.
 
     ``near`` is the opposite endpoint's world center.  Pads closer to

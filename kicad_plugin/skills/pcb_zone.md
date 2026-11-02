@@ -2,6 +2,7 @@
 name: pcb-zone
 priority: 50
 description: "Copper pour & keepout zone CRUD, zone refill via IPC, polygon geometry"
+tools: [list_zones, add_zone, delete_zone, refill_zones]
 ---
 # Tools overview
 - **list_zones** — List all zones in a PCB file, distinguished by type (copper_pour / keepout).

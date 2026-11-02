@@ -2,6 +2,7 @@
 name: pcb-outline
 priority: 40
 description: "Board Edge.Cuts creation and editing workflow"
+tools: [get_board_outline, set_board_outline_rect, add_board_outline_segment, add_board_outline_arc, clear_board_outline]
 ---
 # Board outline workflow
 - Query current Edge.Cuts geometry: **get_board_outline**.

@@ -19,6 +19,7 @@ import os
 import threading
 from typing import Any
 
+from .colors import ERR_HEX, WARN_HEX
 from .stream_events import apply_stream_event, make_ai_entry
 
 log = logging.getLogger(__name__)
@@ -63,6 +64,17 @@ def _strip_images_from_history(history: list[dict]) -> list[dict]:
 
 _IMAGE_PREVIEW_BYTES = 16
 
+# Upgrade dialog width budget.  The labels wrap at ``_UPGRADE_DIALOG_WRAP`` and
+# the dialog height comes from the laid-out sizer, so no platform font/DPI can
+# clip the hint; the minimum width stops it collapsing to a narrow column.
+_UPGRADE_DIALOG_WRAP = 440
+_UPGRADE_DIALOG_MIN_WIDTH = 460
+
+_EDITABLE_INSTALL_MESSAGE = (
+    "kcaa is installed in editable mode (source checkout); the panel will not "
+    "upgrade the plugin. Update the checkout and rerun setup_plugin.sh."
+)
+
 
 def _elide_tool_result_image(result: Any) -> Any:
     """Shallow-copy a tool result for UI display, eliding base64 image data.
@@ -90,6 +102,37 @@ def _elide_tool_result_image(result: Any) -> Any:
         "data": f"{data[:_IMAGE_PREVIEW_BYTES]}…[{len(data)} bytes]",
     }
     return out
+
+
+def _should_offer_update(latest: str, current: str) -> bool:
+    """Panel-side decision: offer an upgrade when the release tag differs."""
+    from .. import updater
+
+    return updater.is_update_available(latest, current)
+
+
+def _update_check_message(result, current: str, editable: bool = False) -> str | None:
+    """Message for a finished manual update check, or None to offer an upgrade.
+
+    ``result`` is an ``updater.CheckResult``.  The wording distinguishes an
+    unusable release (``metadata``) from a transport failure (``network`` /
+    ``timeout``), so the panel never blames the connection for a release that
+    simply lacks the assets the updater needs.  ``editable`` is the plugin
+    venv's PEP 610 editable state; a source ``kcaa`` install is never offered
+    an in-panel upgrade, so it always gets a message (no dialog, no banner).
+    """
+    from .. import updater
+
+    if result.info is None:
+        if result.reason == updater.CHECK_REASON_METADATA:
+            return "Could not check for updates: the latest release is missing required files."
+        return "Could not check for updates. Check your network connection and try again."
+
+    if editable:
+        return _EDITABLE_INSTALL_MESSAGE
+    if _should_offer_update(result.info.version, current):
+        return None
+    return f"You are running the latest version ({current})."
 
 
 if _WX_AVAILABLE:
@@ -204,6 +247,17 @@ if _WX_AVAILABLE:
             self._conv_version: int = 0
             self._saved_conv_version: int = 0
 
+            # ---- Self-update state ----
+            # One silent check per panel lifetime; manual checks may run later.
+            self._update_check_started: bool = False
+            self._update_check_running: bool = False
+            self._update_in_progress: bool = False
+            self._update_cancel_event: threading.Event | None = None
+            self._recovery_checked: bool = False
+            self._check_updates_item: Any | None = None
+            self._update_progress: Any | None = None
+            self._update_progress_timer: Any | None = None
+
             self._build_ui()
             self._start_server()
             self.Centre()
@@ -228,8 +282,8 @@ if _WX_AVAILABLE:
         _C_AI_HEX = "#008250"
         _C_TOOL_HEX = "#787878"
         _C_OK_HEX = "#008C00"
-        _C_WARN_HEX = "#BE6400"
-        _C_ERR_HEX = "#BE1E1E"
+        _C_WARN_HEX = WARN_HEX  # from ui/colors.py (single source of truth)
+        _C_ERR_HEX = ERR_HEX  # from ui/colors.py (single source of truth)
         _BG_CONV_HEX = "#F5F7FC"
 
         @staticmethod
@@ -493,7 +547,12 @@ if _WX_AVAILABLE:
 
             # Help menu
             self._menu_about_id = wx.NewIdRef()
+            self._menu_check_updates_id = wx.NewIdRef()
             help_menu = wx.Menu()
+            self._check_updates_item = help_menu.Append(
+                self._menu_check_updates_id, "Check for Updates\u2026"
+            )
+            help_menu.AppendSeparator()
             help_menu.Append(self._menu_about_id, "About\u2026")
             menu_bar.Append(help_menu, "&Help")
 
@@ -512,6 +571,7 @@ if _WX_AVAILABLE:
             self.Bind(wx.EVT_MENU, self._on_restart, id=self._menu_restart_id)
             self.Bind(wx.EVT_MENU, self._on_autoroute, id=self._menu_autoroute_id)
             self.Bind(wx.EVT_MENU, self._on_find, id=self._menu_find_id)
+            self.Bind(wx.EVT_MENU, self._on_check_for_updates, id=self._menu_check_updates_id)
             self.Bind(wx.EVT_MENU, self._on_about, id=self._menu_about_id)
             self._search_ctrl.Bind(wx.EVT_SEARCHCTRL_SEARCH_BTN, self._on_search)
             self._search_ctrl.Bind(wx.EVT_TEXT, self._on_search_text)
@@ -637,6 +697,18 @@ if _WX_AVAILABLE:
                         self._request_footprint_sync(project)
                 except Exception:
                     log.debug("project re-sync on panel show failed", exc_info=True)
+            if event.IsShown() and not self._recovery_checked:
+                # Restore an interrupted install before any update check.
+                self._recovery_checked = True
+                self._maybe_recover_interrupted_update()
+            if event.IsShown() and not self._update_check_started:
+                # Silent, once-per-panel-lifetime release check.  Failures
+                # stay in the log; a found update prompts the user.  Dev
+                # checkouts skip it (self-update refuses .git); the manual
+                # menu item still runs and surfaces that guard.
+                self._update_check_started = True
+                if not os.path.exists(os.path.join(self._plugin_dir(), ".git")):
+                    self._start_update_check(manual=False)
             event.Skip()
 
         # ------------------------------------------------------------------ #
@@ -979,6 +1051,19 @@ if _WX_AVAILABLE:
 
             def _run():
                 log.info("Background _run (%s): started", kind)
+                # Imported here (not module level) to keep llm_client lazily
+                # loaded until a turn actually runs.
+                from ..llm_client import LLMTurnFailure
+
+                # Structured turn-failure signal (issue #191, Plan A): set by
+                # run()'s on_turn_failure callback on a fatal exit, None for a
+                # normal turn, so the UI never colors replies by text prefix.
+                failure: LLMTurnFailure | None = None
+
+                def _on_turn_failure(category: LLMTurnFailure) -> None:
+                    nonlocal failure
+                    failure = category
+
                 try:
                     if kind == "chat":
                         # Extract PDF text before sending to LLM
@@ -1027,6 +1112,7 @@ if _WX_AVAILABLE:
                             ),
                             images=images,
                             cancel_event=self._cancel_event,
+                            on_turn_failure=_on_turn_failure,
                         )
                     else:  # tool_direct
                         self._llm_client.run(
@@ -1044,11 +1130,19 @@ if _WX_AVAILABLE:
                 except Exception as e:
                     log.exception("LLM request failed")
                     reply = f"[Error] {e}"
+                    failure = LLMTurnFailure.UNKNOWN_FAILURE
                 log.info("Background _run (%s): finished (reply_len=%d)", kind, len(reply))
                 # turn_end is the queue's final event: emitted after the
                 # reload_kicad / tool callbacks, so the consumer orders it
                 # strictly after the last text of the turn.
-                _emit({"type": "turn_end", "reply": reply, "ctx": ctx})
+                _emit(
+                    {
+                        "type": "turn_end",
+                        "reply": reply,
+                        "failure": None if failure is None else failure.value,
+                        "ctx": ctx,
+                    }
+                )
 
             threading.Thread(target=_run, daemon=True).start()
 
@@ -1085,7 +1179,9 @@ if _WX_AVAILABLE:
             from a wx.Image filled with the panel background colour instead.
             """
             if bg is None:
-                bg = wx.WHITE
+                # Explicit RGB: wx.WHITE is a null placeholder when KiCad's
+                # embedded wxPython never created a wx.App (see issue #225).
+                bg = wx.Colour(255, 255, 255)
             data = bytes((bg.Red(), bg.Green(), bg.Blue())) * (size * size)
             img = wx.Image(size, size, data)
             bmp = wx.Bitmap(img)
@@ -1106,10 +1202,17 @@ if _WX_AVAILABLE:
             20      ●─╮   ╭─●  ●───╯  ╰───●  ← arc 3 endpoints (12,20)(16,20)
             26      ╰───────────╯        ← arc 1: large U (bottom)
             """
+            if bg is None:
+                bg = wx.Colour(255, 255, 255)
             bmp, mdc = AssistantPanel._new_icon_bitmap(size, bg)
             pen = wx.Pen(wx.Colour(90, 90, 90), 2)
             mdc.SetPen(pen)
-            mdc.SetBrush(wx.TRANSPARENT_BRUSH)
+            # wxGCDCImpl::DoDrawEllipticArc() calls wxBrush::GetStyle(), which
+            # asserts IsOk().  wx.TRANSPARENT_BRUSH is a null placeholder in
+            # KiCad's embedded wxPython (no Python wx.App ran OnPreInit), and
+            # wx.MemoryDC is GCDC-backed on wxGTK3, so using it aborts KiCad.
+            # Filling with the icon's own background is visually identical.
+            mdc.SetBrush(wx.Brush(bg))
 
             # Arc 1: Large bottom U (opening up)
             # Center (14,20), r=6, bbox (8,14,12,12)
@@ -2006,6 +2109,340 @@ if _WX_AVAILABLE:
             _dlg.ShowModal()
             _dlg.Destroy()
 
+        # ---- Self-update handlers ----
+
+        def _plugin_dir(self) -> str:
+            """Absolute path of the plugin root (the directory holding VERSION)."""
+            return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+        def _set_check_updates_enabled(self, enabled: bool) -> None:
+            if self._check_updates_item is not None:
+                self._check_updates_item.Enable(enabled)
+
+        def _set_check_updates_label(self, version: str | None) -> None:
+            if self._check_updates_item is None:
+                return
+            if version:
+                label = f"Check for Updates (v{version} available)\u2026"
+            else:
+                label = "Check for Updates\u2026"
+            self._check_updates_item.SetItemLabel(label)
+
+        def _maybe_recover_interrupted_update(self) -> None:
+            """Offer to restore the newest backup left by a crashed update."""
+            from .. import updater
+
+            plugin_dir = self._plugin_dir()
+            try:
+                pending = updater.has_pending_recovery(plugin_dir)
+            except Exception:
+                log.debug("could not check for interrupted update", exc_info=True)
+                return
+            if not pending:
+                return
+
+            answer = wx.MessageBox(
+                "A previous plugin update was interrupted. Restore the previous "
+                "version from its backup now?",
+                "Recover interrupted update",
+                wx.YES_NO | wx.ICON_WARNING,
+                self,
+            )
+            if answer != wx.YES:
+                return
+
+            try:
+                backup_dir = updater.recover_incomplete_install(plugin_dir)
+            except Exception as exc:
+                log.error("interrupted update recovery failed: %s", exc, exc_info=True)
+                wx.MessageBox(
+                    f"Recovery failed.\n\n{exc}",
+                    "Recovery failed",
+                    wx.OK | wx.ICON_ERROR,
+                    self,
+                )
+                return
+
+            wx.MessageBox(
+                f"The previous version was restored from:\n{backup_dir}\n\n"
+                "Restart KiCad before using the plugin.",
+                "Recovery complete",
+                wx.OK | wx.ICON_INFORMATION,
+                self,
+            )
+
+        def _on_check_for_updates(self, event) -> None:
+            """Menu handler: Help → Check for Updates…"""
+            if self._update_in_progress:
+                return
+            self._start_update_check(manual=True)
+
+        def _start_update_check(self, manual: bool) -> None:
+            if self._update_check_running or self._update_in_progress:
+                return
+            self._update_check_running = True
+            self._set_check_updates_enabled(False)
+            plugin_dir = self._plugin_dir()
+
+            def _run():
+                result = None
+                current = ""
+                editable = False
+                try:
+                    from .. import updater
+
+                    current = updater.current_version(plugin_dir)
+                    result = updater.check_latest()
+                    editable = updater.installed_kcaa_info(plugin_dir).editable
+                except Exception:
+                    log.debug("update check failed", exc_info=True)
+                wx.CallAfter(self._on_update_check_done, result, current, manual, editable)
+
+            threading.Thread(target=_run, daemon=True).start()
+
+        def _on_update_check_done(
+            self, result, current: str, manual: bool, editable: bool = False
+        ) -> None:
+            self._update_check_running = False
+            self._set_check_updates_enabled(True)
+
+            from .. import updater
+
+            if result is None:
+                result = updater.CheckResult(info=None, reason=updater.CHECK_REASON_NETWORK)
+            log_fn = log.info if manual else log.debug
+            log_fn(
+                "update check: reason=%s version=%s editable=%s",
+                result.reason,
+                result.info.version if result.info is not None else None,
+                editable,
+            )
+
+            message = _update_check_message(result, current, editable=editable)
+            if message is not None:
+                if manual:
+                    icon = (
+                        wx.ICON_INFORMATION
+                        if result.reason == updater.CHECK_REASON_OK
+                        else wx.ICON_WARNING
+                    )
+                    wx.MessageBox(
+                        message,
+                        "Check for Updates",
+                        wx.OK | icon,
+                        self,
+                    )
+                return
+
+            if result.info is None:  # defensive: no upgrade without a release
+                return
+            self._set_check_updates_label(result.info.version)
+            self._prompt_upgrade(result.info, current)
+
+        def _prompt_upgrade(self, info, current: str) -> None:
+            dialog = wx.Dialog(self, wx.ID_ANY, "Update available")
+            sizer = wx.BoxSizer(wx.VERTICAL)
+
+            message = wx.StaticText(
+                dialog,
+                wx.ID_ANY,
+                f"Version {info.version} is available. You are running {current}.",
+            )
+            message.Wrap(_UPGRADE_DIALOG_WRAP)
+            sizer.Add(message, 0, wx.EXPAND | wx.ALL, 12)
+
+            hint = wx.StaticText(
+                dialog,
+                wx.ID_ANY,
+                "The plugin files and its kcaa package will be updated. "
+                "KiCad must be restarted afterwards.",
+            )
+            hint.Wrap(_UPGRADE_DIALOG_WRAP)
+            sizer.Add(hint, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 12)
+
+            button_sizer = wx.BoxSizer(wx.HORIZONTAL)
+            upgrade_btn = wx.Button(dialog, wx.ID_ANY, "Upgrade now")
+            later_btn = wx.Button(dialog, wx.ID_CANCEL, "Later")
+            page_btn = wx.Button(dialog, wx.ID_ANY, "Open release page")
+            button_sizer.Add(page_btn, 0, wx.RIGHT, 8)
+            button_sizer.AddStretchSpacer()
+            button_sizer.Add(later_btn, 0, wx.RIGHT, 8)
+            button_sizer.Add(upgrade_btn, 0)
+            sizer.Add(button_sizer, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 12)
+
+            choice = {"value": "later"}
+
+            def _choose(value: str):
+                def _handler(_event):
+                    choice["value"] = value
+                    dialog.EndModal(wx.ID_OK)
+
+                return _handler
+
+            upgrade_btn.Bind(wx.EVT_BUTTON, _choose("upgrade"))
+            page_btn.Bind(wx.EVT_BUTTON, _choose("page"))
+            # The wrapped labels' height depends on the platform font/DPI, so
+            # the dialog is fitted to the laid-out sizer instead of a fixed
+            # height (which clipped the restart hint); the width floor keeps
+            # it from collapsing on a small font.
+            dialog.SetSizerAndFit(sizer)
+            dialog.SetMinSize((_UPGRADE_DIALOG_MIN_WIDTH, -1))
+            dialog.CentreOnParent()
+            dialog.ShowModal()
+            dialog.Destroy()
+
+            if choice["value"] == "upgrade":
+                self._start_upgrade(info)
+            elif choice["value"] == "page":
+                from .. import updater
+
+                try:
+                    updater._checked_url(info.page_url)
+                except updater.UpdateError as exc:
+                    wx.MessageBox(
+                        f"Cannot open the release page: {exc}",
+                        "Update",
+                        wx.OK | wx.ICON_WARNING,
+                        self,
+                    )
+                else:
+                    wx.LaunchDefaultBrowser(info.page_url)
+
+        def _start_upgrade(self, info) -> None:
+            if self._update_in_progress:
+                return
+            self._update_in_progress = True
+            self._update_cancel_event = threading.Event()
+            try:
+                self._update_progress = wx.ProgressDialog(
+                    "Updating KiCad AI Assistant",
+                    f"Downloading version {info.version}\u2026",
+                    100,
+                    self,
+                    wx.PD_ELAPSED_TIME | wx.PD_AUTO_HIDE,
+                )
+                # The progress dialog is not a modal dialog, so block the panel
+                # explicitly for the duration of the install.
+                self.Disable()
+                self._update_progress.Enable()
+                # Pulse the gauge while the worker runs; actual percentages are
+                # pushed through _apply_update_progress.
+                self._update_progress.Pulse(f"Downloading version {info.version}\u2026")
+                self._update_progress_timer = wx.Timer(self)
+                self.Bind(
+                    wx.EVT_TIMER,
+                    self._on_update_progress_pulse,
+                    self._update_progress_timer,
+                )
+                self._update_progress_timer.Start(120)
+                threading.Thread(
+                    target=self._run_upgrade_worker,
+                    args=(info,),
+                    daemon=True,
+                ).start()
+            except Exception as exc:
+                self._update_in_progress = False
+                self._update_cancel_event = None
+                if self._update_progress_timer is not None:
+                    self._update_progress_timer.Stop()
+                    self._update_progress_timer = None
+                if self._update_progress is not None:
+                    self._update_progress.Destroy()
+                    self._update_progress = None
+                self.Enable()
+                log.error("could not start plugin update: %s", exc, exc_info=True)
+                wx.MessageBox(
+                    f"Could not start the update.\n\n{exc}",
+                    "Update failed",
+                    wx.OK | wx.ICON_ERROR,
+                    self,
+                )
+
+        def _on_update_progress_pulse(self, event) -> None:
+            if self._update_progress is not None:
+                self._update_progress.Pulse()
+
+        def _update_progress_cb(self, done: int, total: int | None) -> None:
+            # Called from the worker thread; marshal onto the GUI thread.
+            wx.CallAfter(self._apply_update_progress, done, total)
+
+        def _apply_update_progress(self, done: int, total: int | None) -> None:
+            if self._update_progress is None:
+                return
+            if total:
+                percent = max(0, min(100, int(done * 100 / total)))
+                self._update_progress.Pulse(f"Updating KiCad AI Assistant\u2026 {percent}%")
+
+        def _run_upgrade_worker(self, info) -> None:
+            error = ""
+            restored: bool | None = None
+            backup_dir: str | None = None
+            try:
+                import tempfile
+
+                from .. import updater
+
+                with tempfile.TemporaryDirectory(prefix="kcaa-update-") as tmp:
+                    download = updater.download_and_verify(
+                        info, tmp, progress_cb=self._update_progress_cb
+                    )
+                    updater.install_update(
+                        download.path,
+                        self._plugin_dir(),
+                        info.version,
+                        progress_cb=self._update_progress_cb,
+                        cancel_event=self._update_cancel_event,
+                        expected_sha256=download.sha256,
+                    )
+            except Exception as exc:
+                error = str(exc) or exc.__class__.__name__
+                restored = getattr(exc, "restored", None)
+                backup_dir = getattr(exc, "backup_dir", None)
+                log.error("plugin update failed: %s", exc, exc_info=True)
+            wx.CallAfter(self._on_upgrade_finished, info, error, restored, backup_dir)
+
+        def _on_upgrade_finished(
+            self,
+            info,
+            error: str,
+            restored: bool | None,
+            backup_dir: str | None,
+        ) -> None:
+            self._update_in_progress = False
+            self._update_cancel_event = None
+            self.Enable()
+            if self._update_progress_timer is not None:
+                self._update_progress_timer.Stop()
+                self._update_progress_timer = None
+            if self._update_progress is not None:
+                self._update_progress.Destroy()
+                self._update_progress = None
+
+            if error:
+                message = f"The update could not be installed.\n\n{error}"
+                if restored is True:
+                    message += "\n\nYour previous version was restored."
+                elif restored is False:
+                    where = f"\n\nA backup is kept at:\n{backup_dir}" if backup_dir else ""
+                    message += (
+                        "\n\nThe installation is in an inconsistent state." + where + "\n\n"
+                        "Restart KiCad before using the plugin, then reinstall if needed."
+                    )
+                wx.MessageBox(message, "Update failed", wx.OK | wx.ICON_ERROR, self)
+                return
+
+            self._set_check_updates_label(None)
+            message = (
+                f"KiCad AI Assistant was updated to version {info.version}.\n\n"
+                "Restart KiCad to apply the update."
+            )
+            wx.MessageBox(
+                message,
+                "Update complete",
+                wx.OK | wx.ICON_INFORMATION,
+                self,
+            )
+
         # ---- Search / Find handlers ----
 
         def _on_find(self, event) -> None:
@@ -2876,6 +3313,11 @@ if _WX_AVAILABLE:
         def _on_destroy(self, event) -> None:
             """Called when the wx window is actually destroyed (e.g. KiCad shutdown)."""
             if event.GetEventObject() is self:
+                if self._update_cancel_event is not None:
+                    self._update_cancel_event.set()
+                if self._update_progress_timer is not None:
+                    self._update_progress_timer.Stop()
+                    self._update_progress_timer = None
                 if self._project_watch_timer is not None:
                     self._project_watch_timer.Stop()
                 self._finalise_and_save_on_teardown()

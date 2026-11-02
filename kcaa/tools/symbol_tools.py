@@ -325,10 +325,14 @@ def register_symbol_tools(mcp: FastMCP) -> None:
         """
         Return the current status of the background symbol index sync.
 
-        Call this after sync_symbol_index to monitor progress. Poll every few
-        seconds until 'running' is False. When running is False and last_result
-        is present, the sync completed successfully. When running is False and
-        error is present, the sync failed.
+        Call this after sync_symbol_index to monitor progress.  When invoked
+        from the assistant loop, the client blocks on this call until the
+        sync finishes (progress notices appear in the UI) and returns the
+        final snapshot; the tool itself always returns a plain status
+        snapshot and may be called again if it still shows running True.
+        When running is False and last_result is present, the sync completed
+        successfully.  When running is False and error is present, the sync
+        failed.
         """
         with _sync_lock:
             state = {
@@ -463,31 +467,25 @@ def register_symbol_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
     async def list_symbol_libraries(
-        table: str | None = None,
         limit: int = 200,
         offset: int = 0,
         project_path: str | None = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """
-        List KiCad symbol libraries from the index.
+        List all indexed KiCad symbol libraries, flat and paginated.
 
         **Always prefer** ``search_symbols`` when looking for a specific
         component — it searches names, descriptions, and keywords across all
         libraries in one call and is far more token-efficient.
 
-        Use this tool only to **browse** the library tree:
-
-        - No arguments → returns a compact list of *table* names (the
-          top-level groupings such as ``"Device"``, ``"Regulator_Linear"``,
-          ``"power"``) with aggregated symbol counts.  Typically ~200 entries.
-        - ``table=<name>`` → returns individual libraries inside that table
-          (e.g. ``table="Device"`` lists ``"Device/R"``, ``"Device/C"``, …).
-          Use ``limit`` and ``offset`` to page through large tables.
+        Use this tool only to **browse**: it returns one row per library
+        (``name``, ``symbol_count``, ``file_path``) for every library in
+        scope, paged with ``limit``/``offset``.  When ``truncated`` is true
+        there are more libraries after this page; advance ``offset`` to
+        fetch them.
 
         Args:
-            table:  Table name to drill into (e.g. ``"Regulator_Linear"``).
-                    Omit to get the top-level table summary.
             limit:  Maximum entries to return (default 200, max 500).
             offset: 0-based entry offset for pagination (default 0).
             project_path: Optional path to a project directory or a file
@@ -506,49 +504,23 @@ def register_symbol_tools(mcp: FastMCP) -> None:
             mgr = _get_index_manager(project_path)
             libraries = mgr.get_all_libraries()
 
-            if table is None:
-                # Aggregate into table-level summaries.
-                table_counts: dict[str, int] = {}
-                for lib in libraries:
-                    tbl = lib.library_name.split("/")[0]
-                    table_counts[tbl] = table_counts.get(tbl, 0) + lib.symbol_count
-                tables_sorted = sorted(table_counts.items())
-                page = tables_sorted[offset : offset + limit]
-                return {
-                    "success": True,
-                    "mode": "tables",
-                    "total": len(tables_sorted),
-                    "offset": offset,
-                    "limit": limit,
-                    "truncated": (offset + limit) < len(tables_sorted),
-                    "tables": [{"name": t, "symbol_count": c} for t, c in page],
-                }
-            else:
-                # Filter to the requested table.
-                prefix = table + "/"
-                # Support both symdir style ("Device/R") and flat style ("Device")
-                matching = [
-                    lib
-                    for lib in libraries
-                    if lib.library_name.startswith(prefix) or lib.library_name == table
-                ]
-                page = matching[offset : offset + limit]
-                return {
-                    "success": True,
-                    "mode": "libraries",
-                    "table": table,
-                    "total": len(matching),
-                    "offset": offset,
-                    "limit": limit,
-                    "truncated": (offset + limit) < len(matching),
-                    "libraries": [
-                        {
-                            "name": lib.library_name,
-                            "symbol_count": lib.symbol_count,
-                        }
-                        for lib in page
-                    ],
-                }
+            page = libraries[offset : offset + limit]
+            out: dict[str, Any] = {
+                "success": True,
+                "total": len(libraries),
+                "offset": offset,
+                "limit": limit,
+                "truncated": (offset + limit) < len(libraries),
+                "libraries": [
+                    {
+                        "name": lib.library_name,
+                        "symbol_count": lib.symbol_count,
+                        "file_path": lib.file_path,
+                    }
+                    for lib in page
+                ],
+            }
+            return out
         except Exception as e:
             log.error(f"list_symbol_libraries failed: {e}", exc_info=True)
             return {"success": False, "error": str(e)}

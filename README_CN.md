@@ -6,6 +6,7 @@ KiCad AI Assistant 是一个 KiCad 动作插件，在 KiCad 内部直接嵌入�
 
 [![CI](https://github.com/paul356/KiCad-AI-Assistant/actions/workflows/ci.yml/badge.svg)](https://github.com/paul356/KiCad-AI-Assistant/actions/workflows/ci.yml)
 
+**欢迎贡献！** Bug 报告、功能建议和 Pull Request 都非常欢迎——参见[贡献指南](#贡献指南)了解如何开始。
 
 ## 目录
 

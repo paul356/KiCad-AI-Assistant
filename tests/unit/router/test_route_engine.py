@@ -6,20 +6,25 @@ import math
 
 import pytest
 import shapely.affinity
-from shapely.geometry import LineString, Polygon
+from shapely.geometry import LineString, Polygon, box
 
 from kcaa.router.pns.shove import ShoveFailure, TrackObstacle
 from kcaa.router.route_engine import (
     PnsFailure,
+    _absorb_terminal_stubs,
     _audit_final_copper,
     _coalesce_stub_pairs,
     _family_hull,
+    _merge_family_chain,
     _path_len,
     _rect_medians,
+    _shoulder_family_corners,
     _snap45_line,
     _track_centerline,
     _visibility_detour,
     _walkaround_solids,
+    merge_parallel_diagonals,
+    moved_pairs_for_layer,
     route_engine,
 )
 from kcaa.router.world_model import Obstacle
@@ -953,6 +958,297 @@ class TestDetourSegmentReduction:
         # (walkaround chord sampling + no family merge).
         assert n <= 8, f"detour splintered into {n} segments"
 
+    def test_detour_has_no_ninety_degree_turns(self):
+        # The lane detour used to enter and leave the parallel run with
+        # two 90-degree corners; every segment was already on the family,
+        # so the direction-only contract accepted them.  The shouldering
+        # pass replaces each with a 45-degree bisector.
+        res = self._route_around_pad()
+        out = res.path
+        assert _turns_le_45(out)
+        for a, b in zip(out, out[1:]):
+            assert math.hypot(b[0] - a[0], b[1] - a[1]) >= W - 1e-9
+
+
+J3_CENTER = (119.84, 90.4)
+J3_START = (118.98, 93.6275)
+J3_END = (120.05, 87.20)
+
+
+def _j3_walkaround_fixture():
+    """The J3.5 walkaround fixture shared by #214 and #217.
+
+    Builds the square pad footprint from the real J3.5 board, walks the
+    initial trace around it, snaps the walkaround onto the family and
+    coalesces the stub pairs, i.e. exactly the input both post-processors
+    see from the engine.  Returns ``(walked, hull, pad)``.
+    """
+    from shapely.geometry import box
+
+    from kcaa.router.pns.direction45 import CornerMode, build_initial_trace
+    from kcaa.router.pns.node import ObstacleNode
+
+    half = 0.85
+    cx, cy = J3_CENTER
+    shape = box(cx - half, cy - half, cx + half, cy + half)
+    pad = Obstacle(shape=shape, layers=frozenset({"F.Cu"}), net="J3", kind="pad")
+    skeleton = build_initial_trace(J3_START, J3_END, CornerMode.MITERED_45).as_polyline()
+    walked = _walkaround_solids(list(skeleton), ObstacleNode([pad]), W, 0.2)
+    hull = _family_hull(shape, 0.2 + 0.01 + W / 2.0)
+    walked = _snap45_line(walked, [hull])
+    walked = _coalesce_stub_pairs(walked)
+    return _merge_family_chain(walked), hull, pad
+
+
+class TestFamilyCornerShouldering:
+    """#214: 45-family routes must not emit 90-degree interior turns.
+
+    ``_line_is_family`` constrains segment directions only, so a family
+    path can still meet at 90 degrees (walkaround through a hull's flat
+    edge, or a parallel-lane stub).  The shouldering pass cuts such a
+    corner with the 45-degree bisector, turning one 90-degree turn into
+    two 45-degree turns without leaving the family."""
+
+    # Exact issue geometry: J3 pad 5, U1.29 -> C3.2 on /RESET.
+    J3_CENTER = (119.84, 90.4)
+    J3_START = (118.98, 93.6275)
+    J3_END = (120.05, 87.20)
+
+    def _walked_j3_path(self):
+        """The walkaround path that reproduces #214.
+
+        The issue's board gives the engine a square pad footprint for
+        J3.5; its family hull's flat north edge is what the vertical
+        skeleton leg hits perpendicularly.  Driving the walkaround
+        directly keeps the lane optimisation (which shifts the whole
+        run sideways) out of the fixture.
+        """
+        walked, hull, _pad = _j3_walkaround_fixture()
+        return walked, hull
+
+    def test_walkaround_flat_edge_reproduces_the_90_degree_corner(self):
+        """Characterisation fixture: the pre-fix walkaround output.
+
+        It pins the exact shape the shouldering pass exists to repair.
+        This is intentionally *not* a regression test — it asserts the
+        90-degree turn that the fix removes, so it must never be updated
+        to expect a clean path; the sibling test below covers the fix.
+        """
+        walked, _hull = self._walked_j3_path()
+        assert _segments_on_45(walked)
+        assert not _turns_le_45(walked)
+
+    def test_shouldering_removes_walkaround_ninety_degree_corners(self):
+        walked, hull = self._walked_j3_path()
+        out = _shoulder_family_corners(walked, [hull], W)
+        assert _turns_le_45(out)
+        assert _segments_on_45(out)
+        for a, b in zip(out, out[1:]):
+            assert math.hypot(b[0] - a[0], b[1] - a[1]) >= W - 1e-9
+        # The shoulder rides the hull's 45-degree chamfer: both cuts
+        # collapse into one long diagonal instead of a sub-width stub.
+        assert out[0] == self.J3_START and out[-1] == self.J3_END
+
+    def test_route_over_j3_pad_has_no_ninety_degree_turns(self):
+        # Acceptance fixture: exact J3 pad-5 geometry through the full
+        # engine (circle shape here; the shouldering pass must also fix
+        # the lane detour the engine prefers).
+        from shapely.geometry import Point
+
+        from kcaa.router.pns.direction45 import CornerMode
+
+        pad = Obstacle(
+            shape=Point(*self.J3_CENTER).buffer(0.85),
+            layers=frozenset({"F.Cu"}),
+            net="J3",
+            kind="pad",
+        )
+        res = route_engine(
+            self.J3_START,
+            self.J3_END,
+            [pad],
+            W,
+            0.2,
+            corner_mode=CornerMode.MITERED_45,
+        )
+        out = res.path
+        assert out[0] == self.J3_START and out[-1] == self.J3_END
+        assert _turns_le_45(out)
+        assert _segments_on_45(out)
+        for a, b in zip(out, out[1:]):
+            assert math.hypot(b[0] - a[0], b[1] - a[1]) >= W - 1e-9
+
+    def test_mitered90_keeps_manhattan_corners(self):
+        # 90-degree corners are the intended output in Manhattan modes;
+        # the shouldering pass must not fire there.
+        from shapely.geometry import Point
+
+        from kcaa.router.pns.direction45 import CornerMode
+
+        pad = Obstacle(
+            shape=Point(0, 0).buffer(1.0),
+            layers=frozenset({"F.Cu"}),
+            net=None,
+            kind="pad",
+        )
+        res = route_engine((-8, 0), (8, 0), [pad], W, CLR, corner_mode=CornerMode.MITERED_90)
+        assert not _turns_le_45(res.path)
+        assert _turns_in_family(res.path)
+
+    def test_rounded90_keeps_manhattan_corners(self):
+        # rounded90 is a Manhattan corner mode too; adding it to the
+        # shouldering gate would silently convert its 90s to 45s.
+        from shapely.geometry import Point
+
+        from kcaa.router.pns.direction45 import CornerMode
+
+        pad = Obstacle(
+            shape=Point(0, 0).buffer(1.0),
+            layers=frozenset({"F.Cu"}),
+            net=None,
+            kind="pad",
+        )
+        res = route_engine((-8, 0), (8, 0), [pad], W, CLR, corner_mode=CornerMode.ROUNDED_90)
+        assert not _turns_le_45(res.path)
+
+    def test_rounded45_route_is_shouldered(self):
+        # rounded45 is a 45-family mode: a detoured route (skeleton arcs
+        # do not survive a detour) must get the same shoulders.
+        from shapely.geometry import Point
+
+        from kcaa.router.pns.direction45 import CornerMode
+
+        pad = Obstacle(
+            shape=Point(0, 0).buffer(1.0),
+            layers=frozenset({"F.Cu"}),
+            net=None,
+            kind="pad",
+        )
+        res = route_engine((-8, 0), (8, 0), [pad], W, CLR, corner_mode=CornerMode.ROUNDED_45)
+        assert _turns_le_45(res.path)
+
+    def test_short_leg_is_consumed_instead_of_left_at_ninety(self):
+        # P1-1: the width floor judges the emitted geometry, not ``t``.
+        # Cutting the short leg fully (t = l1 = 0.3) leaves no sub-width
+        # remainder; the old width/sqrt(2) cap rejected that offset and
+        # kept the 90-degree corner.
+        pts = [(0.0, 0.0), (0.0, 0.3), (2.0, 0.3)]
+        out = _shoulder_family_corners(pts, [], W)
+        assert out == [(0.0, 0.0), (0.3, 0.3), (2.0, 0.3)]
+        assert _turns_le_45(out)
+        for a, b in zip(out, out[1:]):
+            assert math.hypot(b[0] - a[0], b[1] - a[1]) >= W - 1e-9
+
+    def test_prefers_the_shortest_legal_shoulder(self):
+        # Both offsets are legal for this corner: the minimal cut and the
+        # cut that consumes both equal legs (a straight 45-degree
+        # diagonal).  The shortest polyline must win, so a newly legal
+        # small shoulder cannot lengthen a corner a larger cut fixed.
+        pts = [(0.0, 0.0), (0.0, 2.0), (2.0, 2.0)]
+        out = _shoulder_family_corners(pts, [], W)
+        assert out == [(0.0, 0.0), (2.0, 2.0)]
+        assert _turns_le_45(out)
+
+    def test_fully_consumed_leg_guard_rejects_a_new_obtuse_turn(self):
+        # The t = l1 candidate consumes the entry leg and re-anchors the
+        # shoulder at A; the outer neighbour then meets the bisector at
+        # 90 degrees, so that candidate must be rejected.  No other
+        # offset is legal either: the corner is returned untouched.
+        pts = [(1.5, 0.5), (1.0, 0.0), (0.7, 0.0), (0.7, 1.0)]
+        assert _shoulder_family_corners(pts, [], W) == pts
+
+    def test_shoulder_that_leaves_the_board_is_rejected(self):
+        # The corner has a legal shoulder in free space, but the 45-degree
+        # cut leaves this concave board outline: keep the original path.
+        pts = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)]
+        board = Polygon(
+            [
+                (-1.0, -0.01),
+                (1.0, -0.01),
+                (1.0, 1.0),
+                (0.99, 1.0),
+                (0.99, 0.01),
+                (-1.0, 0.01),
+            ]
+        )
+        assert _shoulder_family_corners(pts, [], W, board_limit=board) == pts
+        # Sanity: the same corner shoulders when the board does not bite.
+        assert _shoulder_family_corners(pts, [], W) != pts
+
+    def test_no_shoulder_when_every_bisector_is_blocked(self):
+        # Both candidate offsets are blocked: the near cut (t_cap) and
+        # the fully-consumed-leg chord (t = l1).  The corner must be
+        # returned untouched (no exception, no DRC-breaking shoulder).
+        pts = [(-1.0, 0.0), (0.0, 0.0), (0.0, -1.0)]
+        near = Polygon([(-0.12, -0.12), (-0.02, -0.12), (-0.02, -0.02), (-0.12, -0.02)])
+        chord = Polygon([(-0.62, -0.62), (-0.42, -0.62), (-0.42, -0.42), (-0.62, -0.42)])
+        assert _shoulder_family_corners(pts, [near, chord], W) == pts
+
+    def test_bisector_grazing_a_hull_is_accepted(self):
+        # A shoulder endpoint can land ~1e-16 inside the inflated hull
+        # through float roundoff.  Boundary riding is legal (the
+        # walkaround places segments on the margin), so ``_seg_clear``
+        # must not turn that ulp into a rejected candidate.
+        from shapely.geometry import box
+
+        pts = [
+            (-2.632, 1.55),
+            (2.031, 1.55),
+            (2.031, -0.611),
+            (2.0, -0.642),
+            (2.0, -0.807),
+        ]
+        hull = _family_hull(box(2.341, -0.679, 2.641, 4.715), 0.31)
+        assert not _turns_le_45(pts)
+        out = _shoulder_family_corners(pts, [hull], W)
+        assert _turns_le_45(out)
+        assert _segments_on_45(out)
+        # The input already carries two sub-width pad stubs at the tail;
+        # only the shoulder-introduced segments are held to the floor.
+        for a, b in zip(out[:3], out[1:4]):
+            assert math.hypot(b[0] - a[0], b[1] - a[1]) >= W - 1e-9
+
+    def test_bisector_penetrating_a_hull_is_rejected(self):
+        # A visible cut into the hull must still reject the shoulder:
+        # both candidate diagonals cross it, so the corner is returned
+        # untouched (no exception, no DRC-breaking shoulder).
+        from shapely.geometry import box
+
+        pts = [(0.0, 0.0), (0.0, 0.3), (2.0, 0.3)]
+        cutting = box(0.10, 0.10, 0.30, 0.30)
+        assert _shoulder_family_corners(pts, [cutting], W) == pts
+
+    def test_boundary_riding_shoulder_is_not_penetration(self):
+        # The pass promises boundary riding.  The near candidate diagonal
+        # lies exactly on a hull edge and the wider candidate is blocked,
+        # so accepting the riding shoulder is the only way to fix the
+        # corner.  Measuring penetration against the *exact* hull counts
+        # a shared boundary edge as inside and would reject it.
+        from shapely.geometry import Polygon
+
+        pts = [(0.0, 0.0), (0.0, 1.0), (1.0, 1.0)]
+        t = W / math.sqrt(2.0)
+        riding = Polygon([(0.0, 1.0 - t), (t, 1.0), (0.4, 1.4)])
+        blocking = Polygon([(0.4, 0.4), (0.6, 0.4), (0.6, 0.6), (0.4, 0.6)])
+        out = _shoulder_family_corners(pts, [riding, blocking], W)
+        assert out != pts
+        assert _turns_le_45(out)
+        for a, b in zip(out, out[1:]):
+            assert math.hypot(b[0] - a[0], b[1] - a[1]) >= W - 1e-9
+
+    def test_endpoints_are_pinned_exactly(self):
+        # A fully-consumed exit leg replaces the last vertex with the
+        # recomputed cut point, which can differ from the input endpoint
+        # by float noise.  Physical anchors must be returned exactly.
+        s = 1.0 / math.sqrt(2.0)
+        b = (5.890022579825517, 0.34525830151341586)
+        c = (6.013252905139233, 0.22202797619969908)
+        pts = [(b[0] - s, b[1] - s), b, c]
+        out = _shoulder_family_corners(pts, [], W)
+        assert out[0] == pts[0]
+        assert out[-1] == pts[-1]
+        assert _turns_le_45(out)
+
 
 class TestWalkaroundEndsAtTarget:
     """The walkaround traversal must arrive at the path end point (a
@@ -1357,3 +1653,902 @@ class TestRouteCenterlineObstacle:
             track_net="GND",
         )
         assert clean == [(-10.0, 0.5), (10.0, 0.5)]
+
+
+def _polyline_len(pts) -> float:
+    """Total polyline length (``_path_len`` is a vector norm, not this)."""
+    return sum(math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(pts, pts[1:]))
+
+
+class TestMovedPairsForLayer:
+    """A single-layer run only respects its own layer's foreign copper."""
+
+    @staticmethod
+    def _pair(layer, net, x=0.0):
+        return (
+            TrackObstacle(points=((x, 0.0), (x + 1.0, 0.0)), width=0.2, net=net, layer=layer),
+            TrackObstacle(points=((x, 1.0), (x + 1.0, 1.0)), width=0.2, net=net, layer=layer),
+        )
+
+    def test_keeps_only_this_layer_foreign_net_pairs(self):
+        same_layer_foreign = self._pair("F.Cu", "GND", 0.0)
+        other_layer = self._pair("B.Cu", "GND", 2.0)
+        same_net = self._pair("F.Cu", "VCC", 4.0)
+        unknown_layer = self._pair(None, "GND", 6.0)
+        unknown_net = self._pair("F.Cu", None, 8.0)
+        kept = moved_pairs_for_layer(
+            [same_layer_foreign, other_layer, same_net, unknown_layer, unknown_net],
+            "F.Cu",
+            "VCC",
+        )
+        assert kept == [same_layer_foreign, unknown_layer, unknown_net]
+
+    def test_a_none_net_pair_is_not_dropped_by_a_none_request_net(self):
+        """``_audit_final_copper`` exempts a net only when both nets are
+        non-``None`` and equal, so an unknown net is still audited and
+        must still veto here (dropping it would hide copper the audit
+        will check)."""
+        unknown_net = self._pair("F.Cu", None)
+        assert moved_pairs_for_layer([unknown_net], "F.Cu", None) == [unknown_net]
+
+
+class TestParallelDiagonalMerge:
+    """#217: merge ``[diagonal, axis run, parallel diagonal]``.
+
+    Both diagonals sit in the same direction slot but on different
+    supporting lines, joined by an axis run.  Translating the run along
+    its normal makes the lines coincide; consuming one diagonal then
+    replaces three segments with two at *identical* length.  No
+    vertex-local pass (shouldering, stub coalescing, collinear merge)
+    can reach this: only a translation of a whole straight run can.
+    """
+
+    def test_j3_walkaround_merges_to_five_segments(self):
+        """Acceptance fixture for #217 (walkaround-level shape)."""
+        from shapely.geometry import LineString, Point
+
+        walked, hull, pad = _j3_walkaround_fixture()
+        shouldered = _shoulder_family_corners(walked, [hull], W)
+        assert len(shouldered) == 7  # the #214 shape: 6 segments
+        assert _turns_le_45(shouldered)
+
+        out = merge_parallel_diagonals(shouldered, [hull], W)
+        assert len(out) == 6  # 5 segments
+        assert _segments_on_45(out)
+        assert _turns_le_45(out)
+        assert len(out) - 2 == 4  # turns: [45, 45, 45, 45]
+        assert out[0] == J3_START
+        assert out[-1] == J3_END
+
+        # Length is invariant: the merge moves copper, it does not route.
+        assert _polyline_len(out) == pytest.approx(7.119236649163832, abs=1e-9)
+        assert _polyline_len(out) == pytest.approx(_polyline_len(shouldered), abs=1e-9)
+        for a, b in zip(out, out[1:]):
+            assert math.hypot(b[0] - a[0], b[1] - a[1]) >= W - 1e-9
+
+        # The copper audit (same predicate the engine gates on) accepts.
+        _audit_final_copper(
+            out_path=out,
+            width=W,
+            net="J3",
+            obstacles=[pad],
+            extra_fixed=[],
+            moved_pairs=[],
+            orig_obstacle_ids=set(),
+            clearance=0.2,
+        )
+
+        # The merged long diagonal is tangent to the pad's SW corner at
+        # the 0.31 mm route margin (0.2 clearance + 0.1 half width + 0.01).
+        diagonals = [
+            seg
+            for seg in zip(out, out[1:])
+            if abs(abs(seg[1][0] - seg[0][0]) - abs(seg[1][1] - seg[0][1])) < 1e-9
+        ]
+        longest = max(
+            diagonals,
+            key=lambda seg: math.hypot(seg[1][0] - seg[0][0], seg[1][1] - seg[0][1]),
+        )
+        corner = (J3_CENTER[0] - 0.85, J3_CENTER[1] - 0.85)
+        assert LineString(list(longest)).distance(Point(*corner)) == pytest.approx(0.31, abs=1e-3)
+
+    def test_j3_merge_is_idempotent(self):
+        walked, hull, _pad = _j3_walkaround_fixture()
+        shouldered = _shoulder_family_corners(walked, [hull], W)
+        once = merge_parallel_diagonals(shouldered, [hull], W)
+        assert merge_parallel_diagonals(once, [hull], W) == once
+
+    def test_engine_j3_fixture_keeps_its_lane_route(self):
+        """The engine prefers the 3-segment lane candidate at J3; the
+        merge pass must leave that shape alone (no matching triple).
+
+        This is the engine-level half of the #214 fixture, asserted here
+        so the new pass is proven not to regress it."""
+        from shapely.geometry import Point
+
+        from kcaa.router.pns.direction45 import CornerMode
+
+        pad = Obstacle(
+            shape=Point(*J3_CENTER).buffer(0.85),
+            layers=frozenset({"F.Cu"}),
+            net="J3",
+            kind="pad",
+        )
+        res = route_engine(J3_START, J3_END, [pad], W, 0.2, corner_mode=CornerMode.MITERED_45)
+        out = res.path
+        assert len(out) - 1 == 3
+        assert _turns_le_45(out)
+        assert _polyline_len(out) == pytest.approx(7.20208, abs=1e-4)
+        assert min(
+            math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(out, out[1:])
+        ) == pytest.approx(0.56569, abs=1e-4)
+        assert out[0] == J3_START and out[-1] == J3_END
+        assert merge_parallel_diagonals(out, [], W) == out
+
+    def test_mirror_candidate_merges_when_forward_is_blocked(self):
+        """Both orderings are legal: when the hull blocks the forward
+        run (consuming the trailing diagonal), the mirror must consume
+        the leading diagonal instead of giving up."""
+        from shapely.geometry import box
+
+        pts = [(0.0, 0.0), (1.0, 1.0), (1.0, 3.0), (3.0, 5.0)]
+        blocked = box(2.9, 3.9, 3.1, 4.1)  # on the forward run x=3, y in 3..5
+        out = merge_parallel_diagonals(pts, [blocked], W)
+        assert out == [(0.0, 0.0), (0.0, 2.0), (3.0, 5.0)]
+        assert _segments_on_45(out) and _turns_le_45(out)
+        assert _polyline_len(out) == pytest.approx(_polyline_len(pts), abs=1e-9)
+        # Control: in free space the forward candidate wins.
+        assert merge_parallel_diagonals(pts, [], W) == [
+            (0.0, 0.0),
+            (3.0, 3.0),
+            (3.0, 5.0),
+        ]
+
+    def test_opposite_diagonal_slots_are_not_merged(self):
+        # D+ then D-: the lines are not parallel, so no single
+        # translation makes them collinear.
+        pts = [(0.0, 0.0), (0.5, 0.5), (2.0, 0.5), (2.5, 0.0)]
+        assert merge_parallel_diagonals(pts, [], W) == pts
+
+    def test_diagonal_run_is_not_merged(self):
+        # The middle segment must be an axis run; a diagonal run is a
+        # different shape (and merging it would change the turn angles).
+        pts = [(0.0, 0.0), (1.0, 1.0), (2.0, 2.0), (3.0, 1.0)]
+        assert merge_parallel_diagonals(pts, [], W) == pts
+
+    def test_sub_width_run_is_rejected(self):
+        # Track width gate: the translated run must stay a full-width
+        # segment (the pass never emits a sub-width segment).
+        pts = [(0.0, 0.0), (1.0, 1.0), (1.0, 1.1), (3.0, 3.1)]
+        assert merge_parallel_diagonals(pts, [], W) == pts
+
+    def test_extension_shorter_than_width_is_rejected(self):
+        # Both diagonals are shorter than the track width, so the
+        # extended diagonal (l1 + l3) is sub-width in either ordering.
+        pts = [(0.0, 0.0), (0.05, 0.05), (0.05, 2.05), (0.1, 2.1)]
+        assert merge_parallel_diagonals(pts, [], W) == pts
+
+    def test_hull_penetrating_either_candidate_keeps_the_path(self):
+        # One hull straddling both candidate diagonals (the forward's
+        # leading line y=x and the mirror's trailing line y=x+2): the
+        # pass has no legal translation left and keeps the input.
+        from shapely.geometry import box
+
+        pts = [(0.0, 0.0), (1.0, 1.0), (1.0, 3.0), (3.0, 5.0)]
+        assert merge_parallel_diagonals(pts, [box(0.5, 1.5, 2.5, 3.5)], W) == pts
+
+    def test_board_limits_reject_the_moved_run(self):
+        # Board follows the input corridor but a hole covers the
+        # forward run's new position: only the board gate can reject.
+        from shapely.geometry import LineString, box
+
+        pts = [(0.0, 0.0), (1.0, 1.0), (1.0, 3.0), (3.0, 5.0)]
+        board = (
+            LineString(pts)
+            .buffer(2.0)
+            .difference(box(2.8, 2.8, 3.2, 3.2))  # forward run vertex
+            .difference(box(-0.2, 1.8, 0.2, 2.2))  # mirror run vertex
+        )
+        assert merge_parallel_diagonals(pts, [], W, board_limit=board) == pts
+        # Control: without the hole the merge is accepted.
+        assert merge_parallel_diagonals(pts, [], W, board_limit=LineString(pts).buffer(2.0)) != pts
+
+    def test_preexisting_sub_width_segment_blocks_the_merge(self):
+        # Unlike the shouldering pass, this one is strict: it must not
+        # keep a sub-width segment anywhere in the emitted path.
+        pts = [(0.0, 0.0), (1.0, 1.0), (1.0, 3.0), (3.0, 5.0), (3.0, 5.05)]
+        assert merge_parallel_diagonals(pts, [], W) == pts
+
+    def test_audit_callback_vetoes_the_merge(self):
+        pts = [(0.0, 0.0), (1.0, 1.0), (1.0, 3.0), (3.0, 5.0)]
+        assert merge_parallel_diagonals(pts, [], W, audit=lambda cand: False) == pts
+        assert merge_parallel_diagonals(pts, [], W, audit=lambda cand: True) != pts
+
+    def test_off_family_noise_is_not_amplified_by_the_translation(self):
+        """Candidate family gate: a sub-micron off-family input diagonal
+        (inside every tolerance) must not be *doubled* into real
+        off-family copper by the merge.  ``q1 = d - run`` inherits the
+        offset and re-emits it over the whole merged diagonal, so the
+        candidate family check is what keeps the 0/45/90 contract."""
+        pts = [(0.0, 0.0), (1.0, 1.0000009), (1.0, 2.0), (2.0, 3.0000009)]
+        out = merge_parallel_diagonals(pts, [], W)
+        assert out == pts
+        worst = max(
+            abs(abs(b[0] - a[0]) - abs(b[1] - a[1]))
+            for a, b in zip(out, out[1:])
+            if abs(b[0] - a[0]) > 1e-6 and abs(b[1] - a[1]) > 1e-6
+        )
+        assert worst <= 1e-6
+
+    def test_forward_join_that_would_be_a_ninety_degree_turn_is_skipped(self):
+        # Forward candidate: the run q1->d meets d->e at 90 degrees
+        # (the diagonal it replaces met it at 45).  The mirror is legal,
+        # so the merge still happens — with the mirror's shape.
+        pts = [(0.0, 0.0), (1.0, 1.0), (1.0, 3.0), (3.0, 5.0), (4.0, 5.0)]
+        out = merge_parallel_diagonals(pts, [], W)
+        assert out == [(0.0, 0.0), (0.0, 2.0), (3.0, 5.0), (4.0, 5.0)]
+        assert _turns_le_45(out)
+
+    def test_mirror_join_that_would_be_a_ninety_degree_turn_is_rejected(self):
+        # The entry runs horizontally into the leading diagonal; moving
+        # the run to start at `a` would turn 90 degrees there, so the
+        # mirror candidate must be refused (the forward is hull-blocked).
+        from shapely.geometry import box
+
+        pts = [(0.0, 0.0), (1.0, 0.0), (2.0, 1.0), (2.0, 3.0), (4.0, 5.0)]
+        blocked = box(3.9, 3.3, 4.1, 3.7)  # on the forward run x=4, y in 3..5
+        assert merge_parallel_diagonals(pts, [blocked], W) == pts
+
+    def test_mirror_slide_cannot_retreat_the_leading_diagonal(self):
+        """Family A sign gate.
+
+        Reachable from the router's concatenated chain: the forward
+        candidate re-anchors the trailing diagonal *behind* ``a``, which
+        would fold the merged path back over itself (mutant:
+        ``(-0.265686, -0.265686)`` in place of ``(0.3, 0.0)``).  The
+        input already carries a 135-degree leg-boundary turn at its tail,
+        which the pass must leave alone rather than widen.
+        """
+        pts = [
+            (-0.2, 0.0),
+            (0.0, 0.0),
+            (0.3, 0.3),
+            (0.6, 0.3),
+            (0.034314, -0.265686),
+        ]
+        out = merge_parallel_diagonals(pts, [], W)
+        assert out == [(-0.2, 0.0), (0.0, 0.0), (0.3, 0.0), (0.034314, -0.265686)]
+        assert _turns_le_45(out[:3])
+        # The pre-existing 135-degree boundary turn moves with the
+        # re-anchored diagonal and stays 135 (it is not the pass's turn
+        # to smooth); the pass only refuses to *add* one.
+        assert out[-1] == pts[-1]
+
+    def test_staircase_merge_terminates_and_is_length_preserving(self):
+        """Bounded scan (cap reported) on a long staircase.
+
+        ``4 * len(pts) + 16`` attempts is enough for one acceptance per
+        removed vertex; the pass must reach a fixpoint, stay family-
+        clean, drop segments and keep the total length exactly."""
+        n = 40
+        pts = [(0.0, 0.0)]
+        x = y = 0.0
+        for _ in range(n):
+            x += 0.5
+            y += 0.5
+            pts.append((x, y))  # D+
+            y += 0.5
+            pts.append((x, y))  # V run
+        out = merge_parallel_diagonals(pts, [], W)
+        assert len(out) < len(pts)
+        assert _segments_on_45(out)
+        assert _turns_le_45(out)
+        assert _polyline_len(out) == pytest.approx(_polyline_len(pts), abs=1e-6)
+        for a, b in zip(out, out[1:]):
+            assert math.hypot(b[0] - a[0], b[1] - a[1]) >= W - 1e-9
+        assert out[0] == pts[0] and out[-1] == pts[-1]
+        assert merge_parallel_diagonals(out, [], W) == out
+
+
+class TestStairCollapse:
+    """#217: collapse a staircase between two parallel axis runs.
+
+    Unlike ``TestParallelDiagonalMerge`` (translate the run of a
+    ``[D, run, D]`` triple), this shape has no diagonals at all: two
+    parallel axis runs are joined by a stair.  Replacing the stair with
+    the single 45-degree diagonal joining the runs keeps the family and
+    length (the diagonal is exactly the stair's chord), and the slide of
+    the run is bounded by the hulls on the smaller-slide side.  A
+    vertex-local pass cannot see it, and a `t`-style corner cut cannot
+    reach it: the move translates a whole run.
+    """
+
+    STAIR = [
+        (0.0, 0.0),
+        (0.0, 1.0),
+        (1.0, 1.0),
+        (1.0, 2.0),
+        (2.0, 2.0),
+        (2.0, 3.0),
+    ]
+
+    def test_stair_collapses_to_one_diagonal(self):
+        out = merge_parallel_diagonals(self.STAIR, [], W)
+        assert out == [(0.0, 0.0), (0.0, 1.0), (2.0, 3.0)]
+        assert _segments_on_45(out)
+        assert _turns_le_45(out)
+        assert out[0] == self.STAIR[0] and out[-1] == self.STAIR[-1]
+        assert _polyline_len(out) <= _polyline_len(self.STAIR)
+        for a, b in zip(out, out[1:]):
+            assert math.hypot(b[0] - a[0], b[1] - a[1]) >= W - 1e-9
+        # Fixpoint: a second call is a no-op (the pass cannot drift).
+        assert merge_parallel_diagonals(out, [], W) == out
+
+    def test_long_stair_collapses_and_never_lengthens(self):
+        # A four-step staircase must fold in one call (the outer
+        # run/stair alternation reaches the fixpoint internally).
+        pts = [(0.0, 0.0)]
+        for k in range(1, 5):
+            pts += [(float(k - 1), float(k)), (float(k), float(k))]
+        pts.append((4.0, 5.0))
+        out = merge_parallel_diagonals(pts, [], W)
+        assert out == [(0.0, 0.0), (0.0, 1.0), (4.0, 5.0)]
+        assert _polyline_len(out) <= _polyline_len(pts)
+        assert merge_parallel_diagonals(out, [], W) == out
+
+    def test_slide_stops_on_the_hull_tangent(self):
+        """A hull covering the zero-slide diagonal forces the run to move;
+        the nearest legal placement rides the hull's 45-degree face."""
+        from shapely.geometry import LineString, box
+
+        blocking = box(0.9, 1.9, 1.3, 2.3)
+        blocked = _family_hull(blocking, 0.0)
+        assert LineString([(0.0, 1.0), (2.0, 3.0)]).intersects(blocking)
+        out = merge_parallel_diagonals(self.STAIR, [blocked], W)
+        assert out == [
+            (0.0, 0.0),
+            (0.0, pytest.approx(0.6, abs=1e-9)),
+            (2.0, pytest.approx(2.6, abs=1e-9)),
+            (2.0, 3.0),
+        ]
+        assert _segments_on_45(out) and _turns_le_45(out)
+        # The merged diagonal rides the hull boundary: boundary contact is
+        # legal, penetration is not.
+        merged = ((out[1][0], out[1][1]), (out[2][0], out[2][1]))
+        assert LineString(list(merged)).distance(blocked) == pytest.approx(0.0, abs=1e-9)
+        assert _polyline_len(out) <= _polyline_len(self.STAIR)
+
+    def test_hull_blocking_every_slide_keeps_the_stair(self):
+        from shapely.geometry import box
+
+        # Covers the corridor on both sides of every candidate line.
+        out = merge_parallel_diagonals(self.STAIR, [box(0.5, 0.5, 1.5, 2.5)], W)
+        assert out == self.STAIR
+
+    def test_board_limit_rejects_the_stair_slide(self):
+        from shapely.geometry import LineString
+
+        corridor = LineString(self.STAIR).buffer(0.05)
+        assert merge_parallel_diagonals(self.STAIR, [], W, board_limit=corridor) == self.STAIR
+        wide = LineString([(0.0, 0.0), (2.0, 3.0)]).buffer(2.0)
+        assert merge_parallel_diagonals(self.STAIR, [], W, board_limit=wide) != self.STAIR
+
+    def test_anchor_tolerance_gates_the_collapse(self):
+        from shapely.geometry import LineString, Point
+
+        # The collapsed diagonal passes 0.7071 mm from this anchor.
+        anchor = ((0.5, 2.5), 0.0)
+        out = merge_parallel_diagonals(self.STAIR, [], W, anchors=[anchor])
+        assert out == self.STAIR
+        assert LineString(out).distance(Point(0.5, 2.5)) == pytest.approx(0.7071, abs=1e-4)
+        loose = merge_parallel_diagonals(self.STAIR, [], W, anchors=[((0.5, 2.5), 0.71)])
+        assert len(loose) - 1 == 2
+
+    def test_keep_anchor_vertices_splits_the_merged_diagonal(self):
+        out = merge_parallel_diagonals(
+            self.STAIR,
+            [],
+            W,
+            anchors=[((0.5, 2.5), 0.8)],
+            keep_anchor_vertices=True,
+        )
+        # (1.0, 2.0) is the anchor's projection onto the merged line.
+        assert out == [(0.0, 0.0), (0.0, 1.0), (1.0, 2.0), (2.0, 3.0)]
+        assert merge_parallel_diagonals(out, [], W) == out
+
+    def test_reversed_travel_direction_is_not_collapsed(self):
+        # Same stair walked the other way: the diagonal must keep the
+        # travel direction, and the progression gates refuse the
+        # backwards slide.
+        pts = self.STAIR[::-1]
+        out = merge_parallel_diagonals(pts, [], W)
+        assert out == [(2.0, 3.0), (2.0, 2.0), (0.0, 0.0)]
+        assert out[0] == pts[0] and out[-1] == pts[-1]
+
+    def test_trailing_run_must_be_parallel_to_the_leading_run(self):
+        """Trailing-run slot gate.
+
+        Without it ``j`` may land on a *diagonal* that happens to accept
+        the 45-degree displacement, and the stair plus both flanks
+        collapse onto a shape that skips the walkaround's clearance
+        vertices (mutant: 6 points / 8.6569 mm instead of 7 / 11.8284).
+        """
+        pts = [
+            (0.0, 0.0),
+            (0.0, 1.0),
+            (1.0, 2.0),
+            (1.0, 5.0),
+            (-2.0, 5.0),
+            (-4.0, 5.0),
+            (-4.0, 4.0),
+            (-5.0, 4.0),
+        ]
+        hull = box(0.5, -2.0, 1.5, -1.0)
+        out = merge_parallel_diagonals(pts, [hull], W)
+        assert out == [
+            (0.0, 0.0),
+            (0.0, 1.0),
+            (1.0, 2.0),
+            (1.0, 5.0),
+            (-2.0, 5.0),
+            (-3.0, 4.0),
+            (-5.0, 4.0),
+        ]
+
+    def test_slide_cannot_retreat_behind_the_first_flank_tail(self):
+        """Progression gate on the first flank.
+
+        The flank vertices are the walkaround's clearance tangents in
+        the *full* obstacle set; the pass may only see a subset of it
+        (the router hands it same-net-filtered hulls), so it must never
+        slide the run back past the flank's tail — the mutant folds the
+        path onto ``(0, 0), (-1, 0), (-4, -3)``.
+        """
+        pts = [(0.0, 0.0), (1.0, 0.0), (1.0, -1.0), (-1.0, -3.0), (-4.0, -3.0)]
+        hulls = [box(1.0, 1.0, 2.0, 2.0), box(-2.0, -2.0, -1.0, -1.0)]
+        assert merge_parallel_diagonals(pts, hulls, W) == pts
+
+    def test_slide_cannot_pass_the_next_run_head(self):
+        """Progression gate on the second flank: ``B`` may not move past
+        the next run's head (mutant: ``(0, 0), (3, -3), (4, -3)``)."""
+        pts = [(0.0, 0.0), (2.0, 0.0), (4.0, 0.0), (5.0, 0.0), (5.0, -3.0), (4.0, -3.0)]
+        hulls = [box(-1.0, 1.0, 0.0, 2.0), box(0.5, 3.0, 1.5, 4.0)]
+        assert merge_parallel_diagonals(pts, hulls, W) == pts
+
+    def test_collapse_never_emits_a_spike_at_the_rewired_joints(self):
+        """Junction-turn gate.
+
+        The displacement is 45 degrees to the run, so the two rewired
+        joints can be 45 or 135 — a 135-degree joint is a copper spike
+        (mutant: ``(0, 0), (-3, 0), (-8, 5), (1, 5)``, 19.0711 mm versus
+        12.2426 mm).  Both joints must stay inside the family contract.
+        """
+        pts = [
+            (0.0, 0.0),
+            (-1.0, 1.0),
+            (-4.0, 1.0),
+            (-4.0, 3.0),
+            (-2.0, 3.0),
+            (0.0, 5.0),
+            (1.0, 5.0),
+        ]
+        assert merge_parallel_diagonals(pts, [], W) == pts
+
+    def test_slide_touching_the_next_run_head_still_checks_the_turn(self):
+        """Joint gate must be measured on the *candidate* (trailing joint).
+
+        The slide can land ``B`` exactly on the untouched next-run head;
+        measuring ``_turn_deg(A, B, out[j+1])`` then sees a zero-length
+        leg and returns 0 while the real turn at ``B`` is between
+        ``A->B`` and ``B->out[j+2]``.  Pre-fix the pass returned
+        ``[(0, 0), (0.3, 0), (5.1, 4.8), (4.6, 4.8)]``: a 135-degree
+        spike.  The repro is turn-``<= 45`` family input, so only the
+        joint check can refuse it.
+        """
+        pts = [
+            (0.0, 0.0),
+            (0.3, 0.0),
+            (1.1, -0.8),
+            (3.3, -0.8),
+            (4.6, 0.5),
+            (4.6, 2.5),
+            (6.1, 4.0),
+            (6.1, 4.3),
+            (5.6, 4.8),
+            (5.1, 4.8),
+            (4.6, 4.8),
+        ]
+        assert _turns_le_45(pts)
+        out = merge_parallel_diagonals(pts, [], W)
+        assert _turns_le_45(out)
+        assert _segments_on_45(out)
+        # The pass must still merge (the invariant is paid for by a
+        # refused slide, not by disabling the family on touch).
+        assert len(out) < len(pts)
+        assert merge_parallel_diagonals(out, [], W) == out
+
+    def test_slide_touching_the_flank_head_still_checks_the_turn(self):
+        """Same hole at the symmetric first joint (``A == out[i-1]``).
+
+        The hull tangency places the slide exactly on the first flank's
+        tail, so the dedupe drops ``A`` and the pre-merge wait sees a
+        zero-length leg (turn 0) while the real turn there is between
+        ``out[i-2]`` and ``B``: 90 degrees.  Pre-fix the pass emitted
+        ``[(0, 0), (-0.25, 0.25), (2.5, 3.0)]``; every other gate
+        (family, width, hull, board, audit) accepts that candidate, so
+        only the joint check refuses it.
+        """
+        pts = [
+            (0.0, 0.0),
+            (-0.25, 0.25),
+            (-0.25, 0.75),
+            (0.0, 1.0),
+            (1.0, 2.0),
+            (1.5, 2.5),
+            (1.7, 2.5),
+            (2.0, 2.5),
+            (2.25, 2.5),
+            (2.5, 2.75),
+            (2.5, 3.0),
+        ]
+        hulls = [_family_hull(box(2.18, 2.38, 2.48, 2.68), 0.0)]
+        assert _turns_le_45(pts)
+        out = merge_parallel_diagonals(pts, hulls, W)
+        assert out == pts
+
+    def test_anchor_split_refuses_a_sub_width_remainder(self):
+        """``keep_anchor_vertices`` width gate.
+
+        The anchor rests on the merged diagonal 0.0354 mm from its
+        start: splitting there would emit a sub-width segment, so the
+        node is dropped (mutant: ``(0.024999999999999956, 1.025)``
+        inserted, min segment 0.035355 mm) and the diagonal's endpoints
+        keep the pass's no-sub-width invariant.
+        """
+        out = merge_parallel_diagonals(
+            self.STAIR,
+            [],
+            W,
+            # Both ends of the merged diagonal, each 0.0354 mm inside:
+            # one split is refused by the leading-half gate, the other
+            # by the trailing-half gate.
+            anchors=[((0.025, 1.025), 0.0), ((1.975, 2.975), 0.0)],
+            keep_anchor_vertices=True,
+        )
+        assert out == [(0.0, 0.0), (0.0, 1.0), (2.0, 3.0)]
+        assert min(math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(out, out[1:])) >= W - 1e-9
+
+    def test_staircase_benchmark_is_bounded(self):
+        """Iteration cap: one accepting round per removed vertex, each
+        round at most ``4*n+16`` run steps and ``2*n*n+64`` flank pairs.
+
+        A two-hundred-step staircase must fold without super-linear
+        blow-up and stay idempotent."""
+        n = 200
+        pts = [(0.0, 0.0)]
+        for k in range(1, n + 1):
+            pts += [(float(k - 1), float(k)), (float(k), float(k))]
+        out = merge_parallel_diagonals(pts, [], W)
+        # The whole staircase folds onto one diagonal; only the two runs
+        # that already lie on the 45 lines survive.
+        assert out == [
+            (0.0, 0.0),
+            (0.0, 1.0),
+            (199.0, 200.0),
+            (200.0, 200.0),
+        ]
+        assert merge_parallel_diagonals(out, [], W) == out
+
+
+class TestTerminalStubAbsorption:
+    """#216: absorb a sub-width first/last segment into its adjacent run.
+
+    The walkaround / lane / pad-exit stages can leave a residual
+    connector between a pinned pad-centre anchor and the nearest legal
+    family run.  Sliding the run onto the anchor's line removes it; the
+    pass never lengthens the route and never lowers the minimum segment
+    length, so a stub it cannot remove without a longer path is left in
+    place (documented exception).
+    """
+
+    # Sweep-derived fixture (same class as the issue's 0.009 mm
+    # pad-exit stub): the engine leaves a 0.0875 mm V stub at the
+    # destination before this pass, absorbed to a 0.689 mm leg.
+    S = (-3.4201679360683457, 3.7212679553332517)
+    E = (4.787175092253532, 3.233789531661362)
+    PADS = [
+        (2.568909405254894, 2.261991093591841, 0.5),
+        (-3.777712725048371, 0.6231032772597018, 0.25),
+        (-2.305097949850124, 3.8753303058456448, 0.15),
+    ]
+    STUB_PATH = [
+        S,
+        (-3.0201679360683458, 3.321267955333252),
+        (4.787175092253532, 3.321267955333252),
+        E,
+    ]
+
+    def _obstacles(self):
+        from shapely.geometry import box
+
+        return [
+            Obstacle(
+                shape=box(cx - h, cy - h, cx + h, cy + h),
+                layers=frozenset({"F.Cu"}),
+                net=None,
+                kind="pad",
+            )
+            for cx, cy, h in self.PADS
+        ]
+
+    def test_pad_exit_stub_is_absorbed(self):
+        res = route_engine(
+            self.S,
+            self.E,
+            self._obstacles(),
+            W,
+            W,
+            corner_mode="mitered45",
+        )
+        out = res.path
+        assert out[0] == self.S and out[-1] == self.E
+        assert len(out) - 1 == 2
+        assert min(
+            math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(out, out[1:])
+        ) == pytest.approx(0.6893985981210443, abs=1e-9)
+        assert _polyline_len(out) == pytest.approx(8.409263202771033, abs=1e-9)
+        _audit_final_copper(
+            out_path=out,
+            width=W,
+            net=None,
+            obstacles=self._obstacles(),
+            extra_fixed=[],
+            moved_pairs=[],
+            orig_obstacle_ids=set(),
+            clearance=W,
+        )
+
+    def test_stub_without_the_pass_is_characterised(self):
+        """The pre-pass shape (0.0875 mm stub) is the one being fixed."""
+        assert len(self.STUB_PATH) == 4
+        stub = math.hypot(
+            self.STUB_PATH[-1][0] - self.STUB_PATH[-2][0],
+            self.STUB_PATH[-1][1] - self.STUB_PATH[-2][1],
+        )
+        assert stub == pytest.approx(0.08747842367188996, abs=1e-9)
+        assert stub < W
+
+    def test_absorption_removes_the_vertex_and_shortens(self):
+        out = _absorb_terminal_stubs(self.STUB_PATH, [], W)
+        assert out == [self.S, (-2.932689512396456, 3.233789531661362), self.E]
+        assert _polyline_len(out) < _polyline_len(self.STUB_PATH)
+
+    def test_absorption_never_trades_a_stub_for_a_shorter_one(self):
+        """Min-length gate.
+
+        The slide can land the run's far end close to its anchor, which
+        replaces the 0.05 mm stub with a 0.035 mm one — the mutant
+        accepts ``(0, 0), (0.025, -0.025), (0.1, 0.05)``.  Absorb, do
+        not shuffle: the candidate's shortest segment must not fall
+        below the path's current minimum."""
+        pts = [(0.0, 0.0), (0.0, 0.05), (0.05, 0.0), (0.1, 0.05)]
+        assert _absorb_terminal_stubs(pts, [], W) == pts
+
+    def test_absorption_never_folds_the_path_backwards(self):
+        """Direction and length gates on a fold.
+
+        Sliding the run onto the anchor here would leave ``(0, 0),
+        (0, 0.1), (0.1, 0)``: the run reverses over the path (0.2 mm
+        against the original 0.1914 mm), so the candidate is refused
+        even though it drops a vertex.  The progression check refuses
+        the fold and the length gate refuses the growth — a route may
+        shorten or stay equal, never fold or grow."""
+        pts = [(0.0, 0.0), (0.0, 0.05), (0.05, 0.0), (0.1, 0.0)]
+        assert _absorb_terminal_stubs(pts, [], W) == pts
+        assert _polyline_len(pts) < 0.2
+
+    def test_absorption_leaving_a_three_point_path_stops_safely(self):
+        # After the slide the path is [anchor, run-end, next]: three
+        # points, no second run to slide against, and the remaining
+        # first segment is still sub-width.  The scan must stop instead
+        # of indexing past the end of the path.
+        pts = [(0.0, 0.0), (0.0, 0.1), (0.19, 0.1), (0.19, 1.0)]
+        out = _absorb_terminal_stubs(pts, [], W)
+        assert out == [(0.0, 0.0), (0.19, 0.0), (0.19, 1.0)]
+        assert _absorb_terminal_stubs(out, [], W) == out
+
+    def test_leading_stub_is_absorbed(self):
+        start = [(0.0, 0.0), (0.0, 0.1), (2.0, 0.1), (2.0, 2.0)]
+        out = _absorb_terminal_stubs(start, [], W)
+        assert out == [(0.0, 0.0), (2.0, 0.0), (2.0, 2.0)]
+        assert _polyline_len(out) == pytest.approx(4.0, abs=1e-12)
+
+    def test_all_wide_path_is_untouched(self):
+        pts = [(0.0, 0.0), (0.0, 1.0), (2.0, 1.0), (2.0, 2.0)]
+        assert _absorb_terminal_stubs(pts, [], W) == pts
+        # A long first segment would slide legally: only the sub-width
+        # trigger keeps it in place.
+        long_stub = [(0.0, 0.0), (0.0, 0.5), (2.0, 0.5), (2.0, 2.0)]
+        assert _absorb_terminal_stubs(long_stub, [], W) == long_stub
+        # Control: the same shape with a sub-width first segment slides.
+        assert _absorb_terminal_stubs([(0.0, 0.0), (0.0, 0.1), (2.0, 0.1), (2.0, 2.0)], [], W) != (
+            [(0.0, 0.0), (0.0, 0.1), (2.0, 0.1), (2.0, 2.0)]
+        )
+
+    def test_idempotent(self):
+        once = _absorb_terminal_stubs(self.STUB_PATH, [], W)
+        assert _absorb_terminal_stubs(once, [], W) == once
+
+    def test_clearance_shadow_stub_is_structural(self):
+        """The #216 0.038 mm fixture: the pad's top edge pins the run
+        at y=3.353; sliding it onto the anchor line (y=3.315) would put
+        the run copper 0.181 mm from the pad, inside the 0.2 mm
+        clearance.  The stub is therefore structural: the sliding move
+        is legal in free space but refused by the clearance envelope."""
+        from shapely.geometry import box
+
+        s = (-2.576, 2.553)
+        e = (3.522, 3.315)
+        pts = [s, (-1.776, 3.353), (3.522, 3.353), e]
+        # Free space: the slide is shorter and accepted (control).
+        squeezed = _absorb_terminal_stubs(pts, [], W)
+        assert squeezed != pts
+        assert squeezed[-1] == e
+        # Real pad hull (margin clearance + w/2 + 0.01): refused.
+        pad_shape = box(0.373, 2.834, 0.573, 3.034)
+        hull = _family_hull(pad_shape, 0.2 + 0.01 + W / 2.0)
+        assert _absorb_terminal_stubs(pts, [hull], W) == pts
+        # Real copper audit on the free-space candidate: refused too.
+        pad = Obstacle(
+            shape=pad_shape,
+            layers=frozenset({"F.Cu"}),
+            net=None,
+            kind="pad",
+        )
+
+        def audit(cand):
+            try:
+                _audit_final_copper(
+                    out_path=cand,
+                    width=W,
+                    net=None,
+                    obstacles=[pad],
+                    extra_fixed=[],
+                    moved_pairs=[],
+                    orig_obstacle_ids=set(),
+                    clearance=0.2,
+                )
+            except PnsFailure:
+                return False
+            return True
+
+        assert audit(squeezed) is False
+        assert _absorb_terminal_stubs(pts, [], W, audit=audit) == pts
+
+    def test_hull_blocking_the_slid_run_rejects(self):
+        from shapely.geometry import box
+
+        start = [(0.0, 0.0), (0.0, 0.1), (2.0, 0.1), (2.0, 2.0)]
+        assert _absorb_terminal_stubs(start, [box(0.9, -0.05, 1.1, 0.05)], W) == start
+        # Control: the same path without the hull is absorbed.
+        assert _absorb_terminal_stubs(start, [], W) != start
+
+    def test_board_outside_rejects_the_slid_run(self):
+        from shapely.geometry import Polygon
+
+        start = [(0.0, 0.0), (0.0, 0.1), (2.0, 0.1), (2.0, 2.0)]
+        board = Polygon([(0.0, -0.01), (1.9, -0.01), (1.9, 2.1), (0.0, 2.1)])
+        assert _absorb_terminal_stubs(start, [], W, board_limit=board) == start
+        assert _absorb_terminal_stubs(start, [], W) != start
+
+    def test_audit_callback_vetoes_absorption(self):
+        start = [(0.0, 0.0), (0.0, 0.1), (2.0, 0.1), (2.0, 2.0)]
+        assert _absorb_terminal_stubs(start, [], W, audit=lambda cand: False) == start
+        assert _absorb_terminal_stubs(start, [], W, audit=lambda cand: True) != start
+
+    def test_reversed_run_direction_is_rejected(self):
+        # Sliding the leading run onto the anchor would put the run's
+        # far end behind the anchor along the travel direction (the
+        # following D- line crosses y=0 at x=0.05 while the run travels
+        # -x).  The candidate must be refused.
+        pts = [(0.0, 0.0), (0.0, 0.1), (-0.05, 0.1), (0.45, -0.4)]
+        assert _absorb_terminal_stubs(pts, [], W) == pts
+
+    def test_reversed_trailing_run_direction_is_rejected(self):
+        # The trailing stub is D- and the run travels +y; sliding the
+        # run onto the anchor line would place E behind p2, so the
+        # direction check refuses the candidate (the minimum-length
+        # floor would reject the same geometry independently).
+        pts = [(0.0, 1.0), (1.0, 1.0), (1.0, 1.1), (1.14, 0.96)]
+        assert _absorb_terminal_stubs(pts, [], W) == pts
+
+
+class TestSubWidthRouteInvariant:
+    """#216 target invariant at engine level.
+
+    Every emitted segment is >= track width except a terminal segment
+    structurally required to reach a pinned anchor (the nearest full-
+    width family run from the anchor would leave the clearance envelope
+    or lengthen the route).  This pins the known exception and proves
+    the removable class is gone.
+    """
+
+    def test_single_pad_fixture_keeps_only_the_anchor_stub(self):
+        from shapely.geometry import box
+
+        pad = Obstacle(
+            shape=box(0.373, 2.834, 0.573, 3.034),
+            layers=frozenset({"F.Cu"}),
+            net=None,
+            kind="pad",
+        )
+        res = route_engine(
+            (-2.576, 2.553),
+            (3.522, 3.315),
+            [pad],
+            W,
+            0.2,
+            corner_mode="mitered45",
+        )
+        out = res.path
+        assert out[0] == (-2.576, 2.553)
+        assert out[-1] == (3.522, 3.315)
+        assert len(out) - 1 == 3
+        lens = [math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(out, out[1:])]
+        assert lens[0] == pytest.approx(1.13137, abs=1e-4)
+        assert lens[1] == pytest.approx(5.298, abs=1e-6)
+        assert lens[2] == pytest.approx(0.038, abs=1e-9)  # the documented exception
+        assert _turns_le_45(out) is False  # last turn is the pad-centre 90
+        assert len(out) - 2 == 2  # turns: [45, 90]
+
+    def test_two_pad_fixture_min_improves_and_rest_is_clearance_bound(self):
+        """The #215-review two-pad fixture: the 0.0113 mm pad-exit stub
+        is absorbed (min segment improves to 0.0829 mm), and the
+        segment that remains sub-width is structural: sliding the next
+        run would ride the start pad's hull (clearance envelope)."""
+        from shapely.geometry import box
+
+        pads = [
+            Obstacle(
+                shape=box(3.13004, 3.37452, 3.33004, 3.57452),
+                layers=frozenset({"F.Cu"}),
+                net=None,
+                kind="pad",
+            ),
+            Obstacle(
+                shape=box(-2.37872, 2.67873, -2.27872, 2.77873),
+                layers=frozenset({"F.Cu"}),
+                net=None,
+                kind="pad",
+            ),
+        ]
+        res = route_engine(
+            (-2.7, 2.813),
+            (3.522, 3.315),
+            pads,
+            W,
+            W,
+            corner_mode="mitered45",
+        )
+        out = res.path
+        lens = [math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(out, out[1:])]
+        assert len(lens) == 7  # the pass removed the 0.0113 mm stub
+        assert lens[0] == pytest.approx(0.08286, abs=1e-4)
+        assert min(lens) == pytest.approx(lens[0])
+        assert min(lens) > 0.05  # improved from 0.0113
+        hulls = [_family_hull(o.shape, 0.2 + 0.01 + W / 2.0) for o in pads]
+        assert _absorb_terminal_stubs(out, hulls, W) == out
+
+    def test_removable_class_has_no_sub_width_segment(self):
+        # The sweep-derived pad-exit fixture: before the pass the last
+        # segment is 0.0875 mm; afterwards every segment is full width.
+        res = route_engine(
+            TestTerminalStubAbsorption.S,
+            TestTerminalStubAbsorption.E,
+            TestTerminalStubAbsorption()._obstacles(),
+            W,
+            W,
+            corner_mode="mitered45",
+        )
+        for a, b in zip(res.path, res.path[1:]):
+            assert math.hypot(b[0] - a[0], b[1] - a[1]) >= W - 1e-9

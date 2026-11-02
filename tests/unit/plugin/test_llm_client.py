@@ -5,6 +5,7 @@ import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
 import json
+import logging
 import os
 import re
 import ssl
@@ -19,7 +20,7 @@ import pytest
 
 from kicad_plugin import llm_client
 from kicad_plugin import session_store as sstore
-from kicad_plugin.llm_client import LLMClient, _subprocess_sse_stream
+from kicad_plugin.llm_client import LLMClient, LLMTurnFailure, _subprocess_sse_stream
 from kicad_plugin.settings import DEFAULT_LLM_USER_AGENT
 from kicad_plugin.tool_registry import TOOL_POLICIES
 
@@ -1129,6 +1130,7 @@ class TestRunIntegration:
         client._call_llm = MagicMock(side_effect=[tool_response, {"error": "API down"}])
         client._enabled_tools = {"set_footprint_position"}
 
+        failures = []
         with patch("kicad_plugin.llm_client.call_mcp_tool") as mock_call_tool:
             mock_call_tool.side_effect = [
                 {"success": True},  # save_document
@@ -1136,18 +1138,21 @@ class TestRunIntegration:
                 {"success": True, "pcb_path": "/tmp/board.kicad_pcb"},
                 {"success": True, "reloaded": ["/tmp/board.kicad_pcb"], "failed": []},
             ]
-            result = client.run("move R1", context_block="")
+            result = client.run("move R1", context_block="", on_turn_failure=failures.append)
 
         assert result == "[LLM error] API down"
+        assert failures == [LLMTurnFailure.LLM_ERROR]
         assert mock_call_tool.call_args_list[-1].args == (
             client._mcp_base_url,
             "reload_kicad",
             {"paths": ["/tmp/board.kicad_pcb"]},
         )
 
-    def test_max_iterations_exit_still_reloads_dirty_path(self):
+    def test_max_iterations_exit_still_reloads_dirty_path(self, caplog):
         """Hitting the iteration cap still flushes dirty paths via the shared
-        end-of-turn reload."""
+        end-of-turn reload, logs a WARNING with the reply so the failure is
+        greppable, and reports the structured ITERATION_CAP category
+        (issue #191)."""
         client = _make_client()
         tool_response = {
             "finish_reason": "tool_calls",
@@ -1173,19 +1178,67 @@ class TestRunIntegration:
         client._call_llm = MagicMock(return_value=tool_response)  # never stops calling tools
         client._enabled_tools = {"set_footprint_position"}
 
+        failures = []
         with patch("kicad_plugin.llm_client.call_mcp_tool") as mock_call_tool:
             mock_call_tool.side_effect = lambda base, name, args, timeout=None: (
                 {"success": True, "reloaded": ["/tmp/board.kicad_pcb"], "failed": []}
                 if name == "reload_kicad"
                 else {"success": True}
             )
-            result = client.run("move R1", context_block="")
+            # The plugin logger sets propagate=False (kicad_plugin/__init__),
+            # so pytest's root-level capture never sees the record; attach the
+            # capture handler to the client logger itself, as the plugin's own
+            # FileHandler would receive it.
+            logger = logging.getLogger("kicad_plugin.llm_client")
+            logger.addHandler(caplog.handler)
+            try:
+                with caplog.at_level("WARNING", logger="kicad_plugin.llm_client"):
+                    result = client.run(
+                        "move R1", context_block="", on_turn_failure=failures.append
+                    )
+            finally:
+                logger.removeHandler(caplog.handler)
 
-        assert (
-            result == "[Error] Maximum tool-call iterations reached. Please try a simpler request."
-        )
+        assert failures == [LLMTurnFailure.ITERATION_CAP]
+
+        cap_reply = "[Error] Maximum tool-call iterations reached. Please try a simpler request."
+        assert result == cap_reply
+        assert cap_reply in caplog.text  # greppable failure in the plugin log
         assert mock_call_tool.call_args_list[-1][0][1] == "reload_kicad"
         assert mock_call_tool.call_args_list[-1][0][2] == {"paths": ["/tmp/board.kicad_pcb"]}
+
+    def test_compaction_error_fires_failure_callback(self):
+        """A compaction failure reports COMPACTION_ERROR through
+        on_turn_failure before any LLM call (issue #191, Plan A)."""
+        client = _make_client()
+        client._call_llm = MagicMock()
+        failures = []
+        with patch.object(client, "_maybe_compact", return_value="context window overflow"):
+            result = client.run("hi", context_block="", on_turn_failure=failures.append)
+
+        assert result == "[Error] context window overflow"
+        assert failures == [LLMTurnFailure.COMPACTION_ERROR]
+        client._call_llm.assert_not_called()
+
+    def test_framework_error_fires_failure_callback(self):
+        """A missing tool policy reports FRAMEWORK_ERROR through
+        on_turn_failure before any LLM call (issue #191, Plan A)."""
+        client = _make_client()
+        client._call_llm = MagicMock()
+        client._fetch_tool_definitions = MagicMock(return_value=[])
+        failures = []
+        with (
+            patch.object(client, "_maybe_compact", return_value=None),
+            patch(
+                "kicad_plugin.llm_client.get_missing_tool_policies",
+                return_value=["mystery_tool"],
+            ),
+        ):
+            result = client.run("hi", context_block="", on_turn_failure=failures.append)
+
+        assert "mystery_tool" in result
+        assert failures == [LLMTurnFailure.FRAMEWORK_ERROR]
+        client._call_llm.assert_not_called()
 
     def test_tool_exception_recorded_and_still_reloads_dirty_path(self):
         """A tool raising mid-turn no longer escapes run() (issue #176): the
@@ -1429,7 +1482,8 @@ class TestRunIntegration:
                 {"project_file": "/tmp/board.kicad_pro"},
             ),
         ]
-        tool_result = json.loads(client._history[-2]["content"])
+        tool_results = [m for m in client._history if m["role"] == "tool"]
+        tool_result = json.loads(tool_results[0]["content"])
         assert tool_result["success"] is False
         assert (
             "Failed to save project version before set_footprint_position" in tool_result["error"]
@@ -1579,11 +1633,13 @@ class TestMCPToolTimeoutAndInterrupt:
             time.sleep(10)  # longer than the configured threshold
             raise AssertionError("blocking call must be abandoned on timeout")
 
+        failures = []
         with patch("kicad_plugin.llm_client.call_mcp_tool", side_effect=_block):
-            result = client.run("do it", context_block="")
+            result = client.run("do it", context_block="", on_turn_failure=failures.append)
 
         assert "[Error]" in result
         assert "did not complete within" in result
+        assert failures == [LLMTurnFailure.TIMED_OUT]
         tool_results = [m for m in client._history if m["role"] == "tool"]
         assert len(tool_results) == 1
         recorded = json.loads(tool_results[0]["content"])
@@ -1609,16 +1665,23 @@ class TestMCPToolTimeoutAndInterrupt:
             time.sleep(0.1)
             cancel.set()
 
+        failures = []
         with patch("kicad_plugin.llm_client.call_mcp_tool", side_effect=_block):
             stopper = threading.Thread(target=_press_stop)
             stopper.start()
             try:
-                result = client.run("do it", context_block="", cancel_event=cancel)
+                result = client.run(
+                    "do it",
+                    context_block="",
+                    cancel_event=cancel,
+                    on_turn_failure=failures.append,
+                )
             finally:
                 stopper.join(timeout=2)
 
         assert "[Interrupted]" in result
         assert "interrupted by user" in result
+        assert failures == [LLMTurnFailure.INTERRUPTED]
         tool_results = [m for m in client._history if m["role"] == "tool"]
         assert len(tool_results) == 1
         recorded = json.loads(tool_results[0]["content"])
@@ -1969,6 +2032,332 @@ class TestMCPToolTimeoutAndInterrupt:
         assert recorded["success"] is False
         assert recorded["timed_out"] is True
         client._call_llm.assert_called_once()
+
+
+class TestStatusPollBlocking:
+    """Issue #190: status polls for background operations must not burn the
+    turn's iteration cap.  When get_symbol_sync_status /
+    get_footprint_sync_status report the operation still running, the client
+    re-queries them client-side (bounded by the per-call timeout) and hands
+    the model the final snapshot, so the whole wait costs one poll round."""
+
+    def _tool_response(self, name="get_symbol_sync_status", args=None, call_id="tc1"):
+        return {
+            "finish_reason": "tool_calls",
+            "message": {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": call_id,
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": json.dumps(args or {}),
+                        },
+                    }
+                ],
+            },
+        }
+
+    def test_status_poll_blocks_until_op_finishes_without_extra_rounds(self):
+        """A background op that takes several poll snapshots completes inside
+        the model's single status call: no extra LLM rounds are consumed and
+        the recorded tool result is the final snapshot."""
+        client = _make_client()
+        client._call_llm = MagicMock(
+            side_effect=[
+                self._tool_response(),  # model polls the sync status
+                {"finish_reason": "stop", "message": {"content": "sync done"}},
+            ]
+        )
+        status_calls = {"n": 0}
+
+        def _status(base_url, tool_name, args, timeout=None):
+            if tool_name != "get_symbol_sync_status":
+                return {"success": True}
+            status_calls["n"] += 1
+            if status_calls["n"] < 3:
+                return {"running": True, "current": status_calls["n"], "total": 10}
+            return {
+                "running": False,
+                "current": 10,
+                "total": 10,
+                "last_result": {"symbols": 1234},
+            }
+
+        with (
+            patch("kicad_plugin.llm_client._STATUS_POLL_INTERVAL_SECONDS", 0.01),
+            patch("kicad_plugin.llm_client.call_mcp_tool", side_effect=_status),
+        ):
+            result = client.run("sync symbols", context_block="")
+
+        assert result == "sync done"
+        # The whole wait happened inside one model poll round: round 1 asks
+        # for the status, round 2 sees the finished sync and answers.
+        assert client._call_llm.call_count == 2
+        # Intermediate snapshots were polled client-side, not round-tripped
+        # through the model.
+        assert status_calls["n"] == 3
+        tool_results = [m for m in client._history if m["role"] == "tool"]
+        assert len(tool_results) == 1
+        recorded = json.loads(tool_results[0]["content"])
+        assert recorded["running"] is False
+        assert recorded["last_result"] == {"symbols": 1234}
+
+    def test_status_poll_when_op_already_done_does_not_block(self):
+        """A status call that reports the op finished is a plain single MCP
+        call: no client-side re-polling happens."""
+        client = _make_client()
+        client._call_llm = MagicMock(
+            side_effect=[
+                self._tool_response(),
+                {"finish_reason": "stop", "message": {"content": "ok"}},
+            ]
+        )
+
+        def _status(base_url, tool_name, args, timeout=None):
+            return {"running": False, "last_result": {"symbols": 5}}
+
+        with patch("kicad_plugin.llm_client.call_mcp_tool") as mock_call_tool:
+            mock_call_tool.side_effect = _status
+            result = client.run("sync symbols", context_block="")
+
+        assert result == "ok"
+        assert mock_call_tool.call_count == 1
+
+    def test_status_poll_budget_exhaustion_returns_last_snapshot(self):
+        """When the sync outlasts the wait budget the last snapshot is
+        returned (no error, no timeout marker) and the turn continues; the
+        model may poll again with a fresh budget.  Budget exhaustion is not
+        a fatal exit, so the on_turn_failure callback must NOT fire (issue
+        #191: only the iteration-cap else-branch — reached when the model
+        re-polls past _MAX_ITERATIONS — reports a failure)."""
+        client = _make_client()
+        client._mcp_tool_timeout = 0.1
+        client._call_llm = MagicMock(
+            side_effect=[
+                self._tool_response(),
+                {"finish_reason": "stop", "message": {"content": "still syncing, try later"}},
+            ]
+        )
+        failures: list = []
+
+        def _status(base_url, tool_name, args, timeout=None):
+            return {"running": True, "current": 5, "total": 10}
+
+        with (
+            patch("kicad_plugin.llm_client._STATUS_POLL_INTERVAL_SECONDS", 0.02),
+            patch("kicad_plugin.llm_client.call_mcp_tool", side_effect=_status),
+        ):
+            result = client.run("sync symbols", context_block="", on_turn_failure=failures.append)
+
+        assert result == "still syncing, try later"
+        assert failures == []  # budget exhaustion is not a fatal exit
+        assert client._call_llm.call_count == 2
+        tool_results = [m for m in client._history if m["role"] == "tool"]
+        assert len(tool_results) == 1
+        recorded = json.loads(tool_results[0]["content"])
+        # Last snapshot, not a synthesized error.
+        assert recorded["running"] is True
+        assert recorded["current"] == 5
+        assert "timed_out" not in recorded
+        assert recorded.get("interrupted") is not True
+
+    def test_cancel_during_status_wait_aborts_turn(self):
+        """Pressing Stop while the client blocks on a running sync aborts the
+        turn immediately with the interruption recorded (issue #176
+        semantics), without waiting out another LLM round."""
+        client = _make_client()
+        client._call_llm = MagicMock(return_value=self._tool_response())
+        cancel = threading.Event()
+
+        def _status(base_url, tool_name, args, timeout=None):
+            return {"running": True, "current": 1, "total": 10}
+
+        def _press_stop():
+            time.sleep(0.05)
+            cancel.set()
+
+        with (
+            patch("kicad_plugin.llm_client._STATUS_POLL_INTERVAL_SECONDS", 0.02),
+            patch("kicad_plugin.llm_client.call_mcp_tool", side_effect=_status),
+        ):
+            stopper = threading.Thread(target=_press_stop)
+            stopper.start()
+            try:
+                result = client.run("sync symbols", context_block="", cancel_event=cancel)
+            finally:
+                stopper.join(timeout=2)
+
+        assert "[Interrupted]" in result
+        assert "get_symbol_sync_status interrupted by user" in result
+        tool_results = [m for m in client._history if m["role"] == "tool"]
+        assert len(tool_results) == 1
+        recorded = json.loads(tool_results[0]["content"])
+        assert recorded["interrupted"] is True
+        client._call_llm.assert_called_once()
+
+    def test_status_poll_emits_progress_notice_while_waiting(self):
+        """A blocking status-poll wait surfaces a transient progress notice
+        ("Symbol sync: 1/10 — Device/R") on the status channel (issue #190):
+        the user sees real sync progress instead of a silent block.  A short
+        wait emits exactly one notice — the immediate one; the 5 s rate
+        window is never crossed."""
+        client = _make_client()
+        client._call_llm = MagicMock(
+            side_effect=[
+                self._tool_response(),  # model polls the sync status
+                {"finish_reason": "stop", "message": {"content": "sync done"}},
+            ]
+        )
+        events: list[dict] = []
+        status_calls = {"n": 0}
+
+        def _status(base_url, tool_name, args, timeout=None):
+            status_calls["n"] += 1
+            if status_calls["n"] < 3:
+                return {
+                    "running": True,
+                    "current": status_calls["n"],
+                    "total": 10,
+                    "current_library": "Device/R",
+                }
+            return {"running": False, "current": 10, "total": 10, "last_result": {"symbols": 1}}
+
+        with (
+            patch("kicad_plugin.llm_client._STATUS_POLL_INTERVAL_SECONDS", 0.01),
+            patch("kicad_plugin.llm_client.call_mcp_tool", side_effect=_status),
+        ):
+            result = client.run("sync symbols", context_block="", on_stream_event=events.append)
+
+        assert result == "sync done"
+        progress = [
+            e for e in events if e.get("type") == "status" and "Symbol sync:" in e.get("text", "")
+        ]
+        assert len(progress) == 1
+        # The first notice surfaces the initial status snapshot.
+        assert progress[0]["text"] == "Symbol sync: 1/10 — Device/R"
+        assert progress[0]["color_hex"] == "#BE6400"
+        # The snapshot returned to the model is still the final one.
+        recorded = json.loads([m for m in client._history if m["role"] == "tool"][0]["content"])
+        assert recorded["running"] is False
+
+    def test_status_poll_emits_no_wait_notice_when_not_blocking(self):
+        """An op that is already done never emits a wait notice: the status
+        channel stays silent for a non-blocking poll."""
+        client = _make_client()
+        client._call_llm = MagicMock(
+            side_effect=[
+                self._tool_response(),
+                {"finish_reason": "stop", "message": {"content": "ok"}},
+            ]
+        )
+        events: list[dict] = []
+
+        def _status(base_url, tool_name, args, timeout=None):
+            return {"running": False, "last_result": {"symbols": 5}}
+
+        with patch("kicad_plugin.llm_client.call_mcp_tool") as mock_call_tool:
+            mock_call_tool.side_effect = _status
+            result = client.run("sync symbols", context_block="", on_stream_event=events.append)
+
+        assert result == "ok"
+        assert mock_call_tool.call_count == 1
+        assert [e for e in events if e.get("type") == "status"] == []
+
+    def test_status_poll_progress_notices_rate_limited_to_5s(self):
+        """Progress notices are rate-limited to one per 5 s of elapsed wait
+        time (plus the immediate first one) — the UI is not flooded once per
+        poll — and each notice surfaces the freshest progress seen.  Uses a
+        fake clock so the cadence is deterministic."""
+        client = _make_client()
+        client._mcp_tool_timeout = 60
+        client._call_llm = MagicMock(
+            side_effect=[
+                self._tool_response(),
+                {"finish_reason": "stop", "message": {"content": "ok"}},
+            ]
+        )
+        events: list[tuple[float, dict]] = []
+        status_calls = {"n": 0}
+        fake_now = {"t": 0.0}
+
+        def _status(base_url, tool_name, args, timeout=None):
+            status_calls["n"] += 1
+            return {
+                "running": True,
+                "current": status_calls["n"],
+                "total": 100,
+                "current_library": "Device",
+            }
+
+        def _fake_sleep(seconds):
+            fake_now["t"] += seconds
+
+        def _fake_monotonic():
+            return fake_now["t"]
+
+        def _collect(evt):
+            events.append((fake_now["t"], evt))
+
+        with (
+            patch("kicad_plugin.llm_client.call_mcp_tool", side_effect=_status),
+            patch("kicad_plugin.llm_client.time.sleep", side_effect=_fake_sleep),
+            patch("kicad_plugin.llm_client.time.monotonic", side_effect=_fake_monotonic),
+        ):
+            result = client.run("sync symbols", context_block="", on_stream_event=_collect)
+
+        assert result == "ok"
+        progress = [
+            (t, e)
+            for (t, e) in events
+            if e.get("type") == "status" and "Symbol sync:" in e.get("text", "")
+        ]
+        # Wait runs the full 60 s budget; notices at t=0 then every 5 s.
+        assert [t for t, _ in progress] == [float(k) for k in range(0, 60, 5)]
+        # Each notice carries the freshest snapshot: the emit at t=5*k saw
+        # the poll right before it (current = 5*k + 1).
+        currents = [
+            int(re.search(r"Symbol sync: (\d+)/100 — Device", e["text"]).group(1))
+            for _, e in progress
+        ]
+        assert currents == [5 * k + 1 for k in range(len(progress))]
+        assert all(e["color_hex"] == "#BE6400" for _, e in progress)
+
+    def test_wait_status_text_surfaces_progress_guards(self):
+        """The progress notice format guards total==0 ("preparing…") and a
+        missing/empty current_library (no trailing dash segment)."""
+        status = llm_client._wait_status_text
+        assert (
+            status(
+                "get_symbol_sync_status",
+                {"current": 342, "total": 1250, "current_library": "Device/R"},
+            )
+            == "Symbol sync: 342/1250 — Device/R"
+        )
+        assert (
+            status("get_symbol_sync_status", {"current": 342, "total": 1250, "current_library": ""})
+            == "Symbol sync: 342/1250"
+        )
+        assert (
+            status("get_symbol_sync_status", {"current": 0, "total": 0, "current_library": None})
+            == "Symbol sync: preparing…"
+        )
+        assert (
+            status(
+                "get_symbol_sync_status", {"current": 0, "total": 0, "current_library": "Device"}
+            )
+            == "Symbol sync: preparing… — Device"
+        )
+        assert (
+            status("get_footprint_sync_status", {"current": 0, "total": 0, "current_library": ""})
+            == "Footprint sync: preparing…"
+        )
+        # Unmapped name falls back to the raw tool name (defensive).
+        assert (
+            status("get_board_info", {"current": 1, "total": 2, "current_library": ""})
+            == "get_board_info: 1/2"
+        )
 
 
 class TestToolPolicyRegistry:
@@ -2750,10 +3139,14 @@ class TestStreaming:
             "message": {"content": "done", "tool_calls": []},
         }
         on_event = MagicMock()
+        on_failure = MagicMock()
         client._call_llm = MagicMock(return_value=final_response)
         client._fetch_tool_definitions = MagicMock(return_value=[])
 
-        result = client.run("hello", context_block="", on_stream_event=on_event)
+        result = client.run(
+            "hello", context_block="", on_stream_event=on_event, on_turn_failure=on_failure
+        )
+        on_failure.assert_not_called()  # a normal turn reports no failure
 
         assert result == "done"
         # _call_llm must have been called with on_stream_event=on_event
@@ -4443,6 +4836,107 @@ class TestCallMcpToolImageKey:
         assert "unreachable" in out["error"]
 
 
+# ---------------------------------------------------------------------------
+# call_mcp_tool: isError normalization (issue #195)
+# ---------------------------------------------------------------------------
+
+
+class TestCallMcpToolIsError:
+    """A FastMCP result with isError: true (e.g. a pydantic validation
+    failure) must normalize to success: False with a readable error —
+    never the old behavior of wrapping the error prose in success: True."""
+
+    def _mock_call(self, body):
+        resp = MagicMock()
+        resp.read.return_value = json.dumps(body).encode()
+        resp.__enter__.return_value = resp
+        with patch("urllib.request.urlopen", return_value=resp):
+            return llm_client.call_mcp_tool("http://127.0.0.1:9", "list_symbol_libraries", {})
+
+    def test_validation_error_is_failure_not_success(self):
+        """The observed FastMCP validation-failure shape: isError with a
+        prose text block ("Unexpected keyword argument: 'query'")."""
+        out = self._mock_call(
+            {
+                "result": {
+                    "isError": True,
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "1 validation error for call[list_symbol_libraries]\n"
+                                "query\n  Unexpected keyword argument "
+                                "[type=unexpected_keyword_argument, "
+                                "input_value='Switch', input_type=str]"
+                            ),
+                        }
+                    ],
+                }
+            }
+        )
+        assert out["success"] is False
+        assert "Unexpected keyword argument" in out["error"]
+
+    def test_multiple_text_blocks_are_joined(self):
+        out = self._mock_call(
+            {
+                "result": {
+                    "isError": True,
+                    "content": [
+                        {"type": "text", "text": "first failure"},
+                        {"type": "text", "text": "second failure"},
+                    ],
+                }
+            }
+        )
+        assert out["success"] is False
+        assert out["error"] == "first failure\nsecond failure"
+
+    def test_structured_content_error_preferred(self):
+        out = self._mock_call(
+            {
+                "result": {
+                    "isError": True,
+                    "structuredContent": {"error": "boom: bad argument"},
+                    "content": [{"type": "text", "text": "ignored prose"}],
+                }
+            }
+        )
+        assert out["success"] is False
+        assert out["error"] == "boom: bad argument"
+
+    def test_iserror_without_content_has_fallback_error(self):
+        out = self._mock_call({"result": {"isError": True}})
+        assert out["success"] is False
+        assert out["error"]
+
+    def test_success_result_with_iserror_false_unchanged(self):
+        out = self._mock_call(
+            {
+                "result": {
+                    "isError": False,
+                    "content": [{"type": "text", "text": json.dumps({"ok": 1})}],
+                }
+            }
+        )
+        assert out == {"ok": 1}
+
+    def test_iserror_wins_over_decodable_json_text(self):
+        """A text block that parses as JSON must NOT be returned as
+        success when the server flagged isError — the failure wins over
+        the success-path json.loads (precedence pin, issue #195)."""
+        out = self._mock_call(
+            {
+                "result": {
+                    "isError": True,
+                    "content": [{"type": "text", "text": json.dumps({"ok": 1})}],
+                }
+            }
+        )
+        assert out["success"] is False
+        assert out["error"] == json.dumps({"ok": 1})
+
+
 # Amazon Bedrock provider: OpenAI-compatible endpoint with bearer (Bedrock
 # API key) or AWS SigV4 auth.
 # ---------------------------------------------------------------------------
@@ -4598,3 +5092,266 @@ class TestBedrockDispatch:
         assert types == ["text_start", "text_chunk", "text_end"]
         assert events[1]["content"] == "hello world"
         assert out["finish_reason"] == "stop"
+
+
+# ---------------------------------------------------------------------------
+# Issue #208: harness-side skill auto-injection via frontmatter tools:
+# ---------------------------------------------------------------------------
+
+
+def _write_declared_skill(skills_dir, name, tools, body="Body of the skill."):
+    """Write a skill file with a frontmatter ``tools:`` declaration."""
+    tools_line = f"tools: [{', '.join(tools)}]\n" if tools else ""
+    (skills_dir / f"{name}.md").write_text(
+        f'---\nname: {name}\npriority: "50"\ndescription: "{name} guide"\n'
+        f"{tools_line}---\n# {name}\n{body}\n",
+        encoding="utf-8",
+    )
+
+
+def _guide_messages(history):
+    """Return the user-role skill-guide messages injected into *history*."""
+    return [
+        m
+        for m in history
+        if m.get("role") == "user"
+        and isinstance(m.get("content"), str)
+        and m["content"].startswith("[Skill guide: ")
+    ]
+
+
+class TestSkillAutoInject:
+    """Frontmatter-declared skills must auto-inject into history after the
+    first call to one of their tools, exactly once per session (issue #208)."""
+
+    def _tool_response(self, name, tc_id="tc1", args=None):
+        return {
+            "finish_reason": "tool_calls",
+            "message": {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": tc_id,
+                        "type": "function",
+                        "function": {"name": name, "arguments": json.dumps(args or {})},
+                    }
+                ],
+            },
+        }
+
+    def _client_with_placement_tool(self, tmp_path):
+        """Client whose registry exposes set_footprint_position and whose
+        skills dir declares it for the pcb-placement skill.
+
+        Returns ``(client, skills_dir)``; the caller wraps its run in
+        ``with patch.object(llm_client, "_SKILLS_DIR", skills_dir):``.
+        """
+        client = _make_client()
+        client._tool_registry = {
+            "set_footprint_position": _fake_tool_def("set_footprint_position"),
+            "align_footprints": _fake_tool_def("align_footprints"),
+        }
+        client._enabled_tools = {"set_footprint_position"}
+        skills_dir = tmp_path / "skills"
+        skills_dir.mkdir()
+        _write_declared_skill(
+            skills_dir,
+            "pcb-placement",
+            ["set_footprint_position", "align_footprints"],
+            body="Place bodies must not overlap.",
+        )
+        return client, skills_dir
+
+    def _ok_server(self, *_args, **_kwargs):
+        return {"success": True}
+
+    def test_first_declared_tool_call_injects_skill_body(self, tmp_path):
+        """Red-green core: after a call to a declared tool, the skill body is
+        present in history as a user-role message positioned AFTER that
+        batch's tool results."""
+        client, skills_dir = self._client_with_placement_tool(tmp_path)
+        client._call_llm = MagicMock(
+            side_effect=[
+                self._tool_response(
+                    "set_footprint_position",
+                    args={
+                        "pcb_path": "/tmp/board.kicad_pcb",
+                        "items": [{"reference": "R1", "x": 1.0}],
+                    },
+                ),
+                {"finish_reason": "stop", "message": {"content": "done"}},
+            ]
+        )
+        with (
+            patch.object(llm_client, "_SKILLS_DIR", skills_dir),
+            patch("kicad_plugin.llm_client.call_mcp_tool", side_effect=self._ok_server),
+        ):
+            result = client.run("move R1", context_block="")
+
+        assert result == "done"
+        history = client.get_history()
+        guides = _guide_messages(history)
+        assert len(guides) == 1
+        assert "[Skill guide: pcb-placement]" in guides[0]["content"]
+        assert "Place bodies must not overlap." in guides[0]["content"]
+        # Positioned after the batch's tool-results message, not between the
+        # assistant tool_calls message and its results.
+        tool_idx = next(i for i, m in enumerate(history) if m["role"] == "tool")
+        guide_idx = next(i for i, m in enumerate(history) if m is guides[0])
+        assert guide_idx > tool_idx
+        assert client._injected_skills == {"pcb-placement"}
+
+    def test_repeat_trigger_injects_nothing(self, tmp_path):
+        """A second call to a declared tool in the same session is a pure
+        no-op: no body, no 'already loaded' note, no extra mutation."""
+        client, skills_dir = self._client_with_placement_tool(tmp_path)
+        args = {"pcb_path": "/tmp/board.kicad_pcb", "items": [{"reference": "R1", "x": 1.0}]}
+        client._call_llm = MagicMock(
+            side_effect=[
+                self._tool_response("set_footprint_position", tc_id="tc1", args=args),
+                self._tool_response("set_footprint_position", tc_id="tc2", args=args),
+                {"finish_reason": "stop", "message": {"content": "done"}},
+            ]
+        )
+        with (
+            patch.object(llm_client, "_SKILLS_DIR", skills_dir),
+            patch("kicad_plugin.llm_client.call_mcp_tool", side_effect=self._ok_server),
+        ):
+            result = client.run("move R1 again", context_block="")
+
+        assert result == "done"
+        assert len(_guide_messages(client.get_history())) == 1
+        assert client._injected_skills == {"pcb-placement"}
+
+    def test_skill_without_tools_never_injected(self, tmp_path):
+        """Skills without a frontmatter ``tools:`` field are never
+        auto-injected; get_skill remains their only load path."""
+        client = _make_client()
+        client._tool_registry = {"get_board_info": _fake_tool_def("get_board_info")}
+        client._enabled_tools = {"get_board_info"}
+        skills_dir = tmp_path / "skills"
+        skills_dir.mkdir()
+        _write_skill_file(skills_dir, "plain-skill", "Plain skill without tools")
+        with patch.object(llm_client, "_SKILLS_DIR", skills_dir):
+            client._call_llm = MagicMock(
+                side_effect=[
+                    self._tool_response("get_board_info", args={"pcb_path": "/tmp/b.kicad_pcb"}),
+                    {"finish_reason": "stop", "message": {"content": "ok"}},
+                ]
+            )
+            with patch("kicad_plugin.llm_client.call_mcp_tool", side_effect=self._ok_server):
+                result = client.run("inspect board", context_block="")
+
+        assert result == "ok"
+        assert _guide_messages(client.get_history()) == []
+        assert client._injected_skills == set()
+
+    def test_declared_tool_missing_from_registry_warns_not_crashes(self, tmp_path):
+        """A frontmatter-declared tool absent from the MCP registry yields a
+        warning at map load and is tolerated — no crash, no dropped entries."""
+        client = _make_client()
+        client._tool_registry = {"real_tool": _fake_tool_def("real_tool")}
+        skills_dir = tmp_path / "skills"
+        skills_dir.mkdir()
+        _write_declared_skill(skills_dir, "ghost-skill", ["real_tool", "ghost_tool"])
+
+        # kicad_plugin loggers do not propagate to the root (plugin logging
+        # sets propagate=False), so caplog never sees them — attach a capture
+        # handler straight to the module logger instead.
+        warnings: list[str] = []
+        handler = logging.Handler()
+        handler.emit = lambda record: warnings.append(record.getMessage())  # type: ignore[method-assign]
+        logger = logging.getLogger("kicad_plugin.llm_client")
+        logger.addHandler(handler)
+        try:
+            with patch.object(llm_client, "_SKILLS_DIR", skills_dir):
+                mapping = client._get_skill_tool_map()
+        finally:
+            logger.removeHandler(handler)
+
+        assert any("ghost_tool" in w and "ghost-skill" in w for w in warnings)
+        assert mapping["ghost_tool"].name == "ghost-skill"
+
+    def test_system_prompt_byte_identical_before_after_injection(self, tmp_path):
+        """Injection must never touch the system prompt (cache stability)."""
+        client, skills_dir = self._client_with_placement_tool(tmp_path)
+        args = {"pcb_path": "/tmp/board.kicad_pcb", "items": [{"reference": "R1", "x": 1.0}]}
+        client._call_llm = MagicMock(
+            side_effect=[
+                self._tool_response("set_footprint_position", tc_id="tc1", args=args),
+                self._tool_response("set_footprint_position", tc_id="tc2", args=args),
+                {"finish_reason": "stop", "message": {"content": "done"}},
+            ]
+        )
+        with (
+            patch.object(llm_client, "_SKILLS_DIR", skills_dir),
+            patch("kicad_plugin.llm_client.call_mcp_tool", side_effect=self._ok_server),
+        ):
+            client.run("move R1", context_block="")
+
+        systems = [call.args[0] for call in client._call_llm.call_args_list]
+        assert len(systems) == 3
+        assert systems[0] == systems[1] == systems[2]
+
+    def test_no_user_message_between_assistant_and_tool_results(self, tmp_path):
+        """Provider pairing stays intact: every assistant tool_calls message
+        is immediately followed by its role:'tool' results, even when a skill
+        guide was injected after the previous batch."""
+        client, skills_dir = self._client_with_placement_tool(tmp_path)
+        args = {"pcb_path": "/tmp/board.kicad_pcb", "items": [{"reference": "R1", "x": 1.0}]}
+        client._call_llm = MagicMock(
+            side_effect=[
+                self._tool_response("set_footprint_position", tc_id="tc1", args=args),
+                self._tool_response("set_footprint_position", tc_id="tc2", args=args),
+                {"finish_reason": "stop", "message": {"content": "done"}},
+            ]
+        )
+        with (
+            patch.object(llm_client, "_SKILLS_DIR", skills_dir),
+            patch("kicad_plugin.llm_client.call_mcp_tool", side_effect=self._ok_server),
+        ):
+            result = client.run("move R1", context_block="")
+
+        assert result == "done"
+        history = client.get_history()
+        for i, msg in enumerate(history):
+            if msg.get("role") != "assistant" or not msg.get("tool_calls"):
+                continue
+            # The very next message must be a tool result (no user message
+            # may sit between the assistant tool_calls and its results).
+            assert history[i + 1].get("role") == "tool"
+            expected = {tc["id"] for tc in msg["tool_calls"]}
+            j = i + 1
+            while j < len(history) and history[j].get("role") == "tool":
+                expected.discard(history[j].get("tool_call_id"))
+                j += 1
+            assert not expected, f"orphaned tool_call_ids in history: {expected}"
+
+
+class TestSkillFrontMatterToolsParsing:
+    """Frontmatter ``tools:`` list syntax parsing (issue #208)."""
+
+    def test_bracket_list(self):
+        text = "---\nname: x\ntools: [set_footprint_position, align_footprints]\n---\nbody"
+        meta = llm_client._parse_skill_front_matter(text)
+        assert meta["tools"] == ["set_footprint_position", "align_footprints"]
+
+    def test_comma_separated(self):
+        text = "---\nname: x\ntools: a, b, c\n---\nbody"
+        meta = llm_client._parse_skill_front_matter(text)
+        assert meta["tools"] == ["a", "b", "c"]
+
+    def test_bracket_no_spaces(self):
+        text = "---\nname: x\ntools: [a,b,c]\n---\nbody"
+        meta = llm_client._parse_skill_front_matter(text)
+        assert meta["tools"] == ["a", "b", "c"]
+
+    def test_empty_tools_field(self):
+        text = "---\nname: x\ntools:\n---\nbody"
+        meta = llm_client._parse_skill_front_matter(text)
+        assert meta["tools"] == []
+
+    def test_missing_tools_field(self):
+        text = '---\nname: x\npriority: 50\ndescription: "d"\n---\nbody'
+        meta = llm_client._parse_skill_front_matter(text)
+        assert "tools" not in meta

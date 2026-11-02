@@ -2,6 +2,7 @@
 name: pcb-footprint-library
 priority: 40
 description: "Footprint index sync, library listing, search, and inspection"
+tools: [sync_footprint_index, get_footprint_sync_status, list_footprint_libraries, search_footprints, get_footprint_details, find_footprints_not_in_libraries, create_footprint_library, add_footprints_to_library]
 ---
 - Build/refresh the footprint index (background) for a project:
   **sync_footprint_index(project_path?, force)** — ``project_path`` is

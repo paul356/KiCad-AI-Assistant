@@ -31,13 +31,18 @@ log = logging.getLogger(__name__)
 #   {"type": "text_chunk", "content": str}              streamed content
 #   {"type": "text_end"}                                response text complete -> finalise draft
 #   {"type": "tool_call", "name": str, "args": dict, "result": Any}
-#   {"type": "turn_end", "reply": str}                  turn complete (takes over _on_reply)
+#   {"type": "turn_end", "reply": str, "failure": str | None}   turn complete (takes over _on_reply)
 #   {"type": "status", "text": str, "color_hex": str}   transient system notice (e.g. compacted history)
 #
 # The panel tags every event with the generation of the turn it belongs to
 # (``_gen``) and drops events of older turns before calling apply_stream_event.
 
 AI_ENTRY_TYPES = ("user", "ai")
+
+# Colour for a turn-end error reply surfaced as a status notice — mirrors the
+# panel's _C_ERR_HEX.  Kept here (instead of importing panel, which is wx
+# bound) so the state machine stays importable without a display.
+STATUS_ERR_HEX = "#BE1E1E"
 
 
 def make_ai_entry(text: str, timestamp: str) -> dict[str, Any]:
@@ -133,13 +138,26 @@ def apply_stream_event(
             base.pending = ""
             base.entries_changed = True
         reply = evt.get("reply") or ""
-        if not turn_had_text and reply:
-            # Non-streamed turn (LLM/framework error, iteration cap, or a
-            # cancelled turn whose text never reached the draft): the reply
-            # is the only answer text this turn produced.  Mirrors the old
-            # ``was_streamed=False`` branch of _on_reply.
-            entries.append(make_ai_entry(reply, timestamp()))
-            base.entries_changed = True
+        failure = evt.get("failure")
+        if reply:
+            if not turn_had_text:
+                # Non-streamed turn (LLM/framework error, iteration cap, or a
+                # cancelled turn whose text never reached the draft): the reply
+                # is the only answer text this turn produced.  Mirrors the old
+                # ``was_streamed=False`` branch of _on_reply.
+                entries.append(make_ai_entry(reply, timestamp()))
+                base.entries_changed = True
+            elif failure is not None:
+                # The draft above (or the ai entry archived at text_end) is
+                # the visible answer, so the reply is NOT appended as a second
+                # AI entry; a failed turn must still surface or it looks like
+                # the model silently stopped (issue #191).  Only the
+                # structured ``failure`` category can mark a turn failed —
+                # reply text is never inspected for failure detection, so an
+                # explicit failure=None or a keyless event is a normal turn
+                # even when the text happens to open with "[Error]".
+                entries.append({"type": "status", "text": reply, "color_hex": STATUS_ERR_HEX})
+                base.entries_changed = True
         return base
 
     if etype == "status":

@@ -2,6 +2,7 @@
 name: schematic-wiring
 priority: 70
 description: "Wire routing strategy, pin selection rules, junction handling"
+tools: [connect_pins_with_wire, connect_points_with_wire, delete_wire_from_schematic]
 ---
 # Wiring strategy
 - The required pin on each component is dictated by the **circuit's

@@ -456,6 +456,9 @@ def _pad_obstacle(
         return None
     try:
         lx, ly = float(at[1]), float(at[2])
+        # KiCad 10 stores the pad's own rotation as an absolute
+        # board-space angle (4th ``at`` element); missing = 0.
+        pad_rot = float(at[3]) if len(at) >= 4 else 0.0
     except (TypeError, ValueError):
         return None
 
@@ -478,11 +481,11 @@ def _pad_obstacle(
     wx_off, wy_off = _rotate_ccw_on_screen(lx, ly, fp_rot)
     wx, wy = fp_x + wx_off, fp_y + wy_off
 
-    # Build a rectangle polygon centered at (0,0), rotate by fp_rot only,
-    # then translate to world position.  KiCad stores pad size in the
-    # footprint's local coordinate system (not the pad's), so pad_angle
-    # is NOT included in the size rotation.
-    total_angle = fp_rot
+    # Build a rectangle polygon centered at (0,0) in the pad's local
+    # frame, rotate by the pad's own ``at`` rotation (KiCad 10 stores
+    # it as an absolute board-space angle; the footprint rotation only
+    # affects the position above), then translate to world position.
+    total_angle = pad_rot
     hw, hh = pw / 2.0, ph / 2.0
     corners = [
         _rotate_ccw_on_screen(-hw, -hh, total_angle),
@@ -513,9 +516,14 @@ def _npth_obstacle(
     """Build a non-plated through-hole (NPTH) drill obstacle.
 
     An NPTH is a bare mechanical hole — there is no copper pad, just a
-    circular keepout on every layer where the board is drilled.  A track
-    must not cross one.  The drill diameter (not the ``size``) is the
-    effective keepout radius.
+    circular or oval (slot) keepout on every layer where the board is
+    drilled.  A track must not cross one.  The ``drill`` node (not the
+    ``size``) is the effective keepout: a round drill ``(drill d)``
+    becomes a circle of radius d/2; an oval drill ``(drill oval w l)``
+    becomes a capsule whose total outer length along the major axis is
+    max(w, l) and whose width is min(w, l), per KiCad slot semantics
+    (centre-line endpoints at ±(max−min)/2, major axis along the longer
+    drill dimension).
 
     Unlike ``_via_obstacle``, NPTH pads do not have a net, so the
     ``net_filter`` argument is not consulted — the hole blocks every net.
@@ -529,23 +537,74 @@ def _npth_obstacle(
         return None
     try:
         lx, ly = float(at[1]), float(at[2])
+        # KiCad 10 stores the pad's own rotation as an absolute
+        # board-space angle (4th ``at`` element); missing = 0.
+        pad_rot = float(at[3]) if len(at) >= 4 else 0.0
     except (TypeError, ValueError):
         return None
     drill_sub = _get_sub(pad_node, "drill")
     if drill_sub is None or len(drill_sub) < 2:
         return None
-    try:
-        drill = float(drill_sub[1])
-    except (TypeError, ValueError):
-        return None
-    # Transform local → world (CCW-on-screen, KiCad PCB convention).
+    # Transform local -> world (CCW-on-screen, KiCad PCB convention).
+    # The footprint rotation applies to the pad's centre offset; the
+    # pad's own ``at`` rotation is applied to the SHAPE and is already
+    # absolute (board frame), so it is not combined with fp_rot.
     wx_off, wy_off = _rotate_ccw_on_screen(lx, ly, fp_rot)
     wx, wy = fp_x + wx_off, fp_y + wy_off
+
+    drill_layers = frozenset(
+        {"F.Cu", "B.Cu", "In1.Cu", "In2.Cu", "In3.Cu", "In4.Cu"}
+    )  # NPTH goes through the whole stack: blocks routing on every
+    # copper layer the router might use.
+
+    if _sym(drill_sub[1]) != "oval":
+        try:
+            drill = float(drill_sub[1])
+        except (TypeError, ValueError):
+            return None
+        if drill <= 0:
+            return None
+        return Obstacle(
+            shape=Point(wx, wy).buffer(drill / 2.0),
+            layers=drill_layers,
+            net=None,
+            kind="drill",
+            ref=None,
+        )
+
+    # Oval drill ``(drill oval <w> <l>)``: malformed/too-short/non-numeric
+    # nodes are skipped, never raised on.
+    if len(drill_sub) < 4:
+        return None
+    try:
+        dx, dy = float(drill_sub[2]), float(drill_sub[3])
+    except (TypeError, ValueError):
+        return None
+    if dx <= 0 or dy <= 0:
+        return None
+    # KiCad slot semantics: total outer length = max(w, l) along the
+    # major axis, hole width = min(w, l); the major axis follows the
+    # longer drill dimension and the centre-line endpoints sit at
+    # ±(max−min)/2.  w == l degenerates to a circle of radius w/2.
+    w_slot = min(dx, dy)
+    half_extent = abs(dx - dy) / 2.0
+    if dx > dy:
+        ep1, ep2 = (-half_extent, 0.0), (half_extent, 0.0)
+    elif dy > dx:
+        ep1, ep2 = (0.0, -half_extent), (0.0, half_extent)
+    else:
+        ep1, ep2 = (0.0, 0.0), (0.0, 0.0)
+    r1 = _rotate_ccw_on_screen(ep1[0], ep1[1], pad_rot)
+    r2 = _rotate_ccw_on_screen(ep2[0], ep2[1], pad_rot)
+    capsule = LineString([(wx + r1[0], wy + r1[1]), (wx + r2[0], wy + r2[1])]).buffer(
+        w_slot / 2.0,
+        cap_style="round",
+    )
+    if capsule.is_empty or not capsule.is_valid:
+        return None
     return Obstacle(
-        shape=Point(wx, wy).buffer(drill / 2.0),
-        # NPTH goes through the whole stack: blocks routing on every
-        # copper layer the router might use.
-        layers=frozenset({"F.Cu", "B.Cu", "In1.Cu", "In2.Cu", "In3.Cu", "In4.Cu"}),
+        shape=capsule,
+        layers=drill_layers,
         net=None,
         kind="drill",
         ref=None,

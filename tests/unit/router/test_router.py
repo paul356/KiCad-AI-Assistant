@@ -36,9 +36,11 @@ from kcaa.router.router import (
     _default_track_width,
     _find_footprint,
     _find_pad_center,
+    _find_pad_rotation,
     _find_pad_size,
     _layers_used,
     _project_file_for,
+    _replace_pad_path,
     _routing_layers,
     auto_route_pair,
     connect_with_via,
@@ -511,6 +513,498 @@ def test_dense_pad_connector_covered_start_fails(tmp_path: Path, algorithm: str)
                 via_pairs=(),
             )
         )
+
+
+# ---------------------------------------------------------------------------
+# #216: sub-width pad-exit stub absorbed end-to-end
+# ---------------------------------------------------------------------------
+
+_STUB_FIXTURE_START = (-3.4201679360683457, 3.7212679553332517)
+_STUB_FIXTURE_END = (4.787175092253532, 3.233789531661362)
+_STUB_FIXTURE_PADS = [
+    (2.568909405254894, 2.261991093591841, 0.5),
+    (-3.777712725048371, 0.6231032772597018, 0.25),
+    (-2.305097949850124, 3.8753303058456448, 0.15),
+]
+
+
+def _make_pad_exit_stub_board(tmp_path: Path) -> Path:
+    """R1/1 -> C1/1 with the #216 pad-exit stub geometry.
+
+    The three foreign pads are the sweep-derived fixture that makes the
+    engine finish with a 0.0875 mm vertical stub on the destination
+    anchor.  The endpoint pads are non-square so ``_replace_pad_path``
+    runs (``_is_rect`` rejects squares) and its wire can be audited for
+    an extra kink at the pad entry.
+    """
+    ax, ay = _STUB_FIXTURE_START
+    bx, by = _STUB_FIXTURE_END
+    foreign = ""
+    for i, (cx, cy, h) in enumerate(_STUB_FIXTURE_PADS):
+        foreign += f"""	(footprint "X"
+		(layer "F.Cu")
+		(at {cx} {cy} 0.0)
+		(property "Reference" "X{i + 1}")
+		(pad "1" smd rect
+			(at 0.0 0.0)
+			(size {2 * h} {2 * h})
+			(layers "F.Cu" "F.Mask")
+			(net 2 "GND")
+		)
+	)
+"""
+    pcb = f"""(kicad_pcb
+	(version 20260206)
+	(generator "pad-exit-stub-test")
+	(layers
+		(0 "F.Cu" signal)
+		(44 "Edge.Cuts" user)
+	)
+	(net 0 "")
+	(net 1 "VCC")
+	(net 2 "GND")
+	(footprint "R"
+		(layer "F.Cu")
+		(at {ax} {ay} 0.0)
+		(property "Reference" "R1")
+		(pad "1" smd rect
+			(at 0.0 0.0)
+			(size 0.8 0.3)
+			(layers "F.Cu" "F.Mask")
+			(net 1 "VCC")
+		)
+	)
+	(footprint "C"
+		(layer "F.Cu")
+		(at {bx} {by} 0.0)
+		(property "Reference" "C1")
+		(pad "1" smd rect
+			(at 0.0 0.0)
+			(size 0.8 0.3)
+			(layers "F.Cu" "F.Mask")
+			(net 1 "VCC")
+		)
+	)
+{foreign}	(gr_rect
+		(start -10.0 -10.0)
+		(end 10.0 10.0)
+		(stroke (width 0.1) (type solid))
+		(fill none)
+		(layer "Edge.Cuts")
+	)
+)
+"""
+    path = tmp_path / "stub.kicad_pcb"
+    path.write_text(pcb)
+    _write_min_pro(path, clearance=0.2)
+    return path
+
+
+def _turn_degrees(a, b, c) -> float:
+    v1 = (b[0] - a[0], b[1] - a[1])
+    v2 = (c[0] - b[0], c[1] - b[1])
+    l1 = math.hypot(*v1)
+    l2 = math.hypot(*v2)
+    if l1 < 1e-12 or l2 < 1e-12:
+        return 0.0
+    cos_t = (v1[0] * v2[0] + v1[1] * v2[1]) / (l1 * l2)
+    return math.degrees(math.acos(max(-1.0, min(1.0, cos_t))))
+
+
+def test_pad_exit_stub_absorbed_through_full_router(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The absorbed stub survives the pad-wire replacement cleanly.
+
+    The engine's pre-pass path ends with a 0.0875 mm vertical stub; the
+    absorption slides the horizontal run onto the destination anchor.
+    After ``_replace_pad_path`` / ``_align_path_endpoints`` the written
+    route must still start and end exactly on the pad centres, stay on
+    the 0/45/90 family, and keep every segment at full track width —
+    no 45-degree kink re-introduced at the pad entry."""
+    import kcaa.router.route_engine as route_engine_module
+
+    pcb = _make_pad_exit_stub_board(tmp_path)
+    recorded: list[tuple[list, list]] = []
+    real_absorb = route_engine_module._absorb_terminal_stubs
+
+    def recording_absorb(pts, *args, **kwargs):
+        out = real_absorb(pts, *args, **kwargs)
+        if list(out) != list(pts):
+            recorded.append((list(pts), list(out)))
+        return out
+
+    monkeypatch.setattr(route_engine_module, "_absorb_terminal_stubs", recording_absorb)
+
+    res = auto_route_pair(
+        RouteRequest(
+            pcb_path=str(pcb),
+            ref_a="R1",
+            pad_a="1",
+            ref_b="C1",
+            pad_b="1",
+            net="VCC",
+            width=0.2,
+            algorithm="pns",
+            via_pairs=(),
+        )
+    )
+
+    # The engine really did emit the stub the pass exists to remove.
+    assert recorded, "fixture no longer reproduces the pad-exit stub"
+    pre, post = recorded[0]
+    assert math.hypot(pre[-1][0] - pre[-2][0], pre[-1][1] - pre[-2][1]) == pytest.approx(
+        0.08747842367188996, abs=1e-9
+    )
+    assert post[-1] == pre[-1]
+
+    segs = [(s.x1, s.y1, s.x2, s.y2) for s in res.segments]
+    assert len(segs) == 2
+    pts = [(segs[0][0], segs[0][1])] + [(s[2], s[3]) for s in segs]
+    assert pts[0] == pytest.approx(_STUB_FIXTURE_START)
+    assert pts[-1] == pytest.approx(_STUB_FIXTURE_END)
+    for a, b in zip(pts, pts[1:]):
+        dx, dy = abs(b[0] - a[0]), abs(b[1] - a[1])
+        assert dx < 1e-9 or dy < 1e-9 or abs(dx - dy) < 1e-9
+        assert math.hypot(dx, dy) >= 0.2 - 1e-9
+    # One interior turn only, and it is the 45-degree family corner.
+    assert len(pts) - 2 == 1
+    assert _turn_degrees(*pts) == pytest.approx(45.0, abs=1e-6)
+
+
+def test_leg_boundary_merge_runs_on_the_concatenated_chain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#217 at router level: the merge sees the whole leg chain.
+
+    The staircase the issue reports spans a leg boundary (leg N ends at
+    the waypoint, leg N+1 starts from it), so the engine's per-leg pass
+    cannot reach it.  The router concatenates the legs and runs the same
+    module-level pass once per layer run, handing it the waypoint
+    anchors and the layer's clearance hulls; the returned chain is what
+    the emitted segments are built from.
+    """
+    import kcaa.router.router as router_module
+
+    calls: list[dict] = []
+    real_merge = router_module.merge_parallel_diagonals
+
+    def recording_merge(pts, hulls, width, **kwargs):
+        out = real_merge(pts, hulls, width, **kwargs)
+        calls.append({"pts": list(pts), "hulls": list(hulls), "width": width, **kwargs})
+        return out
+
+    monkeypatch.setattr(router_module, "merge_parallel_diagonals", recording_merge)
+    result = _route_clear(
+        {
+            "algorithm": "pns",
+            "waypoints": [
+                {"kind": "waypoint", "pos": (40.0, 31.0), "tol_mm": 0.0},
+                {"kind": "waypoint", "pos": (50.0, 33.0), "tol_mm": 0.25},
+                {"kind": "waypoint", "pos": (55.0, 36.0), "tol_mm": 0.5},
+            ],
+        },
+        tmp_path,
+    )
+
+    assert len(calls) == 1, "one merge call per layer run"
+    call = calls[0]
+    assert call["width"] == pytest.approx(0.2)
+    # Waypoint anchors travel with their tolerances, keeping the pin
+    # semantics: a candidate may not push a waypoint off its circle.
+    assert call["anchors"] == [
+        ((40.0, 31.0), 0.0),
+        ((50.0, 33.0), 0.25),
+        ((55.0, 36.0), 0.5),
+    ]
+    assert call["keep_anchor_vertices"] is True
+    assert call["board_limit"] is not None
+    assert call["pts"][0] == pytest.approx((29.5, 30.0))
+    assert call["pts"][-1] == pytest.approx((60.0, 39.5))
+    # Every waypoint is still on the emitted centerline.
+    pts = _route_polyline_sampled(result)
+    for wpt in ((40.0, 31.0), (50.0, 33.0), (55.0, 36.0)):
+        assert _point_polyline_distance(pts, wpt) <= 0.5 + 1e-6
+
+    # End-to-end shape: the leg-boundary staircases are gone (the three
+    # walks would otherwise emit 9 segments).  The zero-tolerance
+    # waypoint pins the first corner at (40, 31); the loose ones let the
+    # later corners slide onto the 45 runs.
+    emitted = [(s_.x1, s_.y1, s_.x2, s_.y2) for s_ in result.segments]
+    assert emitted == [
+        pytest.approx((29.5, 30.0, 39.0, 30.0)),
+        pytest.approx((39.0, 30.0, 42.0, 33.0)),
+        pytest.approx((42.0, 33.0, 52.0, 33.0)),
+        pytest.approx((52.0, 33.0, 58.5, 39.5)),
+        pytest.approx((58.5, 39.5, 60.0, 39.5)),
+    ]
+    assert _point_polyline_distance(
+        [(emitted[0][0], emitted[0][1])] + [(e[2], e[3]) for e in emitted], (40.0, 31.0)
+    ) == pytest.approx(0.0, abs=1e-9)
+
+
+def test_leg_boundary_merge_filters_same_net_copper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The merge hulls exclude the route's own net.
+
+    ``_layer_engine_obstacles`` re-adds same-net pads as transit
+    obstacles, so the mid-chain VCC pad is in the run's obstacle list.
+    Same-net copper is legal for the route to touch and the copper audit
+    exempts it, so the filter must drop it before the hulls are built —
+    without the filter the pad's hull reaches the pass (observed through
+    this hook) and can veto a legal merge.  ``_layer_engine_obstacles``
+    only ever contributes same-net *pads*, which is why the fixture pads
+    rather than traces."""
+    import kcaa.router.router as router_module
+
+    calls: list[dict] = []
+    real_hulls = router_module.family_hulls
+
+    def recording_hulls(obstacles, clearance, width, moved_pairs):
+        calls.append({"obstacles": list(obstacles)})
+        return real_hulls(obstacles, clearance, width, moved_pairs)
+
+    monkeypatch.setattr(router_module, "family_hulls", recording_hulls)
+    route = _make_mid_chain_same_net_pad_board(tmp_path)
+    auto_route_pair(
+        RouteRequest(
+            pcb_path=route,
+            ref_a="R1",
+            pad_a="1",
+            ref_b="C1",
+            pad_b="1",
+            net="VCC",
+            width=0.2,
+            via_pairs=(),
+            algorithm="pns",
+            waypoints=[
+                {"kind": "waypoint", "pos": (40.0, 31.0), "tol_mm": 0.0},
+                {"kind": "waypoint", "pos": (50.0, 33.0), "tol_mm": 0.25},
+                {"kind": "waypoint", "pos": (55.0, 36.0), "tol_mm": 0.5},
+            ],
+        )
+    )
+
+    assert len(calls) == 1, "one hull build per layer run"
+    assert [o.net for o in calls[0]["obstacles"]] == []
+
+
+def test_leg_boundary_merge_scopes_moved_pairs_per_layer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both merge call sites take the per-layer filtered moved set.
+
+    ``moved_pairs`` accumulates over every leg and layer, while this
+    run's hull build and audit are single-layer.  Regressing either call
+    site back to the raw ``moved_pairs`` is invisible in the emitted
+    route on today's fixtures (it only over-rejects), so the wiring is
+    pinned here: the set ``moved_pairs_for_layer`` returns must reach
+    ``family_hulls`` and the audit validator unchanged, and the helper
+    must be asked about this run's layer and the request net.
+    """
+    import kcaa.router.router as router_module
+
+    sentinel = [("scoped", "moved-set")]
+    seen: dict[str, object] = {}
+
+    def fake_filter(pairs, layer, net):
+        seen["filter"] = (list(pairs), layer, net)
+        return sentinel
+
+    def recording_hulls(obstacles, clearance, width, moved_pairs):
+        seen["hulls"] = moved_pairs
+        return []
+
+    def recording_audit(*, moved_pairs, **kwargs):
+        seen["audit"] = moved_pairs
+        return True
+
+    monkeypatch.setattr(router_module, "moved_pairs_for_layer", fake_filter)
+    monkeypatch.setattr(router_module, "family_hulls", recording_hulls)
+    monkeypatch.setattr(router_module, "_audit_final_copper", recording_audit)
+
+    _route_clear(
+        {
+            "algorithm": "pns",
+            "waypoints": [
+                {"kind": "waypoint", "pos": (40.0, 31.0), "tol_mm": 0.0},
+                {"kind": "waypoint", "pos": (50.0, 33.0), "tol_mm": 0.25},
+                {"kind": "waypoint", "pos": (55.0, 36.0), "tol_mm": 0.5},
+            ],
+        },
+        tmp_path,
+    )
+
+    assert seen["filter"] == ([], "F.Cu", "VCC")
+    assert seen["hulls"] is sentinel
+    assert seen["audit"] is sentinel
+
+
+def test_leg_boundary_merge_audit_vetoes_foreign_copper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The merge is judged by ``_audit_final_copper``, not only by hulls.
+
+    The hull set covers the audited clearance envelope, so this gate is
+    a safety net — it is pinned here through the call site: the audit
+    handed to the pass must accept the chain it was given and reject a
+    candidate that crosses a foreign trace."""
+    import kcaa.router.router as router_module
+
+    calls: list[dict] = []
+    real_merge = router_module.merge_parallel_diagonals
+
+    def recording_merge(pts, hulls, width, **kwargs):
+        out = real_merge(pts, hulls, width, **kwargs)
+        calls.append({"pts": list(pts), "hulls": list(hulls), **kwargs})
+        return out
+
+    monkeypatch.setattr(router_module, "merge_parallel_diagonals", recording_merge)
+    auto_route_pair(
+        RouteRequest(
+            pcb_path=_make_clear_board_with_track(tmp_path),
+            ref_a="R1",
+            pad_a="1",
+            ref_b="C1",
+            pad_b="1",
+            net="VCC",
+            width=0.2,
+            via_pairs=(),
+            algorithm="pns",
+            waypoints=[
+                {"kind": "waypoint", "pos": (40.0, 31.0), "tol_mm": 0.0},
+                {"kind": "waypoint", "pos": (50.0, 33.0), "tol_mm": 0.25},
+                {"kind": "waypoint", "pos": (55.0, 36.0), "tol_mm": 0.5},
+            ],
+        )
+    )
+
+    assert len(calls) == 1
+    call = calls[0]
+    assert call["hulls"], "the layer run's hulls must reach the pass"
+    audit = call["audit"]
+    assert audit is not None, "the merge must be audited like the engine does"
+    pts = call["pts"]
+    assert audit(list(pts)) is True
+    # (47.5, 32.5) sits on the GND trace; the two-segment shortcut
+    # through it is copper the DRC audit must reject.
+    assert audit([pts[0], (47.5, 32.5), pts[-1]]) is False
+
+
+def test_leg_boundary_merge_sees_a_chain_without_collinear_splits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pass is fed ``_dedupe`` + ``_merge_family_chain`` output.
+
+    A waypoint that lands mid-run splits the concatenated chain into two
+    collinear segments, which hides the ``[run, stair, run]`` patterns
+    the pass matches.  The pre-merge must fold the split away: the
+    chain handed to the pass has no collinear interior vertex, and the
+    mid-run waypoint is still exactly on the emitted centerline.
+    """
+    import kcaa.router.router as router_module
+
+    calls: list[dict] = []
+    real_merge = router_module.merge_parallel_diagonals
+
+    def recording_merge(pts, hulls, width, **kwargs):
+        out = real_merge(pts, hulls, width, **kwargs)
+        calls.append({"pts": list(pts)})
+        return out
+
+    monkeypatch.setattr(router_module, "merge_parallel_diagonals", recording_merge)
+    result = _route_clear(
+        {
+            "algorithm": "pns",
+            "waypoints": [
+                # (35, 30) sits mid-run on the first horizontal leg.
+                {"kind": "waypoint", "pos": (35.0, 30.0), "tol_mm": 0.0},
+                {"kind": "waypoint", "pos": (40.0, 31.0), "tol_mm": 0.0},
+                {"kind": "waypoint", "pos": (50.0, 33.0), "tol_mm": 0.25},
+                {"kind": "waypoint", "pos": (55.0, 36.0), "tol_mm": 0.5},
+            ],
+        },
+        tmp_path,
+    )
+
+    assert len(calls) == 1
+    pts = calls[0]["pts"]
+    for a, b, c in zip(pts, pts[1:], pts[2:]):
+        cross = (b[0] - a[0]) * (c[1] - b[1]) - (b[1] - a[1]) * (c[0] - b[0])
+        assert abs(cross) > 1e-12, f"collinear interior vertex {b} reached the pass"
+    assert _point_polyline_distance(_route_polyline_sampled(result), (35.0, 30.0)) == pytest.approx(
+        0.0, abs=1e-6
+    )
+
+
+def test_leg_boundary_merge_result_drives_the_emitted_segments(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pass's return value is used, not just observed: forcing it to
+    drop a vertex changes the emitted segment count."""
+    import kcaa.router.router as router_module
+
+    real_merge = router_module.merge_parallel_diagonals
+    seen: list[list] = []
+
+    def dropping_merge(pts, hulls, width, **kwargs):
+        out = real_merge(pts, hulls, width, **kwargs)
+        seen.append(list(out))
+        # Drop the second vertex: the emitted route must lose a segment.
+        if len(out) > 3:
+            out = [out[0], *out[2:]]
+        return out
+
+    request = {
+        "algorithm": "pns",
+        "waypoints": [
+            {"kind": "waypoint", "pos": (40.0, 31.0), "tol_mm": 0.0},
+            {"kind": "waypoint", "pos": (50.0, 33.0), "tol_mm": 0.0},
+        ],
+    }
+    control = _route_clear(request, tmp_path)
+    monkeypatch.setattr(router_module, "merge_parallel_diagonals", dropping_merge)
+    mutilated = _route_clear(request, tmp_path)
+    assert seen, "the merge did not run"
+    # The mutated chain is what the emitter used: the first corner is the
+    # waypoint joint (40, 31) instead of the (39, 30) corner the real
+    # pass produced.
+    assert (mutilated.segments[0].x2, mutilated.segments[0].y2) != (
+        control.segments[0].x2,
+        control.segments[0].y2,
+    )
+    assert (mutilated.segments[0].x2, mutilated.segments[0].y2) == pytest.approx((40.0, 31.0))
+
+
+def test_pad_entry_has_no_extra_corner_when_the_run_lands_on_the_pad_line(
+    tmp_path: Path,
+) -> None:
+    """#217: after the run moves onto the pad centre line the terminal
+    leg is one straight 45-degree diagonal into the pad centre.
+    ``_replace_pad_path`` must not re-insert an axis fence there (which
+    would put a 45/90 kink at the pad entry)."""
+    center = (120.05, 87.2)
+    size = (1.0, 1.45)
+    entry = [(118.57, 88.68), center]
+    out = _replace_pad_path(list(entry), center, size, from_center=False)
+    # No axis fence: the 45 run is kept and only the centre duplicate
+    # (harmless, dropped by the emitter) is added.
+    assert [p for i, p in enumerate(out) if p not in out[:i]] == entry
+    assert _turn_degrees(out[0], out[1], out[2]) == pytest.approx(0.0, abs=1e-9)
+
+
+def test_pad_entry_axis_fence_still_used_for_an_axis_entry(
+    tmp_path: Path,
+) -> None:
+    """Control for the test above: an axis entry still gets the standard
+    fence (the pad wire is not dead code)."""
+    center = (120.05, 87.2)
+    size = (1.0, 1.45)
+    axis_entry = [(118.57, 88.68), (120.05, 88.05), center]
+    out = _replace_pad_path(list(axis_entry), center, size, from_center=False)
+    assert out[-1] == pytest.approx(center)
+    assert len(out) >= len(axis_entry)
 
 
 # ---------------------------------------------------------------------------
@@ -1708,6 +2202,200 @@ def test_plated_thru_hole_pad_still_pad_obstacle(tmp_path: Path) -> None:
     assert pads[0].net == "VCC"
 
 
+def test_npth_oval_drill_becomes_capsule_obstacle(tmp_path: Path) -> None:
+    """An oval NPTH drill ``(drill oval 2.5 2)`` must become a drill-kind
+    capsule obstacle whose bbox matches the KiCad slot extent: total
+    outer length 2.5 along the longer axis, width 2, centred on the pad's
+    world position."""
+    from kcaa.router.world_model import build_world_model
+
+    pcb = _load_pcb_text(
+        _fp_with_pad(
+            '\t(pad "" np_thru_hole oval\n'
+            "\t\t(at 0 0)\n"
+            "\t\t(size 3.2 2.5)\n"
+            "\t\t(drill oval 2.5 2)\n"
+            '\t\t(layers "*.Cu" "*.Mask")\n'
+            "\t)\n"
+        ),
+        tmp_path,
+    )
+    world = build_world_model(str(pcb), net_filter=None)
+    drills = [o for o in world.obstacles if o.kind == "drill"]
+    pads = [o for o in world.obstacles if o.kind == "pad"]
+    assert len(drills) == 1, f"expected one drill obstacle, got {len(drills)}"
+    assert pads == [], "NPTH must not produce a pad-kind obstacle"
+    d = drills[0]
+    assert d.layers == frozenset({"F.Cu", "B.Cu", "In1.Cu", "In2.Cu", "In3.Cu", "In4.Cu"})
+    assert d.net is None
+    # Major axis along X (2.5 > 2): outer extent 2.5 x 2 at (100, 100).
+    minx, miny, maxx, maxy = d.shape.bounds
+    assert (minx, miny) == pytest.approx((98.75, 99.0), abs=2e-2)
+    assert (maxx, maxy) == pytest.approx((101.25, 101.0), abs=2e-2)
+    assert (d.shape.centroid.x, d.shape.centroid.y) == pytest.approx((100.0, 100.0))
+    # Capsule area: pi * (2/2)^2 + length 0.5 * width 2.
+    assert d.shape.area == pytest.approx(3.14159 + 1.0, rel=0.02)
+
+
+def test_npth_oval_drill_rotated_with_pad_own_rotation(tmp_path: Path) -> None:
+    """The capsule axis follows the pad's own absolute rotation: an
+    ``(at 5 0 90)`` slot is 2.5 long along Y, 2 wide along X."""
+    from kcaa.router.world_model import build_world_model
+
+    pcb = _load_pcb_text(
+        _fp_with_pad(
+            '\t(pad "" np_thru_hole oval\n'
+            "\t\t(at 5 0 90)\n"
+            "\t\t(size 3.2 2.5)\n"
+            "\t\t(drill oval 2.5 2)\n"
+            '\t\t(layers "*.Cu" "*.Mask")\n'
+            "\t)\n"
+        ),
+        tmp_path,
+    )
+    world = build_world_model(str(pcb), net_filter=None)
+    drills = [o for o in world.obstacles if o.kind == "drill"]
+    assert len(drills) == 1
+    d = drills[0]
+    # Centre: fp origin (100,100) + local (5,0) at fp_rot 0.
+    assert (d.shape.centroid.x, d.shape.centroid.y) == pytest.approx((105.0, 100.0))
+    minx, miny, maxx, maxy = d.shape.bounds
+    assert (maxx - minx) == pytest.approx(2.0, abs=2e-2)
+    assert (maxy - miny) == pytest.approx(2.5, abs=2e-2)
+
+
+def test_npth_oval_drill_in_rotated_footprint(tmp_path: Path) -> None:
+    """KiCad 10 stores pad rotation as absolute board-space degrees: the
+    slot keeps its own 90° angle while its CENTRE follows the footprint
+    rotation (local (5,0) at fp_rot 90 lands at (100,95)).  Adding the
+    footprint rotation to the pad angle would double-count it."""
+    from kcaa.router.world_model import build_world_model
+
+    pcb = _load_pcb_text(
+        _fp_with_pad(
+            '\t(pad "" np_thru_hole oval\n'
+            "\t\t(at 5 0 90)\n"
+            "\t\t(size 3.2 2.5)\n"
+            "\t\t(drill oval 2.5 2)\n"
+            '\t\t(layers "*.Cu" "*.Mask")\n'
+            "\t)\n",
+            ref="X1",
+        ).replace("(at 100 100)", "(at 100 100 90)"),
+        tmp_path,
+    )
+    world = build_world_model(str(pcb), net_filter=None)
+    drills = [o for o in world.obstacles if o.kind == "drill"]
+    assert len(drills) == 1
+    d = drills[0]
+    assert (d.shape.centroid.x, d.shape.centroid.y) == pytest.approx((100.0, 95.0))
+    minx, miny, maxx, maxy = d.shape.bounds
+    assert (maxx - minx) == pytest.approx(2.0, abs=2e-2)
+    assert (maxy - miny) == pytest.approx(2.5, abs=2e-2)
+
+
+def test_npth_oval_drill_no_own_rotation_stays_axis_aligned(tmp_path: Path) -> None:
+    """A pad ``at`` without a rotation value is axis-aligned in board
+    space (KiCad 10: missing angle = absolute 0, "regardless of the
+    parent footprint orientation"), not rotated with the footprint."""
+    from kcaa.router.world_model import build_world_model
+
+    pcb = _load_pcb_text(
+        _fp_with_pad(
+            '\t(pad "" np_thru_hole oval\n'
+            "\t\t(at 5 0)\n"
+            "\t\t(size 3.2 2.5)\n"
+            "\t\t(drill oval 2.5 2)\n"
+            '\t\t(layers "*.Cu" "*.Mask")\n'
+            "\t)\n",
+            ref="X1",
+        ).replace("(at 100 100)", "(at 100 100 90)"),
+        tmp_path,
+    )
+    world = build_world_model(str(pcb), net_filter=None)
+    drills = [o for o in world.obstacles if o.kind == "drill"]
+    assert len(drills) == 1
+    d = drills[0]
+    assert (d.shape.centroid.x, d.shape.centroid.y) == pytest.approx((100.0, 95.0))
+    minx, miny, maxx, maxy = d.shape.bounds
+    assert (maxx - minx) == pytest.approx(2.5, abs=2e-2)
+    assert (maxy - miny) == pytest.approx(2.0, abs=2e-2)
+
+
+def test_npth_oval_drill_with_equal_width_length_is_circle(tmp_path: Path) -> None:
+    """``(drill oval w w)`` degenerates to a circle of radius w/2."""
+    from kcaa.router.world_model import build_world_model
+
+    pcb = _load_pcb_text(
+        _fp_with_pad(
+            '\t(pad "" np_thru_hole oval\n'
+            "\t\t(at 0 0)\n"
+            "\t\t(size 3.2 3.2)\n"
+            "\t\t(drill oval 2.5 2.5)\n"
+            '\t\t(layers "*.Cu" "*.Mask")\n'
+            "\t)\n"
+        ),
+        tmp_path,
+    )
+    world = build_world_model(str(pcb), net_filter=None)
+    drills = [o for o in world.obstacles if o.kind == "drill"]
+    assert len(drills) == 1
+    d = drills[0]
+    assert d.shape.area == pytest.approx(3.14159 * 1.25**2, rel=0.02)
+    minx, miny, maxx, maxy = d.shape.bounds
+    assert (maxx - minx) == pytest.approx(2.5, abs=2e-2)
+    assert (maxy - miny) == pytest.approx(2.5, abs=2e-2)
+
+
+def test_npth_oval_drill_malformed_skipped(tmp_path: Path) -> None:
+    """Missing/too-short/non-numeric oval drill nodes are skipped without
+    crashing — no drill obstacle, no pad obstacle."""
+    from kcaa.router.world_model import build_world_model
+
+    for drill_line in ["(drill oval)", "(drill oval 2.5)", "(drill oval 2.5 foo)"]:
+        pcb = _load_pcb_text(
+            _fp_with_pad(
+                '\t(pad "" np_thru_hole oval\n'
+                "\t\t(at 0 0)\n"
+                "\t\t(size 3.2 2.5)\n"
+                f"\t\t{drill_line}\n"
+                '\t\t(layers "*.Cu" "*.Mask")\n'
+                "\t)\n"
+            ),
+            tmp_path,
+        )
+        world = build_world_model(str(pcb), net_filter=None)
+        assert world.obstacles == [], f"{drill_line!r} must be skipped, got {world.obstacles}"
+
+
+def test_smd_pad_own_rotation_rotates_copper_rectangle(tmp_path: Path) -> None:
+    """A pad's own absolute rotation must rotate the rectangular copper
+    obstacle: size 2x1 at ``(at 0 0 90)`` yields a 1-wide x 2-tall world
+    rectangle (KiCad 10: pad at-angle applied directly, fp adds nothing)."""
+    from kcaa.router.world_model import build_world_model
+
+    pcb = _load_pcb_text(
+        _fp_with_pad(
+            '\t(pad "1" smd rect\n'
+            "\t\t(at 0 0 90)\n"
+            "\t\t(size 2 1)\n"
+            '\t\t(layers "F.Cu" "F.Paste" "F.Mask")\n'
+            "\t)\n"
+        ),
+        tmp_path,
+    )
+    world = build_world_model(str(pcb), net_filter=None)
+    pads = [o for o in world.obstacles if o.kind == "pad"]
+    assert len(pads) == 1
+    p = pads[0]
+    assert p.net is None
+    assert p.layers == frozenset({"F.Cu"})
+    minx, miny, maxx, maxy = p.shape.bounds
+    assert (maxx - minx) == pytest.approx(1.0, abs=2e-6)
+    assert (maxy - miny) == pytest.approx(2.0, abs=2e-6)
+    assert p.shape.area == pytest.approx(2.0, abs=2e-6)
+    assert (p.shape.centroid.x, p.shape.centroid.y) == pytest.approx((100.0, 100.0))
+
+
 # ---------------------------------------------------------------------------
 # PNS engine adapter (corner_mode / arcs / shoved tracks)
 # ---------------------------------------------------------------------------
@@ -2641,9 +3329,15 @@ def test_waypoints_without_tol_keep_exact_anchor(tmp_path: Path) -> None:
         assert result.arcs == [], "mitered45 waypoint chains emit no arcs"
         pts = _route_polyline_sampled(result)
         for wpt in ((40.0, 31.0), (50.0, 33.0), (55.0, 36.0)):
-            d = min(math.hypot(px - wpt[0], py - wpt[1]) for px, py in pts)
-            assert d <= 1.5 + 1e-6, (
-                f"exact anchor must keep the chain at {wpt}, polyline drifts {d:.2f} mm"
+            # Measure the true point-to-centerline distance: the anchor
+            # may legitimately end up inside a merged straight run (the
+            # straight-run optimizer rewrites the waypoint stair), so the
+            # nearest *sampled* point is a sampling artefact.  What the
+            # pin promises is that the copper centre line passes through
+            # the waypoint exactly.
+            d = _point_polyline_distance(pts, wpt)
+            assert d <= 1e-6, (
+                f"exact anchor must keep the chain at {wpt}, polyline drifts {d:.4f} mm"
             )
 
 
@@ -2920,6 +3614,20 @@ def _route_polyline_with_arcs(result, n: int = 64) -> list[tuple[float, float]]:
     return pts
 
 
+def _point_polyline_distance(pts: list[tuple[float, float]], p: tuple[float, float]) -> float:
+    """Distance from ``p`` to the polyline through ``pts`` (0 on any segment)."""
+    best = math.inf
+    for a, b in zip(pts, pts[1:]):
+        dx, dy = b[0] - a[0], b[1] - a[1]
+        seg2 = dx * dx + dy * dy
+        if seg2 <= 1e-18:
+            best = min(best, math.hypot(p[0] - a[0], p[1] - a[1]))
+            continue
+        u = max(0.0, min(1.0, ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / seg2))
+        best = min(best, math.hypot(p[0] - (a[0] + u * dx), p[1] - (a[1] + u * dy)))
+    return best
+
+
 def _route_polyline_sampled(result, n: int = 64) -> list[tuple[float, float]]:
     """Recompose the emitted geometry (segments + arcs attached at the
     running head) sampling every arc at ``n`` points, like the router's
@@ -3186,6 +3894,27 @@ def test_pns_parallel_lane_preferred_over_snake_detour(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 # W3 — PNS candidates (multi-variant routes) + A* failure evidence
 # ---------------------------------------------------------------------------
+def _make_mid_chain_same_net_pad_board(tmp_path: Path) -> str:
+    """Clear board plus a *mid-chain* VCC pad off the routed corridor.
+
+    ``_layer_engine_obstacles`` re-adds same-net pads as transit
+    obstacles (the world model drops this net's copper), so this pad is
+    in the obstacle list the layer run hands the merge.  The router
+    filters it out again: same-net copper is legal for the route to
+    touch, and the DRC audit never space-checks it.  A foreign pad kept
+    in the list is the control."""
+    pcb_path = Path(_make_clear_board(tmp_path))
+    text = pcb_path.read_text()
+    block = text[text.index('\t(footprint "R"') : text.index('\t(footprint "C"')]
+    block = (
+        block.replace("(at 30.0 30.0 0.0)", "(at 55.0 34.5 0.0)")
+        .replace('"R1"', '"R2"')
+        .replace("(at -0.5 0.0)", "(at 0.0 0.0)")
+    )
+    pcb_path.write_text(text.replace("\t(gr_rect", block + "\t(gr_rect"))
+    return str(pcb_path)
+
+
 def _make_clear_board_with_track(tmp_path: Path) -> str:
     """Single-layer clear board plus one foreign-net GND track crossing the
     direct pad-to-pad line, so walkaround and shove diverge.
@@ -3525,3 +4254,197 @@ def test_astar_pad_beyond_board_fails_with_board_bounds(tmp_path: Path) -> None:
     assert "No obstacle-avoiding path" in err
     assert "within board" in err
     assert "Segment" not in err
+
+
+# ---------------------------------------------------------------------------
+# Pad exit-wire geometry on rotated pads (#183)
+# ---------------------------------------------------------------------------
+
+_ROTATED_PAD_BOARD = """(kicad_pcb
+	(version 20260206)
+	(generator "test")
+	(layers
+		(0 "F.Cu" signal)
+		(44 "Edge.Cuts" user)
+	)
+	(net 0 "")
+	(net 1 "VCC")
+	(footprint "R"
+		(layer "F.Cu")
+		(at 30.0 30.0 45.0)
+		(property "Reference" "R1")
+		(pad "1" smd rect
+			(at 0.0 0.0 45.0)
+			(size 2.0 6.0)
+			(layers "F.Cu" "F.Mask")
+			(net 1 "VCC")
+		)
+	)
+	(footprint "C"
+		(layer "F.Cu")
+		(at 60.0 40.0 0.0)
+		(property "Reference" "C1")
+		(pad "1" smd rect
+			(at 0.0 0.0)
+			(size 2.0 2.0)
+			(layers "F.Cu" "F.Mask")
+			(net 1 "VCC")
+		)
+	)
+	(gr_rect
+		(start 20.0 20.0)
+		(end 70.0 60.0)
+		(stroke (width 0.1) (type solid))
+		(fill none)
+		(layer "Edge.Cuts")
+	)
+)
+"""
+
+
+def _rotated_rect_polygon(center: tuple[float, float], size: tuple[float, float], rot: float):
+    """World-space copper polygon of an axis-aligned pad rect rotated by
+    the pad's own absolute board-space angle ``rot`` about its centre.
+    Math is written out explicitly so the test reference is independent
+    of the router's rotation helpers."""
+    from shapely.geometry import Polygon
+
+    hw, hh = size[0] / 2.0, size[1] / 2.0
+    rad = math.radians(rot)
+    c, s = math.cos(rad), math.sin(rad)
+    corners = [
+        (c * -hw + s * -hh, -s * -hw + c * -hh),
+        (c * hw + s * -hh, -s * hw + c * -hh),
+        (c * hw + s * hh, -s * hw + c * hh),
+        (c * -hw + s * hh, -s * -hw + c * hh),
+    ]
+    return Polygon([(center[0] + x, center[1] + y) for x, y in corners])
+
+
+def test_replace_pad_path_rotated_pad_fence_on_copper_edge() -> None:
+    """#183: for a pad rotated at an arbitrary angle the exit-wire fence
+    must lie on the ROTATED pad rect (the real copper edge), not on the
+    oversized world AABB edge.  The pre-fix AABB behaviour fences on the
+    last-inside point, which can sit in an AABB corner OFF the copper."""
+    from shapely.geometry import Point
+
+    center = (0.0, 0.0)
+    size = (2.0, 6.0)  # half extents 1.0 x 3.0, rotated 45 deg
+    rot = 45.0
+    copper = _rotated_rect_polygon(center, size, rot)
+
+    # A* exits the cleared AABB through its top-right region: the last
+    # inside point (1, 3) is inside the AABB but OUTSIDE the 45-deg
+    # copper -- exactly the case the axis-aligned heuristic gets wrong.
+    outside = (1.5, 3.5)
+    path = [(0.0, 0.0), (1.0, 3.0), outside]
+
+    replaced = _replace_pad_path(path, center, size, from_center=True, rot=rot)
+    i = replaced.index(outside)
+    fence = replaced[i - 1]
+    assert copper.distance(Point(fence)) < 1e-6, (
+        f"exit fence {fence} must lie on the rotated copper edge"
+    )
+
+    # Pre-fix AABB behaviour (rot=0) fences on the last-inside AABB
+    # point (1, 3): demonstrate it would fail the same in-copper check.
+    old = _replace_pad_path(path, center, size, from_center=True)
+    i_old = old.index(outside)
+    old_fence = old[i_old - 1]
+    assert old_fence == (1.0, 3.0)
+    assert copper.distance(Point(old_fence)) > 1e-3, (
+        "AABB exit must be off the rotated copper (the bug this fixes)"
+    )
+
+    # Entry side (not from_center): the wire's first point after the
+    # outside run is the entrance on the rotated copper edge.
+    path_in = [(-2.0, -6.5), (-1.0, -3.0), (0.0, 0.0)]
+    replaced_in = _replace_pad_path(path_in, center, size, from_center=False, rot=rot)
+    assert replaced_in[0] == path_in[0]
+    entrance = replaced_in[1]
+    assert copper.distance(Point(entrance)) < 1e-6, (
+        f"entry fence {entrance} must lie on the rotated copper edge"
+    )
+
+
+@pytest.mark.parametrize("rot", [0.0, 90.0, 180.0, 270.0, -90.0, 360.0])
+def test_replace_pad_path_axis_aligned_rotations_identical(rot: float) -> None:
+    """#183: pads that ARE axis-aligned in world space (0/90/180/270,
+    including negative/overflow equivalents) must keep the legacy AABB
+    exit wire byte-identical -- the common case never changes."""
+    center = (0.0, 0.0)
+    size = (2.0, 6.0)
+    cases = [
+        ([(0.0, 0.0), (1.0, 3.0), (1.5, 3.5)], True),
+        ([(-2.0, -6.5), (-1.0, -3.0), (0.0, 0.0)], False),
+    ]
+    for path, from_center in cases:
+        legacy = _replace_pad_path(path, center, size, from_center)
+        assert _replace_pad_path(path, center, size, from_center, rot=rot) == legacy, (
+            f"rot={rot} must not change the pad wire for an axis-aligned pad"
+        )
+
+
+def test_rotated_footprint_pad_rotation_and_exit_fence(tmp_path: Path) -> None:
+    """#183: the full lookup chain -- footprint at 45° whose pad carries
+    its own absolute 45° rotation (KiCad 10 convention) -- threads the
+    pad's OWN rotation (not fp_rot, not a sum) into the exit wire, and
+    the fence lands on the rotated copper edge."""
+    pcb = tmp_path / "rot_board.kicad_pcb"
+    pcb.write_text(_ROTATED_PAD_BOARD)
+    data = load_pcb(str(pcb))
+
+    center = _find_pad_center(data, "R1", "1", "F.Cu")
+    size = _find_pad_size(data, "R1", "1", "F.Cu")
+    rot = _find_pad_rotation(data, "R1", "1", "F.Cu")
+    assert center == pytest.approx((30.0, 30.0))
+    assert size == (2.0, 6.0)
+    # The pad's ``at`` rotation is its OWN absolute board-space angle:
+    # the exact stored value, never fp_rot + pad_rot.
+    assert rot == 45.0
+
+    from shapely.geometry import Point
+
+    copper = _rotated_rect_polygon(tuple(center), size, rot)
+    # A* exits the cleared AABB towards C1 (right/up of the start pad).
+    outside = (center[0] + 1.5, center[1] + 3.5)
+    path = [tuple(center), (center[0] + 1.0, center[1] + 3.0), outside]
+    replaced = _replace_pad_path(path, tuple(center), size, from_center=True, rot=rot)
+    i = replaced.index(outside)
+    fence = replaced[i - 1]
+    assert copper.distance(Point(fence)) < 1e-6, (
+        f"exit fence {fence} must lie on the rotated copper edge"
+    )
+
+    # The AABB behaviour would fence on the last-inside point, off-copper.
+    old = _replace_pad_path(path, tuple(center), size, from_center=True)
+    i_old = old.index(outside)
+    assert copper.distance(Point(old[i_old - 1])) > 1e-3
+
+
+def test_auto_route_pair_routes_rotated_rect_pad(tmp_path: Path) -> None:
+    """#183 regression: a 45-degree-rotated rectangular pad still routes
+    (validity invariant -- obstacles are untouched) and the route lands
+    on both pad centres."""
+    pcb_path = tmp_path / "rot_board.kicad_pcb"
+    pcb_path.write_text(_ROTATED_PAD_BOARD)
+    _write_min_pro(pcb_path)
+    result = auto_route_pair(
+        RouteRequest(
+            pcb_path=str(pcb_path),
+            ref_a="R1",
+            pad_a="1",
+            ref_b="C1",
+            pad_b="1",
+            net="VCC",
+            width=0.2,
+            via_pairs=(),
+        )
+    )
+    assert len(result.segments) > 0
+    # Endpoint alignment may drag the start point by a few hundredths of
+    # a millimetre (pre-existing _align_path_endpoints leg translation),
+    # so the start is asserted loosely; the end pad centre is exact.
+    assert result.start == pytest.approx((30.0, 30.0), abs=0.05)
+    assert result.end == pytest.approx((60.0, 40.0), abs=1e-3)
+    assert result.layers_used == ["F.Cu"]

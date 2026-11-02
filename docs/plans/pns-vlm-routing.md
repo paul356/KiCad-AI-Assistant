@@ -190,10 +190,49 @@ build world model + buffer obstacle space   (unchanged)
       path = walkaround(skeleton, fixed_obstacles)      # solids only
       path, shoved = shove(path, movable_tracks)        # tracks; depth ≤ 4
       path = optimizer.cleanup(path)                    # merge collinear
+      path = optimizer.family_rewrites(path)            # see below, each pass
+                                                       # gated by the copper audit
       emit segments (+arcs) + vias; RouteResult(shoved_tracks=shoved)
   except PnsFailure as exc:
       raise RouteFailure(str(exc))                      # VLM sees real cause
 ```
+
+`optimizer.family_rewrites` (in `kcaa/router/route_engine.py`, ported from the
+KiCad optimizer's straight-run simplifications) is the stack of 0/45/90
+rewrites applied after shove, in this order:
+
+1. `_coalesce_stub_pairs` + `_merge_family_chain` — collinear/near-collinear
+   cleanup (plan §2.4 `MergeSegments`).
+2. `_shoulder_family_corners` — remove a 90-degree interior turn by shouldering
+   it onto the adjacent 45 lines (#215).
+3. `merge_parallel_diagonals` — translate a straight run so two parallel 45
+   diagonals become collinear (`[D, run, D]` -> `D`) and collapse a staircase
+   between two parallel runs onto the single 45 diagonal joining them (#217).
+   The slide is bounded by the hull supports on the smaller-slide side, so the
+   accepted candidates are the untouched-vertex placement and the hull tangent
+   placements; the runs alternate until a full round changes nothing.
+4. `_absorb_terminal_stubs` — slide an end run onto the pinned anchor's line to
+   remove a sub-width pad-exit stub (#216).
+
+Same-net copper imposes no spacing rule (the audit exempts it), so passes 3-4
+build their clearance hulls from foreign-net obstacles only; the walkaround and
+shouldering stages keep the net-inclusive hull set.  Every accepted candidate
+still passes `_audit_final_copper` against the full obstacle set, so a rewrite
+can never trade segments for a DRC error.
+
+The router (`auto_route_pair`) repeats pass 3 once per maximal same-layer run
+of the *concatenated* leg chain, for every `mitered45`/`rounded45` route —
+empty anchor list included, not only waypoint routes: the
+walkaround stair the issue reports spans a leg boundary, which no per-leg run
+can see, and dropping the repeat unless waypoints exist simply hid that case on
+waypoint-free routes.  Waypoint vertices are merge candidates (the waypoint
+simply becomes an interior point of the merged segment) and are handed to the
+pass as anchors, so a candidate that would push a waypoint farther than its
+`tol_mm` is rejected; `keep_anchor_vertices=True` re-inserts the projection as
+a vertex for the downstream emitter.  That call's hull set and audit are
+single-layer: `moved_pairs` is filtered to this layer and to foreign nets
+first, so a displaced track on another layer cannot veto a legal merge (pairs
+with an unknown layer stay in the set — over-rejecting is safe).
 
 Dispatch flow: the router always builds a mitered45 skeleton, so the
 engine never emits skeleton arcs (kept `route_engine` corner modes
