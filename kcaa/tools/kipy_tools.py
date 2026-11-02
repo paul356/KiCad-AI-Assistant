@@ -98,15 +98,17 @@ def register_kipy_tools(mcp: FastMCP) -> None:
             dict with:
                 success (bool): True if the tool executed without errors.
                 connected (bool): True if KiCad is reachable via IPC.
-                socket_path (str): The socket path that was tested.
+                socket_path (str): The socket path that was tested; also
+                    present when the connection attempt failed, so callers
+                    never have to display "unknown".
                 error (str): Present only if connection failed.
         """
+        socket_path = _find_kicad_socket()
         try:
             import kipy.errors  # noqa: PLC0415
 
             # Use longer timeout for ping check since KiCad may be slow to respond
             kicad = _connect(timeout_ms=10000)
-            socket_path = _find_kicad_socket()
 
             try:
                 kicad.ping()
@@ -133,12 +135,14 @@ def register_kipy_tools(mcp: FastMCP) -> None:
                     return {
                         "success": True,
                         "connected": False,
+                        "socket_path": socket_path,
                         "error": str(exc),
                     }
         except RuntimeError as exc:
             return {
                 "success": True,
                 "connected": False,
+                "socket_path": socket_path,
                 "error": str(exc),
             }
         except Exception as exc:
@@ -146,6 +150,7 @@ def register_kipy_tools(mcp: FastMCP) -> None:
             return {
                 "success": True,
                 "connected": False,
+                "socket_path": socket_path,
                 "error": str(exc),
             }
 

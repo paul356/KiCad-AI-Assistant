@@ -766,29 +766,42 @@ if _WX_AVAILABLE:
             # this on the KiCad main (UI) thread would block KiCad, which in
             # turn prevents KiCad from accepting the IPC connection — a
             # deadlock that freezes the entire application on startup.
-            def _check_socket_async():
-                socket_exists = False
-                checked_path = "unknown"
-                base_url = self._server_mgr.base_url
-                if base_url:
-                    try:
-                        from ..llm_client import call_mcp_tool
-
-                        result = call_mcp_tool(
-                            base_url,
-                            "check_kicad_ipc_connection",
-                            {},
-                        )
-                        socket_exists = result.get("connected", False)
-                        checked_path = result.get("socket_path", "unknown")
-                        if not socket_exists:
-                            log.debug("IPC socket check failed: %s", result.get("error", "unknown"))
-                    except Exception as exc:
-                        log.warning("Failed to check IPC socket via MCP tool: %s", exc)
-                wx.CallAfter(self._on_ipc_socket_checked, socket_exists, checked_path)
-
-            t = threading.Thread(target=_check_socket_async, daemon=True)
+            t = threading.Thread(target=self._check_ipc_socket, daemon=True)
             t.start()
+
+        def _check_ipc_socket(self) -> None:
+            """Probe KiCad's IPC API through the MCP server (background thread).
+
+            ``check_kicad_ipc_connection`` is the only source of truth for
+            IPC availability: its result always carries ``connected``.  A
+            result without that key means the MCP request never reached the
+            tool (transport failure, port race, server still starting), which
+            says nothing about the KiCad preference — so log the transport
+            error instead of telling the user to enable an API that may
+            already be enabled (issue #230).
+            """
+            base_url = self._server_mgr.base_url
+            if not base_url:
+                log.warning("IPC check skipped: MCP server URL is not available")
+                return
+            try:
+                from ..llm_client import call_mcp_tool
+
+                result = call_mcp_tool(base_url, "check_kicad_ipc_connection", {})
+            except Exception as exc:
+                log.warning("Failed to check IPC socket via MCP tool: %s", exc)
+                return
+            if "connected" not in result:
+                log.warning(
+                    "IPC check could not reach the MCP server: %s",
+                    result.get("error", "unknown"),
+                )
+                return
+            wx.CallAfter(
+                self._on_ipc_socket_checked,
+                bool(result.get("connected")),
+                result.get("socket_path", "unknown"),
+            )
 
         def _on_ipc_socket_checked(self, socket_exists: bool, checked_path: str) -> None:
             """Callback invoked on the UI thread after the async IPC socket check."""

@@ -195,6 +195,9 @@ class TestCheckKicadIpcConnection:
             assert result["success"] is True
             assert result["connected"] is False
             assert "error" in result
+            # #230: the tested path is still reported on failure, so the UI
+            # never has to show "unknown".
+            assert result["socket_path"]
 
     @patch("kcaa.tools.kipy_tools._connect")
     def test_kipy_not_installed(self, mock_connect):
@@ -206,6 +209,7 @@ class TestCheckKicadIpcConnection:
         assert result["success"] is True
         assert result["connected"] is False
         assert "not installed" in result["error"]
+        assert result["socket_path"]
 
     @patch("kcaa.tools.kipy_tools._connect")
     def test_unexpected_exception(self, mock_connect):
@@ -217,6 +221,7 @@ class TestCheckKicadIpcConnection:
         assert result["success"] is True
         assert result["connected"] is False
         assert "error" in result
+        assert result["socket_path"]
 
 
 # ---------------------------------------------------------------------------
