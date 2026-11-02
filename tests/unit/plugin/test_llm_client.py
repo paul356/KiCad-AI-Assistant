@@ -5396,7 +5396,7 @@ class TestLoopbackProxyBypass:
         class _Opener:
             def open(self, request, timeout=None):
                 calls.append((request, timeout))
-                resp = MagicMock()
+                resp = MagicMock(status=200)
                 resp.read.return_value = b'{"ok": true}'
                 resp.__enter__.return_value = resp
                 return resp
@@ -5461,6 +5461,11 @@ class TestLoopbackProxyBypass:
             "http://127.1.2.3:99/mcp",
             "http://[::1]:8080/mcp",
             "http://0.0.0.0:1234/mcp",
+            "http://localhost./mcp",
+            "https://LOCALHOST.:443/mcp",
+            "http://127.1:8043/mcp",
+            "http://127.0.1:8043/mcp",
+            "http://[::ffff:127.0.0.1]:8043/mcp",
         ],
     )
     def test_is_loopback_url_accepts_loopback_hosts(self, url):
@@ -5471,6 +5476,9 @@ class TestLoopbackProxyBypass:
         [
             "http://127.evil.com/mcp",
             "http://127.0.0.1.evil.com/mcp",
+            "http://127.1.evil.com/mcp",
+            "http://localhost.evil.com/mcp",
+            "http://2130706433/mcp",
             "http://10.0.0.1/mcp",
             "http://192.168.71.5:8118/",
             "https://example.com/mcp",
@@ -5489,6 +5497,18 @@ class TestLoopbackProxyBypass:
 
         monkeypatch.setattr(urllib.request, "getproxies", lambda: {})
         assert llm_client._proxy_would_intercept("http://127.0.0.1:1/mcp") is False
+
+    @pytest.mark.parametrize(
+        "proxies",
+        [
+            {"HTTP": "http://proxy.example:8118"},
+            {"HTTPS": "http://proxy.example:8118"},
+            {"Http": "http://proxy.example:8118", "hTTps": "http://proxy.example:8118"},
+        ],
+    )
+    def test_proxy_keys_are_matched_case_insensitively(self, monkeypatch, proxies):
+        monkeypatch.setattr(urllib.request, "getproxies", lambda: proxies)
+        assert llm_client._proxy_would_intercept("http://127.0.0.1:1/mcp") is True
 
     def test_loopback_opener_is_built_once_and_cached(self, monkeypatch):
         built: list[tuple[object, ...]] = []
@@ -5579,6 +5599,80 @@ class TestLoopbackProxyBypass:
 
         assert out is sentinel
         ca_retry.assert_called_once_with(req, 10)
+
+    def test_https_post_json_loopback_bypasses_proxy(self, monkeypatch):
+        """A local OpenAI-compatible endpoint goes direct, not via the proxy."""
+        monkeypatch.setattr(urllib.request, "getproxies", lambda: {"http": "http://proxy:8118"})
+        _, calls = self._use_fake_loopback_opener(monkeypatch)
+        monkeypatch.setattr(llm_client, "_in_process_ssl", None)
+
+        with patch("urllib.request.urlopen", side_effect=AssertionError("system opener used")):
+            status, text = llm_client._https_post_json(
+                "http://127.0.0.1:1234/v1/chat/completions",
+                {"Content-Type": "application/json"},
+                b'{"model": "local"}',
+                timeout=30,
+            )
+
+        assert (status, text) == (200, '{"ok": true}')
+        assert [call[0].full_url for call in calls] == ["http://127.0.0.1:1234/v1/chat/completions"]
+
+    def test_stream_openai_request_loopback_bypasses_proxy(self, monkeypatch):
+        """The streaming path must also reach a local endpoint directly."""
+        monkeypatch.setattr(urllib.request, "getproxies", lambda: {"http": "http://proxy:8118"})
+        opened: list[str] = []
+
+        class _StreamingOpener:
+            def open(self, request, timeout=None):
+                opened.append(request.full_url)
+                resp = MagicMock()
+                resp.readline.side_effect = [
+                    b'data: {"choices":[{"delta":{"content":"hi"}}]}\n',
+                    b"data: [DONE]\n",
+                ]
+                resp.__enter__.return_value = resp
+                return resp
+
+        monkeypatch.setattr(llm_client, "_loopback_opener", _StreamingOpener())
+        monkeypatch.setattr(llm_client, "_in_process_ssl", None)
+        events: list[dict] = []
+
+        with patch("urllib.request.urlopen", side_effect=AssertionError("system opener used")):
+            out = LLMClient._stream_openai_request(
+                None,
+                "http://127.0.0.1:1234/v1/chat/completions",
+                {"Content-Type": "application/json"},
+                b"{}",
+                events.append,
+            )
+
+        assert out["finish_reason"] == "stop"
+        assert out["message"]["content"] == "hi"
+        assert {"type": "text_chunk", "content": "hi"} in events
+        assert opened == ["http://127.0.0.1:1234/v1/chat/completions"]
+
+    def test_https_post_json_non_loopback_keeps_ca_retry(self, monkeypatch):
+        """Outbound LLM calls keep the existing plugin-CA retry path."""
+        monkeypatch.setattr(urllib.request, "getproxies", lambda: {"http": "http://proxy:8118"})
+        _, loopback_calls = self._use_fake_loopback_opener(monkeypatch)
+        monkeypatch.setattr(llm_client, "_in_process_ssl", None)
+        response = MagicMock(status=200)
+        response.read.return_value = b"ok"
+        response.__enter__.return_value = response
+
+        with patch.object(
+            llm_client, "_urlopen_with_plugin_ca_retry", return_value=response
+        ) as ca_retry:
+            status, text = llm_client._https_post_json(
+                "https://gateway.example/v1/chat/completions",
+                {"Content-Type": "application/json"},
+                b"{}",
+                timeout=30,
+            )
+
+        assert (status, text) == (200, "ok")
+        ca_retry.assert_called_once()
+        assert loopback_calls == []
 
 
 class _RecordingProxyServer(ThreadingHTTPServer):
@@ -5716,3 +5810,18 @@ class TestProxyEndToEnd:
 
         loopback_hits = [r for r in proxy.requests if "127.0.0.1" in r[1]]
         assert loopback_hits == []
+
+    def test_loopback_llm_endpoint_never_reaches_proxy(self, proxy_and_target, monkeypatch):
+        proxy, target = proxy_and_target
+        monkeypatch.setattr(llm_client, "_in_process_ssl", None)
+
+        status, text = llm_client._https_post_json(
+            f"http://127.0.0.1:{target.port}/v1/chat/completions",
+            {"Content-Type": "application/json"},
+            b'{"model": "local"}',
+            timeout=5,
+        )
+
+        assert status == 200
+        assert text == '{"ok": true}'
+        assert proxy.requests == []

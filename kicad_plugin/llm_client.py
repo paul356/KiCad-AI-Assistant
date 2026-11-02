@@ -538,10 +538,18 @@ def _urlopen_with_plugin_ca_retry(request, timeout: float):
 def _is_loopback_url(url: str) -> bool:
     """Return whether *url* points at a loopback destination.
 
-    ``localhost`` is matched by name and ``127.0.0.0/8`` by parsed address.
-    A string prefix check is not enough: ``127.evil.com`` is a DNS name, not
-    a loopback address, and must keep using the system proxy.
+    Matches ``localhost`` (with an optional trailing dot), ``::1``, the
+    unspecified IPv4 address, dotted IPv4 shorthand (``127.1``), and
+    IPv4-mapped IPv6 addresses (``::ffff:127.0.0.1``).  Address parsing is
+    required: a string prefix check would also match the DNS name
+    ``127.evil.com``.
+
+    Integer-decimal spellings (``http://2130706433/``) are deliberately not
+    supported.  ``getaddrinfo`` accepts them, but they are rare in
+    configuration, and treating them as ordinary host names keeps this
+    decision conservative.
     """
+    import socket
     import urllib.parse
 
     try:
@@ -550,13 +558,27 @@ def _is_loopback_url(url: str) -> bool:
         return False
     if not hostname:
         return False
-    host = hostname.lower()
-    if host in ("localhost", "::1", "0.0.0.0"):  # nosec B104 -- hostname, not a bind address
+    host = hostname.lower().rstrip(".")
+    if host in ("localhost", "::1"):
         return True
     try:
-        return ipaddress.ip_address(host).is_loopback
+        address = ipaddress.ip_address(host)
     except ValueError:
-        return False
+        # Dotted IPv4 shorthand (127.1, 127.0.1).  A bare integer has no dot
+        # and is intentionally not accepted.
+        if "." not in host:
+            return False
+        try:
+            address = ipaddress.IPv4Address(socket.inet_aton(host))
+        except OSError:
+            return False
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        address = address.ipv4_mapped
+    # The unspecified IPv4 address is not "loopback" per ipaddress, but a
+    # client connecting to it reaches the local host.
+    return address.is_loopback or (
+        isinstance(address, ipaddress.IPv4Address) and address.is_unspecified
+    )
 
 
 def _proxy_would_intercept(url: str) -> bool:
@@ -573,7 +595,8 @@ def _proxy_would_intercept(url: str) -> bool:
     if not _is_loopback_url(url):
         return False
     proxies = urllib.request.getproxies()
-    return bool(proxies.get("http") or proxies.get("https"))
+    # The Windows registry reader does not normalise key case.
+    return any(value for key, value in proxies.items() if key.lower() in ("http", "https"))
 
 
 # Cached opener that ignores the system proxy.  Built at most once; plugin
@@ -984,7 +1007,7 @@ def _https_post_json(
     if _in_process_ssl is not False:
         req = urllib.request.Request(url, data=body, headers=headers, method="POST")
         try:
-            with _urlopen_with_plugin_ca_retry(req, timeout=timeout) as resp:
+            with _urlopen(req, timeout, ca_retry=True) as resp:
                 _in_process_ssl = True
                 return resp.status, resp.read().decode("utf-8", "replace")
         except urllib.error.HTTPError as e:
@@ -3870,7 +3893,7 @@ class LLMClient:
         if _in_process_ssl is not False:
             req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
             try:
-                with _urlopen_with_plugin_ca_retry(req, timeout=300) as resp:
+                with _urlopen(req, 300, ca_retry=True) as resp:
                     _in_process_ssl = True
                     text_parts = []
                     if on_stream_event is not None:
@@ -4128,7 +4151,7 @@ class LLMClient:
         if _in_process_ssl is not False:
             req = urllib.request.Request(url, data=encoded, headers=headers, method="POST")
             try:
-                with _urlopen_with_plugin_ca_retry(req, timeout=300) as resp:
+                with _urlopen(req, 300, ca_retry=True) as resp:
                     _in_process_ssl = True
                     if on_stream_event is not None:
                         on_stream_event({"type": "text_start"})

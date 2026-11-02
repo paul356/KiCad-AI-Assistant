@@ -225,6 +225,33 @@ class TestCheckKicadIpcConnection:
 
 
 # ---------------------------------------------------------------------------
+# check_kicad_ipc_connection: socket discovery failure
+# ---------------------------------------------------------------------------
+
+
+class TestSocketPathDiscoveryFailure:
+    """A discovered socket that vanishes before ``getmtime`` must not turn the
+    availability check into a tool-level error (issue #230 review, P2-4)."""
+
+    @patch.dict(os.environ, {}, clear=True)
+    @patch("kcaa.tools.kipy_tools.glob.glob", return_value=["/tmp/kicad/api-gone.sock"])
+    @patch("kcaa.tools.kipy_tools.os.path.getmtime", side_effect=FileNotFoundError)
+    @patch("kcaa.tools.kipy_tools._connect")
+    def test_vanished_socket_returns_unknown_path(
+        self, mock_connect, mock_getmtime, mock_glob, tools
+    ):
+        mock_connect.side_effect = RuntimeError("kicad-python is not installed")
+
+        fn = tools["check_kicad_ipc_connection"]
+        result = _run(fn(ctx=None))
+
+        assert result["success"] is True
+        assert result["connected"] is False
+        assert result["socket_path"] == "unknown"
+        assert "not installed" in result["error"]
+
+
+# ---------------------------------------------------------------------------
 # save_document
 # ---------------------------------------------------------------------------
 

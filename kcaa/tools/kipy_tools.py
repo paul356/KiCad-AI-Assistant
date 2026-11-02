@@ -98,12 +98,19 @@ def register_kipy_tools(mcp: FastMCP) -> None:
             dict with:
                 success (bool): True if the tool executed without errors.
                 connected (bool): True if KiCad is reachable via IPC.
-                socket_path (str): The socket path that was tested; also
-                    present when the connection attempt failed, so callers
-                    never have to display "unknown".
+                socket_path (str): The socket path that was tested, or
+                    "unknown" if discovery failed; always present so callers
+                    never have to guess.
                 error (str): Present only if connection failed.
         """
-        socket_path = _find_kicad_socket()
+        socket_path = "unknown"
+        try:
+            socket_path = _find_kicad_socket()
+        except OSError:
+            # The socket can vanish between glob() and getmtime(); an
+            # unresolvable path must not turn the availability check into a
+            # tool-level error.  Keep "unknown" and try to connect anyway.
+            log.warning("Could not resolve the KiCad IPC socket path", exc_info=True)
         try:
             import kipy.errors  # noqa: PLC0415
 
