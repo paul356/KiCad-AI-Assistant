@@ -195,6 +195,9 @@ class TestCheckKicadIpcConnection:
             assert result["success"] is True
             assert result["connected"] is False
             assert "error" in result
+            # #230: the tested path is still reported on failure, so the UI
+            # never has to show "unknown".
+            assert result["socket_path"]
 
     @patch("kcaa.tools.kipy_tools._connect")
     def test_kipy_not_installed(self, mock_connect):
@@ -206,6 +209,7 @@ class TestCheckKicadIpcConnection:
         assert result["success"] is True
         assert result["connected"] is False
         assert "not installed" in result["error"]
+        assert result["socket_path"]
 
     @patch("kcaa.tools.kipy_tools._connect")
     def test_unexpected_exception(self, mock_connect):
@@ -217,6 +221,44 @@ class TestCheckKicadIpcConnection:
         assert result["success"] is True
         assert result["connected"] is False
         assert "error" in result
+        assert result["socket_path"]
+
+
+# ---------------------------------------------------------------------------
+# check_kicad_ipc_connection: socket discovery failure
+# ---------------------------------------------------------------------------
+
+
+class TestSocketPathDiscoveryFailure:
+    """Socket discovery failures must not turn the availability check into a
+    tool-level error (issue #230 review, P2-4).
+
+    ``_find_kicad_socket`` is patched directly so the case exercises the
+    tool's fallback on every platform: the Windows branch returns a fixed
+    path without touching ``glob``/``getmtime``, so a discovery-race test
+    written against those internals would fail there.
+    """
+
+    @pytest.mark.parametrize("system", ["Linux", "Darwin", "Windows"])
+    def test_unresolvable_socket_returns_unknown_path(self, system, tools):
+        with (
+            patch("kcaa.tools.kipy_tools.platform.system", return_value=system),
+            patch(
+                "kcaa.tools.kipy_tools._find_kicad_socket",
+                side_effect=FileNotFoundError("socket vanished"),
+            ),
+            patch(
+                "kcaa.tools.kipy_tools._connect",
+                side_effect=RuntimeError("kicad-python is not installed"),
+            ),
+        ):
+            fn = tools["check_kicad_ipc_connection"]
+            result = _run(fn(ctx=None))
+
+        assert result["success"] is True
+        assert result["connected"] is False
+        assert result["socket_path"] == "unknown"
+        assert "not installed" in result["error"]
 
 
 # ---------------------------------------------------------------------------

@@ -98,15 +98,24 @@ def register_kipy_tools(mcp: FastMCP) -> None:
             dict with:
                 success (bool): True if the tool executed without errors.
                 connected (bool): True if KiCad is reachable via IPC.
-                socket_path (str): The socket path that was tested.
+                socket_path (str): The socket path that was tested, or
+                    "unknown" if discovery failed; always present so callers
+                    never have to guess.
                 error (str): Present only if connection failed.
         """
+        socket_path = "unknown"
+        try:
+            socket_path = _find_kicad_socket()
+        except OSError:
+            # The socket can vanish between glob() and getmtime(); an
+            # unresolvable path must not turn the availability check into a
+            # tool-level error.  Keep "unknown" and try to connect anyway.
+            log.warning("Could not resolve the KiCad IPC socket path", exc_info=True)
         try:
             import kipy.errors  # noqa: PLC0415
 
             # Use longer timeout for ping check since KiCad may be slow to respond
             kicad = _connect(timeout_ms=10000)
-            socket_path = _find_kicad_socket()
 
             try:
                 kicad.ping()
@@ -133,12 +142,14 @@ def register_kipy_tools(mcp: FastMCP) -> None:
                     return {
                         "success": True,
                         "connected": False,
+                        "socket_path": socket_path,
                         "error": str(exc),
                     }
         except RuntimeError as exc:
             return {
                 "success": True,
                 "connected": False,
+                "socket_path": socket_path,
                 "error": str(exc),
             }
         except Exception as exc:
@@ -146,6 +157,7 @@ def register_kipy_tools(mcp: FastMCP) -> None:
             return {
                 "success": True,
                 "connected": False,
+                "socket_path": socket_path,
                 "error": str(exc),
             }
 
