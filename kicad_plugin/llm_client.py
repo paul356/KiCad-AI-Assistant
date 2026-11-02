@@ -570,7 +570,9 @@ def _is_loopback_url(url: str) -> bool:
             return False
         try:
             address = ipaddress.IPv4Address(socket.inet_aton(host))
-        except OSError:
+        except (OSError, ValueError):
+            # inet_aton raises ValueError (not OSError) for a host with an
+            # embedded NUL byte.
             return False
     if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
         address = address.ipv4_mapped

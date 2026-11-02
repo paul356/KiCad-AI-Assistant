@@ -5479,6 +5479,7 @@ class TestLoopbackProxyBypass:
             "http://127.1.evil.com/mcp",
             "http://localhost.evil.com/mcp",
             "http://2130706433/mcp",
+            "http://1.2.3/mcp",
             "http://10.0.0.1/mcp",
             "http://192.168.71.5:8118/",
             "https://example.com/mcp",
@@ -5489,6 +5490,10 @@ class TestLoopbackProxyBypass:
     )
     def test_is_loopback_url_rejects_non_loopback_hosts(self, url):
         assert llm_client._is_loopback_url(url) is False
+
+    def test_host_with_embedded_nul_is_rejected_without_raising(self):
+        """``inet_aton`` raises ValueError (not OSError) on a NUL byte."""
+        assert llm_client._is_loopback_url("http://127.0.0.1\x00evil.com/") is False
 
     def test_proxy_would_intercept_requires_both_conditions(self, monkeypatch):
         monkeypatch.setattr(urllib.request, "getproxies", lambda: {"http": "http://proxy"})
@@ -5650,6 +5655,41 @@ class TestLoopbackProxyBypass:
         assert out["message"]["content"] == "hi"
         assert {"type": "text_chunk", "content": "hi"} in events
         assert opened == ["http://127.0.0.1:1234/v1/chat/completions"]
+
+    def test_stream_anthropic_loopback_bypasses_proxy(self, monkeypatch):
+        """The Anthropic streaming path routes loopback endpoints directly."""
+        monkeypatch.setattr(urllib.request, "getproxies", lambda: {"http": "http://proxy:8118"})
+        opened: list[str] = []
+
+        class _StreamingOpener:
+            def open(self, request, timeout=None):
+                opened.append(request.full_url)
+                resp = MagicMock()
+                resp.readline.side_effect = [b""]
+                resp.__enter__.return_value = resp
+                return resp
+
+        monkeypatch.setattr(llm_client, "_loopback_opener", _StreamingOpener())
+        monkeypatch.setattr(llm_client, "_in_process_ssl", None)
+
+        calls: list[tuple[str, float, bool]] = []
+        real_urlopen = llm_client._urlopen
+
+        def _spy_urlopen(request, timeout, *, ca_retry=False):
+            calls.append((request.full_url, timeout, ca_retry))
+            return real_urlopen(request, timeout, ca_retry=ca_retry)
+
+        monkeypatch.setattr(llm_client, "_urlopen", _spy_urlopen)
+        client = _make_client()
+        client._settings.llm_base_url = "http://127.0.0.1:1234"
+
+        with patch("urllib.request.urlopen", side_effect=AssertionError("system opener used")):
+            out = client._stream_anthropic("sys", [], None)
+
+        assert "error" not in out
+        assert out["finish_reason"] == "stop"
+        assert calls == [("http://127.0.0.1:1234/v1/messages", 300, True)]
+        assert opened == ["http://127.0.0.1:1234/v1/messages"]
 
     def test_https_post_json_non_loopback_keeps_ca_retry(self, monkeypatch):
         """Outbound LLM calls keep the existing plugin-CA retry path."""
