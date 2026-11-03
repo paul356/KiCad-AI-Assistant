@@ -3360,6 +3360,205 @@ class TestToolCallArgumentsNormalization:
         assert result["message"]["content"] == ""
         assert result["finish_reason"] == "stop"
 
+    # ---- Ollama native API round trip (P1) ---------------------------------
+
+    def test_ollama_outbound_history_arguments_are_objects(self):
+        """P1: Ollama's native /api/chat rejects string arguments with
+        ``400 Value looks like object, but can't find closing '}' symbol``,
+        so a normalized history entry must be decoded back to an object while
+        history itself keeps the internal string form."""
+        client = _make_client()
+        client._settings.llm_provider = "ollama"
+        lines = [
+            '{"message":{"role":"assistant","content":"","tool_calls":'
+            '[{"index":0,"function":{"name":"get_board_info",'
+            '"arguments":{"detail":"full"}}}]},"done":false}',
+            '{"done":true,"done_reason":"tool_calls"}',
+        ]
+        streamed = self._stream_ollama(client, lines)
+        assert "error" not in streamed, streamed.get("error")
+
+        history_message = dict(streamed["message"], role="assistant")
+        client._history = [{"role": "user", "content": "board?"}, history_message]
+
+        outbound = client._ollama_messages()[-1]
+        arguments = outbound["tool_calls"][0]["function"]["arguments"]
+        assert isinstance(arguments, dict)
+        assert arguments == {"detail": "full"}
+        assert outbound["tool_calls"][0]["function"]["name"] == "get_board_info"
+
+        # The internal representation and the caller's object stay untouched.
+        assert isinstance(history_message["tool_calls"][0]["function"]["arguments"], str)
+        assert client._history[-1] is history_message
+        assert isinstance(
+            client._history[-1]["tool_calls"][0]["function"]["arguments"],
+            str,
+        )
+
+    def test_ollama_outbound_empty_or_broken_arguments_become_objects(self):
+        """``""`` (no-argument tool call), ``None`` and unparseable strings
+        must reach Ollama as ``{}`` instead of raising."""
+        client = _make_client()
+        client._history = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "a", "type": "function", "function": {"name": "t1", "arguments": ""}},
+                    {"id": "b", "type": "function", "function": {"name": "t2", "arguments": None}},
+                    {
+                        "id": "c",
+                        "type": "function",
+                        "function": {"name": "t3", "arguments": "{not json"},
+                    },
+                ],
+            }
+        ]
+
+        outbound = client._ollama_messages()[0]
+
+        assert [tc["function"]["arguments"] for tc in outbound["tool_calls"]] == [{}, {}, {}]
+        assert client._history[0]["tool_calls"][2]["function"]["arguments"] == "{not json"
+
+    def test_ollama_second_round_request_body_uses_object_arguments(self):
+        """P1 end-to-end: the JSON actually POSTed on the follow-up turn must
+        carry ``arguments`` as an object."""
+        client = _make_client()
+        client._settings.llm_provider = "ollama"
+        client._history = [
+            {"role": "user", "content": "board?"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "",
+                        "type": "function",
+                        "function": {
+                            "name": "get_board_info",
+                            "arguments": '{"detail": "full"}',
+                        },
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "", "content": "{}"},
+        ]
+        captured: dict[str, object] = {}
+        mock_resp = self._make_line_response(['{"done":true,"done_reason":"stop"}'])
+
+        def _fake_urlopen(req, timeout, **kwargs):
+            captured["body"] = json.loads(req.data.decode())
+            return mock_resp
+
+        with patch("kicad_plugin.llm_client._urlopen", side_effect=_fake_urlopen):
+            result = client._stream_ollama("sys", [], on_stream_event=lambda evt: None)
+
+        assert "error" not in result, result.get("error")
+        sent = next(m for m in captured["body"]["messages"] if m.get("role") == "assistant")
+        assert sent["tool_calls"][0]["function"]["arguments"] == {"detail": "full"}
+
+    def test_stream_ollama_http_error_includes_body(self):
+        """A rejected second-round payload (HTTP 400) must show the provider's
+        body, not a bare status code."""
+        client = _make_client()
+        client._settings.llm_provider = "ollama"
+        err = urllib.error.HTTPError(
+            "http://127.0.0.1:11434/api/chat",
+            400,
+            "Bad Request",
+            {},
+            io.BytesIO(
+                b'{"error":"Value looks like object, but can\'t find closing \'}\' symbol"}'
+            ),
+        )
+        with patch("urllib.request.urlopen", side_effect=err):
+            result = client._stream_ollama("sys", [], on_stream_event=lambda evt: None)
+
+        assert result["error"].startswith("Ollama request failed: HTTP 400:")
+        assert "Value looks like object" in result["error"]
+
+    # ---- Remaining covered contracts (P2) ----------------------------------
+
+    def test_stream_openai_relay_serializes_object_arguments(self):
+        """P2-1: ``_in_process_ssl`` is sticky, so a loopback Ollama /v1 URL is
+        relayed through the subprocess script once SSL failed earlier.  That
+        script has its own accumulator and must serialize objects too."""
+        lines = [
+            'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"tc1",'
+            '"function":{"name":"get_board_info","arguments":{"detail":"full"}}}]},'
+            '"finish_reason":null}]}',
+            'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}',
+            "data: [DONE]",
+        ]
+        server = _SSETestServer(lines)
+        client = _make_client()
+        client._settings.llm_base_url = server.url
+        try:
+            with (
+                patch.object(llm_client, "_in_process_ssl", False),
+                patch(
+                    "kicad_plugin.llm_client._resolve_plugin_python",
+                    return_value=sys.executable,
+                ),
+                patch(
+                    "kicad_plugin.llm_client._subprocess_env",
+                    return_value={"PATH": os.environ.get("PATH", "")},
+                ),
+            ):
+                result = client._stream_openai("sys", [], on_stream_event=lambda evt: None)
+        finally:
+            server.shutdown()
+
+        assert "error" not in result, result.get("error")
+        tc = result["message"]["tool_calls"][0]
+        assert tc["id"] == "tc1"
+        assert isinstance(tc["function"]["arguments"], str)
+        assert json.loads(tc["function"]["arguments"]) == {"detail": "full"}
+
+    def test_build_anthropic_messages_empty_arguments(self):
+        """P2-2: a no-argument tool call normalizes to ``""``; the Anthropic
+        history builder must fall back to ``{}`` instead of raising."""
+        client = _make_client()
+        client._history = [
+            {"role": "user", "content": "which tracks?"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tc1",
+                        "type": "function",
+                        "function": {"name": "list_tracks", "arguments": ""},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "tc1", "content": "[]"},
+        ]
+
+        messages = client._build_anthropic_messages()
+
+        assistant = next(m for m in messages if m["role"] == "assistant")
+        assert assistant["content"][0]["type"] == "tool_use"
+        assert assistant["content"][0]["input"] == {}
+
+    def test_normalize_tool_calls_copies_instead_of_mutating(self):
+        """P2-3: the helper must not rewrite the caller's response body."""
+        original = [
+            {
+                "id": "tc1",
+                "type": "function",
+                "function": {"name": "get_board_info", "arguments": {"detail": "full"}},
+            }
+        ]
+
+        normalized = llm_client._normalize_tool_calls(original)
+
+        assert normalized[0]["function"]["arguments"] == '{"detail": "full"}'
+        assert isinstance(original[0]["function"]["arguments"], dict)
+        assert original[0]["function"]["arguments"] == {"detail": "full"}
+        assert normalized[0] is not original[0]
+        assert normalized[0]["function"] is not original[0]["function"]
+
 
 class TestSubprocessSSEStream:
     """End-to-end relay: _subprocess_sse_stream runs a real subprocess Python

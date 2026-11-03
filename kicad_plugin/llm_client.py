@@ -106,6 +106,37 @@ def _normalize_tool_calls(tool_calls: Any) -> Any:
     return normalized
 
 
+def _to_ollama_tool_arguments(value: Any) -> Any:
+    """Return tool-call arguments in the shape Ollama's native API accepts.
+
+    Internally ``function.arguments`` is always a JSON string, but Ollama's
+    ``/api/chat`` unmarshals ``ToolCallFunctionArguments`` from a JSON object
+    and rejects a string with
+    ``400 Value looks like object, but can't find closing '}' symbol``.
+    Decode the string back into the object it encodes.
+
+    - ``dict`` / ``list`` -> returned as-is
+    - ``""`` / ``None`` / unparseable / non-object JSON -> ``{}`` (a
+      no-argument tool call still sends a valid object; failures are logged
+      at debug level and never raise)
+
+    The caller's value is never mutated.
+    """
+    if isinstance(value, (dict, list)):
+        return value
+    if not isinstance(value, str) or not value.strip():
+        return {}
+    try:
+        decoded = json.loads(value)
+    except json.JSONDecodeError as e:
+        log.debug("Could not decode tool-call arguments for Ollama: %s", e)
+        return {}
+    if isinstance(decoded, (dict, list)):
+        return decoded
+    log.debug("Ignoring non-object tool-call arguments for Ollama: %r", decoded)
+    return {}
+
+
 # Synthetic user message prepended to history when a framework tool_direct
 # turn (e.g. auto footprint sync) would otherwise open the conversation with
 # an assistant tool-call message — providers require the first message to
@@ -902,9 +933,10 @@ try:
                     finish_reason = fr
                 delta = choice.get("delta", {})
                 content = delta.get("content")
-                if content:
-                    text_parts.append(content)
-                    emit("SSE-DATA", {"content": content})
+                if isinstance(content, str):
+                    if content:
+                        text_parts.append(content)
+                        emit("SSE-DATA", {"content": content})
                 reasoning_part = delta.get("reasoning_content")
                 if reasoning_part:
                     reasoning.append(reasoning_part)
@@ -918,13 +950,25 @@ try:
                             "function": {"name": "", "arguments": ""},
                         }
                     tc = tool_calls[idx]
-                    if tc_delta.get("id"):
-                        tc["id"] += tc_delta["id"]
-                    fn = tc_delta.get("function", {})
-                    if fn.get("name"):
-                        tc["function"]["name"] += fn["name"]
-                    if fn.get("arguments"):
-                        tc["function"]["arguments"] += fn["arguments"]
+                    call_id = tc_delta.get("id")
+                    if isinstance(call_id, str) and call_id:
+                        tc["id"] += call_id
+                    fn = tc_delta.get("function") or {}
+                    if not isinstance(fn, dict):
+                        continue
+                    name = fn.get("name")
+                    if isinstance(name, str) and name:
+                        tc["function"]["name"] += name
+                    arguments = fn.get("arguments")
+                    if arguments:
+                        if isinstance(arguments, str):
+                            tc["function"]["arguments"] += arguments
+                        else:
+                            # Object-style delta (Ollama /v1, LM Studio):
+                            # serialize once instead of str + dict.
+                            tc["function"]["arguments"] = json.dumps(
+                                arguments, ensure_ascii=False
+                            )
             tool_calls_list = [tool_calls[k] for k in sorted(tool_calls)]
             message_out = {"content": "".join(text_parts)}
             if tool_calls_list:
@@ -3871,7 +3915,7 @@ class LLMClient:
                             "type": "tool_use",
                             "id": tc["id"],
                             "name": tc["function"]["name"],
-                            "input": json.loads(tc["function"].get("arguments", "{}")),
+                            "input": json.loads(tc["function"].get("arguments") or "{}"),
                         }
                         for tc in m["tool_calls"]
                     ]
@@ -4083,6 +4127,25 @@ class LLMClient:
                         images.append(data)
                 content = "\n".join(p for p in text_parts if p)
             converted = {**msg, "content": content}
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                # Ollama's native API requires arguments as JSON objects; the
+                # internal representation is always a JSON string.
+                outbound: list[Any] = []
+                for tc in msg["tool_calls"]:
+                    fn = tc.get("function") if isinstance(tc, dict) else None
+                    if not isinstance(fn, dict):
+                        outbound.append(tc)
+                        continue
+                    outbound.append(
+                        {
+                            **tc,
+                            "function": {
+                                **fn,
+                                "arguments": _to_ollama_tool_arguments(fn.get("arguments")),
+                            },
+                        }
+                    )
+                converted["tool_calls"] = outbound
             if images:
                 converted["images"] = images
             out.append(converted)
@@ -4202,6 +4265,15 @@ class LLMClient:
                     on_stream_event({"type": "text_end"})
                 return {"finish_reason": finish_reason, "message": message}
 
+        except urllib.error.HTTPError as e:
+            # HTTPError is a URLError subclass; surface the reason phrase and
+            # (crucially) the provider's body instead of a bare status code.
+            try:
+                body = e.read().decode("utf-8", "replace")[:200]
+            except Exception:  # noqa: BLE001 -- the body is best-effort context
+                body = ""
+            detail = f"HTTP {e.code}: {body}" if body else f"HTTP {e.code}: {e.reason}"
+            return {"error": f"Ollama request failed: {detail}"}
         except urllib.error.URLError as e:
             return {"error": f"Ollama request failed: {e}"}
         except Exception as e:
