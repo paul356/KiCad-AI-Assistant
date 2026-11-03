@@ -4458,9 +4458,15 @@ class LLMClient:
         if not _choices:
             return {"error": f"{label} response contained no choices"}
         choice = _choices[0]
+        message = choice.get("message", {})
+        # Ollama's OpenAI-compatible endpoint (/v1/chat/completions) returns
+        # tool-call arguments as JSON objects; normalize the copy we hand back
+        # so downstream json.loads(arguments) works.
+        if isinstance(message, dict) and message.get("tool_calls"):
+            message = {**message, "tool_calls": _normalize_tool_calls(message["tool_calls"])}
         return {
             "finish_reason": choice.get("finish_reason", "stop"),
-            "message": choice.get("message", {}),
+            "message": message,
         }
 
     def _call_openai(self, system: str, tools: list[dict]) -> dict[str, Any]:

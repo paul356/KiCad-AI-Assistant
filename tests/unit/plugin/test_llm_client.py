@@ -3255,6 +3255,45 @@ class TestToolCallArgumentsNormalization:
         assert isinstance(arguments, str)
         assert json.loads(arguments) == {"detail": "full"}
 
+    def test_call_openai_normalizes_object_arguments(self):
+        """Ollama's OpenAI-compatible endpoint (/v1/chat/completions) also
+        returns arguments as an object on the non-streaming path."""
+        client = _make_client()
+        client._settings.llm_base_url = "http://127.0.0.1:11434/v1"
+        body = {
+            "choices": [
+                {
+                    "finish_reason": "tool_calls",
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "tc1",
+                                "type": "function",
+                                "function": {
+                                    "name": "get_board_info",
+                                    "arguments": {"detail": "full"},
+                                },
+                            }
+                        ],
+                    },
+                }
+            ]
+        }
+        with patch(
+            "kicad_plugin.llm_client._https_post_json",
+            return_value=(200, json.dumps(body)),
+        ):
+            result = client._call_openai("sys", [])
+
+        assert "error" not in result, result.get("error")
+        assert result["finish_reason"] == "tool_calls"
+        assert result["message"]["content"] == ""
+        arguments = result["message"]["tool_calls"][0]["function"]["arguments"]
+        assert isinstance(arguments, str)
+        assert json.loads(arguments) == {"detail": "full"}
+
     def test_stream_openai_object_arguments_become_json_string(self):
         """Local OpenAI-compatible endpoints (Ollama /v1, LM Studio,
         llama.cpp) can also send arguments as an object."""
