@@ -52,6 +52,60 @@ def _project_path_for(file_path: str) -> str:
     return os.path.join(d, f"{stem}.kicad_pro")
 
 
+def _normalize_tool_arguments(value: Any) -> str:
+    """Return tool-call arguments as a JSON string (provider-agnostic).
+
+    OpenAI-compatible endpoints send ``function.arguments`` already serialized
+    as a JSON string, while Ollama's native ``/api/chat`` sends a ready-made
+    JSON object (and some gateways send lists or scalars).  Normalising every
+    provider to a string keeps downstream ``json.loads(arguments or "{}")``
+    and ``json.dumps`` round-trips valid.
+
+    - ``None`` -> ``""`` (callers already fall back to ``"{}"``)
+    - ``str`` -> returned unchanged; it is NOT re-serialized, so whitespace
+      and key order survive for byte-exact comparisons
+    - ``dict`` / ``list`` / other scalars -> ``json.dumps(value, ensure_ascii=False)``
+    - unserializable objects -> ``json.dumps(str(value), ensure_ascii=False)``
+
+    Never raises.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, ensure_ascii=False)
+    except (TypeError, ValueError):
+        try:
+            return json.dumps(str(value), ensure_ascii=False)
+        except Exception:  # noqa: BLE001 -- normalization must never raise
+            return ""
+
+
+def _normalize_tool_calls(tool_calls: Any) -> Any:
+    """Return *tool_calls* with every ``function.arguments`` normalised to str.
+
+    The list and each tool-call entry are shallow copies, so the response body
+    a caller parsed is never mutated in place.  Non-list values and non-dict
+    entries pass through untouched.
+    """
+    if not isinstance(tool_calls, list):
+        return tool_calls
+    normalized: list[Any] = []
+    for tc in tool_calls:
+        if not isinstance(tc, dict):
+            normalized.append(tc)
+            continue
+        tc = dict(tc)
+        fn = tc.get("function")
+        if isinstance(fn, dict):
+            fn = dict(fn)
+            fn["arguments"] = _normalize_tool_arguments(fn.get("arguments"))
+            tc["function"] = fn
+        normalized.append(tc)
+    return normalized
+
+
 # Synthetic user message prepended to history when a framework tool_direct
 # turn (e.g. auto footprint sync) would otherwise open the conversation with
 # an assistant tool-call message — providers require the first message to
@@ -1174,10 +1228,12 @@ def _subprocess_sse_stream(
     except subprocess.TimeoutExpired:
         proc.kill()
 
-    message: dict[str, Any] = {"content": (done.get("message") or {}).get("content", "")}
     done_message = done.get("message") or {}
+    if not isinstance(done_message, dict):
+        done_message = {}
+    message: dict[str, Any] = {"content": done_message.get("content", "")}
     if done_message.get("tool_calls"):
-        message["tool_calls"] = done_message["tool_calls"]
+        message["tool_calls"] = _normalize_tool_calls(done_message["tool_calls"])
     if done_message.get("reasoning_content"):
         message["reasoning_content"] = done_message["reasoning_content"]
     if on_stream_event is not None:
@@ -3952,13 +4008,30 @@ class LLMClient:
                                     "function": {"name": "", "arguments": ""},
                                 }
                             tc = tool_calls_by_index[idx]
-                            if tc_delta.get("id"):
-                                tc["id"] += tc_delta["id"]
-                            fn = tc_delta.get("function", {})
-                            if fn.get("name"):
-                                tc["function"]["name"] += fn["name"]
-                            if fn.get("arguments"):
-                                tc["function"]["arguments"] += fn["arguments"]
+                            call_id = tc_delta.get("id")
+                            if isinstance(call_id, str) and call_id:
+                                tc["id"] += call_id
+                            elif call_id:
+                                log.debug("Skipping non-string tool-call id %r", call_id)
+                            fn = tc_delta.get("function") or {}
+                            if not isinstance(fn, dict):
+                                continue
+                            name = fn.get("name")
+                            if isinstance(name, str) and name:
+                                tc["function"]["name"] += name
+                            elif name:
+                                log.debug("Skipping non-string tool name %r", name)
+                            arguments = fn.get("arguments")
+                            if arguments:
+                                if isinstance(arguments, str):
+                                    tc["function"]["arguments"] += arguments
+                                else:
+                                    # Object-style delta (Ollama /v1, LM Studio,
+                                    # llama.cpp): serialize once instead of
+                                    # concatenating a dict onto a str.
+                                    tc["function"]["arguments"] = _normalize_tool_arguments(
+                                        arguments
+                                    )
 
                     tool_calls = [tool_calls_by_index[k] for k in sorted(tool_calls_by_index)]
                     message: dict[str, Any] = {"content": "".join(text_parts)}
@@ -4066,14 +4139,27 @@ class LLMClient:
                         finish_reason = chunk.get("done_reason", "stop")
                         break
 
-                    msg = chunk.get("message", {})
-                    content = msg.get("content", "")
-                    if content:
-                        text_parts.append(content)
-                        try:
-                            on_stream_event({"type": "text_chunk", "content": content})
-                        except Exception as e:
-                            log.error("Text delta callback error in Ollama streaming: %s", e)
+                    msg = chunk.get("message")
+                    if not isinstance(msg, dict):
+                        # e.g. an /api/generate-style payload (bare string) or a
+                        # truncated chunk — nothing to accumulate.
+                        continue
+                    content = msg.get("content")
+                    if isinstance(content, str):
+                        if content:
+                            text_parts.append(content)
+                            try:
+                                on_stream_event({"type": "text_chunk", "content": content})
+                            except Exception as e:
+                                log.error("Text delta callback error in Ollama streaming: %s", e)
+                    elif content:
+                        # Some compatible endpoints return content blocks
+                        # (list/dict).  Joining them would raise TypeError and
+                        # JSON-pasting them would corrupt the chat text.
+                        log.warning(
+                            "Ignoring non-string content in Ollama stream (%s)",
+                            type(content).__name__,
+                        )
 
                     for tc_delta in msg.get("tool_calls") or []:
                         idx = tc_delta.get("index", 0)
@@ -4084,13 +4170,29 @@ class LLMClient:
                                 "function": {"name": "", "arguments": ""},
                             }
                         tc = tool_calls_by_index[idx]
-                        if tc_delta.get("id"):
-                            tc["id"] += tc_delta["id"]
-                        fn = tc_delta.get("function", {})
-                        if fn.get("name"):
-                            tc["function"]["name"] += fn["name"]
-                        if fn.get("arguments"):
-                            tc["function"]["arguments"] += fn["arguments"]
+                        call_id = tc_delta.get("id")
+                        if isinstance(call_id, str) and call_id:
+                            tc["id"] += call_id
+                        elif call_id:
+                            log.debug("Skipping non-string tool-call id %r", call_id)
+                        fn = tc_delta.get("function") or {}
+                        if not isinstance(fn, dict):
+                            continue
+                        name = fn.get("name")
+                        if isinstance(name, str) and name:
+                            tc["function"]["name"] += name
+                        elif name:
+                            log.debug("Skipping non-string tool name %r", name)
+                        arguments = fn.get("arguments")
+                        if arguments:
+                            if isinstance(arguments, str):
+                                tc["function"]["arguments"] += arguments
+                            else:
+                                # Ollama's native /api/chat sends arguments as a
+                                # JSON object, not a serialized string: dumping
+                                # once replaces the empty accumulator instead of
+                                # raising TypeError on str + dict (#232).
+                                tc["function"]["arguments"] = _normalize_tool_arguments(arguments)
 
                 tool_calls = [tool_calls_by_index[k] for k in sorted(tool_calls_by_index)]
                 message: dict[str, Any] = {"content": "".join(text_parts)}
@@ -4488,6 +4590,10 @@ class LLMClient:
             return {"error": f"Unexpected response from Ollama: {text[:200]}"}
 
         msg = body.get("message", {})
+        # Ollama returns tool-call arguments as JSON objects; normalize the
+        # copy we hand back so downstream json.loads(arguments) works.
+        if isinstance(msg, dict) and msg.get("tool_calls"):
+            msg = {**msg, "tool_calls": _normalize_tool_calls(msg["tool_calls"])}
         finish_reason = "stop"
         if body.get("done_reason") == "tool_calls":
             finish_reason = "tool_calls"

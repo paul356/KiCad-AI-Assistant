@@ -3168,6 +3168,160 @@ class TestStreaming:
         assert call_kwargs.kwargs.get("on_stream_event") is on_event
 
 
+class TestToolCallArgumentsNormalization:
+    """Tool-call ``arguments`` must reach the client as JSON strings.
+
+    Ollama's native /api/chat encodes them as JSON objects while OpenAI
+    encodes them as serialized strings; both shapes must normalise so the
+    downstream ``json.loads(arguments or "{}")`` never receives a dict (#232).
+    """
+
+    def _make_line_response(self, lines):
+        """Return a mock response object that yields one line per readline()."""
+        data = [line.encode("utf-8") + b"\n" for line in lines] + [b""]
+        obj = MagicMock()
+        obj.readline.side_effect = data
+        obj.__enter__ = lambda s: s
+        obj.__exit__ = MagicMock(return_value=False)
+        return obj
+
+    def _stream_ollama(self, client, lines):
+        mock_resp = self._make_line_response(lines)
+        with patch("urllib.request.urlopen", return_value=mock_resp):
+            return client._stream_ollama("sys", [], on_stream_event=lambda evt: None)
+
+    def test_stream_ollama_object_arguments_become_json_string(self):
+        """Issue #232: the tool call that ends an Ollama stream carries a dict."""
+        client = _make_client()
+        client._settings.llm_provider = "ollama"
+        lines = [
+            '{"message":{"role":"assistant","content":"","tool_calls":'
+            '[{"index":0,"function":{"name":"get_board_info",'
+            '"arguments":{"detail":"full"}}}]},"done":false}',
+            '{"done":true,"done_reason":"stop"}',
+        ]
+
+        result = self._stream_ollama(client, lines)
+
+        assert "error" not in result, result.get("error")
+        tc = result["message"]["tool_calls"][0]
+        assert isinstance(tc["function"]["arguments"], str)
+        assert json.loads(tc["function"]["arguments"]) == {"detail": "full"}
+        assert tc["id"] == ""
+        assert result["finish_reason"] == "stop"
+
+    def test_stream_ollama_string_argument_fragments_still_concatenate(self):
+        """The string-delta path (OpenAI-style) must keep concatenating."""
+        client = _make_client()
+        client._settings.llm_provider = "ollama"
+        lines = [
+            '{"message":{"role":"assistant","content":"","tool_calls":'
+            '[{"index":0,"function":{"name":"add_wire","arguments":"{\\"a\\":"}}]},"done":false}',
+            '{"message":{"role":"assistant","content":"","tool_calls":'
+            '[{"index":0,"function":{"arguments":"1}"}}]},"done":false}',
+            '{"done":true,"done_reason":"tool_calls"}',
+        ]
+
+        result = self._stream_ollama(client, lines)
+
+        assert "error" not in result, result.get("error")
+        assert result["message"]["tool_calls"][0]["function"]["arguments"] == '{"a":1}'
+        assert result["finish_reason"] == "tool_calls"
+
+    def test_call_ollama_normalizes_object_arguments(self):
+        """The non-streaming path returns the raw Ollama message; its tool
+        calls must be normalised before the caller parses them."""
+        client = _make_client()
+        client._settings.llm_provider = "ollama"
+        body = {
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"function": {"name": "get_board_info", "arguments": {"detail": "full"}}}
+                ],
+            },
+            "done_reason": "tool_calls",
+        }
+        with patch(
+            "kicad_plugin.llm_client._https_post_json",
+            return_value=(200, json.dumps(body)),
+        ):
+            result = client._call_ollama("sys", [])
+
+        assert "error" not in result
+        assert result["finish_reason"] == "tool_calls"
+        arguments = result["message"]["tool_calls"][0]["function"]["arguments"]
+        assert isinstance(arguments, str)
+        assert json.loads(arguments) == {"detail": "full"}
+
+    def test_stream_openai_object_arguments_become_json_string(self):
+        """Local OpenAI-compatible endpoints (Ollama /v1, LM Studio,
+        llama.cpp) can also send arguments as an object."""
+        client = _make_client()
+        sse_lines = [
+            'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"tc1",'
+            '"function":{"name":"get_board_info","arguments":{"detail":"full"}}}]},'
+            '"finish_reason":null}]}',
+            'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}',
+            "data: [DONE]",
+        ]
+        mock_resp = self._make_line_response(sse_lines)
+        with patch("urllib.request.urlopen", return_value=mock_resp):
+            result = client._stream_openai("sys", [], on_stream_event=lambda evt: None)
+
+        assert "error" not in result, result.get("error")
+        tc = result["message"]["tool_calls"][0]
+        assert tc["id"] == "tc1"
+        assert isinstance(tc["function"]["arguments"], str)
+        assert json.loads(tc["function"]["arguments"]) == {"detail": "full"}
+
+    def test_stream_ollama_ignores_non_string_content(self):
+        """Content blocks (list/dict) from compatible endpoints must not break
+        ``"".join`` nor be JSON-pasted into the chat text."""
+        client = _make_client()
+        client._settings.llm_provider = "ollama"
+        lines = [
+            '{"message":{"role":"assistant","content":[{"type":"text","text":"hi"}]},"done":false}',
+            '{"message":{"role":"assistant","content":{"text":"x"}},"done":false}',
+            '{"message":{"role":"assistant","content":"Plan: check the board."},"done":false}',
+            '{"done":true,"done_reason":"stop"}',
+        ]
+
+        # kicad_plugin loggers do not propagate to the root (plugin logging
+        # sets propagate=False), so caplog never sees them — attach a capture
+        # handler straight to the module logger instead.
+        warnings: list[str] = []
+        handler = logging.Handler()
+        handler.emit = lambda record: warnings.append(record.getMessage())  # type: ignore[method-assign]
+        logger = logging.getLogger("kicad_plugin.llm_client")
+        logger.addHandler(handler)
+        try:
+            result = self._stream_ollama(client, lines)
+        finally:
+            logger.removeHandler(handler)
+
+        assert "error" not in result, result.get("error")
+        assert result["message"]["content"] == "Plan: check the board."
+        assert result["finish_reason"] == "stop"
+        assert sum("non-string content" in w for w in warnings) == 2
+
+    def test_stream_ollama_skips_non_dict_message(self):
+        """An /api/generate-style or truncated chunk must be skipped."""
+        client = _make_client()
+        client._settings.llm_provider = "ollama"
+        lines = [
+            '{"message": "oops", "done": false}',
+            '{"done": true, "done_reason": "stop"}',
+        ]
+
+        result = self._stream_ollama(client, lines)
+
+        assert "error" not in result, result.get("error")
+        assert result["message"]["content"] == ""
+        assert result["finish_reason"] == "stop"
+
+
 class TestSubprocessSSEStream:
     """End-to-end relay: _subprocess_sse_stream runs a real subprocess Python
     against a local HTTP server speaking SSE, verifying deltas, aggregation,
