@@ -3429,6 +3429,25 @@ class TestToolCallArgumentsNormalization:
         assistant = next(m for m in messages if m["role"] == "assistant")
         assert assistant["content"][0]["input"] == {}
 
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            ({"a": 1}, {"a": 1}),
+            ([1, 2], {}),
+            (5, {}),
+            ("", {}),
+            ("{not json", {}),
+            ('{"a":1}', {"a": 1}),
+            ("[1,2]", {}),
+        ],
+    )
+    def test_anthropic_tool_input_accepts_any_arguments_shape(self, value, expected):
+        """Restored session history can hold a non-string ``arguments``
+        (``_validate_history`` does not check it); ``input`` must degrade to
+        ``{}`` for anything that is not a JSON object, never raise the
+        ``TypeError`` json.loads raises for a dict/list/int."""
+        assert llm_client._anthropic_tool_input(value) == expected
+
     # ---- Ollama native API round trip (P1) ---------------------------------
 
     def test_ollama_outbound_history_arguments_are_objects(self):

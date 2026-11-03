@@ -142,11 +142,14 @@ def _anthropic_tool_input(arguments: Any) -> dict[str, Any]:
 
     Anthropic requires ``input`` to be a JSON object; the internal string
     representation may encode an array or a scalar, and a no-argument call
-    normalizes to ``""``.  Anything that is not a JSON object becomes ``{}``.
+    normalizes to ``""``.  Restored session history may also hold a
+    non-string value.  Anything that is not a JSON object becomes ``{}``.
     """
+    if isinstance(arguments, dict):
+        return arguments
     try:
         decoded = json.loads(arguments or "{}")
-    except json.JSONDecodeError as e:
+    except (json.JSONDecodeError, TypeError) as e:
         log.debug("Could not decode tool-call arguments for Anthropic: %s", e)
         return {}
     if isinstance(decoded, dict):
