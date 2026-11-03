@@ -110,19 +110,19 @@ def _to_ollama_tool_arguments(value: Any) -> Any:
     """Return tool-call arguments in the shape Ollama's native API accepts.
 
     Internally ``function.arguments`` is always a JSON string, but Ollama's
-    ``/api/chat`` unmarshals ``ToolCallFunctionArguments`` from a JSON object
-    and rejects a string with
+    ``/api/chat`` unmarshals ``ToolCallFunctionArguments`` from a JSON
+    **object**: strings, arrays and scalars are all rejected with
     ``400 Value looks like object, but can't find closing '}' symbol``.
-    Decode the string back into the object it encodes.
 
-    - ``dict`` / ``list`` -> returned as-is
-    - ``""`` / ``None`` / unparseable / non-object JSON -> ``{}`` (a
-      no-argument tool call still sends a valid object; failures are logged
-      at debug level and never raise)
+    - ``dict`` -> returned as-is (shared, not copied)
+    - ``str`` -> ``json.loads``; only a decoded object is kept
+    - ``""`` / ``None`` / lists / scalars / unparseable / non-object JSON
+      -> ``{}`` (a no-argument call still sends a valid object; every
+      rejected value is logged at debug level and never raises)
 
     The caller's value is never mutated.
     """
-    if isinstance(value, (dict, list)):
+    if isinstance(value, dict):
         return value
     if not isinstance(value, str) or not value.strip():
         return {}
@@ -131,9 +131,27 @@ def _to_ollama_tool_arguments(value: Any) -> Any:
     except json.JSONDecodeError as e:
         log.debug("Could not decode tool-call arguments for Ollama: %s", e)
         return {}
-    if isinstance(decoded, (dict, list)):
+    if isinstance(decoded, dict):
         return decoded
     log.debug("Ignoring non-object tool-call arguments for Ollama: %r", decoded)
+    return {}
+
+
+def _anthropic_tool_input(arguments: Any) -> dict[str, Any]:
+    """Return Anthropic ``tool_use.input`` as an object.
+
+    Anthropic requires ``input`` to be a JSON object; the internal string
+    representation may encode an array or a scalar, and a no-argument call
+    normalizes to ``""``.  Anything that is not a JSON object becomes ``{}``.
+    """
+    try:
+        decoded = json.loads(arguments or "{}")
+    except json.JSONDecodeError as e:
+        log.debug("Could not decode tool-call arguments for Anthropic: %s", e)
+        return {}
+    if isinstance(decoded, dict):
+        return decoded
+    log.debug("Ignoring non-object tool-call arguments for Anthropic: %r", decoded)
     return {}
 
 
@@ -3915,7 +3933,7 @@ class LLMClient:
                             "type": "tool_use",
                             "id": tc["id"],
                             "name": tc["function"]["name"],
-                            "input": json.loads(tc["function"].get("arguments") or "{}"),
+                            "input": _anthropic_tool_input(tc["function"].get("arguments")),
                         }
                         for tc in m["tool_calls"]
                     ]

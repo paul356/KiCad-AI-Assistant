@@ -3360,6 +3360,75 @@ class TestToolCallArgumentsNormalization:
         assert result["message"]["content"] == ""
         assert result["finish_reason"] == "stop"
 
+    # ---- Ollama outbound arguments must be objects -------------------------
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            ("[1,2]", {}),
+            ([1, 2], {}),
+            ('"s"', {}),
+            ("5", {}),
+            ("", {}),
+            (None, {}),
+            ("{not json", {}),
+            ('{"a": 1}', {"a": 1}),
+            ({"a": 1}, {"a": 1}),
+        ],
+    )
+    def test_to_ollama_tool_arguments_accepts_only_objects(self, value, expected):
+        """Ollama's native API only accepts JSON objects; a JSON array,
+        scalar, or junk must collapse to ``{}`` instead of being forwarded."""
+        assert llm_client._to_ollama_tool_arguments(value) == expected
+
+    def test_ollama_outbound_list_arguments_become_empty_object(self):
+        """A history entry holding ``[1,2]`` must not reach Ollama as a list
+        (its API rejects it with the same 400 as a string)."""
+        client = _make_client()
+        client._history = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tc1",
+                        "type": "function",
+                        "function": {"name": "list_tracks", "arguments": "[1,2]"},
+                    }
+                ],
+            }
+        ]
+
+        outbound = client._ollama_messages()[0]
+
+        assert outbound["tool_calls"][0]["function"]["arguments"] == {}
+        assert client._history[0]["tool_calls"][0]["function"]["arguments"] == "[1,2]"
+
+    def test_build_anthropic_messages_list_arguments_become_empty_object(self):
+        """Anthropic requires ``input`` to be an object; a JSON array in
+        history must fall back to ``{}``."""
+        client = _make_client()
+        client._history = [
+            {"role": "user", "content": "which tracks?"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tc1",
+                        "type": "function",
+                        "function": {"name": "list_tracks", "arguments": "[1,2]"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "tc1", "content": "[]"},
+        ]
+
+        messages = client._build_anthropic_messages()
+
+        assistant = next(m for m in messages if m["role"] == "assistant")
+        assert assistant["content"][0]["input"] == {}
+
     # ---- Ollama native API round trip (P1) ---------------------------------
 
     def test_ollama_outbound_history_arguments_are_objects(self):
