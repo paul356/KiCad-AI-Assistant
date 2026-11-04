@@ -376,7 +376,7 @@ kcaa
 | `list_project_versions` | 列出已保存的项目版本归档 |
 | `restore_project_version` | 将项目文件一起恢复到已保存的归档 |
 | `generate_pcb_thumbnail` | 渲染 PCB 缩略图 |
-| `export_pcb_layer_image` | 将整板或单个铜层渲染为 PNG 图片文件 |
+| `export_pcb_layer_image` | 将整板或单个铜层渲染为图片返回给模型，仅在传入 `output_dir` 时才写出 PNG 文件 |
 
 ### 技能系统
 

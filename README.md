@@ -409,7 +409,7 @@ kcaa
 | `list_project_versions` | List saved project version archives |
 | `restore_project_version` | Restore project files together to a saved archive |
 | `generate_pcb_thumbnail` | Render a PCB thumbnail image |
-| `export_pcb_layer_image` | Render the board — or a single copper layer — to a PNG image file |
+| `export_pcb_layer_image` | Render the board — or a single copper layer — as an image returned to the model; writes a PNG file only when `output_dir` is given |
 
 ### Skill System
 

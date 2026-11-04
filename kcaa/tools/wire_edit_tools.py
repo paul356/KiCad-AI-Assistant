@@ -1651,8 +1651,7 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
         Use this when endpoints are known bare coordinates (e.g. a net label
         position or an existing wire tip).  When both endpoints are symbol
         pins, prefer ``connect_pins_with_wire`` — it resolves pin coordinates
-        automatically.  If this tool fails, fall back to
-        ``add_wire_to_schematic`` (horizontal/vertical only).
+        automatically.
 
         Routing is orthogonal (horizontal-vertical). Coordinates are mm in
         KiCad screen convention (**+Y is down**); align to the 1.27 mm grid.

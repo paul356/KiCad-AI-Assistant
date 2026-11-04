@@ -35,7 +35,6 @@
 | `add_label_to_schematic` | `symbol_edit_tools` | Place a net label at specific coordinates |
 | `list_labels_in_schematic` | `symbol_edit_tools` | Return all net labels and their positions |
 | `delete_label_from_schematic` | `symbol_edit_tools` | Remove a net label by text and coordinates |
-| `add_wire_to_schematic` | `wire_edit_tools` | Draw a wire segment between two coordinates (orthogonal routing) |
 | `connect_pins_with_wire` | `wire_edit_tools` | Connect two component pins automatically, resolving their schematic positions |
 | `delete_wire_from_schematic` | `wire_edit_tools` | Remove a wire segment matching given start/end coordinates |
 | `add_junction_to_schematic` | `wire_edit_tools` | Place a junction dot at a coordinate |
@@ -53,7 +52,7 @@ A typical LLM editing session follows this pattern:
 3. **Place / edit / connect** — use the symbol-editing and wire-editing tools to make changes. After placing a symbol, call `extract_schematic_netlist` to get the new pin positions before routing wires.
 4. **Verify** — call `extract_schematic_netlist` again after all edits. Confirm expected nets exist in `analysis.signal_nets` or `analysis.power_nets` and that `analysis.floating_nets` is empty.
 
-> **Tip:** `connect_pins_with_wire` is the preferred wiring tool when the two endpoints are component pins — it resolves positions automatically. Use `add_wire_to_schematic` only when routing to/from a known coordinate (e.g. a label or an existing wire endpoint).
+> **Tip:** `connect_pins_with_wire` is the preferred wiring tool when the two endpoints are component pins — it resolves positions automatically. Use `connect_points_with_wire` only when routing to/from known coordinates (e.g. a label or an existing wire endpoint).
 
 ---
 
@@ -437,19 +436,9 @@ All label tools write `.kicad_sch.bak` before saving.
 
 All tools in this group write `.kicad_sch.bak` before saving.
 
-#### `add_wire_to_schematic(schematic_path, start_x, start_y, end_x, end_y, add_junction_start=False, add_junction_end=False)`
-
-**Purpose:** Draws a wire segment using orthogonal routing. Set `add_junction_start` or `add_junction_end` to `True` when an endpoint lands in the middle of an existing wire (T-junction).
-
-**Key parameters:** All coordinates in mm (`float`).
-
-**Success response:** `{"success": true, "wire": {"start": {...}, "end": {...}}, "junctions_added": [...]}`
-
----
-
 #### `connect_pins_with_wire(schematic_path, from_ref, from_pin, to_ref, to_pin)`
 
-**Purpose:** Resolves pin schematic positions automatically (accounting for placement and rotation), then routes a smart orthogonal wire between them. Automatically places junction dots when either endpoint is already wired. Preferred over `add_wire_to_schematic` for pin-to-pin connections.
+**Purpose:** Resolves pin schematic positions automatically (accounting for placement and rotation), then routes a smart orthogonal wire between them. Automatically places junction dots when either endpoint is already wired. Preferred for pin-to-pin connections.
 
 **Key parameters:**
 - `from_ref` / `to_ref` (`str`) — reference designators.

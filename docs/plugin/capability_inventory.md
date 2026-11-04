@@ -55,7 +55,6 @@ All write operations create a `.bak` backup before writing.
 
 | Tool | Purpose |
 |------|---------|
-| `add_wire_to_schematic` | Draw a wire segment between two points |
 | `connect_pins_with_wire` | Auto-route a wire between two named component pins |
 | `delete_wire_from_schematic` | Remove a wire segment by start/end coordinates |
 | `add_junction_to_schematic` | Add a junction dot at a point |

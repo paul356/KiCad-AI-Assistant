@@ -24,7 +24,7 @@ The plugin opens as a KiCad action panel (docked or floating) with three zones:
 │    ↳ search_symbols  ✓ "C" → Device:C                        │
 │    ↳ add_symbol_to_schematic  ✓ C3 placed at (120, 95)       │
 │    ↳ connect_pins_with_wire  ✓ C3.1 → U1.4                   │
-│    ↳ add_wire_to_schematic   ✓ C3.2 → GND net               │
+│    ↳ add_label_to_schematic   ✓ C3.2 → GND net               │
 │  I added C3 (100nF, Device:C) connected to U1 pin 4 and GND. │
 │  Please review the change in the schematic editor.           │
 │                                                              │
