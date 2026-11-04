@@ -1358,6 +1358,7 @@ def _write_mod(
     tags: str = "",
     attr: str = "",
     pads: int = 0,
+    model: bool = False,
 ) -> str:
     """Write a minimal but parseable .kicad_mod with optional metadata/pads."""
     children = []
@@ -1369,6 +1370,8 @@ def _write_mod(
         children.append(f"(attr {attr})")
     for i in range(pads):
         children.append(f'(pad "{i + 1}" smd rect (at {i} 0) (size 1 1) (layers "F.Cu"))')
+    if model:
+        children.append('(model "test.wrl")')
     text = f'(footprint "{name}"\n' + "".join(f"  {c}\n" for c in children) + ")\n"
     path = os.path.join(library_dir, name + ".kicad_mod")
     with open(path, "w", encoding="utf-8") as fh:
@@ -1412,28 +1415,23 @@ class TestListLibraryFootprints:
         assert first["pad_count"] == 1
         assert first["has_3d_model"] is False
 
-    def test_project_library_takes_precedence(self, tools, project, tmp_path, monkeypatch):
-        """A project-owned row with the same nickname wins over the global one.
+    def test_project_scope_uses_project_row(self, tools, project, tmp_path, monkeypatch):
+        """A project-scoped manager resolves the project-owned index row.
 
-        Library nicknames are unique in the index (a project re-index replaces
-        the global row), so the surviving project-owned record is the one the
-        tool must resolve and read.
+        Nicknames are unique in the index, so this locks the scope handoff
+        (the tool re-scopes the manager to the requested project) rather than
+        a same-nickname global/project tie that the database cannot hold.
         """
-        global_dir = tmp_path / "SharedGlobal.pretty"
-        global_dir.mkdir()
-        _write_mod(str(global_dir), "GlobalFootprint")
-
         proj_root = tmp_path / "proj"
         proj_root.mkdir()
-        proj_lib = proj_root / "Shared.pretty"
+        proj_lib = proj_root / "ProjOnly.pretty"
         proj_lib.mkdir()
         _write_mod(str(proj_lib), "ProjectFootprint")
         board = proj_root / "board.kicad_pcb"
         board.write_text("(kicad_pcb)\n", encoding="utf-8")
 
         mgr = project["index_mgr"]
-        mgr.index_library("Shared", str(global_dir))
-        mgr.index_library("Shared", str(proj_lib), project=os.path.realpath(str(proj_root)))
+        mgr.index_library("ProjOnly", str(proj_lib), project=os.path.realpath(str(proj_root)))
 
         # Mirror the real factory: re-scope the manager to the requested project.
         def _scoped(project_path=None):
@@ -1447,7 +1445,7 @@ class TestListLibraryFootprints:
 
         result = _run(
             tools["list_library_footprints"](
-                library_name="Shared", project_path=str(board), ctx=None
+                library_name="ProjOnly", project_path=str(board), ctx=None
             )
         )
 
@@ -1461,7 +1459,15 @@ class TestListLibraryFootprints:
         live_lib = tmp_path / "LiveLib.pretty"
         live_lib.mkdir()
         _write_mod(str(live_lib), "B_mod", description="b desc", tags="btag", attr="smd")
-        _write_mod(str(live_lib), "A_mod", description="a desc", tags="atag", attr="through_hole")
+        _write_mod(
+            str(live_lib),
+            "A_mod",
+            description="a desc",
+            tags="atag",
+            attr="through_hole",
+            pads=3,
+            model=True,
+        )
         # Unparsable file: scan lists it, metadata must degrade to empty.
         (live_lib / "Broken.kicad_mod").write_text('(footprint "Broken"', encoding="utf-8")
         _make_fp_lib_table(
@@ -1483,6 +1489,10 @@ class TestListLibraryFootprints:
         assert by_name["A_mod"]["description"] == "a desc"
         assert by_name["A_mod"]["tags"] == "atag"
         assert by_name["A_mod"]["attr"] == "through_hole"
+        assert by_name["A_mod"]["pad_count"] == 3
+        assert by_name["A_mod"]["has_3d_model"] is True
+        assert by_name["B_mod"]["pad_count"] == 0
+        assert by_name["B_mod"]["has_3d_model"] is False
         assert by_name["Broken"] == {
             "name": "Broken",
             "description": "",
@@ -1494,6 +1504,45 @@ class TestListLibraryFootprints:
         assert result["count"] == 3
         assert result["total"] == 3
         assert result["truncated"] is False
+
+    def test_live_scan_truncates_but_reports_true_total(self, tools, project, tmp_path):
+        live_lib = tmp_path / "LiveTrunc.pretty"
+        live_lib.mkdir()
+        for name in ("Ccc", "Aaa", "Bbb"):
+            _write_mod(str(live_lib), name)
+        _make_fp_lib_table(tmp_path, [("LiveTrunc", str(live_lib))])
+        board = tmp_path / "trunc.kicad_pcb"
+        board.write_text("(kicad_pcb)\n", encoding="utf-8")
+
+        result = _run(
+            tools["list_library_footprints"](
+                library_name="LiveTrunc",
+                project_path=str(board),
+                max_results=2,
+                ctx=None,
+            )
+        )
+
+        assert result["source"] == "live_scan"
+        assert [f["name"] for f in result["footprints"]] == ["Aaa", "Bbb"]
+        assert result["count"] == 2
+        assert result["total"] == 3
+        assert result["truncated"] is True
+
+    def test_indexed_library_with_no_rows_degrades_to_live_scan(self, tools, project, tmp_path):
+        """An indexed library whose rows are empty still scans its directory."""
+        lib_dir = tmp_path / "ZeroIdx.pretty"
+        lib_dir.mkdir()
+        mgr = project["index_mgr"]
+        mgr.index_library("ZeroIdx", str(lib_dir))  # row exists, zero footprints
+        _write_mod(str(lib_dir), "LateFootprint")
+
+        result = _run(tools["list_library_footprints"](library_name="ZeroIdx", ctx=None))
+
+        assert result["source"] == "live_scan"
+        assert [f["name"] for f in result["footprints"]] == ["LateFootprint"]
+        assert result["count"] == 1
+        assert result["total"] == 1
 
     def test_unknown_library_returns_error_and_hint(self, tools):
         result = _run(tools["list_library_footprints"](library_name="NoSuchLib", ctx=None))
@@ -1536,6 +1585,76 @@ class TestListLibraryFootprints:
         assert result["total"] == 0
         assert result["truncated"] is False
         assert "error" not in result
+
+    def test_table_directory_missing_returns_error(self, tools, project, tmp_path):
+        missing = tmp_path / "Nope.pretty"  # never created
+        _make_fp_lib_table(tmp_path, [("Missing", str(missing))])
+        board = tmp_path / "missing.kicad_pcb"
+        board.write_text("(kicad_pcb)\n", encoding="utf-8")
+
+        result = _run(
+            tools["list_library_footprints"](
+                library_name="Missing", project_path=str(board), ctx=None
+            )
+        )
+
+        assert result["error"] == (
+            f"Library 'Missing' resolves to '{missing}', which is not a directory."
+        )
+        assert result["hint"] == "Run sync_footprint_index to refresh the index."
+        assert "footprints" not in result
+
+    def test_stale_index_directory_returns_error(self, tools, project, tmp_path):
+        stale = tmp_path / "Gone.pretty"
+        stale.mkdir()
+        _write_mod(str(stale), "Ghost")
+        project["index_mgr"].index_library("Gone", str(stale))
+        shutil.rmtree(stale)
+
+        result = _run(tools["list_library_footprints"](library_name="Gone", ctx=None))
+
+        assert result["error"] == (
+            f"Library 'Gone' resolves to '{stale}', which is not a directory."
+        )
+        assert result["hint"] == "Run sync_footprint_index to refresh the index."
+        assert "footprints" not in result
+
+    def test_stale_index_directory_falls_back_to_table(self, tools, project, tmp_path):
+        stale = tmp_path / "Moved.pretty"
+        stale.mkdir()
+        _write_mod(str(stale), "Ghost")
+        project["index_mgr"].index_library("Moved", str(stale))
+        shutil.rmtree(stale)
+
+        fresh = tmp_path / "MovedFresh.pretty"
+        fresh.mkdir()
+        _write_mod(str(fresh), "FreshFootprint")
+        _make_fp_lib_table(tmp_path, [("Moved", str(fresh))])
+        board = tmp_path / "moved.kicad_pcb"
+        board.write_text("(kicad_pcb)\n", encoding="utf-8")
+
+        result = _run(
+            tools["list_library_footprints"](
+                library_name="Moved", project_path=str(board), ctx=None
+            )
+        )
+
+        assert result["source"] == "live_scan"
+        assert result["library_path"] == str(fresh)
+        assert [f["name"] for f in result["footprints"]] == ["FreshFootprint"]
+        assert result["count"] == 1
+
+    @pytest.mark.parametrize("max_results", [0, -1])
+    def test_max_results_below_one_returns_error(self, tools, max_results):
+        result = _run(
+            tools["list_library_footprints"](
+                library_name="Anything", max_results=max_results, ctx=None
+            )
+        )
+
+        assert result["error"] == "max_results must be >= 1"
+        assert result["hint"] == "Use max_results >= 1; the total is reported in `total`."
+        assert "footprints" not in result
 
     def test_tool_is_registered(self, tools):
         assert "list_library_footprints" in tools
