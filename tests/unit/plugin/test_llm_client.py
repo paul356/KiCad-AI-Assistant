@@ -3648,6 +3648,166 @@ class TestToolCallArgumentsNormalization:
         assert normalized[0]["function"] is not original[0]["function"]
 
 
+class TestToolCallSlotRouting:
+    """Issue #234: a provider may return several tool calls in one message
+    with no ``index`` on any of them.  An index is only a merge key; a
+    nameless index-less delta is an argument fragment of the previous call."""
+
+    def _make_line_response(self, lines):
+        data = [line.encode("utf-8") + b"\n" for line in lines] + [b""]
+        obj = MagicMock()
+        obj.readline.side_effect = data
+        obj.__enter__ = lambda s: s
+        obj.__exit__ = MagicMock(return_value=False)
+        return obj
+
+    def _stream_ollama(self, client, lines):
+        mock_resp = self._make_line_response(lines)
+        with patch("urllib.request.urlopen", return_value=mock_resp):
+            return client._stream_ollama("sys", [], on_stream_event=lambda evt: None)
+
+    def test_stream_ollama_indexless_parallel_calls_get_separate_slots(self):
+        """Ollama returns the whole tool_calls array in one message and omits
+        ``index`` entirely: four calls must not collapse into slot 0."""
+        client = _make_client()
+        client._settings.llm_provider = "ollama"
+        chunk = json.dumps(
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {"function": {"name": "get_board_info", "arguments": {"detail": "full"}}},
+                        {"function": {"name": "list_footprints", "arguments": {"layer": "F.Cu"}}},
+                        {"function": {"name": "list_tracks", "arguments": {"net": "GND"}}},
+                        {
+                            "function": {
+                                "name": "extract_schematic_netlist",
+                                "arguments": {"format": "json"},
+                            }
+                        },
+                    ],
+                },
+                "done": False,
+            }
+        )
+        lines = [chunk, '{"done":true,"done_reason":"tool_calls"}']
+
+        result = self._stream_ollama(client, lines)
+
+        assert "error" not in result, result.get("error")
+        tcs = result["message"]["tool_calls"]
+        assert [tc["function"]["name"] for tc in tcs] == [
+            "get_board_info",
+            "list_footprints",
+            "list_tracks",
+            "extract_schematic_netlist",
+        ]
+        assert [json.loads(tc["function"]["arguments"]) for tc in tcs] == [
+            {"detail": "full"},
+            {"layer": "F.Cu"},
+            {"net": "GND"},
+            {"format": "json"},
+        ]
+
+    def test_stream_ollama_indexless_argument_fragment_continues_last_slot(self):
+        """A nameless index-less delta is a fragment of the call opened by the
+        previous chunk — it must not start a new slot."""
+        client = _make_client()
+        client._settings.llm_provider = "ollama"
+        lines = [
+            json.dumps(
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [{"function": {"name": "add_wire", "arguments": '{"a":'}}],
+                    },
+                    "done": False,
+                }
+            ),
+            json.dumps(
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [{"function": {"arguments": "1}"}}],
+                    },
+                    "done": False,
+                }
+            ),
+            '{"done":true,"done_reason":"tool_calls"}',
+        ]
+
+        result = self._stream_ollama(client, lines)
+
+        assert "error" not in result, result.get("error")
+        tcs = result["message"]["tool_calls"]
+        assert len(tcs) == 1
+        assert tcs[0]["function"]["name"] == "add_wire"
+        assert tcs[0]["function"]["arguments"] == '{"a":1}'
+
+    def test_stream_openai_indexless_parallel_calls_get_separate_slots(self):
+        """The in-process OpenAI-compatible parser has the same contract."""
+        client = _make_client()
+        sse_lines = [
+            'data: {"choices":[{"delta":{"tool_calls":['
+            '{"id":"a","function":{"name":"get_board_info","arguments":{}}},'
+            '{"id":"b","function":{"name":"list_footprints","arguments":{}}}]},'
+            '"finish_reason":null}]}',
+            'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}',
+            "data: [DONE]",
+        ]
+        mock_resp = self._make_line_response(sse_lines)
+        with patch("urllib.request.urlopen", return_value=mock_resp):
+            result = client._stream_openai("sys", [], on_stream_event=lambda evt: None)
+
+        assert "error" not in result, result.get("error")
+        tcs = result["message"]["tool_calls"]
+        assert [tc["function"]["name"] for tc in tcs] == [
+            "get_board_info",
+            "list_footprints",
+        ]
+        assert [tc["id"] for tc in tcs] == ["a", "b"]
+
+    def test_relay_indexless_parallel_calls_get_separate_slots(self):
+        """The subprocess relay script keeps its own accumulator and must
+        route index-less calls the same way."""
+        sse_lines = [
+            'data: {"choices":[{"delta":{"tool_calls":['
+            '{"id":"a","function":{"name":"get_board_info","arguments":{}}},'
+            '{"id":"b","function":{"name":"list_footprints","arguments":{}}}]},'
+            '"finish_reason":null}]}',
+            'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}',
+            "data: [DONE]",
+        ]
+        server = _SSETestServer(sse_lines)
+        client = _make_client()
+        client._settings.llm_base_url = server.url
+        try:
+            with (
+                patch.object(llm_client, "_in_process_ssl", False),
+                patch(
+                    "kicad_plugin.llm_client._resolve_plugin_python",
+                    return_value=sys.executable,
+                ),
+                patch(
+                    "kicad_plugin.llm_client._subprocess_env",
+                    return_value={"PATH": os.environ.get("PATH", "")},
+                ),
+            ):
+                result = client._stream_openai("sys", [], on_stream_event=lambda evt: None)
+        finally:
+            server.shutdown()
+
+        assert "error" not in result, result.get("error")
+        tcs = result["message"]["tool_calls"]
+        assert [tc["function"]["name"] for tc in tcs] == [
+            "get_board_info",
+            "list_footprints",
+        ]
+
+
 class TestSubprocessSSEStream:
     """End-to-end relay: _subprocess_sse_stream runs a real subprocess Python
     against a local HTTP server speaking SSE, verifying deltas, aggregation,
