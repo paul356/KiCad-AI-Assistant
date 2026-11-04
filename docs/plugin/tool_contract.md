@@ -36,7 +36,7 @@
 | `list_labels_in_schematic` | `symbol_edit_tools` | Return all net labels and their positions |
 | `delete_label_from_schematic` | `symbol_edit_tools` | Remove a net label by text and coordinates |
 | `connect_pins_with_wire` | `wire_edit_tools` | Connect two component pins automatically, resolving their schematic positions |
-| `connect_points_with_wire` | `wire_edit_tools` | Draw an orthogonal wire between two raw coordinates, adding junctions at existing-wire endpoints |
+| `connect_points_with_wire` | `wire_edit_tools` | Draw an orthogonal wire between two raw coordinates, placing junctions at existing wire endpoints and splitting a wire when an endpoint lands on its interior |
 | `delete_wire_from_schematic` | `wire_edit_tools` | Remove a wire segment matching given start/end coordinates |
 
 ---
