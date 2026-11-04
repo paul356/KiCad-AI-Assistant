@@ -3823,6 +3823,43 @@ class TestToolCallSlotRouting:
             "third_on_wire",
         ]
 
+    def test_stream_ollama_derived_slot_stays_above_highest_index(self):
+        """``_tool_call_slot`` must advance to the highest index seen, not the
+        last one: slots 5 then 1 leave the index-less call in 6, not 2."""
+        client = _make_client()
+        client._settings.llm_provider = "ollama"
+
+        def _chunk(name, index=None, call_id=""):
+            function: dict[str, object] = {"name": name, "arguments": {"x": 1}}
+            if index is not None:
+                function["index"] = index
+            return json.dumps(
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [{"id": call_id, "function": function}],
+                    },
+                    "done": False,
+                }
+            )
+
+        lines = [
+            _chunk("first@5", 5, "a"),
+            _chunk("first@1", 1, "b"),
+            _chunk("derived@6", None, "c"),
+            '{"done":true,"done_reason":"tool_calls"}',
+        ]
+
+        result = self._stream_ollama(client, lines)
+
+        assert "error" not in result, result.get("error")
+        assert [tc["function"]["name"] for tc in result["message"]["tool_calls"]] == [
+            "first@1",
+            "first@5",
+            "derived@6",
+        ]
+
     def test_stream_ollama_reversed_nested_indices_keep_provider_order(self):
         """The provider index, not the arrival order, defines the call order —
         a name-based fallback would emit these two chunks reversed."""
@@ -4023,6 +4060,29 @@ class TestToolCallSlotRouting:
         assert "error" not in result, result.get("error")
         tcs = result["message"]["tool_calls"]
         assert [tc["function"]["name"] for tc in tcs] == ["first_wire", "second_wire"]
+
+    def test_relay_derived_slot_stays_above_highest_index(self):
+        """The derived slot must clear the *highest* index seen, not the last
+        one: with slots 5 then 1, the index-less call belongs in 6, not 2."""
+        sse_lines = [
+            'data: {"choices":[{"delta":{"tool_calls":[{"index":5,"id":"a",'
+            '"function":{"name":"first@5","arguments":{}}}]},"finish_reason":null}]}',
+            'data: {"choices":[{"delta":{"tool_calls":[{"index":1,"id":"b",'
+            '"function":{"name":"first@1","arguments":{}}}]},"finish_reason":null}]}',
+            'data: {"choices":[{"delta":{"tool_calls":[{"id":"c",'
+            '"function":{"name":"derived@6","arguments":{}}}]},"finish_reason":null}]}',
+            'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}',
+            "data: [DONE]",
+        ]
+
+        result = self._stream_openai_via_relay(sse_lines)
+
+        assert "error" not in result, result.get("error")
+        assert [tc["function"]["name"] for tc in result["message"]["tool_calls"]] == [
+            "first@1",
+            "first@5",
+            "derived@6",
+        ]
 
     def test_relay_nameless_fragment_follows_negative_index(self):
         """Parity with ``_tool_call_slot``: a negative provider index is a real
