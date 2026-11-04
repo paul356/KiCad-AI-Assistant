@@ -1601,7 +1601,11 @@ class TestListLibraryFootprints:
         assert result["error"] == (
             f"Library 'Missing' resolves to '{missing}', which is not a directory."
         )
-        assert result["hint"] == "Run sync_footprint_index to refresh the index."
+        assert result["hint"] == (
+            "Check the library path for 'Missing' in Manage Footprint Libraries "
+            "(fp-lib-table); the directory does not exist."
+        )
+        assert "sync_footprint_index" not in result["hint"]
         assert "footprints" not in result
 
     def test_stale_index_directory_returns_error(self, tools, project, tmp_path):

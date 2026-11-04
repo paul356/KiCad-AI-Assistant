@@ -732,12 +732,19 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
                     usable = lib["uri"]
                     break
             if usable is None:
+                if index_rec is not None:
+                    hint = "Run sync_footprint_index to refresh the index."
+                else:
+                    hint = (
+                        f"Check the library path for '{library_name}' in Manage Footprint "
+                        "Libraries (fp-lib-table); the directory does not exist."
+                    )
                 return {
                     "error": (
                         f"Library '{library_name}' resolves to '{lib_path}', "
                         "which is not a directory."
                     ),
-                    "hint": "Run sync_footprint_index to refresh the index.",
+                    "hint": hint,
                 }
             lib_path = usable
             index_rec = None  # stale rows do not describe this directory
