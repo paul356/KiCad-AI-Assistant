@@ -37,9 +37,6 @@
 | `delete_label_from_schematic` | `symbol_edit_tools` | Remove a net label by text and coordinates |
 | `connect_pins_with_wire` | `wire_edit_tools` | Connect two component pins automatically, resolving their schematic positions |
 | `delete_wire_from_schematic` | `wire_edit_tools` | Remove a wire segment matching given start/end coordinates |
-| `add_junction_to_schematic` | `wire_edit_tools` | Place a junction dot at a coordinate |
-| `list_junctions_in_schematic` | `wire_edit_tools` | Return all junction coordinates |
-| `delete_junction_from_schematic` | `wire_edit_tools` | Remove a junction at a given coordinate |
 
 ---
 
@@ -432,7 +429,7 @@ All label tools write `.kicad_sch.bak` before saving.
 
 ---
 
-### 3.5 Wire and Junction Tools
+### 3.5 Wire Tools
 
 All tools in this group write `.kicad_sch.bak` before saving.
 
@@ -451,28 +448,6 @@ All tools in this group write `.kicad_sch.bak` before saving.
 #### `delete_wire_from_schematic(schematic_path, start_x, start_y, end_x, end_y)`
 
 **Purpose:** Removes a wire segment whose start and end coordinates match the given values (within floating-point tolerance). Use `extract_schematic_netlist` with `include_wire_topology=True` to obtain exact wire coordinates before calling.
-
----
-
-#### `add_junction_to_schematic(schematic_path, x, y)`
-
-**Purpose:** Places a junction dot at a specific coordinate. Required at T-intersections where three or more wires meet.
-
-**Success response:** `{"success": true, "junction": {"x": ..., "y": ...}}`
-
----
-
-#### `list_junctions_in_schematic(schematic_path)`
-
-**Purpose:** Returns all existing junction positions. Use to avoid placing duplicate junctions.
-
-**Success response:** `{"success": true, "junctions": [{"x": ..., "y": ...}, ...]}`
-
----
-
-#### `delete_junction_from_schematic(schematic_path, x, y)`
-
-**Purpose:** Removes a junction at the given coordinate.
 
 ---
 

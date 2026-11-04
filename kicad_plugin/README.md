@@ -87,7 +87,7 @@ Settings are stored in the KiCad user config directory:
 
 ## Available Tools (Milestone 1)
 
-The plugin exposes 25 schematic editing tools to the LLM:
+The plugin exposes 22 schematic editing tools to the LLM:
 
 - **Netlist inspection:** `extract_schematic_netlist`, `find_component_connections`
 - **Symbol search:** `search_symbols`, `get_symbol`, `list_symbol_libraries`, `get_symbol_pins` + 4 more
