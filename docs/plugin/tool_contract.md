@@ -36,6 +36,7 @@
 | `list_labels_in_schematic` | `symbol_edit_tools` | Return all net labels and their positions |
 | `delete_label_from_schematic` | `symbol_edit_tools` | Remove a net label by text and coordinates |
 | `connect_pins_with_wire` | `wire_edit_tools` | Connect two component pins automatically, resolving their schematic positions |
+| `connect_points_with_wire` | `wire_edit_tools` | Draw an orthogonal wire between two raw coordinates, adding junctions at existing-wire endpoints |
 | `delete_wire_from_schematic` | `wire_edit_tools` | Remove a wire segment matching given start/end coordinates |
 
 ---
@@ -442,6 +443,19 @@ All tools in this group write `.kicad_sch.bak` before saving.
 - `from_pin` / `to_pin` (`str`) — pin numbers as strings (e.g. `"1"`, `"A2"`).
 
 **Success response:** `{"success": true, "wire": {"from": {...}, "to": {...}}, "collision_free": true, "auto_junctions_added": [...]}`
+
+---
+
+#### `connect_points_with_wire(schematic_path, start_x, start_y, end_x, end_y)`
+
+**Purpose:** Routes a smart orthogonal wire between two raw schematic coordinates. Use it when the endpoints are known bare coordinates (e.g. a net label position or an existing wire tip); when both endpoints are symbol pins, prefer `connect_pins_with_wire`, which resolves pin positions itself.
+
+Routing is orthogonal (horizontal-vertical). If an endpoint lies on the interior of an existing wire, a junction is placed there and that wire is split at the endpoint, so KiCad ≥ 10 keeps the junction on reload; an endpoint that coincides with an existing wire endpoint or an already-wired pin also gets a junction automatically.
+
+**Key parameters:**
+- `start_x` / `start_y` / `end_x` / `end_y` (`float`) — mm in KiCad screen convention (**+Y is down**); align to the 1.27 mm grid.
+
+**Success response:** `{"success": true, "wire": {"start": {x, y}, "end": {x, y}}, "junctions_added": [...]}`
 
 ---
 

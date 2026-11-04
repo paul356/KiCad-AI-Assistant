@@ -6,7 +6,7 @@ All capabilities currently registered in `kcaa/server.py` are classified here as
 
 ## 1. Tools
 
-### 1.1 Keep for Milestone 1 (22 tools)
+### 1.1 Keep for Milestone 1 (23 tools)
 
 These tools are skip-based, have no `kicad-cli` dependency, and form the core of the plugin-facing editing surface.
 
@@ -56,6 +56,7 @@ All write operations create a `.bak` backup before writing.
 | Tool | Purpose |
 |------|---------|
 | `connect_pins_with_wire` | Auto-route a wire between two named component pins |
+| `connect_points_with_wire` | Route an orthogonal wire between two raw coordinates, adding junctions where needed |
 | `delete_wire_from_schematic` | Remove a wire segment by start/end coordinates |
 
 ---
@@ -145,9 +146,9 @@ MCP prompts are designed for standalone MCP clients (e.g., Claude Desktop) where
 
 | Category | Keep | Defer | Remove |
 |----------|------|-------|--------|
-| Tools | 22 | 2 | 11 |
+| Tools | 23 | 2 | 11 |
 | Resources | 0 | 12 | 0 |
 | Prompts | 0 | 17 | 0 |
-| **Total** | **22** | **31** | **11** |
+| **Total** | **23** | **31** | **11** |
 
-The plugin-facing server profile registers exactly the 22 tools listed in section 1.1.
+The plugin-facing server profile registers exactly the 23 tools listed in section 1.1.
