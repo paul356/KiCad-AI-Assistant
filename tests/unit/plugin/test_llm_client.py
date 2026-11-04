@@ -3771,12 +3771,112 @@ class TestToolCallSlotRouting:
         nested = llm_client._tool_call_slot(
             slots, {"function": {"index": 1, "arguments": '{"a":'}}, 1, 0
         )
-        assert nested == (1, 1, 1)
+        assert nested == (1, 2, 1)
 
         top_level = llm_client._tool_call_slot(
             slots, {"index": 0, "function": {"arguments": "{}"}}, 1, 1
         )
         assert top_level == (0, 1, 0)
+
+    @pytest.mark.parametrize("provider_index", [1, 5])
+    def test_stream_ollama_mixed_indices_keep_wire_order(self, provider_index):
+        """A derived slot must be allocated after the highest provider index;
+        otherwise ``sorted()`` replays a mixed stream out of order."""
+        first_name = "second_on_wire"
+        client = _make_client()
+        client._settings.llm_provider = "ollama"
+        indexed = json.dumps(
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "function": {
+                                "index": provider_index,
+                                "name": first_name,
+                                "arguments": {"x": 1},
+                            }
+                        }
+                    ],
+                },
+                "done": False,
+            }
+        )
+        indexless = json.dumps(
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{"function": {"name": "third_on_wire", "arguments": {"x": 2}}}],
+                },
+                "done": False,
+            }
+        )
+        lines = [indexed, indexless, '{"done":true,"done_reason":"tool_calls"}']
+
+        result = self._stream_ollama(client, lines)
+
+        assert "error" not in result, result.get("error")
+        assert [tc["function"]["name"] for tc in result["message"]["tool_calls"]] == [
+            first_name,
+            "third_on_wire",
+        ]
+
+    def test_stream_ollama_reversed_nested_indices_keep_provider_order(self):
+        """The provider index, not the arrival order, defines the call order —
+        a name-based fallback would emit these two chunks reversed."""
+        client = _make_client()
+        client._settings.llm_provider = "ollama"
+        chunk_second = json.dumps(
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_second",
+                            "function": {
+                                "index": 1,
+                                "name": "second_on_index",
+                                "arguments": {"y": 2},
+                            },
+                        }
+                    ],
+                },
+                "done": False,
+            }
+        )
+        chunk_first = json.dumps(
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_first",
+                            "function": {
+                                "index": 0,
+                                "name": "first_on_index",
+                                "arguments": {"x": 1},
+                            },
+                        }
+                    ],
+                },
+                "done": False,
+            }
+        )
+        lines = [chunk_second, chunk_first, '{"done":true}']
+
+        result = self._stream_ollama(client, lines)
+
+        assert "error" not in result, result.get("error")
+        tcs = result["message"]["tool_calls"]
+        assert [tc["id"] for tc in tcs] == ["call_first", "call_second"]
+        assert [tc["function"]["name"] for tc in tcs] == [
+            "first_on_index",
+            "second_on_index",
+        ]
 
     def test_stream_ollama_indexless_argument_fragment_continues_last_slot(self):
         """A nameless index-less delta is a fragment of the call opened by the
@@ -3838,17 +3938,7 @@ class TestToolCallSlotRouting:
         ]
         assert [tc["id"] for tc in tcs] == ["a", "b"]
 
-    def test_relay_indexless_parallel_calls_get_separate_slots(self):
-        """The subprocess relay script keeps its own accumulator and must
-        route index-less calls the same way."""
-        sse_lines = [
-            'data: {"choices":[{"delta":{"tool_calls":['
-            '{"id":"a","function":{"name":"get_board_info","arguments":{}}},'
-            '{"id":"b","function":{"name":"list_footprints","arguments":{}}}]},'
-            '"finish_reason":null}]}',
-            'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}',
-            "data: [DONE]",
-        ]
+    def _stream_openai_via_relay(self, sse_lines):
         server = _SSETestServer(sse_lines)
         client = _make_client()
         client._settings.llm_base_url = server.url
@@ -3864,9 +3954,23 @@ class TestToolCallSlotRouting:
                     return_value={"PATH": os.environ.get("PATH", "")},
                 ),
             ):
-                result = client._stream_openai("sys", [], on_stream_event=lambda evt: None)
+                return client._stream_openai("sys", [], on_stream_event=lambda evt: None)
         finally:
             server.shutdown()
+
+    def test_relay_indexless_parallel_calls_get_separate_slots(self):
+        """The subprocess relay script keeps its own accumulator and must
+        route index-less calls the same way."""
+        sse_lines = [
+            'data: {"choices":[{"delta":{"tool_calls":['
+            '{"id":"a","function":{"name":"get_board_info","arguments":{}}},'
+            '{"id":"b","function":{"name":"list_footprints","arguments":{}}}]},'
+            '"finish_reason":null}]}',
+            'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}',
+            "data: [DONE]",
+        ]
+
+        result = self._stream_openai_via_relay(sse_lines)
 
         assert "error" not in result, result.get("error")
         tcs = result["message"]["tool_calls"]
@@ -3874,6 +3978,52 @@ class TestToolCallSlotRouting:
             "get_board_info",
             "list_footprints",
         ]
+
+    def test_relay_honours_nested_function_index(self):
+        """The relay copy must read Ollama's nested ``function.index`` exactly
+        like the in-process parser; the name fallback would emit these two
+        chunks in arrival order instead of provider order."""
+        sse_lines = [
+            'data: {"choices":[{"delta":{"tool_calls":['
+            '{"id":"second","function":{"index":1,"name":"second_on_index",'
+            '"arguments":{"y":2}}},'
+            '{"id":"first","function":{"index":0,"name":"first_on_index",'
+            '"arguments":{"x":1}}}]},"finish_reason":null}]}',
+            'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}',
+            "data: [DONE]",
+        ]
+
+        result = self._stream_openai_via_relay(sse_lines)
+
+        assert "error" not in result, result.get("error")
+        tcs = result["message"]["tool_calls"]
+        assert [tc["id"] for tc in tcs] == ["first", "second"]
+        assert [tc["function"]["name"] for tc in tcs] == [
+            "first_on_index",
+            "second_on_index",
+        ]
+
+    def test_relay_nameless_fragment_follows_negative_index(self):
+        """Parity with ``_tool_call_slot``: a negative provider index is a real
+        slot, not the relay's old "no slot yet" sentinel, so the fragment
+        joins it instead of opening slot 0."""
+        sse_lines = [
+            'data: {"choices":[{"delta":{"tool_calls":[{"index":-1,"function":'
+            '{"name":"neg","arguments":"{\\"x\\":"}}]},'
+            '"finish_reason":null}]}',
+            'data: {"choices":[{"delta":{"tool_calls":[{"function":'
+            '{"arguments":"1}"}}]},"finish_reason":null}]}',
+            'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}',
+            "data: [DONE]",
+        ]
+
+        result = self._stream_openai_via_relay(sse_lines)
+
+        assert "error" not in result, result.get("error")
+        tcs = result["message"]["tool_calls"]
+        assert len(tcs) == 1
+        assert tcs[0]["function"]["name"] == "neg"
+        assert tcs[0]["function"]["arguments"] == '{"x":1}'
 
 
 class TestSubprocessSSEStream:
