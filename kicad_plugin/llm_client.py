@@ -106,6 +106,11 @@ def _normalize_tool_calls(tool_calls: Any) -> Any:
     return normalized
 
 
+def _is_slot_index(value: Any) -> bool:
+    """Return whether *value* is a usable tool-call slot index (bools are not)."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
 def _tool_call_slot(
     tool_calls: dict[int, dict],
     entry: dict[str, Any],
@@ -114,23 +119,30 @@ def _tool_call_slot(
 ) -> tuple[int, int, int]:
     """Return the accumulator slot for one streamed tool-call delta (#234).
 
-    An integer ``index`` is the provider's own merge key (OpenAI delta
-    streams).  Index-less entries have to be routed: one carrying a name
-    opens a new call in the next free slot, while one without a name is an
-    argument fragment of the call routed just before it (slot 0 before any
-    call has been routed).
+    The provider's own index is the merge key when present: OpenAI-style
+    deltas carry it at the top level (``entry["index"]``), Ollama's native
+    /api/chat nests it inside the call (``entry["function"]["index"]``, one
+    complete call per chunk in 0.30.5).  Servers that never populate the
+    field (e.g. Ollama 0.12) and bare argument fragments omit it, so the
+    rest is routing:
 
-    Ollama's native /api/chat returns the whole tool-calls array in a single
-    message with no ``index`` at all, so defaulting every entry to slot 0
-    concatenated their names and kept only the first call's arguments.
+    - an index-less entry with a non-empty name opens a new call in the
+      next free slot;
+    - an index-less entry without a name is an argument fragment of the
+      call routed just before it (slot 0 before any call).
+
+    Defaulting every index-less entry to slot 0 concatenated parallel
+    Ollama calls into one name and kept only the first call's arguments.
 
     Returns ``(slot, next_slot, last_slot)``; the caller keeps the two
     counters for the next entry.
     """
-    raw_index = entry.get("index")
-    if isinstance(raw_index, int) and not isinstance(raw_index, bool):
-        return raw_index, next_slot, raw_index
     fn = entry.get("function")
+    raw_index = entry.get("index")
+    if not _is_slot_index(raw_index) and isinstance(fn, dict):
+        raw_index = fn.get("index")
+    if _is_slot_index(raw_index):
+        return raw_index, next_slot, raw_index
     name = fn.get("name") if isinstance(fn, dict) else None
     if isinstance(name, str) and name:
         slot = next_slot
@@ -4307,9 +4319,11 @@ class LLMClient:
                         )
 
                     for tc_delta in msg.get("tool_calls") or []:
-                        # Ollama sends every parallel call in one message
-                        # without an ``index``; each named entry gets its own
-                        # slot instead of merging into slot 0 (#234).
+                        # Ollama nests the call index inside `function` (older
+                        # releases omit it and send one complete call per
+                        # chunk); _tool_call_slot honours either and gives
+                        # every index-less named entry its own slot instead of
+                        # merging into slot 0 (#234).
                         idx, next_slot, last_slot = _tool_call_slot(
                             tool_calls_by_index, tc_delta, next_slot, last_slot
                         )

@@ -3710,6 +3710,74 @@ class TestToolCallSlotRouting:
             {"format": "json"},
         ]
 
+    def test_stream_ollama_real_wire_shape_keeps_parallel_calls_apart(self):
+        """Replay of an Ollama 0.30.5 capture: one complete call per chunk,
+        ``index`` nested in ``function``, ``arguments`` an object."""
+        client = _make_client()
+        client._settings.llm_provider = "ollama"
+        chunk_a = {
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_a",
+                        "function": {
+                            "index": 0,
+                            "name": "get_board_info",
+                            "arguments": {"detail": "full"},
+                        },
+                    }
+                ],
+            },
+            "done": False,
+        }
+        chunk_b = {
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_b",
+                        "function": {
+                            "index": 1,
+                            "name": "list_footprints",
+                            "arguments": {},
+                        },
+                    }
+                ],
+            },
+            "done": False,
+        }
+        lines = [json.dumps(chunk_a), json.dumps(chunk_b), '{"done":true}']
+
+        result = self._stream_ollama(client, lines)
+
+        assert "error" not in result, result.get("error")
+        tcs = result["message"]["tool_calls"]
+        assert [tc["id"] for tc in tcs] == ["call_a", "call_b"]
+        assert [tc["function"]["name"] for tc in tcs] == ["get_board_info", "list_footprints"]
+        assert [json.loads(tc["function"]["arguments"] or "{}") for tc in tcs] == [
+            {"detail": "full"},
+            {},
+        ]
+
+    def test_tool_call_slot_prefers_nested_function_index(self):
+        """Ollama nests the provider index in ``function``; a nameless delta
+        carrying it must join that call instead of the previously routed
+        slot, while a top-level ``index`` keeps its OpenAI behaviour."""
+        slots = {0: {"function": {"name": "get_board_info", "arguments": ""}}}
+
+        nested = llm_client._tool_call_slot(
+            slots, {"function": {"index": 1, "arguments": '{"a":'}}, 1, 0
+        )
+        assert nested == (1, 1, 1)
+
+        top_level = llm_client._tool_call_slot(
+            slots, {"index": 0, "function": {"arguments": "{}"}}, 1, 1
+        )
+        assert top_level == (0, 1, 0)
+
     def test_stream_ollama_indexless_argument_fragment_continues_last_slot(self):
         """A nameless index-less delta is a fragment of the call opened by the
         previous chunk — it must not start a new slot."""
