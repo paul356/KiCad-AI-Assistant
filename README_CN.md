@@ -25,11 +25,13 @@ KiCad AI Assistant 是一个 KiCad 动作插件，在 KiCad 内部直接嵌入�
     - [项目工具](#项目工具)
     - [符号库](#符号库)
     - [原理图编辑](#原理图编辑)
+    - [原理图分组](#原理图分组)
     - [原理图分析](#原理图分析)
     - [层次化图纸](#层次化图纸)
     - [PCB 封装库](#pcb-封装库)
     - [PCB 查询](#pcb-查询)
     - [PCB 编辑](#pcb-编辑)
+    - [PCB 布线](#pcb-布线)
     - [PCB 摆放](#pcb-摆放)
     - [PCB 分组](#pcb-分组)
     - [PCB 区域](#pcb-区域)
@@ -196,12 +198,18 @@ kcaa
 | `get_symbol` | 按库名和符号名查找符号 |
 | `get_library_symbols` | 获取指定库中的符号列表 |
 | `get_symbol_pins` | 获取符号的引脚定义 |
+| `create_symbol_library` | 新建 `.kicad_sym` 符号库（全局第三方或项目级）并在库表中注册 |
+| `delete_symbol_library` | 删除空符号库（连同文件、库表条目和索引） |
+| `add_symbols_to_library` | 将原理图缓存 `lib_symbols` 中的符号复制到已有符号库 |
+| `remove_symbols_from_library` | 从符号库中删除指定符号定义并重新建立索引 |
+| `find_symbols_not_in_libraries` | 列出在所有可用符号库中都解析不到的原理图符号（只读） |
 
 ### 原理图编辑
 
 | 工具 | 说明 |
 |------|------|
 | `add_symbol_to_schematic` | 在原理图上放置符号 |
+| `create_symbol` | 在符号库中定义新符号（仅定义，不在原理图中放置） |
 | `place_symbol_relative` | 相对于已有元件放置符号 |
 | `remove_symbol_from_schematic` | 按位号删除已放置的符号 |
 | `move_component` | 移动/旋转已放置的元件 |
@@ -211,14 +219,28 @@ kcaa
 | `delete_symbol_property` | 删除已放置符号的属性 |
 | `check_reference_conflicts` | 检查重复的位号 |
 | `connect_points_with_wire` | 在两点之间智能正交布线 |
-| `add_wire_to_schematic` | 按端点添加单条导线段 |
 | `connect_pins_with_wire` | 用导线连接两个引脚 |
 | `delete_wire_from_schematic` | 按端点删除导线段 |
 | `add_label_to_schematic` | 添加局部网络标签 |
 | `list_labels_in_schematic` | 列出所有局部网络标签 |
 | `delete_label_from_schematic` | 删除网络标签 |
+| `add_no_connect` | 在引脚坐标处添加不连接（no-connect）标志 |
+| `list_no_connects` | 列出所有不连接标志 |
+| `remove_no_connect` | 按坐标删除不连接标志 |
 | `get_schematic_sheet_info` | 获取图纸尺寸和网格信息 |
 | `find_free_area` | 查找可放置模块的候选区域 |
+
+### 原理图分组
+
+| 工具 | 说明 |
+|------|------|
+| `assign_symbols_to_group` | 将符号分配到命名摆放分组（保存在 `placement_group` 属性中） |
+| `list_symbol_groups` | 列出所有符号摆放分组及其成员数与边界框 |
+| `get_symbol_group` | 获取分组的成员、位置、锚点和边界框 |
+| `score_symbol_group` | 评估分组内间距质量（平均最近邻距离和离散程度） |
+| `place_symbol_group` | 以锚点为中心按网格排布分组，并自动放到图纸空白区域 |
+| `move_symbol_group` | 按新锚点位置整体平移分组，保持组内相对布局不变 |
+| `rotate_symbol_group` | 绕锚点整体旋转分组（逆时针为正） |
 
 ### 原理图分析
 
@@ -226,6 +248,7 @@ kcaa
 |------|------|
 | `extract_schematic_netlist` | 从原理图提取网表 |
 | `find_component_connections` | 查找元件的所有连接 |
+| `run_erc` | 运行电气规则检查（调用无界面的 `kicad-cli`）并返回违规项 |
 | `identify_circuit_patterns` | 识别常见电路模式 |
 | `validate_project` | 项目基本验证 |
 | `validate_project_boundaries` | 验证元件边界 |
@@ -255,6 +278,8 @@ kcaa
 | `find_footprints_not_in_libraries` | 列出板上缺失于所有已索引库的封装 |
 | `create_footprint_library` | 创建全局 3rdparty 或项目级封装库 |
 | `add_footprints_to_library` | 将显式指定的板载封装导出到库 |
+| `delete_footprint_library` | 删除空封装库（连同目录、库表条目和索引） |
+| `remove_footprints_from_library` | 从封装库中删除指定封装并重新建立索引 |
 
 ### PCB 查询
 
@@ -266,6 +291,8 @@ kcaa
 | `get_footprint_bbox` | 获取封装的 courtyard 边界框 |
 | `get_board_bounding_box` | 获取全板封装的联合边界框 |
 | `list_nets` | 列出板上所有网络 |
+| `list_tracks` | 列出走线段和圆弧，按连通性归并为走线，可按网络和层过滤 |
+| `list_vias` | 列出过孔的位置、外径、孔径、层和网络，可按网络过滤 |
 | `get_ratsnest` | 获取未布线飞线（ratsnest） |
 | `score_placement` | 评估当前 PCB 摆放质量 |
 | `suggest_placement_order` | 获取推荐的封装放置顺序 |
@@ -280,7 +307,18 @@ kcaa
 | `add_board_outline_arc` | 向板框添加圆弧 |
 | `set_board_outline_rect` | 设置矩形板框（支持圆角） |
 | `set_footprint_property` | 设置封装的属性字段 |
+| `add_footprints_to_pcb` | 从封装库批量导入封装并按焊盘逐一指定网络后放到板上 |
+| `remove_footprints_from_pcb` | 按位号从板上删除封装（支持批量） |
 | `update_pcb_from_schematic` | 通过 KiCad IPC 触发"从原理图更新 PCB" |
+
+### PCB 布线
+
+| 工具 | 说明 |
+|------|------|
+| `pcb_route_pad_to_pad` | 用带避障的布线器（PNS 推挤或网格 A*）在两个焊盘之间布一条走线，可跨层并通过过孔衔接 |
+| `pcb_add_vias` | 一次写入添加一个或多个通孔过孔，写入前按网络类和间距规则校验 |
+| `pcb_delete_tracks` | 按端点坐标删除走线段和圆弧 |
+| `pcb_delete_vias` | 按 (x, y) 坐标删除过孔 |
 
 ### PCB 摆放
 
@@ -338,6 +376,7 @@ kcaa
 | `list_project_versions` | 列出已保存的项目版本归档 |
 | `restore_project_version` | 将项目文件一起恢复到已保存的归档 |
 | `generate_pcb_thumbnail` | 渲染 PCB 缩略图 |
+| `export_pcb_layer_image` | 将整板或单个铜层渲染为 PNG 图片文件 |
 
 ### 技能系统
 
