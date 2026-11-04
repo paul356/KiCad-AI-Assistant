@@ -645,6 +645,139 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
         return info
 
     @mcp.tool()
+    async def list_library_footprints(
+        library_name: str,
+        project_path: str | None = None,
+        ctx: Context | None = None,
+        max_results: int = 200,
+    ) -> dict[str, Any]:
+        """List every footprint in ONE library (names + light metadata).
+
+        To inspect a single footprint's pads/courtyard use
+        ``get_footprint_details(library_name, footprint_name)``.  Do not pass
+        a list of names here.
+
+        Uses the footprint index when it has this library (fast, ordered by
+        name); otherwise falls back to a live scan of the resolved ``.pretty``
+        directory.  Library resolution matches ``get_footprint_details``:
+        indexed libraries first, a project-owned library beating the global
+        one with the same nickname, then the effective fp-lib-table list.
+        Read-only — nothing is indexed or written.
+
+        Args:
+            library_name: The library nickname (as shown in fp-lib-table),
+                e.g. ``"MountingHole"``.
+            project_path: Optional path to a .kicad_pro file (or .kicad_pcb);
+                its directory identifies the project scope; omit for global
+                (non-project) libraries only.
+            ctx: MCP context for progress reporting.
+            max_results: Maximum number of footprints to return (default 200).
+
+        Returns:
+            dict with ``library``, ``library_path``, ``footprints`` (each
+            ``{name, description, tags, attr, pad_count, has_3d_model}``),
+            ``count`` (rows returned), ``total`` (footprints in the library
+            before the cap), ``truncated`` and ``source`` (``"index"`` or
+            ``"live_scan"``).  Live-scan rows report ``pad_count`` 0 and
+            ``has_3d_model`` False.
+        """
+        if ctx:
+            await ctx.info(f"Listing footprints in '{library_name}'…")
+
+        mgr = get_footprint_index_manager(project_path)
+        db_stats = mgr.get_stats()
+
+        lib_path: str | None = None
+        lib_id: int | None = None
+
+        if db_stats.library_count > 0:
+            lib_records = mgr.get_all_libraries()
+            project_id = normalize_project_id(project_path)
+            # Project-owned libraries take precedence over the global one
+            # with the same nickname.
+            for rec in lib_records:
+                if rec.library_name == library_name and rec.project == project_id:
+                    lib_path = rec.dir_path
+                    lib_id = rec.id
+                    break
+            if lib_path is None:
+                for rec in lib_records:
+                    if rec.library_name == library_name:
+                        lib_path = rec.dir_path
+                        lib_id = rec.id
+                        break
+
+        if not lib_path:
+            # Fallback: live fp-lib-table scan
+            for lib in build_effective_library_list(project_path):
+                if lib["nickname"] == library_name:
+                    lib_path = lib["uri"]
+                    break
+
+        if not lib_path:
+            return {
+                "error": f"Library '{library_name}' not found.",
+                "hint": "Call list_footprint_libraries to see available nicknames.",
+            }
+
+        records = mgr.get_library_footprints(library_name)
+        if lib_id is not None:
+            # Keep only the winning library's rows if a shadowed same-nickname
+            # library is also present in scope.
+            records = [r for r in records if r.library_id == lib_id]
+
+        if records:
+            total = len(records)
+            footprints = [
+                {
+                    "name": r.footprint_name,
+                    "description": r.description,
+                    "tags": r.tags,
+                    "attr": r.attr,
+                    "pad_count": r.pad_count,
+                    "has_3d_model": r.has_3d_model,
+                }
+                for r in records[:max_results]
+            ]
+            source = "index"
+        else:
+            names = scan_footprint_library(lib_path)
+            total = len(names)
+            footprints = []
+            for fp_name in names[:max_results]:
+                desc, tags, attr = "", "", ""
+                mod_path = os.path.join(lib_path, fp_name + ".kicad_mod")
+                try:
+                    info = parse_kicad_mod(mod_path)
+                    desc = info.get("description", "")
+                    tags = info.get("tags", "")
+                    attr = info.get("attr", "")
+                except Exception:
+                    log.debug("Failed to parse footprint metadata from %s", mod_path)
+                footprints.append(
+                    {
+                        "name": fp_name,
+                        "description": desc,
+                        "tags": tags,
+                        "attr": attr,
+                        "pad_count": 0,
+                        "has_3d_model": False,
+                    }
+                )
+            source = "live_scan"
+
+        count = len(footprints)
+        return {
+            "library": library_name,
+            "library_path": lib_path,
+            "footprints": footprints,
+            "count": count,
+            "total": total,
+            "truncated": total > count,
+            "source": source,
+        }
+
+    @mcp.tool()
     async def add_footprints_to_pcb(
         pcb_path: str,
         footprints: list[dict[str, Any]],
