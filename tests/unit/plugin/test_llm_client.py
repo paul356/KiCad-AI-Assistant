@@ -4003,6 +4003,27 @@ class TestToolCallSlotRouting:
             "second_on_index",
         ]
 
+    def test_relay_mixed_indices_keep_wire_order(self):
+        """The relay must derive slots above a provider's explicit index;
+        otherwise a mixed stream is replayed out of wire order once
+        ``sorted()`` orders slots instead of arrival."""
+        sse_lines = [
+            'data: {"choices":[{"delta":{"tool_calls":[{"index":5,"id":"a",'
+            '"function":{"name":"first_wire","arguments":{"x":1}}}]},'
+            '"finish_reason":null}]}',
+            'data: {"choices":[{"delta":{"tool_calls":[{"id":"b",'
+            '"function":{"name":"second_wire","arguments":{"y":2}}}]},'
+            '"finish_reason":null}]}',
+            'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}',
+            "data: [DONE]",
+        ]
+
+        result = self._stream_openai_via_relay(sse_lines)
+
+        assert "error" not in result, result.get("error")
+        tcs = result["message"]["tool_calls"]
+        assert [tc["function"]["name"] for tc in tcs] == ["first_wire", "second_wire"]
+
     def test_relay_nameless_fragment_follows_negative_index(self):
         """Parity with ``_tool_call_slot``: a negative provider index is a real
         slot, not the relay's old "no slot yet" sentinel, so the fragment
