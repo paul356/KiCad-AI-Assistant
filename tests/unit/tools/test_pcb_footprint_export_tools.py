@@ -1346,7 +1346,7 @@ class TestDeleteFootprintLibrary:
 
 
 # ---------------------------------------------------------------------------
-# list_library_footprints
+# get_library_footprints
 # ---------------------------------------------------------------------------
 
 
@@ -1399,7 +1399,7 @@ class TestListLibraryFootprints:
         mgr.index_library("Alpha", str(lib_dir))
         mgr.index_library("Beta", str(other_dir))
 
-        result = _run(tools["list_library_footprints"](library_name="Alpha", ctx=None))
+        result = _run(tools["get_library_footprints"](library_name="Alpha", ctx=None))
 
         assert result["library"] == "Alpha"
         assert result["library_path"] == str(lib_dir)
@@ -1444,7 +1444,7 @@ class TestListLibraryFootprints:
         monkeypatch.setattr("kcaa.tools.pcb_library_tools.get_footprint_index_manager", _scoped)
 
         result = _run(
-            tools["list_library_footprints"](
+            tools["get_library_footprints"](
                 library_name="ProjOnly", project_path=str(board), ctx=None
             )
         )
@@ -1477,7 +1477,7 @@ class TestListLibraryFootprints:
         board.write_text("(kicad_pcb)\n", encoding="utf-8")
 
         result = _run(
-            tools["list_library_footprints"](
+            tools["get_library_footprints"](
                 library_name="LiveLib", project_path=str(board), ctx=None
             )
         )
@@ -1515,7 +1515,7 @@ class TestListLibraryFootprints:
         board.write_text("(kicad_pcb)\n", encoding="utf-8")
 
         result = _run(
-            tools["list_library_footprints"](
+            tools["get_library_footprints"](
                 library_name="LiveTrunc",
                 project_path=str(board),
                 max_results=2,
@@ -1537,7 +1537,7 @@ class TestListLibraryFootprints:
         mgr.index_library("ZeroIdx", str(lib_dir))  # row exists, zero footprints
         _write_mod(str(lib_dir), "LateFootprint")
 
-        result = _run(tools["list_library_footprints"](library_name="ZeroIdx", ctx=None))
+        result = _run(tools["get_library_footprints"](library_name="ZeroIdx", ctx=None))
 
         assert result["source"] == "live_scan"
         assert [f["name"] for f in result["footprints"]] == ["LateFootprint"]
@@ -1545,7 +1545,7 @@ class TestListLibraryFootprints:
         assert result["total"] == 1
 
     def test_unknown_library_returns_error_and_hint(self, tools):
-        result = _run(tools["list_library_footprints"](library_name="NoSuchLib", ctx=None))
+        result = _run(tools["get_library_footprints"](library_name="NoSuchLib", ctx=None))
 
         assert result["error"] == "Library 'NoSuchLib' not found."
         assert result["hint"] == "Call list_footprint_libraries to see available nicknames."
@@ -1559,7 +1559,7 @@ class TestListLibraryFootprints:
         project["index_mgr"].index_library("Trunc", str(lib_dir))
 
         result = _run(
-            tools["list_library_footprints"](library_name="Trunc", max_results=2, ctx=None)
+            tools["get_library_footprints"](library_name="Trunc", max_results=2, ctx=None)
         )
 
         assert [f["name"] for f in result["footprints"]] == ["Aaa", "Bbb"]
@@ -1581,7 +1581,7 @@ class TestListLibraryFootprints:
         ]
         for offset, expected, next_offset in pages:
             result = _run(
-                tools["list_library_footprints"](
+                tools["get_library_footprints"](
                     library_name="Paged", max_results=2, offset=offset, ctx=None
                 )
             )
@@ -1624,7 +1624,7 @@ class TestListLibraryFootprints:
         for offset, expected, next_offset in pages:
             parsed.clear()
             result = _run(
-                tools["list_library_footprints"](
+                tools["get_library_footprints"](
                     library_name="LivePaged",
                     project_path=str(board),
                     max_results=2,
@@ -1651,7 +1651,7 @@ class TestListLibraryFootprints:
         project["index_mgr"].index_library("Short", str(lib_dir))
 
         result = _run(
-            tools["list_library_footprints"](
+            tools["get_library_footprints"](
                 library_name="Short", max_results=2, offset=10, ctx=None
             )
         )
@@ -1665,9 +1665,7 @@ class TestListLibraryFootprints:
         assert result["truncated"] is False
 
     def test_negative_offset_returns_error(self, tools):
-        result = _run(
-            tools["list_library_footprints"](library_name="Anything", offset=-1, ctx=None)
-        )
+        result = _run(tools["get_library_footprints"](library_name="Anything", offset=-1, ctx=None))
 
         assert result["error"] == "offset must be >= 0"
         assert result["hint"] == "Use offset >= 0; it is the number of rows to skip."
@@ -1681,7 +1679,7 @@ class TestListLibraryFootprints:
         project["index_mgr"].index_library("LastPage", str(lib_dir))
 
         result = _run(
-            tools["list_library_footprints"](
+            tools["get_library_footprints"](
                 library_name="LastPage", max_results=2, offset=2, ctx=None
             )
         )
@@ -1703,7 +1701,7 @@ class TestListLibraryFootprints:
 
         # (a) Last full page: offset + count == total and count == max_results.
         last_full = _run(
-            tools["list_library_footprints"](
+            tools["get_library_footprints"](
                 library_name="IndexBounds", max_results=2, offset=2, ctx=None
             )
         )
@@ -1718,7 +1716,7 @@ class TestListLibraryFootprints:
 
         # (b) offset == total.
         at_end = _run(
-            tools["list_library_footprints"](
+            tools["get_library_footprints"](
                 library_name="IndexBounds", max_results=2, offset=4, ctx=None
             )
         )
@@ -1732,7 +1730,7 @@ class TestListLibraryFootprints:
 
         # (c) max_results > total.
         oversized = _run(
-            tools["list_library_footprints"](
+            tools["get_library_footprints"](
                 library_name="IndexBounds", max_results=10, offset=0, ctx=None
             )
         )
@@ -1755,7 +1753,7 @@ class TestListLibraryFootprints:
 
         # (a) Last full page: offset + count == total and count == max_results.
         last_full = _run(
-            tools["list_library_footprints"](
+            tools["get_library_footprints"](
                 library_name="LiveBounds",
                 project_path=str(board),
                 max_results=2,
@@ -1774,7 +1772,7 @@ class TestListLibraryFootprints:
 
         # (b) offset == total.
         at_end = _run(
-            tools["list_library_footprints"](
+            tools["get_library_footprints"](
                 library_name="LiveBounds",
                 project_path=str(board),
                 max_results=2,
@@ -1792,7 +1790,7 @@ class TestListLibraryFootprints:
 
         # (c) max_results > total.
         oversized = _run(
-            tools["list_library_footprints"](
+            tools["get_library_footprints"](
                 library_name="LiveBounds",
                 project_path=str(board),
                 max_results=10,
@@ -1816,7 +1814,7 @@ class TestListLibraryFootprints:
         board.write_text("(kicad_pcb)\n", encoding="utf-8")
 
         result = _run(
-            tools["list_library_footprints"](
+            tools["get_library_footprints"](
                 library_name="EmptyPage",
                 project_path=str(board),
                 max_results=2,
@@ -1842,7 +1840,7 @@ class TestListLibraryFootprints:
         project["index_mgr"].index_library("IndexedEmpty", str(lib_dir))
 
         result = _run(
-            tools["list_library_footprints"](
+            tools["get_library_footprints"](
                 library_name="IndexedEmpty", max_results=2, offset=3, ctx=None
             )
         )
@@ -1866,7 +1864,7 @@ class TestListLibraryFootprints:
         board.write_text("(kicad_pcb)\n", encoding="utf-8")
 
         result = _run(
-            tools["list_library_footprints"](
+            tools["get_library_footprints"](
                 library_name="EmptyLib", project_path=str(board), ctx=None
             )
         )
@@ -1884,7 +1882,7 @@ class TestListLibraryFootprints:
         board.write_text("(kicad_pcb)\n", encoding="utf-8")
 
         result = _run(
-            tools["list_library_footprints"](
+            tools["get_library_footprints"](
                 library_name="Missing", project_path=str(board), ctx=None
             )
         )
@@ -1906,7 +1904,7 @@ class TestListLibraryFootprints:
         project["index_mgr"].index_library("Gone", str(stale))
         shutil.rmtree(stale)
 
-        result = _run(tools["list_library_footprints"](library_name="Gone", ctx=None))
+        result = _run(tools["get_library_footprints"](library_name="Gone", ctx=None))
 
         assert result["error"] == (
             f"Library 'Gone' resolves to '{stale}', which is not a directory."
@@ -1929,9 +1927,7 @@ class TestListLibraryFootprints:
         board.write_text("(kicad_pcb)\n", encoding="utf-8")
 
         result = _run(
-            tools["list_library_footprints"](
-                library_name="Moved", project_path=str(board), ctx=None
-            )
+            tools["get_library_footprints"](library_name="Moved", project_path=str(board), ctx=None)
         )
 
         assert result["source"] == "live_scan"
@@ -1942,7 +1938,7 @@ class TestListLibraryFootprints:
     @pytest.mark.parametrize("max_results", [0, -1])
     def test_max_results_below_one_returns_error(self, tools, max_results):
         result = _run(
-            tools["list_library_footprints"](
+            tools["get_library_footprints"](
                 library_name="Anything", max_results=max_results, ctx=None
             )
         )
@@ -1952,4 +1948,4 @@ class TestListLibraryFootprints:
         assert "footprints" not in result
 
     def test_tool_is_registered(self, tools):
-        assert "list_library_footprints" in tools
+        assert "get_library_footprints" in tools
