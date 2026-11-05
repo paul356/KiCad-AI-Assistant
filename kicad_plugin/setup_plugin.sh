@@ -111,7 +111,7 @@ if [[ -n "$OPTIONAL_PATH" ]]; then
         echo "Expected a *.whl, a *.tar.gz, or a source directory." >&2
         exit 1
     fi
-    parent="$(cd "$(dirname -- "$OPTIONAL_PATH")" && pwd)"
+    parent="$(cd -- "$(dirname -- "$OPTIONAL_PATH")" && pwd)"
     # "${parent%/}" keeps a root-level artifact at "/name", not "//name".
     LOCAL_PATH="${parent%/}/$(basename -- "$OPTIONAL_PATH")"
 fi
