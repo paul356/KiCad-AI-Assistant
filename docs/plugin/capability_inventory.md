@@ -110,7 +110,7 @@ These tools are excluded from the plugin profile: they depend on `kicad-cli` sub
 | `analyze_bom` | `bom_tools.py` | `kicad-cli` dependent |
 | `export_bom_csv` | `bom_tools.py` | `kicad-cli` dependent |
 | `identify_circuit_patterns` | `pattern_tools.py` | Pattern recognition not needed for editing workflows |
-| `validate_project_boundaries` | `validation_tools.py` | Not registered in `server.py`; not relevant to plugin editing profile |
+| `validate_project_boundaries` | `validation_tools.py` | Module deleted in #239; it was never registered and could not be imported (missing utils) |
 
 ---
 
