@@ -1,6 +1,6 @@
 # KiCad MCP Plugin — Tool Contract (Milestone 1)
 
-> **Scope:** This document defines the exact set of MCP tools exposed to the LLM in the milestone-1 plugin integration. Tools not listed here are either deferred or inapplicable to the plugin profile. Tools added after milestone 1 (PCB editing, query, routing, zones, placement and groups; hierarchical sheets; no-connect flags; versioning; skills; layer export) are documented in the README's *Available Tools* tables and are outside this contract's §3 blocks.
+> **Scope:** This document defines the exact set of MCP tools exposed to the LLM in the milestone-1 plugin integration. Tools not listed here are either deferred or inapplicable to the plugin profile. Tools added after milestone 1 (library management, PCB library, PCB editing, query, routing, zones, placement and groups; hierarchical sheets; no-connect flags; DRC/ERC; versioning; skills; layer export; KiCad IPC) are documented in the README's *Available Tools* tables and are outside this contract's §3 blocks. That list is not exhaustive — the README is the full current surface.
 
 ---
 
@@ -471,15 +471,14 @@ Routing is orthogonal (horizontal-vertical). If an endpoint lies on the interior
 |---|---|---|
 | All MCP resources (`kicad://...`) | Resources are not part of the tool-only plugin profile | Post-milestone-1 |
 | All MCP prompts | Prompts assume a standalone MCP client (e.g. Claude Desktop) | Post-milestone-1 |
-| `list_projects`, `get_project_structure` | Plugin provides active-project context directly | Review after initial plugin is stable |
+| `list_projects` | Plugin provides active-project context directly; the profile exposes `get_project_structure` instead (see README) | Review after initial plugin is stable |
 | `open_project` | KiCad plugin manages project opening directly | Not applicable |
-| `get_drc_history`, `run_drc_check` | `kicad-cli` dependency; not skip-based | Separate milestone after `kicad-cli` removal |
+| `get_drc_history` | Tool removed; DRC history is not exposed in the plugin profile | Not planned |
 | `generate_pcb_thumbnail`, `generate_thumbnail_with_cli` | `kicad-cli` dependency | Separate milestone |
 | `get_bom`, `export_bom_csv` | `kicad-cli` dependency | Separate milestone |
 | All pattern tools (`pattern_tools.py`) | Not needed for direct editing workflows | Optional future addition |
 | `validate_project` | Superseded by netlist inspection tools for editing validation | Review later |
-| `validate_project_boundaries`, `generate_validation_report` | `kicad-cli` dependency | Separate milestone |
-| PCB edit tools | Planned for future milestone; see `docs/plugin/pcb_feasibility.md` | Future |
+| `validate_project_boundaries`, `generate_validation_report` | Module never registered (`server.py` does not import `validation_tools`); wire-up or delete tracked separately | Under review |
 
 ---
 

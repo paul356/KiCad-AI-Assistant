@@ -251,8 +251,6 @@ kcaa
 | `run_erc` | 运行电气规则检查（调用无界面的 `kicad-cli`）并返回违规项 |
 | `identify_circuit_patterns` | 识别常见电路模式 |
 | `validate_project` | 项目基本验证 |
-| `validate_project_boundaries` | 验证元件边界 |
-| `generate_validation_report` | 生成综合验证报告 |
 
 ### 层次化图纸
 

@@ -284,8 +284,6 @@ kcaa
 | `run_erc` | Run Electrical Rules Check (headless `kicad-cli`) and return violations |
 | `identify_circuit_patterns` | Identify common circuit patterns |
 | `validate_project` | Basic validation of a KiCad project |
-| `validate_project_boundaries` | Validate component boundaries |
-| `generate_validation_report` | Generate a comprehensive validation report |
 
 ### Hierarchical Sheets
 

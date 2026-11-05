@@ -1,14 +1,14 @@
 # Capability Inventory
 
-This is a milestone-1 decision record: it classifies the capabilities registered at that time as **keep**, **defer**, or **remove** for the plugin-facing profile. Later milestones added PCB, hierarchical-sheet, no-connect, group, versioning, skill and library-management tools — the current surface is documented in the README's *Available Tools* tables and in `kicad_plugin/tool_registry.py`.
+This document records the **keep / defer / remove** classification for the plugin-facing profile as it stands today, not the milestone-1 snapshot it started from. The classifications below cover the schematic/symbol editing surface with its symbol and footprint library tools, plus the project and DRC rows that were formerly deferred or removed. The rest of the profile — PCB editing, query, routing, zones, placement and groups, hierarchical sheets, no-connect flags, versioning, skills, ERC and KiCad IPC — is not enumerated here. That enumeration is deliberately non-exhaustive: the README's *Available Tools* tables and `kicad_plugin/tool_registry.py` are the source of truth for the current surface.
 
 ---
 
 ## 1. Tools
 
-### 1.1 Keep for Milestone 1 (30 tools)
+### 1.1 Keep — plugin-facing schematic/symbol surface (32 tools)
 
-These tools are skip-based, have no `kicad-cli` dependency, and form the core of the plugin-facing editing surface.
+These tools are skip-based and form the core of the plugin-facing editing surface. `get_project_structure` and `run_drc_check` are kept here too, having been reclassified from §1.2/§1.3 once the plugin profile began exposing them.
 
 #### Netlist / Inspection (`netlist_tools.py`)
 
@@ -63,7 +63,7 @@ All write operations create a `.bak` backup before writing.
 | `remove_footprints_from_library` | Remove named footprints from a library directory and re-index it |
 | `delete_footprint_library` | Delete an **empty** footprint library (directory + table entry + index) |
 
-Empty-only deletion refuses to remove a library that still holds definitions; only the library file/directory is touched, never the schematic or board.
+Empty-only deletion refuses to remove a library that still holds definitions. Only the library file/directory, its lib-table entry and its index rows are touched — never the schematic or board.
 
 #### Wire Editing (`wire_edit_tools.py`)
 
@@ -73,31 +73,39 @@ Empty-only deletion refuses to remove a library that still holds definitions; on
 | `connect_points_with_wire` | Route an orthogonal wire between two raw coordinates, adding junctions where needed |
 | `delete_wire_from_schematic` | Remove a wire segment by start/end coordinates |
 
+#### Project Query (`project_tools.py`)
+
+| Tool | Purpose |
+|------|---------|
+| `get_project_structure` | Return project metadata, the sheet hierarchy and the local lib-table paths |
+
+#### DRC (`drc_tools.py`)
+
+| Tool | Purpose |
+|------|---------|
+| `run_drc_check` | Open the Design Rules Checker dialog in the running KiCad editor via IPC |
+
 ---
 
-### 1.2 Defer — Review After Initial Plugin is Stable
+### 1.2 Defer — valid tools outside the plugin profile (1 tool)
 
-These tools may be added back once the plugin is working end-to-end.
+These tools exist and are registered by the full profile, but the plugin profile does not expose them.
 
 | Tool | Module | Reason Deferred |
 |------|--------|----------------|
 | `list_projects` | `project_tools.py` | Plugin provides project context directly; filesystem scanning is not needed |
-| `get_project_structure` | `project_tools.py` | Same as above; context bridge covers this role |
-
-**Decision needed:** once the plugin is stable, decide whether these are useful for LLM exploratory queries (e.g., "what other schematics are in this project?") or whether the plugin context always provides sufficient scope.
 
 ---
 
-### 1.3 Remove from Plugin-Facing Profile
+### 1.3 Remove from the plugin-facing profile (8 tools)
 
-These tools depend on `kicad-cli`, perform OS-level actions that belong to KiCad itself, or serve use cases not relevant to the plugin.
+These tools are excluded from the plugin profile: they depend on `kicad-cli` subprocesses, perform OS-level actions that belong to KiCad itself, or serve use cases not relevant to the plugin.
 
 | Tool | Module | Reason |
 |------|--------|--------|
 | `open_project` | `project_tools.py` | Uses OS-level `open`/`xdg-open`; KiCad plugin manages project lifecycle |
 | `validate_project` | `analysis_tools.py` | Superseded by netlist inspection; unclear CLI dependency |
-| `run_drc_check` | `drc_tools.py` | `kicad-cli` dependent; DRC is a separate milestone |
-| `get_drc_history` | `drc_tools.py` | `kicad-cli` dependent |
+| `get_drc_history` | `drc_tools.py` | Tool no longer exists; the resource helper is not a plugin tool |
 | `generate_pcb_thumbnail` | `export_tools.py` | `kicad-cli` dependent |
 | `analyze_bom` | `bom_tools.py` | `kicad-cli` dependent |
 | `export_bom_csv` | `bom_tools.py` | `kicad-cli` dependent |
@@ -117,6 +125,7 @@ MCP resources are designed for MCP-client-driven browsing (e.g., Claude Desktop)
 | `kicad://schematic/{schematic_path}` | `resources/files.py` | Replaced by `extract_schematic_netlist` tool |
 | `kicad://project/{project_path}` | `resources/projects.py` | Replaced by plugin context bridge |
 | `kicad://netlist/{schematic_path}` | `resources/netlist_resources.py` | Replaced by `extract_schematic_netlist` tool |
+| `kicad://project_netlist/{project_path}` | `resources/netlist_resources.py` | Replaced by `extract_schematic_netlist`, which walks the full sheet hierarchy |
 | `kicad://component/{schematic_path}/{component_ref}` | `resources/netlist_resources.py` | Replaced by `find_component_connections` tool |
 | `kicad://bom/{project_path}` | `resources/bom_resources.py` | BOM features deferred |
 | `kicad://bom/{project_path}/csv` | `resources/bom_resources.py` | BOM features deferred |
@@ -160,9 +169,9 @@ MCP prompts are designed for standalone MCP clients (e.g., Claude Desktop) where
 
 | Category | Keep | Defer | Remove |
 |----------|------|-------|--------|
-| Tools | 30 | 2 | 9 |
-| Resources | 0 | 11 | 0 |
+| Tools | 32 | 1 | 8 |
+| Resources | 0 | 12 | 0 |
 | Prompts | 0 | 17 | 0 |
-| **Total** | **30** | **30** | **9** |
+| **Total** | **32** | **30** | **8** |
 
-Section 1.1 lists the 30 tools that made up the milestone-1 plugin profile; the profile has since grown beyond them (see the README's *Available Tools* tables and `kicad_plugin/tool_registry.py`).
+Section 1.1 holds 32 tools: 23 were in the original milestone-1 schematic/symbol scope, the seven symbol- and footprint-library tools were added later and belong to the same surface, and `get_project_structure` and `run_drc_check` were reclassified from §1.2/§1.3 once the plugin profile started exposing them.
