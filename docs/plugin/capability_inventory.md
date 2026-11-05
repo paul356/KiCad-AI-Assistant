@@ -6,9 +6,9 @@ This document records the **keep / defer / remove** classification for the plugi
 
 ## 1. Tools
 
-### 1.1 Keep — plugin-facing schematic/symbol surface (32 tools)
+### 1.1 Keep — plugin-facing surface (32 tools)
 
-These tools are skip-based and form the core of the plugin-facing editing surface. `get_project_structure` and `run_drc_check` are kept here too, having been reclassified from §1.2/§1.3 once the plugin profile began exposing them.
+Every tool listed here is registered by the plugin profile, grouped by area; the profile's other areas (PCB, sheets, no-connect, versioning, skills) are out of scope for this document and listed in the README. `run_drc_check` uses the IPC bridge to open KiCad's dialog rather than editing files directly; the rest are skip-based file tools.
 
 #### Netlist / Inspection (`netlist_tools.py`)
 

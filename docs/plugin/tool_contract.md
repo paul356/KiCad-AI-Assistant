@@ -479,6 +479,7 @@ Routing is orthogonal (horizontal-vertical). If an endpoint lies on the interior
 | All pattern tools (`pattern_tools.py`) | Not needed for direct editing workflows | Optional future addition |
 | `validate_project` | Superseded by netlist inspection tools for editing validation | Review later |
 | `validate_project_boundaries`, `generate_validation_report` | Module never registered (`server.py` does not import `validation_tools`); wire-up or delete tracked separately | Under review |
+| PCB edit / query / routing / zone / group tools | Shipped in later milestones; see README *Available Tools* | Shipped |
 
 ---
 
