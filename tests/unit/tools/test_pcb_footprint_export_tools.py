@@ -1694,6 +1694,170 @@ class TestListLibraryFootprints:
         assert result["truncated"] is False
         assert result["next_offset"] is None
 
+    def test_index_pagination_boundaries(self, tools, project, tmp_path):
+        lib_dir = tmp_path / "IndexBounds.pretty"
+        lib_dir.mkdir()
+        for name in ("Ddd", "Bbb", "Aaa", "Ccc"):
+            _write_mod(str(lib_dir), name)
+        project["index_mgr"].index_library("IndexBounds", str(lib_dir))
+
+        # (a) Last full page: offset + count == total and count == max_results.
+        last_full = _run(
+            tools["list_library_footprints"](
+                library_name="IndexBounds", max_results=2, offset=2, ctx=None
+            )
+        )
+        assert last_full["source"] == "index"
+        assert [f["name"] for f in last_full["footprints"]] == ["Ccc", "Ddd"]
+        assert last_full["count"] == 2
+        assert last_full["total"] == 4
+        assert last_full["offset"] == 2
+        assert last_full["has_more"] is False
+        assert last_full["next_offset"] is None
+        assert last_full["truncated"] is False
+
+        # (b) offset == total.
+        at_end = _run(
+            tools["list_library_footprints"](
+                library_name="IndexBounds", max_results=2, offset=4, ctx=None
+            )
+        )
+        assert at_end["footprints"] == []
+        assert at_end["count"] == 0
+        assert at_end["total"] == 4
+        assert at_end["offset"] == 4
+        assert at_end["has_more"] is False
+        assert at_end["next_offset"] is None
+        assert at_end["truncated"] is False
+
+        # (c) max_results > total.
+        oversized = _run(
+            tools["list_library_footprints"](
+                library_name="IndexBounds", max_results=10, offset=0, ctx=None
+            )
+        )
+        assert [f["name"] for f in oversized["footprints"]] == ["Aaa", "Bbb", "Ccc", "Ddd"]
+        assert oversized["count"] == 4
+        assert oversized["total"] == 4
+        assert oversized["offset"] == 0
+        assert oversized["has_more"] is False
+        assert oversized["next_offset"] is None
+        assert oversized["truncated"] is False
+
+    def test_live_scan_pagination_boundaries(self, tools, project, tmp_path):
+        live_lib = tmp_path / "LiveBounds.pretty"
+        live_lib.mkdir()
+        for name in ("Ddd", "Bbb", "Aaa", "Ccc"):
+            _write_mod(str(live_lib), name)
+        _make_fp_lib_table(tmp_path, [("LiveBounds", str(live_lib))])
+        board = tmp_path / "bounds.kicad_pcb"
+        board.write_text("(kicad_pcb)\n", encoding="utf-8")
+
+        # (a) Last full page: offset + count == total and count == max_results.
+        last_full = _run(
+            tools["list_library_footprints"](
+                library_name="LiveBounds",
+                project_path=str(board),
+                max_results=2,
+                offset=2,
+                ctx=None,
+            )
+        )
+        assert last_full["source"] == "live_scan"
+        assert [f["name"] for f in last_full["footprints"]] == ["Ccc", "Ddd"]
+        assert last_full["count"] == 2
+        assert last_full["total"] == 4
+        assert last_full["offset"] == 2
+        assert last_full["has_more"] is False
+        assert last_full["next_offset"] is None
+        assert last_full["truncated"] is False
+
+        # (b) offset == total.
+        at_end = _run(
+            tools["list_library_footprints"](
+                library_name="LiveBounds",
+                project_path=str(board),
+                max_results=2,
+                offset=4,
+                ctx=None,
+            )
+        )
+        assert at_end["footprints"] == []
+        assert at_end["count"] == 0
+        assert at_end["total"] == 4
+        assert at_end["offset"] == 4
+        assert at_end["has_more"] is False
+        assert at_end["next_offset"] is None
+        assert at_end["truncated"] is False
+
+        # (c) max_results > total.
+        oversized = _run(
+            tools["list_library_footprints"](
+                library_name="LiveBounds",
+                project_path=str(board),
+                max_results=10,
+                offset=0,
+                ctx=None,
+            )
+        )
+        assert [f["name"] for f in oversized["footprints"]] == ["Aaa", "Bbb", "Ccc", "Ddd"]
+        assert oversized["count"] == 4
+        assert oversized["total"] == 4
+        assert oversized["offset"] == 0
+        assert oversized["has_more"] is False
+        assert oversized["next_offset"] is None
+        assert oversized["truncated"] is False
+
+    def test_live_scan_empty_library_with_positive_offset(self, tools, project, tmp_path):
+        empty_lib = tmp_path / "EmptyPage.pretty"
+        empty_lib.mkdir()
+        _make_fp_lib_table(tmp_path, [("EmptyPage", str(empty_lib))])
+        board = tmp_path / "empty_page.kicad_pcb"
+        board.write_text("(kicad_pcb)\n", encoding="utf-8")
+
+        result = _run(
+            tools["list_library_footprints"](
+                library_name="EmptyPage",
+                project_path=str(board),
+                max_results=2,
+                offset=5,
+                ctx=None,
+            )
+        )
+
+        assert result["source"] == "live_scan"
+        assert result["footprints"] == []
+        assert result["count"] == 0
+        assert result["total"] == 0
+        assert result["offset"] == 5
+        assert result["has_more"] is False
+        assert result["next_offset"] is None
+        assert result["truncated"] is False
+        assert "error" not in result
+
+    def test_indexed_empty_library_with_positive_offset_is_empty(self, tools, project, tmp_path):
+        """An empty indexed library degrades to live scan and stays an empty page."""
+        lib_dir = tmp_path / "IndexedEmpty.pretty"
+        lib_dir.mkdir()
+        project["index_mgr"].index_library("IndexedEmpty", str(lib_dir))
+
+        result = _run(
+            tools["list_library_footprints"](
+                library_name="IndexedEmpty", max_results=2, offset=3, ctx=None
+            )
+        )
+
+        assert result["source"] == "live_scan"
+        assert result["library_path"] == str(lib_dir)
+        assert result["footprints"] == []
+        assert result["count"] == 0
+        assert result["total"] == 0
+        assert result["offset"] == 3
+        assert result["has_more"] is False
+        assert result["next_offset"] is None
+        assert result["truncated"] is False
+        assert "error" not in result
+
     def test_empty_library_directory(self, tools, project, tmp_path):
         empty_lib = tmp_path / "EmptyLib.pretty"
         empty_lib.mkdir()
