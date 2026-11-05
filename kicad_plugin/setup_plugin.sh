@@ -34,6 +34,7 @@ Arguments:
 
 Options:
   -h, --help    Show this help and exit.
+  --            End of options; treat the next argument as a path.
 
 Re-running without an argument targets the PyPI release again; if that release
 has the same version as the installed local build, remove .venv to force it
@@ -43,28 +44,51 @@ EOF
 
 # ---------------------------------------------------------------------------
 # Parse arguments and validate the optional local path.
-# This happens before any venv work so a bad path cannot touch an existing venv.
+# Nonexistent paths and unsupported file types are rejected before any uv call.
+# A directory is accepted as a source tree; whether it is a Python project is
+# only checked by uv itself, after the venv step.
 # ---------------------------------------------------------------------------
 OPTIONAL_PATH=""
+POSITIONAL=""   # set when "--" was used, so a leading dash is a path
 if [[ $# -gt 0 ]]; then
     case "$1" in
         -h|--help)
+            if [[ $# -gt 1 ]]; then
+                echo "ERROR: $1 takes no other arguments" >&2
+                usage >&2
+                exit 2
+            fi
             usage
             exit 0
             ;;
-    esac
-    if [[ $# -gt 1 ]]; then
-        echo "ERROR: too many arguments (expected at most one path)" >&2
-        usage >&2
-        exit 2
-    fi
-    case "$1" in
-        -*)
-            echo "ERROR: unknown option: $1" >&2
-            usage >&2
-            exit 2
+        --)
+            shift
+            POSITIONAL=1
             ;;
     esac
+fi
+
+if [[ $# -gt 1 ]]; then
+    echo "ERROR: too many arguments (expected at most one path)" >&2
+    usage >&2
+    exit 2
+fi
+
+if [[ $# -eq 1 ]]; then
+    if [[ -z "$1" ]]; then
+        echo "ERROR: empty path argument" >&2
+        echo "Pass a wheel, sdist, or source directory, or no argument for PyPI." >&2
+        exit 2
+    fi
+    if [[ -z "$POSITIONAL" ]]; then
+        case "$1" in
+            -*)
+                echo "ERROR: unknown option: $1" >&2
+                usage >&2
+                exit 2
+                ;;
+        esac
+    fi
     OPTIONAL_PATH="$1"
 fi
 
@@ -87,7 +111,9 @@ if [[ -n "$OPTIONAL_PATH" ]]; then
         echo "Expected a *.whl, a *.tar.gz, or a source directory." >&2
         exit 1
     fi
-    LOCAL_PATH="$(cd "$(dirname "$OPTIONAL_PATH")" && pwd)/$(basename "$OPTIONAL_PATH")"
+    parent="$(cd "$(dirname -- "$OPTIONAL_PATH")" && pwd)"
+    # "${parent%/}" keeps a root-level artifact at "/name", not "//name".
+    LOCAL_PATH="${parent%/}/$(basename -- "$OPTIONAL_PATH")"
 fi
 
 # ---------------------------------------------------------------------------
@@ -139,32 +165,50 @@ echo "Venv dir   : $VENV_DIR"
 echo ""
 
 echo "Step 1/3 — Creating virtual environment ..."
-# --allow-existing: reuse an existing .venv instead of failing (uv >= 0.11
-# errors when the target exists), so re-runs can reinstall over a build.
+# --allow-existing: reuse an existing .venv instead of aborting. Current uv
+# refuses an existing target ("Use --clear to replace it"), so without this
+# flag a re-run could never reinstall over an installed build.
 uv venv "$VENV_DIR" --python "$PYTHON_VERSION" --allow-existing
 
 echo "Step 2/3 — Installing kcaa (${SOURCE_KIND}) ..."
 if [[ "$SOURCE_KIND" == "pypi" ]]; then
     uv pip install "kcaa==${KCAA_VERSION}" --python "$VENV_DIR"
 elif [[ "$SOURCE_KIND" == "source directory" ]]; then
-    # --reinstall: an already-installed equal version must actually be replaced.
-    uv pip install -e "$LOCAL_PATH" --reinstall --python "$VENV_DIR"
+    # --reinstall-package kcaa: an installed equal version must be replaced,
+    # without uninstalling and reinstalling every other package in the venv.
+    uv pip install -e "$LOCAL_PATH" --reinstall-package kcaa --python "$VENV_DIR"
 else
-    # --reinstall: a plain install can no-op on a version already present.
-    uv pip install "$LOCAL_PATH" --reinstall --python "$VENV_DIR"
+    # --reinstall-package kcaa: a plain install can no-op on an equal version.
+    uv pip install "$LOCAL_PATH" --reinstall-package kcaa --python "$VENV_DIR"
 fi
 uv pip install "pymupdf" --python "$VENV_DIR"
 
-echo "Installed kcaa module:"
-# Probe from inside the venv dir: the caller's cwd may contain a kcaa/ source
-# tree that would shadow the installed package. Importing kcaa requires a KiCad
-# environment (KICAD_VERSION or KICAD<N>_* vars), so a failure is reported
-# loudly instead of aborting an install that already succeeded.
-if kcaa_module="$(cd "$VENV_DIR" && "$VENV_DIR/bin/python" -c "import kcaa; print(kcaa.__file__)" 2>&1)"; then
-    echo "  $kcaa_module"
+echo "Installed kcaa:"
+# Metadata-only probe: importing kcaa requires a KiCad environment
+# (KICAD_VERSION or KICAD<N>_*), so report the installed distribution instead.
+# Non-fatal: a failed lookup only warns, the install itself already succeeded.
+if kcaa_info="$(
+    cd "$VENV_DIR" && "$VENV_DIR/bin/python" -c '
+import json
+from importlib.metadata import distribution
+from urllib.parse import unquote, urlparse
+
+dist = distribution("kcaa")
+info = "{} at {}".format(dist.version, dist.locate_file(""))
+raw = dist.read_text("direct_url.json")
+try:
+    direct = json.loads(raw) if raw else {}
+except ValueError:
+    direct = {}
+if direct.get("dir_info", {}).get("editable") and direct.get("url"):
+    info += " (editable source: {})".format(unquote(urlparse(direct["url"]).path))
+print(info)
+' 2>&1
+)"; then
+    echo "  $kcaa_info"
 else
-    echo "  WARNING: could not import kcaa from $VENV_DIR:" >&2
-    printf '%s\n' "$kcaa_module" | sed 's/^/    /' >&2
+    echo "  WARNING: could not read kcaa metadata from $VENV_DIR:" >&2
+    printf '%s\n' "$kcaa_info" | sed 's/^/    /' >&2
 fi
 
 echo ""
