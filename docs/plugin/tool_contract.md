@@ -1,6 +1,6 @@
-# KiCad MCP Plugin — Tool Contract (Milestone 1)
+# KiCad MCP Plugin — Tool Contract (Schematic/Symbol Surface)
 
-> **Scope:** This document defines the tool contract for the plugin's schematic/symbol editing surface. Tools not listed here are either deferred or outside that surface — `get_project_structure` and `run_drc_check` are exposed by the plugin profile but are not in §1. Later milestones added PCB library, PCB editing, query, routing, zones, placement and groups; hierarchical sheets; no-connect flags; DRC/ERC; versioning; skills; layer export; KiCad IPC — those are documented in the README and are outside §3. The symbol/footprint library-management tools were also added after milestone 1 and *are* covered here (§1, §3.3).
+> **Scope:** This document defines the tool contract for the plugin's schematic/symbol editing surface. It is not an exhaustive list of the plugin profile: some registered schematic/symbol tools have no contract here (e.g. `place_symbol_relative`, `rename_symbol`, `check_reference_conflicts`), and `get_project_structure` and `run_drc_check` are exposed by the profile but sit outside §1. Later milestones added PCB library, PCB editing, query, routing, zones, placement and groups; hierarchical sheets; no-connect flags; DRC/ERC; versioning; skills; layer export; KiCad IPC — those are documented in the README and are outside §3. The symbol/footprint library-management tools were also added after milestone 1 and *are* covered here (§1, §3.3).
 
 ---
 
