@@ -1,12 +1,12 @@
 # Capability Inventory
 
-All capabilities currently registered in `kcaa/server.py` are classified here as **keep**, **defer**, or **remove** for the plugin-facing milestone-1 profile.
+This is a milestone-1 decision record: it classifies the capabilities registered at that time as **keep**, **defer**, or **remove** for the plugin-facing profile. Later milestones added PCB, hierarchical-sheet, no-connect, group, versioning, skill and library-management tools — the current surface is documented in the README's *Available Tools* tables and in `kicad_plugin/tool_registry.py`.
 
 ---
 
 ## 1. Tools
 
-### 1.1 Keep for Milestone 1 (23 tools)
+### 1.1 Keep for Milestone 1 (30 tools)
 
 These tools are skip-based, have no `kicad-cli` dependency, and form the core of the plugin-facing editing surface.
 
@@ -50,6 +50,20 @@ These are read-only tools. They must be used when the LLM is asked to add a comp
 | `delete_label_from_schematic` | Remove a label by text and position |
 
 All write operations create a `.bak` backup before writing.
+
+#### Library Management (`symbol_edit_tools.py`, `pcb_library_tools.py`)
+
+| Tool | Purpose |
+|------|---------|
+| `create_symbol_library` | Create a `.kicad_sym` library (global 3rd-party or project-local) and register it in sym-lib-table |
+| `delete_symbol_library` | Delete an **empty** symbol library (file + table entry + index) |
+| `add_symbols_to_library` | Copy cached schematic symbols into a symbol library, re-indexing it |
+| `remove_symbols_from_library` | Remove named symbol definitions from a library and re-index it |
+| `find_symbols_not_in_libraries` | List schematic symbols missing from all available libraries |
+| `remove_footprints_from_library` | Remove named footprints from a library directory and re-index it |
+| `delete_footprint_library` | Delete an **empty** footprint library (directory + table entry + index) |
+
+Empty-only deletion refuses to remove a library that still holds definitions; only the library file/directory is touched, never the schematic or board.
 
 #### Wire Editing (`wire_edit_tools.py`)
 
@@ -146,9 +160,9 @@ MCP prompts are designed for standalone MCP clients (e.g., Claude Desktop) where
 
 | Category | Keep | Defer | Remove |
 |----------|------|-------|--------|
-| Tools | 23 | 2 | 11 |
-| Resources | 0 | 12 | 0 |
+| Tools | 30 | 2 | 9 |
+| Resources | 0 | 11 | 0 |
 | Prompts | 0 | 17 | 0 |
-| **Total** | **23** | **31** | **11** |
+| **Total** | **30** | **30** | **9** |
 
-The plugin-facing server profile registers exactly the 23 tools listed in section 1.1.
+Section 1.1 lists the 30 tools that made up the milestone-1 plugin profile; the profile has since grown beyond them (see the README's *Available Tools* tables and `kicad_plugin/tool_registry.py`).

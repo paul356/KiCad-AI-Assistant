@@ -1,6 +1,6 @@
 # KiCad MCP Plugin — Tool Contract (Milestone 1)
 
-> **Scope:** This document defines the exact set of MCP tools exposed to the LLM in the milestone-1 plugin integration. Tools not listed here are either deferred or inapplicable to the plugin profile.
+> **Scope:** This document defines the exact set of MCP tools exposed to the LLM in the milestone-1 plugin integration. Tools not listed here are either deferred or inapplicable to the plugin profile. Tools added after milestone 1 (PCB editing, query, routing, zones, placement and groups; hierarchical sheets; no-connect flags; versioning; skills; layer export) are documented in the README's *Available Tools* tables and are outside this contract's §3 blocks.
 
 ---
 
@@ -36,7 +36,7 @@
 | `list_labels_in_schematic` | `symbol_edit_tools` | Return all net labels and their positions |
 | `delete_label_from_schematic` | `symbol_edit_tools` | Remove a net label by text and coordinates |
 | `connect_pins_with_wire` | `wire_edit_tools` | Connect two component pins automatically, resolving their schematic positions |
-| `connect_points_with_wire` | `wire_edit_tools` | Draw an orthogonal wire between two raw coordinates, placing junctions at existing wire endpoints and splitting a wire when an endpoint lands on its interior |
+| `connect_points_with_wire` | `wire_edit_tools` | Draw an orthogonal wire between two raw coordinates, placing a junction at an existing wire endpoint or on a wire's interior (splitting the wire there) |
 | `delete_wire_from_schematic` | `wire_edit_tools` | Remove a wire segment matching given start/end coordinates |
 
 ---
