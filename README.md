@@ -306,7 +306,7 @@ kcaa
 | `list_footprint_libraries` | List all available footprint libraries |
 | `search_footprints` | Search footprints by name, description, or tag |
 | `get_footprint_details` | Get footprint details (pads, bounding box, etc.) |
-| `list_library_footprints` | List every footprint in one library (names and light metadata) |
+| `list_library_footprints` | List every footprint in one library (names and light metadata) (offset paging) |
 | `find_footprints_not_in_libraries` | List board footprints missing from every indexed library |
 | `create_footprint_library` | Create a global 3rdparty or project-local footprint library |
 | `add_footprints_to_library` | Export explicitly named board footprints into a library |

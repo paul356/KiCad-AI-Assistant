@@ -14,10 +14,12 @@ tools: [sync_footprint_index, get_footprint_sync_status, list_footprint_librarie
 - List libraries: **list_footprint_libraries(project_path?)** — omit
   ``project_path`` for global libraries only.
 - List every footprint in one library: **list_library_footprints(library_name,
-  project_path?, max_results?)** — names plus light metadata (description, tags,
-  attr, pad count, 3D model); use **get_footprint_details(library_name,
-  footprint_name)** to inspect ONE footprint's pads/courtyard, and never pass a
-  list of names to ``list_library_footprints``.
+  project_path?, max_results?, offset?)** — names plus light metadata
+  (description, tags, attr, pad count, 3D model), name-ordered and pageable with
+  ``max_results``/``offset`` (``next_offset`` is where the next page starts);
+  use **get_footprint_details(library_name, footprint_name)** to inspect ONE
+  footprint's pads/courtyard, and never pass a list of names to
+  ``list_library_footprints``.
 - Search footprints: **search_footprints(query, project_path?, limit)** —
   omit ``project_path`` to search global libraries only.
 - Inspect pads/courtyard of a specific footprint:

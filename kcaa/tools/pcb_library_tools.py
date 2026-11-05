@@ -653,6 +653,7 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
         project_path: str | None = None,
         ctx: Context | None = None,
         max_results: int = 200,
+        offset: int = 0,
     ) -> dict[str, Any]:
         """List every footprint in ONE library (names + light metadata).
 
@@ -673,26 +674,36 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
                 its directory identifies the project scope; omit for global
                 (non-project) libraries only.
             ctx: MCP context for progress reporting.
-            max_results: Maximum number of footprints to return (default 200).
-                The returned rows are the first N by name; must be >= 1.
+            max_results: Maximum number of footprints to return per page
+                (default 200); must be >= 1.
+            offset: Number of name-ordered rows to skip before this page
+                (default 0); must be >= 0.
 
         Returns:
             dict with ``library``, ``library_path``, ``footprints`` (each
             ``{name, description, tags, attr, pad_count, has_3d_model}``),
-            ``count`` (rows returned), ``total`` (footprints in the library
-            before the cap), ``truncated`` (``total > count``) and ``source``
-            (``"index"`` or ``"live_scan"``).  Live-scan rows carry the
-            metadata parsed from each file, degrading to empty/0/False per
-            file when it cannot be parsed.
+            ``count`` (rows in this page), ``total`` (footprints in the
+            library), ``offset`` (rows skipped), ``has_more`` (more rows
+            remain after this page), ``next_offset`` (``offset + count`` when
+            ``has_more``, else ``None``), ``truncated`` (same as
+            ``has_more``) and ``source`` (``"index"`` or ``"live_scan"``).
+            Live-scan rows carry the metadata parsed from each file,
+            degrading to empty/0/False per file when it cannot be parsed.
+            Both paths return footprints ordered by name.
 
             Errors return ``error`` + ``hint`` and no ``footprints`` key:
-            unknown nickname, ``max_results < 1``, or a resolved directory
-            that does not exist.
+            unknown nickname, ``max_results < 1``, ``offset < 0``, or a
+            resolved directory that does not exist.
         """
         if max_results < 1:
             return {
                 "error": "max_results must be >= 1",
                 "hint": "Use max_results >= 1; the total is reported in `total`.",
+            }
+        if offset < 0:
+            return {
+                "error": "offset must be >= 0",
+                "hint": "Use offset >= 0; it is the number of rows to skip.",
             }
 
         if ctx:
@@ -762,14 +773,14 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
                     "pad_count": r.pad_count,
                     "has_3d_model": r.has_3d_model,
                 }
-                for r in records[:max_results]
+                for r in records[offset : offset + max_results]
             ]
             source = "index"
         else:
             names = scan_footprint_library(lib_path)
             total = len(names)
             footprints = []
-            for fp_name in names[:max_results]:
+            for fp_name in names[offset : offset + max_results]:
                 desc, tags, attr = "", "", ""
                 pad_count, has_3d_model = 0, False
                 mod_path = os.path.join(lib_path, fp_name + ".kicad_mod")
@@ -795,13 +806,17 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
             source = "live_scan"
 
         count = len(footprints)
+        has_more = offset + count < total
         return {
             "library": library_name,
             "library_path": lib_path,
             "footprints": footprints,
             "count": count,
             "total": total,
-            "truncated": total > count,
+            "offset": offset,
+            "has_more": has_more,
+            "next_offset": offset + count if has_more else None,
+            "truncated": has_more,
             "source": source,
         }
 

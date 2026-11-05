@@ -1567,6 +1567,133 @@ class TestListLibraryFootprints:
         assert result["total"] == 3
         assert result["truncated"] is True
 
+    def test_index_paginates_with_offset(self, tools, project, tmp_path):
+        lib_dir = tmp_path / "Paged.pretty"
+        lib_dir.mkdir()
+        for name in ("Eee", "Aaa", "Ccc", "Bbb", "Ddd"):
+            _write_mod(str(lib_dir), name)
+        project["index_mgr"].index_library("Paged", str(lib_dir))
+
+        pages = [
+            (0, ["Aaa", "Bbb"], 2),
+            (2, ["Ccc", "Ddd"], 4),
+            (4, ["Eee"], None),
+        ]
+        for offset, expected, next_offset in pages:
+            result = _run(
+                tools["list_library_footprints"](
+                    library_name="Paged", max_results=2, offset=offset, ctx=None
+                )
+            )
+
+            assert [f["name"] for f in result["footprints"]] == expected
+            assert result["offset"] == offset
+            assert result["count"] == len(expected)
+            assert result["total"] == 5
+            assert result["has_more"] is (next_offset is not None)
+            assert result["next_offset"] == next_offset
+            assert result["truncated"] is result["has_more"]
+
+    def test_live_scan_paginates_and_parses_only_the_page(
+        self, tools, project, tmp_path, monkeypatch
+    ):
+        live_lib = tmp_path / "LivePaged.pretty"
+        live_lib.mkdir()
+        for name in ("Eee", "Aaa", "Ccc", "Bbb", "Ddd"):
+            _write_mod(str(live_lib), name)
+        _make_fp_lib_table(tmp_path, [("LivePaged", str(live_lib))])
+        board = tmp_path / "paged.kicad_pcb"
+        board.write_text("(kicad_pcb)\n", encoding="utf-8")
+
+        import kcaa.tools.pcb_library_tools as mod
+
+        real_parse = mod.parse_kicad_mod
+        parsed: list[str] = []
+
+        def counting_parse(path):
+            parsed.append(os.path.basename(path))
+            return real_parse(path)
+
+        monkeypatch.setattr(mod, "parse_kicad_mod", counting_parse)
+
+        pages = [
+            (0, ["Aaa", "Bbb"], 2),
+            (2, ["Ccc", "Ddd"], 4),
+            (4, ["Eee"], None),
+        ]
+        for offset, expected, next_offset in pages:
+            parsed.clear()
+            result = _run(
+                tools["list_library_footprints"](
+                    library_name="LivePaged",
+                    project_path=str(board),
+                    max_results=2,
+                    offset=offset,
+                    ctx=None,
+                )
+            )
+
+            assert [f["name"] for f in result["footprints"]] == expected
+            # Only the selected page's files are parsed.
+            assert parsed == [name + ".kicad_mod" for name in expected]
+            assert result["offset"] == offset
+            assert result["count"] == len(expected)
+            assert result["total"] == 5
+            assert result["has_more"] is (next_offset is not None)
+            assert result["next_offset"] == next_offset
+            assert result["truncated"] is result["has_more"]
+
+    def test_offset_beyond_end_returns_empty_page(self, tools, project, tmp_path):
+        lib_dir = tmp_path / "Short.pretty"
+        lib_dir.mkdir()
+        for name in ("Bbb", "Aaa", "Ccc"):
+            _write_mod(str(lib_dir), name)
+        project["index_mgr"].index_library("Short", str(lib_dir))
+
+        result = _run(
+            tools["list_library_footprints"](
+                library_name="Short", max_results=2, offset=10, ctx=None
+            )
+        )
+
+        assert result["footprints"] == []
+        assert result["count"] == 0
+        assert result["total"] == 3
+        assert result["offset"] == 10
+        assert result["has_more"] is False
+        assert result["next_offset"] is None
+        assert result["truncated"] is False
+
+    def test_negative_offset_returns_error(self, tools):
+        result = _run(
+            tools["list_library_footprints"](library_name="Anything", offset=-1, ctx=None)
+        )
+
+        assert result["error"] == "offset must be >= 0"
+        assert result["hint"] == "Use offset >= 0; it is the number of rows to skip."
+        assert "footprints" not in result
+
+    def test_last_page_with_offset_is_not_truncated(self, tools, project, tmp_path):
+        lib_dir = tmp_path / "LastPage.pretty"
+        lib_dir.mkdir()
+        for name in ("Ccc", "Aaa", "Bbb"):
+            _write_mod(str(lib_dir), name)
+        project["index_mgr"].index_library("LastPage", str(lib_dir))
+
+        result = _run(
+            tools["list_library_footprints"](
+                library_name="LastPage", max_results=2, offset=2, ctx=None
+            )
+        )
+
+        assert [f["name"] for f in result["footprints"]] == ["Ccc"]
+        assert result["count"] == 1
+        assert result["total"] == 3
+        assert result["offset"] == 2
+        assert result["has_more"] is False
+        assert result["truncated"] is False
+        assert result["next_offset"] is None
+
     def test_empty_library_directory(self, tools, project, tmp_path):
         empty_lib = tmp_path / "EmptyLib.pretty"
         empty_lib.mkdir()
