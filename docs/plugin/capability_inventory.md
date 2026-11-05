@@ -1,6 +1,6 @@
 # Capability Inventory
 
-This document records the **keep / defer / remove** classification for the plugin-facing profile as it stands today, not the milestone-1 snapshot it started from. The classifications below cover the schematic/symbol editing surface with its symbol and footprint library tools, plus the project and DRC rows that were formerly deferred or removed. The rest of the profile — PCB editing, query, routing, zones, placement and groups, hierarchical sheets, no-connect flags, versioning, skills, ERC and KiCad IPC — is not enumerated here. That enumeration is deliberately non-exhaustive: the README's *Available Tools* tables and `kicad_plugin/tool_registry.py` are the source of truth for the current surface.
+This document records the **keep / defer / remove** classification for the tools enumerated below, which are part of the plugin-facing profile as it stands today. It covers the schematic/symbol editing surface with its symbol and footprint library tools, plus the project and DRC rows that were formerly deferred or removed. The rest of the plugin profile — PCB editing, query, routing, zones, placement and groups, hierarchical sheets, no-connect flags, versioning, skills, ERC and KiCad IPC — is not enumerated here. The README's *Available Tools* tables document the **full server surface**, including full-profile-only tools such as `list_projects`; the plugin profile is the subset listed in §1.1 plus the areas named above, and `kicad_plugin/tool_registry.py` holds the profile's per-tool policies.
 
 ---
 
@@ -8,7 +8,7 @@ This document records the **keep / defer / remove** classification for the plugi
 
 ### 1.1 Keep — plugin-facing surface (32 tools)
 
-Every tool listed here is registered by the plugin profile, grouped by area; the profile's other areas (PCB, sheets, no-connect, versioning, skills) are out of scope for this document and listed in the README. `run_drc_check` uses the IPC bridge to open KiCad's dialog rather than editing files directly; the rest are skip-based file tools.
+Every tool listed here is registered by the plugin profile, grouped by area; the profile's other areas (e.g. PCB, sheets, no-connect, versioning, skills, ERC, KiCad IPC) are out of scope for this document and documented in the README. `run_drc_check` uses the IPC bridge to open KiCad's dialog rather than editing files directly; the rest edit files directly (skip or `sexpdata`; no `kicad-cli`).
 
 #### Netlist / Inspection (`netlist_tools.py`)
 
@@ -174,4 +174,4 @@ MCP prompts are designed for standalone MCP clients (e.g., Claude Desktop) where
 | Prompts | 0 | 17 | 0 |
 | **Total** | **32** | **30** | **8** |
 
-Section 1.1 holds 32 tools: 23 were in the original milestone-1 schematic/symbol scope, the seven symbol- and footprint-library tools were added later and belong to the same surface, and `get_project_structure` and `run_drc_check` were reclassified from §1.2/§1.3 once the plugin profile started exposing them.
+Section 1.1 holds 32 tools: 21 come from the original milestone-1 list — 18 keep their names and 3 were renamed in `820c1b9` (`set_symbol_property`, `list_symbol_properties`, `delete_symbol_property`). `create_symbol` and `connect_points_with_wire` came later (making 23 from that surface), as did the seven symbol- and footprint-library tools, and `get_project_structure` and `run_drc_check` were reclassified from §1.2/§1.3 once the plugin profile started exposing them.

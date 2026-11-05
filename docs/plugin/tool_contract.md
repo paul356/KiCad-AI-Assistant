@@ -1,10 +1,10 @@
 # KiCad MCP Plugin — Tool Contract (Milestone 1)
 
-> **Scope:** This document defines the exact set of MCP tools exposed to the LLM in the milestone-1 plugin integration. Tools not listed here are either deferred or inapplicable to the plugin profile. Tools added after milestone 1 (library management, PCB library, PCB editing, query, routing, zones, placement and groups; hierarchical sheets; no-connect flags; DRC/ERC; versioning; skills; layer export; KiCad IPC) are documented in the README's *Available Tools* tables and are outside this contract's §3 blocks. That list is not exhaustive — the README is the full current surface.
+> **Scope:** This document defines the tool contract for the plugin's schematic/symbol editing surface. Tools not listed here are either deferred or outside that surface — `get_project_structure` and `run_drc_check` are exposed by the plugin profile but are not in §1. Later milestones added PCB library, PCB editing, query, routing, zones, placement and groups; hierarchical sheets; no-connect flags; DRC/ERC; versioning; skills; layer export; KiCad IPC — those are documented in the README and are outside §3. The symbol/footprint library-management tools were also added after milestone 1 and *are* covered here (§1, §3.3).
 
 ---
 
-## 1. Milestone-1 Tool Surface
+## 1. Plugin Tool Surface
 
 | Tool | Module | Description |
 |---|---|---|

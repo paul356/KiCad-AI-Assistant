@@ -17,7 +17,7 @@ KiCad (GUI)
             └─ settings_dialog.py ← Settings dialog
 
 kcaa MCP server (subprocess, streamable-http on localhost)
-  └─ Profile: "plugin" — 23 skip-based schematic editing tools only
+  └─ Profile: "plugin" — 124 tools; 23 are the schematic/symbol core below
 ```
 
 ## Installation
@@ -87,7 +87,7 @@ Settings are stored in the KiCad user config directory:
 
 ## Available Tools (Milestone 1)
 
-The plugin exposes 23 schematic editing tools to the LLM:
+The plugin registers 124 tools in total. The 23 tools below are the milestone-1 schematic/symbol core:
 
 - **Netlist inspection:** `extract_schematic_netlist`, `find_component_connections`
 - **Symbol search:** `search_symbols`, `get_symbol`, `list_symbol_libraries`, `get_symbol_pins` + 4 more
