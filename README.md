@@ -25,11 +25,13 @@ Tested on **KiCad 10.0 / Linux & Windows**.
     - [Project Tools](#project-tools)
     - [Symbol Library](#symbol-library)
     - [Schematic Editing](#schematic-editing)
+    - [Schematic Groups](#schematic-groups)
     - [Schematic Analysis](#schematic-analysis)
     - [Hierarchical Sheets](#hierarchical-sheets)
     - [PCB Library](#pcb-library)
     - [PCB Query](#pcb-query)
     - [PCB Editing](#pcb-editing)
+    - [PCB Routing](#pcb-routing)
     - [PCB Placement](#pcb-placement)
     - [PCB Groups](#pcb-groups)
     - [PCB Zones](#pcb-zones)
@@ -229,6 +231,11 @@ kcaa
 | `get_symbol` | Look up a symbol by library and name |
 | `get_library_symbols` | Return symbols in a specific library |
 | `get_symbol_pins` | Get pin definitions for a symbol |
+| `create_symbol_library` | Create a new `.kicad_sym` library (global 3rd-party or project-local) and register it in the library table |
+| `delete_symbol_library` | Delete an empty symbol library (file, library-table entry, and index) |
+| `add_symbols_to_library` | Copy symbols from a schematic's cached `lib_symbols` into an existing library |
+| `remove_symbols_from_library` | Remove named symbol definitions from a library and re-index it |
+| `find_symbols_not_in_libraries` | List schematic symbols that resolve to no available library (read-only) |
 
 ### Schematic Editing
 
@@ -245,7 +252,6 @@ kcaa
 | `delete_symbol_property` | Delete a property from a placed symbol |
 | `check_reference_conflicts` | Check for duplicate reference designators |
 | `connect_points_with_wire` | Route a smart orthogonal wire between two points |
-| `add_wire_to_schematic` | Add a single wire segment by endpoints |
 | `connect_pins_with_wire` | Connect two symbol pins with a wire |
 | `delete_wire_from_schematic` | Remove wire segments by endpoints |
 | `add_label_to_schematic` | Add a local net label |
@@ -257,6 +263,18 @@ kcaa
 | `get_schematic_sheet_info` | Get drawing area, paper size, and grid |
 | `find_free_area` | Find candidate areas for placing a block |
 
+### Schematic Groups
+
+| Tool | Description |
+|------|-------------|
+| `assign_symbols_to_group` | Assign symbols to a named placement group (stored as the `placement_group` property) |
+| `list_symbol_groups` | List all symbol placement groups with member counts and bounding boxes |
+| `get_symbol_group` | Get a group's members, positions, anchor and bounding box |
+| `score_symbol_group` | Score intra-group spacing (mean nearest-neighbour distance and spread) |
+| `place_symbol_group` | Arrange a group in a grid around its anchor and drop it in a free sheet area |
+| `move_symbol_group` | Translate a whole group to a new anchor position, keeping its internal layout |
+| `rotate_symbol_group` | Rotate a whole group rigidly around its anchor (counter-clockwise positive) |
+
 ### Schematic Analysis
 
 | Tool | Description |
@@ -266,8 +284,6 @@ kcaa
 | `run_erc` | Run Electrical Rules Check (headless `kicad-cli`) and return violations |
 | `identify_circuit_patterns` | Identify common circuit patterns |
 | `validate_project` | Basic validation of a KiCad project |
-| `validate_project_boundaries` | Validate component boundaries |
-| `generate_validation_report` | Generate a comprehensive validation report |
 
 ### Hierarchical Sheets
 
@@ -293,6 +309,8 @@ kcaa
 | `find_footprints_not_in_libraries` | List board footprints missing from every indexed library |
 | `create_footprint_library` | Create a global 3rdparty or project-local footprint library |
 | `add_footprints_to_library` | Export explicitly named board footprints into a library |
+| `delete_footprint_library` | Delete an empty footprint library (directory, library-table entry, and index) |
+| `remove_footprints_from_library` | Remove named footprints from a footprint library and re-index it |
 
 ### PCB Query
 
@@ -304,6 +322,8 @@ kcaa
 | `get_footprint_bbox` | Get the courtyard bounding box of a footprint |
 | `get_board_bounding_box` | Get the union bounding box of all footprints |
 | `list_nets` | List all nets on the board |
+| `list_tracks` | List track segments and arcs grouped into traces, optionally filtered by net and layer |
+| `list_vias` | List through-hole vias with position, size, drill, layers and net, optionally filtered by net |
 | `get_ratsnest` | Get unrouted ratsnest connections |
 | `score_placement` | Score the current PCB placement quality |
 | `suggest_placement_order` | Get recommended footprint placement order |
@@ -318,7 +338,18 @@ kcaa
 | `add_board_outline_arc` | Add an arc to the board outline |
 | `set_board_outline_rect` | Set a rectangular board outline (with optional rounded corners) |
 | `set_footprint_property` | Set a property field on a footprint |
+| `add_footprints_to_pcb` | Import footprints from footprint libraries onto the board at given positions, assigning every pad's net |
+| `remove_footprints_from_pcb` | Remove footprints from the board by reference designator (batch) |
 | `update_pcb_from_schematic` | Trigger *Update PCB from Schematic* via KiCad IPC |
+
+### PCB Routing
+
+| Tool | Description |
+|------|-------------|
+| `pcb_route_pad_to_pad` | Route a single track between two pads with the obstacle-avoiding router (PNS shove or grid A*), optionally across layers via through-vias |
+| `pcb_add_vias` | Add one or more through-hole vias in a single write, pre-checked against netclass and clearance rules |
+| `pcb_delete_tracks` | Delete track segments and arcs matched by their endpoint coordinates |
+| `pcb_delete_vias` | Delete vias matched by their (x, y) position |
 
 ### PCB Placement
 
@@ -376,6 +407,7 @@ kcaa
 | `list_project_versions` | List saved project version archives |
 | `restore_project_version` | Restore project files together to a saved archive |
 | `generate_pcb_thumbnail` | Render a PCB thumbnail image |
+| `export_pcb_layer_image` | Render the board — or a single copper layer — as an image returned to the model; writes a PNG file only when `output_dir` is given |
 
 ### Skill System
 

@@ -1,10 +1,10 @@
-# KiCad MCP Plugin — Tool Contract (Milestone 1)
+# KiCad MCP Plugin — Tool Contract (Schematic/Symbol Surface)
 
-> **Scope:** This document defines the exact set of MCP tools exposed to the LLM in the milestone-1 plugin integration. Tools not listed here are either deferred or inapplicable to the plugin profile.
+> **Scope:** This document defines the tool contract for the plugin's schematic/symbol editing surface. It is not an exhaustive list of the plugin profile: some registered schematic/symbol tools have no contract here (e.g. `place_symbol_relative`, `rename_symbol`, `check_reference_conflicts`), and `get_project_structure` and `run_drc_check` are exposed by the profile but sit outside §1. Later milestones added PCB library, PCB editing, query, routing, zones, placement and groups; hierarchical sheets; no-connect flags; DRC/ERC; versioning; skills; layer export; KiCad IPC — those are documented in the README and are outside §3. The symbol/footprint library-management tools were also added after milestone 1 and *are* covered here (§1, §3.3).
 
 ---
 
-## 1. Milestone-1 Tool Surface
+## 1. Plugin Tool Surface
 
 | Tool | Module | Description |
 |---|---|---|
@@ -35,12 +35,9 @@
 | `add_label_to_schematic` | `symbol_edit_tools` | Place a net label at specific coordinates |
 | `list_labels_in_schematic` | `symbol_edit_tools` | Return all net labels and their positions |
 | `delete_label_from_schematic` | `symbol_edit_tools` | Remove a net label by text and coordinates |
-| `add_wire_to_schematic` | `wire_edit_tools` | Draw a wire segment between two coordinates (orthogonal routing) |
 | `connect_pins_with_wire` | `wire_edit_tools` | Connect two component pins automatically, resolving their schematic positions |
+| `connect_points_with_wire` | `wire_edit_tools` | Draw an orthogonal wire between two raw coordinates, placing a junction at an existing wire endpoint or on a wire's interior (splitting the wire there) |
 | `delete_wire_from_schematic` | `wire_edit_tools` | Remove a wire segment matching given start/end coordinates |
-| `add_junction_to_schematic` | `wire_edit_tools` | Place a junction dot at a coordinate |
-| `list_junctions_in_schematic` | `wire_edit_tools` | Return all junction coordinates |
-| `delete_junction_from_schematic` | `wire_edit_tools` | Remove a junction at a given coordinate |
 
 ---
 
@@ -53,7 +50,7 @@ A typical LLM editing session follows this pattern:
 3. **Place / edit / connect** — use the symbol-editing and wire-editing tools to make changes. After placing a symbol, call `extract_schematic_netlist` to get the new pin positions before routing wires.
 4. **Verify** — call `extract_schematic_netlist` again after all edits. Confirm expected nets exist in `analysis.signal_nets` or `analysis.power_nets` and that `analysis.floating_nets` is empty.
 
-> **Tip:** `connect_pins_with_wire` is the preferred wiring tool when the two endpoints are component pins — it resolves positions automatically. Use `add_wire_to_schematic` only when routing to/from a known coordinate (e.g. a label or an existing wire endpoint).
+> **Tip:** `connect_pins_with_wire` is the preferred wiring tool when the two endpoints are component pins — it resolves positions automatically. Use `connect_points_with_wire` only when routing to/from known coordinates (e.g. a label or an existing wire endpoint).
 
 ---
 
@@ -433,23 +430,13 @@ All label tools write `.kicad_sch.bak` before saving.
 
 ---
 
-### 3.5 Wire and Junction Tools
+### 3.5 Wire Tools
 
 All tools in this group write `.kicad_sch.bak` before saving.
 
-#### `add_wire_to_schematic(schematic_path, start_x, start_y, end_x, end_y, add_junction_start=False, add_junction_end=False)`
-
-**Purpose:** Draws a wire segment using orthogonal routing. Set `add_junction_start` or `add_junction_end` to `True` when an endpoint lands in the middle of an existing wire (T-junction).
-
-**Key parameters:** All coordinates in mm (`float`).
-
-**Success response:** `{"success": true, "wire": {"start": {...}, "end": {...}}, "junctions_added": [...]}`
-
----
-
 #### `connect_pins_with_wire(schematic_path, from_ref, from_pin, to_ref, to_pin)`
 
-**Purpose:** Resolves pin schematic positions automatically (accounting for placement and rotation), then routes a smart orthogonal wire between them. Automatically places junction dots when either endpoint is already wired. Preferred over `add_wire_to_schematic` for pin-to-pin connections.
+**Purpose:** Resolves pin schematic positions automatically (accounting for placement and rotation), then routes a smart orthogonal wire between them. Automatically places junction dots when either endpoint is already wired. Preferred for pin-to-pin connections.
 
 **Key parameters:**
 - `from_ref` / `to_ref` (`str`) — reference designators.
@@ -459,31 +446,22 @@ All tools in this group write `.kicad_sch.bak` before saving.
 
 ---
 
+#### `connect_points_with_wire(schematic_path, start_x, start_y, end_x, end_y)`
+
+**Purpose:** Routes a smart orthogonal wire between two raw schematic coordinates. Use it when the endpoints are known bare coordinates (e.g. a net label position or an existing wire tip); when both endpoints are symbol pins, prefer `connect_pins_with_wire`, which resolves pin positions itself.
+
+Routing is orthogonal (horizontal-vertical). If an endpoint lies on the interior of an existing wire, a junction is placed there and that wire is split at the endpoint, so KiCad ≥ 10 keeps the junction on reload; an endpoint that coincides with an existing wire endpoint or an already-wired pin also gets a junction automatically.
+
+**Key parameters:**
+- `start_x` / `start_y` / `end_x` / `end_y` (`float`) — mm in KiCad screen convention (**+Y is down**); align to the 1.27 mm grid.
+
+**Success response:** `{"success": true, "wire": {"start": {x, y}, "end": {x, y}}, "junctions_added": [...]}`
+
+---
+
 #### `delete_wire_from_schematic(schematic_path, start_x, start_y, end_x, end_y)`
 
 **Purpose:** Removes a wire segment whose start and end coordinates match the given values (within floating-point tolerance). Use `extract_schematic_netlist` with `include_wire_topology=True` to obtain exact wire coordinates before calling.
-
----
-
-#### `add_junction_to_schematic(schematic_path, x, y)`
-
-**Purpose:** Places a junction dot at a specific coordinate. Required at T-intersections where three or more wires meet.
-
-**Success response:** `{"success": true, "junction": {"x": ..., "y": ...}}`
-
----
-
-#### `list_junctions_in_schematic(schematic_path)`
-
-**Purpose:** Returns all existing junction positions. Use to avoid placing duplicate junctions.
-
-**Success response:** `{"success": true, "junctions": [{"x": ..., "y": ...}, ...]}`
-
----
-
-#### `delete_junction_from_schematic(schematic_path, x, y)`
-
-**Purpose:** Removes a junction at the given coordinate.
 
 ---
 
@@ -493,15 +471,15 @@ All tools in this group write `.kicad_sch.bak` before saving.
 |---|---|---|
 | All MCP resources (`kicad://...`) | Resources are not part of the tool-only plugin profile | Post-milestone-1 |
 | All MCP prompts | Prompts assume a standalone MCP client (e.g. Claude Desktop) | Post-milestone-1 |
-| `list_projects`, `get_project_structure` | Plugin provides active-project context directly | Review after initial plugin is stable |
+| `list_projects` | Plugin provides active-project context directly; the profile exposes `get_project_structure` instead (see README) | Review after initial plugin is stable |
 | `open_project` | KiCad plugin manages project opening directly | Not applicable |
-| `get_drc_history`, `run_drc_check` | `kicad-cli` dependency; not skip-based | Separate milestone after `kicad-cli` removal |
+| `get_drc_history` | Tool removed; DRC history is not exposed in the plugin profile | Not planned |
 | `generate_pcb_thumbnail`, `generate_thumbnail_with_cli` | `kicad-cli` dependency | Separate milestone |
 | `get_bom`, `export_bom_csv` | `kicad-cli` dependency | Separate milestone |
 | All pattern tools (`pattern_tools.py`) | Not needed for direct editing workflows | Optional future addition |
 | `validate_project` | Superseded by netlist inspection tools for editing validation | Review later |
-| `validate_project_boundaries`, `generate_validation_report` | `kicad-cli` dependency | Separate milestone |
-| PCB edit tools | Planned for future milestone; see `docs/plugin/pcb_feasibility.md` | Future |
+| `validate_project_boundaries`, `generate_validation_report` | Module never registered (`server.py` does not import `validation_tools`); wire-up or delete tracked separately | Under review |
+| PCB edit / query / routing / zone / group tools | Shipped in later milestones; see README *Available Tools* | Shipped |
 
 ---
 

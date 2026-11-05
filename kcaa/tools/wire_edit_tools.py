@@ -1,7 +1,8 @@
-"""Wire and junction editing tools for KiCad MCP server.
+"""Wire editing tools for KiCad MCP server.
 
-Provides tools to draw, list, and delete wire segments and junction dots
-in KiCad schematics using the skip library.
+Provides tools to draw and delete wire segments in KiCad schematics using
+the skip library.  Junctions have no standalone tools; the wire tools place
+them automatically where connectivity requires.
 """
 
 from collections.abc import Sequence
@@ -1635,7 +1636,7 @@ def _add_junction_and_split(sch: Any, px: float, py: float, tol: float = 0.01) -
 
 
 def register_wire_edit_tools(mcp: FastMCP) -> None:
-    """Register all wire and junction editing tools with the MCP server."""
+    """Register all wire editing tools with the MCP server."""
 
     @mcp.tool()
     async def connect_points_with_wire(
@@ -1651,8 +1652,7 @@ def register_wire_edit_tools(mcp: FastMCP) -> None:
         Use this when endpoints are known bare coordinates (e.g. a net label
         position or an existing wire tip).  When both endpoints are symbol
         pins, prefer ``connect_pins_with_wire`` — it resolves pin coordinates
-        automatically.  If this tool fails, fall back to
-        ``add_wire_to_schematic`` (horizontal/vertical only).
+        automatically.
 
         Routing is orthogonal (horizontal-vertical). Coordinates are mm in
         KiCad screen convention (**+Y is down**); align to the 1.27 mm grid.
