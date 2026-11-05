@@ -3168,6 +3168,945 @@ class TestStreaming:
         assert call_kwargs.kwargs.get("on_stream_event") is on_event
 
 
+class TestToolCallArgumentsNormalization:
+    """Tool-call ``arguments`` must reach the client as JSON strings.
+
+    Ollama's native /api/chat encodes them as JSON objects while OpenAI
+    encodes them as serialized strings; both shapes must normalise so the
+    downstream ``json.loads(arguments or "{}")`` never receives a dict (#232).
+    """
+
+    def _make_line_response(self, lines):
+        """Return a mock response object that yields one line per readline()."""
+        data = [line.encode("utf-8") + b"\n" for line in lines] + [b""]
+        obj = MagicMock()
+        obj.readline.side_effect = data
+        obj.__enter__ = lambda s: s
+        obj.__exit__ = MagicMock(return_value=False)
+        return obj
+
+    def _stream_ollama(self, client, lines):
+        mock_resp = self._make_line_response(lines)
+        with patch("urllib.request.urlopen", return_value=mock_resp):
+            return client._stream_ollama("sys", [], on_stream_event=lambda evt: None)
+
+    def test_stream_ollama_object_arguments_become_json_string(self):
+        """Issue #232: the tool call that ends an Ollama stream carries a dict."""
+        client = _make_client()
+        client._settings.llm_provider = "ollama"
+        lines = [
+            '{"message":{"role":"assistant","content":"","tool_calls":'
+            '[{"index":0,"function":{"name":"get_board_info",'
+            '"arguments":{"detail":"full"}}}]},"done":false}',
+            '{"done":true,"done_reason":"stop"}',
+        ]
+
+        result = self._stream_ollama(client, lines)
+
+        assert "error" not in result, result.get("error")
+        tc = result["message"]["tool_calls"][0]
+        assert isinstance(tc["function"]["arguments"], str)
+        assert json.loads(tc["function"]["arguments"]) == {"detail": "full"}
+        assert tc["id"] == ""
+        assert result["finish_reason"] == "stop"
+
+    def test_stream_ollama_string_argument_fragments_still_concatenate(self):
+        """The string-delta path (OpenAI-style) must keep concatenating."""
+        client = _make_client()
+        client._settings.llm_provider = "ollama"
+        lines = [
+            '{"message":{"role":"assistant","content":"","tool_calls":'
+            '[{"index":0,"function":{"name":"add_wire","arguments":"{\\"a\\":"}}]},"done":false}',
+            '{"message":{"role":"assistant","content":"","tool_calls":'
+            '[{"index":0,"function":{"arguments":"1}"}}]},"done":false}',
+            '{"done":true,"done_reason":"tool_calls"}',
+        ]
+
+        result = self._stream_ollama(client, lines)
+
+        assert "error" not in result, result.get("error")
+        assert result["message"]["tool_calls"][0]["function"]["arguments"] == '{"a":1}'
+        assert result["finish_reason"] == "tool_calls"
+
+    def test_call_ollama_normalizes_object_arguments(self):
+        """The non-streaming path returns the raw Ollama message; its tool
+        calls must be normalised before the caller parses them."""
+        client = _make_client()
+        client._settings.llm_provider = "ollama"
+        body = {
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"function": {"name": "get_board_info", "arguments": {"detail": "full"}}}
+                ],
+            },
+            "done_reason": "tool_calls",
+        }
+        with patch(
+            "kicad_plugin.llm_client._https_post_json",
+            return_value=(200, json.dumps(body)),
+        ):
+            result = client._call_ollama("sys", [])
+
+        assert "error" not in result
+        assert result["finish_reason"] == "tool_calls"
+        arguments = result["message"]["tool_calls"][0]["function"]["arguments"]
+        assert isinstance(arguments, str)
+        assert json.loads(arguments) == {"detail": "full"}
+
+    def test_call_openai_normalizes_object_arguments(self):
+        """Ollama's OpenAI-compatible endpoint (/v1/chat/completions) also
+        returns arguments as an object on the non-streaming path."""
+        client = _make_client()
+        client._settings.llm_base_url = "http://127.0.0.1:11434/v1"
+        body = {
+            "choices": [
+                {
+                    "finish_reason": "tool_calls",
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "tc1",
+                                "type": "function",
+                                "function": {
+                                    "name": "get_board_info",
+                                    "arguments": {"detail": "full"},
+                                },
+                            }
+                        ],
+                    },
+                }
+            ]
+        }
+        with patch(
+            "kicad_plugin.llm_client._https_post_json",
+            return_value=(200, json.dumps(body)),
+        ):
+            result = client._call_openai("sys", [])
+
+        assert "error" not in result, result.get("error")
+        assert result["finish_reason"] == "tool_calls"
+        assert result["message"]["content"] == ""
+        arguments = result["message"]["tool_calls"][0]["function"]["arguments"]
+        assert isinstance(arguments, str)
+        assert json.loads(arguments) == {"detail": "full"}
+
+    def test_stream_openai_object_arguments_become_json_string(self):
+        """Local OpenAI-compatible endpoints (Ollama /v1, LM Studio,
+        llama.cpp) can also send arguments as an object."""
+        client = _make_client()
+        sse_lines = [
+            'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"tc1",'
+            '"function":{"name":"get_board_info","arguments":{"detail":"full"}}}]},'
+            '"finish_reason":null}]}',
+            'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}',
+            "data: [DONE]",
+        ]
+        mock_resp = self._make_line_response(sse_lines)
+        with patch("urllib.request.urlopen", return_value=mock_resp):
+            result = client._stream_openai("sys", [], on_stream_event=lambda evt: None)
+
+        assert "error" not in result, result.get("error")
+        tc = result["message"]["tool_calls"][0]
+        assert tc["id"] == "tc1"
+        assert isinstance(tc["function"]["arguments"], str)
+        assert json.loads(tc["function"]["arguments"]) == {"detail": "full"}
+
+    def test_stream_ollama_ignores_non_string_content(self):
+        """Content blocks (list/dict) from compatible endpoints must not break
+        ``"".join`` nor be JSON-pasted into the chat text."""
+        client = _make_client()
+        client._settings.llm_provider = "ollama"
+        lines = [
+            '{"message":{"role":"assistant","content":[{"type":"text","text":"hi"}]},"done":false}',
+            '{"message":{"role":"assistant","content":{"text":"x"}},"done":false}',
+            '{"message":{"role":"assistant","content":"Plan: check the board."},"done":false}',
+            '{"done":true,"done_reason":"stop"}',
+        ]
+
+        # kicad_plugin loggers do not propagate to the root (plugin logging
+        # sets propagate=False), so caplog never sees them — attach a capture
+        # handler straight to the module logger instead.
+        warnings: list[str] = []
+        handler = logging.Handler()
+        handler.emit = lambda record: warnings.append(record.getMessage())  # type: ignore[method-assign]
+        logger = logging.getLogger("kicad_plugin.llm_client")
+        logger.addHandler(handler)
+        try:
+            result = self._stream_ollama(client, lines)
+        finally:
+            logger.removeHandler(handler)
+
+        assert "error" not in result, result.get("error")
+        assert result["message"]["content"] == "Plan: check the board."
+        assert result["finish_reason"] == "stop"
+        assert sum("non-string content" in w for w in warnings) == 2
+
+    def test_stream_ollama_skips_non_dict_message(self):
+        """An /api/generate-style or truncated chunk must be skipped."""
+        client = _make_client()
+        client._settings.llm_provider = "ollama"
+        lines = [
+            '{"message": "oops", "done": false}',
+            '{"done": true, "done_reason": "stop"}',
+        ]
+
+        result = self._stream_ollama(client, lines)
+
+        assert "error" not in result, result.get("error")
+        assert result["message"]["content"] == ""
+        assert result["finish_reason"] == "stop"
+
+    # ---- Ollama outbound arguments must be objects -------------------------
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            ("[1,2]", {}),
+            ([1, 2], {}),
+            ('"s"', {}),
+            ("5", {}),
+            ("", {}),
+            (None, {}),
+            ("{not json", {}),
+            ('{"a": 1}', {"a": 1}),
+            ({"a": 1}, {"a": 1}),
+        ],
+    )
+    def test_to_ollama_tool_arguments_accepts_only_objects(self, value, expected):
+        """Ollama's native API only accepts JSON objects; a JSON array,
+        scalar, or junk must collapse to ``{}`` instead of being forwarded."""
+        assert llm_client._to_ollama_tool_arguments(value) == expected
+
+    def test_ollama_outbound_list_arguments_become_empty_object(self):
+        """A history entry holding ``[1,2]`` must not reach Ollama as a list
+        (its API rejects it with the same 400 as a string)."""
+        client = _make_client()
+        client._history = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tc1",
+                        "type": "function",
+                        "function": {"name": "list_tracks", "arguments": "[1,2]"},
+                    }
+                ],
+            }
+        ]
+
+        outbound = client._ollama_messages()[0]
+
+        assert outbound["tool_calls"][0]["function"]["arguments"] == {}
+        assert client._history[0]["tool_calls"][0]["function"]["arguments"] == "[1,2]"
+
+    def test_build_anthropic_messages_list_arguments_become_empty_object(self):
+        """Anthropic requires ``input`` to be an object; a JSON array in
+        history must fall back to ``{}``."""
+        client = _make_client()
+        client._history = [
+            {"role": "user", "content": "which tracks?"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tc1",
+                        "type": "function",
+                        "function": {"name": "list_tracks", "arguments": "[1,2]"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "tc1", "content": "[]"},
+        ]
+
+        messages = client._build_anthropic_messages()
+
+        assistant = next(m for m in messages if m["role"] == "assistant")
+        assert assistant["content"][0]["input"] == {}
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            ({"a": 1}, {"a": 1}),
+            ([1, 2], {}),
+            (5, {}),
+            ("", {}),
+            ("{not json", {}),
+            ('{"a":1}', {"a": 1}),
+            ("[1,2]", {}),
+        ],
+    )
+    def test_anthropic_tool_input_accepts_any_arguments_shape(self, value, expected):
+        """Restored session history can hold a non-string ``arguments``
+        (``_validate_history`` does not check it); ``input`` must degrade to
+        ``{}`` for anything that is not a JSON object, never raise the
+        ``TypeError`` json.loads raises for a dict/list/int."""
+        assert llm_client._anthropic_tool_input(value) == expected
+
+    # ---- Ollama native API round trip (P1) ---------------------------------
+
+    def test_ollama_outbound_history_arguments_are_objects(self):
+        """P1: Ollama's native /api/chat rejects string arguments with
+        ``400 Value looks like object, but can't find closing '}' symbol``,
+        so a normalized history entry must be decoded back to an object while
+        history itself keeps the internal string form."""
+        client = _make_client()
+        client._settings.llm_provider = "ollama"
+        lines = [
+            '{"message":{"role":"assistant","content":"","tool_calls":'
+            '[{"index":0,"function":{"name":"get_board_info",'
+            '"arguments":{"detail":"full"}}}]},"done":false}',
+            '{"done":true,"done_reason":"tool_calls"}',
+        ]
+        streamed = self._stream_ollama(client, lines)
+        assert "error" not in streamed, streamed.get("error")
+
+        history_message = dict(streamed["message"], role="assistant")
+        client._history = [{"role": "user", "content": "board?"}, history_message]
+
+        outbound = client._ollama_messages()[-1]
+        arguments = outbound["tool_calls"][0]["function"]["arguments"]
+        assert isinstance(arguments, dict)
+        assert arguments == {"detail": "full"}
+        assert outbound["tool_calls"][0]["function"]["name"] == "get_board_info"
+
+        # The internal representation and the caller's object stay untouched.
+        assert isinstance(history_message["tool_calls"][0]["function"]["arguments"], str)
+        assert client._history[-1] is history_message
+        assert isinstance(
+            client._history[-1]["tool_calls"][0]["function"]["arguments"],
+            str,
+        )
+
+    def test_ollama_outbound_empty_or_broken_arguments_become_objects(self):
+        """``""`` (no-argument tool call), ``None`` and unparseable strings
+        must reach Ollama as ``{}`` instead of raising."""
+        client = _make_client()
+        client._history = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "a", "type": "function", "function": {"name": "t1", "arguments": ""}},
+                    {"id": "b", "type": "function", "function": {"name": "t2", "arguments": None}},
+                    {
+                        "id": "c",
+                        "type": "function",
+                        "function": {"name": "t3", "arguments": "{not json"},
+                    },
+                ],
+            }
+        ]
+
+        outbound = client._ollama_messages()[0]
+
+        assert [tc["function"]["arguments"] for tc in outbound["tool_calls"]] == [{}, {}, {}]
+        assert client._history[0]["tool_calls"][2]["function"]["arguments"] == "{not json"
+
+    def test_ollama_second_round_request_body_uses_object_arguments(self):
+        """P1 end-to-end: the JSON actually POSTed on the follow-up turn must
+        carry ``arguments`` as an object."""
+        client = _make_client()
+        client._settings.llm_provider = "ollama"
+        client._history = [
+            {"role": "user", "content": "board?"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "",
+                        "type": "function",
+                        "function": {
+                            "name": "get_board_info",
+                            "arguments": '{"detail": "full"}',
+                        },
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "", "content": "{}"},
+        ]
+        captured: dict[str, object] = {}
+        mock_resp = self._make_line_response(['{"done":true,"done_reason":"stop"}'])
+
+        def _fake_urlopen(req, timeout, **kwargs):
+            captured["body"] = json.loads(req.data.decode())
+            return mock_resp
+
+        with patch("kicad_plugin.llm_client._urlopen", side_effect=_fake_urlopen):
+            result = client._stream_ollama("sys", [], on_stream_event=lambda evt: None)
+
+        assert "error" not in result, result.get("error")
+        sent = next(m for m in captured["body"]["messages"] if m.get("role") == "assistant")
+        assert sent["tool_calls"][0]["function"]["arguments"] == {"detail": "full"}
+
+    def test_stream_ollama_http_error_includes_body(self):
+        """A rejected second-round payload (HTTP 400) must show the provider's
+        body, not a bare status code."""
+        client = _make_client()
+        client._settings.llm_provider = "ollama"
+        err = urllib.error.HTTPError(
+            "http://127.0.0.1:11434/api/chat",
+            400,
+            "Bad Request",
+            {},
+            io.BytesIO(
+                b'{"error":"Value looks like object, but can\'t find closing \'}\' symbol"}'
+            ),
+        )
+        with patch("urllib.request.urlopen", side_effect=err):
+            result = client._stream_ollama("sys", [], on_stream_event=lambda evt: None)
+
+        assert result["error"].startswith("Ollama request failed: HTTP 400:")
+        assert "Value looks like object" in result["error"]
+
+    # ---- Remaining covered contracts (P2) ----------------------------------
+
+    def test_stream_openai_relay_serializes_object_arguments(self):
+        """P2-1: ``_in_process_ssl`` is sticky, so a loopback Ollama /v1 URL is
+        relayed through the subprocess script once SSL failed earlier.  That
+        script has its own accumulator and must serialize objects too."""
+        lines = [
+            'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"tc1",'
+            '"function":{"name":"get_board_info","arguments":{"detail":"full"}}}]},'
+            '"finish_reason":null}]}',
+            'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}',
+            "data: [DONE]",
+        ]
+        server = _SSETestServer(lines)
+        client = _make_client()
+        client._settings.llm_base_url = server.url
+        try:
+            with (
+                patch.object(llm_client, "_in_process_ssl", False),
+                patch(
+                    "kicad_plugin.llm_client._resolve_plugin_python",
+                    return_value=sys.executable,
+                ),
+                patch(
+                    "kicad_plugin.llm_client._subprocess_env",
+                    return_value={"PATH": os.environ.get("PATH", "")},
+                ),
+            ):
+                result = client._stream_openai("sys", [], on_stream_event=lambda evt: None)
+        finally:
+            server.shutdown()
+
+        assert "error" not in result, result.get("error")
+        tc = result["message"]["tool_calls"][0]
+        assert tc["id"] == "tc1"
+        assert isinstance(tc["function"]["arguments"], str)
+        assert json.loads(tc["function"]["arguments"]) == {"detail": "full"}
+
+    def test_build_anthropic_messages_empty_arguments(self):
+        """P2-2: a no-argument tool call normalizes to ``""``; the Anthropic
+        history builder must fall back to ``{}`` instead of raising."""
+        client = _make_client()
+        client._history = [
+            {"role": "user", "content": "which tracks?"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tc1",
+                        "type": "function",
+                        "function": {"name": "list_tracks", "arguments": ""},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "tc1", "content": "[]"},
+        ]
+
+        messages = client._build_anthropic_messages()
+
+        assistant = next(m for m in messages if m["role"] == "assistant")
+        assert assistant["content"][0]["type"] == "tool_use"
+        assert assistant["content"][0]["input"] == {}
+
+    def test_normalize_tool_calls_copies_instead_of_mutating(self):
+        """P2-3: the helper must not rewrite the caller's response body."""
+        original = [
+            {
+                "id": "tc1",
+                "type": "function",
+                "function": {"name": "get_board_info", "arguments": {"detail": "full"}},
+            }
+        ]
+
+        normalized = llm_client._normalize_tool_calls(original)
+
+        assert normalized[0]["function"]["arguments"] == '{"detail": "full"}'
+        assert isinstance(original[0]["function"]["arguments"], dict)
+        assert original[0]["function"]["arguments"] == {"detail": "full"}
+        assert normalized[0] is not original[0]
+        assert normalized[0]["function"] is not original[0]["function"]
+
+
+class TestToolCallSlotRouting:
+    """Issue #234: a provider may return several tool calls in one message
+    with no ``index`` on any of them.  An index is only a merge key; a
+    nameless index-less delta is an argument fragment of the previous call."""
+
+    def _make_line_response(self, lines):
+        data = [line.encode("utf-8") + b"\n" for line in lines] + [b""]
+        obj = MagicMock()
+        obj.readline.side_effect = data
+        obj.__enter__ = lambda s: s
+        obj.__exit__ = MagicMock(return_value=False)
+        return obj
+
+    def _stream_ollama(self, client, lines):
+        mock_resp = self._make_line_response(lines)
+        with patch("urllib.request.urlopen", return_value=mock_resp):
+            return client._stream_ollama("sys", [], on_stream_event=lambda evt: None)
+
+    def test_stream_ollama_indexless_parallel_calls_get_separate_slots(self):
+        """Ollama returns the whole tool_calls array in one message and omits
+        ``index`` entirely: four calls must not collapse into slot 0."""
+        client = _make_client()
+        client._settings.llm_provider = "ollama"
+        chunk = json.dumps(
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {"function": {"name": "get_board_info", "arguments": {"detail": "full"}}},
+                        {"function": {"name": "list_footprints", "arguments": {"layer": "F.Cu"}}},
+                        {"function": {"name": "list_tracks", "arguments": {"net": "GND"}}},
+                        {
+                            "function": {
+                                "name": "extract_schematic_netlist",
+                                "arguments": {"format": "json"},
+                            }
+                        },
+                    ],
+                },
+                "done": False,
+            }
+        )
+        lines = [chunk, '{"done":true,"done_reason":"tool_calls"}']
+
+        result = self._stream_ollama(client, lines)
+
+        assert "error" not in result, result.get("error")
+        tcs = result["message"]["tool_calls"]
+        assert [tc["function"]["name"] for tc in tcs] == [
+            "get_board_info",
+            "list_footprints",
+            "list_tracks",
+            "extract_schematic_netlist",
+        ]
+        assert [json.loads(tc["function"]["arguments"]) for tc in tcs] == [
+            {"detail": "full"},
+            {"layer": "F.Cu"},
+            {"net": "GND"},
+            {"format": "json"},
+        ]
+
+    def test_stream_ollama_real_wire_shape_keeps_parallel_calls_apart(self):
+        """Replay of an Ollama 0.30.5 capture: one complete call per chunk,
+        ``index`` nested in ``function``, ``arguments`` an object."""
+        client = _make_client()
+        client._settings.llm_provider = "ollama"
+        chunk_a = {
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_a",
+                        "function": {
+                            "index": 0,
+                            "name": "get_board_info",
+                            "arguments": {"detail": "full"},
+                        },
+                    }
+                ],
+            },
+            "done": False,
+        }
+        chunk_b = {
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_b",
+                        "function": {
+                            "index": 1,
+                            "name": "list_footprints",
+                            "arguments": {},
+                        },
+                    }
+                ],
+            },
+            "done": False,
+        }
+        lines = [json.dumps(chunk_a), json.dumps(chunk_b), '{"done":true}']
+
+        result = self._stream_ollama(client, lines)
+
+        assert "error" not in result, result.get("error")
+        tcs = result["message"]["tool_calls"]
+        assert [tc["id"] for tc in tcs] == ["call_a", "call_b"]
+        assert [tc["function"]["name"] for tc in tcs] == ["get_board_info", "list_footprints"]
+        assert [json.loads(tc["function"]["arguments"] or "{}") for tc in tcs] == [
+            {"detail": "full"},
+            {},
+        ]
+
+    def test_tool_call_slot_prefers_nested_function_index(self):
+        """Ollama nests the provider index in ``function``; a nameless delta
+        carrying it must join that call instead of the previously routed
+        slot, while a top-level ``index`` keeps its OpenAI behaviour."""
+        slots = {0: {"function": {"name": "get_board_info", "arguments": ""}}}
+
+        nested = llm_client._tool_call_slot(
+            slots, {"function": {"index": 1, "arguments": '{"a":'}}, 1, 0
+        )
+        assert nested == (1, 2, 1)
+
+        top_level = llm_client._tool_call_slot(
+            slots, {"index": 0, "function": {"arguments": "{}"}}, 1, 1
+        )
+        assert top_level == (0, 1, 0)
+
+    @pytest.mark.parametrize("provider_index", [1, 5])
+    def test_stream_ollama_mixed_indices_keep_wire_order(self, provider_index):
+        """A derived slot must be allocated after the highest provider index;
+        otherwise ``sorted()`` replays a mixed stream out of order."""
+        first_name = "second_on_wire"
+        client = _make_client()
+        client._settings.llm_provider = "ollama"
+        indexed = json.dumps(
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "function": {
+                                "index": provider_index,
+                                "name": first_name,
+                                "arguments": {"x": 1},
+                            }
+                        }
+                    ],
+                },
+                "done": False,
+            }
+        )
+        indexless = json.dumps(
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{"function": {"name": "third_on_wire", "arguments": {"x": 2}}}],
+                },
+                "done": False,
+            }
+        )
+        lines = [indexed, indexless, '{"done":true,"done_reason":"tool_calls"}']
+
+        result = self._stream_ollama(client, lines)
+
+        assert "error" not in result, result.get("error")
+        assert [tc["function"]["name"] for tc in result["message"]["tool_calls"]] == [
+            first_name,
+            "third_on_wire",
+        ]
+
+    def test_stream_ollama_derived_slot_stays_above_highest_index(self):
+        """``_tool_call_slot`` must advance to the highest index seen, not the
+        last one: slots 5 then 1 leave the index-less call in 6, not 2."""
+        client = _make_client()
+        client._settings.llm_provider = "ollama"
+
+        def _chunk(name, index=None, call_id=""):
+            function: dict[str, object] = {"name": name, "arguments": {"x": 1}}
+            if index is not None:
+                function["index"] = index
+            return json.dumps(
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [{"id": call_id, "function": function}],
+                    },
+                    "done": False,
+                }
+            )
+
+        lines = [
+            _chunk("first@5", 5, "a"),
+            _chunk("first@1", 1, "b"),
+            _chunk("derived@6", None, "c"),
+            '{"done":true,"done_reason":"tool_calls"}',
+        ]
+
+        result = self._stream_ollama(client, lines)
+
+        assert "error" not in result, result.get("error")
+        assert [tc["function"]["name"] for tc in result["message"]["tool_calls"]] == [
+            "first@1",
+            "first@5",
+            "derived@6",
+        ]
+
+    def test_stream_ollama_reversed_nested_indices_keep_provider_order(self):
+        """The provider index, not the arrival order, defines the call order —
+        a name-based fallback would emit these two chunks reversed."""
+        client = _make_client()
+        client._settings.llm_provider = "ollama"
+        chunk_second = json.dumps(
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_second",
+                            "function": {
+                                "index": 1,
+                                "name": "second_on_index",
+                                "arguments": {"y": 2},
+                            },
+                        }
+                    ],
+                },
+                "done": False,
+            }
+        )
+        chunk_first = json.dumps(
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_first",
+                            "function": {
+                                "index": 0,
+                                "name": "first_on_index",
+                                "arguments": {"x": 1},
+                            },
+                        }
+                    ],
+                },
+                "done": False,
+            }
+        )
+        lines = [chunk_second, chunk_first, '{"done":true}']
+
+        result = self._stream_ollama(client, lines)
+
+        assert "error" not in result, result.get("error")
+        tcs = result["message"]["tool_calls"]
+        assert [tc["id"] for tc in tcs] == ["call_first", "call_second"]
+        assert [tc["function"]["name"] for tc in tcs] == [
+            "first_on_index",
+            "second_on_index",
+        ]
+
+    def test_stream_ollama_indexless_argument_fragment_continues_last_slot(self):
+        """A nameless index-less delta is a fragment of the call opened by the
+        previous chunk — it must not start a new slot."""
+        client = _make_client()
+        client._settings.llm_provider = "ollama"
+        lines = [
+            json.dumps(
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [{"function": {"name": "add_wire", "arguments": '{"a":'}}],
+                    },
+                    "done": False,
+                }
+            ),
+            json.dumps(
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [{"function": {"arguments": "1}"}}],
+                    },
+                    "done": False,
+                }
+            ),
+            '{"done":true,"done_reason":"tool_calls"}',
+        ]
+
+        result = self._stream_ollama(client, lines)
+
+        assert "error" not in result, result.get("error")
+        tcs = result["message"]["tool_calls"]
+        assert len(tcs) == 1
+        assert tcs[0]["function"]["name"] == "add_wire"
+        assert tcs[0]["function"]["arguments"] == '{"a":1}'
+
+    def test_stream_openai_indexless_parallel_calls_get_separate_slots(self):
+        """The in-process OpenAI-compatible parser has the same contract."""
+        client = _make_client()
+        sse_lines = [
+            'data: {"choices":[{"delta":{"tool_calls":['
+            '{"id":"a","function":{"name":"get_board_info","arguments":{}}},'
+            '{"id":"b","function":{"name":"list_footprints","arguments":{}}}]},'
+            '"finish_reason":null}]}',
+            'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}',
+            "data: [DONE]",
+        ]
+        mock_resp = self._make_line_response(sse_lines)
+        with patch("urllib.request.urlopen", return_value=mock_resp):
+            result = client._stream_openai("sys", [], on_stream_event=lambda evt: None)
+
+        assert "error" not in result, result.get("error")
+        tcs = result["message"]["tool_calls"]
+        assert [tc["function"]["name"] for tc in tcs] == [
+            "get_board_info",
+            "list_footprints",
+        ]
+        assert [tc["id"] for tc in tcs] == ["a", "b"]
+
+    def _stream_openai_via_relay(self, sse_lines):
+        server = _SSETestServer(sse_lines)
+        client = _make_client()
+        client._settings.llm_base_url = server.url
+        try:
+            with (
+                patch.object(llm_client, "_in_process_ssl", False),
+                patch(
+                    "kicad_plugin.llm_client._resolve_plugin_python",
+                    return_value=sys.executable,
+                ),
+                patch(
+                    "kicad_plugin.llm_client._subprocess_env",
+                    return_value={"PATH": os.environ.get("PATH", "")},
+                ),
+            ):
+                return client._stream_openai("sys", [], on_stream_event=lambda evt: None)
+        finally:
+            server.shutdown()
+
+    def test_relay_indexless_parallel_calls_get_separate_slots(self):
+        """The subprocess relay script keeps its own accumulator and must
+        route index-less calls the same way."""
+        sse_lines = [
+            'data: {"choices":[{"delta":{"tool_calls":['
+            '{"id":"a","function":{"name":"get_board_info","arguments":{}}},'
+            '{"id":"b","function":{"name":"list_footprints","arguments":{}}}]},'
+            '"finish_reason":null}]}',
+            'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}',
+            "data: [DONE]",
+        ]
+
+        result = self._stream_openai_via_relay(sse_lines)
+
+        assert "error" not in result, result.get("error")
+        tcs = result["message"]["tool_calls"]
+        assert [tc["function"]["name"] for tc in tcs] == [
+            "get_board_info",
+            "list_footprints",
+        ]
+
+    def test_relay_honours_nested_function_index(self):
+        """The relay copy must read Ollama's nested ``function.index`` exactly
+        like the in-process parser; the name fallback would emit these two
+        chunks in arrival order instead of provider order."""
+        sse_lines = [
+            'data: {"choices":[{"delta":{"tool_calls":['
+            '{"id":"second","function":{"index":1,"name":"second_on_index",'
+            '"arguments":{"y":2}}},'
+            '{"id":"first","function":{"index":0,"name":"first_on_index",'
+            '"arguments":{"x":1}}}]},"finish_reason":null}]}',
+            'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}',
+            "data: [DONE]",
+        ]
+
+        result = self._stream_openai_via_relay(sse_lines)
+
+        assert "error" not in result, result.get("error")
+        tcs = result["message"]["tool_calls"]
+        assert [tc["id"] for tc in tcs] == ["first", "second"]
+        assert [tc["function"]["name"] for tc in tcs] == [
+            "first_on_index",
+            "second_on_index",
+        ]
+
+    def test_relay_mixed_indices_keep_wire_order(self):
+        """The relay must derive slots above a provider's explicit index;
+        otherwise a mixed stream is replayed out of wire order once
+        ``sorted()`` orders slots instead of arrival."""
+        sse_lines = [
+            'data: {"choices":[{"delta":{"tool_calls":[{"index":5,"id":"a",'
+            '"function":{"name":"first_wire","arguments":{"x":1}}}]},'
+            '"finish_reason":null}]}',
+            'data: {"choices":[{"delta":{"tool_calls":[{"id":"b",'
+            '"function":{"name":"second_wire","arguments":{"y":2}}}]},'
+            '"finish_reason":null}]}',
+            'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}',
+            "data: [DONE]",
+        ]
+
+        result = self._stream_openai_via_relay(sse_lines)
+
+        assert "error" not in result, result.get("error")
+        tcs = result["message"]["tool_calls"]
+        assert [tc["function"]["name"] for tc in tcs] == ["first_wire", "second_wire"]
+
+    def test_relay_derived_slot_stays_above_highest_index(self):
+        """The derived slot must clear the *highest* index seen, not the last
+        one: with slots 5 then 1, the index-less call belongs in 6, not 2."""
+        sse_lines = [
+            'data: {"choices":[{"delta":{"tool_calls":[{"index":5,"id":"a",'
+            '"function":{"name":"first@5","arguments":{}}}]},"finish_reason":null}]}',
+            'data: {"choices":[{"delta":{"tool_calls":[{"index":1,"id":"b",'
+            '"function":{"name":"first@1","arguments":{}}}]},"finish_reason":null}]}',
+            'data: {"choices":[{"delta":{"tool_calls":[{"id":"c",'
+            '"function":{"name":"derived@6","arguments":{}}}]},"finish_reason":null}]}',
+            'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}',
+            "data: [DONE]",
+        ]
+
+        result = self._stream_openai_via_relay(sse_lines)
+
+        assert "error" not in result, result.get("error")
+        assert [tc["function"]["name"] for tc in result["message"]["tool_calls"]] == [
+            "first@1",
+            "first@5",
+            "derived@6",
+        ]
+
+    def test_relay_nameless_fragment_follows_negative_index(self):
+        """Parity with ``_tool_call_slot``: a negative provider index is a real
+        slot, not the relay's old "no slot yet" sentinel, so the fragment
+        joins it instead of opening slot 0."""
+        sse_lines = [
+            'data: {"choices":[{"delta":{"tool_calls":[{"index":-1,"function":'
+            '{"name":"neg","arguments":"{\\"x\\":"}}]},'
+            '"finish_reason":null}]}',
+            'data: {"choices":[{"delta":{"tool_calls":[{"function":'
+            '{"arguments":"1}"}}]},"finish_reason":null}]}',
+            'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}',
+            "data: [DONE]",
+        ]
+
+        result = self._stream_openai_via_relay(sse_lines)
+
+        assert "error" not in result, result.get("error")
+        tcs = result["message"]["tool_calls"]
+        assert len(tcs) == 1
+        assert tcs[0]["function"]["name"] == "neg"
+        assert tcs[0]["function"]["arguments"] == '{"x":1}'
+
+
 class TestSubprocessSSEStream:
     """End-to-end relay: _subprocess_sse_stream runs a real subprocess Python
     against a local HTTP server speaking SSE, verifying deltas, aggregation,
