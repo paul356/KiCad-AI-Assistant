@@ -587,7 +587,7 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
         Returns pad layout, courtyard bounding box, and metadata for a
         footprint identified by its library nickname and name.  To enumerate
         every footprint in a library use
-        ``get_library_footprints(library_name)``; this tool takes exactly one
+        ``list_library_footprints(library_name)``; this tool takes exactly one
         ``footprint_name``.  Always reads the .kicad_mod file directly for
         full detail.  The lookup is scoped
         to the project's global + project-local libraries; when a same-named
@@ -648,7 +648,7 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
         return info
 
     @mcp.tool()
-    async def get_library_footprints(
+    async def list_library_footprints(
         library_name: str,
         project_path: str | None = None,
         ctx: Context | None = None,

@@ -2,7 +2,7 @@
 name: pcb-footprint-library
 priority: 40
 description: "Footprint index sync, library listing, search, and inspection"
-tools: [sync_footprint_index, get_footprint_sync_status, list_footprint_libraries, get_library_footprints, search_footprints, get_footprint_details, find_footprints_not_in_libraries, create_footprint_library, add_footprints_to_library]
+tools: [sync_footprint_index, get_footprint_sync_status, list_footprint_libraries, list_library_footprints, search_footprints, get_footprint_details, find_footprints_not_in_libraries, create_footprint_library, add_footprints_to_library]
 ---
 - Build/refresh the footprint index (background) for a project:
   **sync_footprint_index(project_path?, force)** — ``project_path`` is
@@ -13,13 +13,13 @@ tools: [sync_footprint_index, get_footprint_sync_status, list_footprint_librarie
   **get_footprint_sync_status**.
 - List libraries: **list_footprint_libraries(project_path?)** — omit
   ``project_path`` for global libraries only.
-- List every footprint in one library: **get_library_footprints(library_name,
+- List every footprint in one library: **list_library_footprints(library_name,
   project_path?, max_results?, offset?)** — names plus light metadata
   (description, tags, attr, pad count, 3D model), name-ordered and pageable with
   ``max_results``/``offset`` (``next_offset`` is where the next page starts);
   use **get_footprint_details(library_name, footprint_name)** to inspect ONE
   footprint's pads/courtyard, and never pass a list of names to
-  ``get_library_footprints``.
+  ``list_library_footprints``.
 - Search footprints: **search_footprints(query, project_path?, limit)** —
   omit ``project_path`` to search global libraries only.
 - Inspect pads/courtyard of a specific footprint:
