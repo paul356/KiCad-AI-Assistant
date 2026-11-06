@@ -199,10 +199,10 @@ kcaa
 | `sync_symbol_index` | 构建或刷新符号库索引 |
 | `get_symbol_sync_status` | 查询符号索引构建进度 |
 | `get_symbol_index_stats` | 获取符号索引统计信息 |
-| `list_symbol_libraries` | 列出索引中的符号库 |
+| `list_symbol_libraries` | 列出所有符号库；`list_library_symbols` 列出单个库中的符号（按 `library_name` 指定） |
 | `search_symbols` | 全文搜索已索引的符号 |
 | `get_symbol` | 按库名和符号名查找符号 |
-| `get_library_symbols` | 获取指定库中的符号列表 |
+| `list_library_symbols` | 列出单个库中的符号（按 `library_name` 指定）；`list_symbol_libraries` 列出所有符号库 |
 | `get_symbol_pins` | 获取符号的引脚定义 |
 | `create_symbol_library` | 新建 `.kicad_sym` 符号库（全局第三方或项目级）并在库表中注册 |
 | `delete_symbol_library` | 删除空符号库（连同文件、库表条目和索引） |

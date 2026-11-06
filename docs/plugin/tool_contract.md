@@ -15,7 +15,7 @@
 | `search_symbols` | `symbol_tools` | Full-text search across all indexed symbols |
 | `get_symbol` | `symbol_tools` | Retrieve full definition and metadata for one symbol |
 | `list_symbol_libraries` | `symbol_tools` | List all known symbol libraries (names and paths) |
-| `get_library_symbols` | `symbol_tools` | List every symbol in a specific library |
+| `list_library_symbols` | `symbol_tools` | List every symbol in a specific library |
 | `get_symbol_index_stats` | `symbol_tools` | Return aggregate counts for the index |
 | `get_symbol_pins` | `symbol_tools` | Return pin list (number, name, type, direction) for one symbol |
 | `add_symbol_to_schematic` | `symbol_edit_tools` | Place a library symbol onto a schematic |
@@ -183,7 +183,7 @@ express an absolute move as a delta.
 
 ---
 
-#### `get_library_symbols(library_name, limit=50, offset=0, project_path=None)`
+#### `list_library_symbols(library_name, limit=50, offset=0, project_path=None)`
 
 **Purpose:** Lists every symbol inside a specific library. Use to browse a library after identifying it via `list_symbol_libraries`.
 

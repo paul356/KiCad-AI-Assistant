@@ -232,10 +232,10 @@ kcaa
 | `sync_symbol_index` | Build or refresh the symbol library index |
 | `get_symbol_sync_status` | Query symbol index build progress |
 | `get_symbol_index_stats` | Get statistics about the symbol index |
-| `list_symbol_libraries` | List symbol libraries from the index |
+| `list_symbol_libraries` | List all symbol libraries; `list_library_symbols` lists the symbols inside one library (keyed by `library_name`) |
 | `search_symbols` | Full-text search across indexed symbols |
 | `get_symbol` | Look up a symbol by library and name |
-| `get_library_symbols` | Return symbols in a specific library |
+| `list_library_symbols` | List the symbols inside one library, keyed by `library_name`; `list_symbol_libraries` lists all libraries |
 | `get_symbol_pins` | Get pin definitions for a symbol |
 | `create_symbol_library` | Create a new `.kicad_sym` library (global 3rd-party or project-local) and register it in the library table |
 | `delete_symbol_library` | Delete an empty symbol library (file, library-table entry, and index) |

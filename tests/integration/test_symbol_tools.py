@@ -7,7 +7,7 @@ Covers:
   - list_symbol_libraries
   - search_symbols
   - get_symbol
-  - get_library_symbols
+  - list_library_symbols
   - get_symbol_index_stats
   - get_symbol_pins
 
@@ -302,17 +302,17 @@ class TestGetSymbol:
 
 
 # ---------------------------------------------------------------------------
-# Tests: get_library_symbols
+# Tests: list_library_symbols
 # ---------------------------------------------------------------------------
 
 
-class TestGetLibrarySymbols:
+class TestListLibrarySymbols:
     def test_nonexistent_library_returns_error(self, mcp_server):
         port, sid = mcp_server
         result = _call_tool(
             port,
             sid,
-            "get_library_symbols",
+            "list_library_symbols",
             {
                 "library_name": "NonExistentLibrary",
                 "limit": 50,

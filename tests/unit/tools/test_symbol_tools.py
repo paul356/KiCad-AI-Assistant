@@ -404,12 +404,12 @@ class TestListSymbolLibraries:
 
 
 # ---------------------------------------------------------------------------
-# TestGetLibrarySymbols
+# TestListLibrarySymbols
 # ---------------------------------------------------------------------------
 
 
-class TestGetLibrarySymbols:
-    """Tests for get_library_symbols()."""
+class TestListLibrarySymbols:
+    """Tests for list_library_symbols()."""
 
     def _make_sym(self, name, desc="", kw="", pins=2):
         s = MagicMock()
@@ -425,7 +425,7 @@ class TestGetLibrarySymbols:
         mock_mgr.get_library_symbols.return_value = syms
 
         with patch("kcaa.tools.symbol_tools._get_index_manager", return_value=mock_mgr):
-            result = _call("get_library_symbols", library_name="Device")
+            result = _call("list_library_symbols", library_name="Device")
 
         assert result["success"] is True
         assert result["library_name"] == "Device"
@@ -438,7 +438,7 @@ class TestGetLibrarySymbols:
         mock_mgr.get_library_symbols.return_value = []
 
         with patch("kcaa.tools.symbol_tools._get_index_manager", return_value=mock_mgr):
-            result = _call("get_library_symbols", library_name="NOLIB")
+            result = _call("list_library_symbols", library_name="NOLIB")
 
         assert result["success"] is False
         assert "NOLIB" in result["error"]
@@ -837,7 +837,7 @@ class TestProjectPathScoping:
         mock_get_mgr.assert_called_once_with("/p/X")
         assert not any("project_path" in row for row in result["libraries"])
 
-    def test_get_library_symbols_uses_project_index(self):
+    def test_list_library_symbols_uses_project_index(self):
         rec = MagicMock()
         rec.library_name = "ProjLib"
         rec.symbol_name = "R"
@@ -847,7 +847,7 @@ class TestProjectPathScoping:
 
         with self._patch_mgr() as mock_get_mgr:
             mock_get_mgr.return_value.get_library_symbols.return_value = [rec]
-            result = _call("get_library_symbols", library_name="ProjLib", project_path="/p/X")
+            result = _call("list_library_symbols", library_name="ProjLib", project_path="/p/X")
 
         assert result["success"] is True
         assert result["total"] == 1
