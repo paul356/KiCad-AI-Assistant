@@ -2,7 +2,7 @@
 name: symbol-library
 priority: 80
 description: "Symbol index sync, full-text search, pin details, bbox geometry in library space"
-tools: [sync_symbol_index, get_symbol_sync_status, search_symbols, get_symbol, get_symbol_pins, list_symbol_libraries, get_library_symbols, get_symbol_index_stats]
+tools: [sync_symbol_index, get_symbol_sync_status, search_symbols, get_symbol, get_symbol_pins, list_symbol_libraries, list_library_symbols, get_symbol_index_stats]
 ---
 # Tools overview
 - **sync_symbol_index** — Start background sync of the symbol index database.
@@ -11,7 +11,7 @@ tools: [sync_symbol_index, get_symbol_sync_status, search_symbols, get_symbol, g
 - **get_symbol** — Look up a single symbol's metadata, pin count, and body_bbox (library Y-up space).
 - **get_symbol_pins** — Return detailed pin info: number, name, electrical type, wire-exit direction.
 - **list_symbol_libraries** — List all indexed symbol libraries (flat, paginated).
-- **get_library_symbols** — Enumerate symbols within a specific library.
+- **list_library_symbols** — Enumerate symbols within a specific library.
 - **get_symbol_index_stats** — Summary statistics (library count, symbol count, last sync).
 
 # Recommended workflow
@@ -35,7 +35,7 @@ tools: [sync_symbol_index, get_symbol_sync_status, search_symbols, get_symbol, g
    **get_symbol_pins(library_name, symbol_name)**. Also returns `body_bbox` and
    `unit_bboxes`. Pin directions are **wire-exit** directions in library Y-up space
    (KiCad raw pin angles are stub directions; this tool adds 180° automatically).
-6. Use **list_symbol_libraries** and **get_library_symbols** only for browsing —
+6. Use **list_symbol_libraries** and **list_library_symbols** only for browsing —
    they are less token-efficient than `search_symbols` for finding specific parts.
 
 # Coordinate space conventions

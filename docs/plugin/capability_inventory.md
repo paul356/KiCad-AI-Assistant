@@ -28,7 +28,7 @@ These are **read-before-edit** tools. The LLM must call at least one of these be
 | `search_symbols` | Full-text search across all indexed symbol libraries |
 | `get_symbol` | Get full definition of one symbol by library + name |
 | `list_symbol_libraries` | Enumerate all known `.kicad_sym` libraries |
-| `get_library_symbols` | List all symbols in one library |
+| `list_library_symbols` | List all symbols in one library |
 | `get_symbol_index_stats` | Return total library / symbol counts |
 | `get_symbol_pins` | Get pin list for a symbol |
 

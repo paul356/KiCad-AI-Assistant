@@ -41,7 +41,7 @@ TOOL_POLICIES: dict[str, ToolPolicy] = {
     "search_symbols": ToolPolicy(kind="query"),
     "get_symbol": ToolPolicy(kind="query"),
     "list_symbol_libraries": ToolPolicy(kind="query"),
-    "get_library_symbols": ToolPolicy(kind="query"),
+    "list_library_symbols": ToolPolicy(kind="query"),
     "get_symbol_index_stats": ToolPolicy(kind="query"),
     "get_symbol_pins": ToolPolicy(kind="query"),
     # Schematic edit tools
