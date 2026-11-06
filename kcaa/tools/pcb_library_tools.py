@@ -589,7 +589,8 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
         Key: a single library nickname plus footprint name; there is no
         reference-designator lookup (``project_path`` only scopes which library
         table is used).
-        Returns: pads, courtyard bbox, tags/attr, has_3d_model, library_path.
+        Returns: pads, courtyard bbox, tags/attr, has_3d_model, library_path,
+        file_path, edge_cuts.
         Use instead: ``get_footprint`` for footprints placed on a board; this
         tool takes a library nickname + footprint name and cannot be addressed
         by reference designator.  For a symbol placed in a schematic use
@@ -613,7 +614,8 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
 
         Returns:
             dict with name, description, tags, attr, has_3d_model, layer,
-            pads list, courtyard_bbox, and library_path.
+            pads list, courtyard_bbox, edge_cuts, library_path, and file_path
+            (the resolved .kicad_mod path).
         """
         mgr = get_footprint_index_manager(project_path)
         db_stats = mgr.get_stats()
