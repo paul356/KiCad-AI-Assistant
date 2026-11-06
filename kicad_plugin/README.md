@@ -61,20 +61,25 @@ cd "$env:APPDATA\kicad\10.0\scripting\plugins\kicad_ai_plugin"
 .\setup_plugin.bat
 ```
 
-#### Installing an unreleased build (Linux/macOS)
+#### Installing an unreleased build
 
 A PR branch or a CI `dist` artifact usually carries the same version as the last release, so a plain
 install would silently keep the PyPI wheel and the new tools would be missing. Pass the build instead:
 
+**Linux/macOS:**
 ```bash
-./setup_plugin.sh /path/to/kcaa-0.2.9-py3-none-any.whl   # wheel
-./setup_plugin.sh /path/to/kcaa-0.2.9.tar.gz             # sdist
-./setup_plugin.sh /path/to/kcaa                          # source dir (editable)
+./setup_plugin.sh /path/to/kcaa-build          # wheel/sdist file or source directory
+```
+
+**Windows:**
+```powershell
+.\setup_plugin.ps1 C:\path\to\kcaa-build       # wheel/sdist file or source directory
 ```
 
 The local build is reinstalled over any equal version, and no `VERSION` file is required. Re-running
-`./setup_plugin.sh` **without** an argument targets the released `kcaa` from PyPI again; if that release
-has the same version as the local build, delete `.venv` first to force the PyPI copy back.
+`./setup_plugin.sh` (or `.\setup_plugin.ps1`) **without** an argument targets the released `kcaa` from
+PyPI again; if that release has the same version as the local build, delete `.venv` first to force the
+PyPI copy back.
 
 ### 3. Open KiCad
 

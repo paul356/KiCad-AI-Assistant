@@ -61,7 +61,7 @@ run:
 #     README.md
 # Install: unzip into ~/.local/share/kicad/<ver>/scripting/plugins/
 #          then run from the plugin dir:
-#            ./setup_plugin.sh [<wheel|sdist|source-dir>]
+#            ./setup_plugin.sh [<path>]
 #            (no argument installs kcaa from PyPI)
 PLUGIN_ZIP := dist/kicad_ai_assistant.zip
 PLUGIN_SRC := kicad_plugin
