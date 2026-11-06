@@ -508,7 +508,7 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
         }
 
     @mcp.tool()
-    async def search_footprints(
+    async def search_library_footprints(
         query: str,
         project_path: str | None = None,
         ctx: Context | None = None,
@@ -576,7 +576,7 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
         return await _live_search_footprints(query, project_path, max_results)
 
     @mcp.tool()
-    async def get_footprint_details(
+    async def get_library_footprint(
         library_name: str,
         footprint_name: str,
         project_path: str | None = None,
@@ -668,7 +668,7 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
         """List every footprint in ONE library (names + light metadata).
 
         To inspect a single footprint's pads/courtyard use
-        ``get_footprint_details(library_name, footprint_name)``.  Do not pass
+        ``get_library_footprint(library_name, footprint_name)``.  Do not pass
         a list of names here.
 
         Uses the footprint index when it has this library; otherwise falls
@@ -1555,7 +1555,7 @@ async def _live_search_footprints(
     project_path: str | None,
     max_results: int,
 ) -> dict[str, Any]:
-    """Slow live-scan fallback for search_footprints when index is empty."""
+    """Slow live-scan fallback for search_library_footprints when index is empty."""
     from kcaa.utils.pcb_library_utils import scan_footprint_library
 
     needle = query.strip().lower()

@@ -178,11 +178,12 @@ kcaa
 
 ## 工具列表
 
-**何时用哪个工具** — 注意命名是反的：`get_footprint` 读取板上实例，`get_symbol` 读取库中定义。
+**命名约定** — 前缀 `library_` 表示**库中的定义**；无前缀表示**已放置在板上或图中的实例**。带 `library_` 的工具不返回放置信息。
 
-- `get_footprint_details` — 封装库中的封装**定义**；键为 `library_name` + `footprint_name`。
-- `get_footprint` — **PCB 上已放置的封装**；键为 `pcb_path` + `references[]`。
-- `list_symbol_properties` — **原理图中已放置的符号**；键为 `schematic_path` + `references[]`（仅属性，不含几何或网络）。
+- `get_library_footprint` — 封装库中的封装**定义**；键为 `library_name` + `footprint_name`，返回焊盘/courtyard/属性，不含 x/y。
+- `get_footprint` — **PCB 上已放置的封装**；键为 `pcb_path` + `references[]`（世界坐标、旋转、层、属性、焊盘）。
+- `list_symbol_properties` — **原理图中已放置的符号**；键为 `schematic_path` + `references[]`（仅属性，不含几何、位置或网络）。
+- `extract_schematic_netlist` — **唯一**返回原理图已放置符号放置信息的工具（`components[ref].units[n].position`、`rotation`、每个 unit 的 `body_bbox`）；它同时返回整份网表，不是廉价的点查。
 
 ### 项目工具
 
@@ -200,10 +201,10 @@ kcaa
 | `get_symbol_sync_status` | 查询符号索引构建进度 |
 | `get_symbol_index_stats` | 获取符号索引统计信息 |
 | `list_symbol_libraries` | 列出所有符号库；`list_library_symbols` 列出单个库中的符号（按 `library_name` 指定） |
-| `search_symbols` | 全文搜索已索引的符号 |
-| `get_symbol` | 按库名和符号名查找符号 |
+| `search_library_symbols` | 全文搜索已索引的符号 |
+| `get_library_symbol` | 按库名和符号名查找符号 |
 | `list_library_symbols` | 列出单个库中的符号（按 `library_name` 指定）；`list_symbol_libraries` 列出所有符号库 |
-| `get_symbol_pins` | 获取符号的引脚定义 |
+| `get_library_symbol_pins` | 获取符号的引脚定义 |
 | `create_symbol_library` | 新建 `.kicad_sym` 符号库（全局第三方或项目级）并在库表中注册 |
 | `delete_symbol_library` | 删除空符号库（连同文件、库表条目和索引） |
 | `add_symbols_to_library` | 将原理图缓存 `lib_symbols` 中的符号复制到已有符号库 |
@@ -277,8 +278,8 @@ kcaa
 | `sync_footprint_index` | 构建或刷新封装库索引 |
 | `get_footprint_sync_status` | 查询封装索引构建进度 |
 | `list_footprint_libraries` | 列出所有可用封装库 |
-| `search_footprints` | 按名称/描述/标签搜索封装 |
-| `get_footprint_details` | 按库名 + 封装名获取封装库中的封装**定义**（焊盘、边界框等），不是板上的封装实例 |
+| `search_library_footprints` | 按名称/描述/标签搜索封装 |
+| `get_library_footprint` | 按库名 + 封装名获取封装库中的封装**定义**（焊盘、边界框等），不是板上的封装实例 |
 | `list_library_footprints` | 列出单个库中的全部封装（名称及简要元数据）（支持 offset 分页） |
 | `find_footprints_not_in_libraries` | 列出板上缺失于所有已索引库的封装 |
 | `create_footprint_library` | 创建全局 3rdparty 或项目级封装库 |

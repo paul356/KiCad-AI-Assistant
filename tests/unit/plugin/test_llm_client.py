@@ -4871,9 +4871,9 @@ class TestAnnotateStaleQueries:
         assert not tc2_r["content"].startswith(_STALE_MARKER)  # sheet_meta
 
     def test_library_query_never_annotated(self):
-        """Library queries (search_symbols etc.) have no QUERY_CATEGORY entry."""
+        """Library queries (search_library_symbols etc.) have no QUERY_CATEGORY entry."""
         history = self._build_history(
-            ("query", "search_symbols", "f.sch", "tc1", '["opamp"]'),
+            ("query", "search_library_symbols", "f.sch", "tc1", '["opamp"]'),
             ("mutation", "add_symbol_to_schematic", "f.sch", "tc2"),
         )
         client = _make_client()

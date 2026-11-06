@@ -21,7 +21,7 @@ The plugin opens as a KiCad action panel (docked or floating) with three zones:
 │                                                              │
 │  [AI] Reading schematic…                                     │
 │    ↳ extract_schematic_netlist  ✓ 32 nets                    │
-│    ↳ search_symbols  ✓ "C" → Device:C                        │
+│    ↳ search_library_symbols  ✓ "C" → Device:C                        │
 │    ↳ add_symbol_to_schematic  ✓ C3 placed at (120, 95)       │
 │    ↳ connect_pins_with_wire  ✓ C3.1 → U1.4                   │
 │    ↳ add_label_to_schematic   ✓ C3.2 → GND net               │

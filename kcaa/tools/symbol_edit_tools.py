@@ -407,7 +407,7 @@ def _do_add_symbol_to_library(
             skipped.append({"symbol": requested, "reason": "already_in_library"})
             continue
 
-    # Refresh the index so search_symbols/list_symbol_libraries see the new
+    # Refresh the index so search_library_symbols/list_symbol_libraries see the new
     # file — reindexed under the library's OWN ownership (a global library
     # edited from a project schematic must stay global).
     proj_dir = _find_project_dir(schematic_path)
@@ -2221,7 +2221,7 @@ def _do_create_symbol(
         "warnings": warnings,
     }
 
-    # Refresh the index so search_symbols sees the new symbol — reindexed
+    # Refresh the index so search_library_symbols sees the new symbol — reindexed
     # under the library's OWN ownership (a global library stays global).
     target_project = _target_project_of(lib["table_path"], project_dir)
     _index_symbol_library(library, lib_file, project_dir=project_dir, project=target_project)
@@ -2256,7 +2256,7 @@ def register_symbol_edit_tools(mcp: FastMCP) -> None:
         block, and inserts a placed instance for every unit of the symbol.
         The library is resolved scoped to the target schematic's project
         (project sym-lib-table libraries included), matching how
-        ``search_symbols`` reports them.
+        ``search_library_symbols`` reports them.
         Coordinates are mm in KiCad screen convention (**+Y is down**) and
         are auto-snapped to the 1.27 mm (50-mil) grid so pins land on KiCad's
         standard schematic grid and wires can connect to them. A backup
@@ -2272,7 +2272,7 @@ def register_symbol_edit_tools(mcp: FastMCP) -> None:
 
         Args:
             schematic_path: Absolute path to the target .kicad_sch file.
-            library_name: Library name as returned by ``search_symbols`` in
+            library_name: Library name as returned by ``search_library_symbols`` in
                 the ``library_name`` field.  For KiCad 10 symdir-style
                 libraries this is ``"TableName/FileBaseName"``
                 (e.g. ``"Device/R_Small"``), not just the table name
@@ -2549,7 +2549,7 @@ def register_symbol_edit_tools(mcp: FastMCP) -> None:
         ``sym-lib-table`` (created if absent) with a ``${KIPRJMOD}`` URI.
 
         The library is created empty and indexed immediately, so
-        ``search_symbols`` / ``list_symbol_libraries`` see it.  Call this
+        ``search_library_symbols`` / ``list_symbol_libraries`` see it.  Call this
         **before** ``create_symbol`` — the latter requires an existing
         library.
 
@@ -3137,9 +3137,9 @@ def register_symbol_edit_tools(mcp: FastMCP) -> None:
         one payload is returned per reference.
         Returns: per-reference ``properties`` list of {name, value}; no
         geometry, position, or nets.
-        Use instead: ``get_symbol`` / ``get_symbol_pins`` for the library
+        Use instead: ``get_library_symbol`` / ``get_library_symbol_pins`` for the library
         definition and pin data, and ``get_footprint`` for PCB placement geometry.
-        For the library footprint definition use ``get_footprint_details``.
+        For the library footprint definition use ``get_library_footprint``.
 
         Returns every ``(property ...)`` entry found on the first unit of the
         component identified by *reference*.  All units of a multi-unit

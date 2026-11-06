@@ -4,6 +4,14 @@
 
 ---
 
+## Naming conventions
+
+- A `library_` prefix means a **definition inside a library**: `get_library_symbol`, `get_library_symbol_pins`, `get_library_footprint`, `search_library_symbols`, `search_library_footprints`, `list_library_symbols`, `list_library_footprints`. These take `library_name` plus the object name and **never return placement**.
+- No prefix means an **object placed on a board or in a schematic**: `get_footprint`, `list_footprints`, `get_footprint_bbox`, `list_symbol_properties`. These take `pcb_path` / `schematic_path` plus `references[]`.
+- The placement (`position`, `rotation`, `body_bbox`) of a symbol placed in a schematic is returned only by `extract_schematic_netlist` (`components[ref].units[n].position`). There is no separate point-lookup tool for it, so budget for the netlist payload when you need one coordinate.
+
+---
+
 ## 1. Plugin Tool Surface
 
 | Tool | Module | Description |
@@ -12,12 +20,12 @@
 | `find_component_connections` | `netlist_tools` | List all electrical connections for a single reference designator |
 | `sync_symbol_index` | `symbol_tools` | Build or refresh the full-text symbol search index from installed KiCad libraries |
 | `get_symbol_sync_status` | `symbol_tools` | Return the last-sync timestamp and index size |
-| `search_symbols` | `symbol_tools` | Full-text search across all indexed symbols |
-| `get_symbol` | `symbol_tools` | Retrieve full definition and metadata for one symbol |
+| `search_library_symbols` | `symbol_tools` | Full-text search across all indexed symbols |
+| `get_library_symbol` | `symbol_tools` | Retrieve full definition and metadata for one symbol |
 | `list_symbol_libraries` | `symbol_tools` | List all known symbol libraries (names and paths) |
 | `list_library_symbols` | `symbol_tools` | List every symbol in a specific library |
 | `get_symbol_index_stats` | `symbol_tools` | Return aggregate counts for the index |
-| `get_symbol_pins` | `symbol_tools` | Return pin list (number, name, type, direction) for one symbol |
+| `get_library_symbol_pins` | `symbol_tools` | Return pin list (number, name, type, direction) for one symbol |
 | `add_symbol_to_schematic` | `symbol_edit_tools` | Place a library symbol onto a schematic |
 | `create_symbol_library` | `symbol_edit_tools` | Create a new `.kicad_sym` library and register it in sym-lib-table |
 | `create_symbol` | `symbol_edit_tools` | Generate a new symbol definition into an existing library (definition only — no schematic placement) |
@@ -46,7 +54,7 @@
 A typical LLM editing session follows this pattern:
 
 1. **Read current state** — call `extract_schematic_netlist` with the `active_schematic` path from the plugin context. Inspect `analysis.components`, `analysis.power_nets`, and `analysis.signal_nets` to understand what is already present.
-2. **Find symbols** — if adding a new component, call `search_symbols` first to obtain the exact `library_name` and `name` values required by `add_symbol_to_schematic`. Never guess library names.
+2. **Find symbols** — if adding a new component, call `search_library_symbols` first to obtain the exact `library_name` and `name` values required by `add_symbol_to_schematic`. Never guess library names.
 3. **Place / edit / connect** — use the symbol-editing and wire-editing tools to make changes. After placing a symbol, call `extract_schematic_netlist` to get the new pin positions before routing wires.
 4. **Verify** — call `extract_schematic_netlist` again after all edits. Confirm expected nets exist in `analysis.signal_nets` or `analysis.power_nets` and that `analysis.floating_nets` is empty.
 
@@ -136,7 +144,7 @@ express an absolute move as a delta.
 
 #### `sync_symbol_index(force=False, project_path=None)`
 
-**Purpose:** Scans all installed KiCad symbol libraries and populates the local full-text search index. Must be called at least once before `search_symbols` will return results.
+**Purpose:** Scans all installed KiCad symbol libraries and populates the local full-text search index. Must be called at least once before `search_library_symbols` will return results.
 
 **Key parameters:**
 - `force` (`bool`) — when `True`, rebuilds even if the index appears current.
@@ -150,7 +158,7 @@ express an absolute move as a delta.
 
 ---
 
-#### `search_symbols(query, project_path=None, limit=50)`
+#### `search_library_symbols(query, project_path=None, limit=50)`
 
 **Purpose:** Full-text search across symbol name, description, and keywords in the index.
 
@@ -165,21 +173,21 @@ express an absolute move as a delta.
 
 ---
 
-#### `get_symbol(library_name, symbol_name, project_path=None)`
+#### `get_library_symbol(library_name, symbol_name, project_path=None)`
 
 **Purpose:** Retrieve the full symbol definition including all properties and pin details.
 
 **Key parameters:**
-- `library_name` and `symbol_name` exactly as returned by `search_symbols`.
+- `library_name` and `symbol_name` exactly as returned by `search_library_symbols`.
 - `project_path` (`str | None`) — optional path to a project directory or a file inside it. The lookup is scoped to global plus that project's libraries; other projects' libraries are never matched. Omit for global only.
 
 ---
 
 #### `list_symbol_libraries(limit=200, offset=0, project_path=None)`
 
-**Purpose:** Returns one row per known symbol library in scope — `name`, `symbol_count`, `file_path` — as a flat, paginated list. Useful for exploration when `search_symbols` returns no results; looking for a specific component, prefer `search_symbols`.
+**Purpose:** Returns one row per known symbol library in scope — `name`, `symbol_count`, `file_path` — as a flat, paginated list. Useful for exploration when `search_library_symbols` returns no results; looking for a specific component, prefer `search_library_symbols`.
 
-**Key parameters:** `limit` / `offset` — pagination as described in the tool docstring; `project_path` scopes the listing exactly like `search_symbols`. Watch the `truncated` field to know when more pages remain.
+**Key parameters:** `limit` / `offset` — pagination as described in the tool docstring; `project_path` scopes the listing exactly like `search_library_symbols`. Watch the `truncated` field to know when more pages remain.
 
 ---
 
@@ -199,11 +207,11 @@ express an absolute move as a delta.
 
 ---
 
-#### `get_symbol_pins(library_name, symbol_name, project_path=None)`
+#### `get_library_symbol_pins(library_name, symbol_name, project_path=None)`
 
 **Purpose:** Returns the pin list (number, name, electrical type, direction) for a symbol without fetching the full definition. Use when planning wiring before placing a component.
 
-**Key parameters:** `library_name`, `symbol_name` as returned by `search_symbols`; `project_path` scopes the lookup like `get_symbol`.
+**Key parameters:** `library_name`, `symbol_name` as returned by `search_library_symbols`; `project_path` scopes the lookup like `get_library_symbol`.
 
 ---
 
@@ -217,8 +225,8 @@ All tools in this group write a backup to `<schematic_path>.bak` before saving.
 
 **Key parameters:**
 - `schematic_path` (`str`) — absolute path to `.kicad_sch`.
-- `library_name` (`str`) — as returned by `search_symbols`.
-- `symbol_name` (`str`) — as returned by `search_symbols`.
+- `library_name` (`str`) — as returned by `search_library_symbols`.
+- `symbol_name` (`str`) — as returned by `search_library_symbols`.
 - `x`, `y` (`float`) — placement coordinates in mm; snapped to 1.27 mm grid.
 - `rotation` (`int`) — `0`, `90`, `180`, or `270`.
 - `value` (`str | None`) — overrides the `Value` property; defaults to `symbol_name`.
@@ -238,7 +246,7 @@ All tools in this group write a backup to `<schematic_path>.bak` before saving.
 - `name` (`str`) — library nickname (sanitised to sym-lib-table-safe characters).
 - `project_dir` (`str | None`) — when given, the library file is created inside the project directory and registered in the project's `sym-lib-table` (created if absent) with a `${KIPRJMOD}` URI. When omitted, the library is created under `${KICADxx_3RD_PARTY}/symbols` and registered in the global user sym-lib-table.
 
-The library is created empty and indexed immediately, so `search_symbols` / `list_symbol_libraries` see it. Fails if the name is invalid, the library or file already exists (no silent overwrite), or the project directory does not exist.
+The library is created empty and indexed immediately, so `search_library_symbols` / `list_symbol_libraries` see it. Fails if the name is invalid, the library or file already exists (no silent overwrite), or the project directory does not exist.
 
 **Success response:** `{"library": "MyLib", "path": "/abs/MyLib.kicad_sym", "table_path": "/abs/sym-lib-table", "registered": true, "indexed": 0}`
 

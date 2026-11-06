@@ -25,12 +25,12 @@ These are **read-before-edit** tools. The LLM must call at least one of these be
 |------|---------|
 | `sync_symbol_index` | Build or refresh the SQLite symbol search index |
 | `get_symbol_sync_status` | Check whether the index is current |
-| `search_symbols` | Full-text search across all indexed symbol libraries |
-| `get_symbol` | Get full definition of one symbol by library + name |
+| `search_library_symbols` | Full-text search across all indexed symbol libraries |
+| `get_library_symbol` | Get full definition of one symbol by library + name |
 | `list_symbol_libraries` | Enumerate all known `.kicad_sym` libraries |
 | `list_library_symbols` | List all symbols in one library |
 | `get_symbol_index_stats` | Return total library / symbol counts |
-| `get_symbol_pins` | Get pin list for a symbol |
+| `get_library_symbol_pins` | Get pin list for a symbol |
 
 These are read-only tools. They must be used when the LLM is asked to add a component so it can find the correct library name and symbol name before calling `add_symbol_to_schematic`.
 

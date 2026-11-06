@@ -211,11 +211,12 @@ kcaa
 
 ## Available Tools
 
-**Which tool when** — note the naming inversion: `get_footprint` is the placement tool, `get_symbol` the library tool.
+**Naming convention** — a `library_` prefix means a **definition inside a library**; no prefix means an **object placed on a board or in a schematic**. A `library_` tool never returns placement.
 
-- `get_footprint_details` — footprint **definition** in a library; key `library_name` + `footprint_name`.
-- `get_footprint` — footprint **placed on a PCB**; key `pcb_path` + `references[]`.
-- `list_symbol_properties` — symbol **placed in a schematic**; key `schematic_path` + `references[]` (properties only, no geometry or nets).
+- `get_library_footprint` — footprint **definition** in a library; key `library_name` + `footprint_name`. Returns pads/courtyard/attributes, never x/y.
+- `get_footprint` — footprint **placed on a PCB**; key `pcb_path` + `references[]` (world position, rotation, layer, properties, pads).
+- `list_symbol_properties` — symbol **placed in a schematic**; key `schematic_path` + `references[]` (properties only, no geometry, position, or nets).
+- `extract_schematic_netlist` — the **only** tool that returns a placed symbol's placement (`components[ref].units[n].position`, `rotation`, per-unit `body_bbox`); it also returns the full netlist, so it is not a cheap point lookup.
 
 ### Project Tools
 
@@ -233,10 +234,10 @@ kcaa
 | `get_symbol_sync_status` | Query symbol index build progress |
 | `get_symbol_index_stats` | Get statistics about the symbol index |
 | `list_symbol_libraries` | List all symbol libraries; `list_library_symbols` lists the symbols inside one library (keyed by `library_name`) |
-| `search_symbols` | Full-text search across indexed symbols |
-| `get_symbol` | Look up a symbol by library and name |
+| `search_library_symbols` | Full-text search across indexed symbols |
+| `get_library_symbol` | Look up a symbol by library and name |
 | `list_library_symbols` | List the symbols inside one library, keyed by `library_name`; `list_symbol_libraries` lists all libraries |
-| `get_symbol_pins` | Get pin definitions for a symbol |
+| `get_library_symbol_pins` | Get pin definitions for a symbol |
 | `create_symbol_library` | Create a new `.kicad_sym` library (global 3rd-party or project-local) and register it in the library table |
 | `delete_symbol_library` | Delete an empty symbol library (file, library-table entry, and index) |
 | `add_symbols_to_library` | Copy symbols from a schematic's cached `lib_symbols` into an existing library |
@@ -310,8 +311,8 @@ kcaa
 | `sync_footprint_index` | Build or refresh the footprint library index |
 | `get_footprint_sync_status` | Query footprint index build progress |
 | `list_footprint_libraries` | List all available footprint libraries |
-| `search_footprints` | Search footprints by name, description, or tag |
-| `get_footprint_details` | Get a footprint **library definition** (pads, bounding box, etc.) by library name + footprint name — not a board placement |
+| `search_library_footprints` | Search footprints by name, description, or tag |
+| `get_library_footprint` | Get a footprint **library definition** (pads, bounding box, etc.) by library name + footprint name — not a board placement |
 | `list_library_footprints` | List every footprint in one library (names and light metadata) (offset paging) |
 | `find_footprints_not_in_libraries` | List board footprints missing from every indexed library |
 | `create_footprint_library` | Create a global 3rdparty or project-local footprint library |

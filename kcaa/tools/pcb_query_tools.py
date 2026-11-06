@@ -261,7 +261,7 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
         payload is returned per reference.
         Returns: per-reference world x/y/rotation, layer, properties, pads with
         net_name, and Edge.Cuts geometry.
-        Use instead: ``get_footprint_details`` for the library definition; this
+        Use instead: ``get_library_footprint`` for the library definition; this
         tool needs ``pcb_path`` and cannot take a library name.  For a placed
         symbol's properties use ``list_symbol_properties``.
 

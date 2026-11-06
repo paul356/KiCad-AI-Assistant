@@ -110,7 +110,7 @@ Settings are stored in the KiCad user config directory:
 The plugin registers 124 tools in total. The 23 tools below are the milestone-1 schematic/symbol core:
 
 - **Netlist inspection:** `extract_schematic_netlist`, `find_component_connections`
-- **Symbol search:** `search_symbols`, `get_symbol`, `list_symbol_libraries`, `get_symbol_pins` + 4 more
+- **Symbol search:** `search_library_symbols`, `get_library_symbol`, `list_symbol_libraries`, `get_library_symbol_pins` + 4 more
 - **Component editing:** `add_symbol_to_schematic`, `remove_symbol_from_schematic`, `move_component`, `set_symbol_property` + 6 more
 - **Wire editing:** `connect_points_with_wire`, `connect_pins_with_wire`, `delete_wire_from_schematic`
 

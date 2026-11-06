@@ -27,6 +27,14 @@ def register_netlist_tools(mcp: FastMCP) -> None:
     ) -> dict[str, Any]:
         """Extract component inventory, net analysis, and wire geometry for a KiCad schematic.
 
+        This is the **only** tool that returns the placement of a symbol
+        **placed in a schematic** — ``components[ref]["units"][n]["position"]``
+        (``{x, y, rotation}``) plus the unit's ``body_bbox`` and the
+        world-coordinate ``pins``.  For a symbol **definition** in a library
+        (no placement) use ``get_library_symbol`` / ``get_library_symbol_pins``.
+        The netlist payload is large, so prefer this tool when you need
+        connectivity and/or geometry, not for a single coordinate.
+
         A net is a named group of pins that are electrically connected by wires.
         For example, if R1/pin2, C1/pin1, and a GND power symbol are all joined
         by wires, they form one net named "GND".
@@ -38,11 +46,12 @@ def register_netlist_tools(mcp: FastMCP) -> None:
           Their hierarchical pins are exposed like component pins and use the
           sheet-pin name as their local net name.
 
-        - ``position``: ``{x, y}`` placement anchor in mm (KiCad screen coords,
-          **+Y is down**).
-        - ``rotation``, ``mirror``, ``lib_id``, ``value``, ``footprint``.
-        - each unit carries its own ``body_bbox``: ``{min_x, min_y, max_x,
-          max_y}`` world-space bounding box of that unit's footprint. Use it
+        - ``units``: per-unit dict (``"1"``, ``"2"``, … for multi-unit parts).
+          Each unit carries ``position``: ``{x, y, rotation}`` placement anchor
+          in mm (KiCad screen coords, **+Y is down**), ``rotation``, ``mirror``,
+          ``lib_id``, ``value``, ``footprint``, and its own ``body_bbox``:
+          ``{min_x, min_y, max_x, max_y}`` world-space bounding box of that
+          unit's footprint. Use it
           to check overlaps before calling ``move_component`` /
           ``add_symbol_to_schematic``. May be absent for graphics-less
           symbols (e.g. PWR_FLAG).
@@ -72,7 +81,8 @@ def register_netlist_tools(mcp: FastMCP) -> None:
             schematic_path: Path to the KiCad schematic file (.kicad_sch)
             include_wire_topology: When True, a top-level ``wires`` dict is
                 added to the analysis. Each wire carries its own ``net`` field
-                (the net name, or null if the wire is unconnected). Default True.
+                (the net name, or null if the wire is unconnected). Default
+                False — set it only when you need wire geometry.
             ctx: MCP context for progress reporting
 
         Returns:
@@ -86,11 +96,16 @@ def register_netlist_tools(mcp: FastMCP) -> None:
                     "component_types": {"R": 3, "C": 2, ...},
                     "components": {
                         "R1": {"value": "10k",
-                               "position": {"x": ..., "y": ..., "rotation": ...},
-                               "pins": [{"num": "1", "name": "VCC",
-                                         "electrical": "power_in",
-                                         "x": ..., "y": ...,
-                                         "direction": ..., "net": "GND"}, ...]},
+                               "type": "component",
+                               "units": {
+                                   "1": {"position": {"x": ..., "y": ..., "rotation": ...},
+                                         "body_bbox": {"min_x": ..., "min_y": ...,
+                                                       "max_x": ..., "max_y": ...},
+                                         "pins": [{"num": "1", "name": "VCC",
+                                                   "electrical": "power_in",
+                                                   "x": ..., "y": ...,
+                                                   "direction": ..., "net": "GND"}, ...]},
+                               }},
                                # name: pin name (e.g. "VCC", "GPIO1"); electrical: electrical type
                         ...
                     },
