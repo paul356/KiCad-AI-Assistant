@@ -64,16 +64,16 @@ cd "$env:APPDATA\kicad\10.0\scripting\plugins\kicad_ai_plugin"
 #### Installing an unreleased build
 
 A PR branch or a CI `dist` artifact usually carries the same version as the last release, so a plain
-install would silently keep the PyPI wheel and the new tools would be missing. Pass the build instead:
+install would silently keep the PyPI release and the new tools would be missing. Pass the build instead:
 
 **Linux/macOS:**
 ```bash
-./setup_plugin.sh /path/to/kcaa-build          # wheel/sdist file or source directory
+./setup_plugin.sh /path/to/kcaa-build          # artifact file or source directory
 ```
 
 **Windows:**
 ```powershell
-.\setup_plugin.ps1 C:\path\to\kcaa-build       # wheel/sdist file or source directory
+.\setup_plugin.ps1 C:\path\to\kcaa-build       # artifact file or source directory
 ```
 
 The local build is reinstalled over any equal version, and no `VERSION` file is required. Re-running

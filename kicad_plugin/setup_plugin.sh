@@ -7,7 +7,7 @@
 #
 #   cd ~/.local/share/kicad/10.0/scripting/plugins/kicad_ai_assistant
 #   ./setup_plugin.sh                        # kcaa from PyPI
-#   ./setup_plugin.sh /path/to/kcaa-build    # local wheel, sdist, or source tree
+#   ./setup_plugin.sh /path/to/kcaa-build    # local artifact or source tree
 
 set -euo pipefail
 
@@ -25,8 +25,8 @@ and downloads the freerouting JAR for the auto-router feature.
 
 Arguments:
   (none)        Install the released kcaa==<VERSION> from PyPI.
-  <path>        Install that build instead of the PyPI release: a wheel or
-                sdist file, or a source directory (installed editable).
+  <path>        Install that build instead of the PyPI release: an artifact
+                file or a source directory (installed editable).
 
 Options:
   -h, --help    Show this help and exit.
