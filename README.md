@@ -211,6 +211,12 @@ kcaa
 
 ## Available Tools
 
+**Which tool when** — note the naming inversion: `get_footprint` is the placement tool, `get_symbol` the library tool.
+
+- `get_footprint_details` — footprint **definition** in a library; key `library_name` + `footprint_name`.
+- `get_footprint` — footprint **placed on a PCB**; key `pcb_path` + `references[]`.
+- `list_symbol_properties` — symbol **placed in a schematic**; key `schematic_path` + `references[]` (properties only, no geometry or nets).
+
 ### Project Tools
 
 | Tool | Description |
@@ -248,7 +254,7 @@ kcaa
 | `move_component` | Move and/or rotate a placed component |
 | `set_symbol_property` | Set a property field on a placed symbol |
 | `rename_symbol` | Rename a placed symbol's reference designator |
-| `list_symbol_properties` | List all properties of a placed symbol |
+| `list_symbol_properties` | List properties (name → value) of placed schematic symbols — no geometry, position, or nets |
 | `delete_symbol_property` | Delete a property from a placed symbol |
 | `check_reference_conflicts` | Check for duplicate reference designators |
 | `connect_points_with_wire` | Route a smart orthogonal wire between two points |
@@ -305,7 +311,7 @@ kcaa
 | `get_footprint_sync_status` | Query footprint index build progress |
 | `list_footprint_libraries` | List all available footprint libraries |
 | `search_footprints` | Search footprints by name, description, or tag |
-| `get_footprint_details` | Get footprint details (pads, bounding box, etc.) |
+| `get_footprint_details` | Get a footprint **library definition** (pads, bounding box, etc.) by library name + footprint name — not a board placement |
 | `list_library_footprints` | List every footprint in one library (names and light metadata) (offset paging) |
 | `find_footprints_not_in_libraries` | List board footprints missing from every indexed library |
 | `create_footprint_library` | Create a global 3rdparty or project-local footprint library |
@@ -319,7 +325,7 @@ kcaa
 |------|-------------|
 | `get_board_info` | Get basic PCB board information |
 | `list_footprints` | List all footprints placed on the board |
-| `get_footprint` | Get details of a placed footprint (pads, properties, Edge.Cuts geometry) |
+| `get_footprint` | Get details of footprints **placed on the PCB**, one payload per reference in `references` (pads, properties, Edge.Cuts geometry) |
 | `get_footprint_bbox` | Get the courtyard bounding box of a footprint |
 | `get_board_bounding_box` | Get the union bounding box of all footprints |
 | `list_nets` | List all nets on the board |
