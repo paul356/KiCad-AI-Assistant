@@ -582,25 +582,16 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
         project_path: str | None = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
-        """Get a footprint **definition** from a footprint library (.kicad_mod).
+        """Get detailed information about a specific footprint.
 
-        Object: a library footprint definition — not a footprint placed on a
-        board.
-        Key: a single library nickname plus footprint name; there is no
-        reference-designator lookup (``project_path`` only scopes which library
-        table is used).
-        Returns: pads, courtyard bbox, tags/attr, has_3d_model, library_path,
-        file_path, edge_cuts.
-        Use instead: ``get_footprint`` for footprints placed on a board; this
-        tool takes a library nickname + footprint name and cannot be addressed
-        by reference designator.  For a symbol placed in a schematic use
-        ``list_symbol_properties``.  To enumerate every footprint in a library
-        use ``list_library_footprints(library_name)``; this tool takes exactly
-        one ``footprint_name``.
-
-        Always reads the .kicad_mod file directly for full detail.  The lookup
-        is scoped to the project's global + project-local libraries; when a
-        same-named project library exists it takes precedence over the global one.
+        Returns pad layout, courtyard bounding box, and metadata for a
+        footprint identified by its library nickname and name.  To enumerate
+        every footprint in a library use
+        ``list_library_footprints(library_name)``; this tool takes exactly one
+        ``footprint_name``.  Always reads the .kicad_mod file directly for
+        full detail.  The lookup is scoped
+        to the project's global + project-local libraries; when a same-named
+        project library exists it takes precedence over the global one.
 
         Args:
             library_name: The library nickname (as shown in fp-lib-table),
@@ -614,8 +605,7 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
 
         Returns:
             dict with name, description, tags, attr, has_3d_model, layer,
-            pads list, courtyard_bbox, edge_cuts, library_path, and file_path
-            (the resolved .kicad_mod path).
+            pads list, courtyard_bbox, and library_path.
         """
         mgr = get_footprint_index_manager(project_path)
         db_stats = mgr.get_stats()
