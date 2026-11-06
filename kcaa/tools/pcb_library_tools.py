@@ -582,16 +582,22 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
         project_path: str | None = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
-        """Get detailed information about a specific footprint.
+        """Get a footprint **definition** from a footprint library (.kicad_mod).
 
-        Returns pad layout, courtyard bounding box, and metadata for a
-        footprint identified by its library nickname and name.  To enumerate
-        every footprint in a library use
+        Object: a library footprint definition — not a footprint placed on a
+        board.
+        Key: a single library nickname plus footprint name; no board path and
+        no reference designators.
+        Returns: pads, courtyard bbox, tags/attr, has_3d_model, library_path.
+        Use instead: ``get_footprint`` for footprints placed on a board; this
+        tool takes a library nickname + footprint name and cannot be addressed
+        by reference designator.  To enumerate every footprint in a library use
         ``list_library_footprints(library_name)``; this tool takes exactly one
-        ``footprint_name``.  Always reads the .kicad_mod file directly for
-        full detail.  The lookup is scoped
-        to the project's global + project-local libraries; when a same-named
-        project library exists it takes precedence over the global one.
+        ``footprint_name``.
+
+        Always reads the .kicad_mod file directly for full detail.  The lookup
+        is scoped to the project's global + project-local libraries; when a
+        same-named project library exists it takes precedence over the global one.
 
         Args:
             library_name: The library nickname (as shown in fp-lib-table),
