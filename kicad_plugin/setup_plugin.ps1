@@ -126,6 +126,10 @@ if ($HasLocalPath) {
 } else {
     uv pip install "kcaa==${KcaaVersion}" --python "$VenvDir"
 }
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "ERROR: uv pip install failed (exit code $LASTEXITCODE)."
+    exit $LASTEXITCODE
+}
 uv pip install "pymupdf" --python "$VenvDir"
 if ($LASTEXITCODE -ne 0) {
     Write-Host "ERROR: uv pip install failed (exit code $LASTEXITCODE)."
@@ -154,14 +158,20 @@ print(info)
 '@
 
 $PythonExe = Join-Path $VenvDir 'Scripts\python.exe'
+# The probe goes through a temp file: Windows PowerShell 5.1's native argument
+# binder does not escape embedded double quotes, so `python -c <snippet>` would
+# arrive mangled under setup_plugin.bat.
+$ProbeFile = Join-Path $env:TEMP "kcaa_probe_$PID.py"
 $PreviousEap = $ErrorActionPreference
 $ErrorActionPreference = 'Continue'
+Set-Content -LiteralPath $ProbeFile -Value $ProbeScript -Encoding Ascii
 Push-Location -LiteralPath $VenvDir
 try {
-    $KcaaInfo = (& $PythonExe -c $ProbeScript 2>&1 | Out-String).Trim()
+    $KcaaInfo = (& $PythonExe $ProbeFile 2>&1 | Out-String).Trim()
     $ProbeExit = $LASTEXITCODE
 } finally {
     Pop-Location
+    Remove-Item -LiteralPath $ProbeFile -ErrorAction SilentlyContinue
     $ErrorActionPreference = $PreviousEap
 }
 if ($ProbeExit -eq 0) {
@@ -174,7 +184,7 @@ if ($ProbeExit -eq 0) {
 }
 
 # ---------------------------------------------------------------------------
-# Step 3/4 — Detect KiCad configuration
+# Step 3/3 — Downloading freerouting JAR
 # ---------------------------------------------------------------------------
 Write-Host ""
 Write-Host "Step 3/3 - Downloading freerouting JAR ..."
