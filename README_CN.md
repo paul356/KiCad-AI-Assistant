@@ -178,6 +178,12 @@ kcaa
 
 ## 工具列表
 
+**何时用哪个工具** — 注意命名是反的：`get_footprint` 读取板上实例，`get_symbol` 读取库中定义。
+
+- `get_footprint_details` — 封装库中的封装**定义**；键为 `library_name` + `footprint_name`。
+- `get_footprint` — **PCB 上已放置的封装**；键为 `pcb_path` + `references[]`。
+- `list_symbol_properties` — **原理图中已放置的符号**；键为 `schematic_path` + `references[]`（仅属性，不含几何或网络）。
+
 ### 项目工具
 
 | 工具 | 说明 |
@@ -215,7 +221,7 @@ kcaa
 | `move_component` | 移动/旋转已放置的元件 |
 | `set_symbol_property` | 设置已放置符号的属性字段 |
 | `rename_symbol` | 重命名已放置符号的位号 |
-| `list_symbol_properties` | 列出已放置符号的所有属性 |
+| `list_symbol_properties` | 列出已放置原理图符号的属性（名称 → 值），不含几何、位置或网络 |
 | `delete_symbol_property` | 删除已放置符号的属性 |
 | `check_reference_conflicts` | 检查重复的位号 |
 | `connect_points_with_wire` | 在两点之间智能正交布线 |
@@ -272,7 +278,7 @@ kcaa
 | `get_footprint_sync_status` | 查询封装索引构建进度 |
 | `list_footprint_libraries` | 列出所有可用封装库 |
 | `search_footprints` | 按名称/描述/标签搜索封装 |
-| `get_footprint_details` | 获取封装详情（焊盘、边界框等） |
+| `get_footprint_details` | 按库名 + 封装名获取封装库中的封装**定义**（焊盘、边界框等），不是板上的封装实例 |
 | `list_library_footprints` | 列出单个库中的全部封装（名称及简要元数据）（支持 offset 分页） |
 | `find_footprints_not_in_libraries` | 列出板上缺失于所有已索引库的封装 |
 | `create_footprint_library` | 创建全局 3rdparty 或项目级封装库 |
@@ -286,7 +292,7 @@ kcaa
 |------|------|
 | `get_board_info` | 获取 PCB 板基本信息 |
 | `list_footprints` | 列出板上已放置的所有封装 |
-| `get_footprint` | 获取单个已放置封装的详情 |
+| `get_footprint` | 获取板上已放置封装的详情（按 `references` 列表，每个位号一份结果；含焊盘、属性、Edge.Cuts 几何） |
 | `get_footprint_bbox` | 获取封装的 courtyard 边界框 |
 | `get_board_bounding_box` | 获取全板封装的联合边界框 |
 | `list_nets` | 列出板上所有网络 |

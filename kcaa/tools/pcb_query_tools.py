@@ -254,7 +254,16 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
         references: list[str],
         ctx: Context | None,
     ) -> dict[str, Any]:
-        """Get detailed information about one or more footprints on the board.
+        """Get one or more footprints **placed on a PCB** (.kicad_pcb).
+
+        Object: footprint instances placed on a board — not library definitions.
+        Key: a single ``pcb_path`` plus a non-empty ``references`` list; one
+        payload is returned per reference.
+        Returns: per-reference world x/y/rotation, layer, properties, pads with
+        net_name, and Edge.Cuts geometry.
+        Use instead: ``get_footprint_details`` for the library definition; this
+        tool needs ``pcb_path`` and cannot take a library name.  For a placed
+        symbol's properties use ``list_symbol_properties``.
 
         Coordinates are mm, +Y down; rotation is CCW-positive on screen
         (KiCad PCB convention: 0=right, 90=up). The footprint's
