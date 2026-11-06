@@ -165,6 +165,8 @@ $ProbeFile = Join-Path $env:TEMP "kcaa_probe_$PID.py"
 $PreviousEap = $ErrorActionPreference
 $ErrorActionPreference = 'Continue'
 Set-Content -LiteralPath $ProbeFile -Value $ProbeScript -Encoding Ascii
+$ProbeExit = 1
+$KcaaInfo = ''
 Push-Location -LiteralPath $VenvDir
 try {
     $KcaaInfo = (& $PythonExe $ProbeFile 2>&1 | Out-String).Trim()
