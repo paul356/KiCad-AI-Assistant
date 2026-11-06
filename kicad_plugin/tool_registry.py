@@ -190,6 +190,7 @@ TOOL_POLICIES: dict[str, ToolPolicy] = {
     "sync_footprint_index": ToolPolicy(kind="indexing"),
     "get_footprint_sync_status": ToolPolicy(kind="query"),
     "list_footprint_libraries": ToolPolicy(kind="query"),
+    "list_library_footprints": ToolPolicy(kind="query"),
     "search_footprints": ToolPolicy(kind="query"),
     "get_footprint_details": ToolPolicy(kind="query"),
     # PCB → library export tools

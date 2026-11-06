@@ -1343,3 +1343,613 @@ class TestDeleteFootprintLibrary:
         assert not os.path.exists(lib_dir)  # directory was removed first
         assert result["index_removed"] is True  # index cleanup still attempted
         assert project["index_mgr"].library_name_exists("MyVendor") is False
+
+
+# ---------------------------------------------------------------------------
+# list_library_footprints
+# ---------------------------------------------------------------------------
+
+
+def _write_mod(
+    library_dir: str,
+    name: str,
+    *,
+    description: str = "",
+    tags: str = "",
+    attr: str = "",
+    pads: int = 0,
+    model: bool = False,
+) -> str:
+    """Write a minimal but parseable .kicad_mod with optional metadata/pads."""
+    children = []
+    if description:
+        children.append(f'(descr "{description}")')
+    if tags:
+        children.append(f'(tags "{tags}")')
+    if attr:
+        children.append(f"(attr {attr})")
+    for i in range(pads):
+        children.append(f'(pad "{i + 1}" smd rect (at {i} 0) (size 1 1) (layers "F.Cu"))')
+    if model:
+        children.append('(model "test.wrl")')
+    text = f'(footprint "{name}"\n' + "".join(f"  {c}\n" for c in children) + ")\n"
+    path = os.path.join(library_dir, name + ".kicad_mod")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    return path
+
+
+class TestListLibraryFootprints:
+    def test_index_returns_sorted_footprints_with_metadata(self, tools, project, tmp_path):
+        lib_dir = tmp_path / "Alpha.pretty"
+        lib_dir.mkdir()
+        _write_mod(str(lib_dir), "Zeta", description="zeta desc", tags="zeta", attr="smd", pads=2)
+        _write_mod(
+            str(lib_dir),
+            "Alpha",
+            description="alpha desc",
+            tags="alpha",
+            attr="through_hole",
+            pads=1,
+        )
+        other_dir = tmp_path / "Beta.pretty"
+        other_dir.mkdir()
+        _write_mod(str(other_dir), "Other", description="other desc")
+        mgr = project["index_mgr"]
+        mgr.index_library("Alpha", str(lib_dir))
+        mgr.index_library("Beta", str(other_dir))
+
+        result = _run(tools["list_library_footprints"](library_name="Alpha", ctx=None))
+
+        assert result["library"] == "Alpha"
+        assert result["library_path"] == str(lib_dir)
+        assert result["source"] == "index"
+        assert [f["name"] for f in result["footprints"]] == ["Alpha", "Zeta"]
+        assert result["count"] == 2
+        assert result["total"] == 2
+        assert result["truncated"] is False
+        first = result["footprints"][0]
+        assert first["description"] == "alpha desc"
+        assert first["tags"] == "alpha"
+        assert first["attr"] == "through_hole"
+        assert first["pad_count"] == 1
+        assert first["has_3d_model"] is False
+
+    def test_project_scope_uses_project_row(self, tools, project, tmp_path, monkeypatch):
+        """A project-scoped manager resolves the project-owned index row.
+
+        Nicknames are unique in the index, so this locks the scope handoff
+        (the tool re-scopes the manager to the requested project) rather than
+        a same-nickname global/project tie that the database cannot hold.
+        """
+        proj_root = tmp_path / "proj"
+        proj_root.mkdir()
+        proj_lib = proj_root / "ProjOnly.pretty"
+        proj_lib.mkdir()
+        _write_mod(str(proj_lib), "ProjectFootprint")
+        board = proj_root / "board.kicad_pcb"
+        board.write_text("(kicad_pcb)\n", encoding="utf-8")
+
+        mgr = project["index_mgr"]
+        mgr.index_library("ProjOnly", str(proj_lib), project=os.path.realpath(str(proj_root)))
+
+        # Mirror the real factory: re-scope the manager to the requested project.
+        def _scoped(project_path=None):
+            mgr._project_path = project_path
+            mgr._project_id = (
+                os.path.realpath(os.path.dirname(project_path)) if project_path else ""
+            )
+            return mgr
+
+        monkeypatch.setattr("kcaa.tools.pcb_library_tools.get_footprint_index_manager", _scoped)
+
+        result = _run(
+            tools["list_library_footprints"](
+                library_name="ProjOnly", project_path=str(board), ctx=None
+            )
+        )
+
+        assert result["source"] == "index"
+        assert result["library_path"] == str(proj_lib)
+        assert [f["name"] for f in result["footprints"]] == ["ProjectFootprint"]
+        assert result["count"] == 1
+        assert result["total"] == 1
+
+    def test_live_scan_fallback_parses_metadata_and_degrades(self, tools, project, tmp_path):
+        live_lib = tmp_path / "LiveLib.pretty"
+        live_lib.mkdir()
+        _write_mod(str(live_lib), "B_mod", description="b desc", tags="btag", attr="smd")
+        _write_mod(
+            str(live_lib),
+            "A_mod",
+            description="a desc",
+            tags="atag",
+            attr="through_hole",
+            pads=3,
+            model=True,
+        )
+        # Unparsable file: scan lists it, metadata must degrade to empty.
+        (live_lib / "Broken.kicad_mod").write_text('(footprint "Broken"', encoding="utf-8")
+        _make_fp_lib_table(
+            tmp_path, [("TestSys", project["system_lib"]), ("LiveLib", str(live_lib))]
+        )
+        board = tmp_path / "live.kicad_pcb"
+        board.write_text("(kicad_pcb)\n", encoding="utf-8")
+
+        result = _run(
+            tools["list_library_footprints"](
+                library_name="LiveLib", project_path=str(board), ctx=None
+            )
+        )
+
+        assert result["source"] == "live_scan"
+        assert result["library_path"] == str(live_lib)
+        assert [f["name"] for f in result["footprints"]] == ["A_mod", "B_mod", "Broken"]
+        by_name = {f["name"]: f for f in result["footprints"]}
+        assert by_name["A_mod"]["description"] == "a desc"
+        assert by_name["A_mod"]["tags"] == "atag"
+        assert by_name["A_mod"]["attr"] == "through_hole"
+        assert by_name["A_mod"]["pad_count"] == 3
+        assert by_name["A_mod"]["has_3d_model"] is True
+        assert by_name["B_mod"]["pad_count"] == 0
+        assert by_name["B_mod"]["has_3d_model"] is False
+        assert by_name["Broken"] == {
+            "name": "Broken",
+            "description": "",
+            "tags": "",
+            "attr": "",
+            "pad_count": 0,
+            "has_3d_model": False,
+        }
+        assert result["count"] == 3
+        assert result["total"] == 3
+        assert result["truncated"] is False
+
+    def test_live_scan_truncates_but_reports_true_total(self, tools, project, tmp_path):
+        live_lib = tmp_path / "LiveTrunc.pretty"
+        live_lib.mkdir()
+        for name in ("Ccc", "Aaa", "Bbb"):
+            _write_mod(str(live_lib), name)
+        _make_fp_lib_table(tmp_path, [("LiveTrunc", str(live_lib))])
+        board = tmp_path / "trunc.kicad_pcb"
+        board.write_text("(kicad_pcb)\n", encoding="utf-8")
+
+        result = _run(
+            tools["list_library_footprints"](
+                library_name="LiveTrunc",
+                project_path=str(board),
+                max_results=2,
+                ctx=None,
+            )
+        )
+
+        assert result["source"] == "live_scan"
+        assert [f["name"] for f in result["footprints"]] == ["Aaa", "Bbb"]
+        assert result["count"] == 2
+        assert result["total"] == 3
+        assert result["truncated"] is True
+
+    def test_indexed_library_with_no_rows_degrades_to_live_scan(self, tools, project, tmp_path):
+        """An indexed library whose rows are empty still scans its directory."""
+        lib_dir = tmp_path / "ZeroIdx.pretty"
+        lib_dir.mkdir()
+        mgr = project["index_mgr"]
+        mgr.index_library("ZeroIdx", str(lib_dir))  # row exists, zero footprints
+        _write_mod(str(lib_dir), "LateFootprint")
+
+        result = _run(tools["list_library_footprints"](library_name="ZeroIdx", ctx=None))
+
+        assert result["source"] == "live_scan"
+        assert [f["name"] for f in result["footprints"]] == ["LateFootprint"]
+        assert result["count"] == 1
+        assert result["total"] == 1
+
+    def test_unknown_library_returns_error_and_hint(self, tools):
+        result = _run(tools["list_library_footprints"](library_name="NoSuchLib", ctx=None))
+
+        assert result["error"] == "Library 'NoSuchLib' not found."
+        assert result["hint"] == "Call list_footprint_libraries to see available nicknames."
+        assert "footprints" not in result
+
+    def test_truncates_but_reports_true_total(self, tools, project, tmp_path):
+        lib_dir = tmp_path / "Trunc.pretty"
+        lib_dir.mkdir()
+        for name in ("Ccc", "Aaa", "Bbb"):
+            _write_mod(str(lib_dir), name)
+        project["index_mgr"].index_library("Trunc", str(lib_dir))
+
+        result = _run(
+            tools["list_library_footprints"](library_name="Trunc", max_results=2, ctx=None)
+        )
+
+        assert [f["name"] for f in result["footprints"]] == ["Aaa", "Bbb"]
+        assert result["count"] == 2
+        assert result["total"] == 3
+        assert result["truncated"] is True
+
+    def test_index_paginates_with_offset(self, tools, project, tmp_path):
+        lib_dir = tmp_path / "Paged.pretty"
+        lib_dir.mkdir()
+        for name in ("Eee", "Aaa", "Ccc", "Bbb", "Ddd"):
+            _write_mod(str(lib_dir), name)
+        project["index_mgr"].index_library("Paged", str(lib_dir))
+
+        pages = [
+            (0, ["Aaa", "Bbb"], 2),
+            (2, ["Ccc", "Ddd"], 4),
+            (4, ["Eee"], None),
+        ]
+        for offset, expected, next_offset in pages:
+            result = _run(
+                tools["list_library_footprints"](
+                    library_name="Paged", max_results=2, offset=offset, ctx=None
+                )
+            )
+
+            assert [f["name"] for f in result["footprints"]] == expected
+            assert result["offset"] == offset
+            assert result["count"] == len(expected)
+            assert result["total"] == 5
+            assert result["has_more"] is (next_offset is not None)
+            assert result["next_offset"] == next_offset
+            assert result["truncated"] is result["has_more"]
+
+    def test_live_scan_paginates_and_parses_only_the_page(
+        self, tools, project, tmp_path, monkeypatch
+    ):
+        live_lib = tmp_path / "LivePaged.pretty"
+        live_lib.mkdir()
+        for name in ("Eee", "Aaa", "Ccc", "Bbb", "Ddd"):
+            _write_mod(str(live_lib), name)
+        _make_fp_lib_table(tmp_path, [("LivePaged", str(live_lib))])
+        board = tmp_path / "paged.kicad_pcb"
+        board.write_text("(kicad_pcb)\n", encoding="utf-8")
+
+        import kcaa.tools.pcb_library_tools as mod
+
+        real_parse = mod.parse_kicad_mod
+        parsed: list[str] = []
+
+        def counting_parse(path):
+            parsed.append(os.path.basename(path))
+            return real_parse(path)
+
+        monkeypatch.setattr(mod, "parse_kicad_mod", counting_parse)
+
+        pages = [
+            (0, ["Aaa", "Bbb"], 2),
+            (2, ["Ccc", "Ddd"], 4),
+            (4, ["Eee"], None),
+        ]
+        for offset, expected, next_offset in pages:
+            parsed.clear()
+            result = _run(
+                tools["list_library_footprints"](
+                    library_name="LivePaged",
+                    project_path=str(board),
+                    max_results=2,
+                    offset=offset,
+                    ctx=None,
+                )
+            )
+
+            assert [f["name"] for f in result["footprints"]] == expected
+            # Only the selected page's files are parsed.
+            assert parsed == [name + ".kicad_mod" for name in expected]
+            assert result["offset"] == offset
+            assert result["count"] == len(expected)
+            assert result["total"] == 5
+            assert result["has_more"] is (next_offset is not None)
+            assert result["next_offset"] == next_offset
+            assert result["truncated"] is result["has_more"]
+
+    def test_offset_beyond_end_returns_empty_page(self, tools, project, tmp_path):
+        lib_dir = tmp_path / "Short.pretty"
+        lib_dir.mkdir()
+        for name in ("Bbb", "Aaa", "Ccc"):
+            _write_mod(str(lib_dir), name)
+        project["index_mgr"].index_library("Short", str(lib_dir))
+
+        result = _run(
+            tools["list_library_footprints"](
+                library_name="Short", max_results=2, offset=10, ctx=None
+            )
+        )
+
+        assert result["footprints"] == []
+        assert result["count"] == 0
+        assert result["total"] == 3
+        assert result["offset"] == 10
+        assert result["has_more"] is False
+        assert result["next_offset"] is None
+        assert result["truncated"] is False
+
+    def test_negative_offset_returns_error(self, tools):
+        result = _run(
+            tools["list_library_footprints"](library_name="Anything", offset=-1, ctx=None)
+        )
+
+        assert result["error"] == "offset must be >= 0"
+        assert result["hint"] == "Use offset >= 0; it is the number of rows to skip."
+        assert "footprints" not in result
+
+    def test_last_page_with_offset_is_not_truncated(self, tools, project, tmp_path):
+        lib_dir = tmp_path / "LastPage.pretty"
+        lib_dir.mkdir()
+        for name in ("Ccc", "Aaa", "Bbb"):
+            _write_mod(str(lib_dir), name)
+        project["index_mgr"].index_library("LastPage", str(lib_dir))
+
+        result = _run(
+            tools["list_library_footprints"](
+                library_name="LastPage", max_results=2, offset=2, ctx=None
+            )
+        )
+
+        assert [f["name"] for f in result["footprints"]] == ["Ccc"]
+        assert result["count"] == 1
+        assert result["total"] == 3
+        assert result["offset"] == 2
+        assert result["has_more"] is False
+        assert result["truncated"] is False
+        assert result["next_offset"] is None
+
+    def test_index_pagination_boundaries(self, tools, project, tmp_path):
+        lib_dir = tmp_path / "IndexBounds.pretty"
+        lib_dir.mkdir()
+        for name in ("Ddd", "Bbb", "Aaa", "Ccc"):
+            _write_mod(str(lib_dir), name)
+        project["index_mgr"].index_library("IndexBounds", str(lib_dir))
+
+        # (a) Last full page: offset + count == total and count == max_results.
+        last_full = _run(
+            tools["list_library_footprints"](
+                library_name="IndexBounds", max_results=2, offset=2, ctx=None
+            )
+        )
+        assert last_full["source"] == "index"
+        assert [f["name"] for f in last_full["footprints"]] == ["Ccc", "Ddd"]
+        assert last_full["count"] == 2
+        assert last_full["total"] == 4
+        assert last_full["offset"] == 2
+        assert last_full["has_more"] is False
+        assert last_full["next_offset"] is None
+        assert last_full["truncated"] is False
+
+        # (b) offset == total.
+        at_end = _run(
+            tools["list_library_footprints"](
+                library_name="IndexBounds", max_results=2, offset=4, ctx=None
+            )
+        )
+        assert at_end["footprints"] == []
+        assert at_end["count"] == 0
+        assert at_end["total"] == 4
+        assert at_end["offset"] == 4
+        assert at_end["has_more"] is False
+        assert at_end["next_offset"] is None
+        assert at_end["truncated"] is False
+
+        # (c) max_results > total.
+        oversized = _run(
+            tools["list_library_footprints"](
+                library_name="IndexBounds", max_results=10, offset=0, ctx=None
+            )
+        )
+        assert [f["name"] for f in oversized["footprints"]] == ["Aaa", "Bbb", "Ccc", "Ddd"]
+        assert oversized["count"] == 4
+        assert oversized["total"] == 4
+        assert oversized["offset"] == 0
+        assert oversized["has_more"] is False
+        assert oversized["next_offset"] is None
+        assert oversized["truncated"] is False
+
+    def test_live_scan_pagination_boundaries(self, tools, project, tmp_path):
+        live_lib = tmp_path / "LiveBounds.pretty"
+        live_lib.mkdir()
+        for name in ("Ddd", "Bbb", "Aaa", "Ccc"):
+            _write_mod(str(live_lib), name)
+        _make_fp_lib_table(tmp_path, [("LiveBounds", str(live_lib))])
+        board = tmp_path / "bounds.kicad_pcb"
+        board.write_text("(kicad_pcb)\n", encoding="utf-8")
+
+        # (a) Last full page: offset + count == total and count == max_results.
+        last_full = _run(
+            tools["list_library_footprints"](
+                library_name="LiveBounds",
+                project_path=str(board),
+                max_results=2,
+                offset=2,
+                ctx=None,
+            )
+        )
+        assert last_full["source"] == "live_scan"
+        assert [f["name"] for f in last_full["footprints"]] == ["Ccc", "Ddd"]
+        assert last_full["count"] == 2
+        assert last_full["total"] == 4
+        assert last_full["offset"] == 2
+        assert last_full["has_more"] is False
+        assert last_full["next_offset"] is None
+        assert last_full["truncated"] is False
+
+        # (b) offset == total.
+        at_end = _run(
+            tools["list_library_footprints"](
+                library_name="LiveBounds",
+                project_path=str(board),
+                max_results=2,
+                offset=4,
+                ctx=None,
+            )
+        )
+        assert at_end["footprints"] == []
+        assert at_end["count"] == 0
+        assert at_end["total"] == 4
+        assert at_end["offset"] == 4
+        assert at_end["has_more"] is False
+        assert at_end["next_offset"] is None
+        assert at_end["truncated"] is False
+
+        # (c) max_results > total.
+        oversized = _run(
+            tools["list_library_footprints"](
+                library_name="LiveBounds",
+                project_path=str(board),
+                max_results=10,
+                offset=0,
+                ctx=None,
+            )
+        )
+        assert [f["name"] for f in oversized["footprints"]] == ["Aaa", "Bbb", "Ccc", "Ddd"]
+        assert oversized["count"] == 4
+        assert oversized["total"] == 4
+        assert oversized["offset"] == 0
+        assert oversized["has_more"] is False
+        assert oversized["next_offset"] is None
+        assert oversized["truncated"] is False
+
+    def test_live_scan_empty_library_with_positive_offset(self, tools, project, tmp_path):
+        empty_lib = tmp_path / "EmptyPage.pretty"
+        empty_lib.mkdir()
+        _make_fp_lib_table(tmp_path, [("EmptyPage", str(empty_lib))])
+        board = tmp_path / "empty_page.kicad_pcb"
+        board.write_text("(kicad_pcb)\n", encoding="utf-8")
+
+        result = _run(
+            tools["list_library_footprints"](
+                library_name="EmptyPage",
+                project_path=str(board),
+                max_results=2,
+                offset=5,
+                ctx=None,
+            )
+        )
+
+        assert result["source"] == "live_scan"
+        assert result["footprints"] == []
+        assert result["count"] == 0
+        assert result["total"] == 0
+        assert result["offset"] == 5
+        assert result["has_more"] is False
+        assert result["next_offset"] is None
+        assert result["truncated"] is False
+        assert "error" not in result
+
+    def test_indexed_empty_library_with_positive_offset_is_empty(self, tools, project, tmp_path):
+        """An empty indexed library degrades to live scan and stays an empty page."""
+        lib_dir = tmp_path / "IndexedEmpty.pretty"
+        lib_dir.mkdir()
+        project["index_mgr"].index_library("IndexedEmpty", str(lib_dir))
+
+        result = _run(
+            tools["list_library_footprints"](
+                library_name="IndexedEmpty", max_results=2, offset=3, ctx=None
+            )
+        )
+
+        assert result["source"] == "live_scan"
+        assert result["library_path"] == str(lib_dir)
+        assert result["footprints"] == []
+        assert result["count"] == 0
+        assert result["total"] == 0
+        assert result["offset"] == 3
+        assert result["has_more"] is False
+        assert result["next_offset"] is None
+        assert result["truncated"] is False
+        assert "error" not in result
+
+    def test_empty_library_directory(self, tools, project, tmp_path):
+        empty_lib = tmp_path / "EmptyLib.pretty"
+        empty_lib.mkdir()
+        _make_fp_lib_table(tmp_path, [("EmptyLib", str(empty_lib))])
+        board = tmp_path / "empty.kicad_pcb"
+        board.write_text("(kicad_pcb)\n", encoding="utf-8")
+
+        result = _run(
+            tools["list_library_footprints"](
+                library_name="EmptyLib", project_path=str(board), ctx=None
+            )
+        )
+
+        assert result["footprints"] == []
+        assert result["count"] == 0
+        assert result["total"] == 0
+        assert result["truncated"] is False
+        assert "error" not in result
+
+    def test_table_directory_missing_returns_error(self, tools, project, tmp_path):
+        missing = tmp_path / "Nope.pretty"  # never created
+        _make_fp_lib_table(tmp_path, [("Missing", str(missing))])
+        board = tmp_path / "missing.kicad_pcb"
+        board.write_text("(kicad_pcb)\n", encoding="utf-8")
+
+        result = _run(
+            tools["list_library_footprints"](
+                library_name="Missing", project_path=str(board), ctx=None
+            )
+        )
+
+        assert result["error"] == (
+            f"Library 'Missing' resolves to '{missing}', which is not a directory."
+        )
+        assert result["hint"] == (
+            "Check the library path for 'Missing' in Manage Footprint Libraries "
+            "(fp-lib-table); the directory does not exist."
+        )
+        assert "sync_footprint_index" not in result["hint"]
+        assert "footprints" not in result
+
+    def test_stale_index_directory_returns_error(self, tools, project, tmp_path):
+        stale = tmp_path / "Gone.pretty"
+        stale.mkdir()
+        _write_mod(str(stale), "Ghost")
+        project["index_mgr"].index_library("Gone", str(stale))
+        shutil.rmtree(stale)
+
+        result = _run(tools["list_library_footprints"](library_name="Gone", ctx=None))
+
+        assert result["error"] == (
+            f"Library 'Gone' resolves to '{stale}', which is not a directory."
+        )
+        assert result["hint"] == "Run sync_footprint_index to refresh the index."
+        assert "footprints" not in result
+
+    def test_stale_index_directory_falls_back_to_table(self, tools, project, tmp_path):
+        stale = tmp_path / "Moved.pretty"
+        stale.mkdir()
+        _write_mod(str(stale), "Ghost")
+        project["index_mgr"].index_library("Moved", str(stale))
+        shutil.rmtree(stale)
+
+        fresh = tmp_path / "MovedFresh.pretty"
+        fresh.mkdir()
+        _write_mod(str(fresh), "FreshFootprint")
+        _make_fp_lib_table(tmp_path, [("Moved", str(fresh))])
+        board = tmp_path / "moved.kicad_pcb"
+        board.write_text("(kicad_pcb)\n", encoding="utf-8")
+
+        result = _run(
+            tools["list_library_footprints"](
+                library_name="Moved", project_path=str(board), ctx=None
+            )
+        )
+
+        assert result["source"] == "live_scan"
+        assert result["library_path"] == str(fresh)
+        assert [f["name"] for f in result["footprints"]] == ["FreshFootprint"]
+        assert result["count"] == 1
+
+    @pytest.mark.parametrize("max_results", [0, -1])
+    def test_max_results_below_one_returns_error(self, tools, max_results):
+        result = _run(
+            tools["list_library_footprints"](
+                library_name="Anything", max_results=max_results, ctx=None
+            )
+        )
+
+        assert result["error"] == "max_results must be >= 1"
+        assert result["hint"] == "Use max_results >= 1; the total is reported in `total`."
+        assert "footprints" not in result
+
+    def test_tool_is_registered(self, tools):
+        assert "list_library_footprints" in tools
