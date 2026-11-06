@@ -3133,11 +3133,11 @@ def register_symbol_edit_tools(mcp: FastMCP) -> None:
 
         Object: components placed in a schematic — not library symbol
         definitions and not PCB footprints.
-        Key: a single absolute ``schematic_path`` plus a non-empty
-        ``references`` list.
+        Key: a single ``schematic_path`` plus a non-empty ``references`` list.
         Returns: property name → value only; no geometry, position, or nets.
         Use instead: ``get_symbol`` / ``get_symbol_pins`` for the library
         definition and pin data, and ``get_footprint`` for PCB placement geometry.
+        For the library footprint definition use ``get_footprint_details``.
 
         Returns every ``(property ...)`` entry found on the first unit of the
         component identified by *reference*.  All units of a multi-unit
