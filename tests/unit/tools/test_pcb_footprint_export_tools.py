@@ -1379,7 +1379,7 @@ def _write_mod(
     return path
 
 
-class TestListLibraryFootprints:
+class TestGetLibraryFootprints:
     def test_index_returns_sorted_footprints_with_metadata(self, tools, project, tmp_path):
         lib_dir = tmp_path / "Alpha.pretty"
         lib_dir.mkdir()
