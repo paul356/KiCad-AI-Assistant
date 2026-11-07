@@ -104,6 +104,15 @@ def _elide_tool_result_image(result: Any) -> Any:
     return out
 
 
+def _should_follow_output(auto_scroll: bool, follow: bool) -> bool:
+    """Whether a render should pin the conversation to its newest entry.
+
+    ``follow`` describes the render (a turn is producing output); the user's
+    auto-scroll checkbox gates it.  Both must hold to scroll to the bottom.
+    """
+    return auto_scroll and follow
+
+
 def _should_offer_update(latest: str, current: str) -> bool:
     """Panel-side decision: offer an upgrade when the release tag differs."""
     from .. import updater
@@ -205,6 +214,10 @@ if _WX_AVAILABLE:
             # _save_session_to_disk overwrites this file when set, or creates
             # a new timestamped one otherwise.
             self._current_session_file: str | None = None
+            # User-controlled: when False, renders never scroll the
+            # conversation to the newest entry (the view stays where the user
+            # left it).
+            self._auto_scroll_enabled: bool = True
             # Keep the conversation pinned to the newest output while one AI
             # turn is actively streaming / appending tool results.
             self._follow_output_to_bottom: bool = False
@@ -514,6 +527,14 @@ if _WX_AVAILABLE:
 
             vbox.Add(hbox, 0, wx.ALL | wx.EXPAND, 4)
 
+            # ---- Auto-scroll checkbox (below the input row) ----
+            self._auto_scroll_checkbox = wx.CheckBox(panel, label="Auto-scroll")
+            self._auto_scroll_checkbox.SetValue(True)
+            self._auto_scroll_checkbox.SetToolTip(
+                "Keep the conversation pinned to the newest message while the assistant works"
+            )
+            vbox.Add(self._auto_scroll_checkbox, 0, wx.LEFT | wx.BOTTOM, 4)
+
             panel.SetSizer(vbox)
 
             # ---- Menu bar ----
@@ -580,6 +601,7 @@ if _WX_AVAILABLE:
             self._search_next_btn.Bind(wx.EVT_BUTTON, self._on_search_next)
             self._search_prev_btn.Bind(wx.EVT_BUTTON, self._on_search_prev)
             self._search_close_btn.Bind(wx.EVT_BUTTON, self._on_search_close)
+            self._auto_scroll_checkbox.Bind(wx.EVT_CHECKBOX, self._on_auto_scroll_toggle)
             self.Bind(wx.EVT_CLOSE, self._on_close)
             self.Bind(wx.EVT_WINDOW_DESTROY, self._on_destroy)
 
@@ -953,7 +975,9 @@ if _WX_AVAILABLE:
                 self._attached_files.clear()
                 self._refresh_attachments_bar()
                 self._follow_output_to_bottom = True
-                self._render_conversation(force_scroll_to_bottom=True)
+                self._render_conversation(
+                    force_scroll_to_bottom=_should_follow_output(self._auto_scroll_enabled, True)
+                )
 
             # Busy from here on: the turn owns the UI until turn_end.
             self._busy = True
@@ -1111,7 +1135,10 @@ if _WX_AVAILABLE:
                                 pdf_block = "\n\n".join(pdf_blocks)
                                 text_with_pdf = text + ("\n\n" if text else "") + pdf_block
                             # Re-render so the collapsible PDF text appears
-                            wx.CallAfter(self._render_conversation, True)
+                            wx.CallAfter(
+                                self._render_conversation,
+                                _should_follow_output(self._auto_scroll_enabled, True),
+                            )
                         reply = self._llm_client.run(
                             text_with_pdf,
                             context_block,
@@ -1758,9 +1785,17 @@ if _WX_AVAILABLE:
                             len(self._pending_ai_text),
                         )
                 else:
-                    self._render_conversation(force_scroll_to_bottom=self._follow_output_to_bottom)
+                    self._render_conversation(
+                        force_scroll_to_bottom=_should_follow_output(
+                            self._auto_scroll_enabled, self._follow_output_to_bottom
+                        )
+                    )
             if entries_changed or turn_ended:
-                self._render_conversation(force_scroll_to_bottom=self._follow_output_to_bottom)
+                self._render_conversation(
+                    force_scroll_to_bottom=_should_follow_output(
+                        self._auto_scroll_enabled, self._follow_output_to_bottom
+                    )
+                )
 
             if turn_ended:
                 self._finish_turn(turn_ctx)
@@ -1808,13 +1843,14 @@ if _WX_AVAILABLE:
             import json as _json
 
             body_html = self._md_to_html(self._pending_ai_text)
-            scroll_arg = "true" if self._follow_output_to_bottom else "false"
+            follow = _should_follow_output(self._auto_scroll_enabled, self._follow_output_to_bottom)
+            scroll_arg = "true" if follow else "false"
             js = f"_updateStream({_json.dumps(body_html)}, {scroll_arg})"
 
             return bool(
                 self._run_script(
                     js,
-                    force_scroll_to_bottom=self._follow_output_to_bottom,
+                    force_scroll_to_bottom=follow,
                     retry_on_failure=True,
                 )[0]
             )
@@ -1912,7 +1948,11 @@ if _WX_AVAILABLE:
                             "color_hex": self._C_OK_HEX,
                         }
                     )
-                    self._render_conversation(force_scroll_to_bottom=self._follow_output_to_bottom)
+                    self._render_conversation(
+                        force_scroll_to_bottom=_should_follow_output(
+                            self._auto_scroll_enabled, self._follow_output_to_bottom
+                        )
+                    )
                 except ImportError:
                     pass  # outside KiCad — silently skip
                 except Exception as e:
@@ -1923,7 +1963,11 @@ if _WX_AVAILABLE:
                             "color_hex": self._C_WARN_HEX,
                         }
                     )
-                    self._render_conversation(force_scroll_to_bottom=self._follow_output_to_bottom)
+                    self._render_conversation(
+                        force_scroll_to_bottom=_should_follow_output(
+                            self._auto_scroll_enabled, self._follow_output_to_bottom
+                        )
+                    )
                     return
             if self._schematic_edited:
                 self._append_entry(
@@ -1933,7 +1977,11 @@ if _WX_AVAILABLE:
                         "color_hex": self._C_WARN_HEX,
                     }
                 )
-                self._render_conversation(force_scroll_to_bottom=self._follow_output_to_bottom)
+                self._render_conversation(
+                    force_scroll_to_bottom=_should_follow_output(
+                        self._auto_scroll_enabled, self._follow_output_to_bottom
+                    )
+                )
 
         def _on_stop(self, event) -> None:
             """Stop button: cancel the in-progress LLM turn."""
@@ -1968,9 +2016,18 @@ if _WX_AVAILABLE:
                 self._pending_ai_text = ""
                 self._conv_version += 1
                 if self._use_webview and self._shell_loaded:
-                    self._append_entry_js(entry, force_scroll_to_bottom=True)
+                    self._append_entry_js(
+                        entry,
+                        force_scroll_to_bottom=_should_follow_output(
+                            self._auto_scroll_enabled, True
+                        ),
+                    )
                 else:
-                    self._render_conversation(force_scroll_to_bottom=True)
+                    self._render_conversation(
+                        force_scroll_to_bottom=_should_follow_output(
+                            self._auto_scroll_enabled, True
+                        )
+                    )
             self._busy = False
             self._toggle_send_stop(busy=False)
             # Persist what has been finalised so far — the turn was cancelled
@@ -2455,6 +2512,23 @@ if _WX_AVAILABLE:
                 wx.OK | wx.ICON_INFORMATION,
                 self,
             )
+
+        # ---- Auto-scroll ----
+
+        def _on_auto_scroll_toggle(self, event) -> None:
+            """Apply the Auto-scroll checkbox.
+
+            Unchecking only flips the flag: later renders must leave the view
+            where the user put it.  Re-checking pins the view to the newest
+            entry once so the user lands on the current output.
+            """
+            self._auto_scroll_enabled = bool(event.IsChecked())
+            if self._auto_scroll_enabled:
+                log.info("chat: auto-scroll enabled")
+                if self._use_webview and self._shell_loaded:
+                    self._render_conversation(force_scroll_to_bottom=True)
+            else:
+                log.info("chat: auto-scroll disabled")
 
         # ---- Search / Find handlers ----
 
@@ -3073,7 +3147,9 @@ if _WX_AVAILABLE:
             self._current_session_file = os.path.basename(path)
             _sstore.update_current_link(self._settings.config_dir, self._current_session_file)
 
-            self._render_conversation(force_scroll_to_bottom=True)
+            self._render_conversation(
+                force_scroll_to_bottom=_should_follow_output(self._auto_scroll_enabled, True)
+            )
             self._set_status("✅ Session restored", self._C_OK)
             self.Layout()
             return True
@@ -3435,8 +3511,10 @@ if _WX_AVAILABLE:
                     "color_hex": self._C_TOOL_HEX,
                 }
             )
-            # Render once with all content and force scroll to bottom
-            self._render_conversation(force_scroll_to_bottom=True)
+            # Render once with all content and follow the newest entry
+            self._render_conversation(
+                force_scroll_to_bottom=_should_follow_output(self._auto_scroll_enabled, True)
+            )
 
         # ------------------------------------------------------------------ #
         # Rendering helpers
@@ -3668,7 +3746,7 @@ if _WX_AVAILABLE:
             # Trigger render if there is content or pending
             if self._render_pending or self._conv_entries:
                 self._render_pending = False
-                self._update_conversation(True)
+                self._update_conversation(_should_follow_output(self._auto_scroll_enabled, True))
 
         # ------------------------------------------------------------------ #
         # WebView rendering: SetPage-once architecture

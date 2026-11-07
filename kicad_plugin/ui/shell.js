@@ -153,11 +153,25 @@ window._updateConversation = function(entriesJson, scrollBehavior) {
         for (var i = 0; i < entries.length; i++) {
             frag.appendChild(_renderEntry(entries[i]));
         }
+        // A rebuild must not move the reader or collapse tool results they
+        // expanded: capture both, in document order, before wiping the DOM.
+        var sy = window.scrollY;
+        var openRows = [];
+        var oldRows = document.querySelectorAll('details.tools');
+        for (var j = 0; j < oldRows.length; j++) {
+            openRows.push(oldRows[j].open);
+        }
         conv.innerHTML = '';
         conv.appendChild(frag);
         var sw = document.getElementById('stream-wrapper');
         if (sw) sw.style.display = 'none';
         document.getElementById('pending-ai-text').innerHTML = '';
+        // Restore by index; a longer new list just gets its defaults (closed).
+        var newRows = document.querySelectorAll('details.tools');
+        for (var k = 0; k < openRows.length && k < newRows.length; k++) {
+            newRows[k].open = openRows[k];
+        }
+        window.scrollTo(0, sy);
         if (scrollBehavior === 'bottom') {
             window.scrollTo(0, document.body ? document.body.scrollHeight : 0);
         }
