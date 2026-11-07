@@ -52,6 +52,9 @@ function makeEnv() {
     sandbox.scrollY = 0;
     sandbox.scrollTo = function(x, y) {
         scrollCalls.push([x, y]);
+        // Model the real browser result so tests assert the resulting
+        // position, not merely whether scrollTo was called.
+        sandbox.scrollY = y;
     };
 
     const context = vm.createContext(sandbox);
@@ -134,6 +137,8 @@ runSection('1. _updateConversation(..., "preserve") keeps scroll and open rows',
         assert(scrollCalls[0][0] === 0 && scrollCalls[0][1] === 120,
             'restores window.scrollY: got ' + JSON.stringify(scrollCalls[0]));
     }
+    assert(sandbox.scrollY === 120,
+        'resulting scroll position is the saved offset: got ' + sandbox.scrollY);
 });
 
 // (b) 'bottom' scrolls to the document height (bottom wins over restore).
@@ -153,6 +158,8 @@ runSection('2. _updateConversation(..., "bottom") pins to document height', func
         assert(last[0] === 0 && last[1] === document.body.scrollHeight,
             'last scroll is document height: got ' + JSON.stringify(last));
     }
+    assert(sandbox.scrollY === document.body.scrollHeight,
+        'resulting scroll position is document height: got ' + sandbox.scrollY);
     assert(toolRows(document)[0].open === true, 'bottom still keeps expanded rows open');
 });
 
@@ -219,8 +226,8 @@ runSection('5. Replacement mode does not inherit previous document state', funct
         assert(rows[0].open === false && rows[1].open === false,
             'replacement rows start closed (no inherited open flags)');
     }
-    assert(scrollCalls.length === 0,
-        'replacement does not restore the old scroll offset: got ' + JSON.stringify(scrollCalls));
+    assert(sandbox.scrollY === 0,
+        'replacement resets the scroll position to the top: got ' + sandbox.scrollY);
 });
 
 // (f) Replacement mode still honours an explicit bottom request.
@@ -245,9 +252,15 @@ runSection('6. Replacement with "bottom" pins to the new document height', funct
     } else {
         assert(false, 'expected two replacement rows: got ' + rows.length);
     }
-    assert(scrollCalls.length === 1 && scrollCalls[0][0] === 0
-        && scrollCalls[0][1] === document.body.scrollHeight,
-        'replacement-bottom scrolls once to document height: got ' + JSON.stringify(scrollCalls));
+    assert(scrollCalls.length === 2,
+        'replace-bottom resets to top, then scrolls to bottom: got ' + JSON.stringify(scrollCalls));
+    if (scrollCalls.length > 0) {
+        const last = scrollCalls[scrollCalls.length - 1];
+        assert(last[0] === 0 && last[1] === document.body.scrollHeight,
+            'last scroll is document height: got ' + JSON.stringify(last));
+    }
+    assert(sandbox.scrollY === document.body.scrollHeight,
+        'replacement-bottom ends at document height: got ' + sandbox.scrollY);
 });
 
 // ---- Summary ----

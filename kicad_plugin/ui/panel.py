@@ -236,6 +236,11 @@ if _WX_AVAILABLE:
             # by whoever releases the render lock, or by the shell-load
             # completion path.
             self._render_pending: bool = False
+            # Flags of the render request that set _render_pending.  The
+            # deferred request owns them; the replay must not borrow the
+            # flags of whichever call happens to release the lock.
+            self._pending_force_scroll_to_bottom: bool = False
+            self._pending_replace: bool = False
             # True when the stream-wrapper table is visible in the shell.
             self._stream_wrapper_visible: bool = False
             # Shell load retry counter (prevents infinite retry on WebView2 failure).
@@ -3858,13 +3863,19 @@ if _WX_AVAILABLE:
             else:
                 log.debug("_updateConversation JS result: %s", result_str)
 
-        def _process_pending_render(
-            self, force_scroll_to_bottom: bool, replace: bool = False
-        ) -> None:
-            """Process any pending render after _js_running is reset."""
+        def _process_pending_render(self) -> None:
+            """Process any pending render after _js_running is reset.
+
+            The flags stored when the request was deferred are replayed;
+            the call that releases the lock does not own them.
+            """
             if self._render_pending:
                 self._render_pending = False
-                wx.CallAfter(self._update_conversation, force_scroll_to_bottom, replace)
+                wx.CallAfter(
+                    self._update_conversation,
+                    self._pending_force_scroll_to_bottom,
+                    self._pending_replace,
+                )
 
         # ------------------------------------------------------------------ #
         # Render protocol: single RunScript funnel
@@ -3902,6 +3913,9 @@ if _WX_AVAILABLE:
             if not self._use_webview:
                 return False, None
             if not self._try_acquire_render_lock(probe=probe):
+                # The deferred request owns these flags; capture them now.
+                self._pending_force_scroll_to_bottom = force_scroll_to_bottom
+                self._pending_replace = replace
                 return False, None  # deferred: _render_pending already set
             try:
                 ok, result = self._conv_view.RunScript(js)
@@ -3909,14 +3923,18 @@ if _WX_AVAILABLE:
                     log.warning("_run_script: RunScript failed: %r", result)
                     if retry_on_failure:
                         self._render_pending = True
+                        self._pending_force_scroll_to_bottom = force_scroll_to_bottom
+                        self._pending_replace = replace
                 return ok, result
             except Exception as e:
                 log.warning("_run_script exception: %s", e)
                 if retry_on_failure:
                     self._render_pending = True
+                    self._pending_force_scroll_to_bottom = force_scroll_to_bottom
+                    self._pending_replace = replace
                 return False, None
             finally:
-                self._release_render_lock(force_scroll_to_bottom, replace)
+                self._release_render_lock()
 
         # ------------------------------------------------------------------ #
         # Render lock helpers: encapsulate sync state management
@@ -3984,10 +4002,10 @@ if _WX_AVAILABLE:
             log.warning("Shell loaded but JS not working after 3 attempts, allowing retry")
             return False
 
-        def _release_render_lock(self, force_scroll_to_bottom: bool, replace: bool = False) -> None:
+        def _release_render_lock(self) -> None:
             """Release the render lock and process pending if needed."""
             self._js_running = False
-            self._process_pending_render(force_scroll_to_bottom, replace)
+            self._process_pending_render()
 
         def _append_entry_js(self, entry: dict, force_scroll_to_bottom: bool = False) -> None:
             """Append a single entry via JS _appendEntry (WebView path)."""
@@ -4065,6 +4083,8 @@ if _WX_AVAILABLE:
                 # which will trigger pending renders when done
                 if self._page_loading:
                     self._render_pending = True
+                    self._pending_force_scroll_to_bottom = force_scroll_to_bottom
+                    self._pending_replace = replace
                     return  # Let the page load complete and handle it
 
                 # Delegate to _update_conversation which handles locking
@@ -4190,13 +4210,16 @@ if _WX_AVAILABLE:
             # Capture scroll position before replacing the page
             _max = self._conv_view.GetScrollRange(wx.VERTICAL)
             _pos = self._conv_view.GetScrollPos(wx.VERTICAL)
-            follow = _should_follow_output(self._auto_scroll_enabled, force_scroll_to_bottom)
+            follow = force_scroll_to_bottom
             if replace:
                 # Fresh document: only the caller's explicit choice applies.
                 _at_bottom = follow
             else:
-                _at_bottom = (
-                    follow or _max == 0 or (self._auto_scroll_enabled and (_max - _pos) < 3)
+                # ``follow`` is already the caller's decision (explicit force
+                # or the checkbox-gated streaming request).  Only the
+                # parked-at-bottom convenience is gated by the checkbox.
+                _at_bottom = follow or (
+                    self._auto_scroll_enabled and (_max == 0 or (_max - _pos) < 3)
                 )
 
             parts.append("</body></html>")
