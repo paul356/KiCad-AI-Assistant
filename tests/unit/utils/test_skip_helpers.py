@@ -8,6 +8,7 @@ The world position must come from the CCW matrix
 exit conversion ``(angle + 180) % 360`` (wire-exit = stub reversed).
 """
 
+import logging
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -166,6 +167,30 @@ class TestFallbackPath:
         assert (pin.x, pin.y) == pytest.approx((100.0, 97.46))
         assert pin.angle == 90.0
 
+    def test_multi_pin_fallback_warns_about_lost_unit_filtering(self, caplog):
+        """A multi-pin lib definition reached through the fallback may mix
+        units, so the degradation must remain visible."""
+        lib_pins = [
+            _lib_pin("1", "P", 0.0, 2.54, 270),
+            _lib_pin("2", "", 0.0, -2.54, 90),
+        ]
+        sym = _sym(
+            100.0,
+            100.0,
+            0,
+            lib_pins,
+            pins=[SimpleNamespace(), SimpleNamespace()],
+        )
+        with caplog.at_level(logging.DEBUG, logger="kcaa.utils.skip_helpers"):
+            coords = sym_pin_world_coords(sym)
+        assert len(coords) == 2
+        warnings = [
+            r.getMessage()
+            for r in caplog.records
+            if r.name == "kcaa.utils.skip_helpers" and r.levelno >= logging.WARNING
+        ]
+        assert any("per-unit filtering lost" in message for message in warnings)
+
 
 class TestSinglePinSymbolFixture:
     """Regression for #251: a one-pin part must still report its pin.
@@ -192,3 +217,14 @@ class TestSinglePinSymbolFixture:
         assert (pin.x, pin.y) == pytest.approx((100.0, 100.0))
         assert pin.electrical_type == "passive"
         assert pin.angle == 180.0  # non-None wire-exit direction: left
+
+    def test_single_pin_fixture_does_not_warn(self, mgt1, caplog):
+        with caplog.at_level(logging.DEBUG, logger="kcaa.utils.skip_helpers"):
+            coords = sym_pin_world_coords(mgt1)
+        assert len(coords) == 1
+        warnings = [
+            r.getMessage()
+            for r in caplog.records
+            if r.name == "kcaa.utils.skip_helpers" and r.levelno >= logging.WARNING
+        ]
+        assert warnings == []

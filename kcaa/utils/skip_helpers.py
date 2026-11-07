@@ -213,6 +213,7 @@ def sym_pin_world_coords(sym: Any) -> list[PinWorldCoords]:
         pass
 
     used_wrapper_fallback = not results and had_wrappers
+    lib_pin_count = 0
 
     if not results:
         # ---- Fallback path: raw lib-symbol definition ---------------------
@@ -224,7 +225,16 @@ def sym_pin_world_coords(sym: Any) -> list[PinWorldCoords]:
         try:
             lib_sym = sym.lib_symbol
             if lib_sym is not None:
-                for lib_pin in lib_sym.pin:
+                try:
+                    lib_pins = list(lib_sym.pin)
+                except Exception as exc:
+                    log.debug(
+                        "sym_pin_world_coords: cannot enumerate lib pins: %s",
+                        exc,
+                    )
+                    lib_pins = []
+                lib_pin_count = len(lib_pins)
+                for lib_pin in lib_pins:
                     try:
                         num = _parsed_text(lib_pin.number)
                         name = _parsed_text(lib_pin.name)
@@ -268,10 +278,11 @@ def sym_pin_world_coords(sym: Any) -> list[PinWorldCoords]:
             )
 
     if used_wrapper_fallback:
-        # Skip provided SymbolPin wrappers but every one failed.  Now that
-        # the fallback has run, only a genuinely empty result is a problem:
-        # the raw definition drops per-unit filtering, which would mix the
-        # units of a multi-unit symbol.
+        # Skip provided SymbolPin wrappers but every one failed.  A raw lib
+        # definition with more than one pin may belong to a multi-unit
+        # symbol: the fallback then reports every unit with no per-unit
+        # filtering, which must stay visible.  A single-pin lib definition
+        # is the healthy single-pin degradation.
         try:
             ref = sym.property.Reference.value
         except AttributeError:
@@ -280,7 +291,7 @@ def sym_pin_world_coords(sym: Any) -> list[PinWorldCoords]:
             "sym_pin_world_coords: no pin data from SymbolPin wrappers for %s; "
             "used the raw lib definition (per-unit filtering lost)"
         )
-        if results:
+        if results and lib_pin_count <= 1:
             log.debug(message, ref)
         else:
             log.warning(message, ref)
