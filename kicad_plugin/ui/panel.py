@@ -975,9 +975,9 @@ if _WX_AVAILABLE:
                 self._attached_files.clear()
                 self._refresh_attachments_bar()
                 self._follow_output_to_bottom = True
-                self._render_conversation(
-                    force_scroll_to_bottom=_should_follow_output(self._auto_scroll_enabled, True)
-                )
+                # A send is an explicit user action: reveal the message the
+                # user just sent even when the Auto-scroll checkbox is off.
+                self._render_conversation(force_scroll_to_bottom=True)
 
             # Busy from here on: the turn owns the UI until turn_end.
             self._busy = True
@@ -2934,7 +2934,7 @@ if _WX_AVAILABLE:
             self._conv_version += 1
             self._pending_ai_text = ""
             self._current_session_file = None
-            self._render_conversation()
+            self._render_conversation(replace=True)
             if self._llm_client:
                 self._llm_client.reset()
 
@@ -3148,7 +3148,8 @@ if _WX_AVAILABLE:
             _sstore.update_current_link(self._settings.config_dir, self._current_session_file)
 
             self._render_conversation(
-                force_scroll_to_bottom=_should_follow_output(self._auto_scroll_enabled, True)
+                force_scroll_to_bottom=_should_follow_output(self._auto_scroll_enabled, True),
+                replace=True,
             )
             self._set_status("✅ Session restored", self._C_OK)
             self.Layout()
@@ -3321,7 +3322,7 @@ if _WX_AVAILABLE:
             self._conv_entries.clear()
             self._conv_version += 1
             self._pending_ai_text = ""
-            self._render_conversation()
+            self._render_conversation(replace=True)
             if self._llm_client:
                 self._llm_client.reset()
 
@@ -3513,7 +3514,8 @@ if _WX_AVAILABLE:
             )
             # Render once with all content and follow the newest entry
             self._render_conversation(
-                force_scroll_to_bottom=_should_follow_output(self._auto_scroll_enabled, True)
+                force_scroll_to_bottom=_should_follow_output(self._auto_scroll_enabled, True),
+                replace=True,
             )
 
         # ------------------------------------------------------------------ #
@@ -3806,11 +3808,17 @@ if _WX_AVAILABLE:
                 e["output"] = combined or "(no output)"
             return e
 
-        def _update_conversation(self, force_scroll_to_bottom: bool = False) -> None:
+        def _update_conversation(
+            self, force_scroll_to_bottom: bool = False, replace: bool = False
+        ) -> None:
             """Full conversation update via RunScript (WebView path).
 
             Serializes all entries as JSON and calls _updateConversation()
             in the shell.  Locking/deferral is handled by _run_script.
+
+            ``replace`` marks a wholesale conversation swap (session load /
+            restore / clear): the shell must not carry over the previous
+            document's scroll offset or expanded tool rows.
             """
             if not self._use_webview:
                 return
@@ -3819,17 +3827,22 @@ if _WX_AVAILABLE:
 
             js_entries = self._prepare_entries_for_js()
             scroll = '"bottom"' if force_scroll_to_bottom else '"preserve"'
+            replace_arg = "true" if replace else "false"
             # Double json.dumps: inner produces JSON string, outer escapes it
             # for safe embedding inside a JS function call argument.
-            js = f"_updateConversation({_json.dumps(_json.dumps(js_entries))}, {scroll})"
+            js = (
+                f"_updateConversation({_json.dumps(_json.dumps(js_entries))}, "
+                f"{scroll}, {replace_arg})"
+            )
             log.debug(
-                "_updateConversation: %d entries, scroll=%s, js_size=%d",
+                "_updateConversation: %d entries, scroll=%s, replace=%s, js_size=%d",
                 len(js_entries),
                 scroll,
+                replace_arg,
                 len(js),
             )
 
-            ok, result = self._run_script(js, force_scroll_to_bottom)
+            ok, result = self._run_script(js, force_scroll_to_bottom, replace=replace)
             if not ok:
                 log.debug("_updateConversation deferred (pending rebuild scheduled)")
                 return
@@ -3845,11 +3858,13 @@ if _WX_AVAILABLE:
             else:
                 log.debug("_updateConversation JS result: %s", result_str)
 
-        def _process_pending_render(self, force_scroll_to_bottom: bool) -> None:
+        def _process_pending_render(
+            self, force_scroll_to_bottom: bool, replace: bool = False
+        ) -> None:
             """Process any pending render after _js_running is reset."""
             if self._render_pending:
                 self._render_pending = False
-                wx.CallAfter(self._update_conversation, force_scroll_to_bottom)
+                wx.CallAfter(self._update_conversation, force_scroll_to_bottom, replace)
 
         # ------------------------------------------------------------------ #
         # Render protocol: single RunScript funnel
@@ -3867,6 +3882,7 @@ if _WX_AVAILABLE:
             force_scroll_to_bottom: bool = False,
             retry_on_failure: bool = False,
             probe: bool = False,
+            replace: bool = False,
         ) -> tuple[bool, object]:
             """Run a WebView script under the render protocol.
 
@@ -3900,7 +3916,7 @@ if _WX_AVAILABLE:
                     self._render_pending = True
                 return False, None
             finally:
-                self._release_render_lock(force_scroll_to_bottom)
+                self._release_render_lock(force_scroll_to_bottom, replace)
 
         # ------------------------------------------------------------------ #
         # Render lock helpers: encapsulate sync state management
@@ -3968,10 +3984,10 @@ if _WX_AVAILABLE:
             log.warning("Shell loaded but JS not working after 3 attempts, allowing retry")
             return False
 
-        def _release_render_lock(self, force_scroll_to_bottom: bool) -> None:
+        def _release_render_lock(self, force_scroll_to_bottom: bool, replace: bool = False) -> None:
             """Release the render lock and process pending if needed."""
             self._js_running = False
-            self._process_pending_render(force_scroll_to_bottom)
+            self._process_pending_render(force_scroll_to_bottom, replace)
 
         def _append_entry_js(self, entry: dict, force_scroll_to_bottom: bool = False) -> None:
             """Append a single entry via JS _appendEntry (WebView path)."""
@@ -4034,8 +4050,16 @@ if _WX_AVAILABLE:
             if ok:
                 self._stream_wrapper_visible = False
 
-        def _render_conversation(self, force_scroll_to_bottom: bool = False) -> None:
-            """Re-render the conversation.  Routes to WebView or HtmlWindow path."""
+        def _render_conversation(
+            self, force_scroll_to_bottom: bool = False, replace: bool = False
+        ) -> None:
+            """Re-render the conversation.  Routes to WebView or HtmlWindow path.
+
+            ``replace`` is set when the entries come from a different
+            conversation (session load / restore / clear): the view starts
+            fresh instead of inheriting the previous document's position and
+            expanded tool rows.
+            """
             if self._use_webview:
                 # Note: _page_loading is handled by the shell load completion events
                 # which will trigger pending renders when done
@@ -4044,11 +4068,13 @@ if _WX_AVAILABLE:
                     return  # Let the page load complete and handle it
 
                 # Delegate to _update_conversation which handles locking
-                self._update_conversation(force_scroll_to_bottom)
+                self._update_conversation(force_scroll_to_bottom, replace)
             else:
-                self._render_conversation_htmlwindow(force_scroll_to_bottom)
+                self._render_conversation_htmlwindow(force_scroll_to_bottom, replace)
 
-        def _render_conversation_htmlwindow(self, force_scroll_to_bottom: bool = False) -> None:
+        def _render_conversation_htmlwindow(
+            self, force_scroll_to_bottom: bool = False, replace: bool = False
+        ) -> None:
             """HtmlWindow fallback: build HTML and call SetPage.
 
             Used only when wx.html2.WebView is unavailable.  The WebView path
@@ -4164,7 +4190,14 @@ if _WX_AVAILABLE:
             # Capture scroll position before replacing the page
             _max = self._conv_view.GetScrollRange(wx.VERTICAL)
             _pos = self._conv_view.GetScrollPos(wx.VERTICAL)
-            _at_bottom = force_scroll_to_bottom or _max == 0 or (_max - _pos) < 3
+            follow = _should_follow_output(self._auto_scroll_enabled, force_scroll_to_bottom)
+            if replace:
+                # Fresh document: only the caller's explicit choice applies.
+                _at_bottom = follow
+            else:
+                _at_bottom = (
+                    follow or _max == 0 or (self._auto_scroll_enabled and (_max - _pos) < 3)
+                )
 
             parts.append("</body></html>")
             self._conv_view.SetPage("".join(parts))
@@ -4175,7 +4208,7 @@ if _WX_AVAILABLE:
                     50,
                     lambda: self._conv_view.Scroll(0, self._conv_view.GetScrollRange(wx.VERTICAL)),
                 )
-            else:
+            elif not replace:
                 _frac = _pos / _max if _max > 0 else 0.0
                 wx.CallLater(
                     50,
