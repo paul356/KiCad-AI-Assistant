@@ -128,13 +128,13 @@ express an absolute move as a delta.
 
 #### `find_component_connections(project_path, component_ref)`
 
-**Purpose:** Returns all nets and connected pins for a single reference designator. Faster than parsing the full netlist when the LLM only needs to understand one component's connectivity.
+**Purpose:** Returns all nets and connected pins for a single reference designator. It parses the same netlist internally, so the parsing cost is the same as `extract_schematic_netlist`; the saving is a **smaller response**, which suits cases where the LLM only needs one component's connectivity and not the full schematic state.
 
 **Key parameters:**
 - `project_path` (`str`) — absolute path to a `.kicad_pro` file.
 - `component_ref` (`str`) — reference designator (e.g. `"R1"`).
 
-**Return shape:** `{"success": true, "component": "R1", "connections": [{"pin": "1", "net": "VCC", "connected_pins": [...]}, ...]}`
+**Return shape:** `{"success": true, "project_path": "...", "schematic_path": "...", "component": "R1", "component_info": {"reference": "R1", "lib_id": "Device:R", "value": "10k", "footprint": "...", "units": {"1": {"position": {"x": 50.8, "y": 63.5, "rotation": 0}, "body_bbox": {"min_x": ..., ...}, "pins": [{"num": "1", "name": "~", "electrical": "passive", "x": ..., "y": ..., "direction": "up"}]}}}, "connections": [{"pin": "1", "net": "VCC", "connected_to": [{"component": "U1", "pin": "4"}]}], "connected_nets": ["VCC"], "pin_functions": {"1": {"name": "~", "type": "unknown"}}, "total_connections": 1}`
 
 **When to use:** When the engineer asks "what is R1 connected to?" without needing the full schematic state.
 

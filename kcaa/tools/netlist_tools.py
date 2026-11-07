@@ -55,16 +55,20 @@ def register_netlist_tools(mcp: FastMCP) -> None:
         the component level, not inside units.
 
         - ``units``: per-unit dict (``"1"``, ``"2"``, … for multi-unit parts).
-          Each unit carries ``position``: ``{x, y, rotation}`` placement anchor
-          in mm (KiCad screen coords, **+Y is down**; ``rotation`` is a field
-          of ``position``, not a separate unit key), and its own ``body_bbox``:
+          Each unit carries ``position`` when available:
+          ``{x, y, rotation}`` placement anchor in mm (KiCad screen coords,
+          **+Y is down**; sub-sheet entries use ``{x, y}`` without
+          ``rotation``; ``rotation`` is a field of ``position``, not a
+          separate unit key), and its own ``body_bbox``:
           ``{min_x, min_y, max_x, max_y}`` world-space bounding box of that
           unit's footprint. Units carry no ``mirror``, ``lib_id``, or
           ``footprint`` keys. Use ``body_bbox`` to check overlaps before
           calling ``move_component`` / ``add_symbol_to_schematic``. May be
           absent for graphics-less symbols (e.g. PWR_FLAG).
         - ``pins``: **per-unit** list of
-          ``{num, name, electrical, x, y, direction}``. ``x``/``y`` are world
+          ``{num, name, electrical, x, y, direction, net}``. ``net`` is the
+          name of the net the pin belongs to (``null`` or absent when
+          unconnected). ``x``/``y`` are world
           coordinates already accounting for placement and rotation;
           ``direction`` is the screen-space exit direction
           (``"right"|"up"|"left"|"down"``). ``name`` is the pin name
@@ -422,12 +426,13 @@ def register_netlist_tools(mcp: FastMCP) -> None:
             Dictionary with component connection information. This tool operates
             on **one reference** and does not return the whole netlist; use
             ``extract_schematic_netlist`` for the full design.  Its
-            ``component_info`` is the raw netlist entry for ``component_ref``
-            (``{value, type, units}``), where each ``units[n]`` carries
-            ``position`` (``{x, y, rotation}``), ``body_bbox``, and ``pins`` in
-            world coordinates.  In component_info, each pin's ``direction`` is
-            the wire-exit direction in screen coordinates: "right", "down",
-            "left", or "up".
+            ``component_info`` is the raw parser entry for ``component_ref`` —
+            ``{reference, value, units}`` plus ``lib_id`` / ``footprint`` when
+            present; ``type`` appears only on sub-sheet entries.  Each
+            ``units[n]`` carries ``position`` (``{x, y, rotation}``; ``{x, y}``
+            for sub-sheets), ``body_bbox``, and ``pins`` in world coordinates.
+            In component_info, each pin's ``direction`` is the wire-exit
+            direction in screen coordinates: "right", "down", "left", or "up".
         """
         print(f"Finding connections for component {component_ref} in project: {project_path}")
 
