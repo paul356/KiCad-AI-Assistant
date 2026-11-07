@@ -143,6 +143,22 @@ def _run_sync_in_background(force: bool, project_path: str | None = None) -> Non
             _sync_state.current_library = ""
 
 
+def _not_found_scope(project_path: str | None) -> str:
+    """Human-readable scope suffix for an index miss (issue #255).
+
+    Names exactly what was searched so "sync succeeded, still not found"
+    points the caller at the missing project scope instead of looking like a
+    stale index.
+    """
+    project_dir = _project_dir_of(project_path)
+    if project_dir:
+        return f" (searched: global + project libraries of {project_dir})."
+    return (
+        " (searched: global libraries)."
+        " Pass project_path=<project dir> to include that project's libraries."
+    )
+
+
 def _load_lib_symbol_raw(
     library_name: str,
     symbol_name: str,
@@ -156,10 +172,14 @@ def _load_lib_symbol_raw(
     mgr = _get_index_manager(project_path)
     sym_rec = mgr.get_symbol(library_name, symbol_name)
     if sym_rec is None:
-        return None, f"Symbol '{library_name}:{symbol_name}' not found in index."
+        return (
+            None,
+            f"Symbol '{library_name}:{symbol_name}' not found in index"
+            f"{_not_found_scope(project_path)}",
+        )
     lib_rec = mgr.get_library_by_name(library_name)
     if lib_rec is None:
-        return None, f"Library '{library_name}' not found in index."
+        return None, f"Library '{library_name}' not found in index{_not_found_scope(project_path)}"
     try:
         raw = extract_lib_symbol_raw(
             lib_rec.file_path,
@@ -448,7 +468,10 @@ def register_symbol_tools(mcp: FastMCP) -> None:
             if symbol is None:
                 return {
                     "success": False,
-                    "error": f"Symbol '{library_name}:{symbol_name}' not found in index.",
+                    "error": (
+                        f"Symbol '{library_name}:{symbol_name}' not found in index"
+                        f"{_not_found_scope(project_path)}"
+                    ),
                 }
             result: dict[str, Any] = {
                 "success": True,

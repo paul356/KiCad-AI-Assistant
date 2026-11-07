@@ -7,6 +7,7 @@ are fully self-contained and do not require a real KiCad installation.
 
 import asyncio
 import os
+import shutil
 import threading
 from unittest.mock import MagicMock, call, patch
 
@@ -478,6 +479,25 @@ class TestGetSymbolIndexStats:
 
 _TOOLS_FIXTURE_DIR = os.path.join(os.path.dirname(__file__), "fixtures")
 _FIXTURE_SYM = os.path.join(_TOOLS_FIXTURE_DIR, "test_symbols.kicad_sym")
+_UTILS_FIXTURE_SYM = os.path.join(
+    os.path.dirname(__file__), "..", "utils", "fixtures", "test_device.kicad_sym"
+)
+
+
+def _make_project_library(tmp_path) -> str:
+    """Create a project whose sym-lib-table declares one project-only library
+    (``${KIPRJMOD}/lib.kicad_sym``) and return the project directory."""
+    project_dir = tmp_path / "proj"
+    project_dir.mkdir()
+    shutil.copy(_UTILS_FIXTURE_SYM, project_dir / "lib.kicad_sym")
+    (project_dir / "sym-lib-table").write_text(
+        "(sym_lib_table\n"
+        '  (lib (name "Issue255Lib")(type "KiCad")(uri "${KIPRJMOD}/lib.kicad_sym")'
+        '(options "")(descr "project only"))\n'
+        ")\n",
+        encoding="utf-8",
+    )
+    return os.path.realpath(str(project_dir))
 
 
 def _load_fixture_symbol(fixture_path: str, symbol_name: str) -> list:
@@ -572,7 +592,44 @@ class TestGetSymbolPins:
             result = _call("get_library_symbol_pins", library_name="Device", symbol_name="NOEXIST")
 
         assert result.get("success") is False
-        assert "error" in result
+        assert result["error"] == (
+            "Symbol 'Device:NOEXIST' not found in index (searched: global libraries)."
+            " Pass project_path=<project dir> to include that project's libraries."
+        )
+
+    def test_symbol_not_found_reports_project_scope(self, tmp_path):
+        """With a project scope the miss names the project searched."""
+        mock_mgr = MagicMock()
+        mock_mgr.get_symbol.return_value = None
+        project_dir = os.path.realpath(str(tmp_path))
+
+        with patch("kcaa.tools.symbol_tools._get_index_manager", return_value=mock_mgr):
+            result = _call(
+                "get_library_symbol_pins",
+                library_name="Device",
+                symbol_name="NOEXIST",
+                project_path=project_dir,
+            )
+
+        assert result["error"] == (
+            f"Symbol 'Device:NOEXIST' not found in index "
+            f"(searched: global + project libraries of {project_dir})."
+        )
+
+    def test_library_not_found_reports_scope(self):
+        """The Library variant carries the same scope suffix."""
+        sym_rec = MagicMock()
+        mock_mgr = MagicMock()
+        mock_mgr.get_symbol.return_value = sym_rec
+        mock_mgr.get_library_by_name.return_value = None
+
+        with patch("kcaa.tools.symbol_tools._get_index_manager", return_value=mock_mgr):
+            result = _call("get_library_symbol_pins", library_name="MISSINGLIB", symbol_name="R")
+
+        assert result["error"] == (
+            "Library 'MISSINGLIB' not found in index (searched: global libraries)."
+            " Pass project_path=<project dir> to include that project's libraries."
+        )
 
     def test_symbol_not_in_index_with_empty_name(self):
         """Returns error dict when index has no record for the symbol (empty name query)."""
@@ -929,3 +986,58 @@ class TestProjectPathScoping:
         assert result["success"] is True
         mock_get_mgr.assert_called_once_with("/p/X")
         assert "project_path" not in result
+
+
+# ---------------------------------------------------------------------------
+# End-to-end project scope (issue #255): a project-only library is invisible
+# unless the lookup carries the project scope.
+# ---------------------------------------------------------------------------
+
+
+class TestProjectScopedSymbolLookup:
+    """Real SymbolIndexManager (temp DB), no wx: reproduce the reported
+    "sync succeeded, still not found" scenario and prove scope isolation."""
+
+    @staticmethod
+    def _synced_manager(tmp_path):
+        from kcaa.utils.symbol_index_manager import SymbolIndexManager
+
+        project_dir = _make_project_library(tmp_path)
+        mgr = SymbolIndexManager(
+            project_path=project_dir,
+            db_path=str(tmp_path / "symbols.db"),
+        )
+        mgr.sync()
+        return project_dir, mgr
+
+    def test_project_library_resolves_with_project_scope(self, tmp_path):
+        import kcaa.tools.symbol_tools as mod
+
+        project_dir, mgr = self._synced_manager(tmp_path)
+
+        with patch.object(mod, "_index_manager", mgr):
+            result = _call(
+                "get_library_symbol_pins",
+                library_name="Issue255Lib",
+                symbol_name="R",
+                project_path=project_dir,
+            )
+
+        assert result["success"] is True
+        assert result["pin_count"] == 2
+        assert [pin["number"] for pin in result["pins"]] == ["1", "2"]
+
+    def test_project_library_invisible_without_project_scope(self, tmp_path):
+        import kcaa.tools.symbol_tools as mod
+
+        _project_dir, mgr = self._synced_manager(tmp_path)
+
+        with patch.object(mod, "_index_manager", mgr):
+            result = _call(
+                "get_library_symbol_pins",
+                library_name="Issue255Lib",
+                symbol_name="R",
+            )
+
+        assert result["success"] is False
+        assert "not found in index (searched: global libraries)" in result["error"]

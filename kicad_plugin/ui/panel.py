@@ -1126,6 +1126,7 @@ if _WX_AVAILABLE:
                             images=images,
                             cancel_event=self._cancel_event,
                             on_turn_failure=_on_turn_failure,
+                            active_project=self._active_project,
                         )
                     else:  # tool_direct
                         self._llm_client.run(
@@ -1136,6 +1137,7 @@ if _WX_AVAILABLE:
                             },
                             context_block,
                             on_tool_call=_on_tool,
+                            active_project=self._active_project,
                         )
                         # tool_direct produces no assistant text: keep the
                         # turn_end reply empty so no AI entry is rendered.

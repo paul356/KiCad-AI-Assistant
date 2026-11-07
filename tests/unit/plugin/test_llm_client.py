@@ -21,7 +21,12 @@ import pytest
 
 from kicad_plugin import llm_client
 from kicad_plugin import session_store as sstore
-from kicad_plugin.llm_client import LLMClient, LLMTurnFailure, _subprocess_sse_stream
+from kicad_plugin.llm_client import (
+    LLMClient,
+    LLMTurnFailure,
+    _inject_active_project,
+    _subprocess_sse_stream,
+)
 from kicad_plugin.settings import DEFAULT_LLM_USER_AGENT
 from kicad_plugin.tool_registry import TOOL_POLICIES
 
@@ -120,6 +125,45 @@ def _assistant(content="ok", tool_calls=None):
 
 def _tool(tool_call_id="tc1", content="result"):
     return {"role": "tool", "tool_call_id": tool_call_id, "content": content}
+
+
+# ---------------------------------------------------------------------------
+# Active-project injection (issue #255)
+# ---------------------------------------------------------------------------
+
+
+class TestInjectActiveProject:
+    def test_fills_missing_project_path(self):
+        args = {"library_name": "Lib", "symbol_name": "Sym"}
+        result = _inject_active_project("get_library_symbol_pins", args, "/p/proj")
+        assert result == {
+            "library_name": "Lib",
+            "symbol_name": "Sym",
+            "project_path": "/p/proj",
+        }
+        # The caller's dict is not mutated.
+        assert args == {"library_name": "Lib", "symbol_name": "Sym"}
+
+    @pytest.mark.parametrize("explicit", ["/other/proj", "relative/proj", "", "../odd"])
+    def test_explicit_project_path_wins(self, explicit):
+        args = {"library_name": "Lib", "project_path": explicit}
+        assert _inject_active_project("get_library_symbol", args, "/p/proj") is args
+
+    def test_mutating_tool_untouched(self):
+        args = {"library_name": "Lib"}
+        assert _inject_active_project("create_symbol", args, "/p/proj") is args
+
+    def test_unlisted_tool_untouched(self):
+        args = {"pcb_path": "/tmp/x.kicad_pcb"}
+        assert _inject_active_project("move_component", args, "/p/proj") is args
+
+    def test_no_active_project_untouched(self):
+        args = {"library_name": "Lib"}
+        assert _inject_active_project("get_library_symbol", args, None) is args
+
+    def test_non_dict_args_untouched(self):
+        args = ["not", "a", "dict"]
+        assert _inject_active_project("get_library_symbol", args, "/p/proj") is args
 
 
 # ---------------------------------------------------------------------------
@@ -998,6 +1042,72 @@ class TestRunIntegration:
 
         assert result == "done"
         mock_compact.assert_called_once()
+
+    def test_run_injects_active_project_into_symbol_lookup(self):
+        """A symbol tool called without project_path defaults to the active
+        project, so project-scoped libraries resolve (issue #255)."""
+        client = _make_client()
+        tool_response = {
+            "finish_reason": "tool_calls",
+            "message": {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tc1",
+                        "type": "function",
+                        "function": {
+                            "name": "get_library_symbol_pins",
+                            "arguments": json.dumps({"library_name": "Lib", "symbol_name": "Sym"}),
+                        },
+                    }
+                ],
+            },
+        }
+        final_response = {"finish_reason": "stop", "message": {"content": "done"}}
+        client._call_llm = MagicMock(side_effect=[tool_response, final_response])
+        client._enabled_tools = {"get_library_symbol_pins"}
+
+        with patch("kicad_plugin.llm_client.call_mcp_tool") as mock_call_tool:
+            mock_call_tool.return_value = {"success": True}
+            result = client.run("look up Sym", context_block="", active_project="/p/proj")
+
+        assert result == "done"
+        mock_call_tool.assert_called_once()
+        assert mock_call_tool.call_args.args[1:] == (
+            "get_library_symbol_pins",
+            {"library_name": "Lib", "symbol_name": "Sym", "project_path": "/p/proj"},
+        )
+
+    def test_run_does_not_inject_without_active_project(self):
+        client = _make_client()
+        tool_response = {
+            "finish_reason": "tool_calls",
+            "message": {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tc1",
+                        "type": "function",
+                        "function": {
+                            "name": "get_library_symbol",
+                            "arguments": json.dumps({"library_name": "Lib", "symbol_name": "Sym"}),
+                        },
+                    }
+                ],
+            },
+        }
+        final_response = {"finish_reason": "stop", "message": {"content": "done"}}
+        client._call_llm = MagicMock(side_effect=[tool_response, final_response])
+        client._enabled_tools = {"get_library_symbol"}
+
+        with patch("kicad_plugin.llm_client.call_mcp_tool") as mock_call_tool:
+            mock_call_tool.return_value = {"success": True}
+            client.run("look up Sym", context_block="")
+
+        assert mock_call_tool.call_args.args[2] == {
+            "library_name": "Lib",
+            "symbol_name": "Sym",
+        }
 
     def test_framework_auto_snapshots_and_reloads_mutations(self):
         client = _make_client()

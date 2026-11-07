@@ -638,6 +638,43 @@ _META_TOOL_DEFS: list[dict[str, Any]] = [
     },
 ]
 
+# Symbol-library/index tools that accept an optional ``project_path``. Their
+# lookups default to the GLOBAL scope when the model omits it, so a library
+# declared only in the active project's sym-lib-table is invisible even after
+# a successful sync (issue #255). The plugin fills the active project in
+# before dispatch — read-only/indexing tools only: defaulting a *write* target
+# would be a different risk class.
+_PROJECT_SCOPED_SYMBOL_TOOLS = frozenset(
+    {
+        "get_library_symbol",
+        "get_library_symbol_pins",
+        "search_library_symbols",
+        "list_symbol_libraries",
+        "list_library_symbols",
+        "get_symbol_index_stats",
+        "sync_symbol_index",
+    }
+)
+
+
+def _inject_active_project(
+    tool_name: str,
+    args: dict[str, Any],
+    active_project: str | None,
+) -> dict[str, Any]:
+    """Default ``project_path`` to the active project for symbol-scope tools.
+
+    Only tools in ``_PROJECT_SCOPED_SYMBOL_TOOLS`` are touched, and only when
+    the model omitted ``project_path`` entirely: an explicitly supplied value
+    (including an empty, relative, or otherwise odd path) always wins. No
+    active project means the args pass through unchanged (global scope).
+    """
+    if not active_project or tool_name not in _PROJECT_SCOPED_SYMBOL_TOOLS:
+        return args
+    if not isinstance(args, dict) or "project_path" in args:
+        return args
+    return {**args, "project_path": active_project}
+
 
 def _is_certificate_verification_error(error: BaseException) -> bool:
     """Return whether *error* was caused by an untrusted certificate chain."""
@@ -1906,6 +1943,7 @@ class LLMClient:
         request: dict[str, Any],
         on_tool_call: Callable[[str, dict, Any], None] | None = None,
         cancel_event: threading.Event | None = None,
+        active_project: str | None = None,
     ) -> Any:
         """Execute a framework tool_direct request (e.g. auto footprint sync).
 
@@ -1932,6 +1970,7 @@ class LLMClient:
         if not tool_name:
             log.error("tool_direct: missing tool name")
             return {"success": False, "error": "tool_direct request missing 'name'"}
+        args = _inject_active_project(tool_name, args, active_project)
         call_id = f"fw-{tool_name}-{secrets.token_hex(4)}"
 
         # Providers require the first message to have role "user".  This
@@ -3530,6 +3569,7 @@ class LLMClient:
         images: list[dict[str, Any]] | None = None,
         cancel_event: threading.Event | None = None,
         on_turn_failure: Callable[[LLMTurnFailure], None] | None = None,
+        active_project: str | None = None,
     ) -> str:
         """
         Run one engineer request through the agentic loop.
@@ -3563,6 +3603,12 @@ class LLMClient:
                            while the MCP transport is blocked, so an in-flight
                            long call is recorded as an interruption error entry
                            instead of being silently dropped (issue #176).
+            active_project: Active project directory (or a path inside it).
+                           Symbol-library/index tool calls that omit
+                           ``project_path`` default to it, so project-scoped
+                           libraries resolve without the model naming the
+                           project (issue #255).  ``None`` keeps the global
+                           scope.
 
         Returns:
             The final assistant text message for display.
@@ -3571,7 +3617,9 @@ class LLMClient:
         # through run() so it shares the turn lifecycle, but never send it
         # to the LLM — execute the call directly and record the tool pair.
         if isinstance(user_message, dict) and user_message.get("kind") == "tool_direct":
-            return self._run_tool_direct(user_message, on_tool_call, cancel_event)
+            return self._run_tool_direct(
+                user_message, on_tool_call, cancel_event, active_project=active_project
+            )
 
         system = (
             build_system_prompt(context_block)
@@ -3652,6 +3700,7 @@ class LLMClient:
                         args = json.loads(tc["function"].get("arguments") or "{}")
                     except json.JSONDecodeError:
                         args = {}
+                    args = _inject_active_project(name, args, active_project)
 
                     if cancel_event is not None and cancel_event.is_set():
                         # Stop was pressed: record the interruption instead of
