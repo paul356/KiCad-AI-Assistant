@@ -121,8 +121,10 @@ Sub-sheets appear as ordinary components with `type: "sheet"`. Their
 `units[n].position` has no `rotation`. Their `pins` are the reduced
 sheet-pin shape `{num, number, name, x, y, net}`: there is no `electrical`
 or `direction` key (`pin["direction"]` raises `KeyError`), `net` is added
-by this tool (`null` when unconnected), and `num == number == name ==` the
-sheet-pin name — sheet pins are addressed by name, never `REF.N`.
+by this tool and is always a string — the sheet-pin name when nothing else
+names the net, even with nothing wired to the pin — and
+`num == number == name ==` the sheet-pin name — sheet pins are addressed
+by name, never `REF.N`.
 
 `move_component` takes **deltas** (x/y shifts in mm, rotation increment)
 and accepts a `unit` number to move/rotate one unit individually

@@ -68,8 +68,12 @@ def register_netlist_tools(mcp: FastMCP) -> None:
           absent for graphics-less symbols (e.g. PWR_FLAG).
         - ``pins``: **per-unit** list of
           ``{num, name, electrical, x, y, direction, net}``. ``net`` is the
-          name of the net the pin belongs to (``null`` when unconnected; the
-          key is always present). ``x``/``y`` are world
+          name of the net the pin belongs to; the key is always present and
+          an unconnected pin still gets a name (synthetic
+          ``Net-(<ref>-Pin<n>)`` when no label or power symbol supplies
+          one). The value is ``null`` only for pins the netlist builder does
+          not trace: pins of ``#``-prefixed references (power symbols,
+          flags) and pins without a number. ``x``/``y`` are world
           coordinates already accounting for placement and rotation;
           ``direction`` is the screen-space exit direction
           (``"right"|"up"|"left"|"down"``). ``name`` is the pin name
@@ -81,7 +85,9 @@ def register_netlist_tools(mcp: FastMCP) -> None:
           raises ``KeyError``), ``num``, ``number``, and ``name`` all equal the
           sheet-pin name (sheet pins are addressed by name, never ``REF.N``),
           and the unit's ``position`` has no ``rotation`` (see ``units``
-          above). When choosing which two pins to
+          above). ``net`` is always a string for sheet pins: the sheet-pin
+          name when nothing else names the net, even with nothing wired to
+          the pin. When choosing which two pins to
           wire, the **electrically correct pin** comes first — only fall
           back to "closest pin pair" geometry when both candidates are
           electrically interchangeable (e.g. the two leads of a non-polar
