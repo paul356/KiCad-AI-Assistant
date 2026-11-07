@@ -222,12 +222,12 @@ FRAMEWORK_PREAMBLE = (
 # ------------------------------------------------------------------
 
 # Categories assigned to *query* tools based on what they return.
-# Library/lookup-only queries (search_symbols, get_symbol, …) are excluded
+# Library/lookup-only queries (search_library_symbols, get_library_symbol, …) are excluded
 # because they are never invalidated by a file mutation.
 QUERY_CATEGORY: dict[str, str] = {
     # Schematic queries
     "list_symbol_properties": "symbol_properties",
-    "get_symbol_pins": "symbol_pins",
+    "get_library_symbol_pins": "symbol_pins",
     "check_reference_conflicts": "symbol_inventory",
     "list_labels_in_schematic": "labels",
     "extract_schematic_netlist": "netlist",

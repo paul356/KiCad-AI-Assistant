@@ -7,8 +7,8 @@ Covers:
   - Placement tools: set_footprint_position, flip_footprint
   - Edit tools:      set_footprint_property
   - Library tools:   sync_footprint_index, get_footprint_sync_status,
-                     list_footprint_libraries, search_footprints,
-                     get_footprint_details
+                     list_footprint_libraries, search_library_footprints,
+                     get_library_footprint
 
 The tests start a real MCP server subprocess (plugin profile) and talk
 to it over the streamable-http JSON-RPC transport.  No KiCad installation
@@ -822,7 +822,7 @@ class TestSearchFootprints:
         result = _call_tool(
             port,
             sid,
-            "search_footprints",
+            "search_library_footprints",
             {
                 "query": "resistor",
                 "project_path": "/tmp/kicad-mcp-test.kicad_pro",
@@ -836,7 +836,7 @@ class TestSearchFootprints:
         result = _call_tool(
             port,
             sid,
-            "search_footprints",
+            "search_library_footprints",
             {
                 "query": "capacitor",
                 "project_path": "/tmp/kicad-mcp-test.kicad_pro",
@@ -850,7 +850,7 @@ class TestSearchFootprints:
         result = _call_tool(
             port,
             sid,
-            "search_footprints",
+            "search_library_footprints",
             {
                 "query": "",
                 "project_path": "/tmp/kicad-mcp-test.kicad_pro",
@@ -864,7 +864,7 @@ class TestSearchFootprints:
         result = _call_tool(
             port,
             sid,
-            "search_footprints",
+            "search_library_footprints",
             {
                 "query": "R_0402",
                 "project_path": "/tmp/kicad-mcp-test.kicad_pro",
@@ -882,7 +882,7 @@ class TestGetFootprintDetails:
         result = _call_tool(
             port,
             sid,
-            "get_footprint_details",
+            "get_library_footprint",
             {
                 "library_name": "__nonexistent_lib__",
                 "footprint_name": "R_0402",
@@ -897,7 +897,7 @@ class TestGetFootprintDetails:
         result = _call_tool(
             port,
             sid,
-            "get_footprint_details",
+            "get_library_footprint",
             {
                 "library_name": "Resistor_SMD",
                 "footprint_name": "__nonexistent_footprint__",

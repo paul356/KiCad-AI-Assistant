@@ -5,7 +5,7 @@ description: "Symbol placement workflow, find_free_area, bbox geometry, spacing 
 tools: [extract_schematic_netlist, add_symbol_to_schematic, place_symbol_relative, move_component, find_free_area, get_schematic_sheet_info]
 ---
 # Geometry you get for free
-- get_symbol and get_symbol_pins return body_bbox + per-unit bboxes in
+- get_library_symbol and get_library_symbol_pins return body_bbox + per-unit bboxes in
   library coordinates so you can size new placements before inserting.
 - extract_schematic_netlist returns a body_bbox per placed **unit** in
   schematic (Y-down) world coordinates. Union every unit's bbox to get a
@@ -17,7 +17,7 @@ tools: [extract_schematic_netlist, add_symbol_to_schematic, place_symbol_relativ
 # Recommended placement workflow
 1. Call extract_schematic_netlist to learn what already exists and where.
 2. To add a new symbol:
-   a. Look it up with search_symbols / get_symbol (note its body_bbox).
+   a. Look it up with search_library_symbols / get_library_symbol (note its body_bbox).
    b. PREFER place_symbol_relative when you can describe the position
       relative to an existing reference (e.g. "right of U1, gap 2.54").
    c. Otherwise call find_free_area(for_library=..., for_symbol=...,

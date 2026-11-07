@@ -178,6 +178,14 @@ kcaa
 
 ## 工具列表
 
+**命名约定** — 前缀 `library_` 表示**库中的定义**；无前缀表示**已放置在板上或图中的实例**。带 `library_` 的工具不返回放置信息。
+
+- `get_library_footprint` — 封装库中的封装**定义**；键为 `library_name` + `footprint_name`，返回焊盘/courtyard/属性；焊盘坐标为封装本地（footprint-local）坐标，没有板级放置锚点。
+- `get_footprint` — **PCB 上已放置的封装**；键为 `pcb_path` + `references[]`（世界坐标、旋转、层、属性、焊盘）。
+- `list_symbol_properties` — **原理图中已放置的符号**；键为 `schematic_path` + `references[]`（仅属性，不含几何、位置或网络）。
+- `extract_schematic_netlist` — 返回**整份网表**，因此带有**每个**已放置符号的放置信息（`components[ref].units[n].position`、`rotation`、每个 unit 的 `body_bbox`、世界坐标 `pins`）；不是廉价的单点坐标查询。
+- `find_component_connections` — **单个位号**的放置信息与连接（`project_path` + `component_ref`）；只返回该位号自己的 `component_info`（同样含 `units[n].position`），不返回整份网表。
+
 ### 项目工具
 
 | 工具 | 说明 |
@@ -194,10 +202,10 @@ kcaa
 | `get_symbol_sync_status` | 查询符号索引构建进度 |
 | `get_symbol_index_stats` | 获取符号索引统计信息 |
 | `list_symbol_libraries` | 列出所有符号库；`list_library_symbols` 列出单个库中的符号（按 `library_name` 指定） |
-| `search_symbols` | 全文搜索已索引的符号 |
-| `get_symbol` | 按库名和符号名查找符号 |
+| `search_library_symbols` | 全文搜索已索引的符号 |
+| `get_library_symbol` | 按库名和符号名查找符号 |
 | `list_library_symbols` | 列出单个库中的符号（按 `library_name` 指定）；`list_symbol_libraries` 列出所有符号库 |
-| `get_symbol_pins` | 获取符号的引脚定义 |
+| `get_library_symbol_pins` | 获取符号的引脚定义 |
 | `create_symbol_library` | 新建 `.kicad_sym` 符号库（全局第三方或项目级）并在库表中注册 |
 | `delete_symbol_library` | 删除空符号库（连同文件、库表条目和索引） |
 | `add_symbols_to_library` | 将原理图缓存 `lib_symbols` 中的符号复制到已有符号库 |
@@ -215,7 +223,7 @@ kcaa
 | `move_component` | 移动/旋转已放置的元件 |
 | `set_symbol_property` | 设置已放置符号的属性字段 |
 | `rename_symbol` | 重命名已放置符号的位号 |
-| `list_symbol_properties` | 列出已放置符号的所有属性 |
+| `list_symbol_properties` | 列出已放置原理图符号的属性（名称 → 值），不含几何、位置或网络 |
 | `delete_symbol_property` | 删除已放置符号的属性 |
 | `check_reference_conflicts` | 检查重复的位号 |
 | `connect_points_with_wire` | 在两点之间智能正交布线 |
@@ -271,8 +279,8 @@ kcaa
 | `sync_footprint_index` | 构建或刷新封装库索引 |
 | `get_footprint_sync_status` | 查询封装索引构建进度 |
 | `list_footprint_libraries` | 列出所有可用封装库 |
-| `search_footprints` | 按名称/描述/标签搜索封装 |
-| `get_footprint_details` | 获取封装详情（焊盘、边界框等） |
+| `search_library_footprints` | 按名称/描述/标签搜索封装 |
+| `get_library_footprint` | 按库名 + 封装名获取封装库中的封装**定义**（焊盘、边界框等），不是板上的封装实例 |
 | `list_library_footprints` | 列出单个库中的全部封装（名称及简要元数据）（支持 offset 分页） |
 | `find_footprints_not_in_libraries` | 列出板上缺失于所有已索引库的封装 |
 | `create_footprint_library` | 创建全局 3rdparty 或项目级封装库 |
@@ -286,7 +294,7 @@ kcaa
 |------|------|
 | `get_board_info` | 获取 PCB 板基本信息 |
 | `list_footprints` | 列出板上已放置的所有封装 |
-| `get_footprint` | 获取单个已放置封装的详情 |
+| `get_footprint` | 获取板上已放置封装的详情（按 `references` 列表，每个位号一份结果；含焊盘、属性、Edge.Cuts 几何） |
 | `get_footprint_bbox` | 获取封装的 courtyard 边界框 |
 | `get_board_bounding_box` | 获取全板封装的联合边界框 |
 | `list_nets` | 列出板上所有网络 |

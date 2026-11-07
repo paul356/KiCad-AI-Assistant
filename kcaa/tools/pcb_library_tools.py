@@ -508,7 +508,7 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
         }
 
     @mcp.tool()
-    async def search_footprints(
+    async def search_library_footprints(
         query: str,
         project_path: str | None = None,
         ctx: Context | None = None,
@@ -520,6 +520,9 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
         full-text search across global plus the project's own libraries.
         If the index is empty, falls back to a slower live scan of .kicad_mod
         files.  Other projects' libraries are never searched.
+
+        Results are library **definitions**: this tool returns no board or
+        schematic placement.
 
         Args:
             query: Search string matched against footprint name, description,
@@ -576,22 +579,31 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
         return await _live_search_footprints(query, project_path, max_results)
 
     @mcp.tool()
-    async def get_footprint_details(
+    async def get_library_footprint(
         library_name: str,
         footprint_name: str,
         project_path: str | None = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
-        """Get detailed information about a specific footprint.
+        """Get a footprint **definition** from a footprint library (.kicad_mod).
 
-        Returns pad layout, courtyard bounding box, and metadata for a
-        footprint identified by its library nickname and name.  To enumerate
-        every footprint in a library use
-        ``list_library_footprints(library_name)``; this tool takes exactly one
-        ``footprint_name``.  Always reads the .kicad_mod file directly for
-        full detail.  The lookup is scoped
-        to the project's global + project-local libraries; when a same-named
-        project library exists it takes precedence over the global one.
+        Object: a library footprint definition — not a footprint placed on a
+        board.
+        Key: a single library nickname plus footprint name; there is no
+        reference-designator lookup (``project_path`` only scopes which library
+        table is used).
+        Returns: pads, courtyard bbox, tags/attr, has_3d_model, library_path,
+        file_path, edge_cuts.
+        Use instead: ``get_footprint`` for footprints placed on a board; this
+        tool takes a library nickname + footprint name and cannot be addressed
+        by reference designator.  For a symbol placed in a schematic use
+        ``list_symbol_properties``.  To enumerate every footprint in a library
+        use ``list_library_footprints(library_name)``; this tool takes exactly
+        one ``footprint_name``.
+
+        Always reads the .kicad_mod file directly for full detail.  The lookup
+        is scoped to the project's global + project-local libraries; when a
+        same-named project library exists it takes precedence over the global one.
 
         Args:
             library_name: The library nickname (as shown in fp-lib-table),
@@ -605,7 +617,8 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
 
         Returns:
             dict with name, description, tags, attr, has_3d_model, layer,
-            pads list, courtyard_bbox, and library_path.
+            pads list, courtyard_bbox, edge_cuts, library_path, and file_path
+            (the resolved .kicad_mod path).
         """
         mgr = get_footprint_index_manager(project_path)
         db_stats = mgr.get_stats()
@@ -658,7 +671,7 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
         """List every footprint in ONE library (names + light metadata).
 
         To inspect a single footprint's pads/courtyard use
-        ``get_footprint_details(library_name, footprint_name)``.  Do not pass
+        ``get_library_footprint(library_name, footprint_name)``.  Do not pass
         a list of names here.
 
         Uses the footprint index when it has this library; otherwise falls
@@ -1545,7 +1558,7 @@ async def _live_search_footprints(
     project_path: str | None,
     max_results: int,
 ) -> dict[str, Any]:
-    """Slow live-scan fallback for search_footprints when index is empty."""
+    """Slow live-scan fallback for search_library_footprints when index is empty."""
     from kcaa.utils.pcb_library_utils import scan_footprint_library
 
     needle = query.strip().lower()

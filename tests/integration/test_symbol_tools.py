@@ -5,11 +5,11 @@ Covers:
   - sync_symbol_index
   - get_symbol_sync_status
   - list_symbol_libraries
-  - search_symbols
-  - get_symbol
+  - search_library_symbols
+  - get_library_symbol
   - list_library_symbols
   - get_symbol_index_stats
-  - get_symbol_pins
+  - get_library_symbol_pins
 
 The tests start a real MCP server subprocess (plugin profile) and talk
 to it over the streamable-http JSON-RPC transport.  Symbol index tests
@@ -242,7 +242,7 @@ class TestListSymbolLibraries:
 
 
 # ---------------------------------------------------------------------------
-# Tests: search_symbols
+# Tests: search_library_symbols
 # ---------------------------------------------------------------------------
 
 
@@ -252,7 +252,7 @@ class TestSearchSymbols:
         result = _call_tool(
             port,
             sid,
-            "search_symbols",
+            "search_library_symbols",
             {
                 "query": "resistor",
                 "limit": 10,
@@ -269,7 +269,7 @@ class TestSearchSymbols:
         result = _call_tool(
             port,
             sid,
-            "search_symbols",
+            "search_library_symbols",
             {
                 "query": "nonexistent_symbol_xyz123",
                 "limit": 10,
@@ -281,7 +281,7 @@ class TestSearchSymbols:
 
 
 # ---------------------------------------------------------------------------
-# Tests: get_symbol
+# Tests: get_library_symbol
 # ---------------------------------------------------------------------------
 
 
@@ -291,7 +291,7 @@ class TestGetSymbol:
         result = _call_tool(
             port,
             sid,
-            "get_symbol",
+            "get_library_symbol",
             {
                 "library_name": "NonExistentLib",
                 "symbol_name": "NonExistentSymbol",
@@ -346,7 +346,7 @@ class TestGetSymbolIndexStats:
 
 
 # ---------------------------------------------------------------------------
-# Tests: get_symbol_pins
+# Tests: get_library_symbol_pins
 # ---------------------------------------------------------------------------
 
 
@@ -356,7 +356,7 @@ class TestGetSymbolPins:
         result = _call_tool(
             port,
             sid,
-            "get_symbol_pins",
+            "get_library_symbol_pins",
             {
                 "library_name": "NonExistentLib",
                 "symbol_name": "NonExistentSymbol",

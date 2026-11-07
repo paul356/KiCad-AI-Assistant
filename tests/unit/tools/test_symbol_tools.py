@@ -161,7 +161,7 @@ class TestGetSymbolSyncStatus:
 
 
 class TestSearchSymbols:
-    """Tests for search_symbols()."""
+    """Tests for search_library_symbols()."""
 
     def _make_symbol_record(self, lib="Device", name="R", desc="Resistor", kw="res", pins=2):
         r = MagicMock()
@@ -180,7 +180,7 @@ class TestSearchSymbols:
         mock_mgr.search_symbols.return_value = [rec1, rec2]
 
         with patch("kcaa.tools.symbol_tools._get_index_manager", return_value=mock_mgr):
-            result = _call("search_symbols", query="passive")
+            result = _call("search_library_symbols", query="passive")
 
         assert result["success"] is True
         assert result["count"] == 2
@@ -193,7 +193,7 @@ class TestSearchSymbols:
         mock_mgr.search_symbols.return_value = []
 
         with patch("kcaa.tools.symbol_tools._get_index_manager", return_value=mock_mgr):
-            result = _call("search_symbols", query="xyzzy_no_match")
+            result = _call("search_library_symbols", query="xyzzy_no_match")
 
         assert result["success"] is True
         assert result["count"] == 0
@@ -204,7 +204,7 @@ class TestSearchSymbols:
         mock_mgr.search_symbols.side_effect = RuntimeError("DB locked")
 
         with patch("kcaa.tools.symbol_tools._get_index_manager", return_value=mock_mgr):
-            result = _call("search_symbols", query="anything")
+            result = _call("search_library_symbols", query="anything")
 
         assert result["success"] is False
         assert "DB locked" in result["error"]
@@ -216,7 +216,7 @@ class TestSearchSymbols:
 
 
 class TestGetSymbol:
-    """Tests for get_symbol()."""
+    """Tests for get_library_symbol()."""
 
     def test_found(self):
         rec = MagicMock()
@@ -230,7 +230,7 @@ class TestGetSymbol:
         mock_mgr.get_symbol.return_value = rec
 
         with patch("kcaa.tools.symbol_tools._get_index_manager", return_value=mock_mgr):
-            result = _call("get_symbol", library_name="Device", symbol_name="R")
+            result = _call("get_library_symbol", library_name="Device", symbol_name="R")
 
         assert result["success"] is True
         assert result["library_name"] == "Device"
@@ -242,7 +242,7 @@ class TestGetSymbol:
         mock_mgr.get_symbol.return_value = None
 
         with patch("kcaa.tools.symbol_tools._get_index_manager", return_value=mock_mgr):
-            result = _call("get_symbol", library_name="Device", symbol_name="NOEXIST")
+            result = _call("get_library_symbol", library_name="Device", symbol_name="NOEXIST")
 
         assert result["success"] is False
         assert "not found" in result["error"]
@@ -502,7 +502,7 @@ def _load_fixture_symbol(fixture_path: str, symbol_name: str) -> list:
 
 
 class TestGetSymbolPins:
-    """Tests for the get_symbol_pins() MCP tool."""
+    """Tests for the get_library_symbol_pins() MCP tool."""
 
     def _make_mock_mgr(self):
         """Return (mock_mgr, sym_rec, lib_rec) backed by the R_Small fixture."""
@@ -520,7 +520,7 @@ class TestGetSymbolPins:
         return mock_mgr
 
     def test_happy_path(self):
-        """get_symbol_pins returns success with pin data for R_Small."""
+        """get_library_symbol_pins returns success with pin data for R_Small."""
         raw = _load_fixture_symbol(_FIXTURE_SYM, "R_Small")
         mock_mgr = self._make_mock_mgr()
 
@@ -528,7 +528,7 @@ class TestGetSymbolPins:
             patch("kcaa.tools.symbol_tools._get_index_manager", return_value=mock_mgr),
             patch("kcaa.tools.symbol_tools.extract_lib_symbol_raw", return_value=raw),
         ):
-            result = _call("get_symbol_pins", library_name="Device", symbol_name="R_Small")
+            result = _call("get_library_symbol_pins", library_name="Device", symbol_name="R_Small")
 
         assert result["success"] is True
         assert result["symbol_name"] == "R_Small"
@@ -544,7 +544,7 @@ class TestGetSymbolPins:
             patch("kcaa.tools.symbol_tools._get_index_manager", return_value=mock_mgr),
             patch("kcaa.tools.symbol_tools.extract_lib_symbol_raw", return_value=raw),
         ):
-            result = _call("get_symbol_pins", library_name="Device", symbol_name="R_Small")
+            result = _call("get_library_symbol_pins", library_name="Device", symbol_name="R_Small")
 
         for pin in result["pins"]:
             assert set(pin.keys()) == {"number", "name", "type", "direction"}
@@ -559,7 +559,7 @@ class TestGetSymbolPins:
             patch("kcaa.tools.symbol_tools._get_index_manager", return_value=mock_mgr),
             patch("kcaa.tools.symbol_tools.extract_lib_symbol_raw", return_value=raw),
         ):
-            result = _call("get_symbol_pins", library_name="Device", symbol_name="R_Small")
+            result = _call("get_library_symbol_pins", library_name="Device", symbol_name="R_Small")
 
         assert result["pin_count"] == len(result["pins"])
 
@@ -569,7 +569,7 @@ class TestGetSymbolPins:
         mock_mgr.get_symbol.return_value = None
 
         with patch("kcaa.tools.symbol_tools._get_index_manager", return_value=mock_mgr):
-            result = _call("get_symbol_pins", library_name="Device", symbol_name="NOEXIST")
+            result = _call("get_library_symbol_pins", library_name="Device", symbol_name="NOEXIST")
 
         assert result.get("success") is False
         assert "error" in result
@@ -580,7 +580,7 @@ class TestGetSymbolPins:
         mock_mgr.get_symbol.return_value = None
 
         with patch("kcaa.tools.symbol_tools._get_index_manager", return_value=mock_mgr):
-            result = _call("get_symbol_pins", library_name="Device", symbol_name="")
+            result = _call("get_library_symbol_pins", library_name="Device", symbol_name="")
 
         assert result.get("success") is False
         assert "error" in result
@@ -593,7 +593,7 @@ class TestGetSymbolPins:
         mock_mgr.get_library_by_name.return_value = None
 
         with patch("kcaa.tools.symbol_tools._get_index_manager", return_value=mock_mgr):
-            result = _call("get_symbol_pins", library_name="MISSINGLIB", symbol_name="R")
+            result = _call("get_library_symbol_pins", library_name="MISSINGLIB", symbol_name="R")
 
         assert result.get("success") is False
         assert "error" in result
@@ -609,7 +609,7 @@ class TestGetSymbolPins:
                 side_effect=FileNotFoundError("lib gone"),
             ),
         ):
-            result = _call("get_symbol_pins", library_name="Device", symbol_name="R_Small")
+            result = _call("get_library_symbol_pins", library_name="Device", symbol_name="R_Small")
 
         assert result.get("success") is False
         assert "error" in result
@@ -624,7 +624,7 @@ class TestGetSymbolPins:
                 "kcaa.tools.symbol_tools.extract_lib_symbol_raw", side_effect=ValueError("bad data")
             ),
         ):
-            result = _call("get_symbol_pins", library_name="Device", symbol_name="R_Small")
+            result = _call("get_library_symbol_pins", library_name="Device", symbol_name="R_Small")
 
         assert result.get("success") is False
         assert "error" in result
@@ -638,7 +638,7 @@ class TestGetSymbolPins:
             patch("kcaa.tools.symbol_tools._get_index_manager", return_value=mock_mgr),
             patch("kcaa.tools.symbol_tools.extract_lib_symbol_raw", return_value=raw),
         ):
-            result = _call("get_symbol_pins", library_name="Device", symbol_name="R_Small")
+            result = _call("get_library_symbol_pins", library_name="Device", symbol_name="R_Small")
 
         by_num = {p["number"]: p for p in result["pins"]}
         assert by_num["1"] == {"number": "1", "name": "", "type": "passive", "direction": "up"}
@@ -793,7 +793,7 @@ class TestProjectPathScoping:
         with self._patch_mgr() as mock_get_mgr:
             mock_get_mgr.return_value.get_symbol.return_value = rec
             result = _call(
-                "get_symbol", library_name="ProjLib", symbol_name="R", project_path="/p/X"
+                "get_library_symbol", library_name="ProjLib", symbol_name="R", project_path="/p/X"
             )
 
         assert result["success"] is True
@@ -813,7 +813,7 @@ class TestProjectPathScoping:
 
         with self._patch_mgr() as mock_get_mgr:
             mock_get_mgr.return_value.search_symbols.return_value = [rec]
-            result = _call("search_symbols", query="res", project_path="/p/X")
+            result = _call("search_library_symbols", query="res", project_path="/p/X")
 
         assert result["success"] is True
         assert result["count"] == 1
@@ -920,7 +920,10 @@ class TestProjectPathScoping:
             mock_get_mgr.return_value.get_symbol.return_value = sym_rec
             mock_get_mgr.return_value.get_library_by_name.return_value = lib_rec
             result = _call(
-                "get_symbol_pins", library_name="ProjLib", symbol_name="R", project_path="/p/X"
+                "get_library_symbol_pins",
+                library_name="ProjLib",
+                symbol_name="R",
+                project_path="/p/X",
             )
 
         assert result["success"] is True

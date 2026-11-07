@@ -211,6 +211,14 @@ kcaa
 
 ## Available Tools
 
+**Naming convention** — a `library_` prefix means a **definition inside a library**; no prefix means an **object placed on a board or in a schematic**. A `library_` tool never returns placement.
+
+- `get_library_footprint` — footprint **definition** in a library; key `library_name` + `footprint_name`. Returns pads/courtyard/attributes; pad coordinates are footprint-local, with no board-level placement anchor.
+- `get_footprint` — footprint **placed on a PCB**; key `pcb_path` + `references[]` (world position, rotation, layer, properties, pads).
+- `list_symbol_properties` — symbol **placed in a schematic**; key `schematic_path` + `references[]` (properties only, no geometry, position, or nets).
+- `extract_schematic_netlist` — returns the **whole netlist**, including the placement of **every** placed symbol (`components[ref].units[n].position`, `rotation`, per-unit `body_bbox`, world-coordinate `pins`); not a cheap single-coordinate lookup.
+- `find_component_connections` — placement and connections for a **single reference** (`project_path` + `component_ref`); returns only that reference's `component_info` (also with `units[n].position`), not the whole netlist.
+
 ### Project Tools
 
 | Tool | Description |
@@ -227,10 +235,10 @@ kcaa
 | `get_symbol_sync_status` | Query symbol index build progress |
 | `get_symbol_index_stats` | Get statistics about the symbol index |
 | `list_symbol_libraries` | List all symbol libraries; `list_library_symbols` lists the symbols inside one library (keyed by `library_name`) |
-| `search_symbols` | Full-text search across indexed symbols |
-| `get_symbol` | Look up a symbol by library and name |
+| `search_library_symbols` | Full-text search across indexed symbols |
+| `get_library_symbol` | Look up a symbol by library and name |
 | `list_library_symbols` | List the symbols inside one library, keyed by `library_name`; `list_symbol_libraries` lists all libraries |
-| `get_symbol_pins` | Get pin definitions for a symbol |
+| `get_library_symbol_pins` | Get pin definitions for a symbol |
 | `create_symbol_library` | Create a new `.kicad_sym` library (global 3rd-party or project-local) and register it in the library table |
 | `delete_symbol_library` | Delete an empty symbol library (file, library-table entry, and index) |
 | `add_symbols_to_library` | Copy symbols from a schematic's cached `lib_symbols` into an existing library |
@@ -248,7 +256,7 @@ kcaa
 | `move_component` | Move and/or rotate a placed component |
 | `set_symbol_property` | Set a property field on a placed symbol |
 | `rename_symbol` | Rename a placed symbol's reference designator |
-| `list_symbol_properties` | List all properties of a placed symbol |
+| `list_symbol_properties` | List properties (name → value) of placed schematic symbols — no geometry, position, or nets |
 | `delete_symbol_property` | Delete a property from a placed symbol |
 | `check_reference_conflicts` | Check for duplicate reference designators |
 | `connect_points_with_wire` | Route a smart orthogonal wire between two points |
@@ -304,8 +312,8 @@ kcaa
 | `sync_footprint_index` | Build or refresh the footprint library index |
 | `get_footprint_sync_status` | Query footprint index build progress |
 | `list_footprint_libraries` | List all available footprint libraries |
-| `search_footprints` | Search footprints by name, description, or tag |
-| `get_footprint_details` | Get footprint details (pads, bounding box, etc.) |
+| `search_library_footprints` | Search footprints by name, description, or tag |
+| `get_library_footprint` | Get a footprint **library definition** (pads, bounding box, etc.) by library name + footprint name — not a board placement |
 | `list_library_footprints` | List every footprint in one library (names and light metadata) (offset paging) |
 | `find_footprints_not_in_libraries` | List board footprints missing from every indexed library |
 | `create_footprint_library` | Create a global 3rdparty or project-local footprint library |
@@ -319,7 +327,7 @@ kcaa
 |------|-------------|
 | `get_board_info` | Get basic PCB board information |
 | `list_footprints` | List all footprints placed on the board |
-| `get_footprint` | Get details of a placed footprint (pads, properties, Edge.Cuts geometry) |
+| `get_footprint` | Get details of footprints **placed on the PCB**, one payload per reference in `references` (pads, properties, Edge.Cuts geometry) |
 | `get_footprint_bbox` | Get the courtyard bounding box of a footprint |
 | `get_board_bounding_box` | Get the union bounding box of all footprints |
 | `list_nets` | List all nets on the board |
