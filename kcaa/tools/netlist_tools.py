@@ -67,8 +67,8 @@ def register_netlist_tools(mcp: FastMCP) -> None:
           absent for graphics-less symbols (e.g. PWR_FLAG).
         - ``pins``: **per-unit** list of
           ``{num, name, electrical, x, y, direction, net}``. ``net`` is the
-          name of the net the pin belongs to (``null`` or absent when
-          unconnected). ``x``/``y`` are world
+          name of the net the pin belongs to (``null`` when unconnected; the
+          key is always present). ``x``/``y`` are world
           coordinates already accounting for placement and rotation;
           ``direction`` is the screen-space exit direction
           (``"right"|"up"|"left"|"down"``). ``name`` is the pin name
@@ -429,8 +429,9 @@ def register_netlist_tools(mcp: FastMCP) -> None:
             ``component_info`` is the raw parser entry for ``component_ref`` —
             ``{reference, value, units}`` plus ``lib_id`` / ``footprint`` when
             present; ``type`` appears only on sub-sheet entries.  Each
-            ``units[n]`` carries ``position`` (``{x, y, rotation}``; ``{x, y}``
-            for sub-sheets), ``body_bbox``, and ``pins`` in world coordinates.
+            ``units[n]`` carries ``position`` when available
+            (``{x, y, rotation}``; ``{x, y}`` for sub-sheets),
+            ``body_bbox`` when present, and ``pins`` in world coordinates.
             In component_info, each pin's ``direction`` is the wire-exit
             direction in screen coordinates: "right", "down", "left", or "up".
         """
