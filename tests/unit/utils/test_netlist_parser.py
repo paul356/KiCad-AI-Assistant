@@ -221,6 +221,8 @@ class TestSinglePinSymbolConnectivity:
     def test_component_lists_its_single_pin(self, single_pin_netlist):
         pins = single_pin_netlist["components"]["MGT1"]["units"]["1"]["pins"]
         assert [(p["num"], float(p["x"]), float(p["y"])) for p in pins] == [("1", 100.0, 100.0)]
+        assert pins[0]["name"] == "~"  # unnamed-pin marker, per the tool contract
+        assert pins[0]["direction"] == "left"
 
     def test_pin_lands_on_the_labelled_net(self, single_pin_netlist):
         assert single_pin_netlist["nets"]["POWER"] == [{"component": "MGT1", "pin": "1"}]

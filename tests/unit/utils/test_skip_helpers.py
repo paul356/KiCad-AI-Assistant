@@ -143,6 +143,29 @@ class TestFallbackPath:
         assert pin.name == "VCC"
         assert pin.electrical_type == "passive"
 
+    def test_single_pin_fallback_rotation_90(self):
+        """Fallback pins use the same CCW placement transform as wrappers."""
+        pin = _one(_sym(100.0, 100.0, 90, [_lib_pin("1", "P", 0.0, 2.54, 270)], pins=False))
+        # lib (0, 2.54) rot90 → (-2.54, 0); world (100-2.54, 100) = (97.46, 100)
+        assert (pin.x, pin.y) == pytest.approx((97.46, 100.0))
+        assert pin.angle == 180.0
+
+    def test_single_pin_fallback_mirror_x(self):
+        """Fallback pins honour ``(mirror x)``."""
+        pin = _one(
+            _sym(
+                100.0,
+                100.0,
+                0,
+                [_lib_pin("1", "P", 0.0, 2.54, 270)],
+                pins=False,
+                mirror="x",
+            )
+        )
+        # lib (0, 2.54) mirror x → (0, 2.54); world (100, 100-2.54) = (100, 97.46)
+        assert (pin.x, pin.y) == pytest.approx((100.0, 97.46))
+        assert pin.angle == 90.0
+
 
 class TestSinglePinSymbolFixture:
     """Regression for #251: a one-pin part must still report its pin.
@@ -165,6 +188,7 @@ class TestSinglePinSymbolFixture:
         assert len(coords) == 1
         pin = coords[0]
         assert pin.number == "1"
-        assert pin.name == ""  # KiCad's "~" empty-name marker
+        assert pin.name == "~"  # unnamed-pin marker, per the tool contract
         assert (pin.x, pin.y) == pytest.approx((100.0, 100.0))
         assert pin.electrical_type == "passive"
+        assert pin.angle == 180.0  # non-None wire-exit direction: left
