@@ -85,9 +85,12 @@ def register_netlist_tools(mcp: FastMCP) -> None:
           raises ``KeyError``), ``num``, ``number``, and ``name`` all equal the
           sheet-pin name (sheet pins are addressed by name, never ``REF.N``),
           and the unit's ``position`` has no ``rotation`` (see ``units``
-          above). ``net`` is always a string for sheet pins: the sheet-pin
-          name when nothing else names the net, even with nothing wired to
-          the pin. When choosing which two pins to
+          above). For sheet pins ``net`` follows the same untraced-pin rule
+          (``null`` for a ``#``-prefixed sheet reference or a pin with an
+          empty name); otherwise it is a string: an attached label names the
+          net, except that a power-net pin name (``GND``, ``VCC``, ``VDD``,
+          ``VSS``, ``VEE``) takes precedence, and with nothing attached the
+          sheet-pin name is used. When choosing which two pins to
           wire, the **electrically correct pin** comes first — only fall
           back to "closest pin pair" geometry when both candidates are
           electrically interchangeable (e.g. the two leads of a non-polar

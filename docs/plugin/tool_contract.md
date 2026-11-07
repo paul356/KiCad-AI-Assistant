@@ -120,11 +120,13 @@ Sub-sheets appear as ordinary components with `type: "sheet"`. Their
 `value` is the sub-sheet file path (not a symbol value), and
 `units[n].position` has no `rotation`. Their `pins` are the reduced
 sheet-pin shape `{num, number, name, x, y, net}`: there is no `electrical`
-or `direction` key (`pin["direction"]` raises `KeyError`), `net` is added
-by this tool and is always a string — the sheet-pin name when nothing else
-names the net, even with nothing wired to the pin — and
+or `direction` key (`pin["direction"]` raises `KeyError`), and
 `num == number == name ==` the sheet-pin name — sheet pins are addressed
-by name, never `REF.N`.
+by name, never `REF.N`. `net` is added by this tool and follows the same
+untraced-pin rule (a `#`-prefixed sheet reference or a pin with an empty
+name gives `null`); otherwise it is a string: an attached label names the
+net, except that a power-net pin name (`GND`, `VCC`, `VDD`, `VSS`, `VEE`)
+takes precedence, and with nothing attached the sheet-pin name is used.
 
 `move_component` takes **deltas** (x/y shifts in mm, rotation increment)
 and accepts a `unit` number to move/rotate one unit individually
