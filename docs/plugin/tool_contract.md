@@ -116,6 +116,14 @@ footprint), and `pins`. A single-unit component is nested under
 `units["1"]`. There is no merged top-level bbox — union the per-unit
 bboxes when you need a component's whole occupied region.
 
+Sub-sheets appear as ordinary components with `type: "sheet"`. Their
+`value` is the sub-sheet file path (not a symbol value), and
+`units[n].position` has no `rotation`. Their `pins` are the reduced
+sheet-pin shape `{num, number, name, x, y, net}`: there is no `electrical`
+or `direction` key (`pin["direction"]` raises `KeyError`), `net` is added
+by this tool (`null` when unconnected), and `num == number == name ==` the
+sheet-pin name — sheet pins are addressed by name, never `REF.N`.
+
 `move_component` takes **deltas** (x/y shifts in mm, rotation increment)
 and accepts a `unit` number to move/rotate one unit individually
 (omitted = move all units together by the same delta, preserving their
@@ -137,6 +145,8 @@ express an absolute move as a delta.
 **Return shape:** `{"success": true, "project_path": "...", "schematic_path": "...", "component": "R1", "component_info": {"reference": "R1", "lib_id": "Device:R", "value": "10k", "footprint": "...", "units": {"1": {"position": {"x": 50.8, "y": 63.5, "rotation": 0}, "body_bbox": {"min_x": ..., ...}, "pins": [{"num": "1", "name": "~", "electrical": "passive", "x": ..., "y": ..., "direction": "up"}]}}}, "connections": [{"pin": "1", "net": "VCC", "connected_to": [{"component": "U1", "pin": "4"}]}], "connected_nets": ["VCC"], "pin_functions": {"1": {"name": "~", "type": "unknown"}}, "total_connections": 1}`
 
 **When to use:** When the engineer asks "what is R1 connected to?" without needing the full schematic state.
+
+A sub-sheet reference (`type: "sheet"`) returns that reduced sheet-pin shape minus the tool-added `net`: `{num, number, name, x, y}`, with no `electrical` or `direction` and `num == number == name ==` the sheet-pin name.
 
 ---
 
