@@ -27,13 +27,18 @@ def register_netlist_tools(mcp: FastMCP) -> None:
     ) -> dict[str, Any]:
         """Extract component inventory, net analysis, and wire geometry for a KiCad schematic.
 
-        This is the **only** tool that returns the placement of a symbol
-        **placed in a schematic** — ``components[ref]["units"][n]["position"]``
-        (``{x, y, rotation}``) plus the unit's ``body_bbox`` and the
-        world-coordinate ``pins``.  For a symbol **definition** in a library
-        (no placement) use ``get_library_symbol`` / ``get_library_symbol_pins``.
-        The netlist payload is large, so prefer this tool when you need
-        connectivity and/or geometry, not for a single coordinate.
+        This tool returns the **whole netlist**, and therefore the placement of
+        **every** placed symbol: ``components[ref]["units"][n]["position"]``
+        (``{x, y, rotation}``) plus that unit's ``body_bbox`` and the
+        world-coordinate ``pins``.  For a **single reference**, prefer
+        ``find_component_connections(project_path, component_ref)``: it returns
+        only that reference's own ``component_info`` (also containing
+        ``units[n].position``, ``body_bbox``, and world-coordinate ``pins``)
+        and its connections, not the whole netlist.  For a symbol **definition**
+        in a library (no placement) use ``get_library_symbol`` /
+        ``get_library_symbol_pins``.  The netlist payload is large, so use this
+        tool when you need connectivity and/or geometry across the design, not
+        for a single coordinate.
 
         A net is a named group of pins that are electrically connected by wires.
         For example, if R1/pin2, C1/pin1, and a GND power symbol are all joined
@@ -46,16 +51,20 @@ def register_netlist_tools(mcp: FastMCP) -> None:
           Their hierarchical pins are exposed like component pins and use the
           sheet-pin name as their local net name.
 
+        Each entry is ``{value, type, units}``; ``value`` and ``type`` live at
+        the component level, not inside units.
+
         - ``units``: per-unit dict (``"1"``, ``"2"``, … for multi-unit parts).
           Each unit carries ``position``: ``{x, y, rotation}`` placement anchor
-          in mm (KiCad screen coords, **+Y is down**), ``rotation``, ``mirror``,
-          ``lib_id``, ``value``, ``footprint``, and its own ``body_bbox``:
+          in mm (KiCad screen coords, **+Y is down**; ``rotation`` is a field
+          of ``position``, not a separate unit key), and its own ``body_bbox``:
           ``{min_x, min_y, max_x, max_y}`` world-space bounding box of that
-          unit's footprint. Use it
-          to check overlaps before calling ``move_component`` /
-          ``add_symbol_to_schematic``. May be absent for graphics-less
-          symbols (e.g. PWR_FLAG).
-        - ``pins``: list of ``{num, name, electrical, x, y, direction}``. ``x``/``y`` are world
+          unit's footprint. Units carry no ``mirror``, ``lib_id``, or
+          ``footprint`` keys. Use ``body_bbox`` to check overlaps before
+          calling ``move_component`` / ``add_symbol_to_schematic``. May be
+          absent for graphics-less symbols (e.g. PWR_FLAG).
+        - ``pins``: **per-unit** list of
+          ``{num, name, electrical, x, y, direction}``. ``x``/``y`` are world
           coordinates already accounting for placement and rotation;
           ``direction`` is the screen-space exit direction
           (``"right"|"up"|"left"|"down"``). ``name`` is the pin name
@@ -410,9 +419,15 @@ def register_netlist_tools(mcp: FastMCP) -> None:
             ctx: MCP context for progress reporting
 
         Returns:
-            Dictionary with component connection information. In component_info,
-            each pin's ``direction`` is the wire-exit direction in screen coordinates:
-            "right", "down", "left", or "up".
+            Dictionary with component connection information. This tool operates
+            on **one reference** and does not return the whole netlist; use
+            ``extract_schematic_netlist`` for the full design.  Its
+            ``component_info`` is the raw netlist entry for ``component_ref``
+            (``{value, type, units}``), where each ``units[n]`` carries
+            ``position`` (``{x, y, rotation}``), ``body_bbox``, and ``pins`` in
+            world coordinates.  In component_info, each pin's ``direction`` is
+            the wire-exit direction in screen coordinates: "right", "down",
+            "left", or "up".
         """
         print(f"Finding connections for component {component_ref} in project: {project_path}")
 

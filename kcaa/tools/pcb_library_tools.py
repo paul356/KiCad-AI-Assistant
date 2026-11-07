@@ -521,6 +521,9 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
         If the index is empty, falls back to a slower live scan of .kicad_mod
         files.  Other projects' libraries are never searched.
 
+        Results are library **definitions**: this tool returns no board or
+        schematic placement.
+
         Args:
             query: Search string matched against footprint name, description,
                 and tags (case-insensitive).

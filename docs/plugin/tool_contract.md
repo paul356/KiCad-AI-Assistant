@@ -7,8 +7,8 @@
 ## Naming conventions
 
 - A `library_` prefix means a **definition inside a library**: `get_library_symbol`, `get_library_symbol_pins`, `get_library_footprint`, `search_library_symbols`, `search_library_footprints`, `list_library_symbols`, `list_library_footprints`. These take `library_name` plus the object name and **never return placement**.
-- No prefix means an **object placed on a board or in a schematic**: `get_footprint`, `list_footprints`, `get_footprint_bbox`, `list_symbol_properties`. These take `pcb_path` / `schematic_path` plus `references[]`.
-- The placement (`position`, `rotation`, `body_bbox`) of a symbol placed in a schematic is returned only by `extract_schematic_netlist` (`components[ref].units[n].position`). There is no separate point-lookup tool for it, so budget for the netlist payload when you need one coordinate.
+- No prefix means an **object placed on a board or in a schematic**. Reference-addressed tools take `pcb_path` / `schematic_path` plus `references[]`: `get_footprint`, `get_footprint_bbox`, `list_symbol_properties`. `list_footprints` instead takes `pcb_path` plus an optional `ref_prefix` and lists matching footprints.
+- `extract_schematic_netlist` returns the whole netlist, and with it the placement (`position`, `rotation`, `body_bbox`) of **every** symbol placed in a schematic (`components[ref].units[n].position`). For a **single reference**, `find_component_connections(project_path, component_ref)` returns that reference's own `component_info` (also with `units[n].position`) and its connections, without the whole netlist.
 
 ---
 

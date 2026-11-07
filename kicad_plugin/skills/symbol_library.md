@@ -28,9 +28,11 @@ tools: [sync_symbol_index, get_symbol_sync_status, search_library_symbols, get_l
 3. **Always prefer search_library_symbols** for finding components:
    `search_library_symbols(query="NPN transistor", limit=50)` returns `library_name` and `name`
    fields ready to pass to placement tools.
-4. When you need detailed placement geometry, call **get_library_symbol(library_name, symbol_name)**.
-   Returns `body_bbox` (union of graphics + pin points, library Y-up coordinates) and
-   `unit_bboxes` for multi-unit symbols.
+4. When you need clearance or `body_bbox` geometry in **library space** (Y-up),
+   call **get_library_symbol(library_name, symbol_name)**. Returns `body_bbox`
+   (union of graphics + pin points, library Y-up coordinates) and
+   `unit_bboxes` for multi-unit symbols. This is the library **definition**;
+   it returns **no** board or schematic placement.
 5. When you need pin-level detail (direction, electrical type), call
    **get_library_symbol_pins(library_name, symbol_name)**. Also returns `body_bbox` and
    `unit_bboxes`. Pin directions are **wire-exit** directions in library Y-up space

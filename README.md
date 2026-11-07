@@ -213,10 +213,11 @@ kcaa
 
 **Naming convention** — a `library_` prefix means a **definition inside a library**; no prefix means an **object placed on a board or in a schematic**. A `library_` tool never returns placement.
 
-- `get_library_footprint` — footprint **definition** in a library; key `library_name` + `footprint_name`. Returns pads/courtyard/attributes, never x/y.
+- `get_library_footprint` — footprint **definition** in a library; key `library_name` + `footprint_name`. Returns pads/courtyard/attributes; pad coordinates are footprint-local, with no board-level placement anchor.
 - `get_footprint` — footprint **placed on a PCB**; key `pcb_path` + `references[]` (world position, rotation, layer, properties, pads).
 - `list_symbol_properties` — symbol **placed in a schematic**; key `schematic_path` + `references[]` (properties only, no geometry, position, or nets).
-- `extract_schematic_netlist` — the **only** tool that returns a placed symbol's placement (`components[ref].units[n].position`, `rotation`, per-unit `body_bbox`); it also returns the full netlist, so it is not a cheap point lookup.
+- `extract_schematic_netlist` — returns the **whole netlist**, including the placement of **every** placed symbol (`components[ref].units[n].position`, `rotation`, per-unit `body_bbox`, world-coordinate `pins`); not a cheap single-coordinate lookup.
+- `find_component_connections` — placement and connections for a **single reference** (`project_path` + `component_ref`); returns only that reference's `component_info` (also with `units[n].position`), not the whole netlist.
 
 ### Project Tools
 

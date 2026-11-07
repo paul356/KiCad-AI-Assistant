@@ -180,10 +180,11 @@ kcaa
 
 **命名约定** — 前缀 `library_` 表示**库中的定义**；无前缀表示**已放置在板上或图中的实例**。带 `library_` 的工具不返回放置信息。
 
-- `get_library_footprint` — 封装库中的封装**定义**；键为 `library_name` + `footprint_name`，返回焊盘/courtyard/属性，不含 x/y。
+- `get_library_footprint` — 封装库中的封装**定义**；键为 `library_name` + `footprint_name`，返回焊盘/courtyard/属性；焊盘坐标为封装本地（footprint-local）坐标，没有板级放置锚点。
 - `get_footprint` — **PCB 上已放置的封装**；键为 `pcb_path` + `references[]`（世界坐标、旋转、层、属性、焊盘）。
 - `list_symbol_properties` — **原理图中已放置的符号**；键为 `schematic_path` + `references[]`（仅属性，不含几何、位置或网络）。
-- `extract_schematic_netlist` — **唯一**返回原理图已放置符号放置信息的工具（`components[ref].units[n].position`、`rotation`、每个 unit 的 `body_bbox`）；它同时返回整份网表，不是廉价的点查。
+- `extract_schematic_netlist` — 返回**整份网表**，因此带有**每个**已放置符号的放置信息（`components[ref].units[n].position`、`rotation`、每个 unit 的 `body_bbox`、世界坐标 `pins`）；不是廉价的单点坐标查询。
+- `find_component_connections` — **单个位号**的放置信息与连接（`project_path` + `component_ref`）；只返回该位号自己的 `component_info`（同样含 `units[n].position`），不返回整份网表。
 
 ### 项目工具
 

@@ -358,6 +358,9 @@ def register_symbol_tools(mcp: FastMCP) -> None:
         Searches symbol name, description, and keywords. Results are ordered
         by relevance. Run sync_symbol_index first if the index is empty.
 
+        Results are library **definitions**: this tool returns no board or
+        schematic placement.
+
         Args:
             query: Search string (e.g. "resistor", "NPN transistor", "STM32").
             project_path: Optional path to a project directory or a file
