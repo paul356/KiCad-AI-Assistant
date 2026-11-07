@@ -144,7 +144,7 @@ function _shouldScrollBottom() {
     return (sh - ih - sy) < 80;
 }
 
-window._updateConversation = function(entriesJson, scrollBehavior) {
+window._updateConversation = function(entriesJson, scrollBehavior, replaceDocument) {
     try {
         var conv = document.getElementById('conversation');
         if (!conv) return 'error:no conversation div';
@@ -153,11 +153,34 @@ window._updateConversation = function(entriesJson, scrollBehavior) {
         for (var i = 0; i < entries.length; i++) {
             frag.appendChild(_renderEntry(entries[i]));
         }
+        // A rebuild must not move the reader or collapse tool results they
+        // expanded: capture both, in document order, before wiping the DOM.
+        // A replacement (session load/restore/clear) starts a fresh document
+        // and must not inherit state from the previous conversation.
+        var replace = replaceDocument === true;
+        var sy = replace ? 0 : window.scrollY;
+        var openRows = [];
+        if (!replace) {
+            var oldRows = document.querySelectorAll('details.tools');
+            for (var j = 0; j < oldRows.length; j++) {
+                openRows.push(oldRows[j].open);
+            }
+        }
         conv.innerHTML = '';
         conv.appendChild(frag);
         var sw = document.getElementById('stream-wrapper');
         if (sw) sw.style.display = 'none';
         document.getElementById('pending-ai-text').innerHTML = '';
+        if (!replace) {
+            // Restore by index; a longer new list just gets its defaults (closed).
+            var newRows = document.querySelectorAll('details.tools');
+            for (var k = 0; k < openRows.length && k < newRows.length; k++) {
+                newRows[k].open = openRows[k];
+            }
+        }
+        // A replacement starts at the top (sy === 0); a preserve keeps the
+        // reader's offset.  The browser clamps to the new document's range.
+        window.scrollTo(0, sy);
         if (scrollBehavior === 'bottom') {
             window.scrollTo(0, document.body ? document.body.scrollHeight : 0);
         }
