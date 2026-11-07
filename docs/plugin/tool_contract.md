@@ -142,7 +142,7 @@ express an absolute move as a delta.
 
 ### 3.2 Symbol Index Tools
 
-> **Project scope:** At the MCP layer, omitting `project_path` reads the global libraries only. Inside the plugin chat client, the seven tools documented here default an **omitted or `null`** `project_path` to the panel's active project before dispatch. An explicit value always wins — an explicit `""` still means global — and mutating symbol tools (`create_symbol`, `update_symbol`, `delete_symbol`, `register_symbol_library`, …) are never defaulted.
+> **Project scope:** At the MCP layer, omitting `project_path` reads the global libraries only. Inside the plugin chat client, the seven tools here that accept `project_path` default an **omitted or `null`** value to the panel's active project before dispatch. An explicit value always wins — an explicit `""` still means global — and mutating symbol tools (`create_symbol_library`, `add_symbols_to_library`, `remove_symbols_from_library`, `delete_symbol_library`, `delete_symbol_property`, …) are never defaulted.
 
 #### `sync_symbol_index(force=False, project_path=None)`
 
