@@ -246,7 +246,28 @@ class TestGetSymbol:
             result = _call("get_library_symbol", library_name="Device", symbol_name="NOEXIST")
 
         assert result["success"] is False
-        assert "not found" in result["error"]
+        assert result["error"] == (
+            "Symbol 'Device:NOEXIST' not found in index (searched: global libraries)."
+            " Pass project_path=<project dir> to include that project's libraries."
+        )
+
+    def test_not_found_reports_project_scope(self, tmp_path):
+        mock_mgr = MagicMock()
+        mock_mgr.get_symbol.return_value = None
+        project_dir = os.path.realpath(str(tmp_path))
+
+        with patch("kcaa.tools.symbol_tools._get_index_manager", return_value=mock_mgr):
+            result = _call(
+                "get_library_symbol",
+                library_name="Device",
+                symbol_name="NOEXIST",
+                project_path=project_dir,
+            )
+
+        assert result["error"] == (
+            f"Symbol 'Device:NOEXIST' not found in index "
+            f"(searched: global + project libraries of {project_dir})."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -498,6 +519,24 @@ def _make_project_library(tmp_path) -> str:
         encoding="utf-8",
     )
     return os.path.realpath(str(project_dir))
+
+
+class _EmptyGlobalConfig:
+    """Minimal config whose global sym-lib-table is an empty temp file.
+
+    Keeps the unit test hermetic: ``ServerConfig()`` would point at the host's
+    real KiCad user table and pull every installed library into the index.
+    """
+
+    def __init__(self, global_table: str):
+        self._global_table = global_table
+
+    @property
+    def symbol_table_file(self) -> str:
+        return self._global_table
+
+    def get_env_vars(self) -> dict:
+        return {}
 
 
 def _load_fixture_symbol(fixture_path: str, symbol_name: str) -> list:
@@ -1001,13 +1040,22 @@ class TestProjectScopedSymbolLookup:
     @staticmethod
     def _synced_manager(tmp_path):
         from kcaa.utils.symbol_index_manager import SymbolIndexManager
+        from kcaa.utils.symbol_index_reader import SymbolIndexReader
 
         project_dir = _make_project_library(tmp_path)
+        global_table = tmp_path / "global-sym-lib-table"
+        global_table.write_text("(sym_lib_table)\n", encoding="utf-8")
         mgr = SymbolIndexManager(
-            project_path=project_dir,
+            SymbolIndexReader(
+                _EmptyGlobalConfig(str(global_table)),
+                project_dir=project_dir,
+            ),
             db_path=str(tmp_path / "symbols.db"),
+            project_path=project_dir,
         )
         mgr.sync()
+        # Hermeticity guard: the host's global libraries must not leak in.
+        assert [lib.library_name for lib in mgr.get_all_libraries()] == ["Issue255Lib"]
         return project_dir, mgr
 
     def test_project_library_resolves_with_project_scope(self, tmp_path):

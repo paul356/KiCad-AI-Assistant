@@ -81,12 +81,9 @@ The full context JSON is also available as a `context` field if the LLM needs to
 
 ## 5. How Context Reaches MCP Tool Calls
 
-The MCP tools accept explicit path arguments (`schematic_path`, `project_path`). The LLM is instructed by the system prompt to use the active paths from the context. The plugin does **not** inject context as MCP session metadata; it relies on the LLM to pass paths correctly as arguments.
+The MCP tools accept explicit path arguments (`schematic_path`, `project_path`). The LLM is instructed by the system prompt to use the active paths from the context. The plugin does **not** inject context as MCP session metadata, so the MCP server stays stateless and every tool call is self-contained and auditable in the tool log.
 
-This model:
-- Keeps the MCP server stateless (no session state on the server side)
-- Makes every tool call self-contained and auditable in the tool log
-- Allows the engineer to override paths by asking the LLM explicitly
+One exception lives inside the plugin chat client: when a turn has an active project, the symbol-library/index tools (`sync_symbol_index`, `search_library_symbols`, `get_library_symbol`, `get_library_symbol_pins`, `list_symbol_libraries`, `list_library_symbols`, `get_symbol_index_stats`) default an **omitted or `null`** `project_path` to that project before dispatch. An explicit value always wins — including an explicit `""`, which still means the global scope — and mutating symbol tools are never defaulted. Standalone MCP use is unchanged: omitting `project_path` means global.
 
 ---
 

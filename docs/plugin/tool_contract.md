@@ -142,13 +142,15 @@ express an absolute move as a delta.
 
 ### 3.2 Symbol Index Tools
 
+> **Project scope:** At the MCP layer, omitting `project_path` reads the global libraries only. Inside the plugin chat client, the seven tools documented here default an **omitted or `null`** `project_path` to the panel's active project before dispatch. An explicit value always wins — an explicit `""` still means global — and mutating symbol tools (`create_symbol`, `update_symbol`, `delete_symbol`, `register_symbol_library`, …) are never defaulted.
+
 #### `sync_symbol_index(force=False, project_path=None)`
 
 **Purpose:** Scans all installed KiCad symbol libraries and populates the local full-text search index. Must be called at least once before `search_library_symbols` will return results.
 
 **Key parameters:**
 - `force` (`bool`) — when `True`, rebuilds even if the index appears current.
-- `project_path` (`str | None`) — optional path to a project directory or a file inside it (e.g. the schematic). Syncs global plus that project's libraries; other projects' rows are never touched. Omit for the global scope only.
+- `project_path` (`str | None`) — optional path to a project directory or a file inside it (e.g. the schematic). Syncs global plus that project's libraries; other projects' rows are never touched. When called directly over MCP, omit for the global scope only; the plugin defaults it to the active project.
 
 ---
 
@@ -164,7 +166,7 @@ express an absolute move as a delta.
 
 **Key parameters:**
 - `query` (`str`) — search string (e.g. `"NPN transistor"`, `"STM32F4"`).
-- `project_path` (`str | None`) — optional path to a project directory or a file inside it. Global plus that project's libraries are searched; other projects' libraries are never shown. Omit for global libraries only.
+- `project_path` (`str | None`) — optional path to a project directory or a file inside it. Global plus that project's libraries are searched; other projects' libraries are never shown. When called directly over MCP, omit for global libraries only; the plugin defaults it to the active project.
 - `limit` (`int`, default `50`) — maximum results.
 
 **Return shape:** `{"success": true, "count": N, "symbols": [{"library_name": "...", "name": "...", "description": "...", "pin_count": N}, ...]}`
@@ -179,7 +181,7 @@ express an absolute move as a delta.
 
 **Key parameters:**
 - `library_name` and `symbol_name` exactly as returned by `search_library_symbols`.
-- `project_path` (`str | None`) — optional path to a project directory or a file inside it. The lookup is scoped to global plus that project's libraries; other projects' libraries are never matched. Omit for global only.
+- `project_path` (`str | None`) — optional path to a project directory or a file inside it. The lookup is scoped to global plus that project's libraries; other projects' libraries are never matched. When called directly over MCP, omit for global only; the plugin defaults it to the active project.
 
 ---
 

@@ -665,13 +665,17 @@ def _inject_active_project(
     """Default ``project_path`` to the active project for symbol-scope tools.
 
     Only tools in ``_PROJECT_SCOPED_SYMBOL_TOOLS`` are touched, and only when
-    the model omitted ``project_path`` entirely: an explicitly supplied value
-    (including an empty, relative, or otherwise odd path) always wins. No
-    active project means the args pass through unchanged (global scope).
+    the model omitted ``project_path`` or sent ``null`` for it: providers that
+    materialize unset optional arguments as JSON ``null`` must still get the
+    project scope. An explicitly supplied value (including an empty, relative,
+    or otherwise odd path) always wins. No active project means the args pass
+    through unchanged (global scope).
     """
     if not active_project or tool_name not in _PROJECT_SCOPED_SYMBOL_TOOLS:
         return args
-    if not isinstance(args, dict) or "project_path" in args:
+    if not isinstance(args, dict):
+        return args
+    if args.get("project_path") is not None:
         return args
     return {**args, "project_path": active_project}
 
