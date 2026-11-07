@@ -8,11 +8,15 @@ The world position must come from the CCW matrix
 exit conversion ``(angle + 180) % 360`` (wire-exit = stub reversed).
 """
 
+import logging
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from kcaa.utils.skip_helpers import sym_pin_world_coords
+
+SINGLE_PIN_FIXTURE = str(Path(__file__).parent / "fixtures" / "single_pin_symbol.kicad_sch")
 
 
 def _lib_pin(number, name, x, y, angle, etype="passive"):
@@ -139,3 +143,88 @@ class TestFallbackPath:
         assert pin.angle == 180.0  # (270+90)=0 → (0+180)%360 → exit left
         assert pin.name == "VCC"
         assert pin.electrical_type == "passive"
+
+    def test_single_pin_fallback_rotation_90(self):
+        """Fallback pins use the same CCW placement transform as wrappers."""
+        pin = _one(_sym(100.0, 100.0, 90, [_lib_pin("1", "P", 0.0, 2.54, 270)], pins=False))
+        # lib (0, 2.54) rot90 → (-2.54, 0); world (100-2.54, 100) = (97.46, 100)
+        assert (pin.x, pin.y) == pytest.approx((97.46, 100.0))
+        assert pin.angle == 180.0
+
+    def test_single_pin_fallback_mirror_x(self):
+        """Fallback pins honour ``(mirror x)``."""
+        pin = _one(
+            _sym(
+                100.0,
+                100.0,
+                0,
+                [_lib_pin("1", "P", 0.0, 2.54, 270)],
+                pins=False,
+                mirror="x",
+            )
+        )
+        # lib (0, 2.54) mirror x → (0, 2.54); world (100, 100-2.54) = (100, 97.46)
+        assert (pin.x, pin.y) == pytest.approx((100.0, 97.46))
+        assert pin.angle == 90.0
+
+    def test_multi_pin_fallback_warns_about_lost_unit_filtering(self, caplog):
+        """A multi-pin lib definition reached through the fallback may mix
+        units, so the degradation must remain visible."""
+        lib_pins = [
+            _lib_pin("1", "P", 0.0, 2.54, 270),
+            _lib_pin("2", "", 0.0, -2.54, 90),
+        ]
+        sym = _sym(
+            100.0,
+            100.0,
+            0,
+            lib_pins,
+            pins=[SimpleNamespace(), SimpleNamespace()],
+        )
+        with caplog.at_level(logging.DEBUG, logger="kcaa.utils.skip_helpers"):
+            coords = sym_pin_world_coords(sym)
+        assert len(coords) == 2
+        warnings = [
+            r.getMessage()
+            for r in caplog.records
+            if r.name == "kcaa.utils.skip_helpers" and r.levelno >= logging.WARNING
+        ]
+        assert any("per-unit filtering lost" in message for message in warnings)
+
+
+class TestSinglePinSymbolFixture:
+    """Regression for #251: a one-pin part must still report its pin.
+
+    ``Mechanical:MountingHole_Pad`` is a single-pin symbol.  skip yields a
+    raw ``ParsedValue`` for ``sym.pin`` and exposes the lib pin's ``name`` /
+    ``number`` as ``ParsedValue`` objects whose truthiness raises
+    ``TypeError``; the fallback must read their ``.value`` instead.
+    """
+
+    @pytest.fixture(scope="class")
+    def mgt1(self):
+        from kcaa.utils.skip_compat import safe_schematic
+
+        sch = safe_schematic(SINGLE_PIN_FIXTURE)
+        return next(sym for sym in sch.symbol if sym.property.Reference.value == "MGT1")
+
+    def test_single_pin_symbol_yields_exactly_one_pin(self, mgt1):
+        coords = sym_pin_world_coords(mgt1)
+        assert len(coords) == 1
+        pin = coords[0]
+        assert pin.number == "1"
+        assert pin.name == "~"  # unnamed-pin marker, per the tool contract
+        assert (pin.x, pin.y) == pytest.approx((100.0, 100.0))
+        assert pin.electrical_type == "passive"
+        assert pin.angle == 180.0  # non-None wire-exit direction: left
+
+    def test_single_pin_fixture_does_not_warn(self, mgt1, caplog):
+        with caplog.at_level(logging.DEBUG, logger="kcaa.utils.skip_helpers"):
+            coords = sym_pin_world_coords(mgt1)
+        assert len(coords) == 1
+        warnings = [
+            r.getMessage()
+            for r in caplog.records
+            if r.name == "kcaa.utils.skip_helpers" and r.levelno >= logging.WARNING
+        ]
+        assert warnings == []

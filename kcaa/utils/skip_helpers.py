@@ -38,6 +38,22 @@ class PinWorldCoords(NamedTuple):
     #   convention, CCW on screen): 0=right, 90=up, 180=left, 270=down
 
 
+def _parsed_text(value: Any) -> str:
+    """Return the text of a skip ``ParsedValue`` without testing truthiness.
+
+    For single-pin symbols skip exposes ``LibSymbolPin.name`` / ``.number``
+    as ``ParsedValue`` objects whose ``__bool__`` returns a str (raising
+    ``TypeError``) and whose ``__str__`` renders the raw s-expression.
+    Reading the wrapped ``.value`` directly avoids both traps.  KiCad's
+    unnamed-pin marker ``"~"`` is returned unchanged, matching the
+    multi-pin wrapper path and the documented tool contract.
+    """
+    if value is None:
+        return ""
+    raw = getattr(value, "value", value)
+    return "" if raw is None else str(raw)
+
+
 def _pin_electrical_type(pin: Any) -> str:
     """Extract the electrical type from a SymbolPin.
 
@@ -196,50 +212,88 @@ def sym_pin_world_coords(sym: Any) -> list[PinWorldCoords]:
     except (AttributeError, TypeError):
         pass
 
-    if not results and had_wrappers:
-        # Skip provided SymbolPin wrappers but every one failed — the raw
-        # lib-symbol fallback below drops per-unit filtering, which would
-        # mix the units of a multi-unit symbol.  Make the degradation
-        # visible instead of returning silently wrong pin data.
+    used_wrapper_fallback = not results and had_wrappers
+    lib_pin_count = 0
+
+    if not results:
+        # ---- Fallback path: raw lib-symbol definition ---------------------
+        # Triggered for single-pin symbols (power nets, PWR_FLAG, TestPoint,
+        # MountingHole_Pad) where skip does not produce SymbolPin wrappers,
+        # and as a last resort when every wrapper failed.
+        failed = 0
+        first_error: Exception | None = None
+        try:
+            lib_sym = sym.lib_symbol
+            if lib_sym is not None:
+                try:
+                    lib_pins = list(lib_sym.pin)
+                except Exception as exc:
+                    log.debug(
+                        "sym_pin_world_coords: cannot enumerate lib pins: %s",
+                        exc,
+                    )
+                    lib_pins = []
+                lib_pin_count = len(lib_pins)
+                for lib_pin in lib_pins:
+                    try:
+                        num = _parsed_text(lib_pin.number)
+                        name = _parsed_text(lib_pin.name)
+                        etype = _lib_pin_electrical_type(lib_pin)
+                        results.append(
+                            _pin_world_from_lib(
+                                lib_pin,
+                                sym_at,
+                                mirror_val,
+                                placement_rot,
+                                num,
+                                name,
+                                etype,
+                            )
+                        )
+                    except Exception as exc:
+                        failed += 1
+                        if first_error is None:
+                            first_error = exc
+                        log.debug(
+                            "sym_pin_world_coords: failed to resolve pin %r: %s",
+                            lib_pin,
+                            exc,
+                        )
+        except Exception as exc:
+            log.debug("Failed to get pin world coordinates: %s", exc)
+
+        if failed:
+            # One summary per symbol: a broken multi-pin symbol would
+            # otherwise emit one warning per pin for a single root cause.
+            try:
+                ref = sym.property.Reference.value
+            except AttributeError:
+                ref = "<unknown>"
+            log.warning(
+                "sym_pin_world_coords: failed to resolve %d pin(s) of %s "
+                "from the raw lib definition; first error: %s",
+                failed,
+                ref,
+                first_error,
+            )
+
+    if used_wrapper_fallback:
+        # Skip provided SymbolPin wrappers but every one failed.  A raw lib
+        # definition with more than one pin may belong to a multi-unit
+        # symbol: the fallback then reports every unit with no per-unit
+        # filtering, which must stay visible.  A single-pin lib definition
+        # is the healthy single-pin degradation.
         try:
             ref = sym.property.Reference.value
         except AttributeError:
             ref = "<unknown>"
-        log.warning(
+        message = (
             "sym_pin_world_coords: no pin data from SymbolPin wrappers for %s; "
-            "falling back to the raw lib definition (per-unit filtering lost)",
-            ref,
+            "used the raw lib definition (per-unit filtering lost)"
         )
-
-    if not results:
-        # ---- Fallback path: raw lib-symbol definition ---------------------
-        # Triggered for power symbols, PWR_FLAG, TestPoint, etc., where skip's
-        # SymbolPin wrapper is not produced by sym.pin iteration (single-pin
-        # symbols degrade to a raw ParsedValue).
-        try:
-            lib_sym = sym.lib_symbol
-            if lib_sym is None:
-                return results
-            for lib_pin in lib_sym.pin:
-                try:
-                    num = str(lib_pin.number.value)
-                    name = str(lib_pin.name.value) if lib_pin.name else ""
-                    etype = _lib_pin_electrical_type(lib_pin)
-                    results.append(
-                        _pin_world_from_lib(
-                            lib_pin,
-                            sym_at,
-                            mirror_val,
-                            placement_rot,
-                            num,
-                            name,
-                            etype,
-                        )
-                    )
-                except Exception:
-                    log.debug("Failed to get world coordinates for pin %s", num)
-                    continue
-        except Exception:
-            log.debug("Failed to get pin world coordinates")
+        if results and lib_pin_count <= 1:
+            log.debug(message, ref)
+        else:
+            log.warning(message, ref)
 
     return results
