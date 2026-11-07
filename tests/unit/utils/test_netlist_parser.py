@@ -6,7 +6,7 @@ import os
 
 import pytest
 
-from kcaa.utils.netlist_parser import SchematicParser
+from kcaa.utils.netlist_parser import SchematicParser, extract_netlist
 
 # Fixture shared with the tools tests - contains R1…R7 and C1.
 FIXTURE = os.path.join(
@@ -35,6 +35,9 @@ def _pins_of(comp: dict) -> list:
 PIN_TOUCH_FIXTURE = os.path.join(os.path.dirname(__file__), "fixtures", "pin_touch.kicad_sch")
 POWER_TOUCH_FIXTURE = os.path.join(os.path.dirname(__file__), "fixtures", "power_touch.kicad_sch")
 MID_WIRE_FIXTURE = os.path.join(os.path.dirname(__file__), "fixtures", "mid_wire.kicad_sch")
+SINGLE_PIN_FIXTURE = os.path.join(
+    os.path.dirname(__file__), "fixtures", "single_pin_symbol.kicad_sch"
+)
 
 
 @pytest.fixture(scope="module")
@@ -201,6 +204,26 @@ class TestMidWireAnchorConnectivity:
     def test_pin_off_wire_stays_separate(self, mid_parsed):
         """R4 pin 2 sits below the wire end and connects to nothing."""
         assert mid_parsed["nets"].get("Net-(R4-Pin2)") == [{"component": "R4", "pin": "2"}]
+
+
+class TestSinglePinSymbolConnectivity:
+    """Regression for #251: a single-pin symbol keeps its pin and net.
+
+    ``MGT1`` (``Mechanical:MountingHole_Pad``) has one pin at (100, 100)
+    wired to a ``POWER`` label.  skip's single-pin degradation used to drop
+    the pin entirely, leaving the component with zero connections.
+    """
+
+    @pytest.fixture(scope="class")
+    def single_pin_netlist(self):
+        return extract_netlist(SINGLE_PIN_FIXTURE)
+
+    def test_component_lists_its_single_pin(self, single_pin_netlist):
+        pins = single_pin_netlist["components"]["MGT1"]["units"]["1"]["pins"]
+        assert [(p["num"], float(p["x"]), float(p["y"])) for p in pins] == [("1", 100.0, 100.0)]
+
+    def test_pin_lands_on_the_labelled_net(self, single_pin_netlist):
+        assert single_pin_netlist["nets"]["POWER"] == [{"component": "MGT1", "pin": "1"}]
 
 
 class TestNetlistPinDirection:

@@ -38,6 +38,22 @@ class PinWorldCoords(NamedTuple):
     #   convention, CCW on screen): 0=right, 90=up, 180=left, 270=down
 
 
+def _parsed_text(value: Any) -> str:
+    """Return the text of a skip ``ParsedValue`` without testing truthiness.
+
+    For single-pin symbols skip exposes ``LibSymbolPin.name`` / ``.number``
+    as ``ParsedValue`` objects whose ``__bool__`` returns a str (raising
+    ``TypeError``) and whose ``__str__`` renders the raw s-expression.
+    Reading the wrapped ``.value`` directly avoids both traps.  KiCad's
+    empty-name marker ``"~"`` is normalised to ``""``.
+    """
+    if value is None:
+        return ""
+    raw = getattr(value, "value", value)
+    text = "" if raw is None else str(raw)
+    return "" if text == "~" else text
+
+
 def _pin_electrical_type(pin: Any) -> str:
     """Extract the electrical type from a SymbolPin.
 
@@ -222,8 +238,8 @@ def sym_pin_world_coords(sym: Any) -> list[PinWorldCoords]:
                 return results
             for lib_pin in lib_sym.pin:
                 try:
-                    num = str(lib_pin.number.value)
-                    name = str(lib_pin.name.value) if lib_pin.name else ""
+                    num = _parsed_text(lib_pin.number)
+                    name = _parsed_text(lib_pin.name)
                     etype = _lib_pin_electrical_type(lib_pin)
                     results.append(
                         _pin_world_from_lib(
@@ -236,8 +252,14 @@ def sym_pin_world_coords(sym: Any) -> list[PinWorldCoords]:
                             etype,
                         )
                     )
-                except Exception:
-                    log.debug("Failed to get world coordinates for pin %s", num)
+                except Exception as exc:
+                    # A failure here means this pin is silently missing from
+                    # the netlist; keep it visible instead of a bare skip.
+                    log.warning(
+                        "sym_pin_world_coords: failed to resolve pin %r: %s",
+                        lib_pin,
+                        exc,
+                    )
                     continue
         except Exception:
             log.debug("Failed to get pin world coordinates")

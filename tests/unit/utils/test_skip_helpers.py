@@ -8,11 +8,14 @@ The world position must come from the CCW matrix
 exit conversion ``(angle + 180) % 360`` (wire-exit = stub reversed).
 """
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from kcaa.utils.skip_helpers import sym_pin_world_coords
+
+SINGLE_PIN_FIXTURE = str(Path(__file__).parent / "fixtures" / "single_pin_symbol.kicad_sch")
 
 
 def _lib_pin(number, name, x, y, angle, etype="passive"):
@@ -138,4 +141,30 @@ class TestFallbackPath:
         assert (pin.x, pin.y) == pytest.approx((2.46, 6.0))
         assert pin.angle == 180.0  # (270+90)=0 → (0+180)%360 → exit left
         assert pin.name == "VCC"
+        assert pin.electrical_type == "passive"
+
+
+class TestSinglePinSymbolFixture:
+    """Regression for #251: a one-pin part must still report its pin.
+
+    ``Mechanical:MountingHole_Pad`` is a single-pin symbol.  skip yields a
+    raw ``ParsedValue`` for ``sym.pin`` and exposes the lib pin's ``name`` /
+    ``number`` as ``ParsedValue`` objects whose truthiness raises
+    ``TypeError``; the fallback must read their ``.value`` instead.
+    """
+
+    @pytest.fixture(scope="class")
+    def mgt1(self):
+        from kcaa.utils.skip_compat import safe_schematic
+
+        sch = safe_schematic(SINGLE_PIN_FIXTURE)
+        return next(sym for sym in sch.symbol if sym.property.Reference.value == "MGT1")
+
+    def test_single_pin_symbol_yields_exactly_one_pin(self, mgt1):
+        coords = sym_pin_world_coords(mgt1)
+        assert len(coords) == 1
+        pin = coords[0]
+        assert pin.number == "1"
+        assert pin.name == ""  # KiCad's "~" empty-name marker
+        assert (pin.x, pin.y) == pytest.approx((100.0, 100.0))
         assert pin.electrical_type == "passive"

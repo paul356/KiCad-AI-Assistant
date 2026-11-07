@@ -12,6 +12,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 SHEET_SCHEMATIC_PATH = str(Path(__file__).parent / "fixtures/sheet_netlist_test.kicad_sch")
+SINGLE_PIN_SCHEMATIC_PATH = str(
+    Path(__file__).parent.parent / "utils/fixtures/single_pin_symbol.kicad_sch"
+)
 
 # ---------------------------------------------------------------------------
 # MockMCP — captures @mcp.tool()-decorated coroutines
@@ -496,6 +499,23 @@ class TestFindComponentConnections:
         assert pf["3"]["type"] == "input"
         assert pf["4"]["type"] == "output"
         assert pf["5"]["type"] == "io"
+
+    @patch("kcaa.tools.netlist_tools.os.path.exists", return_value=True)
+    @patch(
+        "kcaa.tools.netlist_tools.get_project_files",
+        return_value={"schematic": SINGLE_PIN_SCHEMATIC_PATH},
+    )
+    def test_single_pin_component_reports_its_net(self, mock_files, mock_exists):
+        """Regression for #251: a wired one-pin part reports its POWER net.
+
+        This runs the real ``extract_netlist`` against the fixture, so it
+        covers the single-pin fallback in ``sym_pin_world_coords``.
+        """
+        result = _run(self.fn("/some/project.kicad_pro", "MGT1", ctx=None))
+        assert result["success"] is True
+        assert result["connected_nets"] != []
+        assert "POWER" in result["connected_nets"]
+        assert {"pin": "1", "net": "POWER", "connected_to": []} in result["connections"]
 
     @patch("kcaa.tools.netlist_tools.os.path.exists", return_value=True)
     @patch(
