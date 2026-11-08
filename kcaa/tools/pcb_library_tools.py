@@ -1780,7 +1780,10 @@ def _resolve_library_dir(library: str, pcb_path: str | None) -> tuple[str, str]:
     lib_dir = by_nickname[library].get("uri", "")
     table_path = by_nickname[library].get("table_path", "")
     if not lib_dir or not os.path.isdir(lib_dir):
-        raise ValueError(f"Library '{library}' resolves to a missing directory: {lib_dir}")
+        raise ValueError(
+            f"Library '{library}' resolves to a missing directory: {lib_dir} "
+            f"(searched: {_footprint_scope(pcb_path)})."
+        )
     if not os.access(lib_dir, os.W_OK):
         raise ValueError(
             f"Library '{library}' is read-only or not writable: {lib_dir}. "

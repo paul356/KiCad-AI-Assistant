@@ -865,6 +865,26 @@ class TestAddFootprints:
             "Create it first with create_footprint_library."
         )
 
+    def test_missing_directory_reports_scope(self, tools, tmp_path):
+        """A registered nickname whose .pretty dir is gone still names the scope."""
+        board = _make_board(tmp_path)
+        missing = str(tmp_path / "gone.pretty")
+        _make_fp_lib_table(tmp_path, [("GoneLib", missing)])
+        result = _run(
+            tools["add_footprints_to_library"](
+                pcb_path=board,
+                footprints=["Sensor_Board_XYZ"],
+                library="GoneLib",
+                ctx=None,
+            )
+        )
+
+        assert result["error"] == (
+            f"Library 'GoneLib' resolves to a missing directory: {missing} "
+            f"(searched: global footprint libraries plus the project libraries of "
+            f"{os.path.realpath(str(tmp_path))})."
+        )
+
     def test_exports_missing_to_3rdparty(self, tools, tmp_path, project):
         # Create the target library first, then export into it.
         created = _run(tools["create_footprint_library"](name="MyVendor", ctx=None))
