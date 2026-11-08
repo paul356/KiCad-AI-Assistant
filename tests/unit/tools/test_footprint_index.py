@@ -1053,6 +1053,59 @@ class TestFpSyncTools:
         assert result["status"] == "already_running"
         assert result["current"] == 5
         assert result["total"] == 20
+        assert result["message"].startswith("A sync is already in progress for ")
+        assert result["scope"] == "global footprint libraries plus the project libraries of /tmp"
+
+    def test_started_message_reports_scope(self):
+        """The background-start response says which scope will be indexed."""
+        import asyncio
+        from unittest.mock import MagicMock, patch
+
+        async def _call():
+            from fastmcp import FastMCP
+
+            mcp = FastMCP("test")
+            _tool_module.register_pcb_library_tools(mcp)
+            tool = await mcp.get_tool("sync_footprint_index")
+            assert tool is not None
+            with patch.object(_tool_module.threading, "Thread") as thread_cls:
+                thread_cls.return_value = MagicMock()
+                result = await tool.fn(project_path="/tmp/proj/proj.kicad_pro")
+            return result
+
+        with _tool_module._fp_sync_lock:
+            _tool_module._fp_sync_state.running = False
+
+        result = asyncio.run(_call())
+        assert result["status"] == "started"
+        assert result["scope"] == (
+            "global footprint libraries plus the project libraries of /tmp/proj"
+        )
+        assert result["message"].startswith("Footprint index sync started in the background for ")
+
+    def test_sync_status_reports_last_scope(self):
+        """get_footprint_sync_status says which scope the last sync covered."""
+        import asyncio
+
+        async def _call():
+            with _tool_module._fp_sync_lock:
+                _tool_module._fp_sync_state.running = False
+                _tool_module._fp_sync_state.last_project_path = "/p/proj"
+                _tool_module._fp_sync_state.last_result = {"success": True}
+
+            from fastmcp import FastMCP
+
+            mcp = FastMCP("test")
+            _tool_module.register_pcb_library_tools(mcp)
+            tool = await mcp.get_tool("get_footprint_sync_status")
+            assert tool is not None
+            return await tool.fn()
+
+        result = asyncio.run(_call())
+        assert result["scope"] == (
+            "global footprint libraries plus the project libraries of /p/proj"
+        )
+        assert "hint" not in result
 
     def test_status_percent_complete(self):
         """get_footprint_sync_status computes percent_complete correctly."""
@@ -1079,6 +1132,195 @@ class TestFpSyncTools:
         assert result["current_library"] == "Lib50"
 
 
+class TestFootprintScopeMessaging:
+    """Missing/empty footprint responses name the fp-lib-table scope, and an
+    omitted ``project_path`` is never defaulted (issue #255)."""
+
+    @staticmethod
+    def _register():
+        from fastmcp import FastMCP
+
+        mcp = FastMCP("footprint-scope")
+        _tool_module.register_pcb_library_tools(mcp)
+        return mcp
+
+    @staticmethod
+    async def _call(mcp, name, **kwargs):
+        tool = await mcp.get_tool(name)
+        assert tool is not None
+        return await tool.fn(**kwargs)
+
+    def _project_index(self, tmp_path, monkeypatch):
+        """Build a hermetic project-scoped footprint index in a temp DB."""
+        import kcaa.utils.footprint_index_manager as fim
+
+        project_dir = tmp_path / "proj"
+        project_dir.mkdir()
+        lib_dir = _make_pretty(project_dir, "ProjFp", ["ProjFp_0402"])
+        project_file = str(project_dir / "proj.kicad_pro")
+        entry = {
+            "nickname": "ProjFp",
+            "uri": lib_dir,
+            "raw_uri": "${KIPRJMOD}/ProjFp.pretty",
+            "description": "",
+            "table_path": os.path.realpath(str(project_dir / "fp-lib-table")),
+        }
+
+        monkeypatch.setattr(fim, "_DEFAULT_DB_PATH", tmp_path / "fp.db")
+        monkeypatch.setattr(fim, "_singleton", None)
+        monkeypatch.setattr(fim, "build_effective_library_list", lambda project_path=None: [entry])
+        mgr = fim.get_footprint_index_manager(project_path=project_file)
+        stats = mgr.sync()
+        assert stats.added == 1
+        assert mgr._db.get_all_libraries(project=os.path.realpath(str(project_dir)))[
+            0
+        ].project == os.path.realpath(str(project_dir))
+
+        # The tools' live-scan fallback must not read the host's fp-lib-tables.
+        monkeypatch.setattr(
+            _tool_module, "build_effective_library_list", lambda project_path=None: []
+        )
+        monkeypatch.setattr(_tool_module, "find_fp_lib_tables", lambda project_path=None: [])
+        return project_dir, project_file
+
+    def test_search_never_defaults_project_scope(self, tmp_path, monkeypatch):
+        project_dir, project_file = self._project_index(tmp_path, monkeypatch)
+        project_scope = f"global footprint libraries plus the project libraries of {project_dir}"
+        mcp = self._register()
+
+        import asyncio
+
+        global_result = asyncio.run(
+            self._call(mcp, "search_library_footprints", query="ProjFp_0402")
+        )
+        assert global_result["total_matches"] == 0
+        assert global_result["scope"] == "global footprint libraries only"
+        assert "project_path" in global_result["hint"]
+
+        project_result = asyncio.run(
+            self._call(
+                mcp,
+                "search_library_footprints",
+                query="ProjFp_0402",
+                project_path=project_file,
+            )
+        )
+        assert project_result["total_matches"] == 1
+        assert project_result["scope"] == project_scope
+        assert "hint" not in project_result
+
+        # A project *directory* is equally valid and resolves to the same id.
+        dir_result = asyncio.run(
+            self._call(
+                mcp,
+                "search_library_footprints",
+                query="ProjFp_0402",
+                project_path=str(project_dir),
+            )
+        )
+        assert dir_result["total_matches"] == 1
+        assert dir_result["scope"] == project_scope
+
+    def test_get_library_footprint_reports_scope(self, tmp_path, monkeypatch):
+        project_dir, project_file = self._project_index(tmp_path, monkeypatch)
+        mcp = self._register()
+
+        import asyncio
+
+        global_result = asyncio.run(
+            self._call(
+                mcp,
+                "get_library_footprint",
+                library_name="ProjFp",
+                footprint_name="ProjFp_0402",
+            )
+        )
+        assert "global footprint libraries only" in global_result["error"]
+        assert global_result["scope"] == "global footprint libraries only"
+        assert "project_path" in global_result["hint"]
+
+        project_result = asyncio.run(
+            self._call(
+                mcp,
+                "get_library_footprint",
+                library_name="ProjFp",
+                footprint_name="ProjFp_0402",
+                project_path=project_file,
+            )
+        )
+        assert project_result["name"] == "ProjFp_0402"
+        assert project_result["scope"] == (
+            f"global footprint libraries plus the project libraries of {project_dir}"
+        )
+
+        missing_lib = asyncio.run(
+            self._call(
+                mcp,
+                "get_library_footprint",
+                library_name="NOPE",
+                footprint_name="X",
+                project_path=project_file,
+            )
+        )
+        assert "global footprint libraries plus the project libraries" in missing_lib["error"]
+        assert "project_path" not in missing_lib
+
+    def test_list_library_footprints_reports_scope(self, tmp_path, monkeypatch):
+        project_dir, project_file = self._project_index(tmp_path, monkeypatch)
+        mcp = self._register()
+
+        import asyncio
+
+        global_result = asyncio.run(
+            self._call(mcp, "list_library_footprints", library_name="ProjFp")
+        )
+        assert "global footprint libraries only" in global_result["error"]
+        assert "project_path" in global_result["hint"]
+
+        project_result = asyncio.run(
+            self._call(
+                mcp,
+                "list_library_footprints",
+                library_name="ProjFp",
+                project_path=project_file,
+            )
+        )
+        assert project_result["total"] == 1
+        assert project_result["scope"] == (
+            f"global footprint libraries plus the project libraries of {project_dir}"
+        )
+
+        missing = asyncio.run(
+            self._call(
+                mcp,
+                "list_library_footprints",
+                library_name="NOPE",
+                project_path=project_file,
+            )
+        )
+        assert f"project libraries of {project_dir}" in missing["error"]
+        assert "project_path" not in missing.get("hint", "")
+
+    def test_list_footprint_libraries_reports_scope(self, tmp_path, monkeypatch):
+        project_dir, project_file = self._project_index(tmp_path, monkeypatch)
+        mcp = self._register()
+
+        import asyncio
+
+        global_result = asyncio.run(self._call(mcp, "list_footprint_libraries"))
+        assert global_result["count"] == 0
+        assert global_result["scope"] == "global footprint libraries only"
+        assert "project_path" in global_result["hint"]
+
+        project_result = asyncio.run(
+            self._call(mcp, "list_footprint_libraries", project_path=project_file)
+        )
+        assert project_result["count"] == 1
+        assert project_result["scope"] == (
+            f"global footprint libraries plus the project libraries of {project_dir}"
+        )
+
+
 class TestGetFootprintIndexManager:
     """The factory derives the project id from ``project_path``."""
 
@@ -1097,6 +1339,45 @@ class TestGetFootprintIndexManager:
         global_mgr = mod.get_footprint_index_manager()
         assert global_mgr._project_id == ""
         assert global_mgr._project_path is None
+
+    def test_directory_and_file_derive_same_id(self, tmp_path, monkeypatch):
+        """A project directory is its own id; a file inside it resolves to it."""
+        mod = self._factory_module()
+        monkeypatch.setattr(mod, "_singleton", None)
+        project_dir = tmp_path / "proj"
+        project_dir.mkdir()
+
+        expected = os.path.realpath(str(project_dir))
+        assert mod.normalize_project_id(str(project_dir)) == expected
+        assert mod.normalize_project_id(str(project_dir / "proj.kicad_pro")) == expected
+        assert mod.normalize_project_id(str(project_dir / "proj.kicad_pcb")) == expected
+
+    def test_sync_with_directory_stamps_project_rows(self, tmp_path, monkeypatch):
+        """Passing the project directory must not downgrade its rows to global."""
+        import kcaa.utils.footprint_index_manager as fim
+
+        project_dir = tmp_path / "proj"
+        project_dir.mkdir()
+        lib_dir = _make_pretty(project_dir, "ProjFp", ["ProjFp_0402"])
+        entry = {
+            "nickname": "ProjFp",
+            "uri": lib_dir,
+            "raw_uri": "${KIPRJMOD}/ProjFp.pretty",
+            "description": "",
+            "table_path": os.path.realpath(str(project_dir / "fp-lib-table")),
+        }
+        monkeypatch.setattr(fim, "build_effective_library_list", lambda project_path=None: [entry])
+
+        mgr = FootprintIndexManager(db_path=str(tmp_path / "fp.db"), project_path=str(project_dir))
+        stats = mgr.sync()
+
+        assert stats.added == 1
+        project_id = os.path.realpath(str(project_dir))
+        assert [lib.project for lib in mgr._db.get_all_libraries(project=project_id)] == [
+            project_id
+        ]
+        # A global-scoped lookup must not see the project's library.
+        assert mgr._db.get_all_libraries(project="") == []
 
     def test_factory_rescope_derives_id(self, tmp_path, monkeypatch):
         """Re-scoping the singleton also re-derives the project id."""
