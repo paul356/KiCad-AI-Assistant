@@ -692,6 +692,10 @@ class TestFindMissingFootprints:
         assert sorted(sensor[0]["references"]) == ["U1", "U2"]
         assert sensor[0]["reference_count"] == 2
         assert result["missing_count"] == 2  # Sensor_Board_XYZ + Connector_Odd
+        assert result["scope"] == (
+            f"global footprint libraries plus the project libraries of "
+            f"{os.path.realpath(str(tmp_path))}"
+        )
 
     def test_list_is_read_only(self, tools, tmp_path, project):
         board = _make_board(tmp_path)
@@ -843,6 +847,44 @@ class TestCreateProjectLibrary:
 
 
 class TestAddFootprints:
+    def test_unknown_library_reports_scope(self, tools, tmp_path):
+        board = _make_board(tmp_path)
+        result = _run(
+            tools["add_footprints_to_library"](
+                pcb_path=board,
+                footprints=["Sensor_Board_XYZ"],
+                library="NoSuchLib",
+                ctx=None,
+            )
+        )
+
+        assert result["error"] == (
+            "Library 'NoSuchLib' not found in fp-lib-table "
+            f"(searched: global footprint libraries plus the project libraries of "
+            f"{os.path.realpath(str(tmp_path))}). "
+            "Create it first with create_footprint_library."
+        )
+
+    def test_missing_directory_reports_scope(self, tools, tmp_path):
+        """A registered nickname whose .pretty dir is gone still names the scope."""
+        board = _make_board(tmp_path)
+        missing = str(tmp_path / "gone.pretty")
+        _make_fp_lib_table(tmp_path, [("GoneLib", missing)])
+        result = _run(
+            tools["add_footprints_to_library"](
+                pcb_path=board,
+                footprints=["Sensor_Board_XYZ"],
+                library="GoneLib",
+                ctx=None,
+            )
+        )
+
+        assert result["error"] == (
+            f"Library 'GoneLib' resolves to a missing directory: {missing} "
+            f"(searched: global footprint libraries plus the project libraries of "
+            f"{os.path.realpath(str(tmp_path))})."
+        )
+
     def test_exports_missing_to_3rdparty(self, tools, tmp_path, project):
         # Create the target library first, then export into it.
         created = _run(tools["create_footprint_library"](name="MyVendor", ctx=None))
@@ -1184,7 +1226,11 @@ class TestRemoveFootprintsFromLibrary:
         result = _run(
             tools["remove_footprints_from_library"](library="NoSuchLib", footprints=["X"], ctx=None)
         )
-        assert "error" in result
+        assert result["error"] == (
+            "Library 'NoSuchLib' not found in fp-lib-table "
+            "(searched: global footprint libraries only). "
+            "Create it first with create_footprint_library."
+        )
         assert "success" not in result
 
     def test_empty_footprints_returns_error(self, tools, project):
@@ -1273,7 +1319,11 @@ class TestDeleteFootprintLibrary:
 
     def test_unknown_library_returns_error(self, tools):
         result = _run(tools["delete_footprint_library"](library="NoSuchLib", ctx=None))
-        assert "error" in result
+        assert result["error"] == (
+            "Library 'NoSuchLib' not found in fp-lib-table "
+            "(searched: global footprint libraries only). "
+            "Create it first with create_footprint_library."
+        )
         assert "success" not in result
 
     def test_refuses_system_footprint_library(self, tools, monkeypatch, tmp_path):
@@ -1547,8 +1597,13 @@ class TestListLibraryFootprints:
     def test_unknown_library_returns_error_and_hint(self, tools):
         result = _run(tools["list_library_footprints"](library_name="NoSuchLib", ctx=None))
 
-        assert result["error"] == "Library 'NoSuchLib' not found."
-        assert result["hint"] == "Call list_footprint_libraries to see available nicknames."
+        assert result["error"] == (
+            "Library 'NoSuchLib' not found in the footprint index "
+            "(searched: global footprint libraries only)."
+        )
+        assert result["hint"].startswith(
+            "Call list_footprint_libraries to see available nicknames."
+        )
         assert "footprints" not in result
 
     def test_truncates_but_reports_true_total(self, tools, project, tmp_path):
@@ -1890,7 +1945,9 @@ class TestListLibraryFootprints:
         )
 
         assert result["error"] == (
-            f"Library 'Missing' resolves to '{missing}', which is not a directory."
+            f"Library 'Missing' resolves to '{missing}', which is not a directory "
+            f"(searched: global footprint libraries plus the project libraries of "
+            f"{os.path.realpath(str(tmp_path))})."
         )
         assert result["hint"] == (
             "Check the library path for 'Missing' in Manage Footprint Libraries "
@@ -1909,7 +1966,8 @@ class TestListLibraryFootprints:
         result = _run(tools["list_library_footprints"](library_name="Gone", ctx=None))
 
         assert result["error"] == (
-            f"Library 'Gone' resolves to '{stale}', which is not a directory."
+            f"Library 'Gone' resolves to '{stale}', which is not a directory "
+            "(searched: global footprint libraries only)."
         )
         assert result["hint"] == "Run sync_footprint_index to refresh the index."
         assert "footprints" not in result

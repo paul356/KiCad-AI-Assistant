@@ -55,6 +55,28 @@ def _sym(value: Any) -> str:
     return str(value)
 
 
+def _footprint_scope_dir(project_dir: str | None) -> str:
+    """Describe a footprint scope from an already-canonical project directory."""
+    if project_dir:
+        return f"global footprint libraries plus the project libraries of {project_dir}"
+    return "global footprint libraries only"
+
+
+def _footprint_scope(project_path: str | None) -> str:
+    """Describe the fp-lib-table scope a footprint query actually searched."""
+    return _footprint_scope_dir(normalize_project_id(project_path) or None)
+
+
+def _footprint_scope_hint(project_path: str | None) -> str:
+    """One-line way to widen a footprint query that returned nothing."""
+    if normalize_project_id(project_path):
+        return ""
+    return (
+        "To include a project's own libraries, call again with project_path "
+        "set to that project directory."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Background sync state (thread-safe via lock)
 # ---------------------------------------------------------------------------
@@ -365,9 +387,12 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
         ``sync_footprint_index`` again while a sync is already running.
 
         Args:
-            project_path: Path to a .kicad_pro file (or .kicad_pcb); the
-                project's directory is used to scope the index.  Omit to
-                index only the global (non-project) libraries.
+            project_path: Optional path to a project directory or a file inside it
+                (e.g. the .kicad_pro or .kicad_pcb).  Omit to use
+                global footprint libraries only.  When working inside a
+                project, pass that project's directory so its own
+                fp-lib-table entries are included; other projects'
+                libraries are never searched.
             force: If True, reparse every library regardless of cached state.
                 Use only when the database is messed up.
             ctx: MCP context for progress reporting.
@@ -376,7 +401,11 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
             if _fp_sync_state.running:
                 return {
                     "status": "already_running",
-                    "message": "A sync is already in progress. Use get_footprint_sync_status to check progress.",
+                    "message": (
+                        f"A sync is already in progress for {_footprint_scope(project_path)}. "
+                        "Use get_footprint_sync_status to check progress."
+                    ),
+                    "scope": _footprint_scope(project_path),
                     "current": _fp_sync_state.current,
                     "total": _fp_sync_state.total,
                     "current_library": _fp_sync_state.current_library,
@@ -400,9 +429,11 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
         return {
             "status": "started",
             "message": (
-                "Footprint index sync started in the background. "
+                f"Footprint index sync started in the background for "
+                f"{_footprint_scope(project_path)}. "
                 "Call get_footprint_sync_status to monitor progress."
             ),
+            "scope": _footprint_scope(project_path),
         }
 
     @mcp.tool()
@@ -427,7 +458,8 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
             total = _fp_sync_state.total or 0
             current = _fp_sync_state.current
             pct = round(100.0 * current / total) if total > 0 else 0
-            return {
+            last_project = _fp_sync_state.last_project_path
+            out: dict[str, Any] = {
                 "running": _fp_sync_state.running,
                 "current": current,
                 "total": total,
@@ -435,7 +467,15 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
                 "current_library": _fp_sync_state.current_library,
                 "last_result": _fp_sync_state.last_result,
                 "error": _fp_sync_state.error,
+                "scope": _footprint_scope_dir(last_project),
             }
+            if (
+                not _fp_sync_state.running
+                and _fp_sync_state.last_result is None
+                and _fp_sync_state.error is None
+            ):
+                out["hint"] = "Run sync_footprint_index to build the index."
+            return out
 
     @mcp.tool()
     async def list_footprint_libraries(
@@ -452,9 +492,12 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
 
         Args:
             ctx: MCP context for progress reporting.
-            project_path: Optional path to a .kicad_pro file (or
-                .kicad_pcb); its directory identifies the project scope.
-                Omit for global (non-project) libraries only.
+            project_path: Optional path to a project directory or a file inside it
+                (e.g. the .kicad_pro or .kicad_pcb).  Omit to use
+                global footprint libraries only.  When working inside a
+                project, pass that project's directory so its own
+                fp-lib-table entries are included; other projects'
+                libraries are never searched.
 
         Returns:
             dict with:
@@ -479,33 +522,49 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
                 }
                 for r in lib_records
             ]
-            return {
+            out: dict[str, Any] = {
                 "libraries": libraries,
                 "source": "index",
                 "count": len(libraries),
+                "scope": _footprint_scope(project_path),
             }
+            hint = _footprint_scope_hint(project_path)
+            if not libraries and hint:
+                out["hint"] = hint
+            return out
 
         # Fallback: live scan from fp-lib-table files
         table_paths = find_fp_lib_tables(project_path)
         if not table_paths:
-            return {
+            out = {
                 "libraries": [],
                 "table_files": [],
                 "count": 0,
-                "warning": "No fp-lib-table files found on this system.",
+                "scope": _footprint_scope(project_path),
+                "warning": (f"No fp-lib-table files found for {_footprint_scope(project_path)}."),
             }
+            hint = _footprint_scope_hint(project_path)
+            if hint:
+                out["hint"] = hint
+            return out
 
         all_libraries = build_effective_library_list(project_path)
         for lib in all_libraries:
             lib["exists"] = os.path.isdir(lib["uri"])
 
-        return {
+        out = {
             "libraries": all_libraries,
             "table_files": table_paths,
             "source": "live_scan",
             "count": len(all_libraries),
+            "scope": _footprint_scope(project_path),
             "hint": "Run sync_footprint_index to build the index for faster search.",
         }
+        if not all_libraries:
+            project_hint = _footprint_scope_hint(project_path)
+            if project_hint:
+                out["hint"] = project_hint
+        return out
 
     @mcp.tool()
     async def search_library_footprints(
@@ -527,9 +586,12 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
         Args:
             query: Search string matched against footprint name, description,
                 and tags (case-insensitive).
-            project_path: Optional path to a .kicad_pro file (or .kicad_pcb);
-                its directory identifies the project scope; omit for global
-                (non-project) libraries only.
+            project_path: Optional path to a project directory or a file inside it
+                (e.g. the .kicad_pro or .kicad_pcb).  Omit to use
+                global footprint libraries only.  When working inside a
+                project, pass that project's directory so its own
+                fp-lib-table entries are included; other projects'
+                libraries are never searched.
             ctx: MCP context for progress reporting.
             max_results: Maximum number of results to return (default 50).
 
@@ -541,7 +603,12 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
                 source: "index" or "live_scan"
         """
         if not query or not query.strip():
-            return {"error": "query must not be empty", "results": [], "total_matches": 0}
+            return {
+                "error": "query must not be empty",
+                "results": [],
+                "total_matches": 0,
+                "scope": _footprint_scope(project_path),
+            }
 
         if ctx:
             await ctx.info(f"Searching footprints for '{query}'…")
@@ -563,12 +630,17 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
                 }
                 for r in records
             ]
-            return {
+            out: dict[str, Any] = {
                 "results": results,
                 "total_matches": len(results),
                 "truncated": len(results) >= max_results,
                 "source": "index",
+                "scope": _footprint_scope(project_path),
             }
+            hint = _footprint_scope_hint(project_path)
+            if not results and hint:
+                out["hint"] = hint
+            return out
 
         # Fallback: live scan (slow)
         if ctx:
@@ -610,9 +682,12 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
                 e.g. ``"Resistor_SMD"``.
             footprint_name: The footprint name without extension, e.g.
                 ``"R_0402_1005Metric"``.
-            project_path: Optional path to a .kicad_pro file (or .kicad_pcb);
-                its directory identifies the project scope; omit for global
-                (non-project) libraries only.
+            project_path: Optional path to a project directory or a file inside it
+                (e.g. the .kicad_pro or .kicad_pcb).  Omit to use
+                global footprint libraries only.  When working inside a
+                project, pass that project's directory so its own
+                fp-lib-table entries are included; other projects'
+                libraries are never searched.
             ctx: MCP context for progress reporting.
 
         Returns:
@@ -649,15 +724,36 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
                     break
 
         if not lib_path:
-            return {"error": f"Library '{library_name}' not found."}
+            out = {
+                "error": (
+                    f"Library '{library_name}' not found in the footprint index "
+                    f"(searched: {_footprint_scope(project_path)})."
+                ),
+                "scope": _footprint_scope(project_path),
+            }
+            hint = _footprint_scope_hint(project_path)
+            if hint:
+                out["hint"] = hint
+            return out
 
         mod_path = os.path.join(lib_path, footprint_name + ".kicad_mod")
         if not os.path.isfile(mod_path):
-            return {"error": f"Footprint '{footprint_name}' not found in library '{library_name}'."}
+            out = {
+                "error": (
+                    f"Footprint '{footprint_name}' not found in library "
+                    f"'{library_name}' (searched: {_footprint_scope(project_path)})."
+                ),
+                "scope": _footprint_scope(project_path),
+            }
+            hint = _footprint_scope_hint(project_path)
+            if hint:
+                out["hint"] = hint
+            return out
 
         info = parse_kicad_mod(mod_path)
         info["library_path"] = lib_path
         info["file_path"] = mod_path
+        info["scope"] = _footprint_scope(project_path)
         return info
 
     @mcp.tool()
@@ -683,9 +779,12 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
         Args:
             library_name: The library nickname (as shown in fp-lib-table),
                 e.g. ``"MountingHole"``.
-            project_path: Optional path to a .kicad_pro file (or .kicad_pcb);
-                its directory identifies the project scope; omit for global
-                (non-project) libraries only.
+            project_path: Optional path to a project directory or a file inside it
+                (e.g. the .kicad_pro or .kicad_pcb).  Omit to use
+                global footprint libraries only.  When working inside a
+                project, pass that project's directory so its own
+                fp-lib-table entries are included; other projects'
+                libraries are never searched.
             ctx: MCP context for progress reporting.
             max_results: Maximum number of footprints to return per page
                 (default 200); must be >= 1.
@@ -742,10 +841,18 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
                     break
 
         if not lib_path:
-            return {
-                "error": f"Library '{library_name}' not found.",
+            out = {
+                "error": (
+                    f"Library '{library_name}' not found in the footprint index "
+                    f"(searched: {_footprint_scope(project_path)})."
+                ),
                 "hint": "Call list_footprint_libraries to see available nicknames.",
+                "scope": _footprint_scope(project_path),
             }
+            hint = _footprint_scope_hint(project_path)
+            if hint:
+                out["hint"] = f"{out['hint']} {hint}"
+            return out
 
         if not os.path.isdir(lib_path):
             # Stale index entry, or a table URI that points nowhere: prefer
@@ -766,9 +873,11 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
                 return {
                     "error": (
                         f"Library '{library_name}' resolves to '{lib_path}', "
-                        "which is not a directory."
+                        f"which is not a directory (searched: "
+                        f"{_footprint_scope(project_path)})."
                     ),
                     "hint": hint,
+                    "scope": _footprint_scope(project_path),
                 }
             lib_path = usable
             index_rec = None  # stale rows do not describe this directory
@@ -820,7 +929,7 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
 
         count = len(footprints)
         has_more = offset + count < total
-        return {
+        out = {
             "library": library_name,
             "library_path": lib_path,
             "footprints": footprints,
@@ -831,7 +940,12 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
             "next_offset": offset + count if has_more else None,
             "truncated": has_more,
             "source": source,
+            "scope": _footprint_scope(project_path),
         }
+        hint = _footprint_scope_hint(project_path)
+        if total == 0 and hint:
+            out["hint"] = hint
+        return out
 
     @mcp.tool()
     async def add_footprints_to_pcb(
@@ -1046,8 +1160,9 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
 
         Returns:
             dict with ``missing`` (list of {name, library, references,
-            reference_count, values}), ``missing_count``; plus ``error`` on
-            failure.
+            reference_count, values}), ``missing_count``, ``scope`` (the
+            global/project footprint-library scope actually searched); plus
+            ``error`` on failure.
         """
         try:
             _, footprints, _ = _collect_board_footprints(pcb_path)
@@ -1077,6 +1192,7 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
             return {
                 "missing": missing,
                 "missing_count": len(missing),
+                "scope": _footprint_scope(pcb_path),
             }
         except Exception as exc:
             log.error("find_footprints_not_in_libraries failed: %s", exc, exc_info=True)
@@ -1564,13 +1680,18 @@ async def _live_search_footprints(
     needle = query.strip().lower()
     libraries = build_effective_library_list(project_path)
     if not libraries:
-        return {
+        out = {
             "results": [],
             "total_matches": 0,
             "truncated": False,
-            "warning": "No fp-lib-table files found.",
+            "warning": f"No fp-lib-table files found for {_footprint_scope(project_path)}.",
             "source": "live_scan",
+            "scope": _footprint_scope(project_path),
         }
+        hint = _footprint_scope_hint(project_path)
+        if hint:
+            out["hint"] = hint
+        return out
 
     matches: list[dict[str, str]] = []
     for lib in libraries:
@@ -1603,12 +1724,17 @@ async def _live_search_footprints(
         if len(matches) >= max_results:
             break
 
-    return {
+    out = {
         "results": matches[:max_results],
         "total_matches": len(matches),
         "truncated": len(matches) >= max_results,
         "source": "live_scan",
+        "scope": _footprint_scope(project_path),
     }
+    hint = _footprint_scope_hint(project_path)
+    if not matches and hint:
+        out["hint"] = hint
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1647,13 +1773,17 @@ def _resolve_library_dir(library: str, pcb_path: str | None) -> tuple[str, str]:
     by_nickname = {lib["nickname"]: lib for lib in libs}
     if library not in by_nickname:
         raise ValueError(
-            f"Library '{library}' not found in fp-lib-table. "
+            f"Library '{library}' not found in fp-lib-table "
+            f"(searched: {_footprint_scope(pcb_path)}). "
             "Create it first with create_footprint_library."
         )
     lib_dir = by_nickname[library].get("uri", "")
     table_path = by_nickname[library].get("table_path", "")
     if not lib_dir or not os.path.isdir(lib_dir):
-        raise ValueError(f"Library '{library}' resolves to a missing directory: {lib_dir}")
+        raise ValueError(
+            f"Library '{library}' resolves to a missing directory: {lib_dir} "
+            f"(searched: {_footprint_scope(pcb_path)})."
+        )
     if not os.access(lib_dir, os.W_OK):
         raise ValueError(
             f"Library '{library}' is read-only or not writable: {lib_dir}. "
@@ -1721,7 +1851,8 @@ def _find_footprint_mod_path(
             if not candidates:
                 raise ValueError(
                     f"library {library!r} not found (expected a registered nickname, "
-                    f"a .pretty directory path, or a directory name); scanned libraries: "
+                    f"a .pretty directory path, or a directory name) "
+                    f"(searched: {_footprint_scope(pcb_path)}); scanned libraries: "
                     f"{_fmt_library_list(libs)}"
                 )
     if lib_name is not None:
@@ -1732,7 +1863,8 @@ def _find_footprint_mod_path(
             )
         if lib_name not in lib_by_nick:
             raise ValueError(
-                f"library '{lib_name}' not found in fp-lib-table; scanned libraries: "
+                f"library '{lib_name}' not found in fp-lib-table "
+                f"(searched: {_footprint_scope(pcb_path)}); scanned libraries: "
                 f"{_fmt_library_list(libs)}"
             )
         candidates = [(lib_name, lib_by_nick[lib_name]["uri"])]
@@ -1748,7 +1880,8 @@ def _find_footprint_mod_path(
             return header, mod_candidate, libs
 
     raise ValueError(
-        f"footprint '{footprint}' not found in the scanned libraries: "
+        f"footprint '{footprint}' not found in the scanned libraries "
+        f"(searched: {_footprint_scope(pcb_path)}): "
         f"{_fmt_library_list([{'nickname': label, 'uri': lib_dir} for label, lib_dir in candidates])}"
     )
 
