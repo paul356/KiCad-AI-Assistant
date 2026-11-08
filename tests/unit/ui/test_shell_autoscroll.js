@@ -178,6 +178,40 @@ runSection('2. follow while scrolled up keeps position and open rows', function(
     assert(after[1].open === false, 'collapsed tool result stays collapsed');
 });
 
+runSection('2a. follow measures before the rebuild grows the document', function() {
+    const env = makeEnv({ heightMode: 'conversation' });
+    // Empty conversation => 1000 px document; reader parked at its bottom.
+    assert(env.height() === 1000, 'initial document height: got ' + env.height());
+    atBottom(env);
+    env.scrollCalls.length = 0;
+
+    env.sandbox._updateConversation(ENTRIES_JSON, 'follow');
+
+    assert(env.height() === 1300,
+        'the rebuild itself grew the document: got ' + env.height());
+    assert(env.sandbox.scrollY === env.height(),
+        'at-bottom reader follows the rebuilt document: got ' + env.sandbox.scrollY
+        + ' expected ' + env.height());
+    const last = env.scrollCalls[env.scrollCalls.length - 1];
+    assert(last && last[0] === 0 && last[1] === env.height(),
+        'last scroll targets the post-rebuild height: got ' + JSON.stringify(last));
+});
+
+runSection('2b. follow measures before rebuild when the reader is scrolled up', function() {
+    const env = makeEnv({ heightMode: 'conversation' });
+    env.sandbox.scrollY = 0;
+    env.scrollCalls.length = 0;
+
+    env.sandbox._updateConversation(ENTRIES_JSON, 'follow');
+
+    assert(env.height() === 1300,
+        'the rebuild itself grew the document: got ' + env.height());
+    assert(env.sandbox.scrollY === 0,
+        'scrolled-up reader is not moved by the rebuild: got ' + env.sandbox.scrollY);
+    assert(!env.scrollCalls.some(function(call) { return call[1] === env.height(); }),
+        'no scroll to the grown document bottom: got ' + JSON.stringify(env.scrollCalls));
+});
+
 runSection('3. bottom scrolls even when the reader is scrolled up', function() {
     const env = makeEnv();
     env.sandbox._updateConversation(ENTRIES_JSON, 'none');

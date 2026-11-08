@@ -129,12 +129,20 @@ def test_pdf_rerender_follows() -> None:
 
 
 def test_streaming_renders_follow() -> None:
+    """Every render path in the flush/refresh helpers must use follow mode.
+
+    Dropping ``follow=True`` from any one call (e.g. the entries-changed
+    path) would silently disable positional following there.
+    """
     for method in ("_on_stream_flush", "_auto_refresh"):
         calls = _calls(_function(method), "_render_conversation")
         assert calls, f"{method} should call _render_conversation"
-        assert any(_keyword_true(call, "follow") for call in calls), (
-            f"{method} must render with follow=True"
-        )
+        for index, call in enumerate(calls):
+            assert not call.args, f"{method} render #{index} must use keyword arguments"
+            assert _keyword_true(call, "follow"), f"{method} render #{index} must pass follow=True"
+            assert not any(keyword.arg == "force_scroll_to_bottom" for keyword in call.keywords), (
+                f"{method} render #{index} must not force the bottom"
+            )
 
 
 def test_incremental_stream_update_passes_follow_mode() -> None:
@@ -220,9 +228,28 @@ def test_pending_render_replays_stored_flags() -> None:
                 break
 
     assert replay_args, "_process_pending_render should replay via _update_conversation"
-    assert any(
-        any(_is_self_attr(arg, "_pending_force_scroll_to_bottom") for arg in args)
-        and any(_is_self_attr(arg, "_pending_replace") for arg in args)
-        and any(_is_self_attr(arg, "_pending_follow") for arg in args)
-        for args in replay_args
-    ), "replay must consume all stored pending flags"
+    assert len(replay_args) == 1, "expected exactly one replay call"
+    arg_names: list[str] = []
+    for arg in replay_args[0]:
+        assert isinstance(arg, ast.Attribute), "replay arguments should be pending attributes"
+        arg_names.append(arg.attr)
+
+    # The replayed call is _update_conversation(force, replace, follow).
+    assert arg_names == [
+        "_pending_force_scroll_to_bottom",
+        "_pending_replace",
+        "_pending_follow",
+    ], "replay must pass force, replace, follow in that order"
+
+    # Evaluate the recorded deferrals in the call's actual argument order.
+    # Swapping replace/follow would turn the second tuple into (True, True, False).
+    def replayed(force: bool, replace: bool, follow: bool) -> tuple[bool, ...]:
+        stored = {
+            "_pending_force_scroll_to_bottom": force,
+            "_pending_replace": replace,
+            "_pending_follow": follow,
+        }
+        return tuple(stored[name] for name in arg_names)
+
+    assert replayed(False, True, True) == (False, True, True)
+    assert replayed(True, False, True) == (True, False, True)
