@@ -37,6 +37,17 @@ class _SymbolPin:
         self.name = name
 
 
+class _RaisingPinIter:
+    """A ``sym.pin`` iterator that yields one wrapper, then raises."""
+
+    def __init__(self, pin):
+        self._pin = pin
+
+    def __iter__(self):
+        yield self._pin
+        raise TypeError("pin iterator exploded")
+
+
 def _sym(x, y, rot, lib_pins, pins=None, mirror=None):
     """Build a mock placed symbol.
 
@@ -190,6 +201,107 @@ class TestFallbackPath:
             if r.name == "kcaa.utils.skip_helpers" and r.levelno >= logging.WARNING
         ]
         assert any("per-unit filtering lost" in message for message in warnings)
+
+    def test_wrapperless_multi_pin_fallback_warns(self, caplog):
+        """The multi-unit warning must also fire when no wrappers exist."""
+        lib_pins = [
+            _lib_pin("1", "P", 0.0, 2.54, 270),
+            _lib_pin("2", "", 0.0, -2.54, 90),
+        ]
+        sym = _sym(100.0, 100.0, 0, lib_pins, pins=False)
+        with caplog.at_level(logging.DEBUG, logger="kcaa.utils.skip_helpers"):
+            coords = sym_pin_world_coords(sym)
+        assert len(coords) == 2
+        warnings = [
+            r.getMessage()
+            for r in caplog.records
+            if r.name == "kcaa.utils.skip_helpers" and r.levelno >= logging.WARNING
+        ]
+        assert any("per-unit filtering lost" in message for message in warnings)
+
+    def test_fallback_failure_emits_single_summary_warning(self, caplog):
+        """One root cause -> exactly one warning, with ref and first error."""
+        bad_pin = _lib_pin("2", "Q", 0.0, -2.54, 90)
+        bad_pin.at = SimpleNamespace(value=["bad", 0.0, 0.0])
+        sym = _sym(
+            100.0,
+            100.0,
+            0,
+            [_lib_pin("1", "P", 0.0, 2.54, 270), bad_pin],
+            pins=False,
+        )
+        sym.property = SimpleNamespace(Reference=SimpleNamespace(value="U1"))
+        with caplog.at_level(logging.DEBUG, logger="kcaa.utils.skip_helpers"):
+            coords = sym_pin_world_coords(sym)
+        assert len(coords) == 1
+        warnings = [
+            r.getMessage()
+            for r in caplog.records
+            if r.name == "kcaa.utils.skip_helpers" and r.levelno == logging.WARNING
+        ]
+        assert len(warnings) == 1
+        assert "failed to resolve 1 pin(s) of U1" in warnings[0]
+        assert "could not convert string to float: 'bad'" in warnings[0]
+        assert "per-unit filtering lost" not in warnings[0]
+
+    def test_wrapper_pin_without_lib_at_logs_debug(self, caplog):
+        """A wrapper whose lib pin has no ``at`` must not vanish silently."""
+        good_pin = _lib_pin("1", "P", 0.0, 2.54, 270)
+        broken_lib_pin = SimpleNamespace(
+            number=SimpleNamespace(value="2"),
+            name=SimpleNamespace(value="Q"),
+            wrapped_parsed_value=SimpleNamespace(value=["passive"]),
+        )  # no ``at``
+        sym = _sym(
+            100.0,
+            100.0,
+            0,
+            [good_pin],
+            pins=[_SymbolPin(good_pin, "1", "P"), _SymbolPin(broken_lib_pin, "2", "Q")],
+        )
+        with caplog.at_level(logging.DEBUG, logger="kcaa.utils.skip_helpers"):
+            coords = sym_pin_world_coords(sym)
+        assert len(coords) == 1
+        debug_messages = [
+            r.getMessage()
+            for r in caplog.records
+            if r.name == "kcaa.utils.skip_helpers" and r.levelno == logging.DEBUG
+        ]
+        assert any("failed to resolve wrapper pin" in message for message in debug_messages)
+
+    def test_pin_iteration_failure_logs_debug(self, caplog):
+        """A ``sym.pin`` iterator that stops early must log the drop."""
+        lib_pin = _lib_pin("1", "P", 0.0, 2.54, 270)
+        sym = _sym(
+            100.0,
+            100.0,
+            0,
+            [lib_pin],
+            pins=_RaisingPinIter(_SymbolPin(lib_pin, "1", "P")),
+        )
+        with caplog.at_level(logging.DEBUG, logger="kcaa.utils.skip_helpers"):
+            coords = sym_pin_world_coords(sym)
+        assert len(coords) == 1
+        debug_messages = [
+            r.getMessage()
+            for r in caplog.records
+            if r.name == "kcaa.utils.skip_helpers" and r.levelno == logging.DEBUG
+        ]
+        assert any("stopped early" in message for message in debug_messages)
+
+    def test_none_position_returns_empty_without_raising(self, caplog):
+        """``sym.at.value is None`` degrades to no pins plus a DEBUG line."""
+        sym = _sym(100.0, 100.0, 0, [_lib_pin("1", "P", 0.0, 2.54, 270)])
+        sym.at = SimpleNamespace(value=None)
+        with caplog.at_level(logging.DEBUG, logger="kcaa.utils.skip_helpers"):
+            coords = sym_pin_world_coords(sym)
+        assert coords == []
+        debug_messages = [
+            r.getMessage()
+            for r in caplog.records
+            if r.name == "kcaa.utils.skip_helpers" and r.levelno == logging.DEBUG
+        ]
+        assert any("position of" in message and "is None" in message for message in debug_messages)
 
 
 class TestSinglePinSymbolFixture:
