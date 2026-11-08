@@ -48,8 +48,9 @@ def register_netlist_tools(mcp: FastMCP) -> None:
         entry in ``components`` (keyed by reference) contains:
 
         - Sub-sheets also appear in ``components`` with ``type="sheet"``.
-          Their hierarchical pins are exposed like component pins and use the
-          sheet-pin name as their local net name.
+          They share the ``units[n]`` nesting but **not** the component-pin
+          fields; see the sheet-pin variant under ``pins`` below. Their pins
+          use the sheet-pin name as their local net name.
 
         Each entry is ``{value, type, units}``; ``value`` and ``type`` live at
         the component level, not inside units.
@@ -67,14 +68,29 @@ def register_netlist_tools(mcp: FastMCP) -> None:
           absent for graphics-less symbols (e.g. PWR_FLAG).
         - ``pins``: **per-unit** list of
           ``{num, name, electrical, x, y, direction, net}``. ``net`` is the
-          name of the net the pin belongs to (``null`` when unconnected; the
-          key is always present). ``x``/``y`` are world
+          name of the net the pin belongs to; the key is always present and
+          an unconnected pin still gets a name (synthetic
+          ``Net-(<ref>-Pin<n>)`` when no label or power symbol supplies
+          one). The value is ``null`` only for pins the netlist builder does
+          not trace: pins of ``#``-prefixed references (power symbols,
+          flags) and pins without a number. ``x``/``y`` are world
           coordinates already accounting for placement and rotation;
           ``direction`` is the screen-space exit direction
           (``"right"|"up"|"left"|"down"``). ``name`` is the pin name
           (e.g. ``"VCC"``, ``"GPIO1"``). ``electrical`` is the pin's
           electrical type (e.g. ``"input"``, ``"output"``, ``"power_in"``,
-          ``"bidirectional"``). When choosing which two pins to
+          ``"bidirectional"``). **Sub-sheet** pins instead use
+          ``{num, number, name, x, y, net}``: there is no ``electrical`` or
+          ``direction`` key at all (absent, not ``null`` — ``pin["direction"]``
+          raises ``KeyError``), ``num``, ``number``, and ``name`` all equal the
+          sheet-pin name (sheet pins are addressed by name, never ``REF.N``),
+          and the unit's ``position`` has no ``rotation`` (see ``units``
+          above). For sheet pins ``net`` follows the same untraced-pin rule
+          (``null`` for a ``#``-prefixed sheet reference or a pin with an
+          empty name); otherwise it is a string: an attached label names the
+          net, except that a power-net pin name (``GND``, ``VCC``, ``VDD``,
+          ``VSS``, ``VEE``) takes precedence, and with nothing attached the
+          sheet-pin name is used. When choosing which two pins to
           wire, the **electrically correct pin** comes first — only fall
           back to "closest pin pair" geometry when both candidates are
           electrically interchangeable (e.g. the two leads of a non-polar
@@ -434,6 +450,10 @@ def register_netlist_tools(mcp: FastMCP) -> None:
             ``body_bbox`` when present, and ``pins`` in world coordinates.
             In component_info, each pin's ``direction`` is the wire-exit
             direction in screen coordinates: "right", "down", "left", or "up".
+            For a ``type="sheet"`` entry there is no ``direction`` (or
+            ``electrical``): its pins are the reduced sheet-pin shape
+            ``{num, number, name, x, y}``, with all three name fields equal to
+            the sheet-pin name.
         """
         print(f"Finding connections for component {component_ref} in project: {project_path}")
 
