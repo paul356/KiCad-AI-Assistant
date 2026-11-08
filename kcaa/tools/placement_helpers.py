@@ -175,7 +175,13 @@ def _find_free_area_impl(
                 }
             sym_rec = mgr.get_symbol(for_library, for_symbol)
             if sym_rec is None:
-                return {"error": (f"Symbol '{for_symbol}' not found in library '{for_library}'")}
+                return {
+                    "error": (
+                        f"Symbol '{for_symbol}' not found in library "
+                        f"'{for_library}'"
+                        f"{_not_found_scope(schematic_path, hint=False)}"
+                    )
+                }
             lib_raw = extract_lib_symbol_raw(
                 lib_rec.file_path,
                 sym_rec.file_index,

@@ -683,7 +683,7 @@ def _do_find_symbols_not_in_libraries(schematic_path: str) -> dict[str, Any]:
         pass
 
     if not instances:
-        return {"missing": [], "missing_count": 0}
+        return {"missing": [], "missing_count": 0, "scope": "all indexed libraries"}
 
     # Preferred source of truth: the symbol index database — but only when
     # the current project's sync has actually completed.  Trusting a sync
@@ -770,7 +770,11 @@ def _do_find_symbols_not_in_libraries(schematic_path: str) -> dict[str, Any]:
         entry["reference_count"] = len(entry["references"])
         missing.append(entry)
 
-    return {"missing": missing, "missing_count": len(missing)}
+    return {
+        "missing": missing,
+        "missing_count": len(missing),
+        "scope": "all indexed libraries",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -983,7 +987,8 @@ def _do_add_symbol(
             return {
                 "error": (
                     f"Symbol '{symbol_name}' not found in library "
-                    f"'{library_name}'. Verify the symbol name."
+                    f"'{library_name}'{_not_found_scope(schematic_path, hint=False)} "
+                    "Verify the symbol name."
                 )
             }
 
@@ -2468,7 +2473,12 @@ def register_symbol_edit_tools(mcp: FastMCP) -> None:
                 }
             sym_rec = mgr.get_symbol(library_name, symbol_name)
             if sym_rec is None:
-                return {"error": (f"Symbol '{symbol_name}' not found in library '{library_name}'")}
+                return {
+                    "error": (
+                        f"Symbol '{symbol_name}' not found in library "
+                        f"'{library_name}'{_not_found_scope(schematic_path, hint=False)}"
+                    )
+                }
             new_lib_raw = extract_lib_symbol_raw(
                 lib_rec.file_path,
                 sym_rec.file_index,
@@ -2639,7 +2649,8 @@ def register_symbol_edit_tools(mcp: FastMCP) -> None:
 
         Returns:
             dict with keys: missing (list of dicts with name, library,
-            references, reference_count), missing_count.
+            references, reference_count), missing_count, scope
+            (always ``"all indexed libraries"``).
         """
         return await asyncio.to_thread(
             _do_find_symbols_not_in_libraries, schematic_path=schematic_path

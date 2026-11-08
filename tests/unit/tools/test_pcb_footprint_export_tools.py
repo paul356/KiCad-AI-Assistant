@@ -692,6 +692,7 @@ class TestFindMissingFootprints:
         assert sorted(sensor[0]["references"]) == ["U1", "U2"]
         assert sensor[0]["reference_count"] == 2
         assert result["missing_count"] == 2  # Sensor_Board_XYZ + Connector_Odd
+        assert result["scope"] == "all indexed libraries"
 
     def test_list_is_read_only(self, tools, tmp_path, project):
         board = _make_board(tmp_path)

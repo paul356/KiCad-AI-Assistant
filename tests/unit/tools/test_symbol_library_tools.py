@@ -255,6 +255,23 @@ class TestFindSymbolsNotInLibraries:
         assert ("Device", "R_Small") in names
         assert ("Device", "C") in names
         assert result["missing_count"] == len(result["missing"]) >= 2
+        assert result["scope"] == "all indexed libraries"
+
+    def test_empty_schematic_reports_scope(self, tools, env, tmp_path):
+        """The no-instances short-circuit still names the scanned scope."""
+        empty = tmp_path / "empty.kicad_sch"
+        empty.write_text(
+            "(kicad_sch (version 20230121) (generator eeschema))",
+            encoding="utf-8",
+        )
+
+        result = _run(tools["find_symbols_not_in_libraries"], schematic_path=str(empty))
+
+        assert result == {
+            "missing": [],
+            "missing_count": 0,
+            "scope": "all indexed libraries",
+        }
 
     def test_after_export_symbol_is_no_longer_missing(self, tools, env, tmp_sch):
         """After exporting a cached symbol into a library named like its

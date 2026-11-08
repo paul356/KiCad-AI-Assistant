@@ -387,8 +387,8 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
         ``sync_footprint_index`` again while a sync is already running.
 
         Args:
-            project_path: Optional path to a .kicad_pro file (or .kicad_pcb);
-                its directory identifies the project scope.  Omit to use
+            project_path: Optional path to a project directory or a file inside it
+                (e.g. the .kicad_pro or .kicad_pcb).  Omit to use
                 global footprint libraries only.  When working inside a
                 project, pass that project's directory so its own
                 fp-lib-table entries are included; other projects'
@@ -492,8 +492,8 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
 
         Args:
             ctx: MCP context for progress reporting.
-            project_path: Optional path to a .kicad_pro file (or .kicad_pcb);
-                its directory identifies the project scope.  Omit to use
+            project_path: Optional path to a project directory or a file inside it
+                (e.g. the .kicad_pro or .kicad_pcb).  Omit to use
                 global footprint libraries only.  When working inside a
                 project, pass that project's directory so its own
                 fp-lib-table entries are included; other projects'
@@ -586,8 +586,8 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
         Args:
             query: Search string matched against footprint name, description,
                 and tags (case-insensitive).
-            project_path: Optional path to a .kicad_pro file (or .kicad_pcb);
-                its directory identifies the project scope.  Omit to use
+            project_path: Optional path to a project directory or a file inside it
+                (e.g. the .kicad_pro or .kicad_pcb).  Omit to use
                 global footprint libraries only.  When working inside a
                 project, pass that project's directory so its own
                 fp-lib-table entries are included; other projects'
@@ -682,8 +682,8 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
                 e.g. ``"Resistor_SMD"``.
             footprint_name: The footprint name without extension, e.g.
                 ``"R_0402_1005Metric"``.
-            project_path: Optional path to a .kicad_pro file (or .kicad_pcb);
-                its directory identifies the project scope.  Omit to use
+            project_path: Optional path to a project directory or a file inside it
+                (e.g. the .kicad_pro or .kicad_pcb).  Omit to use
                 global footprint libraries only.  When working inside a
                 project, pass that project's directory so its own
                 fp-lib-table entries are included; other projects'
@@ -779,8 +779,8 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
         Args:
             library_name: The library nickname (as shown in fp-lib-table),
                 e.g. ``"MountingHole"``.
-            project_path: Optional path to a .kicad_pro file (or .kicad_pcb);
-                its directory identifies the project scope.  Omit to use
+            project_path: Optional path to a project directory or a file inside it
+                (e.g. the .kicad_pro or .kicad_pcb).  Omit to use
                 global footprint libraries only.  When working inside a
                 project, pass that project's directory so its own
                 fp-lib-table entries are included; other projects'
@@ -1160,8 +1160,8 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
 
         Returns:
             dict with ``missing`` (list of {name, library, references,
-            reference_count, values}), ``missing_count``; plus ``error`` on
-            failure.
+            reference_count, values}), ``missing_count``, ``scope`` (always
+            ``"all indexed libraries"``); plus ``error`` on failure.
         """
         try:
             _, footprints, _ = _collect_board_footprints(pcb_path)
@@ -1191,6 +1191,7 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
             return {
                 "missing": missing,
                 "missing_count": len(missing),
+                "scope": "all indexed libraries",
             }
         except Exception as exc:
             log.error("find_footprints_not_in_libraries failed: %s", exc, exc_info=True)
@@ -1856,7 +1857,8 @@ def _find_footprint_mod_path(
             )
         if lib_name not in lib_by_nick:
             raise ValueError(
-                f"library '{lib_name}' not found in fp-lib-table; scanned libraries: "
+                f"library '{lib_name}' not found in fp-lib-table "
+                f"(searched: {_footprint_scope(pcb_path)}); scanned libraries: "
                 f"{_fmt_library_list(libs)}"
             )
         candidates = [(lib_name, lib_by_nick[lib_name]["uri"])]
@@ -1872,7 +1874,8 @@ def _find_footprint_mod_path(
             return header, mod_candidate, libs
 
     raise ValueError(
-        f"footprint '{footprint}' not found in the scanned libraries: "
+        f"footprint '{footprint}' not found in the scanned libraries "
+        f"(searched: {_footprint_scope(pcb_path)}): "
         f"{_fmt_library_list([{'nickname': label, 'uri': lib_dir} for label, lib_dir in candidates])}"
     )
 

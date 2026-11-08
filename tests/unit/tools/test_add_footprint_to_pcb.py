@@ -1004,6 +1004,19 @@ class TestValidation:
         assert "fp-lib-table" in res["failed"][0]["error"]
         assert _board_bytes(board_copy) == before
 
+    def test_no_libraries_reports_scope(self, tools, board_with_table, tmp_path, monkeypatch):
+        """When no fp-lib-table libraries resolve, the placement error names
+        the scope searched (the board's project plus global libraries)."""
+        import kcaa.tools.pcb_library_tools as mod
+
+        monkeypatch.setattr(mod, "build_effective_library_list", lambda project_path=None: [])
+        res = _add_one(tools, board_with_table, "R_0402_1005Metric", "R9", 20.0, 20.0)
+
+        error = res["failed"][0]["error"]
+        assert "searched: global footprint libraries plus the project libraries of" in error
+        assert f"{os.path.realpath(str(tmp_path))}" in error
+        assert "(no fp-lib-table libraries found)" in error
+
     def test_missing_pcb_file_rejected(self, tools, tmp_path):
         res = _add_one(
             tools, str(tmp_path / "missing.kicad_pcb"), "R_0402_1005Metric", "R9", 20.0, 20.0

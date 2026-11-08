@@ -264,7 +264,12 @@ class TestAddSymbolToSchematic:
                     y=50.0,
                 )
             )
-        assert "error" in result
+        project_dir = os.path.realpath(os.path.dirname(tmp_sch))
+        assert result["error"] == (
+            "Library 'NonExistentLib' not found in the index "
+            f"(searched: global libraries plus the project libraries of {project_dir}). "
+            "Verify the library name is correct."
+        )
 
     def test_symbol_not_found_returns_error(self, tools, tmp_sch):
         """When the symbol is absent from the index, return an error."""
@@ -281,7 +286,12 @@ class TestAddSymbolToSchematic:
                     y=50.0,
                 )
             )
-        assert "error" in result
+        project_dir = os.path.realpath(os.path.dirname(tmp_sch))
+        assert result["error"] == (
+            f"Symbol 'NoSuchSymbol' not found in library '{_LIB_NAME}' "
+            f"(searched: global libraries plus the project libraries of {project_dir}). "
+            "Verify the symbol name."
+        )
 
     def test_library_resolved_in_schematic_project_scope(self, tools, tmp_sch):
         """add_symbol_to_schematic looks the library up scoped to the
