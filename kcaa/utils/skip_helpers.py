@@ -232,38 +232,58 @@ def sym_pin_world_coords(sym: Any) -> list[PinWorldCoords]:
     # per-unit lib definition (``_lib_sym_pin``), which we use to recompute
     # the position with the correct CCW matrix instead of skip's
     # ``pin.location`` (wrong for 90°/270°).
-    try:
-        for pin in sym.pin:
+    had_wrappers = False
+    pin_elements = getattr(sym, "pin", None)
+    if pin_elements is None or pin_elements is False:
+        log.debug(
+            "sym_pin_world_coords: symbol %s has no pin elements",
+            _symbol_ref(sym),
+        )
+    else:
+        try:
+            pin_iterator = iter(pin_elements)
+        except TypeError as exc:
+            log.debug(
+                "sym_pin_world_coords: pin elements of %s are not iterable: %s",
+                _symbol_ref(sym),
+                exc,
+            )
+        else:
             try:
-                results.append(
-                    _pin_world_from_lib(
-                        pin._lib_sym_pin,
-                        sym_at,
-                        mirror_val,
-                        placement_rot,
-                        str(pin.number),
-                        str(pin.name) if pin.name else "",
-                        _pin_electrical_type(pin),
-                    )
-                )
-            except AttributeError as exc:
+                for pin in pin_iterator:
+                    had_wrappers = True
+                    try:
+                        results.append(
+                            _pin_world_from_lib(
+                                pin._lib_sym_pin,
+                                sym_at,
+                                mirror_val,
+                                placement_rot,
+                                str(pin.number),
+                                str(pin.name) if pin.name else "",
+                                _pin_electrical_type(pin),
+                            )
+                        )
+                    except AttributeError as exc:
+                        log.debug(
+                            "sym_pin_world_coords: failed to resolve wrapper pin %r of %s: %s",
+                            pin,
+                            _symbol_ref(sym),
+                            exc,
+                        )
+                        continue
+            except (AttributeError, TypeError) as exc:
+                # Pins resolved before the iterator failed stay in results;
+                # log what was dropped after that point.
                 log.debug(
-                    "sym_pin_world_coords: failed to resolve wrapper pin %r of %s: %s",
-                    pin,
+                    "sym_pin_world_coords: pin iteration of %s stopped early: %s",
                     _symbol_ref(sym),
                     exc,
                 )
-                continue
-    except (AttributeError, TypeError) as exc:
-        # Pins resolved before the iterator failed stay in results; log what
-        # was dropped after that point instead of failing silently.
-        log.debug(
-            "sym_pin_world_coords: pin iteration of %s stopped early: %s",
-            _symbol_ref(sym),
-            exc,
-        )
 
     fallback_used = False
+    lib_sym_readable = False
+    lib_pins_known = False
     lib_pin_count = 0
     failed = 0
     first_error: Exception | None = None
@@ -274,54 +294,57 @@ def sym_pin_world_coords(sym: Any) -> list[PinWorldCoords]:
         # Triggered for single-pin symbols (power nets, PWR_FLAG, TestPoint,
         # MountingHole_Pad) where skip does not produce SymbolPin wrappers,
         # and as a last resort when every wrapper failed.
+        lib_sym = None
         try:
             lib_sym = sym.lib_symbol
-            if lib_sym is not None:
-                try:
-                    lib_pins = list(lib_sym.pin)
-                except Exception as exc:
-                    log.debug(
-                        "sym_pin_world_coords: cannot enumerate lib pins of %s: %s",
-                        _symbol_ref(sym),
-                        exc,
-                    )
-                    lib_pins = []
-                lib_pin_count = len(lib_pins)
-                for lib_pin in lib_pins:
-                    try:
-                        num = _parsed_text(lib_pin.number)
-                        name = _parsed_text(lib_pin.name)
-                        etype = _lib_pin_electrical_type(lib_pin)
-                        results.append(
-                            _pin_world_from_lib(
-                                lib_pin,
-                                sym_at,
-                                mirror_val,
-                                placement_rot,
-                                num,
-                                name,
-                                etype,
-                            )
-                        )
-                    except Exception as exc:
-                        failed += 1
-                        if first_error is None:
-                            first_error = exc
-                        log.debug(
-                            "sym_pin_world_coords: failed to resolve pin %r of %s: %s",
-                            lib_pin,
-                            _symbol_ref(sym),
-                            exc,
-                        )
         except Exception as exc:
             # No usable lib symbol means no raw pin source; the empty
             # result cannot hide a pin the wrapper path already failed to
-            # resolve (the summary warning below reports that failure).
+            # resolve (reported below).
             log.debug(
                 "sym_pin_world_coords: cannot read lib symbol of %s: %s",
                 _symbol_ref(sym),
                 exc,
             )
+        if lib_sym is not None:
+            lib_sym_readable = True
+            try:
+                lib_pins = list(lib_sym.pin)
+                lib_pins_known = True
+            except Exception as exc:
+                log.debug(
+                    "sym_pin_world_coords: cannot enumerate lib pins of %s: %s",
+                    _symbol_ref(sym),
+                    exc,
+                )
+                lib_pins = []
+            lib_pin_count = len(lib_pins)
+            for lib_pin in lib_pins:
+                try:
+                    num = _parsed_text(lib_pin.number)
+                    name = _parsed_text(lib_pin.name)
+                    etype = _lib_pin_electrical_type(lib_pin)
+                    results.append(
+                        _pin_world_from_lib(
+                            lib_pin,
+                            sym_at,
+                            mirror_val,
+                            placement_rot,
+                            num,
+                            name,
+                            etype,
+                        )
+                    )
+                except Exception as exc:
+                    failed += 1
+                    if first_error is None:
+                        first_error = exc
+                    log.debug(
+                        "sym_pin_world_coords: failed to resolve pin %r of %s: %s",
+                        lib_pin,
+                        _symbol_ref(sym),
+                        exc,
+                    )
 
         if failed:
             # One summary per symbol: a broken multi-pin symbol would
@@ -353,10 +376,19 @@ def sym_pin_world_coords(sym: Any) -> list[PinWorldCoords]:
                 len(results),
                 ref,
             )
-        else:
+        elif not lib_sym_readable or not lib_pins_known or had_wrappers:
+            # Unreadable definition, unknown pin list, or placed pin
+            # elements that yielded nothing: something is really wrong.
             log.warning(
                 "sym_pin_world_coords: no pin data for %s from SymbolPin "
                 "wrappers or the raw lib definition",
+                ref,
+            )
+        else:
+            # Readable lib definition that legitimately declares no pins
+            # (logo, graphic, fiducial, padless mounting hole).
+            log.debug(
+                "sym_pin_world_coords: symbol %s has no pins in its lib definition",
                 ref,
             )
 
