@@ -1427,6 +1427,33 @@ def _collect_unit_pin_numbers(lib_sym_raw: list, unit: int) -> list[str]:
     return pin_numbers
 
 
+def _parse_lib_property(prop_raw: list) -> tuple[str, str, bool]:
+    """Parse a library ``(property ...)`` node by content.
+
+    KiCad stock libraries can prefix a property with one or more bare flag
+    symbols, e.g. ``(property private "KLC_S3.3" "note" ...)`` where the
+    field name is ``KLC_S3.3`` and ``private`` is a marker.  Fixed-index
+    access would mistake the marker for the name and the name for the value.
+
+    Leading bare symbols are treated as flags; the first two string atoms are
+    the field name and value.  Returns ``(name, value, is_private)``.
+    """
+    flags: list[str] = []
+    atoms: list[str] = []
+    for atom in prop_raw[1:]:
+        if isinstance(atom, sexpdata.Symbol):
+            if not atoms:
+                flags.append(atom.value())
+            continue
+        if isinstance(atom, str):
+            atoms.append(atom)
+            if len(atoms) == 2:
+                break
+    name = atoms[0] if atoms else ""
+    value = atoms[1] if len(atoms) > 1 else ""
+    return name, value, "private" in flags
+
+
 def _get_property_at(prop_raw: list) -> tuple[float, float, int]:
     """
     Extract the (at x y rot) from a property raw list.
@@ -1556,14 +1583,18 @@ def _build_placed_symbol(
     # rotating their library-relative offsets by the placement rotation.
     extra_props: list[list] = []
     for prop in lib_props:
-        if len(prop) < 2:
+        pname, pval, is_private = _parse_lib_property(prop)
+        if not pname:
             continue
-        pname = prop[1]
+        if is_private:
+            # Library-design notes (KLC remarks).  KiCad does not copy them
+            # onto placed symbols, and the bare-flag form is not valid in a
+            # schematic's placed-symbol property list.
+            continue
         if pname in ("Reference", "Value", "ki_keywords", "ki_fp_filters", "ki_description"):
             continue
         prop_x, prop_y, prop_rot = _get_property_at(prop)
         pdx, pdy = _rotate_offset(prop_x, prop_y, rotation)
-        pval = prop[2] if len(prop) >= 3 else ""
         extra_props.append(
             _build_property(
                 pname,

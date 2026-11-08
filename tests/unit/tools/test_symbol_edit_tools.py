@@ -36,6 +36,43 @@ MULTI_UNIT_PATH = str(Path(__file__).parent.parent / "utils/fixtures/multi_unit.
 _LIB_NAME = "Device"
 _SYM_NAME = "R_Small"
 
+# Library symbol carrying a KiCad 9/10 bare-flag private field (issue #259).
+# Property order matters: the private field sits between Value and the fields
+# whose values must survive content-based parsing.
+_PRIVATE_FIELD_LIB_TEXT = """
+(symbol "PrivateFields"
+  (property "Reference" "U" (at 0 0 0) (effects (font (size 1.27 1.27))))
+  (property "Value" "PrivateFields" (at 0 2.54 0) (effects (font (size 1.27 1.27))))
+  (property private "KLC_S3.3" "The rectangle is not a symbol body but a graphical element"
+    (at 0 -12.7 0) (effects (font (size 1.27 1.27)) (hide yes)))
+  (property "Footprint" "Package:PRIV" (at 0 0 0) (effects (font (size 1.27 1.27)) (hide yes)))
+  (property "Datasheet" "https://example.invalid/priv.pdf"
+    (at 0 0 0) (effects (font (size 1.27 1.27)) (hide yes)))
+  (property "Description" "Private field test symbol"
+    (at 0 0 0) (effects (font (size 1.27 1.27)) (hide yes)))
+  (property custom_flag "Manufacturer" "Acme Corp"
+    (at 0 0 0) (effects (font (size 1.27 1.27)) (hide yes)))
+  (symbol "PrivateFields_0_1" (polyline (pts (xy -1 0) (xy 1 0))))
+  (symbol "PrivateFields_1_1"
+    (pin passive line (at 0 5.08 270) (length 2.54)
+      (name "" (effects (font (size 1.27 1.27))))
+      (number "1" (effects (font (size 1.27 1.27))))))
+)
+"""
+
+# A genuine user field whose *name* is the quoted string "private".
+_QUOTED_PRIVATE_LIB_TEXT = """
+(symbol "QuotedPrivate"
+  (property "Reference" "U" (at 0 0 0) (effects (font (size 1.27 1.27))))
+  (property "Value" "QuotedPrivate" (at 0 2.54 0) (effects (font (size 1.27 1.27))))
+  (property "private" "kept value" (at 0 0 0) (effects (font (size 1.27 1.27))))
+  (symbol "QuotedPrivate_1_1"
+    (pin passive line (at 0 5.08 270) (length 2.54)
+      (name "" (effects (font (size 1.27 1.27))))
+      (number "1" (effects (font (size 1.27 1.27))))))
+)
+"""
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -92,6 +129,41 @@ def _make_mock_manager() -> MagicMock:
     mgr.get_symbol.return_value = sym_rec
 
     return mgr
+
+
+def _property_pairs(raw_node: list) -> dict[str, str]:
+    """Extract {name: value} from raw (property ...) nodes by content.
+
+    Parses the first two string atoms of each node (leading bare-symbol flags
+    such as the ``private`` marker are ignored), so it stays independent of
+    the production parser and of fixed list indices.
+    """
+    import sexpdata
+
+    pairs: dict[str, str] = {}
+    for child in raw_node:
+        if not (
+            isinstance(child, list)
+            and len(child) >= 2
+            and isinstance(child[0], sexpdata.Symbol)
+            and child[0].value() == "property"
+        ):
+            continue
+        atoms = [atom for atom in child[1:] if isinstance(atom, str)]
+        if atoms:
+            pairs[atoms[0]] = atoms[1] if len(atoms) > 1 else ""
+    return pairs
+
+
+def _contains_bare_symbol(raw_node: object, token: str) -> bool:
+    """Return True if *raw_node* contains a bare ``token`` symbol anywhere."""
+    import sexpdata
+
+    if isinstance(raw_node, sexpdata.Symbol):
+        return raw_node.value() == token
+    if isinstance(raw_node, list):
+        return any(_contains_bare_symbol(child, token) for child in raw_node)
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -358,6 +430,76 @@ class TestAddSymbolToSchematic:
         assert calls, "extends base lookup never reached the manager factory"
         assert all(c is not None for c in calls), f"unscoped lookup used: {calls}"
         assert "/work/proj/sch.kicad_sch" in calls
+
+
+class TestPrivateLibraryFields:
+    """Library properties with bare-flag markers (issue #259)."""
+
+    @staticmethod
+    def _build(text: str, reference: str = "U9", value: str = "CUSTOM_VALUE") -> list:
+        import sexpdata
+
+        from kcaa.tools.symbol_edit_tools import _build_placed_symbol
+
+        raw = sexpdata.loads(text)
+        return _build_placed_symbol(
+            "Device:R_Small",
+            10.0,
+            20.0,
+            0,
+            1,
+            reference,
+            value,
+            "sch-uuid",
+            "proj",
+            raw,
+        )
+
+    def test_private_field_skipped_and_following_values_preserved(self):
+        """A private library field must not reach the placed symbol, and it
+        must not shift the name/value extraction of properties after it."""
+        placed = self._build(_PRIVATE_FIELD_LIB_TEXT)
+        pairs = _property_pairs(placed)
+
+        # The marker form itself must be gone, including its field name.
+        assert not _contains_bare_symbol(placed, "private")
+        assert not _contains_bare_symbol(placed, "custom_flag")
+        assert "KLC_S3.3" not in pairs
+
+        # Reference / Value come from the tool arguments.
+        assert pairs["Reference"] == "U9"
+        assert pairs["Value"] == "CUSTOM_VALUE"
+
+        # Properties after the private field keep their distinct values.
+        assert pairs["Footprint"] == "Package:PRIV"
+        assert pairs["Datasheet"] == "https://example.invalid/priv.pdf"
+        assert pairs["Description"] == "Private field test symbol"
+
+        # An unknown leading flag token is treated as a flag, not a name.
+        assert pairs["Manufacturer"] == "Acme Corp"
+
+    def test_quoted_private_name_is_copied(self):
+        """(property "private" "x" ...) is a normal user field, not a marker."""
+        placed = self._build(_QUOTED_PRIVATE_LIB_TEXT)
+        pairs = _property_pairs(placed)
+        assert pairs["private"] == "kept value"
+
+    def test_serialized_output_parses_without_private_marker(self, tmp_sch):
+        """The written schematic has no bare-flag property node and re-parses."""
+        import sexpdata
+        import skip
+
+        from kcaa.utils.schematic_sexp_utils import save_schematic
+
+        placed = self._build(_PRIVATE_FIELD_LIB_TEXT)
+        sch = skip.Schematic(tmp_sch)
+        sch.new_from_list(placed)
+        save_schematic(tmp_sch, sch)
+
+        text = Path(tmp_sch).read_text()
+        assert "(property private" not in text
+        sexpdata.loads(text)  # must not raise
+        skip.Schematic(tmp_sch)  # must not raise
 
 
 # ---------------------------------------------------------------------------
