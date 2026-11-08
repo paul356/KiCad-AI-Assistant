@@ -65,7 +65,8 @@ in the project's own `fp-lib-table`; other projects are never searched.
   modified.  Typical flow: ``find_footprints_not_in_libraries`` to preview,
   ``create_footprint_library`` once to set up a new library, then
   ``add_footprints_to_library`` to populate it.
-- Project paths may be given as ``.kicad_pro`` or ``.kicad_pcb`` files; the
-  project identity is always the realpath of the parent directory, so all
-  tools agree on which project a library belongs to.  For
-  ``create_footprint_library`` pass the project *directory* directly.
+- Project paths may be given as a project directory or any file inside it
+  (e.g. ``.kicad_pro`` or ``.kicad_pcb``); the project identity is the
+  realpath of that directory, so all tools agree on which project a library
+  belongs to.  For ``create_footprint_library`` pass the project *directory*
+  directly.

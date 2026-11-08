@@ -255,7 +255,10 @@ class TestFindSymbolsNotInLibraries:
         assert ("Device", "R_Small") in names
         assert ("Device", "C") in names
         assert result["missing_count"] == len(result["missing"]) >= 2
-        assert result["scope"] == "all indexed libraries"
+        assert result["scope"] == (
+            f"global libraries plus the project libraries of "
+            f"{os.path.realpath(os.path.dirname(tmp_sch))}"
+        )
 
     def test_empty_schematic_reports_scope(self, tools, env, tmp_path):
         """The no-instances short-circuit still names the scanned scope."""
@@ -270,7 +273,9 @@ class TestFindSymbolsNotInLibraries:
         assert result == {
             "missing": [],
             "missing_count": 0,
-            "scope": "all indexed libraries",
+            "scope": (
+                f"global libraries plus the project libraries of {os.path.realpath(str(tmp_path))}"
+            ),
         }
 
     def test_after_export_symbol_is_no_longer_missing(self, tools, env, tmp_sch):

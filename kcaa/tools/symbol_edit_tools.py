@@ -20,7 +20,7 @@ from fastmcp import Context, FastMCP
 import sexpdata
 
 from kcaa.tools.sheet_tools import _normalize_collection, _sheet_dict_from_wrapper
-from kcaa.tools.symbol_tools import _not_found_scope
+from kcaa.tools.symbol_tools import _not_found_scope, _scope_text
 from kcaa.utils.config import (
     config,
 )
@@ -683,7 +683,7 @@ def _do_find_symbols_not_in_libraries(schematic_path: str) -> dict[str, Any]:
         pass
 
     if not instances:
-        return {"missing": [], "missing_count": 0, "scope": "all indexed libraries"}
+        return {"missing": [], "missing_count": 0, "scope": _scope_text(schematic_path)}
 
     # Preferred source of truth: the symbol index database — but only when
     # the current project's sync has actually completed.  Trusting a sync
@@ -773,7 +773,7 @@ def _do_find_symbols_not_in_libraries(schematic_path: str) -> dict[str, Any]:
     return {
         "missing": missing,
         "missing_count": len(missing),
-        "scope": "all indexed libraries",
+        "scope": _scope_text(schematic_path),
     }
 
 
@@ -2650,7 +2650,7 @@ def register_symbol_edit_tools(mcp: FastMCP) -> None:
         Returns:
             dict with keys: missing (list of dicts with name, library,
             references, reference_count), missing_count, scope
-            (always ``"all indexed libraries"``).
+            (the global/project library scope actually searched).
         """
         return await asyncio.to_thread(
             _do_find_symbols_not_in_libraries, schematic_path=schematic_path

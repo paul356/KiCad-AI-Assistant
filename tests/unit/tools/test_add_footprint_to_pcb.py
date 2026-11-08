@@ -1004,6 +1004,25 @@ class TestValidation:
         assert "fp-lib-table" in res["failed"][0]["error"]
         assert _board_bytes(board_copy) == before
 
+    def test_library_argument_miss_reports_scope(self, tmp_path, monkeypatch):
+        """The private library= branch carries the scope suffix too."""
+        import kcaa.tools.pcb_library_tools as mod
+
+        monkeypatch.setattr(mod, "build_effective_library_list", lambda project_path=None: [])
+        board = tmp_path / "b.kicad_pcb"
+        board.write_text("(kicad_pcb)\n", encoding="utf-8")
+
+        with pytest.raises(ValueError) as excinfo:
+            mod._find_footprint_mod_path("R_0402_1005Metric", "NoSuchLib", str(board))
+
+        assert str(excinfo.value) == (
+            "library 'NoSuchLib' not found (expected a registered nickname, "
+            "a .pretty directory path, or a directory name) "
+            f"(searched: global footprint libraries plus the project libraries of "
+            f"{os.path.realpath(str(tmp_path))}); "
+            "scanned libraries: (no fp-lib-table libraries found)"
+        )
+
     def test_no_libraries_reports_scope(self, tools, board_with_table, tmp_path, monkeypatch):
         """When no fp-lib-table libraries resolve, the placement error names
         the scope searched (the board's project plus global libraries)."""

@@ -1160,8 +1160,9 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
 
         Returns:
             dict with ``missing`` (list of {name, library, references,
-            reference_count, values}), ``missing_count``, ``scope`` (always
-            ``"all indexed libraries"``); plus ``error`` on failure.
+            reference_count, values}), ``missing_count``, ``scope`` (the
+            global/project footprint-library scope actually searched); plus
+            ``error`` on failure.
         """
         try:
             _, footprints, _ = _collect_board_footprints(pcb_path)
@@ -1191,7 +1192,7 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
             return {
                 "missing": missing,
                 "missing_count": len(missing),
-                "scope": "all indexed libraries",
+                "scope": _footprint_scope(pcb_path),
             }
         except Exception as exc:
             log.error("find_footprints_not_in_libraries failed: %s", exc, exc_info=True)
@@ -1772,7 +1773,8 @@ def _resolve_library_dir(library: str, pcb_path: str | None) -> tuple[str, str]:
     by_nickname = {lib["nickname"]: lib for lib in libs}
     if library not in by_nickname:
         raise ValueError(
-            f"Library '{library}' not found in fp-lib-table. "
+            f"Library '{library}' not found in fp-lib-table "
+            f"(searched: {_footprint_scope(pcb_path)}). "
             "Create it first with create_footprint_library."
         )
     lib_dir = by_nickname[library].get("uri", "")
@@ -1846,7 +1848,8 @@ def _find_footprint_mod_path(
             if not candidates:
                 raise ValueError(
                     f"library {library!r} not found (expected a registered nickname, "
-                    f"a .pretty directory path, or a directory name); scanned libraries: "
+                    f"a .pretty directory path, or a directory name) "
+                    f"(searched: {_footprint_scope(pcb_path)}); scanned libraries: "
                     f"{_fmt_library_list(libs)}"
                 )
     if lib_name is not None:

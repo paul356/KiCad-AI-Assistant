@@ -692,7 +692,10 @@ class TestFindMissingFootprints:
         assert sorted(sensor[0]["references"]) == ["U1", "U2"]
         assert sensor[0]["reference_count"] == 2
         assert result["missing_count"] == 2  # Sensor_Board_XYZ + Connector_Odd
-        assert result["scope"] == "all indexed libraries"
+        assert result["scope"] == (
+            f"global footprint libraries plus the project libraries of "
+            f"{os.path.realpath(str(tmp_path))}"
+        )
 
     def test_list_is_read_only(self, tools, tmp_path, project):
         board = _make_board(tmp_path)
@@ -844,6 +847,24 @@ class TestCreateProjectLibrary:
 
 
 class TestAddFootprints:
+    def test_unknown_library_reports_scope(self, tools, tmp_path):
+        board = _make_board(tmp_path)
+        result = _run(
+            tools["add_footprints_to_library"](
+                pcb_path=board,
+                footprints=["Sensor_Board_XYZ"],
+                library="NoSuchLib",
+                ctx=None,
+            )
+        )
+
+        assert result["error"] == (
+            "Library 'NoSuchLib' not found in fp-lib-table "
+            f"(searched: global footprint libraries plus the project libraries of "
+            f"{os.path.realpath(str(tmp_path))}). "
+            "Create it first with create_footprint_library."
+        )
+
     def test_exports_missing_to_3rdparty(self, tools, tmp_path, project):
         # Create the target library first, then export into it.
         created = _run(tools["create_footprint_library"](name="MyVendor", ctx=None))
@@ -1185,7 +1206,11 @@ class TestRemoveFootprintsFromLibrary:
         result = _run(
             tools["remove_footprints_from_library"](library="NoSuchLib", footprints=["X"], ctx=None)
         )
-        assert "error" in result
+        assert result["error"] == (
+            "Library 'NoSuchLib' not found in fp-lib-table "
+            "(searched: global footprint libraries only). "
+            "Create it first with create_footprint_library."
+        )
         assert "success" not in result
 
     def test_empty_footprints_returns_error(self, tools, project):
@@ -1274,7 +1299,11 @@ class TestDeleteFootprintLibrary:
 
     def test_unknown_library_returns_error(self, tools):
         result = _run(tools["delete_footprint_library"](library="NoSuchLib", ctx=None))
-        assert "error" in result
+        assert result["error"] == (
+            "Library 'NoSuchLib' not found in fp-lib-table "
+            "(searched: global footprint libraries only). "
+            "Create it first with create_footprint_library."
+        )
         assert "success" not in result
 
     def test_refuses_system_footprint_library(self, tools, monkeypatch, tmp_path):
