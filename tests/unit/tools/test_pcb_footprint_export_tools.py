@@ -1547,8 +1547,13 @@ class TestListLibraryFootprints:
     def test_unknown_library_returns_error_and_hint(self, tools):
         result = _run(tools["list_library_footprints"](library_name="NoSuchLib", ctx=None))
 
-        assert result["error"] == "Library 'NoSuchLib' not found."
-        assert result["hint"] == "Call list_footprint_libraries to see available nicknames."
+        assert result["error"] == (
+            "Library 'NoSuchLib' not found in the footprint index "
+            "(searched: global footprint libraries only)."
+        )
+        assert result["hint"].startswith(
+            "Call list_footprint_libraries to see available nicknames."
+        )
         assert "footprints" not in result
 
     def test_truncates_but_reports_true_total(self, tools, project, tmp_path):
@@ -1890,7 +1895,9 @@ class TestListLibraryFootprints:
         )
 
         assert result["error"] == (
-            f"Library 'Missing' resolves to '{missing}', which is not a directory."
+            f"Library 'Missing' resolves to '{missing}', which is not a directory "
+            f"(searched: global footprint libraries plus the project libraries of "
+            f"{os.path.realpath(str(tmp_path))})."
         )
         assert result["hint"] == (
             "Check the library path for 'Missing' in Manage Footprint Libraries "
@@ -1909,7 +1916,8 @@ class TestListLibraryFootprints:
         result = _run(tools["list_library_footprints"](library_name="Gone", ctx=None))
 
         assert result["error"] == (
-            f"Library 'Gone' resolves to '{stale}', which is not a directory."
+            f"Library 'Gone' resolves to '{stale}', which is not a directory "
+            "(searched: global footprint libraries only)."
         )
         assert result["hint"] == "Run sync_footprint_index to refresh the index."
         assert "footprints" not in result

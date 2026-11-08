@@ -143,20 +143,35 @@ def _run_sync_in_background(force: bool, project_path: str | None = None) -> Non
             _sync_state.current_library = ""
 
 
-def _not_found_scope(project_path: str | None) -> str:
+def _scope_text(project_path: str | None) -> str:
+    """Describe the library scope a symbol query actually searched."""
+    project_dir = _project_dir_of(project_path)
+    if project_dir:
+        return f"global libraries plus the project libraries of {project_dir}"
+    return "global libraries only"
+
+
+def _scope_hint(project_path: str | None) -> str:
+    """One-line way to widen a symbol query that returned nothing."""
+    if _project_dir_of(project_path):
+        return ""
+    return (
+        "To include a project's own libraries, call again with project_path "
+        "set to that project directory."
+    )
+
+
+def _not_found_scope(project_path: str | None, *, hint: bool = True) -> str:
     """Human-readable scope suffix for an index miss (issue #255).
 
     Names exactly what was searched so "sync succeeded, still not found"
     points the caller at the missing project scope instead of looking like a
-    stale index.
+    stale index.  *hint* is off for callers whose tool has no
+    ``project_path`` parameter (mutation tools scope by their own path).
     """
-    project_dir = _project_dir_of(project_path)
-    if project_dir:
-        return f" (searched: global + project libraries of {project_dir})."
-    return (
-        " (searched: global libraries)."
-        " Pass project_path=<project dir> to include that project's libraries."
-    )
+    advice = _scope_hint(project_path) if hint else ""
+    suffix = f" {advice}" if advice else ""
+    return f" (searched: {_scope_text(project_path)}).{suffix}"
 
 
 def _load_lib_symbol_raw(
@@ -174,12 +189,15 @@ def _load_lib_symbol_raw(
     if sym_rec is None:
         return (
             None,
-            f"Symbol '{library_name}:{symbol_name}' not found in index"
+            f"Symbol '{library_name}:{symbol_name}' not found in the index"
             f"{_not_found_scope(project_path)}",
         )
     lib_rec = mgr.get_library_by_name(library_name)
     if lib_rec is None:
-        return None, f"Library '{library_name}' not found in index{_not_found_scope(project_path)}"
+        return (
+            None,
+            f"Library '{library_name}' not found in the index{_not_found_scope(project_path)}",
+        )
     try:
         raw = extract_lib_symbol_raw(
             lib_rec.file_path,
@@ -306,9 +324,10 @@ def register_symbol_tools(mcp: FastMCP) -> None:
             force: If True, reparse every library regardless of whether it changed. This can take
                    a long time to complete. Use force=True only when the database is messed up.
             project_path: Optional path to a project directory or a file inside it
-                (e.g. the schematic).  Global + that project's libraries are
-                synced; other projects' rows are never touched.  Omit for the
-                global scope only.
+                (e.g. the schematic).  Omit to use global libraries only.
+                When working inside a project, pass that project's directory
+                so its own sym-lib-table entries are included; other
+                projects' libraries are never searched.
         """
         with _sync_lock:
             if _sync_state.running:
@@ -384,10 +403,11 @@ def register_symbol_tools(mcp: FastMCP) -> None:
         Args:
             query: Search string (e.g. "resistor", "NPN transistor", "STM32").
             project_path: Optional path to a project directory or a file
-                inside it (e.g. the schematic).  Global plus that project's
-                libraries are searched; other projects' libraries are never
-                shown.  Omit for global libraries only.  Within a project
-                scope, a same-nickname global+project library pair
+                inside it (e.g. the schematic).  Omit to use global libraries
+                only.  When working inside a project, pass that project's
+                directory so its own sym-lib-table entries are included;
+                other projects' libraries are never searched.  Within a
+                project scope, a same-nickname global+project library pair
                 enumerates as BOTH rows (union scope): a search can return
                 the same ``library_name`` twice, with each row's symbols.
                 Single-library lookups (``get_library_symbol``,
@@ -407,10 +427,11 @@ def register_symbol_tools(mcp: FastMCP) -> None:
         try:
             mgr = _get_index_manager(project_path)
             results = mgr.search_symbols(query, limit=limit)
-            return {
+            out: dict[str, Any] = {
                 "success": True,
                 "query": query,
                 "count": len(results),
+                "scope": _scope_text(project_path),
                 "symbols": [
                     {
                         "library_name": s.library_name,
@@ -422,6 +443,10 @@ def register_symbol_tools(mcp: FastMCP) -> None:
                     for s in results
                 ],
             }
+            hint = _scope_hint(project_path)
+            if not results and hint:
+                out["hint"] = hint
+            return out
         except Exception as e:
             log.error(f"Symbol search failed: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
@@ -453,10 +478,11 @@ def register_symbol_tools(mcp: FastMCP) -> None:
                 not just the table name (e.g. not ``"Device"``).
             symbol_name:  The symbol name within the library (e.g. "R").
             project_path: Optional path to a project directory or a file
-                inside it (e.g. the schematic).  The lookup is scoped to
-                global plus that project's libraries; other projects'
-                libraries are never matched.  Omit for global only.  Within
-                a project scope, a same-nickname global+project library
+                inside it (e.g. the schematic).  Omit to use global libraries
+                only.  When working inside a project, pass that project's
+                directory so its own sym-lib-table entries are included;
+                other projects' libraries are never searched.  Within a
+                project scope, a same-nickname global+project library
                 pair resolves to the PROJECT row (shadow) — the global
                 row's symbols are not merged.  Enumeration/search tools
                 (``search_library_symbols``, ``list_symbol_libraries``) instead show
@@ -469,7 +495,7 @@ def register_symbol_tools(mcp: FastMCP) -> None:
                 return {
                     "success": False,
                     "error": (
-                        f"Symbol '{library_name}:{symbol_name}' not found in index"
+                        f"Symbol '{library_name}:{symbol_name}' not found in the index"
                         f"{_not_found_scope(project_path)}"
                     ),
                 }
@@ -518,12 +544,13 @@ def register_symbol_tools(mcp: FastMCP) -> None:
             limit:  Maximum entries to return (default 200, max 500).
             offset: 0-based entry offset for pagination (default 0).
             project_path: Optional path to a project directory or a file
-                inside it (e.g. the schematic).  Global plus that project's
-                libraries are listed; other projects' libraries are never
-                shown.  Omit for global libraries only.  Within a project
-                scope, a same-nickname global+project library pair lists as
-                BOTH rows (union scope) — the nickname can appear twice.
-                Single-library lookups (``get_library_symbol``,
+                inside it (e.g. the schematic).  Omit to use global libraries
+                only.  When working inside a project, pass that project's
+                directory so its own sym-lib-table entries are included;
+                other projects' libraries are never searched.  Within a
+                project scope, a same-nickname global+project library pair
+                lists as BOTH rows (union scope) — the nickname can appear
+                twice.  Single-library lookups (``get_library_symbol``,
                 ``list_library_symbols``) instead resolve such a pair to the
                 project row (shadow).
         """
@@ -537,6 +564,7 @@ def register_symbol_tools(mcp: FastMCP) -> None:
             out: dict[str, Any] = {
                 "success": True,
                 "total": len(libraries),
+                "scope": _scope_text(project_path),
                 "offset": offset,
                 "limit": limit,
                 "truncated": (offset + limit) < len(libraries),
@@ -549,6 +577,9 @@ def register_symbol_tools(mcp: FastMCP) -> None:
                     for lib in page
                 ],
             }
+            hint = _scope_hint(project_path)
+            if not libraries and hint:
+                out["hint"] = hint
             return out
         except Exception as e:
             log.error(f"list_symbol_libraries failed: {e}", exc_info=True)
@@ -583,14 +614,15 @@ def register_symbol_tools(mcp: FastMCP) -> None:
             limit:  Maximum symbols to return (default 50, max 200).
             offset: 0-based symbol offset for pagination (default 0).
             project_path: Optional path to a project directory or a file
-                inside it (e.g. the schematic).  The library is looked up in
-                global plus that project's scope; other projects' libraries
-                are never matched.  Omit for global only.  Within a project
-                scope, a same-nickname global+project library pair resolves
-                to the PROJECT row (shadow) — the global row's symbols are
-                not merged.  Enumeration/search tools (``search_library_symbols``,
-                ``list_symbol_libraries``) instead show such a pair as both
-                rows (union).
+                inside it (e.g. the schematic).  Omit to use global libraries
+                only.  When working inside a project, pass that project's
+                directory so its own sym-lib-table entries are included;
+                other projects' libraries are never searched.  Within a
+                project scope, a same-nickname global+project library pair
+                resolves to the PROJECT row (shadow) — the global row's
+                symbols are not merged.  Enumeration/search tools
+                (``search_library_symbols``, ``list_symbol_libraries``)
+                instead show such a pair as both rows (union).
         """
         try:
             limit = min(max(1, limit), 200)
@@ -598,14 +630,23 @@ def register_symbol_tools(mcp: FastMCP) -> None:
             mgr = _get_index_manager(project_path)
             symbols = mgr.get_library_symbols(library_name)
             if not symbols:
-                return {
+                out: dict[str, Any] = {
                     "success": False,
-                    "error": f"Library '{library_name}' not found or has no indexed symbols.",
+                    "error": (
+                        f"Library '{library_name}' not found or has no indexed symbols"
+                        f"{_not_found_scope(project_path)}"
+                    ),
+                    "scope": _scope_text(project_path),
                 }
+                hint = _scope_hint(project_path)
+                if hint:
+                    out["hint"] = hint
+                return out
             page = symbols[offset : offset + limit]
             return {
                 "success": True,
                 "library_name": library_name,
+                "scope": _scope_text(project_path),
                 "total": len(symbols),
                 "offset": offset,
                 "limit": limit,
@@ -637,11 +678,12 @@ def register_symbol_tools(mcp: FastMCP) -> None:
 
         Args:
             project_path: Optional path to a project directory or a file
-                inside it.  Counts cover global plus that project's
-                libraries; other projects' rows are excluded.  Omit for the
-                global scope only.  Within a project scope, a same-nickname
-                global+project library pair is counted as TWO rows (union
-                scope).
+                inside it.  Omit to use global libraries only.  When working
+                inside a project, pass that project's directory so its own
+                sym-lib-table entries are included; other projects'
+                libraries are never searched.  Within a project scope, a
+                same-nickname global+project library pair is counted as TWO
+                rows (union scope).
         """
         try:
             mgr = _get_index_manager(project_path)
@@ -690,11 +732,13 @@ def register_symbol_tools(mcp: FastMCP) -> None:
                 (e.g. ``"Device/R"`` for KiCad 10 symdir-style libraries).
             symbol_name: The symbol name within the library (e.g. ``"R"``).
             project_path: Optional path to a project directory or a file
-                inside it (e.g. the schematic).  The library is looked up in
-                global plus that project's scope; other projects' libraries
-                are never matched.  Omit for global only.  Within a project
-                scope, a same-nickname global+project library pair resolves
-                to the PROJECT row (shadow), like ``get_library_symbol``.
+                inside it (e.g. the schematic).  Omit to use global libraries
+                only.  When working inside a project, pass that project's
+                directory so its own sym-lib-table entries are included;
+                other projects' libraries are never searched.  Within a
+                project scope, a same-nickname global+project library pair
+                resolves to the PROJECT row (shadow), like
+                ``get_library_symbol``.
 
         Returns:
             dict with keys: success, library_name, symbol_name, pin_count,

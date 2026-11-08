@@ -156,7 +156,7 @@ A sub-sheet reference (`type: "sheet"`) returns that reduced sheet-pin shape min
 
 ### 3.2 Symbol Index Tools
 
-> **Project scope:** At the MCP layer, omitting `project_path` reads the global libraries only. Inside the plugin chat client, the seven tools here that accept `project_path` default an **omitted or `null`** value to the panel's active project before dispatch. An explicit value always wins — an explicit `""` still means global — and mutating symbol tools (`create_symbol_library`, `add_symbols_to_library`, `remove_symbols_from_library`, `delete_symbol_library`, `delete_symbol_property`, …) are never defaulted.
+> **Project scope:** Omitting `project_path` reads global libraries only. When working inside a project, pass that project's directory so its own `sym-lib-table` entries are included; other projects' libraries are never searched. The tools that accept `project_path` are `sync_symbol_index`, `search_library_symbols`, `get_library_symbol`, `get_library_symbol_pins`, `list_symbol_libraries`, `list_library_symbols`, and `get_symbol_index_stats`.
 
 #### `sync_symbol_index(force=False, project_path=None)`
 
@@ -164,7 +164,7 @@ A sub-sheet reference (`type: "sheet"`) returns that reduced sheet-pin shape min
 
 **Key parameters:**
 - `force` (`bool`) — when `True`, rebuilds even if the index appears current.
-- `project_path` (`str | None`) — optional path to a project directory or a file inside it (e.g. the schematic). Syncs global plus that project's libraries; other projects' rows are never touched. When called directly over MCP, omit for the global scope only; the plugin defaults it to the active project.
+- `project_path` (`str | None`) — optional path to a project directory or a file inside it (e.g. the schematic). Syncs global plus that project's libraries; other projects' rows are never touched. Omit for global libraries only; when working inside a project, pass that project's directory.
 
 ---
 
@@ -180,7 +180,7 @@ A sub-sheet reference (`type: "sheet"`) returns that reduced sheet-pin shape min
 
 **Key parameters:**
 - `query` (`str`) — search string (e.g. `"NPN transistor"`, `"STM32F4"`).
-- `project_path` (`str | None`) — optional path to a project directory or a file inside it. Global plus that project's libraries are searched; other projects' libraries are never shown. When called directly over MCP, omit for global libraries only; the plugin defaults it to the active project.
+- `project_path` (`str | None`) — optional path to a project directory or a file inside it. Global plus that project's libraries are searched; other projects' libraries are never shown. Omit for global libraries only; when working inside a project, pass that project's directory.
 - `limit` (`int`, default `50`) — maximum results.
 
 **Return shape:** `{"success": true, "count": N, "symbols": [{"library_name": "...", "name": "...", "description": "...", "pin_count": N}, ...]}`
@@ -195,7 +195,7 @@ A sub-sheet reference (`type: "sheet"`) returns that reduced sheet-pin shape min
 
 **Key parameters:**
 - `library_name` and `symbol_name` exactly as returned by `search_library_symbols`.
-- `project_path` (`str | None`) — optional path to a project directory or a file inside it. The lookup is scoped to global plus that project's libraries; other projects' libraries are never matched. When called directly over MCP, omit for global only; the plugin defaults it to the active project.
+- `project_path` (`str | None`) — optional path to a project directory or a file inside it. The lookup is scoped to global plus that project's libraries; other projects' libraries are never matched. Omit for global only; when working inside a project, pass that project's directory.
 
 ---
 

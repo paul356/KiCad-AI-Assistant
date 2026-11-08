@@ -4,28 +4,36 @@ priority: 40
 description: "Footprint index sync, library listing, search, and inspection"
 tools: [sync_footprint_index, get_footprint_sync_status, list_footprint_libraries, list_library_footprints, search_library_footprints, get_library_footprint, find_footprints_not_in_libraries, create_footprint_library, add_footprints_to_library]
 ---
+# Project scope (do this first)
+When working inside a project, pass **`project_path` = the path shown as `Active project`**
+in the conversation context to every footprint index build and lookup. Omitting
+`project_path` searches global footprint libraries only and will not find libraries declared
+in the project's own `fp-lib-table`; other projects are never searched.
+
 - Build/refresh the footprint index (background) for a project:
-  **sync_footprint_index(project_path?, force)** — ``project_path`` is
-  optional: omit it to index only the global user/system libraries (useful
-  when the user has no project fp-lib-table); pass a ``.kicad_pro``/``.kicad_pcb``
-  to also index that project's own fp-lib-table entries, recorded per-project.
-  Other projects' indexed libraries are never touched.  Check progress with
+  **sync_footprint_index(project_path=active_project, force=false)** — pass the
+  project path to index global plus that project's own fp-lib-table entries,
+  recorded per-project.  Omit ``project_path`` only for a global-only index
+  (e.g. the user has no project fp-lib-table).  Other projects' indexed
+  libraries are never touched.  Check progress with
   **get_footprint_sync_status**.
-- List libraries: **list_footprint_libraries(project_path?)** — omit
-  ``project_path`` for global libraries only.
+- List libraries: **list_footprint_libraries(project_path=active_project)** —
+  omit ``project_path`` only for a global-only listing.
 - List every footprint in one library: **list_library_footprints(library_name,
-  project_path?, max_results?, offset?)** — names plus light metadata
+  project_path=active_project, max_results?, offset?)** — names plus light metadata
   (description, tags, attr, pad count, 3D model), name-ordered and pageable with
   ``max_results``/``offset`` (``next_offset`` is where the next page starts);
   use **get_library_footprint(library_name, footprint_name)** to inspect ONE
   footprint's pads/courtyard, and never pass a list of names to
   ``list_library_footprints``.
-- Search footprints: **search_library_footprints(query, project_path?, limit)** —
-  omit ``project_path`` to search global libraries only.
+- Search footprints: **search_library_footprints(query,
+  project_path=active_project, max_results?)** — omit ``project_path`` only
+  for a global-only search.
 - Inspect pads/courtyard of a specific footprint:
-  **get_library_footprint(library, name, project_path?)**; a project-owned
-  library with the same nickname takes precedence over the global one.
-  Omit ``project_path`` to look in global libraries only.
+  **get_library_footprint(library_name, footprint_name,
+  project_path=active_project)**; a project-owned library with the same
+  nickname takes precedence over the global one.  Omit ``project_path`` only
+  to look in global libraries.
 - Find board footprints missing from every indexed library:
   **find_footprints_not_in_libraries(pcb_path)**.  Read-only: compares the footprints
   embedded in the board against the indexed footprint database scoped to the

@@ -81,9 +81,7 @@ The full context JSON is also available as a `context` field if the LLM needs to
 
 ## 5. How Context Reaches MCP Tool Calls
 
-The MCP tools accept explicit path arguments (`schematic_path`, `project_path`). The LLM is instructed by the system prompt to use the active paths from the context. The plugin does **not** inject context as MCP session metadata, so the MCP server stays stateless and every tool call is self-contained and auditable in the tool log.
-
-One exception lives inside the plugin chat client: when a turn has an active project, the symbol-library/index tools (`sync_symbol_index`, `search_library_symbols`, `get_library_symbol`, `get_library_symbol_pins`, `list_symbol_libraries`, `list_library_symbols`, `get_symbol_index_stats`) default an **omitted or `null`** `project_path` to that project before dispatch. An explicit value always wins — including an explicit `""`, which still means the global scope — and mutating symbol tools are never defaulted. Standalone MCP use is unchanged: omitting `project_path` means global.
+The tools take explicit path arguments (`schematic_path`, `project_path`). A tool call searches global libraries unless the caller passes `project_path`; nothing is filled in on the way, so each call means exactly what its arguments say. Because of that, the system prompt and the symbol/footprint skills tell the assistant to pass the active project path (shown as `Active project` in the context) whenever it works inside a project. Omitting `project_path` therefore means global libraries only — it will not find project-local libraries — and another project's libraries are never searched.
 
 ---
 

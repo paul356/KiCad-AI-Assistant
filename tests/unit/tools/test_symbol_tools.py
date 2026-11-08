@@ -199,6 +199,23 @@ class TestSearchSymbols:
         assert result["success"] is True
         assert result["count"] == 0
         assert result["symbols"] == []
+        assert result["scope"] == "global libraries only"
+        assert "project_path" in result["hint"]
+
+    def test_empty_results_reports_project_scope(self, tmp_path):
+        mock_mgr = MagicMock()
+        mock_mgr.search_symbols.return_value = []
+        project_dir = os.path.realpath(str(tmp_path))
+
+        with patch("kcaa.tools.symbol_tools._get_index_manager", return_value=mock_mgr):
+            result = _call(
+                "search_library_symbols",
+                query="xyzzy_no_match",
+                project_path=project_dir,
+            )
+
+        assert result["scope"] == (f"global libraries plus the project libraries of {project_dir}")
+        assert "hint" not in result
 
     def test_manager_error(self):
         mock_mgr = MagicMock()
@@ -247,8 +264,9 @@ class TestGetSymbol:
 
         assert result["success"] is False
         assert result["error"] == (
-            "Symbol 'Device:NOEXIST' not found in index (searched: global libraries)."
-            " Pass project_path=<project dir> to include that project's libraries."
+            "Symbol 'Device:NOEXIST' not found in the index "
+            "(searched: global libraries only). To include a project's own "
+            "libraries, call again with project_path set to that project directory."
         )
 
     def test_not_found_reports_project_scope(self, tmp_path):
@@ -265,8 +283,8 @@ class TestGetSymbol:
             )
 
         assert result["error"] == (
-            f"Symbol 'Device:NOEXIST' not found in index "
-            f"(searched: global + project libraries of {project_dir})."
+            f"Symbol 'Device:NOEXIST' not found in the index "
+            f"(searched: global libraries plus the project libraries of {project_dir})."
         )
 
 
@@ -322,7 +340,20 @@ class TestListSymbolLibraries:
         assert result["offset"] == 0
         assert result["truncated"] is False
         assert result["libraries"] == []
+        assert result["scope"] == "global libraries only"
+        assert "project_path" in result["hint"]
         assert "mode" not in result
+
+    def test_empty_libraries_reports_project_scope(self, tmp_path):
+        mock_mgr = MagicMock()
+        mock_mgr.get_all_libraries.return_value = []
+        project_dir = os.path.realpath(str(tmp_path))
+
+        with patch("kcaa.tools.symbol_tools._get_index_manager", return_value=mock_mgr):
+            result = _call("list_symbol_libraries", project_path=project_dir)
+
+        assert result["scope"] == (f"global libraries plus the project libraries of {project_dir}")
+        assert "hint" not in result
 
     def test_pagination_slices_libraries(self):
         mock_mgr = MagicMock()
@@ -463,7 +494,32 @@ class TestListLibrarySymbols:
             result = _call("list_library_symbols", library_name="NOLIB")
 
         assert result["success"] is False
-        assert "NOLIB" in result["error"]
+        assert result["error"] == (
+            "Library 'NOLIB' not found or has no indexed symbols "
+            "(searched: global libraries only). To include a project's own "
+            "libraries, call again with project_path set to that project directory."
+        )
+        assert result["scope"] == "global libraries only"
+        assert "project_path" in result["hint"]
+
+    def test_not_found_reports_project_scope(self, tmp_path):
+        mock_mgr = MagicMock()
+        mock_mgr.get_library_symbols.return_value = []
+        project_dir = os.path.realpath(str(tmp_path))
+
+        with patch("kcaa.tools.symbol_tools._get_index_manager", return_value=mock_mgr):
+            result = _call(
+                "list_library_symbols",
+                library_name="NOLIB",
+                project_path=project_dir,
+            )
+
+        assert result["error"] == (
+            f"Library 'NOLIB' not found or has no indexed symbols "
+            f"(searched: global libraries plus the project libraries of {project_dir})."
+        )
+        assert result["scope"] == (f"global libraries plus the project libraries of {project_dir}")
+        assert "hint" not in result
 
 
 # ---------------------------------------------------------------------------
@@ -632,8 +688,9 @@ class TestGetSymbolPins:
 
         assert result.get("success") is False
         assert result["error"] == (
-            "Symbol 'Device:NOEXIST' not found in index (searched: global libraries)."
-            " Pass project_path=<project dir> to include that project's libraries."
+            "Symbol 'Device:NOEXIST' not found in the index "
+            "(searched: global libraries only). To include a project's own "
+            "libraries, call again with project_path set to that project directory."
         )
 
     def test_symbol_not_found_reports_project_scope(self, tmp_path):
@@ -651,8 +708,8 @@ class TestGetSymbolPins:
             )
 
         assert result["error"] == (
-            f"Symbol 'Device:NOEXIST' not found in index "
-            f"(searched: global + project libraries of {project_dir})."
+            f"Symbol 'Device:NOEXIST' not found in the index "
+            f"(searched: global libraries plus the project libraries of {project_dir})."
         )
 
     def test_library_not_found_reports_scope(self):
@@ -666,8 +723,9 @@ class TestGetSymbolPins:
             result = _call("get_library_symbol_pins", library_name="MISSINGLIB", symbol_name="R")
 
         assert result["error"] == (
-            "Library 'MISSINGLIB' not found in index (searched: global libraries)."
-            " Pass project_path=<project dir> to include that project's libraries."
+            "Library 'MISSINGLIB' not found in the index "
+            "(searched: global libraries only). To include a project's own "
+            "libraries, call again with project_path set to that project directory."
         )
 
     def test_symbol_not_in_index_with_empty_name(self):
@@ -1088,4 +1146,4 @@ class TestProjectScopedSymbolLookup:
             )
 
         assert result["success"] is False
-        assert "not found in index (searched: global libraries)" in result["error"]
+        assert "not found in the index (searched: global libraries only)" in result["error"]

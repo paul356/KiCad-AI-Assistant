@@ -1,6 +1,5 @@
 """Tests for LLMClient history management (dedup + compaction)."""
 
-import ast
 import datetime
 import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -22,13 +21,7 @@ import pytest
 
 from kicad_plugin import llm_client
 from kicad_plugin import session_store as sstore
-from kicad_plugin.llm_client import (
-    _PROJECT_SCOPED_SYMBOL_TOOLS,
-    LLMClient,
-    LLMTurnFailure,
-    _inject_active_project,
-    _subprocess_sse_stream,
-)
+from kicad_plugin.llm_client import LLMClient, LLMTurnFailure, _subprocess_sse_stream
 from kicad_plugin.settings import DEFAULT_LLM_USER_AGENT
 from kicad_plugin.tool_registry import TOOL_POLICIES
 
@@ -127,82 +120,6 @@ def _assistant(content="ok", tool_calls=None):
 
 def _tool(tool_call_id="tc1", content="result"):
     return {"role": "tool", "tool_call_id": tool_call_id, "content": content}
-
-
-# ---------------------------------------------------------------------------
-# Active-project injection (issue #255)
-# ---------------------------------------------------------------------------
-
-
-class TestInjectActiveProject:
-    @pytest.mark.parametrize("tool_name", sorted(_PROJECT_SCOPED_SYMBOL_TOOLS))
-    def test_fills_missing_project_path(self, tool_name):
-        args = {"library_name": "Lib", "symbol_name": "Sym"}
-        result = _inject_active_project(tool_name, args, "/p/proj")
-        assert result == {
-            "library_name": "Lib",
-            "symbol_name": "Sym",
-            "project_path": "/p/proj",
-        }
-        # The caller's dict is not mutated.
-        assert args == {"library_name": "Lib", "symbol_name": "Sym"}
-
-    def test_allow_list_matches_tools_declaring_project_path(self):
-        """Keep the defaulting list in lock-step with the tool surface: every
-        symbol tool whose signature declares ``project_path`` must be covered,
-        and no other tool may be. Derived with ``ast`` so a new tool gaining
-        the parameter fails this test instead of silently missing the default.
-        """
-        import kcaa.tools.symbol_tools as symbol_tools
-
-        with open(symbol_tools.__file__, encoding="utf-8") as f:
-            tree = ast.parse(f.read())
-        register = next(
-            node
-            for node in tree.body
-            if isinstance(node, ast.FunctionDef) and node.name == "register_symbol_tools"
-        )
-        declared = set()
-        for node in register.body:
-            if not isinstance(node, ast.AsyncFunctionDef):
-                continue
-            params = [
-                a.arg for a in (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs)
-            ]
-            if "project_path" in params:
-                declared.add(node.name)
-
-        assert declared == _PROJECT_SCOPED_SYMBOL_TOOLS
-
-    def test_null_project_path_is_filled(self):
-        """A provider that emits JSON null for an unset optional must still get
-        the project scope; explicit ``None`` is indistinguishable from omitted."""
-        args = {"library_name": "Lib", "project_path": None}
-        assert _inject_active_project("get_library_symbol", args, "/p/proj") == {
-            "library_name": "Lib",
-            "project_path": "/p/proj",
-        }
-
-    @pytest.mark.parametrize("explicit", ["/other/proj", "relative/proj", "", "../odd"])
-    def test_explicit_project_path_wins(self, explicit):
-        args = {"library_name": "Lib", "project_path": explicit}
-        assert _inject_active_project("get_library_symbol", args, "/p/proj") is args
-
-    def test_mutating_tool_untouched(self):
-        args = {"library_name": "Lib"}
-        assert _inject_active_project("create_symbol", args, "/p/proj") is args
-
-    def test_unlisted_tool_untouched(self):
-        args = {"pcb_path": "/tmp/x.kicad_pcb"}
-        assert _inject_active_project("move_component", args, "/p/proj") is args
-
-    def test_no_active_project_untouched(self):
-        args = {"library_name": "Lib"}
-        assert _inject_active_project("get_library_symbol", args, None) is args
-
-    def test_non_dict_args_untouched(self):
-        args = ["not", "a", "dict"]
-        assert _inject_active_project("get_library_symbol", args, "/p/proj") is args
 
 
 # ---------------------------------------------------------------------------
@@ -1081,123 +998,6 @@ class TestRunIntegration:
 
         assert result == "done"
         mock_compact.assert_called_once()
-
-    def test_run_injects_active_project_into_symbol_lookup(self):
-        """A symbol tool called without project_path defaults to the active
-        project, so project-scoped libraries resolve (issue #255)."""
-        client = _make_client()
-        tool_response = {
-            "finish_reason": "tool_calls",
-            "message": {
-                "content": "",
-                "tool_calls": [
-                    {
-                        "id": "tc1",
-                        "type": "function",
-                        "function": {
-                            "name": "get_library_symbol_pins",
-                            "arguments": json.dumps({"library_name": "Lib", "symbol_name": "Sym"}),
-                        },
-                    }
-                ],
-            },
-        }
-        final_response = {"finish_reason": "stop", "message": {"content": "done"}}
-        client._call_llm = MagicMock(side_effect=[tool_response, final_response])
-        client._enabled_tools = {"get_library_symbol_pins"}
-
-        with patch("kicad_plugin.llm_client.call_mcp_tool") as mock_call_tool:
-            mock_call_tool.return_value = {"success": True}
-            result = client.run("look up Sym", context_block="", active_project="/p/proj")
-
-        assert result == "done"
-        mock_call_tool.assert_called_once()
-        assert mock_call_tool.call_args.args[1:] == (
-            "get_library_symbol_pins",
-            {"library_name": "Lib", "symbol_name": "Sym", "project_path": "/p/proj"},
-        )
-
-    def test_run_does_not_inject_without_active_project(self):
-        client = _make_client()
-        tool_response = {
-            "finish_reason": "tool_calls",
-            "message": {
-                "content": "",
-                "tool_calls": [
-                    {
-                        "id": "tc1",
-                        "type": "function",
-                        "function": {
-                            "name": "get_library_symbol",
-                            "arguments": json.dumps({"library_name": "Lib", "symbol_name": "Sym"}),
-                        },
-                    }
-                ],
-            },
-        }
-        final_response = {"finish_reason": "stop", "message": {"content": "done"}}
-        client._call_llm = MagicMock(side_effect=[tool_response, final_response])
-        client._enabled_tools = {"get_library_symbol"}
-
-        with patch("kicad_plugin.llm_client.call_mcp_tool") as mock_call_tool:
-            mock_call_tool.return_value = {"success": True}
-            client.run("look up Sym", context_block="")
-
-        assert mock_call_tool.call_args.args[2] == {
-            "library_name": "Lib",
-            "symbol_name": "Sym",
-        }
-
-    def test_run_injects_active_project_into_sync(self):
-        """The reported sequence: sync called with {} must reach the project
-        scope, or the following lookup can never see the project library."""
-        client = _make_client()
-        tool_response = {
-            "finish_reason": "tool_calls",
-            "message": {
-                "content": "",
-                "tool_calls": [
-                    {
-                        "id": "tc1",
-                        "type": "function",
-                        "function": {"name": "sync_symbol_index", "arguments": "{}"},
-                    }
-                ],
-            },
-        }
-        final_response = {"finish_reason": "stop", "message": {"content": "done"}}
-        client._call_llm = MagicMock(side_effect=[tool_response, final_response])
-        client._enabled_tools = {"sync_symbol_index"}
-
-        with patch("kicad_plugin.llm_client.call_mcp_tool") as mock_call_tool:
-            mock_call_tool.return_value = {"status": "started"}
-            client.run("sync", context_block="", active_project="/p/proj")
-
-        assert mock_call_tool.call_args.args[1:] == (
-            "sync_symbol_index",
-            {"project_path": "/p/proj"},
-        )
-
-    def test_tool_direct_injects_active_project(self):
-        """Framework tool_direct calls share the same defaulting rule."""
-        client = _make_client()
-
-        with patch("kicad_plugin.llm_client.call_mcp_tool") as mock_call_tool:
-            mock_call_tool.return_value = {"status": "started"}
-            client.run(
-                {
-                    "kind": "tool_direct",
-                    "name": "sync_symbol_index",
-                    "arguments": {},
-                },
-                context_block="",
-                active_project="/p/proj",
-            )
-
-        assert mock_call_tool.call_args.args[1:] == (
-            "sync_symbol_index",
-            {"project_path": "/p/proj"},
-        )
 
     def test_framework_auto_snapshots_and_reloads_mutations(self):
         client = _make_client()
