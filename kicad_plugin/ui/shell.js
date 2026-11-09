@@ -144,8 +144,11 @@ function _shouldScrollBottom() {
     return (sh - ih - sy) < 80;
 }
 
-window._updateConversation = function(entriesJson, scrollBehavior) {
+window._updateConversation = function(entriesJson, scrollMode, replaceDocument) {
     try {
+        // Measure the reader's position before mutating the DOM: new content
+        // changes scrollHeight, so a post-mutation check always looks "away".
+        var stick = _shouldScrollBottom();
         var conv = document.getElementById('conversation');
         if (!conv) return 'error:no conversation div';
         var frag = document.createDocumentFragment();
@@ -153,12 +156,35 @@ window._updateConversation = function(entriesJson, scrollBehavior) {
         for (var i = 0; i < entries.length; i++) {
             frag.appendChild(_renderEntry(entries[i]));
         }
+        // A rebuild must not move the reader or collapse tool results they
+        // expanded: capture both, in document order, before wiping the DOM.
+        // A replacement (session load/restore/clear) starts a fresh document
+        // and must not inherit state from the previous conversation.
+        var replace = replaceDocument === true;
+        var sy = replace ? 0 : window.scrollY;
+        var openRows = [];
+        if (!replace) {
+            var oldRows = document.querySelectorAll('details.tools');
+            for (var j = 0; j < oldRows.length; j++) {
+                openRows.push(oldRows[j].open);
+            }
+        }
         conv.innerHTML = '';
         conv.appendChild(frag);
         var sw = document.getElementById('stream-wrapper');
         if (sw) sw.style.display = 'none';
         document.getElementById('pending-ai-text').innerHTML = '';
-        if (scrollBehavior === 'bottom') {
+        if (!replace) {
+            // Restore by index; a longer new list just gets its defaults (closed).
+            var newRows = document.querySelectorAll('details.tools');
+            for (var k = 0; k < openRows.length && k < newRows.length; k++) {
+                newRows[k].open = openRows[k];
+            }
+        }
+        // A replacement starts at the top (sy === 0); a preserve keeps the
+        // reader's offset.  The browser clamps to the new document's range.
+        window.scrollTo(0, sy);
+        if (scrollMode === 'bottom' || (scrollMode === 'follow' && stick)) {
             window.scrollTo(0, document.body ? document.body.scrollHeight : 0);
         }
         return 'ok:' + entries.length;
@@ -167,8 +193,10 @@ window._updateConversation = function(entriesJson, scrollBehavior) {
     }
 };
 
-window._appendEntry = function(entryJson, scrollBehavior) {
+window._appendEntry = function(entryJson, scrollMode) {
     try {
+        // Measure before appendChild: the new entry itself changes the height.
+        var stick = _shouldScrollBottom();
         var entry = JSON.parse(entryJson);
         var conv = document.getElementById('conversation');
         if (!conv) return 'error:no conversation div';
@@ -176,7 +204,7 @@ window._appendEntry = function(entryJson, scrollBehavior) {
         var sw = document.getElementById('stream-wrapper');
         if (sw) sw.style.display = 'none';
         document.getElementById('pending-ai-text').innerHTML = '';
-        if (scrollBehavior === 'bottom') {
+        if (scrollMode === 'bottom' || (scrollMode === 'follow' && stick)) {
             window.scrollTo(0, document.body ? document.body.scrollHeight : 0);
         }
         return 'ok:' + entry.type;
@@ -185,13 +213,15 @@ window._appendEntry = function(entryJson, scrollBehavior) {
     }
 };
 
-window._updateStream = function(html, scrollToBottom) {
+window._updateStream = function(html, scrollMode) {
     var el = document.getElementById('pending-ai-text');
     if (!el) return;
+    // Measure before replacing the streamed text grows the document.
+    var stick = _shouldScrollBottom();
     el.innerHTML = html;
     var sw = document.getElementById('stream-wrapper');
     if (sw) sw.style.display = '';
-    if (scrollToBottom) {
+    if (scrollMode === 'bottom' || (scrollMode === 'follow' && stick)) {
         window.scrollTo(0, document.body ? document.body.scrollHeight : 0);
     }
 };
