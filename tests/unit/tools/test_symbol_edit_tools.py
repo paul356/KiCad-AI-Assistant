@@ -117,6 +117,73 @@ _PRIVATE_VALUE_LIB_TEXT = """
 )
 """
 
+# Base symbols for the (extends ...) merge tests (issue #261).  KLCBase
+# carries two private fields plus an ordinary field shared with the variants;
+# TLP3123 reproduces the stock KiCad 10 Relay_SolidState base.
+EXTENDS_BASE_PATH = str(Path(__file__).parent / "fixtures/extends_base_symbols.kicad_sym")
+
+# Base KLC_A/KLC_B + variant KLC_C/KLC_D: all four must survive the merge and
+# the placement.  The ordinary "Shared" property exercises override semantics.
+_EXTENDS_PRIVATE_LIB_TEXT = """
+(symbol "DerivedPrivate"
+  (extends "KLCBase")
+  (property "Reference" "U" (at 0 0 0) (effects (font (size 1.27 1.27))))
+  (property "Value" "DerivedPrivate" (at 0 2.54 0)
+    (effects (font (size 1.27 1.27))))
+  (property private "KLC_C" "Derived note C" (at 0 -10.16 0)
+    (effects (font (size 1.27 1.27)) (hide yes)))
+  (property private "KLC_D" "Derived note D" (at 0 -12.7 0)
+    (effects (font (size 1.27 1.27)) (hide yes)))
+  (property "Shared" "derived-shared" (at 0 -15.24 0)
+    (effects (font (size 1.27 1.27)) (hide yes)))
+)
+"""
+
+# The variant redefines the base's KLC_B; the derived value must win and the
+# name must appear exactly once.
+_EXTENDS_OVERRIDE_LIB_TEXT = """
+(symbol "DerivedOverride"
+  (extends "KLCBase")
+  (property private "KLC_B" "Derived note B" (at 0 -5.08 0)
+    (effects (font (size 1.27 1.27)) (hide yes)))
+  (property private "KLC_C" "Derived note C" (at 0 -10.16 0)
+    (effects (font (size 1.27 1.27)) (hide yes)))
+)
+"""
+
+# Stock-shape derived symbol: Relay_SolidState/AQY282S extends TLP3123 and adds
+# a single KLC note.  The base lives in EXTENDS_BASE_PATH.
+_REAL_AQY282S_LIB_TEXT = """
+(symbol "AQY282S"
+  (extends "TLP3123")
+  (property "Reference" "U" (at -5.08 5.08 0)
+    (show_name no) (do_not_autoplace no)
+    (effects (font (size 1.27 1.27)) (justify left)))
+  (property "Value" "AQY282S" (at 0 5.08 0)
+    (show_name no) (do_not_autoplace no)
+    (effects (font (size 1.27 1.27)) (justify left)))
+  (property "Footprint" "Package_SO:SO-4_4.4x4.3mm_P2.54mm" (at -5.08 -5.08 0)
+    (show_name no) (do_not_autoplace no) (hide yes)
+    (effects (font (size 1.27 1.27) (italic yes)) (justify left)))
+  (property "Datasheet" "https://www.lcsc.com/datasheet/C5377929.pdf" (at 0 0 0)
+    (show_name no) (do_not_autoplace no) (hide yes)
+    (effects (font (size 1.27 1.27)) (justify left)))
+  (property "Description" "Solid State Relay (Photo MOSFET) 60V, 0.5A, 2.5Ohm, SO-4"
+    (at 0 0 0) (show_name no) (do_not_autoplace no) (hide yes)
+    (effects (font (size 1.27 1.27))))
+  (property private "KLC_S6.2" "1-Form-A describes the internal structure of the relay"
+    (at 0 -7.62 0) (show_name yes) (do_not_autoplace no) (hide yes)
+    (effects (font (size 1.27 1.27))))
+  (property "ki_keywords" "MOSFET Output Photorelay 1-Form-A" (at 0 0 0)
+    (show_name no) (do_not_autoplace no) (hide yes)
+    (effects (font (size 1.27 1.27))))
+  (property "ki_fp_filters" "SO*4.4x4.3mm*P2.54mm*" (at 0 0 0)
+    (show_name no) (do_not_autoplace no) (hide yes)
+    (effects (font (size 1.27 1.27))))
+  (embedded_fonts no)
+)
+"""
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -153,16 +220,16 @@ def _get_tools() -> dict:
     return mock.tools
 
 
-def _make_mock_manager() -> MagicMock:
+def _make_mock_manager(sym_path: str = TEST_SYM_PATH) -> MagicMock:
     """
     Return a mock SymbolIndexManager whose library/symbol records point at the
-    test_symbols.kicad_sym fixture.  mtime and file_size are set to 0 so that
+    given .kicad_sym fixture.  mtime and file_size are set to 0 so that
     extract_lib_symbol_raw uses the fallback (full-parse) path.
     """
     mgr = MagicMock()
 
     lib_rec = MagicMock()
-    lib_rec.file_path = TEST_SYM_PATH
+    lib_rec.file_path = sym_path
     lib_rec.mtime = 0.0  # force fallback parse
     lib_rec.file_size = 0
 
@@ -228,6 +295,23 @@ def _property_pairs(raw_node: list) -> dict[str, str]:
 def _private_property_nodes(raw_node: list) -> list[list]:
     """Return property nodes carrying the literal ``private`` marker."""
     return [node for node in _property_nodes(raw_node) if _property_parts(node)[0]]
+
+
+def _private_pairs(raw_node: list) -> dict[str, str]:
+    """Extract {name: value} from private properties only."""
+    pairs: dict[str, str] = {}
+    for node in _private_property_nodes(raw_node):
+        _, name_atom, value_atom = _property_parts(node)
+        pairs[_property_atom_text(name_atom)] = _property_atom_text(value_atom)
+    return pairs
+
+
+def _property_identities(raw_node: list) -> list[tuple[bool, str]]:
+    """Return ``(is_private, name)`` for every property, preserving duplicates."""
+    return [
+        (_property_parts(node)[0], _property_atom_text(_property_parts(node)[1]))
+        for node in _property_nodes(raw_node)
+    ]
 
 
 def _effects_hide_yes(node: list) -> bool:
@@ -698,6 +782,152 @@ class TestPrivateLibraryFields:
         for bad in bad_nodes:
             with pytest.raises(ValueError, match="Malformed property node"):
                 _parse_lib_property(bad)
+
+
+class TestExtendsPropertyMerge:
+    """Properties merged from an ``(extends ...)`` base (issue #261).
+
+    The merge key must distinguish private fields by name: the raw second
+    element of ``(property private <name> ...)`` is the literal marker, so
+    keying on it collapses every private field onto one slot.
+    """
+
+    @staticmethod
+    def _resolve(text: str, library_name: str) -> list:
+        import sexpdata
+
+        from kcaa.tools.symbol_edit_tools import _resolve_extends_symbol
+
+        with patch(
+            "kcaa.tools.symbol_edit_tools._get_index_manager",
+            return_value=_make_mock_manager(EXTENDS_BASE_PATH),
+        ):
+            return _resolve_extends_symbol(sexpdata.loads(text), library_name)
+
+    @staticmethod
+    def _place(merged: list) -> list:
+        from kcaa.tools.symbol_edit_tools import _build_placed_symbol
+
+        return _build_placed_symbol(
+            "Device:Derived",
+            10.0,
+            20.0,
+            0,
+            1,
+            "U9",
+            "CUSTOM_VALUE",
+            "sch-uuid",
+            "proj",
+            merged,
+        )
+
+    def test_all_distinct_private_fields_survive_merge_and_placement(self):
+        """Base KLC_A/KLC_B and variant KLC_C/KLC_D all reach the instance."""
+        merged = self._resolve(_EXTENDS_PRIVATE_LIB_TEXT, "Device/DerivedPrivate")
+        expected = {
+            "KLC_A": "Base note A",
+            "KLC_B": "Base note B",
+            "KLC_C": "Derived note C",
+            "KLC_D": "Derived note D",
+        }
+
+        assert _private_pairs(merged) == expected
+        assert len(_private_property_nodes(merged)) == 4
+
+        placed = self._place(merged)
+        assert _private_pairs(placed) == expected
+        assert len(_private_property_nodes(placed)) == 4
+
+    def test_derived_private_field_overrides_same_named_base_field(self):
+        """Same private name: the variant wins and appears exactly once."""
+        merged = self._resolve(_EXTENDS_OVERRIDE_LIB_TEXT, "Device/DerivedOverride")
+
+        assert _private_pairs(merged) == {
+            "KLC_A": "Base note A",
+            "KLC_B": "Derived note B",
+            "KLC_C": "Derived note C",
+        }
+        identities = _property_identities(merged)
+        assert len(identities) == len(set(identities))
+        assert identities.count((True, "KLC_B")) == 1
+
+    def test_ordinary_property_override_semantics_unchanged(self):
+        """Ordinary properties and structural attributes keep today's rules."""
+        import sexpdata
+
+        merged = self._resolve(_EXTENDS_PRIVATE_LIB_TEXT, "Device/DerivedPrivate")
+        ordinary: dict[str, str] = {}
+        for node in _property_nodes(merged):
+            is_private, name_atom, value_atom = _property_parts(node)
+            if not is_private:
+                ordinary[_property_atom_text(name_atom)] = _property_atom_text(value_atom)
+
+        assert ordinary["Shared"] == "derived-shared"
+        assert ordinary["Reference"] == "U"
+        assert ordinary["Value"] == "DerivedPrivate"
+        assert _property_identities(merged).count((False, "Shared")) == 1
+
+        tags = [
+            child[0].value()
+            for child in merged[2:]
+            if isinstance(child, list) and len(child) >= 1 and isinstance(child[0], sexpdata.Symbol)
+        ]
+        assert "exclude_from_sim" in tags
+
+        sub_symbols = [
+            child[1]
+            for child in merged[2:]
+            if isinstance(child, list)
+            and len(child) >= 2
+            and isinstance(child[0], sexpdata.Symbol)
+            and child[0].value() == "symbol"
+        ]
+        assert "DerivedPrivate_0_1" in sub_symbols
+        assert "DerivedPrivate_1_1" in sub_symbols
+
+    def test_private_marker_preserved_after_merge(self):
+        """Every merged private field keeps the ``private`` marker."""
+        import sexpdata
+
+        merged = self._resolve(_EXTENDS_PRIVATE_LIB_TEXT, "Device/DerivedPrivate")
+        serialized = sexpdata.dumps(merged)
+
+        private_names = [name for is_private, name in _property_identities(merged) if is_private]
+        assert sorted(private_names) == ["KLC_A", "KLC_B", "KLC_C", "KLC_D"]
+        for name in private_names:
+            assert f'(property private "{name}"' in serialized
+
+        shared = [
+            node
+            for node in _property_nodes(merged)
+            if _property_atom_text(_property_parts(node)[1]) == "Shared"
+        ]
+        assert len(shared) == 1
+        assert _property_parts(shared[0])[0] is False
+
+    def test_stock_relay_extends_shape_keeps_private_field(self):
+        """Relay_SolidState/AQY282S (extends TLP3123) keeps its KLC note."""
+        merged = self._resolve(_REAL_AQY282S_LIB_TEXT, "Relay_SolidState/AQY282S")
+        private = {"KLC_S6.2": "1-Form-A describes the internal structure of the relay"}
+        assert _private_pairs(merged) == private
+
+        pairs = _property_pairs(merged)
+        assert pairs["Footprint"] == "Package_SO:SO-4_4.4x4.3mm_P2.54mm"
+        assert pairs["Datasheet"] == "https://www.lcsc.com/datasheet/C5377929.pdf"
+        assert pairs["Description"] == ("Solid State Relay (Photo MOSFET) 60V, 0.5A, 2.5Ohm, SO-4")
+
+        placed = self._place(merged)
+        assert _private_pairs(placed) == private
+        placed_pairs = _property_pairs(placed)
+        assert placed_pairs["Footprint"] == pairs["Footprint"]
+        assert placed_pairs["Datasheet"] == pairs["Datasheet"]
+        assert placed_pairs["Description"] == pairs["Description"]
+
+        placed_names = [name for _, name in _property_identities(placed)]
+        assert placed_names.count("Reference") == 1
+        assert placed_names.count("Value") == 1
+        assert "ki_keywords" not in placed_names
+        assert "ki_fp_filters" not in placed_names
 
 
 # ---------------------------------------------------------------------------

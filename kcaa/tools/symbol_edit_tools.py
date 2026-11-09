@@ -1761,6 +1761,19 @@ def _get_extends_base_name(lib_sym_raw: list) -> str | None:
     return None
 
 
+def _lib_property_merge_key(prop_raw: list) -> tuple[bool, str]:
+    """Return the identity a property keeps when base and variant are merged.
+
+    A private property is written ``(property private <name> <value> ...)``, so
+    its second list element is the literal ``private`` marker, not the field
+    name.  Keying on that element would collapse every private field into one
+    slot; the marker therefore belongs in the key, while the name keeps
+    distinct private fields distinct.
+    """
+    parsed = _parse_lib_property(prop_raw)
+    return (parsed.is_private, parsed.name)
+
+
 def _resolve_extends_symbol(
     lib_sym_raw: list, library_name: str, project_path: str | None = None
 ) -> list:
@@ -1841,7 +1854,7 @@ def _resolve_extends_symbol(
 
     # Collect structural attributes and properties from the *extending* symbol.
     ext_structural: dict[str, list] = {}
-    ext_props: dict[str, list] = {}
+    ext_props: dict[tuple[bool, str], list] = {}
     for child in lib_sym_raw[2:]:
         if not (
             isinstance(child, list) and len(child) >= 1 and isinstance(child[0], sexpdata.Symbol)
@@ -1851,7 +1864,7 @@ def _resolve_extends_symbol(
         if tag == "extends":
             continue
         if tag == "property" and len(child) >= 2:
-            ext_props[child[1]] = child
+            ext_props[_lib_property_merge_key(child)] = child
         elif tag not in _META_TAGS:
             ext_structural[tag] = child
 
@@ -1875,7 +1888,7 @@ def _resolve_extends_symbol(
             merged.append(copy.deepcopy(child))
 
     # 2. Properties: base as default, extending overrides.
-    seen_props: set[str] = set()
+    seen_props: set[tuple[bool, str]] = set()
     for child in base_raw[2:]:
         if not (
             isinstance(child, list)
@@ -1885,13 +1898,13 @@ def _resolve_extends_symbol(
             and len(child) >= 2
         ):
             continue
-        pname = child[1]
-        if pname in seen_props:
+        pkey = _lib_property_merge_key(child)
+        if pkey in seen_props:
             continue
-        merged.append(copy.deepcopy(ext_props.get(pname, child)))
-        seen_props.add(pname)
-    for pname, child in ext_props.items():
-        if pname not in seen_props:
+        merged.append(copy.deepcopy(ext_props.get(pkey, child)))
+        seen_props.add(pkey)
+    for pkey, child in ext_props.items():
+        if pkey not in seen_props:
             merged.append(copy.deepcopy(child))
 
     # 3. Sub-symbols: from base, with names re-prefixed to the extending name.
