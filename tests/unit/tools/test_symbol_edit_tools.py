@@ -1266,6 +1266,124 @@ class TestExtendsPropertyMerge:
         assert "boom" in warnings[0]
         assert "not found" not in warnings[0]
 
+    def test_long_extends_base_id_warning_bounded_and_lookup_exact(self):
+        """A 200k-char base id is bounded in the warning, exact in the lookup."""
+        from sexpdata import Symbol as Sexp
+
+        from kcaa.tools.symbol_edit_tools import _resolve_extends_symbol
+
+        long_base = "B" * 200_000
+        variant = [Sexp("symbol"), "Derived", [Sexp("extends"), long_base]]
+        sink: list[str] = []
+        mgr = MagicMock()
+        mgr.get_symbol.return_value = None
+        mgr.get_library_by_name.return_value = None
+
+        with patch("kcaa.tools.symbol_edit_tools._get_index_manager", return_value=mgr):
+            merged = _resolve_extends_symbol(variant, "Device", warnings=sink)
+
+        assert merged == variant
+        assert len(sink) == 1
+        assert len(sink[0]) < 400, len(sink[0])
+        assert "extends base symbol 'Device:BBBBBBBB" in sink[0]
+        assert "..." in sink[0]
+        assert "200000 chars" in sink[0]
+        # Resolution used the exact, untruncated id.
+        assert mgr.get_symbol.call_args.args == ("Device", long_base)
+        assert mgr.get_library_by_name.call_args.args == ("Device",)
+
+    def test_tool_reports_long_base_name_skipped_field_bounded(self, tools, tmp_sch):
+        """The skipped-field warning stays bounded for a 200k-char base name."""
+        import sexpdata
+        from sexpdata import Symbol as Sexp
+
+        from kcaa.utils.symbol_extractor import extract_lib_symbol_raw
+
+        long_base = "B" * 200_000
+        variant_raw = sexpdata.loads(_EXTENDS_PRIVATE_LIB_TEXT)
+        variant_raw[2] = [Sexp("extends"), long_base]  # replace the extends clause
+        base_raw = extract_lib_symbol_raw(EXTENDS_BASE_PATH, 0, "KLCBase", 0.0, 0)
+        base_raw.append([Sexp("property"), "NoValue"])
+        extracted: list[str] = []
+
+        def fake_extract(file_path, file_index, symbol_name, mtime, file_size):
+            extracted.append(symbol_name)
+            return variant_raw if symbol_name == "DerivedPrivate" else base_raw
+
+        with (
+            patch(
+                "kcaa.tools.symbol_edit_tools._get_index_manager",
+                return_value=_make_mock_manager(EXTENDS_BASE_PATH),
+            ),
+            patch(
+                "kcaa.tools.symbol_edit_tools.extract_lib_symbol_raw",
+                side_effect=fake_extract,
+            ),
+        ):
+            result = asyncio.run(
+                tools["add_symbol_to_schematic"](
+                    schematic_path=tmp_sch,
+                    library_name="Device",
+                    symbol_name="DerivedPrivate",
+                    x=50.0,
+                    y=50.0,
+                )
+            )
+
+        assert result.get("success") is True, result
+        warnings = result["warnings"]
+        assert len(warnings) == 1, result
+        assert len(warnings[0]) < 400, len(warnings[0])
+        assert "Skipping unparseable property 'NoValue'" in warnings[0]
+        assert "'BBBBBBBB" in warnings[0]
+        assert "..." in warnings[0]
+        # The base was still looked up and extracted under its exact name.
+        assert long_base in extracted
+
+    def test_long_property_names_keep_distinct_merge_identity(self):
+        """Names longer than the display bound still key by their exact value.
+
+        A merge keyed on the bounded display label would collapse both base
+        fields (they share their first 64 characters) into one identity.
+        """
+        from sexpdata import Symbol as Sexp
+
+        from kcaa.tools.symbol_edit_tools import _resolve_extends_symbol
+
+        prefix = "K" * (64 + 10)
+        name_a = prefix + "_A"
+        name_b = prefix + "_B"
+        base_raw = [
+            Sexp("symbol"),
+            "KLCBase",
+            [Sexp("property"), name_a, "base-a"],
+            [Sexp("property"), name_b, "base-b"],
+        ]
+        variant = [
+            Sexp("symbol"),
+            "Derived",
+            [Sexp("extends"), "KLCBase"],
+            [Sexp("property"), name_a, "derived-a"],
+        ]
+
+        with (
+            patch(
+                "kcaa.tools.symbol_edit_tools._get_index_manager",
+                return_value=_make_mock_manager(EXTENDS_BASE_PATH),
+            ),
+            patch(
+                "kcaa.tools.symbol_edit_tools.extract_lib_symbol_raw",
+                return_value=base_raw,
+            ),
+        ):
+            merged = _resolve_extends_symbol(variant, "Device/Derived")
+
+        assert _property_pairs(merged) == {name_a: "derived-a", name_b: "base-b"}
+        identities = [name for _, name in _property_identities(merged)]
+        assert len(identities) == 2
+        assert identities.count(name_a) == 1
+        assert identities.count(name_b) == 1
+
     def test_tool_places_all_private_fields_end_to_end(self, tools, tmp_sch):
         """add_symbol_to_schematic keeps KLC_A..D in lib_symbols and instance."""
         expected = {

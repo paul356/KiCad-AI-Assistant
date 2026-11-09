@@ -1920,11 +1920,19 @@ def _resolve_extends_symbol(
     mgr = _get_index_manager(project_path)
     base_sym_rec = mgr.get_symbol(base_lib_name, base_name)
     base_lib_rec = mgr.get_library_by_name(base_lib_name)
-    base_symbol_id = f"{base_lib_name}:{base_name}"
+
+    # Diagnostics-only rendering.  The lookup above keeps the exact names: a
+    # long (but valid) symbol id must still resolve, so nothing here feeds
+    # back into resolution.
+    display_base_id = (
+        f"{_bound_text(base_lib_name, _MAX_PROPERTY_NAME_TEXT)}:"
+        f"{_bound_text(base_name, _MAX_PROPERTY_NAME_TEXT)}"
+    )
+    display_base_name = _bound_text(base_name, _MAX_PROPERTY_NAME_TEXT)
 
     if base_sym_rec is None or base_lib_rec is None:
         message = (
-            f"extends base symbol {base_symbol_id!r} not found; "
+            f"extends base symbol {display_base_id!r} not found; "
             "injecting the symbol as-is (schematic may be incomplete)"
         )
         log.warning(message)
@@ -1942,7 +1950,7 @@ def _resolve_extends_symbol(
         )
     except Exception as exc:
         message = (
-            f"Could not extract extends base symbol {base_symbol_id!r}: {exc}; "
+            f"Could not extract extends base symbol {display_base_id!r}: {exc}; "
             "injecting the symbol as-is (schematic may be incomplete)"
         )
         log.warning(message)
@@ -2005,7 +2013,7 @@ def _resolve_extends_symbol(
         except ValueError as exc:
             message = (
                 f"Skipping unparseable property{_property_node_label(child)} "
-                f"in extends base symbol {base_name!r}: {exc}"
+                f"in extends base symbol {display_base_name!r}: {exc}"
             )
             log.warning(message)
             if warnings is not None:
