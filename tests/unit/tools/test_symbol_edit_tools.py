@@ -946,6 +946,99 @@ class TestExtendsPropertyMerge:
         assert all(name != "NoValue" for _, name in _property_identities(merged))
         assert "Skipping unparseable property" in caplog.text
 
+    def test_bare_property_base_node_skipped_like_any_unparseable_field(self, caplog):
+        """A base ``(property)`` node with no name/value is dropped and logged.
+
+        The drop must go through the same guarded path as every other
+        unparseable base field; a bare node must not slip past a prefilter.
+        """
+        import logging
+
+        import sexpdata
+        from sexpdata import Symbol as Sexp
+
+        from kcaa.tools.symbol_edit_tools import _resolve_extends_symbol
+        from kcaa.utils.symbol_extractor import extract_lib_symbol_raw
+
+        base_raw = extract_lib_symbol_raw(EXTENDS_BASE_PATH, 0, "KLCBase", 0.0, 0)
+        bare = [Sexp("property")]
+        base_raw.append(bare)
+        variant = sexpdata.loads(_EXTENDS_PRIVATE_LIB_TEXT)
+        sink: list[str] = []
+
+        with (
+            patch(
+                "kcaa.tools.symbol_edit_tools._get_index_manager",
+                return_value=_make_mock_manager(EXTENDS_BASE_PATH),
+            ),
+            patch(
+                "kcaa.tools.symbol_edit_tools.extract_lib_symbol_raw",
+                return_value=base_raw,
+            ),
+            caplog.at_level(logging.WARNING),
+        ):
+            merged = _resolve_extends_symbol(variant, "Device/DerivedPrivate", warnings=sink)
+
+        assert bare not in merged
+        assert _private_pairs(merged) == {
+            "KLC_A": "Base note A",
+            "KLC_B": "Base note B",
+            "KLC_C": "Derived note C",
+            "KLC_D": "Derived note D",
+        }
+        assert "Skipping unparseable property" in caplog.text
+        assert len(sink) == 1
+        assert "extends base symbol 'KLCBase'" in sink[0]
+
+    def test_tool_reports_skipped_base_field_as_warning(self, tools, tmp_sch):
+        """add_symbol_to_schematic returns the dropped base field as a warning."""
+        import sexpdata
+        from sexpdata import Symbol as Sexp
+
+        from kcaa.utils.symbol_extractor import extract_lib_symbol_raw
+
+        base_raw = extract_lib_symbol_raw(EXTENDS_BASE_PATH, 0, "KLCBase", 0.0, 0)
+        base_raw.append([Sexp("property"), "NoValue"])
+        variant_raw = sexpdata.loads(_EXTENDS_PRIVATE_LIB_TEXT)
+
+        def fake_extract(file_path, file_index, symbol_name, mtime, file_size):
+            return variant_raw if symbol_name == "DerivedPrivate" else base_raw
+
+        with (
+            patch(
+                "kcaa.tools.symbol_edit_tools._get_index_manager",
+                return_value=_make_mock_manager(EXTENDS_BASE_PATH),
+            ),
+            patch(
+                "kcaa.tools.symbol_edit_tools.extract_lib_symbol_raw",
+                side_effect=fake_extract,
+            ),
+        ):
+            result = asyncio.run(
+                tools["add_symbol_to_schematic"](
+                    schematic_path=tmp_sch,
+                    library_name="Device",
+                    symbol_name="DerivedPrivate",
+                    x=50.0,
+                    y=50.0,
+                )
+            )
+
+        assert result.get("success") is True, result
+        warnings = result.get("warnings")
+        assert isinstance(warnings, list) and len(warnings) == 1, result
+        assert "NoValue" in warnings[0]
+        assert "KLCBase" in warnings[0]
+
+        # The skipped field must not abort the merge of the remaining ones.
+        sch = skip.Schematic(tmp_sch)
+        assert _private_pairs(sch.lib_symbols["Device:DerivedPrivate"].raw) == {
+            "KLC_A": "Base note A",
+            "KLC_B": "Base note B",
+            "KLC_C": "Derived note C",
+            "KLC_D": "Derived note D",
+        }
+
     def test_malformed_variant_property_still_raises(self):
         """A malformed variant field keeps failing instead of being skipped."""
         from sexpdata import Symbol as Sexp
@@ -988,6 +1081,7 @@ class TestExtendsPropertyMerge:
                 )
             )
         assert result.get("success") is True, result
+        assert result.get("warnings") == [], result
 
         sch = skip.Schematic(tmp_sch)
         lib_symbol = sch.lib_symbols["Device:DerivedPrivate"]

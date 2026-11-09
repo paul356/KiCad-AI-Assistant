@@ -1005,8 +1005,13 @@ def _do_add_symbol(
 
         # Expand (extends ...) symbols into self-contained definitions so that
         # the injected lib_symbol has full geometry and pin sub-symbols.
+        # Fields the merge has to drop are reported in the tool response.
+        warnings: list[str] = []
         lib_sym_raw = _resolve_extends_symbol(
-            lib_sym_raw, library_name, project_path=schematic_path
+            lib_sym_raw,
+            library_name,
+            project_path=schematic_path,
+            warnings=warnings,
         )
 
         try:
@@ -1094,7 +1099,7 @@ def _do_add_symbol(
             "position": {"x": x, "y": y},
             "position_adjusted": x != original_x or y != original_y,
             "body_bbox": body_bbox,
-            "warnings": [],
+            "warnings": warnings,
             "file_modified": schematic_path,
             "backup_path": schematic_path + ".bak",
         }
@@ -1777,8 +1782,28 @@ def _lib_property_merge_key(prop_raw: list) -> str:
     return _parse_lib_property(prop_raw).name
 
 
+def _property_node_label(prop_raw: list) -> str:
+    """Return a `` <name>`` suffix naming a property node that failed to parse.
+
+    The second element is the field name, or the literal ``private`` marker.
+    Returns an empty string when the node carries neither (e.g. a bare
+    ``(property)``), so the message can still name the base symbol.
+    """
+    if len(prop_raw) < 2:
+        return ""
+    atom = prop_raw[1]
+    if isinstance(atom, sexpdata.Symbol):
+        return f" {atom.value()!r}"
+    if isinstance(atom, str):
+        return f" {atom!r}"
+    return ""
+
+
 def _resolve_extends_symbol(
-    lib_sym_raw: list, library_name: str, project_path: str | None = None
+    lib_sym_raw: list,
+    library_name: str,
+    project_path: str | None = None,
+    warnings: list[str] | None = None,
 ) -> list:
     """Resolve an ``(extends ...)`` lib symbol into a fully self-contained definition.
 
@@ -1809,6 +1834,9 @@ def _resolve_extends_symbol(
         project_path: Optional project directory or file inside one, used to
             scope the index lookup so base symbols in project-local
             libraries resolve.
+        warnings: Optional sink.  One human-readable message per unparseable
+            base property is appended to it, so tool callers see the dropped
+            fields instead of relying on the server log alone.
     """
     base_name = _get_extends_base_name(lib_sym_raw)
     if base_name is None:
@@ -1898,17 +1926,18 @@ def _resolve_extends_symbol(
             and len(child) >= 1
             and isinstance(child[0], sexpdata.Symbol)
             and child[0].value() == "property"
-            and len(child) >= 2
         ):
             continue
         try:
             pkey = _lib_property_merge_key(child)
         except ValueError as exc:
-            log.warning(
-                "Skipping unparseable property in extends base symbol %r: %s",
-                base_name,
-                exc,
+            message = (
+                f"Skipping unparseable property{_property_node_label(child)} "
+                f"in extends base symbol {base_name!r}: {exc}"
             )
+            log.warning(message)
+            if warnings is not None:
+                warnings.append(message)
             continue
         if pkey in seen_props:
             continue
