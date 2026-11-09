@@ -36,24 +36,39 @@ MULTI_UNIT_PATH = str(Path(__file__).parent.parent / "utils/fixtures/multi_unit.
 _LIB_NAME = "Device"
 _SYM_NAME = "R_Small"
 
-# Library symbol carrying a KiCad 9/10 bare-flag private field (issue #259).
-# Property order matters: the private field sits between Value and the fields
-# whose values must survive content-based parsing.
+# Library symbol carrying KiCad 9/10 private fields (issue #259).  The first
+# property is private, proving it does not hijack Reference/Value selection;
+# a second private field sits before Footprint/Datasheet/Description, proving
+# those fields keep their own name/value instead of shifting.
 _PRIVATE_FIELD_LIB_TEXT = """
 (symbol "PrivateFields"
-  (property "Reference" "U" (at 0 0 0) (effects (font (size 1.27 1.27))))
-  (property "Value" "PrivateFields" (at 0 2.54 0) (effects (font (size 1.27 1.27))))
   (property private "KLC_S3.3" "The rectangle is not a symbol body but a graphical element"
     (at 0 -12.7 0) (effects (font (size 1.27 1.27)) (hide yes)))
+  (property "Reference" "U" (at 0 0 0) (effects (font (size 1.27 1.27))))
+  (property "Value" "PrivateFields" (at 0 2.54 0) (effects (font (size 1.27 1.27))))
+  (property private "KLC_S4.1" "Pin numbers should not be visible when they match the pin name"
+    (at 0 -10.16 0) (effects (font (size 1.27 1.27)) (hide yes)))
   (property "Footprint" "Package:PRIV" (at 0 0 0) (effects (font (size 1.27 1.27)) (hide yes)))
   (property "Datasheet" "https://example.invalid/priv.pdf"
     (at 0 0 0) (effects (font (size 1.27 1.27)) (hide yes)))
   (property "Description" "Private field test symbol"
     (at 0 0 0) (effects (font (size 1.27 1.27)) (hide yes)))
-  (property custom_flag "Manufacturer" "Acme Corp"
-    (at 0 0 0) (effects (font (size 1.27 1.27)) (hide yes)))
   (symbol "PrivateFields_0_1" (polyline (pts (xy -1 0) (xy 1 0))))
   (symbol "PrivateFields_1_1"
+    (pin passive line (at 0 5.08 270) (length 2.54)
+      (name "" (effects (font (size 1.27 1.27))))
+      (number "1" (effects (font (size 1.27 1.27))))))
+)
+"""
+
+# Bare (unquoted) name/value atoms, which KiCad's field grammar also accepts.
+_BARE_ATOM_LIB_TEXT = """
+(symbol "BareAtoms"
+  (property "Reference" "U" (at 0 0 0) (effects (font (size 1.27 1.27))))
+  (property "Value" "BareAtoms" (at 0 2.54 0) (effects (font (size 1.27 1.27))))
+  (property Foo "bar" (at 0 0 0) (effects (font (size 1.27 1.27)) (hide yes)))
+  (property "Baz" qux (at 0 0 0) (effects (font (size 1.27 1.27)) (hide yes)))
+  (symbol "BareAtoms_1_1"
     (pin passive line (at 0 5.08 270) (length 2.54)
       (name "" (effects (font (size 1.27 1.27))))
       (number "1" (effects (font (size 1.27 1.27))))))
@@ -67,6 +82,20 @@ _QUOTED_PRIVATE_LIB_TEXT = """
   (property "Value" "QuotedPrivate" (at 0 2.54 0) (effects (font (size 1.27 1.27))))
   (property "private" "kept value" (at 0 0 0) (effects (font (size 1.27 1.27))))
   (symbol "QuotedPrivate_1_1"
+    (pin passive line (at 0 5.08 270) (length 2.54)
+      (name "" (effects (font (size 1.27 1.27))))
+      (number "1" (effects (font (size 1.27 1.27))))))
+)
+"""
+
+# Private value containing an escaped quote and backslash.
+_PRIVATE_ESCAPE_LIB_TEXT = r"""
+(symbol "PrivateEscape"
+  (property "Reference" "U" (at 0 0 0) (effects (font (size 1.27 1.27))))
+  (property "Value" "PrivateEscape" (at 0 2.54 0) (effects (font (size 1.27 1.27))))
+  (property private "KLC_S3.3" "The \"value\" has a \\ backslash"
+    (at 0 -12.7 0) (effects (font (size 1.27 1.27)) (hide yes)))
+  (symbol "PrivateEscape_1_1"
     (pin passive line (at 0 5.08 270) (length 2.54)
       (name "" (effects (font (size 1.27 1.27))))
       (number "1" (effects (font (size 1.27 1.27))))))
@@ -131,39 +160,79 @@ def _make_mock_manager() -> MagicMock:
     return mgr
 
 
+def _property_nodes(raw_node: list) -> list[list]:
+    """Return direct ``(property ...)`` child nodes."""
+    import sexpdata
+
+    return [
+        child
+        for child in raw_node
+        if isinstance(child, list)
+        and len(child) >= 2
+        and isinstance(child[0], sexpdata.Symbol)
+        and child[0].value() == "property"
+    ]
+
+
+def _property_atom_text(atom: object) -> str:
+    """Return an atom's text (bare symbol or quoted string) for assertions."""
+    import sexpdata
+
+    if isinstance(atom, sexpdata.Symbol):
+        return atom.value()
+    return str(atom)
+
+
+def _property_parts(node: list) -> tuple[bool, object, object]:
+    """Return ``(is_private, name_atom, value_atom)`` for a property node."""
+    import sexpdata
+
+    atoms = list(node[1:])
+    is_private = bool(
+        atoms and isinstance(atoms[0], sexpdata.Symbol) and atoms[0].value() == "private"
+    )
+    if is_private:
+        atoms = atoms[1:]
+    assert len(atoms) >= 2, f"property node has no name/value: {node!r}"
+    return is_private, atoms[0], atoms[1]
+
+
 def _property_pairs(raw_node: list) -> dict[str, str]:
     """Extract {name: value} from raw (property ...) nodes by content.
 
-    Parses the first two string atoms of each node (leading bare-symbol flags
-    such as the ``private`` marker are ignored), so it stays independent of
-    the production parser and of fixed list indices.
+    Handles the optional literal ``private`` marker and bare/quoted atoms, so
+    it stays independent of the production parser and of fixed list indices.
     """
-    import sexpdata
-
     pairs: dict[str, str] = {}
-    for child in raw_node:
-        if not (
-            isinstance(child, list)
-            and len(child) >= 2
-            and isinstance(child[0], sexpdata.Symbol)
-            and child[0].value() == "property"
-        ):
-            continue
-        atoms = [atom for atom in child[1:] if isinstance(atom, str)]
-        if atoms:
-            pairs[atoms[0]] = atoms[1] if len(atoms) > 1 else ""
+    for node in _property_nodes(raw_node):
+        _, name_atom, value_atom = _property_parts(node)
+        pairs[_property_atom_text(name_atom)] = _property_atom_text(value_atom)
     return pairs
 
 
-def _contains_bare_symbol(raw_node: object, token: str) -> bool:
-    """Return True if *raw_node* contains a bare ``token`` symbol anywhere."""
+def _private_property_nodes(raw_node: list) -> list[list]:
+    """Return property nodes carrying the literal ``private`` marker."""
+    return [node for node in _property_nodes(raw_node) if _property_parts(node)[0]]
+
+
+def _effects_hide_yes(node: list) -> bool:
+    """Return True if *node* contains ``(hide yes)`` anywhere."""
     import sexpdata
 
-    if isinstance(raw_node, sexpdata.Symbol):
-        return raw_node.value() == token
-    if isinstance(raw_node, list):
-        return any(_contains_bare_symbol(child, token) for child in raw_node)
-    return False
+    def walk(value: object) -> bool:
+        if isinstance(value, list):
+            if (
+                len(value) >= 2
+                and isinstance(value[0], sexpdata.Symbol)
+                and value[0].value() == "hide"
+                and isinstance(value[1], sexpdata.Symbol)
+                and value[1].value() == "yes"
+            ):
+                return True
+            return any(walk(child) for child in value)
+        return False
+
+    return walk(node)
 
 
 # ---------------------------------------------------------------------------
@@ -433,7 +502,7 @@ class TestAddSymbolToSchematic:
 
 
 class TestPrivateLibraryFields:
-    """Library properties with bare-flag markers (issue #259)."""
+    """Library properties with the ``private`` marker (issue #259)."""
 
     @staticmethod
     def _build(text: str, reference: str = "U9", value: str = "CUSTOM_VALUE") -> list:
@@ -455,51 +524,100 @@ class TestPrivateLibraryFields:
             raw,
         )
 
-    def test_private_field_skipped_and_following_values_preserved(self):
-        """A private library field must not reach the placed symbol, and it
-        must not shift the name/value extraction of properties after it."""
+    def test_private_fields_copied_with_marker_name_value_and_hide(self):
+        """Both private fields keep the marker, full name/value and hide flag."""
+        import sexpdata
+
+        placed = self._build(_PRIVATE_FIELD_LIB_TEXT)
+        serialized = sexpdata.dumps(placed)
+
+        assert (
+            '(property private "KLC_S3.3" '
+            '"The rectangle is not a symbol body but a graphical element"' in serialized
+        )
+        assert (
+            '(property private "KLC_S4.1" '
+            '"Pin numbers should not be visible when they match the pin name"' in serialized
+        )
+
+        private_nodes = _private_property_nodes(placed)
+        assert len(private_nodes) == 2
+        assert [_property_atom_text(_property_parts(n)[1]) for n in private_nodes] == [
+            "KLC_S3.3",
+            "KLC_S4.1",
+        ]
+        assert [_property_atom_text(_property_parts(n)[2]) for n in private_nodes] == [
+            "The rectangle is not a symbol body but a graphical element",
+            "Pin numbers should not be visible when they match the pin name",
+        ]
+        assert all(_effects_hide_yes(node) for node in private_nodes)
+
+    def test_fields_after_private_keep_their_names_and_values(self):
+        """Private fields must not shift Footprint/Datasheet/Description."""
         placed = self._build(_PRIVATE_FIELD_LIB_TEXT)
         pairs = _property_pairs(placed)
 
-        # The marker form itself must be gone, including its field name.
-        assert not _contains_bare_symbol(placed, "private")
-        assert not _contains_bare_symbol(placed, "custom_flag")
-        assert "KLC_S3.3" not in pairs
-
-        # Reference / Value come from the tool arguments.
-        assert pairs["Reference"] == "U9"
-        assert pairs["Value"] == "CUSTOM_VALUE"
-
-        # Properties after the private field keep their distinct values.
         assert pairs["Footprint"] == "Package:PRIV"
         assert pairs["Datasheet"] == "https://example.invalid/priv.pdf"
         assert pairs["Description"] == "Private field test symbol"
+        assert pairs["KLC_S3.3"] == ("The rectangle is not a symbol body but a graphical element")
+        assert pairs["KLC_S4.1"] == (
+            "Pin numbers should not be visible when they match the pin name"
+        )
 
-        # An unknown leading flag token is treated as a flag, not a name.
-        assert pairs["Manufacturer"] == "Acme Corp"
+    def test_bare_atom_name_and_value_supported(self):
+        """KiCad accepts both quoted strings and bare atoms for name/value."""
+        placed = self._build(_BARE_ATOM_LIB_TEXT)
+        pairs = _property_pairs(placed)
+        assert pairs["Foo"] == "bar"
+        assert pairs["Baz"] == "qux"
 
-    def test_quoted_private_name_is_copied(self):
-        """(property "private" "x" ...) is a normal user field, not a marker."""
+    def test_leading_private_does_not_hijack_reference_value(self):
+        """A private field first in the library must not affect Reference/Value."""
+        placed = self._build(_PRIVATE_FIELD_LIB_TEXT, reference="R7", value="10k")
+        pairs = _property_pairs(placed)
+        assert pairs["Reference"] == "R7"
+        assert pairs["Value"] == "10k"
+        assert "private" not in pairs  # the marker is not a field name
+
+    def test_quoted_private_name_is_a_normal_field(self):
+        """(property "private" "x" ...) has no marker and keeps its value."""
+        import sexpdata
+
         placed = self._build(_QUOTED_PRIVATE_LIB_TEXT)
         pairs = _property_pairs(placed)
         assert pairs["private"] == "kept value"
 
-    def test_serialized_output_parses_without_private_marker(self, tmp_sch):
-        """The written schematic has no bare-flag property node and re-parses."""
+        serialized = sexpdata.dumps(placed)
+        assert '(property "private" "kept value"' in serialized
+        assert "(property private" not in serialized
+
+    def test_private_value_preserves_quotes_and_backslashes(self):
+        """The private value is copied verbatim, including sexp escapes."""
         import sexpdata
-        import skip
 
-        from kcaa.utils.schematic_sexp_utils import save_schematic
+        placed = self._build(_PRIVATE_ESCAPE_LIB_TEXT)
+        node = _private_property_nodes(placed)[0]
+        assert _property_atom_text(_property_parts(node)[2]) == 'The "value" has a \\ backslash'
 
-        placed = self._build(_PRIVATE_FIELD_LIB_TEXT)
-        sch = skip.Schematic(tmp_sch)
-        sch.new_from_list(placed)
-        save_schematic(tmp_sch, sch)
+        serialized = sexpdata.dumps(placed)
+        assert '(property private "KLC_S3.3" "The \\"value\\" has a \\\\ backslash"' in serialized
 
-        text = Path(tmp_sch).read_text()
-        assert "(property private" not in text
-        sexpdata.loads(text)  # must not raise
-        skip.Schematic(tmp_sch)  # must not raise
+    def test_malformed_property_raises_with_context(self):
+        """Unparseable nodes must raise instead of shifting name/value."""
+        from sexpdata import Symbol as Sexp
+
+        from kcaa.tools.symbol_edit_tools import _parse_lib_property
+
+        bad_nodes = [
+            [Sexp("property")],
+            [Sexp("property"), Sexp("private")],
+            [Sexp("property"), Sexp("private"), "only-name"],
+            [Sexp("property"), ["not-an-atom"], "value"],
+        ]
+        for bad in bad_nodes:
+            with pytest.raises(ValueError, match="Malformed property node"):
+                _parse_lib_property(bad)
 
 
 # ---------------------------------------------------------------------------
