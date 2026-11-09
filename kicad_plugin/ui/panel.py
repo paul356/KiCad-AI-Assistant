@@ -76,6 +76,25 @@ _EDITABLE_INSTALL_MESSAGE = (
 )
 
 
+# Prompt-field drag limits.  The default is DIP-scaled at the call site; the
+# helper below stays DPI-free so it can be unit-tested without wx.
+_PROMPT_MIN_HEIGHT = 28
+
+
+def _prompt_height_for_drag(
+    start_height: int, dy: int, max_height: int, min_height: int = _PROMPT_MIN_HEIGHT
+) -> int:
+    """New prompt-field height for a pointer delta.
+
+    ``dy`` is positive when the pointer moved up (grow).  ``max_height`` is the
+    cap measured at drag start: the current height plus whatever vertical
+    space the conversation view can give up before its 120 px floor.  The
+    result is clamped to ``[min_height, max(min_height, max_height)]``; when
+    the cap is below the minimum, the minimum wins.
+    """
+    return max(min_height, min(max(min_height, max_height), start_height + dy))
+
+
 def _elide_tool_result_image(result: Any) -> Any:
     """Shallow-copy a tool result for UI display, eliding base64 image data.
 
@@ -282,6 +301,9 @@ if _WX_AVAILABLE:
         _C_GREY = (140, 140, 140)  # Grey   – idle status dot
         _BG_CONV = wx.Colour(245, 247, 252)  # Very light blue-grey conversation bg
         _BG_TOOL = wx.Colour(250, 248, 240)  # Warm off-white tool-log bg
+        # Separator bar above the prompt field; mid-grey reads on light and dark
+        # themes without competing with the native text control.
+        _BG_GRIP = wx.Colour(198, 203, 213)
 
         # Hex equivalents for HTML rendering
         _C_USER_HEX = "#2255CC"
@@ -471,6 +493,18 @@ if _WX_AVAILABLE:
             )
             self._attachments_sizer_item.Show(False)  # hidden until images attached
 
+            # ---- Prompt-field drag grip ----
+            # Thin full-width bar; dragging vertically resizes the input below.
+            grip_h = panel.FromDIP(6)
+            self._prompt_grip = wx.Panel(panel, size=(-1, grip_h), style=wx.BORDER_NONE)
+            self._prompt_grip.SetBackgroundColour(self._BG_GRIP)
+            self._prompt_grip.SetCursor(wx.Cursor(wx.CURSOR_SIZENS))
+            self._prompt_grip.SetToolTip("Drag to resize the prompt field (double-click to reset)")
+            vbox.Add(self._prompt_grip, 0, wx.LEFT | wx.RIGHT | wx.EXPAND, 4)
+            self._prompt_drag_start_y: int | None = None
+            self._prompt_drag_start_height = 0
+            self._prompt_drag_max_height = 0
+
             # ---- Input row ----
             #  [📎] [____ Ask the AI assistant… ____] [ ●  ]
             #  Attach  Text input (expands)         [➤/⬛]
@@ -491,6 +525,8 @@ if _WX_AVAILABLE:
                 panel, style=wx.TE_PROCESS_ENTER | wx.TE_MULTILINE | wx.BORDER_SIMPLE
             )
             self._input.SetHint("Ask the AI assistant…")
+            # Original min size, restored by double-clicking the grip.
+            self._prompt_default_min_size = self._input.GetMinSize()
             hbox.Add(self._input, 1, wx.EXPAND)
 
             # Right-hand column: status dot on top, Send/Stop toggle below.
@@ -571,6 +607,12 @@ if _WX_AVAILABLE:
             self._input.Bind(wx.EVT_CHAR_HOOK, self._on_input_key)
             # Enable drag-and-drop of images and PDFs onto the input box.
             self._input.SetDropTarget(_FileDropTarget(self))
+            # Prompt-field height drag.
+            self._prompt_grip.Bind(wx.EVT_LEFT_DOWN, self._on_prompt_grip_down)
+            self._prompt_grip.Bind(wx.EVT_MOTION, self._on_prompt_grip_motion)
+            self._prompt_grip.Bind(wx.EVT_LEFT_UP, self._on_prompt_grip_up)
+            self._prompt_grip.Bind(wx.EVT_LEFT_DCLICK, self._on_prompt_grip_dclick)
+            self._prompt_grip.Bind(wx.EVT_MOUSE_CAPTURE_LOST, self._on_prompt_grip_capture_lost)
             self.Bind(wx.EVT_MENU, self._on_settings, id=wx.ID_PREFERENCES)
             self.Bind(wx.EVT_MENU, self._on_new_session, id=self._menu_new_session_id)
             self.Bind(wx.EVT_MENU, self._on_load_session, id=self._menu_load_session_id)
@@ -1186,6 +1228,65 @@ if _WX_AVAILABLE:
                 if self._clipboard_has_bitmap():
                     self._on_paste_from_clipboard()
                     return
+            event.Skip()
+
+        # ------------------------------------------------------------------ #
+        # Prompt-field height drag
+        # ------------------------------------------------------------------ #
+
+        def _on_prompt_grip_down(self, event) -> None:
+            """Start a prompt-field resize drag.
+
+            Screen coordinates are stored so the grab point does not jump when
+            the pointer leaves the grip.  The cap is measured here: the
+            conversation view is proportion=1, so any height above its 120 px
+            floor can be handed to the prompt field — this accounts for the
+            attachments strip and search bar whenever they are visible.
+            """
+            if not self._prompt_grip.HasCapture():
+                self._prompt_grip.CaptureMouse()
+            self._prompt_drag_start_y = wx.GetMousePosition().y
+            self._prompt_drag_start_height = self._input.GetSize().height
+            self._prompt_drag_max_height = self._prompt_drag_start_height + max(
+                0, self._conv_view.GetSize().height - 120
+            )
+            event.Skip()
+
+        def _on_prompt_grip_motion(self, event) -> None:
+            """Resize the prompt field while the grip drag is active."""
+            if self._prompt_drag_start_y is None:
+                return
+            if not event.LeftIsDown():
+                # EVT_LEFT_UP was missed (e.g. capture was lost): hovering the
+                # grip must not keep resizing.
+                self._prompt_drag_start_y = None
+                return
+            new_h = _prompt_height_for_drag(
+                self._prompt_drag_start_height,
+                self._prompt_drag_start_y - wx.GetMousePosition().y,
+                self._prompt_drag_max_height,
+                self._ui_panel.FromDIP(_PROMPT_MIN_HEIGHT),
+            )
+            self._input.SetMinSize((-1, new_h))
+            self._ui_panel.Layout()
+
+        def _on_prompt_grip_up(self, event) -> None:
+            """Finish a prompt-field resize drag."""
+            if self._prompt_grip.HasCapture():
+                self._prompt_grip.ReleaseMouse()
+            self._prompt_drag_start_y = None
+            event.Skip()
+
+        def _on_prompt_grip_capture_lost(self, event) -> None:
+            """Stop tracking a drag when another widget steals the mouse."""
+            self._prompt_drag_start_y = None
+            event.Skip()
+
+        def _on_prompt_grip_dclick(self, event) -> None:
+            """Restore the prompt field's height captured at construction."""
+            self._prompt_drag_start_y = None
+            self._input.SetMinSize(self._prompt_default_min_size)
+            self._ui_panel.Layout()
             event.Skip()
 
         # ------------------------------------------------------------------ #

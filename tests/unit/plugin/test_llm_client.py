@@ -7,6 +7,7 @@ import io
 import json
 import logging
 import os
+from pathlib import Path
 import re
 import ssl
 import sys
@@ -2559,6 +2560,17 @@ class TestOpenAICompatibleRequests:
         client._settings.llm_user_agent = ""
 
         assert client._user_agent() == llm_client._LLM_USER_AGENT
+
+    def test_fallback_user_agent_version_matches_pyproject(self):
+        """The fallback UA embeds the release version, so it must track
+        pyproject.toml (the plugin package has no __version__)."""
+        pyproject = Path(__file__).resolve().parents[3] / "pyproject.toml"
+        match = re.search(r'(?m)^version\s*=\s*"([^"]+)"', pyproject.read_text(encoding="utf-8"))
+        assert match is not None, "[project].version not found in pyproject.toml"
+        version = match.group(1)
+        expected = f"KiCad-AI-Assistant/{version} (+https://github.com/paul356/KiCad-AI-Assistant)"
+
+        assert expected == llm_client._LLM_USER_AGENT
 
 
 # ---------------------------------------------------------------------------
