@@ -151,6 +151,24 @@ _EXTENDS_OVERRIDE_LIB_TEXT = """
 )
 """
 
+# Same field name with a changed private flag: the variant node replaces the
+# base node and the surviving node carries the variant's own marker.
+_EXTENDS_PUBLIC_OVERRIDE_LIB_TEXT = """
+(symbol "DerivedPublicOverride"
+  (extends "KLCBase")
+  (property "KLC_A" "Derived public note A" (at 0 -2.54 0)
+    (effects (font (size 1.27 1.27)) (hide yes)))
+)
+"""
+
+_EXTENDS_PRIVATE_OVERRIDE_PUBLIC_LIB_TEXT = """
+(symbol "DerivedPrivateOverridePublic"
+  (extends "KLCPublicBase")
+  (property private "KLC_A" "Derived private note A" (at 0 -2.54 0)
+    (effects (font (size 1.27 1.27)) (hide yes)))
+)
+"""
+
 # Stock-shape derived symbol: Relay_SolidState/AQY282S extends TLP3123 and adds
 # a single KLC note.  The base lives in EXTENDS_BASE_PATH.
 _REAL_AQY282S_LIB_TEXT = """
@@ -312,6 +330,18 @@ def _property_identities(raw_node: list) -> list[tuple[bool, str]]:
         (_property_parts(node)[0], _property_atom_text(_property_parts(node)[1]))
         for node in _property_nodes(raw_node)
     ]
+
+
+def _single_property(raw_node: list, name: str) -> tuple[bool, str]:
+    """Return ``(is_private, value)`` for the sole property called *name*."""
+    nodes = [
+        node
+        for node in _property_nodes(raw_node)
+        if _property_atom_text(_property_parts(node)[1]) == name
+    ]
+    assert len(nodes) == 1, f"expected one {name!r} property, got {len(nodes)}"
+    is_private, _, value_atom = _property_parts(nodes[0])
+    return is_private, _property_atom_text(value_atom)
 
 
 def _effects_hide_yes(node: list) -> bool:
@@ -850,6 +880,31 @@ class TestExtendsPropertyMerge:
         identities = _property_identities(merged)
         assert len(identities) == len(set(identities))
         assert identities.count((True, "KLC_B")) == 1
+
+    def test_derived_public_field_overrides_base_private_field(self):
+        """Same name, derived public: one node, derived value, no marker."""
+        merged = self._resolve(_EXTENDS_PUBLIC_OVERRIDE_LIB_TEXT, "Device/DerivedPublicOverride")
+
+        assert _single_property(merged, "KLC_A") == (False, "Derived public note A")
+        assert _private_pairs(merged)["KLC_B"] == "Base note B"
+
+        placed = self._place(merged)
+        assert _single_property(placed, "KLC_A") == (False, "Derived public note A")
+        assert "KLC_A" not in _private_pairs(placed)
+
+    def test_derived_private_field_overrides_base_public_field(self):
+        """Same name, derived private: one node, derived value, marker kept."""
+        merged = self._resolve(
+            _EXTENDS_PRIVATE_OVERRIDE_PUBLIC_LIB_TEXT,
+            "Device/DerivedPrivateOverridePublic",
+        )
+
+        assert _single_property(merged, "KLC_A") == (True, "Derived private note A")
+        assert _private_pairs(merged) == {"KLC_A": "Derived private note A"}
+
+        placed = self._place(merged)
+        assert _single_property(placed, "KLC_A") == (True, "Derived private note A")
+        assert _private_pairs(placed) == {"KLC_A": "Derived private note A"}
 
     def test_ordinary_property_override_semantics_unchanged(self):
         """Ordinary properties and structural attributes keep today's rules."""

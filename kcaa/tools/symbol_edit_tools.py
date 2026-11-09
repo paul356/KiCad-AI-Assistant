@@ -1761,17 +1761,17 @@ def _get_extends_base_name(lib_sym_raw: list) -> str | None:
     return None
 
 
-def _lib_property_merge_key(prop_raw: list) -> tuple[bool, str]:
+def _lib_property_merge_key(prop_raw: list) -> str:
     """Return the identity a property keeps when base and variant are merged.
 
-    A private property is written ``(property private <name> <value> ...)``, so
-    its second list element is the literal ``private`` marker, not the field
-    name.  Keying on that element would collapse every private field into one
-    slot; the marker therefore belongs in the key, while the name keeps
-    distinct private fields distinct.
+    KiCad identifies a library field by its name; ``private`` is an attribute
+    of that field, not part of its identity.  The raw node's second element is
+    the literal ``private`` marker for a private field and the name otherwise,
+    so parse the node and key on the name.  The winning node keeps its own
+    marker: a variant property replaces a base property of the same name even
+    when their ``private`` flags differ.
     """
-    parsed = _parse_lib_property(prop_raw)
-    return (parsed.is_private, parsed.name)
+    return _parse_lib_property(prop_raw).name
 
 
 def _resolve_extends_symbol(
@@ -1854,7 +1854,7 @@ def _resolve_extends_symbol(
 
     # Collect structural attributes and properties from the *extending* symbol.
     ext_structural: dict[str, list] = {}
-    ext_props: dict[tuple[bool, str], list] = {}
+    ext_props: dict[str, list] = {}
     for child in lib_sym_raw[2:]:
         if not (
             isinstance(child, list) and len(child) >= 1 and isinstance(child[0], sexpdata.Symbol)
@@ -1888,7 +1888,7 @@ def _resolve_extends_symbol(
             merged.append(copy.deepcopy(child))
 
     # 2. Properties: base as default, extending overrides.
-    seen_props: set[tuple[bool, str]] = set()
+    seen_props: set[str] = set()
     for child in base_raw[2:]:
         if not (
             isinstance(child, list)
