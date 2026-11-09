@@ -117,6 +117,91 @@ _PRIVATE_VALUE_LIB_TEXT = """
 )
 """
 
+# Base symbols for the (extends ...) merge tests (issue #261).  KLCBase
+# carries two private fields plus an ordinary field shared with the variants;
+# TLP3123 reproduces the stock KiCad 10 Relay_SolidState base.
+EXTENDS_BASE_PATH = str(Path(__file__).parent / "fixtures/extends_base_symbols.kicad_sym")
+
+# Base KLC_A/KLC_B + variant KLC_C/KLC_D: all four must survive the merge and
+# the placement.  The ordinary "Shared" property exercises override semantics.
+_EXTENDS_PRIVATE_LIB_TEXT = """
+(symbol "DerivedPrivate"
+  (extends "KLCBase")
+  (property "Reference" "U" (at 0 0 0) (effects (font (size 1.27 1.27))))
+  (property "Value" "DerivedPrivate" (at 0 2.54 0)
+    (effects (font (size 1.27 1.27))))
+  (property private "KLC_C" "Derived note C" (at 0 -10.16 0)
+    (effects (font (size 1.27 1.27)) (hide yes)))
+  (property private "KLC_D" "Derived note D" (at 0 -12.7 0)
+    (effects (font (size 1.27 1.27)) (hide yes)))
+  (property "Shared" "derived-shared" (at 0 -15.24 0)
+    (effects (font (size 1.27 1.27)) (hide yes)))
+)
+"""
+
+# The variant redefines the base's KLC_B; the derived value must win and the
+# name must appear exactly once.
+_EXTENDS_OVERRIDE_LIB_TEXT = """
+(symbol "DerivedOverride"
+  (extends "KLCBase")
+  (property private "KLC_B" "Derived note B" (at 0 -5.08 0)
+    (effects (font (size 1.27 1.27)) (hide yes)))
+  (property private "KLC_C" "Derived note C" (at 0 -10.16 0)
+    (effects (font (size 1.27 1.27)) (hide yes)))
+)
+"""
+
+# Same field name with a changed private flag: the variant node replaces the
+# base node and the surviving node carries the variant's own marker.
+_EXTENDS_PUBLIC_OVERRIDE_LIB_TEXT = """
+(symbol "DerivedPublicOverride"
+  (extends "KLCBase")
+  (property "KLC_A" "Derived public note A" (at 0 -2.54 0)
+    (effects (font (size 1.27 1.27)) (hide yes)))
+)
+"""
+
+_EXTENDS_PRIVATE_OVERRIDE_PUBLIC_LIB_TEXT = """
+(symbol "DerivedPrivateOverridePublic"
+  (extends "KLCPublicBase")
+  (property private "KLC_A" "Derived private note A" (at 0 -2.54 0)
+    (effects (font (size 1.27 1.27)) (hide yes)))
+)
+"""
+
+# Stock-shape derived symbol: Relay_SolidState/AQY282S extends TLP3123 and adds
+# a single KLC note.  The base lives in EXTENDS_BASE_PATH.
+_REAL_AQY282S_LIB_TEXT = """
+(symbol "AQY282S"
+  (extends "TLP3123")
+  (property "Reference" "U" (at -5.08 5.08 0)
+    (show_name no) (do_not_autoplace no)
+    (effects (font (size 1.27 1.27)) (justify left)))
+  (property "Value" "AQY282S" (at 0 5.08 0)
+    (show_name no) (do_not_autoplace no)
+    (effects (font (size 1.27 1.27)) (justify left)))
+  (property "Footprint" "Package_SO:SO-4_4.4x4.3mm_P2.54mm" (at -5.08 -5.08 0)
+    (show_name no) (do_not_autoplace no) (hide yes)
+    (effects (font (size 1.27 1.27) (italic yes)) (justify left)))
+  (property "Datasheet" "https://www.lcsc.com/datasheet/C5377929.pdf" (at 0 0 0)
+    (show_name no) (do_not_autoplace no) (hide yes)
+    (effects (font (size 1.27 1.27)) (justify left)))
+  (property "Description" "Solid State Relay (Photo MOSFET) 60V, 0.5A, 2.5Ohm, SO-4"
+    (at 0 0 0) (show_name no) (do_not_autoplace no) (hide yes)
+    (effects (font (size 1.27 1.27))))
+  (property private "KLC_S6.2" "1-Form-A describes the internal structure of the relay"
+    (at 0 -7.62 0) (show_name yes) (do_not_autoplace no) (hide yes)
+    (effects (font (size 1.27 1.27))))
+  (property "ki_keywords" "MOSFET Output Photorelay 1-Form-A" (at 0 0 0)
+    (show_name no) (do_not_autoplace no) (hide yes)
+    (effects (font (size 1.27 1.27))))
+  (property "ki_fp_filters" "SO*4.4x4.3mm*P2.54mm*" (at 0 0 0)
+    (show_name no) (do_not_autoplace no) (hide yes)
+    (effects (font (size 1.27 1.27))))
+  (embedded_fonts no)
+)
+"""
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -153,16 +238,16 @@ def _get_tools() -> dict:
     return mock.tools
 
 
-def _make_mock_manager() -> MagicMock:
+def _make_mock_manager(sym_path: str = TEST_SYM_PATH) -> MagicMock:
     """
     Return a mock SymbolIndexManager whose library/symbol records point at the
-    test_symbols.kicad_sym fixture.  mtime and file_size are set to 0 so that
+    given .kicad_sym fixture.  mtime and file_size are set to 0 so that
     extract_lib_symbol_raw uses the fallback (full-parse) path.
     """
     mgr = MagicMock()
 
     lib_rec = MagicMock()
-    lib_rec.file_path = TEST_SYM_PATH
+    lib_rec.file_path = sym_path
     lib_rec.mtime = 0.0  # force fallback parse
     lib_rec.file_size = 0
 
@@ -228,6 +313,35 @@ def _property_pairs(raw_node: list) -> dict[str, str]:
 def _private_property_nodes(raw_node: list) -> list[list]:
     """Return property nodes carrying the literal ``private`` marker."""
     return [node for node in _property_nodes(raw_node) if _property_parts(node)[0]]
+
+
+def _private_pairs(raw_node: list) -> dict[str, str]:
+    """Extract {name: value} from private properties only."""
+    pairs: dict[str, str] = {}
+    for node in _private_property_nodes(raw_node):
+        _, name_atom, value_atom = _property_parts(node)
+        pairs[_property_atom_text(name_atom)] = _property_atom_text(value_atom)
+    return pairs
+
+
+def _property_identities(raw_node: list) -> list[tuple[bool, str]]:
+    """Return ``(is_private, name)`` for every property, preserving duplicates."""
+    return [
+        (_property_parts(node)[0], _property_atom_text(_property_parts(node)[1]))
+        for node in _property_nodes(raw_node)
+    ]
+
+
+def _single_property(raw_node: list, name: str) -> tuple[bool, str]:
+    """Return ``(is_private, value)`` for the sole property called *name*."""
+    nodes = [
+        node
+        for node in _property_nodes(raw_node)
+        if _property_atom_text(_property_parts(node)[1]) == name
+    ]
+    assert len(nodes) == 1, f"expected one {name!r} property, got {len(nodes)}"
+    is_private, _, value_atom = _property_parts(nodes[0])
+    return is_private, _property_atom_text(value_atom)
 
 
 def _effects_hide_yes(node: list) -> bool:
@@ -698,6 +812,693 @@ class TestPrivateLibraryFields:
         for bad in bad_nodes:
             with pytest.raises(ValueError, match="Malformed property node"):
                 _parse_lib_property(bad)
+
+
+class TestExtendsPropertyMerge:
+    """Properties merged from an ``(extends ...)`` base (issue #261).
+
+    The merge key must distinguish private fields by name: the raw second
+    element of ``(property private <name> ...)`` is the literal marker, so
+    keying on it collapses every private field onto one slot.
+    """
+
+    @staticmethod
+    def _resolve(text: str, library_name: str) -> list:
+        import sexpdata
+
+        from kcaa.tools.symbol_edit_tools import _resolve_extends_symbol
+
+        with patch(
+            "kcaa.tools.symbol_edit_tools._get_index_manager",
+            return_value=_make_mock_manager(EXTENDS_BASE_PATH),
+        ):
+            return _resolve_extends_symbol(sexpdata.loads(text), library_name)
+
+    @staticmethod
+    def _place(merged: list) -> list:
+        from kcaa.tools.symbol_edit_tools import _build_placed_symbol
+
+        return _build_placed_symbol(
+            "Device:Derived",
+            10.0,
+            20.0,
+            0,
+            1,
+            "U9",
+            "CUSTOM_VALUE",
+            "sch-uuid",
+            "proj",
+            merged,
+        )
+
+    def test_all_distinct_private_fields_survive_merge_and_placement(self):
+        """Base KLC_A/KLC_B and variant KLC_C/KLC_D all reach the instance."""
+        merged = self._resolve(_EXTENDS_PRIVATE_LIB_TEXT, "Device/DerivedPrivate")
+        expected = {
+            "KLC_A": "Base note A",
+            "KLC_B": "Base note B",
+            "KLC_C": "Derived note C",
+            "KLC_D": "Derived note D",
+        }
+
+        assert _private_pairs(merged) == expected
+        assert len(_private_property_nodes(merged)) == 4
+
+        placed = self._place(merged)
+        assert _private_pairs(placed) == expected
+        assert len(_private_property_nodes(placed)) == 4
+
+    def test_derived_private_field_overrides_same_named_base_field(self):
+        """Same private name: the variant wins and appears exactly once."""
+        merged = self._resolve(_EXTENDS_OVERRIDE_LIB_TEXT, "Device/DerivedOverride")
+
+        assert _private_pairs(merged) == {
+            "KLC_A": "Base note A",
+            "KLC_B": "Derived note B",
+            "KLC_C": "Derived note C",
+        }
+        identities = _property_identities(merged)
+        assert len(identities) == len(set(identities))
+        assert identities.count((True, "KLC_B")) == 1
+
+    def test_derived_public_field_overrides_base_private_field(self):
+        """Same name, derived public: one node, derived value, no marker."""
+        merged = self._resolve(_EXTENDS_PUBLIC_OVERRIDE_LIB_TEXT, "Device/DerivedPublicOverride")
+
+        assert _single_property(merged, "KLC_A") == (False, "Derived public note A")
+        assert _private_pairs(merged)["KLC_B"] == "Base note B"
+
+        placed = self._place(merged)
+        assert _single_property(placed, "KLC_A") == (False, "Derived public note A")
+        assert "KLC_A" not in _private_pairs(placed)
+
+    def test_derived_private_field_overrides_base_public_field(self):
+        """Same name, derived private: one node, derived value, marker kept."""
+        merged = self._resolve(
+            _EXTENDS_PRIVATE_OVERRIDE_PUBLIC_LIB_TEXT,
+            "Device/DerivedPrivateOverridePublic",
+        )
+
+        assert _single_property(merged, "KLC_A") == (True, "Derived private note A")
+        assert _private_pairs(merged) == {"KLC_A": "Derived private note A"}
+
+        placed = self._place(merged)
+        assert _single_property(placed, "KLC_A") == (True, "Derived private note A")
+        assert _private_pairs(placed) == {"KLC_A": "Derived private note A"}
+
+    def test_malformed_base_property_skipped_without_aborting_merge(self, caplog):
+        """An unparseable base field is skipped; variant fields still merge.
+
+        Library extraction (skip) drops malformed property nodes, so the base
+        raw list is injected directly to exercise the merge's own guard.
+        """
+        import logging
+
+        import sexpdata
+        from sexpdata import Symbol as Sexp
+
+        from kcaa.tools.symbol_edit_tools import _resolve_extends_symbol
+        from kcaa.utils.symbol_extractor import extract_lib_symbol_raw
+
+        base_raw = extract_lib_symbol_raw(EXTENDS_BASE_PATH, 0, "KLCBase", 0.0, 0)
+        base_raw.append([Sexp("property"), "NoValue"])
+        variant = sexpdata.loads(_EXTENDS_PRIVATE_LIB_TEXT)
+
+        with (
+            patch(
+                "kcaa.tools.symbol_edit_tools._get_index_manager",
+                return_value=_make_mock_manager(EXTENDS_BASE_PATH),
+            ),
+            patch(
+                "kcaa.tools.symbol_edit_tools.extract_lib_symbol_raw",
+                return_value=base_raw,
+            ),
+            caplog.at_level(logging.WARNING),
+        ):
+            merged = _resolve_extends_symbol(variant, "Device/DerivedPrivate")
+
+        assert _private_pairs(merged) == {
+            "KLC_A": "Base note A",
+            "KLC_B": "Base note B",
+            "KLC_C": "Derived note C",
+            "KLC_D": "Derived note D",
+        }
+        assert all(name != "NoValue" for _, name in _property_identities(merged))
+        assert "Skipping unparseable property" in caplog.text
+
+    def test_bare_property_base_node_skipped_like_any_unparseable_field(self, caplog):
+        """A base ``(property)`` node with no name/value is dropped and logged.
+
+        The drop must go through the same guarded path as every other
+        unparseable base field; a bare node must not slip past a prefilter.
+        """
+        import logging
+
+        import sexpdata
+        from sexpdata import Symbol as Sexp
+
+        from kcaa.tools.symbol_edit_tools import _resolve_extends_symbol
+        from kcaa.utils.symbol_extractor import extract_lib_symbol_raw
+
+        base_raw = extract_lib_symbol_raw(EXTENDS_BASE_PATH, 0, "KLCBase", 0.0, 0)
+        bare = [Sexp("property")]
+        base_raw.append(bare)
+        variant = sexpdata.loads(_EXTENDS_PRIVATE_LIB_TEXT)
+        sink: list[str] = []
+
+        with (
+            patch(
+                "kcaa.tools.symbol_edit_tools._get_index_manager",
+                return_value=_make_mock_manager(EXTENDS_BASE_PATH),
+            ),
+            patch(
+                "kcaa.tools.symbol_edit_tools.extract_lib_symbol_raw",
+                return_value=base_raw,
+            ),
+            caplog.at_level(logging.WARNING),
+        ):
+            merged = _resolve_extends_symbol(variant, "Device/DerivedPrivate", warnings=sink)
+
+        assert bare not in merged
+        assert _private_pairs(merged) == {
+            "KLC_A": "Base note A",
+            "KLC_B": "Base note B",
+            "KLC_C": "Derived note C",
+            "KLC_D": "Derived note D",
+        }
+        assert "Skipping unparseable property" in caplog.text
+        assert len(sink) == 1
+        assert "extends base symbol 'KLCBase'" in sink[0]
+
+    def test_tool_reports_skipped_base_field_as_warning(self, tools, tmp_sch):
+        """add_symbol_to_schematic returns the dropped base field as a warning."""
+        import sexpdata
+        from sexpdata import Symbol as Sexp
+
+        from kcaa.utils.symbol_extractor import extract_lib_symbol_raw
+
+        base_raw = extract_lib_symbol_raw(EXTENDS_BASE_PATH, 0, "KLCBase", 0.0, 0)
+        base_raw.append([Sexp("property"), "NoValue"])
+        variant_raw = sexpdata.loads(_EXTENDS_PRIVATE_LIB_TEXT)
+
+        def fake_extract(file_path, file_index, symbol_name, mtime, file_size):
+            return variant_raw if symbol_name == "DerivedPrivate" else base_raw
+
+        with (
+            patch(
+                "kcaa.tools.symbol_edit_tools._get_index_manager",
+                return_value=_make_mock_manager(EXTENDS_BASE_PATH),
+            ),
+            patch(
+                "kcaa.tools.symbol_edit_tools.extract_lib_symbol_raw",
+                side_effect=fake_extract,
+            ),
+        ):
+            result = asyncio.run(
+                tools["add_symbol_to_schematic"](
+                    schematic_path=tmp_sch,
+                    library_name="Device",
+                    symbol_name="DerivedPrivate",
+                    x=50.0,
+                    y=50.0,
+                )
+            )
+
+        assert result.get("success") is True, result
+        warnings = result.get("warnings")
+        assert isinstance(warnings, list) and len(warnings) == 1, result
+        assert "NoValue" in warnings[0]
+        assert "KLCBase" in warnings[0]
+
+        # The skipped field must not abort the merge of the remaining ones.
+        sch = skip.Schematic(tmp_sch)
+        assert _private_pairs(sch.lib_symbols["Device:DerivedPrivate"].raw) == {
+            "KLC_A": "Base note A",
+            "KLC_B": "Base note B",
+            "KLC_C": "Derived note C",
+            "KLC_D": "Derived note D",
+        }
+
+    def test_malformed_variant_property_still_raises(self):
+        """A malformed variant field keeps failing instead of being skipped."""
+        from sexpdata import Symbol as Sexp
+
+        from kcaa.tools.symbol_edit_tools import _resolve_extends_symbol
+
+        variant = [
+            Sexp("symbol"),
+            "BadVariant",
+            [Sexp("extends"), "KLCBase"],
+            [Sexp("property"), "NoValue"],
+        ]
+        with patch(
+            "kcaa.tools.symbol_edit_tools._get_index_manager",
+            return_value=_make_mock_manager(EXTENDS_BASE_PATH),
+        ):
+            with pytest.raises(ValueError, match="Malformed property node"):
+                _resolve_extends_symbol(variant, "Device/BadVariant")
+
+    def test_very_long_malformed_base_property_warning_is_bounded(self):
+        """A huge malformed node must not produce a huge warning string."""
+        import sexpdata
+        from sexpdata import Symbol as Sexp
+
+        from kcaa.tools.symbol_edit_tools import _resolve_extends_symbol
+        from kcaa.utils.symbol_extractor import extract_lib_symbol_raw
+
+        base_raw = extract_lib_symbol_raw(EXTENDS_BASE_PATH, 0, "KLCBase", 0.0, 0)
+        base_raw.append([Sexp("property"), "Huge", "v", "x" * 200_000])
+        variant = sexpdata.loads(_EXTENDS_PRIVATE_LIB_TEXT)
+        sink: list[str] = []
+
+        with (
+            patch(
+                "kcaa.tools.symbol_edit_tools._get_index_manager",
+                return_value=_make_mock_manager(EXTENDS_BASE_PATH),
+            ),
+            patch(
+                "kcaa.tools.symbol_edit_tools.extract_lib_symbol_raw",
+                return_value=base_raw,
+            ),
+        ):
+            merged = _resolve_extends_symbol(variant, "Device/DerivedPrivate", warnings=sink)
+
+        assert len(sink) == 1
+        assert len(sink[0]) < 400, len(sink[0])
+        assert "Huge" in sink[0]  # name kept outside the truncated node
+        assert "..." in sink[0]
+        assert _private_pairs(merged) == {
+            "KLC_A": "Base note A",
+            "KLC_B": "Base note B",
+            "KLC_C": "Derived note C",
+            "KLC_D": "Derived note D",
+        }
+
+    def test_very_long_malformed_base_property_name_warning_is_bounded(self):
+        """A huge property *name* is bounded before it is repr-ed.
+
+        The name is copied into the diagnostic label outside the node
+        rendering, so it needs the same cap: without it the warning grows with
+        the name and defeats ``_format_property_node``.
+        """
+        import sexpdata
+        from sexpdata import Symbol as Sexp
+
+        from kcaa.tools.symbol_edit_tools import _resolve_extends_symbol
+        from kcaa.utils.symbol_extractor import extract_lib_symbol_raw
+
+        base_raw = extract_lib_symbol_raw(EXTENDS_BASE_PATH, 0, "KLCBase", 0.0, 0)
+        base_raw.append([Sexp("property"), "N" * 200_000])  # name, no value
+        variant = sexpdata.loads(_EXTENDS_PRIVATE_LIB_TEXT)
+        sink: list[str] = []
+
+        with (
+            patch(
+                "kcaa.tools.symbol_edit_tools._get_index_manager",
+                return_value=_make_mock_manager(EXTENDS_BASE_PATH),
+            ),
+            patch(
+                "kcaa.tools.symbol_edit_tools.extract_lib_symbol_raw",
+                return_value=base_raw,
+            ),
+        ):
+            merged = _resolve_extends_symbol(variant, "Device/DerivedPrivate", warnings=sink)
+
+        assert len(sink) == 1
+        assert len(sink[0]) < 400, len(sink[0])
+        # The beginning of the name survives and the cut is marked explicitly.
+        assert "Skipping unparseable property 'NNNNNNNN" in sink[0]
+        assert "..." in sink[0]
+        assert "200000 chars" in sink[0]
+        assert _private_pairs(merged) == {
+            "KLC_A": "Base note A",
+            "KLC_B": "Base note B",
+            "KLC_C": "Derived note C",
+            "KLC_D": "Derived note D",
+        }
+
+    def test_bare_property_base_message_reports_missing_name_value(self):
+        """A bare base property reports its real shape, not "not a property"."""
+        import sexpdata
+        from sexpdata import Symbol as Sexp
+
+        from kcaa.tools.symbol_edit_tools import _parse_lib_property, _resolve_extends_symbol
+        from kcaa.utils.symbol_extractor import extract_lib_symbol_raw
+
+        base_raw = extract_lib_symbol_raw(EXTENDS_BASE_PATH, 0, "KLCBase", 0.0, 0)
+        base_raw.append([Sexp("property")])
+        variant = sexpdata.loads(_EXTENDS_PRIVATE_LIB_TEXT)
+        sink: list[str] = []
+
+        with (
+            patch(
+                "kcaa.tools.symbol_edit_tools._get_index_manager",
+                return_value=_make_mock_manager(EXTENDS_BASE_PATH),
+            ),
+            patch(
+                "kcaa.tools.symbol_edit_tools.extract_lib_symbol_raw",
+                return_value=base_raw,
+            ),
+        ):
+            _resolve_extends_symbol(variant, "Device/DerivedPrivate", warnings=sink)
+
+        assert len(sink) == 1
+        assert "missing name/value" in sink[0]
+        assert "not a property" not in sink[0]
+
+        # Genuine non-property nodes keep the old wording.
+        with pytest.raises(ValueError, match=r"not a property"):
+            _parse_lib_property([Sexp("symbol"), "X"])
+
+    def test_bare_variant_property_raises_through_tool_boundary(self, tools, tmp_sch):
+        """A variant ``(property)`` node fails the call instead of vanishing."""
+        import sexpdata
+        from sexpdata import Symbol as Sexp
+
+        from kcaa.utils.symbol_extractor import extract_lib_symbol_raw
+
+        variant_raw = sexpdata.loads(_EXTENDS_PRIVATE_LIB_TEXT)
+        variant_raw.append([Sexp("property")])
+        base_raw = extract_lib_symbol_raw(EXTENDS_BASE_PATH, 0, "KLCBase", 0.0, 0)
+
+        def fake_extract(file_path, file_index, symbol_name, mtime, file_size):
+            return variant_raw if symbol_name == "DerivedPrivate" else base_raw
+
+        with (
+            patch(
+                "kcaa.tools.symbol_edit_tools._get_index_manager",
+                return_value=_make_mock_manager(EXTENDS_BASE_PATH),
+            ),
+            patch(
+                "kcaa.tools.symbol_edit_tools.extract_lib_symbol_raw",
+                side_effect=fake_extract,
+            ),
+        ):
+            result = asyncio.run(
+                tools["add_symbol_to_schematic"](
+                    schematic_path=tmp_sch,
+                    library_name="Device",
+                    symbol_name="DerivedPrivate",
+                    x=50.0,
+                    y=50.0,
+                )
+            )
+
+        assert result.get("success") is False, result
+        assert "Malformed property node (missing name/value)" in result["error"]
+
+    def test_unresolved_base_symbol_reports_warning(self):
+        """An unresolvable base leaves a warning naming the base symbol id."""
+        import sexpdata
+
+        from kcaa.tools.symbol_edit_tools import _resolve_extends_symbol
+
+        variant = sexpdata.loads(_EXTENDS_PRIVATE_LIB_TEXT)
+        sink: list[str] = []
+        mgr = MagicMock()
+        mgr.get_symbol.return_value = None
+        mgr.get_library_by_name.return_value = None
+
+        with patch("kcaa.tools.symbol_edit_tools._get_index_manager", return_value=mgr):
+            merged = _resolve_extends_symbol(variant, "Device/DerivedPrivate", warnings=sink)
+
+        assert merged == variant
+        assert len(sink) == 1
+        assert "not found" in sink[0]
+        assert "Device/KLCBase:KLCBase" in sink[0]
+        assert "Could not extract" not in sink[0]
+
+    def test_extract_failure_reports_warning(self, tools, tmp_sch):
+        """A failing base extraction degrades the merge but reports a warning."""
+        import sexpdata
+
+        variant_raw = sexpdata.loads(_EXTENDS_PRIVATE_LIB_TEXT)
+
+        def fake_extract(file_path, file_index, symbol_name, mtime, file_size):
+            if symbol_name == "DerivedPrivate":
+                return variant_raw
+            raise RuntimeError("boom")
+
+        with (
+            patch(
+                "kcaa.tools.symbol_edit_tools._get_index_manager",
+                return_value=_make_mock_manager(EXTENDS_BASE_PATH),
+            ),
+            patch(
+                "kcaa.tools.symbol_edit_tools.extract_lib_symbol_raw",
+                side_effect=fake_extract,
+            ),
+        ):
+            result = asyncio.run(
+                tools["add_symbol_to_schematic"](
+                    schematic_path=tmp_sch,
+                    library_name="Device",
+                    symbol_name="DerivedPrivate",
+                    x=50.0,
+                    y=50.0,
+                )
+            )
+
+        assert result.get("success") is True, result
+        warnings = result["warnings"]
+        assert len(warnings) == 1, result
+        assert "Could not extract extends base symbol" in warnings[0]
+        assert "boom" in warnings[0]
+        assert "not found" not in warnings[0]
+
+    def test_long_extends_base_id_warning_bounded_and_lookup_exact(self):
+        """A 200k-char base id is bounded in the warning, exact in the lookup."""
+        from sexpdata import Symbol as Sexp
+
+        from kcaa.tools.symbol_edit_tools import _resolve_extends_symbol
+
+        long_base = "B" * 200_000
+        variant = [Sexp("symbol"), "Derived", [Sexp("extends"), long_base]]
+        sink: list[str] = []
+        mgr = MagicMock()
+        mgr.get_symbol.return_value = None
+        mgr.get_library_by_name.return_value = None
+
+        with patch("kcaa.tools.symbol_edit_tools._get_index_manager", return_value=mgr):
+            merged = _resolve_extends_symbol(variant, "Device", warnings=sink)
+
+        assert merged == variant
+        assert len(sink) == 1
+        assert len(sink[0]) < 400, len(sink[0])
+        assert "extends base symbol 'Device:BBBBBBBB" in sink[0]
+        assert "..." in sink[0]
+        assert "200000 chars" in sink[0]
+        # Resolution used the exact, untruncated id.
+        assert mgr.get_symbol.call_args.args == ("Device", long_base)
+        assert mgr.get_library_by_name.call_args.args == ("Device",)
+
+    def test_tool_reports_long_base_name_skipped_field_bounded(self, tools, tmp_sch):
+        """The skipped-field warning stays bounded for a 200k-char base name."""
+        import sexpdata
+        from sexpdata import Symbol as Sexp
+
+        from kcaa.utils.symbol_extractor import extract_lib_symbol_raw
+
+        long_base = "B" * 200_000
+        variant_raw = sexpdata.loads(_EXTENDS_PRIVATE_LIB_TEXT)
+        variant_raw[2] = [Sexp("extends"), long_base]  # replace the extends clause
+        base_raw = extract_lib_symbol_raw(EXTENDS_BASE_PATH, 0, "KLCBase", 0.0, 0)
+        base_raw.append([Sexp("property"), "NoValue"])
+        extracted: list[str] = []
+
+        def fake_extract(file_path, file_index, symbol_name, mtime, file_size):
+            extracted.append(symbol_name)
+            return variant_raw if symbol_name == "DerivedPrivate" else base_raw
+
+        with (
+            patch(
+                "kcaa.tools.symbol_edit_tools._get_index_manager",
+                return_value=_make_mock_manager(EXTENDS_BASE_PATH),
+            ),
+            patch(
+                "kcaa.tools.symbol_edit_tools.extract_lib_symbol_raw",
+                side_effect=fake_extract,
+            ),
+        ):
+            result = asyncio.run(
+                tools["add_symbol_to_schematic"](
+                    schematic_path=tmp_sch,
+                    library_name="Device",
+                    symbol_name="DerivedPrivate",
+                    x=50.0,
+                    y=50.0,
+                )
+            )
+
+        assert result.get("success") is True, result
+        warnings = result["warnings"]
+        assert len(warnings) == 1, result
+        assert len(warnings[0]) < 400, len(warnings[0])
+        assert "Skipping unparseable property 'NoValue'" in warnings[0]
+        assert "'BBBBBBBB" in warnings[0]
+        assert "..." in warnings[0]
+        # The base was still looked up and extracted under its exact name.
+        assert long_base in extracted
+
+    def test_long_property_names_keep_distinct_merge_identity(self):
+        """Names longer than the display bound still key by their exact value.
+
+        A merge keyed on the bounded display label would collapse both base
+        fields (they share their first 64 characters) into one identity.
+        """
+        from sexpdata import Symbol as Sexp
+
+        from kcaa.tools.symbol_edit_tools import _resolve_extends_symbol
+
+        prefix = "K" * (64 + 10)
+        name_a = prefix + "_A"
+        name_b = prefix + "_B"
+        base_raw = [
+            Sexp("symbol"),
+            "KLCBase",
+            [Sexp("property"), name_a, "base-a"],
+            [Sexp("property"), name_b, "base-b"],
+        ]
+        variant = [
+            Sexp("symbol"),
+            "Derived",
+            [Sexp("extends"), "KLCBase"],
+            [Sexp("property"), name_a, "derived-a"],
+        ]
+
+        with (
+            patch(
+                "kcaa.tools.symbol_edit_tools._get_index_manager",
+                return_value=_make_mock_manager(EXTENDS_BASE_PATH),
+            ),
+            patch(
+                "kcaa.tools.symbol_edit_tools.extract_lib_symbol_raw",
+                return_value=base_raw,
+            ),
+        ):
+            merged = _resolve_extends_symbol(variant, "Device/Derived")
+
+        assert _property_pairs(merged) == {name_a: "derived-a", name_b: "base-b"}
+        identities = [name for _, name in _property_identities(merged)]
+        assert len(identities) == 2
+        assert identities.count(name_a) == 1
+        assert identities.count(name_b) == 1
+
+    def test_tool_places_all_private_fields_end_to_end(self, tools, tmp_sch):
+        """add_symbol_to_schematic keeps KLC_A..D in lib_symbols and instance."""
+        expected = {
+            "KLC_A": "Base note A",
+            "KLC_B": "Base note B",
+            "KLC_C": "Derived note C",
+            "KLC_D": "Derived note D",
+        }
+
+        with patch(
+            "kcaa.tools.symbol_edit_tools._get_index_manager",
+            return_value=_make_mock_manager(EXTENDS_BASE_PATH),
+        ):
+            result = asyncio.run(
+                tools["add_symbol_to_schematic"](
+                    schematic_path=tmp_sch,
+                    library_name="Device",
+                    symbol_name="DerivedPrivate",
+                    x=50.0,
+                    y=50.0,
+                )
+            )
+        assert result.get("success") is True, result
+        assert result.get("warnings") == [], result
+
+        sch = skip.Schematic(tmp_sch)
+        lib_symbol = sch.lib_symbols["Device:DerivedPrivate"]
+        assert _private_pairs(lib_symbol.raw) == expected
+
+        placed = [s for s in sch.symbol if s.lib_id.value == "Device:DerivedPrivate"]
+        assert len(placed) == 1
+        assert _private_pairs(placed[0].raw) == expected
+
+    def test_ordinary_property_override_semantics_unchanged(self):
+        """Ordinary properties and structural attributes keep today's rules."""
+        import sexpdata
+
+        merged = self._resolve(_EXTENDS_PRIVATE_LIB_TEXT, "Device/DerivedPrivate")
+        ordinary: dict[str, str] = {}
+        for node in _property_nodes(merged):
+            is_private, name_atom, value_atom = _property_parts(node)
+            if not is_private:
+                ordinary[_property_atom_text(name_atom)] = _property_atom_text(value_atom)
+
+        assert ordinary["Shared"] == "derived-shared"
+        assert ordinary["Reference"] == "U"
+        assert ordinary["Value"] == "DerivedPrivate"
+        assert _property_identities(merged).count((False, "Shared")) == 1
+
+        tags = [
+            child[0].value()
+            for child in merged[2:]
+            if isinstance(child, list) and len(child) >= 1 and isinstance(child[0], sexpdata.Symbol)
+        ]
+        assert "exclude_from_sim" in tags
+
+        sub_symbols = [
+            child[1]
+            for child in merged[2:]
+            if isinstance(child, list)
+            and len(child) >= 2
+            and isinstance(child[0], sexpdata.Symbol)
+            and child[0].value() == "symbol"
+        ]
+        assert "DerivedPrivate_0_1" in sub_symbols
+        assert "DerivedPrivate_1_1" in sub_symbols
+
+    def test_private_marker_preserved_after_merge(self):
+        """Every merged private field keeps the ``private`` marker."""
+        import sexpdata
+
+        merged = self._resolve(_EXTENDS_PRIVATE_LIB_TEXT, "Device/DerivedPrivate")
+        serialized = sexpdata.dumps(merged)
+
+        private_names = [name for is_private, name in _property_identities(merged) if is_private]
+        assert sorted(private_names) == ["KLC_A", "KLC_B", "KLC_C", "KLC_D"]
+        for name in private_names:
+            assert f'(property private "{name}"' in serialized
+
+        shared = [
+            node
+            for node in _property_nodes(merged)
+            if _property_atom_text(_property_parts(node)[1]) == "Shared"
+        ]
+        assert len(shared) == 1
+        assert _property_parts(shared[0])[0] is False
+
+    def test_stock_relay_extends_shape_merges_private_field(self):
+        """Real Relay_SolidState/AQY282S shape keeps its KLC note.
+
+        This is real-world shape coverage, not a #261 regression test: the
+        stock pair has a single private field on one side, so it also passes
+        with the old ``child[1]`` key.
+        """
+        merged = self._resolve(_REAL_AQY282S_LIB_TEXT, "Relay_SolidState/AQY282S")
+        private = {"KLC_S6.2": "1-Form-A describes the internal structure of the relay"}
+        assert _private_pairs(merged) == private
+
+        pairs = _property_pairs(merged)
+        assert pairs["Footprint"] == "Package_SO:SO-4_4.4x4.3mm_P2.54mm"
+        assert pairs["Datasheet"] == "https://www.lcsc.com/datasheet/C5377929.pdf"
+        assert pairs["Description"] == ("Solid State Relay (Photo MOSFET) 60V, 0.5A, 2.5Ohm, SO-4")
+
+        placed = self._place(merged)
+        assert _private_pairs(placed) == private
+        placed_pairs = _property_pairs(placed)
+        assert placed_pairs["Footprint"] == pairs["Footprint"]
+        assert placed_pairs["Datasheet"] == pairs["Datasheet"]
+        assert placed_pairs["Description"] == pairs["Description"]
+
+        placed_names = [name for _, name in _property_identities(placed)]
+        assert placed_names.count("Reference") == 1
+        assert placed_names.count("Value") == 1
+        assert "ki_keywords" not in placed_names
+        assert "ki_fp_filters" not in placed_names
 
 
 # ---------------------------------------------------------------------------
