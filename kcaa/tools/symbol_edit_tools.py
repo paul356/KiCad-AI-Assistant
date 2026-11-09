@@ -1452,7 +1452,45 @@ def _property_atom_text(atom: object) -> str | None:
     return None
 
 
-_MAX_PROPERTY_NODE_REPR = 200
+# Diagnostic size budgets.  A malformed node can embed an arbitrarily large
+# atom, and the rendered text is copied into both the server log and the tool
+# response, so every part is bounded.  The three caps keep the longest merged
+# warning well under the 400-character bound the tests assert.
+_MAX_PROPERTY_NODE_REPR = 200  # whole node rendering
+_MAX_PROPERTY_ATOM_TEXT = 120  # one atom inside that rendering
+_MAX_PROPERTY_NAME_TEXT = 64  # property-name label prefixed to the message
+
+
+def _bound_text(text: str, limit: int) -> str:
+    """Cap *text* at *limit* characters, marking the cut explicitly.
+
+    The marker records the original length, so a truncated diagnostic stays
+    distinguishable from a genuinely short one.
+    """
+    if len(text) <= limit:
+        return text
+    suffix = f"... ({len(text)} chars)"
+    return text[: limit - len(suffix)] + suffix
+
+
+def _bounded_node_view(value: object) -> object:
+    """Return a display view of a property node with oversized atoms cut short.
+
+    Atoms are shortened *before* the node is repr-ed: repr-ing a 200 KB string
+    only to slice the result copies the whole string for nothing.  Lists and
+    symbols are rebuilt around the shortened leaves, so the node keeps its
+    shape while its ``repr`` stays cheap.
+    """
+    if isinstance(value, str):
+        return _bound_text(value, _MAX_PROPERTY_ATOM_TEXT)
+    if isinstance(value, sexpdata.Symbol):
+        text = value.value()
+        if isinstance(text, str):
+            return sexpdata.Symbol(_bound_text(text, _MAX_PROPERTY_ATOM_TEXT))
+        return value
+    if isinstance(value, list):
+        return [_bounded_node_view(child) for child in value]
+    return value
 
 
 def _format_property_node(node: object) -> str:
@@ -1460,14 +1498,11 @@ def _format_property_node(node: object) -> str:
 
     The message is copied into both the server log and the tool response, and
     a malformed node can embed an arbitrarily large atom (e.g. a multi-megabyte
-    value in a hand-edited library), so cap what is rendered.  Identifying
+    value in a hand-edited library), so the node is rendered through
+    ``_bounded_node_view`` and capped again for nested-node safety.  Identifying
     fields such as the property name are kept outside this rendering.
     """
-    text = repr(node)
-    if len(text) <= _MAX_PROPERTY_NODE_REPR:
-        return text
-    suffix = f"... ({len(text)} chars)"
-    return text[: _MAX_PROPERTY_NODE_REPR - len(suffix)] + suffix
+    return _bound_text(repr(_bounded_node_view(node)), _MAX_PROPERTY_NODE_REPR)
 
 
 def _parse_lib_property(prop_raw: list) -> _ParsedLibProperty:
@@ -1817,17 +1852,17 @@ def _property_node_label(prop_raw: list) -> str:
     """Return a `` <name>`` suffix naming a property node that failed to parse.
 
     The second element is the field name, or the literal ``private`` marker.
-    Returns an empty string when the node carries neither (e.g. a bare
+    The name is truncated before it is repr-ed and capped like the node
+    rendering, so a huge name cannot blow the message budget either.  Returns
+    an empty string when the node carries no name (e.g. a bare
     ``(property)``), so the message can still name the base symbol.
     """
     if len(prop_raw) < 2:
         return ""
-    atom = prop_raw[1]
-    if isinstance(atom, sexpdata.Symbol):
-        return f" {atom.value()!r}"
-    if isinstance(atom, str):
-        return f" {atom!r}"
-    return ""
+    text = _property_atom_text(prop_raw[1])
+    if text is None:
+        return ""
+    return f" {_bound_text(text, _MAX_PROPERTY_NAME_TEXT)!r}"
 
 
 def _resolve_extends_symbol(

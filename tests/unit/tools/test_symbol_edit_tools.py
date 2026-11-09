@@ -1094,6 +1094,49 @@ class TestExtendsPropertyMerge:
             "KLC_D": "Derived note D",
         }
 
+    def test_very_long_malformed_base_property_name_warning_is_bounded(self):
+        """A huge property *name* is bounded before it is repr-ed.
+
+        The name is copied into the diagnostic label outside the node
+        rendering, so it needs the same cap: without it the warning grows with
+        the name and defeats ``_format_property_node``.
+        """
+        import sexpdata
+        from sexpdata import Symbol as Sexp
+
+        from kcaa.tools.symbol_edit_tools import _resolve_extends_symbol
+        from kcaa.utils.symbol_extractor import extract_lib_symbol_raw
+
+        base_raw = extract_lib_symbol_raw(EXTENDS_BASE_PATH, 0, "KLCBase", 0.0, 0)
+        base_raw.append([Sexp("property"), "N" * 200_000])  # name, no value
+        variant = sexpdata.loads(_EXTENDS_PRIVATE_LIB_TEXT)
+        sink: list[str] = []
+
+        with (
+            patch(
+                "kcaa.tools.symbol_edit_tools._get_index_manager",
+                return_value=_make_mock_manager(EXTENDS_BASE_PATH),
+            ),
+            patch(
+                "kcaa.tools.symbol_edit_tools.extract_lib_symbol_raw",
+                return_value=base_raw,
+            ),
+        ):
+            merged = _resolve_extends_symbol(variant, "Device/DerivedPrivate", warnings=sink)
+
+        assert len(sink) == 1
+        assert len(sink[0]) < 400, len(sink[0])
+        # The beginning of the name survives and the cut is marked explicitly.
+        assert "Skipping unparseable property 'NNNNNNNN" in sink[0]
+        assert "..." in sink[0]
+        assert "200000 chars" in sink[0]
+        assert _private_pairs(merged) == {
+            "KLC_A": "Base note A",
+            "KLC_B": "Base note B",
+            "KLC_C": "Derived note C",
+            "KLC_D": "Derived note D",
+        }
+
     def test_bare_property_base_message_reports_missing_name_value(self):
         """A bare base property reports its real shape, not "not a property"."""
         import sexpdata
