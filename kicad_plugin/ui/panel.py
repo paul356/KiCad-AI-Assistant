@@ -959,7 +959,12 @@ if _WX_AVAILABLE:
                 self._attached_files.clear()
                 self._refresh_attachments_bar()
                 self._follow_output_to_bottom = True
-                self._render_conversation(force_scroll_to_bottom=True)
+                # Follow, not force: sending must not yank a reader who has
+                # scrolled up back to the bottom.  If they are at the bottom
+                # they stay there for the whole turn; if they are not, the
+                # new user entry lands below the viewport and the turn's
+                # streamed reply leaves their position alone.
+                self._render_conversation(follow=True)
 
             # Busy from here on: the turn owns the UI until turn_end.
             self._busy = True

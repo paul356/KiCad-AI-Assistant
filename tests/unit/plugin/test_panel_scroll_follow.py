@@ -118,10 +118,16 @@ def test_update_conversation_forwards_replace_and_follow_to_run_script() -> None
     ), "_update_conversation must forward replace=replace and follow=follow"
 
 
-def test_send_forces_bottom() -> None:
-    """An explicit send reveals the message the user just sent."""
+def test_send_follows_without_forcing_bottom() -> None:
+    """Sending must not yank a reader who scrolled up back to the bottom."""
     calls = _calls(_function("_send_request"), "_render_conversation")
-    assert any(_keyword_true(call, "force_scroll_to_bottom") for call in calls)
+    assert calls, "_send_request must render the newly appended user entry"
+    assert not any(_keyword_true(call, "force_scroll_to_bottom") for call in calls), (
+        "send must not force the view to the bottom; a scrolled-up reader keeps their place"
+    )
+    assert any(_keyword_true(call, "follow") for call in calls), (
+        "send must follow so a reader already at the bottom stays there"
+    )
 
 
 def test_pdf_rerender_follows() -> None:
