@@ -1452,11 +1452,29 @@ def _property_atom_text(atom: object) -> str | None:
     return None
 
 
+_MAX_PROPERTY_NODE_REPR = 200
+
+
+def _format_property_node(node: object) -> str:
+    """Render a malformed property node for an error message, bounded in size.
+
+    The message is copied into both the server log and the tool response, and
+    a malformed node can embed an arbitrarily large atom (e.g. a multi-megabyte
+    value in a hand-edited library), so cap what is rendered.  Identifying
+    fields such as the property name are kept outside this rendering.
+    """
+    text = repr(node)
+    if len(text) <= _MAX_PROPERTY_NODE_REPR:
+        return text
+    suffix = f"... ({len(text)} chars)"
+    return text[: _MAX_PROPERTY_NODE_REPR - len(suffix)] + suffix
+
+
 def _parse_lib_property(prop_raw: list) -> _ParsedLibProperty:
     """Parse a library ``(property ...)`` node using KiCad's field grammar.
 
     KiCad's grammar is ``(property [private] <name> <value> <child>*)``:
-    ``private`` is an optional literal marker token, the name and value are
+    ``private`` is the optional literal marker token, the name and value are
     atoms (quoted strings or bare symbols), and the remaining children are
     positional/effects nodes.  Raises ``ValueError`` for shapes that do not
     match (including an empty name or a non-list atom after the value), so a
@@ -1464,11 +1482,17 @@ def _parse_lib_property(prop_raw: list) -> _ParsedLibProperty:
     """
     if (
         not isinstance(prop_raw, list)
-        or len(prop_raw) < 2
+        or not prop_raw
         or not isinstance(prop_raw[0], sexpdata.Symbol)
         or prop_raw[0].value() != "property"
     ):
-        raise ValueError(f"Malformed property node (not a property): {prop_raw!r}")
+        raise ValueError(
+            f"Malformed property node (not a property): {_format_property_node(prop_raw)}"
+        )
+    if len(prop_raw) < 2:
+        raise ValueError(
+            f"Malformed property node (missing name/value): {_format_property_node(prop_raw)}"
+        )
 
     index = 1
     is_private = False
@@ -1478,19 +1502,26 @@ def _parse_lib_property(prop_raw: list) -> _ParsedLibProperty:
         index += 1
 
     if len(prop_raw) < index + 2:
-        raise ValueError(f"Malformed property node (missing name/value): {prop_raw!r}")
+        raise ValueError(
+            f"Malformed property node (missing name/value): {_format_property_node(prop_raw)}"
+        )
 
     name = _property_atom_text(prop_raw[index])
     value = _property_atom_text(prop_raw[index + 1])
     if name is None or value is None:
-        raise ValueError(f"Malformed property node (name/value not atoms): {prop_raw!r}")
+        raise ValueError(
+            f"Malformed property node (name/value not atoms): {_format_property_node(prop_raw)}"
+        )
     if not name:
-        raise ValueError(f"Malformed property node (empty name): {prop_raw!r}")
+        raise ValueError(f"Malformed property node (empty name): {_format_property_node(prop_raw)}")
 
     tail = list(prop_raw[index + 2 :])
     for child in tail:
         if not isinstance(child, list):
-            raise ValueError(f"Malformed property node (unexpected atom after value): {prop_raw!r}")
+            raise ValueError(
+                "Malformed property node (unexpected atom after value): "
+                f"{_format_property_node(prop_raw)}"
+            )
 
     return _ParsedLibProperty(is_private, name, value, tail)
 
@@ -1828,15 +1859,17 @@ def _resolve_extends_symbol(
          names re-prefixed to match the extending symbol.
 
     Returns *lib_sym_raw* unchanged if no ``(extends ...)`` clause is present
-    or if the base symbol cannot be resolved (a warning is logged).
+    or if the base symbol cannot be resolved (a warning is logged and appended
+    to *warnings* when given).
 
     Args:
         project_path: Optional project directory or file inside one, used to
             scope the index lookup so base symbols in project-local
             libraries resolve.
-        warnings: Optional sink.  One human-readable message per unparseable
-            base property is appended to it, so tool callers see the dropped
-            fields instead of relying on the server log alone.
+        warnings: Optional sink.  Messages are appended for every degradation
+            of the merge — an unresolvable or unextractable base symbol and an
+            unparseable base property — so tool callers see what was lost
+            instead of relying on the server log alone.
     """
     base_name = _get_extends_base_name(lib_sym_raw)
     if base_name is None:
@@ -1852,14 +1885,16 @@ def _resolve_extends_symbol(
     mgr = _get_index_manager(project_path)
     base_sym_rec = mgr.get_symbol(base_lib_name, base_name)
     base_lib_rec = mgr.get_library_by_name(base_lib_name)
+    base_symbol_id = f"{base_lib_name}:{base_name}"
 
     if base_sym_rec is None or base_lib_rec is None:
-        log.warning(
-            "extends base symbol %r not found under library %r; "
-            "injecting as-is (schematic may be incomplete)",
-            base_name,
-            base_lib_name,
+        message = (
+            f"extends base symbol {base_symbol_id!r} not found; "
+            "injecting the symbol as-is (schematic may be incomplete)"
         )
+        log.warning(message)
+        if warnings is not None:
+            warnings.append(message)
         return lib_sym_raw
 
     try:
@@ -1871,11 +1906,13 @@ def _resolve_extends_symbol(
             base_lib_rec.file_size,
         )
     except Exception as exc:
-        log.warning(
-            "Could not extract base symbol %r: %s; injecting as-is",
-            base_name,
-            exc,
+        message = (
+            f"Could not extract extends base symbol {base_symbol_id!r}: {exc}; "
+            "injecting the symbol as-is (schematic may be incomplete)"
         )
+        log.warning(message)
+        if warnings is not None:
+            warnings.append(message)
         return lib_sym_raw
 
     base_raw = copy.deepcopy(base_raw)
@@ -1894,7 +1931,7 @@ def _resolve_extends_symbol(
         tag = child[0].value()
         if tag == "extends":
             continue
-        if tag == "property" and len(child) >= 2:
+        if tag == "property":
             ext_props[_lib_property_merge_key(child)] = child
         elif tag not in _META_TAGS:
             ext_structural[tag] = child

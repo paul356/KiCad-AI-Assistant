@@ -1058,6 +1058,171 @@ class TestExtendsPropertyMerge:
             with pytest.raises(ValueError, match="Malformed property node"):
                 _resolve_extends_symbol(variant, "Device/BadVariant")
 
+    def test_very_long_malformed_base_property_warning_is_bounded(self):
+        """A huge malformed node must not produce a huge warning string."""
+        import sexpdata
+        from sexpdata import Symbol as Sexp
+
+        from kcaa.tools.symbol_edit_tools import _resolve_extends_symbol
+        from kcaa.utils.symbol_extractor import extract_lib_symbol_raw
+
+        base_raw = extract_lib_symbol_raw(EXTENDS_BASE_PATH, 0, "KLCBase", 0.0, 0)
+        base_raw.append([Sexp("property"), "Huge", "v", "x" * 200_000])
+        variant = sexpdata.loads(_EXTENDS_PRIVATE_LIB_TEXT)
+        sink: list[str] = []
+
+        with (
+            patch(
+                "kcaa.tools.symbol_edit_tools._get_index_manager",
+                return_value=_make_mock_manager(EXTENDS_BASE_PATH),
+            ),
+            patch(
+                "kcaa.tools.symbol_edit_tools.extract_lib_symbol_raw",
+                return_value=base_raw,
+            ),
+        ):
+            merged = _resolve_extends_symbol(variant, "Device/DerivedPrivate", warnings=sink)
+
+        assert len(sink) == 1
+        assert len(sink[0]) < 400, len(sink[0])
+        assert "Huge" in sink[0]  # name kept outside the truncated node
+        assert "..." in sink[0]
+        assert _private_pairs(merged) == {
+            "KLC_A": "Base note A",
+            "KLC_B": "Base note B",
+            "KLC_C": "Derived note C",
+            "KLC_D": "Derived note D",
+        }
+
+    def test_bare_property_base_message_reports_missing_name_value(self):
+        """A bare base property reports its real shape, not "not a property"."""
+        import sexpdata
+        from sexpdata import Symbol as Sexp
+
+        from kcaa.tools.symbol_edit_tools import _parse_lib_property, _resolve_extends_symbol
+        from kcaa.utils.symbol_extractor import extract_lib_symbol_raw
+
+        base_raw = extract_lib_symbol_raw(EXTENDS_BASE_PATH, 0, "KLCBase", 0.0, 0)
+        base_raw.append([Sexp("property")])
+        variant = sexpdata.loads(_EXTENDS_PRIVATE_LIB_TEXT)
+        sink: list[str] = []
+
+        with (
+            patch(
+                "kcaa.tools.symbol_edit_tools._get_index_manager",
+                return_value=_make_mock_manager(EXTENDS_BASE_PATH),
+            ),
+            patch(
+                "kcaa.tools.symbol_edit_tools.extract_lib_symbol_raw",
+                return_value=base_raw,
+            ),
+        ):
+            _resolve_extends_symbol(variant, "Device/DerivedPrivate", warnings=sink)
+
+        assert len(sink) == 1
+        assert "missing name/value" in sink[0]
+        assert "not a property" not in sink[0]
+
+        # Genuine non-property nodes keep the old wording.
+        with pytest.raises(ValueError, match=r"not a property"):
+            _parse_lib_property([Sexp("symbol"), "X"])
+
+    def test_bare_variant_property_raises_through_tool_boundary(self, tools, tmp_sch):
+        """A variant ``(property)`` node fails the call instead of vanishing."""
+        import sexpdata
+        from sexpdata import Symbol as Sexp
+
+        from kcaa.utils.symbol_extractor import extract_lib_symbol_raw
+
+        variant_raw = sexpdata.loads(_EXTENDS_PRIVATE_LIB_TEXT)
+        variant_raw.append([Sexp("property")])
+        base_raw = extract_lib_symbol_raw(EXTENDS_BASE_PATH, 0, "KLCBase", 0.0, 0)
+
+        def fake_extract(file_path, file_index, symbol_name, mtime, file_size):
+            return variant_raw if symbol_name == "DerivedPrivate" else base_raw
+
+        with (
+            patch(
+                "kcaa.tools.symbol_edit_tools._get_index_manager",
+                return_value=_make_mock_manager(EXTENDS_BASE_PATH),
+            ),
+            patch(
+                "kcaa.tools.symbol_edit_tools.extract_lib_symbol_raw",
+                side_effect=fake_extract,
+            ),
+        ):
+            result = asyncio.run(
+                tools["add_symbol_to_schematic"](
+                    schematic_path=tmp_sch,
+                    library_name="Device",
+                    symbol_name="DerivedPrivate",
+                    x=50.0,
+                    y=50.0,
+                )
+            )
+
+        assert result.get("success") is False, result
+        assert "Malformed property node (missing name/value)" in result["error"]
+
+    def test_unresolved_base_symbol_reports_warning(self):
+        """An unresolvable base leaves a warning naming the base symbol id."""
+        import sexpdata
+
+        from kcaa.tools.symbol_edit_tools import _resolve_extends_symbol
+
+        variant = sexpdata.loads(_EXTENDS_PRIVATE_LIB_TEXT)
+        sink: list[str] = []
+        mgr = MagicMock()
+        mgr.get_symbol.return_value = None
+        mgr.get_library_by_name.return_value = None
+
+        with patch("kcaa.tools.symbol_edit_tools._get_index_manager", return_value=mgr):
+            merged = _resolve_extends_symbol(variant, "Device/DerivedPrivate", warnings=sink)
+
+        assert merged == variant
+        assert len(sink) == 1
+        assert "not found" in sink[0]
+        assert "Device/KLCBase:KLCBase" in sink[0]
+        assert "Could not extract" not in sink[0]
+
+    def test_extract_failure_reports_warning(self, tools, tmp_sch):
+        """A failing base extraction degrades the merge but reports a warning."""
+        import sexpdata
+
+        variant_raw = sexpdata.loads(_EXTENDS_PRIVATE_LIB_TEXT)
+
+        def fake_extract(file_path, file_index, symbol_name, mtime, file_size):
+            if symbol_name == "DerivedPrivate":
+                return variant_raw
+            raise RuntimeError("boom")
+
+        with (
+            patch(
+                "kcaa.tools.symbol_edit_tools._get_index_manager",
+                return_value=_make_mock_manager(EXTENDS_BASE_PATH),
+            ),
+            patch(
+                "kcaa.tools.symbol_edit_tools.extract_lib_symbol_raw",
+                side_effect=fake_extract,
+            ),
+        ):
+            result = asyncio.run(
+                tools["add_symbol_to_schematic"](
+                    schematic_path=tmp_sch,
+                    library_name="Device",
+                    symbol_name="DerivedPrivate",
+                    x=50.0,
+                    y=50.0,
+                )
+            )
+
+        assert result.get("success") is True, result
+        warnings = result["warnings"]
+        assert len(warnings) == 1, result
+        assert "Could not extract extends base symbol" in warnings[0]
+        assert "boom" in warnings[0]
+        assert "not found" not in warnings[0]
+
     def test_tool_places_all_private_fields_end_to_end(self, tools, tmp_sch):
         """add_symbol_to_schematic keeps KLC_A..D in lib_symbols and instance."""
         expected = {
