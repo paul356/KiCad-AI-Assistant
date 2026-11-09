@@ -906,6 +906,97 @@ class TestExtendsPropertyMerge:
         assert _single_property(placed, "KLC_A") == (True, "Derived private note A")
         assert _private_pairs(placed) == {"KLC_A": "Derived private note A"}
 
+    def test_malformed_base_property_skipped_without_aborting_merge(self, caplog):
+        """An unparseable base field is skipped; variant fields still merge.
+
+        Library extraction (skip) drops malformed property nodes, so the base
+        raw list is injected directly to exercise the merge's own guard.
+        """
+        import logging
+
+        import sexpdata
+        from sexpdata import Symbol as Sexp
+
+        from kcaa.tools.symbol_edit_tools import _resolve_extends_symbol
+        from kcaa.utils.symbol_extractor import extract_lib_symbol_raw
+
+        base_raw = extract_lib_symbol_raw(EXTENDS_BASE_PATH, 0, "KLCBase", 0.0, 0)
+        base_raw.append([Sexp("property"), "NoValue"])
+        variant = sexpdata.loads(_EXTENDS_PRIVATE_LIB_TEXT)
+
+        with (
+            patch(
+                "kcaa.tools.symbol_edit_tools._get_index_manager",
+                return_value=_make_mock_manager(EXTENDS_BASE_PATH),
+            ),
+            patch(
+                "kcaa.tools.symbol_edit_tools.extract_lib_symbol_raw",
+                return_value=base_raw,
+            ),
+            caplog.at_level(logging.WARNING),
+        ):
+            merged = _resolve_extends_symbol(variant, "Device/DerivedPrivate")
+
+        assert _private_pairs(merged) == {
+            "KLC_A": "Base note A",
+            "KLC_B": "Base note B",
+            "KLC_C": "Derived note C",
+            "KLC_D": "Derived note D",
+        }
+        assert all(name != "NoValue" for _, name in _property_identities(merged))
+        assert "Skipping unparseable property" in caplog.text
+
+    def test_malformed_variant_property_still_raises(self):
+        """A malformed variant field keeps failing instead of being skipped."""
+        from sexpdata import Symbol as Sexp
+
+        from kcaa.tools.symbol_edit_tools import _resolve_extends_symbol
+
+        variant = [
+            Sexp("symbol"),
+            "BadVariant",
+            [Sexp("extends"), "KLCBase"],
+            [Sexp("property"), "NoValue"],
+        ]
+        with patch(
+            "kcaa.tools.symbol_edit_tools._get_index_manager",
+            return_value=_make_mock_manager(EXTENDS_BASE_PATH),
+        ):
+            with pytest.raises(ValueError, match="Malformed property node"):
+                _resolve_extends_symbol(variant, "Device/BadVariant")
+
+    def test_tool_places_all_private_fields_end_to_end(self, tools, tmp_sch):
+        """add_symbol_to_schematic keeps KLC_A..D in lib_symbols and instance."""
+        expected = {
+            "KLC_A": "Base note A",
+            "KLC_B": "Base note B",
+            "KLC_C": "Derived note C",
+            "KLC_D": "Derived note D",
+        }
+
+        with patch(
+            "kcaa.tools.symbol_edit_tools._get_index_manager",
+            return_value=_make_mock_manager(EXTENDS_BASE_PATH),
+        ):
+            result = asyncio.run(
+                tools["add_symbol_to_schematic"](
+                    schematic_path=tmp_sch,
+                    library_name="Device",
+                    symbol_name="DerivedPrivate",
+                    x=50.0,
+                    y=50.0,
+                )
+            )
+        assert result.get("success") is True, result
+
+        sch = skip.Schematic(tmp_sch)
+        lib_symbol = sch.lib_symbols["Device:DerivedPrivate"]
+        assert _private_pairs(lib_symbol.raw) == expected
+
+        placed = [s for s in sch.symbol if s.lib_id.value == "Device:DerivedPrivate"]
+        assert len(placed) == 1
+        assert _private_pairs(placed[0].raw) == expected
+
     def test_ordinary_property_override_semantics_unchanged(self):
         """Ordinary properties and structural attributes keep today's rules."""
         import sexpdata
@@ -960,8 +1051,13 @@ class TestExtendsPropertyMerge:
         assert len(shared) == 1
         assert _property_parts(shared[0])[0] is False
 
-    def test_stock_relay_extends_shape_keeps_private_field(self):
-        """Relay_SolidState/AQY282S (extends TLP3123) keeps its KLC note."""
+    def test_stock_relay_extends_shape_merges_private_field(self):
+        """Real Relay_SolidState/AQY282S shape keeps its KLC note.
+
+        This is real-world shape coverage, not a #261 regression test: the
+        stock pair has a single private field on one side, so it also passes
+        with the old ``child[1]`` key.
+        """
         merged = self._resolve(_REAL_AQY282S_LIB_TEXT, "Relay_SolidState/AQY282S")
         private = {"KLC_S6.2": "1-Form-A describes the internal structure of the relay"}
         assert _private_pairs(merged) == private

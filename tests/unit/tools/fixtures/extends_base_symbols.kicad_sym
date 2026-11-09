@@ -202,6 +202,53 @@
     )
     (embedded_fonts no)
   )
+  (symbol "DerivedPrivate"
+    (extends "KLCBase")
+    (property "Reference" "U"
+      (at 0 0 0)
+      (effects
+        (font
+          (size 1.27 1.27)
+        )
+      )
+    )
+    (property "Value" "DerivedPrivate"
+      (at 0 2.54 0)
+      (effects
+        (font
+          (size 1.27 1.27)
+        )
+      )
+    )
+    (property private "KLC_C" "Derived note C"
+      (at 0 -10.16 0)
+      (effects
+        (font
+          (size 1.27 1.27)
+        )
+        (hide yes)
+      )
+    )
+    (property private "KLC_D" "Derived note D"
+      (at 0 -12.7 0)
+      (effects
+        (font
+          (size 1.27 1.27)
+        )
+        (hide yes)
+      )
+    )
+    (property "Shared" "derived-shared"
+      (at 0 -15.24 0)
+      (effects
+        (font
+          (size 1.27 1.27)
+        )
+        (hide yes)
+      )
+    )
+    (embedded_fonts no)
+  )
   (symbol "TLP3123"
     (exclude_from_sim no)
     (in_bom yes)

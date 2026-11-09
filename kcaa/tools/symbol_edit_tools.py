@@ -1771,6 +1771,9 @@ def _lib_property_merge_key(prop_raw: list) -> str:
     marker: a variant property replaces a base property of the same name even
     when their ``private`` flags differ.
     """
+    # Identity is the parsed field name verbatim (exact case).  KiCad writes
+    # canonical capitalisation, so mixed-case duplicates are out of scope and
+    # normalising names here is deliberately not done.
     return _parse_lib_property(prop_raw).name
 
 
@@ -1898,7 +1901,15 @@ def _resolve_extends_symbol(
             and len(child) >= 2
         ):
             continue
-        pkey = _lib_property_merge_key(child)
+        try:
+            pkey = _lib_property_merge_key(child)
+        except ValueError as exc:
+            log.warning(
+                "Skipping unparseable property in extends base symbol %r: %s",
+                base_name,
+                exc,
+            )
+            continue
         if pkey in seen_props:
             continue
         merged.append(copy.deepcopy(ext_props.get(pkey, child)))
