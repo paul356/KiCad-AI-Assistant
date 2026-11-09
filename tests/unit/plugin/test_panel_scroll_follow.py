@@ -162,12 +162,19 @@ def test_incremental_stream_update_passes_follow_mode() -> None:
     assert any(_keyword_name(call, "follow", "follow") for call in calls)
 
 
-def test_stop_forces_bottom() -> None:
+def test_stop_follows_without_forcing_bottom() -> None:
+    """Stopping must not yank a reader who scrolled up back to the bottom."""
     fn = _function("_on_stop")
-    append_calls = _calls(fn, "_append_entry_js")
-    render_calls = _calls(fn, "_render_conversation")
-    assert any(_keyword_true(call, "force_scroll_to_bottom") for call in append_calls)
-    assert any(_keyword_true(call, "force_scroll_to_bottom") for call in render_calls)
+    for attr in ("_append_entry_js", "_render_conversation"):
+        calls = _calls(fn, attr)
+        assert calls, f"_on_stop must finalise the partial entry via {attr}"
+        assert not any(_keyword_true(call, "force_scroll_to_bottom") for call in calls), (
+            f"stop must not force the view to the bottom via {attr}; "
+            "a scrolled-up reader keeps their place"
+        )
+        assert any(_keyword_true(call, "follow") for call in calls), (
+            f"stop must follow via {attr} so a reader already at the bottom stays there"
+        )
 
 
 def test_conversation_replacement_renders_with_replace() -> None:

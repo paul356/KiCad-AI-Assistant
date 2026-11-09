@@ -1980,9 +1980,9 @@ if _WX_AVAILABLE:
                 self._pending_ai_text = ""
                 self._conv_version += 1
                 if self._use_webview and self._shell_loaded:
-                    self._append_entry_js(entry, force_scroll_to_bottom=True)
+                    self._append_entry_js(entry, follow=True)
                 else:
-                    self._render_conversation(force_scroll_to_bottom=True)
+                    self._render_conversation(follow=True)
             self._busy = False
             self._toggle_send_stop(busy=False)
             # Persist what has been finalised so far — the turn was cancelled
