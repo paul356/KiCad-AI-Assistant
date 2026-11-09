@@ -167,7 +167,7 @@ class TestSearchSymbols:
 
 
 # ---------------------------------------------------------------------------
-# get_symbol / get_library_symbols (after sync)
+# get_symbol / list_library_symbols (after sync)
 # ---------------------------------------------------------------------------
 
 

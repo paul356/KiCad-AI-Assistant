@@ -13,7 +13,7 @@ tools: [connect_pins_with_wire, connect_points_with_wire, delete_wire_from_schem
   same internal net. It is NEVER flexible for polarised parts (diodes
   anode/cathode, electrolytic/tantalum capacitor +/-, LEDs, BJT/MOSFET
   terminals), ICs, connectors, or any pin whose name carries meaning
-  (VCC, GND, EN, CLK, D+, etc.). Use ``get_symbol_pins`` /
+  (VCC, GND, EN, CLK, D+, etc.). Use ``get_library_symbol_pins`` /
   ``components[ref].pins[*].num`` together with the symbol's datasheet
   semantics to pick the correct pin first; only then optimise geometry.
 - **When (and only when) the choice is between electrically equivalent

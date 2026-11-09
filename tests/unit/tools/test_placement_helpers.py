@@ -490,6 +490,45 @@ class TestPlaceSymbolRelative:
         # New symbol must be entirely to the right of the anchor.
         assert new_bb["min_x"] >= anchor_bb["max_x"]
 
+    def test_relative_symbol_miss_reports_scope(self, tmp_sch):
+        comps = _component_tools()
+        mgr = _make_mock_manager()
+        with patch(
+            "kcaa.tools.symbol_edit_tools._get_index_manager",
+            return_value=mgr,
+        ):
+            anchor = asyncio.run(
+                comps["add_symbol_to_schematic"](
+                    schematic_path=tmp_sch,
+                    library_name=_LIB_NAME,
+                    symbol_name=_SYM_NAME,
+                    x=120.0,
+                    y=80.0,
+                )
+            )
+        assert anchor["success"], anchor
+
+        mgr.get_symbol.return_value = None
+        with patch(
+            "kcaa.tools.symbol_edit_tools._get_index_manager",
+            return_value=mgr,
+        ):
+            out = asyncio.run(
+                comps["place_symbol_relative"](
+                    schematic_path=tmp_sch,
+                    library_name=_LIB_NAME,
+                    symbol_name="NoSuchSymbol",
+                    anchor_reference=anchor["reference_assigned"],
+                    side="right",
+                )
+            )
+
+        project_dir = os.path.realpath(os.path.dirname(tmp_sch))
+        assert out["error"] == (
+            f"Symbol 'NoSuchSymbol' not found in library '{_LIB_NAME}' "
+            f"(searched: global libraries plus the project libraries of {project_dir})."
+        )
+
     def test_relative_invalid_side_errors(self, tmp_sch):
         comps = _component_tools()
         out = asyncio.run(

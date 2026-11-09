@@ -54,15 +54,18 @@ _DEFAULT_DB_PATH = Path(config.get_kcaa_data_dir()) / "kicad_footprints.db"
 
 
 def normalize_project_id(input: str | None) -> str:
-    """Canonical project identifier for a ``.kicad_pro``/``.kicad_pcb`` path.
+    """Canonical project identifier for a project directory or a file in it.
 
-    Always the realpath of the parent directory, regardless of which file
-    kind was passed — sync (``.kicad_pro``) and find/add (``.kicad_pcb``)
+    An existing directory is used as-is (realpath); any other path is reduced
+    to its parent directory.  Sync (``.kicad_pro``), find/add
+    (``.kicad_pcb``), and callers that pass the project directory itself
     therefore produce identical strings and project-scoped lookups match.
     Empty string means "no project" (globals only).
     """
     if not input:
         return ""
+    if os.path.isdir(input):
+        return os.path.realpath(input)
     return os.path.realpath(os.path.dirname(input))
 
 

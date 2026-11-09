@@ -161,15 +161,27 @@ def _find_free_area_impl(
     if for_library and for_symbol:
         try:
             from kcaa.tools.symbol_edit_tools import _get_index_manager
+            from kcaa.tools.symbol_tools import _not_found_scope
             from kcaa.utils.symbol_extractor import extract_lib_symbol_raw
 
             mgr = _get_index_manager(schematic_path)
             lib_rec = mgr.get_library_by_name(for_library)
             if lib_rec is None:
-                return {"error": f"Library '{for_library}' not found in index"}
+                return {
+                    "error": (
+                        f"Library '{for_library}' not found in the index"
+                        f"{_not_found_scope(schematic_path, hint=False)}"
+                    )
+                }
             sym_rec = mgr.get_symbol(for_library, for_symbol)
             if sym_rec is None:
-                return {"error": (f"Symbol '{for_symbol}' not found in library '{for_library}'")}
+                return {
+                    "error": (
+                        f"Symbol '{for_symbol}' not found in library "
+                        f"'{for_library}'"
+                        f"{_not_found_scope(schematic_path, hint=False)}"
+                    )
+                }
             lib_raw = extract_lib_symbol_raw(
                 lib_rec.file_path,
                 sym_rec.file_index,

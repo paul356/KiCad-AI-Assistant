@@ -17,7 +17,7 @@ KiCad (GUI)
             └─ settings_dialog.py ← Settings dialog
 
 kcaa MCP server (subprocess, streamable-http on localhost)
-  └─ Profile: "plugin" — 25 skip-based schematic editing tools only
+  └─ Profile: "plugin" — 124 tools; 23 are the schematic/symbol core below
 ```
 
 ## Installation
@@ -61,6 +61,26 @@ cd "$env:APPDATA\kicad\10.0\scripting\plugins\kicad_ai_plugin"
 .\setup_plugin.bat
 ```
 
+#### Installing an unreleased build
+
+A PR branch or a CI `dist` artifact usually carries the same version as the last release, so a plain
+install would silently keep the PyPI release and the new tools would be missing. Pass the build instead:
+
+**Linux/macOS:**
+```bash
+./setup_plugin.sh /path/to/kcaa-build          # artifact file or source directory
+```
+
+**Windows:**
+```powershell
+.\setup_plugin.ps1 C:\path\to\kcaa-build       # artifact file or source directory
+```
+
+The local build is reinstalled over any equal version, and no `VERSION` file is required. Re-running
+`./setup_plugin.sh` (or `.\setup_plugin.ps1`) **without** an argument targets the released `kcaa` from
+PyPI again; if that release has the same version as the local build, delete `.venv` first to force the
+PyPI copy back.
+
 ### 3. Open KiCad
 
 1. Open KiCad and load your project
@@ -87,12 +107,12 @@ Settings are stored in the KiCad user config directory:
 
 ## Available Tools (Milestone 1)
 
-The plugin exposes 25 schematic editing tools to the LLM:
+The plugin registers 124 tools in total. The 23 tools below are the milestone-1 schematic/symbol core:
 
 - **Netlist inspection:** `extract_schematic_netlist`, `find_component_connections`
-- **Symbol search:** `search_symbols`, `get_symbol`, `list_symbol_libraries`, `get_symbol_pins` + 4 more
-- **Component editing:** `add_symbol_to_schematic`, `remove_symbol_from_schematic`, `move_component`, `set_symbol_property` + 5 more
-- **Wire editing:** `add_wire_to_schematic`, `connect_pins_with_wire`, `delete_wire_from_schematic` + 3 more
+- **Symbol search:** `search_library_symbols`, `get_library_symbol`, `list_symbol_libraries`, `get_library_symbol_pins` + 4 more
+- **Component editing:** `add_symbol_to_schematic`, `remove_symbol_from_schematic`, `move_component`, `set_symbol_property` + 6 more
+- **Wire editing:** `connect_points_with_wire`, `connect_pins_with_wire`, `delete_wire_from_schematic`
 
 See `docs/plugin/tool_contract.md` for full documentation.
 

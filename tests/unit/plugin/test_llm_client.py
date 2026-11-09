@@ -7,6 +7,7 @@ import io
 import json
 import logging
 import os
+from pathlib import Path
 import re
 import ssl
 import sys
@@ -15,6 +16,7 @@ import time
 import types
 from unittest.mock import ANY, MagicMock, patch
 import urllib.error
+import urllib.request
 
 import pytest
 
@@ -23,6 +25,19 @@ from kicad_plugin import session_store as sstore
 from kicad_plugin.llm_client import LLMClient, LLMTurnFailure, _subprocess_sse_stream
 from kicad_plugin.settings import DEFAULT_LLM_USER_AGENT
 from kicad_plugin.tool_registry import TOOL_POLICIES
+
+
+@pytest.fixture(autouse=True)
+def _neutralize_system_proxy(monkeypatch):
+    """Make these unit tests independent of the host's proxy configuration.
+
+    Most tests here patch ``urllib.request.urlopen`` and drive loopback MCP
+    URLs.  With a real system proxy configured, production code correctly
+    takes the direct-opener path for those URLs and the patch would never be
+    reached.  Proxy handling itself is covered by ``TestLoopbackProxyBypass``
+    and ``TestProxyEndToEnd``.
+    """
+    monkeypatch.setattr(urllib.request, "getproxies", lambda: {})
 
 
 def _on_event_collect(chunks):
@@ -2546,6 +2561,17 @@ class TestOpenAICompatibleRequests:
 
         assert client._user_agent() == llm_client._LLM_USER_AGENT
 
+    def test_fallback_user_agent_version_matches_pyproject(self):
+        """The fallback UA embeds the release version, so it must track
+        pyproject.toml (the plugin package has no __version__)."""
+        pyproject = Path(__file__).resolve().parents[3] / "pyproject.toml"
+        match = re.search(r'(?m)^version\s*=\s*"([^"]+)"', pyproject.read_text(encoding="utf-8"))
+        assert match is not None, "[project].version not found in pyproject.toml"
+        version = match.group(1)
+        expected = f"KiCad-AI-Assistant/{version} (+https://github.com/paul356/KiCad-AI-Assistant)"
+
+        assert expected == llm_client._LLM_USER_AGENT
+
 
 # ---------------------------------------------------------------------------
 # Google OpenAI-compatible endpoint (issue #145): detected by BASE URL, not by
@@ -3152,6 +3178,945 @@ class TestStreaming:
         # _call_llm must have been called with on_stream_event=on_event
         call_kwargs = client._call_llm.call_args
         assert call_kwargs.kwargs.get("on_stream_event") is on_event
+
+
+class TestToolCallArgumentsNormalization:
+    """Tool-call ``arguments`` must reach the client as JSON strings.
+
+    Ollama's native /api/chat encodes them as JSON objects while OpenAI
+    encodes them as serialized strings; both shapes must normalise so the
+    downstream ``json.loads(arguments or "{}")`` never receives a dict (#232).
+    """
+
+    def _make_line_response(self, lines):
+        """Return a mock response object that yields one line per readline()."""
+        data = [line.encode("utf-8") + b"\n" for line in lines] + [b""]
+        obj = MagicMock()
+        obj.readline.side_effect = data
+        obj.__enter__ = lambda s: s
+        obj.__exit__ = MagicMock(return_value=False)
+        return obj
+
+    def _stream_ollama(self, client, lines):
+        mock_resp = self._make_line_response(lines)
+        with patch("urllib.request.urlopen", return_value=mock_resp):
+            return client._stream_ollama("sys", [], on_stream_event=lambda evt: None)
+
+    def test_stream_ollama_object_arguments_become_json_string(self):
+        """Issue #232: the tool call that ends an Ollama stream carries a dict."""
+        client = _make_client()
+        client._settings.llm_provider = "ollama"
+        lines = [
+            '{"message":{"role":"assistant","content":"","tool_calls":'
+            '[{"index":0,"function":{"name":"get_board_info",'
+            '"arguments":{"detail":"full"}}}]},"done":false}',
+            '{"done":true,"done_reason":"stop"}',
+        ]
+
+        result = self._stream_ollama(client, lines)
+
+        assert "error" not in result, result.get("error")
+        tc = result["message"]["tool_calls"][0]
+        assert isinstance(tc["function"]["arguments"], str)
+        assert json.loads(tc["function"]["arguments"]) == {"detail": "full"}
+        assert tc["id"] == ""
+        assert result["finish_reason"] == "stop"
+
+    def test_stream_ollama_string_argument_fragments_still_concatenate(self):
+        """The string-delta path (OpenAI-style) must keep concatenating."""
+        client = _make_client()
+        client._settings.llm_provider = "ollama"
+        lines = [
+            '{"message":{"role":"assistant","content":"","tool_calls":'
+            '[{"index":0,"function":{"name":"add_wire","arguments":"{\\"a\\":"}}]},"done":false}',
+            '{"message":{"role":"assistant","content":"","tool_calls":'
+            '[{"index":0,"function":{"arguments":"1}"}}]},"done":false}',
+            '{"done":true,"done_reason":"tool_calls"}',
+        ]
+
+        result = self._stream_ollama(client, lines)
+
+        assert "error" not in result, result.get("error")
+        assert result["message"]["tool_calls"][0]["function"]["arguments"] == '{"a":1}'
+        assert result["finish_reason"] == "tool_calls"
+
+    def test_call_ollama_normalizes_object_arguments(self):
+        """The non-streaming path returns the raw Ollama message; its tool
+        calls must be normalised before the caller parses them."""
+        client = _make_client()
+        client._settings.llm_provider = "ollama"
+        body = {
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"function": {"name": "get_board_info", "arguments": {"detail": "full"}}}
+                ],
+            },
+            "done_reason": "tool_calls",
+        }
+        with patch(
+            "kicad_plugin.llm_client._https_post_json",
+            return_value=(200, json.dumps(body)),
+        ):
+            result = client._call_ollama("sys", [])
+
+        assert "error" not in result
+        assert result["finish_reason"] == "tool_calls"
+        arguments = result["message"]["tool_calls"][0]["function"]["arguments"]
+        assert isinstance(arguments, str)
+        assert json.loads(arguments) == {"detail": "full"}
+
+    def test_call_openai_normalizes_object_arguments(self):
+        """Ollama's OpenAI-compatible endpoint (/v1/chat/completions) also
+        returns arguments as an object on the non-streaming path."""
+        client = _make_client()
+        client._settings.llm_base_url = "http://127.0.0.1:11434/v1"
+        body = {
+            "choices": [
+                {
+                    "finish_reason": "tool_calls",
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "tc1",
+                                "type": "function",
+                                "function": {
+                                    "name": "get_board_info",
+                                    "arguments": {"detail": "full"},
+                                },
+                            }
+                        ],
+                    },
+                }
+            ]
+        }
+        with patch(
+            "kicad_plugin.llm_client._https_post_json",
+            return_value=(200, json.dumps(body)),
+        ):
+            result = client._call_openai("sys", [])
+
+        assert "error" not in result, result.get("error")
+        assert result["finish_reason"] == "tool_calls"
+        assert result["message"]["content"] == ""
+        arguments = result["message"]["tool_calls"][0]["function"]["arguments"]
+        assert isinstance(arguments, str)
+        assert json.loads(arguments) == {"detail": "full"}
+
+    def test_stream_openai_object_arguments_become_json_string(self):
+        """Local OpenAI-compatible endpoints (Ollama /v1, LM Studio,
+        llama.cpp) can also send arguments as an object."""
+        client = _make_client()
+        sse_lines = [
+            'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"tc1",'
+            '"function":{"name":"get_board_info","arguments":{"detail":"full"}}}]},'
+            '"finish_reason":null}]}',
+            'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}',
+            "data: [DONE]",
+        ]
+        mock_resp = self._make_line_response(sse_lines)
+        with patch("urllib.request.urlopen", return_value=mock_resp):
+            result = client._stream_openai("sys", [], on_stream_event=lambda evt: None)
+
+        assert "error" not in result, result.get("error")
+        tc = result["message"]["tool_calls"][0]
+        assert tc["id"] == "tc1"
+        assert isinstance(tc["function"]["arguments"], str)
+        assert json.loads(tc["function"]["arguments"]) == {"detail": "full"}
+
+    def test_stream_ollama_ignores_non_string_content(self):
+        """Content blocks (list/dict) from compatible endpoints must not break
+        ``"".join`` nor be JSON-pasted into the chat text."""
+        client = _make_client()
+        client._settings.llm_provider = "ollama"
+        lines = [
+            '{"message":{"role":"assistant","content":[{"type":"text","text":"hi"}]},"done":false}',
+            '{"message":{"role":"assistant","content":{"text":"x"}},"done":false}',
+            '{"message":{"role":"assistant","content":"Plan: check the board."},"done":false}',
+            '{"done":true,"done_reason":"stop"}',
+        ]
+
+        # kicad_plugin loggers do not propagate to the root (plugin logging
+        # sets propagate=False), so caplog never sees them — attach a capture
+        # handler straight to the module logger instead.
+        warnings: list[str] = []
+        handler = logging.Handler()
+        handler.emit = lambda record: warnings.append(record.getMessage())  # type: ignore[method-assign]
+        logger = logging.getLogger("kicad_plugin.llm_client")
+        logger.addHandler(handler)
+        try:
+            result = self._stream_ollama(client, lines)
+        finally:
+            logger.removeHandler(handler)
+
+        assert "error" not in result, result.get("error")
+        assert result["message"]["content"] == "Plan: check the board."
+        assert result["finish_reason"] == "stop"
+        assert sum("non-string content" in w for w in warnings) == 2
+
+    def test_stream_ollama_skips_non_dict_message(self):
+        """An /api/generate-style or truncated chunk must be skipped."""
+        client = _make_client()
+        client._settings.llm_provider = "ollama"
+        lines = [
+            '{"message": "oops", "done": false}',
+            '{"done": true, "done_reason": "stop"}',
+        ]
+
+        result = self._stream_ollama(client, lines)
+
+        assert "error" not in result, result.get("error")
+        assert result["message"]["content"] == ""
+        assert result["finish_reason"] == "stop"
+
+    # ---- Ollama outbound arguments must be objects -------------------------
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            ("[1,2]", {}),
+            ([1, 2], {}),
+            ('"s"', {}),
+            ("5", {}),
+            ("", {}),
+            (None, {}),
+            ("{not json", {}),
+            ('{"a": 1}', {"a": 1}),
+            ({"a": 1}, {"a": 1}),
+        ],
+    )
+    def test_to_ollama_tool_arguments_accepts_only_objects(self, value, expected):
+        """Ollama's native API only accepts JSON objects; a JSON array,
+        scalar, or junk must collapse to ``{}`` instead of being forwarded."""
+        assert llm_client._to_ollama_tool_arguments(value) == expected
+
+    def test_ollama_outbound_list_arguments_become_empty_object(self):
+        """A history entry holding ``[1,2]`` must not reach Ollama as a list
+        (its API rejects it with the same 400 as a string)."""
+        client = _make_client()
+        client._history = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tc1",
+                        "type": "function",
+                        "function": {"name": "list_tracks", "arguments": "[1,2]"},
+                    }
+                ],
+            }
+        ]
+
+        outbound = client._ollama_messages()[0]
+
+        assert outbound["tool_calls"][0]["function"]["arguments"] == {}
+        assert client._history[0]["tool_calls"][0]["function"]["arguments"] == "[1,2]"
+
+    def test_build_anthropic_messages_list_arguments_become_empty_object(self):
+        """Anthropic requires ``input`` to be an object; a JSON array in
+        history must fall back to ``{}``."""
+        client = _make_client()
+        client._history = [
+            {"role": "user", "content": "which tracks?"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tc1",
+                        "type": "function",
+                        "function": {"name": "list_tracks", "arguments": "[1,2]"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "tc1", "content": "[]"},
+        ]
+
+        messages = client._build_anthropic_messages()
+
+        assistant = next(m for m in messages if m["role"] == "assistant")
+        assert assistant["content"][0]["input"] == {}
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            ({"a": 1}, {"a": 1}),
+            ([1, 2], {}),
+            (5, {}),
+            ("", {}),
+            ("{not json", {}),
+            ('{"a":1}', {"a": 1}),
+            ("[1,2]", {}),
+        ],
+    )
+    def test_anthropic_tool_input_accepts_any_arguments_shape(self, value, expected):
+        """Restored session history can hold a non-string ``arguments``
+        (``_validate_history`` does not check it); ``input`` must degrade to
+        ``{}`` for anything that is not a JSON object, never raise the
+        ``TypeError`` json.loads raises for a dict/list/int."""
+        assert llm_client._anthropic_tool_input(value) == expected
+
+    # ---- Ollama native API round trip (P1) ---------------------------------
+
+    def test_ollama_outbound_history_arguments_are_objects(self):
+        """P1: Ollama's native /api/chat rejects string arguments with
+        ``400 Value looks like object, but can't find closing '}' symbol``,
+        so a normalized history entry must be decoded back to an object while
+        history itself keeps the internal string form."""
+        client = _make_client()
+        client._settings.llm_provider = "ollama"
+        lines = [
+            '{"message":{"role":"assistant","content":"","tool_calls":'
+            '[{"index":0,"function":{"name":"get_board_info",'
+            '"arguments":{"detail":"full"}}}]},"done":false}',
+            '{"done":true,"done_reason":"tool_calls"}',
+        ]
+        streamed = self._stream_ollama(client, lines)
+        assert "error" not in streamed, streamed.get("error")
+
+        history_message = dict(streamed["message"], role="assistant")
+        client._history = [{"role": "user", "content": "board?"}, history_message]
+
+        outbound = client._ollama_messages()[-1]
+        arguments = outbound["tool_calls"][0]["function"]["arguments"]
+        assert isinstance(arguments, dict)
+        assert arguments == {"detail": "full"}
+        assert outbound["tool_calls"][0]["function"]["name"] == "get_board_info"
+
+        # The internal representation and the caller's object stay untouched.
+        assert isinstance(history_message["tool_calls"][0]["function"]["arguments"], str)
+        assert client._history[-1] is history_message
+        assert isinstance(
+            client._history[-1]["tool_calls"][0]["function"]["arguments"],
+            str,
+        )
+
+    def test_ollama_outbound_empty_or_broken_arguments_become_objects(self):
+        """``""`` (no-argument tool call), ``None`` and unparseable strings
+        must reach Ollama as ``{}`` instead of raising."""
+        client = _make_client()
+        client._history = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "a", "type": "function", "function": {"name": "t1", "arguments": ""}},
+                    {"id": "b", "type": "function", "function": {"name": "t2", "arguments": None}},
+                    {
+                        "id": "c",
+                        "type": "function",
+                        "function": {"name": "t3", "arguments": "{not json"},
+                    },
+                ],
+            }
+        ]
+
+        outbound = client._ollama_messages()[0]
+
+        assert [tc["function"]["arguments"] for tc in outbound["tool_calls"]] == [{}, {}, {}]
+        assert client._history[0]["tool_calls"][2]["function"]["arguments"] == "{not json"
+
+    def test_ollama_second_round_request_body_uses_object_arguments(self):
+        """P1 end-to-end: the JSON actually POSTed on the follow-up turn must
+        carry ``arguments`` as an object."""
+        client = _make_client()
+        client._settings.llm_provider = "ollama"
+        client._history = [
+            {"role": "user", "content": "board?"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "",
+                        "type": "function",
+                        "function": {
+                            "name": "get_board_info",
+                            "arguments": '{"detail": "full"}',
+                        },
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "", "content": "{}"},
+        ]
+        captured: dict[str, object] = {}
+        mock_resp = self._make_line_response(['{"done":true,"done_reason":"stop"}'])
+
+        def _fake_urlopen(req, timeout, **kwargs):
+            captured["body"] = json.loads(req.data.decode())
+            return mock_resp
+
+        with patch("kicad_plugin.llm_client._urlopen", side_effect=_fake_urlopen):
+            result = client._stream_ollama("sys", [], on_stream_event=lambda evt: None)
+
+        assert "error" not in result, result.get("error")
+        sent = next(m for m in captured["body"]["messages"] if m.get("role") == "assistant")
+        assert sent["tool_calls"][0]["function"]["arguments"] == {"detail": "full"}
+
+    def test_stream_ollama_http_error_includes_body(self):
+        """A rejected second-round payload (HTTP 400) must show the provider's
+        body, not a bare status code."""
+        client = _make_client()
+        client._settings.llm_provider = "ollama"
+        err = urllib.error.HTTPError(
+            "http://127.0.0.1:11434/api/chat",
+            400,
+            "Bad Request",
+            {},
+            io.BytesIO(
+                b'{"error":"Value looks like object, but can\'t find closing \'}\' symbol"}'
+            ),
+        )
+        with patch("urllib.request.urlopen", side_effect=err):
+            result = client._stream_ollama("sys", [], on_stream_event=lambda evt: None)
+
+        assert result["error"].startswith("Ollama request failed: HTTP 400:")
+        assert "Value looks like object" in result["error"]
+
+    # ---- Remaining covered contracts (P2) ----------------------------------
+
+    def test_stream_openai_relay_serializes_object_arguments(self):
+        """P2-1: ``_in_process_ssl`` is sticky, so a loopback Ollama /v1 URL is
+        relayed through the subprocess script once SSL failed earlier.  That
+        script has its own accumulator and must serialize objects too."""
+        lines = [
+            'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"tc1",'
+            '"function":{"name":"get_board_info","arguments":{"detail":"full"}}}]},'
+            '"finish_reason":null}]}',
+            'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}',
+            "data: [DONE]",
+        ]
+        server = _SSETestServer(lines)
+        client = _make_client()
+        client._settings.llm_base_url = server.url
+        try:
+            with (
+                patch.object(llm_client, "_in_process_ssl", False),
+                patch(
+                    "kicad_plugin.llm_client._resolve_plugin_python",
+                    return_value=sys.executable,
+                ),
+                patch(
+                    "kicad_plugin.llm_client._subprocess_env",
+                    return_value={"PATH": os.environ.get("PATH", "")},
+                ),
+            ):
+                result = client._stream_openai("sys", [], on_stream_event=lambda evt: None)
+        finally:
+            server.shutdown()
+
+        assert "error" not in result, result.get("error")
+        tc = result["message"]["tool_calls"][0]
+        assert tc["id"] == "tc1"
+        assert isinstance(tc["function"]["arguments"], str)
+        assert json.loads(tc["function"]["arguments"]) == {"detail": "full"}
+
+    def test_build_anthropic_messages_empty_arguments(self):
+        """P2-2: a no-argument tool call normalizes to ``""``; the Anthropic
+        history builder must fall back to ``{}`` instead of raising."""
+        client = _make_client()
+        client._history = [
+            {"role": "user", "content": "which tracks?"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tc1",
+                        "type": "function",
+                        "function": {"name": "list_tracks", "arguments": ""},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "tc1", "content": "[]"},
+        ]
+
+        messages = client._build_anthropic_messages()
+
+        assistant = next(m for m in messages if m["role"] == "assistant")
+        assert assistant["content"][0]["type"] == "tool_use"
+        assert assistant["content"][0]["input"] == {}
+
+    def test_normalize_tool_calls_copies_instead_of_mutating(self):
+        """P2-3: the helper must not rewrite the caller's response body."""
+        original = [
+            {
+                "id": "tc1",
+                "type": "function",
+                "function": {"name": "get_board_info", "arguments": {"detail": "full"}},
+            }
+        ]
+
+        normalized = llm_client._normalize_tool_calls(original)
+
+        assert normalized[0]["function"]["arguments"] == '{"detail": "full"}'
+        assert isinstance(original[0]["function"]["arguments"], dict)
+        assert original[0]["function"]["arguments"] == {"detail": "full"}
+        assert normalized[0] is not original[0]
+        assert normalized[0]["function"] is not original[0]["function"]
+
+
+class TestToolCallSlotRouting:
+    """Issue #234: a provider may return several tool calls in one message
+    with no ``index`` on any of them.  An index is only a merge key; a
+    nameless index-less delta is an argument fragment of the previous call."""
+
+    def _make_line_response(self, lines):
+        data = [line.encode("utf-8") + b"\n" for line in lines] + [b""]
+        obj = MagicMock()
+        obj.readline.side_effect = data
+        obj.__enter__ = lambda s: s
+        obj.__exit__ = MagicMock(return_value=False)
+        return obj
+
+    def _stream_ollama(self, client, lines):
+        mock_resp = self._make_line_response(lines)
+        with patch("urllib.request.urlopen", return_value=mock_resp):
+            return client._stream_ollama("sys", [], on_stream_event=lambda evt: None)
+
+    def test_stream_ollama_indexless_parallel_calls_get_separate_slots(self):
+        """Ollama returns the whole tool_calls array in one message and omits
+        ``index`` entirely: four calls must not collapse into slot 0."""
+        client = _make_client()
+        client._settings.llm_provider = "ollama"
+        chunk = json.dumps(
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {"function": {"name": "get_board_info", "arguments": {"detail": "full"}}},
+                        {"function": {"name": "list_footprints", "arguments": {"layer": "F.Cu"}}},
+                        {"function": {"name": "list_tracks", "arguments": {"net": "GND"}}},
+                        {
+                            "function": {
+                                "name": "extract_schematic_netlist",
+                                "arguments": {"format": "json"},
+                            }
+                        },
+                    ],
+                },
+                "done": False,
+            }
+        )
+        lines = [chunk, '{"done":true,"done_reason":"tool_calls"}']
+
+        result = self._stream_ollama(client, lines)
+
+        assert "error" not in result, result.get("error")
+        tcs = result["message"]["tool_calls"]
+        assert [tc["function"]["name"] for tc in tcs] == [
+            "get_board_info",
+            "list_footprints",
+            "list_tracks",
+            "extract_schematic_netlist",
+        ]
+        assert [json.loads(tc["function"]["arguments"]) for tc in tcs] == [
+            {"detail": "full"},
+            {"layer": "F.Cu"},
+            {"net": "GND"},
+            {"format": "json"},
+        ]
+
+    def test_stream_ollama_real_wire_shape_keeps_parallel_calls_apart(self):
+        """Replay of an Ollama 0.30.5 capture: one complete call per chunk,
+        ``index`` nested in ``function``, ``arguments`` an object."""
+        client = _make_client()
+        client._settings.llm_provider = "ollama"
+        chunk_a = {
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_a",
+                        "function": {
+                            "index": 0,
+                            "name": "get_board_info",
+                            "arguments": {"detail": "full"},
+                        },
+                    }
+                ],
+            },
+            "done": False,
+        }
+        chunk_b = {
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_b",
+                        "function": {
+                            "index": 1,
+                            "name": "list_footprints",
+                            "arguments": {},
+                        },
+                    }
+                ],
+            },
+            "done": False,
+        }
+        lines = [json.dumps(chunk_a), json.dumps(chunk_b), '{"done":true}']
+
+        result = self._stream_ollama(client, lines)
+
+        assert "error" not in result, result.get("error")
+        tcs = result["message"]["tool_calls"]
+        assert [tc["id"] for tc in tcs] == ["call_a", "call_b"]
+        assert [tc["function"]["name"] for tc in tcs] == ["get_board_info", "list_footprints"]
+        assert [json.loads(tc["function"]["arguments"] or "{}") for tc in tcs] == [
+            {"detail": "full"},
+            {},
+        ]
+
+    def test_tool_call_slot_prefers_nested_function_index(self):
+        """Ollama nests the provider index in ``function``; a nameless delta
+        carrying it must join that call instead of the previously routed
+        slot, while a top-level ``index`` keeps its OpenAI behaviour."""
+        slots = {0: {"function": {"name": "get_board_info", "arguments": ""}}}
+
+        nested = llm_client._tool_call_slot(
+            slots, {"function": {"index": 1, "arguments": '{"a":'}}, 1, 0
+        )
+        assert nested == (1, 2, 1)
+
+        top_level = llm_client._tool_call_slot(
+            slots, {"index": 0, "function": {"arguments": "{}"}}, 1, 1
+        )
+        assert top_level == (0, 1, 0)
+
+    @pytest.mark.parametrize("provider_index", [1, 5])
+    def test_stream_ollama_mixed_indices_keep_wire_order(self, provider_index):
+        """A derived slot must be allocated after the highest provider index;
+        otherwise ``sorted()`` replays a mixed stream out of order."""
+        first_name = "second_on_wire"
+        client = _make_client()
+        client._settings.llm_provider = "ollama"
+        indexed = json.dumps(
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "function": {
+                                "index": provider_index,
+                                "name": first_name,
+                                "arguments": {"x": 1},
+                            }
+                        }
+                    ],
+                },
+                "done": False,
+            }
+        )
+        indexless = json.dumps(
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{"function": {"name": "third_on_wire", "arguments": {"x": 2}}}],
+                },
+                "done": False,
+            }
+        )
+        lines = [indexed, indexless, '{"done":true,"done_reason":"tool_calls"}']
+
+        result = self._stream_ollama(client, lines)
+
+        assert "error" not in result, result.get("error")
+        assert [tc["function"]["name"] for tc in result["message"]["tool_calls"]] == [
+            first_name,
+            "third_on_wire",
+        ]
+
+    def test_stream_ollama_derived_slot_stays_above_highest_index(self):
+        """``_tool_call_slot`` must advance to the highest index seen, not the
+        last one: slots 5 then 1 leave the index-less call in 6, not 2."""
+        client = _make_client()
+        client._settings.llm_provider = "ollama"
+
+        def _chunk(name, index=None, call_id=""):
+            function: dict[str, object] = {"name": name, "arguments": {"x": 1}}
+            if index is not None:
+                function["index"] = index
+            return json.dumps(
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [{"id": call_id, "function": function}],
+                    },
+                    "done": False,
+                }
+            )
+
+        lines = [
+            _chunk("first@5", 5, "a"),
+            _chunk("first@1", 1, "b"),
+            _chunk("derived@6", None, "c"),
+            '{"done":true,"done_reason":"tool_calls"}',
+        ]
+
+        result = self._stream_ollama(client, lines)
+
+        assert "error" not in result, result.get("error")
+        assert [tc["function"]["name"] for tc in result["message"]["tool_calls"]] == [
+            "first@1",
+            "first@5",
+            "derived@6",
+        ]
+
+    def test_stream_ollama_reversed_nested_indices_keep_provider_order(self):
+        """The provider index, not the arrival order, defines the call order —
+        a name-based fallback would emit these two chunks reversed."""
+        client = _make_client()
+        client._settings.llm_provider = "ollama"
+        chunk_second = json.dumps(
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_second",
+                            "function": {
+                                "index": 1,
+                                "name": "second_on_index",
+                                "arguments": {"y": 2},
+                            },
+                        }
+                    ],
+                },
+                "done": False,
+            }
+        )
+        chunk_first = json.dumps(
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_first",
+                            "function": {
+                                "index": 0,
+                                "name": "first_on_index",
+                                "arguments": {"x": 1},
+                            },
+                        }
+                    ],
+                },
+                "done": False,
+            }
+        )
+        lines = [chunk_second, chunk_first, '{"done":true}']
+
+        result = self._stream_ollama(client, lines)
+
+        assert "error" not in result, result.get("error")
+        tcs = result["message"]["tool_calls"]
+        assert [tc["id"] for tc in tcs] == ["call_first", "call_second"]
+        assert [tc["function"]["name"] for tc in tcs] == [
+            "first_on_index",
+            "second_on_index",
+        ]
+
+    def test_stream_ollama_indexless_argument_fragment_continues_last_slot(self):
+        """A nameless index-less delta is a fragment of the call opened by the
+        previous chunk — it must not start a new slot."""
+        client = _make_client()
+        client._settings.llm_provider = "ollama"
+        lines = [
+            json.dumps(
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [{"function": {"name": "add_wire", "arguments": '{"a":'}}],
+                    },
+                    "done": False,
+                }
+            ),
+            json.dumps(
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [{"function": {"arguments": "1}"}}],
+                    },
+                    "done": False,
+                }
+            ),
+            '{"done":true,"done_reason":"tool_calls"}',
+        ]
+
+        result = self._stream_ollama(client, lines)
+
+        assert "error" not in result, result.get("error")
+        tcs = result["message"]["tool_calls"]
+        assert len(tcs) == 1
+        assert tcs[0]["function"]["name"] == "add_wire"
+        assert tcs[0]["function"]["arguments"] == '{"a":1}'
+
+    def test_stream_openai_indexless_parallel_calls_get_separate_slots(self):
+        """The in-process OpenAI-compatible parser has the same contract."""
+        client = _make_client()
+        sse_lines = [
+            'data: {"choices":[{"delta":{"tool_calls":['
+            '{"id":"a","function":{"name":"get_board_info","arguments":{}}},'
+            '{"id":"b","function":{"name":"list_footprints","arguments":{}}}]},'
+            '"finish_reason":null}]}',
+            'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}',
+            "data: [DONE]",
+        ]
+        mock_resp = self._make_line_response(sse_lines)
+        with patch("urllib.request.urlopen", return_value=mock_resp):
+            result = client._stream_openai("sys", [], on_stream_event=lambda evt: None)
+
+        assert "error" not in result, result.get("error")
+        tcs = result["message"]["tool_calls"]
+        assert [tc["function"]["name"] for tc in tcs] == [
+            "get_board_info",
+            "list_footprints",
+        ]
+        assert [tc["id"] for tc in tcs] == ["a", "b"]
+
+    def _stream_openai_via_relay(self, sse_lines):
+        server = _SSETestServer(sse_lines)
+        client = _make_client()
+        client._settings.llm_base_url = server.url
+        try:
+            with (
+                patch.object(llm_client, "_in_process_ssl", False),
+                patch(
+                    "kicad_plugin.llm_client._resolve_plugin_python",
+                    return_value=sys.executable,
+                ),
+                patch(
+                    "kicad_plugin.llm_client._subprocess_env",
+                    return_value={"PATH": os.environ.get("PATH", "")},
+                ),
+            ):
+                return client._stream_openai("sys", [], on_stream_event=lambda evt: None)
+        finally:
+            server.shutdown()
+
+    def test_relay_indexless_parallel_calls_get_separate_slots(self):
+        """The subprocess relay script keeps its own accumulator and must
+        route index-less calls the same way."""
+        sse_lines = [
+            'data: {"choices":[{"delta":{"tool_calls":['
+            '{"id":"a","function":{"name":"get_board_info","arguments":{}}},'
+            '{"id":"b","function":{"name":"list_footprints","arguments":{}}}]},'
+            '"finish_reason":null}]}',
+            'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}',
+            "data: [DONE]",
+        ]
+
+        result = self._stream_openai_via_relay(sse_lines)
+
+        assert "error" not in result, result.get("error")
+        tcs = result["message"]["tool_calls"]
+        assert [tc["function"]["name"] for tc in tcs] == [
+            "get_board_info",
+            "list_footprints",
+        ]
+
+    def test_relay_honours_nested_function_index(self):
+        """The relay copy must read Ollama's nested ``function.index`` exactly
+        like the in-process parser; the name fallback would emit these two
+        chunks in arrival order instead of provider order."""
+        sse_lines = [
+            'data: {"choices":[{"delta":{"tool_calls":['
+            '{"id":"second","function":{"index":1,"name":"second_on_index",'
+            '"arguments":{"y":2}}},'
+            '{"id":"first","function":{"index":0,"name":"first_on_index",'
+            '"arguments":{"x":1}}}]},"finish_reason":null}]}',
+            'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}',
+            "data: [DONE]",
+        ]
+
+        result = self._stream_openai_via_relay(sse_lines)
+
+        assert "error" not in result, result.get("error")
+        tcs = result["message"]["tool_calls"]
+        assert [tc["id"] for tc in tcs] == ["first", "second"]
+        assert [tc["function"]["name"] for tc in tcs] == [
+            "first_on_index",
+            "second_on_index",
+        ]
+
+    def test_relay_mixed_indices_keep_wire_order(self):
+        """The relay must derive slots above a provider's explicit index;
+        otherwise a mixed stream is replayed out of wire order once
+        ``sorted()`` orders slots instead of arrival."""
+        sse_lines = [
+            'data: {"choices":[{"delta":{"tool_calls":[{"index":5,"id":"a",'
+            '"function":{"name":"first_wire","arguments":{"x":1}}}]},'
+            '"finish_reason":null}]}',
+            'data: {"choices":[{"delta":{"tool_calls":[{"id":"b",'
+            '"function":{"name":"second_wire","arguments":{"y":2}}}]},'
+            '"finish_reason":null}]}',
+            'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}',
+            "data: [DONE]",
+        ]
+
+        result = self._stream_openai_via_relay(sse_lines)
+
+        assert "error" not in result, result.get("error")
+        tcs = result["message"]["tool_calls"]
+        assert [tc["function"]["name"] for tc in tcs] == ["first_wire", "second_wire"]
+
+    def test_relay_derived_slot_stays_above_highest_index(self):
+        """The derived slot must clear the *highest* index seen, not the last
+        one: with slots 5 then 1, the index-less call belongs in 6, not 2."""
+        sse_lines = [
+            'data: {"choices":[{"delta":{"tool_calls":[{"index":5,"id":"a",'
+            '"function":{"name":"first@5","arguments":{}}}]},"finish_reason":null}]}',
+            'data: {"choices":[{"delta":{"tool_calls":[{"index":1,"id":"b",'
+            '"function":{"name":"first@1","arguments":{}}}]},"finish_reason":null}]}',
+            'data: {"choices":[{"delta":{"tool_calls":[{"id":"c",'
+            '"function":{"name":"derived@6","arguments":{}}}]},"finish_reason":null}]}',
+            'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}',
+            "data: [DONE]",
+        ]
+
+        result = self._stream_openai_via_relay(sse_lines)
+
+        assert "error" not in result, result.get("error")
+        assert [tc["function"]["name"] for tc in result["message"]["tool_calls"]] == [
+            "first@1",
+            "first@5",
+            "derived@6",
+        ]
+
+    def test_relay_nameless_fragment_follows_negative_index(self):
+        """Parity with ``_tool_call_slot``: a negative provider index is a real
+        slot, not the relay's old "no slot yet" sentinel, so the fragment
+        joins it instead of opening slot 0."""
+        sse_lines = [
+            'data: {"choices":[{"delta":{"tool_calls":[{"index":-1,"function":'
+            '{"name":"neg","arguments":"{\\"x\\":"}}]},'
+            '"finish_reason":null}]}',
+            'data: {"choices":[{"delta":{"tool_calls":[{"function":'
+            '{"arguments":"1}"}}]},"finish_reason":null}]}',
+            'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}',
+            "data: [DONE]",
+        ]
+
+        result = self._stream_openai_via_relay(sse_lines)
+
+        assert "error" not in result, result.get("error")
+        tcs = result["message"]["tool_calls"]
+        assert len(tcs) == 1
+        assert tcs[0]["function"]["name"] == "neg"
+        assert tcs[0]["function"]["arguments"] == '{"x":1}'
 
 
 class TestSubprocessSSEStream:
@@ -3918,9 +4883,9 @@ class TestAnnotateStaleQueries:
         assert not tc2_r["content"].startswith(_STALE_MARKER)  # sheet_meta
 
     def test_library_query_never_annotated(self):
-        """Library queries (search_symbols etc.) have no QUERY_CATEGORY entry."""
+        """Library queries (search_library_symbols etc.) have no QUERY_CATEGORY entry."""
         history = self._build_history(
-            ("query", "search_symbols", "f.sch", "tc1", '["opamp"]'),
+            ("query", "search_library_symbols", "f.sch", "tc1", '["opamp"]'),
             ("mutation", "add_symbol_to_schematic", "f.sch", "tc2"),
         )
         client = _make_client()
@@ -5355,3 +6320,499 @@ class TestSkillFrontMatterToolsParsing:
         text = '---\nname: x\npriority: 50\ndescription: "d"\n---\nbody'
         meta = llm_client._parse_skill_front_matter(text)
         assert "tools" not in meta
+
+
+# ---------------------------------------------------------------------------
+# Loopback proxy bypass (issue #230, defect A)
+# ---------------------------------------------------------------------------
+
+
+class TestLoopbackProxyBypass:
+    """``_urlopen`` must route loopback destinations direct only when the
+    system proxy would otherwise intercept them, and must leave every other
+    path byte-for-byte unchanged."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_loopback_opener(self, monkeypatch):
+        monkeypatch.setattr(llm_client, "_loopback_opener", None)
+
+    @staticmethod
+    def _request(url: str):
+        return urllib.request.Request(url, data=b"{}", method="POST")
+
+    def _use_fake_loopback_opener(self, monkeypatch):
+        """Install a fake cached opener and return ``(opener, calls)``."""
+        calls: list[tuple[object, float | None]] = []
+
+        class _Opener:
+            def open(self, request, timeout=None):
+                calls.append((request, timeout))
+                resp = MagicMock(status=200)
+                resp.read.return_value = b'{"ok": true}'
+                resp.__enter__.return_value = resp
+                return resp
+
+        opener = _Opener()
+        monkeypatch.setattr(llm_client, "_loopback_opener", opener)
+        return opener, calls
+
+    @pytest.mark.parametrize(
+        "proxies",
+        [
+            {"http": "http://proxy.example:8118"},
+            {"https": "http://proxy.example:8118"},
+            {"http": "http://proxy.example:8118", "https": "http://proxy.example:8118"},
+        ],
+    )
+    def test_loopback_with_proxy_uses_direct_opener(self, monkeypatch, proxies):
+        monkeypatch.setattr(urllib.request, "getproxies", lambda: proxies)
+        opener, calls = self._use_fake_loopback_opener(monkeypatch)
+        req = self._request("http://127.0.0.1:8043/mcp")
+
+        with patch("urllib.request.urlopen", side_effect=AssertionError("system opener used")):
+            out = llm_client._urlopen(req, 7)
+
+        assert out.read() == b'{"ok": true}'
+        assert calls == [(req, 7)]
+
+    def test_external_with_proxy_uses_default_opener(self, monkeypatch):
+        monkeypatch.setattr(urllib.request, "getproxies", lambda: {"http": "http://proxy:8118"})
+        _, loopback_calls = self._use_fake_loopback_opener(monkeypatch)
+        req = self._request("https://api.deepseek.com/v1/chat/completions")
+        sentinel = object()
+
+        with patch("urllib.request.urlopen", return_value=sentinel) as system_urlopen:
+            out = llm_client._urlopen(req, 9)
+
+        assert out is sentinel
+        system_urlopen.assert_called_once_with(req, timeout=9)
+        # The loopback opener must never be used for outbound traffic.
+        assert loopback_calls == []
+
+    def test_loopback_without_proxy_keeps_default_opener(self, monkeypatch):
+        monkeypatch.setattr(urllib.request, "getproxies", lambda: {})
+        _, loopback_calls = self._use_fake_loopback_opener(monkeypatch)
+        req = self._request("http://127.0.0.1:8043/mcp")
+        sentinel = object()
+
+        with patch("urllib.request.urlopen", return_value=sentinel) as system_urlopen:
+            out = llm_client._urlopen(req, 5)
+
+        assert out is sentinel
+        system_urlopen.assert_called_once_with(req, timeout=5)
+        assert loopback_calls == []
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "http://localhost/mcp",
+            "http://localhost:11434/api/chat",
+            "https://LOCALHOST:443/mcp",
+            "http://127.0.0.1:8043/mcp",
+            "http://127.1.2.3:99/mcp",
+            "http://[::1]:8080/mcp",
+            "http://0.0.0.0:1234/mcp",
+            "http://localhost./mcp",
+            "https://LOCALHOST.:443/mcp",
+            "http://127.1:8043/mcp",
+            "http://127.0.1:8043/mcp",
+            "http://[::ffff:127.0.0.1]:8043/mcp",
+        ],
+    )
+    def test_is_loopback_url_accepts_loopback_hosts(self, url):
+        assert llm_client._is_loopback_url(url) is True
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "http://127.evil.com/mcp",
+            "http://127.0.0.1.evil.com/mcp",
+            "http://127.1.evil.com/mcp",
+            "http://localhost.evil.com/mcp",
+            "http://2130706433/mcp",
+            "http://1.2.3/mcp",
+            "http://10.0.0.1/mcp",
+            "http://192.168.71.5:8118/",
+            "https://example.com/mcp",
+            "https://api.deepseek.com/v1/chat/completions",
+            "not a url",
+            "",
+        ],
+    )
+    def test_is_loopback_url_rejects_non_loopback_hosts(self, url):
+        assert llm_client._is_loopback_url(url) is False
+
+    def test_host_with_embedded_nul_is_rejected_without_raising(self):
+        """``inet_aton`` raises ValueError (not OSError) on a NUL byte."""
+        assert llm_client._is_loopback_url("http://127.0.0.1\x00evil.com/") is False
+
+    def test_proxy_would_intercept_requires_both_conditions(self, monkeypatch):
+        monkeypatch.setattr(urllib.request, "getproxies", lambda: {"http": "http://proxy"})
+        assert llm_client._proxy_would_intercept("http://127.0.0.1:1/mcp") is True
+        assert llm_client._proxy_would_intercept("https://example.com/") is False
+
+        monkeypatch.setattr(urllib.request, "getproxies", lambda: {})
+        assert llm_client._proxy_would_intercept("http://127.0.0.1:1/mcp") is False
+
+    @pytest.mark.parametrize(
+        "proxies",
+        [
+            {"HTTP": "http://proxy.example:8118"},
+            {"HTTPS": "http://proxy.example:8118"},
+            {"Http": "http://proxy.example:8118", "hTTps": "http://proxy.example:8118"},
+        ],
+    )
+    def test_proxy_keys_are_matched_case_insensitively(self, monkeypatch, proxies):
+        monkeypatch.setattr(urllib.request, "getproxies", lambda: proxies)
+        assert llm_client._proxy_would_intercept("http://127.0.0.1:1/mcp") is True
+
+    def test_loopback_opener_is_built_once_and_cached(self, monkeypatch):
+        built: list[tuple[object, ...]] = []
+        sentinel = object()
+
+        def _build(*handlers):
+            built.append(handlers)
+            return sentinel
+
+        monkeypatch.setattr(urllib.request, "build_opener", _build)
+
+        assert llm_client._get_loopback_opener() is sentinel
+        assert llm_client._get_loopback_opener() is sentinel
+        assert len(built) == 1
+        assert isinstance(built[0][0], urllib.request.ProxyHandler)
+        assert built[0][0].proxies == {}
+
+    def test_loopback_opener_build_is_thread_safe(self, monkeypatch):
+        import concurrent.futures
+
+        builds = 0
+        sentinel = object()
+
+        def _slow_build(*handlers):
+            nonlocal builds
+            builds += 1
+            time.sleep(0.01)
+            return sentinel
+
+        monkeypatch.setattr(urllib.request, "build_opener", _slow_build)
+
+        def _get():
+            return llm_client._get_loopback_opener()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
+            results = list(pool.map(lambda _: _get(), range(64)))
+
+        assert builds == 1
+        assert all(result is sentinel for result in results)
+
+    def test_non_loopback_ca_retry_path_is_still_used(self, monkeypatch):
+        monkeypatch.setattr(urllib.request, "getproxies", lambda: {"http": "http://proxy:8118"})
+        self._use_fake_loopback_opener(monkeypatch)
+        req = self._request("https://gateway.example/v1/chat/completions")
+        sentinel = object()
+
+        with (
+            patch.object(
+                llm_client, "_urlopen_with_plugin_ca_retry", return_value=sentinel
+            ) as ca_retry,
+            patch("urllib.request.urlopen", side_effect=AssertionError("default opener used")),
+        ):
+            out = llm_client._urlopen(req, 30, ca_retry=True)
+
+        assert out is sentinel
+        ca_retry.assert_called_once_with(req, 30)
+
+    def test_loopback_with_proxy_skips_ca_retry(self, monkeypatch):
+        monkeypatch.setattr(urllib.request, "getproxies", lambda: {"http": "http://proxy:8118"})
+        _, calls = self._use_fake_loopback_opener(monkeypatch)
+        req = self._request("http://127.0.0.1:8043/mcp")
+
+        with (
+            patch.object(
+                llm_client,
+                "_urlopen_with_plugin_ca_retry",
+                side_effect=AssertionError("CA retry must not run for loopback"),
+            ),
+            patch("urllib.request.urlopen", side_effect=AssertionError("system opener used")),
+        ):
+            llm_client._urlopen(req, 10, ca_retry=True)
+
+        assert [call[0] for call in calls] == [req]
+
+    def test_loopback_without_proxy_keeps_ca_retry_path(self, monkeypatch):
+        monkeypatch.setattr(urllib.request, "getproxies", lambda: {})
+        self._use_fake_loopback_opener(monkeypatch)
+        req = self._request("http://127.0.0.1:8043/mcp")
+        sentinel = object()
+
+        with (
+            patch.object(
+                llm_client, "_urlopen_with_plugin_ca_retry", return_value=sentinel
+            ) as ca_retry,
+            patch("urllib.request.urlopen", side_effect=AssertionError("default opener used")),
+        ):
+            out = llm_client._urlopen(req, 10, ca_retry=True)
+
+        assert out is sentinel
+        ca_retry.assert_called_once_with(req, 10)
+
+    def test_https_post_json_loopback_bypasses_proxy(self, monkeypatch):
+        """A local OpenAI-compatible endpoint goes direct, not via the proxy."""
+        monkeypatch.setattr(urllib.request, "getproxies", lambda: {"http": "http://proxy:8118"})
+        _, calls = self._use_fake_loopback_opener(monkeypatch)
+        monkeypatch.setattr(llm_client, "_in_process_ssl", None)
+
+        with patch("urllib.request.urlopen", side_effect=AssertionError("system opener used")):
+            status, text = llm_client._https_post_json(
+                "http://127.0.0.1:1234/v1/chat/completions",
+                {"Content-Type": "application/json"},
+                b'{"model": "local"}',
+                timeout=30,
+            )
+
+        assert (status, text) == (200, '{"ok": true}')
+        assert [call[0].full_url for call in calls] == ["http://127.0.0.1:1234/v1/chat/completions"]
+
+    def test_stream_openai_request_loopback_bypasses_proxy(self, monkeypatch):
+        """The streaming path must also reach a local endpoint directly."""
+        monkeypatch.setattr(urllib.request, "getproxies", lambda: {"http": "http://proxy:8118"})
+        opened: list[str] = []
+
+        class _StreamingOpener:
+            def open(self, request, timeout=None):
+                opened.append(request.full_url)
+                resp = MagicMock()
+                resp.readline.side_effect = [
+                    b'data: {"choices":[{"delta":{"content":"hi"}}]}\n',
+                    b"data: [DONE]\n",
+                ]
+                resp.__enter__.return_value = resp
+                return resp
+
+        monkeypatch.setattr(llm_client, "_loopback_opener", _StreamingOpener())
+        monkeypatch.setattr(llm_client, "_in_process_ssl", None)
+        events: list[dict] = []
+
+        with patch("urllib.request.urlopen", side_effect=AssertionError("system opener used")):
+            out = LLMClient._stream_openai_request(
+                None,
+                "http://127.0.0.1:1234/v1/chat/completions",
+                {"Content-Type": "application/json"},
+                b"{}",
+                events.append,
+            )
+
+        assert out["finish_reason"] == "stop"
+        assert out["message"]["content"] == "hi"
+        assert {"type": "text_chunk", "content": "hi"} in events
+        assert opened == ["http://127.0.0.1:1234/v1/chat/completions"]
+
+    def test_stream_anthropic_loopback_bypasses_proxy(self, monkeypatch):
+        """The Anthropic streaming path routes loopback endpoints directly."""
+        monkeypatch.setattr(urllib.request, "getproxies", lambda: {"http": "http://proxy:8118"})
+        opened: list[str] = []
+
+        class _StreamingOpener:
+            def open(self, request, timeout=None):
+                opened.append(request.full_url)
+                resp = MagicMock()
+                resp.readline.side_effect = [b""]
+                resp.__enter__.return_value = resp
+                return resp
+
+        monkeypatch.setattr(llm_client, "_loopback_opener", _StreamingOpener())
+        monkeypatch.setattr(llm_client, "_in_process_ssl", None)
+
+        calls: list[tuple[str, float, bool]] = []
+        real_urlopen = llm_client._urlopen
+
+        def _spy_urlopen(request, timeout, *, ca_retry=False):
+            calls.append((request.full_url, timeout, ca_retry))
+            return real_urlopen(request, timeout, ca_retry=ca_retry)
+
+        monkeypatch.setattr(llm_client, "_urlopen", _spy_urlopen)
+        client = _make_client()
+        client._settings.llm_base_url = "http://127.0.0.1:1234"
+
+        with patch("urllib.request.urlopen", side_effect=AssertionError("system opener used")):
+            out = client._stream_anthropic("sys", [], None)
+
+        assert "error" not in out
+        assert out["finish_reason"] == "stop"
+        assert calls == [("http://127.0.0.1:1234/v1/messages", 300, True)]
+        assert opened == ["http://127.0.0.1:1234/v1/messages"]
+
+    def test_https_post_json_non_loopback_keeps_ca_retry(self, monkeypatch):
+        """Outbound LLM calls keep the existing plugin-CA retry path."""
+        monkeypatch.setattr(urllib.request, "getproxies", lambda: {"http": "http://proxy:8118"})
+        _, loopback_calls = self._use_fake_loopback_opener(monkeypatch)
+        monkeypatch.setattr(llm_client, "_in_process_ssl", None)
+        response = MagicMock(status=200)
+        response.read.return_value = b"ok"
+        response.__enter__.return_value = response
+
+        with patch.object(
+            llm_client, "_urlopen_with_plugin_ca_retry", return_value=response
+        ) as ca_retry:
+            status, text = llm_client._https_post_json(
+                "https://gateway.example/v1/chat/completions",
+                {"Content-Type": "application/json"},
+                b"{}",
+                timeout=30,
+            )
+
+        assert (status, text) == (200, "ok")
+        ca_retry.assert_called_once()
+        assert loopback_calls == []
+
+
+class _RecordingProxyServer(ThreadingHTTPServer):
+    """A local HTTP proxy stub that records absolute-URI and CONNECT requests.
+
+    ``do_CONNECT`` is implemented deliberately: HTTPS through a proxy needs
+    the CONNECT tunnel, and without it the client only sees
+    ``501 Unsupported method ('CONNECT')`` — a gap in the stub, not a
+    statement about the caller.
+    """
+
+    def __init__(self) -> None:
+        self.requests: list[tuple[str, str]] = []
+        self._records_lock = threading.Lock()
+        super().__init__(("127.0.0.1", 0), self._make_handler(), bind_and_activate=True)
+        self._thread = threading.Thread(target=self.serve_forever, daemon=True)
+        self._thread.start()
+
+    def record(self, method: str, path: str) -> None:
+        with self._records_lock:
+            self.requests.append((method, path))
+
+    @property
+    def url(self) -> str:
+        host, port = self.server_address[:2]
+        return f"http://{host}:{port}"
+
+    def _make_handler(self):
+        server = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def _answer(self, body: bytes = b"proxied") -> None:
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                server.record("GET", self.path)
+                self._answer()
+
+            def do_POST(self):
+                server.record("POST", self.path)
+                self._answer()
+
+            def do_CONNECT(self):
+                server.record("CONNECT", self.path)
+                self.send_response(200)
+                self.end_headers()
+
+        return Handler
+
+
+class _LoopbackTargetServer(ThreadingHTTPServer):
+    """A direct-only local endpoint that answers MCP-shaped POSTs."""
+
+    def __init__(self) -> None:
+        super().__init__(("127.0.0.1", 0), self._make_handler(), bind_and_activate=True)
+        self._thread = threading.Thread(target=self.serve_forever, daemon=True)
+        self._thread.start()
+
+    @property
+    def port(self) -> int:
+        return self.server_address[1]
+
+    def _make_handler(self):
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                body = b'{"ok": true}'
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        return Handler
+
+
+class TestProxyEndToEnd:
+    """Acceptance check for issue #230: a real fake proxy observes zero
+    loopback requests and exactly one external request."""
+
+    @pytest.fixture()
+    def proxy_and_target(self, monkeypatch):
+        proxy = _RecordingProxyServer()
+        target = _LoopbackTargetServer()
+        monkeypatch.setattr(llm_client, "_loopback_opener", None)
+        # urllib caches its default opener process-wide; earlier tests run
+        # with getproxies() stubbed to {}, so force a rebuild under this
+        # test's proxy environment.
+        monkeypatch.setattr(urllib.request, "_opener", None)
+        monkeypatch.setenv("http_proxy", proxy.url)
+        monkeypatch.setenv("https_proxy", proxy.url)
+        monkeypatch.delenv("no_proxy", raising=False)
+        monkeypatch.delenv("NO_PROXY", raising=False)
+        # The autouse fixture stubs getproxies out; use the real env reader
+        # so this test exercises the production decision end to end.
+        monkeypatch.setattr(urllib.request, "getproxies", urllib.request.getproxies_environment)
+        try:
+            yield proxy, target
+        finally:
+            proxy.shutdown()
+            proxy.server_close()
+            target.shutdown()
+            target.server_close()
+
+    def test_loopback_bypasses_proxy_and_external_still_uses_it(self, proxy_and_target):
+        proxy, target = proxy_and_target
+
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{target.port}/mcp",
+            data=b"{}",
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with llm_client._urlopen(req, 5) as resp:
+            assert resp.read() == b'{"ok": true}'
+        assert proxy.requests == []  # loopback never reached the proxy
+
+        external = urllib.request.Request("http://external.invalid/", method="GET")
+        with llm_client._urlopen(external, 5) as resp:
+            assert resp.read() == b"proxied"
+        assert proxy.requests == [("GET", "http://external.invalid/")]
+
+        https = urllib.request.Request("https://external.invalid/", method="GET")
+        with pytest.raises(urllib.error.URLError):
+            llm_client._urlopen(https, 5)
+        assert ("CONNECT", "external.invalid:443") in proxy.requests
+
+        loopback_hits = [r for r in proxy.requests if "127.0.0.1" in r[1]]
+        assert loopback_hits == []
+
+    def test_loopback_llm_endpoint_never_reaches_proxy(self, proxy_and_target, monkeypatch):
+        proxy, target = proxy_and_target
+        monkeypatch.setattr(llm_client, "_in_process_ssl", None)
+
+        status, text = llm_client._https_post_json(
+            f"http://127.0.0.1:{target.port}/v1/chat/completions",
+            {"Content-Type": "application/json"},
+            b'{"model": "local"}',
+            timeout=5,
+        )
+
+        assert status == 200
+        assert text == '{"ok": true}'
+        assert proxy.requests == []

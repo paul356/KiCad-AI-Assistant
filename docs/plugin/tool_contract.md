@@ -1,10 +1,18 @@
-# KiCad MCP Plugin — Tool Contract (Milestone 1)
+# KiCad MCP Plugin — Tool Contract (Schematic/Symbol Surface)
 
-> **Scope:** This document defines the exact set of MCP tools exposed to the LLM in the milestone-1 plugin integration. Tools not listed here are either deferred or inapplicable to the plugin profile.
+> **Scope:** This document defines the tool contract for the plugin's schematic/symbol editing surface. It is not an exhaustive list of the plugin profile: some registered schematic/symbol tools have no contract here (e.g. `place_symbol_relative`, `rename_symbol`, `check_reference_conflicts`), and `get_project_structure` and `run_drc_check` are exposed by the profile but sit outside §1. Later milestones added PCB library, PCB editing, query, routing, zones, placement and groups; hierarchical sheets; no-connect flags; DRC/ERC; versioning; skills; layer export; KiCad IPC — those are documented in the README and are outside §3. The symbol/footprint library-management tools were also added after milestone 1 and *are* covered here (§1, §3.3).
 
 ---
 
-## 1. Milestone-1 Tool Surface
+## Naming conventions
+
+- A `library_` prefix means a **definition inside a library**: `get_library_symbol`, `get_library_symbol_pins`, `get_library_footprint`, `search_library_symbols`, `search_library_footprints`, `list_library_symbols`, `list_library_footprints`. These take `library_name` plus the object name and **never return placement**.
+- No prefix means an **object placed on a board or in a schematic**. Reference-addressed tools take `pcb_path` / `schematic_path` plus `references[]`: `get_footprint`, `get_footprint_bbox`, `list_symbol_properties`. `list_footprints` instead takes `pcb_path` plus an optional `ref_prefix` and lists matching footprints.
+- `extract_schematic_netlist` returns the whole netlist, and with it the placement (`position`, `rotation`, `body_bbox`) of **every** symbol placed in a schematic (`components[ref].units[n].position`). For a **single reference**, `find_component_connections(project_path, component_ref)` returns that reference's own `component_info` (also with `units[n].position`) and its connections, without the whole netlist.
+
+---
+
+## 1. Plugin Tool Surface
 
 | Tool | Module | Description |
 |---|---|---|
@@ -12,12 +20,12 @@
 | `find_component_connections` | `netlist_tools` | List all electrical connections for a single reference designator |
 | `sync_symbol_index` | `symbol_tools` | Build or refresh the full-text symbol search index from installed KiCad libraries |
 | `get_symbol_sync_status` | `symbol_tools` | Return the last-sync timestamp and index size |
-| `search_symbols` | `symbol_tools` | Full-text search across all indexed symbols |
-| `get_symbol` | `symbol_tools` | Retrieve full definition and metadata for one symbol |
+| `search_library_symbols` | `symbol_tools` | Full-text search across all indexed symbols |
+| `get_library_symbol` | `symbol_tools` | Retrieve full definition and metadata for one symbol |
 | `list_symbol_libraries` | `symbol_tools` | List all known symbol libraries (names and paths) |
-| `get_library_symbols` | `symbol_tools` | List every symbol in a specific library |
+| `list_library_symbols` | `symbol_tools` | List every symbol in a specific library |
 | `get_symbol_index_stats` | `symbol_tools` | Return aggregate counts for the index |
-| `get_symbol_pins` | `symbol_tools` | Return pin list (number, name, type, direction) for one symbol |
+| `get_library_symbol_pins` | `symbol_tools` | Return pin list (number, name, type, direction) for one symbol |
 | `add_symbol_to_schematic` | `symbol_edit_tools` | Place a library symbol onto a schematic |
 | `create_symbol_library` | `symbol_edit_tools` | Create a new `.kicad_sym` library and register it in sym-lib-table |
 | `create_symbol` | `symbol_edit_tools` | Generate a new symbol definition into an existing library (definition only — no schematic placement) |
@@ -35,12 +43,9 @@
 | `add_label_to_schematic` | `symbol_edit_tools` | Place a net label at specific coordinates |
 | `list_labels_in_schematic` | `symbol_edit_tools` | Return all net labels and their positions |
 | `delete_label_from_schematic` | `symbol_edit_tools` | Remove a net label by text and coordinates |
-| `add_wire_to_schematic` | `wire_edit_tools` | Draw a wire segment between two coordinates (orthogonal routing) |
 | `connect_pins_with_wire` | `wire_edit_tools` | Connect two component pins automatically, resolving their schematic positions |
+| `connect_points_with_wire` | `wire_edit_tools` | Draw an orthogonal wire between two raw coordinates, placing a junction at an existing wire endpoint or on a wire's interior (splitting the wire there) |
 | `delete_wire_from_schematic` | `wire_edit_tools` | Remove a wire segment matching given start/end coordinates |
-| `add_junction_to_schematic` | `wire_edit_tools` | Place a junction dot at a coordinate |
-| `list_junctions_in_schematic` | `wire_edit_tools` | Return all junction coordinates |
-| `delete_junction_from_schematic` | `wire_edit_tools` | Remove a junction at a given coordinate |
 
 ---
 
@@ -49,11 +54,11 @@
 A typical LLM editing session follows this pattern:
 
 1. **Read current state** — call `extract_schematic_netlist` with the `active_schematic` path from the plugin context. Inspect `analysis.components`, `analysis.power_nets`, and `analysis.signal_nets` to understand what is already present.
-2. **Find symbols** — if adding a new component, call `search_symbols` first to obtain the exact `library_name` and `name` values required by `add_symbol_to_schematic`. Never guess library names.
+2. **Find symbols** — if adding a new component, call `search_library_symbols` first to obtain the exact `library_name` and `name` values required by `add_symbol_to_schematic`. Never guess library names.
 3. **Place / edit / connect** — use the symbol-editing and wire-editing tools to make changes. After placing a symbol, call `extract_schematic_netlist` to get the new pin positions before routing wires.
 4. **Verify** — call `extract_schematic_netlist` again after all edits. Confirm expected nets exist in `analysis.signal_nets` or `analysis.power_nets` and that `analysis.floating_nets` is empty.
 
-> **Tip:** `connect_pins_with_wire` is the preferred wiring tool when the two endpoints are component pins — it resolves positions automatically. Use `add_wire_to_schematic` only when routing to/from a known coordinate (e.g. a label or an existing wire endpoint).
+> **Tip:** `connect_pins_with_wire` is the preferred wiring tool when the two endpoints are component pins — it resolves positions automatically. Use `connect_points_with_wire` only when routing to/from known coordinates (e.g. a label or an existing wire endpoint).
 
 ---
 
@@ -111,6 +116,18 @@ footprint), and `pins`. A single-unit component is nested under
 `units["1"]`. There is no merged top-level bbox — union the per-unit
 bboxes when you need a component's whole occupied region.
 
+Sub-sheets appear as ordinary components with `type: "sheet"`. Their
+`value` is the sub-sheet file path (not a symbol value), and
+`units[n].position` has no `rotation`. Their `pins` are the reduced
+sheet-pin shape `{num, number, name, x, y, net}`: there is no `electrical`
+or `direction` key (`pin["direction"]` raises `KeyError`), and
+`num == number == name ==` the sheet-pin name — sheet pins are addressed
+by name, never `REF.N`. `net` is added by this tool and follows the same
+untraced-pin rule (a `#`-prefixed sheet reference or a pin with an empty
+name gives `null`); otherwise it is a string: an attached label names the
+net, except that a power-net pin name (`GND`, `VCC`, `VDD`, `VSS`, `VEE`)
+takes precedence, and with nothing attached the sheet-pin name is used.
+
 `move_component` takes **deltas** (x/y shifts in mm, rotation increment)
 and accepts a `unit` number to move/rotate one unit individually
 (omitted = move all units together by the same delta, preserving their
@@ -123,27 +140,31 @@ express an absolute move as a delta.
 
 #### `find_component_connections(project_path, component_ref)`
 
-**Purpose:** Returns all nets and connected pins for a single reference designator. Faster than parsing the full netlist when the LLM only needs to understand one component's connectivity.
+**Purpose:** Returns all nets and connected pins for a single reference designator. It parses the same netlist internally, so the parsing cost is the same as `extract_schematic_netlist`; the saving is a **smaller response**, which suits cases where the LLM only needs one component's connectivity and not the full schematic state.
 
 **Key parameters:**
 - `project_path` (`str`) — absolute path to a `.kicad_pro` file.
 - `component_ref` (`str`) — reference designator (e.g. `"R1"`).
 
-**Return shape:** `{"success": true, "component": "R1", "connections": [{"pin": "1", "net": "VCC", "connected_pins": [...]}, ...]}`
+**Return shape:** `{"success": true, "project_path": "...", "schematic_path": "...", "component": "R1", "component_info": {"reference": "R1", "lib_id": "Device:R", "value": "10k", "footprint": "...", "units": {"1": {"position": {"x": 50.8, "y": 63.5, "rotation": 0}, "body_bbox": {"min_x": ..., ...}, "pins": [{"num": "1", "name": "~", "electrical": "passive", "x": ..., "y": ..., "direction": "up"}]}}}, "connections": [{"pin": "1", "net": "VCC", "connected_to": [{"component": "U1", "pin": "4"}]}], "connected_nets": ["VCC"], "pin_functions": {"1": {"name": "~", "type": "unknown"}}, "total_connections": 1}`
 
 **When to use:** When the engineer asks "what is R1 connected to?" without needing the full schematic state.
+
+A sub-sheet reference (`type: "sheet"`) returns that reduced sheet-pin shape minus the tool-added `net`: `{num, number, name, x, y}`, with no `electrical` or `direction` and `num == number == name ==` the sheet-pin name.
 
 ---
 
 ### 3.2 Symbol Index Tools
 
+> **Project scope:** Omitting `project_path` reads global libraries only. When working inside a project, pass that project's directory so its own `sym-lib-table` entries are included; other projects' libraries are never searched. The tools that accept `project_path` are `sync_symbol_index`, `search_library_symbols`, `get_library_symbol`, `get_library_symbol_pins`, `list_symbol_libraries`, `list_library_symbols`, and `get_symbol_index_stats`.
+
 #### `sync_symbol_index(force=False, project_path=None)`
 
-**Purpose:** Scans all installed KiCad symbol libraries and populates the local full-text search index. Must be called at least once before `search_symbols` will return results.
+**Purpose:** Scans all installed KiCad symbol libraries and populates the local full-text search index. Must be called at least once before `search_library_symbols` will return results.
 
 **Key parameters:**
 - `force` (`bool`) — when `True`, rebuilds even if the index appears current.
-- `project_path` (`str | None`) — optional path to a project directory or a file inside it (e.g. the schematic). Syncs global plus that project's libraries; other projects' rows are never touched. Omit for the global scope only.
+- `project_path` (`str | None`) — optional path to a project directory or a file inside it (e.g. the schematic). Syncs global plus that project's libraries; other projects' rows are never touched. Omit for global libraries only; when working inside a project, pass that project's directory.
 
 ---
 
@@ -153,13 +174,13 @@ express an absolute move as a delta.
 
 ---
 
-#### `search_symbols(query, project_path=None, limit=50)`
+#### `search_library_symbols(query, project_path=None, limit=50)`
 
 **Purpose:** Full-text search across symbol name, description, and keywords in the index.
 
 **Key parameters:**
 - `query` (`str`) — search string (e.g. `"NPN transistor"`, `"STM32F4"`).
-- `project_path` (`str | None`) — optional path to a project directory or a file inside it. Global plus that project's libraries are searched; other projects' libraries are never shown. Omit for global libraries only.
+- `project_path` (`str | None`) — optional path to a project directory or a file inside it. Global plus that project's libraries are searched; other projects' libraries are never shown. Omit for global libraries only; when working inside a project, pass that project's directory.
 - `limit` (`int`, default `50`) — maximum results.
 
 **Return shape:** `{"success": true, "count": N, "symbols": [{"library_name": "...", "name": "...", "description": "...", "pin_count": N}, ...]}`
@@ -168,25 +189,25 @@ express an absolute move as a delta.
 
 ---
 
-#### `get_symbol(library_name, symbol_name, project_path=None)`
+#### `get_library_symbol(library_name, symbol_name, project_path=None)`
 
 **Purpose:** Retrieve the full symbol definition including all properties and pin details.
 
 **Key parameters:**
-- `library_name` and `symbol_name` exactly as returned by `search_symbols`.
-- `project_path` (`str | None`) — optional path to a project directory or a file inside it. The lookup is scoped to global plus that project's libraries; other projects' libraries are never matched. Omit for global only.
+- `library_name` and `symbol_name` exactly as returned by `search_library_symbols`.
+- `project_path` (`str | None`) — optional path to a project directory or a file inside it. The lookup is scoped to global plus that project's libraries; other projects' libraries are never matched. Omit for global only; when working inside a project, pass that project's directory.
 
 ---
 
 #### `list_symbol_libraries(limit=200, offset=0, project_path=None)`
 
-**Purpose:** Returns one row per known symbol library in scope — `name`, `symbol_count`, `file_path` — as a flat, paginated list. Useful for exploration when `search_symbols` returns no results; looking for a specific component, prefer `search_symbols`.
+**Purpose:** Returns one row per known symbol library in scope — `name`, `symbol_count`, `file_path` — as a flat, paginated list. Useful for exploration when `search_library_symbols` returns no results; looking for a specific component, prefer `search_library_symbols`.
 
-**Key parameters:** `limit` / `offset` — pagination as described in the tool docstring; `project_path` scopes the listing exactly like `search_symbols`. Watch the `truncated` field to know when more pages remain.
+**Key parameters:** `limit` / `offset` — pagination as described in the tool docstring; `project_path` scopes the listing exactly like `search_library_symbols`. Watch the `truncated` field to know when more pages remain.
 
 ---
 
-#### `get_library_symbols(library_name, limit=50, offset=0, project_path=None)`
+#### `list_library_symbols(library_name, limit=50, offset=0, project_path=None)`
 
 **Purpose:** Lists every symbol inside a specific library. Use to browse a library after identifying it via `list_symbol_libraries`.
 
@@ -202,11 +223,11 @@ express an absolute move as a delta.
 
 ---
 
-#### `get_symbol_pins(library_name, symbol_name, project_path=None)`
+#### `get_library_symbol_pins(library_name, symbol_name, project_path=None)`
 
 **Purpose:** Returns the pin list (number, name, electrical type, direction) for a symbol without fetching the full definition. Use when planning wiring before placing a component.
 
-**Key parameters:** `library_name`, `symbol_name` as returned by `search_symbols`; `project_path` scopes the lookup like `get_symbol`.
+**Key parameters:** `library_name`, `symbol_name` as returned by `search_library_symbols`; `project_path` scopes the lookup like `get_library_symbol`.
 
 ---
 
@@ -220,8 +241,8 @@ All tools in this group write a backup to `<schematic_path>.bak` before saving.
 
 **Key parameters:**
 - `schematic_path` (`str`) — absolute path to `.kicad_sch`.
-- `library_name` (`str`) — as returned by `search_symbols`.
-- `symbol_name` (`str`) — as returned by `search_symbols`.
+- `library_name` (`str`) — as returned by `search_library_symbols`.
+- `symbol_name` (`str`) — as returned by `search_library_symbols`.
 - `x`, `y` (`float`) — placement coordinates in mm; snapped to 1.27 mm grid.
 - `rotation` (`int`) — `0`, `90`, `180`, or `270`.
 - `value` (`str | None`) — overrides the `Value` property; defaults to `symbol_name`.
@@ -241,7 +262,7 @@ All tools in this group write a backup to `<schematic_path>.bak` before saving.
 - `name` (`str`) — library nickname (sanitised to sym-lib-table-safe characters).
 - `project_dir` (`str | None`) — when given, the library file is created inside the project directory and registered in the project's `sym-lib-table` (created if absent) with a `${KIPRJMOD}` URI. When omitted, the library is created under `${KICADxx_3RD_PARTY}/symbols` and registered in the global user sym-lib-table.
 
-The library is created empty and indexed immediately, so `search_symbols` / `list_symbol_libraries` see it. Fails if the name is invalid, the library or file already exists (no silent overwrite), or the project directory does not exist.
+The library is created empty and indexed immediately, so `search_library_symbols` / `list_symbol_libraries` see it. Fails if the name is invalid, the library or file already exists (no silent overwrite), or the project directory does not exist.
 
 **Success response:** `{"library": "MyLib", "path": "/abs/MyLib.kicad_sym", "table_path": "/abs/sym-lib-table", "registered": true, "indexed": 0}`
 
@@ -433,23 +454,13 @@ All label tools write `.kicad_sch.bak` before saving.
 
 ---
 
-### 3.5 Wire and Junction Tools
+### 3.5 Wire Tools
 
 All tools in this group write `.kicad_sch.bak` before saving.
 
-#### `add_wire_to_schematic(schematic_path, start_x, start_y, end_x, end_y, add_junction_start=False, add_junction_end=False)`
-
-**Purpose:** Draws a wire segment using orthogonal routing. Set `add_junction_start` or `add_junction_end` to `True` when an endpoint lands in the middle of an existing wire (T-junction).
-
-**Key parameters:** All coordinates in mm (`float`).
-
-**Success response:** `{"success": true, "wire": {"start": {...}, "end": {...}}, "junctions_added": [...]}`
-
----
-
 #### `connect_pins_with_wire(schematic_path, from_ref, from_pin, to_ref, to_pin)`
 
-**Purpose:** Resolves pin schematic positions automatically (accounting for placement and rotation), then routes a smart orthogonal wire between them. Automatically places junction dots when either endpoint is already wired. Preferred over `add_wire_to_schematic` for pin-to-pin connections.
+**Purpose:** Resolves pin schematic positions automatically (accounting for placement and rotation), then routes a smart orthogonal wire between them. Automatically places junction dots when either endpoint is already wired. Preferred for pin-to-pin connections.
 
 **Key parameters:**
 - `from_ref` / `to_ref` (`str`) — reference designators.
@@ -459,31 +470,22 @@ All tools in this group write `.kicad_sch.bak` before saving.
 
 ---
 
+#### `connect_points_with_wire(schematic_path, start_x, start_y, end_x, end_y)`
+
+**Purpose:** Routes a smart orthogonal wire between two raw schematic coordinates. Use it when the endpoints are known bare coordinates (e.g. a net label position or an existing wire tip); when both endpoints are symbol pins, prefer `connect_pins_with_wire`, which resolves pin positions itself.
+
+Routing is orthogonal (horizontal-vertical). If an endpoint lies on the interior of an existing wire, a junction is placed there and that wire is split at the endpoint, so KiCad ≥ 10 keeps the junction on reload; an endpoint that coincides with an existing wire endpoint or an already-wired pin also gets a junction automatically.
+
+**Key parameters:**
+- `start_x` / `start_y` / `end_x` / `end_y` (`float`) — mm in KiCad screen convention (**+Y is down**); align to the 1.27 mm grid.
+
+**Success response:** `{"success": true, "wire": {"start": {x, y}, "end": {x, y}}, "junctions_added": [...]}`
+
+---
+
 #### `delete_wire_from_schematic(schematic_path, start_x, start_y, end_x, end_y)`
 
 **Purpose:** Removes a wire segment whose start and end coordinates match the given values (within floating-point tolerance). Use `extract_schematic_netlist` with `include_wire_topology=True` to obtain exact wire coordinates before calling.
-
----
-
-#### `add_junction_to_schematic(schematic_path, x, y)`
-
-**Purpose:** Places a junction dot at a specific coordinate. Required at T-intersections where three or more wires meet.
-
-**Success response:** `{"success": true, "junction": {"x": ..., "y": ...}}`
-
----
-
-#### `list_junctions_in_schematic(schematic_path)`
-
-**Purpose:** Returns all existing junction positions. Use to avoid placing duplicate junctions.
-
-**Success response:** `{"success": true, "junctions": [{"x": ..., "y": ...}, ...]}`
-
----
-
-#### `delete_junction_from_schematic(schematic_path, x, y)`
-
-**Purpose:** Removes a junction at the given coordinate.
 
 ---
 
@@ -493,15 +495,15 @@ All tools in this group write `.kicad_sch.bak` before saving.
 |---|---|---|
 | All MCP resources (`kicad://...`) | Resources are not part of the tool-only plugin profile | Post-milestone-1 |
 | All MCP prompts | Prompts assume a standalone MCP client (e.g. Claude Desktop) | Post-milestone-1 |
-| `list_projects`, `get_project_structure` | Plugin provides active-project context directly | Review after initial plugin is stable |
+| `list_projects` | Plugin provides active-project context directly; the profile exposes `get_project_structure` instead (see README) | Review after initial plugin is stable |
 | `open_project` | KiCad plugin manages project opening directly | Not applicable |
-| `get_drc_history`, `run_drc_check` | `kicad-cli` dependency; not skip-based | Separate milestone after `kicad-cli` removal |
+| `get_drc_history` | Tool removed; DRC history is not exposed in the plugin profile | Not planned |
 | `generate_pcb_thumbnail`, `generate_thumbnail_with_cli` | `kicad-cli` dependency | Separate milestone |
 | `get_bom`, `export_bom_csv` | `kicad-cli` dependency | Separate milestone |
 | All pattern tools (`pattern_tools.py`) | Not needed for direct editing workflows | Optional future addition |
 | `validate_project` | Superseded by netlist inspection tools for editing validation | Review later |
-| `validate_project_boundaries`, `generate_validation_report` | `kicad-cli` dependency | Separate milestone |
-| PCB edit tools | Planned for future milestone; see `docs/plugin/pcb_feasibility.md` | Future |
+| `validate_project_boundaries`, `generate_validation_report` | Module deleted in #239; it was never registered and could not be imported (missing utils) | Not applicable |
+| PCB edit / query / routing / zone / group tools | Shipped in later milestones; see README *Available Tools* | Shipped |
 
 ---
 

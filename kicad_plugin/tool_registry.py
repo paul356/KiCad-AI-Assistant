@@ -38,12 +38,12 @@ TOOL_POLICIES: dict[str, ToolPolicy] = {
     # Symbol tools
     "sync_symbol_index": ToolPolicy(kind="indexing"),
     "get_symbol_sync_status": ToolPolicy(kind="query"),
-    "search_symbols": ToolPolicy(kind="query"),
-    "get_symbol": ToolPolicy(kind="query"),
+    "search_library_symbols": ToolPolicy(kind="query"),
+    "get_library_symbol": ToolPolicy(kind="query"),
     "list_symbol_libraries": ToolPolicy(kind="query"),
-    "get_library_symbols": ToolPolicy(kind="query"),
+    "list_library_symbols": ToolPolicy(kind="query"),
     "get_symbol_index_stats": ToolPolicy(kind="query"),
-    "get_symbol_pins": ToolPolicy(kind="query"),
+    "get_library_symbol_pins": ToolPolicy(kind="query"),
     # Schematic edit tools
     "add_symbol_to_schematic": ToolPolicy(
         kind="file_mutation",
@@ -190,8 +190,9 @@ TOOL_POLICIES: dict[str, ToolPolicy] = {
     "sync_footprint_index": ToolPolicy(kind="indexing"),
     "get_footprint_sync_status": ToolPolicy(kind="query"),
     "list_footprint_libraries": ToolPolicy(kind="query"),
-    "search_footprints": ToolPolicy(kind="query"),
-    "get_footprint_details": ToolPolicy(kind="query"),
+    "list_library_footprints": ToolPolicy(kind="query"),
+    "search_library_footprints": ToolPolicy(kind="query"),
+    "get_library_footprint": ToolPolicy(kind="query"),
     # PCB → library export tools
     "find_footprints_not_in_libraries": ToolPolicy(kind="query"),
     "create_footprint_library": ToolPolicy(kind="file_mutation"),

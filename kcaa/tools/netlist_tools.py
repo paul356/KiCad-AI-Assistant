@@ -27,6 +27,19 @@ def register_netlist_tools(mcp: FastMCP) -> None:
     ) -> dict[str, Any]:
         """Extract component inventory, net analysis, and wire geometry for a KiCad schematic.
 
+        This tool returns the **whole netlist**, and therefore the placement of
+        **every** placed symbol: ``components[ref]["units"][n]["position"]``
+        (``{x, y, rotation}``) plus that unit's ``body_bbox`` and the
+        world-coordinate ``pins``.  For a **single reference**, prefer
+        ``find_component_connections(project_path, component_ref)``: it returns
+        only that reference's own ``component_info`` (also containing
+        ``units[n].position``, ``body_bbox``, and world-coordinate ``pins``)
+        and its connections, not the whole netlist.  For a symbol **definition**
+        in a library (no placement) use ``get_library_symbol`` /
+        ``get_library_symbol_pins``.  The netlist payload is large, so use this
+        tool when you need connectivity and/or geometry across the design, not
+        for a single coordinate.
+
         A net is a named group of pins that are electrically connected by wires.
         For example, if R1/pin2, C1/pin1, and a GND power symbol are all joined
         by wires, they form one net named "GND".
@@ -35,24 +48,49 @@ def register_netlist_tools(mcp: FastMCP) -> None:
         entry in ``components`` (keyed by reference) contains:
 
         - Sub-sheets also appear in ``components`` with ``type="sheet"``.
-          Their hierarchical pins are exposed like component pins and use the
-          sheet-pin name as their local net name.
+          They share the ``units[n]`` nesting but **not** the component-pin
+          fields; see the sheet-pin variant under ``pins`` below. Their pins
+          use the sheet-pin name as their local net name.
 
-        - ``position``: ``{x, y}`` placement anchor in mm (KiCad screen coords,
-          **+Y is down**).
-        - ``rotation``, ``mirror``, ``lib_id``, ``value``, ``footprint``.
-        - each unit carries its own ``body_bbox``: ``{min_x, min_y, max_x,
-          max_y}`` world-space bounding box of that unit's footprint. Use it
-          to check overlaps before calling ``move_component`` /
-          ``add_symbol_to_schematic``. May be absent for graphics-less
-          symbols (e.g. PWR_FLAG).
-        - ``pins``: list of ``{num, name, electrical, x, y, direction}``. ``x``/``y`` are world
+        Each entry is ``{value, type, units}``; ``value`` and ``type`` live at
+        the component level, not inside units.
+
+        - ``units``: per-unit dict (``"1"``, ``"2"``, … for multi-unit parts).
+          Each unit carries ``position`` when available:
+          ``{x, y, rotation}`` placement anchor in mm (KiCad screen coords,
+          **+Y is down**; sub-sheet entries use ``{x, y}`` without
+          ``rotation``; ``rotation`` is a field of ``position``, not a
+          separate unit key), and its own ``body_bbox``:
+          ``{min_x, min_y, max_x, max_y}`` world-space bounding box of that
+          unit's footprint. Units carry no ``mirror``, ``lib_id``, or
+          ``footprint`` keys. Use ``body_bbox`` to check overlaps before
+          calling ``move_component`` / ``add_symbol_to_schematic``. May be
+          absent for graphics-less symbols (e.g. PWR_FLAG).
+        - ``pins``: **per-unit** list of
+          ``{num, name, electrical, x, y, direction, net}``. ``net`` is the
+          name of the net the pin belongs to; the key is always present and
+          an unconnected pin still gets a name (synthetic
+          ``Net-(<ref>-Pin<n>)`` when no label or power symbol supplies
+          one). The value is ``null`` only for pins the netlist builder does
+          not trace: pins of ``#``-prefixed references (power symbols,
+          flags) and pins without a number. ``x``/``y`` are world
           coordinates already accounting for placement and rotation;
           ``direction`` is the screen-space exit direction
           (``"right"|"up"|"left"|"down"``). ``name`` is the pin name
           (e.g. ``"VCC"``, ``"GPIO1"``). ``electrical`` is the pin's
           electrical type (e.g. ``"input"``, ``"output"``, ``"power_in"``,
-          ``"bidirectional"``). When choosing which two pins to
+          ``"bidirectional"``). **Sub-sheet** pins instead use
+          ``{num, number, name, x, y, net}``: there is no ``electrical`` or
+          ``direction`` key at all (absent, not ``null`` — ``pin["direction"]``
+          raises ``KeyError``), ``num``, ``number``, and ``name`` all equal the
+          sheet-pin name (sheet pins are addressed by name, never ``REF.N``),
+          and the unit's ``position`` has no ``rotation`` (see ``units``
+          above). For sheet pins ``net`` follows the same untraced-pin rule
+          (``null`` for a ``#``-prefixed sheet reference or a pin with an
+          empty name); otherwise it is a string: an attached label names the
+          net, except that a power-net pin name (``GND``, ``VCC``, ``VDD``,
+          ``VSS``, ``VEE``) takes precedence, and with nothing attached the
+          sheet-pin name is used. When choosing which two pins to
           wire, the **electrically correct pin** comes first — only fall
           back to "closest pin pair" geometry when both candidates are
           electrically interchangeable (e.g. the two leads of a non-polar
@@ -72,7 +110,8 @@ def register_netlist_tools(mcp: FastMCP) -> None:
             schematic_path: Path to the KiCad schematic file (.kicad_sch)
             include_wire_topology: When True, a top-level ``wires`` dict is
                 added to the analysis. Each wire carries its own ``net`` field
-                (the net name, or null if the wire is unconnected). Default True.
+                (the net name, or null if the wire is unconnected). Default
+                False — set it only when you need wire geometry.
             ctx: MCP context for progress reporting
 
         Returns:
@@ -86,11 +125,16 @@ def register_netlist_tools(mcp: FastMCP) -> None:
                     "component_types": {"R": 3, "C": 2, ...},
                     "components": {
                         "R1": {"value": "10k",
-                               "position": {"x": ..., "y": ..., "rotation": ...},
-                               "pins": [{"num": "1", "name": "VCC",
-                                         "electrical": "power_in",
-                                         "x": ..., "y": ...,
-                                         "direction": ..., "net": "GND"}, ...]},
+                               "type": "component",
+                               "units": {
+                                   "1": {"position": {"x": ..., "y": ..., "rotation": ...},
+                                         "body_bbox": {"min_x": ..., "min_y": ...,
+                                                       "max_x": ..., "max_y": ...},
+                                         "pins": [{"num": "1", "name": "VCC",
+                                                   "electrical": "power_in",
+                                                   "x": ..., "y": ...,
+                                                   "direction": ..., "net": "GND"}, ...]},
+                               }},
                                # name: pin name (e.g. "VCC", "GPIO1"); electrical: electrical type
                         ...
                     },
@@ -395,9 +439,21 @@ def register_netlist_tools(mcp: FastMCP) -> None:
             ctx: MCP context for progress reporting
 
         Returns:
-            Dictionary with component connection information. In component_info,
-            each pin's ``direction`` is the wire-exit direction in screen coordinates:
-            "right", "down", "left", or "up".
+            Dictionary with component connection information. This tool operates
+            on **one reference** and does not return the whole netlist; use
+            ``extract_schematic_netlist`` for the full design.  Its
+            ``component_info`` is the raw parser entry for ``component_ref`` —
+            ``{reference, value, units}`` plus ``lib_id`` / ``footprint`` when
+            present; ``type`` appears only on sub-sheet entries.  Each
+            ``units[n]`` carries ``position`` when available
+            (``{x, y, rotation}``; ``{x, y}`` for sub-sheets),
+            ``body_bbox`` when present, and ``pins`` in world coordinates.
+            In component_info, each pin's ``direction`` is the wire-exit
+            direction in screen coordinates: "right", "down", "left", or "up".
+            For a ``type="sheet"`` entry there is no ``direction`` (or
+            ``electrical``): its pins are the reduced sheet-pin shape
+            ``{num, number, name, x, y}``, with all three name fields equal to
+            the sheet-pin name.
         """
         print(f"Finding connections for component {component_ref} in project: {project_path}")
 

@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 import datetime
 import difflib
 from enum import Enum
+import ipaddress
 import json
 import logging
 import os
@@ -51,6 +52,163 @@ def _project_path_for(file_path: str) -> str:
     return os.path.join(d, f"{stem}.kicad_pro")
 
 
+def _normalize_tool_arguments(value: Any) -> str:
+    """Return tool-call arguments as a JSON string (provider-agnostic).
+
+    OpenAI-compatible endpoints send ``function.arguments`` already serialized
+    as a JSON string, while Ollama's native ``/api/chat`` sends a ready-made
+    JSON object (and some gateways send lists or scalars).  Normalising every
+    provider to a string keeps downstream ``json.loads(arguments or "{}")``
+    and ``json.dumps`` round-trips valid.
+
+    - ``None`` -> ``""`` (callers already fall back to ``"{}"``)
+    - ``str`` -> returned unchanged; it is NOT re-serialized, so whitespace
+      and key order survive for byte-exact comparisons
+    - ``dict`` / ``list`` / other scalars -> ``json.dumps(value, ensure_ascii=False)``
+    - unserializable objects -> ``json.dumps(str(value), ensure_ascii=False)``
+
+    Never raises.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, ensure_ascii=False)
+    except (TypeError, ValueError):
+        try:
+            return json.dumps(str(value), ensure_ascii=False)
+        except Exception:  # noqa: BLE001 -- normalization must never raise
+            return ""
+
+
+def _normalize_tool_calls(tool_calls: Any) -> Any:
+    """Return *tool_calls* with every ``function.arguments`` normalised to str.
+
+    The list and each tool-call entry are shallow copies, so the response body
+    a caller parsed is never mutated in place.  Non-list values and non-dict
+    entries pass through untouched.
+    """
+    if not isinstance(tool_calls, list):
+        return tool_calls
+    normalized: list[Any] = []
+    for tc in tool_calls:
+        if not isinstance(tc, dict):
+            normalized.append(tc)
+            continue
+        tc = dict(tc)
+        fn = tc.get("function")
+        if isinstance(fn, dict):
+            fn = dict(fn)
+            fn["arguments"] = _normalize_tool_arguments(fn.get("arguments"))
+            tc["function"] = fn
+        normalized.append(tc)
+    return normalized
+
+
+def _is_slot_index(value: Any) -> bool:
+    """Return whether *value* is a usable tool-call slot index (bools are not)."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _tool_call_slot(
+    tool_calls: dict[int, dict],
+    entry: dict[str, Any],
+    next_slot: int,
+    last_slot: int | None,
+) -> tuple[int, int, int]:
+    """Return the accumulator slot for one streamed tool-call delta (#234).
+
+    The provider's own index is the merge key when present: OpenAI-style
+    deltas carry it at the top level (``entry["index"]``), Ollama's native
+    /api/chat nests it inside the call (``entry["function"]["index"]``, one
+    complete call per chunk in 0.30.5).  Servers that never populate the
+    field (e.g. Ollama 0.12) and bare argument fragments omit it, so the
+    rest is routing:
+
+    - an index-less entry with a non-empty name opens a new call in the
+      next free slot;
+    - an index-less entry without a name is an argument fragment of the
+      call routed just before it (slot 0 before any call).
+
+    Defaulting every index-less entry to slot 0 concatenated parallel
+    Ollama calls into one name and kept only the first call's arguments.
+
+    Returns ``(slot, next_slot, last_slot)``; the caller keeps the two
+    counters for the next entry.
+    """
+    fn = entry.get("function")
+    raw_index = entry.get("index")
+    if not _is_slot_index(raw_index) and isinstance(fn, dict):
+        raw_index = fn.get("index")
+    if _is_slot_index(raw_index):
+        # Keep derived slots above every provider index: otherwise a later
+        # index-less call is allocated slot 0 and `sorted()` replays the
+        # stream out of wire order.
+        return raw_index, max(next_slot, raw_index + 1), raw_index
+    name = fn.get("name") if isinstance(fn, dict) else None
+    if isinstance(name, str) and name:
+        slot = next_slot
+        while slot in tool_calls:
+            slot += 1
+        return slot, slot + 1, slot
+    if last_slot is None:
+        return 0, next_slot, 0
+    return last_slot, next_slot, last_slot
+
+
+def _to_ollama_tool_arguments(value: Any) -> Any:
+    """Return tool-call arguments in the shape Ollama's native API accepts.
+
+    Internally ``function.arguments`` is always a JSON string, but Ollama's
+    ``/api/chat`` unmarshals ``ToolCallFunctionArguments`` from a JSON
+    **object**: strings, arrays and scalars are all rejected with
+    ``400 Value looks like object, but can't find closing '}' symbol``.
+
+    - ``dict`` -> returned as-is (shared, not copied)
+    - ``str`` -> ``json.loads``; only a decoded object is kept
+    - ``""`` / ``None`` / lists / scalars / unparseable / non-object JSON
+      -> ``{}`` (a no-argument call still sends a valid object; every
+      rejected value is logged at debug level and never raises)
+
+    The caller's value is never mutated.
+    """
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str) or not value.strip():
+        return {}
+    try:
+        decoded = json.loads(value)
+    except json.JSONDecodeError as e:
+        log.debug("Could not decode tool-call arguments for Ollama: %s", e)
+        return {}
+    if isinstance(decoded, dict):
+        return decoded
+    log.debug("Ignoring non-object tool-call arguments for Ollama: %r", decoded)
+    return {}
+
+
+def _anthropic_tool_input(arguments: Any) -> dict[str, Any]:
+    """Return Anthropic ``tool_use.input`` as an object.
+
+    Anthropic requires ``input`` to be a JSON object; the internal string
+    representation may encode an array or a scalar, and a no-argument call
+    normalizes to ``""``.  Restored session history may also hold a
+    non-string value.  Anything that is not a JSON object becomes ``{}``.
+    """
+    if isinstance(arguments, dict):
+        return arguments
+    try:
+        decoded = json.loads(arguments or "{}")
+    except (json.JSONDecodeError, TypeError) as e:
+        log.debug("Could not decode tool-call arguments for Anthropic: %s", e)
+        return {}
+    if isinstance(decoded, dict):
+        return decoded
+    log.debug("Ignoring non-object tool-call arguments for Anthropic: %r", decoded)
+    return {}
+
+
 # Synthetic user message prepended to history when a framework tool_direct
 # turn (e.g. auto footprint sync) would otherwise open the conversation with
 # an assistant tool-call message — providers require the first message to
@@ -64,12 +222,12 @@ FRAMEWORK_PREAMBLE = (
 # ------------------------------------------------------------------
 
 # Categories assigned to *query* tools based on what they return.
-# Library/lookup-only queries (search_symbols, get_symbol, …) are excluded
+# Library/lookup-only queries (search_library_symbols, get_library_symbol, …) are excluded
 # because they are never invalidated by a file mutation.
 QUERY_CATEGORY: dict[str, str] = {
     # Schematic queries
     "list_symbol_properties": "symbol_properties",
-    "get_symbol_pins": "symbol_pins",
+    "get_library_symbol_pins": "symbol_pins",
     "check_reference_conflicts": "symbol_inventory",
     "list_labels_in_schematic": "labels",
     "extract_schematic_netlist": "netlist",
@@ -369,7 +527,7 @@ _COMPACTION_SUMMARY_FLOOR_CHARS = 800
 # "python-requests/2.32.3" from PluginSettings ("Don't use kicad plugin as a
 # type of agent" — review on #150). Version literal must stay in sync with
 # pyproject.toml (the plugin package has no __version__).
-_LLM_USER_AGENT = "KiCad-AI-Assistant/0.2.5 (+https://github.com/paul356/KiCad-AI-Assistant)"
+_LLM_USER_AGENT = "KiCad-AI-Assistant/0.2.10 (+https://github.com/paul356/KiCad-AI-Assistant)"
 
 # ------------------------------------------------------------------
 # On-demand tool loading (issue #129)
@@ -532,6 +690,115 @@ def _urlopen_with_plugin_ca_retry(request, timeout: float):
         return urllib.request.urlopen(  # nosec B310 -- user-configured LLM endpoint
             request, timeout=timeout, context=context
         )
+
+
+def _is_loopback_url(url: str) -> bool:
+    """Return whether *url* points at a loopback destination.
+
+    Matches ``localhost`` (with an optional trailing dot), ``::1``, the
+    unspecified IPv4 address, dotted IPv4 shorthand (``127.1``), and
+    IPv4-mapped IPv6 addresses (``::ffff:127.0.0.1``).  Address parsing is
+    required: a string prefix check would also match the DNS name
+    ``127.evil.com``.
+
+    Integer-decimal spellings (``http://2130706433/``) are deliberately not
+    supported.  ``getaddrinfo`` accepts them, but they are rare in
+    configuration, and treating them as ordinary host names keeps this
+    decision conservative.
+    """
+    import socket
+    import urllib.parse
+
+    try:
+        hostname = urllib.parse.urlsplit(url).hostname
+    except ValueError:
+        return False
+    if not hostname:
+        return False
+    host = hostname.lower().rstrip(".")
+    if host in ("localhost", "::1"):
+        return True
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        # Dotted IPv4 shorthand (127.1, 127.0.1).  A bare integer has no dot
+        # and is intentionally not accepted.
+        if "." not in host:
+            return False
+        try:
+            address = ipaddress.IPv4Address(socket.inet_aton(host))
+        except (OSError, ValueError):
+            # inet_aton raises ValueError (not OSError) for a host with an
+            # embedded NUL byte.
+            return False
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        address = address.ipv4_mapped
+    # The unspecified IPv4 address is not "loopback" per ipaddress, but a
+    # client connecting to it reaches the local host.
+    return address.is_loopback or (
+        isinstance(address, ipaddress.IPv4Address) and address.is_unspecified
+    )
+
+
+def _proxy_would_intercept(url: str) -> bool:
+    """Return whether the system proxy would be used for a loopback *url*.
+
+    Deliberately conservative: any configured HTTP or HTTPS proxy counts.
+    A false positive only sends a local request direct (harmless); a false
+    negative reproduces the Windows registry quirk where
+    ``ProxyOverride=<local>`` bypasses dotted-free names such as
+    ``localhost`` but not ``127.0.0.1`` (issue #230).
+    """
+    import urllib.request
+
+    if not _is_loopback_url(url):
+        return False
+    proxies = urllib.request.getproxies()
+    # The Windows registry reader does not normalise key case.
+    return any(value for key, value in proxies.items() if key.lower() in ("http", "https"))
+
+
+# Cached opener that ignores the system proxy.  Built at most once; plugin
+# threads (panel polling, IPC checks, streaming reads) may race for it.
+_loopback_opener: Any = None
+_loopback_opener_lock = threading.Lock()
+
+
+def _get_loopback_opener():
+    """Return the cached proxy-less opener used for loopback requests."""
+    global _loopback_opener
+    opener = _loopback_opener
+    if opener is None:
+        with _loopback_opener_lock:
+            if _loopback_opener is None:
+                import urllib.request
+
+                _loopback_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            opener = _loopback_opener
+    return opener
+
+
+def _urlopen(request, timeout: float, *, ca_retry: bool = False):
+    """Open *request*, bypassing the system proxy for loopback destinations.
+
+    Loopback requests use a cached ``ProxyHandler({})`` opener, but only
+    when a system proxy is configured and would otherwise intercept them.
+    Without a proxy, and for every outbound request, the existing behaviour
+    is unchanged: the global opener (system proxy) is used, with the plugin
+    CA fallback when *ca_retry* is set.
+
+    A global ``install_opener()`` is deliberately avoided: the plugin runs
+    inside KiCad's interpreter, so replacing the opener would change
+    ``urllib`` for the whole application.
+    """
+    import urllib.request
+
+    url = getattr(request, "full_url", request)
+    if isinstance(url, str) and _proxy_would_intercept(url):
+        return _get_loopback_opener().open(request, timeout=timeout)
+    if ca_retry:
+        return _urlopen_with_plugin_ca_retry(request, timeout)
+    return urllib.request.urlopen(request, timeout=timeout)  # nosec B310 -- caller controls the endpoint
 
 
 def _resolve_plugin_python() -> str | None:
@@ -713,6 +980,8 @@ try:
             # fmt == "openai"
             text_parts = []
             tool_calls = {}
+            next_slot = 0
+            last_slot = None
             finish_reason = "stop"
             reasoning = []
             while True:
@@ -738,29 +1007,66 @@ try:
                     finish_reason = fr
                 delta = choice.get("delta", {})
                 content = delta.get("content")
-                if content:
-                    text_parts.append(content)
-                    emit("SSE-DATA", {"content": content})
+                if isinstance(content, str):
+                    if content:
+                        text_parts.append(content)
+                        emit("SSE-DATA", {"content": content})
                 reasoning_part = delta.get("reasoning_content")
                 if reasoning_part:
                     reasoning.append(reasoning_part)
                 for tc_delta in delta.get("tool_calls") or []:
-                    # Same tolerance as the in-process parser: gateways
-                    # (Gemini) may omit the tool-call index.
-                    idx = tc_delta.get("index", 0)
+                    # Inlined copy of _tool_call_slot (the relay cannot import
+                    # it; keep the two in sync): a top-level or nested
+                    # function.index is the merge key, a named index-less
+                    # entry opens a new call, a nameless one continues the
+                    # call routed just before it (#234).
+                    raw_index = tc_delta.get("index")
+                    _fn = tc_delta.get("function")
+                    if (
+                        not (isinstance(raw_index, int) and not isinstance(raw_index, bool))
+                        and isinstance(_fn, dict)
+                    ):
+                        raw_index = _fn.get("index")
+                    if isinstance(raw_index, int) and not isinstance(raw_index, bool):
+                        idx = raw_index
+                        next_slot = max(next_slot, raw_index + 1)
+                    else:
+                        _name = _fn.get("name") if isinstance(_fn, dict) else None
+                        if isinstance(_name, str) and _name:
+                            idx = next_slot
+                            while idx in tool_calls:
+                                idx += 1
+                            next_slot = idx + 1
+                        elif last_slot is not None:
+                            idx = last_slot
+                        else:
+                            idx = 0
+                    last_slot = idx
                     if idx not in tool_calls:
                         tool_calls[idx] = {
                             "id": "", "type": "function",
                             "function": {"name": "", "arguments": ""},
                         }
                     tc = tool_calls[idx]
-                    if tc_delta.get("id"):
-                        tc["id"] += tc_delta["id"]
-                    fn = tc_delta.get("function", {})
-                    if fn.get("name"):
-                        tc["function"]["name"] += fn["name"]
-                    if fn.get("arguments"):
-                        tc["function"]["arguments"] += fn["arguments"]
+                    call_id = tc_delta.get("id")
+                    if isinstance(call_id, str) and call_id:
+                        tc["id"] += call_id
+                    fn = tc_delta.get("function") or {}
+                    if not isinstance(fn, dict):
+                        continue
+                    name = fn.get("name")
+                    if isinstance(name, str) and name:
+                        tc["function"]["name"] += name
+                    arguments = fn.get("arguments")
+                    if arguments:
+                        if isinstance(arguments, str):
+                            tc["function"]["arguments"] += arguments
+                        else:
+                            # Object-style delta (Ollama /v1, LM Studio):
+                            # serialize once instead of str + dict.
+                            tc["function"]["arguments"] = json.dumps(
+                                arguments, ensure_ascii=False
+                            )
             tool_calls_list = [tool_calls[k] for k in sorted(tool_calls)]
             message_out = {"content": "".join(text_parts)}
             if tool_calls_list:
@@ -899,7 +1205,7 @@ def _https_post_json(
     if _in_process_ssl is not False:
         req = urllib.request.Request(url, data=body, headers=headers, method="POST")
         try:
-            with _urlopen_with_plugin_ca_retry(req, timeout=timeout) as resp:
+            with _urlopen(req, timeout, ca_retry=True) as resp:
                 _in_process_ssl = True
                 return resp.status, resp.read().decode("utf-8", "replace")
         except urllib.error.HTTPError as e:
@@ -1064,10 +1370,12 @@ def _subprocess_sse_stream(
     except subprocess.TimeoutExpired:
         proc.kill()
 
-    message: dict[str, Any] = {"content": (done.get("message") or {}).get("content", "")}
     done_message = done.get("message") or {}
+    if not isinstance(done_message, dict):
+        done_message = {}
+    message: dict[str, Any] = {"content": done_message.get("content", "")}
     if done_message.get("tool_calls"):
-        message["tool_calls"] = done_message["tool_calls"]
+        message["tool_calls"] = _normalize_tool_calls(done_message["tool_calls"])
     if done_message.get("reasoning_content"):
         message["reasoning_content"] = done_message["reasoning_content"]
     if on_stream_event is not None:
@@ -1269,7 +1577,7 @@ def call_mcp_tool(
     def _post() -> None:
         """Run the HTTP POST + parse in the worker; never raises."""
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:  # nosec B310 -- MCP client, localhost only
+            with _urlopen(req, timeout) as resp:
                 body = _parse_mcp_response_text(resp.read().decode())
         except urllib.error.URLError as e:
             box["result"] = {"success": False, "error": f"MCP server unreachable: {e}"}
@@ -3539,7 +3847,7 @@ class LLMClient:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=10) as resp:  # nosec B310 -- MCP client, localhost only
+            with _urlopen(req, 10) as resp:
                 body = _parse_mcp_response_text(resp.read().decode())
         except Exception as e:
             log.warning(f"Could not fetch tool list: {e}")
@@ -3603,21 +3911,23 @@ class LLMClient:
                     # the non-streaming call. Known compat-layer bugs (verified
                     # against googleapis/python-genai#2868 and
                     # discuss.ai.google.dev#60140):
-                    #   1. stream deltas omit the tool_call index field ->
-                    #      parallel tool calls collapse into one slot and names
-                    #      get concatenated (e.g.
-                    #      "extract_schematic_netlistlist_...");
+                    #   1. stream deltas omit the tool_call index field, which
+                    #      used to collapse parallel tool calls into one slot
+                    #      with concatenated names (e.g.
+                    #      "extract_schematic_netlistlist_..."). The
+                    #      index-less name rule in _tool_call_slot now covers
+                    #      that shape;
                     #   2. stream deltas omit the tool_call id -> empty id in
                     #      the next-turn history is rejected (HTTP 400);
                     #   3. finish_reason comes back "stop" instead of
                     #      "tool_calls", ending the tool loop prematurely.
                     # A local-id generator is community-verified to work
-                    # (non-empty id + matching tool_call_id), but it only
-                    # fixes #2 and still leaves #1/#3; all three depend on a
-                    # moving compat layer Google is actively fixing, so a real
-                    # streaming fix is on hold (issue #145). Non-streaming
-                    # responses carry a genuine model-issued id and
-                    # finish_reason, so they are safe.
+                    # (non-empty id + matching tool_call_id) and would close
+                    # #2, but #3 alone still ends the tool loop early, and both
+                    # depend on a moving compat layer Google is actively
+                    # fixing, so a real streaming fix is on hold (issue #145).
+                    # Non-streaming responses carry a genuine model-issued id
+                    # and finish_reason, so they are safe.
                     response = self._call_openai(system, tools)
                     if not response.get("error"):
                         on_stream_event({"type": "text_start"})
@@ -3705,7 +4015,7 @@ class LLMClient:
                             "type": "tool_use",
                             "id": tc["id"],
                             "name": tc["function"]["name"],
-                            "input": json.loads(tc["function"].get("arguments", "{}")),
+                            "input": _anthropic_tool_input(tc["function"].get("arguments")),
                         }
                         for tc in m["tool_calls"]
                     ]
@@ -3785,12 +4095,14 @@ class LLMClient:
         if _in_process_ssl is not False:
             req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
             try:
-                with _urlopen_with_plugin_ca_retry(req, timeout=300) as resp:
+                with _urlopen(req, 300, ca_retry=True) as resp:
                     _in_process_ssl = True
                     text_parts = []
                     if on_stream_event is not None:
                         on_stream_event({"type": "text_start"})
                     tool_calls_by_index: dict[int, dict] = {}
+                    next_slot = 0
+                    last_slot: int | None = None
                     finish_reason = "stop"
 
                     while True:
@@ -3830,11 +4142,13 @@ class LLMClient:
                             _current_reasoning.append(reasoning)
 
                         for tc_delta in delta.get("tool_calls") or []:
-                            # OpenAI-compatible gateways (e.g. Gemini's
-                            # v1beta/openai shim) may omit the per-delta
-                            # tool-call index; default to 0 (a single
-                            # function call) instead of raising KeyError.
-                            idx = tc_delta.get("index", 0)
+                            # Index-less deltas are routed by slot: a named
+                            # entry opens a new call, a nameless one continues
+                            # the previous call (Gemini shims omit the index,
+                            # as does Ollama's native format).
+                            idx, next_slot, last_slot = _tool_call_slot(
+                                tool_calls_by_index, tc_delta, next_slot, last_slot
+                            )
                             if idx not in tool_calls_by_index:
                                 tool_calls_by_index[idx] = {
                                     "id": "",
@@ -3842,13 +4156,30 @@ class LLMClient:
                                     "function": {"name": "", "arguments": ""},
                                 }
                             tc = tool_calls_by_index[idx]
-                            if tc_delta.get("id"):
-                                tc["id"] += tc_delta["id"]
-                            fn = tc_delta.get("function", {})
-                            if fn.get("name"):
-                                tc["function"]["name"] += fn["name"]
-                            if fn.get("arguments"):
-                                tc["function"]["arguments"] += fn["arguments"]
+                            call_id = tc_delta.get("id")
+                            if isinstance(call_id, str) and call_id:
+                                tc["id"] += call_id
+                            elif call_id:
+                                log.debug("Skipping non-string tool-call id %r", call_id)
+                            fn = tc_delta.get("function") or {}
+                            if not isinstance(fn, dict):
+                                continue
+                            name = fn.get("name")
+                            if isinstance(name, str) and name:
+                                tc["function"]["name"] += name
+                            elif name:
+                                log.debug("Skipping non-string tool name %r", name)
+                            arguments = fn.get("arguments")
+                            if arguments:
+                                if isinstance(arguments, str):
+                                    tc["function"]["arguments"] += arguments
+                                else:
+                                    # Object-style delta (Ollama /v1, LM Studio,
+                                    # llama.cpp): serialize once instead of
+                                    # concatenating a dict onto a str.
+                                    tc["function"]["arguments"] = _normalize_tool_arguments(
+                                        arguments
+                                    )
 
                     tool_calls = [tool_calls_by_index[k] for k in sorted(tool_calls_by_index)]
                     message: dict[str, Any] = {"content": "".join(text_parts)}
@@ -3900,6 +4231,25 @@ class LLMClient:
                         images.append(data)
                 content = "\n".join(p for p in text_parts if p)
             converted = {**msg, "content": content}
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                # Ollama's native API requires arguments as JSON objects; the
+                # internal representation is always a JSON string.
+                outbound: list[Any] = []
+                for tc in msg["tool_calls"]:
+                    fn = tc.get("function") if isinstance(tc, dict) else None
+                    if not isinstance(fn, dict):
+                        outbound.append(tc)
+                        continue
+                    outbound.append(
+                        {
+                            **tc,
+                            "function": {
+                                **fn,
+                                "arguments": _to_ollama_tool_arguments(fn.get("arguments")),
+                            },
+                        }
+                    )
+                converted["tool_calls"] = outbound
             if images:
                 converted["images"] = images
             out.append(converted)
@@ -3933,11 +4283,13 @@ class LLMClient:
 
         req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
         try:
-            with urllib.request.urlopen(req, timeout=300) as resp:  # nosec B310 -- localhost only
+            with _urlopen(req, 300) as resp:
                 text_parts = []
                 if on_stream_event is not None:
                     on_stream_event({"type": "text_start"})
                 tool_calls_by_index: dict[int, dict] = {}
+                next_slot = 0
+                last_slot: int | None = None
                 finish_reason = "stop"
 
                 while True:
@@ -3956,17 +4308,37 @@ class LLMClient:
                         finish_reason = chunk.get("done_reason", "stop")
                         break
 
-                    msg = chunk.get("message", {})
-                    content = msg.get("content", "")
-                    if content:
-                        text_parts.append(content)
-                        try:
-                            on_stream_event({"type": "text_chunk", "content": content})
-                        except Exception as e:
-                            log.error("Text delta callback error in Ollama streaming: %s", e)
+                    msg = chunk.get("message")
+                    if not isinstance(msg, dict):
+                        # e.g. an /api/generate-style payload (bare string) or a
+                        # truncated chunk — nothing to accumulate.
+                        continue
+                    content = msg.get("content")
+                    if isinstance(content, str):
+                        if content:
+                            text_parts.append(content)
+                            try:
+                                on_stream_event({"type": "text_chunk", "content": content})
+                            except Exception as e:
+                                log.error("Text delta callback error in Ollama streaming: %s", e)
+                    elif content:
+                        # Some compatible endpoints return content blocks
+                        # (list/dict).  Joining them would raise TypeError and
+                        # JSON-pasting them would corrupt the chat text.
+                        log.warning(
+                            "Ignoring non-string content in Ollama stream (%s)",
+                            type(content).__name__,
+                        )
 
                     for tc_delta in msg.get("tool_calls") or []:
-                        idx = tc_delta.get("index", 0)
+                        # Ollama nests the call index inside `function` (older
+                        # releases omit it and send one complete call per
+                        # chunk); _tool_call_slot honours either and gives
+                        # every index-less named entry its own slot instead of
+                        # merging into slot 0 (#234).
+                        idx, next_slot, last_slot = _tool_call_slot(
+                            tool_calls_by_index, tc_delta, next_slot, last_slot
+                        )
                         if idx not in tool_calls_by_index:
                             tool_calls_by_index[idx] = {
                                 "id": "",
@@ -3974,13 +4346,29 @@ class LLMClient:
                                 "function": {"name": "", "arguments": ""},
                             }
                         tc = tool_calls_by_index[idx]
-                        if tc_delta.get("id"):
-                            tc["id"] += tc_delta["id"]
-                        fn = tc_delta.get("function", {})
-                        if fn.get("name"):
-                            tc["function"]["name"] += fn["name"]
-                        if fn.get("arguments"):
-                            tc["function"]["arguments"] += fn["arguments"]
+                        call_id = tc_delta.get("id")
+                        if isinstance(call_id, str) and call_id:
+                            tc["id"] += call_id
+                        elif call_id:
+                            log.debug("Skipping non-string tool-call id %r", call_id)
+                        fn = tc_delta.get("function") or {}
+                        if not isinstance(fn, dict):
+                            continue
+                        name = fn.get("name")
+                        if isinstance(name, str) and name:
+                            tc["function"]["name"] += name
+                        elif name:
+                            log.debug("Skipping non-string tool name %r", name)
+                        arguments = fn.get("arguments")
+                        if arguments:
+                            if isinstance(arguments, str):
+                                tc["function"]["arguments"] += arguments
+                            else:
+                                # Ollama's native /api/chat sends arguments as a
+                                # JSON object, not a serialized string: dumping
+                                # once replaces the empty accumulator instead of
+                                # raising TypeError on str + dict (#232).
+                                tc["function"]["arguments"] = _normalize_tool_arguments(arguments)
 
                 tool_calls = [tool_calls_by_index[k] for k in sorted(tool_calls_by_index)]
                 message: dict[str, Any] = {"content": "".join(text_parts)}
@@ -3990,6 +4378,15 @@ class LLMClient:
                     on_stream_event({"type": "text_end"})
                 return {"finish_reason": finish_reason, "message": message}
 
+        except urllib.error.HTTPError as e:
+            # HTTPError is a URLError subclass; surface the reason phrase and
+            # (crucially) the provider's body instead of a bare status code.
+            try:
+                body = e.read().decode("utf-8", "replace")[:200]
+            except Exception:  # noqa: BLE001 -- the body is best-effort context
+                body = ""
+            detail = f"HTTP {e.code}: {body}" if body else f"HTTP {e.code}: {e.reason}"
+            return {"error": f"Ollama request failed: {detail}"}
         except urllib.error.URLError as e:
             return {"error": f"Ollama request failed: {e}"}
         except Exception as e:
@@ -4043,7 +4440,7 @@ class LLMClient:
         if _in_process_ssl is not False:
             req = urllib.request.Request(url, data=encoded, headers=headers, method="POST")
             try:
-                with _urlopen_with_plugin_ca_retry(req, timeout=300) as resp:
+                with _urlopen(req, 300, ca_retry=True) as resp:
                     _in_process_ssl = True
                     if on_stream_event is not None:
                         on_stream_event({"type": "text_start"})
@@ -4246,9 +4643,15 @@ class LLMClient:
         if not _choices:
             return {"error": f"{label} response contained no choices"}
         choice = _choices[0]
+        message = choice.get("message", {})
+        # Ollama's OpenAI-compatible endpoint (/v1/chat/completions) returns
+        # tool-call arguments as JSON objects; normalize the copy we hand back
+        # so downstream json.loads(arguments) works.
+        if isinstance(message, dict) and message.get("tool_calls"):
+            message = {**message, "tool_calls": _normalize_tool_calls(message["tool_calls"])}
         return {
             "finish_reason": choice.get("finish_reason", "stop"),
-            "message": choice.get("message", {}),
+            "message": message,
         }
 
     def _call_openai(self, system: str, tools: list[dict]) -> dict[str, Any]:
@@ -4378,6 +4781,10 @@ class LLMClient:
             return {"error": f"Unexpected response from Ollama: {text[:200]}"}
 
         msg = body.get("message", {})
+        # Ollama returns tool-call arguments as JSON objects; normalize the
+        # copy we hand back so downstream json.loads(arguments) works.
+        if isinstance(msg, dict) and msg.get("tool_calls"):
+            msg = {**msg, "tool_calls": _normalize_tool_calls(msg["tool_calls"])}
         finish_reason = "stop"
         if body.get("done_reason") == "tool_calls":
             finish_reason = "tool_calls"

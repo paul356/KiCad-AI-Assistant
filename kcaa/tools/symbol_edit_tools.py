@@ -13,13 +13,14 @@ import os
 from pathlib import Path
 import re
 import threading
-from typing import Any
+from typing import Any, NamedTuple
 import uuid
 
 from fastmcp import Context, FastMCP
 import sexpdata
 
 from kcaa.tools.sheet_tools import _normalize_collection, _sheet_dict_from_wrapper
+from kcaa.tools.symbol_tools import _not_found_scope, _scope_text
 from kcaa.utils.config import (
     config,
 )
@@ -407,7 +408,7 @@ def _do_add_symbol_to_library(
             skipped.append({"symbol": requested, "reason": "already_in_library"})
             continue
 
-    # Refresh the index so search_symbols/list_symbol_libraries see the new
+    # Refresh the index so search_library_symbols/list_symbol_libraries see the new
     # file — reindexed under the library's OWN ownership (a global library
     # edited from a project schematic must stay global).
     proj_dir = _find_project_dir(schematic_path)
@@ -682,7 +683,7 @@ def _do_find_symbols_not_in_libraries(schematic_path: str) -> dict[str, Any]:
         pass
 
     if not instances:
-        return {"missing": [], "missing_count": 0}
+        return {"missing": [], "missing_count": 0, "scope": _scope_text(schematic_path)}
 
     # Preferred source of truth: the symbol index database — but only when
     # the current project's sync has actually completed.  Trusting a sync
@@ -769,7 +770,11 @@ def _do_find_symbols_not_in_libraries(schematic_path: str) -> dict[str, Any]:
         entry["reference_count"] = len(entry["references"])
         missing.append(entry)
 
-    return {"missing": missing, "missing_count": len(missing)}
+    return {
+        "missing": missing,
+        "missing_count": len(missing),
+        "scope": _scope_text(schematic_path),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -971,7 +976,8 @@ def _do_add_symbol(
         if lib_rec is None:
             return {
                 "error": (
-                    f"Library '{library_name}' not found in index. "
+                    f"Library '{library_name}' not found in the index"
+                    f"{_not_found_scope(schematic_path, hint=False)} "
                     "Verify the library name is correct."
                 )
             }
@@ -981,7 +987,8 @@ def _do_add_symbol(
             return {
                 "error": (
                     f"Symbol '{symbol_name}' not found in library "
-                    f"'{library_name}'. Verify the symbol name."
+                    f"'{library_name}'{_not_found_scope(schematic_path, hint=False)} "
+                    "Verify the symbol name."
                 )
             }
 
@@ -998,8 +1005,13 @@ def _do_add_symbol(
 
         # Expand (extends ...) symbols into self-contained definitions so that
         # the injected lib_symbol has full geometry and pin sub-symbols.
+        # Fields the merge has to drop are reported in the tool response.
+        warnings: list[str] = []
         lib_sym_raw = _resolve_extends_symbol(
-            lib_sym_raw, library_name, project_path=schematic_path
+            lib_sym_raw,
+            library_name,
+            project_path=schematic_path,
+            warnings=warnings,
         )
 
         try:
@@ -1087,7 +1099,7 @@ def _do_add_symbol(
             "position": {"x": x, "y": y},
             "position_adjusted": x != original_x or y != original_y,
             "body_bbox": body_bbox,
-            "warnings": [],
+            "warnings": warnings,
             "file_modified": schematic_path,
             "backup_path": schematic_path + ".bak",
         }
@@ -1420,12 +1432,141 @@ def _collect_unit_pin_numbers(lib_sym_raw: list, unit: int) -> list[str]:
     return pin_numbers
 
 
-def _get_property_at(prop_raw: list) -> tuple[float, float, int]:
+class _ParsedLibProperty(NamedTuple):
+    """Content of a library ``(property ...)`` node."""
+
+    is_private: bool
+    name: str
+    value: str
+    tail: list
+
+
+def _property_atom_text(atom: object) -> str | None:
+    """Return the text of a property name/value atom, or ``None`` if not an atom."""
+    if isinstance(atom, sexpdata.Symbol):
+        return atom.value()
+    if isinstance(atom, str):
+        return atom
+    if isinstance(atom, (int, float)):
+        return str(atom)
+    return None
+
+
+# Diagnostic size budgets.  A malformed node can embed an arbitrarily large
+# atom, and the rendered text is copied into both the server log and the tool
+# response, so every part is bounded.  The three caps keep the longest merged
+# warning well under the 400-character bound the tests assert.
+_MAX_PROPERTY_NODE_REPR = 200  # whole node rendering
+_MAX_PROPERTY_ATOM_TEXT = 120  # one atom inside that rendering
+_MAX_PROPERTY_NAME_TEXT = 64  # property-name label prefixed to the message
+
+
+def _bound_text(text: str, limit: int) -> str:
+    """Cap *text* at *limit* characters, marking the cut explicitly.
+
+    The marker records the original length, so a truncated diagnostic stays
+    distinguishable from a genuinely short one.
     """
-    Extract the (at x y rot) from a property raw list.
+    if len(text) <= limit:
+        return text
+    suffix = f"... ({len(text)} chars)"
+    return text[: limit - len(suffix)] + suffix
+
+
+def _bounded_node_view(value: object) -> object:
+    """Return a display view of a property node with oversized atoms cut short.
+
+    Atoms are shortened *before* the node is repr-ed: repr-ing a 200 KB string
+    only to slice the result copies the whole string for nothing.  Lists and
+    symbols are rebuilt around the shortened leaves, so the node keeps its
+    shape while its ``repr`` stays cheap.
+    """
+    if isinstance(value, str):
+        return _bound_text(value, _MAX_PROPERTY_ATOM_TEXT)
+    if isinstance(value, sexpdata.Symbol):
+        text = value.value()
+        if isinstance(text, str):
+            return sexpdata.Symbol(_bound_text(text, _MAX_PROPERTY_ATOM_TEXT))
+        return value
+    if isinstance(value, list):
+        return [_bounded_node_view(child) for child in value]
+    return value
+
+
+def _format_property_node(node: object) -> str:
+    """Render a malformed property node for an error message, bounded in size.
+
+    The message is copied into both the server log and the tool response, and
+    a malformed node can embed an arbitrarily large atom (e.g. a multi-megabyte
+    value in a hand-edited library), so the node is rendered through
+    ``_bounded_node_view`` and capped again for nested-node safety.  Identifying
+    fields such as the property name are kept outside this rendering.
+    """
+    return _bound_text(repr(_bounded_node_view(node)), _MAX_PROPERTY_NODE_REPR)
+
+
+def _parse_lib_property(prop_raw: list) -> _ParsedLibProperty:
+    """Parse a library ``(property ...)`` node using KiCad's field grammar.
+
+    KiCad's grammar is ``(property [private] <name> <value> <child>*)``:
+    ``private`` is the optional literal marker token, the name and value are
+    atoms (quoted strings or bare symbols), and the remaining children are
+    positional/effects nodes.  Raises ``ValueError`` for shapes that do not
+    match (including an empty name or a non-list atom after the value), so a
+    malformed node cannot silently shift name/value extraction.
+    """
+    if (
+        not isinstance(prop_raw, list)
+        or not prop_raw
+        or not isinstance(prop_raw[0], sexpdata.Symbol)
+        or prop_raw[0].value() != "property"
+    ):
+        raise ValueError(
+            f"Malformed property node (not a property): {_format_property_node(prop_raw)}"
+        )
+    if len(prop_raw) < 2:
+        raise ValueError(
+            f"Malformed property node (missing name/value): {_format_property_node(prop_raw)}"
+        )
+
+    index = 1
+    is_private = False
+    marker = prop_raw[index]
+    if isinstance(marker, sexpdata.Symbol) and marker.value() == "private":
+        is_private = True
+        index += 1
+
+    if len(prop_raw) < index + 2:
+        raise ValueError(
+            f"Malformed property node (missing name/value): {_format_property_node(prop_raw)}"
+        )
+
+    name = _property_atom_text(prop_raw[index])
+    value = _property_atom_text(prop_raw[index + 1])
+    if name is None or value is None:
+        raise ValueError(
+            f"Malformed property node (name/value not atoms): {_format_property_node(prop_raw)}"
+        )
+    if not name:
+        raise ValueError(f"Malformed property node (empty name): {_format_property_node(prop_raw)}")
+
+    tail = list(prop_raw[index + 2 :])
+    for child in tail:
+        if not isinstance(child, list):
+            raise ValueError(
+                "Malformed property node (unexpected atom after value): "
+                f"{_format_property_node(prop_raw)}"
+            )
+
+    return _ParsedLibProperty(is_private, name, value, tail)
+
+
+def _get_property_at(prop_children: list) -> tuple[float, float, int]:
+    """
+    Extract the (at x y rot) from a property's tail child nodes.
     Returns (0.0, 0.0, 0) if not found.
     """
-    for child in prop_raw[2:]:
+    for child in prop_children:
         if (
             isinstance(child, list)
             and len(child) >= 3
@@ -1470,12 +1611,16 @@ def _build_property(
     hide: bool = False,
     justify: str | None = None,
     do_not_autoplace: bool = False,
+    *,
+    private: bool,
 ) -> list:
     """Build a (property "name" "value" (at x y rot) (effects ...)) raw list.
 
     When *do_not_autoplace* is True, ``(do_not_autoplace yes)`` is appended
     after the effects node so that KiCad's field auto-placer leaves this
-    property at its specified coordinates.
+    property at its specified coordinates.  When *private* is True, the
+    ``private`` marker is inserted between ``property`` and the name, matching
+    KiCad's library-field grammar.
     """
     effects: list = [
         sexpdata.Symbol("effects"),
@@ -1490,16 +1635,22 @@ def _build_property(
         effects.append([sexpdata.Symbol("hide"), sexpdata.Symbol("yes")])
     node = [
         sexpdata.Symbol("property"),
-        name,
-        value,
-        [
-            sexpdata.Symbol("at"),
-            abs_x,
-            abs_y,
-            rot,
-        ],
-        effects,
     ]
+    if private:
+        node.append(sexpdata.Symbol("private"))
+    node.extend(
+        [
+            name,
+            value,
+            [
+                sexpdata.Symbol("at"),
+                abs_x,
+                abs_y,
+                rot,
+            ],
+            effects,
+        ]
+    )
     if do_not_autoplace:
         node.append([sexpdata.Symbol("do_not_autoplace"), sexpdata.Symbol("yes")])
     return node
@@ -1549,23 +1700,28 @@ def _build_placed_symbol(
     # rotating their library-relative offsets by the placement rotation.
     extra_props: list[list] = []
     for prop in lib_props:
-        if len(prop) < 2:
+        parsed = _parse_lib_property(prop)
+        pname = parsed.name
+        if pname in (
+            "Reference",
+            "Value",
+            "ki_keywords",
+            "ki_fp_filters",
+            "ki_description",
+        ):
             continue
-        pname = prop[1]
-        if pname in ("Reference", "Value", "ki_keywords", "ki_fp_filters", "ki_description"):
-            continue
-        prop_x, prop_y, prop_rot = _get_property_at(prop)
+        prop_x, prop_y, prop_rot = _get_property_at(parsed.tail)
         pdx, pdy = _rotate_offset(prop_x, prop_y, rotation)
-        pval = prop[2] if len(prop) >= 3 else ""
         extra_props.append(
             _build_property(
                 pname,
-                pval,
+                parsed.value,
                 x + pdx,
                 y + pdy,
                 prop_rot,
-                hide=(pname not in _STANDARD_VISIBLE_PROPERTIES),
+                hide=parsed.is_private or (pname not in _STANDARD_VISIBLE_PROPERTIES),
                 do_not_autoplace=not fields_autoplaced,
+                private=parsed.is_private,
             )
         )
 
@@ -1597,6 +1753,7 @@ def _build_placed_symbol(
             justify="left",
             do_not_autoplace=not fields_autoplaced,
             hide=reference.startswith("#"),
+            private=False,
         ),
         _build_property(
             "Value",
@@ -1606,6 +1763,7 @@ def _build_placed_symbol(
             0,
             justify="left",
             do_not_autoplace=not fields_autoplaced,
+            private=False,
         ),
     ]
 
@@ -1674,8 +1832,44 @@ def _get_extends_base_name(lib_sym_raw: list) -> str | None:
     return None
 
 
+def _lib_property_merge_key(prop_raw: list) -> str:
+    """Return the identity a property keeps when base and variant are merged.
+
+    KiCad identifies a library field by its name; ``private`` is an attribute
+    of that field, not part of its identity.  The raw node's second element is
+    the literal ``private`` marker for a private field and the name otherwise,
+    so parse the node and key on the name.  The winning node keeps its own
+    marker: a variant property replaces a base property of the same name even
+    when their ``private`` flags differ.
+    """
+    # Identity is the parsed field name verbatim (exact case).  KiCad writes
+    # canonical capitalisation, so mixed-case duplicates are out of scope and
+    # normalising names here is deliberately not done.
+    return _parse_lib_property(prop_raw).name
+
+
+def _property_node_label(prop_raw: list) -> str:
+    """Return a `` <name>`` suffix naming a property node that failed to parse.
+
+    The second element is the field name, or the literal ``private`` marker.
+    The name is truncated before it is repr-ed and capped like the node
+    rendering, so a huge name cannot blow the message budget either.  Returns
+    an empty string when the node carries no name (e.g. a bare
+    ``(property)``), so the message can still name the base symbol.
+    """
+    if len(prop_raw) < 2:
+        return ""
+    text = _property_atom_text(prop_raw[1])
+    if text is None:
+        return ""
+    return f" {_bound_text(text, _MAX_PROPERTY_NAME_TEXT)!r}"
+
+
 def _resolve_extends_symbol(
-    lib_sym_raw: list, library_name: str, project_path: str | None = None
+    lib_sym_raw: list,
+    library_name: str,
+    project_path: str | None = None,
+    warnings: list[str] | None = None,
 ) -> list:
     """Resolve an ``(extends ...)`` lib symbol into a fully self-contained definition.
 
@@ -1700,12 +1894,17 @@ def _resolve_extends_symbol(
          names re-prefixed to match the extending symbol.
 
     Returns *lib_sym_raw* unchanged if no ``(extends ...)`` clause is present
-    or if the base symbol cannot be resolved (a warning is logged).
+    or if the base symbol cannot be resolved (a warning is logged and appended
+    to *warnings* when given).
 
     Args:
         project_path: Optional project directory or file inside one, used to
             scope the index lookup so base symbols in project-local
             libraries resolve.
+        warnings: Optional sink.  Messages are appended for every degradation
+            of the merge — an unresolvable or unextractable base symbol and an
+            unparseable base property — so tool callers see what was lost
+            instead of relying on the server log alone.
     """
     base_name = _get_extends_base_name(lib_sym_raw)
     if base_name is None:
@@ -1722,13 +1921,23 @@ def _resolve_extends_symbol(
     base_sym_rec = mgr.get_symbol(base_lib_name, base_name)
     base_lib_rec = mgr.get_library_by_name(base_lib_name)
 
+    # Diagnostics-only rendering.  The lookup above keeps the exact names: a
+    # long (but valid) symbol id must still resolve, so nothing here feeds
+    # back into resolution.
+    display_base_id = (
+        f"{_bound_text(base_lib_name, _MAX_PROPERTY_NAME_TEXT)}:"
+        f"{_bound_text(base_name, _MAX_PROPERTY_NAME_TEXT)}"
+    )
+    display_base_name = _bound_text(base_name, _MAX_PROPERTY_NAME_TEXT)
+
     if base_sym_rec is None or base_lib_rec is None:
-        log.warning(
-            "extends base symbol %r not found under library %r; "
-            "injecting as-is (schematic may be incomplete)",
-            base_name,
-            base_lib_name,
+        message = (
+            f"extends base symbol {display_base_id!r} not found; "
+            "injecting the symbol as-is (schematic may be incomplete)"
         )
+        log.warning(message)
+        if warnings is not None:
+            warnings.append(message)
         return lib_sym_raw
 
     try:
@@ -1740,11 +1949,13 @@ def _resolve_extends_symbol(
             base_lib_rec.file_size,
         )
     except Exception as exc:
-        log.warning(
-            "Could not extract base symbol %r: %s; injecting as-is",
-            base_name,
-            exc,
+        message = (
+            f"Could not extract extends base symbol {display_base_id!r}: {exc}; "
+            "injecting the symbol as-is (schematic may be incomplete)"
         )
+        log.warning(message)
+        if warnings is not None:
+            warnings.append(message)
         return lib_sym_raw
 
     base_raw = copy.deepcopy(base_raw)
@@ -1763,8 +1974,8 @@ def _resolve_extends_symbol(
         tag = child[0].value()
         if tag == "extends":
             continue
-        if tag == "property" and len(child) >= 2:
-            ext_props[child[1]] = child
+        if tag == "property":
+            ext_props[_lib_property_merge_key(child)] = child
         elif tag not in _META_TAGS:
             ext_structural[tag] = child
 
@@ -1795,16 +2006,25 @@ def _resolve_extends_symbol(
             and len(child) >= 1
             and isinstance(child[0], sexpdata.Symbol)
             and child[0].value() == "property"
-            and len(child) >= 2
         ):
             continue
-        pname = child[1]
-        if pname in seen_props:
+        try:
+            pkey = _lib_property_merge_key(child)
+        except ValueError as exc:
+            message = (
+                f"Skipping unparseable property{_property_node_label(child)} "
+                f"in extends base symbol {display_base_name!r}: {exc}"
+            )
+            log.warning(message)
+            if warnings is not None:
+                warnings.append(message)
             continue
-        merged.append(copy.deepcopy(ext_props.get(pname, child)))
-        seen_props.add(pname)
-    for pname, child in ext_props.items():
-        if pname not in seen_props:
+        if pkey in seen_props:
+            continue
+        merged.append(copy.deepcopy(ext_props.get(pkey, child)))
+        seen_props.add(pkey)
+    for pkey, child in ext_props.items():
+        if pkey not in seen_props:
             merged.append(copy.deepcopy(child))
 
     # 3. Sub-symbols: from base, with names re-prefixed to the extending name.
@@ -2221,7 +2441,7 @@ def _do_create_symbol(
         "warnings": warnings,
     }
 
-    # Refresh the index so search_symbols sees the new symbol — reindexed
+    # Refresh the index so search_library_symbols sees the new symbol — reindexed
     # under the library's OWN ownership (a global library stays global).
     target_project = _target_project_of(lib["table_path"], project_dir)
     _index_symbol_library(library, lib_file, project_dir=project_dir, project=target_project)
@@ -2256,7 +2476,7 @@ def register_symbol_edit_tools(mcp: FastMCP) -> None:
         block, and inserts a placed instance for every unit of the symbol.
         The library is resolved scoped to the target schematic's project
         (project sym-lib-table libraries included), matching how
-        ``search_symbols`` reports them.
+        ``search_library_symbols`` reports them.
         Coordinates are mm in KiCad screen convention (**+Y is down**) and
         are auto-snapped to the 1.27 mm (50-mil) grid so pins land on KiCad's
         standard schematic grid and wires can connect to them. A backup
@@ -2272,7 +2492,7 @@ def register_symbol_edit_tools(mcp: FastMCP) -> None:
 
         Args:
             schematic_path: Absolute path to the target .kicad_sch file.
-            library_name: Library name as returned by ``search_symbols`` in
+            library_name: Library name as returned by ``search_library_symbols`` in
                 the ``library_name`` field.  For KiCad 10 symdir-style
                 libraries this is ``"TableName/FileBaseName"``
                 (e.g. ``"Device/R_Small"``), not just the table name
@@ -2458,10 +2678,20 @@ def register_symbol_edit_tools(mcp: FastMCP) -> None:
             mgr = _get_index_manager(schematic_path)
             lib_rec = mgr.get_library_by_name(library_name)
             if lib_rec is None:
-                return {"error": f"Library '{library_name}' not found in index"}
+                return {
+                    "error": (
+                        f"Library '{library_name}' not found in the index"
+                        f"{_not_found_scope(schematic_path, hint=False)}"
+                    )
+                }
             sym_rec = mgr.get_symbol(library_name, symbol_name)
             if sym_rec is None:
-                return {"error": (f"Symbol '{symbol_name}' not found in library '{library_name}'")}
+                return {
+                    "error": (
+                        f"Symbol '{symbol_name}' not found in library "
+                        f"'{library_name}'{_not_found_scope(schematic_path, hint=False)}"
+                    )
+                }
             new_lib_raw = extract_lib_symbol_raw(
                 lib_rec.file_path,
                 sym_rec.file_index,
@@ -2549,7 +2779,7 @@ def register_symbol_edit_tools(mcp: FastMCP) -> None:
         ``sym-lib-table`` (created if absent) with a ``${KIPRJMOD}`` URI.
 
         The library is created empty and indexed immediately, so
-        ``search_symbols`` / ``list_symbol_libraries`` see it.  Call this
+        ``search_library_symbols`` / ``list_symbol_libraries`` see it.  Call this
         **before** ``create_symbol`` — the latter requires an existing
         library.
 
@@ -2632,7 +2862,8 @@ def register_symbol_edit_tools(mcp: FastMCP) -> None:
 
         Returns:
             dict with keys: missing (list of dicts with name, library,
-            references, reference_count), missing_count.
+            references, reference_count), missing_count, scope
+            (the global/project library scope actually searched).
         """
         return await asyncio.to_thread(
             _do_find_symbols_not_in_libraries, schematic_path=schematic_path
@@ -3129,7 +3360,17 @@ def register_symbol_edit_tools(mcp: FastMCP) -> None:
         references: list[str],
         ctx: Context | None = None,
     ) -> dict[str, Any]:
-        """List all properties of one or more placed schematic components.
+        """List properties of one or more **placed schematic symbols** (.kicad_sch).
+
+        Object: components placed in a schematic — not library symbol
+        definitions and not PCB footprints.
+        Key: a single ``schematic_path`` plus a non-empty ``references`` list;
+        one payload is returned per reference.
+        Returns: per-reference ``properties`` list of {name, value}; no
+        geometry, position, or nets.
+        Use instead: ``get_library_symbol`` / ``get_library_symbol_pins`` for the library
+        definition and pin data, and ``get_footprint`` for PCB placement geometry.
+        For the library footprint definition use ``get_library_footprint``.
 
         Returns every ``(property ...)`` entry found on the first unit of the
         component identified by *reference*.  All units of a multi-unit
