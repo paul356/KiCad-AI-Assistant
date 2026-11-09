@@ -1,0 +1,336 @@
+(kicad_symbol_lib
+  (version 20220914)
+  (generator kicad_symbol_editor)
+  (symbol "Plain"
+    (pin_numbers
+      (hide yes)
+    )
+    (pin_names
+      (offset 0.254)
+    )
+    (exclude_from_sim no)
+    (in_bom yes)
+    (on_board yes)
+    (property "Reference" "R"
+      (at 0 0 90)
+      (effects
+        (font
+          (size 1.016 1.016)
+        )
+      )
+    )
+    (property "Value" "Plain"
+      (at 0 0 90)
+      (effects
+        (font
+          (size 1.016 1.016)
+        )
+      )
+    )
+    (property "Footprint" ""
+      (at 0 0 0)
+      (effects
+        (font
+          (size 1.016 1.016)
+        )
+        (hide yes)
+      )
+    )
+    (property "Datasheet" "~"
+      (at 0 0 0)
+      (effects
+        (font
+          (size 1.016 1.016)
+        )
+        (hide yes)
+      )
+    )
+    (symbol "Plain_0_1"
+      (rectangle
+        (start -2.54 2.54)
+        (end 2.54 -2.54)
+        (stroke
+          (width 0.254)
+          (type default)
+        )
+        (fill
+          (type none)
+        )
+      )
+    )
+    (symbol "Plain_1_1"
+      (pin passive line
+        (at -5.08 0 0)
+        (length 2.54)
+        (name "A"
+          (effects
+            (font
+              (size 1.27 1.27)
+            )
+          )
+        )
+        (number "P$1"
+          (effects
+            (font
+              (size 1.27 1.27)
+            )
+          )
+        )
+      )
+      (pin passive line
+        (at 5.08 0 180)
+        (length 2.54)
+        (name "B"
+          (effects
+            (font
+              (size 1.27 1.27)
+            )
+          )
+        )
+        (number "P$2"
+          (effects
+            (font
+              (size 1.27 1.27)
+            )
+          )
+        )
+      )
+    )
+  )
+  (symbol "MultiUnit"
+    (pin_numbers
+      (hide yes)
+    )
+    (pin_names
+      (offset 0.254)
+    )
+    (exclude_from_sim no)
+    (in_bom yes)
+    (on_board yes)
+    (property "Reference" "U"
+      (at 0 0 90)
+      (effects
+        (font
+          (size 1.016 1.016)
+        )
+      )
+    )
+    (property "Value" "MultiUnit"
+      (at 0 0 90)
+      (effects
+        (font
+          (size 1.016 1.016)
+        )
+      )
+    )
+    (property "Footprint" ""
+      (at 0 0 0)
+      (effects
+        (font
+          (size 1.016 1.016)
+        )
+        (hide yes)
+      )
+    )
+    (property "Datasheet" "~"
+      (at 0 0 0)
+      (effects
+        (font
+          (size 1.016 1.016)
+        )
+        (hide yes)
+      )
+    )
+    (symbol "MultiUnit_0_1"
+      (rectangle
+        (start -5.08 5.08)
+        (end 5.08 -5.08)
+        (stroke
+          (width 0.254)
+          (type default)
+        )
+        (fill
+          (type none)
+        )
+      )
+    )
+    (symbol "MultiUnit_1_1"
+      (pin passive line
+        (at -7.62 2.54 0)
+        (length 2.54)
+        (name "A"
+          (effects
+            (font
+              (size 1.27 1.27)
+            )
+          )
+        )
+        (number "1"
+          (effects
+            (font
+              (size 1.27 1.27)
+            )
+          )
+        )
+      )
+      (pin passive line
+        (at -7.62 -2.54 0)
+        (length 2.54)
+        (name "B"
+          (effects
+            (font
+              (size 1.27 1.27)
+            )
+          )
+        )
+        (number "2"
+          (effects
+            (font
+              (size 1.27 1.27)
+            )
+          )
+        )
+      )
+    )
+    (symbol "MultiUnit_2_1"
+      (pin passive line
+        (at 7.62 2.54 180)
+        (length 2.54)
+        (name "C"
+          (effects
+            (font
+              (size 1.27 1.27)
+            )
+          )
+        )
+        (number "1"
+          (effects
+            (font
+              (size 1.27 1.27)
+            )
+          )
+        )
+      )
+      (pin passive line
+        (at 7.62 -2.54 180)
+        (length 2.54)
+        (name "D"
+          (effects
+            (font
+              (size 1.27 1.27)
+            )
+          )
+        )
+        (number "3"
+          (effects
+            (font
+              (size 1.27 1.27)
+            )
+          )
+        )
+      )
+    )
+  )
+  (symbol "Derived"
+    (extends "Plain")
+    (property "Reference" "R"
+      (at 0 0 90)
+      (effects
+        (font
+          (size 1.016 1.016)
+        )
+      )
+    )
+    (property "Value" "Derived"
+      (at 0 0 90)
+      (effects
+        (font
+          (size 1.016 1.016)
+        )
+      )
+    )
+    (property "Footprint" ""
+      (at 0 0 0)
+      (effects
+        (font
+          (size 1.016 1.016)
+        )
+        (hide yes)
+      )
+    )
+    (property "Datasheet" "~"
+      (at 0 0 0)
+      (effects
+        (font
+          (size 1.016 1.016)
+        )
+        (hide yes)
+      )
+    )
+  )
+  (symbol "Other"
+    (pin_numbers
+      (hide yes)
+    )
+    (pin_names
+      (offset 0.254)
+    )
+    (exclude_from_sim no)
+    (in_bom yes)
+    (on_board yes)
+    (property "Reference" "C"
+      (at 0 0 90)
+      (effects
+        (font
+          (size 1.016 1.016)
+        )
+      )
+    )
+    (property "Value" "Other"
+      (at 0 0 90)
+      (effects
+        (font
+          (size 1.016 1.016)
+        )
+      )
+    )
+    (property "Footprint" ""
+      (at 0 0 0)
+      (effects
+        (font
+          (size 1.016 1.016)
+        )
+        (hide yes)
+      )
+    )
+    (property "Datasheet" "~"
+      (at 0 0 0)
+      (effects
+        (font
+          (size 1.016 1.016)
+        )
+        (hide yes)
+      )
+    )
+    (symbol "Other_1_1"
+      (pin passive line
+        (at 0 5.08 270)
+        (length 2.54)
+        (name "X"
+          (effects
+            (font
+              (size 1.27 1.27)
+            )
+          )
+        )
+        (number "9"
+          (effects
+            (font
+              (size 1.27 1.27)
+            )
+          )
+        )
+      )
+    )
+  )
+)

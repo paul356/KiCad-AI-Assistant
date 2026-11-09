@@ -274,6 +274,7 @@ MUTATION_RIPPLES: dict[str, set[str]] = {
         "placement",
     },
     "set_symbol_property": {"symbol_properties"},
+    "update_schematic_symbol_pin": {"symbol_pins"},
     "rename_symbol": {"symbol_inventory"},
     "delete_symbol_property": {"symbol_properties"},
     "move_component": {"symbol_inventory", "placement"},

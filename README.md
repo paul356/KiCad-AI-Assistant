@@ -243,6 +243,7 @@ kcaa
 | `delete_symbol_library` | Delete an empty symbol library (file, library-table entry, and index) |
 | `add_symbols_to_library` | Copy symbols from a schematic's cached `lib_symbols` into an existing library |
 | `remove_symbols_from_library` | Remove named symbol definitions from a library and re-index it |
+| `update_library_symbol_pin` | Rename a pin number and/or pin name in a library symbol definition (format-preserving) |
 | `find_symbols_not_in_libraries` | List schematic symbols that resolve to no available library (read-only) |
 
 ### Schematic Editing
@@ -255,6 +256,7 @@ kcaa
 | `remove_symbol_from_schematic` | Remove placed symbol by reference |
 | `move_component` | Move and/or rotate a placed component |
 | `set_symbol_property` | Set a property field on a placed symbol |
+| `update_schematic_symbol_pin` | Rename a pin number and/or pin name in a schematic's cached `lib_symbols` copy |
 | `rename_symbol` | Rename a placed symbol's reference designator |
 | `list_symbol_properties` | List properties (name → value) of placed schematic symbols — no geometry, position, or nets |
 | `delete_symbol_property` | Delete a property from a placed symbol |

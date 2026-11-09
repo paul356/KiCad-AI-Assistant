@@ -2,7 +2,7 @@
 name: schematic-placement
 priority: 70
 description: "Symbol placement workflow, find_free_area, bbox geometry, spacing rules"
-tools: [extract_schematic_netlist, add_symbol_to_schematic, place_symbol_relative, move_component, find_free_area, get_schematic_sheet_info]
+tools: [extract_schematic_netlist, add_symbol_to_schematic, place_symbol_relative, move_component, find_free_area, get_schematic_sheet_info, update_schematic_symbol_pin]
 ---
 # Geometry you get for free
 - get_library_symbol and get_library_symbol_pins return body_bbox + per-unit bboxes in
@@ -44,6 +44,17 @@ tools: [extract_schematic_netlist, add_symbol_to_schematic, place_symbol_relativ
 - Whole-move deltas may be nudged to the nearest free area when the target
   region is occupied: `position_adjusted` is then `True` and
   `requested_position` holds the grid-snapped target.
+
+# Fixing pin numbering before footprint assignment
+- Inspect the symbol with **get_library_symbol_pins**. If its pins are numbered
+  `P$1`, `P$2`, … but the footprint pads are `1`, `2`, …, fix the definition
+  with **update_library_symbol_pin** (library file) and, for parts already
+  placed, **update_schematic_symbol_pin** (the schematic's cached `lib_symbols`
+  copy that KiCad actually renders).
+- Do this **before** `set_symbol_property` assigns the `Footprint`; the two
+  tools are a pair — the library edit covers future placements, the schematic
+  edit covers the placed copies. Both report the changes and write `.bak`
+  backups.
 
 # Spacing & layout rules
 - Keep at least one grid step (1.27 mm) of clearance between symbol body

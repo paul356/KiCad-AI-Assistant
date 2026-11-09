@@ -540,3 +540,381 @@ def remove_symbol_from_library_file(file_path: str, symbol_name: str) -> str:
         fh.write(new_text)
     os.replace(tmp_path, file_path)
     return os.path.abspath(file_path)
+
+
+# ---------------------------------------------------------------------------
+# Pin number / pin name editing
+# ---------------------------------------------------------------------------
+
+_MAX_PIN_NUMBER_LENGTH = 32
+_MAX_AVAILABLE_PIN_NUMBERS = 10
+_STRING_ESCAPES = {"n": "\n", "r": "\r", "t": "\t", "\\": "\\", '"': '"'}
+
+
+def _decode_sexp_string(raw: str) -> str:
+    """Decode the escape sequences KiCad uses inside a quoted string."""
+    out: list[str] = []
+    index = 0
+    while index < len(raw):
+        char = raw[index]
+        if char == "\\" and index + 1 < len(raw):
+            out.append(_STRING_ESCAPES.get(raw[index + 1], raw[index + 1]))
+            index += 2
+            continue
+        out.append(char)
+        index += 1
+    return "".join(out)
+
+
+def _skip_whitespace(text: str, index: int, end: int) -> int:
+    """Advance *index* past whitespace, never past *end*."""
+    while index < end and text[index] in " \t\r\n":
+        index += 1
+    return index
+
+
+def _read_token(text: str, index: int, end: int) -> tuple[str | None, int, int, int]:
+    """Read one s-expression token (quoted string or bare atom).
+
+    :returns: ``(value, token_start, token_end, next_index)``.  *value* is
+        None when no token starts at *index*; the spans cover the token
+        including its quotes so callers can splice a replacement in place.
+    """
+    index = _skip_whitespace(text, index, end)
+    if index >= end:
+        return None, index, index, index
+    if text[index] == '"':
+        start = index
+        index += 1
+        content_start = index
+        while index < end:
+            if text[index] == "\\":
+                index += 2
+                continue
+            if text[index] == '"':
+                return _decode_sexp_string(text[content_start:index]), start, index + 1, index + 1
+            index += 1
+        return None, start, end, end
+    start = index
+    while index < end and text[index] not in ' \t\r\n()"':
+        index += 1
+    if index == start:
+        # A paren: consume it so callers cannot loop forever on it.
+        return None, start, start, index + 1
+    return text[start:index], start, index, index
+
+
+def _node_head(text: str, start: int, end: int) -> tuple[str | None, str | None]:
+    """Return ``(keyword, second_token)`` for the node whose ``(`` is at *start*."""
+    keyword, _, _, after_keyword = _read_token(text, start + 1, end)
+    name, _, _, _ = _read_token(text, after_keyword, end)
+    return keyword, name
+
+
+def _child_spans(text: str, start: int, end: int) -> list[tuple[int, int]]:
+    """Return direct child node spans of the node whose ``(`` is at *start*."""
+    spans: list[tuple[int, int]] = []
+    index = start + 1
+    limit = end - 1
+    while index < limit:
+        char = text[index]
+        if char == ";":
+            newline = text.find("\n", index)
+            index = limit if newline == -1 or newline >= limit else newline + 1
+        elif char == '"':
+            _, _, _, index = _read_token(text, index, limit)
+        elif char == "(":
+            close = _balanced_close(text, index)
+            if close == -1 or close > end:
+                return []
+            spans.append((index, close))
+            index = close
+        else:
+            index += 1
+    return spans
+
+
+def _find_top_symbol_span(text: str, symbol_name: str) -> tuple[int, int] | None:
+    """Return the span of the top-level ``(symbol "symbol_name" ...)`` node."""
+    for start, end in _root_children_spans(text):
+        keyword, name = _node_head(text, start, end)
+        if keyword == "symbol" and name == symbol_name:
+            return start, end
+    return None
+
+
+def _child_token(
+    text: str, start: int, end: int, keyword: str
+) -> tuple[str | None, tuple[int, int] | None]:
+    """Return the first token of a direct *keyword* child node."""
+    for child_start, child_end in _child_spans(text, start, end):
+        child_keyword, _ = _node_head(text, child_start, child_end)
+        if child_keyword != keyword:
+            continue
+        _, _, _, after_keyword = _read_token(text, child_start + 1, child_end)
+        value, token_start, token_end, _ = _read_token(text, after_keyword, child_end)
+        if value is None:
+            return None, None
+        return value, (token_start, token_end)
+    return None, None
+
+
+def _split_sub_symbol_name(name: str, symbol_name: str) -> tuple[int, int] | None:
+    """Parse ``<symbol>_<unit>_<style>`` into ``(unit, style)``.
+
+    Symbol names may themselves contain underscores, so the trailing two
+    all-digit segments are the only ones that define the unit/style.  Returns
+    None for unrelated sub-symbols and for non-numeric suffixes.
+    """
+    prefix = symbol_name + "_"
+    if not name.startswith(prefix):
+        return None
+    parts = name[len(prefix) :].split("_")
+    if len(parts) != 2:
+        return None
+    try:
+        return int(parts[0]), int(parts[1])
+    except ValueError:
+        return None
+
+
+def _validate_pin_edit_args(
+    pin_number: str,
+    new_number: str | None,
+    new_name: str | None,
+) -> None:
+    """Validate the shared argument contract of the pin-edit surfaces.
+
+    Raises:
+        ValueError: With the exact contract message for each invalid input.
+    """
+    if not isinstance(pin_number, str) or not pin_number:
+        raise ValueError("pin_number must be a non-empty string")
+    if new_number is None and new_name is None:
+        raise ValueError("both new_number and new_name are None; nothing to change")
+    if new_number is not None:
+        invalid_number = (
+            not isinstance(new_number, str)
+            or not new_number
+            or len(new_number) > _MAX_PIN_NUMBER_LENGTH
+            or any(char.isspace() for char in new_number)
+            or any(char in new_number for char in '"()\\')
+        )
+        if invalid_number:
+            raise ValueError(
+                "new_number must be a non-empty token without whitespace, quotes, "
+                "parentheses or backslashes (max 32 characters)"
+            )
+    if new_name is not None and (
+        not isinstance(new_name, str) or any(char in new_name for char in '"()\\\n\r\t')
+    ):
+        raise ValueError(
+            "new_name must not contain quotes, parentheses, backslashes or control characters"
+        )
+
+
+def _plan_pin_edit(
+    pins: list[dict[str, Any]],
+    symbol_name: str,
+    pin_number: str,
+    new_number: str | None,
+    new_name: str | None,
+    unit: int | None,
+) -> dict[str, Any]:
+    """Resolve matching pins and validate the whole edit before any write.
+
+    Each entry of *pins* carries at least ``unit``, ``style``, ``number`` and
+    ``name``; callers add their own write payload (spans or raw nodes) and use
+    the returned ``matches`` to apply the plan.
+
+    Raises:
+        ValueError: When no pin matches or when the new number collides with
+            another pin of the same unit.
+    """
+    selected = [pin for pin in pins if unit is None or pin["unit"] == unit]
+    matches = [pin for pin in selected if pin["number"] == pin_number]
+    if not matches:
+        available = list(dict.fromkeys(pin["number"] for pin in selected if pin["number"]))[
+            :_MAX_AVAILABLE_PIN_NUMBERS
+        ]
+        detail = ", ".join(available) if available else "none"
+        raise ValueError(
+            f"pin '{pin_number}' not found in symbol '{symbol_name}' "
+            f"(available pin numbers in the selected units: {detail})"
+        )
+
+    warnings: list[str] = []
+    if new_number is not None:
+        match_ids = {id(pin) for pin in matches}
+        changed_units = {pin["unit"] for pin in matches}
+        for pin in pins:
+            if (
+                id(pin) not in match_ids
+                and pin["unit"] in changed_units
+                and pin["number"] == new_number
+            ):
+                raise ValueError(
+                    f"pin number '{new_number}' is already used by pin "
+                    f"'{pin['name']}' in unit {pin['unit']}"
+                )
+        warned_units: set[int] = set()
+        for pin in pins:
+            if (
+                id(pin) not in match_ids
+                and pin["unit"] not in changed_units
+                and pin["number"] == new_number
+                and pin["unit"] not in warned_units
+            ):
+                warned_units.add(pin["unit"])
+                warnings.append(f"pin number '{new_number}' is also used in unit {pin['unit']}")
+
+    changes: list[dict[str, Any]] = []
+    changed = False
+    for pin in matches:
+        final_number = pin["number"] if new_number is None else new_number
+        final_name = pin["name"] if new_name is None else new_name
+        changes.append(
+            {
+                "unit": pin["unit"],
+                "style": pin["style"],
+                "old_number": pin["number"],
+                "old_name": pin["name"],
+                "new_number": final_number,
+                "new_name": final_name,
+            }
+        )
+        if final_number != pin["number"] or final_name != pin["name"]:
+            changed = True
+
+    return {
+        "matches": matches,
+        "changes": changes,
+        "changed": changed,
+        "warnings": warnings,
+    }
+
+
+def set_symbol_pin(
+    file_path: str,
+    symbol_name: str,
+    pin_number: str,
+    new_number: str | None = None,
+    new_name: str | None = None,
+    unit: int | None = None,
+) -> dict:
+    """Rename a pin number and/or pin name inside one library symbol.
+
+    Only the quoted literals of the targeted ``(number ...)`` / ``(name ...)``
+    nodes are replaced: every other byte of the ``.kicad_sym`` file — header,
+    other symbols, formatting, line endings — stays identical.  The file is
+    written atomically after a ``.bak`` copy is taken; on any validation
+    error nothing is written.
+
+    Pins live in sub-symbols named ``<symbol>_<unit>_<style>``.  ``unit=None``
+    edits every matching occurrence in all units and both body styles;
+    ``unit=N`` restricts the edit to that unit (``0`` = common unit), still
+    covering both styles.
+
+    :param file_path: Absolute path to the ``.kicad_sym`` library file.
+    :param symbol_name: Plain (unqualified) top-level symbol name.
+    :param pin_number: Existing pin number that selects the pin(s) to edit.
+    :param new_number: Replacement pin number; omit to keep the old number.
+    :param new_name: Replacement pin name; omit to keep the old name.
+    :param unit: Optional unit to restrict the edit to.
+    :returns: Report dict with ``occurrences``, ``changes``, ``changed``,
+        ``backup_path`` and ``warnings``.
+    :raises FileNotFoundError: When *file_path* does not exist.
+    :raises SymbolNotFoundError: When *symbol_name* is not a top-level symbol.
+    :raises ValueError: On invalid arguments, a missing pin, or a collision.
+    """
+    _validate_pin_edit_args(pin_number, new_number, new_name)
+    if not os.path.isfile(file_path):
+        raise FileNotFoundError(f"Library file not found: {file_path}")
+
+    with open(file_path, encoding="utf-8", newline="") as fh:
+        text = fh.read()
+
+    span = _find_top_symbol_span(text, symbol_name)
+    if span is None:
+        raise SymbolNotFoundError(
+            f"Symbol '{symbol_name}' not found in library {os.path.basename(file_path)}"
+        )
+    symbol_start, symbol_end = span
+
+    extends_base: str | None = None
+    sub_symbols: list[tuple[int, int, int, int]] = []
+    for child_start, child_end in _child_spans(text, symbol_start, symbol_end):
+        keyword, name = _node_head(text, child_start, child_end)
+        if keyword == "extends" and name is not None:
+            extends_base = name
+        elif keyword == "symbol" and name is not None:
+            parsed = _split_sub_symbol_name(name, symbol_name)
+            if parsed is not None:
+                sub_symbols.append((parsed[0], parsed[1], child_start, child_end))
+
+    pins: list[dict[str, Any]] = []
+    for pin_unit, pin_style, sub_start, sub_end in sub_symbols:
+        for pin_start, pin_end in _child_spans(text, sub_start, sub_end):
+            keyword, _ = _node_head(text, pin_start, pin_end)
+            if keyword != "pin":
+                continue
+            number, number_span = _child_token(text, pin_start, pin_end, "number")
+            name, name_span = _child_token(text, pin_start, pin_end, "name")
+            pins.append(
+                {
+                    "unit": pin_unit,
+                    "style": pin_style,
+                    "number": number or "",
+                    "name": name or "",
+                    "number_span": number_span,
+                    "name_span": name_span,
+                }
+            )
+
+    if extends_base is not None and not pins:
+        raise ValueError(
+            f"symbol '{symbol_name}' extends '{extends_base}' and defines no pins; "
+            f"update the base symbol '{extends_base}' instead"
+        )
+
+    plan = _plan_pin_edit(pins, symbol_name, pin_number, new_number, new_name, unit)
+
+    replacements: list[tuple[tuple[int, int], str]] = []
+    for pin in plan["matches"]:
+        if new_number is not None and new_number != pin["number"]:
+            if pin["number_span"] is None:
+                raise ValueError(
+                    f"pin '{pin_number}' has no (number ...) node in unit {pin['unit']}"
+                )
+            replacements.append((pin["number_span"], f'"{new_number}"'))
+        if new_name is not None and new_name != pin["name"]:
+            if pin["name_span"] is None:
+                raise ValueError(f"pin '{pin_number}' has no (name ...) node in unit {pin['unit']}")
+            replacements.append((pin["name_span"], f'"{new_name}"'))
+
+    backup_path: str | None = None
+    if plan["changed"]:
+        new_text = text
+        for (replace_start, replace_end), replacement in sorted(
+            replacements, key=lambda item: item[0][0], reverse=True
+        ):
+            new_text = new_text[:replace_start] + replacement + new_text[replace_end:]
+        file_path = os.path.abspath(file_path)
+        backup_path = file_path + ".bak"
+        shutil.copy2(file_path, backup_path)
+        tmp_path = file_path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8", newline="") as fh:
+            fh.write(new_text)
+        os.replace(tmp_path, file_path)
+
+    return {
+        "symbol_name": symbol_name,
+        "file_path": os.path.abspath(file_path),
+        "pin_number": new_number if new_number is not None else pin_number,
+        "unit": unit,
+        "occurrences": len(plan["matches"]),
+        "changes": plan["changes"],
+        "changed": plan["changed"],
+        "backup_path": backup_path,
+        "warnings": plan["warnings"],
+    }

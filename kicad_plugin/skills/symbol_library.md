@@ -2,7 +2,7 @@
 name: symbol-library
 priority: 80
 description: "Symbol index sync, full-text search, pin details, bbox geometry in library space"
-tools: [sync_symbol_index, get_symbol_sync_status, search_library_symbols, get_library_symbol, get_library_symbol_pins, list_symbol_libraries, list_library_symbols, get_symbol_index_stats]
+tools: [sync_symbol_index, get_symbol_sync_status, search_library_symbols, get_library_symbol, get_library_symbol_pins, list_symbol_libraries, list_library_symbols, get_symbol_index_stats, update_library_symbol_pin]
 ---
 # Tools overview
 - **sync_symbol_index(project_path?)** — Start background sync of the symbol index database.
@@ -61,6 +61,18 @@ project's own `sym-lib-table`; other projects are never searched. Call tools aga
   (e.g. `"Device/R_Small"`), **not** just the table name (e.g. not `"Device"`).
 - All library-name fields returned by search/lookup tools use this format and are
   ready to pass directly to `add_symbol_to_schematic`, `get_library_symbol`, etc.
+
+# Fixing pin numbers / names
+When a symbol's pins do not match the footprint pads (e.g. pins numbered `P$1`,
+`P$2` but pads `1`, `2`), inspect with **get_library_symbol_pins** first, then fix
+the definition with **update_library_symbol_pin(library_name, symbol_name,
+pin_number, new_number?, new_name?, unit?, project_path?)**. Use `pin_number` to
+select the existing pin; omit `unit` to update every unit and body style, or pass
+`unit=N` to restrict the edit. The `.kicad_sym` file is edited in place (a `.bak`
+backup is written) and only the pin literals change. Schematics that already
+embed the old definition are **not** updated — call **update_schematic_symbol_pin**
+afterwards for already placed parts. Do this before `set_symbol_property` assigns
+the footprint.
 
 # Caveats & gotchas
 - `sync_symbol_index` returns `status: "already_running"` if called while a sync is
