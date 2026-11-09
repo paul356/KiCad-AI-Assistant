@@ -13,7 +13,7 @@ import os
 from pathlib import Path
 import re
 import threading
-from typing import Any
+from typing import Any, NamedTuple
 import uuid
 
 from fastmcp import Context, FastMCP
@@ -1427,12 +1427,75 @@ def _collect_unit_pin_numbers(lib_sym_raw: list, unit: int) -> list[str]:
     return pin_numbers
 
 
-def _get_property_at(prop_raw: list) -> tuple[float, float, int]:
+class _ParsedLibProperty(NamedTuple):
+    """Content of a library ``(property ...)`` node."""
+
+    is_private: bool
+    name: str
+    value: str
+    tail: list
+
+
+def _property_atom_text(atom: object) -> str | None:
+    """Return the text of a property name/value atom, or ``None`` if not an atom."""
+    if isinstance(atom, sexpdata.Symbol):
+        return atom.value()
+    if isinstance(atom, str):
+        return atom
+    if isinstance(atom, (int, float)):
+        return str(atom)
+    return None
+
+
+def _parse_lib_property(prop_raw: list) -> _ParsedLibProperty:
+    """Parse a library ``(property ...)`` node using KiCad's field grammar.
+
+    KiCad's grammar is ``(property [private] <name> <value> <child>*)``:
+    ``private`` is an optional literal marker token, the name and value are
+    atoms (quoted strings or bare symbols), and the remaining children are
+    positional/effects nodes.  Raises ``ValueError`` for shapes that do not
+    match (including an empty name or a non-list atom after the value), so a
+    malformed node cannot silently shift name/value extraction.
     """
-    Extract the (at x y rot) from a property raw list.
+    if (
+        not isinstance(prop_raw, list)
+        or len(prop_raw) < 2
+        or not isinstance(prop_raw[0], sexpdata.Symbol)
+        or prop_raw[0].value() != "property"
+    ):
+        raise ValueError(f"Malformed property node (not a property): {prop_raw!r}")
+
+    index = 1
+    is_private = False
+    marker = prop_raw[index]
+    if isinstance(marker, sexpdata.Symbol) and marker.value() == "private":
+        is_private = True
+        index += 1
+
+    if len(prop_raw) < index + 2:
+        raise ValueError(f"Malformed property node (missing name/value): {prop_raw!r}")
+
+    name = _property_atom_text(prop_raw[index])
+    value = _property_atom_text(prop_raw[index + 1])
+    if name is None or value is None:
+        raise ValueError(f"Malformed property node (name/value not atoms): {prop_raw!r}")
+    if not name:
+        raise ValueError(f"Malformed property node (empty name): {prop_raw!r}")
+
+    tail = list(prop_raw[index + 2 :])
+    for child in tail:
+        if not isinstance(child, list):
+            raise ValueError(f"Malformed property node (unexpected atom after value): {prop_raw!r}")
+
+    return _ParsedLibProperty(is_private, name, value, tail)
+
+
+def _get_property_at(prop_children: list) -> tuple[float, float, int]:
+    """
+    Extract the (at x y rot) from a property's tail child nodes.
     Returns (0.0, 0.0, 0) if not found.
     """
-    for child in prop_raw[2:]:
+    for child in prop_children:
         if (
             isinstance(child, list)
             and len(child) >= 3
@@ -1477,12 +1540,16 @@ def _build_property(
     hide: bool = False,
     justify: str | None = None,
     do_not_autoplace: bool = False,
+    *,
+    private: bool,
 ) -> list:
     """Build a (property "name" "value" (at x y rot) (effects ...)) raw list.
 
     When *do_not_autoplace* is True, ``(do_not_autoplace yes)`` is appended
     after the effects node so that KiCad's field auto-placer leaves this
-    property at its specified coordinates.
+    property at its specified coordinates.  When *private* is True, the
+    ``private`` marker is inserted between ``property`` and the name, matching
+    KiCad's library-field grammar.
     """
     effects: list = [
         sexpdata.Symbol("effects"),
@@ -1497,16 +1564,22 @@ def _build_property(
         effects.append([sexpdata.Symbol("hide"), sexpdata.Symbol("yes")])
     node = [
         sexpdata.Symbol("property"),
-        name,
-        value,
-        [
-            sexpdata.Symbol("at"),
-            abs_x,
-            abs_y,
-            rot,
-        ],
-        effects,
     ]
+    if private:
+        node.append(sexpdata.Symbol("private"))
+    node.extend(
+        [
+            name,
+            value,
+            [
+                sexpdata.Symbol("at"),
+                abs_x,
+                abs_y,
+                rot,
+            ],
+            effects,
+        ]
+    )
     if do_not_autoplace:
         node.append([sexpdata.Symbol("do_not_autoplace"), sexpdata.Symbol("yes")])
     return node
@@ -1556,23 +1629,28 @@ def _build_placed_symbol(
     # rotating their library-relative offsets by the placement rotation.
     extra_props: list[list] = []
     for prop in lib_props:
-        if len(prop) < 2:
+        parsed = _parse_lib_property(prop)
+        pname = parsed.name
+        if pname in (
+            "Reference",
+            "Value",
+            "ki_keywords",
+            "ki_fp_filters",
+            "ki_description",
+        ):
             continue
-        pname = prop[1]
-        if pname in ("Reference", "Value", "ki_keywords", "ki_fp_filters", "ki_description"):
-            continue
-        prop_x, prop_y, prop_rot = _get_property_at(prop)
+        prop_x, prop_y, prop_rot = _get_property_at(parsed.tail)
         pdx, pdy = _rotate_offset(prop_x, prop_y, rotation)
-        pval = prop[2] if len(prop) >= 3 else ""
         extra_props.append(
             _build_property(
                 pname,
-                pval,
+                parsed.value,
                 x + pdx,
                 y + pdy,
                 prop_rot,
-                hide=(pname not in _STANDARD_VISIBLE_PROPERTIES),
+                hide=parsed.is_private or (pname not in _STANDARD_VISIBLE_PROPERTIES),
                 do_not_autoplace=not fields_autoplaced,
+                private=parsed.is_private,
             )
         )
 
@@ -1604,6 +1682,7 @@ def _build_placed_symbol(
             justify="left",
             do_not_autoplace=not fields_autoplaced,
             hide=reference.startswith("#"),
+            private=False,
         ),
         _build_property(
             "Value",
@@ -1613,6 +1692,7 @@ def _build_placed_symbol(
             0,
             justify="left",
             do_not_autoplace=not fields_autoplaced,
+            private=False,
         ),
     ]
 
