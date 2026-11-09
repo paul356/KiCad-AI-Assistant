@@ -102,6 +102,21 @@ _PRIVATE_ESCAPE_LIB_TEXT = r"""
 )
 """
 
+# A private field named Value must still be filtered like any mandatory field.
+_PRIVATE_VALUE_LIB_TEXT = """
+(symbol "PrivateValue"
+  (property "Reference" "U" (at 0 0 0) (effects (font (size 1.27 1.27))))
+  (property private "Value" "LIBVAL" (at 0 2.54 0)
+    (effects (font (size 1.27 1.27)) (hide yes)))
+  (property "Value" "PrivateValue" (at 0 2.54 0) (effects (font (size 1.27 1.27))))
+  (property "Footprint" "Package:PV" (at 0 0 0) (effects (font (size 1.27 1.27)) (hide yes)))
+  (symbol "PrivateValue_1_1"
+    (pin passive line (at 0 5.08 270) (length 2.54)
+      (name "" (effects (font (size 1.27 1.27))))
+      (number "1" (effects (font (size 1.27 1.27))))))
+)
+"""
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -602,6 +617,71 @@ class TestPrivateLibraryFields:
 
         serialized = sexpdata.dumps(placed)
         assert '(property private "KLC_S3.3" "The \\"value\\" has a \\\\ backslash"' in serialized
+
+    def test_private_value_does_not_override_caller_value(self):
+        """Reference/Value/ki_* filtering applies regardless of the marker."""
+        import sexpdata
+
+        placed = self._build(_PRIVATE_VALUE_LIB_TEXT, value="16MHz")
+        value_nodes = [
+            node
+            for node in _property_nodes(placed)
+            if _property_atom_text(_property_parts(node)[1]) == "Value"
+        ]
+        assert len(value_nodes) == 1
+        is_private, _, value_atom = _property_parts(value_nodes[0])
+        assert is_private is False
+        assert _property_atom_text(value_atom) == "16MHz"
+        assert "LIBVAL" not in sexpdata.dumps(placed)
+
+    def test_extra_atom_after_value_rejected(self):
+        """A stray atom after the value must raise instead of being ignored."""
+        from sexpdata import Symbol as Sexp
+
+        from kcaa.tools.symbol_edit_tools import _parse_lib_property
+
+        node = [Sexp("property"), "A", "B", "C", [Sexp("at"), 0, 0, 0]]
+        with pytest.raises(ValueError, match="unexpected atom after value") as exc:
+            _parse_lib_property(node)
+        assert "'C'" in str(exc.value)
+
+    def test_empty_property_name_rejected(self):
+        """KiCad rejects empty field names; the parser must too."""
+        from sexpdata import Symbol as Sexp
+
+        from kcaa.tools.symbol_edit_tools import _parse_lib_property
+
+        node = [Sexp("property"), "", "B", [Sexp("at"), 0, 0, 0]]
+        with pytest.raises(ValueError, match="empty name"):
+            _parse_lib_property(node)
+
+    def test_private_field_survives_save_and_reparse(self, tmp_sch):
+        """A real save/reload keeps the private marker and a non-empty value."""
+        from kcaa.utils.schematic_sexp_utils import save_schematic
+
+        placed = self._build(_PRIVATE_FIELD_LIB_TEXT)
+        sch = skip.Schematic(tmp_sch)
+        sch.new_from_list(placed)
+        save_schematic(tmp_sch, sch)
+
+        text = Path(tmp_sch).read_text()
+        assert '(property private "KLC_S3.3"' in text
+
+        reparsed = skip.Schematic(tmp_sch)
+        found: dict[str, str] = {}
+        for sym in reparsed.symbol:
+            try:
+                raw_tree = sym._pv._tree
+            except AttributeError:
+                continue
+            for node in _property_nodes(raw_tree):
+                is_private, name_atom, value_atom = _property_parts(node)
+                if is_private:
+                    found[_property_atom_text(name_atom)] = _property_atom_text(value_atom)
+        assert found.get("KLC_S3.3") == (
+            "The rectangle is not a symbol body but a graphical element"
+        )
+        assert found["KLC_S3.3"]  # non-empty after the round trip
 
     def test_malformed_property_raises_with_context(self):
         """Unparseable nodes must raise instead of shifting name/value."""

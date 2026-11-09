@@ -1454,7 +1454,8 @@ def _parse_lib_property(prop_raw: list) -> _ParsedLibProperty:
     ``private`` is an optional literal marker token, the name and value are
     atoms (quoted strings or bare symbols), and the remaining children are
     positional/effects nodes.  Raises ``ValueError`` for shapes that do not
-    match, so a malformed node cannot silently shift name/value extraction.
+    match (including an empty name or a non-list atom after the value), so a
+    malformed node cannot silently shift name/value extraction.
     """
     if (
         not isinstance(prop_raw, list)
@@ -1478,8 +1479,15 @@ def _parse_lib_property(prop_raw: list) -> _ParsedLibProperty:
     value = _property_atom_text(prop_raw[index + 1])
     if name is None or value is None:
         raise ValueError(f"Malformed property node (name/value not atoms): {prop_raw!r}")
+    if not name:
+        raise ValueError(f"Malformed property node (empty name): {prop_raw!r}")
 
-    return _ParsedLibProperty(is_private, name, value, list(prop_raw[index + 2 :]))
+    tail = list(prop_raw[index + 2 :])
+    for child in tail:
+        if not isinstance(child, list):
+            raise ValueError(f"Malformed property node (unexpected atom after value): {prop_raw!r}")
+
+    return _ParsedLibProperty(is_private, name, value, tail)
 
 
 def _get_property_at(prop_children: list) -> tuple[float, float, int]:
@@ -1623,7 +1631,7 @@ def _build_placed_symbol(
     for prop in lib_props:
         parsed = _parse_lib_property(prop)
         pname = parsed.name
-        if not parsed.is_private and pname in (
+        if pname in (
             "Reference",
             "Value",
             "ki_keywords",
