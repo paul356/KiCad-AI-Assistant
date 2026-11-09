@@ -366,6 +366,11 @@ if _WX_AVAILABLE:
                 "padding:1px 3px;border-radius:2px;font-weight:600}"
                 "mark.search-match{background:#FFEB3B;color:#000;padding:0 1px;border-radius:1px}"
                 "mark.search-active{background:#FF9800;color:#fff;padding:0 1px;border-radius:1px}"
+                "#jump-latest{display:none;position:fixed;right:14px;bottom:14px;z-index:10;"
+                "width:32px;height:32px;padding:0;border:1px solid #B8BEC9;border-radius:16px;"
+                "background:#FFFFFF;color:#333;font-size:16px;line-height:1;cursor:pointer;"
+                "box-shadow:0 1px 4px rgba(0,0,0,0.22)}"
+                "#jump-latest:hover{background:#E8EDF7}"
                 "</style>"
                 "<script>" + js_code + "</script>"
                 "</head>"
@@ -376,6 +381,8 @@ if _WX_AVAILABLE:
                 "<b><span style='color:#008250'>AI</span></b><br>"
                 "<div id='pending-ai-text'></div>"
                 "</td></tr></table>"
+                "<button id='jump-latest' type='button' "
+                "aria-label='Jump to latest message' title='Jump to latest message'>↓</button>"
                 "</body></html>"
             )
 

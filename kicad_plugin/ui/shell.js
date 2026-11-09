@@ -144,6 +144,39 @@ function _shouldScrollBottom() {
     return (sh - ih - sy) < 80;
 }
 
+// ---- Jump to latest ----
+// A floating button that returns the reader to the newest output.  Its
+// visibility is purely positional: it reuses _shouldScrollBottom(), so it
+// shares the 80 px follow threshold instead of duplicating the constant.
+function _updateJumpLatest() {
+    var btn = document.getElementById('jump-latest');
+    if (!btn) return;
+    btn.style.display = _shouldScrollBottom() ? 'none' : 'block';
+}
+
+function _jumpToLatest() {
+    window.scrollTo(0, document.body ? document.body.scrollHeight : 0);
+    _updateJumpLatest();
+}
+
+(function _installJumpLatest() {
+    function install() {
+        // shell.js runs from <head>, so the button only exists once the body
+        // has been parsed.
+        var btn = document.getElementById('jump-latest');
+        if (!btn) return;
+        btn.addEventListener('click', _jumpToLatest);
+        window.addEventListener('scroll', _updateJumpLatest, { passive: true });
+        window.addEventListener('resize', _updateJumpLatest);
+        _updateJumpLatest();
+    }
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', install);
+    } else {
+        install();
+    }
+})();
+
 window._updateConversation = function(entriesJson, scrollMode, replaceDocument) {
     try {
         // Measure the reader's position before mutating the DOM: new content
@@ -187,6 +220,7 @@ window._updateConversation = function(entriesJson, scrollMode, replaceDocument) 
         if (scrollMode === 'bottom' || (scrollMode === 'follow' && stick)) {
             window.scrollTo(0, document.body ? document.body.scrollHeight : 0);
         }
+        _updateJumpLatest();
         return 'ok:' + entries.length;
     } catch (err) {
         return 'error:' + err.message;
@@ -207,6 +241,7 @@ window._appendEntry = function(entryJson, scrollMode) {
         if (scrollMode === 'bottom' || (scrollMode === 'follow' && stick)) {
             window.scrollTo(0, document.body ? document.body.scrollHeight : 0);
         }
+        _updateJumpLatest();
         return 'ok:' + entry.type;
     } catch (err) {
         return 'error:' + err.message;
@@ -224,6 +259,7 @@ window._updateStream = function(html, scrollMode) {
     if (scrollMode === 'bottom' || (scrollMode === 'follow' && stick)) {
         window.scrollTo(0, document.body ? document.body.scrollHeight : 0);
     }
+    _updateJumpLatest();
 };
 
 window._clearConversation = function() {
@@ -232,6 +268,7 @@ window._clearConversation = function() {
     if (sw) sw.style.display = 'none';
     document.getElementById('pending-ai-text').innerHTML = '';
     window.scrollTo(0, 0);
+    _updateJumpLatest();
 };
 
 // Click-to-collapse: results expand via the summary (native toggle).
