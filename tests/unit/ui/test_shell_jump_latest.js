@@ -21,16 +21,19 @@ const shellJsPath = path.join(__dirname, '..', '..', '..', 'kicad_plugin', 'ui',
 const shellJs = fs.readFileSync(shellJsPath, 'utf-8');
 
 const BODY_HTML = `<!DOCTYPE html>
-<html><head><meta charset="utf-8"></head>
+<html><head><meta charset="utf-8">
+<style>#jump-latest{display:none}</style>
+</head>
 <body>
 <div id="conversation"></div>
 <table id="stream-wrapper"><tr><td id="pending-ai-text"></td></tr></table>
-<button id="jump-latest" type="button" aria-label="Jump to latest message"
-        style="display:none">↓</button>
+<button id="jump-latest" type="button" aria-label="Jump to latest message">↓</button>
 </body></html>`;
 
 const BODY_HTML_NO_BUTTON = `<!DOCTYPE html>
-<html><head><meta charset="utf-8"></head>
+<html><head><meta charset="utf-8">
+<style>#jump-latest{display:none}</style>
+</head>
 <body>
 <div id="conversation"></div>
 <table id="stream-wrapper"><tr><td id="pending-ai-text"></td></tr></table>
@@ -51,14 +54,15 @@ function makeEnv(options) {
     // Explicit height model: base height plus optional DOM-dependent growth.
     const initialHeight = options.initialHeight === undefined ? 1000 : options.initialHeight;
     const heightMode = options.heightMode || 'static';
+    let extraHeight = 0;
     const heightFor = function() {
         if (heightMode === 'conversation') {
-            return initialHeight + conversation.childNodes.length * 100;
+            return initialHeight + conversation.childNodes.length * 100 + extraHeight;
         }
         if (heightMode === 'stream') {
-            return initialHeight + pending.textContent.length * 10;
+            return initialHeight + pending.textContent.length * 10 + extraHeight;
         }
-        return initialHeight;
+        return initialHeight + extraHeight;
     };
     Object.defineProperty(document.body, 'scrollHeight', {
         get: heightFor,
@@ -83,7 +87,10 @@ function makeEnv(options) {
     sandbox.scrollY = 0;
     sandbox.scrollTo = function(x, y) {
         scrollCalls.push([x, y]);
-        sandbox.scrollY = y;
+        // Browsers clamp to the scrollable range; model the landing position,
+        // not just the argument production passed.
+        const max = Math.max(0, heightFor() - INNER_HEIGHT);
+        sandbox.scrollY = Math.max(0, Math.min(y, max));
     };
     // shell.js registers scroll/resize listeners on window at DOMContentLoaded.
     sandbox.addEventListener = function(type, fn, opts) {
@@ -116,6 +123,9 @@ function makeEnv(options) {
     env.resize = function() {
         dom.window.dispatchEvent(new dom.window.Event('resize'));
     };
+    env.grow = function(px) {
+        extraHeight += px;
+    };
     return env;
 }
 
@@ -128,7 +138,9 @@ const ENTRIES = [
 const ENTRIES_JSON = JSON.stringify(ENTRIES);
 
 function hidden(env) {
-    return env.button.style.display === 'none';
+    // The shell hides the button with a stylesheet rule; the JS toggles the
+    // inline display.  Computed style reflects both.
+    return env.dom.window.getComputedStyle(env.button).display === 'none';
 }
 
 // ---- Test runner ----
@@ -214,8 +226,9 @@ runSection('3. clicking the button jumps to the bottom and hides it', function()
     env.scrollCalls.length = 0;
     env.button.click();
 
-    assert(env.sandbox.scrollY === env.height(),
-        'click scrolls to body.scrollHeight: got ' + env.sandbox.scrollY);
+    assert(env.sandbox.scrollY === env.height() - INNER_HEIGHT,
+        'click lands at the clamped bottom (scrollHeight - innerHeight): got '
+        + env.sandbox.scrollY);
     const last = env.scrollCalls[env.scrollCalls.length - 1];
     assert(last && last[0] === 0 && last[1] === env.height(),
         'last scroll targets the document bottom: got ' + JSON.stringify(last));
@@ -228,14 +241,15 @@ runSection('4. follow stays pinned after the jump', function() {
     env.sandbox.scrollY = 0;
     env.scroll();
     env.button.click();
-    assert(env.sandbox.scrollY === 1000, 'jumped to the initial bottom');
+    assert(env.sandbox.scrollY === env.height() - INNER_HEIGHT,
+        'jumped to the clamped initial bottom');
 
     env.scrollCalls.length = 0;
     env.sandbox._updateStream('x'.repeat(20), 'follow');
 
     assert(env.height() === 1200, 'streamed text grew the document: got ' + env.height());
-    assert(env.sandbox.scrollY === env.height(),
-        'follow keeps the reader at the new bottom: got ' + env.sandbox.scrollY);
+    assert(env.sandbox.scrollY === env.height() - INNER_HEIGHT,
+        'follow lands at the clamped new bottom: got ' + env.sandbox.scrollY);
     assert(hidden(env), 'still at the bottom: hidden');
 });
 
@@ -301,9 +315,42 @@ runSection('8. _appendEntry re-measures after the DOM write', function() {
     assert(!hidden(env), 'the reader is now 100 px from the bottom: visible');
 });
 
+// ---- Layout-only changes ----
+
+runSection('9. a toggle after layout growth shows the button', function() {
+    const env = makeEnv();
+    env.install();
+    env.sandbox.scrollY = env.height() - INNER_HEIGHT; // at the bottom
+    env.scroll();
+    assert(hidden(env), 'at the bottom: hidden');
+
+    const details = env.document.createElement('details');
+    env.conversation.appendChild(details);
+    env.grow(200); // expanding the row pushed the newest output below
+    details.dispatchEvent(new env.dom.window.Event('toggle', { bubbles: false }));
+
+    assert(env.height() === 1200, 'the layout grew: got ' + env.height());
+    assert(!hidden(env), 'the non-bubbling toggle is captured and reveals the button');
+});
+
+runSection('10. a toggle without growth keeps it hidden', function() {
+    const env = makeEnv();
+    env.install();
+    env.sandbox.scrollY = env.height() - INNER_HEIGHT; // at the bottom
+    env.scroll();
+    assert(hidden(env), 'at the bottom: hidden');
+
+    const details = env.document.createElement('details');
+    env.conversation.appendChild(details);
+    details.dispatchEvent(new env.dom.window.Event('toggle', { bubbles: false }));
+
+    assert(env.height() === 1000, 'the document did not grow: got ' + env.height());
+    assert(hidden(env), 'toggle with no growth leaves it hidden');
+});
+
 // ---- Defensive ----
 
-runSection('9. a document without the button does not throw', function() {
+runSection('11. a document without the button does not throw', function() {
     const env = makeEnv({ withButton: false, heightMode: 'conversation' });
 
     env.install();

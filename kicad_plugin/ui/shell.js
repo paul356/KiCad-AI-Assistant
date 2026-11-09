@@ -168,6 +168,10 @@ function _jumpToLatest() {
         btn.addEventListener('click', _jumpToLatest);
         window.addEventListener('scroll', _updateJumpLatest, { passive: true });
         window.addEventListener('resize', _updateJumpLatest);
+        // Expanding a tool row or wrapping a search match changes layout
+        // without a scroll or entry write.  'toggle' does not bubble, so it
+        // must be captured at the document.
+        document.addEventListener('toggle', _updateJumpLatest, true);
         _updateJumpLatest();
     }
     if (document.readyState === 'loading') {

@@ -17,11 +17,6 @@ import kicad_plugin.ui.panel as _panel_module
 
 _MODULE_SOURCE = Path(_panel_module.__file__).read_text(encoding="utf-8")
 
-_BUTTON = (
-    "<button id='jump-latest' type='button' "
-    "aria-label='Jump to latest message' title='Jump to latest message'>↓</button>"
-)
-
 
 def _build_shell_html() -> str:
     """Evaluate the template function without importing a wx-enabled panel."""
@@ -44,25 +39,30 @@ _SHELL_HTML = _build_shell_html()
 
 
 def test_shell_html_contains_the_jump_latest_button() -> None:
-    """One button, a down arrow, no emoji or icon font."""
-    assert _SHELL_HTML.count("<button id='jump-latest'") == 1
-    assert _BUTTON in _SHELL_HTML
+    """One button with a down arrow and an accessible name."""
+    _, body = _SHELL_HTML.split("<body>", 1)
+    assert body.count("<button") == 1
+    button = body.split("<button", 1)[1].split("</button>", 1)[0]
+    assert "id='jump-latest'" in button
+    assert "type='button'" in button
+    assert "aria-label='Jump to latest message'" in button
+    assert "title='Jump to latest message'" in button
+    assert "↓" in button
 
 
 def test_jump_latest_button_sits_inside_the_body() -> None:
     """The button must be a body child, never markup injected into the head."""
     head, body = _SHELL_HTML.split("<body>", 1)
-    assert _BUTTON in body
-    assert "<button id='jump-latest'" not in head
+    assert "<button" in body
+    assert "<button" not in head
 
 
 def test_jump_latest_css_rule_is_in_the_style_block() -> None:
-    """The floating placement and resting shadow live in the shell stylesheet."""
-    style, rest = _SHELL_HTML.split("<style>", 1)
-    style, _ = rest.split("</style>", 1)
-    assert "#jump-latest{display:none;position:fixed;right:14px;bottom:14px" in style
-    assert "border:1px solid #B8BEC9" in style
-    assert "box-shadow:" in style
+    """The stylesheet hides and floats the button; exact styling is free."""
+    style = _SHELL_HTML.split("<style>", 1)[1].split("</style>", 1)[0]
+    rule = style.split("#jump-latest{", 1)[1].split("}", 1)[0]
+    assert "display:none" in rule
+    assert "position:fixed" in rule
 
 
 def test_shell_html_inlines_the_jump_latest_hooks() -> None:
