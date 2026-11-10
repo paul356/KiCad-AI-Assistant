@@ -70,7 +70,11 @@ unit?, project_path?)**. `pins` is a non-empty list (max 256) of
 `{pin_number, new_number?, new_name?}` entries — one entry per pin; selectors
 match the pre-edit state, so chain/cycle renames are applied simultaneously and
 validated against the final state. Omit `unit` to update every unit and body
-style, or pass `unit=N` to restrict the batch. The `.kicad_sym` file is edited
+style, or pass `unit=N` to restrict the batch. Collisions are final-state and effective:
+same unit **and** body style → error; different unit → warning; unit `0`
+belongs to every unit, style `0` to every style, and styles `1`/`2` (normal /
+De Morgan) are independent. Pre-existing duplicates such as stacked pins do
+not block an edit. The `.kicad_sym` file is edited
 in place in one write (one `.bak`) and only the pin literals change. Schematics
 that already embed the old definition are **not** updated — call
 **update_schematic_symbol_pin** afterwards for already placed parts. Do this

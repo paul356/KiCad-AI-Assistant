@@ -49,6 +49,7 @@ from kcaa.utils.symbol_library_utils import (
     append_symbol_to_library,
     build_effective_symbol_library_list,
     create_empty_library_file,
+    find_pin_collisions,
     is_safe_symbol_name,
     list_library_symbols,
     remove_symbol_from_library_file,
@@ -2532,6 +2533,7 @@ def _edit_cached_symbol_pins(
         )
 
     plan = _plan_pin_edit_batch(pin_nodes, symbol_name, requests, unit)
+    find_pin_collisions(pin_nodes, plan["final_numbers"])
     for pin, change in zip(plan["changed_pins"], plan["changes"], strict=True):
         if change["new_number"] != pin["number"]:
             if pin["number_node"] is None:
@@ -3326,7 +3328,9 @@ def register_symbol_edit_tools(mcp: FastMCP) -> None:
             unit, pins_requested, pins_changed, occurrences, changes, changed,
             backup_path, indexed, warnings; plus ``error`` on failure (no
             ``success``).  Each ``changes`` entry also carries the selector in
-            ``pin_number``.
+            ``pin_number``.  ``pins_requested`` counts entries while
+            ``pins_changed`` counts changed pin occurrences (a unit-less
+            selector matching two units yields 1 requested, 2 changed).
         """
         return await asyncio.to_thread(
             _do_update_library_symbol_pin,
@@ -3377,7 +3381,10 @@ def register_symbol_edit_tools(mcp: FastMCP) -> None:
             dict with keys: success, lib_id, symbol_name, unit, pins_requested,
             pins_changed, occurrences, changes, changed, backup_path,
             affected_references, affected_count, placements_updated, warnings;
-            plus ``error`` on failure (no ``success``).
+            plus ``error`` on failure (no ``success``).  ``pins_requested``
+            counts entries while ``pins_changed`` counts changed pin
+            occurrences (a unit-less selector matching two units yields 1
+            requested, 2 changed).
         """
         return await asyncio.to_thread(
             _do_update_schematic_symbol_pin,

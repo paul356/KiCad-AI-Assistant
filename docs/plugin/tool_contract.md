@@ -336,7 +336,7 @@ Entries already present in the target library are reported in `skipped` (never o
 
 Only the quoted literals of the targeted `(number "…")` / `(name "…")` nodes are replaced: every other byte of the file (header, `generator` lines, formatting, original `\r\n`/`\n`, other symbols) stays byte-identical. The schematic is never touched — already-placed parts keep their cached copy until `update_schematic_symbol_pin` is called.
 
-**Batch semantics:** the whole request is validated against its **final state** before anything is written. Selectors always match the pre-edit snapshot, so chains and cycles that form a valid permutation (`P$1 → 1`, `1 → 2`) are accepted; only a final same-unit number collision is rejected. Exactly one `.bak`, one atomic write and one re-index are produced. A batch whose requested values are all already present returns `"changed": false` and writes nothing; partial no-ops inside a changed batch are fine.
+**Batch semantics:** the whole request is validated against its **final state** before anything is written. Selectors always match the pre-edit snapshot, so chains and cycles that form a valid permutation (`P$1 → 1`, `1 → 2`) are accepted; only a final collision under the effective unit/style rule is rejected. Exactly one `.bak`, one atomic write and one re-index are produced. A batch whose requested values are all already present returns `"changed": false` and writes nothing; partial no-ops inside a changed batch are fine.
 
 **Key parameters:**
 - `library_name` (`str`) — nickname of a **user** library registered in sym-lib-table. Libraries inside the KiCad installation are refused with the exact `{"error": ...}` used by `remove_symbols_from_library` (symbol library tools operate on user libraries only).
@@ -350,7 +350,9 @@ Only the quoted literals of the targeted `(number "…")` / `(name "…")` nodes
 - `unit` (`int | None`) — `None` edits every matching occurrence in all units and both body styles; `N` restricts the edit to unit `N` (`0` = common unit), still covering both body styles. Pins live in sub-symbols named `<symbol>_<unit>_<style>`.
 - `project_path` (`str | None`) — project path used to resolve project-local libraries (`${KIPRJMOD}`) and scope the re-index.
 
-Errors — unknown selector, duplicate selector, final same-unit collision, invalid field, derived symbol without own pins, empty list or more than 256 entries — return `{"error": ...}` and leave the file byte-identical with no `.bak` and no `.tmp`. A number already used in a *different* unit is legal and reported in `warnings`.
+Errors — unknown selector, duplicate selector, a collision introduced by the batch, invalid field, derived symbol without own pins, empty list or more than 256 entries — return `{"error": ...}` and leave the file byte-identical with no `.bak` and no `.tmp`. Collision rule: same effective unit **and** body style → error; different unit → success with a warning. Unit `0` (common) belongs to every unit, style `0` belongs to every style, and styles `1` and `2` (normal / De Morgan) are independent alternatives. Pre-existing duplicates the batch does not touch (e.g. stacked pins) never block an edit.
+
+`pins_requested` counts requested entries; `pins_changed` counts changed pin **occurrences**, so a unit-less selector matching two units reports `pins_requested: 1`, `occurrences: 2`, `pins_changed: 2`.
 
 **Success response:** `{"success": true, "library_name": "MyLib", "symbol_name": "MYOP", "library_path": "...", "unit": null, "pins_requested": 2, "pins_changed": 2, "occurrences": 2, "changes": [{"pin_number": "P$1", "unit": 1, "style": 1, "old_number": "P$1", "old_name": "A", "new_number": "1", "new_name": "A"}, {"pin_number": "P$2", "unit": 1, "style": 1, "old_number": "P$2", "old_name": "B", "new_number": "2", "new_name": "B"}], "changed": true, "backup_path": "...bak", "indexed": true, "warnings": []}`
 
@@ -369,7 +371,7 @@ When numbers change, the tool also rewrites the matching `(pin "…" (uuid …))
 **Key parameters:**
 - `schematic_path` (`str`) — absolute path to the `.kicad_sch` file.
 - `lib_id` (`str`) — fully-qualified cached symbol id (e.g. `"Device:R"`), exactly as stored in `lib_symbols`.
-- `pins` (`list[dict]`), `unit` (`int | None`) — same batch contract as `update_library_symbol_pin` (max 256 entries, unique selectors, final-state validation, control-character rejection). A number already used in a *different* unit is legal and reported in `warnings`.
+- `pins` (`list[dict]`), `unit` (`int | None`) — same batch contract as `update_library_symbol_pin` (max 256 entries, unique selectors, final-state validation, control-character rejection). Collision rule matches the library tool: same effective unit and style → error; different unit → warning; unit `0` is every unit, style `0` is every style, styles `1` and `2` are independent. `pins_changed` counts changed occurrences, not request entries.
 
 Every reference designator using `lib_id` is reported in `affected_references`, so the caller sees the blast radius. A missing `lib_id`, an unknown pin, a duplicate selector, a collision, or invalid arguments return `{"error": ...}` with the file untouched. Requested values already present → `"changed": false` and no write.
 

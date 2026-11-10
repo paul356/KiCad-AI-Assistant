@@ -20,6 +20,7 @@ from kcaa.utils.symbol_library_utils import set_symbol_pin
 FIXTURES = Path(__file__).parent / "fixtures"
 SYMBOL_LIBRARY = FIXTURES / "pin_edit_symbols.kicad_sym"
 SCHEMATIC = FIXTURES / "pin_edit.kicad_sch"
+UUID_SCHEMATIC = FIXTURES / "pin_edit_uuid.kicad_sch"
 MULTI_UNIT = Path(__file__).parent.parent / "utils/fixtures/multi_unit.kicad_sch"
 SINGLE_PIN = Path(__file__).parent.parent / "utils/fixtures/single_pin_symbol.kicad_sch"
 
@@ -637,6 +638,69 @@ def test_control_characters_are_rejected_without_backup(tmp_path, control):
     assert not Path(str(library) + ".bak").exists()
 
 
+def test_common_pin_edits_apply_to_every_unit(tmp_path):
+    library = _copy(SYMBOL_LIBRARY, tmp_path)
+
+    result = set_symbol_pin(library, "MultiUnit", [_edit("C0", new_number="C9")], unit=0)
+
+    assert result["changed"] is True
+    assert result["occurrences"] == 1
+    assert result["changes"][0]["unit"] == 0
+    assert result["warnings"] == []
+    assert _symbol_pin_numbers(library, "MultiUnit") == {"C9", "1", "2", "3"}
+    text = library.read_text(encoding="utf-8")
+    assert '(number "C9"' in text
+    assert '(number "C0"' not in text
+
+
+@pytest.mark.parametrize(
+    ("pins", "unit"),
+    [
+        ([_edit("1", new_number="C0")], 1),
+        ([_edit("C0", new_number="1")], 0),
+    ],
+)
+def test_common_pin_number_collision_is_an_error(tmp_path, pins, unit):
+    library = _copy(SYMBOL_LIBRARY, tmp_path)
+    before = library.read_bytes()
+
+    with pytest.raises(ValueError, match="pin number 'C0'|pin number '1'"):
+        set_symbol_pin(library, "MultiUnit", pins, unit=unit)
+
+    assert library.read_bytes() == before
+    assert not Path(str(library) + ".bak").exists()
+    assert not Path(str(library) + ".tmp").exists()
+
+
+def test_both_styles_do_not_collide_and_noop_is_allowed(tmp_path):
+    library = _copy(SYMBOL_LIBRARY, tmp_path)
+
+    noop = set_symbol_pin(library, "BothStyles", [_edit("1", new_name="A")])
+    assert noop["changed"] is False
+    assert noop["occurrences"] == 2
+
+    renamed = set_symbol_pin(library, "BothStyles", [_edit("1", new_number="10")], unit=1)
+    assert renamed["changed"] is True
+    assert renamed["pins_changed"] == 2
+    assert renamed["occurrences"] == 2
+    assert {change["style"] for change in renamed["changes"]} == {1, 2}
+    assert {change["new_number"] for change in renamed["changes"]} == {"10"}
+    assert _symbol_pin_numbers(library, "BothStyles") == {"10", "2"}
+
+
+def test_pre_existing_stacked_pins_do_not_block_edits(tmp_path):
+    library = _copy(SYMBOL_LIBRARY, tmp_path)
+
+    renamed = set_symbol_pin(library, "Stacked", [_edit("6", new_number="7")])
+    assert renamed["changed"] is True
+    assert _symbol_pin_numbers(library, "Stacked") == {"5", "7"}
+
+    stack_name = set_symbol_pin(library, "Stacked", [_edit("5", new_name="STACK")])
+    assert stack_name["changed"] is True
+    assert stack_name["occurrences"] == 2
+    assert stack_name["pins_changed"] == 2
+
+
 def test_empty_pin_name_and_spaces_are_written_verbatim(tmp_path):
     library = _copy(SYMBOL_LIBRARY, tmp_path)
 
@@ -994,6 +1058,49 @@ def test_schematic_tool_chain_rename_rewrites_keys_once(tmp_path):
         {"C0", "1", "P$1"},
         {"C0", "1", "P$1"},
     ]
+
+
+def test_schematic_tool_common_pin_collision_is_an_error(tmp_path):
+    schematic = _copy(SCHEMATIC, tmp_path)
+    before = schematic.read_bytes()
+
+    result = asyncio.run(
+        _tools()["update_schematic_symbol_pin"](
+            schematic_path=str(schematic),
+            lib_id="PinEdit:Plain",
+            pins=[_edit("P$1", new_number="C0")],
+        )
+    )
+
+    assert result["error"] == "pin number 'C0' is already used by pin 'COMMON' in unit 1"
+    assert schematic.read_bytes() == before
+    assert not Path(str(schematic) + ".bak").exists()
+    assert not Path(str(schematic) + ".tmp").exists()
+
+
+def test_schematic_tool_uuid_first_placement_mapping(tmp_path):
+    schematic = _copy(UUID_SCHEMATIC, tmp_path)
+
+    result = asyncio.run(
+        _tools()["update_schematic_symbol_pin"](
+            schematic_path=str(schematic),
+            lib_id="PinEdit:Plain",
+            pins=[_edit("P$1", new_number="1")],
+        )
+    )
+
+    assert result["changed"] is True
+    assert result["placements_updated"] == 2
+    after = _semantic_snapshot(schematic)
+    assert [placement["pins"] for placement in after["placements"]] == [
+        ("C0", "1", "P$2"),
+        ("C0", "1", "P$2"),
+    ]
+    # The cached uuid drove the rewrite (the instance key was "STALE"), and
+    # every instance uuid child is preserved.
+    text = schematic.read_text(encoding="utf-8")
+    assert "STALE" not in text
+    assert text.count("cached-uuid-p1") == 3
 
 
 def test_schematic_tool_reports_single_instance(tmp_path):

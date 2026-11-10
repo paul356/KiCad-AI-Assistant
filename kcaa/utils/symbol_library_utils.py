@@ -742,6 +742,68 @@ def _validate_pin_edit_requests(pins: Any) -> list[dict[str, Any]]:
     return requests
 
 
+def _symbol_unit_style_universe(
+    pins: list[dict[str, Any]],
+) -> tuple[set[int], set[int]]:
+    """Return the concrete units and body styles of a symbol.
+
+    Unit ``0`` and style ``0`` are wildcards, so only non-zero values define
+    the universe those wildcards expand to.
+    """
+    units = {pin["unit"] for pin in pins if pin["unit"] != 0}
+    styles = {pin["style"] for pin in pins if pin["style"] != 0}
+    return units or {0}, styles or {0}
+
+
+def effective_unit_styles(
+    pin: dict[str, Any],
+    all_units: set[int],
+    all_styles: set[int],
+) -> tuple[set[int], set[int]]:
+    """Expand a pin's unit/style into the sets it effectively belongs to.
+
+    Unit ``0`` belongs to every unit of the symbol; style ``0`` belongs to
+    every body style.  Styles ``1`` and ``2`` are independent alternatives
+    (normal / De Morgan), not the same representation.
+    """
+    units = set(all_units) if pin["unit"] == 0 else {pin["unit"]}
+    styles = set(all_styles) if pin["style"] == 0 else {pin["style"]}
+    return units, styles
+
+
+def find_pin_collisions(
+    pins: list[dict[str, Any]],
+    final_numbers: dict[int, str],
+) -> None:
+    """Reject number collisions introduced by a batch, ignoring pre-existing ones.
+
+    Two pins collide when their effective unit sets intersect and their
+    effective style sets intersect.  Only pins whose number actually changes
+    are checked, so pre-existing duplicates (KiCad stacked pins) and no-op
+    batches never block an edit.
+
+    Raises:
+        ValueError: When an edited pin lands on a number used by another pin
+            in an intersecting effective unit/style.
+    """
+    all_units, all_styles = _symbol_unit_style_universe(pins)
+    changed = [pin for pin in pins if final_numbers[id(pin)] != pin["number"]]
+    for pin in changed:
+        pin_units, pin_styles = effective_unit_styles(pin, all_units, all_styles)
+        for other in pins:
+            if other is pin:
+                continue
+            if final_numbers[id(other)] != final_numbers[id(pin)]:
+                continue
+            other_units, other_styles = effective_unit_styles(other, all_units, all_styles)
+            if pin_units & other_units and pin_styles & other_styles:
+                display_unit = pin["unit"] or other["unit"] or 0
+                raise ValueError(
+                    f"pin number '{final_numbers[id(pin)]}' is already used by pin "
+                    f"'{other['name']}' in unit {display_unit}"
+                )
+
+
 def _plan_pin_edit_batch(
     pins: list[dict[str, Any]],
     symbol_name: str,
@@ -779,29 +841,7 @@ def _plan_pin_edit_batch(
             if request["new_name"] is not None:
                 final_names[id(pin)] = request["new_name"]
 
-    pins_by_unit: dict[int, list[dict[str, Any]]] = {}
-    for pin in pins:
-        pins_by_unit.setdefault(pin["unit"], []).append(pin)
-    for unit_value, unit_pins in pins_by_unit.items():
-        seen: dict[str, dict[str, Any]] = {}
-        for pin in unit_pins:
-            final_number = final_numbers[id(pin)]
-            other = seen.get(final_number)
-            if other is not None:
-                culprit = other
-                if pin["number"] == final_number:
-                    culprit = pin
-                elif other["number"] == final_number:
-                    culprit = other
-                raise ValueError(
-                    f"pin number '{final_number}' is already used by pin "
-                    f"'{culprit['name']}' in unit {unit_value}"
-                )
-            seen[final_number] = pin
-
-    number_units: dict[str, set[int]] = {}
-    for pin in pins:
-        number_units.setdefault(final_numbers[id(pin)], set()).add(pin["unit"])
+    all_units, all_styles = _symbol_unit_style_universe(pins)
     warnings: list[str] = []
     warned: set[tuple[str, int]] = set()
     for request, matches in resolved:
@@ -809,13 +849,23 @@ def _plan_pin_edit_batch(
             continue
         for pin in matches:
             final_number = final_numbers[id(pin)]
-            for other_unit in sorted(number_units[final_number] - {pin["unit"]}):
-                key = (final_number, other_unit)
-                if key not in warned:
-                    warned.add(key)
-                    warnings.append(
-                        f"pin number '{final_number}' is also used in unit {other_unit}"
-                    )
+            if final_number == pin["number"]:
+                continue
+            pin_units, pin_styles = effective_unit_styles(pin, all_units, all_styles)
+            for other in pins:
+                if other is pin or final_numbers[id(other)] != final_number:
+                    continue
+                other_units, other_styles = effective_unit_styles(other, all_units, all_styles)
+                if pin_units & other_units and pin_styles & other_styles:
+                    # A real collision; find_pin_collisions rejects the batch.
+                    continue
+                for unit_value in sorted(other_units - pin_units):
+                    key = (final_number, unit_value)
+                    if key not in warned:
+                        warned.add(key)
+                        warnings.append(
+                            f"pin number '{final_number}' is also used in unit {unit_value}"
+                        )
 
     changes: list[dict[str, Any]] = []
     changed_pins: list[dict[str, Any]] = []
@@ -842,6 +892,7 @@ def _plan_pin_edit_batch(
     return {
         "changed_pins": changed_pins,
         "changes": changes,
+        "final_numbers": final_numbers,
         "pins_changed": pins_changed,
         "changed": pins_changed > 0,
         "occurrences": len(changed_pins),
@@ -936,6 +987,7 @@ def set_symbol_pin(
         )
 
     plan = _plan_pin_edit_batch(pin_nodes, symbol_name, requests, unit)
+    find_pin_collisions(pin_nodes, plan["final_numbers"])
 
     replacements: list[tuple[tuple[int, int], str]] = []
     for pin, change in zip(plan["changed_pins"], plan["changes"], strict=True):

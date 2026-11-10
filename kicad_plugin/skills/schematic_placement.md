@@ -54,6 +54,8 @@ tools: [extract_schematic_netlist, add_symbol_to_schematic, place_symbol_relativ
   schematic's cached `lib_symbols` copy that KiCad actually renders). `pins` is
   a batch list of `{pin_number, new_number?, new_name?}` entries; renames in a
   batch are applied simultaneously and validated against the final state.
+  Same effective unit and style → error; different unit → warning; unit `0`
+  is every unit, style `0` every style, styles `1`/`2` are independent.
 - Do this **before** `set_symbol_property` assigns the `Footprint`; the two
   tools are a pair — the library edit covers future placements, the schematic
   edit covers the placed copies. Both report the changes and write `.bak`
