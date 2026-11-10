@@ -21,8 +21,8 @@ KiCad's PCM installer inserts the package id after the first path component,
 so ``plugins/__init__.py`` becomes ``<3rdparty>/plugins/<package-id>/__init__.py``.
 
 Both layouts are written deterministically: entries are sorted, timestamps are
-fixed, and permissions are constant, so rebuilding an unchanged tree produces
-byte-identical archives.
+fixed, and file modes are normalized from the source executable bit, so
+rebuilding an unchanged tree produces byte-identical archives.
 """
 
 from __future__ import annotations
@@ -99,7 +99,12 @@ def _parse_project_subset(text: str) -> dict[str, Any]:
 
 
 def plugin_files(source: Path = DEFAULT_SOURCE) -> list[tuple[str, Path]]:
-    """Return ``(relative_posix_path, absolute_path)`` pairs, sorted."""
+    """Return ``(relative_posix_path, absolute_path)`` pairs, sorted.
+
+    Symlink policy: file symlinks are followed (the target's contents and mode
+    are archived); directory symlinks are not traversed by :meth:`Path.rglob`
+    and are therefore skipped. The plugin tree currently contains no symlinks.
+    """
     files: list[tuple[str, Path]] = []
     for path in source.rglob("*"):
         if not path.is_file():
@@ -155,6 +160,12 @@ def pcm_metadata(project: dict[str, Any] | None = None) -> dict[str, Any]:
                 "version": project["version"],
                 "status": "stable",
                 "kicad_version": PCM_KICAD_VERSION,
+                # KiCad deletes non-matching files before extracting an update.
+                # Preserve the setup script's venv and the freerouting download.
+                "keep_on_update": [
+                    r".*/\.venv/.*",
+                    r".*/freerouting-[^/]*\.jar",
+                ],
             }
         ],
     }

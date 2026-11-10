@@ -101,9 +101,9 @@ New-Item -ItemType Directory -Force -Path $KICAD_PLUGIN_DIR
 Expand-Archive -Path kicad_ai_assistant.zip -DestinationPath $KICAD_PLUGIN_DIR
 ```
 
-The archive already contains the `kicad_ai_assistant/` root directory. Keep that name so the documented paths, the updater's `ZIP_ROOT`, and the package's own imports match. Do not hand-unzip this archive into `3rdparty/plugins` — that directory belongs to the Plugin and Content Manager, and a manually copied folder there is not a PCM install.
+The archive already contains the `kicad_ai_assistant/` root directory. Keep that name so the documented `cd`/setup commands and the manual-install convention match; renaming the installed folder is unsupported. Do not hand-unzip this archive into `3rdparty/plugins` — that directory belongs to the Plugin and Content Manager, and a manually copied folder there is not a PCM install.
 
-**Plugin and Content Manager:** open **Preferences → Plugin and Content Manager → Install from File…** and select `kicad_ai_assistant_pcm.zip`. KiCad extracts the package to `<3rdparty>/plugins/com_github_paul356_kicad-ai-assistant/`; that package directory is the plugin directory (its `__init__.py` sits directly inside it). Do not unzip this archive yourself.
+**Plugin and Content Manager:** open **Preferences → Plugin and Content Manager → Install from File…** and select `kicad_ai_assistant_pcm.zip`. KiCad extracts the package to `<3rdparty>/plugins/com_github_paul356_kicad-ai-assistant/`; that package directory is the plugin directory (its `__init__.py` sits directly inside it). Do not unzip this archive yourself. PCM updates keep `.venv` and the freerouting JAR (`keep_on_update`); rerun the setup script after an update so the venv gets the matching `kcaa` version.
 
 Or build from source:
 
@@ -492,7 +492,7 @@ kcaa/
 ## Troubleshooting
 
 **Plugin does not appear in KiCad:**
-- Manual install: confirm the folder is `<documents>/kicad/<ver>/scripting/plugins/kicad_ai_assistant` and was not renamed (the old instructions used `kicad_ai_plugin`).
+- Manual install: confirm you used the documented folder name `<documents>/kicad/<ver>/scripting/plugins/kicad_ai_assistant` (the old instructions used `kicad_ai_plugin`) so the commands below work.
 - PCM install: confirm `<documents>/kicad/<ver>/3rdparty/plugins/com_github_paul356_kicad-ai-assistant` exists and came from `kicad_ai_assistant_pcm.zip`.
 - Run **Tools → External Plugins → Refresh Plugins** after installing.
 - Linux: Check that `setup_plugin.sh` completed without errors and that `.venv/bin/python` exists inside the plugin directory.

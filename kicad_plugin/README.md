@@ -24,8 +24,9 @@ kcaa MCP server (subprocess, streamable-http on localhost)
 
 The plugin is a folder inside KiCad's user plugin directory. Release archives
 already use `kicad_ai_assistant` for manual installs; keep that name so the
-documented paths, the updater's `ZIP_ROOT`, and the package's own imports
-match. `10.0` below is your KiCad `<major>.<minor>` version.
+documented `cd`/setup commands and the manual-install convention match.
+Renaming the installed folder is unsupported. `10.0` below is your KiCad
+`<major>.<minor>` version.
 
 | OS | Manual install (unzip `kicad_ai_assistant.zip` here) | PCM install (`Install from File...`) |
 |----|-----------------------------------------------------|--------------------------------------|
@@ -38,15 +39,18 @@ match. `10.0` below is your KiCad `<major>.<minor>` version.
 ### 1. Install the plugin
 
 **Manual install:** unzip `kicad_ai_assistant.zip` into the manual directory for
-your OS. It creates `<manual>/kicad_ai_assistant/`; keep that name. Do not
-hand-unzip into `3rdparty/plugins` — that directory belongs to the Plugin and
-Content Manager, and a manually copied folder there is not a PCM install.
+your OS. It creates `<manual>/kicad_ai_assistant/`; keep that name so the
+documented `cd`/setup commands match. Do not hand-unzip into `3rdparty/plugins`
+— that directory belongs to the Plugin and Content Manager, and a manually
+copied folder there is not a PCM install.
 
 **PCM install:** use `kicad_ai_assistant_pcm.zip`, not the manual archive. Open
 **Preferences → Plugin and Content Manager → Install from File…** and select it.
 KiCad extracts the package to
 `<3rdparty>/plugins/com_github_paul356_kicad-ai-assistant/`; that package
-directory is the plugin directory, with `__init__.py` directly inside it.
+directory is the plugin directory, with `__init__.py` directly inside it. PCM
+updates keep `.venv` and the freerouting JAR (`keep_on_update`); rerun the
+setup script after an update so the venv gets the matching `kcaa` version.
 
 ### 2. Run the setup script
 

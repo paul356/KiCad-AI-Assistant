@@ -119,8 +119,8 @@ plugin surfaces an error banner with a **Restart** button that re-runs the start
 
 ## 5. Configuration
 
-Stored in the KiCad plugin settings file (`metadata.json` or plugin-specific JSON in the KiCad
-user config directory). **Not** in `.env`.
+Stored in `<config>/kicad/<ver>/kcaa/kicad_ai_assistant.json` (see Directory Layout). **Not** in
+`.env`. `metadata.json` is the PCM package manifest, not plugin settings.
 
 | Variable | Description |
 |---|---|

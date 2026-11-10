@@ -38,7 +38,7 @@ _PACKAGE_KEYS = {
     "resources",
     "versions",
 }
-_VERSION_KEYS = {"version", "status", "kicad_version"}
+_VERSION_KEYS = {"version", "status", "kicad_version", "keep_on_update"}
 
 
 def _namelist(path: Path) -> list[str]:
@@ -109,11 +109,14 @@ def test_pcm_metadata_contract(pcm_zip: Path, project: dict) -> None:
     assert len(metadata["versions"]) == 1
     version = metadata["versions"][0]
     assert set(version) == _VERSION_KEYS
-    assert version == {
-        "version": project["version"],
-        "status": "stable",
-        "kicad_version": "10.0",
-    }
+    assert version["version"] == project["version"]
+    assert version["status"] == "stable"
+    assert version["kicad_version"] == "10.0"
+    assert any(".venv" in pattern for pattern in version["keep_on_update"])
+    assert any(
+        "freerouting" in pattern and pattern.endswith(".jar")
+        for pattern in version["keep_on_update"]
+    )
 
     # KiCad PCM replaces dots in the identifier when creating the install folder.
     assert builder.pcm_package_dirname(metadata["identifier"]) == (
@@ -175,8 +178,14 @@ def test_archives_ship_complete_tree_and_executable_mode(legacy_zip: Path, pcm_z
         assert f"{builder.LEGACY_ROOT}/{relative}" in legacy_names
         assert f"plugins/{relative}" in pcm_names
 
-    assert _modes(legacy_zip)[f"{builder.LEGACY_ROOT}/setup_plugin.sh"] == 0o100755
-    assert _modes(pcm_zip)["plugins/setup_plugin.sh"] == 0o100755
+    legacy_modes = _modes(legacy_zip)
+    pcm_modes = _modes(pcm_zip)
+    assert legacy_modes[f"{builder.LEGACY_ROOT}/setup_plugin.sh"] == 0o100755
+    assert pcm_modes["plugins/setup_plugin.sh"] == 0o100755
+    assert legacy_modes[f"{builder.LEGACY_ROOT}/__init__.py"] == 0o100644
+    assert pcm_modes["plugins/__init__.py"] == 0o100644
+    assert legacy_modes[f"{builder.LEGACY_ROOT}/"] == 0o40755
+    assert pcm_modes["plugins/"] == 0o40755
 
 
 def test_legacy_archive_matches_updater_expectations(legacy_zip: Path) -> None:

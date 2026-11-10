@@ -101,9 +101,9 @@ New-Item -ItemType Directory -Force -Path $KICAD_PLUGIN_DIR
 Expand-Archive -Path kicad_ai_assistant.zip -DestinationPath $KICAD_PLUGIN_DIR
 ```
 
-压缩包已经包含 `kicad_ai_assistant/` 根目录。请保持这个名称，以便文档中的路径、更新器的 `ZIP_ROOT` 和插件自身的导入保持一致。不要把这个压缩包手工解压到 `3rdparty/plugins`——该目录由插件与内容管理器管理，手工复制的文件夹不算 PCM 安装。
+压缩包已经包含 `kicad_ai_assistant/` 根目录。请保持这个名称，以便文档中的 `cd`/安装命令和手动安装约定保持一致；重命名已安装目录不受支持。不要把这个压缩包手工解压到 `3rdparty/plugins`——该目录由插件与内容管理器管理，手工复制的文件夹不算 PCM 安装。
 
-**插件与内容管理器（PCM）：** 打开 **Preferences → Plugin and Content Manager → Install from File…**，选择 `kicad_ai_assistant_pcm.zip`。KiCad 会把它解压到 `<3rdparty>/plugins/com_github_paul356_kicad-ai-assistant/`；该包目录就是插件目录（`__init__.py` 直接位于其中）。不要自行解压这个压缩包。
+**插件与内容管理器（PCM）：** 打开 **Preferences → Plugin and Content Manager → Install from File…**，选择 `kicad_ai_assistant_pcm.zip`。KiCad 会把它解压到 `<3rdparty>/plugins/com_github_paul356_kicad-ai-assistant/`；该包目录就是插件目录（`__init__.py` 直接位于其中）。不要自行解压这个压缩包。PCM 更新会保留 `.venv` 和 freerouting JAR（`keep_on_update`）；更新后请重新运行安装脚本，让虚拟环境安装匹配的 `kcaa` 版本。
 
 或从源码构建：
 
@@ -477,7 +477,7 @@ kcaa/
 ## 常见问题
 
 **插件未出现在 KiCad 中：**
-- 手动安装：确认目录为 `<documents>/kicad/<ver>/scripting/plugins/kicad_ai_assistant`，且没有被重命名（旧说明使用的是 `kicad_ai_plugin`）。
+- 手动安装：确认使用了文档中的目录名 `<documents>/kicad/<ver>/scripting/plugins/kicad_ai_assistant`（旧说明使用的是 `kicad_ai_plugin`），这样下面的命令才能正常工作。
 - PCM 安装：确认 `<documents>/kicad/<ver>/3rdparty/plugins/com_github_paul356_kicad-ai-assistant` 存在，并且来自 `kicad_ai_assistant_pcm.zip`。
 - 安装后执行 **Tools → External Plugins → Refresh Plugins**。
 - Linux：检查 `setup_plugin.sh` 是否成功完成，并确认插件目录下存在 `.venv/bin/python`。
