@@ -18,10 +18,18 @@ import subprocess
 import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
-_WORKFLOWS = sorted((_REPO_ROOT / ".github" / "workflows").glob("*.yml"))
+_WORKFLOW_SUFFIXES = ("*.yml", "*.yaml")
 _RUN_KEY = r"^(?P<indent>\s*)(?:-\s+)?run:"
 _BLOCK_START = re.compile(_RUN_KEY + r"\s*[|>](?:[+-]?\d*|\d*[+-]?)?\s*(?:#.*)?$")
 _INLINE_RUN = re.compile(_RUN_KEY + r"\s+(?P<command>\S.*)$")
+
+
+def _discover_workflows(directory: Path) -> list[Path]:
+    """Return every workflow file in *directory*, with either supported suffix."""
+    return sorted(path for suffix in _WORKFLOW_SUFFIXES for path in directory.glob(suffix))
+
+
+_WORKFLOWS = _discover_workflows(_REPO_ROOT / ".github" / "workflows")
 
 
 def _extract_run_blocks(workflow: Path) -> list[str]:
@@ -87,6 +95,16 @@ def test_extractor_supports_yaml_block_scalar_forms(tmp_path: Path) -> None:
         "  - run: echo inline\n",
         encoding="utf-8",
     )
+    workflow_yaml = tmp_path / "workflow.yaml"
+    workflow_yaml.write_text(
+        "steps:\n  - run: |\n      echo yaml suffix\n",
+        encoding="utf-8",
+    )
+
+    assert [path.name for path in _discover_workflows(tmp_path)] == [
+        "workflow.yaml",
+        "workflow.yml",
+    ]
 
     blocks = _extract_run_blocks(workflow)
     assert len(blocks) == 6
@@ -96,6 +114,10 @@ def test_extractor_supports_yaml_block_scalar_forms(tmp_path: Path) -> None:
     assert "echo indented" in blocks[3]
     assert "echo commented" in blocks[4]
     assert "echo inline" in blocks[5]
+
+    yaml_blocks = _extract_run_blocks(workflow_yaml)
+    assert len(yaml_blocks) == 1
+    assert "echo yaml suffix" in yaml_blocks[0]
 
 
 @pytest.mark.parametrize("workflow", _WORKFLOWS, ids=lambda path: path.name)
