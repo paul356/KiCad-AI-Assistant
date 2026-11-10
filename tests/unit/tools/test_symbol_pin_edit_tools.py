@@ -887,6 +887,21 @@ def test_shared_selector_does_not_warn_against_its_own_edit(tmp_path):
     assert _symbol_pin_numbers(library, "MultiUnit") == {"C0", "5", "2", "3"}
 
 
+def test_same_new_number_warns_once_per_batch(tmp_path):
+    """Two selectors landing on one number from separate parts warn once."""
+    library = _copy(SYMBOL_LIBRARY, tmp_path)
+
+    result = set_symbol_pin(
+        library,
+        "MultiUnit",
+        [_edit("2", new_number="5"), _edit("3", new_number="5")],
+    )
+
+    assert result["changed"] is True
+    assert result["warnings"] == ["pin number '5' is also used by another pin of this symbol"]
+    assert [change["new_number"] for change in result["changes"]] == ["5", "5"]
+
+
 def test_duplicate_pin_names_are_allowed(tmp_path):
     """Names label pins; only numbers are constrained to stay unique."""
     library = _copy(SYMBOL_LIBRARY, tmp_path)

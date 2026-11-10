@@ -891,6 +891,7 @@ def _plan_pin_edit_batch(
     all_units, all_styles = _symbol_unit_style_universe(pins)
     duplicates = _pre_existing_duplicate_pairs(pins)
     warnings: list[str] = []
+    warned_numbers: set[str] = set()
     for request, matches in resolved:
         if request["new_number"] is None:
             continue
@@ -918,9 +919,13 @@ def _plan_pin_edit_batch(
                 if pin_units & other_units and pin_styles & other_styles:
                     # A real collision; find_pin_collisions rejects the batch.
                     continue
-                warnings.append(
-                    f"pin number '{final_number}' is also used by another pin of this symbol"
-                )
+                # One warning per final number for the whole batch, even when
+                # several selectors land on it from separate parts.
+                if final_number not in warned_numbers:
+                    warnings.append(
+                        f"pin number '{final_number}' is also used by another pin of this symbol"
+                    )
+                    warned_numbers.add(final_number)
                 warned = True
                 break
 

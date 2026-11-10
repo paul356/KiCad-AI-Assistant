@@ -1,6 +1,6 @@
 (kicad_sch (version 20260306) (generator "eeschema") (generator_version "10.0") (uuid "b1f7a3c2-5d4e-4a91-8c6f-2e7d0b9a4c11") (paper "A4") (lib_symbols 
 
-(symbol "PinEdit:Plain" (pin_numbers (hide yes)) (pin_names (offset 0.254)) (exclude_from_sim no) (in_bom yes) (on_board yes) (in_pos_files yes) (duplicate_pin_numbers_are_jumpers no) 
+(symbol "PinEdit:Plain" (pin_numbers (hide yes)) (pin_names (offset 0.254)) (exclude_from_sim no) (in_bom yes) (on_board yes) (in_pos_files yes) (duplicate_pin_numbers_are_jumpers yes) 
 
 (property "Reference" "R" (at 0 0 90) (show_name no) (do_not_autoplace no) (effects (font (size 1.016 1.016)))) 
 

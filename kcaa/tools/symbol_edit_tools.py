@@ -3254,10 +3254,12 @@ def register_symbol_edit_tools(mcp: FastMCP) -> None:
 
         A pin number is KiCad's identity for a physical connection, so every
         definition carrying it is edited together.  Numbers keep their
-        uniqueness: a batch that would give two pins the same number is
-        rejected, while duplicates that already existed (KiCad's
-        duplicate-pin jumpers) stay legal.  Pin names are not required to be
-        unique and may be empty.
+        uniqueness: a number already used inside the same part is rejected,
+        while duplicates that already existed (KiCad's duplicate-pin jumpers)
+        stay legal.  A new number that duplicates a pin KiCad resolves
+        separately (another part of a multi-part symbol) is allowed and
+        reported in ``warnings``.  Pin names are not required to be unique and
+        may be empty.
 
         Args:
             project_dir: Project directory (or a file inside it). Its
@@ -3312,10 +3314,12 @@ def register_symbol_edit_tools(mcp: FastMCP) -> None:
         A pin number is KiCad's identity for a physical connection, so every
         definition carrying it is edited together and the instance pin keys of
         every placement of *lib_id* are rewritten.  Numbers keep their
-        uniqueness: a batch that would give two pins the same number is
-        rejected, while duplicates that already existed (KiCad's
-        duplicate-pin jumpers) stay legal.  Pin names are not required to be
-        unique and may be empty.
+        uniqueness: a number already used inside the same part is rejected,
+        while duplicates that already existed (KiCad's duplicate-pin jumpers)
+        stay legal.  A new number that duplicates a pin KiCad resolves
+        separately (another part of a multi-part symbol) is allowed and
+        reported in ``warnings``.  Pin names are not required to be unique and
+        may be empty.
 
         The batch is validated against its final state before writing, with
         exactly one ``.kicad_sch.bak`` and one save.  The file is rewritten
