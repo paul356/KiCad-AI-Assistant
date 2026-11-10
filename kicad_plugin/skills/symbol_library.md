@@ -78,9 +78,10 @@ connection, so a rename hits every definition that carries it. Numbers stay
 unique where they were unique: a batch that would give two pins the same
 number is rejected, while duplicates that already existed (stacked pins,
 KiCad's duplicate-pin jumpers) stay legal and can be renumbered together.
-Pin names are not required to be unique and may be empty. When the new number
-is already used by a pin the batch does not touch, the edit succeeds with a
-warning (KiCad treats duplicate numbers as jumpers). The `.kicad_sym` file is edited
+Pin names are not required to be unique and may be empty. A new number that
+duplicates a pin KiCad resolves separately (another part of a multi-part
+symbol) is allowed with a warning; a duplicate inside the same part is
+rejected. The `.kicad_sym` file is edited
 in place in one write (one `.bak`) and only the pin literals change. Schematics
 that already embed the old definition are **not** updated — call
 **update_schematic_symbol_pin** afterwards for already placed parts. Do this

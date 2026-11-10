@@ -63,7 +63,9 @@ tools: [extract_schematic_netlist, add_symbol_to_schematic, place_symbol_relativ
   together. Numbers stay unique where they were unique: a batch that would
   give two pins the same number is rejected, while duplicates that already
   existed (stacked pins) stay legal. Pin names may repeat or be empty; a new
-  number already used by an untouched pin produces a warning, not an error.
+  number that duplicates a pin KiCad resolves separately (another part of a
+  multi-part symbol) is allowed with a warning, while a duplicate inside the
+  same part is rejected.
 - Do this **before** `set_symbol_property` assigns the `Footprint`; the two
   tools are a pair — the library edit covers future placements, the schematic
   edit covers the placed copies. Both report the changes and write `.bak`

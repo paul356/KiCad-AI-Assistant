@@ -3248,7 +3248,7 @@ def register_symbol_edit_tools(mcp: FastMCP) -> None:
         The whole batch is validated against its final state before anything
         is written.  Selectors always match the pre-edit snapshot, so chains
         and cycles that form a valid permutation (``P$1 → 1``, ``1 → 2``)
-        are accepted; only a final same-unit collision is rejected.  Exactly
+        are accepted; only a newly introduced duplicate number is rejected.  Exactly
         one ``.bak`` and one write are produced, and the library is re-indexed
         once when something changed.
 

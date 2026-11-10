@@ -171,6 +171,34 @@ def _add_cached_symbols(schematic: Path, lib_ids: list[str]) -> None:
     )
 
 
+def _add_stacked_pin(schematic: Path) -> None:
+    """Give the cached ``PinEdit:Plain`` a second pin sharing number ``P$1``.
+
+    KiCad stacked pins sit on top of each other (duplicate numbers are
+    jumpers).  The instance pin key is added to both placements so the key
+    rewrite for a shared number becomes observable.
+    """
+    text = schematic.read_text(encoding="utf-8")
+    text = text.replace(
+        '(number "P$2" (effects (font (size 1.27 1.27))))))',
+        '(number "P$2" (effects (font (size 1.27 1.27)))))'
+        " (pin passive line (at -5.08 0 0) (length 2.54)"
+        ' (name "A2" (effects (font (size 1.27 1.27))))'
+        ' (number "P$1" (effects (font (size 1.27 1.27))))))',
+        1,
+    )
+    for uuid, stacked_uuid in (
+        ("e3c9a2b7-8d4f-4e3a-9b6c-2f0a1d5b8e44", "7b1c2d3e-4f50-4617-8829-3a4b5c6d7e01"),
+        ("1a2b3c4d-5e6f-4708-9a0b-1c2d3e4f5a66", "7b1c2d3e-4f50-4617-8829-3a4b5c6d7e02"),
+    ):
+        text = text.replace(
+            f'(pin "P$1" (uuid "{uuid}"))',
+            f'(pin "P$1" (uuid "{uuid}")) (pin "P$1" (uuid "{stacked_uuid}"))',
+            1,
+        )
+    schematic.write_text(text, encoding="utf-8")
+
+
 def _patch_real_resolution(monkeypatch):
     """Keep real resolution hermetic: no host global tables, no system paths."""
     monkeypatch.setattr(
@@ -1244,6 +1272,46 @@ def test_schematic_tool_not_found_lists_at_most_five_ids(tmp_path):
             " (available: 'Zz:Extra1', 'Zz:Extra2', 'Zz:Extra3', 'Zz:Extra4', 'Zz:Extra5')"
         )
     }
+
+
+def test_schematic_tool_renames_stacked_pins_in_placements(tmp_path):
+    """A shared number rewrites every placement key; uuids and netlist survive."""
+    schematic = _copy(SCHEMATIC, tmp_path)
+    _add_stacked_pin(schematic)
+    before_uuids = _placement_pin_uuids(schematic)
+    connections_before = _connection_count(schematic)
+
+    result = asyncio.run(
+        _tools()["update_schematic_symbol_pin"](
+            schematic_path=str(schematic),
+            lib_id="PinEdit:Plain",
+            pins=[_edit("P$1", new_number="1")],
+        )
+    )
+
+    assert result["changed"] is True
+    assert result["pins_requested"] == 1
+    assert result["pins_changed"] == 2
+    assert result["occurrences"] == 2
+    assert result["placements_updated"] == 2
+    assert result["warnings"] == []
+
+    after = _semantic_snapshot(schematic)
+    assert after["lib_symbols"]["PinEdit:Plain"]["Plain_1_1"] == (
+        ("1", "A"),
+        ("P$2", "B"),
+        ("1", "A2"),
+    )
+    assert [placement["pins"] for placement in after["placements"]] == [
+        ("C0", "1", "1", "P$2"),
+        ("C0", "1", "1", "P$2"),
+    ]
+    assert _placement_pin_uuids(schematic) == before_uuids
+    assert _placement_pin_numbers(schematic, "PinEdit:Plain") == [
+        {"C0", "1", "P$2"},
+        {"C0", "1", "P$2"},
+    ]
+    assert _connection_count(schematic) == connections_before
 
 
 def test_schematic_tool_batch_updates_cache_and_placement_keys(tmp_path):
