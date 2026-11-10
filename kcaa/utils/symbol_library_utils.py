@@ -547,6 +547,7 @@ def remove_symbol_from_library_file(file_path: str, symbol_name: str) -> str:
 # ---------------------------------------------------------------------------
 
 _MAX_PIN_NUMBER_LENGTH = 32
+_MAX_PINS_PER_REQUEST = 256
 _MAX_AVAILABLE_PIN_NUMBERS = 10
 _STRING_ESCAPES = {"n": "\n", "r": "\r", "t": "\t", "\\": "\\", '"': '"'}
 
@@ -678,16 +679,24 @@ def _split_sub_symbol_name(name: str, symbol_name: str) -> tuple[int, int] | Non
         return None
 
 
-def _validate_pin_edit_args(
-    pin_number: str,
-    new_number: str | None,
-    new_name: str | None,
-) -> None:
-    """Validate the shared argument contract of the pin-edit surfaces.
+def _has_control_character(value: str) -> bool:
+    """Return True when *value* contains a C0 control character or DEL."""
+    return any(ord(char) < 0x20 or ord(char) == 0x7F for char in value)
 
-    Raises:
-        ValueError: With the exact contract message for each invalid input.
-    """
+
+def _validate_pin_entry(entry: Any) -> dict[str, Any]:
+    """Validate one ``pins`` entry and return its normalized fields."""
+    if not isinstance(entry, dict):
+        raise ValueError(
+            "each pins entry must be an object with pin_number and at least one of "
+            "new_number/new_name"
+        )
+    unknown = set(entry) - {"pin_number", "new_number", "new_name"}
+    if unknown:
+        raise ValueError(f"unknown pins entry field: {sorted(unknown)[0]!r}")
+    pin_number = entry.get("pin_number")
+    new_number = entry.get("new_number")
+    new_name = entry.get("new_name")
     if not isinstance(pin_number, str) or not pin_number:
         raise ValueError("pin_number must be a non-empty string")
     if new_number is None and new_name is None:
@@ -699,97 +708,143 @@ def _validate_pin_edit_args(
             or len(new_number) > _MAX_PIN_NUMBER_LENGTH
             or any(char.isspace() for char in new_number)
             or any(char in new_number for char in '"()\\')
+            or _has_control_character(new_number)
         )
         if invalid_number:
             raise ValueError(
                 "new_number must be a non-empty token without whitespace, quotes, "
-                "parentheses or backslashes (max 32 characters)"
+                "parentheses, backslashes or control characters (max 32 characters)"
             )
     if new_name is not None and (
-        not isinstance(new_name, str) or any(char in new_name for char in '"()\\\n\r\t')
+        not isinstance(new_name, str)
+        or any(char in new_name for char in '"()\\')
+        or _has_control_character(new_name)
     ):
         raise ValueError(
             "new_name must not contain quotes, parentheses, backslashes or control characters"
         )
+    return {"pin_number": pin_number, "new_number": new_number, "new_name": new_name}
 
 
-def _plan_pin_edit(
+def _validate_pin_edit_requests(pins: Any) -> list[dict[str, Any]]:
+    """Validate the shared batch contract and reject duplicate selectors."""
+    if not isinstance(pins, list) or not pins:
+        raise ValueError("pins must be a non-empty list")
+    if len(pins) > _MAX_PINS_PER_REQUEST:
+        raise ValueError(f"pins must contain at most {_MAX_PINS_PER_REQUEST} entries")
+    requests = [_validate_pin_entry(entry) for entry in pins]
+    seen: set[str] = set()
+    for request in requests:
+        selector = request["pin_number"]
+        if selector in seen:
+            raise ValueError(f"duplicate pin_number '{selector}' in pins list")
+        seen.add(selector)
+    return requests
+
+
+def _plan_pin_edit_batch(
     pins: list[dict[str, Any]],
     symbol_name: str,
-    pin_number: str,
-    new_number: str | None,
-    new_name: str | None,
+    requests: list[dict[str, Any]],
     unit: int | None,
 ) -> dict[str, Any]:
-    """Resolve matching pins and validate the whole edit before any write.
+    """Resolve and validate a whole batch against its *final* state.
 
     Each entry of *pins* carries at least ``unit``, ``style``, ``number`` and
-    ``name``; callers add their own write payload (spans or raw nodes) and use
-    the returned ``matches`` to apply the plan.
-
-    Raises:
-        ValueError: When no pin matches or when the new number collides with
-            another pin of the same unit.
+    ``name``.  All selectors are resolved against the pre-edit snapshot, then
+    every requested value is applied simultaneously before collisions are
+    checked, so chains and cycles that form a valid permutation are accepted.
     """
     selected = [pin for pin in pins if unit is None or pin["unit"] == unit]
-    matches = [pin for pin in selected if pin["number"] == pin_number]
-    if not matches:
-        available = list(dict.fromkeys(pin["number"] for pin in selected if pin["number"]))[
-            :_MAX_AVAILABLE_PIN_NUMBERS
-        ]
-        detail = ", ".join(available) if available else "none"
-        raise ValueError(
-            f"pin '{pin_number}' not found in symbol '{symbol_name}' "
-            f"(available pin numbers in the selected units: {detail})"
-        )
+    resolved: list[tuple[dict[str, Any], list[dict[str, Any]]]] = []
+    for request in requests:
+        matches = [pin for pin in selected if pin["number"] == request["pin_number"]]
+        if not matches:
+            available = list(dict.fromkeys(pin["number"] for pin in selected if pin["number"]))[
+                :_MAX_AVAILABLE_PIN_NUMBERS
+            ]
+            detail = ", ".join(available) if available else "none"
+            raise ValueError(
+                f"pin '{request['pin_number']}' not found in symbol '{symbol_name}' "
+                f"(available pin numbers in the selected units: {detail})"
+            )
+        resolved.append((request, matches))
 
-    warnings: list[str] = []
-    if new_number is not None:
-        match_ids = {id(pin) for pin in matches}
-        changed_units = {pin["unit"] for pin in matches}
-        for pin in pins:
-            if (
-                id(pin) not in match_ids
-                and pin["unit"] in changed_units
-                and pin["number"] == new_number
-            ):
+    final_numbers = {id(pin): pin["number"] for pin in pins}
+    final_names = {id(pin): pin["name"] for pin in pins}
+    for request, matches in resolved:
+        for pin in matches:
+            if request["new_number"] is not None:
+                final_numbers[id(pin)] = request["new_number"]
+            if request["new_name"] is not None:
+                final_names[id(pin)] = request["new_name"]
+
+    pins_by_unit: dict[int, list[dict[str, Any]]] = {}
+    for pin in pins:
+        pins_by_unit.setdefault(pin["unit"], []).append(pin)
+    for unit_value, unit_pins in pins_by_unit.items():
+        seen: dict[str, dict[str, Any]] = {}
+        for pin in unit_pins:
+            final_number = final_numbers[id(pin)]
+            other = seen.get(final_number)
+            if other is not None:
+                culprit = other
+                if pin["number"] == final_number:
+                    culprit = pin
+                elif other["number"] == final_number:
+                    culprit = other
                 raise ValueError(
-                    f"pin number '{new_number}' is already used by pin "
-                    f"'{pin['name']}' in unit {pin['unit']}"
+                    f"pin number '{final_number}' is already used by pin "
+                    f"'{culprit['name']}' in unit {unit_value}"
                 )
-        warned_units: set[int] = set()
-        for pin in pins:
-            if (
-                id(pin) not in match_ids
-                and pin["unit"] not in changed_units
-                and pin["number"] == new_number
-                and pin["unit"] not in warned_units
-            ):
-                warned_units.add(pin["unit"])
-                warnings.append(f"pin number '{new_number}' is also used in unit {pin['unit']}")
+            seen[final_number] = pin
+
+    number_units: dict[str, set[int]] = {}
+    for pin in pins:
+        number_units.setdefault(final_numbers[id(pin)], set()).add(pin["unit"])
+    warnings: list[str] = []
+    warned: set[tuple[str, int]] = set()
+    for request, matches in resolved:
+        if request["new_number"] is None:
+            continue
+        for pin in matches:
+            final_number = final_numbers[id(pin)]
+            for other_unit in sorted(number_units[final_number] - {pin["unit"]}):
+                key = (final_number, other_unit)
+                if key not in warned:
+                    warned.add(key)
+                    warnings.append(
+                        f"pin number '{final_number}' is also used in unit {other_unit}"
+                    )
 
     changes: list[dict[str, Any]] = []
-    changed = False
-    for pin in matches:
-        final_number = pin["number"] if new_number is None else new_number
-        final_name = pin["name"] if new_name is None else new_name
-        changes.append(
-            {
-                "unit": pin["unit"],
-                "style": pin["style"],
-                "old_number": pin["number"],
-                "old_name": pin["name"],
-                "new_number": final_number,
-                "new_name": final_name,
-            }
-        )
-        if final_number != pin["number"] or final_name != pin["name"]:
-            changed = True
+    changed_pins: list[dict[str, Any]] = []
+    pins_changed = 0
+    for request, matches in resolved:
+        for pin in matches:
+            final_number = final_numbers[id(pin)]
+            final_name = final_names[id(pin)]
+            changes.append(
+                {
+                    "pin_number": request["pin_number"],
+                    "unit": pin["unit"],
+                    "style": pin["style"],
+                    "old_number": pin["number"],
+                    "old_name": pin["name"],
+                    "new_number": final_number,
+                    "new_name": final_name,
+                }
+            )
+            changed_pins.append(pin)
+            if final_number != pin["number"] or final_name != pin["name"]:
+                pins_changed += 1
 
     return {
-        "matches": matches,
+        "changed_pins": changed_pins,
         "changes": changes,
-        "changed": changed,
+        "pins_changed": pins_changed,
+        "changed": pins_changed > 0,
+        "occurrences": len(changed_pins),
         "warnings": warnings,
     }
 
@@ -797,18 +852,22 @@ def _plan_pin_edit(
 def set_symbol_pin(
     file_path: str,
     symbol_name: str,
-    pin_number: str,
-    new_number: str | None = None,
-    new_name: str | None = None,
+    pins: list[dict[str, Any]],
     unit: int | None = None,
 ) -> dict:
-    """Rename a pin number and/or pin name inside one library symbol.
+    """Rename pin numbers and/or pin names inside one library symbol.
+
+    *pins* is a non-empty batch (max 256 entries); each entry carries
+    ``pin_number`` plus at least one of ``new_number`` / ``new_name``.  The
+    whole batch is validated against its final state before anything is
+    written: chains and cycles that form a valid permutation are accepted, and
+    only a final same-unit collision is rejected.
 
     Only the quoted literals of the targeted ``(number ...)`` / ``(name ...)``
     nodes are replaced: every other byte of the ``.kicad_sym`` file — header,
-    other symbols, formatting, line endings — stays identical.  The file is
-    written atomically after a ``.bak`` copy is taken; on any validation
-    error nothing is written.
+    other symbols, formatting, line endings — stays identical.  Exactly one
+    ``.bak`` is written and exactly one atomic replace is performed; on any
+    validation error nothing is written.
 
     Pins live in sub-symbols named ``<symbol>_<unit>_<style>``.  ``unit=None``
     edits every matching occurrence in all units and both body styles;
@@ -817,17 +876,16 @@ def set_symbol_pin(
 
     :param file_path: Absolute path to the ``.kicad_sym`` library file.
     :param symbol_name: Plain (unqualified) top-level symbol name.
-    :param pin_number: Existing pin number that selects the pin(s) to edit.
-    :param new_number: Replacement pin number; omit to keep the old number.
-    :param new_name: Replacement pin name; omit to keep the old name.
+    :param pins: Batch of pin edits.
     :param unit: Optional unit to restrict the edit to.
-    :returns: Report dict with ``occurrences``, ``changes``, ``changed``,
-        ``backup_path`` and ``warnings``.
+    :returns: Report dict with ``pins_requested``, ``pins_changed``,
+        ``occurrences``, ``changes``, ``changed``, ``backup_path`` and
+        ``warnings``.
     :raises FileNotFoundError: When *file_path* does not exist.
     :raises SymbolNotFoundError: When *symbol_name* is not a top-level symbol.
     :raises ValueError: On invalid arguments, a missing pin, or a collision.
     """
-    _validate_pin_edit_args(pin_number, new_number, new_name)
+    requests = _validate_pin_edit_requests(pins)
     if not os.path.isfile(file_path):
         raise FileNotFoundError(f"Library file not found: {file_path}")
 
@@ -852,7 +910,7 @@ def set_symbol_pin(
             if parsed is not None:
                 sub_symbols.append((parsed[0], parsed[1], child_start, child_end))
 
-    pins: list[dict[str, Any]] = []
+    pin_nodes: list[dict[str, Any]] = []
     for pin_unit, pin_style, sub_start, sub_end in sub_symbols:
         for pin_start, pin_end in _child_spans(text, sub_start, sub_end):
             keyword, _ = _node_head(text, pin_start, pin_end)
@@ -860,7 +918,7 @@ def set_symbol_pin(
                 continue
             number, number_span = _child_token(text, pin_start, pin_end, "number")
             name, name_span = _child_token(text, pin_start, pin_end, "name")
-            pins.append(
+            pin_nodes.append(
                 {
                     "unit": pin_unit,
                     "style": pin_style,
@@ -871,26 +929,28 @@ def set_symbol_pin(
                 }
             )
 
-    if extends_base is not None and not pins:
+    if extends_base is not None and not pin_nodes:
         raise ValueError(
             f"symbol '{symbol_name}' extends '{extends_base}' and defines no pins; "
             f"update the base symbol '{extends_base}' instead"
         )
 
-    plan = _plan_pin_edit(pins, symbol_name, pin_number, new_number, new_name, unit)
+    plan = _plan_pin_edit_batch(pin_nodes, symbol_name, requests, unit)
 
     replacements: list[tuple[tuple[int, int], str]] = []
-    for pin in plan["matches"]:
-        if new_number is not None and new_number != pin["number"]:
+    for pin, change in zip(plan["changed_pins"], plan["changes"], strict=True):
+        if change["new_number"] != pin["number"]:
             if pin["number_span"] is None:
                 raise ValueError(
-                    f"pin '{pin_number}' has no (number ...) node in unit {pin['unit']}"
+                    f"pin '{change['pin_number']}' has no (number ...) node in unit {pin['unit']}"
                 )
-            replacements.append((pin["number_span"], f'"{new_number}"'))
-        if new_name is not None and new_name != pin["name"]:
+            replacements.append((pin["number_span"], f'"{change["new_number"]}"'))
+        if change["new_name"] != pin["name"]:
             if pin["name_span"] is None:
-                raise ValueError(f"pin '{pin_number}' has no (name ...) node in unit {pin['unit']}")
-            replacements.append((pin["name_span"], f'"{new_name}"'))
+                raise ValueError(
+                    f"pin '{change['pin_number']}' has no (name ...) node in unit {pin['unit']}"
+                )
+            replacements.append((pin["name_span"], f'"{change["new_name"]}"'))
 
     backup_path: str | None = None
     if plan["changed"]:
@@ -910,9 +970,10 @@ def set_symbol_pin(
     return {
         "symbol_name": symbol_name,
         "file_path": os.path.abspath(file_path),
-        "pin_number": new_number if new_number is not None else pin_number,
         "unit": unit,
-        "occurrences": len(plan["matches"]),
+        "pins_requested": len(requests),
+        "pins_changed": plan["pins_changed"],
+        "occurrences": plan["occurrences"],
         "changes": plan["changes"],
         "changed": plan["changed"],
         "backup_path": backup_path,

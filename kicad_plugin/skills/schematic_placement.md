@@ -48,13 +48,17 @@ tools: [extract_schematic_netlist, add_symbol_to_schematic, place_symbol_relativ
 # Fixing pin numbering before footprint assignment
 - Inspect the symbol with **get_library_symbol_pins**. If its pins are numbered
   `P$1`, `P$2`, … but the footprint pads are `1`, `2`, …, fix the definition
-  with **update_library_symbol_pin** (library file) and, for parts already
-  placed, **update_schematic_symbol_pin** (the schematic's cached `lib_symbols`
-  copy that KiCad actually renders).
+  with **update_library_symbol_pin(library_name, symbol_name, pins, unit?,
+  project_path?)** (library file) and, for parts already placed,
+  **update_schematic_symbol_pin(schematic_path, lib_id, pins, unit?)** (the
+  schematic's cached `lib_symbols` copy that KiCad actually renders). `pins` is
+  a batch list of `{pin_number, new_number?, new_name?}` entries; renames in a
+  batch are applied simultaneously and validated against the final state.
 - Do this **before** `set_symbol_property` assigns the `Footprint`; the two
   tools are a pair — the library edit covers future placements, the schematic
   edit covers the placed copies. Both report the changes and write `.bak`
-  backups.
+  backups, and the schematic tool also rewrites the placements' instance pin
+  keys.
 
 # Spacing & layout rules
 - Keep at least one grid step (1.27 mm) of clearance between symbol body

@@ -65,14 +65,16 @@ project's own `sym-lib-table`; other projects are never searched. Call tools aga
 # Fixing pin numbers / names
 When a symbol's pins do not match the footprint pads (e.g. pins numbered `P$1`,
 `P$2` but pads `1`, `2`), inspect with **get_library_symbol_pins** first, then fix
-the definition with **update_library_symbol_pin(library_name, symbol_name,
-pin_number, new_number?, new_name?, unit?, project_path?)**. Use `pin_number` to
-select the existing pin; omit `unit` to update every unit and body style, or pass
-`unit=N` to restrict the edit. The `.kicad_sym` file is edited in place (a `.bak`
-backup is written) and only the pin literals change. Schematics that already
-embed the old definition are **not** updated — call **update_schematic_symbol_pin**
-afterwards for already placed parts. Do this before `set_symbol_property` assigns
-the footprint.
+the definition with **update_library_symbol_pin(library_name, symbol_name, pins,
+unit?, project_path?)**. `pins` is a non-empty list (max 256) of
+`{pin_number, new_number?, new_name?}` entries — one entry per pin; selectors
+match the pre-edit state, so chain/cycle renames are applied simultaneously and
+validated against the final state. Omit `unit` to update every unit and body
+style, or pass `unit=N` to restrict the batch. The `.kicad_sym` file is edited
+in place in one write (one `.bak`) and only the pin literals change. Schematics
+that already embed the old definition are **not** updated — call
+**update_schematic_symbol_pin** afterwards for already placed parts. Do this
+before `set_symbol_property` assigns the footprint.
 
 # Caveats & gotchas
 - `sync_symbol_index` returns `status: "already_running"` if called while a sync is
