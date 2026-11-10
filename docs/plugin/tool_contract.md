@@ -330,61 +330,62 @@ Entries already present in the target library are reported in `skipped` (never o
 
 ---
 
-#### `update_library_symbol_pin(library_name, symbol_name, pins, unit=None, project_path=None)`
+#### `update_library_symbol_pin(project_dir, lib_id, pins)`
 
 **Purpose:** Renames pin numbers and/or pin names in a **symbol library definition** (`.kicad_sym`) as a batch. This is the fix for symbols whose pins are numbered `P$1`, `P$2`, … while the assigned footprint uses `1`, `2`, … — the symbol↔footprint mapping only works when the numbers match. A one-pin edit is a one-element `pins` list.
 
 Only the quoted literals of the targeted `(number "…")` / `(name "…")` nodes are replaced: every other byte of the file (header, `generator` lines, formatting, original `\r\n`/`\n`, other symbols) stays byte-identical. The schematic is never touched — already-placed parts keep their cached copy until `update_schematic_symbol_pin` is called.
 
+**A pin number is the identity.** KiCad identifies a physical connection by pin **number** (duplicate numbers are legal and act as jumpers), so a rename applies to every definition that carries it — all units and both body styles, the sub-symbols named `<symbol>_<unit>_<style>` — in the same write. There is no per-unit or per-style selector.
+
 **Batch semantics:** the whole request is validated against its **final state** before anything is written. Selectors always match the pre-edit snapshot, so chains and cycles that form a valid permutation (`P$1 → 1`, `1 → 2`) are accepted; only a final collision under the effective unit/style rule is rejected. Exactly one `.bak`, one atomic write and one re-index are produced. A batch whose requested values are all already present returns `"changed": false` and writes nothing; partial no-ops inside a changed batch are fine.
 
 **Key parameters:**
-- `library_name` (`str`) — nickname of a **user** library registered in sym-lib-table. Libraries inside the KiCad installation are refused with the exact `{"error": ...}` used by `remove_symbols_from_library` (symbol library tools operate on user libraries only).
-- `symbol_name` (`str`) — plain (unqualified) top-level symbol name.
+- `project_dir` (`str`, required) — project directory (or a file inside it). Its `sym-lib-table` is searched first, then the global table, and the re-index is scoped to it. The libraries inside the KiCad installation are refused with the exact `{"error": ...}` used by `remove_symbols_from_library` (symbol library tools operate on user libraries only). A nickname in neither table returns the sym-lib-table not-found error; an entry whose URI points at a missing file keeps the plain missing-file message.
+- `lib_id` (`str`) — target as `"Library:Symbol"`, split on the **first** colon: the nickname registered in sym-lib-table plus the plain (unqualified) top-level symbol name. Both halves must be non-empty; there is no fallback lookup, no "unique nickname" guess and no scanning of other projects' tables — the nickname resolves exactly as given. Malformed values (missing colon or an empty half) return `{"error": "lib_id must be 'Library:Symbol' (got '...')"}`.
 - `pins` (`list[dict]`) — non-empty batch, at most 256 entries. Each entry:
   - `pin_number` (`str`, required) — existing pin number selecting the pin(s) to edit;
   - `new_number` (`str`, optional) — replacement number: non-empty token without whitespace, quotes, parentheses, backslashes or control characters, max 32 chars;
   - `new_name` (`str`, optional) — replacement name: quotes, parentheses, backslashes and control characters (C0/DEL) are rejected; spaces and an empty string are written verbatim.
 
   At least one of `new_number` / `new_name` is required per entry, and selectors must be unique.
-- `unit` (`int | None`) — `None` edits every matching occurrence in all units and both body styles; `N` restricts the edit to unit `N` (`0` = common unit), still covering both body styles. Pins live in sub-symbols named `<symbol>_<unit>_<style>`.
-- `project_path` (`str | None`) — project path used to resolve project-local libraries (`${KIPRJMOD}`) and scope the re-index.
 
-Errors — unknown selector, duplicate selector, a collision introduced by the batch, invalid field, derived symbol without own pins, empty list or more than 256 entries — return `{"error": ...}` and leave the file byte-identical with no `.bak` and no `.tmp`. Collision rule: same effective unit **and** body style → error; different unit → success with a warning. Unit `0` (common) belongs to every unit, style `0` belongs to every style, and styles `1` and `2` (normal / De Morgan) are independent alternatives. Pre-existing duplicates the batch does not touch (e.g. stacked pins) never block an edit.
+Errors — unknown selector, duplicate selector, a collision introduced by the batch, invalid field, derived symbol without own pins, empty list or more than 256 entries — return `{"error": ...}` and leave the file byte-identical with no `.bak` and no `.tmp`. Collision validation stays per unit and style: same effective unit **and** body style → error; same number in a different unit only → success with a warning. The common definitions (unit `0`, style `0`) belong to every unit/style, and styles `1` and `2` (normal / De Morgan) are independent alternatives. Pre-existing duplicates the batch does not touch (e.g. stacked pins) never block an edit.
 
-`pins_requested` counts requested entries; `pins_changed` counts changed pin **occurrences**, so a unit-less selector matching two units reports `pins_requested: 1`, `occurrences: 2`, `pins_changed: 2`.
+`pins_requested` counts requested entries; `pins_changed` counts changed pin **occurrences**, so a selector that matches two units reports `pins_requested: 1`, `occurrences: 2`, `pins_changed: 2`. Every `changes` entry carries the `unit` and `style` of the definition it came from.
 
-**Success response:** `{"success": true, "library_name": "MyLib", "symbol_name": "MYOP", "library_path": "...", "unit": null, "pins_requested": 2, "pins_changed": 2, "occurrences": 2, "changes": [{"pin_number": "P$1", "unit": 1, "style": 1, "old_number": "P$1", "old_name": "A", "new_number": "1", "new_name": "A"}, {"pin_number": "P$2", "unit": 1, "style": 1, "old_number": "P$2", "old_name": "B", "new_number": "2", "new_name": "B"}], "changed": true, "backup_path": "...bak", "indexed": true, "warnings": []}`
+**Success response:** `{"success": true, "library_name": "MyLib", "symbol_name": "MYOP", "library_path": "...", "pins_requested": 2, "pins_changed": 2, "occurrences": 2, "changes": [{"pin_number": "P$1", "unit": 1, "style": 1, "old_number": "P$1", "old_name": "A", "new_number": "1", "new_name": "A"}, {"pin_number": "P$2", "unit": 1, "style": 1, "old_number": "P$2", "old_name": "B", "new_number": "2", "new_name": "B"}], "changed": true, "backup_path": "...bak", "indexed": true, "warnings": []}`
 
 **Failure response:** `{"error": "<message>"}` — no `success` key.
 
 ---
 
-#### `update_schematic_symbol_pin(schematic_path, lib_id, pins, unit=None)`
+#### `update_schematic_symbol_pin(schematic_path, lib_id, pins)`
 
 **Purpose:** Renames pin numbers and/or pin names in a schematic's **cached** `lib_symbols` copy as a batch. KiCad renders that embedded copy rather than the library file at load time, so an already-placed symbol (and every instance sharing `lib_id`) only sees the fix after this tool runs. The parsed tree is mutated and saved through the project's normal schematic save path, with a `.kicad_sch.bak` backup; the whole file is re-serialised, so formatting is **not** preserved byte-for-byte.
 
 The batch is validated against its **final state** before writing, with exactly one backup and one save. Chains/cycles that form a valid final permutation are accepted.
 
-When numbers change, the tool also rewrites the matching `(pin "…" (uuid …))` keys on the affected placements, preserving each `(uuid …)`: skip resolves a placement's pins by intersecting the cached numbers with those instance keys, so leaving them stale would drop pins from netlist/geometry queries. The rewrite uses one simultaneous mapping built from the pre-edit snapshot (cached pin uuid first, number fallback), so a chain never rewrites a key twice and a number freed by the batch cannot leave a stale key. Selection: `unit=None` or `unit=0` rewrites every placement of `lib_id`; `unit=N` rewrites only placements whose `(unit N)` equals `N`, plus every placement when an edited pin lives in the common unit-0 sub-symbol. Wires, junctions, labels, `instances`, properties and every other cached symbol are left untouched. The count is reported as `placements_updated`.
+When numbers change, the tool also rewrites the matching `(pin "…" (uuid …))` keys on the affected placements, preserving each `(uuid …)`: skip resolves a placement's pins by intersecting the cached numbers with those instance keys, so leaving them stale would drop pins from netlist/geometry queries. The rewrite uses one simultaneous mapping built from the pre-edit snapshot (cached pin uuid first, number fallback), so a chain never rewrites a key twice and a number freed by the batch cannot leave a stale key. Because a pin number is the identity of a physical connection (duplicate numbers are legal jumpers), every matching definition is edited together — all units and both body styles — and every placement of `lib_id` gets its instance keys rewritten. Wires, junctions, labels, `instances`, properties and every other cached symbol are left untouched. The count is reported as `placements_updated`.
 
 **Key parameters:**
 - `schematic_path` (`str`) — absolute path to the `.kicad_sch` file.
-- `lib_id` (`str`) — fully-qualified cached symbol id (e.g. `"Device:R"`), exactly as stored in `lib_symbols`.
-- `pins` (`list[dict]`), `unit` (`int | None`) — same batch contract as `update_library_symbol_pin` (max 256 entries, unique selectors, final-state validation, control-character rejection). Collision rule matches the library tool: same effective unit and style → error; different unit → warning; unit `0` is every unit, style `0` is every style, styles `1` and `2` are independent. `pins_changed` counts changed occurrences, not request entries.
+- `lib_id` (`str`) — the id **exactly as stored as the key** in the schematic's `lib_symbols` cache (`"Library:Symbol"` for library symbols; a bare `"R"` when that is what the file stores). Matching is byte-for-byte on that stored key: no format check, no nickname prefixing or stripping, no case folding, and no fallback between `"R"` and `"Device:R"` in either direction. An unknown id returns the not-found error with up to five available ids, e.g. `lib_id 'R' not found in the schematic's lib_symbols cache (available: 'Device:R', 'MyLib:LED')`.
+- `pins` (`list[dict]`) — same batch contract as `update_library_symbol_pin` (max 256 entries, unique selectors, final-state validation, control-character rejection). Collision validation stays per unit and style: same effective unit and style → error; same number in a different unit only → warning; the common definitions (unit `0`, style `0`) belong to every unit/style, and styles `1` and `2` are independent. `pins_changed` counts changed occurrences, not request entries; every `changes` entry carries the `unit` and `style` it came from.
 
 Every reference designator using `lib_id` is reported in `affected_references`, so the caller sees the blast radius. A missing `lib_id`, an unknown pin, a duplicate selector, a collision, or invalid arguments return `{"error": ...}` with the file untouched. Requested values already present → `"changed": false` and no write.
 
-**Success response:** `{"success": true, "lib_id": "Device:R", "symbol_name": "R", "unit": null, "pins_requested": 2, "pins_changed": 2, "occurrences": 2, "changes": [...], "changed": true, "backup_path": "...bak", "affected_references": ["R1", "R2"], "affected_count": 2, "placements_updated": 2, "warnings": []}`
+**Success response:** `{"success": true, "lib_id": "Device:R", "symbol_name": "R", "pins_requested": 2, "pins_changed": 2, "occurrences": 2, "changes": [...], "changed": true, "backup_path": "...bak", "affected_references": ["R1", "R2"], "affected_count": 2, "placements_updated": 2, "warnings": []}`
 
 **Failure response:** `{"error": "<message>"}` — no `success` key.
 
 **Pairing rule:** the two tools edit independent copies. Fixing the library does **not** update schematics that already embed the old definition, and fixing a schematic does **not** update the library (future placements would still be wrong). For an already-placed part, call both — library first, then schematic — before `set_symbol_property` assigns the footprint:
 
 ```text
-get_library_symbol_pins(library_name="MyLib", symbol_name="MYOP")
+get_library_symbol_pins(library_name="MyLib", symbol_name="MYOP",
+                        project_path="/abs/project")
 update_library_symbol_pin(
-    library_name="MyLib", symbol_name="MYOP",
+    project_dir="/abs/project", lib_id="MyLib:MYOP",
     pins=[{"pin_number": "P$1", "new_number": "1"},
           {"pin_number": "P$2", "new_number": "2"}])
 update_schematic_symbol_pin(

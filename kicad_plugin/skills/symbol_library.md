@@ -65,15 +65,21 @@ project's own `sym-lib-table`; other projects are never searched. Call tools aga
 # Fixing pin numbers / names
 When a symbol's pins do not match the footprint pads (e.g. pins numbered `P$1`,
 `P$2` but pads `1`, `2`), inspect with **get_library_symbol_pins** first, then fix
-the definition with **update_library_symbol_pin(library_name, symbol_name, pins,
-unit?, project_path?)**. `pins` is a non-empty list (max 256) of
+the definition with **update_library_symbol_pin(project_dir, lib_id, pins)**.
+`project_dir` is required — pass `active_project`; the project's
+`sym-lib-table` is searched first, then the global table. `lib_id` is
+`"Library:Symbol"` — the library nickname as registered in sym-lib-table plus
+the plain symbol name inside it — and it is split on the first colon; there is
+no guessing or fallback lookup. `pins` is a non-empty list (max 256) of
 `{pin_number, new_number?, new_name?}` entries — one entry per pin; selectors
 match the pre-edit state, so chain/cycle renames are applied simultaneously and
-validated against the final state. Omit `unit` to update every unit and body
-style, or pass `unit=N` to restrict the batch. Collisions are final-state and effective:
-same unit **and** body style → error; different unit → warning; unit `0`
-belongs to every unit, style `0` to every style, and styles `1`/`2` (normal /
-De Morgan) are independent. Pre-existing duplicates such as stacked pins do
+validated against the final state. A pin number is the identity of a physical
+connection, so a rename hits every definition that carries it: all units and
+both body styles (there is no unit selector). Collisions are final-state and
+effective: same unit **and** body style → error; same number in a different
+unit only → warning; the common definitions (unit `0`, style `0`) belong to
+every unit/style, and styles `1`/`2` (normal / De Morgan) are independent.
+Pre-existing duplicates such as stacked pins do
 not block an edit. The `.kicad_sym` file is edited
 in place in one write (one `.bak`) and only the pin literals change. Schematics
 that already embed the old definition are **not** updated — call

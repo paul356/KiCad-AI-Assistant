@@ -828,7 +828,7 @@ def _plan_pin_edit_batch(
             detail = ", ".join(available) if available else "none"
             raise ValueError(
                 f"pin '{request['pin_number']}' not found in symbol '{symbol_name}' "
-                f"(available pin numbers in the selected units: {detail})"
+                f"(available pin numbers: {detail})"
             )
         resolved.append((request, matches))
 

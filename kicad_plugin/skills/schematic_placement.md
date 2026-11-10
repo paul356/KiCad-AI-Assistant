@@ -48,14 +48,23 @@ tools: [extract_schematic_netlist, add_symbol_to_schematic, place_symbol_relativ
 # Fixing pin numbering before footprint assignment
 - Inspect the symbol with **get_library_symbol_pins**. If its pins are numbered
   `P$1`, `P$2`, … but the footprint pads are `1`, `2`, …, fix the definition
-  with **update_library_symbol_pin(library_name, symbol_name, pins, unit?,
-  project_path?)** (library file) and, for parts already placed,
-  **update_schematic_symbol_pin(schematic_path, lib_id, pins, unit?)** (the
-  schematic's cached `lib_symbols` copy that KiCad actually renders). `pins` is
-  a batch list of `{pin_number, new_number?, new_name?}` entries; renames in a
-  batch are applied simultaneously and validated against the final state.
-  Same effective unit and style → error; different unit → warning; unit `0`
-  is every unit, style `0` every style, styles `1`/`2` are independent.
+  with **update_library_symbol_pin(project_dir, lib_id, pins)**
+  (library file) and, for parts already placed,
+  **update_schematic_symbol_pin(schematic_path, lib_id, pins)** (the
+  schematic's cached `lib_symbols` copy that KiCad actually renders). For the
+  library tool `project_dir` is required (pass `active_project`): its
+  `sym-lib-table` is searched first, then the global table. `lib_id` there is
+  `"Library:Symbol"` and is split on the first colon; for the schematic tool
+  `lib_id` is matched by exact cached entry name, so no colon is required.
+  `pins` is a batch list of `{pin_number, new_number?, new_name?}` entries;
+  renames in a batch are applied simultaneously and validated against the
+  final state. There is no unit selector: a pin number is the identity of a
+  physical connection, so every definition carrying it (all units, both body
+  styles) and every placement's instance pin keys are updated together.
+  Collision validation stays per unit/style: same effective unit and style →
+  error; same number in a different unit only → warning; the common
+  definitions (unit `0`, style `0`) belong to every unit/style, and styles
+  `1`/`2` are independent.
 - Do this **before** `set_symbol_property` assigns the `Footprint`; the two
   tools are a pair — the library edit covers future placements, the schematic
   edit covers the placed copies. Both report the changes and write `.bak`

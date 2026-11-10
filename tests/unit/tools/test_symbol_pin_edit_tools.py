@@ -92,6 +92,97 @@ def _patch_library(monkeypatch, library_path: Path):
     )
 
 
+_PROJECT_LOCAL_LIB = "pinlib_local"
+
+
+def _make_project_local_library(tmp_path) -> tuple[Path, Path]:
+    """Project dir whose sym-lib-table registers one ``${KIPRJMOD}`` library."""
+    project_dir = tmp_path / "proj"
+    project_dir.mkdir()
+    library = project_dir / "pin_edit_local.kicad_sym"
+    shutil.copy2(SYMBOL_LIBRARY, library)
+    (project_dir / "sym-lib-table").write_text(
+        "(sym_lib_table\n"
+        f'  (lib (name "{_PROJECT_LOCAL_LIB}")(type "KiCad")'
+        '(uri "${KIPRJMOD}/pin_edit_local.kicad_sym")(options "")(descr ""))\n'
+        ")\n",
+        encoding="utf-8",
+    )
+    return project_dir, library
+
+
+def _add_common_pin(schematic: Path) -> None:
+    """Give ``myLib:DUAL`` a common-unit pin present on both unit placements.
+
+    The shared ``multi_unit.kicad_sch`` fixture has no common-unit sub-symbol,
+    so the copy is extended in place: a ``DUAL_0_1`` pin ``C0`` plus the
+    matching instance pin key on the unit-1 and unit-2 placements.
+    """
+    text = schematic.read_text(encoding="utf-8")
+    text = text.replace(
+        '(embedded_fonts no) (symbol "DUAL_1_1"',
+        '(embedded_fonts no) (symbol "DUAL_0_1"'
+        " (pin passive line (at 0 0 0) (length 0.762)"
+        ' (name "COM" (effects (font (size 1.27 1.27))))'
+        ' (number "C0" (effects (font (size 1.27 1.27)))))) (symbol "DUAL_1_1"',
+        1,
+    )
+    text = text.replace(
+        '(pin "2" (uuid "33333333-3333-3333-3333-333333333332"))',
+        '(pin "C0" (uuid "66666666-6666-6666-6666-666666666660"))'
+        ' (pin "2" (uuid "33333333-3333-3333-3333-333333333332"))',
+        1,
+    )
+    text = text.replace(
+        '(pin "4" (uuid "55555555-5555-5555-5555-555555555554"))',
+        '(pin "C0" (uuid "66666666-6666-6666-6666-666666666661"))'
+        ' (pin "4" (uuid "55555555-5555-5555-5555-555555555554"))',
+        1,
+    )
+    schematic.write_text(text, encoding="utf-8")
+
+
+def _make_bare_id_schematic(schematic: Path, qualified: str, bare: str) -> None:
+    """Rewrite a cached id — and its placements — to the bare stored form."""
+    text = schematic.read_text(encoding="utf-8")
+    text = text.replace(f'(symbol "{qualified}"', f'(symbol "{bare}"')
+    text = text.replace(f'(lib_id "{qualified}")', f'(lib_id "{bare}")')
+    schematic.write_text(text, encoding="utf-8")
+
+
+_CACHED_SYMBOL_TEMPLATE = (
+    '(symbol "{lib_id}" (pin_numbers (hide yes)) (pin_names (offset 0.254))'
+    " (exclude_from_sim no) (in_bom yes) (on_board yes)"
+    " (duplicate_pin_numbers_are_jumpers no)"
+    ' (property "Reference" "U" (at 0 0 0) (effects (font (size 1.27 1.27))))'
+    ' (property "Value" "X" (at 0 0 0) (effects (font (size 1.27 1.27))))'
+    ' (symbol "Extra_1_1" (pin passive line (at 0 0 0) (length 2.54)'
+    ' (name "A" (effects (font (size 1.27 1.27))))'
+    ' (number "1" (effects (font (size 1.27 1.27)))))))'
+)
+
+
+def _add_cached_symbols(schematic: Path, lib_ids: list[str]) -> None:
+    """Prepend minimal ``lib_symbols`` entries for *lib_ids*."""
+    nodes = "".join(_CACHED_SYMBOL_TEMPLATE.format(lib_id=lib_id) for lib_id in lib_ids)
+    text = schematic.read_text(encoding="utf-8")
+    schematic.write_text(
+        text.replace("(lib_symbols ", f"(lib_symbols {nodes}", 1), encoding="utf-8"
+    )
+
+
+def _patch_real_resolution(monkeypatch):
+    """Keep real resolution hermetic: no host global tables, no system paths."""
+    monkeypatch.setattr(
+        "kcaa.utils.symbol_library_utils._default_kicad_config_dirs",
+        lambda: [],
+    )
+    monkeypatch.setattr(
+        "kcaa.tools.symbol_edit_tools.config.is_system_library_path",
+        lambda path: False,
+    )
+
+
 def _keyword(node) -> str:
     return str(node[0]) if isinstance(node, list) and node else ""
 
@@ -407,6 +498,7 @@ def test_unknown_pin_error_lists_available_numbers(tmp_path):
 
     message = str(excinfo.value)
     assert message.startswith("pin 'X99' not found in symbol 'Plain'")
+    assert "(available pin numbers: " in message
     assert "P$1" in message
     assert "P$2" in message
     assert library.read_bytes() == before
@@ -730,10 +822,9 @@ def test_tool_refreshes_index_once_for_batch(monkeypatch, tmp_path):
 
     result = asyncio.run(
         _tools()["update_library_symbol_pin"](
-            library_name=_TOOL_LIB,
-            symbol_name="Plain",
+            project_dir=str(tmp_path),
+            lib_id=f"{_TOOL_LIB}:Plain",
             pins=[_edit("P$1", new_number="1"), _edit("P$2", new_number="2")],
-            project_path=str(tmp_path),
         )
     )
 
@@ -752,8 +843,8 @@ def test_tool_refreshes_index_once_for_batch(monkeypatch, tmp_path):
 
     noop = asyncio.run(
         _tools()["update_library_symbol_pin"](
-            library_name=_TOOL_LIB,
-            symbol_name="Plain",
+            project_dir=str(tmp_path),
+            lib_id=f"{_TOOL_LIB}:Plain",
             pins=[_edit("1", new_number="1")],
         )
     )
@@ -772,8 +863,8 @@ def test_tool_reports_index_failure_as_not_indexed(monkeypatch, tmp_path):
 
     result = asyncio.run(
         _tools()["update_library_symbol_pin"](
-            library_name=_TOOL_LIB,
-            symbol_name="Plain",
+            project_dir=str(tmp_path),
+            lib_id=f"{_TOOL_LIB}:Plain",
             pins=[_edit("P$1", new_number="1")],
         )
     )
@@ -795,8 +886,8 @@ def test_tool_refuses_system_library(monkeypatch, tmp_path):
 
     result = asyncio.run(
         _tools()["update_library_symbol_pin"](
-            library_name=_TOOL_LIB,
-            symbol_name="Plain",
+            project_dir=str(tmp_path),
+            lib_id=f"{_TOOL_LIB}:Plain",
             pins=[_edit("P$1", new_number="1")],
         )
     )
@@ -817,8 +908,8 @@ def test_tool_reports_invalid_pin_as_error(monkeypatch, tmp_path):
 
     result = asyncio.run(
         _tools()["update_library_symbol_pin"](
-            library_name=_TOOL_LIB,
-            symbol_name="Plain",
+            project_dir=str(tmp_path),
+            lib_id=f"{_TOOL_LIB}:Plain",
             pins=[_edit("nope", new_number="1")],
         )
     )
@@ -828,9 +919,191 @@ def test_tool_reports_invalid_pin_as_error(monkeypatch, tmp_path):
     assert result["error"].startswith("pin 'nope' not found in symbol 'Plain'")
 
 
+def test_tool_selector_in_two_units_edits_both(monkeypatch, tmp_path):
+    """A shared number is one connection, so every unit's definition is edited."""
+    library = _copy(SYMBOL_LIBRARY, tmp_path)
+    _patch_library(monkeypatch, library)
+    calls: list[tuple[tuple, dict]] = []
+    monkeypatch.setattr(
+        "kcaa.tools.symbol_edit_tools._index_symbol_library",
+        lambda *args, **kwargs: calls.append((args, kwargs)) or 1,
+    )
+
+    result = asyncio.run(
+        _tools()["update_library_symbol_pin"](
+            project_dir=str(tmp_path),
+            lib_id=f"{_TOOL_LIB}:MultiUnit",
+            pins=[_edit("1", new_name="RENAMED")],
+        )
+    )
+
+    assert "unit" not in result
+    assert result["pins_requested"] == 1
+    assert result["pins_changed"] == 2
+    assert result["occurrences"] == 2
+    assert {change["unit"] for change in result["changes"]} == {1, 2}
+    assert [change["new_name"] for change in result["changes"]] == ["RENAMED", "RENAMED"]
+    assert library.read_text(encoding="utf-8").count('(name "RENAMED"') == 2
+    assert len(calls) == 1
+
+
+def test_tool_rejects_lib_id_without_colon(monkeypatch, tmp_path):
+    library = _copy(SYMBOL_LIBRARY, tmp_path)
+    _patch_library(monkeypatch, library)
+    before = library.read_bytes()
+
+    result = asyncio.run(
+        _tools()["update_library_symbol_pin"](
+            project_dir=str(tmp_path),
+            lib_id="MYOP",
+            pins=[_edit("P$1", new_number="1")],
+        )
+    )
+
+    assert result == {"error": "lib_id must be 'Library:Symbol' (got 'MYOP')"}
+    assert library.read_bytes() == before
+    assert not Path(str(library) + ".bak").exists()
+    assert not Path(str(library) + ".tmp").exists()
+
+
+@pytest.mark.parametrize("lib_id", [":Plain", f"{_TOOL_LIB}:"])
+def test_tool_rejects_lib_id_with_empty_half(monkeypatch, tmp_path, lib_id):
+    library = _copy(SYMBOL_LIBRARY, tmp_path)
+    _patch_library(monkeypatch, library)
+    before = library.read_bytes()
+
+    result = asyncio.run(
+        _tools()["update_library_symbol_pin"](
+            project_dir=str(tmp_path),
+            lib_id=lib_id,
+            pins=[_edit("P$1", new_number="1")],
+        )
+    )
+
+    assert result == {"error": f"lib_id must be 'Library:Symbol' (got {lib_id!r})"}
+    assert library.read_bytes() == before
+    assert not Path(str(library) + ".bak").exists()
+    assert not Path(str(library) + ".tmp").exists()
+
+
+def test_tool_project_local_library_edits_with_project_dir(monkeypatch, tmp_path):
+    project_dir, library = _make_project_local_library(tmp_path)
+    _patch_real_resolution(monkeypatch)
+    calls: list[tuple[tuple, dict]] = []
+    monkeypatch.setattr(
+        "kcaa.tools.symbol_edit_tools._index_symbol_library",
+        lambda *args, **kwargs: calls.append((args, kwargs)) or 1,
+    )
+
+    result = asyncio.run(
+        _tools()["update_library_symbol_pin"](
+            project_dir=str(project_dir),
+            lib_id=f"{_PROJECT_LOCAL_LIB}:Plain",
+            pins=[_edit("P$1", new_number="1")],
+        )
+    )
+
+    assert result["success"] is True
+    assert result["library_name"] == _PROJECT_LOCAL_LIB
+    assert result["symbol_name"] == "Plain"
+    assert result["library_path"] == str(library)
+    assert result["changed"] is True
+    assert result["indexed"] is True
+    assert calls == [
+        (
+            (_PROJECT_LOCAL_LIB, str(library)),
+            {"project_dir": str(project_dir), "project": str(project_dir.resolve())},
+        )
+    ]
+    assert '(number "1"' in library.read_text(encoding="utf-8")
+
+
 # ---------------------------------------------------------------------------
 # Schematic tool
 # ---------------------------------------------------------------------------
+
+
+def test_schematic_tool_edits_symbol_stored_without_nickname(tmp_path):
+    """A bare cache key is editable as-is; the qualified spelling must not match."""
+    schematic = _copy(SCHEMATIC, tmp_path)
+    _make_bare_id_schematic(schematic, "PinEdit:Plain", "Plain")
+    before = schematic.read_bytes()
+
+    missing = asyncio.run(
+        _tools()["update_schematic_symbol_pin"](
+            schematic_path=str(schematic),
+            lib_id="PinEdit:Plain",
+            pins=[_edit("P$1", new_number="1")],
+        )
+    )
+
+    assert missing["error"].startswith(
+        "lib_id 'PinEdit:Plain' not found in the schematic's lib_symbols cache"
+    )
+    assert "'Plain'" in missing["error"]
+    assert schematic.read_bytes() == before
+    assert not Path(str(schematic) + ".bak").exists()
+
+    result = asyncio.run(
+        _tools()["update_schematic_symbol_pin"](
+            schematic_path=str(schematic),
+            lib_id="Plain",
+            pins=[_edit("P$1", new_number="1"), _edit("P$2", new_number="2")],
+        )
+    )
+
+    assert result["success"] is True
+    assert result["lib_id"] == "Plain"
+    assert result["changed"] is True
+    assert result["placements_updated"] == 2
+    after = _semantic_snapshot(schematic)
+    assert after["lib_symbols"]["Plain"]["Plain_1_1"] == (("1", "A"), ("2", "B"))
+    assert [placement["pins"] for placement in after["placements"]] == [
+        ("C0", "1", "2"),
+        ("C0", "1", "2"),
+    ]
+
+
+def test_schematic_tool_bare_name_does_not_match_qualified_cache(tmp_path):
+    """``R_Small`` must not resolve to the stored ``Device:R_Small``."""
+    schematic = _copy(SINGLE_PIN, tmp_path)
+    before = schematic.read_bytes()
+
+    result = asyncio.run(
+        _tools()["update_schematic_symbol_pin"](
+            schematic_path=str(schematic),
+            lib_id="R_Small",
+            pins=[_edit("1", new_number="2")],
+        )
+    )
+
+    assert result["error"].startswith(
+        "lib_id 'R_Small' not found in the schematic's lib_symbols cache"
+    )
+    assert "'Device:R_Small'" in result["error"]
+    assert schematic.read_bytes() == before
+    assert not Path(str(schematic) + ".bak").exists()
+    assert not Path(str(schematic) + ".tmp").exists()
+
+
+def test_schematic_tool_not_found_lists_at_most_five_ids(tmp_path):
+    schematic = _copy(SCHEMATIC, tmp_path)
+    _add_cached_symbols(schematic, [f"Zz:Extra{n}" for n in range(1, 6)])
+
+    result = asyncio.run(
+        _tools()["update_schematic_symbol_pin"](
+            schematic_path=str(schematic),
+            lib_id="Nope:Nope",
+            pins=[_edit("1", new_number="2")],
+        )
+    )
+
+    assert result == {
+        "error": (
+            "lib_id 'Nope:Nope' not found in the schematic's lib_symbols cache"
+            " (available: 'Zz:Extra1', 'Zz:Extra2', 'Zz:Extra3', 'Zz:Extra4', 'Zz:Extra5')"
+        )
+    }
 
 
 def test_schematic_tool_batch_updates_cache_and_placement_keys(tmp_path):
@@ -944,43 +1217,40 @@ def test_schematic_tool_rewrites_through_normal_save_path(tmp_path):
     assert after["sheet_instances"] == before["sheet_instances"]
 
 
-def test_schematic_tool_unit_scope_rewrites_only_that_unit(tmp_path):
+def test_schematic_tool_common_pin_updates_placements_of_every_unit(tmp_path):
+    """A common-unit pin edit rewrites the instance keys of every unit.
+
+    No unit selector exists any more, so the batch covers the whole cached
+    definition and all placements of the ``lib_id``.
+    """
     schematic = _copy(MULTI_UNIT, tmp_path)
-    before = _semantic_snapshot(schematic)
+    _add_common_pin(schematic)
     connections_before = _connection_count(schematic)
 
     result = asyncio.run(
         _tools()["update_schematic_symbol_pin"](
             schematic_path=str(schematic),
             lib_id="myLib:DUAL",
-            pins=[_edit("1", new_number="5")],
-            unit=1,
+            pins=[_edit("C0", new_number="C9")],
         )
     )
 
+    assert "unit" not in result
     assert result["occurrences"] == 1
     assert result["changed"] is True
-    assert result["placements_updated"] == 1
+    assert result["placements_updated"] == 2
+    assert result["affected_references"] == ["U1"]
     after = _semantic_snapshot(schematic)
-    assert after["lib_symbols"]["myLib:DUAL"]["DUAL_1_1"] == (("5", ""), ("2", ""))
+    assert after["lib_symbols"]["myLib:DUAL"]["DUAL_0_1"] == (("C9", "COM"),)
+    assert after["lib_symbols"]["myLib:DUAL"]["DUAL_1_1"] == (("1", ""), ("2", ""))
     assert after["lib_symbols"]["myLib:DUAL"]["DUAL_2_1"] == (("3", ""), ("4", ""))
     placements = [
-        placement["pins"]
+        (placement["unit"], placement["pins"])
         for placement in after["placements"]
         if placement["lib_id"] == "myLib:DUAL"
     ]
-    assert placements == [("5", "2"), ("3", "4")]
-    assert _placement_pin_numbers(schematic, "myLib:DUAL") == [{"5", "2"}, {"3", "4"}]
-    assert _connection_count(schematic) == connections_before == 20
-    # Only the unit-1 placement's pin keys changed.
-    old_dual = [
-        placement for placement in before["placements"] if placement["lib_id"] == "myLib:DUAL"
-    ]
-    new_dual = [
-        placement for placement in after["placements"] if placement["lib_id"] == "myLib:DUAL"
-    ]
-    assert old_dual[0]["pins"] == ("1", "2") and new_dual[0]["pins"] == ("5", "2")
-    assert old_dual[1]["pins"] == new_dual[1]["pins"] == ("3", "4")
+    assert placements == [("1", ("1", "C9", "2")), ("2", ("3", "C9", "4"))]
+    assert _connection_count(schematic) == connections_before
 
 
 def test_schematic_tool_common_pin_updates_all_placements(tmp_path):
@@ -992,7 +1262,6 @@ def test_schematic_tool_common_pin_updates_all_placements(tmp_path):
             schematic_path=str(schematic),
             lib_id="PinEdit:Plain",
             pins=[_edit("C0", new_number="C1")],
-            unit=0,
         )
     )
 
@@ -1021,7 +1290,6 @@ def test_schematic_tool_cross_unit_number_warning(tmp_path):
             schematic_path=str(schematic),
             lib_id="myLib:DUAL",
             pins=[_edit("1", new_number="3")],
-            unit=1,
         )
     )
 
@@ -1138,7 +1406,10 @@ def test_schematic_tool_unknown_lib_id_leaves_file_untouched(tmp_path):
     )
 
     assert result == {
-        "error": "lib_id 'Missing:Symbol' not found in the schematic's lib_symbols cache"
+        "error": (
+            "lib_id 'Missing:Symbol' not found in the schematic's lib_symbols cache"
+            " (available: 'PinEdit:Plain', 'Device:C')"
+        )
     }
     assert schematic.read_bytes() == before
     assert not Path(str(schematic) + ".bak").exists()
@@ -1244,3 +1515,45 @@ def test_schematic_tool_validates_before_writing(tmp_path, pins, message):
     assert result == {"error": message}
     assert schematic.read_bytes() == before
     assert not Path(str(schematic) + ".bak").exists()
+
+
+# ---------------------------------------------------------------------------
+# Public tool schema
+# ---------------------------------------------------------------------------
+
+
+def test_tool_schemas_pin_the_public_surface():
+    """The MCP schema must keep the round-8/9 signatures (no ``unit``).
+
+    Calling the functions directly would still fail if someone re-added
+    ``unit`` or gave ``project_dir`` a default; the advertised schema is what
+    the plugin exposes to the model, so it is asserted here.
+    """
+    from fastmcp import FastMCP
+
+    from kcaa.tools.symbol_edit_tools import register_symbol_edit_tools
+
+    mcp = FastMCP("test")
+    register_symbol_edit_tools(mcp)
+
+    async def _parameters():
+        return {
+            name: (await mcp.get_tool(name)).parameters
+            for name in ("update_library_symbol_pin", "update_schematic_symbol_pin")
+        }
+
+    schemas = asyncio.run(_parameters())
+
+    library = schemas["update_library_symbol_pin"]
+    assert sorted(library["required"]) == ["lib_id", "pins", "project_dir"]
+    assert "unit" not in library["properties"]
+    assert "ctx" not in library["properties"]
+    assert library["properties"]["pins"]["type"] == "array"
+    assert library["properties"]["pins"]["items"]["type"] == "object"
+
+    schematic = schemas["update_schematic_symbol_pin"]
+    assert sorted(schematic["required"]) == ["lib_id", "pins", "schematic_path"]
+    assert "unit" not in schematic["properties"]
+    assert "ctx" not in schematic["properties"]
+    assert schematic["properties"]["pins"]["type"] == "array"
+    assert schematic["properties"]["pins"]["items"]["type"] == "object"
