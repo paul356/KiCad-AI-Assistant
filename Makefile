@@ -1,4 +1,6 @@
-.PHONY: help install test lint format clean build run dist-plugin
+.PHONY: help install test lint format clean build run dist-plugin dist-pcm
+
+PYTHON ?= python3
 
 help:
 	@echo "Available commands:"
@@ -11,6 +13,7 @@ help:
 	@echo " 	build         		Build package"
 	@echo " 	run           		Start the KiCad MCP server"
 	@echo " 	dist-plugin   		Build installable KiCad plugin zip"
+	@echo " 	dist-pcm      		Build KiCad Plugin and Content Manager zip"
 
 install:
 	uv sync --group dev
@@ -49,8 +52,8 @@ run:
 	uv run python main.py
 
 # Build an installable KiCad plugin zip.
-# KiCad discovers plugins by looking for a directory named after the plugin
-# inside its scripting/plugins/ folder. The zip contains:
+# KiCad discovers manual plugins by looking for a directory named after the
+# plugin inside its scripting/plugins/ folder. The zip contains:
 #   kicad_ai_assistant/          <- KiCad plugin directory
 #     __init__.py                <- entry point (KiCadAIPlugin)
 #     context_bridge.py
@@ -59,26 +62,22 @@ run:
 #     settings.py
 #     ui/
 #     README.md
-# Install: unzip into ~/.local/share/kicad/<ver>/scripting/plugins/
+#     VERSION                    <- generated from pyproject.toml
+# Install: unzip into <documents>/kicad/<ver>/scripting/plugins/
 #          then run from the plugin dir:
 #            ./setup_plugin.sh [<path>]
 #            (no argument installs kcaa from PyPI)
 PLUGIN_ZIP := dist/kicad_ai_assistant.zip
+PCM_ZIP := dist/kicad_ai_assistant_pcm.zip
 PLUGIN_SRC := kicad_plugin
 
 dist-plugin:
-	@mkdir -p dist
-	@rm -f $(PLUGIN_ZIP)
-	@echo "Building $(PLUGIN_ZIP)..."
-	@rm -rf dist/_stage
-	@mkdir -p dist/_stage
-	@cp -r $(PLUGIN_SRC) dist/_stage/kicad_ai_assistant
-	@find dist/_stage -type d -name __pycache__ -exec rm -rf {} +
-	@find dist/_stage -type f -name "*.pyc" -delete
-	@echo "Extracting version from pyproject.toml..."
-	@grep -m1 '^version = ' pyproject.toml | sed 's/version = "\(.*\)"/\1/' > dist/_stage/kicad_ai_assistant/VERSION
-	@echo "Version: $$(cat dist/_stage/kicad_ai_assistant/VERSION)"
-	@cd dist/_stage && zip -r ../$(notdir $(PLUGIN_ZIP)) kicad_ai_assistant
-	@rm -rf dist/_stage
-	@echo "Created $(PLUGIN_ZIP)"
+	@$(PYTHON) scripts/build_plugin_zip.py legacy --output $(PLUGIN_ZIP) --source $(PLUGIN_SRC)
+
+# Build a KiCad Plugin and Content Manager archive:
+#   metadata.json
+#   plugins/kicad_ai_assistant/  <- same plugin tree and VERSION file
+# Install with Preferences -> Plugin and Content Manager -> Install from File...
+dist-pcm:
+	@$(PYTHON) scripts/build_plugin_zip.py pcm --output $(PCM_ZIP) --source $(PLUGIN_SRC)
 

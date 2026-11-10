@@ -22,44 +22,55 @@ kcaa MCP server (subprocess, streamable-http on localhost)
 
 ## Installation
 
-### 1. Copy the plugin into KiCad's plugin directory
+The plugin is a folder named `kicad_ai_assistant` inside KiCad's user plugin
+directory. Release archives are already rooted at that name; renaming the
+folder makes KiCad ignore the plugin. `10.0` below is your KiCad
+`<major>.<minor>` version.
 
-**Linux:**
-```bash
-KICAD_PLUGIN_DIR=~/.local/share/kicad/10.0/scripting/plugins
-mkdir -p "$KICAD_PLUGIN_DIR"
-cp -r kicad_plugin "$KICAD_PLUGIN_DIR/kicad_ai_plugin"
-```
+| OS | Manual install (unzip `kicad_ai_assistant.zip` here) | PCM install (`Install from File...`) |
+|----|-----------------------------------------------------|--------------------------------------|
+| Linux | `~/.local/share/kicad/10.0/scripting/plugins` | `~/.local/share/kicad/10.0/3rdparty/plugins` |
+| macOS | `~/Documents/KiCad/10.0/scripting/plugins` | `~/Documents/KiCad/10.0/3rdparty/plugins` |
+| Windows | `%USERPROFILE%\Documents\KiCad\10.0\scripting\plugins` | `%USERPROFILE%\Documents\KiCad\10.0\3rdparty\plugins` |
 
-**macOS:**
-```bash
-KICAD_PLUGIN_DIR=~/Library/Preferences/kicad/10.0/scripting/plugins
-mkdir -p "$KICAD_PLUGIN_DIR"
-cp -r kicad_plugin "$KICAD_PLUGIN_DIR/kicad_ai_plugin"
-```
+`KICAD_DOCUMENTS_HOME` overrides the documents directory on every OS.
 
-**Windows (PowerShell):**
-```powershell
-$dir = "$env:APPDATA\kicad\10.0\scripting\plugins\kicad_ai_plugin"
-New-Item -ItemType Directory -Force -Path $dir
-Copy-Item -Recurse kicad_plugin\* $dir
-```
+### 1. Install the plugin
+
+**Manual install:** unzip `kicad_ai_assistant.zip` into the manual directory for
+your OS. It creates `<manual>/kicad_ai_assistant/`; keep that name. Do not
+hand-unzip into `3rdparty/plugins` — that directory belongs to the Plugin and
+Content Manager, and a manually copied folder there is not a PCM install.
+
+**PCM install:** use `kicad_ai_assistant_pcm.zip`, not the manual archive. Open
+**Preferences → Plugin and Content Manager → Install from File…** and select it.
+KiCad extracts the package to
+`<3rdparty>/plugins/com_github_paul356_kicad-ai-assistant/`.
 
 ### 2. Run the setup script
 
-The setup script creates a virtual environment, installs `kcaa` from PyPI, and downloads the freerouting JAR.
+The script creates `.venv`, installs `kcaa` and **PyMuPDF** (imported as
+`fitz`, used for PDF import), and downloads the freerouting JAR. `uv` is
+required; if it is missing the script prints an error and exits non-zero.
+Install it from <https://docs.astral.sh/uv/getting-started/installation/>.
+
+Run it from the installed plugin directory (the folder containing this README):
 
 **Linux/macOS:**
 ```bash
-cd "$KICAD_PLUGIN_DIR/kicad_ai_plugin"
+cd "<installed plugin directory>"
 ./setup_plugin.sh
 ```
 
 **Windows:**
 ```powershell
-cd "$env:APPDATA\kicad\10.0\scripting\plugins\kicad_ai_plugin"
+cd "<installed plugin directory>"
 .\setup_plugin.bat
 ```
+
+For a manual install the directory is
+`...\scripting\plugins\kicad_ai_assistant`; for a PCM install it is
+`...\3rdparty\plugins\com_github_paul356_kicad-ai-assistant`.
 
 #### Installing an unreleased build
 
@@ -81,7 +92,14 @@ The local build is reinstalled over any equal version, and no `VERSION` file is 
 PyPI again; if that release has the same version as the local build, delete `.venv` first to force the
 PyPI copy back.
 
-### 3. Open KiCad
+### 3. Enable the KiCad API
+
+**Preferences → Plugins → Enable KiCad API.** The panel uses this IPC socket for
+**Reload PCB** and the `update_pcb_from_schematic` tool; without it those two
+fail, while file-based editing keeps working. PCM shows this prompt after
+installing a plugin package; a manual install does not.
+
+### 4. Open KiCad
 
 1. Open KiCad and load your project
 2. In the PCB editor or schematic editor, go to **Tools → External Plugins → Refresh Plugins**

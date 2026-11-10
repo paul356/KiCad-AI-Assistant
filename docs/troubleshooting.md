@@ -2,6 +2,26 @@
 
 This guide helps you troubleshoot common issues with the KiCad MCP Server.
 
+## Plugin Installation Issues
+
+### Setup Script Fails and the Window Closes
+
+**Symptoms:**
+- Double-clicking `setup_plugin.bat` opens a window that closes before the error can be read.
+- The plugin appears in KiCad but the panel cannot find `.venv`.
+- `setup_plugin.sh` or `setup_plugin.ps1` exits without installing `kcaa`.
+
+**Solution:**
+
+1. Run the script from a terminal so its output stays visible:
+   - Linux/macOS: `cd` into the plugin directory and run `bash -x ./setup_plugin.sh`
+   - Windows: `cd` into the plugin directory and run `powershell -ExecutionPolicy Bypass -File .\setup_plugin.ps1`
+2. Check the exit code (`echo $?` on Linux/macOS, `echo %ERRORLEVEL%` in Command Prompt). A non-zero exit means the install failed; the last message above it names the failing step.
+3. Common causes:
+   - `uv` is not on `PATH` — install it from <https://docs.astral.sh/uv/getting-started/installation/>.
+   - `VERSION` is missing when installing from PyPI — use the release zip, or pass a local build to the script.
+   - The download of `kcaa` or the freerouting JAR failed — check the network/proxy and re-run.
+
 ## Server Setup Issues
 
 ### Server Not Starting

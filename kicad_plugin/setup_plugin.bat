@@ -4,3 +4,11 @@
 :: Usage: setup_plugin.bat [<path>]
 
 powershell.exe -ExecutionPolicy Bypass -File "%~dp0setup_plugin.ps1" %*
+if errorlevel 1 (
+    echo.
+    echo Setup failed with exit code %ERRORLEVEL%.
+    echo Fix the error shown above and run this script again.
+    pause
+    exit /b %ERRORLEVEL%
+)
+exit /b %ERRORLEVEL%
