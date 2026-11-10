@@ -2,8 +2,10 @@
 
 PyYAML is a runtime dependency but not a declared dev dependency, and this
 repository does not want to add one just for a test. The workflows are
-therefore scanned with a targeted regex for ``run: |`` blocks (plus
-single-line ``run:`` commands), dedented, and checked with ``bash -n``.
+therefore scanned with a targeted regex for YAML block scalar ``run:``
+forms (``|``/``>`` with optional chomping or indentation indicators, including
+a trailing comment) plus single-line ``run:`` commands, dedented, and checked
+with ``bash -n``.
 """
 
 from __future__ import annotations
@@ -16,12 +18,10 @@ import subprocess
 import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
-_WORKFLOWS = [
-    _REPO_ROOT / ".github" / "workflows" / "ci.yml",
-    _REPO_ROOT / ".github" / "workflows" / "publish.yml",
-]
-_BLOCK_START = re.compile(r"^(?P<indent>\s*)run:\s*\|\s*$")
-_INLINE_RUN = re.compile(r"^\s*run:\s+(?P<command>\S.*)$")
+_WORKFLOWS = sorted((_REPO_ROOT / ".github" / "workflows").glob("*.yml"))
+_RUN_KEY = r"^(?P<indent>\s*)(?:-\s+)?run:"
+_BLOCK_START = re.compile(_RUN_KEY + r"\s*[|>](?:[+-]?\d*|\d*[+-]?)?\s*(?:#.*)?$")
+_INLINE_RUN = re.compile(_RUN_KEY + r"\s+(?P<command>\S.*)$")
 
 
 def _extract_run_blocks(workflow: Path) -> list[str]:
@@ -58,6 +58,44 @@ def _extract_run_blocks(workflow: Path) -> list[str]:
         index += 1
 
     return blocks
+
+
+def test_workflow_discovery_covers_every_workflow_file() -> None:
+    assert len(_WORKFLOWS) == 4
+    assert {path.name for path in _WORKFLOWS} == {
+        "build-plugin.yml",
+        "ci.yml",
+        "enforce-develop-pr.yml",
+        "publish.yml",
+    }
+
+
+def test_extractor_supports_yaml_block_scalar_forms(tmp_path: Path) -> None:
+    workflow = tmp_path / "workflow.yml"
+    workflow.write_text(
+        "steps:\n"
+        "  - run: |\n"
+        "      echo pipe\n"
+        "  - run: >\n"
+        "      echo folded\n"
+        "  - run: |-\n"
+        "      echo strip\n"
+        "  - run: |2\n"
+        "        echo indented\n"
+        "  - run: | # comment\n"
+        "      echo commented\n"
+        "  - run: echo inline\n",
+        encoding="utf-8",
+    )
+
+    blocks = _extract_run_blocks(workflow)
+    assert len(blocks) == 6
+    assert "echo pipe" in blocks[0]
+    assert "echo folded" in blocks[1]
+    assert "echo strip" in blocks[2]
+    assert "echo indented" in blocks[3]
+    assert "echo commented" in blocks[4]
+    assert "echo inline" in blocks[5]
 
 
 @pytest.mark.parametrize("workflow", _WORKFLOWS, ids=lambda path: path.name)

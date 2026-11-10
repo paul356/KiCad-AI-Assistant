@@ -96,6 +96,13 @@ def test_pcm_archive_layout(pcm_zip: Path, project: dict) -> None:
 
 
 def test_pcm_metadata_contract(pcm_zip: Path, project: dict) -> None:
+    """Validate package/version metadata and keep_on_update patterns.
+
+    KiCad evaluates these patterns with wxRegEx (POSIX ERE) against the path
+    relative to the 3rd-party root with separators normalised to "/". This
+    test approximates that with Python re, so syntax valid in one engine but
+    not the other is a known limit.
+    """
     metadata = json.loads(_member(pcm_zip, "metadata.json"))
 
     assert set(metadata) == _PACKAGE_KEYS
@@ -112,11 +119,16 @@ def test_pcm_metadata_contract(pcm_zip: Path, project: dict) -> None:
     assert version["version"] == project["version"]
     assert version["status"] == "stable"
     assert version["kicad_version"] == "10.0"
-    assert any(".venv" in pattern for pattern in version["keep_on_update"])
-    assert any(
-        "freerouting" in pattern and pattern.endswith(".jar")
-        for pattern in version["keep_on_update"]
-    )
+    patterns = version["keep_on_update"]
+    clean_identifier = builder.pcm_package_dirname(metadata["identifier"])
+    venv_pattern = next(pattern for pattern in patterns if ".venv" in pattern)
+    jar_pattern = next(pattern for pattern in patterns if "freerouting" in pattern)
+    for prefix in ("", "/"):
+        assert re.search(venv_pattern, f"{prefix}plugins/{clean_identifier}/.venv/bin/python")
+        assert re.search(jar_pattern, f"{prefix}plugins/{clean_identifier}/freerouting-2.2.3.jar")
+    non_matching = f"plugins/{clean_identifier}/__init__.py"
+    assert not re.search(venv_pattern, non_matching)
+    assert not re.search(jar_pattern, non_matching)
 
     # KiCad PCM replaces dots in the identifier when creating the install folder.
     assert builder.pcm_package_dirname(metadata["identifier"]) == (

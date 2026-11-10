@@ -29,11 +29,11 @@ test:
 	@:
 
 lint:
-	uv run ruff check kcaa/ tests/
+	uv run ruff check kcaa/ tests/ scripts/
 	uv run mypy kcaa/
 
 format:
-	uv run ruff format kcaa/ tests/
+	uv run ruff format kcaa/ tests/ scripts/
 
 clean:
 	rm -rf dist/
