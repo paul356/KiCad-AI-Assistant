@@ -75,9 +75,10 @@ no guessing or fallback lookup. `pins` is a non-empty list (max 256) of
 match the pre-edit state, so chain/cycle renames are applied simultaneously and
 validated against the final state. A pin number is the identity of a physical
 connection, so a rename hits every definition that carries it. Numbers stay
-unique where they were unique: a batch that would give two pins the same
-number is rejected, while duplicates that already existed (stacked pins,
-KiCad's duplicate-pin jumpers) stay legal and can be renumbered together.
+unique where they were unique: a batch that would give two pins of the same
+part the same number is rejected, while duplicates that already existed
+(stacked pins, KiCad's duplicate-pin jumpers) stay legal and can be
+renumbered together.
 Pin names are not required to be unique and may be empty. A new number that
 duplicates a pin KiCad resolves separately (another part of a multi-part
 symbol) is allowed with a warning; a duplicate inside the same part is
