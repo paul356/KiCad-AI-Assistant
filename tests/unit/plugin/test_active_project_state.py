@@ -124,6 +124,20 @@ class TestProjectTickTransitions:
         ticks, root, publish = _project_state_for_tick(self.PROJECT, ticks, None)
         assert (ticks, root, publish) == (2, None, True)
 
+    def test_four_none_ticks_publish_null_only_once(self):
+        ticks = 0
+        published = []
+        for _ in range(4):
+            ticks, _root, publish = _project_state_for_tick(self.PROJECT, ticks, None)
+            published.append(publish)
+        assert published == [False, True, False, False]
+
+    def test_no_active_project_never_publishes_null(self):
+        ticks = 0
+        for _ in range(5):
+            ticks, root, publish = _project_state_for_tick(None, ticks, None)
+            assert (root, publish) == (None, False)
+
     def test_project_then_one_none_tick_then_project_does_not_publish_null(self):
         ticks, _root, publish = _project_state_for_tick(self.PROJECT, 0, None)
         assert publish is False

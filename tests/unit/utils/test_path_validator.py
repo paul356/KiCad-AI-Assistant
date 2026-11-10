@@ -15,6 +15,7 @@ import tempfile
 import pytest
 
 from kcaa.utils.config import config
+import kcaa.utils.path_validator as path_validator_mod
 from kcaa.utils.path_validator import (
     PathValidationError,
     PathValidator,
@@ -256,6 +257,108 @@ class TestStateFile:
 
         os.unlink(state_file)
         assert validator.validate_path(str(schematic), must_exist=True) == str(schematic)
+
+    def test_state_file_pointing_at_regular_file_keeps_previous_root(self, tmp_path, monkeypatch):
+        state_file = tmp_path / "active_project.json"
+        project = tmp_path / "project"
+        project.mkdir()
+        schematic = project / "board.kicad_sch"
+        schematic.write_text("", encoding="utf-8")
+        project_file = project / "board.kicad_pro"
+        project_file.write_text("{}", encoding="utf-8")
+
+        _write_state(str(state_file), str(project))
+        validator = _make_state_validator(monkeypatch, str(state_file))
+        assert validator.validate_path(str(schematic), must_exist=True) == str(schematic)
+
+        # The published contract is a directory; a .kicad_pro file is refused.
+        _write_state(str(state_file), str(project_file))
+        assert validator.validate_path(str(schematic), must_exist=True) == os.path.realpath(
+            schematic
+        )
+        assert validator._project_root == os.path.realpath(project)
+
+    def test_state_file_pointing_at_regular_file_with_no_previous_root(self, tmp_path, monkeypatch):
+        state_file = tmp_path / "active_project.json"
+        project = tmp_path / "project"
+        project.mkdir()
+        schematic = project / "board.kicad_sch"
+        schematic.write_text("", encoding="utf-8")
+        project_file = project / "board.kicad_pro"
+        project_file.write_text("{}", encoding="utf-8")
+
+        _write_state(str(state_file), str(project_file))
+        validator = _make_state_validator(monkeypatch, str(state_file))
+
+        assert validator._project_root is None
+        with pytest.raises(PathValidationError):
+            validator.validate_path(str(schematic))
+        # KiCad directory matching still works.
+        assert validator.validate_path(_inside_kicad_user_dir("x.kicad_pcb"))
+
+    def test_realpath_failure_after_state_read_never_escapes(self, tmp_path, monkeypatch):
+        """A filesystem change during refresh keeps the root; validate_path does not raise."""
+        state_file = tmp_path / "active_project.json"
+        project_a = tmp_path / "a"
+        project_b = tmp_path / "b"
+        project_a.mkdir()
+        project_b.mkdir()
+        file_a = project_a / "a.kicad_sch"
+        file_a.write_text("", encoding="utf-8")
+
+        _write_state(str(state_file), str(project_a))
+        validator = _make_state_validator(monkeypatch, str(state_file))
+        assert validator.validate_path(str(file_a), must_exist=True) == str(file_a)
+        previous = validator._project_root
+
+        _write_state(str(state_file), str(project_b))
+
+        def broken_normalize(_path):
+            raise OSError("parent directory vanished mid-refresh")
+
+        monkeypatch.setattr(path_validator_mod, "_normalize", broken_normalize)
+
+        assert validator.validate_path(str(file_a), must_exist=True) == str(file_a)
+        assert validator._project_root == previous
+
+    def test_no_second_resolution_when_installing_state_root(self, tmp_path, monkeypatch):
+        """The state value is resolved once; a failure while installing it is guarded.
+
+        Under the old two-realpath design the second resolution raised out of
+        validate_path when the filesystem changed between the calls.
+        """
+        state_file = tmp_path / "active_project.json"
+        project_a = tmp_path / "a"
+        project_b = tmp_path / "b"
+        project_a.mkdir()
+        project_b.mkdir()
+        file_a = project_a / "a.kicad_sch"
+        file_a.write_text("", encoding="utf-8")
+
+        _write_state(str(state_file), str(project_a))
+        validator = _make_state_validator(monkeypatch, str(state_file))
+        assert validator.validate_path(str(file_a), must_exist=True) == str(file_a)
+        previous = validator._project_root
+
+        _write_state(str(state_file), str(project_b))
+        calls = {"n": 0}
+        real_normalize = path_validator_mod._normalize
+
+        def normalize_that_fails_on_second_call(path):
+            calls["n"] += 1
+            if calls["n"] > 1:
+                raise OSError("second resolution failed")
+            return real_normalize(path)
+
+        def failing_install(_self, _normalized):
+            raise OSError("filesystem changed while installing the root")
+
+        monkeypatch.setattr(path_validator_mod, "_normalize", normalize_that_fails_on_second_call)
+        monkeypatch.setattr(PathValidator, "_install_root", failing_install)
+
+        assert validator.validate_path(str(file_a), must_exist=True) == str(file_a)
+        assert validator._project_root == previous
+        assert calls["n"] == 1
 
 
 class TestContainment:

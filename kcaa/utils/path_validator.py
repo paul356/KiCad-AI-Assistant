@@ -117,8 +117,20 @@ class PathValidator:
             PathValidationError: If *path* is an existing regular file.
         """
         normalized = _normalize(path) if path else None
+        self._install_root(normalized)
+
+    def _install_root(self, normalized: str | None) -> None:
+        """Install an already-normalized project root.
+
+        The caller resolves the path (``realpath``) exactly once: resolving it
+        again here would add a filesystem round-trip that can fail between the
+        state-file read and the install, and there is nothing left to resolve.
+
+        Raises:
+            PathValidationError: If *normalized* is an existing regular file.
+        """
         if normalized and os.path.isfile(normalized):
-            raise PathValidationError(f"Project root must be a directory, not a file: {path}")
+            raise PathValidationError(f"Project root must be a directory, not a file: {normalized}")
         with self._lock:
             if normalized == self._project_root:
                 return
@@ -189,8 +201,8 @@ class PathValidator:
             return
         log.debug("Project state file %s: project_root=%r", state_file, root)
         try:
-            self.set_project_root(root)
-        except PathValidationError as exc:
+            self._install_root(normalized)
+        except (PathValidationError, OSError, ValueError) as exc:
             log.debug(
                 "Ignoring unusable project root from %s (%s); keeping %r",
                 state_file,
