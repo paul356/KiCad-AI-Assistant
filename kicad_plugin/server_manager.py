@@ -22,6 +22,10 @@ _STARTUP_TIMEOUT_S = 30
 _HEALTH_POLL_INTERVAL_S = 0.3
 _HEALTH_PATH = "/mcp"  # FastMCP's default health-check endpoint
 
+# File under the plugin data directory where the panel publishes the open
+# project root; the server re-reads it on every path validation.
+ACTIVE_PROJECT_STATE_FILENAME = "active_project.json"
+
 
 def _find_free_port() -> int:
     """Bind to port 0 and immediately release to get an OS-assigned free port."""
@@ -257,6 +261,12 @@ class ServerManager:
         env["MCP_PORT"] = str(port)
         env["MCP_HOST"] = "127.0.0.1"  # never listen on 0.0.0.0
         env["KICAD_MCP_PROFILE"] = "plugin"
+        # The plugin publishes the open project root to this file (written by
+        # the panel); the server refreshes its PathValidator project root from
+        # it on every validation.
+        env["KCAA_PROJECT_STATE_FILE"] = os.path.join(
+            self._settings.config_dir, ACTIVE_PROJECT_STATE_FILENAME
+        )
         env["KCAA_SKILLS_DIR"] = os.path.join(os.path.dirname(os.path.abspath(__file__)), "skills")
         # The model's image capability: image-bearing tool results are
         # gated on this server-side (model_supports_vision reads it), so

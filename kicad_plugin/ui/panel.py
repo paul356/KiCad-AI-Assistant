@@ -16,13 +16,102 @@ import datetime
 import json
 import logging
 import os
+import tempfile
 import threading
+import time
 from typing import Any
 
+from ..server_manager import ACTIVE_PROJECT_STATE_FILENAME
 from .colors import ERR_HEX, WARN_HEX
 from .stream_events import apply_stream_event, make_ai_entry
 
 log = logging.getLogger(__name__)
+
+# Windows: the server may hold the state file open for the instant it reads
+# it, so os.replace can transiently fail with PermissionError. Retry briefly
+# before giving up (the caller logs and keeps serving without the switch).
+_REPLACE_ATTEMPTS = 5
+_REPLACE_RETRY_DELAY_S = 0.05
+
+# Consecutive empty project probes before the published root is cleared. Two
+# ticks debounce the empty window during a project switch.
+_PROJECT_GONE_TICKS = 2
+
+
+def _project_root_for_publish(active_project: str | None) -> str | None:
+    """Directory to publish for *active_project*.
+
+    ``active_project`` is the absolute path of the open ``.kicad_pro`` **file**
+    (panel probe, context bridge and session store all use the file path); the
+    trust root is its parent directory. ``None`` publishes ``null``.
+    """
+    return os.path.dirname(active_project) if active_project else None
+
+
+def _project_state_for_tick(
+    active_project: str | None, none_ticks: int, probed_project: str | None
+) -> tuple[int, str | None, bool]:
+    """Decide what one project-watch tick publishes.
+
+    Returns ``(none_ticks, root_to_publish, should_publish)``. A detected
+    switch publishes nothing here — the caller also reloads the session and
+    publishes after updating ``_active_project``.
+
+    A probe that is empty two ticks in a row means the project was closed:
+    publish ``null`` (the panel keeps the last project for session stamps).
+    When a project reappears after that, republish its root.
+    """
+    if probed_project is None:
+        none_ticks += 1
+        if none_ticks == _PROJECT_GONE_TICKS and active_project is not None:
+            return none_ticks, None, True
+        return none_ticks, None, False
+
+    if probed_project == active_project:
+        # Republish only if the previous tick(s) cleared the published root.
+        if none_ticks >= _PROJECT_GONE_TICKS:
+            return 0, _project_root_for_publish(active_project), True
+        return 0, None, False
+
+    return 0, None, False
+
+
+def _write_active_project_state(config_dir: str, project_root: str | None) -> str:
+    """Atomically publish the open project root for the MCP server.
+
+    Writes ``<config_dir>/active_project.json`` with
+    ``{"project_root": "<abs path>"}`` (or ``null`` when no project is open)
+    through a temp file in the same directory followed by ``os.replace``, so
+    the server never observes a partially written file. ``os.replace`` is
+    retried briefly on ``PermissionError`` (a reader may hold the file open on
+    Windows). The server re-reads the file on each path validation and
+    re-points its trust root in place.
+
+    Returns the state-file path.
+    """
+    os.makedirs(config_dir, exist_ok=True)
+    path = os.path.join(config_dir, ACTIVE_PROJECT_STATE_FILENAME)
+    fd, tmp_path = tempfile.mkstemp(prefix=".active_project_", suffix=".json", dir=config_dir)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump({"project_root": project_root}, f)
+            f.write("\n")
+        for attempt in range(_REPLACE_ATTEMPTS):
+            try:
+                os.replace(tmp_path, path)
+                break
+            except PermissionError:
+                if attempt == _REPLACE_ATTEMPTS - 1:
+                    raise
+                time.sleep(_REPLACE_RETRY_DELAY_S)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+    return path
+
 
 try:
     import wx
@@ -264,6 +353,7 @@ if _WX_AVAILABLE:
             # switching projects can re-offer that project's saved sessions
             # (same flow as startup auto-restore). Started by _init_llm_client.
             self._active_project: str | None = None
+            self._project_none_ticks = 0
             self._project_watch_timer = wx.Timer(self)
             # Version-based dirty tracking: _conv_version bumps on every
             # conversation mutation; saves skip the write when the last
@@ -741,6 +831,8 @@ if _WX_AVAILABLE:
                             project,
                         )
                         self._active_project = project
+                        self._project_none_ticks = 0
+                        self._publish_active_project()
                         self._autoload_session(prompt_if_missing=True)
                         self._request_footprint_sync(project)
                 except Exception:
@@ -3218,6 +3310,21 @@ if _WX_AVAILABLE:
                 log.debug("_collect_active_project failed", exc_info=True)
             return None
 
+        def _publish_project_state(self, project_root: str | None) -> None:
+            """Write the published project root, never breaking the panel."""
+            try:
+                _write_active_project_state(self._settings.config_dir, project_root)
+            except OSError as e:
+                log.warning("Could not publish active project state: %s", e)
+
+        def _publish_active_project(self) -> None:
+            """Publish the active project's directory for the path validator.
+
+            ``_active_project`` is the ``.kicad_pro`` file; the trust root is
+            its parent directory. No project publishes ``null``.
+            """
+            self._publish_project_state(_project_root_for_publish(self._active_project))
+
         def _start_project_watch(self) -> None:
             """Start polling for KiCad project switches (1 s interval).
 
@@ -3228,6 +3335,8 @@ if _WX_AVAILABLE:
             if not self._project_watch_timer:
                 return
             self._active_project = self._collect_active_project()
+            self._project_none_ticks = 0
+            self._publish_active_project()
             log.info(
                 "project watch started: active=%r",
                 self._active_project,
@@ -3246,9 +3355,10 @@ if _WX_AVAILABLE:
             auto-restores the right session on first display.
 
             A switch is acted on as soon as the probe returns a different
-            non-None project.  None readings (mid-switch GetBoard() empty,
-            window-title fallback missing) are deliberately ignored so the
-            last valid project is never downgraded.
+            non-None project.  A single None reading (mid-switch GetBoard()
+            empty, window-title fallback missing) is ignored; two in a row
+            publish ``null`` so the server stops trusting a closed project,
+            while ``_active_project`` is kept for session stamps.
             """
             if not self.IsShown():
                 # Panel dismissed: stay silent — no session dialogs from a
@@ -3263,17 +3373,28 @@ if _WX_AVAILABLE:
                 )
                 return
             project = self._collect_active_project()
+            ticks, publish_root, should_publish = _project_state_for_tick(
+                self._active_project, self._project_none_ticks, project
+            )
+            self._project_none_ticks = ticks
             if project is None:
                 # Probing failed (GetBoard empty / no window-title match) —
-                # e.g. mid-project-switch.  Never downgrade a known project
-                # to None: keep the last valid value so session saves keep
-                # their project stamp.
+                # e.g. mid-project-switch.  A single empty probe is ignored so
+                # session saves keep their project stamp (issue #108); two in
+                # a row mean the project was closed, so the published trust
+                # root is cleared while _active_project is kept.
+                if should_publish:
+                    log.info("project watch: no project open; clearing published root")
+                    self._publish_project_state(None)
                 log.debug(
                     "project watch: probe returned None — keeping active=%r",
                     self._active_project,
                 )
                 return
             if project == self._active_project:
+                # Reopened after the published root was cleared.
+                if should_publish:
+                    self._publish_project_state(publish_root)
                 return
             log.info(
                 "Project switch detected: %s -> %s; switching session",
@@ -3281,6 +3402,7 @@ if _WX_AVAILABLE:
                 project,
             )
             self._active_project = project
+            self._publish_active_project()
             # Keep this panel open and re-run the startup restore flow for
             # the new project: matching current.json is restored in place,
             # otherwise the new project's sessions are offered.  Never

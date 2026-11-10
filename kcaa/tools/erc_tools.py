@@ -79,7 +79,10 @@ def register_erc_tools(mcp: FastMCP) -> None:
         full sheet hierarchy from *schematic_path*.
 
         Args:
-            schematic_path: Absolute path to the root .kicad_sch file.
+            schematic_path: Absolute path to the root .kicad_sch file. It must
+                resolve inside the open project or a KiCad directory
+                (PathValidator roots); the server working directory is not
+                trusted.
             severity: Which violations to report:
                 "default" (errors + warnings), "all" (also excluded),
                 "error" (errors only), or "warning" (warnings only).
