@@ -296,7 +296,10 @@ class TestStateFile:
         # KiCad directory matching still works.
         assert validator.validate_path(_inside_kicad_user_dir("x.kicad_pcb"))
 
-    def test_realpath_failure_after_state_read_never_escapes(self, tmp_path, monkeypatch):
+    @pytest.mark.parametrize("error_cls", [OSError, ValueError], ids=["oserror", "valueerror"])
+    def test_realpath_failure_after_state_read_never_escapes(
+        self, tmp_path, monkeypatch, error_cls
+    ):
         """A filesystem change during refresh keeps the root; validate_path does not raise."""
         state_file = tmp_path / "active_project.json"
         project_a = tmp_path / "a"
@@ -314,14 +317,17 @@ class TestStateFile:
         _write_state(str(state_file), str(project_b))
 
         def broken_normalize(_path):
-            raise OSError("parent directory vanished mid-refresh")
+            raise error_cls("parent directory vanished mid-refresh")
 
         monkeypatch.setattr(path_validator_mod, "_normalize", broken_normalize)
 
         assert validator.validate_path(str(file_a), must_exist=True) == str(file_a)
         assert validator._project_root == previous
 
-    def test_no_second_resolution_when_installing_state_root(self, tmp_path, monkeypatch):
+    @pytest.mark.parametrize("error_cls", [OSError, ValueError], ids=["oserror", "valueerror"])
+    def test_no_second_resolution_when_installing_state_root(
+        self, tmp_path, monkeypatch, error_cls
+    ):
         """The state value is resolved once; a failure while installing it is guarded.
 
         Under the old two-realpath design the second resolution raised out of
@@ -347,11 +353,11 @@ class TestStateFile:
         def normalize_that_fails_on_second_call(path):
             calls["n"] += 1
             if calls["n"] > 1:
-                raise OSError("second resolution failed")
+                raise error_cls("second resolution failed")
             return real_normalize(path)
 
         def failing_install(_self, _normalized):
-            raise OSError("filesystem changed while installing the root")
+            raise error_cls("filesystem changed while installing the root")
 
         monkeypatch.setattr(path_validator_mod, "_normalize", normalize_that_fails_on_second_call)
         monkeypatch.setattr(PathValidator, "_install_root", failing_install)
