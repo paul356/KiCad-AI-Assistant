@@ -18,6 +18,7 @@ import logging
 import os
 import re
 import shutil
+import stat
 from typing import Any
 
 import sexpdata
@@ -414,6 +415,28 @@ def _balanced_close(text: str, start: int) -> int:
     return -1
 
 
+def _outer_root_span(text: str) -> tuple[int, int] | None:
+    """Return the span of the outermost balanced s-expression, or None.
+
+    ``None`` means the text has no root node or its parentheses do not
+    balance, which callers report as a syntax error rather than as a
+    missing symbol.
+    """
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == ";":
+            nl = text.find("\n", i)
+            i = n if nl == -1 else nl + 1
+            continue
+        if ch == "(":
+            close = _balanced_close(text, i)
+            return (i, close) if close != -1 else None
+        i += 1
+    return None
+
+
 def _root_children_spans(text: str) -> list[tuple[int, int]]:
     """Return (start, end) text spans of the root node's direct children.
 
@@ -422,24 +445,10 @@ def _root_children_spans(text: str) -> list[tuple[int, int]]:
     comment is never mistaken for a node start.  Returns [] when the text
     has no root, or the layout cannot be scanned reliably.
     """
-    i = 0
-    n = len(text)
-    root_open = -1
-    while i < n:
-        ch = text[i]
-        if ch == ";":
-            nl = text.find("\n", i)
-            i = n if nl == -1 else nl + 1
-            continue
-        if ch == "(":
-            root_open = i
-            break
-        i += 1
-    if root_open == -1:
+    root = _outer_root_span(text)
+    if root is None:
         return []
-    root_close = _balanced_close(text, root_open)
-    if root_close == -1:
-        return []
+    root_open, root_close = root
     spans: list[tuple[int, int]] = []
     i = root_open + 1
     while i < root_close:
@@ -771,21 +780,52 @@ def effective_unit_styles(
     return units, styles
 
 
+def _pin_pair_key(first: dict[str, Any], second: dict[str, Any]) -> tuple[int, int]:
+    """Return an order-independent id pair for two pin dicts."""
+    first_id, second_id = id(first), id(second)
+    return (first_id, second_id) if first_id < second_id else (second_id, first_id)
+
+
+def _pre_existing_duplicate_pairs(pins: list[dict[str, Any]]) -> set[tuple[int, int]]:
+    """Return the id pairs of pins that already share a number in one scope.
+
+    KiCad allows duplicate pin numbers (``duplicate_pin_numbers_are_jumpers``),
+    so duplicates that exist *before* a batch are legal and must not be
+    reported as collisions.  Scope is the intersection of the effective unit
+    and body-style sets, matching :func:`find_pin_collisions`.
+    """
+    all_units, all_styles = _symbol_unit_style_universe(pins)
+    pairs: set[tuple[int, int]] = set()
+    for index, pin in enumerate(pins):
+        pin_units, pin_styles = effective_unit_styles(pin, all_units, all_styles)
+        for other in pins[index + 1 :]:
+            if other["number"] != pin["number"]:
+                continue
+            other_units, other_styles = effective_unit_styles(other, all_units, all_styles)
+            if pin_units & other_units and pin_styles & other_styles:
+                pairs.add(_pin_pair_key(pin, other))
+    return pairs
+
+
 def find_pin_collisions(
     pins: list[dict[str, Any]],
     final_numbers: dict[int, str],
+    pre_existing: set[tuple[int, int]] | None = None,
 ) -> None:
     """Reject number collisions introduced by a batch, ignoring pre-existing ones.
 
     Two pins collide when their effective unit sets intersect and their
-    effective style sets intersect.  Only pins whose number actually changes
-    are checked, so pre-existing duplicates (KiCad stacked pins) and no-op
-    batches never block an edit.
+    effective style sets intersect.  Pairs that already shared a number
+    before the batch (KiCad stacked pins / jumpers) stay legal, so renaming
+    a stacked pin keeps working; only a *new* duplicate is rejected.  Only
+    pins whose number actually changes are checked, so no-op batches never
+    block an edit.
 
     Raises:
         ValueError: When an edited pin lands on a number used by another pin
             in an intersecting effective unit/style.
     """
+    already_duplicated = pre_existing or set()
     all_units, all_styles = _symbol_unit_style_universe(pins)
     changed = [pin for pin in pins if final_numbers[id(pin)] != pin["number"]]
     for pin in changed:
@@ -795,13 +835,18 @@ def find_pin_collisions(
                 continue
             if final_numbers[id(other)] != final_numbers[id(pin)]:
                 continue
+            if _pin_pair_key(pin, other) in already_duplicated:
+                continue
             other_units, other_styles = effective_unit_styles(other, all_units, all_styles)
-            if pin_units & other_units and pin_styles & other_styles:
-                display_unit = pin["unit"] or other["unit"] or 0
+            if not (pin_units & other_units and pin_styles & other_styles):
+                continue
+            number = final_numbers[id(pin)]
+            if final_numbers[id(other)] != other["number"]:
                 raise ValueError(
-                    f"pin number '{final_numbers[id(pin)]}' is already used by pin "
-                    f"'{other['name']}' in unit {display_unit}"
+                    f"pin number '{number}' is requested for more than one pin in "
+                    "this batch; give each pin a distinct number"
                 )
+            raise ValueError(f"pin number '{number}' is already used by another pin in the symbol")
 
 
 def _plan_pin_edit_batch(
@@ -816,6 +861,8 @@ def _plan_pin_edit_batch(
     ``name``.  All selectors are resolved against the pre-edit snapshot, then
     every requested value is applied simultaneously before collisions are
     checked, so chains and cycles that form a valid permutation are accepted.
+    Only pin *numbers* are constrained to stay unique where they already were;
+    names may repeat or be empty (KiCad allows both).
     """
     selected = [pin for pin in pins if unit is None or pin["unit"] == unit]
     resolved: list[tuple[dict[str, Any], list[dict[str, Any]]]] = []
@@ -842,30 +889,40 @@ def _plan_pin_edit_batch(
                 final_names[id(pin)] = request["new_name"]
 
     all_units, all_styles = _symbol_unit_style_universe(pins)
+    duplicates = _pre_existing_duplicate_pairs(pins)
     warnings: list[str] = []
-    warned: set[tuple[str, int]] = set()
     for request, matches in resolved:
         if request["new_number"] is None:
             continue
+        # A selector can match several pins (stacked pins, shared numbers).
+        # Those pins are edited together by the caller's request, so they are
+        # not "another pin" to warn about, and one warning per selector is
+        # enough.
+        match_ids = {id(pin) for pin in matches}
+        warned = False
         for pin in matches:
+            if warned:
+                break
             final_number = final_numbers[id(pin)]
             if final_number == pin["number"]:
                 continue
             pin_units, pin_styles = effective_unit_styles(pin, all_units, all_styles)
             for other in pins:
-                if other is pin or final_numbers[id(other)] != final_number:
+                if other is pin or id(other) in match_ids:
+                    continue
+                if final_numbers[id(other)] != final_number:
+                    continue
+                if _pin_pair_key(pin, other) in duplicates:
                     continue
                 other_units, other_styles = effective_unit_styles(other, all_units, all_styles)
                 if pin_units & other_units and pin_styles & other_styles:
                     # A real collision; find_pin_collisions rejects the batch.
                     continue
-                for unit_value in sorted(other_units - pin_units):
-                    key = (final_number, unit_value)
-                    if key not in warned:
-                        warned.add(key)
-                        warnings.append(
-                            f"pin number '{final_number}' is also used in unit {unit_value}"
-                        )
+                warnings.append(
+                    f"pin number '{final_number}' is also used by another pin of this symbol"
+                )
+                warned = True
+                break
 
     changes: list[dict[str, Any]] = []
     changed_pins: list[dict[str, Any]] = []
@@ -874,25 +931,37 @@ def _plan_pin_edit_batch(
         for pin in matches:
             final_number = final_numbers[id(pin)]
             final_name = final_names[id(pin)]
+            changed = final_number != pin["number"] or final_name != pin["name"]
+            log.debug(
+                "pin edit in '%s': unit=%s style=%s selector=%s old=(%s,%s) new=(%s,%s)",
+                symbol_name,
+                pin["unit"],
+                pin["style"],
+                request["pin_number"],
+                pin["number"],
+                pin["name"],
+                final_number,
+                final_name,
+            )
             changes.append(
                 {
                     "pin_number": request["pin_number"],
-                    "unit": pin["unit"],
-                    "style": pin["style"],
                     "old_number": pin["number"],
                     "old_name": pin["name"],
                     "new_number": final_number,
                     "new_name": final_name,
+                    "changed": changed,
                 }
             )
             changed_pins.append(pin)
-            if final_number != pin["number"] or final_name != pin["name"]:
+            if changed:
                 pins_changed += 1
 
     return {
         "changed_pins": changed_pins,
         "changes": changes,
         "final_numbers": final_numbers,
+        "pre_existing_pairs": duplicates,
         "pins_changed": pins_changed,
         "changed": pins_changed > 0,
         "occurrences": len(changed_pins),
@@ -911,14 +980,17 @@ def set_symbol_pin(
     *pins* is a non-empty batch (max 256 entries); each entry carries
     ``pin_number`` plus at least one of ``new_number`` / ``new_name``.  The
     whole batch is validated against its final state before anything is
-    written: chains and cycles that form a valid permutation are accepted, and
-    only a final same-unit collision is rejected.
+    written: chains and cycles that form a valid permutation are accepted,
+    and only a *newly introduced* duplicate number is rejected (duplicate
+    numbers that already existed, e.g. KiCad stacked pins, stay legal).  Pin
+    names are not required to be unique and may be empty.
 
     Only the quoted literals of the targeted ``(number ...)`` / ``(name ...)``
     nodes are replaced: every other byte of the ``.kicad_sym`` file — header,
     other symbols, formatting, line endings — stays identical.  Exactly one
     ``.bak`` is written and exactly one atomic replace is performed; on any
-    validation error nothing is written.
+    validation error nothing is written.  The file's permission bits are
+    preserved, and a read-only file is refused.
 
     Pins live in sub-symbols named ``<symbol>_<unit>_<style>``.  ``unit=None``
     edits every matching occurrence in all units and both body styles;
@@ -942,6 +1014,12 @@ def set_symbol_pin(
 
     with open(file_path, encoding="utf-8", newline="") as fh:
         text = fh.read()
+
+    if _outer_root_span(text) is None:
+        raise ValueError(
+            f"Library {os.path.basename(file_path)} is not valid s-expression data "
+            "(no root node or unbalanced parentheses); refusing to edit it"
+        )
 
     span = _find_top_symbol_span(text, symbol_name)
     if span is None:
@@ -987,25 +1065,27 @@ def set_symbol_pin(
         )
 
     plan = _plan_pin_edit_batch(pin_nodes, symbol_name, requests, unit)
-    find_pin_collisions(pin_nodes, plan["final_numbers"])
+    find_pin_collisions(pin_nodes, plan["final_numbers"], plan["pre_existing_pairs"])
 
     replacements: list[tuple[tuple[int, int], str]] = []
     for pin, change in zip(plan["changed_pins"], plan["changes"], strict=True):
         if change["new_number"] != pin["number"]:
             if pin["number_span"] is None:
-                raise ValueError(
-                    f"pin '{change['pin_number']}' has no (number ...) node in unit {pin['unit']}"
-                )
+                raise ValueError(f"pin '{change['pin_number']}' has no (number ...) node to edit")
             replacements.append((pin["number_span"], f'"{change["new_number"]}"'))
         if change["new_name"] != pin["name"]:
             if pin["name_span"] is None:
-                raise ValueError(
-                    f"pin '{change['pin_number']}' has no (name ...) node in unit {pin['unit']}"
-                )
+                raise ValueError(f"pin '{change['pin_number']}' has no (name ...) node to edit")
             replacements.append((pin["name_span"], f'"{change["new_name"]}"'))
 
     backup_path: str | None = None
     if plan["changed"]:
+        if not os.access(file_path, os.W_OK):
+            raise PermissionError(
+                f"Library file is not writable: {file_path} "
+                "(fix the file permissions and retry; nothing was changed)"
+            )
+        mode = stat.S_IMODE(os.stat(file_path).st_mode)
         new_text = text
         for (replace_start, replace_end), replacement in sorted(
             replacements, key=lambda item: item[0][0], reverse=True
@@ -1017,6 +1097,9 @@ def set_symbol_pin(
         tmp_path = file_path + ".tmp"
         with open(tmp_path, "w", encoding="utf-8", newline="") as fh:
             fh.write(new_text)
+        # Keep the library's own mode (e.g. 0640); the temp file is created
+        # with the process default otherwise.
+        os.chmod(tmp_path, mode)
         os.replace(tmp_path, file_path)
 
     return {

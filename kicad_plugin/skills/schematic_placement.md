@@ -58,13 +58,12 @@ tools: [extract_schematic_netlist, add_symbol_to_schematic, place_symbol_relativ
   `lib_id` is matched by exact cached entry name, so no colon is required.
   `pins` is a batch list of `{pin_number, new_number?, new_name?}` entries;
   renames in a batch are applied simultaneously and validated against the
-  final state. There is no unit selector: a pin number is the identity of a
-  physical connection, so every definition carrying it (all units, both body
-  styles) and every placement's instance pin keys are updated together.
-  Collision validation stays per unit/style: same effective unit and style →
-  error; same number in a different unit only → warning; the common
-  definitions (unit `0`, style `0`) belong to every unit/style, and styles
-  `1`/`2` are independent.
+  final state. A pin number is the identity of a physical connection, so every
+  definition carrying it and every placement's instance pin keys are updated
+  together. Numbers stay unique where they were unique: a batch that would
+  give two pins the same number is rejected, while duplicates that already
+  existed (stacked pins) stay legal. Pin names may repeat or be empty; a new
+  number already used by an untouched pin produces a warning, not an error.
 - Do this **before** `set_symbol_property` assigns the `Footprint`; the two
   tools are a pair — the library edit covers future placements, the schematic
   edit covers the placed copies. Both report the changes and write `.bak`

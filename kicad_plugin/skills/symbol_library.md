@@ -74,13 +74,13 @@ no guessing or fallback lookup. `pins` is a non-empty list (max 256) of
 `{pin_number, new_number?, new_name?}` entries — one entry per pin; selectors
 match the pre-edit state, so chain/cycle renames are applied simultaneously and
 validated against the final state. A pin number is the identity of a physical
-connection, so a rename hits every definition that carries it: all units and
-both body styles (there is no unit selector). Collisions are final-state and
-effective: same unit **and** body style → error; same number in a different
-unit only → warning; the common definitions (unit `0`, style `0`) belong to
-every unit/style, and styles `1`/`2` (normal / De Morgan) are independent.
-Pre-existing duplicates such as stacked pins do
-not block an edit. The `.kicad_sym` file is edited
+connection, so a rename hits every definition that carries it. Numbers stay
+unique where they were unique: a batch that would give two pins the same
+number is rejected, while duplicates that already existed (stacked pins,
+KiCad's duplicate-pin jumpers) stay legal and can be renumbered together.
+Pin names are not required to be unique and may be empty. When the new number
+is already used by a pin the batch does not touch, the edit succeeds with a
+warning (KiCad treats duplicate numbers as jumpers). The `.kicad_sym` file is edited
 in place in one write (one `.bak`) and only the pin literals change. Schematics
 that already embed the old definition are **not** updated — call
 **update_schematic_symbol_pin** afterwards for already placed parts. Do this

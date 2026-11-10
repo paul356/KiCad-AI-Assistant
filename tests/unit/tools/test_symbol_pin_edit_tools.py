@@ -10,6 +10,7 @@ checked semantically because the normal save path re-serialises the file.
 import asyncio
 from pathlib import Path
 import shutil
+import stat
 
 import pytest
 import sexpdata
@@ -20,7 +21,6 @@ from kcaa.utils.symbol_library_utils import set_symbol_pin
 FIXTURES = Path(__file__).parent / "fixtures"
 SYMBOL_LIBRARY = FIXTURES / "pin_edit_symbols.kicad_sym"
 SCHEMATIC = FIXTURES / "pin_edit.kicad_sch"
-UUID_SCHEMATIC = FIXTURES / "pin_edit_uuid.kicad_sch"
 MULTI_UNIT = Path(__file__).parent.parent / "utils/fixtures/multi_unit.kicad_sch"
 SINGLE_PIN = Path(__file__).parent.parent / "utils/fixtures/single_pin_symbol.kicad_sch"
 
@@ -296,6 +296,21 @@ def _placement_pin_numbers(path: Path, lib_id: str) -> list[set[str]]:
     ]
 
 
+def _placement_pin_uuids(path: Path) -> list[tuple[str, str]]:
+    """Return ``(lib_id, uuid)`` for every instance pin key in *path*."""
+    data = sexpdata.loads(path.read_text(encoding="utf-8"))
+    pairs: list[tuple[str, str]] = []
+    for node in data[1:]:
+        if _keyword(node) != "symbol":
+            continue
+        lib_id = _child_value(node, "lib_id")
+        for child in node[1:]:
+            if _keyword(child) != "pin":
+                continue
+            pairs.append((lib_id, _child_value(child, "uuid")))
+    return pairs
+
+
 def _connection_count(path: Path) -> int:
     """Return the number of resolved pin connections via the netlist parser."""
     return analyze_netlist(SchematicParser(str(path)).parse())["total_pin_connections"]
@@ -320,12 +335,11 @@ def test_rename_pin_number_keeps_pin_name_and_writes_backup(tmp_path):
     assert result["changes"] == [
         {
             "pin_number": "P$1",
-            "unit": 1,
-            "style": 1,
             "old_number": "P$1",
             "old_name": "A",
             "new_number": "1",
             "new_name": "A",
+            "changed": True,
         }
     ]
     assert result["changed"] is True
@@ -349,12 +363,11 @@ def test_rename_number_and_name_in_one_call(tmp_path):
     assert result["changes"] == [
         {
             "pin_number": "P$1",
-            "unit": 1,
-            "style": 1,
             "old_number": "P$1",
             "old_name": "A",
             "new_number": "1",
             "new_name": "IN",
+            "changed": True,
         }
     ]
     text = library.read_text(encoding="utf-8")
@@ -372,12 +385,11 @@ def test_name_only_change_keeps_pin_number(tmp_path):
     assert result["changes"] == [
         {
             "pin_number": "P$2",
-            "unit": 1,
-            "style": 1,
             "old_number": "P$2",
             "old_name": "B",
             "new_number": "P$2",
             "new_name": "OUT",
+            "changed": True,
         }
     ]
     text = library.read_text(encoding="utf-8")
@@ -431,21 +443,21 @@ def test_multi_unit_scope_edits_all_units_or_one(tmp_path):
 
     both = set_symbol_pin(library, "MultiUnit", [_edit("1", new_name="RENAMED")])
     assert both["pins_requested"] == 1
+    assert both["pins_changed"] == 2
     assert both["occurrences"] == 2
-    assert {change["unit"] for change in both["changes"]} == {1, 2}
     assert [change["new_name"] for change in both["changes"]] == ["RENAMED", "RENAMED"]
+    assert library.read_text(encoding="utf-8").count('(name "RENAMED"') == 2
 
     one = set_symbol_pin(library, "MultiUnit", [_edit("1", new_name="UNIT_TWO")], unit=2)
     assert one["occurrences"] == 1
     assert one["changes"] == [
         {
             "pin_number": "1",
-            "unit": 2,
-            "style": 1,
             "old_number": "1",
             "old_name": "RENAMED",
             "new_number": "1",
             "new_name": "UNIT_TWO",
+            "changed": True,
         }
     ]
 
@@ -472,7 +484,9 @@ def test_collision_error_leaves_file_untouched(tmp_path):
     library = _copy(SYMBOL_LIBRARY, tmp_path)
     before = library.read_bytes()
 
-    with pytest.raises(ValueError, match="pin number 'P\\$2' is already used by pin 'B' in unit 1"):
+    with pytest.raises(
+        ValueError, match="pin number 'P\\$2' is already used by another pin in the symbol"
+    ):
         set_symbol_pin(library, "Plain", [_edit("P$1", new_number="P$2")])
 
     assert library.read_bytes() == before
@@ -486,7 +500,7 @@ def test_cross_unit_number_is_a_warning_not_an_error(tmp_path):
     result = set_symbol_pin(library, "MultiUnit", [_edit("1", new_number="2")], unit=2)
 
     assert result["changed"] is True
-    assert result["warnings"] == ["pin number '2' is also used in unit 1"]
+    assert result["warnings"] == ["pin number '2' is also used by another pin of this symbol"]
 
 
 def test_unknown_pin_error_lists_available_numbers(tmp_path):
@@ -566,21 +580,19 @@ def test_mixed_number_and_name_batch(tmp_path):
     assert result["changes"] == [
         {
             "pin_number": "P$1",
-            "unit": 1,
-            "style": 1,
             "old_number": "P$1",
             "old_name": "A",
             "new_number": "1",
             "new_name": "A",
+            "changed": True,
         },
         {
             "pin_number": "P$2",
-            "unit": 1,
-            "style": 1,
             "old_number": "P$2",
             "old_name": "B",
             "new_number": "P$2",
             "new_name": "OUT",
+            "changed": True,
         },
     ]
 
@@ -737,7 +749,7 @@ def test_common_pin_edits_apply_to_every_unit(tmp_path):
 
     assert result["changed"] is True
     assert result["occurrences"] == 1
-    assert result["changes"][0]["unit"] == 0
+    assert [change["new_number"] for change in result["changes"]] == ["C9"]
     assert result["warnings"] == []
     assert _symbol_pin_numbers(library, "MultiUnit") == {"C9", "1", "2", "3"}
     text = library.read_text(encoding="utf-8")
@@ -775,7 +787,7 @@ def test_both_styles_do_not_collide_and_noop_is_allowed(tmp_path):
     assert renamed["changed"] is True
     assert renamed["pins_changed"] == 2
     assert renamed["occurrences"] == 2
-    assert {change["style"] for change in renamed["changes"]} == {1, 2}
+    assert library.read_text(encoding="utf-8").count('(number "10"') == 2
     assert {change["new_number"] for change in renamed["changes"]} == {"10"}
     assert _symbol_pin_numbers(library, "BothStyles") == {"10", "2"}
 
@@ -791,6 +803,109 @@ def test_pre_existing_stacked_pins_do_not_block_edits(tmp_path):
     assert stack_name["changed"] is True
     assert stack_name["occurrences"] == 2
     assert stack_name["pins_changed"] == 2
+
+
+def test_stacked_pins_are_renumbered_together(tmp_path):
+    """KiCad jumpers: a shared number stays one connection after the rename."""
+    library = _copy(SYMBOL_LIBRARY, tmp_path)
+
+    result = set_symbol_pin(library, "Stacked", [_edit("5", new_number="7")])
+
+    assert result["changed"] is True
+    assert result["pins_requested"] == 1
+    assert result["pins_changed"] == 2
+    assert result["occurrences"] == 2
+    assert result["warnings"] == []
+    assert _symbol_pin_numbers(library, "Stacked") == {"7", "6"}
+
+
+def test_stacked_rename_rejects_a_number_already_in_use(tmp_path):
+    library = _copy(SYMBOL_LIBRARY, tmp_path)
+    # Make 7 an existing number, then try to renumber the stacked 5s onto it.
+    set_symbol_pin(library, "Stacked", [_edit("6", new_number="7")])
+    before = library.read_bytes()
+
+    with pytest.raises(ValueError, match="pin number '7' is already used by another pin"):
+        set_symbol_pin(library, "Stacked", [_edit("5", new_number="7")])
+
+    assert library.read_bytes() == before
+    assert not Path(str(library) + ".tmp").exists()
+    assert _symbol_pin_numbers(library, "Stacked") == {"5", "7"}
+
+
+def test_batch_cannot_map_two_selectors_to_one_number(tmp_path):
+    library = _copy(SYMBOL_LIBRARY, tmp_path)
+    before = library.read_bytes()
+
+    with pytest.raises(ValueError, match="requested for more than one pin"):
+        set_symbol_pin(
+            library,
+            "Plain",
+            [_edit("P$1", new_number="9"), _edit("P$2", new_number="9")],
+        )
+
+    assert library.read_bytes() == before
+    assert not Path(str(library) + ".bak").exists()
+
+
+def test_shared_selector_does_not_warn_against_its_own_edit(tmp_path):
+    """One selector matching several pins is a single edit, not a conflict."""
+    library = _copy(SYMBOL_LIBRARY, tmp_path)
+
+    result = set_symbol_pin(library, "MultiUnit", [_edit("1", new_number="5")])
+
+    assert result["pins_changed"] == 2
+    assert result["warnings"] == []
+    assert _symbol_pin_numbers(library, "MultiUnit") == {"C0", "5", "2", "3"}
+
+
+def test_duplicate_pin_names_are_allowed(tmp_path):
+    """Names label pins; only numbers are constrained to stay unique."""
+    library = _copy(SYMBOL_LIBRARY, tmp_path)
+
+    result = set_symbol_pin(library, "Plain", [_edit("P$1", new_name="B")])
+
+    assert result["changed"] is True
+    assert [change["new_name"] for change in result["changes"]] == ["B"]
+    text = library.read_text(encoding="utf-8")
+    plain = text[text.index('(symbol "Plain"') : text.index('(symbol "MultiUnit"')]
+    assert plain.count('(name "B"') == 2
+
+
+def test_read_only_library_is_refused(tmp_path):
+    library = _copy(SYMBOL_LIBRARY, tmp_path)
+    before = library.read_bytes()
+    library.chmod(0o444)
+
+    with pytest.raises(PermissionError, match="not writable"):
+        set_symbol_pin(library, "Plain", [_edit("P$1", new_number="1")])
+
+    assert library.read_bytes() == before
+    assert not Path(str(library) + ".bak").exists()
+    assert not Path(str(library) + ".tmp").exists()
+    assert stat.S_IMODE(library.stat().st_mode) == 0o444
+
+
+def test_library_mode_is_preserved(tmp_path):
+    library = _copy(SYMBOL_LIBRARY, tmp_path)
+    library.chmod(0o640)
+
+    set_symbol_pin(library, "Plain", [_edit("P$1", new_number="1")])
+
+    assert stat.S_IMODE(library.stat().st_mode) == 0o640
+
+
+def test_corrupt_library_reports_syntax_error(tmp_path):
+    library = _copy(SYMBOL_LIBRARY, tmp_path)
+    text = library.read_text(encoding="utf-8")
+    library.write_text(text[: text.rindex(")")], encoding="utf-8")
+    before = library.read_bytes()
+
+    with pytest.raises(ValueError, match="not valid s-expression"):
+        set_symbol_pin(library, "Plain", [_edit("P$1", new_number="1")])
+
+    assert library.read_bytes() == before
+    assert not Path(str(library) + ".bak").exists()
 
 
 def test_empty_pin_name_and_spaces_are_written_verbatim(tmp_path):
@@ -902,6 +1017,31 @@ def test_tool_refuses_system_library(monkeypatch, tmp_path):
     assert library.read_bytes() == before
 
 
+def test_tool_refuses_read_only_library(monkeypatch, tmp_path):
+    library = _copy(SYMBOL_LIBRARY, tmp_path)
+    _patch_library(monkeypatch, library)
+    before = library.read_bytes()
+    library.chmod(0o444)
+
+    result = asyncio.run(
+        _tools()["update_library_symbol_pin"](
+            project_dir=str(tmp_path),
+            lib_id=f"{_TOOL_LIB}:Plain",
+            pins=[_edit("P$1", new_number="1")],
+        )
+    )
+
+    assert result == {
+        "error": (
+            f"Library file is not writable: {library} "
+            "(fix the file permissions and retry; nothing was changed)"
+        )
+    }
+    assert library.read_bytes() == before
+    assert not Path(str(library) + ".bak").exists()
+    assert not Path(str(library) + ".tmp").exists()
+
+
 def test_tool_reports_invalid_pin_as_error(monkeypatch, tmp_path):
     library = _copy(SYMBOL_LIBRARY, tmp_path)
     _patch_library(monkeypatch, library)
@@ -941,8 +1081,8 @@ def test_tool_selector_in_two_units_edits_both(monkeypatch, tmp_path):
     assert result["pins_requested"] == 1
     assert result["pins_changed"] == 2
     assert result["occurrences"] == 2
-    assert {change["unit"] for change in result["changes"]} == {1, 2}
-    assert [change["new_name"] for change in result["changes"]] == ["RENAMED", "RENAMED"]
+    assert {change["new_name"] for change in result["changes"]} == {"RENAMED"}
+    assert [change["old_number"] for change in result["changes"]] == ["1", "1"]
     assert library.read_text(encoding="utf-8").count('(name "RENAMED"') == 2
     assert len(calls) == 1
 
@@ -1134,21 +1274,19 @@ def test_schematic_tool_batch_updates_cache_and_placement_keys(tmp_path):
     assert result["changes"] == [
         {
             "pin_number": "P$1",
-            "unit": 1,
-            "style": 1,
             "old_number": "P$1",
             "old_name": "A",
             "new_number": "1",
             "new_name": "A",
+            "changed": True,
         },
         {
             "pin_number": "P$2",
-            "unit": 1,
-            "style": 1,
             "old_number": "P$2",
             "old_name": "B",
             "new_number": "2",
             "new_name": "B",
+            "changed": True,
         },
     ]
     assert result["changed"] is True
@@ -1295,7 +1433,7 @@ def test_schematic_tool_cross_unit_number_warning(tmp_path):
 
     assert result["success"] is True
     assert result["changed"] is True
-    assert result["warnings"] == ["pin number '3' is also used in unit 2"]
+    assert result["warnings"] == ["pin number '3' is also used by another pin of this symbol"]
     after = _semantic_snapshot(schematic)
     assert after["lib_symbols"]["myLib:DUAL"]["DUAL_1_1"] == (("3", ""), ("2", ""))
 
@@ -1340,14 +1478,16 @@ def test_schematic_tool_common_pin_collision_is_an_error(tmp_path):
         )
     )
 
-    assert result["error"] == "pin number 'C0' is already used by pin 'COMMON' in unit 1"
+    assert result["error"] == "pin number 'C0' is already used by another pin in the symbol"
     assert schematic.read_bytes() == before
     assert not Path(str(schematic) + ".bak").exists()
     assert not Path(str(schematic) + ".tmp").exists()
 
 
-def test_schematic_tool_uuid_first_placement_mapping(tmp_path):
-    schematic = _copy(UUID_SCHEMATIC, tmp_path)
+def test_schematic_tool_rewrite_keeps_instance_pin_uuids(tmp_path):
+    """Keys are matched by number; each instance's ``(uuid …)`` child survives."""
+    schematic = _copy(SCHEMATIC, tmp_path)
+    before_uuids = _placement_pin_uuids(schematic)
 
     result = asyncio.run(
         _tools()["update_schematic_symbol_pin"](
@@ -1359,16 +1499,11 @@ def test_schematic_tool_uuid_first_placement_mapping(tmp_path):
 
     assert result["changed"] is True
     assert result["placements_updated"] == 2
-    after = _semantic_snapshot(schematic)
-    assert [placement["pins"] for placement in after["placements"]] == [
+    assert _placement_pin_uuids(schematic) == before_uuids
+    assert [placement["pins"] for placement in _semantic_snapshot(schematic)["placements"]] == [
         ("C0", "1", "P$2"),
         ("C0", "1", "P$2"),
     ]
-    # The cached uuid drove the rewrite (the instance key was "STALE"), and
-    # every instance uuid child is preserved.
-    text = schematic.read_text(encoding="utf-8")
-    assert "STALE" not in text
-    assert text.count("cached-uuid-p1") == 3
 
 
 def test_schematic_tool_reports_single_instance(tmp_path):

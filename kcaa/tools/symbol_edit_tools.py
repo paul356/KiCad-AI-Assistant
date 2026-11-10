@@ -2483,13 +2483,14 @@ def _edit_cached_symbol_pins(
     raw: list,
     symbol_name: str,
     pins: list[dict[str, Any]],
-    unit: int | None,
 ) -> dict[str, Any]:
     """Edit pins in a cached lib_symbols raw tree in place.
 
     Mirrors :func:`kcaa.utils.symbol_library_utils.set_symbol_pin` — same batch
     selector, final-state collision rules and return shape — but writes into
-    the parsed S-expression tree the schematic serialises on save.
+    the parsed S-expression tree the schematic serialises on save.  Every
+    matching occurrence in every unit and body style is edited; duplicate
+    numbers that already existed stay legal.
     """
     requests = _validate_pin_edit_requests(pins)
 
@@ -2532,20 +2533,17 @@ def _edit_cached_symbol_pins(
             f"update the base symbol '{extends_base}' instead"
         )
 
-    plan = _plan_pin_edit_batch(pin_nodes, symbol_name, requests, unit)
-    find_pin_collisions(pin_nodes, plan["final_numbers"])
+    # The tool has no unit selector: every matching pin is edited.
+    plan = _plan_pin_edit_batch(pin_nodes, symbol_name, requests, None)
+    find_pin_collisions(pin_nodes, plan["final_numbers"], plan["pre_existing_pairs"])
     for pin, change in zip(plan["changed_pins"], plan["changes"], strict=True):
         if change["new_number"] != pin["number"]:
             if pin["number_node"] is None:
-                raise ValueError(
-                    f"pin '{change['pin_number']}' has no (number ...) node in unit {pin['unit']}"
-                )
+                raise ValueError(f"pin '{change['pin_number']}' has no (number ...) node to edit")
             pin["number_node"][1] = change["new_number"]
         if change["new_name"] != pin["name"]:
             if pin["name_node"] is None:
-                raise ValueError(
-                    f"pin '{change['pin_number']}' has no (name ...) node in unit {pin['unit']}"
-                )
+                raise ValueError(f"pin '{change['pin_number']}' has no (name ...) node to edit")
             pin["name_node"][1] = change["new_name"]
     return plan
 
@@ -2576,62 +2574,22 @@ def _symbol_raw_tree(symbol: Any) -> list | None:
     return tree if isinstance(tree, list) else None
 
 
-def _cached_pin_uuid_numbers(raw: list, symbol_name: str) -> dict[str, str]:
-    """Map cached pin ``(uuid ...)`` values to their pre-edit pin numbers.
-
-    Cached library pins usually omit a uuid; when present it identifies the
-    pin more reliably than its number.  Ambiguous uuids (same uuid, different
-    numbers) are dropped so callers fall back to the number.
-    """
-    numbers: dict[str, str] = {}
-    ambiguous: set[str] = set()
-    for child in raw[2:]:
-        if _raw_node_keyword(child) != "symbol" or len(child) < 2:
-            continue
-        if _split_sub_symbol_name(str(child[1]), symbol_name) is None:
-            continue
-        for pin in child[1:]:
-            if _raw_node_keyword(pin) != "pin":
-                continue
-            number_node = _raw_child_node(pin, "number")
-            uuid_node = _raw_child_node(pin, "uuid")
-            if (
-                number_node is None
-                or len(number_node) < 2
-                or uuid_node is None
-                or len(uuid_node) < 2
-            ):
-                continue
-            uuid = str(uuid_node[1])
-            number = str(number_node[1])
-            if uuid in numbers and numbers[uuid] != number:
-                numbers.pop(uuid, None)
-                ambiguous.add(uuid)
-            elif uuid not in ambiguous:
-                numbers[uuid] = number
-    return numbers
-
-
 def _rewrite_placement_pin_keys(
     sch: Any,
     lib_id: str,
     number_mapping: dict[str, str],
-    uuid_numbers: dict[str, str],
-    unit: int | None,
-    edited_units: set[int],
 ) -> int:
     """Rewrite instance pin keys in placements of *lib_id*; return placements changed.
 
     skip resolves a placement's pins by intersecting the cached lib-symbol
-    numbers with the placement's own ``(pin "…" (uuid …))`` keys, so renumbering
-    only the cache would make the pin disappear.  The mapping is built from the
-    pre-edit snapshot and applied in one pass, so chains never rewrite twice.
-    A cached pin uuid identifies the pin when present; otherwise the key number
-    is used.  The ``(uuid …)`` child on the instance key is preserved.
+    numbers with the placement's own ``(pin "<number>" (uuid …))`` keys, so
+    renumbering only the cache would make the pin disappear.  The instance key
+    *is* the pin number (skip ignores the uuid child), and the mapping is built
+    from the pre-edit snapshot and applied in one pass, so chains never rewrite
+    twice.  Only the key token changes; the ``(uuid …)`` child is preserved.
     """
     if not number_mapping:
         return 0
-    select_all = unit is None or unit == 0 or 0 in edited_units
     updated = 0
     try:
         symbols = sch.symbol
@@ -2646,16 +2604,6 @@ def _rewrite_placement_pin_keys(
         raw = _symbol_raw_tree(symbol)
         if raw is None:
             continue
-        if not select_all:
-            unit_node = _raw_child_node(raw, "unit")
-            if unit_node is None or len(unit_node) < 2:
-                continue
-            try:
-                placed_unit = int(unit_node[1])
-            except (TypeError, ValueError):
-                continue
-            if placed_unit != unit:
-                continue
         rewrote = False
         for child in raw:
             if _raw_node_keyword(child) != "pin":
@@ -2663,11 +2611,7 @@ def _rewrite_placement_pin_keys(
             if len(child) < 2:
                 continue
             key_number = str(child[1])
-            uuid_node = _raw_child_node(child, "uuid")
-            source_number = key_number
-            if uuid_node is not None and len(uuid_node) > 1:
-                source_number = uuid_numbers.get(str(uuid_node[1]), key_number)
-            new_number = number_mapping.get(source_number)
+            new_number = number_mapping.get(key_number)
             if new_number is not None and new_number != key_number:
                 child[1] = new_number
                 rewrote = True
@@ -2788,9 +2732,8 @@ def _do_update_schematic_symbol_pin(
     # The cache key is *lib_id* exactly as stored (no split, no fallback); the
     # bare part after the colon only names ``<symbol>_<unit>_<style>`` children.
     symbol_name = lib_id.split(":", 1)[-1]
-    uuid_numbers = _cached_pin_uuid_numbers(raw, symbol_name)
     try:
-        result = _edit_cached_symbol_pins(raw, symbol_name, pins, None)
+        result = _edit_cached_symbol_pins(raw, symbol_name, pins)
     except ValueError as exc:
         return {"error": str(exc)}
 
@@ -2803,10 +2746,7 @@ def _do_update_schematic_symbol_pin(
 
     placements_updated = 0
     if result["changed"] and number_mapping:
-        edited_units = {change["unit"] for change in result["changes"]}
-        placements_updated = _rewrite_placement_pin_keys(
-            sch, lib_id, number_mapping, uuid_numbers, None, edited_units
-        )
+        placements_updated = _rewrite_placement_pin_keys(sch, lib_id, number_mapping)
 
     backup_path: str | None = None
     if result["changed"]:
@@ -3313,10 +3253,11 @@ def register_symbol_edit_tools(mcp: FastMCP) -> None:
         once when something changed.
 
         A pin number is KiCad's identity for a physical connection, so every
-        matching occurrence is edited together: all units and both body styles
-        (the sub-symbols named ``<symbol>_<unit>_<style>``).  Collisions are
-        still validated per unit and style; unrelated units of the same number
-        produce a warning, not an error.
+        definition carrying it is edited together.  Numbers keep their
+        uniqueness: a batch that would give two pins the same number is
+        rejected, while duplicates that already existed (KiCad's
+        duplicate-pin jumpers) stay legal.  Pin names are not required to be
+        unique and may be empty.
 
         Args:
             project_dir: Project directory (or a file inside it). Its
@@ -3336,11 +3277,11 @@ def register_symbol_edit_tools(mcp: FastMCP) -> None:
             pins_requested, pins_changed, occurrences, changes, changed,
             backup_path, indexed, warnings; plus ``error`` on failure (no
             ``success``).  ``library_name`` and ``symbol_name`` are the two
-            halves of *lib_id*.  Each ``changes`` entry also carries the
-            selector in ``pin_number`` and the ``unit``/``style`` definition it
-            came from.  ``pins_requested`` counts entries while
+            halves of *lib_id*.  Each ``changes`` entry reports ``pin_number``,
+            ``old_number``/``old_name``, ``new_number``/``new_name`` and
+            ``changed``.  ``pins_requested`` counts entries while
             ``pins_changed`` counts changed pin occurrences (one selector
-            matching two units yields 1 requested, 2 changed).
+            matching two pins yields 1 requested, 2 changed).
         """
         return await asyncio.to_thread(
             _do_update_library_symbol_pin,
@@ -3369,9 +3310,12 @@ def register_symbol_edit_tools(mcp: FastMCP) -> None:
         change; every affected reference designator is reported.
 
         A pin number is KiCad's identity for a physical connection, so every
-        matching occurrence is edited together (all units and both body
-        styles) and the instance pin keys of every placement of *lib_id* are
-        rewritten.  Collisions are still validated per unit and style.
+        definition carrying it is edited together and the instance pin keys of
+        every placement of *lib_id* are rewritten.  Numbers keep their
+        uniqueness: a batch that would give two pins the same number is
+        rejected, while duplicates that already existed (KiCad's
+        duplicate-pin jumpers) stay legal.  Pin names are not required to be
+        unique and may be empty.
 
         The batch is validated against its final state before writing, with
         exactly one ``.kicad_sch.bak`` and one save.  The file is rewritten
@@ -3398,10 +3342,11 @@ def register_symbol_edit_tools(mcp: FastMCP) -> None:
             pins_changed, occurrences, changes, changed, backup_path,
             affected_references, affected_count, placements_updated, warnings;
             plus ``error`` on failure (no ``success``).  Each ``changes`` entry
-            carries the ``unit``/``style`` definition it came from.
-            ``pins_requested`` counts entries while ``pins_changed`` counts
-            changed pin occurrences (one selector matching two units yields 1
-            requested, 2 changed).
+            reports ``pin_number``, ``old_number``/``old_name``,
+            ``new_number``/``new_name`` and ``changed``.  ``pins_requested``
+            counts entries while ``pins_changed`` counts changed pin
+            occurrences (one selector matching two pins yields 1 requested, 2
+            changed).
         """
         return await asyncio.to_thread(
             _do_update_schematic_symbol_pin,
