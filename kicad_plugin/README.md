@@ -22,10 +22,10 @@ kcaa MCP server (subprocess, streamable-http on localhost)
 
 ## Installation
 
-The plugin is a folder named `kicad_ai_assistant` inside KiCad's user plugin
-directory. Release archives are already rooted at that name; renaming the
-folder makes KiCad ignore the plugin. `10.0` below is your KiCad
-`<major>.<minor>` version.
+The plugin is a folder inside KiCad's user plugin directory. Release archives
+already use `kicad_ai_assistant` for manual installs; keep that name so the
+documented paths, the updater's `ZIP_ROOT`, and the package's own imports
+match. `10.0` below is your KiCad `<major>.<minor>` version.
 
 | OS | Manual install (unzip `kicad_ai_assistant.zip` here) | PCM install (`Install from File...`) |
 |----|-----------------------------------------------------|--------------------------------------|
@@ -45,7 +45,8 @@ Content Manager, and a manually copied folder there is not a PCM install.
 **PCM install:** use `kicad_ai_assistant_pcm.zip`, not the manual archive. Open
 **Preferences → Plugin and Content Manager → Install from File…** and select it.
 KiCad extracts the package to
-`<3rdparty>/plugins/com_github_paul356_kicad-ai-assistant/`.
+`<3rdparty>/plugins/com_github_paul356_kicad-ai-assistant/`; that package
+directory is the plugin directory, with `__init__.py` directly inside it.
 
 ### 2. Run the setup script
 
@@ -96,8 +97,8 @@ PyPI copy back.
 
 **Preferences → Plugins → Enable KiCad API.** The panel uses this IPC socket for
 **Reload PCB** and the `update_pcb_from_schematic` tool; without it those two
-fail, while file-based editing keeps working. PCM shows this prompt after
-installing a plugin package; a manual install does not.
+fail, while file-based editing keeps working. This package does not declare
+the IPC runtime, so KiCad does not prompt for the toggle — enable it manually.
 
 ### 4. Open KiCad
 
@@ -109,10 +110,10 @@ installing a plugin package; a manual install does not.
 
 ## Configuration
 
-Settings are stored in the KiCad user config directory:
-- Linux: `~/.config/kicad/kicad_ai_assistant.json`
-- macOS: `~/Library/Preferences/kicad/kicad_ai_assistant.json`
-- Windows: `%APPDATA%\kicad\kicad_ai_assistant.json`
+Settings are stored under `<config>/kicad/<ver>/kcaa/kicad_ai_assistant.json`:
+- Linux: `~/.config/kicad/10.0/kcaa/kicad_ai_assistant.json`
+- macOS: `~/Library/Preferences/kicad/10.0/kcaa/kicad_ai_assistant.json`
+- Windows: `%APPDATA%\kicad\10.0\kcaa\kicad_ai_assistant.json`
 
 | Setting | Description | Default |
 |---------|-------------|---------|

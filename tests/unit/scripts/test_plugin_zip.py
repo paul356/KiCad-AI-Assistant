@@ -6,6 +6,7 @@ zip output the in-panel updater depends on.
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 import json
 from pathlib import Path
@@ -85,14 +86,13 @@ def test_pcm_archive_layout(pcm_zip: Path, project: dict) -> None:
     names = _namelist(pcm_zip)
 
     assert "metadata.json" in names
-    assert f"{builder.PCM_PLUGIN_ROOT}/__init__.py" in names
-    assert f"{builder.PCM_PLUGIN_ROOT}/VERSION" in names
-    assert (
-        _member(pcm_zip, f"{builder.PCM_PLUGIN_ROOT}/VERSION").decode().strip()
-        == project["version"]
-    )
+    assert "plugins/__init__.py" in names
+    assert "plugins/VERSION" in names
+    assert "plugins/ui/panel.py" in names
+    assert _member(pcm_zip, "plugins/VERSION").decode().strip() == project["version"]
     assert builder.LEGACY_ROOT not in _top_level(names)
     assert not any(name.startswith(f"{builder.LEGACY_ROOT}/") for name in names)
+    assert not any(name.startswith("plugins/kicad_ai_assistant/") for name in names)
 
 
 def test_pcm_metadata_contract(pcm_zip: Path, project: dict) -> None:
@@ -116,9 +116,9 @@ def test_pcm_metadata_contract(pcm_zip: Path, project: dict) -> None:
     }
 
     # KiCad PCM replaces dots in the identifier when creating the install folder.
-    folder = builder.pcm_package_dirname(metadata["identifier"])
-    assert folder == metadata["identifier"].replace(".", "_")
-    assert "." not in folder
+    assert builder.pcm_package_dirname(metadata["identifier"]) == (
+        "com_github_paul356_kicad-ai-assistant"
+    )
 
 
 def test_archives_are_deterministic(tmp_path: Path) -> None:
@@ -133,6 +133,52 @@ def test_archives_are_deterministic(tmp_path: Path) -> None:
     assert first_pcm.read_bytes() == second_pcm.read_bytes()
 
 
+def _simulate_pcm_package_member(name: str, clean_identifier: str) -> str | None:
+    """Mirror KiCad's ``extract()`` under ``<3rdparty>/plugins``.
+
+    PCM inserts the package id after the first path component, so a
+    ``plugins/`` member lands directly inside the package directory.
+    """
+    parts = name.split("/")
+    if parts[0] != "plugins" or len(parts) < 2:
+        return None
+    return "/".join([clean_identifier, *parts[1:]])
+
+
+def test_pcm_extraction_places_plugin_contents_at_package_root(pcm_zip: Path) -> None:
+    metadata = json.loads(_member(pcm_zip, "metadata.json"))
+    clean_identifier = builder.pcm_package_dirname(metadata["identifier"])
+    extracted = {
+        mapped
+        for name in _namelist(pcm_zip)
+        if (mapped := _simulate_pcm_package_member(name, clean_identifier)) is not None
+    }
+
+    assert f"{clean_identifier}/__init__.py" in extracted
+    assert f"{clean_identifier}/VERSION" in extracted
+    assert f"{clean_identifier}/ui/panel.py" in extracted
+    assert not any(name.startswith(f"{clean_identifier}/kicad_ai_assistant/") for name in extracted)
+
+
+def _modes(path: Path) -> dict[str, int]:
+    with zipfile.ZipFile(path) as archive:
+        return {info.filename: info.external_attr >> 16 for info in archive.infolist()}
+
+
+def test_archives_ship_complete_tree_and_executable_mode(legacy_zip: Path, pcm_zip: Path) -> None:
+    source_names = [relative for relative, _ in builder.plugin_files()]
+    assert source_names
+
+    legacy_names = set(_namelist(legacy_zip))
+    pcm_names = set(_namelist(pcm_zip))
+    for relative in source_names:
+        assert f"{builder.LEGACY_ROOT}/{relative}" in legacy_names
+        assert f"plugins/{relative}" in pcm_names
+
+    assert _modes(legacy_zip)[f"{builder.LEGACY_ROOT}/setup_plugin.sh"] == 0o100755
+    assert _modes(pcm_zip)["plugins/setup_plugin.sh"] == 0o100755
+
+
 def test_legacy_archive_matches_updater_expectations(legacy_zip: Path) -> None:
     assert builder.LEGACY_ROOT == updater.ZIP_ROOT
     assert builder.LEGACY_ARCHIVE == updater.ZIP_ASSET
@@ -145,14 +191,24 @@ def test_legacy_archive_matches_updater_expectations(legacy_zip: Path) -> None:
     )
 
 
-def test_shipped_plugin_readme_uses_real_install_paths() -> None:
+@pytest.mark.parametrize("relative_path", ["README.md", "__init__.py"])
+def test_shipped_plugin_files_use_real_install_paths(relative_path: str) -> None:
+    text = (_REPO_ROOT / "kicad_plugin" / relative_path).read_text(encoding="utf-8")
+    docs = ast.get_docstring(ast.parse(text)) if relative_path.endswith(".py") else text
+    assert docs is not None
+
+    assert "kicad_ai_plugin" not in docs
+    assert "APPDATA\\kicad\\10.0\\scripting" not in docs
+    assert "APPDATA\\kicad\\<ver>\\scripting" not in docs
+    assert "Library/Preferences/kicad/10.0/scripting" not in docs
+    assert "Library/Preferences/kicad/<ver>/scripting" not in docs
+    assert "Documents\\KiCad" in docs
+    assert "scripting\\plugins" in docs
+
+
+def test_shipped_plugin_readme_mentions_api_toggle() -> None:
     text = (_REPO_ROOT / "kicad_plugin" / "README.md").read_text(encoding="utf-8")
 
-    assert "kicad_ai_plugin" not in text
-    assert "APPDATA\\kicad\\10.0" not in text
-    assert "Library/Preferences/kicad/10.0" not in text
-    assert "Documents\\KiCad\\10.0\\scripting\\plugins" in text
-    assert "Documents/KiCad/10.0/scripting/plugins" in text
     assert "Enable KiCad API" in text
 
 

@@ -134,37 +134,25 @@ user config directory). **Not** in `.env`.
 
 ## 6. Directory Layout
 
-### macOS
-```
-~/Library/Preferences/kicad/<ver>/scripting/plugins/kcaa_plugin/
-    __init__.py          # wx panel entry point
-    client/              # LLM client code
-    logs/                # server logs (KICAD_MCP_LOG_DIR default)
+Install paths follow KiCad's documents directory (`KICAD_DOCUMENTS_HOME` when set):
 
-~/Library/Preferences/kicad/<ver>/scripting/plugins/kcaa_plugin/
-    settings.json        # API key, model, port override
+| OS | Manual install (`scripting/plugins`) | PCM install (`3rdparty/plugins`) |
+|----|--------------------------------------|----------------------------------|
+| Linux | `~/.local/share/kicad/<ver>/scripting/plugins/kicad_ai_assistant/` | `~/.local/share/kicad/<ver>/3rdparty/plugins/com_github_paul356_kicad-ai-assistant/` |
+| macOS | `~/Documents/KiCad/<ver>/scripting/plugins/kicad_ai_assistant/` | `~/Documents/KiCad/<ver>/3rdparty/plugins/com_github_paul356_kicad-ai-assistant/` |
+| Windows | `%USERPROFILE%\Documents\KiCad\<ver>\scripting\plugins\kicad_ai_assistant\` | `%USERPROFILE%\Documents\KiCad\<ver>\3rdparty\plugins\com_github_paul356_kicad-ai-assistant\` |
 
-# MCP server (installed as a Python package, separate venv or system):
-<venv>/lib/python*/site-packages/kcaa/
-```
+The plugin package directory contains `__init__.py`, the Python modules, `ui/`, `skills/`, the
+setup scripts, and the generated `VERSION` file. The setup script creates `.venv/` inside it.
 
-### Linux
-```
-~/.config/kicad/<ver>/scripting/plugins/kcaa_plugin/
-    __init__.py
-    client/
-    logs/
-    settings.json
-```
+Settings and logs live under the KiCad user config directory:
 
-### Windows
-```
-%APPDATA%\kicad\<ver>\scripting\plugins\kcaa_plugin\
-    __init__.py
-    client\
-    logs\
-    settings.json
-```
+- Linux: `~/.config/kicad/<ver>/kcaa/kicad_ai_assistant.json`
+- macOS: `~/Library/Preferences/kicad/<ver>/kcaa/kicad_ai_assistant.json`
+- Windows: `%APPDATA%\kicad\<ver>\kcaa\kicad_ai_assistant.json`
+
+The MCP server (`kcaa`) is installed as a Python package inside the plugin `.venv`
+(`<venv>/lib/python*/site-packages/kcaa/`). See the repository README for install commands.
 
 ---
 

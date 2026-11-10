@@ -12,10 +12,13 @@ updater expects::
 Plugin and Content Manager accepts for "Install from File...":
 
     metadata.json
-    plugins/kicad_ai_assistant/
-        ...plugin tree...
+    plugins/
+        ...plugin tree (same contents as kicad_plugin/)...
         VERSION
     resources/icon.png        (only when the repository already ships one)
+
+KiCad's PCM installer inserts the package id after the first path component,
+so ``plugins/__init__.py`` becomes ``<3rdparty>/plugins/<package-id>/__init__.py``.
 
 Both layouts are written deterministically: entries are sorted, timestamps are
 fixed, and permissions are constant, so rebuilding an unchanged tree produces
@@ -39,7 +42,7 @@ DIST_DIR = REPO_ROOT / "dist"
 LEGACY_ROOT = "kicad_ai_assistant"
 LEGACY_ARCHIVE = "kicad_ai_assistant.zip"
 
-PCM_PLUGIN_ROOT = "plugins/" + LEGACY_ROOT
+PCM_PLUGIN_ROOT = "plugins"
 PCM_IDENTIFIER = "com.github.paul356.kicad-ai-assistant"
 PCM_KICAD_VERSION = "10.0"
 PCM_ARCHIVE = "kicad_ai_assistant_pcm.zip"
@@ -157,7 +160,12 @@ def pcm_metadata(project: dict[str, Any] | None = None) -> dict[str, Any]:
     }
 
 
-def _tree_entries(prefix: str, source: Path, version: str) -> list[tuple[str, bytes]]:
+def _file_mode(path: Path) -> int:
+    """Return the stored zip mode, preserving the source executable bit."""
+    return 0o100755 if path.stat().st_mode & 0o111 else 0o100644
+
+
+def _tree_entries(prefix: str, source: Path, version: str) -> list[tuple[str, bytes, int]]:
     """Return directory, plugin-tree and generated ``VERSION`` entries."""
     files = plugin_files(source)
     directories = {prefix}
@@ -166,24 +174,28 @@ def _tree_entries(prefix: str, source: Path, version: str) -> list[tuple[str, by
         for index in range(1, len(parts) + 1):
             directories.add(f"{prefix}/{'/'.join(parts[:index])}")
 
-    entries: list[tuple[str, bytes]] = [(directory + "/", b"") for directory in directories]
-    entries.extend((f"{prefix}/{relative}", path.read_bytes()) for relative, path in files)
-    entries.append((f"{prefix}/VERSION", f"{version}\n".encode()))
+    entries: list[tuple[str, bytes, int]] = [
+        (directory + "/", b"", 0o40755) for directory in directories
+    ]
+    entries.extend(
+        (f"{prefix}/{relative}", path.read_bytes(), _file_mode(path)) for relative, path in files
+    )
+    entries.append((f"{prefix}/VERSION", f"{version}\n".encode(), 0o100644))
     return entries
 
 
-def _write_archive(output: Path, entries: list[tuple[str, bytes]]) -> Path:
+def _write_archive(output: Path, entries: list[tuple[str, bytes, int]]) -> Path:
     output.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        for name, payload in sorted(entries, key=lambda item: item[0]):
+        for name, payload, mode in sorted(entries, key=lambda item: item[0]):
             info = zipfile.ZipInfo(name, date_time=_ZIP_TIMESTAMP)
             info.create_system = 3
+            info.external_attr = mode << 16
             if name.endswith("/"):
                 info.compress_type = zipfile.ZIP_STORED
-                info.external_attr = (0o40755 << 16) | 0x10
+                info.external_attr |= 0x10
             else:
                 info.compress_type = zipfile.ZIP_DEFLATED
-                info.external_attr = 0o100644 << 16
             archive.writestr(info, payload)
     return output
 
@@ -208,15 +220,14 @@ def build_pcm(
 ) -> Path:
     """Build the Plugin and Content Manager archive."""
     project = project if project is not None else load_project()
-    entries = [("plugins/", b"")]
-    entries.extend(_tree_entries(PCM_PLUGIN_ROOT, source, str(project["version"])))
+    entries = _tree_entries(PCM_PLUGIN_ROOT, source, str(project["version"]))
     metadata = json.dumps(pcm_metadata(project), indent=2, sort_keys=True) + "\n"
-    entries.append(("metadata.json", metadata.encode("utf-8")))
+    entries.append(("metadata.json", metadata.encode("utf-8"), 0o100644))
 
     icon = find_icon(source)
     if icon is not None:
-        entries.append(("resources/", b""))
-        entries.append(("resources/icon.png", icon.read_bytes()))
+        entries.append(("resources/", b"", 0o40755))
+        entries.append(("resources/icon.png", icon.read_bytes(), _file_mode(icon)))
 
     return _write_archive(output, entries)
 

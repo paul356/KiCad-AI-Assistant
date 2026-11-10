@@ -5,10 +5,12 @@ This is the KiCad action plugin entry point. KiCad discovers this file via
 the plugin directory and calls KiCadAIPlugin().register() at startup.
 
 Usage:
-  Copy or symlink this directory into KiCad's plugin search path:
-    - Linux:   ~/.local/share/kicad/<ver>/scripting/plugins/kicad_ai_plugin/
-    - macOS:   ~/Library/Preferences/kicad/<ver>/scripting/plugins/kicad_ai_plugin/
-    - Windows: %APPDATA%\\kicad\\<ver>\\scripting\\plugins\\kicad_ai_plugin\\
+  Manual install (unzip kicad_ai_assistant.zip):
+    - Linux:   ~/.local/share/kicad/<ver>/scripting/plugins/kicad_ai_assistant/
+    - macOS:   ~/Documents/KiCad/<ver>/scripting/plugins/kicad_ai_assistant/
+    - Windows: %USERPROFILE%\\Documents\\KiCad\\<ver>\\scripting\\plugins\\kicad_ai_assistant\\
+  PCM install (kicad_ai_assistant_pcm.zip):
+    <documents>/kicad/<ver>/3rdparty/plugins/com_github_paul356_kicad-ai-assistant/
 """
 
 import logging

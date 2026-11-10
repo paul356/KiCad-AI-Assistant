@@ -70,7 +70,7 @@ cd KiCad-AI-Assistant
 - `kicad_ai_assistant.zip` — 用于手动安装和面板内更新器。
 - `kicad_ai_assistant_pcm.zip` — 用于 KiCad 的插件与内容管理器（Plugin and Content Manager，"Install from File…"）。
 
-两者安装的是同一个插件目录，只是目标位置不同。下文的 `10.0` 是你的 KiCad `<major>.<minor>` 版本。设置 `KICAD_DOCUMENTS_HOME` 可在所有系统上覆盖文档目录。
+两者安装的插件内容相同，但安装后的文件夹名不同（手动安装为 `kicad_ai_assistant/`，PCM 安装为 `com_github_paul356_kicad-ai-assistant/`）。下文的 `10.0` 是你的 KiCad `<major>.<minor>` 版本。设置 `KICAD_DOCUMENTS_HOME` 可在所有系统上覆盖文档目录。
 
 | 系统 | 手动安装：`scripting/plugins` | PCM 安装：`3rdparty/plugins` |
 |------|-------------------------------|------------------------------|
@@ -101,9 +101,9 @@ New-Item -ItemType Directory -Force -Path $KICAD_PLUGIN_DIR
 Expand-Archive -Path kicad_ai_assistant.zip -DestinationPath $KICAD_PLUGIN_DIR
 ```
 
-压缩包已经包含 `kicad_ai_assistant/` 根目录，**必须保持这个名称**：重命名后 KiCad 将看不到插件。不要把这个压缩包手工解压到 `3rdparty/plugins`——该目录由插件与内容管理器管理，手工复制的文件夹不算 PCM 安装。
+压缩包已经包含 `kicad_ai_assistant/` 根目录。请保持这个名称，以便文档中的路径、更新器的 `ZIP_ROOT` 和插件自身的导入保持一致。不要把这个压缩包手工解压到 `3rdparty/plugins`——该目录由插件与内容管理器管理，手工复制的文件夹不算 PCM 安装。
 
-**插件与内容管理器（PCM）：** 打开 **Preferences → Plugin and Content Manager → Install from File…**，选择 `kicad_ai_assistant_pcm.zip`。KiCad 会把它解压到 `<3rdparty>/plugins/com_github_paul356_kicad-ai-assistant/`。不要自行解压这个压缩包。
+**插件与内容管理器（PCM）：** 打开 **Preferences → Plugin and Content Manager → Install from File…**，选择 `kicad_ai_assistant_pcm.zip`。KiCad 会把它解压到 `<3rdparty>/plugins/com_github_paul356_kicad-ai-assistant/`；该包目录就是插件目录（`__init__.py` 直接位于其中）。不要自行解压这个压缩包。
 
 或从源码构建：
 
@@ -159,14 +159,14 @@ PCM 安装时，请在 `...\3rdparty\plugins\com_github_paul356_kicad-ai-assista
 
 1. 打开 KiCad 并加载你的项目。
 2. 打开 **PCB 编辑器**。
-3. 进入 **Preferences → Plugins**，启用 **Enable KiCad API**。面板需要该 IPC 套接字来执行 **Reload PCB** 和 `update_pcb_from_schematic` 工具；未启用时这两项会失败，但直接编辑文件的功能仍然可用。通过 PCM 安装插件包后 KiCad 会自动提示启用；手动安装不会提示。
+3. 进入 **Preferences → Plugins**，启用 **Enable KiCad API**。面板需要该 IPC 套接字来执行 **Reload PCB** 和 `update_pcb_from_schematic` 工具；未启用时这两项会失败，但直接编辑文件的功能仍然可用。本安装包未声明 IPC 运行时，因此 KiCad 不会提示启用，请手动开启。
 4. 依次点击 **Tools → External Plugins → Refresh Plugins**。
 5. 在插件列表中点击 **KiCad AI Assistant**，打开聊天面板。
 6. 进入 **Options → Settings**，输入你的 LLM API Key。
 
 ## 插件配置
 
-插件配置文件路径：`~/.config/kicad/kicad_ai_assistant.json`
+插件配置文件路径：`~/.config/kicad/10.0/kcaa/kicad_ai_assistant.json`
 
 所有设置均可通过插件面板的 **Options → Settings** 修改：
 

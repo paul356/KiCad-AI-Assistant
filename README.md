@@ -70,7 +70,7 @@ Two release archives are published:
 - `kicad_ai_assistant.zip` — manual installation and the in-panel updater.
 - `kicad_ai_assistant_pcm.zip` — installation through KiCad's Plugin and Content Manager ("Install from File…").
 
-Both install the same plugin folder; only the target directory differs. `10.0` below is your KiCad `<major>.<minor>` version. `KICAD_DOCUMENTS_HOME` overrides the documents directory on every OS.
+Both install the same plugin contents; the installed folder names differ (`kicad_ai_assistant/` for manual installs, `com_github_paul356_kicad-ai-assistant/` for PCM). `10.0` below is your KiCad `<major>.<minor>` version. `KICAD_DOCUMENTS_HOME` overrides the documents directory on every OS.
 
 | OS | Manual install: `scripting/plugins` | PCM install: `3rdparty/plugins` |
 |----|-------------------------------------|---------------------------------|
@@ -101,9 +101,9 @@ New-Item -ItemType Directory -Force -Path $KICAD_PLUGIN_DIR
 Expand-Archive -Path kicad_ai_assistant.zip -DestinationPath $KICAD_PLUGIN_DIR
 ```
 
-The archive already contains the `kicad_ai_assistant/` root directory. **Keep that name**: renaming the folder makes the plugin invisible to KiCad. Do not hand-unzip this archive into `3rdparty/plugins` — that directory belongs to the Plugin and Content Manager, and a manually copied folder there is not a PCM install.
+The archive already contains the `kicad_ai_assistant/` root directory. Keep that name so the documented paths, the updater's `ZIP_ROOT`, and the package's own imports match. Do not hand-unzip this archive into `3rdparty/plugins` — that directory belongs to the Plugin and Content Manager, and a manually copied folder there is not a PCM install.
 
-**Plugin and Content Manager:** open **Preferences → Plugin and Content Manager → Install from File…** and select `kicad_ai_assistant_pcm.zip`. KiCad extracts the package to `<3rdparty>/plugins/com_github_paul356_kicad-ai-assistant/`. Do not unzip this archive yourself.
+**Plugin and Content Manager:** open **Preferences → Plugin and Content Manager → Install from File…** and select `kicad_ai_assistant_pcm.zip`. KiCad extracts the package to `<3rdparty>/plugins/com_github_paul356_kicad-ai-assistant/`; that package directory is the plugin directory (its `__init__.py` sits directly inside it). Do not unzip this archive yourself.
 
 Or build from source:
 
@@ -159,7 +159,7 @@ The short version of these instructions also ships inside the plugin zip (`kicad
 
 1. Open KiCad and load your project.
 2. Open the **PCB Editor**.
-3. Go to **Preferences → Plugins** and enable **Enable KiCad API**. The panel needs this IPC socket for **Reload PCB** and the `update_pcb_from_schematic` tool; without it those two fail, while file-based editing keeps working. PCM prompts for this automatically after installing a plugin package; a manual install does not.
+3. Go to **Preferences → Plugins** and enable **Enable KiCad API**. The panel needs this IPC socket for **Reload PCB** and the `update_pcb_from_schematic` tool; without it those two fail, while file-based editing keeps working. This package does not declare the IPC runtime, so KiCad does not prompt for the toggle — enable it manually.
 4. Go to **Tools → External Plugins → Refresh Plugins**.
 5. Click **KiCad AI Assistant** in the plugin list to open the chat panel.
 6. Go to **Options → Settings** and enter your LLM API key.
@@ -168,7 +168,7 @@ The short version of these instructions also ships inside the plugin zip (`kicad
 
 Plugin settings are stored in the KiCad user config directory:
 
-Settings file: `~/.config/kicad/kicad_ai_assistant.json`
+Settings file: `~/.config/kicad/10.0/kcaa/kicad_ai_assistant.json`
 
 All settings can be changed through **Options → Settings** in the plugin panel:
 
