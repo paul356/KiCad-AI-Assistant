@@ -2,7 +2,7 @@
 name: symbol-library
 priority: 80
 description: "Symbol index sync, full-text search, pin details, bbox geometry in library space"
-tools: [sync_symbol_index, get_symbol_sync_status, search_library_symbols, get_library_symbol, get_library_symbol_pins, list_symbol_libraries, list_library_symbols, get_symbol_index_stats]
+tools: [sync_symbol_index, get_symbol_sync_status, search_library_symbols, get_library_symbol, get_library_symbol_pins, list_symbol_libraries, list_library_symbols, get_symbol_index_stats, update_library_symbol_pin]
 ---
 # Tools overview
 - **sync_symbol_index(project_path?)** — Start background sync of the symbol index database.
@@ -61,6 +61,32 @@ project's own `sym-lib-table`; other projects are never searched. Call tools aga
   (e.g. `"Device/R_Small"`), **not** just the table name (e.g. not `"Device"`).
 - All library-name fields returned by search/lookup tools use this format and are
   ready to pass directly to `add_symbol_to_schematic`, `get_library_symbol`, etc.
+
+# Fixing pin numbers / names
+When a symbol's pins do not match the footprint pads (e.g. pins numbered `P$1`,
+`P$2` but pads `1`, `2`), inspect with **get_library_symbol_pins** first, then fix
+the definition with **update_library_symbol_pin(project_dir, lib_id, pins)**.
+`project_dir` is required — pass `active_project`; the project's
+`sym-lib-table` is searched first, then the global table. `lib_id` is
+`"Library:Symbol"` — the library nickname as registered in sym-lib-table plus
+the plain symbol name inside it — and it is split on the first colon; there is
+no guessing or fallback lookup. `pins` is a non-empty list (max 256) of
+`{pin_number, new_number?, new_name?}` entries — one entry per pin; selectors
+match the pre-edit state, so chain/cycle renames are applied simultaneously and
+validated against the final state. A pin number is the identity of a physical
+connection, so a rename hits every definition that carries it. Numbers stay
+unique where they were unique: a batch that would give two pins of the same
+part the same number is rejected, while duplicates that already existed
+(stacked pins, KiCad's duplicate-pin jumpers) stay legal and can be
+renumbered together.
+Pin names are not required to be unique and may be empty. A new number that
+duplicates a pin KiCad resolves separately (another part of a multi-part
+symbol) is allowed with a warning; a duplicate inside the same part is
+rejected. The `.kicad_sym` file is edited
+in place in one write (one `.bak`) and only the pin literals change. Schematics
+that already embed the old definition are **not** updated — call
+**update_schematic_symbol_pin** afterwards for already placed parts. Do this
+before `set_symbol_property` assigns the footprint.
 
 # Caveats & gotchas
 - `sync_symbol_index` returns `status: "already_running"` if called while a sync is

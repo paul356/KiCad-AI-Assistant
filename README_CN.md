@@ -210,6 +210,7 @@ kcaa
 | `delete_symbol_library` | 删除空符号库（连同文件、库表条目和索引） |
 | `add_symbols_to_library` | 将原理图缓存 `lib_symbols` 中的符号复制到已有符号库 |
 | `remove_symbols_from_library` | 从符号库中删除指定符号定义并重新建立索引 |
+| `update_library_symbol_pin` | 修改符号库定义中的引脚编号和/或引脚名称（保持文件其余字节不变） |
 | `find_symbols_not_in_libraries` | 列出在所有可用符号库中都解析不到的原理图符号（只读） |
 
 ### 原理图编辑
@@ -222,6 +223,7 @@ kcaa
 | `remove_symbol_from_schematic` | 按位号删除已放置的符号 |
 | `move_component` | 移动/旋转已放置的元件 |
 | `set_symbol_property` | 设置已放置符号的属性字段 |
+| `update_schematic_symbol_pin` | 修改原理图缓存 `lib_symbols` 中的引脚编号和/或引脚名称 |
 | `rename_symbol` | 重命名已放置符号的位号 |
 | `list_symbol_properties` | 列出已放置原理图符号的属性（名称 → 值），不含几何、位置或网络 |
 | `delete_symbol_property` | 删除已放置符号的属性 |
