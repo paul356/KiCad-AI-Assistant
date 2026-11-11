@@ -4431,7 +4431,7 @@ class LLMClient:
                 ):
                     content_text = thinking_text
                     used_thinking = True
-                if tool_calls and not content_text.strip():
+                if (tool_calls or finish_reason == "tool_calls") and not content_text.strip():
                     # Whitespace-only content on a tool-call turn is noise: the
                     # UI and history must show nothing for that message.
                     content_text = ""
@@ -4877,11 +4877,12 @@ class LLMClient:
                 and thinking.strip()
             ):
                 msg = {**msg, "content": thinking}
-        if has_tool_calls:
+        if has_tool_calls or finish_reason == "tool_calls":
             content = msg.get("content") if isinstance(msg, dict) else None
             if not isinstance(content, str) or not content.strip():
                 msg = {**msg, "content": ""}
-            msg = {**msg, "tool_calls": _normalize_tool_calls(msg["tool_calls"])}
+            if has_tool_calls:
+                msg = {**msg, "tool_calls": _normalize_tool_calls(msg["tool_calls"])}
         return {
             "finish_reason": finish_reason,
             "message": msg,

@@ -3967,6 +3967,32 @@ class TestToolCallArgumentsNormalization:
         assert without_events["message"]["content"] == ""
         assert without_events["finish_reason"] == "tool_calls"
 
+    def test_stream_ollama_thinking_only_without_callback_returns_thinking(self):
+        """``on_stream_event=None`` still applies the thinking fallback on a
+        normal (``done_reason="stop"``) reply."""
+        client = _make_client()
+        client._settings.llm_provider = "ollama"
+        lines = [
+            json.dumps(
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "thinking": "answer",
+                    },
+                    "done": False,
+                }
+            ),
+            '{"done":true,"done_reason":"stop"}',
+        ]
+        mock_resp = self._make_line_response(lines)
+        with patch("kicad_plugin.llm_client._urlopen", return_value=mock_resp):
+            result = client._stream_ollama("sys", [], on_stream_event=None)
+
+        assert "error" not in result, result.get("error")
+        assert result["finish_reason"] == "stop"
+        assert result["message"]["content"] == "answer"
+
     def test_stream_ollama_preserves_thinking_crlf(self):
         """CRLF sequences and blank-line gaps in thinking survive verbatim."""
         client = _make_client()
@@ -4049,6 +4075,34 @@ class TestToolCallArgumentsNormalization:
         assert result["message"]["content"] == ""
         assert [e for e in events if e["type"] == "text_chunk"] == []
 
+    def test_stream_ollama_non_string_thinking_without_tool_gate(self):
+        """On a normal reply, non-string thinking is ignored and content stays
+        empty without a fallback or crash."""
+        client = _make_client()
+        client._settings.llm_provider = "ollama"
+        lines = [
+            json.dumps(
+                {"message": {"role": "assistant", "content": "", "thinking": None}, "done": False}
+            ),
+            json.dumps(
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "thinking": {"text": "no"},
+                    },
+                    "done": False,
+                }
+            ),
+            '{"done":true,"done_reason":"stop"}',
+        ]
+        result, _, events = self._run_stream_ollama(client, lines)
+
+        assert "error" not in result, result.get("error")
+        assert result["finish_reason"] == "stop"
+        assert result["message"]["content"] == ""
+        assert [e for e in events if e["type"] == "text_chunk"] == []
+
     def test_stream_ollama_malformed_tool_calls_reason_blocks_fallback(self):
         """A ``tool_calls`` finish reason without any parsed call must not turn
         reasoning into content."""
@@ -4090,6 +4144,111 @@ class TestToolCallArgumentsNormalization:
 
         assert result["finish_reason"] == "tool_calls"
         assert result["message"]["content"] == ""
+
+    def test_stream_ollama_malformed_tool_calls_normalises_whitespace(self):
+        """A call-less ``tool_calls`` reason still normalises whitespace-only
+        content to "" and emits no chunk."""
+        client = _make_client()
+        client._settings.llm_provider = "ollama"
+        lines = [
+            json.dumps(
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "\n",
+                        "thinking": "reason",
+                    },
+                    "done": False,
+                }
+            ),
+            '{"done":true,"done_reason":"tool_calls"}',
+        ]
+        result, _, events = self._run_stream_ollama(client, lines)
+
+        assert "error" not in result, result.get("error")
+        assert result["finish_reason"] == "tool_calls"
+        assert result["message"]["content"] == ""
+        assert [e for e in events if e["type"] == "text_chunk"] == []
+
+    def test_call_ollama_malformed_tool_calls_normalises_whitespace(self):
+        """Non-streaming: a call-less ``tool_calls`` reason normalises
+        whitespace-only content to ""."""
+        client = _make_client()
+        client._settings.llm_provider = "ollama"
+        body = {
+            "message": {
+                "role": "assistant",
+                "content": "\n",
+                "thinking": "reason",
+            },
+            "done_reason": "tool_calls",
+        }
+        result, _ = self._run_call_ollama(client, body)
+
+        assert "error" not in result, result.get("error")
+        assert result["finish_reason"] == "tool_calls"
+        assert result["message"]["content"] == ""
+
+    def test_stream_ollama_tool_call_with_length_reason_stays_empty(self):
+        """A parsed call reports ``tool_calls`` even when the server's done
+        reason is ``length``; whitespace content is still dropped."""
+        client = _make_client()
+        client._settings.llm_provider = "ollama"
+        lines = [
+            json.dumps(
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "\n",
+                        "thinking": "reason",
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "function": {
+                                    "name": "get_board_info",
+                                    "arguments": {"detail": "full"},
+                                },
+                            }
+                        ],
+                    },
+                    "done": False,
+                }
+            ),
+            '{"done":true,"done_reason":"length"}',
+        ]
+        result, _, events = self._run_stream_ollama(client, lines)
+
+        assert "error" not in result, result.get("error")
+        assert result["finish_reason"] == "tool_calls"
+        assert result["message"]["content"] == ""
+        assert result["message"]["tool_calls"][0]["function"]["name"] == "get_board_info"
+        assert [e for e in events if e["type"] == "text_chunk"] == []
+        assert all("reason" not in (e.get("content") or "") for e in events)
+
+    def test_call_ollama_tool_call_with_content_preserves_it(self):
+        """Non-streaming tool calls keep real content verbatim while arguments
+        are normalised to JSON strings."""
+        client = _make_client()
+        client._settings.llm_provider = "ollama"
+        body = {
+            "message": {
+                "role": "assistant",
+                "content": "Board info follows.",
+                "thinking": "reason",
+                "tool_calls": [
+                    {"function": {"name": "get_board_info", "arguments": {"detail": "full"}}}
+                ],
+            },
+            "done_reason": "stop",
+        }
+        result, _ = self._run_call_ollama(client, body)
+
+        assert "error" not in result, result.get("error")
+        assert result["finish_reason"] == "tool_calls"
+        assert result["message"]["content"] == "Board info follows."
+        arguments = result["message"]["tool_calls"][0]["function"]["arguments"]
+        assert isinstance(arguments, str)
+        assert json.loads(arguments) == {"detail": "full"}
 
     def test_stream_ollama_http_error_includes_body(self):
         """A rejected second-round payload (HTTP 400) must show the provider's
