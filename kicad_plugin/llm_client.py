@@ -4421,10 +4421,21 @@ class LLMClient:
                 # Some models answer only in ``message.thinking``, which would
                 # otherwise leave the assistant message blank.  Treat that
                 # reasoning as the reply when no content was produced — but
-                # never for a tool-call turn, whose content must stay empty.
-                if not tool_calls and not content_text.strip() and thinking_text.strip():
+                # never for a tool-call turn (even an unparsable one), whose
+                # content must stay empty.
+                if (
+                    not tool_calls
+                    and finish_reason != "tool_calls"
+                    and not content_text.strip()
+                    and thinking_text.strip()
+                ):
                     content_text = thinking_text
                     used_thinking = True
+                if tool_calls and not content_text.strip():
+                    # Whitespace-only content on a tool-call turn is noise: the
+                    # UI and history must show nothing for that message.
+                    content_text = ""
+                    pending_whitespace.clear()
                 message: dict[str, Any] = {"content": content_text}
                 if tool_calls:
                     message["tool_calls"] = tool_calls
@@ -4848,11 +4859,16 @@ class LLMClient:
             and isinstance(msg.get("tool_calls"), list)
             and bool(msg["tool_calls"])
         )
+        # Ollama's DoneReason is only stop/length/connection_closed, so a
+        # tool-call turn is identified by the message payload; otherwise keep
+        # the provider's reason (e.g. "length" when num_predict truncates).
+        finish_reason = "tool_calls" if has_tool_calls else body.get("done_reason", "stop")
         # Some models answer only in ``message.thinking``, which this client
         # would otherwise drop, leaving the assistant message blank.  Treat
         # that reasoning as the reply when no content was produced — but never
-        # for a tool-call turn, whose content must stay empty.
-        if not has_tool_calls and isinstance(msg, dict):
+        # for a tool-call turn (even an unparsable one), whose content must
+        # stay empty.
+        if not has_tool_calls and finish_reason != "tool_calls" and isinstance(msg, dict):
             content = msg.get("content")
             thinking = msg.get("thinking")
             if (
@@ -4862,11 +4878,10 @@ class LLMClient:
             ):
                 msg = {**msg, "content": thinking}
         if has_tool_calls:
+            content = msg.get("content") if isinstance(msg, dict) else None
+            if not isinstance(content, str) or not content.strip():
+                msg = {**msg, "content": ""}
             msg = {**msg, "tool_calls": _normalize_tool_calls(msg["tool_calls"])}
-        # Ollama's DoneReason is only stop/length/connection_closed, so a
-        # tool-call turn is identified by the message payload; otherwise keep
-        # the provider's reason (e.g. "length" when num_predict truncates).
-        finish_reason = "tool_calls" if has_tool_calls else body.get("done_reason", "stop")
         return {
             "finish_reason": finish_reason,
             "message": msg,
