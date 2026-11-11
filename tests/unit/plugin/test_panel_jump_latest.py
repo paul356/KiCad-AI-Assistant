@@ -17,7 +17,10 @@ from pathlib import Path
 import textwrap
 from types import SimpleNamespace
 
+import pytest
+
 import kicad_plugin.ui.panel as _panel_module
+from kicad_plugin.ui.panel import _jump_arrow_geometry
 
 _MODULE_SOURCE = Path(_panel_module.__file__).read_text(encoding="utf-8")
 _MODULE_TREE = ast.parse(_MODULE_SOURCE, filename=str(_panel_module.__file__))
@@ -129,9 +132,12 @@ def test_send_row_puts_the_status_dot_after_send() -> None:
 
 def test_jump_buttons_have_tooltips_and_accessible_names() -> None:
     source = _source(_function("_build_ui"))
-    for label in ("Jump to start", "Jump to latest"):
-        assert f'.SetToolTip("{label}")' in source
-        assert f'.SetName("{label}")' in source
+    for widget, label in (
+        ("_jump_top_btn", "Jump to start"),
+        ("_jump_latest_btn", "Jump to latest"),
+    ):
+        assert f'self.{widget}.SetToolTip("{label}")' in source
+        assert f'self.{widget}.SetName("{label}")' in source
 
 
 def test_jump_buttons_bind_their_handlers() -> None:
@@ -141,17 +147,37 @@ def test_jump_buttons_bind_their_handlers() -> None:
 
 
 def test_jump_buttons_are_always_visible() -> None:
-    """Visibility is not tied to scroll position; no Show/Enable toggling."""
+    """Both buttons exist and no visibility call touches them."""
+    source = _source(_function("_build_ui"))
     for name in ("_jump_top_btn", "_jump_latest_btn"):
-        assert f"{name}.Show(" not in _MODULE_SOURCE
-        assert f"{name}.Enable(" not in _MODULE_SOURCE
+        assert f"self.{name} = wx.BitmapButton(" in source
+        for method in ("Show(", "Hide(", "Enable(", "Disable("):
+            assert f"self.{name}.{method}" not in _MODULE_SOURCE
+
+
+@pytest.mark.parametrize(
+    ("direction", "expected"),
+    [("up", (6.0, 22.0, 12.0)), ("down", (22.0, 6.0, 16.0))],
+)
+def test_jump_arrow_geometry(direction: str, expected: tuple[float, float, float]) -> None:
+    assert _jump_arrow_geometry(28, direction) == expected
+
+
+@pytest.mark.parametrize("direction", ["Up", "top", ""])
+def test_jump_arrow_geometry_rejects_unknown_directions(direction: str) -> None:
+    with pytest.raises(ValueError):
+        _jump_arrow_geometry(28, direction)
 
 
 def test_jump_bitmap_helper_draws_both_directions() -> None:
     source = _source(_function("_make_jump_bitmap"))
     assert "GraphicsContext.Create" in source
-    assert 'direction == "up"' in source
+    assert "gc.StrokeLine(" in source
+    assert "gc.FillPath(" in source
+    assert "_jump_arrow_geometry(size, direction)" in source
     assert "size: int = 28" in source
+    for direction in ("up", "down"):
+        assert len(_jump_arrow_geometry(28, direction)) == 3
 
 
 # --------------------------------------------------------------------------- #

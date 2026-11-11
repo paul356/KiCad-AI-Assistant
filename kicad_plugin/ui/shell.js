@@ -147,7 +147,7 @@ function _shouldScrollBottom() {
 // ---- Jump to edges ----
 // The native panel buttons call these; no DOM state is involved.
 window._jumpToLatest = function() {
-    window.scrollTo(0, document.body.scrollHeight);
+    window.scrollTo(0, document.body ? document.body.scrollHeight : 0);
 };
 
 window._jumpToStart = function() {

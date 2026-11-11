@@ -154,6 +154,15 @@ def _update_check_message(result, current: str, editable: bool = False) -> str |
     return f"You are running the latest version ({current})."
 
 
+def _jump_arrow_geometry(size: int, direction: str) -> tuple[float, float, float]:
+    """Return (tip_y, tail_y, head_y) for the up/down jump arrows."""
+    if direction == "up":
+        return (6.0, float(size - 6), 12.0)
+    if direction == "down":
+        return (float(size - 6), 6.0, float(size - 12))
+    raise ValueError(f"unknown jump arrow direction: {direction!r}")
+
+
 if _WX_AVAILABLE:
 
     class _FileDropTarget(wx.FileDropTarget):
@@ -1436,10 +1445,7 @@ if _WX_AVAILABLE:
             gc.SetPen(wx.Pen(colour, 2))
             gc.SetBrush(wx.Brush(colour))
             cx = size / 2
-            if direction == "up":
-                tip_y, tail_y, head_y = 6, size - 6, 12
-            else:
-                tip_y, tail_y, head_y = size - 6, 6, size - 12
+            tip_y, tail_y, head_y = _jump_arrow_geometry(size, direction)
             gc.StrokeLine(cx, tail_y, cx, tip_y)
             path = gc.CreatePath()
             path.MoveToPoint(cx, tip_y)
