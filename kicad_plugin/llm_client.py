@@ -4288,6 +4288,16 @@ class LLMClient:
             with _urlopen(req, 300) as resp:
                 text_parts = []
                 thinking_parts: list[str] = []
+                pending_whitespace: list[str] = []
+
+                def emit_text(chunk_text: str) -> None:
+                    if on_stream_event is None:
+                        return
+                    try:
+                        on_stream_event({"type": "text_chunk", "content": chunk_text})
+                    except Exception as e:
+                        log.error("Text delta callback error in Ollama streaming: %s", e)
+
                 if on_stream_event is not None:
                     on_stream_event({"type": "text_start"})
                 tool_calls_by_index: dict[int, dict] = {}
@@ -4319,12 +4329,12 @@ class LLMClient:
                         if isinstance(content, str):
                             if content:
                                 text_parts.append(content)
-                                try:
-                                    on_stream_event({"type": "text_chunk", "content": content})
-                                except Exception as e:
-                                    log.error(
-                                        "Text delta callback error in Ollama streaming: %s", e
-                                    )
+                                if on_stream_event is not None:
+                                    if content.strip():
+                                        emit_text("".join(pending_whitespace) + content)
+                                        pending_whitespace.clear()
+                                    else:
+                                        pending_whitespace.append(content)
                         elif content:
                             # Some compatible endpoints return content blocks
                             # (list/dict).  Joining them would raise TypeError
@@ -4410,8 +4420,9 @@ class LLMClient:
                 used_thinking = False
                 # Some models answer only in ``message.thinking``, which would
                 # otherwise leave the assistant message blank.  Treat that
-                # reasoning as the reply when no content was produced.
-                if not content_text.strip() and thinking_text.strip():
+                # reasoning as the reply when no content was produced — but
+                # never for a tool-call turn, whose content must stay empty.
+                if not tool_calls and not content_text.strip() and thinking_text.strip():
                     content_text = thinking_text
                     used_thinking = True
                 message: dict[str, Any] = {"content": content_text}
@@ -4419,10 +4430,11 @@ class LLMClient:
                     message["tool_calls"] = tool_calls
                 if on_stream_event is not None:
                     if used_thinking:
-                        try:
-                            on_stream_event({"type": "text_chunk", "content": content_text})
-                        except Exception as e:
-                            log.error("Text delta callback error in Ollama streaming: %s", e)
+                        # Buffered whitespace would duplicate the fallback text.
+                        emit_text(content_text)
+                    elif pending_whitespace:
+                        # No fallback: keep the streamed text equal to content.
+                        emit_text("".join(pending_whitespace))
                     on_stream_event({"type": "text_end"})
                 return {"finish_reason": finish_reason, "message": message}
 
@@ -4829,10 +4841,18 @@ class LLMClient:
             return {"error": f"Unexpected response from Ollama: {text[:200]}"}
 
         msg = body.get("message", {})
+        # Ollama returns tool-call arguments as JSON objects; normalize the
+        # copy we hand back so downstream json.loads(arguments) works.
+        has_tool_calls = (
+            isinstance(msg, dict)
+            and isinstance(msg.get("tool_calls"), list)
+            and bool(msg["tool_calls"])
+        )
         # Some models answer only in ``message.thinking``, which this client
         # would otherwise drop, leaving the assistant message blank.  Treat
-        # that reasoning as the reply when no content was produced.
-        if isinstance(msg, dict):
+        # that reasoning as the reply when no content was produced — but never
+        # for a tool-call turn, whose content must stay empty.
+        if not has_tool_calls and isinstance(msg, dict):
             content = msg.get("content")
             thinking = msg.get("thinking")
             if (
@@ -4841,13 +4861,6 @@ class LLMClient:
                 and thinking.strip()
             ):
                 msg = {**msg, "content": thinking}
-        # Ollama returns tool-call arguments as JSON objects; normalize the
-        # copy we hand back so downstream json.loads(arguments) works.
-        has_tool_calls = (
-            isinstance(msg, dict)
-            and isinstance(msg.get("tool_calls"), list)
-            and bool(msg["tool_calls"])
-        )
         if has_tool_calls:
             msg = {**msg, "tool_calls": _normalize_tool_calls(msg["tool_calls"])}
         # Ollama's DoneReason is only stop/length/connection_closed, so a
