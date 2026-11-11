@@ -4273,6 +4273,10 @@ class LLMClient:
             "messages": messages,
             "tools": tools or None,
             "stream": True,
+            # Without this, reasoning-capable models return their answer in
+            # ``message.thinking``, which this client never reads, so the
+            # chat renders blank.  Older servers/models ignore the flag.
+            "think": False,
             "options": {"num_ctx": self._context_tokens},
         }
         if self._max_tokens > 0:
@@ -4760,6 +4764,10 @@ class LLMClient:
             "messages": messages,
             "tools": tools or None,
             "stream": False,
+            # Without this, reasoning-capable models return their answer in
+            # ``message.thinking``, which this client never reads, so the
+            # chat renders blank.  Older servers/models ignore the flag.
+            "think": False,
             "options": {"num_ctx": self._context_tokens},
         }
         if self._max_tokens > 0:

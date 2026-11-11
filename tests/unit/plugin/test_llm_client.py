@@ -3557,6 +3557,44 @@ class TestToolCallArgumentsNormalization:
         sent = next(m for m in captured["body"]["messages"] if m.get("role") == "assistant")
         assert sent["tool_calls"][0]["function"]["arguments"] == {"detail": "full"}
 
+    def test_stream_ollama_request_disables_thinking(self):
+        """Issue #273: reasoning models otherwise return the whole reply in
+        ``message.thinking``, which this client never reads, leaving the chat
+        blank.  The streaming request must carry a JSON ``false``."""
+        client = _make_client()
+        client._settings.llm_provider = "ollama"
+        captured: dict[str, object] = {}
+        mock_resp = self._make_line_response(['{"done":true,"done_reason":"stop"}'])
+
+        def _fake_urlopen(req, timeout, **kwargs):
+            captured["body"] = json.loads(req.data.decode())
+            return mock_resp
+
+        with patch("kicad_plugin.llm_client._urlopen", side_effect=_fake_urlopen):
+            client._stream_ollama("sys", [], on_stream_event=lambda evt: None)
+
+        body = captured["body"]
+        assert body["stream"] is True
+        assert body["think"] is False
+
+    def test_call_ollama_request_disables_thinking(self):
+        """Issue #273: same flag on the non-streaming request path."""
+        client = _make_client()
+        client._settings.llm_provider = "ollama"
+        captured: dict[str, object] = {}
+
+        def _fake_post(url, headers, payload, timeout=300):
+            captured["body"] = json.loads(payload.decode())
+            return 200, '{"message":{"role":"assistant","content":"hi"}}'
+
+        with patch("kicad_plugin.llm_client._https_post_json", side_effect=_fake_post):
+            result = client._call_ollama("sys", [])
+
+        assert "error" not in result, result.get("error")
+        body = captured["body"]
+        assert body["stream"] is False
+        assert body["think"] is False
+
     def test_stream_ollama_http_error_includes_body(self):
         """A rejected second-round payload (HTTP 400) must show the provider's
         body, not a bare status code."""
