@@ -3220,7 +3220,11 @@ class TestToolCallArgumentsNormalization:
         assert isinstance(tc["function"]["arguments"], str)
         assert json.loads(tc["function"]["arguments"]) == {"detail": "full"}
         assert tc["id"] == ""
-        assert result["finish_reason"] == "stop"
+        # #272: an accumulated tool call reports "tool_calls" even when the
+        # provider's done_reason says "stop".  The value coincides with what
+        # OpenAI-compatible providers report for tool calls; that path echoes
+        # the provider's finish_reason rather than inferring it.
+        assert result["finish_reason"] == "tool_calls"
 
     def test_stream_ollama_string_argument_fragments_still_concatenate(self):
         """The string-delta path (OpenAI-style) must keep concatenating."""
@@ -3253,7 +3257,7 @@ class TestToolCallArgumentsNormalization:
                     {"function": {"name": "get_board_info", "arguments": {"detail": "full"}}}
                 ],
             },
-            "done_reason": "tool_calls",
+            "done_reason": "stop",
         }
         with patch(
             "kicad_plugin.llm_client._https_post_json",
@@ -3266,6 +3270,26 @@ class TestToolCallArgumentsNormalization:
         arguments = result["message"]["tool_calls"][0]["function"]["arguments"]
         assert isinstance(arguments, str)
         assert json.loads(arguments) == {"detail": "full"}
+
+    def test_call_ollama_text_response_keeps_done_reason(self):
+        """Without tool calls the provider's reason (e.g. a num_predict
+        truncation) must reach the caller unchanged."""
+        client = _make_client()
+        client._settings.llm_provider = "ollama"
+        body = {
+            "message": {"role": "assistant", "content": "Partial answer"},
+            "done_reason": "length",
+        }
+        with patch(
+            "kicad_plugin.llm_client._https_post_json",
+            return_value=(200, json.dumps(body)),
+        ):
+            result = client._call_ollama("sys", [])
+
+        assert "error" not in result
+        assert result["finish_reason"] == "length"
+        assert result["message"]["content"] == "Partial answer"
+        assert "tool_calls" not in result["message"]
 
     def test_call_openai_normalizes_object_arguments(self):
         """Ollama's OpenAI-compatible endpoint (/v1/chat/completions) also
@@ -3696,6 +3720,220 @@ class TestToolCallArgumentsNormalization:
         assert original[0]["function"]["arguments"] == {"detail": "full"}
         assert normalized[0] is not original[0]
         assert normalized[0]["function"] is not original[0]["function"]
+
+
+class TestOllamaFinalChunk:
+    """Issue #272: Ollama may attach the last assistant message to the chunk
+    that also carries ``done: true``.  That message must be consumed before
+    the read loop exits instead of being dropped along with the chunk."""
+
+    def _make_line_response(self, lines):
+        data = [line.encode("utf-8") + b"\n" for line in lines] + [b""]
+        obj = MagicMock()
+        obj.readline.side_effect = data
+        obj.__enter__ = lambda s: s
+        obj.__exit__ = MagicMock(return_value=False)
+        return obj
+
+    def _stream_ollama(self, client, lines, events=None):
+        mock_resp = self._make_line_response(lines)
+        with patch("urllib.request.urlopen", return_value=mock_resp):
+            return client._stream_ollama(
+                "sys", [], on_stream_event=(events.append if events is not None else None)
+            )
+
+    def test_stream_ollama_final_chunk_tool_call_is_kept(self):
+        """A complete call in the ``done: true`` chunk must reach the caller."""
+        client = _make_client()
+        client._settings.llm_provider = "ollama"
+        lines = [
+            '{"message":{"role":"assistant","content":"","tool_calls":'
+            '[{"index":0,"id":"call_1","function":{"name":"get_board_info",'
+            '"arguments":"{\\"detail\\":\\"full\\"}"}}]},"done":true,'
+            '"done_reason":"stop"}',
+        ]
+
+        result = self._stream_ollama(client, lines)
+
+        assert "error" not in result, result.get("error")
+        tcs = result["message"]["tool_calls"]
+        assert len(tcs) == 1
+        assert tcs[0]["id"] == "call_1"
+        assert tcs[0]["function"]["name"] == "get_board_info"
+        assert isinstance(tcs[0]["function"]["arguments"], str)
+        assert json.loads(tcs[0]["function"]["arguments"]) == {"detail": "full"}
+        assert result["finish_reason"] == "tool_calls"
+
+    def test_stream_ollama_final_chunk_object_arguments_are_normalized(self):
+        """The #232 object-arguments rule also applies to the final chunk."""
+        client = _make_client()
+        client._settings.llm_provider = "ollama"
+        final = {
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"function": {"name": "list_footprints", "arguments": {"layer": "F.Cu"}}}
+                ],
+            },
+            "done": True,
+            "done_reason": "stop",
+        }
+
+        result = self._stream_ollama(client, [json.dumps(final)])
+
+        assert "error" not in result, result.get("error")
+        tcs = result["message"]["tool_calls"]
+        assert len(tcs) == 1
+        assert isinstance(tcs[0]["function"]["arguments"], str)
+        assert json.loads(tcs[0]["function"]["arguments"]) == {"layer": "F.Cu"}
+        assert result["finish_reason"] == "tool_calls"
+
+    def test_stream_ollama_tool_call_split_across_final_chunk_is_merged(self):
+        """Name and arguments arriving in different chunks share one slot."""
+        client = _make_client()
+        client._settings.llm_provider = "ollama"
+        lines = [
+            '{"message":{"role":"assistant","content":"","tool_calls":'
+            '[{"index":0,"function":{"name":"add_wire"}}]},"done":false}',
+            '{"message":{"role":"assistant","content":"","tool_calls":'
+            '[{"index":0,"function":{"arguments":"{\\"a\\":1}"}}]},"done":true,'
+            '"done_reason":"tool_calls"}',
+        ]
+
+        result = self._stream_ollama(client, lines)
+
+        assert "error" not in result, result.get("error")
+        tcs = result["message"]["tool_calls"]
+        assert len(tcs) == 1
+        assert tcs[0]["function"]["name"] == "add_wire"
+        assert tcs[0]["function"]["arguments"] == '{"a":1}'
+
+    def test_stream_ollama_final_chunk_content_and_tool_call(self):
+        """Both the text and the call in the final chunk must be kept, and the
+        text emitted exactly once."""
+        client = _make_client()
+        client._settings.llm_provider = "ollama"
+        events = []
+        final = {
+            "message": {
+                "role": "assistant",
+                "content": "Checking the board.",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "function": {
+                            "index": 0,
+                            "name": "get_board_info",
+                            "arguments": {"detail": "full"},
+                        },
+                    }
+                ],
+            },
+            "done": True,
+            "done_reason": "stop",
+        }
+
+        result = self._stream_ollama(client, [json.dumps(final)], events=events)
+
+        assert "error" not in result, result.get("error")
+        assert result["message"]["content"] == "Checking the board."
+        assert events == [
+            {"type": "text_start"},
+            {"type": "text_chunk", "content": "Checking the board."},
+            {"type": "text_end"},
+        ]
+        tcs = result["message"]["tool_calls"]
+        assert tcs[0]["function"]["name"] == "get_board_info"
+        assert json.loads(tcs[0]["function"]["arguments"]) == {"detail": "full"}
+        assert result["finish_reason"] == "tool_calls"
+
+    def test_stream_ollama_final_chunk_content_only_survives(self):
+        """A final chunk carrying only text must not be lost at the break."""
+        client = _make_client()
+        client._settings.llm_provider = "ollama"
+        events = []
+        final = {
+            "message": {"role": "assistant", "content": "Done: all nets routed."},
+            "done": True,
+            "done_reason": "stop",
+        }
+
+        result = self._stream_ollama(client, [json.dumps(final)], events=events)
+
+        assert "error" not in result, result.get("error")
+        assert result["message"]["content"] == "Done: all nets routed."
+        assert "tool_calls" not in result["message"]
+        assert events == [
+            {"type": "text_start"},
+            {"type": "text_chunk", "content": "Done: all nets routed."},
+            {"type": "text_end"},
+        ]
+        assert result["finish_reason"] == "stop"
+
+    def test_stream_ollama_eof_without_done_chunk_keeps_calls(self):
+        """A truncated stream with no ``done`` chunk still returns the calls
+        accumulated so far and reports them."""
+        client = _make_client()
+        client._settings.llm_provider = "ollama"
+        lines = [
+            '{"message":{"role":"assistant","content":"","tool_calls":'
+            '[{"index":0,"id":"call_1","function":{"name":"get_board_info",'
+            '"arguments":{"detail":"full"}}}]},"done":false}',
+        ]
+
+        result = self._stream_ollama(client, lines)
+
+        assert "error" not in result, result.get("error")
+        tcs = result["message"]["tool_calls"]
+        assert len(tcs) == 1
+        assert tcs[0]["function"]["name"] == "get_board_info"
+        assert json.loads(tcs[0]["function"]["arguments"]) == {"detail": "full"}
+        assert result["finish_reason"] == "tool_calls"
+
+    @pytest.mark.parametrize("tool_calls", [{}, {"function": {"name": "get_board_info"}}])
+    def test_stream_ollama_final_chunk_non_list_tool_calls_is_ignored(self, tool_calls):
+        """A malformed ``tool_calls`` object must not raise; the content the
+        chunk carried still reaches the caller."""
+        client = _make_client()
+        client._settings.llm_provider = "ollama"
+        final = {
+            "message": {
+                "role": "assistant",
+                "content": "Board checked.",
+                "tool_calls": tool_calls,
+            },
+            "done": True,
+            "done_reason": "stop",
+        }
+
+        result = self._stream_ollama(client, [json.dumps(final)])
+
+        assert "error" not in result, result.get("error")
+        assert result["message"] == {"content": "Board checked."}
+        assert result["finish_reason"] == "stop"
+
+    @pytest.mark.parametrize(
+        "final_chunk",
+        [
+            {"done": True},
+            {"done": True, "message": {}},
+            {"done": True, "message": None},
+            {"done": True, "message": "oops"},
+        ],
+    )
+    def test_stream_ollama_final_chunk_without_message_is_unchanged(self, final_chunk):
+        """Missing, empty, or non-dict messages on the final chunk behave as
+        before: empty content, no tool calls, ``stop``."""
+        client = _make_client()
+        client._settings.llm_provider = "ollama"
+        events = []
+
+        result = self._stream_ollama(client, [json.dumps(final_chunk)], events=events)
+
+        assert "error" not in result, result.get("error")
+        assert result == {"finish_reason": "stop", "message": {"content": ""}}
+        assert events == [{"type": "text_start"}, {"type": "text_end"}]
 
 
 class TestToolCallSlotRouting:
