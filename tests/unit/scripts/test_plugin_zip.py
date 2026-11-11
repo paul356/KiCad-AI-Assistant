@@ -28,6 +28,7 @@ sys.modules["build_plugin_zip"] = builder
 _spec.loader.exec_module(builder)
 
 _PACKAGE_KEYS = {
+    "$schema",
     "name",
     "description",
     "description_full",
@@ -103,9 +104,14 @@ def test_pcm_metadata_contract(pcm_zip: Path, project: dict) -> None:
     test approximates that with Python re, so syntax valid in one engine but
     not the other is a known limit.
     """
-    metadata = json.loads(_member(pcm_zip, "metadata.json"))
+    generated = builder.pcm_metadata(project)
+    assert next(iter(generated)) == "$schema"
+    assert generated["$schema"] == "https://go.kicad.org/pcm/schemas/v2"
 
+    metadata = json.loads(_member(pcm_zip, "metadata.json"))
     assert set(metadata) == _PACKAGE_KEYS
+    assert next(iter(metadata)) == "$schema"
+    assert metadata["$schema"] == "https://go.kicad.org/pcm/schemas/v2"
     assert metadata["type"] == "plugin"
     assert metadata["license"] == project["license"]["text"]
     assert metadata["author"]["name"] == project["authors"][0]["name"]

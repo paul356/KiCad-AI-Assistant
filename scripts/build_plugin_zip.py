@@ -133,7 +133,12 @@ def pcm_package_dirname(identifier: str = PCM_IDENTIFIER) -> str:
 
 
 def pcm_metadata(project: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Build ``metadata.json`` satisfying KiCad's ``pcm.v1`` schema."""
+    """Build ``metadata.json`` satisfying KiCad's ``pcm.v2`` schema.
+
+    KiCad 10 validates package metadata with the v2 schema only. Every value
+    emitted here is also valid under v1, so declaring v2 matches the validator
+    that actually loads the archive while remaining consistent with v1.
+    """
     project = project if project is not None else load_project()
     urls = project.get("urls") or {}
     license_info = project.get("license") or {}
@@ -147,6 +152,7 @@ def pcm_metadata(project: dict[str, Any] | None = None) -> dict[str, Any]:
         resources["bug tracker"] = urls["Bug Tracker"]
 
     return {
+        "$schema": "https://go.kicad.org/pcm/schemas/v2",
         "name": "KiCad AI Assistant",
         "description": project["description"],
         "description_full": project["description"],
