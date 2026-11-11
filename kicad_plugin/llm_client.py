@@ -4273,11 +4273,6 @@ class LLMClient:
             "messages": messages,
             "tools": tools or None,
             "stream": True,
-            # Ask the server not to think: models that permit it then return
-            # the answer in ``content``.  Ones that cannot may still answer
-            # only in ``message.thinking``, which this client never reads,
-            # so the chat renders blank for them.  Older servers ignore it.
-            "think": False,
             "options": {"num_ctx": self._context_tokens},
         }
         if self._max_tokens > 0:
@@ -4292,6 +4287,7 @@ class LLMClient:
         try:
             with _urlopen(req, 300) as resp:
                 text_parts = []
+                thinking_parts: list[str] = []
                 if on_stream_event is not None:
                     on_stream_event({"type": "text_start"})
                 tool_calls_by_index: dict[int, dict] = {}
@@ -4337,6 +4333,10 @@ class LLMClient:
                                 "Ignoring non-string content in Ollama stream (%s)",
                                 type(content).__name__,
                             )
+
+                        thinking = msg.get("thinking")
+                        if isinstance(thinking, str) and thinking:
+                            thinking_parts.append(thinking)
 
                         raw_tool_calls = msg.get("tool_calls")
                         if raw_tool_calls is not None and not isinstance(raw_tool_calls, list):
@@ -4405,10 +4405,24 @@ class LLMClient:
                     finish_reason = "tool_calls"
 
                 tool_calls = [tool_calls_by_index[k] for k in sorted(tool_calls_by_index)]
-                message: dict[str, Any] = {"content": "".join(text_parts)}
+                content_text = "".join(text_parts)
+                thinking_text = "".join(thinking_parts)
+                used_thinking = False
+                # Some models answer only in ``message.thinking``, which would
+                # otherwise leave the assistant message blank.  Treat that
+                # reasoning as the reply when no content was produced.
+                if not content_text.strip() and thinking_text.strip():
+                    content_text = thinking_text
+                    used_thinking = True
+                message: dict[str, Any] = {"content": content_text}
                 if tool_calls:
                     message["tool_calls"] = tool_calls
                 if on_stream_event is not None:
+                    if used_thinking:
+                        try:
+                            on_stream_event({"type": "text_chunk", "content": content_text})
+                        except Exception as e:
+                            log.error("Text delta callback error in Ollama streaming: %s", e)
                     on_stream_event({"type": "text_end"})
                 return {"finish_reason": finish_reason, "message": message}
 
@@ -4792,11 +4806,6 @@ class LLMClient:
             "messages": messages,
             "tools": tools or None,
             "stream": False,
-            # Ask the server not to think: models that permit it then return
-            # the answer in ``content``.  Ones that cannot may still answer
-            # only in ``message.thinking``, which this client never reads,
-            # so the chat renders blank for them.  Older servers ignore it.
-            "think": False,
             "options": {"num_ctx": self._context_tokens},
         }
         if self._max_tokens > 0:
@@ -4820,6 +4829,18 @@ class LLMClient:
             return {"error": f"Unexpected response from Ollama: {text[:200]}"}
 
         msg = body.get("message", {})
+        # Some models answer only in ``message.thinking``, which this client
+        # would otherwise drop, leaving the assistant message blank.  Treat
+        # that reasoning as the reply when no content was produced.
+        if isinstance(msg, dict):
+            content = msg.get("content")
+            thinking = msg.get("thinking")
+            if (
+                (not isinstance(content, str) or not content.strip())
+                and isinstance(thinking, str)
+                and thinking.strip()
+            ):
+                msg = {**msg, "content": thinking}
         # Ollama returns tool-call arguments as JSON objects; normalize the
         # copy we hand back so downstream json.loads(arguments) works.
         has_tool_calls = (

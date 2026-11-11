@@ -3581,10 +3581,10 @@ class TestToolCallArgumentsNormalization:
         sent = next(m for m in captured["body"]["messages"] if m.get("role") == "assistant")
         assert sent["tool_calls"][0]["function"]["arguments"] == {"detail": "full"}
 
-    def test_stream_ollama_request_disables_thinking(self):
-        """Issue #273: reasoning models otherwise return the whole reply in
-        ``message.thinking``, which this client never reads, leaving the chat
-        blank.  The streaming request must carry a JSON ``false``."""
+    def test_stream_ollama_request_leaves_thinking_to_the_server(self):
+        """Issue #273: the request must not set ``think``.  Forcing it false
+        makes models that support the channel natively fold their reasoning
+        into ``content`` (including literal ``<think`` markers)."""
         client = _make_client()
         client._settings.llm_provider = "ollama"
         captured: dict[str, object] = {}
@@ -3599,10 +3599,10 @@ class TestToolCallArgumentsNormalization:
 
         body = captured["body"]
         assert body["stream"] is True
-        assert body["think"] is False
+        assert "think" not in body
 
-    def test_call_ollama_request_disables_thinking(self):
-        """Issue #273: same flag on the non-streaming request path."""
+    def test_call_ollama_request_leaves_thinking_to_the_server(self):
+        """Issue #273: same for the non-streaming request path."""
         client = _make_client()
         client._settings.llm_provider = "ollama"
         captured: dict[str, object] = {}
@@ -3617,7 +3617,120 @@ class TestToolCallArgumentsNormalization:
         assert "error" not in result, result.get("error")
         body = captured["body"]
         assert body["stream"] is False
-        assert body["think"] is False
+        assert "think" not in body
+
+    def test_stream_ollama_uses_thinking_when_content_empty(self):
+        """Issue #273: a model that answers only in ``message.thinking`` must
+        still produce the reply instead of a blank message."""
+        client = _make_client()
+        client._settings.llm_provider = "ollama"
+        lines = [
+            '{"message":{"role":"assistant","content":"","thinking":"The board "},"done":false}',
+            '{"message":{"role":"assistant","content":"","thinking":"has 4 layers."},"done":false}',
+            '{"done":true,"done_reason":"stop"}',
+        ]
+        result = self._stream_ollama(client, lines)
+
+        assert "error" not in result, result.get("error")
+        assert result["message"]["content"] == "The board has 4 layers."
+        assert result["finish_reason"] == "stop"
+
+    def test_stream_ollama_prefers_content_over_thinking(self):
+        """Issue #273: thinking is a fallback only; real content always wins."""
+        client = _make_client()
+        client._settings.llm_provider = "ollama"
+        captured: dict[str, object] = {}
+        lines = [
+            '{"message":{"role":"assistant","content":"","thinking":"reasoning"},"done":false}',
+            '{"message":{"role":"assistant","content":"4","thinking":""},"done":false}',
+            '{"done":true,"done_reason":"stop"}',
+        ]
+        mock_resp = self._make_line_response(lines)
+
+        def _fake_urlopen(req, timeout, **kwargs):
+            captured["body"] = json.loads(req.data.decode())
+            return mock_resp
+
+        with patch("kicad_plugin.llm_client._urlopen", side_effect=_fake_urlopen):
+            result = client._stream_ollama("sys", [], on_stream_event=lambda evt: None)
+
+        assert "error" not in result, result.get("error")
+        assert result["message"]["content"] == "4"
+        assert "think" not in captured["body"]
+
+    def test_stream_ollama_tool_call_with_empty_content_unaffected(self):
+        """A tool-call turn keeps its empty content, calls and finish reason,
+        and the request still leaves ``think`` to the server."""
+        client = _make_client()
+        client._settings.llm_provider = "ollama"
+        captured: dict[str, object] = {}
+        lines = [
+            '{"message":{"role":"assistant","content":"","tool_calls":'
+            '[{"index":0,"function":{"name":"get_board_info","arguments":{"detail":"full"}}}]},'
+            '"done":false}',
+            '{"done":true,"done_reason":"tool_calls"}',
+        ]
+        mock_resp = self._make_line_response(lines)
+
+        def _fake_urlopen(req, timeout, **kwargs):
+            captured["body"] = json.loads(req.data.decode())
+            return mock_resp
+
+        with patch("kicad_plugin.llm_client._urlopen", side_effect=_fake_urlopen):
+            result = client._stream_ollama("sys", [], on_stream_event=lambda evt: None)
+
+        assert "error" not in result, result.get("error")
+        assert result["finish_reason"] == "tool_calls"
+        assert result["message"]["content"] == ""
+        assert result["message"]["tool_calls"][0]["function"]["name"] == "get_board_info"
+        assert "think" not in captured["body"]
+
+    def test_call_ollama_uses_thinking_when_content_empty(self):
+        """Issue #273: non-streaming reply falls back to ``message.thinking``
+        when ``content`` is empty."""
+        client = _make_client()
+        client._settings.llm_provider = "ollama"
+        body = {
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "thinking": "Layer count is 4.",
+            },
+            "done_reason": "stop",
+        }
+        with patch(
+            "kicad_plugin.llm_client._https_post_json",
+            return_value=(200, json.dumps(body)),
+        ):
+            result = client._call_ollama("sys", [])
+
+        assert "error" not in result, result.get("error")
+        assert result["message"]["content"] == "Layer count is 4."
+
+    def test_call_ollama_prefers_content_over_thinking(self):
+        """Issue #273: thinking is ignored when the model produced content."""
+        client = _make_client()
+        client._settings.llm_provider = "ollama"
+        captured: dict[str, object] = {}
+        body = {
+            "message": {
+                "role": "assistant",
+                "content": "4",
+                "thinking": "reasoning",
+            },
+            "done_reason": "stop",
+        }
+
+        def _fake_post(url, headers, payload, timeout=300):
+            captured["body"] = json.loads(payload.decode())
+            return 200, json.dumps(body)
+
+        with patch("kicad_plugin.llm_client._https_post_json", side_effect=_fake_post):
+            result = client._call_ollama("sys", [])
+
+        assert "error" not in result, result.get("error")
+        assert result["message"]["content"] == "4"
+        assert "think" not in captured["body"]
 
     def test_stream_ollama_http_error_includes_body(self):
         """A rejected second-round payload (HTTP 400) must show the provider's
