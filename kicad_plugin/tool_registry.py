@@ -55,6 +55,7 @@ TOOL_POLICIES: dict[str, ToolPolicy] = {
     "create_symbol_library": ToolPolicy(kind="file_mutation"),
     "add_symbols_to_library": ToolPolicy(kind="file_mutation"),
     "remove_symbols_from_library": ToolPolicy(kind="file_mutation"),
+    "update_library_symbol_pin": ToolPolicy(kind="file_mutation"),
     "delete_symbol_library": ToolPolicy(kind="file_mutation"),
     "find_symbols_not_in_libraries": ToolPolicy(kind="query"),
     "place_symbol_relative": ToolPolicy(
@@ -70,6 +71,12 @@ TOOL_POLICIES: dict[str, ToolPolicy] = {
         mark_dirty=True,
     ),
     "set_symbol_property": ToolPolicy(
+        kind="file_mutation",
+        path_arg="schematic_path",
+        auto_snapshot=True,
+        mark_dirty=True,
+    ),
+    "update_schematic_symbol_pin": ToolPolicy(
         kind="file_mutation",
         path_arg="schematic_path",
         auto_snapshot=True,
