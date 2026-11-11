@@ -87,7 +87,7 @@ def test_shell_html_inlines_both_jump_hooks() -> None:
 # --------------------------------------------------------------------------- #
 
 
-def _side_vbox_order(build_ui: ast.FunctionDef) -> list[str]:
+def _sizer_order(build_ui: ast.FunctionDef, sizer: str) -> list[str]:
     adds: list[tuple[int, str]] = []
     for node in ast.walk(build_ui):
         if not (
@@ -95,24 +95,36 @@ def _side_vbox_order(build_ui: ast.FunctionDef) -> list[str]:
             and isinstance(node.func, ast.Attribute)
             and node.func.attr == "Add"
             and isinstance(node.func.value, ast.Name)
-            and node.func.value.id == "side_vbox"
+            and node.func.value.id == sizer
             and node.args
         ):
             continue
         name = _self_attr(node.args[0])
+        if name is None and isinstance(node.args[0], ast.Name):
+            name = node.args[0].id
         if name is not None:
             adds.append((node.lineno, name))
     return [name for _, name in sorted(adds)]
 
 
-def test_jump_buttons_surround_send_in_the_side_column() -> None:
+def test_jump_buttons_surround_the_send_row() -> None:
     """Top control above Send/Stop, latest below it."""
-    assert _side_vbox_order(_function("_build_ui")) == [
-        "_status_dot",
+    assert _sizer_order(_function("_build_ui"), "side_vbox") == [
         "_jump_top_btn",
-        "_send_btn",
+        "send_row",
         "_jump_latest_btn",
     ]
+
+
+def test_send_row_puts_the_status_dot_after_send() -> None:
+    """The backend indicator sits immediately to the right of Send/Stop."""
+    build_ui = _function("_build_ui")
+    assert _sizer_order(build_ui, "send_row") == ["_send_btn", "_status_dot"]
+    assert "send_row = wx.BoxSizer(wx.HORIZONTAL)" in _source(build_ui)
+    assert "send_row.Add(self._status_dot, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 4)" in _source(
+        build_ui
+    )
+    assert "_status_dot" not in _sizer_order(build_ui, "side_vbox")
 
 
 def test_jump_buttons_have_tooltips_and_accessible_names() -> None:

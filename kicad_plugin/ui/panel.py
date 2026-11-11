@@ -506,8 +506,9 @@ if _WX_AVAILABLE:
             self._prompt_drag_max_height = 0
 
             # ---- Input row ----
-            #  [📎] [____ Ask the AI assistant… ____] [ ●  ]
-            #  Attach  Text input (expands)         [➤/⬛]
+            #  [📎] [____ Ask the AI assistant… ____] [↑]
+            #  Attach  Text input (expands)      [➤/⬛ ●]
+            #                                      [↓]
             hbox = wx.BoxSizer(wx.HORIZONTAL)
 
             # Attach button — single entry point for images & PDFs.
@@ -529,18 +530,10 @@ if _WX_AVAILABLE:
             self._prompt_default_min_size = self._input.GetMinSize()
             hbox.Add(self._input, 1, wx.EXPAND)
 
-            # Right-hand column: status dot on top, Send/Stop toggle below.
+            # Right-hand column: jump-to-start, Send/Stop + status, jump-to-latest.
             side_vbox = wx.BoxSizer(wx.VERTICAL)
 
-            # Status dot — 14 px coloured circle, tooltip carries full text.
-            self._status_dot = wx.StaticBitmap(
-                panel,
-                bitmap=self._make_status_dot_bitmap(self._C_GREY, bg=panel.GetBackgroundColour()),
-            )
-            self._status_dot.SetToolTip("Starting backend…")
-            side_vbox.Add(self._status_dot, 0, wx.ALIGN_CENTER_HORIZONTAL | wx.BOTTOM, 2)
-
-            # Jump-to-start: above Send/Stop, always visible.
+            # Jump-to-start: top of the column, always visible.
             icon_bg = panel.GetBackgroundColour()
             self._jump_top_btn = wx.BitmapButton(
                 panel,
@@ -551,6 +544,8 @@ if _WX_AVAILABLE:
             self._jump_top_btn.SetName("Jump to start")
             side_vbox.Add(self._jump_top_btn, 0, wx.ALIGN_CENTER_HORIZONTAL | wx.BOTTOM, 2)
 
+            # Send/Stop with the backend status dot immediately to its right.
+            send_row = wx.BoxSizer(wx.HORIZONTAL)
             # Send / Stop toggle button — doubles as Stop during generation.
             self._send_btn = wx.BitmapButton(
                 panel,
@@ -561,7 +556,17 @@ if _WX_AVAILABLE:
             # Backend not ready until _on_server_started(True); the button is
             # enabled there, not clickable while the backend is down.
             self._send_btn.Disable()
-            side_vbox.Add(self._send_btn, 0, wx.ALIGN_CENTER_HORIZONTAL)
+            send_row.Add(self._send_btn, 0, wx.ALIGN_CENTER_VERTICAL)
+
+            # Status dot — 14 px coloured circle, tooltip carries full text.
+            self._status_dot = wx.StaticBitmap(
+                panel,
+                bitmap=self._make_status_dot_bitmap(self._C_GREY, bg=panel.GetBackgroundColour()),
+            )
+            self._status_dot.SetToolTip("Starting backend…")
+            send_row.Add(self._status_dot, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 4)
+
+            side_vbox.Add(send_row, 0, wx.ALIGN_CENTER_HORIZONTAL)
 
             # Jump-to-latest: below Send/Stop, always visible.
             self._jump_latest_btn = wx.BitmapButton(
