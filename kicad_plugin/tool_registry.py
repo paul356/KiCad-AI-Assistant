@@ -82,6 +82,12 @@ TOOL_POLICIES: dict[str, ToolPolicy] = {
         auto_snapshot=True,
         mark_dirty=True,
     ),
+    "update_schematic_symbol_from_library": ToolPolicy(
+        kind="file_mutation",
+        path_arg="schematic_path",
+        auto_snapshot=True,
+        mark_dirty=True,
+    ),
     "rename_symbol": ToolPolicy(
         kind="file_mutation",
         path_arg="schematic_path",

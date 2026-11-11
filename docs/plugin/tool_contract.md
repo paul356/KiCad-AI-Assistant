@@ -35,6 +35,7 @@
 | `remove_symbols_from_library` | `symbol_edit_tools` | Remove named symbol definitions from an existing library |
 | `update_library_symbol_pin` | `symbol_edit_tools` | Rename pin numbers/names in a library symbol definition (batch, format-preserving) |
 | `update_schematic_symbol_pin` | `symbol_edit_tools` | Rename pin numbers/names in a schematic's cached `lib_symbols` copy (batch) |
+| `update_schematic_symbol_from_library` | `symbol_edit_tools` | Replace a schematic's cached `lib_symbols` definition with the current library version (definition only) |
 | `delete_symbol_library` | `symbol_edit_tools` | Delete an **empty** symbol library (file + table entry + index) |
 | `remove_footprints_from_library` | `pcb_library_tools` | Remove named footprints from an existing footprint library |
 | `delete_footprint_library` | `pcb_library_tools` | Delete an **empty** footprint library (directory + table entry + index) |
@@ -399,6 +400,32 @@ set_symbol_property(schematic_path="/abs/project/board.kicad_sch",
                     items=[{"reference": "U1", "property_name": "Footprint",
                             "property_value": "Package_SO:SOIC-8_3.9x4.9mm_P1.27mm"}])
 ```
+
+---
+
+#### `update_schematic_symbol_from_library(schematic_path, project_dir, lib_id, dry_run=False)`
+
+**Purpose:** Replaces the schematic's cached `lib_symbols` definition of `lib_id` with the current definition read from the indexed symbol library — the "Update Symbols from Library" operation after a library change (for example renamed pins). The definition is replaced as a whole: graphics, pins (number, name, electrical type, shape, position, length), unit/style sub-symbols, symbol-level flags (`pin_numbers`, `pin_names`, `in_bom`, `on_board`, …) and the definition's symbol-level properties. Derived (`extends`) library symbols are flattened into a self-contained cache entry, and any degradation of that merge is reported in `warnings`.
+
+**Definition-only scope:** placements are deliberately **not** refreshed. Their `at`, rotation, mirror, unit, `uuid`, `instances` and every property (Reference, Value, Footprint, Datasheet, custom fields and their positions) stay exactly as they are. "Update fields" and dropping extra fields are non-goals of this tool; changing a placed part's fields is `set_symbol_property`'s job. Wires, junctions, labels, sheets and every other cached symbol are untouched. This keeps the operation predictable: a library refresh must not silently move parts, rewrite values, or change netlist identity.
+
+**Pin-key rewrite rule:** KiCad's `(pin "<number>" (uuid …))` placement key **is** the pin number, so a renumbering has to be mirrored or skip loses the pin. Renumbering is inferred positionally, because the library no longer carries the old numbers: a mapping `old → new` is created only where exactly one old and exactly one new pin share the same `(unit, style, x, y)` and their numbers differ. The mapping must be one-to-one in both directions; if it is ambiguous, nothing is rewritten, the existing keys are kept, and a warning says so. The mapping is applied to every placement of `lib_id` in one simultaneous pass (no chains), preserving each `(uuid …)`. A pin that disappeared from the library keeps its placement key — removing it would silently change netlist identity — and is warned about. A pin that kept its number but moved is warned about with old and new coordinates; attached wires are **not** moved by this tool.
+
+**Key parameters:**
+- `schematic_path` (`str`) — path to the target `.kicad_sch` file.
+- `project_dir` (`str`, required) — project directory (or a file inside it) scoping the symbol index. Only libraries visible in that scope are consulted: the project's own libraries plus the global libraries. There is no fallback outside that scope and no scanning of other projects.
+- `lib_id` (`str`) — the id **exactly as stored as the key** in the schematic's `lib_symbols` cache, as `"Library:Symbol"`. Lookup is an exact, case-sensitive match on the stored key; an unknown id returns the not-found error with up to five available ids. The id must contain a colon with both halves non-empty: a bare cached id such as `"R"` cannot be resolved to a library and returns an actionable error instead of guessing.
+- `dry_run` (`bool`, default `False`) — return the full diff summary and `changed` value without writing anything; the file stays byte-identical and no `.bak`/`.tmp` is produced.
+
+**Diff summary:** returned whether or not anything changed: `pins_added` / `pins_removed` (`number`, `name`, `unit`, `style`), `pins_renamed` (`number`, `old_name`, `new_name`, `unit`, `style`), `pins_renumbered` (`old_number`, `new_number`, `name`, `unit`, `style`), `pins_moved` (`number`, `name`, `old_at`, `new_at`), `properties_added` / `properties_removed` / `properties_changed` (property names) and `graphics_changed` (any non-pin, non-property child of the unit sub-symbols or symbol body differs). The comparison is structural: whitespace, formatting and the top-level name prefix (`"Library:Symbol"` in the cache, plain name in the library) are ignored.
+
+**Write behaviour:** `changed: false` writes nothing and returns `backup_path: null`. Otherwise the parsed tree is mutated in memory and saved exactly once through the project's normal schematic save path, which creates a `.kicad_sch.bak`; the file is re-serialised, so formatting is not preserved byte-for-byte. A second identical call returns `changed: false` (idempotent).
+
+**Success response:** `{"success": true, "lib_id": "MyLib:MYOP", "symbol_name": "MYOP", "library_name": "MyLib", "library_path": "...", "changed": true, "dry_run": false, "backup_path": "...bak", "pins_added": [], "pins_removed": [], "pins_renamed": [{"number": "1", "old_name": "IN", "new_name": "ANODE", "unit": 1, "style": 1}], "pins_renumbered": [], "pins_moved": [], "properties_added": [], "properties_removed": [], "properties_changed": [], "graphics_changed": false, "affected_references": ["U1", "U2"], "affected_count": 2, "placements_updated": 0, "warnings": []}`. `placements_updated` counts placements whose pin keys were rewritten; `affected_references` lists every reference using `lib_id`.
+
+**Failure response:** `{"error": "<message>"}` — no `success` key. Missing file, wrong extension, unknown cached id, a bare `lib_id`, an unresolvable library/symbol (the error names the nickname, the symbol and the searched project scope) and extraction/save failures are all reported this way; nothing is written.
+
+**Pairing rule:** this tool pushes a definition from library to schematic. To change the library *and* every placed part, edit the library first (`update_library_symbol_pin`, or external editing plus `sync_symbol_index`) and then call `update_schematic_symbol_from_library` for each affected schematic. Future placements pick up the library automatically; this tool only fixes schematics that already embed an old copy. Because placements are not refreshed, follow up with `set_symbol_property` only for fields you explicitly want to change on placed parts.
 
 ---
 

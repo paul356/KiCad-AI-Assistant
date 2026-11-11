@@ -279,6 +279,7 @@ kcaa
 | `move_component` | Move and/or rotate a placed component |
 | `set_symbol_property` | Set a property field on a placed symbol |
 | `update_schematic_symbol_pin` | Rename a pin number and/or pin name in a schematic's cached `lib_symbols` copy |
+| `update_schematic_symbol_from_library` | Refresh a schematic's cached `lib_symbols` definition from the library (graphics, pins, unit sub-symbols and definition properties; placements keep their fields) |
 | `rename_symbol` | Rename a placed symbol's reference designator |
 | `list_symbol_properties` | List properties (name → value) of placed schematic symbols — no geometry, position, or nets |
 | `delete_symbol_property` | Delete a property from a placed symbol |
