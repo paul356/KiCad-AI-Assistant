@@ -4877,8 +4877,8 @@ class LLMClient:
                 and thinking.strip()
             ):
                 msg = {**msg, "content": thinking}
-        if has_tool_calls or finish_reason == "tool_calls":
-            content = msg.get("content") if isinstance(msg, dict) else None
+        if isinstance(msg, dict) and (has_tool_calls or finish_reason == "tool_calls"):
+            content = msg.get("content")
             if not isinstance(content, str) or not content.strip():
                 msg = {**msg, "content": ""}
             if has_tool_calls:

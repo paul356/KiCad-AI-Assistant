@@ -4189,6 +4189,38 @@ class TestToolCallArgumentsNormalization:
         assert result["finish_reason"] == "tool_calls"
         assert result["message"]["content"] == ""
 
+    @pytest.mark.parametrize("message", [None, "oops"])
+    def test_call_ollama_malformed_tool_calls_keeps_non_dict_message(self, message):
+        """A non-dict ``message`` must pass through untouched instead of
+        raising when ``done_reason`` claims tool calls."""
+        client = _make_client()
+        client._settings.llm_provider = "ollama"
+        body = {"message": message, "done_reason": "tool_calls"}
+        result, _ = self._run_call_ollama(client, body)
+
+        assert "error" not in result, result.get("error")
+        assert result["finish_reason"] == "tool_calls"
+        assert result["message"] == message
+
+    def test_call_ollama_malformed_tool_calls_normalises_dict_message(self):
+        """The non-dict guard must not skip whitespace normalization for a
+        dict message."""
+        client = _make_client()
+        client._settings.llm_provider = "ollama"
+        body = {
+            "message": {
+                "role": "assistant",
+                "content": "\n",
+                "thinking": "reason",
+            },
+            "done_reason": "tool_calls",
+        }
+        result, _ = self._run_call_ollama(client, body)
+
+        assert "error" not in result, result.get("error")
+        assert result["finish_reason"] == "tool_calls"
+        assert result["message"]["content"] == ""
+
     def test_stream_ollama_tool_call_with_length_reason_stays_empty(self):
         """A parsed call reports ``tool_calls`` even when the server's done
         reason is ``length``; whitespace content is still dropped."""
