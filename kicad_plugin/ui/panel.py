@@ -366,11 +366,6 @@ if _WX_AVAILABLE:
                 "padding:1px 3px;border-radius:2px;font-weight:600}"
                 "mark.search-match{background:#FFEB3B;color:#000;padding:0 1px;border-radius:1px}"
                 "mark.search-active{background:#FF9800;color:#fff;padding:0 1px;border-radius:1px}"
-                "#jump-latest{display:none;position:fixed;right:14px;bottom:14px;z-index:10;"
-                "width:32px;height:32px;padding:0;border:1px solid #B8BEC9;border-radius:16px;"
-                "background:#FFFFFF;color:#333;font-size:16px;line-height:1;cursor:pointer;"
-                "box-shadow:0 1px 4px rgba(0,0,0,0.22)}"
-                "#jump-latest:hover{background:#E8EDF7}"
                 "</style>"
                 "<script>" + js_code + "</script>"
                 "</head>"
@@ -381,8 +376,6 @@ if _WX_AVAILABLE:
                 "<b><span style='color:#008250'>AI</span></b><br>"
                 "<div id='pending-ai-text'></div>"
                 "</td></tr></table>"
-                "<button id='jump-latest' type='button' "
-                "aria-label='Jump to latest message' title='Jump to latest message'>↓</button>"
                 "</body></html>"
             )
 
@@ -547,6 +540,17 @@ if _WX_AVAILABLE:
             self._status_dot.SetToolTip("Starting backend…")
             side_vbox.Add(self._status_dot, 0, wx.ALIGN_CENTER_HORIZONTAL | wx.BOTTOM, 2)
 
+            # Jump-to-start: above Send/Stop, always visible.
+            icon_bg = panel.GetBackgroundColour()
+            self._jump_top_btn = wx.BitmapButton(
+                panel,
+                bitmap=self._make_jump_bitmap("up", bg=icon_bg),
+                style=wx.BU_EXACTFIT | wx.BORDER_NONE,
+            )
+            self._jump_top_btn.SetToolTip("Jump to start")
+            self._jump_top_btn.SetName("Jump to start")
+            side_vbox.Add(self._jump_top_btn, 0, wx.ALIGN_CENTER_HORIZONTAL | wx.BOTTOM, 2)
+
             # Send / Stop toggle button — doubles as Stop during generation.
             self._send_btn = wx.BitmapButton(
                 panel,
@@ -558,6 +562,16 @@ if _WX_AVAILABLE:
             # enabled there, not clickable while the backend is down.
             self._send_btn.Disable()
             side_vbox.Add(self._send_btn, 0, wx.ALIGN_CENTER_HORIZONTAL)
+
+            # Jump-to-latest: below Send/Stop, always visible.
+            self._jump_latest_btn = wx.BitmapButton(
+                panel,
+                bitmap=self._make_jump_bitmap("down", bg=icon_bg),
+                style=wx.BU_EXACTFIT | wx.BORDER_NONE,
+            )
+            self._jump_latest_btn.SetToolTip("Jump to latest")
+            self._jump_latest_btn.SetName("Jump to latest")
+            side_vbox.Add(self._jump_latest_btn, 0, wx.ALIGN_CENTER_HORIZONTAL | wx.TOP, 2)
 
             hbox.Add(side_vbox, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 4)
 
@@ -609,6 +623,8 @@ if _WX_AVAILABLE:
 
             # ---- Events ----
             self._send_btn.Bind(wx.EVT_BUTTON, self._on_send_btn)
+            self._jump_top_btn.Bind(wx.EVT_BUTTON, self._on_jump_start)
+            self._jump_latest_btn.Bind(wx.EVT_BUTTON, self._on_jump_latest)
             self._attach_btn.Bind(wx.EVT_BUTTON, self._on_attach)
             self._input.Bind(wx.EVT_TEXT_ENTER, self._on_send)
             self._input.Bind(wx.EVT_CHAR_HOOK, self._on_input_key)
@@ -1405,6 +1421,31 @@ if _WX_AVAILABLE:
             return bmp
 
         @staticmethod
+        def _make_jump_bitmap(
+            direction: str, size: int = 28, bg: wx.Colour | None = None
+        ) -> wx.Bitmap:
+            """Up/down arrow for the conversation jump buttons."""
+            bmp, mdc = AssistantPanel._new_icon_bitmap(size, bg)
+            gc = wx.GraphicsContext.Create(mdc)
+            colour = wx.Colour(34, 85, 204)  # _C_USER blue
+            gc.SetPen(wx.Pen(colour, 2))
+            gc.SetBrush(wx.Brush(colour))
+            cx = size / 2
+            if direction == "up":
+                tip_y, tail_y, head_y = 6, size - 6, 12
+            else:
+                tip_y, tail_y, head_y = size - 6, 6, size - 12
+            gc.StrokeLine(cx, tail_y, cx, tip_y)
+            path = gc.CreatePath()
+            path.MoveToPoint(cx, tip_y)
+            path.AddLineToPoint(cx - 4, head_y)
+            path.AddLineToPoint(cx + 4, head_y)
+            path.CloseSubpath()
+            gc.FillPath(path)
+            del gc, mdc
+            return bmp
+
+        @staticmethod
         def _make_status_dot_bitmap(
             rgb: tuple, size: int = 14, bg: wx.Colour | None = None
         ) -> wx.Bitmap:
@@ -1447,6 +1488,26 @@ if _WX_AVAILABLE:
                 self._on_stop(event)
             else:
                 self._on_send(event)
+
+        def _on_jump_start(self, event) -> None:
+            """Scroll the conversation to its first entry."""
+            try:
+                if self._use_webview and self._shell_loaded:
+                    self._run_script("_jumpToStart()")
+                elif not self._use_webview:
+                    self._conv_view.Scroll(0, 0)
+            except Exception as e:
+                log.warning("_on_jump_start: %s", e)
+
+        def _on_jump_latest(self, event) -> None:
+            """Scroll the conversation to its newest entry."""
+            try:
+                if self._use_webview and self._shell_loaded:
+                    self._run_script("_jumpToLatest()")
+                elif not self._use_webview:
+                    self._conv_view.Scroll(0, self._conv_view.GetScrollRange(wx.VERTICAL))
+            except Exception as e:
+                log.warning("_on_jump_latest: %s", e)
 
         def _on_attach(self, event) -> None:
             """Unified attach dialog: images or PDF in one file picker."""
