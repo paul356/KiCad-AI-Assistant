@@ -48,8 +48,9 @@ KiCad AI Assistant 是一个 KiCad 动作插件，在 KiCad 内部直接嵌入�
 
 - KiCad 10.0 或更高版本
 - [`uv`](https://github.com/astral-sh/uv) — 管理 Python 虚拟环境并自动安装所需 Python 版本
-  - `curl -Lsf https://astral.sh/uv/install.sh | sh`
-- OpenAI、Anthropic 或兼容 LLM 提供商的 API Key
+  - Linux/macOS：`curl -Lsf https://astral.sh/uv/install.sh | sh`
+  - Windows：`powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"`
+- OpenAI、Anthropic 或兼容 LLM 提供商的 API Key（Ollama 不需要）
 
 ## 安装
 
@@ -58,47 +59,83 @@ KiCad AI Assistant 是一个 KiCad 动作插件，在 KiCad 内部直接嵌入�
 仅当你需要从源码构建插件或参与项目开发时才需要此步骤。如果从 Releases 页面下载预构建的插件，可跳过此步骤。
 
 ```bash
-git clone https://github.com/paul356/kcaa.git
-cd kcaa
+git clone https://github.com/paul356/KiCad-AI-Assistant.git
+cd KiCad-AI-Assistant
 ```
 
 ### 2. 安装插件
 
-从 [Releases 页面](https://github.com/paul356/KiCad-AI-Assistant/releases) 下载 `kicad-ai-assistant.zip`，解压到 KiCad 插件目录：
+发布页提供两个压缩包：
+
+- `kicad_ai_assistant.zip` — 用于手动安装和面板内更新器。
+- `kicad_ai_assistant_pcm.zip` — 用于 KiCad 的插件与内容管理器（Plugin and Content Manager，"Install from File…"）。
+
+两者安装的插件内容相同，但安装后的文件夹名不同（手动安装为 `kicad_ai_assistant/`，PCM 安装为 `com_github_paul356_kicad-ai-assistant/`）。下文的 `10.0` 是你的 KiCad `<major>.<minor>` 版本。设置 `KICAD_DOCUMENTS_HOME` 可在所有系统上覆盖文档目录。
+
+| 系统 | 手动安装：`scripting/plugins` | PCM 安装：`3rdparty/plugins` |
+|------|-------------------------------|------------------------------|
+| Linux | `~/.local/share/kicad/10.0/scripting/plugins` | `~/.local/share/kicad/10.0/3rdparty/plugins` |
+| macOS | `~/Documents/KiCad/10.0/scripting/plugins` | `~/Documents/KiCad/10.0/3rdparty/plugins` |
+| Windows | `%USERPROFILE%\Documents\KiCad\10.0\scripting\plugins` | `%USERPROFILE%\Documents\KiCad\10.0\3rdparty\plugins` |
+
+从 [Releases 页面](https://github.com/paul356/KiCad-AI-Assistant/releases) 下载 `kicad_ai_assistant.zip`，解压到上表对应的手动安装目录：
 
 **Linux:**
 ```bash
 KICAD_PLUGIN_DIR=~/.local/share/kicad/10.0/scripting/plugins
 mkdir -p "$KICAD_PLUGIN_DIR"
-unzip kicad-ai-assistant.zip -d "$KICAD_PLUGIN_DIR"
+unzip kicad_ai_assistant.zip -d "$KICAD_PLUGIN_DIR"
+```
+
+**macOS:**
+```bash
+KICAD_PLUGIN_DIR=~/Documents/KiCad/10.0/scripting/plugins
+mkdir -p "$KICAD_PLUGIN_DIR"
+unzip kicad_ai_assistant.zip -d "$KICAD_PLUGIN_DIR"
 ```
 
 **Windows (PowerShell):**
 ```powershell
 $KICAD_PLUGIN_DIR = "$env:USERPROFILE\Documents\KiCad\10.0\scripting\plugins"
 New-Item -ItemType Directory -Force -Path $KICAD_PLUGIN_DIR
-Expand-Archive -Path kicad-ai-assistant.zip -DestinationPath $KICAD_PLUGIN_DIR
+Expand-Archive -Path kicad_ai_assistant.zip -DestinationPath $KICAD_PLUGIN_DIR
 ```
+
+压缩包已经包含 `kicad_ai_assistant/` 根目录。请保持这个名称，以便文档中的 `cd`/安装命令和手动安装约定保持一致；重命名已安装目录不受支持。不要把这个压缩包手工解压到 `3rdparty/plugins`——该目录由插件与内容管理器管理，手工复制的文件夹不算 PCM 安装。
+
+**插件与内容管理器（PCM）：** 打开 **Preferences → Plugin and Content Manager → Install from File…**，选择 `kicad_ai_assistant_pcm.zip`。KiCad 会把它解压到 `<3rdparty>/plugins/com_github_paul356_kicad-ai-assistant/`；该包目录就是插件目录（`__init__.py` 直接位于其中）。不要自行解压这个压缩包。PCM 更新会保留 `.venv` 和 freerouting JAR（`keep_on_update`）；更新后请重新运行安装脚本，让虚拟环境安装匹配的 `kcaa` 版本。
 
 或从源码构建：
 
 ```bash
-# 在 kcaa 仓库根目录执行：
-make dist-plugin          # 生成 dist/kicad_ai_assistant.zip
+# 在仓库根目录执行：
+make dist-plugin          # 生成 dist/kicad_ai_assistant.zip（手动安装 + 更新器）
+make dist-pcm             # 生成 dist/kicad_ai_assistant_pcm.zip（PCM 安装）
 
 # Linux:
 KICAD_PLUGIN_DIR=~/.local/share/kicad/10.0/scripting/plugins
+mkdir -p "$KICAD_PLUGIN_DIR"
+unzip dist/kicad_ai_assistant.zip -d "$KICAD_PLUGIN_DIR"
+
+# macOS:
+KICAD_PLUGIN_DIR=~/Documents/KiCad/10.0/scripting/plugins
 mkdir -p "$KICAD_PLUGIN_DIR"
 unzip dist/kicad_ai_assistant.zip -d "$KICAD_PLUGIN_DIR"
 ```
 
 ### 3. 创建插件虚拟环境
 
-在已安装的插件目录中运行安装脚本，创建 `.venv`、从 PyPI 安装 `kcaa`，并下载 freerouting JAR。`uv` 会自动安装所需的 Python 版本。
+在已安装的插件目录中运行安装脚本，创建 `.venv`、从 PyPI 安装 `kcaa`、安装 **PyMuPDF**（以 `fitz` 导入，用于 PDF 导入），并下载 freerouting JAR。此步骤需要 `uv`；缺少时脚本会打印错误并以非零状态退出，请按 <https://docs.astral.sh/uv/getting-started/installation/> 或[前置条件](#前置条件)中的命令安装。`uv` 会自动安装所需的 Python 版本。
 
 **Linux:**
 ```bash
 cd ~/.local/share/kicad/10.0/scripting/plugins/kicad_ai_assistant
+./setup_plugin.sh
+```
+
+**macOS:**
+```bash
+cd ~/Documents/KiCad/10.0/scripting/plugins/kicad_ai_assistant
 ./setup_plugin.sh
 ```
 
@@ -114,19 +151,22 @@ cd /d "%USERPROFILE%\Documents\KiCad\10.0\scripting\plugins\kicad_ai_assistant"
 setup_plugin.bat
 ```
 
-脚本会从插件目录路径自动检测 KiCad 版本。KiCad 已提供所有必要的环境变量（`KICAD_VERSION`、`KICAD*_DIR` 等），无需 `.env` 文件。
+PCM 安装时，请在 `...\3rdparty\plugins\com_github_paul356_kicad-ai-assistant` 中运行同一个脚本。脚本会从插件目录路径自动检测 KiCad 版本。KiCad 已提供所有必要的环境变量（`KICAD_VERSION`、`KICAD*_DIR` 等），无需 `.env` 文件。
+
+这些说明的简版也会随插件压缩包一起提供（`kicad_plugin/README.md`）。
 
 ### 4. 在 KiCad 中加载插件
 
 1. 打开 KiCad 并加载你的项目。
 2. 打开 **PCB 编辑器**。
-3. 依次点击 **Tools → External Plugins → Refresh Plugins**。
-4. 在插件列表中点击 **KiCad AI Assistant**，打开聊天面板。
-5. 进入 **Options → Settings**，输入你的 LLM API Key。
+3. 进入 **Preferences → Plugins**，启用 **Enable KiCad API**。面板需要该 IPC 套接字来执行 **Reload PCB** 和 `update_pcb_from_schematic` 工具；未启用时这两项会失败，但直接编辑文件的功能仍然可用。本安装包未声明 IPC 运行时，因此 KiCad 不会提示启用，请手动开启。
+4. 依次点击 **Tools → External Plugins → Refresh Plugins**。
+5. 在插件列表中点击 **KiCad AI Assistant**，打开聊天面板。
+6. 进入 **Options → Settings**，输入你的 LLM API Key。
 
 ## 插件配置
 
-插件配置文件路径：`~/.config/kicad/kicad_ai_assistant.json`
+插件配置文件路径：`~/.config/kicad/10.0/kcaa/kicad_ai_assistant.json`
 
 所有设置均可通过插件面板的 **Options → Settings** 修改：
 
@@ -439,10 +479,12 @@ kcaa/
 ## 常见问题
 
 **插件未出现在 KiCad 中：**
-- 确认插件目录名称为 `kicad_ai_assistant`（注意不要写错）。
+- 手动安装：确认使用了文档中的目录名 `<documents>/kicad/<ver>/scripting/plugins/kicad_ai_assistant`（旧说明使用的是 `kicad_ai_plugin`），这样下面的命令才能正常工作。
+- PCM 安装：确认 `<documents>/kicad/<ver>/3rdparty/plugins/com_github_paul356_kicad-ai-assistant` 存在，并且来自 `kicad_ai_assistant_pcm.zip`。
 - 安装后执行 **Tools → External Plugins → Refresh Plugins**。
 - Linux：检查 `setup_plugin.sh` 是否成功完成，并确认插件目录下存在 `.venv/bin/python`。
 - Windows：检查 `setup_plugin.bat`（或 `setup_plugin.ps1`）是否成功完成，并确认插件目录下存在 `.venv/Scripts/python.exe`。
+- 如果安装脚本失败，参见 [安装脚本排查说明](docs/troubleshooting.md#setup-script-fails-and-the-window-closes)。
 
 **MCP 服务器启动失败：**
 - Linux：查看 `~/.config/kicad/` 目录下的插件日志，排查 Python 报错信息。

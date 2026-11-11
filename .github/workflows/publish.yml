@@ -79,8 +79,9 @@ jobs:
     - name: Publish to PyPI
       uses: pypa/gh-action-pypi-publish@release/v1
 
-  # Attach the plugin zip and its checksum to the GitHub release so the
-  # in-panel updater has a verifiable download payload.
+  # Attach both plugin archives and their checksums to the GitHub release:
+  # kicad_ai_assistant.zip is the manual-install / in-panel updater payload,
+  # kicad_ai_assistant_pcm.zip is for Plugin and Content Manager installs.
   plugin-assets:
     runs-on: ubuntu-latest
     if: github.event_name == 'release'
@@ -89,8 +90,8 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
-    - name: Build plugin zip
-      run: make dist-plugin
+    - name: Build plugin archives
+      run: make dist-plugin dist-pcm
 
     - name: Verify plugin VERSION matches release tag
       env:
@@ -101,19 +102,26 @@ jobs:
           echo "::error::Release tag '$expected' is not an installable version"
           exit 1
         fi
-        actual="$(unzip -p dist/kicad_ai_assistant.zip kicad_ai_assistant/VERSION | tr -d '[:space:]')"
-        echo "Release tag:   ${expected}"
-        echo "Plugin VERSION: ${actual}"
-        if [ -z "${actual}" ] || [ "${actual}" != "${expected}" ]; then
-          echo "::error::Plugin VERSION '${actual}' does not match release tag '${expected}'"
-          exit 1
-        fi
+        echo "Release tag: ${expected}"
+        for spec in \
+          "kicad_ai_assistant.zip:kicad_ai_assistant/VERSION" \
+          "kicad_ai_assistant_pcm.zip:plugins/VERSION"
+        do
+          archive="${spec%%:*}"
+          member="${spec#*:}"
+          actual="$(unzip -p "dist/${archive}" "${member}" | tr -d '[:space:]')"
+          echo "${archive} VERSION: ${actual}"
+          if [ -z "${actual}" ] || [ "${actual}" != "${expected}" ]; then
+            echo "::error::${archive} VERSION '${actual}' does not match release tag '${expected}'"
+            exit 1
+          fi
+        done
 
     - name: Generate checksums
-      run: cd dist && sha256sum kicad_ai_assistant.zip > SHA256SUMS
+      run: cd dist && sha256sum kicad_ai_assistant.zip kicad_ai_assistant_pcm.zip > SHA256SUMS
 
     - name: Upload release assets
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         TAG: ${{ github.event.release.tag_name }}
-      run: gh release upload "$TAG" dist/kicad_ai_assistant.zip dist/SHA256SUMS --clobber
+      run: gh release upload "$TAG" dist/kicad_ai_assistant.zip dist/kicad_ai_assistant_pcm.zip dist/SHA256SUMS --clobber
