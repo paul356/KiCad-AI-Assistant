@@ -4333,7 +4333,14 @@ class LLMClient:
                                 type(content).__name__,
                             )
 
-                        for tc_delta in msg.get("tool_calls") or []:
+                        raw_tool_calls = msg.get("tool_calls")
+                        if raw_tool_calls is not None and not isinstance(raw_tool_calls, list):
+                            log.warning(
+                                "Ignoring non-list tool_calls in Ollama stream (%s)",
+                                type(raw_tool_calls).__name__,
+                            )
+                            raw_tool_calls = None
+                        for tc_delta in raw_tool_calls or []:
                             # Ollama nests the call index inside `function`
                             # (older releases omit it and send one complete call
                             # per chunk); _tool_call_slot honours either and
@@ -4379,12 +4386,18 @@ class LLMClient:
                     if done:
                         # The final chunk may also carry the last assistant
                         # message (content and/or tool calls); it was consumed
-                        # above before leaving the stream (#272).
-                        if tool_calls_by_index:
-                            finish_reason = "tool_calls"
-                        else:
-                            finish_reason = chunk.get("done_reason", "stop")
+                        # above before leaving the stream (#272).  Ollama emits
+                        # that message as a delta (empty content, calls sent
+                        # once), so accumulating it is not double-counting; a
+                        # shim that repeats the cumulative message is out of
+                        # contract.
+                        finish_reason = chunk.get("done_reason", "stop")
                         break
+
+                # A stream can end without a done chunk (connection closed or
+                # truncated); the calls accumulated so far are still usable.
+                if tool_calls_by_index:
+                    finish_reason = "tool_calls"
 
                 tool_calls = [tool_calls_by_index[k] for k in sorted(tool_calls_by_index)]
                 message: dict[str, Any] = {"content": "".join(text_parts)}
@@ -4799,11 +4812,17 @@ class LLMClient:
         msg = body.get("message", {})
         # Ollama returns tool-call arguments as JSON objects; normalize the
         # copy we hand back so downstream json.loads(arguments) works.
-        if isinstance(msg, dict) and msg.get("tool_calls"):
+        has_tool_calls = (
+            isinstance(msg, dict)
+            and isinstance(msg.get("tool_calls"), list)
+            and bool(msg["tool_calls"])
+        )
+        if has_tool_calls:
             msg = {**msg, "tool_calls": _normalize_tool_calls(msg["tool_calls"])}
-        finish_reason = "stop"
-        if body.get("done_reason") == "tool_calls":
-            finish_reason = "tool_calls"
+        # Ollama's DoneReason is only stop/length/connection_closed, so a
+        # tool-call turn is identified by the message payload; otherwise keep
+        # the provider's reason (e.g. "length" when num_predict truncates).
+        finish_reason = "tool_calls" if has_tool_calls else body.get("done_reason", "stop")
         return {
             "finish_reason": finish_reason,
             "message": msg,

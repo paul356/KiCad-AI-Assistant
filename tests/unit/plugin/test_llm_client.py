@@ -3221,7 +3221,9 @@ class TestToolCallArgumentsNormalization:
         assert json.loads(tc["function"]["arguments"]) == {"detail": "full"}
         assert tc["id"] == ""
         # #272: an accumulated tool call reports "tool_calls" even when the
-        # provider's done_reason says "stop", matching _stream_openai.
+        # provider's done_reason says "stop".  The value coincides with what
+        # OpenAI-compatible providers report for tool calls; that path echoes
+        # the provider's finish_reason rather than inferring it.
         assert result["finish_reason"] == "tool_calls"
 
     def test_stream_ollama_string_argument_fragments_still_concatenate(self):
@@ -3255,7 +3257,7 @@ class TestToolCallArgumentsNormalization:
                     {"function": {"name": "get_board_info", "arguments": {"detail": "full"}}}
                 ],
             },
-            "done_reason": "tool_calls",
+            "done_reason": "stop",
         }
         with patch(
             "kicad_plugin.llm_client._https_post_json",
@@ -3268,6 +3270,26 @@ class TestToolCallArgumentsNormalization:
         arguments = result["message"]["tool_calls"][0]["function"]["arguments"]
         assert isinstance(arguments, str)
         assert json.loads(arguments) == {"detail": "full"}
+
+    def test_call_ollama_text_response_keeps_done_reason(self):
+        """Without tool calls the provider's reason (e.g. a num_predict
+        truncation) must reach the caller unchanged."""
+        client = _make_client()
+        client._settings.llm_provider = "ollama"
+        body = {
+            "message": {"role": "assistant", "content": "Partial answer"},
+            "done_reason": "length",
+        }
+        with patch(
+            "kicad_plugin.llm_client._https_post_json",
+            return_value=(200, json.dumps(body)),
+        ):
+            result = client._call_ollama("sys", [])
+
+        assert "error" not in result
+        assert result["finish_reason"] == "length"
+        assert result["message"]["content"] == "Partial answer"
+        assert "tool_calls" not in result["message"]
 
     def test_call_openai_normalizes_object_arguments(self):
         """Ollama's OpenAI-compatible endpoint (/v1/chat/completions) also
@@ -3809,6 +3831,48 @@ class TestOllamaFinalChunk:
             {"type": "text_chunk", "content": "Done: all nets routed."},
             {"type": "text_end"},
         ]
+        assert result["finish_reason"] == "stop"
+
+    def test_stream_ollama_eof_without_done_chunk_keeps_calls(self):
+        """A truncated stream with no ``done`` chunk still returns the calls
+        accumulated so far and reports them."""
+        client = _make_client()
+        client._settings.llm_provider = "ollama"
+        lines = [
+            '{"message":{"role":"assistant","content":"","tool_calls":'
+            '[{"index":0,"id":"call_1","function":{"name":"get_board_info",'
+            '"arguments":{"detail":"full"}}}]},"done":false}',
+        ]
+
+        result = self._stream_ollama(client, lines)
+
+        assert "error" not in result, result.get("error")
+        tcs = result["message"]["tool_calls"]
+        assert len(tcs) == 1
+        assert tcs[0]["function"]["name"] == "get_board_info"
+        assert json.loads(tcs[0]["function"]["arguments"]) == {"detail": "full"}
+        assert result["finish_reason"] == "tool_calls"
+
+    @pytest.mark.parametrize("tool_calls", [{}, {"function": {"name": "get_board_info"}}])
+    def test_stream_ollama_final_chunk_non_list_tool_calls_is_ignored(self, tool_calls):
+        """A malformed ``tool_calls`` object must not raise; the content the
+        chunk carried still reaches the caller."""
+        client = _make_client()
+        client._settings.llm_provider = "ollama"
+        final = {
+            "message": {
+                "role": "assistant",
+                "content": "Board checked.",
+                "tool_calls": tool_calls,
+            },
+            "done": True,
+            "done_reason": "stop",
+        }
+
+        result = self._stream_ollama(client, [json.dumps(final)])
+
+        assert "error" not in result, result.get("error")
+        assert result["message"] == {"content": "Board checked."}
         assert result["finish_reason"] == "stop"
 
     @pytest.mark.parametrize(
