@@ -46,6 +46,18 @@
 		(pad "2" smd rect (at 0.5 0.0) (size 0.5 0.5) (layers "F.Cu" "F.Paste" "F.Mask"))
 	)
 
+	; R4 – B.Cu-only obstacle next to R1, so B-side blocking can be observed
+	; without relying on the coincident R2.
+	(footprint "Resistor_SMD:R_0603_1608Metric"
+		(layer "B.Cu")
+		(at 12.7 10.0 0.0)
+		(property "Reference" "R4")
+		(property "Value" "33k")
+		(fp_rect (start -1.0 -0.5) (end 1.0 0.5) (layer "B.Courtyard"))
+		(pad "1" smd rect (at -0.5 0.0) (size 0.5 0.5) (layers "B.Cu" "B.Paste" "B.Mask"))
+		(pad "2" smd rect (at 0.5 0.0) (size 0.5 0.5) (layers "B.Cu" "B.Paste" "B.Mask"))
+	)
+
 	; R5 – no layer node at all: the side is unknown and must stay conservative.
 	(footprint "Resistor_SMD:R_0603_1608Metric"
 		(at 20.0 10.0 0.0)

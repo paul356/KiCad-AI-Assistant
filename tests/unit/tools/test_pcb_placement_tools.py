@@ -508,6 +508,7 @@ class TestSideAwareCollisions:
       R1 — F.Cu at (10, 10)
       R2 — B.Cu at (10, 10)   (overlaps R1 in XY, opposite side)
       R3 — F.Cu at (30, 10)   (same side as R1)
+      R4 — B.Cu at (12.7, 10) (B-side-only obstacle next to R1)
       R5 — no layer node at (20, 10)  (unknown side)
     """
 
@@ -672,6 +673,10 @@ class TestSideAwareCollisions:
         )
         assert result["candidates"], result
         for cand in result["candidates"]:
+            # R1 is F.Cu, R4 is B.Cu.  Without footprint_ref there is no side
+            # to compare, so both must still block: a candidate at (12.7,
+            # 10.16) would overlap R4 alone and only appear if the no-ref path
+            # wrongly assumed the F side.
             overlaps_r1 = (
                 cand["x"] - 1.0 < 11.0
                 and cand["x"] + 1.0 > 9.0
@@ -679,3 +684,106 @@ class TestSideAwareCollisions:
                 and cand["y"] + 0.5 > 9.5
             )
             assert not overlaps_r1, cand
+            overlaps_r4 = (
+                cand["x"] - 1.0 < 13.7
+                and cand["x"] + 1.0 > 11.7
+                and cand["y"] - 0.5 < 10.5
+                and cand["y"] + 0.5 > 9.5
+            )
+            assert not overlaps_r4, cand
+
+    def test_unknown_proposal_side_collides_with_both(self, tools, sides_board_copy, monkeypatch):
+        """A layer-less proposal must not default to either real side."""
+        import kcaa.tools.pcb_placement_tools as placement_tools
+
+        monkeypatch.setattr(placement_tools, "find_nearest_free_position", lambda *a, **k: None)
+        result = _run(
+            tools["set_footprint_position"](
+                pcb_path=sides_board_copy,
+                items=[{"reference": "R5", "x": 10.0, "y": 10.0, "rotation": None}],
+                ctx=None,
+            )
+        )
+        assert result["failure_count"] == 1
+        entry = result["results"][0]
+        assert "error" in entry
+        assert entry["proposed_position_overlaps"] == ["R1", "R2"]
+
+    def test_group_position_ignores_opposite_side_static(self, sides_board_copy):
+        """A B.Cu member over the F.Cu R1 is clear and is not relocated."""
+        from kcaa.tools.pcb_placement_helpers import _find_group_board_position
+
+        data = load_pcb(sides_board_copy)
+        x, y, found_clear, push_list = _find_group_board_position(
+            data,
+            {"R2"},
+            [{"ref": "R2", "dx": 0.0, "dy": 0.0, "rotation": 0.0}],
+            anchor_current_pos=(10.0, 10.0),
+        )
+        assert found_clear is True
+        assert x == pytest.approx(10.16)
+        assert y == pytest.approx(10.16)
+        assert push_list == []
+
+    def test_group_position_still_blocked_by_same_side_static(self, sides_board_copy):
+        """An F.Cu member over the F.Cu R3 cannot keep its position."""
+        from kcaa.tools.pcb_placement_helpers import _find_group_board_position
+
+        data = load_pcb(sides_board_copy)
+        x, y, found_clear, _ = _find_group_board_position(
+            data,
+            {"R1"},
+            [{"ref": "R1", "dx": 0.0, "dy": 0.0, "rotation": 0.0}],
+            anchor_current_pos=(30.0, 10.0),
+        )
+        started_clear = found_clear and x == pytest.approx(30.48) and y == pytest.approx(10.16)
+        assert not started_clear
+
+    def test_push_shove_ignores_opposite_side_conflict(self):
+        """Pushing an F.Cu part onto a B.Cu courtyard is not a new conflict."""
+        from kcaa.tools.pcb_placement_helpers import _resolve_push_shove
+
+        member = {"min_x": -0.5, "min_y": -0.5, "max_x": 1.5, "max_y": 0.5}
+        pushed = {
+            "ref": "A",
+            "layer": "F.Cu",
+            "min_x": -1.0,
+            "min_y": -0.5,
+            "max_x": 1.0,
+            "max_y": 0.5,
+        }
+        opposite = {
+            "ref": "B",
+            "layer": "B.Cu",
+            "min_x": -1.0,
+            "min_y": 0.9,
+            "max_x": 1.0,
+            "max_y": 1.9,
+        }
+        result = _resolve_push_shove({"A": [member]}, [pushed, opposite], 2.0)
+        assert result is not None
+        assert result[0]["ref"] == "A"
+        assert result[0]["push_dy"] == pytest.approx(1.27)
+
+    def test_push_shove_blocked_by_same_side_conflict(self):
+        """The same push is rejected when the obstruction is on the same side."""
+        from kcaa.tools.pcb_placement_helpers import _resolve_push_shove
+
+        member = {"min_x": -0.5, "min_y": -0.5, "max_x": 1.5, "max_y": 0.5}
+        pushed = {
+            "ref": "A",
+            "layer": "F.Cu",
+            "min_x": -1.0,
+            "min_y": -0.5,
+            "max_x": 1.0,
+            "max_y": 0.5,
+        }
+        same_side = {
+            "ref": "B",
+            "layer": "F.Cu",
+            "min_x": -1.0,
+            "min_y": 0.9,
+            "max_x": 1.0,
+            "max_y": 1.9,
+        }
+        assert _resolve_push_shove({"A": [member]}, [pushed, same_side], 2.0) is None
