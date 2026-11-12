@@ -154,13 +154,17 @@ def _update_check_message(result, current: str, editable: bool = False) -> str |
     return f"You are running the latest version ({current})."
 
 
-def _jump_arrow_geometry(size: int, direction: str) -> tuple[float, float, float]:
-    """Return (tip_y, tail_y, head_y) for the up/down jump arrows."""
+def _jump_chevron_geometry(
+    size: int, direction: str
+) -> tuple[tuple[float, float], tuple[float, float], tuple[float, float]]:
+    """Return (tip, left_wing, right_wing) for the up/down chevrons."""
+    cx = size / 2
+    cy = size / 2
     if direction == "up":
-        return (6.0, float(size - 6), 12.0)
+        return ((cx, cy - 5.0), (cx - 7.0, cy + 5.0), (cx + 7.0, cy + 5.0))
     if direction == "down":
-        return (float(size - 6), 6.0, float(size - 12))
-    raise ValueError(f"unknown jump arrow direction: {direction!r}")
+        return ((cx, cy + 5.0), (cx - 7.0, cy - 5.0), (cx + 7.0, cy - 5.0))
+    raise ValueError(f"unknown jump chevron direction: {direction!r}")
 
 
 if _WX_AVAILABLE:
@@ -515,9 +519,8 @@ if _WX_AVAILABLE:
             self._prompt_drag_max_height = 0
 
             # ---- Input row ----
-            #  [📎] [____ Ask the AI assistant… ____] [↑]
-            #  Attach  Text input (expands)      [➤/⬛ ●]
-            #                                      [↓]
+            #  [📎] [____ Ask the AI assistant… ____] [↑ ↓]
+            #  Attach  Text input (expands)      [➤/⬛  ●]
             hbox = wx.BoxSizer(wx.HORIZONTAL)
 
             # Attach button — single entry point for images & PDFs.
@@ -539,11 +542,12 @@ if _WX_AVAILABLE:
             self._prompt_default_min_size = self._input.GetMinSize()
             hbox.Add(self._input, 1, wx.EXPAND)
 
-            # Right-hand column: jump-to-start, Send/Stop + status, jump-to-latest.
+            # Right-hand column: [jump up][jump down] over [send ●].
             side_vbox = wx.BoxSizer(wx.VERTICAL)
 
-            # Jump-to-start: top of the column, always visible.
+            # Both jump buttons share one row, above Send/Stop.
             icon_bg = panel.GetBackgroundColour()
+            jump_row = wx.BoxSizer(wx.HORIZONTAL)
             self._jump_top_btn = wx.BitmapButton(
                 panel,
                 bitmap=self._make_jump_bitmap("up", bg=icon_bg),
@@ -551,9 +555,20 @@ if _WX_AVAILABLE:
             )
             self._jump_top_btn.SetToolTip("Jump to start")
             self._jump_top_btn.SetName("Jump to start")
-            side_vbox.Add(self._jump_top_btn, 0, wx.ALIGN_CENTER_HORIZONTAL | wx.BOTTOM, 2)
+            jump_row.Add(self._jump_top_btn, 0, wx.ALIGN_CENTER_VERTICAL)
 
-            # Send/Stop with the backend status dot immediately to its right.
+            self._jump_latest_btn = wx.BitmapButton(
+                panel,
+                bitmap=self._make_jump_bitmap("down", bg=icon_bg),
+                style=wx.BU_EXACTFIT | wx.BORDER_NONE,
+            )
+            self._jump_latest_btn.SetToolTip("Jump to latest")
+            self._jump_latest_btn.SetName("Jump to latest")
+            jump_row.Add(self._jump_latest_btn, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 6)
+
+            side_vbox.Add(jump_row, 0, wx.ALIGN_CENTER_HORIZONTAL | wx.BOTTOM, 4)
+
+            # Send/Stop with the backend status dot 12 px to its right.
             send_row = wx.BoxSizer(wx.HORIZONTAL)
             # Send / Stop toggle button — doubles as Stop during generation.
             self._send_btn = wx.BitmapButton(
@@ -567,25 +582,15 @@ if _WX_AVAILABLE:
             self._send_btn.Disable()
             send_row.Add(self._send_btn, 0, wx.ALIGN_CENTER_VERTICAL)
 
-            # Status dot — 14 px coloured circle, tooltip carries full text.
+            # Status dot — 10 px coloured circle, tooltip carries full text.
             self._status_dot = wx.StaticBitmap(
                 panel,
                 bitmap=self._make_status_dot_bitmap(self._C_GREY, bg=panel.GetBackgroundColour()),
             )
             self._status_dot.SetToolTip("Starting backend…")
-            send_row.Add(self._status_dot, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 4)
+            send_row.Add(self._status_dot, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 12)
 
             side_vbox.Add(send_row, 0, wx.ALIGN_CENTER_HORIZONTAL)
-
-            # Jump-to-latest: below Send/Stop, always visible.
-            self._jump_latest_btn = wx.BitmapButton(
-                panel,
-                bitmap=self._make_jump_bitmap("down", bg=icon_bg),
-                style=wx.BU_EXACTFIT | wx.BORDER_NONE,
-            )
-            self._jump_latest_btn.SetToolTip("Jump to latest")
-            self._jump_latest_btn.SetName("Jump to latest")
-            side_vbox.Add(self._jump_latest_btn, 0, wx.ALIGN_CENTER_HORIZONTAL | wx.TOP, 2)
 
             hbox.Add(side_vbox, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 4)
 
@@ -1405,32 +1410,49 @@ if _WX_AVAILABLE:
             return bmp
 
         @staticmethod
-        def _make_send_bitmap(size: int = 28, bg: wx.Colour | None = None) -> wx.Bitmap:
-            """Paper-plane send icon drawn with GraphicsContext."""
+        def _make_send_bitmap(size: int = 36, bg: wx.Colour | None = None) -> wx.Bitmap:
+            """Blue rounded chip with a white paper-plane glyph."""
             bmp, mdc = AssistantPanel._new_icon_bitmap(size, bg)
             gc = wx.GraphicsContext.Create(mdc)
-            gc.SetBrush(wx.Brush(wx.Colour(34, 85, 204)))  # _C_USER blue
-            gc.SetPen(wx.Pen(wx.Colour(24, 65, 180), 1))
-            path = gc.CreatePath()
-            path.MoveToPoint(4, 4)
-            path.AddLineToPoint(size - 4, size / 2)
-            path.AddLineToPoint(4, size - 4)
-            path.AddLineToPoint(4, 4)
-            gc.DrawPath(path)
+            chip = gc.CreatePath()
+            chip.AddRoundedRectangle(0.5, 0.5, size - 1, size - 1, 8)
+            gc.SetBrush(wx.Brush(wx.Colour(34, 85, 204)))  # #2255CC
+            gc.SetPen(wx.Pen(wx.Colour(28, 76, 184), 1))  # #1C4CB8
+            gc.DrawPath(chip)
+
+            # White paper plane, 16 px across, centred.
+            cx = size / 2
+            cy = size / 2
+            plane = gc.CreatePath()
+            plane.MoveToPoint(cx - 8, cy - 6)
+            plane.AddLineToPoint(cx + 8, cy)
+            plane.AddLineToPoint(cx - 8, cy + 6)
+            plane.AddLineToPoint(cx - 4, cy)
+            plane.CloseSubpath()
+            gc.SetBrush(wx.Brush(wx.Colour(255, 255, 255)))
+            gc.SetPen(wx.Pen(wx.Colour(255, 255, 255), 1))
+            gc.DrawPath(plane)
             del gc, mdc
             return bmp
 
         @staticmethod
-        def _make_stop_bitmap(size: int = 28, bg: wx.Colour | None = None) -> wx.Bitmap:
-            """Red rounded-square stop icon drawn with GraphicsContext."""
+        def _make_stop_bitmap(size: int = 36, bg: wx.Colour | None = None) -> wx.Bitmap:
+            """Red rounded chip with a white stop square."""
             bmp, mdc = AssistantPanel._new_icon_bitmap(size, bg)
             gc = wx.GraphicsContext.Create(mdc)
-            gc.SetBrush(wx.Brush(wx.Colour(220, 70, 70)))
-            gc.SetPen(wx.Pen(wx.Colour(180, 50, 50), 1))
-            path = gc.CreatePath()
-            margin = 5
-            path.AddRoundedRectangle(margin, margin, size - 2 * margin, size - 2 * margin, 3)
-            gc.DrawPath(path)
+            chip = gc.CreatePath()
+            chip.AddRoundedRectangle(0.5, 0.5, size - 1, size - 1, 8)
+            gc.SetBrush(wx.Brush(wx.Colour(220, 70, 70)))  # #DC4646
+            gc.SetPen(wx.Pen(wx.Colour(185, 56, 56), 1))  # #B93838
+            gc.DrawPath(chip)
+
+            # White 12×12 stop square, centred.
+            margin = (size - 12) / 2
+            square = gc.CreatePath()
+            square.AddRoundedRectangle(margin, margin, 12, 12, 2)
+            gc.SetBrush(wx.Brush(wx.Colour(255, 255, 255)))
+            gc.SetPen(wx.Pen(wx.Colour(255, 255, 255), 1))
+            gc.DrawPath(square)
             del gc, mdc
             return bmp
 
@@ -1438,34 +1460,30 @@ if _WX_AVAILABLE:
         def _make_jump_bitmap(
             direction: str, size: int = 28, bg: wx.Colour | None = None
         ) -> wx.Bitmap:
-            """Up/down arrow for the conversation jump buttons."""
+            """Bold grey chevron for the conversation jump buttons."""
             bmp, mdc = AssistantPanel._new_icon_bitmap(size, bg)
             gc = wx.GraphicsContext.Create(mdc)
-            colour = wx.Colour(34, 85, 204)  # _C_USER blue
-            gc.SetPen(wx.Pen(colour, 2))
-            gc.SetBrush(wx.Brush(colour))
-            cx = size / 2
-            tip_y, tail_y, head_y = _jump_arrow_geometry(size, direction)
-            gc.StrokeLine(cx, tail_y, cx, tip_y)
+            colour = wx.Colour(91, 100, 112)  # #5B6470
+            gc.SetPen(wx.Pen(colour, 3))
+            tip, left_wing, right_wing = _jump_chevron_geometry(size, direction)
             path = gc.CreatePath()
-            path.MoveToPoint(cx, tip_y)
-            path.AddLineToPoint(cx - 4, head_y)
-            path.AddLineToPoint(cx + 4, head_y)
-            path.CloseSubpath()
-            gc.FillPath(path)
+            path.MoveToPoint(left_wing[0], left_wing[1])
+            path.AddLineToPoint(tip[0], tip[1])
+            path.AddLineToPoint(right_wing[0], right_wing[1])
+            gc.StrokePath(path)
             del gc, mdc
             return bmp
 
         @staticmethod
         def _make_status_dot_bitmap(
-            rgb: tuple, size: int = 14, bg: wx.Colour | None = None
+            rgb: tuple, size: int = 10, bg: wx.Colour | None = None
         ) -> wx.Bitmap:
-            """Coloured circle for the status indicator."""
+            """Coloured circle with a subtle ring for the status indicator."""
             bmp, mdc = AssistantPanel._new_icon_bitmap(size, bg)
             gc = wx.GraphicsContext.Create(mdc)
             gc.SetBrush(wx.Brush(wx.Colour(*rgb)))
-            gc.SetPen(wx.Pen(wx.Colour(*rgb), 1))
-            gc.DrawEllipse(1, 1, size - 2, size - 2)
+            gc.SetPen(wx.Pen(wx.Colour(214, 218, 224), 1))  # #D6DAE0
+            gc.DrawEllipse(0.5, 0.5, size - 1, size - 1)
             del gc, mdc
             return bmp
 

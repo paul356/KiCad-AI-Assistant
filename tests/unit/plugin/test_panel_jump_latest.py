@@ -20,7 +20,7 @@ from types import SimpleNamespace
 import pytest
 
 import kicad_plugin.ui.panel as _panel_module
-from kicad_plugin.ui.panel import _jump_arrow_geometry
+from kicad_plugin.ui.panel import _jump_chevron_geometry
 
 _MODULE_SOURCE = Path(_panel_module.__file__).read_text(encoding="utf-8")
 _MODULE_TREE = ast.parse(_MODULE_SOURCE, filename=str(_panel_module.__file__))
@@ -110,24 +110,30 @@ def _sizer_order(build_ui: ast.FunctionDef, sizer: str) -> list[str]:
     return [name for _, name in sorted(adds)]
 
 
-def test_jump_buttons_surround_the_send_row() -> None:
-    """Top control above Send/Stop, latest below it."""
-    assert _sizer_order(_function("_build_ui"), "side_vbox") == [
-        "_jump_top_btn",
-        "send_row",
-        "_jump_latest_btn",
-    ]
+def test_jump_buttons_share_a_row_above_send() -> None:
+    """Both jump buttons sit in one horizontal row above the send row."""
+    build_ui = _function("_build_ui")
+    assert _sizer_order(build_ui, "side_vbox") == ["jump_row", "send_row"]
+    assert _sizer_order(build_ui, "jump_row") == ["_jump_top_btn", "_jump_latest_btn"]
+    source = _source(build_ui)
+    assert "jump_row = wx.BoxSizer(wx.HORIZONTAL)" in source
+    assert "jump_row.Add(self._jump_latest_btn, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 6)" in source
+    side_children = _sizer_order(build_ui, "side_vbox")
+    assert "_status_dot" not in side_children
+    assert "_jump_top_btn" not in side_children
+    assert "_jump_latest_btn" not in side_children
 
 
 def test_send_row_puts_the_status_dot_after_send() -> None:
-    """The backend indicator sits immediately to the right of Send/Stop."""
+    """The backend indicator sits 12 px to the right of the send chip."""
     build_ui = _function("_build_ui")
     assert _sizer_order(build_ui, "send_row") == ["_send_btn", "_status_dot"]
     assert "send_row = wx.BoxSizer(wx.HORIZONTAL)" in _source(build_ui)
-    assert "send_row.Add(self._status_dot, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 4)" in _source(
+    assert "send_row.Add(self._status_dot, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 12)" in _source(
         build_ui
     )
-    assert "_status_dot" not in _sizer_order(build_ui, "side_vbox")
+    assert "_jump_top_btn" not in _sizer_order(build_ui, "send_row")
+    assert "_jump_latest_btn" not in _sizer_order(build_ui, "send_row")
 
 
 def test_jump_buttons_have_tooltips_and_accessible_names() -> None:
@@ -157,27 +163,56 @@ def test_jump_buttons_are_always_visible() -> None:
 
 @pytest.mark.parametrize(
     ("direction", "expected"),
-    [("up", (6.0, 22.0, 12.0)), ("down", (22.0, 6.0, 16.0))],
+    [
+        ("up", ((14.0, 9.0), (7.0, 19.0), (21.0, 19.0))),
+        ("down", ((14.0, 19.0), (7.0, 9.0), (21.0, 9.0))),
+    ],
 )
-def test_jump_arrow_geometry(direction: str, expected: tuple[float, float, float]) -> None:
-    assert _jump_arrow_geometry(28, direction) == expected
+def test_jump_chevron_geometry(direction: str, expected: tuple[tuple[float, float], ...]) -> None:
+    assert _jump_chevron_geometry(28, direction) == expected
 
 
 @pytest.mark.parametrize("direction", ["Up", "top", ""])
-def test_jump_arrow_geometry_rejects_unknown_directions(direction: str) -> None:
+def test_jump_chevron_geometry_rejects_unknown_directions(direction: str) -> None:
     with pytest.raises(ValueError):
-        _jump_arrow_geometry(28, direction)
+        _jump_chevron_geometry(28, direction)
 
 
-def test_jump_bitmap_helper_draws_both_directions() -> None:
+def test_jump_bitmap_draws_distinct_chevrons() -> None:
     source = _source(_function("_make_jump_bitmap"))
     assert "GraphicsContext.Create" in source
-    assert "gc.StrokeLine(" in source
-    assert "gc.FillPath(" in source
-    assert "_jump_arrow_geometry(size, direction)" in source
+    assert "wx.Pen(colour, 3)" in source
+    assert "gc.StrokePath(path)" in source
     assert "size: int = 28" in source
-    for direction in ("up", "down"):
-        assert len(_jump_arrow_geometry(28, direction)) == 3
+    up = _jump_chevron_geometry(28, "up")
+    down = _jump_chevron_geometry(28, "down")
+    assert up != down
+    assert up[0][0] == down[0][0]  # same centre column
+    assert up[1][0] == down[1][0] == 7.0
+    assert up[2][0] == down[2][0] == 21.0
+    assert up[1][1] == up[2][1] == 19.0
+    assert down[1][1] == down[2][1] == 9.0
+    assert up[0][1] < up[1][1] and down[0][1] > down[1][1]  # opposite points
+
+
+def test_send_and_stop_use_the_same_36px_chip() -> None:
+    send = _source(_function("_make_send_bitmap"))
+    stop = _source(_function("_make_stop_bitmap"))
+    for source in (send, stop):
+        assert "size: int = 36" in source
+        assert "AddRoundedRectangle" in source
+        assert "wx.Pen(" in source
+    assert "wx.Colour(34, 85, 204)" in send
+    assert "wx.Colour(28, 76, 184)" in send
+    assert "wx.Colour(220, 70, 70)" in stop
+    assert "wx.Colour(185, 56, 56)" in stop
+
+
+def test_status_dot_is_ten_pixels_with_a_ring() -> None:
+    source = _source(_function("_make_status_dot_bitmap"))
+    assert "size: int = 10" in source
+    assert "wx.Colour(214, 218, 224)" in source
+    assert "DrawEllipse(0.5, 0.5, size - 1, size - 1)" in source
 
 
 # --------------------------------------------------------------------------- #
