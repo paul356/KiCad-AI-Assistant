@@ -110,19 +110,23 @@ def _sizer_order(build_ui: ast.FunctionDef, sizer: str) -> list[str]:
     return [name for _, name in sorted(adds)]
 
 
-def test_jump_buttons_share_a_row_above_send() -> None:
-    """Both jump buttons sit in one horizontal row above the send row."""
+def test_jump_arrows_stack_above_and_below_send() -> None:
+    """Top arrow, send row, bottom arrow, left-aligned at 2 px spacing."""
     build_ui = _function("_build_ui")
-    assert _sizer_order(build_ui, "side_vbox") == ["jump_row", "send_row"]
-    assert _sizer_order(build_ui, "jump_row") == ["_jump_top_btn", "_jump_latest_btn"]
+    assert _sizer_order(build_ui, "side_vbox") == [
+        "_jump_top_btn",
+        "send_row",
+        "_jump_latest_btn",
+    ]
     source = _source(build_ui)
-    assert "jump_row = wx.BoxSizer(wx.HORIZONTAL)" in source
-    assert "jump_row.Add(self._jump_latest_btn, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 6)" in source
-    assert "side_vbox.Add(jump_row, 0, wx.ALIGN_CENTER_HORIZONTAL | wx.BOTTOM, 4)" in source
+    assert "side_vbox.Add(self._jump_top_btn, 0, wx.ALIGN_LEFT | wx.BOTTOM, 2)" in source
+    assert "side_vbox.Add(send_row, 0, wx.ALIGN_LEFT | wx.BOTTOM, 2)" in source
+    assert "side_vbox.Add(self._jump_latest_btn, 0, wx.ALIGN_LEFT)" in source
     side_children = _sizer_order(build_ui, "side_vbox")
+    assert side_children.count("_jump_top_btn") == 1
+    assert side_children.count("send_row") == 1
+    assert side_children.count("_jump_latest_btn") == 1
     assert "_status_dot" not in side_children
-    assert "_jump_top_btn" not in side_children
-    assert "_jump_latest_btn" not in side_children
 
 
 def test_send_row_puts_the_status_dot_after_send() -> None:
@@ -165,18 +169,18 @@ def test_jump_buttons_are_always_visible() -> None:
 @pytest.mark.parametrize(
     ("direction", "expected"),
     [
-        ("up", ((14.0, 9.0), (7.0, 19.0), (21.0, 19.0))),
-        ("down", ((14.0, 19.0), (7.0, 9.0), (21.0, 9.0))),
+        ("up", ((18.0, 5.5), (12.0, 12.5), (24.0, 12.5))),
+        ("down", ((18.0, 12.5), (12.0, 5.5), (24.0, 5.5))),
     ],
 )
 def test_jump_chevron_geometry(direction: str, expected: tuple[tuple[float, float], ...]) -> None:
-    assert _jump_chevron_geometry(28, direction) == expected
+    assert _jump_chevron_geometry(36, 18, direction) == expected
 
 
 @pytest.mark.parametrize("direction", ["Up", "top", ""])
 def test_jump_chevron_geometry_rejects_unknown_directions(direction: str) -> None:
     with pytest.raises(ValueError):
-        _jump_chevron_geometry(28, direction)
+        _jump_chevron_geometry(36, 18, direction)
 
 
 def test_jump_bitmap_draws_distinct_chevrons() -> None:
@@ -184,15 +188,17 @@ def test_jump_bitmap_draws_distinct_chevrons() -> None:
     assert "GraphicsContext.Create" in source
     assert "wx.Pen(colour, 3)" in source
     assert "gc.StrokePath(path)" in source
-    assert "size: int = 28" in source
-    up = _jump_chevron_geometry(28, "up")
-    down = _jump_chevron_geometry(28, "down")
+    assert "width: int = 36" in source
+    assert "height: int = 18" in source
+    assert "_new_icon_bitmap(width, bg, height)" in source
+    up = _jump_chevron_geometry(36, 18, "up")
+    down = _jump_chevron_geometry(36, 18, "down")
     assert up != down
-    assert up[0][0] == down[0][0]  # same centre column
-    assert up[1][0] == down[1][0] == 7.0
-    assert up[2][0] == down[2][0] == 21.0
-    assert up[1][1] == up[2][1] == 19.0
-    assert down[1][1] == down[2][1] == 9.0
+    assert up[0][0] == down[0][0] == 18.0  # same centre column
+    assert up[1][0] == down[1][0] == 12.0
+    assert up[2][0] == down[2][0] == 24.0
+    assert up[1][1] == up[2][1] == 12.5
+    assert down[1][1] == down[2][1] == 5.5
     assert up[0][1] < up[1][1] and down[0][1] > down[1][1]  # opposite points
 
 

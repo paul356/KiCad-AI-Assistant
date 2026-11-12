@@ -244,15 +244,15 @@ def _update_check_message(result, current: str, editable: bool = False) -> str |
 
 
 def _jump_chevron_geometry(
-    size: int, direction: str
+    width: int, height: int, direction: str
 ) -> tuple[tuple[float, float], tuple[float, float], tuple[float, float]]:
     """Return (tip, left_wing, right_wing) for the up/down chevrons."""
-    cx = size / 2
-    cy = size / 2
+    cx = width / 2
+    cy = height / 2
     if direction == "up":
-        return ((cx, cy - 5.0), (cx - 7.0, cy + 5.0), (cx + 7.0, cy + 5.0))
+        return ((cx, cy - 3.5), (cx - 6.0, cy + 3.5), (cx + 6.0, cy + 3.5))
     if direction == "down":
-        return ((cx, cy + 5.0), (cx - 7.0, cy - 5.0), (cx + 7.0, cy - 5.0))
+        return ((cx, cy + 3.5), (cx - 6.0, cy - 3.5), (cx + 6.0, cy - 3.5))
     raise ValueError(f"unknown jump chevron direction: {direction!r}")
 
 
@@ -632,12 +632,11 @@ if _WX_AVAILABLE:
             self._prompt_default_min_size = self._input.GetMinSize()
             hbox.Add(self._input, 1, wx.EXPAND)
 
-            # Right-hand column: [jump up][jump down] over [send ●].
+            # Right-hand column: jump-up, [send ●], jump-down.
             side_vbox = wx.BoxSizer(wx.VERTICAL)
 
-            # Both jump buttons share one row, above Send/Stop.
+            # Jump-to-start: 36×18 so the column stays 76 px tall.
             icon_bg = panel.GetBackgroundColour()
-            jump_row = wx.BoxSizer(wx.HORIZONTAL)
             self._jump_top_btn = wx.BitmapButton(
                 panel,
                 bitmap=self._make_jump_bitmap("up", bg=icon_bg),
@@ -645,18 +644,7 @@ if _WX_AVAILABLE:
             )
             self._jump_top_btn.SetToolTip("Jump to start")
             self._jump_top_btn.SetName("Jump to start")
-            jump_row.Add(self._jump_top_btn, 0, wx.ALIGN_CENTER_VERTICAL)
-
-            self._jump_latest_btn = wx.BitmapButton(
-                panel,
-                bitmap=self._make_jump_bitmap("down", bg=icon_bg),
-                style=wx.BU_EXACTFIT | wx.BORDER_NONE,
-            )
-            self._jump_latest_btn.SetToolTip("Jump to latest")
-            self._jump_latest_btn.SetName("Jump to latest")
-            jump_row.Add(self._jump_latest_btn, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 6)
-
-            side_vbox.Add(jump_row, 0, wx.ALIGN_CENTER_HORIZONTAL | wx.BOTTOM, 4)
+            side_vbox.Add(self._jump_top_btn, 0, wx.ALIGN_LEFT | wx.BOTTOM, 2)
 
             # Send/Stop with the backend status dot 12 px to its right.
             send_row = wx.BoxSizer(wx.HORIZONTAL)
@@ -680,7 +668,17 @@ if _WX_AVAILABLE:
             self._status_dot.SetToolTip("Starting backend…")
             send_row.Add(self._status_dot, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 12)
 
-            side_vbox.Add(send_row, 0, wx.ALIGN_CENTER_HORIZONTAL)
+            side_vbox.Add(send_row, 0, wx.ALIGN_LEFT | wx.BOTTOM, 2)
+
+            # Jump-to-latest: 36×18, aligned with the chip's left edge.
+            self._jump_latest_btn = wx.BitmapButton(
+                panel,
+                bitmap=self._make_jump_bitmap("down", bg=icon_bg),
+                style=wx.BU_EXACTFIT | wx.BORDER_NONE,
+            )
+            self._jump_latest_btn.SetToolTip("Jump to latest")
+            self._jump_latest_btn.SetName("Jump to latest")
+            side_vbox.Add(self._jump_latest_btn, 0, wx.ALIGN_LEFT)
 
             hbox.Add(side_vbox, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 4)
 
@@ -1429,9 +1427,12 @@ if _WX_AVAILABLE:
 
         @staticmethod
         def _new_icon_bitmap(
-            size: int, bg: wx.Colour | None = None
+            size: int, bg: wx.Colour | None = None, height: int | None = None
         ) -> tuple[wx.Bitmap, wx.MemoryDC]:
             """Create a canvas for a custom-drawn icon with the given background.
+
+            ``height`` defaults to ``size`` for square icons; the jump icons
+            pass 36×18 so the column stays short.
 
             wx.Bitmap(size, size) starts uninitialised (often black on GTK) and
             MemoryDC.Clear() does not reliably repaint it, so build the base
@@ -1441,8 +1442,9 @@ if _WX_AVAILABLE:
                 # Explicit RGB: wx.WHITE is a null placeholder when KiCad's
                 # embedded wxPython never created a wx.App (see issue #225).
                 bg = wx.Colour(255, 255, 255)
-            data = bytes((bg.Red(), bg.Green(), bg.Blue())) * (size * size)
-            img = wx.Image(size, size, data)
+            h = size if height is None else height
+            data = bytes((bg.Red(), bg.Green(), bg.Blue())) * (size * h)
+            img = wx.Image(size, h, data)
             bmp = wx.Bitmap(img)
             mdc = wx.MemoryDC()
             mdc.SelectObject(bmp)
@@ -1550,14 +1552,17 @@ if _WX_AVAILABLE:
 
         @staticmethod
         def _make_jump_bitmap(
-            direction: str, size: int = 28, bg: wx.Colour | None = None
+            direction: str,
+            width: int = 36,
+            height: int = 18,
+            bg: wx.Colour | None = None,
         ) -> wx.Bitmap:
             """Bold grey chevron for the conversation jump buttons."""
-            bmp, mdc = AssistantPanel._new_icon_bitmap(size, bg)
+            bmp, mdc = AssistantPanel._new_icon_bitmap(width, bg, height)
             gc = wx.GraphicsContext.Create(mdc)
             colour = wx.Colour(91, 100, 112)  # #5B6470
             gc.SetPen(wx.Pen(colour, 3))
-            tip, left_wing, right_wing = _jump_chevron_geometry(size, direction)
+            tip, left_wing, right_wing = _jump_chevron_geometry(width, height, direction)
             path = gc.CreatePath()
             path.MoveToPoint(left_wing[0], left_wing[1])
             path.AddLineToPoint(tip[0], tip[1])
