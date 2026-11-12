@@ -184,8 +184,49 @@ def _send_row_spacing(build_ui: ast.FunctionDef) -> tuple[int, int, int, int]:
     return leading, dot_size, trailing, margin
 
 
+def _flag_names(node: ast.AST) -> set[str]:
+    """Return the ``wx.<NAME>`` attributes combined with ``|``."""
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+        return _flag_names(node.left) | _flag_names(node.right)
+    if (
+        isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "wx"
+    ):
+        return {node.attr}
+    return set()
+
+
+def _side_vbox_item_flags(
+    build_ui: ast.FunctionDef, item: str
+) -> tuple[set[str] | None, int | None]:
+    """Return the flags and border on ``side_vbox.Add(<item>, ...)``."""
+    for node in ast.walk(build_ui):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "Add"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "side_vbox"
+            and len(node.args) >= 3
+        ):
+            continue
+        name = _self_attr(node.args[0])
+        if name is None and isinstance(node.args[0], ast.Name):
+            name = node.args[0].id
+        if name != item:
+            continue
+        border = _int_constant(node.args[3]) if len(node.args) >= 4 else 0
+        return _flag_names(node.args[2]), border
+    return None, None
+
+
 def test_jump_arrows_stack_above_and_below_send() -> None:
-    """Top arrow, send row, bottom arrow, in that order."""
+    """Top arrow, send row, bottom arrow, in that order.
+
+    The alignment is pinned too: both chevrons must centre over the
+    ``send + status`` row, so reverting either flag to ``ALIGN_LEFT`` fails.
+    """
     build_ui = _function("_build_ui")
     assert _sizer_order(build_ui, "side_vbox") == [
         "_jump_top_btn",
@@ -197,6 +238,18 @@ def test_jump_arrows_stack_above_and_below_send() -> None:
     assert side_children.count("send_row") == 1
     assert side_children.count("_jump_latest_btn") == 1
     assert "_status_dot" not in side_children
+
+    top_flags, top_border = _side_vbox_item_flags(build_ui, "_jump_top_btn")
+    latest_flags, latest_border = _side_vbox_item_flags(build_ui, "_jump_latest_btn")
+    row_flags, row_border = _side_vbox_item_flags(build_ui, "send_row")
+    assert top_flags is not None
+    assert latest_flags is not None
+    assert row_flags is not None
+    assert "ALIGN_CENTER_HORIZONTAL" in top_flags
+    assert "ALIGN_CENTER_HORIZONTAL" in latest_flags
+    assert "ALIGN_LEFT" in row_flags
+    assert "ALIGN_CENTER_HORIZONTAL" not in row_flags
+    assert (top_border, latest_border, row_border) == (2, 0, 2)
 
 
 def test_send_row_puts_the_status_dot_after_send() -> None:
