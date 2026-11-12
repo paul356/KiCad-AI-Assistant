@@ -14,6 +14,7 @@ import ast
 import logging
 import os
 from pathlib import Path
+import re
 import textwrap
 from types import SimpleNamespace
 
@@ -110,6 +111,28 @@ def _sizer_order(build_ui: ast.FunctionDef, sizer: str) -> list[str]:
     return [name for _, name in sorted(adds)]
 
 
+def _send_row_layout(build_ui: ast.FunctionDef) -> list[str]:
+    """Return send-row children/spacers in source order."""
+    items: list[tuple[int, str]] = []
+    for node in ast.walk(build_ui):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "send_row"
+        ):
+            continue
+        if node.func.attr == "Add" and node.args:
+            name = _self_attr(node.args[0])
+            if name is not None:
+                items.append((node.lineno, name))
+        elif node.func.attr == "AddSpacer" and node.args:
+            value = node.args[0]
+            if isinstance(value, ast.Constant):
+                items.append((node.lineno, f"spacer:{value.value}"))
+    return [item for _, item in sorted(items)]
+
+
 def test_jump_arrows_stack_above_and_below_send() -> None:
     """Top arrow, send row, bottom arrow, left-aligned at 2 px spacing."""
     build_ui = _function("_build_ui")
@@ -130,15 +153,35 @@ def test_jump_arrows_stack_above_and_below_send() -> None:
 
 
 def test_send_row_puts_the_status_dot_after_send() -> None:
-    """The backend indicator sits 12 px to the right of the send chip."""
+    """The dot is 14 px from the chip and followed by a matching pad."""
     build_ui = _function("_build_ui")
-    assert _sizer_order(build_ui, "send_row") == ["_send_btn", "_status_dot"]
-    assert "send_row = wx.BoxSizer(wx.HORIZONTAL)" in _source(build_ui)
-    assert "send_row.Add(self._status_dot, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 12)" in _source(
-        build_ui
-    )
+    assert _send_row_layout(build_ui) == ["_send_btn", "_status_dot", "spacer:14"]
+    source = _source(build_ui)
+    assert "send_row = wx.BoxSizer(wx.HORIZONTAL)" in source
+    assert "send_row.Add(self._status_dot, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 14)" in source
+    assert "send_row.AddSpacer(14)" in source
+    assert "_status_dot" not in _sizer_order(build_ui, "side_vbox")
     assert "_jump_top_btn" not in _sizer_order(build_ui, "send_row")
     assert "_jump_latest_btn" not in _sizer_order(build_ui, "send_row")
+
+
+def test_status_dot_is_centred_in_the_trailing_space() -> None:
+    """Leading gap + half the dot is the chip-right → dot-centre offset."""
+    build_ui = _function("_build_ui")
+    source = _source(build_ui)
+    dot_add = re.search(
+        r"send_row\.Add\(self\._status_dot, 0, wx\.ALIGN_CENTER_VERTICAL \| "
+        r"wx\.LEFT, (\d+)\)",
+        source,
+    )
+    spacer = re.search(r"send_row\.AddSpacer\((\d+)\)", source)
+    assert dot_add is not None and spacer is not None
+    leading = int(dot_add.group(1))
+    trailing = int(spacer.group(1))
+    dot_source = _source(_function("_make_status_dot_bitmap"))
+    dot_size = int(re.search(r"size: int = (\d+)", dot_source).group(1))
+    assert leading + dot_size / 2 == 19.0  # chip right → dot centre
+    assert trailing == leading
 
 
 def test_jump_buttons_have_tooltips_and_accessible_names() -> None:

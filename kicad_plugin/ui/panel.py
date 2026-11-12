@@ -666,7 +666,8 @@ if _WX_AVAILABLE:
                 bitmap=self._make_status_dot_bitmap(self._C_GREY, bg=panel.GetBackgroundColour()),
             )
             self._status_dot.SetToolTip("Starting backend…")
-            send_row.Add(self._status_dot, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 12)
+            send_row.Add(self._status_dot, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 14)
+            send_row.AddSpacer(14)
 
             side_vbox.Add(send_row, 0, wx.ALIGN_LEFT | wx.BOTTOM, 2)
 
