@@ -3395,24 +3395,22 @@ def _refresh_diff(
             if counter[canonical] <= 0:
                 del counter[canonical]
 
-    def _subtract_occurrence(
+    def _subtract_number(
         counter: Counter,
         records: list[_LibPinRecord],
         number: str,
-        name: str | None,
     ) -> None:
-        candidates = [
-            record
-            for record in records
-            if record.number == number and (name is None or record.name == name)
-        ]
-        for record in candidates:
+        # Inference only accepts a mapping when every occurrence of the number
+        # belongs to it, so removing all occurrences cannot over-subtract.
+        # Counter guards make this idempotent with the added/removed pass.
+        for record in records:
+            if record.number != number:
+                continue
             canonical = _canonical_sexp(record.node)
             if counter.get(canonical, 0) > 0:
                 counter[canonical] -= 1
                 if counter[canonical] <= 0:
                     del counter[canonical]
-                return
 
     for scope in sorted(set(old_by_scope) | set(new_by_scope)):
         unit, style = scope
@@ -3436,8 +3434,8 @@ def _refresh_diff(
         for entry in pins_renumbered:
             if (entry["unit"], entry["style"]) != scope:
                 continue
-            _subtract_occurrence(old_counter, old_records, entry["old_number"], entry["name"])
-            _subtract_occurrence(new_counter, new_records, entry["new_number"], entry["name"])
+            _subtract_number(old_counter, old_records, entry["old_number"])
+            _subtract_number(new_counter, new_records, entry["new_number"])
 
         old_by_key = {_canonical_sexp(record.node): record for record in old_records}
         new_by_key = {_canonical_sexp(record.node): record for record in new_records}

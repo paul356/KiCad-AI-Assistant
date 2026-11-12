@@ -390,6 +390,34 @@ def _change_pin_fields(
     _save_library(path, tree)
 
 
+def _change_last_pin_fields(
+    path: Path,
+    symbol_name: str,
+    number: str,
+    x: float,
+    y: float,
+    *,
+    pin_type: str | None = None,
+    length: float | None = None,
+) -> None:
+    """Change fields of the last pin with *number* at ``(x, y)``."""
+    tree = _load_library(path)
+    matches = [
+        pin
+        for pin in _pins(_library_symbol(tree, symbol_name))
+        if str(_child(pin, "number")[1]) == number
+        and float(_child(pin, "at")[1]) == float(x)
+        and float(_child(pin, "at")[2]) == float(y)
+    ]
+    assert matches
+    pin = matches[-1]
+    if pin_type is not None:
+        pin[1] = Symbol(pin_type)
+    if length is not None:
+        _child(pin, "length")[1] = length
+    _save_library(path, tree)
+
+
 def _reorder_properties(path: Path, symbol_name: str, first: str, second: str) -> None:
     tree = _load_library(path)
     symbol = _library_symbol(tree, symbol_name)
@@ -475,6 +503,7 @@ def _add_placement_pin_key(
     reference: str,
     number: str,
     uuid_value: str,
+    duplicate: bool = False,
 ) -> None:
     tree = sexpdata.loads(schematic.read_text(encoding="utf-8"))
     for node in tree[1:]:
@@ -485,7 +514,9 @@ def _add_placement_pin_key(
         }
         if properties.get("Reference") != reference:
             continue
-        if any(_keyword(child) == "pin" and str(child[1]) == number for child in node[2:]):
+        if not duplicate and any(
+            _keyword(child) == "pin" and str(child[1]) == number for child in node[2:]
+        ):
             return
         insert_at = next(
             (i for i, child in enumerate(node) if _keyword(child) == "instances"),
@@ -703,6 +734,134 @@ def test_mixed_scope_reports_unclassified_residual(refresh_env):
     assert {entry["new"]["name"] for entry in result["pins_unclassified"] if entry["new"]} == {
         "ANODE"
     }
+
+
+@pytest.mark.parametrize(
+    "extra_names",
+    [("IN", "IN"), ("MID", "STACK")],
+    ids=["identical-names", "distinct-names"],
+)
+def test_three_deep_stack_renumber_has_no_residual(refresh_env, extra_names):
+    for name in extra_names:
+        _add_library_pin(refresh_env.library, "MYOP", 1, 1, "1", name, -7.62, 0.0, 0)
+        _add_cached_pin(refresh_env.schematic, LIB_ID, 1, 1, "1", name, -7.62, 0.0, 0)
+    _renumber_all_at(refresh_env.library, "MYOP", "1", "9", -7.62, 0.0)
+    _add_placement_pin_key(
+        refresh_env.schematic,
+        "U1",
+        "1",
+        "ff000000-0000-4000-8000-000000000001",
+        duplicate=True,
+    )
+    _add_placement_pin_key(
+        refresh_env.schematic,
+        "U1",
+        "1",
+        "ff000000-0000-4000-8000-000000000002",
+        duplicate=True,
+    )
+
+    result = _run(refresh_env)
+
+    assert result["changed"] is True
+    assert result["renumber_ambiguous"] is False
+    assert result["pins_renumbered"] != []
+    assert result["pins_unclassified"] == []
+    assert result["warnings"] == []
+    sch = safe_schematic(str(refresh_env.schematic))
+    cache_numbers = [str(_child(pin, "number")[1]) for pin in _pins(_cache_entry(sch, LIB_ID))]
+    assert cache_numbers.count("9") == 3
+    placements = _placement_snapshot(refresh_env.schematic)
+    assert [number for number, _ in placements[0]["pins"]].count("9") == 3
+    assert {
+        "a0b1c2d3-e4f5-4607-8899-aabbccddee01",
+        "ff000000-0000-4000-8000-000000000001",
+        "ff000000-0000-4000-8000-000000000002",
+    } <= {uuid_value for _, uuid_value in placements[0]["pins"]}
+
+
+def test_rejected_heterogeneous_move_keeps_changed_true(refresh_env):
+    # Two different numbers share a position and one of them moves: the
+    # mapping is rejected, the derived move is filtered out, but `changed`
+    # must still reflect the definition difference.
+    _add_library_pin(refresh_env.library, "MYOP", 1, 1, "3", "SIBLING", -7.62, 0.0, 0)
+    _add_cached_pin(refresh_env.schematic, LIB_ID, 1, 1, "3", "SIBLING", -7.62, 0.0, 0)
+    _move_pin(refresh_env.library, "MYOP", "1", -10.16, 0.0, 0)
+
+    result = _run(refresh_env)
+
+    assert result["changed"] is True
+    assert result["renumber_ambiguous"] is True
+    assert result["pins_added"] == []
+    assert result["pins_removed"] == []
+    assert result["pins_renamed"] == []
+    assert result["pins_moved"] == []
+    assert result["pins_modified"] == []
+    assert result["pins_renumbered"] == []
+    assert result["warnings"]
+
+
+def test_identical_stack_tail_field_change_is_not_unclassified(refresh_env):
+    _add_library_pin(
+        refresh_env.library,
+        "MYOP",
+        1,
+        1,
+        "1",
+        "IN",
+        -7.62,
+        0.0,
+        0,
+        pin_type="input",
+        shape="line",
+        length=2.54,
+    )
+    _add_cached_pin(
+        refresh_env.schematic,
+        LIB_ID,
+        1,
+        1,
+        "1",
+        "IN",
+        -7.62,
+        0.0,
+        0,
+        pin_type="input",
+        shape="line",
+        length=2.54,
+    )
+    _change_last_pin_fields(
+        refresh_env.library,
+        "MYOP",
+        "1",
+        -7.62,
+        0.0,
+        pin_type="output",
+        length=3.81,
+    )
+
+    result = _run(refresh_env)
+
+    assert result["changed"] is True
+    assert result["pins_modified"] == [
+        {
+            "number": "1",
+            "unit": 1,
+            "style": 1,
+            "field": "type",
+            "old": "input",
+            "new": "output",
+        },
+        {
+            "number": "1",
+            "unit": 1,
+            "style": 1,
+            "field": "length",
+            "old": 2.54,
+            "new": 3.81,
+        },
+    ]
+    assert result["pins_unclassified"] == []
 
 
 def test_stacked_rename_shadowed_by_number_key_is_reported(refresh_env):
