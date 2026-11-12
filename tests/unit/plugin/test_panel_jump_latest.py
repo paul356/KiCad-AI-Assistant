@@ -153,20 +153,20 @@ def test_jump_arrows_stack_above_and_below_send() -> None:
 
 
 def test_send_row_puts_the_status_dot_after_send() -> None:
-    """The dot is 14 px from the chip and followed by a matching pad."""
+    """The dot is 16 px from the chip and followed by a 12 px pad."""
     build_ui = _function("_build_ui")
-    assert _send_row_layout(build_ui) == ["_send_btn", "_status_dot", "spacer:14"]
+    assert _send_row_layout(build_ui) == ["_send_btn", "_status_dot", "spacer:12"]
     source = _source(build_ui)
     assert "send_row = wx.BoxSizer(wx.HORIZONTAL)" in source
-    assert "send_row.Add(self._status_dot, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 14)" in source
-    assert "send_row.AddSpacer(14)" in source
+    assert "send_row.Add(self._status_dot, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 16)" in source
+    assert "send_row.AddSpacer(12)" in source
     assert "_status_dot" not in _sizer_order(build_ui, "side_vbox")
     assert "_jump_top_btn" not in _sizer_order(build_ui, "send_row")
     assert "_jump_latest_btn" not in _sizer_order(build_ui, "send_row")
 
 
 def test_status_dot_is_centred_in_the_trailing_space() -> None:
-    """Leading gap + half the dot is the chip-right → dot-centre offset."""
+    """16 px left equals 12 px spacer + the surrounding 4 px panel margin."""
     build_ui = _function("_build_ui")
     source = _source(build_ui)
     dot_add = re.search(
@@ -175,13 +175,16 @@ def test_status_dot_is_centred_in_the_trailing_space() -> None:
         source,
     )
     spacer = re.search(r"send_row\.AddSpacer\((\d+)\)", source)
-    assert dot_add is not None and spacer is not None
+    margin = re.search(r"vbox\.Add\(hbox, 0, wx\.ALL \| wx\.EXPAND, (\d+)\)", source)
+    assert dot_add is not None and spacer is not None and margin is not None
     leading = int(dot_add.group(1))
     trailing = int(spacer.group(1))
+    panel_margin = int(margin.group(1))
     dot_source = _source(_function("_make_status_dot_bitmap"))
     dot_size = int(re.search(r"size: int = (\d+)", dot_source).group(1))
-    assert leading + dot_size / 2 == 19.0  # chip right → dot centre
-    assert trailing == leading
+    assert (leading, trailing, panel_margin) == (16, 12, 4)
+    assert leading + dot_size / 2 == 21.0  # chip right → dot centre
+    assert trailing + panel_margin == leading
 
 
 def test_jump_buttons_have_tooltips_and_accessible_names() -> None:
