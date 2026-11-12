@@ -151,6 +151,9 @@ class _GraphicsContext:
     def DrawPath(self, path: _Path) -> None:
         self.events.append(("draw", path))
 
+    def StrokePath(self, path: _Path) -> None:
+        self.events.append(("stroke", path))
+
     def DrawEllipse(self, *args) -> None:
         self.events.append(("draw", args))
 
@@ -351,6 +354,51 @@ def test_icon_pens_are_valid_and_explicit(panel_mod, name: str) -> None:
             colour = pen.GetColour()
             assert colour.IsOk()
             assert all(isinstance(v, int) for v in (colour.Red(), colour.Green(), colour.Blue()))
+
+
+def test_jump_bitmaps_are_36x18_stroke_only(panel_mod) -> None:
+    panel, fake_wx, records = panel_mod
+    bg = fake_wx.Colour(*_BG)
+
+    for direction in ("up", "down"):
+        bmp = panel.AssistantPanel._make_jump_bitmap(direction, bg=bg)
+        assert (bmp.width, bmp.height) == (36, 18)
+
+    assert len(records.gcs) == 2
+    for gc in records.gcs:
+        assert gc.brushes == [], "chevron must be stroke-only"
+        assert len(gc.pens) == 1
+        pen = gc.pens[0]
+        assert pen.width == 3
+        colour = pen.GetColour()
+        assert colour is not None
+        assert (colour.Red(), colour.Green(), colour.Blue()) == (91, 100, 112)
+        assert [event[0] for event in gc.events] == ["pen", "stroke"]
+
+
+@pytest.mark.parametrize("rgb", [(140, 140, 140), (0, 140, 0)])
+def test_status_dot_is_18px_ring_and_fill(panel_mod, rgb: tuple[int, int, int]) -> None:
+    panel, fake_wx, records = panel_mod
+    bmp = panel.AssistantPanel._make_status_dot_bitmap(rgb, bg=fake_wx.Colour(*_BG))
+    assert (bmp.width, bmp.height) == (18, 18)
+
+    gc = records.gcs[-1]
+    draws = [event[1] for event in gc.events if event[0] == "draw"]
+    assert draws == [(0.5, 0.5, 17, 17), (1.5, 1.5, 15, 15)]
+
+    assert len(gc.pens) == 2
+    assert len(gc.brushes) == 2
+    ring_pen = gc.pens[0].GetColour()
+    fill_pen = gc.pens[1].GetColour()
+    ring_brush = gc.brushes[0].GetColour()
+    fill_brush = gc.brushes[1].GetColour()
+    for colour in (ring_pen, ring_brush):
+        assert colour is not None
+        assert (colour.Red(), colour.Green(), colour.Blue()) == (214, 218, 224)
+    for colour in (fill_pen, fill_brush):
+        assert colour is not None
+        assert (colour.Red(), colour.Green(), colour.Blue()) == rgb
+    assert [pen.width for pen in gc.pens] == [1, 1]
 
 
 def test_paperclip_arcs_fill_with_background_brush(panel_mod) -> None:
