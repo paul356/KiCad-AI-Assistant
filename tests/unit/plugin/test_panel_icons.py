@@ -151,6 +151,9 @@ class _GraphicsContext:
     def DrawPath(self, path: _Path) -> None:
         self.events.append(("draw", path))
 
+    def StrokePath(self, path: _Path) -> None:
+        self.events.append(("stroke", path))
+
     def DrawEllipse(self, *args) -> None:
         self.events.append(("draw", args))
 
@@ -351,6 +354,26 @@ def test_icon_pens_are_valid_and_explicit(panel_mod, name: str) -> None:
             colour = pen.GetColour()
             assert colour.IsOk()
             assert all(isinstance(v, int) for v in (colour.Red(), colour.Green(), colour.Blue()))
+
+
+def test_jump_bitmaps_are_36x18_stroke_only(panel_mod) -> None:
+    panel, fake_wx, records = panel_mod
+    bg = fake_wx.Colour(*_BG)
+
+    for direction in ("up", "down"):
+        bmp = panel.AssistantPanel._make_jump_bitmap(direction, bg=bg)
+        assert (bmp.width, bmp.height) == (36, 18)
+
+    assert len(records.gcs) == 2
+    for gc in records.gcs:
+        assert gc.brushes == [], "chevron must be stroke-only"
+        assert len(gc.pens) == 1
+        pen = gc.pens[0]
+        assert pen.width == 3
+        colour = pen.GetColour()
+        assert colour is not None
+        assert (colour.Red(), colour.Green(), colour.Blue()) == (91, 100, 112)
+        assert any(event[0] == "stroke" for event in gc.events)
 
 
 def test_paperclip_arcs_fill_with_background_brush(panel_mod) -> None:

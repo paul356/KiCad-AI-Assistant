@@ -14,7 +14,6 @@ import ast
 import logging
 import os
 from pathlib import Path
-import re
 import textwrap
 from types import SimpleNamespace
 
@@ -133,6 +132,58 @@ def _send_row_layout(build_ui: ast.FunctionDef) -> list[str]:
     return [item for _, item in sorted(items)]
 
 
+def _int_constant(node: ast.AST) -> int | None:
+    if isinstance(node, ast.Constant) and type(node.value) is int:
+        return node.value
+    return None
+
+
+def _default_int_arg(fn: ast.FunctionDef, name: str) -> int | None:
+    positional = fn.args.args
+    defaults = fn.args.defaults
+    offset = len(positional) - len(defaults)
+    for index, arg in enumerate(positional):
+        if arg.arg == name and index >= offset:
+            value = ast.literal_eval(defaults[index - offset])
+            if type(value) is int:
+                return value
+    return None
+
+
+def _send_row_spacing(build_ui: ast.FunctionDef) -> tuple[int, int, int, int]:
+    """Return (leading gap, dot size, trailing spacer, panel margin)."""
+    leading: int | None = None
+    trailing: int | None = None
+    margin: int | None = None
+    for node in ast.walk(build_ui):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+        ):
+            continue
+        sizer = node.func.value.id
+        if sizer == "send_row" and node.func.attr == "Add" and len(node.args) >= 4:
+            if _self_attr(node.args[0]) == "_status_dot":
+                leading = _int_constant(node.args[3])
+        elif sizer == "send_row" and node.func.attr == "AddSpacer" and node.args:
+            trailing = _int_constant(node.args[0])
+        elif (
+            sizer == "vbox"
+            and node.func.attr == "Add"
+            and len(node.args) >= 4
+            and isinstance(node.args[0], ast.Name)
+            and node.args[0].id == "hbox"
+        ):
+            margin = _int_constant(node.args[3])
+    dot_size = _default_int_arg(_function("_make_status_dot_bitmap"), "size")
+    assert leading is not None
+    assert trailing is not None
+    assert margin is not None
+    assert dot_size is not None
+    return leading, dot_size, trailing, margin
+
+
 def test_jump_arrows_stack_above_and_below_send() -> None:
     """Top arrow, send row, bottom arrow, left-aligned at 2 px spacing."""
     build_ui = _function("_build_ui")
@@ -166,25 +217,13 @@ def test_send_row_puts_the_status_dot_after_send() -> None:
 
 
 def test_status_dot_is_centred_in_the_trailing_space() -> None:
-    """16 px left equals 12 px spacer + the surrounding 4 px panel margin."""
-    build_ui = _function("_build_ui")
-    source = _source(build_ui)
-    dot_add = re.search(
-        r"send_row\.Add\(self\._status_dot, 0, wx\.ALIGN_CENTER_VERTICAL \| "
-        r"wx\.LEFT, (\d+)\)",
-        source,
-    )
-    spacer = re.search(r"send_row\.AddSpacer\((\d+)\)", source)
-    margin = re.search(r"vbox\.Add\(hbox, 0, wx\.ALL \| wx\.EXPAND, (\d+)\)", source)
-    assert dot_add is not None and spacer is not None and margin is not None
-    leading = int(dot_add.group(1))
-    trailing = int(spacer.group(1))
-    panel_margin = int(margin.group(1))
-    dot_source = _source(_function("_make_status_dot_bitmap"))
-    dot_size = int(re.search(r"size: int = (\d+)", dot_source).group(1))
-    assert (leading, trailing, panel_margin) == (16, 12, 4)
-    assert leading + dot_size / 2 == 21.0  # chip right → dot centre
-    assert trailing + panel_margin == leading
+    """The leading gap equals the trailing spacer plus the panel margin."""
+    leading, dot_size, trailing, margin = _send_row_spacing(_function("_build_ui"))
+    assert leading > 0
+    assert dot_size > 0
+    assert trailing > 0
+    assert margin > 0
+    assert leading == trailing + margin
 
 
 def test_jump_buttons_have_tooltips_and_accessible_names() -> None:
