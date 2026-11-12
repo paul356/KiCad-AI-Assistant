@@ -106,6 +106,21 @@ def _normalize_tool_calls(tool_calls: Any) -> Any:
     return normalized
 
 
+def _wire_message(msg: dict[str, Any]) -> dict[str, Any]:
+    """Copy only the fields defined by the chat-message wire contract.
+
+    History also carries client-side bookkeeping such as
+    ``reasoning_content``; spreading the entry would echo it back to the
+    provider (#283).  Adding another internal key later must not reach the
+    wire by accident.
+    """
+    return {
+        key: msg[key]
+        for key in ("role", "content", "name", "tool_calls", "tool_call_id")
+        if key in msg
+    }
+
+
 def _is_slot_index(value: Any) -> bool:
     """Return whether *value* is a usable tool-call slot index (bools are not)."""
     return isinstance(value, int) and not isinstance(value, bool)
@@ -4069,7 +4084,9 @@ class LLMClient:
         base = self._settings.llm_base_url or "https://api.openai.com"
         url = self._openai_endpoint_url(base)
 
-        messages = [{"role": "system", "content": system}] + self._history
+        messages = [{"role": "system", "content": system}] + [
+            _wire_message(msg) for msg in self._history
+        ]
         payload = json.dumps(
             {
                 "model": self._settings.llm_model,
@@ -4233,7 +4250,8 @@ class LLMClient:
                             data = url
                         images.append(data)
                 content = "\n".join(p for p in text_parts if p)
-            converted = {**msg, "content": content}
+            converted = _wire_message(msg)
+            converted["content"] = content
             if msg.get("role") == "assistant" and msg.get("tool_calls"):
                 # Ollama's native API requires arguments as JSON objects; the
                 # internal representation is always a JSON string.
@@ -4288,6 +4306,17 @@ class LLMClient:
         try:
             with _urlopen(req, 300) as resp:
                 text_parts = []
+                thinking_parts: list[str] = []
+                pending_whitespace: list[str] = []
+
+                def emit_text(chunk_text: str) -> None:
+                    if on_stream_event is None:
+                        return
+                    try:
+                        on_stream_event({"type": "text_chunk", "content": chunk_text})
+                    except Exception as e:
+                        log.error("Text delta callback error in Ollama streaming: %s", e)
+
                 if on_stream_event is not None:
                     on_stream_event({"type": "text_start"})
                 tool_calls_by_index: dict[int, dict] = {}
@@ -4319,12 +4348,12 @@ class LLMClient:
                         if isinstance(content, str):
                             if content:
                                 text_parts.append(content)
-                                try:
-                                    on_stream_event({"type": "text_chunk", "content": content})
-                                except Exception as e:
-                                    log.error(
-                                        "Text delta callback error in Ollama streaming: %s", e
-                                    )
+                                if on_stream_event is not None:
+                                    if content.strip():
+                                        emit_text("".join(pending_whitespace) + content)
+                                        pending_whitespace.clear()
+                                    else:
+                                        pending_whitespace.append(content)
                         elif content:
                             # Some compatible endpoints return content blocks
                             # (list/dict).  Joining them would raise TypeError
@@ -4333,6 +4362,10 @@ class LLMClient:
                                 "Ignoring non-string content in Ollama stream (%s)",
                                 type(content).__name__,
                             )
+
+                        thinking = msg.get("thinking")
+                        if isinstance(thinking, str) and thinking:
+                            thinking_parts.append(thinking)
 
                         raw_tool_calls = msg.get("tool_calls")
                         if raw_tool_calls is not None and not isinstance(raw_tool_calls, list):
@@ -4401,10 +4434,37 @@ class LLMClient:
                     finish_reason = "tool_calls"
 
                 tool_calls = [tool_calls_by_index[k] for k in sorted(tool_calls_by_index)]
-                message: dict[str, Any] = {"content": "".join(text_parts)}
+                content_text = "".join(text_parts)
+                thinking_text = "".join(thinking_parts)
+                used_thinking = False
+                # Some models answer only in ``message.thinking``, which would
+                # otherwise leave the assistant message blank.  Treat that
+                # reasoning as the reply when no content was produced — but
+                # never for a tool-call turn (even an unparsable one), whose
+                # content must stay empty.
+                if (
+                    not tool_calls
+                    and finish_reason != "tool_calls"
+                    and not content_text.strip()
+                    and thinking_text.strip()
+                ):
+                    content_text = thinking_text
+                    used_thinking = True
+                if (tool_calls or finish_reason == "tool_calls") and not content_text.strip():
+                    # Whitespace-only content on a tool-call turn is noise: the
+                    # UI and history must show nothing for that message.
+                    content_text = ""
+                    pending_whitespace.clear()
+                message: dict[str, Any] = {"content": content_text}
                 if tool_calls:
                     message["tool_calls"] = tool_calls
                 if on_stream_event is not None:
+                    if used_thinking:
+                        # Buffered whitespace would duplicate the fallback text.
+                        emit_text(content_text)
+                    elif pending_whitespace:
+                        # No fallback: keep the streamed text equal to content.
+                        emit_text("".join(pending_whitespace))
                     on_stream_event({"type": "text_end"})
                 return {"finish_reason": finish_reason, "message": message}
 
@@ -4638,7 +4698,9 @@ class LLMClient:
 
     def _openai_payload(self, system: str, tools: list[dict], stream: bool) -> bytes:
         """Build the OpenAI-compatible chat-completions request body."""
-        messages = [{"role": "system", "content": system}] + self._history
+        messages = [{"role": "system", "content": system}] + [
+            _wire_message(msg) for msg in self._history
+        ]
         payload_dict: dict[str, Any] = {
             "model": self._settings.llm_model,
             "messages": messages,
@@ -4818,12 +4880,30 @@ class LLMClient:
             and isinstance(msg.get("tool_calls"), list)
             and bool(msg["tool_calls"])
         )
-        if has_tool_calls:
-            msg = {**msg, "tool_calls": _normalize_tool_calls(msg["tool_calls"])}
         # Ollama's DoneReason is only stop/length/connection_closed, so a
         # tool-call turn is identified by the message payload; otherwise keep
         # the provider's reason (e.g. "length" when num_predict truncates).
         finish_reason = "tool_calls" if has_tool_calls else body.get("done_reason", "stop")
+        # Some models answer only in ``message.thinking``, which this client
+        # would otherwise drop, leaving the assistant message blank.  Treat
+        # that reasoning as the reply when no content was produced — but never
+        # for a tool-call turn (even an unparsable one), whose content must
+        # stay empty.
+        if not has_tool_calls and finish_reason != "tool_calls" and isinstance(msg, dict):
+            content = msg.get("content")
+            thinking = msg.get("thinking")
+            if (
+                (not isinstance(content, str) or not content.strip())
+                and isinstance(thinking, str)
+                and thinking.strip()
+            ):
+                msg = {**msg, "content": thinking}
+        if isinstance(msg, dict) and (has_tool_calls or finish_reason == "tool_calls"):
+            content = msg.get("content")
+            if not isinstance(content, str) or not content.strip():
+                msg = {**msg, "content": ""}
+            if has_tool_calls:
+                msg = {**msg, "tool_calls": _normalize_tool_calls(msg["tool_calls"])}
         return {
             "finish_reason": finish_reason,
             "message": msg,
