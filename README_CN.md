@@ -264,6 +264,7 @@ kcaa
 | `move_component` | 移动/旋转已放置的元件 |
 | `set_symbol_property` | 设置已放置符号的属性字段 |
 | `update_schematic_symbol_pin` | 修改原理图缓存 `lib_symbols` 中的引脚编号和/或引脚名称 |
+| `update_schematic_symbol_from_library` | 从符号库刷新原理图缓存 `lib_symbols` 中的符号定义（图形、引脚、单元子符号和定义属性；已放置元件保留自身字段） |
 | `rename_symbol` | 重命名已放置符号的位号 |
 | `list_symbol_properties` | 列出已放置原理图符号的属性（名称 → 值），不含几何、位置或网络 |
 | `delete_symbol_property` | 删除已放置符号的属性 |
