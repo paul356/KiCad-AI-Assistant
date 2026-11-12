@@ -48,7 +48,8 @@ Tested on **KiCad 10.0 / Linux & Windows**.
 
 - KiCad 10.0 or higher
 - [`uv`](https://github.com/astral-sh/uv) — manages the Python virtual environment and installs the correct Python version automatically
-  - `curl -Lsf https://astral.sh/uv/install.sh | sh`
+  - Linux/macOS: `curl -Lsf https://astral.sh/uv/install.sh | sh`
+  - Windows: `powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"`
 - An API key for OpenAI, Anthropic, Amazon Bedrock, or a compatible LLM provider (Ollama needs none)
 
 ## Installation
@@ -64,7 +65,20 @@ cd KiCad-AI-Assistant
 
 ### 2. Install the plugin
 
-Download `kicad_ai_assistant.zip` from the [Releases page](https://github.com/paul356/KiCad-AI-Assistant/releases) and unzip it into KiCad's plugin directory:
+Two release archives are published:
+
+- `kicad_ai_assistant.zip` — manual installation and the in-panel updater.
+- `kicad_ai_assistant_pcm.zip` — installation through KiCad's Plugin and Content Manager ("Install from File…").
+
+Both install the same plugin contents; the installed folder names differ (`kicad_ai_assistant/` for manual installs, `com_github_paul356_kicad-ai-assistant/` for PCM). `10.0` below is your KiCad `<major>.<minor>` version. `KICAD_DOCUMENTS_HOME` overrides the documents directory on every OS.
+
+| OS | Manual install: `scripting/plugins` | PCM install: `3rdparty/plugins` |
+|----|-------------------------------------|---------------------------------|
+| Linux | `~/.local/share/kicad/10.0/scripting/plugins` | `~/.local/share/kicad/10.0/3rdparty/plugins` |
+| macOS | `~/Documents/KiCad/10.0/scripting/plugins` | `~/Documents/KiCad/10.0/3rdparty/plugins` |
+| Windows | `%USERPROFILE%\Documents\KiCad\10.0\scripting\plugins` | `%USERPROFILE%\Documents\KiCad\10.0\3rdparty\plugins` |
+
+Download `kicad_ai_assistant.zip` from the [Releases page](https://github.com/paul356/KiCad-AI-Assistant/releases) and unzip it into the manual directory:
 
 **Linux:**
 ```bash
@@ -87,11 +101,16 @@ New-Item -ItemType Directory -Force -Path $KICAD_PLUGIN_DIR
 Expand-Archive -Path kicad_ai_assistant.zip -DestinationPath $KICAD_PLUGIN_DIR
 ```
 
+The archive already contains the `kicad_ai_assistant/` root directory. Keep that name so the documented `cd`/setup commands and the manual-install convention match; renaming the installed folder is unsupported. Do not hand-unzip this archive into `3rdparty/plugins` — that directory belongs to the Plugin and Content Manager, and a manually copied folder there is not a PCM install.
+
+**Plugin and Content Manager:** open **Preferences → Plugin and Content Manager → Install from File…** and select `kicad_ai_assistant_pcm.zip`. KiCad extracts the package to `<3rdparty>/plugins/com_github_paul356_kicad-ai-assistant/`; that package directory is the plugin directory (its `__init__.py` sits directly inside it). Do not unzip this archive yourself. PCM updates keep `.venv` and the freerouting JAR (`keep_on_update`); rerun the setup script after an update so the venv gets the matching `kcaa` version.
+
 Or build from source:
 
 ```bash
-# In the kcaa repository root:
-make dist-plugin          # produces dist/kicad_ai_assistant.zip
+# In the repo root:
+make dist-plugin          # dist/kicad_ai_assistant.zip (manual install + updater)
+make dist-pcm             # dist/kicad_ai_assistant_pcm.zip (PCM install)
 
 # Linux:
 KICAD_PLUGIN_DIR=~/.local/share/kicad/10.0/scripting/plugins
@@ -106,7 +125,7 @@ unzip dist/kicad_ai_assistant.zip -d "$KICAD_PLUGIN_DIR"
 
 ### 3. Create the plugin virtual environment
 
-Run the setup script from inside the installed plugin directory to create a `.venv`, install `kcaa` from PyPI, and download the freerouting JAR. `uv` will automatically install the required Python version.
+Run the setup script from inside the installed plugin directory to create a `.venv`, install `kcaa` from PyPI, install **PyMuPDF** (imported as `fitz`, used for PDF import), and download the freerouting JAR. This requires `uv`; when it is missing the script prints an error and exits non-zero — install it from <https://docs.astral.sh/uv/getting-started/installation/> or with the command in [Prerequisites](#prerequisites). `uv` will automatically install the required Python version.
 
 **Linux:**
 ```bash
@@ -132,21 +151,24 @@ cd /d "%USERPROFILE%\Documents\KiCad\10.0\scripting\plugins\kicad_ai_assistant"
 setup_plugin.bat
 ```
 
-The script will detect your KiCad version from the plugin directory path. KiCad already provides all necessary environment variables (`KICAD_VERSION`, `KICAD*_DIR`, etc.), so no `.env` file is needed.
+For a PCM install, run the same script from `...\3rdparty\plugins\com_github_paul356_kicad-ai-assistant`. The script detects your KiCad version from the plugin directory path. KiCad already provides all necessary environment variables (`KICAD_VERSION`, `KICAD*_DIR`, etc.), so no `.env` file is needed.
+
+The short version of these instructions also ships inside the plugin zip (`kicad_plugin/README.md`).
 
 ### 4. Load the plugin in KiCad
 
 1. Open KiCad and load your project.
 2. Open the **PCB Editor**.
-3. Go to **Tools → External Plugins → Refresh Plugins**.
-4. Click **KiCad AI Assistant** in the plugin list to open the chat panel.
-5. Go to **Options → Settings** and enter your LLM API key.
+3. Go to **Preferences → Plugins** and enable **Enable KiCad API**. The panel needs this IPC socket for **Reload PCB** and the `update_pcb_from_schematic` tool; without it those two fail, while file-based editing keeps working. This package does not declare the IPC runtime, so KiCad does not prompt for the toggle — enable it manually.
+4. Go to **Tools → External Plugins → Refresh Plugins**.
+5. Click **KiCad AI Assistant** in the plugin list to open the chat panel.
+6. Go to **Options → Settings** and enter your LLM API key.
 
 ## Configuration
 
 Plugin settings are stored in the KiCad user config directory:
 
-Settings file: `~/.config/kicad/kicad_ai_assistant.json`
+Settings file: `~/.config/kicad/10.0/kcaa/kicad_ai_assistant.json`
 
 All settings can be changed through **Options → Settings** in the plugin panel:
 
@@ -243,6 +265,7 @@ kcaa
 | `delete_symbol_library` | Delete an empty symbol library (file, library-table entry, and index) |
 | `add_symbols_to_library` | Copy symbols from a schematic's cached `lib_symbols` into an existing library |
 | `remove_symbols_from_library` | Remove named symbol definitions from a library and re-index it |
+| `update_library_symbol_pin` | Rename a pin number and/or pin name in a library symbol definition (format-preserving) |
 | `find_symbols_not_in_libraries` | List schematic symbols that resolve to no available library (read-only) |
 
 ### Schematic Editing
@@ -255,6 +278,7 @@ kcaa
 | `remove_symbol_from_schematic` | Remove placed symbol by reference |
 | `move_component` | Move and/or rotate a placed component |
 | `set_symbol_property` | Set a property field on a placed symbol |
+| `update_schematic_symbol_pin` | Rename a pin number and/or pin name in a schematic's cached `lib_symbols` copy |
 | `rename_symbol` | Rename a placed symbol's reference designator |
 | `list_symbol_properties` | List properties (name → value) of placed schematic symbols — no geometry, position, or nets |
 | `delete_symbol_property` | Delete a property from a placed symbol |
@@ -470,10 +494,12 @@ kcaa/
 ## Troubleshooting
 
 **Plugin does not appear in KiCad:**
-- Confirm the plugin directory is named exactly `kicad_ai_assistant` (not `kicad_ai_plugin`).
+- Manual install: confirm you used the documented folder name `<documents>/kicad/<ver>/scripting/plugins/kicad_ai_assistant` (the old instructions used `kicad_ai_plugin`) so the commands below work.
+- PCM install: confirm `<documents>/kicad/<ver>/3rdparty/plugins/com_github_paul356_kicad-ai-assistant` exists and came from `kicad_ai_assistant_pcm.zip`.
 - Run **Tools → External Plugins → Refresh Plugins** after installing.
 - Linux: Check that `setup_plugin.sh` completed without errors and that `.venv/bin/python` exists inside the plugin directory.
 - Windows: Check that `setup_plugin.bat` (or `setup_plugin.ps1`) completed without errors and that `.venv/Scripts/python.exe` exists inside the plugin directory.
+- If the setup script failed, see [the setup troubleshooting entry](docs/troubleshooting.md#setup-script-fails-and-the-window-closes).
 
 **MCP server fails to start:**
 - Linux: Check the plugin log in `~/.config/kicad/` for Python tracebacks.

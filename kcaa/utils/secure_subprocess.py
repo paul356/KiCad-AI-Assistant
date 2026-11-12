@@ -53,6 +53,9 @@ class SecureSubprocessRunner:
         """
         Run a KiCad CLI command with security validation.
 
+        Input files must resolve inside the open project or a KiCad directory
+        (the PathValidator roots); the process working directory is not one.
+
         Args:
             command_args: Command arguments (excluding the kicad-cli executable)
             input_files: List of input file paths to validate
@@ -192,7 +195,10 @@ class SecureSubprocessRunner:
         self, suffix: str = "", prefix: str = "kcaa_", content: str | None = None
     ) -> str:
         """
-        Create a temporary file within validated directories.
+        Create a temporary file in the server's private temp directory.
+
+        The file lives under the kcaa data directory, never in the project or
+        in a KiCad library directory, so it works with no project root set.
 
         Args:
             suffix: File suffix/extension

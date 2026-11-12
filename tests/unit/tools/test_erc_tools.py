@@ -210,6 +210,93 @@ class TestRunErcParsing:
 
 
 # ---------------------------------------------------------------------------
+# Path trust roots (mocked CLI, real PathValidator)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def state_project(tmp_path, monkeypatch):
+    """Publish a tmp project via the plugin state file and reset server globals.
+
+    Returns (project_dir, schematic_path).
+    """
+    from kcaa.utils.config import config
+    import kcaa.utils.path_validator as path_validator_mod
+    import kcaa.utils.secure_subprocess as secure_subprocess_mod
+
+    state_file = tmp_path / "active_project.json"
+    project = tmp_path / "proj"
+    project.mkdir()
+    schematic = project / "board.kicad_sch"
+    schematic.write_text("(kicad_sch)", encoding="utf-8")
+    state_file.write_text(json.dumps({"project_root": str(project)}), encoding="utf-8")
+
+    monkeypatch.setenv("KCAA_PROJECT_STATE_FILE", str(state_file))
+    # Server temp files go to a scratch data dir, not the user's config dir.
+    monkeypatch.setattr(config, "get_kcaa_data_dir", lambda: str(tmp_path / "kcaa_data"))
+    monkeypatch.setattr(path_validator_mod, "_default_validator", None)
+    monkeypatch.setattr(secure_subprocess_mod, "_subprocess_runner", None)
+    return project, schematic
+
+
+def _fake_kicad_cli(captured: dict):
+    """Stand-in for SecureSubprocessRunner._run_subprocess that writes the report."""
+
+    def _run(_self, command, working_dir=None, timeout=None, capture_output=True):
+        captured["argv"] = list(command)
+        out_path = command[command.index("--output") + 1]
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(SAMPLE_REPORT, f)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    return _run
+
+
+class TestRunErcTrustRoots:
+    def test_schematic_under_published_project_root_succeeds(self, tools, state_project):
+        from kcaa.utils.secure_subprocess import SecureSubprocessRunner
+
+        project, schematic = state_project
+        captured: dict = {}
+        with (
+            patch(
+                "kcaa.utils.secure_subprocess.get_kicad_cli_path",
+                return_value="/usr/bin/kicad-cli",
+            ),
+            patch.object(SecureSubprocessRunner, "_run_subprocess", new=_fake_kicad_cli(captured)),
+        ):
+            result = asyncio.run(tools["run_erc"](schematic_path=str(schematic)))
+
+        assert result["success"] is True, result
+        argv = captured["argv"]
+        assert argv[0] == "/usr/bin/kicad-cli"
+        assert argv[1:3] == ["sch", "erc"]
+        assert argv[3] == str(schematic)
+        assert "--output" in argv
+        assert "--severity-error" in argv and "--severity-warning" in argv
+
+    def test_schematic_outside_every_root_fails(self, tools, state_project):
+        from kcaa.utils.secure_subprocess import SecureSubprocessRunner
+
+        project, _ = state_project
+        outside = project.parent / "outside.kicad_sch"
+        outside.write_text("(kicad_sch)", encoding="utf-8")
+        called: dict = {}
+        with (
+            patch(
+                "kcaa.utils.secure_subprocess.get_kicad_cli_path",
+                return_value="/usr/bin/kicad-cli",
+            ),
+            patch.object(SecureSubprocessRunner, "_run_subprocess", new=_fake_kicad_cli(called)),
+        ):
+            result = asyncio.run(tools["run_erc"](schematic_path=str(outside)))
+
+        assert result["success"] is False
+        assert "outside trusted directories" in result["error"]
+        assert called == {}
+
+
+# ---------------------------------------------------------------------------
 # Live integration (only when kicad-cli is installed)
 # ---------------------------------------------------------------------------
 

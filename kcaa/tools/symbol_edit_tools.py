@@ -43,14 +43,19 @@ from kcaa.utils.symbol_index_reader import SymbolIndexReader
 from kcaa.utils.symbol_library_utils import (
     SymbolNameExistsError,
     SymbolNotFoundError,
+    _plan_pin_edit_batch,
+    _split_sub_symbol_name,
+    _validate_pin_edit_requests,
     append_symbol_to_library,
     build_effective_symbol_library_list,
     create_empty_library_file,
+    find_pin_collisions,
     is_safe_symbol_name,
     list_library_symbols,
     remove_symbol_from_library_file,
     resolve_symbol_library,
     sanitize_lib_nickname,
+    set_symbol_pin,
 )
 
 log = logging.getLogger(__name__)
@@ -2450,6 +2455,324 @@ def _do_create_symbol(
 
 
 # ---------------------------------------------------------------------------
+# Pin number / pin name editing
+# ---------------------------------------------------------------------------
+
+
+def _raw_node_keyword(node: Any) -> str | None:
+    """Return a raw s-expression node's head keyword, or None."""
+    if not isinstance(node, list) or not node:
+        return None
+    head = node[0]
+    if isinstance(head, sexpdata.Symbol):
+        return head.value()
+    if isinstance(head, str):
+        return head
+    return None
+
+
+def _raw_child_node(node: list, keyword: str) -> list | None:
+    """Return the first direct child of *node* whose keyword matches."""
+    for child in node[1:]:
+        if _raw_node_keyword(child) == keyword:
+            return child
+    return None
+
+
+def _edit_cached_symbol_pins(
+    raw: list,
+    symbol_name: str,
+    pins: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Edit pins in a cached lib_symbols raw tree in place.
+
+    Mirrors :func:`kcaa.utils.symbol_library_utils.set_symbol_pin` — same batch
+    selector, final-state collision rules and return shape — but writes into
+    the parsed S-expression tree the schematic serialises on save.  Every
+    matching occurrence in every unit and body style is edited; duplicate
+    numbers that already existed stay legal.
+    """
+    requests = _validate_pin_edit_requests(pins)
+
+    extends_base: str | None = None
+    sub_symbols: list[tuple[int, int, list]] = []
+    for child in raw[2:]:
+        keyword = _raw_node_keyword(child)
+        if keyword == "extends" and len(child) > 1:
+            extends_base = str(child[1])
+        elif keyword == "symbol" and len(child) > 1:
+            parsed = _split_sub_symbol_name(str(child[1]), symbol_name)
+            if parsed is not None:
+                sub_symbols.append((parsed[0], parsed[1], child))
+
+    pin_nodes: list[dict[str, Any]] = []
+    for pin_unit, pin_style, sub_symbol in sub_symbols:
+        for child in sub_symbol[1:]:
+            if _raw_node_keyword(child) != "pin":
+                continue
+            number_node = _raw_child_node(child, "number")
+            name_node = _raw_child_node(child, "name")
+            pin_nodes.append(
+                {
+                    "unit": pin_unit,
+                    "style": pin_style,
+                    "number": str(number_node[1])
+                    if number_node is not None and len(number_node) > 1
+                    else "",
+                    "name": str(name_node[1])
+                    if name_node is not None and len(name_node) > 1
+                    else "",
+                    "number_node": number_node,
+                    "name_node": name_node,
+                }
+            )
+
+    if extends_base is not None and not pin_nodes:
+        raise ValueError(
+            f"symbol '{symbol_name}' extends '{extends_base}' and defines no pins; "
+            f"update the base symbol '{extends_base}' instead"
+        )
+
+    # The tool has no unit selector: every matching pin is edited.
+    plan = _plan_pin_edit_batch(pin_nodes, symbol_name, requests, None)
+    find_pin_collisions(pin_nodes, plan["final_numbers"], plan["pre_existing_pairs"])
+    for pin, change in zip(plan["changed_pins"], plan["changes"], strict=True):
+        if change["new_number"] != pin["number"]:
+            if pin["number_node"] is None:
+                raise ValueError(f"pin '{change['pin_number']}' has no (number ...) node to edit")
+            pin["number_node"][1] = change["new_number"]
+        if change["new_name"] != pin["name"]:
+            if pin["name_node"] is None:
+                raise ValueError(f"pin '{change['pin_number']}' has no (name ...) node to edit")
+            pin["name_node"][1] = change["new_name"]
+    return plan
+
+
+def _references_using_lib_id(sch: Any, lib_id: str) -> list[str]:
+    """Return the unique reference designators of placed units using *lib_id*."""
+    references: list[str] = []
+    try:
+        symbols = sch.symbol
+    except AttributeError:
+        return references
+    for symbol in symbols:
+        try:
+            if symbol.lib_id.value != lib_id:
+                continue
+            reference = symbol.property.Reference.value
+        except AttributeError:
+            continue
+        if reference not in references:
+            references.append(reference)
+    return references
+
+
+def _symbol_raw_tree(symbol: Any) -> list | None:
+    """Return a placed symbol's live raw S-expression tree, or None."""
+    pv = getattr(symbol, "_pv", None)
+    tree = getattr(pv, "_tree", None)
+    return tree if isinstance(tree, list) else None
+
+
+def _rewrite_placement_pin_keys(
+    sch: Any,
+    lib_id: str,
+    number_mapping: dict[str, str],
+) -> int:
+    """Rewrite instance pin keys in placements of *lib_id*; return placements changed.
+
+    skip resolves a placement's pins by intersecting the cached lib-symbol
+    numbers with the placement's own ``(pin "<number>" (uuid …))`` keys, so
+    renumbering only the cache would make the pin disappear.  The instance key
+    *is* the pin number (skip ignores the uuid child), and the mapping is built
+    from the pre-edit snapshot and applied in one pass, so chains never rewrite
+    twice.  Only the key token changes; the ``(uuid …)`` child is preserved.
+    """
+    if not number_mapping:
+        return 0
+    updated = 0
+    try:
+        symbols = sch.symbol
+    except AttributeError:
+        return 0
+    for symbol in symbols:
+        try:
+            if symbol.lib_id.value != lib_id:
+                continue
+        except AttributeError:
+            continue
+        raw = _symbol_raw_tree(symbol)
+        if raw is None:
+            continue
+        rewrote = False
+        for child in raw:
+            if _raw_node_keyword(child) != "pin":
+                continue
+            if len(child) < 2:
+                continue
+            key_number = str(child[1])
+            new_number = number_mapping.get(key_number)
+            if new_number is not None and new_number != key_number:
+                child[1] = new_number
+                rewrote = True
+        if rewrote:
+            updated += 1
+    return updated
+
+
+def _do_update_library_symbol_pin(
+    project_dir: str,
+    lib_id: str,
+    pins: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Core implementation of ``update_library_symbol_pin``.
+
+    Splits *lib_id* on its first colon into nickname and symbol name,
+    resolves the nickname through *project_dir*'s ``sym-lib-table`` first and
+    the global table second (nothing else), applies the whole pin batch to the
+    ``.kicad_sym`` definition in place (format-preserving), and re-indexes the
+    library once under its own ownership.  A pin number is KiCad's identity for
+    a physical connection, so every occurrence in every unit and body style is
+    edited together.  System libraries are refused, exactly like
+    ``remove_symbols_from_library``.
+    """
+    library_name, sep, symbol_name = lib_id.partition(":")
+    if not sep or not library_name or not symbol_name:
+        return {"error": f"lib_id must be 'Library:Symbol' (got {lib_id!r})"}
+
+    try:
+        _validate_pin_edit_requests(pins)
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    try:
+        lib = resolve_symbol_library(library_name, project_path=project_dir)
+    except ValueError as exc:
+        return {"error": str(exc)}
+    lib_file = lib["path"]
+
+    if config.is_system_library_path(lib_file):
+        return {
+            "error": (
+                f"Refusing to modify system library '{library_name}' "
+                f"(resolves to {lib_file}, inside the KiCad installation): "
+                "symbol library tools operate on user libraries only."
+            )
+        }
+
+    try:
+        result = set_symbol_pin(lib_file, symbol_name, pins)
+    except Exception as exc:
+        log.warning("update_library_symbol_pin failed for %s: %s", symbol_name, exc)
+        return {"error": str(exc)}
+
+    indexed = False
+    if result["changed"]:
+        target_project = _target_project_of(lib["table_path"], project_dir)
+        indexed = (
+            _index_symbol_library(
+                library_name, lib_file, project_dir=project_dir, project=target_project
+            )
+            >= 0
+        )
+
+    return {
+        "success": True,
+        "library_name": library_name,
+        "symbol_name": symbol_name,
+        "library_path": lib_file,
+        "pins_requested": result["pins_requested"],
+        "pins_changed": result["pins_changed"],
+        "occurrences": result["occurrences"],
+        "changes": result["changes"],
+        "changed": result["changed"],
+        "backup_path": result["backup_path"],
+        "indexed": indexed,
+        "warnings": result["warnings"],
+    }
+
+
+def _do_update_schematic_symbol_pin(
+    schematic_path: str,
+    lib_id: str,
+    pins: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Core implementation of ``update_schematic_symbol_pin``.
+
+    Edits the schematic's cached ``lib_symbols`` copy of *lib_id* and rewrites
+    the matching ``(pin "…" (uuid …))`` keys on affected placements so skip can
+    still resolve the renamed pins.  Renumbering uses one simultaneous
+    pre-edit mapping, so chain/cycle renames never rewrite a key twice.
+    Wires, junctions, labels, instances, properties and every other cached
+    symbol are left untouched.  The file is rewritten through the project's
+    normal schematic save path (not preserved byte-for-byte); it is saved only
+    when something actually changed.
+    """
+    if not schematic_path.endswith(".kicad_sch"):
+        return {"error": f"Not a .kicad_sch file: {schematic_path!r}"}
+    if not os.path.isfile(schematic_path):
+        return {"error": f"Schematic file not found: {schematic_path!r}"}
+
+    try:
+        _validate_pin_edit_requests(pins)
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    try:
+        sch = safe_schematic(schematic_path)
+    except Exception as exc:
+        return {"error": f"Failed to open schematic: {exc}"}
+
+    raw = _cached_lib_symbol_raw(sch, lib_id)
+    if raw is None:
+        available = [stored_id for stored_id, _ in _extract_cached_raw_entries(sch)][:5]
+        hint = f" (available: {', '.join(map(repr, available))})" if available else ""
+        return {"error": f"lib_id '{lib_id}' not found in the schematic's lib_symbols cache{hint}"}
+
+    # The cache key is *lib_id* exactly as stored (no split, no fallback); the
+    # bare part after the colon only names ``<symbol>_<unit>_<style>`` children.
+    symbol_name = lib_id.split(":", 1)[-1]
+    try:
+        result = _edit_cached_symbol_pins(raw, symbol_name, pins)
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    affected_references = _references_using_lib_id(sch, lib_id)
+
+    number_mapping: dict[str, str] = {}
+    for change in result["changes"]:
+        if change["old_number"] != change["new_number"]:
+            number_mapping[change["old_number"]] = change["new_number"]
+
+    placements_updated = 0
+    if result["changed"] and number_mapping:
+        placements_updated = _rewrite_placement_pin_keys(sch, lib_id, number_mapping)
+
+    backup_path: str | None = None
+    if result["changed"]:
+        try:
+            backup_path = save_schematic(schematic_path, sch)
+        except Exception as exc:
+            return {"error": f"Failed to save schematic: {exc}"}
+
+    return {
+        "success": True,
+        "lib_id": lib_id,
+        "symbol_name": symbol_name,
+        "pins_requested": len(pins),
+        "pins_changed": result["pins_changed"],
+        "occurrences": result["occurrences"],
+        "changes": result["changes"],
+        "changed": result["changed"],
+        "backup_path": backup_path,
+        "affected_references": affected_references,
+        "affected_count": len(affected_references),
+        "placements_updated": placements_updated,
+        "warnings": result["warnings"],
+    }
+
+
+# ---------------------------------------------------------------------------
 # MCP tool registration
 # ---------------------------------------------------------------------------
 
@@ -2904,6 +3227,136 @@ def register_symbol_edit_tools(mcp: FastMCP) -> None:
         """
         return _do_remove_symbol_from_library(
             library=library, symbols=symbols, project_dir=project_dir
+        )
+
+    @mcp.tool()
+    async def update_library_symbol_pin(
+        project_dir: str,
+        lib_id: str,
+        pins: list[dict[str, Any]],
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Rename pin numbers and/or names in a symbol library definition.
+
+        Applies a batch of pin edits to the ``.kicad_sym`` definition in one
+        atomic write, preserving every other byte of the file (formatting,
+        line endings, other symbols).  Use this to fix symbol pins (e.g.
+        ``P$1`` → ``1``) so they match the footprint pads.  Already-placed
+        symbols keep their cached copy — call ``update_schematic_symbol_pin``
+        as well to fix those schematics.
+
+        The whole batch is validated against its final state before anything
+        is written.  Selectors always match the pre-edit snapshot, so chains
+        and cycles that form a valid permutation (``P$1 → 1``, ``1 → 2``)
+        are accepted; only a newly introduced duplicate number is rejected.  Exactly
+        one ``.bak`` and one write are produced, and the library is re-indexed
+        once when something changed.
+
+        A pin number is KiCad's identity for a physical connection, so every
+        definition carrying it is edited together.  Numbers keep their
+        uniqueness: a number already used inside the same part is rejected,
+        while duplicates that already existed (KiCad's duplicate-pin jumpers)
+        stay legal.  A new number that duplicates a pin KiCad resolves
+        separately (another part of a multi-part symbol) is allowed and
+        reported in ``warnings``.  Pin names are not required to be unique and
+        may be empty.
+
+        Args:
+            project_dir: Project directory (or a file inside it). Its
+                ``sym-lib-table`` is searched first, then the global table,
+                and the re-index is scoped to it. Required: the project can
+                hold project-local libraries (``${KIPRJMOD}``), so there is
+                no global-only mode.
+            lib_id: Target as ``"Library:Symbol"`` — nickname registered in
+                sym-lib-table plus the plain symbol name inside that library.
+            pins: Non-empty list (max 256) of edit dicts.  Each entry has
+                ``pin_number`` (str, required selector), ``new_number``
+                (str, optional) and ``new_name`` (str, optional); at least one
+                of the two replacements is required.
+
+        Returns:
+            dict with keys: success, library_name, symbol_name, library_path,
+            pins_requested, pins_changed, occurrences, changes, changed,
+            backup_path, indexed, warnings; plus ``error`` on failure (no
+            ``success``).  ``library_name`` and ``symbol_name`` are the two
+            halves of *lib_id*.  Each ``changes`` entry reports ``pin_number``,
+            ``old_number``/``old_name``, ``new_number``/``new_name`` and
+            ``changed``.  ``pins_requested`` counts entries while
+            ``pins_changed`` counts changed pin occurrences (one selector
+            matching two pins yields 1 requested, 2 changed).
+        """
+        return await asyncio.to_thread(
+            _do_update_library_symbol_pin,
+            lib_id=lib_id,
+            pins=pins,
+            project_dir=project_dir,
+        )
+
+    @mcp.tool()
+    async def update_schematic_symbol_pin(
+        schematic_path: str,
+        lib_id: str,
+        pins: list[dict[str, Any]],
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Rename pin numbers and/or names in a schematic's cached symbol.
+
+        KiCad renders the schematic's embedded ``lib_symbols`` copy, not the
+        library file.  This tool applies a batch of pin edits to that cached
+        entry for *lib_id* and rewrites the matching ``(pin "…" (uuid …))``
+        keys of the affected placements, so skip still resolves the renamed
+        pins after the change.  Renumbering uses one simultaneous pre-edit
+        mapping, so chain/cycle renames never rewrite a key twice.  Wires,
+        junctions, labels, ``instances``, properties and every other cached
+        symbol are untouched.  All placed copies sharing *lib_id* pick up the
+        change; every affected reference designator is reported.
+
+        A pin number is KiCad's identity for a physical connection, so every
+        definition carrying it is edited together and the instance pin keys of
+        every placement of *lib_id* are rewritten.  Numbers keep their
+        uniqueness: a number already used inside the same part is rejected,
+        while duplicates that already existed (KiCad's duplicate-pin jumpers)
+        stay legal.  A new number that duplicates a pin KiCad resolves
+        separately (another part of a multi-part symbol) is allowed and
+        reported in ``warnings``.  Pin names are not required to be unique and
+        may be empty.
+
+        The batch is validated against its final state before writing, with
+        exactly one ``.kicad_sch.bak`` and one save.  The file is rewritten
+        through the project's normal schematic save path (formatting is not
+        preserved byte-for-byte).  To also fix future placements, call
+        ``update_library_symbol_pin``.
+
+        Args:
+            schematic_path: Absolute path to the target ``.kicad_sch`` file.
+            lib_id: The id exactly as stored as the key in the schematic's
+                ``lib_symbols`` cache (``"Library:Symbol"`` for library
+                symbols; a bare ``"R"`` when that is what the file stores).
+                Lookup is an exact, case-sensitive match on that stored key:
+                no format check, no nickname prefixing or stripping, and no
+                fallback between ``"R"`` and ``"Device:R"``.  An unknown id
+                returns the not-found error with up to five available ids.
+            pins: Non-empty list (max 256) of edit dicts.  Each entry has
+                ``pin_number`` (str, required selector), ``new_number``
+                (str, optional) and ``new_name`` (str, optional); at least one
+                of the two replacements is required.
+
+        Returns:
+            dict with keys: success, lib_id, symbol_name, pins_requested,
+            pins_changed, occurrences, changes, changed, backup_path,
+            affected_references, affected_count, placements_updated, warnings;
+            plus ``error`` on failure (no ``success``).  Each ``changes`` entry
+            reports ``pin_number``, ``old_number``/``old_name``,
+            ``new_number``/``new_name`` and ``changed``.  ``pins_requested``
+            counts entries while ``pins_changed`` counts changed pin
+            occurrences (one selector matching two pins yields 1 requested, 2
+            changed).
+        """
+        return await asyncio.to_thread(
+            _do_update_schematic_symbol_pin,
+            schematic_path=schematic_path,
+            lib_id=lib_id,
+            pins=pins,
         )
 
     @mcp.tool()
