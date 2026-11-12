@@ -156,15 +156,12 @@ def _get_footprint_sides(data: list[Any]) -> dict[str, str | None]:
 def _get_all_footprint_bboxes(
     data: list[Any],
     exclude_refs: set[str] | None = None,
-    layer: str | None = None,
 ) -> list[dict[str, Any]]:
     """Return world-coordinate courtyard bboxes for all footprints.
 
     Args:
         data: Parsed PCB S-expression tree.
         exclude_refs: References to skip (e.g. the footprint being repositioned).
-        layer: If given, only include footprints whose primary layer matches
-               (e.g. ``"F.Cu"`` or ``"B.Cu"``).
 
     Returns:
         List of ``{ref, layer, min_x, min_y, max_x, max_y}`` dicts.  ``layer``
@@ -178,8 +175,6 @@ def _get_all_footprint_bboxes(
             continue
 
         fp_layer = get_fp_layer(item)
-        if layer is not None and fp_layer != layer:
-            continue
 
         # Extract position
         fp_x, fp_y, fp_rot = 0.0, 0.0, 0.0
