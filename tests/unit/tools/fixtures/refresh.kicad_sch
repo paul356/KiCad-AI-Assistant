@@ -426,6 +426,8 @@
       )
     )
   )
+  (junction (at 95 100) (diameter 0) (color 0 0 0 0) (uuid "aa000000-0000-4000-8000-000000000001"))
+  (label "NET_IN" (at 95 100 0) (effects (font (size 1.27 1.27)) (justify left bottom)) (uuid "aa000000-0000-4000-8000-000000000002"))
   (sheet_instances
     (path "/"
       (page "1")

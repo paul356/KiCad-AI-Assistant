@@ -7,6 +7,7 @@ so no KiCad installation or network access is required.
 """
 
 import asyncio
+import copy
 from pathlib import Path
 import shutil
 from types import SimpleNamespace
@@ -69,6 +70,7 @@ class _FakeIndex:
         self.library_path = library_path
         self.library_names = set(library_names)
         self.symbols = set(symbols)
+        self.project_paths: list[str | None] = []
 
     def get_library_by_name(self, name: str):
         if name not in self.library_names:
@@ -97,9 +99,14 @@ def refresh_env(tmp_path, monkeypatch):
     shutil.copy(SCHEMATIC, schematic)
 
     index = _FakeIndex(library)
+
+    def _manager(project_path=None):
+        index.project_paths.append(project_path)
+        return index
+
     monkeypatch.setattr(
         "kcaa.tools.symbol_edit_tools._get_index_manager",
-        lambda project_path=None: index,
+        _manager,
     )
     return SimpleNamespace(
         project_dir=project_dir,
@@ -244,6 +251,201 @@ def _change_property(path: Path, symbol_name: str, name: str, value: str) -> Non
     raise AssertionError(f"property {name!r} not found")
 
 
+def _ensure_sub_symbol(symbol: list, unit: int, style: int) -> list:
+    """Return (creating if needed) a unit/style sub-symbol node."""
+    plain_name = str(symbol[1]).split(":", 1)[-1]
+    name = f"{plain_name}_{unit}_{style}"
+    for child in symbol[2:]:
+        if _keyword(child) == "symbol" and child[1] == name:
+            return child
+    node = [Symbol("symbol"), name]
+    insert_at = len(symbol)
+    for index, child in enumerate(symbol[2:], start=2):
+        if _keyword(child) == "embedded_fonts":
+            insert_at = index
+            break
+    symbol.insert(insert_at, node)
+    return node
+
+
+def _new_pin_node(
+    number: str,
+    name: str,
+    x: float,
+    y: float,
+    angle: int,
+    pin_type: str = "passive",
+    shape: str = "line",
+    length: float = 2.54,
+    hidden: bool = False,
+) -> list:
+    effects = [Symbol("effects"), [Symbol("font"), [Symbol("size"), 1.27, 1.27]]]
+    node = [
+        Symbol("pin"),
+        Symbol(pin_type),
+        Symbol(shape),
+        [Symbol("at"), x, y, angle],
+        [Symbol("length"), length],
+        [Symbol("name"), name, copy.deepcopy(effects)],
+        [Symbol("number"), number, copy.deepcopy(effects)],
+    ]
+    if hidden:
+        node.append([Symbol("hide"), Symbol("yes")])
+    return node
+
+
+def _add_library_pin(
+    path: Path,
+    symbol_name: str,
+    unit: int,
+    style: int,
+    number: str,
+    name: str,
+    x: float,
+    y: float,
+    angle: int,
+    **pin_fields,
+) -> None:
+    tree = _load_library(path)
+    sub = _ensure_sub_symbol(_library_symbol(tree, symbol_name), unit, style)
+    sub.append(_new_pin_node(number, name, x, y, angle, **pin_fields))
+    _save_library(path, tree)
+
+
+def _add_cached_pin(
+    path: Path,
+    lib_id: str,
+    unit: int,
+    style: int,
+    number: str,
+    name: str,
+    x: float,
+    y: float,
+    angle: int,
+    **pin_fields,
+) -> None:
+    tree = sexpdata.loads(path.read_text(encoding="utf-8"))
+    lib_symbols = next(node for node in tree[1:] if _keyword(node) == "lib_symbols")
+    cached = next(
+        child for child in lib_symbols[1:] if _keyword(child) == "symbol" and child[1] == lib_id
+    )
+    sub = _ensure_sub_symbol(cached, unit, style)
+    sub.append(_new_pin_node(number, name, x, y, angle, **pin_fields))
+    path.write_text(sexpdata.dumps(tree), encoding="utf-8")
+
+
+def _pin_at_number(
+    symbol: list,
+    number: str,
+    x: float,
+    y: float,
+) -> list:
+    for pin in _pins(symbol):
+        at = _child(pin, "at")
+        if (
+            str(_child(pin, "number")[1]) == number
+            and float(at[1]) == float(x)
+            and float(at[2]) == float(y)
+        ):
+            return pin
+    raise AssertionError(f"pin {number!r} at ({x}, {y}) not found")
+
+
+def _renumber_pin_at(
+    path: Path,
+    symbol_name: str,
+    old: str,
+    new: str,
+    x: float,
+    y: float,
+) -> None:
+    tree = _load_library(path)
+    pin = _pin_at_number(_library_symbol(tree, symbol_name), old, x, y)
+    _child(pin, "number")[1] = new
+    _save_library(path, tree)
+
+
+def _change_pin_fields(
+    path: Path,
+    symbol_name: str,
+    number: str,
+    *,
+    pin_type: str | None = None,
+    shape: str | None = None,
+    length: float | None = None,
+    hidden: bool | None = None,
+) -> None:
+    tree = _load_library(path)
+    pin = _pin_by_number(_library_symbol(tree, symbol_name), number)
+    if pin_type is not None:
+        pin[1] = Symbol(pin_type)
+    if shape is not None:
+        pin[2] = Symbol(shape)
+    if length is not None:
+        _child(pin, "length")[1] = length
+    if hidden is True and _child(pin, "hide") is None:
+        pin.append([Symbol("hide"), Symbol("yes")])
+    elif hidden is False and _child(pin, "hide") is not None:
+        pin.remove(_child(pin, "hide"))
+    _save_library(path, tree)
+
+
+def _reorder_properties(path: Path, symbol_name: str, first: str, second: str) -> None:
+    tree = _load_library(path)
+    symbol = _library_symbol(tree, symbol_name)
+    nodes = {str(child[1]): child for child in symbol[2:] if _keyword(child) == "property"}
+    first_index = next(i for i, child in enumerate(symbol) if child is nodes[first])
+    second_index = next(i for i, child in enumerate(symbol) if child is nodes[second])
+    symbol[first_index], symbol[second_index] = symbol[second_index], symbol[first_index]
+    _save_library(path, tree)
+
+
+def _non_lib_symbols_snapshot(path: Path) -> list[str]:
+    """Serialize every top-level node except ``lib_symbols``."""
+    data = sexpdata.loads(path.read_text(encoding="utf-8"))
+    return [sexpdata.dumps(node) for node in data[1:] if _keyword(node) != "lib_symbols"]
+
+
+def _add_mirrored_unit2_placement(schematic: Path) -> None:
+    """Add a unit-2 placement rotated 90° with a Y mirror."""
+    tree = sexpdata.loads(schematic.read_text(encoding="utf-8"))
+    source = None
+    for node in tree[1:]:
+        if _keyword(node) != "symbol" or "U2" not in {
+            str(prop[2]) for prop in node[2:] if _keyword(prop) == "property"
+        }:
+            continue
+        source = copy.deepcopy(node)
+        break
+    assert source is not None
+    _child(source, "at")[1], _child(source, "at")[2] = 150, 120
+    _child(source, "unit")[1] = 2
+    _child(source, "uuid")[1] = "cc000000-0000-4000-8000-000000000001"
+    source.insert(2, [Symbol("mirror"), Symbol("y")])
+    for prop in source[2:]:
+        if _keyword(prop) == "property" and prop[1] == "Reference":
+            prop[2] = "U3"
+    for child in list(source):
+        if _keyword(child) == "pin":
+            source.remove(child)
+    source.insert(
+        next(i for i, child in enumerate(source) if _keyword(child) == "instances"),
+        [Symbol("pin"), "3", [Symbol("uuid"), "cc000000-0000-4000-8000-000000000002"]],
+    )
+    for instances in source[2:]:
+        if _keyword(instances) != "instances":
+            continue
+        path_node = _child(instances, "project")
+        if path_node is not None:
+            path_node = _child(path_node, "path")
+            if path_node is not None:
+                _child(path_node, "reference")[1] = "U3"
+                _child(path_node, "unit")[1] = 2
+    sheet_index = next(i for i, node in enumerate(tree) if _keyword(node) == "sheet_instances")
+    tree.insert(sheet_index, source)
+    schematic.write_text(sexpdata.dumps(tree), encoding="utf-8")
+
+
 def _raw_cache(sch) -> dict[str, list]:
     from kcaa.tools.symbol_edit_tools import _extract_cached_raw_entries
 
@@ -265,6 +467,12 @@ def _placement_snapshot(path: Path) -> list[dict]:
                 "lib_id": str(_child(node, "lib_id")[1]),
                 "at": list(_child(node, "at")[1:]),
                 "unit": str(_child(node, "unit")[1]),
+                "body_style": str(_child(node, "body_style")[1]),
+                "mirror": (
+                    sexpdata.dumps(_child(node, "mirror"))
+                    if _child(node, "mirror") is not None
+                    else None
+                ),
                 "uuid": str(_child(node, "uuid")[1]),
                 "properties": properties,
                 "pins": [
@@ -351,6 +559,182 @@ def test_pin_renumbering_rewrites_placement_keys_and_keeps_uuids(refresh_env):
         }
 
 
+def test_cross_unit_renumber_does_not_touch_other_units(refresh_env):
+    # The same number exists in unit 1 and unit 2; only unit 2 is renumbered.
+    _add_library_pin(refresh_env.library, "MYOP", 2, 1, "1", "ALT", 0.0, -7.62, 0)
+    _add_cached_pin(refresh_env.schematic, LIB_ID, 2, 1, "1", "ALT", 0.0, -7.62, 0)
+    _renumber_pin_at(refresh_env.library, "MYOP", "1", "9", 0.0, -7.62)
+
+    result = _run(refresh_env)
+
+    assert result["changed"] is True
+    assert result["pins_renumbered"] == [
+        {"old_number": "1", "new_number": "9", "name": "ALT", "unit": 2, "style": 1}
+    ]
+    assert result["placements_updated"] == 0
+    assert any("no placement uses that unit" in warning for warning in result["warnings"])
+    placements = _placement_snapshot(refresh_env.schematic)
+    assert [entry["pins"] for entry in placements[:2]] == [
+        [
+            ("1", "a0b1c2d3-e4f5-4607-8899-aabbccddee01"),
+            ("2", "e3c9a2b7-8d4f-4e3a-9b6c-2f0a1d5b8e44"),
+        ],
+        [
+            ("1", "1a2b3c4d-5e6f-4708-9a0b-1c2d3e4f5a66"),
+            ("2", "2b3c4d5e-6f70-4819-0a1b-2c3d4e5f6b77"),
+        ],
+    ]
+
+
+def test_renumber_target_colliding_with_retained_pin_is_rejected(refresh_env):
+    # Old 1@-7.62 and 2@7.62; the library drops 2 and renumbers 1 to 2.
+    _remove_pin(refresh_env.library, "MYOP", "2")
+    _renumber_pin_at(refresh_env.library, "MYOP", "1", "2", -7.62, 0.0)
+    before = _placement_snapshot(refresh_env.schematic)
+
+    result = _run(refresh_env)
+
+    assert result["changed"] is True
+    assert result["renumber_ambiguous"] is True
+    assert result["placements_updated"] == 0
+    assert result["pins_renumbered"] == []
+    assert any("could not infer a unique pin renumbering" in w for w in result["warnings"])
+    assert _placement_snapshot(refresh_env.schematic) == before
+
+
+def test_common_and_own_unit_conflict_skips_the_placement(refresh_env):
+    _add_library_pin(refresh_env.library, "MYOP", 0, 1, "1", "COMMON", 0.0, 0.0, 0)
+    _add_cached_pin(refresh_env.schematic, LIB_ID, 0, 1, "1", "COMMON", 0.0, 0.0, 0)
+    _renumber_pin_at(refresh_env.library, "MYOP", "1", "9", 0.0, 0.0)
+    _renumber_pin_at(refresh_env.library, "MYOP", "1", "10", -7.62, 0.0)
+    before = _placement_snapshot(refresh_env.schematic)
+
+    result = _run(refresh_env)
+
+    assert result["changed"] is True
+    assert result["renumber_ambiguous"] is True
+    assert result["placements_updated"] == 0
+    assert any("conflicting renumber targets" in w for w in result["warnings"])
+    assert _placement_snapshot(refresh_env.schematic) == before
+
+
+def test_renumber_to_a_retained_identity_number_is_rejected(refresh_env):
+    # Pin 2 -> 3 while another pin keeps number 3 in the same unit/style.
+    _add_library_pin(refresh_env.library, "MYOP", 1, 1, "3", "KEEP", 0.0, -10.16, 0)
+    _add_cached_pin(refresh_env.schematic, LIB_ID, 1, 1, "3", "KEEP", 0.0, -10.16, 0)
+    _renumber_pin_at(refresh_env.library, "MYOP", "2", "3", 7.62, 0.0)
+    before = _placement_snapshot(refresh_env.schematic)
+
+    result = _run(refresh_env)
+
+    assert result["changed"] is True
+    assert result["renumber_ambiguous"] is True
+    assert result["placements_updated"] == 0
+    assert result["pins_renumbered"] == []
+    assert _placement_snapshot(refresh_env.schematic) == before
+
+
+def test_duplicate_number_renumber_is_rejected(refresh_env):
+    # Two pins numbered "1" in unit 1; only the extra one is renumbered.
+    _add_library_pin(refresh_env.library, "MYOP", 1, 1, "1", "STACK", 0.0, -10.16, 0)
+    _add_cached_pin(refresh_env.schematic, LIB_ID, 1, 1, "1", "STACK", 0.0, -10.16, 0)
+    _renumber_pin_at(refresh_env.library, "MYOP", "1", "9", 0.0, -10.16)
+    before = _placement_snapshot(refresh_env.schematic)
+
+    result = _run(refresh_env)
+
+    assert result["changed"] is True
+    assert result["renumber_ambiguous"] is True
+    assert result["placements_updated"] == 0
+    assert result["pins_renumbered"] == []
+    assert _placement_snapshot(refresh_env.schematic) == before
+
+
+def test_renumber_is_idempotent_and_creates_one_backup(refresh_env):
+    _renumber_pin(refresh_env.library, "MYOP", "1", "P$1")
+
+    first = _run(refresh_env)
+    assert first["changed"] is True
+    second = _run(refresh_env)
+
+    assert second["changed"] is False
+    assert second["placements_updated"] == 0
+    assert len(list(refresh_env.schematic.parent.glob("*.bak"))) == 1
+    assert not list(refresh_env.schematic.parent.glob("*.tmp"))
+
+
+def test_pin_type_shape_length_and_hide_changes_are_reported(refresh_env):
+    _change_pin_fields(
+        refresh_env.library,
+        "MYOP",
+        "1",
+        pin_type="output",
+        shape="inverted",
+        length=3.81,
+        hidden=True,
+    )
+
+    result = _run(refresh_env)
+
+    assert result["changed"] is True
+    assert result["renumber_ambiguous"] is False
+    assert result["pins_added"] == []
+    assert result["pins_removed"] == []
+    assert result["pins_renamed"] == []
+    assert result["pins_moved"] == []
+    assert result["graphics_changed"] is False
+    assert {(item["field"], item["old"], item["new"]) for item in result["pins_modified"]} == {
+        ("type", "input", "output"),
+        ("shape", "line", "inverted"),
+        ("length", 2.54, 3.81),
+        ("hide", False, True),
+    }
+    assert {item["number"] for item in result["pins_modified"]} == {"1"}
+
+
+def test_property_reordering_is_reported(refresh_env):
+    _reorder_properties(refresh_env.library, "MYOP", "Reference", "Value")
+
+    result = _run(refresh_env)
+
+    assert result["changed"] is True
+    assert result["properties_reordered"] is True
+    assert result["properties_changed"] == []
+    assert result["properties_added"] == []
+    assert result["properties_removed"] == []
+
+
+def test_apply_and_save_failures_are_reported_distinctly(refresh_env, monkeypatch):
+    _rename_pin(refresh_env.library, "MYOP", "1", "ANODE")
+    original = refresh_env.schematic.read_bytes()
+
+    def _raise(exc: Exception):
+        def _fail(*args, **kwargs):
+            raise exc
+
+        return _fail
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(
+            "kcaa.tools.symbol_edit_tools._replace_cached_lib_symbol",
+            _raise(ValueError("bad tree")),
+        )
+        apply_failure = _run(refresh_env)
+    assert apply_failure["error"].startswith("Failed to apply symbol definition:")
+    assert "bad tree" in apply_failure["error"]
+    assert refresh_env.schematic.read_bytes() == original
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(
+            "kcaa.tools.symbol_edit_tools.save_schematic",
+            _raise(OSError("disk full")),
+        )
+        save_failure = _run(refresh_env)
+    assert save_failure["error"].startswith("Failed to save schematic")
+    assert "target file was not replaced" in save_failure["error"]
+    assert "disk full" in save_failure["error"]
+
+
 def test_graphics_only_change_updates_cache(refresh_env):
     _add_rectangle(refresh_env.library, "MYOP", unit=0, style=1)
     before = _placement_snapshot(refresh_env.schematic)
@@ -435,10 +819,13 @@ def test_dry_run_preview_matches_the_real_run(refresh_env):
         "pins_renamed",
         "pins_renumbered",
         "pins_moved",
+        "pins_modified",
         "properties_added",
         "properties_removed",
         "properties_changed",
+        "properties_reordered",
         "graphics_changed",
+        "renumber_ambiguous",
         "affected_references",
         "affected_count",
         "placements_updated",
@@ -504,7 +891,14 @@ def test_moved_pin_warns_with_coordinates_and_leaves_placement(refresh_env):
     result = _run(refresh_env)
 
     assert result["pins_moved"] == [
-        {"number": "1", "name": "IN", "old_at": [-7.62, 0.0, 0.0], "new_at": [-8.89, 0.0, 0.0]}
+        {
+            "number": "1",
+            "name": "IN",
+            "old_at": [-7.62, 0.0, 0.0],
+            "new_at": [-8.89, 0.0, 0.0],
+            "unit": 1,
+            "style": 1,
+        }
     ]
     moved_warning = next(w for w in result["warnings"] if "moved from" in w)
     assert "-7.62" in moved_warning
@@ -564,6 +958,16 @@ def test_symdir_library_form_is_resolved(refresh_env, monkeypatch):
     assert result.get("success") is True, result
     assert result["changed"] is True
     assert result["warnings"] == []
+
+
+def test_project_dir_scopes_every_index_query(refresh_env):
+    _rename_pin(refresh_env.library, "MYOP", "1", "ANODE")
+
+    result = _run(refresh_env)
+
+    assert result.get("success") is True, result
+    assert refresh_env.index.project_paths
+    assert set(refresh_env.index.project_paths) == {str(refresh_env.project_dir)}
 
 
 def test_bare_lib_id_without_colon_is_rejected(refresh_env):
@@ -672,6 +1076,53 @@ def test_derived_symbol_is_flattened_into_cache(refresh_env):
     assert cached_props["Value"] == "MYOP_DERIVED"
     assert cached_props["Description"] == "Derived operational amplifier"
     assert cached_props["Datasheet"] == "~"
+
+
+def test_malformed_extends_property_returns_error(refresh_env):
+    _insert_stale_derived_cache(refresh_env.schematic)
+    tree = _load_library(refresh_env.library)
+    _library_symbol(tree, "MYOP_DERIVED").append([Symbol("property"), Symbol("private")])
+    _save_library(refresh_env.library, tree)
+    original = refresh_env.schematic.read_bytes()
+
+    result = _run(refresh_env, lib_id=DERIVED_LIB_ID)
+
+    assert "error" in result
+    assert result["error"].startswith("Failed to resolve extends chain:")
+    assert refresh_env.schematic.read_bytes() == original
+
+
+def test_rotated_mirrored_non_unit1_placement_is_preserved(refresh_env):
+    _add_mirrored_unit2_placement(refresh_env.schematic)
+    before = _placement_snapshot(refresh_env.schematic)
+    _rename_pin(refresh_env.library, "MYOP", "1", "ANODE")
+
+    result = _run(refresh_env)
+
+    assert result.get("success") is True, result
+    after = _placement_snapshot(refresh_env.schematic)
+    assert after == before
+    extra = next(entry for entry in after if entry["lib_id"] == LIB_ID and entry["unit"] == "2")
+    assert extra["at"] == [150, 120, 90]
+    assert extra["mirror"] is not None
+    assert extra["pins"] == [("3", "cc000000-0000-4000-8000-000000000002")]
+
+
+def test_junction_label_and_non_lib_symbols_nodes_survive(refresh_env):
+    _rename_pin(refresh_env.library, "MYOP", "1", "ANODE")
+    before_sch = safe_schematic(str(refresh_env.schematic))
+    unrelated_before = sexpdata.dumps(_cache_entry(before_sch, "Other:UNRELATED"))
+    top_level_before = _non_lib_symbols_snapshot(refresh_env.schematic)
+
+    result = _run(refresh_env)
+
+    assert result.get("success") is True, result
+    assert _non_lib_symbols_snapshot(refresh_env.schematic) == top_level_before
+    after_sch = safe_schematic(str(refresh_env.schematic))
+    assert sexpdata.dumps(_cache_entry(after_sch, "Other:UNRELATED")) == unrelated_before
+    text = refresh_env.schematic.read_text(encoding="utf-8")
+    assert "(junction" in text
+    assert '(label "NET_IN"' in text
 
 
 def test_unrelated_cached_symbol_and_placement_stay_untouched(refresh_env):
