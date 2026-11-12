@@ -169,3 +169,52 @@ The MCP server does not implement file locking. If two tool calls attempt to wri
 - The engineer is working in one file at a time
 
 Multi-user or multi-instance scenarios are out of scope for milestone 1.
+
+---
+
+## 9. Path Trust Roots (Read Side)
+
+Path validation currently exists on the **subprocess/ERC surface only**:
+`SecureSubprocessRunner` validates every input file, output directory and
+working directory it is given, and `run_erc` is the tool that uses it. Other
+tools do **not** validate path arguments yet. Where validation applies, the
+trusted roots are:
+
+- the **open project** — the directory of the active `.kicad_pro`;
+- the **KiCad user directory** (platform default: `~/KiCad` on Linux,
+  `~/Documents/KiCad` on macOS/Windows);
+- KiCad's symbol, footprint and third-party directories;
+- any additional search paths (`KICAD_SEARCH_PATHS` plus auto-detected
+  conventional locations);
+- the server's private temp directory (`<kcaa data dir>/tmp`), solely for
+  server-generated output. The rest of the kcaa data directory (settings,
+  session records, the server `.env`) is **not** trusted.
+
+The server's process working directory is **not** a trust root: it has nothing
+to do with the open project or with KiCad, and under the plugin it is the
+plugin data directory.
+
+### 9.1 How the plugin publishes the open project
+
+`ServerManager` starts the server with `KCAA_PROJECT_STATE_FILE` pointing at
+`<kcaa data dir>/active_project.json`. The panel atomically writes that file
+(temp file + `os.replace`) whenever it knows the active project:
+
+```json
+{"project_root": "/home/user/MyProject"}
+```
+
+With no project open (two consecutive empty probes after the project closes)
+it writes `{"project_root": null}`. The server re-reads the (tiny) file on
+every path validation and re-points the project root **in place** when the
+value changed — switching projects needs no server restart and no panel
+teardown. A missing, unreadable or malformed state file keeps the current
+root; the file is written by the plugin, never by the model.
+
+### 9.2 Empty project root is normal
+
+An empty project root (no state file, or `null`) is a normal state: matching
+then falls back to the KiCad directory roots. Server-generated temp files are
+written to a private `0o700` directory under the kcaa data directory — never
+into the project or a KiCad library directory — so they keep working with no
+project at all.

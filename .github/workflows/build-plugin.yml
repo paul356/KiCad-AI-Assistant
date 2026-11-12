@@ -13,11 +13,13 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
-    - name: Build plugin zip (make dist-plugin)
-      run: make dist-plugin
+    - name: Build plugin archives (make dist-plugin dist-pcm)
+      run: make dist-plugin dist-pcm
 
-    - name: Upload plugin zip
+    - name: Upload plugin archives
       uses: actions/upload-artifact@v4
       with:
         name: kicad-ai-assistant-plugin
-        path: dist/kicad_ai_assistant.zip
+        path: |
+          dist/kicad_ai_assistant.zip
+          dist/kicad_ai_assistant_pcm.zip

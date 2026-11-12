@@ -6,7 +6,7 @@ This document records the **keep / defer / remove** classification for the tools
 
 ## 1. Tools
 
-### 1.1 Keep — plugin-facing surface (32 tools)
+### 1.1 Keep — plugin-facing surface (34 tools)
 
 Every tool listed here is registered by the plugin profile, grouped by area; the profile's other areas (e.g. PCB, sheets, no-connect, versioning, skills, ERC, KiCad IPC) are out of scope for this document and documented in the README. `run_drc_check` uses the IPC bridge to open KiCad's dialog rather than editing files directly; the rest edit files directly (skip or `sexpdata`; no `kicad-cli`).
 
@@ -42,6 +42,7 @@ These are read-only tools. They must be used when the LLM is asked to add a comp
 | `create_symbol` | Define a new symbol into a symbol library (definition only — no schematic placement) |
 | `remove_symbol_from_schematic` | Remove one or more symbols by reference |
 | `set_symbol_property` | Update any property on one or more components (batch, partial-apply) |
+| `update_schematic_symbol_pin` | Rename a pin number/name in a schematic's cached `lib_symbols` copy |
 | `list_symbol_properties` | Read all properties of one or more components (batch) |
 | `delete_symbol_property` | Remove a custom property |
 | `move_component` | Shift a component by a delta, optionally per unit |
@@ -59,6 +60,7 @@ All write operations create a `.bak` backup before writing.
 | `delete_symbol_library` | Delete an **empty** symbol library (file + table entry + index) |
 | `add_symbols_to_library` | Copy cached schematic symbols into a symbol library, re-indexing it |
 | `remove_symbols_from_library` | Remove named symbol definitions from a library and re-index it |
+| `update_library_symbol_pin` | Rename a pin number/name in a library symbol definition (format-preserving) |
 | `find_symbols_not_in_libraries` | List schematic symbols missing from all available libraries |
 | `remove_footprints_from_library` | Remove named footprints from a library directory and re-index it |
 | `delete_footprint_library` | Delete an **empty** footprint library (directory + table entry + index) |
@@ -169,9 +171,9 @@ MCP prompts are designed for standalone MCP clients (e.g., Claude Desktop) where
 
 | Category | Keep | Defer | Remove |
 |----------|------|-------|--------|
-| Tools | 32 | 1 | 8 |
+| Tools | 34 | 1 | 8 |
 | Resources | 0 | 12 | 0 |
 | Prompts | 0 | 17 | 0 |
-| **Total** | **32** | **30** | **8** |
+| **Total** | **34** | **30** | **8** |
 
-Section 1.1 holds 32 tools: 21 come from the original milestone-1 list — 18 keep their names and 3 were renamed in `820c1b9` (`set_symbol_property`, `list_symbol_properties`, `delete_symbol_property`). `create_symbol` and `connect_points_with_wire` came later (making 23 from that surface), as did the seven symbol- and footprint-library tools, and `get_project_structure` and `run_drc_check` were reclassified from §1.2/§1.3 once the plugin profile started exposing them.
+Section 1.1 holds 34 tools: 21 come from the original milestone-1 list — 18 keep their names and 3 were renamed in `820c1b9` (`set_symbol_property`, `list_symbol_properties`, `delete_symbol_property`). `create_symbol` and `connect_points_with_wire` came later (making 23 from that surface), as did the seven symbol- and footprint-library tools, the two pin-editing tools `update_library_symbol_pin` and `update_schematic_symbol_pin`, and `get_project_structure` and `run_drc_check` were reclassified from §1.2/§1.3 once the plugin profile started exposing them.

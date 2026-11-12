@@ -72,6 +72,26 @@ The server automatically searches for KiCad projects in:
 
 Projects are identified by the `.kicad_pro` file extension. The server recursively searches all configured directories to find KiCad projects.
 
+### Standalone Server: Project Location
+
+A standalone server (not started by the KiCad plugin) has **no project
+context**: nothing publishes an open project to it, so its path validator has
+an empty project root. Path arguments are then matched against the KiCad
+directories only: the KiCad user directory, the symbol/footprint/third-party
+directories, and every configured additional search path (`KICAD_SEARCH_PATHS`
+plus auto-detected conventional locations such as `~/Documents/PCB`, `~/PCB`,
+`~/Electronics` and `~/Projects/*`).
+
+**Consequence:** for a standalone server, a KiCad project must live under one
+of those directories — most naturally the KiCad user directory (`~/KiCad` by
+default on Linux, `~/Documents/KiCad` on macOS/Windows) or a path listed in
+`KICAD_SEARCH_PATHS`. Paths outside every configured root are rejected. Start
+the server through the plugin when you need tools to operate on a project
+stored elsewhere: the plugin publishes the open project, which the server uses
+as an additional trust root.
+
+The process working directory is never used as a trust root.
+
 ## Client Configuration
 
 ### Claude Desktop Configuration
