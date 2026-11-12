@@ -667,7 +667,7 @@ if _WX_AVAILABLE:
                 bitmap=self._make_status_dot_bitmap(self._C_GREY, bg=panel.GetBackgroundColour()),
             )
             self._status_dot.SetToolTip("Starting backend…")
-            # 16 px left, 10 px dot, 12 px right + the 4 px hbox border:
+            # 16 px left, 18 px dot, 12 px right + the 4 px hbox border:
             # the dot is centred between the chip and the panel edge.
             send_row.Add(self._status_dot, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 16)
             send_row.AddSpacer(12)
