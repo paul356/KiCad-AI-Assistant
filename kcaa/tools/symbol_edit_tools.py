@@ -3357,10 +3357,6 @@ def _refresh_diff(
         _infer_pin_renumbering(old_occurrences, new_occurrences)
     )
 
-    classified_scopes = {
-        (entry["unit"], entry["style"])
-        for entry in (pins_added + pins_removed + pins_renamed + pins_moved + pins_modified)
-    }
     pins_unclassified: list[dict[str, Any]] = []
     old_by_scope: dict[tuple[int, int], list[_LibPinRecord]] = {}
     new_by_scope: dict[tuple[int, int], list[_LibPinRecord]] = {}
@@ -3368,18 +3364,83 @@ def _refresh_diff(
         old_by_scope.setdefault((record.unit, record.style), []).append(record)
     for record in new_occurrences:
         new_by_scope.setdefault((record.unit, record.style), []).append(record)
+
+    classified_entries = pins_renamed + pins_moved + pins_modified
+    classified_keys: dict[tuple[int, int], set[tuple[int, int, str]]] = {}
+    for entry in classified_entries:
+        scope = (entry["unit"], entry["style"])
+        classified_keys.setdefault(scope, set()).add(
+            (entry["unit"], entry["style"], entry["number"])
+        )
+    added_keys: dict[tuple[int, int], set[tuple[int, int, str]]] = {}
+    for entry in pins_added:
+        scope = (entry["unit"], entry["style"])
+        added_keys.setdefault(scope, set()).add((entry["unit"], entry["style"], entry["number"]))
+    removed_keys: dict[tuple[int, int], set[tuple[int, int, str]]] = {}
+    for entry in pins_removed:
+        scope = (entry["unit"], entry["style"])
+        removed_keys.setdefault(scope, set()).add((entry["unit"], entry["style"], entry["number"]))
+
+    def _subtract_key(
+        counter: Counter,
+        record_by_key: dict[tuple[int, int, str], _LibPinRecord],
+        key: tuple[int, int, str],
+    ) -> None:
+        record = record_by_key.get(key)
+        if record is None:
+            return
+        canonical = _canonical_sexp(record.node)
+        if counter.get(canonical, 0) > 0:
+            counter[canonical] -= 1
+            if counter[canonical] <= 0:
+                del counter[canonical]
+
+    def _subtract_occurrence(
+        counter: Counter,
+        records: list[_LibPinRecord],
+        number: str,
+        name: str | None,
+    ) -> None:
+        candidates = [
+            record
+            for record in records
+            if record.number == number and (name is None or record.name == name)
+        ]
+        for record in candidates:
+            canonical = _canonical_sexp(record.node)
+            if counter.get(canonical, 0) > 0:
+                counter[canonical] -= 1
+                if counter[canonical] <= 0:
+                    del counter[canonical]
+                return
+
     for scope in sorted(set(old_by_scope) | set(new_by_scope)):
-        if scope in classified_scopes:
-            continue
+        unit, style = scope
         old_records = old_by_scope.get(scope, [])
         new_records = new_by_scope.get(scope, [])
         old_counter = Counter(_canonical_sexp(record.node) for record in old_records)
         new_counter = Counter(_canonical_sexp(record.node) for record in new_records)
         if old_counter == new_counter:
             continue
+
+        # Subtract exactly the occurrence nodes already described by the
+        # number-keyed entries for this scope.  Whatever multiset difference
+        # remains is a real change those entries did not account for.
+        for key in classified_keys.get(scope, set()):
+            _subtract_key(old_counter, old_pins, key)
+            _subtract_key(new_counter, new_pins, key)
+        for key in added_keys.get(scope, set()):
+            _subtract_key(new_counter, new_pins, key)
+        for key in removed_keys.get(scope, set()):
+            _subtract_key(old_counter, old_pins, key)
+        for entry in pins_renumbered:
+            if (entry["unit"], entry["style"]) != scope:
+                continue
+            _subtract_occurrence(old_counter, old_records, entry["old_number"], entry["name"])
+            _subtract_occurrence(new_counter, new_records, entry["new_number"], entry["name"])
+
         old_by_key = {_canonical_sexp(record.node): record for record in old_records}
         new_by_key = {_canonical_sexp(record.node): record for record in new_records}
-        unit, style = scope
         additions: list[dict[str, Any]] = []
         for key, count in (old_counter - new_counter).items():
             record = old_by_key[key]
@@ -3445,6 +3506,21 @@ def _refresh_diff(
         or properties_reordered
         or graphics_changed
     )
+
+    # A rejected renumber makes the per-key view describe changes that were
+    # not applied (a shadowed rename, a spurious move/field change).  Keep
+    # those facts out of the number-keyed lists; the ambiguity warning and
+    # `pins_unclassified` carry the real signal.  `changed` was computed from
+    # the unedited classification above, so the definition change is not lost.
+    if rejected_numbers:
+
+        def _not_rejected(entry: dict[str, Any]) -> bool:
+            scope = (entry["unit"], entry["style"])
+            return entry["number"] not in rejected_numbers.get(scope, set())
+
+        pins_renamed = [entry for entry in pins_renamed if _not_rejected(entry)]
+        pins_moved = [entry for entry in pins_moved if _not_rejected(entry)]
+        pins_modified = [entry for entry in pins_modified if _not_rejected(entry)]
 
     return {
         "changed": changed,

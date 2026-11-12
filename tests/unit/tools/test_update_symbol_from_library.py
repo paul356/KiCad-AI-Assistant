@@ -565,6 +565,7 @@ def test_pin_name_change_updates_cache_only(refresh_env):
         {"number": "1", "old_name": "IN", "new_name": "ANODE", "unit": 1, "style": 1}
     ]
     assert result["placements_updated"] == 0
+    assert result["pins_unclassified"] == []
     assert result["warnings"] == []
     assert Path(result["backup_path"]).exists()
 
@@ -586,6 +587,7 @@ def test_pin_renumbering_rewrites_placement_keys_and_keeps_uuids(refresh_env):
     assert result["affected_count"] == 2
     assert result["placements_updated"] == 2
     assert result["warnings"] == []
+    assert result["pins_unclassified"] == []
     assert {(item["old_number"], item["new_number"]) for item in result["pins_renumbered"]} == {
         ("1", "P$1"),
         ("2", "P$2"),
@@ -681,6 +683,28 @@ def test_unit0_renumber_applies_when_no_other_scope_shares_number(refresh_env):
     assert placements[1]["pins"][-1] == ("9", "ee000000-0000-4000-8000-000000000002")
 
 
+def test_mixed_scope_reports_unclassified_residual(refresh_env):
+    # One shadowed stacked rename (pin 1) plus a normal rename (pin 2) in the
+    # same scope: the classified pin-2 entry must not hide pin 1's residual.
+    _add_library_pin(refresh_env.library, "MYOP", 1, 1, "1", "STACK", -7.62, 0.0, 0)
+    _add_cached_pin(refresh_env.schematic, LIB_ID, 1, 1, "1", "STACK", -7.62, 0.0, 0)
+    _rename_pin(refresh_env.library, "MYOP", "1", "ANODE")
+    _rename_pin(refresh_env.library, "MYOP", "2", "OUT2")
+
+    result = _run(refresh_env)
+
+    assert result["changed"] is True
+    assert result["pins_renamed"] == [
+        {"number": "2", "old_name": "OUT", "new_name": "OUT2", "unit": 1, "style": 1}
+    ]
+    assert len(result["pins_unclassified"]) == 2
+    assert {entry["number"] for entry in result["pins_unclassified"]} == {"1"}
+    assert {entry["old"]["name"] for entry in result["pins_unclassified"] if entry["old"]} == {"IN"}
+    assert {entry["new"]["name"] for entry in result["pins_unclassified"] if entry["new"]} == {
+        "ANODE"
+    }
+
+
 def test_stacked_rename_shadowed_by_number_key_is_reported(refresh_env):
     _add_library_pin(refresh_env.library, "MYOP", 1, 1, "1", "STACK", -7.62, 0.0, 0)
     _add_cached_pin(refresh_env.schematic, LIB_ID, 1, 1, "1", "STACK", -7.62, 0.0, 0)
@@ -721,6 +745,7 @@ def test_fully_renumbered_stacked_pins_rewrite_keys(refresh_env):
     assert result["changed"] is True
     assert result["renumber_ambiguous"] is False
     assert result["placements_updated"] == 2
+    assert result["pins_unclassified"] == []
     assert result["pins_renumbered"] == [
         {"old_number": "1", "new_number": "9", "name": "IN", "unit": 1, "style": 1}
     ]
@@ -764,6 +789,9 @@ def test_renumber_target_colliding_with_retained_pin_is_rejected(refresh_env):
     assert result["renumber_ambiguous"] is True
     assert result["placements_updated"] == 0
     assert result["pins_renumbered"] == []
+    assert result["pins_renamed"] == []
+    assert result["pins_moved"] == []
+    assert result["pins_modified"] == []
     assert (
         "could not infer a unique pin renumbering mapping; "
         "placement pin keys were left unchanged" in result["warnings"]
@@ -826,6 +854,9 @@ def test_duplicate_number_renumber_is_rejected(refresh_env):
     assert result["renumber_ambiguous"] is True
     assert result["placements_updated"] == 0
     assert result["pins_renumbered"] == []
+    assert result["pins_renamed"] == []
+    assert result["pins_moved"] == []
+    assert result["pins_modified"] == []
     assert result["warnings"] == [
         "could not infer a unique pin renumbering mapping; placement pin keys were left unchanged"
     ]
