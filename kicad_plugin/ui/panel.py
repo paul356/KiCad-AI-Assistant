@@ -660,13 +660,13 @@ if _WX_AVAILABLE:
             self._send_btn.Disable()
             send_row.Add(self._send_btn, 0, wx.ALIGN_CENTER_VERTICAL)
 
-            # Status dot — 10 px coloured circle, tooltip carries full text.
+            # Status dot — 16 px bitmap: 14 px dot with a 1 px ring.
             self._status_dot = wx.StaticBitmap(
                 panel,
                 bitmap=self._make_status_dot_bitmap(self._C_GREY, bg=panel.GetBackgroundColour()),
             )
             self._status_dot.SetToolTip("Starting backend…")
-            # 16 px left, 10 px dot, 12 px right + the 4 px hbox border:
+            # 16 px left, 16 px dot, 12 px right + the 4 px hbox border:
             # the dot is centred between the chip and the panel edge.
             send_row.Add(self._status_dot, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 16)
             send_row.AddSpacer(12)
@@ -1576,14 +1576,19 @@ if _WX_AVAILABLE:
 
         @staticmethod
         def _make_status_dot_bitmap(
-            rgb: tuple, size: int = 10, bg: wx.Colour | None = None
+            rgb: tuple, size: int = 16, bg: wx.Colour | None = None
         ) -> wx.Bitmap:
-            """Coloured circle with a subtle ring for the status indicator."""
+            """14 px dot with a 1 px ring, filled with the status colour."""
             bmp, mdc = AssistantPanel._new_icon_bitmap(size, bg)
             gc = wx.GraphicsContext.Create(mdc)
-            gc.SetBrush(wx.Brush(wx.Colour(*rgb)))
-            gc.SetPen(wx.Pen(wx.Colour(214, 218, 224), 1))  # #D6DAE0
-            gc.DrawEllipse(0.5, 0.5, size - 1, size - 1)
+            ring = wx.Colour(214, 218, 224)  # #D6DAE0
+            gc.SetBrush(wx.Brush(ring))
+            gc.SetPen(wx.Pen(ring, 1))
+            gc.DrawEllipse(1, 1, size - 2, size - 2)
+            fill = wx.Colour(*rgb)
+            gc.SetBrush(wx.Brush(fill))
+            gc.SetPen(wx.Pen(fill, 1))
+            gc.DrawEllipse(2, 2, size - 4, size - 4)
             del gc, mdc
             return bmp
 

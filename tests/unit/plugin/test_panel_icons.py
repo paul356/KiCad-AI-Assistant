@@ -376,6 +376,24 @@ def test_jump_bitmaps_are_36x18_stroke_only(panel_mod) -> None:
         assert any(event[0] == "stroke" for event in gc.events)
 
 
+@pytest.mark.parametrize("rgb", [(140, 140, 140), (0, 140, 0)])
+def test_status_dot_is_16px_ring_and_fill(panel_mod, rgb: tuple[int, int, int]) -> None:
+    panel, fake_wx, records = panel_mod
+    bmp = panel.AssistantPanel._make_status_dot_bitmap(rgb, bg=fake_wx.Colour(*_BG))
+    assert (bmp.width, bmp.height) == (16, 16)
+
+    gc = records.gcs[-1]
+    draws = [event[1] for event in gc.events if event[0] == "draw"]
+    assert draws == [(1, 1, 14, 14), (2, 2, 12, 12)]
+
+    ring = gc.pens[0].GetColour()
+    assert ring is not None
+    assert (ring.Red(), ring.Green(), ring.Blue()) == (214, 218, 224)
+    fill = gc.brushes[1].GetColour()
+    assert fill is not None
+    assert (fill.Red(), fill.Green(), fill.Blue()) == rgb
+
+
 def test_paperclip_arcs_fill_with_background_brush(panel_mod) -> None:
     panel, fake_wx, records = panel_mod
     bg = fake_wx.Colour(*_BG)

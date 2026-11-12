@@ -300,11 +300,12 @@ def test_send_and_stop_use_the_same_36px_chip() -> None:
     assert "wx.Colour(220, 70, 70)" in stop
 
 
-def test_status_dot_is_ten_pixels_with_a_ring() -> None:
+def test_status_dot_is_sixteen_pixels_with_a_ring() -> None:
     source = _source(_function("_make_status_dot_bitmap"))
-    assert "size: int = 10" in source
+    assert "size: int = 16" in source
     assert "wx.Colour(214, 218, 224)" in source
-    assert "DrawEllipse(0.5, 0.5, size - 1, size - 1)" in source
+    assert "DrawEllipse(1, 1, size - 2, size - 2)" in source
+    assert "DrawEllipse(2, 2, size - 4, size - 4)" in source
 
 
 # --------------------------------------------------------------------------- #
