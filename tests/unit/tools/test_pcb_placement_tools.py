@@ -787,3 +787,55 @@ class TestSideAwareCollisions:
             "max_y": 1.9,
         }
         assert _resolve_push_shove({"A": [member]}, [pushed, same_side], 2.0) is None
+
+    def test_push_shove_cross_check_blocks_same_side_pushed_pair(self):
+        """Two pushed F.Cu parts that overlap each other after the push are rejected.
+
+        A is pushed down by 1.27 and B up by 1.27; they start 2 mm apart, so
+        their original courtyards do not touch, and the per-push new-conflict
+        loop skips both refs because both are in ``conflicting``.  Only the
+        final pushed-vs-pushed cross-check can reject this push set.
+        """
+
+        def box(ref: str, layer: str, cy: float) -> dict:
+            return {
+                "ref": ref,
+                "layer": layer,
+                "min_x": -0.5,
+                "min_y": cy - 0.5,
+                "max_x": 0.5,
+                "max_y": cy + 0.5,
+            }
+
+        from kcaa.tools.pcb_placement_helpers import _resolve_push_shove
+
+        member_a = {"min_x": -0.5, "min_y": -1.5, "max_x": 0.5, "max_y": -0.2}
+        member_b = {"min_x": -0.5, "min_y": 3.2, "max_x": 0.5, "max_y": 4.5}
+        conflicting = {"A": [member_a], "B": [member_b]}
+        statics = [box("A", "F.Cu", 0.0), box("B", "F.Cu", 3.0)]
+        assert _resolve_push_shove(conflicting, statics, 2.0) is None
+
+    def test_push_shove_cross_check_allows_opposite_side_pushed_pair(self):
+        """The same overlapping push pair is accepted when the sides differ."""
+
+        def box(ref: str, layer: str, cy: float) -> dict:
+            return {
+                "ref": ref,
+                "layer": layer,
+                "min_x": -0.5,
+                "min_y": cy - 0.5,
+                "max_x": 0.5,
+                "max_y": cy + 0.5,
+            }
+
+        from kcaa.tools.pcb_placement_helpers import _resolve_push_shove
+
+        member_a = {"min_x": -0.5, "min_y": -1.5, "max_x": 0.5, "max_y": -0.2}
+        member_b = {"min_x": -0.5, "min_y": 3.2, "max_x": 0.5, "max_y": 4.5}
+        conflicting = {"A": [member_a], "B": [member_b]}
+        statics = [box("A", "F.Cu", 0.0), box("B", "B.Cu", 3.0)]
+        pushes = _resolve_push_shove(conflicting, statics, 2.0)
+        assert pushes == [
+            {"ref": "A", "push_dx": 0.0, "push_dy": pytest.approx(1.27)},
+            {"ref": "B", "push_dx": 0.0, "push_dy": pytest.approx(-1.27)},
+        ]
