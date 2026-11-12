@@ -22,6 +22,11 @@ from fastmcp import Context, FastMCP
 import sexpdata
 
 from kcaa.utils.pcb_board_utils import get_edge_cuts_items, get_fp_courtyard_bbox
+from kcaa.utils.pcb_footprint_utils import (
+    get_fp_layer,
+    get_fp_property,
+    iter_footprint_nodes,
+)
 from kcaa.utils.pcb_sexp_utils import load_pcb
 
 log = logging.getLogger(__name__)
@@ -114,6 +119,40 @@ def _get_board_bounds_or_fallback(data: list[Any]) -> dict[str, float]:
     }
 
 
+def _fp_side(layer: str | None) -> str | None:
+    """Return the board side (``"F"``/``"B"``) for a footprint layer.
+
+    Only ``F.Cu`` and ``B.Cu`` identify a side.  A missing layer, a ``*.Cu``
+    wildcard, or any other layer name returns ``None`` so callers can treat
+    the side as unknown instead of guessing.
+    """
+    if layer == "F.Cu":
+        return "F"
+    if layer == "B.Cu":
+        return "B"
+    return None
+
+
+def _sides_can_collide(a: str | None, b: str | None) -> bool:
+    """Return True when two footprints can occupy the same board area.
+
+    Footprints collide only when they sit on the same side.  An unknown side
+    (``None``) conservatively collides with both sides, so an unparseable
+    layer can never silently disable the collision guard.
+    """
+    return a is None or b is None or a == b
+
+
+def _get_footprint_sides(data: list[Any]) -> dict[str, str | None]:
+    """Map each footprint reference to its board side (``"F"``/``"B"``/``None``)."""
+    sides: dict[str, str | None] = {}
+    for fp_node in iter_footprint_nodes(data):
+        ref = get_fp_property(fp_node, "Reference")
+        if ref:
+            sides[ref] = _fp_side(get_fp_layer(fp_node))
+    return sides
+
+
 def _get_all_footprint_bboxes(
     data: list[Any],
     exclude_refs: set[str] | None = None,
@@ -128,36 +167,19 @@ def _get_all_footprint_bboxes(
                (e.g. ``"F.Cu"`` or ``"B.Cu"``).
 
     Returns:
-        List of ``{ref, min_x, min_y, max_x, max_y}`` dicts.
+        List of ``{ref, layer, min_x, min_y, max_x, max_y}`` dicts.  ``layer``
+        is the footprint's primary layer string; it is ``None`` when the
+        footprint has no layer node.
     """
     result: list[dict[str, Any]] = []
-    for item in data:
-        if not (isinstance(item, list) and len(item) > 0):
-            continue
-        if _sym(item[0]) != "footprint":
-            continue
-
-        # Extract reference
-        ref = ""
-        for sub in item:
-            if isinstance(sub, list) and len(sub) >= 3 and _sym(sub[0]) == "property":
-                prop_name = sub[1] if isinstance(sub[1], str) else _sym(sub[1])
-                if prop_name == "Reference":
-                    ref = sub[2] if isinstance(sub[2], str) else _sym(sub[2])
-                    break
-
+    for item in iter_footprint_nodes(data):
+        ref = get_fp_property(item, "Reference") or ""
         if exclude_refs and ref in exclude_refs:
             continue
 
-        # Filter by layer if requested
-        if layer is not None:
-            fp_layer: str | None = None
-            for sub in item:
-                if isinstance(sub, list) and len(sub) >= 2 and _sym(sub[0]) == "layer":
-                    fp_layer = sub[1] if isinstance(sub[1], str) else _sym(sub[1])
-                    break
-            if fp_layer != layer:
-                continue
+        fp_layer = get_fp_layer(item)
+        if layer is not None and fp_layer != layer:
+            continue
 
         # Extract position
         fp_x, fp_y, fp_rot = 0.0, 0.0, 0.0
@@ -174,6 +196,7 @@ def _get_all_footprint_bboxes(
         result.append(
             {
                 "ref": ref,
+                "layer": fp_layer,
                 "min_x": bbox["min_x"],
                 "min_y": bbox["min_y"],
                 "max_x": bbox["max_x"],
@@ -497,12 +520,20 @@ def find_collisions(
         proposals: List of ``(reference, x, y, rotation)`` proposed positions.
         extra_exclude_refs: Additional refs to exclude from the static footprint
             check (besides the refs already present in ``proposals``).
-        layer: If given, only check collisions against footprints on this layer.
-            Used by ``flip_footprint`` to limit the check to the destination layer.
+        layer: The board layer the proposals live on.  When given it defines
+            the proposal side, so footprints on the opposite side are never
+            reported as overlapping.  ``flip_footprint`` passes the
+            destination layer here because it flips the footprint before
+            checking.  Omitting it derives each proposal's side from its
+            footprint node.
         check_within_group: If False, skip collision checks between proposals
             themselves.  Use this when moving a group as a rigid unit — their
             relative positions are unchanged so any pre-existing intra-group
             overlaps should not block the move.
+
+    Only same-side footprints collide: a footprint on ``F.Cu`` never conflicts
+    with one on ``B.Cu``.  A footprint whose layer cannot be determined is
+    conservatively treated as colliding with both sides.
 
     Returns:
         List of ``{ref: str, overlapping_with: [str, ...]}`` for every proposal
@@ -516,29 +547,45 @@ def find_collisions(
         all_excluded.update(extra_exclude_refs)
 
     # Static footprint bboxes (everything not in the proposal set)
-    static_bboxes = _get_all_footprint_bboxes(data, exclude_refs=all_excluded, layer=layer)
+    static_bboxes = _get_all_footprint_bboxes(data, exclude_refs=all_excluded)
+
+    # Side of each proposal.  An explicit `layer` wins (flip_footprint has
+    # already moved the footprint to its destination layer); otherwise read
+    # the footprint's own layer node.  Unknown stays None → collides with both.
+    proposal_side = _fp_side(layer)
+    sides = _get_footprint_sides(data) if layer is None else {}
 
     # Compute proposed bboxes
-    proposed: list[tuple[str, dict[str, float] | None]] = [
-        (ref, _get_footprint_bbox_at(data, ref, x, y, rot)) for ref, x, y, rot in proposals
+    proposed: list[tuple[str, dict[str, float] | None, str | None]] = [
+        (
+            ref,
+            _get_footprint_bbox_at(data, ref, x, y, rot),
+            proposal_side if layer is not None else sides.get(ref),
+        )
+        for ref, x, y, rot in proposals
     ]
 
     collisions: list[dict[str, Any]] = []
-    for i, (ref, bbox) in enumerate(proposed):
+    for i, (ref, bbox, side) in enumerate(proposed):
         if bbox is None:
             continue  # No courtyard geometry — skip
 
         overlapping_with: list[str] = []
 
-        # Check against static footprints
+        # Check against static footprints on the same side
         for sb in static_bboxes:
-            if _bboxes_overlap(bbox, sb):
+            if _bboxes_overlap(bbox, sb) and _sides_can_collide(side, _fp_side(sb["layer"])):
                 overlapping_with.append(sb["ref"])
 
         # Check against other proposals (use their proposed bboxes)
         if check_within_group:
-            for j, (other_ref, other_bbox) in enumerate(proposed):
-                if i != j and other_bbox is not None and _bboxes_overlap(bbox, other_bbox):
+            for j, (other_ref, other_bbox, other_side) in enumerate(proposed):
+                if (
+                    i != j
+                    and other_bbox is not None
+                    and _bboxes_overlap(bbox, other_bbox)
+                    and _sides_can_collide(side, other_side)
+                ):
                     overlapping_with.append(other_ref)
 
         if overlapping_with:
@@ -559,7 +606,11 @@ def find_nearest_free_position(
 
     Scans a ``_GRID_MM`` grid centred on ``(target_x, target_y)`` within
     ``search_radius_mm``, returning the closest anchor position where the
-    footprint's courtyard does not overlap any existing footprint courtyard.
+    footprint's courtyard does not overlap any existing footprint courtyard
+    **on the same side of the board**.  Footprints on the opposite side share
+    the same XY area without colliding, so they never push the search away.
+    An unknown side (missing/unparseable layer) keeps the footprint blocked by
+    both sides.
 
     Args:
         data: Parsed PCB S-expression tree.
@@ -586,7 +637,13 @@ def find_nearest_free_position(
     off_max_x = bbox_at_origin["max_x"]
     off_max_y = bbox_at_origin["max_y"]
 
-    static_bboxes = _get_all_footprint_bboxes(data, exclude_refs={reference})
+    # Only same-side footprints can block; unknown sides block both ways.
+    own_side = _get_footprint_sides(data).get(reference)
+    static_bboxes = [
+        sb
+        for sb in _get_all_footprint_bboxes(data, exclude_refs={reference})
+        if _sides_can_collide(own_side, _fp_side(sb["layer"]))
+    ]
 
     # Snap target to nearest grid point, then scan outward sorted by distance
     snap_x = round(round(target_x / _GRID_MM) * _GRID_MM, 9)
@@ -691,9 +748,9 @@ def _resolve_push_shove(
 
     * the displacement does not exceed *max_push_mm*,
     * the new position does not overlap any other (non-pushed) static
-      footprint, and
+      footprint on the same side, and
     * after all pushes are applied the pushed footprints do not overlap
-      each other.
+      each other on the same side.
 
     Args:
         conflicting: ``{static_ref: [member_bboxes_that_overlap_it]}``.
@@ -704,9 +761,9 @@ def _resolve_push_shove(
         List of ``{ref, push_dx, push_dy}`` push actions (grid-snapped) on
         success, or ``None`` if any conflict cannot be resolved.
     """
-    static_bbox_map: dict[str, dict[str, float]] = {b["ref"]: b for b in all_static_bboxes}
+    static_bbox_map: dict[str, dict[str, Any]] = {b["ref"]: b for b in all_static_bboxes}
     # Track tentatively updated bboxes to detect newly introduced conflicts.
-    updated: dict[str, dict[str, float]] = {ref: dict(b) for ref, b in static_bbox_map.items()}
+    updated: dict[str, dict[str, Any]] = {ref: dict(b) for ref, b in static_bbox_map.items()}
     push_list: list[dict[str, Any]] = []
 
     for s_ref, member_bboxes in conflicting.items():
@@ -729,7 +786,8 @@ def _resolve_push_shove(
         if math.hypot(push_dx, push_dy) > max_push_mm:
             return None  # push exceeds the allowed limit
 
-        new_box: dict[str, float] = {
+        new_box: dict[str, Any] = {
+            "layer": s_box.get("layer"),
             "min_x": s_box["min_x"] + push_dx,
             "min_y": s_box["min_y"] + push_dy,
             "max_x": s_box["max_x"] + push_dx,
@@ -741,7 +799,9 @@ def _resolve_push_shove(
         for other_ref, other_box in updated.items():
             if other_ref == s_ref or other_ref in conflicting:
                 continue
-            if _bboxes_overlap(new_box, other_box):
+            if _bboxes_overlap(new_box, other_box) and _sides_can_collide(
+                _fp_side(new_box["layer"]), _fp_side(other_box["layer"])
+            ):
                 return None  # would introduce a new collision
 
         updated[s_ref] = new_box
@@ -751,7 +811,11 @@ def _resolve_push_shove(
     pushed_refs = [p["ref"] for p in push_list]
     for i in range(len(pushed_refs)):
         for j in range(i + 1, len(pushed_refs)):
-            if _bboxes_overlap(updated[pushed_refs[i]], updated[pushed_refs[j]]):
+            box_i = updated[pushed_refs[i]]
+            box_j = updated[pushed_refs[j]]
+            if _bboxes_overlap(box_i, box_j) and _sides_can_collide(
+                _fp_side(box_i["layer"]), _fp_side(box_j["layer"])
+            ):
                 return None
 
     return push_list
@@ -916,18 +980,18 @@ def _find_group_board_position(
     # Helper to check overlap for a given position
     def check_position(
         cx: float, cy: float
-    ) -> tuple[bool, dict[str, list[dict[str, float]]], list[dict[str, float]]]:
+    ) -> tuple[bool, dict[str, list[dict[str, float]]], list[tuple[str | None, dict[str, float]]]]:
         """Check if position (cx, cy) is collision-free.
 
         Returns:
-            (found_clear, conflicting, placed_member_bboxes) where:
-            - found_clear: True if no overlaps
+            (found_clear, conflicting, placed_members) where:
+            - found_clear: True if no same-side overlaps
             - conflicting: dict of {static_ref: [overlapping_member_bboxes]}
-            - placed_member_bboxes: list of all member bboxes at this position
+            - placed_members: list of ``(side, bbox)`` for placed group members
         """
         conflicting: dict[str, list[dict[str, float]]] = {}
         found_clear = True
-        placed_member_bboxes: list[dict[str, float]] = []
+        placed_members: list[tuple[str | None, dict[str, float]]] = []
 
         for pos in relative_layout:
             fp_node = fp_node_cache.get(pos["ref"])
@@ -938,9 +1002,12 @@ def _find_group_board_position(
             member_bbox = get_fp_courtyard_bbox(fp_node, mx, my, pos["rotation"])
             if member_bbox is None:
                 continue
+            member_side = _fp_side(get_fp_layer(fp_node))
             member_clear = True
-            # Check against external (non-group) static footprints.
+            # Check against external (non-group) static footprints on the same side.
             for sb in static_bboxes:
+                if not _sides_can_collide(member_side, _fp_side(sb["layer"])):
+                    continue
                 if _bboxes_overlap(member_bbox, sb):
                     found_clear = False
                     member_clear = False
@@ -950,17 +1017,19 @@ def _find_group_board_position(
                         break
             if not member_clear and push_shove_mm <= 0.0:
                 break
-            # Check against other group members
+            # Check against other group members on the same side
             if member_clear:
-                for pm in placed_member_bboxes:
-                    if _bboxes_overlap(member_bbox, pm):
+                for other_side, other_bbox in placed_members:
+                    if _sides_can_collide(member_side, other_side) and _bboxes_overlap(
+                        member_bbox, other_bbox
+                    ):
                         found_clear = False
                         member_clear = False
                         break
             if member_clear:
-                placed_member_bboxes.append(member_bbox)
+                placed_members.append((member_side, member_bbox))
 
-        return found_clear, conflicting, placed_member_bboxes
+        return found_clear, conflicting, placed_members
 
     # Helper to calculate overlap area between two bboxes
     def overlap_area(bb1: dict[str, float], bb2: dict[str, float]) -> float:
@@ -1032,9 +1101,12 @@ def _find_group_board_position(
                 member_bbox = get_fp_courtyard_bbox(fp_node, mx, my, pos["rotation"])
                 if member_bbox is None:
                     continue
+                member_side = _fp_side(get_fp_layer(fp_node))
 
-                # Check overlap with all static components
+                # Check overlap with same-side static components
                 for sb in static_bboxes:
+                    if not _sides_can_collide(member_side, _fp_side(sb["layer"])):
+                        continue
                     area = overlap_area(member_bbox, sb)
                     if area > 0:
                         # Calculate centroid of overlap region
@@ -1190,6 +1262,11 @@ def register_pcb_placement_helper_tools(mcp: FastMCP) -> None:
         candidate anchor positions where the footprint's courtyard fits
         without overlapping any existing component courtyard.
 
+        Only footprints on the same side of the board block candidates: an
+        F.Cu footprint may sit directly over a B.Cu one.  The side comes from
+        ``footprint_ref``; without it there is no side to compare, so parts on
+        both sides block the same way they always have.
+
         The board Edge.Cuts outline is used as the candidate search area
         (soft boundary — footprints may still be placed outside the
         outline intentionally; this tool simply confines the search).
@@ -1231,6 +1308,7 @@ def register_pcb_placement_helper_tools(mcp: FastMCP) -> None:
         _off_min_y: float | None = None
         _off_max_x: float | None = None
         _off_max_y: float | None = None
+        ref_side: str | None = None
 
         if footprint_ref:
             bbox_at_origin = _get_footprint_bbox_at(data, footprint_ref, 0.0, 0.0, 0.0)
@@ -1239,6 +1317,7 @@ def register_pcb_placement_helper_tools(mcp: FastMCP) -> None:
                 _off_min_y = bbox_at_origin["min_y"]
                 _off_max_x = bbox_at_origin["max_x"]
                 _off_max_y = bbox_at_origin["max_y"]
+            ref_side = _get_footprint_sides(data).get(footprint_ref)
 
         if _off_min_x is None or _off_min_y is None or _off_max_x is None or _off_max_y is None:
             # Fall back to explicit width / height (centred on anchor)
@@ -1275,6 +1354,11 @@ def register_pcb_placement_helper_tools(mcp: FastMCP) -> None:
         # ------------------------------------------------------------------
         exclude: set[str] | None = {footprint_ref} if footprint_ref else None
         static_bboxes = _get_all_footprint_bboxes(data, exclude_refs=exclude)
+        # `ref_side` is None when no footprint_ref was given → every footprint
+        # blocks (no side to compare).  Unknown side also blocks both ways.
+        blocking_bboxes = [
+            sb for sb in static_bboxes if _sides_can_collide(ref_side, _fp_side(sb["layer"]))
+        ]
         inflated_bboxes = [
             {
                 "ref": sb["ref"],
@@ -1283,7 +1367,7 @@ def register_pcb_placement_helper_tools(mcp: FastMCP) -> None:
                 "max_x": sb["max_x"] + margin,
                 "max_y": sb["max_y"] + margin,
             }
-            for sb in static_bboxes
+            for sb in blocking_bboxes
         ]
 
         # ------------------------------------------------------------------
