@@ -4385,6 +4385,91 @@ class TestToolCallArgumentsNormalization:
         assert normalized[0]["function"] is not original[0]["function"]
 
 
+class TestOutboundReasoningHygiene:
+    """Issue #283: stored reasoning text must not reach provider requests."""
+
+    @staticmethod
+    def _history():
+        return [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "What is on this board?"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,QUJD"},
+                    },
+                ],
+            },
+            {
+                "role": "assistant",
+                "content": "",
+                "reasoning_content": "hidden chain",
+                "tool_calls": [
+                    {
+                        "id": "tc1",
+                        "type": "function",
+                        "function": {"name": "get_board_info", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "tc1", "content": "{}"},
+        ]
+
+    def test_history_round_trip_keeps_reasoning_content(self):
+        client = _make_client()
+        history = self._history()
+        client.set_history(history)
+
+        restored = client.get_history()
+
+        assert restored == history
+        assert restored[1]["reasoning_content"] == "hidden chain"
+
+    def test_openai_payload_omits_reasoning_content(self):
+        client = _make_client()
+        client._history = self._history()
+
+        payload = json.loads(client._openai_payload("sys", [], False))
+
+        assert all("reasoning_content" not in m for m in payload["messages"])
+        assistant = next(m for m in payload["messages"] if m["role"] == "assistant")
+        assert assistant["tool_calls"][0]["function"]["name"] == "get_board_info"
+        tool = next(m for m in payload["messages"] if m["role"] == "tool")
+        assert tool["tool_call_id"] == "tc1"
+
+    def test_ollama_messages_omit_reasoning_content(self):
+        client = _make_client()
+        client._history = self._history()
+
+        messages = client._ollama_messages()
+
+        assert all("reasoning_content" not in m for m in messages)
+        assert messages[0]["content"] == "What is on this board?"
+        assert messages[0]["images"] == ["QUJD"]
+        assert messages[1]["tool_calls"][0]["function"]["arguments"] == {}
+        assert messages[2]["tool_call_id"] == "tc1"
+
+    def test_call_ollama_body_omits_reasoning_content(self):
+        client = _make_client()
+        client._settings.llm_provider = "ollama"
+        client._history = self._history()
+        captured: dict[str, object] = {}
+
+        def _fake_post(url, headers, payload, timeout=300):
+            captured["body"] = json.loads(payload.decode())
+            return 200, '{"message":{"role":"assistant","content":"ok"}}'
+
+        with patch("kicad_plugin.llm_client._https_post_json", side_effect=_fake_post):
+            result = client._call_ollama("sys", [])
+
+        assert "error" not in result, result.get("error")
+        messages = captured["body"]["messages"]  # type: ignore[index]
+        assert all("reasoning_content" not in m for m in messages)
+        assistant = next(m for m in messages if m["role"] == "assistant")
+        assert assistant["tool_calls"][0]["function"]["arguments"] == {}
+
+
 class TestOllamaFinalChunk:
     """Issue #272: Ollama may attach the last assistant message to the chunk
     that also carries ``done: true``.  That message must be consumed before

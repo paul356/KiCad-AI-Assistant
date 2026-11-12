@@ -106,6 +106,21 @@ def _normalize_tool_calls(tool_calls: Any) -> Any:
     return normalized
 
 
+def _wire_message(msg: dict[str, Any]) -> dict[str, Any]:
+    """Copy only the fields defined by the chat-message wire contract.
+
+    History also carries client-side bookkeeping such as
+    ``reasoning_content``; spreading the entry would echo it back to the
+    provider (#283).  Adding another internal key later must not reach the
+    wire by accident.
+    """
+    return {
+        key: msg[key]
+        for key in ("role", "content", "name", "tool_calls", "tool_call_id")
+        if key in msg
+    }
+
+
 def _is_slot_index(value: Any) -> bool:
     """Return whether *value* is a usable tool-call slot index (bools are not)."""
     return isinstance(value, int) and not isinstance(value, bool)
@@ -4069,7 +4084,9 @@ class LLMClient:
         base = self._settings.llm_base_url or "https://api.openai.com"
         url = self._openai_endpoint_url(base)
 
-        messages = [{"role": "system", "content": system}] + self._history
+        messages = [{"role": "system", "content": system}] + [
+            _wire_message(msg) for msg in self._history
+        ]
         payload = json.dumps(
             {
                 "model": self._settings.llm_model,
@@ -4233,7 +4250,8 @@ class LLMClient:
                             data = url
                         images.append(data)
                 content = "\n".join(p for p in text_parts if p)
-            converted = {**msg, "content": content}
+            converted = _wire_message(msg)
+            converted["content"] = content
             if msg.get("role") == "assistant" and msg.get("tool_calls"):
                 # Ollama's native API requires arguments as JSON objects; the
                 # internal representation is always a JSON string.
@@ -4680,7 +4698,9 @@ class LLMClient:
 
     def _openai_payload(self, system: str, tools: list[dict], stream: bool) -> bytes:
         """Build the OpenAI-compatible chat-completions request body."""
-        messages = [{"role": "system", "content": system}] + self._history
+        messages = [{"role": "system", "content": system}] + [
+            _wire_message(msg) for msg in self._history
+        ]
         payload_dict: dict[str, Any] = {
             "model": self._settings.llm_model,
             "messages": messages,
