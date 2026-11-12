@@ -377,14 +377,14 @@ def test_jump_bitmaps_are_36x18_stroke_only(panel_mod) -> None:
 
 
 @pytest.mark.parametrize("rgb", [(140, 140, 140), (0, 140, 0)])
-def test_status_dot_is_16px_ring_and_fill(panel_mod, rgb: tuple[int, int, int]) -> None:
+def test_status_dot_is_18px_ring_and_fill(panel_mod, rgb: tuple[int, int, int]) -> None:
     panel, fake_wx, records = panel_mod
     bmp = panel.AssistantPanel._make_status_dot_bitmap(rgb, bg=fake_wx.Colour(*_BG))
-    assert (bmp.width, bmp.height) == (16, 16)
+    assert (bmp.width, bmp.height) == (18, 18)
 
     gc = records.gcs[-1]
     draws = [event[1] for event in gc.events if event[0] == "draw"]
-    assert draws == [(1, 1, 14, 14), (2, 2, 12, 12)]
+    assert draws == [(1, 1, 16, 16), (1.5, 1.5, 15, 15)]
 
     assert len(gc.pens) == 2
     assert len(gc.brushes) == 2

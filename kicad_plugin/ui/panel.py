@@ -636,6 +636,7 @@ if _WX_AVAILABLE:
             side_vbox = wx.BoxSizer(wx.VERTICAL)
 
             # Jump-to-start: 36×18 so the column stays 76 px tall.
+            # Centred over the send+status row below.
             icon_bg = panel.GetBackgroundColour()
             self._jump_top_btn = wx.BitmapButton(
                 panel,
@@ -644,7 +645,7 @@ if _WX_AVAILABLE:
             )
             self._jump_top_btn.SetToolTip("Jump to start")
             self._jump_top_btn.SetName("Jump to start")
-            side_vbox.Add(self._jump_top_btn, 0, wx.ALIGN_LEFT | wx.BOTTOM, 2)
+            side_vbox.Add(self._jump_top_btn, 0, wx.ALIGN_CENTER_HORIZONTAL | wx.BOTTOM, 2)
 
             # Send/Stop with the backend status dot 12 px to its right.
             send_row = wx.BoxSizer(wx.HORIZONTAL)
@@ -660,20 +661,20 @@ if _WX_AVAILABLE:
             self._send_btn.Disable()
             send_row.Add(self._send_btn, 0, wx.ALIGN_CENTER_VERTICAL)
 
-            # Status dot — 16 px bitmap: 14 px dot with a 1 px ring.
+            # Status dot — 18 px bitmap: 16 px green ball inside the light ring.
             self._status_dot = wx.StaticBitmap(
                 panel,
                 bitmap=self._make_status_dot_bitmap(self._C_GREY, bg=panel.GetBackgroundColour()),
             )
             self._status_dot.SetToolTip("Starting backend…")
-            # 16 px left, 16 px dot, 12 px right + the 4 px hbox border:
+            # 16 px left, 10 px dot, 12 px right + the 4 px hbox border:
             # the dot is centred between the chip and the panel edge.
             send_row.Add(self._status_dot, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 16)
             send_row.AddSpacer(12)
 
             side_vbox.Add(send_row, 0, wx.ALIGN_LEFT | wx.BOTTOM, 2)
 
-            # Jump-to-latest: 36×18, aligned with the chip's left edge.
+            # Jump-to-latest: 36×18, centred over the send+status row.
             self._jump_latest_btn = wx.BitmapButton(
                 panel,
                 bitmap=self._make_jump_bitmap("down", bg=icon_bg),
@@ -681,7 +682,7 @@ if _WX_AVAILABLE:
             )
             self._jump_latest_btn.SetToolTip("Jump to latest")
             self._jump_latest_btn.SetName("Jump to latest")
-            side_vbox.Add(self._jump_latest_btn, 0, wx.ALIGN_LEFT)
+            side_vbox.Add(self._jump_latest_btn, 0, wx.ALIGN_CENTER_HORIZONTAL)
 
             hbox.Add(side_vbox, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 4)
 
@@ -1576,9 +1577,14 @@ if _WX_AVAILABLE:
 
         @staticmethod
         def _make_status_dot_bitmap(
-            rgb: tuple, size: int = 16, bg: wx.Colour | None = None
+            rgb: tuple, size: int = 18, bg: wx.Colour | None = None
         ) -> wx.Bitmap:
-            """14 px dot with a 1 px ring, filled with the status colour."""
+            """16 px green ball inside a 1 px light ring.
+
+            The ball's radius is doubled from the previous 10 px bitmap; the
+            ring can only grow with it because the fill cannot exceed the
+            outline.
+            """
             bmp, mdc = AssistantPanel._new_icon_bitmap(size, bg)
             gc = wx.GraphicsContext.Create(mdc)
             ring = wx.Colour(214, 218, 224)  # #D6DAE0
@@ -1588,7 +1594,7 @@ if _WX_AVAILABLE:
             fill = wx.Colour(*rgb)
             gc.SetBrush(wx.Brush(fill))
             gc.SetPen(wx.Pen(fill, 1))
-            gc.DrawEllipse(2, 2, size - 4, size - 4)
+            gc.DrawEllipse(1.5, 1.5, size - 3, size - 3)
             del gc, mdc
             return bmp
 

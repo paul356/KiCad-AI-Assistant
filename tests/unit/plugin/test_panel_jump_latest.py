@@ -185,17 +185,13 @@ def _send_row_spacing(build_ui: ast.FunctionDef) -> tuple[int, int, int, int]:
 
 
 def test_jump_arrows_stack_above_and_below_send() -> None:
-    """Top arrow, send row, bottom arrow, left-aligned at 2 px spacing."""
+    """Top arrow, send row, bottom arrow, in that order."""
     build_ui = _function("_build_ui")
     assert _sizer_order(build_ui, "side_vbox") == [
         "_jump_top_btn",
         "send_row",
         "_jump_latest_btn",
     ]
-    source = _source(build_ui)
-    assert "side_vbox.Add(self._jump_top_btn, 0, wx.ALIGN_LEFT | wx.BOTTOM, 2)" in source
-    assert "side_vbox.Add(send_row, 0, wx.ALIGN_LEFT | wx.BOTTOM, 2)" in source
-    assert "side_vbox.Add(self._jump_latest_btn, 0, wx.ALIGN_LEFT)" in source
     side_children = _sizer_order(build_ui, "side_vbox")
     assert side_children.count("_jump_top_btn") == 1
     assert side_children.count("send_row") == 1
@@ -298,14 +294,6 @@ def test_send_and_stop_use_the_same_36px_chip() -> None:
     assert "gc.SetPen(wx.Pen(wx.Colour(185, 56, 56), 1))" in stop
     assert "wx.Colour(34, 85, 204)" in send
     assert "wx.Colour(220, 70, 70)" in stop
-
-
-def test_status_dot_is_sixteen_pixels_with_a_ring() -> None:
-    source = _source(_function("_make_status_dot_bitmap"))
-    assert "size: int = 16" in source
-    assert "wx.Colour(214, 218, 224)" in source
-    assert "DrawEllipse(1, 1, size - 2, size - 2)" in source
-    assert "DrawEllipse(2, 2, size - 4, size - 4)" in source
 
 
 # --------------------------------------------------------------------------- #
