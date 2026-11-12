@@ -19,6 +19,7 @@ FIXTURE_DIR = os.path.join(os.path.dirname(__file__), "fixtures")
 BOARD_FIXTURE = os.path.join(FIXTURE_DIR, "test_board.kicad_pcb")
 BOARD_WITH_OUTLINE_FIXTURE = os.path.join(FIXTURE_DIR, "test_board_with_outline.kicad_pcb")
 GROUP_PLACEMENT_FIXTURE = os.path.join(FIXTURE_DIR, "test_group_placement.kicad_pcb")
+SIDES_FIXTURE = os.path.join(FIXTURE_DIR, "test_board_sides.kicad_pcb")
 
 
 class _MockMCP:
@@ -66,6 +67,27 @@ def group_board_copy(tmp_path):
     """Board with courtyard geometry (0603/SOD-123/USB-C), for collision tests."""
     dest = tmp_path / "group_placement.kicad_pcb"
     shutil.copy(GROUP_PLACEMENT_FIXTURE, dest)
+    return str(dest)
+
+
+def _get_helper_tools() -> dict:
+    from kcaa.tools.pcb_placement_helpers import register_pcb_placement_helper_tools
+
+    mock = _MockMCP()
+    register_pcb_placement_helper_tools(mock)
+    return mock.tools
+
+
+@pytest.fixture(scope="module")
+def helper_tools():
+    return _get_helper_tools()
+
+
+@pytest.fixture
+def sides_board_copy(tmp_path):
+    """Board with mixed F.Cu/B.Cu parts and one footprint without a layer."""
+    dest = tmp_path / "board_sides.kicad_pcb"
+    shutil.copy(SIDES_FIXTURE, dest)
     return str(dest)
 
 
@@ -475,3 +497,185 @@ class TestMoveFootprintsByDelta:
             )
         )
         assert os.path.exists(board_with_outline_copy + ".bak")
+
+
+class TestSideAwareCollisions:
+    """Courtyard collisions only apply to footprints on the same board side.
+
+    Fixture layout (``test_board_sides.kicad_pcb``), every courtyard is
+    ``(-1.0, -0.5) .. (1.0, 0.5)``:
+
+      R1 — F.Cu at (10, 10)
+      R2 — B.Cu at (10, 10)   (overlaps R1 in XY, opposite side)
+      R3 — F.Cu at (30, 10)   (same side as R1)
+      R5 — no layer node at (20, 10)  (unknown side)
+    """
+
+    def test_move_across_sides_allowed(self, tools, sides_board_copy):
+        result = _run(
+            tools["set_footprint_position"](
+                pcb_path=sides_board_copy,
+                items=[{"reference": "R1", "x": 10.5, "y": 10.0, "rotation": None}],
+                ctx=None,
+            )
+        )
+        assert "error" not in result, result
+        entry = result["results"][0]
+        assert entry["success"] is True
+        assert entry["status"] == "placed"
+        assert entry["placed_at"]["x"] == pytest.approx(10.5)
+        data = load_pcb(sides_board_copy)
+        x, y, _ = get_fp_at(find_footprint(data, "R1"))
+        assert x == pytest.approx(10.5)
+        assert y == pytest.approx(10.0)
+
+    def test_move_same_side_rejected(self, tools, sides_board_copy, monkeypatch):
+        import kcaa.tools.pcb_placement_tools as placement_tools
+
+        monkeypatch.setattr(placement_tools, "find_nearest_free_position", lambda *a, **k: None)
+        result = _run(
+            tools["set_footprint_position"](
+                pcb_path=sides_board_copy,
+                items=[{"reference": "R1", "x": 30.0, "y": 10.0, "rotation": None}],
+                ctx=None,
+            )
+        )
+        assert result["failure_count"] == 1
+        entry = result["results"][0]
+        assert "error" in entry
+        assert entry["proposed_position_overlaps"] == ["R3"]
+        data = load_pcb(sides_board_copy)
+        x, y, _ = get_fp_at(find_footprint(data, "R1"))
+        assert x == pytest.approx(10.0)
+        assert y == pytest.approx(10.0)
+
+    def test_flip_to_occupied_side_rejected(self, tools, sides_board_copy):
+        result = _run(tools["flip_footprint"](pcb_path=sides_board_copy, reference="R1", ctx=None))
+        assert "error" in result
+        assert result["overlapping_with"] == ["R2"]
+        data = load_pcb(sides_board_copy)
+        assert get_fp_layer(find_footprint(data, "R1")) == "F.Cu"
+
+    def test_flip_to_clear_side_succeeds(self, tools, sides_board_copy):
+        result = _run(tools["flip_footprint"](pcb_path=sides_board_copy, reference="R3", ctx=None))
+        assert "error" not in result, result
+        data = load_pcb(sides_board_copy)
+        assert get_fp_layer(find_footprint(data, "R3")) == "B.Cu"
+
+    def test_flip_back_to_front_rejected(self, tools, sides_board_copy):
+        result = _run(tools["flip_footprint"](pcb_path=sides_board_copy, reference="R2", ctx=None))
+        assert "error" in result
+        assert result["overlapping_with"] == ["R1"]
+        data = load_pcb(sides_board_copy)
+        assert get_fp_layer(find_footprint(data, "R2")) == "B.Cu"
+
+    def test_align_cross_side_overlap_not_flagged(self, tools, sides_board_copy):
+        result = _run(
+            tools["align_footprints"](
+                pcb_path=sides_board_copy,
+                references=["R2", "R3"],
+                axis="x",
+                coordinate=30.0,
+                ctx=None,
+            )
+        )
+        assert "error" not in result, result
+        new_xs = {entry["reference"]: entry["new_x"] for entry in result["aligned"]}
+        assert new_xs["R2"] == pytest.approx(30.0)
+        data = load_pcb(sides_board_copy)
+        assert get_fp_at(find_footprint(data, "R2"))[0] == pytest.approx(30.0)
+
+    def test_align_same_side_overlap_flagged(self, tools, sides_board_copy):
+        result = _run(
+            tools["align_footprints"](
+                pcb_path=sides_board_copy,
+                references=["R1", "R3"],
+                axis="x",
+                coordinate=30.0,
+                ctx=None,
+            )
+        )
+        assert "error" in result
+        flagged = {c["ref"]: c["overlapping_with"] for c in result["collisions"]}
+        assert flagged["R1"] == ["R3"]
+        assert flagged["R3"] == ["R1"]
+        data = load_pcb(sides_board_copy)
+        assert get_fp_at(find_footprint(data, "R1"))[0] == pytest.approx(10.0)
+
+    def test_nearest_free_position_ignores_opposite_side(self, sides_board_copy):
+        from kcaa.tools.pcb_placement_helpers import find_nearest_free_position
+
+        data = load_pcb(sides_board_copy)
+        # R2 is on B.Cu; R1 (F.Cu) sits exactly on the target but must not
+        # push the search away.
+        assert find_nearest_free_position(data, "R2", 10.0, 10.0, 0.0) == (
+            pytest.approx(10.16),
+            pytest.approx(10.16),
+        )
+
+    def test_nearest_free_position_still_blocked_by_unknown_side(self, sides_board_copy):
+        from kcaa.tools.pcb_placement_helpers import find_nearest_free_position
+
+        data = load_pcb(sides_board_copy)
+        # R5 has no layer node; the conservative rule keeps it blocking R1.
+        free = find_nearest_free_position(data, "R1", 20.0, 10.0, 0.0)
+        assert free is not None
+        x, y = free
+        assert not (x - 1.0 < 21.0 and x + 1.0 > 19.0 and y - 0.5 < 10.5 and y + 0.5 > 9.5)
+
+    def test_unknown_layer_still_collides(self, tools, sides_board_copy, monkeypatch):
+        import kcaa.tools.pcb_placement_tools as placement_tools
+
+        monkeypatch.setattr(placement_tools, "find_nearest_free_position", lambda *a, **k: None)
+        result = _run(
+            tools["set_footprint_position"](
+                pcb_path=sides_board_copy,
+                items=[{"reference": "R1", "x": 20.0, "y": 10.0, "rotation": None}],
+                ctx=None,
+            )
+        )
+        assert result["failure_count"] == 1
+        entry = result["results"][0]
+        assert "error" in entry
+        assert entry["proposed_position_overlaps"] == ["R5"]
+
+    def test_find_free_pcb_area_ignores_opposite_side(self, helper_tools, sides_board_copy):
+        result = _run(
+            helper_tools["find_free_pcb_area"](
+                pcb_path=sides_board_copy,
+                footprint_ref="R2",
+                prefer_near_ref="R1",
+                margin=0.0,
+                max_candidates=5,
+                ctx=None,
+            )
+        )
+        assert "candidates" in result, result
+        first = result["candidates"][0]
+        assert first["x"] == pytest.approx(10.16)
+        assert first["y"] == pytest.approx(10.16)
+        # The candidate really does sit on top of R1 (opposite side).
+        assert first["x"] - 1.0 < 11.0 and first["x"] + 1.0 > 9.0
+        assert first["y"] - 0.5 < 10.5 and first["y"] + 0.5 > 9.5
+
+    def test_find_free_pcb_area_without_ref_blocks_both_sides(self, helper_tools, sides_board_copy):
+        result = _run(
+            helper_tools["find_free_pcb_area"](
+                pcb_path=sides_board_copy,
+                width=2.0,
+                height=1.0,
+                prefer_near_ref="R1",
+                margin=0.0,
+                max_candidates=200,
+                ctx=None,
+            )
+        )
+        assert result["candidates"], result
+        for cand in result["candidates"]:
+            overlaps_r1 = (
+                cand["x"] - 1.0 < 11.0
+                and cand["x"] + 1.0 > 9.0
+                and cand["y"] - 0.5 < 10.5
+                and cand["y"] + 0.5 > 9.5
+            )
+            assert not overlaps_r1, cand
