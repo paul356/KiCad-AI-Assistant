@@ -386,12 +386,18 @@ def test_status_dot_is_16px_ring_and_fill(panel_mod, rgb: tuple[int, int, int]) 
     draws = [event[1] for event in gc.events if event[0] == "draw"]
     assert draws == [(1, 1, 14, 14), (2, 2, 12, 12)]
 
-    ring = gc.pens[0].GetColour()
-    assert ring is not None
-    assert (ring.Red(), ring.Green(), ring.Blue()) == (214, 218, 224)
-    fill = gc.brushes[1].GetColour()
-    assert fill is not None
-    assert (fill.Red(), fill.Green(), fill.Blue()) == rgb
+    assert len(gc.pens) == 2
+    assert len(gc.brushes) == 2
+    ring_pen = gc.pens[0].GetColour()
+    fill_pen = gc.pens[1].GetColour()
+    ring_brush = gc.brushes[0].GetColour()
+    fill_brush = gc.brushes[1].GetColour()
+    for colour in (ring_pen, ring_brush):
+        assert colour is not None
+        assert (colour.Red(), colour.Green(), colour.Blue()) == (214, 218, 224)
+    for colour in (fill_pen, fill_brush):
+        assert colour is not None
+        assert (colour.Red(), colour.Green(), colour.Blue()) == rgb
 
 
 def test_paperclip_arcs_fill_with_background_brush(panel_mod) -> None:
