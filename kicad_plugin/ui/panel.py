@@ -1579,12 +1579,13 @@ if _WX_AVAILABLE:
         def _make_status_dot_bitmap(
             rgb: tuple, size: int = 18, bg: wx.Colour | None = None
         ) -> wx.Bitmap:
-            """16 px status-coloured ball inside a 1 px light ring.
+            """16 px status-coloured ball inside a 1 px light ring on an 18 px bitmap.
 
-            On this branch the bitmap grows from 16 px to 18 px: the rendered
-            ball goes from 13 px to 16 px (path 12 -> 15 px, 1 px pen each
-            side) and the ring path from 14 px to 17 px, leaving 1 px visible.
-            The fill cannot exceed the outline, so the ring grows with the ball.
+            The fill path is 15 px; its 1 px centred stroke extends 0.5 px on
+            each side, rendering a 16 px ball. The ring path is 17 px, kept
+            1 px outside the fill path so the ball never covers the ring,
+            leaving 1 px visible. (Previously the bitmap was 16 px, the fill
+            path 12 px and the ring 14 px.)
             """
             bmp, mdc = AssistantPanel._new_icon_bitmap(size, bg)
             gc = wx.GraphicsContext.Create(mdc)
