@@ -1,0 +1,75 @@
+(kicad_pcb
+	(version 20260206)
+	(generator "pcbnew")
+	(generator_version "10.0")
+	(general
+		(thickness 1.6)
+		(legacy_teardrops no)
+	)
+	(paper "A4")
+	(layers
+		(0 "F.Cu" signal)
+		(31 "B.Cu" signal)
+		(36 "B.Courtyard" user)
+		(37 "F.Courtyard" user)
+		(44 "Edge.Cuts" user)
+	)
+
+	; R1 / R2 share the same XY courtyard but sit on opposite sides.
+	(footprint "Resistor_SMD:R_0603_1608Metric"
+		(layer "F.Cu")
+		(at 10.0 10.0 0.0)
+		(property "Reference" "R1")
+		(property "Value" "10k")
+		(fp_rect (start -1.0 -0.5) (end 1.0 0.5) (layer "F.Courtyard"))
+		(pad "1" smd rect (at -0.5 0.0) (size 0.5 0.5) (layers "F.Cu" "F.Paste" "F.Mask"))
+		(pad "2" smd rect (at 0.5 0.0) (size 0.5 0.5) (layers "F.Cu" "F.Paste" "F.Mask"))
+	)
+	(footprint "Resistor_SMD:R_0603_1608Metric"
+		(layer "B.Cu")
+		(at 10.0 10.0 0.0)
+		(property "Reference" "R2")
+		(property "Value" "22k")
+		(fp_rect (start -1.0 -0.5) (end 1.0 0.5) (layer "B.Courtyard"))
+		(pad "1" smd rect (at -0.5 0.0) (size 0.5 0.5) (layers "B.Cu" "B.Paste" "B.Mask"))
+		(pad "2" smd rect (at 0.5 0.0) (size 0.5 0.5) (layers "B.Cu" "B.Paste" "B.Mask"))
+	)
+
+	; R3 – same-side partner for R1, far from the R1/R2 pair.
+	(footprint "Resistor_SMD:R_0603_1608Metric"
+		(layer "F.Cu")
+		(at 30.0 10.0 0.0)
+		(property "Reference" "R3")
+		(property "Value" "47k")
+		(fp_rect (start -1.0 -0.5) (end 1.0 0.5) (layer "F.Courtyard"))
+		(pad "1" smd rect (at -0.5 0.0) (size 0.5 0.5) (layers "F.Cu" "F.Paste" "F.Mask"))
+		(pad "2" smd rect (at 0.5 0.0) (size 0.5 0.5) (layers "F.Cu" "F.Paste" "F.Mask"))
+	)
+
+	; R4 – B.Cu-only obstacle next to R1, so B-side blocking can be observed
+	; without relying on the coincident R2.
+	(footprint "Resistor_SMD:R_0603_1608Metric"
+		(layer "B.Cu")
+		(at 12.7 10.0 0.0)
+		(property "Reference" "R4")
+		(property "Value" "33k")
+		(fp_rect (start -1.0 -0.5) (end 1.0 0.5) (layer "B.Courtyard"))
+		(pad "1" smd rect (at -0.5 0.0) (size 0.5 0.5) (layers "B.Cu" "B.Paste" "B.Mask"))
+		(pad "2" smd rect (at 0.5 0.0) (size 0.5 0.5) (layers "B.Cu" "B.Paste" "B.Mask"))
+	)
+
+	; R5 – no layer node at all: the side is unknown and must stay conservative.
+	(footprint "Resistor_SMD:R_0603_1608Metric"
+		(at 20.0 10.0 0.0)
+		(property "Reference" "R5")
+		(property "Value" "1k")
+		(fp_rect (start -1.0 -0.5) (end 1.0 0.5) (layer "F.Courtyard"))
+		(pad "1" smd rect (at -0.5 0.0) (size 0.5 0.5) (layers "F.Cu" "F.Paste" "F.Mask"))
+		(pad "2" smd rect (at 0.5 0.0) (size 0.5 0.5) (layers "F.Cu" "F.Paste" "F.Mask"))
+	)
+
+	(gr_line (start 0.0 0.0) (end 60.0 0.0) (stroke (width 0.05) (type solid)) (layer "Edge.Cuts"))
+	(gr_line (start 60.0 0.0) (end 60.0 40.0) (stroke (width 0.05) (type solid)) (layer "Edge.Cuts"))
+	(gr_line (start 60.0 40.0) (end 0.0 40.0) (stroke (width 0.05) (type solid)) (layer "Edge.Cuts"))
+	(gr_line (start 0.0 40.0) (end 0.0 0.0) (stroke (width 0.05) (type solid)) (layer "Edge.Cuts"))
+)
