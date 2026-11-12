@@ -373,7 +373,7 @@ def test_jump_bitmaps_are_36x18_stroke_only(panel_mod) -> None:
         colour = pen.GetColour()
         assert colour is not None
         assert (colour.Red(), colour.Green(), colour.Blue()) == (91, 100, 112)
-        assert any(event[0] == "stroke" for event in gc.events)
+        assert [event[0] for event in gc.events] == ["pen", "stroke"]
 
 
 @pytest.mark.parametrize("rgb", [(140, 140, 140), (0, 140, 0)])
