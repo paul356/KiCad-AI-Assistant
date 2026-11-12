@@ -446,6 +446,57 @@ def _add_mirrored_unit2_placement(schematic: Path) -> None:
     schematic.write_text(sexpdata.dumps(tree), encoding="utf-8")
 
 
+def _renumber_all_at(
+    path: Path,
+    symbol_name: str,
+    old: str,
+    new: str,
+    x: float,
+    y: float,
+) -> None:
+    """Renumber every occurrence of *old* at ``(x, y)``."""
+    tree = _load_library(path)
+    changed = 0
+    for pin in _pins(_library_symbol(tree, symbol_name)):
+        at = _child(pin, "at")
+        if (
+            str(_child(pin, "number")[1]) == old
+            and float(at[1]) == float(x)
+            and float(at[2]) == float(y)
+        ):
+            _child(pin, "number")[1] = new
+            changed += 1
+    assert changed
+    _save_library(path, tree)
+
+
+def _add_placement_pin_key(
+    schematic: Path,
+    reference: str,
+    number: str,
+    uuid_value: str,
+) -> None:
+    tree = sexpdata.loads(schematic.read_text(encoding="utf-8"))
+    for node in tree[1:]:
+        if _keyword(node) != "symbol":
+            continue
+        properties = {
+            str(prop[1]): str(prop[2]) for prop in node[2:] if _keyword(prop) == "property"
+        }
+        if properties.get("Reference") != reference:
+            continue
+        if any(_keyword(child) == "pin" and str(child[1]) == number for child in node[2:]):
+            return
+        insert_at = next(
+            (i for i, child in enumerate(node) if _keyword(child) == "instances"),
+            len(node),
+        )
+        node.insert(insert_at, [Symbol("pin"), number, [Symbol("uuid"), uuid_value]])
+        schematic.write_text(sexpdata.dumps(tree), encoding="utf-8")
+        return
+    raise AssertionError(f"placement {reference!r} not found")
+
+
 def _raw_cache(sch) -> dict[str, list]:
     from kcaa.tools.symbol_edit_tools import _extract_cached_raw_entries
 
@@ -572,7 +623,11 @@ def test_cross_unit_renumber_does_not_touch_other_units(refresh_env):
         {"old_number": "1", "new_number": "9", "name": "ALT", "unit": 2, "style": 1}
     ]
     assert result["placements_updated"] == 0
-    assert any("no placement uses that unit" in warning for warning in result["warnings"])
+    assert any(
+        "pin renumbering for unit 2, style 1 was not applied: "
+        "no placement uses that unit/style and no pin keys needed rewriting" in warning
+        for warning in result["warnings"]
+    )
     placements = _placement_snapshot(refresh_env.schematic)
     assert [entry["pins"] for entry in placements[:2]] == [
         [
@@ -584,6 +639,117 @@ def test_cross_unit_renumber_does_not_touch_other_units(refresh_env):
             ("2", "2b3c4d5e-6f70-4819-0a1b-2c3d4e5f6b77"),
         ],
     ]
+
+
+def test_unit0_renumber_does_not_rewrite_other_scopes(refresh_env):
+    # Pin "1" exists in unit 0 and unit 1; only the unit-0 copy is renumbered.
+    _add_library_pin(refresh_env.library, "MYOP", 0, 1, "1", "COMMON", 0.0, 0.0, 0)
+    _add_cached_pin(refresh_env.schematic, LIB_ID, 0, 1, "1", "COMMON", 0.0, 0.0, 0)
+    _renumber_pin_at(refresh_env.library, "MYOP", "1", "9", 0.0, 0.0)
+    before = _placement_snapshot(refresh_env.schematic)
+
+    result = _run(refresh_env)
+
+    assert result["changed"] is True
+    assert result["renumber_ambiguous"] is True
+    assert result["placements_updated"] == 0
+    assert any("conflicting renumber targets" in w for w in result["warnings"])
+    assert _placement_snapshot(refresh_env.schematic) == before
+
+
+def test_unit0_renumber_applies_when_no_other_scope_shares_number(refresh_env):
+    _add_library_pin(refresh_env.library, "MYOP", 0, 1, "5", "COMMON", 0.0, 0.0, 0)
+    _add_cached_pin(refresh_env.schematic, LIB_ID, 0, 1, "5", "COMMON", 0.0, 0.0, 0)
+    _add_placement_pin_key(refresh_env.schematic, "U1", "5", "ee000000-0000-4000-8000-000000000001")
+    _add_placement_pin_key(refresh_env.schematic, "U2", "5", "ee000000-0000-4000-8000-000000000002")
+    _renumber_pin_at(refresh_env.library, "MYOP", "5", "9", 0.0, 0.0)
+
+    result = _run(refresh_env)
+
+    assert result["changed"] is True
+    assert result["renumber_ambiguous"] is False
+    assert result["placements_updated"] == 2
+    assert result["pins_renumbered"] == [
+        {"old_number": "5", "new_number": "9", "name": "COMMON", "unit": 0, "style": 1}
+    ]
+    placements = _placement_snapshot(refresh_env.schematic)
+    assert placements[0]["pins"] == [
+        ("1", "a0b1c2d3-e4f5-4607-8899-aabbccddee01"),
+        ("2", "e3c9a2b7-8d4f-4e3a-9b6c-2f0a1d5b8e44"),
+        ("9", "ee000000-0000-4000-8000-000000000001"),
+    ]
+    assert placements[1]["pins"][-1] == ("9", "ee000000-0000-4000-8000-000000000002")
+
+
+def test_stacked_rename_shadowed_by_number_key_is_reported(refresh_env):
+    _add_library_pin(refresh_env.library, "MYOP", 1, 1, "1", "STACK", -7.62, 0.0, 0)
+    _add_cached_pin(refresh_env.schematic, LIB_ID, 1, 1, "1", "STACK", -7.62, 0.0, 0)
+    _rename_pin(refresh_env.library, "MYOP", "1", "ANODE")
+    before = _placement_snapshot(refresh_env.schematic)
+
+    result = _run(refresh_env)
+
+    assert result["changed"] is True
+    assert result["backup_path"] is not None
+    assert result["pins_added"] == []
+    assert result["pins_removed"] == []
+    assert result["pins_renamed"] == []
+    assert result["pins_moved"] == []
+    assert result["pins_modified"] == []
+    assert len(result["pins_unclassified"]) == 2
+    assert {entry["old"]["name"] for entry in result["pins_unclassified"] if entry["old"]} == {"IN"}
+    assert {entry["new"]["name"] for entry in result["pins_unclassified"] if entry["new"]} == {
+        "ANODE"
+    }
+    assert _placement_snapshot(refresh_env.schematic) == before
+    sch = safe_schematic(str(refresh_env.schematic))
+    names = [
+        str(_child(pin, "name")[1])
+        for pin in _pins(_cache_entry(sch, LIB_ID))
+        if str(_child(pin, "number")[1]) == "1"
+    ]
+    assert names == ["ANODE", "STACK"]
+
+
+def test_fully_renumbered_stacked_pins_rewrite_keys(refresh_env):
+    _add_library_pin(refresh_env.library, "MYOP", 1, 1, "1", "STACK", -7.62, 0.0, 0)
+    _add_cached_pin(refresh_env.schematic, LIB_ID, 1, 1, "1", "STACK", -7.62, 0.0, 0)
+    _renumber_all_at(refresh_env.library, "MYOP", "1", "9", -7.62, 0.0)
+
+    result = _run(refresh_env)
+
+    assert result["changed"] is True
+    assert result["renumber_ambiguous"] is False
+    assert result["placements_updated"] == 2
+    assert result["pins_renumbered"] == [
+        {"old_number": "1", "new_number": "9", "name": "IN", "unit": 1, "style": 1}
+    ]
+    placements = _placement_snapshot(refresh_env.schematic)
+    assert placements[0]["pins"] == [
+        ("9", "a0b1c2d3-e4f5-4607-8899-aabbccddee01"),
+        ("2", "e3c9a2b7-8d4f-4e3a-9b6c-2f0a1d5b8e44"),
+    ]
+    assert placements[1]["pins"] == [
+        ("9", "1a2b3c4d-5e6f-4708-9a0b-1c2d3e4f5a66"),
+        ("2", "2b3c4d5e-6f70-4819-0a1b-2c3d4e5f6b77"),
+    ]
+    assert not any("was removed from the library" in w for w in result["warnings"])
+
+
+def test_partially_renumbered_stacked_pins_are_refused(refresh_env):
+    _add_library_pin(refresh_env.library, "MYOP", 1, 1, "1", "STACK", -7.62, 0.0, 0)
+    _add_cached_pin(refresh_env.schematic, LIB_ID, 1, 1, "1", "STACK", -7.62, 0.0, 0)
+    _renumber_pin_at(refresh_env.library, "MYOP", "1", "9", -7.62, 0.0)
+    before = _placement_snapshot(refresh_env.schematic)
+
+    result = _run(refresh_env)
+
+    assert result["changed"] is True
+    assert result["renumber_ambiguous"] is True
+    assert result["placements_updated"] == 0
+    assert result["pins_renumbered"] == []
+    assert any("could not infer a unique pin renumbering" in w for w in result["warnings"])
+    assert _placement_snapshot(refresh_env.schematic) == before
 
 
 def test_renumber_target_colliding_with_retained_pin_is_rejected(refresh_env):
@@ -598,7 +764,20 @@ def test_renumber_target_colliding_with_retained_pin_is_rejected(refresh_env):
     assert result["renumber_ambiguous"] is True
     assert result["placements_updated"] == 0
     assert result["pins_renumbered"] == []
-    assert any("could not infer a unique pin renumbering" in w for w in result["warnings"])
+    assert (
+        "could not infer a unique pin renumbering mapping; "
+        "placement pin keys were left unchanged" in result["warnings"]
+    )
+    assert any(
+        "pin number '1'" in warning
+        and "may have been renumbered and the mapping was rejected" in warning
+        for warning in result["warnings"]
+    )
+    assert not any(
+        "pin '1'" in warning and "was removed from the library" in warning
+        for warning in result["warnings"]
+    )
+    assert not any("moved from" in warning for warning in result["warnings"])
     assert _placement_snapshot(refresh_env.schematic) == before
 
 
@@ -647,6 +826,9 @@ def test_duplicate_number_renumber_is_rejected(refresh_env):
     assert result["renumber_ambiguous"] is True
     assert result["placements_updated"] == 0
     assert result["pins_renumbered"] == []
+    assert result["warnings"] == [
+        "could not infer a unique pin renumbering mapping; placement pin keys were left unchanged"
+    ]
     assert _placement_snapshot(refresh_env.schematic) == before
 
 
@@ -820,6 +1002,7 @@ def test_dry_run_preview_matches_the_real_run(refresh_env):
         "pins_renumbered",
         "pins_moved",
         "pins_modified",
+        "pins_unclassified",
         "properties_added",
         "properties_removed",
         "properties_changed",
