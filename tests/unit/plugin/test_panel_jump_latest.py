@@ -118,6 +118,7 @@ def test_jump_buttons_share_a_row_above_send() -> None:
     source = _source(build_ui)
     assert "jump_row = wx.BoxSizer(wx.HORIZONTAL)" in source
     assert "jump_row.Add(self._jump_latest_btn, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 6)" in source
+    assert "side_vbox.Add(jump_row, 0, wx.ALIGN_CENTER_HORIZONTAL | wx.BOTTOM, 4)" in source
     side_children = _sizer_order(build_ui, "side_vbox")
     assert "_status_dot" not in side_children
     assert "_jump_top_btn" not in side_children
@@ -198,14 +199,14 @@ def test_jump_bitmap_draws_distinct_chevrons() -> None:
 def test_send_and_stop_use_the_same_36px_chip() -> None:
     send = _source(_function("_make_send_bitmap"))
     stop = _source(_function("_make_stop_bitmap"))
+    chip = "AddRoundedRectangle(0.5, 0.5, size - 1, size - 1, 8)"
     for source in (send, stop):
         assert "size: int = 36" in source
-        assert "AddRoundedRectangle" in source
-        assert "wx.Pen(" in source
+        assert chip in source
+    assert "gc.SetPen(wx.Pen(wx.Colour(28, 76, 184), 1))" in send
+    assert "gc.SetPen(wx.Pen(wx.Colour(185, 56, 56), 1))" in stop
     assert "wx.Colour(34, 85, 204)" in send
-    assert "wx.Colour(28, 76, 184)" in send
     assert "wx.Colour(220, 70, 70)" in stop
-    assert "wx.Colour(185, 56, 56)" in stop
 
 
 def test_status_dot_is_ten_pixels_with_a_ring() -> None:
