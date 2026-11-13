@@ -3,6 +3,7 @@ Unit tests for kcaa/tools/pcb_query_tools.py
 """
 
 import asyncio
+import json
 import os
 import re
 import shutil
@@ -13,6 +14,8 @@ FIXTURE_DIR = os.path.join(os.path.dirname(__file__), "fixtures")
 BOARD_FIXTURE = os.path.join(FIXTURE_DIR, "test_board.kicad_pcb")
 BOARD_WITH_OUTLINE_FIXTURE = os.path.join(FIXTURE_DIR, "test_board_with_outline.kicad_pcb")
 BOARD_WITH_ZONES_FIXTURE = os.path.join(FIXTURE_DIR, "test_board_with_zones.kicad_pcb")
+BOARD_FOUR_LAYERS_FIXTURE = os.path.join(FIXTURE_DIR, "test_board_four_layers.kicad_pcb")
+BOARD_MIXED_LAYERS_FIXTURE = os.path.join(FIXTURE_DIR, "test_board_mixed_layers.kicad_pcb")
 
 
 # ── Segment/via snippets to append to a board file ──────────────────────
@@ -179,6 +182,56 @@ class TestGetBoardInfo:
         layer_names = [l["name"] for l in result["all_layers"]]
         assert "F.Cu" in layer_names
         assert "B.Cu" in layer_names
+
+    def test_four_layer_board_counts_copper_layers(self, tools):
+        result = _run(tools["get_board_info"](pcb_path=BOARD_FOUR_LAYERS_FIXTURE, ctx=None))
+        assert result["thickness_mm"] == pytest.approx(0.8)
+        assert result["copper_layer_count"] == 4
+        assert [layer["id"] for layer in result["all_layers"]] == [0, 31, 1, 2]
+        assert [layer["name"] for layer in result["all_layers"]] == [
+            "F.Cu",
+            "B.Cu",
+            "In1.Cu",
+            "In2.Cu",
+        ]
+        for layer in result["all_layers"]:
+            assert type(layer["type"]) is str
+            assert layer["type"] == "signal"
+        assert result["generator"] == "pcbnew"
+        assert result["generator_version"] == "10.0"
+
+    def test_board_info_json_roundtrip_has_no_symbols(self, tools):
+        result = _run(tools["get_board_info"](pcb_path=BOARD_FOUR_LAYERS_FIXTURE, ctx=None))
+        dumped = json.dumps(result)
+        assert json.loads(dumped) == result
+        assert json.loads(dumped)["all_layers"] == [
+            {"id": 0, "name": "F.Cu", "type": "signal"},
+            {"id": 31, "name": "B.Cu", "type": "signal"},
+            {"id": 1, "name": "In1.Cu", "type": "signal"},
+            {"id": 2, "name": "In2.Cu", "type": "signal"},
+        ]
+
+    def test_mixed_layer_board_counts_only_copper_layers(self, tools):
+        result = _run(tools["get_board_info"](pcb_path=BOARD_MIXED_LAYERS_FIXTURE, ctx=None))
+        assert result["copper_layer_count"] == 4
+        assert [layer["name"] for layer in result["all_layers"]] == [
+            "F.Cu",
+            "B.Cu",
+            "In1.Cu",
+            "In2.Cu",
+            "B.SilkS",
+            "F.SilkS",
+        ]
+        assert [layer["type"] for layer in result["all_layers"]] == [
+            "signal",
+            "power",
+            "mixed",
+            "signal",
+            "user",
+            "user",
+        ]
+        for layer in result["all_layers"]:
+            assert type(layer["type"]) is str
 
     def test_raises_on_missing_file(self, tools):
         with pytest.raises((FileNotFoundError, ValueError, Exception)):
