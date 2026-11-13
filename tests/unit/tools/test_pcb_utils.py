@@ -20,8 +20,10 @@ from kcaa.utils.pcb_footprint_utils import (
     get_fp_at,
     get_fp_layer,
     get_fp_property,
+    normalize_footprint_for_library,
     set_fp_at,
     set_fp_property,
+    split_footprint_header,
     upsert_fp_property,
 )
 from kcaa.utils.pcb_sexp_utils import _serialize, load_pcb, save_pcb
@@ -421,3 +423,61 @@ class TestLayerFlipMap:
     def test_all_entries_are_symmetric(self):
         for src, dst in LAYER_FLIP_MAP.items():
             assert LAYER_FLIP_MAP.get(dst) == src, f"{src} -> {dst} has no reverse mapping"
+
+
+# ---------------------------------------------------------------------------
+# Unquoted S-expression atoms (sexpdata.Symbol)
+# ---------------------------------------------------------------------------
+
+
+def _unquoted_footprint() -> list:
+    s = sexpdata.Symbol
+    return [
+        s("footprint"),
+        s("Lib:Part"),
+        [s("layer"), s("F.Cu")],
+        [s("at"), 0.0, 0.0, 0.0],
+        [s("property"), s("Reference"), s("R1")],
+        [s("property"), s("Value"), s("10k")],
+    ]
+
+
+class TestUnquotedAtoms:
+    """Unquoted tokens parse as ``sexpdata.Symbol``; lookups must still match
+    the plain-string literals callers compare against."""
+
+    def test_find_footprint_matches_unquoted_reference(self):
+        fp = _unquoted_footprint()
+        assert find_footprint([fp], "R1") is fp
+
+    def test_get_fp_property_normalizes_name_and_value(self):
+        fp = _unquoted_footprint()
+        assert get_fp_property(fp, "Reference") == "R1"
+        assert get_fp_property(fp, "Value") == "10k"
+
+    def test_set_fp_property_matches_unquoted_name(self):
+        fp = _unquoted_footprint()
+        assert set_fp_property(fp, "Reference", "R2") is True
+        assert get_fp_property(fp, "Reference") == "R2"
+
+    def test_get_fp_layer_returns_plain_string(self):
+        assert get_fp_layer(_unquoted_footprint()) == "F.Cu"
+
+    def test_flip_fp_layers_recognizes_unquoted_layer(self):
+        fp = _unquoted_footprint()
+        flip_fp_layers(fp)
+        assert get_fp_layer(fp) == "B.Cu"
+
+    def test_split_footprint_header_normalizes_bare_name(self):
+        fp = _unquoted_footprint()
+        fp[1] = sexpdata.Symbol("Bare")
+        assert split_footprint_header(fp) == (None, "Bare")
+        # Absent and non-token headers stay empty rather than leaking the node.
+        assert split_footprint_header([sexpdata.Symbol("footprint")]) == (None, "")
+        assert split_footprint_header([sexpdata.Symbol("footprint"), ["nested"]]) == (None, "")
+
+    def test_normalize_converts_unquoted_reference_property(self):
+        result = normalize_footprint_for_library(_unquoted_footprint(), 20260206, "Lib")
+        children = [c for c in result if isinstance(c, list) and len(c) > 1]
+        assert not any(str(c[0]) == "property" and str(c[1]) == "Reference" for c in children)
+        assert any(str(c[0]) == "fp_text" and str(c[1]) == "reference" for c in children)

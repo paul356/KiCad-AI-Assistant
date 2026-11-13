@@ -1497,3 +1497,47 @@ class TestFootprintIndexManagerRemoveLibrary:
     def test_remove_missing_returns_false(self, tmp_path):
         mgr = FootprintIndexManager(db_path=str(tmp_path / "fp.db"))
         assert mgr.remove_library("NoSuchLib") is False
+
+
+# ---------------------------------------------------------------------------
+# Unquoted atoms in library files (sexpdata.Symbol)
+# ---------------------------------------------------------------------------
+
+
+class TestUnquotedAtoms:
+    """Unquoted table/module tokens parse as ``sexpdata.Symbol`` and must be
+    normalized to plain strings in the returned dicts."""
+
+    def test_fp_lib_table_unquoted_values_are_plain_strings(self, tmp_path):
+        table = tmp_path / "fp-lib-table"
+        table.write_text(
+            "(fp_lib_table\n"
+            "  (version 7)\n"
+            '  (lib (name Bare) (type KiCad) (uri /tmp/Bare.pretty) (options "") (descr desc))\n'
+            ")\n",
+            encoding="utf-8",
+        )
+        entry = parse_fp_lib_table(str(table))[0]
+        assert entry["nickname"] == "Bare"
+        assert entry["type"] == "KiCad"
+        assert entry["raw_uri"] == "/tmp/Bare.pretty"
+
+    def test_parse_kicad_mod_unquoted_values_are_plain_strings(self, tmp_path):
+        mod = tmp_path / "Bare.kicad_mod"
+        mod.write_text(
+            "(footprint Bare\n"
+            "  (layer F.Cu)\n"
+            "  (descr Desc)\n"
+            "  (tags TagA)\n"
+            "  (pad 1 smd rect (at 0 0) (layers F.Cu))\n"
+            ")\n",
+            encoding="utf-8",
+        )
+        info = parse_kicad_mod(str(mod))
+        assert info["description"] == "Desc"
+        assert info["tags"] == "TagA"
+        assert info["layer"] == "F.Cu"
+        assert info["pads"][0]["number"] == "1"
+        assert info["pads"][0]["type"] == "smd"
+        assert info["pads"][0]["shape"] == "rect"
+        assert info["pads"][0]["layer"] == "F.Cu"

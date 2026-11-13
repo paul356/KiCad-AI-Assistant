@@ -6,6 +6,7 @@ import math
 import os
 
 import pytest
+import sexpdata
 
 from kcaa.utils.pcb_board_utils import (
     add_gr_arc,
@@ -513,3 +514,49 @@ class TestGetFpEdgeCutsItems:
         ]
         item = get_fp_edge_cuts_items(fp)[0]
         assert item["width"] == pytest.approx(0.07)
+
+
+# ---------------------------------------------------------------------------
+# Unquoted layer tokens (sexpdata.Symbol)
+# ---------------------------------------------------------------------------
+
+
+class TestUnquotedLayerTokens:
+    """Unquoted layer names parse as ``sexpdata.Symbol`` and must still match
+    the plain-string layer constants."""
+
+    def test_get_layer_returns_plain_string(self):
+        from kcaa.utils.pcb_board_utils import _get_layer
+
+        node = [
+            sexpdata.Symbol("gr_line"),
+            [sexpdata.Symbol("layer"), sexpdata.Symbol("Edge.Cuts")],
+        ]
+        assert _get_layer(node) == "Edge.Cuts"
+
+    def test_courtyard_layer_filter_accepts_unquoted_name(self):
+        s = sexpdata.Symbol
+        fp = [
+            s("footprint"),
+            "TestLib:R",
+            [s("at"), 0.0, 0.0, 0.0],
+            [s("layer"), s("F.Cu")],
+            [
+                s("fp_line"),
+                [s("start"), -1.0, -1.0],
+                [s("end"), 1.0, 1.0],
+                [s("layer"), s("F.Courtyard")],
+                [s("width"), 0.05],
+            ],
+            [
+                s("fp_line"),
+                [s("start"), -5.0, -5.0],
+                [s("end"), 5.0, 5.0],
+                [s("layer"), s("F.Fab")],
+                [s("width"), 0.05],
+            ],
+        ]
+        bbox = get_fp_courtyard_bbox(fp, 0.0, 0.0, 0.0)
+        assert bbox is not None
+        assert bbox["width"] == pytest.approx(2.0)
+        assert bbox["height"] == pytest.approx(2.0)

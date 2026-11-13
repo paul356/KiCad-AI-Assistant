@@ -146,7 +146,7 @@ def _parse_fp_lib_table_raw(table_path: str, env: dict[str, str]) -> list[dict[s
             if not (isinstance(sub, list) and len(sub) >= 2):
                 continue
             key = _sym(sub[0])
-            val = sub[1] if isinstance(sub[1], str) else _sym(sub[1])
+            val = _sym(sub[1])
             if key == "name":
                 entry["nickname"] = val
             elif key == "type":
@@ -299,11 +299,11 @@ def parse_kicad_mod(path: str) -> dict[str, Any]:
             continue
         key = _sym(item[0])
         if key == "descr":
-            result["description"] = item[1] if isinstance(item[1], str) else _sym(item[1])
+            result["description"] = _sym(item[1])
         elif key == "tags":
-            result["tags"] = item[1] if isinstance(item[1], str) else _sym(item[1])
+            result["tags"] = _sym(item[1])
         elif key == "layer":
-            result["layer"] = item[1] if isinstance(item[1], str) else _sym(item[1])
+            result["layer"] = _sym(item[1])
         elif key == "attr":
             # (attr smd) or (attr through_hole) — unquoted value is a Symbol
             result["attr"] = _sym(item[1])
@@ -335,9 +335,9 @@ def _parse_pad(pad_node: list[Any], sym: Any) -> dict[str, Any] | None:
     """Extract pad info from a pad S-expression node."""
     if len(pad_node) < 4:
         return None
-    pad_num = pad_node[1] if isinstance(pad_node[1], str) else sym(pad_node[1])
-    pad_type = pad_node[2] if isinstance(pad_node[2], str) else sym(pad_node[2])
-    pad_shape = pad_node[3] if isinstance(pad_node[3], str) else sym(pad_node[3])
+    pad_num = sym(pad_node[1])
+    pad_type = sym(pad_node[2])
+    pad_shape = sym(pad_node[3])
     x, y = 0.0, 0.0
     layer = ""
     for sub in pad_node:
@@ -352,7 +352,7 @@ def _parse_pad(pad_node: list[Any], sym: Any) -> dict[str, Any] | None:
             and len(sub) >= 2
             and sym(sub[0]) == "layer"
         ):
-            layer = sub[1] if isinstance(sub[1], str) else sym(sub[1])
+            layer = sym(sub[1])
     return {
         "number": str(pad_num),
         "type": str(pad_type),
@@ -367,7 +367,7 @@ def _is_courtyard(node: list[Any], sym: Any) -> bool:
     """Return True if node belongs to a courtyard layer."""
     for sub in node:
         if isinstance(sub, list) and len(sub) >= 2 and sym(sub[0]) == "layer":
-            layer = sub[1] if isinstance(sub[1], str) else sym(sub[1])
+            layer = sym(sub[1])
             return "Courtyard" in str(layer)
     return False
 

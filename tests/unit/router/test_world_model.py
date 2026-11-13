@@ -512,3 +512,66 @@ class TestRoutingFixture:
         m = build_world_model(self.FIXTURE, net_filter="VCC")
         tracks = [o for o in m.obstacles if o.kind == "track"]
         assert tracks == []
+
+
+# ---------------------------------------------------------------------------
+# Unquoted atoms (sexpdata.Symbol)
+# ---------------------------------------------------------------------------
+
+
+class TestUnquotedAtoms:
+    """Bare tokens parse as ``sexpdata.Symbol`` — a ``str`` subclass that
+    compares unequal to a plain string — and must be normalized."""
+
+    def test_wildcard_copper_layers_expand_to_all_copper(self, tmp_path):
+        s = sexpdata.Symbol
+        fp = [
+            s("footprint"),
+            "Test:Part",
+            [s("layer"), s("F.Cu")],
+            [s("at"), 1.0, 1.0, 0.0],
+            [s("property"), s("Reference"), s("R1")],
+            [
+                s("pad"),
+                s("1"),
+                s("smd"),
+                s("rect"),
+                [s("at"), 0.0, 0.0],
+                [s("size"), 0.5, 0.5],
+                [s("layers"), s("*.Cu"), s("*.Mask")],
+                [s("net"), s("VCC")],
+            ],
+        ]
+        m = build_world_model(_write_pcb(tmp_path, _make_pcb([fp])))
+        pads = [o for o in m.obstacles if o.kind == "pad"]
+        assert len(pads) == 1
+        assert pads[0].layers == frozenset({"F.Cu", "B.Cu", "In1.Cu", "In2.Cu", "In3.Cu", "In4.Cu"})
+        assert pads[0].net == "VCC"
+
+    def test_unquoted_net_name_matches_filter(self, tmp_path):
+        s = sexpdata.Symbol
+        seg = [
+            s("segment"),
+            [s("start"), 0.0, 0.0],
+            [s("end"), 10.0, 0.0],
+            [s("width"), 0.5],
+            [s("layer"), s("F.Cu")],
+            [s("net"), s("GND")],
+        ]
+        m = build_world_model(_write_pcb(tmp_path, _make_pcb(segments=[seg])), net_filter="GND")
+        assert m.obstacles == []
+
+    def test_unquoted_track_layer_normalized(self, tmp_path):
+        s = sexpdata.Symbol
+        seg = [
+            s("segment"),
+            [s("start"), 0.0, 0.0],
+            [s("end"), 10.0, 0.0],
+            [s("width"), 0.5],
+            [s("layer"), s("F.Cu")],
+            [s("net"), s("VCC")],
+        ]
+        m = build_world_model(_write_pcb(tmp_path, _make_pcb(segments=[seg])))
+        assert len(m.obstacles) == 1
+        assert m.obstacles[0].layers == frozenset({"F.Cu"})
+        assert m.obstacles[0].net == "VCC"
