@@ -3525,3 +3525,25 @@ def test_extract_cached_raw_entries_normalizes_bare_lib_id():
     entries = _extract_cached_raw_entries(sch)
     assert entries == [("Device:R", entry)]
     assert dict(entries).get("Device:R") is entry
+
+
+def test_extract_cached_raw_entries_wrapper_lookup_uses_normalized_id():
+    """The wrapper branch (``entry[0]`` is not a Symbol) resolves the raw
+    symbol through ``_libsyms_by_id``.  That dict is keyed by plain ``str``,
+    so the lookup must use the normalized id — a ``Symbol`` key never
+    matches and the cached symbol is silently lost."""
+    import sexpdata
+
+    from kcaa.tools.symbol_edit_tools import _extract_cached_raw_entries
+
+    raw = sexpdata.loads('(symbol Device:R (property "Reference" "U"))')
+    # entry[0] is not a Symbol -> wrapper branch (skip-loaded cache entry).
+    entry = ["wrapper", sexpdata.Symbol("Device:R")]
+    sch = SimpleNamespace(
+        lib_symbols=SimpleNamespace(
+            _pv=SimpleNamespace(_tree=[entry]),
+            _libsyms_by_id={"Device:R": raw},
+        )
+    )
+
+    assert _extract_cached_raw_entries(sch) == [("Device:R", raw)]

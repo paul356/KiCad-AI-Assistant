@@ -873,7 +873,11 @@ def _track_matches_segment(track: TrackObstacle, fields: dict, eps: float = 1e-6
             continue
         if abs(track.width - fields["width"]) > eps:
             continue
-        if fields["layer"] != track.layer:
+        # ``fields["layer"]`` is a plain str (``_segment_fields``), while
+        # ``track.layer`` may still be a raw sexpdata.Symbol from
+        # router/world_model._get_layer_str (owned by #287); normalize both
+        # for the same reason as the net below.
+        if str(fields["layer"]) != str(track.layer):
             continue
         # ``fields["net"]`` is a normalized plain str (``_get_net_name``),
         # while ``track.net`` may still be a raw sexpdata.Symbol from

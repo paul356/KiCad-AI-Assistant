@@ -1194,6 +1194,38 @@ def test_apply_shoved_tracks_collapses_repeated_original() -> None:
     assert len(vcc) == 1 and vcc[0]["start"] == (1.0, 1.0) and vcc[0]["end"] == (2.0, 1.0)
 
 
+def _bare_token_segment(start, end, layer, net):
+    """A ``(segment ...)`` node whose layer/net atoms may be raw Symbols."""
+    import sexpdata
+
+    return [
+        sexpdata.Symbol("segment"),
+        [sexpdata.Symbol("start"), *start],
+        [sexpdata.Symbol("end"), *end],
+        [sexpdata.Symbol("width"), 0.2],
+        [sexpdata.Symbol("layer"), layer],
+        [sexpdata.Symbol("net"), net],
+    ]
+
+
+def _assert_shoved_replaces_original(make_data, orig_layer, orig_net):
+    from kcaa.router.pns.shove import TrackObstacle
+    from kcaa.tools.pcb_routing_tools import _apply_shoved_tracks, _segment_fields
+
+    orig = TrackObstacle(points=((1.0, 1.0), (2.0, 1.0)), width=0.2, net=orig_net, layer=orig_layer)
+    displaced = TrackObstacle(
+        points=((1.0, 1.5), (2.0, 1.5)), width=0.2, net=orig_net, layer=orig_layer
+    )
+    data = [make_data()]
+
+    _apply_shoved_tracks(data, [(orig, displaced)])
+
+    fields = [f for f in (_segment_fields(n) for n in data) if f is not None]
+    assert len(fields) == 1, fields
+    assert fields[0]["start"] == (1.0, 1.5)
+    assert fields[0]["end"] == (2.0, 1.5)
+
+
 def test_apply_shoved_tracks_matches_bare_net_token() -> None:
     """An unquoted ``(net GND)`` parses to ``sexpdata.Symbol``.  The matched
     original segment must still be removed instead of being written next to
@@ -1206,31 +1238,29 @@ def test_apply_shoved_tracks_matches_bare_net_token() -> None:
     """
     import sexpdata
 
-    from kcaa.router.pns.shove import TrackObstacle
-    from kcaa.tools.pcb_routing_tools import _apply_shoved_tracks, _segment_fields
+    _assert_shoved_replaces_original(
+        lambda: _bare_token_segment((1, 1), (2, 1), "F.Cu", sexpdata.Symbol("GND")),
+        orig_layer="F.Cu",
+        orig_net=sexpdata.Symbol("GND"),
+    )
 
-    def bare_token_segment(x1, y1, x2, y2):
-        return [
-            sexpdata.Symbol("segment"),
-            [sexpdata.Symbol("start"), x1, y1],
-            [sexpdata.Symbol("end"), x2, y2],
-            [sexpdata.Symbol("width"), 0.2],
-            [sexpdata.Symbol("layer"), "F.Cu"],
-            [sexpdata.Symbol("net"), sexpdata.Symbol("GND")],  # unquoted token
-        ]
 
-    data = [bare_token_segment(1, 1, 2, 1)]
-    # What router/world_model._get_net yields for the bare token today.
-    net = sexpdata.Symbol("GND")
-    orig = TrackObstacle(points=((1.0, 1.0), (2.0, 1.0)), width=0.2, net=net, layer="F.Cu")
-    displaced = TrackObstacle(points=((1.0, 1.5), (2.0, 1.5)), width=0.2, net=net, layer="F.Cu")
+def test_apply_shoved_tracks_matches_bare_layer_token() -> None:
+    """An unquoted ``(layer F.Cu)`` parses to ``sexpdata.Symbol``.  The
+    original must still be matched and removed; ``track.layer`` carries the
+    raw Symbol from ``router/world_model._get_layer_str`` today (owned by
+    #287), so both sides are normalized.
 
-    _apply_shoved_tracks(data, [(orig, displaced)])
+    NOTE: like the net case, this stops discriminating once #287 normalizes
+    ``_get_layer_str`` — the comparison remains correct either way.
+    """
+    import sexpdata
 
-    fields = [f for f in (_segment_fields(n) for n in data) if f is not None]
-    assert len(fields) == 1, fields
-    assert fields[0]["start"] == (1.0, 1.5)
-    assert fields[0]["end"] == (2.0, 1.5)
+    _assert_shoved_replaces_original(
+        lambda: _bare_token_segment((1, 1), (2, 1), sexpdata.Symbol("F.Cu"), "GND"),
+        orig_layer=sexpdata.Symbol("F.Cu"),
+        orig_net="GND",
+    )
 
 
 class TestRouteRenderContextAccounting:
