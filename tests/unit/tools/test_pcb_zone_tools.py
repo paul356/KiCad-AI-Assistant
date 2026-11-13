@@ -344,3 +344,49 @@ class TestDeleteZone:
             _run(self.delete_zone(tmp_pcb, uuid, None))
         after = _run(self.list_zones(tmp_pcb, None))
         assert after["count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Unquoted zone tokens (sexpdata.Symbol)
+# ---------------------------------------------------------------------------
+
+
+class TestUnquotedAtoms:
+    """Unquoted tokens parse as ``sexpdata.Symbol``; parsed zones must carry
+    plain strings so response comparisons work."""
+
+    @staticmethod
+    def _write_board(tmp_path, zone_body: str) -> str:
+        board = tmp_path / "unquoted_zone.kicad_pcb"
+        board.write_text(
+            f"(kicad_pcb\n  (version 20260206)\n  (generator test)\n  (zone\n{zone_body}\n  )\n)\n",
+            encoding="utf-8",
+        )
+        return str(board)
+
+    def test_zone_text_tokens_are_plain_strings(self, tmp_path):
+        path = self._write_board(
+            tmp_path,
+            "    (net 0)\n"
+            "    (net_name GND)\n"
+            "    (layer F.Cu)\n"
+            "    (hatch edge 0.508)\n"
+            "    (fill no)\n"
+            "    (polygon (pts (xy 0 0) (xy 1 0) (xy 1 1)))",
+        )
+        zone = _run(_get_tools()["list_zones"](path, None))["zones"][0]
+        assert zone["layer"] == "F.Cu"
+        assert zone["net_name"] == "GND"
+        assert zone["hatch_style"] == "edge"
+        assert zone["fill"] is False
+
+    def test_zone_layers_list_is_plain_strings(self, tmp_path):
+        path = self._write_board(
+            tmp_path,
+            "    (net 0)\n"
+            "    (layers F.Cu In1.Cu)\n"
+            "    (fill yes)\n"
+            "    (polygon (pts (xy 0 0) (xy 1 0) (xy 1 1)))",
+        )
+        zone = _run(_get_tools()["list_zones"](path, None))["zones"][0]
+        assert zone["layer"] == ["F.Cu", "In1.Cu"]

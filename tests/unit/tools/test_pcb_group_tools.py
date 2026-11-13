@@ -22,14 +22,17 @@ import os
 import shutil
 
 import pytest
+import sexpdata
 
 from kcaa.tools.pcb_group_tools import _grid_layout, _rotate_layout
 from kcaa.tools.pcb_placement_helpers import (
     _GRID_MM,
     _bboxes_overlap,
+    _compute_group_hpwl,
     _compute_layout_hpwl,
     _find_group_board_position,
     _get_board_bounds_or_fallback,
+    _get_footprint_bbox_at,
     _get_fp_local_pads,
     _get_fp_pads_world,
 )
@@ -882,3 +885,70 @@ class TestRotateGroup:
         # Rotation should increment by 360° (wraps to same angle)
         expected_rot = (r1_rot_before + 360.0) % 360.0
         assert abs(r1_rot_after - expected_rot) < 0.01
+
+
+# ---------------------------------------------------------------------------
+# Unquoted placement tokens (sexpdata.Symbol)
+# ---------------------------------------------------------------------------
+
+
+def _unquoted_fp(
+    ref: str,
+    net_args: list,
+    x: float = 0.0,
+    y: float = 0.0,
+    courtyard: bool = False,
+) -> list:
+    s = sexpdata.Symbol
+    fp = [
+        s("footprint"),
+        s("Test:Part"),
+        [s("layer"), s("F.Cu")],
+        [s("at"), x, y, 0.0],
+        [s("property"), s("Reference"), s(ref)],
+        [
+            s("pad"),
+            s("1"),
+            s("smd"),
+            s("rect"),
+            [s("at"), 0.0, 0.0],
+            [s("size"), 0.5, 0.5],
+            [s("layers"), s("F.Cu")],
+            [s("net"), *net_args],
+        ],
+    ]
+    if courtyard:
+        fp.append(
+            [
+                s("fp_line"),
+                [s("start"), -1.0, -1.0],
+                [s("end"), 1.0, 1.0],
+                [s("layer"), "F.Courtyard"],
+                [s("width"), 0.05],
+            ]
+        )
+    return fp
+
+
+class TestUnquotedAtoms:
+    """Unquoted reference/net tokens must be normalized before lookups and
+    net grouping."""
+
+    def test_world_pads_normalize_unquoted_net(self):
+        pads = _get_fp_pads_world(_unquoted_fp("R1", [sexpdata.Symbol("GND")]))
+        assert pads[0]["net"] == "GND"
+
+    def test_local_pads_normalize_unquoted_net_id_form(self):
+        pads = _get_fp_local_pads(_unquoted_fp("R1", [1, sexpdata.Symbol("GND")]))
+        assert pads[0]["net"] == "GND"
+
+    def test_footprint_bbox_matches_unquoted_reference(self):
+        fp = _unquoted_fp("R1", [sexpdata.Symbol("GND")], courtyard=True)
+        assert _get_footprint_bbox_at([fp], "R1", 0.0, 0.0, 0.0) is not None
+
+    def test_group_hpwl_normalizes_unquoted_references_and_nets(self):
+        fps = [
+            _unquoted_fp("R1", [sexpdata.Symbol("GND")], x=0.0),
+            _unquoted_fp("R2", [sexpdata.Symbol("GND")], x=10.0),
+        ]
+        assert _compute_group_hpwl(fps, {"R1", "R2"}) > 0.0
