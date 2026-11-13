@@ -751,7 +751,9 @@ def _get_net_name(net_node: list) -> str | None:
         raw = net_node[1]
     else:
         return None
-    return raw if isinstance(raw, str) else str(raw)
+    # A bare net name (GND) parses to a sexpdata.Symbol, whose __eq__ is
+    # class-exact; return a plain str so name comparisons work.
+    return str(raw)
 
 
 def _segment_fields(node: list) -> dict | None:

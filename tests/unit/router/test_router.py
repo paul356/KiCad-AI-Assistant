@@ -22,6 +22,7 @@ import pytest
 
 from kcaa.router.path_postprocess import OutputSegment, OutputVia
 from kcaa.router.router import (
+    _ALL_COPPER,
     DesignRulesUnavailable,
     NetClassUnresolved,
     ProFileMalformed,
@@ -38,10 +39,14 @@ from kcaa.router.router import (
     _find_pad_center,
     _find_pad_rotation,
     _find_pad_size,
+    _get_pad_name,
     _layers_used,
+    _pad_layers,
+    _pcb_layer_names,
     _project_file_for,
     _replace_pad_path,
     _routing_layers,
+    _same_net_pad_polygons,
     auto_route_pair,
     connect_with_via,
 )
@@ -1308,6 +1313,72 @@ def test_find_footprint_returns_footprint_for_existing_ref():
     ]
     fake_pcb = [target, ["footprint", ["property", "Reference", "OTHER"]]]
     assert _find_footprint(fake_pcb, "R1") is target
+
+
+# ---------------------------------------------------------------------------
+# Bare-token (sexpdata.Symbol) normalization
+# ---------------------------------------------------------------------------
+
+# Unquoted tokens are the only way sexpdata produces a Symbol.  A Symbol
+# subclasses str but its __eq__ is class-exact, so every token read here must
+# be converted to a plain str before it is compared or returned.
+_BARE_TOKEN_BOARD = """(kicad_pcb
+  (version 20240108)
+  (layers (0 F.Cu signal) (31 B.Cu signal))
+  (footprint "R_0402_1005Metric" (layer F.Cu)
+    (property Reference R1 (at 0 0))
+    (pad MP smd rect (at 0 0) (size 1 1)
+      (layers *.Cu *.Mask) (net "GND"))
+  )
+)
+"""
+
+
+@pytest.fixture
+def bare_token_board(tmp_path):
+    path = tmp_path / "bare_tokens.kicad_pcb"
+    path.write_text(_BARE_TOKEN_BOARD)
+    return load_pcb(str(path))
+
+
+def _bare_footprint(data: list) -> list:
+    return next(n for n in data if isinstance(n, list) and str(n[0]) == "footprint")
+
+
+def _bare_pad(fp: list) -> list:
+    return next(n for n in fp if isinstance(n, list) and str(n[0]) == "pad")
+
+
+def test_pcb_layer_names_converts_bare_tokens(bare_token_board):
+    names = _pcb_layer_names(bare_token_board)
+    assert names == ["F.Cu", "B.Cu"]
+    assert all(type(name) is str for name in names)
+
+
+def test_pad_layers_expands_bare_star_cu(bare_token_board):
+    layers = _pad_layers(_bare_pad(_bare_footprint(bare_token_board)))
+    assert set(_ALL_COPPER) <= set(layers)
+    assert "*.Mask" in layers
+    assert all(type(name) is str for name in layers)
+
+
+def test_find_footprint_matches_bare_reference(bare_token_board):
+    assert _find_footprint(bare_token_board, "R1") is _bare_footprint(bare_token_board)
+
+
+def test_get_pad_name_returns_plain_str(bare_token_board):
+    name = _get_pad_name(_bare_pad(_bare_footprint(bare_token_board)))
+    assert name == "MP"
+    assert type(name) is str
+
+
+def test_same_net_pad_polygons_returns_plain_tokens(bare_token_board):
+    polygons = _same_net_pad_polygons(bare_token_board, "GND")
+    assert len(polygons) == 1
+    _poly, copper, ref, pad_name, _center = polygons[0]
+    assert ref == "R1" and type(ref) is str
+    assert pad_name == "MP" and type(pad_name) is str
+    assert "F.Cu" in copper
 
 
 # ---------------------------------------------------------------------------

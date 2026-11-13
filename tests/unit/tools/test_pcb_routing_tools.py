@@ -184,6 +184,30 @@ class TestSegmentFields:
         }
 
 
+class TestGetNetNameBareToken:
+    """A bare net name (``(net GND)``) parses to ``sexpdata.Symbol``, which
+    subclasses ``str`` but has a class-exact ``__eq__``.  ``_get_net_name``
+    must return the plain ``str`` it represents so name comparisons work."""
+
+    def test_numberless_bare_net_name_returns_plain_str(self):
+        import sexpdata
+
+        from kcaa.tools.pcb_routing_tools import _get_net_name
+
+        name = _get_net_name(sexpdata.loads("(net GND)"))
+        assert name == "GND"
+        assert type(name) is str
+
+    def test_numbered_bare_net_name_returns_plain_str(self):
+        import sexpdata
+
+        from kcaa.tools.pcb_routing_tools import _get_net_name
+
+        name = _get_net_name(sexpdata.loads("(net 1 GND)"))
+        assert name == "GND"
+        assert type(name) is str
+
+
 def _get_tools() -> dict:
     from kcaa.tools.pcb_routing_tools import register_pcb_routing_tools
 
