@@ -54,6 +54,19 @@ def bare_token_board(tmp_path: Path) -> str:
     return str(pcb)
 
 
+# An unquoted ``*.Cu`` in a via's layer list is a Symbol, not the literal
+# string the ``!= "*.Cu"`` filter compares against.
+_BARE_STAR_CU_BOARD = """(kicad_pcb
+  (version 20240108)
+  (generator "test")
+  (layers (0 "F.Cu" signal) (31 "B.Cu" signal))
+  (via (at 1 1) (size 0.8) (drill 0.4) (layers *.Cu))
+  (segment (start 1 1) (end 2 1) (width 0.2) (layer "F.Cu") (net 0))
+  (segment (start 1 2) (end 2 2) (width 0.2) (layer "B.Cu") (net 0))
+)
+"""
+
+
 @pytest.fixture
 def board_copy(tmp_path: Path) -> str:
     """Copy the routing fixture to a writable temp dir, keeping the .pro."""
@@ -307,6 +320,17 @@ def test_copper_layers_detected_from_board(board_copy: str) -> None:
     assert "F.Cu" in layers  # R1/C1/U1 SMD pads and the VCC track
     assert "In1.Cu" in layers  # D1 lives on the inner copper layer
     assert layers.index("F.Cu") < layers.index("In1.Cu")  # KiCad stack order
+
+
+def test_copper_layers_ignores_bare_star_cu(tmp_path: Path) -> None:
+    """An unquoted ``(layers *.Cu)`` on a via parses to a ``Symbol``; it must
+    be excluded like the quoted literal instead of entering the layer set."""
+    pcb = tmp_path / "bare_star_cu.kicad_pcb"
+    pcb.write_text(_BARE_STAR_CU_BOARD)
+    layers = vrf._copper_layers(vrf.load_pcb(str(pcb)))
+    assert layers == ["F.Cu", "B.Cu"]
+    assert "*.Cu" not in layers
+    assert all(type(lay) is str for lay in layers)
 
 
 def test_pad_copper_layers_expands_thru_holes() -> None:

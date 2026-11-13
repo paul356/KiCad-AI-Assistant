@@ -271,7 +271,7 @@ def _footprint_ref(fp: list) -> str | None:
             isinstance(sub, list)
             and len(sub) >= 3
             and _sym(sub[0]) == "property"
-            and sub[1] == "Reference"
+            and _sym(sub[1]) == "Reference"
         ):
             return str(sub[2])
     return None
