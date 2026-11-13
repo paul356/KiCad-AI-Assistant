@@ -273,7 +273,7 @@ def _footprint_ref(fp: list) -> str | None:
             and _sym(sub[0]) == "property"
             and sub[1] == "Reference"
         ):
-            return sub[2]
+            return str(sub[2])
     return None
 
 
@@ -322,7 +322,7 @@ def collect_nets(pcb_path: str) -> dict[str, list[tuple[str, str]]]:
                 continue
             if _sym(sub[0]) != "pad":
                 continue
-            pad_num = sub[1] if isinstance(sub[1], str) else str(sub[1])
+            pad_num = str(sub[1])
             net = _pad_net(sub)
             if net:
                 nets.setdefault(net, []).append((ref, pad_num))
@@ -452,7 +452,7 @@ def _pad_center(data: list, ref: str, pad_num: str) -> tuple[float, float] | Non
                 continue
             if _sym(sub[0]) != "pad":
                 continue
-            pnum = sub[1] if isinstance(sub[1], str) else str(sub[1])
+            pnum = str(sub[1])
             if pnum != pad_num:
                 continue
             geo = _pad_geometry(sub, (fp_at[0], fp_at[1]), fp_at[2])
@@ -710,8 +710,11 @@ def _copper_layers(data: list) -> list[str]:
             for sub in node:
                 if isinstance(sub, list) and len(sub) >= 2 and _sym(sub[0]) == "layers":
                     for v in sub[1:]:
-                        if isinstance(v, str) and v != "*.Cu" and v.endswith(".Cu"):
-                            found.add(v)
+                        if not isinstance(v, str):
+                            continue
+                        lay = _sym(v)
+                        if lay != "*.Cu" and lay.endswith(".Cu"):
+                            found.add(lay)
         elif head == "footprint":
             for sub in node:
                 if isinstance(sub, list) and len(sub) >= 2 and _sym(sub[0]) == "pad":

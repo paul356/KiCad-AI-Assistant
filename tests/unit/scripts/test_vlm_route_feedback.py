@@ -31,6 +31,28 @@ _FIXTURE_DIR = _REPO_ROOT / "tests" / "integration" / "fixtures"
 _BOARD_FIXTURE = _FIXTURE_DIR / "test_routing_board.kicad_pcb"
 _PRO_FIXTURE = _FIXTURE_DIR / "test_routing_board.kicad_pro"
 
+# Unquoted tokens are the only way sexpdata yields a Symbol.  Both the
+# Reference *value* and the pad number here parse to sexpdata.Symbol.
+_BARE_TOKEN_BOARD = """(kicad_pcb
+  (version 20240108)
+  (generator "test")
+  (layers (0 "F.Cu" signal) (31 "B.Cu" signal))
+  (net 1 "VCC")
+  (footprint "R_0402" (layer "F.Cu") (at 10 10)
+    (property "Reference" R1 (at 0 0))
+    (pad A1 thru_hole circle (at 0 0) (size 1 1)
+      (layers "F.Cu" "B.Cu") (net 1 "VCC"))
+  )
+)
+"""
+
+
+@pytest.fixture
+def bare_token_board(tmp_path: Path) -> str:
+    pcb = tmp_path / "bare_tokens.kicad_pcb"
+    pcb.write_text(_BARE_TOKEN_BOARD)
+    return str(pcb)
+
 
 @pytest.fixture
 def board_copy(tmp_path: Path) -> str:
@@ -123,6 +145,27 @@ def test_pad_center_world_coords(board_copy: str) -> None:
     assert c is not None
     assert abs(c[0] - 29.5) < 1e-6  # R1 at (30,30), pad 1 local (-0.5, 0)
     assert abs(c[1] - 30.0) < 1e-6
+
+
+def test_collect_nets_normalizes_bare_pad_number(bare_token_board: str) -> None:
+    """An unquoted ``(pad A1 ...)`` parses to a ``sexpdata.Symbol``; the net
+    map is annotated ``dict[str, list[tuple[str, str]]]``, so both the
+    reference and the pad number must be plain ``str``."""
+    nets = vrf.collect_nets(bare_token_board)
+    assert nets == {"VCC": [("R1", "A1")]}
+    ref, pad = nets["VCC"][0]
+    assert type(ref) is str
+    assert type(pad) is str
+
+
+def test_pad_center_matches_bare_pad_number(bare_token_board: str) -> None:
+    """The lookup pad number is a caller-supplied plain ``str``.  An unquoted
+    pad number in the file must still match and resolve to its world centre
+    (footprint at (10, 10), pad local (0, 0))."""
+    data = vrf.load_pcb(bare_token_board)
+    center = vrf._pad_center(data, "R1", "A1")
+    assert center is not None
+    assert center == pytest.approx((10.0, 10.0))
 
 
 # ---------------------------------------------------------------------------
