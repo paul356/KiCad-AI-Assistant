@@ -1194,6 +1194,45 @@ def test_apply_shoved_tracks_collapses_repeated_original() -> None:
     assert len(vcc) == 1 and vcc[0]["start"] == (1.0, 1.0) and vcc[0]["end"] == (2.0, 1.0)
 
 
+def test_apply_shoved_tracks_matches_bare_net_token() -> None:
+    """An unquoted ``(net GND)`` parses to ``sexpdata.Symbol``.  The matched
+    original segment must still be removed instead of being written next to
+    its displaced replacement.
+
+    NOTE: this only discriminates while ``router/world_model._get_net``
+    (owned by #287) still returns the raw Symbol for a bare token.  Both
+    sides of the comparison are normalized, so it stays correct after #287
+    lands — the test just stops detecting the asymmetry.
+    """
+    import sexpdata
+
+    from kcaa.router.pns.shove import TrackObstacle
+    from kcaa.tools.pcb_routing_tools import _apply_shoved_tracks, _segment_fields
+
+    def bare_token_segment(x1, y1, x2, y2):
+        return [
+            sexpdata.Symbol("segment"),
+            [sexpdata.Symbol("start"), x1, y1],
+            [sexpdata.Symbol("end"), x2, y2],
+            [sexpdata.Symbol("width"), 0.2],
+            [sexpdata.Symbol("layer"), "F.Cu"],
+            [sexpdata.Symbol("net"), sexpdata.Symbol("GND")],  # unquoted token
+        ]
+
+    data = [bare_token_segment(1, 1, 2, 1)]
+    # What router/world_model._get_net yields for the bare token today.
+    net = sexpdata.Symbol("GND")
+    orig = TrackObstacle(points=((1.0, 1.0), (2.0, 1.0)), width=0.2, net=net, layer="F.Cu")
+    displaced = TrackObstacle(points=((1.0, 1.5), (2.0, 1.5)), width=0.2, net=net, layer="F.Cu")
+
+    _apply_shoved_tracks(data, [(orig, displaced)])
+
+    fields = [f for f in (_segment_fields(n) for n in data) if f is not None]
+    assert len(fields) == 1, fields
+    assert fields[0]["start"] == (1.0, 1.5)
+    assert fields[0]["end"] == (2.0, 1.5)
+
+
 class TestRouteRenderContextAccounting:
     """Issue #170 direction 2: image token accounting + frame budget.
 

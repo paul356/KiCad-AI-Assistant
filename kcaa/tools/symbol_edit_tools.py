@@ -331,15 +331,19 @@ def _extract_cached_raw_entries(sch: Any) -> list[tuple[str, list]]:
     for entry in tree:
         if not (isinstance(entry, list) and len(entry) >= 2 and isinstance(entry[1], str)):
             continue
+        # sexpdata.Symbol subclasses str but compares class-exactly, and the
+        # id becomes a dict key (``cached_by_id.get(requested)``), so an
+        # unquoted ``(symbol Device:R ...)`` must be reduced to plain str.
+        entry_id = str(entry[1])
         # entry itself is the raw list when injected, or a LibSymbol wrapper
         # when loaded by skip — unwrap to the raw list.
         raw = (
             entry
             if isinstance(entry[0], sexpdata.Symbol)
-            else _cached_lib_symbol_raw(sch, entry[1])
+            else _cached_lib_symbol_raw(sch, entry_id)
         )
         if raw is not None:
-            entries.append((entry[1], raw))
+            entries.append((entry_id, raw))
     return entries
 
 

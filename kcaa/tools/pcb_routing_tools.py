@@ -875,7 +875,11 @@ def _track_matches_segment(track: TrackObstacle, fields: dict, eps: float = 1e-6
             continue
         if fields["layer"] != track.layer:
             continue
-        if track.net is not None and fields["net"] != track.net:
+        # ``fields["net"]`` is a normalized plain str (``_get_net_name``),
+        # while ``track.net`` may still be a raw sexpdata.Symbol from
+        # router/world_model._get_net (owned by #287); normalize both so an
+        # unquoted ``(net GND)`` matches and the original segment is removed.
+        if track.net is not None and str(fields["net"]) != str(track.net):
             continue
         return True
     return False

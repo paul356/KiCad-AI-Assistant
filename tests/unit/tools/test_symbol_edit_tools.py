@@ -17,6 +17,7 @@ import os
 from pathlib import Path
 import shutil
 import tempfile
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -3503,3 +3504,24 @@ class TestCheckReferenceConflicts:
             )
         )
         assert "error" in result
+
+
+# ---------------------------------------------------------------------------
+# Cached lib_symbols entry ids
+# ---------------------------------------------------------------------------
+
+
+def test_extract_cached_raw_entries_normalizes_bare_lib_id():
+    """An unquoted ``(symbol Device:R ...)`` parses its id to a
+    ``sexpdata.Symbol``.  The id is also used as a dict key, so it must be
+    stored as the plain ``str`` it represents."""
+    import sexpdata
+
+    from kcaa.tools.symbol_edit_tools import _extract_cached_raw_entries
+
+    entry = sexpdata.loads('(symbol Device:R (property "Reference" "U"))')
+    sch = SimpleNamespace(lib_symbols=SimpleNamespace(_pv=SimpleNamespace(_tree=[entry])))
+
+    entries = _extract_cached_raw_entries(sch)
+    assert entries == [("Device:R", entry)]
+    assert dict(entries).get("Device:R") is entry
