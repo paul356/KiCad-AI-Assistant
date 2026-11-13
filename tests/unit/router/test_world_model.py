@@ -9,6 +9,7 @@ import sexpdata
 
 from kcaa.router.world_model import (
     WorldModel,
+    _get_net,
     build_world_model,
 )
 
@@ -575,3 +576,24 @@ class TestUnquotedAtoms:
         assert len(m.obstacles) == 1
         assert m.obstacles[0].layers == frozenset({"F.Cu"})
         assert m.obstacles[0].net == "VCC"
+
+
+class TestGetNetNameMatrix:
+    """Pin the id/name discrimination in ``_get_net``.
+
+    A quoted name is a name even when it looks numeric; a bare numeric token
+    is the id (or the unconnected marker) and must not become a net name.
+    """
+
+    @staticmethod
+    def _node(*args: Any) -> list:
+        return [_sym("segment"), [_sym("net"), *args]]
+
+    def test_quoted_numeric_name_survives(self):
+        assert _get_net(self._node(1, "0")) == "0"
+
+    def test_zero_id_is_unconnected(self):
+        assert _get_net(self._node(0)) is None
+
+    def test_bare_id_only_is_none(self):
+        assert _get_net(self._node(1)) is None
