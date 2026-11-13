@@ -17,6 +17,7 @@ import os
 from pathlib import Path
 import shutil
 import tempfile
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -72,6 +73,34 @@ _BARE_ATOM_LIB_TEXT = """
     (pin passive line (at 0 5.08 270) (length 2.54)
       (name "" (effects (font (size 1.27 1.27))))
       (number "1" (effects (font (size 1.27 1.27))))))
+)
+"""
+
+# Unquoted Reference *value*: parses to sexpdata.Symbol, whose __eq__ is
+# class-exact, so the auto-reference prefix must be normalized to plain str.
+_BARE_REF_VALUE_LIB_TEXT = """
+(kicad_symbol_lib (version 20231120) (generator kicad_symbol_editor)
+  (symbol "BareRefValue"
+    (property "Reference" Q (at 0 0 0) (effects (font (size 1.27 1.27))))
+    (property "Value" "BareRefValue" (at 0 2.54 0) (effects (font (size 1.27 1.27))))
+    (symbol "BareRefValue_1_1"
+      (pin passive line (at 0 5.08 270) (length 2.54)
+        (name "" (effects (font (size 1.27 1.27))))
+        (number "1" (effects (font (size 1.27 1.27))))))
+  )
+)
+"""
+
+# No Reference property at all: the prefix must fall back to "U".
+_NO_REF_PROP_LIB_TEXT = """
+(kicad_symbol_lib (version 20231120) (generator kicad_symbol_editor)
+  (symbol "NoRefProp"
+    (property "Value" "NoRefProp" (at 0 2.54 0) (effects (font (size 1.27 1.27))))
+    (symbol "NoRefProp_1_1"
+      (pin passive line (at 0 5.08 270) (length 2.54)
+        (name "" (effects (font (size 1.27 1.27))))
+        (number "1" (effects (font (size 1.27 1.27))))))
+  )
 )
 """
 
@@ -430,6 +459,57 @@ class TestAddSymbolToSchematic:
         ref = result["reference_assigned"]
         assert ref.startswith("R"), f"expected reference like R1, got {ref!r}"
         assert result["units_added"] >= 1
+
+    def _add_from_source_lib(self, tools, schematic_path, tmp_path, lib_text, symbol_name):
+        lib = tmp_path / f"{symbol_name}.kicad_sym"
+        lib.write_text(lib_text)
+        mgr = _make_mock_manager(str(lib))
+        with patch("kcaa.tools.symbol_edit_tools._get_index_manager", return_value=mgr):
+            return asyncio.run(
+                tools["add_symbol_to_schematic"](
+                    schematic_path=schematic_path,
+                    library_name=_LIB_NAME,
+                    symbol_name=symbol_name,
+                    x=50.0,
+                    y=50.0,
+                )
+            )
+
+    def test_bare_reference_value_sets_prefix(self, tools, tmp_sch, tmp_path):
+        """An unquoted ``(property "Reference" Q ...)`` must yield a "Q"
+        reference prefix, not silently fall back to "U"."""
+        result = self._add_from_source_lib(
+            tools, tmp_sch, tmp_path, _BARE_REF_VALUE_LIB_TEXT, "BareRefValue"
+        )
+        assert result.get("success") is True, result
+        assert result["reference_assigned"].startswith("Q"), result
+
+    def test_missing_reference_property_falls_back_to_u(self, tools, tmp_sch, tmp_path):
+        result = self._add_from_source_lib(
+            tools, tmp_sch, tmp_path, _NO_REF_PROP_LIB_TEXT, "NoRefProp"
+        )
+        assert result.get("success") is True, result
+        assert result["reference_assigned"].startswith("U"), result
+
+    def test_reference_prefix_helper_normalizes_bare_token(self):
+        """The prefix leaves the parser as a ``sexpdata.Symbol``; it must be
+        returned as the plain ``str`` it represents."""
+        import sexpdata
+
+        from kcaa.tools.symbol_edit_tools import _reference_prefix
+
+        raw = sexpdata.loads('(symbol "Bare" (property "Reference" Q (at 0 0)))')
+        prefix = _reference_prefix(raw)
+        assert prefix == "Q"
+        assert type(prefix) is str
+
+    def test_reference_prefix_helper_defaults_to_u(self):
+        import sexpdata
+
+        from kcaa.tools.symbol_edit_tools import _reference_prefix
+
+        raw = sexpdata.loads('(symbol "Bare" (property "Value" "X" (at 0 0)))')
+        assert _reference_prefix(raw) == "U"
 
     def test_creates_backup(self, tools, tmp_sch):
         """A .bak file should appear next to the schematic after adding."""
@@ -3424,3 +3504,46 @@ class TestCheckReferenceConflicts:
             )
         )
         assert "error" in result
+
+
+# ---------------------------------------------------------------------------
+# Cached lib_symbols entry ids
+# ---------------------------------------------------------------------------
+
+
+def test_extract_cached_raw_entries_normalizes_bare_lib_id():
+    """An unquoted ``(symbol Device:R ...)`` parses its id to a
+    ``sexpdata.Symbol``.  The id is also used as a dict key, so it must be
+    stored as the plain ``str`` it represents."""
+    import sexpdata
+
+    from kcaa.tools.symbol_edit_tools import _extract_cached_raw_entries
+
+    entry = sexpdata.loads('(symbol Device:R (property "Reference" "U"))')
+    sch = SimpleNamespace(lib_symbols=SimpleNamespace(_pv=SimpleNamespace(_tree=[entry])))
+
+    entries = _extract_cached_raw_entries(sch)
+    assert entries == [("Device:R", entry)]
+    assert dict(entries).get("Device:R") is entry
+
+
+def test_extract_cached_raw_entries_wrapper_lookup_uses_normalized_id():
+    """The wrapper branch (``entry[0]`` is not a Symbol) resolves the raw
+    symbol through ``_libsyms_by_id``.  That dict is keyed by plain ``str``,
+    so the lookup must use the normalized id — a ``Symbol`` key never
+    matches and the cached symbol is silently lost."""
+    import sexpdata
+
+    from kcaa.tools.symbol_edit_tools import _extract_cached_raw_entries
+
+    raw = sexpdata.loads('(symbol Device:R (property "Reference" "U"))')
+    # entry[0] is not a Symbol -> wrapper branch (skip-loaded cache entry).
+    entry = ["wrapper", sexpdata.Symbol("Device:R")]
+    sch = SimpleNamespace(
+        lib_symbols=SimpleNamespace(
+            _pv=SimpleNamespace(_tree=[entry]),
+            _libsyms_by_id={"Device:R": raw},
+        )
+    )
+
+    assert _extract_cached_raw_entries(sch) == [("Device:R", raw)]

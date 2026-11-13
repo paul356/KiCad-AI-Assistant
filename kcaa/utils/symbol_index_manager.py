@@ -491,6 +491,10 @@ class SymbolIndexManager:
         After parsing:
             prop.children[0] = "Description"   (str, property name)
             prop.children[1] = "Resistor"       (str, property value)
+
+        An unquoted atom parses to ``sexpdata.Symbol``, which subclasses
+        ``str`` but whose ``__eq__`` is class-exact; both atoms are
+        converted to plain ``str`` so the literal comparisons below match.
         """
         description = ""
         keywords = ""
@@ -498,8 +502,8 @@ class SymbolIndexManager:
             children = prop.children
             if len(children) < 2:
                 continue
-            prop_name = children[0] if isinstance(children[0], str) else ""
-            prop_val = children[1] if isinstance(children[1], str) else ""
+            prop_name = str(children[0]) if isinstance(children[0], str) else ""
+            prop_val = str(children[1]) if isinstance(children[1], str) else ""
             if prop_name in ("Description", "ki_description"):
                 description = prop_val
             elif prop_name == "ki_keywords":

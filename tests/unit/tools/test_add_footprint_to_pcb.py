@@ -17,6 +17,7 @@ import os
 import shutil
 
 import pytest
+import sexpdata
 
 from kcaa.utils.pcb_footprint_utils import (
     get_fp_property,
@@ -511,6 +512,16 @@ class TestNets:
         no2, name2 = _resolve_board_net(board2, "7")
         assert no2 == 7 and name2 == "7"
 
+    def test_resolve_board_net_bare_token_name(self):
+        """An unquoted net name parses to ``sexpdata.Symbol``; it must
+        resolve by name and must not spawn a duplicate declaration."""
+        from kcaa.tools.pcb_library_tools import _resolve_board_net
+
+        board = sexpdata.loads('(kicad_pcb (net GND) (net 0 ""))')[1:]
+        no, name = _resolve_board_net(board, "GND")
+        assert (no, name) == (None, "GND")
+        assert len([n for n in board if isinstance(n, list) and _sym(n[-1]) == "GND"]) == 1
+
     def test_numeric_net_value_rejected_no_write(self, tools, board_with_table):
         """P2-2: a JSON slip with a numeric ``net`` value must fail the item
         with a clear error before any write — it would otherwise serialize
@@ -703,6 +714,18 @@ class TestBatchRemove:
         assert _board_bytes(board_copy) == before
         assert not os.path.exists(board_copy + ".bak")
         assert len(self._refs(board_copy)) == 4
+
+    def test_batch_symbol_reference_is_normalized(self, tools, board_copy):
+        """An unquoted reference parses to ``sexpdata.Symbol``, which passes
+        the ``isinstance(str)`` validation yet never compares equal to the
+        board's plain-str property value.  It must be normalized first."""
+        result = _remove(tools, board_copy, sexpdata.Symbol("R1"))
+        assert "error" not in result, result
+        assert result["success"] is True
+        assert result["removed_count"] == 1
+        assert result["results"][0]["reference"] == "R1"
+        assert type(result["results"][0]["reference"]) is str
+        assert "R1" not in self._refs(board_copy)
 
 
 class TestBatchPlacement:

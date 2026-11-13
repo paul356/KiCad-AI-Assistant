@@ -31,6 +31,41 @@ _FIXTURE_DIR = _REPO_ROOT / "tests" / "integration" / "fixtures"
 _BOARD_FIXTURE = _FIXTURE_DIR / "test_routing_board.kicad_pcb"
 _PRO_FIXTURE = _FIXTURE_DIR / "test_routing_board.kicad_pro"
 
+# Unquoted tokens are the only way sexpdata yields a Symbol.  Both the
+# Reference *value* and the pad number here parse to sexpdata.Symbol.
+_BARE_TOKEN_BOARD = """(kicad_pcb
+  (version 20240108)
+  (generator "test")
+  (layers (0 "F.Cu" signal) (31 "B.Cu" signal))
+  (net 1 "VCC")
+  (footprint "R_0402" (layer "F.Cu") (at 10 10)
+    (property "Reference" R1 (at 0 0))
+    (pad A1 thru_hole circle (at 0 0) (size 1 1)
+      (layers "F.Cu" "B.Cu") (net 1 "VCC"))
+  )
+)
+"""
+
+
+@pytest.fixture
+def bare_token_board(tmp_path: Path) -> str:
+    pcb = tmp_path / "bare_tokens.kicad_pcb"
+    pcb.write_text(_BARE_TOKEN_BOARD)
+    return str(pcb)
+
+
+# An unquoted ``*.Cu`` in a via's layer list is a Symbol, not the literal
+# string the ``!= "*.Cu"`` filter compares against.
+_BARE_STAR_CU_BOARD = """(kicad_pcb
+  (version 20240108)
+  (generator "test")
+  (layers (0 "F.Cu" signal) (31 "B.Cu" signal))
+  (via (at 1 1) (size 0.8) (drill 0.4) (layers *.Cu))
+  (segment (start 1 1) (end 2 1) (width 0.2) (layer "F.Cu") (net 0))
+  (segment (start 1 2) (end 2 2) (width 0.2) (layer "B.Cu") (net 0))
+)
+"""
+
 
 @pytest.fixture
 def board_copy(tmp_path: Path) -> str:
@@ -123,6 +158,27 @@ def test_pad_center_world_coords(board_copy: str) -> None:
     assert c is not None
     assert abs(c[0] - 29.5) < 1e-6  # R1 at (30,30), pad 1 local (-0.5, 0)
     assert abs(c[1] - 30.0) < 1e-6
+
+
+def test_collect_nets_normalizes_bare_pad_number(bare_token_board: str) -> None:
+    """An unquoted ``(pad A1 ...)`` parses to a ``sexpdata.Symbol``; the net
+    map is annotated ``dict[str, list[tuple[str, str]]]``, so both the
+    reference and the pad number must be plain ``str``."""
+    nets = vrf.collect_nets(bare_token_board)
+    assert nets == {"VCC": [("R1", "A1")]}
+    ref, pad = nets["VCC"][0]
+    assert type(ref) is str
+    assert type(pad) is str
+
+
+def test_pad_center_matches_bare_pad_number(bare_token_board: str) -> None:
+    """The lookup pad number is a caller-supplied plain ``str``.  An unquoted
+    pad number in the file must still match and resolve to its world centre
+    (footprint at (10, 10), pad local (0, 0))."""
+    data = vrf.load_pcb(bare_token_board)
+    center = vrf._pad_center(data, "R1", "A1")
+    assert center is not None
+    assert center == pytest.approx((10.0, 10.0))
 
 
 # ---------------------------------------------------------------------------
@@ -264,6 +320,17 @@ def test_copper_layers_detected_from_board(board_copy: str) -> None:
     assert "F.Cu" in layers  # R1/C1/U1 SMD pads and the VCC track
     assert "In1.Cu" in layers  # D1 lives on the inner copper layer
     assert layers.index("F.Cu") < layers.index("In1.Cu")  # KiCad stack order
+
+
+def test_copper_layers_ignores_bare_star_cu(tmp_path: Path) -> None:
+    """An unquoted ``(layers *.Cu)`` on a via parses to a ``Symbol``; it must
+    be excluded like the quoted literal instead of entering the layer set."""
+    pcb = tmp_path / "bare_star_cu.kicad_pcb"
+    pcb.write_text(_BARE_STAR_CU_BOARD)
+    layers = vrf._copper_layers(vrf.load_pcb(str(pcb)))
+    assert layers == ["F.Cu", "B.Cu"]
+    assert "*.Cu" not in layers
+    assert all(type(lay) is str for lay in layers)
 
 
 def test_pad_copper_layers_expands_thru_holes() -> None:

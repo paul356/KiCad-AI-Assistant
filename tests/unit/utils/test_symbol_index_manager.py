@@ -768,3 +768,36 @@ class TestSyncExistenceGuard:
             "C",
         }
         assert g_row.id != p_row.id
+
+
+# ---------------------------------------------------------------------------
+# Property atom normalization
+# ---------------------------------------------------------------------------
+
+# Unquoted property atoms parse to sexpdata.Symbol.  A Symbol subclasses str
+# but its __eq__ is class-exact, so _extract_properties must convert them to
+# plain str before matching the Description / ki_keywords names.
+_BARE_ATOM_LIB = """(kicad_symbol_lib (version 20231120) (generator kicad_symbol_editor)
+  (symbol "BareAtoms"
+    (property "Description" Resistor (at 0 0 0) (effects (font (size 1.27 1.27))))
+    (property ki_keywords Filter (at 0 0 0) (effects (font (size 1.27 1.27))))
+    (symbol "BareAtoms_0_1" (polyline (pts (xy -1 0) (xy 1 0))))
+  )
+)
+"""
+
+
+class TestExtractPropertiesBareTokens:
+    def test_bare_property_atoms_are_matched_as_plain_str(self, tmp_path):
+        from kcaa.utils.skip_compat import safe_source_file
+
+        lib = tmp_path / "BareAtoms.kicad_sym"
+        lib.write_text(_BARE_ATOM_LIB)
+
+        library_file = safe_source_file(str(lib))
+        description, keywords = SymbolIndexManager._extract_properties(library_file.symbol)
+
+        assert description == "Resistor"
+        assert keywords == "Filter"
+        assert type(description) is str
+        assert type(keywords) is str
