@@ -9,6 +9,8 @@ import sexpdata
 
 from kcaa.router.world_model import (
     WorldModel,
+    _get_net,
+    _pad_copper_layers,
     build_world_model,
 )
 
@@ -496,6 +498,20 @@ class TestBoardOutline:
         # Polygon area excludes the interior ring: 50 - 2 slot = 48.
         assert abs(m.board_outline.area - 48.0) < 1e-9
         assert len(m.board_outline.interiors) == 1
+
+
+class TestBareSymbolAtoms:
+    def test_get_net_bare_name_is_plain_str(self):
+        """Reproduces #295: a bare net-name atom must not leak a Symbol."""
+        name = _get_net([_sym("segment"), [_sym("net"), _sym("GND")]])
+        assert name == "GND"
+        assert type(name) is str
+
+    def test_pad_copper_layers_bare_names_are_plain_str(self):
+        """Reproduces #295: bare layer atoms must not leak Symbols."""
+        layers = _pad_copper_layers([_sym("layers"), _sym("F.Cu"), _sym("B.Cu")])
+        assert layers == {"F.Cu", "B.Cu"}
+        assert all(type(name) is str for name in layers)
 
 
 class TestRoutingFixture:

@@ -376,7 +376,7 @@ def split_footprint_header(node: list[Any]) -> tuple[str | None, str]:
     The header string is ``"Library:Name"`` when the footprint came from a
     library, or just ``"Name"`` for footprints created on the board.
     """
-    header = node[1] if len(node) > 1 and isinstance(node[1], str) else ""
+    header = _sym(node[1]) if len(node) > 1 and isinstance(node[1], str) else ""
     if ":" in header:
         lib, _, name = header.rpartition(":")
         return (lib or None), name
@@ -639,7 +639,7 @@ def normalize_footprint_for_library(
         elif key in _INSTANCE_ONLY_KEYS:
             del node[i]
         elif key == "property":
-            prop_name = child[1] if len(child) > 1 and isinstance(child[1], str) else ""
+            prop_name = _sym(child[1]) if len(child) > 1 and isinstance(child[1], str) else ""
             if prop_name in _INSTANCE_PROPERTIES:
                 text_type = "reference" if prop_name == "Reference" else "value"
                 if _has_fp_text_of_type(node, text_type):

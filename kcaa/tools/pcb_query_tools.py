@@ -1605,4 +1605,4 @@ def _get_net_name_pq(net_node: list) -> str | None:
         raw = net_node[1]
     else:
         return None
-    return raw if isinstance(raw, str) else str(raw)
+    return _sym(raw)

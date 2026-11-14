@@ -670,5 +670,13 @@ class TestBareSymbolAtoms:
         result = _run(tools["get_board_info"](pcb_path=str(board), ctx=None))
         name = result["all_layers"][0]["name"]
         assert name == "F.Cu"
-        assert type(name) is str and not isinstance(name, sexpdata.Symbol)
+        assert type(name) is str
         assert result["copper_layer_count"] == 2
+
+    def test_bare_net_reference_name_is_plain_str(self):
+        """Reproduces #295: a bare (net GND) atom must not leak a Symbol."""
+        from kcaa.tools.pcb_query_tools import _get_net_name_pq
+
+        name = _get_net_name_pq([sexpdata.Symbol("net"), sexpdata.Symbol("GND")])
+        assert name == "GND"
+        assert type(name) is str

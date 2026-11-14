@@ -388,9 +388,7 @@ class TestBareSymbolAtoms:
         ]
         result = _parse_zone(node)
         assert result["net_name"] == "GND"
-        assert type(result["net_name"]) is str and not isinstance(
-            result["net_name"], sexpdata.Symbol
-        )
+        assert type(result["net_name"]) is str
 
     def test_find_net_and_build_zone_write_plain_string(self):
         """Reproduces #295: a bare net-table name must be written back quoted."""
@@ -400,7 +398,7 @@ class TestBareSymbolAtoms:
         net_id, name = found
         assert net_id == 1
         assert name == "GND"
-        assert type(name) is str and not isinstance(name, sexpdata.Symbol)
+        assert type(name) is str
 
         node = _build_zone_node(
             zone_uuid="zone-test",
@@ -425,3 +423,36 @@ class TestBareSymbolAtoms:
         dumped = sexpdata.dumps(node)
         assert '(net_name "GND")' in dumped
         assert "(net_name GND)" not in dumped
+
+    @pytest.mark.parametrize(
+        "net_node",
+        [
+            [sexpdata.Symbol("net"), 1, sexpdata.Symbol("GND")],
+            [sexpdata.Symbol("net"), sexpdata.Symbol("GND")],
+        ],
+        ids=["with-id", "id-less"],
+    )
+    def test_find_net_by_name_pad_fallback_is_plain_str(self, net_node):
+        """Reproduces #295: KiCad 10 boards may omit the net table.
+
+        The net then lives in the pad and must still come back as a plain str.
+        """
+        tree = [
+            [
+                sexpdata.Symbol("footprint"),
+                "Lib:R1",
+                [
+                    sexpdata.Symbol("pad"),
+                    "1",
+                    sexpdata.Symbol("smd"),
+                    sexpdata.Symbol("rect"),
+                    net_node,
+                ],
+            ]
+        ]
+        found = _find_net_by_name(tree, "GND")
+        assert found is not None
+        net_id, name = found
+        assert net_id is None
+        assert name == "GND"
+        assert type(name) is str

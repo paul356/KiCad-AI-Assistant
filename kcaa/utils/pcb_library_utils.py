@@ -347,7 +347,7 @@ def _parse_pad(pad_node: list[Any], sym: Any) -> dict[str, Any] | None:
             and len(sub) >= 2
             and sym(sub[0]) == "layer"
         ):
-            layer = sub[1] if isinstance(sub[1], str) else sym(sub[1])
+            layer = sym(sub[1])
     return {
         "number": str(pad_num),
         "type": str(pad_type),
