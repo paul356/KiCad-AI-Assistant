@@ -20,3 +20,8 @@ def test_sym_str_result_is_not_a_symbol():
 def test_sym_str_converts_non_symbol_values():
     """Non-Symbol input still converts through str()."""
     assert sym_str(3) == "3"
+
+
+def test_sym_str_returns_plain_string_for_string_atom():
+    """Quoted atoms parse as sexpdata.String, which has the same equality trap."""
+    assert sym_str(sexpdata.String("F.Cu")) == "F.Cu"
