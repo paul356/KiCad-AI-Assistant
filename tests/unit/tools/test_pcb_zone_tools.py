@@ -1,16 +1,18 @@
 """
 Unit tests for PCB zone tools: list_zones, add_zone, and delete_zone.
 
-Uses tests/unit/tools/fixtures/test_board_with_zones.kicad_pcb which
-contains:
-  - zone0001…001  copper_pour on F.Cu  (net GND)
-  - zone0002…002  keepout    on F.Cu   (no net)
-  - zone0003…003  copper_pour on B.Cu  (net VCC)
+Uses tests/unit/tools/fixtures/test_board_with_zones.kicad_pcb, a board
+written by KiCad 10's ``SaveBoard()``, which contains:
+  - 1e08b401…4fd5  copper_pour on F.Cu  (net GND)
+  - c601cc88…0f1a  keepout    on F.Cu   (no net)
+  - c4f6bbf4…54c0  copper_pour on B.Cu  (net VCC)
+
+and the footprint R1 (Resistor_SMD:R_0402_1005Metric) at (10, 20) with pad 1
+on VCC and pad 2 on GND.
 """
 
 import asyncio
 import os
-import re
 import shutil
 
 import pytest
@@ -18,15 +20,49 @@ import sexpdata
 
 from kcaa.tools.pcb_zone_tools import _build_zone_node, _find_net_by_name, _parse_zone
 from kcaa.utils.pcb_sexp_utils import load_pcb
+from kcaa.utils.sexp_utils import sym_str
 
 FIXTURE_PCB = os.path.join(os.path.dirname(__file__), "fixtures", "test_board_with_zones.kicad_pcb")
 PRE_V10_FIXTURE = os.path.join(
     os.path.dirname(__file__), "fixtures", "test_board_pre_v10.kicad_pcb"
 )
 
-UUID_COPPER_GND = "zone0001-0000-0000-0000-000000000001"
-UUID_KEEPOUT = "zone0002-0000-0000-0000-000000000002"
-UUID_COPPER_VCC = "zone0003-0000-0000-0000-000000000003"
+UUID_COPPER_GND = "1e08b401-2611-467f-9f96-aea85e324fd5"
+UUID_KEEPOUT = "c601cc88-e4d3-43a1-87e8-1daf351a0f1a"
+UUID_COPPER_VCC = "c4f6bbf4-adaf-420b-8018-83250cf554c0"
+
+# File-level layer ids as KiCad 10 writes them in the ``(layers ...)`` block:
+# PCB_LAYER_ID values, odd for front / even for back (see
+# pcbnew/pcb_io/kicad_sexpr/pcb_io_kicad_sexpr.cpp, formatBoardLayers()).
+FILE_LAYER_IDS = {
+    "F.Cu": 0,
+    "B.Cu": 2,
+    "F.Mask": 1,
+    "B.Mask": 3,
+    "F.SilkS": 5,
+    "B.SilkS": 7,
+    "F.Adhes": 9,
+    "B.Adhes": 11,
+    "F.Paste": 13,
+    "B.Paste": 15,
+    "Dwgs.User": 17,
+    "Cmts.User": 19,
+    "Eco1.User": 21,
+    "Eco2.User": 23,
+    "Edge.Cuts": 25,
+    "Margin": 27,
+    "B.CrtYd": 29,
+    "F.CrtYd": 31,
+    "B.Fab": 33,
+    "F.Fab": 35,
+    "User.1": 39,
+    "User.2": 41,
+    "User.3": 43,
+    "User.4": 45,
+}
+
+# Keepout rules KiCad 10 writes; it has no ``text`` rule.
+KEEPOUT_KEYWORDS = {"tracks", "vias", "pads", "copperpour", "footprints"}
 
 
 # ---------------------------------------------------------------------------
@@ -67,13 +103,19 @@ def tmp_pcb(tmp_path):
 
 
 @pytest.fixture()
-def tmp_pcb_no_net_table(tmp_path):
-    """Fixture rewritten to KiCad's name-only net format without top-level net table."""
-    dst = tmp_path / "test_board_with_zones_name_only.kicad_pcb"
+def tmp_pcb_legacy_net_table(tmp_path):
+    """Fixture rewritten with a numbered net table in the KiCad 9 shape.
+
+    Position and shape match KiCad 9; KiCad 10 still loads the table. It is not
+    a byte-exact KiCad 9 save of this board.
+    """
+    dst = tmp_path / "test_board_with_zones_legacy_net_table.kicad_pcb"
     shutil.copy2(FIXTURE_PCB, dst)
     text = dst.read_text(encoding="utf-8")
-    text = re.sub(r'^\t\(net\s+\d+\s+"[^"]*"\)\n', "", text, flags=re.MULTILINE)
-    text = re.sub(r'\(net\s+\d+\s+"([^"]*)"\)', r'(net "\1")', text)
+    table = '\t(net 0 "")\n\t(net 1 "GND")\n\t(net 2 "VCC")\n'
+    # KiCad 9 put the net table between (setup ...) and the footprints. A missed
+    # anchor fails the test below (net stays None) instead of passing.
+    text = text.replace("\t(footprint ", table + "\t(footprint ", 1)
     dst.write_text(text, encoding="utf-8")
     return str(dst)
 
@@ -280,10 +322,11 @@ class TestAddZone:
         assert added["layer"] == "B.Cu"
         assert added["keepout_rules"]["tracks"] == "allowed"
 
-    def test_add_copper_zone_without_top_level_net_table(self, tmp_pcb_no_net_table):
+    def test_add_copper_zone_without_top_level_net_table(self, tmp_pcb):
+        """The fixture itself is a KiCad 10 board with no net table: nets live in pads."""
         result = _run(
             self.add_zone(
-                pcb_path=tmp_pcb_no_net_table,
+                pcb_path=tmp_pcb,
                 layer="F.Cu",
                 polygon_pts=[
                     {"x": 70.0, "y": 10.0},
@@ -299,8 +342,38 @@ class TestAddZone:
         assert result["net"] is None
         assert result["net_name"] == "GND"
 
-        after = _run(self.list_zones(tmp_pcb_no_net_table, None))
+        after = _run(self.list_zones(tmp_pcb, None))
         added = next(z for z in after["zones"] if z["uuid"] == result["zone_uuid"])
+        assert added["net"] is None
+        assert added["net_name"] == "GND"
+
+    def test_add_copper_zone_with_legacy_net_table(self, tmp_pcb_legacy_net_table):
+        """A numbered net table in the KiCad 9 shape supplies the netcode.
+
+        The board format itself is still KiCad 10, so the zone is written in the
+        v10 name-only form even though the netcode was resolved.
+        """
+        result = _run(
+            self.add_zone(
+                pcb_path=tmp_pcb_legacy_net_table,
+                layer="F.Cu",
+                polygon_pts=[
+                    {"x": 70.0, "y": 10.0},
+                    {"x": 90.0, "y": 10.0},
+                    {"x": 90.0, "y": 30.0},
+                    {"x": 70.0, "y": 30.0},
+                ],
+                net_name="GND",
+                ctx=None,
+            )
+        )
+        assert result["added"] is True
+        assert result["net"] == 1
+        assert result["net_name"] == "GND"
+
+        after = _run(self.list_zones(tmp_pcb_legacy_net_table, None))
+        added = next(z for z in after["zones"] if z["uuid"] == result["zone_uuid"])
+        assert added["net"] is None
         assert added["net_name"] == "GND"
 
     def test_add_zone_creates_backup(self, tmp_pcb):
@@ -593,3 +666,71 @@ class TestBareSymbolAtoms:
         assert net_id is None
         assert name == "GND"
         assert type(name) is str
+
+
+# ---------------------------------------------------------------------------
+# Fixture format guard
+# ---------------------------------------------------------------------------
+
+
+class TestFixtureIsKiCad10Shape:
+    """Guards the fixture's byte shape without needing KiCad installed (#306).
+
+    The fixture used to claim ``(version 20260206)`` while carrying layer names
+    KiCad never writes (``B.Courtyard``/``F.Courtyard``), a name-only top-level
+    net table and a ``(text ...)`` keepout rule, so KiCad 10 refused to load it.
+    Its layer *numbers* were also wrong; KiCad tolerates those, renumbering from
+    each layer's name on save, so the guard pins them but they did not block the
+    load.
+    """
+
+    def _tree(self):
+        with open(FIXTURE_PCB, encoding="utf-8") as handle:
+            return sexpdata.loads(handle.read())
+
+    def test_top_level_net_entries_carry_an_integer_code(self):
+        """A top-level net entry must never come back in name-only form.
+
+        A KiCad 10 board has no top-level net table, so this loop runs zero times
+        on the current fixture: the test does not assert that the fixture lacks a
+        table, only that any entry present carries its netcode.
+        """
+        for node in self._tree():
+            if not (isinstance(node, list) and node and sym_str(node[0]) == "net"):
+                continue
+            assert isinstance(node[1], int), (
+                f"top-level net entry has no netcode: {node!r}. KiCad parses the net "
+                "table with parseInt('net number'); only net references may be name-only."
+            )
+            assert len(node) == 3, f"unexpected net entry shape: {node!r}"
+
+    def test_layer_numbers_are_file_level_ids(self):
+        for node in self._tree():
+            if not (isinstance(node, list) and node and sym_str(node[0]) == "layers"):
+                continue
+            entries = node[1:]
+            assert entries, "the board declares no layers"
+            for entry in entries:
+                number, name = entry[0], sym_str(entry[1])
+                assert name in FILE_LAYER_IDS, f"unknown layer name {name!r}"
+                assert number == FILE_LAYER_IDS[name], (
+                    f"layer {name!r} is declared as {number!r}, "
+                    f"KiCad 10 writes {FILE_LAYER_IDS[name]}"
+                )
+
+    def test_keepout_rules_use_kicad10_keywords(self):
+        keepouts = 0
+        for node in self._tree():
+            if not (isinstance(node, list) and node and sym_str(node[0]) == "zone"):
+                continue
+            for child in node[1:]:
+                if not (isinstance(child, list) and child and sym_str(child[0]) == "keepout"):
+                    continue
+                keepouts += 1
+                for rule in child[1:]:
+                    keyword = sym_str(rule[0])
+                    assert keyword in KEEPOUT_KEYWORDS, (
+                        f"keepout rule {keyword!r} is not one KiCad 10 writes "
+                        f"({sorted(KEEPOUT_KEYWORDS)})"
+                    )
+        assert keepouts == 1, "the fixture must keep exactly one keepout zone"
