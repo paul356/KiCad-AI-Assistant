@@ -14,16 +14,11 @@ from typing import Any
 
 import sexpdata
 
+from kcaa.utils.sexp_utils import sym_str as _sym
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
-
-
-def _sym(value: Any) -> str:
-    """Return the string form of a sexpdata Symbol or plain string."""
-    if isinstance(value, sexpdata.Symbol):
-        return str(value)
-    return str(value)
 
 
 def _make_sym(name: str) -> sexpdata.Symbol:

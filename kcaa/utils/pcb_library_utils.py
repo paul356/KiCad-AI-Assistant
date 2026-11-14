@@ -17,6 +17,7 @@ import sexpdata
 
 from kcaa.utils.config import ServerConfig
 from kcaa.utils.pcb_board_utils import get_fp_edge_cuts_items
+from kcaa.utils.sexp_utils import sym_str as _sym
 
 log = logging.getLogger(__name__)
 
@@ -128,9 +129,6 @@ def _parse_fp_lib_table_raw(table_path: str, env: dict[str, str]) -> list[dict[s
         data = sexpdata.loads(raw)
     except Exception:
         return libraries
-
-    def _sym(v: Any) -> str:
-        return str(v) if isinstance(v, sexpdata.Symbol) else str(v)
 
     for item in data:
         if not (isinstance(item, list) and len(item) > 0 and _sym(item[0]) == "lib"):
@@ -288,9 +286,6 @@ def parse_kicad_mod(path: str) -> dict[str, Any]:
         data = sexpdata.loads(raw)
     except Exception:
         return result
-
-    def _sym(v: Any) -> str:
-        return str(v) if isinstance(v, sexpdata.Symbol) else str(v)
 
     courtyard_points: list[tuple] = []
 
