@@ -40,7 +40,6 @@ from kcaa.tools.pcb_placement_helpers import (
 )
 from kcaa.utils.pcb_board_utils import get_fp_courtyard_bbox
 from kcaa.utils.pcb_footprint_utils import (
-    _sym,
     find_footprint,
     get_fp_at,
     get_fp_layer,
@@ -49,6 +48,7 @@ from kcaa.utils.pcb_footprint_utils import (
     upsert_fp_property,
 )
 from kcaa.utils.pcb_sexp_utils import load_pcb, save_pcb
+from kcaa.utils.sexp_utils import sym_str as _sym
 
 log = logging.getLogger(__name__)
 

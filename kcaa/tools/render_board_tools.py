@@ -31,6 +31,7 @@ import matplotlib.pyplot as plt  # noqa: E402
 
 from kcaa.utils.config import model_supports_vision
 from kcaa.utils.pcb_sexp_utils import load_pcb
+from kcaa.utils.sexp_utils import sym_str as _sym
 
 # KiCad default theme approximations (same palette as scripts/vlm_route_feedback.py).
 _KICAD_LAYER_COLORS = {
@@ -93,15 +94,6 @@ _FP_REF_STROKE = _PAD_LABEL_COLOR
 _FP_REF_ALPHA = 0.9
 
 _PT_PER_MM = 72.0 / 25.4
-
-
-def _sym(value: Any) -> str:
-    """String form of a sexpdata Symbol or plain string.
-
-    ``sexpdata.Symbol`` overrides ``__eq__`` so it never equals a ``str``;
-    always compare via this helper.
-    """
-    return str(value)
 
 
 def _layer_color(layer: str) -> str:

@@ -19,7 +19,6 @@ import re
 from typing import Any
 
 from fastmcp import Context, FastMCP
-import sexpdata
 
 from kcaa.utils.pcb_board_utils import get_edge_cuts_items, get_fp_courtyard_bbox
 from kcaa.utils.pcb_footprint_utils import (
@@ -28,6 +27,7 @@ from kcaa.utils.pcb_footprint_utils import (
     iter_footprint_nodes,
 )
 from kcaa.utils.pcb_sexp_utils import load_pcb
+from kcaa.utils.sexp_utils import sym_str as _sym
 
 log = logging.getLogger(__name__)
 
@@ -38,13 +38,6 @@ _GRID_MM: float = 1.27
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
-
-
-def _sym(value: Any) -> str:
-    """Return the string representation of a sexpdata Symbol or plain value."""
-    if isinstance(value, sexpdata.Symbol):
-        return str(value)
-    return str(value)
 
 
 def _get_board_bounds(data: list[Any]) -> dict[str, float] | None:

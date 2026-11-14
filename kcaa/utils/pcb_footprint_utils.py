@@ -18,6 +18,8 @@ from typing import Any
 
 import sexpdata
 
+from kcaa.utils.sexp_utils import sym_str as _sym
+
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -56,13 +58,6 @@ LAYER_FLIP_MAP: dict[str, str] = {
     "F_Adhes": "B_Adhes",
     "B_Adhes": "F_Adhes",
 }
-
-
-def _sym(value: Any) -> str:
-    """Return the string form of a sexpdata Symbol or plain string."""
-    if isinstance(value, sexpdata.Symbol):
-        return str(value)
-    return str(value)
 
 
 def find_footprint(data: list[Any], reference: str) -> list[Any]:

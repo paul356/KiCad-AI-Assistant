@@ -20,6 +20,7 @@ from fastmcp import Context, FastMCP
 import sexpdata
 
 from kcaa.utils.pcb_sexp_utils import load_pcb, save_pcb
+from kcaa.utils.sexp_utils import sym_str as _sym
 
 log = logging.getLogger(__name__)
 
@@ -27,13 +28,6 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
-
-
-def _sym(value: Any) -> str:
-    """Return the string form of a sexpdata Symbol or plain string."""
-    if isinstance(value, sexpdata.Symbol):
-        return value.value()
-    return str(value)
 
 
 def _parse_zone(node: list[Any]) -> dict[str, Any]:

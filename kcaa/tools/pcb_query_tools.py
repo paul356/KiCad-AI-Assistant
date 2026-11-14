@@ -14,7 +14,6 @@ import re
 from typing import Any
 
 from fastmcp import Context, FastMCP
-import sexpdata
 
 from kcaa.tools.pcb_placement_helpers import (
     _TIER_NAMES,
@@ -26,13 +25,13 @@ from kcaa.tools.pcb_placement_helpers import (
 )
 from kcaa.utils.pcb_board_utils import get_fp_courtyard_bbox, get_fp_edge_cuts_items
 from kcaa.utils.pcb_footprint_utils import (
-    _sym,
     find_footprint,
     get_fp_at,
     get_fp_layer,
     get_fp_property,
 )
 from kcaa.utils.pcb_sexp_utils import load_pcb
+from kcaa.utils.sexp_utils import sym_str as _sym
 
 log = logging.getLogger(__name__)
 
@@ -487,9 +486,6 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
             fall back to raw graphics or were skipped).
         """
 
-        def _sym_local(v: Any) -> str:
-            return str(v) if isinstance(v, sexpdata.Symbol) else str(v)
-
         data = load_pcb(pcb_path)
         all_min_x: list[float] = []
         all_min_y: list[float] = []
@@ -501,17 +497,17 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
         for item in data:
             if not (isinstance(item, list) and len(item) > 0):
                 continue
-            if _sym_local(item[0]) != "footprint":
+            if _sym(item[0]) != "footprint":
                 continue
             fp_count += 1
             ref = ""
             for sub in item:
-                if isinstance(sub, list) and len(sub) >= 3 and _sym_local(sub[0]) == "property":
-                    if (sub[1] if isinstance(sub[1], str) else _sym_local(sub[1])) == "Reference":
-                        ref = sub[2] if isinstance(sub[2], str) else _sym_local(sub[2])
+                if isinstance(sub, list) and len(sub) >= 3 and _sym(sub[0]) == "property":
+                    if (sub[1] if isinstance(sub[1], str) else _sym(sub[1])) == "Reference":
+                        ref = sub[2] if isinstance(sub[2], str) else _sym(sub[2])
             fp_x, fp_y, fp_rot = 0.0, 0.0, 0.0
             for sub in item:
-                if isinstance(sub, list) and len(sub) >= 3 and _sym_local(sub[0]) == "at":
+                if isinstance(sub, list) and len(sub) >= 3 and _sym(sub[0]) == "at":
                     fp_x, fp_y = float(sub[1]), float(sub[2])
                     fp_rot = float(sub[3]) if len(sub) > 3 else 0.0
 

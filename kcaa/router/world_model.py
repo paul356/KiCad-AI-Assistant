@@ -29,6 +29,7 @@ from shapely.geometry import LineString, Point, Polygon
 from shapely.ops import polygonize, unary_union
 
 from kcaa.utils.pcb_sexp_utils import load_pcb
+from kcaa.utils.sexp_utils import sym_str as _sym
 
 ObstacleKind = Literal[
     "footprint",
@@ -172,10 +173,6 @@ def build_world_model(
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
-
-
-def _sym(v: Any) -> str:
-    return str(v)
 
 
 def _is_list(v: Any) -> bool:
