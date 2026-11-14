@@ -151,7 +151,7 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
                             {
                                 "id": int(sub[0]) if isinstance(sub[0], int) else sub[0],
                                 "name": sub[1] if isinstance(sub[1], str) else _sym(sub[1]),
-                                "type": sub[2] if isinstance(sub[2], str) else _sym(sub[2]),
+                                "type": _sym(sub[2]),
                             }
                         )
             elif key == "footprint":

@@ -13,6 +13,7 @@ FIXTURE_DIR = os.path.join(os.path.dirname(__file__), "fixtures")
 BOARD_FIXTURE = os.path.join(FIXTURE_DIR, "test_board.kicad_pcb")
 BOARD_WITH_OUTLINE_FIXTURE = os.path.join(FIXTURE_DIR, "test_board_with_outline.kicad_pcb")
 BOARD_WITH_ZONES_FIXTURE = os.path.join(FIXTURE_DIR, "test_board_with_zones.kicad_pcb")
+BOARD_FOUR_LAYERS_FIXTURE = os.path.join(FIXTURE_DIR, "test_board_four_layers.kicad_pcb")
 
 
 # ── Segment/via snippets to append to a board file ──────────────────────
@@ -179,6 +180,13 @@ class TestGetBoardInfo:
         layer_names = [l["name"] for l in result["all_layers"]]
         assert "F.Cu" in layer_names
         assert "B.Cu" in layer_names
+
+    # Reproduces #284: bare `signal` tokens parsed as Symbol made copper_layer_count 0.
+    def test_four_layer_board_counts_copper_layers(self, tools):
+        result = _run(tools["get_board_info"](pcb_path=BOARD_FOUR_LAYERS_FIXTURE, ctx=None))
+        assert result["copper_layer_count"] == 4
+        for layer in result["all_layers"]:
+            assert layer["type"] == "signal"
 
     def test_raises_on_missing_file(self, tools):
         with pytest.raises((FileNotFoundError, ValueError, Exception)):
