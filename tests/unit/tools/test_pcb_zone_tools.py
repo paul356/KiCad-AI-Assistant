@@ -102,6 +102,12 @@ class TestListZones:
         assert zone["fill"] is True
         assert len(zone["polygon_pts"]) == 4
 
+    def test_hatch_style_reads_back_as_plain_string(self):
+        """Reproduces #292: the bare token came back as a Symbol, not a str."""
+        result = _run(self.list_zones(FIXTURE_PCB, None))
+        zone = next(z for z in result["zones"] if z["uuid"] == UUID_COPPER_GND)
+        assert zone["hatch_style"] == "edge"
+
     def test_keepout_fields(self):
         result = _run(self.list_zones(FIXTURE_PCB, None))
         zone = next(z for z in result["zones"] if z["uuid"] == UUID_KEEPOUT)
@@ -171,6 +177,29 @@ class TestAddZone:
         assert added["net_name"] == "GND"
         assert added["layer"] == "F.Cu"
         assert added["polygon_pts"] == points
+
+    def test_fill_false_round_trips(self, tmp_pcb):
+        """Reproduces #292: (fill no) was read back as fill=True."""
+        before = _run(self.list_zones(tmp_pcb, None))["count"]
+        result = _run(
+            self.add_zone(
+                pcb_path=tmp_pcb,
+                layer="F.Cu",
+                polygon_pts=[
+                    {"x": 70.0, "y": 10.0},
+                    {"x": 90.0, "y": 10.0},
+                    {"x": 90.0, "y": 30.0},
+                    {"x": 70.0, "y": 30.0},
+                ],
+                net_name="GND",
+                fill=False,
+                ctx=None,
+            )
+        )
+        after = _run(self.list_zones(tmp_pcb, None))
+        added = next(z for z in after["zones"] if z["uuid"] == result["zone_uuid"])
+        assert after["count"] == before + 1
+        assert added["fill"] is False
 
     def test_add_keepout_zone(self, tmp_pcb):
         result = _run(

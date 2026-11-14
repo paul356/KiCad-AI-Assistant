@@ -85,7 +85,7 @@ def _parse_zone(node: list[Any]) -> dict[str, Any]:
             result["layer"] = [(s if isinstance(s, str) else _sym(s)) for s in sub[1:]]
         elif key == "hatch":
             if len(sub) >= 2:
-                result["hatch_style"] = sub[1] if isinstance(sub[1], str) else _sym(sub[1])
+                result["hatch_style"] = _sym(sub[1])
         elif key == "keepout":
             result["zone_type"] = "keepout"
             rules: dict[str, str] = {}
@@ -96,7 +96,7 @@ def _parse_zone(node: list[Any]) -> dict[str, Any]:
         elif key == "fill":
             # (fill yes ...) or (fill (thermal_gap ...) ...)
             if len(sub) >= 2:
-                val = sub[1] if isinstance(sub[1], str) else _sym(sub[1])
+                val = _sym(sub[1])
                 result["fill"] = val not in ("no", "none")
             else:
                 result["fill"] = True
