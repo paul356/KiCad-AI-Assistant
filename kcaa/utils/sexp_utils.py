@@ -15,7 +15,7 @@ def sym_str(value: Any) -> str:
     parse tree must therefore go through ``str()`` before it is compared, used
     as a dict key, or returned to callers.
 
-    Only equality fails: both classes inherit ``__hash__`` from ``str``, so
+    Only equality fails: both classes hash exactly like ``str``, so
     hashes still match and a dict or set lookup still misses, because equality
     is checked after the hash.
 
