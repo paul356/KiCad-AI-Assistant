@@ -23,9 +23,6 @@ from kcaa.utils.pcb_sexp_utils import load_pcb
 from kcaa.utils.sexp_utils import sym_str
 
 FIXTURE_PCB = os.path.join(os.path.dirname(__file__), "fixtures", "test_board_with_zones.kicad_pcb")
-PRE_V10_FIXTURE = os.path.join(
-    os.path.dirname(__file__), "fixtures", "test_board_pre_v10.kicad_pcb"
-)
 
 UUID_COPPER_GND = "1e08b401-2611-467f-9f96-aea85e324fd5"
 UUID_KEEPOUT = "c601cc88-e4d3-43a1-87e8-1daf351a0f1a"
@@ -116,38 +113,6 @@ def tmp_pcb_legacy_net_table(tmp_path):
     # KiCad 9 put the net table between (setup ...) and the footprints. A missed
     # anchor fails the test below (net stays None) instead of passing.
     text = text.replace("\t(footprint ", table + "\t(footprint ", 1)
-    dst.write_text(text, encoding="utf-8")
-    return str(dst)
-
-
-@pytest.fixture()
-def tmp_pre_v10_pcb(tmp_path):
-    """Copy the KiCad 9 (version 20241229) fixture so writes don't affect it."""
-    dst = tmp_path / "test_board_pre_v10.kicad_pcb"
-    shutil.copy2(PRE_V10_FIXTURE, dst)
-    return str(dst)
-
-
-@pytest.fixture()
-def tmp_pre_v10_pcb_pad_net(tmp_path):
-    """Pre-10 board whose net table lacks VCC; only a pad names that net."""
-    dst = tmp_path / "test_board_pre_v10_pad_net.kicad_pcb"
-    shutil.copy2(PRE_V10_FIXTURE, dst)
-    text = dst.read_text(encoding="utf-8")
-    footprint = (
-        '\t(footprint "Test:Point"\n'
-        '\t\t(layer "F.Cu")\n'
-        '\t\t(uuid "aaaaaaaa-0000-0000-0000-0000000000aa")\n'
-        "\t\t(at 10.0 10.0)\n"
-        '\t\t(pad "1" smd rect\n'
-        "\t\t\t(at 0.0 0.0)\n"
-        "\t\t\t(size 0.5 0.5)\n"
-        '\t\t\t(layers "F.Cu")\n'
-        '\t\t\t(net 2 "VCC")\n'
-        "\t\t)\n"
-        "\t)\n"
-    )
-    text = text.replace('\t(net 1 "GND")\n)', '\t(net 1 "GND")\n' + footprint + ")")
     dst.write_text(text, encoding="utf-8")
     return str(dst)
 
@@ -455,7 +420,7 @@ class TestAddZone:
 
 
 # ---------------------------------------------------------------------------
-# add_zone: net reference form follows the board format version
+# add_zone: the zone net reference form
 # ---------------------------------------------------------------------------
 
 _ADD_POINTS = [
@@ -494,35 +459,6 @@ class TestZoneNetForm:
         added = next(z for z in after["zones"] if z["uuid"] == result["zone_uuid"])
         assert added["net"] is None
         assert added["net_name"] == "GND"
-
-    def test_pre_v10_board_writes_netcode_and_name(self, tmp_pre_v10_pcb):
-        result = self._add_zone(tmp_pre_v10_pcb)
-        node = _find_zone_node(load_pcb(tmp_pre_v10_pcb), result["zone_uuid"])
-        dumped = sexpdata.dumps(node)
-        assert "(net 1)" in dumped
-        assert '(net_name "GND")' in dumped
-        assert '(net "GND")' not in dumped
-
-        after = _run(self.tools["list_zones"](tmp_pre_v10_pcb, None))
-        added = next(z for z in after["zones"] if z["uuid"] == result["zone_uuid"])
-        assert added["net"] == 1
-        assert added["net_name"] == "GND"
-
-    def test_pre_v10_board_without_a_net_table_entry_still_writes_net_name(
-        self, tmp_pre_v10_pcb_pad_net
-    ):
-        """Name resolved from a pad, so no netcode: pre-10 keeps the legacy pair."""
-        result = self._add_zone(tmp_pre_v10_pcb_pad_net, net_name="VCC")
-        assert result["net"] is None
-        node = _find_zone_node(load_pcb(tmp_pre_v10_pcb_pad_net), result["zone_uuid"])
-        dumped = sexpdata.dumps(node)
-        assert '(net "VCC")' in dumped
-        assert '(net_name "VCC")' in dumped
-
-        after = _run(self.tools["list_zones"](tmp_pre_v10_pcb_pad_net, None))
-        added = next(z for z in after["zones"] if z["uuid"] == result["zone_uuid"])
-        assert added["net"] is None
-        assert added["net_name"] == "VCC"
 
     def test_v10_keepout_keeps_legacy_net_pair(self, tmp_pcb):
         """Rule areas are untouched by #303 — they still carry (net 0)."""
@@ -616,7 +552,6 @@ class TestBareSymbolAtoms:
             polygon_pts=[{"x": 0.0, "y": 0.0}, {"x": 1.0, "y": 0.0}, {"x": 1.0, "y": 1.0}],
             net_id=net_id,
             net_name=name,
-            board_version=20241229,
             hatch_style="edge",
             hatch_pitch=0.508,
             clearance=0.5,
@@ -630,9 +565,13 @@ class TestBareSymbolAtoms:
             keepout_footprints="allowed",
             keepout_text="allowed",
         )
+        # A copper pour writes its net by name, and the name must stay a quoted
+        # string (a bare symbol would serialize as ``GND``).
+        assert node[1] == [sexpdata.Symbol("net"), "GND"]
         dumped = sexpdata.dumps(node)
-        assert '(net_name "GND")' in dumped
-        assert "(net_name GND)" not in dumped
+        assert '(net "GND")' in dumped
+        assert "(net GND)" not in dumped
+        assert "net_name" not in dumped
 
     @pytest.mark.parametrize(
         "net_node",
