@@ -66,6 +66,7 @@ from kcaa.tools.pcb_routing_tools import (  # noqa: E402
     _via_to_sexp,
 )
 from kcaa.utils.pcb_sexp_utils import load_pcb, save_pcb  # noqa: E402
+from kcaa.utils.sexp_utils import sym_str as _sym  # noqa: E402
 
 DEFAULT_PCB = os.path.join(
     _REPO_ROOT, "tests", "integration", "fixtures", "test_routing_board.kicad_pcb"
@@ -118,15 +119,6 @@ _ZONE_FACE = "#26262B"
 _ZONE_EDGE = "#707070"
 _VIA_FACE = "#1F1F23"
 _PENDING_COLOR = "#F0F0F0"
-
-
-def _sym(value: Any) -> str:
-    """Return the string form of a sexpdata Symbol or plain string.
-
-    sexpdata.Symbol subclasses str but overrides ``__eq__``, so
-    ``Symbol('pad') == 'pad'`` is False.  Always compare via this helper.
-    """
-    return str(value)
 
 
 def _layer_color(layer: str) -> str:
