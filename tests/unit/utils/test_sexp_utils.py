@@ -23,5 +23,5 @@ def test_sym_str_converts_non_symbol_values():
 
 
 def test_sym_str_returns_plain_string_for_string_atom():
-    """Quoted atoms parse as sexpdata.String, which has the same equality trap."""
+    """Guards callers that parse with string_to=sexpdata.String: same trap."""
     assert sym_str(sexpdata.String("F.Cu")) == "F.Cu"
