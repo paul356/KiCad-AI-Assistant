@@ -19,10 +19,18 @@ import uuid
 from fastmcp import Context, FastMCP
 import sexpdata
 
+from kcaa.utils.pcb_footprint_utils import get_pcb_version
 from kcaa.utils.pcb_sexp_utils import load_pcb, save_pcb
 from kcaa.utils.sexp_utils import sym_str as _sym
 
 log = logging.getLogger(__name__)
+
+# First board format version that writes a zone's net as a name only:
+# ``(net "<name>")`` instead of ``(net <code>)`` plus ``net_name``.  This is
+# the development stamp at which KiCad stopped writing netcodes, not the
+# version a shipped 10.x board necessarily carries (10.0.6 writes 20260206).
+# Older boards keep the legacy pair.
+_NETCODE_DROPPED_VERSION = 20251028
 
 
 # ---------------------------------------------------------------------------
@@ -36,7 +44,9 @@ def _parse_zone(node: list[Any]) -> dict[str, Any]:
     Returns a dict with:
         uuid         – zone UUID string (empty string if absent)
         zone_type    – ``"keepout"`` or ``"copper_pour"``
-        net          – net number (int), 0 for keepout
+        net          – netcode (``int``); ``None`` for the name-only
+                       ``(net "GND")`` form; 0 when the zone has no
+                       ``(net ...)`` node at all (e.g. keepout)
         net_name     – net name string
         layer        – layer string (single-layer zones) or list of layers
         hatch_style  – hatch style string (e.g. ``"edge"``)
@@ -177,6 +187,7 @@ def _build_zone_node(
     polygon_pts: list[dict[str, float]],
     net_id: int | None,
     net_name: str,
+    board_version: int,
     hatch_style: str,
     hatch_pitch: float,
     clearance: float,
@@ -198,7 +209,10 @@ def _build_zone_node(
         [sexpdata.Symbol("hatch"), sexpdata.Symbol(hatch_style), float(hatch_pitch)],
     ]
 
-    if net_id is None:
+    if zone_type == "copper_pour" and board_version >= _NETCODE_DROPPED_VERSION:
+        # KiCad 10: the net is a name, and there is no net_name node.
+        zone_node.insert(1, [sexpdata.Symbol("net"), net_name])
+    elif net_id is None:
         zone_node.insert(1, [sexpdata.Symbol("net"), net_name])
         if net_name:
             zone_node.insert(2, [sexpdata.Symbol("net_name"), net_name])
@@ -332,6 +346,7 @@ def register_pcb_zone_tools(mcp: FastMCP) -> None:
                 return {"error": "Each polygon point must use numeric 'x' and 'y' values."}
 
         data = load_pcb(pcb_path)
+        board_version = get_pcb_version(data)
         if layer not in _get_layer_names(data):
             return {"error": f"Layer '{layer}' is not declared in this PCB file."}
 
@@ -354,6 +369,7 @@ def register_pcb_zone_tools(mcp: FastMCP) -> None:
             polygon_pts=polygon_pts,
             net_id=resolved_net_id,
             net_name=resolved_net_name,
+            board_version=board_version,
             hatch_style=hatch_style,
             hatch_pitch=hatch_pitch,
             clearance=clearance,
