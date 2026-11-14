@@ -8,6 +8,7 @@ import re
 import shutil
 
 import pytest
+import sexpdata
 
 FIXTURE_DIR = os.path.join(os.path.dirname(__file__), "fixtures")
 BOARD_FIXTURE = os.path.join(FIXTURE_DIR, "test_board.kicad_pcb")
@@ -647,3 +648,27 @@ class TestGetRatsnestZoneCoverage:
         assert len(gnd_connected) > 0, "GND pad should be zone-connected"
         # R1/2 is GND and inside the zone polygon (5,5)→(60,5)→(60,60)→(5,60)
         assert any(p["ref"] == "R1" and p["pad"] == "2" for p in gnd_connected)
+
+
+class TestBareSymbolAtoms:
+    def test_board_info_layer_name_is_plain_str(self, tools, tmp_path):
+        """Reproduces #295: a bare layer token must not leak a Symbol to callers."""
+        board = tmp_path / "bare_layers.kicad_pcb"
+        board.write_text(
+            sexpdata.dumps(
+                [
+                    sexpdata.Symbol("kicad_pcb"),
+                    [
+                        sexpdata.Symbol("layers"),
+                        [0, sexpdata.Symbol("F.Cu"), sexpdata.Symbol("signal")],
+                        [1, sexpdata.Symbol("Jumper"), sexpdata.Symbol("jumper")],
+                    ],
+                ]
+            ),
+            encoding="utf-8",
+        )
+        result = _run(tools["get_board_info"](pcb_path=str(board), ctx=None))
+        name = result["all_layers"][0]["name"]
+        assert name == "F.Cu"
+        assert type(name) is str and not isinstance(name, sexpdata.Symbol)
+        assert result["copper_layer_count"] == 2

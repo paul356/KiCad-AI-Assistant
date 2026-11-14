@@ -191,7 +191,7 @@ def _get_layer_str(node: list[Any]) -> str | None:
     for sub in node:
         if _is_list(sub) and _sym(sub[0]) == "layer" and len(sub) >= 2:
             v = sub[1]
-            return v if isinstance(v, str) else _sym(v)
+            return _sym(v)
     return None
 
 

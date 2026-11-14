@@ -14,6 +14,9 @@ import re
 import shutil
 
 import pytest
+import sexpdata
+
+from kcaa.tools.pcb_zone_tools import _build_zone_node, _find_net_by_name, _parse_zone
 
 FIXTURE_PCB = os.path.join(os.path.dirname(__file__), "fixtures", "test_board_with_zones.kicad_pcb")
 
@@ -373,3 +376,52 @@ class TestDeleteZone:
             _run(self.delete_zone(tmp_pcb, uuid, None))
         after = _run(self.list_zones(tmp_pcb, None))
         assert after["count"] == 0
+
+
+class TestBareSymbolAtoms:
+    def test_parse_zone_net_name_is_plain_str(self):
+        """Reproduces #295: a bare net-name atom must be returned as a plain str."""
+        node = [
+            sexpdata.Symbol("zone"),
+            [sexpdata.Symbol("net_name"), sexpdata.Symbol("GND")],
+            [sexpdata.Symbol("layer"), sexpdata.Symbol("F.Cu")],
+        ]
+        result = _parse_zone(node)
+        assert result["net_name"] == "GND"
+        assert type(result["net_name"]) is str and not isinstance(
+            result["net_name"], sexpdata.Symbol
+        )
+
+    def test_find_net_and_build_zone_write_plain_string(self):
+        """Reproduces #295: a bare net-table name must be written back quoted."""
+        data = [[sexpdata.Symbol("net"), 1, sexpdata.Symbol("GND")]]
+        found = _find_net_by_name(data, "GND")
+        assert found is not None
+        net_id, name = found
+        assert net_id == 1
+        assert name == "GND"
+        assert type(name) is str and not isinstance(name, sexpdata.Symbol)
+
+        node = _build_zone_node(
+            zone_uuid="zone-test",
+            zone_type="copper_pour",
+            layer="F.Cu",
+            polygon_pts=[{"x": 0.0, "y": 0.0}, {"x": 1.0, "y": 0.0}, {"x": 1.0, "y": 1.0}],
+            net_id=net_id,
+            net_name=name,
+            hatch_style="edge",
+            hatch_pitch=0.508,
+            clearance=0.5,
+            min_thickness=0.25,
+            fill=True,
+            thermal_gap=0.5,
+            thermal_bridge_width=0.5,
+            keepout_tracks="not_allowed",
+            keepout_vias="not_allowed",
+            keepout_copperpour="not_allowed",
+            keepout_footprints="allowed",
+            keepout_text="allowed",
+        )
+        dumped = sexpdata.dumps(node)
+        assert '(net_name "GND")' in dumped
+        assert "(net_name GND)" not in dumped

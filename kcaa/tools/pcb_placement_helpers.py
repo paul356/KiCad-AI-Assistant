@@ -222,9 +222,9 @@ def _get_footprint_bbox_at(
             continue
         for sub in item:
             if isinstance(sub, list) and len(sub) >= 3 and _sym(sub[0]) == "property":
-                prop_name = sub[1] if isinstance(sub[1], str) else _sym(sub[1])
+                prop_name = _sym(sub[1])
                 if prop_name == "Reference":
-                    ref_val = sub[2] if isinstance(sub[2], str) else _sym(sub[2])
+                    ref_val = _sym(sub[2])
                     if ref_val == reference:
                         return get_fp_courtyard_bbox(item, x, y, rotation)
     return None
@@ -310,9 +310,9 @@ def _get_fp_pads_world(fp_node: list[Any]) -> list[dict[str, Any]]:
                 # KiCad 8.x: (net "name") — 2 elements
                 # KiCad <8:  (net N "name") — 3 elements
                 if len(psub) >= 3 and not isinstance(psub[1], str):
-                    net_name = psub[2] if isinstance(psub[2], str) else _sym(psub[2])
+                    net_name = _sym(psub[2])
                 else:
-                    net_name = psub[1] if isinstance(psub[1], str) else _sym(psub[1])
+                    net_name = _sym(psub[1])
         abs_x = fp_x + rel_x * cos_t + rel_y * sin_t
         abs_y = fp_y - rel_x * sin_t + rel_y * cos_t
         pads.append({"x": abs_x, "y": abs_y, "net": net_name})
@@ -351,9 +351,9 @@ def _get_fp_local_pads(fp_node: list[Any]) -> list[dict[str, Any]]:
                     pad_w, pad_h = float(psub[1]), float(psub[2])
             elif isinstance(psub, list) and len(psub) >= 2 and _sym(psub[0]) == "net":
                 if len(psub) >= 3 and not isinstance(psub[1], str):
-                    net_name = psub[2] if isinstance(psub[2], str) else _sym(psub[2])
+                    net_name = _sym(psub[2])
                 else:
-                    net_name = psub[1] if isinstance(psub[1], str) else _sym(psub[1])
+                    net_name = _sym(psub[1])
         pads.append(
             {
                 "lx": lx,
@@ -420,9 +420,9 @@ def _compute_group_hpwl(data: list[Any], refs: set[str]) -> float:
         ref = ""
         for sub in item:
             if isinstance(sub, list) and len(sub) >= 3 and _sym(sub[0]) == "property":
-                pname = sub[1] if isinstance(sub[1], str) else _sym(sub[1])
+                pname = _sym(sub[1])
                 if pname == "Reference":
-                    ref = sub[2] if isinstance(sub[2], str) else _sym(sub[2])
+                    ref = _sym(sub[2])
                     break
         if ref not in refs:
             continue
@@ -843,9 +843,9 @@ def _compute_hpwl_with_hypothetical_group(
         ref = ""
         for sub in item:
             if isinstance(sub, list) and len(sub) >= 3 and _sym(sub[0]) == "property":
-                pname = sub[1] if isinstance(sub[1], str) else _sym(sub[1])
+                pname = _sym(sub[1])
                 if pname == "Reference":
-                    ref = sub[2] if isinstance(sub[2], str) else _sym(sub[2])
+                    ref = _sym(sub[2])
                     break
         if ref in group_refs:
             continue  # Skip group members — we'll add them from the layout
@@ -958,9 +958,9 @@ def _find_group_board_position(
             continue
         for sub in item:
             if isinstance(sub, list) and len(sub) >= 3 and _sym(sub[0]) == "property":
-                prop_name = sub[1] if isinstance(sub[1], str) else _sym(sub[1])
+                prop_name = _sym(sub[1])
                 if prop_name == "Reference":
-                    ref_val = sub[2] if isinstance(sub[2], str) else _sym(sub[2])
+                    ref_val = _sym(sub[2])
                     if ref_val in group_refs:
                         fp_node_cache[ref_val] = item
                     break
