@@ -83,9 +83,9 @@ def _get_fp_reference(fp_node: list[Any]) -> str | None:
     """Extract the Reference property value from a footprint node."""
     for sub in fp_node:
         if isinstance(sub, list) and len(sub) >= 3 and _sym(sub[0]) == "property":
-            name = sub[1] if isinstance(sub[1], str) else _sym(sub[1])
+            name = _sym(sub[1])
             if name == "Reference":
-                return sub[2] if isinstance(sub[2], str) else _sym(sub[2])
+                return _sym(sub[2])
     return None
 
 
@@ -132,9 +132,9 @@ def get_fp_property(fp_node: list[Any], name: str) -> str | None:
     """Return the value of a named ``property`` in a footprint node, or None."""
     for sub in fp_node:
         if isinstance(sub, list) and len(sub) >= 3 and _sym(sub[0]) == "property":
-            prop_name = sub[1] if isinstance(sub[1], str) else _sym(sub[1])
+            prop_name = _sym(sub[1])
             if prop_name == name:
-                return sub[2] if isinstance(sub[2], str) else _sym(sub[2])
+                return _sym(sub[2])
     return None
 
 
@@ -145,7 +145,7 @@ def set_fp_property(fp_node: list[Any], name: str, value: str) -> bool:
     """
     for sub in fp_node:
         if isinstance(sub, list) and len(sub) >= 3 and _sym(sub[0]) == "property":
-            prop_name = sub[1] if isinstance(sub[1], str) else _sym(sub[1])
+            prop_name = _sym(sub[1])
             if prop_name == name:
                 sub[2] = value
                 return True
@@ -244,7 +244,7 @@ def upsert_fp_property(fp_node: list[Any], name: str, value: str, *, hidden: boo
     node = None
     for sub in fp_node:
         if isinstance(sub, list) and len(sub) >= 3 and _sym(sub[0]) == "property":
-            prop_name = sub[1] if isinstance(sub[1], str) else _sym(sub[1])
+            prop_name = _sym(sub[1])
             if prop_name == name:
                 node = sub
                 break
@@ -263,7 +263,7 @@ def get_fp_layer(fp_node: list[Any]) -> str | None:
     """Return the primary layer of a footprint (e.g. ``'F.Cu'``)."""
     for sub in fp_node:
         if isinstance(sub, list) and len(sub) >= 2 and _sym(sub[0]) == "layer":
-            return sub[1] if isinstance(sub[1], str) else _sym(sub[1])
+            return _sym(sub[1])
     return None
 
 
@@ -327,14 +327,14 @@ def _flip_layers_recursive(node: Any) -> None:
         if isinstance(sub, list):
             if len(sub) >= 2 and _sym(sub[0]) == "layer":
                 # (layer "F.Cu") — singular layer reference
-                current = sub[1] if isinstance(sub[1], str) else _sym(sub[1])
+                current = _sym(sub[1])
                 flipped = LAYER_FLIP_MAP.get(current)
                 if flipped:
                     sub[1] = flipped
             elif len(sub) >= 2 and _sym(sub[0]) == "layers":
                 # (layers "F.Cu" "F.Paste" "F.Mask") — SMD pad multi-layer list
                 for j in range(1, len(sub)):
-                    layer_str = sub[j] if isinstance(sub[j], str) else _sym(sub[j])
+                    layer_str = _sym(sub[j])
                     flipped = LAYER_FLIP_MAP.get(layer_str)
                     if flipped:
                         sub[j] = flipped
@@ -376,7 +376,7 @@ def split_footprint_header(node: list[Any]) -> tuple[str | None, str]:
     The header string is ``"Library:Name"`` when the footprint came from a
     library, or just ``"Name"`` for footprints created on the board.
     """
-    header = node[1] if len(node) > 1 and isinstance(node[1], str) else ""
+    header = _sym(node[1]) if len(node) > 1 and isinstance(node[1], str) else ""
     if ":" in header:
         lib, _, name = header.rpartition(":")
         return (lib or None), name
@@ -639,7 +639,7 @@ def normalize_footprint_for_library(
         elif key in _INSTANCE_ONLY_KEYS:
             del node[i]
         elif key == "property":
-            prop_name = child[1] if len(child) > 1 and isinstance(child[1], str) else ""
+            prop_name = _sym(child[1]) if len(child) > 1 and isinstance(child[1], str) else ""
             if prop_name in _INSTANCE_PROPERTIES:
                 text_type = "reference" if prop_name == "Reference" else "value"
                 if _has_fp_text_of_type(node, text_type):

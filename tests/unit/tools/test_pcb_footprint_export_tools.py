@@ -2011,3 +2011,37 @@ class TestListLibraryFootprints:
 
     def test_tool_is_registered(self, tools):
         assert "list_library_footprints" in tools
+
+
+class TestBareSymbolAtoms:
+    def test_bare_property_and_header_atoms_are_plain_str(self):
+        """Reproduces #295: bare property/header atoms must still be matched."""
+        import sexpdata
+
+        tree = sexpdata.loads(
+            "(kicad_pcb"
+            " (footprint R1"
+            '  (layer "F.Cu")'
+            '  (fp_text reference "R1" (at 0 1.5) (layer "F.SilkS"))'
+            '  (property Reference "R1" (at 0 1.5) (layer "F.SilkS"))'
+            " )"
+            ")"
+        )
+        fp = next(n for n in tree if isinstance(n, list) and n and str(n[0]) == "footprint")
+
+        out = normalize_footprint_for_library(fp, 20260206, "MyLib")
+
+        props = [c for c in out if isinstance(c, list) and c and str(c[0]) == "property"]
+        assert props == [], "duplicate instance property must be dropped"
+        ref_texts = [
+            c
+            for c in out
+            if isinstance(c, list)
+            and len(c) > 1
+            and str(c[0]) == "fp_text"
+            and str(c[1]) == "reference"
+        ]
+        assert len(ref_texts) == 1, "the existing fp_text must be kept, not duplicated"
+        lib, name = split_footprint_header(out)
+        assert (lib, name) == (None, "R1")
+        assert type(name) is str

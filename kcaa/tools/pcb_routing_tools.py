@@ -42,6 +42,7 @@ from kcaa.utils.config import (
     route_frame_budget,
 )
 from kcaa.utils.pcb_sexp_utils import load_pcb, save_pcb
+from kcaa.utils.sexp_utils import sym_str as _sym
 
 log = logging.getLogger(__name__)
 
@@ -751,7 +752,7 @@ def _get_net_name(net_node: list) -> str | None:
         raw = net_node[1]
     else:
         return None
-    return raw if isinstance(raw, str) else str(raw)
+    return _sym(raw)
 
 
 def _segment_fields(node: list) -> dict | None:

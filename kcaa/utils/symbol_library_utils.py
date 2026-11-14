@@ -119,7 +119,7 @@ def _parse_sym_lib_table_raw(table_path: str, env: dict[str, str]) -> list[dict[
             if not (isinstance(sub, list) and len(sub) >= 2):
                 continue
             key = _sym(sub[0])
-            val = sub[1] if isinstance(sub[1], str) else _sym(sub[1])
+            val = _sym(sub[1])
             if key == "name":
                 entry["nickname"] = val
             elif key == "type":

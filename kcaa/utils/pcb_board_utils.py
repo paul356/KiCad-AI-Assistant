@@ -29,7 +29,7 @@ def _get_layer(node: list[Any]) -> str | None:
     """Return the layer string of a graphic node, or None."""
     for sub in node:
         if isinstance(sub, list) and len(sub) >= 2 and _sym(sub[0]) == "layer":
-            return sub[1] if isinstance(sub[1], str) else _sym(sub[1])
+            return _sym(sub[1])
     return None
 
 
@@ -348,7 +348,7 @@ def get_fp_courtyard_bbox(
         layer: str | None = None
         for ssub in sub:
             if isinstance(ssub, list) and len(ssub) >= 2 and _sym(ssub[0]) == "layer":
-                layer = ssub[1] if isinstance(ssub[1], str) else _sym(ssub[1])
+                layer = _sym(ssub[1])
         if require_courtyard and layer not in _COURTYARD_LAYERS:
             return
 

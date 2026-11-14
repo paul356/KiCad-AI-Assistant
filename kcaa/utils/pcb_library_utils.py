@@ -144,7 +144,7 @@ def _parse_fp_lib_table_raw(table_path: str, env: dict[str, str]) -> list[dict[s
             if not (isinstance(sub, list) and len(sub) >= 2):
                 continue
             key = _sym(sub[0])
-            val = sub[1] if isinstance(sub[1], str) else _sym(sub[1])
+            val = _sym(sub[1])
             if key == "name":
                 entry["nickname"] = val
             elif key == "type":
@@ -294,11 +294,11 @@ def parse_kicad_mod(path: str) -> dict[str, Any]:
             continue
         key = _sym(item[0])
         if key == "descr":
-            result["description"] = item[1] if isinstance(item[1], str) else _sym(item[1])
+            result["description"] = _sym(item[1])
         elif key == "tags":
-            result["tags"] = item[1] if isinstance(item[1], str) else _sym(item[1])
+            result["tags"] = _sym(item[1])
         elif key == "layer":
-            result["layer"] = item[1] if isinstance(item[1], str) else _sym(item[1])
+            result["layer"] = _sym(item[1])
         elif key == "attr":
             # (attr smd) or (attr through_hole) — unquoted value is a Symbol
             result["attr"] = _sym(item[1])
@@ -347,7 +347,7 @@ def _parse_pad(pad_node: list[Any], sym: Any) -> dict[str, Any] | None:
             and len(sub) >= 2
             and sym(sub[0]) == "layer"
         ):
-            layer = sub[1] if isinstance(sub[1], str) else sym(sub[1])
+            layer = sym(sub[1])
     return {
         "number": str(pad_num),
         "type": str(pad_type),

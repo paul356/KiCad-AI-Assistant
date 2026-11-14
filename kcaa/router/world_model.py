@@ -191,7 +191,7 @@ def _get_layer_str(node: list[Any]) -> str | None:
     for sub in node:
         if _is_list(sub) and _sym(sub[0]) == "layer" and len(sub) >= 2:
             v = sub[1]
-            return v if isinstance(v, str) else _sym(v)
+            return _sym(v)
     return None
 
 
@@ -207,7 +207,7 @@ def _get_net(node: list[Any]) -> str | None:
     # KiCad 9+: (net <id> "<name>") — name is the last string.
     for v in reversed(sub[1:]):
         if isinstance(v, str):
-            return v
+            return _sym(v)
         s = _sym(v)
         if s and not s.lstrip("-").isdigit():
             return s
@@ -409,10 +409,7 @@ def _pad_copper_layers(layers_node: list[Any]) -> frozenset[str]:
         return frozenset()
     result: set[str] = set()
     for v in layers_node[1:]:
-        if isinstance(v, str):
-            name = v
-        else:
-            name = _sym(v)
+        name = _sym(v)
         if name == "*.Cu":
             return _ALL_COPPER_LAYERS
         if name.endswith(".Cu") and not name.endswith(("Mask.Cu", "Paste.Cu")):
