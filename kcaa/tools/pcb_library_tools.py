@@ -1085,11 +1085,6 @@ def register_pcb_library_tools(mcp: FastMCP) -> None:
             not_found: list[dict[str, Any]] = []
             removed_total = 0
             for item in references:
-                if isinstance(item, str):
-                    # sexpdata.Symbol subclasses str but its __eq__ is
-                    # class-exact, so an unquoted reference would pass this
-                    # validation and then never match a board property.
-                    item = _sym(item)
                 if not isinstance(item, str) or not item:
                     error = "reference must be a non-empty string"
                     ref_label = item if isinstance(item, str) else str(item)
@@ -1924,9 +1919,7 @@ def _resolve_board_net(data: list[Any], name: str | None) -> tuple[int | None, s
         net_name: str | None = None
         for v in item[1:]:
             if isinstance(v, str):
-                # Convert bare tokens: a Symbol name never equals the
-                # plain-str name the caller passes.
-                net_name = _sym(v)
+                net_name = v
         if net_name is None:
             continue
         raw_id = item[1]

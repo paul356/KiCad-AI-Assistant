@@ -751,9 +751,7 @@ def _get_net_name(net_node: list) -> str | None:
         raw = net_node[1]
     else:
         return None
-    # A bare net name (GND) parses to a sexpdata.Symbol, whose __eq__ is
-    # class-exact; return a plain str so name comparisons work.
-    return str(raw)
+    return raw if isinstance(raw, str) else str(raw)
 
 
 def _segment_fields(node: list) -> dict | None:
@@ -873,17 +871,9 @@ def _track_matches_segment(track: TrackObstacle, fields: dict, eps: float = 1e-6
             continue
         if abs(track.width - fields["width"]) > eps:
             continue
-        # ``fields["layer"]`` is a plain str (``_segment_fields``), while
-        # ``track.layer`` may still be a raw sexpdata.Symbol from
-        # router/world_model._get_layer_str (owned by #287); normalize both
-        # for the same reason as the net below.
-        if str(fields["layer"]) != str(track.layer):
+        if fields["layer"] != track.layer:
             continue
-        # ``fields["net"]`` is a normalized plain str (``_get_net_name``),
-        # while ``track.net`` may still be a raw sexpdata.Symbol from
-        # router/world_model._get_net (owned by #287); normalize both so an
-        # unquoted ``(net GND)`` matches and the original segment is removed.
-        if track.net is not None and str(fields["net"]) != str(track.net):
+        if track.net is not None and fields["net"] != track.net:
             continue
         return True
     return False

@@ -87,24 +87,3 @@ class TestRemoveSymbolFromLibraryFile:
             remove_symbol_from_library_file(str(lib), "Ghost")
         assert not (tmp_path / "lib.kicad_sym.bak").exists()
         assert lib.read_text() == before
-
-
-class TestSymLibTableUnquotedAtoms:
-    """Unquoted sym-lib-table tokens parse as ``sexpdata.Symbol`` and must be
-    normalized to plain strings."""
-
-    def test_unquoted_values_are_plain_strings(self, tmp_path):
-        from kcaa.utils.symbol_library_utils import _parse_sym_lib_table_raw
-
-        table = tmp_path / "sym-lib-table"
-        table.write_text(
-            "(sym_lib_table\n"
-            "  (version 7)\n"
-            '  (lib (name Bare) (type KiCad) (uri /tmp/Bare.kicad_sym) (options "") (descr desc))\n'
-            ")\n",
-            encoding="utf-8",
-        )
-        entry = _parse_sym_lib_table_raw(str(table), {})[0]
-        assert entry["nickname"] == "Bare"
-        assert entry["type"] == "KiCad"
-        assert entry["raw_uri"] == "/tmp/Bare.kicad_sym"

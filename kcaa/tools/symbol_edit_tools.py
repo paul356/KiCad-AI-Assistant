@@ -331,19 +331,15 @@ def _extract_cached_raw_entries(sch: Any) -> list[tuple[str, list]]:
     for entry in tree:
         if not (isinstance(entry, list) and len(entry) >= 2 and isinstance(entry[1], str)):
             continue
-        # sexpdata.Symbol subclasses str but compares class-exactly, and the
-        # id becomes a dict key (``cached_by_id.get(requested)``), so an
-        # unquoted ``(symbol Device:R ...)`` must be reduced to plain str.
-        entry_id = str(entry[1])
         # entry itself is the raw list when injected, or a LibSymbol wrapper
         # when loaded by skip — unwrap to the raw list.
         raw = (
             entry
             if isinstance(entry[0], sexpdata.Symbol)
-            else _cached_lib_symbol_raw(sch, entry_id)
+            else _cached_lib_symbol_raw(sch, entry[1])
         )
         if raw is not None:
-            entries.append((entry_id, raw))
+            entries.append((entry[1], raw))
     return entries
 
 
@@ -948,26 +944,6 @@ def _find_safe_placement(
     return x, y
 
 
-def _reference_prefix(lib_sym_raw: list) -> str:
-    """Return the ``Reference`` prefix declared by a lib symbol, or ``"U"``.
-
-    ``lib_sym_raw`` comes straight from an s-expression parse: an unquoted
-    property value (``U``) is a ``sexpdata.Symbol``, whose ``__eq__`` is
-    class-exact.  Convert it to a plain ``str`` so every consumer compares
-    and formats it as text; a missing or non-string value keeps ``"U"``.
-    """
-    for child in lib_sym_raw[2:]:
-        if (
-            isinstance(child, list)
-            and len(child) >= 3
-            and isinstance(child[0], sexpdata.Symbol)
-            and child[0].value() == "property"
-            and child[1] == "Reference"
-        ):
-            return str(child[2]) if isinstance(child[2], str) else "U"
-    return "U"
-
-
 def _do_add_symbol(
     schematic_path: str,
     library_name: str,
@@ -1062,7 +1038,17 @@ def _do_add_symbol(
             return {"error": f"Failed to inject lib symbol: {exc}"}
 
         unit_count = _get_unit_count(lib_sym_raw)
-        prefix = _reference_prefix(lib_sym_raw)
+        prefix = "U"
+        for child in lib_sym_raw[2:]:
+            if (
+                isinstance(child, list)
+                and len(child) >= 3
+                and isinstance(child[0], sexpdata.Symbol)
+                and child[0].value() == "property"
+                and child[1] == "Reference"
+            ):
+                prefix = child[2] if isinstance(child[2], str) else "U"
+                break
         reference = _next_reference(sch, prefix, schematic_path=schematic_path)
 
         project_name = _find_project_name(schematic_path)

@@ -69,23 +69,23 @@ def _parse_zone(node: list[Any]) -> dict[str, Any]:
         key = _sym(sub[0])
 
         if key == "uuid":
-            result["uuid"] = _sym(sub[1])
+            result["uuid"] = sub[1] if isinstance(sub[1], str) else _sym(sub[1])
         elif key == "net":
             try:
                 result["net"] = int(sub[1])
             except (IndexError, ValueError, TypeError):
                 if len(sub) >= 2 and sub[1] != "":
                     result["net"] = None
-                    result["net_name"] = _sym(sub[1])
+                    result["net_name"] = sub[1] if isinstance(sub[1], str) else _sym(sub[1])
         elif key == "net_name":
-            result["net_name"] = _sym(sub[1])
+            result["net_name"] = sub[1] if isinstance(sub[1], str) else _sym(sub[1])
         elif key == "layer":
-            result["layer"] = _sym(sub[1])
+            result["layer"] = sub[1] if isinstance(sub[1], str) else _sym(sub[1])
         elif key == "layers":
-            result["layer"] = [_sym(s) for s in sub[1:]]
+            result["layer"] = [(s if isinstance(s, str) else _sym(s)) for s in sub[1:]]
         elif key == "hatch":
             if len(sub) >= 2:
-                result["hatch_style"] = _sym(sub[1])
+                result["hatch_style"] = sub[1] if isinstance(sub[1], str) else _sym(sub[1])
         elif key == "keepout":
             result["zone_type"] = "keepout"
             rules: dict[str, str] = {}
@@ -96,7 +96,7 @@ def _parse_zone(node: list[Any]) -> dict[str, Any]:
         elif key == "fill":
             # (fill yes ...) or (fill (thermal_gap ...) ...)
             if len(sub) >= 2:
-                val = _sym(sub[1])
+                val = sub[1] if isinstance(sub[1], str) else _sym(sub[1])
                 result["fill"] = val not in ("no", "none")
             else:
                 result["fill"] = True
@@ -130,7 +130,7 @@ def _get_layer_names(data: list[Any]) -> set[str]:
             names: set[str] = set()
             for sub in item[1:]:
                 if isinstance(sub, list) and len(sub) >= 2:
-                    names.add(_sym(sub[1]))
+                    names.add(sub[1] if isinstance(sub[1], str) else _sym(sub[1]))
             return names
     return set()
 
@@ -143,7 +143,7 @@ def _find_net_by_name(data: list[Any], net_name: str) -> tuple[int | None, str] 
                 net_id = int(item[1])
             except (TypeError, ValueError):
                 continue
-            name = _sym(item[2])
+            name = item[2] if isinstance(item[2], str) else _sym(item[2])
             if name == net_name:
                 return net_id, name
 
@@ -159,9 +159,9 @@ def _find_net_by_name(data: list[Any], net_name: str) -> tuple[int | None, str] 
                 if not (isinstance(psub, list) and len(psub) >= 2 and _sym(psub[0]) == "net"):
                     continue
                 if len(psub) >= 3:
-                    raw_name = _sym(psub[2])
+                    raw_name = psub[2] if isinstance(psub[2], str) else _sym(psub[2])
                 else:
-                    raw_name = _sym(psub[1])
+                    raw_name = psub[1] if isinstance(psub[1], str) else _sym(psub[1])
                 if raw_name == net_name:
                     return None, raw_name
     return None

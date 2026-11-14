@@ -3787,9 +3787,8 @@ def _pcb_layer_names(data: list) -> list[str]:
         for sub in item[1:]:
             if not _is_list(sub) or len(sub) < 2:
                 continue
-            # sexpdata.Symbol subclasses str but its __eq__ is class-exact,
-            # so a bare token ("F.Cu") must be converted to a plain str.
-            names.append(str(sub[1]))
+            v = sub[1]
+            names.append(v if isinstance(v, str) else str(v))
         return names
     return []
 
@@ -3954,16 +3953,17 @@ def _find_footprint(data: list, ref: str) -> list | None:
             if str(sub[0]) != "property":
                 continue
             if len(sub) >= 3 and str(sub[1]) == "Reference":
-                if str(sub[2]) == ref:
+                v = sub[2]
+                val = v if isinstance(v, str) else str(v)
+                if val == ref:
                     return item
     return None
 
 
 def _get_pad_name(pad_node: list) -> str:
     if len(pad_node) >= 2:
-        # A bare pad name ("1") is a sexpdata.Symbol, whose __eq__ is
-        # class-exact; return a plain str so name comparisons work.
-        return str(pad_node[1])
+        v = pad_node[1]
+        return v if isinstance(v, str) else str(v)
     return ""
 
 
@@ -4008,8 +4008,7 @@ def _pad_layers(pad_node: list) -> list[str]:
     for sub in pad_node:
         if _is_list(sub) and str(sub[0]) == "layers" and len(sub) >= 2:
             for v in sub[1:]:
-                # Convert bare tokens (sexpdata.Symbol) so "*.Cu" matches.
-                name = str(v)
+                name = v if isinstance(v, str) else str(v)
                 if name == "*.Cu":
                     layers.extend(_ALL_COPPER)
                 else:
@@ -4313,7 +4312,7 @@ def _same_net_pad_polygons(
                 and len(sub) >= 3
                 and str(sub[1]) == "Reference"
             ):
-                ref = str(sub[2])
+                ref = sub[2] if isinstance(sub[2], str) else str(sub[2])
         for sub in item:
             if not _is_list(sub) or str(sub[0]) != "pad":
                 continue
