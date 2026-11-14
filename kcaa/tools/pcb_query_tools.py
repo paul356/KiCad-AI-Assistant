@@ -174,7 +174,9 @@ def register_pcb_query_tools(mcp: FastMCP) -> None:
             elif key == "generator_version":
                 generator_version = item[1] if isinstance(item[1], str) else _sym(item[1])
 
-        copper_layers = [lay for lay in layers if lay["type"] in ("signal", "mixed", "power")]
+        copper_layers = [
+            lay for lay in layers if lay["type"] in ("signal", "mixed", "power", "jumper")
+        ]
 
         # KiCad 8 has net 0 with empty name, KiCad 10 doesn't
         has_empty_net = any(name == "" for name in pad_net_names) or net_count == 0

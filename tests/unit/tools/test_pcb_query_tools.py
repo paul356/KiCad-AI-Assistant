@@ -14,6 +14,7 @@ BOARD_FIXTURE = os.path.join(FIXTURE_DIR, "test_board.kicad_pcb")
 BOARD_WITH_OUTLINE_FIXTURE = os.path.join(FIXTURE_DIR, "test_board_with_outline.kicad_pcb")
 BOARD_WITH_ZONES_FIXTURE = os.path.join(FIXTURE_DIR, "test_board_with_zones.kicad_pcb")
 BOARD_FOUR_LAYERS_FIXTURE = os.path.join(FIXTURE_DIR, "test_board_four_layers.kicad_pcb")
+BOARD_JUMPER_LAYER_FIXTURE = os.path.join(FIXTURE_DIR, "test_board_jumper_layer.kicad_pcb")
 
 
 # ── Segment/via snippets to append to a board file ──────────────────────
@@ -187,6 +188,14 @@ class TestGetBoardInfo:
         assert result["copper_layer_count"] == 4
         for layer in result["all_layers"]:
             assert layer["type"] == "signal"
+
+    # Reproduces #294: `jumper` is a copper layer type per the board format.
+    def test_jumper_layer_counts_as_copper(self, tools):
+        result = _run(tools["get_board_info"](pcb_path=BOARD_JUMPER_LAYER_FIXTURE, ctx=None))
+        assert result["copper_layer_count"] == 3
+        jumper_layers = [layer for layer in result["all_layers"] if layer["name"] == "Jumper"]
+        assert len(jumper_layers) == 1
+        assert jumper_layers[0]["type"] == "jumper"
 
     def test_raises_on_missing_file(self, tools):
         with pytest.raises((FileNotFoundError, ValueError, Exception)):
