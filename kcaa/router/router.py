@@ -94,6 +94,7 @@ from kcaa.router.via_check import ProposedVia, check_vias
 from kcaa.router.visibility_graph import RouteNode
 from kcaa.router.world_model import Obstacle, _get_net, build_world_model
 from kcaa.utils.pcb_sexp_utils import load_pcb
+from kcaa.utils.sexp_utils import sym_str as _sym
 
 logger = logging.getLogger(__name__)
 
@@ -3788,7 +3789,7 @@ def _pcb_layer_names(data: list) -> list[str]:
             if not _is_list(sub) or len(sub) < 2:
                 continue
             v = sub[1]
-            names.append(v if isinstance(v, str) else str(v))
+            names.append(_sym(v))
         return names
     return []
 
@@ -3954,7 +3955,7 @@ def _find_footprint(data: list, ref: str) -> list | None:
                 continue
             if len(sub) >= 3 and str(sub[1]) == "Reference":
                 v = sub[2]
-                val = v if isinstance(v, str) else str(v)
+                val = _sym(v)
                 if val == ref:
                     return item
     return None
@@ -3963,7 +3964,7 @@ def _find_footprint(data: list, ref: str) -> list | None:
 def _get_pad_name(pad_node: list) -> str:
     if len(pad_node) >= 2:
         v = pad_node[1]
-        return v if isinstance(v, str) else str(v)
+        return _sym(v)
     return ""
 
 
@@ -4008,7 +4009,7 @@ def _pad_layers(pad_node: list) -> list[str]:
     for sub in pad_node:
         if _is_list(sub) and str(sub[0]) == "layers" and len(sub) >= 2:
             for v in sub[1:]:
-                name = v if isinstance(v, str) else str(v)
+                name = _sym(v)
                 if name == "*.Cu":
                     layers.extend(_ALL_COPPER)
                 else:
@@ -4312,7 +4313,7 @@ def _same_net_pad_polygons(
                 and len(sub) >= 3
                 and str(sub[1]) == "Reference"
             ):
-                ref = sub[2] if isinstance(sub[2], str) else str(sub[2])
+                ref = _sym(sub[2])
         for sub in item:
             if not _is_list(sub) or str(sub[0]) != "pad":
                 continue
