@@ -1734,13 +1734,14 @@ class TestMCPToolTimeoutAndInterrupt:
         assert len(tool_results) == 1
         assert json.loads(tool_results[0]["content"])["interrupted"] is True
 
-    def test_failed_call_result_written_into_session_payload(self):
+    def test_failed_call_result_written_into_session_payload(self, board_project):
         """A failed tool call must write a result entry carrying the
         server-side error into the session payload (llm_history), so the next
         turn can see why the call failed."""
+        pcb, _pro = board_project
         client = _make_client()
         route_args = {
-            "pcb_path": "/tmp/board.kicad_pcb",
+            "pcb_path": pcb,
             "ref_a": "U11",
             "pad_a": "3v3",
             "ref_b": "J2",
@@ -2028,16 +2029,17 @@ class TestMCPToolTimeoutAndInterrupt:
         for m in tool_results:
             assert json.loads(m["content"])["interrupted"] is True
 
-    def test_snapshot_phase_timeout_aborts_turn_with_marker(self):
+    def test_snapshot_phase_timeout_aborts_turn_with_marker(self, board_project):
         """A Stop/deadline landing during the pre-tool snapshot phase must
         carry the marker: the turn aborts with [Error] and records
         timed_out, and the main tool never runs with a fresh deadline."""
+        pcb, _pro = board_project
         client = _make_client()
         client._mcp_tool_timeout = 0.05
         client._call_llm = MagicMock(
             return_value=self._tool_response(
                 name="pcb_route_pad_to_pad",
-                args={"pcb_path": "/tmp/board.kicad_pcb", "pad1": "A1", "pad2": "B2"},
+                args={"pcb_path": pcb, "pad1": "A1", "pad2": "B2"},
             )
         )
         client._enabled_tools = {"pcb_route_pad_to_pad"}
@@ -7183,17 +7185,18 @@ class TestSkillAutoInject:
     def _ok_server(self, *_args, **_kwargs):
         return {"success": True}
 
-    def test_first_declared_tool_call_injects_skill_body(self, tmp_path):
+    def test_first_declared_tool_call_injects_skill_body(self, tmp_path, board_project):
         """Red-green core: after a call to a declared tool, the skill body is
         present in history as a user-role message positioned AFTER that
         batch's tool results."""
+        pcb, _pro = board_project
         client, skills_dir = self._client_with_placement_tool(tmp_path)
         client._call_llm = MagicMock(
             side_effect=[
                 self._tool_response(
                     "set_footprint_position",
                     args={
-                        "pcb_path": "/tmp/board.kicad_pcb",
+                        "pcb_path": pcb,
                         "items": [{"reference": "R1", "x": 1.0}],
                     },
                 ),
@@ -7219,11 +7222,12 @@ class TestSkillAutoInject:
         assert guide_idx > tool_idx
         assert client._injected_skills == {"pcb-placement"}
 
-    def test_repeat_trigger_injects_nothing(self, tmp_path):
+    def test_repeat_trigger_injects_nothing(self, tmp_path, board_project):
         """A second call to a declared tool in the same session is a pure
         no-op: no body, no 'already loaded' note, no extra mutation."""
+        pcb, _pro = board_project
         client, skills_dir = self._client_with_placement_tool(tmp_path)
-        args = {"pcb_path": "/tmp/board.kicad_pcb", "items": [{"reference": "R1", "x": 1.0}]}
+        args = {"pcb_path": pcb, "items": [{"reference": "R1", "x": 1.0}]}
         client._call_llm = MagicMock(
             side_effect=[
                 self._tool_response("set_footprint_position", tc_id="tc1", args=args),
@@ -7290,10 +7294,11 @@ class TestSkillAutoInject:
         assert any("ghost_tool" in w and "ghost-skill" in w for w in warnings)
         assert mapping["ghost_tool"].name == "ghost-skill"
 
-    def test_system_prompt_byte_identical_before_after_injection(self, tmp_path):
+    def test_system_prompt_byte_identical_before_after_injection(self, tmp_path, board_project):
         """Injection must never touch the system prompt (cache stability)."""
+        pcb, _pro = board_project
         client, skills_dir = self._client_with_placement_tool(tmp_path)
-        args = {"pcb_path": "/tmp/board.kicad_pcb", "items": [{"reference": "R1", "x": 1.0}]}
+        args = {"pcb_path": pcb, "items": [{"reference": "R1", "x": 1.0}]}
         client._call_llm = MagicMock(
             side_effect=[
                 self._tool_response("set_footprint_position", tc_id="tc1", args=args),
@@ -7311,12 +7316,13 @@ class TestSkillAutoInject:
         assert len(systems) == 3
         assert systems[0] == systems[1] == systems[2]
 
-    def test_no_user_message_between_assistant_and_tool_results(self, tmp_path):
+    def test_no_user_message_between_assistant_and_tool_results(self, tmp_path, board_project):
         """Provider pairing stays intact: every assistant tool_calls message
         is immediately followed by its role:'tool' results, even when a skill
         guide was injected after the previous batch."""
+        pcb, _pro = board_project
         client, skills_dir = self._client_with_placement_tool(tmp_path)
-        args = {"pcb_path": "/tmp/board.kicad_pcb", "items": [{"reference": "R1", "x": 1.0}]}
+        args = {"pcb_path": pcb, "items": [{"reference": "R1", "x": 1.0}]}
         client._call_llm = MagicMock(
             side_effect=[
                 self._tool_response("set_footprint_position", tc_id="tc1", args=args),
