@@ -171,11 +171,15 @@ class TestListZones:
         zone = next(z for z in result["zones"] if z["uuid"] == UUID_KEEPOUT)
         assert zone["zone_type"] == "keepout"
         assert zone["net"] == 0
+        assert zone["net_name"] == ""
         assert zone["layer"] == "F.Cu"
-        assert zone["keepout_rules"]["tracks"] == "not_allowed"
-        assert zone["keepout_rules"]["vias"] == "not_allowed"
-        assert zone["keepout_rules"]["copperpour"] == "not_allowed"
-        assert zone["keepout_rules"]["footprints"] == "allowed"
+        assert zone["keepout_rules"] == {
+            "tracks": "not_allowed",
+            "vias": "not_allowed",
+            "pads": "allowed",
+            "copperpour": "not_allowed",
+            "footprints": "allowed",
+        }
 
     def test_polygon_pts_coordinates(self):
         result = _run(self.list_zones(FIXTURE_PCB, None))
@@ -280,12 +284,63 @@ class TestAddZone:
         assert result["net"] == 0
         assert result["net_name"] == ""
 
+        node = _find_zone_node(load_pcb(tmp_pcb), result["zone_uuid"])
+        keepout = next(
+            sub
+            for sub in node[1:]
+            if isinstance(sub, list) and sub and sym_str(sub[0]) == "keepout"
+        )
+        # KiCad 10's rule-area block: five clauses, in this order, `pads` always
+        # allowed, and no `text` clause (10.x rejects it on load).
+        assert sexpdata.dumps(keepout) == (
+            "(keepout (tracks allowed) (vias not_allowed) (pads allowed) "
+            "(copperpour not_allowed) (footprints allowed))"
+        )
+        assert [sym_str(rule[0]) for rule in keepout[1:]] == [
+            "tracks",
+            "vias",
+            "pads",
+            "copperpour",
+            "footprints",
+        ]
+        assert "text" not in [sym_str(rule[0]) for rule in keepout[1:]]
+
+        # A 10.x rule area carries no net node at all.
+        zone_keys = [sym_str(sub[0]) for sub in node[1:] if isinstance(sub, list) and sub]
+        assert "net" not in zone_keys
+        assert "net_name" not in zone_keys
+
+        # ... and the read-back is unchanged: no net node still means net 0.
         after = _run(self.list_zones(tmp_pcb, None))
         assert after["keepout_count"] == 2
         added = next(z for z in after["zones"] if z["uuid"] == result["zone_uuid"])
         assert added["zone_type"] == "keepout"
+        assert added["net"] == 0
+        assert added["net_name"] == ""
         assert added["layer"] == "B.Cu"
-        assert added["keepout_rules"]["tracks"] == "allowed"
+        assert added["keepout_rules"] == {
+            "tracks": "allowed",
+            "vias": "not_allowed",
+            "pads": "allowed",
+            "copperpour": "not_allowed",
+            "footprints": "allowed",
+        }
+
+    def test_keepout_text_parameter_is_gone(self, tmp_pcb):
+        """The concept does not exist in the KiCad 10 format (#308)."""
+        with pytest.raises(TypeError, match="keepout_text"):
+            self.add_zone(
+                pcb_path=tmp_pcb,
+                layer="B.Cu",
+                zone_type="keepout",
+                polygon_pts=[
+                    {"x": 70.0, "y": 35.0},
+                    {"x": 90.0, "y": 35.0},
+                    {"x": 90.0, "y": 55.0},
+                ],
+                keepout_text="allowed",
+                ctx=None,
+            )
 
     def test_add_copper_zone_without_top_level_net_table(self, tmp_pcb):
         """The fixture itself is a KiCad 10 board with no net table: nets live in pads."""
@@ -460,8 +515,8 @@ class TestZoneNetForm:
         assert added["net"] is None
         assert added["net_name"] == "GND"
 
-    def test_v10_keepout_keeps_legacy_net_pair(self, tmp_pcb):
-        """Rule areas are untouched by #303 — they still carry (net 0)."""
+    def test_v10_keepout_writes_no_net_node(self, tmp_pcb):
+        """A KiCad 10 rule area carries no (net ...) and no net_name node."""
         result = _run(
             self.tools["add_zone"](
                 pcb_path=tmp_pcb,
@@ -474,8 +529,8 @@ class TestZoneNetForm:
         assert result["added"] is True, result
         node = _find_zone_node(load_pcb(tmp_pcb), result["zone_uuid"])
         dumped = sexpdata.dumps(node)
-        assert "(net 0)" in dumped
-        assert '(net_name "")' in dumped
+        assert "(net " not in dumped
+        assert "net_name" not in dumped
 
 
 # ---------------------------------------------------------------------------
@@ -550,7 +605,6 @@ class TestBareSymbolAtoms:
             zone_type="copper_pour",
             layer="F.Cu",
             polygon_pts=[{"x": 0.0, "y": 0.0}, {"x": 1.0, "y": 0.0}, {"x": 1.0, "y": 1.0}],
-            net_id=net_id,
             net_name=name,
             hatch_style="edge",
             hatch_pitch=0.508,
@@ -563,7 +617,6 @@ class TestBareSymbolAtoms:
             keepout_vias="not_allowed",
             keepout_copperpour="not_allowed",
             keepout_footprints="allowed",
-            keepout_text="allowed",
         )
         # A copper pour writes its net by name, and the name must stay a quoted
         # string (a bare symbol would serialize as ``GND``).

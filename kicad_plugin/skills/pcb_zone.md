@@ -20,9 +20,11 @@ tools: [list_zones, add_zone, delete_zone, refill_zones]
    - `polygon_pts` is `[{x, y}, ...]` — minimum 3 points in board coordinates (mm, +X right, +Y down).
    - For `zone_type="copper_pour"`: `net_name` is required and must match an existing board net.
      Supply `clearance`, `min_thickness`, `fill`, `thermal_gap`, `thermal_bridge_width` as needed.
-   - For `zone_type="keepout"`: `net_name` is ignored (created on net 0). Supply
-     `keepout_tracks`, `keepout_vias`, `keepout_copperpour`, `keepout_footprints`, `keepout_text`
-     (each `"allowed"` or `"not_allowed"`).
+   - For `zone_type="keepout"`: `net_name` is ignored (a KiCad 10 rule area carries no net).
+     Supply `keepout_tracks`, `keepout_vias`, `keepout_copperpour`, `keepout_footprints`
+     (each `"allowed"` or `"not_allowed"`). Pads are always allowed by this tool,
+     matching KiCad's rule-area default; the format has no `text` rule, so there is
+     no parameter for it.
    - `hatch_style` must be `"edge"` or `"full"` (default `"edge"`, pitch 0.508 mm).
    Returns `zone_uuid` (auto-generated UUIDv4) for future reference.
 3. **Refill after file-based changes**:
@@ -49,4 +51,4 @@ tools: [list_zones, add_zone, delete_zone, refill_zones]
 - `delete_zone` looks up the zone by UUID. If the UUID is not found, it returns
   `deleted: false` — double-check the UUID from `list_zones` output.
 - Keepout rules fields default to `"not_allowed"` for tracks/vias/copperpour and
-  `"allowed"` for footprints/text — matching typical KiCad keepout defaults.
+  `"allowed"` for footprints and pads — matching KiCad's rule-area defaults.
