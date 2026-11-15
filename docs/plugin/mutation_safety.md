@@ -231,3 +231,10 @@ resolved project — never a fabricated sibling — and always contains the
 nested sheet or board about to be modified. If no `.kicad_pro` exists anywhere
 above the file, the tool call fails before the document is touched; the
 snapshot is not skipped silently.
+
+Snapshot state is keyed by **(project, file) per turn**: editing file A and
+then file B in the same project within one turn produces two archives, each
+containing the edited file's pre-turn content. Repeated edits to the same file
+reuse that turn's snapshot. An explicit `save_project_version` or
+`restore_project_version` call counts as a project-wide snapshot for the rest
+of the turn.

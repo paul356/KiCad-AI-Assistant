@@ -1706,7 +1706,12 @@ def _is_retryable_llm_error(error: str) -> bool:
 class _ToolExecutionState:
     """Per-request framework state for snapshot and reload orchestration."""
 
-    snapshotted_paths: set[str] = field(default_factory=set)
+    # One snapshot per (project, file) per turn, so a second file edited in
+    # the same project still gets its own pre-edit archive.
+    snapshotted_paths: set[tuple[str, str]] = field(default_factory=set)
+    # An explicit save_project_version/restore_project_version covers the
+    # whole project for the rest of the turn.
+    snapshotted_projects: set[str] = field(default_factory=set)
     dirty_paths: set[str] = field(default_factory=set)
 
 
@@ -3053,7 +3058,11 @@ class LLMClient:
                         f"No .kicad_pro project file found for {path!r}; searched: {searched}"
                     ),
                 }
-            if project_path not in state.snapshotted_paths:
+            file_key = (project_path, os.path.abspath(path))
+            if (
+                project_path not in state.snapshotted_projects
+                and file_key not in state.snapshotted_paths
+            ):
                 # Save the document in KiCad first to sync in-memory changes
                 # (e.g. from IPC operations) to disk before taking a snapshot.
                 save_args = {"file_path": path}
@@ -3092,7 +3101,7 @@ class LLMClient:
                         snapshot_result,
                         f"Failed to save project version before {tool_name}: {error}",
                     )
-                state.snapshotted_paths.add(project_path)
+                state.snapshotted_paths.add(file_key)
 
         result = self._call_mcp_tool_guarded(tool_name, args, cancel_event)
 
@@ -3126,7 +3135,7 @@ class LLMClient:
         if policy.track_snapshot and path:
             resolved_project = _project_path_for(path)
             if resolved_project is not None:
-                state.snapshotted_paths.add(resolved_project)
+                state.snapshotted_projects.add(resolved_project)
         if policy.clear_dirty_paths_arg:
             reload_paths = args.get(policy.clear_dirty_paths_arg, [])
             if isinstance(reload_paths, list):

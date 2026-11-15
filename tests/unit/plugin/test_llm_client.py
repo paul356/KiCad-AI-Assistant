@@ -11,6 +11,7 @@ from pathlib import Path
 import re
 import ssl
 import sys
+import tarfile
 import threading
 import time
 import types
@@ -1400,6 +1401,105 @@ class TestRunIntegration:
             ),
             (client._mcp_base_url, "reload_kicad", {"paths": [pcb]}),
         ]
+
+    def test_two_files_same_project_each_get_pre_edit_snapshot(self, tmp_path):
+        """A second file edited in the same project/turn gets its own backup."""
+        from kcaa.utils import version_manager as _vm
+
+        pro = tmp_path / "aria.kicad_pro"
+        pro.write_text("{}\n")
+        (tmp_path / "aria.kicad_sch").write_text("root\n")
+        hardware = tmp_path / "hardware"
+        hardware.mkdir()
+        file_a = hardware / "a.kicad_pcb"
+        file_b = hardware / "b.kicad_pcb"
+        file_a.write_text("A-v1\n")
+        file_b.write_text("B-v1\n")
+
+        client = _make_client()
+        tool_response = {
+            "finish_reason": "tool_calls",
+            "message": {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tcA",
+                        "type": "function",
+                        "function": {
+                            "name": "set_footprint_position",
+                            "arguments": json.dumps(
+                                {
+                                    "pcb_path": str(file_a),
+                                    "items": [{"reference": "R1", "x": 1.0}],
+                                }
+                            ),
+                        },
+                    },
+                    {
+                        "id": "tcB",
+                        "type": "function",
+                        "function": {
+                            "name": "flip_footprint",
+                            "arguments": json.dumps({"pcb_path": str(file_b), "reference": "R2"}),
+                        },
+                    },
+                ],
+            },
+        }
+        client._call_llm = MagicMock(
+            side_effect=[
+                tool_response,
+                {"finish_reason": "stop", "message": {"content": "done"}},
+            ]
+        )
+        client._enabled_tools = {"set_footprint_position", "flip_footprint"}
+
+        calls = []
+
+        def _server(base_url, name, args, timeout=None):
+            calls.append((name, args))
+            if name == "save_project_version":
+                archive = _vm.save_project_version(
+                    args["project_file"], include_files=args.get("include_files")
+                )
+                return {
+                    "success": True,
+                    "version_id": _vm.project_version_id(archive, args["project_file"]),
+                }
+            if name == "reload_kicad":
+                return {"success": True, "reloaded": args["paths"], "failed": []}
+            return {"success": True}
+
+        with patch("kicad_plugin.llm_client.call_mcp_tool", side_effect=_server):
+            result = client.run("edit two files", context_block="")
+
+        assert result == "done"
+        snapshot_args = [args for name, args in calls if name == "save_project_version"]
+        assert [args["include_files"] for args in snapshot_args] == [
+            [str(file_a)],
+            [str(file_b)],
+        ]
+
+        versions = _vm.list_project_versions(str(pro))
+        assert len(versions) == 2  # documented rule: one archive per edited file
+
+        archived: dict[str, bytes] = {}
+        archive_dir = os.path.join(tmp_path, ".versions", "project")
+        for version in versions:
+            archive_path = os.path.join(archive_dir, f"aria.project.{version['id']}.tar.gz")
+            with tarfile.open(archive_path, "r:gz") as tar:
+                for member in tar.getmembers():
+                    if member.name in (
+                        "hardware/a.kicad_pcb",
+                        "hardware/b.kicad_pcb",
+                    ):
+                        fh = tar.extractfile(member)
+                        assert fh is not None
+                        archived[member.name] = fh.read()
+        assert archived == {
+            "hardware/a.kicad_pcb": b"A-v1\n",
+            "hardware/b.kicad_pcb": b"B-v1\n",
+        }
 
     def test_explicit_save_project_version_is_reused_by_later_mutation(self, board_project):
         pcb, pro = board_project
