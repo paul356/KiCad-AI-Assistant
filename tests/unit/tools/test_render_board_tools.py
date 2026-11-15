@@ -22,6 +22,7 @@ import pytest
 
 FIXTURE_DIR = os.path.join(os.path.dirname(__file__), "fixtures")
 BOARD_FIXTURE = os.path.join(FIXTURE_DIR, "test_board.kicad_pcb")
+SIDES_FIXTURE = os.path.join(FIXTURE_DIR, "test_board_sides.kicad_pcb")
 
 from kcaa.tools.render_board_tools import (  # noqa: E402
     _BG_COLOR,
@@ -437,7 +438,10 @@ class TestRenderBoardBaseline:
         assert report["pad_labels"] > 0
         assert report["label_collisions"] >= 0
         assert isinstance(report["label_skipped"], list)
-        assert report["footprint_refs"] == 3  # R1/C1/J1 (fixture has no silk refs)
+        # KiCad writes every Reference property on F.SilkS, so the silk text
+        # itself is drawn and no fallback label is duplicated (was 3 when the
+        # hand-written fixture carried no renderable silk reference).
+        assert report["footprint_refs"] == 0
         assert report["footprint_refs_skipped"] == []
         assert len(report["region_bbox"]) == 4
         assert _png_size(png)[0] > 0
@@ -448,14 +452,19 @@ class TestRenderBoardBaseline:
         assert report["pad_labels"] == 0
         assert report["label_collisions"] == 0
         assert report["label_skipped"] == []
-        # Turning pad labels off does not kill the footprint refs.
-        assert report["footprint_refs"] == 3
+        # Pad labels stay off; the footprint references are silk text already.
+        assert report["footprint_refs"] == 0
 
     def test_connect_pads_and_layer_still_work(self):
-        _, _, report = render_board(BOARD_FIXTURE, connect_pads=["J1.1", "R1.2"], layer="F.Cu")
-        # J1.1 (GND) and R1.2 (GND) share an unrouted net -> ratsnest shown.
-        assert report["pending_nets"] == ["GND"]
+        lines, _, report = render_board(BOARD_FIXTURE, connect_pads=["R1.1", "C1.1"], layer="F.Cu")
+        # VCC has no copper track on the regenerated board, so R1.1 and C1.1
+        # stay unconnected and the renderer must draw the ratsnest between
+        # them instead of reporting the net as already routed.
+        assert report["pending_nets"] == ["VCC"]
+        assert report["routed_nets"] == []
         assert report["missing_pads"] == []
+        assert report["connect_pads_requested"] == 2
+        assert any("pending (unrouted) nets=['VCC']" in line for line in lines)
         # Layer filter does not change pad-label collision behavior.
         assert report["pads"] == FIXTURE_PADS
 
@@ -782,11 +791,12 @@ class TestPadLabelFormats:
 
 
 class TestFootprintRefs:
-    # test_board.kicad_pcb carries no silkscreen reference texts, so refs
-    # are re-drawn for every footprint that shows pads.
-    def test_drawn_for_every_footprint_by_default(self):
+    # test_board.kicad_pcb is real KiCad output, so each footprint's Reference
+    # is a visible F.SilkS property.  A full-board render draws that silk text
+    # and must not duplicate it with a fallback label.
+    def test_silk_reference_is_not_redrawn(self):
         _, _, report = render_board(BOARD_FIXTURE)
-        assert report["footprint_refs"] == 3
+        assert report["footprint_refs"] == 0
         assert report["footprint_refs_skipped"] == []
 
     def test_disabled_flag_zeroes_refs(self):
@@ -798,6 +808,21 @@ class TestFootprintRefs:
         # B.Cu render keeps only thru-hole J1 pads -> only J1 gets a ref.
         _, _, report = render_board(BOARD_FIXTURE, layer="B.Cu")
         assert report["footprint_refs"] == 1
+
+    def test_fallback_drawn_for_b_side_without_silk_refs(self):
+        # test_board_sides writes every Reference on F.SilkS.  A B.Cu render
+        # filters those silk texts out, so R2/R4 (the B-side pads) must get
+        # fallback labels instead of silently losing their designators.
+        _, _, report = render_board(SIDES_FIXTURE, layer="B.Cu")
+        assert report["footprint_refs"] == 2
+        assert report["footprint_refs_skipped"] == []
+
+    def test_fallback_suppressed_for_f_side_silk_refs(self):
+        # The same board rendered on F.Cu draws its F.SilkS references, so the
+        # fallback branch must add nothing: both halves of the rule are pinned.
+        _, _, report = render_board(SIDES_FIXTURE, layer="F.Cu")
+        assert report["footprint_refs"] == 0
+        assert report["footprint_refs_skipped"] == []
 
     def test_deduped_against_visible_silkscreen_ref(self, tmp_path):
         _, _, report = render_board(_silk_ref_board_path(tmp_path))
