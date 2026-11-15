@@ -48,6 +48,40 @@ def _project_root_for_publish(active_project: str | None) -> str | None:
     return os.path.dirname(active_project) if active_project else None
 
 
+def _take_autoroute_snapshot(board_path: str, base_url: str, call_tool) -> tuple[str, str | None]:
+    """Snapshot the project before FreeRouting touches the board.
+
+    Returns ``(backup_path, error)``.  When the board has no owning
+    ``.kicad_pro``, *error* is an actionable message and the caller must
+    abort before launching the router.  Other snapshot failures keep the
+    previous behaviour: log and route without a snapshot.
+    """
+    from ..llm_client import _project_path_for
+
+    project_path = _project_path_for(board_path)
+    if project_path is None:
+        return "", (
+            f"Auto Route needs a KiCad project before routing: no .kicad_pro "
+            f"found for {board_path!r}. Save or create a project alongside the "
+            "board (File → Save Project), then retry."
+        )
+    try:
+        result = call_tool(
+            base_url,
+            "save_project_version",
+            {"project_file": project_path, "include_files": [board_path]},
+        )
+    except Exception as exc:  # noqa: BLE001 -- snapshot must not crash the UI
+        log.warning("autoroute: version snapshot failed: %s", exc)
+        return "", None
+    if isinstance(result, dict) and result.get("error"):
+        log.warning("autoroute: version snapshot failed: %s", result["error"])
+        return "", None
+    archive_path = result.get("archive_path", "") if isinstance(result, dict) else ""
+    log.info("autoroute: project version snapshot saved to %s", archive_path)
+    return archive_path, None
+
+
 def _project_state_for_tick(
     active_project: str | None, none_ticks: int, probed_project: str | None
 ) -> tuple[int, str | None, bool]:
@@ -2963,19 +2997,22 @@ if _WX_AVAILABLE:
             board_path = board.GetFileName()
             backup_path = ""
             if board_path and os.path.isfile(board_path):
-                try:
-                    from ..llm_client import _project_path_for, call_mcp_tool
+                from ..llm_client import call_mcp_tool
 
-                    result = call_mcp_tool(
-                        self._server_mgr.base_url,
-                        "save_project_version",
-                        {"project_file": _project_path_for(board_path)},
+                backup_path, snapshot_error = _take_autoroute_snapshot(
+                    board_path, self._server_mgr.base_url, call_mcp_tool
+                )
+                if snapshot_error:
+                    shutil.rmtree(tmp_dir, ignore_errors=True)
+                    self._append_entry(
+                        {
+                            "type": "status",
+                            "text": f"⚠ {snapshot_error}",
+                            "color_hex": self._C_WARN_HEX,
+                        }
                     )
-                    backup_path = result.get("archive_path", "")
-                    log.info("autoroute: project version snapshot saved to %s", backup_path)
-                except Exception as exc:
-                    log.warning("autoroute: version snapshot failed: %s", exc)
-                    backup_path = ""
+                    self._render_conversation()
+                    return
 
             try:
                 _pcbnew.ExportSpecctraDSN(board, dsn_path)
