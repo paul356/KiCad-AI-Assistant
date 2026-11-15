@@ -234,7 +234,10 @@ snapshot is not skipped silently.
 
 Snapshot state is keyed by **(project, file) per turn**: editing file A and
 then file B in the same project within one turn produces two archives, each
-containing the edited file's pre-turn content. Repeated edits to the same file
-reuse that turn's snapshot. An explicit `save_project_version` or
-`restore_project_version` call counts as a project-wide snapshot for the rest
-of the turn.
+containing the edited file's pre-edit content (the archive is taken after
+`save_document`, immediately before the first edit). Repeated edits to the
+same file reuse that turn's snapshot. An explicit `save_project_version` or
+`restore_project_version` suppresses the per-file snapshot only for the
+project-relative files it reports covering — the default trio for a save
+without `include_files`, or the restored members for a restore. Any other
+file in the same project still gets its own pre-edit archive.

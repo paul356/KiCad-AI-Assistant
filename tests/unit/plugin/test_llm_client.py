@@ -1501,6 +1501,155 @@ class TestRunIntegration:
             "hardware/b.kicad_pcb": b"B-v1\n",
         }
 
+    @staticmethod
+    def _nested_sheet_project(tmp_path):
+        pro = tmp_path / "aria.kicad_pro"
+        pro.write_text("{}\n")
+        root_sch = tmp_path / "aria.kicad_sch"
+        root_sch.write_text("root-v1\n")
+        hardware = tmp_path / "hardware"
+        hardware.mkdir()
+        nested = hardware / "main_bus.kicad_sch"
+        nested.write_text("nested-v1\n")
+        return pro, root_sch, nested
+
+    def _run_two_tool_calls(self, client, first, second):
+        responses = [
+            {"finish_reason": "tool_calls", "message": {"content": "", "tool_calls": [first]}},
+            {"finish_reason": "tool_calls", "message": {"content": "", "tool_calls": [second]}},
+            {"finish_reason": "stop", "message": {"content": "done"}},
+        ]
+        client._call_llm = MagicMock(side_effect=responses)
+        return client.run("edit", context_block="")
+
+    def test_explicit_save_does_not_suppress_uncovered_nested_sheet(self, tmp_path):
+        """An explicit save covers only its reported files; a nested edit still snapshots."""
+        from kcaa.utils import version_manager as _vm
+
+        pro, _root_sch, nested = self._nested_sheet_project(tmp_path)
+        calls = []
+
+        def _server(base_url, name, args, timeout=None):
+            calls.append((name, args))
+            if name == "save_project_version":
+                files = sorted(
+                    _vm.project_file_set(
+                        args["project_file"], include_files=args.get("include_files")
+                    )
+                )
+                archive = _vm.save_project_version(
+                    args["project_file"], include_files=args.get("include_files")
+                )
+                return {
+                    "success": True,
+                    "version_id": _vm.project_version_id(archive, args["project_file"]),
+                    "files": files,
+                }
+            if name == "set_symbol_property":
+                nested.write_text("nested-v2\n")
+            if name == "reload_kicad":
+                return {"success": True, "reloaded": args["paths"], "failed": []}
+            return {"success": True}
+
+        client = _make_client()
+        client._enabled_tools = {"save_project_version", "set_symbol_property"}
+        with patch("kicad_plugin.llm_client.call_mcp_tool", side_effect=_server):
+            result = self._run_two_tool_calls(
+                client,
+                _tool_call("s1", "save_project_version", {"project_file": str(pro)}),
+                _tool_call("e1", "set_symbol_property", {"schematic_path": str(nested)}),
+            )
+
+        assert result == "done"
+        names = [name for name, _ in calls]
+        assert "save_document" in names
+        assert any(
+            name == "save_project_version" and args.get("include_files") == [str(nested)]
+            for name, args in calls
+        )
+        versions = _vm.list_project_versions(str(pro))
+        assert len(versions) == 2
+        archived = {}
+        for version in versions:
+            archive_path = os.path.join(
+                tmp_path, ".versions", "project", f"aria.project.{version['id']}.tar.gz"
+            )
+            with tarfile.open(archive_path, "r:gz") as tar:
+                for member in tar.getmembers():
+                    if member.name == "hardware/main_bus.kicad_sch":
+                        fh = tar.extractfile(member)
+                        assert fh is not None
+                        archived[version["id"]] = fh.read()
+        assert b"nested-v1\n" in archived.values()
+
+    def test_explicit_save_still_suppresses_covered_root_sheet(self, tmp_path):
+        """A root sheet in the explicit save's files list needs no second snapshot."""
+        from kcaa.utils import version_manager as _vm
+
+        pro, root_sch, _nested = self._nested_sheet_project(tmp_path)
+        calls = []
+
+        def _server(base_url, name, args, timeout=None):
+            calls.append((name, args))
+            if name == "save_project_version":
+                files = sorted(_vm.project_file_set(args["project_file"]))
+                archive = _vm.save_project_version(args["project_file"])
+                return {
+                    "success": True,
+                    "version_id": _vm.project_version_id(archive, args["project_file"]),
+                    "files": files,
+                }
+            if name == "reload_kicad":
+                return {"success": True, "reloaded": args["paths"], "failed": []}
+            return {"success": True}
+
+        client = _make_client()
+        client._enabled_tools = {"save_project_version", "set_symbol_property"}
+        with patch("kicad_plugin.llm_client.call_mcp_tool", side_effect=_server):
+            result = self._run_two_tool_calls(
+                client,
+                _tool_call("s1", "save_project_version", {"project_file": str(pro)}),
+                _tool_call("e1", "set_symbol_property", {"schematic_path": str(root_sch)}),
+            )
+
+        assert result == "done"
+        names = [name for name, _ in calls]
+        assert names.count("save_project_version") == 1
+        assert "save_document" not in names
+        assert len(_vm.list_project_versions(str(pro))) == 1
+
+    def test_restore_covers_only_files_it_reported(self, tmp_path):
+        """Files absent from the restored archive are not suppressed."""
+        pro, _root_sch, nested = self._nested_sheet_project(tmp_path)
+        calls = []
+
+        def _server(base_url, name, args, timeout=None):
+            calls.append((name, args))
+            if name == "restore_project_version":
+                return {"success": True, "files": ["aria.kicad_sch"]}
+            if name == "reload_kicad":
+                return {"success": True, "reloaded": args["paths"], "failed": []}
+            return {"success": True}
+
+        client = _make_client()
+        client._enabled_tools = {"restore_project_version", "set_symbol_property"}
+        with patch("kicad_plugin.llm_client.call_mcp_tool", side_effect=_server):
+            result = self._run_two_tool_calls(
+                client,
+                _tool_call(
+                    "r1", "restore_project_version", {"project_file": str(pro), "version_id": "v1"}
+                ),
+                _tool_call("e1", "set_symbol_property", {"schematic_path": str(nested)}),
+            )
+
+        assert result == "done"
+        names = [name for name, _ in calls]
+        assert "save_document" in names
+        assert any(
+            name == "save_project_version" and args.get("include_files") == [str(nested)]
+            for name, args in calls
+        )
+
     def test_explicit_save_project_version_is_reused_by_later_mutation(self, board_project):
         pcb, pro = board_project
         client = _make_client()
@@ -1547,7 +1696,11 @@ class TestRunIntegration:
 
         with patch("kicad_plugin.llm_client.call_mcp_tool") as mock_call_tool:
             mock_call_tool.side_effect = [
-                {"success": True, "version_id": "v1"},
+                {
+                    "success": True,
+                    "version_id": "v1",
+                    "files": ["board.kicad_pro", "board.kicad_sch", "board.kicad_pcb"],
+                },
                 {"success": True, "pcb_path": pcb},
                 {"success": True, "reloaded": [pcb], "failed": []},
             ]

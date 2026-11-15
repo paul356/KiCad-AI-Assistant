@@ -58,6 +58,24 @@ def _searched_directories(file_path: str) -> list[str]:
         directory = parent
 
 
+def _project_relative_path(project_file: str, path: str) -> str | None:
+    """Return *path* relative to the project directory, or None if outside.
+
+    Uses the realpath of both ends so a symlinked file is compared by its
+    target, and returns POSIX separators to match ``save_project_version``'s
+    reported ``files`` list.
+    """
+    project_root = os.path.realpath(os.path.dirname(os.path.abspath(project_file)))
+    target = os.path.realpath(os.path.abspath(path))
+    try:
+        rel = os.path.relpath(target, project_root)
+    except ValueError:
+        return None
+    if rel == os.pardir or rel.startswith(os.pardir + os.sep) or os.path.isabs(rel):
+        return None
+    return rel.replace(os.sep, "/")
+
+
 def _normalize_tool_arguments(value: Any) -> str:
     """Return tool-call arguments as a JSON string (provider-agnostic).
 
@@ -1709,9 +1727,9 @@ class _ToolExecutionState:
     # One snapshot per (project, file) per turn, so a second file edited in
     # the same project still gets its own pre-edit archive.
     snapshotted_paths: set[tuple[str, str]] = field(default_factory=set)
-    # An explicit save_project_version/restore_project_version covers the
-    # whole project for the rest of the turn.
-    snapshotted_projects: set[str] = field(default_factory=set)
+    # Explicit save_project_version/restore_project_version calls report the
+    # project-relative files they covered; only those files are suppressed.
+    covered_files: dict[str, set[str]] = field(default_factory=dict)
     dirty_paths: set[str] = field(default_factory=set)
 
 
@@ -3059,9 +3077,10 @@ class LLMClient:
                     ),
                 }
             file_key = (project_path, os.path.abspath(path))
-            if (
-                project_path not in state.snapshotted_projects
-                and file_key not in state.snapshotted_paths
+            file_relative = _project_relative_path(project_path, path)
+            covered = state.covered_files.get(project_path, set())
+            if file_key not in state.snapshotted_paths and (
+                file_relative is None or file_relative not in covered
             ):
                 # Save the document in KiCad first to sync in-memory changes
                 # (e.g. from IPC operations) to disk before taking a snapshot.
@@ -3135,7 +3154,12 @@ class LLMClient:
         if policy.track_snapshot and path:
             resolved_project = _project_path_for(path)
             if resolved_project is not None:
-                state.snapshotted_projects.add(resolved_project)
+                covered = state.covered_files.setdefault(resolved_project, set())
+                reported = result.get("files") if isinstance(result, dict) else None
+                if isinstance(reported, list):
+                    for rel in reported:
+                        if isinstance(rel, str):
+                            covered.add(rel.replace(os.sep, "/"))
         if policy.clear_dirty_paths_arg:
             reload_paths = args.get(policy.clear_dirty_paths_arg, [])
             if isinstance(reload_paths, list):
